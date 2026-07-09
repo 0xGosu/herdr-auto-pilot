@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -475,6 +476,154 @@ func (s *Store) DecisionsForSignature(ctx context.Context, signature string, lim
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// ListSignatures returns learning state rows, newest-updated first.
+// Zero-valued filter fields are ignored.
+func (s *Store) ListSignatures(ctx context.Context, f domain.SignatureFilter) ([]domain.SignatureState, error) {
+	query := `
+		SELECT signature, situation_type, agent_type, mode, consecutive_confirmations,
+			cached_confidence, guard_state, updated_at
+		FROM signatures WHERE 1=1`
+	var args []any
+	if f.SituationType != "" {
+		query += ` AND situation_type = ?`
+		args = append(args, string(f.SituationType))
+	}
+	if f.AgentType != "" {
+		query += ` AND agent_type = ?`
+		args = append(args, f.AgentType)
+	}
+	if f.Mode != "" {
+		query += ` AND mode = ?`
+		args = append(args, string(f.Mode))
+	}
+	if f.MinConfidence > 0 {
+		query += ` AND cached_confidence >= ?`
+		args = append(args, f.MinConfidence)
+	}
+	query += ` ORDER BY updated_at DESC, signature ASC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.SignatureState
+	for rows.Next() {
+		var st domain.SignatureState
+		var situationType, mode string
+		var updated int64
+		if err := rows.Scan(&st.Signature, &situationType, &st.AgentType, &mode,
+			&st.ConsecutiveConfirmations, &st.CachedConfidence, &st.GuardState, &updated); err != nil {
+			return nil, err
+		}
+		st.SituationType = domain.SituationType(situationType)
+		st.Mode = domain.Mode(mode)
+		st.UpdatedAt = fromUnix(updated)
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// ResolveSignature expands a unique signature prefix to the full key,
+// git-style; the full key always resolves to itself. Errors on no match or
+// on an ambiguous prefix (listing the candidates).
+func (s *Store) ResolveSignature(ctx context.Context, prefix string) (string, error) {
+	if prefix == "" {
+		return "", fmt.Errorf("empty signature prefix")
+	}
+	// ESCAPE guards the LIKE wildcards; signatures are hex-ish but a prefix
+	// typed by the operator could contain % or _.
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT signature FROM signatures WHERE signature LIKE ? ESCAPE '\' ORDER BY signature LIMIT 11`,
+		escaped+"%")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var matches []string
+	for rows.Next() {
+		var sig string
+		if err := rows.Scan(&sig); err != nil {
+			return "", err
+		}
+		matches = append(matches, sig)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no signature matches %q", prefix)
+	case 1:
+		return matches[0], nil
+	default:
+		// An exact key that is also a prefix of others still resolves.
+		for _, m := range matches {
+			if m == prefix {
+				return m, nil
+			}
+		}
+		list := matches
+		suffix := ""
+		if len(list) > 10 {
+			list, suffix = list[:10], ", …"
+		}
+		return "", fmt.Errorf("signature prefix %q is ambiguous: %s%s",
+			prefix, strings.Join(list, ", "), suffix)
+	}
+}
+
+// DeleteSignature removes the signature row, its decision history, and its
+// error-retry row in one transaction, returning the number of decision rows
+// removed. Audit rows are kept (DR-005 lineage). The daemon may recreate
+// the signature from an in-flight event or pending correction immediately
+// afterwards; that recreated state starts from zero, which is exactly what
+// deletion means, so the race is accepted.
+func (s *Store) DeleteSignature(ctx context.Context, signature string) (int64, error) {
+	var decisions int64
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `DELETE FROM signatures WHERE signature = ?`, signature)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("no signature %q", signature)
+		}
+		res, err = tx.ExecContext(ctx, `DELETE FROM decisions WHERE signature = ?`, signature)
+		if err != nil {
+			return err
+		}
+		if decisions, err = res.RowsAffected(); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM error_retries WHERE error_signature = ?`, signature)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return decisions, nil
+}
+
+// LatestAuditForSignature returns the newest audit row for a signature
+// (nil when none) — display context for list/detail views.
+func (s *Store) LatestAuditForSignature(ctx context.Context, signature string) (*domain.AuditRecord, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+auditCols+` FROM audit_log WHERE signature = ? ORDER BY id DESC LIMIT 1`, signature)
+	if err != nil {
+		return nil, err
+	}
+	audits, err := s.scanAudits(rows)
+	if err != nil || len(audits) == 0 {
+		return nil, err
+	}
+	return &audits[0], nil
 }
 
 // LatestKillEvent returns the newest kill event row, or nil (read every tick).

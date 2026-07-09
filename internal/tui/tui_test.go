@@ -7,8 +7,13 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"context"
+	"path/filepath"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
 func testModel(t *testing.T) Model {
@@ -37,6 +42,21 @@ func testModel(t *testing.T) Model {
 				Signature: "choice|claude|abc123", DecisionID: 3,
 				CreatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)},
 		},
+		signatures: []frontend.SignatureRow{
+			{SignatureState: domain.SignatureState{
+				Signature: "choice:ffff0000eeee1111", SituationType: domain.SituationChoice,
+				AgentType: "codex", Mode: domain.ModeAutonomous,
+				ConsecutiveConfirmations: 5, CachedConfidence: 0.93,
+				UpdatedAt: time.Date(2026, 7, 9, 12, 30, 0, 0, time.UTC)},
+				TopAction: "2", Decisions: 6},
+			{SignatureState: domain.SignatureState{
+				Signature: "approval:1234abcd5678efab", SituationType: domain.SituationApproval,
+				AgentType: "claude", Mode: domain.ModeShadow,
+				ConsecutiveConfirmations: 3, CachedConfidence: 0.71,
+				UpdatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)},
+				TopAction: "1", Decisions: 4},
+		},
+		cfg: func() config.Config { c := config.Default(); c.Learning.GraduationN = 5; return c }(),
 	})
 	return upd.(Model)
 }
@@ -163,10 +183,10 @@ func TestDetailViewIgnoredWithoutRows(t *testing.T) {
 		t.Error("v with no rows should not open a detail view")
 	}
 	m = testModel(t)
-	m.tab = tabRules
+	m.tab = tabConfig
 	m = press(t, m, "v")
 	if m.detail != nil {
-		t.Error("v on the Rules tab should not open a detail view")
+		t.Error("v on the Config tab should not open a detail view")
 	}
 }
 
@@ -246,5 +266,160 @@ func TestWrapText(t *testing.T) {
 	// A degenerate width must not loop forever or panic.
 	if got := wrapText("abc", 0); len(got) != 3 {
 		t.Errorf("wrapText width guard failed: %q", got)
+	}
+}
+
+// appModel is a Model wired to a real store-backed App for action tests.
+func appModel(t *testing.T) (Model, *frontend.App, *store.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	app := &frontend.App{Store: st, ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:deadbeef00112233", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		ConsecutiveConfirmations: 2, CachedConfidence: 0.66, UpdatedAt: now,
+	})
+	st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:deadbeef00112233",
+		SituationType: domain.SituationApproval, AgentType: "claude",
+		ChosenAction: "1", Source: domain.SourceOperator, CreatedAt: now})
+	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:deadbeef00112233",
+		Trigger: "apply?", SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: "shadow mode suggestion", Status: "escalated", CreatedAt: now})
+
+	m := New(ctx, app)
+	m.width, m.height = 100, 30
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabSignatures
+	return m, app, st
+}
+
+func TestSignaturesTabRendersRows(t *testing.T) {
+	m := testModel(t)
+	m.tab = tabSignatures
+	view := m.View()
+	for _, want := range []string{"choice:ffff0000e…", "approval:1234abc…", "autonomous", "shadow", "5/5", "3/5", "conf=0.93"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("signatures tab missing %q:\n%s", want, view)
+		}
+	}
+	if !strings.Contains(m.helpLine(), "x: delete") {
+		t.Errorf("help line should document signature keys: %s", m.helpLine())
+	}
+
+	// Empty state.
+	var empty Model
+	empty.tab = tabSignatures
+	if !strings.Contains(empty.View(), "no learned signatures yet") {
+		t.Error("empty state missing")
+	}
+}
+
+func TestSignaturesModeFilterCycles(t *testing.T) {
+	m := testModel(t)
+	m.tab = tabSignatures
+	m = press(t, m, "f") // all → shadow
+	if m.sigMode != domain.ModeShadow || len(m.visibleSignatures()) != 1 ||
+		m.visibleSignatures()[0].Mode != domain.ModeShadow {
+		t.Fatalf("first f should filter to shadow, got %q %d", m.sigMode, len(m.visibleSignatures()))
+	}
+	view := m.View()
+	if strings.Contains(view, "autonomous") && !strings.Contains(view, "filter: mode=shadow") {
+		t.Errorf("shadow filter not applied:\n%s", view)
+	}
+	m = press(t, m, "f") // shadow → autonomous
+	if m.sigMode != domain.ModeAutonomous || len(m.visibleSignatures()) != 1 {
+		t.Fatalf("second f should filter to autonomous")
+	}
+	m = press(t, m, "f") // autonomous → all
+	if m.sigMode != "" || len(m.visibleSignatures()) != 2 {
+		t.Fatalf("third f should clear the filter")
+	}
+}
+
+func TestSignatureDetailOverlay(t *testing.T) {
+	m, _, _ := appModel(t)
+	// enter (or v) triggers an async load; run the returned command and
+	// feed its message back, as Bubble Tea's runtime would.
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("enter on a signature row should load the detail")
+	}
+	upd, _ = m.Update(cmd())
+	m = upd.(Model)
+	if m.detail == nil {
+		t.Fatal("sigDetailMsg should open the detail overlay")
+	}
+	view := m.View()
+	for _, want := range []string{"approval:deadbeef00112233", "Streak", "Recent decisions", "shadow mode suggestion"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("signature detail missing %q:\n%s", want, view)
+		}
+	}
+	m = press(t, m, "esc")
+	if m.detail != nil {
+		t.Error("esc should close the signature detail")
+	}
+}
+
+func TestSignatureDeletePromptFlow(t *testing.T) {
+	m, _, st := appModel(t)
+	ctx := context.Background()
+
+	// x opens the type-yes prompt.
+	m = press(t, m, "x")
+	if m.prompt == nil || !strings.Contains(m.prompt.label, "type 'yes' to delete approval:deadbee…") {
+		t.Fatalf("x should open the delete prompt, got %+v", m.prompt)
+	}
+	// Any other input aborts.
+	m = press(t, m, "n", "o")
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if msg, ok := cmd().(actionResultMsg); !ok || msg.message != "delete aborted" {
+		t.Fatalf("non-yes input must abort, got %+v", msg)
+	}
+	if sig, _ := st.GetSignature(ctx, "approval:deadbeef00112233"); sig == nil {
+		t.Fatal("aborted delete must not remove the signature")
+	}
+
+	// Typing yes deletes signature + decisions, keeps audit rows.
+	m = press(t, m, "x", "y", "e", "s")
+	upd, cmd = m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	msg, ok := cmd().(actionResultMsg)
+	if !ok || msg.err != nil || !strings.Contains(msg.message, "deleted approval:deadbee…") {
+		t.Fatalf("yes should delete, got %+v", msg)
+	}
+	if sig, _ := st.GetSignature(ctx, "approval:deadbeef00112233"); sig != nil {
+		t.Error("signature should be deleted")
+	}
+	if recs, _ := st.DecisionsForSignature(ctx, "approval:deadbeef00112233", 10); len(recs) != 0 {
+		t.Error("decisions should be deleted")
+	}
+	if log, _ := st.AuditLog(ctx, 10); len(log) != 1 {
+		t.Error("audit rows must be kept")
+	}
+}
+
+func TestConfigTabKeepsEditing(t *testing.T) {
+	m := testModel(t)
+	m.tab = tabConfig
+	if len(m.items) == 0 {
+		t.Fatal("config items should be built from cfg")
+	}
+	m = press(t, m, "enter")
+	if m.prompt == nil || !strings.Contains(m.prompt.label, "set thresholds.idle") {
+		t.Fatalf("enter on Config tab should edit the selected field, got %+v", m.prompt)
+	}
+	if !strings.Contains(testModel(t).View(), "Config") {
+		t.Error("Config tab name missing from the tab bar")
 	}
 }

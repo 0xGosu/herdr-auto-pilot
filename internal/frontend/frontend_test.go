@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
+	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 func testApp(t *testing.T) (*frontend.App, *store.Store) {
@@ -414,5 +416,136 @@ func TestCLIParityWithSharedLayer(t *testing.T) {
 	names, _ := app.Names(ctx)
 	if names["w1:p1"] != "frontend-dev" {
 		t.Errorf("CLI rename must hit shared state: %v", names)
+	}
+}
+
+func TestSignaturesEnrichmentAndFilter(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:one", SituationType: domain.SituationApproval, AgentType: "claude",
+		Mode: domain.ModeShadow, CachedConfidence: 0.6, UpdatedAt: now,
+	})
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "choice:two", SituationType: domain.SituationChoice, AgentType: "codex",
+		Mode: domain.ModeAutonomous, CachedConfidence: 0.95, UpdatedAt: now.Add(time.Second),
+	})
+	for i := 0; i < 3; i++ {
+		st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:one",
+			SituationType: domain.SituationApproval, AgentType: "claude",
+			ChosenAction: "1", Source: domain.SourceOperator, CreatedAt: now})
+	}
+	st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:one",
+		SituationType: domain.SituationApproval, AgentType: "claude",
+		ChosenAction: "2", Source: domain.SourceOperator, CreatedAt: now})
+
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Signature != "choice:two" {
+		t.Fatalf("want 2 rows newest first, got %+v", rows)
+	}
+	one := rows[1]
+	if one.TopAction != "1" || one.Decisions != 4 {
+		t.Errorf("enrichment: top=%q n=%d, want top=1 n=4", one.TopAction, one.Decisions)
+	}
+
+	// Filter pass-through.
+	rows, err = app.Signatures(ctx, domain.SignatureFilter{Mode: domain.ModeAutonomous})
+	if err != nil || len(rows) != 1 || rows[0].Signature != "choice:two" {
+		t.Errorf("mode filter: got %+v, %v", rows, err)
+	}
+}
+
+func TestSignatureDetail(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:detail", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, CachedConfidence: 0.7, UpdatedAt: now,
+	})
+	st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:detail",
+		SituationType: domain.SituationApproval, AgentType: "claude",
+		ChosenAction: "yes", Source: domain.SourceOperator, CreatedAt: now})
+	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:detail",
+		Trigger: "apply the diff?", SituationType: domain.SituationApproval,
+		Action: "escalated", Rationale: "shadow mode", Status: "escalated", CreatedAt: now})
+
+	row, history, err := app.SignatureDetail(ctx, "approval:det")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Signature != "approval:detail" || row.TopAction != "yes" || row.Decisions != 1 {
+		t.Errorf("detail row: %+v", row)
+	}
+	if len(history) != 1 || history[0].ChosenAction != "yes" {
+		t.Errorf("history: %+v", history)
+	}
+	if row.LastAudit == nil || row.LastAudit.Trigger != "apply the diff?" {
+		t.Errorf("last audit: %+v", row.LastAudit)
+	}
+
+	if _, _, err := app.SignatureDetail(ctx, "nope"); err == nil {
+		t.Error("unknown prefix must error")
+	}
+}
+
+func TestDeleteSignatureThroughApp(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "error:gone", SituationType: domain.SituationError,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+	})
+	st.RecordDecision(ctx, domain.DecisionRecord{Signature: "error:gone",
+		SituationType: domain.SituationError, AgentType: "claude",
+		ChosenAction: "retry", Source: domain.SourceRule, CreatedAt: now})
+
+	sig, n, err := app.DeleteSignature(ctx, "error:g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sig != "error:gone" || n != 1 {
+		t.Errorf("delete: sig=%q n=%d", sig, n)
+	}
+	if got, _ := st.GetSignature(ctx, "error:gone"); got != nil {
+		t.Error("signature should be deleted")
+	}
+	if _, _, err := app.DeleteSignature(ctx, "error:g"); err == nil {
+		t.Error("prefix resolution error must surface")
+	}
+}
+
+func TestDeleteSignatureNudgesReload(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "idle:nudged", SituationType: domain.SituationIdle,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: time.Now(),
+	})
+
+	got := make(chan control.Kind, 1)
+	sock := filepath.Join(testutil.SocketDir(t), "ctl.sock")
+	srv, err := control.NewServer(sock, func(k control.Kind) { got <- k })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	app.ControlPath = sock
+
+	if _, _, err := app.DeleteSignature(ctx, "idle:n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case k := <-got:
+		if k != control.KindReload {
+			t.Errorf("nudge kind = %q, want reload", k)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DeleteSignature must nudge the daemon with KindReload")
 	}
 }

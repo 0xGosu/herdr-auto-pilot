@@ -116,6 +116,15 @@ type SignatureState struct {
 	UpdatedAt                time.Time
 }
 
+// SignatureFilter narrows a learned-signature listing; zero-valued fields
+// are ignored.
+type SignatureFilter struct {
+	SituationType SituationType // "" = any
+	AgentType     string        // "" = any
+	Mode          Mode          // "" = any (shadow | autonomous)
+	MinConfidence float64       // 0 = any
+}
+
 // DecisionRecord is one learned/observed decision for a signature (DR-001).
 type DecisionRecord struct {
 	ID            int64

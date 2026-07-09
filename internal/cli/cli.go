@@ -3,13 +3,17 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -53,10 +57,193 @@ func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, arg
 		return taskSource(ctx, app, out, args)
 	case "rename":
 		return rename(ctx, app, out, args)
+	case "signatures", "sigs":
+		return signatures(ctx, app, out, args)
 	case "clear-data":
 		return clearData(ctx, app, out, args)
 	}
 	return fmt.Errorf("unknown command %q", verb)
+}
+
+func signatures(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	sub := "list"
+	if len(args) > 0 {
+		sub = args[0]
+		args = args[1:]
+	}
+	switch sub {
+	case "list":
+		return signaturesList(ctx, app, out, args)
+	case "show":
+		return signaturesShow(ctx, app, out, args)
+	case "delete":
+		return signaturesDelete(ctx, app, out, args)
+	}
+	// Bare `signatures --type X` style: treat unknown leading flag as list.
+	if strings.HasPrefix(sub, "-") {
+		return signaturesList(ctx, app, out, append([]string{sub}, args...))
+	}
+	return fmt.Errorf("usage: signatures [list|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]]")
+}
+
+func signaturesList(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	fs := flag.NewFlagSet("signatures list", flag.ContinueOnError)
+	situation := fs.String("type", "", "filter by situation type (idle|approval|choice|error)")
+	mode := fs.String("mode", "", "filter by mode (shadow|autonomous)")
+	agentType := fs.String("agent-type", "", "filter by agent type")
+	minConf := fs.Float64("min-conf", 0, "filter by minimum cached confidence")
+	fs.SetOutput(out)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	switch *situation {
+	case "", "idle", "approval", "choice", "error":
+	default:
+		return fmt.Errorf("invalid --type %q (idle|approval|choice|error)", *situation)
+	}
+	switch *mode {
+	case "", string(domain.ModeShadow), string(domain.ModeAutonomous):
+	default:
+		return fmt.Errorf("invalid --mode %q (shadow|autonomous)", *mode)
+	}
+	filtered := *situation != "" || *mode != "" || *agentType != "" || *minConf > 0
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{
+		SituationType: domain.SituationType(*situation),
+		AgentType:     *agentType,
+		Mode:          domain.Mode(*mode),
+		MinConfidence: *minConf,
+	})
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		if filtered {
+			fmt.Fprintln(out, "no signatures match the filter")
+		} else {
+			fmt.Fprintln(out, "no learned signatures yet — confirm suggestions to teach hap")
+		}
+		return nil
+	}
+	graduationN := graduationN(app)
+	for _, r := range rows {
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d/%d\tconf=%.2f\ttop=%q\t%s\n",
+			shortSignature(r.Signature), r.SituationType, orDash(r.AgentType), r.Mode,
+			r.ConsecutiveConfirmations, graduationN, r.CachedConfidence,
+			r.TopAction, r.UpdatedAt.Format("01-02 15:04:05"))
+	}
+	fmt.Fprintf(out, "\n%d signature(s); inspect with: signatures show <prefix>\n", len(rows))
+	return nil
+}
+
+func signaturesShow(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: signatures show <sig-or-prefix>")
+	}
+	row, history, err := app.SignatureDetail(ctx, args[0])
+	if err != nil {
+		return err
+	}
+	printSignatureRow(out, row, graduationN(app))
+	if len(history) > 0 {
+		fmt.Fprintln(out, "recent decisions (newest first):")
+		for _, d := range history {
+			marker := ""
+			if d.IsCorrection {
+				marker = "\tCORRECTION"
+			}
+			fmt.Fprintf(out, "  #%d\t%s\t%q\tsource=%s%s\n",
+				d.ID, d.CreatedAt.Format("01-02 15:04:05"), d.ChosenAction, d.Source, marker)
+		}
+	}
+	if a := row.LastAudit; a != nil {
+		fmt.Fprintf(out, "last audit #%d (%s): %s — %s\n",
+			a.ID, a.Status, a.Action, a.Rationale)
+	}
+	return nil
+}
+
+func signaturesDelete(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	prefix, rest := splitLeadingID(args)
+	fs := flag.NewFlagSet("signatures delete", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "skip the interactive confirmation")
+	fs.SetOutput(out)
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if prefix == "" && fs.NArg() > 0 {
+		prefix = fs.Arg(0)
+	}
+	if prefix == "" {
+		return fmt.Errorf("usage: signatures delete <sig-or-prefix> [--yes]")
+	}
+	// target holds the exact key once shown to the operator: the confirmed
+	// row and the deleted row must be the same even if the daemon learns
+	// another signature sharing the prefix while the operator types.
+	target := prefix
+	if !*yes {
+		row, _, err := app.SignatureDetail(ctx, prefix)
+		if err != nil {
+			return err
+		}
+		target = row.Signature
+		printSignatureRow(out, row, graduationN(app))
+		if !stdinIsTTY() {
+			return fmt.Errorf("deleting a signature erases its learned history; rerun as: signatures delete %s --yes", row.Signature)
+		}
+		fmt.Fprintf(out, "type 'yes' to delete %s and its %d decision(s): ", shortSignature(row.Signature), row.Decisions)
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && line == "" {
+			return fmt.Errorf("read confirmation: %w", err)
+		}
+		if strings.TrimSpace(line) != "yes" {
+			fmt.Fprintln(out, "aborted")
+			return nil
+		}
+	}
+	sig, decisions, err := app.DeleteSignature(ctx, target)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "deleted signature %s and %d decision(s); audit rows kept\n", sig, decisions)
+	return nil
+}
+
+func printSignatureRow(out io.Writer, r frontend.SignatureRow, graduationN int) {
+	fmt.Fprintf(out, "signature:   %s\n", r.Signature)
+	fmt.Fprintf(out, "situation:   %s\tagent type: %s\n", r.SituationType, orDash(r.AgentType))
+	fmt.Fprintf(out, "mode:        %s\tstreak: %d/%d\tconfidence: %.2f\n",
+		r.Mode, r.ConsecutiveConfirmations, graduationN, r.CachedConfidence)
+	fmt.Fprintf(out, "top action:  %q over %d decision(s)\n", r.TopAction, r.Decisions)
+	fmt.Fprintf(out, "updated:     %s\n", r.UpdatedAt.Format(time.RFC3339))
+}
+
+// graduationN reads the live graduation threshold for streak display.
+func graduationN(app *frontend.App) int {
+	if cfg, err := app.Config(); err == nil && cfg.Learning.GraduationN > 0 {
+		return cfg.Learning.GraduationN
+	}
+	return config.Default().Learning.GraduationN
+}
+
+// shortSignature abbreviates a signature for one-line listings.
+func shortSignature(sig string) string {
+	if len(sig) <= 16 {
+		return sig
+	}
+	return sig[:16] + "…"
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// stdinIsTTY reports whether stdin is an interactive terminal;
+// scripted/non-TTY deletes must pass --yes explicitly.
+func stdinIsTTY() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
 func rename(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {

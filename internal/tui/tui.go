@@ -1,9 +1,9 @@
 // Package tui is the primary control surface, run as a Herdr pane. It
 // mirrors every CLI capability (FR-022): monitored agents (with rename),
 // pending escalations (confirm/correct), the audit log (post-hoc
-// correction), rules and thresholds (view AND edit: config fields,
-// allowlist patterns, task sources, clear-data), and the pause/kill switch
-// with history.
+// correction), learned signatures (Rules tab: inspect/filter/delete),
+// configuration (Config tab: fields, allowlist patterns, task sources,
+// clear-data), and the pause/kill switch with history.
 package tui
 
 import (
@@ -28,12 +28,13 @@ const (
 	tabAgents tab = iota
 	tabEscalations
 	tabAudit
-	tabRules
+	tabSignatures // "Rules": learned signatures (list/inspect/delete)
+	tabConfig     // config fields, allowlist patterns, task sources
 	tabKill
 	tabCount
 )
 
-var tabNames = []string{"Agents", "Escalations", "Audit", "Rules", "Pause/Kill"}
+var tabNames = []string{"Agents", "Escalations", "Audit", "Rules", "Config", "Pause/Kill"}
 
 var (
 	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
@@ -53,8 +54,16 @@ type refreshMsg struct {
 	escalations []domain.AuditRecord
 	audit       []domain.AuditRecord
 	kills       []domain.KillEvent
+	signatures  []frontend.SignatureRow
 	cfg         config.Config
 	err         error
+}
+
+// sigDetailMsg carries an asynchronously loaded signature detail.
+type sigDetailMsg struct {
+	row     frontend.SignatureRow
+	history []domain.DecisionRecord
+	err     error
 }
 
 type actionResultMsg struct {
@@ -72,7 +81,7 @@ type prompt struct {
 }
 
 // detailView is a full-record overlay opened with `v` on the Agents,
-// Escalations, and Audit tabs, showing the selected row untruncated.
+// Escalations, Audit, and Rules tabs, showing the selected row untruncated.
 type detailView struct {
 	title  string
 	lines  []string                 // wrapped to the pane width at open/resize
@@ -80,7 +89,7 @@ type detailView struct {
 	build  func(width int) []string // rebuilds lines from the snapshot on resize
 }
 
-// ruleItem is one navigable row of the Rules tab.
+// ruleItem is one navigable row of the Config tab.
 type ruleItem struct {
 	kind  string // "field" | "pattern" | "source"
 	key   string // config field key (fields)
@@ -97,12 +106,27 @@ type Model struct {
 	tab     tab
 	cursor  int
 	data    refreshMsg
-	items   []ruleItem // Rules tab rows, rebuilt on refresh
+	items   []ruleItem  // Config tab rows, rebuilt on refresh
+	sigMode domain.Mode // Rules tab display filter: "" = all
 	message string
 	prompt  *prompt
 	detail  *detailView
 	width   int
 	height  int
+}
+
+// visibleSignatures applies the display-side mode filter (f key).
+func (m Model) visibleSignatures() []frontend.SignatureRow {
+	if m.sigMode == "" {
+		return m.data.signatures
+	}
+	var out []frontend.SignatureRow
+	for _, r := range m.data.signatures {
+		if r.Mode == m.sigMode {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // New creates the TUI model.
@@ -142,11 +166,15 @@ func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 	if msg.err != nil {
 		return msg
 	}
+	msg.signatures, msg.err = app.Signatures(ctx, domain.SignatureFilter{})
+	if msg.err != nil {
+		return msg
+	}
 	msg.cfg, msg.err = app.Config()
 	return msg
 }
 
-// buildRuleItems lays out the Rules tab rows from the current config.
+// buildRuleItems lays out the Config tab rows from the current config.
 func buildRuleItems(cfg config.Config) []ruleItem {
 	var items []ruleItem
 	for _, key := range frontend.ConfigFieldKeys {
@@ -204,6 +232,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.refresh()
 	case tickMsg:
 		return m, tea.Batch(m.refresh(), tick())
+	case sigDetailMsg:
+		if msg.err != nil {
+			m.message = errStyle.Render(msg.err.Error())
+			return m, nil
+		}
+		gradN := m.data.cfg.Learning.GraduationN
+		build := func(width int) []string {
+			return signatureDetailLines(msg.row, msg.history, gradN, width)
+		}
+		m.detail = &detailView{
+			title: fmt.Sprintf("Signature %s", shortSig(msg.row.Signature)),
+			lines: build(m.wrapWidth()),
+			build: build,
+		}
+		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -293,11 +336,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.tab {
 		case tabEscalations:
 			return m.confirmSelected()
-		case tabRules:
+		case tabSignatures:
+			return m.viewSignatureDetail()
+		case tabConfig:
 			return m.editSelectedRule()
 		}
 	case "e":
-		if m.tab == tabRules {
+		if m.tab == tabConfig {
 			return m.editSelectedRule()
 		}
 	case "c":
@@ -309,21 +354,40 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.renameSelected()
 		}
 	case "v":
+		if m.tab == tabSignatures {
+			return m.viewSignatureDetail()
+		}
 		return m.viewSelected()
+	case "f":
+		if m.tab == tabSignatures {
+			switch m.sigMode {
+			case "":
+				m.sigMode = domain.ModeShadow
+			case domain.ModeShadow:
+				m.sigMode = domain.ModeAutonomous
+			default:
+				m.sigMode = ""
+			}
+			m.cursor = 0
+			m.message = "filter: " + orDash(string(m.sigMode))
+		}
 	case "a":
-		if m.tab == tabRules {
+		if m.tab == tabConfig {
 			return m.addPatternPrompt()
 		}
 	case "t":
-		if m.tab == tabRules {
+		if m.tab == tabConfig {
 			return m.addTaskSourcePrompt()
 		}
 	case "x", "delete":
-		if m.tab == tabRules {
+		switch m.tab {
+		case tabSignatures:
+			return m.deleteSignaturePrompt()
+		case tabConfig:
 			return m.removeSelectedRule()
 		}
 	case "X":
-		if m.tab == tabRules {
+		if m.tab == tabConfig {
 			return m.clearDataPrompt()
 		}
 	}
@@ -349,7 +413,9 @@ func (m Model) rowCount() int {
 		return len(m.data.escalations)
 	case tabAudit:
 		return len(m.data.audit)
-	case tabRules:
+	case tabSignatures:
+		return len(m.visibleSignatures())
+	case tabConfig:
 		return len(m.items)
 	case tabKill:
 		return len(m.data.kills)
@@ -583,10 +649,108 @@ func wrapText(s string, width int) []string {
 	return out
 }
 
-// --- Rules tab editing ---
+// --- Signatures (Rules tab) ---
+
+func (m Model) selectedSignature() *frontend.SignatureRow {
+	sigs := m.visibleSignatures()
+	if m.tab == tabSignatures && m.cursor < len(sigs) {
+		return &sigs[m.cursor]
+	}
+	return nil
+}
+
+// viewSignatureDetail loads the full record (history + last audit) off the
+// Update loop and opens the detail overlay when it arrives.
+func (m Model) viewSignatureDetail() (tea.Model, tea.Cmd) {
+	row := m.selectedSignature()
+	if row == nil {
+		return m, nil
+	}
+	sig := row.Signature
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	return m, func() tea.Msg {
+		detail, history, err := app.SignatureDetail(ctx, sig)
+		return sigDetailMsg{row: detail, history: history, err: err}
+	}
+}
+
+func (m Model) deleteSignaturePrompt() (tea.Model, tea.Cmd) {
+	row := m.selectedSignature()
+	if row == nil {
+		return m, nil
+	}
+	sig, decisions := row.Signature, row.Decisions
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	m.prompt = &prompt{
+		label: fmt.Sprintf("type 'yes' to delete %s and its %d decision(s)", shortSig(sig), decisions),
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				if input != "yes" {
+					return actionResultMsg{message: "delete aborted"}
+				}
+				deleted, n, err := app.DeleteSignature(ctx, sig)
+				if err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: fmt.Sprintf(
+					"deleted %s and %d decision(s); audit rows kept", shortSig(deleted), n)}
+			}
+		},
+	}
+	return m, nil
+}
+
+// signatureDetailLines renders the full-record overlay for one signature.
+func signatureDetailLines(row frontend.SignatureRow, history []domain.DecisionRecord, graduationN, w int) []string {
+	var lines []string
+	lines = detailField(lines, w, "Signature", row.Signature)
+	lines = detailField(lines, w, "Situation", string(row.SituationType))
+	lines = detailField(lines, w, "Agent type", orDash(row.AgentType))
+	lines = detailField(lines, w, "Mode", string(row.Mode))
+	lines = detailField(lines, w, "Streak", fmt.Sprintf("%d/%d confirmations toward graduation", row.ConsecutiveConfirmations, graduationN))
+	lines = detailField(lines, w, "Confidence", fmt.Sprintf("%.2f (cached)", row.CachedConfidence))
+	if row.TopAction != "" {
+		lines = detailField(lines, w, "Top action", fmt.Sprintf("%q over %d decision(s)", row.TopAction, row.Decisions))
+	}
+	if row.GuardState != "" {
+		lines = detailField(lines, w, "Guard", row.GuardState)
+	}
+	if !row.UpdatedAt.IsZero() {
+		lines = detailField(lines, w, "Updated", row.UpdatedAt.Format(time.RFC3339))
+	}
+	if len(history) > 0 {
+		var b strings.Builder
+		for _, d := range history {
+			marker := ""
+			if d.IsCorrection {
+				marker = "  CORRECTION"
+			}
+			fmt.Fprintf(&b, "#%d  %s  %q  source=%s%s\n",
+				d.ID, d.CreatedAt.Format("01-02 15:04:05"), d.ChosenAction, d.Source, marker)
+		}
+		lines = detailField(lines, w, "Recent decisions (newest first)", strings.TrimRight(b.String(), "\n"))
+	}
+	if a := row.LastAudit; a != nil {
+		lines = detailField(lines, w, "Last audit",
+			fmt.Sprintf("#%d (%s) %s — %s", a.ID, a.Status, a.Action, a.Rationale))
+	}
+	return lines
+}
+
+// shortSig abbreviates a signature hash for one-line rows.
+func shortSig(sig string) string {
+	if len(sig) <= 16 {
+		return sig
+	}
+	return sig[:16] + "…"
+}
+
+// --- Config tab editing ---
 
 func (m Model) selectedRule() *ruleItem {
-	if m.tab == tabRules && m.cursor < len(m.items) {
+	if m.tab == tabConfig && m.cursor < len(m.items) {
 		return &m.items[m.cursor]
 	}
 	return nil
@@ -745,8 +909,10 @@ func (m Model) View() string {
 		m.renderEscalations(&b)
 	case tabAudit:
 		m.renderAudit(&b)
-	case tabRules:
-		m.renderRules(&b)
+	case tabSignatures:
+		m.renderSignatures(&b)
+	case tabConfig:
+		m.renderConfig(&b)
 	case tabKill:
 		m.renderKills(&b)
 	}
@@ -773,10 +939,42 @@ func (m Model) helpLine() string {
 		return "enter/y: confirm+send  c: correct  v: details  " + common
 	case tabAudit:
 		return "c: correct decision  v: details  " + common
-	case tabRules:
+	case tabSignatures:
+		return "enter/v: details  x: delete  f: filter mode  " + common
+	case tabConfig:
 		return "enter/e: edit field  a: add pattern  t: add task source  x: remove  X: clear data  " + common
 	}
 	return common
+}
+
+// renderSignatures draws the learned-signature list (the Rules tab).
+func (m Model) renderSignatures(b *strings.Builder) {
+	sigs := m.visibleSignatures()
+	if m.sigMode != "" {
+		fmt.Fprintf(b, "%s\n", sectionStyle.Render("filter: mode="+string(m.sigMode)+"  (f cycles)"))
+	}
+	if len(sigs) == 0 {
+		if len(m.data.signatures) > 0 {
+			fmt.Fprintln(b, "no signatures match the filter — press f to cycle")
+			return
+		}
+		fmt.Fprintln(b, "no learned signatures yet — confirm suggestions to teach hap")
+		return
+	}
+	gradN := m.data.cfg.Learning.GraduationN
+	for i, r := range sigs {
+		line := fmt.Sprintf("%-18s %-9s %-10s %-11s %d/%d conf=%.2f  %s",
+			shortSig(r.Signature), r.SituationType, orDash(r.AgentType), r.Mode,
+			r.ConsecutiveConfirmations, gradN, r.CachedConfidence,
+			oneLine(r.TopAction, 30))
+		switch {
+		case i == m.cursor:
+			line = selectedStyle.Render(line)
+		case r.Mode == domain.ModeAutonomous:
+			line = okStyle.Render(line)
+		}
+		fmt.Fprintln(b, line)
+	}
 }
 
 // renderDetail draws the open detail overlay in place of the tab body.
@@ -849,7 +1047,7 @@ func (m Model) renderAudit(b *strings.Builder) {
 	}
 }
 
-func (m Model) renderRules(b *strings.Builder) {
+func (m Model) renderConfig(b *strings.Builder) {
 	if len(m.items) == 0 {
 		fmt.Fprintln(b, "no configuration loaded")
 		return

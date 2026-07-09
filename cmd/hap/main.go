@@ -43,6 +43,8 @@ Operate:
   confirm <id> [--send]         confirm an escalation's suggested action
   resolve <id> --action TEXT [--send]   record the correct action (post-hoc correction)
   audit [--limit N]     show the audit log
+  signatures [list|show <sig>|delete <sig> [--yes]]   learned signatures (alias: sigs)
+                        list filters: --type T --mode M --agent-type A --min-conf C
   pause | resume        global pause/kill switch
   kill-history          pause/kill event history
 

@@ -62,8 +62,8 @@ The plugin never acts on a situation it hasn't learned from you.
 2. **Confirm or correct.** In the TUI's *Escalations* tab press `enter` to
    confirm the suggestion (and send it), or `c` to type the correct
    response — `v` shows the full record (trigger, rationale, LLM output)
-   when the list line is truncated; it works on the *Agents* and *Audit*
-   tabs too. From the CLI: `confirm <id> --send` or
+   when the list line is truncated; it works on the *Agents*, *Audit*, and
+   *Rules* tabs too. From the CLI: `confirm <id> --send` or
    `resolve <id> --action TEXT --send`.
 3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
    *and* confidence above the per-situation threshold, that signature becomes
@@ -71,6 +71,22 @@ The plugin never acts on a situation it hasn't learned from you.
 4. **Stay in control.** Correct any automated decision post-hoc (TUI *Audit*
    tab or `resolve <audit-id> --action ...`). A correction demotes the
    signature back to shadow mode — it must re-earn your trust.
+
+### Inspecting what it has learned
+
+Every learned signature is visible on the TUI's *Rules* tab and via the
+`signatures` CLI (alias `sigs`): mode, confirmation streak toward
+graduation, confidence, and the action it learned. Press `enter`/`v` for
+the full record (recent decisions, last audit context), `f` to filter by
+mode, and `x` to delete a signature you no longer trust — deletion erases
+its decision history too (audit rows are kept), so it re-learns from
+scratch. Signatures are addressed by unique prefix, git-style:
+
+```sh
+bin/hap signatures                      # list (--type, --mode, --agent-type, --min-conf)
+bin/hap signatures show approval:9f2c   # full detail by unique prefix
+bin/hap signatures delete approval:9f2c --yes
+```
 
 ## Configuration
 
@@ -134,7 +150,7 @@ allowlist_patterns = ['(?i)restart\s+the\s+payment\s+service']
 ```
 
 or `hap rules add '<regex>'` / `rules remove <index>`, or press `a`/`x` on
-the TUI's *Rules* tab — which also edits every config field inline
+the TUI's *Config* tab — which also edits every config field inline
 (`enter`), adds/removes task sources (`t`/`x`), and clears learned data
 (`X`). Prompts that *look* destructive
 but match no pattern are escalated by a suspected-irreversible heuristic

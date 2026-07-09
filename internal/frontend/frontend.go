@@ -508,6 +508,81 @@ func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path string) 
 	})
 }
 
+// SignatureRow is a learned signature enriched for display: the persisted
+// state plus the dominant action and decision count recomputed from history.
+type SignatureRow struct {
+	domain.SignatureState
+	TopAction string
+	Decisions int
+	LastAudit *domain.AuditRecord
+}
+
+// Signatures lists learned signatures (newest-updated first) enriched with
+// their top action and decision count. Per-row history reads are N+1 at
+// operator scale; a SQL aggregate is a future optimization if lists grow.
+func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]SignatureRow, error) {
+	states, err := a.Store.ListSignatures(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]SignatureRow, 0, len(states))
+	for _, st := range states {
+		history, err := a.Store.DecisionsForSignature(ctx, st.Signature, 50)
+		if err != nil {
+			return nil, err
+		}
+		conf := domain.Confidence(history)
+		rows = append(rows, SignatureRow{
+			SignatureState: st, TopAction: conf.TopAction, Decisions: conf.Decisions,
+		})
+	}
+	return rows, nil
+}
+
+// SignatureDetail resolves a signature (or unique prefix) and returns its
+// enriched row, recent decision history, and latest audit context.
+func (a *App) SignatureDetail(ctx context.Context, prefix string) (SignatureRow, []domain.DecisionRecord, error) {
+	var row SignatureRow
+	sig, err := a.Store.ResolveSignature(ctx, prefix)
+	if err != nil {
+		return row, nil, err
+	}
+	st, err := a.Store.GetSignature(ctx, sig)
+	if err != nil {
+		return row, nil, err
+	}
+	if st == nil {
+		return row, nil, fmt.Errorf("signature %q vanished while reading", sig)
+	}
+	history, err := a.Store.DecisionsForSignature(ctx, sig, 50)
+	if err != nil {
+		return row, nil, err
+	}
+	conf := domain.Confidence(history)
+	row = SignatureRow{SignatureState: *st, TopAction: conf.TopAction, Decisions: conf.Decisions}
+	audit, err := a.Store.LatestAuditForSignature(ctx, sig)
+	if err != nil {
+		return row, nil, err
+	}
+	row.LastAudit = audit
+	return row, history, nil
+}
+
+// DeleteSignature resolves the prefix, deletes the signature with its
+// decision history and error-retry row, and nudges the daemon to drop any
+// in-memory state. Returns the resolved key and removed decision count.
+func (a *App) DeleteSignature(ctx context.Context, prefix string) (string, int64, error) {
+	sig, err := a.Store.ResolveSignature(ctx, prefix)
+	if err != nil {
+		return "", 0, err
+	}
+	decisions, err := a.Store.DeleteSignature(ctx, sig)
+	if err != nil {
+		return "", 0, err
+	}
+	return sig, decisions, a.nudge(ctx, control.KindReload)
+}
+
 // ClearData resets learned history and audit data (DR-004).
 func (a *App) ClearData(ctx context.Context) error {
 	if err := a.Store.ClearLearnedData(ctx); err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -435,5 +436,161 @@ func TestClearLearnedData(t *testing.T) {
 	recs, _ := s.DecisionsForSignature(ctx, "s", 10)
 	if len(log) != 0 || len(recs) != 0 {
 		t.Error("clear should reset learned + audit data")
+	}
+}
+
+func seedSignature(t *testing.T, s *Store, sig string, situation domain.SituationType,
+	agentType string, mode domain.Mode, conf float64, at time.Time) {
+	t.Helper()
+	err := s.UpsertSignature(context.Background(), domain.SignatureState{
+		Signature: sig, SituationType: situation, AgentType: agentType,
+		Mode: mode, ConsecutiveConfirmations: 2, CachedConfidence: conf, UpdatedAt: at,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListSignaturesFiltersAndOrder(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour)
+	seedSignature(t, s, "approval:aaa", domain.SituationApproval, "claude", domain.ModeShadow, 0.5, base)
+	seedSignature(t, s, "choice:bbb", domain.SituationChoice, "codex", domain.ModeAutonomous, 0.9, base.Add(2*time.Minute))
+	seedSignature(t, s, "approval:ccc", domain.SituationApproval, "codex", domain.ModeAutonomous, 0.85, base.Add(time.Minute))
+
+	all, err := s.ListSignatures(ctx, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 || all[0].Signature != "choice:bbb" || all[2].Signature != "approval:aaa" {
+		t.Fatalf("want newest-updated first, got %+v", all)
+	}
+
+	cases := []struct {
+		name string
+		f    domain.SignatureFilter
+		want []string
+	}{
+		{"by situation", domain.SignatureFilter{SituationType: domain.SituationApproval}, []string{"approval:ccc", "approval:aaa"}},
+		{"by agent type", domain.SignatureFilter{AgentType: "codex"}, []string{"choice:bbb", "approval:ccc"}},
+		{"by mode", domain.SignatureFilter{Mode: domain.ModeAutonomous}, []string{"choice:bbb", "approval:ccc"}},
+		{"by min confidence", domain.SignatureFilter{MinConfidence: 0.86}, []string{"choice:bbb"}},
+		{"combined", domain.SignatureFilter{AgentType: "codex", SituationType: domain.SituationApproval}, []string{"approval:ccc"}},
+		{"no match", domain.SignatureFilter{AgentType: "gemini"}, nil},
+	}
+	for _, tc := range cases {
+		got, err := s.ListSignatures(ctx, tc.f)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if len(got) != len(tc.want) {
+			t.Fatalf("%s: got %d rows, want %d (%+v)", tc.name, len(got), len(tc.want), got)
+		}
+		for i, w := range tc.want {
+			if got[i].Signature != w {
+				t.Errorf("%s: row %d = %s, want %s", tc.name, i, got[i].Signature, w)
+			}
+		}
+	}
+}
+
+func TestResolveSignaturePrefix(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	seedSignature(t, s, "approval:9f2c11", domain.SituationApproval, "claude", domain.ModeShadow, 0.5, now)
+	seedSignature(t, s, "approval:9f2c22", domain.SituationApproval, "claude", domain.ModeShadow, 0.5, now)
+	seedSignature(t, s, "choice:1234", domain.SituationChoice, "claude", domain.ModeShadow, 0.5, now)
+
+	if got, err := s.ResolveSignature(ctx, "choice:"); err != nil || got != "choice:1234" {
+		t.Errorf("unique prefix: got %q, %v", got, err)
+	}
+	if got, err := s.ResolveSignature(ctx, "approval:9f2c11"); err != nil || got != "approval:9f2c11" {
+		t.Errorf("full key: got %q, %v", got, err)
+	}
+	if _, err := s.ResolveSignature(ctx, "approval:9f2c"); err == nil {
+		t.Error("ambiguous prefix must error")
+	} else if !strings.Contains(err.Error(), "approval:9f2c11") || !strings.Contains(err.Error(), "approval:9f2c22") {
+		t.Errorf("ambiguity error should list candidates, got %v", err)
+	}
+	if _, err := s.ResolveSignature(ctx, "zzz"); err == nil {
+		t.Error("no match must error")
+	}
+	if _, err := s.ResolveSignature(ctx, ""); err == nil {
+		t.Error("empty prefix must error")
+	}
+	// LIKE wildcards in the prefix must be literal, not match-anything.
+	if _, err := s.ResolveSignature(ctx, "%"); err == nil {
+		t.Error("wildcard prefix must not match everything")
+	}
+}
+
+func TestDeleteSignature(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	seedSignature(t, s, "error:dead", domain.SituationError, "claude", domain.ModeShadow, 0.6, now)
+	seedSignature(t, s, "error:kept", domain.SituationError, "claude", domain.ModeShadow, 0.6, now)
+	for i := 0; i < 3; i++ {
+		s.RecordDecision(ctx, domain.DecisionRecord{Signature: "error:dead", SituationType: domain.SituationError,
+			AgentType: "claude", ChosenAction: "retry", Source: domain.SourceRule, CreatedAt: now})
+	}
+	s.RecordDecision(ctx, domain.DecisionRecord{Signature: "error:kept", SituationType: domain.SituationError,
+		AgentType: "claude", ChosenAction: "retry", Source: domain.SourceRule, CreatedAt: now})
+	s.UpsertErrorRetry(ctx, domain.ErrorRetry{ErrorSignature: "error:dead", AgentID: "w1:p1", RetryCount: 2, UpdatedAt: now})
+	auditID, _ := s.AppendAudit(ctx, domain.AuditRecord{Signature: "error:dead", Trigger: "boom",
+		SituationType: domain.SituationError, Action: "escalated", Status: "escalated", CreatedAt: now})
+
+	n, err := s.DeleteSignature(ctx, "error:dead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("deleted decision count = %d, want 3", n)
+	}
+	if st, _ := s.GetSignature(ctx, "error:dead"); st != nil {
+		t.Error("signature row should be gone")
+	}
+	if recs, _ := s.DecisionsForSignature(ctx, "error:dead", 10); len(recs) != 0 {
+		t.Error("decision history should be gone")
+	}
+	if r, _ := s.GetErrorRetry(ctx, "error:dead"); r.RetryCount != 0 {
+		t.Error("error-retry row should be gone")
+	}
+	// Audit lineage is kept; other signatures untouched.
+	if a, _ := s.GetAudit(ctx, auditID); a == nil {
+		t.Error("audit rows must be kept")
+	}
+	if st, _ := s.GetSignature(ctx, "error:kept"); st == nil {
+		t.Error("other signatures must be untouched")
+	}
+	if recs, _ := s.DecisionsForSignature(ctx, "error:kept", 10); len(recs) != 1 {
+		t.Error("other signatures' decisions must be untouched")
+	}
+	if _, err := s.DeleteSignature(ctx, "error:dead"); err == nil {
+		t.Error("deleting a nonexistent signature must error")
+	}
+}
+
+func TestLatestAuditForSignature(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	if a, err := s.LatestAuditForSignature(ctx, "none"); err != nil || a != nil {
+		t.Fatalf("no rows should give nil,nil; got %v,%v", a, err)
+	}
+	now := time.Now()
+	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:x", Trigger: "old",
+		SituationType: domain.SituationApproval, Action: "1", CreatedAt: now.Add(-time.Minute)})
+	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:x", Trigger: "new",
+		SituationType: domain.SituationApproval, Action: "2", CreatedAt: now})
+	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:other", Trigger: "other",
+		SituationType: domain.SituationApproval, Action: "3", CreatedAt: now})
+	a, err := s.LatestAuditForSignature(ctx, "sig:x")
+	if err != nil || a == nil {
+		t.Fatalf("latest audit: %v, %v", a, err)
+	}
+	if a.Trigger != "new" {
+		t.Errorf("newest row should win, got trigger %q", a.Trigger)
 	}
 }

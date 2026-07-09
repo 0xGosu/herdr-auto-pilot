@@ -86,6 +86,11 @@ type FrontendStore interface {
 	// AssignAgentName upserts a name for an agent id the caller has
 	// verified to be live (e.g. present in Herdr's agent list).
 	AssignAgentName(ctx context.Context, agentID, name string) error
+	// DeleteSignature removes one learned signature with its decision
+	// history and error-retry row, returning the decision count. The daemon
+	// may recreate the signature from an in-flight event; the recreated
+	// state starts from zero, which is what deletion means.
+	DeleteSignature(ctx context.Context, signature string) (int64, error)
 	ClearLearnedData(ctx context.Context) error
 }
 
@@ -118,6 +123,15 @@ type ReadStore interface {
 	AgentNames(ctx context.Context) (map[string]string, error)
 	// ResolveAgent maps a short name or agent/pane id to the agent id.
 	ResolveAgent(ctx context.Context, target string) (string, error)
+	// ListSignatures returns learning state rows, newest-updated first;
+	// zero-valued filter fields are ignored.
+	ListSignatures(ctx context.Context, f domain.SignatureFilter) ([]domain.SignatureState, error)
+	// ResolveSignature expands a unique signature prefix to the full key,
+	// erroring on no match or ambiguity.
+	ResolveSignature(ctx context.Context, prefix string) (string, error)
+	// LatestAuditForSignature returns the newest audit row for a signature,
+	// or nil when none exists.
+	LatestAuditForSignature(ctx context.Context, signature string) (*domain.AuditRecord, error)
 }
 
 // Clock abstracts time for deterministic tests.
