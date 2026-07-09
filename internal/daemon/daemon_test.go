@@ -488,6 +488,44 @@ func TestIdleDeclaredTaskSourceDrivesNextPrompt(t *testing.T) {
 	}
 }
 
+func TestIdleTaskSourceMatchesAgentShortName(t *testing.T) {
+	// Task-source selectors match the auto-generated (or renamed) short
+	// name, not just pane ids.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	os.WriteFile(taskFile, []byte("- [ ] short-name task\n"), 0o600)
+
+	idlePane := "All tests pass. Task is complete.\n"
+	h := newHarness(t, "")
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	// Name the agent the way the daemon will, then rename it and point a
+	// task source at the new name.
+	ctx := context.Background()
+	if _, err := h.raw.EnsureAgentName(ctx, "agent-15"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raw.RenameAgent(ctx, "agent-15", "docs-writer"); err != nil {
+		t.Fatal(err)
+	}
+	cfgTOML := fmt.Sprintf("[[task_sources]]\nagent = \"docs-writer\"\npath = %q\n", taskFile)
+	os.WriteFile(h.cfgPath, []byte(cfgTOML), 0o600)
+	if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		cfg, _, _ := h.daemon.snapshot()
+		return len(cfg.TaskSources) == 1
+	})
+
+	h.push("agent-15", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "short-name task" {
+		t.Errorf("sent %q, want the short-name-matched task", got)
+	}
+}
+
 func TestIdleWithoutTaskSourceEscalates(t *testing.T) {
 	// FR-011: no declared source, no structured signal → escalate, never a
 	// synthesized "continue".

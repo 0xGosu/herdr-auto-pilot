@@ -8,6 +8,8 @@ package frontend
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -43,6 +45,8 @@ type Status struct {
 	LatestKill         *domain.KillEvent
 	PendingEscalations int
 	MonitoredAgents    []domain.AgentTransition
+	// AgentNames maps agent/pane ids to their short names.
+	AgentNames map[string]string
 }
 
 // GetStatus returns the operator-facing status summary.
@@ -64,7 +68,27 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 			st.MonitoredAgents = agents
 		}
 	}
+	if names, err := a.Store.AgentNames(ctx); err == nil {
+		st.AgentNames = names
+	}
 	return st, nil
+}
+
+// AgentName returns the short name for an agent id ("" when unnamed).
+func (st Status) AgentName(agentID string) string { return st.AgentNames[agentID] }
+
+// Names returns the agent id → short name mapping.
+func (a *App) Names(ctx context.Context) (map[string]string, error) {
+	return a.Store.AgentNames(ctx)
+}
+
+// RenameAgent gives an agent a new short name; target may be the current
+// name or the agent/pane id. The name is what task-source selectors match.
+func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
+	if err := a.Store.RenameAgent(ctx, target, newName); err != nil {
+		return err
+	}
+	return a.nudge(ctx, control.KindReload)
 }
 
 // Escalations lists pending escalations.
@@ -188,33 +212,262 @@ func (a *App) Config() (config.Config, error) {
 	return config.Load(a.ConfigPath)
 }
 
-// SetThreshold updates one per-situation threshold (FR-009) and reloads.
-func (a *App) SetThreshold(ctx context.Context, situation string, value float64) error {
-	if value <= 0 || value >= 1 {
-		return fmt.Errorf("threshold must be in (0,1), got %v", value)
+// UpdateConfig loads the config, applies fn, saves, and nudges the daemon —
+// the single write path both front-ends use for config.toml edits. An
+// advisory file lock serializes the read-modify-write against concurrent
+// front-ends (a long-running TUI plus CLI invocations is a supported
+// combination), so no edit is silently lost to a last-writer-wins race.
+func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) error {
+	unlock, err := lockFile(a.ConfigPath + ".lock")
+	if err != nil {
+		return fmt.Errorf("lock config for editing: %w", err)
 	}
+	defer unlock()
+
 	cfg, err := config.Load(a.ConfigPath)
 	if err != nil {
 		return err
 	}
-	switch situation {
-	case "idle":
-		cfg.Thresholds.Idle = value
-	case "approval":
-		cfg.Thresholds.Approval = value
-	case "choice":
-		cfg.Thresholds.Choice = value
-	case "error":
-		cfg.Thresholds.Error = value
-	case "inferred_task_bar":
-		cfg.Thresholds.InferredTaskBar = value
-	default:
-		return fmt.Errorf("unknown situation %q (idle|approval|choice|error|inferred_task_bar)", situation)
+	if err := fn(&cfg); err != nil {
+		return err
 	}
 	if err := config.Save(a.ConfigPath, cfg); err != nil {
 		return err
 	}
 	return a.nudge(ctx, control.KindReload)
+}
+
+// ConfigFieldKeys lists every scalar config field editable via SetField, in
+// display order (shared by the TUI config editor and `config set`).
+var ConfigFieldKeys = []string{
+	"thresholds.idle",
+	"thresholds.approval",
+	"thresholds.choice",
+	"thresholds.error",
+	"thresholds.inferred_task_bar",
+	"learning.graduation_n",
+	"limits.max_consecutive_auto_prompts",
+	"limits.max_auto_prompts_per_minute",
+	"limits.max_error_retries",
+	"llm.command",
+	"llm.timeout_seconds",
+	"llm.auto_act",
+}
+
+// FieldValue renders the current value of a SetField key for display.
+func FieldValue(cfg config.Config, key string) string {
+	switch key {
+	case "thresholds.idle":
+		return fmt.Sprintf("%.2f", cfg.Thresholds.Idle)
+	case "thresholds.approval":
+		return fmt.Sprintf("%.2f", cfg.Thresholds.Approval)
+	case "thresholds.choice":
+		return fmt.Sprintf("%.2f", cfg.Thresholds.Choice)
+	case "thresholds.error":
+		return fmt.Sprintf("%.2f", cfg.Thresholds.Error)
+	case "thresholds.inferred_task_bar":
+		return fmt.Sprintf("%.2f", cfg.Thresholds.InferredTaskBar)
+	case "learning.graduation_n":
+		return strconv.Itoa(cfg.Learning.GraduationN)
+	case "limits.max_consecutive_auto_prompts":
+		return strconv.Itoa(cfg.Limits.MaxConsecutiveAutoPrompts)
+	case "limits.max_auto_prompts_per_minute":
+		return strconv.Itoa(cfg.Limits.MaxAutoPromptsPerMinute)
+	case "limits.max_error_retries":
+		return strconv.Itoa(cfg.Limits.MaxErrorRetries)
+	case "llm.command":
+		return JoinCommand(cfg.LLM.Command)
+	case "llm.timeout_seconds":
+		return strconv.Itoa(cfg.LLM.TimeoutSeconds)
+	case "llm.auto_act":
+		return strconv.FormatBool(cfg.LLM.AutoAct)
+	}
+	return ""
+}
+
+// SetField updates one scalar config field by key, with validation. It
+// backs both the TUI config editor and `config set <key> <value>`.
+func (a *App) SetField(ctx context.Context, key, value string) error {
+	value = strings.TrimSpace(value)
+	setFloat := func(dst *float64) error {
+		v, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("%s: %q is not a number", key, value)
+		}
+		if v <= 0 || v >= 1 {
+			return fmt.Errorf("%s must be in (0,1), got %v", key, v)
+		}
+		*dst = v
+		return nil
+	}
+	setInt := func(dst *int) error {
+		v, err := strconv.Atoi(value)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("%s must be a positive integer, got %q", key, value)
+		}
+		*dst = v
+		return nil
+	}
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		switch key {
+		case "thresholds.idle":
+			return setFloat(&cfg.Thresholds.Idle)
+		case "thresholds.approval":
+			return setFloat(&cfg.Thresholds.Approval)
+		case "thresholds.choice":
+			return setFloat(&cfg.Thresholds.Choice)
+		case "thresholds.error":
+			return setFloat(&cfg.Thresholds.Error)
+		case "thresholds.inferred_task_bar":
+			return setFloat(&cfg.Thresholds.InferredTaskBar)
+		case "learning.graduation_n":
+			return setInt(&cfg.Learning.GraduationN)
+		case "limits.max_consecutive_auto_prompts":
+			return setInt(&cfg.Limits.MaxConsecutiveAutoPrompts)
+		case "limits.max_auto_prompts_per_minute":
+			return setInt(&cfg.Limits.MaxAutoPromptsPerMinute)
+		case "limits.max_error_retries":
+			return setInt(&cfg.Limits.MaxErrorRetries)
+		case "llm.timeout_seconds":
+			return setInt(&cfg.LLM.TimeoutSeconds)
+		case "llm.auto_act":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("llm.auto_act must be true or false, got %q", value)
+			}
+			cfg.LLM.AutoAct = v
+			return nil
+		case "llm.command":
+			argv, err := SplitCommand(value)
+			if err != nil {
+				return fmt.Errorf("llm.command: %w", err)
+			}
+			cfg.LLM.Command = argv // empty disables the LLM fallback
+			return nil
+		}
+		return fmt.Errorf("unknown config field %q", key)
+	})
+}
+
+// SplitCommand splits a command line into argv, honoring single and double
+// quotes (for editing llm.command as one line).
+func SplitCommand(s string) ([]string, error) {
+	var argv []string
+	var cur strings.Builder
+	var quote rune
+	inToken := false
+	for _, r := range s {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				cur.WriteRune(r)
+			}
+		case r == '\'' || r == '"':
+			quote = r
+			inToken = true
+		case r == ' ' || r == '\t':
+			if inToken {
+				argv = append(argv, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+		default:
+			cur.WriteRune(r)
+			inToken = true
+		}
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated %c-quote", quote)
+	}
+	if inToken {
+		argv = append(argv, cur.String())
+	}
+	return argv, nil
+}
+
+// JoinCommand renders argv as a single line that SplitCommand parses back
+// to the same argv: args containing whitespace or quotes are quoted, so a
+// display → edit → save round trip never corrupts llm.command.
+func JoinCommand(argv []string) string {
+	parts := make([]string, len(argv))
+	for i, arg := range argv {
+		switch {
+		case arg == "" || strings.ContainsAny(arg, " \t"):
+			if !strings.Contains(arg, `"`) {
+				parts[i] = `"` + arg + `"`
+			} else {
+				parts[i] = "'" + arg + "'"
+			}
+		case strings.Contains(arg, `"`):
+			parts[i] = "'" + arg + "'"
+		case strings.Contains(arg, `'`):
+			parts[i] = `"` + arg + `"`
+		default:
+			parts[i] = arg
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// RemoveAllowlistPattern deletes an operator allowlist pattern by index (as
+// listed by `rules list` / the TUI). expected is the pattern text the caller
+// believes is at that index: removal is refused on mismatch, so a listing
+// gone stale (another front-end edited in between) can never silently delete
+// the wrong never-auto pattern. Seed patterns cannot be removed here;
+// disabling the seed requires the explicit safety.disable_seed TOML edit.
+func (a *App) RemoveAllowlistPattern(ctx context.Context, index int, expected string) error {
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		if index < 0 || index >= len(cfg.Safety.AllowlistPatterns) {
+			return fmt.Errorf("no operator allowlist pattern #%d", index)
+		}
+		if got := cfg.Safety.AllowlistPatterns[index]; got != expected {
+			return fmt.Errorf("pattern #%d changed since it was listed (now %q); re-list and retry", index, got)
+		}
+		cfg.Safety.AllowlistPatterns = append(
+			cfg.Safety.AllowlistPatterns[:index], cfg.Safety.AllowlistPatterns[index+1:]...)
+		return nil
+	})
+}
+
+// RemoveTaskSource deletes a task source by index; expectedPath guards
+// against removing a different entry after a stale listing.
+func (a *App) RemoveTaskSource(ctx context.Context, index int, expectedPath string) error {
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		if index < 0 || index >= len(cfg.TaskSources) {
+			return fmt.Errorf("no task source #%d", index)
+		}
+		if got := cfg.TaskSources[index].Path; got != expectedPath {
+			return fmt.Errorf("task source #%d changed since it was listed (now %s); re-list and retry", index, got)
+		}
+		cfg.TaskSources = append(cfg.TaskSources[:index], cfg.TaskSources[index+1:]...)
+		return nil
+	})
+}
+
+// SetThreshold updates one per-situation threshold (FR-009) and reloads.
+func (a *App) SetThreshold(ctx context.Context, situation string, value float64) error {
+	if value <= 0 || value >= 1 {
+		return fmt.Errorf("threshold must be in (0,1), got %v", value)
+	}
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		switch situation {
+		case "idle":
+			cfg.Thresholds.Idle = value
+		case "approval":
+			cfg.Thresholds.Approval = value
+		case "choice":
+			cfg.Thresholds.Choice = value
+		case "error":
+			cfg.Thresholds.Error = value
+		case "inferred_task_bar":
+			cfg.Thresholds.InferredTaskBar = value
+		default:
+			return fmt.Errorf("unknown situation %q (idle|approval|choice|error|inferred_task_bar)", situation)
+		}
+		return nil
+	})
 }
 
 // AddAllowlistPattern appends a never-auto pattern (FR-016) and reloads.
@@ -222,30 +475,20 @@ func (a *App) AddAllowlistPattern(ctx context.Context, pattern string) error {
 	if _, errs := domain.NewAllowlist(false, []string{pattern}, nil); len(errs) > 0 {
 		return fmt.Errorf("invalid pattern: %v", errs[0])
 	}
-	cfg, err := config.Load(a.ConfigPath)
-	if err != nil {
-		return err
-	}
-	cfg.Safety.AllowlistPatterns = append(cfg.Safety.AllowlistPatterns, pattern)
-	if err := config.Save(a.ConfigPath, cfg); err != nil {
-		return err
-	}
-	return a.nudge(ctx, control.KindReload)
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		cfg.Safety.AllowlistPatterns = append(cfg.Safety.AllowlistPatterns, pattern)
+		return nil
+	})
 }
 
 // AddTaskSource points an agent/workspace at a declared task list (FR-011).
 func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path string) error {
-	cfg, err := config.Load(a.ConfigPath)
-	if err != nil {
-		return err
-	}
-	cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{
-		Agent: agent, Workspace: workspace, Path: path,
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{
+			Agent: agent, Workspace: workspace, Path: path,
+		})
+		return nil
 	})
-	if err := config.Save(a.ConfigPath, cfg); err != nil {
-		return err
-	}
-	return a.nudge(ctx, control.KindReload)
 }
 
 // ClearData resets learned history and audit data (DR-004).

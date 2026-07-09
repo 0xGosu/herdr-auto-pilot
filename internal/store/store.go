@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -149,6 +150,11 @@ CREATE TABLE IF NOT EXISTS operator (
 	label TEXT NOT NULL DEFAULT ''
 );
 INSERT OR IGNORE INTO operator (id, label) VALUES ('operator', 'Operator');
+CREATE TABLE IF NOT EXISTS agent_names (
+	agent_id TEXT PRIMARY KEY,
+	name TEXT NOT NULL UNIQUE,
+	created_at INTEGER NOT NULL
+);
 `
 
 func (s *Store) migrate() error {
@@ -651,6 +657,135 @@ func (s *Store) GetLLMRequest(ctx context.Context, requestID string) (*domain.LL
 	r.SituationType = domain.SituationType(situationType)
 	r.CreatedAt = fromUnix(created)
 	return &r, nil
+}
+
+// --- Agent short names ---
+
+// agentNameRE constrains operator-chosen agent names: short, lowercase,
+// shell- and TOML-friendly.
+var agentNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// EnsureAgentName returns the agent's short name, generating and persisting
+// one on first sight (daemon-owned insert; existing rows are never updated
+// here, so operator renames are preserved).
+func (s *Store) EnsureAgentName(ctx context.Context, agentID string) (string, error) {
+	if name, err := s.agentNameByID(ctx, agentID); err != nil || name != "" {
+		return name, err
+	}
+	// Two attempts: a concurrent rename can steal the generated name between
+	// the probe and the insert (INSERT OR IGNORE swallows the UNIQUE
+	// violation); the second attempt regenerates against the fresh state.
+	for attempt := 0; attempt < 2; attempt++ {
+		var probeErr error
+		taken := func(name string) bool {
+			if probeErr != nil {
+				return false // stop probing; the error aborts below
+			}
+			var n int
+			if err := s.db.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM agent_names WHERE name = ?`, name).Scan(&n); err != nil {
+				probeErr = err
+				return false
+			}
+			return n > 0
+		}
+		name := domain.GenerateAgentName(agentID, taken)
+		if probeErr != nil {
+			return "", fmt.Errorf("probe agent names: %w", probeErr)
+		}
+		err := s.tx(ctx, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx,
+				`INSERT OR IGNORE INTO agent_names (agent_id, name, created_at) VALUES (?, ?, ?)`,
+				agentID, name, time.Now().UnixMilli())
+			return err
+		})
+		if err != nil {
+			return "", err
+		}
+		// Re-read: a concurrent insert for this agent may have won instead.
+		got, err := s.agentNameByID(ctx, agentID)
+		if err != nil || got != "" {
+			return got, err
+		}
+	}
+	return "", fmt.Errorf("could not assign a unique name to agent %s", agentID)
+}
+
+func (s *Store) agentNameByID(ctx context.Context, agentID string) (string, error) {
+	var name string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT name FROM agent_names WHERE agent_id = ?`, agentID).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return name, err
+}
+
+// RenameAgent gives the agent a new operator-chosen short name (front-end
+// write). target may be the current short name or the agent/pane id.
+func (s *Store) RenameAgent(ctx context.Context, target, newName string) error {
+	if !agentNameRE.MatchString(newName) {
+		return fmt.Errorf("invalid name %q: use 1-32 lowercase letters, digits, - or _", newName)
+	}
+	agentID, err := s.ResolveAgent(ctx, target)
+	if err != nil {
+		return err
+	}
+	// Renames only apply to agents the daemon has already named (rows are
+	// created on first sight); a bogus target must not invent a mapping.
+	if existing, err := s.agentNameByID(ctx, agentID); err != nil {
+		return err
+	} else if existing == "" {
+		return fmt.Errorf("no agent known as %q (agents are named when first monitored)", target)
+	}
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		var n int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM agent_names WHERE name = ? AND agent_id != ?`,
+			newName, agentID).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			return fmt.Errorf("name %q is already taken", newName)
+		}
+		_, err := tx.ExecContext(ctx,
+			`UPDATE agent_names SET name = ? WHERE agent_id = ?`, newName, agentID)
+		return err
+	})
+}
+
+// ResolveAgent maps a short name or agent/pane id to the agent id. Targets
+// that match no known name pass through as-is (e.g. a pane id seen before
+// naming), so naming stays optional.
+func (s *Store) ResolveAgent(ctx context.Context, target string) (string, error) {
+	var agentID string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT agent_id FROM agent_names WHERE name = ?`, target).Scan(&agentID)
+	if err == nil {
+		return agentID, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	return target, nil
+}
+
+// AgentNames returns every agent id → short name mapping.
+func (s *Store) AgentNames(ctx context.Context) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT agent_id, name FROM agent_names`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	names := map[string]string{}
+	for rows.Next() {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		names[id] = name
+	}
+	return names, rows.Err()
 }
 
 // LatestPendingLLMRequest returns the newest pending staged request, or nil.

@@ -97,10 +97,25 @@ max_error_retries = 2              # per error signature
 # task from an explicit checklist the agent itself printed — never free-form
 # prose — and holds it to the higher inferred_task_bar.
 [[task_sources]]
-agent = ""            # agent id/name/type ("" = any)
+agent = "brave-otter" # agent short name, pane id, or type ("" = any)
 workspace = ""        # workspace id ("" = any)
 path = "/home/me/project/docs/tasks.md"
 ```
+
+### Agent short names
+
+Every monitored agent automatically gets a short friendly name (e.g.
+`brave-otter`) the first time it's seen — pane ids like `w6:p1` are not
+operator-friendly. Use the name in task-source selectors, and rename agents
+to whatever fits your workflow:
+
+```sh
+bin/hap agents                      # short name, pane id, type, status
+bin/hap rename brave-otter backend-dev
+bin/hap task-source --agent backend-dev ./docs/backend-tasks.md
+```
+
+(Or in the TUI: select the agent and press `n`.)
 
 ### Never-auto allowlist
 
@@ -116,7 +131,10 @@ regex patterns:
 allowlist_patterns = ['(?i)restart\s+the\s+payment\s+service']
 ```
 
-or `hap rules add '<regex>'`. Prompts that *look* destructive
+or `hap rules add '<regex>'` / `rules remove <index>`, or press `a`/`x` on
+the TUI's *Rules* tab — which also edits every config field inline
+(`enter`), adds/removes task sources (`t`/`x`), and clears learned data
+(`X`). Prompts that *look* destructive
 but match no pattern are escalated by a suspected-irreversible heuristic
 rather than automated.
 

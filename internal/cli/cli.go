@@ -51,10 +51,23 @@ func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, arg
 		return rules(ctx, app, out, args)
 	case "task-source":
 		return taskSource(ctx, app, out, args)
+	case "rename":
+		return rename(ctx, app, out, args)
 	case "clear-data":
 		return clearData(ctx, app, out, args)
 	}
 	return fmt.Errorf("unknown command %q", verb)
+}
+
+func rename(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: rename <agent-or-name> <new-name>")
+	}
+	if err := app.RenameAgent(ctx, args[0], args[1]); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "agent %q is now named %q (task-source selectors match this name)\n", args[0], args[1])
+	return nil
 }
 
 func status(ctx context.Context, app *frontend.App, out io.Writer) error {
@@ -86,7 +99,11 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		return nil
 	}
 	for _, a := range st.MonitoredAgents {
-		fmt.Fprintf(out, "%s\t%s\t%s\n", a.AgentID, a.AgentType, a.Status)
+		name := st.AgentName(a.AgentID)
+		if name == "" {
+			name = "-"
+		}
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", name, a.AgentID, a.AgentType, a.Status)
 	}
 	return nil
 }
@@ -100,9 +117,17 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer) error {
 		fmt.Fprintln(out, "no pending escalations")
 		return nil
 	}
+	names, err := app.Names(ctx)
+	if err != nil {
+		names = map[string]string{}
+	}
 	for _, e := range esc {
+		agent := e.AgentID
+		if n := names[e.AgentID]; n != "" {
+			agent = n
+		}
 		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\tagent=%s\tsuggestion=%q\n",
-			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.Rationale, e.AgentID, e.Suggestion)
+			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.Rationale, agent, e.Suggestion)
 	}
 	fmt.Fprintf(out, "\n%d pending; respond with: confirm <id> | resolve <id> --action TEXT [--send]\n", len(esc))
 	return nil
@@ -212,7 +237,27 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		printConfig(out, cfg)
 		return nil
 	}
-	if args[0] == "set-threshold" {
+	switch args[0] {
+	case "fields":
+		cfg, err := app.Config()
+		if err != nil {
+			return err
+		}
+		for _, key := range frontend.ConfigFieldKeys {
+			fmt.Fprintf(out, "%-40s %s\n", key, frontend.FieldValue(cfg, key))
+		}
+		return nil
+	case "set":
+		if len(args) < 3 {
+			return fmt.Errorf("usage: config set <field> <value> (see: config fields)")
+		}
+		value := strings.Join(args[2:], " ")
+		if err := app.SetField(ctx, args[1], value); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "%s set to %s (daemon reloaded)\n", args[1], value)
+		return nil
+	case "set-threshold":
 		if len(args) != 3 {
 			return fmt.Errorf("usage: config set-threshold <idle|approval|choice|error|inferred_task_bar> <value>")
 		}
@@ -226,7 +271,7 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		fmt.Fprintf(out, "threshold %s set to %.2f (daemon reloaded)\n", args[1], v)
 		return nil
 	}
-	return fmt.Errorf("usage: config [show|set-threshold <situation> <value>]")
+	return fmt.Errorf("usage: config [show|fields|set <field> <value>|set-threshold <situation> <value>]")
 }
 
 func printConfig(out io.Writer, cfg config.Config) {
@@ -250,33 +295,91 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		}
 		fmt.Fprintln(out, "# seed never-auto allowlist (always active unless disable_seed=true)")
 		for _, p := range domain.SeedAllowlistPatterns {
-			fmt.Fprintf(out, "seed\t%s\n", p)
+			fmt.Fprintf(out, "seed\t\t%s\n", p)
 		}
-		for _, p := range cfg.Safety.AllowlistPatterns {
-			fmt.Fprintf(out, "operator\t%s\n", p)
+		for i, p := range cfg.Safety.AllowlistPatterns {
+			fmt.Fprintf(out, "operator #%d\t%s\n", i, p)
 		}
 		return nil
 	}
-	if args[0] == "add" && len(args) == 2 {
+	switch {
+	case args[0] == "add" && len(args) == 2:
 		if err := app.AddAllowlistPattern(ctx, args[1]); err != nil {
 			return err
 		}
 		fmt.Fprintf(out, "allowlist pattern added: %s\n", args[1])
 		return nil
+	case args[0] == "remove" && len(args) == 2:
+		idx, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("invalid pattern index %q (see: rules list)", args[1])
+		}
+		cfg, err := app.Config()
+		if err != nil {
+			return err
+		}
+		if idx < 0 || idx >= len(cfg.Safety.AllowlistPatterns) {
+			return fmt.Errorf("no operator allowlist pattern #%d (see: rules list)", idx)
+		}
+		expected := cfg.Safety.AllowlistPatterns[idx]
+		if err := app.RemoveAllowlistPattern(ctx, idx, expected); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "operator allowlist pattern #%d removed: %s\n", idx, expected)
+		return nil
 	}
-	return fmt.Errorf("usage: rules [list|add <regex>]")
+	return fmt.Errorf("usage: rules [list|add <regex>|remove <index>]")
 }
 
 func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) > 0 && args[0] == "list" {
+		cfg, err := app.Config()
+		if err != nil {
+			return err
+		}
+		if len(cfg.TaskSources) == 0 {
+			fmt.Fprintln(out, "no task sources configured")
+			return nil
+		}
+		for i, src := range cfg.TaskSources {
+			fmt.Fprintf(out, "#%d\tagent=%q workspace=%q path=%s\n", i, src.Agent, src.Workspace, src.Path)
+		}
+		return nil
+	}
+	if len(args) > 0 && args[0] == "remove" {
+		if len(args) != 2 {
+			return fmt.Errorf("usage: task-source remove <index> (see: task-source list)")
+		}
+		idx, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("invalid task source index %q", args[1])
+		}
+		cfg, err := app.Config()
+		if err != nil {
+			return err
+		}
+		if idx < 0 || idx >= len(cfg.TaskSources) {
+			return fmt.Errorf("no task source #%d (see: task-source list)", idx)
+		}
+		expected := cfg.TaskSources[idx].Path
+		if err := app.RemoveTaskSource(ctx, idx, expected); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "task source #%d removed: %s\n", idx, expected)
+		return nil
+	}
+	if len(args) > 0 && args[0] == "add" {
+		args = args[1:]
+	}
 	fs := flag.NewFlagSet("task-source", flag.ContinueOnError)
-	agent := fs.String("agent", "", "agent id/name/type this source applies to")
+	agent := fs.String("agent", "", "agent short name, id, or type this source applies to")
 	workspace := fs.String("workspace", "", "workspace id this source applies to")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: task-source [--agent A] [--workspace W] <checklist.md>")
+		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] <checklist.md> | list | remove <index>")
 	}
 	if err := app.AddTaskSource(ctx, *agent, *workspace, fs.Arg(0)); err != nil {
 		return err

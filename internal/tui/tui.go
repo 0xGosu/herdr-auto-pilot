@@ -1,7 +1,9 @@
 // Package tui is the primary control surface, run as a Herdr pane. It
-// surfaces monitored agents, pending escalations, the audit log, rules and
-// thresholds, and the pause/kill switch with history (FR-022, FR-017,
-// FR-021) — every capability here is also a CLI verb.
+// mirrors every CLI capability (FR-022): monitored agents (with rename),
+// pending escalations (confirm/correct), the audit log (post-hoc
+// correction), rules and thresholds (view AND edit: config fields,
+// allowlist patterns, task sources, clear-data), and the pause/kill switch
+// with history.
 package tui
 
 import (
@@ -13,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 )
@@ -37,8 +40,10 @@ var (
 	pausedStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
 	runningStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("46"))
 	selectedStyle = lipgloss.NewStyle().Reverse(true)
+	sectionStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
 	helpStyle     = lipgloss.NewStyle().Faint(true)
 	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	okStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
 )
 
 type refreshMsg struct {
@@ -46,24 +51,46 @@ type refreshMsg struct {
 	escalations []domain.AuditRecord
 	audit       []domain.AuditRecord
 	kills       []domain.KillEvent
+	cfg         config.Config
 	err         error
 }
 
+type actionResultMsg struct {
+	message string
+	err     error
+}
+
 type tickMsg time.Time
+
+// prompt is an in-flight inline input.
+type prompt struct {
+	label    string
+	input    string
+	onSubmit func(string) tea.Cmd
+}
+
+// ruleItem is one navigable row of the Rules tab.
+type ruleItem struct {
+	kind  string // "field" | "pattern" | "source"
+	key   string // config field key (fields)
+	index int    // slice index (patterns / sources)
+	value string // pattern text / source path — verified on removal
+	label string // rendered row
+}
 
 // Model is the Bubble Tea model.
 type Model struct {
 	app *frontend.App
 	ctx context.Context
 
-	tab      tab
-	cursor   int
-	data     refreshMsg
-	message  string
-	entering bool   // typing a correction
-	input    string // correction text
-	width    int
-	height   int
+	tab     tab
+	cursor  int
+	data    refreshMsg
+	items   []ruleItem // Rules tab rows, rebuilt on refresh
+	message string
+	prompt  *prompt
+	width   int
+	height  int
 }
 
 // New creates the TUI model.
@@ -100,7 +127,43 @@ func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 		return msg
 	}
 	msg.kills, msg.err = app.KillHistory(ctx, 50)
+	if msg.err != nil {
+		return msg
+	}
+	msg.cfg, msg.err = app.Config()
 	return msg
+}
+
+// buildRuleItems lays out the Rules tab rows from the current config.
+func buildRuleItems(cfg config.Config) []ruleItem {
+	var items []ruleItem
+	for _, key := range frontend.ConfigFieldKeys {
+		items = append(items, ruleItem{
+			kind: "field", key: key,
+			label: fmt.Sprintf("%-38s %s", key, frontend.FieldValue(cfg, key)),
+		})
+	}
+	for i, p := range cfg.Safety.AllowlistPatterns {
+		items = append(items, ruleItem{
+			kind: "pattern", index: i, value: p,
+			label: fmt.Sprintf("allowlist #%d  %s", i, p),
+		})
+	}
+	for i, src := range cfg.TaskSources {
+		sel := src.Agent
+		if sel == "" {
+			sel = "*"
+		}
+		ws := src.Workspace
+		if ws == "" {
+			ws = "*"
+		}
+		items = append(items, ruleItem{
+			kind: "source", index: i, value: src.Path,
+			label: fmt.Sprintf("task-source #%d  agent=%s ws=%s  %s", i, sel, ws, src.Path),
+		})
+	}
+	return items
 }
 
 // Update handles events.
@@ -111,10 +174,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case refreshMsg:
 		m.data = msg
+		m.items = buildRuleItems(msg.cfg)
 		if m.cursor >= m.rowCount() {
 			m.cursor = max(0, m.rowCount()-1)
 		}
 		return m, nil
+	case actionResultMsg:
+		if msg.err != nil {
+			m.message = errStyle.Render(msg.err.Error())
+		} else if msg.message != "" {
+			m.message = okStyle.Render(msg.message)
+		}
+		return m, m.refresh()
 	case tickMsg:
 		return m, tea.Batch(m.refresh(), tick())
 	case tea.KeyMsg:
@@ -124,34 +195,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.entering {
+	if m.prompt != nil {
 		switch msg.Type {
+		case tea.KeyCtrlC:
+			return m, tea.Quit
 		case tea.KeyEnter:
-			m.entering = false
-			input := strings.TrimSpace(m.input)
-			m.input = ""
+			p := m.prompt
+			m.prompt = nil
+			input := strings.TrimSpace(p.input)
 			if input == "" {
-				m.message = "correction cancelled"
+				m.message = "cancelled"
 				return m, nil
 			}
-			return m, m.doResolve(input)
+			return m, p.onSubmit(input)
 		case tea.KeyEsc:
-			m.entering = false
-			m.input = ""
-			m.message = "correction cancelled"
+			m.prompt = nil
+			m.message = "cancelled"
 			return m, nil
 		case tea.KeyBackspace:
-			if r := []rune(m.input); len(r) > 0 {
-				m.input = string(r[:len(r)-1])
+			if r := []rune(m.prompt.input); len(r) > 0 {
+				m.prompt.input = string(r[:len(r)-1])
 			}
 			return m, nil
 		case tea.KeySpace:
-			m.input += " "
+			m.prompt.input += " "
 			return m, nil
 		case tea.KeyRunes:
 			// Only printable input; key names like "up"/"home" must not
-			// leak into the correction text.
-			m.input += string(msg.Runes)
+			// leak into the text.
+			m.prompt.input += string(msg.Runes)
 			return m, nil
 		default:
 			return m, nil
@@ -164,33 +236,73 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "tab", "right", "l":
 		m.tab = (m.tab + 1) % tabCount
 		m.cursor = 0
+		m.message = ""
 	case "shift+tab", "left", "h":
 		m.tab = (m.tab + tabCount - 1) % tabCount
 		m.cursor = 0
+		m.message = ""
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
 		}
+		m.message = ""
 	case "down", "j":
 		if m.cursor < m.rowCount()-1 {
 			m.cursor++
 		}
+		m.message = ""
 	case "p":
-		return m, m.doPause()
+		return m, m.do("automation paused", func(ctx context.Context) error { return m.app.Pause(ctx) })
 	case "r":
-		return m, m.doResume()
+		return m, m.do("automation resumed", func(ctx context.Context) error { return m.app.Resume(ctx) })
 	case "enter", "y":
-		if m.tab == tabEscalations {
-			return m, m.doConfirm()
+		switch m.tab {
+		case tabEscalations:
+			return m.confirmSelected()
+		case tabRules:
+			return m.editSelectedRule()
+		}
+	case "e":
+		if m.tab == tabRules {
+			return m.editSelectedRule()
 		}
 	case "c":
 		if m.tab == tabEscalations || m.tab == tabAudit {
-			m.entering = true
-			m.input = ""
-			m.message = ""
+			return m.correctSelected()
+		}
+	case "n":
+		if m.tab == tabAgents {
+			return m.renameSelected()
+		}
+	case "a":
+		if m.tab == tabRules {
+			return m.addPatternPrompt()
+		}
+	case "t":
+		if m.tab == tabRules {
+			return m.addTaskSourcePrompt()
+		}
+	case "x", "delete":
+		if m.tab == tabRules {
+			return m.removeSelectedRule()
+		}
+	case "X":
+		if m.tab == tabRules {
+			return m.clearDataPrompt()
 		}
 	}
 	return m, nil
+}
+
+// do runs a mutation and reports its outcome.
+func (m Model) do(okMsg string, fn func(context.Context) error) tea.Cmd {
+	ctx := m.ctx
+	return func() tea.Msg {
+		if err := fn(ctx); err != nil {
+			return actionResultMsg{err: err}
+		}
+		return actionResultMsg{message: okMsg}
+	}
 }
 
 func (m Model) rowCount() int {
@@ -201,6 +313,8 @@ func (m Model) rowCount() int {
 		return len(m.data.escalations)
 	case tabAudit:
 		return len(m.data.audit)
+	case tabRules:
+		return len(m.items)
 	case tabKill:
 		return len(m.data.kills)
 	}
@@ -221,53 +335,187 @@ func (m Model) selectedAudit() *domain.AuditRecord {
 	return nil
 }
 
-func (m Model) doPause() tea.Cmd {
-	app, ctx := m.app, m.ctx
-	return func() tea.Msg {
-		if err := app.Pause(ctx); err != nil {
-			return refreshMsg{err: err}
-		}
-		return refreshData(ctx, app)
-	}
-}
+// --- Escalation / audit actions ---
 
-func (m Model) doResume() tea.Cmd {
-	app, ctx := m.app, m.ctx
-	return func() tea.Msg {
-		if err := app.Resume(ctx); err != nil {
-			return refreshMsg{err: err}
-		}
-		return refreshData(ctx, app)
-	}
-}
-
-func (m Model) doConfirm() tea.Cmd {
+func (m Model) confirmSelected() (tea.Model, tea.Cmd) {
 	rec := m.selectedAudit()
 	if rec == nil {
-		return nil
+		return m, nil
 	}
-	app, ctx, id := m.app, m.ctx, rec.ID
-	return func() tea.Msg {
-		if err := app.Confirm(ctx, id, true); err != nil {
-			return refreshMsg{err: err}
-		}
-		return refreshData(ctx, app)
+	id := rec.ID
+	return m, m.do(fmt.Sprintf("confirmed #%d and sent", id), func(ctx context.Context) error {
+		return m.app.Confirm(ctx, id, true)
+	})
+}
+
+func (m Model) correctSelected() (tea.Model, tea.Cmd) {
+	rec := m.selectedAudit()
+	if rec == nil {
+		return m, nil
+	}
+	id := rec.ID
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	m.prompt = &prompt{
+		label: fmt.Sprintf("correct #%d — action to record", id),
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				if err := app.Resolve(ctx, id, input, false); err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: fmt.Sprintf("correction recorded for #%d", id)}
+			}
+		},
+	}
+	return m, nil
+}
+
+// --- Agent rename ---
+
+func (m Model) renameSelected() (tea.Model, tea.Cmd) {
+	if m.cursor >= len(m.data.status.MonitoredAgents) {
+		return m, nil
+	}
+	agent := m.data.status.MonitoredAgents[m.cursor]
+	current := m.data.status.AgentName(agent.AgentID)
+	target := agent.AgentID
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	m.prompt = &prompt{
+		label: fmt.Sprintf("rename %s (%s) to", orDash(current), agent.AgentID),
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				if err := app.RenameAgent(ctx, target, input); err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: fmt.Sprintf("agent renamed to %q", input)}
+			}
+		},
+	}
+	return m, nil
+}
+
+// --- Rules tab editing ---
+
+func (m Model) selectedRule() *ruleItem {
+	if m.tab == tabRules && m.cursor < len(m.items) {
+		return &m.items[m.cursor]
+	}
+	return nil
+}
+
+func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
+	item := m.selectedRule()
+	if item == nil || item.kind != "field" {
+		return m, nil
+	}
+	key := item.key
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	m.prompt = &prompt{
+		label: fmt.Sprintf("set %s (current %s)", key, frontend.FieldValue(m.data.cfg, key)),
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				if err := app.SetField(ctx, key, input); err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: key + " updated (daemon reloaded)"}
+			}
+		},
+	}
+	return m, nil
+}
+
+func (m Model) addPatternPrompt() (tea.Model, tea.Cmd) {
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	m.prompt = &prompt{
+		label: "add never-auto allowlist regex",
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				if err := app.AddAllowlistPattern(ctx, input); err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: "allowlist pattern added"}
+			}
+		},
+	}
+	return m, nil
+}
+
+func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	m.prompt = &prompt{
+		label: "add task source: <path> [agent] [workspace]",
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				parts := strings.Fields(input)
+				if len(parts) > 3 {
+					return actionResultMsg{err: fmt.Errorf(
+						"expected <path> [agent] [workspace] — got %d fields (paths with spaces are not supported here; use the CLI)", len(parts))}
+				}
+				var agent, workspace string
+				if len(parts) > 1 {
+					agent = parts[1]
+				}
+				if len(parts) > 2 {
+					workspace = parts[2]
+				}
+				if err := app.AddTaskSource(ctx, agent, workspace, parts[0]); err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: "task source added"}
+			}
+		},
+	}
+	return m, nil
+}
+
+func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
+	item := m.selectedRule()
+	if item == nil {
+		return m, nil
+	}
+	app := m.app
+	switch item.kind {
+	case "pattern":
+		idx, expected := item.index, item.value
+		return m, m.do(fmt.Sprintf("allowlist pattern #%d removed", idx), func(c context.Context) error {
+			return app.RemoveAllowlistPattern(c, idx, expected)
+		})
+	case "source":
+		idx, expected := item.index, item.value
+		return m, m.do(fmt.Sprintf("task source #%d removed", idx), func(c context.Context) error {
+			return app.RemoveTaskSource(c, idx, expected)
+		})
+	default:
+		m.message = "config fields are edited (enter), not removed"
+		return m, nil
 	}
 }
 
-func (m Model) doResolve(action string) tea.Cmd {
-	rec := m.selectedAudit()
-	if rec == nil {
-		return nil
+func (m Model) clearDataPrompt() (tea.Model, tea.Cmd) {
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	m.prompt = &prompt{
+		label: "type 'yes' to permanently clear learned history + audit data",
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				if input != "yes" {
+					return actionResultMsg{message: "clear-data aborted"}
+				}
+				if err := app.ClearData(ctx); err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: "learned history and audit data cleared"}
+			}
+		},
 	}
-	app, ctx, id := m.app, m.ctx, rec.ID
-	return func() tea.Msg {
-		if err := app.Resolve(ctx, id, action, false); err != nil {
-			return refreshMsg{err: err}
-		}
-		return refreshData(ctx, app)
-	}
+	return m, nil
 }
+
+// --- View ---
 
 // View renders the pane.
 func (m Model) View() string {
@@ -291,10 +539,10 @@ func (m Model) View() string {
 			tabs = append(tabs, inactiveTab.Render(label))
 		}
 	}
-	b.WriteString(strings.Join(tabs, "|") + "\n\n")
+	fmt.Fprintf(&b, "%s\n\n", strings.Join(tabs, "|"))
 
 	if m.data.err != nil {
-		b.WriteString(errStyle.Render("error: "+m.data.err.Error()) + "\n")
+		fmt.Fprintf(&b, "%s\n", errStyle.Render("error: "+m.data.err.Error()))
 	}
 
 	switch m.tab {
@@ -310,48 +558,67 @@ func (m Model) View() string {
 		m.renderKills(&b)
 	}
 
-	if m.entering {
-		fmt.Fprintf(&b, "\ncorrection> %s█\n", m.input)
+	if m.prompt != nil {
+		fmt.Fprintf(&b, "\n%s> %s█\n", m.prompt.label, m.prompt.input)
 	}
 	if m.message != "" {
-		b.WriteString("\n" + m.message + "\n")
+		fmt.Fprintf(&b, "\n%s\n", m.message)
 	}
-	b.WriteString("\n" + helpStyle.Render(
-		"tab: switch  ↑/↓: select  enter/y: confirm+send  c: correct  p: pause  r: resume  q: quit"))
+	fmt.Fprintf(&b, "\n%s", helpStyle.Render(m.helpLine()))
 	return b.String()
+}
+
+func (m Model) helpLine() string {
+	common := "tab: switch  ↑/↓: select  p: pause  r: resume  q: quit"
+	switch m.tab {
+	case tabAgents:
+		return "n: rename agent  " + common
+	case tabEscalations:
+		return "enter/y: confirm+send  c: correct  " + common
+	case tabAudit:
+		return "c: correct decision  " + common
+	case tabRules:
+		return "enter/e: edit field  a: add pattern  t: add task source  x: remove  X: clear data  " + common
+	}
+	return common
 }
 
 func (m Model) renderAgents(b *strings.Builder) {
 	agents := m.data.status.MonitoredAgents
 	if len(agents) == 0 {
-		b.WriteString("no agents detected\n")
+		fmt.Fprintln(b, "no agents detected")
 		return
 	}
 	for i, a := range agents {
-		line := fmt.Sprintf("%-16s %-12s %s", a.AgentID, a.AgentType, a.Status)
+		name := orDash(m.data.status.AgentName(a.AgentID))
+		line := fmt.Sprintf("%-18s %-12s %-12s %s", name, a.AgentID, a.AgentType, a.Status)
 		if i == m.cursor {
 			line = selectedStyle.Render(line)
 		}
-		b.WriteString(line + "\n")
+		fmt.Fprintln(b, line)
 	}
 }
 
 func (m Model) renderEscalations(b *strings.Builder) {
 	esc := m.data.escalations
 	if len(esc) == 0 {
-		b.WriteString("no pending escalations — the herd is unblocked 🎉\n")
+		fmt.Fprintln(b, "no pending escalations — the herd is unblocked 🎉")
 		return
 	}
 	for i, e := range esc {
-		line := fmt.Sprintf("#%-5d %-8s %-10s agent=%-10s %s",
-			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.AgentID, oneLine(e.Rationale, 60))
+		agent := e.AgentID
+		if n := m.data.status.AgentName(e.AgentID); n != "" {
+			agent = n
+		}
+		line := fmt.Sprintf("#%-5d %-8s %-10s agent=%-14s %s",
+			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, agent, oneLine(e.Rationale, 60))
 		if e.Suggestion != "" {
 			line += "  → " + oneLine(e.Suggestion, 40)
 		}
 		if i == m.cursor {
 			line = selectedStyle.Render(line)
 		}
-		b.WriteString(line + "\n")
+		fmt.Fprintln(b, line)
 	}
 }
 
@@ -363,39 +630,51 @@ func (m Model) renderAudit(b *strings.Builder) {
 		if i == m.cursor {
 			line = selectedStyle.Render(line)
 		}
-		b.WriteString(line + "\n")
+		fmt.Fprintln(b, line)
 	}
 	if len(m.data.audit) == 0 {
-		b.WriteString("no audit records yet\n")
+		fmt.Fprintln(b, "no audit records yet")
 	}
 }
 
 func (m Model) renderRules(b *strings.Builder) {
-	cfg, err := m.app.Config()
-	if err != nil {
-		b.WriteString(errStyle.Render("config error: "+err.Error()) + "\n")
+	if len(m.items) == 0 {
+		fmt.Fprintln(b, "no configuration loaded")
 		return
 	}
-	fmt.Fprintf(b, "thresholds  idle=%.2f approval=%.2f choice=%.2f error=%.2f inferred=%.2f\n",
-		cfg.Thresholds.Idle, cfg.Thresholds.Approval, cfg.Thresholds.Choice,
-		cfg.Thresholds.Error, cfg.Thresholds.InferredTaskBar)
-	fmt.Fprintf(b, "graduation  N=%d consecutive confirmations\n", cfg.Learning.GraduationN)
-	fmt.Fprintf(b, "limits      %d consecutive, %d/minute, %d error retries\n",
-		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries)
-	fmt.Fprintf(b, "llm         configured=%v auto_act=%v timeout=%ds\n",
-		len(cfg.LLM.Command) > 0, cfg.LLM.AutoAct, cfg.LLM.TimeoutSeconds)
-	fmt.Fprintf(b, "\nnever-auto allowlist: %d seed + %d operator patterns\n",
-		len(domain.SeedAllowlistPatterns), len(cfg.Safety.AllowlistPatterns))
-	for _, p := range cfg.Safety.AllowlistPatterns {
-		fmt.Fprintf(b, "  operator: %s\n", p)
+	lastKind := ""
+	for i, item := range m.items {
+		if item.kind != lastKind {
+			lastKind = item.kind
+			switch item.kind {
+			case "field":
+				fmt.Fprintln(b, sectionStyle.Render("Config"))
+			case "pattern":
+				fmt.Fprintf(b, "\n%s\n", sectionStyle.Render(fmt.Sprintf(
+					"Never-auto allowlist (operator patterns; +%d seed)", len(domain.SeedAllowlistPatterns))))
+			case "source":
+				fmt.Fprintf(b, "\n%s\n", sectionStyle.Render("Task sources"))
+			}
+		}
+		line := "  " + item.label
+		if i == m.cursor {
+			line = selectedStyle.Render(line)
+		}
+		fmt.Fprintln(b, line)
 	}
-	b.WriteString(helpStyle.Render("\nedit via CLI: config set-threshold, rules add, task-source — or hand-edit config.toml"))
-	b.WriteString("\n")
+	if len(m.data.cfg.Safety.AllowlistPatterns) == 0 {
+		fmt.Fprintf(b, "\n%s\n", sectionStyle.Render(fmt.Sprintf(
+			"Never-auto allowlist: no operator patterns (+%d seed active) — press a to add",
+			len(domain.SeedAllowlistPatterns))))
+	}
+	if len(m.data.cfg.TaskSources) == 0 {
+		fmt.Fprintf(b, "%s\n", sectionStyle.Render("Task sources: none — press t to add"))
+	}
 }
 
 func (m Model) renderKills(b *strings.Builder) {
 	if len(m.data.kills) == 0 {
-		b.WriteString("no pause/kill events recorded\n")
+		fmt.Fprintln(b, "no pause/kill events recorded")
 		return
 	}
 	for i, e := range m.data.kills {
@@ -404,7 +683,7 @@ func (m Model) renderKills(b *strings.Builder) {
 		if i == m.cursor {
 			line = selectedStyle.Render(line)
 		}
-		b.WriteString(line + "\n")
+		fmt.Fprintln(b, line)
 	}
 }
 
@@ -412,6 +691,13 @@ func oneLine(s string, limit int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	if r := []rune(s); len(r) > limit {
 		return string(r[:limit-1]) + "…"
+	}
+	return s
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
 	}
 	return s
 }

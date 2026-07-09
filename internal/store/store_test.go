@@ -363,6 +363,66 @@ func TestLLMRequestDecisionFlow(t *testing.T) {
 	}
 }
 
+func TestAgentNames(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	// First sight generates a stable adjective-animal name.
+	name, err := s.EnsureAgentName(ctx, "w1:p1")
+	if err != nil || name == "" {
+		t.Fatalf("ensure: %q %v", name, err)
+	}
+	again, err := s.EnsureAgentName(ctx, "w1:p1")
+	if err != nil || again != name {
+		t.Fatalf("ensure must be idempotent: %q vs %q (%v)", again, name, err)
+	}
+
+	// A second agent gets a different name.
+	other, _ := s.EnsureAgentName(ctx, "w2:p1")
+	if other == name {
+		t.Fatalf("distinct agents must get distinct names, both %q", name)
+	}
+
+	// Rename by current name, then by agent id.
+	if err := s.RenameAgent(ctx, name, "builder"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.EnsureAgentName(ctx, "w1:p1")
+	if got != "builder" {
+		t.Fatalf("rename lost: %q", got)
+	}
+	if err := s.RenameAgent(ctx, "w1:p1", "reviewer"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resolution: short name → agent id; unknown targets pass through.
+	if id, _ := s.ResolveAgent(ctx, "reviewer"); id != "w1:p1" {
+		t.Errorf("resolve by name = %q", id)
+	}
+	if id, _ := s.ResolveAgent(ctx, "w9:p9"); id != "w9:p9" {
+		t.Errorf("unknown target should pass through, got %q", id)
+	}
+
+	// Uniqueness and validation.
+	if err := s.RenameAgent(ctx, "w2:p1", "reviewer"); err == nil {
+		t.Error("duplicate name must be rejected")
+	}
+	if err := s.RenameAgent(ctx, "w2:p1", "Bad Name!"); err == nil {
+		t.Error("invalid name must be rejected")
+	}
+	if err := s.RenameAgent(ctx, "nonexistent-agent-name-xyz", "x"); err == nil {
+		t.Error("renaming an unknown-but-valid target creates a mapping only for pane-id-like targets; a bogus name target must not silently invent an agent")
+	}
+
+	names, err := s.AgentNames(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names["w1:p1"] != "reviewer" || names["w2:p1"] != other {
+		t.Errorf("names map: %v", names)
+	}
+}
+
 func TestClearLearnedData(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

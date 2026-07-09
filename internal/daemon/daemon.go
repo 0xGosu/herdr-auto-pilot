@@ -238,6 +238,14 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		return
 	}
 
+	// Auto-generate a short friendly name on first sight; operators use it
+	// for task-source config and renames (insert-if-absent, so operator
+	// renames are never clobbered).
+	agentName, err := d.opt.Store.EnsureAgentName(ctx, tr.AgentID)
+	if err != nil {
+		slog.Warn("agent name generation failed", "agent", tr.AgentID, "error", err)
+	}
+
 	pane, err := d.opt.Herdr.ReadPane(ctx, tr.PaneID, d.opt.PaneReadLines)
 	if err != nil {
 		// Herdr unreachable / pane read failure: no automated action, log,
@@ -290,7 +298,7 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		Now:                   now,
 		RetryCount:            retries,
 		MaxRetries:            cfg.Limits.MaxErrorRetries,
-		DeclaredTask:          d.declaredTask(cfg, tr),
+		DeclaredTask:          d.declaredTask(cfg, tr, agentName),
 		LLMConfigured:         d.llmPort() != nil && d.llmPort().Configured(),
 		AllowlistHit:          allowPattern,
 		AllowlistMatched:      allowMatched,
@@ -394,7 +402,7 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		learned = dec.OptionID
 	case s.Type == domain.SituationIdle:
 		// idle actions are learned symbolically
-		if d.declaredTaskFor(s) != "" {
+		if d.declaredTaskFor(ctx, s) != "" {
 			learned = domain.ActionNextDeclaredTask
 		} else {
 			learned = domain.ActionNextInferredTask
@@ -456,7 +464,11 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		}
 	}
 
-	title := fmt.Sprintf("Agent %s needs attention", s.AgentID)
+	agentLabel := s.AgentID
+	if name, err := d.opt.Store.EnsureAgentName(ctx, s.AgentID); err == nil && name != "" {
+		agentLabel = fmt.Sprintf("%s (%s)", name, s.AgentID)
+	}
+	title := fmt.Sprintf("Agent %s needs attention", agentLabel)
 	body := fmt.Sprintf("%s situation escalated (%s).", s.Type, dec.Reason)
 	if dec.Suggestion != "" {
 		body += " Suggestion: " + dec.Suggestion
@@ -802,9 +814,12 @@ func (d *Daemon) registerHumanInteraction(ctx context.Context, agentID string) {
 }
 
 // declaredTask resolves the operator-declared next task for a transition.
-func (d *Daemon) declaredTask(cfg config.Config, tr domain.AgentTransition) string {
+// A task source's agent selector matches the agent/pane id, the agent type,
+// or the agent's short name.
+func (d *Daemon) declaredTask(cfg config.Config, tr domain.AgentTransition, agentName string) string {
 	for _, src := range cfg.TaskSources {
-		if src.Agent != "" && src.Agent != tr.AgentID && src.Agent != tr.AgentType {
+		if src.Agent != "" && src.Agent != tr.AgentID && src.Agent != tr.AgentType &&
+			(agentName == "" || src.Agent != agentName) {
 			continue
 		}
 		if src.Workspace != "" && src.Workspace != tr.WorkspaceID {
@@ -822,11 +837,15 @@ func (d *Daemon) declaredTask(cfg config.Config, tr domain.AgentTransition) stri
 	return ""
 }
 
-func (d *Daemon) declaredTaskFor(s domain.Situation) string {
+func (d *Daemon) declaredTaskFor(ctx context.Context, s domain.Situation) string {
 	cfg, _, _ := d.snapshot()
+	name, err := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
+	if err != nil {
+		name = ""
+	}
 	return d.declaredTask(cfg, domain.AgentTransition{
 		AgentID: s.AgentID, AgentType: s.AgentType, WorkspaceID: s.WorkspaceID,
-	})
+	}, name)
 }
 
 func (d *Daemon) audit(ctx context.Context, rec domain.AuditRecord) {

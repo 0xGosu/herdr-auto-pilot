@@ -64,6 +64,9 @@ type DaemonStore interface {
 	UpsertErrorRetry(ctx context.Context, e domain.ErrorRetry) error
 	ResetErrorRetry(ctx context.Context, errorSignature string) error
 	MarkCorrectionProcessed(ctx context.Context, id int64) error
+	// EnsureAgentName returns the agent's short name, generating one on
+	// first sight (insert-if-absent only; renames stay operator-owned).
+	EnsureAgentName(ctx context.Context, agentID string) (string, error)
 	StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64, error)
 	UpdateLLMRequestStatus(ctx context.Context, requestID, status string) error
 	UpdateLLMDecisionStatus(ctx context.Context, id int64, status string) error
@@ -75,6 +78,9 @@ type FrontendStore interface {
 
 	InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error)
 	InsertKillEvent(ctx context.Context, e domain.KillEvent) (int64, error)
+	// RenameAgent gives an agent a new operator-chosen short name; target
+	// may be the current name or the agent/pane id.
+	RenameAgent(ctx context.Context, target, newName string) error
 	ClearLearnedData(ctx context.Context) error
 }
 
@@ -99,6 +105,10 @@ type ReadStore interface {
 	GetErrorRetry(ctx context.Context, errorSignature string) (*domain.ErrorRetry, error)
 	PendingLLMDecisions(ctx context.Context) ([]domain.LLMDecision, error)
 	LLMDecisionByRequest(ctx context.Context, requestID string) (*domain.LLMDecision, error)
+	// AgentNames returns every agent id → short name mapping.
+	AgentNames(ctx context.Context) (map[string]string, error)
+	// ResolveAgent maps a short name or agent/pane id to the agent id.
+	ResolveAgent(ctx context.Context, target string) (string, error)
 }
 
 // Clock abstracts time for deterministic tests.

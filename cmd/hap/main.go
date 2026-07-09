@@ -37,7 +37,8 @@ Core:
 
 Operate:
   status                automation state, pending escalations, agents
-  agents                list monitored agents
+  agents                list monitored agents (short name, id, type, status)
+  rename <agent> <name> give an agent a short name (used by task sources)
   escalations           list pending escalations
   confirm <id> [--send]         confirm an escalation's suggested action
   resolve <id> --action TEXT [--send]   record the correct action (post-hoc correction)
@@ -46,9 +47,9 @@ Operate:
   kill-history          pause/kill event history
 
 Configure:
-  config [show|set-threshold <situation> <value>]
-  rules [list|add <regex>]          never-auto allowlist
-  task-source [--agent A] [--workspace W] <checklist.md>
+  config [show|fields|set <field> <value>|set-threshold <situation> <value>]
+  rules [list|add <regex>|remove <index>]      never-auto allowlist
+  task-source [add] [--agent A] [--workspace W] <checklist.md> | list | remove <index>
   clear-data --yes      reset learned history + audit data
 
   version               print version
