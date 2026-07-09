@@ -9,11 +9,13 @@ package tui
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -69,6 +71,15 @@ type prompt struct {
 	onSubmit func(string) tea.Cmd
 }
 
+// detailView is a full-record overlay opened with `v` on the Agents,
+// Escalations, and Audit tabs, showing the selected row untruncated.
+type detailView struct {
+	title  string
+	lines  []string                 // wrapped to the pane width at open/resize
+	offset int                      // first visible line (↑/↓ scroll)
+	build  func(width int) []string // rebuilds lines from the snapshot on resize
+}
+
 // ruleItem is one navigable row of the Rules tab.
 type ruleItem struct {
 	kind  string // "field" | "pattern" | "source"
@@ -89,6 +100,7 @@ type Model struct {
 	items   []ruleItem // Rules tab rows, rebuilt on refresh
 	message string
 	prompt  *prompt
+	detail  *detailView
 	width   int
 	height  int
 }
@@ -171,6 +183,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		if m.detail != nil && m.detail.build != nil {
+			m.detail.lines = m.detail.build(m.wrapWidth())
+			m.detail.offset = min(m.detail.offset, max(0, len(m.detail.lines)-m.detailPageSize()))
+		}
 		return m, nil
 	case refreshMsg:
 		m.data = msg
@@ -195,6 +211,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.detail != nil {
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "up", "k":
+			if m.detail.offset > 0 {
+				m.detail.offset--
+			}
+		case "down", "j":
+			if m.detail.offset < max(0, len(m.detail.lines)-m.detailPageSize()) {
+				m.detail.offset++
+			}
+		case "esc", "q", "v", "enter":
+			m.detail = nil
+		}
+		return m, nil
+	}
+
 	if m.prompt != nil {
 		switch msg.Type {
 		case tea.KeyCtrlC:
@@ -274,6 +308,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.tab == tabAgents {
 			return m.renameSelected()
 		}
+	case "v":
+		return m.viewSelected()
 	case "a":
 		if m.tab == tabRules {
 			return m.addPatternPrompt()
@@ -393,6 +429,158 @@ func (m Model) renameSelected() (tea.Model, tea.Cmd) {
 		},
 	}
 	return m, nil
+}
+
+// --- Detail view (v) ---
+
+// viewSelected opens a full-record overlay for the selected row. The record
+// is snapshotted at open time; the build closure re-wraps it on resize.
+func (m Model) viewSelected() (tea.Model, tea.Cmd) {
+	switch m.tab {
+	case tabAgents:
+		if m.cursor < len(m.data.status.MonitoredAgents) {
+			a := m.data.status.MonitoredAgents[m.cursor]
+			build := func(width int) []string { return m.agentDetailLines(a, width) }
+			m.message = ""
+			m.detail = &detailView{
+				title: fmt.Sprintf("Agent %s", a.AgentID),
+				lines: build(m.wrapWidth()),
+				build: build,
+			}
+		}
+	case tabEscalations, tabAudit:
+		if rec := m.selectedAudit(); rec != nil {
+			kind := "Audit record"
+			if m.tab == tabEscalations {
+				kind = "Escalation"
+			}
+			r := *rec
+			build := func(width int) []string { return m.auditDetailLines(r, width) }
+			m.message = ""
+			m.detail = &detailView{
+				title: fmt.Sprintf("%s #%d", kind, r.ID),
+				lines: build(m.wrapWidth()),
+				build: build,
+			}
+		}
+	}
+	return m, nil
+}
+
+// detailPageSize is how many detail lines fit under the header and help:
+// header title + tabs + blank (3), detail title + blank (2), the more-lines
+// indicator (1), and blank + help (2) — plus the error line when present.
+func (m Model) detailPageSize() int {
+	if m.height <= 0 {
+		return 20
+	}
+	chrome := 8
+	if m.data.err != nil {
+		chrome++
+	}
+	return max(1, m.height-chrome)
+}
+
+// wrapWidth is the text width for the detail view.
+func (m Model) wrapWidth() int {
+	if m.width <= 0 {
+		return 76
+	}
+	return max(40, m.width-4)
+}
+
+// detailField appends a labelled, wrapped block; empty values are skipped.
+func detailField(lines []string, width int, label, value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return lines
+	}
+	lines = append(lines, sectionStyle.Render(label))
+	for _, ln := range wrapText(value, width) {
+		lines = append(lines, "  "+ln)
+	}
+	return lines
+}
+
+func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
+	var lines []string
+	lines = detailField(lines, w, "Short name", orDash(m.data.status.AgentName(a.AgentID)))
+	lines = detailField(lines, w, "Agent id", a.AgentID)
+	lines = detailField(lines, w, "Pane", a.PaneID)
+	lines = detailField(lines, w, "Workspace", a.WorkspaceID)
+	lines = detailField(lines, w, "Type", a.AgentType)
+	lines = detailField(lines, w, "Status", a.Status)
+	if !a.At.IsZero() {
+		lines = detailField(lines, w, "Last transition", a.At.Format(time.RFC3339))
+	}
+	return lines
+}
+
+func (m Model) auditDetailLines(r domain.AuditRecord, w int) []string {
+	var lines []string
+	agent := r.AgentID
+	if n := m.data.status.AgentName(r.AgentID); n != "" {
+		agent = fmt.Sprintf("%s (%s)", n, r.AgentID)
+	}
+	lines = detailField(lines, w, "When", r.CreatedAt.Format(time.RFC3339))
+	lines = detailField(lines, w, "Status", r.Status)
+	lines = detailField(lines, w, "Situation", string(r.SituationType))
+	lines = detailField(lines, w, "Agent", agent)
+	lines = detailField(lines, w, "Confidence", fmt.Sprintf("%.2f", r.Confidence))
+	lines = detailField(lines, w, "Trigger", r.Trigger)
+	lines = detailField(lines, w, "Suggestion", r.Suggestion)
+	lines = detailField(lines, w, "Action", r.Action)
+	lines = detailField(lines, w, "Input", r.Input)
+	lines = detailField(lines, w, "Rationale", r.Rationale)
+	lines = detailField(lines, w, "LLM output", r.LLMOutput)
+	lines = detailField(lines, w, "Signature", r.Signature)
+	if r.DecisionID != 0 {
+		lines = detailField(lines, w, "Decision id", fmt.Sprintf("%d", r.DecisionID))
+	}
+	if r.CorrectsAuditID != 0 {
+		lines = detailField(lines, w, "Corrects audit", fmt.Sprintf("#%d", r.CorrectsAuditID))
+	}
+	return lines
+}
+
+// ansiEscape matches CSI/OSC/charset-designation terminal escape sequences
+// so raw CLI output (the LLM output field) cannot restyle or reposition the
+// pane; controlChars then strips any leftover C0 controls (except newline).
+var (
+	ansiEscape   = regexp.MustCompile(`\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()#][0-9A-Za-z]|\x1b[@-_]`)
+	controlChars = regexp.MustCompile("[\x00-\x08\x0b-\x1f\x7f]")
+)
+
+// wrapText wraps s at width display cells, preserving existing newlines.
+// Escape sequences, carriage returns, and tabs are sanitized first: values
+// can be verbatim subprocess output that would otherwise overprint the
+// screen. Cell-width wrapping (not rune count) keeps wide runes (CJK,
+// emoji) from overflowing the pane and breaking the row budget.
+func wrapText(s string, width int) []string {
+	if width < 1 {
+		width = 1
+	}
+	s = ansiEscape.ReplaceAllString(s, "")
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = strings.ReplaceAll(s, "\t", "    ")
+	s = controlChars.ReplaceAllString(s, "")
+	var out []string
+	for _, ln := range strings.Split(s, "\n") {
+		cur := make([]rune, 0, width)
+		cells := 0
+		for _, r := range ln {
+			w := runewidth.RuneWidth(r)
+			if cells+w > width && len(cur) > 0 {
+				out = append(out, string(cur))
+				cur = cur[:0]
+				cells = 0
+			}
+			cur = append(cur, r)
+			cells += w
+		}
+		out = append(out, string(cur))
+	}
+	return out
 }
 
 // --- Rules tab editing ---
@@ -545,6 +733,11 @@ func (m Model) View() string {
 		fmt.Fprintf(&b, "%s\n", errStyle.Render("error: "+m.data.err.Error()))
 	}
 
+	if m.detail != nil {
+		m.renderDetail(&b)
+		return b.String()
+	}
+
 	switch m.tab {
 	case tabAgents:
 		m.renderAgents(&b)
@@ -569,18 +762,37 @@ func (m Model) View() string {
 }
 
 func (m Model) helpLine() string {
+	if m.detail != nil {
+		return "↑/↓: scroll  esc/q/v: close"
+	}
 	common := "tab: switch  ↑/↓: select  p: pause  r: resume  q: quit"
 	switch m.tab {
 	case tabAgents:
-		return "n: rename agent  " + common
+		return "v: details  n: rename agent  " + common
 	case tabEscalations:
-		return "enter/y: confirm+send  c: correct  " + common
+		return "enter/y: confirm+send  c: correct  v: details  " + common
 	case tabAudit:
-		return "c: correct decision  " + common
+		return "c: correct decision  v: details  " + common
 	case tabRules:
 		return "enter/e: edit field  a: add pattern  t: add task source  x: remove  X: clear data  " + common
 	}
 	return common
+}
+
+// renderDetail draws the open detail overlay in place of the tab body.
+func (m Model) renderDetail(b *strings.Builder) {
+	fmt.Fprintf(b, "%s\n\n", titleStyle.Render(m.detail.title))
+	page := m.detailPageSize()
+	lines := m.detail.lines
+	start := min(m.detail.offset, max(0, len(lines)-1))
+	end := min(start+page, len(lines))
+	for _, ln := range lines[start:end] {
+		fmt.Fprintln(b, ln)
+	}
+	if end < len(lines) {
+		fmt.Fprintf(b, "%s\n", helpStyle.Render(fmt.Sprintf("… %d more line(s) — ↓ to scroll", len(lines)-end)))
+	}
+	fmt.Fprintf(b, "\n%s", helpStyle.Render(m.helpLine()))
 }
 
 func (m Model) renderAgents(b *strings.Builder) {
