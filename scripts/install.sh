@@ -38,9 +38,19 @@ BASE="https://github.com/${SLUG}/releases/download/v${VERSION}"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+# Right after a version bump lands, the release workflow may still be
+# uploading assets for a couple of minutes; retry patiently (curl treats
+# 404/5xx during that window as retryable with --retry-all-errors) instead
+# of failing the install on the publish gap.
+fetch() {
+  curl -fsSL --retry 6 --retry-delay 10 --retry-all-errors -o "$1" "$2" ||
+    fail "download failed: $2
+(if the v${VERSION} release was published in the last few minutes, its assets may still be uploading — retry shortly)"
+}
 echo "fetching ${BASE}/${ASSET}"
-curl -fsSL --retry 2 -o "${TMP}/${ASSET}" "${BASE}/${ASSET}" || fail "download failed: ${BASE}/${ASSET}"
-curl -fsSL --retry 2 -o "${TMP}/SHA256SUMS" "${BASE}/SHA256SUMS" || fail "download failed: ${BASE}/SHA256SUMS"
+fetch "${TMP}/${ASSET}" "${BASE}/${ASSET}"
+fetch "${TMP}/SHA256SUMS" "${BASE}/SHA256SUMS"
 
 # Verify the checksum with whichever tool this platform has.
 if command -v sha256sum >/dev/null 2>&1; then
