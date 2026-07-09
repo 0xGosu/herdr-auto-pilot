@@ -30,7 +30,9 @@ var SeedAllowlistPatterns = []string{
 	`(?i)chmod\s+-R\s+777`,
 	// Databases
 	`(?i)\bDROP\s+(TABLE|DATABASE|SCHEMA|INDEX)\b`,
-	`(?i)\bTRUNCATE\s+(TABLE)?\b`,
+	// TABLE required: an optional group would make this match everyday
+	// "truncate the log line" prompts.
+	`(?i)\bTRUNCATE\s+TABLE\b`,
 	`(?im)\bDELETE\s+FROM\s+[\w."]+\s*;?\s*$`,
 	`(?i)\bFLUSHALL\b|\bFLUSHDB\b`,
 	// Deploy / publish / release
@@ -61,12 +63,31 @@ var SeedAllowlistPatterns = []string{
 // SeedIrreversibleIndicators back the suspected-irreversible-but-unmatched
 // heuristic (FR-016): destructive-operation indicators that, present in a
 // prompt with no allowlist match, bias the plugin toward escalation.
+//
+// A hit escalates unconditionally, so every indicator needs corroboration:
+// a bare verb like "remove" or "drop" appears in everyday refactoring
+// prompts ("remove the unused import") and must not trip the heuristic on
+// its own — only paired with a data/infrastructure target, no-undo
+// language, or a force/credential/production context.
 var SeedIrreversibleIndicators = []string{
-	`(?i)\b(delete|destroy|remove|erase|wipe|purge|drop|truncate|revoke|rotate)\b`,
-	`(?i)\b(force|forcibly|permanent(ly)?|irreversibl[ey]|unrecoverabl[ey]|cannot be undone|can't be undone|no undo)\b`,
-	`(?i)\b(deploy|publish|release|push)\b[^\n]*\b(prod|production|live|public)\b`,
-	`(?i)\b(overwrite|clobber|discard)\b[^\n]*\b(changes|data|history|work)\b`,
-	`(?i)\bare you (absolutely )?sure\b`,
+	// Explicit no-undo language — strong enough to stand alone.
+	`(?i)\birreversibl[ey]\b|\bunrecoverabl[ey]\b|\bcannot\s+be\s+(undone|recovered|restored|reversed|reverted)\b|\bcan't\s+be\s+undone\b|\bno\s+undo\b|\blost\s+forever\b|\b(is|are)\s+permanent\b`,
+	`(?i)\bare\s+you\s+absolutely\s+sure\b`,
+	// Destructive verb aimed at a data/infrastructure target. (?s) with a
+	// bounded bridge: confirmations often put the verb and its target on
+	// different lines ("Delete the following?\n - production backups").
+	`(?is)\b(delet(e[sd]?|ing)|destroy(s|ed|ing)?|remov(e[sd]?|ing)|eras(e[sd]?|ing)|wip(e[sd]?|ing)|purg(e[sd]?|ing)|drop(s|ped|ping)?|truncat(e[sd]?|ing))\b.{0,120}?\b(databases?|tables?|schemas?|backups?|snapshots?|buckets?|volumes?|partitions?|disks?|prod(uction)?|(user|customer|all)\s+data|records?|history|repositor(y|ies)|accounts?)\b`,
+	`(?i)\bpermanently\s+(delet|destroy|remov|eras|wip|purg|discard)`,
+	// Forced overwrites/removals (force-push itself is allowlisted).
+	`(?i)\bforc(e|ed|ibly)\b[^\n]*\b(overwrit|delet|remov|push)`,
+	// Credential / access invalidation.
+	`(?i)\b(revok|rotat|invalidat|regenerat)(e[sd]?|ing|ion)\b[^\n]*\b(access|keys?|tokens?|cert(ificate)?s?|credentials?|secrets?|sessions?|passwords?)\b`,
+	// Shipping to shared/production surfaces.
+	`(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing)|push(es|ed|ing)?)\b[^\n]*\b(prod|production|live|public)\b`,
+	// Discarding work.
+	`(?i)\b(overwrit(e[sd]?|ing)|clobber(s|ed|ing)?|discard(s|ed|ing)?)\b[^\n]*\b(changes|data|history|work)\b`,
+	// A confirmation that itself names a destructive act.
+	`(?is)\bare\s+you\s+sure\b.{0,120}?\b(delet|remov|eras|wip|purg|discard|overwrit|destroy|drop|reset)`,
 }
 
 // Allowlist is the compiled never-auto matcher plus the suspected-

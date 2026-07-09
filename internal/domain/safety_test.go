@@ -61,6 +61,7 @@ func TestAllowlistDoesNotMatchBenignPrompts(t *testing.T) {
 		"Apply the suggested refactor to the config loader?",
 		"Run git status and show the diff?",
 		"Commit the staged changes with message 'fix: handle nil input'?",
+		"Truncate the log line to 80 characters?",
 	}
 	for _, p := range benign {
 		if pat, ok := a.Match(p); ok {
@@ -92,14 +93,46 @@ func TestSuspectedIrreversibleHeuristic(t *testing.T) {
 		"This will permanently erase the workspace metadata. Continue?",
 		"Overwrite the existing changes and discard local work?",
 		"This action cannot be undone. Proceed?",
+		"Delete all rows from the users table?",
+		"This wipes the database and restores factory defaults.",
+		"Revoke the API tokens for the staging tenant?",
+		"Are you sure you want to delete these branches?",
+		"Are you absolutely sure?",
+		"Force overwrite the remote copy?",
+		"Publish the package to the public registry?",
+		"Removing the backups frees 2GB. Continue?",
+		"This wipes the databases for every tenant.",
+		"Drop all tables and re-run the migration?",
+		"Delete the user accounts flagged as spam?",
+		"This change is permanent and cannot be reversed.",
+		"Delete the following?\n  - production database backups",
 	}
 	for _, p := range suspicious {
 		if !a.SuspectedIrreversible(p) {
 			t.Errorf("expected suspected-irreversible for %q", p)
 		}
 	}
-	if a.SuspectedIrreversible("Run the formatter on the changed files?") {
-		t.Error("benign prompt should not trip the heuristic")
+
+	// Everyday coding prompts contain destructive-sounding verbs; bare
+	// verbs without a destructive target must NOT trip the heuristic
+	// (operator-reported false alarms).
+	benign := []string{
+		"Run the formatter on the changed files?",
+		"Do you want to remove the unused import?",
+		"Drop the extra parameter from the function signature?",
+		"Delete the commented-out block in parser.go?",
+		"Rotate the image 90 degrees before saving the thumbnail?",
+		"Force the type assertion here instead of reflection?",
+		"Should I push the branch and open a pull request?",
+		"Are you sure you want to continue?",
+		"Purge the memoization cache entry after each test?",
+		"Truncate the log line to 80 characters?",
+		"Erase the whiteboard diagram from the README?",
+	}
+	for _, p := range benign {
+		if a.SuspectedIrreversible(p) {
+			t.Errorf("benign prompt should not trip the heuristic: %q", p)
+		}
 	}
 }
 
