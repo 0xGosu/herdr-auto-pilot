@@ -1,0 +1,6 @@
+$ go build ./...
+# github.com/example/app/server
+server/handler.go:42:15: undefined: parseRequest
+ERROR: build failed with exit code 1
+
+The build failed. Retry, skip, or abort?

@@ -1,58 +1,172 @@
-# [Project Name]
+# Herd Auto Prompter
 
-Project description goes here.
+**Keep your [Herdr](https://herdr.dev) coding agents unblocked, hands-free.**
 
-## Setup Guidelines
+Herd Auto Prompter is a Herdr plugin that watches every agent session in your
+herd, detects when an agent needs input — finished a step, waiting on an
+approval, stuck on a multiple-choice question, or stalled on an error — and
+automatically supplies the next prompt or the correct response, *the way you
+would*. It learns from your own past decisions in a supervised shadow mode,
+acts autonomously only when its confidence clears your thresholds, and
+escalates to you when it isn't sure. Everything it does is audited and
+correctable.
 
-This template supports two different project setups. Choose the one that fits your needs:
+- **Learned, not guessed** — every automated choice traces back to your own
+  confirmed decisions.
+- **Confidence-gated** — below the per-situation threshold it escalates, never
+  guesses.
+- **Safety first** — a never-auto allowlist (force-push, destructive ops,
+  deploys, credential changes, …), a global pause/kill switch, a runaway-loop
+  guard, and an error-retry ceiling all veto automation.
+- **Fully local** — learning data, history, and the audit log live in SQLite
+  on your machine. No telemetry, no cloud calls.
 
-### Single Project Setup
+## Quickstart
 
-For standalone applications or single-purpose projects:
+Requires: Herdr ≥ 0.7.0 and a Go ≥ 1.24 toolchain (the plugin builds from
+source on install).
 
-- Use **[src/](src/)** for your main application code
-- The **[packages/](packages/)** and **[projects/](projects/)** directories are **not needed** and can be removed
-- All documentation directories ([docs/](docs/)) remain relevant
-- Keep [scripts/](scripts/) and [test/](test/) for development workflows
+```sh
+herdr plugin install 0xGosu/herdr-auto-pilot
+```
 
-### Monorepo Setup
+Pin a release (recommended for reproducible installs), or install
+non-interactively:
 
-For managing multiple related projects or shared packages:
+```sh
+herdr plugin install 0xGosu/herdr-auto-pilot --ref v0.1.0
+herdr plugin install 0xGosu/herdr-auto-pilot --yes
+```
 
-- Use **[packages/](packages/)** for shared libraries and reusable modules
-- Use **[projects/](projects/)** for individual applications or sub-projects
-- Each package/project can have its own [src/](src/), tests, and configuration
-- The root **[src/](src/)** directory may not be needed in this setup
-- All documentation and development directories remain relevant
+That's it. The monitoring daemon starts automatically when an agent appears in
+the herd, and the **Auto Prompter** pane (TUI) is available from Herdr's pane
+commands. Everything the TUI does is also a CLI verb on the same binary:
 
-## Directory Structure
+```sh
+bin/herd-auto-prompter status         # from the plugin dir, or put it on PATH
+bin/herd-auto-prompter escalations
+bin/herd-auto-prompter pause          # global kill switch
+```
 
-This project follows a structured organization to maintain clarity and separation of concerns:
+## How it learns (shadow mode)
 
-### Source Code
+The plugin never acts on a situation it hasn't learned from you.
 
-- **[src/](src/)** - Main source code directory containing the application implementation and unit tests (unit tests are recommended to be co-located with the source code)
+1. **Observe.** When an agent needs input, the plugin classifies the
+   situation (idle / approval / choice / error), fingerprints it into a
+   *situation signature* (volatile stuff like paths, hashes, and timestamps
+   is masked), and — in shadow mode — **escalates with a suggestion**.
+2. **Confirm or correct.** In the TUI's *Escalations* tab press `enter` to
+   confirm the suggestion (and send it), or `c` to type the correct
+   response. From the CLI: `confirm <id> --send` or
+   `resolve <id> --action TEXT --send`.
+3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
+   *and* confidence above the per-situation threshold, that signature becomes
+   autonomous: next time, the plugin acts on its own and logs it.
+4. **Stay in control.** Correct any automated decision post-hoc (TUI *Audit*
+   tab or `resolve <audit-id> --action ...`). A correction demotes the
+   signature back to shadow mode — it must re-earn your trust.
 
-### Packages & Dependencies
+## Configuration
 
-- **[packages/](packages/)** - Internal packages and reusable modules
-- **[submodule/github.com/](submodule/github.com/)** - External GitHub submodules and third-party dependencies (can be removed if not needed)
+Config lives in the plugin config dir (`herdr plugin config-dir
+herd-auto-prompter`) as hand-editable TOML; edits apply live (the daemon is
+nudged, or picks them up on the next event).
 
-### Documentation
+```toml
+[thresholds]
+idle = 0.75
+approval = 0.80
+choice = 0.80
+error = 0.85
+inferred_task_bar = 0.90   # higher bar for tasks inferred from pane history
 
-- **[docs/goals/](docs/goals/)** - Project goals, objectives, and success metrics
-- **[docs/prd/](docs/prd/)** - Product Requirements Documents (PRDs) defining features and functionality
-- **[docs/specs/](docs/specs/)** - Technical specifications and detailed design documents
-- **[docs/plans/](docs/plans/)** - Implementation plans and project roadmaps
-- **[docs/analyst/](docs/analyst/)** - Business analysis, requirements analysis, and data insights
-- **[docs/architect/](docs/architect/)** - Architecture designs, system diagrams, and technical decisions
-- **[docs/designer/](docs/designer/)** - UI/UX designs, mockups, and design specifications for frontend projects (can be removed if not needed)
+[learning]
+graduation_n = 5           # consecutive confirmations to graduate
 
-### Development
+[limits]
+max_consecutive_auto_prompts = 5   # per agent, without human interaction
+max_auto_prompts_per_minute = 10   # per agent
+max_error_retries = 2              # per error signature
 
-- **[scripts/](scripts/)** - Utility scripts for build, deployment, and automation tasks
-- **[test/](test/)** - Test files including integration tests, E2E tests, and test utilities. Unit tests are not included
+# Point agents/workspaces at a task list so idle agents get the next
+# unchecked item. Without a declared source, the plugin only infers a next
+# task from an explicit checklist the agent itself printed — never free-form
+# prose — and holds it to the higher inferred_task_bar.
+[[task_sources]]
+agent = ""            # agent id/name/type ("" = any)
+workspace = ""        # workspace id ("" = any)
+path = "/home/me/project/docs/tasks.md"
+```
 
-### Projects
+### Never-auto allowlist
 
-- **[projects/](projects/)** - Sub-projects, standalone modules, or related project components
+Irreversible operations are **never** automated, regardless of confidence.
+The shipped seed covers force-pushes, destructive filesystem/database ops,
+deploys/publishes, credential changes, and more — and is regression-tested in
+CI against a maintained corpus of irreversible-operation prompts
+(`internal/domain/testdata/irreversible_corpus.txt`). Extend it with your own
+regex patterns:
+
+```toml
+[safety]
+allowlist_patterns = ['(?i)restart\s+the\s+payment\s+service']
+```
+
+or `herd-auto-prompter rules add '<regex>'`. Prompts that *look* destructive
+but match no pattern are escalated by a suspected-irreversible heuristic
+rather than automated.
+
+### Local LLM fallback (optional)
+
+When no confident learned rule applies, the plugin can consult a local
+LLM/agent CLI you already have installed. The model receives context and
+submits its suggestion through the plugin's own MCP server
+(`herd-auto-prompter mcp` — tools `get_context` and `submit_decision`); its
+stdout is captured for audit only. Example for Claude Code:
+
+```toml
+[llm]
+command = [
+  "claude", "-p",
+  "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
+  "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
+  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
+]
+timeout_seconds = 60
+auto_act = false   # false: LLM suggestions are surfaced for your confirmation
+```
+
+Placeholders: `{self}` (this plugin binary), `{request_id}`, `{db}`,
+`{control}`. Every LLM suggestion is re-gated through the same allowlist,
+kill switch, and rate guards; with `auto_act = true` it may act only when it
+doesn't contradict your learned history. On timeout or no submission the
+situation escalates.
+
+## Pause/kill switch & audit
+
+- `pause` / `resume` (CLI, TUI `p`/`r`, or Herdr plugin actions) toggle a
+  global kill switch. It takes effect within a second — the daemon re-reads
+  the latest kill event on every decision — and the full pause/resume history
+  is kept for audit.
+- Every automated action **and** every escalation writes an audit record:
+  trigger, situation, action or escalation reason, confidence, rationale, and
+  (for LLM decisions) captured output. `audit` / the *Audit* tab shows it;
+  corrections keep their lineage to the original decision.
+- `clear-data --yes` resets all learned history and audit data (it never
+  leaves your machine in the first place).
+
+## Development
+
+```sh
+go build ./...        # build
+go test ./...         # unit, golden, safety-invariant, concurrency, integration
+herdr plugin link .   # develop against your local checkout (build bin/ first)
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The specification this plugin
+implements lives in [`docs/specs/herd-auto-prompter/`](docs/specs/herd-auto-prompter/).
+
+## License
+
+[MIT](LICENSE)

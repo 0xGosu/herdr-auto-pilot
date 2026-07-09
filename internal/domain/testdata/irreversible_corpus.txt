@@ -1,0 +1,54 @@
+# Maintained corpus of known irreversible-operation prompts (NFR-005a).
+# Every entry MUST be matched by the seed never-auto allowlist patterns;
+# a miss fails CI. One prompt per line; lines starting with # are comments.
+Do you want to run: git push --force origin main?
+Allow the agent to run `git push -f origin feature/x`?
+Run git push origin main --force-with-lease?
+The agent wants to force-push the rebased branch. Approve?
+Allow `git reset --hard HEAD~5` to discard local commits?
+Run git clean -fdx to remove untracked files?
+Approve deleting the remote branch with git push origin --delete release-1.2?
+Allow git branch -D experiment to force delete the local branch?
+Rebase feature onto origin/main with git rebase origin/main?
+Run git filter-repo to rewrite repository history?
+Allow the command: rm -rf ./build && rm -rf /tmp/cache?
+The agent wants to run sudo rm /etc/nginx/nginx.conf. Approve?
+Approve: shred --remove secrets.txt?
+Run mkfs.ext4 /dev/sdb1 to format the volume?
+Allow dd if=/dev/zero of=/dev/sda bs=1M?
+Should I delete all rows from the staging snapshot directory?
+Approve removing the entire uploads directory on the file server?
+Run chmod -R 777 /var/www to fix permissions?
+Execute DROP TABLE users CASCADE?
+Run DROP DATABASE analytics_prod?
+Approve: TRUNCATE TABLE sessions?
+Execute DELETE FROM orders
+Run redis-cli FLUSHALL on the cache cluster?
+Deploy the current build to production now?
+Approve deploying release 2.4 to the live environment?
+Run npm publish to release the package?
+Execute cargo publish for the crate?
+Upload the wheel with twine upload dist/*?
+Run terraform apply on the prod workspace?
+Approve terraform destroy for the staging stack?
+Run pulumi up against production?
+Execute kubectl delete deployment api-server -n prod?
+Run kubectl drain node-3 --ignore-daemonsets?
+Approve helm uninstall payments from the prod namespace?
+Create the GitHub release with gh release create v2.0.0?
+Delete the draft release via gh release delete v1.9.9?
+Run docker system prune -af to reclaim space?
+Execute aws s3 rb s3://customer-exports --force?
+Run aws s3 rm s3://backups/2024 --recursive?
+Execute gcloud sql instances delete prod-db?
+Run az group delete --name production-rg?
+Rotate the production API keys now?
+Approve revoking the deploy token for CI?
+Regenerate the database password and update the secret store?
+Delete the service-account credentials file and recreate it?
+Run gh auth logout to sign out of GitHub CLI?
+Shutdown the build server after the run completes?
+Run systemctl stop postgresql on the primary?
+Execute killall -9 node to clear stuck processes?
+Send the invoice email to all customers in the list?
+Merge the pull request into main and delete the branch?

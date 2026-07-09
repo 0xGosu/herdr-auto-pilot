@@ -1,0 +1,6 @@
+approval_permission.txt status=blocked type=approval verb=proceed options=3
+approval_yn.txt status=blocked type=approval verb= options=0
+choice_library.txt status=blocked type=choice verb= options=3
+error_build.txt status=blocked type=error verb= options=0
+idle_finished.txt status=idle type=idle verb= options=0
+unclassifiable_blocked.txt status=blocked type=unclassifiable verb= options=0

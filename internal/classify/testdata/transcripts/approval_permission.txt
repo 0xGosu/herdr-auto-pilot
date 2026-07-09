@@ -1,0 +1,8 @@
+● I'll update the config loader to handle the new field.
+
+  Bash(go test ./internal/config/...)
+
+  Do you want to proceed?
+  ❯ 1. Yes
+    2. Yes, and don't ask again for go test commands
+    3. No, and tell Claude what to do differently (esc)

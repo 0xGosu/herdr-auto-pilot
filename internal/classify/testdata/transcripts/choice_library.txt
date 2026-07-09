@@ -1,0 +1,6 @@
+Before I continue, which HTTP client should this project standardize on?
+
+Select an option:
+  1. Use the standard library net/http
+  2. Use resty for retries and middleware
+  3. Keep both and abstract behind an interface
