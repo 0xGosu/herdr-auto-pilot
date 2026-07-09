@@ -1,15 +1,17 @@
 # Herd Auto Prompter — Herdr plugin manifest (IR-004)
 id = "herd-auto-prompter"
 name = "Herd Auto Prompter"
-version = "0.1.1"
+version = "0.1.2"
 description = "Monitors every agent in the herd, auto-supplies the next prompt or response when confident, and escalates to you when not — learned from your own past decisions."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
 
-# Build steps run from a clean checkout exactly as `herdr plugin install`
-# executes them. Requires a Go 1.24+ toolchain on the installing machine.
+# The build step fetches the prebuilt binary for this platform from the
+# GitHub release matching `version`, verified against SHA256SUMS — no Go
+# toolchain required to install. Dev installs (`herdr plugin link`) build
+# with Go themselves: go build -o bin/herd-auto-prompter ./cmd/herd-auto-prompter
 [[build]]
-command = ["go", "build", "-trimpath", "-ldflags", "-s -w", "-o", "./bin/herd-auto-prompter", "./cmd/herd-auto-prompter"]
+command = ["bash", "scripts/install.sh"]
 
 # The TUI control surface, run as a Herdr pane.
 [[panes]]

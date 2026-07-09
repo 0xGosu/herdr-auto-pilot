@@ -52,9 +52,13 @@ herdr plugin link .
 
 ## Release flow (maintainers)
 
-1. Update `version` in `herdr-plugin.toml`.
-2. Tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+1. Update `version` in `herdr-plugin.toml` to `X.Y.Z`.
+2. Tag the same commit: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 3. The Release workflow runs the full CI gate, builds Linux/macOS binaries,
-   and publishes a GitHub Release — after which
-   `herdr plugin install 0xGosu/herdr-auto-pilot --ref vX.Y.Z` resolves the
-   pinned tag.
+   and publishes a GitHub Release.
+
+The manifest version and the tag MUST match: `herdr plugin install` runs
+`scripts/install.sh`, which downloads the release asset for the version
+declared in `herdr-plugin.toml` (that's what removes the Go-toolchain
+dependency for users). Pushing a manifest version before its release exists
+briefly breaks fresh installs, so push the tag immediately after the bump.

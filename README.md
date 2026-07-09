@@ -23,8 +23,11 @@ correctable.
 
 ## Quickstart
 
-Requires: Herdr ≥ 0.7.0 and a Go ≥ 1.24 toolchain (the plugin builds from
-source on install).
+Requires: Herdr ≥ 0.7.0 and `curl`. **No Go toolchain needed** — the install
+step downloads the prebuilt binary for your platform (Linux/macOS,
+amd64/arm64) from the matching GitHub Release and verifies it against the
+published SHA256SUMS. (Building from source instead needs Go ≥ 1.24; see
+Development.)
 
 ```sh
 herdr plugin install 0xGosu/herdr-auto-pilot
@@ -161,7 +164,11 @@ situation escalates.
 ```sh
 go build ./...        # build
 go test ./...         # unit, golden, safety-invariant, concurrency, integration
-herdr plugin link .   # develop against your local checkout (build bin/ first)
+
+# develop against your local checkout: linking skips the release-download
+# build step, so build the binary yourself first
+go build -o bin/herd-auto-prompter ./cmd/herd-auto-prompter
+herdr plugin link .
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The specification this plugin
