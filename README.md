@@ -148,13 +148,15 @@ stdout is captured for audit only. Example for Claude Code:
 
 ```toml
 [llm]
+# NOTE: the prompt must come immediately after -p — the claude CLI rejects
+# a positional prompt placed after other flags ("Input must be provided...").
 command = [
   "claude", "-p",
+  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
-  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
 ]
-timeout_seconds = 60
+timeout_seconds = 120
 auto_act = false   # false: LLM suggestions are surfaced for your confirmation
 ```
 

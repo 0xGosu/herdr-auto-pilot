@@ -118,6 +118,17 @@ func Decide(in DecideInput) Decision {
 	// Resolve the candidate action per situation type.
 	candidate, suggestion, resolveEsc := resolveSituation(in, conf)
 	if resolveEsc != ReasonNone {
+		// "No confident learned rule applies" is exactly the LLM fallback's
+		// job (FR-010): a signature with no history yet, or a learned option
+		// missing from the offered set, consults the configured LLM instead
+		// of escalating outright. The submission is re-gated by every safety
+		// control before anything acts. Idle situations are excluded: with
+		// no task source the plugin must never synthesize a prompt (FR-011).
+		if in.LLMConfigured &&
+			(resolveEsc == ReasonNoHistory || resolveEsc == ReasonUnfamiliarOptions) {
+			return Decision{Action: ActionConsult, Confidence: conf.Score,
+				Rationale: fmt.Sprintf("%s; consulting configured LLM for a suggestion", rationaleFor(resolveEsc))}
+		}
 		return esc(resolveEsc, rationaleFor(resolveEsc), conf.Score, suggestion)
 	}
 

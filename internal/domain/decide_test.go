@@ -224,12 +224,48 @@ func TestChoiceUnfamiliarOptionSetEscalates(t *testing.T) {
 	}
 }
 
-func TestApprovalNoHistoryEscalates(t *testing.T) {
+func TestApprovalNoHistoryEscalatesWithoutLLM(t *testing.T) {
 	in := baseInput(SituationApproval)
 	in.State = &SignatureState{Mode: ModeAutonomous}
 	d := Decide(in)
 	if d.Action != ActionEscalate {
-		t.Fatalf("no history must escalate, got %+v", d)
+		t.Fatalf("no history without an LLM must escalate, got %+v", d)
+	}
+}
+
+func TestNoHistoryConsultsLLMWhenConfigured(t *testing.T) {
+	// FR-010: "no confident learned rule applies" includes a brand-new
+	// signature — with an LLM configured it is consulted, not escalated.
+	for _, st := range []SituationType{SituationApproval, SituationChoice, SituationError} {
+		in := baseInput(st)
+		in.LLMConfigured = true
+		if st == SituationChoice {
+			in.Situation.Options = []string{"red", "green"}
+		}
+		d := Decide(in)
+		if d.Action != ActionConsult {
+			t.Errorf("%s with no history and LLM configured should consult, got %+v", st, d)
+		}
+	}
+
+	// Idle stays excluded: never synthesize a prompt without a task source
+	// (FR-011), LLM or not.
+	in := baseInput(SituationIdle)
+	in.LLMConfigured = true
+	in.Situation.Content = "Task is complete."
+	if d := Decide(in); d.Action != ActionEscalate || d.Reason != ReasonNoTaskSource {
+		t.Errorf("idle without a task source must escalate even with an LLM, got %+v", d)
+	}
+}
+
+func TestUnfamiliarOptionsConsultLLMWhenConfigured(t *testing.T) {
+	in := autonomous(baseInput(SituationChoice),
+		"use pnpm", "use pnpm", "use pnpm", "use pnpm", "use pnpm", "use pnpm", "use pnpm", "use pnpm")
+	in.Situation.Options = []string{"use bun", "use deno"}
+	in.LLMConfigured = true
+	d := Decide(in)
+	if d.Action != ActionConsult {
+		t.Fatalf("unfamiliar option set with LLM configured should consult, got %+v", d)
 	}
 }
 
