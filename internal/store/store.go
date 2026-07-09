@@ -17,6 +17,8 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
@@ -723,33 +725,45 @@ func (s *Store) agentNameByID(ctx context.Context, agentID string) (string, erro
 
 // RenameAgent gives the agent a new operator-chosen short name (front-end
 // write). target may be the current short name or the agent/pane id.
+// Returns ErrUnknownAgent when no name row exists for the target — a bogus
+// target must not silently invent a mapping.
 func (s *Store) RenameAgent(ctx context.Context, target, newName string) error {
-	if !agentNameRE.MatchString(newName) {
-		return fmt.Errorf("invalid name %q: use 1-32 lowercase letters, digits, - or _", newName)
-	}
 	agentID, err := s.ResolveAgent(ctx, target)
 	if err != nil {
 		return err
 	}
-	// Renames only apply to agents the daemon has already named (rows are
-	// created on first sight); a bogus target must not invent a mapping.
 	if existing, err := s.agentNameByID(ctx, agentID); err != nil {
 		return err
 	} else if existing == "" {
-		return fmt.Errorf("no agent known as %q (agents are named when first monitored)", target)
+		return fmt.Errorf("no agent known as %q: %w", target, ports.ErrUnknownAgent)
+	}
+	return s.AssignAgentName(ctx, agentID, newName)
+}
+
+// AssignAgentName upserts the short name for a known-live agent id. Used by
+// RenameAgent for already-named agents, and directly by front-ends after
+// verifying the agent exists in Herdr's live agent list (an agent that has
+// not transitioned since daemon start has no auto-generated row yet). Safe
+// against the daemon's concurrent INSERT OR IGNORE: either order converges
+// to the operator's name.
+func (s *Store) AssignAgentName(ctx context.Context, agentID, name string) error {
+	if !agentNameRE.MatchString(name) {
+		return fmt.Errorf("invalid name %q: use 1-32 lowercase letters, digits, - or _", name)
 	}
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		var n int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM agent_names WHERE name = ? AND agent_id != ?`,
-			newName, agentID).Scan(&n); err != nil {
+			name, agentID).Scan(&n); err != nil {
 			return err
 		}
 		if n > 0 {
-			return fmt.Errorf("name %q is already taken", newName)
+			return fmt.Errorf("name %q is already taken", name)
 		}
-		_, err := tx.ExecContext(ctx,
-			`UPDATE agent_names SET name = ? WHERE agent_id = ?`, newName, agentID)
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO agent_names (agent_id, name, created_at) VALUES (?, ?, ?)
+			ON CONFLICT(agent_id) DO UPDATE SET name = excluded.name`,
+			agentID, name, time.Now().UnixMilli())
 		return err
 	})
 }

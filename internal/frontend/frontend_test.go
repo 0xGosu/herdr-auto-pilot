@@ -256,6 +256,44 @@ func TestJoinCommandRoundTrip(t *testing.T) {
 	}
 }
 
+// fakeHerdrPort serves a fixed live agent list (no sends expected).
+type fakeHerdrPort struct {
+	agents []domain.AgentTransition
+}
+
+func (f *fakeHerdrPort) Send(ctx context.Context, paneID, input string) error { return nil }
+func (f *fakeHerdrPort) ReadPane(ctx context.Context, paneID string, lines int) (string, error) {
+	return "", nil
+}
+func (f *fakeHerdrPort) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) {
+	return f.agents, nil
+}
+
+func TestRenameLiveButUnnamedAgent(t *testing.T) {
+	// Regression: the TUI/CLI list agents straight from Herdr, but the
+	// daemon only creates a name row when the agent first transitions. A
+	// live agent with no row yet ("no agent known as ...") must still be
+	// renamable — the rename verifies liveness and creates the row.
+	app, _ := testApp(t)
+	ctx := context.Background()
+	app.Herdr = &fakeHerdrPort{agents: []domain.AgentTransition{
+		{AgentID: "w65:p1", PaneID: "w65:p1", AgentType: "claude", Status: "blocked"},
+	}}
+
+	if err := app.RenameAgent(ctx, "w65:p1", "quiet-agent"); err != nil {
+		t.Fatalf("renaming a live unnamed agent must succeed: %v", err)
+	}
+	names, _ := app.Names(ctx)
+	if names["w65:p1"] != "quiet-agent" {
+		t.Fatalf("name row not created: %v", names)
+	}
+
+	// A target that is neither named nor live must still be rejected.
+	if err := app.RenameAgent(ctx, "w99:p9", "ghost"); err == nil {
+		t.Error("renaming a non-live unknown agent must fail")
+	}
+}
+
 func TestRenameAgentThroughApp(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()

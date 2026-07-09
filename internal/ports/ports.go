@@ -5,6 +5,7 @@ package ports
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -79,10 +80,18 @@ type FrontendStore interface {
 	InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error)
 	InsertKillEvent(ctx context.Context, e domain.KillEvent) (int64, error)
 	// RenameAgent gives an agent a new operator-chosen short name; target
-	// may be the current name or the agent/pane id.
+	// may be the current name or the agent/pane id. Returns an error
+	// wrapping ErrUnknownAgent when the target has no name row yet.
 	RenameAgent(ctx context.Context, target, newName string) error
+	// AssignAgentName upserts a name for an agent id the caller has
+	// verified to be live (e.g. present in Herdr's agent list).
+	AssignAgentName(ctx context.Context, agentID, name string) error
 	ClearLearnedData(ctx context.Context) error
 }
+
+// ErrUnknownAgent reports a rename target with no name row yet; callers may
+// verify the agent is live and use AssignAgentName instead.
+var ErrUnknownAgent = errors.New("agent has no name record yet")
 
 // MCPStore is the mcp subcommand's write surface plus shared reads.
 type MCPStore interface {

@@ -7,6 +7,7 @@ package frontend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -84,8 +85,24 @@ func (a *App) Names(ctx context.Context) (map[string]string, error) {
 
 // RenameAgent gives an agent a new short name; target may be the current
 // name or the agent/pane id. The name is what task-source selectors match.
+// An agent that is live in Herdr but has not transitioned since daemon
+// start has no auto-generated name row yet; for those, the rename creates
+// the row after verifying the target against Herdr's live agent list.
 func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
-	if err := a.Store.RenameAgent(ctx, target, newName); err != nil {
+	err := a.Store.RenameAgent(ctx, target, newName)
+	if errors.Is(err, ports.ErrUnknownAgent) && a.Herdr != nil {
+		agents, listErr := a.Herdr.ListAgents(ctx)
+		if listErr != nil {
+			return fmt.Errorf("%w (and the live agent list is unavailable: %v)", err, listErr)
+		}
+		for _, agent := range agents {
+			if agent.AgentID == target || agent.PaneID == target {
+				err = a.Store.AssignAgentName(ctx, agent.AgentID, newName)
+				break
+			}
+		}
+	}
+	if err != nil {
 		return err
 	}
 	return a.nudge(ctx, control.KindReload)
