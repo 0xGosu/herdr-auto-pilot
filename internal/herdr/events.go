@@ -172,10 +172,17 @@ func (s *Subscriber) runDiscovery(ctx context.Context) error {
 	})
 }
 
-// runStatus subscribes to pane.agent_status_changed for every known pane;
-// it returns (to be re-run by loop) whenever the pane set changes.
+// runStatus subscribes to pane.agent_status_changed for every live pane;
+// it returns (to be re-run by loop) whenever the pane set changes. The pane
+// set is fetched authoritatively via pane.list on every (re)subscribe —
+// discovery events only trigger the refresh — so a pane that exited during
+// a reconnect window can never wedge the subscription (herdr rejects
+// subscriptions naming dead panes).
 func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTransition) error {
-	paneIDs := s.paneIDs()
+	paneIDs, err := s.listPanes(ctx)
+	if err != nil {
+		return fmt.Errorf("pane.list: %w", err)
+	}
 	if len(paneIDs) == 0 {
 		// Nothing to watch yet: wait for discovery to find panes.
 		select {
@@ -203,7 +210,7 @@ func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTrans
 		}
 	}()
 
-	err := s.stream(streamCtx, "hap_status", subs, func(frame eventFrame) error {
+	err = s.stream(streamCtx, "hap_status", subs, func(frame eventFrame) error {
 		var d eventData
 		if err := json.Unmarshal(frame.Data, &d); err != nil {
 			slog.Warn("undecodable status event ignored", "error", err)
@@ -339,15 +346,67 @@ func (s *Subscriber) signalDirty() {
 	}
 }
 
-func (s *Subscriber) paneIDs() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ids := make([]string, 0, len(s.panes))
-	for id := range s.panes {
-		ids = append(ids, id)
+// listPanes queries the live pane set over a short-lived connection.
+func (s *Subscriber) listPanes(ctx context.Context) ([]string, error) {
+	conn, err := s.Dial(ctx)
+	if err != nil {
+		return nil, err
 	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+
+	req, _ := json.Marshal(socketRequest{ID: "hap_pane_list", Method: "pane.list", Params: map[string]any{}})
+	if _, err := conn.Write(append(req, '\n')); err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("connection closed before pane.list response")
+	}
+	var resp struct {
+		Error *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+		Result struct {
+			Panes []struct {
+				PaneID      string `json:"pane_id"`
+				WorkspaceID string `json:"workspace_id"`
+			} `json:"panes"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("%s: %s", resp.Error.Code, resp.Error.Message)
+	}
+	ids := make([]string, 0, len(resp.Result.Panes))
+	s.mu.Lock()
+	live := map[string]bool{}
+	for _, p := range resp.Result.Panes {
+		ids = append(ids, p.PaneID)
+		live[p.PaneID] = true
+		info := s.panes[p.PaneID]
+		if p.WorkspaceID != "" {
+			info.workspaceID = p.WorkspaceID
+		}
+		s.panes[p.PaneID] = info
+	}
+	// Prune panes that no longer exist so labels don't leak.
+	for id := range s.panes {
+		if !live[id] {
+			delete(s.panes, id)
+		}
+	}
+	s.mu.Unlock()
 	sort.Strings(ids)
-	return ids
+	return ids, nil
 }
 
 func (s *Subscriber) agentLabel(paneID string) string {

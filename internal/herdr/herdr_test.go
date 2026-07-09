@@ -110,6 +110,45 @@ func TestSubscriberReconnectsWithBackoff(t *testing.T) {
 	t.Fatal("subscriber did not reconnect after socket loss")
 }
 
+func TestSubscriberRecoversFromSilentlyVanishedPane(t *testing.T) {
+	// Regression: a pane whose exit event was missed (e.g. during a
+	// reconnect window) must not wedge the status subscription — real herdr
+	// rejects subscriptions naming dead panes. The pane set is re-fetched
+	// via pane.list on every (re)subscribe, so the subscriber self-heals.
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.AddPane("w1:p1", "w1")
+	srv.AddPane("w1:p9", "w1")
+
+	sub := NewSubscriber(srv.SocketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan domain.AgentTransition, 16)
+	go sub.Subscribe(ctx, out)
+	time.Sleep(300 * time.Millisecond)
+
+	// Simulate the missed exit, then force a resubscribe by breaking the
+	// current connections.
+	srv.RemovePaneSilently("w1:p9")
+	srv.DropConnections()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.PushTransition("w1:p1", "w1", "claude", "blocked")
+		select {
+		case tr := <-out:
+			if tr.PaneID == "w1:p1" {
+				return // recovered: dead pane pruned, live pane still watched
+			}
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	t.Fatal("subscriber did not recover after a silently vanished pane")
+}
+
 func TestCLIExecutor(t *testing.T) {
 	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
 	if err != nil {

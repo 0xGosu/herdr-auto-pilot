@@ -76,9 +76,45 @@ func (s *Server) serve(conn net.Conn) {
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
 			continue
 		}
+		if req.Method == "pane.list" {
+			s.mu.Lock()
+			var panes []map[string]any
+			for paneID, wsID := range s.panes {
+				panes = append(panes, map[string]any{"pane_id": paneID, "workspace_id": wsID})
+			}
+			s.mu.Unlock()
+			resp, _ := json.Marshal(map[string]any{
+				"id": req.ID, "result": map[string]any{"type": "pane_list", "panes": panes},
+			})
+			conn.Write(append(resp, '\n'))
+			continue
+		}
 		if req.Method != "events.subscribe" {
 			continue
 		}
+		// Mirror real herdr: a status subscription naming a pane that no
+		// longer exists is rejected with an error.
+		s.mu.Lock()
+		var badPane string
+		for _, sub := range req.Params.Subscriptions {
+			if sub.Type == "pane.agent_status_changed" && sub.PaneID != "" {
+				if _, ok := s.panes[sub.PaneID]; !ok {
+					badPane = sub.PaneID
+					break
+				}
+			}
+		}
+		s.mu.Unlock()
+		if badPane != "" {
+			resp, _ := json.Marshal(map[string]any{
+				"id": req.ID, "error": map[string]any{
+					"code": "internal_error", "message": "failed to decode pane get error",
+				},
+			})
+			conn.Write(append(resp, '\n'))
+			continue
+		}
+
 		cc := &clientConn{conn: conn, subs: req.Params.Subscriptions}
 		s.mu.Lock()
 		s.conns[conn] = cc
@@ -167,6 +203,14 @@ func (s *Server) broadcast(eventType string, data map[string]any, paneID string)
 			break
 		}
 	}
+}
+
+// RemovePaneSilently drops a pane WITHOUT emitting pane.exited, simulating
+// an exit event missed during a reconnect window.
+func (s *Server) RemovePaneSilently(paneID string) {
+	s.mu.Lock()
+	delete(s.panes, paneID)
+	s.mu.Unlock()
 }
 
 // DropConnections severs all live subscriber connections (reconnect tests).
