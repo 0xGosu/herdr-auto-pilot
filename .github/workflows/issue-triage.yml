@@ -1,0 +1,46 @@
+name: issue-triage
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: write # Required for Claude to read CI results on PRs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            ISSUE NUMBER: ${{ github.event.issue.number }}
+            TITLE: ${{ github.event.issue.title }}
+            BODY: ${{ github.event.issue.body }}
+            AUTHOR: ${{ github.event.issue.user.login }}
+
+            Analyze this new issue and:
+            1. Determine if it's a bug report, feature request, or question
+            2. Assess priority (critical, high, medium, low)
+            3. List all existing labels available in the repo
+            4. Suggest appropriate labels
+            5. Check if it duplicates existing issues
+
+            Based on your analysis, add the appropriate labels using:
+            `gh issue edit [number] --add-label "label1,label2"`
+
+            If it appears to be a duplicate, post a comment mentioning the original issue.
+
+          claude_args: |
+            --model haiku
+            --max-turns 200
+            --allowedTools "WebSearch,WebFetch,mcp__gosu,Bash(gh label:*),Bash(gh search:*),Bash(gh pr:*),Bash(gh issue:*),Bash(gh release create:*),Bash(gh release list:*),Bash(gh run:*),Bash(gh search:*)"
+            --system-prompt "You MUST plan carefully so that you can finish all planned tasks within 200 turns."

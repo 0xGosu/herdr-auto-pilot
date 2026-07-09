@@ -1,0 +1,74 @@
+// For format details, see https://aka.ms/devcontainer.json
+{
+  "name": "Gelmium Development Environment in a Docker Container",
+  // This is a pre-build image contain all tool required
+  "image": "gelmium/devcontainer:latest",
+  // Add any feature will cause devcontainer image to be rebuilt
+  // "features": {
+  // },
+  "overrideCommand": false,
+  "privileged": true,
+  "mounts": [
+    // Enable docker dind
+    {
+      "source": "dind-var-lib-docker-${devcontainerId}",
+      "target": "/var/lib/docker",
+      "type": "volume"
+    }
+  ],
+  // the run args will be passed to docker run command
+  "runArgs": ["--label", "DEVCONTAINER_REF=${devcontainerId}"],
+
+  // Use 'forwardPorts' to make a list of ports inside the container available locally.
+  "forwardPorts": [],
+  // Devcontainer CLI use this instead of 'forwardPorts' to expose ports.
+  "appPort": [],
+
+  // Use 'initializeCommand' to run commands in the host before the container is created.
+  "initializeCommand": "docker pull gelmium/devcontainer:latest;echo DEVCONTAINER_REF=${devcontainerId} > .devcontainer/.env",
+
+  // Use 'postCreateCommand' to run commands after the container is created.
+  "postCreateCommand": "bash -i -c 'post_create_command' || true",
+
+  // A command to run each time the container is successfully started.
+  "postStartCommand": "bash -i -c 'post_start_command' || true",
+
+  // Configure tool-specific properties.
+  "customizations": {
+    "codespaces": {
+      // "repositories": {
+      //   "gelmium/template-base-all-project": {
+      //     "permissions": "read-all"
+      //   }
+      // }
+    },
+    "vscode": {
+      "extensions": [
+        "ms-vscode.makefile-tools",
+        "mikestead.dotenv",
+        "ckolkman.vscode-postgres",
+        "ms-azuretools.vscode-containers",
+        "esbenp.prettier-vscode",
+        "GitHub.copilot",
+        "GitHub.copilot-chat",
+        "anthropic.claude-code",
+        "openai.chatgpt",
+        "yoavbls.pretty-ts-errors",
+        "redhat.vscode-yaml",
+        "ms-python.python",
+        "ms-python.black-formatter",
+        "meta.pyrefly",
+        "golang.Go"
+      ],
+      "settings": {
+        "editor.dragAndDrop": false,
+        "prettier.configPath": "/root/.prettierrc"
+      }
+    }
+  },
+  "containerEnv": {
+    // your environment variables
+  },
+  // Connect as root. To use non root user: https://aka.ms/dev-containers-non-root.
+  "remoteUser": "root"
+}

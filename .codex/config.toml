@@ -1,0 +1,314 @@
+# Default Codex Configuration
+# Generated from schema
+
+# Agent-related settings (thread limits, etc.).
+# Type: AgentsToml
+#agents = {}
+
+# Whether the model may request a login shell for shell-based tools. Default to
+# `true`  If `true`, the model may request a login shell (`login = true`), and
+# omitting `login` defaults to using a login shell. If `false`, the model can
+# never use a login shell: `login = true` requests are rejected, and omitting
+# `login` defaults to a non-login shell.
+#allow_login_shell = false
+
+# When `false`, disables analytics across Codex product surfaces in this machine.
+# Defaults to `true`.
+# Type: AnalyticsConfigToml
+#analytics = {}
+
+# Default approval policy for executing commands. (between untrusted, on-request, and never)
+approval_policy = "never"
+
+# Settings for app-specific controls.
+# Type: AppsConfigToml
+#apps = {}
+
+# Machine-local realtime audio device preferences used by realtime voice.
+# Type: RealtimeAudioToml
+#audio = {}
+
+# Maximum poll window for background terminal output (`write_stdin`), in
+# milliseconds. Default: `300000` (5 minutes).
+#background_terminal_max_timeout = 0
+
+# Base URL for requests to ChatGPT (as opposed to the OpenAI API).
+#chatgpt_base_url = ""
+
+# When `true`, checks for Codex updates on startup and surfaces update prompts.
+# Set to `false` only if your Codex updates are centrally managed. Defaults to
+# `true`.
+#check_for_update_on_startup = false
+
+# Preferred backend for storing CLI auth credentials. file (default): Use a file
+# in the Codex home directory. keyring: Use an OS-specific keyring service. auto:
+# Use the keyring if available, otherwise use a file.
+#cli_auth_credentials_store = "file"
+
+# Optional commit attribution text for commit message co-author trailers.  Set to
+# an empty string to disable automatic commit attribution.
+#commit_attribution = ""
+
+# Compact prompt used for history compaction.
+#compact_prompt = ""
+
+# Developer instructions inserted as a `developer` role message.
+#developer_instructions = ""
+
+# When true, disables burst-paste detection for typed input entirely. All
+# characters are inserted as they are received, and no buffering or placeholder
+# replacement will occur for fast keypress bursts.
+#disable_paste_burst = false
+
+#experimental_compact_prompt_file = ""
+
+# Experimental / do not use. Overrides only the realtime conversation websocket
+# transport instructions (the `Op::RealtimeConversation` `/ws` session.update
+# instructions) without changing normal prompts.
+#experimental_realtime_ws_backend_prompt = ""
+
+# Experimental / do not use. Overrides only the realtime conversation websocket
+# transport base URL (the `Op::RealtimeConversation` `/v1/realtime` connection)
+# without changing normal provider HTTP requests.
+#experimental_realtime_ws_base_url = ""
+
+# Experimental / do not use. Selects the realtime websocket model/snapshot used
+# for the `Op::RealtimeConversation` connection.
+#experimental_realtime_ws_model = ""
+
+#experimental_use_freeform_apply_patch = false
+
+#experimental_use_unified_exec_tool = false
+
+# Centralized feature flags (new). Prefer this over individual toggles.
+[features]
+shell_snapshot = true           # Speed up repeated commands
+
+# When `false`, disables feedback collection across Codex product surfaces.
+# Defaults to `true`.
+# Type: FeedbackConfigToml
+#feedback = {}
+
+# Optional URI-based file opener. If set, citations to files in the model output
+# will be hyperlinked using the specified URI scheme.
+#file_opener = "vscode"
+
+# When set, restricts ChatGPT login to a specific workspace identifier.
+#forced_chatgpt_workspace_id = ""
+
+# When set, restricts the login mechanism users may use.
+# Type: ForcedLoginMethod
+#forced_login_method = "chatgpt"
+
+# Settings for ghost snapshots (used for undo).
+# Type: GhostSnapshotToml
+#ghost_snapshot = {}
+
+# When set to `true`, `AgentReasoning` events will be hidden from the UI/output.
+# Defaults to `false`.
+#hide_agent_reasoning = false
+
+# Settings that govern if and what will be written to `~/.codex/history.jsonl`.
+# Type: History
+#history = {}
+
+# System instructions.
+#instructions = ""
+
+# Ordered list of directories to search for Node modules in `js_repl`.
+#js_repl_node_module_dirs = []
+
+# Optional absolute path to the Node runtime used by `js_repl`.
+# Type: AbsolutePathBuf
+#js_repl_node_path = ""
+
+# Directory where Codex writes log files, for example `codex-tui.log`. Defaults to
+# `$CODEX_HOME/log`.
+# Type: AbsolutePathBuf
+# log_dir = "/absolute/path/to/codex-logs"
+
+# Optional fixed port for the local HTTP callback server used during MCP OAuth
+# login. When unset, Codex will bind to an ephemeral port chosen by the OS.
+#mcp_oauth_callback_port = 0
+
+# Optional redirect URI to use during MCP OAuth login. When set, this URI is used
+# in the OAuth authorization request instead of the local listener address. The
+# local callback listener still binds to 127.0.0.1 (using
+# `mcp_oauth_callback_port` when provided).
+#mcp_oauth_callback_url = ""
+
+# Preferred backend for storing MCP OAuth credentials. keyring: Use an OS-specific
+# keyring service. https://github.com/openai/codex/blob/main/codex-rs/rmcp-
+# client/src/oauth.rs#L2 file: Use a file in the Codex home directory. auto
+# (default): Use the OS-specific keyring service if available, otherwise use a
+# file.
+#mcp_oauth_credentials_store = "auto"
+
+# Definition for MCP servers that Codex can reach out to for tool calls.
+#mcp_servers = {}
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+
+[mcp_servers.github]
+url = "https://api.githubcopilot.com/mcp/"
+http_headers = { 
+  "X-MCP-Toolsets" = "context,repos,issues,pull_requests,users,dependabot,discussions"
+}
+disabled_tools = ["assign_copilot_to_issue", "create_branch", "create_or_update_file", "create_pull_request", "create_repository", "delete_file", "delete_project_item", "fork_repository", "merge_pull_request", "push_files", "request_copilot_review", "update_pull_request", "update_pull_request_branch"]
+
+[mcp_servers.notion]
+url = "https://mcp.notion.com/mcp"
+
+# Memories subsystem settings.
+# Type: MemoriesToml
+#memories = {}
+
+# Optional override of model selection.
+#model = "gpt-5.4"
+
+# Token usage threshold triggering auto-compaction of conversation history.
+#model_auto_compact_token_limit = 0
+
+# Optional path to a JSON model catalog (applied on startup only). Per-thread
+# `config` overrides are accepted but do not reapply this (no-ops).
+# Type: AbsolutePathBuf
+#model_catalog_json = ""
+
+# Size of the context window for the model, in tokens.
+#model_context_window = 0
+
+# Optional path to a file containing model instructions that will override the
+# built-in instructions for the selected model. Users are STRONGLY DISCOURAGED
+# from using this field, as deviating from the instructions sanctioned by Codex
+# will likely degrade model performance.
+# Type: AbsolutePathBuf
+#model_instructions_file = ""
+
+# Provider to use from the model_providers map.
+#model_provider = ""
+
+# User-defined provider entries that extend/override the built-in list.
+#model_providers = {}
+
+model_reasoning_effort = "high"
+
+#model_reasoning_summary = ""
+
+# Override to force-enable reasoning summaries for the configured model.
+#model_supports_reasoning_summaries = false
+
+# Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
+# Type: Verbosity
+#model_verbosity = "low"
+
+# Collection of in-product notices (different from notifications) See
+# [`crate::config::types::Notices`] for more details
+# Type: Notice
+#notice = {}
+
+# Optional external command to spawn for end-user notifications.
+#notify = []
+
+# Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
+#oss_provider = ""
+
+# OTEL configuration.
+# Type: OtelConfigToml
+#otel = {}
+
+# Nested permissions settings.
+# Type: PermissionsToml
+#permissions = {}
+
+# Optionally specify a personality for the model
+# Type: Personality
+#personality = "pragmatic" # or "friendly" or "none"
+
+#plan_mode_reasoning_effort = ""
+
+# User-level plugin config entries keyed by plugin name.
+#plugins = {}
+
+# Profile to use from the `profiles` map.
+#profile = ""
+
+# Named profiles to facilitate switching between different configurations.
+#profiles = {}
+
+# Ordered list of fallback filenames to look for when AGENTS.md is missing.
+#project_doc_fallback_filenames = []
+
+# Maximum number of bytes to include from an AGENTS.md project doc file.
+#project_doc_max_bytes = 0
+
+# Markers used to detect the project root when searching parent directories for
+# `.codex` folders. Defaults to [".git"] when unset.
+#project_root_markers = []
+
+#projects = {}
+
+# Review model override used by the `/review` feature.
+#review_model = ""
+
+# Sandbox mode to use.
+# Type: SandboxMode
+sandbox_mode = "workspace-write"
+
+# Sandbox configuration to apply if `sandbox` is `WorkspaceWrite`.
+# Type: SandboxWorkspaceWrite
+#sandbox_workspace_write = {}
+
+# Optional explicit service tier preference for new turns (`fast` or `flex`).
+# Type: ServiceTier
+#service_tier = "fast"
+
+# Type: ShellEnvironmentPolicyToml
+[shell_environment_policy]
+include_only = ["PATH", "HOME"]
+
+# When set to `true`, `AgentReasoningRawContentEvent` events will be shown in the
+# UI/output. Defaults to `false`.
+#show_raw_agent_reasoning = false
+
+# User-level skill config entries keyed by SKILL.md path.
+# Type: SkillsConfig
+#skills = {}
+
+# Directory where Codex stores the SQLite state DB. Defaults to
+# `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`.
+# Type: AbsolutePathBuf
+#sqlite_home = ""
+
+# Suppress warnings about unstable (under development) features.
+#suppress_unstable_features_warning = false
+
+# Token budget applied when storing tool/function outputs in the context manager.
+#tool_output_token_limit = 0
+
+# Nested tools section for feature toggles
+# Type: ToolsToml
+#tools = {}
+
+# Collection of settings that are specific to the TUI.
+# Type: Tui
+#tui = {}
+
+# Controls the web search tool mode: disabled, cached, or live.
+# Type: WebSearchMode
+# web_search = "cached"  # default; serves results from the web search cache
+web_search = "live"  # fetch the most recent data from the web (same as --search)
+# web_search = "disabled"
+
+# Windows-specific configuration.
+# Type: WindowsToml
+[windows]
+sandbox = "elevated"   # Recommended
+# sandbox = "unelevated" # Fallback if admin permissions/setup are unavailable
+
+# Tracks whether the Windows onboarding screen has been acknowledged.
+#windows_wsl_setup_acknowledged = false
+
+# Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell
+# execution.
+# Type: AbsolutePathBuf
+#zsh_path = ""
