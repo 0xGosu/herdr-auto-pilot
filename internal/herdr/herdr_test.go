@@ -7,10 +7,11 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/fakeherdr"
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 func TestSubscriberReceivesTransitions(t *testing.T) {
-	srv, err := fakeherdr.NewServer(t.TempDir())
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +44,7 @@ func TestSubscriberReceivesTransitions(t *testing.T) {
 }
 
 func TestSubscriberDiscoversNewPanes(t *testing.T) {
-	srv, err := fakeherdr.NewServer(t.TempDir())
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +78,7 @@ func TestSubscriberDiscoversNewPanes(t *testing.T) {
 
 func TestSubscriberReconnectsWithBackoff(t *testing.T) {
 	// FR-023: on socket loss the subscriber reconnects and resumes.
-	srv, err := fakeherdr.NewServer(t.TempDir())
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
 	if err != nil {
 		t.Fatal(err)
 	}

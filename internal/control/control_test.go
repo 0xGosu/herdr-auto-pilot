@@ -9,10 +9,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 func TestNudgeRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "ctl.sock")
+	path := filepath.Join(testutil.SocketDir(t), "ctl.sock")
 	var mu sync.Mutex
 	var got []Kind
 	srv, err := NewServer(path, func(k Kind) {
@@ -51,7 +53,7 @@ func TestNudgeRoundTrip(t *testing.T) {
 }
 
 func TestSocketOwnerOnlyPermissions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "ctl.sock")
+	path := filepath.Join(testutil.SocketDir(t), "ctl.sock")
 	srv, err := NewServer(path, func(Kind) {})
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +70,7 @@ func TestSocketOwnerOnlyPermissions(t *testing.T) {
 }
 
 func TestMalformedNudgeIgnored(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "ctl.sock")
+	path := filepath.Join(testutil.SocketDir(t), "ctl.sock")
 	var mu sync.Mutex
 	calls := 0
 	srv, err := NewServer(path, func(Kind) {
@@ -98,7 +100,7 @@ func TestMalformedNudgeIgnored(t *testing.T) {
 }
 
 func TestNudgeDebounce(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "ctl.sock")
+	path := filepath.Join(testutil.SocketDir(t), "ctl.sock")
 	var mu sync.Mutex
 	calls := 0
 	srv, err := NewServer(path, func(Kind) {

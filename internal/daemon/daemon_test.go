@@ -16,6 +16,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 // --- fakes ---
@@ -167,7 +168,8 @@ func newHarness(t *testing.T, cfgTOML string) *harness {
 	fe := &fakeEvents{ch: make(chan domain.AgentTransition, 64)}
 	fl := &fakeLLM{}
 
-	ctlPath := filepath.Join(dir, "control.sock")
+	// Socket paths must stay short for macOS (104-byte cap).
+	ctlPath := filepath.Join(testutil.SocketDir(t), "control.sock")
 	d, err := New(Options{
 		ConfigPath:        cfgPath,
 		ControlSocketPath: ctlPath,
