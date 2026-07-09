@@ -57,6 +57,9 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 		arg = strings.ReplaceAll(arg, "{control}", a.ControlPath)
 		argv[i] = arg
 	}
+	// Auto-repair known CLI misconfigurations (e.g. claude's prompt placed
+	// after other flags) so a slightly-off operator config still works.
+	argv = NormalizeLLMCommand(argv)
 
 	timeout := a.Timeout
 	if timeout <= 0 {
@@ -95,7 +98,8 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 			return nil, fmt.Errorf("llm CLI failed without submit_decision: %w (output: %s)",
 				runErr, truncate(captured, 500))
 		}
-		return nil, fmt.Errorf("llm CLI exited without calling submit_decision")
+		return nil, fmt.Errorf("llm CLI exited without calling submit_decision (output tail: %s)",
+			tailOf(captured, 500))
 	}
 	dec.CapturedOutput = captured
 	return dec, nil
@@ -106,4 +110,11 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func tailOf(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }

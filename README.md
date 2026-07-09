@@ -148,8 +148,8 @@ stdout is captured for audit only. Example for Claude Code:
 
 ```toml
 [llm]
-# NOTE: the prompt must come immediately after -p — the claude CLI rejects
-# a positional prompt placed after other flags ("Input must be provided...").
+# Claude Code: the prompt belongs immediately after -p (the plugin
+# auto-repairs a prompt misplaced after other flags — see below).
 command = [
   "claude", "-p",
   "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
@@ -160,11 +160,60 @@ timeout_seconds = 120
 auto_act = false   # false: LLM suggestions are surfaced for your confirmation
 ```
 
+OpenAI Codex CLI (MCP server passed inline via `-c` overrides; `exec` is
+required for headless runs — the plugin inserts it if you forget). Codex's
+approval policy auto-denies MCP tool calls in headless mode, so the bypass
+flag is required; hap's own safety controls still re-gate every submission
+before anything reaches an agent:
+
+```toml
+[llm]
+command = [
+  "codex", "exec", "--skip-git-repo-check",
+  "--dangerously-bypass-approvals-and-sandbox",
+  "-c", 'mcp_servers.hap.command="{self}"',
+  "-c", 'mcp_servers.hap.args=["mcp"]',
+  "-c", 'mcp_servers.hap.env.HAP_REQUEST_ID="{request_id}"',
+  "-c", 'mcp_servers.hap.env.HAP_DB_PATH="{db}"',
+  "-c", 'mcp_servers.hap.env.HAP_CONTROL_PATH="{control}"',
+  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision. Do not run any other commands.",
+]
+timeout_seconds = 180
+```
+
+(The `HAP_DB_PATH`/`HAP_CONTROL_PATH` entries matter: codex launches MCP
+servers with a sanitized environment, so the hap server must be told its
+database explicitly.)
+
+Antigravity CLI (`agy`) has no per-invocation MCP flag — register hap once
+in `~/.gemini/config/mcp_config.json` with the database path in `env` (the
+hap MCP tools default to the current pending request, so no request id is
+needed):
+
+```json
+{"mcpServers": {"hap": {"command": "/path/to/plugin/bin/hap", "args": ["mcp"],
+  "env": {"HAP_DB_PATH": "~/.local/state/herdr/plugins/herd-auto-prompter/herd-auto-prompter.db"}}}}
+```
+
+```toml
+[llm]
+# agy, like claude, wants the prompt immediately after --print
+# (auto-repaired if misplaced).
+command = [
+  "agy", "--print",
+  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
+  "--dangerously-skip-permissions",
+]
+timeout_seconds = 180
+```
+
 Placeholders: `{self}` (this plugin binary), `{request_id}`, `{db}`,
-`{control}`. Every LLM suggestion is re-gated through the same allowlist,
-kill switch, and rate guards; with `auto_act = true` it may act only when it
-doesn't contradict your learned history. On timeout or no submission the
-situation escalates.
+`{control}`. Common misconfigurations of known CLIs are auto-repaired at
+launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing
+`exec` inserted) — an unrecognized shape is left untouched. Every LLM
+suggestion is re-gated through the same allowlist, kill switch, and rate
+guards; with `auto_act = true` it may act only when it doesn't contradict
+your learned history. On timeout or no submission the situation escalates.
 
 ## Pause/kill switch & audit
 

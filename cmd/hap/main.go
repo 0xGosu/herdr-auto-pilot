@@ -205,14 +205,27 @@ func ensureDaemon(paths config.Paths) error {
 }
 
 func runMCP(ctx context.Context, paths config.Paths) error {
-	st, err := store.Open(paths.DBPath())
+	// Some agent CLIs (e.g. codex) launch MCP servers with a sanitized
+	// environment that drops HERDR_PLUGIN_STATE_DIR, which would silently
+	// point us at the wrong database. HAP_DB_PATH / HAP_CONTROL_PATH —
+	// injectable via the {db} / {control} placeholders in the MCP server's
+	// env map — take precedence over the path resolution.
+	dbPath := os.Getenv("HAP_DB_PATH")
+	if dbPath == "" {
+		dbPath = paths.DBPath()
+	}
+	controlPath := os.Getenv("HAP_CONTROL_PATH")
+	if controlPath == "" {
+		controlPath = paths.ControlSocketPath()
+	}
+	st, err := store.Open(dbPath)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 	srv := &mcpserver.Server{
 		Store:            st,
-		ControlPath:      paths.ControlSocketPath(),
+		ControlPath:      controlPath,
 		DefaultRequestID: os.Getenv("HAP_REQUEST_ID"),
 	}
 	return srv.Run(ctx, os.Stdin, os.Stdout)
