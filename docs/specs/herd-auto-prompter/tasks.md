@@ -378,7 +378,7 @@ Implementation plan derived from the constitution, requirements, and solution sp
   - _Requirements: IR-004, FR-022, Constitution (auditability, coding standards), DR-004 (Data Protection)_
   - _Complexity: Medium_
 
-- [ ] 41\. Tag-driven GitHub Actions release with artifacts
+- [x] 41\. Tag-driven GitHub Actions release with artifacts
   - Add a release workflow: on a SemVer tag, run the full CI gate, build Linux/macOS binaries, and publish a GitHub Release with artifacts so `herdr plugin install` can resolve a pinned `--ref`.
   - Acceptance Criteria:
     - Pushing a semver tag produces a GitHub Release with Linux/macOS artifacts after CI passes; releases are versioned per SemVer.
@@ -386,7 +386,7 @@ Implementation plan derived from the constitution, requirements, and solution sp
   - _Requirements: Constitution (SemVer, release discipline), IR-004_
   - _Complexity: Medium_
 
-- [ ] 42\. End-to-end install-from-GitHub verification
+- [x] 42\. End-to-end install-from-GitHub verification
   - Add a verification job that installs the plugin from GitHub via `herdr plugin install <org/repo>` (including a pinned `--ref`) on a clean machine/CI and confirms manifest validation, build, and daemon + TUI launch succeed.
   - Acceptance Criteria:
     - `herdr plugin install <org/repo> --ref <tag>` succeeds from a clean environment; manifest validates, the plugin builds, and the daemon + TUI pane start.
