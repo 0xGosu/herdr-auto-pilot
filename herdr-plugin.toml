@@ -9,7 +9,7 @@ platforms = ["linux", "macos"]
 # The build step fetches the prebuilt binary for this platform from the
 # GitHub release matching `version`, verified against SHA256SUMS — no Go
 # toolchain required to install. Dev installs (`herdr plugin link`) build
-# with Go themselves: go build -o bin/herd-auto-prompter ./cmd/herd-auto-prompter
+# with Go themselves: go build -o bin/hap ./cmd/hap
 [[build]]
 command = ["bash", "scripts/install.sh"]
 
@@ -18,33 +18,33 @@ command = ["bash", "scripts/install.sh"]
 id = "control"
 title = "Auto Prompter"
 placement = "split"
-command = ["./bin/herd-auto-prompter", "tui"]
+command = ["./bin/hap", "tui"]
 
 # The monitoring daemon is ensured (started once, flock-guarded) whenever an
 # agent appears in the herd; the hook command returns immediately.
 [[events]]
 on = "pane.agent_detected"
-command = ["./bin/herd-auto-prompter", "daemon", "--ensure"]
+command = ["./bin/hap", "daemon", "--ensure"]
 
 [[events]]
 on = "workspace.created"
-command = ["./bin/herd-auto-prompter", "daemon", "--ensure"]
+command = ["./bin/hap", "daemon", "--ensure"]
 
 # One-shot control actions.
 [[actions]]
 id = "pause"
 title = "Pause auto-prompting (kill switch)"
 contexts = ["workspace"]
-command = ["./bin/herd-auto-prompter", "pause"]
+command = ["./bin/hap", "pause"]
 
 [[actions]]
 id = "resume"
 title = "Resume auto-prompting"
 contexts = ["workspace"]
-command = ["./bin/herd-auto-prompter", "resume"]
+command = ["./bin/hap", "resume"]
 
 [[actions]]
 id = "status"
 title = "Auto Prompter status"
 contexts = ["workspace"]
-command = ["./bin/herd-auto-prompter", "status"]
+command = ["./bin/hap", "status"]

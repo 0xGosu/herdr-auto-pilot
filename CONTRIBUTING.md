@@ -38,7 +38,7 @@ the diff carefully.
 To exercise your working tree inside Herdr:
 
 ```sh
-go build -o bin/herd-auto-prompter ./cmd/herd-auto-prompter
+go build -o bin/hap ./cmd/hap
 herdr plugin link .
 ```
 

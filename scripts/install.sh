@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Fetch the prebuilt herd-auto-prompter binary for this platform from GitHub
+# Fetch the prebuilt hap (Herd Auto Prompter) binary for this platform from GitHub
 # Releases, verified against SHA256SUMS. Run by the herdr plugin [[build]]
 # step with cwd = plugin root, so `herdr plugin install` needs no Go
 # toolchain. Dev installs (herdr plugin link) build with Go themselves:
-#   go build -o bin/herd-auto-prompter ./cmd/herd-auto-prompter
+#   go build -o bin/hap ./cmd/hap
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-DEST="bin/herd-auto-prompter"
+DEST="bin/hap"
 
 fail() {
-  echo "herd-auto-prompter fetch failed: $1" >&2
-  echo "to build from source instead: go build -o bin/herd-auto-prompter ./cmd/herd-auto-prompter" >&2
+  echo "hap fetch failed: $1" >&2
+  echo "to build from source instead: go build -o bin/hap ./cmd/hap" >&2
   exit 1
 }
 
@@ -33,7 +33,7 @@ case "$(uname -m)" in
   x86_64 | amd64) ARCH="amd64" ;;
   *) fail "unsupported architecture: $(uname -m)" ;;
 esac
-ASSET="herd-auto-prompter-${OS}-${ARCH}"
+ASSET="hap-${OS}-${ARCH}"
 BASE="https://github.com/${SLUG}/releases/download/v${VERSION}"
 
 TMP="$(mktemp -d)"

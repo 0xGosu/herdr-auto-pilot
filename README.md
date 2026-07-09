@@ -37,7 +37,7 @@ Pin a release (recommended for reproducible installs), or install
 non-interactively:
 
 ```sh
-herdr plugin install 0xGosu/herdr-auto-pilot --ref v0.1.0
+herdr plugin install 0xGosu/herdr-auto-pilot --ref v0.1.2
 herdr plugin install 0xGosu/herdr-auto-pilot --yes
 ```
 
@@ -46,9 +46,9 @@ the herd, and the **Auto Prompter** pane (TUI) is available from Herdr's pane
 commands. Everything the TUI does is also a CLI verb on the same binary:
 
 ```sh
-bin/herd-auto-prompter status         # from the plugin dir, or put it on PATH
-bin/herd-auto-prompter escalations
-bin/herd-auto-prompter pause          # global kill switch
+bin/hap status         # from the plugin dir, or put it on PATH
+bin/hap escalations
+bin/hap pause          # global kill switch
 ```
 
 ## How it learns (shadow mode)
@@ -116,7 +116,7 @@ regex patterns:
 allowlist_patterns = ['(?i)restart\s+the\s+payment\s+service']
 ```
 
-or `herd-auto-prompter rules add '<regex>'`. Prompts that *look* destructive
+or `hap rules add '<regex>'`. Prompts that *look* destructive
 but match no pattern are escalated by a suspected-irreversible heuristic
 rather than automated.
 
@@ -125,7 +125,7 @@ rather than automated.
 When no confident learned rule applies, the plugin can consult a local
 LLM/agent CLI you already have installed. The model receives context and
 submits its suggestion through the plugin's own MCP server
-(`herd-auto-prompter mcp` — tools `get_context` and `submit_decision`); its
+(`hap mcp` — tools `get_context` and `submit_decision`); its
 stdout is captured for audit only. Example for Claude Code:
 
 ```toml
@@ -167,7 +167,7 @@ go test ./...         # unit, golden, safety-invariant, concurrency, integration
 
 # develop against your local checkout: linking skips the release-download
 # build step, so build the binary yourself first
-go build -o bin/herd-auto-prompter ./cmd/herd-auto-prompter
+go build -o bin/hap ./cmd/hap
 herdr plugin link .
 ```
 

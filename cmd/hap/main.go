@@ -28,7 +28,7 @@ import (
 // version is stamped by the release build (-ldflags "-X main.version=...").
 var version = "dev"
 
-const usage = `herd-auto-prompter — keep your Herdr agents unblocked, hands-free
+const usage = `hap (Herd Auto Prompter) — keep your Herdr agents unblocked, hands-free
 
 Core:
   daemon [--ensure]     run the monitoring daemon (--ensure: start only if not running)
@@ -63,7 +63,7 @@ func main() {
 	args := os.Args[2:]
 
 	if verb == "version" || verb == "--version" || verb == "-V" {
-		fmt.Println("herd-auto-prompter", version)
+		fmt.Println("hap (herd-auto-prompter)", version)
 		return
 	}
 	if verb == "help" || verb == "--help" || verb == "-h" {

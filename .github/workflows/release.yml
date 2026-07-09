@@ -41,8 +41,8 @@ jobs:
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             GOOS="${target%/*}" GOARCH="${target#*/}" \
               go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-              -o "dist/herd-auto-prompter-${target%/*}-${target#*/}" \
-              ./cmd/herd-auto-prompter
+              -o "dist/hap-${target%/*}-${target#*/}" \
+              ./cmd/hap
           done
           (cd dist && sha256sum * > SHA256SUMS)
       - name: Publish GitHub Release
