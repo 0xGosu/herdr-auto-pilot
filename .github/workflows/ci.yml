@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (gofmt, go vet, golangci-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt violations:" && echo "$out" && exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+
+  test:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Full test suite (unit, golden, safety-invariant, concurrency, integration)
+        run: go test ./... -count=1 -timeout 10m
+      - name: Race detector
+        run: go test ./internal/store/... ./internal/domain/... ./internal/control/... -race -count=1
+
+  corpus-gate:
+    name: Allowlist corpus regression gate (NFR-005a)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Seed patterns must catch 100% of the irreversible-op corpus
+        run: go test ./internal/domain/ -run TestSeedAllowlistCatchesCorpus -v -count=1
+
+  cross-build:
+    name: Cross-platform build check (SC-8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: linux/amd64
+        run: GOOS=linux GOARCH=amd64 go build ./...
+      - name: linux/arm64
+        run: GOOS=linux GOARCH=arm64 go build ./...
+      - name: darwin/amd64
+        run: GOOS=darwin GOARCH=amd64 go build ./...
+      - name: darwin/arm64
+        run: GOOS=darwin GOARCH=arm64 go build ./...
+      - name: windows/amd64 (no platform lock on the daemon path)
+        run: GOOS=windows GOARCH=amd64 go build ./...
