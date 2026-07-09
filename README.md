@@ -61,7 +61,9 @@ The plugin never acts on a situation it hasn't learned from you.
    is masked), and — in shadow mode — **escalates with a suggestion**.
 2. **Confirm or correct.** In the TUI's *Escalations* tab press `enter` to
    confirm the suggestion (and send it), or `c` to type the correct
-   response. From the CLI: `confirm <id> --send` or
+   response — `v` shows the full record (trigger, rationale, LLM output)
+   when the list line is truncated; it works on the *Agents* and *Audit*
+   tabs too. From the CLI: `confirm <id> --send` or
    `resolve <id> --action TEXT --send`.
 3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
    *and* confidence above the per-situation threshold, that signature becomes
@@ -136,7 +138,11 @@ the TUI's *Rules* tab — which also edits every config field inline
 (`enter`), adds/removes task sources (`t`/`x`), and clears learned data
 (`X`). Prompts that *look* destructive
 but match no pattern are escalated by a suspected-irreversible heuristic
-rather than automated.
+rather than automated. The heuristic needs corroboration to fire — a
+destructive verb aimed at a data/infrastructure target, explicit no-undo
+language, and the like — so everyday prompts ("remove the unused import")
+don't trip it. Extend it with `irreversible_indicators` regex patterns in
+`[safety]`.
 
 ### Local LLM fallback (optional)
 
