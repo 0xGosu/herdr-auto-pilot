@@ -364,6 +364,10 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	situation.PaneID = tr.PaneID
 	situation.TabID = tr.TabID
 	situation.WorkspaceID = tr.WorkspaceID
+	// Keep herdr's reported agent_status with the situation: downstream
+	// sites (the async LLM path) must render the REAL status in triggers,
+	// never a fabricated one.
+	situation.Status = tr.Status
 	if situation.AgentType == "" {
 		situation.AgentType = "unknown"
 	}
@@ -952,6 +956,7 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	}
 	current := cls.Classify(s.AgentType, res.tr.Status, pane)
 	current.AgentID, current.PaneID, current.WorkspaceID = s.AgentID, s.PaneID, s.WorkspaceID
+	current.Status = res.tr.Status
 	if current.Type != s.Type {
 		slog.Info("situation changed during rewrite; dropping send",
 			"agent", s.AgentID, "was", s.Type, "now", current.Type)
@@ -997,7 +1002,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	cfg, allow, _ := d.snapshot()
 	now := d.opt.Clock.Now()
 	s := res.situation
-	tr := domain.AgentTransition{AgentID: s.AgentID, PaneID: s.PaneID, Status: "blocked"}
+	// The reconstructed transition must carry the status herdr actually
+	// reported (kept on the situation at classify time): the escalation
+	// trigger renders it, and a fabricated "blocked" misled operators
+	// whenever the consulted pane was really idle/done.
+	tr := domain.AgentTransition{AgentID: s.AgentID, PaneID: s.PaneID, Status: s.Status}
 
 	d.opt.Store.UpdateLLMRequestStatus(ctx, res.request.RequestID, "done")
 
@@ -1114,8 +1123,9 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(domain.ReasonHerdrUnreachable, "pane re-read failed before LLM promotion: "+err.Error())
 		return
 	}
-	current := cls.Classify(s.AgentType, "blocked", pane)
+	current := cls.Classify(s.AgentType, s.Status, pane)
 	current.AgentID, current.PaneID, current.WorkspaceID = s.AgentID, s.PaneID, s.WorkspaceID
+	current.Status = s.Status
 	// Compare raw content hashes: the staged signature may have been
 	// semantically remapped onto another key, but Raw always reflects the
 	// pane content as read, so equal Raw means the pane did not move on.

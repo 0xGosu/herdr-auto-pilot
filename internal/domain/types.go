@@ -60,6 +60,7 @@ type Situation struct {
 	PaneID         string
 	TabID          string
 	WorkspaceID    string
+	Status         string   // herdr-reported agent_status (e.g. idle|working|blocked|done|detected); empty when unknown
 	Content        string   // pane snapshot used for classification
 	Options        []string // normalized option set (choice situations)
 	PermissionVerb string   // salient permission verb/action (approval situations)
