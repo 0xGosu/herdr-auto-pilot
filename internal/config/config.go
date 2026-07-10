@@ -90,6 +90,32 @@ type LLM struct {
 	RewriteFallbackTemplate string `toml:"rewrite_fallback_template"`
 }
 
+// Embedding configures semantic signature matching: situations are matched
+// to learned signatures by embedding their masked salient content and
+// searching stored vectors, with BM25 text scoring as the fallback when the
+// embedder is unavailable. Missing model assets never break the daemon —
+// matching degrades to BM25, then to exact hashing.
+type Embedding struct {
+	// Disabled turns semantic matching off entirely (exact-hash only).
+	Disabled bool `toml:"disabled"`
+	// ModelPath overrides the embedding model. Empty resolves to
+	// <plugin-root>/models/all-minilm-l6-v2-q8_0.gguf next to the binary.
+	ModelPath string `toml:"model_path"`
+	// SimilarityThreshold is the minimum cosine similarity for a situation
+	// to reuse an existing signature. Values outside (0,1) restore the
+	// default 0.90.
+	SimilarityThreshold float64 `toml:"similarity_threshold"`
+	// BM25MinScore is the minimum NORMALIZED BM25 similarity, in (0,1], for
+	// the text-search fallback to reuse an existing signature (the hit's
+	// score relative to how well its stored text matches itself, so the
+	// bar stays meaningful as the corpus grows). Default 0.35: measured
+	// near-duplicate renders score ~0.4 while different actions score below
+	// ~0.26 or miss entirely.
+	BM25MinScore float64 `toml:"bm25_min_score"`
+	// GPULayers offloads model layers to the GPU (0 = CPU only).
+	GPULayers int `toml:"gpu_layers"`
+}
+
 // TaskSource points an agent or workspace at a declared next-task list (FR-011).
 type TaskSource struct {
 	Agent string `toml:"agent"` // agent id or name ("" = any)
@@ -127,6 +153,7 @@ type Config struct {
 	Safety      Safety           `toml:"safety"`
 	Limits      Limits           `toml:"limits"`
 	LLM         LLM              `toml:"llm"`
+	Embedding   Embedding        `toml:"embedding"`
 	TUI         TUI              `toml:"tui"`
 	TaskSources []TaskSource     `toml:"task_sources"`
 	Classifier  []ClassifierRule `toml:"classifier"`
@@ -154,6 +181,10 @@ func Default() Config {
 		// before unmarshalling, and a non-zero seed would mask "omitted →
 		// inherit timeout_seconds" in fillZeroes.
 		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000},
+		Embedding: Embedding{
+			SimilarityThreshold: 0.90,
+			BM25MinScore:        0.35,
+		},
 	}
 }
 
@@ -294,6 +325,15 @@ func (c *Config) fillZeroes() {
 	// RewriteTimeoutSeconds is deliberately NOT filled: it inherits its
 	// sibling timeout_seconds dynamically (RewriteTimeout), and a Save
 	// after filling would freeze the inherited value into config.toml.
+	if c.Embedding.SimilarityThreshold <= 0 || c.Embedding.SimilarityThreshold >= 1 {
+		c.Embedding.SimilarityThreshold = d.Embedding.SimilarityThreshold
+	}
+	if c.Embedding.BM25MinScore <= 0 || c.Embedding.BM25MinScore > 1 {
+		c.Embedding.BM25MinScore = d.Embedding.BM25MinScore
+	}
+	if c.Embedding.GPULayers < 0 {
+		c.Embedding.GPULayers = 0
+	}
 }
 
 // LLMTimeout returns the configured LLM timeout as a duration.

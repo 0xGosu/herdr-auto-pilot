@@ -154,7 +154,7 @@ __snapshot__
 *.snap
 
 # Turborepo
-.turbo 
+.turbo
 
 # Python
 __pycache__/
@@ -235,3 +235,7 @@ hooks.*.json
 .mind.mv2.*
 mind.mv2
 mind.mv2.lock
+# hap native/semantic-matching artifacts
+models/*.gguf
+lib/
+.cache/

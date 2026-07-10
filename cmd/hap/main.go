@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemon"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
+	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/herdr"
 	"github.com/0xGosu/herdr-auto-pilot/internal/llm"
@@ -176,6 +178,15 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		}
 	}
 
+	// The embedder is likewise rebuilt whenever the [embedding] section
+	// changes; nil (disabled) leaves BM25/exact matching.
+	embedderFactory := func(cfg config.Config) ports.EmbedderPort {
+		if cfg.Embedding.Disabled {
+			return nil
+		}
+		return embedder.New(cfg.Embedding)
+	}
+
 	socketPath := os.Getenv("HERDR_SOCKET_PATH")
 	if socketPath == "" {
 		home, _ := os.UserHomeDir()
@@ -190,6 +201,8 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		Events:            herdr.NewSubscriber(socketPath),
 		Notify:            cliAdapter,
 		LLMFactory:        llmFactory,
+		EmbedderFactory:   embedderFactory,
+		MatchIndexDir:     filepath.Join(paths.StateDir, "match-index"),
 	})
 	if err != nil {
 		return err

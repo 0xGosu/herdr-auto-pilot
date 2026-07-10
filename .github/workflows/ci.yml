@@ -9,47 +9,86 @@ on:
 permissions:
   contents: read
 
+env:
+  GO_BUILD_TAGS: vectors cpu
+
 jobs:
   lint:
     name: Lint (gofmt, go vet, golangci-lint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+      - name: Native cache key (submodule commit)
+        id: subsha
+        run: echo "sha=$(git submodule status third_party/llama-go | awk '{print substr($1,1,12)}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+      - name: Cache native builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/native
+            third_party/llama-go/*.a
+            third_party/llama-go/*.so
+            third_party/llama-go/llama.cpp/**/*.o
+          key: native-lint-${{ runner.os }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
+      - name: Build native dependencies
+        run: bash scripts/setup-native.sh
       - name: gofmt
         run: |
-          out=$(gofmt -l .)
+          out=$(gofmt -l . | grep -v '^third_party/' || true)
           if [ -n "$out" ]; then
             echo "gofmt violations:" && echo "$out" && exit 1
           fi
       - name: go vet
-        run: go vet ./...
+        run: go vet -tags "${GO_BUILD_TAGS}" ./...
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.12.2
+          args: --build-tags "vectors,cpu"
 
   test:
     name: Tests (${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # One linux and one macos runner; CGO makes cross-compile checks
+        # impossible, so the release matrix is the real multi-arch gate.
+        os: [ubuntu-latest, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+      - name: Native cache key (submodule commit)
+        id: subsha
+        run: echo "sha=$(git submodule status third_party/llama-go | awk '{print substr($1,1,12)}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+      - name: Cache native builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/native
+            third_party/llama-go/*.a
+            third_party/llama-go/*.so
+            third_party/llama-go/*.dylib
+            third_party/llama-go/llama.cpp/**/*.o
+          key: native-test-${{ matrix.os }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
+      - name: Build native dependencies
+        run: bash scripts/setup-native.sh
       - name: Build
-        run: go build ./...
-      - name: Full test suite (unit, golden, safety-invariant, concurrency, integration)
-        run: go test ./... -count=1 -timeout 10m
+        run: go build -tags "${GO_BUILD_TAGS}" ./...
+      - name: Full test suite (unit, golden, safety-invariant, concurrency, semantic-match)
+        run: go test -tags "${GO_BUILD_TAGS}" ./... -count=1 -timeout 15m
       - name: Race detector
-        run: go test ./internal/store/... ./internal/domain/... ./internal/control/... -race -count=1
+        run: go test -tags "${GO_BUILD_TAGS}" ./internal/store/... ./internal/domain/... ./internal/control/... ./internal/embedder/... ./internal/match/... ./internal/daemon/... -race -count=1
 
   corpus-gate:
     name: Allowlist corpus regression gate (NFR-005a)
@@ -60,25 +99,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # internal/domain is pure Go (TestDomainPurity), so no native deps
+      # or build tags are needed here.
       - name: Seed patterns must catch 100% of the irreversible-op corpus
         run: go test ./internal/domain/ -run TestSeedAllowlistCatchesCorpus -v -count=1
-
-  cross-build:
-    name: Cross-platform build check (SC-8)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: linux/amd64
-        run: GOOS=linux GOARCH=amd64 go build ./...
-      - name: linux/arm64
-        run: GOOS=linux GOARCH=arm64 go build ./...
-      - name: darwin/amd64
-        run: GOOS=darwin GOARCH=amd64 go build ./...
-      - name: darwin/arm64
-        run: GOOS=darwin GOARCH=arm64 go build ./...
-      - name: windows/amd64 (no platform lock on the daemon path)
-        run: GOOS=windows GOARCH=amd64 go build ./...

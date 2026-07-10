@@ -285,6 +285,9 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "pending escalations: %d\n", st.PendingEscalations)
 	fmt.Fprintf(out, "monitored agents:    %d\n", len(st.MonitoredAgents))
+	if st.Embedding != "" {
+		fmt.Fprintf(out, "semantic matching:   %s\n", st.Embedding)
+	}
 	if st.LatestKill != nil {
 		fmt.Fprintf(out, "last kill event:     %s by %s at %s\n",
 			st.LatestKill.State, st.LatestKill.Author, st.LatestKill.CreatedAt.Format(time.RFC3339))

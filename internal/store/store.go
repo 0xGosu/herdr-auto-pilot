@@ -9,8 +9,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"regexp"
 	"strings"
@@ -158,6 +160,18 @@ CREATE TABLE IF NOT EXISTS agent_names (
 	name TEXT NOT NULL UNIQUE,
 	created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS signature_embeddings (
+	signature TEXT PRIMARY KEY,
+	situation_type TEXT NOT NULL,
+	agent_type TEXT NOT NULL,
+	model TEXT NOT NULL DEFAULT '',
+	dims INTEGER NOT NULL DEFAULT 0,
+	vector BLOB,
+	salient TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sig_embed_scope
+	ON signature_embeddings(situation_type, agent_type);
 `
 
 func (s *Store) migrate() error {
@@ -390,13 +404,103 @@ func (s *Store) InsertKillEvent(ctx context.Context, e domain.KillEvent) (int64,
 func (s *Store) ClearLearnedData(ctx context.Context) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		for _, table := range []string{"signatures", "decisions", "audit_log", "corrections",
-			"agent_rate", "error_retries", "llm_requests", "llm_decisions"} {
+			"agent_rate", "error_retries", "llm_requests", "llm_decisions",
+			"signature_embeddings"} {
 			if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+}
+
+// UpsertSignatureEmbedding stores the semantic identity (salient text +
+// vector) a signature was minted from (daemon-owned).
+func (s *Store) UpsertSignatureEmbedding(ctx context.Context, e domain.SignatureEmbedding) error {
+	blob, err := encodeVector(e.Vector)
+	if err != nil {
+		return err
+	}
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO signature_embeddings (signature, situation_type, agent_type,
+				model, dims, vector, salient, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(signature) DO UPDATE SET
+				model=excluded.model,
+				dims=excluded.dims,
+				vector=excluded.vector,
+				salient=excluded.salient`,
+			e.Signature, string(e.SituationType), e.AgentType,
+			e.Model, e.Dims, blob, e.Salient, unix(e.CreatedAt))
+		return err
+	})
+}
+
+// ListSignatureEmbeddings returns every stored semantic identity row.
+func (s *Store) ListSignatureEmbeddings(ctx context.Context) ([]domain.SignatureEmbedding, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT signature, situation_type, agent_type, model, dims, vector, salient, created_at
+		FROM signature_embeddings ORDER BY created_at, signature`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.SignatureEmbedding
+	for rows.Next() {
+		var e domain.SignatureEmbedding
+		var st string
+		var blob []byte
+		var created int64
+		if err := rows.Scan(&e.Signature, &st, &e.AgentType, &e.Model, &e.Dims,
+			&blob, &e.Salient, &created); err != nil {
+			return nil, err
+		}
+		e.SituationType = domain.SituationType(st)
+		e.CreatedAt = fromUnix(created)
+		if e.Vector, err = decodeVector(blob, e.Dims); err != nil {
+			// A corrupt vector must not poison the whole load: surface the
+			// row without it so it behaves like a BM25-era row.
+			e.Vector, e.Dims, e.Model = nil, 0, ""
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// CountSignatureEmbeddings reports how many semantic identity rows exist.
+func (s *Store) CountSignatureEmbeddings(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM signature_embeddings`).Scan(&n)
+	return n, err
+}
+
+// encodeVector packs float32s as a little-endian blob (nil for no vector).
+func encodeVector(v []float32) ([]byte, error) {
+	if len(v) == 0 {
+		return nil, nil
+	}
+	buf := make([]byte, 4*len(v))
+	for i, f := range v {
+		binary.LittleEndian.PutUint32(buf[4*i:], math.Float32bits(f))
+	}
+	return buf, nil
+}
+
+// decodeVector unpacks a little-endian float32 blob, validating length.
+func decodeVector(blob []byte, dims int) ([]float32, error) {
+	if len(blob) == 0 {
+		return nil, nil
+	}
+	if dims <= 0 || len(blob) != 4*dims {
+		return nil, fmt.Errorf("vector blob length %d does not match dims %d", len(blob), dims)
+	}
+	v := make([]float32, dims)
+	for i := range v {
+		v[i] = math.Float32frombits(binary.LittleEndian.Uint32(blob[4*i:]))
+	}
+	return v, nil
 }
 
 // --- mcp writes (staged) ---
@@ -602,7 +706,10 @@ func (s *Store) DeleteSignature(ctx context.Context, signature string) (int64, e
 		if decisions, err = res.RowsAffected(); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM error_retries WHERE error_signature = ?`, signature)
+		if _, err = tx.ExecContext(ctx, `DELETE FROM error_retries WHERE error_signature = ?`, signature); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM signature_embeddings WHERE signature = ?`, signature)
 		return err
 	})
 	if err != nil {

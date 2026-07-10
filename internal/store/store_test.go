@@ -594,3 +594,88 @@ func TestLatestAuditForSignature(t *testing.T) {
 		t.Errorf("newest row should win, got trigger %q", a.Trigger)
 	}
 }
+
+func TestSignatureEmbeddingRoundTrip(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	vec := []float32{0.25, -1.5, 3.0e-7, 0.99999}
+	err := s.UpsertSignatureEmbedding(ctx, domain.SignatureEmbedding{
+		Signature: "approval:abc", SituationType: domain.SituationApproval,
+		AgentType: "claude", Model: "minilm", Dims: len(vec), Vector: vec,
+		Salient: "permission: edit files", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A vector-less (BM25-era) row is legal.
+	if err := s.UpsertSignatureEmbedding(ctx, domain.SignatureEmbedding{
+		Signature: "choice:def", SituationType: domain.SituationChoice,
+		AgentType: "codex", Salient: "options:no;yes", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.ListSignatureEmbeddings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	got := rows[0]
+	if got.Signature != "approval:abc" || got.Model != "minilm" || got.Salient != "permission: edit files" {
+		t.Errorf("row fields lost: %+v", got)
+	}
+	if len(got.Vector) != len(vec) {
+		t.Fatalf("vector dims = %d, want %d", len(got.Vector), len(vec))
+	}
+	for i := range vec {
+		if got.Vector[i] != vec[i] {
+			t.Errorf("vector[%d] = %v, want %v (float32 fidelity)", i, got.Vector[i], vec[i])
+		}
+	}
+	if rows[1].Vector != nil {
+		t.Error("vector-less row should decode to nil vector")
+	}
+
+	// Upsert replaces the vector in place.
+	if err := s.UpsertSignatureEmbedding(ctx, domain.SignatureEmbedding{
+		Signature: "approval:abc", SituationType: domain.SituationApproval,
+		AgentType: "claude", Model: "other", Dims: 2, Vector: []float32{1, 2},
+		Salient: "permission: edit files", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountSignatureEmbeddings(ctx); n != 2 {
+		t.Errorf("count after upsert = %d, want 2", n)
+	}
+
+	// DeleteSignature cascades the embedding row.
+	seedSignature(t, s, "approval:abc", domain.SituationApproval, "claude", domain.ModeShadow, 0.5, now)
+	if _, err := s.DeleteSignature(ctx, "approval:abc"); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ = s.ListSignatureEmbeddings(ctx)
+	if len(rows) != 1 || rows[0].Signature != "choice:def" {
+		t.Errorf("embedding row should be cascade-deleted, got %+v", rows)
+	}
+
+	// ClearLearnedData empties the table.
+	if err := s.ClearLearnedData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountSignatureEmbeddings(ctx); n != 0 {
+		t.Errorf("count after clear = %d, want 0", n)
+	}
+}
+
+func TestDecodeVectorRejectsCorruptBlob(t *testing.T) {
+	if _, err := decodeVector([]byte{1, 2, 3}, 1); err == nil {
+		t.Error("length mismatch should error")
+	}
+	if v, err := decodeVector(nil, 0); err != nil || v != nil {
+		t.Errorf("empty blob should be nil vector, got %v/%v", v, err)
+	}
+}

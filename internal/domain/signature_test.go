@@ -137,3 +137,20 @@ func TestSalientContentUsesPermissionVerb(t *testing.T) {
 		t.Error("approval signatures should key on the permission verb, not pane noise")
 	}
 }
+
+func TestComputeSignatureRawMirrorsKey(t *testing.T) {
+	res := ComputeSignature(sit(SituationApproval, "claude",
+		strings.Repeat("allow the tool to edit files in the project? ", 2)))
+	if res.Verdict != GuardOK {
+		t.Fatalf("verdict = %v, want ok", res.Verdict)
+	}
+	if res.Raw == "" || res.Raw != res.Signature {
+		t.Errorf("Raw = %q, want equal to Signature %q", res.Raw, res.Signature)
+	}
+
+	over := ComputeSignature(sit(SituationIdle, "claude", "/a/b/c 12345"))
+	if over.Raw != "" || over.Signature != "" {
+		t.Errorf("over-masked signature should have empty key and Raw, got %q / %q",
+			over.Signature, over.Raw)
+	}
+}
