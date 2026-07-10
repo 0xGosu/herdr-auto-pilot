@@ -94,8 +94,10 @@ with a ticket/issue id**. Examples from history:
 
 Releases are **tag-driven**: merging a PR does NOT create a release.
 `.github/workflows/release.yml` fires on a `v*.*.*` tag push, runs the full
-CI gate, then builds on FOUR native runners (CGO cannot cross-compile):
-`hap-{linux,darwin}-{amd64,arm64}` (llama.cpp statically linked in), a
+CI gate, then builds on THREE native runners (CGO cannot cross-compile; Intel
+macOS is deliberately unsupported):
+`hap-{linux-amd64,linux-arm64,darwin-arm64}` (llama.cpp statically
+linked in), a
 `hap-native-<os>-<arch>.tar.gz` per platform (FAISS shared libs, plus
 libomp on macOS, rpath'd to `<plugin>/lib`), the
 `all-minilm-l6-v2-q8_0.gguf` embedding model fetched from Hugging Face
