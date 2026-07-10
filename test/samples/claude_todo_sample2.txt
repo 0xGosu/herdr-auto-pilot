@@ -1,0 +1,16 @@
+Found 1 new diagnostic issue in 1 file (ctrl+o to expand)
+
+The link drags in -lggml-vulkan -lvulkan. Checking why the vulkan variant got compiled in.
+
+  Searching for 2 patterns, listing 1 directory, running 9 shell commands…
+  ⎿  $ sed -n '40,52p' /workspaces/native-build/faiss/c_api/CMakeLists.txt
+
+● Background command "Build faiss core then relink faiss_c" failed with exit code 1
+
+✽ Setting up native build environment… (1h 24m 14s · ↓ 85.3k tokens · thought for 2s)
+◼ Set up worktree, submodule, native deps (llama-go libbinding.a, FAISS libfaiss_c, cmake)
+◼ Add go.mod deps (llama-go replace, bleve/v2) and verify -tags vectors builds
+◼ Embedder adapter internal/embedder (llama-go wrapper)
+◼ Matcher internal/match (bleve KNN + BM25)
+◻ Daemon: resolveSignature 5-step flow + initSemantic + Options wiring + hap status
+ … +2 pending, 3 completed

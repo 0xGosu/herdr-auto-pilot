@@ -126,48 +126,64 @@ func InferNextTask(agentType, transcript string) InferredTask {
 }
 
 // claudeTodoItemRE matches one line of Claude Code's todo-widget rendering:
-// optional indent, an optional ⎿/└ connector on the first item, a status
-// marker rune, then the task text. Markers are matched liberally across
-// Claude Code versions/fonts: completed ✔ ✓ ☒, in-progress ■ ▪ ◼,
-// pending □ ▫ ☐.
-var claudeTodoItemRE = regexp.MustCompile(`^\s*([⎿└]\s*)?([✔✓☒■▪◼□▫☐])\s+(\S.*)$`)
+// optional indent, an optional ⎿/└ connector, a status marker rune, then
+// the task text. Marker runes vary across Claude Code versions/fonts —
+// verified against real TUI copies in test/samples/claude_todo_sample*.txt:
+// completed ✔ ✓ ☒, in-progress ■ ▪ ◼ ◾, pending □ ▫ ☐ ◻ ◽.
+var claudeTodoItemRE = regexp.MustCompile(`^\s*(?:[⎿└]\s*)?([✔✓☒■▪◼◾□▫☐◻◽])\s+(\S.*)$`)
 
-// inferClaudeNextTask parses Claude Code's native todo widget:
+// claudeTodoHeaderRE matches the widget's header/status line — a spinner
+// glyph (frames vary: · * ✽ ✻ ✶ ✳ ✢, or the ● message bullet), a space,
+// and text containing the "…" ellipsis every header carries ("Wiring
+// daemon semantic resolver… (1h 42m · ↓ 133.0k tokens)"). A header ends
+// the current block so back-to-back renders with no blank line between
+// them never concatenate; requiring the ellipsis keeps an item's wrapped
+// continuation line from ever matching.
+var claudeTodoHeaderRE = regexp.MustCompile(`^\s*[·✻✽✶✳✢*●]\s.*…`)
+
+// inferClaudeNextTask parses Claude Code's native todo widget, e.g. (a
+// real TUI copy; the header spinner varies — · * ✽ ✻ — and a footer like
+// "… +2 pending, 3 completed" summarizes items hidden by truncation):
 //
-//	· Building integration test suite… (27m 52s · ↓ 73.9k tokens)
-//	  ⎿  ✔ Fix send: map option label to menu index
-//	     ✔ TUI full width rendering + config knob
-//	     ■ Real herdr+claude integration test suite
-//	     □ Docs + full verification + PR
+//	✻ Wiring daemon semantic resolver… (1h 42m 16s · ↓ 133.0k tokens)
+//	◼ Daemon: resolveSignature 5-step flow + initSemantic + Options wiring
+//	◻ Packaging: release.yml 4-runner matrix, install.sh, docs
+//	✔ Set up worktree, submodule, native deps
+//	 … +5 completed
 //
 // Claude re-renders the widget as it progresses, so only the freshest
-// render counts: an item line carrying the ⎿/└ connector starts a new
-// block, later marker lines append to it, and every other line — blank
-// lines, narration, or an item's own hard-wrapped continuation (pane
-// content is screen rows, wrapped at pane width) — is ignored rather than
-// treated as a block break, so a wrapped item never splits the widget.
-// The next task is the in-progress (■) item when one exists — the agent
-// stopped mid-item — otherwise the first pending (□) item. A fully
-// completed list (or no widget at all) yields a zero value.
+// render counts: a blank line or a widget header line ends the current
+// block, and the next item line after that starts a new block superseding
+// earlier ones. Other non-item lines — an item's own hard-wrapped
+// continuation (pane content is screen rows, wrapped at pane width), the
+// "… +N" footer, or adjacent narration — never split a block, so a
+// wrapped item cannot hide an in-progress entry. The next task is the
+// first in-progress item when one exists (the widget sorts in-progress
+// before pending), otherwise the first pending item. A fully completed
+// list (or no widget at all) yields a zero value.
 func inferClaudeNextTask(transcript string) InferredTask {
 	type item struct{ marker, text string }
 	var block []item
+	inBlock := false
 	for _, line := range strings.Split(transcript, "\n") {
-		m := claudeTodoItemRE.FindStringSubmatch(line)
-		if m == nil {
+		if m := claudeTodoItemRE.FindStringSubmatch(line); m != nil {
+			if !inBlock {
+				block = block[:0] // a newer render supersedes earlier ones
+				inBlock = true
+			}
+			block = append(block, item{marker: m[1], text: strings.TrimSpace(m[2])})
 			continue
 		}
-		if m[1] != "" {
-			block = block[:0] // connector = a fresh render; supersede earlier ones
+		if strings.TrimSpace(line) == "" || claudeTodoHeaderRE.MatchString(line) {
+			inBlock = false // a blank line or fresh header ends the widget
 		}
-		block = append(block, item{marker: m[2], text: strings.TrimSpace(m[3])})
 	}
 	var firstPending string
 	for _, it := range block {
 		switch it.marker {
-		case "■", "▪", "◼":
+		case "■", "▪", "◼", "◾":
 			return InferredTask{Task: it.text, Structured: true}
-		case "□", "▫", "☐":
+		case "□", "▫", "☐", "◻", "◽":
 			if firstPending == "" {
 				firstPending = it.text
 			}
