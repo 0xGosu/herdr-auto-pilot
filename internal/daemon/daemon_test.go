@@ -1024,21 +1024,26 @@ func TestCorrectionDemotesAutonomousSignature(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Wait for the lineage audit — the LAST write applyCorrection makes
+	// before resolving — so every earlier effect (demotion included) is
+	// durably visible when we assert; waiting on the demotion alone raced
+	// the lineage append on slow runners.
 	waitFor(t, 3*time.Second, func() bool {
-		st, _ := h.raw.GetSignature(ctx, sigKey)
-		return st != nil && st.Mode == domain.ModeShadow && st.ConsecutiveConfirmations == 0
+		log, _ := h.raw.AuditLog(ctx, 5)
+		for _, r := range log {
+			if r.CorrectsAuditID == audits[0].ID {
+				return true
+			}
+		}
+		return false
 	})
 
-	// The correction is itself in the audit trail with lineage (DR-005).
-	log, _ := h.raw.AuditLog(ctx, 5)
-	var found bool
-	for _, r := range log {
-		if r.CorrectsAuditID == audits[0].ID {
-			found = true
-		}
+	st, err := h.raw.GetSignature(ctx, sigKey)
+	if err != nil || st == nil {
+		t.Fatalf("signature state: %v %v", st, err)
 	}
-	if !found {
-		t.Error("correction lineage missing from audit trail")
+	if st.Mode != domain.ModeShadow || st.ConsecutiveConfirmations != 0 {
+		t.Errorf("correction must demote to shadow with a reset streak: %+v", st)
 	}
 }
 
