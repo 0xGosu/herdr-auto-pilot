@@ -269,6 +269,11 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		{"llm.auto_act", "true", false},
 		{"llm.auto_act", "maybe", true},
 		{"llm.command", `claude -p "decide for me"`, false},
+		{"llm.rewrite_command", `claude -p "rewrite: {text}" --model haiku`, false},
+		{"llm.rewrite_command", `claude -p "unbalanced`, true},
+		{"llm.rewrite_timeout_seconds", "45", false},
+		{"llm.rewrite_timeout_seconds", "zero", true},
+		{"llm.rewrite_fallback_template", "Act on: {original_text}", false},
 		{"nonexistent.field", "1", true},
 	}
 	for _, c := range cases {
@@ -288,6 +293,13 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 	}
 	if len(cfg.LLM.Command) != 3 || cfg.LLM.Command[2] != "decide for me" {
 		t.Errorf("llm.command quote handling: %v", cfg.LLM.Command)
+	}
+	if len(cfg.LLM.RewriteCommand) != 5 || cfg.LLM.RewriteCommand[2] != "rewrite: {text}" {
+		t.Errorf("llm.rewrite_command quote handling: %v", cfg.LLM.RewriteCommand)
+	}
+	if cfg.LLM.RewriteTimeoutSeconds != 45 ||
+		cfg.LLM.RewriteFallbackTemplate != "Act on: {original_text}" {
+		t.Errorf("rewrite keys not persisted: %+v", cfg.LLM)
 	}
 	// Every editable key renders a value.
 	for _, key := range frontend.ConfigFieldKeys {

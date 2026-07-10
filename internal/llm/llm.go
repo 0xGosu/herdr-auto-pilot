@@ -30,6 +30,12 @@ type Adapter struct {
 	Store           ports.ReadStore
 	// SelfPath overrides the {self} placeholder (defaults to os.Executable).
 	SelfPath string
+	// RewriteTemplate is the argv template for the one-shot outbound-text
+	// rewrite (llm.rewrite_command); placeholders {text}, {situation_type},
+	// {agent_type}, {pane_excerpt}. Empty disables rewriting.
+	RewriteTemplate []string
+	// RewriteTimeout bounds one rewrite run (<=0 falls back to Timeout).
+	RewriteTimeout time.Duration
 }
 
 // Configured reports whether an LLM CLI is configured (IR-005).
@@ -62,15 +68,8 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 	// after other flags) so a slightly-off operator config still works.
 	argv = NormalizeLLMCommand(argv)
 
-	// The daemon's PATH can be narrower than the operator's shell (GUI- or
-	// hook-launched); surface that as itself instead of a bare exit error.
-	// A command containing a separator never consults PATH, so it gets a
-	// message that doesn't misdiagnose a missing file as a PATH problem.
-	if _, err := exec.LookPath(argv[0]); err != nil {
-		if strings.ContainsRune(argv[0], os.PathSeparator) {
-			return nil, fmt.Errorf("llm command %q not runnable: %w", argv[0], err)
-		}
-		return nil, fmt.Errorf("llm command %q not found in PATH (the daemon's PATH may differ from your shell): %w", argv[0], err)
+	if err := preflight(argv[0]); err != nil {
+		return nil, err
 	}
 
 	timeout := a.Timeout
@@ -144,6 +143,21 @@ func (a *Adapter) WorkDir() string {
 func dirLives(dir string) bool {
 	fi, err := os.Stat(dir)
 	return err == nil && fi.IsDir()
+}
+
+// preflight verifies the CLI is runnable before spawning. The daemon's PATH
+// can be narrower than the operator's shell (GUI- or hook-launched); surface
+// that as itself instead of a bare exit error. A command containing a
+// separator never consults PATH, so it gets a message that doesn't
+// misdiagnose a missing file as a PATH problem.
+func preflight(argv0 string) error {
+	if _, err := exec.LookPath(argv0); err != nil {
+		if strings.ContainsRune(argv0, os.PathSeparator) {
+			return fmt.Errorf("llm command %q not runnable: %w", argv0, err)
+		}
+		return fmt.Errorf("llm command %q not found in PATH (the daemon's PATH may differ from your shell): %w", argv0, err)
+	}
+	return nil
 }
 
 func truncate(s string, n int) string {

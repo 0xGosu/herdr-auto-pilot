@@ -74,6 +74,20 @@ type LLM struct {
 	// in the consult context handed to the LLM. Zero or omitted restores
 	// the 5000-char default.
 	PaneExcerptChars int `toml:"pane_excerpt_chars"`
+	// RewriteCommand is the argv template for the one-shot rewrite of
+	// literal outbound text (idle next-task prompts, error retry commands,
+	// free-text replies — never menu digits); placeholders {text},
+	// {situation_type}, {agent_type}, {pane_excerpt}. The rewritten text
+	// is read from the CLI's stdout. Empty means literal text is sent
+	// unchanged.
+	RewriteCommand []string `toml:"rewrite_command"`
+	// RewriteTimeoutSeconds bounds one rewrite run; zero or omitted
+	// inherits timeout_seconds.
+	RewriteTimeoutSeconds int `toml:"rewrite_timeout_seconds"`
+	// RewriteFallbackTemplate wraps the original text when the rewrite
+	// fails ({original_text} placeholder). Empty uses the built-in
+	// default; a rewrite failure never blocks the send.
+	RewriteFallbackTemplate string `toml:"rewrite_fallback_template"`
 }
 
 // TaskSource points an agent or workspace at a declared next-task list (FR-011).
@@ -136,6 +150,9 @@ func Default() Config {
 			MaxAutoPromptsPerMinute:   10,
 			MaxErrorRetries:           2,
 		},
+		// RewriteTimeoutSeconds stays zero here: Load seeds from Default
+		// before unmarshalling, and a non-zero seed would mask "omitted →
+		// inherit timeout_seconds" in fillZeroes.
 		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000},
 	}
 }
@@ -274,11 +291,23 @@ func (c *Config) fillZeroes() {
 	if c.LLM.PaneExcerptChars <= 0 {
 		c.LLM.PaneExcerptChars = d.LLM.PaneExcerptChars
 	}
+	// RewriteTimeoutSeconds is deliberately NOT filled: it inherits its
+	// sibling timeout_seconds dynamically (RewriteTimeout), and a Save
+	// after filling would freeze the inherited value into config.toml.
 }
 
 // LLMTimeout returns the configured LLM timeout as a duration.
 func (c Config) LLMTimeout() time.Duration {
 	return time.Duration(c.LLM.TimeoutSeconds) * time.Second
+}
+
+// RewriteTimeout returns the rewrite timeout: rewrite_timeout_seconds, or —
+// when zero/omitted — the consult timeout_seconds.
+func (c Config) RewriteTimeout() time.Duration {
+	if c.LLM.RewriteTimeoutSeconds <= 0 {
+		return c.LLMTimeout()
+	}
+	return time.Duration(c.LLM.RewriteTimeoutSeconds) * time.Second
 }
 
 // Save writes the config to path in TOML form (used by `config set`).

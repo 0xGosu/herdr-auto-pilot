@@ -332,6 +332,9 @@ var ConfigFieldKeys = []string{
 	"llm.command",
 	"llm.timeout_seconds",
 	"llm.auto_act",
+	"llm.rewrite_command",
+	"llm.rewrite_timeout_seconds",
+	"llm.rewrite_fallback_template",
 }
 
 // FieldValue renders the current value of a SetField key for display.
@@ -361,6 +364,12 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.LLM.TimeoutSeconds)
 	case "llm.auto_act":
 		return strconv.FormatBool(cfg.LLM.AutoAct)
+	case "llm.rewrite_command":
+		return JoinCommand(cfg.LLM.RewriteCommand)
+	case "llm.rewrite_timeout_seconds":
+		return strconv.Itoa(cfg.LLM.RewriteTimeoutSeconds)
+	case "llm.rewrite_fallback_template":
+		return cfg.LLM.RewriteFallbackTemplate
 	}
 	return ""
 }
@@ -423,6 +432,20 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("llm.command: %w", err)
 			}
 			cfg.LLM.Command = argv // empty disables the LLM fallback
+			return nil
+		case "llm.rewrite_command":
+			argv, err := SplitCommand(value)
+			if err != nil {
+				return fmt.Errorf("llm.rewrite_command: %w", err)
+			}
+			cfg.LLM.RewriteCommand = argv // empty disables the rewrite
+			return nil
+		case "llm.rewrite_timeout_seconds":
+			return setInt(&cfg.LLM.RewriteTimeoutSeconds)
+		case "llm.rewrite_fallback_template":
+			// Any text is accepted; empty restores the built-in default at
+			// use time (domain.ApplyRewriteFallback).
+			cfg.LLM.RewriteFallbackTemplate = value
 			return nil
 		}
 		return fmt.Errorf("unknown config field %q", key)
