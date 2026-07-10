@@ -7,14 +7,18 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemon"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/herdr"
 	"github.com/0xGosu/herdr-auto-pilot/internal/llm"
@@ -25,13 +29,11 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/tui"
 )
 
-// version is stamped by the release build (-ldflags "-X main.version=...").
-var version = "dev"
-
 const usage = `hap (Herd Auto Prompter) — keep your Herdr agents unblocked, hands-free
 
 Core:
-  daemon [--ensure]     run the monitoring daemon (--ensure: start only if not running)
+  daemon [--ensure]     run the monitoring daemon (--ensure: start if not
+                        running; replace a daemon left by an older binary)
   tui                   run the TUI control pane
   mcp                   run the stdio MCP server (used by the LLM fallback)
 
@@ -66,7 +68,7 @@ func main() {
 	args := os.Args[2:]
 
 	if verb == "version" || verb == "--version" || verb == "-V" {
-		fmt.Println("hap (herd-auto-prompter)", version)
+		fmt.Println("hap (herd-auto-prompter)", buildinfo.Version)
 		return
 	}
 	if verb == "help" || verb == "--help" || verb == "-h" {
@@ -125,6 +127,9 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 		ConfigPath:  paths.File(),
 		ControlPath: paths.ControlSocketPath(),
 		Author:      "operator",
+		DaemonInfo: func() (bool, int, string) {
+			return daemonlock.Info(paths)
+		},
 	}
 	return app, func() { st.Close() }, nil
 }
@@ -139,11 +144,16 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		return err
 	}
 
-	lock, err := acquireDaemonLock(paths)
+	// The herdr event hook launches the daemon from arbitrary workspace
+	// dirs that may later be deleted; a dead cwd kills child CLIs at spawn
+	// (the Bun-built claude dies on getcwd), so run from the state dir.
+	chdirStable(paths.StateDir)
+
+	lock, err := daemonlock.Acquire(paths)
 	if err != nil {
 		return err
 	}
-	defer lock.release()
+	defer lock.Release()
 
 	st, err := store.Open(paths.DBPath())
 	if err != nil {
@@ -186,24 +196,39 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 }
 
 // ensureDaemon starts a detached daemon if none is running (used by the
-// Herdr event hook so hooks return promptly).
+// Herdr event hook so hooks return promptly). A daemon left over from a
+// different binary version is stopped and replaced, so binary upgrades
+// take effect without a manual kill.
 func ensureDaemon(paths config.Paths) error {
-	if daemonRunning(paths) {
-		return nil
+	return daemonlock.EnsureFresh(paths, buildinfo.Version, 3*time.Second, daemonlock.Stop, func() error {
+		self, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		cmd := exec.Command(self, "daemon")
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+		cmd.Stdin = nil
+		daemonlock.Detach(cmd)
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		return cmd.Process.Release()
+	})
+}
+
+// chdirStable moves the daemon onto a directory that outlives it; failure
+// is survivable (llm.Adapter.WorkDir still guards each spawn) so it only
+// warns.
+func chdirStable(stateDir string) {
+	if err := os.Chdir(stateDir); err == nil {
+		return
 	}
-	self, err := os.Executable()
-	if err != nil {
-		return err
+	if home, err := os.UserHomeDir(); err == nil && os.Chdir(home) == nil {
+		slog.Warn("state dir not usable as cwd; running from home", "state_dir", stateDir)
+		return
 	}
-	cmd := exec.Command(self, "daemon")
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.Stdin = nil
-	detach(cmd)
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	return cmd.Process.Release()
+	slog.Warn("could not leave inherited cwd; child CLIs may fail if it is deleted", "state_dir", stateDir)
 }
 
 func runMCP(ctx context.Context, paths config.Paths) error {

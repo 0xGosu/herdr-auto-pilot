@@ -33,6 +33,25 @@ func writeScript(t *testing.T, body string) string {
 	return path
 }
 
+func TestConsultPreflightsMissingCommand(t *testing.T) {
+	// A hook-launched daemon can have a narrower PATH than the operator's
+	// shell; the adapter must name the missing command instead of failing
+	// with a bare exit error. Store stays nil: the preflight must reject
+	// before any spawn or DB read.
+	a := &Adapter{
+		CommandTemplate: []string{"hap-test-command-that-does-not-exist"},
+		Timeout:         time.Second,
+		SelfPath:        "/bin/true",
+	}
+	_, err := a.Consult(context.Background(), domain.LLMRequest{RequestID: "req-p"})
+	if err == nil {
+		t.Fatal("missing command must produce an error")
+	}
+	if !strings.Contains(err.Error(), "not found in PATH") {
+		t.Errorf("error should name the PATH problem: %v", err)
+	}
+}
+
 func TestConsultTimeoutEscalates(t *testing.T) {
 	// NFR-006: consultation is bounded by the timeout, after which the
 	// adapter fails safe (the daemon escalates).

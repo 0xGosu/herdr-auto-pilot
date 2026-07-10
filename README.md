@@ -294,6 +294,23 @@ suggestion is re-gated through the same allowlist, kill switch, and rate
 guards; with `auto_act = true` it may act only when it doesn't contradict
 your learned history. On timeout or no submission the situation escalates.
 
+#### Troubleshooting the fallback
+
+- **Escalations citing `not found in PATH`** — the daemon inherits herdr's
+  environment, which can be narrower than your shell's; make sure the CLI
+  is reachable from a non-login shell or use an absolute path in
+  `llm.command`.
+- **Escalations citing `ENOENT: Bun could not find a file` (≤ v0.1.10)** —
+  the daemon was started from a workspace directory that has since been
+  deleted, which kills the Bun-built `claude` CLI at startup. Fixed in
+  v0.1.11; upgrading also requires replacing the running daemon (below).
+- **Upgrades not taking effect** — the daemon is a singleton that outlives
+  binary upgrades. Since v0.1.13, `hap daemon --ensure` (fired by herdr's
+  event hooks) detects the version mismatch and replaces the old daemon
+  automatically; `hap status` shows the running daemon's version and flags
+  a stale one. On older versions run `pkill -f 'hap daemon'` once after
+  upgrading.
+
 ## Pause/kill switch & audit
 
 - `pause` / `resume` (CLI, TUI `p`/`r`, or Herdr plugin actions) toggle a

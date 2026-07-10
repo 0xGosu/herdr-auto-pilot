@@ -62,6 +62,17 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 	// after other flags) so a slightly-off operator config still works.
 	argv = NormalizeLLMCommand(argv)
 
+	// The daemon's PATH can be narrower than the operator's shell (GUI- or
+	// hook-launched); surface that as itself instead of a bare exit error.
+	// A command containing a separator never consults PATH, so it gets a
+	// message that doesn't misdiagnose a missing file as a PATH problem.
+	if _, err := exec.LookPath(argv[0]); err != nil {
+		if strings.ContainsRune(argv[0], os.PathSeparator) {
+			return nil, fmt.Errorf("llm command %q not runnable: %w", argv[0], err)
+		}
+		return nil, fmt.Errorf("llm command %q not found in PATH (the daemon's PATH may differ from your shell): %w", argv[0], err)
+	}
+
 	timeout := a.Timeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second

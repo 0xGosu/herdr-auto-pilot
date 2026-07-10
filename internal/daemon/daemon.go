@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/classify"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
@@ -183,7 +184,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	sweep := time.NewTicker(time.Minute)
 	defer sweep.Stop()
 
-	slog.Info("daemon running")
+	slog.Info("daemon running", "version", buildinfo.Version)
 	for {
 		select {
 		case <-ctx.Done():
@@ -499,7 +500,8 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	}
 	d.notify(ctx, title, body)
 	slog.Info("escalated", "agent", s.AgentID, "situation", s.Type,
-		"reason", dec.Reason, "suggestion", dec.Suggestion)
+		"reason", dec.Reason, "suggestion", dec.Suggestion,
+		"version", buildinfo.Version)
 }
 
 // consultLLM stages a request and launches the operator's LLM CLI in a

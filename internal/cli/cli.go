@@ -15,7 +15,9 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 )
@@ -267,6 +269,20 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 		state = "PAUSED (kill switch active)"
 	}
 	fmt.Fprintf(out, "automation:          %s\n", state)
+	if app.DaemonInfo != nil {
+		running, pid, ver := app.DaemonInfo()
+		switch {
+		case !running:
+			fmt.Fprintf(out, "daemon:              not running\n")
+		case ver == buildinfo.Version:
+			fmt.Fprintf(out, "daemon:              running %s (pid %d)\n", daemonlock.VersionLabel(ver), pid)
+		default:
+			// A holder from another binary keeps old bugs alive; make the
+			// mismatch and the remedy impossible to miss.
+			fmt.Fprintf(out, "daemon:              running %s (pid %d) — STALE, binary is %s; run: hap daemon --ensure\n",
+				daemonlock.VersionLabel(ver), pid, buildinfo.Version)
+		}
+	}
 	fmt.Fprintf(out, "pending escalations: %d\n", st.PendingEscalations)
 	fmt.Fprintf(out, "monitored agents:    %d\n", len(st.MonitoredAgents))
 	if st.LatestKill != nil {

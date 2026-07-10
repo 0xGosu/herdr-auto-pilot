@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
@@ -34,6 +35,31 @@ func run(t *testing.T, app *frontend.App, verb string, args ...string) (string, 
 	var out bytes.Buffer
 	err := cli.Run(context.Background(), app, &out, verb, args)
 	return out.String(), err
+}
+
+func TestStatusShowsDaemonLine(t *testing.T) {
+	app, _ := testApp(t)
+
+	app.DaemonInfo = func() (bool, int, string) { return false, 0, "" }
+	out, err := run(t, app, "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "daemon:") || !strings.Contains(out, "not running") {
+		t.Errorf("status must report a stopped daemon, got:\n%s", out)
+	}
+
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, buildinfo.Version }
+	out, _ = run(t, app, "status")
+	if !strings.Contains(out, "running "+buildinfo.Version+" (pid 4242)") || strings.Contains(out, "STALE") {
+		t.Errorf("matching daemon version must not read as stale, got:\n%s", out)
+	}
+
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, "v0.0.1" }
+	out, _ = run(t, app, "status")
+	if !strings.Contains(out, "STALE") || !strings.Contains(out, "hap daemon --ensure") {
+		t.Errorf("version mismatch must flag STALE with the remedy, got:\n%s", out)
+	}
 }
 
 func seedSignatures(t *testing.T, st *store.Store) {

@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,9 @@ type App struct {
 	ConfigPath  string
 	ControlPath string
 	Author      string
+	// DaemonInfo reports the running daemon's identity from the lock file
+	// (daemonlock.Info in prod); nil hides the daemon line in status.
+	DaemonInfo func() (running bool, pid int, version string)
 }
 
 // nudge wakes the daemon; a failed nudge is surfaced but non-fatal (the
@@ -538,6 +542,12 @@ func (a *App) AddAllowlistPattern(ctx context.Context, pattern string) error {
 // template optionally overrides the outbound next-task prompt format
 // ({next_task_content} / {task_list_path} placeholders); "" uses the default.
 func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, template string) error {
+	// The daemon reads the file from its own cwd (the state dir), not the
+	// operator's shell; resolve relative paths here where they still mean
+	// what the operator sees.
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{
 			Agent: agent, Workspace: workspace, Path: path, NextTaskTemplate: template,

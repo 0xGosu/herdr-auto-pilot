@@ -40,7 +40,7 @@ jobs:
           mkdir -p dist
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             GOOS="${target%/*}" GOARCH="${target#*/}" \
-              go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+              go build -trimpath -ldflags "-s -w -X github.com/0xGosu/herdr-auto-pilot/internal/buildinfo.Version=${VERSION}" \
               -o "dist/hap-${target%/*}-${target#*/}" \
               ./cmd/hap
           done
