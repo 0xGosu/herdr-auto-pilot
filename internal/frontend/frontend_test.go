@@ -94,6 +94,52 @@ func TestConfirmUsesSuggestion(t *testing.T) {
 	}
 }
 
+// fakeHerdr captures Send calls for confirm/resolve delivery assertions.
+type fakeHerdr struct {
+	panes  []string
+	inputs []string
+}
+
+func (f *fakeHerdr) Send(_ context.Context, paneID, input string) error {
+	f.panes = append(f.panes, paneID)
+	f.inputs = append(f.inputs, input)
+	return nil
+}
+
+func (f *fakeHerdr) ReadPane(context.Context, string, int) (string, error) { return "", nil }
+
+func (f *fakeHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) { return nil, nil }
+
+func TestConfirmSendsRenderedDeclaredTaskPrompt(t *testing.T) {
+	// The confirm path must deliver the exact rendered prompt carried in the
+	// "send next declared task: " suggestion (the SuggestedAction /
+	// materializeForSend contract), while recording the symbolic action.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	prompt := domain.DeclaredTask{Task: "step two", Path: "/docs/tasks.md"}.Prompt()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: "send next declared task: " + prompt, CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].CorrectedAction != domain.ActionNextDeclaredTask {
+		t.Errorf("confirm should record the symbolic declared-task action: %+v", corr)
+	}
+	if len(fake.inputs) != 1 || fake.inputs[0] != prompt {
+		t.Errorf("delivered %v, want the rendered prompt %q", fake.inputs, prompt)
+	}
+	if len(fake.panes) != 1 || fake.panes[0] != "w1:p1" {
+		t.Errorf("delivered to %v, want the audit's agent pane", fake.panes)
+	}
+}
+
 func TestResolveUnknownAuditFails(t *testing.T) {
 	app, _ := testApp(t)
 	if err := app.Resolve(context.Background(), 999, "x", false); err == nil {
@@ -207,7 +253,7 @@ func TestRemoveByIndexIsValueVerified(t *testing.T) {
 	ctx := context.Background()
 	app.AddAllowlistPattern(ctx, `(?i)one`)
 	app.AddAllowlistPattern(ctx, `(?i)two`)
-	app.AddTaskSource(ctx, "builder", "", "/tmp/tasks.md")
+	app.AddTaskSource(ctx, "builder", "", "/tmp/tasks.md", "")
 
 	// A stale expectation must refuse to delete (safety-relevant: never
 	// silently remove the wrong never-auto pattern).

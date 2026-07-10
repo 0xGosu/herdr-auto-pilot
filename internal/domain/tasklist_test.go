@@ -21,6 +21,81 @@ func TestNextDeclaredTask(t *testing.T) {
 	}
 }
 
+func TestDeclaredTaskPrompt(t *testing.T) {
+	cases := []struct {
+		name string
+		task DeclaredTask
+		want string
+	}{
+		{
+			name: "default template",
+			task: DeclaredTask{Task: "add validation", Path: "/docs/tasks.md"},
+			want: "Your next task is add validation. Read the full tasks list at /docs/tasks.md.",
+		},
+		{
+			name: "completed list uses none",
+			task: DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md"},
+			want: "Your next task is none. Read the full tasks list at /docs/tasks.md.",
+		},
+		{
+			name: "custom template",
+			task: DeclaredTask{
+				Task:     "wire logging",
+				Path:     "/p/t.md",
+				Template: "Next: {next_task_content}. List: {task_list_path}. Verify dependencies first.",
+			},
+			want: "Next: wire logging. List: /p/t.md. Verify dependencies first.",
+		},
+		{
+			name: "template without placeholders is sent verbatim",
+			task: DeclaredTask{Task: "x", Path: "/p/t.md", Template: "Keep going."},
+			want: "Keep going.",
+		},
+		{
+			name: "repeated placeholders all substituted",
+			task: DeclaredTask{Task: "a", Path: "/p", Template: "{next_task_content}/{next_task_content} at {task_list_path}"},
+			want: "a/a at /p",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.task.Prompt(); got != c.want {
+				t.Errorf("Prompt() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestMatchWorkspace(t *testing.T) {
+	cases := []struct {
+		name, pattern, target string
+		want                  bool
+	}{
+		{"empty matches any", "", "codex-main", true},
+		{"lone star matches any", "*", "codex-main", true},
+		{"lone star matches empty name", "*", "", true},
+		{"exact match", "codex-main", "codex-main", true},
+		{"exact mismatch", "codex-main", "codex-dev", false},
+		{"prefix wildcard hit", "codex-*", "codex-main", true},
+		{"prefix wildcard miss", "codex-*", "claude-main", false},
+		{"prefix wildcard matches empty rest", "codex-*", "codex-", true},
+		{"suffix wildcard hit", "*-vscode3", "team-vscode3", true},
+		{"suffix wildcard miss", "*-vscode3", "team-vscode4", false},
+		{"suffix must not overlap prefix", "a*a", "a", false},
+		{"both-ends wildcard", "*code*", "my-codex-ws", true},
+		{"both-ends wildcard miss", "*code*", "my-claude-ws", false},
+		{"middle wildcard", "codex-*-dev", "codex-eu-dev", true},
+		{"middle wildcard miss", "codex-*-dev", "codex-eu-prod", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := MatchWorkspace(c.pattern, c.target); got != c.want {
+				t.Errorf("MatchWorkspace(%q, %q) = %v, want %v", c.pattern, c.target, got, c.want)
+			}
+		})
+	}
+}
+
 func TestInferNextTask(t *testing.T) {
 	cases := []struct {
 		name       string

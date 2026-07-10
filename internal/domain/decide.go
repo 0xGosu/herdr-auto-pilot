@@ -54,7 +54,7 @@ type DecideInput struct {
 	Now           time.Time
 	RetryCount    int // error situations: automated retries so far
 	MaxRetries    int
-	DeclaredTask  string // next unchecked item from the declared source ("" = none)
+	DeclaredTask  *DeclaredTask // resolved declared source (nil = no source matched)
 	LLMConfigured bool
 	// AllowlistHit and SuspectedIrreversible are precomputed by the caller
 	// from the compiled Allowlist so the core stays free of regex state.
@@ -195,9 +195,11 @@ func Decide(in DecideInput) Decision {
 func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggestion string, escReason EscalateReason) {
 	switch in.Situation.Type {
 	case SituationIdle:
-		// Two-tier next-task resolution (FR-011).
-		if in.DeclaredTask != "" {
-			return ActionNextDeclaredTask, "send next declared task: " + in.DeclaredTask, ReasonNone
+		// Two-tier next-task resolution (FR-011). A matched source always
+		// yields a candidate — even a completed list, whose templated prompt
+		// (task content "none") lets the operator steer idle agents.
+		if in.DeclaredTask != nil {
+			return ActionNextDeclaredTask, "send next declared task: " + in.DeclaredTask.Prompt(), ReasonNone
 		}
 		inferred := InferNextTask(in.Situation.Content)
 		if inferred.Structured {
@@ -242,10 +244,10 @@ func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggest
 func materialize(in DecideInput, action string) (input, optionID string, ok bool) {
 	switch action {
 	case ActionNextDeclaredTask:
-		if in.DeclaredTask == "" {
+		if in.DeclaredTask == nil {
 			return "", "", false
 		}
-		return in.DeclaredTask, "", true
+		return in.DeclaredTask.Prompt(), "", true
 	case ActionNextInferredTask:
 		inferred := InferNextTask(in.Situation.Content)
 		if !inferred.Structured {

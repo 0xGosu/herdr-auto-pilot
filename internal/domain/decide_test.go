@@ -170,10 +170,40 @@ func TestIdleDeclaredTaskSource(t *testing.T) {
 	in := autonomous(baseInput(SituationIdle),
 		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
 		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
-	in.DeclaredTask = "Implement the config loader"
+	in.DeclaredTask = &DeclaredTask{Task: "Implement the config loader", Path: "/docs/tasks.md"}
 	d := Decide(in)
-	if d.Action != ActionSend || d.Input != "Implement the config loader" {
+	want := "Your next task is Implement the config loader. Read the full tasks list at /docs/tasks.md."
+	if d.Action != ActionSend || d.Input != want {
 		t.Fatalf("declared task source should drive the next prompt, got %+v", d)
+	}
+}
+
+func TestIdleDeclaredTaskCustomTemplate(t *testing.T) {
+	in := autonomous(baseInput(SituationIdle),
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
+	in.DeclaredTask = &DeclaredTask{
+		Task:     "wire logging",
+		Path:     "/docs/tasks.md",
+		Template: "Do: {next_task_content} (list: {task_list_path})",
+	}
+	d := Decide(in)
+	if d.Action != ActionSend || d.Input != "Do: wire logging (list: /docs/tasks.md)" {
+		t.Fatalf("custom template should format the prompt, got %+v", d)
+	}
+}
+
+func TestIdleDeclaredTaskCompletedListStillSends(t *testing.T) {
+	// A matched source whose checklist is complete still delivers the
+	// templated prompt with task content "none" — never an escalation.
+	in := autonomous(baseInput(SituationIdle),
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
+	in.DeclaredTask = &DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md"}
+	d := Decide(in)
+	want := "Your next task is none. Read the full tasks list at /docs/tasks.md."
+	if d.Action != ActionSend || d.Input != want {
+		t.Fatalf("completed declared list should still send the templated prompt, got %+v", d)
 	}
 }
 

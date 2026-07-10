@@ -12,6 +12,79 @@ import (
 var uncheckedItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[[ ]\]\s*(.+)$`)
 var checkedItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[[xX+\-*]\]\s*(.+)$`)
 
+// DefaultNextTaskTemplate is the prompt template used when a task source
+// declares none. Placeholders: {next_task_content} is the next unchecked
+// item (or NoTaskContent when the list is complete), {task_list_path} is
+// the task-source file path.
+const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."
+
+// NoTaskContent is the {next_task_content} value when a declared list has
+// no unchecked item left: the templated prompt is still delivered so the
+// operator's template can steer what the agent does next.
+const NoTaskContent = "none"
+
+// DeclaredTask is the resolved operator-declared next task (FR-011): the
+// task content plus the source it came from, so the outbound prompt can be
+// rendered from the source's template.
+type DeclaredTask struct {
+	Task     string // next unchecked item, or NoTaskContent when complete
+	Path     string // task-source file path
+	Template string // operator template; "" uses DefaultNextTaskTemplate
+}
+
+// Prompt renders the outbound prompt from the source's template. A single
+// pass substitutes both placeholders, so placeholder-like text inside the
+// task content or path is never re-expanded.
+func (t DeclaredTask) Prompt() string {
+	tpl := t.Template
+	if tpl == "" {
+		tpl = DefaultNextTaskTemplate
+	}
+	return strings.NewReplacer(
+		"{next_task_content}", t.Task,
+		"{task_list_path}", t.Path,
+	).Replace(tpl)
+}
+
+// MatchWorkspace reports whether a task source's workspace selector matches
+// a workspace name. "" and "*" match any workspace. "*" inside the pattern
+// matches any run of characters, so "codex-*" matches names starting with
+// "codex-" and "*-vscode3" matches names ending with "-vscode3". Patterns
+// without "*" must match exactly.
+func MatchWorkspace(pattern, name string) bool {
+	if pattern == "" || pattern == "*" {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return pattern == name
+	}
+	parts := strings.Split(pattern, "*")
+	if !strings.HasPrefix(name, parts[0]) {
+		return false
+	}
+	rest := name[len(parts[0]):]
+	for _, mid := range parts[1 : len(parts)-1] {
+		idx := strings.Index(rest, mid)
+		if idx < 0 {
+			return false
+		}
+		rest = rest[idx+len(mid):]
+	}
+	return strings.HasSuffix(rest, parts[len(parts)-1])
+}
+
+// HasChecklistItems reports whether the content contains any checklist item,
+// checked or unchecked. A file without a single item is not a completed
+// checklist — it is not a checklist at all.
+func HasChecklistItems(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		if uncheckedItemRE.MatchString(line) || checkedItemRE.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
+
 // NextDeclaredTask returns the first unchecked checklist item from an
 // operator-declared task-source file's content, or "" when none remains.
 func NextDeclaredTask(content string) string {

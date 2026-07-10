@@ -198,9 +198,13 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		if ws == "" {
 			ws = "*"
 		}
+		label := fmt.Sprintf("task-source #%d  agent=%s ws=%s  %s", i, sel, ws, src.Path)
+		if src.NextTaskTemplate != "" {
+			label += fmt.Sprintf("  template=%q", src.NextTaskTemplate)
+		}
 		items = append(items, ruleItem{
 			kind: "source", index: i, value: src.Path,
-			label: fmt.Sprintf("task-source #%d  agent=%s ws=%s  %s", i, sel, ws, src.Path),
+			label: label,
 		})
 	}
 	return items
@@ -851,7 +855,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 				if len(parts) > 2 {
 					workspace = parts[2]
 				}
-				if err := app.AddTaskSource(ctx, agent, workspace, parts[0]); err != nil {
+				if err := app.AddTaskSource(ctx, agent, workspace, parts[0], ""); err != nil {
 					return actionResultMsg{err: err}
 				}
 				return actionResultMsg{message: "task source added"}

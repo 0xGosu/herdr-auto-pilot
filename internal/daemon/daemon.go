@@ -60,6 +60,11 @@ type Daemon struct {
 	// lastAutoSend tracks our own sends so a subsequent "working"
 	// transition is attributed to automation, not the human.
 	lastAutoSend map[string]time.Time
+
+	// wsNames caches the workspace id→name listing for task-source
+	// workspace matching; refreshed after workspaceCacheTTL.
+	wsNames   map[string]string
+	wsNamesAt time.Time
 }
 
 type llmOutcome struct {
@@ -288,12 +293,16 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	// The heuristic scans only the actionable region (pending dialog +
 	// outbound task text), not the full scrollback: agents narrating *about*
 	// destructive operations must not be flagged perpetually (FR-016).
-	declared := d.declaredTask(cfg, tr, agentName)
+	declared := d.declaredTask(ctx, cfg, tr, agentName)
+	declaredPrompt := ""
+	if declared != nil {
+		declaredPrompt = declared.Prompt()
+	}
 	var irrevHit domain.IndicatorHit
 	suspected := false
 	if !allowMatched {
 		irrevHit, suspected = allow.SuspectedIrreversible(situation.AgentType,
-			domain.IrreversibleScanContent(situation, declared))
+			domain.IrreversibleScanContent(situation, declaredPrompt))
 	}
 
 	in := domain.DecideInput{
@@ -417,7 +426,7 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		learned = dec.OptionID
 	case s.Type == domain.SituationIdle:
 		// idle actions are learned symbolically
-		if d.declaredTaskFor(ctx, s) != "" {
+		if d.declaredTaskFor(ctx, s) != nil {
 			learned = domain.ActionNextDeclaredTask
 		} else {
 			learned = domain.ActionNextInferredTask
@@ -586,7 +595,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	}
 	// The heuristic screens the situation's actionable region plus the
 	// outbound text the LLM authored (which is what would actually be sent).
-	scan := domain.IrreversibleScanContent(s, d.declaredTaskFor(ctx, s))
+	declaredPrompt := ""
+	if dt := d.declaredTaskFor(ctx, s); dt != nil {
+		declaredPrompt = dt.Prompt()
+	}
+	scan := domain.IrreversibleScanContent(s, declaredPrompt)
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType, scan); sus {
 		reject(domain.ReasonSuspectedIrrevers,
 			fmt.Sprintf("suspected-irreversible content: indicator %s matched %q", hit.Pattern, hit.Excerpt))
@@ -839,15 +852,30 @@ func (d *Daemon) registerHumanInteraction(ctx context.Context, agentID string) {
 
 // declaredTask resolves the operator-declared next task for a transition.
 // A task source's agent selector matches the agent/pane id, the agent type,
-// or the agent's short name.
-func (d *Daemon) declaredTask(cfg config.Config, tr domain.AgentTransition, agentName string) string {
+// or the agent's short name; the workspace selector matches the workspace's
+// herdr name (label) with "*" wildcards, falling back to the raw workspace
+// id when no name is resolvable. A matched source with a fully completed
+// list still resolves (task content "none") so the templated prompt is
+// delivered; sources with a real remaining task take precedence.
+func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.AgentTransition, agentName string) *domain.DeclaredTask {
+	var completed *domain.DeclaredTask
+	wsName, wsResolved := "", false
 	for _, src := range cfg.TaskSources {
 		if src.Agent != "" && src.Agent != tr.AgentID && src.Agent != tr.AgentType &&
 			(agentName == "" || src.Agent != agentName) {
 			continue
 		}
-		if src.Workspace != "" && src.Workspace != tr.WorkspaceID {
-			continue
+		if src.Workspace != "" && src.Workspace != "*" {
+			if !wsResolved {
+				wsName, wsResolved = d.workspaceName(ctx, tr.WorkspaceID), true
+			}
+			target := wsName
+			if target == "" {
+				target = tr.WorkspaceID
+			}
+			if !domain.MatchWorkspace(src.Workspace, target) {
+				continue
+			}
 		}
 		data, err := d.opt.ReadTaskFile(src.Path)
 		if err != nil {
@@ -855,21 +883,61 @@ func (d *Daemon) declaredTask(cfg config.Config, tr domain.AgentTransition, agen
 			continue
 		}
 		if task := domain.NextDeclaredTask(string(data)); task != "" {
-			return task
+			return &domain.DeclaredTask{Task: task, Path: src.Path, Template: src.NextTaskTemplate}
+		}
+		// Only a real checklist with every item checked counts as completed;
+		// an empty or non-checklist file must not suppress tier-2 inference.
+		if completed == nil && domain.HasChecklistItems(string(data)) {
+			completed = &domain.DeclaredTask{Task: domain.NoTaskContent, Path: src.Path, Template: src.NextTaskTemplate}
 		}
 	}
-	return ""
+	return completed
 }
 
-func (d *Daemon) declaredTaskFor(ctx context.Context, s domain.Situation) string {
+func (d *Daemon) declaredTaskFor(ctx context.Context, s domain.Situation) *domain.DeclaredTask {
 	cfg, _, _ := d.snapshot()
 	name, err := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
 	if err != nil {
 		name = ""
 	}
-	return d.declaredTask(cfg, domain.AgentTransition{
+	return d.declaredTask(ctx, cfg, domain.AgentTransition{
 		AgentID: s.AgentID, AgentType: s.AgentType, WorkspaceID: s.WorkspaceID,
 	}, name)
+}
+
+// workspaceCacheTTL bounds how long the workspace id→name listing is reused;
+// declaredTask runs on every event and must not spawn the herdr CLI each time.
+const workspaceCacheTTL = 5 * time.Second
+
+// workspaceName resolves a workspace id to its herdr display name (label).
+// It returns "" when no name is resolvable — the Herdr port has no locator
+// surface, the listing fails, or the id is unknown.
+func (d *Daemon) workspaceName(ctx context.Context, workspaceID string) string {
+	if workspaceID == "" {
+		return ""
+	}
+	loc, ok := d.opt.Herdr.(ports.LocatorPort)
+	if !ok {
+		return ""
+	}
+	now := d.opt.Clock.Now()
+	d.mu.RLock()
+	names, at := d.wsNames, d.wsNamesAt
+	d.mu.RUnlock()
+	if names == nil || now.Sub(at) > workspaceCacheTTL {
+		names = map[string]string{}
+		if wss, err := loc.ListWorkspaces(ctx); err == nil {
+			for _, w := range wss {
+				names[w.ID] = w.Label
+			}
+		} else {
+			slog.Warn("workspace listing failed; task-source workspace match falls back to ids", "error", err)
+		}
+		d.mu.Lock()
+		d.wsNames, d.wsNamesAt = names, now
+		d.mu.Unlock()
+	}
+	return names[workspaceID]
 }
 
 func (d *Daemon) audit(ctx context.Context, rec domain.AuditRecord) {

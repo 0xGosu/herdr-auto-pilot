@@ -74,9 +74,16 @@ type LLM struct {
 
 // TaskSource points an agent or workspace at a declared next-task list (FR-011).
 type TaskSource struct {
-	Agent     string `toml:"agent"`     // agent id or name ("" = any)
-	Workspace string `toml:"workspace"` // workspace id ("" = any)
-	Path      string `toml:"path"`      // markdown checklist file
+	Agent string `toml:"agent"` // agent id or name ("" = any)
+	// Workspace matches the workspace's herdr name (label). "" or "*"
+	// matches any; "*" inside the value is a wildcard ("codex-*",
+	// "*-vscode3"). Raw workspace ids still match when no name resolves.
+	Workspace string `toml:"workspace"`
+	Path      string `toml:"path"` // markdown checklist file
+	// NextTaskTemplate overrides the outbound prompt format. Placeholders:
+	// {next_task_content} (next unchecked item, or "none" when the list is
+	// complete) and {task_list_path}. Empty uses the built-in default.
+	NextTaskTemplate string `toml:"next_task_template,omitempty"`
 }
 
 // ClassifierRule is one manifest rule classifying pane content (FR-002).

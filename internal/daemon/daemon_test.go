@@ -26,6 +26,7 @@ type fakeHerdr struct {
 	pane          string
 	sent          []string
 	notifications []string
+	workspaces    []domain.WorkspaceInfo
 	failSend      bool
 	panicOnRead   bool
 	failRead      bool
@@ -55,6 +56,22 @@ func (f *fakeHerdr) ReadPane(ctx context.Context, paneID string, lines int) (str
 
 func (f *fakeHerdr) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) {
 	return nil, nil
+}
+
+func (f *fakeHerdr) ListWorkspaces(ctx context.Context) ([]domain.WorkspaceInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.WorkspaceInfo(nil), f.workspaces...), nil
+}
+
+func (f *fakeHerdr) ListTabs(ctx context.Context) ([]domain.TabInfo, error) {
+	return nil, nil
+}
+
+func (f *fakeHerdr) setWorkspaces(wss []domain.WorkspaceInfo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.workspaces = wss
 }
 
 func (f *fakeHerdr) Notify(ctx context.Context, title, body string) error {
@@ -211,8 +228,13 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 }
 
 func (h *harness) push(agentID, status string) {
+	h.pushIn(agentID, "", status)
+}
+
+func (h *harness) pushIn(agentID, workspaceID, status string) {
 	h.events.ch <- domain.AgentTransition{
-		AgentID: agentID, PaneID: agentID, AgentType: "claude", Status: status,
+		AgentID: agentID, PaneID: agentID, WorkspaceID: workspaceID,
+		AgentType: "claude", Status: status,
 	}
 }
 
@@ -607,8 +629,168 @@ func TestIdleDeclaredTaskSourceDrivesNextPrompt(t *testing.T) {
 
 	h.push("agent-9", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	if got := h.herdr.sentInputs()[0]; got != "step two" {
-		t.Errorf("sent %q, want next unchecked item \"step two\"", got)
+	want := fmt.Sprintf("Your next task is step two. Read the full tasks list at %s.", taskFile)
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sent %q, want templated prompt for next unchecked item %q", got, want)
+	}
+}
+
+func TestIdleDeclaredTaskCustomTemplate(t *testing.T) {
+	// A per-source next_task_template overrides the outbound prompt format.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	os.WriteFile(taskFile, []byte("- [ ] polish docs\n"), 0o600)
+
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf(
+		"[[task_sources]]\nagent = \"agent-19\"\npath = %q\nnext_task_template = \"Task: {next_task_content} ({task_list_path})\"\n",
+		taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	h.push("agent-19", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	want := fmt.Sprintf("Task: polish docs (%s)", taskFile)
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sent %q, want custom-templated prompt %q", got, want)
+	}
+}
+
+func TestIdleDeclaredTaskRealTaskBeatsCompletedSource(t *testing.T) {
+	// A later matching source with a real remaining task takes precedence
+	// over an earlier matched source whose checklist is fully completed.
+	dir := t.TempDir()
+	doneFile := filepath.Join(dir, "done.md")
+	os.WriteFile(doneFile, []byte("- [x] all finished\n"), 0o600)
+	nextFile := filepath.Join(dir, "next.md")
+	os.WriteFile(nextFile, []byte("- [ ] real task\n"), 0o600)
+
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf(
+		"[[task_sources]]\nagent = \"agent-21\"\npath = %q\n\n[[task_sources]]\nagent = \"agent-21\"\npath = %q\n",
+		doneFile, nextFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	h.push("agent-21", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	want := fmt.Sprintf("Your next task is real task. Read the full tasks list at %s.", nextFile)
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sent %q, want the real remaining task to win over the completed source: %q", got, want)
+	}
+}
+
+func TestIdleNonChecklistTaskFileDoesNotResolve(t *testing.T) {
+	// A matched file without a single checklist item is not a completed
+	// list: tier-1 must not send "none"; with no structured pane signal the
+	// situation escalates instead.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "notes.md")
+	os.WriteFile(taskFile, []byte("just prose notes, no checklist here\n"), 0o600)
+
+	idlePane := "Task is complete. I could also look into performance sometime.\n"
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-22\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	h.push("agent-22", "idle")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(context.Background())
+		return len(esc) == 1
+	})
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("a non-checklist task file must not produce a \"none\" prompt")
+	}
+}
+
+func TestIdleDeclaredTaskCompletedListSendsNone(t *testing.T) {
+	// A matched source with every item checked still delivers the templated
+	// prompt with task content "none" instead of escalating.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	os.WriteFile(taskFile, []byte("- [x] step one\n- [x] step two\n"), 0o600)
+
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-20\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	h.push("agent-20", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	want := fmt.Sprintf("Your next task is none. Read the full tasks list at %s.", taskFile)
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sent %q, want completed-list prompt %q", got, want)
+	}
+}
+
+func TestIdleTaskSourceMatchesWorkspaceNameWildcard(t *testing.T) {
+	// The workspace selector matches the workspace's herdr name (label)
+	// with "*" wildcards, not the raw workspace id.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	os.WriteFile(taskFile, []byte("- [ ] workspace task\n"), 0o600)
+
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf("[[task_sources]]\nworkspace = \"codex-*\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setWorkspaces([]domain.WorkspaceInfo{{ID: "w7", Label: "codex-main"}})
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	h.pushIn("agent-23", "w7", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	want := fmt.Sprintf("Your next task is workspace task. Read the full tasks list at %s.", taskFile)
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sent %q, want workspace-name-matched prompt %q", got, want)
+	}
+}
+
+func TestIdleTaskSourceWorkspaceNameMismatchEscalates(t *testing.T) {
+	// A workspace selector that matches neither the workspace name nor the
+	// id leaves the agent without a source; the idle situation escalates.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	os.WriteFile(taskFile, []byte("- [ ] other team's task\n"), 0o600)
+
+	idlePane := "Task is complete. I could also look into performance sometime.\n"
+	cfg := fmt.Sprintf("[[task_sources]]\nworkspace = \"*-vscode3\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setWorkspaces([]domain.WorkspaceInfo{{ID: "w7", Label: "codex-main"}})
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	h.pushIn("agent-24", "w7", "idle")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(context.Background())
+		return len(esc) == 1
+	})
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("a non-matching workspace selector must not deliver the source's task")
+	}
+}
+
+func TestIdleTaskSourceWorkspaceIdFallback(t *testing.T) {
+	// When no workspace name resolves (empty listing), the selector still
+	// matches the raw workspace id so existing id-based configs keep working.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	os.WriteFile(taskFile, []byte("- [ ] fallback task\n"), 0o600)
+
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf("[[task_sources]]\nworkspace = \"w9\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	h.pushIn("agent-25", "w9", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	want := fmt.Sprintf("Your next task is fallback task. Read the full tasks list at %s.", taskFile)
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sent %q, want id-fallback-matched prompt %q", got, want)
 	}
 }
 
@@ -645,8 +827,9 @@ func TestIdleTaskSourceMatchesAgentShortName(t *testing.T) {
 
 	h.push("agent-15", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	if got := h.herdr.sentInputs()[0]; got != "short-name task" {
-		t.Errorf("sent %q, want the short-name-matched task", got)
+	want := fmt.Sprintf("Your next task is short-name task. Read the full tasks list at %s.", taskFile)
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sent %q, want the short-name-matched task prompt %q", got, want)
 	}
 }
 

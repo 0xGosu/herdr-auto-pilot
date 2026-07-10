@@ -535,10 +535,12 @@ func (a *App) AddAllowlistPattern(ctx context.Context, pattern string) error {
 }
 
 // AddTaskSource points an agent/workspace at a declared task list (FR-011).
-func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path string) error {
+// template optionally overrides the outbound next-task prompt format
+// ({next_task_content} / {task_list_path} placeholders); "" uses the default.
+func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, template string) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{
-			Agent: agent, Workspace: workspace, Path: path,
+			Agent: agent, Workspace: workspace, Path: path, NextTaskTemplate: template,
 		})
 		return nil
 	})

@@ -529,7 +529,11 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 			return nil
 		}
 		for i, src := range cfg.TaskSources {
-			fmt.Fprintf(out, "#%d\tagent=%q workspace=%q path=%s\n", i, src.Agent, src.Workspace, src.Path)
+			fmt.Fprintf(out, "#%d\tagent=%q workspace=%q path=%s", i, src.Agent, src.Workspace, src.Path)
+			if src.NextTaskTemplate != "" {
+				fmt.Fprintf(out, " template=%q", src.NextTaskTemplate)
+			}
+			fmt.Fprintln(out)
 		}
 		return nil
 	}
@@ -560,15 +564,16 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	}
 	fs := flag.NewFlagSet("task-source", flag.ContinueOnError)
 	agent := fs.String("agent", "", "agent short name, id, or type this source applies to")
-	workspace := fs.String("workspace", "", "workspace id this source applies to")
+	workspace := fs.String("workspace", "", "workspace name this source applies to (\"*\" wildcards, e.g. \"codex-*\")")
+	template := fs.String("template", "", "next-task prompt template ({next_task_content}, {task_list_path} placeholders)")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] <checklist.md> | list | remove <index>")
+		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] <checklist.md> | list | remove <index>")
 	}
-	if err := app.AddTaskSource(ctx, *agent, *workspace, fs.Arg(0)); err != nil {
+	if err := app.AddTaskSource(ctx, *agent, *workspace, fs.Arg(0), *template); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "task source added: %s\n", fs.Arg(0))

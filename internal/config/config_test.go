@@ -76,7 +76,7 @@ func TestSaveRoundTrip(t *testing.T) {
 	cfg := Default()
 	cfg.Thresholds.Choice = 0.88
 	cfg.Safety.AllowlistPatterns = []string{`(?i)restart\s+prod`}
-	cfg.TaskSources = []TaskSource{{Agent: "a1", Path: "/tmp/tasks.md"}}
+	cfg.TaskSources = []TaskSource{{Agent: "a1", Path: "/tmp/tasks.md", NextTaskTemplate: "Do {next_task_content} from {task_list_path}"}}
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -86,6 +86,9 @@ func TestSaveRoundTrip(t *testing.T) {
 	}
 	if got.Thresholds.Choice != 0.88 || len(got.Safety.AllowlistPatterns) != 1 || len(got.TaskSources) != 1 {
 		t.Errorf("round trip mismatch: %+v", got)
+	}
+	if got.TaskSources[0].NextTaskTemplate != "Do {next_task_content} from {task_list_path}" {
+		t.Errorf("next_task_template round trip mismatch: %+v", got.TaskSources[0])
 	}
 }
 

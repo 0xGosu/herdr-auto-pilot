@@ -148,10 +148,19 @@ max_error_retries = 2              # per error signature
 # unchecked item. Without a declared source, the plugin only infers a next
 # task from an explicit checklist the agent itself printed — never free-form
 # prose — and holds it to the higher inferred_task_bar.
+#
+# The prompt sent to the agent is rendered from a template. The default is:
+#   "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."
+# When every item is checked off, the prompt is still sent with
+# {next_task_content} = "none", so the template can steer what an idle agent
+# does when the list is done.
 [[task_sources]]
 agent = "brave-otter" # agent short name, pane id, or type ("" = any)
-workspace = ""        # workspace id ("" = any)
+workspace = ""        # workspace name; "" or "*" = any, "*" wildcards work
+                      # ("codex-*" = starts with, "*-vscode3" = ends with)
 path = "/home/me/project/docs/tasks.md"
+# Optional per-source prompt format ({next_task_content}, {task_list_path}):
+next_task_template = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}. Verify task dependencies before starting. When there is no task available, focus on improving the test coverage of this project."
 ```
 
 ### Agent short names
@@ -168,6 +177,7 @@ whatever fits your workflow:
 bin/hap agents                      # short name, pane id, type, status
 bin/hap rename brave-otter backend-dev
 bin/hap task-source --agent backend-dev ./docs/backend-tasks.md
+bin/hap task-source --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
 ```
 
 (Or in the TUI: select the agent and press `n`.)
