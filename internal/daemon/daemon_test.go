@@ -155,6 +155,38 @@ func (f *fakeLLM) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 	return f.consult(ctx, req)
 }
 
+// fakeRewriter layers ports.RewriterPort on the LLM fake so the daemon's
+// type assertion finds the optional rewrite capability.
+type fakeRewriter struct {
+	*fakeLLM
+	mu       sync.Mutex
+	rewrite  func(ctx context.Context, req domain.RewriteRequest) (string, error)
+	requests []domain.RewriteRequest
+}
+
+func (f *fakeRewriter) RewriteConfigured() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rewrite != nil
+}
+
+func (f *fakeRewriter) Rewrite(ctx context.Context, req domain.RewriteRequest) (string, error) {
+	f.mu.Lock()
+	f.requests = append(f.requests, req)
+	fn := f.rewrite
+	f.mu.Unlock()
+	if fn == nil {
+		return "", errors.New("no rewrite configured")
+	}
+	return fn(ctx, req)
+}
+
+func (f *fakeRewriter) rewriteCalls() []domain.RewriteRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.RewriteRequest(nil), f.requests...)
+}
+
 // failingStore injects persistence failures on audit writes (FR-024).
 type failingStore struct {
 	ports.StorePort
@@ -194,12 +226,23 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, cfgTOML string) *harness {
-	return newHarnessWrapped(t, cfgTOML, nil)
+	return newHarnessFull(t, cfgTOML, nil, nil)
 }
 
 // newHarnessWrapped lets a test substitute the HerdrPort the daemon sees
 // (e.g. hiding optional interfaces) while keeping the fake for assertions.
 func newHarnessWrapped(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort) *harness {
+	return newHarnessFull(t, cfgTOML, wrap, nil)
+}
+
+// newHarnessRewriter installs a rewriter-capable LLM port.
+func newHarnessRewriter(t *testing.T, cfgTOML string,
+	rewrite func(ctx context.Context, req domain.RewriteRequest) (string, error)) (*harness, *fakeRewriter) {
+	fr := &fakeRewriter{fakeLLM: &fakeLLM{}, rewrite: rewrite}
+	return newHarnessFull(t, cfgTOML, nil, fr), fr
+}
+
+func newHarnessFull(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort, rw *fakeRewriter) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
@@ -218,6 +261,11 @@ func newHarnessWrapped(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports
 	fh := &fakeHerdr{}
 	fe := &fakeEvents{ch: make(chan domain.AgentTransition, 64)}
 	fl := &fakeLLM{}
+	var llmPort ports.LLMPort = fl
+	if rw != nil {
+		fl = rw.fakeLLM
+		llmPort = rw
+	}
 	var herdrPort ports.HerdrPort = fh
 	if wrap != nil {
 		herdrPort = wrap(fh)
@@ -232,7 +280,7 @@ func newHarnessWrapped(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports
 		Herdr:             herdrPort,
 		Events:            fe,
 		Notify:            fh,
-		LLM:               fl,
+		LLM:               llmPort,
 	})
 	if err != nil {
 		t.Fatal(err)

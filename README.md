@@ -313,6 +313,56 @@ suggestion is re-gated through the same allowlist, kill switch, and rate
 guards; with `auto_act = true` it may act only when it doesn't contradict
 your learned history. On timeout or no submission the situation escalates.
 
+### LLM rewrite of literal replies (optional)
+
+When a learned rule resolves to **literal free text** — an idle next-task
+prompt, an error retry command, a free-text approval reply — the plugin can
+pass that text through a one-shot LLM CLI to adapt it to what's actually on
+the agent's screen before sending. Unlike the consult fallback there is no
+MCP round-trip: the CLI is run once and its **stdout is the rewritten
+text**.
+
+```toml
+[llm]
+rewrite_command = [
+  "claude", "-p",
+  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
+  "--model", "haiku",
+]
+rewrite_timeout_seconds = 30   # omitted: inherits timeout_seconds
+# Wraps the original when the rewrite fails (never blocks the send):
+rewrite_fallback_template = "You must act based on the following: {original_text}"
+```
+
+Placeholders in `rewrite_command`: `{text}` (the literal reply a rule
+resolved to), `{situation_type}`, `{agent_type}`, `{pane_excerpt}` (last
+`pane_excerpt_chars` characters of the live pane). The same CLI auto-repair
+as `llm.command` applies (on the raw template, before substitution). No
+shell is involved — each element is one argv entry — but `{text}` and
+`{pane_excerpt}` carry untrusted pane content: embed them inside a prompt
+string (as in the example) rather than as standalone argv elements, so a
+value starting with `-` can never be parsed as a flag; the same values are
+also available as `HAP_REWRITE_TEXT` / `HAP_SITUATION_TYPE` /
+`HAP_AGENT_TYPE` env vars.
+
+Invariants:
+
+- **Numbered-menu answers are never rewritten** — a mapped digit reaches
+  the menu untouched. Only literal free text goes through the rewriter.
+- **A rewrite failure never blocks the send**: on error, timeout, or empty
+  output the original text is delivered wrapped in
+  `rewrite_fallback_template` (`{original_text}` placeholder; empty or
+  placeholder-less templates fall back to the built-in default).
+- **Safety controls still apply to the rewritten text**: output matching
+  the never-auto allowlist or the irreversible-operation heuristic is
+  discarded in favor of the wrapped original; if even that trips, the
+  situation escalates instead of sending. Kill switch, rate guard, and a
+  staleness re-check (the pane must still show the same situation) run
+  again at delivery time.
+- **Learning is unaffected**: decision history records the original
+  learned action, never the rewritten text, so rule confidence and the
+  variance guard keep working.
+
 #### Troubleshooting the fallback
 
 - **Escalations citing `not found in PATH`** — the daemon inherits herdr's

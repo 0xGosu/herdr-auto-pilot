@@ -55,13 +55,20 @@ type Daemon struct {
 	classifier *classify.Classifier
 	llm        ports.LLMPort
 
-	transitions chan domain.AgentTransition
-	nudges      chan control.Kind
-	llmResults  chan llmOutcome
+	transitions    chan domain.AgentTransition
+	nudges         chan control.Kind
+	llmResults     chan llmOutcome
+	rewriteResults chan rewriteOutcome
 
 	// lastAutoSend tracks our own sends so a subsequent "working"
 	// transition is attributed to automation, not the human.
 	lastAutoSend map[string]time.Time
+
+	// rewriteInFlight tracks the one live outbound-text rewrite per agent;
+	// the token lets the outcome handler drop superseded results. Guarded
+	// by mu alongside rewriteSeq.
+	rewriteInFlight map[string]rewriteFlight
+	rewriteSeq      uint64
 
 	// wsNames caches the workspace id→name listing for task-source
 	// workspace matching; refreshed after workspaceCacheTTL.
@@ -77,6 +84,28 @@ type llmOutcome struct {
 	err       error
 }
 
+// rewriteFlight is the registry entry for one in-flight outbound rewrite.
+type rewriteFlight struct {
+	signature string
+	token     uint64
+	cancel    context.CancelFunc
+}
+
+// rewriteOutcome carries a finished rewrite back into the main loop. The
+// fallback template is snapshotted at handoff so a config reload mid-flight
+// cannot change the failure behavior of an already-launched rewrite.
+type rewriteOutcome struct {
+	situation domain.Situation
+	sig       domain.SignatureResult
+	tr        domain.AgentTransition
+	dec       domain.Decision
+	learned   string // original learned form for RecordDecision
+	fallback  string // snapshotted rewrite_fallback_template
+	rewritten string
+	err       error
+	token     uint64
+}
+
 // New creates a daemon.
 func New(opt Options) (*Daemon, error) {
 	if opt.Clock == nil {
@@ -89,11 +118,13 @@ func New(opt Options) (*Daemon, error) {
 		opt.PaneReadLines = 120
 	}
 	d := &Daemon{
-		opt:          opt,
-		transitions:  make(chan domain.AgentTransition, 256),
-		nudges:       make(chan control.Kind, 16),
-		llmResults:   make(chan llmOutcome, 16),
-		lastAutoSend: map[string]time.Time{},
+		opt:             opt,
+		transitions:     make(chan domain.AgentTransition, 256),
+		nudges:          make(chan control.Kind, 16),
+		llmResults:      make(chan llmOutcome, 16),
+		rewriteResults:  make(chan rewriteOutcome, 16),
+		lastAutoSend:    map[string]time.Time{},
+		rewriteInFlight: map[string]rewriteFlight{},
 	}
 	if err := d.reload(); err != nil {
 		return nil, err
@@ -225,6 +256,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.handleLLMOutcome(ctx, res)
 				return nil
 			})
+		case res := <-d.rewriteResults:
+			logging.Guard("rewrite-result", func() error {
+				d.handleRewriteOutcome(ctx, res)
+				return nil
+			})
 		}
 	}
 }
@@ -344,6 +380,15 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 
 	decision := domain.Decide(in)
 
+	// Any newer decision for this agent owns the pane: an in-flight rewrite
+	// for a DIFFERENT situation must never deliver behind it. A same-
+	// signature send is kept — startRewrite drops it as a duplicate.
+	keepSig := ""
+	if decision.Action == domain.ActionSend {
+		keepSig = sig.Signature
+	}
+	d.cancelRewriteExcept(situation.AgentID, keepSig)
+
 	switch decision.Action {
 	case domain.ActionSend:
 		d.act(ctx, situation, sig, decision, tr, now)
@@ -352,6 +397,31 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	default:
 		d.escalate(ctx, situation, sig, decision, tr, now)
 	}
+}
+
+// truncateRunes shortens s to at most n runes, marking the cut with an
+// ellipsis (rune-safe: never splits a UTF-8 sequence).
+func truncateRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
+}
+
+// cancelRewriteExcept invalidates the agent's in-flight rewrite unless it is
+// for keepSig. The cancelled flight's outcome is dropped by the token check.
+func (d *Daemon) cancelRewriteExcept(agentID, keepSig string) {
+	d.mu.Lock()
+	fl, ok := d.rewriteInFlight[agentID]
+	if !ok || (keepSig != "" && fl.signature == keepSig) {
+		d.mu.Unlock()
+		return
+	}
+	delete(d.rewriteInFlight, agentID)
+	d.mu.Unlock()
+	fl.cancel()
+	slog.Info("in-flight rewrite superseded by a newer decision", "agent", agentID)
 }
 
 // readDecisionState gathers all store reads for one decision. The latest
@@ -408,10 +478,65 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		return
 	}
 
+	// Numbered menus (Claude approvals/choices) accept the option's digit,
+	// not the label text; deliver the keystroke the menu expects. Free-text
+	// situations deliver the literal reply. s.Content is the classification
+	// snapshot, which carries the menu for the situation being acted on.
+	outbound, menuMapped := domain.DeliverOutbound(s.Type, s.Content, dec.Input)
+
+	// Literal free text can be adapted to the live pane by the optional
+	// rewrite CLI; menu digits must reach the menu untouched. The send
+	// completes asynchronously via handleRewriteOutcome, so the learned
+	// action is pinned NOW — situation state may drift before delivery.
+	if rw, ok := d.llmPort().(ports.RewriterPort); ok && rw.RewriteConfigured() &&
+		!menuMapped && dec.Input != "" {
+		d.startRewrite(ctx, rw, s, sig, dec, tr, d.learnedAction(ctx, s, dec))
+		return
+	}
+
+	// learned stays empty: deliverAutonomous computes it after the send,
+	// exactly as the pre-rewrite code did.
+	d.deliverAutonomous(ctx, s, sig, dec, tr, delivery{
+		sendText: outbound, input: dec.Input, rationale: dec.Rationale,
+	}, now)
+}
+
+// learnedAction is the action recorded in decision history for a rule-path
+// send (idle learns symbolically so signatures generalize across tasks).
+func (d *Daemon) learnedAction(ctx context.Context, s domain.Situation, dec domain.Decision) string {
+	switch {
+	case dec.OptionID != "":
+		return dec.OptionID
+	case s.Type == domain.SituationIdle:
+		if d.declaredTaskFor(ctx, s) != nil {
+			return domain.ActionNextDeclaredTask
+		}
+		return domain.ActionNextInferredTask
+	}
+	return dec.Input
+}
+
+// delivery describes one autonomous send: what to write to the pane, what
+// to audit, and what to learn.
+type delivery struct {
+	sendText  string // exactly what is written to the pane
+	input     string // audit Input and the "auto:" action label
+	rationale string
+	llmOutput string // rewrite CLI diagnostics, when applicable
+	learned   string // ChosenAction recorded for learning
+}
+
+// deliverAutonomous is the shared tail of every autonomous rule-path send:
+// pre-action audit guard (FR-024), delivery, and the daemon-owned learning
+// and counter writes.
+func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
+	dec domain.Decision, tr domain.AgentTransition, del delivery, now time.Time) {
+
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, Signature: sig.Signature, Trigger: trigger(tr),
-		SituationType: s.Type, Action: "auto:" + dec.Input, Input: dec.Input,
-		Confidence: dec.Confidence, Rationale: dec.Rationale, Status: "auto", CreatedAt: now,
+		SituationType: s.Type, Action: "auto:" + del.input, Input: del.input,
+		Confidence: dec.Confidence, Rationale: del.rationale, LLMOutput: del.llmOutput,
+		Status: "auto", CreatedAt: now,
 	})
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
@@ -420,12 +545,7 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		return
 	}
 
-	// Numbered menus (Claude approvals/choices) accept the option's digit,
-	// not the label text; deliver the keystroke the menu expects. Free-text
-	// situations deliver the literal reply. s.Content is the classification
-	// snapshot, which carries the menu for the situation being acted on.
-	outbound := domain.DeliverKeystroke(s.Type, s.Content, dec.Input)
-	if err := d.opt.Herdr.Send(ctx, s.PaneID, outbound); err != nil {
+	if err := d.opt.Herdr.Send(ctx, s.PaneID, del.sendText); err != nil {
 		slog.Error("agent send failed; escalating", "pane", s.PaneID, "error", err)
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed",
@@ -437,18 +557,12 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	d.lastAutoSend[s.AgentID] = now
 	d.mu.Unlock()
 
-	// Learning + counters (daemon-owned hot-path rows).
-	learned := dec.Input
-	switch {
-	case dec.OptionID != "":
-		learned = dec.OptionID
-	case s.Type == domain.SituationIdle:
-		// idle actions are learned symbolically
-		if d.declaredTaskFor(ctx, s) != nil {
-			learned = domain.ActionNextDeclaredTask
-		} else {
-			learned = domain.ActionNextInferredTask
-		}
+	// Learning + counters (daemon-owned hot-path rows). The rewrite path
+	// pins the learned action at decision time; the synchronous path
+	// resolves it here, after the send, as it always has.
+	learned := del.learned
+	if learned == "" {
+		learned = d.learnedAction(ctx, s, dec)
 	}
 	if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
@@ -480,7 +594,7 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 
 	slog.Info("automated action delivered",
 		"agent", s.AgentID, "situation", s.Type, "confidence", dec.Confidence,
-		"rationale", dec.Rationale, "audit_id", auditID)
+		"rationale", del.rationale, "audit_id", auditID)
 }
 
 // escalate records and surfaces an escalation: no input is sent (FR-018).
@@ -559,25 +673,7 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 // get_context MCP tool: the classified situation, a pane excerpt, the
 // agent's herdr location, and the pane working directory.
 func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation) []byte {
-	chars := cfg.LLM.PaneExcerptChars
-	if chars <= 0 {
-		chars = config.Default().LLM.PaneExcerptChars
-	}
-
-	// The classification read is kept shallow so the first-match-wins
-	// classifier does not latch onto stale scrollback; the LLM excerpt
-	// gets its own deeper read (~10 chars/line is a conservative floor).
-	excerpt := s.Content
-	lines := chars / 10
-	if lines < d.opt.PaneReadLines {
-		lines = d.opt.PaneReadLines
-	}
-	if deep, err := d.opt.Herdr.ReadPane(ctx, s.PaneID, lines); err == nil {
-		excerpt = deep
-	} else {
-		slog.Warn("deep pane read for LLM context failed; using classification snapshot",
-			"pane", s.PaneID, "error", err)
-	}
+	excerpt := d.paneExcerpt(ctx, cfg, s)
 
 	// Pane location and cwd come from `pane get`; degrade to empty values
 	// when the adapter cannot report them (ports.InspectorPort is optional).
@@ -604,7 +700,7 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		"options":         s.Options,
 		"permission_verb": s.PermissionVerb,
 		"error_summary":   s.ErrorSummary,
-		"pane_excerpt":    tail(excerpt, chars),
+		"pane_excerpt":    excerpt,
 		"workspace_id":    workspaceID,
 		"tab_id":          tabID,
 		"pane_id":         s.PaneID,
@@ -613,6 +709,235 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		"foreground_cwd":  info.ForegroundCwd,
 	})
 	return contextJSON
+}
+
+// paneExcerpt reads a deep pane excerpt (last llm.pane_excerpt_chars) for
+// LLM-facing context. It reads the VISIBLE screen: the consuming "recent"
+// delta was already drained by this transition's classification read, so a
+// ReadPane here would often return just the cursor line. A failed or empty
+// read keeps the classification snapshot (~10 chars/line is a conservative
+// floor for the line count).
+func (d *Daemon) paneExcerpt(ctx context.Context, cfg config.Config, s domain.Situation) string {
+	chars := cfg.LLM.PaneExcerptChars
+	if chars <= 0 {
+		chars = config.Default().LLM.PaneExcerptChars
+	}
+	excerpt := s.Content
+	lines := chars / 10
+	if lines < d.opt.PaneReadLines {
+		lines = d.opt.PaneReadLines
+	}
+	if deep, err := d.readVisible(ctx, s.PaneID, lines); err == nil && strings.TrimSpace(deep) != "" {
+		excerpt = deep
+	} else if err != nil {
+		slog.Warn("deep pane read for LLM context failed; using classification snapshot",
+			"pane", s.PaneID, "error", err)
+	}
+	return tail(excerpt, chars)
+}
+
+// startRewrite hands a literal outbound text to the rewrite CLI. The
+// subprocess runs in a goroutine — it must never stall the main loop — and
+// the send completes in handleRewriteOutcome. One flight per agent: a
+// duplicate transition for the same signature is dropped, a new situation
+// cancels and supersedes the old flight.
+func (d *Daemon) startRewrite(ctx context.Context, rw ports.RewriterPort, s domain.Situation,
+	sig domain.SignatureResult, dec domain.Decision, tr domain.AgentTransition, learned string) {
+
+	cfg, _, _ := d.snapshot()
+
+	d.mu.Lock()
+	if fl, ok := d.rewriteInFlight[s.AgentID]; ok {
+		if fl.signature == sig.Signature {
+			d.mu.Unlock()
+			slog.Info("rewrite already in flight for this situation; dropping duplicate",
+				"agent", s.AgentID)
+			return
+		}
+		fl.cancel() // a newer situation owns the pane now
+	}
+	d.rewriteSeq++
+	token := d.rewriteSeq
+	rctx, cancel := context.WithCancel(ctx)
+	d.rewriteInFlight[s.AgentID] = rewriteFlight{signature: sig.Signature, token: token, cancel: cancel}
+	d.mu.Unlock()
+
+	go func() {
+		outcome := rewriteOutcome{
+			situation: s, sig: sig, tr: tr, dec: dec, learned: learned,
+			fallback: cfg.LLM.RewriteFallbackTemplate, token: token,
+		}
+		outcome.err = logging.Guard("llm-rewrite", func() error {
+			req := domain.RewriteRequest{
+				Text: dec.Input, SituationType: s.Type, AgentType: s.AgentType,
+				PaneExcerpt: d.paneExcerpt(rctx, cfg, s),
+			}
+			text, err := rw.Rewrite(rctx, req)
+			outcome.rewritten = text
+			return err
+		})
+		select {
+		case d.rewriteResults <- outcome:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+// rewriteSuggestion formats the original action as an escalation suggestion
+// the front-ends' Confirm flow can replay (same prefixes SuggestedAction
+// parses), for the rare case a rewrite outcome must escalate.
+func rewriteSuggestion(sitType domain.SituationType, learned, original string) string {
+	switch sitType {
+	case domain.SituationApproval:
+		return "respond: " + original
+	case domain.SituationChoice:
+		return "choose: " + original
+	case domain.SituationError:
+		return "on error: " + original
+	case domain.SituationIdle:
+		if learned == domain.ActionNextInferredTask {
+			return "send inferred next task: " + original
+		}
+		return "send next declared task: " + original
+	}
+	return original
+}
+
+// handleRewriteOutcome finalizes an async outbound rewrite: the rewritten
+// text is re-gated through every safety control (the rewriter is an LLM
+// authoring outbound text — FR-015 applies) and delivered. A rewrite
+// failure degrades to the fallback-wrapped original rather than blocking
+// the send; only safety trips on that wrapped form escalate.
+func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
+	s := res.situation
+
+	// A superseded flight must never send: a newer situation owns the pane.
+	d.mu.Lock()
+	fl, ok := d.rewriteInFlight[s.AgentID]
+	if !ok || fl.token != res.token {
+		d.mu.Unlock()
+		slog.Info("rewrite outcome superseded; dropping", "agent", s.AgentID)
+		return
+	}
+	delete(d.rewriteInFlight, s.AgentID)
+	d.mu.Unlock()
+	fl.cancel()
+
+	cfg, allow, cls := d.snapshot()
+	now := d.opt.Clock.Now()
+
+	escalateWith := func(reason domain.EscalateReason, why string) {
+		d.escalate(ctx, s, res.sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: reason, Rationale: why,
+			Confidence: res.dec.Confidence,
+			Suggestion: rewriteSuggestion(s.Type, res.learned, res.dec.Input),
+		}, res.tr, now)
+	}
+
+	// Final text: the rewrite, or — on any failure, including safety trips
+	// on the rewritten form — the fallback-wrapped original.
+	final := strings.TrimSpace(res.rewritten)
+	note := "rewritten by llm.rewrite_command"
+	llmOutput := ""
+	degrade := func(why string) {
+		final = domain.ApplyRewriteFallback(res.fallback, res.dec.Input)
+		note = "rewrite " + why + "; fallback template applied"
+	}
+	switch {
+	case res.err != nil:
+		degrade(fmt.Sprintf("failed (%v)", res.err))
+		llmOutput = res.err.Error()
+	case final == "":
+		degrade("produced empty output")
+	default:
+		if pattern, matched := allow.Match(final); matched {
+			llmOutput = "discarded rewrite: " + truncateRunes(final, 500)
+			degrade("output matched never-auto pattern " + pattern)
+		} else if hit, sus := allow.SuspectedIrreversible(s.AgentType, final); sus {
+			llmOutput = "discarded rewrite: " + truncateRunes(final, 500)
+			degrade(fmt.Sprintf("output tripped irreversible indicator %s (%.60q)", hit.Pattern, hit.Excerpt))
+		}
+	}
+
+	// Safety controls are never bypassed (SC-5): the final text — even the
+	// fallback-wrapped original, whose framing could complete a pattern the
+	// raw original did not — is screened once more, and the world may have
+	// changed since Decide ran (kill switch, rate, the pane itself).
+	kill, err := d.opt.Store.LatestKillEvent(ctx)
+	if err != nil || domain.KillStateActive(kill) {
+		escalateWith(domain.ReasonKilled, "kill switch active at rewrite delivery time")
+		return
+	}
+	if pattern, matched := allow.Match(final); matched {
+		escalateWith(domain.ReasonAllowlistMatch, "rewritten outbound matches never-auto pattern: "+pattern)
+		return
+	}
+	if hit, sus := allow.SuspectedIrreversible(s.AgentType, final); sus {
+		escalateWith(domain.ReasonSuspectedIrrevers,
+			fmt.Sprintf("rewritten outbound tripped irreversible indicator %s (%.60q)", hit.Pattern, hit.Excerpt))
+		return
+	}
+	rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
+	if err != nil {
+		// Fail closed: an unreadable rate row must not skip the guard.
+		escalateWith(domain.ReasonPersistenceFailed, "agent rate read failed at rewrite delivery time: "+err.Error())
+		return
+	}
+	if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
+		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
+		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
+	}); !ok {
+		escalateWith(reason, "runaway-loop guard at rewrite delivery time")
+		return
+	}
+
+	// Staleness: the rewrite took up to its timeout — never inject into a
+	// pane that moved on. Re-classify the visible screen with the original
+	// transition status. Signature equality is required only for
+	// approval/choice/error: idle signatures hash a masked content head
+	// that legitimately differs between the visible re-read and the
+	// original consuming "recent" read, so idle matches on type alone.
+	pane, err := d.readVisible(ctx, s.PaneID, d.opt.PaneReadLines)
+	if err != nil {
+		escalateWith(domain.ReasonHerdrUnreachable, "pane re-read failed before rewrite delivery: "+err.Error())
+		return
+	}
+	current := cls.Classify(s.AgentType, res.tr.Status, pane)
+	current.AgentID, current.PaneID, current.WorkspaceID = s.AgentID, s.PaneID, s.WorkspaceID
+	if current.Type != s.Type {
+		slog.Info("situation changed during rewrite; dropping send",
+			"agent", s.AgentID, "was", s.Type, "now", current.Type)
+		return
+	}
+	if s.Type != domain.SituationIdle {
+		if freshSig := domain.ComputeSignature(current); freshSig.Signature != res.sig.Signature {
+			slog.Info("signature changed during rewrite; dropping send", "agent", s.AgentID)
+			return
+		}
+	}
+	// The idle policy tolerates changed content, so the FRESH pane must be
+	// re-screened the way handleTransition screened the original: Decide's
+	// veto ran against content that may no longer be what's on screen.
+	if pattern, matched := allow.Match(current.Content); matched {
+		escalateWith(domain.ReasonAllowlistMatch,
+			"pane content matches never-auto pattern at rewrite delivery: "+pattern)
+		return
+	}
+	if hit, sus := allow.SuspectedIrreversible(s.AgentType,
+		domain.IrreversibleScanContent(current, "")); sus {
+		escalateWith(domain.ReasonSuspectedIrrevers,
+			fmt.Sprintf("pane tripped irreversible indicator at rewrite delivery: %s (%.60q)", hit.Pattern, hit.Excerpt))
+		return
+	}
+
+	original := truncateRunes(res.dec.Input, 200)
+	d.deliverAutonomous(ctx, s, res.sig, res.dec, res.tr, delivery{
+		sendText:  final,
+		input:     final,
+		rationale: fmt.Sprintf("%s; %s (original: %q)", res.dec.Rationale, note, original),
+		llmOutput: llmOutput,
+		learned:   res.learned,
+	}, now)
 }
 
 // handleLLMOutcome re-gates a staged LLM submission through the same safety
@@ -918,6 +1243,8 @@ func (d *Daemon) expireStaleLLMWork(ctx context.Context) {
 }
 
 func (d *Daemon) registerHumanInteraction(ctx context.Context, agentID string) {
+	// The human owns the pane now: a pending rewritten send is moot.
+	d.cancelRewriteExcept(agentID, "")
 	rate, err := d.opt.Store.GetAgentRate(ctx, agentID)
 	if err != nil {
 		return
