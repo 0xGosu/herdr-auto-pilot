@@ -84,6 +84,7 @@ type agentListResponse struct {
 			Agent       string `json:"agent"`
 			AgentStatus string `json:"agent_status"`
 			PaneID      string `json:"pane_id"`
+			TabID       string `json:"tab_id"`
 			WorkspaceID string `json:"workspace_id"`
 		} `json:"agents"`
 	} `json:"result"`
@@ -104,10 +105,70 @@ func (c *CLI) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) 
 		agents = append(agents, domain.AgentTransition{
 			AgentID:     a.PaneID,
 			PaneID:      a.PaneID,
+			TabID:       a.TabID,
 			AgentType:   a.Agent,
 			WorkspaceID: a.WorkspaceID,
 			Status:      a.AgentStatus,
 		})
 	}
 	return agents, nil
+}
+
+// workspaceListResponse is the `herdr workspace list` envelope
+// (verified against herdr 0.7).
+type workspaceListResponse struct {
+	Result struct {
+		Workspaces []struct {
+			WorkspaceID string `json:"workspace_id"`
+			Label       string `json:"label"`
+			Number      int    `json:"number"`
+		} `json:"workspaces"`
+	} `json:"result"`
+}
+
+// ListWorkspaces returns workspace display metadata (`workspace list`).
+func (c *CLI) ListWorkspaces(ctx context.Context) ([]domain.WorkspaceInfo, error) {
+	out, err := c.run(ctx, "workspace", "list")
+	if err != nil {
+		return nil, err
+	}
+	var resp workspaceListResponse
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &resp); err != nil {
+		return nil, fmt.Errorf("parse workspace list output: %w", err)
+	}
+	var out2 []domain.WorkspaceInfo
+	for _, w := range resp.Result.Workspaces {
+		out2 = append(out2, domain.WorkspaceInfo{ID: w.WorkspaceID, Label: w.Label, Number: w.Number})
+	}
+	return out2, nil
+}
+
+// tabListResponse is the `herdr tab list` envelope (verified against
+// herdr 0.7).
+type tabListResponse struct {
+	Result struct {
+		Tabs []struct {
+			TabID       string `json:"tab_id"`
+			Label       string `json:"label"`
+			Number      int    `json:"number"`
+			WorkspaceID string `json:"workspace_id"`
+		} `json:"tabs"`
+	} `json:"result"`
+}
+
+// ListTabs returns tab display metadata (`tab list`).
+func (c *CLI) ListTabs(ctx context.Context) ([]domain.TabInfo, error) {
+	out, err := c.run(ctx, "tab", "list")
+	if err != nil {
+		return nil, err
+	}
+	var resp tabListResponse
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &resp); err != nil {
+		return nil, fmt.Errorf("parse tab list output: %w", err)
+	}
+	var tabs []domain.TabInfo
+	for _, t := range resp.Result.Tabs {
+		tabs = append(tabs, domain.TabInfo{ID: t.TabID, Label: t.Label, Number: t.Number, WorkspaceID: t.WorkspaceID})
+	}
+	return tabs, nil
 }

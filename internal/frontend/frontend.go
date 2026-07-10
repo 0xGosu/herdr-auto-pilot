@@ -1,8 +1,9 @@
 // Package frontend is the shared view/command layer behind both the TUI
 // and the CLI (FR-022): identical read queries and identical mutations.
-// Mutations write operator-owned data (corrections, kill events, TOML)
-// directly, then nudge the daemon's control socket to reload; front-ends
-// never write daemon-owned hot-path rows.
+// Mutations write operator-owned data (corrections, kill events, agent
+// name rows, TOML) directly, then nudge the daemon's control socket to
+// reload; front-ends never write daemon-owned hot-path rows (agent_names
+// is insert-if-absent from both sides and not part of that partition).
 package frontend
 
 import (
@@ -48,6 +49,10 @@ type Status struct {
 	MonitoredAgents    []domain.AgentTransition
 	// AgentNames maps agent/pane ids to their short names.
 	AgentNames map[string]string
+	// Workspaces / Tabs map ids to display metadata (label, number) for
+	// locating agents; empty when the Herdr adapter cannot report them.
+	Workspaces map[string]domain.WorkspaceInfo
+	Tabs       map[string]domain.TabInfo
 }
 
 // GetStatus returns the operator-facing status summary.
@@ -68,9 +73,40 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 		if agents, err := a.Herdr.ListAgents(ctx); err == nil {
 			st.MonitoredAgents = agents
 		}
+		if loc, ok := a.Herdr.(ports.LocatorPort); ok {
+			if wss, err := loc.ListWorkspaces(ctx); err == nil {
+				st.Workspaces = map[string]domain.WorkspaceInfo{}
+				for _, w := range wss {
+					st.Workspaces[w.ID] = w
+				}
+			}
+			if tabs, err := loc.ListTabs(ctx); err == nil {
+				st.Tabs = map[string]domain.TabInfo{}
+				for _, t := range tabs {
+					st.Tabs[t.ID] = t
+				}
+			}
+		}
 	}
 	if names, err := a.Store.AgentNames(ctx); err == nil {
 		st.AgentNames = names
+	}
+	// Name any live agent the daemon has not named yet (a brand-new agent,
+	// or one that predates the daemon): the operator should never have to
+	// stare at a bare pane id. Insert-if-absent, so this can never clobber
+	// a rename; failures degrade to showing the id. Agentless panes (herdr
+	// lists plain shells with no agent label) are skipped, mirroring the
+	// subscriber's discovery guard — the name table stays agents-only.
+	for _, agent := range st.MonitoredAgents {
+		if agent.AgentType == "" || st.AgentNames[agent.AgentID] != "" {
+			continue
+		}
+		if name, err := a.Store.EnsureAgentName(ctx, agent.AgentID); err == nil && name != "" {
+			if st.AgentNames == nil {
+				st.AgentNames = map[string]string{}
+			}
+			st.AgentNames[agent.AgentID] = name
+		}
 	}
 	return st, nil
 }

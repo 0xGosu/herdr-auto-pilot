@@ -63,6 +63,18 @@ func TestSuspectedIrreversibleEscalates(t *testing.T) {
 	}
 }
 
+func TestSuspectedIrreversibleRationaleNamesIndicator(t *testing.T) {
+	// The escalation must be debuggable: the rationale names the indicator
+	// and the pane text it matched.
+	in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y", "y", "y")
+	in.SuspectedIrreversible = true
+	in.IrreversibleHit = IndicatorHit{Pattern: `(?i)\bno\s+undo\b`, Excerpt: "no undo"}
+	d := Decide(in)
+	if !strings.Contains(d.Rationale, `(?i)\bno\s+undo\b`) || !strings.Contains(d.Rationale, `"no undo"`) {
+		t.Fatalf("rationale must name the indicator and excerpt, got %q", d.Rationale)
+	}
+}
+
 func TestRunawayGuardBlocksSixthConsecutive(t *testing.T) {
 	// FR-019 acceptance: a 6th consecutive auto-prompt is blocked.
 	in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y", "y", "y")

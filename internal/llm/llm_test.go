@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -137,6 +138,80 @@ func TestTemplatePlaceholderExpansion(t *testing.T) {
 		if !strings.Contains(argv, want) {
 			t.Errorf("argv missing %q: %s", want, argv)
 		}
+	}
+}
+
+// chdirDeleted moves the test process into a directory and deletes it,
+// simulating a daemon whose start directory was removed after launch.
+func chdirDeleted(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("a directory in use as a cwd cannot be removed on Windows")
+	}
+	dead := filepath.Join(t.TempDir(), "dead")
+	if err := os.Mkdir(dead, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dead)
+	if err := os.Remove(dead); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkDirInheritsLiveCwd(t *testing.T) {
+	a := &Adapter{DBPath: filepath.Join(t.TempDir(), "t.db")}
+	if dir := a.WorkDir(); dir != "" {
+		t.Errorf("live cwd must be inherited, got %q", dir)
+	}
+}
+
+func TestWorkDirFallsBackWhenCwdDeleted(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "t.db")
+	a := &Adapter{DBPath: db}
+	chdirDeleted(t)
+	if dir := a.WorkDir(); dir != filepath.Dir(db) {
+		t.Errorf("dead cwd must fall back to the state dir, got %q", dir)
+	}
+}
+
+func TestConsultRunsFromStableDirWhenCwdGone(t *testing.T) {
+	// The daemon's start directory can be deleted while it runs; the CLI
+	// must still launch from a live directory (the Bun-built claude binary
+	// exits 1 with an opaque ENOENT otherwise).
+	st, db := testStore(t)
+	out := filepath.Join(t.TempDir(), "pwd.txt")
+	script := writeScript(t, "pwd > "+out+"\n")
+	a := &Adapter{
+		CommandTemplate: []string{script},
+		Timeout:         5 * time.Second,
+		DBPath:          db, Store: st, SelfPath: "/bin/true",
+	}
+	req := domain.LLMRequest{RequestID: "req-cwd", CreatedAt: time.Now()}
+	st.StageLLMRequest(context.Background(), req)
+	st.InsertLLMDecision(context.Background(), domain.LLMDecision{
+		RequestID: "req-cwd", Action: "ok", Status: "pending", CreatedAt: time.Now(),
+	})
+
+	chdirDeleted(t)
+	if _, err := a.Consult(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// EvalSymlinks both sides: macOS temp dirs live under the /var →
+	// /private/var symlink, so pwd prints the resolved path.
+	want, err := filepath.EvalSymlinks(filepath.Dir(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := filepath.EvalSymlinks(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("CLI ran in %q, want state dir %q", got, want)
 	}
 }
 

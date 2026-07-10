@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -69,6 +70,7 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 	defer cancel()
 
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
+	cmd.Dir = a.WorkDir()
 	// After the timeout kills the CLI, don't wait on lingering
 	// grandchildren holding the output pipes open — fail safe promptly.
 	cmd.WaitDelay = 2 * time.Second
@@ -103,6 +105,34 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 	}
 	dec.CapturedOutput = captured
 	return dec, nil
+}
+
+// WorkDir returns the directory the CLI must run in, or "" to inherit the
+// daemon's working directory. The daemon can outlive the directory it was
+// started in (herdr may launch it from a since-deleted workspace); a child
+// spawned with that dead cwd dies at startup — the Bun-built claude CLI
+// exits 1 with an opaque "ENOENT: Bun could not find a file" before it can
+// call submit_decision — so a dead cwd falls back to the state dir holding
+// the DB, then the home dir, then the system temp dir.
+func (a *Adapter) WorkDir() string {
+	if wd, err := os.Getwd(); err == nil && dirLives(wd) {
+		return ""
+	}
+	if a.DBPath != "" {
+		// IsAbs: a relative DBPath would resolve against the dead cwd.
+		if dir := filepath.Dir(a.DBPath); filepath.IsAbs(dir) && dirLives(dir) {
+			return dir
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && dirLives(home) {
+		return home
+	}
+	return os.TempDir()
+}
+
+func dirLives(dir string) bool {
+	fi, err := os.Stat(dir)
+	return err == nil && fi.IsDir()
 }
 
 func truncate(s string, n int) string {

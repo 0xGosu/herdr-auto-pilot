@@ -66,6 +66,9 @@ func TestSubscriberDiscoversNewPanes(t *testing.T) {
 		srv.PushTransition("w2:p9", "w2", "codex", "idle")
 		select {
 		case tr := <-out:
+			if tr.Status == "detected" {
+				continue // discovery emission, asserted separately
+			}
 			if tr.PaneID != "w2:p9" || tr.AgentType != "codex" || tr.Status != "idle" {
 				t.Errorf("unexpected transition: %+v", tr)
 			}
@@ -74,6 +77,40 @@ func TestSubscriberDiscoversNewPanes(t *testing.T) {
 		}
 	}
 	t.Fatal("transition for newly discovered pane not received")
+}
+
+func TestSubscriberEmitsDetectedTransition(t *testing.T) {
+	// A newly detected agent must surface immediately (so the daemon can
+	// name it) without waiting for its first status change.
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	sub := NewSubscriber(srv.SocketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan domain.AgentTransition, 16)
+	go sub.Subscribe(ctx, out)
+	time.Sleep(200 * time.Millisecond)
+
+	srv.PushAgentDetected("w3:p1", "w3", "codex")
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case tr := <-out:
+			if tr.Status != "detected" {
+				continue
+			}
+			if tr.AgentID != "w3:p1" || tr.AgentType != "codex" || tr.WorkspaceID != "w3" {
+				t.Errorf("unexpected detected transition: %+v", tr)
+			}
+			return
+		case <-deadline:
+			t.Fatal("no detected transition received for a new agent")
+		}
+	}
 }
 
 func TestSubscriberReconnectsWithBackoff(t *testing.T) {
@@ -222,5 +259,45 @@ func TestCLIFailureSurfaced(t *testing.T) {
 	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
 	if err := cli.Send(context.Background(), "w1:p1", "x"); err == nil {
 		t.Error("CLI failure must be surfaced (→ log + escalate upstream)")
+	}
+}
+
+func TestListWorkspacesTabsAndAgentTabIDs(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	ctx := context.Background()
+
+	// Envelopes below mirror live herdr 0.7.1 output.
+	fake.SetAgentList(`{"id":"cli:agent:list","result":{"agents":[` +
+		`{"agent":"claude","agent_status":"blocked","pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"}],"type":"agent_list"}}`)
+	agents, err := cli.ListAgents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].TabID != "w1:t1" {
+		t.Errorf("agent tab_id parsing: %+v", agents)
+	}
+
+	fake.SetWorkspaceList(`{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[` +
+		`{"active_tab_id":"w1:t1","focused":true,"label":"test","number":1,"pane_count":2,"tab_count":1,"workspace_id":"w1"}]}}`)
+	wss, err := cli.ListWorkspaces(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wss) != 1 || wss[0].ID != "w1" || wss[0].Label != "test" || wss[0].Number != 1 {
+		t.Errorf("workspace list parsing: %+v", wss)
+	}
+
+	fake.SetTabList(`{"id":"cli:tab:list","result":{"tabs":[` +
+		`{"focused":true,"label":"1","number":1,"pane_count":2,"tab_id":"w1:t1","workspace_id":"w1"}],"type":"tab_list"}}`)
+	tabs, err := cli.ListTabs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tabs) != 1 || tabs[0].ID != "w1:t1" || tabs[0].Number != 1 || tabs[0].WorkspaceID != "w1" {
+		t.Errorf("tab list parsing: %+v", tabs)
 	}
 }

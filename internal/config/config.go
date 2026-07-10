@@ -35,8 +35,20 @@ type Safety struct {
 	AllowlistPatterns []string `toml:"allowlist_patterns"`
 	// DisableSeed disables the shipped seed allowlist (not recommended).
 	DisableSeed bool `toml:"disable_seed"`
-	// IrreversibleIndicators extends the suspected-irreversible heuristic.
+	// IrreversibleIndicators extends the suspected-irreversible heuristic
+	// for every agent type. Use IndicatorRules to scope a pattern to a
+	// subset of agents.
 	IrreversibleIndicators []string `toml:"irreversible_indicators"`
+	// IndicatorRules extends the suspected-irreversible heuristic with
+	// agent-scoped patterns.
+	IndicatorRules []IndicatorRule `toml:"indicator_rules"`
+}
+
+// IndicatorRule is one operator-added suspected-irreversible indicator,
+// optionally scoped to specific agent types ("*" or empty = all agents).
+type IndicatorRule struct {
+	Pattern string   `toml:"pattern"`
+	Agents  []string `toml:"agents"`
 }
 
 // Limits bounds automated prompting (FR-014, FR-019).

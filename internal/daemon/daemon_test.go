@@ -373,6 +373,130 @@ func TestAllowlistBlocksDestructiveApproval(t *testing.T) {
 	}
 }
 
+func TestNarrationInScrollbackDoesNotTripHeuristic(t *testing.T) {
+	// Regression (agy false-positive): an agent whose *narration* discusses
+	// destructive operations must not be perpetually flagged — the heuristic
+	// scans the actionable region, not the whole scrollback.
+	narration := "The cleanup job is deleting\nold databases tonight. That cannot be undone.\n"
+	var filler strings.Builder
+	for i := 0; i < domain.IrreversibleScanTailLines; i++ {
+		filler.WriteString("filler narration text\n")
+	}
+	pane := narration + filler.String() + approvalPane
+	h := newHarness(t, "")
+	h.herdr.setPane(pane)
+	h.seedAutonomous(pane, domain.SituationApproval, "1")
+
+	h.push("agent-n1", "blocked")
+
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "1" {
+		t.Errorf("benign approval below stale narration should auto-act, sent %q", got)
+	}
+}
+
+func TestAllowlistScansFullSnapshotBeyondTailWindow(t *testing.T) {
+	// FR-015 invariant pin: only the heuristic is scoped to the tail window;
+	// the never-auto allowlist must keep scanning the entire snapshot.
+	var b strings.Builder
+	b.WriteString("Earlier: git push --force origin main\n")
+	for i := 0; i < domain.IrreversibleScanTailLines; i++ {
+		b.WriteString("filler narration text\n")
+	}
+	pane := b.String() + approvalPane
+	h := newHarness(t, "")
+	h.herdr.setPane(pane)
+	h.seedAutonomous(pane, domain.SituationApproval, "1")
+
+	h.push("agent-n6", "blocked")
+
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(context.Background())
+		return len(esc) == 1
+	})
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("allowlist-matched content anywhere in the snapshot must block auto-action")
+	}
+	esc, _ := h.raw.PendingEscalations(context.Background())
+	if !contains(esc[0].Rationale, "allowlist") {
+		t.Errorf("escalation should cite the allowlist, got %q", esc[0].Rationale)
+	}
+}
+
+func TestIdleNarrationEscalatesWithoutIrreversibleFlag(t *testing.T) {
+	// Idle scans only the outbound next-task text; destructive words in the
+	// recap must not surface as suspected_irreversible.
+	pane := "I summarized the module: it guards against deleting\ndatabases and similar. Task complete.\n"
+	h := newHarness(t, "")
+	h.herdr.setPane(pane)
+
+	h.push("agent-n2", "idle")
+
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(context.Background())
+		return len(esc) == 1
+	})
+	esc, _ := h.raw.PendingEscalations(context.Background())
+	if contains(esc[0].Rationale, "irreversible") {
+		t.Errorf("idle recap must not be flagged irreversible, got %q", esc[0].Rationale)
+	}
+	if !contains(esc[0].Rationale, string(domain.ReasonNoTaskSource)) {
+		t.Errorf("expected no_task_source escalation, got %q", esc[0].Rationale)
+	}
+}
+
+func TestIrreversibleEscalationCitesIndicator(t *testing.T) {
+	// FR-016 + diagnosability: a destructive-looking pending dialog escalates
+	// and the rationale names the indicator and matched text.
+	pane := "Do you want to proceed?\nThis action cannot be undone.\n❯ 1. Yes\n  2. No\n"
+	h := newHarness(t, "")
+	h.herdr.setPane(pane)
+	h.seedAutonomous(pane, domain.SituationApproval, "1")
+
+	h.push("agent-n3", "blocked")
+
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(context.Background())
+		return len(esc) == 1
+	})
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("suspected-irreversible dialog must not be auto-approved")
+	}
+	esc, _ := h.raw.PendingEscalations(context.Background())
+	if !contains(esc[0].Rationale, string(domain.ReasonSuspectedIrrevers)) {
+		t.Fatalf("expected suspected_irreversible, got %q", esc[0].Rationale)
+	}
+	if !contains(esc[0].Rationale, "cannot be undone") || !contains(esc[0].Rationale, "indicator") {
+		t.Errorf("rationale should cite the indicator and matched text, got %q", esc[0].Rationale)
+	}
+}
+
+func TestAgentScopedIndicatorRules(t *testing.T) {
+	// Operator indicator rules scoped to agent types: a rule listing the
+	// agent applies; a rule scoped to other agents does not.
+	pane := "Do you want to proceed?\nThis will frobnicate the widgets.\n❯ 1. Yes\n  2. No\n"
+	cfgScoped := "[[safety.indicator_rules]]\npattern = '(?i)frobnicate\\s+the\\s+widgets'\nagents = [\"claude\"]\n"
+	h := newHarness(t, cfgScoped)
+	h.herdr.setPane(pane)
+	h.seedAutonomous(pane, domain.SituationApproval, "1")
+	h.push("agent-n4", "blocked")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(context.Background())
+		return len(esc) == 1
+	})
+	esc, _ := h.raw.PendingEscalations(context.Background())
+	if !contains(esc[0].Rationale, "frobnicate") {
+		t.Errorf("scoped rule should apply to a listed agent, got %q", esc[0].Rationale)
+	}
+
+	cfgOther := "[[safety.indicator_rules]]\npattern = '(?i)frobnicate\\s+the\\s+widgets'\nagents = [\"codex\", \"agy\"]\n"
+	h2 := newHarness(t, cfgOther)
+	h2.herdr.setPane(pane)
+	h2.seedAutonomous(pane, domain.SituationApproval, "1")
+	h2.push("agent-n5", "blocked")
+	waitFor(t, 3*time.Second, func() bool { return len(h2.herdr.sentInputs()) == 1 })
+}
+
 func TestPersistenceFailureBlocksAction(t *testing.T) {
 	// FR-024: a simulated audit write failure blocks the autonomous action
 	// — no input is sent — and raises an operator-visible notification.
@@ -727,3 +851,35 @@ func TestLLMFailureEscalates(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+func TestAgentNamedOnDiscoveryAndWorking(t *testing.T) {
+	// A brand-new agent must get its short name the moment it is seen —
+	// on a "detected" discovery event or a "working" transition — not only
+	// when it first needs attention.
+	h := newHarness(t, "")
+	ctx := context.Background()
+
+	h.push("w23:p5", "detected")
+	waitFor(t, 2*time.Second, func() bool {
+		names, _ := h.raw.AgentNames(ctx)
+		return names["w23:p5"] != ""
+	})
+
+	h.push("w24:p1", "working")
+	waitFor(t, 2*time.Second, func() bool {
+		names, _ := h.raw.AgentNames(ctx)
+		return names["w24:p1"] != ""
+	})
+
+	// Names are two-word adjective-animal slugs, and a detected event never
+	// triggers any automated action.
+	names, _ := h.raw.AgentNames(ctx)
+	for _, id := range []string{"w23:p5", "w24:p1"} {
+		if !strings.Contains(names[id], "-") {
+			t.Errorf("agent %s name %q should be a two-word slug", id, names[id])
+		}
+	}
+	if inputs := h.herdr.sentInputs(); len(inputs) != 0 {
+		t.Errorf("discovery must not cause sends, got %v", inputs)
+	}
+}

@@ -89,6 +89,39 @@ func TestSaveRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLoadAgentScopedIndicatorRules(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte(`
+[safety]
+irreversible_indicators = ['(?i)nuke\s+it']
+
+[[safety.indicator_rules]]
+pattern = '(?i)compact\s+the\s+conversation'
+agents = ["codex", "agy"]
+
+[[safety.indicator_rules]]
+pattern = '(?i)squash\s+the\s+timeline'
+agents = ["*"]
+`), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Safety.IrreversibleIndicators) != 1 {
+		t.Errorf("flat indicators lost: %+v", cfg.Safety.IrreversibleIndicators)
+	}
+	if len(cfg.Safety.IndicatorRules) != 2 {
+		t.Fatalf("expected 2 indicator rules, got %+v", cfg.Safety.IndicatorRules)
+	}
+	r := cfg.Safety.IndicatorRules[0]
+	if r.Pattern != `(?i)compact\s+the\s+conversation` || len(r.Agents) != 2 || r.Agents[1] != "agy" {
+		t.Errorf("scoped rule mismatch: %+v", r)
+	}
+	if cfg.Safety.IndicatorRules[1].Agents[0] != "*" {
+		t.Errorf("wildcard rule mismatch: %+v", cfg.Safety.IndicatorRules[1])
+	}
+}
+
 func setHome(t *testing.T, home string) {
 	t.Helper()
 	t.Setenv("HOME", home)

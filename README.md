@@ -59,6 +59,31 @@ Herdr injects, and without them auto-detects Herdr's plugin directories
 exists — the plugin isn't installed — does it fall back to standalone
 dirs (`~/.config/herd-auto-prompter`, `~/.local/state/herd-auto-prompter`).
 
+### Open the pane with a hotkey (optional)
+
+Herdr supports custom command keybindings, and the Auto Prompter pane can be
+opened from the CLI — so you can bind it to a key. Add this to
+`~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+a"
+type = "shell"
+command = "herdr plugin pane open --plugin herd-auto-prompter --entrypoint control"
+description = "Open Auto Prompter pane"
+```
+
+Then apply it with `herdr server reload-config` (no restart needed). Now
+`ctrl+b` (Herdr's default prefix) followed by `a` opens the pane.
+
+Notes:
+
+- The pane opens as a split (the placement declared in the plugin manifest);
+  override with `--placement overlay|tab|zoomed` in the command if you prefer.
+- `prefix+a` is unused by Herdr's default bindings. Direct (no-prefix) chords
+  like `key = "ctrl+alt+a"` also work — ctrl+letter, function keys, and
+  explicit modified chords are the most reliable.
+
 ## How it learns (shadow mode)
 
 The plugin never acts on a situation it hasn't learned from you.
@@ -71,8 +96,9 @@ The plugin never acts on a situation it hasn't learned from you.
    confirm the suggestion (and send it), or `c` to type the correct
    response — `v` shows the full record (trigger, rationale, LLM output)
    when the list line is truncated; it works on the *Agents*, *Audit*, and
-   *Rules* tabs too. From the CLI: `confirm <id> --send` or
-   `resolve <id> --action TEXT --send`.
+   *Rules* tabs too, and pressing `tab`/`shift+tab` inside the detail view
+   switches tabs directly (no `esc` needed). From the CLI:
+   `confirm <id> --send` or `resolve <id> --action TEXT --send`.
 3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
    *and* confidence above the per-situation threshold, that signature becomes
    autonomous: next time, the plugin acts on its own and logs it.
@@ -130,10 +156,13 @@ path = "/home/me/project/docs/tasks.md"
 
 ### Agent short names
 
-Every monitored agent automatically gets a short friendly name (e.g.
-`brave-otter`) the first time it's seen — pane ids like `w6:p1` are not
-operator-friendly. Use the name in task-source selectors, and rename agents
-to whatever fits your workflow:
+Every monitored agent automatically gets a short friendly two-word name
+(e.g. `brave-otter`) the moment it appears in the herd — on detection, not
+on its first blocked prompt — because pane ids like `w6:p1` are not
+operator-friendly. The TUI's agent detail (`v`) also shows exactly where
+the agent lives: workspace, tab, and pane, each with its number, label,
+and id. Use the name in task-source selectors, and rename agents to
+whatever fits your workflow:
 
 ```sh
 bin/hap agents                      # short name, pane id, type, status
@@ -165,8 +194,18 @@ but match no pattern are escalated by a suspected-irreversible heuristic
 rather than automated. The heuristic needs corroboration to fire — a
 destructive verb aimed at a data/infrastructure target, explicit no-undo
 language, and the like — so everyday prompts ("remove the unused import")
-don't trip it. Extend it with `irreversible_indicators` regex patterns in
-`[safety]`.
+don't trip it. It scans only the actionable region (the pending dialog near
+the pane bottom, or the next-task prompt about to be sent when idle), so an
+agent merely *talking about* destructive operations in its narration isn't
+flagged, and the escalation rationale names the indicator and the text it
+matched. Extend it with `irreversible_indicators` regex patterns in
+`[safety]` (all agents), or scope a pattern to specific agent types:
+
+```toml
+[[safety.indicator_rules]]
+pattern = '(?i)compact\s+the\s+conversation'
+agents = ["codex", "agy"]   # "*" or omit for all agents
+```
 
 ### Local LLM fallback (optional)
 
@@ -257,6 +296,39 @@ your learned history. On timeout or no submission the situation escalates.
   corrections keep their lineage to the original decision.
 - `clear-data --yes` resets all learned history and audit data (it never
   leaves your machine in the first place).
+
+### Wiping plugin data
+
+Two levels, depending on how much you want gone:
+
+- **Reset learned data (the supported path):**
+
+  ```sh
+  bin/hap clear-data --yes
+  ```
+
+  This empties every learning-related table in the SQLite database
+  (signatures, decisions, audit log, corrections, rate/retry counters, LLM
+  requests and decisions) and nudges the running daemon to reload — no
+  restart needed. The `--yes` is mandatory; without it the command refuses.
+  Your configuration (thresholds, never-auto rules, task sources) is kept.
+
+- **Full factory reset (everything, including config):** there's no single
+  CLI verb for this — stop the daemon and delete the plugin's two
+  directories:
+
+  ```sh
+  pkill -f "hap daemon" 2>/dev/null                          # stop the daemon
+  rm -rf ~/.local/state/herdr/plugins/herd-auto-prompter     # DB, log, socket, lock
+  rm -rf ~/.config/herdr/plugins/config/herd-auto-prompter   # config.toml
+  ```
+
+  Both directories are recreated fresh automatically — the daemon restarts
+  on the next `pane.agent_detected`/`workspace.created` event, or
+  immediately via `bin/hap daemon --ensure`.
+
+Prefer `clear-data` unless you also want your config gone; it's the only
+path that keeps the daemon running through the wipe.
 
 ## Development
 

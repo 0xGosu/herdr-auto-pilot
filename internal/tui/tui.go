@@ -266,6 +266,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.detail.offset < max(0, len(m.detail.lines)-m.detailPageSize()) {
 				m.detail.offset++
 			}
+		case "tab", "right", "l":
+			// Tab-switching works from inside the overlay: close it and
+			// move on, no extra esc needed.
+			m.detail = nil
+			m.tab = (m.tab + 1) % tabCount
+			m.cursor = 0
+			m.message = ""
+		case "shift+tab", "left", "h":
+			m.detail = nil
+			m.tab = (m.tab + tabCount - 1) % tabCount
+			m.cursor = 0
+			m.message = ""
 		case "esc", "q", "v", "enter":
 			m.detail = nil
 		}
@@ -571,14 +583,39 @@ func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 	var lines []string
 	lines = detailField(lines, w, "Short name", orDash(m.data.status.AgentName(a.AgentID)))
 	lines = detailField(lines, w, "Agent id", a.AgentID)
+	lines = detailField(lines, w, "Workspace", locationLabel(a.WorkspaceID,
+		func() (string, int, bool) {
+			ws, ok := m.data.status.Workspaces[a.WorkspaceID]
+			return ws.Label, ws.Number, ok
+		}))
+	lines = detailField(lines, w, "Tab", locationLabel(a.TabID,
+		func() (string, int, bool) {
+			tab, ok := m.data.status.Tabs[a.TabID]
+			return tab.Label, tab.Number, ok
+		}))
 	lines = detailField(lines, w, "Pane", a.PaneID)
-	lines = detailField(lines, w, "Workspace", a.WorkspaceID)
 	lines = detailField(lines, w, "Type", a.AgentType)
 	lines = detailField(lines, w, "Status", a.Status)
 	if !a.At.IsZero() {
 		lines = detailField(lines, w, "Last transition", a.At.Format(time.RFC3339))
 	}
 	return lines
+}
+
+// locationLabel renders `#<number> "<label>" (<id>)` for a workspace/tab,
+// degrading to the raw id when no metadata is known.
+func locationLabel(id string, lookup func() (label string, number int, ok bool)) string {
+	if id == "" {
+		return ""
+	}
+	if label, number, ok := lookup(); ok {
+		out := fmt.Sprintf("#%d", number)
+		if label != "" {
+			out += fmt.Sprintf(" %q", label)
+		}
+		return out + " (" + id + ")"
+	}
+	return id
 }
 
 func (m Model) auditDetailLines(r domain.AuditRecord, w int) []string {
@@ -929,7 +966,7 @@ func (m Model) View() string {
 
 func (m Model) helpLine() string {
 	if m.detail != nil {
-		return "↑/↓: scroll  esc/q/v: close"
+		return "↑/↓: scroll  tab: switch tab  esc/q/v: close"
 	}
 	common := "tab: switch  ↑/↓: select  p: pause  r: resume  q: quit"
 	switch m.tab {

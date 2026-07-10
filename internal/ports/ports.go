@@ -21,6 +21,14 @@ type HerdrPort interface {
 	ListAgents(ctx context.Context) ([]domain.AgentTransition, error)
 }
 
+// LocatorPort is implemented by Herdr adapters that can report workspace
+// and tab display metadata (labels, numbers) for locating agents. Optional:
+// callers type-assert and degrade to raw ids when absent.
+type LocatorPort interface {
+	ListWorkspaces(ctx context.Context) ([]domain.WorkspaceInfo, error)
+	ListTabs(ctx context.Context) ([]domain.TabInfo, error)
+}
+
 // EventPort is the inbound Herdr event subscription (raw socket).
 type EventPort interface {
 	// Subscribe streams agent-status transitions until ctx is done.
@@ -86,6 +94,10 @@ type FrontendStore interface {
 	// AssignAgentName upserts a name for an agent id the caller has
 	// verified to be live (e.g. present in Herdr's agent list).
 	AssignAgentName(ctx context.Context, agentID, name string) error
+	// EnsureAgentName returns the agent's short name, generating one on
+	// first sight. Front-ends use it to name live agents the daemon has
+	// not observed yet (insert-if-absent; renames stay operator-owned).
+	EnsureAgentName(ctx context.Context, agentID string) (string, error)
 	// DeleteSignature removes one learned signature with its decision
 	// history and error-retry row, returning the decision count. The daemon
 	// may recreate the signature from an in-flight event; the recreated

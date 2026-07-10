@@ -23,10 +23,16 @@ func testModel(t *testing.T) Model {
 	upd, _ := m.Update(refreshMsg{
 		status: frontend.Status{
 			MonitoredAgents: []domain.AgentTransition{
-				{AgentID: "w6:p1", AgentType: "claude", PaneID: "p1", WorkspaceID: "w6",
+				{AgentID: "w6:p1", AgentType: "claude", PaneID: "w6:p1", TabID: "w6:t1", WorkspaceID: "w6",
 					Status: "blocked", At: time.Date(2026, 7, 9, 10, 0, 0, 0, time.UTC)},
 			},
 			AgentNames: map[string]string{"w6:p1": "brave-otter"},
+			Workspaces: map[string]domain.WorkspaceInfo{
+				"w6": {ID: "w6", Label: "v013-check", Number: 6},
+			},
+			Tabs: map[string]domain.TabInfo{
+				"w6:t1": {ID: "w6:t1", Label: "1", Number: 1, WorkspaceID: "w6"},
+			},
 		},
 		escalations: []domain.AuditRecord{
 			{ID: 41, AgentID: "w6:p1", SituationType: domain.SituationApproval,
@@ -93,10 +99,50 @@ func TestDetailViewAgents(t *testing.T) {
 		t.Fatal("v on Agents tab should open the detail view")
 	}
 	view := m.View()
-	for _, want := range []string{"Agent w6:p1", "brave-otter", "Workspace", "w6", "blocked", "2026-07-09T10:00:00Z"} {
+	// Location shows workspace/tab number+label with ids, plus the pane.
+	for _, want := range []string{"Agent w6:p1", "brave-otter",
+		`#6 "v013-check" (w6)`, `#1 "1" (w6:t1)`, "Pane", "w6:p1",
+		"blocked", "2026-07-09T10:00:00Z"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("agent detail view missing %q:\n%s", want, view)
 		}
+	}
+}
+
+func TestDetailViewAgentLocationFallsBackToIDs(t *testing.T) {
+	m := testModel(t)
+	m.data.status.Workspaces = nil
+	m.data.status.Tabs = nil
+	m = press(t, m, "v")
+	view := m.View()
+	if !strings.Contains(view, "w6:t1") || !strings.Contains(view, "w6") {
+		t.Errorf("without metadata the raw ids must still show:\n%s", view)
+	}
+}
+
+func TestDetailViewTabSwitches(t *testing.T) {
+	m := press(t, testModel(t), "v")
+	if m.detail == nil {
+		t.Fatal("detail should be open")
+	}
+	// tab inside the overlay closes it AND moves to the next tab.
+	m = press(t, m, "tab")
+	if m.detail != nil {
+		t.Error("tab should close the detail view")
+	}
+	if m.tab != tabEscalations {
+		t.Errorf("tab should advance to Escalations, got %v", m.tab)
+	}
+	// shift+tab goes backwards from an open detail too.
+	m.tab = tabAudit
+	m = press(t, m, "v")
+	if m.detail == nil {
+		t.Fatal("detail should be open on Audit")
+	}
+	upd, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	m = upd.(Model)
+	if m.detail != nil || m.tab != tabEscalations {
+		t.Errorf("shift+tab should close the detail and go back, got tab=%v detail=%v", m.tab, m.detail != nil)
 	}
 }
 

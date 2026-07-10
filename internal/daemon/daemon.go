@@ -103,7 +103,7 @@ func (d *Daemon) reload() error {
 		return err
 	}
 	allow, errs := domain.NewAllowlist(!cfg.Safety.DisableSeed,
-		cfg.Safety.AllowlistPatterns, cfg.Safety.IrreversibleIndicators)
+		cfg.Safety.AllowlistPatterns, indicatorRules(cfg.Safety))
 	for _, e := range errs {
 		slog.Warn("allowlist pattern rejected", "error", e)
 	}
@@ -217,6 +217,16 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	cfg, allow, cls := d.snapshot()
 	now := d.opt.Clock.Now()
 
+	// Auto-generate a short friendly name on first sight — for EVERY
+	// observed transition, including "detected" discovery events and
+	// "working", so a brand-new agent is named the moment it appears, not
+	// only when it first needs attention (insert-if-absent, so operator
+	// renames are never clobbered).
+	agentName, err := d.opt.Store.EnsureAgentName(ctx, tr.AgentID)
+	if err != nil {
+		slog.Warn("agent name generation failed", "agent", tr.AgentID, "error", err)
+	}
+
 	switch tr.Status {
 	case "working":
 		// A transition to working that we did not cause means the human
@@ -235,15 +245,8 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	case "idle", "done", "blocked":
 		// attention-requiring; continue below
 	default:
+		// "detected" and unknown statuses: named above, nothing to act on.
 		return
-	}
-
-	// Auto-generate a short friendly name on first sight; operators use it
-	// for task-source config and renames (insert-if-absent, so operator
-	// renames are never clobbered).
-	agentName, err := d.opt.Store.EnsureAgentName(ctx, tr.AgentID)
-	if err != nil {
-		slog.Warn("agent name generation failed", "agent", tr.AgentID, "error", err)
 	}
 
 	pane, err := d.opt.Herdr.ReadPane(ctx, tr.PaneID, d.opt.PaneReadLines)
@@ -282,6 +285,17 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 
 	allowPattern, allowMatched := allow.Match(situation.Content)
 
+	// The heuristic scans only the actionable region (pending dialog +
+	// outbound task text), not the full scrollback: agents narrating *about*
+	// destructive operations must not be flagged perpetually (FR-016).
+	declared := d.declaredTask(cfg, tr, agentName)
+	var irrevHit domain.IndicatorHit
+	suspected := false
+	if !allowMatched {
+		irrevHit, suspected = allow.SuspectedIrreversible(situation.AgentType,
+			domain.IrreversibleScanContent(situation, declared))
+	}
+
 	in := domain.DecideInput{
 		Situation:   situation,
 		Signature:   sig,
@@ -298,11 +312,12 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		Now:                   now,
 		RetryCount:            retries,
 		MaxRetries:            cfg.Limits.MaxErrorRetries,
-		DeclaredTask:          d.declaredTask(cfg, tr, agentName),
+		DeclaredTask:          declared,
 		LLMConfigured:         d.llmPort() != nil && d.llmPort().Configured(),
 		AllowlistHit:          allowPattern,
 		AllowlistMatched:      allowMatched,
-		SuspectedIrreversible: !allowMatched && allow.SuspectedIrreversible(situation.Content),
+		SuspectedIrreversible: suspected,
+		IrreversibleHit:       irrevHit,
 	}
 
 	decision := domain.Decide(in)
@@ -569,8 +584,17 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(domain.ReasonAllowlistMatch, "LLM action matches never-auto pattern: "+pattern)
 		return
 	}
-	if allow.SuspectedIrreversible(s.Content) || allow.SuspectedIrreversible(llmDec.Action) {
-		reject(domain.ReasonSuspectedIrrevers, "suspected-irreversible content")
+	// The heuristic screens the situation's actionable region plus the
+	// outbound text the LLM authored (which is what would actually be sent).
+	scan := domain.IrreversibleScanContent(s, d.declaredTaskFor(ctx, s))
+	if hit, sus := allow.SuspectedIrreversible(s.AgentType, scan); sus {
+		reject(domain.ReasonSuspectedIrrevers,
+			fmt.Sprintf("suspected-irreversible content: indicator %s matched %q", hit.Pattern, hit.Excerpt))
+		return
+	}
+	if hit, sus := allow.SuspectedIrreversible(s.AgentType, llmDec.Action); sus {
+		reject(domain.ReasonSuspectedIrrevers,
+			fmt.Sprintf("suspected-irreversible LLM action: indicator %s matched %q", hit.Pattern, hit.Excerpt))
 		return
 	}
 	rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
@@ -861,6 +885,19 @@ func (d *Daemon) notify(ctx context.Context, title, body string) {
 	if err := d.opt.Notify.Notify(ctx, title, body); err != nil {
 		slog.Warn("notification failed", "error", err)
 	}
+}
+
+// indicatorRules merges the flat (all-agent) operator indicator patterns
+// with the agent-scoped rules into the domain representation.
+func indicatorRules(s config.Safety) []domain.IndicatorRule {
+	rules := make([]domain.IndicatorRule, 0, len(s.IrreversibleIndicators)+len(s.IndicatorRules))
+	for _, p := range s.IrreversibleIndicators {
+		rules = append(rules, domain.IndicatorRule{Pattern: p})
+	}
+	for _, r := range s.IndicatorRules {
+		rules = append(rules, domain.IndicatorRule{Pattern: r.Pattern, Agents: r.Agents})
+	}
+	return rules
 }
 
 func thresholds(cfg config.Config) domain.DecideThresholds {

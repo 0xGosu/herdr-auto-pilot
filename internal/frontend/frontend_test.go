@@ -549,3 +549,66 @@ func TestDeleteSignatureNudgesReload(t *testing.T) {
 		t.Fatal("DeleteSignature must nudge the daemon with KindReload")
 	}
 }
+
+// fakeLocatorPort is a fakeHerdrPort that also reports workspace/tab
+// metadata (ports.LocatorPort).
+type fakeLocatorPort struct {
+	fakeHerdrPort
+	workspaces []domain.WorkspaceInfo
+	tabs       []domain.TabInfo
+}
+
+func (f *fakeLocatorPort) ListWorkspaces(ctx context.Context) ([]domain.WorkspaceInfo, error) {
+	return f.workspaces, nil
+}
+func (f *fakeLocatorPort) ListTabs(ctx context.Context) ([]domain.TabInfo, error) {
+	return f.tabs, nil
+}
+
+func TestGetStatusNamesLiveAgentsAndReportsLocation(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	app.Herdr = &fakeLocatorPort{
+		fakeHerdrPort: fakeHerdrPort{agents: []domain.AgentTransition{
+			{AgentID: "w23:p5", PaneID: "w23:p5", TabID: "w23:t1", WorkspaceID: "w23",
+				AgentType: "claude", Status: "working"},
+		}},
+		workspaces: []domain.WorkspaceInfo{{ID: "w23", Label: "backend", Number: 23}},
+		tabs:       []domain.TabInfo{{ID: "w23:t1", Label: "1", Number: 1, WorkspaceID: "w23"}},
+	}
+
+	stat, err := app.GetStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A live agent with no name row gets one immediately — the operator
+	// never stares at a bare pane id.
+	name := stat.AgentName("w23:p5")
+	if name == "" || !strings.Contains(name, "-") {
+		t.Fatalf("live agent should be auto-named with a two-word slug, got %q", name)
+	}
+	persisted, _ := st.AgentNames(ctx)
+	if persisted["w23:p5"] != name {
+		t.Error("auto-assigned name must be persisted")
+	}
+	// A second call is stable (insert-if-absent).
+	stat2, _ := app.GetStatus(ctx)
+	if stat2.AgentName("w23:p5") != name {
+		t.Error("name must be stable across refreshes")
+	}
+	// Location metadata is exposed for the detail view.
+	if ws := stat.Workspaces["w23"]; ws.Label != "backend" || ws.Number != 23 {
+		t.Errorf("workspace metadata: %+v", stat.Workspaces)
+	}
+	if tab := stat.Tabs["w23:t1"]; tab.Number != 1 {
+		t.Errorf("tab metadata: %+v", stat.Tabs)
+	}
+	// An operator rename is never clobbered by the auto-naming pass.
+	if err := app.RenameAgent(ctx, "w23:p5", "backend-dev"); err != nil {
+		t.Fatal(err)
+	}
+	stat3, _ := app.GetStatus(ctx)
+	if stat3.AgentName("w23:p5") != "backend-dev" {
+		t.Errorf("rename clobbered: %q", stat3.AgentName("w23:p5"))
+	}
+}

@@ -3,6 +3,7 @@ package domain
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -60,34 +61,53 @@ var SeedAllowlistPatterns = []string{
 	`(?i)\b(merge|merging)\b[^\n]*\bpull request\b[^\n]*\b(main|master|prod)`,
 }
 
+// IndicatorRule is one suspected-irreversible indicator, optionally scoped
+// to a subset of agent types. An empty Agents list — or one containing "*" —
+// applies the indicator to every agent.
+type IndicatorRule struct {
+	Pattern string
+	Agents  []string
+}
+
 // SeedIrreversibleIndicators back the suspected-irreversible-but-unmatched
 // heuristic (FR-016): destructive-operation indicators that, present in a
-// prompt with no allowlist match, bias the plugin toward escalation.
+// prompt with no allowlist match, bias the plugin toward escalation. The
+// seed rules apply to all agent types; operator rules may scope to a subset.
 //
 // A hit escalates unconditionally, so every indicator needs corroboration:
 // a bare verb like "remove" or "drop" appears in everyday refactoring
 // prompts ("remove the unused import") and must not trip the heuristic on
 // its own — only paired with a data/infrastructure target, no-undo
 // language, or a force/credential/production context.
-var SeedIrreversibleIndicators = []string{
+var SeedIrreversibleIndicators = []IndicatorRule{
 	// Explicit no-undo language — strong enough to stand alone.
-	`(?i)\birreversibl[ey]\b|\bunrecoverabl[ey]\b|\bcannot\s+be\s+(undone|recovered|restored|reversed|reverted)\b|\bcan't\s+be\s+undone\b|\bno\s+undo\b|\blost\s+forever\b|\b(is|are)\s+permanent\b`,
-	`(?i)\bare\s+you\s+absolutely\s+sure\b`,
-	// Destructive verb aimed at a data/infrastructure target. (?s) with a
-	// bounded bridge: confirmations often put the verb and its target on
-	// different lines ("Delete the following?\n - production backups").
-	`(?is)\b(delet(e[sd]?|ing)|destroy(s|ed|ing)?|remov(e[sd]?|ing)|eras(e[sd]?|ing)|wip(e[sd]?|ing)|purg(e[sd]?|ing)|drop(s|ped|ping)?|truncat(e[sd]?|ing))\b.{0,120}?\b(databases?|tables?|schemas?|backups?|snapshots?|buckets?|volumes?|partitions?|disks?|prod(uction)?|(user|customer|all)\s+data|records?|history|repositor(y|ies)|accounts?)\b`,
-	`(?i)\bpermanently\s+(delet|destroy|remov|eras|wip|purg|discard)`,
+	{Pattern: `(?i)\birreversibl[ey]\b|\bunrecoverabl[ey]\b|\bcannot\s+be\s+(undone|recovered|restored|reversed|reverted)\b|\bcan't\s+be\s+undone\b|\bno\s+undo\b|\blost\s+forever\b|\b(is|are)\s+permanent\b`},
+	{Pattern: `(?i)\bare\s+you\s+absolutely\s+sure\b`},
+	// Destructive verb aimed at a data/infrastructure target. The bridge
+	// allows at most one line break or one blank line: confirmations often
+	// put the verb and its target on adjacent lines ("Delete the
+	// following?\n\n - production backups"), but a verb and target separated
+	// by other lines of text is narration, not a pending operation.
+	{Pattern: `(?i)\b(delet(e[sd]?|ing)|destroy(s|ed|ing)?|remov(e[sd]?|ing)|eras(e[sd]?|ing)|wip(e[sd]?|ing)|purg(e[sd]?|ing)|drop(s|ped|ping)?|truncat(e[sd]?|ing))\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(databases?|tables?|schemas?|backups?|snapshots?|buckets?|volumes?|partitions?|disks?|prod(uction)?|(user|customer|all)\s+data|records?|history|repositor(y|ies)|accounts?)\b`},
+	{Pattern: `(?i)\bpermanently\s+(delet|destroy|remov|eras|wip|purg|discard)`},
 	// Forced overwrites/removals (force-push itself is allowlisted).
-	`(?i)\bforc(e|ed|ibly)\b[^\n]*\b(overwrit|delet|remov|push)`,
+	{Pattern: `(?i)\bforc(e|ed|ibly)\b[^\n]*\b(overwrit|delet|remov|push)`},
 	// Credential / access invalidation.
-	`(?i)\b(revok|rotat|invalidat|regenerat)(e[sd]?|ing|ion)\b[^\n]*\b(access|keys?|tokens?|cert(ificate)?s?|credentials?|secrets?|sessions?|passwords?)\b`,
+	{Pattern: `(?i)\b(revok|rotat|invalidat|regenerat)(e[sd]?|ing|ion)\b[^\n]*\b(access|keys?|tokens?|cert(ificate)?s?|credentials?|secrets?|sessions?|passwords?)\b`},
 	// Shipping to shared/production surfaces.
-	`(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing)|push(es|ed|ing)?)\b[^\n]*\b(prod|production|live|public)\b`,
+	{Pattern: `(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing)|push(es|ed|ing)?)\b[^\n]*\b(prod|production|live|public)\b`},
 	// Discarding work.
-	`(?i)\b(overwrit(e[sd]?|ing)|clobber(s|ed|ing)?|discard(s|ed|ing)?)\b[^\n]*\b(changes|data|history|work)\b`,
-	// A confirmation that itself names a destructive act.
-	`(?is)\bare\s+you\s+sure\b.{0,120}?\b(delet|remov|eras|wip|purg|discard|overwrit|destroy|drop|reset)`,
+	{Pattern: `(?i)\b(overwrit(e[sd]?|ing)|clobber(s|ed|ing)?|discard(s|ed|ing)?)\b[^\n]*\b(changes|data|history|work)\b`},
+	// A confirmation that itself names a destructive act (same bounded
+	// bridge as the verb/target rule above).
+	{Pattern: `(?i)\bare\s+you\s+sure\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(delet|remov|eras|wip|purg|discard|overwrit|destroy|drop|reset)`},
+}
+
+// compiledIndicator is one indicator rule ready for matching.
+type compiledIndicator struct {
+	re     *regexp.Regexp
+	raw    string
+	agents []string // empty (or containing "*") = all agent types
 }
 
 // Allowlist is the compiled never-auto matcher plus the suspected-
@@ -95,33 +115,41 @@ var SeedIrreversibleIndicators = []string{
 type Allowlist struct {
 	patterns   []*regexp.Regexp
 	raw        []string
-	indicators []*regexp.Regexp
+	indicators []compiledIndicator
 }
 
 // NewAllowlist compiles seed + operator patterns and heuristic indicators.
 // Invalid operator patterns are reported, not silently dropped.
-func NewAllowlist(seedEnabled bool, extraPatterns, extraIndicators []string) (*Allowlist, []error) {
+func NewAllowlist(seedEnabled bool, extraPatterns []string, extraIndicators []IndicatorRule) (*Allowlist, []error) {
 	var errs []error
 	a := &Allowlist{}
-	add := func(pats []string, dst *[]*regexp.Regexp, keepRaw bool) {
+	addPatterns := func(pats []string) {
 		for _, p := range pats {
 			re, err := regexp.Compile(p)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("invalid pattern %q: %w", p, err))
 				continue
 			}
-			*dst = append(*dst, re)
-			if keepRaw {
-				a.raw = append(a.raw, p)
+			a.patterns = append(a.patterns, re)
+			a.raw = append(a.raw, p)
+		}
+	}
+	addIndicators := func(rules []IndicatorRule) {
+		for _, r := range rules {
+			re, err := regexp.Compile(r.Pattern)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("invalid pattern %q: %w", r.Pattern, err))
+				continue
 			}
+			a.indicators = append(a.indicators, compiledIndicator{re: re, raw: r.Pattern, agents: r.Agents})
 		}
 	}
 	if seedEnabled {
-		add(SeedAllowlistPatterns, &a.patterns, true)
+		addPatterns(SeedAllowlistPatterns)
 	}
-	add(extraPatterns, &a.patterns, true)
-	add(SeedIrreversibleIndicators, &a.indicators, false)
-	add(extraIndicators, &a.indicators, false)
+	addPatterns(extraPatterns)
+	addIndicators(SeedIrreversibleIndicators)
+	addIndicators(extraIndicators)
 	return a, errs
 }
 
@@ -136,15 +164,104 @@ func (a *Allowlist) Match(content string) (string, bool) {
 	return "", false
 }
 
+// IndicatorHit identifies which indicator tripped the suspected-irreversible
+// heuristic and the text it matched, so escalations are debuggable.
+type IndicatorHit struct {
+	Pattern string
+	Excerpt string
+}
+
 // SuspectedIrreversible reports whether content exhibits destructive
-// indicators without an allowlist match (FR-016 heuristic).
-func (a *Allowlist) SuspectedIrreversible(content string) bool {
-	for _, re := range a.indicators {
-		if re.MatchString(content) {
+// indicators without an allowlist match (FR-016 heuristic), returning the
+// first matching indicator. Only indicators scoped to agentType (or to all
+// agents) are consulted.
+func (a *Allowlist) SuspectedIrreversible(agentType, content string) (IndicatorHit, bool) {
+	for _, ind := range a.indicators {
+		if !indicatorAppliesTo(ind.agents, agentType) {
+			continue
+		}
+		// FindStringIndex, not FindString: a pattern that can match the
+		// empty string must still fire (noisy-safe), just with an empty
+		// excerpt.
+		if loc := ind.re.FindStringIndex(content); loc != nil {
+			return IndicatorHit{Pattern: ind.raw, Excerpt: excerpt(content[loc[0]:loc[1]], 80)}, true
+		}
+	}
+	return IndicatorHit{}, false
+}
+
+// indicatorAppliesTo reports whether an indicator's agent scope covers the
+// given agent type. An empty scope or a "*" entry covers everything; a blank
+// entry is treated as "*" too — a silently dead safety rule is worse than a
+// noisy one.
+func indicatorAppliesTo(agents []string, agentType string) bool {
+	if len(agents) == 0 {
+		return true
+	}
+	for _, ag := range agents {
+		ag = strings.TrimSpace(ag)
+		if ag == "" || ag == "*" || strings.EqualFold(ag, strings.TrimSpace(agentType)) {
 			return true
 		}
 	}
 	return false
+}
+
+// excerpt collapses whitespace runs and truncates to at most n runes, for
+// embedding matched pane text in a one-line rationale.
+func excerpt(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+// IrreversibleScanTailLines is how much of the pane bottom the suspected-
+// irreversible heuristic inspects for blocked situations: enough to cover a
+// pending approval/choice dialog, small enough to exclude most stale
+// narration further up the scrollback.
+const IrreversibleScanTailLines = 40
+
+// IrreversibleScanContent returns the content the suspected-irreversible
+// heuristic scans for a situation: the actionable region — the pending
+// dialog near the pane bottom plus any text automation would send — rather
+// than the whole scrollback. Scanning the full snapshot flagged agents whose
+// own narration merely *described* destructive operations (FR-016 is about
+// pending operations, not conversation about them).
+//
+// The never-auto allowlist (Match) still scans the full snapshot; only the
+// heuristic is scoped.
+func IrreversibleScanContent(s Situation, declaredTask string) string {
+	switch s.Type {
+	case SituationIdle:
+		// Idle has no pending pane operation; what could be irreversible is
+		// the next-task prompt automation would send.
+		parts := []string{declaredTask}
+		if inferred := InferNextTask(s.Content); inferred.Structured {
+			parts = append(parts, inferred.Task)
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	case SituationApproval, SituationChoice, SituationError:
+		parts := []string{lastLines(s.Content, IrreversibleScanTailLines),
+			s.PermissionVerb, s.ErrorSummary}
+		parts = append(parts, s.Options...)
+		return strings.Join(parts, "\n")
+	}
+	// Unclassifiable escalates before the heuristic runs; keep the full
+	// content for any future situation type so the check fails safe.
+	return s.Content
+}
+
+// lastLines returns the final n lines of s. A trailing newline is not
+// counted as a line, so the window holds n content lines.
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimSuffix(s, "\n"), "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
 // Patterns returns the active allowlist patterns (for display).

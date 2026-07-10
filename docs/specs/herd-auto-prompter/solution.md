@@ -321,7 +321,7 @@ erDiagram
 
 **Write ownership (see Concurrency & Durability Model).**
 - **Daemon-exclusive writers:** `SIGNATURES` (mode/counters), `AGENT_RATE`, `ERROR_RETRIES`, the `AUDIT_LOG` rows the daemon emits, and daemon-authored `DECISIONS` (including LLM decisions promoted from `LLM_DECISIONS`).
-- **Front-end (direct) writers:** `CORRECTIONS` records, `KILL_EVENTS` (append-only toggles), and TOML config/rules. The daemon re-derives affected `SIGNATURES` counters from `CORRECTIONS` on reload.
+- **Front-end (direct) writers:** `CORRECTIONS` records, `KILL_EVENTS` (append-only toggles), and TOML config/rules. The daemon re-derives affected `SIGNATURES` counters from `CORRECTIONS` on reload. `AGENT_NAMES` sits outside this partition: it is insert-if-absent from both the daemon and front-ends (concurrent inserts converge; renames are front-end-owned), so it carries no read-modify-write hazard.
 - **`mcp` (staged) writer:** `LLM_DECISIONS` rows only; the daemon consumes, re-gates, and promotes them — the `mcp` process never writes `DECISIONS`/`SIGNATURES` directly.
 
 **Entities.**

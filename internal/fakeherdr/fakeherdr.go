@@ -261,9 +261,15 @@ case "$1 $2" in
   "agent list")
     cat %q.agents 2>/dev/null
     ;;
+  "workspace list")
+    cat %q.workspaces 2>/dev/null
+    ;;
+  "tab list")
+    cat %q.tabs 2>/dev/null
+    ;;
 esac
 exit 0
-`, f.LogPath, f.FailFlag, f.PaneFile, f.PaneFile)
+`, f.LogPath, f.FailFlag, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
 	if err := os.WriteFile(f.BinPath, []byte(script), 0o700); err != nil {
 		return nil, err
 	}
@@ -278,6 +284,16 @@ func (f *FakeCLI) SetPaneContent(content string) error {
 // SetAgentList sets the raw JSON `agent list` returns.
 func (f *FakeCLI) SetAgentList(content string) error {
 	return os.WriteFile(f.PaneFile+".agents", []byte(content), 0o600)
+}
+
+// SetWorkspaceList sets the raw JSON `workspace list` returns.
+func (f *FakeCLI) SetWorkspaceList(content string) error {
+	return os.WriteFile(f.PaneFile+".workspaces", []byte(content), 0o600)
+}
+
+// SetTabList sets the raw JSON `tab list` returns.
+func (f *FakeCLI) SetTabList(content string) error {
+	return os.WriteFile(f.PaneFile+".tabs", []byte(content), 0o600)
 }
 
 // SetFailing toggles induced CLI failure.

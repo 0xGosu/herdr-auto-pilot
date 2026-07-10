@@ -22,9 +22,25 @@ type AgentTransition struct {
 	AgentID     string
 	AgentType   string
 	PaneID      string
+	TabID       string
 	WorkspaceID string
-	Status      string // idle | working | blocked | done | unknown
+	Status      string // idle | working | blocked | done | unknown | detected
 	At          time.Time
+}
+
+// WorkspaceInfo is display metadata for one Herdr workspace.
+type WorkspaceInfo struct {
+	ID     string
+	Label  string
+	Number int
+}
+
+// TabInfo is display metadata for one Herdr tab.
+type TabInfo struct {
+	ID          string
+	Label       string
+	Number      int
+	WorkspaceID string
 }
 
 // Situation is a classified, attention-requiring state of one agent pane.

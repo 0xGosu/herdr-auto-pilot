@@ -817,8 +817,9 @@ func (s *Store) GetLLMRequest(ctx context.Context, requestID string) (*domain.LL
 var agentNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 // EnsureAgentName returns the agent's short name, generating and persisting
-// one on first sight (daemon-owned insert; existing rows are never updated
-// here, so operator renames are preserved).
+// one on first sight. Insert-if-absent, callable by the daemon and by
+// front-ends (existing rows are never updated here, so operator renames
+// are preserved; concurrent callers converge via INSERT OR IGNORE).
 func (s *Store) EnsureAgentName(ctx context.Context, agentID string) (string, error) {
 	if name, err := s.agentNameByID(ctx, agentID); err != nil || name != "" {
 		return name, err

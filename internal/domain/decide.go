@@ -58,9 +58,11 @@ type DecideInput struct {
 	LLMConfigured bool
 	// AllowlistHit and SuspectedIrreversible are precomputed by the caller
 	// from the compiled Allowlist so the core stays free of regex state.
+	// IrreversibleHit carries the matching indicator for the rationale.
 	AllowlistHit          string
 	AllowlistMatched      bool
 	SuspectedIrreversible bool
+	IrreversibleHit       IndicatorHit
 }
 
 // Decide is the pure decision core (Solution §Decision Core): it resolves a
@@ -108,9 +110,13 @@ func Decide(in DecideInput) Decision {
 	// The suspected-irreversible heuristic biases to escalation before any
 	// autonomous action (FR-016).
 	if in.SuspectedIrreversible {
-		return esc(ReasonSuspectedIrrevers,
-			"destructive-operation indicators present without an allowlist match",
-			conf.Score, conf.TopAction)
+		rationale := "destructive-operation indicators present without an allowlist match"
+		if in.IrreversibleHit.Pattern != "" {
+			// %s for the pattern: %q would double-escape its backslashes.
+			rationale = fmt.Sprintf("%s: indicator %s matched %q",
+				rationale, in.IrreversibleHit.Pattern, in.IrreversibleHit.Excerpt)
+		}
+		return esc(ReasonSuspectedIrrevers, rationale, conf.Score, conf.TopAction)
 	}
 
 	threshold := in.Thresholds.ForType(in.Situation.Type)

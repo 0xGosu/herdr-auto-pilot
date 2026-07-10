@@ -41,6 +41,7 @@ type Subscriber struct {
 
 type paneInfo struct {
 	workspaceID string
+	tabID       string
 	agentLabel  string
 }
 
@@ -78,11 +79,13 @@ type eventFrame struct {
 type eventData struct {
 	Type        string `json:"type"`
 	PaneID      string `json:"pane_id"`
+	TabID       string `json:"tab_id"`
 	WorkspaceID string `json:"workspace_id"`
 	Agent       string `json:"agent"`
 	AgentStatus string `json:"agent_status"`
 	Pane        *struct {
 		PaneID      string `json:"pane_id"`
+		TabID       string `json:"tab_id"`
 		WorkspaceID string `json:"workspace_id"`
 	} `json:"pane,omitempty"`
 }
@@ -94,7 +97,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, out chan<- domain.AgentTrans
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		s.loop(ctx, "discovery", func(c context.Context) error { return s.runDiscovery(c) })
+		s.loop(ctx, "discovery", func(c context.Context) error { return s.runDiscovery(c, out) })
 	}()
 	go func() {
 		defer wg.Done()
@@ -138,7 +141,7 @@ func (s *Subscriber) loop(ctx context.Context, name string, fn func(context.Cont
 // runDiscovery watches the herd-wide pane lifecycle: pane.created replays
 // existing panes on subscribe, pane.agent_detected attaches agent labels,
 // pane.exited removes panes.
-func (s *Subscriber) runDiscovery(ctx context.Context) error {
+func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTransition) error {
 	subs := []map[string]string{
 		{"type": "pane.created"},
 		{"type": "pane.agent_detected"},
@@ -152,16 +155,37 @@ func (s *Subscriber) runDiscovery(ctx context.Context) error {
 		}
 		switch normalizeEventName(frame.Event, d.Type) {
 		case "pane.created":
-			paneID, wsID := d.PaneID, d.WorkspaceID
+			paneID, wsID, tabID := d.PaneID, d.WorkspaceID, d.TabID
 			if d.Pane != nil {
-				paneID, wsID = d.Pane.PaneID, d.Pane.WorkspaceID
+				paneID, wsID, tabID = d.Pane.PaneID, d.Pane.WorkspaceID, d.Pane.TabID
 			}
 			if paneID != "" {
-				s.upsertPane(paneID, wsID, "")
+				s.upsertPane(paneID, wsID, tabID, "")
 			}
 		case "pane.agent_detected":
-			if d.PaneID != "" {
-				s.upsertPane(d.PaneID, d.WorkspaceID, d.Agent)
+			if d.PaneID == "" {
+				return nil
+			}
+			s.upsertPane(d.PaneID, d.WorkspaceID, d.TabID, d.Agent)
+			// Surface the discovery as a transition so the daemon can name
+			// the agent immediately — herdr replays agent_detected for
+			// existing panes on subscribe, so this also covers agents that
+			// predate the daemon. The daemon takes no action on "detected".
+			if d.Agent != "" {
+				tr := domain.AgentTransition{
+					AgentID:     d.PaneID,
+					AgentType:   d.Agent,
+					PaneID:      d.PaneID,
+					TabID:       s.tabID(d.PaneID),
+					WorkspaceID: d.WorkspaceID,
+					Status:      "detected",
+					At:          time.Now(),
+				}
+				select {
+				case out <- tr:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
 		case "pane.exited", "pane.closed":
 			if d.PaneID != "" {
@@ -223,10 +247,15 @@ func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTrans
 		if agentType == "" {
 			agentType = s.agentLabel(d.PaneID)
 		}
+		tabID := d.TabID
+		if tabID == "" {
+			tabID = s.tabID(d.PaneID)
+		}
 		tr := domain.AgentTransition{
 			AgentID:     d.PaneID,
 			AgentType:   agentType,
 			PaneID:      d.PaneID,
+			TabID:       tabID,
 			WorkspaceID: d.WorkspaceID,
 			Status:      d.AgentStatus,
 			At:          time.Now(),
@@ -312,12 +341,15 @@ func normalizeEventName(names ...string) string {
 	return ""
 }
 
-func (s *Subscriber) upsertPane(paneID, workspaceID, agentLabel string) {
+func (s *Subscriber) upsertPane(paneID, workspaceID, tabID, agentLabel string) {
 	s.mu.Lock()
 	info, exists := s.panes[paneID]
 	changed := !exists
 	if workspaceID != "" && info.workspaceID != workspaceID {
 		info.workspaceID = workspaceID
+	}
+	if tabID != "" && info.tabID != tabID {
+		info.tabID = tabID
 	}
 	if agentLabel != "" && info.agentLabel != agentLabel {
 		info.agentLabel = agentLabel
@@ -376,7 +408,9 @@ func (s *Subscriber) listPanes(ctx context.Context) ([]string, error) {
 		Result struct {
 			Panes []struct {
 				PaneID      string `json:"pane_id"`
+				TabID       string `json:"tab_id"`
 				WorkspaceID string `json:"workspace_id"`
+				Agent       string `json:"agent"`
 			} `json:"panes"`
 		} `json:"result"`
 	}
@@ -396,6 +430,12 @@ func (s *Subscriber) listPanes(ctx context.Context) ([]string, error) {
 		if p.WorkspaceID != "" {
 			info.workspaceID = p.WorkspaceID
 		}
+		if p.TabID != "" {
+			info.tabID = p.TabID
+		}
+		if p.Agent != "" {
+			info.agentLabel = p.Agent
+		}
 		s.panes[p.PaneID] = info
 	}
 	// Prune panes that no longer exist so labels don't leak.
@@ -413,4 +453,11 @@ func (s *Subscriber) agentLabel(paneID string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.panes[paneID].agentLabel
+}
+
+// tabID returns the tracked tab id for a pane ("" when unknown).
+func (s *Subscriber) tabID(paneID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.panes[paneID].tabID
 }
