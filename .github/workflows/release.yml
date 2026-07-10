@@ -54,8 +54,11 @@ jobs:
           # CGO cannot cross-compile, so each target builds on its own
           # native runner. Intel macOS (darwin-amd64) is deliberately
           # unsupported: Apple Silicon only.
-          - { os: ubuntu-latest,    target: linux-amd64 }
-          - { os: ubuntu-24.04-arm, target: linux-arm64 }
+          # Linux artifacts build on 22.04 deliberately: CGO binaries (and
+          # the bundled FAISS libs) inherit the builder's glibc floor, and
+          # 24.04's glibc 2.39 breaks Debian 12 / Ubuntu 22.04 hosts.
+          - { os: ubuntu-22.04,     target: linux-amd64 }
+          - { os: ubuntu-22.04-arm, target: linux-arm64 }
           - { os: macos-14,         target: darwin-arm64 }
     runs-on: ${{ matrix.os }}
     steps:
