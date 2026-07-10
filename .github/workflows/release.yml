@@ -52,10 +52,10 @@ jobs:
       matrix:
         include:
           # CGO cannot cross-compile, so each target builds on its own
-          # native runner.
+          # native runner. Intel macOS (darwin-amd64) is deliberately
+          # unsupported: Apple Silicon only.
           - { os: ubuntu-latest,    target: linux-amd64 }
           - { os: ubuntu-24.04-arm, target: linux-arm64 }
-          - { os: macos-13,         target: darwin-amd64 }
           - { os: macos-14,         target: darwin-arm64 }
     runs-on: ${{ matrix.os }}
     steps:

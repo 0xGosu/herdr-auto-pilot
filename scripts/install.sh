@@ -33,6 +33,10 @@ case "$(uname -m)" in
   x86_64 | amd64) ARCH="amd64" ;;
   *) fail "unsupported architecture: $(uname -m)" ;;
 esac
+# No Intel-macOS release assets are published: Apple Silicon only.
+if [ "$OS" = "darwin" ] && [ "$ARCH" = "amd64" ]; then
+  fail "Intel macOS (darwin-amd64) is not supported; hap ships Apple Silicon (arm64) builds only"
+fi
 ASSET="hap-${OS}-${ARCH}"
 NATIVE_ASSET="hap-native-${OS}-${ARCH}.tar.gz"
 MODEL_FILE="all-minilm-l6-v2-q8_0.gguf"
