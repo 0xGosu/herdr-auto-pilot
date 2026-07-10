@@ -67,6 +67,18 @@ type LLMPort interface {
 	Configured() bool
 }
 
+// RewriterPort is an optional capability of the LLM adapter: a one-shot
+// rewrite of literal outbound text before delivery (llm.rewrite_command).
+// Unlike Consult's MCP-staged flow, the rewritten text is the subprocess's
+// stdout. Callers type-assert and degrade gracefully when absent.
+type RewriterPort interface {
+	// Rewrite runs the configured rewrite CLI and returns the rewritten
+	// text, or an error on timeout / failure / empty output.
+	Rewrite(ctx context.Context, req domain.RewriteRequest) (string, error)
+	// RewriteConfigured reports whether a rewrite CLI is configured.
+	RewriteConfigured() bool
+}
+
 // StorePort is the persistence boundary. Write-ownership is partitioned:
 // daemon-exclusive writers for signatures/agent_rate/error_retries/decisions
 // and daemon-emitted audit rows; front-ends write corrections/kill_events;

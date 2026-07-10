@@ -171,6 +171,8 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 			DBPath:          paths.DBPath(),
 			ControlPath:     paths.ControlSocketPath(),
 			Store:           st,
+			RewriteTemplate: cfg.LLM.RewriteCommand,
+			RewriteTimeout:  cfg.RewriteTimeout(),
 		}
 	}
 

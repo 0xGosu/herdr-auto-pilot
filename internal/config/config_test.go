@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadMissingFileYieldsDefaults(t *testing.T) {
@@ -304,5 +305,84 @@ func TestTUIMaxContentWidthParsed(t *testing.T) {
 	os.WriteFile(path, []byte("[learning]\ngraduation_n = 5\n"), 0o600)
 	if cfg, _ = Load(path); cfg.TUI.MaxContentWidth != 0 {
 		t.Errorf("omitted max_content_width should default to 0, got %d", cfg.TUI.MaxContentWidth)
+	}
+}
+
+func TestRewriteConfigKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+
+	// Omitted entirely: disabled command, timeout inherits the default
+	// consult timeout, template empty (domain resolves the default).
+	os.WriteFile(path, []byte("[llm]\ncommand = [\"claude\"]\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LLM.RewriteCommand) != 0 {
+		t.Errorf("rewrite_command should default empty, got %v", cfg.LLM.RewriteCommand)
+	}
+	// Inheritance is resolved at use time, never materialized: a later Save
+	// must not freeze the inherited value into config.toml.
+	if cfg.LLM.RewriteTimeoutSeconds != 0 {
+		t.Errorf("omitted rewrite timeout should stay 0 (inherit at use time), got %d", cfg.LLM.RewriteTimeoutSeconds)
+	}
+	if cfg.RewriteTimeout() != 60*time.Second {
+		t.Errorf("RewriteTimeout() = %v, want inherited default 60s", cfg.RewriteTimeout())
+	}
+	if cfg.LLM.RewriteFallbackTemplate != "" {
+		t.Errorf("fallback template should stay empty (domain default applies), got %q", cfg.LLM.RewriteFallbackTemplate)
+	}
+
+	// Omitted rewrite timeout inherits a CUSTOM consult timeout — even
+	// after a Save/Load cycle (the zero survives the round trip).
+	os.WriteFile(path, []byte("[llm]\ntimeout_seconds = 120\n"), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RewriteTimeout() != 120*time.Second {
+		t.Errorf("RewriteTimeout() = %v, want inherited 120s", cfg.RewriteTimeout())
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.RewriteTimeoutSeconds != 0 || cfg.RewriteTimeout() != 120*time.Second {
+		t.Errorf("Save must not freeze the inherited timeout: raw=%d effective=%v",
+			cfg.LLM.RewriteTimeoutSeconds, cfg.RewriteTimeout())
+	}
+
+	// Explicit values are honored verbatim.
+	os.WriteFile(path, []byte(`[llm]
+timeout_seconds = 120
+rewrite_command = ["claude", "-p", "rewrite: {text}"]
+rewrite_timeout_seconds = 30
+rewrite_fallback_template = "Do this: {original_text}"
+`), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LLM.RewriteCommand) != 3 || cfg.LLM.RewriteCommand[2] != "rewrite: {text}" {
+		t.Errorf("rewrite_command lost: %v", cfg.LLM.RewriteCommand)
+	}
+	if cfg.LLM.RewriteTimeoutSeconds != 30 {
+		t.Errorf("explicit rewrite timeout lost: %d", cfg.LLM.RewriteTimeoutSeconds)
+	}
+	if cfg.LLM.RewriteFallbackTemplate != "Do this: {original_text}" {
+		t.Errorf("fallback template lost: %q", cfg.LLM.RewriteFallbackTemplate)
+	}
+
+	// Save/Load round trip keeps all three keys.
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.LLM.RewriteCommand) != 3 || rt.LLM.RewriteTimeoutSeconds != 30 ||
+		rt.LLM.RewriteFallbackTemplate != "Do this: {original_text}" {
+		t.Errorf("round trip lost rewrite keys: %+v", rt.LLM)
 	}
 }

@@ -76,20 +76,25 @@ func MenuKeystroke(content, chosen string) (string, bool) {
 	return chosen, false
 }
 
-// DeliverKeystroke maps a chosen reply to the numbered-menu digit, but ONLY
+// DeliverOutbound maps a chosen reply to the numbered-menu digit, but ONLY
 // for approval/choice situations. Free-text prompts — idle next-task prompts,
 // error-retry commands — are always delivered literally, so a pane that
 // happens to contain an ordinary numbered list (e.g. a summary "1. ran tests")
 // can never hijack the reply into a bare digit. paneContent is the live
-// screen; returns the digit when it maps, else chosen unchanged.
-func DeliverKeystroke(sitType SituationType, paneContent, chosen string) string {
+// screen. The bool reports whether a menu digit was mapped: false means the
+// returned text is free text (callers deciding whether to rewrite literal
+// outbound text key off this).
+func DeliverOutbound(sitType SituationType, paneContent, chosen string) (string, bool) {
 	if sitType != SituationApproval && sitType != SituationChoice {
-		return chosen
+		return chosen, false
 	}
-	if key, ok := MenuKeystroke(paneContent, chosen); ok {
-		return key
-	}
-	return chosen
+	return MenuKeystroke(paneContent, chosen)
+}
+
+// DeliverKeystroke is DeliverOutbound for callers that only need the text.
+func DeliverKeystroke(sitType SituationType, paneContent, chosen string) string {
+	out, _ := DeliverOutbound(sitType, paneContent, chosen)
+	return out
 }
 
 // uniquePrefixMatch returns an option's number when exactly one option label
