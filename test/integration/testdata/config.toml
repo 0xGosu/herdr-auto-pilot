@@ -22,9 +22,12 @@
   max_error_retries = 2
 
 [llm]
+# The prompt must come immediately after -p (claude quirk; the plugin also
+# auto-repairs it). --model haiku keeps the consult fast in the local suite.
 command = [
   "claude", "-p",
   "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
+  "--model", "haiku",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
 ]
