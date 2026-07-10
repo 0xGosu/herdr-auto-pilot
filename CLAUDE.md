@@ -95,8 +95,9 @@ with a ticket/issue id**. Examples from history:
 Releases are **tag-driven**: merging a PR does NOT create a release.
 `.github/workflows/release.yml` fires on a `v*.*.*` tag push, runs the full
 CI gate, then builds on FOUR native runners (CGO cannot cross-compile):
-`hap-{linux,darwin}-{amd64,arm64}`, a `hap-native-<os>-<arch>.tar.gz` per
-platform (FAISS + llama.cpp shared libs, rpath'd to `<plugin>/lib`), the
+`hap-{linux,darwin}-{amd64,arm64}` (llama.cpp statically linked in), a
+`hap-native-<os>-<arch>.tar.gz` per platform (FAISS shared libs, plus
+libomp on macOS, rpath'd to `<plugin>/lib`), the
 `all-minilm-l6-v2-q8_0.gguf` embedding model fetched from Hugging Face
 (sha256-pinned), and `SHA256SUMS`; then publishes the GitHub Release.
 `install.sh` treats the binary and native tarball as REQUIRED and the model

@@ -33,7 +33,6 @@ jobs:
           path: |
             .cache/native
             third_party/llama-go/*.a
-            third_party/llama-go/*.so
             third_party/llama-go/llama.cpp/**/*.o
           key: native-lint-${{ runner.os }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
       - name: Build native dependencies
@@ -77,8 +76,6 @@ jobs:
           path: |
             .cache/native
             third_party/llama-go/*.a
-            third_party/llama-go/*.so
-            third_party/llama-go/*.dylib
             third_party/llama-go/llama.cpp/**/*.o
           key: native-test-${{ matrix.os }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
       - name: Build native dependencies
@@ -86,9 +83,22 @@ jobs:
       - name: Build
         run: go build -tags "${GO_BUILD_TAGS}" ./...
       - name: Full test suite (unit, golden, safety-invariant, concurrency, semantic-match)
-        run: go test -tags "${GO_BUILD_TAGS}" ./... -count=1 -timeout 15m
+        # macOS: test binaries need a dyld rpath to reach the FAISS dylibs
+        # in /usr/local/lib (bleve docs: go test -ldflags "-r /usr/local/lib").
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            go test -ldflags "-r /usr/local/lib" -tags "${GO_BUILD_TAGS}" ./... -count=1 -timeout 15m
+          else
+            go test -tags "${GO_BUILD_TAGS}" ./... -count=1 -timeout 15m
+          fi
       - name: Race detector
-        run: go test -tags "${GO_BUILD_TAGS}" ./internal/store/... ./internal/domain/... ./internal/control/... ./internal/embedder/... ./internal/match/... ./internal/daemon/... -race -count=1
+        run: |
+          PKGS="./internal/store/... ./internal/domain/... ./internal/control/... ./internal/embedder/... ./internal/match/... ./internal/daemon/..."
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            go test -ldflags "-r /usr/local/lib" -tags "${GO_BUILD_TAGS}" $PKGS -race -count=1
+          else
+            go test -tags "${GO_BUILD_TAGS}" $PKGS -race -count=1
+          fi
 
   corpus-gate:
     name: Allowlist corpus regression gate (NFR-005a)

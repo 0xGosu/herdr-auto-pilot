@@ -2,10 +2,11 @@
 # Build and install the native libraries hap needs since the semantic
 # signature matcher landed:
 #
-#   - libbinding.a + libllama/libggml* from third_party/llama-go (llama.cpp
-#     embeddings, statically linked binding + shared runtime libs)
-#   - libfaiss_c + libfaiss from the blevesearch FAISS fork (bleve vector
-#     search behind the `vectors` build tag)
+#   - libbinding.a + static llama.cpp archives from third_party/llama-go
+#     (llama.cpp embeddings; BUILD_SHARED_LIBS=OFF so the hap binary links
+#     them statically — no llama/ggml runtime libraries to ship)
+#   - libfaiss_c + libfaiss shared libs from the blevesearch FAISS fork
+#     (bleve vector search behind the `vectors` build tag)
 #
 # After this script succeeds, build and test with:
 #   go build -tags "vectors cpu" ./...
@@ -28,18 +29,57 @@ JOBS="${HAP_NATIVE_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null ||
 SUDO="sudo"
 if [ -w "${PREFIX}/lib" ] || [ "$(id -u)" = "0" ]; then SUDO=""; fi
 
-case "$(uname -s)" in
+OS="$(uname -s)"
+case "$OS" in
   Darwin) SOEXT="dylib" ;;
   *) SOEXT="so" ;;
 esac
+
+# FAISS needs BLAS and OpenMP. Linux: OpenBLAS + gcc's libgomp. macOS: the
+# Accelerate framework provides BLAS, but Apple clang has no OpenMP — bleve's
+# documented recipe builds FAISS with Homebrew LLVM (which bundles libomp).
+FAISS_CMAKE_ENV=()
+if [ "$OS" = "Linux" ]; then
+  if ! ldconfig -p 2>/dev/null | grep -q libopenblas && command -v apt-get >/dev/null 2>&1; then
+    echo "==> installing libopenblas-dev (FAISS BLAS backend)"
+    $SUDO apt-get update -qq && $SUDO apt-get install -y -qq libopenblas-dev
+  fi
+elif [ "$OS" = "Darwin" ]; then
+  command -v brew >/dev/null 2>&1 || { echo "Homebrew is required on macOS (for LLVM/OpenMP)" >&2; exit 1; }
+  if ! brew list llvm >/dev/null 2>&1; then
+    echo "==> installing Homebrew LLVM (OpenMP toolchain for FAISS)"
+    brew install llvm
+  fi
+  LLVM_PREFIX="$(brew --prefix llvm)"
+  FAISS_CMAKE_ENV=(
+    "CC=${LLVM_PREFIX}/bin/clang"
+    "CXX=${LLVM_PREFIX}/bin/clang++"
+    "LDFLAGS=-L${LLVM_PREFIX}/lib"
+    "CPPFLAGS=-I${LLVM_PREFIX}/include"
+  )
+fi
 
 echo "==> submodules (llama-go + shallow llama.cpp)"
 git submodule update --init third_party/llama-go
 git -C third_party/llama-go submodule update --init --depth 1 llama.cpp
 
-echo "==> llama-go static binding (BUILD_TYPE=cpu default)"
-if [ ! -f third_party/llama-go/libbinding.a ]; then
-  make -C third_party/llama-go libbinding.a -j"${JOBS}"
+echo "==> llama-go static binding (CPU only, static archives)"
+# BUILD_SHARED_LIBS=OFF makes the Makefile copy .a archives — the shared
+# branch hardcodes .so names and breaks on macOS. GPU/BLAS backends are off:
+# hap embeds short strings on CPU and links with the `cpu` build tag.
+LLAMA_CMAKE_ARGS="-DBUILD_SHARED_LIBS=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF"
+# The llama-go Makefile only invalidates its cmake cache on GPU-flag
+# mismatches, not shared/static — wipe a build configured for shared libs.
+if [ -f third_party/llama-go/build/CMakeCache.txt ] &&
+  ! grep -q "BUILD_SHARED_LIBS:BOOL=OFF" third_party/llama-go/build/CMakeCache.txt; then
+  echo "    (wiping shared-lib cmake cache)"
+  rm -rf third_party/llama-go/build third_party/llama-go/llama.cpp/*.o \
+    third_party/llama-go/*.o third_party/llama-go/*.a \
+    third_party/llama-go/*.so third_party/llama-go/*.dylib
+fi
+if [ ! -f third_party/llama-go/libbinding.a ] || [ ! -f third_party/llama-go/libllama.a ]; then
+  rm -f third_party/llama-go/*.a third_party/llama-go/*.so third_party/llama-go/*.dylib
+  CMAKE_ARGS="${LLAMA_CMAKE_ARGS}" make -C third_party/llama-go libbinding.a -j"${JOBS}"
 fi
 
 echo "==> FAISS (blevesearch fork @ ${FAISS_COMMIT:0:7})"
@@ -49,7 +89,7 @@ if [ ! -d "${CACHE}/faiss" ]; then
 fi
 git -C "${CACHE}/faiss" checkout --quiet "${FAISS_COMMIT}"
 if [ ! -f "${CACHE}/faiss/build/c_api/libfaiss_c.${SOEXT}" ]; then
-  cmake -S "${CACHE}/faiss" -B "${CACHE}/faiss/build" \
+  env ${FAISS_CMAKE_ENV[@]+"${FAISS_CMAKE_ENV[@]}"} cmake -S "${CACHE}/faiss" -B "${CACHE}/faiss/build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=ON \
     -DFAISS_ENABLE_GPU=OFF \
@@ -63,20 +103,12 @@ if [ ! -f "${CACHE}/faiss/build/c_api/libfaiss_c.${SOEXT}" ]; then
   make -C "${CACHE}/faiss/build" faiss_c
 fi
 
-echo "==> install shared libraries to ${PREFIX}/lib"
+echo "==> install FAISS shared libraries to ${PREFIX}/lib"
 $SUDO mkdir -p "${PREFIX}/lib" "${PREFIX}/include/faiss"
 $SUDO cp "${CACHE}/faiss/build/faiss/libfaiss.${SOEXT}" \
   "${CACHE}/faiss/build/c_api/libfaiss_c.${SOEXT}" "${PREFIX}/lib/"
 # go-faiss includes <faiss/c_api/...> headers at build time.
 $SUDO cp -r "${CACHE}/faiss/c_api" "${PREFIX}/include/faiss/"
-# llama-go's binding is static but its ggml/llama runtime libs are shared.
-for lib in third_party/llama-go/libllama.${SOEXT} third_party/llama-go/libggml*.${SOEXT}; do
-  [ -e "$lib" ] || continue
-  $SUDO cp "$lib" "${PREFIX}/lib/"
-  base="$(basename "$lib" ".${SOEXT}")"
-  # The linker records versioned sonames (libllama.so.0); satisfy them.
-  $SUDO ln -sf "${base}.${SOEXT}" "${PREFIX}/lib/${base}.${SOEXT}.0"
-done
 if command -v ldconfig >/dev/null 2>&1; then $SUDO ldconfig; fi
 
 echo "==> done. Build with: go build -tags \"vectors cpu\" ./..."

@@ -34,7 +34,6 @@ jobs:
           path: |
             .cache/native
             third_party/llama-go/*.a
-            third_party/llama-go/*.so
             third_party/llama-go/llama.cpp/**/*.o
           key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
       - name: Build native dependencies
@@ -76,8 +75,6 @@ jobs:
           path: |
             .cache/native
             third_party/llama-go/*.a
-            third_party/llama-go/*.so
-            third_party/llama-go/*.dylib
             third_party/llama-go/llama.cpp/**/*.o
           key: native-${{ matrix.target }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
       - name: Build native dependencies
@@ -95,8 +92,9 @@ jobs:
             -o "dist/hap-${{ matrix.target }}" ./cmd/hap
       - name: Bundle native runtime libraries
         run: |
-          # Everything the binary dlopens/links at runtime, self-contained
-          # in one lib/ dir: libfaiss_c -> libfaiss, libllama, libggml*.
+          # llama.cpp is statically linked into the binary; only the FAISS
+          # shared libs (plus libomp on macOS) ship, self-contained in one
+          # lib/ dir the binary reaches via its <plugin>/lib rpath.
           set -euo pipefail
           case "${{ matrix.target }}" in
             linux-*)  EXT=so ;;
@@ -105,21 +103,28 @@ jobs:
           mkdir -p bundle/lib
           cp ".cache/native/faiss/build/faiss/libfaiss.${EXT}" bundle/lib/
           cp ".cache/native/faiss/build/c_api/libfaiss_c.${EXT}" bundle/lib/
-          for lib in third_party/llama-go/libllama.${EXT} third_party/llama-go/libggml*.${EXT}; do
-            [ -e "$lib" ] && cp "$lib" bundle/lib/
-          done
           cd bundle/lib
           # Inter-library resolution must work from the bundle dir alone.
           if [ "${EXT}" = "so" ]; then
             sudo apt-get install -y -qq patchelf
             for f in *.so; do
               patchelf --set-rpath '$ORIGIN' "$f"
-              ln -sf "$f" "$f.0"
             done
           else
+            install_name_tool -id '@rpath/libfaiss.dylib' libfaiss.dylib
+            install_name_tool -id '@rpath/libfaiss_c.dylib' libfaiss_c.dylib
+            dep=$(otool -L libfaiss_c.dylib | awk 'NR>1 && /libfaiss[^_]/ {print $1; exit}')
+            [ -n "$dep" ] && install_name_tool -change "$dep" '@rpath/libfaiss.dylib' libfaiss_c.dylib
+            # FAISS is built with Homebrew LLVM's OpenMP; ship libomp and
+            # rewire both libs to load it from the bundle.
+            cp "$(brew --prefix llvm)/lib/libomp.dylib" .
+            install_name_tool -id '@rpath/libomp.dylib' libomp.dylib
+            for f in libfaiss.dylib libfaiss_c.dylib; do
+              omp=$(otool -L "$f" | awk 'NR>1 && /libomp/ {print $1; exit}')
+              [ -n "$omp" ] && install_name_tool -change "$omp" '@rpath/libomp.dylib' "$f" || true
+            done
             for f in *.dylib; do
               install_name_tool -add_rpath '@loader_path' "$f" 2>/dev/null || true
-              ln -sf "$f" "${f%.dylib}.0.dylib"
             done
             # Ad-hoc sign after mutation (required on arm64 macOS).
             codesign --force -s - ./*.dylib
