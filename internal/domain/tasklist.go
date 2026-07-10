@@ -96,69 +96,85 @@ func NextDeclaredTask(content string) string {
 	return ""
 }
 
-// numberedPlanRE matches an explicit numbered plan step like "2. Do thing".
-var numberedPlanRE = regexp.MustCompile(`^\s*\d+[.)]\s+(.\S.+)$`)
-
-// todoMarkerRE matches lines that signal an agent-emitted structured todo.
-var todoMarkerRE = regexp.MustCompile(`(?i)^\s*(#+\s*)?(todo|task list|tasks|next steps|plan)\b[:\s]*$`)
-
 // InferredTask is a next task inferred from the agent's own transcript.
 type InferredTask struct {
 	Task string
-	// Structured is true only when the transcript contained an explicit
-	// structured signal (checklist or numbered plan) with an unambiguous
-	// next item. Free-form prose never qualifies (FR-011).
+	// Structured is true only when the transcript contained the agent
+	// type's native structured todo rendering with an unambiguous next
+	// item. Free-form prose never qualifies (FR-011).
 	Structured bool
 }
 
-// InferNextTask scans a pane transcript for an explicit, structured signal —
-// a todo/checklist or numbered plan the agent itself emitted with an
-// unambiguous next item. It returns a zero value when nothing qualifies:
-// free-form prose that merely discusses possible work does NOT qualify.
-func InferNextTask(transcript string) InferredTask {
-	lines := strings.Split(transcript, "\n")
+// taskInferrers maps an agent type to its transcript task-list extractor.
+// Tier-2 inference is deliberately per-agent-type: each agent CLI renders
+// its todo list differently, and guessing from generic text is unsafe.
+var taskInferrers = map[string]func(transcript string) InferredTask{
+	"claude": inferClaudeNextTask,
+}
 
-	// Pass 1: checkbox checklist — unambiguous if there is exactly one
-	// contiguous checklist block; the next item is its first unchecked entry.
-	var unchecked []string
-	var sawChecklist bool
-	for _, line := range lines {
-		if m := uncheckedItemRE.FindStringSubmatch(line); m != nil {
-			sawChecklist = true
-			unchecked = append(unchecked, strings.TrimSpace(m[1]))
-		} else if checkedItemRE.MatchString(line) {
-			sawChecklist = true
-		}
+// InferNextTask scans a pane transcript for the agent type's native
+// structured todo signal with an unambiguous next item. Agent types
+// without a dedicated extractor return a zero value: Tier-2 inference is
+// skipped entirely rather than guessed (FR-011). The lookup is
+// case-insensitive, matching the classifier's agent-type handling.
+func InferNextTask(agentType, transcript string) InferredTask {
+	infer, ok := taskInferrers[strings.ToLower(agentType)]
+	if !ok {
+		return InferredTask{}
 	}
-	if sawChecklist && len(unchecked) > 0 {
-		return InferredTask{Task: unchecked[0], Structured: true}
-	}
-	if sawChecklist {
-		return InferredTask{} // checklist fully done — nothing next
-	}
+	return infer(transcript)
+}
 
-	// Pass 2: numbered plan under an explicit todo/plan marker. Only the
-	// block immediately following the most recent marker counts, and the
-	// first step is taken as next only when the plan is clearly a plan
-	// (>= 2 steps).
-	lastMarker := -1
-	for i, line := range lines {
-		if todoMarkerRE.MatchString(line) {
-			lastMarker = i
+// claudeTodoItemRE matches one line of Claude Code's todo-widget rendering:
+// optional indent, an optional ⎿/└ connector on the first item, a status
+// marker rune, then the task text. Markers are matched liberally across
+// Claude Code versions/fonts: completed ✔ ✓ ☒, in-progress ■ ▪ ◼,
+// pending □ ▫ ☐.
+var claudeTodoItemRE = regexp.MustCompile(`^\s*([⎿└]\s*)?([✔✓☒■▪◼□▫☐])\s+(\S.*)$`)
+
+// inferClaudeNextTask parses Claude Code's native todo widget:
+//
+//	· Building integration test suite… (27m 52s · ↓ 73.9k tokens)
+//	  ⎿  ✔ Fix send: map option label to menu index
+//	     ✔ TUI full width rendering + config knob
+//	     ■ Real herdr+claude integration test suite
+//	     □ Docs + full verification + PR
+//
+// Claude re-renders the widget as it progresses, so only the freshest
+// render counts: an item line carrying the ⎿/└ connector starts a new
+// block, later marker lines append to it, and every other line — blank
+// lines, narration, or an item's own hard-wrapped continuation (pane
+// content is screen rows, wrapped at pane width) — is ignored rather than
+// treated as a block break, so a wrapped item never splits the widget.
+// The next task is the in-progress (■) item when one exists — the agent
+// stopped mid-item — otherwise the first pending (□) item. A fully
+// completed list (or no widget at all) yields a zero value.
+func inferClaudeNextTask(transcript string) InferredTask {
+	type item struct{ marker, text string }
+	var block []item
+	for _, line := range strings.Split(transcript, "\n") {
+		m := claudeTodoItemRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
 		}
+		if m[1] != "" {
+			block = block[:0] // connector = a fresh render; supersede earlier ones
+		}
+		block = append(block, item{marker: m[2], text: strings.TrimSpace(m[3])})
 	}
-	if lastMarker >= 0 {
-		var steps []string
-		for _, line := range lines[lastMarker+1:] {
-			if m := numberedPlanRE.FindStringSubmatch(line); m != nil {
-				steps = append(steps, strings.TrimSpace(m[1]))
-			} else if len(steps) > 0 && strings.TrimSpace(line) != "" {
-				break
+	var firstPending string
+	for _, it := range block {
+		switch it.marker {
+		case "■", "▪", "◼":
+			return InferredTask{Task: it.text, Structured: true}
+		case "□", "▫", "☐":
+			if firstPending == "" {
+				firstPending = it.text
 			}
 		}
-		if len(steps) >= 2 {
-			return InferredTask{Task: steps[0], Structured: true}
-		}
+	}
+	if firstPending != "" {
+		return InferredTask{Task: firstPending, Structured: true}
 	}
 	return InferredTask{}
 }

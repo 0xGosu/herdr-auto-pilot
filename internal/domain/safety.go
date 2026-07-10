@@ -239,7 +239,7 @@ func IrreversibleScanContent(s Situation, declaredTask string) string {
 		// Idle has no pending pane operation; what could be irreversible is
 		// the next-task prompt automation would send.
 		parts := []string{declaredTask}
-		if inferred := InferNextTask(s.Content); inferred.Structured {
+		if inferred := InferNextTask(s.AgentType, s.Content); inferred.Structured {
 			parts = append(parts, inferred.Task)
 		}
 		return strings.TrimSpace(strings.Join(parts, "\n"))

@@ -251,8 +251,10 @@ func TestIrreversibleScanContent(t *testing.T) {
 		t.Errorf("idle scan must be the declared task only, got %q", got)
 	}
 
-	// Idle with a structured checklist: the inferred next item is scanned.
-	idleList := Situation{Type: SituationIdle, Content: "- [x] step one\n- [ ] drop the users table"}
+	// Idle with the agent's native todo widget: the inferred next item is
+	// scanned (inference is per-agent-type, so AgentType must be set).
+	idleList := Situation{Type: SituationIdle, AgentType: "claude",
+		Content: "  ⎿  ✔ step one\n     □ drop the users table"}
 	got = IrreversibleScanContent(idleList, "")
 	if !strings.Contains(got, "drop the users table") {
 		t.Errorf("idle scan must include the inferred next task, got %q", got)

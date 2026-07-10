@@ -97,48 +97,130 @@ func TestMatchWorkspace(t *testing.T) {
 }
 
 func TestInferNextTask(t *testing.T) {
+	claudeWidget := "· Building integration test suite… (27m 52s · ↓ 73.9k tokens)\n" +
+		"  ⎿  ✔ Fix send: map option label to menu index\n" +
+		"     ✔ TUI full width rendering + config knob\n" +
+		"     ■ Real herdr+claude integration test suite\n" +
+		"     □ Docs + full verification + PR\n"
+
 	cases := []struct {
 		name       string
+		agentType  string
 		transcript string
 		wantTask   string
 		structured bool
 	}{
 		{
-			name:       "agent-emitted checklist",
-			transcript: "Here is my plan:\n- [x] parse input\n- [ ] validate fields\n- [ ] emit output",
+			name:       "in-progress item preferred over pending",
+			agentType:  "claude",
+			transcript: claudeWidget,
+			wantTask:   "Real herdr+claude integration test suite",
+			structured: true,
+		},
+		{
+			name:      "first pending when nothing in progress",
+			agentType: "claude",
+			transcript: "  ⎿  ✔ parse input\n" +
+				"     □ validate fields\n" +
+				"     □ emit output\n",
 			wantTask:   "validate fields",
 			structured: true,
 		},
 		{
-			name:       "numbered plan under todo marker",
-			transcript: "TODO:\n1. refactor the store layer\n2. add integration tests",
-			wantTask:   "refactor the store layer",
+			name:      "all completed yields nothing",
+			agentType: "claude",
+			transcript: "  ⎿  ✔ everything\n" +
+				"     ✓ is done\n",
+			structured: false,
+		},
+		{
+			name:      "last block wins over stale earlier render",
+			agentType: "claude",
+			transcript: "  ⎿  □ old first item\n" +
+				"     □ old second item\n" +
+				"\nSome narration in between.\n\n" +
+				"  ⎿  ✔ old first item\n" +
+				"     ■ fresher current item\n" +
+				"     □ later item\n",
+			wantTask:   "fresher current item",
 			structured: true,
 		},
 		{
+			name:       "alternate marker runes handled",
+			agentType:  "claude",
+			transcript: "  ⎿  ☒ setup\n     ▪ wire the adapter\n     ☐ write docs\n",
+			wantTask:   "wire the adapter",
+			structured: true,
+		},
+		{
+			name:      "wrapped item line does not split the block",
+			agentType: "claude",
+			transcript: "  ⎿  ✔ setup\n" +
+				"     ■ a long in-progress item whose text\n" +
+				"       hard-wraps onto this continuation line\n" +
+				"     □ pending item\n",
+			wantTask:   "a long in-progress item whose text",
+			structured: true,
+		},
+		{
+			name:      "└ connector variant handled",
+			agentType: "claude",
+			transcript: "  └ ✔ setup\n" +
+				"    ■ current work\n",
+			wantTask:   "current work",
+			structured: true,
+		},
+		{
+			name:      "connector line without a marker neither parses nor resets",
+			agentType: "claude",
+			transcript: "  ⎿  ✔ setup\n" +
+				"     □ pending item\n" +
+				"\n· Reading 1 file…\n" +
+				"  ⎿ internal/herdr/cli.go\n",
+			wantTask:   "pending item",
+			structured: true,
+		},
+		{
+			name:       "agent type lookup is case-insensitive",
+			agentType:  "Claude",
+			transcript: "  ⎿  ■ current work\n",
+			wantTask:   "current work",
+			structured: true,
+		},
+		{
+			name:       "markdown checklist no longer qualifies",
+			agentType:  "claude",
+			transcript: "Here is my plan:\n- [x] parse input\n- [ ] validate fields\n- [ ] emit output",
+			structured: false,
+		},
+		{
+			name:       "numbered plan no longer qualifies",
+			agentType:  "claude",
+			transcript: "TODO:\n1. refactor the store layer\n2. add integration tests",
+			structured: false,
+		},
+		{
 			name:       "free-form prose does not qualify",
+			agentType:  "claude",
 			transcript: "We might want to think about improving error handling and maybe caching.",
 			structured: false,
 		},
 		{
-			name:       "completed checklist yields nothing",
-			transcript: "- [x] everything\n- [x] is done",
+			name:       "unsupported agent type skips inference entirely",
+			agentType:  "codex",
+			transcript: claudeWidget,
 			structured: false,
 		},
 		{
-			name:       "single numbered line is not a plan",
-			transcript: "Plan:\n1. just one ambiguous thing",
-			structured: false,
-		},
-		{
-			name:       "numbers without a todo marker do not qualify",
-			transcript: "The 3 issues were:\n1. flaky test\n2. race condition",
+			name:       "empty agent type skips inference",
+			agentType:  "",
+			transcript: claudeWidget,
 			structured: false,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := InferNextTask(c.transcript)
+			got := InferNextTask(c.agentType, c.transcript)
 			if got.Structured != c.structured {
 				t.Fatalf("Structured = %v, want %v (task %q)", got.Structured, c.structured, got.Task)
 			}
