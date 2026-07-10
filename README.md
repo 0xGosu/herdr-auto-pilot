@@ -144,6 +144,19 @@ max_consecutive_auto_prompts = 5   # per agent, without human interaction
 max_auto_prompts_per_minute = 10   # per agent
 max_error_retries = 2              # per error signature
 
+# Semantic rule matching: situations are matched to learned rules by
+# embedding their masked salient content (llama.cpp, MiniLM by default) and
+# vector-searching stored signatures, so a paraphrased prompt reuses the
+# rule instead of re-learning from zero. When the model is unavailable the
+# daemon falls back to normalized BM25 text matching, and failing that to
+# exact hash matching — it never blocks or crashes on missing assets.
+[embedding]
+disabled = false
+model_path = ""            # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
+similarity_threshold = 0.90 # min cosine similarity to reuse a learned signature
+bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1]
+gpu_layers = 0              # model layers offloaded to GPU (0 = CPU)
+
 # Point agents/workspaces at a task list so idle agents get the next
 # unchecked item. Without a declared source, the plugin falls back to
 # inferring the next task from the agent's own native todo rendering —

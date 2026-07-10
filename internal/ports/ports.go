@@ -58,6 +58,23 @@ type NotifyPort interface {
 	Notify(ctx context.Context, title, body string) error
 }
 
+// EmbedderPort turns masked salient text into a semantic vector for
+// signature matching. Implementations must be safe for concurrent use and
+// must return errors — never panic — when the model is unavailable, so the
+// daemon can degrade to text matching.
+type EmbedderPort interface {
+	// EmbedText returns the L2-normalized embedding of text.
+	EmbedText(ctx context.Context, text string) ([]float32, error)
+	// ModelID identifies the loaded model (basename of the gguf) so stored
+	// vectors can be scoped to the model that produced them.
+	ModelID() string
+	// Dims is the embedding dimensionality (0 before the first successful
+	// model load).
+	Dims() int
+	// Close releases the model.
+	Close() error
+}
+
 // LLMPort consults the operator-configured local LLM CLI for a suggestion.
 type LLMPort interface {
 	// Consult launches the LLM CLI for the situation and returns the staged
@@ -108,6 +125,9 @@ type DaemonStore interface {
 	StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64, error)
 	UpdateLLMRequestStatus(ctx context.Context, requestID, status string) error
 	UpdateLLMDecisionStatus(ctx context.Context, id int64, status string) error
+	// UpsertSignatureEmbedding stores the semantic identity (salient text +
+	// vector) a signature was minted from.
+	UpsertSignatureEmbedding(ctx context.Context, e domain.SignatureEmbedding) error
 }
 
 // FrontendStore is the front-end (TUI/CLI) write surface plus shared reads.
@@ -173,6 +193,11 @@ type ReadStore interface {
 	// LatestAuditForSignature returns the newest audit row for a signature,
 	// or nil when none exists.
 	LatestAuditForSignature(ctx context.Context, signature string) (*domain.AuditRecord, error)
+	// ListSignatureEmbeddings returns every stored semantic identity row
+	// (all models), for rebuilding the in-memory match index.
+	ListSignatureEmbeddings(ctx context.Context) ([]domain.SignatureEmbedding, error)
+	// CountSignatureEmbeddings reports how many semantic identity rows exist.
+	CountSignatureEmbeddings(ctx context.Context) (int64, error)
 }
 
 // Clock abstracts time for deterministic tests.

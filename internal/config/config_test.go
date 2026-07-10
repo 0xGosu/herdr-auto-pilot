@@ -386,3 +386,45 @@ rewrite_fallback_template = "Do this: {original_text}"
 		t.Errorf("round trip lost rewrite keys: %+v", rt.LLM)
 	}
 }
+
+func TestEmbeddingDefaultsAndOverride(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+
+	// Omitted section → enabled with documented defaults.
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embedding.Disabled {
+		t.Error("embedding should default to enabled")
+	}
+	if cfg.Embedding.SimilarityThreshold != 0.90 {
+		t.Errorf("default similarity_threshold = %v, want 0.90", cfg.Embedding.SimilarityThreshold)
+	}
+	if cfg.Embedding.BM25MinScore != 0.35 {
+		t.Errorf("default bm25_min_score = %v, want 0.35", cfg.Embedding.BM25MinScore)
+	}
+
+	// Explicit values honored, including a custom model path.
+	os.WriteFile(path, []byte(
+		"[embedding]\ndisabled = true\nmodel_path = \"/models/custom.gguf\"\nsimilarity_threshold = 0.75\nbm25_min_score = 0.5\ngpu_layers = 8\n"), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Embedding.Disabled || cfg.Embedding.ModelPath != "/models/custom.gguf" ||
+		cfg.Embedding.SimilarityThreshold != 0.75 || cfg.Embedding.BM25MinScore != 0.5 ||
+		cfg.Embedding.GPULayers != 8 {
+		t.Errorf("explicit embedding values lost: %+v", cfg.Embedding)
+	}
+
+	// Out-of-range numerics restore defaults.
+	os.WriteFile(path, []byte(
+		"[embedding]\nsimilarity_threshold = 1.5\nbm25_min_score = 1.5\ngpu_layers = -1\n"), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embedding.SimilarityThreshold != 0.90 || cfg.Embedding.BM25MinScore != 0.35 ||
+		cfg.Embedding.GPULayers != 0 {
+		t.Errorf("out-of-range embedding values should restore defaults: %+v", cfg.Embedding)
+	}
+}

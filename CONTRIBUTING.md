@@ -24,11 +24,16 @@ Thanks for helping keep herds unblocked! This guide covers the essentials.
 
 ## Build & test
 
+The semantic signature matcher links native code (llama.cpp via CGO and
+FAISS behind bleve's `vectors` build tag), so builds need a C/C++ toolchain,
+cmake, a one-time native-deps build, and the `vectors cpu` build tags:
+
 ```sh
-go build ./...                 # full build (pure Go, CGO not required)
-go test ./... -count=1         # full suite: unit, golden, safety, concurrency, integration
-gofmt -l . && go vet ./...     # what CI gates on
-golangci-lint run              # lint (CI runs this too)
+bash scripts/setup-native.sh                 # one-time: submodules, llama-go libs, FAISS
+go build -tags "vectors cpu" ./...           # full build (CGO)
+go test -tags "vectors cpu" ./... -count=1   # full suite: unit, golden, safety, concurrency, semantic
+gofmt -l . | grep -v third_party ; go vet -tags "vectors cpu" ./...
+golangci-lint run --build-tags "vectors,cpu" # lint (CI runs this too)
 ```
 
 Golden classifier fixtures live in `internal/classify/testdata/`; regenerate

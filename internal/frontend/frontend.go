@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
@@ -71,6 +73,10 @@ type Status struct {
 	// locating agents; empty when the Herdr adapter cannot report them.
 	Workspaces map[string]domain.WorkspaceInfo
 	Tabs       map[string]domain.TabInfo
+	// Embedding summarizes semantic-matching availability: "disabled",
+	// "model missing (<path>)", or "ready (N signatures, <model>)". The
+	// daemon's live health (a degraded embedder) shows in its log instead.
+	Embedding string
 }
 
 // GetStatus returns the operator-facing status summary.
@@ -109,6 +115,7 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 	if names, err := a.Store.AgentNames(ctx); err == nil {
 		st.AgentNames = names
 	}
+	st.Embedding = a.embeddingStatus(ctx)
 	// Name any live agent the daemon has not named yet (a brand-new agent,
 	// or one that predates the daemon): the operator should never have to
 	// stare at a bare pane id. Insert-if-absent, so this can never clobber
@@ -131,6 +138,30 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 
 // AgentName returns the short name for an agent id ("" when unnamed).
 func (st Status) AgentName(agentID string) string { return st.AgentNames[agentID] }
+
+// embeddingStatus summarizes semantic-matching availability from config,
+// model presence on disk, and the persisted signature-embedding count.
+func (a *App) embeddingStatus(ctx context.Context) string {
+	cfg, err := config.Load(a.ConfigPath)
+	if err != nil {
+		return "unknown (config unreadable)"
+	}
+	if cfg.Embedding.Disabled {
+		return "disabled"
+	}
+	modelPath := embedder.ResolveModelPath(cfg.Embedding)
+	count, countErr := a.Store.CountSignatureEmbeddings(ctx)
+	if _, statErr := os.Stat(modelPath); statErr != nil {
+		if countErr != nil {
+			return fmt.Sprintf("model missing (%s)", modelPath)
+		}
+		return fmt.Sprintf("bm25-fallback, model missing (%s), %d signatures indexed", modelPath, count)
+	}
+	if countErr != nil {
+		return fmt.Sprintf("ready (%s)", filepath.Base(modelPath))
+	}
+	return fmt.Sprintf("ready (%d signatures, %s)", count, filepath.Base(modelPath))
+}
 
 // Names returns the agent id → short name mapping.
 func (a *App) Names(ctx context.Context) (map[string]string, error) {
@@ -335,6 +366,11 @@ var ConfigFieldKeys = []string{
 	"llm.rewrite_command",
 	"llm.rewrite_timeout_seconds",
 	"llm.rewrite_fallback_template",
+	"embedding.disabled",
+	"embedding.model_path",
+	"embedding.similarity_threshold",
+	"embedding.bm25_min_score",
+	"embedding.gpu_layers",
 }
 
 // FieldValue renders the current value of a SetField key for display.
@@ -370,6 +406,19 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.LLM.RewriteTimeoutSeconds)
 	case "llm.rewrite_fallback_template":
 		return cfg.LLM.RewriteFallbackTemplate
+	case "embedding.disabled":
+		return strconv.FormatBool(cfg.Embedding.Disabled)
+	case "embedding.model_path":
+		if cfg.Embedding.ModelPath == "" {
+			return "(bundled " + embedder.DefaultModelFile + ")"
+		}
+		return cfg.Embedding.ModelPath
+	case "embedding.similarity_threshold":
+		return fmt.Sprintf("%.2f", cfg.Embedding.SimilarityThreshold)
+	case "embedding.bm25_min_score":
+		return fmt.Sprintf("%.2f", cfg.Embedding.BM25MinScore)
+	case "embedding.gpu_layers":
+		return strconv.Itoa(cfg.Embedding.GPULayers)
 	}
 	return ""
 }
@@ -446,6 +495,32 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			// Any text is accepted; empty restores the built-in default at
 			// use time (domain.ApplyRewriteFallback).
 			cfg.LLM.RewriteFallbackTemplate = value
+			return nil
+		case "embedding.disabled":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("embedding.disabled must be true or false, got %q", value)
+			}
+			cfg.Embedding.Disabled = v
+			return nil
+		case "embedding.model_path":
+			cfg.Embedding.ModelPath = value // empty restores the bundled default
+			return nil
+		case "embedding.similarity_threshold":
+			return setFloat(&cfg.Embedding.SimilarityThreshold)
+		case "embedding.bm25_min_score":
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil || v <= 0 || v > 1 {
+				return fmt.Errorf("embedding.bm25_min_score must be in (0,1], got %q", value)
+			}
+			cfg.Embedding.BM25MinScore = v
+			return nil
+		case "embedding.gpu_layers":
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("embedding.gpu_layers must be a non-negative integer, got %q", value)
+			}
+			cfg.Embedding.GPULayers = v
 			return nil
 		}
 		return fmt.Errorf("unknown config field %q", key)

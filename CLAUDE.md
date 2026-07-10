@@ -8,13 +8,24 @@ reference for day-to-day development.
 
 ## Build, test, lint
 
+The semantic signature matcher links native code (llama.cpp via CGO,
+FAISS behind bleve's `vectors` build tag), so **every build needs the
+native deps once** and the `vectors cpu` build tags always:
+
 ```sh
-go build ./...                  # pure Go, no CGO
-go test ./... -count=1          # full unit/golden/safety suite (what CI runs)
-gofmt -l . && go vet ./...      # CI gates on both
-golangci-lint run               # CI runs this too
+bash scripts/setup-native.sh                   # one-time: submodules + llama-go libs + FAISS → /usr/local/lib
+go build -tags "vectors cpu" ./...             # CGO; needs a C/C++ toolchain
+go test -tags "vectors cpu" ./... -count=1     # full unit/golden/safety/semantic suite (what CI runs)
+gofmt -l . | grep -v third_party && go vet -tags "vectors cpu" ./...
+golangci-lint run --build-tags "vectors,cpu"   # CI runs this too
 ```
 
+- `cpu` disables llama-go's default GPU (Vulkan/Metal) linkage; `vectors`
+  turns on bleve's FAISS-backed KNN. Both are required — a build without
+  them fails to link or compile.
+- The real-model embedder test skips unless `models/all-minilm-l6-v2-q8_0.gguf`
+  exists (download once from the HF repo in `release.yml`, or set
+  `HAP_TEST_EMBED_MODEL`).
 - Run the full suite before every commit that touches Go code.
 - Golden classifier fixtures: `internal/classify/testdata/`; regenerate with
   `UPDATE_GOLDEN=1 go test ./internal/classify/` and review the diff.
@@ -83,8 +94,14 @@ with a ticket/issue id**. Examples from history:
 
 Releases are **tag-driven**: merging a PR does NOT create a release.
 `.github/workflows/release.yml` fires on a `v*.*.*` tag push, runs the full
-CI gate, builds `hap-{linux,darwin}-{amd64,arm64}` + `SHA256SUMS`, and
-publishes the GitHub Release.
+CI gate, then builds on FOUR native runners (CGO cannot cross-compile):
+`hap-{linux,darwin}-{amd64,arm64}` (llama.cpp statically linked in), a
+`hap-native-<os>-<arch>.tar.gz` per platform (FAISS shared libs, plus
+libomp on macOS, rpath'd to `<plugin>/lib`), the
+`all-minilm-l6-v2-q8_0.gguf` embedding model fetched from Hugging Face
+(sha256-pinned), and `SHA256SUMS`; then publishes the GitHub Release.
+`install.sh` treats the binary and native tarball as REQUIRED and the model
+as optional (BM25 fallback).
 
 The invariant: **`version` in `herdr-plugin.toml` and the git tag MUST
 match.** `scripts/install.sh` downloads the release asset named by the
@@ -138,6 +155,16 @@ git push origin vX.Y.Z
   agents; anything that shells out repeatedly (LLM CLI, deep pane reads)
   belongs in a goroutine that funnels results back through a channel
   (see `consultLLM` / `llmResults`).
+- **Semantic matching degrades, never blocks** — situations resolve to
+  learned signatures via embedding + vector search over the MASKED salient
+  content (`daemon.resolveSignature`, `internal/match`, `internal/embedder`),
+  falling back to normalized-BM25 text matching, then to today's exact hash.
+  `SignatureResult.Raw` is the never-remapped content hash (the LLM drift
+  check depends on it); SQLite's `signature_embeddings` is the source of
+  truth and the bleve index under `<state>/match-index` is a disposable
+  cache (mem-only scorch does NOT serve KNN — keep it disk-backed). Embed
+  calls are stall-guarded and latch a degraded mode after 3 consecutive
+  failures.
 
 ## Testing practices
 

@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
+	"github.com/0xGosu/herdr-auto-pilot/internal/match"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
@@ -38,7 +40,17 @@ type Options struct {
 	// config on every reload so llm.command/timeout edits apply live. It
 	// takes precedence over the static LLM field.
 	LLMFactory func(cfg config.Config) ports.LLMPort
-	Clock      ports.Clock
+	// Embedder turns salient text into vectors for semantic signature
+	// matching (nil = text/exact matching only).
+	Embedder ports.EmbedderPort
+	// EmbedderFactory, when set, rebuilds the embedder from freshly loaded
+	// config whenever the [embedding] section changes. Takes precedence
+	// over the static Embedder field.
+	EmbedderFactory func(cfg config.Config) ports.EmbedderPort
+	// MatchIndexDir is where the disposable bleve match index lives
+	// (typically <state>/match-index). Empty disables semantic matching.
+	MatchIndexDir string
+	Clock         ports.Clock
 	// ReadTaskFile reads a declared task-source file (os.ReadFile in prod).
 	ReadTaskFile func(path string) ([]byte, error)
 	// PaneReadLines is how much recent pane content classification sees.
@@ -54,11 +66,25 @@ type Daemon struct {
 	allowlist  *domain.Allowlist
 	classifier *classify.Classifier
 	llm        ports.LLMPort
+	embedder   ports.EmbedderPort
+
+	// matcher is the semantic match index; semanticReady gates resolution
+	// until the background initSemantic has populated it. semanticGen
+	// invalidates in-flight initSemantic runs superseded by a newer reload,
+	// so a slow old run can never rebuild the index from stale rows or
+	// re-enable matching the operator just disabled.
+	matcher       *match.Matcher
+	semanticReady atomic.Bool
+	semanticGen   atomic.Int64
 
 	transitions    chan domain.AgentTransition
 	nudges         chan control.Kind
 	llmResults     chan llmOutcome
 	rewriteResults chan rewriteOutcome
+
+	// configured flips after the first successful reload so reloadEmbedder
+	// can tell first load from a config change.
+	configured bool
 
 	// lastAutoSend tracks our own sends so a subsequent "working"
 	// transition is attributed to automation, not the human.
@@ -125,6 +151,10 @@ func New(opt Options) (*Daemon, error) {
 		rewriteResults:  make(chan rewriteOutcome, 16),
 		lastAutoSend:    map[string]time.Time{},
 		rewriteInFlight: map[string]rewriteFlight{},
+		embedder:        opt.Embedder,
+	}
+	if opt.MatchIndexDir != "" {
+		d.matcher = match.New(opt.MatchIndexDir)
 	}
 	if err := d.reload(); err != nil {
 		return nil, err
@@ -153,11 +183,15 @@ func (d *Daemon) reload() error {
 	}
 
 	d.mu.Lock()
+	prev, first := d.cfg, !d.configured
+	d.configured = true
 	d.cfg = cfg
 	d.allowlist = allow
 	d.classifier = cls
 	d.llm = llmPort
 	d.mu.Unlock()
+
+	d.reloadEmbedder(prev, cfg, first)
 	slog.Info("configuration loaded", "path", d.opt.ConfigPath)
 	return nil
 }
@@ -204,6 +238,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		defer ctl.Close()
 	}
+
+	// Release native resources (embedding model, match index) on exit.
+	defer func() {
+		if emb := d.embedderPort(); emb != nil {
+			emb.Close()
+		}
+		if d.matcher != nil {
+			d.matcher.Close()
+		}
+	}()
 
 	// Event subscription with reconnect/backoff lives in its own goroutine.
 	go func() {
@@ -325,6 +369,10 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	}
 
 	sig := domain.ComputeSignature(situation)
+	// Semantic resolution may remap the key onto an existing learned
+	// signature (embedding / BM25 match on the masked salient content);
+	// sig.Raw always keeps the literal content hash.
+	sig = d.resolveSignature(ctx, cfg, sig, situation)
 
 	// Assemble decision inputs (all reads).
 	state, history, rate, retries, killActive, readErr := d.readDecisionState(ctx, sig, situation)
@@ -910,7 +958,10 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 		return
 	}
 	if s.Type != domain.SituationIdle {
-		if freshSig := domain.ComputeSignature(current); freshSig.Signature != res.sig.Signature {
+		// Compare raw content hashes: the staged signature may have been
+		// semantically remapped onto another key, but Raw always reflects
+		// the pane content as read, so equal Raw means the pane held still.
+		if freshSig := domain.ComputeSignature(current); freshSig.Raw != res.sig.Raw {
 			slog.Info("signature changed during rewrite; dropping send", "agent", s.AgentID)
 			return
 		}
@@ -1065,7 +1116,10 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	}
 	current := cls.Classify(s.AgentType, "blocked", pane)
 	current.AgentID, current.PaneID, current.WorkspaceID = s.AgentID, s.PaneID, s.WorkspaceID
-	if freshSig := domain.ComputeSignature(current); freshSig.Signature != res.sig.Signature {
+	// Compare raw content hashes: the staged signature may have been
+	// semantically remapped onto another key, but Raw always reflects the
+	// pane content as read, so equal Raw means the pane did not move on.
+	if freshSig := domain.ComputeSignature(current); freshSig.Raw != res.sig.Raw {
 		reject(domain.ReasonLLMNoSubmit, "situation changed while consulting the LLM; suggestion is stale")
 		return
 	}

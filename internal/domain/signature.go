@@ -59,9 +59,14 @@ const overMaskMaxRatio = 0.6
 
 // SignatureResult is the output of signature generation.
 type SignatureResult struct {
+	// Signature is the learning key situations are matched under. Semantic
+	// resolution may remap it onto an existing signature's key.
 	Signature string
-	Salient   string
-	Verdict   GuardVerdict
+	// Raw is the content hash exactly as computed; it is never remapped, so
+	// two reads of the same pane content always compare equal on Raw.
+	Raw     string
+	Salient string
+	Verdict GuardVerdict
 }
 
 // ComputeSignature derives a stable situation signature (FR-003): situation
@@ -77,8 +82,10 @@ func ComputeSignature(s Situation) SignatureResult {
 
 	canon := strings.Join([]string{"v1", string(s.Type), s.AgentType, strings.ToLower(masked)}, "|")
 	sum := sha256.Sum256([]byte(canon))
+	key := string(s.Type) + ":" + hex.EncodeToString(sum[:12])
 	return SignatureResult{
-		Signature: string(s.Type) + ":" + hex.EncodeToString(sum[:12]),
+		Signature: key,
+		Raw:       key,
 		Salient:   masked,
 		Verdict:   GuardOK,
 	}

@@ -7,47 +7,154 @@ on:
 permissions:
   contents: write
 
+env:
+  GO_BUILD_TAGS: vectors cpu
+  MODEL_URL: https://huggingface.co/sudomoniker/all-MiniLM-L6-v2-Q8_0-GGUF/resolve/main/all-minilm-l6-v2-q8_0.gguf
+  MODEL_FILE: all-minilm-l6-v2-q8_0.gguf
+  MODEL_SHA256: 606364fbf83de64c258ea9e011b74691d509d66292be0da612307488a46dfba5
+
 jobs:
   gate:
     name: Full CI gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+      - name: Native cache key (submodule commit)
+        id: subsha
+        run: echo "sha=$(git submodule status third_party/llama-go | awk '{print substr($1,1,12)}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+      - name: Cache native builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/native
+            third_party/llama-go/*.a
+            third_party/llama-go/llama.cpp/**/*.o
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
+      - name: Build native dependencies
+        run: bash scripts/setup-native.sh
       - name: gofmt
         run: |
-          out=$(gofmt -l .)
+          out=$(gofmt -l . | grep -v '^third_party/' || true)
           if [ -n "$out" ]; then echo "$out" && exit 1; fi
-      - run: go vet ./...
-      - run: go test ./... -count=1 -timeout 10m
+      - run: go vet -tags "${GO_BUILD_TAGS}" ./...
+      - run: go test -tags "${GO_BUILD_TAGS}" ./... -count=1 -timeout 15m
 
-  release:
-    name: Build artifacts & publish release
+  build:
+    name: Build ${{ matrix.target }}
     needs: gate
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # CGO cannot cross-compile, so each target builds on its own
+          # native runner.
+          - { os: ubuntu-latest,    target: linux-amd64 }
+          - { os: ubuntu-24.04-arm, target: linux-arm64 }
+          - { os: macos-13,         target: darwin-amd64 }
+          - { os: macos-14,         target: darwin-arm64 }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: Build Linux/macOS binaries
+      - name: Native cache key (submodule commit)
+        id: subsha
+        run: echo "sha=$(git submodule status third_party/llama-go | awk '{print substr($1,1,12)}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+      - name: Cache native builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/native
+            third_party/llama-go/*.a
+            third_party/llama-go/llama.cpp/**/*.o
+          key: native-${{ matrix.target }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
+      - name: Build native dependencies
+        run: bash scripts/setup-native.sh
+      - name: Build hap binary
         run: |
           VERSION="${GITHUB_REF_NAME}"
+          case "${{ matrix.target }}" in
+            linux-*)  RPATH='-Wl,-rpath,$ORIGIN/../lib' ;;
+            darwin-*) RPATH='-Wl,-rpath,@loader_path/../lib' ;;
+          esac
           mkdir -p dist
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            GOOS="${target%/*}" GOARCH="${target#*/}" \
-              go build -trimpath -ldflags "-s -w -X github.com/0xGosu/herdr-auto-pilot/internal/buildinfo.Version=${VERSION}" \
-              -o "dist/hap-${target%/*}-${target#*/}" \
-              ./cmd/hap
-          done
-          (cd dist && sha256sum * > SHA256SUMS)
-      - name: Publish GitHub Release
+          CGO_ENABLED=1 go build -tags "${GO_BUILD_TAGS}" -trimpath \
+            -ldflags "-s -w -X github.com/0xGosu/herdr-auto-pilot/internal/buildinfo.Version=${VERSION} -extldflags '${RPATH}'" \
+            -o "dist/hap-${{ matrix.target }}" ./cmd/hap
+      - name: Bundle native runtime libraries
+        run: |
+          # llama.cpp is statically linked into the binary; only the FAISS
+          # shared libs (plus libomp on macOS) ship, self-contained in one
+          # lib/ dir the binary reaches via its <plugin>/lib rpath.
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            linux-*)  EXT=so ;;
+            darwin-*) EXT=dylib ;;
+          esac
+          mkdir -p bundle/lib
+          cp ".cache/native/faiss/build/faiss/libfaiss.${EXT}" bundle/lib/
+          cp ".cache/native/faiss/build/c_api/libfaiss_c.${EXT}" bundle/lib/
+          cd bundle/lib
+          # Inter-library resolution must work from the bundle dir alone.
+          if [ "${EXT}" = "so" ]; then
+            sudo apt-get install -y -qq patchelf
+            for f in *.so; do
+              patchelf --set-rpath '$ORIGIN' "$f"
+            done
+          else
+            install_name_tool -id '@rpath/libfaiss.dylib' libfaiss.dylib
+            install_name_tool -id '@rpath/libfaiss_c.dylib' libfaiss_c.dylib
+            dep=$(otool -L libfaiss_c.dylib | awk 'NR>1 && /libfaiss[^_]/ {print $1; exit}')
+            [ -n "$dep" ] && install_name_tool -change "$dep" '@rpath/libfaiss.dylib' libfaiss_c.dylib
+            # FAISS is built with Homebrew LLVM's OpenMP; ship libomp and
+            # rewire both libs to load it from the bundle.
+            cp "$(brew --prefix llvm)/lib/libomp.dylib" .
+            install_name_tool -id '@rpath/libomp.dylib' libomp.dylib
+            for f in libfaiss.dylib libfaiss_c.dylib; do
+              omp=$(otool -L "$f" | awk 'NR>1 && /libomp/ {print $1; exit}')
+              [ -n "$omp" ] && install_name_tool -change "$omp" '@rpath/libomp.dylib' "$f" || true
+            done
+            for f in *.dylib; do
+              install_name_tool -add_rpath '@loader_path' "$f" 2>/dev/null || true
+            done
+            # Ad-hoc sign after mutation (required on arm64 macOS).
+            codesign --force -s - ./*.dylib
+          fi
+          cd ..
+          tar -czf "../dist/hap-native-${{ matrix.target }}.tar.gz" lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          retention-days: 3
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Fetch embedding model (Hugging Face)
+        run: |
+          curl -fsSL --retry 5 --retry-delay 10 -o "dist/${MODEL_FILE}" "${MODEL_URL}"
+          echo "${MODEL_SHA256}  dist/${MODEL_FILE}" | sha256sum -c -
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+      - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/*
+          files: dist/*
           generate_release_notes: true

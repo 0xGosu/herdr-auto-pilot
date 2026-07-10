@@ -250,3 +250,18 @@ type ErrorRetry struct {
 	RetryCount     int
 	UpdatedAt      time.Time
 }
+
+// SignatureEmbedding is the stored semantic identity of a signature: the
+// masked salient text it was minted from plus its embedding vector. Vector
+// is nil when the row was persisted while the embedder was unavailable; such
+// rows still serve BM25 fallback matching and are backfilled on load.
+type SignatureEmbedding struct {
+	Signature     string
+	SituationType SituationType
+	AgentType     string
+	Model         string // embedding model id ("" until embedded)
+	Dims          int
+	Vector        []float32
+	Salient       string
+	CreatedAt     time.Time
+}
