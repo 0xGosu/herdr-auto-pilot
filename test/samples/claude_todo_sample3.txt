@@ -1,0 +1,12 @@
+
+● Running 1 shell command…
+  ⎿  $ go test -tags "vectors cpu" ./... -count=1 2>&1 | grep -vE "^ok|no test files" | head -8; echo ===; gofmt -l . 2>/dev/null | grep -v third_party | head
+Found 10 new diagnostic issues in 1 file (ctrl+o to expand)
+
+✻ Wiring daemon semantic resolver… (1h 42m 16s · ↓ 133.0k tokens)
+◼ Daemon: resolveSignature 5-step flow + initSemantic + Options wiring + hap status
+◻ Packaging: release.yml 4-runner matrix, install.sh (libfaiss_c + HF model), setup-native.sh, docs
+◻ Run full test suite via subagent, code review via subagent, fix findings, open PR
+✔ Set up worktree, submodule, native deps (llama-go libbinding.a, FAISS libfaiss_c, cmake)
+✔ Add go.mod deps (llama-go replace, bleve/v2) and verify -tags vectors builds
+ … +5 completed

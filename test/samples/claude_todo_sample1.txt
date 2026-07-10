@@ -1,0 +1,8 @@
+bleve's cosine metric maps to FAISS inner-product over normalized vectors, so hit.Score is the true cosine — thresholds compare directly. Writing the matcher package now.
+
+* Setting up native build environment… (27m 29s · ↓ 66.0k tokens)
+◼ Set up worktree, submodule, native deps (llama-go libbinding.a, FAISS libfaiss_c, cmake)
+◼ Add go.mod deps (llama-go replace, bleve/v2) and verify -tags vectors builds
+◼ Matcher internal/match (bleve KNN + BM25)
+◻ Embedder adapter internal/embedder (llama-go wrapper)
+◻ Daemon: resolveSignature 5-step flow + initSemantic + Options wiring + hap status

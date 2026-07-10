@@ -1,6 +1,10 @@
 package domain
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestNextDeclaredTask(t *testing.T) {
 	cases := []struct {
@@ -96,6 +100,34 @@ func TestMatchWorkspace(t *testing.T) {
 	}
 }
 
+// TestInferClaudeNextTaskRealSamples pins the parser against verbatim
+// copies of Claude Code's TUI (test/samples/claude_todo_sample*.txt):
+// mixed narration, shell-echo ⎿ widgets, varying header spinners (* ✽ ✻),
+// the "… +N pending, M completed" truncation footer, and the real marker
+// runes ◼ (in progress) / ◻ (pending) / ✔ (completed) without connectors.
+func TestInferClaudeNextTaskRealSamples(t *testing.T) {
+	cases := []struct {
+		file string
+		want string
+	}{
+		{"claude_todo_sample1.txt", "Set up worktree, submodule, native deps (llama-go libbinding.a, FAISS libfaiss_c, cmake)"},
+		{"claude_todo_sample2.txt", "Set up worktree, submodule, native deps (llama-go libbinding.a, FAISS libfaiss_c, cmake)"},
+		{"claude_todo_sample3.txt", "Daemon: resolveSignature 5-step flow + initSemantic + Options wiring + hap status"},
+	}
+	for _, c := range cases {
+		t.Run(c.file, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("..", "..", "test", "samples", c.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := InferNextTask("claude", string(data))
+			if !got.Structured || got.Task != c.want {
+				t.Errorf("InferNextTask = %+v, want structured task %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestInferNextTask(t *testing.T) {
 	claudeWidget := "· Building integration test suite… (27m 52s · ↓ 73.9k tokens)\n" +
 		"  ⎿  ✔ Fix send: map option label to menu index\n" +
@@ -150,6 +182,49 @@ func TestInferNextTask(t *testing.T) {
 			agentType:  "claude",
 			transcript: "  ⎿  ☒ setup\n     ▪ wire the adapter\n     ☐ write docs\n",
 			wantTask:   "wire the adapter",
+			structured: true,
+		},
+		{
+			name:      "real TUI markers ◼/◻ without connectors",
+			agentType: "claude",
+			transcript: "* Setting up native build environment… (27m 29s · ↓ 66.0k tokens)\n" +
+				"◼ Set up worktree and native deps\n" +
+				"◻ Embedder adapter\n",
+			wantTask:   "Set up worktree and native deps",
+			structured: true,
+		},
+		{
+			name:      "connectorless renders separated by a blank line supersede",
+			agentType: "claude",
+			transcript: "✽ Working… (1m · ↓ 1k tokens)\n" +
+				"◼ task A\n" +
+				"◻ task B\n" +
+				"\n" +
+				"✻ Working… (2m · ↓ 2k tokens)\n" +
+				"✔ task A\n" +
+				"◼ task B\n",
+			wantTask:   "task B",
+			structured: true,
+		},
+		{
+			name:      "back-to-back renders without a blank line supersede via the header",
+			agentType: "claude",
+			transcript: "✽ Working… (1m · ↓ 1k tokens)\n" +
+				"◼ task A\n" +
+				"◻ task B\n" +
+				"✻ Working… (2m · ↓ 2k tokens)\n" +
+				"✔ task A\n" +
+				"◼ task B\n",
+			wantTask:   "task B",
+			structured: true,
+		},
+		{
+			name:      "pending-only ◻ list falls back to first pending",
+			agentType: "claude",
+			transcript: "✻ Planning… (2m 3s · ↓ 1.2k tokens)\n" +
+				"◻ first pending thing\n" +
+				"◻ second pending thing\n",
+			wantTask:   "first pending thing",
 			structured: true,
 		},
 		{
