@@ -352,8 +352,9 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// notify (FR-023); the subscriber's backoff handles reconnection.
 		slog.Warn("pane read failed; taking no action", "pane", tr.PaneID, "error", err)
 		d.audit(ctx, domain.AuditRecord{
-			AgentID: tr.AgentID, Trigger: trigger(tr), SituationType: domain.SituationUnclassifiable,
-			Action: "escalated", Rationale: string(domain.ReasonHerdrUnreachable),
+			AgentID: tr.AgentID, AgentType: tr.AgentType, Trigger: trigger(tr),
+			SituationType: domain.SituationUnclassifiable,
+			Action:        "escalated", Rationale: string(domain.ReasonHerdrUnreachable),
 			Status: "escalated", CreatedAt: now,
 		})
 		return
@@ -585,7 +586,7 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 	dec domain.Decision, tr domain.AgentTransition, del delivery, now time.Time) {
 
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: s.AgentID, Signature: sig.Signature, Trigger: trigger(tr),
+		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "auto:" + del.input, Input: del.input,
 		Confidence: dec.Confidence, Rationale: del.rationale, LLMOutput: del.llmOutput,
 		Status: "auto", CreatedAt: now,
@@ -654,7 +655,7 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
 
 	rec := domain.AuditRecord{
-		AgentID: s.AgentID, Signature: sig.Signature, Trigger: trigger(tr),
+		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "escalated", Confidence: dec.Confidence,
 		Rationale: fmt.Sprintf("[%s] %s", dec.Reason, dec.Rationale),
 		Status:    "escalated", Suggestion: dec.Suggestion, CreatedAt: now,
@@ -1136,7 +1137,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 
 	// Promote: audit-before-act guard applies here too (FR-024).
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: s.AgentID, Signature: res.sig.Signature, Trigger: "llm-fallback",
+		AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
 		SituationType: s.Type, Action: "auto:" + llmDec.Action, Input: llmDec.Action,
 		Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
 		Status: "auto", CreatedAt: now,
@@ -1231,6 +1232,11 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 			Signature: audit.Signature, SituationType: audit.SituationType,
 			AgentType: agentTypeOf(history, audit), Mode: domain.ModeShadow,
 		}
+	} else if state.AgentType == "" || state.AgentType == "unknown" {
+		// Heal rules learned before the audit carried an agent type.
+		if at := agentTypeOf(history, audit); at != "unknown" {
+			state.AgentType = at
+		}
 	}
 
 	// Was this a confirmation of the suggested/learned action, or a
@@ -1283,7 +1289,8 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 
 	// Correction lineage in the audit trail (DR-005).
 	d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: audit.AgentID, Signature: audit.Signature, Trigger: "operator-correction",
+		AgentID: audit.AgentID, AgentType: state.AgentType, Signature: audit.Signature,
+		Trigger:       "operator-correction",
 		SituationType: audit.SituationType, Action: "corrected:" + c.CorrectedAction,
 		Input: c.CorrectedAction, Rationale: "operator " + map[bool]string{true: "confirmed", false: "corrected"}[isConfirmation],
 		CorrectsAuditID: c.AuditID, Status: "resolved", CreatedAt: now,
@@ -1471,11 +1478,18 @@ func suggestionAction(audit *domain.AuditRecord) string {
 	return sug
 }
 
+// agentTypeOf resolves the agent type for a signature learned via an
+// operator correction: decision history first, then the audit row (which
+// records the type observed at escalation time), else "unknown".
 func agentTypeOf(history []domain.DecisionRecord, audit *domain.AuditRecord) string {
-	if len(history) > 0 {
-		return history[0].AgentType
+	for _, h := range history {
+		if h.AgentType != "" && h.AgentType != "unknown" {
+			return h.AgentType
+		}
 	}
-	_ = audit
+	if audit != nil && audit.AgentType != "" {
+		return audit.AgentType
+	}
 	return "unknown"
 }
 

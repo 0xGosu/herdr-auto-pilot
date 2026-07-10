@@ -327,16 +327,37 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer) error {
 	if err != nil {
 		names = map[string]string{}
 	}
+	rules, gradN := ruleIndex(ctx, app)
 	for _, e := range esc {
 		agent := e.AgentID
 		if n := names[e.AgentID]; n != "" {
 			agent = n
 		}
-		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\tagent=%s\tsuggestion=%q\n",
-			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.Rationale, agent, e.Suggestion)
+		rule := "none yet"
+		if row, ok := rules[e.Signature]; ok {
+			rule = frontend.RuleSummary(row, gradN)
+		}
+		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\tagent=%s\tsuggestion=%q\trule=[%s]\n",
+			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.Rationale, agent, e.Suggestion, rule)
 	}
 	fmt.Fprintf(out, "\n%d pending; respond with: confirm <id> | resolve <id> --action TEXT [--send]\n", len(esc))
 	return nil
+}
+
+// ruleIndex loads the learned signatures keyed by signature, plus the
+// graduation N, for annotating escalation/audit rows with their matched
+// rule. Degrades to an empty index on error — the listing must not fail
+// because rule enrichment did.
+func ruleIndex(ctx context.Context, app *frontend.App) (map[string]frontend.SignatureRow, int) {
+	gradN := 5
+	if cfg, err := app.Config(); err == nil {
+		gradN = cfg.Learning.GraduationN
+	}
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil {
+		return map[string]frontend.SignatureRow{}, gradN
+	}
+	return frontend.IndexSignatures(rows), gradN
 }
 
 func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
@@ -350,10 +371,15 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 	if err != nil {
 		return err
 	}
+	rules, _ := ruleIndex(ctx, app)
 	for _, r := range recs {
-		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%.2f\t%s\n",
+		rule := "-"
+		if row, ok := rules[r.Signature]; ok {
+			rule = string(row.Mode)
+		}
+		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%.2f\trule=%s\t%s\n",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
-			r.Action, r.Confidence, r.Rationale)
+			r.Action, r.Confidence, rule, r.Rationale)
 	}
 	return nil
 }

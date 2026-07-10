@@ -170,6 +170,7 @@ type AuditRecord struct {
 	ID              int64
 	DecisionID      int64
 	AgentID         string
+	AgentType       string // agent type at decision time (e.g. "claude"); "" on legacy rows
 	Signature       string
 	Trigger         string
 	SituationType   SituationType

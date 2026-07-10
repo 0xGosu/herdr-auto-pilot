@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	decision_id INTEGER NOT NULL DEFAULT 0,
 	agent_id TEXT NOT NULL DEFAULT '',
+	agent_type TEXT NOT NULL DEFAULT '',
 	signature TEXT NOT NULL DEFAULT '',
 	trigger TEXT NOT NULL,
 	situation_type TEXT NOT NULL,
@@ -179,6 +180,17 @@ func (s *Store) migrate() error {
 	if err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
+	// Column additions to pre-existing tables (CREATE IF NOT EXISTS above
+	// only covers new tables). Idempotent: a duplicate-column error means
+	// the column is already there.
+	for _, ddl := range []string{
+		`ALTER TABLE audit_log ADD COLUMN agent_type TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := s.db.Exec(ddl); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("migrate column: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -219,6 +231,7 @@ func (s *Store) UpsertSignature(ctx context.Context, sig domain.SignatureState) 
 				consecutive_confirmations, cached_confidence, guard_state, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(signature) DO UPDATE SET
+				agent_type=excluded.agent_type,
 				mode=excluded.mode,
 				consecutive_confirmations=excluded.consecutive_confirmations,
 				cached_confidence=excluded.cached_confidence,
@@ -254,11 +267,11 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO audit_log (decision_id, agent_id, signature, trigger, situation_type,
+			INSERT INTO audit_log (decision_id, agent_id, agent_type, signature, trigger, situation_type,
 				action_or_escalation, input, confidence, rationale, llm_output,
 				corrects_audit_id, status, suggestion, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			a.DecisionID, a.AgentID, a.Signature, a.Trigger, string(a.SituationType),
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
 			a.Action, a.Input, a.Confidence, a.Rationale, a.LLMOutput,
 			a.CorrectsAuditID, a.Status, a.Suggestion, unix(a.CreatedAt))
 		if err != nil {
@@ -781,7 +794,7 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 		var a domain.AuditRecord
 		var situationType string
 		var created int64
-		if err := rows.Scan(&a.ID, &a.DecisionID, &a.AgentID, &a.Signature, &a.Trigger,
+		if err := rows.Scan(&a.ID, &a.DecisionID, &a.AgentID, &a.AgentType, &a.Signature, &a.Trigger,
 			&situationType, &a.Action, &a.Input, &a.Confidence, &a.Rationale,
 			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &created); err != nil {
 			return nil, err
@@ -793,7 +806,7 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 	return out, rows.Err()
 }
 
-const auditCols = `id, decision_id, agent_id, signature, trigger, situation_type,
+const auditCols = `id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
 	action_or_escalation, input, confidence, rationale, llm_output,
 	corrects_audit_id, status, suggestion, created_at`
 

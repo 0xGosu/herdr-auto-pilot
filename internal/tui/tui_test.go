@@ -36,10 +36,11 @@ func testModel(t *testing.T) Model {
 			},
 		},
 		escalations: []domain.AuditRecord{
-			{ID: 41, AgentID: "w6:p1", SituationType: domain.SituationApproval,
+			{ID: 41, AgentID: "w6:p1", AgentType: "claude", SituationType: domain.SituationApproval,
 				Status: "escalated", Confidence: 0.42,
 				Trigger:    "Do you want to apply this edit to internal/store/store.go?\n1. Yes\n2. No",
 				Suggestion: "1", Rationale: longRationale,
+				Signature: "approval:1234abcd5678efab", // matches the shadow rule below
 				CreatedAt: time.Date(2026, 7, 9, 11, 0, 0, 0, time.UTC)},
 		},
 		audit: []domain.AuditRecord{
@@ -165,13 +166,14 @@ func TestDetailViewEscalationShowsFullText(t *testing.T) {
 
 func TestDetailViewAudit(t *testing.T) {
 	m := testModel(t)
+	m.height = 40 // the detail gained fields (agent type, matched rule); keep every asserted line on screen
 	m.tab = tabAudit
 	m = press(t, m, "v")
 	if m.detail == nil {
 		t.Fatal("v on Audit tab should open the detail view")
 	}
 	view := m.View()
-	for _, want := range []string{"Audit record #7", "model said pick option two", "choice|claude|abc123", "Decision id"} {
+	for _, want := range []string{"Audit record #7", "model said pick option two", "choice|claude|abc123", "Decision id", "Matched rule"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("audit detail missing %q:\n%s", want, view)
 		}
@@ -656,4 +658,48 @@ func TestEscalationDetailEnterConfirmsSnapshotNotClampedCursor(t *testing.T) {
 		t.Errorf("should deliver B's suggestion, got %v", h.sent)
 	}
 	_ = idA
+}
+
+func TestEscalationShowsMatchedRule(t *testing.T) {
+	// The escalation shares its signature with a learned rule: the detail
+	// view names that exact rule (mode, streak, confidence, top action) and
+	// the list row carries the compact marker.
+	m := testModel(t)
+	m.tab = tabEscalations
+
+	list := m.View()
+	if !strings.Contains(list, "rule=shadow") {
+		t.Errorf("escalation list should mark the matched rule mode:\n%s", list)
+	}
+
+	m.height = 40
+	m = press(t, m, "v")
+	if m.detail == nil {
+		t.Fatal("v should open the escalation detail")
+	}
+	view := m.View()
+	want := `shadow — 3/5 confirmations, confidence 0.71, top action "1" over 4 decision(s)`
+	if !strings.Contains(view, "Matched rule") || !strings.Contains(view, want) {
+		t.Errorf("escalation detail should describe the matched rule %q:\n%s", want, view)
+	}
+	if !strings.Contains(view, "Agent type") {
+		t.Errorf("escalation detail should show the agent type:\n%s", view)
+	}
+}
+
+func TestEscalationWithoutRuleShowsNoneYet(t *testing.T) {
+	m := testModel(t)
+	m.tab = tabAudit // the audit fixture's signature matches no rule
+	m.height = 40
+	m = press(t, m, "v")
+	view := m.View()
+	if !strings.Contains(view, "none yet — learned when the operator confirms or resolves this") {
+		t.Errorf("unmatched signature should render the none-yet hint:\n%s", view)
+	}
+	// And its list row shows the dash marker.
+	m2 := testModel(t)
+	m2.tab = tabAudit
+	if list := m2.View(); !strings.Contains(list, "rule=-") {
+		t.Errorf("audit list should dash-mark rows without a rule:\n%s", list)
+	}
 }

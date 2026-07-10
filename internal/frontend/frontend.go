@@ -686,6 +686,30 @@ type SignatureRow struct {
 	LastAudit *domain.AuditRecord
 }
 
+// RuleSummary renders a one-line description of the learned rule backing a
+// signature, for escalation/audit views (TUI detail and CLI share the
+// wording so operators see the same rule either way).
+func RuleSummary(row SignatureRow, graduationN int) string {
+	s := fmt.Sprintf("%s — %d/%d confirmations, confidence %.2f",
+		row.Mode, row.ConsecutiveConfirmations, graduationN, row.CachedConfidence)
+	if row.TopAction != "" {
+		s += fmt.Sprintf(", top action %q over %d decision(s)", row.TopAction, row.Decisions)
+	}
+	return s
+}
+
+// IndexSignatures keys signature rows by signature for O(1) rule lookups
+// from escalation/audit rows (they share the signature string; with
+// semantic matching the stored signature is the possibly-remapped learned
+// key, so the lookup lands on the rule that actually drove the decision).
+func IndexSignatures(rows []SignatureRow) map[string]SignatureRow {
+	idx := make(map[string]SignatureRow, len(rows))
+	for _, r := range rows {
+		idx[r.Signature] = r
+	}
+	return idx
+}
+
 // Signatures lists learned signatures (newest-updated first) enriched with
 // their top action and decision count. Per-row history reads are N+1 at
 // operator scale; a SQL aggregate is a future optimization if lists grow.

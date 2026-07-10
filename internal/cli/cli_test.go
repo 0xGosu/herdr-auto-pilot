@@ -200,3 +200,33 @@ func TestSignaturesDelete(t *testing.T) {
 		t.Errorf("ambiguous prefix must error, got %v", err)
 	}
 }
+
+func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
+	app, st := testApp(t)
+	seedSignatures(t, st) // seeds a shadow rule + an escalation sharing its signature
+
+	out, err := run(t, app, "escalations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `rule=[shadow — 3/5 confirmations, confidence 0.75, top action "1" over 2 decision(s)]`) {
+		t.Errorf("escalations should name the matched rule, got:\n%s", out)
+	}
+
+	// An escalation with no learned rule reads "none yet".
+	st.AppendAudit(context.Background(), domain.AuditRecord{Signature: "error:9999dddd",
+		Trigger: "boom", SituationType: domain.SituationError,
+		Action: "escalated", Rationale: "fresh", Status: "escalated", CreatedAt: time.Now()})
+	out, _ = run(t, app, "escalations")
+	if !strings.Contains(out, "rule=[none yet]") {
+		t.Errorf("unmatched escalation should read none yet, got:\n%s", out)
+	}
+
+	out, err = run(t, app, "audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "rule=shadow") || !strings.Contains(out, "rule=-") {
+		t.Errorf("audit rows should carry the rule mode marker (or dash), got:\n%s", out)
+	}
+}

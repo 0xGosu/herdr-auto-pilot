@@ -94,11 +94,16 @@ The plugin never acts on a situation it hasn't learned from you.
    is masked), and — in shadow mode — **escalates with a suggestion**.
 2. **Confirm or correct.** In the TUI's *Escalations* tab press `enter` to
    confirm the suggestion (and send it), or `c` to type the correct
-   response — `v` shows the full record (trigger, rationale, LLM output)
-   when the list line is truncated; it works on the *Agents*, *Audit*, and
-   *Rules* tabs too, and pressing `tab`/`shift+tab` inside the detail view
-   switches tabs directly (no `esc` needed). From the CLI:
-   `confirm <id> --send` or `resolve <id> --action TEXT --send`.
+   response — `v` shows the full record (trigger, rationale, LLM output,
+   agent type, and the **matched rule** — the exact learned signature this
+   situation resolved to, with its mode/streak/confidence/top action, or
+   "none yet" for a first sighting) when the list line is truncated; it
+   works on the *Agents*, *Audit*, and *Rules* tabs too, and pressing
+   `tab`/`shift+tab` inside the detail view switches tabs directly (no
+   `esc` needed). Escalation and audit list rows carry compact `rule=` and
+   agent-type columns; the CLI `escalations`/`audit` listings show the
+   same. From the CLI: `confirm <id> --send` or
+   `resolve <id> --action TEXT --send`.
 3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
    *and* confidence above the per-situation threshold, that signature becomes
    autonomous: next time, the plugin acts on its own and logs it.

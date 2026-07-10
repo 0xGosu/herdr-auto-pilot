@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -102,12 +103,17 @@ func TestAuditAndCorrectionLineage(t *testing.T) {
 	ctx := context.Background()
 
 	auditID, err := s.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: "a1", Signature: "sig", Trigger: "agent-status: blocked",
+		AgentID: "a1", AgentType: "claude", Signature: "sig", Trigger: "agent-status: blocked",
 		SituationType: domain.SituationApproval, Action: "auto:y", Input: "y",
 		Confidence: 0.93, Rationale: "learned rule", Status: "auto", CreatedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The agent type recorded at decision time round-trips (rules learned
+	// from confirmed escalations depend on it).
+	if got, err := s.GetAudit(ctx, auditID); err != nil || got == nil || got.AgentType != "claude" {
+		t.Fatalf("audit agent type round trip: %+v %v", got, err)
 	}
 
 	// Post-hoc correction (FR-021, DR-005): the correction preserves the
@@ -677,5 +683,69 @@ func TestDecodeVectorRejectsCorruptBlob(t *testing.T) {
 	}
 	if v, err := decodeVector(nil, 0); err != nil || v != nil {
 		t.Errorf("empty blob should be nil vector, got %v/%v", v, err)
+	}
+}
+
+func TestMigrateAddsAgentTypeToLegacyAuditLog(t *testing.T) {
+	// A database created before 0.2.2 has an audit_log WITHOUT agent_type;
+	// CREATE IF NOT EXISTS skips the existing table, so only the ALTER in
+	// migrate() can add the column. The column lands at the end — harmless,
+	// because every query names its columns explicitly.
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+		CREATE TABLE audit_log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			decision_id INTEGER NOT NULL DEFAULT 0,
+			agent_id TEXT NOT NULL DEFAULT '',
+			signature TEXT NOT NULL DEFAULT '',
+			trigger TEXT NOT NULL,
+			situation_type TEXT NOT NULL,
+			action_or_escalation TEXT NOT NULL,
+			input TEXT NOT NULL DEFAULT '',
+			confidence REAL NOT NULL DEFAULT 0,
+			rationale TEXT NOT NULL DEFAULT '',
+			llm_output TEXT NOT NULL DEFAULT '',
+			corrects_audit_id INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT '',
+			suggestion TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		);
+		INSERT INTO audit_log (trigger, situation_type, action_or_escalation, status, created_at)
+		VALUES ('agent-status: idle', 'idle', 'escalated', 'escalated', 1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("opening a legacy DB must migrate, got: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	ctx := context.Background()
+	// The pre-migration row reads back with an empty agent type.
+	legacy, err := s.GetAudit(ctx, 1)
+	if err != nil || legacy == nil || legacy.AgentType != "" {
+		t.Fatalf("legacy row after migration: %+v %v", legacy, err)
+	}
+	// New rows round-trip the migrated column.
+	id, err := s.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", AgentType: "claude", Trigger: "agent-status: idle",
+		SituationType: domain.SituationIdle, Action: "escalated", Status: "escalated",
+		CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetAudit(ctx, id)
+	if err != nil || got == nil || got.AgentType != "claude" {
+		t.Fatalf("migrated column round trip: %+v %v", got, err)
 	}
 }

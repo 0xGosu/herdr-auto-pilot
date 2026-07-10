@@ -697,6 +697,7 @@ func (m Model) auditDetailLines(r domain.AuditRecord, w int) []string {
 	lines = detailField(lines, w, "Status", r.Status)
 	lines = detailField(lines, w, "Situation", string(r.SituationType))
 	lines = detailField(lines, w, "Agent", agent)
+	lines = detailField(lines, w, "Agent type", m.agentTypeFor(r))
 	lines = detailField(lines, w, "Confidence", fmt.Sprintf("%.2f", r.Confidence))
 	lines = detailField(lines, w, "Trigger", r.Trigger)
 	lines = detailField(lines, w, "Suggestion", r.Suggestion)
@@ -705,6 +706,15 @@ func (m Model) auditDetailLines(r domain.AuditRecord, w int) []string {
 	lines = detailField(lines, w, "Rationale", r.Rationale)
 	lines = detailField(lines, w, "LLM output", r.LLMOutput)
 	lines = detailField(lines, w, "Signature", r.Signature)
+	if r.Signature != "" {
+		if row, ok := m.ruleFor(r.Signature); ok {
+			lines = detailField(lines, w, "Matched rule",
+				frontend.RuleSummary(row, m.data.cfg.Learning.GraduationN))
+		} else {
+			lines = detailField(lines, w, "Matched rule",
+				"none yet — learned when the operator confirms or resolves this")
+		}
+	}
 	if r.DecisionID != 0 {
 		lines = detailField(lines, w, "Decision id", fmt.Sprintf("%d", r.DecisionID))
 	}
@@ -1120,22 +1130,65 @@ func (m Model) renderAgents(b *strings.Builder) {
 	}
 }
 
+// ruleFor resolves the learned rule an audit/escalation row is keyed to
+// (they share the signature string), from the snapshot the Rules tab uses.
+func (m Model) ruleFor(signature string) (frontend.SignatureRow, bool) {
+	if signature == "" {
+		return frontend.SignatureRow{}, false
+	}
+	for _, row := range m.data.signatures {
+		if row.Signature == signature {
+			return row, true
+		}
+	}
+	return frontend.SignatureRow{}, false
+}
+
+// ruleMarker is the compact list-column form of ruleFor: the rule's mode
+// abbreviated, or "-" when no rule exists yet.
+func (m Model) ruleMarker(signature string) string {
+	row, ok := m.ruleFor(signature)
+	if !ok {
+		return "-"
+	}
+	if row.Mode == domain.ModeAutonomous {
+		return "auto"
+	}
+	return string(row.Mode)
+}
+
+// agentTypeFor resolves an audit row's agent type: the recorded value, or —
+// for rows written before the audit log carried it — the live agent's type.
+func (m Model) agentTypeFor(r domain.AuditRecord) string {
+	if r.AgentType != "" {
+		return r.AgentType
+	}
+	for _, a := range m.data.status.MonitoredAgents {
+		if a.AgentID == r.AgentID {
+			return a.AgentType
+		}
+	}
+	return ""
+}
+
 func (m Model) renderEscalations(b *strings.Builder) {
 	esc := m.data.escalations
 	if len(esc) == 0 {
 		fmt.Fprintln(b, "no pending escalations — the herd is unblocked 🎉")
 		return
 	}
-	// Prefix: "#%-5d %-8s %-10s agent=%-14s " → 6+1+8+1+10+1+6+14+1 = 48 cells.
-	const escPrefix = 48
+	// Prefix: "#%-5d %-8s %-10s %-8s agent=%-14s rule=%-6s " → 69 cells.
+	const escPrefix = 69
 	for i, e := range esc {
 		agent := e.AgentID
 		if n := m.data.status.AgentName(e.AgentID); n != "" {
 			agent = n
 		}
 		rWidth, sWidth := m.budget(escPrefix, e.Suggestion != "")
-		line := fmt.Sprintf("#%-5d %-8s %-10s agent=%-14s %s",
-			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, agent, oneLine(e.Rationale, rWidth))
+		line := fmt.Sprintf("#%-5d %-8s %-10s %-8s agent=%-14s rule=%-6s %s",
+			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType,
+			oneLine(orDash(m.agentTypeFor(e)), 8), agent,
+			m.ruleMarker(e.Signature), oneLine(e.Rationale, rWidth))
 		if e.Suggestion != "" {
 			line += "  → " + oneLine(e.Suggestion, sWidth)
 		}
@@ -1147,12 +1200,12 @@ func (m Model) renderEscalations(b *strings.Builder) {
 }
 
 func (m Model) renderAudit(b *strings.Builder) {
-	// Prefix up to the action column is ~53 fixed cells.
-	actWidth, _ := m.budget(53, false)
+	// Prefix up to the action column is ~53 fixed cells + "rule=%-6s " (12).
+	actWidth, _ := m.budget(65, false)
 	for i, r := range m.data.audit {
-		line := fmt.Sprintf("#%-5d %-14s %-9s %-10s conf=%.2f %s",
+		line := fmt.Sprintf("#%-5d %-14s %-9s %-10s conf=%.2f rule=%-6s %s",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
-			r.Confidence, oneLine(r.Action, actWidth))
+			r.Confidence, m.ruleMarker(r.Signature), oneLine(r.Action, actWidth))
 		if i == m.cursor {
 			line = selectedStyle.Render(line)
 		}
