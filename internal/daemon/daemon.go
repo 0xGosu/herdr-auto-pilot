@@ -131,6 +131,16 @@ func (d *Daemon) reload() error {
 	return nil
 }
 
+// readVisible returns the pane's current on-screen content when the adapter
+// supports it (needed to see a standing menu, which the consuming "recent"
+// read can miss), falling back to ReadPane otherwise.
+func (d *Daemon) readVisible(ctx context.Context, paneID string, lines int) (string, error) {
+	if vr, ok := d.opt.Herdr.(ports.VisiblePaneReader); ok {
+		return vr.ReadPaneVisible(ctx, paneID, lines)
+	}
+	return d.opt.Herdr.ReadPane(ctx, paneID, lines)
+}
+
 // llmPort returns the current LLM port (rebuilt on reload when a factory is
 // configured).
 func (d *Daemon) llmPort() ports.LLMPort {
@@ -410,7 +420,12 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		return
 	}
 
-	if err := d.opt.Herdr.Send(ctx, s.PaneID, dec.Input); err != nil {
+	// Numbered menus (Claude approvals/choices) accept the option's digit,
+	// not the label text; deliver the keystroke the menu expects. Free-text
+	// situations deliver the literal reply. s.Content is the classification
+	// snapshot, which carries the menu for the situation being acted on.
+	outbound := domain.DeliverKeystroke(s.Type, s.Content, dec.Input)
+	if err := d.opt.Herdr.Send(ctx, s.PaneID, outbound); err != nil {
 		slog.Error("agent send failed; escalating", "pane", s.PaneID, "error", err)
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed",
@@ -714,9 +729,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 
 	// Staleness re-check: the consultation took up to the LLM timeout, so
 	// re-read the pane and verify the same situation is still showing —
-	// never inject a stale answer into a pane that moved on.
+	// never inject a stale answer into a pane that moved on. Use the visible
+	// screen: the consuming "recent" delta was already drained by the
+	// classification read, so it would read empty and falsely reject.
 	_, _, cls := d.snapshot()
-	pane, err := d.opt.Herdr.ReadPane(ctx, s.PaneID, d.opt.PaneReadLines)
+	pane, err := d.readVisible(ctx, s.PaneID, d.opt.PaneReadLines)
 	if err != nil {
 		reject(domain.ReasonHerdrUnreachable, "pane re-read failed before LLM promotion: "+err.Error())
 		return
@@ -741,7 +758,10 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			"An LLM-derived action was blocked because its audit record could not be written.")
 		return
 	}
-	if err := d.opt.Herdr.Send(ctx, s.PaneID, llmDec.Action); err != nil {
+	// Same numbered-menu mapping as the learned act path: deliver the digit
+	// for approval/choice, the literal reply otherwise. `pane` is the visible
+	// re-read verified current just above.
+	if err := d.opt.Herdr.Send(ctx, s.PaneID, domain.DeliverKeystroke(s.Type, pane, llmDec.Action)); err != nil {
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
 		return

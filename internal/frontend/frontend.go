@@ -21,6 +21,20 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
+// menuReadLines is how much of a pane the confirm/resolve path re-reads to
+// recover the live numbered menu before delivering the operator's reply.
+const menuReadLines = 40
+
+// readVisiblePane returns the pane's current on-screen content, preferring a
+// visible-source read (which reflects a standing menu) and falling back to
+// the plain recent read when the adapter cannot do visible reads.
+func (a *App) readVisiblePane(ctx context.Context, paneID string, lines int) (string, error) {
+	if vr, ok := a.Herdr.(ports.VisiblePaneReader); ok {
+		return vr.ReadPaneVisible(ctx, paneID, lines)
+	}
+	return a.Herdr.ReadPane(ctx, paneID, lines)
+}
+
 // App bundles the shared state both front-ends operate on.
 type App struct {
 	Store       ports.FrontendStore
@@ -208,7 +222,16 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		return err
 	}
 	if send && a.Herdr != nil && audit.AgentID != "" {
-		if err := a.Herdr.Send(ctx, audit.AgentID, materializeForSend(action, audit)); err != nil {
+		outbound := materializeForSend(action, audit)
+		// A numbered menu (Claude approvals/choices) only accepts the
+		// option's digit, not the label. Re-read the pane's CURRENT screen
+		// so a menu still up gets the right keystroke; on read failure, a
+		// free-text prompt, or a non-menu situation, deliver the literal
+		// reply unchanged.
+		if pane, rerr := a.readVisiblePane(ctx, audit.AgentID, menuReadLines); rerr == nil {
+			outbound = domain.DeliverKeystroke(audit.SituationType, pane, outbound)
+		}
+		if err := a.Herdr.Send(ctx, audit.AgentID, outbound); err != nil {
 			return fmt.Errorf("correction recorded, but sending to the agent failed: %w", err)
 		}
 	}

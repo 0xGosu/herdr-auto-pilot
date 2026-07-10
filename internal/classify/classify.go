@@ -147,7 +147,6 @@ func matchRule(r compiledRule, pane string) bool {
 	return false
 }
 
-var optionLineRE = regexp.MustCompile(`(?m)^\s*(?:[❯>]\s*)?(?:\d+[.)]|\[\d+\])\s+(\S.*)$`)
 var permissionVerbRE = regexp.MustCompile(`(?i)do you want to ((?:proceed|continue|allow|run|make|create|apply)[^?\n]*)`)
 var allowVerbRE = regexp.MustCompile(`(?i)(?:allow|permit|approve|authorize) ((?:this|the) [^?\n]*)`)
 var errorLineRE = regexp.MustCompile(`(?im)^\s*(?:error|fatal|panic|exception)[:\s]+(.{0,160})`)
@@ -157,12 +156,7 @@ var errorLineRE = regexp.MustCompile(`(?im)^\s*(?:error|fatal|panic|exception)[:
 func enrich(s *domain.Situation) {
 	switch s.Type {
 	case domain.SituationChoice:
-		for _, m := range optionLineRE.FindAllStringSubmatch(s.Content, -1) {
-			opt := strings.TrimSpace(m[1])
-			if opt != "" {
-				s.Options = append(s.Options, opt)
-			}
-		}
+		s.Options = append(s.Options, domain.OptionLabels(s.Content)...)
 	case domain.SituationApproval:
 		if m := permissionVerbRE.FindStringSubmatch(s.Content); m != nil {
 			s.PermissionVerb = domain.MaskVolatile(strings.TrimSpace(m[1]))
@@ -171,11 +165,7 @@ func enrich(s *domain.Situation) {
 		}
 		// Approval prompts often carry numbered options (e.g. "1. Yes");
 		// extract them so suggestions and sends can use the exact reply.
-		for _, m := range optionLineRE.FindAllStringSubmatch(s.Content, -1) {
-			if opt := strings.TrimSpace(m[1]); opt != "" {
-				s.Options = append(s.Options, opt)
-			}
-		}
+		s.Options = append(s.Options, domain.OptionLabels(s.Content)...)
 	case domain.SituationError:
 		if m := errorLineRE.FindStringSubmatch(s.Content); m != nil {
 			s.ErrorSummary = domain.MaskVolatile(strings.TrimSpace(m[1]))

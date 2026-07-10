@@ -1,0 +1,36 @@
+# Configuration for the LOCAL integration suite (test/integration).
+# Not used in production or CI — it drives a real herdr + a real claude CLI.
+#
+# The suite points HERDR_PLUGIN_CONFIG_DIR at this directory so `hap` loads
+# this file. Thresholds are the documented defaults; the LLM command is the
+# Claude Code recipe from the README so the consult smoke test exercises the
+# real MCP round-trip.
+
+[thresholds]
+  idle = 0.75
+  approval = 0.80
+  choice = 0.80
+  error = 0.85
+  inferred_task_bar = 0.90
+
+[learning]
+  graduation_n = 5
+
+[limits]
+  max_consecutive_auto_prompts = 5
+  max_auto_prompts_per_minute = 10
+  max_error_retries = 2
+
+[llm]
+command = [
+  "claude", "-p",
+  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
+  "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
+  "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
+]
+timeout_seconds = 120
+auto_act = false
+pane_excerpt_chars = 5000
+
+[tui]
+  max_content_width = 0

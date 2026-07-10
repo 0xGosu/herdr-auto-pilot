@@ -469,3 +469,48 @@ func TestConfigTabKeepsEditing(t *testing.T) {
 		t.Error("Config tab name missing from the tab bar")
 	}
 }
+
+func TestEscalationsRowWidensWithTerminal(t *testing.T) {
+	// The escalation row must use the terminal width, not the old fixed
+	// 60-char rationale cap, so a wide monitor shows more text.
+	m := testModel(t) // width 100
+	m.tab = tabEscalations
+	narrow := m.View()
+
+	wide, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 30})
+	wm := wide.(Model)
+	wm.tab = tabEscalations
+	wideView := wm.View()
+
+	widestLine := func(v string) int {
+		max := 0
+		for _, ln := range strings.Split(v, "\n") {
+			if n := len([]rune(ln)); n > max {
+				max = n
+			}
+		}
+		return max
+	}
+	if widestLine(wideView) <= widestLine(narrow) {
+		t.Errorf("wide terminal (%d) should render longer rows than narrow (%d)",
+			widestLine(wideView), widestLine(narrow))
+	}
+}
+
+func TestMaxContentWidthCapsRows(t *testing.T) {
+	// [tui] max_content_width caps the row width even on a wide terminal.
+	m := testModel(t)
+	upd, _ := m.Update(tea.WindowSizeMsg{Width: 300, Height: 30})
+	m = upd.(Model)
+	m.data.cfg.TUI.MaxContentWidth = 90
+	m.tab = tabEscalations
+	v := m.View()
+	for _, ln := range strings.Split(v, "\n") {
+		if !strings.HasPrefix(ln, "#") {
+			continue // data rows only, not the static help/header lines
+		}
+		if n := len([]rune(ln)); n > 100 { // 90 cap + small prefix slack
+			t.Errorf("row exceeds the configured cap: %d cells: %q", n, ln)
+		}
+	}
+}
