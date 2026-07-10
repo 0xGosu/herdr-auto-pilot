@@ -201,7 +201,7 @@ func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggest
 		if in.DeclaredTask != nil {
 			return ActionNextDeclaredTask, "send next declared task: " + in.DeclaredTask.Prompt(), ReasonNone
 		}
-		inferred := InferNextTask(in.Situation.Content)
+		inferred := InferNextTask(in.Situation.AgentType, in.Situation.Content)
 		if inferred.Structured {
 			// Pane-history inference is held to the higher bar.
 			if conf.Score <= in.Thresholds.InferredTaskBar && in.State != nil && in.State.Mode == ModeAutonomous {
@@ -249,7 +249,7 @@ func materialize(in DecideInput, action string) (input, optionID string, ok bool
 		}
 		return in.DeclaredTask.Prompt(), "", true
 	case ActionNextInferredTask:
-		inferred := InferNextTask(in.Situation.Content)
+		inferred := InferNextTask(in.Situation.AgentType, in.Situation.Content)
 		if !inferred.Structured {
 			return "", "", false
 		}
@@ -278,7 +278,7 @@ func optionInSet(option string, options []string) bool {
 func rationaleFor(r EscalateReason) string {
 	switch r {
 	case ReasonNoTaskSource:
-		return "no declared task source and no qualifying structured next-task signal in pane history"
+		return "no declared task source and no native todo signal in pane history (inference runs only for supported agent types)"
 	case ReasonNoHistory:
 		return "no learned history for this signature"
 	case ReasonUnfamiliarOptions:

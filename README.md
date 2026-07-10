@@ -145,9 +145,12 @@ max_auto_prompts_per_minute = 10   # per agent
 max_error_retries = 2              # per error signature
 
 # Point agents/workspaces at a task list so idle agents get the next
-# unchecked item. Without a declared source, the plugin only infers a next
-# task from an explicit checklist the agent itself printed — never free-form
-# prose — and holds it to the higher inferred_task_bar.
+# unchecked item. Without a declared source, the plugin falls back to
+# inferring the next task from the agent's own native todo rendering —
+# never free-form prose — held to the higher inferred_task_bar. Inference
+# is agent-type-specific: currently only `claude` is supported (Claude
+# Code's ✔/■/□ todo widget; the in-progress item wins, else the first
+# pending one). Other agent types skip inference entirely and escalate.
 #
 # The prompt sent to the agent is rendered from a template. The default is:
 #   "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."

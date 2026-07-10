@@ -219,8 +219,23 @@ func TestIdleInferredTaskRequiresStructuredSignal(t *testing.T) {
 	}
 }
 
+func TestIdleInferredTaskUnsupportedAgentTypeSkipsTier2(t *testing.T) {
+	// Inference is per-agent-type: an agent type without an extractor must
+	// escalate even when its pane shows a perfect todo widget.
+	in := autonomous(baseInput(SituationIdle),
+		ActionNextInferredTask, ActionNextInferredTask, ActionNextInferredTask,
+		ActionNextInferredTask, ActionNextInferredTask, ActionNextInferredTask,
+		ActionNextInferredTask, ActionNextInferredTask)
+	in.Situation.AgentType = "codex"
+	in.Situation.Content = "  ⎿  ✔ write parser\n     ■ add validation for config fields\n     □ wire logging"
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonNoTaskSource {
+		t.Fatalf("unsupported agent type must skip tier-2 inference and escalate, got %+v", d)
+	}
+}
+
 func TestIdleInferredTaskHigherBar(t *testing.T) {
-	content := "TODO:\n- [x] write parser\n- [ ] add validation for config fields\n- [ ] wire logging"
+	content := "  ⎿  ✔ write parser\n     ■ add validation for config fields\n     □ wire logging"
 	// History consistent enough to clear the idle threshold (0.75) but the
 	// test uses a mixed history that stays below the inferred bar (0.9).
 	in := autonomous(baseInput(SituationIdle),
