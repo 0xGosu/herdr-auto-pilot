@@ -37,6 +37,15 @@ type InspectorPort interface {
 	PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, error)
 }
 
+// VisiblePaneReader is implemented by Herdr adapters that can read the pane's
+// current on-screen content (as opposed to ReadPane's consuming "recent"
+// delta). Used to recover a standing numbered menu when delivering an
+// operator's confirmed reply. Optional: callers type-assert and fall back to
+// ReadPane when absent.
+type VisiblePaneReader interface {
+	ReadPaneVisible(ctx context.Context, paneID string, lines int) (string, error)
+}
+
 // EventPort is the inbound Herdr event subscription (raw socket).
 type EventPort interface {
 	// Subscribe streams agent-status transitions until ctx is done.

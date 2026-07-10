@@ -289,3 +289,20 @@ func TestPaneExcerptCharsDefaultsAndOverride(t *testing.T) {
 		t.Errorf("zero should restore the default, got %d", cfg.LLM.PaneExcerptChars)
 	}
 }
+
+func TestTUIMaxContentWidthParsed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte("[tui]\nmax_content_width = 140\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TUI.MaxContentWidth != 140 {
+		t.Errorf("max_content_width = %d, want 140", cfg.TUI.MaxContentWidth)
+	}
+	// Omitted → 0 (meaning full terminal width).
+	os.WriteFile(path, []byte("[learning]\ngraduation_n = 5\n"), 0o600)
+	if cfg, _ = Load(path); cfg.TUI.MaxContentWidth != 0 {
+		t.Errorf("omitted max_content_width should default to 0, got %d", cfg.TUI.MaxContentWidth)
+	}
+}

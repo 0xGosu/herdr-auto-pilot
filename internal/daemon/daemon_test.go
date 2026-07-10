@@ -347,6 +347,47 @@ func TestPipelineAutoApprovesConfidentSignature(t *testing.T) {
 	}
 }
 
+func TestLLMPromotionDeliversMenuDigitForLabel(t *testing.T) {
+	// The LLM auto-act promotion path must also map an option LABEL to the
+	// menu digit (Claude's numbered menu ignores the label).
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(approvalPane)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "Yes", Rationale: "operator always approves", Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "Yes",
+			Rationale: "operator always approves", Status: "pending"}, nil
+	}
+
+	// A brand-new signature with an LLM configured takes the consult path.
+	h.push("agent-llm-lbl", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "1" {
+		t.Errorf("promoted LLM label \"Yes\" delivered as %q, want digit \"1\"", got)
+	}
+}
+
+func TestAutoActDeliversMenuDigitForLabelAction(t *testing.T) {
+	// When the learned action is the option LABEL ("Yes"), the auto-act
+	// path must deliver the menu digit "1" (Claude's numbered menu ignores
+	// the label text) — the daemon-side half of the send-content fix.
+	h := newHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	h.seedAutonomous(approvalPane, domain.SituationApproval, "Yes")
+
+	h.push("agent-lbl", "blocked")
+
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "1" {
+		t.Errorf("sent %q, want the menu digit \"1\" for label \"Yes\"", got)
+	}
+}
+
 func TestPipelineShadowModeEscalatesWithSuggestion(t *testing.T) {
 	h := newHarness(t, "")
 	h.herdr.setPane(approvalPane)

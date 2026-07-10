@@ -98,6 +98,14 @@ type ClassifierRule struct {
 	Keywords  []string `toml:"keywords"`
 }
 
+// TUI configures the terminal UI's presentation (DR-003).
+type TUI struct {
+	// MaxContentWidth caps the character width of variable-length columns
+	// (rationale, suggestion, action) in the list views. 0 (the default)
+	// means use the full terminal width, so rows fill a wide monitor.
+	MaxContentWidth int `toml:"max_content_width"`
+}
+
 // Config is the full operator configuration.
 type Config struct {
 	Thresholds  Thresholds       `toml:"thresholds"`
@@ -105,6 +113,7 @@ type Config struct {
 	Safety      Safety           `toml:"safety"`
 	Limits      Limits           `toml:"limits"`
 	LLM         LLM              `toml:"llm"`
+	TUI         TUI              `toml:"tui"`
 	TaskSources []TaskSource     `toml:"task_sources"`
 	Classifier  []ClassifierRule `toml:"classifier"`
 	// Paused persists nothing; pause state lives in the kill_events table.

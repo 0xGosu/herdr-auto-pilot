@@ -571,6 +571,48 @@ func (m Model) wrapWidth() int {
 	return max(40, m.width-4)
 }
 
+// fallbackContentWidth is used before the first WindowSizeMsg arrives: 1.5×
+// the legacy fixed caps so even a pre-resize frame shows more than before.
+const fallbackContentWidth = 120
+
+// contentWidth is the usable width for list rows: the full terminal width by
+// default, optionally capped by [tui] max_content_width, floored so a narrow
+// terminal stays readable.
+func (m Model) contentWidth() int {
+	w := m.width
+	if w <= 0 {
+		w = fallbackContentWidth
+	}
+	if maxW := m.data.cfg.TUI.MaxContentWidth; maxW > 0 && maxW < w {
+		w = maxW
+	}
+	return max(40, w)
+}
+
+// budgetSeparator is the width of the "  → " glyph the escalations row
+// inserts between the rationale and the suggestion; budget() reserves it so a
+// full row never overflows contentWidth and wraps.
+const budgetSeparator = 4
+
+// budget splits the width remaining after a fixed-width row prefix between a
+// primary field (rationale/action) and an optional trailing field
+// (suggestion). primary is favored; trailing gets at most 40%.
+func (m Model) budget(prefixCells int, hasTrailing bool) (primary, trailing int) {
+	remaining := m.contentWidth() - prefixCells
+	if remaining < 20 {
+		remaining = 20
+	}
+	if !hasTrailing {
+		return remaining, 0
+	}
+	remaining -= budgetSeparator
+	trailing = remaining * 2 / 5
+	if trailing < 16 {
+		trailing = 16
+	}
+	return remaining - trailing, trailing
+}
+
 // detailField appends a labelled, wrapped block; empty values are skipped.
 func detailField(lines []string, width int, label, value string) []string {
 	if strings.TrimSpace(value) == "" {
@@ -1003,11 +1045,13 @@ func (m Model) renderSignatures(b *strings.Builder) {
 		return
 	}
 	gradN := m.data.cfg.Learning.GraduationN
+	// Prefix up to the action column is ~66 fixed cells.
+	actWidth, _ := m.budget(66, false)
 	for i, r := range sigs {
 		line := fmt.Sprintf("%-18s %-9s %-10s %-11s %d/%d conf=%.2f  %s",
 			shortSig(r.Signature), r.SituationType, orDash(r.AgentType), r.Mode,
 			r.ConsecutiveConfirmations, gradN, r.CachedConfidence,
-			oneLine(r.TopAction, 30))
+			oneLine(r.TopAction, actWidth))
 		switch {
 		case i == m.cursor:
 			line = selectedStyle.Render(line)
@@ -1056,15 +1100,18 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		fmt.Fprintln(b, "no pending escalations — the herd is unblocked 🎉")
 		return
 	}
+	// Prefix: "#%-5d %-8s %-10s agent=%-14s " → 6+1+8+1+10+1+6+14+1 = 48 cells.
+	const escPrefix = 48
 	for i, e := range esc {
 		agent := e.AgentID
 		if n := m.data.status.AgentName(e.AgentID); n != "" {
 			agent = n
 		}
+		rWidth, sWidth := m.budget(escPrefix, e.Suggestion != "")
 		line := fmt.Sprintf("#%-5d %-8s %-10s agent=%-14s %s",
-			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, agent, oneLine(e.Rationale, 60))
+			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, agent, oneLine(e.Rationale, rWidth))
 		if e.Suggestion != "" {
-			line += "  → " + oneLine(e.Suggestion, 40)
+			line += "  → " + oneLine(e.Suggestion, sWidth)
 		}
 		if i == m.cursor {
 			line = selectedStyle.Render(line)
@@ -1074,10 +1121,12 @@ func (m Model) renderEscalations(b *strings.Builder) {
 }
 
 func (m Model) renderAudit(b *strings.Builder) {
+	// Prefix up to the action column is ~53 fixed cells.
+	actWidth, _ := m.budget(53, false)
 	for i, r := range m.data.audit {
 		line := fmt.Sprintf("#%-5d %-14s %-9s %-10s conf=%.2f %s",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
-			r.Confidence, oneLine(r.Action, 50))
+			r.Confidence, oneLine(r.Action, actWidth))
 		if i == m.cursor {
 			line = selectedStyle.Render(line)
 		}

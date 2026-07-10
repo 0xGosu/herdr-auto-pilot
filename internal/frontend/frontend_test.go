@@ -3,6 +3,7 @@ package frontend_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -95,9 +96,13 @@ func TestConfirmUsesSuggestion(t *testing.T) {
 }
 
 // fakeHerdr captures Send calls for confirm/resolve delivery assertions.
+var errAny = errors.New("induced failure")
+
 type fakeHerdr struct {
-	panes  []string
-	inputs []string
+	panes   []string
+	inputs  []string
+	pane    string // returned by ReadPane (live menu content)
+	readErr error
 }
 
 func (f *fakeHerdr) Send(_ context.Context, paneID, input string) error {
@@ -106,7 +111,9 @@ func (f *fakeHerdr) Send(_ context.Context, paneID, input string) error {
 	return nil
 }
 
-func (f *fakeHerdr) ReadPane(context.Context, string, int) (string, error) { return "", nil }
+func (f *fakeHerdr) ReadPane(context.Context, string, int) (string, error) {
+	return f.pane, f.readErr
+}
 
 func (f *fakeHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) { return nil, nil }
 
@@ -137,6 +144,70 @@ func TestConfirmSendsRenderedDeclaredTaskPrompt(t *testing.T) {
 	}
 	if len(fake.panes) != 1 || fake.panes[0] != "w1:p1" {
 		t.Errorf("delivered to %v, want the audit's agent pane", fake.panes)
+	}
+}
+
+func TestConfirmDeliversMenuDigitNotLabel(t *testing.T) {
+	// Regression: an LLM/learned approval carries the option LABEL ("Yes"),
+	// but Claude's numbered menu only accepts the digit. Confirm must
+	// re-read the live pane and deliver "1", not "Yes".
+	app, st := testApp(t)
+	fake := &fakeHerdr{pane: "Do you want to proceed?\n❯ 1. Yes\n  2. No, and tell the agent\n"}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: "LLM suggested: Yes", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 1 || fake.inputs[0] != "1" {
+		t.Errorf("delivered %v, want the menu digit [\"1\"]", fake.inputs)
+	}
+}
+
+func TestConfirmFreeTextPromptDeliveredLiterally(t *testing.T) {
+	// A pane with no numbered menu (free-text reply) must receive the
+	// literal action, not be mangled by menu mapping.
+	app, st := testApp(t)
+	fake := &fakeHerdr{pane: "Enter a commit message:\n> "}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: "respond: fix: the bug", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 1 || fake.inputs[0] != "fix: the bug" {
+		t.Errorf("delivered %v, want the literal reply", fake.inputs)
+	}
+}
+
+func TestConfirmMenuUnreadableFallsBackToLabel(t *testing.T) {
+	// If the pane can't be re-read, the confirm still delivers (the literal
+	// label) rather than dropping the send.
+	app, st := testApp(t)
+	fake := &fakeHerdr{readErr: errAny}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: "LLM suggested: Yes", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 1 || fake.inputs[0] != "Yes" {
+		t.Errorf("delivered %v, want the literal label fallback", fake.inputs)
 	}
 }
 

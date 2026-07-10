@@ -15,7 +15,10 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
-var _ ports.InspectorPort = (*CLI)(nil)
+var (
+	_ ports.InspectorPort     = (*CLI)(nil)
+	_ ports.VisiblePaneReader = (*CLI)(nil)
+)
 
 // CLI issues one-shot Herdr control actions through the herdr binary
 // (HERDR_BIN_PATH), which stays portable across Unix sockets and Windows
@@ -71,6 +74,18 @@ func (c *CLI) ReadPane(ctx context.Context, paneID string, lines int) (string, e
 	}
 	return c.run(ctx, "pane", "read", paneID,
 		"--source", "recent", "--lines", strconv.Itoa(lines), "--format", "text")
+}
+
+// ReadPaneVisible returns the pane's CURRENT screen (`pane read --source
+// visible`). Unlike --source recent (a consuming delta that a prior read can
+// empty), visible always reflects what is on screen now — needed to recover
+// a standing numbered menu at confirm time (ports.VisiblePaneReader).
+func (c *CLI) ReadPaneVisible(ctx context.Context, paneID string, lines int) (string, error) {
+	if lines <= 0 {
+		lines = 80
+	}
+	return c.run(ctx, "pane", "read", paneID,
+		"--source", "visible", "--lines", strconv.Itoa(lines), "--format", "text")
 }
 
 // Notify surfaces an operator notification (`notification show`).
