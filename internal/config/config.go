@@ -70,6 +70,10 @@ type LLM struct {
 	// the default — LLM suggestions are surfaced as escalation suggestions
 	// for the operator to confirm.
 	AutoAct bool `toml:"auto_act"`
+	// PaneExcerptChars caps the pane excerpt (last N characters) included
+	// in the consult context handed to the LLM. Zero or omitted restores
+	// the 5000-char default.
+	PaneExcerptChars int `toml:"pane_excerpt_chars"`
 }
 
 // TaskSource points an agent or workspace at a declared next-task list (FR-011).
@@ -123,7 +127,7 @@ func Default() Config {
 			MaxAutoPromptsPerMinute:   10,
 			MaxErrorRetries:           2,
 		},
-		LLM: LLM{TimeoutSeconds: 60},
+		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000},
 	}
 }
 
@@ -257,6 +261,9 @@ func (c *Config) fillZeroes() {
 	}
 	if c.LLM.TimeoutSeconds <= 0 {
 		c.LLM.TimeoutSeconds = d.LLM.TimeoutSeconds
+	}
+	if c.LLM.PaneExcerptChars <= 0 {
+		c.LLM.PaneExcerptChars = d.LLM.PaneExcerptChars
 	}
 }
 

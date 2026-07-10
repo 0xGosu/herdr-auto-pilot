@@ -102,7 +102,7 @@ func toolDefinitions() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        "get_context",
-			"description": "Get the situation context for the pending Herd Auto Prompter decision request: situation type, agent type, options, permission verb, and a pane excerpt.",
+			"description": "Get the situation context for the pending Herd Auto Prompter decision request: situation type, agent type, options, permission verb, error summary, a pane excerpt (last N chars of the pane), the agent's herdr location (workspace_id, tab_id, pane_id, agent_id — usable with read-only herdr CLI queries such as `herdr pane get <pane_id>` or `herdr pane read <pane_id>`), and the pane's working directory (cwd/foreground_cwd; advisory — a deleted dir carries a ' (deleted)' suffix and either may be empty).",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

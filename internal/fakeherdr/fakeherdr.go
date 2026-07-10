@@ -258,6 +258,9 @@ case "$1 $2" in
   "pane read")
     cat %q 2>/dev/null
     ;;
+  "pane get")
+    cat %q.paneinfo 2>/dev/null
+    ;;
   "agent list")
     cat %q.agents 2>/dev/null
     ;;
@@ -269,7 +272,7 @@ case "$1 $2" in
     ;;
 esac
 exit 0
-`, f.LogPath, f.FailFlag, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
+`, f.LogPath, f.FailFlag, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
 	if err := os.WriteFile(f.BinPath, []byte(script), 0o700); err != nil {
 		return nil, err
 	}
@@ -279,6 +282,11 @@ exit 0
 // SetPaneContent sets what `pane read` returns.
 func (f *FakeCLI) SetPaneContent(content string) error {
 	return os.WriteFile(f.PaneFile, []byte(content), 0o600)
+}
+
+// SetPaneInfo sets the raw JSON `pane get` returns.
+func (f *FakeCLI) SetPaneInfo(content string) error {
+	return os.WriteFile(f.PaneFile+".paneinfo", []byte(content), 0o600)
 }
 
 // SetAgentList sets the raw JSON `agent list` returns.

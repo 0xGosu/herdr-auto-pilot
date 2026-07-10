@@ -301,3 +301,46 @@ func TestListWorkspacesTabsAndAgentTabIDs(t *testing.T) {
 		t.Errorf("tab list parsing: %+v", tabs)
 	}
 }
+
+func TestPaneInfo(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	ctx := context.Background()
+
+	// Full envelope as printed by real herdr 0.7.
+	fake.SetPaneInfo(`{"id":"cli:pane:get","result":{"pane":{` +
+		`"agent":"claude","agent_status":"blocked","cwd":"/home/op/project",` +
+		`"foreground_cwd":"/home/op/project/sub","focused":false,"pane_id":"w1:p1",` +
+		`"revision":0,"tab_id":"w1:t1","workspace_id":"w1"},"type":"pane_info"}}`)
+	info, err := cli.PaneInfo(ctx, "w1:p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.PaneID != "w1:p1" || info.TabID != "w1:t1" || info.WorkspaceID != "w1" {
+		t.Errorf("pane identity parsing: %+v", info)
+	}
+	if info.Cwd != "/home/op/project" || info.ForegroundCwd != "/home/op/project/sub" {
+		t.Errorf("cwd parsing: %+v", info)
+	}
+
+	// Deleted cwd renders with a literal suffix and no foreground_cwd;
+	// both pass through verbatim / zero-valued.
+	fake.SetPaneInfo(`{"id":"cli:pane:get","result":{"pane":{` +
+		`"cwd":"/gone/dir (deleted)","pane_id":"w1:p2","tab_id":"w1:t1",` +
+		`"workspace_id":"w1"},"type":"pane_info"}}`)
+	if info, err = cli.PaneInfo(ctx, "w1:p2"); err != nil {
+		t.Fatal(err)
+	}
+	if info.Cwd != "/gone/dir (deleted)" || info.ForegroundCwd != "" {
+		t.Errorf("deleted-cwd handling: %+v", info)
+	}
+
+	// CLI failure surfaces an error.
+	fake.SetFailing(true)
+	if _, err := cli.PaneInfo(ctx, "w1:p1"); err == nil {
+		t.Error("failing CLI must surface an error")
+	}
+}

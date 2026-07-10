@@ -42,6 +42,12 @@ func run() error {
 	if err := cli.SetPaneContent("Bash command: ls docs/\nDo you want to proceed? (y/n)"); err != nil {
 		return err
 	}
+	if err := cli.SetPaneInfo(`{"id":"cli:pane:get","result":{"pane":{` +
+		`"agent":"claude","agent_status":"blocked","cwd":"/home/op/project",` +
+		`"foreground_cwd":"/home/op/project","pane_id":"pane-1","tab_id":"ws-1:t1",` +
+		`"workspace_id":"ws-1"},"type":"pane_info"}}`); err != nil {
+		return err
+	}
 
 	// Reproduce the reported environment: the daemon's cwd is deleted
 	// after launch (herdr started it from a since-removed workspace).

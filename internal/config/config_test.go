@@ -260,3 +260,32 @@ func TestResolvePathsHonorsXDGBases(t *testing.T) {
 		t.Errorf("state should pair under XDG_STATE_HOME, got %s", p.StateDir)
 	}
 }
+
+func TestPaneExcerptCharsDefaultsAndOverride(t *testing.T) {
+	// Omitted → 5000-char default; explicit value honored; zero restored.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte("[llm]\ncommand = [\"claude\"]\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.PaneExcerptChars != 5000 {
+		t.Errorf("default pane_excerpt_chars = %d, want 5000", cfg.LLM.PaneExcerptChars)
+	}
+
+	os.WriteFile(path, []byte("[llm]\npane_excerpt_chars = 800\n"), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.PaneExcerptChars != 800 {
+		t.Errorf("explicit pane_excerpt_chars lost: %d", cfg.LLM.PaneExcerptChars)
+	}
+
+	os.WriteFile(path, []byte("[llm]\npane_excerpt_chars = 0\n"), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.PaneExcerptChars != 5000 {
+		t.Errorf("zero should restore the default, got %d", cfg.LLM.PaneExcerptChars)
+	}
+}

@@ -43,12 +43,22 @@ type TabInfo struct {
 	WorkspaceID string
 }
 
+// PaneInfo is per-pane metadata read via `herdr pane get` (herdr 0.7).
+type PaneInfo struct {
+	PaneID        string
+	TabID         string
+	WorkspaceID   string
+	Cwd           string // pane working directory; herdr renders a deleted dir with a " (deleted)" suffix
+	ForegroundCwd string // cwd of the foreground process; absent in some herdr responses
+}
+
 // Situation is a classified, attention-requiring state of one agent pane.
 type Situation struct {
 	Type           SituationType
 	AgentID        string
 	AgentType      string
 	PaneID         string
+	TabID          string
 	WorkspaceID    string
 	Content        string   // pane snapshot used for classification
 	Options        []string // normalized option set (choice situations)
