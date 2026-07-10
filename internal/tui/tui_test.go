@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -513,4 +514,146 @@ func TestMaxContentWidthCapsRows(t *testing.T) {
 			t.Errorf("row exceeds the configured cap: %d cells: %q", n, ln)
 		}
 	}
+}
+
+// captureHerdr records inputs delivered to the agent pane.
+type captureHerdr struct{ sent []string }
+
+func (c *captureHerdr) Send(_ context.Context, _, input string) error {
+	c.sent = append(c.sent, input)
+	return nil
+}
+func (c *captureHerdr) ReadPane(context.Context, string, int) (string, error)        { return "", nil }
+func (c *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) { return nil, nil }
+
+func TestEscalationDetailEnterConfirmsAndCloses(t *testing.T) {
+	// v opens the escalation detail; enter there must confirm+send and return
+	// to the list (detail closed), not merely close the overlay.
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	h := &captureHerdr{}
+	app := &frontend.App{Store: st, Herdr: h, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	ctx := context.Background()
+	st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationApproval, Trigger: "apply?",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: Yes",
+		CreatedAt: time.Now(),
+	})
+
+	m := New(ctx, app)
+	m.width, m.height = 100, 30
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabEscalations
+	m = press(t, m, "v")
+	if m.detail == nil {
+		t.Fatal("v on Escalations should open the detail view")
+	}
+
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if m.detail != nil {
+		t.Error("enter in the escalation detail should close it and return to the list")
+	}
+	if cmd == nil {
+		t.Fatal("enter should issue the confirm+send command")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok || res.err != nil {
+		t.Fatalf("confirm+send should succeed, got %+v (ok=%v)", res, ok)
+	}
+	if len(h.sent) != 1 || h.sent[0] != "Yes" {
+		t.Errorf("expected the suggestion delivered to the agent, got %v", h.sent)
+	}
+}
+
+func TestAuditDetailEnterOnlyCloses(t *testing.T) {
+	// The send-on-enter shortcut is Escalations-only; the Audit detail's
+	// enter must still just close the overlay (no send).
+	m := testModel(t)
+	m.tab = tabAudit
+	m = press(t, m, "v")
+	if m.detail == nil {
+		t.Fatal("v on Audit should open the detail view")
+	}
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if m.detail != nil {
+		t.Error("enter should close the audit detail")
+	}
+	if cmd != nil {
+		t.Error("audit detail enter must not trigger a send command")
+	}
+}
+
+func TestEscalationDetailEnterConfirmsSnapshotNotClampedCursor(t *testing.T) {
+	// Safety: if a background refresh shrinks the escalations list and clamps
+	// the cursor while the detail overlay is open, enter must confirm the
+	// record ON SCREEN (snapshotted at open), never whatever the cursor now
+	// points at.
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	h := &captureHerdr{}
+	app := &frontend.App{Store: st, Herdr: h, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	ctx := context.Background()
+	idA, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:pA", SituationType: domain.SituationApproval, Trigger: "a",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: Apple", CreatedAt: time.Now(),
+	})
+	idB, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:pB", SituationType: domain.SituationApproval, Trigger: "b",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: Banana", CreatedAt: time.Now().Add(time.Second),
+	})
+
+	m := New(ctx, app)
+	m.width, m.height = 100, 30
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabEscalations
+
+	// Point the cursor at escalation B and open its detail.
+	for i := range m.data.escalations {
+		if m.data.escalations[i].ID == idB {
+			m.cursor = i
+		}
+	}
+	m = press(t, m, "v")
+	if m.detail == nil || m.detail.confirmID != idB {
+		t.Fatalf("detail should snapshot escalation B (id %d), got confirmID=%d", idB, m.detail.confirmID)
+	}
+
+	// Background: B gets resolved elsewhere; a refresh shrinks the list and
+	// clamps the cursor onto A.
+	st.UpdateAuditStatus(ctx, idB, "resolved")
+	upd, _ = m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	if len(m.data.escalations) != 1 || m.data.escalations[0].ID != idA {
+		t.Fatalf("expected only escalation A pending after resolve, got %+v", m.data.escalations)
+	}
+
+	// Enter must confirm B (the displayed snapshot), not A (the clamped cursor).
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("enter should issue a confirm command")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok || res.err != nil {
+		t.Fatalf("confirm should succeed, got %+v", res)
+	}
+	if !strings.Contains(res.message, fmt.Sprintf("#%d", idB)) {
+		t.Errorf("should confirm the displayed escalation #%d, message was %q", idB, res.message)
+	}
+	if len(h.sent) != 1 || h.sent[0] != "Banana" {
+		t.Errorf("should deliver B's suggestion, got %v", h.sent)
+	}
+	_ = idA
 }

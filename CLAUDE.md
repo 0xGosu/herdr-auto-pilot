@@ -46,7 +46,13 @@ HAP_ITEST_CLAUDE=1 go test -tags integration ./test/integration/ -v
 - Current cases: `TestRealPaneInfo` (herdr `pane get` → cwd/ids),
   `TestRealConfirmDeliversMenuDigit` (confirming a label reply selects the
   numbered menu — the send-content regression), `TestRealClaudeConsult`
-  (headless claude smoke, gated by `HAP_ITEST_CLAUDE=1`).
+  (gated by `HAP_ITEST_CLAUDE=1`) drives a **real Claude Code session
+  (`--model haiku`)** to a real approval menu, confirms it through the
+  plugin, and asserts the menu digit reached claude (the command runs).
+- The claude case skips (never fails) if it can't elicit a prompt; it needs a
+  path OUTSIDE claude's auto-approved dirs (`/tmp`, `/workspaces`,
+  `~/.claude`) to force the permission menu — it touches a `$HOME` dotfile.
+  Override the model with `HAP_ITEST_CLAUDE_MODEL`.
 
 **Recommended: run the integration suite once after finishing any feature**,
 before opening the PR — the unit suite fakes herdr, so only this catches real

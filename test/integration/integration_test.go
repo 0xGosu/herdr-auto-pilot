@@ -15,6 +15,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/classify"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/herdr"
@@ -61,6 +63,15 @@ func runHerdr(t *testing.T, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// tryHerdr runs a best-effort herdr command with a bounded timeout, ignoring
+// the result — used for fire-and-forget keystrokes and teardown so a stuck
+// herdr can never wedge the test loop or cleanup.
+func tryHerdr(args ...string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = exec.CommandContext(ctx, herdrBin(), args...).Run()
+}
+
 // startMenuAgent spawns a scratch agent that presents a numbered menu
 // (bash `select`, exactly the shape Claude's approvals use) and returns its
 // pane id. The agent writes its picked option to markerPath.
@@ -90,7 +101,7 @@ func startMenuAgent(t *testing.T, markerPath string) string {
 	if pane == "" {
 		t.Fatalf("no pane id in agent start output: %s", out)
 	}
-	t.Cleanup(func() { _ = exec.Command(herdrBin(), "pane", "close", pane).Run() })
+	t.Cleanup(func() { tryHerdr("pane", "close", pane) })
 	return pane
 }
 
@@ -182,26 +193,176 @@ func TestRealConfirmDeliversMenuDigit(t *testing.T) {
 	t.Fatal("confirm did not drive the menu selection (send did not land)")
 }
 
-// TestRealClaudeConsult drives a real Claude Code consult end to end. It is
-// gated behind HAP_ITEST_CLAUDE=1 because it needs a working, authenticated
-// claude CLI and spends tokens.
+// claudeModel is the model alias the real-claude cases run with; haiku keeps
+// responses fast. Override with HAP_ITEST_CLAUDE_MODEL.
+func claudeModel() string {
+	if m := os.Getenv("HAP_ITEST_CLAUDE_MODEL"); m != "" {
+		return m
+	}
+	return "haiku"
+}
+
+// startClaudeAgent launches an interactive Claude Code session in a herdr
+// pane, with permission prompting on so a Bash tool call raises an approval
+// menu, and returns its pane id. It also clears the first-run "trust this
+// folder" prompt so the REPL is ready for input.
+func startClaudeAgent(t *testing.T, cli *herdr.CLI, cwd string) string {
+	t.Helper()
+	out := runHerdr(t, "agent", "start", "hapclaude", "--cwd", cwd, "--no-focus",
+		"--", "claude", "--model", claudeModel(), "--permission-mode", "default")
+	var resp struct {
+		Result struct {
+			Agent struct {
+				PaneID string `json:"pane_id"`
+			} `json:"agent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("parse claude agent start: %v (%s)", err, out)
+	}
+	pane := resp.Result.Agent.PaneID
+	if pane == "" {
+		t.Fatalf("no pane id from claude agent start: %s", out)
+	}
+	t.Cleanup(func() { tryHerdr("pane", "close", pane) })
+
+	// Claude asks to trust a new folder on first start; option 1 ("Yes, I
+	// trust") is pre-selected, so Enter clears it. Wait for the REPL prompt.
+	deadline := time.Now().Add(40 * time.Second)
+	for time.Now().Before(deadline) {
+		content, _ := cli.ReadPaneVisible(context.Background(), pane, 30)
+		if strings.Contains(content, "trust this folder") || strings.Contains(content, "I trust") {
+			tryHerdr("pane", "send-keys", pane, "enter")
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		// Ready REPL = the input caret plus the status bar's context-window
+		// percentage (e.g. "(0%)") — model-independent, unlike the model
+		// name, so a full-id HAP_ITEST_CLAUDE_MODEL still matches. Both can
+		// flash mid-boot before input is accepted, so settle first.
+		// (Screen shapes verified against Claude Code 2.1.206.)
+		if strings.Contains(content, "❯") && strings.Contains(content, "%)") {
+			time.Sleep(4 * time.Second)
+			return pane
+		}
+		time.Sleep(1 * time.Second)
+	}
+	t.Skip("claude REPL did not become ready within 40s (slow start or unauthenticated claude)")
+	return pane
+}
+
+// driveToApproval sends prompt to claude and waits for an approval menu,
+// re-sending once if the first attempt does not surface a prompt (a keystroke
+// lost to a still-initializing REPL is the common flake).
+func driveToApproval(t *testing.T, cli *herdr.CLI, pane, prompt string) (domain.Situation, bool) {
+	t.Helper()
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := cli.Send(context.Background(), pane, prompt); err != nil {
+			t.Fatalf("send prompt to claude: %v", err)
+		}
+		if sit, ok := waitForApproval(t, cli, pane, 45*time.Second); ok {
+			return sit, true
+		}
+	}
+	return domain.Situation{}, false
+}
+
+// waitForApproval polls the pane's visible screen until the classifier sees
+// an approval/choice with a numbered option set, and returns that situation.
+// It returns ok=false if no approval menu appears within the deadline (e.g.
+// claude auto-approved or never called the tool) so the caller can skip.
+func waitForApproval(t *testing.T, cli *herdr.CLI, pane string, within time.Duration) (domain.Situation, bool) {
+	t.Helper()
+	cls := classify.New(nil)
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		content, err := cli.ReadPaneVisible(context.Background(), pane, 60)
+		if err == nil {
+			s := cls.Classify("claude", "blocked", content)
+			if (s.Type == domain.SituationApproval || s.Type == domain.SituationChoice) &&
+				len(domain.ParseNumberedOptions(content)) > 0 {
+				return s, true
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return domain.Situation{}, false
+}
+
+// TestRealClaudeConsult drives a REAL Claude Code session end to end: it
+// makes claude raise an approval menu, then confirms it through the plugin's
+// send path and verifies the menu digit actually reached claude (the command
+// runs). Gated behind HAP_ITEST_CLAUDE=1 — it needs an authenticated claude
+// and spends tokens. Skips (never fails) if it cannot elicit a prompt.
 func TestRealClaudeConsult(t *testing.T) {
 	if os.Getenv("HAP_ITEST_CLAUDE") != "1" {
 		t.Skip("set HAP_ITEST_CLAUDE=1 to run the real Claude consult test")
 	}
+	requireHerdr(t)
 	if _, err := exec.LookPath("claude"); err != nil {
 		t.Skipf("claude CLI not found: %v", err)
 	}
-	// A trivial prompt that must call the two hap MCP tools would require a
-	// staged request + running MCP server; that full path is covered by the
-	// e2e_harness. Here we only assert the claude CLI is invokable headless.
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "claude", "-p", "reply with the single word OK").CombinedOutput()
+
+	cli := herdr.NewCLI()
+	work := t.TempDir()
+
+	// The marker must live OUTSIDE claude's auto-approved directories
+	// (/tmp, /workspaces, ~/.claude and the trusted cwd) so touching it
+	// actually raises a permission prompt. A dotfile in $HOME's root
+	// qualifies and is cross-platform.
+	home, err := os.UserHomeDir()
 	if err != nil {
-		t.Fatalf("claude -p failed: %v (%s)", err, string(out))
+		t.Skipf("cannot resolve home dir: %v", err)
 	}
-	if !strings.Contains(strings.ToUpper(string(out)), "OK") {
-		t.Errorf("claude did not reply as expected: %s", string(out))
+	// Per-PID name so concurrent runs don't collide, and a SIGKILL leaves at
+	// most one identifiable stray file.
+	marker := filepath.Join(home, fmt.Sprintf(".hap-claude-itest-marker-%d", os.Getpid()))
+	_ = os.Remove(marker)
+	t.Cleanup(func() { _ = os.Remove(marker) })
+
+	pane := startClaudeAgent(t, cli, work)
+
+	// Ask claude to run a Bash command it must request permission for; it
+	// renders a numbered "Do you want to proceed?" menu — exactly the shape
+	// the send fix targets.
+	prompt := "Use the Bash tool to run exactly this one command and nothing else: touch " + marker
+	sit, ok := driveToApproval(t, cli, pane, prompt)
+	if !ok {
+		t.Skip("claude did not raise an approval menu (auto-approved or slow); nothing to assert")
 	}
+	t.Logf("claude approval detected; options=%v", sit.Options)
+
+	// Confirm through the plugin, exactly as an operator pressing Enter in
+	// the Escalations tab would: the learned reply is the LABEL "Yes"; the
+	// send fix must deliver the menu digit so claude proceeds.
+	st, err := store.Open(filepath.Join(work, "hap.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	app := &frontend.App{Store: st, Herdr: cli, Author: "itest"}
+	ctx := context.Background()
+	id, err := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: pane, SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: "LLM suggested: Yes", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// If the digit reached claude, the approval clears and the Bash command
+	// runs, creating the marker file.
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(marker); err == nil {
+			return // claude proceeded — the digit landed
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	pane1, _ := cli.ReadPaneVisible(ctx, pane, 40)
+	t.Fatalf("claude did not proceed after confirm; the menu digit did not land.\npane:\n%s", pane1)
 }
