@@ -34,7 +34,7 @@ jobs:
             .cache/native
             third_party/llama-go/*.a
             third_party/llama-go/llama.cpp/**/*.o
-          key: native-lint-${{ runner.os }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
+          key: native-lint-${{ runner.os }}-${{ env.ImageOS }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
       - name: Build native dependencies
         run: bash scripts/setup-native.sh
       - name: gofmt
@@ -77,7 +77,7 @@ jobs:
             .cache/native
             third_party/llama-go/*.a
             third_party/llama-go/llama.cpp/**/*.o
-          key: native-test-${{ matrix.os }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
+          key: native-test-${{ matrix.os }}-${{ env.ImageOS }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
       - name: Build native dependencies
         run: bash scripts/setup-native.sh
       - name: Build
