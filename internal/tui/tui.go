@@ -87,6 +87,10 @@ type detailView struct {
 	lines  []string                 // wrapped to the pane width at open/resize
 	offset int                      // first visible line (↑/↓ scroll)
 	build  func(width int) []string // rebuilds lines from the snapshot on resize
+	// confirmID is the escalation's audit id captured at open time, so
+	// enter confirms the record ON SCREEN even if a background refresh
+	// clamped the list cursor. 0 = not a confirmable escalation detail.
+	confirmID int64
 }
 
 // ruleItem is one navigable row of the Config tab.
@@ -282,7 +286,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.tab = (m.tab + tabCount - 1) % tabCount
 			m.cursor = 0
 			m.message = ""
-		case "esc", "q", "v", "enter":
+		case "enter":
+			// On an escalation's detail view, Enter confirms+sends the
+			// record shown (by its snapshotted id, not the live cursor) and
+			// returns to the list — no need to close and re-press.
+			if id := m.detail.confirmID; id != 0 {
+				m.detail = nil
+				return m.confirmAuditID(id)
+			}
+			m.detail = nil
+		case "esc", "q", "v":
 			m.detail = nil
 		}
 		return m, nil
@@ -460,7 +473,12 @@ func (m Model) confirmSelected() (tea.Model, tea.Cmd) {
 	if rec == nil {
 		return m, nil
 	}
-	id := rec.ID
+	return m.confirmAuditID(rec.ID)
+}
+
+// confirmAuditID confirms+sends a specific escalation by id (used by the
+// list and by the detail overlay, which confirms the record it snapshotted).
+func (m Model) confirmAuditID(id int64) (tea.Model, tea.Cmd) {
 	return m, m.do(fmt.Sprintf("confirmed #%d and sent", id), func(ctx context.Context) error {
 		return m.app.Confirm(ctx, id, true)
 	})
@@ -539,11 +557,16 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 			r := *rec
 			build := func(width int) []string { return m.auditDetailLines(r, width) }
 			m.message = ""
-			m.detail = &detailView{
+			d := &detailView{
 				title: fmt.Sprintf("%s #%d", kind, r.ID),
 				lines: build(m.wrapWidth()),
 				build: build,
 			}
+			// Only the Escalations detail is confirmable via enter.
+			if m.tab == tabEscalations {
+				d.confirmID = r.ID
+			}
+			m.detail = d
 		}
 	}
 	return m, nil
@@ -1012,6 +1035,9 @@ func (m Model) View() string {
 
 func (m Model) helpLine() string {
 	if m.detail != nil {
+		if m.detail.confirmID != 0 {
+			return "enter: confirm+send  ↑/↓: scroll  tab: switch tab  esc/q/v: close"
+		}
 		return "↑/↓: scroll  tab: switch tab  esc/q/v: close"
 	}
 	common := "tab: switch  ↑/↓: select  p: pause  r: resume  q: quit"
