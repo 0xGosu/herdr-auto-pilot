@@ -78,6 +78,14 @@ func semanticHarness(t *testing.T, emb *fakeEmbedder, cfgTOML string) *Daemon {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// These tests drive the daemon without Run(), whose defer normally
+	// closes the match index — close it here or bleve's background writers
+	// race the TempDir cleanup ("directory not empty" on macOS runners).
+	t.Cleanup(func() {
+		if d.matcher != nil {
+			d.matcher.Close()
+		}
+	})
 	// New's reload spawns initSemantic in the background; wait for it so
 	// tests observe deterministic state.
 	waitFor(t, 5*time.Second, func() bool { return d.semanticReady.Load() })
