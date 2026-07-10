@@ -729,10 +729,13 @@ func TestRunawayGuardPausesAgent(t *testing.T) {
 	if len(h.herdr.sentInputs()) != 5 {
 		t.Fatalf("6th consecutive prompt must be blocked; sent %d", len(h.herdr.sentInputs()))
 	}
-	rate, _ := h.raw.GetAgentRate(context.Background(), "agent-8")
-	if !rate.Paused {
-		t.Error("agent should be paused pending human check-in")
-	}
+	// escalate() persists the pause AFTER the escalation audit row, so the
+	// pause may not be visible yet when PendingEscalations first reports 1 —
+	// poll instead of asserting immediately (flaked under -race).
+	waitFor(t, 3*time.Second, func() bool {
+		rate, _ := h.raw.GetAgentRate(context.Background(), "agent-8")
+		return rate.Paused
+	})
 
 	// Human interaction (agent starts working without our input) resumes.
 	h.push("agent-8", "working")
