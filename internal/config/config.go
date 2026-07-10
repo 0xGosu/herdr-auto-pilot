@@ -115,8 +115,14 @@ type Paths struct {
 	StateDir  string
 }
 
-// ResolvePaths determines config/state dirs from HERDR_PLUGIN_CONFIG_DIR /
-// HERDR_PLUGIN_STATE_DIR, falling back to XDG-style user directories.
+// ResolvePaths determines the config/state dirs, in priority order:
+//
+//  1. HERDR_PLUGIN_CONFIG_DIR / HERDR_PLUGIN_STATE_DIR — set by Herdr for
+//     every command it launches (the plugin contract).
+//  2. Herdr's own plugin directories, when they exist — so running the
+//     binary from a plain shell operates on the same instance the daemon
+//     uses instead of a parallel standalone world.
+//  3. XDG-style standalone directories, created on demand.
 func ResolvePaths() (Paths, error) {
 	p := Paths{
 		ConfigDir: os.Getenv("HERDR_PLUGIN_CONFIG_DIR"),
@@ -126,11 +132,37 @@ func ResolvePaths() (Paths, error) {
 	if err != nil && (p.ConfigDir == "" || p.StateDir == "") {
 		return p, fmt.Errorf("resolve home dir: %w", err)
 	}
+	configBase := os.Getenv("XDG_CONFIG_HOME")
+	if configBase == "" {
+		configBase = filepath.Join(home, ".config")
+	}
+	stateBase := os.Getenv("XDG_STATE_HOME")
+	if stateBase == "" {
+		stateBase = filepath.Join(home, ".local", "state")
+	}
+	if p.ConfigDir == "" || p.StateDir == "" {
+		// Herdr's layout, as printed by `herdr plugin config-dir`. The two
+		// dirs are adopted as a pair: mixing a herdr config dir with a
+		// standalone state dir (or vice versa) would recreate the split
+		// world this detection exists to prevent. Detection never creates
+		// the layout — an uninstalled plugin stays standalone — but once
+		// either dir exists the missing sibling is created below.
+		herdrConfig := filepath.Join(configBase, "herdr", "plugins", "config", "herd-auto-prompter")
+		herdrState := filepath.Join(stateBase, "herdr", "plugins", "herd-auto-prompter")
+		if dirExists(herdrConfig) || dirExists(herdrState) {
+			if p.ConfigDir == "" {
+				p.ConfigDir = herdrConfig
+			}
+			if p.StateDir == "" {
+				p.StateDir = herdrState
+			}
+		}
+	}
 	if p.ConfigDir == "" {
-		p.ConfigDir = filepath.Join(home, ".config", "herd-auto-prompter")
+		p.ConfigDir = filepath.Join(configBase, "herd-auto-prompter")
 	}
 	if p.StateDir == "" {
-		p.StateDir = filepath.Join(home, ".local", "state", "herd-auto-prompter")
+		p.StateDir = filepath.Join(stateBase, "herd-auto-prompter")
 	}
 	for _, dir := range []string{p.ConfigDir, p.StateDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -138,6 +170,11 @@ func ResolvePaths() (Paths, error) {
 		}
 	}
 	return p, nil
+}
+
+func dirExists(dir string) bool {
+	fi, err := os.Stat(dir)
+	return err == nil && fi.IsDir()
 }
 
 // File returns the main config file path.

@@ -88,3 +88,139 @@ func TestSaveRoundTrip(t *testing.T) {
 		t.Errorf("round trip mismatch: %+v", got)
 	}
 }
+
+func setHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // windows home
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HERDR_PLUGIN_CONFIG_DIR", "")
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", "")
+}
+
+func TestResolvePathsPriorityOrder(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+
+	// 3) No herdr install: standalone fallback, created on demand.
+	p, err := ResolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCfg := filepath.Join(home, ".config", "herd-auto-prompter")
+	wantState := filepath.Join(home, ".local", "state", "herd-auto-prompter")
+	if p.ConfigDir != wantCfg || p.StateDir != wantState {
+		t.Fatalf("standalone fallback: %+v", p)
+	}
+	if _, err := os.Stat(p.ConfigDir); err != nil {
+		t.Errorf("fallback config dir should be created: %v", err)
+	}
+
+	// 2) Herdr's plugin dirs exist: auto-detected, so a shell-run hap
+	// operates on the same instance the daemon uses.
+	herdrCfg := filepath.Join(home, ".config", "herdr", "plugins", "config", "herd-auto-prompter")
+	herdrState := filepath.Join(home, ".local", "state", "herdr", "plugins", "herd-auto-prompter")
+	for _, d := range []string{herdrCfg, herdrState} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p, err = ResolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ConfigDir != herdrCfg || p.StateDir != herdrState {
+		t.Fatalf("herdr dirs should be detected, got %+v", p)
+	}
+
+	// A file at the candidate path is not a directory — not detected.
+	badHome := t.TempDir()
+	setHome(t, badHome)
+	notDir := filepath.Join(badHome, ".local", "state", "herdr", "plugins")
+	if err := os.MkdirAll(notDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(notDir, "herd-auto-prompter"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err = ResolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.StateDir != filepath.Join(badHome, ".local", "state", "herd-auto-prompter") {
+		t.Fatalf("a non-directory candidate must not be detected, got %s", p.StateDir)
+	}
+
+	// 1) The herdr-injected env vars always win over detection.
+	setHome(t, home)
+	envCfg := filepath.Join(t.TempDir(), "cfg")
+	envState := filepath.Join(t.TempDir(), "state")
+	t.Setenv("HERDR_PLUGIN_CONFIG_DIR", envCfg)
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", envState)
+	p, err = ResolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ConfigDir != envCfg || p.StateDir != envState {
+		t.Fatalf("env vars must take priority, got %+v", p)
+	}
+}
+
+func TestResolvePathsHerdrDirsAdoptedAsAPair(t *testing.T) {
+	// Only ONE of herdr's dirs existing must still adopt the herdr layout
+	// for BOTH — mixing a herdr config dir with a standalone state dir
+	// would point the TUI/CLI at a different DB than the daemon's.
+	for _, only := range []string{"config", "state"} {
+		home := t.TempDir()
+		setHome(t, home)
+		herdrCfg := filepath.Join(home, ".config", "herdr", "plugins", "config", "herd-auto-prompter")
+		herdrState := filepath.Join(home, ".local", "state", "herdr", "plugins", "herd-auto-prompter")
+		seed := herdrCfg
+		if only == "state" {
+			seed = herdrState
+		}
+		if err := os.MkdirAll(seed, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		p, err := ResolvePaths()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.ConfigDir != herdrCfg || p.StateDir != herdrState {
+			t.Fatalf("only-%s-exists must adopt the full herdr layout, got %+v", only, p)
+		}
+		// The missing sibling is created so both dirs are usable.
+		if _, err := os.Stat(herdrCfg); err != nil {
+			t.Errorf("missing sibling should be created: %v", err)
+		}
+		if _, err := os.Stat(herdrState); err != nil {
+			t.Errorf("missing sibling should be created: %v", err)
+		}
+	}
+}
+
+func TestResolvePathsHonorsXDGBases(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	xdgCfg := filepath.Join(t.TempDir(), "xdg-config")
+	xdgState := filepath.Join(t.TempDir(), "xdg-state")
+	t.Setenv("XDG_CONFIG_HOME", xdgCfg)
+	t.Setenv("XDG_STATE_HOME", xdgState)
+
+	// Detection probes under the XDG bases (where herdr itself would live).
+	herdrCfg := filepath.Join(xdgCfg, "herdr", "plugins", "config", "herd-auto-prompter")
+	if err := os.MkdirAll(herdrCfg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p, err := ResolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.ConfigDir != herdrCfg {
+		t.Errorf("detection should probe XDG_CONFIG_HOME, got %s", p.ConfigDir)
+	}
+	if p.StateDir != filepath.Join(xdgState, "herdr", "plugins", "herd-auto-prompter") {
+		t.Errorf("state should pair under XDG_STATE_HOME, got %s", p.StateDir)
+	}
+}

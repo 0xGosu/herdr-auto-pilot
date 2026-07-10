@@ -51,6 +51,14 @@ bin/hap escalations
 bin/hap pause          # global kill switch
 ```
 
+Run from any shell, `hap` operates on the same instance the daemon uses:
+it honors the `HERDR_PLUGIN_CONFIG_DIR`/`HERDR_PLUGIN_STATE_DIR` env vars
+Herdr injects, and without them auto-detects Herdr's plugin directories
+(`~/.config/herdr/plugins/config/herd-auto-prompter`,
+`~/.local/state/herdr/plugins/herd-auto-prompter`). Only when neither
+exists — the plugin isn't installed — does it fall back to standalone
+dirs (`~/.config/herd-auto-prompter`, `~/.local/state/herd-auto-prompter`).
+
 ## How it learns (shadow mode)
 
 The plugin never acts on a situation it hasn't learned from you.
