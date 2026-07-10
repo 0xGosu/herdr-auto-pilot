@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
+
+var _ ports.InspectorPort = (*CLI)(nil)
 
 // CLI issues one-shot Herdr control actions through the herdr binary
 // (HERDR_BIN_PATH), which stays portable across Unix sockets and Windows
@@ -112,6 +115,42 @@ func (c *CLI) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) 
 		})
 	}
 	return agents, nil
+}
+
+// paneGetResponse is the JSON envelope `herdr pane get <pane_id>` prints
+// (verified against herdr 0.7). cwd may carry a literal " (deleted)"
+// suffix; foreground_cwd is absent on some panes.
+type paneGetResponse struct {
+	Result struct {
+		Pane struct {
+			PaneID        string `json:"pane_id"`
+			TabID         string `json:"tab_id"`
+			WorkspaceID   string `json:"workspace_id"`
+			Cwd           string `json:"cwd"`
+			ForegroundCwd string `json:"foreground_cwd"`
+		} `json:"pane"`
+	} `json:"result"`
+}
+
+// PaneInfo returns per-pane metadata (`pane get`), including the pane's
+// working directory (ports.InspectorPort).
+func (c *CLI) PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, error) {
+	out, err := c.run(ctx, "pane", "get", paneID)
+	if err != nil {
+		return domain.PaneInfo{}, err
+	}
+	var resp paneGetResponse
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &resp); err != nil {
+		return domain.PaneInfo{}, fmt.Errorf("parse pane get output: %w", err)
+	}
+	p := resp.Result.Pane
+	return domain.PaneInfo{
+		PaneID:        p.PaneID,
+		TabID:         p.TabID,
+		WorkspaceID:   p.WorkspaceID,
+		Cwd:           p.Cwd,
+		ForegroundCwd: p.ForegroundCwd,
+	}, nil
 }
 
 // workspaceListResponse is the `herdr workspace list` envelope

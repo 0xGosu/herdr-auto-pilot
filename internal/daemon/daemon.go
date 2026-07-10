@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/classify"
@@ -271,6 +272,7 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	situation := cls.Classify(tr.AgentType, tr.Status, pane)
 	situation.AgentID = tr.AgentID
 	situation.PaneID = tr.PaneID
+	situation.TabID = tr.TabID
 	situation.WorkspaceID = tr.WorkspaceID
 	if situation.AgentType == "" {
 		situation.AgentType = "unknown"
@@ -336,7 +338,7 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	case domain.ActionSend:
 		d.act(ctx, situation, sig, decision, tr, now)
 	case domain.ActionConsult:
-		d.consultLLM(ctx, situation, sig, now)
+		d.consultLLM(ctx, cfg, situation, sig, now)
 	default:
 		d.escalate(ctx, situation, sig, decision, tr, now)
 	}
@@ -504,36 +506,28 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		"version", buildinfo.Version)
 }
 
-// consultLLM stages a request and launches the operator's LLM CLI in a
-// goroutine; the outcome funnels back into the main loop (NFR-006 timeout
-// handled by the adapter).
-func (d *Daemon) consultLLM(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
-	now time.Time) {
+// consultLLM assembles the consult context, stages the request, and
+// launches the operator's LLM CLI — all inside a goroutine, because the
+// context assembly shells out to the herdr CLI (deep pane read + pane get)
+// and must not stall the main loop; every failure funnels back through
+// handleLLMOutcome (NFR-006 timeout handled by the adapter).
+func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Situation,
+	sig domain.SignatureResult, now time.Time) {
 
-	contextJSON, _ := json.Marshal(map[string]any{
-		"situation_type":  s.Type,
-		"agent_type":      s.AgentType,
-		"options":         s.Options,
-		"permission_verb": s.PermissionVerb,
-		"error_summary":   s.ErrorSummary,
-		"pane_excerpt":    tail(s.Content, 2000),
-	})
+	llm := d.llmPort()
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("req-%s-%d", s.AgentID, now.UnixNano()),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-		ContextJSON: string(contextJSON), Status: "pending", CreatedAt: now,
+		Status: "pending", CreatedAt: now,
 	}
-	if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
-		slog.Error("staging LLM request failed; escalating", "error", err)
-		d.escalate(ctx, s, sig, domain.Decision{Action: domain.ActionEscalate,
-			Reason: domain.ReasonPersistenceFailed, Rationale: err.Error()}, domain.AgentTransition{AgentID: s.AgentID, Status: "blocked"}, now)
-		return
-	}
-
-	llm := d.llmPort()
 	go func() {
 		outcome := llmOutcome{situation: s, sig: sig, request: req}
 		err := logging.Guard("llm-consult", func() error {
+			req.ContextJSON = string(d.consultContext(ctx, cfg, s))
+			if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
+				return fmt.Errorf("staging LLM request failed: %w", err)
+			}
+			outcome.request = req
 			decision, err := llm.Consult(ctx, req)
 			outcome.decision = decision
 			return err
@@ -544,6 +538,66 @@ func (d *Daemon) consultLLM(ctx context.Context, s domain.Situation, sig domain.
 		case <-ctx.Done():
 		}
 	}()
+}
+
+// consultContext builds the JSON context handed to the LLM CLI via the
+// get_context MCP tool: the classified situation, a pane excerpt, the
+// agent's herdr location, and the pane working directory.
+func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation) []byte {
+	chars := cfg.LLM.PaneExcerptChars
+	if chars <= 0 {
+		chars = config.Default().LLM.PaneExcerptChars
+	}
+
+	// The classification read is kept shallow so the first-match-wins
+	// classifier does not latch onto stale scrollback; the LLM excerpt
+	// gets its own deeper read (~10 chars/line is a conservative floor).
+	excerpt := s.Content
+	lines := chars / 10
+	if lines < d.opt.PaneReadLines {
+		lines = d.opt.PaneReadLines
+	}
+	if deep, err := d.opt.Herdr.ReadPane(ctx, s.PaneID, lines); err == nil {
+		excerpt = deep
+	} else {
+		slog.Warn("deep pane read for LLM context failed; using classification snapshot",
+			"pane", s.PaneID, "error", err)
+	}
+
+	// Pane location and cwd come from `pane get`; degrade to empty values
+	// when the adapter cannot report them (ports.InspectorPort is optional).
+	var info domain.PaneInfo
+	if insp, ok := d.opt.Herdr.(ports.InspectorPort); ok {
+		var err error
+		if info, err = insp.PaneInfo(ctx, s.PaneID); err != nil {
+			slog.Warn("pane info for LLM context failed", "pane", s.PaneID, "error", err)
+			info = domain.PaneInfo{}
+		}
+	}
+	tabID := s.TabID
+	if tabID == "" {
+		tabID = info.TabID
+	}
+	workspaceID := s.WorkspaceID
+	if workspaceID == "" {
+		workspaceID = info.WorkspaceID
+	}
+
+	contextJSON, _ := json.Marshal(map[string]any{
+		"situation_type":  s.Type,
+		"agent_type":      s.AgentType,
+		"options":         s.Options,
+		"permission_verb": s.PermissionVerb,
+		"error_summary":   s.ErrorSummary,
+		"pane_excerpt":    tail(excerpt, chars),
+		"workspace_id":    workspaceID,
+		"tab_id":          tabID,
+		"pane_id":         s.PaneID,
+		"agent_id":        s.AgentID,
+		"cwd":             info.Cwd,
+		"foreground_cwd":  info.ForegroundCwd,
+	})
+	return contextJSON
 }
 
 // handleLLMOutcome re-gates a staged LLM submission through the same safety
@@ -560,6 +614,9 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reason := domain.ReasonLLMNoSubmit
 		if res.err != nil && strings.Contains(res.err.Error(), "timeout") {
 			reason = domain.ReasonLLMTimeout
+		}
+		if res.err != nil && strings.Contains(res.err.Error(), "staging LLM request") {
+			reason = domain.ReasonPersistenceFailed
 		}
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: reason,
@@ -1015,5 +1072,13 @@ func tail(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[len(s)-n:]
+	cut := s[len(s)-n:]
+	// Never start mid-rune: skip leading UTF-8 continuation bytes.
+	for i := 0; i < len(cut) && i < utf8.UTFMax; i++ {
+		if !utf8.RuneStart(cut[i]) {
+			continue
+		}
+		return cut[i:]
+	}
+	return cut
 }

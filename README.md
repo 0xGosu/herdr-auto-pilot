@@ -237,6 +237,22 @@ command = [
 ]
 timeout_seconds = 120
 auto_act = false   # false: LLM suggestions are surfaced for your confirmation
+pane_excerpt_chars = 5000   # pane excerpt size in the consult context (default 5000)
+```
+
+`get_context` hands the model the classified situation (type, options,
+permission verb, error summary), a pane excerpt (the last
+`pane_excerpt_chars` characters, read deeper than the classification
+snapshot), the agent's herdr location (`workspace_id`, `tab_id`,
+`pane_id`, `agent_id`), and the pane's working directory (`cwd`,
+`foreground_cwd` — advisory: a deleted directory carries a
+`" (deleted)"` suffix and either may be empty). The location ids let the
+model run its own read-only `herdr` queries (`herdr pane read <pane_id>`,
+`herdr pane get <pane_id>`, ...) — to allow that with Claude Code, extend
+the allowlist, e.g.:
+
+```toml
+"--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision,Bash(herdr pane read:*),Bash(herdr pane get:*)",
 ```
 
 OpenAI Codex CLI (MCP server passed inline via `-c` overrides; `exec` is

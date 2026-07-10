@@ -29,6 +29,14 @@ type LocatorPort interface {
 	ListTabs(ctx context.Context) ([]domain.TabInfo, error)
 }
 
+// InspectorPort is implemented by Herdr adapters that can report per-pane
+// metadata (tab/workspace ids, working directory) for enriching the LLM
+// consult context. Optional: callers type-assert and degrade to empty
+// values when absent.
+type InspectorPort interface {
+	PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, error)
+}
+
 // EventPort is the inbound Herdr event subscription (raw socket).
 type EventPort interface {
 	// Subscribe streams agent-status transitions until ctx is done.

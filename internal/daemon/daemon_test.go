@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/classify"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
@@ -30,6 +32,13 @@ type fakeHerdr struct {
 	failSend      bool
 	panicOnRead   bool
 	failRead      bool
+	// failReadOver, when > 0, fails ReadPane calls asking for more than
+	// that many lines (isolates the deep LLM-context read from the
+	// shallow classification read).
+	failReadOver int
+	readLines    []int
+	paneInfo     domain.PaneInfo
+	failPaneInfo bool
 }
 
 func (f *fakeHerdr) Send(ctx context.Context, paneID, input string) error {
@@ -48,10 +57,29 @@ func (f *fakeHerdr) ReadPane(ctx context.Context, paneID string, lines int) (str
 	if f.panicOnRead {
 		panic("induced pane read panic")
 	}
+	f.readLines = append(f.readLines, lines)
 	if f.failRead {
 		return "", errors.New("induced read failure")
 	}
+	if f.failReadOver > 0 && lines > f.failReadOver {
+		return "", errors.New("induced deep read failure")
+	}
 	return f.pane, nil
+}
+
+func (f *fakeHerdr) PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failPaneInfo {
+		return domain.PaneInfo{}, errors.New("induced pane info failure")
+	}
+	return f.paneInfo, nil
+}
+
+func (f *fakeHerdr) readLineCalls() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.readLines...)
 }
 
 func (f *fakeHerdr) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) {
@@ -166,6 +194,12 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, cfgTOML string) *harness {
+	return newHarnessWrapped(t, cfgTOML, nil)
+}
+
+// newHarnessWrapped lets a test substitute the HerdrPort the daemon sees
+// (e.g. hiding optional interfaces) while keeping the fake for assertions.
+func newHarnessWrapped(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
@@ -184,6 +218,10 @@ func newHarness(t *testing.T, cfgTOML string) *harness {
 	fh := &fakeHerdr{}
 	fe := &fakeEvents{ch: make(chan domain.AgentTransition, 64)}
 	fl := &fakeLLM{}
+	var herdrPort ports.HerdrPort = fh
+	if wrap != nil {
+		herdrPort = wrap(fh)
+	}
 
 	// Socket paths must stay short for macOS (104-byte cap).
 	ctlPath := filepath.Join(testutil.SocketDir(t), "control.sock")
@@ -191,7 +229,7 @@ func newHarness(t *testing.T, cfgTOML string) *harness {
 		ConfigPath:        cfgPath,
 		ControlSocketPath: ctlPath,
 		Store:             fs,
-		Herdr:             fh,
+		Herdr:             herdrPort,
 		Events:            fe,
 		Notify:            fh,
 		LLM:               fl,
@@ -1064,5 +1102,198 @@ func TestAgentNamedOnDiscoveryAndWorking(t *testing.T) {
 	}
 	if inputs := h.herdr.sentInputs(); len(inputs) != 0 {
 		t.Errorf("discovery must not cause sends, got %v", inputs)
+	}
+}
+
+// captureConsultContext wires the fake LLM to record req.ContextJSON and
+// fail the consult (the escalation path is not under test here).
+func captureConsultContext(h *harness) *atomicString {
+	var captured atomicString
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		captured.set(req.ContextJSON)
+		return nil, errors.New("consult not under test")
+	}
+	return &captured
+}
+
+func decodeContext(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatalf("context JSON unparseable: %v (%s)", err, raw)
+	}
+	return m
+}
+
+func TestConsultContextCarriesLocationCwdAndDeepExcerpt(t *testing.T) {
+	// The consult context must hand the LLM the agent's herdr location
+	// (workspace/tab/pane ids), the pane cwd, and a pane excerpt sourced
+	// from a deeper read than the classification snapshot.
+	h := newHarness(t, "")
+	captured := captureConsultContext(h)
+	filler := strings.Repeat("compiling module alpha beta gamma\n", 200) // ~6800 chars
+	h.herdr.setPane(filler + approvalPane)
+	h.herdr.mu.Lock()
+	h.herdr.paneInfo = domain.PaneInfo{
+		PaneID: "w2:p7", TabID: "w2:t3", WorkspaceID: "w2",
+		Cwd: "/home/op/project", ForegroundCwd: "/home/op/project/sub",
+	}
+	h.herdr.mu.Unlock()
+
+	// Fresh signature + configured LLM → consult (no seeding needed).
+	h.events.ch <- domain.AgentTransition{
+		AgentID: "w2:p7", PaneID: "w2:p7", TabID: "w2:t3", WorkspaceID: "w2",
+		AgentType: "claude", Status: "blocked",
+	}
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	for key, want := range map[string]string{
+		"workspace_id":   "w2",
+		"tab_id":         "w2:t3",
+		"pane_id":        "w2:p7",
+		"agent_id":       "w2:p7",
+		"cwd":            "/home/op/project",
+		"foreground_cwd": "/home/op/project/sub",
+	} {
+		if got, _ := m[key].(string); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+	excerpt, _ := m["pane_excerpt"].(string)
+	if len(excerpt) != 5000 {
+		t.Errorf("pane_excerpt length = %d, want the 5000-char default", len(excerpt))
+	}
+	if !strings.Contains(excerpt, "Do you want to proceed?") {
+		t.Error("pane_excerpt must keep the tail of the pane")
+	}
+	// The deep read asks for pane_excerpt_chars/10 lines; the shallow
+	// classification read keeps the PaneReadLines default.
+	lines := h.herdr.readLineCalls()
+	if len(lines) < 2 || lines[len(lines)-1] != 500 {
+		t.Errorf("deep read should request 500 lines, got calls %v", lines)
+	}
+}
+
+func TestConsultContextExcerptSizeConfigurable(t *testing.T) {
+	h := newHarness(t, "[llm]\ncommand = [\"fake\"]\npane_excerpt_chars = 300\n")
+	captured := captureConsultContext(h)
+	h.herdr.setPane(strings.Repeat("noise line for the excerpt budget\n", 40) + approvalPane)
+
+	h.push("agent-ex", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	excerpt, _ := m["pane_excerpt"].(string)
+	if len(excerpt) != 300 {
+		t.Errorf("pane_excerpt length = %d, want the configured 300", len(excerpt))
+	}
+}
+
+func TestConsultContextDegradesWithoutPaneInfo(t *testing.T) {
+	// A failing `pane get` must not block the consult: location falls back
+	// to the transition ids and cwd stays empty.
+	h := newHarness(t, "")
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+	h.herdr.mu.Lock()
+	h.herdr.failPaneInfo = true
+	h.herdr.mu.Unlock()
+
+	h.events.ch <- domain.AgentTransition{
+		AgentID: "w3:p1", PaneID: "w3:p1", TabID: "w3:t1", WorkspaceID: "w3",
+		AgentType: "claude", Status: "blocked",
+	}
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if got, _ := m["cwd"].(string); got != "" {
+		t.Errorf("cwd should degrade to empty, got %q", got)
+	}
+	if got, _ := m["tab_id"].(string); got != "w3:t1" {
+		t.Errorf("tab_id should come from the transition, got %q", got)
+	}
+}
+
+func TestConsultContextFallsBackToClassificationSnapshot(t *testing.T) {
+	// When the deep read fails, the excerpt falls back to the (shallow)
+	// classification snapshot instead of aborting the consult.
+	h := newHarness(t, "")
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+	h.herdr.mu.Lock()
+	h.herdr.failReadOver = 120 // classification read (120 lines) passes, deep read fails
+	h.herdr.mu.Unlock()
+
+	h.push("agent-fb", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if excerpt, _ := m["pane_excerpt"].(string); excerpt != approvalPane {
+		t.Errorf("excerpt should fall back to the classification snapshot, got %q", excerpt)
+	}
+}
+
+// inspectorlessHerdr exposes only the base HerdrPort surface, hiding the
+// fake's PaneInfo to exercise the optional-InspectorPort degradation.
+type inspectorlessHerdr struct{ f *fakeHerdr }
+
+func (h inspectorlessHerdr) Send(ctx context.Context, paneID, input string) error {
+	return h.f.Send(ctx, paneID, input)
+}
+
+func (h inspectorlessHerdr) ReadPane(ctx context.Context, paneID string, lines int) (string, error) {
+	return h.f.ReadPane(ctx, paneID, lines)
+}
+
+func (h inspectorlessHerdr) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) {
+	return h.f.ListAgents(ctx)
+}
+
+func TestConsultContextWithoutInspectorPort(t *testing.T) {
+	// An adapter without the optional InspectorPort still consults: ids
+	// come from the transition and cwd stays empty.
+	h := newHarnessWrapped(t, "", func(f *fakeHerdr) ports.HerdrPort {
+		return inspectorlessHerdr{f}
+	})
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.events.ch <- domain.AgentTransition{
+		AgentID: "w4:p1", PaneID: "w4:p1", TabID: "w4:t2", WorkspaceID: "w4",
+		AgentType: "claude", Status: "blocked",
+	}
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if got, _ := m["cwd"].(string); got != "" {
+		t.Errorf("cwd must stay empty without InspectorPort, got %q", got)
+	}
+	if got, _ := m["tab_id"].(string); got != "w4:t2" {
+		t.Errorf("tab_id should come from the transition, got %q", got)
+	}
+	if got, _ := m["workspace_id"].(string); got != "w4" {
+		t.Errorf("workspace_id should come from the transition, got %q", got)
+	}
+}
+
+func TestTailTrimsAtRuneBoundary(t *testing.T) {
+	if got := tail("hello", 10); got != "hello" {
+		t.Errorf("short input must pass through, got %q", got)
+	}
+	if got := tail("abcdef", 3); got != "def" {
+		t.Errorf("ascii cut = %q, want \"def\"", got)
+	}
+	// A 4-byte budget on "héllo" lands inside the 2-byte é: the leading
+	// continuation byte must be skipped, never emitted.
+	if got := tail("héllo", 4); got != "llo" {
+		t.Errorf("mid-rune cut = %q, want \"llo\"", got)
+	}
+	if got := tail("héllo", 5); got != "éllo" {
+		t.Errorf("boundary cut = %q, want \"éllo\"", got)
+	}
+	if got := tail(strings.Repeat("界", 10), 7); !utf8.ValidString(got) {
+		t.Errorf("tail must never emit invalid UTF-8, got %q", got)
 	}
 }
