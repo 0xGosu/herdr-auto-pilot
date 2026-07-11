@@ -111,10 +111,16 @@ func TestDismissEscalationGuardsStatus(t *testing.T) {
 	// how a concurrent resolve/confirm wins over a late dismiss.
 	autoID, err := s.AppendAudit(ctx, domain.AuditRecord{
 		SituationType: domain.SituationChoice, Trigger: "t",
-		Action: "auto:2", Status: "auto", CreatedAt: time.Now(),
+		Action: "auto:2", Status: "auto",
+		PaneExcerpt: "pick one\n1. a\n2. b", CreatedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Fresh-DB round trip: pane_excerpt sits mid-table here (the ALTER
+	// puts it last on upgraded DBs) — both layouts must read back.
+	if rec, err := s.GetAudit(ctx, autoID); err != nil || rec == nil || rec.PaneExcerpt != "pick one\n1. a\n2. b" {
+		t.Fatalf("fresh-DB pane_excerpt round trip: %+v %v", rec, err)
 	}
 	if err := s.DismissEscalation(ctx, autoID); err == nil {
 		t.Error("dismissing a non-escalated row must fail")
@@ -874,22 +880,23 @@ func TestMigrateAddsAgentTypeToLegacyAuditLog(t *testing.T) {
 	t.Cleanup(func() { s.Close() })
 
 	ctx := context.Background()
-	// The pre-migration row reads back with an empty agent type.
+	// The pre-migration row reads back with an empty agent type and an
+	// empty per-entry pane excerpt (both columns are post-hoc ALTERs).
 	legacy, err := s.GetAudit(ctx, 1)
-	if err != nil || legacy == nil || legacy.AgentType != "" {
+	if err != nil || legacy == nil || legacy.AgentType != "" || legacy.PaneExcerpt != "" {
 		t.Fatalf("legacy row after migration: %+v %v", legacy, err)
 	}
 	// New rows round-trip the migrated column.
 	id, err := s.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "a1", AgentType: "claude", Trigger: "agent-status: idle",
 		SituationType: domain.SituationIdle, Action: "escalated", Status: "escalated",
-		CreatedAt: time.Now(),
+		PaneExcerpt: "the pane as classified", CreatedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetAudit(ctx, id)
-	if err != nil || got == nil || got.AgentType != "claude" {
+	if err != nil || got == nil || got.AgentType != "claude" || got.PaneExcerpt != "the pane as classified" {
 		t.Fatalf("migrated column round trip: %+v %v", got, err)
 	}
 }

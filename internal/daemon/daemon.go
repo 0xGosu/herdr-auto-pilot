@@ -803,7 +803,7 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "auto:" + del.input, Input: del.input,
 		Confidence: dec.Confidence, Rationale: del.rationale, LLMOutput: del.llmOutput,
-		Status: "auto", CreatedAt: now,
+		Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
@@ -878,7 +878,7 @@ func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "noop", Input: "",
 		Confidence: dec.Confidence, Rationale: dec.Rationale,
-		Status: "auto", CreatedAt: now,
+		Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous noop (FR-024)", "error", err)
@@ -924,7 +924,11 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "escalated", Confidence: dec.Confidence,
 		Rationale: rationale,
-		Status:    "escalated", Suggestion: dec.Suggestion, CreatedAt: now,
+		Status:    "escalated", Suggestion: dec.Suggestion,
+		// The content THIS escalation was classified from — per entry,
+		// unlike the signature's first-seen provenance snapshot.
+		PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes),
+		CreatedAt:   now,
 	}
 	if _, err := d.opt.Store.AppendAudit(ctx, rec); err != nil {
 		slog.Error("audit write failed for escalation", "error", err)
@@ -1450,7 +1454,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
 			SituationType: s.Type, Action: "noop", Input: "",
 			Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
-			Status: "auto", CreatedAt: now,
+			Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 		}); err != nil {
 			slog.Error("audit write failed; blocking LLM noop (FR-024)", "error", err)
 			d.notify(ctx, "Herd Auto Prompter: persistence failure",
@@ -1523,7 +1527,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
 		SituationType: s.Type, Action: "auto:" + llmDec.Action, Input: llmDec.Action,
 		Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
-		Status: "auto", CreatedAt: now,
+		Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})
 	if err != nil {
 		slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)

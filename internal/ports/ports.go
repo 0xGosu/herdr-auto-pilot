@@ -194,6 +194,9 @@ type ReadStore interface {
 	AuditLog(ctx context.Context, limit int) ([]domain.AuditRecord, error)
 	GetAudit(ctx context.Context, id int64) (*domain.AuditRecord, error)
 	PendingEscalations(ctx context.Context) ([]domain.AuditRecord, error)
+	// CountPendingEscalations counts pending escalations without fetching
+	// the (pane-excerpt-heavy) rows.
+	CountPendingEscalations(ctx context.Context) (int64, error)
 	UnprocessedCorrections(ctx context.Context) ([]domain.CorrectionRecord, error)
 	GetAgentRate(ctx context.Context, agentID string) (*domain.AgentRate, error)
 	GetErrorRetry(ctx context.Context, errorSignature string) (*domain.ErrorRetry, error)

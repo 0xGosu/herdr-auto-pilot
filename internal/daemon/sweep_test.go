@@ -238,6 +238,11 @@ func TestLLMMultiTabConsultAndSeriesPromotion(t *testing.T) {
 	if len(audits) == 0 || audits[0].Action != "auto:1 2 1" || audits[0].Trigger != "llm-fallback" {
 		t.Fatalf("series promotion audit missing: %+v", audits)
 	}
+	// The per-entry excerpt must be the swept AGGREGATE (all tabs), not
+	// the single focused frame.
+	if !strings.Contains(audits[0].PaneExcerpt, "[question 3/3]") {
+		t.Errorf("series audit must carry the swept aggregate, got %q", audits[0].PaneExcerpt)
+	}
 	<-mu
 	for _, want := range []string{`"tab_count":3`, "select_options MUST be a list of exactly 3 integers", "[question 1/3]", "[question 3/3]"} {
 		if !strings.Contains(contextJSON, want) {

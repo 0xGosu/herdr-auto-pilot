@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	corrects_audit_id INTEGER NOT NULL DEFAULT 0,
 	status TEXT NOT NULL DEFAULT '',
 	suggestion TEXT NOT NULL DEFAULT '',
+	pane_excerpt TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
@@ -191,6 +192,7 @@ func (s *Store) migrate() error {
 	// the column is already there.
 	for _, ddl := range []string{
 		`ALTER TABLE audit_log ADD COLUMN agent_type TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE audit_log ADD COLUMN pane_excerpt TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil &&
@@ -276,11 +278,11 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO audit_log (decision_id, agent_id, agent_type, signature, trigger, situation_type,
 				action_or_escalation, input, confidence, rationale, llm_output,
-				corrects_audit_id, status, suggestion, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				corrects_audit_id, status, suggestion, pane_excerpt, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
 			a.Action, a.Input, a.Confidence, a.Rationale, a.LLMOutput,
-			a.CorrectsAuditID, a.Status, a.Suggestion, unix(a.CreatedAt))
+			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt, unix(a.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -878,7 +880,7 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 		var created int64
 		if err := rows.Scan(&a.ID, &a.DecisionID, &a.AgentID, &a.AgentType, &a.Signature, &a.Trigger,
 			&situationType, &a.Action, &a.Input, &a.Confidence, &a.Rationale,
-			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &created); err != nil {
+			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &a.PaneExcerpt, &created); err != nil {
 			return nil, err
 		}
 		a.SituationType = domain.SituationType(situationType)
@@ -890,7 +892,7 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 
 const auditCols = `id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
 	action_or_escalation, input, confidence, rationale, llm_output,
-	corrects_audit_id, status, suggestion, created_at`
+	corrects_audit_id, status, suggestion, pane_excerpt, created_at`
 
 // AuditLog returns recent audit records, newest first.
 func (s *Store) AuditLog(ctx context.Context, limit int) ([]domain.AuditRecord, error) {
@@ -920,6 +922,15 @@ func (s *Store) GetAudit(ctx context.Context, id int64) (*domain.AuditRecord, er
 }
 
 // PendingEscalations returns unresolved escalations, newest first.
+// CountPendingEscalations reports how many escalations are pending without
+// fetching the rows (each can carry a multi-KB pane excerpt).
+func (s *Store) CountPendingEscalations(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM audit_log WHERE status = 'escalated'`).Scan(&n)
+	return n, err
+}
+
 func (s *Store) PendingEscalations(ctx context.Context) ([]domain.AuditRecord, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+auditCols+` FROM audit_log WHERE status = 'escalated' ORDER BY id DESC LIMIT 200`)

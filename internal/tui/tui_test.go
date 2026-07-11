@@ -340,7 +340,8 @@ func appModel(t *testing.T) (Model, *frontend.App, *store.Store) {
 		ChosenAction: "1", Source: domain.SourceOperator, CreatedAt: now})
 	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:deadbeef00112233",
 		Trigger: "apply?", SituationType: domain.SituationApproval, Action: "escalated",
-		Rationale: "shadow mode suggestion", Status: "escalated", CreatedAt: now})
+		Rationale: "shadow mode suggestion", Status: "escalated",
+		PaneExcerpt: "Bash(kubectl apply -f svc.yaml)\nDo you want to proceed?", CreatedAt: now})
 	st.SaveSignatureSnapshot(ctx, "approval:deadbeef00112233",
 		"Bash(kubectl apply -f deploy.yaml)\nDo you want to proceed?", now)
 
@@ -896,9 +897,11 @@ func TestEscalationWithoutRuleShowsNoneYet(t *testing.T) {
 	}
 }
 
-func TestEscalationDetailShowsOriginalSituation(t *testing.T) {
-	// The Escalations detail view surfaces the captured pane content
-	// (the signature's first-seen snapshot) so the operator has context.
+func TestEscalationDetailShowsCurrentAndOriginalSituation(t *testing.T) {
+	// The Escalations detail view shows the pane content THIS entry was
+	// classified from (Current situation) and, below it, the matched
+	// rule's first-seen snapshot (Original situation) — which is shared
+	// by every entry resolving to that rule.
 	m, _, _ := appModel(t)
 	m.tab = tabEscalations
 	m.cursor = 0
@@ -907,10 +910,39 @@ func TestEscalationDetailShowsOriginalSituation(t *testing.T) {
 		t.Fatal("v should open the escalation detail")
 	}
 	view := m.View()
-	for _, want := range []string{"Original situation", "kubectl apply"} {
+	for _, want := range []string{"Current situation", "svc.yaml", "Original situation", "deploy.yaml"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("escalation detail missing %q:\n%s", want, view)
 		}
+	}
+	if strings.Index(view, "Current situation") > strings.Index(view, "Original situation") {
+		t.Error("Current situation must render above Original situation")
+	}
+}
+
+func TestEscalationDetailCurrentOnlyWithoutRule(t *testing.T) {
+	// An entry with a captured excerpt but no signature (no rule to show
+	// provenance for) renders only the Current situation block.
+	m, app, st := appModel(t)
+	ctx := context.Background()
+	if _, err := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w6:p1", SituationType: domain.SituationApproval, Trigger: "agent-status: blocked",
+		Action: "escalated", Status: "escalated",
+		PaneExcerpt: "overwrite scratch.txt? (y/n)", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabEscalations
+	m.cursor = 0 // newest first
+	m = press(t, m, "v")
+	view := m.View()
+	if !strings.Contains(view, "Current situation") || !strings.Contains(view, "scratch.txt") {
+		t.Errorf("detail must show the per-entry excerpt:\n%s", view)
+	}
+	if strings.Contains(view, "Original situation") {
+		t.Errorf("no signature: the rule-provenance block must be absent:\n%s", view)
 	}
 }
 

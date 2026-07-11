@@ -457,6 +457,9 @@ func TestPipelineAutoApprovesConfidentSignature(t *testing.T) {
 	if audits[0].Status != "auto" || audits[0].Input != "1" {
 		t.Errorf("audit record mismatch: %+v", audits[0])
 	}
+	if !contains(audits[0].PaneExcerpt, "Do you want to proceed") {
+		t.Errorf("auto audit must carry the classified pane content, got %q", audits[0].PaneExcerpt)
+	}
 }
 
 func TestLLMPromotionDeliversMenuDigitForLabel(t *testing.T) {

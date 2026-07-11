@@ -2,8 +2,11 @@ package daemon
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
 // The delayed-capture tests use real timers (the repo has no fake clock).
@@ -23,6 +26,18 @@ func TestCaptureDelaysClassificationRead(t *testing.T) {
 		t.Fatalf("pane read fired %d time(s) before the start delay elapsed", n)
 	}
 	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 1 })
+
+	// The escalation records the pane content it was classified from —
+	// the per-entry "Current situation", distinct from the signature's
+	// first-seen provenance snapshot.
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(context.Background())
+		return len(esc) == 1
+	})
+	if !strings.Contains(esc[0].PaneExcerpt, "Do you want to proceed") {
+		t.Errorf("escalation must carry the classified pane content, got %q", esc[0].PaneExcerpt)
+	}
 }
 
 func TestCaptureCoalescesEventBursts(t *testing.T) {
@@ -50,7 +65,7 @@ func TestCaptureCoalescesEventBursts(t *testing.T) {
 func TestCaptureStartVsEventDelay(t *testing.T) {
 	// The first capture waits start_ms; once it has fired, later events
 	// use the (much shorter) event_ms.
-	cfg := "[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 3000\nevent_ms = 1\n"
+	cfg := "[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 6000\nevent_ms = 1\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 
@@ -59,12 +74,12 @@ func TestCaptureStartVsEventDelay(t *testing.T) {
 	if n := len(h.herdr.readLineCalls()); n != 0 {
 		t.Fatalf("first event must wait the start delay, read fired %d time(s)", n)
 	}
-	waitFor(t, 10*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 1 })
+	waitFor(t, 15*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 1 })
 
 	// Far beyond the event delay, far under another start delay: only the
-	// event delay can satisfy this deadline.
+	// event delay can satisfy this deadline, even on a stalled runner.
 	h.push("agent-cap3", "blocked")
-	waitFor(t, 1500*time.Millisecond, func() bool { return len(h.herdr.readLineCalls()) == 2 })
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 2 })
 }
 
 func TestCaptureTimersArePerPane(t *testing.T) {
@@ -85,14 +100,14 @@ func TestCaptureTimersArePerPane(t *testing.T) {
 func TestCaptureCanceledByWorkingTransition(t *testing.T) {
 	// The human answered before the capture fired: the pending capture is
 	// canceled — no stale read, no escalation for a pane that moved on.
-	cfg := "[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 600\nevent_ms = 600\n"
+	cfg := "[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 1500\nevent_ms = 1500\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 
 	h.push("agent-cap4", "blocked")
 	time.Sleep(100 * time.Millisecond)
 	h.push("agent-cap4", "working")
-	time.Sleep(1200 * time.Millisecond)
+	time.Sleep(2500 * time.Millisecond)
 	if n := len(h.herdr.readLineCalls()); n != 0 {
 		t.Fatalf("working must cancel the pending capture, read fired %d time(s)", n)
 	}
