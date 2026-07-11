@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
@@ -112,16 +114,19 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "submit_decision",
-			"description": "Submit your decision for the pending request. action is the literal reply text to send to the agent (for choices, the exact option text). If the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit action \"@noop\" to explicitly do nothing. The daemon re-gates this through the confidence gate and never-auto patterns before acting.",
+			"description": "Submit your decision for the pending request. For multiple-choice situations (the context lists options or a multi-tab question form), answer with select_options — the 1-based option number(s). Otherwise recommend_action is the literal reply text to send to the agent. If the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit recommend_action \"@noop\" to explicitly do nothing. The daemon re-gates this through the confidence gate and never-auto patterns before acting.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"request_id": map[string]any{"type": "string", "description": "Decision request id (optional; defaults to the current request)"},
-					"action":     map[string]any{"type": "string", "description": "Literal reply text to send to the agent, or \"@noop\" to explicitly send nothing (use when no reply is needed)"},
-					"option_id":  map[string]any{"type": "string", "description": "Selected option text for multiple-choice situations"},
-					"rationale":  map[string]any{"type": "string", "description": "Why this action matches the operator's likely intent"},
+					"recommend_action": map[string]any{"type": "string",
+						"description": "Literal reply text to send to the agent, or \"@noop\" to explicitly send nothing (use when no reply is needed). For multiple-choice situations use select_options instead."},
+					"select_options": map[string]any{"type": "array", "items": map[string]any{"type": "integer", "minimum": 1, "maximum": 9},
+						"description": "Answer for multiple-choice situations: the chosen option number(s), 1-based. A single menu takes exactly one integer, e.g. [2]. A multi-tab question form takes exactly one integer per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1]."},
+					"confident_score": map[string]any{"type": "integer", "minimum": 0, "maximum": 100,
+						"description": "How confident you are in this decision, 0 (a guess) to 100 (certain); shown to the operator with the decision"},
+					"rationale": map[string]any{"type": "string", "description": "Why this action matches the operator's likely intent"},
 				},
-				"required": []string{"action"},
 			},
 		},
 	}
@@ -130,11 +135,65 @@ func toolDefinitions() []map[string]any {
 type toolCallParams struct {
 	Name      string `json:"name"`
 	Arguments struct {
-		RequestID string `json:"request_id"`
-		Action    string `json:"action"`
-		OptionID  string `json:"option_id"`
-		Rationale string `json:"rationale"`
+		RequestID       string `json:"request_id"`
+		RecommendAction string `json:"recommend_action"`
+		SelectOptions   []int  `json:"select_options"`
+		ConfidentScore  *int   `json:"confident_score"`
+		Rationale       string `json:"rationale"`
+		// Legacy aliases from the pre-rename tool surface; accepted so a
+		// consult started under an older prompt still lands.
+		Action   string `json:"action"`
+		OptionID string `json:"option_id"`
 	} `json:"arguments"`
+}
+
+// consultContextFields is the slice of the daemon's context_json blob the
+// select_options resolver needs; everything else stays opaque. The key
+// names are a wire contract with daemon.consultContext — renaming either
+// side silently degrades single-menu answers to bare digits (the daemon's
+// gates still re-check them).
+type consultContextFields struct {
+	Options  []string `json:"options"`
+	TabCount int      `json:"tab_count"`
+}
+
+// resolveSelectOptions turns 1-based option numbers into the outbound reply
+// the daemon's gates expect: the option's text for a single menu (falling
+// back to the bare digit when the context lists no options — numbered menus
+// accept an already-numeric selection), or the space-joined digit series for
+// a multi-tab form (one digit per tab, Submit included).
+func resolveSelectOptions(contextJSON string, selects []int) (action, optionID string, err error) {
+	var cc consultContextFields
+	// The blob is daemon-authored JSON; if it doesn't parse, degrade to no
+	// options/tabs rather than refusing the submission.
+	_ = json.Unmarshal([]byte(contextJSON), &cc)
+	if cc.TabCount > 1 && len(selects) != cc.TabCount {
+		return "", "", fmt.Errorf("this multi-tab form has %d tabs (Submit included): select_options needs exactly %d integers in tab order, got %d",
+			cc.TabCount, cc.TabCount, len(selects))
+	}
+	if cc.TabCount <= 1 && len(selects) != 1 {
+		return "", "", fmt.Errorf("this situation takes a single choice: select_options needs exactly one integer, got %d", len(selects))
+	}
+	for i, n := range selects {
+		if n < 1 || n > 9 {
+			return "", "", fmt.Errorf("select_options[%d] = %d: option numbers are 1-based menu digits (1-9)", i, n)
+		}
+	}
+	if cc.TabCount > 1 {
+		digits := make([]string, len(selects))
+		for i, n := range selects {
+			digits[i] = strconv.Itoa(n)
+		}
+		return strings.Join(digits, " "), "", nil
+	}
+	n := selects[0]
+	if len(cc.Options) > 0 {
+		if n > len(cc.Options) {
+			return "", "", fmt.Errorf("select_options[0] = %d but only %d options are offered", n, len(cc.Options))
+		}
+		return cc.Options[n-1], cc.Options[n-1], nil
+	}
+	return strconv.Itoa(n), "", nil
 }
 
 func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -156,23 +215,49 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error)
 		return textResult(req.ContextJSON), nil
 
 	case "submit_decision":
-		if p.Arguments.Action == "" {
-			return nil, fmt.Errorf("action is required")
+		action := p.Arguments.RecommendAction
+		if action == "" {
+			action = p.Arguments.Action // legacy alias
+		}
+		selects := p.Arguments.SelectOptions
+		if action == "" && len(selects) == 0 {
+			return nil, fmt.Errorf("recommend_action or select_options is required")
+		}
+		score := -1
+		if p.Arguments.ConfidentScore != nil {
+			score = *p.Arguments.ConfidentScore
+			if score < 0 || score > 100 {
+				return nil, fmt.Errorf("confident_score must be between 0 and 100, got %d", score)
+			}
 		}
 		// Accept the common noop spellings; a noop never carries an option.
-		p.Arguments.Action = domain.NormalizeNoopAction(p.Arguments.Action)
-		if p.Arguments.Action == domain.ActionNoop {
-			p.Arguments.OptionID = ""
+		action = domain.NormalizeNoopAction(action)
+		optionID := p.Arguments.OptionID
+		if action == domain.ActionNoop {
+			optionID, selects = "", nil
 		}
 		req, err := s.resolveRequest(ctx, requestID)
 		if err != nil {
 			return nil, err
 		}
+		if len(selects) > 0 {
+			// The explicit MCQ answer wins over any free-text action: it is
+			// resolved against the staged context so the daemon's gates see
+			// the option text (single menu) or the digit series (multi-tab).
+			resolved, resolvedOption, rerr := resolveSelectOptions(req.ContextJSON, selects)
+			if rerr != nil {
+				return nil, rerr
+			}
+			// Unconditional: on the bare-digit path resolvedOption is empty,
+			// and a stale caller-supplied option_id must not survive it.
+			action, optionID = resolved, resolvedOption
+		}
 		_, err = s.Store.InsertLLMDecision(ctx, domain.LLMDecision{
 			RequestID: req.RequestID, Signature: req.Signature,
 			SituationType: req.SituationType, AgentType: req.AgentType,
-			Action: p.Arguments.Action, OptionID: p.Arguments.OptionID,
-			Rationale: p.Arguments.Rationale, Status: "pending",
+			Action: action, OptionID: optionID,
+			Rationale: p.Arguments.Rationale, ConfidentScore: score,
+			Status:    "pending",
 			CreatedAt: time.Now(),
 		})
 		if err != nil {

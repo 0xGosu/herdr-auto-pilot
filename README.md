@@ -270,7 +270,13 @@ When no confident learned rule applies, the plugin can consult a local
 LLM/agent CLI you already have installed. The model receives context and
 submits its suggestion through the plugin's own MCP server
 (`hap mcp` — tools `get_context` and `submit_decision`); its
-stdout is captured for audit only. Example for Claude Code:
+stdout is captured for audit only. `submit_decision` takes
+`recommend_action` (literal reply text, or `@noop` for "no reply
+needed"), `select_options` (the explicit multiple-choice answer: 1-based
+option numbers — `[2]` for a single menu, one integer per tab for a
+multi-tab form), and an optional `confident_score` (0-100, shown on the
+escalation entry so you can weigh the suggestion). Example for Claude
+Code:
 
 ```toml
 [llm]
@@ -278,7 +284,7 @@ stdout is captured for audit only. Example for Claude Code:
 # auto-repairs a prompt misplaced after other flags — see below).
 command = [
   "claude", "-p",
-  "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (action '@noop' to do nothing).",
+  "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (select_options for multiple-choice, recommend_action '@noop' to do nothing).",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
 ]
@@ -318,7 +324,7 @@ command = [
   "-c", 'mcp_servers.hap.env.HAP_REQUEST_ID="{request_id}"',
   "-c", 'mcp_servers.hap.env.HAP_DB_PATH="{db}"',
   "-c", 'mcp_servers.hap.env.HAP_CONTROL_PATH="{control}"',
-  "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (action '@noop' to do nothing). Do not run any other commands.",
+  "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (select_options for multiple-choice, recommend_action '@noop' to do nothing). Do not run any other commands.",
 ]
 timeout_seconds = 180
 ```
@@ -343,7 +349,7 @@ needed):
 # (auto-repaired if misplaced).
 command = [
   "agy", "--print",
-  "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (action '@noop' to do nothing).",
+  "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (select_options for multiple-choice, recommend_action '@noop' to do nothing).",
   "--dangerously-skip-permissions",
 ]
 timeout_seconds = 180

@@ -1166,6 +1166,44 @@ func TestLLMFallbackStagingRegateAndPromotion(t *testing.T) {
 	}
 }
 
+func TestLLMConfidentScoreShownOnEscalation(t *testing.T) {
+	// The agent's self-reported confident_score (0-100) must reach the
+	// escalation entry the operator sees; without one (-1) nothing is added.
+	cfg := "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n" // auto_act off → shadow reject
+	h := newHarness(t, cfg)
+	h.herdr.setPane(approvalPane)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, err := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "1", Rationale: "operator always approves",
+			ConfidentScore: 62, Status: "pending", CreatedAt: time.Now(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &domain.LLMDecision{
+			ID: id, RequestID: req.RequestID, Action: "1",
+			Rationale: "operator always approves", ConfidentScore: 62, Status: "pending",
+		}, nil
+	}
+
+	ctx := context.Background()
+	h.push("agent-cs", "blocked")
+	var esc []domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if !strings.Contains(esc[0].Rationale, "llm confidence 62/100") {
+		t.Errorf("escalation rationale should carry the confident score, got %q", esc[0].Rationale)
+	}
+	if !strings.Contains(esc[0].Rationale, "[shadow_mode]") {
+		t.Errorf("shadow-mode reject expected, got %q", esc[0].Rationale)
+	}
+}
+
 type atomicString struct {
 	mu sync.Mutex
 	v  string
