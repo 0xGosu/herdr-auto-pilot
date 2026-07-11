@@ -1,0 +1,115 @@
+name: Auto Release
+
+# Every push to main cuts a release, versioned from herdr-plugin.toml:
+#
+# - manifest version ALREADY tagged  → ordinary merge: open a patch-bump PR
+#   (bump commit carries [skip ci], so CI ignores it), merge it with the
+#   owner's token (RELEASE_PAT secret, admin squash-merge), tag, build,
+#   publish;
+# - manifest version NOT yet tagged  → a manual major/minor bump merged:
+#   tag and release exactly the manifest version, no bump PR.
+#
+# The manifest/tag invariant (version in herdr-plugin.toml == git tag) holds
+# by construction. No loops: the squashed bump commit lands on main with
+# [skip ci], which suppresses every push-triggered workflow — including this
+# one — regardless of which token merged it. The release build is invoked
+# via workflow_call from THIS run (triggered by the original merge), so the
+# skip marker never suppresses the build. Doc/workflow-only pushes don't
+# trigger (paths-ignore) and [skip release] in the merge commit opts out.
+# The old manual path — pushing a v*.*.* tag by hand — still works via
+# release.yml's tag trigger.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/**'
+
+permissions:
+  contents: write
+
+# Serialize runs: a second merge landing mid-release waits, then resolves
+# its version from the (by then bumped) latest main.
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags decide bump-vs-release
+      - name: Resolve version (bump PR when the manifest version is already tagged)
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+        run: |
+          set -euo pipefail
+          # Work from the LATEST main, not the triggering SHA: a run queued
+          # behind another release must see that release's bump commit.
+          git fetch origin main
+          git checkout -B main origin/main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          CURRENT=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml)
+          [ -n "$CURRENT" ] || { echo "::error::no version in herdr-plugin.toml"; exit 1; }
+
+          if git rev-parse -q --verify "refs/tags/v${CURRENT}" >/dev/null; then
+            # Ordinary merge: the manifest version is already released, so
+            # this push earns a patch bump — via a PR merged with the
+            # owner's token, per repo convention (never commit to main).
+            [ -n "${GH_TOKEN}" ] || { echo "::error::RELEASE_PAT secret is not set; cannot open the bump PR"; exit 1; }
+            IFS=. read -r MA MI PA <<<"$CURRENT"
+            NEXT="${MA}.${MI}.$((PA + 1))"
+            if git rev-parse -q --verify "refs/tags/v${NEXT}" >/dev/null; then
+              echo "::error::tag v${NEXT} already exists but the manifest says ${CURRENT}; fix the manifest manually"
+              exit 1
+            fi
+            BRANCH="release/bump-v${NEXT}"
+            git checkout -b "${BRANCH}"
+            sed -i "s/^version = \"${CURRENT}\"/version = \"${NEXT}\"/" herdr-plugin.toml
+            git commit -am "#1 chore: bump plugin version to ${NEXT} [skip ci]"
+            git push origin "HEAD:${BRANCH}"
+            gh pr create --base main --head "${BRANCH}" \
+              --title "#1 chore: bump plugin version to ${NEXT} [skip ci]" \
+              --body "Automated patch bump for the release of v${NEXT} (triggered by ${GITHUB_SHA}). CI is skipped on this PR; the release build runs in the Auto Release workflow."
+            # Mergeability computation can lag a freshly opened PR briefly.
+            for i in 1 2 3 4 5; do
+              gh pr merge "${BRANCH}" --squash --admin --delete-branch \
+                --subject "#1 chore: bump plugin version to ${NEXT} [skip ci]" \
+                --body "Automated patch bump for v${NEXT}." && break
+              [ "$i" = 5 ] && { echo "::error::could not merge the bump PR"; exit 1; }
+              sleep 5
+            done
+            git fetch origin main
+            git checkout -B main origin/main
+            VERSION="$NEXT"
+          else
+            # Manual major/minor bump just merged: release it as-is.
+            VERSION="$CURRENT"
+          fi
+
+          # Tag via the checkout's persisted GITHUB_TOKEN credentials: that
+          # token never retriggers workflows, so release.yml's tag trigger
+          # stays quiet — the build below is invoked directly instead.
+          git tag "v${VERSION}"
+          git push origin "v${VERSION}"
+          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Build & publish
+    needs: version
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      ref: ${{ needs.version.outputs.ref }}
