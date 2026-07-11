@@ -39,10 +39,13 @@ max_error_retries = 2              # per error signature
 
 # ── Operator LLM (consulted on unknown situations) ──────────────────
 # Omit this whole section to escalate unknown situations directly to you.
+# Two recipes are shown below — Claude Code is active; the OpenAI Codex
+# equivalent is commented out. Enable ONE `command` / `rewrite_command`
+# pair (comment the Claude keys and uncomment the Codex ones to switch).
 [llm]
-# Claude Code recipe; {self} = the hap binary, {request_id} is filled per
-# consult. The prompt must come immediately after -p (claude quirk; the
-# plugin also auto-repairs it).
+# ── Claude Code recipe (active) ──
+# {self} = the hap binary, {request_id} is filled per consult. The prompt
+# must come immediately after -p (claude quirk; the plugin auto-repairs it).
 command = [
   "claude", "-p",
   "You are the auto-answer assistant for herd-auto-prompter (hap). A coding agent running in a herdr terminal pane has stopped and is waiting for input. Your job: answer exactly as the human operator would, using ONLY the two hap MCP tools.\n\nStep 1 — call get_context. It returns the classified situation:\n- situation_type: 'approval' (permission prompt), 'choice' (menu of options), 'error' (the agent hit a failure), or 'idle' (finished or waiting for its next instruction)\n- options: the menu option texts, when the pane shows a menu\n- permission_verb: what the agent is asking permission to do\n- error_summary: short description of the failure, when situation_type is 'error'\n- pane_excerpt: the recent terminal screen — read it carefully; it is the ground truth for what the agent is doing and asking\n- cwd / foreground_cwd and herdr ids (workspace_id, tab_id, pane_id, agent_id): where the agent is working\n\nStep 2 — decide what the operator would answer:\n- approval / choice: pick ONE entry from options and use its EXACT text. Approve routine, reversible work (reading files, edits, builds, tests, linters). Prefer the safest option and DENY anything destructive or hard to reverse: deleting data, force-pushing or hard-resetting git history, production/deploy changes, touching secrets or credentials, mass file operations.\n- error: reply with one short, concrete instruction telling the agent how to diagnose or fix the failure and continue.\n- idle: reply with the most sensible next instruction based on the pane_excerpt (e.g. continue the remaining work); if nothing remains, tell it to summarize and stop.\n- If the pane_excerpt is ambiguous or does not match the classified situation, choose the most conservative reply.\n\nStep 3 — call submit_decision with: action = the literal reply text to send to the agent (for menus, the exact option text — hap maps it to the menu digit), option_id = the chosen option text for menus, rationale = one sentence on why the operator would answer this way.",
@@ -50,15 +53,44 @@ command = [
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
   "--model", "opus",
 ]
-timeout_seconds = 120
+
+# ── OpenAI Codex CLI recipe (commented; swap in to use codex) ──
+# The `exec` subcommand is required for headless runs (the plugin inserts
+# it if you forget), and the bypass flag is needed because Codex's approval
+# policy auto-denies MCP tool calls when headless — hap's own safety
+# controls still re-gate every submission. Codex sanitizes the MCP server's
+# environment, so the db/control paths must be passed explicitly via
+# {db}/{control}.
+# command = [
+#   "codex", "exec", "--skip-git-repo-check",
+#   "--dangerously-bypass-approvals-and-sandbox",
+#   "-c", 'mcp_servers.hap.command="{self}"',
+#   "-c", 'mcp_servers.hap.args=["mcp"]',
+#   "-c", 'mcp_servers.hap.env.HAP_REQUEST_ID="{request_id}"',
+#   "-c", 'mcp_servers.hap.env.HAP_DB_PATH="{db}"',
+#   "-c", 'mcp_servers.hap.env.HAP_CONTROL_PATH="{control}"',
+#   "You are the auto-answer assistant for herd-auto-prompter (hap). A coding agent running in a herdr terminal pane has stopped and is waiting for input. Your job: answer exactly as the human operator would, using ONLY the two hap MCP tools.\n\nStep 1 — call get_context. It returns the classified situation:\n- situation_type: 'approval' (permission prompt), 'choice' (menu of options), 'error' (the agent hit a failure), or 'idle' (finished or waiting for its next instruction)\n- options: the menu option texts, when the pane shows a menu\n- permission_verb: what the agent is asking permission to do\n- error_summary: short description of the failure, when situation_type is 'error'\n- pane_excerpt: the recent terminal screen — read it carefully; it is the ground truth for what the agent is doing and asking\n- cwd / foreground_cwd and herdr ids (workspace_id, tab_id, pane_id, agent_id): where the agent is working\n\nStep 2 — decide what the operator would answer:\n- approval / choice: pick ONE entry from options and use its EXACT text. Approve routine, reversible work (reading files, edits, builds, tests, linters). Prefer the safest option and DENY anything destructive or hard to reverse: deleting data, force-pushing or hard-resetting git history, production/deploy changes, touching secrets or credentials, mass file operations.\n- error: reply with one short, concrete instruction telling the agent how to diagnose or fix the failure and continue.\n- idle: reply with the most sensible next instruction based on the pane_excerpt (e.g. continue the remaining work); if nothing remains, tell it to summarize and stop.\n- If the pane_excerpt is ambiguous or does not match the classified situation, choose the most conservative reply.\n\nStep 3 — call submit_decision with: action = the literal reply text to send to the agent (for menus, the exact option text — hap maps it to the menu digit), option_id = the chosen option text for menus, rationale = one sentence on why the operator would answer this way.",
+# ]
+
+timeout_seconds = 120              # codex is slower to start; 180 is a safer value there
 auto_act = false                   # false: LLM suggestions are surfaced for your confirmation
 pane_excerpt_chars = 5000          # pane context included in the consult
 
+# ── Rewrite recipe — Claude Code (active) ──
+# A one-shot text transform, no MCP round-trip: the CLI runs once and its
+# stdout is the rewritten text.
 rewrite_command = [
   "claude", "-p",
   "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
   "--model", "haiku",
 ]
+
+# ── Rewrite recipe — OpenAI Codex (commented; swap in to use codex) ──
+# rewrite_command = [
+#   "codex", "exec", "--skip-git-repo-check",
+#   "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
+# ]
+
 rewrite_timeout_seconds = 60       # omitted: inherits timeout_seconds
 rewrite_fallback_template = "You must act based on the following: {original_text}"
 
@@ -77,6 +109,12 @@ bm25_min_score = 0.35       # text-fallback floor when the model is unavailable,
 gpu_layers = 0              # inert in official builds (Metal/Vulkan compiled out; the
                             # bundled MiniLM runs in ms on CPU) — only meaningful if you
                             # rebuild llama-go with GPU on and use a larger model
+# pane_salient_chars controls the fallback signature window: for idle/
+# unclassified situations the signature (and its embedding) is minted from
+# the trailing N characters of pane content. Omit or 0 → built-in default (800).
+# Changing it re-keys idle/unclassified rules once (they re-learn); structured
+# approval/choice/error rules are unaffected.
+# pane_salient_chars = 800
 
 # ── TUI ─────────────────────────────────────────────────────────────
 [tui]

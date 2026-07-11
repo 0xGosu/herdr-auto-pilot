@@ -9,6 +9,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/match"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/reembed"
 )
 
 // initSemantic builds the match index from the persisted semantic identities
@@ -24,50 +25,32 @@ func (d *Daemon) initSemantic(ctx context.Context, gen int64) {
 		return
 	}
 
-	rows, err := d.opt.Store.ListSignatureEmbeddings(ctx)
+	// Warm the embedder and re-embed rows minted by another model (or with
+	// stale dims) from their stored salient text, so a model swap keeps
+	// every signature matchable. Warm failure is not fatal: the index still
+	// serves BM25 text matching (dims 0).
+	res, err := reembed.Reconcile(ctx, d.opt.Store, d.embedderPort(),
+		func(_, _ int, sig string, rowErr error) {
+			if rowErr != nil {
+				slog.Warn("re-embedding stored signature failed; row serves text matching only",
+					"signature", sig, "error", rowErr)
+			}
+		},
+		// A newer reload owns the table once the generation moves on; stop
+		// so this run cannot overwrite the newer run's fresh vectors.
+		func() bool { return d.semanticGen.Load() != gen })
 	if err != nil {
 		slog.Warn("semantic index load failed; matching stays exact-hash", "error", err)
 		return
 	}
-
-	// Warm the embedder to learn the model's dimensionality. Failure is not
-	// fatal: the index still serves BM25 text matching (dims 0).
-	dims := 0
-	emb := d.embedderPort()
-	if emb != nil {
-		if _, err := emb.EmbedText(ctx, "warmup"); err != nil {
-			slog.Warn("embedder unavailable; semantic matching falls back to text search", "error", err)
-		} else {
-			dims = emb.Dims()
-		}
-	}
-
-	// Vectors from another model (or stale dims) are re-embedded from their
-	// stored salient text so a model swap keeps every signature matchable.
-	if dims > 0 {
-		for i := range rows {
-			r := &rows[i]
-			if r.Model == emb.ModelID() && len(r.Vector) == dims {
-				continue
-			}
-			vec, err := emb.EmbedText(ctx, r.Salient)
-			if err != nil {
-				slog.Warn("re-embedding stored signature failed; row serves text matching only",
-					"signature", r.Signature, "error", err)
-				r.Vector, r.Dims, r.Model = nil, 0, ""
-				continue
-			}
-			r.Vector, r.Dims, r.Model = vec, dims, emb.ModelID()
-			if err := d.opt.Store.UpsertSignatureEmbedding(ctx, *r); err != nil {
-				slog.Warn("persisting re-embedded signature failed", "signature", r.Signature, "error", err)
-			}
-		}
+	if res.WarmErr != nil {
+		slog.Warn("embedder unavailable; semantic matching falls back to text search", "error", res.WarmErr)
 	}
 
 	if d.semanticGen.Load() != gen {
 		return // superseded by a newer reload; let its run own the index
 	}
-	if err := d.matcher.Rebuild(rows, dims); err != nil {
+	if err := d.matcher.Rebuild(res.Rows, res.Dims); err != nil {
 		slog.Warn("semantic index rebuild failed; matching stays exact-hash", "error", err)
 		return
 	}
@@ -75,7 +58,7 @@ func (d *Daemon) initSemantic(ctx context.Context, gen int64) {
 		return // a newer reload raced past; it decides readiness
 	}
 	d.semanticReady.Store(true)
-	slog.Info("semantic matching ready", "signatures", len(rows), "vector_dims", dims)
+	slog.Info("semantic matching ready", "signatures", len(res.Rows), "vector_dims", res.Dims)
 }
 
 // resolveSignature maps a freshly computed signature to its learning key:

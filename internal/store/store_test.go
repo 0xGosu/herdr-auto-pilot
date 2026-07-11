@@ -769,6 +769,38 @@ func TestSignatureEmbeddingRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCountStaleSignatureEmbeddings(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// One row on the current model, one from another model, one text-only.
+	for _, e := range []domain.SignatureEmbedding{
+		{Signature: "approval:current", SituationType: domain.SituationApproval,
+			AgentType: "claude", Model: "minilm", Dims: 3, Vector: []float32{1, 0, 0},
+			Salient: "permission:a", CreatedAt: now},
+		{Signature: "approval:foreign", SituationType: domain.SituationApproval,
+			AgentType: "claude", Model: "old-model", Dims: 2, Vector: []float32{1, 0},
+			Salient: "permission:b", CreatedAt: now},
+		{Signature: "choice:textonly", SituationType: domain.SituationChoice,
+			AgentType: "codex", Salient: "options:no;yes", CreatedAt: now},
+	} {
+		if err := s.UpsertSignatureEmbedding(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if n, err := s.CountStaleSignatureEmbeddings(ctx, "minilm"); err != nil || n != 2 {
+		t.Errorf("stale for minilm = %d (%v), want 2 (foreign + text-only)", n, err)
+	}
+	if n, err := s.CountStaleSignatureEmbeddings(ctx, "third-model"); err != nil || n != 3 {
+		t.Errorf("stale for third-model = %d (%v), want 3", n, err)
+	}
+	if n, err := s.CountStaleSignatureEmbeddings(ctx, "old-model"); err != nil || n != 2 {
+		t.Errorf("stale for old-model = %d (%v), want 2 (current + text-only)", n, err)
+	}
+}
+
 func TestDecodeVectorRejectsCorruptBlob(t *testing.T) {
 	if _, err := decodeVector([]byte{1, 2, 3}, 1); err == nil {
 		t.Error("length mismatch should error")

@@ -20,6 +20,7 @@ func TestPaletteDefaultResolution(t *testing.T) {
 		ok:      lipgloss.Color("46"),
 		paused:  lipgloss.Color("196"),
 		running: lipgloss.Color("46"),
+		warn:    lipgloss.Color("214"),
 		help:    lipgloss.Color(""),
 	}
 	for _, theme := range []string{"", "default", "DEFAULT", "Default", "  default  ", "solarized"} {

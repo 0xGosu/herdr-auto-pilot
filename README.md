@@ -194,6 +194,12 @@ model_path = ""            # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.
 similarity_threshold = 0.90 # min cosine similarity to reuse a learned signature
 bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1]
 gpu_layers = 0              # inert in official builds (GPU backends compiled out)
+# pane_salient_chars = 800  # fallback signature window for idle/unclassified
+                            # situations (trailing N characters of pane content).
+                            # Changing it (or upgrading past the 400→800 default
+                            # bump) re-keys idle/unclassified rules once, so they
+                            # re-learn; structured approval/choice/error rules
+                            # are unaffected.
 
 # TUI appearance. `theme` picks a named palette: default, dark, light,
 # high-contrast. Empty or unknown names resolve to default — the exact

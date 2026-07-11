@@ -20,6 +20,11 @@ type Kind string
 const (
 	KindReload Kind = "reload"
 	KindWake   Kind = "wake"
+	// KindReembed asks the daemon to rebuild a FRESH embedder (clearing any
+	// degraded-failure latch) and re-embed stored signatures from their
+	// salient text. Daemons predating this kind log and ignore it — the
+	// stale-daemon remedy (`hap daemon --ensure`) applies.
+	KindReembed Kind = "reembed"
 )
 
 type message struct {
@@ -72,7 +77,7 @@ func (s *Server) accept() {
 					slog.Warn("malformed control nudge ignored", "error", err)
 					continue
 				}
-				if m.Kind != KindReload && m.Kind != KindWake {
+				if m.Kind != KindReload && m.Kind != KindWake && m.Kind != KindReembed {
 					slog.Warn("unknown control nudge kind ignored", "kind", m.Kind)
 					continue
 				}

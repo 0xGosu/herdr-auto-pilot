@@ -4,6 +4,8 @@
 // name rows, TOML) directly, then nudge the daemon's control socket to
 // reload; front-ends never write daemon-owned hot-path rows (agent_names
 // is insert-if-absent from both sides and not part of that partition).
+// One maintenance exception: ReembedStandalone rewrites the daemon-owned
+// signature_embeddings rows, and only when no daemon is running.
 package frontend
 
 import (
@@ -21,6 +23,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/reembed"
 )
 
 // menuReadLines is how much of a pane the confirm/resolve path re-reads to
@@ -54,6 +57,9 @@ type App struct {
 	// DaemonInfo reports the running daemon's identity from the lock file
 	// (daemonlock.Info in prod); nil hides the daemon line in status.
 	DaemonInfo func() (running bool, pid int, version string)
+	// NewEmbedder builds the embedder for ReembedStandalone; nil defaults
+	// to the production embedder. Tests inject fakes.
+	NewEmbedder func(cfg config.Embedding) ports.EmbedderPort
 }
 
 // nudge wakes the daemon; a failed nudge is surfaced but non-fatal (the
@@ -84,6 +90,9 @@ type Status struct {
 	// "model missing (<path>)", or "ready (N signatures, <model>)". The
 	// daemon's live health (a degraded embedder) shows in its log instead.
 	Embedding string
+	// Drift reports stored embeddings minted by a different model than the
+	// currently configured one (best-effort; zero-valued on check failure).
+	Drift EmbeddingDrift
 }
 
 // GetStatus returns the operator-facing status summary.
@@ -122,7 +131,15 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 	if names, err := a.Store.AgentNames(ctx); err == nil {
 		st.AgentNames = names
 	}
-	st.Embedding = a.embeddingStatus(ctx)
+	// One config load serves both embedding summaries so they cannot
+	// disagree about a mid-edit config within a single status snapshot.
+	if cfg, err := config.Load(a.ConfigPath); err != nil {
+		st.Embedding = "unknown (config unreadable)"
+	} else {
+		st.Embedding = a.embeddingStatus(ctx, cfg)
+		// Best-effort: a drift-check failure must not break status.
+		st.Drift, _ = a.embeddingDrift(ctx, cfg)
+	}
 	// Name any live agent the daemon has not named yet (a brand-new agent,
 	// or one that predates the daemon): the operator should never have to
 	// stare at a bare pane id. Insert-if-absent, so this can never clobber
@@ -148,11 +165,7 @@ func (st Status) AgentName(agentID string) string { return st.AgentNames[agentID
 
 // embeddingStatus summarizes semantic-matching availability from config,
 // model presence on disk, and the persisted signature-embedding count.
-func (a *App) embeddingStatus(ctx context.Context) string {
-	cfg, err := config.Load(a.ConfigPath)
-	if err != nil {
-		return "unknown (config unreadable)"
-	}
+func (a *App) embeddingStatus(ctx context.Context, cfg config.Config) string {
 	if cfg.Embedding.Disabled {
 		return "disabled"
 	}
@@ -168,6 +181,110 @@ func (a *App) embeddingStatus(ctx context.Context) string {
 		return fmt.Sprintf("ready (%s)", filepath.Base(modelPath))
 	}
 	return fmt.Sprintf("ready (%d signatures, %s)", count, filepath.Base(modelPath))
+}
+
+// EmbeddingDrift reports whether stored signature embeddings were produced
+// by a different model than the currently configured one. Detection is by
+// model id (gguf basename): replacing the model file IN PLACE under the
+// same name is not detected here (a dims change is still caught by the
+// daemon's reconcile at its next index init; a same-dims in-place swap
+// silently mixes vector spaces).
+type EmbeddingDrift struct {
+	Detected     bool   // stale rows exist and embedding is enabled
+	ModelID      string // basename of the resolved model path
+	ModelMissing bool   // model file absent — a re-embed cannot run yet
+	Total        int64  // all signature_embeddings rows
+	Stale        int64  // rows a re-embed would rewrite
+}
+
+// EmbeddingDrift checks stored embeddings against the configured model.
+// Zero-valued (Detected=false) when embedding is disabled.
+func (a *App) EmbeddingDrift(ctx context.Context) (EmbeddingDrift, error) {
+	cfg, err := config.Load(a.ConfigPath)
+	if err != nil {
+		return EmbeddingDrift{}, fmt.Errorf("load config: %w", err)
+	}
+	return a.embeddingDrift(ctx, cfg)
+}
+
+// embeddingDrift is EmbeddingDrift against an already loaded config.
+func (a *App) embeddingDrift(ctx context.Context, cfg config.Config) (EmbeddingDrift, error) {
+	var d EmbeddingDrift
+	if cfg.Embedding.Disabled {
+		return d, nil
+	}
+	modelPath := embedder.ResolveModelPath(cfg.Embedding)
+	d.ModelID = filepath.Base(modelPath)
+	if _, err := os.Stat(modelPath); err != nil {
+		d.ModelMissing = true
+	}
+	var err error
+	if d.Total, err = a.Store.CountSignatureEmbeddings(ctx); err != nil {
+		return d, err
+	}
+	if d.Stale, err = a.Store.CountStaleSignatureEmbeddings(ctx, d.ModelID); err != nil {
+		return d, err
+	}
+	d.Detected = d.Stale > 0
+	return d, nil
+}
+
+// RequestReembed asks the running daemon to rebuild a fresh embedder and
+// re-embed stored signatures (control.KindReembed). Errors with the CLI
+// remedy when no daemon is running.
+func (a *App) RequestReembed(ctx context.Context) error {
+	if a.DaemonInfo != nil {
+		if running, _, _ := a.DaemonInfo(); !running {
+			return fmt.Errorf("daemon not running — run: hap signatures reembed")
+		}
+	}
+	return a.nudge(ctx, control.KindReembed)
+}
+
+// ReembedStandalone re-embeds stored signatures in this process. Only safe
+// when no daemon is running (the daemon is the owner-writer of
+// signature_embeddings), so it refuses otherwise. A daemon starting
+// mid-run is harmless: upserts are idempotent per signature and its own
+// semantic init reconciles again — worst case duplicate work. The bleve
+// match index is left alone (a disposable cache the daemon wipes and
+// rebuilds at start). progress may be nil.
+func (a *App) ReembedStandalone(ctx context.Context, progress reembed.RowFunc) (reembed.Result, error) {
+	var res reembed.Result
+	if a.DaemonInfo != nil {
+		if running, pid, _ := a.DaemonInfo(); running {
+			return res, fmt.Errorf("daemon is running (pid %d) — use: hap signatures reembed (it nudges the daemon), or stop the daemon first", pid)
+		}
+	}
+	cfg, err := config.Load(a.ConfigPath)
+	if err != nil {
+		return res, fmt.Errorf("load config: %w", err)
+	}
+	if cfg.Embedding.Disabled {
+		return res, fmt.Errorf("embedding is disabled in config — nothing to re-embed")
+	}
+	ws, ok := a.Store.(reembed.Store)
+	if !ok {
+		return res, fmt.Errorf("store lacks write access for re-embedding")
+	}
+	var emb ports.EmbedderPort
+	if a.NewEmbedder != nil {
+		emb = a.NewEmbedder(cfg.Embedding)
+	} else {
+		emb = embedder.New(cfg.Embedding)
+	}
+	defer emb.Close()
+	res, err = reembed.Reconcile(ctx, ws, emb, progress, nil)
+	if err != nil {
+		return res, err
+	}
+	if res.WarmErr != nil {
+		return res, fmt.Errorf("embedding model unavailable, nothing re-embedded: %w", res.WarmErr)
+	}
+	// Best-effort: if a daemon appeared mid-run, have it reload the index.
+	if nudgeErr := a.nudge(ctx, control.KindReembed); nudgeErr != nil {
+		_ = nudgeErr // no daemon to pick it up; the next start reconciles
+	}
+	return res, nil
 }
 
 // Names returns the agent id → short name mapping.
@@ -483,6 +600,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "embedding.similarity_threshold", TUIEditable: true},
 	{Key: "embedding.bm25_min_score", TUIEditable: true},
 	{Key: "embedding.gpu_layers", TUIEditable: true},
+	{Key: "embedding.pane_salient_chars", TUIEditable: true},
 	{Key: "tui.max_content_width", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
 }
@@ -524,6 +642,11 @@ func FieldValue(cfg config.Config, key string) string {
 		return fmt.Sprintf("%.2f", cfg.Thresholds.InferredTaskBar)
 	case "learning.graduation_n":
 		return strconv.Itoa(cfg.Learning.GraduationN)
+	case "embedding.pane_salient_chars":
+		if cfg.Embedding.PaneSalientChars <= 0 {
+			return fmt.Sprintf("%d (default)", domain.DefaultPaneSalientChars)
+		}
+		return strconv.Itoa(cfg.Embedding.PaneSalientChars)
 	case "limits.max_consecutive_auto_prompts":
 		return strconv.Itoa(cfg.Limits.MaxConsecutiveAutoPrompts)
 	case "limits.max_auto_prompts_per_minute":
@@ -619,6 +742,8 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setFloat(&cfg.Thresholds.InferredTaskBar)
 		case "learning.graduation_n":
 			return setInt(&cfg.Learning.GraduationN)
+		case "embedding.pane_salient_chars":
+			return setInt(&cfg.Embedding.PaneSalientChars)
 		case "limits.max_consecutive_auto_prompts":
 			return setInt(&cfg.Limits.MaxConsecutiveAutoPrompts)
 		case "limits.max_auto_prompts_per_minute":

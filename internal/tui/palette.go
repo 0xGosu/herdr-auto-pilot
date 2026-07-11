@@ -17,6 +17,7 @@ type palette struct {
 	ok      lipgloss.Color
 	paused  lipgloss.Color
 	running lipgloss.Color
+	warn    lipgloss.Color
 	help    lipgloss.Color // empty = faint only (the original look)
 }
 
@@ -33,6 +34,7 @@ var themes = map[string]palette{
 		ok:      lipgloss.Color("46"),
 		paused:  lipgloss.Color("196"),
 		running: lipgloss.Color("46"),
+		warn:    lipgloss.Color("214"),
 	},
 	"dark": {
 		title:   lipgloss.Color("213"),
@@ -41,6 +43,7 @@ var themes = map[string]palette{
 		ok:      lipgloss.Color("84"),
 		paused:  lipgloss.Color("203"),
 		running: lipgloss.Color("84"),
+		warn:    lipgloss.Color("215"),
 		help:    lipgloss.Color("245"),
 	},
 	"light": {
@@ -50,6 +53,7 @@ var themes = map[string]palette{
 		ok:      lipgloss.Color("28"),
 		paused:  lipgloss.Color("124"),
 		running: lipgloss.Color("28"),
+		warn:    lipgloss.Color("130"),
 		help:    lipgloss.Color("240"),
 	},
 	"high-contrast": {
@@ -59,6 +63,7 @@ var themes = map[string]palette{
 		ok:      lipgloss.Color("46"),
 		paused:  lipgloss.Color("201"),
 		running: lipgloss.Color("46"),
+		warn:    lipgloss.Color("208"),
 		help:    lipgloss.Color("252"),
 	},
 }
@@ -83,6 +88,7 @@ func resolvePalette(t config.TUI) palette {
 	set(&p.ok, o.OK)
 	set(&p.paused, o.Paused)
 	set(&p.running, o.Running)
+	set(&p.warn, o.Warn)
 	set(&p.help, o.Help)
 	return p
 }
@@ -100,6 +106,7 @@ type styles struct {
 	help        lipgloss.Style
 	err         lipgloss.Style
 	ok          lipgloss.Style
+	warn        lipgloss.Style
 }
 
 func newStyles(p palette) styles {
@@ -118,6 +125,7 @@ func newStyles(p palette) styles {
 		help:        help,
 		err:         lipgloss.NewStyle().Foreground(p.err),
 		ok:          lipgloss.NewStyle().Foreground(p.ok),
+		warn:        lipgloss.NewStyle().Bold(true).Foreground(p.warn),
 	}
 }
 

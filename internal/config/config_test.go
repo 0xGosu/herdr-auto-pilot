@@ -35,6 +35,24 @@ func TestLoadPartialConfigFillsDefaults(t *testing.T) {
 	if cfg.Learning.GraduationN != Default().Learning.GraduationN {
 		t.Errorf("graduation N default lost: %d", cfg.Learning.GraduationN)
 	}
+	// PaneSalientChars is unset here: 0 is the valid "use the built-in
+	// default" sentinel (the domain layer applies DefaultPaneSalientChars),
+	// so fillZeroes must leave it at 0 rather than freezing a value.
+	if cfg.Embedding.PaneSalientChars != 0 {
+		t.Errorf("unset pane_salient_chars should stay 0 (use-default), got %d", cfg.Embedding.PaneSalientChars)
+	}
+}
+
+func TestPaneSalientCharsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte("[embedding]\npane_salient_chars = 1200\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embedding.PaneSalientChars != 1200 {
+		t.Errorf("explicit pane_salient_chars lost: %d", cfg.Embedding.PaneSalientChars)
+	}
 }
 
 func TestLoadMalformedTOMLRejectedSafely(t *testing.T) {

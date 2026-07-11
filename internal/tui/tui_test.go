@@ -958,3 +958,90 @@ func TestEscalationDetailSnapshotFallback(t *testing.T) {
 		t.Errorf("missing snapshot should render the fallback line:\n%s", m.View())
 	}
 }
+
+// driftModel builds a model whose refresh carries an embedding-drift report.
+func driftModel(t *testing.T, drift frontend.EmbeddingDrift) Model {
+	t.Helper()
+	m := Model{width: 100, height: 30}
+	upd, _ := m.Update(refreshMsg{status: frontend.Status{Drift: drift}})
+	return upd.(Model)
+}
+
+func TestDriftBannerRenders(t *testing.T) {
+	m := driftModel(t, frontend.EmbeddingDrift{
+		Detected: true, ModelID: "new-model.gguf", Stale: 3, Total: 5,
+	})
+	view := m.View()
+	if !strings.Contains(view, "embedding model changed") ||
+		!strings.Contains(view, "3 of 5 rules need re-compute") ||
+		!strings.Contains(view, "hap signatures reembed") {
+		t.Errorf("drift banner missing or incomplete:\n%s", view)
+	}
+	if !strings.Contains(m.helpLine(), "R: re-embed") {
+		t.Errorf("help line should advertise R while drifted, got %q", m.helpLine())
+	}
+
+	// The banner stays out of the way while the model file is missing (a
+	// re-embed cannot run yet) and when there is no drift.
+	missing := driftModel(t, frontend.EmbeddingDrift{
+		Detected: true, ModelMissing: true, Stale: 3, Total: 5,
+	})
+	if strings.Contains(missing.View(), "embedding model changed") {
+		t.Error("banner must be suppressed while the model file is missing")
+	}
+	clean := driftModel(t, frontend.EmbeddingDrift{})
+	if strings.Contains(clean.View(), "embedding model changed") {
+		t.Error("banner must be absent without drift")
+	}
+	if strings.Contains(clean.helpLine(), "R: re-embed") {
+		t.Error("help line must not advertise R without drift")
+	}
+}
+
+func TestReembedKey(t *testing.T) {
+	// Without drift, R is a no-op with a hint.
+	m := driftModel(t, frontend.EmbeddingDrift{})
+	upd, cmd := m.Update(pressKeyMsg("R"))
+	m = upd.(Model)
+	if cmd != nil || !strings.Contains(m.message, "no embedding drift") {
+		t.Errorf("driftless R should only hint, message=%q cmd=%v", m.message, cmd)
+	}
+
+	// Drift with a missing model file: R refuses with the CLI remedy
+	// instead of a misleading "requested" toast.
+	m = driftModel(t, frontend.EmbeddingDrift{Detected: true, ModelMissing: true, Stale: 1, Total: 1})
+	upd, cmd = m.Update(pressKeyMsg("R"))
+	m = upd.(Model)
+	if cmd != nil || !strings.Contains(m.message, "embedding.model_path") {
+		t.Errorf("missing-model R should refuse with the config remedy, message=%q cmd=%v", m.message, cmd)
+	}
+
+	// With drift but no daemon, the resulting action surfaces the CLI
+	// remedy through the normal action-outcome path.
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	app := &frontend.App{
+		Store:      st,
+		ConfigPath: filepath.Join(dir, "config.toml"),
+		DaemonInfo: func() (bool, int, string) { return false, 0, "" },
+	}
+	m = driftModel(t, frontend.EmbeddingDrift{Detected: true, Stale: 1, Total: 1})
+	m.app = app
+	m.ctx = context.Background()
+	upd, cmd = m.Update(pressKeyMsg("R"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("drifted R must produce a command")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok {
+		t.Fatalf("command result = %T, want actionResultMsg", cmd())
+	}
+	if res.err == nil || !strings.Contains(res.err.Error(), "hap signatures reembed") {
+		t.Errorf("daemon-down R should surface the CLI remedy, got %v", res.err)
+	}
+}
