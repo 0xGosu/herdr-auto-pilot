@@ -112,4 +112,9 @@ jobs:
       # internal/domain is pure Go (TestDomainPurity), so no native deps
       # or build tags are needed here.
       - name: Seed patterns must catch 100% of the irreversible-op corpus
-        run: go test ./internal/domain/ -run TestSeedAllowlistCatchesCorpus -v -count=1
+        # Guard against the -run pattern silently matching nothing (go test
+        # exits 0 with "no tests to run"): require the PASS line explicitly.
+        run: |
+          go test ./internal/domain/ -run 'TestSeedNeverAutoCatchesCorpus$' -v -count=1 | tee /tmp/corpus-gate.out
+          grep -q -- '--- PASS: TestSeedNeverAutoCatchesCorpus' /tmp/corpus-gate.out \
+            || { echo '::error::corpus gate did not execute TestSeedNeverAutoCatchesCorpus (test renamed?)'; exit 1; }
