@@ -239,7 +239,7 @@ func TestLLMMultiTabConsultAndSeriesPromotion(t *testing.T) {
 		t.Fatalf("series promotion audit missing: %+v", audits)
 	}
 	<-mu
-	for _, want := range []string{`"tab_count":3`, "space-separated series of exactly 3 digits", "[question 1/3]", "[question 3/3]"} {
+	for _, want := range []string{`"tab_count":3`, "select_options MUST be a list of exactly 3 integers", "[question 1/3]", "[question 3/3]"} {
 		if !strings.Contains(contextJSON, want) {
 			t.Errorf("consult context missing %q: %s", want, contextJSON)
 		}

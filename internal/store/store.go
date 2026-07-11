@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS llm_decisions (
 	action TEXT NOT NULL,
 	option_id TEXT NOT NULL DEFAULT '',
 	rationale TEXT NOT NULL DEFAULT '',
+	confident_score INTEGER NOT NULL DEFAULT -1,
 	captured_output TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL DEFAULT 'pending',
 	created_at INTEGER NOT NULL
@@ -190,6 +191,7 @@ func (s *Store) migrate() error {
 	// the column is already there.
 	for _, ddl := range []string{
 		`ALTER TABLE audit_log ADD COLUMN agent_type TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
@@ -529,10 +531,10 @@ func (s *Store) InsertLLMDecision(ctx context.Context, d domain.LLMDecision) (in
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO llm_decisions (request_id, signature, situation_type, agent_type,
-				action, option_id, rationale, captured_output, status, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				action, option_id, rationale, confident_score, captured_output, status, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			d.RequestID, d.Signature, string(d.SituationType), d.AgentType,
-			d.Action, d.OptionID, d.Rationale, d.CapturedOutput,
+			d.Action, d.OptionID, d.Rationale, d.ConfidentScore, d.CapturedOutput,
 			orDefault(d.Status, "pending"), unix(d.CreatedAt))
 		if err != nil {
 			return err
@@ -1181,7 +1183,7 @@ func (s *Store) scanLLMDecisions(rows *sql.Rows) ([]domain.LLMDecision, error) {
 		var situationType string
 		var created int64
 		if err := rows.Scan(&d.ID, &d.RequestID, &d.Signature, &situationType, &d.AgentType,
-			&d.Action, &d.OptionID, &d.Rationale, &d.CapturedOutput, &d.Status, &created); err != nil {
+			&d.Action, &d.OptionID, &d.Rationale, &d.ConfidentScore, &d.CapturedOutput, &d.Status, &created); err != nil {
 			return nil, err
 		}
 		d.SituationType = domain.SituationType(situationType)
@@ -1192,7 +1194,7 @@ func (s *Store) scanLLMDecisions(rows *sql.Rows) ([]domain.LLMDecision, error) {
 }
 
 const llmDecisionCols = `id, request_id, signature, situation_type, agent_type,
-	action, option_id, rationale, captured_output, status, created_at`
+	action, option_id, rationale, confident_score, captured_output, status, created_at`
 
 // PendingLLMDecisions returns staged decisions awaiting daemon consumption.
 func (s *Store) PendingLLMDecisions(ctx context.Context) ([]domain.LLMDecision, error) {

@@ -212,7 +212,7 @@ sequenceDiagram
 
 **Responsibilities.** For low-confidence situations with an LLM configured, launch the operator's LLM/agent CLI with an attached stdio MCP server (`mcp` subcommand) exposing `get_context` and `submit_decision`; capture stdout/stderr for audit only (FR-010, NFR-006).
 **Key Components.** `mcp` subcommand server, argv template expander, request/timeout controller, correlation id.
-**Key Interfaces.** MCP tools `get_context(request_id)` and `submit_decision(request_id, action, option_id?, rationale)` → the `mcp` process writes a **staged `llm_decisions` row** directly to the DB and nudges the daemon.
+**Key Interfaces.** MCP tools `get_context(request_id)` and `submit_decision(request_id, recommend_action, select_options?, confident_score?, rationale)` → the `mcp` process writes a **staged `llm_decisions` row** directly to the DB and nudges the daemon.
 **Data Models.** `llm_decisions` (staged submission; consumed and re-gated by the daemon, then promoted into `decisions` with `source=LLM` on acceptance), audit fields (captured output).
 **Dependencies.** Local LLM CLI, StorePort.
 **Error Handling.** No `submit_decision` or timeout → escalate (staged row marked `expired`); the submitted decision is re-gated by the confidence gate + never-auto patterns before acting; unparseable tool args → escalate.
@@ -309,6 +309,7 @@ erDiagram
         text action
         text option_id
         text rationale
+        int confident_score
         text captured_output
         text status
         int created_at
@@ -369,9 +370,9 @@ This section makes the coordination model explicit so the single-writer question
 ### MCP tool surface (internal, exposed to the LLM agent)
 
 - `get_context(request_id) -> { situation_type, agent_type, options?, permission_verb?, history_summary }`.
-- `submit_decision(request_id, action, option_id?, rationale)` — the `mcp` process writes an `LLM_DECISIONS` row (`status=pending`) and nudges the daemon; the daemon re-gates it (confidence + never-auto patterns) before promoting it into `DECISIONS` and acting.
+- `submit_decision(request_id, recommend_action, select_options?, confident_score?, rationale)` — the `mcp` process writes an `LLM_DECISIONS` row (`status=pending`) and nudges the daemon; the daemon re-gates it (confidence + never-auto patterns) before promoting it into `DECISIONS` and acting.
 - `action: "@noop"` (sentinel; `noop`/`no_op`/`no-op` normalize to it) — an explicit "no reply needed" decision: promoted like any other submission (audit `action=noop`, learned as `@noop`, runaway counter advanced) but nothing is ever sent to the pane. Breaks the LLM↔agent nudge loop on idle/done status reports. Free text such as "do nothing" is NOT normalized — it stays a literal reply.
-- Multi-tab MCQ forms (Claude AskUserQuestion / plan-mode): the daemon sweeps every tab (Right-arrow protocol, reset with a fixed Left-arrow burst) and the consult context carries the aggregated questions plus `tab_count` and `answer_format`. The answer is a space-separated digit series, one digit per tab INCLUDING the final Submit tab (e.g. `"1 2 3 2 1"`); a length mismatch is rejected — a partial answer is never delivered. Delivery is one digit keystroke per tab (the form advances itself), never literal text.
+- Multi-tab MCQ forms (Claude AskUserQuestion / plan-mode): the daemon sweeps every tab (Right-arrow protocol, reset with a fixed Left-arrow burst) and the consult context carries the aggregated questions plus `tab_count` and `answer_format`. The LLM answers with `select_options` — one integer per tab INCLUDING the final Submit tab (e.g. `[1, 2, 3, 2, 1]`), which the `mcp` process stages as the space-separated digit series (`"1 2 3 2 1"`) the daemon's length gate checks; a length mismatch is rejected — a partial answer is never delivered. Delivery is one digit keystroke per tab (the form advances itself), never literal text.
 
 ### Error Codes / semantics
 

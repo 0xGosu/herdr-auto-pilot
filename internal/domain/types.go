@@ -213,14 +213,17 @@ func KillStateActive(latest *KillEvent) bool {
 
 // LLMDecision is a staged submission written by the mcp process.
 type LLMDecision struct {
-	ID             int64
-	RequestID      string
-	Signature      string
-	SituationType  SituationType
-	AgentType      string
-	Action         string
-	OptionID       string
-	Rationale      string
+	ID            int64
+	RequestID     string
+	Signature     string
+	SituationType SituationType
+	AgentType     string
+	Action        string
+	OptionID      string
+	Rationale     string
+	// ConfidentScore is the agent's self-reported confidence in this
+	// decision, 0-100; -1 means the agent did not report one.
+	ConfidentScore int
 	CapturedOutput string
 	Status         string // pending | accepted | rejected | expired
 	CreatedAt      time.Time

@@ -429,7 +429,8 @@ func TestLLMRequestDecisionFlow(t *testing.T) {
 	}
 
 	_, err = s.InsertLLMDecision(ctx, domain.LLMDecision{
-		RequestID: "req-1", Action: "a", Rationale: "because", CreatedAt: time.Now(),
+		RequestID: "req-1", Action: "a", Rationale: "because",
+		ConfidentScore: 62, CreatedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -437,6 +438,9 @@ func TestLLMRequestDecisionFlow(t *testing.T) {
 	pending, err := s.PendingLLMDecisions(ctx)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending llm decisions: %+v %v", pending, err)
+	}
+	if pending[0].ConfidentScore != 62 {
+		t.Errorf("confident score round trip: got %d, want 62", pending[0].ConfidentScore)
 	}
 	if err := s.UpdateLLMDecisionStatus(ctx, pending[0].ID, "accepted"); err != nil {
 		t.Fatal(err)
@@ -765,6 +769,64 @@ func TestDecodeVectorRejectsCorruptBlob(t *testing.T) {
 	}
 	if v, err := decodeVector(nil, 0); err != nil || v != nil {
 		t.Errorf("empty blob should be nil vector, got %v/%v", v, err)
+	}
+}
+
+func TestMigrateAddsConfidentScoreToLegacyLLMDecisions(t *testing.T) {
+	// A database created before confident_score existed has an
+	// llm_decisions table WITHOUT the column; CREATE IF NOT EXISTS skips
+	// the existing table, so only the ALTER in migrate() can add it. The
+	// column lands at the end (fresh DBs carry it mid-table) — harmless,
+	// because every query names its columns explicitly.
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+		CREATE TABLE llm_decisions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			request_id TEXT NOT NULL,
+			signature TEXT NOT NULL DEFAULT '',
+			situation_type TEXT NOT NULL DEFAULT '',
+			agent_type TEXT NOT NULL DEFAULT '',
+			action TEXT NOT NULL,
+			option_id TEXT NOT NULL DEFAULT '',
+			rationale TEXT NOT NULL DEFAULT '',
+			captured_output TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'pending',
+			created_at INTEGER NOT NULL
+		);
+		INSERT INTO llm_decisions (request_id, action, status, created_at)
+		VALUES ('req-legacy', 'Yes', 'pending', 1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("opening a legacy DB must migrate, got: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	ctx := context.Background()
+	// The pre-migration row reads back the -1 "not reported" sentinel.
+	legacy, err := s.LLMDecisionByRequest(ctx, "req-legacy")
+	if err != nil || legacy == nil || legacy.ConfidentScore != -1 {
+		t.Fatalf("legacy row after migration: %+v %v", legacy, err)
+	}
+	// New rows round-trip the migrated column.
+	if _, err := s.InsertLLMDecision(ctx, domain.LLMDecision{
+		RequestID: "req-new", Action: "No", ConfidentScore: 40, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := s.LLMDecisionByRequest(ctx, "req-new")
+	if err != nil || fresh == nil || fresh.ConfidentScore != 40 {
+		t.Fatalf("migrated column round trip: %+v %v", fresh, err)
 	}
 }
 

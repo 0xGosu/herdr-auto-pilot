@@ -908,6 +908,9 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		workspaceID = info.WorkspaceID
 	}
 
+	// "options" and "tab_count" are a wire contract with the mcp server's
+	// select_options resolver (mcpserver.consultContextFields) — keep the
+	// key names in sync.
 	fields := map[string]any{
 		"situation_type":  s.Type,
 		"agent_type":      s.AgentType,
@@ -921,13 +924,15 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		"agent_id":        s.AgentID,
 		"cwd":             info.Cwd,
 		"foreground_cwd":  info.ForegroundCwd,
-		"no_reply_option": "if the agent needs no reply (it finished or is only reporting status), submit_decision with action \"@noop\" to explicitly do nothing",
+		"no_reply_option": "if the agent needs no reply (it finished or is only reporting status), submit_decision with recommend_action \"@noop\" to explicitly do nothing",
 	}
 	if s.TabCount > 1 {
 		fields["tab_count"] = s.TabCount
 		fields["answer_format"] = fmt.Sprintf(
-			"this is a multi-tab question form with %d tabs (the final tab is Submit); the pane excerpt lists every question in order. submit_decision action MUST be a space-separated series of exactly %d digits, one chosen option digit per tab including Submit, e.g. \"1 2 3 2 1\"",
+			"this is a multi-tab question form with %d tabs (the final tab is Submit); the pane excerpt lists every question in order. submit_decision select_options MUST be a list of exactly %d integers, one chosen option number per tab including Submit, e.g. [1, 2, 3, 2, 1]",
 			s.TabCount, s.TabCount)
+	} else if len(s.Options) > 0 {
+		fields["answer_format"] = "answer with submit_decision select_options: a one-element list with the 1-based number of the chosen option, e.g. [2]"
 	}
 	contextJSON, _ := json.Marshal(fields)
 	return contextJSON
@@ -1217,6 +1222,16 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		if isNoop {
 			// Raw "@noop" is never surfaced to humans.
 			suggested = domain.ActionNoopSuggestion
+		}
+		// Surface the agent's self-reported confidence on the escalation so
+		// the operator can weigh the suggestion (-1 = not reported).
+		if llmDec.ConfidentScore >= 0 {
+			conf := fmt.Sprintf("llm confidence %d/100", llmDec.ConfidentScore)
+			if why == "" {
+				why = conf
+			} else {
+				why += "; " + conf
+			}
 		}
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: reason, Rationale: why,
