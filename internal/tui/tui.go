@@ -430,11 +430,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "x", "delete":
 		switch m.tab {
 		case tabEscalations:
-			return m.deleteEscalationsPrompt()
+			return m.deleteEscalations()
 		case tabSignatures:
 			return m.deleteSignaturePrompt()
 		case tabConfig:
 			return m.removeSelectedRule()
+		case tabAudit:
+			m.message = "audit log is append-only — entries can't be deleted individually"
 		}
 	case "X":
 		switch m.tab {
@@ -590,10 +592,10 @@ func describeEscalations(ids []int64) string {
 	return fmt.Sprintf("%d escalations (%s)", len(ids), strings.Join(parts, " "))
 }
 
-// deleteEscalationsPrompt confirms then dismisses the targeted escalations:
-// they leave the pending queue without a reply being sent or learned; the
+// deleteEscalations immediately dismisses the targeted escalations — no
+// confirmation: dismissing is safe (nothing is sent or learned) and the
 // audit rows are kept with status "dismissed".
-func (m Model) deleteEscalationsPrompt() (tea.Model, tea.Cmd) {
+func (m Model) deleteEscalations() (tea.Model, tea.Cmd) {
 	ids := m.deleteEscalationIDs()
 	if len(ids) == 0 {
 		return m, nil
@@ -601,38 +603,29 @@ func (m Model) deleteEscalationsPrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	desc := describeEscalations(ids)
 	m.message = ""
-	m.prompt = &prompt{
-		label: fmt.Sprintf("type 'yes' to delete %s — nothing is sent or learned", desc),
-		onSubmit: func(input string) tea.Cmd {
-			return func() tea.Msg {
-				if input != "yes" {
-					return actionResultMsg{message: "delete aborted"}
+	return m, func() tea.Msg {
+		// Skip-and-continue: a failed id usually means the row was
+		// resolved/confirmed concurrently; the rest still delete.
+		deleted := 0
+		var skipped []string
+		var firstErr error
+		for _, id := range ids {
+			if err := app.Dismiss(ctx, id); err != nil {
+				skipped = append(skipped, fmt.Sprintf("#%d", id))
+				if firstErr == nil {
+					firstErr = err
 				}
-				// Skip-and-continue: a failed id usually means the row was
-				// resolved/confirmed concurrently; the rest still delete.
-				deleted := 0
-				var skipped []string
-				var firstErr error
-				for _, id := range ids {
-					if err := app.Dismiss(ctx, id); err != nil {
-						skipped = append(skipped, fmt.Sprintf("#%d", id))
-						if firstErr == nil {
-							firstErr = err
-						}
-						continue
-					}
-					deleted++
-				}
-				if firstErr != nil {
-					return actionResultMsg{err: fmt.Errorf("deleted %d, skipped %s: %w",
-						deleted, strings.Join(skipped, " "), firstErr)}
-				}
-				return actionResultMsg{message: fmt.Sprintf(
-					"deleted %s; audit rows kept as dismissed", desc)}
+				continue
 			}
-		},
+			deleted++
+		}
+		if firstErr != nil {
+			return actionResultMsg{err: fmt.Errorf("deleted %d, skipped %s: %w",
+				deleted, strings.Join(skipped, " "), firstErr)}
+		}
+		return actionResultMsg{message: fmt.Sprintf(
+			"deleted %s; audit rows kept as dismissed", desc)}
 	}
-	return m, nil
 }
 
 // pruneEscalationsPrompt asks for an age in minutes (pre-filled with the

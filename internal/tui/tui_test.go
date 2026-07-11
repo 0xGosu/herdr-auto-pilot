@@ -732,45 +732,77 @@ func TestEscalationMarkToggleAndRender(t *testing.T) {
 	}
 }
 
-func TestEscalationDeletePromptFlow(t *testing.T) {
+func TestEscalationDeleteImmediate(t *testing.T) {
 	m, _, st, oldID, freshID := escalationsModel(t)
 	ctx := context.Background()
 
-	// x with nothing marked targets the cursor row only.
-	m = press(t, m, "x")
-	if m.prompt == nil || !strings.Contains(m.prompt.label, fmt.Sprintf("escalation #%d", oldID)) {
-		t.Fatalf("x should prompt for the cursor row, got %+v", m.prompt)
-	}
-	// Any non-yes input aborts.
-	m = press(t, m, "n", "o")
-	upd, cmd := m.Update(pressKeyMsg("enter"))
+	// x with nothing marked deletes the cursor row right away — dismissing
+	// an escalation is safe, so no confirmation prompt opens.
+	upd, cmd := m.Update(pressKeyMsg("x"))
 	m = upd.(Model)
-	if msg, ok := cmd().(actionResultMsg); !ok || msg.message != "delete aborted" {
-		t.Fatalf("non-yes input must abort, got %+v", msg)
+	if m.prompt != nil {
+		t.Fatalf("x must not open a confirmation prompt, got %+v", m.prompt)
 	}
-	if esc, _ := st.PendingEscalations(ctx); len(esc) != 2 {
-		t.Fatalf("aborted delete must keep both escalations, got %d", len(esc))
+	if cmd == nil {
+		t.Fatal("x should return the dismiss command")
 	}
+	msg, ok := cmd().(actionResultMsg)
+	if !ok || msg.err != nil || !strings.Contains(msg.message, fmt.Sprintf("escalation #%d", oldID)) {
+		t.Fatalf("x should delete the cursor row immediately, got %+v", msg)
+	}
+	if rec, _ := st.GetAudit(ctx, oldID); rec == nil || rec.Status != "dismissed" {
+		t.Fatalf("audit #%d must be kept as dismissed, got %+v", oldID, rec)
+	}
+	if esc, _ := st.PendingEscalations(ctx); len(esc) != 1 || esc[0].ID != freshID {
+		t.Fatalf("only #%d should remain pending, got %+v", freshID, esc)
+	}
+}
 
-	// Mark both rows, x prompts for the batch, yes dismisses them.
-	m = press(t, m, " ", " ", "x")
-	if m.prompt == nil || !strings.Contains(m.prompt.label, "2 escalations") {
-		t.Fatalf("x should prompt for the marked batch, got %+v", m.prompt)
-	}
-	m = press(t, m, "y", "e", "s")
-	upd, cmd = m.Update(pressKeyMsg("enter"))
+func TestEscalationBatchDeleteImmediate(t *testing.T) {
+	m, _, st, oldID, freshID := escalationsModel(t)
+	ctx := context.Background()
+
+	// Mark both rows; x deletes the batch right away — no prompt.
+	m = press(t, m, " ", " ")
+	upd, cmd := m.Update(pressKeyMsg("x"))
 	m = upd.(Model)
+	if m.prompt != nil {
+		t.Fatalf("batch delete must not open a confirmation prompt, got %+v", m.prompt)
+	}
 	msg, ok := cmd().(actionResultMsg)
 	if !ok || msg.err != nil || !strings.Contains(msg.message, "deleted 2 escalations") {
-		t.Fatalf("yes should delete the marked escalations, got %+v", msg)
+		t.Fatalf("marked delete should run immediately, got %+v", msg)
 	}
 	if esc, _ := st.PendingEscalations(ctx); len(esc) != 0 {
 		t.Errorf("queue should be empty, got %+v", esc)
 	}
-	for _, id := range []int64{freshID, oldID} {
+	for _, id := range []int64{oldID, freshID} {
 		if rec, _ := st.GetAudit(ctx, id); rec == nil || rec.Status != "dismissed" {
 			t.Errorf("audit #%d must be kept as dismissed, got %+v", id, rec)
 		}
+	}
+}
+
+func TestAuditTabDeleteRefused(t *testing.T) {
+	m, _, st, oldID, _ := escalationsModel(t)
+	ctx := context.Background()
+
+	// Move to the Audit tab and press x: nothing may change — the audit
+	// log is append-only.
+	for m.tab != tabAudit {
+		m = press(t, m, "tab")
+	}
+	m.cursor = 0
+	upd, cmd := m.Update(pressKeyMsg("x"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("x on the audit tab must not run any mutation")
+	}
+	if !strings.Contains(m.message, "append-only") {
+		t.Errorf("x on the audit tab should explain the log is append-only, got %q", m.message)
+	}
+	if rec, _ := st.GetAudit(ctx, oldID); rec == nil || rec.Status != "escalated" {
+		t.Errorf("audit #%d must be untouched, got %+v", oldID, rec)
 	}
 }
 
