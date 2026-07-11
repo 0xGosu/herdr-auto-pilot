@@ -292,10 +292,13 @@ func newHarnessFull(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
-	if cfgTOML != "" {
-		if err := os.WriteFile(cfgPath, []byte(cfgTOML), 0o600); err != nil {
-			t.Fatal(err)
-		}
+	// Existing tests assume near-synchronous attention handling: append a
+	// tiny wildcard capture delay LAST, so a test-supplied
+	// [[capture_delay]] rule earlier in the config still wins (first
+	// match wins) while everything else skips the real-world settle.
+	cfgTOML += tinyCaptureDelay
+	if err := os.WriteFile(cfgPath, []byte(cfgTOML), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	raw, err := store.Open(filepath.Join(dir, "test.db"))
 	if err != nil {
@@ -357,6 +360,21 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition not met within timeout")
+}
+
+// tinyCaptureDelay keeps tests near-synchronous; appended LAST to every
+// harness config so a test-supplied [[capture_delay]] rule still wins
+// (first match wins).
+const tinyCaptureDelay = "\n[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 1\nevent_ms = 1\n"
+
+// writeConfig rewrites the harness config mid-test (callers nudge reload),
+// re-appending the tiny capture delay so the daemon keeps test-speed
+// capture timing after the reload.
+func (h *harness) writeConfig(t *testing.T, cfgTOML string) {
+	t.Helper()
+	if err := os.WriteFile(h.cfgPath, []byte(cfgTOML+tinyCaptureDelay), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (h *harness) push(agentID, status string) {
@@ -992,7 +1010,7 @@ func TestIdleTaskSourceMatchesAgentShortName(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgTOML := fmt.Sprintf("[[task_sources]]\nagent = \"docs-writer\"\npath = %q\n", taskFile)
-	os.WriteFile(h.cfgPath, []byte(cfgTOML), 0o600)
+	h.writeConfig(t, cfgTOML)
 	if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
 		t.Fatal(err)
 	}
@@ -1096,7 +1114,7 @@ func TestCorrectionDemotesAutonomousSignature(t *testing.T) {
 func TestConfigReloadPropagatesWithinBudget(t *testing.T) {
 	// NFR-009 / SC-2: a config edit + nudge is reflected ≤ 1s.
 	h := newHarness(t, "[thresholds]\napproval = 0.8\n")
-	os.WriteFile(h.cfgPath, []byte("[thresholds]\napproval = 0.99\n"), 0o600)
+	h.writeConfig(t, "[thresholds]\napproval = 0.99\n")
 
 	start := time.Now()
 	if err := control.Nudge(context.Background(), h.ctlPath, control.KindReload); err != nil {

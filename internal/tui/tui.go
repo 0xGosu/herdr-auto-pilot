@@ -704,7 +704,9 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 				kind = "Escalation"
 			}
 			r := *rec
-			build := func(width int) []string { return m.auditDetailLines(r, width) }
+			// Fetched once at open time (not on every resize rebuild).
+			snapshot := m.app.SignatureSnapshot(m.ctx, r.Signature)
+			build := func(width int) []string { return m.auditDetailLines(r, snapshot, width) }
 			m.message = ""
 			d := &detailView{
 				title: fmt.Sprintf("%s #%d", kind, r.ID),
@@ -841,7 +843,7 @@ func locationLabel(id string, lookup func() (label string, number int, ok bool))
 	return id
 }
 
-func (m Model) auditDetailLines(r domain.AuditRecord, w int) []string {
+func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int) []string {
 	var lines []string
 	agent := r.AgentID
 	if n := m.data.status.AgentName(r.AgentID); n != "" {
@@ -874,6 +876,16 @@ func (m Model) auditDetailLines(r domain.AuditRecord, w int) []string {
 	}
 	if r.CorrectsAuditID != 0 {
 		lines = detailField(lines, w, "Corrects audit", fmt.Sprintf("#%d", r.CorrectsAuditID))
+	}
+	// The captured pane content behind this record — the signature's
+	// FIRST-seen excerpt (rule provenance), not the pane at this exact
+	// moment; same semantics as the Rules detail.
+	if r.Signature != "" {
+		if snapshot != "" {
+			lines = detailField(lines, w, "Original situation", snapshot)
+		} else {
+			lines = detailField(lines, w, "Original situation", "(not captured yet — recorded on the rule's next sighting)")
+		}
 	}
 	return lines
 }

@@ -145,6 +145,15 @@ type ClassifierRule struct {
 	Keywords  []string `toml:"keywords"`
 }
 
+// CaptureDelayRule delays the classification pane read after a herdr event,
+// so the agent TUI has painted before we snapshot it (a read fired straight
+// on the start event captures shell scrollback, not the agent's screen).
+type CaptureDelayRule struct {
+	AgentType string `toml:"agent_type"` // exact agent type, or "*"/"" for any
+	StartMs   int    `toml:"start_ms"`   // first event after agent start
+	EventMs   int    `toml:"event_ms"`   // all later events
+}
+
 // TUI configures the terminal UI's presentation (DR-003).
 type TUI struct {
 	// MaxContentWidth caps the character width of variable-length columns
@@ -164,6 +173,10 @@ type Config struct {
 	TUI         TUI              `toml:"tui"`
 	TaskSources []TaskSource     `toml:"task_sources"`
 	Classifier  []ClassifierRule `toml:"classifier"`
+	// CaptureDelays are optional per-agent-type overrides for the delayed
+	// pane capture; absent rules fall back to built-in defaults (not part
+	// of fillZeroes — optional tables, absent is not "zeroed").
+	CaptureDelays []CaptureDelayRule `toml:"capture_delay"`
 	// Paused persists nothing; pause state lives in the kill_events table.
 }
 
@@ -376,6 +389,38 @@ func (c Config) RewriteTimeout() time.Duration {
 		return c.LLMTimeout()
 	}
 	return time.Duration(c.LLM.RewriteTimeoutSeconds) * time.Second
+}
+
+// Built-in capture delays: the agent TUI needs ~a second to paint after
+// launch; later events only need a short settle.
+const (
+	defaultCaptureStartDelay = 1000 * time.Millisecond
+	defaultCaptureEventDelay = 200 * time.Millisecond
+)
+
+// CaptureDelay returns how long to wait before reading the pane after a
+// herdr event — start is the agent's first event since it appeared. The
+// first [[capture_delay]] rule matching the agent type (exact, "*", or
+// empty) wins; a matched field <= 0 and the no-rule case fall back to the
+// built-in defaults.
+func (c Config) CaptureDelay(agentType string, start bool) time.Duration {
+	for _, r := range c.CaptureDelays {
+		if r.AgentType != agentType && r.AgentType != "*" && r.AgentType != "" {
+			continue
+		}
+		ms := r.EventMs
+		if start {
+			ms = r.StartMs
+		}
+		if ms <= 0 {
+			break // matched but unset: built-in default
+		}
+		return time.Duration(ms) * time.Millisecond
+	}
+	if start {
+		return defaultCaptureStartDelay
+	}
+	return defaultCaptureEventDelay
 }
 
 // Save writes the config to path in TOML form (used by `config set`).

@@ -510,3 +510,57 @@ func TestDeprecatedAllowlistPatternsEmptySliceMigrates(t *testing.T) {
 		t.Errorf("saved config must not re-emit the deprecated key:\n%s", data)
 	}
 }
+
+func TestCaptureDelayRuleMatching(t *testing.T) {
+	rules := func(rs ...CaptureDelayRule) Config {
+		c := Default()
+		c.CaptureDelays = rs
+		return c
+	}
+	cases := []struct {
+		name  string
+		cfg   Config
+		agent string
+		start bool
+		want  time.Duration
+	}{
+		{"no rules start default", rules(), "claude", true, 1000 * time.Millisecond},
+		{"no rules event default", rules(), "claude", false, 200 * time.Millisecond},
+		{"exact match start", rules(CaptureDelayRule{AgentType: "claude", StartMs: 1500, EventMs: 50}), "claude", true, 1500 * time.Millisecond},
+		{"exact match event", rules(CaptureDelayRule{AgentType: "claude", StartMs: 1500, EventMs: 50}), "claude", false, 50 * time.Millisecond},
+		{"first match wins", rules(
+			CaptureDelayRule{AgentType: "claude", StartMs: 100},
+			CaptureDelayRule{AgentType: "*", StartMs: 900},
+		), "claude", true, 100 * time.Millisecond},
+		{"wildcard matches any", rules(CaptureDelayRule{AgentType: "*", StartMs: 300}), "codex", true, 300 * time.Millisecond},
+		{"empty agent_type matches any", rules(CaptureDelayRule{AgentType: "", EventMs: 70}), "codex", false, 70 * time.Millisecond},
+		{"matched but unset field falls back", rules(CaptureDelayRule{AgentType: "claude", EventMs: 80}), "claude", true, 1000 * time.Millisecond},
+		{"non-matching rule skipped", rules(CaptureDelayRule{AgentType: "codex", StartMs: 5}), "claude", true, 1000 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cfg.CaptureDelay(tc.agent, tc.start); got != tc.want {
+				t.Errorf("CaptureDelay(%q, start=%v) = %v, want %v", tc.agent, tc.start, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCaptureDelayLoadedFromTOML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte("[[capture_delay]]\nagent_type = \"claude\"\nstart_ms = 1500\nevent_ms = 250\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.CaptureDelay("claude", true); got != 1500*time.Millisecond {
+		t.Errorf("start delay = %v, want 1.5s", got)
+	}
+	if got := cfg.CaptureDelay("claude", false); got != 250*time.Millisecond {
+		t.Errorf("event delay = %v, want 250ms", got)
+	}
+	// A type without a rule uses the built-in defaults.
+	if got := cfg.CaptureDelay("codex", true); got != 1000*time.Millisecond {
+		t.Errorf("unmatched start delay = %v, want 1s", got)
+	}
+}

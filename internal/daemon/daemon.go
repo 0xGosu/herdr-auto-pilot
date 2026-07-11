@@ -82,6 +82,17 @@ type Daemon struct {
 	llmResults     chan llmOutcome
 	rewriteResults chan rewriteOutcome
 	sweepResults   chan sweepOutcome
+	// delayedTr re-enters attention transitions whose capture delay has
+	// elapsed; the pane read happens back on the main loop, like every
+	// other pipeline entry point.
+	delayedTr chan domain.AgentTransition
+
+	// pendingCapture coalesces attention-event bursts per pane: one timer
+	// per pane, latest event wins, exactly one capture fires per burst.
+	// captureStarted marks panes whose first capture has fired, so later
+	// events use the shorter event delay. Both guarded by mu.
+	pendingCapture map[string]*captureEntry
+	captureStarted map[string]bool
 
 	// configured flips after the first successful reload so reloadEmbedder
 	// can tell first load from a config change.
@@ -177,6 +188,9 @@ func New(opt Options) (*Daemon, error) {
 		llmResults:      make(chan llmOutcome, 16),
 		rewriteResults:  make(chan rewriteOutcome, 16),
 		sweepResults:    make(chan sweepOutcome, 16),
+		delayedTr:       make(chan domain.AgentTransition, 256),
+		pendingCapture:  map[string]*captureEntry{},
+		captureStarted:  map[string]bool{},
 		lastAutoSend:    map[string]time.Time{},
 		lastAutoNoop:    map[string]time.Time{},
 		rewriteInFlight: map[string]rewriteFlight{},
@@ -324,6 +338,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.handleTransition(ctx, tr)
 				return nil
 			})
+		case tr := <-d.delayedTr:
+			logging.Guard("pipeline", func() error {
+				d.handleAttention(ctx, tr)
+				return nil
+			})
 		case kind := <-d.nudges:
 			logging.Guard("nudge", func() error {
 				if kind == control.KindReload {
@@ -354,7 +373,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 // handleTransition evaluates one agent-status transition end to end.
 func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition) {
-	_, _, cls := d.snapshot()
 	now := d.opt.Clock.Now()
 
 	// Auto-generate a short friendly name on first sight — for EVERY
@@ -362,8 +380,7 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	// "working", so a brand-new agent is named the moment it appears, not
 	// only when it first needs attention (insert-if-absent, so operator
 	// renames are never clobbered).
-	agentName, err := d.opt.Store.EnsureAgentName(ctx, tr.AgentID)
-	if err != nil {
+	if _, err := d.opt.Store.EnsureAgentName(ctx, tr.AgentID); err != nil {
 		slog.Warn("agent name generation failed", "agent", tr.AgentID, "error", err)
 	}
 
@@ -388,12 +405,100 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		if paused || !ours || now.Sub(last) > 10*time.Second {
 			d.registerHumanInteraction(ctx, tr.AgentID)
 		}
+		// The agent resumed: a pending delayed capture would read a pane
+		// that moved on (the consuming recent-delta still holds the old
+		// menu AND the answer) — activity supersedes it.
+		d.cancelCapture(tr.PaneID)
 		return
 	case "idle", "done", "blocked":
-		// attention-requiring; continue below
+		// Attention-requiring: the pane read is DELAYED so the agent TUI
+		// has painted (an immediate read on the start event captures shell
+		// scrollback, not the agent's screen). Bursts coalesce per pane —
+		// the latest event wins and exactly one capture fires.
+		d.scheduleCapture(ctx, tr)
+		return
 	default:
 		// "detected" and unknown statuses: named above, nothing to act on.
+		// "detected" is discovery (pane created / subscriber replay): a
+		// fresh agent in this pane must get the full start settle again,
+		// and any pending capture belongs to a previous tenant. A replay
+		// on subscriber reconnect only costs one extra long settle.
+		if tr.Status == "detected" {
+			d.cancelCapture(tr.PaneID)
+			d.mu.Lock()
+			delete(d.captureStarted, tr.PaneID)
+			d.mu.Unlock()
+		}
 		return
+	}
+}
+
+// cancelCapture stops and forgets the pane's pending delayed capture —
+// activity or discovery supersedes it. A closure that already started
+// firing sees its map entry gone and bails (generation check).
+func (d *Daemon) cancelCapture(paneID string) {
+	d.mu.Lock()
+	if p := d.pendingCapture[paneID]; p != nil {
+		p.timer.Stop()
+		delete(d.pendingCapture, paneID)
+	}
+	d.mu.Unlock()
+}
+
+// captureEntry is one pane's pending delayed capture; the pointer identity
+// doubles as the generation token that closes the Timer.Stop race.
+type captureEntry struct {
+	timer *time.Timer
+}
+
+// scheduleCapture (re)arms the pane's capture timer: a newer event cancels
+// a pending one (latest wins). When the timer fires, the transition
+// re-enters the main loop through delayedTr — nothing sleeps in Run.
+func (d *Daemon) scheduleCapture(ctx context.Context, tr domain.AgentTransition) {
+	cfg, _, _ := d.snapshot()
+	d.mu.Lock()
+	if p := d.pendingCapture[tr.PaneID]; p != nil {
+		p.timer.Stop()
+	}
+	// The start delay applies until the pane's FIRST capture actually
+	// fires — a burst of events during startup keeps the longer settle.
+	delay := cfg.CaptureDelay(tr.AgentType, !d.captureStarted[tr.PaneID])
+	entry := &captureEntry{}
+	entry.timer = time.AfterFunc(delay, func() {
+		d.mu.Lock()
+		current := d.pendingCapture[tr.PaneID] == entry
+		if current {
+			delete(d.pendingCapture, tr.PaneID)
+			d.captureStarted[tr.PaneID] = true
+		}
+		d.mu.Unlock()
+		if !current {
+			// Superseded: Stop() lost the race with this func starting,
+			// but the map entry identity says a newer capture owns the
+			// pane now. Only the newest delivers.
+			return
+		}
+		select {
+		case d.delayedTr <- tr:
+		case <-ctx.Done():
+		}
+	})
+	d.pendingCapture[tr.PaneID] = entry
+	d.mu.Unlock()
+}
+
+// handleAttention is the post-delay half of the pipeline: the classification
+// pane read and everything after it. It runs on the main loop (via
+// delayedTr) and re-derives its inputs at fire time, so every gate — kill
+// switch, rate guard, retry ceiling — applies AFTER the delay.
+func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition) {
+	_, _, cls := d.snapshot()
+	now := d.opt.Clock.Now()
+	// Insert-if-absent; the transition handler already named the agent,
+	// this just re-reads (and covers rows racing a clear-data).
+	agentName, err := d.opt.Store.EnsureAgentName(ctx, tr.AgentID)
+	if err != nil {
+		slog.Warn("agent name generation failed", "agent", tr.AgentID, "error", err)
 	}
 
 	pane, err := d.opt.Herdr.ReadPane(ctx, tr.PaneID, d.opt.PaneReadLines)
