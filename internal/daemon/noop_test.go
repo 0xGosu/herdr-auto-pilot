@@ -1,0 +1,206 @@
+package daemon
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/control"
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+)
+
+// A graduated @noop rule fires autonomously: audit + learning recorded,
+// runaway counter advanced, nothing ever sent to the pane.
+func TestNoopRuleAutonomousNoSend(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	sig := h.seedAutonomous(approvalPane, domain.SituationApproval, domain.ActionNoop)
+
+	h.push("agent-noop", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(ctx, 10)
+		return len(audits) > 0 && audits[0].Action == "noop"
+	})
+	audits, _ := h.raw.AuditLog(ctx, 10)
+	if audits[0].Status != "auto" || audits[0].Input != "" {
+		t.Errorf("noop audit mismatch: %+v", audits[0])
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("noop must not send, sent %v", h.herdr.sentInputs())
+	}
+
+	decs, _ := h.raw.DecisionsForSignature(ctx, sig, 10)
+	if len(decs) != 9 || decs[0].ChosenAction != domain.ActionNoop || decs[0].Source != domain.SourceRule {
+		t.Errorf("noop decision not recorded for learning: %+v", decs[0])
+	}
+
+	// D3: the runaway counter counts noops — a self-flapping agent must
+	// still trip the consecutive ceiling and reach a human eventually.
+	rate, err := h.raw.GetAgentRate(ctx, "agent-noop")
+	if err != nil || rate.ConsecutiveAuto != 1 {
+		t.Errorf("noop must register an auto prompt, rate=%+v err=%v", rate, err)
+	}
+}
+
+// An LLM-submitted @noop with auto_act enabled is promoted: decision
+// accepted, learning recorded, nothing sent — this breaks the LLM↔agent
+// nudge loop.
+func TestLLMNoopPromotionRecordsWithoutSend(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(approvalPane)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "@noop", Rationale: "agent finished; no reply needed",
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "@noop",
+			Rationale: "agent finished; no reply needed", Status: "pending"}, nil
+	}
+
+	h.push("agent-llmnoop", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 5*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(ctx, 10)
+		return len(audits) > 0 && audits[0].Action == "noop"
+	})
+	audits, _ := h.raw.AuditLog(ctx, 10)
+	if audits[0].Status != "auto" || audits[0].Trigger != "llm-fallback" || audits[0].Input != "" {
+		t.Errorf("LLM noop audit mismatch: %+v", audits[0])
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("LLM noop must not send, sent %v", h.herdr.sentInputs())
+	}
+
+	decs, _ := h.raw.DecisionsForSignature(ctx, audits[0].Signature, 10)
+	if len(decs) != 1 || decs[0].ChosenAction != domain.ActionNoop || decs[0].Source != domain.SourceLLM {
+		t.Errorf("LLM noop decision not learned: %+v", decs)
+	}
+
+	pending, _ := h.raw.PendingLLMDecisions(ctx)
+	if len(pending) != 0 {
+		t.Errorf("staged decision should be accepted, still pending: %+v", pending)
+	}
+	rate, err := h.raw.GetAgentRate(ctx, "agent-llmnoop")
+	if err != nil || rate.ConsecutiveAuto != 1 {
+		t.Errorf("LLM noop must register an auto prompt, rate=%+v err=%v", rate, err)
+	}
+}
+
+// With auto_act disabled an LLM @noop surfaces as a human-readable
+// suggestion; confirming it records the @noop as a learning event
+// (end-to-end: accepted noop escalation becomes learned history).
+func TestLLMNoopEscalatesWhenAutoActDisabled(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(approvalPane)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "noop", Rationale: "nothing to do", Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "noop",
+			Rationale: "nothing to do", Status: "pending"}, nil
+	}
+
+	h.push("agent-noopesc", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 5*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	esc, _ := h.raw.PendingEscalations(ctx)
+	want := "LLM suggested: " + domain.ActionNoopSuggestion
+	if esc[0].Suggestion != want {
+		t.Fatalf("suggestion = %q, want %q (raw @noop must never surface)", esc[0].Suggestion, want)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("escalation must not send, sent %v", h.herdr.sentInputs())
+	}
+
+	// Operator confirms "do nothing": the confirm flow round-trips the
+	// display text back to the sentinel and it is learned, not sent.
+	action := frontendSuggestedAction(esc[0])
+	if action != domain.ActionNoop {
+		t.Fatalf("confirm resolves suggestion to %q, want %q", action, domain.ActionNoop)
+	}
+	if _, err := h.raw.InsertCorrection(ctx, domain.CorrectionRecord{
+		AuditID: esc[0].ID, CorrectedAction: action, Author: "operator", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 3*time.Second, func() bool {
+		st, _ := h.raw.GetSignature(ctx, esc[0].Signature)
+		return st != nil && st.ConsecutiveConfirmations >= 1
+	})
+	decs, _ := h.raw.DecisionsForSignature(ctx, esc[0].Signature, 10)
+	if len(decs) == 0 || decs[0].ChosenAction != domain.ActionNoop || decs[0].IsCorrection {
+		t.Errorf("confirmed noop must be learned as a confirmation: %+v", decs)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("confirmed noop must never send, sent %v", h.herdr.sentInputs())
+	}
+}
+
+// A self-flapping agent that resumes right after a noop must NOT read as
+// human interaction: the runaway counter keeps advancing across flap
+// cycles so the consecutive ceiling eventually escalates (D3).
+func TestNoopFlapDoesNotResetRunawayCounter(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	h.seedAutonomous(approvalPane, domain.SituationApproval, domain.ActionNoop)
+
+	ctx := context.Background()
+	auditCount := func() int {
+		audits, _ := h.raw.AuditLog(ctx, 20)
+		n := 0
+		for _, a := range audits {
+			if a.Action == "noop" {
+				n++
+			}
+		}
+		return n
+	}
+
+	h.push("agent-flap", "blocked")
+	waitFor(t, 3*time.Second, func() bool { return auditCount() == 1 })
+
+	// The agent flaps back to working on its own, then blocks again.
+	h.push("agent-flap", "working")
+	h.push("agent-flap", "blocked")
+	waitFor(t, 3*time.Second, func() bool { return auditCount() == 2 })
+
+	rate, err := h.raw.GetAgentRate(ctx, "agent-flap")
+	if err != nil || rate.ConsecutiveAuto != 2 {
+		t.Errorf("flap after noop must not reset the counter, rate=%+v err=%v", rate, err)
+	}
+}
+
+// suggestionAction maps every noop display form back to the sentinel.
+func TestSuggestionActionMapsNoopDisplay(t *testing.T) {
+	cases := map[string]string{
+		"LLM suggested: " + domain.ActionNoopSuggestion: domain.ActionNoop,
+		domain.ActionNoopSuggestion:                     domain.ActionNoop, // bare shadow-mode form
+		"respond: y":                                    "y",
+		"LLM suggested: continue":                       "continue",
+	}
+	for sug, want := range cases {
+		audit := &domain.AuditRecord{Suggestion: sug}
+		if got := suggestionAction(audit); got != want {
+			t.Errorf("suggestionAction(%q) = %q, want %q", sug, got, want)
+		}
+	}
+}

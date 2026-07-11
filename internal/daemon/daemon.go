@@ -87,8 +87,13 @@ type Daemon struct {
 	configured bool
 
 	// lastAutoSend tracks our own sends so a subsequent "working"
-	// transition is attributed to automation, not the human.
+	// transition is attributed to automation, not the human. lastAutoNoop
+	// does the same for noop decisions: nothing was sent, but a
+	// self-flapping agent resuming right after a noop is not human
+	// interaction — without this marker every flap would reset the runaway
+	// counter and a noop rule could fire silently forever (D3).
 	lastAutoSend map[string]time.Time
+	lastAutoNoop map[string]time.Time
 
 	// rewriteInFlight tracks the one live outbound-text rewrite per agent;
 	// the token lets the outcome handler drop superseded results. Guarded
@@ -150,6 +155,7 @@ func New(opt Options) (*Daemon, error) {
 		llmResults:      make(chan llmOutcome, 16),
 		rewriteResults:  make(chan rewriteOutcome, 16),
 		lastAutoSend:    map[string]time.Time{},
+		lastAutoNoop:    map[string]time.Time{},
 		rewriteInFlight: map[string]rewriteFlight{},
 		embedder:        opt.Embedder,
 	}
@@ -334,6 +340,13 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		paused := err == nil && rate.Paused
 		d.mu.Lock()
 		last, ours := d.lastAutoSend[tr.AgentID]
+		// A noop decision sends nothing, but an agent resuming right after
+		// one is self-flapping, not human-driven: without this the flap
+		// would reset the runaway counter and a noop rule could fire
+		// silently forever (D3).
+		if ln, ok := d.lastAutoNoop[tr.AgentID]; ok && (!ours || ln.After(last)) {
+			last, ours = ln, true
+		}
 		d.mu.Unlock()
 		if paused || !ours || now.Sub(last) > 10*time.Second {
 			d.registerHumanInteraction(ctx, tr.AgentID)
@@ -445,6 +458,8 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	switch decision.Action {
 	case domain.ActionSend:
 		d.act(ctx, situation, sig, decision, tr, now)
+	case domain.ActionKindNoop:
+		d.deliverNoop(ctx, situation, sig, decision, tr, now)
 	case domain.ActionConsult:
 		d.consultLLM(ctx, cfg, situation, sig, now)
 	default:
@@ -650,6 +665,52 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 		"rationale", del.rationale, "audit_id", auditID)
 }
 
+// deliverNoop applies a graduated "do nothing" rule autonomously: audit-first
+// (FR-024), then the learning and rate writes — but nothing is sent. The
+// runaway counter still advances (D3): a self-flapping agent must not
+// consult-and-noop silently forever; the consecutive ceiling eventually
+// escalates it to a human. lastAutoSend stays untouched (no send happened);
+// lastAutoNoop is stamped instead so a self-resuming flap does not read as
+// human interaction and reset that counter.
+func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
+	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
+
+	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
+		SituationType: s.Type, Action: "noop", Input: "",
+		Confidence: dec.Confidence, Rationale: dec.Rationale,
+		Status: "auto", CreatedAt: now,
+	})
+	if err != nil {
+		slog.Error("audit write failed; blocking autonomous noop (FR-024)", "error", err)
+		d.notify(ctx, "Herd Auto Prompter: persistence failure",
+			"An automated no-op was blocked because its audit record could not be written.")
+		return
+	}
+
+	if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
+		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
+		ChosenAction: domain.ActionNoop, Source: dec.Source, Confidence: dec.Confidence, CreatedAt: now,
+	}); err != nil {
+		slog.Error("decision record write failed", "error", err)
+	}
+
+	if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
+		updated := domain.RegisterAutoPrompt(*rate, now)
+		updated.AgentID = s.AgentID
+		if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
+			slog.Error("agent rate update failed", "error", err)
+		}
+	}
+
+	d.mu.Lock()
+	d.lastAutoNoop[s.AgentID] = now
+	d.mu.Unlock()
+
+	slog.Info("learned noop applied: no reply sent",
+		"agent", s.AgentID, "situation", s.Type, "confidence", dec.Confidence, "audit_id", auditID)
+}
+
 // escalate records and surfaces an escalation: no input is sent (FR-018).
 func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
@@ -760,6 +821,7 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		"agent_id":        s.AgentID,
 		"cwd":             info.Cwd,
 		"foreground_cwd":  info.ForegroundCwd,
+		"no_reply_option": "if the agent needs no reply (it finished or is only reporting status), submit_decision with action \"@noop\" to explicitly do nothing",
 	})
 	return contextJSON
 }
@@ -1027,11 +1089,24 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	}
 
 	llmDec := res.decision
+	// Defensive re-normalization: the MCP server already normalizes, but a
+	// row staged by an older binary (or written directly) must not slip a
+	// noop spelling into the pane as literal text.
+	llmDec.Action = domain.NormalizeNoopAction(llmDec.Action)
+	isNoop := domain.IsNoopAction(llmDec.Action)
+	if isNoop {
+		llmDec.OptionID = ""
+	}
 	reject := func(reason domain.EscalateReason, why string) {
 		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
+		suggested := llmDec.Action
+		if isNoop {
+			// Raw "@noop" is never surfaced to humans.
+			suggested = domain.ActionNoopSuggestion
+		}
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: reason, Rationale: why,
-			Suggestion: "LLM suggested: " + llmDec.Action,
+			Suggestion: "LLM suggested: " + suggested,
 		}, tr, now)
 	}
 
@@ -1048,10 +1123,13 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	}
 	// The LLM authors the outbound text, so the allowlist screens the
 	// submitted action too — the LLM can never smuggle an irreversible
-	// operation past the allowlist (FR-015).
-	if pattern, matched := allow.Match(llmDec.Action); matched {
-		reject(domain.ReasonAllowlistMatch, "LLM action matches never-auto pattern: "+pattern)
-		return
+	// operation past the allowlist (FR-015). A noop has no outbound text to
+	// screen.
+	if !isNoop {
+		if pattern, matched := allow.Match(llmDec.Action); matched {
+			reject(domain.ReasonAllowlistMatch, "LLM action matches never-auto pattern: "+pattern)
+			return
+		}
 	}
 	// The heuristic screens the situation's actionable region plus the
 	// outbound text the LLM authored (which is what would actually be sent).
@@ -1065,10 +1143,12 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			fmt.Sprintf("suspected-irreversible content: indicator %s matched %q", hit.Pattern, hit.Excerpt))
 		return
 	}
-	if hit, sus := allow.SuspectedIrreversible(s.AgentType, llmDec.Action); sus {
-		reject(domain.ReasonSuspectedIrrevers,
-			fmt.Sprintf("suspected-irreversible LLM action: indicator %s matched %q", hit.Pattern, hit.Excerpt))
-		return
+	if !isNoop {
+		if hit, sus := allow.SuspectedIrreversible(s.AgentType, llmDec.Action); sus {
+			reject(domain.ReasonSuspectedIrrevers,
+				fmt.Sprintf("suspected-irreversible LLM action: indicator %s matched %q", hit.Pattern, hit.Excerpt))
+			return
+		}
 	}
 	rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
 	if err != nil {
@@ -1082,8 +1162,9 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(reason, "runaway-loop guard at LLM promotion time")
 		return
 	}
-	// Choice sanity: the option must exist in the offered set.
-	if s.Type == domain.SituationChoice && len(s.Options) > 0 {
+	// Choice sanity: the option must exist in the offered set. A noop is
+	// never an offered option; it deliberately bypasses this check.
+	if s.Type == domain.SituationChoice && !isNoop && len(s.Options) > 0 {
 		found := false
 		for _, o := range s.Options {
 			if strings.EqualFold(strings.TrimSpace(o), strings.TrimSpace(llmDec.Action)) ||
@@ -1110,6 +1191,50 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	}
 	if conf := domain.Confidence(history); conf.TopAction != "" && conf.TopAction != llmDec.Action {
 		reject(domain.ReasonVarianceGuard, "LLM suggestion contradicts learned history")
+		return
+	}
+
+	if isNoop {
+		// NoOp promotion: record and stand down — nothing is sent. The
+		// staleness re-read is skipped on purpose: it exists solely to
+		// prevent stale *injections*, a stale noop is harmless, and
+		// rejecting it would recreate the very escalation noise the noop
+		// resolves. Audit-before-act still applies (FR-024).
+		if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+			AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
+			SituationType: s.Type, Action: "noop", Input: "",
+			Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
+			Status: "auto", CreatedAt: now,
+		}); err != nil {
+			slog.Error("audit write failed; blocking LLM noop (FR-024)", "error", err)
+			d.notify(ctx, "Herd Auto Prompter: persistence failure",
+				"An LLM-derived no-op was blocked because its audit record could not be written.")
+			return
+		}
+		if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "accepted"); err != nil {
+			slog.Error("llm decision status update failed", "error", err)
+		}
+		if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
+			Signature: res.sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
+			ChosenAction: domain.ActionNoop, Source: domain.SourceLLM, CreatedAt: now,
+		}); err != nil {
+			slog.Error("decision record write failed", "error", err)
+		}
+		// The runaway counter still advances (D3): a self-flapping agent
+		// must not consult-and-noop silently forever. lastAutoSend stays
+		// untouched (nothing was sent); lastAutoNoop is stamped so a
+		// self-resuming flap does not reset that counter.
+		if rate2, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
+			updated := domain.RegisterAutoPrompt(*rate2, now)
+			updated.AgentID = s.AgentID
+			if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
+				slog.Error("agent rate update failed", "error", err)
+			}
+		}
+		d.mu.Lock()
+		d.lastAutoNoop[s.AgentID] = now
+		d.mu.Unlock()
+		slog.Info("LLM noop accepted: no reply sent", "agent", s.AgentID)
 		return
 	}
 
@@ -1466,7 +1591,8 @@ func suggestionAction(audit *domain.AuditRecord) string {
 	sug := audit.Suggestion
 	for _, prefix := range []string{"respond: ", "choose: ", "on error: ", "LLM suggested: "} {
 		if rest, ok := strings.CutPrefix(sug, prefix); ok {
-			return rest
+			sug = rest
+			break
 		}
 	}
 	if strings.HasPrefix(sug, "send next declared task: ") {
@@ -1474,6 +1600,11 @@ func suggestionAction(audit *domain.AuditRecord) string {
 	}
 	if strings.HasPrefix(sug, "send inferred next task: ") {
 		return domain.ActionNextInferredTask
+	}
+	// The human-readable "do nothing" suggestion round-trips to the sentinel
+	// so a confirmed noop is learned as @noop, never sent as literal text.
+	if sug == domain.ActionNoopSuggestion {
+		return domain.ActionNoop
 	}
 	return sug
 }

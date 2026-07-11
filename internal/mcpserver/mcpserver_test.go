@@ -175,3 +175,54 @@ func TestMCPIgnoresGarbageFrames(t *testing.T) {
 		t.Fatalf("server should survive garbage frames: %v", resp["error"])
 	}
 }
+
+func TestMCPSubmitNoopNormalized(t *testing.T) {
+	// Every accepted noop spelling stages the canonical sentinel with the
+	// option blanked; the tool description advertises the verb (D2).
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	for i, spelling := range []string{"@noop", "noop", "NO_OP", " no-op "} {
+		reqID := fmt.Sprintf("req-noop-%d", i)
+		if _, err := st.StageLLMRequest(ctx, domain.LLMRequest{
+			RequestID: reqID, Signature: "idle:aaaa", SituationType: domain.SituationIdle,
+			AgentType: "claude", ContextJSON: "{}", CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		c := startServer(t, st, reqID)
+		resp := c.call(t, "tools/call", map[string]any{
+			"name": "submit_decision",
+			"arguments": map[string]any{
+				"action": spelling, "option_id": "should-be-blanked", "rationale": "agent is done",
+			},
+		})
+		if text, _ := json.Marshal(resp); !strings.Contains(string(text), "staged") {
+			t.Fatalf("%q: submit_decision should stage: %s", spelling, text)
+		}
+	}
+
+	pending, err := st.PendingLLMDecisions(ctx)
+	if err != nil || len(pending) != 4 {
+		t.Fatalf("pending decisions: %+v %v", pending, err)
+	}
+	for _, d := range pending {
+		if d.Action != domain.ActionNoop {
+			t.Errorf("staged action = %q, want %q", d.Action, domain.ActionNoop)
+		}
+		if d.OptionID != "" {
+			t.Errorf("noop must blank option_id, got %q", d.OptionID)
+		}
+	}
+
+	// tools/list documents the noop verb.
+	c := startServer(t, st, "")
+	resp := c.call(t, "tools/list", nil)
+	if text, _ := json.Marshal(resp); !strings.Contains(string(text), "@noop") {
+		t.Fatalf("tools/list should document @noop: %s", text)
+	}
+}

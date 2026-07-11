@@ -741,3 +741,78 @@ func TestGetStatusNamesLiveAgentsAndReportsLocation(t *testing.T) {
 		t.Errorf("rename clobbered: %q", stat3.AgentName("w23:p5"))
 	}
 }
+
+func TestConfirmNoopSuggestionSkipsSend(t *testing.T) {
+	// Confirming a "do nothing" suggestion records the @noop learning event
+	// and never writes anything to the pane — even with send=true.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p9", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: "LLM suggested: " + domain.ActionNoopSuggestion, CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].CorrectedAction != domain.ActionNoop {
+		t.Errorf("confirm should record the noop sentinel: %+v", corr)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("confirmed noop must never send, sent %v", fake.inputs)
+	}
+}
+
+func TestResolveNoopSkipsSend(t *testing.T) {
+	// An explicit `resolve --action @noop --send` records the correction
+	// but skips delivery: "do nothing" means exactly that.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p10", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+	if err := app.Resolve(ctx, id, domain.ActionNoop, true); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].CorrectedAction != domain.ActionNoop {
+		t.Errorf("resolve should record the noop correction: %+v", corr)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("noop resolve must never send, sent %v", fake.inputs)
+	}
+}
+
+func TestResolveNormalizesNoopSpelling(t *testing.T) {
+	// The human surface accepts the same spellings as the MCP surface: a
+	// bare "noop" is the sentinel, never literal pane text.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p11", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+	if err := app.Resolve(ctx, id, "noop", true); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].CorrectedAction != domain.ActionNoop {
+		t.Errorf("bare noop spelling should normalize to the sentinel: %+v", corr)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("normalized noop must never send, sent %v", fake.inputs)
+	}
+}

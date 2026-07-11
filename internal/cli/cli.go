@@ -412,7 +412,7 @@ func confirm(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 func resolve(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	idArg, rest := splitLeadingID(args)
 	fs := flag.NewFlagSet("resolve", flag.ContinueOnError)
-	action := fs.String("action", "", "the response the agent should have received")
+	action := fs.String("action", "", "the response the agent should have received (@noop = no reply was needed; nothing is ever sent)")
 	send := fs.Bool("send", false, "also deliver the action to the agent pane")
 	fs.SetOutput(out)
 	if err := fs.Parse(rest); err != nil {

@@ -252,7 +252,7 @@ stdout is captured for audit only. Example for Claude Code:
 # auto-repairs a prompt misplaced after other flags — see below).
 command = [
   "claude", "-p",
-  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
+  "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (action '@noop' to do nothing).",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
 ]
@@ -292,7 +292,7 @@ command = [
   "-c", 'mcp_servers.hap.env.HAP_REQUEST_ID="{request_id}"',
   "-c", 'mcp_servers.hap.env.HAP_DB_PATH="{db}"',
   "-c", 'mcp_servers.hap.env.HAP_CONTROL_PATH="{control}"',
-  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision. Do not run any other commands.",
+  "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (action '@noop' to do nothing). Do not run any other commands.",
 ]
 timeout_seconds = 180
 ```
@@ -317,7 +317,7 @@ needed):
 # (auto-repaired if misplaced).
 command = [
   "agy", "--print",
-  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
+  "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (action '@noop' to do nothing).",
   "--dangerously-skip-permissions",
 ]
 timeout_seconds = 180
@@ -330,6 +330,15 @@ launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing
 suggestion is re-gated through the same allowlist, kill switch, and rate
 guards; with `auto_act = true` it may act only when it doesn't contradict
 your learned history. On timeout or no submission the situation escalates.
+
+The model can also submit `action: "@noop"` (also accepted: `noop`,
+`no_op`, `no-op`) to say **no reply is needed** — the agent finished or is
+only reporting status, and any prompt would just nudge it into another
+round trip. A noop is recorded in the audit trail and learned like any
+other decision (an accepted "do nothing" escalation graduates into a rule
+that silently stands down), but nothing is ever sent to the pane. Note: a
+learned idle noop suppresses task sends for that signature until you
+correct it or delete the signature.
 
 ### LLM rewrite of literal replies (optional)
 

@@ -74,6 +74,7 @@ const (
 	ActionSend     ActionKind = "send"     // send input to the agent pane
 	ActionEscalate ActionKind = "escalate" // hand to the human, take no action
 	ActionConsult  ActionKind = "consult_llm"
+	ActionKindNoop ActionKind = "noop" // deliberately do nothing (learned no-op)
 )
 
 // Source identifies who authored a decision.

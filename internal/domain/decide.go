@@ -14,6 +14,33 @@ const (
 	ActionNextInferredTask = "@next_task:inferred"
 )
 
+// ActionNoop is the learned "do nothing" action: the operator (or LLM)
+// decided the situation needs no reply at all. It flows through decision
+// history and graduation like any other action, but nothing is ever sent —
+// this is what breaks the LLM↔agent nudge loop on chatty status reports.
+// ActionNoopSuggestion is the human-readable form surfaced in escalations;
+// raw "@noop" is never shown to operators.
+const (
+	ActionNoop           = "@noop"
+	ActionNoopSuggestion = "do nothing (no reply needed)"
+)
+
+// IsNoopAction reports whether a learned/submitted action is the noop
+// sentinel.
+func IsNoopAction(s string) bool { return s == ActionNoop }
+
+// NormalizeNoopAction maps the accepted noop spellings ("@noop", "noop",
+// "no_op", "no-op"; case-insensitive, trimmed) to ActionNoop. Free text such
+// as "do nothing" is returned unchanged — it could be a legitimate literal
+// reply.
+func NormalizeNoopAction(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "@noop", "noop", "no_op", "no-op":
+		return ActionNoop
+	}
+	return s
+}
+
 // DecideThresholds are the per-situation confidence thresholds (FR-009).
 type DecideThresholds struct {
 	Idle            float64
@@ -116,7 +143,12 @@ func Decide(in DecideInput) Decision {
 			rationale = fmt.Sprintf("%s: indicator %s matched %q",
 				rationale, in.IrreversibleHit.Pattern, in.IrreversibleHit.Excerpt)
 		}
-		return esc(ReasonSuspectedIrrevers, rationale, conf.Score, conf.TopAction)
+		suggestion := conf.TopAction
+		if suggestion == ActionNoop {
+			// Raw "@noop" is never surfaced to operators.
+			suggestion = ActionNoopSuggestion
+		}
+		return esc(ReasonSuspectedIrrevers, rationale, conf.Score, suggestion)
 	}
 
 	threshold := in.Thresholds.ForType(in.Situation.Type)
@@ -140,7 +172,9 @@ func Decide(in DecideInput) Decision {
 
 	// Error retry ceiling (FR-014): max automated retries per error
 	// signature; exhaustion forces escalation regardless of confidence.
-	if in.Situation.Type == SituationError && in.RetryCount >= in.MaxRetries {
+	// A noop is not a retry — doing nothing cannot loop the error.
+	if in.Situation.Type == SituationError && in.RetryCount >= in.MaxRetries &&
+		candidate != ActionNoop {
 		return esc(ReasonRetryExhausted,
 			fmt.Sprintf("error signature reached the %d automated-retry ceiling", in.MaxRetries),
 			conf.Score, suggestion)
@@ -171,6 +205,19 @@ func Decide(in DecideInput) Decision {
 			conf.Score, suggestion)
 	}
 
+	// A graduated noop rule "fires" by standing down: audit + learning are
+	// recorded by the caller, nothing is sent (there is no input to
+	// materialize).
+	if candidate == ActionNoop {
+		return Decision{
+			Action:     ActionKindNoop,
+			Source:     SourceRule,
+			Confidence: conf.Score,
+			Rationale: fmt.Sprintf("learned rule: do nothing (%q chosen %d times, agreement %.2f > threshold %.2f)",
+				candidate, conf.Decisions, conf.Score, threshold),
+		}
+	}
+
 	// The learned action must be the resolved candidate: acting on anything
 	// else would not be traceable to the operator's observed decisions.
 	input, optionID, ok := materialize(in, candidate)
@@ -195,6 +242,11 @@ func Decide(in DecideInput) Decision {
 func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggestion string, escReason EscalateReason) {
 	switch in.Situation.Type {
 	case SituationIdle:
+		// A learned noop beats task resolution: the operator repeatedly said
+		// "leave this one alone", which outranks re-sending tasks.
+		if conf.TopAction == ActionNoop {
+			return ActionNoop, ActionNoopSuggestion, ReasonNone
+		}
 		// Two-tier next-task resolution (FR-011). A matched source always
 		// yields a candidate — even a completed list, whose templated prompt
 		// (task content "none") lets the operator steer idle agents.
@@ -216,11 +268,19 @@ func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggest
 		if conf.TopAction == "" {
 			return "", "", ReasonNoHistory
 		}
+		if conf.TopAction == ActionNoop {
+			return ActionNoop, ActionNoopSuggestion, ReasonNone
+		}
 		return conf.TopAction, "respond: " + conf.TopAction, ReasonNone
 
 	case SituationChoice:
 		if conf.TopAction == "" {
 			return "", "", ReasonNoHistory
+		}
+		// A learned noop is never one of the offered options; it bypasses
+		// the option-set check by design.
+		if conf.TopAction == ActionNoop {
+			return ActionNoop, ActionNoopSuggestion, ReasonNone
 		}
 		// The learned option must exist in the current option set; an
 		// unfamiliar set escalates (FR-013). (Unfamiliar sets normally
@@ -233,6 +293,9 @@ func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggest
 	case SituationError:
 		if conf.TopAction == "" {
 			return "", "", ReasonNoHistory
+		}
+		if conf.TopAction == ActionNoop {
+			return ActionNoop, ActionNoopSuggestion, ReasonNone
 		}
 		return conf.TopAction, "on error: " + conf.TopAction, ReasonNone
 	}

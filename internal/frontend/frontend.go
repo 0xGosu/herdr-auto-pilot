@@ -247,12 +247,19 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	if action == "" {
 		return fmt.Errorf("an action is required")
 	}
+	// Same normalization as the MCP surface: an operator typing "noop"
+	// means the sentinel, and the literal spelling must never be learned
+	// as pane text (free text like "do nothing" stays literal).
+	action = domain.NormalizeNoopAction(action)
 	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
 		AuditID: auditID, CorrectedAction: action, Author: a.Author, CreatedAt: time.Now(),
 	}); err != nil {
 		return err
 	}
-	if send && a.Herdr != nil && audit.AgentID != "" {
+	// A confirmed/resolved noop records the correction — the learning event
+	// — but never writes the sentinel into the pane: "do nothing" means
+	// exactly that.
+	if send && action != domain.ActionNoop && a.Herdr != nil && audit.AgentID != "" {
 		outbound := materializeForSend(action, audit)
 		// A numbered menu (Claude approvals/choices) only accepts the
 		// option's digit, not the label. Re-read the pane's CURRENT screen
@@ -291,7 +298,8 @@ func SuggestedAction(audit *domain.AuditRecord) string {
 	sug := audit.Suggestion
 	for _, p := range []string{"respond: ", "choose: ", "on error: ", "LLM suggested: "} {
 		if len(sug) > len(p) && sug[:len(p)] == p {
-			return sug[len(p):]
+			sug = sug[len(p):]
+			break
 		}
 	}
 	for _, p := range []string{"send next declared task: ", "send inferred next task: "} {
@@ -301,6 +309,11 @@ func SuggestedAction(audit *domain.AuditRecord) string {
 			}
 			return domain.ActionNextInferredTask
 		}
+	}
+	// The human-readable "do nothing" suggestion round-trips to the sentinel
+	// so a confirmed noop is learned as @noop, never sent as literal text.
+	if sug == domain.ActionNoopSuggestion {
+		return domain.ActionNoop
 	}
 	return sug
 }

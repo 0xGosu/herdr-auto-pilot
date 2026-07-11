@@ -120,7 +120,8 @@ func frontendSuggestedAction(audit domain.AuditRecord) string {
 	sug := audit.Suggestion
 	for _, p := range []string{"respond: ", "choose: ", "on error: ", "LLM suggested: "} {
 		if len(sug) > len(p) && sug[:len(p)] == p {
-			return sug[len(p):]
+			sug = sug[len(p):]
+			break
 		}
 	}
 	for _, p := range []string{"send next declared task: ", "send inferred next task: "} {
@@ -130,6 +131,9 @@ func frontendSuggestedAction(audit domain.AuditRecord) string {
 			}
 			return domain.ActionNextInferredTask
 		}
+	}
+	if sug == domain.ActionNoopSuggestion {
+		return domain.ActionNoop
 	}
 	return sug
 }

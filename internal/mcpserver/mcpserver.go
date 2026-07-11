@@ -112,12 +112,12 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "submit_decision",
-			"description": "Submit your decision for the pending request. action is the literal reply text to send to the agent (for choices, the exact option text). The daemon re-gates this through the confidence gate and never-auto allowlist before acting.",
+			"description": "Submit your decision for the pending request. action is the literal reply text to send to the agent (for choices, the exact option text). If the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit action \"@noop\" to explicitly do nothing. The daemon re-gates this through the confidence gate and never-auto allowlist before acting.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"request_id": map[string]any{"type": "string", "description": "Decision request id (optional; defaults to the current request)"},
-					"action":     map[string]any{"type": "string", "description": "Literal reply text to send to the agent"},
+					"action":     map[string]any{"type": "string", "description": "Literal reply text to send to the agent, or \"@noop\" to explicitly send nothing (use when no reply is needed)"},
 					"option_id":  map[string]any{"type": "string", "description": "Selected option text for multiple-choice situations"},
 					"rationale":  map[string]any{"type": "string", "description": "Why this action matches the operator's likely intent"},
 				},
@@ -158,6 +158,11 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error)
 	case "submit_decision":
 		if p.Arguments.Action == "" {
 			return nil, fmt.Errorf("action is required")
+		}
+		// Accept the common noop spellings; a noop never carries an option.
+		p.Arguments.Action = domain.NormalizeNoopAction(p.Arguments.Action)
+		if p.Arguments.Action == domain.ActionNoop {
+			p.Arguments.OptionID = ""
 		}
 		req, err := s.resolveRequest(ctx, requestID)
 		if err != nil {
