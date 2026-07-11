@@ -46,6 +46,15 @@ type VisiblePaneReader interface {
 	ReadPaneVisible(ctx context.Context, paneID string, lines int) (string, error)
 }
 
+// KeystrokeSender is implemented by Herdr adapters that can press a single
+// key in a pane (`herdr pane send-keys`) WITHOUT submitting text — arrows to
+// sweep a multi-tab question form, digits to answer it. Optional: callers
+// type-assert and degrade (single-frame capture, escalate instead of a
+// partial answer) when absent.
+type KeystrokeSender interface {
+	SendKey(ctx context.Context, paneID, key string) error
+}
+
 // EventPort is the inbound Herdr event subscription (raw socket).
 type EventPort interface {
 	// Subscribe streams agent-status transitions until ctx is done.

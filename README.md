@@ -92,6 +92,13 @@ The plugin never acts on a situation it hasn't learned from you.
    situation (idle / approval / choice / error), fingerprints it into a
    *situation signature* (volatile stuff like paths, hashes, and timestamps
    is masked), and — in shadow mode — **escalates with a suggestion**.
+   Claude's AskUserQuestion MCQ forms classify as `choice`; a **multi-tab**
+   form (plan-mode question series, `← ☐ … ✔ Submit →` header) is first
+   swept tab-by-tab with arrow keystrokes so the escalation, the signature,
+   and the LLM consult see **all** questions, not just the focused one. Its
+   answer is a digit series, one digit per tab including Submit (e.g.
+   `1 2 3 2 1`), delivered as keystrokes; a series that doesn't match the
+   tab count is never partially delivered.
 2. **Confirm or correct.** In the TUI's *Escalations* tab press `enter` to
    confirm the suggestion (and send it), or `c` to type the correct
    response — `v` shows the full record (trigger, rationale, LLM output,
@@ -131,7 +138,10 @@ bin/hap signatures delete approval:9f2c --yes
 
 Config lives in the plugin config dir (`herdr plugin config-dir
 herd-auto-prompter`) as hand-editable TOML; edits apply live (the daemon is
-nudged, or picks them up on the next event).
+nudged, or picks them up on the next event). A complete annotated sample
+covering every section (including `[safety]`, `[llm]`, and `[tui]`) ships
+at [`sample/config.toml`](sample/config.toml) — copy it in and tune. The
+highlights:
 
 ```toml
 [thresholds]
@@ -160,7 +170,7 @@ disabled = false
 model_path = ""            # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
 similarity_threshold = 0.90 # min cosine similarity to reuse a learned signature
 bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1]
-gpu_layers = 0              # model layers offloaded to GPU (0 = CPU)
+gpu_layers = 0              # inert in official builds (GPU backends compiled out)
 
 # Point agents/workspaces at a task list so idle agents get the next
 # unchecked item. Without a declared source, the plugin falls back to

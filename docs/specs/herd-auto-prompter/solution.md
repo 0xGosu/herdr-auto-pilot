@@ -371,6 +371,7 @@ This section makes the coordination model explicit so the single-writer question
 - `get_context(request_id) -> { situation_type, agent_type, options?, permission_verb?, history_summary }`.
 - `submit_decision(request_id, action, option_id?, rationale)` — the `mcp` process writes an `LLM_DECISIONS` row (`status=pending`) and nudges the daemon; the daemon re-gates it (confidence + never-auto allowlist) before promoting it into `DECISIONS` and acting.
 - `action: "@noop"` (sentinel; `noop`/`no_op`/`no-op` normalize to it) — an explicit "no reply needed" decision: promoted like any other submission (audit `action=noop`, learned as `@noop`, runaway counter advanced) but nothing is ever sent to the pane. Breaks the LLM↔agent nudge loop on idle/done status reports. Free text such as "do nothing" is NOT normalized — it stays a literal reply.
+- Multi-tab MCQ forms (Claude AskUserQuestion / plan-mode): the daemon sweeps every tab (Right-arrow protocol, reset with a fixed Left-arrow burst) and the consult context carries the aggregated questions plus `tab_count` and `answer_format`. The answer is a space-separated digit series, one digit per tab INCLUDING the final Submit tab (e.g. `"1 2 3 2 1"`); a length mismatch is rejected — a partial answer is never delivered. Delivery is one digit keystroke per tab (the form advances itself), never literal text.
 
 ### Error Codes / semantics
 

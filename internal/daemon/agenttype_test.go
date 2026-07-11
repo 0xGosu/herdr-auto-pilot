@@ -118,7 +118,7 @@ func TestConfirmationHealsUnknownAgentType(t *testing.T) {
 // tests (the frontend package is not imported here to keep the test local).
 func frontendSuggestedAction(audit domain.AuditRecord) string {
 	sug := audit.Suggestion
-	for _, p := range []string{"respond: ", "choose: ", "on error: ", "LLM suggested: "} {
+	for _, p := range []string{"respond: ", "choose: ", "answer series: ", "on error: ", "LLM suggested: "} {
 		if len(sug) > len(p) && sug[:len(p)] == p {
 			sug = sug[len(p):]
 			break

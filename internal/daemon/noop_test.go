@@ -19,9 +19,12 @@ func TestNoopRuleAutonomousNoSend(t *testing.T) {
 	h.push("agent-noop", "blocked")
 
 	ctx := context.Background()
+	// The rate write is the LAST persistence step of deliverNoop; waiting on
+	// it (not the audit, which lands first) avoids racing the delivery tail
+	// against test teardown.
 	waitFor(t, 3*time.Second, func() bool {
-		audits, _ := h.raw.AuditLog(ctx, 10)
-		return len(audits) > 0 && audits[0].Action == "noop"
+		rate, err := h.raw.GetAgentRate(ctx, "agent-noop")
+		return err == nil && rate.ConsecutiveAuto == 1
 	})
 	audits, _ := h.raw.AuditLog(ctx, 10)
 	if audits[0].Status != "auto" || audits[0].Input != "" {

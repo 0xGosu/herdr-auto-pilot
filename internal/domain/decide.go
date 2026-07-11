@@ -282,6 +282,16 @@ func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggest
 		if conf.TopAction == ActionNoop {
 			return ActionNoop, ActionNoopSuggestion, ReasonNone
 		}
+		// Multi-tab MCQ forms learn a digit series ("1 2 3 2 1"), one digit
+		// per tab including the final Submit tab. The series is never in the
+		// offered option set; instead its length must match the captured tab
+		// count — a mismatched answer must never be partially delivered.
+		if in.Situation.TabCount > 1 {
+			if seq, ok := ParseDigitSeries(conf.TopAction); ok && len(seq) == in.Situation.TabCount {
+				return conf.TopAction, "answer series: " + conf.TopAction, ReasonNone
+			}
+			return "", "", ReasonUnfamiliarOptions
+		}
 		// The learned option must exist in the current option set; an
 		// unfamiliar set escalates (FR-013). (Unfamiliar sets normally
 		// produce a fresh signature already; this guards drift.)

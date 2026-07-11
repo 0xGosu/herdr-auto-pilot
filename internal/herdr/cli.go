@@ -18,6 +18,7 @@ import (
 var (
 	_ ports.InspectorPort     = (*CLI)(nil)
 	_ ports.VisiblePaneReader = (*CLI)(nil)
+	_ ports.KeystrokeSender   = (*CLI)(nil)
 )
 
 // CLI issues one-shot Herdr control actions through the herdr binary
@@ -64,6 +65,14 @@ func (c *CLI) Send(ctx context.Context, paneID, input string) error {
 		return err
 	}
 	_, err := c.run(ctx, "pane", "send-keys", paneID, "enter")
+	return err
+}
+
+// SendKey presses a single key in the pane (`pane send-keys`) without
+// submitting any text (ports.KeystrokeSender): arrow keys sweep a multi-tab
+// question form, digit keys answer numbered menus in place.
+func (c *CLI) SendKey(ctx context.Context, paneID, key string) error {
+	_, err := c.run(ctx, "pane", "send-keys", paneID, key)
 	return err
 }
 

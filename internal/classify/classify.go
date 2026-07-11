@@ -34,6 +34,17 @@ func DefaultRules() []config.ClassifierRule {
 			AgentType: "*", Situation: "choice",
 			Regex: []string{
 				`(?m)^\s*[❯>]?\s*1[.)]\s+\S.*\n\s*[❯>]?\s*2[.)]\s+\S`,
+				// Claude AskUserQuestion / plan-mode MCQ forms: every variant
+				// (single and multi-tab) renders this footer. The navigation
+				// tail is required so an agent merely printing/narrating
+				// "enter to select" (fzf-style help text in dev output) does
+				// not classify as a live menu.
+				`(?im)^.*enter to select.*(·|\bnavigate\b).*$`,
+				// MCQ layout with an indented description line under each
+				// option: allow a bounded run of description lines between
+				// option 1 and option 2 ({0,4} keeps long narrated markdown
+				// lists from false-positiving as a live menu).
+				`(?m)^\s*[❯>]?\s*1[.)]\s+\S.*\n(?:[ \t]+\S.*\n){0,4}\s*[❯>]?\s*2[.)]\s+\S`,
 				`(?i)(select|choose|pick) (an option|one of|from the following)`,
 				`(?i)which (option|approach|one) (would you|should)`,
 				`(?m)^\s*\[1\]\s+\S.*\n\s*\[2\]\s+\S`,
@@ -157,6 +168,12 @@ func enrich(s *domain.Situation) {
 	switch s.Type {
 	case domain.SituationChoice:
 		s.Options = append(s.Options, domain.OptionLabels(s.Content)...)
+		// Multi-tab MCQ forms show one question at a time; the tab count
+		// tells the daemon to sweep the remaining tabs and the answer paths
+		// to expect a digit series (one digit per tab, Submit included).
+		if tabs, ok := domain.MultiTabForm(s.Content); ok {
+			s.TabCount = tabs
+		}
 	case domain.SituationApproval:
 		if m := permissionVerbRE.FindStringSubmatch(s.Content); m != nil {
 			s.PermissionVerb = domain.MaskVolatile(strings.TrimSpace(m[1]))

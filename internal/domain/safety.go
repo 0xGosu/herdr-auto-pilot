@@ -244,6 +244,12 @@ func IrreversibleScanContent(s Situation, declaredTask string) string {
 		}
 		return strings.TrimSpace(strings.Join(parts, "\n"))
 	case SituationApproval, SituationChoice, SituationError:
+		// A swept multi-tab aggregate IS the actionable region already
+		// (scrollback was dropped per frame): the tail window would hide
+		// destructive phrasing in the leading questions.
+		if s.TabCount > 1 {
+			return strings.Join(append([]string{s.Content}, s.Options...), "\n")
+		}
 		parts := []string{lastLines(s.Content, IrreversibleScanTailLines),
 			s.PermissionVerb, s.ErrorSummary}
 		parts = append(parts, s.Options...)

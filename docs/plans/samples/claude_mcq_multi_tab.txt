@@ -1,0 +1,52 @@
+      internal/daemon/agenttype_test.go      | 135 +++++++++++++++++++++++++++++++++
+      internal/daemon/daemon.go              |  46 ++++++++---
+      internal/daemon/daemon_test.go         |  27 ++++---
+      internal/daemon/semantic_test.go       |   8 ++
+      internal/daemon/trigger_status_test.go |  69 +++++++++++++++++
+      internal/domain/types.go               |   2 +
+      internal/frontend/frontend.go          |  24 ++++++
+      internal/store/store.go                |  23 ++++--
+      internal/store/store_test.go           |  72 +++++++++++++++++-
+      internal/tui/tui.go                    |  69 +++++++++++++++--
+      internal/tui/tui_test.go               |  50 +++++++++++-
+      15 files changed, 558 insertions(+), 48 deletions(-)
+      create mode 100644 internal/daemon/agenttype_test.go
+      create mode 100644 internal/daemon/trigger_status_test.go
+
+⏺ Repo updated to v0.2.2 (145fb20). Clean tree. Ready for task.
+
+✻ Crunched for 7s
+
+❯ i want to make the text in the Escalations be concise to save space for the actual LLM suggested text. e.g: `[shadow_mode] llm.auto_act disabled: surfacing LLM suggestion for confirmation  → LLM suggested: ...` can reduced to only
+  `[shadown_mode] surfacing → LLM suggested: ...`. We must avoid showing information that already know repeatedly in th TUI.
+  - Avoid info that  the user is fully aware of, e.g: the current config set in config.toml
+  - Make the template string concise (no need to explain too much to user).
+  And one more thing the "allowlist_match" is very confusing term. This is actually mean "never-auto allowlist" we should change the name of this config/term to avoid confusion
+
+  Read 8 files, ran 1 agent, called 1 tool, ran 19 shell commands
+
+⏺ Waiting on exploration agent results before drafting plan.
+
+✻ Waiting for 1 background agent to finish · 6 messages hidden (/focus to show)
+
+  Running 1 agent, calling 1 tool…
+
+⏺ Exploration done. Full map of escalation strings + allowlist usage. Before writing plan, few decisions needed:
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Planning: /Users/vincent/.claude/plans/i-want-to-make-glistening-nebula.md
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ New name  ☐ Rename depth  ☐ Config compat  ☐ Conciseness  ✔ Submit  →
+
+New name for the "allowlist" concept (config key, reason token, labels)? It means: patterns that must NEVER be auto-answered — always escalate to human.
+
+❯ 1. never_auto (Recommended)
+     config key `never_auto_patterns`, reason token `never_auto_match`, TUI/CLI label "never-auto". Matches wording already used in docs/help text.
+  2. deny
+     config key `deny_patterns`, reason `deny_match`. Shorter but ambiguous (deny what?).
+  3. escalate_always
+     config key `escalate_always_patterns`, reason `escalate_always`. Very explicit, longer.
+  4. Type something.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel

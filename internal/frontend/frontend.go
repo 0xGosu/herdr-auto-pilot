@@ -27,6 +27,13 @@ import (
 // recover the live numbered menu before delivering the operator's reply.
 const menuReadLines = 40
 
+// seriesResetKeys / seriesKeyDelay mirror the daemon's multi-tab answer
+// protocol (sweepResetKeys / sweepKeyDelay): a fixed Left-arrow burst lands
+// on the first question regardless of form size, and the delay lets the
+// form advance and re-render between keystrokes.
+const seriesResetKeys = 10
+const seriesKeyDelay = 250 * time.Millisecond
+
 // readVisiblePane returns the pane's current on-screen content, preferring a
 // visible-source read (which reflects a standing menu) and falling back to
 // the plain recent read when the adapter cannot do visible reads.
@@ -266,7 +273,42 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		// so a menu still up gets the right keystroke; on read failure, a
 		// free-text prompt, or a non-menu situation, deliver the literal
 		// reply unchanged.
-		if pane, rerr := a.readVisiblePane(ctx, audit.AgentID, menuReadLines); rerr == nil {
+		pane, rerr := a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
+		// A digit series ("1 2 3 2 1") answers a multi-tab question form:
+		// one digit keystroke per tab, Submit included — sent as literal
+		// text it would land in the first question's input instead.
+		if seq, isSeries := domain.ParseDigitSeries(outbound); isSeries &&
+			audit.SituationType == domain.SituationChoice {
+			if rerr != nil {
+				return fmt.Errorf("correction recorded, but the pane could not be read to deliver the answer series: %w", rerr)
+			}
+			if tabs, ok := domain.MultiTabForm(pane); !ok || tabs != len(seq) {
+				return fmt.Errorf("correction recorded, but the pane no longer shows a %d-tab form; answer series not delivered", len(seq))
+			}
+			ks, ok := a.Herdr.(ports.KeystrokeSender)
+			if !ok {
+				return fmt.Errorf("correction recorded, but this herdr adapter cannot send keystrokes for the answer series")
+			}
+			// Reset to the first question with a fixed Left-arrow burst —
+			// the operator may have tabbed around the form since the
+			// escalation was raised — then answer one digit per tab.
+			for i := 0; i < seriesResetKeys; i++ {
+				if err := ks.SendKey(ctx, audit.AgentID, "left"); err != nil {
+					return fmt.Errorf("correction recorded, but resetting the form failed: %w", err)
+				}
+			}
+			time.Sleep(seriesKeyDelay)
+			for i, digit := range seq {
+				if i > 0 {
+					time.Sleep(seriesKeyDelay)
+				}
+				if err := ks.SendKey(ctx, audit.AgentID, digit); err != nil {
+					return fmt.Errorf("correction recorded, but the answer series failed at digit %d/%d: %w", i+1, len(seq), err)
+				}
+			}
+			return a.nudge(ctx, control.KindReload)
+		}
+		if rerr == nil {
 			outbound = domain.DeliverKeystroke(audit.SituationType, pane, outbound)
 		}
 		if err := a.Herdr.Send(ctx, audit.AgentID, outbound); err != nil {
@@ -296,7 +338,7 @@ func (a *App) Confirm(ctx context.Context, auditID int64, send bool) error {
 // Keep in sync with the daemon's suggestionAction.
 func SuggestedAction(audit *domain.AuditRecord) string {
 	sug := audit.Suggestion
-	for _, p := range []string{"respond: ", "choose: ", "on error: ", "LLM suggested: "} {
+	for _, p := range []string{"respond: ", "choose: ", "answer series: ", "on error: ", "LLM suggested: "} {
 		if len(sug) > len(p) && sug[:len(p)] == p {
 			sug = sug[len(p):]
 			break

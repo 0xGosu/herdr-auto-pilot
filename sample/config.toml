@@ -1,0 +1,98 @@
+# Sample hap (Herd Auto Prompter) configuration — every section with its
+# default values, annotated. Copy into the plugin config dir reported by
+# `herdr plugin config-dir herd-auto-prompter` and tune from there.
+#
+# Everything is optional: omitted keys fall back to their defaults, and
+# invalid values are corrected to defaults rather than erroring. Edits
+# apply live (the daemon is nudged, or picks them up on the next event).
+
+# ── Decision confidence ─────────────────────────────────────────────
+# Per-situation confidence a learned rule must reach before acting.
+[thresholds]
+idle = 0.75
+approval = 0.80
+choice = 0.80
+error = 0.85
+inferred_task_bar = 0.90   # higher bar for tasks inferred from the agent's todo widget
+
+# ── Shadow-mode learning ────────────────────────────────────────────
+[learning]
+graduation_n = 5           # consecutive consistent confirmations to graduate a rule
+
+# ── Safety (never-auto) ─────────────────────────────────────────────
+[safety]
+allowlist_patterns = []          # extra regexes that ALWAYS escalate (e.g. "rm -rf")
+disable_seed = false             # keep the shipped seed allowlist (recommended)
+irreversible_indicators = []     # extra suspected-irreversible patterns, all agents
+
+# Agent-scoped irreversible indicator (repeatable):
+# [[safety.indicator_rules]]
+# pattern = "terraform (apply|destroy)"
+# agents  = ["claude", "codex"]     # "*" or empty = all agents
+
+# ── Rate limits ─────────────────────────────────────────────────────
+[limits]
+max_consecutive_auto_prompts = 5   # per agent, without human interaction
+max_auto_prompts_per_minute = 10   # per agent
+max_error_retries = 2              # per error signature
+
+# ── Operator LLM (consulted on unknown situations) ──────────────────
+# Omit this whole section to escalate unknown situations directly to you.
+[llm]
+# Claude Code recipe; {self} = the hap binary, {request_id} is filled per
+# consult. The prompt must come immediately after -p (claude quirk; the
+# plugin also auto-repairs it).
+command = [
+  "claude", "-p",
+  "You are the auto-answer assistant for herd-auto-prompter (hap). A coding agent running in a herdr terminal pane has stopped and is waiting for input. Your job: answer exactly as the human operator would, using ONLY the two hap MCP tools.\n\nStep 1 — call get_context. It returns the classified situation:\n- situation_type: 'approval' (permission prompt), 'choice' (menu of options), 'error' (the agent hit a failure), or 'idle' (finished or waiting for its next instruction)\n- options: the menu option texts, when the pane shows a menu\n- permission_verb: what the agent is asking permission to do\n- error_summary: short description of the failure, when situation_type is 'error'\n- pane_excerpt: the recent terminal screen — read it carefully; it is the ground truth for what the agent is doing and asking\n- cwd / foreground_cwd and herdr ids (workspace_id, tab_id, pane_id, agent_id): where the agent is working\n\nStep 2 — decide what the operator would answer:\n- approval / choice: pick ONE entry from options and use its EXACT text. Approve routine, reversible work (reading files, edits, builds, tests, linters). Prefer the safest option and DENY anything destructive or hard to reverse: deleting data, force-pushing or hard-resetting git history, production/deploy changes, touching secrets or credentials, mass file operations.\n- error: reply with one short, concrete instruction telling the agent how to diagnose or fix the failure and continue.\n- idle: reply with the most sensible next instruction based on the pane_excerpt (e.g. continue the remaining work); if nothing remains, tell it to summarize and stop.\n- If the pane_excerpt is ambiguous or does not match the classified situation, choose the most conservative reply.\n\nStep 3 — call submit_decision with: action = the literal reply text to send to the agent (for menus, the exact option text — hap maps it to the menu digit), option_id = the chosen option text for menus, rationale = one sentence on why the operator would answer this way.",
+  "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
+  "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
+  "--model", "opus",
+]
+timeout_seconds = 120
+auto_act = false                   # false: LLM suggestions are surfaced for your confirmation
+pane_excerpt_chars = 5000          # pane context included in the consult
+
+rewrite_command = [
+  "claude", "-p",
+  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
+  "--model", "haiku",
+]
+rewrite_timeout_seconds = 60       # omitted: inherits timeout_seconds
+rewrite_fallback_template = "You must act based on the following: {original_text}"
+
+
+# ── Semantic rule matching (vector embeddings) ──────────────────────
+# Situations are matched to learned rules by embedding their masked salient
+# content and vector-searching stored signatures, so a paraphrased prompt
+# reuses the rule instead of re-learning from zero. Falls back to normalized
+# BM25 text matching when the model is unavailable, then to exact hashing —
+# missing assets never block or crash the daemon.
+[embedding]
+disabled = false
+model_path = ""             # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
+similarity_threshold = 0.90 # min cosine to reuse a learned rule; outside (0,1) resets to 0.90
+bm25_min_score = 0.35       # text-fallback floor when the model is unavailable, (0,1]
+gpu_layers = 0              # inert in official builds (Metal/Vulkan compiled out; the
+                            # bundled MiniLM runs in ms on CPU) — only meaningful if you
+                            # rebuild llama-go with GPU on and use a larger model
+
+# ── TUI ─────────────────────────────────────────────────────────────
+[tui]
+max_content_width = 0      # cap on variable-length list columns; 0 = full terminal width
+
+# ── Declared task lists for idle agents (repeatable) ────────────────
+# Without a declared source, the plugin falls back to inferring the next
+# task from the agent's own todo rendering, held to inferred_task_bar.
+# [[task_sources]]
+# agent = ""                 # short name, pane id, or type; "" = any
+# workspace = ""             # "" or "*" = any; wildcards like "codex-*" work
+# path = "/home/me/project/docs/tasks.md"
+# next_task_template = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."
+
+# ── Custom classifier rules (repeatable, extend the built-ins) ──────
+# [[classifier]]
+# agent_type = "*"                      # "*" = any agent type
+# situation = "approval"                # approval | choice | error | idle
+# regex = ['(?i)shall I go ahead\?']
+# keywords = ["waiting for approval"]

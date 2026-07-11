@@ -47,6 +47,9 @@ go test -tags integration ./test/integration/ -v
 
 # also drive a real, authenticated claude (spends tokens):
 HAP_ITEST_CLAUDE=1 go test -tags integration ./test/integration/ -v
+
+# include the real-model semantic matching case (needs the native deps):
+go test -tags "integration vectors cpu" ./test/integration/ -v
 ```
 
 - Each test **skips** (never fails) when its dependency is absent, so the
@@ -60,6 +63,12 @@ HAP_ITEST_CLAUDE=1 go test -tags integration ./test/integration/ -v
   (gated by `HAP_ITEST_CLAUDE=1`) drives a **real Claude Code session
   (`--model haiku`)** to a real approval menu, confirms it through the
   plugin, and asserts the menu digit reached claude (the command runs).
+  `TestRealEmbeddingSemanticMatch` (needs the extra `vectors cpu` tags)
+  drives a **real llama.cpp embedding model + FAISS index** through an
+  in-process daemon: a rule learned for one approval auto-answers a
+  paraphrase (cosine ≥ 0.90) and leaves an unrelated approval alone; skips
+  when `models/all-minilm-l6-v2-q8_0.gguf` is absent
+  (`HAP_TEST_EMBED_MODEL` overrides).
 - The claude case skips (never fails) if it can't elicit a prompt; it needs a
   path OUTSIDE claude's auto-approved dirs (`/tmp`, `/workspaces`,
   `~/.claude`) to force the permission menu — it touches a `$HOME` dotfile.

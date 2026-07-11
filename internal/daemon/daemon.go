@@ -81,6 +81,7 @@ type Daemon struct {
 	nudges         chan control.Kind
 	llmResults     chan llmOutcome
 	rewriteResults chan rewriteOutcome
+	sweepResults   chan sweepOutcome
 
 	// configured flips after the first successful reload so reloadEmbedder
 	// can tell first load from a config change.
@@ -100,6 +101,10 @@ type Daemon struct {
 	// by mu alongside rewriteSeq.
 	rewriteInFlight map[string]rewriteFlight
 	rewriteSeq      uint64
+
+	// sweepInFlight dedupes the one live multi-tab form sweep per agent
+	// (guarded by mu); outcomes return through sweepResults.
+	sweepInFlight map[string]bool
 
 	// wsNames caches the workspace id→name listing for task-source
 	// workspace matching; refreshed after workspaceCacheTTL.
@@ -137,6 +142,18 @@ type rewriteOutcome struct {
 	token     uint64
 }
 
+// sweepOutcome carries a finished multi-tab form sweep back into the main
+// loop: the situation with content/options aggregated across all tabs, or —
+// degraded — the original single-frame situation plus the failure reason
+// (a degraded capture escalates; it must never feed an LLM consult).
+type sweepOutcome struct {
+	situation domain.Situation
+	tr        domain.AgentTransition
+	agentName string
+	degraded  bool
+	reason    string
+}
+
 // New creates a daemon.
 func New(opt Options) (*Daemon, error) {
 	if opt.Clock == nil {
@@ -154,9 +171,11 @@ func New(opt Options) (*Daemon, error) {
 		nudges:          make(chan control.Kind, 16),
 		llmResults:      make(chan llmOutcome, 16),
 		rewriteResults:  make(chan rewriteOutcome, 16),
+		sweepResults:    make(chan sweepOutcome, 16),
 		lastAutoSend:    map[string]time.Time{},
 		lastAutoNoop:    map[string]time.Time{},
 		rewriteInFlight: map[string]rewriteFlight{},
+		sweepInFlight:   map[string]bool{},
 		embedder:        opt.Embedder,
 	}
 	if opt.MatchIndexDir != "" {
@@ -311,13 +330,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.handleRewriteOutcome(ctx, res)
 				return nil
 			})
+		case res := <-d.sweepResults:
+			logging.Guard("sweep-result", func() error {
+				d.handleSweepOutcome(ctx, res)
+				return nil
+			})
 		}
 	}
 }
 
 // handleTransition evaluates one agent-status transition end to end.
 func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition) {
-	cfg, allow, cls := d.snapshot()
+	_, _, cls := d.snapshot()
 	now := d.opt.Clock.Now()
 
 	// Auto-generate a short friendly name on first sight — for EVERY
@@ -385,6 +409,31 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	if situation.AgentType == "" {
 		situation.AgentType = "unknown"
 	}
+
+	// Multi-tab MCQ forms show one question at a time: sweep the remaining
+	// tabs (Right-arrow protocol) so the signature, the escalation, and the
+	// LLM consult all describe the WHOLE form, not question 1 of N. The
+	// sweep is pane interaction and runs off the main loop; its outcome
+	// re-enters decideAndAct. It is gated like any automation — kill
+	// switch, rate pause, allowlist — BEFORE the first keystroke, and
+	// degrades to single-frame when the adapter cannot send keystrokes.
+	if situation.Type == domain.SituationChoice && situation.TabCount > 1 {
+		if ks, ok := d.opt.Herdr.(ports.KeystrokeSender); ok && d.sweepAllowed(ctx, situation) {
+			d.startSweep(ctx, ks, situation, tr, agentName)
+			return
+		}
+	}
+
+	d.decideAndAct(ctx, situation, tr, agentName, now)
+}
+
+// decideAndAct is the decision tail shared by handleTransition and the
+// multi-tab sweep outcome: signature, state reads, safety inputs, the pure
+// decision core, and dispatch.
+func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
+	tr domain.AgentTransition, agentName string, now time.Time) {
+
+	cfg, allow, _ := d.snapshot()
 
 	sig := domain.ComputeSignature(situation)
 	// Semantic resolution may remap the key onto an existing learned
@@ -543,6 +592,13 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 			Rationale:  "outbound input matches never-auto pattern: " + pattern,
 			Confidence: dec.Confidence,
 		}, tr, now)
+		return
+	}
+
+	// Multi-tab MCQ forms are answered with a digit series, one keystroke
+	// per tab — never a single mapped label, never rewritten.
+	if s.Type == domain.SituationChoice && s.TabCount > 1 {
+		d.deliverSeries(ctx, s, sig, dec, tr, now)
 		return
 	}
 
@@ -808,7 +864,7 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		workspaceID = info.WorkspaceID
 	}
 
-	contextJSON, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"situation_type":  s.Type,
 		"agent_type":      s.AgentType,
 		"options":         s.Options,
@@ -822,7 +878,14 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		"cwd":             info.Cwd,
 		"foreground_cwd":  info.ForegroundCwd,
 		"no_reply_option": "if the agent needs no reply (it finished or is only reporting status), submit_decision with action \"@noop\" to explicitly do nothing",
-	})
+	}
+	if s.TabCount > 1 {
+		fields["tab_count"] = s.TabCount
+		fields["answer_format"] = fmt.Sprintf(
+			"this is a multi-tab question form with %d tabs (the final tab is Submit); the pane excerpt lists every question in order. submit_decision action MUST be a space-separated series of exactly %d digits, one chosen option digit per tab including Submit, e.g. \"1 2 3 2 1\"",
+			s.TabCount, s.TabCount)
+	}
+	contextJSON, _ := json.Marshal(fields)
 	return contextJSON
 }
 
@@ -836,6 +899,13 @@ func (d *Daemon) paneExcerpt(ctx context.Context, cfg config.Config, s domain.Si
 	chars := cfg.LLM.PaneExcerptChars
 	if chars <= 0 {
 		chars = config.Default().LLM.PaneExcerptChars
+	}
+	// A multi-tab situation carries the swept aggregate (every question in
+	// order); a fresh read would see only the currently focused tab. Take
+	// the HEAD when it exceeds the excerpt cap — the consult contract says
+	// the questions appear in order, so question 1 must never be cut.
+	if s.TabCount > 1 {
+		return truncateRunes(s.Content, chars)
 	}
 	excerpt := s.Content
 	lines := chars / 10
@@ -1162,9 +1232,19 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(reason, "runaway-loop guard at LLM promotion time")
 		return
 	}
-	// Choice sanity: the option must exist in the offered set. A noop is
-	// never an offered option; it deliberately bypasses this check.
-	if s.Type == domain.SituationChoice && !isNoop && len(s.Options) > 0 {
+	// Choice sanity. Multi-tab forms expect a digit series (one digit per
+	// tab, Submit included) — a mismatched length must never be partially
+	// delivered. Single menus require the chosen option to exist in the
+	// offered set. A noop is never an offered option; it deliberately
+	// bypasses both checks.
+	if s.Type == domain.SituationChoice && s.TabCount > 1 && !isNoop {
+		if seq, ok := domain.ParseDigitSeries(llmDec.Action); !ok || len(seq) != s.TabCount {
+			reject(domain.ReasonUnfamiliarOptions,
+				fmt.Sprintf("multi-tab form expects a series of %d digits (e.g. \"1 2 3 2 1\"), got %q",
+					s.TabCount, llmDec.Action))
+			return
+		}
+	} else if s.Type == domain.SituationChoice && !isNoop && len(s.Options) > 0 {
 		found := false
 		for _, o := range s.Options {
 			if strings.EqualFold(strings.TrimSpace(o), strings.TrimSpace(llmDec.Action)) ||
@@ -1252,10 +1332,22 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	current := cls.Classify(s.AgentType, s.Status, pane)
 	current.AgentID, current.PaneID, current.WorkspaceID = s.AgentID, s.PaneID, s.WorkspaceID
 	current.Status = s.Status
-	// Compare raw content hashes: the staged signature may have been
-	// semantically remapped onto another key, but Raw always reflects the
-	// pane content as read, so equal Raw means the pane did not move on.
-	if freshSig := domain.ComputeSignature(current); freshSig.Raw != res.sig.Raw {
+	if s.TabCount > 1 {
+		// Multi-tab situations carry the swept AGGREGATE as content, which
+		// never hashes equal to any single frame: staleness here means the
+		// form is gone, reshaped, or REPLACED — a different form with the
+		// same tab count (consults take minutes) must never receive this
+		// series, so the first question is compared verbatim too.
+		if tabs, ok := domain.MultiTabForm(pane); !ok || tabs != s.TabCount ||
+			domain.ExtractMCQForm(pane) != domain.FirstMCQQuestion(s.Content) {
+			reject(domain.ReasonLLMNoSubmit, "multi-tab form changed while consulting the LLM; suggestion is stale")
+			return
+		}
+	} else if freshSig := domain.ComputeSignature(current); freshSig.Raw != res.sig.Raw {
+		// Compare raw content hashes: the staged signature may have been
+		// semantically remapped onto another key, but Raw always reflects
+		// the pane content as read, so equal Raw means the pane did not
+		// move on.
 		reject(domain.ReasonLLMNoSubmit, "situation changed while consulting the LLM; suggestion is stale")
 		return
 	}
@@ -1274,8 +1366,28 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		return
 	}
 	// Same numbered-menu mapping as the learned act path: deliver the digit
-	// for approval/choice, the literal reply otherwise. `pane` is the visible
-	// re-read verified current just above.
+	// for approval/choice, the literal reply otherwise. Multi-tab forms take
+	// the validated digit series, one keystroke per tab — off the main loop
+	// (the keystrokes take seconds) and mutually exclusive with any sweep.
+	// `pane` is the visible re-read verified current just above.
+	if s.Type == domain.SituationChoice && s.TabCount > 1 {
+		ks, ok := d.opt.Herdr.(ports.KeystrokeSender)
+		if !ok {
+			d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+			d.notify(ctx, "Herd Auto Prompter: action delivery failed",
+				"herdr adapter cannot send keystrokes; multi-tab answer needs them")
+			return
+		}
+		if !d.acquirePane(s.AgentID) {
+			d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+			d.notify(ctx, "Herd Auto Prompter: action delivery failed",
+				"another pane interaction is in flight for this agent; not delivering concurrently")
+			return
+		}
+		seq, _ := domain.ParseDigitSeries(llmDec.Action)
+		d.deliverSeriesLLM(ctx, ks, s, res.sig.Signature, llmDec, seq, auditID, now)
+		return
+	}
 	if err := d.opt.Herdr.Send(ctx, s.PaneID, domain.DeliverKeystroke(s.Type, pane, llmDec.Action)); err != nil {
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
@@ -1589,7 +1701,7 @@ func trigger(tr domain.AgentTransition) string {
 // frontend.SuggestedAction, which does the same for confirm flows.
 func suggestionAction(audit *domain.AuditRecord) string {
 	sug := audit.Suggestion
-	for _, prefix := range []string{"respond: ", "choose: ", "on error: ", "LLM suggested: "} {
+	for _, prefix := range []string{"respond: ", "choose: ", "answer series: ", "on error: ", "LLM suggested: "} {
 		if rest, ok := strings.CutPrefix(sug, prefix); ok {
 			sug = rest
 			break

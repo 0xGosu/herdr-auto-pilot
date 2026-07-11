@@ -65,6 +65,7 @@ type Situation struct {
 	Options        []string // normalized option set (choice situations)
 	PermissionVerb string   // salient permission verb/action (approval situations)
 	ErrorSummary   string   // salient error text (error situations)
+	TabCount       int      // multi-tab MCQ form: number of tabs incl. Submit (0/1 = single question)
 }
 
 // ActionKind is what the plugin decided to do.

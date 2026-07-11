@@ -39,6 +39,16 @@ type fakeHerdr struct {
 	readLines    []int
 	paneInfo     domain.PaneInfo
 	failPaneInfo bool
+	// keys records every SendKey call (ports.KeystrokeSender). When frames
+	// is set, "right"/"left" keys move frameIdx and ReadPane serves the
+	// focused frame — simulating a multi-tab form under an arrow sweep.
+	keys     []string
+	frames   []string
+	frameIdx int
+	failKeys bool
+	// failKeyName fails only SendKey calls for that specific key (e.g.
+	// "left" to break the sweep's reset burst but not its Right sweep).
+	failKeyName string
 }
 
 func (f *fakeHerdr) Send(ctx context.Context, paneID, input string) error {
@@ -64,7 +74,43 @@ func (f *fakeHerdr) ReadPane(ctx context.Context, paneID string, lines int) (str
 	if f.failReadOver > 0 && lines > f.failReadOver {
 		return "", errors.New("induced deep read failure")
 	}
+	if len(f.frames) > 0 {
+		return f.frames[f.frameIdx], nil
+	}
 	return f.pane, nil
+}
+
+func (f *fakeHerdr) SendKey(ctx context.Context, paneID, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failKeys || (f.failKeyName != "" && key == f.failKeyName) {
+		return errors.New("induced keystroke failure")
+	}
+	f.keys = append(f.keys, key)
+	switch key {
+	case "right":
+		if f.frameIdx < len(f.frames)-1 {
+			f.frameIdx++
+		}
+	case "left":
+		if f.frameIdx > 0 {
+			f.frameIdx--
+		}
+	}
+	return nil
+}
+
+func (f *fakeHerdr) keysSent() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.keys...)
+}
+
+func (f *fakeHerdr) setFrames(frames []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.frames = frames
+	f.frameIdx = 0
 }
 
 func (f *fakeHerdr) PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, error) {

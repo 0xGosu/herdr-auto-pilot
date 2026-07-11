@@ -816,3 +816,73 @@ func TestResolveNormalizesNoopSpelling(t *testing.T) {
 		t.Errorf("normalized noop must never send, sent %v", fake.inputs)
 	}
 }
+
+// fakeKeyHerdr adds keystroke support (ports.KeystrokeSender) to fakeHerdr.
+type fakeKeyHerdr struct {
+	fakeHerdr
+	keys []string
+}
+
+func (f *fakeKeyHerdr) SendKey(_ context.Context, paneID, key string) error {
+	f.keys = append(f.keys, key)
+	return nil
+}
+
+func TestResolveDigitSeriesDeliversKeystrokes(t *testing.T) {
+	// Confirming a multi-tab answer series delivers one digit keystroke per
+	// tab (Submit included) — never the series as literal text.
+	app, st := testApp(t)
+	fake := &fakeKeyHerdr{fakeHerdr: fakeHerdr{
+		pane: "←  ☐ Q one  ☐ Q two  ✔ Submit  →\n\nWhich backend?\n❯ 1. sqlite\n  2. postgres\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n",
+	}}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p12", SituationType: domain.SituationChoice, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: "answer series: 1 2 1", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].CorrectedAction != "1 2 1" {
+		t.Errorf("confirm should record the series: %+v", corr)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("series must not be sent as text, sent %v", fake.inputs)
+	}
+	// A fixed Left-arrow burst resets the form to question 1 first — the
+	// operator may have tabbed around since the escalation was raised.
+	want := strings.TrimSpace(strings.Repeat("left ", 10)) + " 1 2 1"
+	if got := strings.Join(fake.keys, " "); got != want {
+		t.Errorf("keystrokes = %q, want %q", got, want)
+	}
+}
+
+func TestResolveDigitSeriesStaleFormFails(t *testing.T) {
+	// The pane no longer shows a matching multi-tab form: the correction is
+	// recorded but no digit is typed into whatever replaced it.
+	app, st := testApp(t)
+	fake := &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: "$ waiting at a shell prompt\n"}}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p13", SituationType: domain.SituationChoice, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: "answer series: 1 2 1", CreatedAt: time.Now(),
+	})
+	err := app.Resolve(ctx, id, "1 2 1", true)
+	if err == nil || !strings.Contains(err.Error(), "no longer shows") {
+		t.Fatalf("stale form must fail the send, got err=%v", err)
+	}
+	if len(fake.keys) != 0 || len(fake.inputs) != 0 {
+		t.Errorf("nothing may reach the pane: keys=%v inputs=%v", fake.keys, fake.inputs)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 {
+		t.Errorf("the correction itself must still be recorded: %+v", corr)
+	}
+}
