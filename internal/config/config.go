@@ -160,7 +160,30 @@ type TUI struct {
 	// (rationale, suggestion, action) in the list views. 0 (the default)
 	// means use the full terminal width, so rows fill a wide monitor.
 	MaxContentWidth int `toml:"max_content_width"`
+	// Theme selects a named TUI palette (see ValidThemes). Empty and
+	// unknown names resolve to "default" — the exact pre-theming look.
+	Theme string `toml:"theme,omitempty"`
+	// Palette overrides individual color roles on top of the selected
+	// theme; unset roles inherit the theme's value.
+	Palette PaletteOverrides `toml:"palette,omitempty"`
 }
+
+// PaletteOverrides are optional per-role color overrides for the TUI
+// palette. Values are terminal color strings lipgloss accepts ("205",
+// "#ff5faf"). Edited via config.toml only — the TUI shows them read-only.
+type PaletteOverrides struct {
+	Title   string `toml:"title,omitempty"`
+	Section string `toml:"section,omitempty"`
+	Error   string `toml:"error,omitempty"`
+	OK      string `toml:"ok,omitempty"`
+	Paused  string `toml:"paused,omitempty"`
+	Running string `toml:"running,omitempty"`
+	Help    string `toml:"help,omitempty"`
+}
+
+// ValidThemes are the named palettes `[tui] theme` accepts. The tui
+// package defines their colors; a test there keeps the two lists in sync.
+var ValidThemes = []string{"default", "dark", "light", "high-contrast"}
 
 // Config is the full operator configuration.
 type Config struct {

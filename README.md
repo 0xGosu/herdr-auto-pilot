@@ -118,7 +118,16 @@ The plugin never acts on a situation it hasn't learned from you.
    responding — the audit row is kept as `dismissed`. Deleting a learned
    rule still asks for confirmation, and audit entries can't be deleted
    individually (only the full clear-data reset removes them). CLI:
-   `dismiss <id>...` and `escalations prune [minutes]`.
+   `dismiss <id>...` and `escalations prune [minutes]`. Long lists scroll
+   with the cursor and show a `… N more` line when rows are clipped, and
+   `/` opens an incremental search on the *Agents*, *Escalations*,
+   *Audit*, and *Rules* tabs — case-insensitive substring over the visible
+   columns. `esc`/`enter` closes the search input keeping the filter,
+   backspacing the query to empty clears it, and while typing, every
+   printable key goes into the query — action keys like `q`, `y`, and `x`
+   can't fire mid-search. Action outcomes (confirm, resolve, delete, …)
+   stay pinned in a status area (`✓`/`✗` plus timestamp) until the next
+   action, so the result of a multi-step operation isn't missed.
 3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
    *and* confidence above the per-situation threshold, that signature becomes
    autonomous: next time, the plugin acts on its own and logs it.
@@ -135,8 +144,10 @@ the full record — including the **original situation**, the pane snapshot
 first captured for the rule, so you can see exactly what a rule answers,
 not just the action it sends (rules learned before this feature pick it
 up on their next sighting) — plus recent decisions and last audit
-context. `f`
-filters by mode, and `x` deletes a signature you no longer trust — deletion erases
+context. The list shows each rule's full signature id untruncated, ready
+to copy into the CLI. `f`
+filters by mode (composing with `/` search), and `x` deletes a signature
+you no longer trust — deletion erases
 its decision history too (audit rows are kept), so it re-learns from
 scratch. Signatures are addressed by unique prefix, git-style:
 
@@ -183,6 +194,22 @@ model_path = ""            # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.
 similarity_threshold = 0.90 # min cosine similarity to reuse a learned signature
 bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1]
 gpu_layers = 0              # inert in official builds (GPU backends compiled out)
+
+# TUI appearance. `theme` picks a named palette: default, dark, light,
+# high-contrast. Empty or unknown names resolve to default — the exact
+# original look — so existing setups see no change.
+[tui]
+max_content_width = 0       # cap variable-width list columns; 0 = full width
+theme = "high-contrast"
+
+# Optional per-role color overrides, layered on top of the theme; unset
+# roles inherit the theme's value. Values are terminal color strings
+# lipgloss accepts: 256-color codes ("205") or hex ("#ff5faf"). Roles:
+# title, section, error, ok, paused, running, help. Edited in config.toml
+# only (the TUI shows them read-only).
+[tui.palette]
+title = "205"
+error = "#ff5f5f"
 
 # Point agents/workspaces at a task list so idle agents get the next
 # unchecked item. Without a declared source, the plugin falls back to
@@ -244,9 +271,20 @@ patterns are merged with a warning, and the next config save rewrites the
 file under the new key.)
 
 or `hap rules add '<regex>'` / `rules remove <index>`, or press `a`/`x` on
-the TUI's *Config* tab — which also edits every config field inline
-(`enter`), adds/removes task sources (`t`/`x`), and clears learned data
-(`X`). Prompts that *look* destructive
+the TUI's *Config* tab — which also lists every scalar config field,
+adds/removes task sources (`t`/`x`), and clears learned data (`X`).
+Simple fields — numbers, booleans, and the `tui.theme` enum, including
+`llm.pane_excerpt_chars`, `safety.disable_seed`, and
+`tui.max_content_width` — edit inline (`enter`) or via
+`hap config set <key> <value>`. Free-text fields (`llm.command`,
+`llm.rewrite_command`, `llm.rewrite_fallback_template`,
+`embedding.model_path`) show read-only in the TUI, because a one-line
+prompt mangles quoted argv values — edit them in `config.toml` or with
+`config set`, which accepts every key. The safety indicator patterns and
+`[[capture_delay]]` rules also display read-only on the tab (capture
+delays show the built-in defaults, 1000 ms first event / 200 ms after,
+when none are configured), and long values are truncated to one line —
+the full value lives in `config.toml`. Prompts that *look* destructive
 but match no pattern are escalated by a suspected-irreversible heuristic
 rather than automated. The heuristic needs corroboration to fire — a
 destructive verb aimed at a data/infrastructure target, explicit no-undo

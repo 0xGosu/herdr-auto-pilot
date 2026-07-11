@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
@@ -377,9 +378,190 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 	}
 	// Every editable key renders a value.
 	for _, key := range frontend.ConfigFieldKeys {
-		if key != "llm.command" && frontend.FieldValue(cfg, key) == "" {
+		if frontend.FieldValue(cfg, key) == "" {
 			t.Errorf("FieldValue(%s) is empty", key)
 		}
+	}
+}
+
+// TestConfigFieldRegistryParity is the CR-033 three-way guarantee: every key
+// in the ConfigFields registry must (1) render a display value from the
+// default config and (2) be accepted by SetField with a valid sample value.
+// Adding a key to the registry without teaching FieldValue/SetField about it
+// (or without a sample here) fails this test by name.
+func TestConfigFieldRegistryParity(t *testing.T) {
+	// One valid sample value per registry key. When you add a field to
+	// frontend.ConfigFields, add a sample here or this test fails loudly.
+	samples := map[string]string{
+		"thresholds.idle":                     "0.70",
+		"thresholds.approval":                 "0.85",
+		"thresholds.choice":                   "0.85",
+		"thresholds.error":                    "0.90",
+		"thresholds.inferred_task_bar":        "0.95",
+		"learning.graduation_n":               "5",
+		"limits.max_consecutive_auto_prompts": "5",
+		"limits.max_auto_prompts_per_minute":  "10",
+		"limits.max_error_retries":            "2",
+		"safety.disable_seed":                 "true",
+		"llm.command":                         `claude -p "decide"`,
+		"llm.timeout_seconds":                 "60",
+		"llm.auto_act":                        "true",
+		"llm.pane_excerpt_chars":              "4000",
+		"llm.rewrite_command":                 `claude -p "rewrite: {text}"`,
+		"llm.rewrite_timeout_seconds":         "45",
+		"llm.rewrite_fallback_template":       "Act on: {original_text}",
+		"embedding.disabled":                  "false",
+		"embedding.model_path":                "/models/custom.gguf",
+		"embedding.similarity_threshold":      "0.90",
+		"embedding.bm25_min_score":            "0.35",
+		"embedding.gpu_layers":                "0",
+		"tui.max_content_width":               "140",
+		"tui.theme":                           "dark",
+	}
+
+	registry := make(map[string]bool, len(frontend.ConfigFieldKeys))
+	for _, key := range frontend.ConfigFieldKeys {
+		registry[key] = true
+		if _, ok := samples[key]; !ok {
+			t.Errorf("registry key %q has no sample value in this test — add one to keep the CR-033 parity guarantee", key)
+		}
+	}
+	for key := range samples {
+		if !registry[key] {
+			t.Errorf("sample key %q is not in frontend.ConfigFields — stale sample or missing registry entry", key)
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	// (1) Every key renders a non-empty display value from the defaults.
+	def := config.Default()
+	for _, key := range frontend.ConfigFieldKeys {
+		if frontend.FieldValue(def, key) == "" {
+			t.Errorf("FieldValue(Default(), %s) is empty — FieldValue is missing the key", key)
+		}
+	}
+
+	// (2) SetField accepts a valid sample for every key.
+	app, _ := testApp(t)
+	ctx := context.Background()
+	for _, key := range frontend.ConfigFieldKeys {
+		if err := app.SetField(ctx, key, samples[key]); err != nil {
+			t.Errorf("SetField(%s, %q) rejected a valid value: %v", key, samples[key], err)
+		}
+	}
+}
+
+// TestFieldTUIEditableClassification pins CR-036: free-text fields (argv
+// templates, template strings, paths) are read-only in the TUI, everything
+// else in the registry is editable, and unknown keys are never editable.
+func TestFieldTUIEditableClassification(t *testing.T) {
+	readOnly := map[string]bool{
+		"llm.command":                   true,
+		"llm.rewrite_command":           true,
+		"llm.rewrite_fallback_template": true,
+		"embedding.model_path":          true,
+	}
+	for _, key := range frontend.ConfigFieldKeys {
+		want := !readOnly[key]
+		if got := frontend.FieldTUIEditable(key); got != want {
+			t.Errorf("FieldTUIEditable(%s) = %v, want %v", key, got, want)
+		}
+	}
+	// Every expected read-only key must actually exist in the registry.
+	present := make(map[string]bool, len(frontend.ConfigFieldKeys))
+	for _, key := range frontend.ConfigFieldKeys {
+		present[key] = true
+	}
+	for key := range readOnly {
+		if !present[key] {
+			t.Errorf("expected read-only key %q missing from ConfigFields", key)
+		}
+	}
+	if frontend.FieldTUIEditable("nonexistent.field") {
+		t.Error("unknown key must not be TUI-editable")
+	}
+}
+
+func TestSetFieldNewKeysValidation(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		key, value string
+		wantErr    bool
+	}{
+		{"tui.theme", "dark", false},
+		{"tui.theme", "solarized", true},
+		{"tui.max_content_width", "140", false},
+		{"tui.max_content_width", "0", false},
+		{"tui.max_content_width", "-1", true},
+		{"tui.max_content_width", "abc", true},
+		{"safety.disable_seed", "true", false},
+		{"safety.disable_seed", "false", false},
+		{"safety.disable_seed", "yes", true},
+		{"llm.pane_excerpt_chars", "0", false}, // 0 = restore-default sentinel (fillZeroes)
+		{"llm.pane_excerpt_chars", "-5", true},
+		{"llm.pane_excerpt_chars", "abc", true},
+		{"llm.pane_excerpt_chars", "4000", false},
+	}
+	for _, c := range cases {
+		err := app.SetField(ctx, c.key, c.value)
+		if (err != nil) != c.wantErr {
+			t.Errorf("SetField(%s, %q) error = %v, wantErr %v", c.key, c.value, err, c.wantErr)
+		}
+	}
+
+	// The unknown-theme error names the valid themes.
+	err := app.SetField(ctx, "tui.theme", "solarized")
+	if err == nil {
+		t.Fatal("unknown theme must be rejected")
+	}
+	for _, name := range config.ValidThemes {
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("theme error should list valid name %q, got: %v", name, err)
+		}
+	}
+
+	// Case-insensitive theme names normalize to lowercase on persist.
+	if err := app.SetField(ctx, "tui.theme", "DARK"); err != nil {
+		t.Fatalf("SetField(tui.theme, DARK) should normalize, got %v", err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TUI.Theme != "dark" {
+		t.Errorf("persisted theme = %q, want normalized \"dark\"", cfg.TUI.Theme)
+	}
+	// Empty resets to the default theme.
+	if err := app.SetField(ctx, "tui.theme", ""); err != nil {
+		t.Fatalf("empty theme should reset: %v", err)
+	}
+	if cfg, _ = app.Config(); cfg.TUI.Theme != "" {
+		t.Errorf("empty theme should persist as \"\", got %q", cfg.TUI.Theme)
+	}
+
+	// End each key on a NON-zero accepted value so persistence is positively
+	// asserted (a validator that forgot the assignment would otherwise pass).
+	if err := app.SetField(ctx, "tui.max_content_width", "140"); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SetField(ctx, "safety.disable_seed", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TUI.MaxContentWidth != 140 {
+		t.Errorf("tui.max_content_width = %d, want 140", cfg.TUI.MaxContentWidth)
+	}
+	if !cfg.Safety.DisableSeed {
+		t.Error("safety.disable_seed = false, want true (assignment not persisted)")
+	}
+	if cfg.LLM.PaneExcerptChars != 4000 {
+		t.Errorf("llm.pane_excerpt_chars = %d, want 4000", cfg.LLM.PaneExcerptChars)
 	}
 }
 
