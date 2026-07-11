@@ -54,6 +54,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # tags decide release-vs-recovery
+          # Do NOT persist GITHUB_TOKEN: checkout stores it as an
+          # http.extraheader that outranks gh's credential helper, so every
+          # git push would silently authenticate as GITHUB_TOKEN — and a
+          # GITHUB_TOKEN-pushed tag never triggers release.yml.
+          persist-credentials: false
       - name: Tag the manifest version, then pre-bump the next patch
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT }}
