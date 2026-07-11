@@ -270,12 +270,16 @@ When no confident learned rule applies, the plugin can consult a local
 LLM/agent CLI you already have installed. The model receives context and
 submits its suggestion through the plugin's own MCP server
 (`hap mcp` — tools `get_context` and `submit_decision`); its
-stdout is captured for audit only. `submit_decision` takes
-`recommend_action` (literal reply text, or `@noop` for "no reply
-needed"), `select_options` (the explicit multiple-choice answer: 1-based
-option numbers — `[2]` for a single menu, one integer per tab for a
-multi-tab form), and an optional `confident_score` (0-100, shown on the
-escalation entry so you can weigh the suggestion). Example for Claude
+stdout is captured for audit only. `submit_decision` enforces a
+per-situation contract: `approval`/`choice` listing options must be
+answered with `select_options` (the explicit answer: 1-based option
+numbers — `[2]` for a single menu, one integer per tab for a multi-tab
+form; a menu-less prompt such as a bare y/n takes `recommend_action`
+literal text instead), while `idle`/`error` require `recommend_action`
+(the literal reply text) and reject `select_options`;
+`recommend_action "@noop"` ("no reply needed") is accepted for any
+situation, and an optional `confident_score` (0-100) is shown on the
+escalation entry so you can weigh the suggestion. Example for Claude
 Code:
 
 ```toml

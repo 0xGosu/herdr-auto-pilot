@@ -233,7 +233,8 @@ func TestMCPConfidentScoreValidation(t *testing.T) {
 
 func TestMCPLegacyActionAliasAccepted(t *testing.T) {
 	// A consult started under the pre-rename prompt may still submit with
-	// the old field names; they must keep working.
+	// the old "action" field name; it must keep working where literal
+	// reply text is the expected answer (idle/error).
 	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -241,22 +242,109 @@ func TestMCPLegacyActionAliasAccepted(t *testing.T) {
 	defer st.Close()
 	ctx := context.Background()
 	if _, err := st.StageLLMRequest(ctx, domain.LLMRequest{
-		RequestID: "req-old", SituationType: domain.SituationChoice,
-		ContextJSON: `{"options":["red","green"]}`, CreatedAt: time.Now(),
+		RequestID: "req-old", SituationType: domain.SituationIdle,
+		ContextJSON: `{}`, CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	c := startServer(t, st, "req-old")
 	resp := c.call(t, "tools/call", map[string]any{
 		"name":      "submit_decision",
-		"arguments": map[string]any{"action": "green", "option_id": "green"},
+		"arguments": map[string]any{"action": "run the next task"},
 	})
 	if text, _ := json.Marshal(resp); !strings.Contains(string(text), "staged") {
-		t.Fatalf("legacy action/option_id should stage: %s", text)
+		t.Fatalf("legacy action alias should stage: %s", text)
 	}
 	pending, _ := st.PendingLLMDecisions(ctx)
-	if len(pending) != 1 || pending[0].Action != "green" || pending[0].OptionID != "green" {
+	if len(pending) != 1 || pending[0].Action != "run the next task" {
 		t.Fatalf("legacy alias mismatch: %+v", pending)
+	}
+}
+
+func TestMCPSituationInputContract(t *testing.T) {
+	// approval/choice must be answered with select_options; idle/error
+	// with recommend_action. An explicit @noop is valid for any type.
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	stage := func(reqID string, sit domain.SituationType, contextJSON string) {
+		t.Helper()
+		if _, err := st.StageLLMRequest(ctx, domain.LLMRequest{
+			RequestID: reqID, SituationType: sit,
+			ContextJSON: contextJSON, CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		name    string
+		sit     domain.SituationType
+		context string
+		args    map[string]any
+		wantErr string // "" = must stage
+		action  string // staged action when wantErr == ""
+	}{
+		{"choice rejects recommend_action", domain.SituationChoice,
+			`{"options":["red","green"]}`,
+			map[string]any{"recommend_action": "green"}, "select_options", ""},
+		{"approval rejects recommend_action", domain.SituationApproval,
+			`{"options":["Yes","No"]}`,
+			map[string]any{"recommend_action": "Yes"}, "select_options", ""},
+		{"approval accepts select_options", domain.SituationApproval,
+			`{"options":["Yes","No"]}`,
+			map[string]any{"select_options": []int{1}}, "", "Yes"},
+		{"approval accepts noop", domain.SituationApproval,
+			`{"options":["Yes","No"]}`,
+			map[string]any{"recommend_action": "@noop"}, "", domain.ActionNoop},
+		{"idle rejects select_options", domain.SituationIdle, `{}`,
+			map[string]any{"select_options": []int{1}}, "recommend_action", ""},
+		{"error rejects select_options", domain.SituationError, `{}`,
+			map[string]any{"select_options": []int{2}, "recommend_action": "retry"}, "recommend_action", ""},
+		{"error accepts recommend_action", domain.SituationError, `{}`,
+			map[string]any{"recommend_action": "go test ./... -count=1"}, "", "go test ./... -count=1"},
+		{"unknown type stays permissive", domain.SituationUnclassifiable, `{}`,
+			map[string]any{"recommend_action": "continue"}, "", "continue"},
+		{"choice with both fields: select_options wins", domain.SituationChoice,
+			`{"options":["red","green"]}`,
+			map[string]any{"recommend_action": "red", "select_options": []int{2}}, "", "green"},
+		{"menu-less approval takes literal text", domain.SituationApproval,
+			`{"options":[]}`,
+			map[string]any{"recommend_action": "y"}, "", "y"},
+		{"noop spelling exempts approval", domain.SituationApproval,
+			`{"options":["Yes","No"]}`,
+			map[string]any{"recommend_action": "noop"}, "", domain.ActionNoop},
+		{"noop clears stray select_options", domain.SituationApproval,
+			`{"options":["Yes","No"]}`,
+			map[string]any{"recommend_action": "@noop", "select_options": []int{1}}, "", domain.ActionNoop},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqID := fmt.Sprintf("req-sc-%d", i)
+			stage(reqID, tc.sit, tc.context)
+			c := startServer(t, st, reqID)
+			resp := c.call(t, "tools/call", map[string]any{
+				"name": "submit_decision", "arguments": tc.args,
+			})
+			text, _ := json.Marshal(resp)
+			if tc.wantErr != "" {
+				if !strings.Contains(string(text), "isError") || !strings.Contains(string(text), tc.wantErr) {
+					t.Fatalf("want error mentioning %q, got %s", tc.wantErr, text)
+				}
+				return
+			}
+			if !strings.Contains(string(text), "staged") {
+				t.Fatalf("should stage: %s", text)
+			}
+			d, err := st.LLMDecisionByRequest(ctx, reqID)
+			if err != nil || d == nil || d.Action != tc.action {
+				t.Fatalf("staged action = %+v (%v), want %q", d, err, tc.action)
+			}
+		})
 	}
 }
 

@@ -114,15 +114,15 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "submit_decision",
-			"description": "Submit your decision for the pending request. For multiple-choice situations (the context lists options or a multi-tab question form), answer with select_options — the 1-based option number(s). Otherwise recommend_action is the literal reply text to send to the agent. If the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit recommend_action \"@noop\" to explicitly do nothing. The daemon re-gates this through the confidence gate and never-auto patterns before acting.",
+			"description": "Submit your decision for the pending request. Which field to use depends on the situation_type in get_context: \"approval\" and \"choice\" listing options (or a multi-tab form) MUST be answered with select_options — the 1-based option number(s) shown in the context (single menu: exactly one integer, e.g. [2]; multi-tab question form: one integer per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1]) — while an approval/choice with NO options listed (e.g. a bare y/n prompt) takes recommend_action with the literal text the prompt expects; \"idle\" and \"error\" MUST be answered with recommend_action — the literal reply text (next prompt/task for idle, recovery command/reply for error), and select_options is rejected. In ANY situation, if the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit recommend_action \"@noop\" to explicitly do nothing. The daemon re-gates every submission through the confidence gate and never-auto patterns before acting.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"request_id": map[string]any{"type": "string", "description": "Decision request id (optional; defaults to the current request)"},
 					"recommend_action": map[string]any{"type": "string",
-						"description": "Literal reply text to send to the agent, or \"@noop\" to explicitly send nothing (use when no reply is needed). For multiple-choice situations use select_options instead."},
+						"description": "Literal reply text to send to the agent — REQUIRED for idle and error situations, and for approval/choice prompts with no options listed — or \"@noop\" in any situation to explicitly send nothing. Not accepted as the answer to an approval/choice that lists options (use select_options)."},
 					"select_options": map[string]any{"type": "array", "items": map[string]any{"type": "integer", "minimum": 1, "maximum": 9},
-						"description": "Answer for multiple-choice situations: the chosen option number(s), 1-based. A single menu takes exactly one integer, e.g. [2]. A multi-tab question form takes exactly one integer per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1]."},
+						"description": "REQUIRED answer for approval and choice situations that list options: the chosen option number(s), 1-based. A single menu takes exactly one integer, e.g. [2]. A multi-tab question form takes exactly one integer per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1]. Rejected for idle/error situations."},
 					"confident_score": map[string]any{"type": "integer", "minimum": 0, "maximum": 100,
 						"description": "How confident you are in this decision, 0 (a guess) to 100 (certain); shown to the operator with the decision"},
 					"rationale": map[string]any{"type": "string", "description": "Why this action matches the operator's likely intent"},
@@ -220,9 +220,6 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error)
 			action = p.Arguments.Action // legacy alias
 		}
 		selects := p.Arguments.SelectOptions
-		if action == "" && len(selects) == 0 {
-			return nil, fmt.Errorf("recommend_action or select_options is required")
-		}
 		score := -1
 		if p.Arguments.ConfidentScore != nil {
 			score = *p.Arguments.ConfidentScore
@@ -239,6 +236,33 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error)
 		req, err := s.resolveRequest(ctx, requestID)
 		if err != nil {
 			return nil, err
+		}
+		// Per-situation input contract (an explicit @noop is exempt — it is
+		// a valid "no reply" answer to any situation): approval/choice with
+		// a parsed menu must be answered with select_options; idle/error
+		// with recommend_action. A menu-less approval/choice (e.g. a bare
+		// y/n prompt) takes literal reply text, and select_options stays
+		// available as an escape hatch for a menu the parser missed.
+		if action != domain.ActionNoop {
+			var cc consultContextFields
+			_ = json.Unmarshal([]byte(req.ContextJSON), &cc)
+			hasMenu := len(cc.Options) > 0 || cc.TabCount > 1
+			switch req.SituationType {
+			case domain.SituationApproval, domain.SituationChoice:
+				if hasMenu && len(selects) == 0 {
+					return nil, fmt.Errorf("%s situations with a numbered menu must be answered with select_options — the 1-based option number(s) from the context — or recommend_action \"@noop\" to do nothing", req.SituationType)
+				}
+			case domain.SituationIdle, domain.SituationError:
+				if len(selects) > 0 {
+					return nil, fmt.Errorf("%s situations take literal reply text via recommend_action, not select_options", req.SituationType)
+				}
+				if action == "" {
+					return nil, fmt.Errorf("%s situations require recommend_action (the literal reply text), or \"@noop\" to do nothing", req.SituationType)
+				}
+			}
+			if action == "" && len(selects) == 0 {
+				return nil, fmt.Errorf("recommend_action or select_options is required")
+			}
 		}
 		if len(selects) > 0 {
 			// The explicit MCQ answer wins over any free-text action: it is

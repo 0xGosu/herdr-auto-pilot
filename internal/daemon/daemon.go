@@ -933,6 +933,8 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 			s.TabCount, s.TabCount)
 	} else if len(s.Options) > 0 {
 		fields["answer_format"] = "answer with submit_decision select_options: a one-element list with the 1-based number of the chosen option, e.g. [2]"
+	} else if s.Type == domain.SituationApproval || s.Type == domain.SituationChoice {
+		fields["answer_format"] = "no numbered options were detected on the pane: answer with submit_decision recommend_action — the literal text the prompt expects (e.g. \"y\" for a y/n confirmation)"
 	}
 	contextJSON, _ := json.Marshal(fields)
 	return contextJSON
