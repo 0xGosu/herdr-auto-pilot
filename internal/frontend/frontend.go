@@ -334,6 +334,48 @@ func (a *App) Confirm(ctx context.Context, auditID int64, send bool) error {
 	return a.Resolve(ctx, auditID, action, send)
 }
 
+// Dismiss removes a pending escalation from the queue without responding:
+// nothing is sent to the agent and no learning event is recorded. The audit
+// row is kept (append-only, FR-020) with its status flipped to "dismissed".
+func (a *App) Dismiss(ctx context.Context, auditID int64) error {
+	audit, err := a.Store.GetAudit(ctx, auditID)
+	if err != nil {
+		return err
+	}
+	if audit == nil {
+		return fmt.Errorf("audit record %d not found", auditID)
+	}
+	if audit.Status != "escalated" {
+		return fmt.Errorf("audit record %d is %q, not a pending escalation", auditID, audit.Status)
+	}
+	if err := a.Store.DismissEscalation(ctx, auditID); err != nil {
+		return err
+	}
+	// Best-effort nudge: the dismissal is already committed, and callers
+	// batch-dismiss — a dead daemon must not read as a failed dismiss.
+	a.nudge(ctx, control.KindReload)
+	return nil
+}
+
+// DefaultPruneMinutes is how old a pending escalation must be before a
+// prune dismisses it, absent an explicit age (CLI argument / TUI prompt).
+const DefaultPruneMinutes = 360
+
+// PruneEscalations dismisses every pending escalation older than the given
+// age, returning how many were dismissed. Like Dismiss, the audit rows are
+// kept and nothing is sent or learned.
+func (a *App) PruneEscalations(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if olderThan <= 0 {
+		return 0, fmt.Errorf("prune age must be positive, got %s", olderThan)
+	}
+	n, err := a.Store.DismissEscalationsBefore(ctx, time.Now().Add(-olderThan))
+	if err != nil {
+		return 0, err
+	}
+	a.nudge(ctx, control.KindReload) // best-effort, as above
+	return n, nil
+}
+
 // SuggestedAction extracts the confirmable action from an escalation.
 // Keep in sync with the daemon's suggestionAction.
 func SuggestedAction(audit *domain.AuditRecord) string {

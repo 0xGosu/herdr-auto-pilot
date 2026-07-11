@@ -30,13 +30,15 @@ func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, arg
 	case "agents":
 		return agents(ctx, app, out)
 	case "escalations":
-		return escalations(ctx, app, out)
+		return escalations(ctx, app, out, args)
 	case "audit":
 		return audit(ctx, app, out, args)
 	case "confirm":
 		return confirm(ctx, app, out, args)
 	case "resolve", "correct":
 		return resolve(ctx, app, out, args)
+	case "dismiss":
+		return dismiss(ctx, app, out, args)
 	case "pause":
 		if err := app.Pause(ctx); err != nil {
 			return err
@@ -322,7 +324,13 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 	return nil
 }
 
-func escalations(ctx context.Context, app *frontend.App, out io.Writer) error {
+func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) > 0 {
+		if args[0] != "prune" {
+			return fmt.Errorf("usage: escalations [prune [minutes]]")
+		}
+		return escalationsPrune(ctx, app, out, args[1:])
+	}
 	esc, err := app.Escalations(ctx)
 	if err != nil {
 		return err
@@ -348,7 +356,47 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer) error {
 		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\tagent=%s\tsuggestion=%q\trule=[%s]\n",
 			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.Rationale, agent, e.Suggestion, rule)
 	}
-	fmt.Fprintf(out, "\n%d pending; respond with: confirm <id> | resolve <id> --action TEXT [--send]\n", len(esc))
+	fmt.Fprintf(out, "\n%d pending; respond with: confirm <id> | resolve <id> --action TEXT [--send] | dismiss <id>...\n", len(esc))
+	return nil
+}
+
+// escalationsPrune dismisses pending escalations older than the given age
+// in minutes (default 360). Audit rows are kept; nothing is sent or learned.
+func escalationsPrune(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	minutes := frontend.DefaultPruneMinutes
+	if len(args) > 1 {
+		return fmt.Errorf("usage: escalations prune [minutes]")
+	}
+	if len(args) == 1 {
+		v, err := strconv.Atoi(args[0])
+		if err != nil || v <= 0 {
+			return fmt.Errorf("invalid age %q — whole minutes, e.g. escalations prune 120", args[0])
+		}
+		minutes = v
+	}
+	n, err := app.PruneEscalations(ctx, time.Duration(minutes)*time.Minute)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "pruned %d escalation(s) older than %d minute(s); audit rows kept as dismissed\n", n, minutes)
+	return nil
+}
+
+// dismiss removes pending escalations from the queue without responding.
+func dismiss(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: dismiss <audit-id> [<audit-id>...]")
+	}
+	for _, arg := range args {
+		id, err := strconv.ParseInt(arg, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid audit id %q", arg)
+		}
+		if err := app.Dismiss(ctx, id); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "dismissed escalation #%d (audit row kept; nothing sent or learned)\n", id)
+	}
 	return nil
 }
 

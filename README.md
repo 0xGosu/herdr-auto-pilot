@@ -110,7 +110,12 @@ The plugin never acts on a situation it hasn't learned from you.
    `esc` needed). Escalation and audit list rows carry compact `rule=` and
    agent-type columns; the CLI `escalations`/`audit` listings show the
    same. From the CLI: `confirm <id> --send` or
-   `resolve <id> --action TEXT --send`.
+   `resolve <id> --action TEXT --send`. Escalations you don't want to
+   answer can be **deleted**: `space` marks one or more rows, `x` deletes
+   the marked (or selected) ones, and `X` prunes everything older than an
+   age you pick (default 360 minutes). Deleting dismisses without
+   responding — the audit row is kept as `dismissed`, nothing is sent or
+   learned. CLI: `dismiss <id>...` and `escalations prune [minutes]`.
 3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
    *and* confidence above the per-situation threshold, that signature becomes
    autonomous: next time, the plugin acts on its own and logs it.

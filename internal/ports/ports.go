@@ -164,6 +164,13 @@ type FrontendStore interface {
 	// may recreate the signature from an in-flight event; the recreated
 	// state starts from zero, which is what deletion means.
 	DeleteSignature(ctx context.Context, signature string) (int64, error)
+	// DismissEscalation flips one pending escalation to "dismissed" without
+	// recording a correction; the audit row is kept (append-only, FR-020).
+	// Errors when the record is not a pending escalation.
+	DismissEscalation(ctx context.Context, auditID int64) error
+	// DismissEscalationsBefore dismisses every pending escalation created
+	// before cutoff, returning how many were dismissed.
+	DismissEscalationsBefore(ctx context.Context, cutoff time.Time) (int64, error)
 	ClearLearnedData(ctx context.Context) error
 }
 

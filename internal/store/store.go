@@ -740,6 +740,46 @@ func (s *Store) DeleteSignature(ctx context.Context, signature string) (int64, e
 	return decisions, nil
 }
 
+// DismissEscalation flips one pending escalation to "dismissed" (front-end
+// write). The audit row is kept (append-only, FR-020); no correction is
+// recorded, so nothing is learned. The status guard in the WHERE clause
+// makes a concurrent resolve/confirm win over the dismiss.
+func (s *Store) DismissEscalation(ctx context.Context, auditID int64) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE audit_log SET status = 'dismissed' WHERE id = ? AND status = 'escalated'`,
+			auditID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("audit record %d is not a pending escalation", auditID)
+		}
+		return nil
+	})
+}
+
+// DismissEscalationsBefore dismisses every pending escalation created before
+// cutoff, returning how many were dismissed (the front-end prune).
+func (s *Store) DismissEscalationsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	var dismissed int64
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE audit_log SET status = 'dismissed' WHERE status = 'escalated' AND created_at < ?`,
+			unix(cutoff))
+		if err != nil {
+			return err
+		}
+		dismissed, err = res.RowsAffected()
+		return err
+	})
+	return dismissed, err
+}
+
 // SaveSignatureSnapshot records the pane excerpt a signature was first
 // minted from — rule provenance for the detail views. First sighting wins
 // (INSERT OR IGNORE): the ORIGINAL situation stays on display even as later

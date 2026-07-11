@@ -182,7 +182,7 @@ type AuditRecord struct {
 	Rationale       string
 	LLMOutput       string
 	CorrectsAuditID int64
-	Status          string // "auto" | "escalated" | "resolved"
+	Status          string // "auto" | "escalated" | "resolved" | "dismissed"
 	Suggestion      string
 	CreatedAt       time.Time
 }

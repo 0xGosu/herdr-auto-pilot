@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -205,6 +206,94 @@ func TestSignaturesDelete(t *testing.T) {
 	if _, err := run(t, app, "signatures", "delete", "choice:cccc", "--yes"); err == nil ||
 		!strings.Contains(err.Error(), "ambiguous") {
 		t.Errorf("ambiguous prefix must error, got %v", err)
+	}
+}
+
+func TestDismissCLI(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	var ids []int64
+	for _, trigger := range []string{"one", "two"} {
+		id, err := st.AppendAudit(ctx, domain.AuditRecord{
+			SituationType: domain.SituationApproval, Trigger: trigger,
+			Action: "escalated", Status: "escalated", CreatedAt: time.Now(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+
+	out, err := run(t, app, "dismiss", fmt.Sprintf("%d", ids[0]), fmt.Sprintf("%d", ids[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if !strings.Contains(out, fmt.Sprintf("dismissed escalation #%d", id)) {
+			t.Errorf("output missing #%d:\n%s", id, out)
+		}
+		if rec, _ := st.GetAudit(ctx, id); rec == nil || rec.Status != "dismissed" {
+			t.Errorf("audit #%d must be kept as dismissed, got %+v", id, rec)
+		}
+	}
+	if esc, _ := app.Escalations(ctx); len(esc) != 0 {
+		t.Errorf("queue should be empty, got %+v", esc)
+	}
+
+	if _, err := run(t, app, "dismiss"); err == nil {
+		t.Error("dismiss without ids must fail with usage")
+	}
+	if _, err := run(t, app, "dismiss", "not-a-number"); err == nil {
+		t.Error("dismiss with a non-numeric id must fail")
+	}
+	if _, err := run(t, app, "dismiss", fmt.Sprintf("%d", ids[0])); err == nil {
+		t.Error("dismissing an already-dismissed escalation must fail")
+	}
+}
+
+func TestEscalationsPruneCLI(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	oldID, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		SituationType: domain.SituationApproval, Trigger: "old",
+		Action: "escalated", Status: "escalated", CreatedAt: time.Now().Add(-7 * time.Hour),
+	})
+	freshID, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		SituationType: domain.SituationApproval, Trigger: "fresh",
+		Action: "escalated", Status: "escalated", CreatedAt: time.Now().Add(-2 * time.Hour),
+	})
+
+	// Default cutoff (360 minutes) prunes only the 7h-old escalation.
+	out, err := run(t, app, "escalations", "prune")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "pruned 1 escalation(s) older than 360 minute(s)") {
+		t.Errorf("unexpected prune output:\n%s", out)
+	}
+	if rec, _ := st.GetAudit(ctx, oldID); rec.Status != "dismissed" {
+		t.Errorf("old escalation must be dismissed, got %q", rec.Status)
+	}
+	if rec, _ := st.GetAudit(ctx, freshID); rec.Status != "escalated" {
+		t.Errorf("2h-old escalation must survive the default cutoff, got %q", rec.Status)
+	}
+
+	// An explicit age overrides the default.
+	out, err = run(t, app, "escalations", "prune", "60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "pruned 1 escalation(s) older than 60 minute(s)") {
+		t.Errorf("unexpected prune output:\n%s", out)
+	}
+	if rec, _ := st.GetAudit(ctx, freshID); rec.Status != "dismissed" {
+		t.Errorf("2h-old escalation must fall to the 60-minute cutoff, got %q", rec.Status)
+	}
+
+	for _, args := range [][]string{{"prune", "0"}, {"prune", "-5"}, {"prune", "abc"}, {"prune", "60", "extra"}, {"bogus"}} {
+		if _, err := run(t, app, "escalations", args...); err == nil {
+			t.Errorf("escalations %v must fail", args)
+		}
 	}
 }
 

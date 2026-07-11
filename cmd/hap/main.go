@@ -43,9 +43,12 @@ Operate:
   status                automation state, pending escalations, agents
   agents                list monitored agents (short name, id, type, status)
   rename <agent> <name> give an agent a short name (used by task sources)
-  escalations           list pending escalations
+  escalations [prune [minutes]]  list pending escalations; prune dismisses
+                        those older than N minutes (default 360)
   confirm <id> [--send]         confirm an escalation's suggested action
   resolve <id> --action TEXT [--send]   record the correct action (post-hoc correction)
+  dismiss <id>...       drop pending escalation(s) without responding
+                        (audit rows kept; nothing sent or learned)
   audit [--limit N]     show the audit log
   signatures [list|show <sig>|delete <sig> [--yes]]   learned signatures (alias: sigs)
                         list filters: --type T --mode M --agent-type A --min-conf C
