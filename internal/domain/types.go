@@ -184,7 +184,11 @@ type AuditRecord struct {
 	CorrectsAuditID int64
 	Status          string // "auto" | "escalated" | "resolved" | "dismissed"
 	Suggestion      string
-	CreatedAt       time.Time
+	// PaneExcerpt is the pane content THIS record was classified from
+	// (per-entry, unlike the signature's first-seen provenance snapshot);
+	// "" on legacy rows and paths with no pane read (herdr unreachable).
+	PaneExcerpt string
+	CreatedAt   time.Time
 }
 
 // CorrectionRecord is a front-end-written correction amending an audit entry.

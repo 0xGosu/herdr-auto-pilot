@@ -877,9 +877,15 @@ func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int) []
 	if r.CorrectsAuditID != 0 {
 		lines = detailField(lines, w, "Corrects audit", fmt.Sprintf("#%d", r.CorrectsAuditID))
 	}
-	// The captured pane content behind this record — the signature's
-	// FIRST-seen excerpt (rule provenance), not the pane at this exact
-	// moment; same semantics as the Rules detail.
+	// Current situation: the pane content THIS record was classified from
+	// (per entry). Below it, the matched rule's Original situation — the
+	// signature's FIRST-seen excerpt (rule provenance), which is shared by
+	// every record resolving to that rule; same semantics as the Rules
+	// detail. Legacy rows predate the per-entry column and show only the
+	// provenance block.
+	if r.PaneExcerpt != "" {
+		lines = detailField(lines, w, "Current situation", r.PaneExcerpt)
+	}
 	if r.Signature != "" {
 		if snapshot != "" {
 			lines = detailField(lines, w, "Original situation", snapshot)

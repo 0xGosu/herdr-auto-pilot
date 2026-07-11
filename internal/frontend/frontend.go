@@ -95,11 +95,11 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 	}
 	st.LatestKill = kill
 	st.Paused = domain.KillStateActive(kill)
-	esc, err := a.Store.PendingEscalations(ctx)
+	pending, err := a.Store.CountPendingEscalations(ctx)
 	if err != nil {
 		return st, err
 	}
-	st.PendingEscalations = len(esc)
+	st.PendingEscalations = int(pending)
 	if a.Herdr != nil {
 		if agents, err := a.Herdr.ListAgents(ctx); err == nil {
 			st.MonitoredAgents = agents
