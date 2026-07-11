@@ -97,3 +97,13 @@ max_content_width = 0      # cap on variable-length list columns; 0 = full termi
 # situation = "approval"                # approval | choice | error | idle
 # regex = ['(?i)shall I go ahead\?']
 # keywords = ["waiting for approval"]
+
+# ── Capture delay (repeatable; first matching rule wins) ────────────
+# Delay before reading the pane after a herdr agent event, so the agent
+# TUI has painted (avoids capturing shell scrollback at startup).
+# A matched rule's unset (or 0) field uses the built-in default — later
+# rules are not consulted; a true 0ms delay is not expressible (use 1).
+# [[capture_delay]]
+# agent_type = "claude"      # exact agent type, or "*" for any
+# start_ms = 1500            # first event after the agent starts (default 1000)
+# event_ms = 200             # subsequent events (default 200)

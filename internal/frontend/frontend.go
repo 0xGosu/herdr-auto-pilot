@@ -866,6 +866,20 @@ func (a *App) SignatureDetail(ctx context.Context, prefix string) (SignatureRow,
 	return row, history, nil
 }
 
+// SignatureSnapshot returns the pane excerpt a signature was first seen
+// with, or "" on a nil app, empty signature, miss, or error — detail views
+// degrade to their "not captured yet" fallback rather than failing.
+func (a *App) SignatureSnapshot(ctx context.Context, signature string) string {
+	if a == nil || signature == "" {
+		return ""
+	}
+	excerpt, err := a.Store.GetSignatureSnapshot(ctx, signature)
+	if err != nil {
+		return ""
+	}
+	return excerpt
+}
+
 // DeleteSignature resolves the prefix, deletes the signature with its
 // decision history and error-retry row, and nudges the daemon to drop any
 // in-memory state. Returns the resolved key and removed decision count.

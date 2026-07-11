@@ -895,3 +895,33 @@ func TestEscalationWithoutRuleShowsNoneYet(t *testing.T) {
 		t.Errorf("audit list should dash-mark rows without a rule:\n%s", list)
 	}
 }
+
+func TestEscalationDetailShowsOriginalSituation(t *testing.T) {
+	// The Escalations detail view surfaces the captured pane content
+	// (the signature's first-seen snapshot) so the operator has context.
+	m, _, _ := appModel(t)
+	m.tab = tabEscalations
+	m.cursor = 0
+	m = press(t, m, "v")
+	if m.detail == nil {
+		t.Fatal("v should open the escalation detail")
+	}
+	view := m.View()
+	for _, want := range []string{"Original situation", "kubectl apply"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("escalation detail missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestEscalationDetailSnapshotFallback(t *testing.T) {
+	// No snapshot stored yet: the detail shows the not-captured fallback
+	// instead of an empty block.
+	m := testModel(t)
+	m.height = 44
+	m.tab = tabEscalations
+	m = press(t, m, "v")
+	if !strings.Contains(m.View(), "not captured yet") {
+		t.Errorf("missing snapshot should render the fallback line:\n%s", m.View())
+	}
+}

@@ -960,3 +960,22 @@ func TestResolveDigitSeriesStaleFormFails(t *testing.T) {
 		t.Errorf("the correction itself must still be recorded: %+v", corr)
 	}
 }
+
+func TestSignatureSnapshotAccessor(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+
+	if err := st.SaveSignatureSnapshot(ctx, "approval:feed0000beef1111",
+		"Do you want to proceed?\n1. Yes\n2. No", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got := app.SignatureSnapshot(ctx, "approval:feed0000beef1111"); !strings.Contains(got, "proceed") {
+		t.Errorf("snapshot hit = %q, want the stored excerpt", got)
+	}
+	if got := app.SignatureSnapshot(ctx, "approval:unknown0000000000"); got != "" {
+		t.Errorf("snapshot miss should be empty, got %q", got)
+	}
+	if got := app.SignatureSnapshot(ctx, ""); got != "" {
+		t.Errorf("empty signature should be empty, got %q", got)
+	}
+}
