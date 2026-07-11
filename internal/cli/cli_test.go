@@ -88,6 +88,8 @@ func seedSignatures(t *testing.T, st *store.Store) {
 	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:aaaa1111bbbb2222",
 		Trigger: "apply?", SituationType: domain.SituationApproval,
 		Action: "escalated", Rationale: "shadow mode", Status: "escalated", CreatedAt: now})
+	st.SaveSignatureSnapshot(ctx, "approval:aaaa1111bbbb2222",
+		"Bash(terraform apply)\nDo you want to proceed?", now)
 }
 
 func TestSignaturesList(t *testing.T) {
@@ -139,10 +141,15 @@ func TestSignaturesShow(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"approval:aaaa1111bbbb2222", "streak: 3/5", "top action:  \"1\" over 2 decision(s)",
-		"recent decisions", "last audit", "shadow mode"} {
+		"original situation:", "terraform apply", "recent decisions", "last audit", "shadow mode"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("show output missing %q:\n%s", want, out)
 		}
+	}
+
+	out, err = run(t, app, "signatures", "show", "choice:")
+	if err != nil || !strings.Contains(out, "original situation: (not captured") {
+		t.Errorf("snapshot-less rule must show the fallback (%v):\n%s", err, out)
 	}
 
 	if _, err := run(t, app, "signatures", "show", "zzz"); err == nil {

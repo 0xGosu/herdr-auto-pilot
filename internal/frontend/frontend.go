@@ -644,22 +644,22 @@ func JoinCommand(argv []string) string {
 	return strings.Join(parts, " ")
 }
 
-// RemoveAllowlistPattern deletes an operator allowlist pattern by index (as
+// RemoveNeverAutoPattern deletes an operator never-auto pattern by index (as
 // listed by `rules list` / the TUI). expected is the pattern text the caller
 // believes is at that index: removal is refused on mismatch, so a listing
 // gone stale (another front-end edited in between) can never silently delete
 // the wrong never-auto pattern. Seed patterns cannot be removed here;
 // disabling the seed requires the explicit safety.disable_seed TOML edit.
-func (a *App) RemoveAllowlistPattern(ctx context.Context, index int, expected string) error {
+func (a *App) RemoveNeverAutoPattern(ctx context.Context, index int, expected string) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
-		if index < 0 || index >= len(cfg.Safety.AllowlistPatterns) {
-			return fmt.Errorf("no operator allowlist pattern #%d", index)
+		if index < 0 || index >= len(cfg.Safety.NeverAutoPatterns) {
+			return fmt.Errorf("no operator never-auto pattern #%d", index)
 		}
-		if got := cfg.Safety.AllowlistPatterns[index]; got != expected {
+		if got := cfg.Safety.NeverAutoPatterns[index]; got != expected {
 			return fmt.Errorf("pattern #%d changed since it was listed (now %q); re-list and retry", index, got)
 		}
-		cfg.Safety.AllowlistPatterns = append(
-			cfg.Safety.AllowlistPatterns[:index], cfg.Safety.AllowlistPatterns[index+1:]...)
+		cfg.Safety.NeverAutoPatterns = append(
+			cfg.Safety.NeverAutoPatterns[:index], cfg.Safety.NeverAutoPatterns[index+1:]...)
 		return nil
 	})
 }
@@ -703,13 +703,13 @@ func (a *App) SetThreshold(ctx context.Context, situation string, value float64)
 	})
 }
 
-// AddAllowlistPattern appends a never-auto pattern (FR-016) and reloads.
-func (a *App) AddAllowlistPattern(ctx context.Context, pattern string) error {
-	if _, errs := domain.NewAllowlist(false, []string{pattern}, nil); len(errs) > 0 {
+// AddNeverAutoPattern appends a never-auto pattern (FR-016) and reloads.
+func (a *App) AddNeverAutoPattern(ctx context.Context, pattern string) error {
+	if _, errs := domain.NewNeverAutoList(false, []string{pattern}, nil); len(errs) > 0 {
 		return fmt.Errorf("invalid pattern: %v", errs[0])
 	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
-		cfg.Safety.AllowlistPatterns = append(cfg.Safety.AllowlistPatterns, pattern)
+		cfg.Safety.NeverAutoPatterns = append(cfg.Safety.NeverAutoPatterns, pattern)
 		return nil
 	})
 }
@@ -739,6 +739,9 @@ type SignatureRow struct {
 	TopAction string
 	Decisions int
 	LastAudit *domain.AuditRecord
+	// PaneExcerpt is the pane snapshot the signature was first seen with
+	// (rule provenance); "" for rules learned before snapshots existed.
+	PaneExcerpt string
 }
 
 // RuleSummary renders a one-line description of the learned rule backing a
@@ -813,6 +816,11 @@ func (a *App) SignatureDetail(ctx context.Context, prefix string) (SignatureRow,
 		return row, nil, err
 	}
 	row.LastAudit = audit
+	excerpt, err := a.Store.GetSignatureSnapshot(ctx, sig)
+	if err != nil {
+		return row, nil, err
+	}
+	row.PaneExcerpt = excerpt
 	return row, history, nil
 }
 

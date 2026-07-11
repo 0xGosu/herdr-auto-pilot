@@ -2,7 +2,7 @@
 // mirrors every CLI capability (FR-022): monitored agents (with rename),
 // pending escalations (confirm/correct), the audit log (post-hoc
 // correction), learned signatures (Rules tab: inspect/filter/delete),
-// configuration (Config tab: fields, allowlist patterns, task sources,
+// configuration (Config tab: fields, never-auto patterns, task sources,
 // clear-data), and the pause/kill switch with history.
 package tui
 
@@ -29,7 +29,7 @@ const (
 	tabEscalations
 	tabAudit
 	tabSignatures // "Rules": learned signatures (list/inspect/delete)
-	tabConfig     // config fields, allowlist patterns, task sources
+	tabConfig     // config fields, never-auto patterns, task sources
 	tabKill
 	tabCount
 )
@@ -187,10 +187,10 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 			label: fmt.Sprintf("%-38s %s", key, frontend.FieldValue(cfg, key)),
 		})
 	}
-	for i, p := range cfg.Safety.AllowlistPatterns {
+	for i, p := range cfg.Safety.NeverAutoPatterns {
 		items = append(items, ruleItem{
 			kind: "pattern", index: i, value: p,
-			label: fmt.Sprintf("allowlist #%d  %s", i, p),
+			label: fmt.Sprintf("never-auto #%d  %s", i, p),
 		})
 	}
 	for i, src := range cfg.TaskSources {
@@ -836,6 +836,13 @@ func signatureDetailLines(row frontend.SignatureRow, history []domain.DecisionRe
 	if !row.UpdatedAt.IsZero() {
 		lines = detailField(lines, w, "Updated", row.UpdatedAt.Format(time.RFC3339))
 	}
+	// Rule provenance: what the pane showed when this signature was first
+	// seen — the situation the learned action answers.
+	if row.PaneExcerpt != "" {
+		lines = detailField(lines, w, "Original situation", row.PaneExcerpt)
+	} else {
+		lines = detailField(lines, w, "Original situation", "(not captured yet — recorded on the rule's next sighting)")
+	}
 	if len(history) > 0 {
 		var b strings.Builder
 		for _, d := range history {
@@ -898,13 +905,13 @@ func (m Model) addPatternPrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.message = ""
 	m.prompt = &prompt{
-		label: "add never-auto allowlist regex",
+		label: "add never-auto regex",
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
-				if err := app.AddAllowlistPattern(ctx, input); err != nil {
+				if err := app.AddNeverAutoPattern(ctx, input); err != nil {
 					return actionResultMsg{err: err}
 				}
-				return actionResultMsg{message: "allowlist pattern added"}
+				return actionResultMsg{message: "never-auto pattern added"}
 			}
 		},
 	}
@@ -949,8 +956,8 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 	switch item.kind {
 	case "pattern":
 		idx, expected := item.index, item.value
-		return m, m.do(fmt.Sprintf("allowlist pattern #%d removed", idx), func(c context.Context) error {
-			return app.RemoveAllowlistPattern(c, idx, expected)
+		return m, m.do(fmt.Sprintf("never-auto pattern #%d removed", idx), func(c context.Context) error {
+			return app.RemoveNeverAutoPattern(c, idx, expected)
 		})
 	case "source":
 		idx, expected := item.index, item.value
@@ -1230,7 +1237,7 @@ func (m Model) renderConfig(b *strings.Builder) {
 				fmt.Fprintln(b, sectionStyle.Render("Config"))
 			case "pattern":
 				fmt.Fprintf(b, "\n%s\n", sectionStyle.Render(fmt.Sprintf(
-					"Never-auto allowlist (operator patterns; +%d seed)", len(domain.SeedAllowlistPatterns))))
+					"Never-auto patterns (operator; +%d seed)", len(domain.SeedNeverAutoPatterns))))
 			case "source":
 				fmt.Fprintf(b, "\n%s\n", sectionStyle.Render("Task sources"))
 			}
@@ -1241,10 +1248,10 @@ func (m Model) renderConfig(b *strings.Builder) {
 		}
 		fmt.Fprintln(b, line)
 	}
-	if len(m.data.cfg.Safety.AllowlistPatterns) == 0 {
+	if len(m.data.cfg.Safety.NeverAutoPatterns) == 0 {
 		fmt.Fprintf(b, "\n%s\n", sectionStyle.Render(fmt.Sprintf(
-			"Never-auto allowlist: no operator patterns (+%d seed active) — press a to add",
-			len(domain.SeedAllowlistPatterns))))
+			"Never-auto patterns: none from operator (+%d seed active) — press a to add",
+			len(domain.SeedNeverAutoPatterns))))
 	}
 	if len(m.data.cfg.TaskSources) == 0 {
 		fmt.Fprintf(b, "%s\n", sectionStyle.Render("Task sources: none — press t to add"))

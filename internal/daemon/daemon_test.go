@@ -545,7 +545,7 @@ func TestKillSwitchHonoredWithoutNudge(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
 }
 
-func TestAllowlistBlocksDestructiveApproval(t *testing.T) {
+func TestNeverAutoBlocksDestructiveApproval(t *testing.T) {
 	// FR-015 safety invariant end to end: allowlist match escalates even
 	// for a fully trained autonomous signature.
 	pane := "Do you want to proceed?\nBash(git push --force origin main)\n❯ 1. Yes\n  2. No\n"
@@ -563,8 +563,8 @@ func TestAllowlistBlocksDestructiveApproval(t *testing.T) {
 		t.Fatal("allowlist-matched operation must never be auto-executed")
 	}
 	esc, _ := h.raw.PendingEscalations(context.Background())
-	if !contains(esc[0].Rationale, "allowlist") {
-		t.Errorf("escalation should cite the allowlist, got %q", esc[0].Rationale)
+	if !contains(esc[0].Rationale, "pattern:") {
+		t.Errorf("escalation should name the matched pattern, got %q", esc[0].Rationale)
 	}
 }
 
@@ -590,7 +590,7 @@ func TestNarrationInScrollbackDoesNotTripHeuristic(t *testing.T) {
 	}
 }
 
-func TestAllowlistScansFullSnapshotBeyondTailWindow(t *testing.T) {
+func TestNeverAutoScansFullSnapshotBeyondTailWindow(t *testing.T) {
 	// FR-015 invariant pin: only the heuristic is scoped to the tail window;
 	// the never-auto allowlist must keep scanning the entire snapshot.
 	var b strings.Builder
@@ -613,8 +613,8 @@ func TestAllowlistScansFullSnapshotBeyondTailWindow(t *testing.T) {
 		t.Fatal("allowlist-matched content anywhere in the snapshot must block auto-action")
 	}
 	esc, _ := h.raw.PendingEscalations(context.Background())
-	if !contains(esc[0].Rationale, "allowlist") {
-		t.Errorf("escalation should cite the allowlist, got %q", esc[0].Rationale)
+	if !contains(esc[0].Rationale, "pattern:") {
+		t.Errorf("escalation should name the matched pattern, got %q", esc[0].Rationale)
 	}
 }
 
@@ -1438,5 +1438,33 @@ func TestTailTrimsAtRuneBoundary(t *testing.T) {
 	}
 	if got := tail(strings.Repeat("界", 10), 7); !utf8.ValidString(got) {
 		t.Errorf("tail must never emit invalid UTF-8, got %q", got)
+	}
+}
+
+// Every classified situation records the pane snapshot its signature was
+// first seen with (rule provenance); later differing renders never
+// overwrite the original.
+func TestSignatureSnapshotRecordedOnFirstSighting(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	sig := h.seedAutonomous(approvalPane, domain.SituationApproval, "1")
+
+	h.push("agent-snap", "blocked")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+
+	ctx := context.Background()
+	snap, err := h.raw.GetSignatureSnapshot(ctx, sig)
+	if err != nil || !contains(snap, "Do you want to proceed?") {
+		t.Fatalf("snapshot should hold the classification pane, got %q err=%v", snap, err)
+	}
+
+	// A second transition with slightly different content (same signature —
+	// options unchanged) must keep the original snapshot.
+	h.herdr.setPane("EXTRA NARRATION\n" + approvalPane)
+	h.push("agent-snap", "blocked")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 2 })
+	snap2, _ := h.raw.GetSignatureSnapshot(ctx, sig)
+	if snap2 != snap {
+		t.Errorf("later sighting must not overwrite the original snapshot")
 	}
 }

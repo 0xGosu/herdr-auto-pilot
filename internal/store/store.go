@@ -173,6 +173,11 @@ CREATE TABLE IF NOT EXISTS signature_embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_sig_embed_scope
 	ON signature_embeddings(situation_type, agent_type);
+CREATE TABLE IF NOT EXISTS signature_snapshots (
+	signature TEXT PRIMARY KEY,
+	pane_excerpt TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
 `
 
 func (s *Store) migrate() error {
@@ -418,7 +423,7 @@ func (s *Store) ClearLearnedData(ctx context.Context) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		for _, table := range []string{"signatures", "decisions", "audit_log", "corrections",
 			"agent_rate", "error_retries", "llm_requests", "llm_decisions",
-			"signature_embeddings"} {
+			"signature_embeddings", "signature_snapshots"} {
 			if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 				return err
 			}
@@ -722,13 +727,48 @@ func (s *Store) DeleteSignature(ctx context.Context, signature string) (int64, e
 		if _, err = tx.ExecContext(ctx, `DELETE FROM error_retries WHERE error_signature = ?`, signature); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM signature_embeddings WHERE signature = ?`, signature)
+		if _, err = tx.ExecContext(ctx, `DELETE FROM signature_embeddings WHERE signature = ?`, signature); err != nil {
+			return err
+		}
+		// Snapshot goes too: a re-learned rule re-captures its situation.
+		_, err = tx.ExecContext(ctx, `DELETE FROM signature_snapshots WHERE signature = ?`, signature)
 		return err
 	})
 	if err != nil {
 		return 0, err
 	}
 	return decisions, nil
+}
+
+// SaveSignatureSnapshot records the pane excerpt a signature was first
+// minted from — rule provenance for the detail views. First sighting wins
+// (INSERT OR IGNORE): the ORIGINAL situation stays on display even as later
+// semantically-matched sightings reuse the signature.
+func (s *Store) SaveSignatureSnapshot(ctx context.Context, signature, excerpt string, at time.Time) error {
+	if signature == "" || excerpt == "" {
+		return nil
+	}
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO signature_snapshots (signature, pane_excerpt, created_at)
+			VALUES (?, ?, ?)`, signature, excerpt, unix(at))
+		return err
+	})
+}
+
+// GetSignatureSnapshot returns the stored pane excerpt for a signature, or
+// "" when none was captured (rules learned before snapshots existed).
+func (s *Store) GetSignatureSnapshot(ctx context.Context, signature string) (string, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT pane_excerpt FROM signature_snapshots WHERE signature = ?`, signature)
+	var excerpt string
+	if err := row.Scan(&excerpt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return excerpt, nil
 }
 
 // LatestAuditForSignature returns the newest audit row for a signature

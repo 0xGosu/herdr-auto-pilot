@@ -749,3 +749,71 @@ func TestMigrateAddsAgentTypeToLegacyAuditLog(t *testing.T) {
 		t.Fatalf("migrated column round trip: %+v %v", got, err)
 	}
 }
+
+func TestSignatureSnapshotFirstSightingWins(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	if err := st.SaveSignatureSnapshot(ctx, "approval:aaaa", "the ORIGINAL pane", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// Later sightings must not overwrite the original.
+	if err := st.SaveSignatureSnapshot(ctx, "approval:aaaa", "a later pane", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetSignatureSnapshot(ctx, "approval:aaaa")
+	if err != nil || got != "the ORIGINAL pane" {
+		t.Fatalf("snapshot = %q err=%v, want the original", got, err)
+	}
+
+	// Absent (legacy rule) reads back empty without error.
+	if got, err := st.GetSignatureSnapshot(ctx, "approval:none"); err != nil || got != "" {
+		t.Errorf("missing snapshot = %q err=%v, want empty", got, err)
+	}
+	// Empty writes are no-ops, not rows.
+	if err := st.SaveSignatureSnapshot(ctx, "approval:blank", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetSignatureSnapshot(ctx, "approval:blank"); got != "" {
+		t.Errorf("empty excerpt must not persist, got %q", got)
+	}
+}
+
+func TestSignatureSnapshotCascades(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "choice:bbbb", SituationType: domain.SituationChoice,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSignatureSnapshot(ctx, "choice:bbbb", "which backend?", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteSignature(ctx, "choice:bbbb"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetSignatureSnapshot(ctx, "choice:bbbb"); got != "" {
+		t.Errorf("DeleteSignature must cascade the snapshot, got %q", got)
+	}
+
+	if err := st.SaveSignatureSnapshot(ctx, "idle:cccc", "task done", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ClearLearnedData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetSignatureSnapshot(ctx, "idle:cccc"); got != "" {
+		t.Errorf("ClearLearnedData must clear snapshots, got %q", got)
+	}
+}

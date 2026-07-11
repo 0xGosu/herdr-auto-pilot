@@ -31,7 +31,7 @@ const sweepResetKeys = 10
 
 // sweepAllowed re-reads the gates that must veto pane interaction BEFORE
 // any sweep keystroke: kill switch (FR-017), rate pause (FR-019), and the
-// never-auto allowlist on the visible content (FR-015). Failing any gate —
+// never-auto patterns on the visible content (FR-015). Failing any gate —
 // including a failed read, which fails closed — skips the sweep; the
 // single-frame situation proceeds to decideAndAct, which escalates with the
 // proper reason.
@@ -167,7 +167,7 @@ func (d *Daemon) handleSweepOutcome(ctx context.Context, res sweepOutcome) {
 		sig := domain.ComputeSignature(res.situation)
 		d.escalate(ctx, res.situation, sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonHerdrUnreachable,
-			Rationale: "multi-tab form sweep failed (" + res.reason + "); only the focused question was captured — please answer in the pane",
+			Rationale: "sweep failed: " + res.reason + "; partial capture, answer in pane",
 		}, res.tr, now)
 		return
 	}
@@ -210,8 +210,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 
 	ks, ok := d.opt.Herdr.(ports.KeystrokeSender)
 	if !ok {
-		escalateWith(domain.ReasonHerdrUnreachable,
-			"herdr adapter cannot send keystrokes; multi-tab answer needs them")
+		escalateWith(domain.ReasonHerdrUnreachable, "keystrokes unavailable")
 		return
 	}
 	seq, ok := domain.ParseDigitSeries(dec.Input)
@@ -225,8 +224,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 		return
 	}
 	if !d.acquirePane(s.AgentID) {
-		escalateWith(domain.ReasonRateLimited,
-			"another pane interaction is in flight for this agent; not delivering concurrently")
+		escalateWith(domain.ReasonRateLimited, "pane busy")
 		return
 	}
 

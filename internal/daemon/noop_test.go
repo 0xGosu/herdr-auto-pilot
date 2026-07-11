@@ -181,14 +181,17 @@ func TestNoopFlapDoesNotResetRunawayCounter(t *testing.T) {
 	h.push("agent-flap", "blocked")
 	waitFor(t, 3*time.Second, func() bool { return auditCount() == 1 })
 
-	// The agent flaps back to working on its own, then blocks again.
+	// The agent flaps back to working on its own, then blocks again. Wait
+	// on the rate row (the LAST persistence step of deliverNoop), not the
+	// audit (written first) — reading between the two races the tail.
 	h.push("agent-flap", "working")
 	h.push("agent-flap", "blocked")
-	waitFor(t, 3*time.Second, func() bool { return auditCount() == 2 })
-
-	rate, err := h.raw.GetAgentRate(ctx, "agent-flap")
-	if err != nil || rate.ConsecutiveAuto != 2 {
-		t.Errorf("flap after noop must not reset the counter, rate=%+v err=%v", rate, err)
+	waitFor(t, 3*time.Second, func() bool {
+		rate, err := h.raw.GetAgentRate(ctx, "agent-flap")
+		return err == nil && rate.ConsecutiveAuto == 2
+	})
+	if n := auditCount(); n != 2 {
+		t.Errorf("expected 2 noop audits, got %d", n)
 	}
 }
 

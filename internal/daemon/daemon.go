@@ -63,7 +63,7 @@ type Daemon struct {
 
 	mu         sync.RWMutex
 	cfg        config.Config
-	allowlist  *domain.Allowlist
+	neverAuto  *domain.NeverAutoList
 	classifier *classify.Classifier
 	llm        ports.LLMPort
 	embedder   ports.EmbedderPort
@@ -105,6 +105,11 @@ type Daemon struct {
 	// sweepInFlight dedupes the one live multi-tab form sweep per agent
 	// (guarded by mu); outcomes return through sweepResults.
 	sweepInFlight map[string]bool
+
+	// snapshotSaved caches which signatures already have a provenance
+	// snapshot this daemon lifetime (guarded by mu), so the hot path skips
+	// the no-op INSERT OR IGNORE write transaction on repeat sightings.
+	snapshotSaved map[string]bool
 
 	// wsNames caches the workspace id→name listing for task-source
 	// workspace matching; refreshed after workspaceCacheTTL.
@@ -176,6 +181,7 @@ func New(opt Options) (*Daemon, error) {
 		lastAutoNoop:    map[string]time.Time{},
 		rewriteInFlight: map[string]rewriteFlight{},
 		sweepInFlight:   map[string]bool{},
+		snapshotSaved:   map[string]bool{},
 		embedder:        opt.Embedder,
 	}
 	if opt.MatchIndexDir != "" {
@@ -188,17 +194,24 @@ func New(opt Options) (*Daemon, error) {
 }
 
 // reload re-reads TOML config and rebuilds derived state (classifier,
-// allowlist). Malformed config keeps the previous good state.
+// never-auto list). Malformed config keeps the previous good state.
 func (d *Daemon) reload() error {
 	cfg, err := config.Load(d.opt.ConfigPath)
 	if err != nil {
 		slog.Error("config reload failed; keeping previous config", "error", err)
 		return err
 	}
-	allow, errs := domain.NewAllowlist(!cfg.Safety.DisableSeed,
-		cfg.Safety.AllowlistPatterns, indicatorRules(cfg.Safety))
+	// A reload also follows signature deletion: drop the snapshot cache so
+	// a re-learned rule re-captures its situation.
+	d.mu.Lock()
+	if d.snapshotSaved != nil {
+		d.snapshotSaved = map[string]bool{}
+	}
+	d.mu.Unlock()
+	allow, errs := domain.NewNeverAutoList(!cfg.Safety.DisableSeed,
+		cfg.Safety.NeverAutoPatterns, indicatorRules(cfg.Safety))
 	for _, e := range errs {
-		slog.Warn("allowlist pattern rejected", "error", e)
+		slog.Warn("never-auto pattern rejected", "error", e)
 	}
 	cls := classify.New(cfg.Classifier)
 
@@ -211,7 +224,7 @@ func (d *Daemon) reload() error {
 	prev, first := d.cfg, !d.configured
 	d.configured = true
 	d.cfg = cfg
-	d.allowlist = allow
+	d.neverAuto = allow
 	d.classifier = cls
 	d.llm = llmPort
 	d.mu.Unlock()
@@ -239,10 +252,10 @@ func (d *Daemon) llmPort() ports.LLMPort {
 	return d.llm
 }
 
-func (d *Daemon) snapshot() (config.Config, *domain.Allowlist, *classify.Classifier) {
+func (d *Daemon) snapshot() (config.Config, *domain.NeverAutoList, *classify.Classifier) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.cfg, d.allowlist, d.classifier
+	return d.cfg, d.neverAuto, d.classifier
 }
 
 // Run drives the daemon until ctx is done. It never panics: every handler
@@ -391,8 +404,11 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		d.audit(ctx, domain.AuditRecord{
 			AgentID: tr.AgentID, AgentType: tr.AgentType, Trigger: trigger(tr),
 			SituationType: domain.SituationUnclassifiable,
-			Action:        "escalated", Rationale: string(domain.ReasonHerdrUnreachable),
-			Status: "escalated", CreatedAt: now,
+			Action:        "escalated",
+			// Bracketed like every escalate()-built rationale, so the one
+			// path that bypasses escalate() renders identically.
+			Rationale: "[" + string(domain.ReasonHerdrUnreachable) + "]",
+			Status:    "escalated", CreatedAt: now,
 		})
 		return
 	}
@@ -415,7 +431,7 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	// LLM consult all describe the WHOLE form, not question 1 of N. The
 	// sweep is pane interaction and runs off the main loop; its outcome
 	// re-enters decideAndAct. It is gated like any automation — kill
-	// switch, rate pause, allowlist — BEFORE the first keystroke, and
+	// switch, rate pause, never-auto patterns — BEFORE the first keystroke, and
 	// degrades to single-frame when the adapter cannot send keystrokes.
 	if situation.Type == domain.SituationChoice && situation.TabCount > 1 {
 		if ks, ok := d.opt.Herdr.(ports.KeystrokeSender); ok && d.sweepAllowed(ctx, situation) {
@@ -426,6 +442,10 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 
 	d.decideAndAct(ctx, situation, tr, agentName, now)
 }
+
+// snapshotMaxRunes caps the stored rule-provenance pane snapshot; big
+// enough for a full classification read or a multi-tab aggregate head.
+const snapshotMaxRunes = 4000
 
 // decideAndAct is the decision tail shared by handleTransition and the
 // multi-tab sweep outcome: signature, state reads, safety inputs, the pure
@@ -440,6 +460,24 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	// signature (embedding / BM25 match on the masked salient content);
 	// sig.Raw always keeps the literal content hash.
 	sig = d.resolveSignature(ctx, cfg, sig, situation)
+
+	// Rule provenance: keep the pane snapshot the signature was FIRST seen
+	// with (insert-or-ignore; an in-memory cache skips the no-op write on
+	// repeat sightings), so the Rules views can show what situation a
+	// learned action answers. Best-effort — never blocks the decision.
+	d.mu.Lock()
+	saved := d.snapshotSaved[sig.Signature]
+	d.mu.Unlock()
+	if sig.Signature != "" && !saved {
+		if err := d.opt.Store.SaveSignatureSnapshot(ctx, sig.Signature,
+			truncateRunes(situation.Content, snapshotMaxRunes), now); err != nil {
+			slog.Warn("signature snapshot write failed", "error", err)
+		} else {
+			d.mu.Lock()
+			d.snapshotSaved[sig.Signature] = true
+			d.mu.Unlock()
+		}
+	}
 
 	// Assemble decision inputs (all reads).
 	state, history, rate, retries, killActive, readErr := d.readDecisionState(ctx, sig, situation)
@@ -487,8 +525,8 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		MaxRetries:            cfg.Limits.MaxErrorRetries,
 		DeclaredTask:          declared,
 		LLMConfigured:         d.llmPort() != nil && d.llmPort().Configured(),
-		AllowlistHit:          allowPattern,
-		AllowlistMatched:      allowMatched,
+		NeverAutoHit:          allowPattern,
+		NeverAutoMatched:      allowMatched,
 		SuspectedIrreversible: suspected,
 		IrreversibleHit:       irrevHit,
 	}
@@ -582,14 +620,14 @@ func (d *Daemon) readDecisionState(ctx context.Context, sig domain.SignatureResu
 func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
 
-	// The never-auto allowlist also screens the OUTBOUND text: a next-task
+	// The never-auto patterns also screen the OUTBOUND text: a next-task
 	// line from a task file (or any learned action) naming an irreversible
 	// operation must never be delivered automatically (FR-015).
 	_, allow, _ := d.snapshot()
 	if pattern, matched := allow.Match(dec.Input); matched {
 		d.escalate(ctx, s, sig, domain.Decision{
-			Action: domain.ActionEscalate, Reason: domain.ReasonAllowlistMatch,
-			Rationale:  "outbound input matches never-auto pattern: " + pattern,
+			Action: domain.ActionEscalate, Reason: domain.ReasonNeverAutoMatch,
+			Rationale:  "outbound pattern: " + pattern,
 			Confidence: dec.Confidence,
 		}, tr, now)
 		return
@@ -771,10 +809,16 @@ func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain
 func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
 
+	// Tag-only when the reason self-explains: the escalation line's budget
+	// belongs to the suggestion, not to prose repeating the tag.
+	rationale := "[" + string(dec.Reason) + "]"
+	if dec.Rationale != "" {
+		rationale += " " + dec.Rationale
+	}
 	rec := domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "escalated", Confidence: dec.Confidence,
-		Rationale: fmt.Sprintf("[%s] %s", dec.Reason, dec.Rationale),
+		Rationale: rationale,
 		Status:    "escalated", Suggestion: dec.Suggestion, CreatedAt: now,
 	}
 	if _, err := d.opt.Store.AppendAudit(ctx, rec); err != nil {
@@ -1050,29 +1094,29 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	// changed since Decide ran (kill switch, rate, the pane itself).
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
-		escalateWith(domain.ReasonKilled, "kill switch active at rewrite delivery time")
+		escalateWith(domain.ReasonKilled, "at rewrite")
 		return
 	}
 	if pattern, matched := allow.Match(final); matched {
-		escalateWith(domain.ReasonAllowlistMatch, "rewritten outbound matches never-auto pattern: "+pattern)
+		escalateWith(domain.ReasonNeverAutoMatch, "rewrite pattern: "+pattern)
 		return
 	}
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType, final); sus {
 		escalateWith(domain.ReasonSuspectedIrrevers,
-			fmt.Sprintf("rewritten outbound tripped irreversible indicator %s (%.60q)", hit.Pattern, hit.Excerpt))
+			fmt.Sprintf("rewrite: indicator %s matched %.60q", hit.Pattern, hit.Excerpt))
 		return
 	}
 	rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
 	if err != nil {
 		// Fail closed: an unreadable rate row must not skip the guard.
-		escalateWith(domain.ReasonPersistenceFailed, "agent rate read failed at rewrite delivery time: "+err.Error())
+		escalateWith(domain.ReasonPersistenceFailed, "rate read failed at rewrite: "+err.Error())
 		return
 	}
 	if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
 	}); !ok {
-		escalateWith(reason, "runaway-loop guard at rewrite delivery time")
+		escalateWith(reason, "at rewrite")
 		return
 	}
 
@@ -1084,7 +1128,7 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	// original consuming "recent" read, so idle matches on type alone.
 	pane, err := d.readVisible(ctx, s.PaneID, d.opt.PaneReadLines)
 	if err != nil {
-		escalateWith(domain.ReasonHerdrUnreachable, "pane re-read failed before rewrite delivery: "+err.Error())
+		escalateWith(domain.ReasonHerdrUnreachable, "pane re-read failed: "+err.Error())
 		return
 	}
 	current := cls.Classify(s.AgentType, res.tr.Status, pane)
@@ -1108,14 +1152,14 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	// re-screened the way handleTransition screened the original: Decide's
 	// veto ran against content that may no longer be what's on screen.
 	if pattern, matched := allow.Match(current.Content); matched {
-		escalateWith(domain.ReasonAllowlistMatch,
-			"pane content matches never-auto pattern at rewrite delivery: "+pattern)
+		escalateWith(domain.ReasonNeverAutoMatch,
+			"pattern: "+pattern+" (at rewrite)")
 		return
 	}
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType,
 		domain.IrreversibleScanContent(current, "")); sus {
 		escalateWith(domain.ReasonSuspectedIrrevers,
-			fmt.Sprintf("pane tripped irreversible indicator at rewrite delivery: %s (%.60q)", hit.Pattern, hit.Excerpt))
+			fmt.Sprintf("indicator %s matched %.60q (at rewrite)", hit.Pattern, hit.Excerpt))
 		return
 	}
 
@@ -1153,7 +1197,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		}
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: reason,
-			Rationale: fmt.Sprintf("LLM fallback failed: %v", res.err),
+			Rationale: fmt.Sprintf("%v", res.err),
 		}, tr, now)
 		return
 	}
@@ -1180,24 +1224,24 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		}, tr, now)
 	}
 
-	// Re-gate: kill switch, allowlist, heuristic, rate — the LLM can never
+	// Re-gate: kill switch, never-auto patterns, heuristic, rate — the LLM can never
 	// bypass safety controls.
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
-		reject(domain.ReasonKilled, "kill switch active at LLM promotion time")
+		reject(domain.ReasonKilled, "at LLM promotion")
 		return
 	}
 	if pattern, matched := allow.Match(s.Content); matched {
-		reject(domain.ReasonAllowlistMatch, "never-auto allowlist matched: "+pattern)
+		reject(domain.ReasonNeverAutoMatch, "pattern: "+pattern)
 		return
 	}
-	// The LLM authors the outbound text, so the allowlist screens the
+	// The LLM authors the outbound text, so the never-auto patterns screen the
 	// submitted action too — the LLM can never smuggle an irreversible
-	// operation past the allowlist (FR-015). A noop has no outbound text to
+	// operation past the never-auto screen (FR-015). A noop has no outbound text to
 	// screen.
 	if !isNoop {
 		if pattern, matched := allow.Match(llmDec.Action); matched {
-			reject(domain.ReasonAllowlistMatch, "LLM action matches never-auto pattern: "+pattern)
+			reject(domain.ReasonNeverAutoMatch, "LLM action pattern: "+pattern)
 			return
 		}
 	}
@@ -1210,13 +1254,13 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	scan := domain.IrreversibleScanContent(s, declaredPrompt)
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType, scan); sus {
 		reject(domain.ReasonSuspectedIrrevers,
-			fmt.Sprintf("suspected-irreversible content: indicator %s matched %q", hit.Pattern, hit.Excerpt))
+			fmt.Sprintf("indicator %s matched %q", hit.Pattern, hit.Excerpt))
 		return
 	}
 	if !isNoop {
 		if hit, sus := allow.SuspectedIrreversible(s.AgentType, llmDec.Action); sus {
 			reject(domain.ReasonSuspectedIrrevers,
-				fmt.Sprintf("suspected-irreversible LLM action: indicator %s matched %q", hit.Pattern, hit.Excerpt))
+				fmt.Sprintf("LLM action: indicator %s matched %q", hit.Pattern, hit.Excerpt))
 			return
 		}
 	}
@@ -1229,7 +1273,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
 	}); !ok {
-		reject(reason, "runaway-loop guard at LLM promotion time")
+		reject(reason, "at LLM promotion")
 		return
 	}
 	// Choice sanity. Multi-tab forms expect a digit series (one digit per
@@ -1254,14 +1298,14 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			}
 		}
 		if !found {
-			reject(domain.ReasonUnfamiliarOptions, "LLM chose an option not in the offered set")
+			reject(domain.ReasonUnfamiliarOptions, "LLM option not offered")
 			return
 		}
 	}
 	// Learned-history gate: the LLM must not contradict established
 	// operator behavior, and auto-acting requires explicit opt-in.
 	if !cfg.LLM.AutoAct {
-		reject(domain.ReasonShadowMode, "llm.auto_act disabled: surfacing LLM suggestion for confirmation")
+		reject(domain.ReasonShadowMode, "")
 		return
 	}
 	history, err := d.opt.Store.DecisionsForSignature(ctx, res.sig.Signature, 50)
@@ -1270,7 +1314,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		return
 	}
 	if conf := domain.Confidence(history); conf.TopAction != "" && conf.TopAction != llmDec.Action {
-		reject(domain.ReasonVarianceGuard, "LLM suggestion contradicts learned history")
+		reject(domain.ReasonVarianceGuard, "LLM contradicts history")
 		return
 	}
 
@@ -1326,7 +1370,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	_, _, cls := d.snapshot()
 	pane, err := d.readVisible(ctx, s.PaneID, d.opt.PaneReadLines)
 	if err != nil {
-		reject(domain.ReasonHerdrUnreachable, "pane re-read failed before LLM promotion: "+err.Error())
+		reject(domain.ReasonHerdrUnreachable, "pane re-read failed: "+err.Error())
 		return
 	}
 	current := cls.Classify(s.AgentType, s.Status, pane)
@@ -1340,7 +1384,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		// series, so the first question is compared verbatim too.
 		if tabs, ok := domain.MultiTabForm(pane); !ok || tabs != s.TabCount ||
 			domain.ExtractMCQForm(pane) != domain.FirstMCQQuestion(s.Content) {
-			reject(domain.ReasonLLMNoSubmit, "multi-tab form changed while consulting the LLM; suggestion is stale")
+			reject(domain.ReasonLLMNoSubmit, "stale: form changed during consult")
 			return
 		}
 	} else if freshSig := domain.ComputeSignature(current); freshSig.Raw != res.sig.Raw {
@@ -1348,7 +1392,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		// semantically remapped onto another key, but Raw always reflects
 		// the pane content as read, so equal Raw means the pane did not
 		// move on.
-		reject(domain.ReasonLLMNoSubmit, "situation changed while consulting the LLM; suggestion is stale")
+		reject(domain.ReasonLLMNoSubmit, "stale: situation changed during consult")
 		return
 	}
 

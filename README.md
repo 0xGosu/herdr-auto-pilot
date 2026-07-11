@@ -15,7 +15,7 @@ correctable.
   confirmed decisions.
 - **Confidence-gated** — below the per-situation threshold it escalates, never
   guesses.
-- **Safety first** — a never-auto allowlist (force-push, destructive ops,
+- **Safety first** — never-auto patterns (force-push, destructive ops,
   deploys, credential changes, …), a global pause/kill switch, a runaway-loop
   guard, and an error-retry ceiling all veto automation.
 - **Fully local** — learning data, history, and the audit log live in SQLite
@@ -123,8 +123,12 @@ The plugin never acts on a situation it hasn't learned from you.
 Every learned signature is visible on the TUI's *Rules* tab and via the
 `signatures` CLI (alias `sigs`): mode, confirmation streak toward
 graduation, confidence, and the action it learned. Press `enter`/`v` for
-the full record (recent decisions, last audit context), `f` to filter by
-mode, and `x` to delete a signature you no longer trust — deletion erases
+the full record — including the **original situation**, the pane snapshot
+first captured for the rule, so you can see exactly what a rule answers,
+not just the action it sends (rules learned before this feature pick it
+up on their next sighting) — plus recent decisions and last audit
+context. `f`
+filters by mode, and `x` deletes a signature you no longer trust — deletion erases
 its decision history too (audit rows are kept), so it re-learns from
 scratch. Signatures are addressed by unique prefix, git-style:
 
@@ -213,7 +217,7 @@ bin/hap task-source --agent backend-dev --template 'Do this next: {next_task_con
 
 (Or in the TUI: select the agent and press `n`.)
 
-### Never-auto allowlist
+### Never-auto patterns
 
 Irreversible operations are **never** automated, regardless of confidence.
 The shipped seed covers force-pushes, destructive filesystem/database ops,
@@ -224,8 +228,12 @@ regex patterns:
 
 ```toml
 [safety]
-allowlist_patterns = ['(?i)restart\s+the\s+payment\s+service']
+never_auto_patterns = ['(?i)restart\s+the\s+payment\s+service']
 ```
+
+(The pre-rename key `allowlist_patterns` still loads as a deprecated alias —
+patterns are merged with a warning, and the next config save rewrites the
+file under the new key.)
 
 or `hap rules add '<regex>'` / `rules remove <index>`, or press `a`/`x` on
 the TUI's *Config* tab — which also edits every config field inline
@@ -280,7 +288,7 @@ snapshot), the agent's herdr location (`workspace_id`, `tab_id`,
 `" (deleted)"` suffix and either may be empty). The location ids let the
 model run its own read-only `herdr` queries (`herdr pane read <pane_id>`,
 `herdr pane get <pane_id>`, ...) — to allow that with Claude Code, extend
-the allowlist, e.g.:
+the tool allowlist, e.g.:
 
 ```toml
 "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision,Bash(herdr pane read:*),Bash(herdr pane get:*)",
@@ -337,7 +345,7 @@ Placeholders: `{self}` (this plugin binary), `{request_id}`, `{db}`,
 `{control}`. Common misconfigurations of known CLIs are auto-repaired at
 launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing
 `exec` inserted) — an unrecognized shape is left untouched. Every LLM
-suggestion is re-gated through the same allowlist, kill switch, and rate
+suggestion is re-gated through the same never-auto patterns, kill switch, and rate
 guards; with `auto_act = true` it may act only when it doesn't contradict
 your learned history. On timeout or no submission the situation escalates.
 
@@ -391,7 +399,7 @@ Invariants:
   `rewrite_fallback_template` (`{original_text}` placeholder; empty or
   placeholder-less templates fall back to the built-in default).
 - **Safety controls still apply to the rewritten text**: output matching
-  the never-auto allowlist or the irreversible-operation heuristic is
+  the never-auto patterns or the irreversible-operation heuristic is
   discarded in favor of the wrapped original; if even that trips, the
   situation escalates instead of sending. Kill switch, rate guard, and a
   staleness re-check (the pane must still show the same situation) run

@@ -137,6 +137,9 @@ type DaemonStore interface {
 	// UpsertSignatureEmbedding stores the semantic identity (salient text +
 	// vector) a signature was minted from.
 	UpsertSignatureEmbedding(ctx context.Context, e domain.SignatureEmbedding) error
+	// SaveSignatureSnapshot records the pane excerpt a signature was first
+	// seen with (rule provenance; first sighting wins, later calls no-op).
+	SaveSignatureSnapshot(ctx context.Context, signature, excerpt string, at time.Time) error
 }
 
 // FrontendStore is the front-end (TUI/CLI) write surface plus shared reads.
@@ -207,6 +210,9 @@ type ReadStore interface {
 	ListSignatureEmbeddings(ctx context.Context) ([]domain.SignatureEmbedding, error)
 	// CountSignatureEmbeddings reports how many semantic identity rows exist.
 	CountSignatureEmbeddings(ctx context.Context) (int64, error)
+	// GetSignatureSnapshot returns the pane excerpt a signature was first
+	// seen with, or "" when none was captured (pre-snapshot rules).
+	GetSignatureSnapshot(ctx context.Context, signature string) (string, error)
 }
 
 // Clock abstracts time for deterministic tests.

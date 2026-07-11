@@ -83,11 +83,11 @@ type DecideInput struct {
 	MaxRetries    int
 	DeclaredTask  *DeclaredTask // resolved declared source (nil = no source matched)
 	LLMConfigured bool
-	// AllowlistHit and SuspectedIrreversible are precomputed by the caller
-	// from the compiled Allowlist so the core stays free of regex state.
+	// NeverAutoHit and SuspectedIrreversible are precomputed by the caller
+	// from the compiled NeverAutoList so the core stays free of regex state.
 	// IrreversibleHit carries the matching indicator for the rationale.
-	AllowlistHit          string
-	AllowlistMatched      bool
+	NeverAutoHit          string
+	NeverAutoMatched      bool
 	SuspectedIrreversible bool
 	IrreversibleHit       IndicatorHit
 }
@@ -108,40 +108,41 @@ func Decide(in DecideInput) Decision {
 	}
 
 	// Safety controls veto first (Constitution: safety over throughput).
+	// Rationales are tag-only where the reason token self-explains — the
+	// escalation line's budget belongs to the suggestion, not to prose
+	// repeating the tag or the operator's own config.
 	if in.KillActive {
-		return esc(ReasonKilled, "global pause/kill switch active", 0, "")
+		return esc(ReasonKilled, "", 0, "")
 	}
 	if in.Situation.Type == SituationUnclassifiable {
-		return esc(ReasonUnclassifiable, "situation could not be classified", 0, "")
+		return esc(ReasonUnclassifiable, "", 0, "")
 	}
 	if in.Signature.Verdict == GuardOverMasked {
-		return esc(ReasonOverMasked, "prompt reduced almost entirely to placeholders", 0, "")
+		return esc(ReasonOverMasked, "", 0, "")
 	}
-	if in.AllowlistMatched {
-		return esc(ReasonAllowlistMatch,
-			fmt.Sprintf("never-auto allowlist pattern matched: %s", in.AllowlistHit), 0, "")
+	if in.NeverAutoMatched {
+		return esc(ReasonNeverAutoMatch,
+			fmt.Sprintf("pattern: %s", in.NeverAutoHit), 0, "")
 	}
 
 	conf := Confidence(in.History)
 
 	if VarianceGuardTripped(in.History) {
-		return esc(ReasonVarianceGuard,
-			"contradictory decision history for this signature; disambiguation needed",
-			conf.Score, "")
+		return esc(ReasonVarianceGuard, "contradictory history", conf.Score, "")
 	}
 
 	if ok, reason := CheckRate(in.Rate, in.Now, in.RateLimits); !ok {
-		return esc(reason, "runaway-loop guard: automated prompting ceiling reached", conf.Score, "")
+		return esc(reason, "", conf.Score, "")
 	}
 
 	// The suspected-irreversible heuristic biases to escalation before any
 	// autonomous action (FR-016).
 	if in.SuspectedIrreversible {
-		rationale := "destructive-operation indicators present without an allowlist match"
+		rationale := ""
 		if in.IrreversibleHit.Pattern != "" {
 			// %s for the pattern: %q would double-escape its backslashes.
-			rationale = fmt.Sprintf("%s: indicator %s matched %q",
-				rationale, in.IrreversibleHit.Pattern, in.IrreversibleHit.Excerpt)
+			rationale = fmt.Sprintf("indicator %s matched %q",
+				in.IrreversibleHit.Pattern, in.IrreversibleHit.Excerpt)
 		}
 		suggestion := conf.TopAction
 		if suggestion == ActionNoop {
@@ -165,7 +166,7 @@ func Decide(in DecideInput) Decision {
 		if in.LLMConfigured &&
 			(resolveEsc == ReasonNoHistory || resolveEsc == ReasonUnfamiliarOptions) {
 			return Decision{Action: ActionConsult, Confidence: conf.Score,
-				Rationale: fmt.Sprintf("%s; consulting configured LLM for a suggestion", rationaleFor(resolveEsc))}
+				Rationale: string(resolveEsc) + "; consulting LLM"}
 		}
 		return esc(resolveEsc, rationaleFor(resolveEsc), conf.Score, suggestion)
 	}
@@ -176,7 +177,7 @@ func Decide(in DecideInput) Decision {
 	if in.Situation.Type == SituationError && in.RetryCount >= in.MaxRetries &&
 		candidate != ActionNoop {
 		return esc(ReasonRetryExhausted,
-			fmt.Sprintf("error signature reached the %d automated-retry ceiling", in.MaxRetries),
+			fmt.Sprintf("retry ceiling %d", in.MaxRetries),
 			conf.Score, suggestion)
 	}
 
@@ -189,9 +190,7 @@ func Decide(in DecideInput) Decision {
 			return Decision{Action: ActionConsult, Confidence: conf.Score,
 				Rationale: "no learned history; consulting configured LLM for a suggestion"}
 		}
-		return esc(ReasonShadowMode,
-			"signature in shadow mode: suggesting for operator confirmation",
-			conf.Score, suggestion)
+		return esc(ReasonShadowMode, "", conf.Score, suggestion)
 	}
 
 	// Confidence gate (FR-008).
@@ -201,7 +200,7 @@ func Decide(in DecideInput) Decision {
 				Rationale: fmt.Sprintf("confidence %.2f at/below threshold %.2f; consulting LLM", conf.Score, threshold)}
 		}
 		return esc(ReasonBelowThreshold,
-			fmt.Sprintf("confidence %.2f at/below threshold %.2f", conf.Score, threshold),
+			fmt.Sprintf("%.2f ≤ %.2f", conf.Score, threshold),
 			conf.Score, suggestion)
 	}
 
@@ -222,7 +221,7 @@ func Decide(in DecideInput) Decision {
 	// else would not be traceable to the operator's observed decisions.
 	input, optionID, ok := materialize(in, candidate)
 	if !ok {
-		return esc(ReasonNoTaskSource, "learned action cannot be materialized for this situation",
+		return esc(ReasonNoTaskSource, "action not materializable",
 			conf.Score, suggestion)
 	}
 	return Decision{
@@ -347,18 +346,14 @@ func optionInSet(option string, options []string) bool {
 	return false
 }
 
-// rationaleFor maps resolver escalation reasons to human rationale.
+// rationaleFor maps resolver escalation reasons to rationale text. Empty
+// means the reason tag alone tells the story; only actionable specifics
+// earn words.
 func rationaleFor(r EscalateReason) string {
 	switch r {
-	case ReasonNoTaskSource:
-		return "no declared task source and no native todo signal in pane history (inference runs only for supported agent types)"
-	case ReasonNoHistory:
-		return "no learned history for this signature"
 	case ReasonUnfamiliarOptions:
-		return "learned option not present in the offered option set"
-	case ReasonBelowThreshold:
-		return "confidence below the applicable bar"
+		return "learned option not offered"
 	default:
-		return string(r)
+		return "" // tag-only: [reason] says it all
 	}
 }

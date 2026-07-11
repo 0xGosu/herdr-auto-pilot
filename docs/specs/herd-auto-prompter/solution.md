@@ -16,7 +16,7 @@ This solution realizes the requirements within the constitution's constraints: G
 | Herdr events | **Raw socket** `events.subscribe` (JSON) | Long-lived agent-status subscription (constitution). |
 | Herdr actions | **CLI via `HERDR_BIN_PATH`** (`agent send`, `pane read`, `agent list`, `wait agent-status`, `notification show`) | Portable across Unix socket / Windows pipe (constitution). |
 | History / audit | **Embedded SQLite (WAL)** | Transactional; corruption-safe concurrent access; queryable audit. |
-| Operator config / rules | **TOML** in the plugin config dir | Hand-editable thresholds, allowlist patterns, classifier manifests, task sources. |
+| Operator config / rules | **TOML** in the plugin config dir | Hand-editable thresholds, never-auto patterns, classifier manifests, task sources. |
 | Daemon coordination | **Unix-domain control socket** (named pipe on Windows) — reload/wake nudge | Sub-second propagation (NFR-009), no idle polling (NFR-003). |
 | LLM fallback | **Local LLM/agent CLI** launched with an attached **stdio MCP server** (`mcp` subcommand) | Agent-native; the model submits its decision via MCP tools rather than parsed stdout. |
 | Classification | **TOML regex/keyword manifests per agent type** | Deterministic, golden-testable; mirrors Herdr's own screen manifests. |
@@ -30,7 +30,7 @@ This solution realizes the requirements within the constitution's constraints: G
 - **Instant kill switch with full history** — pause/kill is an **append-only event table** (one row per toggle, with author, scope, and timestamp); the daemon reads the **latest row every pipeline tick** to determine current state, so a kill takes effect even before the reload nudge is processed, and every pause/resume/kill is preserved for audit.
 - **Deterministic classification** — TOML manifests classify pane content; unknown shapes yield `unclassifiable` → escalate (fail-safe).
 - **Pure decision core** — layered `cmd → domain (pure) → adapters`; the domain imports nothing from Herdr, SQLite, or the LLM. Side effects live behind ports (HerdrPort, StorePort, LLMPort, NotifyPort).
-- **MCP-mediated LLM** — a per-invocation stdio MCP server exposes `get_context` and `submit_decision`; the submitted decision re-enters the same confidence gate + never-auto allowlist before any action; no submit / timeout → escalate, with captured stdout retained for audit only.
+- **MCP-mediated LLM** — a per-invocation stdio MCP server exposes `get_context` and `submit_decision`; the submitted decision re-enters the same confidence gate + never-auto patterns before any action; no submit / timeout → escalate, with captured stdout retained for audit only.
 
 ## High-Level Architecture Design
 
@@ -49,7 +49,7 @@ flowchart TD
             EV[Event Subscriber] --> CL[Classifier - TOML manifests]
             CL --> SG[Signature Normalizer + Guards]
             SG --> DC[Pure Decision Core: confidence gate + graduation]
-            DC --> SF[Safety Controls: allowlist, kill switch, rate + retry guard]
+            DC --> SF[Safety Controls: never-auto patterns, kill switch, rate + retry guard]
             SF -->|act| AX[Action Executor]
             SF -->|escalate| ESC[Escalation + Notify]
             LRN[Learning subsystem] --- DC
@@ -61,7 +61,7 @@ flowchart TD
 
     subgraph Store[Local state]
         DB[(SQLite WAL: decisions, audit_log, signatures, agent_rate, error_retries, kill_events, corrections, llm_decisions)]
-        CFG[[TOML: thresholds, allowlist, classifier manifests, task sources, llm]]
+        CFG[[TOML: thresholds, never-auto patterns, classifier manifests, task sources, llm]]
     end
 
     HS --> EV
@@ -114,7 +114,7 @@ sequenceDiagram
         D->>M: launch LLM CLI with MCP (get_context available)
         M->>S: write staged llm_decision (direct)
         M->>D: nudge (control socket)
-        D->>D: consume llm_decision; re-gate: confidence + never-auto allowlist
+        D->>D: consume llm_decision; re-gate: confidence + never-auto patterns
         alt passes gate & safety
             D->>S: promote to decisions (source=LLM) + audit (stdout captured)
             D->>H: agent send
@@ -123,7 +123,7 @@ sequenceDiagram
             D->>H: notification show (escalation)
             D->>O: surface in TUI
         end
-    else low confidence / unclassifiable / allowlist / rate / retry-exhausted / killed
+    else low confidence / unclassifiable / never-auto / rate / retry-exhausted / killed
         D->>S: audit (escalated)
         D->>H: notification show (escalation)
         D->>O: surface in TUI
@@ -183,10 +183,10 @@ sequenceDiagram
 
 ### Safety Controls (pure domain + config)
 
-**Responsibilities.** Enforce never-auto allowlist (FR-015/FR-016) incl. seed-corpus-validated patterns + suspected-irreversible heuristic, global pause/kill (FR-017), runaway-loop guard (FR-019), per-error-signature retry ceiling (FR-014), escalation-on-uncertainty (FR-018).
-**Key Components.** Allowlist matcher (regex/keyword), suspected-irreversible indicator scanner, **kill-switch reader that reads the latest row of the append-only `kill_events` table every pipeline tick**, per-agent rate/consecutive counters (`agent_rate`, daemon-owned), **per-error-signature retry counters (`error_retries`, daemon-owned)**.
+**Responsibilities.** Enforce never-auto patterns (FR-015/FR-016) incl. seed-corpus-validated patterns + suspected-irreversible heuristic, global pause/kill (FR-017), runaway-loop guard (FR-019), per-error-signature retry ceiling (FR-014), escalation-on-uncertainty (FR-018).
+**Key Components.** Never-auto matcher (regex/keyword), suspected-irreversible indicator scanner, **kill-switch reader that reads the latest row of the append-only `kill_events` table every pipeline tick**, per-agent rate/consecutive counters (`agent_rate`, daemon-owned), **per-error-signature retry counters (`error_retries`, daemon-owned)**.
 **Key Interfaces.** `Vet(decision, agentState) -> Allow | Escalate`.
-**Data Models.** Allowlist patterns (TOML), `kill_events` (latest row = current state), `agent_rate` counters, `error_retries` counters.
+**Data Models.** Never-auto patterns (TOML), `kill_events` (latest row = current state), `agent_rate` counters, `error_retries` counters.
 **Dependencies.** StorePort, TOML.
 **Error Handling.** Any match/uncertainty/ceiling → escalate; an active latest kill event overrides everything, immediately, without waiting for a reload nudge.
 
@@ -215,7 +215,7 @@ sequenceDiagram
 **Key Interfaces.** MCP tools `get_context(request_id)` and `submit_decision(request_id, action, option_id?, rationale)` → the `mcp` process writes a **staged `llm_decisions` row** directly to the DB and nudges the daemon.
 **Data Models.** `llm_decisions` (staged submission; consumed and re-gated by the daemon, then promoted into `decisions` with `source=LLM` on acceptance), audit fields (captured output).
 **Dependencies.** Local LLM CLI, StorePort.
-**Error Handling.** No `submit_decision` or timeout → escalate (staged row marked `expired`); the submitted decision is re-gated by the confidence gate + never-auto allowlist before acting; unparseable tool args → escalate.
+**Error Handling.** No `submit_decision` or timeout → escalate (staged row marked `expired`); the submitted decision is re-gated by the confidence gate + never-auto patterns before acting; unparseable tool args → escalate.
 
 ### TUI / CLI (front-ends, direct writers of operator data)
 
@@ -332,10 +332,10 @@ erDiagram
 - **ERROR_RETRIES** — **daemon-owned, per-error-signature retry counter** backing FR-014's "max 2 automated retries per error signature" ceiling (distinct from the per-agent `AGENT_RATE`); reset when the error signature is resolved or corrected.
 - **CORRECTIONS** — front-end-written correction records amending an `AUDIT_LOG` entry; consumed by the daemon to re-derive signature state (DR-005).
 - **KILL_EVENTS** — **append-only** pause/kill/resume event log (FR-017), authored by the OPERATOR. Each toggle inserts a new row with `state` (e.g. `active`/`resumed`), `scope`, `author`, and `created_at`; the **latest row by `id`/`created_at` is the current effective state**. This gives the daemon an instant, always-available flag (read every tick) *and* a full historical audit of every pause/kill.
-- **LLM_DECISIONS** — **staged LLM submission** written by the `mcp` process via `submit_decision`. The daemon consumes it, re-gates it (confidence + never-auto allowlist), and on acceptance promotes it into `DECISIONS` (`source=LLM`) and `AUDIT_LOG` (`llm_output` = captured stdout); `status` tracks `pending`/`accepted`/`rejected`/`expired`.
+- **LLM_DECISIONS** — **staged LLM submission** written by the `mcp` process via `submit_decision`. The daemon consumes it, re-gates it (confidence + never-auto patterns), and on acceptance promotes it into `DECISIONS` (`source=LLM`) and `AUDIT_LOG` (`llm_output` = captured stdout); `status` tracks `pending`/`accepted`/`rejected`/`expired`.
 - **OPERATOR** — the single operator actor; present in the model to anchor `CORRECTIONS` and `KILL_EVENTS` authorship for audit.
 
-TOML config (not in SQLite): per-situation thresholds + inferred-task bar, graduation N, error-retry ceiling, allowlist patterns + seed, classifier manifests, next-task source references, LLM argv template + timeout, rate ceilings.
+TOML config (not in SQLite): per-situation thresholds + inferred-task bar, graduation N, error-retry ceiling, never-auto patterns + seed, classifier manifests, next-task source references, LLM argv template + timeout, rate ceilings.
 
 ## Concurrency & Durability Model
 
@@ -347,7 +347,7 @@ This section makes the coordination model explicit so the single-writer question
 
 **Write-ownership partition.**
 - **Daemon-exclusive (hot path):** `SIGNATURES` counters/mode, `AGENT_RATE`, `ERROR_RETRIES`, daemon-emitted `AUDIT_LOG`/`DECISIONS`. No other process writes these rows, so the daemon's read-modify-write is race-free without cross-process locks.
-- **Front-end direct (operator-owned):** TOML config/rules/allowlist, `CORRECTIONS` records, `KILL_EVENTS` inserts. These are **append-only inserts or independent rows** with no concurrent daemon writer contending on the same row.
+- **Front-end direct (operator-owned):** TOML config/rules/never-auto patterns, `CORRECTIONS` records, `KILL_EVENTS` inserts. These are **append-only inserts or independent rows** with no concurrent daemon writer contending on the same row.
 - **`mcp` staged:** `LLM_DECISIONS` inserts only. The daemon consumes these read-only and derives any hot-path effect itself (promotion into `DECISIONS`, counter updates).
 
 **Propagation (NFR-009) without polling (NFR-003).** After a direct/staged write, the writer sends a nudge over the daemon's **Unix-domain control socket** (named pipe on Windows). The daemon reloads TOML and re-reads operator/staged rows on nudge — sub-second, no idle poll. The **pause/kill switch is the one exception that is not nudge-dependent**: the daemon reads the **latest `KILL_EVENTS` row on every pipeline tick**, so a kill halts automation immediately even if the nudge is delayed or the socket is momentarily unavailable — while still recording a complete pause/kill history.
@@ -369,25 +369,25 @@ This section makes the coordination model explicit so the single-writer question
 ### MCP tool surface (internal, exposed to the LLM agent)
 
 - `get_context(request_id) -> { situation_type, agent_type, options?, permission_verb?, history_summary }`.
-- `submit_decision(request_id, action, option_id?, rationale)` — the `mcp` process writes an `LLM_DECISIONS` row (`status=pending`) and nudges the daemon; the daemon re-gates it (confidence + never-auto allowlist) before promoting it into `DECISIONS` and acting.
+- `submit_decision(request_id, action, option_id?, rationale)` — the `mcp` process writes an `LLM_DECISIONS` row (`status=pending`) and nudges the daemon; the daemon re-gates it (confidence + never-auto patterns) before promoting it into `DECISIONS` and acting.
 - `action: "@noop"` (sentinel; `noop`/`no_op`/`no-op` normalize to it) — an explicit "no reply needed" decision: promoted like any other submission (audit `action=noop`, learned as `@noop`, runaway counter advanced) but nothing is ever sent to the pane. Breaks the LLM↔agent nudge loop on idle/done status reports. Free text such as "do nothing" is NOT normalized — it stays a literal reply.
 - Multi-tab MCQ forms (Claude AskUserQuestion / plan-mode): the daemon sweeps every tab (Right-arrow protocol, reset with a fixed Left-arrow burst) and the consult context carries the aggregated questions plus `tab_count` and `answer_format`. The answer is a space-separated digit series, one digit per tab INCLUDING the final Submit tab (e.g. `"1 2 3 2 1"`); a length mismatch is rejected — a partial answer is never delivered. Delivery is one digit keystroke per tab (the form advances itself), never literal text.
 
 ### Error Codes / semantics
 
-Every rejected/failed path resolves to **escalate + audit**, never silent drop: `unclassifiable`, `below_threshold`, `variance_guard`, `over_masked`, `allowlist_match`, `suspected_irreversible`, `rate_limited`, `retry_exhausted`, `killed`, `llm_timeout`, `llm_no_submit`, `herdr_unreachable`, `persistence_failed`.
+Every rejected/failed path resolves to **escalate + audit**, never silent drop: `unclassifiable`, `below_threshold`, `variance_guard`, `over_masked`, `never_auto_match` (formerly `allowlist_match`), `suspected_irreversible`, `rate_limited`, `retry_exhausted`, `killed`, `llm_timeout`, `llm_no_submit`, `herdr_unreachable`, `persistence_failed`.
 
 ## Security Architecture
 
 **Authentication & Authorization.** Single Operator role; no network auth surface. The plugin runs as the operator's user per Herdr's trust model and adds no listeners beyond the local control socket and the MCP stdio channel, plus the Herdr socket it consumes.
-**Input Validation.** Pane content is treated as untrusted text: volatile-token masking during signature generation; allowlist/heuristic scanning before any auto-action; MCP tool arguments and control-socket messages validated and re-gated. Malformed input fails safe to escalation.
+**Input Validation.** Pane content is treated as untrusted text: volatile-token masking during signature generation; never-auto/heuristic scanning before any auto-action; MCP tool arguments and control-socket messages validated and re-gated. Malformed input fails safe to escalation.
 **Data Protection.** Fully local, no telemetry (NFR-007). No pane content leaves the machine except to the operator-configured local LLM CLI. SQLite/TOML live in the plugin's config/state directory with normal user-file permissions; the control socket/named pipe is created with owner-only access; operator can clear/reset learned + audit data (DR-004).
 
 ## Deployment & Operations
 
 **Infrastructure Layout.** One Go static binary installed as a Herdr plugin. `herdr-plugin.toml` declares: pinned `min_herdr_version`; a **daemon** long-running entrypoint (started via event hook on session/agent lifecycle); a **panes** entry for the TUI; **actions** for common CLI ops (pause, resume, review, correct); and Go **build** steps. The `mcp` subcommand is launched on demand by the LLM adapter.
 **Scaling Strategy.** Vertical only — one daemon per Herdr session monitoring up to ~25 concurrent agents (NFR-002). Concurrency per the Concurrency & Durability Model: WAL DB with partitioned write ownership; per-agent work bounded by the runaway guard.
-**Configuration.** TOML in the plugin config dir; a `reload` nudge applies edits without restart; thresholds, allowlist, classifier manifests, task sources, and LLM argv/timeout are all hand-editable.
+**Configuration.** TOML in the plugin config dir; a `reload` nudge applies edits without restart; thresholds, never-auto patterns, classifier manifests, task sources, and LLM argv/timeout are all hand-editable.
 
 ## Observability
 
@@ -397,7 +397,7 @@ Structured logging via `slog`; every automated decision/escalation emits a machi
 
 - **Unit (mandatory):** decision core — confidence math, threshold/graduation/demotion, per-situation resolvers (incl. the two-tier idle resolver and the per-error-signature retry ceiling) — table-driven.
 - **Golden:** classifier + signature normalization over recorded pane transcripts (idle/approval/choice/error/unclassifiable), including volatile-token masking and guard trips.
-- **Safety-invariant (mandatory):** never-auto allowlist blocks the maintained irreversible-op corpus (NFR-005a, CI-enforced); kill switch (latest `kill_events` row read every tick) halts all action even without a reload nudge; confidence gate blocks low-confidence auto-acts; suspected-irreversible heuristic escalates unmatched destructive prompts; error retry ceiling forces escalation on exhaustion.
+- **Safety-invariant (mandatory):** never-auto patterns blocks the maintained irreversible-op corpus (NFR-005a, CI-enforced); kill switch (latest `kill_events` row read every tick) halts all action even without a reload nudge; confidence gate blocks low-confidence auto-acts; suspected-irreversible heuristic escalates unmatched destructive prompts; error retry ceiling forces escalation on exhaustion.
 - **Concurrency:** WAL under concurrent daemon + front-end + `mcp` writes shows no lost updates on partitioned ownership (`signatures`/`agent_rate`/`error_retries`); nudge-driven reload propagates within budget; latest kill event honored on next tick under a delayed nudge; pause/kill history preserved across toggles.
 - **Integration:** full monitor→decide→act loop against a faked Herdr (socket + CLI), plus MCP `submit_decision` staging → re-gating → promotion and timeout→escalate.
 - **Portability:** build + integration suite run on Linux and macOS; no platform-locked API on the daemon/action path (control channel abstracts Unix socket vs. named pipe) so a Windows build stays achievable.
@@ -416,10 +416,10 @@ Structured logging via `slog`; every automated decision/escalation emits a machi
 ## Key Solution Decisions
 
 - **WAL DB with partitioned write ownership** (vs. polling command inbox / dedicated daemon-only socket writer). *Chosen* after the corruption question was clarified: SQLite WAL already makes concurrent multi-process writes corruption-safe, so the inbox was unnecessary; the real hazard (read-modify-write on hot rows) is solved by giving the daemon exclusive ownership of those rows while front-ends write operator-owned data directly and `mcp` writes only staged rows. This lowers latency (no poll) and simplifies the model. *Alternatives* — a polling inbox (adds latency), a daemon-only control socket that also owns all DB writes (more surface, no corruption benefit over WAL) — were rejected.
-- **Staged `LLM_DECISIONS` promoted by the daemon** (vs. the `mcp` process writing `DECISIONS` directly). *Chosen* so the LLM submission is always re-gated by the same confidence + allowlist controls before it becomes an authoritative decision, keeping the daemon the sole writer of learning state.
+- **Staged `LLM_DECISIONS` promoted by the daemon** (vs. the `mcp` process writing `DECISIONS` directly). *Chosen* so the LLM submission is always re-gated by the same confidence + never-auto controls before it becomes an authoritative decision, keeping the daemon the sole writer of learning state.
 - **Dedicated `ERROR_RETRIES` counter** (vs. overloading `AGENT_RATE`). *Chosen* to give FR-014's per-error-signature ceiling an explicit daemon-owned home, distinct from the per-agent runaway guard.
 - **Append-only pause/kill event log** (vs. single mutable flag row). *Chosen* so the daemon still gets an instant, always-readable current state (latest row read each tick) while retaining a full historical audit of every pause/resume/kill. *Alternative* single-row flag was rejected because it discards that history.
 - **Control-socket nudge + always-read latest kill row** (vs. OS signals / config-version poll). *Chosen* for immediate, payload-free reloads (NFR-009) with no idle cost (NFR-003); the kill state is read every tick so safety never depends on nudge delivery.
-- **MCP-mediated LLM contract** (vs. JSON-over-stdout). *Chosen* because it is agent-native: the model calls `submit_decision`/`get_context`, stdout is captured for audit only, and the submitted decision is re-gated by the same safety controls, so the LLM never bypasses the allowlist or confidence gate.
+- **MCP-mediated LLM contract** (vs. JSON-over-stdout). *Chosen* because it is agent-native: the model calls `submit_decision`/`get_context`, stdout is captured for audit only, and the submitted decision is re-gated by the same safety controls, so the LLM never bypasses the never-auto patterns or confidence gate.
 - **Deterministic TOML classification manifests** (vs. LLM/heuristic classifier). *Chosen* for transparency, golden-testability, and zero-dependency operation; the LLM assists decisions only, never classification authority.
 - **Layered pure decision core with ports/adapters** (`cmd → domain → adapters`). *Chosen* to satisfy the constitution's Herdr-agnostic pure-core rule and enable the mandatory unit/safety tests without a live Herdr or LLM.

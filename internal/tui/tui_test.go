@@ -341,9 +341,11 @@ func appModel(t *testing.T) (Model, *frontend.App, *store.Store) {
 	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:deadbeef00112233",
 		Trigger: "apply?", SituationType: domain.SituationApproval, Action: "escalated",
 		Rationale: "shadow mode suggestion", Status: "escalated", CreatedAt: now})
+	st.SaveSignatureSnapshot(ctx, "approval:deadbeef00112233",
+		"Bash(kubectl apply -f deploy.yaml)\nDo you want to proceed?", now)
 
 	m := New(ctx, app)
-	m.width, m.height = 100, 30
+	m.width, m.height = 100, 44
 	upd, _ := m.Update(refreshData(ctx, app))
 	m = upd.(Model)
 	m.tab = tabSignatures
@@ -408,7 +410,8 @@ func TestSignatureDetailOverlay(t *testing.T) {
 		t.Fatal("sigDetailMsg should open the detail overlay")
 	}
 	view := m.View()
-	for _, want := range []string{"approval:deadbeef00112233", "Streak", "Recent decisions", "shadow mode suggestion"} {
+	for _, want := range []string{"approval:deadbeef00112233", "Streak", "Original situation",
+		"kubectl apply -f deploy.yaml", "Recent decisions", "shadow mode suggestion"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("signature detail missing %q:\n%s", want, view)
 		}

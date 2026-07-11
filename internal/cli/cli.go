@@ -146,6 +146,14 @@ func signaturesShow(ctx context.Context, app *frontend.App, out io.Writer, args 
 		return err
 	}
 	printSignatureRow(out, row, graduationN(app))
+	if row.PaneExcerpt != "" {
+		fmt.Fprintln(out, "original situation:")
+		for _, line := range strings.Split(strings.TrimRight(row.PaneExcerpt, "\n"), "\n") {
+			fmt.Fprintf(out, "  %s\n", line)
+		}
+	} else {
+		fmt.Fprintln(out, "original situation: (not captured yet — recorded on the rule's next sighting)")
+	}
 	if len(history) > 0 {
 		fmt.Fprintln(out, "recent decisions (newest first):")
 		for _, d := range history {
@@ -515,8 +523,8 @@ func printConfig(out io.Writer, cfg config.Config) {
 		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries)
 	fmt.Fprintf(out, "llm:        configured=%v timeout=%ds auto_act=%v\n",
 		len(cfg.LLM.Command) > 0, cfg.LLM.TimeoutSeconds, cfg.LLM.AutoAct)
-	fmt.Fprintf(out, "task sources: %d, operator allowlist patterns: %d (+%d seed)\n",
-		len(cfg.TaskSources), len(cfg.Safety.AllowlistPatterns), len(domain.SeedAllowlistPatterns))
+	fmt.Fprintf(out, "task sources: %d, operator never-auto patterns: %d (+%d seed)\n",
+		len(cfg.TaskSources), len(cfg.Safety.NeverAutoPatterns), len(domain.SeedNeverAutoPatterns))
 }
 
 func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
@@ -525,21 +533,21 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(out, "# seed never-auto allowlist (always active unless disable_seed=true)")
-		for _, p := range domain.SeedAllowlistPatterns {
+		fmt.Fprintln(out, "# seed never-auto patterns (always active unless disable_seed=true)")
+		for _, p := range domain.SeedNeverAutoPatterns {
 			fmt.Fprintf(out, "seed\t\t%s\n", p)
 		}
-		for i, p := range cfg.Safety.AllowlistPatterns {
+		for i, p := range cfg.Safety.NeverAutoPatterns {
 			fmt.Fprintf(out, "operator #%d\t%s\n", i, p)
 		}
 		return nil
 	}
 	switch {
 	case args[0] == "add" && len(args) == 2:
-		if err := app.AddAllowlistPattern(ctx, args[1]); err != nil {
+		if err := app.AddNeverAutoPattern(ctx, args[1]); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "allowlist pattern added: %s\n", args[1])
+		fmt.Fprintf(out, "never-auto pattern added: %s\n", args[1])
 		return nil
 	case args[0] == "remove" && len(args) == 2:
 		idx, err := strconv.Atoi(args[1])
@@ -550,14 +558,14 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if err != nil {
 			return err
 		}
-		if idx < 0 || idx >= len(cfg.Safety.AllowlistPatterns) {
-			return fmt.Errorf("no operator allowlist pattern #%d (see: rules list)", idx)
+		if idx < 0 || idx >= len(cfg.Safety.NeverAutoPatterns) {
+			return fmt.Errorf("no operator never-auto pattern #%d (see: rules list)", idx)
 		}
-		expected := cfg.Safety.AllowlistPatterns[idx]
-		if err := app.RemoveAllowlistPattern(ctx, idx, expected); err != nil {
+		expected := cfg.Safety.NeverAutoPatterns[idx]
+		if err := app.RemoveNeverAutoPattern(ctx, idx, expected); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "operator allowlist pattern #%d removed: %s\n", idx, expected)
+		fmt.Fprintf(out, "operator never-auto pattern #%d removed: %s\n", idx, expected)
 		return nil
 	}
 	return fmt.Errorf("usage: rules [list|add <regex>|remove <index>]")

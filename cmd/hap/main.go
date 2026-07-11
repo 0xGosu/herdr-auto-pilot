@@ -54,7 +54,7 @@ Operate:
 
 Configure:
   config [show|fields|set <field> <value>|set-threshold <situation> <value>]
-  rules [list|add <regex>|remove <index>]      never-auto allowlist
+  rules [list|add <regex>|remove <index>]      never-auto patterns
   task-source [add] [--agent A] [--workspace W] [--template T] <checklist.md> | list | remove <index>
   clear-data --yes      reset learned history + audit data
 

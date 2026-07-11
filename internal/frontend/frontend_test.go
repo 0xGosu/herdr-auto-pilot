@@ -236,17 +236,17 @@ func TestSetThresholdPersists(t *testing.T) {
 	}
 }
 
-func TestAddAllowlistPatternValidates(t *testing.T) {
+func TestAddNeverAutoPatternValidates(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
-	if err := app.AddAllowlistPattern(ctx, `(?i)restart\s+prod`); err != nil {
+	if err := app.AddNeverAutoPattern(ctx, `(?i)restart\s+prod`); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := app.Config()
-	if len(cfg.Safety.AllowlistPatterns) != 1 {
+	if len(cfg.Safety.NeverAutoPatterns) != 1 {
 		t.Error("pattern not persisted")
 	}
-	if err := app.AddAllowlistPattern(ctx, "([broken"); err == nil {
+	if err := app.AddNeverAutoPattern(ctx, "([broken"); err == nil {
 		t.Error("invalid regex must be rejected")
 	}
 }
@@ -334,23 +334,23 @@ func TestSplitCommand(t *testing.T) {
 func TestRemoveByIndexIsValueVerified(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
-	app.AddAllowlistPattern(ctx, `(?i)one`)
-	app.AddAllowlistPattern(ctx, `(?i)two`)
+	app.AddNeverAutoPattern(ctx, `(?i)one`)
+	app.AddNeverAutoPattern(ctx, `(?i)two`)
 	app.AddTaskSource(ctx, "builder", "", "/tmp/tasks.md", "")
 
 	// A stale expectation must refuse to delete (safety-relevant: never
 	// silently remove the wrong never-auto pattern).
-	if err := app.RemoveAllowlistPattern(ctx, 0, `(?i)two`); err == nil {
+	if err := app.RemoveNeverAutoPattern(ctx, 0, `(?i)two`); err == nil {
 		t.Fatal("mismatched expected pattern must refuse removal")
 	}
-	if err := app.RemoveAllowlistPattern(ctx, 0, `(?i)one`); err != nil {
+	if err := app.RemoveNeverAutoPattern(ctx, 0, `(?i)one`); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := app.Config()
-	if len(cfg.Safety.AllowlistPatterns) != 1 || cfg.Safety.AllowlistPatterns[0] != `(?i)two` {
-		t.Errorf("wrong pattern removed: %v", cfg.Safety.AllowlistPatterns)
+	if len(cfg.Safety.NeverAutoPatterns) != 1 || cfg.Safety.NeverAutoPatterns[0] != `(?i)two` {
+		t.Errorf("wrong pattern removed: %v", cfg.Safety.NeverAutoPatterns)
 	}
-	if err := app.RemoveAllowlistPattern(ctx, 5, "x"); err == nil {
+	if err := app.RemoveNeverAutoPattern(ctx, 5, "x"); err == nil {
 		t.Error("out-of-range pattern index must error")
 	}
 
@@ -521,8 +521,8 @@ func TestCLIParityWithSharedLayer(t *testing.T) {
 	run("rules", "add", `(?i)reboot\s+router`)
 	run("rules", "remove", "0")
 	cfg, _ = app.Config()
-	if len(cfg.Safety.AllowlistPatterns) != 0 {
-		t.Errorf("rules remove failed: %v", cfg.Safety.AllowlistPatterns)
+	if len(cfg.Safety.NeverAutoPatterns) != 0 {
+		t.Errorf("rules remove failed: %v", cfg.Safety.NeverAutoPatterns)
 	}
 
 	// task-source add/list/remove round trip
