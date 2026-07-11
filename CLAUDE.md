@@ -101,27 +101,39 @@ with a ticket/issue id**. Examples from history:
 
 ## Version bump & release
 
-Releases are **automated on merge to main** with a pre-bump model
+Releases are **automated on merge to main** with a bump-then-tag model
 (`.github/workflows/auto-release.yml`); `version` in `herdr-plugin.toml`
-is the single source of truth and is kept one patch AHEAD of the newest
-tag:
+is the single source of truth and always names a version whose GitHub
+release exists — it TRAILS releases, never leads them. This is
+load-bearing: `herdr plugin install` clones main and `scripts/install.sh`
+downloads the release assets named by the manifest version, so a manifest
+pointing at an unreleased version 404s every install.
 
 - **Patch (the default)** — just merge your feature PR. The workflow finds
-  the manifest version untagged (staged by the previous cycle's auto-merged
-  "pre-bump" PR), tags it with the owner's `RELEASE_PAT`, and that tag
-  fires the standard tag-driven `release.yml`. Afterwards the workflow
-  auto-merges the next pre-bump PR (`release/bump-vX.Y.Z+1`, commit marked
-  `[skip ci]` so CI ignores it). Never bump the manifest for patch work.
-- **Minor/major (the reserved manual path)** — overwrite the pre-bumped
-  `version` in `herdr-plugin.toml` INSIDE your feature PR (e.g. `0.4.0`);
-  on merge that exact version is tagged and released, then the pre-bump
-  re-arms at its patch+1.
+  the manifest version already tagged (the last release), auto-merges a
+  bump PR (`release/bump-vX.Y.Z+1`, commit marked `[skip release]`), tags
+  that bump commit with the owner's `RELEASE_PAT`, and the tag fires the
+  standard tag-driven `release.yml`. Never bump the manifest for patch
+  work.
+- **Minor/major (the reserved manual path)** — overwrite `version` in
+  `herdr-plugin.toml` INSIDE your feature PR (e.g. `0.4.0`); on merge the
+  workflow finds that version untagged, skips the bump, and tags the
+  merge commit directly. (The same branch self-heals a crashed run that
+  bumped but never tagged.)
 - Doc/workflow-only pushes (`**.md`, `docs/**`, `.github/**`) and merge
   commits containing `[skip release]` do not release. Hand-pushing a
   `v*.*.*` tag still works (release.yml is unchanged and tag-driven).
-- If a merge ever finds the manifest already tagged (bootstrap/recovery),
-  the workflow merges the pre-bump first, tags the bump commit, and
-  re-arms — self-healing, no manual step.
+- Never put `[skip ci]`-family keywords ANYWHERE in the squash-merge
+  message (title or body) of a PR that should release: GitHub suppresses
+  ALL workflows for refs whose head commit carries one — including the
+  tag push onto that commit, so the release silently never builds. The
+  workflow refuses to tag such a commit. `[skip release]` (our custom
+  marker) is safe on tagged commits but suppresses auto-release itself,
+  so keep the literal string out of ordinary merge messages too.
+- Between the bump merge and the release publishing (~15 min), installs
+  from main can fail with 404 — install.sh's ~60 s curl retry only
+  bridges the post-publish upload gap, not the build. Retry once the
+  release publishes; pinned `--ref vX.Y.Z` installs are never affected.
 - If the release BUILD fails after the tag exists, re-run the failed
   release.yml run; do not re-run auto-release (it would advance versions).
 
