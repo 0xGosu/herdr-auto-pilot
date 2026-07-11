@@ -1,27 +1,31 @@
 name: Auto Release
 
-# Every push to main cuts a release, versioned from herdr-plugin.toml:
+# Pre-bump release automation. main's manifest version is kept one patch
+# AHEAD of the newest tag by an auto-merged "pre-bump" PR, so releasing is
+# just tagging:
 #
-# - manifest version ALREADY tagged  → ordinary merge: open a patch-bump PR
-#   (bump commit carries [skip ci], so CI ignores it), merge it with the
-#   owner's token (RELEASE_PAT secret, admin squash-merge), tag, build,
-#   publish;
-# - manifest version NOT yet tagged  → a manual major/minor bump merged:
-#   tag and release exactly the manifest version, no bump PR.
+# 1. A feature PR merges → this workflow reads `version` from
+#    herdr-plugin.toml. It is untagged (pre-bumped by the previous cycle),
+#    so the workflow tags it with the owner's RELEASE_PAT — and that tag
+#    push fires the standard tag-driven release.yml, unchanged.
+# 2. After tagging, the workflow opens the NEXT pre-bump PR (patch+1; its
+#    commit carries [skip ci], so CI ignores it) and squash-merges it with
+#    RELEASE_PAT. main is now staged for the next cycle.
 #
-# The manifest/tag invariant (version in herdr-plugin.toml == git tag) holds
-# by construction and is asserted before tagging. No loops: the squashed
-# bump commit lands on main with [skip ci], which suppresses every
-# push-triggered workflow — including this one — regardless of which token
-# merged it. The release build is invoked via workflow_call from THIS run
-# (triggered by the original merge), so the skip marker never suppresses
-# the build. Doc/workflow-only pushes don't trigger (paths-ignore) and
-# [skip release] in the merge commit opts out. The old manual path —
-# pushing a v*.*.* tag by hand — still works via release.yml's tag trigger.
+# Manual minor/major (the reserved path): overwrite the pre-bumped version
+# in your feature PR (e.g. 0.4.0); on merge that exact version is tagged
+# and released, and the pre-bump re-arms at its patch+1.
 #
-# Recovery: if the BUILD fails after the tag exists, use "Re-run failed
-# jobs" (the version outputs are reused). "Re-run all jobs" would resolve
-# and bump AGAIN — don't.
+# Recovery/bootstrap (manifest version already tagged — e.g. the very
+# first run, or a release cut by hand): the pre-bump PR is merged FIRST
+# (without [skip ci] — its commit gets tagged, and a skip keyword in a
+# tagged commit's message would suppress the tag-triggered release), the
+# bump commit is tagged, then a normal [skip ci] pre-bump re-arms.
+#
+# No loops: the [skip ci] pre-bump merge triggers nothing; the tag is
+# pushed with RELEASE_PAT deliberately so release.yml DOES fire. Doc and
+# workflow-only pushes don't trigger (paths-ignore); [skip release] in a
+# merge commit opts out; pushing a v*.*.* tag by hand still works.
 on:
   push:
     branches: [main]
@@ -34,121 +38,112 @@ permissions:
   contents: write
 
 # One run executes, at most one waits; further merges arriving meanwhile
-# replace the waiting run (its push is still released — the run that
+# replace the waiting run (their content is still released — the run that
 # eventually executes resolves from LATEST main, so a "canceled" run here
-# means "absorbed by the next release", not a failure).
+# means "absorbed", not a failure).
 concurrency:
   group: auto-release
   cancel-in-progress: false
 
 jobs:
-  version:
-    name: Resolve release version
+  release:
+    name: Tag release & pre-bump
     runs-on: ubuntu-latest
     if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
-    outputs:
-      proceed: ${{ steps.resolve.outputs.proceed }}
-      version: ${{ steps.resolve.outputs.version }}
-      ref: ${{ steps.resolve.outputs.ref }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # tags decide bump-vs-release
-      - name: Resolve version (bump PR when the manifest version is already tagged)
-        id: resolve
+          fetch-depth: 0 # tags decide release-vs-recovery
+      - name: Tag the manifest version, then pre-bump the next patch
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT }}
         run: |
           set -euo pipefail
+          [ -n "${GH_TOKEN}" ] || { echo "::error::RELEASE_PAT secret is not set"; exit 1; }
           # Work from the LATEST main, not the triggering SHA: a run queued
-          # behind another release must see that release's bump commit.
+          # behind another release must see that release's pre-bump.
           git fetch origin main
           git checkout -B main origin/main
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The PAT must push the tag (a GITHUB_TOKEN tag push would not
+          # fire release.yml); route git pushes through gh's credentials.
+          gh auth setup-git
 
-          CURRENT=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml)
-          [ -n "$CURRENT" ] || { echo "::error::no version in herdr-plugin.toml"; exit 1; }
+          version() { sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml; }
+          next_patch() { IFS=. read -r MA MI PA <<<"$1"; echo "${MA}.${MI}.$((PA + 1))"; }
 
-          if git rev-parse -q --verify "refs/tags/v${CURRENT}" >/dev/null; then
-            # A queued run whose triggering merge was already absorbed by
-            # the previous release finds HEAD == the released commit:
-            # nothing new to release.
-            if [ "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/v${CURRENT}^{commit}")" ]; then
-              echo "main is already released as v${CURRENT}; nothing to do"
-              echo "proceed=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            # Ordinary merge: the manifest version is already released, so
-            # this push earns a patch bump — via a PR merged with the
-            # owner's token, per repo convention (never commit to main).
-            [ -n "${GH_TOKEN}" ] || { echo "::error::RELEASE_PAT secret is not set; cannot open the bump PR"; exit 1; }
-            IFS=. read -r MA MI PA <<<"$CURRENT"
-            NEXT="${MA}.${MI}.$((PA + 1))"
-            if git rev-parse -q --verify "refs/tags/v${NEXT}" >/dev/null; then
-              echo "::error::tag v${NEXT} already exists but the manifest says ${CURRENT}; fix the manifest manually"
-              exit 1
-            fi
-
-            BRANCH="release/bump-v${NEXT}"
-            git checkout -B "${BRANCH}"
-            sed -i "s/^version = \"${CURRENT}\"/version = \"${NEXT}\"/" herdr-plugin.toml
-            git commit -am "#1 chore: bump plugin version to ${NEXT} [skip ci]"
-            # Force-push: the branch is bot-owned and may hold the remains
-            # of a previously failed run — self-heal, don't wedge.
+          # Opens the pre-bump PR for $1 (commit suffixed with $2, e.g.
+          # " [skip ci]") and squash-merges it with the owner token.
+          # Self-healing: force-pushes the bot branch, reuses an open PR,
+          # and treats an already-merged PR as success.
+          prebump() {
+            local NEXT="$1" MARKER="${2-}"
+            local BRANCH="release/bump-v${NEXT}"
+            local CUR; CUR=$(version)
+            git checkout -B "${BRANCH}" origin/main
+            sed -i "s/^version = \"${CUR}\"/version = \"${NEXT}\"/" herdr-plugin.toml
+            git commit -am "#1 chore: pre-bump plugin version to ${NEXT}${MARKER}"
             git push --force origin "HEAD:${BRANCH}"
-
-            # Idempotent PR: reuse an open bump PR left by a failed run.
+            local PR
             PR=$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number' || true)
             if [ -z "${PR}" ]; then
               gh pr create --base main --head "${BRANCH}" \
-                --title "#1 chore: bump plugin version to ${NEXT} [skip ci]" \
-                --body "Automated patch bump for the release of v${NEXT} (triggered by ${GITHUB_SHA}). CI is skipped on this PR; the release build runs in the Auto Release workflow."
+                --title "#1 chore: pre-bump plugin version to ${NEXT}${MARKER}" \
+                --body "Automated pre-bump: stages v${NEXT} as the next release. Merged by the Auto Release workflow."
             fi
-
-            # Merge. gh pr merge can exit non-zero AFTER the squash landed
-            # (e.g. a branch-deletion race), so treat MERGED as success.
+            local i STATE
             for i in 1 2 3 4 5; do
               if gh pr merge "${BRANCH}" --squash --admin --delete-branch \
-                --subject "#1 chore: bump plugin version to ${NEXT} [skip ci]" \
-                --body "Automated patch bump for v${NEXT}."; then
+                --subject "#1 chore: pre-bump plugin version to ${NEXT}${MARKER}" \
+                --body "Automated pre-bump for the next release."; then
                 break
               fi
               STATE=$(gh pr view "${BRANCH}" --json state --jq .state 2>/dev/null || echo "")
               [ "${STATE}" = "MERGED" ] && break
               if [ "$i" = 5 ]; then
-                echo "::error::could not merge the bump PR (state: ${STATE:-unknown})"
-                exit 1
+                echo "::error::could not merge the pre-bump PR (state: ${STATE:-unknown})"; exit 1
               fi
               sleep 5
             done
-
             git fetch origin main
             git checkout -B main origin/main
-            # The invariant, asserted: the refetched main must carry NEXT.
             grep -q "^version = \"${NEXT}\"" herdr-plugin.toml || {
-              echo "::error::main does not carry version ${NEXT} after the bump merge"; exit 1; }
-            VERSION="$NEXT"
-          else
-            # Manual major/minor bump just merged: release it as-is.
-            VERSION="$CURRENT"
+              echo "::error::main does not carry version ${NEXT} after the pre-bump merge"; exit 1; }
+          }
+
+          # A queued run whose merge was absorbed by the previous release
+          # finds a pre-bump commit on top: nothing new to release.
+          if git log -1 --format=%s | grep -q "chore: pre-bump plugin version"; then
+            echo "HEAD is the pre-bump staging commit; nothing to release"
+            exit 0
           fi
 
-          # Tag via the checkout's persisted GITHUB_TOKEN credentials: that
-          # token never retriggers workflows, so release.yml's tag trigger
-          # stays quiet — the build below is invoked directly instead.
-          git tag "v${VERSION}"
-          git push origin "v${VERSION}"
-          echo "proceed=true" >> "$GITHUB_OUTPUT"
-          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          CURRENT=$(version)
+          [ -n "$CURRENT" ] || { echo "::error::no version in herdr-plugin.toml"; exit 1; }
 
-  release:
-    name: Build & publish
-    needs: version
-    if: ${{ needs.version.outputs.proceed == 'true' }}
-    uses: ./.github/workflows/release.yml
-    with:
-      version: ${{ needs.version.outputs.version }}
-      ref: ${{ needs.version.outputs.ref }}
+          if git rev-parse -q --verify "refs/tags/v${CURRENT}" >/dev/null; then
+            # Recovery/bootstrap: the manifest was never pre-bumped. Merge
+            # a pre-bump WITHOUT [skip ci] (its commit gets tagged below;
+            # a skip keyword there would suppress the tag-triggered
+            # release), then tag it. [skip release] only stops THIS
+            # workflow from re-running on that merge.
+            RELEASE=$(next_patch "$CURRENT")
+            if git rev-parse -q --verify "refs/tags/v${RELEASE}" >/dev/null; then
+              echo "::error::tag v${RELEASE} already exists but the manifest says ${CURRENT}; fix the manifest manually"
+              exit 1
+            fi
+            prebump "${RELEASE}" " [skip release]"
+          else
+            # Steady state: the pre-bumped (or manually bumped) manifest
+            # version releases as-is, tagged at the feature merge.
+            RELEASE="$CURRENT"
+          fi
+
+          git tag "v${RELEASE}"
+          git push origin "v${RELEASE}"
+          echo "tagged v${RELEASE}; the tag-driven release.yml takes it from here"
+
+          # Re-arm: stage the next patch so the following merge releases
+          # by tagging alone. [skip ci]: nothing runs on this merge.
+          prebump "$(next_patch "${RELEASE}")" " [skip ci]"

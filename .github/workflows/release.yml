@@ -1,22 +1,8 @@
 name: Release
 
-# Two entry points, one build:
-# - workflow_call from auto-release.yml (the normal path: version resolved
-#   from herdr-plugin.toml, ref pinned to the bump/merge commit);
-# - a hand-pushed v*.*.* tag (the reserved manual/emergency path).
 on:
   push:
     tags: ['v*.*.*']
-  workflow_call:
-    inputs:
-      version:
-        description: Release tag (vX.Y.Z), already created by the caller
-        required: true
-        type: string
-      ref:
-        description: Commit SHA to build (carries the matching manifest version)
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -35,7 +21,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          ref: ${{ inputs.ref || github.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -80,7 +65,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          ref: ${{ inputs.ref || github.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -100,7 +84,7 @@ jobs:
         run: bash scripts/setup-native.sh
       - name: Build hap binary
         run: |
-          VERSION="${{ inputs.version || github.ref_name }}"
+          VERSION="${GITHUB_REF_NAME}"
           case "${{ matrix.target }}" in
             linux-*)  RPATH='-Wl,-rpath,$ORIGIN/../lib' ;;
             darwin-*) RPATH='-Wl,-rpath,@loader_path/../lib' ;;
@@ -175,8 +159,5 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          # Explicit on the workflow_call path (github.ref is a branch
-          # there); the tag already exists in both entry modes.
-          tag_name: ${{ inputs.version || github.ref_name }}
           files: dist/*
           generate_release_notes: true
