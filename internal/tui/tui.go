@@ -15,7 +15,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -37,18 +36,11 @@ const (
 
 var tabNames = []string{"Agents", "Escalations", "Audit", "Rules", "Config", "Pause/Kill"}
 
-var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	activeTab     = lipgloss.NewStyle().Bold(true).Underline(true)
-	inactiveTab   = lipgloss.NewStyle().Faint(true)
-	pausedStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
-	runningStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("46"))
-	selectedStyle = lipgloss.NewStyle().Reverse(true)
-	sectionStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
-	helpStyle     = lipgloss.NewStyle().Faint(true)
-	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	okStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
-)
+// isList reports whether t renders a scrollable, searchable row list.
+// Config and Pause/Kill keep their existing unwindowed navigation (AR-032).
+func (t tab) isList() bool {
+	return t == tabAgents || t == tabEscalations || t == tabAudit || t == tabSignatures
+}
 
 type refreshMsg struct {
 	status      frontend.Status
@@ -70,6 +62,15 @@ type sigDetailMsg struct {
 type actionResultMsg struct {
 	message string
 	err     error
+}
+
+// statusNote is a durable action outcome shown in the status area until
+// the next outcome replaces it (CR-025) — unlike the transient m.message
+// hint line, navigation never clears it.
+type statusNote struct {
+	text string
+	err  bool
+	at   time.Time
 }
 
 type tickMsg time.Time
@@ -94,9 +95,11 @@ type detailView struct {
 	confirmID int64
 }
 
-// ruleItem is one navigable row of the Config tab.
+// ruleItem is one navigable row of the Config tab. "indicator" and
+// "capture" rows are read-only (AR-034, AR-035): they render for
+// visibility and refuse edit/remove with a config.toml pointer.
 type ruleItem struct {
-	kind  string // "field" | "pattern" | "source"
+	kind  string // "field" | "pattern" | "source" | "indicator" | "capture"
 	key   string // config field key (fields)
 	index int    // slice index (patterns / sources)
 	value string // pattern text / source path — verified on removal
@@ -119,18 +122,86 @@ type Model struct {
 	detail  *detailView
 	width   int
 	height  int
+
+	offsets   [tabCount]int    // per-list viewport offset (AR-001)
+	query     [tabCount]string // per-tab search filter (AR-013)
+	searching bool             // search-input mode on the active tab (AR-011)
+	status    *statusNote      // durable action outcome (CR-025)
+	st        *styles          // palette-resolved styles; nil = default palette
 }
 
-// visibleSignatures applies the display-side mode filter (f key).
+// matchesQuery reports whether any of the row's visible column values
+// contains tab t's query as a case-insensitive substring (AR-013).
+func (m Model) matchesQuery(t tab, fields ...string) bool {
+	q := strings.ToLower(m.query[t])
+	if q == "" {
+		return true
+	}
+	for _, f := range fields {
+		if strings.Contains(strings.ToLower(f), q) {
+			return true
+		}
+	}
+	return false
+}
+
+// visibleAgents applies the Agents tab search filter.
+func (m Model) visibleAgents() []domain.AgentTransition {
+	if m.query[tabAgents] == "" {
+		return m.data.status.MonitoredAgents
+	}
+	var out []domain.AgentTransition
+	for _, a := range m.data.status.MonitoredAgents {
+		if m.matchesQuery(tabAgents, m.data.status.AgentName(a.AgentID),
+			a.AgentID, a.AgentType, a.Status) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// visibleEscalations applies the Escalations tab search filter.
+func (m Model) visibleEscalations() []domain.AuditRecord {
+	return m.filterAudit(tabEscalations, m.data.escalations)
+}
+
+// visibleAudit applies the Audit tab search filter.
+func (m Model) visibleAudit() []domain.AuditRecord {
+	return m.filterAudit(tabAudit, m.data.audit)
+}
+
+func (m Model) filterAudit(t tab, rows []domain.AuditRecord) []domain.AuditRecord {
+	if m.query[t] == "" {
+		return rows
+	}
+	var out []domain.AuditRecord
+	for _, r := range rows {
+		if m.matchesQuery(t,
+			fmt.Sprintf("#%d", r.ID), string(r.SituationType), r.Status,
+			m.data.status.AgentName(r.AgentID), r.AgentID, m.agentTypeFor(r),
+			r.Action, r.Rationale, r.Suggestion) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// visibleSignatures applies the display-side mode filter (f key) composed
+// with the Rules tab search query (CR-017).
 func (m Model) visibleSignatures() []frontend.SignatureRow {
-	if m.sigMode == "" {
+	if m.sigMode == "" && m.query[tabSignatures] == "" {
 		return m.data.signatures
 	}
 	var out []frontend.SignatureRow
 	for _, r := range m.data.signatures {
-		if r.Mode == m.sigMode {
-			out = append(out, r)
+		if m.sigMode != "" && r.Mode != m.sigMode {
+			continue
 		}
+		if !m.matchesQuery(tabSignatures, r.Signature, string(r.SituationType),
+			r.AgentType, string(r.Mode), r.TopAction) {
+			continue
+		}
+		out = append(out, r)
 	}
 	return out
 }
@@ -213,6 +284,45 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 			label: label,
 		})
 	}
+	// Read-only visibility rows (AR-034, AR-035): the suspected-irreversible
+	// indicator patterns and the capture-delay rules, previously invisible
+	// outside config.toml.
+	for i, p := range cfg.Safety.IrreversibleIndicators {
+		items = append(items, ruleItem{
+			kind: "indicator", index: i, value: p,
+			label: fmt.Sprintf("indicator #%d  %s", i, p),
+		})
+	}
+	for i, r := range cfg.Safety.IndicatorRules {
+		scope := "*"
+		if len(r.Agents) > 0 {
+			scope = strings.Join(r.Agents, ",")
+		}
+		items = append(items, ruleItem{
+			kind: "indicator", index: len(cfg.Safety.IrreversibleIndicators) + i, value: r.Pattern,
+			label: fmt.Sprintf("indicator-rule #%d  agents=%s  %s", i, scope, r.Pattern),
+		})
+	}
+	if len(cfg.CaptureDelays) == 0 {
+		// No rules configured: show the effective built-in defaults so the
+		// operator can see what timing applies (AR-035).
+		items = append(items, ruleItem{
+			kind: "capture",
+			label: fmt.Sprintf("defaults  start=%dms event=%dms (built-in)",
+				cfg.CaptureDelay("*", true).Milliseconds(), cfg.CaptureDelay("*", false).Milliseconds()),
+		})
+	}
+	for i, r := range cfg.CaptureDelays {
+		at := r.AgentType
+		if at == "" {
+			at = "*"
+		}
+		items = append(items, ruleItem{
+			kind: "capture", index: i,
+			label: fmt.Sprintf("capture-delay #%d  agent=%s start=%dms event=%dms",
+				i, at, r.StartMs, r.EventMs),
+		})
+	}
 	return items
 }
 
@@ -225,13 +335,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detail.lines = m.detail.build(m.wrapWidth())
 			m.detail.offset = min(m.detail.offset, max(0, len(m.detail.lines)-m.detailPageSize()))
 		}
+		m.clampListViewport()
 		return m, nil
 	case refreshMsg:
 		m.data = msg
 		m.items = buildRuleItems(msg.cfg)
-		if m.cursor >= m.rowCount() {
-			m.cursor = max(0, m.rowCount()-1)
+		// A failed refresh carries a zero config; keep the current palette
+		// rather than flickering back to the default while the error shows.
+		if msg.err == nil {
+			st := newStyles(resolvePalette(msg.cfg.TUI))
+			m.st = &st
 		}
+		m.clampListViewport()
 		// Drop marks whose escalations are no longer pending (deleted,
 		// confirmed, or resolved elsewhere) — marks track ids, not rows.
 		if len(m.marked) > 0 {
@@ -248,21 +363,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case actionResultMsg:
 		if msg.err != nil {
-			m.message = errStyle.Render(msg.err.Error())
+			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
 		} else if msg.message != "" {
-			m.message = okStyle.Render(msg.message)
+			m.status = &statusNote{text: msg.message, at: time.Now()}
 		}
+		// The status area shrinks the page by 2 — keep the cursor visible.
+		m.clampListViewport()
 		return m, m.refresh()
 	case tickMsg:
 		return m, tea.Batch(m.refresh(), tick())
 	case sigDetailMsg:
 		if msg.err != nil {
-			m.message = errStyle.Render(msg.err.Error())
+			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
 			return m, nil
 		}
 		gradN := m.data.cfg.Learning.GraduationN
 		build := func(width int) []string {
-			return signatureDetailLines(msg.row, msg.history, gradN, width)
+			return m.signatureDetailLines(msg.row, msg.history, gradN, width)
 		}
 		m.detail = &detailView{
 			title: fmt.Sprintf("Signature %s", shortSig(msg.row.Signature)),
@@ -295,11 +412,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.detail = nil
 			m.tab = (m.tab + 1) % tabCount
 			m.cursor = 0
+			m.offsets[m.tab] = 0
+			m.searching = false
 			m.message = ""
 		case "shift+tab", "left", "h":
 			m.detail = nil
 			m.tab = (m.tab + tabCount - 1) % tabCount
 			m.cursor = 0
+			m.offsets[m.tab] = 0
+			m.searching = false
 			m.message = ""
 		case "enter":
 			// On an escalation's detail view, Enter confirms+sends the
@@ -351,27 +472,66 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Search-input mode (AR-011): every printable key edits the query —
+	// action and navigation bindings, `q`/`y` included, never fire while
+	// typing (CR-019). esc and enter both exit, retaining a non-empty
+	// query as the active filter (AR-014, AR-015).
+	if m.searching {
+		switch msg.Type {
+		case tea.KeyCtrlC:
+			return m, tea.Quit
+		case tea.KeyEsc, tea.KeyEnter:
+			m.searching = false
+		case tea.KeyBackspace:
+			if r := []rune(m.query[m.tab]); len(r) > 0 {
+				m.query[m.tab] = string(r[:len(r)-1])
+			}
+		case tea.KeySpace:
+			m.query[m.tab] += " "
+		case tea.KeyRunes:
+			m.query[m.tab] += string(msg.Runes)
+		}
+		m.clampListViewport() // CR-016
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 	case "tab", "right", "l":
 		m.tab = (m.tab + 1) % tabCount
 		m.cursor = 0
+		m.offsets[m.tab] = 0
 		m.message = ""
 	case "shift+tab", "left", "h":
 		m.tab = (m.tab + tabCount - 1) % tabCount
 		m.cursor = 0
+		m.offsets[m.tab] = 0
 		m.message = ""
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
 		}
+		m.scrollCursorIntoView()
 		m.message = ""
 	case "down", "j":
 		if m.cursor < m.rowCount()-1 {
 			m.cursor++
 		}
+		m.scrollCursorIntoView()
 		m.message = ""
+	case "/":
+		if m.tab.isList() {
+			m.searching = true
+			m.message = ""
+		}
+	case "backspace":
+		// The active-filter hint advertises backspace-to-clear outside
+		// search mode too; a no-op otherwise.
+		if m.tab.isList() && m.query[m.tab] != "" {
+			m.query[m.tab] = ""
+			m.clampListViewport()
+		}
 	case "p":
 		return m, m.do("automation paused", func(ctx context.Context) error { return m.app.Pause(ctx) })
 	case "r":
@@ -413,6 +573,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.sigMode = ""
 			}
 			m.cursor = 0
+			m.offsets[tabSignatures] = 0
 			m.message = "filter: " + orDash(string(m.sigMode))
 		}
 	case "a":
@@ -437,6 +598,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.removeSelectedRule()
 		case tabAudit:
 			m.message = "audit log is append-only — entries can't be deleted individually"
+			m.scrollCursorIntoView() // the hint line shrinks the page
 		}
 	case "X":
 		switch m.tab {
@@ -460,14 +622,17 @@ func (m Model) do(okMsg string, fn func(context.Context) error) tea.Cmd {
 	}
 }
 
-func (m Model) rowCount() int {
-	switch m.tab {
+// rowCountFor counts tab t's currently visible rows: search-filter-aware
+// for the four list tabs (CR-008); Config and Pause/Kill keep their raw
+// counts so their navigation is untouched (AR-032).
+func (m Model) rowCountFor(t tab) int {
+	switch t {
 	case tabAgents:
-		return len(m.data.status.MonitoredAgents)
+		return len(m.visibleAgents())
 	case tabEscalations:
-		return len(m.data.escalations)
+		return len(m.visibleEscalations())
 	case tabAudit:
-		return len(m.data.audit)
+		return len(m.visibleAudit())
 	case tabSignatures:
 		return len(m.visibleSignatures())
 	case tabConfig:
@@ -478,15 +643,17 @@ func (m Model) rowCount() int {
 	return 0
 }
 
+func (m Model) rowCount() int { return m.rowCountFor(m.tab) }
+
 func (m Model) selectedAudit() *domain.AuditRecord {
 	switch m.tab {
 	case tabEscalations:
-		if m.cursor < len(m.data.escalations) {
-			return &m.data.escalations[m.cursor]
+		if esc := m.visibleEscalations(); m.cursor < len(esc) {
+			return &esc[m.cursor]
 		}
 	case tabAudit:
-		if m.cursor < len(m.data.audit) {
-			return &m.data.audit[m.cursor]
+		if rows := m.visibleAudit(); m.cursor < len(rows) {
+			return &rows[m.cursor]
 		}
 	}
 	return nil
@@ -555,6 +722,10 @@ func (m Model) toggleMarkSelected() (tea.Model, tea.Cmd) {
 	if m.cursor < m.rowCount()-1 {
 		m.cursor++
 	}
+	// The advance can walk the cursor past the window's bottom edge (and
+	// the mark message shrinks the page): keep the cursor row visible
+	// (AR-003).
+	m.scrollCursorIntoView()
 	return m, nil
 }
 
@@ -658,10 +829,11 @@ func (m Model) pruneEscalationsPrompt() (tea.Model, tea.Cmd) {
 // --- Agent rename ---
 
 func (m Model) renameSelected() (tea.Model, tea.Cmd) {
-	if m.cursor >= len(m.data.status.MonitoredAgents) {
+	agents := m.visibleAgents()
+	if m.cursor >= len(agents) {
 		return m, nil
 	}
-	agent := m.data.status.MonitoredAgents[m.cursor]
+	agent := agents[m.cursor]
 	current := m.data.status.AgentName(agent.AgentID)
 	target := agent.AgentID
 	app, ctx := m.app, m.ctx
@@ -687,8 +859,8 @@ func (m Model) renameSelected() (tea.Model, tea.Cmd) {
 func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 	switch m.tab {
 	case tabAgents:
-		if m.cursor < len(m.data.status.MonitoredAgents) {
-			a := m.data.status.MonitoredAgents[m.cursor]
+		if agents := m.visibleAgents(); m.cursor < len(agents) {
+			a := agents[m.cursor]
 			build := func(width int) []string { return m.agentDetailLines(a, width) }
 			m.message = ""
 			m.detail = &detailView{
@@ -735,6 +907,87 @@ func (m Model) detailPageSize() int {
 		chrome++
 	}
 	return max(1, m.height-chrome)
+}
+
+// listPageSize is how many list rows fit under the current pane chrome,
+// mirroring detailPageSize's accounting (AR-002): header title + tabs +
+// blank (3), the more-rows indicator (1), and blank + help (2) — plus the
+// error line, the search/filter lines, and the prompt, hint, and status
+// areas when present.
+func (m Model) listPageSize() int {
+	if m.height <= 0 {
+		return 20
+	}
+	chrome := 6
+	if m.data.err != nil {
+		chrome++
+	}
+	if m.searching || (m.tab.isList() && m.query[m.tab] != "") {
+		chrome++
+	}
+	if m.tab == tabSignatures && m.sigMode != "" {
+		chrome++
+	}
+	if m.prompt != nil {
+		chrome += 2
+	}
+	if m.message != "" {
+		chrome += 2
+	}
+	if m.status != nil {
+		chrome += 2
+	}
+	return max(1, m.height-chrome)
+}
+
+// window clamps the active tab's offset to n rows and returns the visible
+// slice bounds; the caller renders rows[start:end] and the more-rows
+// indicator when end < n (AR-002, AR-009).
+func (m Model) window(n int) (start, end int) {
+	page := m.listPageSize()
+	start = min(m.offsets[m.tab], max(0, n-page))
+	start = max(0, start)
+	end = min(start+page, n)
+	return start, end
+}
+
+// scrollCursorIntoView moves the active list tab's offset so the shared
+// cursor stays visible (AR-003, AR-004).
+func (m *Model) scrollCursorIntoView() {
+	if !m.tab.isList() {
+		return
+	}
+	if m.cursor < m.offsets[m.tab] {
+		m.offsets[m.tab] = m.cursor
+	}
+	if page := m.listPageSize(); m.cursor >= m.offsets[m.tab]+page {
+		m.offsets[m.tab] = m.cursor - page + 1
+	}
+}
+
+// clampListViewport keeps every list tab's offset within
+// [0, rowCount−pageSize] and the shared cursor within the active tab's
+// visible (filtered) rows (CR-007, CR-008, CR-016).
+func (m *Model) clampListViewport() {
+	page := m.listPageSize()
+	for _, t := range []tab{tabAgents, tabEscalations, tabAudit, tabSignatures} {
+		if maxOff := max(0, m.rowCountFor(t)-page); m.offsets[t] > maxOff {
+			m.offsets[t] = maxOff
+		}
+	}
+	if m.cursor >= m.rowCount() {
+		m.cursor = max(0, m.rowCount()-1)
+	}
+	m.scrollCursorIntoView()
+}
+
+// renderMoreRows draws the clipped-rows affordance, matching the detail
+// overlay's more-lines indicator (AR-009).
+func (m Model) renderMoreRows(b *strings.Builder, remaining int) {
+	if remaining > 0 {
+		fmt.Fprintf(b, "%s\n", m.styles().help.Render(
+			fmt.Sprintf("… %d more row(s) — ↓ to scroll", remaining)))
+	}
 }
 
 // wrapWidth is the text width for the detail view.
@@ -793,11 +1046,11 @@ func (m Model) budget(prefixCells int, hasTrailing bool) (primary, trailing int)
 }
 
 // detailField appends a labelled, wrapped block; empty values are skipped.
-func detailField(lines []string, width int, label, value string) []string {
+func (m Model) detailField(lines []string, width int, label, value string) []string {
 	if strings.TrimSpace(value) == "" {
 		return lines
 	}
-	lines = append(lines, sectionStyle.Render(label))
+	lines = append(lines, m.styles().section.Render(label))
 	for _, ln := range wrapText(value, width) {
 		lines = append(lines, "  "+ln)
 	}
@@ -806,23 +1059,23 @@ func detailField(lines []string, width int, label, value string) []string {
 
 func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 	var lines []string
-	lines = detailField(lines, w, "Short name", orDash(m.data.status.AgentName(a.AgentID)))
-	lines = detailField(lines, w, "Agent id", a.AgentID)
-	lines = detailField(lines, w, "Workspace", locationLabel(a.WorkspaceID,
+	lines = m.detailField(lines, w, "Short name", orDash(m.data.status.AgentName(a.AgentID)))
+	lines = m.detailField(lines, w, "Agent id", a.AgentID)
+	lines = m.detailField(lines, w, "Workspace", locationLabel(a.WorkspaceID,
 		func() (string, int, bool) {
 			ws, ok := m.data.status.Workspaces[a.WorkspaceID]
 			return ws.Label, ws.Number, ok
 		}))
-	lines = detailField(lines, w, "Tab", locationLabel(a.TabID,
+	lines = m.detailField(lines, w, "Tab", locationLabel(a.TabID,
 		func() (string, int, bool) {
 			tab, ok := m.data.status.Tabs[a.TabID]
 			return tab.Label, tab.Number, ok
 		}))
-	lines = detailField(lines, w, "Pane", a.PaneID)
-	lines = detailField(lines, w, "Type", a.AgentType)
-	lines = detailField(lines, w, "Status", a.Status)
+	lines = m.detailField(lines, w, "Pane", a.PaneID)
+	lines = m.detailField(lines, w, "Type", a.AgentType)
+	lines = m.detailField(lines, w, "Status", a.Status)
 	if !a.At.IsZero() {
-		lines = detailField(lines, w, "Last transition", a.At.Format(time.RFC3339))
+		lines = m.detailField(lines, w, "Last transition", a.At.Format(time.RFC3339))
 	}
 	return lines
 }
@@ -849,33 +1102,33 @@ func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int) []
 	if n := m.data.status.AgentName(r.AgentID); n != "" {
 		agent = fmt.Sprintf("%s (%s)", n, r.AgentID)
 	}
-	lines = detailField(lines, w, "When", r.CreatedAt.Format(time.RFC3339))
-	lines = detailField(lines, w, "Status", r.Status)
-	lines = detailField(lines, w, "Situation", string(r.SituationType))
-	lines = detailField(lines, w, "Agent", agent)
-	lines = detailField(lines, w, "Agent type", m.agentTypeFor(r))
-	lines = detailField(lines, w, "Confidence", fmt.Sprintf("%.2f", r.Confidence))
-	lines = detailField(lines, w, "Trigger", r.Trigger)
-	lines = detailField(lines, w, "Suggestion", r.Suggestion)
-	lines = detailField(lines, w, "Action", r.Action)
-	lines = detailField(lines, w, "Input", r.Input)
-	lines = detailField(lines, w, "Rationale", r.Rationale)
-	lines = detailField(lines, w, "LLM output", r.LLMOutput)
-	lines = detailField(lines, w, "Signature", r.Signature)
+	lines = m.detailField(lines, w, "When", r.CreatedAt.Format(time.RFC3339))
+	lines = m.detailField(lines, w, "Status", r.Status)
+	lines = m.detailField(lines, w, "Situation", string(r.SituationType))
+	lines = m.detailField(lines, w, "Agent", agent)
+	lines = m.detailField(lines, w, "Agent type", m.agentTypeFor(r))
+	lines = m.detailField(lines, w, "Confidence", fmt.Sprintf("%.2f", r.Confidence))
+	lines = m.detailField(lines, w, "Trigger", r.Trigger)
+	lines = m.detailField(lines, w, "Suggestion", r.Suggestion)
+	lines = m.detailField(lines, w, "Action", r.Action)
+	lines = m.detailField(lines, w, "Input", r.Input)
+	lines = m.detailField(lines, w, "Rationale", r.Rationale)
+	lines = m.detailField(lines, w, "LLM output", r.LLMOutput)
+	lines = m.detailField(lines, w, "Signature", r.Signature)
 	if r.Signature != "" {
 		if row, ok := m.ruleFor(r.Signature); ok {
-			lines = detailField(lines, w, "Matched rule",
+			lines = m.detailField(lines, w, "Matched rule",
 				frontend.RuleSummary(row, m.data.cfg.Learning.GraduationN))
 		} else {
-			lines = detailField(lines, w, "Matched rule",
+			lines = m.detailField(lines, w, "Matched rule",
 				"none yet — learned when the operator confirms or resolves this")
 		}
 	}
 	if r.DecisionID != 0 {
-		lines = detailField(lines, w, "Decision id", fmt.Sprintf("%d", r.DecisionID))
+		lines = m.detailField(lines, w, "Decision id", fmt.Sprintf("%d", r.DecisionID))
 	}
 	if r.CorrectsAuditID != 0 {
-		lines = detailField(lines, w, "Corrects audit", fmt.Sprintf("#%d", r.CorrectsAuditID))
+		lines = m.detailField(lines, w, "Corrects audit", fmt.Sprintf("#%d", r.CorrectsAuditID))
 	}
 	// Current situation: the pane content THIS record was classified from
 	// (per entry). Below it, the matched rule's Original situation — the
@@ -884,13 +1137,13 @@ func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int) []
 	// detail. Legacy rows predate the per-entry column and show only the
 	// provenance block.
 	if r.PaneExcerpt != "" {
-		lines = detailField(lines, w, "Current situation", r.PaneExcerpt)
+		lines = m.detailField(lines, w, "Current situation", r.PaneExcerpt)
 	}
 	if r.Signature != "" {
 		if snapshot != "" {
-			lines = detailField(lines, w, "Original situation", snapshot)
+			lines = m.detailField(lines, w, "Original situation", snapshot)
 		} else {
-			lines = detailField(lines, w, "Original situation", "(not captured yet — recorded on the rule's next sighting)")
+			lines = m.detailField(lines, w, "Original situation", "(not captured yet — recorded on the rule's next sighting)")
 		}
 	}
 	return lines
@@ -991,29 +1244,29 @@ func (m Model) deleteSignaturePrompt() (tea.Model, tea.Cmd) {
 }
 
 // signatureDetailLines renders the full-record overlay for one signature.
-func signatureDetailLines(row frontend.SignatureRow, history []domain.DecisionRecord, graduationN, w int) []string {
+func (m Model) signatureDetailLines(row frontend.SignatureRow, history []domain.DecisionRecord, graduationN, w int) []string {
 	var lines []string
-	lines = detailField(lines, w, "Signature", row.Signature)
-	lines = detailField(lines, w, "Situation", string(row.SituationType))
-	lines = detailField(lines, w, "Agent type", orDash(row.AgentType))
-	lines = detailField(lines, w, "Mode", string(row.Mode))
-	lines = detailField(lines, w, "Streak", fmt.Sprintf("%d/%d confirmations toward graduation", row.ConsecutiveConfirmations, graduationN))
-	lines = detailField(lines, w, "Confidence", fmt.Sprintf("%.2f (cached)", row.CachedConfidence))
+	lines = m.detailField(lines, w, "Signature", row.Signature)
+	lines = m.detailField(lines, w, "Situation", string(row.SituationType))
+	lines = m.detailField(lines, w, "Agent type", orDash(row.AgentType))
+	lines = m.detailField(lines, w, "Mode", string(row.Mode))
+	lines = m.detailField(lines, w, "Streak", fmt.Sprintf("%d/%d confirmations toward graduation", row.ConsecutiveConfirmations, graduationN))
+	lines = m.detailField(lines, w, "Confidence", fmt.Sprintf("%.2f (cached)", row.CachedConfidence))
 	if row.TopAction != "" {
-		lines = detailField(lines, w, "Top action", fmt.Sprintf("%q over %d decision(s)", row.TopAction, row.Decisions))
+		lines = m.detailField(lines, w, "Top action", fmt.Sprintf("%q over %d decision(s)", row.TopAction, row.Decisions))
 	}
 	if row.GuardState != "" {
-		lines = detailField(lines, w, "Guard", row.GuardState)
+		lines = m.detailField(lines, w, "Guard", row.GuardState)
 	}
 	if !row.UpdatedAt.IsZero() {
-		lines = detailField(lines, w, "Updated", row.UpdatedAt.Format(time.RFC3339))
+		lines = m.detailField(lines, w, "Updated", row.UpdatedAt.Format(time.RFC3339))
 	}
 	// Rule provenance: what the pane showed when this signature was first
 	// seen — the situation the learned action answers.
 	if row.PaneExcerpt != "" {
-		lines = detailField(lines, w, "Original situation", row.PaneExcerpt)
+		lines = m.detailField(lines, w, "Original situation", row.PaneExcerpt)
 	} else {
-		lines = detailField(lines, w, "Original situation", "(not captured yet — recorded on the rule's next sighting)")
+		lines = m.detailField(lines, w, "Original situation", "(not captured yet — recorded on the rule's next sighting)")
 	}
 	if len(history) > 0 {
 		var b strings.Builder
@@ -1025,10 +1278,10 @@ func signatureDetailLines(row frontend.SignatureRow, history []domain.DecisionRe
 			fmt.Fprintf(&b, "#%d  %s  %q  source=%s%s\n",
 				d.ID, d.CreatedAt.Format("01-02 15:04:05"), d.ChosenAction, d.Source, marker)
 		}
-		lines = detailField(lines, w, "Recent decisions (newest first)", strings.TrimRight(b.String(), "\n"))
+		lines = m.detailField(lines, w, "Recent decisions (newest first)", strings.TrimRight(b.String(), "\n"))
 	}
 	if a := row.LastAudit; a != nil {
-		lines = detailField(lines, w, "Last audit",
+		lines = m.detailField(lines, w, "Last audit",
 			fmt.Sprintf("#%d (%s) %s — %s", a.ID, a.Status, a.Action, a.Rationale))
 	}
 	return lines
@@ -1053,7 +1306,22 @@ func (m Model) selectedRule() *ruleItem {
 
 func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	item := m.selectedRule()
-	if item == nil || item.kind != "field" {
+	if item == nil {
+		return m, nil
+	}
+	switch item.kind {
+	case "indicator", "capture":
+		m.message = "read-only — edit config.toml (the daemon reloads on save)"
+		return m, nil
+	case "field":
+	default:
+		return m, nil
+	}
+	// Free-text fields (argv templates, template strings, paths) are
+	// read-only in the TUI (CR-036): the one-line prompt round-trip mangles
+	// them. `hap config set` still accepts every key.
+	if !frontend.FieldTUIEditable(item.key) {
+		m.message = fmt.Sprintf("%s is read-only in the TUI — edit config.toml or run: hap config set %s <value>", item.key, item.key)
 		return m, nil
 	}
 	key := item.key
@@ -1136,6 +1404,9 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 		return m, m.do(fmt.Sprintf("task source #%d removed", idx), func(c context.Context) error {
 			return app.RemoveTaskSource(c, idx, expected)
 		})
+	case "indicator", "capture":
+		m.message = "read-only — edit config.toml (the daemon reloads on save)"
+		return m, nil
 	default:
 		m.message = "config fields are edited (enter), not removed"
 		return m, nil
@@ -1166,13 +1437,14 @@ func (m Model) clearDataPrompt() (tea.Model, tea.Cmd) {
 
 // View renders the pane.
 func (m Model) View() string {
+	st := m.styles()
 	var b strings.Builder
 
-	state := runningStyle.Render("● running")
+	state := st.running.Render("● running")
 	if m.data.status.Paused {
-		state = pausedStyle.Render("■ PAUSED (kill switch)")
+		state = st.paused.Render("■ PAUSED (kill switch)")
 	}
-	fmt.Fprintf(&b, "%s  %s\n", titleStyle.Render("Herd Auto Prompter"), state)
+	fmt.Fprintf(&b, "%s  %s\n", st.title.Render("Herd Auto Prompter"), state)
 
 	var tabs []string
 	for i, name := range tabNames {
@@ -1181,20 +1453,29 @@ func (m Model) View() string {
 			label = fmt.Sprintf(" %s(%d) ", name, len(m.data.escalations))
 		}
 		if tab(i) == m.tab {
-			tabs = append(tabs, activeTab.Render(label))
+			tabs = append(tabs, st.activeTab.Render(label))
 		} else {
-			tabs = append(tabs, inactiveTab.Render(label))
+			tabs = append(tabs, st.inactiveTab.Render(label))
 		}
 	}
 	fmt.Fprintf(&b, "%s\n\n", strings.Join(tabs, "|"))
 
 	if m.data.err != nil {
-		fmt.Fprintf(&b, "%s\n", errStyle.Render("error: "+m.data.err.Error()))
+		fmt.Fprintf(&b, "%s\n", st.err.Render("error: "+m.data.err.Error()))
 	}
 
 	if m.detail != nil {
 		m.renderDetail(&b)
 		return b.String()
+	}
+
+	// Search bar / active-filter line (its height is accounted for in
+	// listPageSize so the body never overflows the pane).
+	if m.searching {
+		fmt.Fprintf(&b, "%s%s█\n", st.section.Render("search> "), m.query[m.tab])
+	} else if m.tab.isList() && m.query[m.tab] != "" {
+		fmt.Fprintf(&b, "%s\n", st.help.Render(
+			fmt.Sprintf("filter: %q — / to edit, backspace to clear", m.query[m.tab])))
 	}
 
 	switch m.tab {
@@ -1218,7 +1499,21 @@ func (m Model) View() string {
 	if m.message != "" {
 		fmt.Fprintf(&b, "\n%s\n", m.message)
 	}
-	fmt.Fprintf(&b, "\n%s", helpStyle.Render(m.helpLine()))
+	// Durable status area (CR-025): the last action outcome stays readable
+	// until the next one replaces it, styled ok/error from the palette
+	// (CR-026).
+	if m.status != nil {
+		mark, style := "✓", st.ok
+		if m.status.err {
+			mark, style = "✗", st.err
+		}
+		// Errors can embed multi-line subprocess output; the status area
+		// budgets exactly one line, so flatten and truncate.
+		text := oneLine(m.status.text, max(20, m.contentWidth()-12))
+		fmt.Fprintf(&b, "\n%s\n", style.Render(
+			fmt.Sprintf("%s %s  %s", mark, text, m.status.at.Format("15:04:05"))))
+	}
+	fmt.Fprintf(&b, "\n%s", st.help.Render(m.helpLine()))
 	return b.String()
 }
 
@@ -1229,16 +1524,19 @@ func (m Model) helpLine() string {
 		}
 		return "↑/↓: scroll  tab: switch tab  esc/q/v: close"
 	}
+	if m.searching {
+		return "type to filter  backspace: erase  esc/enter: apply & close"
+	}
 	common := "tab: switch  ↑/↓: select  p: pause  r: resume  q: quit"
 	switch m.tab {
 	case tabAgents:
-		return "v: details  n: rename agent  " + common
+		return "v: details  n: rename agent  /: search  " + common
 	case tabEscalations:
-		return "enter/y: confirm+send  c: correct  space: mark  x: delete  X: prune old  v: details  " + common
+		return "enter/y: confirm+send  c: correct  space: mark  x: delete  X: prune old  v: details  /: search  " + common
 	case tabAudit:
-		return "c: correct decision  v: details  " + common
+		return "c: correct decision  v: details  /: search  " + common
 	case tabSignatures:
-		return "enter/v: details  x: delete  f: filter mode  " + common
+		return "enter/v: details  x: delete  f: filter mode  /: search  " + common
 	case tabConfig:
 		return "enter/e: edit field  a: add pattern  t: add task source  x: remove  X: clear data  " + common
 	}
@@ -1247,39 +1545,52 @@ func (m Model) helpLine() string {
 
 // renderSignatures draws the learned-signature list (the Rules tab).
 func (m Model) renderSignatures(b *strings.Builder) {
+	st := m.styles()
 	sigs := m.visibleSignatures()
 	if m.sigMode != "" {
-		fmt.Fprintf(b, "%s\n", sectionStyle.Render("filter: mode="+string(m.sigMode)+"  (f cycles)"))
+		fmt.Fprintf(b, "%s\n", st.section.Render("filter: mode="+string(m.sigMode)+"  (f cycles)"))
 	}
 	if len(sigs) == 0 {
 		if len(m.data.signatures) > 0 {
-			fmt.Fprintln(b, "no signatures match the filter — press f to cycle")
+			fmt.Fprintln(b, m.styles().help.Render("no signatures match the filter — f cycles mode, / edits search"))
 			return
 		}
-		fmt.Fprintln(b, "no learned signatures yet — confirm suggestions to teach hap")
+		fmt.Fprintln(b, m.styles().help.Render("no learned signatures yet — confirm suggestions to teach hap"))
 		return
 	}
 	gradN := m.data.cfg.Learning.GraduationN
-	// Prefix up to the action column is ~66 fixed cells.
-	actWidth, _ := m.budget(66, false)
-	for i, r := range sigs {
-		line := fmt.Sprintf("%-18s %-9s %-10s %-11s %d/%d conf=%.2f  %s",
-			shortSig(r.Signature), r.SituationType, orDash(r.AgentType), r.Mode,
+	// The signature column sizes to the widest visible id so the full id
+	// renders untruncated (CR-032); the fixed columns after it are ~48
+	// cells, so the action budget shifts right with the column.
+	sigW := 18
+	for _, r := range sigs {
+		if n := runewidth.StringWidth(r.Signature); n > sigW {
+			sigW = n
+		}
+	}
+	actWidth, _ := m.budget(sigW+48, false)
+	start, end := m.window(len(sigs))
+	for i := start; i < end; i++ {
+		r := sigs[i]
+		line := fmt.Sprintf("%-*s %-9s %-10s %-11s %d/%d conf=%.2f  %s",
+			sigW, r.Signature, r.SituationType, orDash(r.AgentType), r.Mode,
 			r.ConsecutiveConfirmations, gradN, r.CachedConfidence,
 			oneLine(r.TopAction, actWidth))
 		switch {
 		case i == m.cursor:
-			line = selectedStyle.Render(line)
+			line = st.selected.Render(line)
 		case r.Mode == domain.ModeAutonomous:
-			line = okStyle.Render(line)
+			line = st.ok.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
+	m.renderMoreRows(b, len(sigs)-end)
 }
 
 // renderDetail draws the open detail overlay in place of the tab body.
 func (m Model) renderDetail(b *strings.Builder) {
-	fmt.Fprintf(b, "%s\n\n", titleStyle.Render(m.detail.title))
+	st := m.styles()
+	fmt.Fprintf(b, "%s\n\n", st.title.Render(m.detail.title))
 	page := m.detailPageSize()
 	lines := m.detail.lines
 	start := min(m.detail.offset, max(0, len(lines)-1))
@@ -1288,25 +1599,32 @@ func (m Model) renderDetail(b *strings.Builder) {
 		fmt.Fprintln(b, ln)
 	}
 	if end < len(lines) {
-		fmt.Fprintf(b, "%s\n", helpStyle.Render(fmt.Sprintf("… %d more line(s) — ↓ to scroll", len(lines)-end)))
+		fmt.Fprintf(b, "%s\n", st.help.Render(fmt.Sprintf("… %d more line(s) — ↓ to scroll", len(lines)-end)))
 	}
-	fmt.Fprintf(b, "\n%s", helpStyle.Render(m.helpLine()))
+	fmt.Fprintf(b, "\n%s", st.help.Render(m.helpLine()))
 }
 
 func (m Model) renderAgents(b *strings.Builder) {
-	agents := m.data.status.MonitoredAgents
+	agents := m.visibleAgents()
 	if len(agents) == 0 {
-		fmt.Fprintln(b, "no agents detected")
+		if len(m.data.status.MonitoredAgents) > 0 {
+			fmt.Fprintln(b, m.styles().help.Render("no agents match the filter — / edits, backspace clears"))
+		} else {
+			fmt.Fprintln(b, m.styles().help.Render("no agents detected"))
+		}
 		return
 	}
-	for i, a := range agents {
+	start, end := m.window(len(agents))
+	for i := start; i < end; i++ {
+		a := agents[i]
 		name := orDash(m.data.status.AgentName(a.AgentID))
 		line := fmt.Sprintf("%-18s %-12s %-12s %s", name, a.AgentID, a.AgentType, a.Status)
 		if i == m.cursor {
-			line = selectedStyle.Render(line)
+			line = m.styles().selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
+	m.renderMoreRows(b, len(agents)-end)
 }
 
 // ruleFor resolves the learned rule an audit/escalation row is keyed to
@@ -1351,14 +1669,20 @@ func (m Model) agentTypeFor(r domain.AuditRecord) string {
 }
 
 func (m Model) renderEscalations(b *strings.Builder) {
-	esc := m.data.escalations
+	esc := m.visibleEscalations()
 	if len(esc) == 0 {
-		fmt.Fprintln(b, "no pending escalations — the herd is unblocked 🎉")
+		if len(m.data.escalations) > 0 {
+			fmt.Fprintln(b, m.styles().help.Render("no escalations match the filter — / edits, backspace clears"))
+		} else {
+			fmt.Fprintln(b, m.styles().help.Render("no pending escalations — the herd is unblocked 🎉"))
+		}
 		return
 	}
 	// Prefix: "<mark> #%-5d %-8s %-10s %-8s agent=%-14s rule=%-6s " → 71 cells.
 	const escPrefix = 71
-	for i, e := range esc {
+	start, end := m.window(len(esc))
+	for i := start; i < end; i++ {
+		e := esc[i]
 		agent := e.AgentID
 		if n := m.data.status.AgentName(e.AgentID); n != "" {
 			agent = n
@@ -1376,32 +1700,43 @@ func (m Model) renderEscalations(b *strings.Builder) {
 			line += "  → " + oneLine(e.Suggestion, sWidth)
 		}
 		if i == m.cursor {
-			line = selectedStyle.Render(line)
+			line = m.styles().selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
+	m.renderMoreRows(b, len(esc)-end)
 }
 
 func (m Model) renderAudit(b *strings.Builder) {
+	rows := m.visibleAudit()
+	if len(rows) == 0 {
+		if len(m.data.audit) > 0 {
+			fmt.Fprintln(b, m.styles().help.Render("no audit records match the filter — / edits, backspace clears"))
+		} else {
+			fmt.Fprintln(b, m.styles().help.Render("no audit records yet"))
+		}
+		return
+	}
 	// Prefix up to the action column is ~53 fixed cells + "rule=%-6s " (12).
 	actWidth, _ := m.budget(65, false)
-	for i, r := range m.data.audit {
+	start, end := m.window(len(rows))
+	for i := start; i < end; i++ {
+		r := rows[i]
 		line := fmt.Sprintf("#%-5d %-14s %-9s %-10s conf=%.2f rule=%-6s %s",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
 			r.Confidence, m.ruleMarker(r.Signature), oneLine(r.Action, actWidth))
 		if i == m.cursor {
-			line = selectedStyle.Render(line)
+			line = m.styles().selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
-	if len(m.data.audit) == 0 {
-		fmt.Fprintln(b, "no audit records yet")
-	}
+	m.renderMoreRows(b, len(rows)-end)
 }
 
 func (m Model) renderConfig(b *strings.Builder) {
+	st := m.styles()
 	if len(m.items) == 0 {
-		fmt.Fprintln(b, "no configuration loaded")
+		fmt.Fprintln(b, m.styles().help.Render("no configuration loaded"))
 		return
 	}
 	lastKind := ""
@@ -1410,57 +1745,75 @@ func (m Model) renderConfig(b *strings.Builder) {
 			lastKind = item.kind
 			switch item.kind {
 			case "field":
-				fmt.Fprintln(b, sectionStyle.Render("Config"))
+				fmt.Fprintln(b, st.section.Render("Config"))
 			case "pattern":
-				fmt.Fprintf(b, "\n%s\n", sectionStyle.Render(fmt.Sprintf(
-					"Never-auto patterns (operator; +%d seed)", len(domain.SeedNeverAutoPatterns))))
+				fmt.Fprintf(b, "\n%s\n", st.section.Render(fmt.Sprintf(
+					"Never-auto patterns (operator; %s)", m.seedLabel())))
 			case "source":
-				fmt.Fprintf(b, "\n%s\n", sectionStyle.Render("Task sources"))
+				fmt.Fprintf(b, "\n%s\n", st.section.Render("Task sources"))
+			case "indicator":
+				fmt.Fprintf(b, "\n%s\n", st.section.Render("Safety indicators (read-only — edit config.toml)"))
+			case "capture":
+				fmt.Fprintf(b, "\n%s\n", st.section.Render("Capture delays (read-only — edit config.toml)"))
 			}
 		}
-		line := "  " + item.label
+		// Long values (argv templates, paths) truncate to one line (CR-037).
+		line := "  " + oneLine(item.label, m.contentWidth()-2)
 		if i == m.cursor {
-			line = selectedStyle.Render(line)
+			line = st.selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
 	if len(m.data.cfg.Safety.NeverAutoPatterns) == 0 {
-		fmt.Fprintf(b, "\n%s\n", sectionStyle.Render(fmt.Sprintf(
-			"Never-auto patterns: none from operator (+%d seed active) — press a to add",
-			len(domain.SeedNeverAutoPatterns))))
+		fmt.Fprintf(b, "\n%s\n", st.section.Render(fmt.Sprintf(
+			"Never-auto patterns: none from operator (%s) — press a to add", m.seedLabel())))
 	}
 	if len(m.data.cfg.TaskSources) == 0 {
-		fmt.Fprintf(b, "%s\n", sectionStyle.Render("Task sources: none — press t to add"))
+		fmt.Fprintf(b, "%s\n", st.section.Render("Task sources: none — press t to add"))
 	}
+}
+
+// seedLabel names the shipped seed patterns' state: the count when active,
+// or an explicit marker when safety.disable_seed dropped them (so the
+// Config tab never contradicts the new editable field).
+func (m Model) seedLabel() string {
+	if m.data.cfg.Safety.DisableSeed {
+		return "seed disabled"
+	}
+	return fmt.Sprintf("+%d seed active", len(domain.SeedNeverAutoPatterns))
 }
 
 func (m Model) renderKills(b *strings.Builder) {
 	if len(m.data.kills) == 0 {
-		fmt.Fprintln(b, "no pause/kill events recorded")
+		fmt.Fprintln(b, m.styles().help.Render("no pause/kill events recorded"))
 		return
 	}
 	for i, e := range m.data.kills {
 		line := fmt.Sprintf("#%-4d %-20s %-8s by %s",
 			e.ID, e.CreatedAt.Format(time.RFC3339), e.State, e.Author)
 		if i == m.cursor {
-			line = selectedStyle.Render(line)
+			line = m.styles().selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
 }
 
+// oneLine flattens newlines and truncates to limit display CELLS (not
+// runes): row budgets are in cells, and wide runes (CJK, emoji) arriving
+// verbatim from pane content would otherwise overflow the row and break
+// the pane-height invariant (AR-010).
 func oneLine(s string, limit int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	if limit < 1 {
 		limit = 1
 	}
-	if r := []rune(s); len(r) > limit {
-		if limit == 1 {
-			return "…"
-		}
-		return string(r[:limit-1]) + "…"
+	if runewidth.StringWidth(s) <= limit {
+		return s
 	}
-	return s
+	if limit == 1 {
+		return "…"
+	}
+	return runewidth.Truncate(s, limit, "…")
 }
 
 func orDash(s string) string {

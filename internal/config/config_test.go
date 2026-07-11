@@ -309,6 +309,68 @@ func TestTUIMaxContentWidthParsed(t *testing.T) {
 	}
 }
 
+func TestTUIThemeAndPaletteParsed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte(`[tui]
+theme = "dark"
+max_content_width = 120
+
+[tui.palette]
+title = "99"
+error = "#ff5faf"
+`), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TUI.Theme != "dark" {
+		t.Errorf("theme = %q, want dark", cfg.TUI.Theme)
+	}
+	if cfg.TUI.MaxContentWidth != 120 {
+		t.Errorf("max_content_width = %d, want 120", cfg.TUI.MaxContentWidth)
+	}
+	if cfg.TUI.Palette.Title != "99" || cfg.TUI.Palette.Error != "#ff5faf" {
+		t.Errorf("palette overrides lost: %+v", cfg.TUI.Palette)
+	}
+	// Unset roles stay empty (inherit the theme's value at render time).
+	if cfg.TUI.Palette.Section != "" || cfg.TUI.Palette.OK != "" ||
+		cfg.TUI.Palette.Paused != "" || cfg.TUI.Palette.Running != "" ||
+		cfg.TUI.Palette.Help != "" {
+		t.Errorf("unset palette roles must stay empty: %+v", cfg.TUI.Palette)
+	}
+}
+
+func TestTUIThemeBackwardCompat(t *testing.T) {
+	// CR-029: pre-theming config files keep loading unchanged.
+	path := filepath.Join(t.TempDir(), "config.toml")
+
+	// Legacy [tui] section with only max_content_width.
+	os.WriteFile(path, []byte("[tui]\nmax_content_width = 140\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("legacy [tui] file must load: %v", err)
+	}
+	if cfg.TUI.MaxContentWidth != 140 {
+		t.Errorf("max_content_width = %d, want 140", cfg.TUI.MaxContentWidth)
+	}
+	if cfg.TUI.Theme != "" {
+		t.Errorf("legacy file must leave theme empty, got %q", cfg.TUI.Theme)
+	}
+	if cfg.TUI.Palette != (PaletteOverrides{}) {
+		t.Errorf("legacy file must leave palette zero, got %+v", cfg.TUI.Palette)
+	}
+
+	// No [tui] section at all.
+	os.WriteFile(path, []byte("[learning]\ngraduation_n = 5\n"), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatalf("file without [tui] must load: %v", err)
+	}
+	if cfg.TUI.MaxContentWidth != 0 || cfg.TUI.Theme != "" ||
+		cfg.TUI.Palette != (PaletteOverrides{}) {
+		t.Errorf("missing [tui] must default to zero TUI config, got %+v", cfg.TUI)
+	}
+}
+
 func TestRewriteConfigKeys(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 

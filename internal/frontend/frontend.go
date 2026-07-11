@@ -445,29 +445,68 @@ func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) e
 	return a.nudge(ctx, control.KindReload)
 }
 
+// ConfigFieldDef describes one scalar config field: its SetField key and
+// whether the TUI's inline prompt may edit it. Free-text values — argv
+// templates, template strings, paths — are TUI-read-only as a standing
+// rule (CR-036): the one-line prompt round-trip mangles them. `config set`
+// accepts every key regardless of the flag.
+type ConfigFieldDef struct {
+	Key         string
+	TUIEditable bool
+}
+
+// ConfigFields is the single source of truth for the scalar config field
+// registry, in display order (CR-033). A parity test fails when a key here
+// is missing from FieldValue or SetField; a switch case added without a
+// registry entry is unguarded (the field silently disappears from the TUI
+// and `config fields`), so always add new fields here first.
+var ConfigFields = []ConfigFieldDef{
+	{Key: "thresholds.idle", TUIEditable: true},
+	{Key: "thresholds.approval", TUIEditable: true},
+	{Key: "thresholds.choice", TUIEditable: true},
+	{Key: "thresholds.error", TUIEditable: true},
+	{Key: "thresholds.inferred_task_bar", TUIEditable: true},
+	{Key: "learning.graduation_n", TUIEditable: true},
+	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
+	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
+	{Key: "limits.max_error_retries", TUIEditable: true},
+	{Key: "safety.disable_seed", TUIEditable: true},
+	{Key: "llm.command"}, // argv template
+	{Key: "llm.timeout_seconds", TUIEditable: true},
+	{Key: "llm.auto_act", TUIEditable: true},
+	{Key: "llm.pane_excerpt_chars", TUIEditable: true},
+	{Key: "llm.rewrite_command"}, // argv template
+	{Key: "llm.rewrite_timeout_seconds", TUIEditable: true},
+	{Key: "llm.rewrite_fallback_template"}, // template string
+	{Key: "embedding.disabled", TUIEditable: true},
+	{Key: "embedding.model_path"}, // path
+	{Key: "embedding.similarity_threshold", TUIEditable: true},
+	{Key: "embedding.bm25_min_score", TUIEditable: true},
+	{Key: "embedding.gpu_layers", TUIEditable: true},
+	{Key: "tui.max_content_width", TUIEditable: true},
+	{Key: "tui.theme", TUIEditable: true},
+}
+
 // ConfigFieldKeys lists every scalar config field editable via SetField, in
 // display order (shared by the TUI config editor and `config set`).
-var ConfigFieldKeys = []string{
-	"thresholds.idle",
-	"thresholds.approval",
-	"thresholds.choice",
-	"thresholds.error",
-	"thresholds.inferred_task_bar",
-	"learning.graduation_n",
-	"limits.max_consecutive_auto_prompts",
-	"limits.max_auto_prompts_per_minute",
-	"limits.max_error_retries",
-	"llm.command",
-	"llm.timeout_seconds",
-	"llm.auto_act",
-	"llm.rewrite_command",
-	"llm.rewrite_timeout_seconds",
-	"llm.rewrite_fallback_template",
-	"embedding.disabled",
-	"embedding.model_path",
-	"embedding.similarity_threshold",
-	"embedding.bm25_min_score",
-	"embedding.gpu_layers",
+var ConfigFieldKeys = func() []string {
+	keys := make([]string, len(ConfigFields))
+	for i, f := range ConfigFields {
+		keys[i] = f.Key
+	}
+	return keys
+}()
+
+// FieldTUIEditable reports whether the TUI inline prompt may edit key;
+// false means the TUI shows it read-only (config.toml and `config set`
+// still work — CR-036).
+func FieldTUIEditable(key string) bool {
+	for _, f := range ConfigFields {
+		if f.Key == key {
+			return f.TUIEditable
+		}
+	}
+	return false
 }
 
 // FieldValue renders the current value of a SetField key for display.
@@ -492,16 +531,27 @@ func FieldValue(cfg config.Config, key string) string {
 	case "limits.max_error_retries":
 		return strconv.Itoa(cfg.Limits.MaxErrorRetries)
 	case "llm.command":
+		if len(cfg.LLM.Command) == 0 {
+			return "(disabled)"
+		}
 		return JoinCommand(cfg.LLM.Command)
 	case "llm.timeout_seconds":
 		return strconv.Itoa(cfg.LLM.TimeoutSeconds)
 	case "llm.auto_act":
 		return strconv.FormatBool(cfg.LLM.AutoAct)
+	case "llm.pane_excerpt_chars":
+		return strconv.Itoa(cfg.LLM.PaneExcerptChars)
 	case "llm.rewrite_command":
+		if len(cfg.LLM.RewriteCommand) == 0 {
+			return "(disabled)"
+		}
 		return JoinCommand(cfg.LLM.RewriteCommand)
 	case "llm.rewrite_timeout_seconds":
 		return strconv.Itoa(cfg.LLM.RewriteTimeoutSeconds)
 	case "llm.rewrite_fallback_template":
+		if cfg.LLM.RewriteFallbackTemplate == "" {
+			return "(built-in default)"
+		}
 		return cfg.LLM.RewriteFallbackTemplate
 	case "embedding.disabled":
 		return strconv.FormatBool(cfg.Embedding.Disabled)
@@ -516,6 +566,18 @@ func FieldValue(cfg config.Config, key string) string {
 		return fmt.Sprintf("%.2f", cfg.Embedding.BM25MinScore)
 	case "embedding.gpu_layers":
 		return strconv.Itoa(cfg.Embedding.GPULayers)
+	case "safety.disable_seed":
+		return strconv.FormatBool(cfg.Safety.DisableSeed)
+	case "tui.max_content_width":
+		if cfg.TUI.MaxContentWidth == 0 {
+			return "0 (full width)"
+		}
+		return strconv.Itoa(cfg.TUI.MaxContentWidth)
+	case "tui.theme":
+		if cfg.TUI.Theme == "" {
+			return "default"
+		}
+		return cfg.TUI.Theme
 	}
 	return ""
 }
@@ -619,6 +681,46 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			cfg.Embedding.GPULayers = v
 			return nil
+		case "llm.pane_excerpt_chars":
+			// 0 is the config's "restore the 5000-char default" sentinel
+			// (fillZeroes) — accept it, like tui.max_content_width does.
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("llm.pane_excerpt_chars must be a non-negative integer (0 = default), got %q", value)
+			}
+			cfg.LLM.PaneExcerptChars = v
+			return nil
+		case "safety.disable_seed":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("safety.disable_seed must be true or false, got %q", value)
+			}
+			cfg.Safety.DisableSeed = v
+			return nil
+		case "tui.max_content_width":
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("tui.max_content_width must be a non-negative integer (0 = full width), got %q", value)
+			}
+			cfg.TUI.MaxContentWidth = v
+			return nil
+		case "tui.theme":
+			// `config set` rejects unknown names with the valid list (the
+			// CR-033 "pick ONE behavior" choice); a hand-edited config.toml
+			// still degrades gracefully at render time (AR-030).
+			t := strings.ToLower(strings.TrimSpace(value))
+			if t == "" {
+				cfg.TUI.Theme = ""
+				return nil
+			}
+			for _, name := range config.ValidThemes {
+				if t == name {
+					cfg.TUI.Theme = t
+					return nil
+				}
+			}
+			return fmt.Errorf("tui.theme must be one of %s, got %q",
+				strings.Join(config.ValidThemes, ", "), value)
 		}
 		return fmt.Errorf("unknown config field %q", key)
 	})

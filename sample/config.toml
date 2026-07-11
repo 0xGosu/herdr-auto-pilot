@@ -81,6 +81,19 @@ gpu_layers = 0              # inert in official builds (Metal/Vulkan compiled ou
 # ── TUI ─────────────────────────────────────────────────────────────
 [tui]
 max_content_width = 0      # cap on variable-length list columns; 0 = full terminal width
+theme = ""                 # named palette: default | dark | light | high-contrast;
+                           # empty/unknown = default (the original look)
+
+# Optional per-role color overrides layered on the selected theme; unset
+# roles inherit the theme. Values are terminal colors ("205", "#ff5faf").
+# [tui.palette]
+# title = "205"
+# section = "117"
+# error = "196"
+# ok = "46"
+# paused = "196"
+# running = "46"
+# help = ""
 
 # ── Declared task lists for idle agents (repeatable) ────────────────
 # Without a declared source, the plugin falls back to inferring the next
