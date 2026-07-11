@@ -1,7 +1,7 @@
 # Herd Auto Prompter — Herdr plugin manifest (IR-004)
 id = "herd-auto-prompter"
 name = "Herd Auto Prompter"
-version = "0.3.2"
+version = "0.3.3"
 description = "Monitors every agent in the herd, auto-supplies the next prompt or response when confident, and escalates to you when not — learned from your own past decisions."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
