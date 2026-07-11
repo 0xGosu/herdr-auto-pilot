@@ -101,39 +101,48 @@ with a ticket/issue id**. Examples from history:
 
 ## Version bump & release
 
-Releases are **tag-driven**: merging a PR does NOT create a release.
-`.github/workflows/release.yml` fires on a `v*.*.*` tag push, runs the full
-CI gate, then builds on THREE native runners (CGO cannot cross-compile; Intel
-macOS is deliberately unsupported):
-`hap-{linux-amd64,linux-arm64,darwin-arm64}` (llama.cpp statically
-linked in), a
-`hap-native-<os>-<arch>.tar.gz` per platform (FAISS shared libs, plus
-libomp on macOS, rpath'd to `<plugin>/lib`), the
-`all-minilm-l6-v2-q8_0.gguf` embedding model fetched from Hugging Face
-(sha256-pinned), and `SHA256SUMS`; then publishes the GitHub Release.
-`install.sh` treats the binary and native tarball as REQUIRED and the model
-as optional (BM25 fallback).
+Releases are **automated on merge to main** with a pre-bump model
+(`.github/workflows/auto-release.yml`); `version` in `herdr-plugin.toml`
+is the single source of truth and is kept one patch AHEAD of the newest
+tag:
 
-The invariant: **`version` in `herdr-plugin.toml` and the git tag MUST
-match.** `scripts/install.sh` downloads the release asset named by the
-manifest version, so a bumped manifest without its release breaks fresh
-installs — push the tag immediately after the bump lands.
+- **Patch (the default)** — just merge your feature PR. The workflow finds
+  the manifest version untagged (staged by the previous cycle's auto-merged
+  "pre-bump" PR), tags it with the owner's `RELEASE_PAT`, and that tag
+  fires the standard tag-driven `release.yml`. Afterwards the workflow
+  auto-merges the next pre-bump PR (`release/bump-vX.Y.Z+1`, commit marked
+  `[skip ci]` so CI ignores it). Never bump the manifest for patch work.
+- **Minor/major (the reserved manual path)** — overwrite the pre-bumped
+  `version` in `herdr-plugin.toml` INSIDE your feature PR (e.g. `0.4.0`);
+  on merge that exact version is tagged and released, then the pre-bump
+  re-arms at its patch+1.
+- Doc/workflow-only pushes (`**.md`, `docs/**`, `.github/**`) and merge
+  commits containing `[skip release]` do not release. Hand-pushing a
+  `v*.*.*` tag still works (release.yml is unchanged and tag-driven).
+- If a merge ever finds the manifest already tagged (bootstrap/recovery),
+  the workflow merges the pre-bump first, tags the bump commit, and
+  re-arms — self-healing, no manual step.
+- If the release BUILD fails after the tag exists, re-run the failed
+  release.yml run; do not re-run auto-release (it would advance versions).
 
-Standard flow (SemVer):
+`release.yml` (tag-driven, unchanged) runs the full CI gate, then builds
+on THREE native runners (CGO cannot cross-compile; Intel macOS is
+deliberately unsupported): `hap-{linux-amd64,linux-arm64,darwin-arm64}`
+(llama.cpp statically linked in), a `hap-native-<os>-<arch>.tar.gz` per
+platform (FAISS shared libs, plus libomp on macOS, rpath'd to
+`<plugin>/lib`), the `all-minilm-l6-v2-q8_0.gguf` embedding model fetched
+from Hugging Face (sha256-pinned), and `SHA256SUMS`; then publishes the
+GitHub Release. `install.sh` treats the binary and native tarball as
+REQUIRED and the model as optional (BM25 fallback).
 
-```sh
-# 1. On the feature branch (or right after merge), bump the manifest:
-#    herdr-plugin.toml: version = "X.Y.Z"
-git commit -m "#<issue> chore: bump plugin version to X.Y.Z"
+The invariant: **the tagged commit's `herdr-plugin.toml` version and the
+git tag MUST match** — the automation preserves it by construction (the
+tag always lands on a commit whose manifest carries exactly that
+version). `scripts/install.sh` downloads the release asset named by the
+manifest version.
 
-# 2. After the PR merges, tag the merge commit and push the tag:
-git pull --ff-only
-git tag vX.Y.Z <merge-commit>
-git push origin vX.Y.Z
-
-# 3. Verify: gh run watch <release-run-id> --exit-status
-#            gh release view vX.Y.Z   # expect 4 binaries + SHA256SUMS
-```
+Verify after any release: `gh release view vX.Y.Z` — expect 3 binaries,
+3 native tarballs, the model, and SHA256SUMS.
 
 - `internal/buildinfo.Version` is stamped by the release build via ldflags —
   never edit it by hand.
