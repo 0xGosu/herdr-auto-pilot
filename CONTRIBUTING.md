@@ -32,7 +32,7 @@ cmake, a one-time native-deps build, and the `vectors cpu` build tags:
 bash scripts/setup-native.sh                 # one-time: submodules, llama-go libs, FAISS
 go build -tags "vectors cpu" ./...           # full build (CGO)
 go test -tags "vectors cpu" ./... -count=1   # full suite: unit, golden, safety, concurrency, semantic
-gofmt -l . | grep -v third_party ; go vet -tags "vectors cpu" ./...
+gofmt -l . | grep -v submodule ; go vet -tags "vectors cpu" ./...
 golangci-lint run --build-tags "vectors,cpu" # lint (CI runs this too)
 ```
 

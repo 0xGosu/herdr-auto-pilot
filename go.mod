@@ -66,4 +66,4 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace github.com/tcpipuk/llama-go => ./third_party/llama-go
+replace github.com/tcpipuk/llama-go => ./submodule/github.com/seed-hypermedia/llama-go

@@ -2,7 +2,7 @@
 # Build and install the native libraries hap needs since the semantic
 # signature matcher landed:
 #
-#   - libbinding.a + static llama.cpp archives from third_party/llama-go
+#   - libbinding.a + static llama.cpp archives from submodule/github.com/seed-hypermedia/llama-go
 #     (llama.cpp embeddings; BUILD_SHARED_LIBS=OFF so the hap binary links
 #     them statically — no llama/ggml runtime libraries to ship)
 #   - libfaiss_c + libfaiss shared libs from the blevesearch FAISS fork
@@ -60,8 +60,8 @@ elif [ "$OS" = "Darwin" ]; then
 fi
 
 echo "==> submodules (llama-go + shallow llama.cpp)"
-git submodule update --init third_party/llama-go
-git -C third_party/llama-go submodule update --init --depth 1 llama.cpp
+git submodule update --init submodule/github.com/seed-hypermedia/llama-go
+git -C submodule/github.com/seed-hypermedia/llama-go submodule update --init --depth 1 llama.cpp
 
 echo "==> llama-go static binding (CPU only, static archives)"
 # BUILD_SHARED_LIBS=OFF makes the Makefile copy .a archives — the shared
@@ -70,16 +70,16 @@ echo "==> llama-go static binding (CPU only, static archives)"
 LLAMA_CMAKE_ARGS="-DBUILD_SHARED_LIBS=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF"
 # The llama-go Makefile only invalidates its cmake cache on GPU-flag
 # mismatches, not shared/static — wipe a build configured for shared libs.
-if [ -f third_party/llama-go/build/CMakeCache.txt ] &&
-  ! grep -q "BUILD_SHARED_LIBS:BOOL=OFF" third_party/llama-go/build/CMakeCache.txt; then
+if [ -f submodule/github.com/seed-hypermedia/llama-go/build/CMakeCache.txt ] &&
+  ! grep -q "BUILD_SHARED_LIBS:BOOL=OFF" submodule/github.com/seed-hypermedia/llama-go/build/CMakeCache.txt; then
   echo "    (wiping shared-lib cmake cache)"
-  rm -rf third_party/llama-go/build third_party/llama-go/llama.cpp/*.o \
-    third_party/llama-go/*.o third_party/llama-go/*.a \
-    third_party/llama-go/*.so third_party/llama-go/*.dylib
+  rm -rf submodule/github.com/seed-hypermedia/llama-go/build submodule/github.com/seed-hypermedia/llama-go/llama.cpp/*.o \
+    submodule/github.com/seed-hypermedia/llama-go/*.o submodule/github.com/seed-hypermedia/llama-go/*.a \
+    submodule/github.com/seed-hypermedia/llama-go/*.so submodule/github.com/seed-hypermedia/llama-go/*.dylib
 fi
-if [ ! -f third_party/llama-go/libbinding.a ] || [ ! -f third_party/llama-go/libllama.a ]; then
-  rm -f third_party/llama-go/*.a third_party/llama-go/*.so third_party/llama-go/*.dylib
-  CMAKE_ARGS="${LLAMA_CMAKE_ARGS}" make -C third_party/llama-go libbinding.a -j"${JOBS}"
+if [ ! -f submodule/github.com/seed-hypermedia/llama-go/libbinding.a ] || [ ! -f submodule/github.com/seed-hypermedia/llama-go/libllama.a ]; then
+  rm -f submodule/github.com/seed-hypermedia/llama-go/*.a submodule/github.com/seed-hypermedia/llama-go/*.so submodule/github.com/seed-hypermedia/llama-go/*.dylib
+  CMAKE_ARGS="${LLAMA_CMAKE_ARGS}" make -C submodule/github.com/seed-hypermedia/llama-go libbinding.a -j"${JOBS}"
 fi
 
 echo "==> FAISS (blevesearch fork @ ${FAISS_COMMIT:0:7})"
