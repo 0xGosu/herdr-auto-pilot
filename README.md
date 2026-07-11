@@ -112,10 +112,13 @@ The plugin never acts on a situation it hasn't learned from you.
    same. From the CLI: `confirm <id> --send` or
    `resolve <id> --action TEXT --send`. Escalations you don't want to
    answer can be **deleted**: `space` marks one or more rows, `x` deletes
-   the marked (or selected) ones, and `X` prunes everything older than an
-   age you pick (default 360 minutes). Deleting dismisses without
-   responding — the audit row is kept as `dismissed`, nothing is sent or
-   learned. CLI: `dismiss <id>...` and `escalations prune [minutes]`.
+   the marked (or selected) ones right away (no confirmation — dismissing
+   is safe, nothing is sent or learned), and `X` prunes everything older
+   than an age you pick (default 360 minutes). Deleting dismisses without
+   responding — the audit row is kept as `dismissed`. Deleting a learned
+   rule still asks for confirmation, and audit entries can't be deleted
+   individually (only the full clear-data reset removes them). CLI:
+   `dismiss <id>...` and `escalations prune [minutes]`.
 3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
    *and* confidence above the per-situation threshold, that signature becomes
    autonomous: next time, the plugin acts on its own and logs it.
