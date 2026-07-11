@@ -26,20 +26,20 @@ jobs:
           cache: true
       - name: Native cache key (submodule commit)
         id: subsha
-        run: echo "sha=$(git submodule status third_party/llama-go | awk '{print substr($1,1,12)}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git submodule status submodule/github.com/seed-hypermedia/llama-go | awk '{print substr($1,1,12)}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
       - name: Cache native builds
         uses: actions/cache@v4
         with:
           path: |
             .cache/native
-            third_party/llama-go/*.a
-            third_party/llama-go/llama.cpp/**/*.o
+            submodule/github.com/seed-hypermedia/llama-go/*.a
+            submodule/github.com/seed-hypermedia/llama-go/llama.cpp/**/*.o
           key: native-lint-${{ runner.os }}-${{ env.ImageOS }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
       - name: Build native dependencies
         run: bash scripts/setup-native.sh
       - name: gofmt
         run: |
-          out=$(gofmt -l . | grep -v '^third_party/' || true)
+          out=$(gofmt -l . | grep -v '^submodule/' || true)
           if [ -n "$out" ]; then
             echo "gofmt violations:" && echo "$out" && exit 1
           fi
@@ -69,14 +69,14 @@ jobs:
           cache: true
       - name: Native cache key (submodule commit)
         id: subsha
-        run: echo "sha=$(git submodule status third_party/llama-go | awk '{print substr($1,1,12)}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git submodule status submodule/github.com/seed-hypermedia/llama-go | awk '{print substr($1,1,12)}' | tr -d '+-')" >> "$GITHUB_OUTPUT"
       - name: Cache native builds
         uses: actions/cache@v4
         with:
           path: |
             .cache/native
-            third_party/llama-go/*.a
-            third_party/llama-go/llama.cpp/**/*.o
+            submodule/github.com/seed-hypermedia/llama-go/*.a
+            submodule/github.com/seed-hypermedia/llama-go/llama.cpp/**/*.o
           key: native-test-${{ matrix.os }}-${{ env.ImageOS }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
       - name: Build native dependencies
         run: bash scripts/setup-native.sh

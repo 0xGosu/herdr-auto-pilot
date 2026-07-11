@@ -16,7 +16,7 @@ native deps once** and the `vectors cpu` build tags always:
 bash scripts/setup-native.sh                   # one-time: submodules + llama-go libs + FAISS → /usr/local/lib
 go build -tags "vectors cpu" ./...             # CGO; needs a C/C++ toolchain
 go test -tags "vectors cpu" ./... -count=1     # full unit/golden/safety/semantic suite (what CI runs)
-gofmt -l . | grep -v third_party && go vet -tags "vectors cpu" ./...
+gofmt -l . | grep -v submodule && go vet -tags "vectors cpu" ./...
 golangci-lint run --build-tags "vectors,cpu"   # CI runs this too
 ```
 
