@@ -10,14 +10,18 @@ name: Auto Release
 #   tag and release exactly the manifest version, no bump PR.
 #
 # The manifest/tag invariant (version in herdr-plugin.toml == git tag) holds
-# by construction. No loops: the squashed bump commit lands on main with
-# [skip ci], which suppresses every push-triggered workflow — including this
-# one — regardless of which token merged it. The release build is invoked
-# via workflow_call from THIS run (triggered by the original merge), so the
-# skip marker never suppresses the build. Doc/workflow-only pushes don't
-# trigger (paths-ignore) and [skip release] in the merge commit opts out.
-# The old manual path — pushing a v*.*.* tag by hand — still works via
-# release.yml's tag trigger.
+# by construction and is asserted before tagging. No loops: the squashed
+# bump commit lands on main with [skip ci], which suppresses every
+# push-triggered workflow — including this one — regardless of which token
+# merged it. The release build is invoked via workflow_call from THIS run
+# (triggered by the original merge), so the skip marker never suppresses
+# the build. Doc/workflow-only pushes don't trigger (paths-ignore) and
+# [skip release] in the merge commit opts out. The old manual path —
+# pushing a v*.*.* tag by hand — still works via release.yml's tag trigger.
+#
+# Recovery: if the BUILD fails after the tag exists, use "Re-run failed
+# jobs" (the version outputs are reused). "Re-run all jobs" would resolve
+# and bump AGAIN — don't.
 on:
   push:
     branches: [main]
@@ -29,8 +33,10 @@ on:
 permissions:
   contents: write
 
-# Serialize runs: a second merge landing mid-release waits, then resolves
-# its version from the (by then bumped) latest main.
+# One run executes, at most one waits; further merges arriving meanwhile
+# replace the waiting run (its push is still released — the run that
+# eventually executes resolves from LATEST main, so a "canceled" run here
+# means "absorbed by the next release", not a failure).
 concurrency:
   group: auto-release
   cancel-in-progress: false
@@ -41,6 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
     outputs:
+      proceed: ${{ steps.resolve.outputs.proceed }}
       version: ${{ steps.resolve.outputs.version }}
       ref: ${{ steps.resolve.outputs.ref }}
     steps:
@@ -64,6 +71,15 @@ jobs:
           [ -n "$CURRENT" ] || { echo "::error::no version in herdr-plugin.toml"; exit 1; }
 
           if git rev-parse -q --verify "refs/tags/v${CURRENT}" >/dev/null; then
+            # A queued run whose triggering merge was already absorbed by
+            # the previous release finds HEAD == the released commit:
+            # nothing new to release.
+            if [ "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/v${CURRENT}^{commit}")" ]; then
+              echo "main is already released as v${CURRENT}; nothing to do"
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
             # Ordinary merge: the manifest version is already released, so
             # this push earns a patch bump — via a PR merged with the
             # owner's token, per repo convention (never commit to main).
@@ -74,24 +90,45 @@ jobs:
               echo "::error::tag v${NEXT} already exists but the manifest says ${CURRENT}; fix the manifest manually"
               exit 1
             fi
+
             BRANCH="release/bump-v${NEXT}"
-            git checkout -b "${BRANCH}"
+            git checkout -B "${BRANCH}"
             sed -i "s/^version = \"${CURRENT}\"/version = \"${NEXT}\"/" herdr-plugin.toml
             git commit -am "#1 chore: bump plugin version to ${NEXT} [skip ci]"
-            git push origin "HEAD:${BRANCH}"
-            gh pr create --base main --head "${BRANCH}" \
-              --title "#1 chore: bump plugin version to ${NEXT} [skip ci]" \
-              --body "Automated patch bump for the release of v${NEXT} (triggered by ${GITHUB_SHA}). CI is skipped on this PR; the release build runs in the Auto Release workflow."
-            # Mergeability computation can lag a freshly opened PR briefly.
+            # Force-push: the branch is bot-owned and may hold the remains
+            # of a previously failed run — self-heal, don't wedge.
+            git push --force origin "HEAD:${BRANCH}"
+
+            # Idempotent PR: reuse an open bump PR left by a failed run.
+            PR=$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number' || true)
+            if [ -z "${PR}" ]; then
+              gh pr create --base main --head "${BRANCH}" \
+                --title "#1 chore: bump plugin version to ${NEXT} [skip ci]" \
+                --body "Automated patch bump for the release of v${NEXT} (triggered by ${GITHUB_SHA}). CI is skipped on this PR; the release build runs in the Auto Release workflow."
+            fi
+
+            # Merge. gh pr merge can exit non-zero AFTER the squash landed
+            # (e.g. a branch-deletion race), so treat MERGED as success.
             for i in 1 2 3 4 5; do
-              gh pr merge "${BRANCH}" --squash --admin --delete-branch \
+              if gh pr merge "${BRANCH}" --squash --admin --delete-branch \
                 --subject "#1 chore: bump plugin version to ${NEXT} [skip ci]" \
-                --body "Automated patch bump for v${NEXT}." && break
-              [ "$i" = 5 ] && { echo "::error::could not merge the bump PR"; exit 1; }
+                --body "Automated patch bump for v${NEXT}."; then
+                break
+              fi
+              STATE=$(gh pr view "${BRANCH}" --json state --jq .state 2>/dev/null || echo "")
+              [ "${STATE}" = "MERGED" ] && break
+              if [ "$i" = 5 ]; then
+                echo "::error::could not merge the bump PR (state: ${STATE:-unknown})"
+                exit 1
+              fi
               sleep 5
             done
+
             git fetch origin main
             git checkout -B main origin/main
+            # The invariant, asserted: the refetched main must carry NEXT.
+            grep -q "^version = \"${NEXT}\"" herdr-plugin.toml || {
+              echo "::error::main does not carry version ${NEXT} after the bump merge"; exit 1; }
             VERSION="$NEXT"
           else
             # Manual major/minor bump just merged: release it as-is.
@@ -103,12 +140,14 @@ jobs:
           # stays quiet — the build below is invoked directly instead.
           git tag "v${VERSION}"
           git push origin "v${VERSION}"
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
           echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   release:
     name: Build & publish
     needs: version
+    if: ${{ needs.version.outputs.proceed == 'true' }}
     uses: ./.github/workflows/release.yml
     with:
       version: ${{ needs.version.outputs.version }}
