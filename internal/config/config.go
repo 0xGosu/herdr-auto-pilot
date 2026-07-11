@@ -1,11 +1,12 @@
 // Package config loads and reloads the operator-editable TOML configuration
-// (DR-003): thresholds, graduation N, retry/rate ceilings, allowlist
+// (DR-003): thresholds, graduation N, retry/rate ceilings, never-auto
 // patterns, classifier manifests, task sources, and LLM CLI settings.
 package config
 
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -28,12 +29,18 @@ type Learning struct {
 	GraduationN int `toml:"graduation_n"`
 }
 
-// Safety holds the never-auto allowlist and heuristic configuration (FR-015/016).
+// Safety holds the never-auto patterns and heuristic configuration (FR-015/016).
 type Safety struct {
-	// AllowlistPatterns are operator-added regex patterns matched against
-	// prompt/pane content; matches always escalate.
-	AllowlistPatterns []string `toml:"allowlist_patterns"`
-	// DisableSeed disables the shipped seed allowlist (not recommended).
+	// NeverAutoPatterns are operator-added regex patterns matched against
+	// prompt/pane content; a match means the operation may NEVER be
+	// automated — it always escalates.
+	NeverAutoPatterns []string `toml:"never_auto_patterns"`
+	// DeprecatedAllowlistPatterns is the pre-rename key for
+	// NeverAutoPatterns. Load merges it (with a warning) and clears it, so
+	// any Save rewrites the file under the new key. Decode-only.
+	DeprecatedAllowlistPatterns []string `toml:"allowlist_patterns"`
+	// DisableSeed disables the shipped seed never-auto patterns (not
+	// recommended).
 	DisableSeed bool `toml:"disable_seed"`
 	// IrreversibleIndicators extends the suspected-irreversible heuristic
 	// for every agent type. Use IndicatorRules to scope a pattern to a
@@ -281,6 +288,27 @@ func Load(path string) (Config, error) {
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return Default(), fmt.Errorf("parse config %s: %w", path, err)
 	}
+	// Deprecated `allowlist_patterns` alias: merge into never_auto_patterns
+	// (dedupe) and clear, so a later Save migrates the file to the new key
+	// (Save re-encodes the whole struct from toml tags).
+	if len(cfg.Safety.DeprecatedAllowlistPatterns) > 0 {
+		slog.Warn("config key `allowlist_patterns` is deprecated; use `never_auto_patterns` (patterns merged)",
+			"path", path)
+		seen := make(map[string]bool, len(cfg.Safety.NeverAutoPatterns))
+		for _, p := range cfg.Safety.NeverAutoPatterns {
+			seen[p] = true
+		}
+		for _, p := range cfg.Safety.DeprecatedAllowlistPatterns {
+			if !seen[p] {
+				cfg.Safety.NeverAutoPatterns = append(cfg.Safety.NeverAutoPatterns, p)
+				seen[p] = true
+			}
+		}
+	}
+	// Always cleared, even when empty (`allowlist_patterns = []` decodes to
+	// a non-nil slice): the encoder skips only nil fields, so anything left
+	// here would be re-emitted under the deprecated key on every Save.
+	cfg.Safety.DeprecatedAllowlistPatterns = nil
 	cfg.fillZeroes()
 	return cfg, nil
 }

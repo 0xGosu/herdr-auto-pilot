@@ -97,7 +97,7 @@ const (
 	ReasonBelowThreshold       EscalateReason = "below_threshold"
 	ReasonVarianceGuard        EscalateReason = "variance_guard"
 	ReasonOverMasked           EscalateReason = "over_masked"
-	ReasonAllowlistMatch       EscalateReason = "allowlist_match"
+	ReasonNeverAutoMatch       EscalateReason = "never_auto_match"
 	ReasonSuspectedIrrevers    EscalateReason = "suspected_irreversible"
 	ReasonRateLimited          EscalateReason = "rate_limited"
 	ReasonRetryExhausted       EscalateReason = "retry_exhausted"
@@ -182,7 +182,7 @@ type AuditRecord struct {
 	Rationale       string
 	LLMOutput       string
 	CorrectsAuditID int64
-	Status          string // "auto" | "escalated" | "resolved"
+	Status          string // "auto" | "escalated" | "resolved" | "dismissed"
 	Suggestion      string
 	CreatedAt       time.Time
 }

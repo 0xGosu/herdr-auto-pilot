@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,7 +77,7 @@ func TestSaveRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	cfg := Default()
 	cfg.Thresholds.Choice = 0.88
-	cfg.Safety.AllowlistPatterns = []string{`(?i)restart\s+prod`}
+	cfg.Safety.NeverAutoPatterns = []string{`(?i)restart\s+prod`}
 	cfg.TaskSources = []TaskSource{{Agent: "a1", Path: "/tmp/tasks.md", NextTaskTemplate: "Do {next_task_content} from {task_list_path}"}}
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
@@ -85,7 +86,7 @@ func TestSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Thresholds.Choice != 0.88 || len(got.Safety.AllowlistPatterns) != 1 || len(got.TaskSources) != 1 {
+	if got.Thresholds.Choice != 0.88 || len(got.Safety.NeverAutoPatterns) != 1 || len(got.TaskSources) != 1 {
 		t.Errorf("round trip mismatch: %+v", got)
 	}
 	if got.TaskSources[0].NextTaskTemplate != "Do {next_task_content} from {task_list_path}" {
@@ -426,5 +427,86 @@ func TestEmbeddingDefaultsAndOverride(t *testing.T) {
 	if cfg.Embedding.SimilarityThreshold != 0.90 || cfg.Embedding.BM25MinScore != 0.35 ||
 		cfg.Embedding.GPULayers != 0 {
 		t.Errorf("out-of-range embedding values should restore defaults: %+v", cfg.Embedding)
+	}
+}
+
+func TestDeprecatedAllowlistPatternsAliasMerges(t *testing.T) {
+	// Pre-rename configs keep working: `allowlist_patterns` loads into
+	// NeverAutoPatterns (deduped against the new key) and is cleared, so a
+	// later Save migrates the file to `never_auto_patterns` only.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	toml := `[safety]
+never_auto_patterns = ['keep-me', 'both-keys']
+allowlist_patterns = ['legacy-only', 'both-keys']
+`
+	if err := os.WriteFile(path, []byte(toml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"keep-me", "both-keys", "legacy-only"}
+	if len(cfg.Safety.NeverAutoPatterns) != len(want) {
+		t.Fatalf("merged patterns = %v, want %v", cfg.Safety.NeverAutoPatterns, want)
+	}
+	for i, p := range want {
+		if cfg.Safety.NeverAutoPatterns[i] != p {
+			t.Errorf("pattern[%d] = %q, want %q", i, cfg.Safety.NeverAutoPatterns[i], p)
+		}
+	}
+	if cfg.Safety.DeprecatedAllowlistPatterns != nil {
+		t.Error("deprecated field must be cleared after the merge")
+	}
+
+	// Save migrates the file: new key present, old key gone.
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), "never_auto_patterns") {
+		t.Error("saved config must use never_auto_patterns")
+	}
+	if strings.Contains(string(data), "allowlist_patterns") {
+		t.Errorf("saved config must not re-emit the deprecated key:\n%s", data)
+	}
+}
+
+func TestDeprecatedAllowlistPatternsOnlyKeyStillLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	toml := "[safety]\nallowlist_patterns = ['legacy']\n"
+	if err := os.WriteFile(path, []byte(toml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Safety.NeverAutoPatterns) != 1 || cfg.Safety.NeverAutoPatterns[0] != "legacy" {
+		t.Fatalf("legacy-only config must load patterns, got %v", cfg.Safety.NeverAutoPatterns)
+	}
+}
+
+func TestDeprecatedAllowlistPatternsEmptySliceMigrates(t *testing.T) {
+	// `allowlist_patterns = []` (the old sample config) decodes to a
+	// non-nil empty slice; it must still be cleared so Save never re-emits
+	// the deprecated key.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[safety]\nallowlist_patterns = []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Safety.DeprecatedAllowlistPatterns != nil {
+		t.Error("empty deprecated slice must be cleared on load")
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	if strings.Contains(string(data), "allowlist_patterns") {
+		t.Errorf("saved config must not re-emit the deprecated key:\n%s", data)
 	}
 }

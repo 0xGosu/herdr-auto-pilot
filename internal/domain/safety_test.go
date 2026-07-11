@@ -8,20 +8,20 @@ import (
 	"time"
 )
 
-func newSeedAllowlist(t *testing.T) *Allowlist {
+func newSeedNeverAuto(t *testing.T) *NeverAutoList {
 	t.Helper()
-	a, errs := NewAllowlist(true, nil, nil)
+	a, errs := NewNeverAutoList(true, nil, nil)
 	if len(errs) > 0 {
 		t.Fatalf("seed allowlist failed to compile: %v", errs)
 	}
 	return a
 }
 
-// TestSeedAllowlistCatchesCorpus is the CI regression gate (NFR-005a):
+// TestSeedNeverAutoCatchesCorpus is the CI regression gate (NFR-005a):
 // 100% of the irreversible-op corpus must be matched by seed patterns.
 // A corpus miss fails the build.
-func TestSeedAllowlistCatchesCorpus(t *testing.T) {
-	a := newSeedAllowlist(t)
+func TestSeedNeverAutoCatchesCorpus(t *testing.T) {
+	a := newSeedNeverAuto(t)
 
 	f, err := os.Open("testdata/irreversible_corpus.txt")
 	if err != nil {
@@ -51,8 +51,8 @@ func TestSeedAllowlistCatchesCorpus(t *testing.T) {
 	t.Logf("allowlist corpus: %d/%d matched", total-missed, total)
 }
 
-func TestAllowlistDoesNotMatchBenignPrompts(t *testing.T) {
-	a := newSeedAllowlist(t)
+func TestNeverAutoDoesNotMatchBenignPrompts(t *testing.T) {
+	a := newSeedNeverAuto(t)
 	benign := []string{
 		"Do you want to run the unit test suite now?",
 		"Allow reading the file src/main.go?",
@@ -71,7 +71,7 @@ func TestAllowlistDoesNotMatchBenignPrompts(t *testing.T) {
 }
 
 func TestOperatorPatternsExtendSeed(t *testing.T) {
-	a, errs := NewAllowlist(true, []string{`(?i)restart\s+the\s+payment\s+service`}, nil)
+	a, errs := NewNeverAutoList(true, []string{`(?i)restart\s+the\s+payment\s+service`}, nil)
 	if len(errs) > 0 {
 		t.Fatalf("compile: %v", errs)
 	}
@@ -81,14 +81,14 @@ func TestOperatorPatternsExtendSeed(t *testing.T) {
 }
 
 func TestInvalidOperatorPatternReported(t *testing.T) {
-	_, errs := NewAllowlist(true, []string{`([unclosed`}, nil)
+	_, errs := NewNeverAutoList(true, []string{`([unclosed`}, nil)
 	if len(errs) == 0 {
 		t.Error("invalid pattern must be reported")
 	}
 }
 
 func TestSuspectedIrreversibleHeuristic(t *testing.T) {
-	a := newSeedAllowlist(t)
+	a := newSeedNeverAuto(t)
 	suspicious := []string{
 		"This will permanently erase the workspace metadata. Continue?",
 		"Overwrite the existing changes and discard local work?",
@@ -138,7 +138,7 @@ func TestSuspectedIrreversibleHeuristic(t *testing.T) {
 }
 
 func TestSuspectedIrreversibleReportsHit(t *testing.T) {
-	a := newSeedAllowlist(t)
+	a := newSeedNeverAuto(t)
 	hit, ok := a.SuspectedIrreversible("claude", "This wipes   the\ndatabase for every tenant.")
 	if !ok {
 		t.Fatal("expected a heuristic hit")
@@ -155,7 +155,7 @@ func TestSuspectedIrreversibleIgnoresDistantNarration(t *testing.T) {
 	// Regression for the agy false-positive: a destructive verb and a data
 	// target separated by more than one line break is conversation about an
 	// operation, not a pending one.
-	a := newSeedAllowlist(t)
+	a := newSeedNeverAuto(t)
 	narration := "The summarizer described deleting entries yesterday.\n" +
 		"That indicator needs corroboration to fire.\n" +
 		"All databases stay healthy and untouched."
@@ -178,7 +178,7 @@ func TestSuspectedIrreversibleIgnoresDistantNarration(t *testing.T) {
 func TestEmptyMatchableIndicatorStillFires(t *testing.T) {
 	// A misconfigured operator pattern that can match the empty string must
 	// fire (noisy-safe), not silently disable itself.
-	a, errs := NewAllowlist(false, nil, []IndicatorRule{{Pattern: `(?i)(drop prod)?`}})
+	a, errs := NewNeverAutoList(false, nil, []IndicatorRule{{Pattern: `(?i)(drop prod)?`}})
 	if len(errs) > 0 {
 		t.Fatalf("compile: %v", errs)
 	}
@@ -192,7 +192,7 @@ func TestAgentScopedIndicators(t *testing.T) {
 		{Pattern: `(?i)compact\s+the\s+conversation`, Agents: []string{"codex", "agy"}},
 		{Pattern: `(?i)squash\s+the\s+timeline`, Agents: []string{"*"}},
 	}
-	a, errs := NewAllowlist(false, nil, rules)
+	a, errs := NewNeverAutoList(false, nil, rules)
 	if len(errs) > 0 {
 		t.Fatalf("compile: %v", errs)
 	}
@@ -210,7 +210,7 @@ func TestAgentScopedIndicators(t *testing.T) {
 
 	// Sloppy scope entries fail noisy, not silently dead: a padded "*" is
 	// still a wildcard and a blank entry is treated as one.
-	padded, errs := NewAllowlist(false, nil, []IndicatorRule{
+	padded, errs := NewNeverAutoList(false, nil, []IndicatorRule{
 		{Pattern: `(?i)compact\s+the\s+conversation`, Agents: []string{" * "}},
 		{Pattern: `(?i)squash\s+the\s+timeline`, Agents: []string{""}},
 	})
@@ -233,7 +233,7 @@ func TestAgentScopedIndicators(t *testing.T) {
 }
 
 func TestSeedIndicatorsApplyToAllAgents(t *testing.T) {
-	a := newSeedAllowlist(t)
+	a := newSeedNeverAuto(t)
 	for _, agent := range []string{"claude", "codex", "agy", "unknown", ""} {
 		if _, ok := a.SuspectedIrreversible(agent, "This action cannot be undone."); !ok {
 			t.Errorf("seed indicators must apply to agent %q", agent)

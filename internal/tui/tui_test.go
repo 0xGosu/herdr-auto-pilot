@@ -341,9 +341,11 @@ func appModel(t *testing.T) (Model, *frontend.App, *store.Store) {
 	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:deadbeef00112233",
 		Trigger: "apply?", SituationType: domain.SituationApproval, Action: "escalated",
 		Rationale: "shadow mode suggestion", Status: "escalated", CreatedAt: now})
+	st.SaveSignatureSnapshot(ctx, "approval:deadbeef00112233",
+		"Bash(kubectl apply -f deploy.yaml)\nDo you want to proceed?", now)
 
 	m := New(ctx, app)
-	m.width, m.height = 100, 30
+	m.width, m.height = 100, 44
 	upd, _ := m.Update(refreshData(ctx, app))
 	m = upd.(Model)
 	m.tab = tabSignatures
@@ -408,7 +410,8 @@ func TestSignatureDetailOverlay(t *testing.T) {
 		t.Fatal("sigDetailMsg should open the detail overlay")
 	}
 	view := m.View()
-	for _, want := range []string{"approval:deadbeef00112233", "Streak", "Recent decisions", "shadow mode suggestion"} {
+	for _, want := range []string{"approval:deadbeef00112233", "Streak", "Original situation",
+		"kubectl apply -f deploy.yaml", "Recent decisions", "shadow mode suggestion"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("signature detail missing %q:\n%s", want, view)
 		}
@@ -508,13 +511,19 @@ func TestMaxContentWidthCapsRows(t *testing.T) {
 	m.data.cfg.TUI.MaxContentWidth = 90
 	m.tab = tabEscalations
 	v := m.View()
+	rows := 0
 	for _, ln := range strings.Split(v, "\n") {
-		if !strings.HasPrefix(ln, "#") {
-			continue // data rows only, not the static help/header lines
+		// Data rows start with "#", behind the Escalations tab's mark cell.
+		if !strings.HasPrefix(strings.TrimLeft(ln, " ✓"), "#") {
+			continue // not the static help/header lines
 		}
+		rows++
 		if n := len([]rune(ln)); n > 100 { // 90 cap + small prefix slack
 			t.Errorf("row exceeds the configured cap: %d cells: %q", n, ln)
 		}
+	}
+	if rows == 0 {
+		t.Fatalf("no data rows matched — filter broken?\n%s", v)
 	}
 }
 
@@ -658,6 +667,157 @@ func TestEscalationDetailEnterConfirmsSnapshotNotClampedCursor(t *testing.T) {
 		t.Errorf("should deliver B's suggestion, got %v", h.sent)
 	}
 	_ = idA
+}
+
+// escalationsModel builds an app-backed model on the Escalations tab with
+// two pending escalations. The list orders newest-first BY ID, so the
+// 7-hour-old row (appended second) is the cursor row; appModel's fresh row
+// (created now) sits below it. Returns (model, app, store, oldID, freshID).
+func escalationsModel(t *testing.T) (Model, *frontend.App, *store.Store, int64, int64) {
+	t.Helper()
+	m, app, st := appModel(t) // seeds one escalation, created now
+	ctx := context.Background()
+	oldID, err := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p2", SituationType: domain.SituationChoice, Trigger: "pick one",
+		Action: "escalated", Status: "escalated", CreatedAt: time.Now().Add(-7 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabEscalations
+	m.cursor = 0
+	esc := m.data.escalations
+	if len(esc) != 2 || esc[0].ID != oldID {
+		t.Fatalf("expected the old escalation #%d on top of 2 pending, got %+v", oldID, esc)
+	}
+	return m, app, st, oldID, esc[1].ID
+}
+
+func TestEscalationMarkToggleAndRender(t *testing.T) {
+	m, _, _, oldID, freshID := escalationsModel(t)
+
+	// Space marks the cursor row (the old escalation on top) and advances.
+	m = press(t, m, " ")
+	if !m.marked[oldID] || m.cursor != 1 {
+		t.Fatalf("space should mark #%d and advance, got marked=%v cursor=%d", oldID, m.marked, m.cursor)
+	}
+	if !strings.Contains(m.View(), "✓") {
+		t.Errorf("marked row should render the ✓ marker:\n%s", m.View())
+	}
+	if !strings.Contains(m.helpLine(), "space: mark") || !strings.Contains(m.helpLine(), "x: delete") ||
+		!strings.Contains(m.helpLine(), "X: prune old") {
+		t.Errorf("help line should document mark/delete/prune: %s", m.helpLine())
+	}
+
+	// Space again marks the second row; moving back and pressing space unmarks.
+	m = press(t, m, " ")
+	if !m.marked[freshID] {
+		t.Fatalf("second space should mark #%d, got %v", freshID, m.marked)
+	}
+	m.cursor = 0
+	m = press(t, m, " ")
+	if m.marked[oldID] || !m.marked[freshID] {
+		t.Errorf("space on a marked row should unmark it, got %v", m.marked)
+	}
+
+	// A refresh that drops a marked escalation prunes its mark.
+	refreshed := m.data
+	refreshed.escalations = refreshed.escalations[:1] // fresh row resolved elsewhere
+	upd, _ := m.Update(refreshed)
+	m = upd.(Model)
+	if len(m.marked) != 0 {
+		t.Errorf("marks for gone escalations must be pruned, got %v", m.marked)
+	}
+}
+
+func TestEscalationDeletePromptFlow(t *testing.T) {
+	m, _, st, oldID, freshID := escalationsModel(t)
+	ctx := context.Background()
+
+	// x with nothing marked targets the cursor row only.
+	m = press(t, m, "x")
+	if m.prompt == nil || !strings.Contains(m.prompt.label, fmt.Sprintf("escalation #%d", oldID)) {
+		t.Fatalf("x should prompt for the cursor row, got %+v", m.prompt)
+	}
+	// Any non-yes input aborts.
+	m = press(t, m, "n", "o")
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if msg, ok := cmd().(actionResultMsg); !ok || msg.message != "delete aborted" {
+		t.Fatalf("non-yes input must abort, got %+v", msg)
+	}
+	if esc, _ := st.PendingEscalations(ctx); len(esc) != 2 {
+		t.Fatalf("aborted delete must keep both escalations, got %d", len(esc))
+	}
+
+	// Mark both rows, x prompts for the batch, yes dismisses them.
+	m = press(t, m, " ", " ", "x")
+	if m.prompt == nil || !strings.Contains(m.prompt.label, "2 escalations") {
+		t.Fatalf("x should prompt for the marked batch, got %+v", m.prompt)
+	}
+	m = press(t, m, "y", "e", "s")
+	upd, cmd = m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	msg, ok := cmd().(actionResultMsg)
+	if !ok || msg.err != nil || !strings.Contains(msg.message, "deleted 2 escalations") {
+		t.Fatalf("yes should delete the marked escalations, got %+v", msg)
+	}
+	if esc, _ := st.PendingEscalations(ctx); len(esc) != 0 {
+		t.Errorf("queue should be empty, got %+v", esc)
+	}
+	for _, id := range []int64{freshID, oldID} {
+		if rec, _ := st.GetAudit(ctx, id); rec == nil || rec.Status != "dismissed" {
+			t.Errorf("audit #%d must be kept as dismissed, got %+v", id, rec)
+		}
+	}
+}
+
+func TestEscalationPrunePromptFlow(t *testing.T) {
+	m, _, st, oldID, freshID := escalationsModel(t)
+	ctx := context.Background()
+
+	// X opens the prune prompt pre-filled with the default age.
+	m = press(t, m, "X")
+	if m.prompt == nil || m.prompt.input != "360" {
+		t.Fatalf("X should open the prune prompt pre-filled with 360, got %+v", m.prompt)
+	}
+	// Enter with the default prunes only the 7h-old escalation.
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	msg, ok := cmd().(actionResultMsg)
+	if !ok || msg.err != nil || !strings.Contains(msg.message, "pruned 1 escalation(s) older than 360 minute(s)") {
+		t.Fatalf("default prune should dismiss the old escalation, got %+v", msg)
+	}
+	if rec, _ := st.GetAudit(ctx, oldID); rec.Status != "dismissed" {
+		t.Errorf("old escalation must be dismissed, got %q", rec.Status)
+	}
+	if rec, _ := st.GetAudit(ctx, freshID); rec.Status != "escalated" {
+		t.Errorf("fresh escalation must stay pending, got %q", rec.Status)
+	}
+
+	// The pre-filled age is editable; garbage input errors instead of pruning.
+	m = press(t, m, "X")
+	for range "360" {
+		upd, _ := m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = upd.(Model)
+	}
+	m = press(t, m, "a", "b")
+	upd, cmd = m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if msg, ok := cmd().(actionResultMsg); !ok || msg.err == nil {
+		t.Fatalf("a non-numeric age must error, got %+v", msg)
+	}
+	if rec, _ := st.GetAudit(ctx, freshID); rec.Status != "escalated" {
+		t.Errorf("failed prune must not touch pending escalations, got %q", rec.Status)
+	}
+
+	// esc cancels without pruning.
+	m = press(t, m, "X", "esc")
+	if m.prompt != nil || m.message != "cancelled" {
+		t.Errorf("esc should cancel the prune prompt, got prompt=%v message=%q", m.prompt != nil, m.message)
+	}
 }
 
 func TestEscalationShowsMatchedRule(t *testing.T) {

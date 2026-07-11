@@ -21,8 +21,9 @@ graduation_n = 5           # consecutive consistent confirmations to graduate a 
 
 # ── Safety (never-auto) ─────────────────────────────────────────────
 [safety]
-allowlist_patterns = []          # extra regexes that ALWAYS escalate (e.g. "rm -rf")
-disable_seed = false             # keep the shipped seed allowlist (recommended)
+never_auto_patterns = []         # extra regexes that ALWAYS escalate (e.g. "rm -rf")
+# allowlist_patterns = []        # DEPRECATED alias for never_auto_patterns (merged on load)
+disable_seed = false             # keep the shipped seed never-auto patterns (recommended)
 irreversible_indicators = []     # extra suspected-irreversible patterns, all agents
 
 # Agent-scoped irreversible indicator (repeatable):

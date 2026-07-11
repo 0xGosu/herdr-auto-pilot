@@ -40,14 +40,14 @@ func TestKillSwitchVetoesEverything(t *testing.T) {
 	}
 }
 
-func TestAllowlistVetoesRegardlessOfConfidence(t *testing.T) {
+func TestNeverAutoVetoesRegardlessOfConfidence(t *testing.T) {
 	// FR-015 safety invariant: an allowlist match escalates regardless of
 	// confidence or mode.
 	in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y", "y", "y")
-	in.AllowlistMatched = true
-	in.AllowlistHit = `git push --force`
+	in.NeverAutoMatched = true
+	in.NeverAutoHit = `git push --force`
 	d := Decide(in)
-	if d.Action != ActionEscalate || d.Reason != ReasonAllowlistMatch {
+	if d.Action != ActionEscalate || d.Reason != ReasonNeverAutoMatch {
 		t.Fatalf("allowlist match must escalate, got %+v", d)
 	}
 }

@@ -30,13 +30,15 @@ func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, arg
 	case "agents":
 		return agents(ctx, app, out)
 	case "escalations":
-		return escalations(ctx, app, out)
+		return escalations(ctx, app, out, args)
 	case "audit":
 		return audit(ctx, app, out, args)
 	case "confirm":
 		return confirm(ctx, app, out, args)
 	case "resolve", "correct":
 		return resolve(ctx, app, out, args)
+	case "dismiss":
+		return dismiss(ctx, app, out, args)
 	case "pause":
 		if err := app.Pause(ctx); err != nil {
 			return err
@@ -146,6 +148,14 @@ func signaturesShow(ctx context.Context, app *frontend.App, out io.Writer, args 
 		return err
 	}
 	printSignatureRow(out, row, graduationN(app))
+	if row.PaneExcerpt != "" {
+		fmt.Fprintln(out, "original situation:")
+		for _, line := range strings.Split(strings.TrimRight(row.PaneExcerpt, "\n"), "\n") {
+			fmt.Fprintf(out, "  %s\n", line)
+		}
+	} else {
+		fmt.Fprintln(out, "original situation: (not captured yet — recorded on the rule's next sighting)")
+	}
 	if len(history) > 0 {
 		fmt.Fprintln(out, "recent decisions (newest first):")
 		for _, d := range history {
@@ -314,7 +324,13 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 	return nil
 }
 
-func escalations(ctx context.Context, app *frontend.App, out io.Writer) error {
+func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) > 0 {
+		if args[0] != "prune" {
+			return fmt.Errorf("usage: escalations [prune [minutes]]")
+		}
+		return escalationsPrune(ctx, app, out, args[1:])
+	}
 	esc, err := app.Escalations(ctx)
 	if err != nil {
 		return err
@@ -340,7 +356,47 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer) error {
 		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\tagent=%s\tsuggestion=%q\trule=[%s]\n",
 			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.Rationale, agent, e.Suggestion, rule)
 	}
-	fmt.Fprintf(out, "\n%d pending; respond with: confirm <id> | resolve <id> --action TEXT [--send]\n", len(esc))
+	fmt.Fprintf(out, "\n%d pending; respond with: confirm <id> | resolve <id> --action TEXT [--send] | dismiss <id>...\n", len(esc))
+	return nil
+}
+
+// escalationsPrune dismisses pending escalations older than the given age
+// in minutes (default 360). Audit rows are kept; nothing is sent or learned.
+func escalationsPrune(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	minutes := frontend.DefaultPruneMinutes
+	if len(args) > 1 {
+		return fmt.Errorf("usage: escalations prune [minutes]")
+	}
+	if len(args) == 1 {
+		v, err := strconv.Atoi(args[0])
+		if err != nil || v <= 0 {
+			return fmt.Errorf("invalid age %q — whole minutes, e.g. escalations prune 120", args[0])
+		}
+		minutes = v
+	}
+	n, err := app.PruneEscalations(ctx, time.Duration(minutes)*time.Minute)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "pruned %d escalation(s) older than %d minute(s); audit rows kept as dismissed\n", n, minutes)
+	return nil
+}
+
+// dismiss removes pending escalations from the queue without responding.
+func dismiss(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: dismiss <audit-id> [<audit-id>...]")
+	}
+	for _, arg := range args {
+		id, err := strconv.ParseInt(arg, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid audit id %q", arg)
+		}
+		if err := app.Dismiss(ctx, id); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "dismissed escalation #%d (audit row kept; nothing sent or learned)\n", id)
+	}
 	return nil
 }
 
@@ -515,8 +571,8 @@ func printConfig(out io.Writer, cfg config.Config) {
 		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries)
 	fmt.Fprintf(out, "llm:        configured=%v timeout=%ds auto_act=%v\n",
 		len(cfg.LLM.Command) > 0, cfg.LLM.TimeoutSeconds, cfg.LLM.AutoAct)
-	fmt.Fprintf(out, "task sources: %d, operator allowlist patterns: %d (+%d seed)\n",
-		len(cfg.TaskSources), len(cfg.Safety.AllowlistPatterns), len(domain.SeedAllowlistPatterns))
+	fmt.Fprintf(out, "task sources: %d, operator never-auto patterns: %d (+%d seed)\n",
+		len(cfg.TaskSources), len(cfg.Safety.NeverAutoPatterns), len(domain.SeedNeverAutoPatterns))
 }
 
 func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
@@ -525,21 +581,21 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(out, "# seed never-auto allowlist (always active unless disable_seed=true)")
-		for _, p := range domain.SeedAllowlistPatterns {
+		fmt.Fprintln(out, "# seed never-auto patterns (always active unless disable_seed=true)")
+		for _, p := range domain.SeedNeverAutoPatterns {
 			fmt.Fprintf(out, "seed\t\t%s\n", p)
 		}
-		for i, p := range cfg.Safety.AllowlistPatterns {
+		for i, p := range cfg.Safety.NeverAutoPatterns {
 			fmt.Fprintf(out, "operator #%d\t%s\n", i, p)
 		}
 		return nil
 	}
 	switch {
 	case args[0] == "add" && len(args) == 2:
-		if err := app.AddAllowlistPattern(ctx, args[1]); err != nil {
+		if err := app.AddNeverAutoPattern(ctx, args[1]); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "allowlist pattern added: %s\n", args[1])
+		fmt.Fprintf(out, "never-auto pattern added: %s\n", args[1])
 		return nil
 	case args[0] == "remove" && len(args) == 2:
 		idx, err := strconv.Atoi(args[1])
@@ -550,14 +606,14 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if err != nil {
 			return err
 		}
-		if idx < 0 || idx >= len(cfg.Safety.AllowlistPatterns) {
-			return fmt.Errorf("no operator allowlist pattern #%d (see: rules list)", idx)
+		if idx < 0 || idx >= len(cfg.Safety.NeverAutoPatterns) {
+			return fmt.Errorf("no operator never-auto pattern #%d (see: rules list)", idx)
 		}
-		expected := cfg.Safety.AllowlistPatterns[idx]
-		if err := app.RemoveAllowlistPattern(ctx, idx, expected); err != nil {
+		expected := cfg.Safety.NeverAutoPatterns[idx]
+		if err := app.RemoveNeverAutoPattern(ctx, idx, expected); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "operator allowlist pattern #%d removed: %s\n", idx, expected)
+		fmt.Fprintf(out, "operator never-auto pattern #%d removed: %s\n", idx, expected)
 		return nil
 	}
 	return fmt.Errorf("usage: rules [list|add <regex>|remove <index>]")

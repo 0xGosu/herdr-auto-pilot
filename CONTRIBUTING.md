@@ -16,7 +16,7 @@ Thanks for helping keep herds unblocked! This guide covers the essentials.
   Side effects live behind the ports in `internal/ports`.
 - **Fail-safe on the daemon path.** No panics; every error path resolves to
   escalate + log. New adapter calls run under `logging.Guard`.
-- **Safety tests are non-negotiable.** Changes touching the allowlist, kill
+- **Safety tests are non-negotiable.** Changes touching the never-auto patterns, kill
   switch, confidence gate, rate guard, or retry ceiling must keep (and where
   relevant, extend) the safety-invariant tests. New irreversible-operation
   shapes belong in `internal/domain/testdata/irreversible_corpus.txt` — CI
@@ -52,7 +52,7 @@ herdr plugin link .
 1. Fork/branch from `main`.
 2. Keep PRs focused; include tests for behavior changes.
 3. Make sure `go test ./...`, `gofmt`, `go vet`, and `golangci-lint` pass —
-   CI gates on all of them plus the allowlist-corpus regression.
+   CI gates on all of them plus the never-auto patterns-corpus regression.
 4. Describe *what* and *why* in the PR body; link related issues.
 
 ## Release flow (maintainers)

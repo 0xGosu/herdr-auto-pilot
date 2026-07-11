@@ -7,11 +7,11 @@ import (
 	"time"
 )
 
-// SeedAllowlistPatterns is the shipped never-auto allowlist (FR-015/016):
+// SeedNeverAutoPatterns are the shipped never-auto patterns (FR-015/016):
 // regex patterns matched against prompt/pane content. Any match escalates,
 // always, regardless of confidence or mode. The patterns are validated in CI
 // against the irreversible-op corpus in testdata/corpus (NFR-005a).
-var SeedAllowlistPatterns = []string{
+var SeedNeverAutoPatterns = []string{
 	// Git history / remote destruction
 	`(?i)git\s+push\s+[^\n]*(--force\b|-f\b|--force-with-lease)`,
 	`(?i)git\s+reset\s+--hard`,
@@ -71,7 +71,7 @@ type IndicatorRule struct {
 
 // SeedIrreversibleIndicators back the suspected-irreversible-but-unmatched
 // heuristic (FR-016): destructive-operation indicators that, present in a
-// prompt with no allowlist match, bias the plugin toward escalation. The
+// prompt with no never-auto match, bias the plugin toward escalation. The
 // seed rules apply to all agent types; operator rules may scope to a subset.
 //
 // A hit escalates unconditionally, so every indicator needs corroboration:
@@ -90,7 +90,7 @@ var SeedIrreversibleIndicators = []IndicatorRule{
 	// by other lines of text is narration, not a pending operation.
 	{Pattern: `(?i)\b(delet(e[sd]?|ing)|destroy(s|ed|ing)?|remov(e[sd]?|ing)|eras(e[sd]?|ing)|wip(e[sd]?|ing)|purg(e[sd]?|ing)|drop(s|ped|ping)?|truncat(e[sd]?|ing))\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(databases?|tables?|schemas?|backups?|snapshots?|buckets?|volumes?|partitions?|disks?|prod(uction)?|(user|customer|all)\s+data|records?|history|repositor(y|ies)|accounts?)\b`},
 	{Pattern: `(?i)\bpermanently\s+(delet|destroy|remov|eras|wip|purg|discard)`},
-	// Forced overwrites/removals (force-push itself is allowlisted).
+	// Forced overwrites/removals (force-push itself is a seed pattern).
 	{Pattern: `(?i)\bforc(e|ed|ibly)\b[^\n]*\b(overwrit|delet|remov|push)`},
 	// Credential / access invalidation.
 	{Pattern: `(?i)\b(revok|rotat|invalidat|regenerat)(e[sd]?|ing|ion)\b[^\n]*\b(access|keys?|tokens?|cert(ificate)?s?|credentials?|secrets?|sessions?|passwords?)\b`},
@@ -110,19 +110,19 @@ type compiledIndicator struct {
 	agents []string // empty (or containing "*") = all agent types
 }
 
-// Allowlist is the compiled never-auto matcher plus the suspected-
+// NeverAutoList is the compiled never-auto matcher plus the suspected-
 // irreversible heuristic.
-type Allowlist struct {
+type NeverAutoList struct {
 	patterns   []*regexp.Regexp
 	raw        []string
 	indicators []compiledIndicator
 }
 
-// NewAllowlist compiles seed + operator patterns and heuristic indicators.
+// NewNeverAutoList compiles seed + operator patterns and heuristic indicators.
 // Invalid operator patterns are reported, not silently dropped.
-func NewAllowlist(seedEnabled bool, extraPatterns []string, extraIndicators []IndicatorRule) (*Allowlist, []error) {
+func NewNeverAutoList(seedEnabled bool, extraPatterns []string, extraIndicators []IndicatorRule) (*NeverAutoList, []error) {
 	var errs []error
-	a := &Allowlist{}
+	a := &NeverAutoList{}
 	addPatterns := func(pats []string) {
 		for _, p := range pats {
 			re, err := regexp.Compile(p)
@@ -145,7 +145,7 @@ func NewAllowlist(seedEnabled bool, extraPatterns []string, extraIndicators []In
 		}
 	}
 	if seedEnabled {
-		addPatterns(SeedAllowlistPatterns)
+		addPatterns(SeedNeverAutoPatterns)
 	}
 	addPatterns(extraPatterns)
 	addIndicators(SeedIrreversibleIndicators)
@@ -153,9 +153,9 @@ func NewAllowlist(seedEnabled bool, extraPatterns []string, extraIndicators []In
 	return a, errs
 }
 
-// Match returns the first allowlist pattern matching content, if any.
+// Match returns the first never-auto pattern matching content, if any.
 // A match means the operation may never be automated (FR-015).
-func (a *Allowlist) Match(content string) (string, bool) {
+func (a *NeverAutoList) Match(content string) (string, bool) {
 	for i, re := range a.patterns {
 		if re.MatchString(content) {
 			return a.raw[i], true
@@ -172,10 +172,10 @@ type IndicatorHit struct {
 }
 
 // SuspectedIrreversible reports whether content exhibits destructive
-// indicators without an allowlist match (FR-016 heuristic), returning the
+// indicators without a never-auto match (FR-016 heuristic), returning the
 // first matching indicator. Only indicators scoped to agentType (or to all
 // agents) are consulted.
-func (a *Allowlist) SuspectedIrreversible(agentType, content string) (IndicatorHit, bool) {
+func (a *NeverAutoList) SuspectedIrreversible(agentType, content string) (IndicatorHit, bool) {
 	for _, ind := range a.indicators {
 		if !indicatorAppliesTo(ind.agents, agentType) {
 			continue
@@ -231,7 +231,7 @@ const IrreversibleScanTailLines = 40
 // own narration merely *described* destructive operations (FR-016 is about
 // pending operations, not conversation about them).
 //
-// The never-auto allowlist (Match) still scans the full snapshot; only the
+// The never-auto patterns (Match) still scan the full snapshot; only the
 // heuristic is scoped.
 func IrreversibleScanContent(s Situation, declaredTask string) string {
 	switch s.Type {
@@ -270,8 +270,8 @@ func lastLines(s string, n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
-// Patterns returns the active allowlist patterns (for display).
-func (a *Allowlist) Patterns() []string { return a.raw }
+// Patterns returns the active never-auto patterns (for display).
+func (a *NeverAutoList) Patterns() []string { return a.raw }
 
 // RateLimits configures the runaway-loop guard (FR-019).
 type RateLimits struct {

@@ -157,7 +157,7 @@ git push origin vX.Y.Z
 - **Fail safe on the daemon path** — no panics; every error resolves to
   escalate + audit + log. Wrap new handler/adapter calls in `logging.Guard`.
 - **Safety controls are never bypassed** — LLM submissions and learned rules
-  alike are re-gated through kill switch, allowlist, rate guard, and retry
+  alike are re-gated through kill switch, never-auto patterns, rate guard, and retry
   ceiling. Changes touching these must keep/extend the safety-invariant
   tests; new destructive-command shapes go in
   `internal/domain/testdata/irreversible_corpus.txt` (CI fails if seed

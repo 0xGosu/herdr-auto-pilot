@@ -112,7 +112,7 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "submit_decision",
-			"description": "Submit your decision for the pending request. action is the literal reply text to send to the agent (for choices, the exact option text). If the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit action \"@noop\" to explicitly do nothing. The daemon re-gates this through the confidence gate and never-auto allowlist before acting.",
+			"description": "Submit your decision for the pending request. action is the literal reply text to send to the agent (for choices, the exact option text). If the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit action \"@noop\" to explicitly do nothing. The daemon re-gates this through the confidence gate and never-auto patterns before acting.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

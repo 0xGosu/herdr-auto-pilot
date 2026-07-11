@@ -141,7 +141,7 @@ func TestRewriteCustomFallbackTemplate(t *testing.T) {
 	}
 }
 
-func TestRewrittenTextTrippingAllowlistFallsBack(t *testing.T) {
+func TestRewrittenTextTrippingNeverAutoFallsBack(t *testing.T) {
 	// SC-5/FR-015: the rewriter is an LLM authoring outbound text — output
 	// naming an irreversible operation is discarded and the safe original
 	// (wrapped) is delivered instead.
@@ -264,7 +264,7 @@ func TestRewriteKillSwitchMidFlightEscalates(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool {
 		audits, _ := h.raw.AuditLog(context.Background(), 10)
 		for _, a := range audits {
-			if a.Status == "escalated" && strings.Contains(a.Rationale, "kill switch") {
+			if a.Status == "escalated" && strings.Contains(a.Rationale, "[killed]") {
 				return true
 			}
 		}
@@ -338,7 +338,7 @@ func TestRewriteRateGuardAtDeliveryEscalates(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool {
 		audits, _ := h.raw.AuditLog(context.Background(), 10)
 		for _, a := range audits {
-			if a.Status == "escalated" && strings.Contains(a.Rationale, "runaway-loop guard") {
+			if a.Status == "escalated" && strings.Contains(a.Rationale, "[rate_limited]") {
 				return true
 			}
 		}

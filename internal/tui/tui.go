@@ -2,7 +2,7 @@
 // mirrors every CLI capability (FR-022): monitored agents (with rename),
 // pending escalations (confirm/correct), the audit log (post-hoc
 // correction), learned signatures (Rules tab: inspect/filter/delete),
-// configuration (Config tab: fields, allowlist patterns, task sources,
+// configuration (Config tab: fields, never-auto patterns, task sources,
 // clear-data), and the pause/kill switch with history.
 package tui
 
@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +30,7 @@ const (
 	tabEscalations
 	tabAudit
 	tabSignatures // "Rules": learned signatures (list/inspect/delete)
-	tabConfig     // config fields, allowlist patterns, task sources
+	tabConfig     // config fields, never-auto patterns, task sources
 	tabKill
 	tabCount
 )
@@ -110,8 +111,9 @@ type Model struct {
 	tab     tab
 	cursor  int
 	data    refreshMsg
-	items   []ruleItem  // Config tab rows, rebuilt on refresh
-	sigMode domain.Mode // Rules tab display filter: "" = all
+	items   []ruleItem     // Config tab rows, rebuilt on refresh
+	sigMode domain.Mode    // Rules tab display filter: "" = all
+	marked  map[int64]bool // Escalations tab multi-select (audit ids), space toggles
 	message string
 	prompt  *prompt
 	detail  *detailView
@@ -187,10 +189,10 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 			label: fmt.Sprintf("%-38s %s", key, frontend.FieldValue(cfg, key)),
 		})
 	}
-	for i, p := range cfg.Safety.AllowlistPatterns {
+	for i, p := range cfg.Safety.NeverAutoPatterns {
 		items = append(items, ruleItem{
 			kind: "pattern", index: i, value: p,
-			label: fmt.Sprintf("allowlist #%d  %s", i, p),
+			label: fmt.Sprintf("never-auto #%d  %s", i, p),
 		})
 	}
 	for i, src := range cfg.TaskSources {
@@ -229,6 +231,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.items = buildRuleItems(msg.cfg)
 		if m.cursor >= m.rowCount() {
 			m.cursor = max(0, m.rowCount()-1)
+		}
+		// Drop marks whose escalations are no longer pending (deleted,
+		// confirmed, or resolved elsewhere) — marks track ids, not rows.
+		if len(m.marked) > 0 {
+			pending := make(map[int64]bool, len(msg.escalations))
+			for _, e := range msg.escalations {
+				pending[e.ID] = true
+			}
+			for id := range m.marked {
+				if !pending[id] {
+					delete(m.marked, id)
+				}
+			}
 		}
 		return m, nil
 	case actionResultMsg:
@@ -408,15 +423,24 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.tab == tabConfig {
 			return m.addTaskSourcePrompt()
 		}
+	case " ":
+		if m.tab == tabEscalations {
+			return m.toggleMarkSelected()
+		}
 	case "x", "delete":
 		switch m.tab {
+		case tabEscalations:
+			return m.deleteEscalationsPrompt()
 		case tabSignatures:
 			return m.deleteSignaturePrompt()
 		case tabConfig:
 			return m.removeSelectedRule()
 		}
 	case "X":
-		if m.tab == tabConfig {
+		switch m.tab {
+		case tabEscalations:
+			return m.pruneEscalationsPrompt()
+		case tabConfig:
 			return m.clearDataPrompt()
 		}
 	}
@@ -500,6 +524,138 @@ func (m Model) correctSelected() (tea.Model, tea.Cmd) {
 					return actionResultMsg{err: err}
 				}
 				return actionResultMsg{message: fmt.Sprintf("correction recorded for #%d", id)}
+			}
+		},
+	}
+	return m, nil
+}
+
+// toggleMarkSelected flips the multi-select mark on the escalation under the
+// cursor and advances, so repeated space marks a run of rows.
+func (m Model) toggleMarkSelected() (tea.Model, tea.Cmd) {
+	rec := m.selectedAudit()
+	if rec == nil {
+		return m, nil
+	}
+	if m.marked == nil {
+		m.marked = map[int64]bool{}
+	}
+	if m.marked[rec.ID] {
+		delete(m.marked, rec.ID)
+	} else {
+		m.marked[rec.ID] = true
+	}
+	if len(m.marked) == 0 {
+		m.message = "no marks — x deletes the row under the cursor"
+	} else {
+		m.message = fmt.Sprintf("%d marked — x deletes them", len(m.marked))
+	}
+	if m.cursor < m.rowCount()-1 {
+		m.cursor++
+	}
+	return m, nil
+}
+
+// deleteEscalationIDs is what x targets: the marked escalations (in list
+// order), or just the cursor row when nothing is marked.
+func (m Model) deleteEscalationIDs() []int64 {
+	var ids []int64
+	for _, e := range m.data.escalations {
+		if m.marked[e.ID] {
+			ids = append(ids, e.ID)
+		}
+	}
+	if len(ids) == 0 {
+		if rec := m.selectedAudit(); rec != nil {
+			ids = append(ids, rec.ID)
+		}
+	}
+	return ids
+}
+
+// describeEscalations names the delete targets compactly: "escalation #41"
+// or "3 escalations (#41 #40 #39)", eliding a long id list.
+func describeEscalations(ids []int64) string {
+	if len(ids) == 1 {
+		return fmt.Sprintf("escalation #%d", ids[0])
+	}
+	var parts []string
+	for i, id := range ids {
+		if i == 6 {
+			parts = append(parts, "…")
+			break
+		}
+		parts = append(parts, fmt.Sprintf("#%d", id))
+	}
+	return fmt.Sprintf("%d escalations (%s)", len(ids), strings.Join(parts, " "))
+}
+
+// deleteEscalationsPrompt confirms then dismisses the targeted escalations:
+// they leave the pending queue without a reply being sent or learned; the
+// audit rows are kept with status "dismissed".
+func (m Model) deleteEscalationsPrompt() (tea.Model, tea.Cmd) {
+	ids := m.deleteEscalationIDs()
+	if len(ids) == 0 {
+		return m, nil
+	}
+	app, ctx := m.app, m.ctx
+	desc := describeEscalations(ids)
+	m.message = ""
+	m.prompt = &prompt{
+		label: fmt.Sprintf("type 'yes' to delete %s — nothing is sent or learned", desc),
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				if input != "yes" {
+					return actionResultMsg{message: "delete aborted"}
+				}
+				// Skip-and-continue: a failed id usually means the row was
+				// resolved/confirmed concurrently; the rest still delete.
+				deleted := 0
+				var skipped []string
+				var firstErr error
+				for _, id := range ids {
+					if err := app.Dismiss(ctx, id); err != nil {
+						skipped = append(skipped, fmt.Sprintf("#%d", id))
+						if firstErr == nil {
+							firstErr = err
+						}
+						continue
+					}
+					deleted++
+				}
+				if firstErr != nil {
+					return actionResultMsg{err: fmt.Errorf("deleted %d, skipped %s: %w",
+						deleted, strings.Join(skipped, " "), firstErr)}
+				}
+				return actionResultMsg{message: fmt.Sprintf(
+					"deleted %s; audit rows kept as dismissed", desc)}
+			}
+		},
+	}
+	return m, nil
+}
+
+// pruneEscalationsPrompt asks for an age in minutes (pre-filled with the
+// default, editable) and dismisses every pending escalation older than that.
+// Enter confirms, esc cancels.
+func (m Model) pruneEscalationsPrompt() (tea.Model, tea.Cmd) {
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	m.prompt = &prompt{
+		label: "prune escalations older than N minutes — enter confirms, esc cancels",
+		input: strconv.Itoa(frontend.DefaultPruneMinutes),
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				minutes, err := strconv.Atoi(input)
+				if err != nil || minutes <= 0 {
+					return actionResultMsg{err: fmt.Errorf("invalid age %q — whole minutes", input)}
+				}
+				n, err := app.PruneEscalations(ctx, time.Duration(minutes)*time.Minute)
+				if err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: fmt.Sprintf(
+					"pruned %d escalation(s) older than %d minute(s); audit rows kept as dismissed", n, minutes)}
 			}
 		},
 	}
@@ -632,6 +788,11 @@ func (m Model) budget(prefixCells int, hasTrailing bool) (primary, trailing int)
 	trailing = remaining * 2 / 5
 	if trailing < 16 {
 		trailing = 16
+	}
+	// On a very tight cap the trailing minimum could swallow the whole
+	// budget; primary keeps a readable floor (it is the favored field).
+	if remaining-trailing < 8 {
+		trailing = max(remaining-8, 0)
 	}
 	return remaining - trailing, trailing
 }
@@ -836,6 +997,13 @@ func signatureDetailLines(row frontend.SignatureRow, history []domain.DecisionRe
 	if !row.UpdatedAt.IsZero() {
 		lines = detailField(lines, w, "Updated", row.UpdatedAt.Format(time.RFC3339))
 	}
+	// Rule provenance: what the pane showed when this signature was first
+	// seen — the situation the learned action answers.
+	if row.PaneExcerpt != "" {
+		lines = detailField(lines, w, "Original situation", row.PaneExcerpt)
+	} else {
+		lines = detailField(lines, w, "Original situation", "(not captured yet — recorded on the rule's next sighting)")
+	}
 	if len(history) > 0 {
 		var b strings.Builder
 		for _, d := range history {
@@ -898,13 +1066,13 @@ func (m Model) addPatternPrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.message = ""
 	m.prompt = &prompt{
-		label: "add never-auto allowlist regex",
+		label: "add never-auto regex",
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
-				if err := app.AddAllowlistPattern(ctx, input); err != nil {
+				if err := app.AddNeverAutoPattern(ctx, input); err != nil {
 					return actionResultMsg{err: err}
 				}
-				return actionResultMsg{message: "allowlist pattern added"}
+				return actionResultMsg{message: "never-auto pattern added"}
 			}
 		},
 	}
@@ -949,8 +1117,8 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 	switch item.kind {
 	case "pattern":
 		idx, expected := item.index, item.value
-		return m, m.do(fmt.Sprintf("allowlist pattern #%d removed", idx), func(c context.Context) error {
-			return app.RemoveAllowlistPattern(c, idx, expected)
+		return m, m.do(fmt.Sprintf("never-auto pattern #%d removed", idx), func(c context.Context) error {
+			return app.RemoveNeverAutoPattern(c, idx, expected)
 		})
 	case "source":
 		idx, expected := item.index, item.value
@@ -1055,7 +1223,7 @@ func (m Model) helpLine() string {
 	case tabAgents:
 		return "v: details  n: rename agent  " + common
 	case tabEscalations:
-		return "enter/y: confirm+send  c: correct  v: details  " + common
+		return "enter/y: confirm+send  c: correct  space: mark  x: delete  X: prune old  v: details  " + common
 	case tabAudit:
 		return "c: correct decision  v: details  " + common
 	case tabSignatures:
@@ -1177,16 +1345,20 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		fmt.Fprintln(b, "no pending escalations — the herd is unblocked 🎉")
 		return
 	}
-	// Prefix: "#%-5d %-8s %-10s %-8s agent=%-14s rule=%-6s " → 69 cells.
-	const escPrefix = 69
+	// Prefix: "<mark> #%-5d %-8s %-10s %-8s agent=%-14s rule=%-6s " → 71 cells.
+	const escPrefix = 71
 	for i, e := range esc {
 		agent := e.AgentID
 		if n := m.data.status.AgentName(e.AgentID); n != "" {
 			agent = n
 		}
+		mark := " "
+		if m.marked[e.ID] {
+			mark = "✓"
+		}
 		rWidth, sWidth := m.budget(escPrefix, e.Suggestion != "")
-		line := fmt.Sprintf("#%-5d %-8s %-10s %-8s agent=%-14s rule=%-6s %s",
-			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType,
+		line := fmt.Sprintf("%s #%-5d %-8s %-10s %-8s agent=%-14s rule=%-6s %s",
+			mark, e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType,
 			oneLine(orDash(m.agentTypeFor(e)), 8), agent,
 			m.ruleMarker(e.Signature), oneLine(e.Rationale, rWidth))
 		if e.Suggestion != "" {
@@ -1230,7 +1402,7 @@ func (m Model) renderConfig(b *strings.Builder) {
 				fmt.Fprintln(b, sectionStyle.Render("Config"))
 			case "pattern":
 				fmt.Fprintf(b, "\n%s\n", sectionStyle.Render(fmt.Sprintf(
-					"Never-auto allowlist (operator patterns; +%d seed)", len(domain.SeedAllowlistPatterns))))
+					"Never-auto patterns (operator; +%d seed)", len(domain.SeedNeverAutoPatterns))))
 			case "source":
 				fmt.Fprintf(b, "\n%s\n", sectionStyle.Render("Task sources"))
 			}
@@ -1241,10 +1413,10 @@ func (m Model) renderConfig(b *strings.Builder) {
 		}
 		fmt.Fprintln(b, line)
 	}
-	if len(m.data.cfg.Safety.AllowlistPatterns) == 0 {
+	if len(m.data.cfg.Safety.NeverAutoPatterns) == 0 {
 		fmt.Fprintf(b, "\n%s\n", sectionStyle.Render(fmt.Sprintf(
-			"Never-auto allowlist: no operator patterns (+%d seed active) — press a to add",
-			len(domain.SeedAllowlistPatterns))))
+			"Never-auto patterns: none from operator (+%d seed active) — press a to add",
+			len(domain.SeedNeverAutoPatterns))))
 	}
 	if len(m.data.cfg.TaskSources) == 0 {
 		fmt.Fprintf(b, "%s\n", sectionStyle.Render("Task sources: none — press t to add"))
@@ -1268,7 +1440,13 @@ func (m Model) renderKills(b *strings.Builder) {
 
 func oneLine(s string, limit int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
+	if limit < 1 {
+		limit = 1
+	}
 	if r := []rune(s); len(r) > limit {
+		if limit == 1 {
+			return "…"
+		}
 		return string(r[:limit-1]) + "…"
 	}
 	return s

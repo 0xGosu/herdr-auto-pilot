@@ -98,6 +98,88 @@ func TestDecisionHistoryNewestFirst(t *testing.T) {
 	}
 }
 
+func TestDismissEscalationGuardsStatus(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	// A missing id is rejected.
+	if err := s.DismissEscalation(ctx, 999); err == nil {
+		t.Error("dismissing a missing audit id must fail")
+	}
+
+	// The WHERE status guard rejects non-pending rows untouched — this is
+	// how a concurrent resolve/confirm wins over a late dismiss.
+	autoID, err := s.AppendAudit(ctx, domain.AuditRecord{
+		SituationType: domain.SituationChoice, Trigger: "t",
+		Action: "auto:2", Status: "auto", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DismissEscalation(ctx, autoID); err == nil {
+		t.Error("dismissing a non-escalated row must fail")
+	}
+	if rec, _ := s.GetAudit(ctx, autoID); rec == nil || rec.Status != "auto" {
+		t.Errorf("rejected dismiss must leave the row untouched, got %+v", rec)
+	}
+
+	// A pending escalation flips to dismissed; a second dismiss fails.
+	escID, err := s.AppendAudit(ctx, domain.AuditRecord{
+		SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DismissEscalation(ctx, escID); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := s.GetAudit(ctx, escID); rec == nil || rec.Status != "dismissed" {
+		t.Errorf("audit row must be kept as dismissed, got %+v", rec)
+	}
+	if err := s.DismissEscalation(ctx, escID); err == nil {
+		t.Error("a second dismiss of the same row must fail")
+	}
+}
+
+func TestDismissEscalationsBefore(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	oldID, _ := s.AppendAudit(ctx, domain.AuditRecord{
+		SituationType: domain.SituationApproval, Trigger: "old",
+		Action: "escalated", Status: "escalated", CreatedAt: now.Add(-2 * time.Hour),
+	})
+	freshID, _ := s.AppendAudit(ctx, domain.AuditRecord{
+		SituationType: domain.SituationApproval, Trigger: "fresh",
+		Action: "escalated", Status: "escalated", CreatedAt: now.Add(-time.Minute),
+	})
+	// Non-escalated rows are never touched, regardless of age.
+	resolvedID, _ := s.AppendAudit(ctx, domain.AuditRecord{
+		SituationType: domain.SituationApproval, Trigger: "done",
+		Action: "escalated", Status: "resolved", CreatedAt: now.Add(-3 * time.Hour),
+	})
+
+	n, err := s.DismissEscalationsBefore(ctx, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("dismissed %d row(s), want 1", n)
+	}
+	for id, want := range map[int64]string{oldID: "dismissed", freshID: "escalated", resolvedID: "resolved"} {
+		if rec, _ := s.GetAudit(ctx, id); rec == nil || rec.Status != want {
+			t.Errorf("audit #%d status = %+v, want %q", id, rec, want)
+		}
+	}
+
+	// Nothing left past the cutoff: a repeat is a no-op, not an error.
+	if n, err := s.DismissEscalationsBefore(ctx, now.Add(-time.Hour)); err != nil || n != 0 {
+		t.Errorf("repeat prune should dismiss 0 rows, got %d %v", n, err)
+	}
+}
+
 func TestAuditAndCorrectionLineage(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()
@@ -747,5 +829,73 @@ func TestMigrateAddsAgentTypeToLegacyAuditLog(t *testing.T) {
 	got, err := s.GetAudit(ctx, id)
 	if err != nil || got == nil || got.AgentType != "claude" {
 		t.Fatalf("migrated column round trip: %+v %v", got, err)
+	}
+}
+
+func TestSignatureSnapshotFirstSightingWins(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	if err := st.SaveSignatureSnapshot(ctx, "approval:aaaa", "the ORIGINAL pane", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// Later sightings must not overwrite the original.
+	if err := st.SaveSignatureSnapshot(ctx, "approval:aaaa", "a later pane", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetSignatureSnapshot(ctx, "approval:aaaa")
+	if err != nil || got != "the ORIGINAL pane" {
+		t.Fatalf("snapshot = %q err=%v, want the original", got, err)
+	}
+
+	// Absent (legacy rule) reads back empty without error.
+	if got, err := st.GetSignatureSnapshot(ctx, "approval:none"); err != nil || got != "" {
+		t.Errorf("missing snapshot = %q err=%v, want empty", got, err)
+	}
+	// Empty writes are no-ops, not rows.
+	if err := st.SaveSignatureSnapshot(ctx, "approval:blank", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetSignatureSnapshot(ctx, "approval:blank"); got != "" {
+		t.Errorf("empty excerpt must not persist, got %q", got)
+	}
+}
+
+func TestSignatureSnapshotCascades(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "choice:bbbb", SituationType: domain.SituationChoice,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSignatureSnapshot(ctx, "choice:bbbb", "which backend?", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteSignature(ctx, "choice:bbbb"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetSignatureSnapshot(ctx, "choice:bbbb"); got != "" {
+		t.Errorf("DeleteSignature must cascade the snapshot, got %q", got)
+	}
+
+	if err := st.SaveSignatureSnapshot(ctx, "idle:cccc", "task done", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ClearLearnedData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetSignatureSnapshot(ctx, "idle:cccc"); got != "" {
+		t.Errorf("ClearLearnedData must clear snapshots, got %q", got)
 	}
 }

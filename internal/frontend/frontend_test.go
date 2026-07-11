@@ -211,6 +211,80 @@ func TestConfirmMenuUnreadableFallsBackToLabel(t *testing.T) {
 	}
 }
 
+func TestDismissEscalation(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+
+	if err := app.Dismiss(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	// Gone from the pending queue, kept in the audit log as dismissed.
+	esc, _ := app.Escalations(ctx)
+	if len(esc) != 0 {
+		t.Errorf("dismissed escalation still pending: %+v", esc)
+	}
+	rec, _ := st.GetAudit(ctx, id)
+	if rec == nil || rec.Status != "dismissed" {
+		t.Fatalf("audit row must be kept as dismissed, got %+v", rec)
+	}
+	// A dismiss must never become a learning event.
+	if corr, _ := st.UnprocessedCorrections(ctx); len(corr) != 0 {
+		t.Errorf("dismiss must not record a correction: %+v", corr)
+	}
+}
+
+func TestDismissRejectsNonPending(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	if err := app.Dismiss(ctx, 999); err == nil {
+		t.Error("dismissing a missing audit record must fail")
+	}
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		SituationType: domain.SituationChoice, Trigger: "t",
+		Action: "2", Status: "auto", CreatedAt: time.Now(),
+	})
+	if err := app.Dismiss(ctx, id); err == nil {
+		t.Error("dismissing a non-escalated record must fail")
+	}
+	if rec, _ := st.GetAudit(ctx, id); rec == nil || rec.Status != "auto" {
+		t.Errorf("rejected dismiss must not change the row, got %+v", rec)
+	}
+}
+
+func TestPruneEscalations(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	oldID, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		SituationType: domain.SituationApproval, Trigger: "old",
+		Action: "escalated", Status: "escalated", CreatedAt: time.Now().Add(-7 * time.Hour),
+	})
+	freshID, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		SituationType: domain.SituationApproval, Trigger: "fresh",
+		Action: "escalated", Status: "escalated", CreatedAt: time.Now().Add(-time.Minute),
+	})
+
+	n, err := app.PruneEscalations(ctx, 6*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("pruned %d escalation(s), want 1", n)
+	}
+	if rec, _ := st.GetAudit(ctx, oldID); rec == nil || rec.Status != "dismissed" {
+		t.Errorf("old escalation must be dismissed, got %+v", rec)
+	}
+	if rec, _ := st.GetAudit(ctx, freshID); rec == nil || rec.Status != "escalated" {
+		t.Errorf("fresh escalation must stay pending, got %+v", rec)
+	}
+	if _, err := app.PruneEscalations(ctx, 0); err == nil {
+		t.Error("a non-positive prune age must be rejected")
+	}
+}
+
 func TestResolveUnknownAuditFails(t *testing.T) {
 	app, _ := testApp(t)
 	if err := app.Resolve(context.Background(), 999, "x", false); err == nil {
@@ -236,17 +310,17 @@ func TestSetThresholdPersists(t *testing.T) {
 	}
 }
 
-func TestAddAllowlistPatternValidates(t *testing.T) {
+func TestAddNeverAutoPatternValidates(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
-	if err := app.AddAllowlistPattern(ctx, `(?i)restart\s+prod`); err != nil {
+	if err := app.AddNeverAutoPattern(ctx, `(?i)restart\s+prod`); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := app.Config()
-	if len(cfg.Safety.AllowlistPatterns) != 1 {
+	if len(cfg.Safety.NeverAutoPatterns) != 1 {
 		t.Error("pattern not persisted")
 	}
-	if err := app.AddAllowlistPattern(ctx, "([broken"); err == nil {
+	if err := app.AddNeverAutoPattern(ctx, "([broken"); err == nil {
 		t.Error("invalid regex must be rejected")
 	}
 }
@@ -334,23 +408,23 @@ func TestSplitCommand(t *testing.T) {
 func TestRemoveByIndexIsValueVerified(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
-	app.AddAllowlistPattern(ctx, `(?i)one`)
-	app.AddAllowlistPattern(ctx, `(?i)two`)
+	app.AddNeverAutoPattern(ctx, `(?i)one`)
+	app.AddNeverAutoPattern(ctx, `(?i)two`)
 	app.AddTaskSource(ctx, "builder", "", "/tmp/tasks.md", "")
 
 	// A stale expectation must refuse to delete (safety-relevant: never
 	// silently remove the wrong never-auto pattern).
-	if err := app.RemoveAllowlistPattern(ctx, 0, `(?i)two`); err == nil {
+	if err := app.RemoveNeverAutoPattern(ctx, 0, `(?i)two`); err == nil {
 		t.Fatal("mismatched expected pattern must refuse removal")
 	}
-	if err := app.RemoveAllowlistPattern(ctx, 0, `(?i)one`); err != nil {
+	if err := app.RemoveNeverAutoPattern(ctx, 0, `(?i)one`); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := app.Config()
-	if len(cfg.Safety.AllowlistPatterns) != 1 || cfg.Safety.AllowlistPatterns[0] != `(?i)two` {
-		t.Errorf("wrong pattern removed: %v", cfg.Safety.AllowlistPatterns)
+	if len(cfg.Safety.NeverAutoPatterns) != 1 || cfg.Safety.NeverAutoPatterns[0] != `(?i)two` {
+		t.Errorf("wrong pattern removed: %v", cfg.Safety.NeverAutoPatterns)
 	}
-	if err := app.RemoveAllowlistPattern(ctx, 5, "x"); err == nil {
+	if err := app.RemoveNeverAutoPattern(ctx, 5, "x"); err == nil {
 		t.Error("out-of-range pattern index must error")
 	}
 
@@ -521,8 +595,8 @@ func TestCLIParityWithSharedLayer(t *testing.T) {
 	run("rules", "add", `(?i)reboot\s+router`)
 	run("rules", "remove", "0")
 	cfg, _ = app.Config()
-	if len(cfg.Safety.AllowlistPatterns) != 0 {
-		t.Errorf("rules remove failed: %v", cfg.Safety.AllowlistPatterns)
+	if len(cfg.Safety.NeverAutoPatterns) != 0 {
+		t.Errorf("rules remove failed: %v", cfg.Safety.NeverAutoPatterns)
 	}
 
 	// task-source add/list/remove round trip
