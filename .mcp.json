@@ -1,4 +1,8 @@
 {
   "mcpServers": {
+    "myspec": {
+      "command": "npx",
+      "args": ["-y", "@myspec/mcp-server"]
+    }
   }
 }
