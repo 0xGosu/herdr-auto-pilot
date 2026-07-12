@@ -82,12 +82,80 @@ func signatures(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		return signaturesShow(ctx, app, out, args)
 	case "delete":
 		return signaturesDelete(ctx, app, out, args)
+	case "reembed":
+		return signaturesReembed(ctx, app, out, args)
 	}
 	// Bare `signatures --type X` style: treat unknown leading flag as list.
 	if strings.HasPrefix(sub, "-") {
 		return signaturesList(ctx, app, out, append([]string{sub}, args...))
 	}
-	return fmt.Errorf("usage: signatures [list|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]]")
+	return fmt.Errorf("usage: signatures [list|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]|reembed [--force]]")
+}
+
+// signaturesReembed re-computes stored signature embeddings for the
+// currently configured model: via a daemon nudge when one is running (the
+// daemon owns signature_embeddings writes), in-process otherwise.
+func signaturesReembed(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	fs := flag.NewFlagSet("signatures reembed", flag.ContinueOnError)
+	force := fs.Bool("force", false, "re-run even when no drift is detected (retries a previously failed pass)")
+	fs.SetOutput(out)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	drift, err := app.EmbeddingDrift(ctx)
+	if err != nil {
+		return err
+	}
+	if drift.ModelID == "" {
+		return fmt.Errorf("embedding is disabled in config — nothing to re-embed")
+	}
+	if drift.ModelMissing {
+		return fmt.Errorf("embedding model %s not found — fix embedding.model_path first", drift.ModelID)
+	}
+	if !drift.Detected && !*force {
+		fmt.Fprintf(out, "all %d stored signature embeddings match model %s — nothing to do (--force re-runs anyway)\n",
+			drift.Total, drift.ModelID)
+		return nil
+	}
+	if drift.Detected {
+		fmt.Fprintf(out, "%d of %d stored signature embeddings need re-compute for model %s\n",
+			drift.Stale, drift.Total, drift.ModelID)
+	}
+
+	if app.DaemonInfo != nil {
+		if running, _, ver := app.DaemonInfo(); running {
+			// A daemon from an older binary ignores the reembed nudge
+			// (unknown control kind), so "nudged" would wait forever.
+			// Replacing it re-embeds anyway: startup reconciles the rows.
+			if ver != buildinfo.Version {
+				return fmt.Errorf("daemon is STALE (running %s, binary is %s) — run: hap daemon --ensure (its startup re-embeds automatically)",
+					daemonlock.VersionLabel(ver), buildinfo.Version)
+			}
+			if err := app.RequestReembed(ctx); err != nil {
+				return err
+			}
+			fmt.Fprintln(out, "daemon nudged — re-embedding runs in the background; check: hap status")
+			return nil
+		}
+	}
+
+	res, err := app.ReembedStandalone(ctx, func(done, total int, sig string, rowErr error) {
+		if rowErr != nil {
+			fmt.Fprintf(out, "  %s: %v\n", sig, rowErr)
+		} else if done%25 == 0 || done == total {
+			fmt.Fprintf(out, "  %d/%d\n", done, total)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "re-embedded %d, kept %d, downgraded %d (text-only) — model %s\n",
+		res.Reembedded, res.Kept, res.Downgraded, drift.ModelID)
+	if res.PersistFailed > 0 {
+		fmt.Fprintf(out, "WARNING: %d re-embedded row(s) failed to persist and stay stale — re-run: hap signatures reembed\n",
+			res.PersistFailed)
+	}
+	return nil
 }
 
 func signaturesList(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
@@ -297,6 +365,12 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	fmt.Fprintf(out, "monitored agents:    %d\n", len(st.MonitoredAgents))
 	if st.Embedding != "" {
 		fmt.Fprintf(out, "semantic matching:   %s\n", st.Embedding)
+	}
+	if st.Drift.Detected {
+		// Same shape as the STALE-daemon line: the mismatch and the remedy
+		// in one glance.
+		fmt.Fprintf(out, "embedding drift:     %d of %d rules embedded with a previous model; run: hap signatures reembed\n",
+			st.Drift.Stale, st.Drift.Total)
 	}
 	if st.LatestKill != nil {
 		fmt.Fprintf(out, "last kill event:     %s by %s at %s\n",

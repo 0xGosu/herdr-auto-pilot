@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
@@ -33,6 +36,207 @@ func testApp(t *testing.T) (*frontend.App, *store.Store) {
 		Author:     "operator",
 		// no ControlPath: nudges are skipped (daemon absent is legal)
 	}, st
+}
+
+// fakeEmbedder is a canned embedder for the standalone re-embed path.
+type fakeEmbedder struct {
+	fail bool
+	dims int
+	id   string
+}
+
+func (f *fakeEmbedder) EmbedText(context.Context, string) ([]float32, error) {
+	if f.fail {
+		return nil, errors.New("induced embed failure")
+	}
+	v := make([]float32, f.dims)
+	v[0] = 1
+	return v, nil
+}
+func (f *fakeEmbedder) ModelID() string { return f.id }
+func (f *fakeEmbedder) Dims() int       { return f.dims }
+func (f *fakeEmbedder) Close() error    { return nil }
+
+// seedEmbeddingRow persists one semantic identity row minted by `model`.
+func seedEmbeddingRow(t *testing.T, st *store.Store, sig, model string, vec []float32) {
+	t.Helper()
+	if err := st.UpsertSignatureEmbedding(context.Background(), domain.SignatureEmbedding{
+		Signature: sig, SituationType: domain.SituationApproval, AgentType: "claude",
+		Model: model, Dims: len(vec), Vector: vec,
+		Salient: "permission:" + sig, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeEmbeddingConfig points [embedding] model_path at a real temp file so
+// the drift check sees the model as present.
+func writeEmbeddingConfig(t *testing.T, app *frontend.App) string {
+	t.Helper()
+	modelPath := filepath.Join(t.TempDir(), "test-model.gguf")
+	if err := os.WriteFile(modelPath, []byte("gguf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgTOML := fmt.Sprintf("[embedding]\nmodel_path = %q\n", modelPath)
+	if err := os.WriteFile(app.ConfigPath, []byte(cfgTOML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return modelPath
+}
+
+func TestEmbeddingDrift(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	writeEmbeddingConfig(t, app)
+
+	// No rows yet: no drift.
+	d, err := app.EmbeddingDrift(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Detected || d.ModelMissing || d.ModelID != "test-model.gguf" {
+		t.Errorf("empty store must not drift: %+v", d)
+	}
+
+	seedEmbeddingRow(t, st, "current", "test-model.gguf", []float32{1, 0, 0})
+	seedEmbeddingRow(t, st, "legacy", "old-model.gguf", []float32{1, 0})
+	d, err = app.EmbeddingDrift(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Detected || d.Stale != 1 || d.Total != 2 {
+		t.Errorf("drift = %+v, want Detected with 1 of 2 stale", d)
+	}
+
+	// GetStatus carries the same check.
+	st2, err := app.GetStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st2.Drift.Detected || st2.Drift.Stale != 1 {
+		t.Errorf("status drift = %+v, want detected", st2.Drift)
+	}
+
+	// Missing model file → ModelMissing, drift still counted.
+	cfgTOML := "[embedding]\nmodel_path = \"/nonexistent/other-model.gguf\"\n"
+	if err := os.WriteFile(app.ConfigPath, []byte(cfgTOML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err = app.EmbeddingDrift(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.ModelMissing || !d.Detected || d.Stale != 2 {
+		t.Errorf("missing model: %+v, want ModelMissing with 2 stale", d)
+	}
+
+	// Disabled embedding → zero-valued.
+	if err := os.WriteFile(app.ConfigPath, []byte("[embedding]\ndisabled = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err = app.EmbeddingDrift(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Detected || d.ModelID != "" {
+		t.Errorf("disabled embedding must report zero drift: %+v", d)
+	}
+}
+
+func TestRequestReembedRequiresDaemon(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+
+	app.DaemonInfo = func() (bool, int, string) { return false, 0, "" }
+	err := app.RequestReembed(ctx)
+	if err == nil || !strings.Contains(err.Error(), "hap signatures reembed") {
+		t.Errorf("daemon-down error must point at the CLI remedy, got %v", err)
+	}
+
+	// Daemon up: the KindReembed nudge reaches the control socket.
+	sock := filepath.Join(testutil.SocketDir(t), "ctl.sock")
+	var mu sync.Mutex
+	var kinds []control.Kind
+	srv, err := control.NewServer(sock, func(k control.Kind) {
+		mu.Lock()
+		kinds = append(kinds, k)
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	app.ControlPath = sock
+	app.DaemonInfo = func() (bool, int, string) { return true, 42, "test" }
+	if err := app.RequestReembed(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(kinds)
+		mu.Unlock()
+		if n > 0 {
+			if kinds[0] != control.KindReembed {
+				t.Errorf("nudge kind = %v, want %v", kinds[0], control.KindReembed)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("reembed nudge never reached the daemon socket")
+}
+
+func TestReembedStandalone(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	writeEmbeddingConfig(t, app)
+	seedEmbeddingRow(t, st, "legacy", "old-model.gguf", []float32{1, 0})
+	seedEmbeddingRow(t, st, "current", "test-model.gguf", []float32{1, 0, 0})
+	app.NewEmbedder = func(config.Embedding) ports.EmbedderPort {
+		return &fakeEmbedder{dims: 3, id: "test-model.gguf"}
+	}
+
+	// Refused while a daemon runs (it owns signature_embeddings writes).
+	app.DaemonInfo = func() (bool, int, string) { return true, 42, "test" }
+	if _, err := app.ReembedStandalone(ctx, nil); err == nil {
+		t.Fatal("standalone re-embed must refuse while a daemon is running")
+	}
+
+	app.DaemonInfo = func() (bool, int, string) { return false, 0, "" }
+	res, err := app.ReembedStandalone(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reembedded != 1 || res.Kept != 1 || res.Downgraded != 0 {
+		t.Errorf("Reembedded/Kept/Downgraded = %d/%d/%d, want 1/1/0",
+			res.Reembedded, res.Kept, res.Downgraded)
+	}
+	d, err := app.EmbeddingDrift(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Detected {
+		t.Errorf("drift must clear after standalone re-embed: %+v", d)
+	}
+
+	// An unavailable model fails loudly instead of silently doing nothing.
+	app.NewEmbedder = func(config.Embedding) ports.EmbedderPort {
+		return &fakeEmbedder{fail: true}
+	}
+	seedEmbeddingRow(t, st, "legacy2", "old-model.gguf", []float32{1, 0})
+	if _, err := app.ReembedStandalone(ctx, nil); err == nil ||
+		!strings.Contains(err.Error(), "embedding model unavailable") {
+		t.Errorf("warm failure must surface, got %v", err)
+	}
+
+	// Disabled embedding is an explicit error, not a silent no-op.
+	if err := os.WriteFile(app.ConfigPath, []byte("[embedding]\ndisabled = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ReembedStandalone(ctx, nil); err == nil {
+		t.Error("disabled embedding must error")
+	}
 }
 
 func TestPauseResumeAppendsKillEvents(t *testing.T) {
@@ -399,6 +603,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"thresholds.error":                    "0.90",
 		"thresholds.inferred_task_bar":        "0.95",
 		"learning.graduation_n":               "5",
+		"embedding.pane_salient_chars":        "800",
 		"limits.max_consecutive_auto_prompts": "5",
 		"limits.max_auto_prompts_per_minute":  "10",
 		"limits.max_error_retries":            "2",
@@ -450,6 +655,34 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		if err := app.SetField(ctx, key, samples[key]); err != nil {
 			t.Errorf("SetField(%s, %q) rejected a valid value: %v", key, samples[key], err)
 		}
+	}
+}
+
+func TestPaneSalientCharsFieldDisplay(t *testing.T) {
+	// Unset (0) renders the effective built-in default, not a bare "0".
+	def := config.Default()
+	got := frontend.FieldValue(def, "embedding.pane_salient_chars")
+	if !strings.Contains(got, "default") || !strings.Contains(got, "800") {
+		t.Errorf("unset pane_salient_chars should show the default, got %q", got)
+	}
+	// An explicit value renders plainly.
+	def.Embedding.PaneSalientChars = 1200
+	if got := frontend.FieldValue(def, "embedding.pane_salient_chars"); got != "1200" {
+		t.Errorf("explicit pane_salient_chars display = %q, want 1200", got)
+	}
+
+	// SetField round-trips through the store and rejects non-positive values.
+	app, _ := testApp(t)
+	ctx := context.Background()
+	if err := app.SetField(ctx, "embedding.pane_salient_chars", "1000"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := app.Config()
+	if cfg.Embedding.PaneSalientChars != 1000 {
+		t.Errorf("SetField did not persist pane_salient_chars, got %d", cfg.Embedding.PaneSalientChars)
+	}
+	if err := app.SetField(ctx, "embedding.pane_salient_chars", "0"); err == nil {
+		t.Error("pane_salient_chars must reject 0 (use omission for the default)")
 	}
 }
 

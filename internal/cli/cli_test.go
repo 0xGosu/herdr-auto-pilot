@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,8 +12,10 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
@@ -324,5 +327,153 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 	}
 	if !strings.Contains(out, "rule=shadow") || !strings.Contains(out, "rule=-") {
 		t.Errorf("audit rows should carry the rule mode marker (or dash), got:\n%s", out)
+	}
+}
+
+// cliFakeEmbedder backs the standalone reembed path in CLI tests.
+type cliFakeEmbedder struct{ id string }
+
+func (f *cliFakeEmbedder) EmbedText(context.Context, string) ([]float32, error) {
+	return []float32{1, 0, 0}, nil
+}
+func (f *cliFakeEmbedder) ModelID() string { return f.id }
+func (f *cliFakeEmbedder) Dims() int       { return 3 }
+func (f *cliFakeEmbedder) Close() error    { return nil }
+
+// setupReembedApp seeds one stale + one current embedding row and points
+// the config at an existing dummy model file.
+func setupReembedApp(t *testing.T, app *frontend.App, st *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	modelPath := filepath.Join(t.TempDir(), "test-model.gguf")
+	if err := os.WriteFile(modelPath, []byte("gguf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf("[embedding]\nmodel_path = %q\n", modelPath)
+	if err := os.WriteFile(app.ConfigPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []domain.SignatureEmbedding{
+		{Signature: "approval:legacy", SituationType: domain.SituationApproval,
+			AgentType: "claude", Model: "old-model.gguf", Dims: 2, Vector: []float32{1, 0},
+			Salient: "permission:legacy", CreatedAt: time.Now()},
+		{Signature: "approval:current", SituationType: domain.SituationApproval,
+			AgentType: "claude", Model: "test-model.gguf", Dims: 3, Vector: []float32{1, 0, 0},
+			Salient: "permission:current", CreatedAt: time.Now()},
+	} {
+		if err := st.UpsertSignatureEmbedding(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app.NewEmbedder = func(config.Embedding) ports.EmbedderPort {
+		return &cliFakeEmbedder{id: "test-model.gguf"}
+	}
+}
+
+func TestSignaturesReembedStandalone(t *testing.T) {
+	app, st := testApp(t)
+	setupReembedApp(t, app, st)
+	app.DaemonInfo = func() (bool, int, string) { return false, 0, "" }
+
+	out, err := run(t, app, "signatures", "reembed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "1 of 2 stored signature embeddings need re-compute") {
+		t.Errorf("missing drift summary, got:\n%s", out)
+	}
+	if !strings.Contains(out, "re-embedded 1, kept 1, downgraded 0") {
+		t.Errorf("missing result summary, got:\n%s", out)
+	}
+
+	// A second run has nothing to do without --force.
+	out, err = run(t, app, "signatures", "reembed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "nothing to do") {
+		t.Errorf("clean state should read nothing to do, got:\n%s", out)
+	}
+
+	// --force re-runs anyway (the degraded-latch retry path).
+	out, err = run(t, app, "signatures", "reembed", "--force")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "re-embedded") {
+		t.Errorf("--force should run the pass, got:\n%s", out)
+	}
+}
+
+func TestSignaturesReembedNudgesRunningDaemon(t *testing.T) {
+	app, st := testApp(t)
+	setupReembedApp(t, app, st)
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, buildinfo.Version }
+
+	out, err := run(t, app, "signatures", "reembed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "daemon nudged") {
+		t.Errorf("running daemon should be nudged, got:\n%s", out)
+	}
+	// The CLI did not write the rows itself — the daemon owns them.
+	if n, _ := st.CountStaleSignatureEmbeddings(context.Background(), "test-model.gguf"); n != 1 {
+		t.Errorf("stale rows = %d, want 1 (untouched by the CLI)", n)
+	}
+}
+
+func TestSignaturesReembedRefusesStaleDaemon(t *testing.T) {
+	app, st := testApp(t)
+	setupReembedApp(t, app, st)
+	// A running daemon from an older binary would silently ignore the
+	// reembed nudge, so the CLI must refuse and point at --ensure.
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, "v0.0.1" }
+
+	_, err := run(t, app, "signatures", "reembed")
+	if err == nil || !strings.Contains(err.Error(), "hap daemon --ensure") {
+		t.Errorf("stale daemon must refuse with the --ensure remedy, got %v", err)
+	}
+	// The rows are untouched — the CLI did not fall through to standalone.
+	if n, _ := st.CountStaleSignatureEmbeddings(context.Background(), "test-model.gguf"); n != 1 {
+		t.Errorf("stale rows = %d, want 1 (untouched)", n)
+	}
+}
+
+func TestSignaturesReembedMissingModel(t *testing.T) {
+	app, st := testApp(t)
+	setupReembedApp(t, app, st)
+	cfg := "[embedding]\nmodel_path = \"/nonexistent/model.gguf\"\n"
+	if err := os.WriteFile(app.ConfigPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := run(t, app, "signatures", "reembed")
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("missing model must error with the config remedy, got %v", err)
+	}
+}
+
+func TestStatusShowsEmbeddingDrift(t *testing.T) {
+	app, st := testApp(t)
+	setupReembedApp(t, app, st)
+
+	out, err := run(t, app, "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "embedding drift:") ||
+		!strings.Contains(out, "1 of 2 rules embedded with a previous model") ||
+		!strings.Contains(out, "run: hap signatures reembed") {
+		t.Errorf("status must flag embedding drift with the remedy, got:\n%s", out)
+	}
+
+	// No drift → no line.
+	app2, _ := testApp(t)
+	out, err = run(t, app2, "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "embedding drift:") {
+		t.Errorf("driftless status must not show the drift line, got:\n%s", out)
 	}
 }

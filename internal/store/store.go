@@ -2,8 +2,11 @@
 // busy_timeout, transactional writes). Write ownership is partitioned per
 // the solution's Concurrency & Durability Model: the daemon exclusively
 // writes hot-path rows (signatures, agent_rate, error_retries, decisions,
-// its audit rows); front-ends write corrections/kill_events; the mcp
-// process writes llm_decisions only.
+// its audit rows, signature_embeddings); front-ends write
+// corrections/kill_events; the mcp process writes llm_decisions only. One
+// maintenance exception: `hap signatures reembed` rewrites
+// signature_embeddings from the CLI process when no daemon is running
+// (verified via the daemon lock).
 package store
 
 import (
@@ -495,6 +498,17 @@ func (s *Store) CountSignatureEmbeddings(ctx context.Context) (int64, error) {
 	var n int64
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM signature_embeddings`).Scan(&n)
+	return n, err
+}
+
+// CountStaleSignatureEmbeddings counts semantic identity rows whose vector
+// was not produced by the given model — including text-only rows (no
+// vector) — i.e. rows a re-embed pass would rewrite.
+func (s *Store) CountStaleSignatureEmbeddings(ctx context.Context, model string) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM signature_embeddings
+		 WHERE model <> ? OR vector IS NULL OR dims <= 0`, model).Scan(&n)
 	return n, err
 }
 

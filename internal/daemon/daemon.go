@@ -209,7 +209,15 @@ func New(opt Options) (*Daemon, error) {
 
 // reload re-reads TOML config and rebuilds derived state (classifier,
 // never-auto list). Malformed config keeps the previous good state.
-func (d *Daemon) reload() error {
+func (d *Daemon) reload() error { return d.reloadWith(false) }
+
+// reloadWith(forceEmbedder=true) additionally rebuilds the embedder from a
+// FRESH instance even when the [embedding] config is unchanged — a new
+// instance starts with a clean degraded-failure latch, so a re-embed
+// request can retry a model that previously failed. (With a static
+// Options.Embedder — tests — there is nothing to swap; the pass still
+// re-runs initSemantic.)
+func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	cfg, err := config.Load(d.opt.ConfigPath)
 	if err != nil {
 		slog.Error("config reload failed; keeping previous config", "error", err)
@@ -243,7 +251,7 @@ func (d *Daemon) reload() error {
 	d.llm = llmPort
 	d.mu.Unlock()
 
-	d.reloadEmbedder(prev, cfg, first)
+	d.reloadEmbedder(prev, cfg, first || forceEmbedder)
 	slog.Info("configuration loaded", "path", d.opt.ConfigPath)
 	return nil
 }
@@ -345,8 +353,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 			})
 		case kind := <-d.nudges:
 			logging.Guard("nudge", func() error {
-				if kind == control.KindReload {
+				switch kind {
+				case control.KindReload:
 					d.reload()
+				case control.KindReembed:
+					// Operator-requested re-compute: force a fresh embedder
+					// (clean degraded latch) and re-run the semantic init.
+					d.reloadWith(true)
 				}
 				d.processCorrections(ctx)
 				d.expireStaleLLMWork(ctx)
@@ -560,7 +573,7 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 
 	cfg, allow, _ := d.snapshot()
 
-	sig := domain.ComputeSignature(situation)
+	sig := domain.ComputeSignatureN(situation, cfg.Embedding.PaneSalientChars)
 	// Semantic resolution may remap the key onto an existing learned
 	// signature (embedding / BM25 match on the masked salient content);
 	// sig.Raw always keeps the literal content hash.
@@ -1259,7 +1272,7 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 		// Compare raw content hashes: the staged signature may have been
 		// semantically remapped onto another key, but Raw always reflects
 		// the pane content as read, so equal Raw means the pane held still.
-		if freshSig := domain.ComputeSignature(current); freshSig.Raw != res.sig.Raw {
+		if freshSig := domain.ComputeSignatureN(current, cfg.Embedding.PaneSalientChars); freshSig.Raw != res.sig.Raw {
 			slog.Info("signature changed during rewrite; dropping send", "agent", s.AgentID)
 			return
 		}
@@ -1513,7 +1526,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			reject(domain.ReasonLLMNoSubmit, "stale: form changed during consult")
 			return
 		}
-	} else if freshSig := domain.ComputeSignature(current); freshSig.Raw != res.sig.Raw {
+	} else if freshSig := domain.ComputeSignatureN(current, cfg.Embedding.PaneSalientChars); freshSig.Raw != res.sig.Raw {
 		// Compare raw content hashes: the staged signature may have been
 		// semantically remapped onto another key, but Raw always reflects
 		// the pane content as read, so equal Raw means the pane did not

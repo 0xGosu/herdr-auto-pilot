@@ -121,6 +121,16 @@ type Embedding struct {
 	BM25MinScore float64 `toml:"bm25_min_score"`
 	// GPULayers offloads model layers to the GPU (0 = CPU only).
 	GPULayers int `toml:"gpu_layers"`
+	// PaneSalientChars bounds the fallback salient window: for situations
+	// with no structured salient field (idle, and any unclassified content),
+	// the signature and its embedding are minted from the trailing this-many
+	// characters of pane content. 0 → the built-in default
+	// (domain.DefaultPaneSalientChars). Widening it captures more context
+	// (still well within the embedding model's window); changing it re-keys
+	// idle/unclassified signatures whose content exceeds the old window, so
+	// those rules re-learn (structured approval/choice/error rules are
+	// unaffected).
+	PaneSalientChars int `toml:"pane_salient_chars"`
 }
 
 // TaskSource points an agent or workspace at a declared next-task list (FR-011).
@@ -178,6 +188,7 @@ type PaletteOverrides struct {
 	OK      string `toml:"ok,omitempty"`
 	Paused  string `toml:"paused,omitempty"`
 	Running string `toml:"running,omitempty"`
+	Warn    string `toml:"warn,omitempty"`
 	Help    string `toml:"help,omitempty"`
 }
 

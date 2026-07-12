@@ -106,9 +106,11 @@ type RewriterPort interface {
 }
 
 // StorePort is the persistence boundary. Write-ownership is partitioned:
-// daemon-exclusive writers for signatures/agent_rate/error_retries/decisions
-// and daemon-emitted audit rows; front-ends write corrections/kill_events;
-// the mcp process writes llm_decisions only.
+// daemon-exclusive writers for signatures/agent_rate/error_retries/decisions,
+// daemon-emitted audit rows, and signature_embeddings (with one maintenance
+// exception: `hap signatures reembed` rewrites signature_embeddings from the
+// CLI process when no daemon is running); front-ends write
+// corrections/kill_events; the mcp process writes llm_decisions only.
 type StorePort interface {
 	DaemonStore
 	FrontendStore
@@ -220,6 +222,9 @@ type ReadStore interface {
 	ListSignatureEmbeddings(ctx context.Context) ([]domain.SignatureEmbedding, error)
 	// CountSignatureEmbeddings reports how many semantic identity rows exist.
 	CountSignatureEmbeddings(ctx context.Context) (int64, error)
+	// CountStaleSignatureEmbeddings counts rows a re-embed under the given
+	// model id would rewrite (other-model vectors and text-only rows).
+	CountStaleSignatureEmbeddings(ctx context.Context, model string) (int64, error)
 	// GetSignatureSnapshot returns the pane excerpt a signature was first
 	// seen with, or "" when none was captured (pre-snapshot rules).
 	GetSignatureSnapshot(ctx context.Context, signature string) (string, error)

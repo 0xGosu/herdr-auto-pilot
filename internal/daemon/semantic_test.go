@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
@@ -21,6 +23,7 @@ type fakeEmbedder struct {
 	vectors map[string][]float32
 	calls   int
 	fail    bool
+	closed  bool
 }
 
 func (f *fakeEmbedder) EmbedText(ctx context.Context, text string) ([]float32, error) {
@@ -40,12 +43,24 @@ func (f *fakeEmbedder) EmbedText(ctx context.Context, text string) ([]float32, e
 
 func (f *fakeEmbedder) ModelID() string { return "fake-model" }
 func (f *fakeEmbedder) Dims() int       { return 4 }
-func (f *fakeEmbedder) Close() error    { return nil }
+
+func (f *fakeEmbedder) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+	return nil
+}
 
 func (f *fakeEmbedder) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+func (f *fakeEmbedder) wasClosed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
 }
 
 // semanticHarness builds a daemon with a real store + matcher and a fake
@@ -300,4 +315,101 @@ func TestInitSemanticRebuildsFromStoreAndReembedsForeignModels(t *testing.T) {
 	if sig.Signature != "approval:legacy" {
 		t.Errorf("resolved to %s, want approval:legacy", sig.Signature)
 	}
+}
+
+// TestReembedNudgeSwapsEmbedderAndRetriesDegraded covers the KindReembed
+// path (reloadWith(true)): a failed re-embed pass — the shape a degraded
+// embedder latch leaves behind — is retried with a FRESH embedder even
+// though the [embedding] config never changed, while a plain reload keeps
+// the existing (possibly latched) instance.
+func TestReembedNudgeSwapsEmbedderAndRetriesDegraded(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	raw, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+
+	if err := raw.UpsertSignatureEmbedding(ctx, domain.SignatureEmbedding{
+		Signature: "approval:legacy", SituationType: domain.SituationApproval,
+		AgentType: "claude", Model: "old-model", Dims: 2, Vector: []float32{1, 0},
+		Salient: "permission:push to remote", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The factory hands out whatever `current` points at, like the prod
+	// factory building an embedder from live config.
+	failing := &fakeEmbedder{fail: true}
+	var mu sync.Mutex
+	current := ports.EmbedderPort(failing)
+	factoryCalls := 0
+	factory := func(config.Config) ports.EmbedderPort {
+		mu.Lock()
+		defer mu.Unlock()
+		factoryCalls++
+		return current
+	}
+
+	d, err := New(Options{
+		ConfigPath:        filepath.Join(dir, "config.toml"),
+		ControlSocketPath: filepath.Join(testutil.SocketDir(t), "c.sock"),
+		Store:             raw,
+		Herdr:             &fakeHerdr{},
+		Events:            &fakeEvents{ch: make(chan domain.AgentTransition, 4)},
+		Notify:            &fakeHerdr{},
+		EmbedderFactory:   factory,
+		MatchIndexDir:     filepath.Join(dir, "match-index"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if d.matcher != nil {
+			d.matcher.Close()
+		}
+	})
+	waitFor(t, 5*time.Second, func() bool { return d.semanticReady.Load() })
+
+	// The failing embedder left the row on the old model (text-only pass).
+	rows, _ := raw.ListSignatureEmbeddings(ctx)
+	if len(rows) != 1 || rows[0].Model != "old-model" {
+		t.Fatalf("row should be untouched after a failed pass: %+v", rows)
+	}
+
+	// A plain reload must NOT rebuild the embedder (config unchanged): the
+	// factory is not consulted again, so a degraded instance would persist.
+	if err := d.reload(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	calls := factoryCalls
+	mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("plain reload rebuilt the embedder (factory calls = %d, want 1)", calls)
+	}
+
+	// The forced path (KindReembed) swaps in a fresh instance and re-embeds.
+	working := &fakeEmbedder{}
+	mu.Lock()
+	current = working
+	mu.Unlock()
+	if err := d.reloadWith(true); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	calls = factoryCalls
+	mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("forced reload must rebuild the embedder (factory calls = %d, want 2)", calls)
+	}
+	if !failing.wasClosed() {
+		t.Error("the replaced embedder must be closed")
+	}
+
+	waitFor(t, 5*time.Second, func() bool {
+		rows, err := raw.ListSignatureEmbeddings(ctx)
+		return err == nil && len(rows) == 1 && rows[0].Model == "fake-model" && rows[0].Dims == 4
+	})
 }

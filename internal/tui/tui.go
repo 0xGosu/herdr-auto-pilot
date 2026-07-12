@@ -536,6 +536,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.do("automation paused", func(ctx context.Context) error { return m.app.Pause(ctx) })
 	case "r":
 		return m, m.do("automation resumed", func(ctx context.Context) error { return m.app.Resume(ctx) })
+	case "R":
+		switch d := m.data.status.Drift; {
+		case !d.Detected:
+			m.message = "no embedding drift detected — rules already match the configured model"
+		case d.ModelMissing:
+			// Match the CLI's refusal: a re-embed cannot run without the
+			// model file, so a "requested" toast would be a lie.
+			m.message = "embedding model not found — fix embedding.model_path first"
+		default:
+			return m, m.do("re-compute requested — daemon is re-embedding in the background",
+				func(ctx context.Context) error { return m.app.RequestReembed(ctx) })
+		}
+		return m, nil
 	case "enter", "y":
 		switch m.tab {
 		case tabEscalations:
@@ -1463,6 +1476,16 @@ func (m Model) View() string {
 	if m.data.err != nil {
 		fmt.Fprintf(&b, "%s\n", st.err.Render("error: "+m.data.err.Error()))
 	}
+	// Embedding-model drift banner: stored rule embeddings were minted by a
+	// different model than the configured one, so semantic matching misses
+	// until they are re-computed. Suppressed while the model file itself is
+	// missing — a re-embed cannot run yet, and the semantic-matching status
+	// line already reports the missing model.
+	if d := m.data.status.Drift; d.Detected && !d.ModelMissing {
+		fmt.Fprintf(&b, "%s\n", st.warn.Render(fmt.Sprintf(
+			"⚠ embedding model changed — %d of %d rules need re-compute; press R or run: hap signatures reembed",
+			d.Stale, d.Total)))
+	}
 
 	if m.detail != nil {
 		m.renderDetail(&b)
@@ -1528,6 +1551,9 @@ func (m Model) helpLine() string {
 		return "type to filter  backspace: erase  esc/enter: apply & close"
 	}
 	common := "tab: switch  ↑/↓: select  p: pause  r: resume  q: quit"
+	if d := m.data.status.Drift; d.Detected && !d.ModelMissing {
+		common = "R: re-embed  " + common
+	}
 	switch m.tab {
 	case tabAgents:
 		return "v: details  n: rename agent  /: search  " + common

@@ -57,6 +57,12 @@ const overMaskMinContent = 12
 // may consist of placeholders before the situation is deemed over-masked.
 const overMaskMaxRatio = 0.6
 
+// DefaultPaneSalientChars is the fallback window: for situations with no
+// structured salient field (idle, and any unclassified content), the
+// signature is minted from the last this-many characters of pane content.
+// Operators can widen or narrow it via embedding.pane_salient_chars.
+const DefaultPaneSalientChars = 800
+
 // SignatureResult is the output of signature generation.
 type SignatureResult struct {
 	// Signature is the learning key situations are matched under. Semantic
@@ -73,7 +79,15 @@ type SignatureResult struct {
 // type + agent type + salient decision content, with volatile tokens masked,
 // scoped per agent type. It applies the over-masking floor (FR-003a).
 func ComputeSignature(s Situation) SignatureResult {
-	salient := salientContent(s)
+	return ComputeSignatureN(s, DefaultPaneSalientChars)
+}
+
+// ComputeSignatureN is ComputeSignature with an explicit fallback content
+// window: salientChars bounds the trailing pane-content characters used for
+// idle and unclassified situations; salientChars <= 0 falls back to
+// DefaultPaneSalientChars.
+func ComputeSignatureN(s Situation, salientChars int) SignatureResult {
+	salient := salientContent(s, salientChars)
 	masked := MaskVolatile(salient)
 
 	if verdict := overMaskVerdict(masked); verdict != GuardOK {
@@ -93,9 +107,9 @@ func ComputeSignature(s Situation) SignatureResult {
 
 // salientContent extracts the decision-relevant content per situation type:
 // the normalized option set for choices, the permission verb/action for
-// approvals, the error summary for errors, and a trimmed head of the pane
-// content otherwise.
-func salientContent(s Situation) string {
+// approvals, the error summary for errors, and the trailing salientChars
+// characters of the pane content otherwise.
+func salientContent(s Situation, salientChars int) string {
 	switch s.Type {
 	case SituationChoice:
 		opts := make([]string, len(s.Options))
@@ -113,10 +127,14 @@ func salientContent(s Situation) string {
 			return "error:" + s.ErrorSummary
 		}
 	}
+	if salientChars <= 0 {
+		salientChars = DefaultPaneSalientChars
+	}
 	content := s.Content
-	const head = 400
-	if len(content) > head {
-		content = content[len(content)-head:]
+	// Trailing salientChars characters (rune-aware, so a multibyte glyph is
+	// never split at the window boundary — matches the "chars" naming).
+	if r := []rune(content); len(r) > salientChars {
+		content = string(r[len(r)-salientChars:])
 	}
 	return content
 }

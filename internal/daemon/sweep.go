@@ -164,7 +164,8 @@ func (d *Daemon) handleSweepOutcome(ctx context.Context, res sweepOutcome) {
 	d.releasePane(res.situation.AgentID)
 	now := d.opt.Clock.Now()
 	if res.degraded {
-		sig := domain.ComputeSignature(res.situation)
+		cfg, _, _ := d.snapshot()
+		sig := domain.ComputeSignatureN(res.situation, cfg.Embedding.PaneSalientChars)
 		d.escalate(ctx, res.situation, sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonHerdrUnreachable,
 			Rationale: "sweep failed: " + res.reason + "; partial capture, answer in pane",

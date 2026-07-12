@@ -154,3 +154,36 @@ func TestComputeSignatureRawMirrorsKey(t *testing.T) {
 			over.Signature, over.Raw)
 	}
 }
+
+func TestComputeSignatureNWindow(t *testing.T) {
+	// salientContent keeps the TRAILING salientChars of pane content, so the
+	// distinguishing text goes in the PREFIX with a long shared suffix: a
+	// narrow (tail) window sees only the shared suffix, a wide window reaches
+	// back into the differing prefix.
+	suffix := strings.Repeat("status ok ", 60) // ~600 chars of shared real words
+	a := sit(SituationIdle, "claude", "the build finished successfully "+suffix)
+	b := sit(SituationIdle, "claude", "the build failed with three errs "+suffix)
+
+	// Narrow window (only the shared suffix fits) → identical salient.
+	if narrowA, narrowB := ComputeSignatureN(a, 20), ComputeSignatureN(b, 20); narrowA.Salient != narrowB.Salient {
+		t.Fatalf("narrow window premise broken: %q vs %q", narrowA.Salient, narrowB.Salient)
+	}
+
+	// Wide window (spans back into the differing prefix) → distinct signatures.
+	wideA := ComputeSignatureN(a, 800)
+	wideB := ComputeSignatureN(b, 800)
+	if wideA.Verdict != GuardOK || wideB.Verdict != GuardOK {
+		t.Fatalf("wide window should yield valid signatures: %v / %v", wideA.Verdict, wideB.Verdict)
+	}
+	if wideA.Raw == wideB.Raw {
+		t.Errorf("wider window must distinguish prefixes a narrow one cannot see: both = %q", wideA.Raw)
+	}
+
+	// salientChars <= 0 falls back to the default window (same as ComputeSignature).
+	if got, want := ComputeSignatureN(a, 0).Raw, ComputeSignature(a).Raw; got != want {
+		t.Errorf("salientChars<=0 should match the default: %q vs %q", got, want)
+	}
+	if DefaultPaneSalientChars != 800 {
+		t.Errorf("DefaultPaneSalientChars = %d, want 800", DefaultPaneSalientChars)
+	}
+}

@@ -52,6 +52,39 @@ func TestNudgeRoundTrip(t *testing.T) {
 	t.Fatal("nudge never reached the handler")
 }
 
+func TestReembedNudgeRoundTrip(t *testing.T) {
+	path := filepath.Join(testutil.SocketDir(t), "ctl.sock")
+	var mu sync.Mutex
+	var got []Kind
+	srv, err := NewServer(path, func(k Kind) {
+		mu.Lock()
+		got = append(got, k)
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	if err := Nudge(context.Background(), path, KindReembed); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n == 1 {
+			if got[0] != KindReembed {
+				t.Errorf("kind = %v, want %v", got[0], KindReembed)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("reembed nudge never reached the handler")
+}
+
 func TestSocketOwnerOnlyPermissions(t *testing.T) {
 	path := filepath.Join(testutil.SocketDir(t), "ctl.sock")
 	srv, err := NewServer(path, func(Kind) {})

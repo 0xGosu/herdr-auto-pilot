@@ -52,6 +52,8 @@ Operate:
   audit [--limit N]     show the audit log
   signatures [list|show <sig>|delete <sig> [--yes]]   learned signatures (alias: sigs)
                         list filters: --type T --mode M --agent-type A --min-conf C
+  signatures reembed [--force]   re-compute stored embeddings after an
+                        embedding model change (via the daemon when running)
   pause | resume        global pause/kill switch
   kill-history          pause/kill event history
 
