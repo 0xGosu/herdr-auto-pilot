@@ -490,18 +490,24 @@ func TestEscalationsRowWidensWithTerminal(t *testing.T) {
 	wm.tab = tabEscalations
 	wideView := wm.View()
 
-	widestLine := func(v string) int {
+	// Measure the escalation DATA rows (lines behind the mark cell starting
+	// with "#"), not the whole View: the static help/header chrome does not
+	// scale with terminal width and would mask the row growth this asserts.
+	widestRow := func(v string) int {
 		max := 0
 		for _, ln := range strings.Split(v, "\n") {
+			if !strings.HasPrefix(strings.TrimLeft(ln, " ✓"), "#") {
+				continue
+			}
 			if n := len([]rune(ln)); n > max {
 				max = n
 			}
 		}
 		return max
 	}
-	if widestLine(wideView) <= widestLine(narrow) {
+	if widestRow(wideView) <= widestRow(narrow) {
 		t.Errorf("wide terminal (%d) should render longer rows than narrow (%d)",
-			widestLine(wideView), widestLine(narrow))
+			widestRow(wideView), widestRow(narrow))
 	}
 }
 
@@ -1043,5 +1049,227 @@ func TestReembedKey(t *testing.T) {
 	}
 	if res.err == nil || !strings.Contains(res.err.Error(), "hap signatures reembed") {
 		t.Errorf("daemon-down R should surface the CLI remedy, got %v", res.err)
+	}
+}
+
+// retryAppModel builds a Model backed by a real App/store holding one
+// retryable ([llm_timeout]) escalation for agent w1:pA, positioned on the
+// Escalations tab. Returns the model, the store, and the escalation id.
+func retryAppModel(t *testing.T) (Model, *store.Store, *frontend.App, int64) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	app := &frontend.App{Store: st, Herdr: &captureHerdr{}, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	ctx := context.Background()
+	id, err := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:pA", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Rationale: "[llm_timeout] llm timeout after 2m0s without submit_decision",
+		Status: "escalated", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(ctx, app)
+	m.width, m.height = 100, 30
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabEscalations
+	return m, st, app, id
+}
+
+func TestRetryLLMListQueuesForFailedConsult(t *testing.T) {
+	m, st, _, id := retryAppModel(t)
+	ctx := context.Background()
+
+	_, cmd := m.Update(pressKeyMsg("l"))
+	if cmd == nil {
+		t.Fatal("l on a retryable escalation should issue the retry command")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok || res.err != nil {
+		t.Fatalf("retry should succeed, got %+v", res)
+	}
+	q, _ := st.UnprocessedLLMRetries(ctx)
+	if len(q) != 1 || q[0].AuditID != id {
+		t.Errorf("retry should queue for audit %d, got %+v", id, q)
+	}
+}
+
+func TestRetryLLMListGatedForNonFailure(t *testing.T) {
+	// A non-LLM-failure escalation offers no retry: the key reports why and
+	// queues nothing.
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	app := &frontend.App{Store: st, Herdr: &captureHerdr{}, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	ctx := context.Background()
+	st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:pA", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Rationale: "[shadow_mode]", Status: "escalated", CreatedAt: time.Now(),
+	})
+	m := New(ctx, app)
+	m.width, m.height = 100, 30
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabEscalations
+
+	upd, cmd := m.Update(pressKeyMsg("l"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Error("l on a non-retryable escalation should not issue a command")
+	}
+	if !strings.Contains(m.message, "failed or timed-out") {
+		t.Errorf("expected an ineligibility hint, got %q", m.message)
+	}
+	if q, _ := st.UnprocessedLLMRetries(ctx); len(q) != 0 {
+		t.Errorf("a gated retry must queue nothing, got %+v", q)
+	}
+}
+
+func TestRetryLLMListGatedWhileConsultPending(t *testing.T) {
+	// A retryable escalation whose agent still has a consult in flight is
+	// disabled: the pending lookup folded into refresh suppresses the key.
+	m, st, app, _ := retryAppModel(t)
+	ctx := context.Background()
+	if _, err := st.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: "req-w1:pA-1", Signature: "sig", SituationType: domain.SituationApproval,
+		AgentType: "claude", AgentID: "w1:pA", ContextJSON: "{}", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Re-refresh so pendingConsult reflects the in-flight consult.
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabEscalations
+
+	upd, cmd := m.Update(pressKeyMsg("l"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Error("l must be inert while a consult is running")
+	}
+	if !strings.Contains(m.message, "already running") {
+		t.Errorf("expected an in-flight hint, got %q", m.message)
+	}
+	if q, _ := st.UnprocessedLLMRetries(ctx); len(q) != 0 {
+		t.Errorf("a gated retry must queue nothing, got %+v", q)
+	}
+}
+
+func TestDetailViewEscalationActionsAndFooter(t *testing.T) {
+	m, st, _, id := retryAppModel(t)
+	ctx := context.Background()
+
+	m = press(t, m, "v")
+	if m.detail == nil || m.detail.confirmID != id {
+		t.Fatalf("v should open the escalation detail snapshotting #%d, got %+v", id, m.detail)
+	}
+	if !m.detail.escRetryable {
+		t.Fatal("a [llm_timeout] escalation detail should be retryable")
+	}
+	// The detail footer mirrors the list's per-entry actions.
+	footer := m.helpLine()
+	for _, want := range []string{"c: correct", "x: delete", "l: retry LLM"} {
+		if !strings.Contains(footer, want) {
+			t.Errorf("detail footer missing %q: %q", want, footer)
+		}
+	}
+
+	// x dismisses the snapshotted escalation.
+	upd, cmd := m.Update(pressKeyMsg("x"))
+	m = upd.(Model)
+	if m.detail != nil {
+		t.Error("x should close the detail overlay")
+	}
+	if cmd == nil {
+		t.Fatal("x should issue the dismiss command")
+	}
+	if res, ok := cmd().(actionResultMsg); !ok || res.err != nil {
+		t.Fatalf("dismiss should succeed, got %+v", res)
+	}
+	if rec, _ := st.GetAudit(ctx, id); rec == nil || rec.Status != "dismissed" {
+		t.Errorf("detail x should dismiss #%d, got %+v", id, rec)
+	}
+}
+
+func TestDetailViewRetryKeyQueuesForSnapshottedID(t *testing.T) {
+	m, st, _, id := retryAppModel(t)
+	ctx := context.Background()
+
+	m = press(t, m, "v")
+	upd, cmd := m.Update(pressKeyMsg("l"))
+	m = upd.(Model)
+	if m.detail != nil {
+		t.Error("l should close the detail overlay")
+	}
+	if cmd == nil {
+		t.Fatal("l on a retryable escalation detail should issue the retry command")
+	}
+	if res, ok := cmd().(actionResultMsg); !ok || res.err != nil {
+		t.Fatalf("retry should succeed, got %+v", res)
+	}
+	q, _ := st.UnprocessedLLMRetries(ctx)
+	if len(q) != 1 || q[0].AuditID != id {
+		t.Errorf("detail retry should queue for the snapshotted #%d, got %+v", id, q)
+	}
+}
+
+func TestDetailViewCorrectTargetsSnapshottedID(t *testing.T) {
+	m, _, _, id := retryAppModel(t)
+	m = press(t, m, "v")
+	upd, _ := m.Update(pressKeyMsg("c"))
+	m = upd.(Model)
+	if m.detail != nil {
+		t.Error("c should close the detail overlay")
+	}
+	if m.prompt == nil {
+		t.Fatal("c should open the correction prompt")
+	}
+	if !strings.Contains(m.prompt.label, fmt.Sprintf("#%d", id)) {
+		t.Errorf("correction prompt should target the snapshotted #%d, got %q", id, m.prompt.label)
+	}
+}
+
+func TestDetailViewNonRetryableHidesRetryAndStaysOnEscalation(t *testing.T) {
+	// The stock escalation (#41) is not an LLM failure: its detail offers no
+	// retry, and pressing l reports that without leaking into a tab switch.
+	m := testModel(t)
+	m.tab = tabEscalations
+	m = press(t, m, "v")
+	if m.detail == nil || m.detail.escRetryable {
+		t.Fatalf("non-LLM escalation detail must not be retryable, got %+v", m.detail)
+	}
+	if strings.Contains(m.helpLine(), "retry LLM") {
+		t.Error("footer must not advertise retry for a non-retryable escalation")
+	}
+	upd, _ := m.Update(pressKeyMsg("l"))
+	m = upd.(Model)
+	if m.tab != tabEscalations {
+		t.Errorf("l on an escalation detail must not switch tabs, got %v", m.tab)
+	}
+	if !strings.Contains(m.message, "not available") {
+		t.Errorf("expected an unavailable hint, got %q", m.message)
+	}
+}
+
+func TestDetailViewVimLStillSwitchesTabsOffEscalations(t *testing.T) {
+	// On a non-escalation detail (Agents), l keeps its vim-right meaning.
+	m := press(t, testModel(t), "v") // Agents tab detail
+	if m.detail == nil {
+		t.Fatal("detail should be open on Agents")
+	}
+	upd, _ := m.Update(pressKeyMsg("l"))
+	m = upd.(Model)
+	if m.detail != nil {
+		t.Error("l should close the Agents detail (vim-right)")
+	}
+	if m.tab != tabEscalations {
+		t.Errorf("l should advance Agents → Escalations, got %v", m.tab)
 	}
 }

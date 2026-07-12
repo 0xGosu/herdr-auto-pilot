@@ -474,6 +474,37 @@ func (a *App) Dismiss(ctx context.Context, auditID int64) error {
 	return nil
 }
 
+// RetryLLM re-invokes the operator LLM on an escalation whose consult failed
+// or timed out. It queues the request; the daemon drains it on the reload
+// nudge and re-drives a fresh consult against the agent's live pane. The
+// caller should gate on HasPendingLLMConsult first (UX), but the daemon
+// re-checks authoritatively before re-consulting.
+func (a *App) RetryLLM(ctx context.Context, auditID int64) error {
+	audit, err := a.Store.GetAudit(ctx, auditID)
+	if err != nil {
+		return err
+	}
+	if audit == nil {
+		return fmt.Errorf("audit record %d not found", auditID)
+	}
+	if !domain.IsRetryableLLMEscalation(audit) {
+		return fmt.Errorf("audit record %d is not a retryable LLM escalation", auditID)
+	}
+	if _, err := a.Store.InsertLLMRetry(ctx, auditID, time.Now()); err != nil {
+		return err
+	}
+	// Best-effort nudge: the request is committed; a dead daemon picks it up
+	// on next startup/sweep.
+	a.nudge(ctx, control.KindReload)
+	return nil
+}
+
+// HasPendingLLMConsult reports whether a consult is still running for the
+// agent — the TUI uses it to disable "retry LLM" while one is in flight.
+func (a *App) HasPendingLLMConsult(ctx context.Context, agentID string) (bool, error) {
+	return a.Store.HasPendingLLMConsult(ctx, agentID)
+}
+
 // DefaultPruneMinutes is how old a pending escalation must be before a
 // prune dismisses it, absent an explicit age (CLI argument / TUI prompt).
 const DefaultPruneMinutes = 360

@@ -4,7 +4,10 @@
 // internal/ports. This purity is enforced by TestDomainPurity.
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // SituationType is the classified kind of an attention-requiring situation.
 type SituationType string
@@ -191,6 +194,20 @@ type AuditRecord struct {
 	CreatedAt   time.Time
 }
 
+// IsRetryableLLMEscalation reports whether an escalation is a candidate for
+// re-invoking the LLM: a still-pending escalation whose consult never produced
+// a decision (it timed out or the CLI exited without submitting). A
+// gated-but-answered escalation (shadow_mode, variance_guard, …) is NOT
+// retryable — re-invoking would hit the same gate. The reason is carried as a
+// "[reason]" prefix on Rationale (see the daemon's escalate()).
+func IsRetryableLLMEscalation(a *AuditRecord) bool {
+	if a == nil || a.Status != "escalated" {
+		return false
+	}
+	return strings.HasPrefix(a.Rationale, "["+string(ReasonLLMTimeout)+"]") ||
+		strings.HasPrefix(a.Rationale, "["+string(ReasonLLMNoSubmit)+"]")
+}
+
 // CorrectionRecord is a front-end-written correction amending an audit entry.
 type CorrectionRecord struct {
 	ID              int64
@@ -240,9 +257,22 @@ type LLMRequest struct {
 	Signature     string
 	SituationType SituationType
 	AgentType     string
-	ContextJSON   string
-	Status        string // pending | done | expired
-	CreatedAt     time.Time
+	// AgentID identifies the agent this consult is for, so a pending row can
+	// be found by agent (the "is a consult still running?" retry guard).
+	AgentID     string
+	ContextJSON string
+	Status      string // pending | done | expired
+	CreatedAt   time.Time
+}
+
+// LLMRetry is a front-end-written request to re-invoke the LLM on an
+// escalation whose consult failed or timed out; the daemon drains it and
+// re-drives a fresh consult on the agent's live pane.
+type LLMRetry struct {
+	ID        int64
+	AuditID   int64
+	Processed bool
+	CreatedAt time.Time
 }
 
 // AgentRate is the per-agent runaway-loop counter state (FR-019).

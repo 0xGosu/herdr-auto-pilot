@@ -49,6 +49,11 @@ type fakeHerdr struct {
 	// failKeyName fails only SendKey calls for that specific key (e.g.
 	// "left" to break the sweep's reset burst but not its Right sweep).
 	failKeyName string
+	// agents is the current agent set ListAgents reports; listAgentsCalls
+	// counts calls so a test can assert the retry guard short-circuits before
+	// resolving the pane.
+	agents          []domain.AgentTransition
+	listAgentsCalls int
 }
 
 func (f *fakeHerdr) Send(ctx context.Context, paneID, input string) error {
@@ -129,7 +134,22 @@ func (f *fakeHerdr) readLineCalls() []int {
 }
 
 func (f *fakeHerdr) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) {
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listAgentsCalls++
+	return append([]domain.AgentTransition(nil), f.agents...), nil
+}
+
+func (f *fakeHerdr) setAgents(agents []domain.AgentTransition) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.agents = agents
+}
+
+func (f *fakeHerdr) listAgentsCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listAgentsCalls
 }
 
 func (f *fakeHerdr) ListWorkspaces(ctx context.Context) ([]domain.WorkspaceInfo, error) {
@@ -1270,6 +1290,148 @@ func TestLLMFailureEscalates(t *testing.T) {
 	esc, _ := h.raw.PendingEscalations(ctx)
 	if !contains(esc[0].Rationale, "llm") && !contains(esc[0].Rationale, "LLM") {
 		t.Errorf("escalation should cite the LLM failure: %+v", esc[0])
+	}
+}
+
+func TestRetryLLMReDrivesConsultOnLivePane(t *testing.T) {
+	// A failed consult leaves a retryable escalation; a queued retry re-drives
+	// a fresh consult against the agent's live pane, which this time delivers.
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(approvalPane)
+	h.llm.configured = true
+
+	var mu sync.Mutex
+	calls := 0
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			// First consult times out → the escalation the operator retries.
+			return nil, errors.New("llm timeout after 5s without submit_decision")
+		}
+		// The retry consult submits and is promoted.
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "1", Rationale: "operator always approves", Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "1",
+			Rationale: "operator always approves", Status: "pending"}, nil
+	}
+
+	ctx := context.Background()
+	// Brand-new signature + configured LLM → consult path.
+	h.push("agent-retry", "blocked")
+	var esc []domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if !domain.IsRetryableLLMEscalation(&esc[0]) {
+		t.Fatalf("first consult should leave a retryable LLM escalation, got %q", esc[0].Rationale)
+	}
+	// The failed consult cleared its pending request (the guard is reset on
+	// every outcome path, including the failure branch), so a retry is allowed.
+	if pending, _ := h.raw.HasPendingLLMConsult(ctx, "agent-retry"); pending {
+		t.Fatal("a resolved (failed) consult must not leave a pending request")
+	}
+
+	// The agent is still live on its pane: queue a retry and nudge.
+	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-retry", PaneID: "agent-retry", Status: "blocked"}})
+	if _, err := h.raw.InsertLLMRetry(ctx, esc[0].ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+
+	// The retry re-drove the consult, which this time delivered the digit.
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "1" {
+		t.Errorf("retry consult delivered %q, want \"1\"", got)
+	}
+}
+
+func TestRetryLLMGuardSkipsWhileConsultInFlight(t *testing.T) {
+	// The retry must never stack onto a consult that is still running: with a
+	// pending llm_requests row for the agent, the retry short-circuits BEFORE
+	// resolving the pane, and is still drained from the queue.
+	h := newHarness(t, "")
+	ctx := context.Background()
+	id, _ := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-busy", Signature: "sig", Trigger: "agent-status: blocked",
+		SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: "[llm_timeout] llm timeout", Status: "escalated", CreatedAt: time.Now(),
+	})
+	if _, err := h.raw.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: "req-agent-busy-1", Signature: "sig", SituationType: domain.SituationApproval,
+		AgentType: "claude", AgentID: "agent-busy", ContextJSON: "{}", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-busy", PaneID: "agent-busy", Status: "blocked"}})
+
+	if _, err := h.raw.InsertLLMRetry(ctx, id, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// Drain directly for determinism (ListAgents is only ever called while
+	// resolving a retry's pane, so its call count is the guard's witness).
+	h.daemon.processLLMRetries(ctx)
+
+	if n := h.herdr.listAgentsCallCount(); n != 0 {
+		t.Errorf("retry must not resolve the pane while a consult is in flight; ListAgents called %d time(s)", n)
+	}
+	if q, _ := h.raw.UnprocessedLLMRetries(ctx); len(q) != 0 {
+		t.Errorf("a skipped retry should still be drained, got %+v", q)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("a guarded retry must not send anything")
+	}
+
+	// Once the consult resolves, a fresh retry is allowed to resolve the pane.
+	if err := h.raw.UpdateLLMRequestStatus(ctx, "req-agent-busy-1", "done"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.raw.InsertLLMRetry(ctx, id, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	h.daemon.processLLMRetries(ctx)
+	if n := h.herdr.listAgentsCallCount(); n == 0 {
+		t.Error("after the consult resolved, the retry should resolve the agent's pane")
+	}
+}
+
+func TestRetryLLMAgentGoneNotifies(t *testing.T) {
+	// A retry for an agent that is no longer present notifies the operator and
+	// takes no action, but is still drained.
+	h := newHarness(t, "")
+	ctx := context.Background()
+	id, _ := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-ghost", Signature: "sig", Trigger: "agent-status: blocked",
+		SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: "[llm_no_submit] llm exited without submitting", Status: "escalated", CreatedAt: time.Now(),
+	})
+	// No live agents (setAgents left empty) and no pending consult.
+	if _, err := h.raw.InsertLLMRetry(ctx, id, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	before := len(h.herdr.notified())
+	h.daemon.processLLMRetries(ctx)
+
+	if n := h.herdr.listAgentsCallCount(); n == 0 {
+		t.Fatal("retry should attempt to resolve the (now absent) agent's pane")
+	}
+	if len(h.herdr.notified()) <= before {
+		t.Error("a retry for a vanished agent should notify the operator")
+	}
+	if q, _ := h.raw.UnprocessedLLMRetries(ctx); len(q) != 0 {
+		t.Errorf("a retry for a gone agent should still be drained, got %+v", q)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("no send for a vanished agent")
 	}
 }
 

@@ -49,7 +49,11 @@ type refreshMsg struct {
 	kills       []domain.KillEvent
 	signatures  []frontend.SignatureRow
 	cfg         config.Config
-	err         error
+	// pendingConsult holds agent ids that currently have an LLM consult in
+	// flight, so "l: retry LLM" is disabled while one is running (the daemon
+	// re-checks authoritatively). Populated only for retryable escalations.
+	pendingConsult map[string]bool
+	err            error
 }
 
 // sigDetailMsg carries an asynchronously loaded signature detail.
@@ -92,7 +96,10 @@ type detailView struct {
 	// confirmID is the escalation's audit id captured at open time, so
 	// enter confirms the record ON SCREEN even if a background refresh
 	// clamped the list cursor. 0 = not a confirmable escalation detail.
-	confirmID int64
+	// The per-entry actions (c/x/l) act on this id too, never the live
+	// cursor. escRetryable snapshots whether "l: retry LLM" is offered.
+	confirmID    int64
+	escRetryable bool
 }
 
 // ruleItem is one navigable row of the Config tab. "indicator" and
@@ -234,6 +241,21 @@ func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 	msg.escalations, msg.err = app.Escalations(ctx)
 	if msg.err != nil {
 		return msg
+	}
+	// Gate "retry LLM" per agent: a consult already in flight disables it.
+	// Best-effort — a lookup error just leaves the key enabled (the daemon
+	// guards authoritatively before re-consulting).
+	msg.pendingConsult = map[string]bool{}
+	checked := map[string]bool{}
+	for i := range msg.escalations {
+		e := msg.escalations[i]
+		if !domain.IsRetryableLLMEscalation(&e) || checked[e.AgentID] {
+			continue
+		}
+		checked[e.AgentID] = true
+		if pending, perr := app.HasPendingLLMConsult(ctx, e.AgentID); perr == nil && pending {
+			msg.pendingConsult[e.AgentID] = true
+		}
 	}
 	msg.audit, msg.err = app.Audit(ctx, 50)
 	if msg.err != nil {
@@ -406,9 +428,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.detail.offset < max(0, len(m.detail.lines)-m.detailPageSize()) {
 				m.detail.offset++
 			}
-		case "tab", "right", "l":
+		case "tab", "right":
 			// Tab-switching works from inside the overlay: close it and
-			// move on, no extra esc needed.
+			// move on, no extra esc needed. (On an escalation detail, `l` is
+			// "retry LLM" instead — vim-right still switches via "right".)
 			m.detail = nil
 			m.tab = (m.tab + 1) % tabCount
 			m.cursor = 0
@@ -431,6 +454,36 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.confirmAuditID(id)
 			}
 			m.detail = nil
+		case "c":
+			// Per-entry actions mirror the list, acting on the snapshotted
+			// escalation id (confirmID), never the live cursor.
+			if id := m.detail.confirmID; id != 0 {
+				m.detail = nil
+				return m.correctByID(id)
+			}
+		case "x", "delete":
+			if id := m.detail.confirmID; id != 0 {
+				m.detail = nil
+				return m.dismissByID(id)
+			}
+		case "l":
+			// On an escalation detail, `l` retries the LLM on the snapshotted
+			// record; elsewhere it keeps its vim-right "next tab" meaning.
+			if id := m.detail.confirmID; id != 0 {
+				if !m.detail.escRetryable {
+					m.message = "retry LLM: not available for this escalation"
+					m.detail = nil
+					return m, nil
+				}
+				m.detail = nil
+				return m.retryByID(id)
+			}
+			m.detail = nil
+			m.tab = (m.tab + 1) % tabCount
+			m.cursor = 0
+			m.offsets[m.tab] = 0
+			m.searching = false
+			m.message = ""
 		case "esc", "q", "v":
 			m.detail = nil
 		}
@@ -499,6 +552,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 	case "tab", "right", "l":
+		// `l` retries the LLM on the Escalations tab; everywhere else it keeps
+		// its vim-right "next tab" meaning ("tab"/"right" always switch).
+		if msg.String() == "l" && m.tab == tabEscalations {
+			return m.retrySelected()
+		}
 		m.tab = (m.tab + 1) % tabCount
 		m.cursor = 0
 		m.offsets[m.tab] = 0
@@ -672,6 +730,13 @@ func (m Model) selectedAudit() *domain.AuditRecord {
 	return nil
 }
 
+// canRetry reports whether "retry LLM" is offered for an escalation: it must
+// be a retryable LLM failure (timeout / no-submit) with no consult currently
+// in flight for its agent.
+func (m Model) canRetry(rec domain.AuditRecord) bool {
+	return domain.IsRetryableLLMEscalation(&rec) && !m.data.pendingConsult[rec.AgentID]
+}
+
 // --- Escalation / audit actions ---
 
 func (m Model) confirmSelected() (tea.Model, tea.Cmd) {
@@ -695,7 +760,13 @@ func (m Model) correctSelected() (tea.Model, tea.Cmd) {
 	if rec == nil {
 		return m, nil
 	}
-	id := rec.ID
+	return m.correctByID(rec.ID)
+}
+
+// correctByID opens the correction prompt for a specific audit id — used by
+// the list and by the detail overlay (which corrects its snapshotted record,
+// not the live cursor).
+func (m Model) correctByID(id int64) (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.message = ""
 	m.prompt = &prompt{
@@ -710,6 +781,39 @@ func (m Model) correctSelected() (tea.Model, tea.Cmd) {
 		},
 	}
 	return m, nil
+}
+
+// dismissByID dismisses one escalation by id — used by the detail overlay.
+// The list uses deleteEscalations for its marked/cursor batch semantics.
+func (m Model) dismissByID(id int64) (tea.Model, tea.Cmd) {
+	return m, m.do(fmt.Sprintf("dismissed #%d", id), func(ctx context.Context) error {
+		return m.app.Dismiss(ctx, id)
+	})
+}
+
+// retryByID re-invokes the LLM on one escalation by id (list and detail).
+func (m Model) retryByID(id int64) (tea.Model, tea.Cmd) {
+	return m, m.do(fmt.Sprintf("retry LLM queued for #%d", id), func(ctx context.Context) error {
+		return m.app.RetryLLM(ctx, id)
+	})
+}
+
+// retrySelected re-invokes the LLM on the escalation under the cursor, with a
+// hint when the row isn't eligible or a consult is already running.
+func (m Model) retrySelected() (tea.Model, tea.Cmd) {
+	rec := m.selectedAudit()
+	if rec == nil {
+		return m, nil
+	}
+	if !domain.IsRetryableLLMEscalation(rec) {
+		m.message = "retry LLM: only for a failed or timed-out LLM escalation"
+		return m, nil
+	}
+	if m.data.pendingConsult[rec.AgentID] {
+		m.message = "retry LLM: a consult is already running for this agent"
+		return m, nil
+	}
+	return m.retryByID(rec.ID)
 }
 
 // toggleMarkSelected flips the multi-select mark on the escalation under the
@@ -898,9 +1002,12 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 				lines: build(m.wrapWidth()),
 				build: build,
 			}
-			// Only the Escalations detail is confirmable via enter.
+			// Only the Escalations detail is confirmable via enter and
+			// carries the per-entry actions (c/x/l), which act on this
+			// snapshotted id — never the live cursor.
 			if m.tab == tabEscalations {
 				d.confirmID = r.ID
+				d.escRetryable = m.canRetry(r)
 			}
 			m.detail = d
 		}
@@ -1543,7 +1650,12 @@ func (m Model) View() string {
 func (m Model) helpLine() string {
 	if m.detail != nil {
 		if m.detail.confirmID != 0 {
-			return "enter: confirm+send  ↑/↓: scroll  tab: switch tab  esc/q/v: close"
+			retry := ""
+			if m.detail.escRetryable {
+				retry = "  l: retry LLM"
+			}
+			return "enter: confirm+send  c: correct  x: delete" + retry +
+				"  ↑/↓: scroll  tab: switch tab  esc/q/v: close"
 		}
 		return "↑/↓: scroll  tab: switch tab  esc/q/v: close"
 	}
@@ -1558,7 +1670,7 @@ func (m Model) helpLine() string {
 	case tabAgents:
 		return "v: details  n: rename agent  /: search  " + common
 	case tabEscalations:
-		return "enter/y: confirm+send  c: correct  space: mark  x: delete  X: prune old  v: details  /: search  " + common
+		return "enter/y: confirm+send  c: correct  l: retry LLM  space: mark  x: delete  X: prune old  v: details  /: search  " + common
 	case tabAudit:
 		return "c: correct decision  v: details  /: search  " + common
 	case tabSignatures:

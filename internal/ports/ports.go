@@ -130,11 +130,16 @@ type DaemonStore interface {
 	UpsertErrorRetry(ctx context.Context, e domain.ErrorRetry) error
 	ResetErrorRetry(ctx context.Context, errorSignature string) error
 	MarkCorrectionProcessed(ctx context.Context, id int64) error
+	// MarkLLMRetryProcessed marks a queued LLM-retry request consumed.
+	MarkLLMRetryProcessed(ctx context.Context, id int64) error
 	// EnsureAgentName returns the agent's short name, generating one on
 	// first sight (insert-if-absent only; renames stay operator-owned).
 	EnsureAgentName(ctx context.Context, agentID string) (string, error)
 	StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64, error)
 	UpdateLLMRequestStatus(ctx context.Context, requestID, status string) error
+	// ExpireStalePendingLLMRequests reclaims pending consult rows whose
+	// outcome was never delivered, so they stop blocking the retry guard.
+	ExpireStalePendingLLMRequests(ctx context.Context, cutoff time.Time) (int64, error)
 	UpdateLLMDecisionStatus(ctx context.Context, id int64, status string) error
 	// UpsertSignatureEmbedding stores the semantic identity (salient text +
 	// vector) a signature was minted from.
@@ -149,6 +154,9 @@ type FrontendStore interface {
 	ReadStore
 
 	InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error)
+	// InsertLLMRetry queues a request to re-invoke the LLM on an escalation
+	// whose consult failed/timed out; the daemon drains it on reload.
+	InsertLLMRetry(ctx context.Context, auditID int64, now time.Time) (int64, error)
 	InsertKillEvent(ctx context.Context, e domain.KillEvent) (int64, error)
 	// RenameAgent gives an agent a new operator-chosen short name; target
 	// may be the current name or the agent/pane id. Returns an error
@@ -200,6 +208,11 @@ type ReadStore interface {
 	// the (pane-excerpt-heavy) rows.
 	CountPendingEscalations(ctx context.Context) (int64, error)
 	UnprocessedCorrections(ctx context.Context) ([]domain.CorrectionRecord, error)
+	// UnprocessedLLMRetries returns queued LLM-retry requests in order.
+	UnprocessedLLMRetries(ctx context.Context) ([]domain.LLMRetry, error)
+	// HasPendingLLMConsult reports whether a consult is still in flight for
+	// the agent (a pending llm_requests row) — the retry concurrency guard.
+	HasPendingLLMConsult(ctx context.Context, agentID string) (bool, error)
 	GetAgentRate(ctx context.Context, agentID string) (*domain.AgentRate, error)
 	GetErrorRetry(ctx context.Context, errorSignature string) (*domain.ErrorRetry, error)
 	PendingLLMDecisions(ctx context.Context) ([]domain.LLMDecision, error)
