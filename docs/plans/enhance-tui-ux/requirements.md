@@ -268,7 +268,7 @@ Terminology: a **list tab** is one of Agents, Escalations, Audit, or Rules — t
 **User Role:** Operator
 **Acceptance Criteria:**
 - WHEN rendering the Config tab, the system SHALL display each `[[capture_delay]]` rule (agent type, start_ms, event_ms; config.go 151–155) as a read-only row.
-- WHEN no `[[capture_delay]]` rules are configured, the system SHALL show the effective built-in defaults (start 1000 ms / event 200 ms, config.go 396–399) so the operator can see what timing applies.
+- WHEN no `[[capture_delay]]` rules are configured, the system SHALL show the effective built-in defaults (start 10000 ms / event 500 ms) so the operator can see what timing applies.
 - Classifier manifests (`[[classifier]]`, config.go 141–146) SHALL remain file-only and out of scope for this change.
 
 ### CR-036 — TUI field editability classification
