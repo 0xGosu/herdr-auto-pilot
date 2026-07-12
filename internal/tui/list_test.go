@@ -675,7 +675,7 @@ func TestConfigReadOnlyRowsRefuseEditAndRemove(t *testing.T) {
 }
 
 func TestConfigTUIReadOnlyFieldsNoPrompt(t *testing.T) {
-	readOnly := []string{"llm.command", "llm.rewrite_command", "llm.rewrite_fallback_template", "embedding.model_path"}
+	readOnly := []string{"llm.command", "llm.command_start", "llm.rewrite_command", "llm.rewrite_command_start", "llm.rewrite_fallback_template", "embedding.model_path"}
 	for _, key := range readOnly {
 		for _, k := range []string{"enter", "e"} {
 			t.Run(key+"/"+k, func(t *testing.T) {
@@ -708,7 +708,8 @@ func TestConfigLongValueTruncatesToOneLine(t *testing.T) {
 	m := configModel(t, cfg)
 	found := false
 	for _, ln := range strings.Split(m.View(), "\n") {
-		if !strings.Contains(ln, "llm.command") {
+		// Trailing space keeps this from also matching "llm.command_start".
+		if !strings.Contains(ln, "llm.command ") {
 			continue
 		}
 		found = true

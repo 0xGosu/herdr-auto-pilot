@@ -283,8 +283,9 @@ Simple fields — numbers, booleans, and the `tui.theme` enum, including
 `llm.pane_excerpt_chars`, `safety.disable_seed`, and
 `tui.max_content_width` — edit inline (`enter`) or via
 `hap config set <key> <value>`. Free-text fields (`llm.command`,
-`llm.rewrite_command`, `llm.rewrite_fallback_template`,
-`embedding.model_path`) show read-only in the TUI, because a one-line
+`llm.command_start`, `llm.rewrite_command`, `llm.rewrite_command_start`,
+`llm.rewrite_fallback_template`, `embedding.model_path`) show read-only in
+the TUI, because a one-line
 prompt mangles quoted argv values — edit them in `config.toml` or with
 `config set`, which accepts every key. The safety indicator patterns and
 `[[capture_delay]]` rules also display read-only on the tab (capture
@@ -339,6 +340,23 @@ command = [
 timeout_seconds = 120
 auto_act_confidence_threshold = 999   # auto-act only when the LLM's confidence (0-100) is >= this; 999 = never (surface for your confirmation)
 pane_excerpt_chars = 5000   # pane excerpt size in the consult context (default 5000)
+```
+
+An optional **`command_start`** runs *instead of* `command` on an agent's
+**first consult** — the first time the plugin needs the LLM for that agent
+this daemon lifetime. Every later consult uses `command`. A genuinely new
+agent almost always starts in a new pane, so it primes on its own; a herdr
+subscriber reconnect does **not** re-fire it, so a long-running agent's
+kickoff prompt won't repeat mid-session. It takes the same placeholders and
+MCP flow as `command`; use it for a priming/kickoff prompt or a stronger
+model on the first touch. Omitting it (or leaving it empty) reuses
+`command`, so the feature is opt-in — and `command_start` alone never
+enables the fallback (`command` is what gates it):
+
+```toml
+[llm]
+command       = [ "claude", "-p", "...ongoing consult prompt...", "--model", "haiku" ]
+command_start = [ "claude", "-p", "...first-touch kickoff prompt...", "--model", "opus" ]
 ```
 
 `get_context` hands the model the classified situation (type, options,
@@ -442,6 +460,10 @@ rewrite_command = [
 rewrite_timeout_seconds = 30   # omitted: inherits timeout_seconds
 # Wraps the original when the rewrite fails (never blocks the send):
 rewrite_fallback_template = "You must act based on the following: {original_text}"
+# Optional: runs instead of rewrite_command on the agent's FIRST rewrite
+# (same first-interaction boundary as command_start, tracked independently;
+# empty inherits rewrite_command):
+# rewrite_command_start = [ "claude", "-p", "...first-rewrite prompt...", "--model", "haiku" ]
 ```
 
 Placeholders in `rewrite_command`: `{text}` (the literal reply a rule

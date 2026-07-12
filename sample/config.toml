@@ -55,6 +55,20 @@ command = [
   "--model", "opus",
 ]
 
+# ── First-consult variant (optional) ──
+# command_start runs INSTEAD of command on an agent's very first consult
+# this daemon lifetime (a new agent normally starts in a new pane and primes
+# on its own; a subscriber reconnect does NOT re-fire it). Same
+# placeholders/tools as command; use it for a priming/kickoff prompt or a
+# stronger model on the first touch. Omit or leave empty to reuse command.
+# command_start = [
+#   "claude", "-p",
+#   "This is your first interaction with this agent. ...same MCP flow as command...",
+#   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
+#   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
+#   "--model", "opus",
+# ]
+
 # ── OpenAI Codex CLI recipe (commented; swap in to use codex) ──
 # The `exec` subcommand is required for headless runs (the plugin inserts
 # it if you forget), and the bypass flag is needed because Codex's approval
@@ -85,6 +99,17 @@ rewrite_command = [
   "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
   "--model", "haiku",
 ]
+
+# ── First-rewrite variant (optional) ──
+# rewrite_command_start runs INSTEAD of rewrite_command on an agent's first
+# rewrite this daemon lifetime (same first-interaction boundary as
+# command_start, tracked independently). Same placeholders as
+# rewrite_command. Omit or leave empty to reuse rewrite_command.
+# rewrite_command_start = [
+#   "claude", "-p",
+#   "First rewrite for this agent. Rewrite this instruction given its screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
+#   "--model", "haiku",
+# ]
 
 # ── Rewrite recipe — OpenAI Codex (commented; swap in to use codex) ──
 # rewrite_command = [

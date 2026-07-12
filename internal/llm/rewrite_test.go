@@ -62,6 +62,40 @@ printf 'name=%s\n' "$HAP_AGENT_NAME" >> `+argvFile+"\necho rewritten reply\n")
 	}
 }
 
+func TestRewriteUsesStartTemplateOnFirst(t *testing.T) {
+	// The script echoes its first arg (the marker) as the rewritten result.
+	script := writeScript(t, `printf '%s' "$1"`+"\n")
+	a := &Adapter{
+		RewriteTemplate:      []string{script, "base"},
+		RewriteStartTemplate: []string{script, "start"},
+		RewriteTimeout:       5 * time.Second,
+	}
+	first, err := a.Rewrite(context.Background(), domain.RewriteRequest{Text: "x", First: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != "start" {
+		t.Errorf("first rewrite marker = %q, want start", first)
+	}
+	later, err := a.Rewrite(context.Background(), domain.RewriteRequest{Text: "x", First: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if later != "base" {
+		t.Errorf("later rewrite marker = %q, want base", later)
+	}
+
+	// No start template → First=true falls back to the base template.
+	b := &Adapter{RewriteTemplate: []string{script, "base"}, RewriteTimeout: 5 * time.Second}
+	got, err := b.Rewrite(context.Background(), domain.RewriteRequest{Text: "x", First: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "base" {
+		t.Errorf("empty start template must fall back to base, got %q", got)
+	}
+}
+
 func TestRewriteStderrExcludedFromResult(t *testing.T) {
 	script := writeScript(t, "echo 'diagnostic noise' >&2\necho '  the reply  '\n")
 	a := &Adapter{RewriteTemplate: []string{script}, RewriteTimeout: 5 * time.Second}

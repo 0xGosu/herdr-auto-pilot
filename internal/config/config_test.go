@@ -468,6 +468,50 @@ rewrite_fallback_template = "Do this: {original_text}"
 	}
 }
 
+func TestCommandStartConfigKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+
+	// Omitted: both start variants default empty (inherit at use time).
+	os.WriteFile(path, []byte("[llm]\ncommand = [\"claude\"]\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LLM.CommandStart) != 0 {
+		t.Errorf("command_start should default empty, got %v", cfg.LLM.CommandStart)
+	}
+	if len(cfg.LLM.RewriteCommandStart) != 0 {
+		t.Errorf("rewrite_command_start should default empty, got %v", cfg.LLM.RewriteCommandStart)
+	}
+
+	// Explicit values are honored and survive a Save/Load round trip.
+	os.WriteFile(path, []byte(`[llm]
+command = ["claude", "-p", "ongoing"]
+command_start = ["claude", "-p", "first: {agent_name}", "--model", "opus"]
+rewrite_command = ["claude", "-p", "rewrite: {text}"]
+rewrite_command_start = ["claude", "-p", "first rewrite: {text}"]
+`), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LLM.CommandStart) != 5 || cfg.LLM.CommandStart[2] != "first: {agent_name}" {
+		t.Errorf("command_start lost: %v", cfg.LLM.CommandStart)
+	}
+	if len(cfg.LLM.RewriteCommandStart) != 3 || cfg.LLM.RewriteCommandStart[2] != "first rewrite: {text}" {
+		t.Errorf("rewrite_command_start lost: %v", cfg.LLM.RewriteCommandStart)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.LLM.CommandStart) != 5 || len(rt.LLM.RewriteCommandStart) != 3 {
+		t.Errorf("round trip lost start keys: %+v", rt.LLM)
+	}
+}
+
 func TestEmbeddingDefaultsAndOverride(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 

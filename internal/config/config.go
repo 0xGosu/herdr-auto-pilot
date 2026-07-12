@@ -71,7 +71,13 @@ type LLM struct {
 	// {request_id}, {db}, {control}, and {agent_name} (the agent's short
 	// name) placeholders. Empty means no LLM is configured (low-confidence
 	// situations escalate).
-	Command        []string `toml:"command"`
+	Command []string `toml:"command"`
+	// CommandStart is the argv template used on the FIRST consult per agent
+	// (a fresh agent in a pane, until superseded on the next "detected"
+	// discovery). Same placeholders as Command. Empty inherits Command, so
+	// the feature is opt-in and existing configs are unaffected. A CommandStart
+	// with no Command does NOT enable the LLM — Command alone gates that.
+	CommandStart   []string `toml:"command_start"`
 	TimeoutSeconds int      `toml:"timeout_seconds"`
 	// AutoActConfidenceThreshold gates acting on an LLM suggestion
 	// automatically (subject to every safety control and the learned-history
@@ -97,6 +103,11 @@ type LLM struct {
 	// rewritten text is read from the CLI's stdout. Empty means literal
 	// text is sent unchanged.
 	RewriteCommand []string `toml:"rewrite_command"`
+	// RewriteCommandStart is the argv template used on the FIRST rewrite per
+	// agent (same first-interaction boundary as CommandStart). Same
+	// placeholders as RewriteCommand. Empty inherits RewriteCommand, so the
+	// feature is opt-in; it is tracked independently of CommandStart's "first".
+	RewriteCommandStart []string `toml:"rewrite_command_start"`
 	// RewriteTimeoutSeconds bounds one rewrite run; zero or omitted
 	// inherits timeout_seconds.
 	RewriteTimeoutSeconds int `toml:"rewrite_timeout_seconds"`

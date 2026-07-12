@@ -619,11 +619,13 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
 	{Key: "safety.disable_seed", TUIEditable: true},
-	{Key: "llm.command"}, // argv template
+	{Key: "llm.command"},       // argv template
+	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
 	{Key: "llm.timeout_seconds", TUIEditable: true},
 	{Key: "llm.auto_act_confidence_threshold", TUIEditable: true},
 	{Key: "llm.pane_excerpt_chars", TUIEditable: true},
-	{Key: "llm.rewrite_command"}, // argv template
+	{Key: "llm.rewrite_command"},       // argv template
+	{Key: "llm.rewrite_command_start"}, // argv template (first rewrite; inherits rewrite_command)
 	{Key: "llm.rewrite_timeout_seconds", TUIEditable: true},
 	{Key: "llm.rewrite_fallback_template"}, // template string
 	{Key: "embedding.disabled", TUIEditable: true},
@@ -689,6 +691,11 @@ func FieldValue(cfg config.Config, key string) string {
 			return "(disabled)"
 		}
 		return JoinCommand(cfg.LLM.Command)
+	case "llm.command_start":
+		if len(cfg.LLM.CommandStart) == 0 {
+			return "(inherits command)"
+		}
+		return JoinCommand(cfg.LLM.CommandStart)
 	case "llm.timeout_seconds":
 		return strconv.Itoa(cfg.LLM.TimeoutSeconds)
 	case "llm.auto_act_confidence_threshold":
@@ -703,6 +710,11 @@ func FieldValue(cfg config.Config, key string) string {
 			return "(disabled)"
 		}
 		return JoinCommand(cfg.LLM.RewriteCommand)
+	case "llm.rewrite_command_start":
+		if len(cfg.LLM.RewriteCommandStart) == 0 {
+			return "(inherits rewrite_command)"
+		}
+		return JoinCommand(cfg.LLM.RewriteCommandStart)
 	case "llm.rewrite_timeout_seconds":
 		return strconv.Itoa(cfg.LLM.RewriteTimeoutSeconds)
 	case "llm.rewrite_fallback_template":
@@ -802,12 +814,26 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			cfg.LLM.Command = argv // empty disables the LLM fallback
 			return nil
+		case "llm.command_start":
+			argv, err := SplitCommand(value)
+			if err != nil {
+				return fmt.Errorf("llm.command_start: %w", err)
+			}
+			cfg.LLM.CommandStart = argv // empty inherits llm.command
+			return nil
 		case "llm.rewrite_command":
 			argv, err := SplitCommand(value)
 			if err != nil {
 				return fmt.Errorf("llm.rewrite_command: %w", err)
 			}
 			cfg.LLM.RewriteCommand = argv // empty disables the rewrite
+			return nil
+		case "llm.rewrite_command_start":
+			argv, err := SplitCommand(value)
+			if err != nil {
+				return fmt.Errorf("llm.rewrite_command_start: %w", err)
+			}
+			cfg.LLM.RewriteCommandStart = argv // empty inherits llm.rewrite_command
 			return nil
 		case "llm.rewrite_timeout_seconds":
 			return setInt(&cfg.LLM.RewriteTimeoutSeconds)
