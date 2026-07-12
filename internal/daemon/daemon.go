@@ -324,6 +324,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// periodic sweep as a safety net.
 	logging.Guard("startup-corrections", func() error {
 		d.processCorrections(ctx)
+		d.processLLMRetries(ctx)
 		d.expireStaleLLMWork(ctx)
 		return nil
 	})
@@ -338,6 +339,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-sweep.C:
 			logging.Guard("periodic-sweep", func() error {
 				d.processCorrections(ctx)
+				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)
 				return nil
 			})
@@ -362,6 +364,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 					d.reloadWith(true)
 				}
 				d.processCorrections(ctx)
+				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)
 				return nil
 			})
@@ -983,7 +986,7 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("req-%s-%d", s.AgentID, now.UnixNano()),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-		Status: "pending", CreatedAt: now,
+		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
 	}
 	go func() {
 		outcome := llmOutcome{situation: s, sig: sig, request: req}
@@ -1314,7 +1317,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// whenever the consulted pane was really idle/done.
 	tr := domain.AgentTransition{AgentID: s.AgentID, PaneID: s.PaneID, Status: s.Status}
 
-	d.opt.Store.UpdateLLMRequestStatus(ctx, res.request.RequestID, "done")
+	// Resolving the request clears the retry guard for this agent; a failed
+	// write leaves it pending until expireStaleLLMWork reclaims it.
+	if err := d.opt.Store.UpdateLLMRequestStatus(ctx, res.request.RequestID, "done"); err != nil {
+		slog.Error("marking LLM request done failed", "request", res.request.RequestID, "error", err)
+	}
 
 	if res.err != nil || res.decision == nil {
 		reason := domain.ReasonLLMNoSubmit
@@ -1616,6 +1623,90 @@ func (d *Daemon) processCorrections(ctx context.Context) {
 	}
 }
 
+// processLLMRetries drains operator-queued LLM-retry requests: for each, it
+// re-drives a fresh consult on the escalation's agent by re-injecting an
+// attention transition for the agent's LIVE pane (the normal
+// read→classify→decide→consult pipeline). Every request is marked processed —
+// a retry is best-effort; the operator re-queues if it doesn't take.
+func (d *Daemon) processLLMRetries(ctx context.Context) {
+	retries, err := d.opt.Store.UnprocessedLLMRetries(ctx)
+	if err != nil {
+		slog.Error("reading llm retries failed", "error", err)
+		return
+	}
+	for _, r := range retries {
+		d.applyLLMRetry(ctx, r)
+		if err := d.opt.Store.MarkLLMRetryProcessed(ctx, r.ID); err != nil {
+			// A duplicate on the next sweep only re-injects a coalesced
+			// capture and re-hits the pending-consult guard — harmless, so
+			// log and keep draining rather than aborting the batch.
+			slog.Error("marking llm retry processed failed", "retry", r.ID, "error", err)
+		}
+	}
+}
+
+// applyLLMRetry re-injects one retry request. It resolves the escalation's
+// agent to its live pane and schedules an attention capture, guarding against
+// stacking a retry onto a consult that is still running.
+func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) {
+	audit, err := d.opt.Store.GetAudit(ctx, r.AuditID)
+	if err != nil {
+		slog.Error("llm retry: reading audit failed", "retry", r.ID, "audit", r.AuditID, "error", err)
+		return
+	}
+	if audit == nil || audit.AgentID == "" {
+		slog.Warn("llm retry: audit missing or has no agent", "retry", r.ID, "audit", r.AuditID)
+		return
+	}
+	agentID := audit.AgentID
+
+	// Guard: never stack a retry onto a consult that is still in flight for
+	// this agent (a pending llm_requests row). The operator re-queues once it
+	// resolves; expireStaleLLMWork clears an abandoned one after 2×timeout.
+	if pending, err := d.opt.Store.HasPendingLLMConsult(ctx, agentID); err != nil {
+		slog.Error("llm retry: pending-consult check failed", "agent", agentID, "error", err)
+		return
+	} else if pending {
+		slog.Info("llm retry skipped: consult already in flight", "agent", agentID)
+		return
+	}
+
+	// Resolve the agent to its current pane — retry re-reads the LIVE screen,
+	// so the pane may differ from where the escalation first fired.
+	agents, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		slog.Error("llm retry: listing agents failed", "agent", agentID, "error", err)
+		return
+	}
+	var paneID string
+	var found bool
+	for _, a := range agents {
+		if a.AgentID == agentID {
+			paneID, found = a.PaneID, true
+			break
+		}
+	}
+	if !found {
+		slog.Info("llm retry: agent no longer present", "agent", agentID)
+		label := agentID
+		if name, nerr := d.opt.Store.EnsureAgentName(ctx, agentID); nerr == nil && name != "" {
+			label = fmt.Sprintf("%s (%s)", name, agentID)
+		}
+		d.notify(ctx, "Herd Auto Prompter: retry skipped",
+			fmt.Sprintf("Agent %s is no longer present — cannot re-invoke the LLM.", label))
+		return
+	}
+
+	// Force an attention capture: "blocked" runs the delayed-capture path
+	// (handleAttention → classify → decideAndAct), which re-consults when the
+	// live pane still needs help. scheduleCapture coalesces per pane, so rapid
+	// double-retries collapse into one capture.
+	slog.Info("llm retry: re-driving consult", "agent", agentID, "pane", paneID)
+	d.scheduleCapture(ctx, domain.AgentTransition{
+		AgentID: agentID, PaneID: paneID, Status: "blocked",
+	})
+}
+
 func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domain.CorrectionRecord) error {
 	audit, err := d.opt.Store.GetAudit(ctx, c.AuditID)
 	if err != nil {
@@ -1718,14 +1809,23 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	return d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
 }
 
-// expireStaleLLMWork marks dangling pending LLM decisions expired.
+// expireStaleLLMWork marks dangling pending LLM decisions AND pending consult
+// requests expired. Reclaiming stale requests is load-bearing for the retry
+// guard: a consult whose outcome was never delivered (daemon restart/upgrade,
+// cancelled context) would otherwise leave a "pending" llm_requests row that
+// blocks every future retry for that agent forever.
 func (d *Daemon) expireStaleLLMWork(ctx context.Context) {
 	cfg, _, _ := d.snapshot()
+	cutoff := d.opt.Clock.Now().Add(-2 * cfg.LLMTimeout())
+
+	if _, err := d.opt.Store.ExpireStalePendingLLMRequests(ctx, cutoff); err != nil {
+		slog.Error("expiring stale LLM requests failed", "error", err)
+	}
+
 	pending, err := d.opt.Store.PendingLLMDecisions(ctx)
 	if err != nil {
 		return
 	}
-	cutoff := d.opt.Clock.Now().Add(-2 * cfg.LLMTimeout())
 	for _, p := range pending {
 		if p.CreatedAt.Before(cutoff) {
 			d.opt.Store.UpdateLLMDecisionStatus(ctx, p.ID, "expired")

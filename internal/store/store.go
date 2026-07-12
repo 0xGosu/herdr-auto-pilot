@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS llm_requests (
 	signature TEXT NOT NULL,
 	situation_type TEXT NOT NULL,
 	agent_type TEXT NOT NULL,
+	agent_id TEXT NOT NULL DEFAULT '',
 	context_json TEXT NOT NULL,
 	status TEXT NOT NULL DEFAULT 'pending',
 	created_at INTEGER NOT NULL
@@ -154,6 +155,12 @@ CREATE TABLE IF NOT EXISTS llm_decisions (
 	confident_score INTEGER NOT NULL DEFAULT -1,
 	captured_output TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL DEFAULT 'pending',
+	created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS llm_retries (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	audit_id INTEGER NOT NULL,
+	processed INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS operator (
@@ -197,6 +204,7 @@ func (s *Store) migrate() error {
 		`ALTER TABLE audit_log ADD COLUMN agent_type TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE audit_log ADD COLUMN pane_excerpt TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
+		`ALTER TABLE llm_requests ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
@@ -358,10 +366,10 @@ func (s *Store) StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO llm_requests (request_id, signature, situation_type, agent_type, context_json, status, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			INSERT INTO llm_requests (request_id, signature, situation_type, agent_type, agent_id, context_json, status, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			r.RequestID, r.Signature, string(r.SituationType), r.AgentType,
-			r.ContextJSON, orDefault(r.Status, "pending"), unix(r.CreatedAt))
+			r.AgentID, r.ContextJSON, orDefault(r.Status, "pending"), unix(r.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -378,6 +386,42 @@ func (s *Store) UpdateLLMRequestStatus(ctx context.Context, requestID, status st
 			`UPDATE llm_requests SET status = ? WHERE request_id = ?`, status, requestID)
 		return err
 	})
+}
+
+// HasPendingLLMConsult reports whether a consult is still in flight for an
+// agent — a staged llm_requests row that has not yet resolved to done/expired.
+// It is the durable "is the LLM still running?" guard for retry: consultLLM
+// stages the row as pending, handleLLMOutcome marks it done, and
+// expireStaleLLMWork expires abandoned ones after 2×timeout.
+func (s *Store) HasPendingLLMConsult(ctx context.Context, agentID string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM llm_requests WHERE agent_id = ? AND status = 'pending'`,
+		agentID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// ExpireStalePendingLLMRequests marks pending consult requests older than
+// cutoff expired. handleLLMOutcome normally resolves a request to "done", but
+// a consult whose outcome was never delivered (daemon restart/upgrade,
+// cancelled context) would otherwise leave a "pending" row forever — and that
+// row is the retry guard, so it must be reclaimed. Returns the number expired.
+func (s *Store) ExpireStalePendingLLMRequests(ctx context.Context, cutoff time.Time) (int64, error) {
+	var n int64
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE llm_requests SET status = 'expired' WHERE status = 'pending' AND created_at < ?`,
+			unix(cutoff))
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	return n, err
 }
 
 // UpdateLLMDecisionStatus transitions a staged decision (pending → accepted/rejected/expired).
@@ -408,6 +452,23 @@ func (s *Store) InsertCorrection(ctx context.Context, c domain.CorrectionRecord)
 	return id, err
 }
 
+// InsertLLMRetry queues a front-end request to re-invoke the LLM on an
+// escalation; the daemon drains it on the next reload nudge.
+func (s *Store) InsertLLMRetry(ctx context.Context, auditID int64, now time.Time) (int64, error) {
+	var id int64
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO llm_retries (audit_id, processed, created_at)
+			VALUES (?, 0, ?)`, auditID, unix(now))
+		if err != nil {
+			return err
+		}
+		id, err = res.LastInsertId()
+		return err
+	})
+	return id, err
+}
+
 // InsertKillEvent appends a pause/kill/resume toggle (append-only, FR-017).
 func (s *Store) InsertKillEvent(ctx context.Context, e domain.KillEvent) (int64, error) {
 	var id int64
@@ -429,7 +490,7 @@ func (s *Store) InsertKillEvent(ctx context.Context, e domain.KillEvent) (int64,
 func (s *Store) ClearLearnedData(ctx context.Context) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		for _, table := range []string{"signatures", "decisions", "audit_log", "corrections",
-			"agent_rate", "error_retries", "llm_requests", "llm_decisions",
+			"agent_rate", "error_retries", "llm_requests", "llm_decisions", "llm_retries",
 			"signature_embeddings", "signature_snapshots"} {
 			if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 				return err
@@ -978,6 +1039,39 @@ func (s *Store) UnprocessedCorrections(ctx context.Context) ([]domain.Correction
 	return out, rows.Err()
 }
 
+// UnprocessedLLMRetries returns queued LLM-retry requests in insertion order.
+func (s *Store) UnprocessedLLMRetries(ctx context.Context) ([]domain.LLMRetry, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, audit_id, processed, created_at
+		FROM llm_retries WHERE processed = 0 ORDER BY id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.LLMRetry
+	for rows.Next() {
+		var r domain.LLMRetry
+		var processed int
+		var created int64
+		if err := rows.Scan(&r.ID, &r.AuditID, &processed, &created); err != nil {
+			return nil, err
+		}
+		r.Processed = processed != 0
+		r.CreatedAt = fromUnix(created)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// MarkLLMRetryProcessed marks a queued LLM-retry request as consumed.
+func (s *Store) MarkLLMRetryProcessed(ctx context.Context, id int64) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE llm_retries SET processed = 1 WHERE id = ?`, id)
+		return err
+	})
+}
+
 // GetAgentRate returns runaway counters for an agent (zero value when absent).
 func (s *Store) GetAgentRate(ctx context.Context, agentID string) (*domain.AgentRate, error) {
 	row := s.db.QueryRowContext(ctx, `
@@ -1019,13 +1113,13 @@ func (s *Store) GetErrorRetry(ctx context.Context, errorSignature string) (*doma
 // GetLLMRequest returns a staged LLM request by request id, or nil.
 func (s *Store) GetLLMRequest(ctx context.Context, requestID string) (*domain.LLMRequest, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, request_id, signature, situation_type, agent_type, context_json, status, created_at
+		SELECT id, request_id, signature, situation_type, agent_type, agent_id, context_json, status, created_at
 		FROM llm_requests WHERE request_id = ?`, requestID)
 	var r domain.LLMRequest
 	var situationType string
 	var created int64
 	err := row.Scan(&r.ID, &r.RequestID, &r.Signature, &situationType, &r.AgentType,
-		&r.ContextJSON, &r.Status, &created)
+		&r.AgentID, &r.ContextJSON, &r.Status, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

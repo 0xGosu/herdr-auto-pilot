@@ -460,6 +460,68 @@ func TestDismissRejectsNonPending(t *testing.T) {
 	}
 }
 
+func TestRetryLLMQueuesForFailedConsult(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "agent-status: blocked",
+		Action: "escalated", Rationale: "[llm_timeout] llm timeout after 2m0s without submit_decision",
+		Status: "escalated", CreatedAt: time.Now(),
+	})
+
+	if err := app.RetryLLM(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	q, err := st.UnprocessedLLMRetries(ctx)
+	if err != nil || len(q) != 1 || q[0].AuditID != id {
+		t.Fatalf("retry should be queued for audit %d, got %+v %v", id, q, err)
+	}
+	// The escalation is unchanged — a fresh outcome writes its own audit row.
+	if rec, _ := st.GetAudit(ctx, id); rec == nil || rec.Status != "escalated" {
+		t.Errorf("retry must not change the escalation status, got %+v", rec)
+	}
+}
+
+func TestRetryLLMRejectsNonRetryable(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+
+	if err := app.RetryLLM(ctx, 999); err == nil {
+		t.Error("retrying a missing audit record must fail")
+	}
+
+	// A gated-but-answered escalation (shadow_mode) is not an LLM failure:
+	// re-invoking would hit the same gate, so it is not retryable.
+	shadowID, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Rationale: "[shadow_mode]", Status: "escalated", CreatedAt: time.Now(),
+	})
+	if err := app.RetryLLM(ctx, shadowID); err == nil {
+		t.Error("retrying a non-LLM-failure escalation must fail")
+	}
+	if q, _ := st.UnprocessedLLMRetries(ctx); len(q) != 0 {
+		t.Errorf("rejected retry must not queue anything, got %+v", q)
+	}
+}
+
+func TestHasPendingLLMConsult(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+
+	if pending, err := app.HasPendingLLMConsult(ctx, "a1"); err != nil || pending {
+		t.Fatalf("no consult staged: got %v %v, want false", pending, err)
+	}
+	if _, err := st.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: "req-a1-1", Signature: "sig", SituationType: domain.SituationApproval,
+		AgentType: "claude", AgentID: "a1", ContextJSON: "{}", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := app.HasPendingLLMConsult(ctx, "a1"); err != nil || !pending {
+		t.Fatalf("consult in flight: got %v %v, want true", pending, err)
+	}
+}
+
 func TestPruneEscalations(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()

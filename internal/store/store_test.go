@@ -1000,3 +1000,136 @@ func TestSignatureSnapshotCascades(t *testing.T) {
 		t.Errorf("ClearLearnedData must clear snapshots, got %q", got)
 	}
 }
+
+func TestLLMRequestAgentIDAndPendingGuard(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	// No consult staged yet: the retry guard reports nothing in flight.
+	if pending, err := s.HasPendingLLMConsult(ctx, "a1"); err != nil || pending {
+		t.Fatalf("HasPendingLLMConsult before staging: got %v %v, want false", pending, err)
+	}
+
+	if _, err := s.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: "req-a1-1", Signature: "sig", SituationType: domain.SituationApproval,
+		AgentType: "claude", AgentID: "a1", ContextJSON: "{}", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// agent_id round-trips.
+	if req, err := s.GetLLMRequest(ctx, "req-a1-1"); err != nil || req == nil || req.AgentID != "a1" {
+		t.Fatalf("agent_id round trip: %+v %v", req, err)
+	}
+
+	// A pending row means a consult is in flight for that agent — but only for
+	// that agent.
+	if pending, err := s.HasPendingLLMConsult(ctx, "a1"); err != nil || !pending {
+		t.Fatalf("HasPendingLLMConsult with pending row: got %v %v, want true", pending, err)
+	}
+	if pending, err := s.HasPendingLLMConsult(ctx, "a2"); err != nil || pending {
+		t.Fatalf("HasPendingLLMConsult for a different agent: got %v %v, want false", pending, err)
+	}
+
+	// Resolving the request clears the guard.
+	if err := s.UpdateLLMRequestStatus(ctx, "req-a1-1", "done"); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := s.HasPendingLLMConsult(ctx, "a1"); err != nil || pending {
+		t.Fatalf("HasPendingLLMConsult after done: got %v %v, want false", pending, err)
+	}
+
+	// An expired (abandoned) request also frees the agent to retry again.
+	if _, err := s.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: "req-a1-2", Signature: "sig", SituationType: domain.SituationApproval,
+		AgentType: "claude", AgentID: "a1", ContextJSON: "{}", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateLLMRequestStatus(ctx, "req-a1-2", "expired"); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := s.HasPendingLLMConsult(ctx, "a1"); err != nil || pending {
+		t.Fatalf("HasPendingLLMConsult after expired: got %v %v, want false", pending, err)
+	}
+}
+
+func TestLLMRetryQueueRoundTrip(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	auditID, err := s.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", Signature: "sig", Trigger: "agent-status: blocked",
+		SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: "[llm_timeout] llm timeout after 2m0s", Status: "escalated", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing queued yet.
+	if q, err := s.UnprocessedLLMRetries(ctx); err != nil || len(q) != 0 {
+		t.Fatalf("empty retry queue: %+v %v", q, err)
+	}
+
+	retryID, err := s.InsertLLMRetry(ctx, auditID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := s.UnprocessedLLMRetries(ctx)
+	if err != nil || len(q) != 1 {
+		t.Fatalf("queued retry: %+v %v", q, err)
+	}
+	if q[0].AuditID != auditID || q[0].ID != retryID || q[0].Processed {
+		t.Errorf("retry row wrong: %+v (want audit %d, id %d, unprocessed)", q[0], auditID, retryID)
+	}
+
+	// Consuming it drains the queue.
+	if err := s.MarkLLMRetryProcessed(ctx, retryID); err != nil {
+		t.Fatal(err)
+	}
+	if q, _ := s.UnprocessedLLMRetries(ctx); len(q) != 0 {
+		t.Errorf("retry should be consumed once processed, got %+v", q)
+	}
+}
+
+func TestExpireStalePendingLLMRequestsReleasesGuard(t *testing.T) {
+	// A consult whose outcome was never delivered (crash/upgrade/cancel)
+	// leaves a pending row; without reclamation it would block retry forever.
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	old := time.Now().Add(-10 * time.Minute)
+	fresh := time.Now()
+	if _, err := s.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: "req-a1-old", Signature: "sig", SituationType: domain.SituationApproval,
+		AgentType: "claude", AgentID: "a1", ContextJSON: "{}", CreatedAt: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: "req-a2-fresh", Signature: "sig", SituationType: domain.SituationApproval,
+		AgentType: "claude", AgentID: "a2", ContextJSON: "{}", CreatedAt: fresh,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both guards read as in flight before reclamation.
+	if p, _ := s.HasPendingLLMConsult(ctx, "a1"); !p {
+		t.Fatal("stale request should read as pending before expiry")
+	}
+
+	cutoff := time.Now().Add(-5 * time.Minute)
+	n, err := s.ExpireStalePendingLLMRequests(ctx, cutoff)
+	if err != nil || n != 1 {
+		t.Fatalf("expiring stale requests: n=%d err=%v, want 1 expired", n, err)
+	}
+
+	// The stale agent is released; the fresh consult is untouched.
+	if p, _ := s.HasPendingLLMConsult(ctx, "a1"); p {
+		t.Error("stale pending request should be reclaimed, releasing the retry guard")
+	}
+	if p, _ := s.HasPendingLLMConsult(ctx, "a2"); !p {
+		t.Error("a fresh pending request must not be expired")
+	}
+}
