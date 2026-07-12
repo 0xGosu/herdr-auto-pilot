@@ -178,8 +178,8 @@ inferred_task_bar = 0.90   # higher bar for tasks inferred from pane history
 graduation_n = 5           # consecutive confirmations to graduate
 
 [limits]
-max_consecutive_auto_prompts = 5   # per agent, without human interaction
-max_auto_prompts_per_minute = 10   # per agent
+max_consecutive_auto_prompts = 10  # per agent, without human interaction
+max_auto_prompts_per_minute = 3    # per agent
 max_error_retries = 2              # per error signature
 
 # Semantic rule matching: situations are matched to learned rules by

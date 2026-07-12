@@ -235,8 +235,8 @@ func Default() Config {
 		},
 		Learning: Learning{GraduationN: 5},
 		Limits: Limits{
-			MaxConsecutiveAutoPrompts: 5,
-			MaxAutoPromptsPerMinute:   10,
+			MaxConsecutiveAutoPrompts: 10,
+			MaxAutoPromptsPerMinute:   3,
 			MaxErrorRetries:           2,
 		},
 		// RewriteTimeoutSeconds stays zero here: Load seeds from Default

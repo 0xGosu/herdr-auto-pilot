@@ -797,8 +797,10 @@ func TestPanicInjectionAtAdapterBoundaries(t *testing.T) {
 
 func TestRunawayGuardPausesAgent(t *testing.T) {
 	// FR-019 end to end: the 6th consecutive auto-prompt is blocked and the
-	// agent pauses until human interaction.
-	h := newHarness(t, "")
+	// agent pauses until human interaction. Pin explicit limits so the test
+	// exercises the CONSECUTIVE guard specifically, independent of the
+	// defaults (and with the per-minute cap held high so it never interferes).
+	h := newHarness(t, "[limits]\nmax_consecutive_auto_prompts = 5\nmax_auto_prompts_per_minute = 1000\n")
 	h.herdr.setPane(approvalPane)
 	h.seedAutonomous(approvalPane, domain.SituationApproval, "1")
 
