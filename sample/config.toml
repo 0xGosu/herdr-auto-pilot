@@ -156,5 +156,5 @@ theme = ""                 # named palette: default | dark | light | high-contra
 # rules are not consulted; a true 0ms delay is not expressible (use 1).
 # [[capture_delay]]
 # agent_type = "claude"      # exact agent type, or "*" for any
-# start_ms = 1500            # first event after the agent starts (default 1000)
-# event_ms = 200             # subsequent events (default 200)
+# start_ms = 3000            # first event after the agent starts (default 10000)
+# event_ms = 200             # subsequent events (default 500)

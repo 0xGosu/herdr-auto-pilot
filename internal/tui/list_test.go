@@ -629,7 +629,7 @@ func TestConfigShowsIndicatorAndCaptureRows(t *testing.T) {
 		"indicator #0  drop table",
 		"indicator-rule #0  agents=claude  rm -rf /",
 		"Capture delays (read-only — edit config.toml)",
-		"defaults  start=1000ms event=200ms (built-in)", // no [[capture_delay]] configured
+		"defaults  start=10000ms event=500ms (built-in)", // no [[capture_delay]] configured
 	} {
 		if !strings.Contains(view, want) {
 			t.Errorf("config tab missing %q:\n%s", want, view)

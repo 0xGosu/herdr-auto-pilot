@@ -604,8 +604,8 @@ func TestCaptureDelayRuleMatching(t *testing.T) {
 		start bool
 		want  time.Duration
 	}{
-		{"no rules start default", rules(), "claude", true, 1000 * time.Millisecond},
-		{"no rules event default", rules(), "claude", false, 200 * time.Millisecond},
+		{"no rules start default", rules(), "claude", true, 10000 * time.Millisecond},
+		{"no rules event default", rules(), "claude", false, 500 * time.Millisecond},
 		{"exact match start", rules(CaptureDelayRule{AgentType: "claude", StartMs: 1500, EventMs: 50}), "claude", true, 1500 * time.Millisecond},
 		{"exact match event", rules(CaptureDelayRule{AgentType: "claude", StartMs: 1500, EventMs: 50}), "claude", false, 50 * time.Millisecond},
 		{"first match wins", rules(
@@ -614,8 +614,8 @@ func TestCaptureDelayRuleMatching(t *testing.T) {
 		), "claude", true, 100 * time.Millisecond},
 		{"wildcard matches any", rules(CaptureDelayRule{AgentType: "*", StartMs: 300}), "codex", true, 300 * time.Millisecond},
 		{"empty agent_type matches any", rules(CaptureDelayRule{AgentType: "", EventMs: 70}), "codex", false, 70 * time.Millisecond},
-		{"matched but unset field falls back", rules(CaptureDelayRule{AgentType: "claude", EventMs: 80}), "claude", true, 1000 * time.Millisecond},
-		{"non-matching rule skipped", rules(CaptureDelayRule{AgentType: "codex", StartMs: 5}), "claude", true, 1000 * time.Millisecond},
+		{"matched but unset field falls back", rules(CaptureDelayRule{AgentType: "claude", EventMs: 80}), "claude", true, 10000 * time.Millisecond},
+		{"non-matching rule skipped", rules(CaptureDelayRule{AgentType: "codex", StartMs: 5}), "claude", true, 10000 * time.Millisecond},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -640,7 +640,7 @@ func TestCaptureDelayLoadedFromTOML(t *testing.T) {
 		t.Errorf("event delay = %v, want 250ms", got)
 	}
 	// A type without a rule uses the built-in defaults.
-	if got := cfg.CaptureDelay("codex", true); got != 1000*time.Millisecond {
-		t.Errorf("unmatched start delay = %v, want 1s", got)
+	if got := cfg.CaptureDelay("codex", true); got != 10000*time.Millisecond {
+		t.Errorf("unmatched start delay = %v, want 10s", got)
 	}
 }

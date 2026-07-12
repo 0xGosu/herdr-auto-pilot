@@ -425,11 +425,11 @@ func (c Config) RewriteTimeout() time.Duration {
 	return time.Duration(c.LLM.RewriteTimeoutSeconds) * time.Second
 }
 
-// Built-in capture delays: the agent TUI needs ~a second to paint after
-// launch; later events only need a short settle.
+// Built-in capture delays: the agent TUI can take several seconds to paint
+// after launch; later events only need a short settle.
 const (
-	defaultCaptureStartDelay = 1000 * time.Millisecond
-	defaultCaptureEventDelay = 200 * time.Millisecond
+	defaultCaptureStartDelay = 10000 * time.Millisecond
+	defaultCaptureEventDelay = 500 * time.Millisecond
 )
 
 // CaptureDelay returns how long to wait before reading the pane after a

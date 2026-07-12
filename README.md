@@ -288,7 +288,7 @@ Simple fields — numbers, booleans, and the `tui.theme` enum, including
 prompt mangles quoted argv values — edit them in `config.toml` or with
 `config set`, which accepts every key. The safety indicator patterns and
 `[[capture_delay]]` rules also display read-only on the tab (capture
-delays show the built-in defaults, 1000 ms first event / 200 ms after,
+delays show the built-in defaults, 10000 ms first event / 500 ms after,
 when none are configured), and long values are truncated to one line —
 the full value lives in `config.toml`. Prompts that *look* destructive
 but match no pattern are escalated by a suspected-irreversible heuristic
