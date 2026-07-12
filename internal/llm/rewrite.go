@@ -37,7 +37,11 @@ func (a *Adapter) Rewrite(ctx context.Context, req domain.RewriteRequest) (strin
 	// shapes, and substituted pane text is untrusted — it must not be able
 	// to perturb the repair (same fixes as Consult: claude/agy want the
 	// prompt right after -p/--print, codex needs the exec subcommand).
-	template := NormalizeLLMCommand(a.RewriteTemplate)
+	base := a.RewriteTemplate
+	if req.First && len(a.RewriteStartTemplate) > 0 {
+		base = a.RewriteStartTemplate
+	}
+	template := NormalizeLLMCommand(base)
 	argv := make([]string, len(template))
 	for i, arg := range template {
 		arg = strings.ReplaceAll(arg, "{text}", req.Text)

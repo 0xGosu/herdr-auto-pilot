@@ -611,7 +611,9 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		{"llm.auto_act_confidence_threshold", "-1", true},
 		{"llm.auto_act_confidence_threshold", "maybe", true},
 		{"llm.command", `claude -p "decide for me"`, false},
+		{"llm.command_start", `claude -p "first: {agent_name}" --model opus`, false},
 		{"llm.rewrite_command", `claude -p "rewrite: {text}" --model haiku`, false},
+		{"llm.rewrite_command_start", `claude -p "first rewrite: {text}"`, false},
 		{"llm.rewrite_command", `claude -p "unbalanced`, true},
 		{"llm.rewrite_timeout_seconds", "45", false},
 		{"llm.rewrite_timeout_seconds", "zero", true},
@@ -639,6 +641,19 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 	}
 	if len(cfg.LLM.RewriteCommand) != 5 || cfg.LLM.RewriteCommand[2] != "rewrite: {text}" {
 		t.Errorf("llm.rewrite_command quote handling: %v", cfg.LLM.RewriteCommand)
+	}
+	if len(cfg.LLM.CommandStart) != 5 || cfg.LLM.CommandStart[2] != "first: {agent_name}" {
+		t.Errorf("llm.command_start quote handling: %v", cfg.LLM.CommandStart)
+	}
+	if len(cfg.LLM.RewriteCommandStart) != 3 || cfg.LLM.RewriteCommandStart[2] != "first rewrite: {text}" {
+		t.Errorf("llm.rewrite_command_start quote handling: %v", cfg.LLM.RewriteCommandStart)
+	}
+	// Empty start variants render an inherit placeholder, not a blank cell.
+	if got := frontend.FieldValue(config.Config{}, "llm.command_start"); got != "(inherits command)" {
+		t.Errorf("empty command_start display = %q, want inherit placeholder", got)
+	}
+	if got := frontend.FieldValue(config.Config{}, "llm.rewrite_command_start"); got != "(inherits rewrite_command)" {
+		t.Errorf("empty rewrite_command_start display = %q, want inherit placeholder", got)
 	}
 	if cfg.LLM.RewriteTimeoutSeconds != 45 ||
 		cfg.LLM.RewriteFallbackTemplate != "Act on: {original_text}" {
@@ -673,10 +688,12 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"limits.max_error_retries":            "2",
 		"safety.disable_seed":                 "true",
 		"llm.command":                         `claude -p "decide"`,
+		"llm.command_start":                   `claude -p "first: decide"`,
 		"llm.timeout_seconds":                 "60",
 		"llm.auto_act_confidence_threshold":   "70",
 		"llm.pane_excerpt_chars":              "4000",
 		"llm.rewrite_command":                 `claude -p "rewrite: {text}"`,
+		"llm.rewrite_command_start":           `claude -p "first rewrite: {text}"`,
 		"llm.rewrite_timeout_seconds":         "45",
 		"llm.rewrite_fallback_template":       "Act on: {original_text}",
 		"embedding.disabled":                  "false",
@@ -784,7 +801,9 @@ func TestPaneSalientCharsFieldDisplay(t *testing.T) {
 func TestFieldTUIEditableClassification(t *testing.T) {
 	readOnly := map[string]bool{
 		"llm.command":                   true,
+		"llm.command_start":             true,
 		"llm.rewrite_command":           true,
+		"llm.rewrite_command_start":     true,
 		"llm.rewrite_fallback_template": true,
 		"embedding.model_path":          true,
 	}

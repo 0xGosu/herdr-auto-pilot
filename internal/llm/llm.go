@@ -24,16 +24,22 @@ type Adapter struct {
 	// CommandTemplate is the argv template from config; placeholders:
 	// {self} → this binary, {request_id}, {db}, {control}, {agent_name}.
 	CommandTemplate []string
-	Timeout         time.Duration
-	DBPath          string
-	ControlPath     string
-	Store           ports.ReadStore
+	// CommandStartTemplate is used instead of CommandTemplate on an agent's
+	// first consult (req.First); empty falls back to CommandTemplate.
+	CommandStartTemplate []string
+	Timeout              time.Duration
+	DBPath               string
+	ControlPath          string
+	Store                ports.ReadStore
 	// SelfPath overrides the {self} placeholder (defaults to os.Executable).
 	SelfPath string
 	// RewriteTemplate is the argv template for the one-shot outbound-text
 	// rewrite (llm.rewrite_command); placeholders {text}, {situation_type},
 	// {agent_type}, {agent_name}, {pane_excerpt}. Empty disables rewriting.
 	RewriteTemplate []string
+	// RewriteStartTemplate is used instead of RewriteTemplate on an agent's
+	// first rewrite (req.First); empty falls back to RewriteTemplate.
+	RewriteStartTemplate []string
 	// RewriteTimeout bounds one rewrite run (<=0 falls back to Timeout).
 	RewriteTimeout time.Duration
 }
@@ -56,8 +62,14 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 			return nil, fmt.Errorf("resolve self path: %w", err)
 		}
 	}
-	argv := make([]string, len(a.CommandTemplate))
-	for i, arg := range a.CommandTemplate {
+	// The first consult for an agent uses command_start when configured;
+	// an empty start template falls back to the base command.
+	tmpl := a.CommandTemplate
+	if req.First && len(a.CommandStartTemplate) > 0 {
+		tmpl = a.CommandStartTemplate
+	}
+	argv := make([]string, len(tmpl))
+	for i, arg := range tmpl {
 		arg = strings.ReplaceAll(arg, "{self}", self)
 		arg = strings.ReplaceAll(arg, "{request_id}", req.RequestID)
 		arg = strings.ReplaceAll(arg, "{db}", a.DBPath)

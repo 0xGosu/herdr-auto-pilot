@@ -160,6 +160,51 @@ func TestTemplatePlaceholderExpansion(t *testing.T) {
 	}
 }
 
+func TestConsultUsesCommandStartOnFirst(t *testing.T) {
+	st, db := testStore(t)
+	out := filepath.Join(t.TempDir(), "argv.txt")
+	// The script appends its first arg (the marker) so the chosen template
+	// is observable across calls.
+	script := writeScript(t, `echo "$1" >> `+out+"\n")
+	run := func(a *Adapter, reqID string, first bool) {
+		t.Helper()
+		req := domain.LLMRequest{RequestID: reqID, First: first, CreatedAt: time.Now()}
+		st.StageLLMRequest(context.Background(), req)
+		st.InsertLLMDecision(context.Background(), domain.LLMDecision{
+			RequestID: reqID, Action: "ok", Status: "pending", CreatedAt: time.Now(),
+		})
+		if _, err := a.Consult(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	a := &Adapter{
+		CommandTemplate:      []string{script, "base"},
+		CommandStartTemplate: []string{script, "start"},
+		Timeout:              5 * time.Second,
+		DBPath:               db, Store: st, SelfPath: "/bin/true",
+	}
+	run(a, "req-1", true)  // first consult → command_start
+	run(a, "req-2", false) // later consult → command
+	if data, _ := os.ReadFile(out); string(data) != "start\nbase\n" {
+		t.Errorf("marker sequence = %q, want start then base", data)
+	}
+
+	// With no start template configured, First=true still uses the base
+	// command — the feature is opt-in.
+	out2 := filepath.Join(t.TempDir(), "argv2.txt")
+	script2 := writeScript(t, `echo "$1" >> `+out2+"\n")
+	b := &Adapter{
+		CommandTemplate: []string{script2, "base"},
+		Timeout:         5 * time.Second,
+		DBPath:          db, Store: st, SelfPath: "/bin/true",
+	}
+	run(b, "req-3", true)
+	if data, _ := os.ReadFile(out2); string(data) != "base\n" {
+		t.Errorf("empty start template must fall back to base, got %q", data)
+	}
+}
+
 // chdirDeleted moves the test process into a directory and deletes it,
 // simulating a daemon whose start directory was removed after launch.
 func chdirDeleted(t *testing.T) {

@@ -94,6 +94,19 @@ type Daemon struct {
 	pendingCapture map[string]*captureEntry
 	captureStarted map[string]bool
 
+	// firstConsult / firstRewrite mark agents whose first LLM consult /
+	// rewrite has fired, so the first interaction can use command_start /
+	// rewrite_command_start and every later one uses the base template. Keyed
+	// by agentID (== paneID in herdr), tracked independently of each other.
+	// NOT reset on "detected": that event also fires on every subscriber
+	// reconnect (pane-topology change), which would re-fire the kickoff
+	// prompt mid-session for long-running agents. A genuinely new agent
+	// almost always arrives in a new pane (new key → first=true naturally);
+	// the rare pane-id reuse forgoes re-priming rather than re-prime on every
+	// reconnect. Both guarded by mu.
+	firstConsult map[string]bool
+	firstRewrite map[string]bool
+
 	// configured flips after the first successful reload so reloadEmbedder
 	// can tell first load from a config change.
 	configured bool
@@ -192,6 +205,8 @@ func New(opt Options) (*Daemon, error) {
 		delayedTr:       make(chan domain.AgentTransition, 256),
 		pendingCapture:  map[string]*captureEntry{},
 		captureStarted:  map[string]bool{},
+		firstConsult:    map[string]bool{},
+		firstRewrite:    map[string]bool{},
 		lastAutoSend:    map[string]time.Time{},
 		lastAutoNoop:    map[string]time.Time{},
 		rewriteInFlight: map[string]rewriteFlight{},
@@ -984,10 +999,16 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 	sig domain.SignatureResult, now time.Time) {
 
 	llm := d.llmPort()
+	// The first consult for this agent selects command_start (when
+	// configured); mark it consumed here on the main loop, before the goroutine.
+	d.mu.Lock()
+	first := !d.firstConsult[s.AgentID]
+	d.firstConsult[s.AgentID] = true
+	d.mu.Unlock()
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("req-%s-%d", s.AgentID, now.UnixNano()),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
+		AgentID: s.AgentID, Status: "pending", CreatedAt: now, First: first,
 	}
 	go func() {
 		outcome := llmOutcome{situation: s, sig: sig, request: req}
@@ -1130,6 +1151,11 @@ func (d *Daemon) startRewrite(ctx context.Context, rw ports.RewriterPort, s doma
 	token := d.rewriteSeq
 	rctx, cancel := context.WithCancel(ctx)
 	d.rewriteInFlight[s.AgentID] = rewriteFlight{signature: sig.Signature, token: token, cancel: cancel}
+	// The first rewrite for this agent selects rewrite_command_start (when
+	// configured); consumed here, past the duplicate-drop, under the same
+	// lock. Tracked independently of the consult "first".
+	first := !d.firstRewrite[s.AgentID]
+	d.firstRewrite[s.AgentID] = true
 	d.mu.Unlock()
 
 	go func() {
@@ -1147,6 +1173,7 @@ func (d *Daemon) startRewrite(ctx context.Context, rw ports.RewriterPort, s doma
 			req := domain.RewriteRequest{
 				Text: dec.Input, SituationType: s.Type, AgentType: s.AgentType,
 				PaneExcerpt: d.paneExcerpt(rctx, cfg, s), AgentName: agentName,
+				First: first,
 			}
 			text, err := rw.Rewrite(rctx, req)
 			outcome.rewritten = text

@@ -18,6 +18,10 @@ type RewriteRequest struct {
 	PaneExcerpt string
 	// AgentName is the agent's short name, for {agent_name}.
 	AgentName string
+	// First marks this as the agent's first rewrite this daemon lifetime,
+	// selecting llm.rewrite_command_start when configured. Tracked
+	// independently of the consult "first".
+	First bool
 }
 
 // DefaultRewriteFallbackTemplate wraps the original text when the rewrite

@@ -173,13 +173,15 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 	// llm.command/timeout edits apply without a daemon restart.
 	llmFactory := func(cfg config.Config) ports.LLMPort {
 		return &llm.Adapter{
-			CommandTemplate: cfg.LLM.Command,
-			Timeout:         cfg.LLMTimeout(),
-			DBPath:          paths.DBPath(),
-			ControlPath:     paths.ControlSocketPath(),
-			Store:           st,
-			RewriteTemplate: cfg.LLM.RewriteCommand,
-			RewriteTimeout:  cfg.RewriteTimeout(),
+			CommandTemplate:      cfg.LLM.Command,
+			CommandStartTemplate: cfg.LLM.CommandStart,
+			Timeout:              cfg.LLMTimeout(),
+			DBPath:               paths.DBPath(),
+			ControlPath:          paths.ControlSocketPath(),
+			Store:                st,
+			RewriteTemplate:      cfg.LLM.RewriteCommand,
+			RewriteStartTemplate: cfg.LLM.RewriteCommandStart,
+			RewriteTimeout:       cfg.RewriteTimeout(),
 		}
 	}
 

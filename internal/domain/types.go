@@ -271,6 +271,10 @@ type LLMRequest struct {
 	ContextJSON string
 	Status      string // pending | done | expired
 	CreatedAt   time.Time
+	// First marks this as the agent's first consult this daemon lifetime,
+	// selecting llm.command_start when configured. Transient: it drives adapter
+	// template selection and is not persisted with the staged request.
+	First bool
 }
 
 // LLMRetry is a front-end-written request to re-invoke the LLM on an
