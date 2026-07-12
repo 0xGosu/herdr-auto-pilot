@@ -94,6 +94,13 @@ type Daemon struct {
 	pendingCapture map[string]*captureEntry
 	captureStarted map[string]bool
 
+	// episodeHandled dedupes the subscribe-time reconcile (#49): a pane whose
+	// current parked episode (blocked/idle/done) has already been surfaced
+	// through the pipeline is not re-driven on every 60s sweep. Cleared on the
+	// agent's next real "working" transition (genuine progress = new episode).
+	// Guarded by mu.
+	episodeHandled map[string]bool
+
 	// firstConsult / firstRewrite mark agents whose first LLM consult /
 	// rewrite has fired, so the first interaction can use command_start /
 	// rewrite_command_start and every later one uses the base template. Keyed
@@ -205,6 +212,7 @@ func New(opt Options) (*Daemon, error) {
 		delayedTr:       make(chan domain.AgentTransition, 256),
 		pendingCapture:  map[string]*captureEntry{},
 		captureStarted:  map[string]bool{},
+		episodeHandled:  map[string]bool{},
 		firstConsult:    map[string]bool{},
 		firstRewrite:    map[string]bool{},
 		lastAutoSend:    map[string]time.Time{},
@@ -342,6 +350,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.processCorrections(ctx)
 		d.processLLMRetries(ctx)
 		d.expireStaleLLMWork(ctx)
+		d.reconcileAttention(ctx)
 		return nil
 	})
 	sweep := time.NewTicker(time.Minute)
@@ -357,6 +366,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)
+				d.reconcileAttention(ctx)
 				return nil
 			})
 		case tr := <-d.transitions:
@@ -382,6 +392,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)
+				d.reconcileAttention(ctx)
 				return nil
 			})
 		case res := <-d.llmResults:
@@ -441,6 +452,11 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// that moved on (the consuming recent-delta still holds the old
 		// menu AND the answer) — activity supersedes it.
 		d.cancelCapture(tr.PaneID)
+		// Genuine progress ends the pane's parked episode: re-arm the
+		// subscribe-time reconcile so a fresh block/idle/done is surfaced (#49).
+		d.mu.Lock()
+		delete(d.episodeHandled, tr.PaneID)
+		d.mu.Unlock()
 		return
 	case "idle", "done", "blocked":
 		// Attention-requiring: the pane read is DELAYED so the agent TUI
@@ -517,6 +533,63 @@ func (d *Daemon) scheduleCapture(ctx context.Context, tr domain.AgentTransition)
 	})
 	d.pendingCapture[tr.PaneID] = entry
 	d.mu.Unlock()
+}
+
+// reconcileAttention surfaces agents already parked in an attention state at
+// (re)start/sweep time. herdr's pane.agent_status_changed subscription only
+// delivers FUTURE transitions, so anything already blocked/idle/done before the
+// daemon subscribed (restart, upgrade self-replace, kill→resume, resubscribe
+// window) is otherwise invisible to the escalation path (#49). ListAgents reads
+// live agent_status; each parked agent is re-driven through the normal
+// capture→classify→escalate path (like applyLLMRetry) exactly once per parked
+// episode. Runs on the sweep path, where ListAgents is already called.
+func (d *Daemon) reconcileAttention(ctx context.Context) {
+	agents, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		slog.Error("reconcile: listing agents failed", "error", err)
+		return
+	}
+	for _, a := range agents {
+		switch a.Status {
+		case "blocked", "idle", "done":
+		default:
+			continue
+		}
+		// Within-run guard: don't re-drive a still-parked episode every sweep.
+		d.mu.Lock()
+		handled := d.episodeHandled[a.PaneID]
+		if !handled {
+			d.episodeHandled[a.PaneID] = true
+		}
+		d.mu.Unlock()
+		if handled {
+			continue
+		}
+		// Durable guard: after a restart the in-memory set is empty, so an
+		// escalation already open before the crash must not be re-raised.
+		if d.hasOpenEscalation(ctx, a.AgentID) {
+			continue
+		}
+		slog.Info("reconcile: re-driving parked agent", "agent", a.AgentID, "pane", a.PaneID, "status", a.Status)
+		d.scheduleCapture(ctx, a)
+	}
+}
+
+// hasOpenEscalation reports whether the agent already has an unresolved
+// escalation (an audit_log row still in status 'escalated'). Fails safe: on a
+// store error it returns true so reconcile skips rather than risk a duplicate.
+func (d *Daemon) hasOpenEscalation(ctx context.Context, agentID string) bool {
+	esc, err := d.opt.Store.PendingEscalations(ctx)
+	if err != nil {
+		slog.Warn("reconcile: pending-escalation check failed", "agent", agentID, "error", err)
+		return true
+	}
+	for _, e := range esc {
+		if e.AgentID == agentID {
+			return true
+		}
+	}
+	return false
 }
 
 // handleAttention is the post-delay half of the pipeline: the classification

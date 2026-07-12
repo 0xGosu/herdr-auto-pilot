@@ -556,6 +556,137 @@ func TestPipelineShadowModeEscalatesWithSuggestion(t *testing.T) {
 	}
 }
 
+// TestReconcileEscalatesAlreadyParkedAgent covers #49: an agent already
+// blocked at subscribe time (never delivered as a pane.agent_status_changed
+// transition) is surfaced by reconcileAttention through the normal
+// capture→classify→escalate path. The second reconcile proves the dedup guard
+// against escalation storms on repeated sweeps.
+func TestReconcileEscalatesAlreadyParkedAgent(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	// Parked BEFORE any transition arrives — only ListAgents knows it exists.
+	h.herdr.setAgents([]domain.AgentTransition{
+		{AgentID: "pA", PaneID: "pA", AgentType: "claude", Status: "blocked"},
+	})
+
+	h.daemon.reconcileAttention(ctx)
+
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("no learned rule: reconcile must escalate, not send input")
+	}
+
+	// Second reconcile (a resubscribe/sweep re-run) must not re-escalate.
+	// reconcileAttention is synchronous and, with the episode already handled
+	// (and an open escalation on record), returns without scheduling a capture.
+	h.daemon.reconcileAttention(ctx)
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 1 {
+		t.Fatalf("resubscribe storm re-escalated: got %d escalations, want 1", len(esc))
+	}
+}
+
+// TestReconcileAutoAnswersParkedAgentOnce proves the in-memory dedup guard for
+// the auto-answer path: a confident learned rule leaves NO escalation row, so
+// only episodeHandled (not the store check) stops a re-answer on the next
+// sweep. A genuine "working" transition re-arms the pane for a new episode.
+func TestReconcileAutoAnswersParkedAgentOnce(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	h.seedAutonomous(approvalPane, domain.SituationApproval, "1")
+	h.herdr.setAgents([]domain.AgentTransition{
+		{AgentID: "pA", PaneID: "pA", AgentType: "claude", Status: "blocked"},
+	})
+
+	h.daemon.reconcileAttention(ctx)
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "1" {
+		t.Errorf("sent %q, want learned approval \"1\"", got)
+	}
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 0 {
+		t.Fatalf("auto-answered agent should not escalate, got %d", len(esc))
+	}
+
+	// Second reconcile: episode handled, no escalation row to lean on — the
+	// in-memory guard alone must prevent a duplicate send. Synchronous return.
+	h.daemon.reconcileAttention(ctx)
+	if n := len(h.herdr.sentInputs()); n != 1 {
+		t.Fatalf("sweep re-answered a still-parked agent: got %d sends, want 1", n)
+	}
+
+	// A real "working" transition ends the episode: the in-memory guard clears
+	// so a future block/idle/done is surfaced again (re-arm).
+	h.push("pA", "working")
+	waitFor(t, 2*time.Second, func() bool {
+		h.daemon.mu.Lock()
+		defer h.daemon.mu.Unlock()
+		return !h.daemon.episodeHandled["pA"]
+	})
+}
+
+// TestReconcileIgnoresNonAttentionAgents confirms only blocked/idle/done panes
+// are reconciled — a working agent is left alone.
+func TestReconcileIgnoresNonAttentionAgents(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{
+		{AgentID: "pA", PaneID: "pA", AgentType: "claude", Status: "working"},
+	})
+
+	h.daemon.reconcileAttention(ctx)
+
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 0 {
+		t.Fatalf("working agent must not reconcile, got %d escalations", len(esc))
+	}
+	if n := len(h.herdr.sentInputs()); n != 0 {
+		t.Fatalf("working agent must not be actioned, got %d sends", n)
+	}
+}
+
+// TestReconcileDurableGuardSurvivesRestart exercises the cross-restart half of
+// the dedup: after a restart the in-memory episode guard is empty, so the
+// escalation row on disk is the only thing that stops a duplicate. It also
+// verifies the AgentID round-trip — the pipeline must stamp the escalation with
+// the agent id reconcile matches on, or hasOpenEscalation silently no-ops.
+func TestReconcileDurableGuardSurvivesRestart(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{
+		{AgentID: "pA", PaneID: "pA", AgentType: "claude", Status: "blocked"},
+	})
+
+	h.daemon.reconcileAttention(ctx) // real pipeline escalation
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+
+	// Simulate a restart: drop the in-memory guard, keeping the escalation row.
+	// The durable guard alone must now prevent a re-drive.
+	h.daemon.mu.Lock()
+	delete(h.daemon.episodeHandled, "pA")
+	h.daemon.mu.Unlock()
+
+	h.daemon.reconcileAttention(ctx)
+	// reconcileAttention is synchronous up to scheduleCapture: a broken guard
+	// leaves a pending capture entry; a working one schedules nothing.
+	h.daemon.mu.Lock()
+	_, scheduled := h.daemon.pendingCapture["pA"]
+	h.daemon.mu.Unlock()
+	if scheduled {
+		t.Fatal("durable guard failed: reconcile re-drove an agent with an open escalation")
+	}
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 1 {
+		t.Fatalf("open escalation duplicated across restart: got %d, want 1", len(esc))
+	}
+}
+
 func TestKillSwitchHonoredWithoutNudge(t *testing.T) {
 	// FR-017 / SC-2: the daemon reads the latest kill row every tick, so a
 	// kill written directly to the DB (no nudge) still halts automation.
@@ -1464,12 +1595,17 @@ func TestRetryLLMGuardSkipsWhileConsultInFlight(t *testing.T) {
 	if _, err := h.raw.InsertLLMRetry(ctx, id, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	// Drain directly for determinism (ListAgents is only ever called while
-	// resolving a retry's pane, so its call count is the guard's witness).
+	// Drain directly for determinism. ListAgents is the guard's witness: a
+	// retry resolves an agent's pane through it, so a skipped retry adds no
+	// call. The startup attention reconcile (#49) also calls ListAgents once,
+	// so measure the DELTA around processLLMRetries rather than an absolute
+	// count — after waiting for that one reconcile call to land.
+	waitFor(t, 2*time.Second, func() bool { return h.herdr.listAgentsCallCount() >= 1 })
+	base := h.herdr.listAgentsCallCount()
 	h.daemon.processLLMRetries(ctx)
 
-	if n := h.herdr.listAgentsCallCount(); n != 0 {
-		t.Errorf("retry must not resolve the pane while a consult is in flight; ListAgents called %d time(s)", n)
+	if n := h.herdr.listAgentsCallCount() - base; n != 0 {
+		t.Errorf("retry must not resolve the pane while a consult is in flight; ListAgents called %d extra time(s)", n)
 	}
 	if q, _ := h.raw.UnprocessedLLMRetries(ctx); len(q) != 0 {
 		t.Errorf("a skipped retry should still be drained, got %+v", q)
@@ -1485,8 +1621,9 @@ func TestRetryLLMGuardSkipsWhileConsultInFlight(t *testing.T) {
 	if _, err := h.raw.InsertLLMRetry(ctx, id, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	base = h.herdr.listAgentsCallCount()
 	h.daemon.processLLMRetries(ctx)
-	if n := h.herdr.listAgentsCallCount(); n == 0 {
+	if n := h.herdr.listAgentsCallCount() - base; n == 0 {
 		t.Error("after the consult resolved, the retry should resolve the agent's pane")
 	}
 }
