@@ -190,6 +190,41 @@ func TestMCPSelectOptionsValidation(t *testing.T) {
 	}
 }
 
+func TestMCPSubmitDecisionSchemaRequiresConfidentScore(t *testing.T) {
+	// The schema advertises confident_score as required so models reliably
+	// report it (it gates auto-act); the server still tolerates absence
+	// (covered by TestMCPConfidentScoreValidation: omitted → -1).
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	c := startServer(t, st, "")
+	c.call(t, "initialize", map[string]any{})
+	resp := c.call(t, "tools/list", nil)
+
+	result, _ := resp["result"].(map[string]any)
+	tools, _ := result["tools"].([]any)
+	var required []any
+	for _, tl := range tools {
+		m, _ := tl.(map[string]any)
+		if m["name"] != "submit_decision" {
+			continue
+		}
+		schema, _ := m["inputSchema"].(map[string]any)
+		required, _ = schema["required"].([]any)
+	}
+	found := false
+	for _, r := range required {
+		if r == "confident_score" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("submit_decision schema must require confident_score, got required=%v", required)
+	}
+}
+
 func TestMCPConfidentScoreValidation(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {

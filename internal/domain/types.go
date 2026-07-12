@@ -95,18 +95,23 @@ const (
 type EscalateReason string
 
 const (
-	ReasonNone                 EscalateReason = ""
-	ReasonUnclassifiable       EscalateReason = "unclassifiable"
-	ReasonBelowThreshold       EscalateReason = "below_threshold"
-	ReasonVarianceGuard        EscalateReason = "variance_guard"
-	ReasonOverMasked           EscalateReason = "over_masked"
-	ReasonNeverAutoMatch       EscalateReason = "never_auto_match"
-	ReasonSuspectedIrrevers    EscalateReason = "suspected_irreversible"
-	ReasonRateLimited          EscalateReason = "rate_limited"
-	ReasonRetryExhausted       EscalateReason = "retry_exhausted"
-	ReasonKilled               EscalateReason = "killed"
-	ReasonLLMTimeout           EscalateReason = "llm_timeout"
-	ReasonLLMNoSubmit          EscalateReason = "llm_no_submit"
+	ReasonNone              EscalateReason = ""
+	ReasonUnclassifiable    EscalateReason = "unclassifiable"
+	ReasonBelowThreshold    EscalateReason = "below_threshold"
+	ReasonVarianceGuard     EscalateReason = "variance_guard"
+	ReasonOverMasked        EscalateReason = "over_masked"
+	ReasonNeverAutoMatch    EscalateReason = "never_auto_match"
+	ReasonSuspectedIrrevers EscalateReason = "suspected_irreversible"
+	ReasonRateLimited       EscalateReason = "rate_limited"
+	ReasonRetryExhausted    EscalateReason = "retry_exhausted"
+	ReasonKilled            EscalateReason = "killed"
+	ReasonLLMTimeout        EscalateReason = "llm_timeout"
+	ReasonLLMNoSubmit       EscalateReason = "llm_no_submit"
+	// ReasonLLMLowConfidence: the LLM answered, but its self-reported
+	// confidence was below the operator's auto_act_confidence_threshold (or
+	// it reported no score), so the suggestion is surfaced for confirmation
+	// instead of being auto-acted.
+	ReasonLLMLowConfidence     EscalateReason = "llm_low_confidence"
 	ReasonHerdrUnreachable     EscalateReason = "herdr_unreachable"
 	ReasonPersistenceFailed    EscalateReason = "persistence_failed"
 	ReasonShadowMode           EscalateReason = "shadow_mode"

@@ -337,7 +337,7 @@ command = [
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
 ]
 timeout_seconds = 120
-auto_act = false   # false: LLM suggestions are surfaced for your confirmation
+auto_act_confidence_threshold = 999   # auto-act only when the LLM's confidence (0-100) is >= this; 999 = never (surface for your confirmation)
 pane_excerpt_chars = 5000   # pane excerpt size in the consult context (default 5000)
 ```
 
@@ -408,8 +408,10 @@ Placeholders: `{self}` (this plugin binary), `{request_id}`, `{db}`,
 launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing
 `exec` inserted) — an unrecognized shape is left untouched. Every LLM
 suggestion is re-gated through the same never-auto patterns, kill switch, and rate
-guards; with `auto_act = true` it may act only when it doesn't contradict
-your learned history. On timeout or no submission the situation escalates.
+guards; it auto-acts only when the LLM's self-reported confidence meets
+`auto_act_confidence_threshold` (0-100; default 999 = never) and the action
+doesn't contradict your learned history — otherwise the suggestion is surfaced
+for you to confirm. On timeout or no submission the situation escalates.
 
 The model can also submit `action: "@noop"` (also accepted: `noop`,
 `no_op`, `no-op`) to say **no reply is needed** — the agent finished or is

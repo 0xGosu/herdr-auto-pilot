@@ -621,7 +621,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "safety.disable_seed", TUIEditable: true},
 	{Key: "llm.command"}, // argv template
 	{Key: "llm.timeout_seconds", TUIEditable: true},
-	{Key: "llm.auto_act", TUIEditable: true},
+	{Key: "llm.auto_act_confidence_threshold", TUIEditable: true},
 	{Key: "llm.pane_excerpt_chars", TUIEditable: true},
 	{Key: "llm.rewrite_command"}, // argv template
 	{Key: "llm.rewrite_timeout_seconds", TUIEditable: true},
@@ -691,8 +691,11 @@ func FieldValue(cfg config.Config, key string) string {
 		return JoinCommand(cfg.LLM.Command)
 	case "llm.timeout_seconds":
 		return strconv.Itoa(cfg.LLM.TimeoutSeconds)
-	case "llm.auto_act":
-		return strconv.FormatBool(cfg.LLM.AutoAct)
+	case "llm.auto_act_confidence_threshold":
+		if cfg.LLM.AutoActConfidenceThreshold > 100 {
+			return fmt.Sprintf("%d (never auto-acts)", cfg.LLM.AutoActConfidenceThreshold)
+		}
+		return strconv.Itoa(cfg.LLM.AutoActConfidenceThreshold)
 	case "llm.pane_excerpt_chars":
 		return strconv.Itoa(cfg.LLM.PaneExcerptChars)
 	case "llm.rewrite_command":
@@ -783,12 +786,14 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setInt(&cfg.Limits.MaxErrorRetries)
 		case "llm.timeout_seconds":
 			return setInt(&cfg.LLM.TimeoutSeconds)
-		case "llm.auto_act":
-			v, err := strconv.ParseBool(value)
-			if err != nil {
-				return fmt.Errorf("llm.auto_act must be true or false, got %q", value)
+		case "llm.auto_act_confidence_threshold":
+			// 0-100 auto-acts at/above that confidence; any value >100
+			// (conventionally 999) never auto-acts. Reject negatives.
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("llm.auto_act_confidence_threshold must be a non-negative integer (0-100; 999 = never), got %q", value)
 			}
-			cfg.LLM.AutoAct = v
+			cfg.LLM.AutoActConfidenceThreshold = v
 			return nil
 		case "llm.command":
 			argv, err := SplitCommand(value)

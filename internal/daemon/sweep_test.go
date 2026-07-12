@@ -114,7 +114,7 @@ func TestMultiTabSweepAndSeriesDelivery(t *testing.T) {
 // consult (the consult contract would demand N answers for questions the
 // model never saw).
 func TestSweepFailureDegradesToSingleFrame(t *testing.T) {
-	h := newHarness(t, "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n")
+	h := newHarness(t, "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 0\ntimeout_seconds = 5\n")
 	h.herdr.setFrames(mcqFrames)
 	h.herdr.mu.Lock()
 	h.herdr.failKeys = true
@@ -209,7 +209,7 @@ func TestSweepResetFailureDegrades(t *testing.T) {
 // The LLM consult context for a multi-tab form advertises the digit-series
 // contract, and a submitted series is promoted via keystrokes.
 func TestLLMMultiTabConsultAndSeriesPromotion(t *testing.T) {
-	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n"
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
 	h := newHarness(t, cfg)
 	h.herdr.setFrames(mcqFrames)
 	h.llm.configured = true
@@ -222,10 +222,10 @@ func TestLLMMultiTabConsultAndSeriesPromotion(t *testing.T) {
 		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
 			RequestID: req.RequestID, Signature: req.Signature,
 			SituationType: req.SituationType, AgentType: req.AgentType,
-			Action: "1 2 1", Rationale: "sane defaults", Status: "pending", CreatedAt: time.Now(),
+			Action: "1 2 1", Rationale: "sane defaults", ConfidentScore: 80, Status: "pending", CreatedAt: time.Now(),
 		})
 		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "1 2 1",
-			Rationale: "sane defaults", Status: "pending"}, nil
+			Rationale: "sane defaults", ConfidentScore: 80, Status: "pending"}, nil
 	}
 
 	h.push("agent-mcqllm", "blocked")
@@ -261,7 +261,7 @@ func TestLLMMultiTabConsultAndSeriesPromotion(t *testing.T) {
 // A DIFFERENT form with the same tab count showing at promotion time must
 // reject the series: consults take minutes and forms can be replaced.
 func TestLLMMultiTabDifferentFormRejected(t *testing.T) {
-	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n"
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 0\ntimeout_seconds = 5\n"
 	h := newHarness(t, cfg)
 	h.herdr.setFrames(mcqFrames)
 	h.llm.configured = true
@@ -302,7 +302,7 @@ func TestLLMMultiTabDifferentFormRejected(t *testing.T) {
 // An LLM answer whose digit count does not match the tab count is rejected —
 // a partial answer must never reach the form.
 func TestLLMMultiTabSeriesLengthMismatchRejected(t *testing.T) {
-	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n"
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 0\ntimeout_seconds = 5\n"
 	h := newHarness(t, cfg)
 	h.herdr.setFrames(mcqFrames)
 	h.llm.configured = true

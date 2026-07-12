@@ -47,11 +47,11 @@ func TestNoopRuleAutonomousNoSend(t *testing.T) {
 	}
 }
 
-// An LLM-submitted @noop with auto_act enabled is promoted: decision
-// accepted, learning recorded, nothing sent — this breaks the LLM↔agent
-// nudge loop.
+// An LLM-submitted @noop whose confidence meets the threshold is promoted:
+// decision accepted, learning recorded, nothing sent — this breaks the
+// LLM↔agent nudge loop.
 func TestLLMNoopPromotionRecordsWithoutSend(t *testing.T) {
-	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n"
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true
@@ -60,10 +60,10 @@ func TestLLMNoopPromotionRecordsWithoutSend(t *testing.T) {
 			RequestID: req.RequestID, Signature: req.Signature,
 			SituationType: req.SituationType, AgentType: req.AgentType,
 			Action: "@noop", Rationale: "agent finished; no reply needed",
-			Status: "pending", CreatedAt: time.Now(),
+			ConfidentScore: 80, Status: "pending", CreatedAt: time.Now(),
 		})
 		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "@noop",
-			Rationale: "agent finished; no reply needed", Status: "pending"}, nil
+			Rationale: "agent finished; no reply needed", ConfidentScore: 80, Status: "pending"}, nil
 	}
 
 	h.push("agent-llmnoop", "blocked")
@@ -96,11 +96,11 @@ func TestLLMNoopPromotionRecordsWithoutSend(t *testing.T) {
 	}
 }
 
-// With auto_act disabled an LLM @noop surfaces as a human-readable
-// suggestion; confirming it records the @noop as a learning event
-// (end-to-end: accepted noop escalation becomes learned history).
-func TestLLMNoopEscalatesWhenAutoActDisabled(t *testing.T) {
-	cfg := "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n"
+// Below the confidence threshold (default 999 = never), an LLM @noop surfaces
+// as a human-readable suggestion; confirming it records the @noop as a
+// learning event (end-to-end: accepted noop escalation becomes learned history).
+func TestLLMNoopEscalatesBelowConfidenceThreshold(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n" // threshold defaults to 999 (never)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true
