@@ -24,10 +24,37 @@ New name for the "allowlist" concept (config key, reason token, labels)?
 Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 `
 
+// mcqTabFrameV2 uses the Claude Code v2.1.207 footer wording — the tab-switch
+// hint moved from "Tab/Arrow keys to navigate" to "Tab to switch questions"
+// (issue #50). The header is unchanged, so only the footer regex must adapt.
+const mcqTabFrameV2 = `⏺ Daemon dead — no process. Two decisions are yours:
+───────────────────────────────
+←  ☐ Test scope  ☐ Daemon  ✔ Submit  →
+
+How deep should the feature test go?
+
+❯ 1. Read-only + config
+  2. Full end-to-end
+  3. Read-only only
+───────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel
+`
+
 func TestMultiTabFormDetectsTabs(t *testing.T) {
 	tabs, ok := MultiTabForm(mcqTabFrame)
 	if !ok || tabs != 5 {
 		t.Fatalf("MultiTabForm = (%d,%v), want (5,true)", tabs, ok)
+	}
+}
+
+func TestMultiTabFormDetectsV2Footer(t *testing.T) {
+	// Regression for #50: the v2.1.207 "Tab to switch questions" footer must
+	// still detect the 3-tab form (Test scope / Daemon / Submit).
+	tabs, ok := MultiTabForm(mcqTabFrameV2)
+	if !ok || tabs != 3 {
+		t.Fatalf("MultiTabForm(v2 footer) = (%d,%v), want (3,true)", tabs, ok)
 	}
 }
 

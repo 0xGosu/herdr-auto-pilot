@@ -110,9 +110,56 @@ jobs:
           # Inter-library resolution must work from the bundle dir alone.
           if [ "${EXT}" = "so" ]; then
             sudo apt-get install -y -qq patchelf
-            for f in *.so; do
+            # FAISS is built against OpenBLAS (its BLAS backend) plus libgomp,
+            # and OpenBLAS in turn pulls in libgfortran + libquadmath. None of
+            # these are guaranteed present on a target box (a bare Debian has
+            # no libopenblas.so.0), so bundle the whole chain beside FAISS.
+            # Copy by SONAME — the NEEDED string the loader matches on — not
+            # the readlink -f real filename (libopenblasp-r*.so would not
+            # resolve). Paths come from the runner's ldconfig so the
+            # pthread-vs-openmp OpenBLAS variant doesn't matter.
+            copy_soname() {
+              local p
+              p="$(ldconfig -p | awk -v s="$1" '$1==s {print $NF; exit}')"
+              [ -n "$p" ] || { echo "cannot locate $1 on runner" >&2; exit 1; }
+              cp -L "$p" "./$1"
+            }
+            for so in libopenblas.so.0 libgfortran.so.5 libquadmath.so.0 libgomp.so.1; do
+              copy_soname "$so"
+            done
+            # DT_RUNPATH is NOT transitive: each bundled lib needs its own
+            # $ORIGIN so it can find the next link in the chain. Glob *.so*
+            # (not *.so) to catch versioned sonames like libgfortran.so.5.
+            for f in *.so*; do
+              [ -f "$f" ] || continue
               patchelf --set-rpath '$ORIGIN' "$f"
             done
+            # Prove the bundle is self-contained: after patchelf, nothing may
+            # resolve outside lib/ except an explicit base-system allowlist.
+            # Fails the release on any drift (e.g. a future FAISS bump adding
+            # an unbundled dep), instead of silently reshipping a broken lib/.
+            allow='libc\.so|libm\.so|libpthread\.so|libdl\.so|librt\.so|ld-linux|libstdc\+\+\.so|libgcc_s\.so'
+            # Match against the canonical dir: the loader resolves symlinks
+            # when it expands $ORIGIN, so ldd prints realpaths — a symlinked
+            # cwd would make correctly-bundled deps look like leaks.
+            libdir="$(realpath "$PWD")"
+            bad=0
+            for f in *.so*; do
+              [ -f "$f" ] || continue
+              # Capture ldd (and its exit): a non-parseable lib must fail the
+              # guard, not pass vacuously by reading zero lines.
+              deps="$(ldd "$f")" || { echo "ldd failed on $f" >&2; bad=1; continue; }
+              while read -r name arrow path _; do
+                [ "$arrow" = "=>" ] || continue          # skip vdso / ld.so lines
+                printf '%s' "$name" | grep -qE "$allow" && continue
+                case "$path" in
+                  "$libdir/"*) : ;;                       # good: resolved inside lib/
+                  not) echo "UNRESOLVED $name (needed by $f)" >&2; bad=1 ;;
+                  *) echo "LEAK $name -> $path (needed by $f)" >&2; bad=1 ;;
+                esac
+              done <<< "$deps"
+            done
+            [ "$bad" = 0 ] || { echo "native bundle is not self-contained" >&2; exit 1; }
           else
             install_name_tool -id '@rpath/libfaiss.dylib' libfaiss.dylib
             install_name_tool -id '@rpath/libfaiss_c.dylib' libfaiss_c.dylib

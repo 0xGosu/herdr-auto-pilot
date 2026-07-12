@@ -13,7 +13,10 @@ import (
 // Three-tab AskUserQuestion form (2 questions + Submit), one frame per tab
 // exactly as `pane read --source visible` would return them.
 const mcqHeader = "←  ☐ Q one  ☐ Q two  ✔ Submit  →"
-const mcqFooter = "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"
+
+// v2.1.207 footer wording — "Tab to switch questions" (issue #50). The old
+// "Tab/Arrow keys to navigate" form is still covered by the domain fixtures.
+const mcqFooter = "Enter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel"
 
 var mcqFrames = []string{
 	"scrollback narration up here\n──────\n" + mcqHeader + "\n\nWhich storage backend should we use?\n\n" +

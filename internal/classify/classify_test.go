@@ -184,6 +184,21 @@ func TestClaudeMCQMultiTabFormReportsTabCount(t *testing.T) {
 	}
 }
 
+func TestClaudeMCQMultiTabV2FooterReportsTabCount(t *testing.T) {
+	// Regression for #50: the Claude Code v2.1.207 footer says "Tab to switch
+	// questions", not "Tab/Arrow keys to navigate". A genuine 3-tab form
+	// (Test scope / Daemon / Submit) must still report its tab count.
+	c := New(nil)
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "choice_claude_mcq_tabs_v2.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.Classify("claude", "blocked", string(data))
+	if s.TabCount != 3 {
+		t.Errorf("tab count = %d, want 3 (2 questions + Submit)", s.TabCount)
+	}
+}
+
 func TestNarratedNumberedListNotChoice(t *testing.T) {
 	// A narrated markdown list whose first item wraps into a long indented
 	// continuation block (> 4 lines, no MCQ footer) must NOT classify as a

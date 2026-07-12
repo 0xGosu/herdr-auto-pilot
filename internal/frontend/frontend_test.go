@@ -1433,7 +1433,7 @@ func TestResolveDigitSeriesDeliversKeystrokes(t *testing.T) {
 	// tab (Submit included) — never the series as literal text.
 	app, st := testApp(t)
 	fake := &fakeKeyHerdr{fakeHerdr: fakeHerdr{
-		pane: "←  ☐ Q one  ☐ Q two  ✔ Submit  →\n\nWhich backend?\n❯ 1. sqlite\n  2. postgres\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n",
+		pane: "←  ☐ Q one  ☐ Q two  ✔ Submit  →\n\nWhich backend?\n❯ 1. sqlite\n  2. postgres\n\nEnter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel\n",
 	}}
 	app.Herdr = fake
 	ctx := context.Background()
