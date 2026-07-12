@@ -29,16 +29,19 @@ func TestRewriteSubstitutesPlaceholders(t *testing.T) {
 	dir := t.TempDir()
 	argvFile := filepath.Join(dir, "argv")
 	script := writeScript(t,
-		`printf '%s\n' "$@" > `+argvFile+"\necho rewritten reply\n")
+		`printf '%s\n' "$@" > `+argvFile+`
+printf 'name=%s\n' "$HAP_AGENT_NAME" >> `+argvFile+"\necho rewritten reply\n")
 	a := &Adapter{
 		RewriteTemplate: []string{script,
-			"text={text}", "sit={situation_type}", "agent={agent_type}", "pane={pane_excerpt}"},
+			"text={text}", "sit={situation_type}", "agent={agent_type}",
+			"name={agent_name}", "pane={pane_excerpt}"},
 		RewriteTimeout: 5 * time.Second,
 	}
 	got, err := a.Rewrite(context.Background(), domain.RewriteRequest{
 		Text:          "go test ./...",
 		SituationType: domain.SituationError,
 		AgentType:     "claude",
+		AgentName:     "brave-otter",
 		PaneExcerpt:   "FAIL: TestX",
 	})
 	if err != nil {
@@ -51,7 +54,9 @@ func TestRewriteSubstitutesPlaceholders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "text=go test ./...\nsit=error\nagent=claude\npane=FAIL: TestX\n"
+	// The {agent_name} placeholder substitutes into argv, and the same value
+	// is exported as HAP_AGENT_NAME for env-based recipes.
+	want := "text=go test ./...\nsit=error\nagent=claude\nname=brave-otter\npane=FAIL: TestX\nname=brave-otter\n"
 	if string(argv) != want {
 		t.Errorf("argv = %q, want %q", argv, want)
 	}

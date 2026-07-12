@@ -4,10 +4,11 @@ import "testing"
 
 func TestApplyRewriteFallback(t *testing.T) {
 	tests := []struct {
-		name     string
-		template string
-		original string
-		want     string
+		name      string
+		template  string
+		original  string
+		agentName string
+		want      string
 	}{
 		{
 			name:     "empty template uses default",
@@ -39,12 +40,26 @@ func TestApplyRewriteFallback(t *testing.T) {
 			original: "",
 			want:     "You must act based on the following: ",
 		},
+		{
+			name:      "agent_name substituted",
+			template:  "{agent_name}, do: {original_text}",
+			original:  "run tests",
+			agentName: "brave-otter",
+			want:      "brave-otter, do: run tests",
+		},
+		{
+			name:      "agent_name in original not re-expanded",
+			template:  "{agent_name}: {original_text}",
+			original:  "print {agent_name}",
+			agentName: "calm-lynx",
+			want:      "calm-lynx: print {agent_name}",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ApplyRewriteFallback(tt.template, tt.original); got != tt.want {
-				t.Errorf("ApplyRewriteFallback(%q, %q) = %q, want %q",
-					tt.template, tt.original, got, tt.want)
+			if got := ApplyRewriteFallback(tt.template, tt.original, tt.agentName); got != tt.want {
+				t.Errorf("ApplyRewriteFallback(%q, %q, %q) = %q, want %q",
+					tt.template, tt.original, tt.agentName, got, tt.want)
 			}
 		})
 	}

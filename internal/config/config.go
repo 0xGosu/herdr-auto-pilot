@@ -68,8 +68,9 @@ type Limits struct {
 // LLM configures the optional local LLM/agent CLI fallback (FR-010, IR-005).
 type LLM struct {
 	// Command is the argv template; supports {self} (this binary),
-	// {request_id}, {db}, and {control} placeholders. Empty means no LLM is
-	// configured (low-confidence situations escalate).
+	// {request_id}, {db}, {control}, and {agent_name} (the agent's short
+	// name) placeholders. Empty means no LLM is configured (low-confidence
+	// situations escalate).
 	Command        []string `toml:"command"`
 	TimeoutSeconds int      `toml:"timeout_seconds"`
 	// AutoActConfidenceThreshold gates acting on an LLM suggestion
@@ -92,16 +93,16 @@ type LLM struct {
 	// RewriteCommand is the argv template for the one-shot rewrite of
 	// literal outbound text (idle next-task prompts, error retry commands,
 	// free-text replies — never menu digits); placeholders {text},
-	// {situation_type}, {agent_type}, {pane_excerpt}. The rewritten text
-	// is read from the CLI's stdout. Empty means literal text is sent
-	// unchanged.
+	// {situation_type}, {agent_type}, {agent_name}, {pane_excerpt}. The
+	// rewritten text is read from the CLI's stdout. Empty means literal
+	// text is sent unchanged.
 	RewriteCommand []string `toml:"rewrite_command"`
 	// RewriteTimeoutSeconds bounds one rewrite run; zero or omitted
 	// inherits timeout_seconds.
 	RewriteTimeoutSeconds int `toml:"rewrite_timeout_seconds"`
 	// RewriteFallbackTemplate wraps the original text when the rewrite
-	// fails ({original_text} placeholder). Empty uses the built-in
-	// default; a rewrite failure never blocks the send.
+	// fails (placeholders {original_text}, {agent_name}). Empty uses the
+	// built-in default; a rewrite failure never blocks the send.
 	RewriteFallbackTemplate string `toml:"rewrite_fallback_template"`
 }
 
@@ -151,7 +152,8 @@ type TaskSource struct {
 	Path      string `toml:"path"` // markdown checklist file
 	// NextTaskTemplate overrides the outbound prompt format. Placeholders:
 	// {next_task_content} (next unchecked item, or "none" when the list is
-	// complete) and {task_list_path}. Empty uses the built-in default.
+	// complete), {task_list_path}, and {agent_name} (the agent's short
+	// name). Empty uses the built-in default.
 	NextTaskTemplate string `toml:"next_task_template,omitempty"`
 }
 

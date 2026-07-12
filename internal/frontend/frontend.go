@@ -1021,7 +1021,8 @@ func (a *App) AddNeverAutoPattern(ctx context.Context, pattern string) error {
 
 // AddTaskSource points an agent/workspace at a declared task list (FR-011).
 // template optionally overrides the outbound next-task prompt format
-// ({next_task_content} / {task_list_path} placeholders); "" uses the default.
+// ({next_task_content} / {task_list_path} / {agent_name} placeholders);
+// "" uses the default.
 func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, template string) error {
 	// The daemon reads the file from its own cwd (the state dir), not the
 	// operator's shell; resolve relative paths here where they still mean

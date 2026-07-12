@@ -60,6 +60,26 @@ func TestDeclaredTaskPrompt(t *testing.T) {
 			task: DeclaredTask{Task: "a", Path: "/p", Template: "{next_task_content}/{next_task_content} at {task_list_path}"},
 			want: "a/a at /p",
 		},
+		{
+			name: "agent_name substituted",
+			task: DeclaredTask{
+				Task:      "add validation",
+				Path:      "/docs/tasks.md",
+				Template:  "Hey {agent_name}, your next task is {next_task_content} ({task_list_path}).",
+				AgentName: "brave-otter",
+			},
+			want: "Hey brave-otter, your next task is add validation (/docs/tasks.md).",
+		},
+		{
+			name: "agent_name in task content not re-expanded",
+			task: DeclaredTask{
+				Task:      "print {agent_name}",
+				Path:      "/p",
+				Template:  "{agent_name}: {next_task_content}",
+				AgentName: "calm-lynx",
+			},
+			want: "calm-lynx: print {agent_name}",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

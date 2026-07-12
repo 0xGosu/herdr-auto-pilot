@@ -44,8 +44,9 @@ max_error_retries = 2              # per error signature
 # pair (comment the Claude keys and uncomment the Codex ones to switch).
 [llm]
 # ── Claude Code recipe (active) ──
-# {self} = the hap binary, {request_id} is filled per consult. The prompt
-# must come immediately after -p (claude quirk; the plugin auto-repairs it).
+# {self} = the hap binary, {request_id} is filled per consult, {agent_name}
+# is the agent's short name ({db}/{control} also available). The prompt must
+# come immediately after -p (claude quirk; the plugin auto-repairs it).
 command = [
   "claude", "-p",
   "You are the auto-answer assistant for herd-auto-prompter (hap). A coding agent running in a herdr terminal pane has stopped and is waiting for input. Your job: answer exactly as the human operator would, using ONLY the two hap MCP tools.\n\nStep 1 — call get_context. It returns the classified situation:\n- situation_type: 'approval' (permission prompt), 'choice' (menu of options), 'error' (the agent hit a failure), or 'idle' (finished or waiting for its next instruction)\n- options: the menu option texts, when the pane shows a menu\n- permission_verb: what the agent is asking permission to do\n- error_summary: short description of the failure, when situation_type is 'error'\n- pane_excerpt: the recent terminal screen — read it carefully; it is the ground truth for what the agent is doing and asking\n- cwd / foreground_cwd and herdr ids (workspace_id, tab_id, pane_id, agent_id): where the agent is working\n\nStep 2 — decide what the operator would answer:\n- approval / choice: pick ONE entry from options and use its EXACT text. Approve routine, reversible work (reading files, edits, builds, tests, linters). Prefer the safest option and DENY anything destructive or hard to reverse: deleting data, force-pushing or hard-resetting git history, production/deploy changes, touching secrets or credentials, mass file operations.\n- error: reply with one short, concrete instruction telling the agent how to diagnose or fix the failure and continue.\n- idle: reply with the most sensible next instruction based on the pane_excerpt (e.g. continue the remaining work); if nothing remains, tell it to summarize and stop.\n- If the pane_excerpt is ambiguous or does not match the classified situation, choose the most conservative reply.\n\nStep 3 — call submit_decision with: action = the literal reply text to send to the agent (for menus, the exact option text — hap maps it to the menu digit), option_id = the chosen option text for menus, rationale = one sentence on why the operator would answer this way.",
@@ -140,6 +141,7 @@ theme = ""                 # named palette: default | dark | light | high-contra
 # agent = ""                 # short name, pane id, or type; "" = any
 # workspace = ""             # "" or "*" = any; wildcards like "codex-*" work
 # path = "/home/me/project/docs/tasks.md"
+# next_task_template placeholders: {next_task_content}, {task_list_path}, {agent_name}
 # next_task_template = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."
 
 # ── Custom classifier rules (repeatable, extend the built-ins) ──────

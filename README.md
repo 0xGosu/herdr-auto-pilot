@@ -235,7 +235,7 @@ agent = "brave-otter" # agent short name, pane id, or type ("" = any)
 workspace = ""        # workspace name; "" or "*" = any, "*" wildcards work
                       # ("codex-*" = starts with, "*-vscode3" = ends with)
 path = "/home/me/project/docs/tasks.md"
-# Optional per-source prompt format ({next_task_content}, {task_list_path}):
+# Optional per-source prompt format ({next_task_content}, {task_list_path}, {agent_name}):
 next_task_template = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}. Verify task dependencies before starting. When there is no task available, focus on improving the test coverage of this project."
 ```
 
@@ -404,7 +404,8 @@ timeout_seconds = 180
 ```
 
 Placeholders: `{self}` (this plugin binary), `{request_id}`, `{db}`,
-`{control}`. Common misconfigurations of known CLIs are auto-repaired at
+`{control}`, `{agent_name}` (the agent's short name). Common
+misconfigurations of known CLIs are auto-repaired at
 launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing
 `exec` inserted) — an unrecognized shape is left untouched. Every LLM
 suggestion is re-gated through the same never-auto patterns, kill switch, and rate
@@ -444,15 +445,15 @@ rewrite_fallback_template = "You must act based on the following: {original_text
 ```
 
 Placeholders in `rewrite_command`: `{text}` (the literal reply a rule
-resolved to), `{situation_type}`, `{agent_type}`, `{pane_excerpt}` (last
-`pane_excerpt_chars` characters of the live pane). The same CLI auto-repair
-as `llm.command` applies (on the raw template, before substitution). No
-shell is involved — each element is one argv entry — but `{text}` and
-`{pane_excerpt}` carry untrusted pane content: embed them inside a prompt
-string (as in the example) rather than as standalone argv elements, so a
-value starting with `-` can never be parsed as a flag; the same values are
-also available as `HAP_REWRITE_TEXT` / `HAP_SITUATION_TYPE` /
-`HAP_AGENT_TYPE` env vars.
+resolved to), `{situation_type}`, `{agent_type}`, `{agent_name}` (the
+agent's short name), `{pane_excerpt}` (last `pane_excerpt_chars` characters
+of the live pane). The same CLI auto-repair as `llm.command` applies (on the
+raw template, before substitution). No shell is involved — each element is
+one argv entry — but `{text}` and `{pane_excerpt}` carry untrusted pane
+content: embed them inside a prompt string (as in the example) rather than as
+standalone argv elements, so a value starting with `-` can never be parsed as
+a flag; the same values are also available as `HAP_REWRITE_TEXT` /
+`HAP_SITUATION_TYPE` / `HAP_AGENT_TYPE` / `HAP_AGENT_NAME` env vars.
 
 Invariants:
 
@@ -460,8 +461,9 @@ Invariants:
   the menu untouched. Only literal free text goes through the rewriter.
 - **A rewrite failure never blocks the send**: on error, timeout, or empty
   output the original text is delivered wrapped in
-  `rewrite_fallback_template` (`{original_text}` placeholder; empty or
-  placeholder-less templates fall back to the built-in default).
+  `rewrite_fallback_template` (`{original_text}`, `{agent_name}`
+  placeholders; empty or `{original_text}`-less templates fall back to the
+  built-in default).
 - **Safety controls still apply to the rewritten text**: output matching
   the never-auto patterns or the irreversible-operation heuristic is
   discarded in favor of the wrapped original; if even that trips, the

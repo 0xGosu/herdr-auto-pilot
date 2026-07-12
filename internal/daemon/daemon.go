@@ -153,6 +153,7 @@ type rewriteOutcome struct {
 	dec       domain.Decision
 	learned   string // original learned form for RecordDecision
 	fallback  string // snapshotted rewrite_fallback_template
+	agentName string // agent short name, for {agent_name}
 	rewritten string
 	err       error
 	token     uint64
@@ -991,7 +992,14 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 	go func() {
 		outcome := llmOutcome{situation: s, sig: sig, request: req}
 		err := logging.Guard("llm-consult", func() error {
-			req.ContextJSON = string(d.consultContext(ctx, cfg, s))
+			// The short name rides on the request ({agent_name}) and the
+			// consult context blob; degrade to "" when unresolvable.
+			agentName, nerr := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
+			if nerr != nil {
+				agentName = ""
+			}
+			req.AgentName = agentName
+			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName))
 			if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
 				return fmt.Errorf("staging LLM request failed: %w", err)
 			}
@@ -1011,7 +1019,7 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 // consultContext builds the JSON context handed to the LLM CLI via the
 // get_context MCP tool: the classified situation, a pane excerpt, the
 // agent's herdr location, and the pane working directory.
-func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation) []byte {
+func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation, agentName string) []byte {
 	excerpt := d.paneExcerpt(ctx, cfg, s)
 
 	// Pane location and cwd come from `pane get`; degrade to empty values
@@ -1047,6 +1055,7 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		"tab_id":          tabID,
 		"pane_id":         s.PaneID,
 		"agent_id":        s.AgentID,
+		"agent_name":      agentName,
 		"cwd":             info.Cwd,
 		"foreground_cwd":  info.ForegroundCwd,
 		"no_reply_option": "if the agent needs no reply (it finished or is only reporting status), submit_decision with recommend_action \"@noop\" to explicitly do nothing",
@@ -1124,14 +1133,20 @@ func (d *Daemon) startRewrite(ctx context.Context, rw ports.RewriterPort, s doma
 	d.mu.Unlock()
 
 	go func() {
+		// The short name rides on the request ({agent_name}) and is reused
+		// for the fallback template if the rewrite degrades; degrade to "".
+		agentName, err := d.opt.Store.EnsureAgentName(rctx, s.AgentID)
+		if err != nil {
+			agentName = ""
+		}
 		outcome := rewriteOutcome{
 			situation: s, sig: sig, tr: tr, dec: dec, learned: learned,
-			fallback: cfg.LLM.RewriteFallbackTemplate, token: token,
+			fallback: cfg.LLM.RewriteFallbackTemplate, agentName: agentName, token: token,
 		}
 		outcome.err = logging.Guard("llm-rewrite", func() error {
 			req := domain.RewriteRequest{
 				Text: dec.Input, SituationType: s.Type, AgentType: s.AgentType,
-				PaneExcerpt: d.paneExcerpt(rctx, cfg, s),
+				PaneExcerpt: d.paneExcerpt(rctx, cfg, s), AgentName: agentName,
 			}
 			text, err := rw.Rewrite(rctx, req)
 			outcome.rewritten = text
@@ -1201,7 +1216,7 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	note := "rewritten by llm.rewrite_command"
 	llmOutput := ""
 	degrade := func(why string) {
-		final = domain.ApplyRewriteFallback(res.fallback, res.dec.Input)
+		final = domain.ApplyRewriteFallback(res.fallback, res.dec.Input, res.agentName)
 		note = "rewrite " + why + "; fallback template applied"
 	}
 	switch {
@@ -1883,12 +1898,12 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 			continue
 		}
 		if task := domain.NextDeclaredTask(string(data)); task != "" {
-			return &domain.DeclaredTask{Task: task, Path: src.Path, Template: src.NextTaskTemplate}
+			return &domain.DeclaredTask{Task: task, Path: src.Path, Template: src.NextTaskTemplate, AgentName: agentName}
 		}
 		// Only a real checklist with every item checked counts as completed;
 		// an empty or non-checklist file must not suppress tier-2 inference.
 		if completed == nil && domain.HasChecklistItems(string(data)) {
-			completed = &domain.DeclaredTask{Task: domain.NoTaskContent, Path: src.Path, Template: src.NextTaskTemplate}
+			completed = &domain.DeclaredTask{Task: domain.NoTaskContent, Path: src.Path, Template: src.NextTaskTemplate, AgentName: agentName}
 		}
 	}
 	return completed
