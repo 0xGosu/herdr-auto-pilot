@@ -49,6 +49,10 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: gate
     strategy:
+      # Don't cancel the other targets when one fails: a per-arch bundling
+      # bug must surface on every platform in a single run, not hide behind
+      # the first failure (the arm64-only libquadmath break did exactly that).
+      fail-fast: false
       matrix:
         include:
           # CGO cannot cross-compile, so each target builds on its own
@@ -110,23 +114,27 @@ jobs:
           # Inter-library resolution must work from the bundle dir alone.
           if [ "${EXT}" = "so" ]; then
             sudo apt-get install -y -qq patchelf
-            # FAISS is built against OpenBLAS (its BLAS backend) plus libgomp,
-            # and OpenBLAS in turn pulls in libgfortran + libquadmath. None of
-            # these are guaranteed present on a target box (a bare Debian has
-            # no libopenblas.so.0), so bundle the whole chain beside FAISS.
-            # Copy by SONAME — the NEEDED string the loader matches on — not
-            # the readlink -f real filename (libopenblasp-r*.so would not
-            # resolve). Paths come from the runner's ldconfig so the
-            # pthread-vs-openmp OpenBLAS variant doesn't matter.
-            copy_soname() {
-              local p
-              p="$(ldconfig -p | awk -v s="$1" '$1==s {print $NF; exit}')"
-              [ -n "$p" ] || { echo "cannot locate $1 on runner" >&2; exit 1; }
-              cp -L "$p" "./$1"
-            }
-            for so in libopenblas.so.0 libgfortran.so.5 libquadmath.so.0 libgomp.so.1; do
-              copy_soname "$so"
-            done
+            # Base system libs every glibc box already has — never bundle
+            # these (shipping our own libc/libm is a portability hazard).
+            allow='libc\.so|libm\.so|libpthread\.so|libdl\.so|librt\.so|ld-linux|libstdc\+\+\.so|libgcc_s\.so'
+            # FAISS needs a BLAS backend (OpenBLAS) + OpenMP, and OpenBLAS
+            # pulls in its own Fortran runtime — none guaranteed on a target
+            # box (a bare Debian has no libopenblas.so.0). DISCOVER that chain
+            # instead of hardcoding it: ldd is recursive, so its output for
+            # the two FAISS libs is the full transitive closure. Copying every
+            # non-base dep is arch-adaptive by construction — x86_64 pulls in
+            # libquadmath, aarch64 doesn't, and this copies exactly what each
+            # runner's closure resolves. Copy by SONAME (the $1 column ldd
+            # prints — the NEEDED name the loader matches), not the realpath.
+            deps="$( { ldd libfaiss.so; ldd libfaiss_c.so; } | awk '$2=="=>" {print $1"\t"$3}' | sort -u )"
+            while IFS="$(printf '\t')" read -r name path; do
+              [ -n "$name" ] || continue
+              printf '%s' "$name" | grep -qE "$allow" && continue
+              [ "$path" = "not" ] && { echo "FAISS dep $name is unresolved on the runner" >&2; exit 1; }
+              case "$path" in
+                /*) [ -e "./$name" ] || cp -L "$path" "./$name" ;;
+              esac
+            done <<< "$deps"
             # DT_RUNPATH is NOT transitive: each bundled lib needs its own
             # $ORIGIN so it can find the next link in the chain. Glob *.so*
             # (not *.so) to catch versioned sonames like libgfortran.so.5.
@@ -135,10 +143,9 @@ jobs:
               patchelf --set-rpath '$ORIGIN' "$f"
             done
             # Prove the bundle is self-contained: after patchelf, nothing may
-            # resolve outside lib/ except an explicit base-system allowlist.
-            # Fails the release on any drift (e.g. a future FAISS bump adding
-            # an unbundled dep), instead of silently reshipping a broken lib/.
-            allow='libc\.so|libm\.so|libpthread\.so|libdl\.so|librt\.so|ld-linux|libstdc\+\+\.so|libgcc_s\.so'
+            # resolve outside lib/ except the base allowlist above. Fails the
+            # release on any drift (a FAISS bump adding a dep the harvest
+            # missed), instead of silently reshipping a broken lib/.
             # Match against the canonical dir: the loader resolves symlinks
             # when it expands $ORIGIN, so ldd prints realpaths — a symlinked
             # cwd would make correctly-bundled deps look like leaks.
