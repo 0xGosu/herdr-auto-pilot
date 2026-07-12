@@ -1230,7 +1230,9 @@ func TestIdleWithoutTaskSourceEscalates(t *testing.T) {
 
 func TestErrorRetryCeilingEndToEnd(t *testing.T) {
 	// FR-014: up to 2 automated retries per error signature; 3rd escalates.
-	errorPane := "ERROR: build failed with exit status 2\nRetry, skip, or abort?\n"
+	// A Claude error/retry situation (interrupt prompt) — generic build-log
+	// text no longer classifies as error (it is ordinary narration).
+	errorPane := "⎿  Interrupted · What should Claude do instead?\n"
 	h := newHarness(t, "")
 	h.herdr.setPane(errorPane)
 	h.seedAutonomous(errorPane, domain.SituationError, "retry")

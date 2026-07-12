@@ -1,0 +1,3 @@
+⏺ Running the full test suite…
+
+  ⎿  Interrupted · What should Claude do instead?
