@@ -12,19 +12,21 @@ import (
 //
 //	←  ☐ New name  ☐ Rename depth  ☐ Config compat  ☐ Conciseness  ✔ Submit  →
 //
-// and a footer that names Tab/Arrow navigation. The pane shows ONE question
-// at a time; the header is the only signal that more tabs exist.
+// and a footer that names tab navigation ("Tab/Arrow keys to navigate" on
+// older builds, "Tab to switch questions" since Claude Code v2.1.207). The
+// pane shows ONE question at a time; the header is the only signal that more
+// tabs exist.
 var (
 	mcqTabHeaderRE = regexp.MustCompile(`(?m)^\s*←.*[☐✔].*→\s*$`)
 	mcqTabEntryRE  = regexp.MustCompile(`[☐✔]`)
-	mcqTabFooterRE = regexp.MustCompile(`(?i)tab/arrow keys to navigate`)
+	mcqTabFooterRE = regexp.MustCompile(`(?i)(tab/arrow keys to navigate|tab to switch questions)`)
 	mcqFooterRE    = regexp.MustCompile(`(?im)^.*enter to select.*$`)
 	digitTokenRE   = regexp.MustCompile(`^[1-9]$`)
 )
 
 // MultiTabForm reports whether pane content shows the multi-tab MCQ variant
 // and how many tabs it has (checkbox entries plus the Submit entry). Both
-// the tab header and the Tab/Arrow footer are required, so a narrated
+// the tab header and the tab-navigation footer are required, so a narrated
 // checkbox list can not false-positive. The LAST header occurrence is the
 // live render: a consuming "recent" read can carry earlier renders (or an
 // older form) above the current one.
