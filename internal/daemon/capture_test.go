@@ -91,10 +91,14 @@ func TestCaptureTimersArePerPane(t *testing.T) {
 	h.push("agent-capA", "blocked")
 	h.push("agent-capB", "blocked")
 	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 2 })
-	esc, err := h.raw.PendingEscalations(context.Background())
-	if err != nil || len(esc) != 2 {
-		t.Fatalf("both panes must escalate, got %d (%v)", len(esc), err)
-	}
+	// Both reads have fired, but each escalation is persisted AFTER its read
+	// returns — poll for the DB writes instead of reading once (checking
+	// immediately raced the second escalation on stalled runners). waitFor
+	// t.Fatals if the second escalation never lands.
+	waitFor(t, 5*time.Second, func() bool {
+		esc, err := h.raw.PendingEscalations(context.Background())
+		return err == nil && len(esc) == 2
+	})
 }
 
 func TestCaptureCanceledByWorkingTransition(t *testing.T) {
