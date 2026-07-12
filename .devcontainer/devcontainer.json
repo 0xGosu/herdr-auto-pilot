@@ -28,7 +28,9 @@
   "initializeCommand": "docker pull gelmium/devcontainer:latest;echo DEVCONTAINER_REF=${devcontainerId} > .devcontainer/.env",
 
   // Use 'postCreateCommand' to run commands after the container is created.
-  "postCreateCommand": "bash -i -c 'post_create_command' || true",
+  // scripts/devcontainer-postcreate.sh installs hap's native runtime deps
+  // (libopenblas0 for FAISS); keep project setup steps there, not inline.
+  "postCreateCommand": "bash -i -c 'post_create_command' || true; bash scripts/devcontainer-postcreate.sh || true",
 
   // A command to run each time the container is successfully started.
   "postStartCommand": "bash -i -c 'post_start_command' || true",

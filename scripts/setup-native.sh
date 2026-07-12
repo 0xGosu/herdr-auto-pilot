@@ -67,12 +67,26 @@ echo "==> llama-go static binding (CPU only, static archives)"
 # BUILD_SHARED_LIBS=OFF makes the Makefile copy .a archives — the shared
 # branch hardcodes .so names and breaks on macOS. GPU/BLAS backends are off:
 # hap embeds short strings on CPU and links with the `cpu` build tag.
-LLAMA_CMAKE_ARGS="-DBUILD_SHARED_LIBS=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF"
+# GGML_NATIVE=OFF stops ggml passing -march=native, which would bake the
+# BUILDER's CPU features into the archive — a release runner with AVX-512
+# then produces a binary that SIGILLs on load on AVX2-only hosts. On x86 we
+# pin an explicit AVX2 baseline (x86-64-v3, every 2013+ Haswell) so the build
+# is portable yet not scalar-slow; these flags are inert on arm64 (ggml reads
+# them only under its x86 arch guard), and CGO builds each platform on its own
+# native runner, so `uname -m` is the target arch.
+LLAMA_CMAKE_ARGS="-DBUILD_SHARED_LIBS=OFF -DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF -DGGML_NATIVE=OFF"
+case "$(uname -m)" in
+  x86_64 | amd64)
+    LLAMA_CMAKE_ARGS="${LLAMA_CMAKE_ARGS} -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF"
+    ;;
+esac
 # The llama-go Makefile only invalidates its cmake cache on GPU-flag
-# mismatches, not shared/static — wipe a build configured for shared libs.
+# mismatches, not shared/static or the native/baseline flags above — wipe a
+# build configured for shared libs OR still carrying -march=native.
 if [ -f submodule/github.com/seed-hypermedia/llama-go/build/CMakeCache.txt ] &&
-  ! grep -q "BUILD_SHARED_LIBS:BOOL=OFF" submodule/github.com/seed-hypermedia/llama-go/build/CMakeCache.txt; then
-  echo "    (wiping shared-lib cmake cache)"
+  { ! grep -q "BUILD_SHARED_LIBS:BOOL=OFF" submodule/github.com/seed-hypermedia/llama-go/build/CMakeCache.txt ||
+    ! grep -q "GGML_NATIVE:BOOL=OFF" submodule/github.com/seed-hypermedia/llama-go/build/CMakeCache.txt; }; then
+  echo "    (wiping stale cmake cache: shared-lib or native config)"
   rm -rf submodule/github.com/seed-hypermedia/llama-go/build submodule/github.com/seed-hypermedia/llama-go/llama.cpp/*.o \
     submodule/github.com/seed-hypermedia/llama-go/*.o submodule/github.com/seed-hypermedia/llama-go/*.a \
     submodule/github.com/seed-hypermedia/llama-go/*.so submodule/github.com/seed-hypermedia/llama-go/*.dylib
