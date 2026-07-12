@@ -218,6 +218,131 @@ func TestNarratedNumberedListNotChoice(t *testing.T) {
 	}
 }
 
+func TestApprovalAndChoiceOnlyWhenBlocked(t *testing.T) {
+	// Approval and choice are BLOCKED situations: the same content at a
+	// non-blocked status must NOT classify as approval/choice.
+	c := New(nil)
+	approval := "Do you want to proceed?\n❯ 1. Yes\n  2. No\n"
+	choice := "Which option would you like?\n"
+	for _, status := range []string{"working", "idle", "done"} {
+		if s := c.Classify("claude", status, approval); s.Type == domain.SituationApproval {
+			t.Errorf("approval content at status %q must not classify approval", status)
+		}
+		if s := c.Classify("claude", status, choice); s.Type == domain.SituationChoice {
+			t.Errorf("choice content at status %q must not classify choice", status)
+		}
+	}
+	// The same content when blocked still classifies.
+	if s := c.Classify("claude", "blocked", approval); s.Type != domain.SituationApproval {
+		t.Errorf("blocked approval content = %v, want approval", s.Type)
+	}
+	if s := c.Classify("claude", "blocked", choice); s.Type != domain.SituationChoice {
+		t.Errorf("blocked choice content = %v, want choice", s.Type)
+	}
+}
+
+func TestClaudeMCQAtNonBlockedNotChoice(t *testing.T) {
+	// A Claude MCQ form (structural, no textual keyword) at a non-blocked
+	// status must not read as a live choice.
+	c := New(nil)
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "choice_claude_mcq_tabs_v2.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := c.Classify("claude", "idle", string(data)); s.Type == domain.SituationChoice {
+		t.Errorf("MCQ form at idle status must not classify choice, got %v", s.Type)
+	}
+}
+
+func TestBlockedMCQWithErrorNarrationClassifiesChoice(t *testing.T) {
+	// Rule order is approval > choice > error. A blocked Claude MCQ whose
+	// content ALSO carries a real error signal (an interrupt line that
+	// ClaudeErrorForm matches) must still classify as choice — the MCQ signal
+	// is evaluated at the choice position, before the error rule. The question
+	// is deliberately not approval-shaped so choice-beats-error is the only
+	// thing under test.
+	pane := "⎿  Interrupted · What should Claude do instead?\n\n" +
+		"How should the fix be submitted?\n" +
+		"❯ 1. Retry the build\n  2. Skip and continue\n\n" +
+		"Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+	// Sanity: the interrupt line alone WOULD classify as error, so choice
+	// really is winning over a live error signal.
+	if _, ok := domain.ClaudeErrorForm(pane); !ok {
+		t.Fatal("test setup: pane must contain a live error signal")
+	}
+	c := New(nil)
+	if s := c.Classify("claude", "blocked", pane); s.Type != domain.SituationChoice {
+		t.Fatalf("blocked MCQ with error signal = %v, want choice", s.Type)
+	}
+}
+
+func TestPlainNumberedListNotChoice(t *testing.T) {
+	// Numbered-menu regexes were removed: a bare numbered list with no MCQ
+	// footer and no "select an option" keyword must not classify as choice,
+	// even when blocked.
+	c := New(nil)
+	pane := "Here is what I changed:\n1. Fixed the parser\n2. Added a test\n3. Updated docs\n"
+	if s := c.Classify("claude", "blocked", pane); s.Type == domain.SituationChoice {
+		t.Errorf("plain numbered list must not classify choice, got %v", s.Type)
+	}
+}
+
+func TestClaudeErrorSituations(t *testing.T) {
+	c := New(nil)
+	for _, name := range []string{"error_claude_limit.txt", "error_claude_interrupted.txt"} {
+		data, err := os.ReadFile(filepath.Join("testdata", "transcripts", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s := c.Classify("claude", "blocked", string(data)); s.Type != domain.SituationError {
+			t.Errorf("%s: type = %v, want error", name, s.Type)
+		}
+		// Error detection is claude-scoped: the same content on another agent
+		// type must NOT classify as error (no rule for it yet).
+		if s := c.Classify("codex", "blocked", string(data)); s.Type == domain.SituationError {
+			t.Errorf("%s on non-claude agent must not classify error, got %v", name, s.Type)
+		}
+	}
+}
+
+func TestGenericErrorNarrationNotError(t *testing.T) {
+	// The generic error regexes were removed: a printed build failure /
+	// stack trace (ordinary agent narration) must no longer read as a live
+	// error situation.
+	c := New(nil)
+	pane := "$ go build ./...\nserver/handler.go:42: undefined: parseRequest\n" +
+		"ERROR: build failed with exit code 1\npanic: nil pointer\n"
+	if s := c.Classify("claude", "blocked", pane); s.Type == domain.SituationError {
+		t.Errorf("narrated build failure must not classify error, got %v", s.Type)
+	}
+}
+
+func TestClaudeMCQFormIsClaudeScoped(t *testing.T) {
+	// The structural MCQ signal is claude-only: the identical form on another
+	// agent type, even when blocked, must not classify as choice (guards the
+	// agentType == "claude" gate at the choice position).
+	c := New(nil)
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "choice_claude_mcq_tabs_v2.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := c.Classify("codex", "blocked", string(data)); s.Type == domain.SituationChoice {
+		t.Errorf("MCQ form on non-claude agent must not classify choice, got %v", s.Type)
+	}
+}
+
+func TestApprovalWinsOverMCQFooter(t *testing.T) {
+	// Priority invariant: a blocked claude pane that matches BOTH an approval
+	// regex and the MCQ "Enter to select" footer must classify as approval —
+	// the MCQ choice signal must never outrank approval.
+	c := New(nil)
+	pane := "Do you want to proceed with the edit?\n" +
+		"❯ 1. Yes\n  2. No\n\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+	if s := c.Classify("claude", "blocked", pane); s.Type != domain.SituationApproval {
+		t.Fatalf("approval must win over MCQ footer, got %v", s.Type)
+	}
+}
+
 func TestApprovalFixturesStillApproval(t *testing.T) {
 	// Regression: permission menus also render numbered options; approval
 	// must keep winning (rule order encodes priority).

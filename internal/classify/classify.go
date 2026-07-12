@@ -31,34 +31,27 @@ func DefaultRules() []config.ClassifierRule {
 			},
 		},
 		{
+			// Plain numbered-menu regexes were removed: any narrated numbered
+			// list tripped them. Textual cues stay here; Claude's structural
+			// MCQ forms are detected via domain.ClaudeMCQForm at the choice
+			// position in Classify (tab header/footer, or the single-question
+			// "enter to select" footer).
 			AgentType: "*", Situation: "choice",
 			Regex: []string{
-				`(?m)^\s*[❯>]?\s*1[.)]\s+\S.*\n\s*[❯>]?\s*2[.)]\s+\S`,
-				// Claude AskUserQuestion / plan-mode MCQ forms: every variant
-				// (single and multi-tab) renders this footer. The navigation
-				// tail is required so an agent merely printing/narrating
-				// "enter to select" (fzf-style help text in dev output) does
-				// not classify as a live menu.
-				`(?im)^.*enter to select.*(·|\bnavigate\b).*$`,
-				// MCQ layout with an indented description line under each
-				// option: allow a bounded run of description lines between
-				// option 1 and option 2 ({0,4} keeps long narrated markdown
-				// lists from false-positiving as a live menu).
-				`(?m)^\s*[❯>]?\s*1[.)]\s+\S.*\n(?:[ \t]+\S.*\n){0,4}\s*[❯>]?\s*2[.)]\s+\S`,
 				`(?i)(select|choose|pick) (an option|one of|from the following)`,
 				`(?i)which (option|approach|one) (would you|should)`,
-				`(?m)^\s*\[1\]\s+\S.*\n\s*\[2\]\s+\S`,
 			},
 		},
 		{
-			AgentType: "*", Situation: "error",
-			Regex: []string{
-				`(?im)^\s*(error|fatal|panic|exception)[:\s]`,
-				`(?i)(command|build|test|request) failed`,
-				`(?i)(retry|try again|skip|abort)\?`,
-				`(?i)\b(stack trace|traceback)\b`,
-				`(?i)exit (code|status) [1-9]`,
-			},
+			// Generic error regexes (line-start error/fatal/panic, "… failed",
+			// "retry/skip/abort?", stack trace, "exit code N") were removed:
+			// they tripped on ordinary error-shaped narration (a printed stack
+			// trace, a build log). Claude's blocking conditions (usage limit,
+			// interrupt prompt) are detected structurally via
+			// domain.ClaudeErrorForm at the error position in Classify. Other
+			// agent types get error rules in future.
+			AgentType: "claude", Situation: "error",
+			Regex: nil,
 		},
 		{
 			AgentType: "*", Situation: "idle",
@@ -123,15 +116,41 @@ func New(operatorRules []config.ClassifierRule) *Classifier {
 func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situation {
 	s := domain.Situation{AgentType: agentType, Content: pane, Type: domain.SituationUnclassifiable}
 
+	// Approval and choice are BLOCKED situations (constitution taxonomy): only
+	// a blocked agent is actually waiting on a prompt, so their content rules
+	// are gated on herdr reporting the agent blocked.
+	blocked := agentStatus == "blocked"
+
 	for _, r := range c.rules {
 		if r.agentType != "*" && !strings.EqualFold(r.agentType, agentType) {
 			continue
 		}
-		if matchRule(r, pane) {
-			s.Type = r.situation
-			enrich(&s)
-			return s
+		matched := matchRule(r, pane)
+		// Claude's MCQ selection prompts render structurally (a tab header or
+		// an "Enter to select" navigation footer), not as a plain numbered
+		// menu. Detect them at the choice rule's position so approval still
+		// wins and error is still evaluated after choice (rule order encodes
+		// priority, classify.go docs).
+		if !matched && r.situation == domain.SituationChoice && strings.EqualFold(agentType, "claude") {
+			matched = domain.ClaudeMCQForm(pane)
 		}
+		// Claude's error/retry situations (usage-limit stop, interrupt prompt)
+		// are detected structurally at the error position, after choice, so
+		// rule priority (approval > choice > error) is preserved.
+		if !matched && r.situation == domain.SituationError && strings.EqualFold(agentType, "claude") {
+			_, matched = domain.ClaudeErrorForm(pane)
+		}
+		if !matched {
+			continue
+		}
+		// A numbered list or "select an option" phrase in ordinary
+		// working/idle output must never read as a live prompt.
+		if (r.situation == domain.SituationApproval || r.situation == domain.SituationChoice) && !blocked {
+			continue
+		}
+		s.Type = r.situation
+		enrich(&s)
+		return s
 	}
 
 	// No content rule matched. An idle/done agent with unremarkable output
@@ -186,6 +205,10 @@ func enrich(s *domain.Situation) {
 	case domain.SituationError:
 		if m := errorLineRE.FindStringSubmatch(s.Content); m != nil {
 			s.ErrorSummary = domain.MaskVolatile(strings.TrimSpace(m[1]))
+		} else if kind, ok := domain.ClaudeErrorForm(s.Content); ok {
+			// Claude's built-in error forms carry no "error:"-prefixed line;
+			// use the stable kind so paraphrases share one signature.
+			s.ErrorSummary = kind
 		}
 	}
 }

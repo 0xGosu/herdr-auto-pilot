@@ -76,6 +76,29 @@ func TestMultiTabFormRejectsNarratedCheckboxes(t *testing.T) {
 	}
 }
 
+func TestClaudeMCQForm(t *testing.T) {
+	singleQuestion := "How do you want to submit?\n❯ 1. All 4\n  2. Hold\n\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+	cases := []struct {
+		name string
+		pane string
+		want bool
+	}{
+		{"multi-tab v1 footer", mcqTabFrame, true},
+		{"multi-tab v2 footer", mcqTabFrameV2, true},
+		{"single-question footer", singleQuestion, true},
+		{"narrated checkbox no footer", "Plan status:\n←  ☐ step one  ✔ done  →\nall good\n", false},
+		{"plain numbered list", "Summary:\n1. Refactored the consumer\n2. Updated the spec\n", false},
+		{"narrated enter to select without nav tail", "run help: press Enter to select an entry\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClaudeMCQForm(tc.pane); got != tc.want {
+				t.Errorf("ClaudeMCQForm = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseDigitSeries(t *testing.T) {
 	cases := []struct {
 		in   string

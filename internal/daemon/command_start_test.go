@@ -43,8 +43,11 @@ func TestConsultFirstFlagPerAgent(t *testing.T) {
 
 	// Three distinct situation types → three distinct signatures for the same
 	// agent, so each is a fresh consult (no same-signature escalation dedup).
-	errorPane := "ERROR: build failed with exit status 2\nRetry, skip, or abort?\n"
-	choicePane := "Which framework?\n❯ 1. React\n  2. Vue\n  3. Svelte\n"
+	// A Claude error situation (interrupt prompt); the choice pane uses the
+	// "which … option/approach" phrasing since bare numbered menus no longer
+	// classify as choice.
+	errorPane := "⎿  Interrupted · What should Claude do instead?\n"
+	choicePane := "Which option should we use?\n❯ 1. React\n  2. Vue\n  3. Svelte\n"
 
 	consult := func(agent, pane string, wantLen int) {
 		t.Helper()

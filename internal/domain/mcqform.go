@@ -24,6 +24,27 @@ var (
 	digitTokenRE   = regexp.MustCompile(`^[1-9]$`)
 )
 
+// mcqSingleFooterRE matches Claude's single-question selection footer — the
+// "Enter to select" line plus its navigation tail (a "·" separator or the
+// word "navigate"). The tail keeps an agent merely narrating "press enter to
+// select" (fzf-style help text in dev output) from reading as a live prompt.
+// The single-question form carries no tab header, so this footer is the only
+// structural signal it is a live menu.
+var mcqSingleFooterRE = regexp.MustCompile(`(?im)^.*enter to select.*(·|\bnavigate\b).*$`)
+
+// ClaudeMCQForm reports whether pane content shows any of Claude Code's
+// on-screen MCQ selection prompts: the multi-tab AskUserQuestion form (a tab
+// header plus its navigation footer, via MultiTabForm) or the single-question
+// form (an "Enter to select … navigate" footer). This is the choice-
+// classification signal for claude, replacing brittle numbered-line matching
+// that any narrated list would trip.
+func ClaudeMCQForm(pane string) bool {
+	if _, ok := MultiTabForm(pane); ok {
+		return true
+	}
+	return mcqSingleFooterRE.MatchString(pane)
+}
+
 // MultiTabForm reports whether pane content shows the multi-tab MCQ variant
 // and how many tabs it has (checkbox entries plus the Submit entry). Both
 // the tab header and the tab-navigation footer are required, so a narrated
