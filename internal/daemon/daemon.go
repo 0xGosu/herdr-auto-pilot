@@ -1448,10 +1448,13 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			return
 		}
 	}
-	// Learned-history gate: the LLM must not contradict established
-	// operator behavior, and auto-acting requires explicit opt-in.
-	if !cfg.LLM.AutoAct {
-		reject(domain.ReasonShadowMode, "")
+	// Confidence gate: auto-act only when the LLM's self-reported confidence
+	// meets the operator's threshold. A missing score (-1) is below any
+	// threshold >= 0, so it always escalates; the default threshold (999) is
+	// unreachable on the 0-100 scale, i.e. never auto-act. The reject closure
+	// surfaces the score ("llm confidence N/100") on the escalation.
+	if llmDec.ConfidentScore < cfg.LLM.AutoActConfidenceThreshold {
+		reject(domain.ReasonLLMLowConfidence, "")
 		return
 	}
 	history, err := d.opt.Store.DecisionsForSignature(ctx, res.sig.Signature, 50)

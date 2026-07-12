@@ -591,6 +591,126 @@ func TestDeprecatedAllowlistPatternsEmptySliceMigrates(t *testing.T) {
 	}
 }
 
+func TestAutoActConfidenceThresholdDefault(t *testing.T) {
+	// Omitted key keeps the never-auto default (999).
+	if got := Default().LLM.AutoActConfidenceThreshold; got != 999 {
+		t.Fatalf("default threshold = %d, want 999", got)
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[llm]\ntimeout_seconds = 30\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.AutoActConfidenceThreshold != 999 {
+		t.Errorf("omitted key should default to 999, got %d", cfg.LLM.AutoActConfidenceThreshold)
+	}
+}
+
+func TestAutoActConfidenceThresholdZeroPreserved(t *testing.T) {
+	// 0 is meaningful (act on any reported score) and must survive fillZeroes.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[llm]\nauto_act_confidence_threshold = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.AutoActConfidenceThreshold != 0 {
+		t.Errorf("explicit 0 must be preserved, got %d", cfg.LLM.AutoActConfidenceThreshold)
+	}
+}
+
+func TestDeprecatedAutoActMigrates(t *testing.T) {
+	cases := []struct {
+		name string
+		toml string
+		want int
+	}{
+		{"true migrates to 0", "[llm]\nauto_act = true\n", 0},
+		{"false migrates to 999", "[llm]\nauto_act = false\n", 999},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.toml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.LLM.AutoActConfidenceThreshold != tc.want {
+				t.Errorf("migrated threshold = %d, want %d", cfg.LLM.AutoActConfidenceThreshold, tc.want)
+			}
+			if cfg.LLM.DeprecatedAutoAct != nil {
+				t.Error("deprecated auto_act must be cleared after migration")
+			}
+			// Save rewrites the file to the new key, dropping the old one.
+			if err := Save(path, cfg); err != nil {
+				t.Fatal(err)
+			}
+			data, _ := os.ReadFile(path)
+			if !strings.Contains(string(data), "auto_act_confidence_threshold") {
+				t.Errorf("saved config must use the new key:\n%s", data)
+			}
+			if strings.Contains(string(data), "auto_act =") {
+				t.Errorf("saved config must not re-emit the deprecated key:\n%s", data)
+			}
+		})
+	}
+}
+
+func TestDeprecatedAutoActYieldsToExplicitNewKey(t *testing.T) {
+	// When both keys are present, the explicit new key wins over the old bool —
+	// including when it equals the default sentinel 999 (an operator who set it
+	// explicitly to "never" must not be flipped to 0 by a stale auto_act=true).
+	cases := []struct {
+		name string
+		toml string
+		want int
+	}{
+		{"explicit 70 wins", "[llm]\nauto_act = true\nauto_act_confidence_threshold = 70\n", 70},
+		{"explicit 999 (never) is not clobbered by stale auto_act=true",
+			"[llm]\nauto_act = true\nauto_act_confidence_threshold = 999\n", 999},
+		{"explicit 0 wins over auto_act=false", "[llm]\nauto_act = false\nauto_act_confidence_threshold = 0\n", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.toml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.LLM.AutoActConfidenceThreshold != tc.want {
+				t.Errorf("explicit new key should win: got %d, want %d", cfg.LLM.AutoActConfidenceThreshold, tc.want)
+			}
+		})
+	}
+}
+
+func TestAutoActConfidenceThresholdNegativeClamped(t *testing.T) {
+	// A hand-edited negative threshold is invalid and must not let an
+	// unreported (-1) score auto-act: it falls back to the never-default.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[llm]\nauto_act_confidence_threshold = -5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.AutoActConfidenceThreshold != 999 {
+		t.Errorf("negative threshold must clamp to the never-default 999, got %d", cfg.LLM.AutoActConfidenceThreshold)
+	}
+}
+
 func TestCaptureDelayRuleMatching(t *testing.T) {
 	rules := func(rs ...CaptureDelayRule) Config {
 		c := Default()

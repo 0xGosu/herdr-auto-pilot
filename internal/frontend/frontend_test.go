@@ -607,8 +607,9 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		{"learning.graduation_n", "-1", true},
 		{"limits.max_error_retries", "3", false},
 		{"llm.timeout_seconds", "90", false},
-		{"llm.auto_act", "true", false},
-		{"llm.auto_act", "maybe", true},
+		{"llm.auto_act_confidence_threshold", "70", false},
+		{"llm.auto_act_confidence_threshold", "-1", true},
+		{"llm.auto_act_confidence_threshold", "maybe", true},
 		{"llm.command", `claude -p "decide for me"`, false},
 		{"llm.rewrite_command", `claude -p "rewrite: {text}" --model haiku`, false},
 		{"llm.rewrite_command", `claude -p "unbalanced`, true},
@@ -629,7 +630,8 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Thresholds.Approval != 0.92 || cfg.Learning.GraduationN != 7 ||
-		cfg.Limits.MaxErrorRetries != 3 || cfg.LLM.TimeoutSeconds != 90 || !cfg.LLM.AutoAct {
+		cfg.Limits.MaxErrorRetries != 3 || cfg.LLM.TimeoutSeconds != 90 ||
+		cfg.LLM.AutoActConfidenceThreshold != 70 {
 		t.Errorf("persisted config mismatch: %+v", cfg)
 	}
 	if len(cfg.LLM.Command) != 3 || cfg.LLM.Command[2] != "decide for me" {
@@ -672,7 +674,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"safety.disable_seed":                 "true",
 		"llm.command":                         `claude -p "decide"`,
 		"llm.timeout_seconds":                 "60",
-		"llm.auto_act":                        "true",
+		"llm.auto_act_confidence_threshold":   "70",
 		"llm.pane_excerpt_chars":              "4000",
 		"llm.rewrite_command":                 `claude -p "rewrite: {text}"`,
 		"llm.rewrite_timeout_seconds":         "45",
@@ -717,6 +719,34 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		if err := app.SetField(ctx, key, samples[key]); err != nil {
 			t.Errorf("SetField(%s, %q) rejected a valid value: %v", key, samples[key], err)
 		}
+	}
+}
+
+func TestAutoActConfidenceThresholdFieldDisplay(t *testing.T) {
+	// The default (999) renders with a "never" label, not a bare number.
+	def := config.Default()
+	got := frontend.FieldValue(def, "llm.auto_act_confidence_threshold")
+	if !strings.Contains(got, "never") || !strings.Contains(got, "999") {
+		t.Errorf("default threshold should show a never label, got %q", got)
+	}
+	// A reachable 0-100 threshold renders plainly.
+	def.LLM.AutoActConfidenceThreshold = 70
+	if got := frontend.FieldValue(def, "llm.auto_act_confidence_threshold"); got != "70" {
+		t.Errorf("in-range threshold display = %q, want 70", got)
+	}
+
+	// SetField round-trips and rejects negatives; 0 is a valid value.
+	app, _ := testApp(t)
+	ctx := context.Background()
+	if err := app.SetField(ctx, "llm.auto_act_confidence_threshold", "0"); err != nil {
+		t.Fatalf("threshold 0 (act on any score) must be accepted: %v", err)
+	}
+	cfg, _ := app.Config()
+	if cfg.LLM.AutoActConfidenceThreshold != 0 {
+		t.Errorf("SetField did not persist 0, got %d", cfg.LLM.AutoActConfidenceThreshold)
+	}
+	if err := app.SetField(ctx, "llm.auto_act_confidence_threshold", "-5"); err == nil {
+		t.Error("negative threshold must be rejected")
 	}
 }
 

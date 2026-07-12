@@ -73,7 +73,7 @@ command = [
 # ]
 
 timeout_seconds = 120              # codex is slower to start; 180 is a safer value there
-auto_act = false                   # false: LLM suggestions are surfaced for your confirmation
+auto_act_confidence_threshold = 999  # auto-act only when the LLM confidence (0-100) is >= this; 999 = never (surface for confirmation)
 pane_excerpt_chars = 5000          # pane context included in the consult
 
 # ── Rewrite recipe — Claude Code (active) ──

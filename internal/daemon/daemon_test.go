@@ -485,7 +485,7 @@ func TestPipelineAutoApprovesConfidentSignature(t *testing.T) {
 func TestLLMPromotionDeliversMenuDigitForLabel(t *testing.T) {
 	// The LLM auto-act promotion path must also map an option LABEL to the
 	// menu digit (Claude's numbered menu ignores the label).
-	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n"
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true
@@ -493,10 +493,10 @@ func TestLLMPromotionDeliversMenuDigitForLabel(t *testing.T) {
 		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
 			RequestID: req.RequestID, Signature: req.Signature,
 			SituationType: req.SituationType, AgentType: req.AgentType,
-			Action: "Yes", Rationale: "operator always approves", Status: "pending", CreatedAt: time.Now(),
+			Action: "Yes", Rationale: "operator always approves", ConfidentScore: 80, Status: "pending", CreatedAt: time.Now(),
 		})
 		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "Yes",
-			Rationale: "operator always approves", Status: "pending"}, nil
+			Rationale: "operator always approves", ConfidentScore: 80, Status: "pending"}, nil
 	}
 
 	// A brand-new signature with an LLM configured takes the consult path.
@@ -1155,7 +1155,7 @@ func TestConfigReloadPropagatesWithinBudget(t *testing.T) {
 func TestLLMFallbackStagingRegateAndPromotion(t *testing.T) {
 	// FR-010/SC-5: LLM staged decision is re-gated and promoted; timeout
 	// and no-submit escalate.
-	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n"
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	var requestID atomicString
@@ -1166,14 +1166,14 @@ func TestLLMFallbackStagingRegateAndPromotion(t *testing.T) {
 			RequestID: req.RequestID, Signature: req.Signature,
 			SituationType: req.SituationType, AgentType: req.AgentType,
 			Action: "1", Rationale: "matches operator's usual approval",
-			Status: "pending", CreatedAt: time.Now(),
+			ConfidentScore: 80, Status: "pending", CreatedAt: time.Now(),
 		})
 		if err != nil {
 			return nil, err
 		}
 		return &domain.LLMDecision{
 			ID: id, RequestID: req.RequestID, Action: "1",
-			Rationale: "matches operator's usual approval", Status: "pending",
+			Rationale: "matches operator's usual approval", ConfidentScore: 80, Status: "pending",
 		}, nil
 	}
 
@@ -1210,7 +1210,7 @@ func TestLLMFallbackStagingRegateAndPromotion(t *testing.T) {
 func TestLLMConfidentScoreShownOnEscalation(t *testing.T) {
 	// The agent's self-reported confident_score (0-100) must reach the
 	// escalation entry the operator sees; without one (-1) nothing is added.
-	cfg := "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n" // auto_act off → shadow reject
+	cfg := "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n" // threshold defaults to 999: 62 < 999 → escalate
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true
@@ -1240,8 +1240,66 @@ func TestLLMConfidentScoreShownOnEscalation(t *testing.T) {
 	if !strings.Contains(esc[0].Rationale, "llm confidence 62/100") {
 		t.Errorf("escalation rationale should carry the confident score, got %q", esc[0].Rationale)
 	}
-	if !strings.Contains(esc[0].Rationale, "[shadow_mode]") {
-		t.Errorf("shadow-mode reject expected, got %q", esc[0].Rationale)
+	if !strings.Contains(esc[0].Rationale, "[llm_low_confidence]") {
+		t.Errorf("below-threshold reject expected, got %q", esc[0].Rationale)
+	}
+}
+
+func TestAutoActConfidenceThresholdGate(t *testing.T) {
+	// The LLM decision auto-acts only when its confidence meets the operator's
+	// threshold; below it (or with no reported score) the situation escalates
+	// with [llm_low_confidence].
+	cases := []struct {
+		name      string
+		threshold int
+		score     int
+		promote   bool
+	}{
+		{"above threshold promotes", 50, 80, true},
+		{"at threshold promotes (inclusive)", 70, 70, true},
+		{"below threshold escalates", 70, 40, false},
+		{"reported 0 promotes at threshold 0", 0, 0, true},
+		{"unreported (-1) escalates even at threshold 0", 0, -1, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = %d\ntimeout_seconds = 5\n", tc.threshold)
+			h := newHarness(t, cfg)
+			h.herdr.setPane(approvalPane)
+			h.llm.configured = true
+			h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+				dec := domain.LLMDecision{
+					RequestID: req.RequestID, Signature: req.Signature,
+					SituationType: req.SituationType, AgentType: req.AgentType,
+					Action: "1", Rationale: "matches operator", ConfidentScore: tc.score,
+					Status: "pending", CreatedAt: time.Now(),
+				}
+				id, _ := h.raw.InsertLLMDecision(ctx, dec)
+				dec.ID = id
+				return &dec, nil
+			}
+
+			ctx := context.Background()
+			h.push("agent-thr", "blocked")
+			if tc.promote {
+				waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+				if got := h.herdr.sentInputs()[0]; got != "1" {
+					t.Errorf("promoted action = %q, want \"1\"", got)
+				}
+				return
+			}
+			waitFor(t, 5*time.Second, func() bool {
+				esc, _ := h.raw.PendingEscalations(ctx)
+				return len(esc) == 1
+			})
+			if len(h.herdr.sentInputs()) != 0 {
+				t.Fatalf("below-threshold decision must not act, sent %v", h.herdr.sentInputs())
+			}
+			esc, _ := h.raw.PendingEscalations(ctx)
+			if !strings.Contains(esc[0].Rationale, "[llm_low_confidence]") {
+				t.Errorf("expected llm_low_confidence escalation, got %q", esc[0].Rationale)
+			}
+		})
 	}
 }
 
@@ -1254,7 +1312,7 @@ func (a *atomicString) set(v string) { a.mu.Lock(); a.v = v; a.mu.Unlock() }
 func (a *atomicString) get() string  { a.mu.Lock(); defer a.mu.Unlock(); return a.v }
 
 func TestLLMFailureEscalates(t *testing.T) {
-	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 1\n"
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 0\ntimeout_seconds = 1\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true
@@ -1296,7 +1354,7 @@ func TestLLMFailureEscalates(t *testing.T) {
 func TestRetryLLMReDrivesConsultOnLivePane(t *testing.T) {
 	// A failed consult leaves a retryable escalation; a queued retry re-drives
 	// a fresh consult against the agent's live pane, which this time delivers.
-	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act = true\ntimeout_seconds = 5\n"
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true
@@ -1312,14 +1370,14 @@ func TestRetryLLMReDrivesConsultOnLivePane(t *testing.T) {
 			// First consult times out → the escalation the operator retries.
 			return nil, errors.New("llm timeout after 5s without submit_decision")
 		}
-		// The retry consult submits and is promoted.
+		// The retry consult submits with high confidence and is promoted.
 		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
 			RequestID: req.RequestID, Signature: req.Signature,
 			SituationType: req.SituationType, AgentType: req.AgentType,
-			Action: "1", Rationale: "operator always approves", Status: "pending", CreatedAt: time.Now(),
+			Action: "1", Rationale: "operator always approves", ConfidentScore: 80, Status: "pending", CreatedAt: time.Now(),
 		})
 		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "1",
-			Rationale: "operator always approves", Status: "pending"}, nil
+			Rationale: "operator always approves", ConfidentScore: 80, Status: "pending"}, nil
 	}
 
 	ctx := context.Background()

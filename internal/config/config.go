@@ -72,11 +72,19 @@ type LLM struct {
 	// configured (low-confidence situations escalate).
 	Command        []string `toml:"command"`
 	TimeoutSeconds int      `toml:"timeout_seconds"`
-	// AutoAct opts in to acting on LLM suggestions automatically (subject
-	// to every safety control and the learned-history gate). When false —
-	// the default — LLM suggestions are surfaced as escalation suggestions
-	// for the operator to confirm.
-	AutoAct bool `toml:"auto_act"`
+	// AutoActConfidenceThreshold gates acting on an LLM suggestion
+	// automatically (subject to every safety control and the learned-history
+	// gate): the daemon auto-acts only when the LLM's self-reported
+	// confidence score (0-100) is at or above this threshold. A value above
+	// 100 — the default 999 — never auto-acts (LLM suggestions are surfaced
+	// as escalations for the operator to confirm); 0 acts on any reported
+	// score. A decision with no reported score (-1) always escalates.
+	AutoActConfidenceThreshold int `toml:"auto_act_confidence_threshold"`
+	// DeprecatedAutoAct is the removed boolean `auto_act` key, kept only to
+	// migrate existing configs: on Load, true → threshold 0, false → 999,
+	// then it is cleared so the next Save rewrites the file to the new key.
+	// A pointer distinguishes an absent key from an explicit `false`.
+	DeprecatedAutoAct *bool `toml:"auto_act"`
 	// PaneExcerptChars caps the pane excerpt (last N characters) included
 	// in the consult context handed to the LLM. Zero or omitted restores
 	// the 5000-char default.
@@ -234,7 +242,7 @@ func Default() Config {
 		// RewriteTimeoutSeconds stays zero here: Load seeds from Default
 		// before unmarshalling, and a non-zero seed would mask "omitted →
 		// inherit timeout_seconds" in fillZeroes.
-		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000},
+		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 999},
 		Embedding: Embedding{
 			SimilarityThreshold: 0.90,
 			BM25MinScore:        0.35,
@@ -356,6 +364,32 @@ func Load(path string) (Config, error) {
 	// a non-nil slice): the encoder skips only nil fields, so anything left
 	// here would be re-emitted under the deprecated key on every Save.
 	cfg.Safety.DeprecatedAllowlistPatterns = nil
+	// Deprecated boolean `auto_act`: migrate to the confidence threshold only
+	// when the new key was NOT explicitly set. A magic-number check on the
+	// default (999) can't tell an explicit "never" from the default — 999 is
+	// also the value operators write to disable auto-act — so probe the raw
+	// file for the new key's presence: an explicit new key always wins. true →
+	// 0 (act on any reported score) is the closest equivalent, not identical:
+	// unreported-confidence decisions now escalate. Clearing the pointer makes
+	// the next Save drop the old key.
+	if cfg.LLM.DeprecatedAutoAct != nil {
+		var probe struct {
+			LLM struct {
+				Threshold *int `toml:"auto_act_confidence_threshold"`
+			} `toml:"llm"`
+		}
+		_ = toml.Unmarshal(data, &probe)
+		if probe.LLM.Threshold == nil {
+			migrated := 999
+			if *cfg.LLM.DeprecatedAutoAct {
+				migrated = 0
+			}
+			slog.Warn("config key `auto_act` is deprecated; use `auto_act_confidence_threshold` (0-100; 999 = never). If your LLM CLI does not report a confidence score, auto-act stays off until you set a reachable threshold.",
+				"path", path, "migrated_to", migrated)
+			cfg.LLM.AutoActConfidenceThreshold = migrated
+		}
+		cfg.LLM.DeprecatedAutoAct = nil
+	}
 	cfg.fillZeroes()
 	return cfg, nil
 }
@@ -396,6 +430,12 @@ func (c *Config) fillZeroes() {
 	}
 	if c.LLM.PaneExcerptChars <= 0 {
 		c.LLM.PaneExcerptChars = d.LLM.PaneExcerptChars
+	}
+	// A hand-edited negative threshold is invalid (SetField rejects it too):
+	// fall back to the never-default, never a value below 0 that would let an
+	// unreported (-1) score auto-act. 0 stays valid (act on any reported score).
+	if c.LLM.AutoActConfidenceThreshold < 0 {
+		c.LLM.AutoActConfidenceThreshold = d.LLM.AutoActConfidenceThreshold
 	}
 	// RewriteTimeoutSeconds is deliberately NOT filled: it inherits its
 	// sibling timeout_seconds dynamically (RewriteTimeout), and a Save

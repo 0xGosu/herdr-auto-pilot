@@ -643,8 +643,8 @@ func printConfig(out io.Writer, cfg config.Config) {
 	fmt.Fprintf(out, "learning:   graduation_n=%d\n", cfg.Learning.GraduationN)
 	fmt.Fprintf(out, "limits:     consecutive=%d per_minute=%d error_retries=%d\n",
 		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries)
-	fmt.Fprintf(out, "llm:        configured=%v timeout=%ds auto_act=%v\n",
-		len(cfg.LLM.Command) > 0, cfg.LLM.TimeoutSeconds, cfg.LLM.AutoAct)
+	fmt.Fprintf(out, "llm:        configured=%v timeout=%ds auto_act_confidence_threshold=%d\n",
+		len(cfg.LLM.Command) > 0, cfg.LLM.TimeoutSeconds, cfg.LLM.AutoActConfidenceThreshold)
 	fmt.Fprintf(out, "task sources: %d, operator never-auto patterns: %d (+%d seed)\n",
 		len(cfg.TaskSources), len(cfg.Safety.NeverAutoPatterns), len(domain.SeedNeverAutoPatterns))
 }

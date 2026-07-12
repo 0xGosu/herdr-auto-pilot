@@ -32,7 +32,7 @@ command = [
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
 ]
 timeout_seconds = 120
-auto_act = false
+auto_act_confidence_threshold = 999
 pane_excerpt_chars = 5000
 
 [tui]
