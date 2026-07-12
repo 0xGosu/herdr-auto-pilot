@@ -135,11 +135,11 @@ func TestTemplatePlaceholderExpansion(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "argv.txt")
 	script := writeScript(t, `echo "$@" > `+out+"\n")
 	a := &Adapter{
-		CommandTemplate: []string{script, "--req", "{request_id}", "--db", "{db}", "--self", "{self}"},
+		CommandTemplate: []string{script, "--req", "{request_id}", "--db", "{db}", "--self", "{self}", "--agent", "{agent_name}"},
 		Timeout:         5 * time.Second,
 		DBPath:          db, Store: st, SelfPath: "/bin/echo",
 	}
-	req := domain.LLMRequest{RequestID: "req-x", CreatedAt: time.Now()}
+	req := domain.LLMRequest{RequestID: "req-x", AgentName: "brave-otter", CreatedAt: time.Now()}
 	st.StageLLMRequest(context.Background(), req)
 	st.InsertLLMDecision(context.Background(), domain.LLMDecision{
 		RequestID: "req-x", Action: "ok", Status: "pending", CreatedAt: time.Now(),
@@ -153,7 +153,7 @@ func TestTemplatePlaceholderExpansion(t *testing.T) {
 		t.Fatal(err)
 	}
 	argv := string(data)
-	for _, want := range []string{"--req req-x", "--db " + db, "--self /bin/echo"} {
+	for _, want := range []string{"--req req-x", "--db " + db, "--self /bin/echo", "--agent brave-otter"} {
 		if !strings.Contains(argv, want) {
 			t.Errorf("argv missing %q: %s", want, argv)
 		}

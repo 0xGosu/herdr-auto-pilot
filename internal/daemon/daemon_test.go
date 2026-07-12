@@ -797,8 +797,10 @@ func TestPanicInjectionAtAdapterBoundaries(t *testing.T) {
 
 func TestRunawayGuardPausesAgent(t *testing.T) {
 	// FR-019 end to end: the 6th consecutive auto-prompt is blocked and the
-	// agent pauses until human interaction.
-	h := newHarness(t, "")
+	// agent pauses until human interaction. Pin explicit limits so the test
+	// exercises the CONSECUTIVE guard specifically, independent of the
+	// defaults (and with the per-minute cap held high so it never interferes).
+	h := newHarness(t, "[limits]\nmax_consecutive_auto_prompts = 5\nmax_auto_prompts_per_minute = 1000\n")
 	h.herdr.setPane(approvalPane)
 	h.seedAutonomous(approvalPane, domain.SituationApproval, "1")
 
@@ -871,6 +873,33 @@ func TestIdleDeclaredTaskCustomTemplate(t *testing.T) {
 	want := fmt.Sprintf("Task: polish docs (%s)", taskFile)
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want custom-templated prompt %q", got, want)
+	}
+}
+
+func TestIdleDeclaredTaskAgentNameTemplate(t *testing.T) {
+	// {agent_name} in a next_task_template renders the agent's resolved
+	// short name in the delivered prompt.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	os.WriteFile(taskFile, []byte("- [ ] polish docs\n"), 0o600)
+
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf(
+		"[[task_sources]]\nagent = \"agent-name-19\"\npath = %q\nnext_task_template = \"Hey {agent_name}, next: {next_task_content}\"\n",
+		taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	name, err := h.raw.EnsureAgentName(context.Background(), "agent-name-19")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.push("agent-name-19", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	want := fmt.Sprintf("Hey %s, next: polish docs", name)
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sent %q, want agent-name-templated prompt %q", got, want)
 	}
 }
 
@@ -1582,6 +1611,11 @@ func TestConsultContextCarriesLocationCwdAndDeepExcerpt(t *testing.T) {
 		if got, _ := m[key].(string); got != want {
 			t.Errorf("%s = %q, want %q", key, got, want)
 		}
+	}
+	// agent_name carries the agent's resolved short name (for {agent_name}).
+	wantName, _ := h.raw.EnsureAgentName(context.Background(), "w2:p7")
+	if got, _ := m["agent_name"].(string); got == "" || got != wantName {
+		t.Errorf("agent_name = %q, want resolved short name %q", got, wantName)
 	}
 	excerpt, _ := m["pane_excerpt"].(string)
 	if len(excerpt) != 5000 {

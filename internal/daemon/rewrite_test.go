@@ -58,6 +58,11 @@ func TestRewriteAppliedToIdleDeclaredTask(t *testing.T) {
 	if calls[0].SituationType != domain.SituationIdle || calls[0].PaneExcerpt == "" {
 		t.Errorf("rewrite request missing context: %+v", calls[0])
 	}
+	// The agent's short name rides on the request for {agent_name}.
+	wantName, _ := h.raw.EnsureAgentName(context.Background(), "agent-rw1")
+	if calls[0].AgentName == "" || calls[0].AgentName != wantName {
+		t.Errorf("rewrite request agent name = %q, want resolved short name %q", calls[0].AgentName, wantName)
+	}
 
 	audits, err := h.raw.AuditLog(context.Background(), 10)
 	if err != nil || len(audits) == 0 {

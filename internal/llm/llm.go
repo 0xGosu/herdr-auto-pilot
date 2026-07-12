@@ -22,7 +22,7 @@ import (
 // Adapter shells out to the operator's LLM CLI.
 type Adapter struct {
 	// CommandTemplate is the argv template from config; placeholders:
-	// {self} → this binary, {request_id}, {db}, {control}.
+	// {self} → this binary, {request_id}, {db}, {control}, {agent_name}.
 	CommandTemplate []string
 	Timeout         time.Duration
 	DBPath          string
@@ -32,7 +32,7 @@ type Adapter struct {
 	SelfPath string
 	// RewriteTemplate is the argv template for the one-shot outbound-text
 	// rewrite (llm.rewrite_command); placeholders {text}, {situation_type},
-	// {agent_type}, {pane_excerpt}. Empty disables rewriting.
+	// {agent_type}, {agent_name}, {pane_excerpt}. Empty disables rewriting.
 	RewriteTemplate []string
 	// RewriteTimeout bounds one rewrite run (<=0 falls back to Timeout).
 	RewriteTimeout time.Duration
@@ -62,6 +62,7 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 		arg = strings.ReplaceAll(arg, "{request_id}", req.RequestID)
 		arg = strings.ReplaceAll(arg, "{db}", a.DBPath)
 		arg = strings.ReplaceAll(arg, "{control}", a.ControlPath)
+		arg = strings.ReplaceAll(arg, "{agent_name}", req.AgentName)
 		argv[i] = arg
 	}
 	// Auto-repair known CLI misconfigurations (e.g. claude's prompt placed

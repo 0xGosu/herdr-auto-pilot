@@ -15,7 +15,7 @@ var checkedItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[[xX+\-*]\]\s*(.+)$`)
 // DefaultNextTaskTemplate is the prompt template used when a task source
 // declares none. Placeholders: {next_task_content} is the next unchecked
 // item (or NoTaskContent when the list is complete), {task_list_path} is
-// the task-source file path.
+// the task-source file path, {agent_name} is the agent's short name.
 const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."
 
 // NoTaskContent is the {next_task_content} value when a declared list has
@@ -27,9 +27,10 @@ const NoTaskContent = "none"
 // task content plus the source it came from, so the outbound prompt can be
 // rendered from the source's template.
 type DeclaredTask struct {
-	Task     string // next unchecked item, or NoTaskContent when complete
-	Path     string // task-source file path
-	Template string // operator template; "" uses DefaultNextTaskTemplate
+	Task      string // next unchecked item, or NoTaskContent when complete
+	Path      string // task-source file path
+	Template  string // operator template; "" uses DefaultNextTaskTemplate
+	AgentName string // agent short name, for {agent_name}
 }
 
 // Prompt renders the outbound prompt from the source's template. A single
@@ -43,6 +44,7 @@ func (t DeclaredTask) Prompt() string {
 	return strings.NewReplacer(
 		"{next_task_content}", t.Task,
 		"{task_list_path}", t.Path,
+		"{agent_name}", t.AgentName,
 	).Replace(tpl)
 }
 

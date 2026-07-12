@@ -264,7 +264,10 @@ type LLMRequest struct {
 	AgentType     string
 	// AgentID identifies the agent this consult is for, so a pending row can
 	// be found by agent (the "is a consult still running?" retry guard).
-	AgentID     string
+	AgentID string
+	// AgentName is the agent's short name, for the {agent_name} command
+	// placeholder and the consult context blob.
+	AgentName   string
 	ContextJSON string
 	Status      string // pending | done | expired
 	CreatedAt   time.Time

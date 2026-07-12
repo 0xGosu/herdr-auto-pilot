@@ -43,6 +43,7 @@ func (a *Adapter) Rewrite(ctx context.Context, req domain.RewriteRequest) (strin
 		arg = strings.ReplaceAll(arg, "{text}", req.Text)
 		arg = strings.ReplaceAll(arg, "{situation_type}", string(req.SituationType))
 		arg = strings.ReplaceAll(arg, "{agent_type}", req.AgentType)
+		arg = strings.ReplaceAll(arg, "{agent_name}", req.AgentName)
 		arg = strings.ReplaceAll(arg, "{pane_excerpt}", req.PaneExcerpt)
 		argv[i] = arg
 	}
@@ -73,6 +74,7 @@ func (a *Adapter) Rewrite(ctx context.Context, req domain.RewriteRequest) (strin
 		"HAP_REWRITE_TEXT="+req.Text,
 		"HAP_SITUATION_TYPE="+string(req.SituationType),
 		"HAP_AGENT_TYPE="+req.AgentType,
+		"HAP_AGENT_NAME="+req.AgentName,
 	)
 	runErr := cmd.Run()
 
