@@ -58,9 +58,11 @@ Operate:
                         embedding model change (via the daemon when running)
   pause | resume        global pause/kill switch
   kill-history          pause/kill event history
+  state-dir             print the state directory (DB, logs, socket, index)
+  paths                 print resolved config + state paths (labeled)
 
 Configure:
-  config [show|fields|set <field> <value>|set-threshold <situation> <value>]
+  config [show|fields|path|set <field> <value>|set-threshold <situation> <value>]
   rules [list|add <regex>|remove <index>]      never-auto patterns
   task-source [add] [--agent A] [--workspace W] [--template T] <checklist.md> | list | remove <index>
   clear-data --yes      reset learned history + audit data
@@ -103,6 +105,16 @@ func run(verb string, args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Path-printing verbs resolve from `paths` alone: no store, no daemon, no
+	// DB creation as a side effect. They must stay usable when the state dir is
+	// unwritable or the DB is corrupt — exactly the situations an operator runs
+	// them to diagnose ("paste your `hap paths`").
+	if verb == "state-dir" || verb == "paths" ||
+		(verb == "config" && len(args) > 0 && args[0] == "path") {
+		app := &frontend.App{ConfigPath: paths.File(), StateDir: paths.StateDir}
+		return cli.Run(ctx, app, os.Stdout, verb, args)
+	}
 
 	switch verb {
 	case "daemon":

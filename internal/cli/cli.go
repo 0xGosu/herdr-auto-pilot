@@ -63,6 +63,11 @@ func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, arg
 		return killHistory(ctx, app, out)
 	case "config":
 		return configCmd(ctx, app, out, args)
+	case "state-dir":
+		fmt.Fprintln(out, app.StateDir)
+		return nil
+	case "paths":
+		return paths(out, app)
 	case "rules":
 		return rules(ctx, app, out, args)
 	case "task-source":
@@ -658,6 +663,9 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		return nil
 	}
 	switch args[0] {
+	case "path":
+		fmt.Fprintln(out, app.ConfigPath)
+		return nil
 	case "fields":
 		cfg, err := app.Config()
 		if err != nil {
@@ -691,7 +699,15 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		fmt.Fprintf(out, "threshold %s set to %.2f (daemon reloaded)\n", args[1], v)
 		return nil
 	}
-	return fmt.Errorf("usage: config [show|fields|set <field> <value>|set-threshold <situation> <value>]")
+	return fmt.Errorf("usage: config [show|fields|path|set <field> <value>|set-threshold <situation> <value>]")
+}
+
+// paths prints the resolved config and state paths, labeled, for human use.
+// The discrete `state-dir` and `config path` verbs stay bare for scripting.
+func paths(out io.Writer, app *frontend.App) error {
+	fmt.Fprintf(out, "config:    %s\n", app.ConfigPath)
+	fmt.Fprintf(out, "state:     %s\n", app.StateDir)
+	return nil
 }
 
 func printConfig(out io.Writer, cfg config.Config) {
