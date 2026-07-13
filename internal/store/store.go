@@ -842,6 +842,31 @@ func (s *Store) DismissEscalation(ctx context.Context, auditID int64) error {
 	})
 }
 
+// ResolveEscalation atomically flips one pending escalation to "resolved",
+// returning whether it CLAIMED the row (false when it was already resolved/
+// dismissed, or another writer won the race). The status guard in the WHERE
+// clause makes the claim safe against a double-confirm, so a caller can apply
+// one-time side effects (writing a file, appending config, sending) only when
+// it actually claimed the escalation.
+func (s *Store) ResolveEscalation(ctx context.Context, auditID int64) (bool, error) {
+	var claimed bool
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE audit_log SET status = 'resolved' WHERE id = ? AND status = 'escalated'`,
+			auditID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		claimed = n > 0
+		return nil
+	})
+	return claimed, err
+}
+
 // DismissEscalationsBefore dismisses every pending escalation created before
 // cutoff, returning how many were dismissed (the front-end prune).
 func (s *Store) DismissEscalationsBefore(ctx context.Context, cutoff time.Time) (int64, error) {

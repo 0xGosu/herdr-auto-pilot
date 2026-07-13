@@ -308,6 +308,7 @@ type fakeHerdr struct {
 	inputs  []string
 	pane    string // returned by ReadPane (live menu content)
 	readErr error
+	agents  []domain.AgentTransition // returned by ListAgents (live statuses)
 }
 
 func (f *fakeHerdr) Send(_ context.Context, paneID, input string) error {
@@ -320,7 +321,9 @@ func (f *fakeHerdr) ReadPane(context.Context, string, int) (string, error) {
 	return f.pane, f.readErr
 }
 
-func (f *fakeHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) { return nil, nil }
+func (f *fakeHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
+	return f.agents, nil
+}
 
 func TestConfirmSendsRenderedDeclaredTaskPrompt(t *testing.T) {
 	// The confirm path must deliver the exact rendered prompt carried in the
@@ -349,6 +352,210 @@ func TestConfirmSendsRenderedDeclaredTaskPrompt(t *testing.T) {
 	}
 	if len(fake.panes) != 1 || fake.panes[0] != "w1:p1" {
 		t.Errorf("delivered to %v, want the audit's agent pane", fake.panes)
+	}
+}
+
+func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
+	// Confirming an idle task suggestion writes a per-agent tasks.md (single
+	// in-progress "[-]" item), registers a matching [[task_sources]] entry,
+	// records the correction, and sends the task to the agent.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	// Route the tasks file into a known state dir.
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	taskText := "Investigate the flaky auth test and add a retry guard"
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + taskText, CreatedAt: time.Now(),
+	})
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// tasks.md written with a single in-progress item.
+	path := filepath.Join(stateDir, "tasks", name+".md")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("tasks file not written: %v", err)
+	}
+	if !strings.Contains(string(body), "- [-] "+taskText) {
+		t.Errorf("tasks file = %q, want a single in-progress %q item", body, taskText)
+	}
+
+	// The item is parsed as not-actionable, so the declared-task resolver
+	// treats the list as complete (no next "[ ]" item to re-send).
+	if next := domain.NextDeclaredTask(string(body)); next != "" {
+		t.Errorf("in-progress item must not resolve as a next declared task, got %q", next)
+	}
+
+	// A matching task source was appended, scoped to the agent, pointing at
+	// the absolute file path.
+	cfg, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 {
+		t.Fatalf("want 1 task source, got %d", len(cfg.TaskSources))
+	}
+	if cfg.TaskSources[0].Agent != name || cfg.TaskSources[0].Path != path {
+		t.Errorf("task source = %+v, want agent %q path %q", cfg.TaskSources[0], name, path)
+	}
+
+	// The correction resolves the escalation and learns the declared-task
+	// action.
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].CorrectedAction != domain.ActionNextDeclaredTask || corr[0].AuditID != id {
+		t.Errorf("confirm should record a declared-task correction: %+v", corr)
+	}
+
+	// The task text was sent to the agent's pane.
+	if len(fake.inputs) != 1 || fake.inputs[0] != taskText {
+		t.Errorf("delivered %v, want the task text %q", fake.inputs, taskText)
+	}
+	if len(fake.panes) != 1 || fake.panes[0] != "w1:p1" {
+		t.Errorf("delivered to %v, want the audit's agent pane", fake.panes)
+	}
+}
+
+func TestConfirmGeneratedTaskWithoutSendStillWritesSource(t *testing.T) {
+	// send=false establishes the source and file but delivers nothing.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	app.StateDir = t.TempDir()
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w2:p2", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Write missing tests", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("send=false must deliver nothing, got %v", fake.inputs)
+	}
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 1 {
+		t.Errorf("source must still be registered on a non-send confirm, got %d", len(cfg.TaskSources))
+	}
+}
+
+func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
+	// A multiline suggestion (a Markdown checklist from the LLM) is normalized:
+	// the file lists the first task in-progress "[-]" and the rest pending
+	// "[ ]", and ONLY the first task is sent to the agent.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	// The model already used Markdown checkboxes — markers must be stripped,
+	// not double-inserted.
+	suggestion := domain.SuggestTaskPrefix + "- [ ] Investigate the flaky auth test\n- [ ] Add a retry guard\n- [ ] Backfill unit tests"
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: suggestion, CreatedAt: time.Now(),
+	})
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(stateDir, "tasks", name+".md")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("tasks file not written: %v", err)
+	}
+	want := "- [-] Investigate the flaky auth test\n- [ ] Add a retry guard\n- [ ] Backfill unit tests\n"
+	if !strings.Contains(string(body), want) {
+		t.Errorf("tasks file = %q, want a checklist %q", body, want)
+	}
+	// Only the first task is sent to the agent.
+	if len(fake.inputs) != 1 || fake.inputs[0] != "Investigate the flaky auth test" {
+		t.Errorf("delivered %v, want only the first task", fake.inputs)
+	}
+	// The next declared task is the first pending item, so the queue drives on
+	// later idles.
+	if next := domain.NextDeclaredTask(string(body)); next != "Add a retry guard" {
+		t.Errorf("next declared task = %q, want the first pending item", next)
+	}
+}
+
+func TestConfirmGeneratedTaskIsIdempotent(t *testing.T) {
+	// A double-submit (or re-confirm after resolution) must not re-send the
+	// task or accumulate duplicate task sources: the atomic claim lets only the
+	// first confirm apply side effects.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	app.StateDir = t.TempDir()
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w3:p3", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Do the thing", CreatedAt: time.Now(),
+	})
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	// Second confirm must fail (already claimed) and change nothing.
+	if err := app.Confirm(ctx, id, true); err == nil {
+		t.Error("second confirm on a resolved escalation must fail")
+	}
+
+	if len(fake.inputs) != 1 {
+		t.Errorf("task must be sent exactly once, got %d sends", len(fake.inputs))
+	}
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 1 {
+		t.Errorf("want exactly 1 task source after a double confirm, got %d", len(cfg.TaskSources))
+	}
+}
+
+func TestConfirmGeneratedTaskRefusesWhenAgentWorking(t *testing.T) {
+	// If the agent has started working by the time the operator confirms, the
+	// suggestion is stale: no source is created, nothing is sent, and the
+	// escalation stays pending so the operator can dismiss it.
+	app, st := testApp(t)
+	fake := &fakeHerdr{agents: []domain.AgentTransition{{AgentID: "w4:p4", Status: "working"}}}
+	app.Herdr = fake
+	app.StateDir = t.TempDir()
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w4:p4", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Do the thing", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err == nil {
+		t.Fatal("confirming a stale suggestion for a working agent must fail")
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("nothing may be sent to a working agent, got %v", fake.inputs)
+	}
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 0 {
+		t.Errorf("no task source may be created for a stale suggestion, got %d", len(cfg.TaskSources))
+	}
+	// The escalation is untouched (still pending), so it can be dismissed.
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "escalated" {
+		t.Errorf("escalation must remain pending after a refused confirm, got %q", audit.Status)
 	}
 }
 

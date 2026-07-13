@@ -115,6 +115,23 @@ type LLM struct {
 	// fails (placeholders {original_text}, {agent_name}). Empty uses the
 	// built-in default; a rewrite failure never blocks the send.
 	RewriteFallbackTemplate string `toml:"rewrite_fallback_template"`
+	// GenerateTaskCommand is the argv template for the one-shot task
+	// suggestion an idle agent gets when it has NO task source (no declared
+	// [[task_sources]] and nothing inferable from the pane). Placeholders:
+	// {self}, {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. The suggested
+	// task is read from the CLI's stdout and surfaced as an escalation the
+	// operator confirms (writing a per-agent tasks.md) or dismisses. Empty
+	// keeps today's behavior: idle with no task source escalates as
+	// no_task_source and the plugin never synthesizes a prompt (FR-011).
+	GenerateTaskCommand []string `toml:"generate_task_command"`
+	// GenerateTaskCommandStart is the argv template used on the FIRST task
+	// generation per agent (same first-interaction boundary as CommandStart).
+	// Same placeholders as GenerateTaskCommand. Empty inherits
+	// GenerateTaskCommand; tracked independently of the consult "first".
+	GenerateTaskCommandStart []string `toml:"generate_task_command_start,omitempty"`
+	// GenerateTaskTimeoutSeconds bounds one task-generation run; zero or
+	// omitted inherits timeout_seconds.
+	GenerateTaskTimeoutSeconds int `toml:"generate_task_timeout_seconds,omitempty"`
 }
 
 // Embedding configures semantic signature matching: situations are matched
@@ -499,6 +516,16 @@ func (c Config) RewriteTimeout() time.Duration {
 		return c.LLMTimeout()
 	}
 	return time.Duration(c.LLM.RewriteTimeoutSeconds) * time.Second
+}
+
+// GenerateTaskTimeout returns the task-generation timeout:
+// generate_task_timeout_seconds, or — when zero/omitted — the consult
+// timeout_seconds.
+func (c Config) GenerateTaskTimeout() time.Duration {
+	if c.LLM.GenerateTaskTimeoutSeconds <= 0 {
+		return c.LLMTimeout()
+	}
+	return time.Duration(c.LLM.GenerateTaskTimeoutSeconds) * time.Second
 }
 
 // Built-in capture delays: the agent TUI can take several seconds to paint

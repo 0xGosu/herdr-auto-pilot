@@ -120,6 +120,29 @@ rewrite_command = [
 rewrite_timeout_seconds = 60       # omitted: inherits timeout_seconds
 rewrite_fallback_template = "You must act based on the following: {original_text}"
 
+# ── Idle task suggestion (optional) ──
+# When an agent goes idle with NO task source (no [[task_sources]] matches it
+# and nothing is inferable from the pane), a one-shot CLI can SUGGEST tasks.
+# Its stdout is the suggestion (one task per line — plain text or a Markdown
+# checklist; hap normalizes the format), surfaced as an escalation. Confirm it
+# (enter/y) and hap writes a per-agent tasks.md whose FIRST task is in-progress
+# ("[-]") and the rest pending ("[ ]"), registers it as a [[task_sources]]
+# entry, and sends ONLY the first task to the agent (the remaining tasks are
+# picked up by the normal declared-task flow on later idles). Dismiss (x) to
+# ignore; if the CLI fails, retry with `l`. A suggestion is dropped/refused if
+# the agent starts working before it is surfaced/confirmed. Placeholders:
+# {self}, {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. Omit to keep the
+# safe default: idle with no task source escalates and hap synthesizes nothing.
+# generate_task_command = [
+#   "claude", "-p",
+#   "Suggest concrete next tasks for the coding agent in this project, most important first. Reply with ONLY the tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
+#   "--model", "haiku",
+# ]
+# generate_task_command_start runs INSTEAD on the agent's first generation
+# (tracked independently); omit to reuse generate_task_command.
+# generate_task_command_start = [ ... ]
+# generate_task_timeout_seconds = 60   # omitted: inherits timeout_seconds
+
 
 # ── Semantic rule matching (vector embeddings) ──────────────────────
 # Situations are matched to learned rules by embedding their masked salient

@@ -105,6 +105,18 @@ type RewriterPort interface {
 	RewriteConfigured() bool
 }
 
+// TaskGeneratorPort is an optional capability of the LLM adapter: a one-shot
+// task suggestion for an idle agent with no task source
+// (llm.generate_task_command). Like Rewrite, the suggested task is the
+// subprocess's stdout. Callers type-assert and degrade gracefully when absent.
+type TaskGeneratorPort interface {
+	// GenerateTask runs the configured generate-task CLI and returns the
+	// suggested task text, or an error on timeout / failure / empty output.
+	GenerateTask(ctx context.Context, req domain.TaskGenRequest) (string, error)
+	// GenerateTaskConfigured reports whether a generate-task CLI is configured.
+	GenerateTaskConfigured() bool
+}
+
 // StorePort is the persistence boundary. Write-ownership is partitioned:
 // daemon-exclusive writers for signatures/agent_rate/error_retries/decisions,
 // daemon-emitted audit rows, and signature_embeddings (with one maintenance
@@ -178,6 +190,10 @@ type FrontendStore interface {
 	// recording a correction; the audit row is kept (append-only, FR-020).
 	// Errors when the record is not a pending escalation.
 	DismissEscalation(ctx context.Context, auditID int64) error
+	// ResolveEscalation atomically flips one pending escalation to "resolved",
+	// returning whether it claimed the row (false when already resolved/
+	// dismissed). Callers apply one-time side effects only on a true claim.
+	ResolveEscalation(ctx context.Context, auditID int64) (bool, error)
 	// DismissEscalationsBefore dismisses every pending escalation created
 	// before cutoff, returning how many were dismissed.
 	DismissEscalationsBefore(ctx context.Context, cutoff time.Time) (int64, error)

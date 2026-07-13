@@ -79,6 +79,10 @@ const (
 	ActionEscalate ActionKind = "escalate" // hand to the human, take no action
 	ActionConsult  ActionKind = "consult_llm"
 	ActionKindNoop ActionKind = "noop" // deliberately do nothing (learned no-op)
+	// ActionGenerateTask: an idle agent with no task source triggers a
+	// one-shot LLM task suggestion (llm.generate_task_command). The result is
+	// surfaced as an escalation, never auto-acted (FR-011 relaxation).
+	ActionGenerateTask ActionKind = "generate_task"
 )
 
 // Source identifies who authored a decision.
@@ -119,6 +123,10 @@ const (
 	ReasonUnfamiliarOptions    EscalateReason = "unfamiliar_options"
 	ReasonNoHistory            EscalateReason = "no_history"
 	ReasonNotConsecutiveEnough EscalateReason = "graduation_pending"
+	// ReasonTaskGenFailed: the idle task-generation CLI failed, timed out, or
+	// produced no usable task. The failure rationale is surfaced and the
+	// escalation is retryable (like a failed consult).
+	ReasonTaskGenFailed EscalateReason = "task_gen_failed"
 )
 
 // Decision is the outcome of the pure decision core for one situation.
@@ -201,7 +209,8 @@ type AuditRecord struct {
 
 // IsRetryableLLMEscalation reports whether an escalation is a candidate for
 // re-invoking the LLM: a still-pending escalation whose consult never produced
-// a decision (it timed out or the CLI exited without submitting). A
+// a decision (it timed out or the CLI exited without submitting), or whose
+// idle task-generation CLI failed (task_gen_failed). A
 // gated-but-answered escalation (shadow_mode, variance_guard, …) is NOT
 // retryable — re-invoking would hit the same gate. The reason is carried as a
 // "[reason]" prefix on Rationale (see the daemon's escalate()).
@@ -210,7 +219,8 @@ func IsRetryableLLMEscalation(a *AuditRecord) bool {
 		return false
 	}
 	return strings.HasPrefix(a.Rationale, "["+string(ReasonLLMTimeout)+"]") ||
-		strings.HasPrefix(a.Rationale, "["+string(ReasonLLMNoSubmit)+"]")
+		strings.HasPrefix(a.Rationale, "["+string(ReasonLLMNoSubmit)+"]") ||
+		strings.HasPrefix(a.Rationale, "["+string(ReasonTaskGenFailed)+"]")
 }
 
 // CorrectionRecord is a front-end-written correction amending an audit entry.

@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -379,6 +380,12 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// means the sentinel, and the literal spelling must never be learned
 	// as pane text (free text like "do nothing" stays literal).
 	action = domain.NormalizeNoopAction(action)
+	// Confirming an idle task suggestion is not a pane send: it writes a
+	// per-agent tasks.md, registers it as a task source, and (when send) hands
+	// the task to the agent. Handle it before the send-oriented flow below.
+	if action == domain.SuggestGenerateTask {
+		return a.acceptGeneratedTask(ctx, audit, send)
+	}
 	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
 		AuditID: auditID, CorrectedAction: action, Author: a.Author, CreatedAt: time.Now(),
 	}); err != nil {
@@ -437,6 +444,152 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		}
 	}
 	return a.nudge(ctx, control.KindReload)
+}
+
+// acceptGeneratedTask confirms an idle task suggestion: it writes a per-agent
+// tasks.md (a single in-progress "[-]" item), registers it as a task source in
+// config.toml, records the correction that resolves the escalation, and — when
+// send — hands the task to the agent. Side effects run source-first so a send
+// failure never leaves the agent without the task source that was just
+// established.
+func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord, send bool) error {
+	// The suggestion may carry one task or several (plain or as a Markdown
+	// list); normalize into clean bare task strings so the file is always a
+	// well-formed checklist, never raw multiline text written after "- [-] ".
+	raw := strings.TrimPrefix(audit.Suggestion, domain.SuggestTaskPrefix)
+	tasks := domain.NormalizeGeneratedTasks(raw)
+	if len(tasks) == 0 {
+		return fmt.Errorf("audit record %d carries no generated task to confirm", audit.ID)
+	}
+	if audit.AgentID == "" {
+		return fmt.Errorf("audit record %d has no agent to attach a task source to", audit.ID)
+	}
+	// Cheap early-out for a stale re-confirm (already resolved/dismissed): the
+	// atomic claim below is the authoritative guard against the concurrent race.
+	if audit.Status != "escalated" {
+		return fmt.Errorf("audit record %d is no longer a pending escalation", audit.ID)
+	}
+
+	// Staleness: the operator may confirm minutes after the suggestion was
+	// raised. If the agent has since started working, sending an outdated task
+	// would interrupt it — refuse rather than create a source and send. Fail
+	// open when the status is unknown (list error / agent absent): the operator
+	// explicitly asked to confirm.
+	if a.Herdr != nil {
+		if agents, lerr := a.Herdr.ListAgents(ctx); lerr == nil {
+			for _, ag := range agents {
+				if ag.AgentID == audit.AgentID {
+					if domain.AgentBusy(ag.Status) {
+						return fmt.Errorf("agent is no longer idle (%s); the suggested task is stale — dismiss it or wait until the agent is idle", ag.Status)
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// A short name reads well in the file name and matches the task source
+	// selector; fall back to the agent id when unresolvable.
+	name, err := a.Store.EnsureAgentName(ctx, audit.AgentID)
+	if err != nil || name == "" {
+		name = audit.AgentID
+	}
+
+	// Idempotent side effects FIRST (before the claim): writing the file and
+	// registering the source can be safely repeated — the file is rewritten
+	// with identical content and addTaskSourceIfAbsent de-dupes under
+	// UpdateConfig's advisory lock. Running them before the claim means a
+	// failure here leaves the escalation still pending, so the operator can
+	// retry; only the non-idempotent send is gated by the claim below.
+	base := a.StateDir
+	if base == "" {
+		base = filepath.Dir(a.ConfigPath)
+	}
+	dir := filepath.Join(base, "tasks")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create tasks dir: %w", err)
+	}
+	path := filepath.Join(dir, sanitizeTaskFileName(name)+".md")
+	// First task is in-progress ("[-]", sent to the agent now); any remaining
+	// tasks are pending ("[ ]") and the normal declared-task flow picks them up
+	// on later idles.
+	content := domain.RenderGeneratedTaskList(name, tasks)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("write tasks file: %w", err)
+	}
+	// Register the file as this agent's task source (writes config.toml and
+	// nudges the daemon to reload). Idempotent: a re-confirm for the same
+	// agent+path never stacks duplicate entries. Scope by the agent selector;
+	// workspace "" = any so the source follows the agent across workspaces.
+	if err := a.addTaskSourceIfAbsent(ctx, name, path); err != nil {
+		return fmt.Errorf("register task source: %w", err)
+	}
+
+	// Atomically CLAIM the escalation. Only the writer that flips
+	// escalated→resolved proceeds to the non-idempotent send, so a
+	// double-submit can never send the task twice.
+	claimed, err := a.Store.ResolveEscalation(ctx, audit.ID)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return fmt.Errorf("audit record %d is no longer a pending escalation", audit.ID)
+	}
+
+	// Record the correction so the idle signature learns to drive from its
+	// declared task list. Best-effort: the escalation is already resolved and
+	// the source established, so a failed learning write must not fail the
+	// confirm — it only skips a learning event.
+	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
+		Author: a.Author, CreatedAt: time.Now(),
+	}); err != nil {
+		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", err)
+	}
+
+	if send && a.Herdr != nil {
+		// Only the first task is sent — the operator's "start now" task.
+		if err := a.Herdr.Send(ctx, audit.AgentID, tasks[0]); err != nil {
+			return fmt.Errorf("task source created, but sending the task to the agent failed: %w", err)
+		}
+	}
+	return a.nudge(ctx, control.KindReload)
+}
+
+// addTaskSourceIfAbsent registers a task list for an agent, skipping the append
+// when an identical agent+path entry already exists — so confirming the same
+// generated-task escalation twice never accumulates duplicate sources.
+func (a *App) addTaskSourceIfAbsent(ctx context.Context, agent, path string) error {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		for _, ts := range cfg.TaskSources {
+			if ts.Agent == agent && ts.Path == path {
+				return nil
+			}
+		}
+		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{Agent: agent, Path: path})
+		return nil
+	})
+}
+
+// sanitizeTaskFileName makes an agent name safe as a file name: path
+// separators and whitespace collapse to hyphens, so a colorful short name (or
+// a raw agent id) never escapes the tasks dir.
+func sanitizeTaskFileName(name string) string {
+	repl := func(r rune) rune {
+		if strings.ContainsRune("/\\ \t\n", r) || r == os.PathSeparator {
+			return '-'
+		}
+		return r
+	}
+	out := strings.Map(repl, name)
+	out = strings.Trim(out, "-.")
+	if out == "" {
+		return "agent"
+	}
+	return out
 }
 
 // Confirm records agreement with an escalation's suggested action.
@@ -532,6 +685,12 @@ func (a *App) PruneEscalations(ctx context.Context, olderThan time.Duration) (in
 // Keep in sync with the daemon's suggestionAction.
 func SuggestedAction(audit *domain.AuditRecord) string {
 	sug := audit.Suggestion
+	// An idle task suggestion is confirmed into a tasks.md + task source, not
+	// sent to the pane as literal text — recognize it before the send-oriented
+	// prefixes below.
+	if strings.HasPrefix(sug, domain.SuggestTaskPrefix) {
+		return domain.SuggestGenerateTask
+	}
 	for _, p := range []string{"respond: ", "choose: ", "answer series: ", "on error: ", "LLM suggested: "} {
 		if len(sug) > len(p) && sug[:len(p)] == p {
 			sug = sug[len(p):]

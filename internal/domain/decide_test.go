@@ -315,6 +315,57 @@ func TestNoHistoryConsultsLLMWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestIdleGeneratesTaskWhenConfigured(t *testing.T) {
+	// FR-011 relaxation: idle with no task source generates a suggestion when
+	// llm.generate_task_command is configured, instead of escalating.
+	in := baseInput(SituationIdle)
+	in.Situation.Content = "Task is complete."
+	in.GenerateTaskConfigured = true
+	d := Decide(in)
+	if d.Action != ActionGenerateTask {
+		t.Fatalf("idle with no task source and generate_task_command should generate a task, got %+v", d)
+	}
+}
+
+func TestIdleNoTaskSourceStillEscalatesWithoutGenerateConfig(t *testing.T) {
+	// Without the opt-in command, today's safe behavior is preserved.
+	in := baseInput(SituationIdle)
+	in.Situation.Content = "Task is complete."
+	in.LLMConfigured = true // consult being configured must not relax idle
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonNoTaskSource {
+		t.Fatalf("idle with no task source and no generate_task_command must escalate, got %+v", d)
+	}
+}
+
+func TestIdleDeclaredTaskBeatsGeneration(t *testing.T) {
+	// A matched declared source wins even when generation is configured — the
+	// operator's own list is authoritative.
+	in := autonomous(baseInput(SituationIdle),
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
+		ActionNextDeclaredTask, ActionNextDeclaredTask)
+	in.DeclaredTask = &DeclaredTask{Task: "write the parser", Path: "/tmp/tasks.md"}
+	in.GenerateTaskConfigured = true
+	d := Decide(in)
+	if d.Action != ActionSend {
+		t.Fatalf("declared task must win over generation, got %+v", d)
+	}
+}
+
+func TestTaskGenFailureIsRetryable(t *testing.T) {
+	// A task_gen_failed escalation is retryable (like a failed consult); a
+	// gated escalation is not.
+	retryable := &AuditRecord{Status: "escalated", Rationale: "[task_gen_failed] llm CLI failed"}
+	if !IsRetryableLLMEscalation(retryable) {
+		t.Errorf("task_gen_failed escalation should be retryable")
+	}
+	notRetryable := &AuditRecord{Status: "escalated", Rationale: "[no_task_source]"}
+	if IsRetryableLLMEscalation(notRetryable) {
+		t.Errorf("no_task_source escalation must not be retryable")
+	}
+}
+
 func TestUnfamiliarOptionsConsultLLMWhenConfigured(t *testing.T) {
 	in := autonomous(baseInput(SituationChoice),
 		"use pnpm", "use pnpm", "use pnpm", "use pnpm", "use pnpm", "use pnpm", "use pnpm", "use pnpm")

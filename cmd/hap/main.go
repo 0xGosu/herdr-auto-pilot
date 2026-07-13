@@ -253,6 +253,9 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 			RewriteTemplate:      cfg.LLM.RewriteCommand,
 			RewriteStartTemplate: cfg.LLM.RewriteCommandStart,
 			RewriteTimeout:       cfg.RewriteTimeout(),
+			TaskGenTemplate:      cfg.LLM.GenerateTaskCommand,
+			TaskGenStartTemplate: cfg.LLM.GenerateTaskCommandStart,
+			TaskGenTimeout:       cfg.GenerateTaskTimeout(),
 		}
 	}
 
