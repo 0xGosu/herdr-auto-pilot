@@ -1284,7 +1284,7 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 				agentName = ""
 			}
 			req.AgentName = agentName
-			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, ""))
+			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, nil))
 			if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
 				return fmt.Errorf("staging LLM request failed: %w", err)
 			}
@@ -1299,6 +1299,18 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 		case <-ctx.Done():
 		}
 	}()
+}
+
+// taskReviewContext carries the extra get_context fields for a pre-send
+// declared-task review: the rendered prompt that would be sent (proposed_task),
+// the task-list file path, the current (next unchecked) task, and every pending
+// task in file order so the LLM can pick a different one when it judges the
+// current task already done.
+type taskReviewContext struct {
+	proposedPrompt string
+	listPath       string
+	currentTask    string
+	pending        []string
 }
 
 // consultDeclaredTask reviews a determined declared task before sending: it
@@ -1340,7 +1352,19 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 				agentName = ""
 			}
 			req.AgentName = agentName
-			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, proposed))
+			// Give the review the full remaining list (re-read off the main
+			// loop) so it can pick a different task when the current one is
+			// already done; degrade to just the current task on a read error.
+			review := &taskReviewContext{
+				proposedPrompt: proposed, listPath: declared.Path, currentTask: declared.Task,
+			}
+			if data, rerr := d.opt.ReadTaskFile(declared.Path); rerr == nil {
+				review.pending = domain.PendingDeclaredTasks(string(data))
+			} else {
+				slog.Warn("task-review: re-reading task source for pending list failed",
+					"path", declared.Path, "error", rerr)
+			}
+			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, review))
 			if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
 				return fmt.Errorf("staging LLM request failed: %w", err)
 			}
@@ -1523,11 +1547,12 @@ func (d *Daemon) agentNotCleanlyIdle(ctx context.Context, agentID string) bool {
 // consultContext builds the JSON context handed to the LLM CLI via the
 // get_context MCP tool: the classified situation, a pane excerpt, the
 // agent's herdr location, and the pane working directory.
-// consultContext builds the get_context blob for one consult. proposedTask is
-// non-empty only for a pre-send declared-task review: it carries the rendered
-// task under review, exposed as "proposed_task" with an answer_format that
-// frames submit_decision as send (recommend_action) vs. decline (@noop).
-func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation, agentName, proposedTask string) []byte {
+// consultContext builds the get_context blob for one consult. review is
+// non-nil only for a pre-send declared-task review: it adds proposed_task (the
+// rendered task under review), task_list_path, current_task, and pending_tasks,
+// with an answer_format that frames submit_decision as send (recommend_action)
+// vs. decline (@noop) — and lets the LLM pick a different pending task.
+func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation, agentName string, review *taskReviewContext) []byte {
 	excerpt := d.paneExcerpt(ctx, cfg, s)
 
 	// Pane location and cwd come from `pane get`; degrade to empty values
@@ -1580,10 +1605,14 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 	}
 	// Pre-send declared-task review: the agent is idle with a next task queued.
 	// Ask the LLM to judge, from the pane, whether sending it now is right —
-	// send it (recommend_action, edited if warranted) or decline (@noop).
-	if proposedTask != "" {
-		fields["proposed_task"] = proposedTask
-		fields["answer_format"] = "this idle agent has a next task ready to send (see proposed_task); decide from the pane whether sending it now is appropriate. To send it, submit_decision recommend_action with the task text (lightly edit it only if the pane clearly requires it). To decline — the agent is still busy, the task is already done, or the pane shows it should not run now — submit_decision recommend_action \"@noop\" with a one-sentence rationale. Always include confident_score: a confident decision is applied automatically (the task is sent, or skipped on a decline), while a low-confidence one is surfaced to the operator"
+	// send it (recommend_action, edited if warranted), pick a different pending
+	// task when the current one is already done, or decline (@noop).
+	if review != nil {
+		fields["proposed_task"] = review.proposedPrompt
+		fields["task_list_path"] = review.listPath
+		fields["current_task"] = review.currentTask
+		fields["pending_tasks"] = review.pending
+		fields["answer_format"] = "this idle agent has a next task ready to send: proposed_task is the exact instruction that would be sent, current_task is that task's text, task_list_path is the checklist file, and pending_tasks lists every remaining task in order. Decide from the pane what to send. Normally submit_decision recommend_action with proposed_task (lightly edit it only if the pane clearly requires). If the pane shows current_task is ALREADY DONE, pick the next still-unfinished item from pending_tasks and send that instruction instead. To decline — the agent is still busy, every task is done, or nothing should run now — submit_decision recommend_action \"@noop\" with a one-sentence rationale. Always include confident_score: a confident decision is applied automatically (the chosen task is sent, or skipped on a decline), while a low-confidence one is surfaced to the operator"
 	}
 	contextJSON, _ := json.Marshal(fields)
 	return contextJSON

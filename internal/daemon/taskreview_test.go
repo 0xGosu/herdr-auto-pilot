@@ -50,7 +50,7 @@ func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
 	// With an LLM command configured, a determined declared task is reviewed
 	// before sending. An approval (recommend_action with the task text) is
 	// delivered once it clears the confidence gate.
-	taskFile := writeReviewTaskFile(t, "- [ ] refactor the parser\n")
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [ ] refactor the parser\n- [ ] add parser tests\n")
 	idlePane := "All tests pass. Task is complete.\n"
 	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-rev\"\npath = %q\n", taskFile)
 	h := newHarness(t, cfg)
@@ -81,10 +81,21 @@ func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
 	if got := h.herdr.sentInputs()[0]; got != action {
 		t.Errorf("sent %q, want the LLM-approved task text %q", got, action)
 	}
-	// The review context handed the LLM the queued task as proposed_task.
+	// The review context hands the LLM the queued task plus the full list so it
+	// can pick a different pending task when the current one is already done.
 	m := decodeContext(t, reviewedCtx.get())
 	if pt, _ := m["proposed_task"].(string); !strings.Contains(pt, "refactor the parser") {
 		t.Errorf("proposed_task = %q, want the rendered declared task", pt)
+	}
+	if ct, _ := m["current_task"].(string); ct != "refactor the parser" {
+		t.Errorf("current_task = %q, want the next unchecked item", ct)
+	}
+	if lp, _ := m["task_list_path"].(string); lp != taskFile {
+		t.Errorf("task_list_path = %q, want %q", lp, taskFile)
+	}
+	pending, _ := m["pending_tasks"].([]any)
+	if len(pending) != 2 || pending[0] != "refactor the parser" || pending[1] != "add parser tests" {
+		t.Errorf("pending_tasks = %v, want the two unchecked items in order", pending)
 	}
 }
 

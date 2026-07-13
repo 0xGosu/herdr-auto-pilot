@@ -421,9 +421,11 @@ existing config.)
 When an `[llm].command` is configured, each task determined from a
 `[[task_sources]]` entry for an idle agent is first **reviewed** by that LLM
 before it is sent. Using the same two MCP tools as an ordinary consult
-(`get_context` / `submit_decision`), the LLM sees the live pane — plus the
-queued task as `proposed_task` — and decides whether sending it now is
-appropriate:
+(`get_context` / `submit_decision`), the LLM sees the live pane plus the queued
+task (`proposed_task` / `current_task`), the checklist path (`task_list_path`),
+and every remaining item (`pending_tasks`) — so it can also **pick a different
+pending task** when the pane shows the current one is already done — and decides
+what to send:
 
 - **Send** — `submit_decision` with `recommend_action` set to the task text
   (lightly edited only if the pane requires it).

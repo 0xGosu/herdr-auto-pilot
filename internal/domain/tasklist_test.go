@@ -25,6 +25,32 @@ func TestNextDeclaredTask(t *testing.T) {
 	}
 }
 
+func TestPendingDeclaredTasks(t *testing.T) {
+	cases := []struct {
+		name, content string
+		want          []string
+	}{
+		{"all unchecked after a done one", "- [x] done\n- [ ] a\n- [ ] b", []string{"a", "b"}},
+		{"none remaining", "- [x] a\n- [x] b", nil},
+		{"empty file", "", nil},
+		{"order preserved", "- [ ] first\n- [x] middle\n- [ ] last", []string{"first", "last"}},
+		{"plain checkbox", "[ ] bare one\n[ ] bare two", []string{"bare one", "bare two"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := PendingDeclaredTasks(c.content)
+			if len(got) != len(c.want) {
+				t.Fatalf("PendingDeclaredTasks(%q) = %v, want %v", c.content, got, c.want)
+			}
+			for i := range c.want {
+				if got[i] != c.want[i] {
+					t.Errorf("item %d = %q, want %q", i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestDeclaredTaskPrompt(t *testing.T) {
 	cases := []struct {
 		name string

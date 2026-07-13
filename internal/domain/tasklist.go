@@ -106,6 +106,22 @@ func NextDeclaredTask(content string) string {
 	return ""
 }
 
+// PendingDeclaredTasks returns every unchecked checklist item from an
+// operator-declared task-source file's content, in file order. The first
+// element is the same item NextDeclaredTask returns; the rest are the tasks
+// still queued behind it. Returns nil when nothing is unchecked. Used to give
+// the pre-send LLM review the full remaining list so it can pick a different
+// task when the current one is already done.
+func PendingDeclaredTasks(content string) []string {
+	var pending []string
+	for _, line := range strings.Split(content, "\n") {
+		if m := uncheckedItemRE.FindStringSubmatch(line); m != nil {
+			pending = append(pending, strings.TrimSpace(m[1]))
+		}
+	}
+	return pending
+}
+
 // InferredTask is a next task inferred from the agent's own transcript.
 type InferredTask struct {
 	Task string
