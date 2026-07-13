@@ -51,6 +51,14 @@ const DefaultContextWindow = 512
 // GetEmbeddings tokenizer disagree by a token or two.
 const specialTokenHeadroom = 8
 
+// minContextWindow floors any positive ModelContextWindow override. A window
+// small enough that the budget can't even hold the special tokens (e.g. 1 or
+// 2) makes every input — including the empty string, which still tokenizes to
+// [CLS]/[SEP] — exceed n_ctx and SIGABRT the worker (#82, PR review). No real
+// embedding model has a window below this, so a lower value is always a
+// misconfiguration; clamp up to it rather than trust it.
+const minContextWindow = 256
+
 // truncateIters bounds the proportional-cut retry loop so a pathological
 // text→token ratio can never spin; each pass overshoots the cut, so it
 // converges in one or two iterations in practice.
@@ -96,13 +104,21 @@ func NewEngine(cfg config.Embedding) *Llama {
 	}
 }
 
-// ResolveContextWindow returns the configured embedding context window, or the
-// bundled model's default when unset/non-positive.
+// ResolveContextWindow returns the effective embedding context window: the
+// bundled model's default when unset/non-positive, otherwise the override
+// floored to minContextWindow. This is the single chokepoint for every
+// construction path (config and the HAP_EMBED_CONTEXT_WINDOW worker env both
+// reach the engine through NewEngine), so no sub-minimum window can ever reach
+// GetEmbeddings and abort the worker.
 func ResolveContextWindow(cfg config.Embedding) int {
-	if cfg.ModelContextWindow > 0 {
-		return cfg.ModelContextWindow
+	w := cfg.ModelContextWindow
+	if w <= 0 {
+		return DefaultContextWindow
 	}
-	return DefaultContextWindow
+	if w < minContextWindow {
+		return minContextWindow
+	}
+	return w
 }
 
 // ResolveModelPath expands the configured model path, defaulting to the

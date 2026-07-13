@@ -128,17 +128,43 @@ func TestEmbedLongInputNoCrash(t *testing.T) {
 		t.Errorf("short input was altered: %q", got)
 	}
 
-	// A pathologically small context window must not panic (the proportional
-	// cut walking runes toward 0) and must still embed on the hard-clamped
-	// prefix.
-	tiny := NewEngine(config.Embedding{ModelPath: testModelPath(t), ModelContextWindow: 12})
+	// A pathologically small context window override is floored to
+	// minContextWindow (a window below it can't hold the special tokens and
+	// would SIGABRT). The engine must use the floor, not the raw value, and
+	// still embed the long input on the truncated prefix.
+	tiny := NewEngine(config.Embedding{ModelPath: testModelPath(t), ModelContextWindow: 1})
 	defer tiny.Close()
+	if tiny.ctxWindow != minContextWindow {
+		t.Errorf("ctxWindow = %d, want floored to %d", tiny.ctxWindow, minContextWindow)
+	}
 	tv, err := tiny.EmbedText(ctx, long)
 	if err != nil {
-		t.Fatalf("tiny-window embed should succeed on the clamped prefix, got: %v", err)
+		t.Fatalf("floored-window embed should succeed on the truncated prefix, got: %v", err)
 	}
 	if len(tv) != 384 {
-		t.Errorf("tiny-window dims = %d, want 384", len(tv))
+		t.Errorf("floored-window dims = %d, want 384", len(tv))
+	}
+}
+
+// TestResolveContextWindowFloor covers the override boundaries — 0/negative
+// fall to the default, and any positive value below the safe minimum (at or
+// below the special-token headroom included) is clamped up so the budget can
+// never go sub-headroom (#82, PR review).
+func TestResolveContextWindowFloor(t *testing.T) {
+	cases := []struct{ in, want int }{
+		{0, DefaultContextWindow},
+		{-5, DefaultContextWindow},
+		{1, minContextWindow},
+		{specialTokenHeadroom, minContextWindow},
+		{255, minContextWindow},
+		{minContextWindow, minContextWindow},
+		{512, 512},
+		{2048, 2048},
+	}
+	for _, c := range cases {
+		if got := ResolveContextWindow(config.Embedding{ModelContextWindow: c.in}); got != c.want {
+			t.Errorf("ResolveContextWindow(%d) = %d, want %d", c.in, got, c.want)
+		}
 	}
 }
 

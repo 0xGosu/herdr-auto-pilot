@@ -146,8 +146,11 @@ type Embedding struct {
 	// tokens before embedding, so it MUST NOT exceed what the model supports:
 	// feeding a BERT/MiniLM model more than its 512 positions hard-aborts the
 	// native library (#82). 0 → the built-in default
-	// (embedder.DefaultContextWindow, 512 for the bundled MiniLM). Raise it
-	// only when pointing model_path at a model with a larger window.
+	// (embedder.DefaultContextWindow, 512 for the bundled MiniLM). A positive
+	// value below embedder.minContextWindow (256) is clamped up to it — no
+	// real embedding model has a smaller window, and a tiny one can't hold the
+	// special tokens. Raise it only when pointing model_path at a model with a
+	// larger window.
 	ModelContextWindow int `toml:"model_context_window"`
 	// PaneSalientChars bounds the fallback salient window: for situations
 	// with no structured salient field (idle, and any unclassified content),
