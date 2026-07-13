@@ -57,6 +57,10 @@ type App struct {
 	// DaemonInfo reports the running daemon's identity from the lock file
 	// (daemonlock.Info in prod); nil hides the daemon line in status.
 	DaemonInfo func() (running bool, pid int, version string)
+	// StateDir is the daemon state directory; front-ends read the daemon's
+	// heartbeat/health record (daemonhealth) and reference the captured
+	// stderr log from here. Empty skips the health-derived status lines.
+	StateDir string
 	// NewEmbedder builds the embedder for ReembedStandalone; nil defaults
 	// to the production embedder. Tests inject fakes.
 	NewEmbedder func(cfg config.Embedding) ports.EmbedderPort

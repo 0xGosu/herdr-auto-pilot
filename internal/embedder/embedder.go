@@ -178,6 +178,11 @@ func (l *Llama) ModelID() string { return filepath.Base(l.modelPath) }
 // Dims is the embedding dimensionality (0 before the first success).
 func (l *Llama) Dims() int { return int(l.dims.Load()) }
 
+// Degraded reports whether the failure latch has tripped (embed calls now
+// short-circuit to text matching). Exposed for the daemon's health heartbeat;
+// callers type-assert this optional accessor rather than widening EmbedderPort.
+func (l *Llama) Degraded() bool { return l.degraded.Load() }
+
 // Close releases the model. It must never block the caller (the daemon
 // select loop calls it on reload/shutdown), so when a native embed call is
 // in flight — possibly hung, which is why the stall guard exists — the
