@@ -1025,6 +1025,35 @@ func TestPaneReadFailureTakesNoAction(t *testing.T) {
 	}
 }
 
+func TestPaneReadFailureDedupsDuplicateEvents(t *testing.T) {
+	// A persistent Herdr/pane-read outage delivers the same blocked event
+	// repeatedly. That escalation path bypasses escalate() (there is no pane
+	// to classify), so it must dedup inline — an outage must not pile up one
+	// identical pending escalation per event.
+	h := newHarness(t, "")
+	h.herdr.failRead = true
+	ctx := context.Background()
+
+	h.push("agent-ru", "blocked")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+
+	// Second identical event during the outage is a duplicate: ignored, no
+	// second pending escalation.
+	h.push("agent-ru", "blocked")
+	waitFor(t, 3*time.Second, func() bool { return len(ignoredRows(t, h)) == 1 })
+
+	esc, _ := h.raw.PendingEscalations(ctx)
+	if len(esc) != 1 {
+		t.Fatalf("read-outage storm created duplicate escalations: got %d, want 1", len(esc))
+	}
+	if !contains(esc[0].Rationale, string(domain.ReasonHerdrUnreachable)) {
+		t.Errorf("expected herdr_unreachable escalation, got %q", esc[0].Rationale)
+	}
+}
+
 func TestPanicInjectionAtAdapterBoundaries(t *testing.T) {
 	// SC-4: a panic at an adapter boundary is caught by the daemon guard —
 	// the daemon keeps running and processes subsequent events.
