@@ -12,12 +12,22 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
+
+// fastFailWindow bounds how quickly a CLI run must error out to count as a
+// "fast fail" that triggers a one-shot retry with the alternate template
+// (command ↔ command_start / rewrite_command ↔ rewrite_command_start). It is
+// spawn-to-exit wall time, so it must comfortably exceed a healthy CLI's
+// startup cost yet stay short enough that an argument-rejection (e.g. claude's
+// `--resume <non-uuid>`) lands inside it. The clock covers the whole run, not
+// just the CLI's own validation.
+const fastFailWindow = time.Second
 
 // Adapter shells out to the operator's LLM CLI.
 type Adapter struct {
@@ -49,25 +59,120 @@ func (a *Adapter) Configured() bool {
 	return a != nil && len(a.CommandTemplate) > 0
 }
 
+// consultAttempt captures the outcome of one CLI run so Consult can decide
+// whether to retry with the alternate template.
+type consultAttempt struct {
+	dec      *domain.LLMDecision
+	captured string
+	runErr   error
+	deadline bool          // the run hit its own timeout
+	elapsed  time.Duration // spawn-to-exit wall time
+}
+
+// staged reports whether the run left a usable (pending) decision.
+func (att *consultAttempt) staged() bool {
+	return att.dec != nil && att.dec.Status == "pending"
+}
+
+// fastFailed reports a quick error exit with no usable decision — the trigger
+// for a one-shot retry with the alternate template. A timeout (slow by
+// definition) and a clean no-submit exit are deliberately excluded.
+func (att *consultAttempt) fastFailed() bool {
+	return att.runErr != nil && !att.deadline && !att.staged() && att.elapsed < fastFailWindow
+}
+
+// failure renders the escalation error for a run that produced no usable
+// decision (the caller guarantees !staged()).
+func (att *consultAttempt) failure(timeout time.Duration) error {
+	if att.deadline {
+		return fmt.Errorf("llm timeout after %s without submit_decision", timeout)
+	}
+	if att.runErr != nil {
+		return fmt.Errorf("llm CLI failed without submit_decision: %w (output: %s)",
+			att.runErr, truncate(att.captured, 500))
+	}
+	return fmt.Errorf("llm CLI exited without calling submit_decision (output tail: %s)",
+		tailOf(att.captured, 500))
+}
+
 // Consult launches the CLI and returns the staged decision, or an error on
-// timeout / missing submission — both of which the daemon escalates.
+// timeout / missing submission — both of which the daemon escalates. When the
+// preferred template fails fast (e.g. `command` resumes a session that does
+// not exist yet), Consult retries once with the alternate template.
 func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
 	if !a.Configured() {
 		return nil, fmt.Errorf("no LLM CLI configured")
 	}
-	self := a.SelfPath
-	if self == "" {
-		var err error
-		if self, err = os.Executable(); err != nil {
-			return nil, fmt.Errorf("resolve self path: %w", err)
+	self, err := a.resolveSelf()
+	if err != nil {
+		return nil, err
+	}
+	// The first consult for an agent prefers command_start when configured;
+	// the other template is the fast-fail fallback and, absent a start
+	// template, First simply reuses the base command.
+	primary, alt := a.CommandTemplate, a.CommandStartTemplate
+	if req.First && len(a.CommandStartTemplate) > 0 {
+		primary, alt = a.CommandStartTemplate, a.CommandTemplate
+	}
+
+	timeout := a.Timeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+
+	att, err := a.runConsult(ctx, primary, self, req, timeout)
+	if err != nil {
+		// A preflight/store error on the PRIMARY aborts outright (a missing
+		// preferred binary is a config error worth surfacing directly); the
+		// same error on the retry is folded into retryErr so the primary wins.
+		return nil, err
+	}
+	// A fast fail retries once with the alternate template. Skip when the
+	// parent context is already cancelled (shutdown makes every run "fail
+	// fast") or the alternate is absent / identical.
+	var retryErr error
+	if att.fastFailed() && ctx.Err() == nil && len(alt) > 0 && !slices.Equal(alt, primary) {
+		altAtt, rerr := a.runConsult(ctx, alt, self, req, timeout)
+		switch {
+		case rerr != nil:
+			retryErr = rerr // preflight/store error on the retry
+		case altAtt.staged():
+			att = altAtt // the alternate rescued the consult
+		default:
+			retryErr = altAtt.failure(timeout)
 		}
 	}
-	// The first consult for an agent uses command_start when configured;
-	// an empty start template falls back to the base command.
-	tmpl := a.CommandTemplate
-	if req.First && len(a.CommandStartTemplate) > 0 {
-		tmpl = a.CommandStartTemplate
+
+	if !att.staged() {
+		base := att.failure(timeout)
+		if retryErr != nil {
+			// Lead with the primary failure (the informative one the operator
+			// must debug); note the alternate also failed.
+			return nil, fmt.Errorf("%w; retry with alternate command also failed: %v", base, retryErr)
+		}
+		return nil, base
 	}
+	att.dec.CapturedOutput = att.captured
+	return att.dec, nil
+}
+
+// resolveSelf resolves the {self} placeholder: the configured override, else
+// this binary's path.
+func (a *Adapter) resolveSelf() (string, error) {
+	if a.SelfPath != "" {
+		return a.SelfPath, nil
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve self path: %w", err)
+	}
+	return self, nil
+}
+
+// runConsult runs one CLI attempt with the given template and reports the
+// outcome. It never re-stages the request (the daemon already did); it only
+// launches the CLI and reads back whatever decision was staged.
+func (a *Adapter) runConsult(ctx context.Context, tmpl []string, self string, req domain.LLMRequest, timeout time.Duration) (*consultAttempt, error) {
 	argv := make([]string, len(tmpl))
 	for i, arg := range tmpl {
 		arg = strings.ReplaceAll(arg, "{self}", self)
@@ -85,10 +190,6 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 		return nil, err
 	}
 
-	timeout := a.Timeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -105,7 +206,9 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 		"HAP_DB_PATH="+a.DBPath,
 		"HAP_CONTROL_PATH="+a.ControlPath,
 	)
+	started := time.Now()
 	runErr := cmd.Run()
+	elapsed := time.Since(started)
 
 	captured := truncate(out.String(), 16*1024)
 
@@ -115,19 +218,13 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 	if err != nil {
 		return nil, fmt.Errorf("read staged decision: %w", err)
 	}
-	if dec == nil || dec.Status != "pending" {
-		if runCtx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("llm timeout after %s without submit_decision", timeout)
-		}
-		if runErr != nil {
-			return nil, fmt.Errorf("llm CLI failed without submit_decision: %w (output: %s)",
-				runErr, truncate(captured, 500))
-		}
-		return nil, fmt.Errorf("llm CLI exited without calling submit_decision (output tail: %s)",
-			tailOf(captured, 500))
-	}
-	dec.CapturedOutput = captured
-	return dec, nil
+	return &consultAttempt{
+		dec:      dec,
+		captured: captured,
+		runErr:   runErr,
+		deadline: runCtx.Err() == context.DeadlineExceeded,
+		elapsed:  elapsed,
+	}, nil
 }
 
 // WorkDir returns the directory the CLI must run in, or "" to inherit the
