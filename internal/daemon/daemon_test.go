@@ -1661,6 +1661,68 @@ func TestRetryLLMAgentGoneNotifies(t *testing.T) {
 	}
 }
 
+// TestRetryLLMRefreshesLiveHerdrStatus proves the retry re-drives with herdr's
+// CURRENT status/type from `agent list`, not a fabricated "blocked". The
+// original escalation was recorded while herdr reported "blocked"; by retry
+// time the agent has moved on and herdr reports "done" with type "claude". The
+// re-driven escalation must render that live status (and carry the live agent
+// type), so a stale/fabricated status never leaks onto a retry.
+func TestRetryLLMRefreshesLiveHerdrStatus(t *testing.T) {
+	// No [llm] section → llm.configured is false, so the re-driven capture
+	// escalates deterministically (no consult branch) and we can assert the
+	// resulting trigger.
+	h := newHarness(t, "")
+	ctx := context.Background()
+
+	// Seed a retryable LLM escalation captured earlier at status "blocked".
+	seed, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-r", Signature: "sig", Trigger: "agent-status: blocked",
+		SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: "[llm_timeout] llm timeout", Status: "escalated", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Live herdr snapshot at retry time: the agent has moved on to "done" and
+	// its type is known. A pane is present for the re-classification read.
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{
+		{AgentID: "agent-r", PaneID: "agent-r", AgentType: "claude", Status: "done"},
+	})
+
+	if _, err := h.raw.InsertLLMRetry(ctx, seed, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	h.daemon.processLLMRetries(ctx)
+
+	// The retry re-drives capture→classify→escalate on the live status. A new
+	// escalation appears whose trigger reflects herdr's REAL status ("done"),
+	// never the fabricated "blocked". Using "blocked" here (as the old code
+	// did) would have produced another "agent-status: blocked" row instead.
+	var redriven domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		for _, e := range esc {
+			if e.ID != seed && e.AgentID == "agent-r" {
+				redriven = e
+				return true
+			}
+		}
+		return false
+	})
+	if redriven.Trigger != "agent-status: done" {
+		t.Errorf("re-driven escalation trigger = %q, want %q (herdr's live status)",
+			redriven.Trigger, "agent-status: done")
+	}
+	// The live agent type must propagate too (empty type would fall back to
+	// "unknown" and break Claude's structural detectors / signature lookup).
+	if redriven.AgentType != "claude" {
+		t.Errorf("re-driven escalation agent type = %q, want \"claude\" (live from agent list)",
+			redriven.AgentType)
+	}
+}
+
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
 
 func TestAgentNamedOnDiscoveryAndWorking(t *testing.T) {
