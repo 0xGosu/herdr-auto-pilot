@@ -98,22 +98,28 @@ func main() {
 }
 
 func run(verb string, args []string) error {
-	paths, err := config.ResolvePaths()
-	if err != nil {
-		return err
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Path-printing verbs resolve from `paths` alone: no store, no daemon, no
-	// DB creation as a side effect. They must stay usable when the state dir is
-	// unwritable or the DB is corrupt — exactly the situations an operator runs
-	// them to diagnose ("paste your `hap paths`").
+	// Path-printing verbs are pure diagnostics: they resolve paths WITHOUT
+	// creating directories, opening the store, or touching the daemon — so they
+	// stay usable, and side-effect-free, in exactly the degraded states an
+	// operator runs them to inspect (an unwritable parent dir, a corrupt DB:
+	// "paste your `hap paths`"). Resolve before the creating ResolvePaths below
+	// so none of that filesystem mutation happens on this path.
 	if verb == "state-dir" || verb == "paths" ||
 		(verb == "config" && len(args) > 0 && args[0] == "path") {
+		paths, err := config.ResolvePathsNoCreate()
+		if err != nil {
+			return err
+		}
 		app := &frontend.App{ConfigPath: paths.File(), StateDir: paths.StateDir}
 		return cli.Run(ctx, app, os.Stdout, verb, args)
+	}
+
+	paths, err := config.ResolvePaths()
+	if err != nil {
+		return err
 	}
 
 	switch verb {
