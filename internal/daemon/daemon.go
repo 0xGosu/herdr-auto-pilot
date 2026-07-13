@@ -1851,18 +1851,21 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) {
 		return
 	}
 
-	// Resolve the agent to its current pane — retry re-reads the LIVE screen,
-	// so the pane may differ from where the escalation first fired.
+	// Resolve the agent to its current pane AND its live herdr state — retry
+	// re-reads the LIVE screen, so the pane may differ from where the
+	// escalation first fired. ListAgents reports the real agent_status, type,
+	// and location; carry the WHOLE transition forward (like reconcileAttention)
+	// so the recapture reflects herdr's current snapshot, never a fabricated one.
 	agents, err := d.opt.Herdr.ListAgents(ctx)
 	if err != nil {
 		slog.Error("llm retry: listing agents failed", "agent", agentID, "error", err)
 		return
 	}
-	var paneID string
+	var live domain.AgentTransition
 	var found bool
 	for _, a := range agents {
 		if a.AgentID == agentID {
-			paneID, found = a.PaneID, true
+			live, found = a, true
 			break
 		}
 	}
@@ -1877,14 +1880,17 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) {
 		return
 	}
 
-	// Force an attention capture: "blocked" runs the delayed-capture path
-	// (handleAttention → classify → decideAndAct), which re-consults when the
-	// live pane still needs help. scheduleCapture coalesces per pane, so rapid
-	// double-retries collapse into one capture.
-	slog.Info("llm retry: re-driving consult", "agent", agentID, "pane", paneID)
-	d.scheduleCapture(ctx, domain.AgentTransition{
-		AgentID: agentID, PaneID: paneID, Status: "blocked",
-	})
+	// Re-drive the attention pipeline with the live transition. scheduleCapture
+	// fires unconditionally (it re-enters via delayedTr → handleAttention, not
+	// handleTransition, so the status does not gate the capture), re-reads the
+	// pane, and re-derives every gate at fire time — re-consulting when the live
+	// pane still needs help. Forwarding herdr's real status/type/location (vs a
+	// fabricated "blocked") keeps the trigger honest and lets the Claude
+	// structural detectors and signature lookup see the correct agent type.
+	// scheduleCapture coalesces per pane, so rapid double-retries collapse into
+	// one capture.
+	slog.Info("llm retry: re-driving consult", "agent", agentID, "pane", live.PaneID, "status", live.Status)
+	d.scheduleCapture(ctx, live)
 }
 
 func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domain.CorrectionRecord) error {
