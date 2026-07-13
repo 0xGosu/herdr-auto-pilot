@@ -67,6 +67,33 @@ func TestMultiTabFormRejectsSingleQuestionForm(t *testing.T) {
 	}
 }
 
+// mcqSubmitFrame is the FINAL tab of a live multi-tab form: the header is
+// intact but the tab-navigation footer is gone, replaced by the Submit
+// confirmation body (issue #95). MultiTabForm must still detect it so the
+// daemon's sweep does not abort on the last tab.
+const mcqSubmitFrame = `⏺ The advisor confirmed the approach.
+───────────────────────────────
+←  ☐ Agent identity  ☐ Stats to show  ✔ Submit  →
+
+Review your answers
+
+⚠ You have not answered all questions
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel
+`
+
+func TestMultiTabFormDetectsFooterlessSubmitTab(t *testing.T) {
+	// Regression for #95: the Submit tab drops the footer but keeps the
+	// header; it must still resolve to the same 3-tab form.
+	tabs, ok := MultiTabForm(mcqSubmitFrame)
+	if !ok || tabs != 3 {
+		t.Fatalf("MultiTabForm(submit tab) = (%d,%v), want (3,true)", tabs, ok)
+	}
+}
+
 func TestMultiTabFormRejectsNarratedCheckboxes(t *testing.T) {
 	// A narrated checkbox list without the navigation footer must not
 	// trigger the sweep protocol.
@@ -85,8 +112,11 @@ func TestClaudeMCQForm(t *testing.T) {
 	}{
 		{"multi-tab v1 footer", mcqTabFrame, true},
 		{"multi-tab v2 footer", mcqTabFrameV2, true},
+		{"multi-tab submit tab no footer", mcqSubmitFrame, true},
 		{"single-question footer", singleQuestion, true},
 		{"narrated checkbox no footer", "Plan status:\n←  ☐ step one  ✔ done  →\nall good\n", false},
+		{"submit prompt without tab header", "All done.\nReady to submit your answers?\nyes I think so\n", false},
+		{"submit narration mid-line with header", "←  ☐ a  ☐ b  ✔ Submit  →\nSo, are you ready to submit your answers? Not yet.\n", false},
 		{"plain numbered list", "Summary:\n1. Refactored the consumer\n2. Updated the spec\n", false},
 		{"narrated enter to select without nav tail", "run help: press Enter to select an entry\n", false},
 	}

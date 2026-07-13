@@ -23,8 +23,12 @@ var mcqFrames = []string{
 		"❯ 1. sqlite (Recommended)\n     single file, zero ops\n  2. postgres\n     needs a server\n  3. Type something.\n\n" + mcqFooter + "\n",
 	"scrollback narration up here\n──────\n" + mcqHeader + "\n\nHow should migrations run?\n\n" +
 		"❯ 1. auto on boot\n  2. manual command\n  3. Type something.\n\n" + mcqFooter + "\n",
-	"scrollback narration up here\n──────\n" + mcqHeader + "\n\nReady to submit your answers?\n\n" +
-		"❯ 1. Submit\n  2. Keep editing\n\n" + mcqFooter + "\n",
+	// The final Submit tab keeps the header but DROPS the footer, showing the
+	// confirmation body instead (issue #95). Without the footer-less-aware
+	// MultiTabForm, sweepFrames aborts here with "tab 3/3 no longer shows the
+	// 3-tab form" and the whole form escalates.
+	"scrollback narration up here\n──────\n" + mcqHeader + "\n\nReview your answers\n\n" +
+		"⚠ You have not answered all questions\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n",
 }
 
 // sweptSituation mirrors what the daemon builds after the sweep: the frame-1
