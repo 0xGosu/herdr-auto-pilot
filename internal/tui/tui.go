@@ -49,6 +49,10 @@ type refreshMsg struct {
 	kills       []domain.KillEvent
 	signatures  []frontend.SignatureRow
 	cfg         config.Config
+	// daemonHealth combines lock + heartbeat + crash-loop state for the health
+	// banner, so the operator sees a hung/degraded/crash-looping daemon that
+	// otherwise looks identical to "all quiet" (no escalations).
+	daemonHealth frontend.DaemonHealth
 	// pendingConsult holds agent ids that currently have an LLM consult in
 	// flight, so "l: retry LLM" is disabled while one is running (the daemon
 	// re-checks authoritatively). Populated only for retryable escalations.
@@ -234,6 +238,9 @@ func (m Model) refresh() tea.Cmd {
 
 func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 	var msg refreshMsg
+	// Daemon health is read from local state files (never errors), so assess it
+	// first — it stays meaningful even when GetStatus fails (e.g. daemon down).
+	msg.daemonHealth = app.AssessDaemonHealth()
 	msg.status, msg.err = app.GetStatus(ctx)
 	if msg.err != nil {
 		return msg
@@ -1017,7 +1024,8 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 
 // detailPageSize is how many detail lines fit under the header and help:
 // header title + tabs + blank (3), detail title + blank (2), the more-lines
-// indicator (1), and blank + help (2) — plus the error line when present.
+// indicator (1), and blank + help (2) — plus the error line and the daemon
+// health banner when present.
 func (m Model) detailPageSize() int {
 	if m.height <= 0 {
 		return 20
@@ -1026,20 +1034,26 @@ func (m Model) detailPageSize() int {
 	if m.data.err != nil {
 		chrome++
 	}
+	if m.data.daemonHealth.Banner() != "" {
+		chrome++
+	}
 	return max(1, m.height-chrome)
 }
 
 // listPageSize is how many list rows fit under the current pane chrome,
 // mirroring detailPageSize's accounting (AR-002): header title + tabs +
 // blank (3), the more-rows indicator (1), and blank + help (2) — plus the
-// error line, the search/filter lines, and the prompt, hint, and status
-// areas when present.
+// error line, the daemon health banner, the search/filter lines, and the
+// prompt, hint, and status areas when present.
 func (m Model) listPageSize() int {
 	if m.height <= 0 {
 		return 20
 	}
 	chrome := 6
 	if m.data.err != nil {
+		chrome++
+	}
+	if m.data.daemonHealth.Banner() != "" {
 		chrome++
 	}
 	if m.searching || (m.tab.isList() && m.query[m.tab] != "") {
@@ -1579,6 +1593,17 @@ func (m Model) View() string {
 		}
 	}
 	fmt.Fprintf(&b, "%s\n\n", strings.Join(tabs, "|"))
+
+	// Daemon health banner: a hung, crash-looping, or degraded daemon otherwise
+	// looks identical to "all quiet" (no escalations). Error states use the
+	// error palette; degraded/stale (a working fallback) use warn.
+	if banner := m.data.daemonHealth.Banner(); banner != "" {
+		style := st.warn
+		if m.data.daemonHealth.Severity() == frontend.DaemonError {
+			style = st.err
+		}
+		fmt.Fprintf(&b, "%s\n", style.Render(banner))
+	}
 
 	if m.data.err != nil {
 		fmt.Fprintf(&b, "%s\n", st.err.Render("error: "+m.data.err.Error()))

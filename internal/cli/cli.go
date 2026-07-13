@@ -18,8 +18,6 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
-	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
-	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
@@ -356,52 +354,33 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 		state = "PAUSED (kill switch active)"
 	}
 	fmt.Fprintf(out, "automation:          %s\n", state)
-	// health is the daemon's heartbeat record (absent for a daemon older than
-	// heartbeat support, or one not running); hung is a held lock with a stale
-	// beat — a live-but-wedged daemon, the case flock alone can't reveal.
-	var health daemonhealth.Health
-	var guard crashguard.State
-	var haveHealth, hung, gaveUp bool
+	// Daemon health combines the lock, heartbeat, and crash-loop breaker into
+	// one assessment shared with the TUI banner (frontend.AssessDaemonHealth),
+	// so CLI and TUI can never disagree about whether the daemon is healthy.
+	h := app.AssessDaemonHealth()
 	if app.DaemonInfo != nil {
-		running, pid, ver := app.DaemonInfo()
-		if running && app.StateDir != "" {
-			// Only trust a heartbeat written by THIS lock holder. A hard abort
-			// skips the daemon's cleanup, so a fresh same-version daemon can be
-			// holding the lock while a dead predecessor's stale record still
-			// sits on disk — attributing it here would false-flag the new
-			// daemon NOT RESPONDING during its startup window. flock guarantees
-			// the pid is live, so matching pids means the record is genuinely
-			// this daemon's (bar astronomically-unlikely pid reuse in that window).
-			if h, ok := daemonhealth.Read(app.StateDir); ok && h.PID == pid {
-				health, haveHealth = h, true
-			}
-		}
-		now := time.Now()
-		hung = running && haveHealth && health.Stale(now)
-		// The crash-loop breaker may have latched a hard stop (daemon not
-		// starting) or an embedder auto-disable — surface both.
-		if app.StateDir != "" {
-			guard, _ = crashguard.Read(app.StateDir)
-		}
-		label := fmt.Sprintf("running %s (pid %d)", daemonlock.VersionLabel(ver), pid)
+		label := fmt.Sprintf("running %s (pid %d)", daemonlock.VersionLabel(h.Version), h.PID)
 		switch {
-		case !running && guard.GaveUp:
+		case !h.Running && h.GaveUp:
 			// Respawns are suppressed until the [embedding] config changes.
-			fmt.Fprintf(out, "daemon:              NOT STARTING — crash-loop breaker gave up: %s\n", guard.Reason)
-			gaveUp = true
-		case !running:
+			fmt.Fprintf(out, "daemon:              NOT STARTING — crash-loop breaker gave up: %s\n", h.Reason)
+		case !h.Running && h.CrashLooping:
+			// Down with a recent boot cluster: crashing and being respawned.
+			fmt.Fprintf(out, "daemon:              DOWN — crash-looping (%d restarts recently); recent output: %s\n",
+				h.RecentRestarts, h.StderrLog)
+		case !h.Running:
 			fmt.Fprintf(out, "daemon:              not running\n")
-		case hung:
+		case h.Hung:
 			// A held lock with a dead heartbeat: alive but not progressing (or
 			// mid-crash-loop). Point at the captured stderr for the reason; if
 			// it is also a different binary, keep the --ensure remedy visible.
 			line := fmt.Sprintf("%s — NOT RESPONDING (last heartbeat %s ago); recent output: %s",
-				label, roundDuration(health.Age(now)), daemonhealth.StderrLogPath(app.StateDir))
-			if ver != buildinfo.Version {
+				label, roundDuration(h.HeartbeatAge), h.StderrLog)
+			if h.VersionStale {
 				line += fmt.Sprintf(" [also STALE: binary is %s; run: hap daemon --ensure]", buildinfo.Version)
 			}
 			fmt.Fprintf(out, "daemon:              %s\n", line)
-		case ver != buildinfo.Version:
+		case h.VersionStale:
 			// A holder from another binary keeps old bugs alive; make the
 			// mismatch and the remedy impossible to miss.
 			fmt.Fprintf(out, "daemon:              %s — STALE, binary is %s; run: hap daemon --ensure\n",
@@ -416,15 +395,15 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	// replaces the config-derived line (which can't know matching was forced
 	// off); it latches until the [embedding] config changes.
 	switch {
-	case guard.EmbeddingOff:
-		fmt.Fprintf(out, "semantic matching:   AUTO-DISABLED by crash-loop breaker — %s\n", guard.Reason)
+	case h.EmbeddingAutoDisabled:
+		fmt.Fprintf(out, "semantic matching:   AUTO-DISABLED by crash-loop breaker — %s\n", h.Reason)
 	case st.Embedding != "":
 		fmt.Fprintf(out, "semantic matching:   %s\n", st.Embedding)
 	}
 	// A running embedder can still be soft-degraded (embed calls latched to
 	// text fallback) — the config-derived line above would otherwise hide it.
-	if haveHealth && health.Embedder == daemonhealth.EmbedderDegraded {
-		fmt.Fprintf(out, "embedder health:     DEGRADED at runtime — %s\n", health.EmbedderNote())
+	if h.EmbedderDegraded {
+		fmt.Fprintf(out, "embedder health:     DEGRADED at runtime — %s\n", h.EmbedderNote)
 	}
 	if st.Drift.Detected {
 		// Same shape as the STALE-daemon line: the mismatch and the remedy
@@ -439,7 +418,7 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	// A hung daemon or a latched crash-loop give-up is a failure state: exit
 	// non-zero so scripted checks and the operator notice, even though the
 	// status body already explained it.
-	if hung || gaveUp {
+	if h.Hung || h.GaveUp || h.CrashLooping {
 		return ErrUnhealthy
 	}
 	return nil
