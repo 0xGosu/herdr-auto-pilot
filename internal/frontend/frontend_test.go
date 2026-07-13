@@ -701,6 +701,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"embedding.similarity_threshold":      "0.90",
 		"embedding.bm25_min_score":            "0.35",
 		"embedding.gpu_layers":                "0",
+		"embedding.model_context_window":      "512",
 		"tui.max_content_width":               "140",
 		"tui.theme":                           "dark",
 	}
@@ -771,7 +772,7 @@ func TestPaneSalientCharsFieldDisplay(t *testing.T) {
 	// Unset (0) renders the effective built-in default, not a bare "0".
 	def := config.Default()
 	got := frontend.FieldValue(def, "embedding.pane_salient_chars")
-	if !strings.Contains(got, "default") || !strings.Contains(got, "800") {
+	if !strings.Contains(got, "default") || !strings.Contains(got, "500") {
 		t.Errorf("unset pane_salient_chars should show the default, got %q", got)
 	}
 	// An explicit value renders plainly.

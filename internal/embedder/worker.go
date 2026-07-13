@@ -20,6 +20,9 @@ const (
 	EnvWorkerModel = "HAP_EMBED_MODEL"
 	// EnvWorkerGPULayers is the GPU offload layer count (optional, default 0).
 	EnvWorkerGPULayers = "HAP_EMBED_GPU_LAYERS"
+	// EnvWorkerContextWindow overrides the model's context window / token cap
+	// (optional; empty or "0" → DefaultContextWindow).
+	EnvWorkerContextWindow = "HAP_EMBED_CONTEXT_WINDOW"
 	// EnvWorkerCrash is a TEST/FAULT-INJECTION seam: set to N and the worker
 	// os.Exit(134)s (mimicking a SIGABRT) when it receives its N-th embed
 	// request, before responding. It exists so the isolation contract — a
@@ -48,6 +51,13 @@ func workerConfigFromEnv() (config.Embedding, error) {
 			return config.Embedding{}, fmt.Errorf("invalid %s=%q: %w", EnvWorkerGPULayers, v, err)
 		}
 		cfg.GPULayers = n
+	}
+	if v := os.Getenv(EnvWorkerContextWindow); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return config.Embedding{}, fmt.Errorf("invalid %s=%q: %w", EnvWorkerContextWindow, v, err)
+		}
+		cfg.ModelContextWindow = n
 	}
 	return cfg, nil
 }

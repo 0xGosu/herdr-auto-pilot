@@ -638,6 +638,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "embedding.bm25_min_score", TUIEditable: true},
 	{Key: "embedding.gpu_layers", TUIEditable: true},
 	{Key: "embedding.pane_salient_chars", TUIEditable: true},
+	{Key: "embedding.model_context_window", TUIEditable: true},
 	{Key: "tui.max_content_width", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
 }
@@ -739,6 +740,11 @@ func FieldValue(cfg config.Config, key string) string {
 		return fmt.Sprintf("%.2f", cfg.Embedding.BM25MinScore)
 	case "embedding.gpu_layers":
 		return strconv.Itoa(cfg.Embedding.GPULayers)
+	case "embedding.model_context_window":
+		if cfg.Embedding.ModelContextWindow <= 0 {
+			return fmt.Sprintf("%d (default)", embedder.DefaultContextWindow)
+		}
+		return strconv.Itoa(cfg.Embedding.ModelContextWindow)
 	case "safety.disable_seed":
 		return strconv.FormatBool(cfg.Safety.DisableSeed)
 	case "tui.max_content_width":
@@ -871,6 +877,15 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("embedding.gpu_layers must be a non-negative integer, got %q", value)
 			}
 			cfg.Embedding.GPULayers = v
+			return nil
+		case "embedding.model_context_window":
+			// 0 restores the built-in default (embedder.DefaultContextWindow);
+			// a positive value tunes the token cap for a larger custom model.
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("embedding.model_context_window must be a non-negative integer (0 = default), got %q", value)
+			}
+			cfg.Embedding.ModelContextWindow = v
 			return nil
 		case "llm.pane_excerpt_chars":
 			// 0 is the config's "restore the 5000-char default" sentinel
