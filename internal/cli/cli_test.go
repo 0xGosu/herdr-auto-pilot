@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
@@ -63,6 +65,108 @@ func TestStatusShowsDaemonLine(t *testing.T) {
 	out, _ = run(t, app, "status")
 	if !strings.Contains(out, "STALE") || !strings.Contains(out, "hap daemon --ensure") {
 		t.Errorf("version mismatch must flag STALE with the remedy, got:\n%s", out)
+	}
+}
+
+func TestStatusHungDaemonUnhealthy(t *testing.T) {
+	app, _ := testApp(t)
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, buildinfo.Version }
+
+	// A held lock but a heartbeat well past the stale threshold = hung.
+	if err := daemonhealth.Write(stateDir, daemonhealth.Health{
+		PID: 4242, Version: buildinfo.Version,
+		HeartbeatAt: time.Now().Add(-2 * daemonhealth.StaleAfter),
+		Embedder:    daemonhealth.EmbedderReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "status")
+	if !errors.Is(err, cli.ErrUnhealthy) {
+		t.Fatalf("hung daemon must return ErrUnhealthy for a non-zero exit, got err=%v", err)
+	}
+	if !strings.Contains(out, "NOT RESPONDING") {
+		t.Errorf("hung daemon must be flagged NOT RESPONDING, got:\n%s", out)
+	}
+	if !strings.Contains(out, "daemon.stderr.log") {
+		t.Errorf("hung daemon should point at the captured stderr log, got:\n%s", out)
+	}
+}
+
+func TestStatusIgnoresStaleHealthFromDeadInstance(t *testing.T) {
+	app, _ := testApp(t)
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	// The lock is held by a fresh daemon (pid 4242); a crashed predecessor
+	// (pid 9999) left a stale record its hard abort never cleaned up. That
+	// record must NOT be attributed to the live daemon (else a false
+	// NOT RESPONDING during the new daemon's startup window).
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, buildinfo.Version }
+	if err := daemonhealth.Write(stateDir, daemonhealth.Health{
+		PID: 9999, Version: buildinfo.Version,
+		HeartbeatAt: time.Now().Add(-2 * daemonhealth.StaleAfter),
+		Embedder:    daemonhealth.EmbedderReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "status")
+	if err != nil {
+		t.Fatalf("a stale record from a DIFFERENT pid must not read as hung, got err=%v", err)
+	}
+	if strings.Contains(out, "NOT RESPONDING") {
+		t.Errorf("dead predecessor's heartbeat must not be attributed to the live daemon, got:\n%s", out)
+	}
+	if !strings.Contains(out, "running "+buildinfo.Version+" (pid 4242)") {
+		t.Errorf("should fall back to a healthy running line, got:\n%s", out)
+	}
+}
+
+func TestStatusFreshHeartbeatHealthy(t *testing.T) {
+	app, _ := testApp(t)
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, buildinfo.Version }
+
+	if err := daemonhealth.Write(stateDir, daemonhealth.Health{
+		PID: 4242, Version: buildinfo.Version,
+		HeartbeatAt: time.Now(), Embedder: daemonhealth.EmbedderReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "status")
+	if err != nil {
+		t.Fatalf("fresh heartbeat must be healthy, got err=%v", err)
+	}
+	if strings.Contains(out, "NOT RESPONDING") {
+		t.Errorf("a fresh heartbeat must not read as hung, got:\n%s", out)
+	}
+}
+
+func TestStatusEmbedderDegradedSurfaced(t *testing.T) {
+	app, _ := testApp(t)
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, buildinfo.Version }
+
+	if err := daemonhealth.Write(stateDir, daemonhealth.Health{
+		PID: 4242, Version: buildinfo.Version,
+		HeartbeatAt: time.Now(), Embedder: daemonhealth.EmbedderDegraded,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "status")
+	// Degraded is a working fallback, NOT an unhealthy exit — but it must be
+	// surfaced so the operator knows semantic matching is off.
+	if err != nil {
+		t.Fatalf("a degraded embedder is not an unhealthy exit, got err=%v", err)
+	}
+	if !strings.Contains(out, "DEGRADED") {
+		t.Errorf("runtime-degraded embedder must be surfaced, got:\n%s", out)
 	}
 }
 

@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemon"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
 	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
@@ -84,7 +86,11 @@ func main() {
 	}
 
 	if err := run(verb, args); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+		// `hap status` on an unhealthy daemon already printed the human detail;
+		// exit non-zero for scripts without a redundant "error:" line.
+		if !errors.Is(err, cli.ErrUnhealthy) {
+			fmt.Fprintln(os.Stderr, "error:", err)
+		}
 		os.Exit(1)
 	}
 }
@@ -134,6 +140,7 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 		ConfigPath:  paths.File(),
 		ControlPath: paths.ControlSocketPath(),
 		Author:      "operator",
+		StateDir:    paths.StateDir,
 		DaemonInfo: func() (bool, int, string) {
 			return daemonlock.Info(paths)
 		},
@@ -210,6 +217,7 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		LLMFactory:        llmFactory,
 		EmbedderFactory:   embedderFactory,
 		MatchIndexDir:     filepath.Join(paths.StateDir, "match-index"),
+		StateDir:          paths.StateDir,
 	})
 	if err != nil {
 		return err
@@ -229,7 +237,15 @@ func ensureDaemon(paths config.Paths) error {
 		}
 		cmd := exec.Command(self, "daemon")
 		cmd.Stdout = nil
-		cmd.Stderr = nil
+		// Capture the detached daemon's stderr to a file. A native abort in
+		// the embedder (llama.cpp GGML_ASSERT → SIGABRT) prints there and is
+		// invisible to Go recovery; without this it went to /dev/null and the
+		// only crash evidence vanished. Best-effort: a nil file means the
+		// child inherits no stderr (today's behaviour), never a failed launch.
+		if stderrLog := daemonhealth.OpenStderrLog(paths.StateDir); stderrLog != nil {
+			cmd.Stderr = stderrLog
+			defer stderrLog.Close() // the child dup'd the fd at Start
+		}
 		cmd.Stdin = nil
 		daemonlock.Detach(cmd)
 		if err := cmd.Start(); err != nil {

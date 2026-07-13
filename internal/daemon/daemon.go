@@ -21,6 +21,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/classify"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/match"
@@ -50,7 +51,10 @@ type Options struct {
 	// MatchIndexDir is where the disposable bleve match index lives
 	// (typically <state>/match-index). Empty disables semantic matching.
 	MatchIndexDir string
-	Clock         ports.Clock
+	// StateDir is where the daemon writes its heartbeat/health record
+	// (daemonhealth). Empty disables health writing (tests that don't care).
+	StateDir string
+	Clock    ports.Clock
 	// ReadTaskFile reads a declared task-source file (os.ReadFile in prod).
 	ReadTaskFile func(path string) ([]byte, error)
 	// PaneReadLines is how much recent pane content classification sees.
@@ -304,9 +308,59 @@ func (d *Daemon) snapshot() (config.Config, *domain.NeverAutoList, *classify.Cla
 	return d.cfg, d.neverAuto, d.classifier
 }
 
+// embedderState reports the current semantic-matching health for the heartbeat
+// record. A hard native abort never reaches here (it kills the process first);
+// this only distinguishes disabled / starting / soft-degraded / ready.
+func (d *Daemon) embedderState() daemonhealth.EmbedderState {
+	d.mu.RLock()
+	disabled := d.cfg.Embedding.Disabled
+	d.mu.RUnlock()
+	if disabled {
+		return daemonhealth.EmbedderDisabled
+	}
+	if emb := d.embedderPort(); emb != nil {
+		if deg, ok := emb.(interface{ Degraded() bool }); ok && deg.Degraded() {
+			return daemonhealth.EmbedderDegraded
+		}
+	}
+	if d.semanticReady.Load() {
+		return daemonhealth.EmbedderReady
+	}
+	return daemonhealth.EmbedderStarting
+}
+
+// writeHealth refreshes the heartbeat file (best-effort; a failed write is
+// logged once at debug and never disturbs the loop). No-op without a StateDir.
+func (d *Daemon) writeHealth(startedAt time.Time) {
+	if d.opt.StateDir == "" {
+		return
+	}
+	h := daemonhealth.Health{
+		PID:         os.Getpid(),
+		Version:     buildinfo.Version,
+		StartedAt:   startedAt,
+		HeartbeatAt: d.opt.Clock.Now(),
+		Embedder:    d.embedderState(),
+	}
+	if err := daemonhealth.Write(d.opt.StateDir, h); err != nil {
+		slog.Debug("heartbeat write failed", "error", err)
+	}
+}
+
 // Run drives the daemon until ctx is done. It never panics: every handler
 // runs under the fail-safe guard (NFR-004).
 func (d *Daemon) Run(ctx context.Context) error {
+	// Heartbeat first: publish a fresh health record (stamped with THIS pid)
+	// as the very first action, before the slower socket/subscriber setup, so
+	// a status check during startup sees this daemon's beat — not a dead
+	// predecessor's stale file left by a hard abort. Refreshed on a ticker
+	// below; removed on clean shutdown so a graceful stop reads as gone.
+	startedAt := d.opt.Clock.Now()
+	d.writeHealth(startedAt)
+	if d.opt.StateDir != "" {
+		defer func() { _ = daemonhealth.Remove(d.opt.StateDir) }()
+	}
+
 	// Control socket: reload/wake nudges from front-ends and mcp.
 	var ctl *control.Server
 	if d.opt.ControlSocketPath != "" {
@@ -356,11 +410,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	sweep := time.NewTicker(time.Minute)
 	defer sweep.Stop()
 
+	// Heartbeat ticker: refresh the health record (written once above at
+	// startup) so out-of-process status/TUI can tell a live, progressing
+	// daemon from a hung one.
+	heartbeat := time.NewTicker(daemonhealth.HeartbeatInterval)
+	defer heartbeat.Stop()
+
 	slog.Info("daemon running", "version", buildinfo.Version)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-heartbeat.C:
+			d.writeHealth(startedAt)
 		case <-sweep.C:
 			logging.Guard("periodic-sweep", func() error {
 				d.processCorrections(ctx)
