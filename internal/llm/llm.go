@@ -53,7 +53,7 @@ type Adapter struct {
 	// RewriteTimeout bounds one rewrite run (<=0 falls back to Timeout).
 	RewriteTimeout time.Duration
 	// TaskGenTemplate is the argv template for the one-shot idle task
-	// suggestion (llm.generate_task_command); placeholders {self},
+	// suggestion (llm.task_generate_command); placeholders {self},
 	// {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. Empty disables it.
 	TaskGenTemplate []string
 	// TaskGenStartTemplate is used instead of TaskGenTemplate on an agent's

@@ -1376,7 +1376,7 @@ func TestIdleWithoutTaskSourceEscalates(t *testing.T) {
 }
 
 func TestIdleGeneratesTaskSuggestionEscalation(t *testing.T) {
-	// FR-011 relaxation: idle with no task source and generate_task_command
+	// FR-011 relaxation: idle with no task source and task_generate_command
 	// configured surfaces an LLM-suggested task as a (non-retryable)
 	// escalation, and sends nothing to the pane.
 	idlePane := "Task is complete.\n"

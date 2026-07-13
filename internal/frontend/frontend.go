@@ -791,9 +791,9 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "llm.rewrite_command_start"}, // argv template (first rewrite; inherits rewrite_command)
 	{Key: "llm.rewrite_timeout_seconds", TUIEditable: true},
 	{Key: "llm.rewrite_fallback_template"},   // template string
-	{Key: "llm.generate_task_command"},       // argv template (idle task suggestion)
-	{Key: "llm.generate_task_command_start"}, // argv template (first generation; inherits generate_task_command)
-	{Key: "llm.generate_task_timeout_seconds", TUIEditable: true},
+	{Key: "llm.task_generate_command"},       // argv template (idle task suggestion)
+	{Key: "llm.task_generate_command_start"}, // argv template (first generation; inherits task_generate_command)
+	{Key: "llm.task_generate_timeout_seconds", TUIEditable: true},
 	{Key: "embedding.disabled", TUIEditable: true},
 	{Key: "embedding.model_path"}, // path
 	{Key: "embedding.similarity_threshold", TUIEditable: true},
@@ -889,17 +889,17 @@ func FieldValue(cfg config.Config, key string) string {
 			return "(built-in default)"
 		}
 		return cfg.LLM.RewriteFallbackTemplate
-	case "llm.generate_task_command":
+	case "llm.task_generate_command":
 		if len(cfg.LLM.GenerateTaskCommand) == 0 {
 			return "(disabled)"
 		}
 		return JoinCommand(cfg.LLM.GenerateTaskCommand)
-	case "llm.generate_task_command_start":
+	case "llm.task_generate_command_start":
 		if len(cfg.LLM.GenerateTaskCommandStart) == 0 {
-			return "(inherits generate_task_command)"
+			return "(inherits task_generate_command)"
 		}
 		return JoinCommand(cfg.LLM.GenerateTaskCommandStart)
-	case "llm.generate_task_timeout_seconds":
+	case "llm.task_generate_timeout_seconds":
 		if cfg.LLM.GenerateTaskTimeoutSeconds <= 0 {
 			return "(inherits timeout_seconds)"
 		}
@@ -1029,26 +1029,26 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			// use time (domain.ApplyRewriteFallback).
 			cfg.LLM.RewriteFallbackTemplate = value
 			return nil
-		case "llm.generate_task_command":
+		case "llm.task_generate_command":
 			argv, err := SplitCommand(value)
 			if err != nil {
-				return fmt.Errorf("llm.generate_task_command: %w", err)
+				return fmt.Errorf("llm.task_generate_command: %w", err)
 			}
 			cfg.LLM.GenerateTaskCommand = argv // empty disables idle task suggestion
 			return nil
-		case "llm.generate_task_command_start":
+		case "llm.task_generate_command_start":
 			argv, err := SplitCommand(value)
 			if err != nil {
-				return fmt.Errorf("llm.generate_task_command_start: %w", err)
+				return fmt.Errorf("llm.task_generate_command_start: %w", err)
 			}
-			cfg.LLM.GenerateTaskCommandStart = argv // empty inherits llm.generate_task_command
+			cfg.LLM.GenerateTaskCommandStart = argv // empty inherits llm.task_generate_command
 			return nil
-		case "llm.generate_task_timeout_seconds":
+		case "llm.task_generate_timeout_seconds":
 			// 0 inherits timeout_seconds at use time (GenerateTaskTimeout());
 			// a positive value bounds one task-generation run. Reject negatives.
 			v, err := strconv.Atoi(value)
 			if err != nil || v < 0 {
-				return fmt.Errorf("llm.generate_task_timeout_seconds must be a non-negative integer (0 = inherit timeout_seconds), got %q", value)
+				return fmt.Errorf("llm.task_generate_timeout_seconds must be a non-negative integer (0 = inherit timeout_seconds), got %q", value)
 			}
 			cfg.LLM.GenerateTaskTimeoutSeconds = v
 			return nil

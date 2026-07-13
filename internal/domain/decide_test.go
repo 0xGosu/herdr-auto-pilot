@@ -317,13 +317,13 @@ func TestNoHistoryConsultsLLMWhenConfigured(t *testing.T) {
 
 func TestIdleGeneratesTaskWhenConfigured(t *testing.T) {
 	// FR-011 relaxation: idle with no task source generates a suggestion when
-	// llm.generate_task_command is configured, instead of escalating.
+	// llm.task_generate_command is configured, instead of escalating.
 	in := baseInput(SituationIdle)
 	in.Situation.Content = "Task is complete."
 	in.GenerateTaskConfigured = true
 	d := Decide(in)
 	if d.Action != ActionGenerateTask {
-		t.Fatalf("idle with no task source and generate_task_command should generate a task, got %+v", d)
+		t.Fatalf("idle with no task source and task_generate_command should generate a task, got %+v", d)
 	}
 }
 
@@ -334,7 +334,7 @@ func TestIdleNoTaskSourceStillEscalatesWithoutGenerateConfig(t *testing.T) {
 	in.LLMConfigured = true // consult being configured must not relax idle
 	d := Decide(in)
 	if d.Action != ActionEscalate || d.Reason != ReasonNoTaskSource {
-		t.Fatalf("idle with no task source and no generate_task_command must escalate, got %+v", d)
+		t.Fatalf("idle with no task source and no task_generate_command must escalate, got %+v", d)
 	}
 }
 

@@ -80,7 +80,7 @@ const (
 	ActionConsult  ActionKind = "consult_llm"
 	ActionKindNoop ActionKind = "noop" // deliberately do nothing (learned no-op)
 	// ActionGenerateTask: an idle agent with no task source triggers a
-	// one-shot LLM task suggestion (llm.generate_task_command). The result is
+	// one-shot LLM task suggestion (llm.task_generate_command). The result is
 	// surfaced as an escalation, never auto-acted (FR-011 relaxation).
 	ActionGenerateTask ActionKind = "generate_task"
 )
@@ -127,6 +127,11 @@ const (
 	// produced no usable task. The failure rationale is surfaced and the
 	// escalation is retryable (like a failed consult).
 	ReasonTaskGenFailed EscalateReason = "task_gen_failed"
+	// ReasonLLMDeclinedTask: the pre-send LLM review of a declared task-source
+	// task returned @noop — the LLM judged the proposed task should not be sent
+	// now given the pane. The proposed task is surfaced for the operator to
+	// confirm-and-send or dismiss.
+	ReasonLLMDeclinedTask EscalateReason = "llm_declined_task"
 )
 
 // Decision is the outcome of the pure decision core for one situation.
@@ -285,6 +290,15 @@ type LLMRequest struct {
 	// selecting llm.command_start when configured. Transient: it drives adapter
 	// template selection and is not persisted with the staged request.
 	First bool
+	// TaskReview marks this consult as a pre-send review of a declared task
+	// (not an answer to a pane prompt): the LLM decides whether the proposed
+	// task should be sent to the idle agent now. Transient; drives the decline
+	// handling in handleLLMOutcome.
+	TaskReview bool
+	// ProposedTask is the rendered outbound prompt under review when
+	// TaskReview is set, surfaced verbatim if the LLM declines so the operator
+	// can confirm-and-send it. Transient.
+	ProposedTask string
 }
 
 // LLMRetry is a front-end-written request to re-invoke the LLM on an

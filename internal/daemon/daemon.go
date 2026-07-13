@@ -119,7 +119,7 @@ type Daemon struct {
 	firstConsult map[string]bool
 	firstRewrite map[string]bool
 	// firstTaskGen marks agents whose first idle task generation has fired, so
-	// the first one can use generate_task_command_start. Same keying/semantics
+	// the first one can use task_generate_command_start. Same keying/semantics
 	// as firstConsult/firstRewrite; guarded by mu.
 	firstTaskGen map[string]bool
 
@@ -155,6 +155,17 @@ type Daemon struct {
 	// workspace matching; refreshed after workspaceCacheTTL.
 	wsNames   map[string]string
 	wsNamesAt time.Time
+
+	// paneCwds caches per-pane working directory for the {cwd} placeholder in
+	// next_task_template; declaredTask runs on the main loop and must not shell
+	// out to `pane get` on every event. Entries expire after workspaceCacheTTL.
+	paneCwds map[string]paneCwdEntry
+}
+
+// paneCwdEntry is one cached pane working directory with its capture time.
+type paneCwdEntry struct {
+	cwd string
+	at  time.Time
 }
 
 type llmOutcome struct {
@@ -244,6 +255,7 @@ func New(opt Options) (*Daemon, error) {
 		rewriteInFlight: map[string]rewriteFlight{},
 		sweepInFlight:   map[string]bool{},
 		snapshotSaved:   map[string]bool{},
+		paneCwds:        map[string]paneCwdEntry{},
 		embedder:        opt.Embedder,
 	}
 	if opt.MatchIndexDir != "" {
@@ -855,6 +867,29 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 			domain.IrreversibleScanContent(situation, declaredPrompt))
 	}
 
+	// Pre-send LLM review of a determined declared task (opt-out per source via
+	// llm_review=false): when an LLM command is configured, the LLM — not
+	// shadow-mode graduation — decides whether this task should be sent to the
+	// idle agent now, seeing the live pane through get_context. A decline
+	// escalates to the operator; an approval is still re-gated in
+	// handleLLMOutcome. The fail-safe pre-checks (killed / never-auto /
+	// suspected-irreversible) escalate normally instead of spending a consult.
+	if situation.Type == domain.SituationIdle && declared != nil &&
+		declared.Task != domain.NoTaskContent && declared.LLMReview &&
+		!killActive && !allowMatched && !suspected &&
+		d.llmPort() != nil && d.llmPort().Configured() {
+		// A matching escalation already awaiting the operator (e.g. a prior
+		// decline of this same task) means the situation is handled: don't
+		// re-consult the LLM (a wasted, token-spending review) and don't fall
+		// through to a non-reviewed send — ignore the duplicate event.
+		if d.duplicatePendingEscalation(ctx, situation) {
+			d.ignoreDuplicate(ctx, situation, tr, now)
+			return
+		}
+		d.consultDeclaredTask(ctx, cfg, situation, sig, tr, declared, now)
+		return
+	}
+
 	in := domain.DecideInput{
 		Situation:   situation,
 		Signature:   sig,
@@ -1249,7 +1284,63 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 				agentName = ""
 			}
 			req.AgentName = agentName
-			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName))
+			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, ""))
+			if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
+				return fmt.Errorf("staging LLM request failed: %w", err)
+			}
+			outcome.request = req
+			decision, err := llm.Consult(ctx, req)
+			outcome.decision = decision
+			return err
+		})
+		outcome.err = err
+		select {
+		case d.llmResults <- outcome:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+// consultDeclaredTask reviews a determined declared task before sending: it
+// consults the operator's LLM (the same command + get_context/submit_decision
+// MCP round-trip as consultLLM) with the proposed task in context, and funnels
+// the result through the shared handleLLMOutcome so every safety re-gate still
+// applies. An approval is delivered (subject to the confidence gate); a decline
+// (@noop) is escalated to the operator in handleLLMOutcome. Runs the context
+// assembly + spawn in a goroutine so the herdr CLI reads never stall the loop.
+func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s domain.Situation,
+	sig domain.SignatureResult, tr domain.AgentTransition, declared *domain.DeclaredTask, now time.Time) {
+
+	llm := d.llmPort()
+	// Don't stack a review onto a consult already in flight for this agent —
+	// the same guard the generate-task path uses.
+	if pending, err := d.opt.Store.HasPendingLLMConsult(ctx, s.AgentID); err != nil {
+		slog.Error("task-review: pending check failed", "agent", s.AgentID, "error", err)
+		return
+	} else if pending {
+		slog.Info("task-review skipped: consult already in flight", "agent", s.AgentID)
+		return
+	}
+
+	proposed := declared.Prompt()
+	// A review consults the operator's command, but the priming/first-consult
+	// variant is meant for answering pane prompts, not task review — always use
+	// the base command so First stays false here.
+	req := domain.LLMRequest{
+		RequestID: fmt.Sprintf("taskreview-%s-%d", s.AgentID, now.UnixNano()),
+		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
+		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
+		TaskReview: true, ProposedTask: proposed,
+	}
+	go func() {
+		outcome := llmOutcome{situation: s, sig: sig, request: req}
+		err := logging.Guard("llm-task-review", func() error {
+			agentName, nerr := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
+			if nerr != nil {
+				agentName = ""
+			}
+			req.AgentName = agentName
+			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, proposed))
 			if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
 				return fmt.Errorf("staging LLM request failed: %w", err)
 			}
@@ -1299,7 +1390,7 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 		return
 	}
 
-	// The first generation for this agent selects generate_task_command_start
+	// The first generation for this agent selects task_generate_command_start
 	// (when configured); mark it consumed on the main loop, before the goroutine.
 	d.mu.Lock()
 	first := !d.firstTaskGen[s.AgentID]
@@ -1432,7 +1523,11 @@ func (d *Daemon) agentNotCleanlyIdle(ctx context.Context, agentID string) bool {
 // consultContext builds the JSON context handed to the LLM CLI via the
 // get_context MCP tool: the classified situation, a pane excerpt, the
 // agent's herdr location, and the pane working directory.
-func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation, agentName string) []byte {
+// consultContext builds the get_context blob for one consult. proposedTask is
+// non-empty only for a pre-send declared-task review: it carries the rendered
+// task under review, exposed as "proposed_task" with an answer_format that
+// frames submit_decision as send (recommend_action) vs. decline (@noop).
+func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation, agentName, proposedTask string) []byte {
 	excerpt := d.paneExcerpt(ctx, cfg, s)
 
 	// Pane location and cwd come from `pane get`; degrade to empty values
@@ -1482,6 +1577,13 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		fields["answer_format"] = "answer with submit_decision select_options: a one-element list with the 1-based number of the chosen option, e.g. [2]"
 	} else if s.Type == domain.SituationApproval || s.Type == domain.SituationChoice {
 		fields["answer_format"] = "no numbered options were detected on the pane: answer with submit_decision recommend_action — the literal text the prompt expects (e.g. \"y\" for a y/n confirmation)"
+	}
+	// Pre-send declared-task review: the agent is idle with a next task queued.
+	// Ask the LLM to judge, from the pane, whether sending it now is right —
+	// send it (recommend_action, edited if warranted) or decline (@noop).
+	if proposedTask != "" {
+		fields["proposed_task"] = proposedTask
+		fields["answer_format"] = "this idle agent has a next task ready to send (see proposed_task); decide from the pane whether sending it now is appropriate. To send it, submit_decision recommend_action with the task text (lightly edit it only if the pane clearly requires it). To decline — the agent is still busy, the task is already done, or the pane shows it should not run now — submit_decision recommend_action \"@noop\" with a one-sentence rationale; a decline is surfaced to the operator, never sent silently"
 	}
 	contextJSON, _ := json.Marshal(fields)
 	return contextJSON
@@ -1804,6 +1906,27 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		}, tr, now)
 	}
 
+	// A declined task review (@noop) does not mean "do nothing" — it means the
+	// LLM judged the queued declared task should not be sent now. Surface the
+	// proposed task to the operator (confirm-and-send or dismiss) with the
+	// LLM's reasoning, rather than promoting a silent noop.
+	if res.request.TaskReview && isNoop {
+		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
+		why := strings.TrimSpace(llmDec.Rationale)
+		if why == "" {
+			why = "LLM declined to send the next declared task"
+		}
+		if llmDec.ConfidentScore >= 0 {
+			why += fmt.Sprintf("; llm confidence %d/100", llmDec.ConfidentScore)
+		}
+		d.escalate(ctx, s, res.sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonLLMDeclinedTask,
+			Rationale:  why,
+			Suggestion: "LLM suggested: " + res.request.ProposedTask,
+		}, tr, now)
+		return
+	}
+
 	// Re-gate: kill switch, never-auto patterns, heuristic, rate — the LLM can never
 	// bypass safety controls.
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
@@ -1896,9 +2019,14 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(domain.ReasonPersistenceFailed, err.Error())
 		return
 	}
-	if conf := domain.Confidence(history); conf.TopAction != "" && conf.TopAction != llmDec.Action {
-		reject(domain.ReasonVarianceGuard, "LLM contradicts history")
-		return
+	// The variance guard compares the LLM's action to the signature's dominant
+	// learned action; it does not apply to a declared-task review, whose action
+	// is novel task text (each task differs) rather than a repeated answer.
+	if !res.request.TaskReview {
+		if conf := domain.Confidence(history); conf.TopAction != "" && conf.TopAction != llmDec.Action {
+			reject(domain.ReasonVarianceGuard, "LLM contradicts history")
+			return
+		}
 	}
 
 	if isNoop {
@@ -2335,13 +2463,28 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 			slog.Warn("task source unreadable", "path", src.Path, "error", err)
 			continue
 		}
+		// Resolve cwd only when the template references it (the common case
+		// does not), keeping the main-loop `pane get` shell-out off the hot
+		// path; a source opts out of the pre-send LLM review with
+		// llm_review=false (nil = the default, on).
+		build := func(task string) *domain.DeclaredTask {
+			cwd := ""
+			if strings.Contains(src.NextTaskTemplate, "{cwd}") {
+				cwd = d.paneCwd(ctx, tr.PaneID)
+			}
+			return &domain.DeclaredTask{
+				Task: task, Path: src.Path, Template: src.NextTaskTemplate,
+				AgentName: agentName, Cwd: cwd,
+				LLMReview: src.LLMReview == nil || *src.LLMReview,
+			}
+		}
 		if task := domain.NextDeclaredTask(string(data)); task != "" {
-			return &domain.DeclaredTask{Task: task, Path: src.Path, Template: src.NextTaskTemplate, AgentName: agentName}
+			return build(task)
 		}
 		// Only a real checklist with every item checked counts as completed;
 		// an empty or non-checklist file must not suppress tier-2 inference.
 		if completed == nil && domain.HasChecklistItems(string(data)) {
-			completed = &domain.DeclaredTask{Task: domain.NoTaskContent, Path: src.Path, Template: src.NextTaskTemplate, AgentName: agentName}
+			completed = build(domain.NoTaskContent)
 		}
 	}
 	return completed
@@ -2391,6 +2534,40 @@ func (d *Daemon) workspaceName(ctx context.Context, workspaceID string) string {
 		d.mu.Unlock()
 	}
 	return names[workspaceID]
+}
+
+// paneCwd resolves a pane's working directory (foreground cwd, falling back to
+// the shell cwd) for the {cwd} placeholder in next_task_template. It caches per
+// pane for workspaceCacheTTL so declaredTask — which runs on the main loop —
+// never shells out to `pane get` on every event; a deleted-directory suffix
+// ("/path (deleted)") is left as herdr reports it. Returns "" when the Herdr
+// port has no inspector surface or the read fails.
+func (d *Daemon) paneCwd(ctx context.Context, paneID string) string {
+	if paneID == "" {
+		return ""
+	}
+	now := d.opt.Clock.Now()
+	d.mu.RLock()
+	entry, ok := d.paneCwds[paneID]
+	d.mu.RUnlock()
+	if ok && now.Sub(entry.at) <= workspaceCacheTTL {
+		return entry.cwd
+	}
+	cwd := ""
+	if insp, isInsp := d.opt.Herdr.(ports.InspectorPort); isInsp {
+		if pi, err := insp.PaneInfo(ctx, paneID); err == nil {
+			cwd = pi.ForegroundCwd
+			if cwd == "" {
+				cwd = pi.Cwd
+			}
+		} else {
+			slog.Warn("pane cwd for next-task template failed", "pane", paneID, "error", err)
+		}
+	}
+	d.mu.Lock()
+	d.paneCwds[paneID] = paneCwdEntry{cwd: cwd, at: now}
+	d.mu.Unlock()
+	return cwd
 }
 
 func (d *Daemon) audit(ctx context.Context, rec domain.AuditRecord) {

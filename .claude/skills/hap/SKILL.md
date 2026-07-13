@@ -411,8 +411,11 @@ Your next task is {next_task_content}. Read the full tasks list at {task_list_pa
 - `{next_task_content}` — the text of the next unchecked item (or `"none"` when the list is complete)
 - `{task_list_path}` — absolute path to the checklist file
 - `{agent_name}` — the agent's hap-owned short name
+- `{cwd}` — the agent's working directory (the project it is in)
 
 when every item is checked off, the prompt is still sent with `{next_task_content} = "none"`, so the template can steer what an idle agent does when the list is done.
+
+when an `[llm].command` is configured, each determined task is first reviewed by the llm before it is sent: via the `get_context`/`submit_decision` mcp tools it sees the live pane plus the queued task (`proposed_task`) and either sends it (re-gated like any consult, so the default confidence threshold surfaces it for confirmation) or declines with `@noop`, which escalates the task to the operator. this review is on by default; set `llm_review = false` on a `[[task_sources]]` entry (in `config.toml`) to opt that source out.
 
 without a declared task source, the plugin falls back to inferring the next task from the agent's own native todo rendering (currently only `claude` agent type is supported for inference). other agent types skip inference and escalate.
 

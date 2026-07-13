@@ -112,6 +112,35 @@ func TestSaveRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTaskSourceLLMReviewParsing(t *testing.T) {
+	// llm_review is opt-out: unset stays nil (the daemon treats nil as on),
+	// and an explicit false is preserved so a source can opt out.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte(`
+[[task_sources]]
+agent = "a1"
+path = "/tmp/one.md"
+
+[[task_sources]]
+agent = "a2"
+path = "/tmp/two.md"
+llm_review = false
+`), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Fatalf("want 2 task sources, got %d", len(cfg.TaskSources))
+	}
+	if cfg.TaskSources[0].LLMReview != nil {
+		t.Errorf("unset llm_review should stay nil (default on), got %v", *cfg.TaskSources[0].LLMReview)
+	}
+	if cfg.TaskSources[1].LLMReview == nil || *cfg.TaskSources[1].LLMReview {
+		t.Errorf("explicit llm_review=false should parse as a non-nil false, got %v", cfg.TaskSources[1].LLMReview)
+	}
+}
+
 func TestLoadAgentScopedIndicatorRules(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	os.WriteFile(path, []byte(`
@@ -502,7 +531,7 @@ func TestGenerateTaskConfigKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(cfg.LLM.GenerateTaskCommand) != 0 {
-		t.Errorf("generate_task_command should default empty, got %v", cfg.LLM.GenerateTaskCommand)
+		t.Errorf("task_generate_command should default empty, got %v", cfg.LLM.GenerateTaskCommand)
 	}
 	if cfg.LLM.GenerateTaskTimeoutSeconds != 0 {
 		t.Errorf("omitted generate-task timeout should stay 0 (inherit at use time), got %d", cfg.LLM.GenerateTaskTimeoutSeconds)
@@ -534,18 +563,18 @@ func TestGenerateTaskConfigKeys(t *testing.T) {
 	// Explicit values are honored verbatim and survive a round trip.
 	os.WriteFile(path, []byte(`[llm]
 timeout_seconds = 120
-generate_task_command = ["claude", "-p", "suggest a task for {agent_name}"]
-generate_task_command_start = ["claude", "-p", "first task for {agent_name}"]
-generate_task_timeout_seconds = 45
+task_generate_command = ["claude", "-p", "suggest a task for {agent_name}"]
+task_generate_command_start = ["claude", "-p", "first task for {agent_name}"]
+task_generate_timeout_seconds = 45
 `), 0o600)
 	if cfg, err = Load(path); err != nil {
 		t.Fatal(err)
 	}
 	if len(cfg.LLM.GenerateTaskCommand) != 3 || cfg.LLM.GenerateTaskCommand[2] != "suggest a task for {agent_name}" {
-		t.Errorf("generate_task_command lost: %v", cfg.LLM.GenerateTaskCommand)
+		t.Errorf("task_generate_command lost: %v", cfg.LLM.GenerateTaskCommand)
 	}
 	if len(cfg.LLM.GenerateTaskCommandStart) != 3 {
-		t.Errorf("generate_task_command_start lost: %v", cfg.LLM.GenerateTaskCommandStart)
+		t.Errorf("task_generate_command_start lost: %v", cfg.LLM.GenerateTaskCommandStart)
 	}
 	if cfg.LLM.GenerateTaskTimeoutSeconds != 45 || cfg.GenerateTaskTimeout() != 45*time.Second {
 		t.Errorf("explicit generate-task timeout lost: raw=%d effective=%v",

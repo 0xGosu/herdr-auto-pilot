@@ -107,7 +107,7 @@ type RewriterPort interface {
 
 // TaskGeneratorPort is an optional capability of the LLM adapter: a one-shot
 // task suggestion for an idle agent with no task source
-// (llm.generate_task_command). Like Rewrite, the suggested task is the
+// (llm.task_generate_command). Like Rewrite, the suggested task is the
 // subprocess's stdout. Callers type-assert and degrade gracefully when absent.
 type TaskGeneratorPort interface {
 	// GenerateTask runs the configured generate-task CLI and returns the

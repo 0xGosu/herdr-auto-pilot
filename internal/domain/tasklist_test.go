@@ -80,6 +80,25 @@ func TestDeclaredTaskPrompt(t *testing.T) {
 			},
 			want: "calm-lynx: print {agent_name}",
 		},
+		{
+			name: "cwd substituted",
+			task: DeclaredTask{
+				Task:     "build the widget",
+				Path:     "/docs/tasks.md",
+				Template: "In {cwd}: {next_task_content}",
+				Cwd:      "/home/op/widgets",
+			},
+			want: "In /home/op/widgets: build the widget",
+		},
+		{
+			name: "unset cwd renders empty",
+			task: DeclaredTask{
+				Task:     "build the widget",
+				Path:     "/p",
+				Template: "[{cwd}] {next_task_content}",
+			},
+			want: "[] build the widget",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

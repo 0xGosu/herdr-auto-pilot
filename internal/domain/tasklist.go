@@ -15,7 +15,8 @@ var checkedItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[[xX+\-*]\]\s*(.+)$`)
 // DefaultNextTaskTemplate is the prompt template used when a task source
 // declares none. Placeholders: {next_task_content} is the next unchecked
 // item (or NoTaskContent when the list is complete), {task_list_path} is
-// the task-source file path, {agent_name} is the agent's short name.
+// the task-source file path, {agent_name} is the agent's short name, {cwd}
+// is the agent's working directory (the project it is in).
 const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."
 
 // NoTaskContent is the {next_task_content} value when a declared list has
@@ -31,10 +32,16 @@ type DeclaredTask struct {
 	Path      string // task-source file path
 	Template  string // operator template; "" uses DefaultNextTaskTemplate
 	AgentName string // agent short name, for {agent_name}
+	Cwd       string // agent working directory, for {cwd}
+	// LLMReview reports whether the source opted in to the pre-send LLM review
+	// gate (default: on; a source sets llm_review=false to opt out). The
+	// runtime "is an LLM command configured" check stays at the daemon call
+	// site — this flag carries only the source's declared preference.
+	LLMReview bool
 }
 
 // Prompt renders the outbound prompt from the source's template. A single
-// pass substitutes both placeholders, so placeholder-like text inside the
+// pass substitutes every placeholder, so placeholder-like text inside the
 // task content or path is never re-expanded.
 func (t DeclaredTask) Prompt() string {
 	tpl := t.Template
@@ -45,6 +52,7 @@ func (t DeclaredTask) Prompt() string {
 		"{next_task_content}", t.Task,
 		"{task_list_path}", t.Path,
 		"{agent_name}", t.AgentName,
+		"{cwd}", t.Cwd,
 	).Replace(tpl)
 }
 

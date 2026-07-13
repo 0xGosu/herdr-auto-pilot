@@ -337,7 +337,7 @@ error = "#ff5f5f"
 # unchecked item. Without a declared source, the plugin falls back to
 # inferring the next task from the agent's own native todo rendering — never
 # free-form prose — held to the higher inferred_task_bar. If neither source
-# exists, an optional llm.generate_task_command can propose tasks for you to
+# exists, an optional llm.task_generate_command can propose tasks for you to
 # approve. Inference is agent-type-specific: currently only `claude` is
 # supported (Claude Code's ✔/■/□ todo widget; the in-progress item wins,
 # else the first
@@ -353,8 +353,12 @@ agent = "brave-otter" # agent short name, pane id, or type ("" = any)
 workspace = ""        # workspace name; "" or "*" = any, "*" wildcards work
                       # ("codex-*" = starts with, "*-vscode3" = ends with)
 path = "/home/me/project/docs/tasks.md"
-# Optional per-source prompt format ({next_task_content}, {task_list_path}, {agent_name}):
+# Optional per-source prompt format ({next_task_content}, {task_list_path}, {agent_name}, {cwd}):
 next_task_template = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}. Verify task dependencies before starting. When there is no task available, focus on improving the test coverage of this project."
+# When an [llm].command is configured, each determined task is first reviewed by
+# the LLM before it is sent (see "Reviewing tasks before they are sent" below).
+# Default: on. Opt this source out with:
+# llm_review = false
 ```
 
 ### Agent short names
@@ -379,7 +383,7 @@ bin/hap task-source --agent backend-dev --template 'Do this next: {next_task_con
 ### Suggesting tasks when no source exists (optional)
 
 If an idle agent has neither a matching `[[task_sources]]` entry nor an
-inferable native todo, `llm.generate_task_command` can run a one-shot local
+inferable native todo, `llm.task_generate_command` can run a one-shot local
 CLI to propose one or more next tasks. This is opt-in: without the command,
 the safe default remains a `no_task_source` escalation and hap invents
 nothing.
@@ -396,19 +400,44 @@ gained a task source in the meantime.
 
 ```toml
 [llm]
-generate_task_command = [
+task_generate_command = [
   "claude", "-p",
   "Suggest concrete next tasks, most important first. Reply with only the tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
   "--model", "haiku",
 ]
 # Optional first generation for each agent this daemon lifetime:
-# generate_task_command_start = [ ... ]
-# generate_task_timeout_seconds = 60  # omitted: inherits timeout_seconds
+# task_generate_command_start = [ ... ]
+# task_generate_timeout_seconds = 60  # omitted: inherits timeout_seconds
 ```
 
 Available placeholders are `{self}`, `{agent_name}`, `{agent_type}`,
 `{pane_excerpt}`, and `{cwd}`. The first-generation state is tracked
-independently from LLM consults and rewrites.
+independently from LLM consults and rewrites. (These keys were renamed from
+`generate_task_command*`; the old spellings no longer load, so update an
+existing config.)
+
+### Reviewing tasks before they are sent (optional)
+
+When an `[llm].command` is configured, each task determined from a
+`[[task_sources]]` entry for an idle agent is first **reviewed** by that LLM
+before it is sent. Using the same two MCP tools as an ordinary consult
+(`get_context` / `submit_decision`), the LLM sees the live pane — plus the
+queued task as `proposed_task` — and decides whether sending it now is
+appropriate:
+
+- **Send** — `submit_decision` with `recommend_action` set to the task text
+  (lightly edited only if the pane requires it). The send is re-gated by the
+  same safety controls and `auto_act_confidence_threshold` as any consult, so
+  with the default threshold it is surfaced for you to confirm rather than sent
+  autonomously; lower the threshold to let approvals auto-send.
+- **Decline** — `submit_decision` with `recommend_action` `@noop` (the agent is
+  still busy, the task is already done, or the pane shows it should not run).
+  The task is escalated to you (never dropped silently), and you can confirm-
+  and-send or dismiss it.
+
+This is **on by default** whenever the LLM command exists; set
+`llm_review = false` on a `[[task_sources]]` entry to keep the plain
+declared-task flow for that source.
 
 ### Never-auto patterns
 
@@ -432,13 +461,13 @@ or `hap rules add '<regex>'` / `rules remove <index>`, or press `a`/`x` on
 the TUI's *Config* tab — which also lists the supported scalar config fields,
 adds/removes task sources (`t`/`x`), and clears learned data (`X`).
 Simple fields — numbers, booleans, and the `tui.theme` enum, including
-`llm.pane_excerpt_chars`, `llm.generate_task_timeout_seconds`,
+`llm.pane_excerpt_chars`, `llm.task_generate_timeout_seconds`,
 `embedding.model_context_window`, `safety.disable_seed`, and
 `tui.max_content_width` — edit inline (`enter`) or via
 `hap config set <key> <value>`. Free-text fields (`llm.command`,
 `llm.command_start`, `llm.rewrite_command`, `llm.rewrite_command_start`,
-`llm.rewrite_fallback_template`, `llm.generate_task_command`,
-`llm.generate_task_command_start`, `embedding.model_path`) show read-only in
+`llm.rewrite_fallback_template`, `llm.task_generate_command`,
+`llm.task_generate_command_start`, `embedding.model_path`) show read-only in
 the TUI, because a one-line
 prompt mangles quoted argv values — edit them in `config.toml` or with
 `config set`, which accepts every listed scalar key. The safety indicator
