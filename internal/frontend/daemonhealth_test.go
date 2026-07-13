@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,48 @@ func appWithDaemon(t *testing.T, running bool, pid int, ver string) *App {
 	return &App{
 		StateDir:   dir,
 		DaemonInfo: func() (bool, int, string) { return running, pid, ver },
+	}
+}
+
+func TestDaemonStderrTail(t *testing.T) {
+	app := appWithDaemon(t, false, 0, "")
+
+	// No file yet: the path is still returned, tail empty, no error (#83).
+	path, tail := app.DaemonStderrTail()
+	if path == "" {
+		t.Fatal("expected a stderr log path even before the file exists")
+	}
+	if tail != "" {
+		t.Errorf("absent file should yield empty tail, got %q", tail)
+	}
+
+	// Captured output: the tail is returned right-trimmed.
+	if err := os.WriteFile(path, []byte("GGML_ASSERT(i01 < ne01) failed\nggml_abort\n\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, tail = app.DaemonStderrTail(); !strings.Contains(tail, "GGML_ASSERT") {
+		t.Errorf("tail missing the crash reason: %q", tail)
+	}
+	if strings.HasSuffix(tail, "\n") {
+		t.Errorf("tail should be right-trimmed, got %q", tail)
+	}
+
+	// Oversized log: only the last maxStderrTailBytes are read, keeping the end.
+	big := strings.Repeat("x", maxStderrTailBytes) + "TAIL-MARKER"
+	if err := os.WriteFile(path, []byte(big), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, tail = app.DaemonStderrTail()
+	if !strings.HasSuffix(tail, "TAIL-MARKER") {
+		t.Errorf("oversized tail should keep the end marker")
+	}
+	if len(tail) > maxStderrTailBytes {
+		t.Errorf("tail = %d bytes, want <= %d", len(tail), maxStderrTailBytes)
+	}
+
+	// No StateDir configured: empty path and tail (no panic).
+	if p, tl := (&App{}).DaemonStderrTail(); p != "" || tl != "" {
+		t.Errorf("no StateDir should yield empty, got (%q, %q)", p, tl)
 	}
 }
 

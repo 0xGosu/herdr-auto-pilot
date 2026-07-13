@@ -2,12 +2,20 @@ package frontend
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 )
+
+// maxStderrTailBytes bounds how much of the captured daemon stderr a front-end
+// pulls into memory for the post-mortem detail view — a native abort dumps a
+// backtrace, but the reason line is near the end, so the tail is what matters.
+const maxStderrTailBytes = 16 << 10 // 16 KiB
 
 // DaemonSeverity ranks daemon health for front-ends that surface a single
 // banner (the TUI) or an exit code (the CLI).
@@ -149,6 +157,33 @@ func (h DaemonHealth) Banner() string {
 	default:
 		return ""
 	}
+}
+
+// DaemonStderrTail returns the tail of the daemon's captured stderr log (the
+// native-crash reason a hung/crash-looping daemon leaves behind, e.g. the #82
+// GGML_ASSERT) and the log's path. The banner names the path; this makes the
+// content reachable in-app (#83). It never errors — an empty StateDir, absent
+// file, or read failure degrades to empty tail, mirroring AssessDaemonHealth.
+func (a *App) DaemonStderrTail() (path, tail string) {
+	if a.StateDir == "" {
+		return "", ""
+	}
+	path = daemonhealth.StderrLogPath(a.StateDir)
+	f, err := os.Open(path)
+	if err != nil {
+		return path, ""
+	}
+	defer f.Close()
+	if fi, statErr := f.Stat(); statErr == nil && fi.Size() > maxStderrTailBytes {
+		// Seek to the last maxStderrTailBytes; a partial first line is
+		// acceptable for a post-mortem tail.
+		_, _ = f.Seek(-maxStderrTailBytes, io.SeekEnd)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return path, ""
+	}
+	return path, strings.TrimRight(string(data), "\n \t")
 }
 
 // formatAge renders a heartbeat age compactly ("45s", "2m0s").
