@@ -45,7 +45,7 @@ func (d *Daemon) sweepAllowed(ctx context.Context, s domain.Situation) bool {
 		return false
 	}
 	_, allow, _ := d.snapshot()
-	if _, matched := allow.Match(s.Content); matched {
+	if _, matched := allow.Match(domain.IrreversibleScanContent(s, "")); matched {
 		return false
 	}
 	return true
