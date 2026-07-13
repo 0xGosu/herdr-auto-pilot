@@ -1040,6 +1040,26 @@ func (s *Store) PendingEscalations(ctx context.Context) ([]domain.AuditRecord, e
 	return s.scanAudits(rows)
 }
 
+// DuplicatePendingEscalation reports whether an unresolved escalation already
+// exists for the same agent + agent type + situation type + exact pane content.
+// It backs the daemon's live-event dedup: a fresh transition whose captured
+// situation matches an escalation still awaiting the user is a duplicate and is
+// ignored. Cheaper than PendingEscalations — it never materializes the
+// (pane-excerpt-heavy) rows. The caller must pass the pane excerpt already
+// truncated the same way escalate() stores it, so the comparison lines up.
+func (s *Store) DuplicatePendingEscalation(ctx context.Context, agentID, agentType string,
+	sitType domain.SituationType, paneExcerpt string) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM audit_log WHERE status = 'escalated'
+			AND agent_id = ? AND agent_type = ? AND situation_type = ? AND pane_excerpt = ?)`,
+		agentID, agentType, string(sitType), paneExcerpt).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists != 0, nil
+}
+
 // UnprocessedCorrections returns corrections the daemon has not consumed.
 func (s *Store) UnprocessedCorrections(ctx context.Context) ([]domain.CorrectionRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
