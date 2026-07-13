@@ -14,6 +14,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
@@ -121,6 +122,55 @@ func TestStatusIgnoresStaleHealthFromDeadInstance(t *testing.T) {
 	}
 	if !strings.Contains(out, "running "+buildinfo.Version+" (pid 4242)") {
 		t.Errorf("should fall back to a healthy running line, got:\n%s", out)
+	}
+}
+
+func TestStatusEmbeddingAutoDisabledByBreaker(t *testing.T) {
+	app, _ := testApp(t)
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, buildinfo.Version }
+	// A running daemon (fresh heartbeat) with the embedder auto-disabled.
+	if err := daemonhealth.Write(stateDir, daemonhealth.Health{
+		PID: 4242, Version: buildinfo.Version, HeartbeatAt: time.Now(),
+		Embedder: daemonhealth.EmbedderDisabled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := crashguard.Write(stateDir, crashguard.State{
+		EmbeddingOff: true, ConfigDigest: "cfg", Reason: "auto-disabled after a crash-loop",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "status")
+	// Auto-disabled embedding is a working BM25 fallback, not an unhealthy exit.
+	if err != nil {
+		t.Fatalf("auto-disabled embedding is a working fallback, not unhealthy; got err=%v", err)
+	}
+	if !strings.Contains(out, "AUTO-DISABLED by crash-loop breaker") {
+		t.Errorf("must surface the embedder auto-disable, got:\n%s", out)
+	}
+}
+
+func TestStatusCrashLoopGaveUpUnhealthy(t *testing.T) {
+	app, _ := testApp(t)
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	// The breaker gave up → the daemon is NOT running (respawns suppressed).
+	app.DaemonInfo = func() (bool, int, string) { return false, 0, "" }
+	if err := crashguard.Write(stateDir, crashguard.State{
+		GaveUp: true, ConfigDigest: "cfg", Reason: "crash-looping even with the embedder disabled",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "status")
+	if !errors.Is(err, cli.ErrUnhealthy) {
+		t.Fatalf("a crash-loop give-up must exit non-zero, got err=%v", err)
+	}
+	if !strings.Contains(out, "NOT STARTING") || !strings.Contains(out, "gave up") {
+		t.Errorf("must explain the daemon is not starting due to the breaker, got:\n%s", out)
 	}
 }
 
