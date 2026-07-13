@@ -190,6 +190,10 @@ type FrontendStore interface {
 	// recording a correction; the audit row is kept (append-only, FR-020).
 	// Errors when the record is not a pending escalation.
 	DismissEscalation(ctx context.Context, auditID int64) error
+	// ResolveEscalation atomically flips one pending escalation to "resolved",
+	// returning whether it claimed the row (false when already resolved/
+	// dismissed). Callers apply one-time side effects only on a true claim.
+	ResolveEscalation(ctx context.Context, auditID int64) (bool, error)
 	// DismissEscalationsBefore dismisses every pending escalation created
 	// before cutoff, returning how many were dismissed.
 	DismissEscalationsBefore(ctx context.Context, cutoff time.Time) (int64, error)

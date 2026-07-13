@@ -1307,6 +1307,22 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 		slog.Error("marking generate-task request done failed", "request", res.request.RequestID, "error", err)
 	}
 
+	// Staleness: generation took up to its timeout — never surface a suggestion
+	// for an agent that moved on. If the agent STARTED WORKING (its live herdr
+	// status is no longer idle/done), or it now has a matching task source, the
+	// suggestion is moot — drop it instead of leaving a stale, confirmable
+	// escalation. Unknown status (list error / agent absent) falls through and
+	// still surfaces the outcome (fail-safe). The confirm path re-checks too,
+	// since the operator may act minutes later.
+	if d.agentNotCleanlyIdle(ctx, s.AgentID) {
+		slog.Info("generate-task: agent no longer idle; dropping suggestion", "agent", s.AgentID)
+		return
+	}
+	if d.declaredTaskFor(ctx, s) != nil {
+		slog.Info("generate-task: agent now has a task source; dropping suggestion", "agent", s.AgentID)
+		return
+	}
+
 	if res.err != nil || res.task == "" {
 		rationale := "generate-task produced no task"
 		if res.err != nil {
@@ -1327,6 +1343,24 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 		Action: domain.ActionEscalate, Reason: domain.ReasonNoTaskSource,
 		Suggestion: domain.SuggestTaskPrefix + res.task,
 	}, res.tr, now)
+}
+
+// agentNotCleanlyIdle reports whether the agent's LIVE herdr status means it is
+// no longer cleanly idle (see domain.AgentBusy: not idle/done/unknown). It
+// fails closed to false — an unreadable agent list or an absent agent is
+// inconclusive, so the caller does not drop on it. Used to invalidate an idle
+// task suggestion the agent has since moved past.
+func (d *Daemon) agentNotCleanlyIdle(ctx context.Context, agentID string) bool {
+	agents, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		return false
+	}
+	for _, a := range agents {
+		if a.AgentID == agentID {
+			return domain.AgentBusy(a.Status)
+		}
+	}
+	return false
 }
 
 // consultContext builds the JSON context handed to the LLM CLI via the

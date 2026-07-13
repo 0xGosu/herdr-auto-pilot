@@ -1384,6 +1384,36 @@ func TestIdleTaskGenRetryReDrivesGeneration(t *testing.T) {
 	})
 }
 
+func TestIdleTaskGenDropsStaleSuggestion(t *testing.T) {
+	// If the agent starts work while the LLM runs (its live herdr status is no
+	// longer idle when the result returns), the suggestion is DROPPED — never
+	// surfaced, so it can't be confirmed and sent into a busy agent.
+	var h *harness
+	h, tg := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		// Simulate the agent moving on mid-generation.
+		h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-30", PaneID: "agent-30", Status: "working"}})
+		return "Some now-stale task", nil
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	h.push("agent-30", "idle")
+	// The drop path clears the pending row and writes NO audit, so once the
+	// outcome is processed (pending cleared, generator ran) the assertion is
+	// stable.
+	waitFor(t, 3*time.Second, func() bool {
+		pending, _ := h.raw.HasPendingLLMConsult(ctx, "agent-30")
+		return !pending && len(tg.genCalls()) == 1
+	})
+	esc, _ := h.raw.PendingEscalations(ctx)
+	if len(esc) != 0 {
+		t.Errorf("a stale suggestion must not be surfaced, got %d escalations", len(esc))
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("nothing may be sent for a dropped suggestion, got %v", h.herdr.sentInputs())
+	}
+}
+
 func TestErrorRetryCeilingEndToEnd(t *testing.T) {
 	// FR-014: up to 2 automated retries per error signature; 3rd escalates.
 	// A Claude error/retry situation (interrupt prompt) — generic build-log
