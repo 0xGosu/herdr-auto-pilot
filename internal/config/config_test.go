@@ -491,6 +491,79 @@ rewrite_fallback_template = "Do this: {original_text}"
 	}
 }
 
+func TestGenerateTaskConfigKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+
+	// Omitted entirely: command disabled, timeout inherits the consult
+	// timeout (resolved at use time, never materialized into the file).
+	os.WriteFile(path, []byte("[llm]\ncommand = [\"claude\"]\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LLM.GenerateTaskCommand) != 0 {
+		t.Errorf("generate_task_command should default empty, got %v", cfg.LLM.GenerateTaskCommand)
+	}
+	if cfg.LLM.GenerateTaskTimeoutSeconds != 0 {
+		t.Errorf("omitted generate-task timeout should stay 0 (inherit at use time), got %d", cfg.LLM.GenerateTaskTimeoutSeconds)
+	}
+	if cfg.GenerateTaskTimeout() != 60*time.Second {
+		t.Errorf("GenerateTaskTimeout() = %v, want inherited default 60s", cfg.GenerateTaskTimeout())
+	}
+
+	// Omitted timeout inherits a CUSTOM consult timeout, and Save must not
+	// freeze that inheritance into the file.
+	os.WriteFile(path, []byte("[llm]\ntimeout_seconds = 120\n"), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GenerateTaskTimeout() != 120*time.Second {
+		t.Errorf("GenerateTaskTimeout() = %v, want inherited 120s", cfg.GenerateTaskTimeout())
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.GenerateTaskTimeoutSeconds != 0 || cfg.GenerateTaskTimeout() != 120*time.Second {
+		t.Errorf("Save must not freeze the inherited timeout: raw=%d effective=%v",
+			cfg.LLM.GenerateTaskTimeoutSeconds, cfg.GenerateTaskTimeout())
+	}
+
+	// Explicit values are honored verbatim and survive a round trip.
+	os.WriteFile(path, []byte(`[llm]
+timeout_seconds = 120
+generate_task_command = ["claude", "-p", "suggest a task for {agent_name}"]
+generate_task_command_start = ["claude", "-p", "first task for {agent_name}"]
+generate_task_timeout_seconds = 45
+`), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LLM.GenerateTaskCommand) != 3 || cfg.LLM.GenerateTaskCommand[2] != "suggest a task for {agent_name}" {
+		t.Errorf("generate_task_command lost: %v", cfg.LLM.GenerateTaskCommand)
+	}
+	if len(cfg.LLM.GenerateTaskCommandStart) != 3 {
+		t.Errorf("generate_task_command_start lost: %v", cfg.LLM.GenerateTaskCommandStart)
+	}
+	if cfg.LLM.GenerateTaskTimeoutSeconds != 45 || cfg.GenerateTaskTimeout() != 45*time.Second {
+		t.Errorf("explicit generate-task timeout lost: raw=%d effective=%v",
+			cfg.LLM.GenerateTaskTimeoutSeconds, cfg.GenerateTaskTimeout())
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.LLM.GenerateTaskCommand) != 3 || len(rt.LLM.GenerateTaskCommandStart) != 3 ||
+		rt.LLM.GenerateTaskTimeoutSeconds != 45 {
+		t.Errorf("round trip lost generate-task keys: %+v", rt.LLM)
+	}
+}
+
 func TestCommandStartConfigKeys(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 

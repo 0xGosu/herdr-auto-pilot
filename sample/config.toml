@@ -120,6 +120,25 @@ rewrite_command = [
 rewrite_timeout_seconds = 60       # omitted: inherits timeout_seconds
 rewrite_fallback_template = "You must act based on the following: {original_text}"
 
+# ── Idle task suggestion (optional) ──
+# When an agent goes idle with NO task source (no [[task_sources]] matches it
+# and nothing is inferable from the pane), a one-shot CLI can SUGGEST a task.
+# Its stdout is the suggested task; hap surfaces it as an escalation. Confirm
+# it (enter/y) and hap writes a per-agent tasks.md (a single in-progress `[-]`
+# item), registers it as a [[task_sources]] entry, and sends the task to the
+# agent; dismiss (x) to ignore; if the CLI fails, retry with `l`. Placeholders:
+# {self}, {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. Omit to keep the
+# safe default: idle with no task source escalates and hap synthesizes nothing.
+# generate_task_command = [
+#   "claude", "-p",
+#   "Suggest ONE concrete next task for the coding agent in this project. Reply with ONLY the task, one line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
+#   "--model", "haiku",
+# ]
+# generate_task_command_start runs INSTEAD on the agent's first generation
+# (tracked independently); omit to reuse generate_task_command.
+# generate_task_command_start = [ ... ]
+# generate_task_timeout_seconds = 60   # omitted: inherits timeout_seconds
+
 
 # ── Semantic rule matching (vector embeddings) ──────────────────────
 # Situations are matched to learned rules by embedding their masked salient

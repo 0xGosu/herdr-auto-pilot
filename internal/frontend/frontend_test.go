@@ -352,6 +352,100 @@ func TestConfirmSendsRenderedDeclaredTaskPrompt(t *testing.T) {
 	}
 }
 
+func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
+	// Confirming an idle task suggestion writes a per-agent tasks.md (single
+	// in-progress "[-]" item), registers a matching [[task_sources]] entry,
+	// records the correction, and sends the task to the agent.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	// Route the tasks file into a known state dir.
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	taskText := "Investigate the flaky auth test and add a retry guard"
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + taskText, CreatedAt: time.Now(),
+	})
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// tasks.md written with a single in-progress item.
+	path := filepath.Join(stateDir, "tasks", name+".md")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("tasks file not written: %v", err)
+	}
+	if !strings.Contains(string(body), "- [-] "+taskText) {
+		t.Errorf("tasks file = %q, want a single in-progress %q item", body, taskText)
+	}
+
+	// The item is parsed as not-actionable, so the declared-task resolver
+	// treats the list as complete (no next "[ ]" item to re-send).
+	if next := domain.NextDeclaredTask(string(body)); next != "" {
+		t.Errorf("in-progress item must not resolve as a next declared task, got %q", next)
+	}
+
+	// A matching task source was appended, scoped to the agent, pointing at
+	// the absolute file path.
+	cfg, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 {
+		t.Fatalf("want 1 task source, got %d", len(cfg.TaskSources))
+	}
+	if cfg.TaskSources[0].Agent != name || cfg.TaskSources[0].Path != path {
+		t.Errorf("task source = %+v, want agent %q path %q", cfg.TaskSources[0], name, path)
+	}
+
+	// The correction resolves the escalation and learns the declared-task
+	// action.
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].CorrectedAction != domain.ActionNextDeclaredTask || corr[0].AuditID != id {
+		t.Errorf("confirm should record a declared-task correction: %+v", corr)
+	}
+
+	// The task text was sent to the agent's pane.
+	if len(fake.inputs) != 1 || fake.inputs[0] != taskText {
+		t.Errorf("delivered %v, want the task text %q", fake.inputs, taskText)
+	}
+	if len(fake.panes) != 1 || fake.panes[0] != "w1:p1" {
+		t.Errorf("delivered to %v, want the audit's agent pane", fake.panes)
+	}
+}
+
+func TestConfirmGeneratedTaskWithoutSendStillWritesSource(t *testing.T) {
+	// send=false establishes the source and file but delivers nothing.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	app.StateDir = t.TempDir()
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w2:p2", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Write missing tests", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("send=false must deliver nothing, got %v", fake.inputs)
+	}
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 1 {
+		t.Errorf("source must still be registered on a non-send confirm, got %d", len(cfg.TaskSources))
+	}
+}
+
 func TestConfirmDeliversMenuDigitNotLabel(t *testing.T) {
 	// Regression: an LLM/learned approval carries the option LABEL ("Yes"),
 	// but Claude's numbered menu only accepts the digit. Confirm must

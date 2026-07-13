@@ -85,6 +85,7 @@ type Daemon struct {
 	nudges         chan control.Kind
 	llmResults     chan llmOutcome
 	rewriteResults chan rewriteOutcome
+	taskGenResults chan taskGenOutcome
 	sweepResults   chan sweepOutcome
 	// delayedTr re-enters attention transitions whose capture delay has
 	// elapsed; the pane read happens back on the main loop, like every
@@ -117,6 +118,10 @@ type Daemon struct {
 	// reconnect. Both guarded by mu.
 	firstConsult map[string]bool
 	firstRewrite map[string]bool
+	// firstTaskGen marks agents whose first idle task generation has fired, so
+	// the first one can use generate_task_command_start. Same keying/semantics
+	// as firstConsult/firstRewrite; guarded by mu.
+	firstTaskGen map[string]bool
 
 	// configured flips after the first successful reload so reloadEmbedder
 	// can tell first load from a config change.
@@ -183,6 +188,19 @@ type rewriteOutcome struct {
 	token     uint64
 }
 
+// taskGenOutcome carries a finished idle task generation back into the main
+// loop: the suggested task text, or an error the daemon surfaces as a
+// retryable escalation. The request rides along so the pending guard can be
+// cleared exactly like a consult.
+type taskGenOutcome struct {
+	situation domain.Situation
+	sig       domain.SignatureResult
+	tr        domain.AgentTransition
+	request   domain.LLMRequest
+	task      string
+	err       error
+}
+
 // sweepOutcome carries a finished multi-tab form sweep back into the main
 // loop: the situation with content/options aggregated across all tabs, or —
 // degraded — the original single-frame situation plus the failure reason
@@ -212,6 +230,7 @@ func New(opt Options) (*Daemon, error) {
 		nudges:          make(chan control.Kind, 16),
 		llmResults:      make(chan llmOutcome, 16),
 		rewriteResults:  make(chan rewriteOutcome, 16),
+		taskGenResults:  make(chan taskGenOutcome, 16),
 		sweepResults:    make(chan sweepOutcome, 16),
 		delayedTr:       make(chan domain.AgentTransition, 256),
 		pendingCapture:  map[string]*captureEntry{},
@@ -219,6 +238,7 @@ func New(opt Options) (*Daemon, error) {
 		episodeHandled:  map[string]bool{},
 		firstConsult:    map[string]bool{},
 		firstRewrite:    map[string]bool{},
+		firstTaskGen:    map[string]bool{},
 		lastAutoSend:    map[string]time.Time{},
 		lastAutoNoop:    map[string]time.Time{},
 		rewriteInFlight: map[string]rewriteFlight{},
@@ -465,6 +485,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case res := <-d.rewriteResults:
 			logging.Guard("rewrite-result", func() error {
 				d.handleRewriteOutcome(ctx, res)
+				return nil
+			})
+		case res := <-d.taskGenResults:
+			logging.Guard("task-gen-result", func() error {
+				d.handleTaskGenOutcome(ctx, res)
 				return nil
 			})
 		case res := <-d.sweepResults:
@@ -792,15 +817,16 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 			MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 			MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
 		},
-		Now:                   now,
-		RetryCount:            retries,
-		MaxRetries:            cfg.Limits.MaxErrorRetries,
-		DeclaredTask:          declared,
-		LLMConfigured:         d.llmPort() != nil && d.llmPort().Configured(),
-		NeverAutoHit:          allowPattern,
-		NeverAutoMatched:      allowMatched,
-		SuspectedIrreversible: suspected,
-		IrreversibleHit:       irrevHit,
+		Now:                    now,
+		RetryCount:             retries,
+		MaxRetries:             cfg.Limits.MaxErrorRetries,
+		DeclaredTask:           declared,
+		LLMConfigured:          d.llmPort() != nil && d.llmPort().Configured(),
+		GenerateTaskConfigured: d.taskGenPort() != nil,
+		NeverAutoHit:           allowPattern,
+		NeverAutoMatched:       allowMatched,
+		SuspectedIrreversible:  suspected,
+		IrreversibleHit:        irrevHit,
 	}
 
 	decision := domain.Decide(in)
@@ -821,6 +847,8 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		d.deliverNoop(ctx, situation, sig, decision, tr, now)
 	case domain.ActionConsult:
 		d.consultLLM(ctx, cfg, situation, sig, now)
+	case domain.ActionGenerateTask:
+		d.generateTask(ctx, cfg, situation, sig, tr, now)
 	default:
 		d.escalate(ctx, situation, sig, decision, tr, now)
 	}
@@ -1170,6 +1198,135 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 		case <-ctx.Done():
 		}
 	}()
+}
+
+// taskGenPort returns the LLM adapter as a TaskGeneratorPort when a
+// generate-task CLI is configured, else nil (the capability is optional).
+func (d *Daemon) taskGenPort() ports.TaskGeneratorPort {
+	tg, ok := d.llmPort().(ports.TaskGeneratorPort)
+	if !ok || !tg.GenerateTaskConfigured() {
+		return nil
+	}
+	return tg
+}
+
+// generateTask asks the operator LLM to SUGGEST a task for an idle agent that
+// has no task source (FR-011 relaxation). Like consultLLM the subprocess runs
+// in a goroutine — it shells out to herdr for the pane excerpt and cwd — and
+// the suggestion funnels back through handleTaskGenOutcome as an escalation the
+// operator confirms or dismisses; it is never auto-acted. A pending
+// llm_requests row guards against concurrent generations from bursty idle
+// events and lets `l`-retry reuse the same in-flight check.
+func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.Situation,
+	sig domain.SignatureResult, tr domain.AgentTransition, now time.Time) {
+
+	tg := d.taskGenPort()
+	if tg == nil {
+		return
+	}
+	// Don't stack a generation onto one already in flight for this agent.
+	if pending, err := d.opt.Store.HasPendingLLMConsult(ctx, s.AgentID); err != nil {
+		slog.Error("generate-task: pending check failed", "agent", s.AgentID, "error", err)
+		return
+	} else if pending {
+		slog.Info("generate-task skipped: request already in flight", "agent", s.AgentID)
+		return
+	}
+
+	// The first generation for this agent selects generate_task_command_start
+	// (when configured); mark it consumed on the main loop, before the goroutine.
+	d.mu.Lock()
+	first := !d.firstTaskGen[s.AgentID]
+	d.firstTaskGen[s.AgentID] = true
+	d.mu.Unlock()
+
+	req := domain.LLMRequest{
+		RequestID: fmt.Sprintf("gentask-%s-%d", s.AgentID, now.UnixNano()),
+		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
+		AgentID: s.AgentID, Status: "pending", CreatedAt: now, First: first,
+	}
+	// Stage the pending row synchronously so a second idle event cannot race
+	// past the guard above before the goroutine registers the flight.
+	if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
+		slog.Error("generate-task: staging request failed", "agent", s.AgentID, "error", err)
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonTaskGenFailed,
+			Rationale: "staging request failed: " + err.Error(),
+		}, tr, now)
+		return
+	}
+
+	go func() {
+		outcome := taskGenOutcome{situation: s, sig: sig, tr: tr, request: req}
+		err := logging.Guard("generate-task", func() error {
+			agentName, nerr := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
+			if nerr != nil {
+				agentName = ""
+			}
+			// cwd comes from `pane get`; degrade to empty when the adapter
+			// cannot report it (ports.InspectorPort is optional).
+			var info domain.PaneInfo
+			if insp, ok := d.opt.Herdr.(ports.InspectorPort); ok {
+				if pi, perr := insp.PaneInfo(ctx, s.PaneID); perr == nil {
+					info = pi
+				}
+			}
+			cwd := info.ForegroundCwd
+			if cwd == "" {
+				cwd = info.Cwd
+			}
+			task, gerr := tg.GenerateTask(ctx, domain.TaskGenRequest{
+				AgentType:   s.AgentType,
+				AgentName:   agentName,
+				PaneExcerpt: d.paneExcerpt(ctx, cfg, s),
+				Cwd:         cwd,
+				First:       first,
+			})
+			outcome.task = task
+			return gerr
+		})
+		outcome.err = err
+		select {
+		case d.taskGenResults <- outcome:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+// handleTaskGenOutcome surfaces a finished idle task generation as an
+// escalation: a suggestion the operator confirms (writing a per-agent tasks.md)
+// or dismisses on success, or a retryable failure rationale. It never acts on
+// the pane itself.
+func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
+	now := d.opt.Clock.Now()
+	s := res.situation
+
+	// Clear the pending guard for this agent; a failed write leaves it pending
+	// until expireStaleLLMWork reclaims it.
+	if err := d.opt.Store.UpdateLLMRequestStatus(ctx, res.request.RequestID, "done"); err != nil {
+		slog.Error("marking generate-task request done failed", "request", res.request.RequestID, "error", err)
+	}
+
+	if res.err != nil || res.task == "" {
+		rationale := "generate-task produced no task"
+		if res.err != nil {
+			rationale = res.err.Error()
+		}
+		d.escalate(ctx, s, res.sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonTaskGenFailed,
+			Rationale: rationale,
+		}, res.tr, now)
+		return
+	}
+
+	// Success: surface the suggestion for confirmation. The reason stays
+	// no_task_source (the agent IS still without a source) so the escalation
+	// is NOT retryable — the operator confirms or dismisses it — while the
+	// suggestion carries the generated task for the confirm path.
+	d.escalate(ctx, s, res.sig, domain.Decision{
+		Action: domain.ActionEscalate, Reason: domain.ReasonNoTaskSource,
+		Suggestion: domain.SuggestTaskPrefix + res.task,
+	}, res.tr, now)
 }
 
 // consultContext builds the JSON context handed to the LLM CLI via the
@@ -1886,9 +2043,12 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) {
 	// pane, and re-derives every gate at fire time — re-consulting when the live
 	// pane still needs help. Forwarding herdr's real status/type/location (vs a
 	// fabricated "blocked") keeps the trigger honest and lets the Claude
-	// structural detectors and signature lookup see the correct agent type.
-	// scheduleCapture coalesces per pane, so rapid double-retries collapse into
-	// one capture.
+	// structural detectors and signature lookup see the correct agent type. This
+	// also carries an idle task-generation retry correctly: the live status is
+	// idle, so the pane re-classifies as idle and re-enters the generate-task
+	// path (and if the agent has since started working, it is no longer idle and
+	// no stale suggestion is regenerated). scheduleCapture coalesces per pane, so
+	// rapid double-retries collapse into one capture.
 	slog.Info("llm retry: re-driving consult", "agent", agentID, "pane", live.PaneID, "status", live.Status)
 	d.scheduleCapture(ctx, live)
 }
@@ -2002,7 +2162,17 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 // blocks every future retry for that agent forever.
 func (d *Daemon) expireStaleLLMWork(ctx context.Context) {
 	cfg, _, _ := d.snapshot()
-	cutoff := d.opt.Clock.Now().Add(-2 * cfg.LLMTimeout())
+	// The reclaim window must exceed the LONGEST work a pending llm_requests
+	// row can represent: a consult (LLMTimeout) or an idle task generation
+	// (GenerateTaskTimeout, which can be configured longer). Using only the
+	// consult timeout would expire a still-running generation early, letting a
+	// second idle event launch a concurrent generation (defeats the in-flight
+	// guard in generateTask).
+	longest := cfg.LLMTimeout()
+	if gt := cfg.GenerateTaskTimeout(); gt > longest {
+		longest = gt
+	}
+	cutoff := d.opt.Clock.Now().Add(-2 * longest)
 
 	if _, err := d.opt.Store.ExpireStalePendingLLMRequests(ctx, cutoff); err != nil {
 		slog.Error("expiring stale LLM requests failed", "error", err)

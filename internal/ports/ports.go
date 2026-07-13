@@ -105,6 +105,18 @@ type RewriterPort interface {
 	RewriteConfigured() bool
 }
 
+// TaskGeneratorPort is an optional capability of the LLM adapter: a one-shot
+// task suggestion for an idle agent with no task source
+// (llm.generate_task_command). Like Rewrite, the suggested task is the
+// subprocess's stdout. Callers type-assert and degrade gracefully when absent.
+type TaskGeneratorPort interface {
+	// GenerateTask runs the configured generate-task CLI and returns the
+	// suggested task text, or an error on timeout / failure / empty output.
+	GenerateTask(ctx context.Context, req domain.TaskGenRequest) (string, error)
+	// GenerateTaskConfigured reports whether a generate-task CLI is configured.
+	GenerateTaskConfigured() bool
+}
+
 // StorePort is the persistence boundary. Write-ownership is partitioned:
 // daemon-exclusive writers for signatures/agent_rate/error_retries/decisions,
 // daemon-emitted audit rows, and signature_embeddings (with one maintenance

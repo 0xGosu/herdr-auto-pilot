@@ -253,6 +253,38 @@ func (f *fakeRewriter) rewriteCalls() []domain.RewriteRequest {
 	return append([]domain.RewriteRequest(nil), f.requests...)
 }
 
+// fakeTaskGen layers ports.TaskGeneratorPort on the LLM fake so the daemon's
+// type assertion finds the optional idle task-generation capability.
+type fakeTaskGen struct {
+	*fakeLLM
+	mu       sync.Mutex
+	generate func(ctx context.Context, req domain.TaskGenRequest) (string, error)
+	requests []domain.TaskGenRequest
+}
+
+func (f *fakeTaskGen) GenerateTaskConfigured() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.generate != nil
+}
+
+func (f *fakeTaskGen) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+	f.mu.Lock()
+	f.requests = append(f.requests, req)
+	fn := f.generate
+	f.mu.Unlock()
+	if fn == nil {
+		return "", errors.New("no generate configured")
+	}
+	return fn(ctx, req)
+}
+
+func (f *fakeTaskGen) genCalls() []domain.TaskGenRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.TaskGenRequest(nil), f.requests...)
+}
+
 // failingStore injects persistence failures on audit writes (FR-024).
 type failingStore struct {
 	ports.StorePort
@@ -308,7 +340,29 @@ func newHarnessRewriter(t *testing.T, cfgTOML string,
 	return newHarnessFull(t, cfgTOML, nil, fr), fr
 }
 
+// newHarnessTaskGen installs a task-generator-capable LLM port for idle
+// task-suggestion tests.
+func newHarnessTaskGen(t *testing.T, cfgTOML string,
+	generate func(ctx context.Context, req domain.TaskGenRequest) (string, error)) (*harness, *fakeTaskGen) {
+	tg := &fakeTaskGen{fakeLLM: &fakeLLM{}, generate: generate}
+	return newHarnessCore(t, cfgTOML, nil, tg, tg.fakeLLM), tg
+}
+
 func newHarnessFull(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort, rw *fakeRewriter) *harness {
+	fl := &fakeLLM{}
+	var llmPort ports.LLMPort = fl
+	if rw != nil {
+		fl = rw.fakeLLM
+		llmPort = rw
+	}
+	return newHarnessCore(t, cfgTOML, wrap, llmPort, fl)
+}
+
+// newHarnessCore wires the daemon with a caller-supplied LLM port (plus the
+// underlying *fakeLLM for assertions), so optional-capability variants
+// (rewriter, task generator) share one setup path.
+func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort,
+	llmPort ports.LLMPort, fl *fakeLLM) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
@@ -329,12 +383,6 @@ func newHarnessFull(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 	fs := &failingStore{StorePort: raw}
 	fh := &fakeHerdr{}
 	fe := &fakeEvents{ch: make(chan domain.AgentTransition, 64)}
-	fl := &fakeLLM{}
-	var llmPort ports.LLMPort = fl
-	if rw != nil {
-		fl = rw.fakeLLM
-		llmPort = rw
-	}
 	var herdrPort ports.HerdrPort = fh
 	if wrap != nil {
 		herdrPort = wrap(fh)
@@ -1226,6 +1274,114 @@ func TestIdleWithoutTaskSourceEscalates(t *testing.T) {
 	if len(h.herdr.sentInputs()) != 0 {
 		t.Fatal("no arbitrary prompt may be synthesized")
 	}
+}
+
+func TestIdleGeneratesTaskSuggestionEscalation(t *testing.T) {
+	// FR-011 relaxation: idle with no task source and generate_task_command
+	// configured surfaces an LLM-suggested task as a (non-retryable)
+	// escalation, and sends nothing to the pane.
+	idlePane := "Task is complete.\n"
+	h, tg := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return "Investigate the flaky auth test and add a retry guard", nil
+	})
+	h.herdr.setPane(idlePane)
+
+	ctx := context.Background()
+	h.push("agent-20", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	want := domain.SuggestTaskPrefix + "Investigate the flaky auth test and add a retry guard"
+	if esc[0].Suggestion != want {
+		t.Errorf("escalation suggestion = %q, want %q", esc[0].Suggestion, want)
+	}
+	if domain.IsRetryableLLMEscalation(&esc[0]) {
+		t.Error("a successful task suggestion must NOT be retryable (operator confirms/dismisses)")
+	}
+	if calls := tg.genCalls(); len(calls) != 1 {
+		t.Fatalf("generator should be called once, got %d", len(calls))
+	} else if calls[0].AgentType != "claude" && calls[0].AgentType != "unknown" {
+		t.Errorf("generator request should carry the agent type, got %q", calls[0].AgentType)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatalf("nothing may be sent to the pane before the operator confirms, sent %v", h.herdr.sentInputs())
+	}
+	// The pending guard was cleared on the outcome path.
+	if pending, _ := h.raw.HasPendingLLMConsult(ctx, "agent-20"); pending {
+		t.Error("a resolved task generation must not leave a pending request")
+	}
+}
+
+func TestIdleTaskGenFailureIsRetryableEscalation(t *testing.T) {
+	// A failed generation surfaces the rationale and is retryable with `l`.
+	h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return "", errors.New("generate-task CLI failed: boom")
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	h.push("agent-21", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if !domain.IsRetryableLLMEscalation(&esc[0]) {
+		t.Fatalf("a failed generation should be retryable, got rationale %q", esc[0].Rationale)
+	}
+	if !strings.Contains(esc[0].Rationale, string(domain.ReasonTaskGenFailed)) ||
+		!strings.Contains(esc[0].Rationale, "boom") {
+		t.Errorf("rationale should carry the failure tag and message, got %q", esc[0].Rationale)
+	}
+}
+
+func TestIdleTaskGenRetryReDrivesGeneration(t *testing.T) {
+	// A queued retry re-injects the idle status (not blocked) so the pane
+	// re-classifies as idle and re-enters the generate-task path.
+	var mu sync.Mutex
+	calls := 0
+	h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			return "", errors.New("generate-task timeout after 5s")
+		}
+		return "Write the missing unit tests for the parser", nil
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	h.push("agent-22", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1 && domain.IsRetryableLLMEscalation(&esc[0])
+	})
+
+	// Agent still live on its pane: queue a retry and nudge.
+	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-22", PaneID: "agent-22", Status: "idle"}})
+	if _, err := h.raw.InsertLLMRetry(ctx, esc[0].ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+
+	// The retry re-drove generation, which this time yielded a suggestion.
+	want := domain.SuggestTaskPrefix + "Write the missing unit tests for the parser"
+	waitFor(t, 5*time.Second, func() bool {
+		all, _ := h.raw.PendingEscalations(ctx)
+		for _, e := range all {
+			if e.Suggestion == want {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 func TestErrorRetryCeilingEndToEnd(t *testing.T) {

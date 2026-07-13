@@ -14,6 +14,12 @@ const (
 	ActionNextInferredTask = "@next_task:inferred"
 )
 
+// SuggestGenerateTask is the confirmable action carried by an idle
+// task-suggestion escalation. Confirming it makes the front-end write a
+// per-agent tasks.md, register it as a task source, and send the suggested
+// task — it is never sent to a pane as literal text.
+const SuggestGenerateTask = "@generate_task"
+
 // ActionNoop is the learned "do nothing" action: the operator (or LLM)
 // decided the situation needs no reply at all. It flows through decision
 // history and graduation like any other action, but nothing is ever sent —
@@ -83,6 +89,10 @@ type DecideInput struct {
 	MaxRetries    int
 	DeclaredTask  *DeclaredTask // resolved declared source (nil = no source matched)
 	LLMConfigured bool
+	// GenerateTaskConfigured reports that llm.generate_task_command is set, so
+	// an idle agent with no task source generates a task suggestion instead of
+	// escalating no_task_source (FR-011 relaxation).
+	GenerateTaskConfigured bool
 	// NeverAutoHit and SuspectedIrreversible are precomputed by the caller
 	// from the compiled NeverAutoList so the core stays free of regex state.
 	// IrreversibleHit carries the matching indicator for the rationale.
@@ -167,6 +177,16 @@ func Decide(in DecideInput) Decision {
 			(resolveEsc == ReasonNoHistory || resolveEsc == ReasonUnfamiliarOptions) {
 			return Decision{Action: ActionConsult, Confidence: conf.Score,
 				Rationale: string(resolveEsc) + "; consulting LLM"}
+		}
+		// FR-011 relaxation: an idle agent with no task source normally
+		// escalates no_task_source (never synthesizing a prompt). When the
+		// operator has opted in with llm.generate_task_command, instead ask the
+		// LLM to SUGGEST a task — surfaced as an escalation for confirmation,
+		// never auto-acted, so the operator stays in control.
+		if in.Situation.Type == SituationIdle && resolveEsc == ReasonNoTaskSource &&
+			in.GenerateTaskConfigured {
+			return Decision{Action: ActionGenerateTask, Confidence: conf.Score,
+				Rationale: "idle with no task source; generating a task suggestion"}
 		}
 		return esc(resolveEsc, rationaleFor(resolveEsc), conf.Score, suggestion)
 	}
