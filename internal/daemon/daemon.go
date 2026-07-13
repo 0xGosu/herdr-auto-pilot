@@ -1636,7 +1636,7 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		fields["task_list_path"] = review.listPath
 		fields["current_task"] = review.currentTask
 		fields["pending_tasks"] = review.pending
-		fields["answer_format"] = "this idle agent has a next task ready to send: proposed_task is the exact instruction that would be sent, current_task is that task's text, task_list_path is the checklist file, and pending_tasks lists every remaining task in order. Decide from the pane what to send. Normally submit_decision recommend_action with proposed_task (lightly edit it only if the pane clearly requires). If the pane shows current_task is ALREADY DONE, pick the next still-unfinished item from pending_tasks and send that instruction instead. To decline — the agent is still busy, every task is done, or nothing should run now — submit_decision recommend_action \"@noop\" with a one-sentence rationale. Always include confident_score: a confident decision is applied automatically (the chosen task is sent, or skipped on a decline), while a low-confidence one is surfaced to the operator"
+		fields["answer_format"] = "this idle agent has a next task ready to send: proposed_task is the exact instruction that would be sent, current_task is that task's text, task_list_path is the checklist file, and pending_tasks lists every remaining task in order. Decide from the pane what to send. To send the queued task unchanged, submit_decision recommend_action \"@next_task:declared\" — the daemon sends proposed_task verbatim, so you never need to copy it. Only put literal text in recommend_action when you are editing the task or, if the pane shows current_task is ALREADY DONE, sending a different still-unfinished item from pending_tasks. To decline — the agent is still busy, every task is done, or nothing should run now — submit_decision recommend_action \"@noop\" with a one-sentence rationale. Always include confident_score: a confident decision is applied automatically (the chosen task is sent, or skipped on a decline), while a low-confidence one is surfaced to the operator"
 	}
 	contextJSON, _ := json.Marshal(fields)
 	return contextJSON
@@ -1932,6 +1932,14 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// row staged by an older binary (or written directly) must not slip a
 	// noop spelling into the pane as literal text.
 	llmDec.Action = domain.NormalizeNoopAction(llmDec.Action)
+	// Task-review shorthand: the LLM may approve the queued task verbatim with
+	// the send-proposed sentinel instead of re-typing it. Expand it to the
+	// reviewed task BEFORE the re-gates/send so every safety scan and the
+	// escalation suggestion operate on the real instruction, never the sentinel.
+	if res.request.TaskReview && res.request.ProposedTask != "" &&
+		llmDec.Action == domain.ActionSendProposed {
+		llmDec.Action = res.request.ProposedTask
+	}
 	isNoop := domain.IsNoopAction(llmDec.Action)
 	if isNoop {
 		llmDec.OptionID = ""

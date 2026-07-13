@@ -31,6 +31,13 @@ const (
 	ActionNoopSuggestion = "do nothing (no reply needed)"
 )
 
+// ActionSendProposed is the task-review shorthand: instead of re-typing the
+// queued task into recommend_action, the LLM submits this sentinel to send the
+// reviewed task (the request's ProposedTask) verbatim. The daemon expands it to
+// that text before the safety re-gates and send, so the agent never receives
+// the literal sentinel. Only meaningful for a task-review consult.
+const ActionSendProposed = "@next_task:declared"
+
 // IsNoopAction reports whether a learned/submitted action is the noop
 // sentinel.
 func IsNoopAction(s string) bool { return s == ActionNoop }

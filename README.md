@@ -427,8 +427,11 @@ and every remaining item (`pending_tasks`) — so it can also **pick a different
 pending task** when the pane shows the current one is already done — and decides
 what to send:
 
-- **Send** — `submit_decision` with `recommend_action` set to the task text
-  (lightly edited only if the pane requires it).
+- **Send as-is** — `submit_decision` with `recommend_action` `@next_task:declared`;
+  the daemon sends the queued task verbatim (no copying, no paraphrase drift).
+- **Send edited / a different task** — `recommend_action` set to the literal
+  instruction text (an edit, or the next unfinished item from `pending_tasks`
+  when the current one is already done).
 - **Decline** — `submit_decision` with `recommend_action` `@noop` (the agent is
   still busy, the task is already done, or the pane shows it should not run).
 
