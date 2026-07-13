@@ -24,6 +24,15 @@ var (
 	digitTokenRE   = regexp.MustCompile(`^[1-9]$`)
 )
 
+// mcqSubmitScreenRE matches the final Submit tab's confirmation body. That
+// tab keeps the `←…✔ Submit…→` header but DROPS the tab-navigation footer
+// (issue #95), so the footer alone can not stand for "this is still the live
+// multi-tab form". The "Ready to submit your answers?" prompt is present
+// whether or not every question is answered (the "⚠ You have not answered all
+// questions" warning is conditional), and it is line-anchored so narration
+// can not trip it.
+var mcqSubmitScreenRE = regexp.MustCompile(`(?im)^\s*ready to submit your answers\?\s*$`)
+
 // mcqSingleFooterRE matches Claude's single-question selection footer — the
 // "Enter to select" line plus its navigation tail (a "·" separator or the
 // word "navigate"). The tail keeps an agent merely narrating "press enter to
@@ -46,14 +55,19 @@ func ClaudeMCQForm(pane string) bool {
 }
 
 // MultiTabForm reports whether pane content shows the multi-tab MCQ variant
-// and how many tabs it has (checkbox entries plus the Submit entry). Both
-// the tab header and the tab-navigation footer are required, so a narrated
-// checkbox list can not false-positive. The LAST header occurrence is the
-// live render: a consuming "recent" read can carry earlier renders (or an
-// older form) above the current one.
+// and how many tabs it has (checkbox entries plus the Submit entry). The tab
+// header is always required; alongside it the pane must carry EITHER the
+// tab-navigation footer (the question tabs) OR the Submit confirmation body
+// (the final tab drops the footer — issue #95). Requiring one of the two
+// keeps a narrated checkbox list from false-positiving. The LAST header
+// occurrence is the live render: a consuming "recent" read can carry earlier
+// renders (or an older form) above the current one.
 func MultiTabForm(pane string) (tabs int, ok bool) {
 	headers := mcqTabHeaderRE.FindAllString(pane, -1)
-	if len(headers) == 0 || !mcqTabFooterRE.MatchString(pane) {
+	if len(headers) == 0 {
+		return 0, false
+	}
+	if !mcqTabFooterRE.MatchString(pane) && !mcqSubmitScreenRE.MatchString(pane) {
 		return 0, false
 	}
 	n := len(mcqTabEntryRE.FindAllString(headers[len(headers)-1], -1))
