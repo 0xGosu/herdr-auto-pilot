@@ -1223,8 +1223,9 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	rec := domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "escalated", Confidence: dec.Confidence,
-		Rationale: rationale,
-		Status:    "escalated", Suggestion: dec.Suggestion,
+		LLMConfidence: dec.LLMConfidence,
+		Rationale:     rationale,
+		Status:        "escalated", Suggestion: dec.Suggestion,
 		// The content THIS escalation was classified from — per entry,
 		// unlike the signature's first-seen provenance snapshot.
 		PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes),
@@ -1971,9 +1972,17 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				why += "proposed task: " + res.request.ProposedTask
 			}
 		}
+		// Carry the LLM's self-reported score onto the escalation's audit row
+		// (0-100); -1 means the agent reported none, so leave it nil.
+		var llmConf *int
+		if llmDec.ConfidentScore >= 0 {
+			score := llmDec.ConfidentScore
+			llmConf = &score
+		}
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: reason, Rationale: why,
-			Suggestion: "LLM suggested: " + suggested,
+			LLMConfidence: llmConf,
+			Suggestion:    "LLM suggested: " + suggested,
 		}, tr, now)
 	}
 
@@ -2084,6 +2093,12 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		}
 	}
 
+	// Both scores land on the auto-acted audit row: the computed 0-1 agreement
+	// over this signature's history AND the LLM's self-reported 0-100 (>= 0
+	// here — a lower score would have escalated at the gate above).
+	computedConf := domain.Confidence(history).Score
+	llmConf := llmDec.ConfidentScore
+
 	if isNoop {
 		// NoOp promotion: record and stand down — nothing is sent. The
 		// staleness re-read is skipped on purpose: it exists solely to
@@ -2093,6 +2108,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 			AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
 			SituationType: s.Type, Action: "noop", Input: "",
+			Confidence: computedConf, LLMConfidence: &llmConf,
 			Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
 			Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 		}); err != nil {
@@ -2182,6 +2198,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
 		SituationType: s.Type, Action: "auto:" + llmDec.Action, Input: llmDec.Action,
+		Confidence: computedConf, LLMConfidence: &llmConf,
 		Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
 		Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})

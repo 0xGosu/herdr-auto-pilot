@@ -1281,6 +1281,10 @@ func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int) []
 	lines = m.detailField(lines, w, "Agent", agent)
 	lines = m.detailField(lines, w, "Agent type", m.agentTypeFor(r))
 	lines = m.detailField(lines, w, "Confidence", fmt.Sprintf("%.2f", r.Confidence))
+	if r.LLMConfidence != nil {
+		lines = m.detailField(lines, w, "LLM confidence",
+			fmt.Sprintf("%d/100", *r.LLMConfidence))
+	}
 	lines = m.detailField(lines, w, "Trigger", r.Trigger)
 	lines = m.detailField(lines, w, "Suggestion", r.Suggestion)
 	lines = m.detailField(lines, w, "Action", r.Action)
@@ -1885,8 +1889,10 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		}
 		return
 	}
-	// Prefix: "<mark> #%-5d %-8s %-10s %-8s agent=%-14s rule=%-6s " → 71 cells.
-	const escPrefix = 71
+	// Prefix: "<mark> #%-5d %-8s %-10s %-8s agent=%-14s llm=%-4s rule=%-6s "
+	// → 80 cells. llm is the consulting LLM's self-reported 0-100 ("-" when the
+	// escalation carries no LLM score, e.g. shadow-mode or a safety veto).
+	const escPrefix = 80
 	start, end := m.window(len(esc))
 	for i := start; i < end; i++ {
 		e := esc[i]
@@ -1899,10 +1905,11 @@ func (m Model) renderEscalations(b *strings.Builder) {
 			mark = "✓"
 		}
 		rWidth, sWidth := m.budget(escPrefix, e.Suggestion != "")
-		line := fmt.Sprintf("%s #%-5d %-8s %-10s %-8s agent=%-14s rule=%-6s %s",
+		line := fmt.Sprintf("%s #%-5d %-8s %-10s %-8s agent=%-14s llm=%-4s rule=%-6s %s",
 			mark, e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType,
 			oneLine(orDash(m.agentTypeFor(e)), 8), agent,
-			m.ruleMarker(e.Signature), oneLine(e.Rationale, rWidth))
+			llmConfShort(e.LLMConfidence), m.ruleMarker(e.Signature),
+			oneLine(e.Rationale, rWidth))
 		if e.Suggestion != "" {
 			line += "  → " + oneLine(e.Suggestion, sWidth)
 		}
@@ -1924,14 +1931,17 @@ func (m Model) renderAudit(b *strings.Builder) {
 		}
 		return
 	}
-	// Prefix up to the action column is ~53 fixed cells + "rule=%-6s " (12).
-	actWidth, _ := m.budget(65, false)
+	// Prefix up to the action column is ~53 fixed cells + "rule=%-6s " (12) +
+	// "llm=%-4s " (9). conf is the computed 0-1 agreement; llm is the
+	// consulting LLM's self-reported 0-100 ("-" when the row has no LLM score).
+	actWidth, _ := m.budget(74, false)
 	start, end := m.window(len(rows))
 	for i := start; i < end; i++ {
 		r := rows[i]
-		line := fmt.Sprintf("#%-5d %-14s %-9s %-10s conf=%.2f rule=%-6s %s",
+		line := fmt.Sprintf("#%-5d %-14s %-9s %-10s conf=%.2f llm=%-4s rule=%-6s %s",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
-			r.Confidence, m.ruleMarker(r.Signature), oneLine(r.Action, actWidth))
+			r.Confidence, llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature),
+			oneLine(r.Action, actWidth))
 		if i == m.cursor {
 			line = m.styles().selected.Render(line)
 		}
@@ -2028,6 +2038,15 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// llmConfShort renders an audit row's LLM confidence for a list column: the
+// 0-100 score, or "-" when the row has no LLM score (learned/operator rows).
+func llmConfShort(v *int) string {
+	if v == nil {
+		return "-"
+	}
+	return strconv.Itoa(*v)
 }
 
 // Run starts the TUI program.

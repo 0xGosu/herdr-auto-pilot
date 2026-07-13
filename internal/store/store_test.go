@@ -186,6 +186,46 @@ func TestDismissEscalationsBefore(t *testing.T) {
 	}
 }
 
+func TestAuditLLMConfidenceRoundTrip(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	// An LLM-authored row carries both scores: computed agreement (0-1) and
+	// the LLM's self-reported confidence (0-100).
+	score := 85
+	llmID, err := s.AppendAudit(ctx, domain.AuditRecord{
+		Signature: "sig-llm", Trigger: "llm-fallback", SituationType: domain.SituationApproval,
+		Action: "auto:y", Confidence: 0.5, LLMConfidence: &score, Status: "auto", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetAudit(ctx, llmID)
+	if err != nil || got == nil {
+		t.Fatalf("get llm audit: %v", err)
+	}
+	if got.LLMConfidence == nil || *got.LLMConfidence != 85 {
+		t.Errorf("LLMConfidence round trip = %v, want 85", got.LLMConfidence)
+	}
+
+	// A learned/operator row has no LLM score: nil must survive as NULL, not
+	// collapse to a reported 0.
+	nonLLMID, err := s.AppendAudit(ctx, domain.AuditRecord{
+		Signature: "sig-rule", Trigger: "agent-status: blocked", SituationType: domain.SituationApproval,
+		Action: "auto:y", Confidence: 1.0, Status: "auto", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetAudit(ctx, nonLLMID)
+	if err != nil || got == nil {
+		t.Fatalf("get non-llm audit: %v", err)
+	}
+	if got.LLMConfidence != nil {
+		t.Errorf("non-LLM row LLMConfidence = %v, want nil", *got.LLMConfidence)
+	}
+}
+
 func TestAuditAndCorrectionLineage(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

@@ -1670,6 +1670,27 @@ func TestLLMFallbackStagingRegateAndPromotion(t *testing.T) {
 	if decs == nil || decs.Status != "accepted" {
 		t.Errorf("staged decision should be accepted, got %+v", decs)
 	}
+	// The auto-acted audit row captures BOTH scores: the LLM's self-reported
+	// 0-100 and the computed 0-1 agreement over this signature's history
+	// (4×"1" vs 1×"2" → 0.8-ish, always > 0), so the Audit view never shows an
+	// LLM=80 row alongside a misleading conf=0.00.
+	audits, _ := h.raw.AuditLog(ctx, 10)
+	var promoted *domain.AuditRecord
+	for i := range audits {
+		if audits[i].Action == "auto:1" && audits[i].Trigger == "llm-fallback" {
+			promoted = &audits[i]
+			break
+		}
+	}
+	if promoted == nil {
+		t.Fatalf("no promoted llm-fallback audit row found in %+v", audits)
+	}
+	if promoted.LLMConfidence == nil || *promoted.LLMConfidence != 80 {
+		t.Errorf("promoted row LLMConfidence = %v, want 80", promoted.LLMConfidence)
+	}
+	if promoted.Confidence <= 0 {
+		t.Errorf("promoted row computed Confidence = %v, want > 0", promoted.Confidence)
+	}
 }
 
 func TestLLMConfidentScoreShownOnEscalation(t *testing.T) {
@@ -1707,6 +1728,11 @@ func TestLLMConfidentScoreShownOnEscalation(t *testing.T) {
 	}
 	if !strings.Contains(esc[0].Rationale, "[llm_low_confidence]") {
 		t.Errorf("below-threshold reject expected, got %q", esc[0].Rationale)
+	}
+	// The score is also captured as a structured field on the audit row, not
+	// only embedded in the rationale prose.
+	if esc[0].LLMConfidence == nil || *esc[0].LLMConfidence != 62 {
+		t.Errorf("escalation LLMConfidence = %v, want 62", esc[0].LLMConfidence)
 	}
 }
 
@@ -1763,6 +1789,17 @@ func TestAutoActConfidenceThresholdGate(t *testing.T) {
 			esc, _ := h.raw.PendingEscalations(ctx)
 			if !strings.Contains(esc[0].Rationale, "[llm_low_confidence]") {
 				t.Errorf("expected llm_low_confidence escalation, got %q", esc[0].Rationale)
+			}
+			// The structured LLM score on the escalation row follows the
+			// not-reported convention: an unreported score (-1) must land as
+			// nil, NOT a stored -1; a reported-but-low score is kept verbatim.
+			got := esc[0].LLMConfidence
+			if tc.score < 0 {
+				if got != nil {
+					t.Errorf("unreported score must store nil LLMConfidence, got %v", *got)
+				}
+			} else if got == nil || *got != tc.score {
+				t.Errorf("escalation LLMConfidence = %v, want %d", got, tc.score)
 			}
 		})
 	}
