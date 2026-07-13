@@ -49,7 +49,7 @@ max_error_retries = 2              # per error signature
 # come immediately after -p (claude quirk; the plugin auto-repairs it).
 command = [
   "claude", "-p",
-  "You are the auto-answer assistant for herd-auto-prompter (hap). A coding agent running in a herdr terminal pane has stopped and is waiting for input. Your job: answer exactly as the human operator would, using ONLY the two hap MCP tools.\n\nStep 1 — call get_context. It returns the classified situation:\n- situation_type: 'approval' (permission prompt), 'choice' (menu of options), 'error' (the agent hit a failure), or 'idle' (finished or waiting for its next instruction)\n- options: the menu option texts, when the pane shows a menu\n- permission_verb: what the agent is asking permission to do\n- error_summary: short description of the failure, when situation_type is 'error'\n- pane_excerpt: the recent terminal screen — read it carefully; it is the ground truth for what the agent is doing and asking\n- cwd / foreground_cwd and herdr ids (workspace_id, tab_id, pane_id, agent_id): where the agent is working\n\nStep 2 — decide what the operator would answer:\n- approval / choice: pick ONE entry from options and use its EXACT text. Approve routine, reversible work (reading files, edits, builds, tests, linters). Prefer the safest option and DENY anything destructive or hard to reverse: deleting data, force-pushing or hard-resetting git history, production/deploy changes, touching secrets or credentials, mass file operations.\n- error: reply with one short, concrete instruction telling the agent how to diagnose or fix the failure and continue.\n- idle: reply with the most sensible next instruction based on the pane_excerpt (e.g. continue the remaining work); if nothing remains, tell it to summarize and stop.\n- If the pane_excerpt is ambiguous or does not match the classified situation, choose the most conservative reply.\n\nStep 3 — call submit_decision with: action = the literal reply text to send to the agent (for menus, the exact option text — hap maps it to the menu digit), option_id = the chosen option text for menus, rationale = one sentence on why the operator would answer this way.",
+  "You are the auto-answer assistant for herd-auto-prompter (hap). A coding agent running in a herdr terminal pane has stopped and is waiting for input. Your job: answer exactly as the human operator would, using ONLY the two hap MCP tools.\n\nStep 1 — call get_context. It returns the classified situation:\n- situation_type: 'approval' (permission prompt), 'choice' (menu of options), 'error' (the agent hit a failure), or 'idle' (finished or waiting for its next instruction)\n- options: the menu option texts, when the pane shows a menu\n- permission_verb: what the agent is asking permission to do\n- error_summary: short description of the failure, when situation_type is 'error'\n- pane_excerpt: the recent terminal screen — read it carefully; it is the ground truth for what the agent is doing and asking\n- cwd / foreground_cwd and herdr ids (workspace_id, tab_id, pane_id, agent_id): where the agent is working\n\nStep 2 — decide what the operator would answer:\n- approval / choice with options: choose the safest 1-based option number. Approve routine, reversible work (reading files, edits, builds, tests, linters). DENY anything destructive or hard to reverse: deleting data, force-pushing or hard-resetting git history, production/deploy changes, touching secrets or credentials, mass file operations.\n- approval / choice without options: reply with the literal text the prompt expects.\n- error: reply with one short, concrete instruction telling the agent how to diagnose or fix the failure and continue.\n- idle: reply with the most sensible next instruction based on the pane_excerpt; if no reply is needed, use @noop.\n- If the pane_excerpt is ambiguous or does not match the classified situation, choose the most conservative reply.\n\nStep 3 — call submit_decision. For a menu, pass select_options with the chosen 1-based number (one number per tab for a multi-tab form). Otherwise pass recommend_action with the literal reply, or @noop to send nothing. Always include confident_score (0-100) and a one-sentence rationale.",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
   "--model", "opus",
@@ -61,6 +61,8 @@ command = [
 # on its own; a subscriber reconnect does NOT re-fire it). Same
 # placeholders/tools as command; use it for a priming/kickoff prompt or a
 # stronger model on the first touch. Omit or leave empty to reuse command.
+# If the preferred command exits with an error in under one second without
+# submitting a decision, hap retries once with the other command template.
 # command_start = [
 #   "claude", "-p",
 #   "This is your first interaction with this agent. ...same MCP flow as command...",
@@ -84,7 +86,7 @@ command = [
 #   "-c", 'mcp_servers.hap.env.HAP_REQUEST_ID="{request_id}"',
 #   "-c", 'mcp_servers.hap.env.HAP_DB_PATH="{db}"',
 #   "-c", 'mcp_servers.hap.env.HAP_CONTROL_PATH="{control}"',
-#   "You are the auto-answer assistant for herd-auto-prompter (hap). A coding agent running in a herdr terminal pane has stopped and is waiting for input. Your job: answer exactly as the human operator would, using ONLY the two hap MCP tools.\n\nStep 1 — call get_context. It returns the classified situation:\n- situation_type: 'approval' (permission prompt), 'choice' (menu of options), 'error' (the agent hit a failure), or 'idle' (finished or waiting for its next instruction)\n- options: the menu option texts, when the pane shows a menu\n- permission_verb: what the agent is asking permission to do\n- error_summary: short description of the failure, when situation_type is 'error'\n- pane_excerpt: the recent terminal screen — read it carefully; it is the ground truth for what the agent is doing and asking\n- cwd / foreground_cwd and herdr ids (workspace_id, tab_id, pane_id, agent_id): where the agent is working\n\nStep 2 — decide what the operator would answer:\n- approval / choice: pick ONE entry from options and use its EXACT text. Approve routine, reversible work (reading files, edits, builds, tests, linters). Prefer the safest option and DENY anything destructive or hard to reverse: deleting data, force-pushing or hard-resetting git history, production/deploy changes, touching secrets or credentials, mass file operations.\n- error: reply with one short, concrete instruction telling the agent how to diagnose or fix the failure and continue.\n- idle: reply with the most sensible next instruction based on the pane_excerpt (e.g. continue the remaining work); if nothing remains, tell it to summarize and stop.\n- If the pane_excerpt is ambiguous or does not match the classified situation, choose the most conservative reply.\n\nStep 3 — call submit_decision with: action = the literal reply text to send to the agent (for menus, the exact option text — hap maps it to the menu digit), option_id = the chosen option text for menus, rationale = one sentence on why the operator would answer this way.",
+#   "Use only the hap MCP tools. Call get_context, choose the safest response, then call submit_decision with select_options for a menu or recommend_action for literal text/@noop. Always include confident_score and rationale.",
 # ]
 
 timeout_seconds = 120              # codex is slower to start; 180 is a safer value there
@@ -105,6 +107,7 @@ rewrite_command = [
 # rewrite this daemon lifetime (same first-interaction boundary as
 # command_start, tracked independently). Same placeholders as
 # rewrite_command. Omit or leave empty to reuse rewrite_command.
+# A sub-one-second error exit is retried once with the other rewrite template.
 # rewrite_command_start = [
 #   "claude", "-p",
 #   "First rewrite for this agent. Rewrite this instruction given its screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
@@ -149,7 +152,8 @@ rewrite_fallback_template = "You must act based on the following: {original_text
 # content and vector-searching stored signatures, so a paraphrased prompt
 # reuses the rule instead of re-learning from zero. Falls back to normalized
 # BM25 text matching when the model is unavailable, then to exact hashing —
-# missing assets never block or crash the daemon.
+# llama.cpp runs in an isolated worker, so missing assets, stalls, and native
+# worker aborts degrade matching without taking down the monitoring daemon.
 [embedding]
 disabled = false
 model_path = ""             # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
@@ -158,12 +162,17 @@ bm25_min_score = 0.35       # text-fallback floor when the model is unavailable,
 gpu_layers = 0              # inert in official builds (Metal/Vulkan compiled out; the
                             # bundled MiniLM runs in ms on CPU) — only meaningful if you
                             # rebuild llama-go with GPU on and use a larger model
+# Input is token-truncated below the model's position limit before embedding.
+# 0 uses the bundled MiniLM default (512); positive values below 256 are
+# clamped to 256. NEVER set this above the real limit of model_path: an
+# oversized context can make llama.cpp abort its isolated embed worker.
+model_context_window = 0
 # pane_salient_chars controls the fallback signature window: for idle/
 # unclassified situations the signature (and its embedding) is minted from
-# the trailing N characters of pane content. Omit or 0 → built-in default (800).
+# the trailing N characters of pane content. Omit or 0 → built-in default (500).
 # Changing it re-keys idle/unclassified rules once (they re-learn); structured
 # approval/choice/error rules are unaffected.
-# pane_salient_chars = 800
+# pane_salient_chars = 500
 
 # ── TUI ─────────────────────────────────────────────────────────────
 [tui]
@@ -180,11 +189,13 @@ theme = ""                 # named palette: default | dark | light | high-contra
 # ok = "46"
 # paused = "196"
 # running = "46"
+# warn = "214"
 # help = ""
 
 # ── Declared task lists for idle agents (repeatable) ────────────────
 # Without a declared source, the plugin falls back to inferring the next
-# task from the agent's own todo rendering, held to inferred_task_bar.
+# task from the agent's own todo rendering, held to inferred_task_bar, then
+# uses generate_task_command (when configured) to surface a suggestion.
 # [[task_sources]]
 # agent = ""                 # short name, pane id, or type; "" = any
 # workspace = ""             # "" or "*" = any; wildcards like "codex-*" work

@@ -5,6 +5,6 @@ SHELL := /bin/bash
 
 
 hap-reinstall-from-github:
-	herdr plugin uninstall herd-auto-prompter
+	herdr plugin uninstall herd-auto-prompter || true
 	herdr plugin install 0xGosu/herdr-auto-pilot --yes
 	hap daemon --ensure

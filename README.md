@@ -96,6 +96,110 @@ Notes:
   like `key = "ctrl+alt+a"` also work — ctrl+letter, function keys, and
   explicit modified chords are the most reliable.
 
+## Architecture
+
+Herd Auto Prompter is one Go binary (`hap`) used in several roles: a
+long-running monitoring daemon, a TUI hosted in a Herdr pane, equivalent CLI
+commands, an internal embedding worker, and an MCP server for optional LLM
+consults. Herdr remains the source of truth for workspaces, panes, agents,
+status events, screen contents, and keyboard input. Hap never attaches to or
+sends input directly to an agent process; it observes and controls the agent's
+pane through Herdr.
+
+```mermaid
+flowchart LR
+    O["Operator"]
+
+    subgraph HR["Herdr runtime"]
+        H["Herdr server<br/>events and pane control"]
+        A["Coding agent<br/>running in a Herdr pane"]
+    end
+
+    subgraph HP["Herd Auto Prompter plugin"]
+        E["Plugin event hooks<br/>hap daemon --ensure"]
+        D["hap daemon<br/>capture → classify → match → decide → gate"]
+        F["hap TUI / CLI<br/>operator controls"]
+        W["hap embed-worker<br/>llama.cpp embeddings"]
+        L["Optional LLM / agent CLI<br/>hap mcp for consults"]
+    end
+
+    subgraph LS["Local state"]
+        CFG["config.toml<br/>thresholds, safety, tasks, LLM"]
+        DB[("SQLite + match index<br/>rules, decisions, audit, escalations")]
+    end
+
+    A -->|screen output and status| H
+    H -->|keyboard input| A
+    H -->|workspace.created / pane.agent_detected| E
+    E --> D
+    H -->|agent-status events over local socket| D
+    D -->|pane read/get, agent list| H
+    D -->|agent send, send-keys, notifications| H
+
+    D <-->|semantic match requests| W
+    D <-->|consult, rewrite, or task suggestion| L
+    D <-->|read/write| DB
+    CFG -.->|live reload| D
+
+    O <--> F
+    H -.->|notifications| O
+    H -.->|hosts the TUI pane| F
+    F -->|operator-confirmed input| H
+    F -->|configuration changes| CFG
+    F -->|confirmations, corrections, pause, audit| DB
+    F -.->|reload / wake nudge| D
+```
+
+### Runtime flow
+
+1. **Herdr starts the plugin daemon.** The plugin manifest registers hooks for
+   `workspace.created` and `pane.agent_detected`. A hook runs
+   `hap daemon --ensure`, which starts one version-checked, lock-guarded daemon
+   for the whole herd and returns immediately.
+2. **Herdr reports an agent transition.** The daemon subscribes to Herdr's
+   local event socket for pane discovery and agent-status changes. When an
+   agent becomes idle, blocked, done, or otherwise needs attention, the daemon
+   waits for the agent interface to paint, then asks Herdr to read the pane
+   and its metadata. Reconnects replay existing panes, so agents that predate
+   the daemon are reconciled too.
+3. **Hap interprets the screen.** It classifies the captured situation as
+   idle, approval, choice, or error; masks volatile text into a stable
+   signature; and looks for a learned rule. Semantic lookup runs in the
+   isolated `hap embed-worker`, with BM25 and exact matching as fallbacks.
+4. **The daemon makes and re-checks the decision.** Learned confidence,
+   graduation state, optional task sources, and any LLM suggestion feed the
+   decision pipeline. Before delivery, every result passes the same kill
+   switch, never-auto patterns, suspected-irreversible check, rate/retry
+   ceilings, audit-before-action rule, and live-pane staleness check.
+5. **Herdr delivers an approved response.** Hap calls Herdr's CLI to send text
+   and Enter, or individual keystrokes for numbered and multi-tab forms. Herdr
+   injects that input into the agent pane; the agent resumes, and later status
+   changes begin the cycle again. A `@noop` decision is audited but sends no
+   input.
+6. **Uncertain decisions return to the operator.** The daemon writes an audit
+   row and escalation, then asks Herdr to show a notification. The TUI and CLI
+   read the same local state. Confirming, correcting, dismissing, pausing, or
+   changing config writes operator-owned state. A confirmed/corrected reply is
+   a human-initiated action, so the frontend records it and sends it through
+   Herdr directly; it then sends a lightweight nudge to the daemon, which
+   reloads the new learning/config state without restarting.
+
+### Optional LLM path
+
+For an unknown situation, the daemon may launch the configured local
+LLM/agent CLI. Consults attach a short-lived `hap mcp` server: the model reads
+the staged context with `get_context` and returns a structured decision with
+`submit_decision`. Rewrites and idle-task generation are one-shot commands
+whose stdout is treated as a proposed result. In every case the daemon — not
+the model or MCP process — owns the final decision, re-applies safety and
+staleness checks, and either sends through Herdr or escalates.
+
+SQLite stores learned signatures, decisions, audit records, escalations,
+operator corrections, and safety counters. `config.toml` remains the
+hand-editable source for thresholds, safety rules, task sources, embedding,
+LLM, and TUI settings. Both live under the local plugin directories described
+in Quickstart; no learning state is stored in Herdr or in an agent's context.
+
 ## How it learns (shadow mode)
 
 The plugin never acts on a situation it hasn't learned from you.
@@ -195,23 +299,23 @@ max_auto_prompts_per_minute = 3    # per agent
 max_error_retries = 2              # per error signature
 
 # Semantic rule matching: situations are matched to learned rules by
-# embedding their masked salient content (llama.cpp, MiniLM by default) and
-# vector-searching stored signatures, so a paraphrased prompt reuses the
-# rule instead of re-learning from zero. When the model is unavailable the
-# daemon falls back to normalized BM25 text matching, and failing that to
-# exact hash matching — it never blocks or crashes on missing assets.
+# embedding their masked salient content (llama.cpp, MiniLM by default) in an
+# isolated worker and vector-searching stored signatures, so a paraphrased
+# prompt reuses the rule instead of re-learning from zero. Worker/model
+# failures degrade to normalized BM25 text matching, then exact hashes.
 [embedding]
 disabled = false
 model_path = ""            # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
 similarity_threshold = 0.90 # min cosine similarity to reuse a learned signature
 bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1]
 gpu_layers = 0              # inert in official builds (GPU backends compiled out)
-# pane_salient_chars = 800  # fallback signature window for idle/unclassified
+model_context_window = 0    # 0 = bundled-model default (512 tokens); input is
+                            # truncated below this limit before embedding
+# pane_salient_chars = 500  # fallback signature window for idle/unclassified
                             # situations (trailing N characters of pane content).
-                            # Changing it (or upgrading past the 400→800 default
-                            # bump) re-keys idle/unclassified rules once, so they
-                            # re-learn; structured approval/choice/error rules
-                            # are unaffected.
+                            # Changing it re-keys idle/unclassified rules once,
+                            # so they re-learn; structured approval/choice/error
+                            # rules are unaffected.
 
 # TUI appearance. `theme` picks a named palette: default, dark, light,
 # high-contrast. Empty or unknown names resolve to default — the exact
@@ -223,7 +327,7 @@ theme = "high-contrast"
 # Optional per-role color overrides, layered on top of the theme; unset
 # roles inherit the theme's value. Values are terminal color strings
 # lipgloss accepts: 256-color codes ("205") or hex ("#ff5faf"). Roles:
-# title, section, error, ok, paused, running, help. Edited in config.toml
+# title, section, error, ok, paused, running, warn, help. Edited in config.toml
 # only (the TUI shows them read-only).
 [tui.palette]
 title = "205"
@@ -231,10 +335,12 @@ error = "#ff5f5f"
 
 # Point agents/workspaces at a task list so idle agents get the next
 # unchecked item. Without a declared source, the plugin falls back to
-# inferring the next task from the agent's own native todo rendering —
-# never free-form prose — held to the higher inferred_task_bar. Inference
-# is agent-type-specific: currently only `claude` is supported (Claude
-# Code's ✔/■/□ todo widget; the in-progress item wins, else the first
+# inferring the next task from the agent's own native todo rendering — never
+# free-form prose — held to the higher inferred_task_bar. If neither source
+# exists, an optional llm.generate_task_command can propose tasks for you to
+# approve. Inference is agent-type-specific: currently only `claude` is
+# supported (Claude Code's ✔/■/□ todo widget; the in-progress item wins,
+# else the first
 # pending one). Other agent types skip inference entirely and escalate.
 #
 # The prompt sent to the agent is rendered from a template. The default is:
@@ -270,6 +376,40 @@ bin/hap task-source --agent backend-dev --template 'Do this next: {next_task_con
 
 (Or in the TUI: select the agent and press `n`.)
 
+### Suggesting tasks when no source exists (optional)
+
+If an idle agent has neither a matching `[[task_sources]]` entry nor an
+inferable native todo, `llm.generate_task_command` can run a one-shot local
+CLI to propose one or more next tasks. This is opt-in: without the command,
+the safe default remains a `no_task_source` escalation and hap invents
+nothing.
+
+The command's stdout may be plain lines or a Markdown list/checklist. Hap
+normalizes it and surfaces it as an escalation; it never auto-accepts a
+generated task. Confirming the suggestion creates
+`<state-dir>/tasks/<agent-name>.md`, marks the first task in progress,
+registers the file as that agent's task source, and sends only the first task.
+Later idle events consume the remaining tasks through the normal declared-task
+flow. Dismiss it with `x`; if generation failed or timed out, press `l` to
+retry. Suggestions are dropped or refused if the agent has started working or
+gained a task source in the meantime.
+
+```toml
+[llm]
+generate_task_command = [
+  "claude", "-p",
+  "Suggest concrete next tasks, most important first. Reply with only the tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
+  "--model", "haiku",
+]
+# Optional first generation for each agent this daemon lifetime:
+# generate_task_command_start = [ ... ]
+# generate_task_timeout_seconds = 60  # omitted: inherits timeout_seconds
+```
+
+Available placeholders are `{self}`, `{agent_name}`, `{agent_type}`,
+`{pane_excerpt}`, and `{cwd}`. The first-generation state is tracked
+independently from LLM consults and rewrites.
+
 ### Never-auto patterns
 
 Irreversible operations are **never** automated, regardless of confidence.
@@ -289,21 +429,24 @@ patterns are merged with a warning, and the next config save rewrites the
 file under the new key.)
 
 or `hap rules add '<regex>'` / `rules remove <index>`, or press `a`/`x` on
-the TUI's *Config* tab — which also lists every scalar config field,
+the TUI's *Config* tab — which also lists the supported scalar config fields,
 adds/removes task sources (`t`/`x`), and clears learned data (`X`).
 Simple fields — numbers, booleans, and the `tui.theme` enum, including
-`llm.pane_excerpt_chars`, `safety.disable_seed`, and
+`llm.pane_excerpt_chars`, `llm.generate_task_timeout_seconds`,
+`embedding.model_context_window`, `safety.disable_seed`, and
 `tui.max_content_width` — edit inline (`enter`) or via
 `hap config set <key> <value>`. Free-text fields (`llm.command`,
 `llm.command_start`, `llm.rewrite_command`, `llm.rewrite_command_start`,
-`llm.rewrite_fallback_template`, `embedding.model_path`) show read-only in
+`llm.rewrite_fallback_template`, `llm.generate_task_command`,
+`llm.generate_task_command_start`, `embedding.model_path`) show read-only in
 the TUI, because a one-line
 prompt mangles quoted argv values — edit them in `config.toml` or with
-`config set`, which accepts every key. The safety indicator patterns and
-`[[capture_delay]]` rules also display read-only on the tab (capture
-delays show the built-in defaults, 10000 ms first event / 500 ms after,
-when none are configured), and long values are truncated to one line —
-the full value lives in `config.toml`. Prompts that *look* destructive
+`config set`, which accepts every listed scalar key. The safety indicator
+patterns and `[[capture_delay]]` rules also display read-only on the tab. The
+`[tui.palette]` overrides are edited directly in `config.toml`. Capture delays show the built-in defaults (10000
+ms first event / 500 ms after) when none are configured, and long values are
+truncated to one line — the full value lives in `config.toml`. Prompts that
+*look* destructive
 but match no pattern are escalated by a suspected-irreversible heuristic
 rather than automated. The heuristic needs corroboration to fire — a
 destructive verb aimed at a data/infrastructure target, explicit no-undo
@@ -321,6 +464,31 @@ pattern = '(?i)compact\s+the\s+conversation'
 agents = ["codex", "agy"]   # "*" or omit for all agents
 ```
 
+### Daemon and semantic-matching health
+
+`hap status` and the TUI share the same health assessment. They report a
+stale or hung daemon, a runtime-degraded embedder, crash-looping, and the
+crash-loop breaker's auto-disable/give-up states. The detached daemon's stderr
+is captured at `<state-dir>/daemon.stderr.log` (rotated at 256 KiB); an
+error-severity TUI banner offers `!` to open the last 16 KiB in a scrollable
+detail view. The same path appears in `hap status` and `hap state-dir` makes it
+easy to locate.
+
+Llama.cpp runs in a persistent `hap embed-worker` child rather than inside the
+daemon. A native abort or stalled embedding call therefore kills/restarts the
+worker and degrades semantic matching to BM25/exact matching after repeated
+failures while the monitoring daemon stays alive. The outer crash-loop breaker
+is still a final safeguard: clustered daemon restarts first latch embeddings
+off, then stop respawning if the daemon continues to crash. Changing any
+`[embedding]` setting clears that latch and retries.
+
+Embedding input is token-truncated before it reaches the model. The bundled
+MiniLM uses `model_context_window = 0` (resolved to 512 positions); custom
+models can set their real limit explicitly. Positive values below 256 are
+clamped to 256. Never configure a value above the model's actual position
+limit, because llama.cpp can abort the worker when that limit is exceeded.
+The fallback idle/unclassified signature window defaults to 500 characters.
+
 ### Local LLM fallback (optional)
 
 When no confident learned rule applies, the plugin can consult a local
@@ -335,7 +503,7 @@ form; a menu-less prompt such as a bare y/n takes `recommend_action`
 literal text instead), while `idle`/`error` require `recommend_action`
 (the literal reply text) and reject `select_options`;
 `recommend_action "@noop"` ("no reply needed") is accepted for any
-situation, and an optional `confident_score` (0-100) is shown on the
+situation, and a `confident_score` (0-100) is shown on the
 escalation entry so you can weigh the suggestion. Example for Claude
 Code:
 
@@ -370,6 +538,14 @@ enables the fallback (`command` is what gates it):
 command       = [ "claude", "-p", "...ongoing consult prompt...", "--model", "haiku" ]
 command_start = [ "claude", "-p", "...first-touch kickoff prompt...", "--model", "opus" ]
 ```
+
+The preferred template also has a one-shot **fast-fail fallback**. If it
+exits with an error in under one second without staging a decision, hap tries
+the other template (`command` ↔ `command_start`) once. This works in both
+directions, so a failed first-touch command can fall back to the ongoing one,
+and a failed ongoing/resume command can try the start form. Timeouts, clean
+exits without `submit_decision`, cancelled runs, and absent or identical
+alternates are not retried automatically.
 
 `get_context` hands the model the classified situation (type, options,
 permission verb, error summary), a pane excerpt (the last
@@ -442,9 +618,12 @@ suggestion is re-gated through the same never-auto patterns, kill switch, and ra
 guards; it auto-acts only when the LLM's self-reported confidence meets
 `auto_act_confidence_threshold` (0-100; default 999 = never) and the action
 doesn't contradict your learned history — otherwise the suggestion is surfaced
-for you to confirm. On timeout or no submission the situation escalates.
+for you to confirm. On timeout, CLI failure, or no submission the situation
+escalates. For a retryable failed/timed-out consult, press `l` on its TUI
+escalation; hap refreshes the agent's live pane and status before re-running
+the consult, and disables retry while another consult is already in flight.
 
-The model can also submit `action: "@noop"` (also accepted: `noop`,
+The model can also submit `recommend_action: "@noop"` (also accepted: `noop`,
 `no_op`, `no-op`) to say **no reply is needed** — the agent finished or is
 only reporting status, and any prompt would just nudge it into another
 round trip. A noop is recorded in the audit trail and learned like any
@@ -477,6 +656,11 @@ rewrite_fallback_template = "You must act based on the following: {original_text
 # empty inherits rewrite_command):
 # rewrite_command_start = [ "claude", "-p", "...first-rewrite prompt...", "--model", "haiku" ]
 ```
+
+As with consult commands, a rewrite command that exits with an error in under
+one second is retried once with the other configured rewrite template
+(`rewrite_command` ↔ `rewrite_command_start`). Timeouts and clean empty or
+oversized output use the normal rewrite fallback instead of retrying.
 
 Placeholders in `rewrite_command`: `{text}` (the literal reply a rule
 resolved to), `{situation_type}`, `{agent_type}`, `{agent_name}` (the
