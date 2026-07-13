@@ -35,7 +35,7 @@ func cosine(a, b []float32) float64 {
 }
 
 func TestEmbedTextRealModel(t *testing.T) {
-	l := New(config.Embedding{ModelPath: testModelPath(t)})
+	l := NewEngine(config.Embedding{ModelPath: testModelPath(t)})
 	defer l.Close()
 	ctx := context.Background()
 
@@ -85,7 +85,7 @@ func TestEmbedTextRealModel(t *testing.T) {
 }
 
 func TestEmbedMissingModelDegrades(t *testing.T) {
-	l := New(config.Embedding{ModelPath: filepath.Join(t.TempDir(), "missing.gguf")})
+	l := NewEngine(config.Embedding{ModelPath: filepath.Join(t.TempDir(), "missing.gguf")})
 	defer l.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -102,11 +102,11 @@ func TestEmbedMissingModelDegrades(t *testing.T) {
 }
 
 func TestModelIDIsBasename(t *testing.T) {
-	l := New(config.Embedding{ModelPath: "/x/y/custom-model.gguf"})
+	l := NewEngine(config.Embedding{ModelPath: "/x/y/custom-model.gguf"})
 	if l.ModelID() != "custom-model.gguf" {
 		t.Errorf("ModelID = %q", l.ModelID())
 	}
-	def := New(config.Embedding{})
+	def := NewEngine(config.Embedding{})
 	if def.ModelID() != DefaultModelFile {
 		t.Errorf("default ModelID = %q, want %q", def.ModelID(), DefaultModelFile)
 	}

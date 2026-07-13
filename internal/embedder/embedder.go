@@ -58,9 +58,17 @@ type Llama struct {
 	closed   atomic.Bool
 }
 
-// New builds an embedder from config. An empty ModelPath resolves to the
-// bundled model under the plugin root (<root>/models/...).
-func New(cfg config.Embedding) *Llama {
+// NewEngine builds the in-process, CGO-backed embedder from config. An empty
+// ModelPath resolves to the bundled model under the plugin root
+// (<root>/models/...).
+//
+// This is the engine that actually links llama.cpp. In production it runs
+// inside the `hap embed-worker` child process (see RunWorker), never in the
+// daemon itself: a native abort in llama.cpp (GGML_ASSERT → SIGABRT) is
+// uncatchable from Go and would take the whole process down, so the daemon
+// drives it out-of-process through Client instead (see New). Direct callers
+// are the worker and the engine's own tests.
+func NewEngine(cfg config.Embedding) *Llama {
 	return &Llama{modelPath: ResolveModelPath(cfg), gpuLayers: cfg.GPULayers}
 }
 

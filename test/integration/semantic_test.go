@@ -179,7 +179,10 @@ func TestRealEmbeddingSemanticMatch(t *testing.T) {
 	}
 	defer st.Close()
 
-	emb := embedder.New(config.Embedding{ModelPath: modelPath})
+	// Route through the subprocess-isolated Client (the #60 fix), re-execing
+	// this test binary as the embed worker (see TestMain), so the real llama.cpp
+	// + FAISS pipeline is exercised end to end through the out-of-process path.
+	emb := embedder.NewReexecClient(config.Embedding{ModelPath: modelPath})
 	defer emb.Close()
 
 	fh := &semHerdr{}

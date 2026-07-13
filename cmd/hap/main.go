@@ -126,6 +126,12 @@ func run(verb string, args []string) error {
 	switch verb {
 	case "daemon":
 		return runDaemon(ctx, paths, args)
+	case "embed-worker":
+		// Internal subcommand: the short-lived child that the embedder Client
+		// spawns to run llama.cpp out-of-process. It takes its config from the
+		// environment the parent sets and speaks the framed stdin/stdout embed
+		// protocol; not meant to be run by hand.
+		return embedder.RunWorker(ctx, os.Stdin, os.Stdout)
 	case "mcp":
 		return runMCP(ctx, paths)
 	case "tui":
