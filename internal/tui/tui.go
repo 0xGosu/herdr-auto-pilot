@@ -640,6 +640,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.viewSignatureDetail()
 		}
 		return m.viewSelected()
+	case "!":
+		// Global: open the daemon's captured stderr (the crash reason behind an
+		// error-severity banner) as a scrollable detail (#83).
+		return m.viewDaemonStderr()
 	case "f":
 		if m.tab == tabSignatures {
 			switch m.sigMode {
@@ -980,6 +984,41 @@ func (m Model) renameSelected() (tea.Model, tea.Cmd) {
 
 // viewSelected opens a full-record overlay for the selected row. The record
 // is snapshotted at open time; the build closure re-wraps it on resize.
+// viewDaemonStderr opens the daemon's captured stderr as a scrollable detail —
+// the last-crash reason behind a hung/crash-looping/gave-up banner (#83). Only
+// offered in an error state: a healthy daemon has no crash to explain.
+func (m Model) viewDaemonStderr() (tea.Model, tea.Cmd) {
+	if m.data.daemonHealth.Severity() != frontend.DaemonError {
+		m.message = "daemon is not crashed/hung — no captured output to show"
+		return m, nil
+	}
+	path, tail := m.app.DaemonStderrTail()
+	build := func(width int) []string {
+		var lines []string
+		if path != "" {
+			lines = append(lines, path, "")
+		}
+		if tail == "" {
+			return append(lines, "(no captured stderr — the daemon left no output)")
+		}
+		for _, ln := range strings.Split(tail, "\n") {
+			if ln == "" {
+				lines = append(lines, "")
+				continue
+			}
+			lines = append(lines, wrapText(ln, width)...)
+		}
+		return lines
+	}
+	m.message = ""
+	m.detail = &detailView{
+		title: "Daemon captured output (last crash)",
+		lines: build(m.wrapWidth()),
+		build: build,
+	}
+	return m, nil
+}
+
 func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 	switch m.tab {
 	case tabAgents:
@@ -1601,6 +1640,11 @@ func (m Model) View() string {
 		style := st.warn
 		if m.data.daemonHealth.Severity() == frontend.DaemonError {
 			style = st.err
+			// The captured crash output explains the "why"; point the operator
+			// at the in-app viewer (same line, no extra layout row).
+			if m.data.daemonHealth.StderrLog != "" {
+				banner += "  ·  press ! for captured output"
+			}
 		}
 		fmt.Fprintf(&b, "%s\n", style.Render(banner))
 	}
