@@ -18,6 +18,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -359,7 +360,8 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	// heartbeat support, or one not running); hung is a held lock with a stale
 	// beat — a live-but-wedged daemon, the case flock alone can't reveal.
 	var health daemonhealth.Health
-	var haveHealth, hung bool
+	var guard crashguard.State
+	var haveHealth, hung, gaveUp bool
 	if app.DaemonInfo != nil {
 		running, pid, ver := app.DaemonInfo()
 		if running && app.StateDir != "" {
@@ -376,8 +378,17 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 		}
 		now := time.Now()
 		hung = running && haveHealth && health.Stale(now)
+		// The crash-loop breaker may have latched a hard stop (daemon not
+		// starting) or an embedder auto-disable — surface both.
+		if app.StateDir != "" {
+			guard, _ = crashguard.Read(app.StateDir)
+		}
 		label := fmt.Sprintf("running %s (pid %d)", daemonlock.VersionLabel(ver), pid)
 		switch {
+		case !running && guard.GaveUp:
+			// Respawns are suppressed until the [embedding] config changes.
+			fmt.Fprintf(out, "daemon:              NOT STARTING — crash-loop breaker gave up: %s\n", guard.Reason)
+			gaveUp = true
 		case !running:
 			fmt.Fprintf(out, "daemon:              not running\n")
 		case hung:
@@ -401,12 +412,17 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "pending escalations: %d\n", st.PendingEscalations)
 	fmt.Fprintf(out, "monitored agents:    %d\n", len(st.MonitoredAgents))
-	if st.Embedding != "" {
+	// The crash-loop breaker's auto-disable is the authoritative state and
+	// replaces the config-derived line (which can't know matching was forced
+	// off); it latches until the [embedding] config changes.
+	switch {
+	case guard.EmbeddingOff:
+		fmt.Fprintf(out, "semantic matching:   AUTO-DISABLED by crash-loop breaker — %s\n", guard.Reason)
+	case st.Embedding != "":
 		fmt.Fprintf(out, "semantic matching:   %s\n", st.Embedding)
 	}
-	// The config-derived line above says what SHOULD be running; the daemon's
-	// live heartbeat can report the embedder soft-degraded (embed calls latched
-	// to text fallback), which that line would otherwise hide.
+	// A running embedder can still be soft-degraded (embed calls latched to
+	// text fallback) — the config-derived line above would otherwise hide it.
 	if haveHealth && health.Embedder == daemonhealth.EmbedderDegraded {
 		fmt.Fprintf(out, "embedder health:     DEGRADED at runtime — %s\n", health.EmbedderNote())
 	}
@@ -420,9 +436,10 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 		fmt.Fprintf(out, "last kill event:     %s by %s at %s\n",
 			st.LatestKill.State, st.LatestKill.Author, st.LatestKill.CreatedAt.Format(time.RFC3339))
 	}
-	// A hung daemon is a failure state: exit non-zero so scripted checks and
-	// the operator notice, even though the status body already explained it.
-	if hung {
+	// A hung daemon or a latched crash-loop give-up is a failure state: exit
+	// non-zero so scripted checks and the operator notice, even though the
+	// status body already explained it.
+	if hung || gaveUp {
 		return ErrUnhealthy
 	}
 	return nil

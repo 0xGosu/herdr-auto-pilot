@@ -19,6 +19,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemon"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
@@ -169,6 +170,45 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 	}
 	defer lock.Release()
 
+	// Crash-loop breaker: record this boot and decide whether to degrade
+	// BEFORE building the daemon — a native embedder abort kills us inside
+	// daemon.New (model load), so the only lever is the persisted boot history.
+	bootCfg, _ := config.Load(paths.File())
+	guard, _ := crashguard.Read(paths.StateDir)
+	guard, decision := crashguard.Evaluate(guard, time.Now(), embeddingDigest(bootCfg))
+	if err := crashguard.Write(paths.StateDir, guard); err != nil {
+		// A failed write means this boot is not recorded, so the breaker cannot
+		// accumulate toward its threshold — it is effectively disarmed until the
+		// disk recovers. Log loudly rather than swallow it; continuing is still
+		// right (a guard-file write failure must not itself block the daemon).
+		slog.Error("crashguard write failed; crash-loop breaker impaired this boot", "error", err)
+	}
+	if decision.GiveUp {
+		// Looping even with the embedder disabled — degrading can't help.
+		// Exit without running; ensureDaemon declines future respawns until
+		// the [embedding] config changes.
+		slog.Error("daemon not starting: unrecoverable crash-loop", "reason", decision.Reason)
+		return nil
+	}
+	if decision.DisableEmbedding {
+		slog.Warn("crash-loop mitigation: starting with the embedder disabled (BM25 fallback)", "reason", decision.Reason)
+	}
+	// Reset the boot history once we survive past the window (loop broken). If
+	// we crash first this never fires, so the count keeps climbing toward the
+	// mitigation threshold. This read-modify-write can race an embedder-reload
+	// that clears the latch (both are in-process, un-serialized by the flock):
+	// worst case it briefly resurrects a just-cleared latch, which the next
+	// reload's digest check re-clears — bounded and self-healing, never an
+	// incorrect give-up (that path creates no timer).
+	survived := time.AfterFunc(crashguard.Window, func() {
+		if g, ok := crashguard.Read(paths.StateDir); ok {
+			if g2, changed := g.Survived(); changed {
+				_ = crashguard.Write(paths.StateDir, g2)
+			}
+		}
+	})
+	defer survived.Stop()
+
 	st, err := store.Open(paths.DBPath())
 	if err != nil {
 		return err
@@ -194,9 +234,34 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 
 	// The embedder is likewise rebuilt whenever the [embedding] section
 	// changes; nil (disabled) leaves BM25/exact matching.
+	//
+	// The FIRST build honors the authoritative boot decision directly, rather
+	// than re-deriving suppression from the crashguard file — if it re-derived,
+	// any future divergence between how bootCfg and the factory's cfg normalize
+	// the [embedding] section would make the mitigation boot rebuild the very
+	// embedder that is aborting. Later builds (config reloads) consult the
+	// persisted latch so that editing the [embedding] config re-enables
+	// semantic matching live, without a restart.
+	firstBuild := true
 	embedderFactory := func(cfg config.Config) ports.EmbedderPort {
 		if cfg.Embedding.Disabled {
 			return nil
+		}
+		if firstBuild {
+			firstBuild = false
+			if decision.DisableEmbedding {
+				return nil
+			}
+			return embedder.New(cfg.Embedding)
+		}
+		if g, ok := crashguard.Read(paths.StateDir); ok {
+			suppressed, cleared, changed := crashguard.EmbeddingSuppressed(g, embeddingDigest(cfg))
+			if changed {
+				_ = crashguard.Write(paths.StateDir, cleared)
+			}
+			if suppressed {
+				return nil
+			}
 		}
 		return embedder.New(cfg.Embedding)
 	}
@@ -229,7 +294,30 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 // Herdr event hook so hooks return promptly). A daemon left over from a
 // different binary version is stopped and replaced, so binary upgrades
 // take effect without a manual kill.
+// embeddingDigest fingerprints the [embedding] config so the crash-loop
+// breaker can tell an operator config change (which lifts a latch) from a
+// plain restart. Any change to the section produces a different string.
+func embeddingDigest(cfg config.Config) string {
+	return fmt.Sprintf("%+v", cfg.Embedding)
+}
+
 func ensureDaemon(paths config.Paths) error {
+	// Crash-loop hard stop: after we've given up (still looping even with the
+	// embedder off), decline to respawn until the [embedding] config changes —
+	// this is what actually ends the storm herdr's per-event --ensure would
+	// otherwise sustain.
+	if g, ok := crashguard.Read(paths.StateDir); ok {
+		cfg, _ := config.Load(paths.File())
+		blocked, cleared, reason := crashguard.SpawnBlocked(g, embeddingDigest(cfg))
+		if blocked {
+			slog.Warn("daemon respawn suppressed by crash-loop breaker", "reason", reason)
+			return nil
+		}
+		if g.GaveUp && !cleared.GaveUp {
+			// Config changed since we gave up: lift the latch so this start retries.
+			_ = crashguard.Write(paths.StateDir, cleared)
+		}
+	}
 	return daemonlock.EnsureFresh(paths, buildinfo.Version, 3*time.Second, daemonlock.Stop, func() error {
 		self, err := os.Executable()
 		if err != nil {
