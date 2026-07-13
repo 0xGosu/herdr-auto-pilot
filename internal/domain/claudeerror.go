@@ -16,6 +16,13 @@ var (
 	// bounded gap tolerates the "·" separator (and minor spacing drift) while
 	// staying on one line so it can't span unrelated narration.
 	claudeInterruptedRE = regexp.MustCompile(`(?i)interrupted\b.{0,12}what should claude do instead`)
+	// claudeAPIResponseRetryRE matches Claude Code's live API/network retry
+	// status. Keep all separators and phrases in the signal so ordinary prose
+	// about waiting for an API or checking a network does not become an error.
+	// The countdown may contain any combination of hour, minute, and second
+	// components (for example "2m 2s" or "45s"). Horizontal whitespace keeps
+	// the match confined to the rendered status line.
+	claudeAPIResponseRetryRE = regexp.MustCompile(`(?i)waiting[ \t]+for[ \t]+api[ \t]+response[ \t]*·[ \t]*will[ \t]+retry[ \t]+in[ \t]+(?:\d+[hms][ \t]*)+·[ \t]*check[ \t]+your[ \t]+network\b`)
 )
 
 // Stable ErrorSummary labels for Claude's built-in error forms — used as the
@@ -24,6 +31,7 @@ var (
 const (
 	ClaudeErrorLimit       = "usage-limit"
 	ClaudeErrorInterrupted = "interrupted"
+	ClaudeErrorAPIRetry    = "api-response-retry"
 )
 
 // ClaudeErrorForm reports whether pane content shows one of Claude Code's
@@ -36,6 +44,8 @@ func ClaudeErrorForm(pane string) (kind string, ok bool) {
 		return ClaudeErrorLimit, true
 	case claudeInterruptedRE.MatchString(pane):
 		return ClaudeErrorInterrupted, true
+	case claudeAPIResponseRetryRE.MatchString(pane):
+		return ClaudeErrorAPIRetry, true
 	}
 	return "", false
 }

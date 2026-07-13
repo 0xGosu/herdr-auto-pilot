@@ -1,3 +1,4 @@
+approval_claude_plan.txt status=blocked type=approval verb=proceed options=4
 approval_permission.txt status=blocked type=approval verb=proceed options=3
 approval_yn.txt status=blocked type=approval verb= options=0
 choice_claude_mcq.txt status=blocked type=choice verb= options=5
@@ -5,6 +6,7 @@ choice_claude_mcq_tabs.txt status=blocked type=choice verb= options=5
 choice_claude_mcq_tabs_v2.txt status=blocked type=choice verb= options=3
 choice_library.txt status=blocked type=choice verb= options=3
 error_build.txt status=blocked type=unclassifiable verb= options=0
+error_claude_api_retry.txt status=blocked type=error verb= options=0
 error_claude_interrupted.txt status=blocked type=error verb= options=0
 error_claude_limit.txt status=blocked type=error verb= options=0
 idle_finished.txt status=idle type=idle verb= options=0
