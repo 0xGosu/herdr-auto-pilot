@@ -289,7 +289,7 @@ func TestPlainNumberedListNotChoice(t *testing.T) {
 
 func TestClaudeErrorSituations(t *testing.T) {
 	c := New(nil)
-	for _, name := range []string{"error_claude_limit.txt", "error_claude_interrupted.txt"} {
+	for _, name := range []string{"error_claude_limit.txt", "error_claude_interrupted.txt", "error_claude_api_retry.txt"} {
 		data, err := os.ReadFile(filepath.Join("testdata", "transcripts", name))
 		if err != nil {
 			t.Fatal(err)
@@ -340,6 +340,33 @@ func TestApprovalWinsOverMCQFooter(t *testing.T) {
 		"❯ 1. Yes\n  2. No\n\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
 	if s := c.Classify("claude", "blocked", pane); s.Type != domain.SituationApproval {
 		t.Fatalf("approval must win over MCQ footer, got %v", s.Type)
+	}
+}
+
+// Claude's plan-mode approval panel ("Claude has written up a plan and is
+// ready to execute. Would you like to proceed?" with a numbered menu) asks
+// with "would you like to", not "do you want to", so it previously fell
+// through to unclassifiable (bare escalation). It must classify as approval
+// with the four menu options extracted.
+func TestPlanModeApprovalClassifiesApproval(t *testing.T) {
+	c := New(nil)
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "approval_claude_plan.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.Classify("claude", "blocked", string(data))
+	if s.Type != domain.SituationApproval {
+		t.Fatalf("plan-mode approval type = %v, want approval", s.Type)
+	}
+	if len(s.Options) != 4 {
+		t.Errorf("plan-mode approval options = %d (%v), want 4", len(s.Options), s.Options)
+	}
+	if !strings.HasPrefix(s.PermissionVerb, "proceed") {
+		t.Errorf("plan-mode approval verb = %q, want it to start with %q", s.PermissionVerb, "proceed")
+	}
+	// The same panel content when NOT blocked must not read as a live prompt.
+	if s := c.Classify("claude", "working", string(data)); s.Type == domain.SituationApproval {
+		t.Error("plan-mode panel at non-blocked status must not classify approval")
 	}
 }
 

@@ -23,6 +23,12 @@ func DefaultRules() []config.ClassifierRule {
 			AgentType: "*", Situation: "approval",
 			Regex: []string{
 				`(?i)do you want to (proceed|continue|allow|run|make this edit|create|apply)`,
+				// Claude's plan-mode approval ("Claude has written up a plan and
+				// is ready to execute. Would you like to proceed?") asks with
+				// "would you like to", not "do you want to". Kept in step with the
+				// verb set above; blocked-gating keeps it from tripping on
+				// narration.
+				`(?i)would you like to (proceed|continue|allow|run|make this edit|create|apply)`,
 				`(?i)(allow|permit|approve|authorize) (this|the) (command|action|tool|edit|operation|change)`,
 				`(?i)\((y/n|yes/no)\)`,
 				`(?i)permission (request|required|needed)`,
@@ -177,7 +183,7 @@ func matchRule(r compiledRule, pane string) bool {
 	return false
 }
 
-var permissionVerbRE = regexp.MustCompile(`(?i)do you want to ((?:proceed|continue|allow|run|make|create|apply)[^?\n]*)`)
+var permissionVerbRE = regexp.MustCompile(`(?i)(?:do you want to|would you like to) ((?:proceed|continue|allow|run|make|create|apply)[^?\n]*)`)
 var allowVerbRE = regexp.MustCompile(`(?i)(?:allow|permit|approve|authorize) ((?:this|the) [^?\n]*)`)
 var errorLineRE = regexp.MustCompile(`(?im)^\s*(?:error|fatal|panic|exception)[:\s]+(.{0,160})`)
 

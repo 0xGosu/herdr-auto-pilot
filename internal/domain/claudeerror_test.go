@@ -13,11 +13,15 @@ func TestClaudeErrorForm(t *testing.T) {
 		{"limit curly apostrophe", "You’ve hit your limit\n", true},
 		{"limit usage qualifier", "you've hit your usage limit for today\n", true},
 		{"interrupted prompt", "⎿  Interrupted · What should Claude do instead?\n", true},
+		{"api retry minutes and seconds", "✻ Waiting for API response · will retry in 2m 2s · check your network\n", true},
+		{"api retry seconds", "✽  waiting for api response · will retry in 45s · check your network\n", true},
 		// Ordinary error-shaped narration must NOT match (the whole point of
 		// the tightening).
 		{"narrated build failure", "ERROR: build failed with exit code 1\nThe build failed. Retry, skip, or abort?\n", false},
 		{"narrated stack trace", "panic: nil pointer\ngoroutine 1 [running]:\nmain.main()\n", false},
 		{"narrated interrupt word", "the download was interrupted midway and resumed\n", false},
+		{"narrated network retry", "Waiting for an API response; I will retry after checking your network.\n", false},
+		{"retry without network warning", "Waiting for API response · will retry in 2m 2s\n", false},
 		{"empty", "", false},
 	}
 	for _, tc := range cases {
@@ -39,5 +43,8 @@ func TestClaudeErrorFormKind(t *testing.T) {
 	}
 	if kind, _ := ClaudeErrorForm("Interrupted · What should Claude do instead?\n"); kind != ClaudeErrorInterrupted {
 		t.Errorf("interrupted kind = %q, want %q", kind, ClaudeErrorInterrupted)
+	}
+	if kind, _ := ClaudeErrorForm("Waiting for API response · will retry in 2m 2s · check your network\n"); kind != ClaudeErrorAPIRetry {
+		t.Errorf("API retry kind = %q, want %q", kind, ClaudeErrorAPIRetry)
 	}
 }

@@ -1,0 +1,49 @@
+
+  ⎿  ✔ Advisor has reviewed the conversation and will apply the feedback
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Ready to code?
+
+   Here is Claude's plan:
+  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+   Idle-agent LLM task suggestion
+
+   Context
+
+   Why: Today, when an agent goes idle with no task source (the operator
+   declared no [[task_sources]] and hap can't infer a next task from the pane's
+   native todo widget), hap escalates with no_task_source and sends nothing —
+   this is the load-bearing FR-011 invariant: "with no task source the plugin
+   must never synthesize a prompt" (internal/domain/decide.go:164-166,263). The
+   agent just sits idle until a human intervenes.
+
+   Goal: When a new llm.generate_task_command is configured, an idle agent
+   with no task source instead triggers a one-shot local-LLM call that suggests a
+   task. The suggestion surfaces as a normal escalation. The operator can:
+   - confirm+send (enter/y) → hap writes a per-agent tasks.md (single
+   in-progress [-] item), registers it as a [[task_sources]] entry, and sends
+   the task text to the agent's pane; or
+   - dismiss (x) → nothing happens; or
+   - if generation failed, the escalation shows the failure rationale and the
+   operator retries with l (same key as the existing LLM-consult retry).
+
+   Outcome: Idle agents get a proactive, operator-approved first task, and once
+   tasks.md exists the normal declared-task flow takes over on subsequent idles
+   (the completed-list template steers the agent to decide what's next) — hap never
+   re-generates for that agent.
+
+   Key design decisions (confirmed):
+   - tasks.md lives in the plugin state dir: <StateDir>/tasks/<agent-name>.md
+   (no repo pollution).
+   - The presence of generate_task_command is itself the opt-in — no separate                                                                                                                        ↓
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+   ❯ 1. Yes, and use auto mode
+     2. Yes, manually approve edits
+     3. No, refine with Ultraplan on Claude Code on the web
+     4. Tell Claude what to change
+        shift+tab to approve with this feedback
+
+   ctrl+g to edit in  VS Code  · ~/.claude/plans/i-want-to-make-sorted-zebra.md
