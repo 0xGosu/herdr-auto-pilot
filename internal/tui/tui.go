@@ -1024,7 +1024,8 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 
 // detailPageSize is how many detail lines fit under the header and help:
 // header title + tabs + blank (3), detail title + blank (2), the more-lines
-// indicator (1), and blank + help (2) — plus the error line when present.
+// indicator (1), and blank + help (2) — plus the error line and the daemon
+// health banner when present.
 func (m Model) detailPageSize() int {
 	if m.height <= 0 {
 		return 20
@@ -1033,20 +1034,26 @@ func (m Model) detailPageSize() int {
 	if m.data.err != nil {
 		chrome++
 	}
+	if m.data.daemonHealth.Banner() != "" {
+		chrome++
+	}
 	return max(1, m.height-chrome)
 }
 
 // listPageSize is how many list rows fit under the current pane chrome,
 // mirroring detailPageSize's accounting (AR-002): header title + tabs +
 // blank (3), the more-rows indicator (1), and blank + help (2) — plus the
-// error line, the search/filter lines, and the prompt, hint, and status
-// areas when present.
+// error line, the daemon health banner, the search/filter lines, and the
+// prompt, hint, and status areas when present.
 func (m Model) listPageSize() int {
 	if m.height <= 0 {
 		return 20
 	}
 	chrome := 6
 	if m.data.err != nil {
+		chrome++
+	}
+	if m.data.daemonHealth.Banner() != "" {
 		chrome++
 	}
 	if m.searching || (m.tab.isList() && m.query[m.tab] != "") {

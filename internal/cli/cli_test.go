@@ -174,6 +174,27 @@ func TestStatusCrashLoopGaveUpUnhealthy(t *testing.T) {
 	}
 }
 
+func TestStatusCrashLoopingDownUnhealthy(t *testing.T) {
+	app, _ := testApp(t)
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	app.DaemonInfo = func() (bool, int, string) { return false, 0, "" } // down
+	now := time.Now()
+	if err := crashguard.Write(stateDir, crashguard.State{
+		Starts: []time.Time{now.Add(-20 * time.Second), now.Add(-5 * time.Second)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "status")
+	if !errors.Is(err, cli.ErrUnhealthy) {
+		t.Fatalf("a down, crash-looping daemon must exit non-zero, got err=%v", err)
+	}
+	if !strings.Contains(out, "DOWN") || !strings.Contains(out, "crash-looping") {
+		t.Errorf("must flag the daemon down and crash-looping, got:\n%s", out)
+	}
+}
+
 func TestStatusFreshHeartbeatHealthy(t *testing.T) {
 	app, _ := testApp(t)
 	stateDir := t.TempDir()

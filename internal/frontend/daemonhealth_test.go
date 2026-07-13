@@ -126,6 +126,68 @@ func TestAssessGaveUp(t *testing.T) {
 	}
 }
 
+func TestAssessCrashLoopingDown(t *testing.T) {
+	app := appWithDaemon(t, false, 0, "") // daemon currently down
+	// A recent cluster of boots (crashing + being respawned), not yet gave-up.
+	now := time.Now()
+	crashguard.Write(app.StateDir, crashguard.State{
+		Starts: []time.Time{now.Add(-20 * time.Second), now.Add(-5 * time.Second)},
+	})
+	h := app.AssessDaemonHealth()
+	if !h.CrashLooping || h.Severity() != DaemonError {
+		t.Errorf("down with a recent boot cluster should be crash-looping/error: %+v", h)
+	}
+	if h.RecentRestarts != 2 {
+		t.Errorf("RecentRestarts = %d, want 2", h.RecentRestarts)
+	}
+	if !strings.Contains(h.Banner(), "crash-looping") {
+		t.Errorf("banner = %q, want crash-looping", h.Banner())
+	}
+}
+
+func TestAssessLoneBootNotCrashLooping(t *testing.T) {
+	// A single recent boot while down is ambiguous with a brief clean run — do
+	// NOT flag it as crash-looping (avoid false alarms on a normal stop).
+	app := appWithDaemon(t, false, 0, "")
+	crashguard.Write(app.StateDir, crashguard.State{
+		Starts: []time.Time{time.Now().Add(-5 * time.Second)},
+	})
+	h := app.AssessDaemonHealth()
+	if h.CrashLooping || h.Severity() != DaemonOK {
+		t.Errorf("a lone boot must not read as crash-looping: %+v", h)
+	}
+}
+
+func TestAssessStaleStartsNotCrashLooping(t *testing.T) {
+	// Boots older than the breaker window are a since-recovered loop, not a
+	// current one.
+	app := appWithDaemon(t, false, 0, "")
+	old := time.Now().Add(-2 * crashguard.Window)
+	crashguard.Write(app.StateDir, crashguard.State{Starts: []time.Time{old, old}})
+	h := app.AssessDaemonHealth()
+	if h.CrashLooping {
+		t.Errorf("stale boots outside the window must not flag crash-looping: %+v", h)
+	}
+}
+
+func TestAssessGaveUpOutranksCrashLooping(t *testing.T) {
+	// Once given up, that terminal state wins over the crash-looping signal
+	// even though a recent boot cluster is still on disk.
+	app := appWithDaemon(t, false, 0, "")
+	now := time.Now()
+	crashguard.Write(app.StateDir, crashguard.State{
+		GaveUp: true, ConfigDigest: "cfg", Reason: "boom",
+		Starts: []time.Time{now.Add(-20 * time.Second), now.Add(-5 * time.Second)},
+	})
+	h := app.AssessDaemonHealth()
+	if h.CrashLooping {
+		t.Errorf("give-up must suppress the crash-looping flag: %+v", h)
+	}
+	if !h.GaveUp || !strings.Contains(h.Banner(), "NOT STARTING") {
+		t.Errorf("give-up banner must win, got %q (%+v)", h.Banner(), h)
+	}
+}
+
 func TestAssessVersionStale(t *testing.T) {
 	app := appWithDaemon(t, true, 100, "v0.0.1-old")
 	daemonhealth.Write(app.StateDir, daemonhealth.Health{

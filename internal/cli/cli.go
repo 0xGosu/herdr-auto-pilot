@@ -364,6 +364,10 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 		case !h.Running && h.GaveUp:
 			// Respawns are suppressed until the [embedding] config changes.
 			fmt.Fprintf(out, "daemon:              NOT STARTING — crash-loop breaker gave up: %s\n", h.Reason)
+		case !h.Running && h.CrashLooping:
+			// Down with a recent boot cluster: crashing and being respawned.
+			fmt.Fprintf(out, "daemon:              DOWN — crash-looping (%d restarts recently); recent output: %s\n",
+				h.RecentRestarts, h.StderrLog)
 		case !h.Running:
 			fmt.Fprintf(out, "daemon:              not running\n")
 		case h.Hung:
@@ -414,7 +418,7 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	// A hung daemon or a latched crash-loop give-up is a failure state: exit
 	// non-zero so scripted checks and the operator notice, even though the
 	// status body already explained it.
-	if h.Hung || h.GaveUp {
+	if h.Hung || h.GaveUp || h.CrashLooping {
 		return ErrUnhealthy
 	}
 	return nil

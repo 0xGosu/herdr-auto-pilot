@@ -37,6 +37,12 @@ type DaemonHealth struct {
 	HeartbeatAge time.Duration
 	// GaveUp: the crash-loop breaker stopped restarting the daemon.
 	GaveUp bool
+	// CrashLooping: the daemon is down with a recent cluster of boots — it is
+	// crashing and being respawned, but the breaker has not yet given up. This
+	// is the primary #60 symptom (a dead daemon that otherwise looks quiet).
+	CrashLooping bool
+	// RecentRestarts is how many daemon boots fall within the breaker's window.
+	RecentRestarts int
 	// EmbeddingAutoDisabled: the breaker forced the embedder off (BM25 fallback).
 	EmbeddingAutoDisabled bool
 	// EmbedderDegraded: the running embedder soft-degraded (embed calls latched
@@ -92,6 +98,21 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 			h.GaveUp = true
 			h.Reason = g.Reason
 		}
+		// Down with a recent boot cluster = crash-looping (crashing + being
+		// respawned) but not yet given up. Count only boots within the breaker's
+		// window so a stale record from an old, since-recovered loop doesn't
+		// false-flag; a lone recent boot is ambiguous with a brief clean run, so
+		// require a cluster (>=2).
+		if !h.Running {
+			for _, s := range g.Starts {
+				if now.Sub(s) <= crashguard.Window {
+					h.RecentRestarts++
+				}
+			}
+			if h.RecentRestarts >= 2 && !h.GaveUp {
+				h.CrashLooping = true
+			}
+		}
 	}
 	return h
 }
@@ -99,7 +120,7 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 // Severity ranks the health for a single-banner/exit-code front-end.
 func (h DaemonHealth) Severity() DaemonSeverity {
 	switch {
-	case h.Hung || h.GaveUp:
+	case h.Hung || h.GaveUp || h.CrashLooping:
 		return DaemonError
 	case h.EmbeddingAutoDisabled || h.EmbedderDegraded || (h.Running && h.VersionStale):
 		return DaemonWarn
@@ -114,6 +135,9 @@ func (h DaemonHealth) Banner() string {
 	switch {
 	case h.GaveUp:
 		return "⚠ DAEMON NOT STARTING — crash-loop breaker gave up: " + h.Reason
+	case h.CrashLooping:
+		return fmt.Sprintf("⚠ DAEMON DOWN — crash-looping (%d restarts within %s); see %s",
+			h.RecentRestarts, crashguard.Window, h.StderrLog)
 	case h.Hung:
 		return fmt.Sprintf("⚠ DAEMON NOT RESPONDING — no heartbeat for %s; see %s", formatAge(h.HeartbeatAge), h.StderrLog)
 	case h.EmbeddingAutoDisabled:
