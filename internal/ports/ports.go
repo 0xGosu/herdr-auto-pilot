@@ -149,6 +149,10 @@ type DaemonStore interface {
 	EnsureAgentName(ctx context.Context, agentID string) (string, error)
 	StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64, error)
 	UpdateLLMRequestStatus(ctx context.Context, requestID, status string) error
+	// UpdateLLMRequestContext fills the context_json of an already-staged
+	// request, so the pending row can be staged synchronously (holding the
+	// in-flight guard) and its context populated off-loop before get_context.
+	UpdateLLMRequestContext(ctx context.Context, requestID, contextJSON string) error
 	// ExpireStalePendingLLMRequests reclaims pending consult rows whose
 	// outcome was never delivered, so they stop blocking the retry guard.
 	ExpireStalePendingLLMRequests(ctx context.Context, cutoff time.Time) (int64, error)

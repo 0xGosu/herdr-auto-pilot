@@ -294,6 +294,12 @@ type LLMRequest struct {
 	// TaskReview is set, surfaced verbatim if the LLM declines so the operator
 	// can confirm-and-send it. Transient.
 	ProposedTask string
+	// SourcePath and ReviewedTask capture the task-source file and its current
+	// (next unchecked) task at review time. Before the delayed send, the daemon
+	// re-reads SourcePath and refuses to inject the task if its next item has
+	// changed since review (checked off / edited). Transient.
+	SourcePath   string
+	ReviewedTask string
 }
 
 // LLMRetry is a front-end-written request to re-invoke the LLM on an

@@ -25,9 +25,10 @@ func writeReviewTaskFile(t *testing.T, body string) string {
 }
 
 func TestIdleDeclaredTaskCwdTemplate(t *testing.T) {
-	// {cwd} in a next_task_template renders the agent's working directory,
-	// resolved via `pane get` (foreground cwd). No LLM configured → the plain
-	// declared-task flow sends the rendered prompt directly.
+	// {cwd} in a next_task_template renders the agent's working directory
+	// (foreground cwd). Resolution happens OFF the main loop — the daemon never
+	// blocks on `pane get` — so the first render for a cold pane is empty and
+	// self-heals once the async refresh lands.
 	taskFile := writeReviewTaskFile(t, "- [ ] build the widget\n")
 	idlePane := "All tests pass. Task is complete.\n"
 	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-cwd\"\npath = %q\nnext_task_template = \"In {cwd}: {next_task_content}\"\n", taskFile)
@@ -38,12 +39,25 @@ func TestIdleDeclaredTaskCwdTemplate(t *testing.T) {
 	h.herdr.mu.Unlock()
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
+	// First idle: the cwd cache is cold, so the send has an empty cwd and a
+	// background refresh warms the cache off-loop.
 	h.push("agent-cwd", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := "In /home/op/widgets: build the widget"
-	if got := h.herdr.sentInputs()[0]; got != want {
-		t.Errorf("sent %q, want cwd-substituted prompt %q", got, want)
+	if got := h.herdr.sentInputs()[0]; got != "In : build the widget" {
+		t.Errorf("first (cold-cache) send = %q, want the empty-cwd render", got)
 	}
+	// The background refresh populates the cache without stalling the loop.
+	waitFor(t, 3*time.Second, func() bool {
+		h.daemon.mu.RLock()
+		defer h.daemon.mu.RUnlock()
+		return h.daemon.paneCwds["agent-cwd"].cwd == "/home/op/widgets"
+	})
+	// A fresh idle now renders {cwd} from the warm cache.
+	h.push("agent-cwd", "idle")
+	waitFor(t, 3*time.Second, func() bool {
+		ins := h.herdr.sentInputs()
+		return len(ins) >= 2 && ins[len(ins)-1] == "In /home/op/widgets: build the widget"
+	})
 }
 
 func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
@@ -276,5 +290,75 @@ func TestDeclaredTaskLLMReviewOptOut(t *testing.T) {
 	}
 	if consulted.get() != "" {
 		t.Error("opt-out source must not consult the LLM")
+	}
+}
+
+func TestDeclaredTaskLLMReviewPendingCheckErrorEscalates(t *testing.T) {
+	// A persistence error on the in-flight check must escalate (fail-safe), not
+	// silently drop the task.
+	taskFile := writeReviewTaskFile(t, "- [ ] do the thing\n")
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-pce\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.llm.configured = true
+	h.store.(*failingStore).setFailPending(true)
+
+	ctx := context.Background()
+	h.push("agent-pce", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if !strings.Contains(esc[0].Rationale, string(domain.ReasonPersistenceFailed)) {
+		t.Errorf("pending-check error should escalate as persistence_failed, got %q", esc[0].Rationale)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("nothing should be sent on a pending-check failure, sent %v", h.herdr.sentInputs())
+	}
+}
+
+func TestDeclaredTaskLLMReviewSourceChangedEscalates(t *testing.T) {
+	// If the checklist's next item changes while the LLM review is running, the
+	// (now stale) task must NOT be injected — escalate instead.
+	taskFile := writeReviewTaskFile(t, "- [ ] original task\n")
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-src\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.llm.configured = true
+	action := "Do: original task"
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		// Simulate the checklist advancing during the review: the reviewed item
+		// gets checked off before the outcome is applied.
+		if err := os.WriteFile(taskFile, []byte("- [x] original task\n- [ ] a different task\n"), 0o600); err != nil {
+			return nil, err
+		}
+		id, err := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: action, Rationale: "looks ready", ConfidentScore: 90,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: action,
+			Rationale: "looks ready", ConfidentScore: 90, Status: "pending"}, nil
+	}
+
+	ctx := context.Background()
+	h.push("agent-src", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if !strings.Contains(esc[0].Rationale, "task list changed during review") {
+		t.Errorf("a source change during review should escalate, got %q", esc[0].Rationale)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("a stale task must not be sent, sent %v", h.herdr.sentInputs())
 	}
 }

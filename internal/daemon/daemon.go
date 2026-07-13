@@ -158,8 +158,11 @@ type Daemon struct {
 
 	// paneCwds caches per-pane working directory for the {cwd} placeholder in
 	// next_task_template; declaredTask runs on the main loop and must not shell
-	// out to `pane get` on every event. Entries expire after workspaceCacheTTL.
-	paneCwds map[string]paneCwdEntry
+	// out to `pane get` on every event. Entries expire after workspaceCacheTTL
+	// and are refreshed OFF the main loop. paneCwdRefreshing dedupes concurrent
+	// background refreshes per pane.
+	paneCwds          map[string]paneCwdEntry
+	paneCwdRefreshing map[string]bool
 }
 
 // paneCwdEntry is one cached pane working directory with its capture time.
@@ -236,27 +239,28 @@ func New(opt Options) (*Daemon, error) {
 		opt.PaneReadLines = 120
 	}
 	d := &Daemon{
-		opt:             opt,
-		transitions:     make(chan domain.AgentTransition, 256),
-		nudges:          make(chan control.Kind, 16),
-		llmResults:      make(chan llmOutcome, 16),
-		rewriteResults:  make(chan rewriteOutcome, 16),
-		taskGenResults:  make(chan taskGenOutcome, 16),
-		sweepResults:    make(chan sweepOutcome, 16),
-		delayedTr:       make(chan domain.AgentTransition, 256),
-		pendingCapture:  map[string]*captureEntry{},
-		captureStarted:  map[string]bool{},
-		episodeHandled:  map[string]bool{},
-		firstConsult:    map[string]bool{},
-		firstRewrite:    map[string]bool{},
-		firstTaskGen:    map[string]bool{},
-		lastAutoSend:    map[string]time.Time{},
-		lastAutoNoop:    map[string]time.Time{},
-		rewriteInFlight: map[string]rewriteFlight{},
-		sweepInFlight:   map[string]bool{},
-		snapshotSaved:   map[string]bool{},
-		paneCwds:        map[string]paneCwdEntry{},
-		embedder:        opt.Embedder,
+		opt:               opt,
+		transitions:       make(chan domain.AgentTransition, 256),
+		nudges:            make(chan control.Kind, 16),
+		llmResults:        make(chan llmOutcome, 16),
+		rewriteResults:    make(chan rewriteOutcome, 16),
+		taskGenResults:    make(chan taskGenOutcome, 16),
+		sweepResults:      make(chan sweepOutcome, 16),
+		delayedTr:         make(chan domain.AgentTransition, 256),
+		pendingCapture:    map[string]*captureEntry{},
+		captureStarted:    map[string]bool{},
+		episodeHandled:    map[string]bool{},
+		firstConsult:      map[string]bool{},
+		firstRewrite:      map[string]bool{},
+		firstTaskGen:      map[string]bool{},
+		lastAutoSend:      map[string]time.Time{},
+		lastAutoNoop:      map[string]time.Time{},
+		rewriteInFlight:   map[string]rewriteFlight{},
+		sweepInFlight:     map[string]bool{},
+		snapshotSaved:     map[string]bool{},
+		paneCwds:          map[string]paneCwdEntry{},
+		paneCwdRefreshing: map[string]bool{},
+		embedder:          opt.Embedder,
 	}
 	if opt.MatchIndexDir != "" {
 		d.matcher = match.New(opt.MatchIndexDir)
@@ -1325,9 +1329,13 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 
 	llm := d.llmPort()
 	// Don't stack a review onto a consult already in flight for this agent —
-	// the same guard the generate-task path uses.
+	// the same guard the generate-task path uses. A persistence error must
+	// escalate + audit, never silently drop the task (fail-safe rule).
 	if pending, err := d.opt.Store.HasPendingLLMConsult(ctx, s.AgentID); err != nil {
-		slog.Error("task-review: pending check failed", "agent", s.AgentID, "error", err)
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonPersistenceFailed,
+			Rationale: "task-review pending check failed: " + err.Error(),
+		}, tr, now)
 		return
 	} else if pending {
 		slog.Info("task-review skipped: consult already in flight", "agent", s.AgentID)
@@ -1337,13 +1345,26 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 	proposed := declared.Prompt()
 	// A review consults the operator's command, but the priming/first-consult
 	// variant is meant for answering pane prompts, not task review — always use
-	// the base command so First stays false here.
+	// the base command so First stays false here. SourcePath/ReviewedTask let
+	// the delayed send revalidate the checklist (see handleLLMOutcome).
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("taskreview-%s-%d", s.AgentID, now.UnixNano()),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
 		TaskReview: true, ProposedTask: proposed,
+		SourcePath: declared.Path, ReviewedTask: declared.Task,
 	}
+	// Stage the pending row synchronously (context filled off-loop below) so a
+	// second idle event cannot race past the guard before the goroutine
+	// registers the flight. Mirrors generateTask.
+	if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonPersistenceFailed,
+			Rationale: "staging task review failed: " + err.Error(),
+		}, tr, now)
+		return
+	}
+
 	go func() {
 		outcome := llmOutcome{situation: s, sig: sig, request: req}
 		err := logging.Guard("llm-task-review", func() error {
@@ -1364,9 +1385,11 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 				slog.Warn("task-review: re-reading task source for pending list failed",
 					"path", declared.Path, "error", rerr)
 			}
+			// Fill the context on the already-staged row before the CLI reads
+			// it via get_context.
 			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, review))
-			if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
-				return fmt.Errorf("staging LLM request failed: %w", err)
+			if err := d.opt.Store.UpdateLLMRequestContext(ctx, req.RequestID, req.ContextJSON); err != nil {
+				return fmt.Errorf("staging LLM request context failed: %w", err)
 			}
 			outcome.request = req
 			decision, err := llm.Consult(ctx, req)
@@ -2139,6 +2162,22 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		return
 	}
 
+	// Task-review send: the review took up to the LLM timeout, so besides the
+	// pane the SOURCE can have moved on (item checked off, list edited). Re-read
+	// it and refuse to inject a task whose next item changed since review —
+	// escalate for the operator instead of sending a stale task.
+	if res.request.TaskReview && res.request.SourcePath != "" {
+		data, rerr := d.opt.ReadTaskFile(res.request.SourcePath)
+		if rerr != nil {
+			reject(domain.ReasonHerdrUnreachable, "task source unreadable before send: "+rerr.Error())
+			return
+		}
+		if domain.NextDeclaredTask(string(data)) != res.request.ReviewedTask {
+			reject(domain.ReasonLLMNoSubmit, "task list changed during review")
+			return
+		}
+	}
+
 	// Promote: audit-before-act guard applies here too (FR-024).
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
@@ -2582,24 +2621,52 @@ func (d *Daemon) paneCwd(ctx context.Context, paneID string) string {
 	d.mu.RLock()
 	entry, ok := d.paneCwds[paneID]
 	d.mu.RUnlock()
-	if ok && now.Sub(entry.at) <= workspaceCacheTTL {
-		return entry.cwd
+	if !ok || now.Sub(entry.at) > workspaceCacheTTL {
+		// NEVER shell out on the main loop: `pane get` can block for its CLI
+		// timeout. Refresh in the background and return the cached (or empty)
+		// value now — the first {cwd} render for a cold pane is empty and
+		// self-heals once the refresh lands (the review path still gets the
+		// real cwd via get_context's cwd field, resolved off-loop).
+		d.refreshPaneCwd(ctx, paneID)
 	}
-	cwd := ""
-	if insp, isInsp := d.opt.Herdr.(ports.InspectorPort); isInsp {
+	return entry.cwd
+}
+
+// refreshPaneCwd resolves a pane's working directory off the main loop and
+// caches it (foreground cwd, falling back to the shell cwd), deduping
+// concurrent refreshes per pane. A failed read caches "" for the TTL so a
+// broken `pane get` is not hammered every event.
+func (d *Daemon) refreshPaneCwd(ctx context.Context, paneID string) {
+	insp, ok := d.opt.Herdr.(ports.InspectorPort)
+	if !ok {
+		return
+	}
+	d.mu.Lock()
+	if d.paneCwdRefreshing[paneID] {
+		d.mu.Unlock()
+		return
+	}
+	d.paneCwdRefreshing[paneID] = true
+	d.mu.Unlock()
+	go func() {
+		defer func() {
+			d.mu.Lock()
+			delete(d.paneCwdRefreshing, paneID)
+			d.mu.Unlock()
+		}()
+		cwd := ""
 		if pi, err := insp.PaneInfo(ctx, paneID); err == nil {
 			cwd = pi.ForegroundCwd
 			if cwd == "" {
 				cwd = pi.Cwd
 			}
 		} else {
-			slog.Warn("pane cwd for next-task template failed", "pane", paneID, "error", err)
+			slog.Warn("pane cwd refresh for next-task template failed", "pane", paneID, "error", err)
 		}
-	}
-	d.mu.Lock()
-	d.paneCwds[paneID] = paneCwdEntry{cwd: cwd, at: now}
-	d.mu.Unlock()
-	return cwd
+		d.mu.Lock()
+		d.paneCwds[paneID] = paneCwdEntry{cwd: cwd, at: d.opt.Clock.Now()}
+		d.mu.Unlock()
+	}()
 }
 
 func (d *Daemon) audit(ctx context.Context, rec domain.AuditRecord) {
