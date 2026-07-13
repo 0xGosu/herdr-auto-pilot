@@ -269,6 +269,52 @@ func TestPendingEscalations(t *testing.T) {
 	}
 }
 
+func TestDuplicatePendingEscalation(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	rec := domain.AuditRecord{
+		AgentID: "agent-1", AgentType: "claude", Trigger: "x",
+		SituationType: domain.SituationChoice, Action: "escalated",
+		Status: "escalated", PaneExcerpt: "pick a package manager: 1. pnpm 2. npm",
+		CreatedAt: time.Now(),
+	}
+	id, err := s.AppendAudit(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dup := func(r domain.AuditRecord) bool {
+		got, err := s.DuplicatePendingEscalation(ctx, r.AgentID, r.AgentType, r.SituationType, r.PaneExcerpt)
+		if err != nil {
+			t.Fatalf("DuplicatePendingEscalation: %v", err)
+		}
+		return got
+	}
+
+	if !dup(rec) {
+		t.Error("identical escalated row should match")
+	}
+	// Any field differing breaks the match.
+	for name, mut := range map[string]func(domain.AuditRecord) domain.AuditRecord{
+		"agent_id":     func(r domain.AuditRecord) domain.AuditRecord { r.AgentID = "agent-2"; return r },
+		"agent_type":   func(r domain.AuditRecord) domain.AuditRecord { r.AgentType = "codex"; return r },
+		"situation":    func(r domain.AuditRecord) domain.AuditRecord { r.SituationType = domain.SituationIdle; return r },
+		"pane_excerpt": func(r domain.AuditRecord) domain.AuditRecord { r.PaneExcerpt = "something else"; return r },
+	} {
+		if dup(mut(rec)) {
+			t.Errorf("differing %s should not match", name)
+		}
+	}
+
+	// A non-escalated (resolved/dismissed) row is not a pending duplicate.
+	if err := s.UpdateAuditStatus(ctx, id, "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	if dup(rec) {
+		t.Error("resolved escalation should not count as a pending duplicate")
+	}
+}
+
 // TestConcurrentPartitionedWrites proves SC-7: concurrent daemon +
 // front-end + mcp writers lose no updates on hot-path rows, and append-only
 // tables retain full history.

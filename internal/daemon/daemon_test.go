@@ -604,6 +604,76 @@ func TestPipelineShadowModeEscalatesWithSuggestion(t *testing.T) {
 	}
 }
 
+// otherApprovalPane is a distinct approval (different command → different
+// classified content/signature) used to prove content-level dedup.
+const otherApprovalPane = "Bash(npm install)\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell the agent what to do differently\n"
+
+// ignoredRows returns every audit row the daemon marked as an ignored
+// duplicate event.
+func ignoredRows(t *testing.T, h *harness) []domain.AuditRecord {
+	t.Helper()
+	audits, err := h.raw.AuditLog(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("audit log: %v", err)
+	}
+	var out []domain.AuditRecord
+	for _, a := range audits {
+		if a.Status == "ignored" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// TestPipelineIgnoresDuplicateEvent covers the live-event dedup: a fresh
+// transition whose captured situation exactly matches an escalation still
+// awaiting the user is dropped as a no-op and audited, while a genuinely new
+// situation on the same agent still escalates (content-level, not agent-level).
+func TestPipelineIgnoresDuplicateEvent(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+
+	// First blocked event with no learned rule escalates.
+	h.push("agent-dup", "blocked")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+
+	// An identical event (same agent + type + pane content) while the first
+	// escalation is still pending is a duplicate: no new escalation, no send,
+	// and a single audit row explaining the ignore.
+	h.push("agent-dup", "blocked")
+	waitFor(t, 3*time.Second, func() bool { return len(ignoredRows(t, h)) == 1 })
+
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 1 {
+		t.Fatalf("duplicate event created a second escalation: got %d, want 1", len(esc))
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("duplicate event must not send input")
+	}
+	ign := ignoredRows(t, h)[0]
+	if ign.Rationale != "duplicated event" {
+		t.Errorf("ignored rationale = %q, want %q", ign.Rationale, "duplicated event")
+	}
+	if !contains(ign.PaneExcerpt, "Do you want to proceed") {
+		t.Errorf("ignored row should keep the captured pane content, got %q", ign.PaneExcerpt)
+	}
+
+	// A genuinely NEW situation on the SAME agent (different pane content) is
+	// NOT a duplicate — content-level dedup, not agent-level — so it escalates.
+	h.herdr.setPane(otherApprovalPane)
+	h.push("agent-dup", "blocked")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 2
+	})
+	if got := len(ignoredRows(t, h)); got != 1 {
+		t.Fatalf("new situation was wrongly ignored: %d ignored rows, want 1", got)
+	}
+}
+
 // TestReconcileEscalatesAlreadyParkedAgent covers #49: an agent already
 // blocked at subscribe time (never delivered as a pane.agent_status_changed
 // transition) is surfaced by reconcileAttention through the normal
@@ -952,6 +1022,35 @@ func TestPaneReadFailureTakesNoAction(t *testing.T) {
 	audits, _ := h.raw.AuditLog(context.Background(), 10)
 	if !contains(audits[0].Rationale, string(domain.ReasonHerdrUnreachable)) {
 		t.Errorf("audit should record herdr_unreachable, got %+v", audits[0])
+	}
+}
+
+func TestPaneReadFailureDedupsDuplicateEvents(t *testing.T) {
+	// A persistent Herdr/pane-read outage delivers the same blocked event
+	// repeatedly. That escalation path bypasses escalate() (there is no pane
+	// to classify), so it must dedup inline — an outage must not pile up one
+	// identical pending escalation per event.
+	h := newHarness(t, "")
+	h.herdr.failRead = true
+	ctx := context.Background()
+
+	h.push("agent-ru", "blocked")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+
+	// Second identical event during the outage is a duplicate: ignored, no
+	// second pending escalation.
+	h.push("agent-ru", "blocked")
+	waitFor(t, 3*time.Second, func() bool { return len(ignoredRows(t, h)) == 1 })
+
+	esc, _ := h.raw.PendingEscalations(ctx)
+	if len(esc) != 1 {
+		t.Fatalf("read-outage storm created duplicate escalations: got %d, want 1", len(esc))
+	}
+	if !contains(esc[0].Rationale, string(domain.ReasonHerdrUnreachable)) {
+		t.Errorf("expected herdr_unreachable escalation, got %q", esc[0].Rationale)
 	}
 }
 
