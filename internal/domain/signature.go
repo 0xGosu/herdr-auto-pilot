@@ -61,7 +61,12 @@ const overMaskMaxRatio = 0.6
 // structured salient field (idle, and any unclassified content), the
 // signature is minted from the last this-many characters of pane content.
 // Operators can widen or narrow it via embedding.pane_salient_chars.
-const DefaultPaneSalientChars = 800
+//
+// Kept comfortably below the embedding model's 512-token limit as a first
+// line of defense against the position-embedding overflow (#82): token-dense
+// content (CJK, box-drawing, code) can approach ~1 token/char, so 500 chars
+// stays clear of 512 even before the embedder's own truncation guard.
+const DefaultPaneSalientChars = 500
 
 // SignatureResult is the output of signature generation.
 type SignatureResult struct {

@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +83,89 @@ func TestEmbedTextRealModel(t *testing.T) {
 			cosine(v1, para), cosine(v1, other))
 	}
 	t.Logf("paraphrase cos=%.3f unrelated cos=%.3f", cosine(v1, para), cosine(v1, other))
+}
+
+// TestEmbedLongInputNoCrash guards #82: a sequence longer than the model's
+// 512 position embeddings must be truncated, not fed whole — an untruncated
+// long input overflows the position-embedding get_rows and hard-aborts the
+// native library (SIGABRT), which would take the whole process down. The
+// embed must instead succeed on the truncated prefix and return a valid
+// vector. 700 space-delimited words tokenize well past 512.
+func TestEmbedLongInputNoCrash(t *testing.T) {
+	l := NewEngine(config.Embedding{ModelPath: testModelPath(t)})
+	defer l.Close()
+	ctx := context.Background()
+
+	long := strings.Repeat("word ", 700)
+	// Pre-truncation this aborts the process; post-fix it returns a vector.
+	v, err := l.EmbedText(ctx, long)
+	if err != nil {
+		t.Fatalf("long input should embed after truncation, got error: %v", err)
+	}
+	if len(v) != 384 {
+		t.Errorf("dims = %d, want 384", len(v))
+	}
+
+	// The truncated text alone must tokenize within budget — proves the guard
+	// actually bounded the sequence rather than the embed getting lucky.
+	l.initOnce.Do(l.init)
+	if l.initErr != nil {
+		t.Fatalf("init: %v", l.initErr)
+	}
+	safe := l.truncateToBudget(long)
+	toks, err := l.lctx.Tokenize(safe)
+	if err != nil {
+		t.Fatalf("tokenize truncated: %v", err)
+	}
+	budget := DefaultContextWindow - specialTokenHeadroom
+	if len(toks) > budget {
+		t.Errorf("truncated to %d tokens, want <= %d", len(toks), budget)
+	}
+
+	// A short input is returned unchanged (no needless truncation).
+	short := "permission: edit the config file"
+	if got := l.truncateToBudget(short); got != short {
+		t.Errorf("short input was altered: %q", got)
+	}
+
+	// A pathologically small context window override is floored to
+	// minContextWindow (a window below it can't hold the special tokens and
+	// would SIGABRT). The engine must use the floor, not the raw value, and
+	// still embed the long input on the truncated prefix.
+	tiny := NewEngine(config.Embedding{ModelPath: testModelPath(t), ModelContextWindow: 1})
+	defer tiny.Close()
+	if tiny.ctxWindow != minContextWindow {
+		t.Errorf("ctxWindow = %d, want floored to %d", tiny.ctxWindow, minContextWindow)
+	}
+	tv, err := tiny.EmbedText(ctx, long)
+	if err != nil {
+		t.Fatalf("floored-window embed should succeed on the truncated prefix, got: %v", err)
+	}
+	if len(tv) != 384 {
+		t.Errorf("floored-window dims = %d, want 384", len(tv))
+	}
+}
+
+// TestResolveContextWindowFloor covers the override boundaries — 0/negative
+// fall to the default, and any positive value below the safe minimum (at or
+// below the special-token headroom included) is clamped up so the budget can
+// never go sub-headroom (#82, PR review).
+func TestResolveContextWindowFloor(t *testing.T) {
+	cases := []struct{ in, want int }{
+		{0, DefaultContextWindow},
+		{-5, DefaultContextWindow},
+		{1, minContextWindow},
+		{specialTokenHeadroom, minContextWindow},
+		{255, minContextWindow},
+		{minContextWindow, minContextWindow},
+		{512, 512},
+		{2048, 2048},
+	}
+	for _, c := range cases {
+		if got := ResolveContextWindow(config.Embedding{ModelContextWindow: c.in}); got != c.want {
+			t.Errorf("ResolveContextWindow(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
 }
 
 func TestEmbedMissingModelDegrades(t *testing.T) {

@@ -35,6 +35,7 @@ import (
 type Client struct {
 	modelPath string
 	gpuLayers int
+	ctxWindow int // model context window forwarded to the worker (0 = worker default)
 
 	// execPath/execArgs/extraEnv build the worker command. Production uses the
 	// running binary's `embed-worker` subcommand; tests inject a re-exec of the
@@ -64,6 +65,7 @@ func New(cfg config.Embedding) *Client {
 	return &Client{
 		modelPath: ResolveModelPath(cfg),
 		gpuLayers: cfg.GPULayers,
+		ctxWindow: cfg.ModelContextWindow, // 0 → worker uses DefaultContextWindow
 		execArgs:  []string{"embed-worker"},
 	}
 }
@@ -103,6 +105,7 @@ func (c *Client) spawn() (*worker, error) {
 	cmd.Env = append(os.Environ(),
 		EnvWorkerModel+"="+c.modelPath,
 		EnvWorkerGPULayers+"="+strconv.Itoa(c.gpuLayers),
+		EnvWorkerContextWindow+"="+strconv.Itoa(c.ctxWindow),
 	)
 	cmd.Env = append(cmd.Env, c.extraEnv...)
 

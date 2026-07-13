@@ -37,6 +37,33 @@ const warmTimeout = 30 * time.Second
 // stays on its fallback path for the process lifetime.
 const maxConsecutiveFailures = 3
 
+// DefaultContextWindow is the BERT/MiniLM position-embedding limit (n_ctx) of
+// the bundled all-MiniLM-L6-v2: 512 position rows. Feeding GetEmbeddings a
+// sequence longer than the model's window overflows the position-embedding
+// get_rows and hard-aborts the native library (GGML_ASSERT(i01 < ne01) →
+// SIGABRT, #82) — uncatchable in Go, so the ONLY defense is to not exceed it.
+// Overridable per model via config Embedding.ModelContextWindow.
+const DefaultContextWindow = 512
+
+// specialTokenHeadroom is reserved out of the context window for the special
+// tokens the model adds ([CLS]/[SEP], plus a small margin) so the assembled
+// sequence stays strictly under the limit even if Tokenize and the internal
+// GetEmbeddings tokenizer disagree by a token or two.
+const specialTokenHeadroom = 8
+
+// minContextWindow floors any positive ModelContextWindow override. A window
+// small enough that the budget can't even hold the special tokens (e.g. 1 or
+// 2) makes every input — including the empty string, which still tokenizes to
+// [CLS]/[SEP] — exceed n_ctx and SIGABRT the worker (#82, PR review). No real
+// embedding model has a window below this, so a lower value is always a
+// misconfiguration; clamp up to it rather than trust it.
+const minContextWindow = 256
+
+// truncateIters bounds the proportional-cut retry loop so a pathological
+// text→token ratio can never spin; each pass overshoots the cut, so it
+// converges in one or two iterations in practice.
+const truncateIters = 8
+
 // ErrDegraded is returned once the failure latch has tripped.
 var ErrDegraded = fmt.Errorf("embedder degraded after %d consecutive failures", maxConsecutiveFailures)
 
@@ -44,6 +71,7 @@ var ErrDegraded = fmt.Errorf("embedder degraded after %d consecutive failures", 
 type Llama struct {
 	modelPath string
 	gpuLayers int
+	ctxWindow int // model position-embedding limit (n_ctx); see DefaultContextWindow
 
 	initOnce sync.Once
 	initErr  error
@@ -69,7 +97,28 @@ type Llama struct {
 // drives it out-of-process through Client instead (see New). Direct callers
 // are the worker and the engine's own tests.
 func NewEngine(cfg config.Embedding) *Llama {
-	return &Llama{modelPath: ResolveModelPath(cfg), gpuLayers: cfg.GPULayers}
+	return &Llama{
+		modelPath: ResolveModelPath(cfg),
+		gpuLayers: cfg.GPULayers,
+		ctxWindow: ResolveContextWindow(cfg),
+	}
+}
+
+// ResolveContextWindow returns the effective embedding context window: the
+// bundled model's default when unset/non-positive, otherwise the override
+// floored to minContextWindow. This is the single chokepoint for every
+// construction path (config and the HAP_EMBED_CONTEXT_WINDOW worker env both
+// reach the engine through NewEngine), so no sub-minimum window can ever reach
+// GetEmbeddings and abort the worker.
+func ResolveContextWindow(cfg config.Embedding) int {
+	w := cfg.ModelContextWindow
+	if w <= 0 {
+		return DefaultContextWindow
+	}
+	if w < minContextWindow {
+		return minContextWindow
+	}
+	return w
 }
 
 // ResolveModelPath expands the configured model path, defaulting to the
@@ -106,7 +155,10 @@ func (l *Llama) init() {
 		l.initErr = fmt.Errorf("load embedding model %s: %w", l.modelPath, err)
 		return
 	}
-	lctx, err := model.NewContext(llama.WithEmbeddings())
+	// WithContext caps the KV/positional window at the model's limit — defense
+	// in depth alongside truncateToBudget; the truncation is what actually
+	// prevents the >n_ctx position-embedding overflow (#82).
+	lctx, err := model.NewContext(llama.WithEmbeddings(), llama.WithContext(l.ctxWindow))
 	if err != nil {
 		model.Close()
 		l.initErr = fmt.Errorf("create embedding context: %w", err)
@@ -148,7 +200,7 @@ func (l *Llama) EmbedText(ctx context.Context, text string) ([]float32, error) {
 			ch <- result{nil, l.initErr}
 			return
 		}
-		vec, err := l.lctx.GetEmbeddings(text)
+		vec, err := l.lctx.GetEmbeddings(l.truncateToBudget(text))
 		ch <- result{vec, err}
 	}()
 
@@ -171,6 +223,60 @@ func (l *Llama) EmbedText(ctx context.Context, text string) ([]float32, error) {
 		l.warmed.Store(true)
 		return r.vec, nil
 	}
+}
+
+// truncateToBudget shortens text so its tokenization stays within tokenBudget,
+// guaranteeing the sequence GetEmbeddings assembles never exceeds the model's
+// position-embedding limit (which would SIGABRT the native library, #82). It
+// must be called with l.mu held and after init (l.lctx valid).
+//
+// GetEmbeddings tokenizes internally and takes text, not tokens, so the cut is
+// made on the text: tokenize to measure, and if over budget, keep a prefix
+// sized by the current token→rune ratio (overshooting downward), then re-check.
+// The salient content is front-loaded, so a prefix is the right thing to keep.
+// A Tokenize error is non-fatal — fall through to GetEmbeddings, which will
+// surface its own error (degrading, never aborting the daemon).
+func (l *Llama) truncateToBudget(text string) string {
+	budget := l.ctxWindow - specialTokenHeadroom
+	if budget < 1 {
+		budget = 1
+	}
+	toks, err := l.lctx.Tokenize(text)
+	if err != nil || len(toks) <= budget {
+		return text
+	}
+	runes := []rune(text)
+	for i := 0; i < truncateIters && len(toks) > budget; i++ {
+		if len(runes) <= 1 {
+			break // nothing left to trim
+		}
+		// Overshoot by 5% under the proportional target so a sub-linear
+		// token→rune relationship still converges downward each pass.
+		keep := int(float64(len(runes)) * float64(budget) / float64(len(toks)) * 0.95)
+		if keep < 1 {
+			keep = 1
+		}
+		if keep >= len(runes) { // ratio made no progress: force a real cut
+			keep = len(runes) / 2
+		}
+		runes = runes[:keep]
+		toks, err = l.lctx.Tokenize(string(runes))
+		if err != nil {
+			break
+		}
+	}
+	// Guarantee the invariant the whole function exists for: the returned text
+	// must tokenize within budget, or GetEmbeddings SIGABRTs the worker (#82).
+	// The proportional loop can exit still-over-budget — bounded iterations, a
+	// Tokenize error, or an override window set above the model's real limit —
+	// so hard-halve the prefix until it fits. Halving reaches 1 rune, so this
+	// always terminates; a Tokenize error leaves toks stale and stops the loop
+	// (the embed then surfaces its own error and degrades, never aborts).
+	for err == nil && len(toks) > budget && len(runes) > 1 {
+		runes = runes[:len(runes)/2]
+		toks, err = l.lctx.Tokenize(string(runes))
+	}
+	return string(runes)
 }
 
 func (l *Llama) recordFailure() {

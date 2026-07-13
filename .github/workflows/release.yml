@@ -97,6 +97,19 @@ jobs:
           CGO_ENABLED=1 go build -tags "${GO_BUILD_TAGS}" -trimpath \
             -ldflags "-s -w -X github.com/0xGosu/herdr-auto-pilot/internal/buildinfo.Version=${VERSION} -extldflags '${RPATH}'" \
             -o "dist/hap-${{ matrix.target }}" ./cmd/hap
+      - name: Embed smoke test (>512 tokens, guards #82)
+        # A real embed on EACH native runner: catches a native GGML abort in
+        # the embedder before it ships. The input MUST exceed the model's 512
+        # position embeddings — a short string never trips the overflow (#82).
+        # TestEmbedLongInputNoCrash embeds a ~700-token string; the process
+        # SIGABRTs here if truncation regresses. shasum works on macOS + Linux.
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-delay 10 -o "${MODEL_FILE}" "${MODEL_URL}"
+          echo "${MODEL_SHA256}  ${MODEL_FILE}" | shasum -a 256 -c -
+          HAP_TEST_EMBED_MODEL="${PWD}/${MODEL_FILE}" \
+            go test -tags "${GO_BUILD_TAGS}" -count=1 \
+            -run 'TestEmbedLongInputNoCrash|TestEmbedTextRealModel' ./internal/embedder/
       - name: Bundle native runtime libraries
         run: |
           # llama.cpp is statically linked into the binary; only the FAISS

@@ -183,7 +183,7 @@ func TestComputeSignatureNWindow(t *testing.T) {
 	if got, want := ComputeSignatureN(a, 0).Raw, ComputeSignature(a).Raw; got != want {
 		t.Errorf("salientChars<=0 should match the default: %q vs %q", got, want)
 	}
-	if DefaultPaneSalientChars != 800 {
-		t.Errorf("DefaultPaneSalientChars = %d, want 800", DefaultPaneSalientChars)
+	if DefaultPaneSalientChars != 500 {
+		t.Errorf("DefaultPaneSalientChars = %d, want 500", DefaultPaneSalientChars)
 	}
 }
