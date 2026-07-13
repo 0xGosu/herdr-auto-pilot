@@ -426,14 +426,23 @@ queued task as `proposed_task` — and decides whether sending it now is
 appropriate:
 
 - **Send** — `submit_decision` with `recommend_action` set to the task text
-  (lightly edited only if the pane requires it). The send is re-gated by the
-  same safety controls and `auto_act_confidence_threshold` as any consult, so
-  with the default threshold it is surfaced for you to confirm rather than sent
-  autonomously; lower the threshold to let approvals auto-send.
+  (lightly edited only if the pane requires it).
 - **Decline** — `submit_decision` with `recommend_action` `@noop` (the agent is
   still busy, the task is already done, or the pane shows it should not run).
-  The task is escalated to you (never dropped silently), and you can confirm-
-  and-send or dismiss it.
+
+Both outcomes follow `auto_act_confidence_threshold` exactly like any consult,
+and are re-gated by the same safety controls (kill switch, never-auto patterns,
+irreversible heuristic, rate limits):
+
+- **Confident (`confident_score ≥ threshold`)** — the LLM's resolution is applied
+  automatically: a send delivers the task, a decline silently skips it.
+- **Low-confidence (`< threshold`)** — surfaced for you to confirm. The
+  escalation's suggestion is the LLM's exact recommendation (the possibly-edited
+  task, or *no reply* for a decline), and the **original** queued task and the
+  LLM's reasoning appear in the escalation detail.
+
+Because the default threshold is `999` (never auto-act), every review is
+surfaced for confirmation until you lower `auto_act_confidence_threshold`.
 
 This is **on by default** whenever the LLM command exists; set
 `llm_review = false` on a `[[task_sources]]` entry to keep the plain

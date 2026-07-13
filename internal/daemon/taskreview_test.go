@@ -89,8 +89,10 @@ func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
 }
 
 func TestDeclaredTaskLLMReviewDeclineEscalates(t *testing.T) {
-	// A declined review (@noop) surfaces the proposed task to the operator with
-	// the LLM's reasoning and sends nothing.
+	// A SUB-THRESHOLD declined review (@noop, score below the default 999
+	// threshold) is surfaced to the operator: the suggestion is the LLM's exact
+	// recommendation (no reply), and the original task + reasoning ride on the
+	// rationale. Nothing is sent.
 	taskFile := writeReviewTaskFile(t, "- [ ] update the changelog\n")
 	idlePane := "All tests pass. Task is complete.\n"
 	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-dec\"\npath = %q\n", taskFile)
@@ -118,18 +120,69 @@ func TestDeclaredTaskLLMReviewDeclineEscalates(t *testing.T) {
 		esc, _ = h.raw.PendingEscalations(ctx)
 		return len(esc) == 1
 	})
-	wantTask := "Your next task is update the changelog. Read the full tasks list at " + taskFile + "."
-	if esc[0].Suggestion != "LLM suggested: "+wantTask {
-		t.Errorf("decline suggestion = %q, want the proposed task carried for confirm-and-send", esc[0].Suggestion)
+	// The suggestion carries the LLM's exact recommendation — a declined task
+	// resolves to "no reply" — while the ORIGINAL queued task and the LLM's
+	// reasoning ride on the rationale for the operator's detail view.
+	if esc[0].Suggestion != "LLM suggested: "+domain.ActionNoopSuggestion {
+		t.Errorf("decline suggestion = %q, want the LLM's exact recommendation (no reply)", esc[0].Suggestion)
 	}
-	if !strings.Contains(esc[0].Rationale, string(domain.ReasonLLMDeclinedTask)) {
-		t.Errorf("decline rationale should carry the reason tag, got %q", esc[0].Rationale)
+	wantTask := "Your next task is update the changelog. Read the full tasks list at " + taskFile + "."
+	if !strings.Contains(esc[0].Rationale, wantTask) {
+		t.Errorf("decline rationale should show the original proposed task, got %q", esc[0].Rationale)
 	}
 	if !strings.Contains(esc[0].Rationale, "still finishing") {
 		t.Errorf("decline rationale should carry the LLM reasoning, got %q", esc[0].Rationale)
 	}
+	if !strings.Contains(esc[0].Rationale, string(domain.ReasonLLMLowConfidence)) {
+		t.Errorf("a sub-threshold decline should escalate under llm_low_confidence, got %q", esc[0].Rationale)
+	}
 	if len(h.herdr.sentInputs()) != 0 {
 		t.Errorf("a declined task must not be sent, sent %v", h.herdr.sentInputs())
+	}
+}
+
+func TestDeclaredTaskLLMReviewConfidentDeclineSkips(t *testing.T) {
+	// A CONFIDENT decline (@noop, score ≥ auto_act_confidence_threshold) is
+	// applied automatically — symmetric with a confident approve: nothing is
+	// sent, nothing is escalated, and a noop is recorded.
+	taskFile := writeReviewTaskFile(t, "- [ ] update the changelog\n")
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-skip\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, err := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "@noop", Rationale: "the task is already done", ConfidentScore: 90,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "@noop",
+			Rationale: "the task is already done", ConfidentScore: 90, Status: "pending"}, nil
+	}
+
+	ctx := context.Background()
+	h.push("agent-skip", "idle")
+	// The noop stand-down records a "noop" audit; wait for it, then assert no
+	// send and no escalation.
+	waitFor(t, 5*time.Second, func() bool {
+		all, _ := h.raw.AuditLog(ctx, 50)
+		for _, a := range all {
+			if a.Action == "noop" {
+				return true
+			}
+		}
+		return false
+	})
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 0 {
+		t.Errorf("a confident decline must not escalate, got %d escalations", len(esc))
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("a confident decline must not send, sent %v", h.herdr.sentInputs())
 	}
 }
 

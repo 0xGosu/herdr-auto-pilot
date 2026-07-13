@@ -127,11 +127,6 @@ const (
 	// produced no usable task. The failure rationale is surfaced and the
 	// escalation is retryable (like a failed consult).
 	ReasonTaskGenFailed EscalateReason = "task_gen_failed"
-	// ReasonLLMDeclinedTask: the pre-send LLM review of a declared task-source
-	// task returned @noop — the LLM judged the proposed task should not be sent
-	// now given the pane. The proposed task is surfaced for the operator to
-	// confirm-and-send or dismiss.
-	ReasonLLMDeclinedTask EscalateReason = "llm_declined_task"
 )
 
 // Decision is the outcome of the pure decision core for one situation.

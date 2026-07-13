@@ -1583,7 +1583,7 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 	// send it (recommend_action, edited if warranted) or decline (@noop).
 	if proposedTask != "" {
 		fields["proposed_task"] = proposedTask
-		fields["answer_format"] = "this idle agent has a next task ready to send (see proposed_task); decide from the pane whether sending it now is appropriate. To send it, submit_decision recommend_action with the task text (lightly edit it only if the pane clearly requires it). To decline — the agent is still busy, the task is already done, or the pane shows it should not run now — submit_decision recommend_action \"@noop\" with a one-sentence rationale; a decline is surfaced to the operator, never sent silently"
+		fields["answer_format"] = "this idle agent has a next task ready to send (see proposed_task); decide from the pane whether sending it now is appropriate. To send it, submit_decision recommend_action with the task text (lightly edit it only if the pane clearly requires it). To decline — the agent is still busy, the task is already done, or the pane shows it should not run now — submit_decision recommend_action \"@noop\" with a one-sentence rationale. Always include confident_score: a confident decision is applied automatically (the task is sent, or skipped on a decline), while a low-confidence one is surfaced to the operator"
 	}
 	contextJSON, _ := json.Marshal(fields)
 	return contextJSON
@@ -1900,32 +1900,35 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				why += "; " + conf
 			}
 		}
+		// A task review's suggestion is the LLM's EXACT recommendation (the
+		// possibly-rewritten task, or "[no reply]" when it declined). Ride the
+		// LLM's reasoning and the ORIGINAL queued task on the rationale so the
+		// detail view still shows what was proposed even when the LLM rewrote or
+		// dismissed it.
+		if res.request.TaskReview {
+			if r := strings.TrimSpace(llmDec.Rationale); r != "" {
+				if why != "" {
+					why += "; "
+				}
+				why += "LLM: " + r
+			}
+			if res.request.ProposedTask != "" {
+				if why != "" {
+					why += "; "
+				}
+				why += "proposed task: " + res.request.ProposedTask
+			}
+		}
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: reason, Rationale: why,
 			Suggestion: "LLM suggested: " + suggested,
 		}, tr, now)
 	}
 
-	// A declined task review (@noop) does not mean "do nothing" — it means the
-	// LLM judged the queued declared task should not be sent now. Surface the
-	// proposed task to the operator (confirm-and-send or dismiss) with the
-	// LLM's reasoning, rather than promoting a silent noop.
-	if res.request.TaskReview && isNoop {
-		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
-		why := strings.TrimSpace(llmDec.Rationale)
-		if why == "" {
-			why = "LLM declined to send the next declared task"
-		}
-		if llmDec.ConfidentScore >= 0 {
-			why += fmt.Sprintf("; llm confidence %d/100", llmDec.ConfidentScore)
-		}
-		d.escalate(ctx, s, res.sig, domain.Decision{
-			Action: domain.ActionEscalate, Reason: domain.ReasonLLMDeclinedTask,
-			Rationale:  why,
-			Suggestion: "LLM suggested: " + res.request.ProposedTask,
-		}, tr, now)
-		return
-	}
+	// A task review follows the SAME confidence gate as any consult (below): a
+	// confident decline (@noop, score ≥ threshold) promotes a silent noop —
+	// nothing is sent — while a sub-threshold outcome (approve or decline) is
+	// surfaced by reject() above. No task-review special-casing here.
 
 	// Re-gate: kill switch, never-auto patterns, heuristic, rate — the LLM can never
 	// bypass safety controls.
