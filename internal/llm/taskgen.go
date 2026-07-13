@@ -41,7 +41,7 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 			return "", fmt.Errorf("resolve self path: %w", err)
 		}
 	}
-	// The first generation for an agent uses generate_task_command_start when
+	// The first generation for an agent uses task_generate_command_start when
 	// configured; an empty start template falls back to the base command.
 	// Auto-repair BEFORE substitution: the normalizer pattern-matches argv
 	// shapes, and substituted pane text is untrusted — it must not be able to

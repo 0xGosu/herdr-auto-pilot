@@ -89,7 +89,7 @@ type DecideInput struct {
 	MaxRetries    int
 	DeclaredTask  *DeclaredTask // resolved declared source (nil = no source matched)
 	LLMConfigured bool
-	// GenerateTaskConfigured reports that llm.generate_task_command is set, so
+	// GenerateTaskConfigured reports that llm.task_generate_command is set, so
 	// an idle agent with no task source generates a task suggestion instead of
 	// escalating no_task_source (FR-011 relaxation).
 	GenerateTaskConfigured bool
@@ -180,7 +180,7 @@ func Decide(in DecideInput) Decision {
 		}
 		// FR-011 relaxation: an idle agent with no task source normally
 		// escalates no_task_source (never synthesizing a prompt). When the
-		// operator has opted in with llm.generate_task_command, instead ask the
+		// operator has opted in with llm.task_generate_command, instead ask the
 		// LLM to SUGGEST a task — surfaced as an escalation for confirmation,
 		// never auto-acted, so the operator stays in control.
 		if in.Situation.Type == SituationIdle && resolveEsc == ReasonNoTaskSource &&

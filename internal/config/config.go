@@ -123,15 +123,15 @@ type LLM struct {
 	// operator confirms (writing a per-agent tasks.md) or dismisses. Empty
 	// keeps today's behavior: idle with no task source escalates as
 	// no_task_source and the plugin never synthesizes a prompt (FR-011).
-	GenerateTaskCommand []string `toml:"generate_task_command"`
+	GenerateTaskCommand []string `toml:"task_generate_command"`
 	// GenerateTaskCommandStart is the argv template used on the FIRST task
 	// generation per agent (same first-interaction boundary as CommandStart).
 	// Same placeholders as GenerateTaskCommand. Empty inherits
 	// GenerateTaskCommand; tracked independently of the consult "first".
-	GenerateTaskCommandStart []string `toml:"generate_task_command_start,omitempty"`
+	GenerateTaskCommandStart []string `toml:"task_generate_command_start,omitempty"`
 	// GenerateTaskTimeoutSeconds bounds one task-generation run; zero or
 	// omitted inherits timeout_seconds.
-	GenerateTaskTimeoutSeconds int `toml:"generate_task_timeout_seconds,omitempty"`
+	GenerateTaskTimeoutSeconds int `toml:"task_generate_timeout_seconds,omitempty"`
 }
 
 // Embedding configures semantic signature matching: situations are matched
@@ -191,9 +191,16 @@ type TaskSource struct {
 	Path      string `toml:"path"` // markdown checklist file
 	// NextTaskTemplate overrides the outbound prompt format. Placeholders:
 	// {next_task_content} (next unchecked item, or "none" when the list is
-	// complete), {task_list_path}, and {agent_name} (the agent's short
-	// name). Empty uses the built-in default.
+	// complete), {task_list_path}, {agent_name} (the agent's short name), and
+	// {cwd} (the agent's working directory). Empty uses the built-in default.
 	NextTaskTemplate string `toml:"next_task_template,omitempty"`
+	// LLMReview gates the pre-send LLM review of this source's determined
+	// tasks. When an [llm].command is configured, a determined task is first
+	// reviewed by the LLM (via the get_context/submit_decision MCP tools),
+	// which decides whether to send it now given the live pane; a decline is
+	// escalated to the operator. nil (unset) defaults to on; set
+	// llm_review=false to opt out and keep the plain declared-task flow.
+	LLMReview *bool `toml:"llm_review,omitempty"`
 }
 
 // ClassifierRule is one manifest rule classifying pane content (FR-002).
@@ -530,7 +537,7 @@ func (c Config) RewriteTimeout() time.Duration {
 }
 
 // GenerateTaskTimeout returns the task-generation timeout:
-// generate_task_timeout_seconds, or — when zero/omitted — the consult
+// task_generate_timeout_seconds, or — when zero/omitted — the consult
 // timeout_seconds.
 func (c Config) GenerateTaskTimeout() time.Duration {
 	if c.LLM.GenerateTaskTimeoutSeconds <= 0 {

@@ -388,6 +388,18 @@ func (s *Store) UpdateLLMRequestStatus(ctx context.Context, requestID, status st
 	})
 }
 
+// UpdateLLMRequestContext fills in the context_json of an already-staged
+// request. It lets a caller stage the pending row synchronously (to hold the
+// in-flight guard) and populate the context — which needs off-loop pane reads —
+// afterwards, before the MCP get_context tool reads it.
+func (s *Store) UpdateLLMRequestContext(ctx context.Context, requestID, contextJSON string) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE llm_requests SET context_json = ? WHERE request_id = ?`, contextJSON, requestID)
+		return err
+	})
+}
+
 // HasPendingLLMConsult reports whether a consult is still in flight for an
 // agent — a staged llm_requests row that has not yet resolved to done/expired.
 // It is the durable "is the LLM still running?" guard for retry: consultLLM

@@ -7,7 +7,7 @@ import (
 )
 
 // Task generation for idle agents with no task source (FR-011 relaxation):
-// when llm.generate_task_command is configured, an idle agent that has no
+// when llm.task_generate_command is configured, an idle agent that has no
 // declared [[task_sources]] and nothing inferable from its pane triggers a
 // one-shot LLM call that SUGGESTS a task. The suggestion is surfaced as an
 // escalation the operator confirms or dismisses; it is never auto-acted. These
@@ -31,7 +31,7 @@ type TaskGenRequest struct {
 	// suggested task should be about.
 	Cwd string
 	// First marks this as the agent's first task generation this daemon
-	// lifetime, selecting llm.generate_task_command_start when configured.
+	// lifetime, selecting llm.task_generate_command_start when configured.
 	// Tracked independently of the consult "first".
 	First bool
 }

@@ -825,8 +825,8 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		{"llm.rewrite_timeout_seconds", "45", false},
 		{"llm.rewrite_timeout_seconds", "zero", true},
 		{"llm.rewrite_fallback_template", "Act on: {original_text}", false},
-		{"llm.generate_task_command", `claude -p "suggest: {agent_name}" --model haiku`, false},
-		{"llm.generate_task_command_start", `claude -p "first suggest: {agent_name}"`, false},
+		{"llm.task_generate_command", `claude -p "suggest: {agent_name}" --model haiku`, false},
+		{"llm.task_generate_command_start", `claude -p "first suggest: {agent_name}"`, false},
 		{"nonexistent.field", "1", true},
 	}
 	for _, c := range cases {
@@ -858,10 +858,10 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		t.Errorf("llm.rewrite_command_start quote handling: %v", cfg.LLM.RewriteCommandStart)
 	}
 	if len(cfg.LLM.GenerateTaskCommand) != 5 || cfg.LLM.GenerateTaskCommand[2] != "suggest: {agent_name}" {
-		t.Errorf("llm.generate_task_command quote handling: %v", cfg.LLM.GenerateTaskCommand)
+		t.Errorf("llm.task_generate_command quote handling: %v", cfg.LLM.GenerateTaskCommand)
 	}
 	if len(cfg.LLM.GenerateTaskCommandStart) != 3 || cfg.LLM.GenerateTaskCommandStart[2] != "first suggest: {agent_name}" {
-		t.Errorf("llm.generate_task_command_start quote handling: %v", cfg.LLM.GenerateTaskCommandStart)
+		t.Errorf("llm.task_generate_command_start quote handling: %v", cfg.LLM.GenerateTaskCommandStart)
 	}
 	// Empty start variants render an inherit placeholder, not a blank cell.
 	if got := frontend.FieldValue(config.Config{}, "llm.command_start"); got != "(inherits command)" {
@@ -870,11 +870,11 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 	if got := frontend.FieldValue(config.Config{}, "llm.rewrite_command_start"); got != "(inherits rewrite_command)" {
 		t.Errorf("empty rewrite_command_start display = %q, want inherit placeholder", got)
 	}
-	if got := frontend.FieldValue(config.Config{}, "llm.generate_task_command_start"); got != "(inherits generate_task_command)" {
-		t.Errorf("empty generate_task_command_start display = %q, want inherit placeholder", got)
+	if got := frontend.FieldValue(config.Config{}, "llm.task_generate_command_start"); got != "(inherits task_generate_command)" {
+		t.Errorf("empty task_generate_command_start display = %q, want inherit placeholder", got)
 	}
-	if got := frontend.FieldValue(config.Config{}, "llm.generate_task_timeout_seconds"); got != "(inherits timeout_seconds)" {
-		t.Errorf("empty generate_task_timeout_seconds display = %q, want inherit placeholder", got)
+	if got := frontend.FieldValue(config.Config{}, "llm.task_generate_timeout_seconds"); got != "(inherits timeout_seconds)" {
+		t.Errorf("empty task_generate_timeout_seconds display = %q, want inherit placeholder", got)
 	}
 	if cfg.LLM.RewriteTimeoutSeconds != 45 ||
 		cfg.LLM.RewriteFallbackTemplate != "Act on: {original_text}" {
@@ -917,9 +917,9 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"llm.rewrite_command_start":           `claude -p "first rewrite: {text}"`,
 		"llm.rewrite_timeout_seconds":         "45",
 		"llm.rewrite_fallback_template":       "Act on: {original_text}",
-		"llm.generate_task_command":           `claude -p "suggest a task"`,
-		"llm.generate_task_command_start":     `claude -p "first suggest a task"`,
-		"llm.generate_task_timeout_seconds":   "45",
+		"llm.task_generate_command":           `claude -p "suggest a task"`,
+		"llm.task_generate_command_start":     `claude -p "first suggest a task"`,
+		"llm.task_generate_timeout_seconds":   "45",
 		"embedding.disabled":                  "false",
 		"embedding.model_path":                "/models/custom.gguf",
 		"embedding.similarity_threshold":      "0.90",
@@ -1030,8 +1030,8 @@ func TestFieldTUIEditableClassification(t *testing.T) {
 		"llm.rewrite_command":             true,
 		"llm.rewrite_command_start":       true,
 		"llm.rewrite_fallback_template":   true,
-		"llm.generate_task_command":       true,
-		"llm.generate_task_command_start": true,
+		"llm.task_generate_command":       true,
+		"llm.task_generate_command_start": true,
 		"embedding.model_path":            true,
 	}
 	for _, key := range frontend.ConfigFieldKeys {
@@ -1076,14 +1076,14 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 		{"llm.pane_excerpt_chars", "-5", true},
 		{"llm.pane_excerpt_chars", "abc", true},
 		{"llm.pane_excerpt_chars", "4000", false},
-		{"llm.generate_task_timeout_seconds", "0", false}, // 0 = inherit timeout_seconds
-		{"llm.generate_task_timeout_seconds", "45", false},
-		{"llm.generate_task_timeout_seconds", "-5", true},
-		{"llm.generate_task_timeout_seconds", "abc", true},
-		{"llm.generate_task_command", `claude -p "suggest"`, false},
-		{"llm.generate_task_command", "", false}, // empty disables the feature
-		{"llm.generate_task_command_start", `claude -p "first suggest"`, false},
-		{"llm.generate_task_command_start", "", false}, // empty inherits generate_task_command
+		{"llm.task_generate_timeout_seconds", "0", false}, // 0 = inherit timeout_seconds
+		{"llm.task_generate_timeout_seconds", "45", false},
+		{"llm.task_generate_timeout_seconds", "-5", true},
+		{"llm.task_generate_timeout_seconds", "abc", true},
+		{"llm.task_generate_command", `claude -p "suggest"`, false},
+		{"llm.task_generate_command", "", false}, // empty disables the feature
+		{"llm.task_generate_command_start", `claude -p "first suggest"`, false},
+		{"llm.task_generate_command_start", "", false}, // empty inherits task_generate_command
 	}
 	for _, c := range cases {
 		err := app.SetField(ctx, c.key, c.value)
@@ -1130,7 +1130,7 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 	if err := app.SetField(ctx, "safety.disable_seed", "true"); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SetField(ctx, "llm.generate_task_timeout_seconds", "30"); err != nil {
+	if err := app.SetField(ctx, "llm.task_generate_timeout_seconds", "30"); err != nil {
 		t.Fatal(err)
 	}
 	if cfg, err = app.Config(); err != nil {
@@ -1146,7 +1146,7 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 		t.Errorf("llm.pane_excerpt_chars = %d, want 4000", cfg.LLM.PaneExcerptChars)
 	}
 	if cfg.LLM.GenerateTaskTimeoutSeconds != 30 {
-		t.Errorf("llm.generate_task_timeout_seconds = %d, want 30 (assignment not persisted)", cfg.LLM.GenerateTaskTimeoutSeconds)
+		t.Errorf("llm.task_generate_timeout_seconds = %d, want 30 (assignment not persisted)", cfg.LLM.GenerateTaskTimeoutSeconds)
 	}
 }
 

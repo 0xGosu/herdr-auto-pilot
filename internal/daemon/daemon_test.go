@@ -285,17 +285,25 @@ func (f *fakeTaskGen) genCalls() []domain.TaskGenRequest {
 	return append([]domain.TaskGenRequest(nil), f.requests...)
 }
 
-// failingStore injects persistence failures on audit writes (FR-024).
+// failingStore injects persistence failures on audit writes (FR-024) and,
+// optionally, on the LLM in-flight check.
 type failingStore struct {
 	ports.StorePort
-	mu        sync.Mutex
-	failAudit bool
+	mu          sync.Mutex
+	failAudit   bool
+	failPending bool
 }
 
 func (f *failingStore) setFailAudit(v bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failAudit = v
+}
+
+func (f *failingStore) setFailPending(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failPending = v
 }
 
 func (f *failingStore) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, error) {
@@ -306,6 +314,16 @@ func (f *failingStore) AppendAudit(ctx context.Context, a domain.AuditRecord) (i
 		return 0, errors.New("induced audit write failure")
 	}
 	return f.StorePort.AppendAudit(ctx, a)
+}
+
+func (f *failingStore) HasPendingLLMConsult(ctx context.Context, agentID string) (bool, error) {
+	f.mu.Lock()
+	fail := f.failPending
+	f.mu.Unlock()
+	if fail {
+		return false, errors.New("induced pending-check failure")
+	}
+	return f.StorePort.HasPendingLLMConsult(ctx, agentID)
 }
 
 // --- harness ---
@@ -1376,7 +1394,7 @@ func TestIdleWithoutTaskSourceEscalates(t *testing.T) {
 }
 
 func TestIdleGeneratesTaskSuggestionEscalation(t *testing.T) {
-	// FR-011 relaxation: idle with no task source and generate_task_command
+	// FR-011 relaxation: idle with no task source and task_generate_command
 	// configured surfaces an LLM-suggested task as a (non-retryable)
 	// escalation, and sends nothing to the pane.
 	idlePane := "Task is complete.\n"
