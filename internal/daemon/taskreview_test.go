@@ -113,6 +113,38 @@ func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
 	}
 }
 
+func TestDeclaredTaskLLMReviewSendProposedSentinel(t *testing.T) {
+	// The LLM can approve the queued task verbatim with the send-proposed
+	// sentinel instead of re-typing it; the daemon expands it to the rendered
+	// task and sends that (no paraphrase, no wasted tokens).
+	taskFile := writeReviewTaskFile(t, "- [ ] refactor the parser\n")
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-sentinel\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, err := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: domain.ActionSendProposed, Rationale: "ready to go", ConfidentScore: 90,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: domain.ActionSendProposed,
+			Rationale: "ready to go", ConfidentScore: 90, Status: "pending"}, nil
+	}
+
+	h.push("agent-sentinel", "idle")
+	want := "Your next task is refactor the parser. Read the full tasks list at " + taskFile + "."
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sentinel should send the rendered task verbatim, got %q, want %q", got, want)
+	}
+}
+
 func TestDeclaredTaskLLMReviewDeclineEscalates(t *testing.T) {
 	// A SUB-THRESHOLD declined review (@noop, score below the default 999
 	// threshold) is surfaced to the operator: the suggestion is the LLM's exact
