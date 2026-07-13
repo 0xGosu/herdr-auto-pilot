@@ -218,6 +218,11 @@ func TestStatusEmbedderDegradedSurfaced(t *testing.T) {
 	if !strings.Contains(out, "DEGRADED") {
 		t.Errorf("runtime-degraded embedder must be surfaced, got:\n%s", out)
 	}
+	// The remediation must name the REAL command (`hap config set <field> <value>`),
+	// not an invented syntax — guards against the note text drifting.
+	if !strings.Contains(out, "hap config set embedding.disabled") {
+		t.Errorf("degraded note must carry the actionable, valid remediation command, got:\n%s", out)
+	}
 }
 
 func seedSignatures(t *testing.T, st *store.Store) {

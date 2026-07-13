@@ -49,6 +49,10 @@ type refreshMsg struct {
 	kills       []domain.KillEvent
 	signatures  []frontend.SignatureRow
 	cfg         config.Config
+	// daemonHealth combines lock + heartbeat + crash-loop state for the health
+	// banner, so the operator sees a hung/degraded/crash-looping daemon that
+	// otherwise looks identical to "all quiet" (no escalations).
+	daemonHealth frontend.DaemonHealth
 	// pendingConsult holds agent ids that currently have an LLM consult in
 	// flight, so "l: retry LLM" is disabled while one is running (the daemon
 	// re-checks authoritatively). Populated only for retryable escalations.
@@ -234,6 +238,9 @@ func (m Model) refresh() tea.Cmd {
 
 func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 	var msg refreshMsg
+	// Daemon health is read from local state files (never errors), so assess it
+	// first — it stays meaningful even when GetStatus fails (e.g. daemon down).
+	msg.daemonHealth = app.AssessDaemonHealth()
 	msg.status, msg.err = app.GetStatus(ctx)
 	if msg.err != nil {
 		return msg
@@ -1579,6 +1586,17 @@ func (m Model) View() string {
 		}
 	}
 	fmt.Fprintf(&b, "%s\n\n", strings.Join(tabs, "|"))
+
+	// Daemon health banner: a hung, crash-looping, or degraded daemon otherwise
+	// looks identical to "all quiet" (no escalations). Error states use the
+	// error palette; degraded/stale (a working fallback) use warn.
+	if banner := m.data.daemonHealth.Banner(); banner != "" {
+		style := st.warn
+		if m.data.daemonHealth.Severity() == frontend.DaemonError {
+			style = st.err
+		}
+		fmt.Fprintf(&b, "%s\n", style.Render(banner))
+	}
 
 	if m.data.err != nil {
 		fmt.Fprintf(&b, "%s\n", st.err.Render("error: "+m.data.err.Error()))
