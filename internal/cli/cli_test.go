@@ -657,3 +657,61 @@ func TestStatusShowsEmbeddingDrift(t *testing.T) {
 		t.Errorf("driftless status must not show the drift line, got:\n%s", out)
 	}
 }
+
+func TestStateDirCmd(t *testing.T) {
+	app, _ := testApp(t)
+	app.StateDir = t.TempDir()
+
+	out, err := run(t, app, "state-dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Bare absolute path, no decoration, so `cd "$(hap state-dir)"` works.
+	if got := strings.TrimSpace(out); got != app.StateDir {
+		t.Errorf("state-dir must print the bare state dir; got %q want %q", got, app.StateDir)
+	}
+}
+
+func TestConfigPathCmd(t *testing.T) {
+	app, _ := testApp(t)
+
+	out, err := run(t, app, "config", "path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(out); got != app.ConfigPath {
+		t.Errorf("config path must print the bare config.toml path; got %q want %q", got, app.ConfigPath)
+	}
+}
+
+func TestConfigPathWhenFileAbsent(t *testing.T) {
+	app, _ := testApp(t)
+	// testApp points ConfigPath at a file that is never written to disk.
+	if _, err := os.Stat(app.ConfigPath); !os.IsNotExist(err) {
+		t.Fatalf("precondition: config.toml must not exist, stat err=%v", err)
+	}
+
+	out, err := run(t, app, "config", "path")
+	if err != nil {
+		t.Fatalf("config path must not error when the file is absent: %v", err)
+	}
+	if got := strings.TrimSpace(out); got != app.ConfigPath {
+		t.Errorf("config path must print the resolved location even when absent; got %q want %q", got, app.ConfigPath)
+	}
+}
+
+func TestPathsCmd(t *testing.T) {
+	app, _ := testApp(t)
+	app.StateDir = t.TempDir()
+
+	out, err := run(t, app, "paths")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "config:") || !strings.Contains(out, app.ConfigPath) {
+		t.Errorf("paths must show the labeled config path, got:\n%s", out)
+	}
+	if !strings.Contains(out, "state:") || !strings.Contains(out, app.StateDir) {
+		t.Errorf("paths must show the labeled state dir, got:\n%s", out)
+	}
+}

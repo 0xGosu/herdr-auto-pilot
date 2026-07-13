@@ -256,6 +256,29 @@ func TestResolvePathsHerdrDirsAdoptedAsAPair(t *testing.T) {
 	}
 }
 
+func TestResolvePathsNoCreateComputesButCreatesNothing(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+
+	p, err := ResolvePathsNoCreate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same standalone resolution as ResolvePaths...
+	wantCfg := filepath.Join(home, ".config", "herd-auto-prompter")
+	wantState := filepath.Join(home, ".local", "state", "herd-auto-prompter")
+	if p.ConfigDir != wantCfg || p.StateDir != wantState {
+		t.Fatalf("no-create resolution must match ResolvePaths, got %+v", p)
+	}
+	// ...but no directory is created — the diagnostics stay side-effect-free
+	// and usable even under an unwritable parent.
+	for _, dir := range []string{p.ConfigDir, p.StateDir} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("ResolvePathsNoCreate must not create %s (stat err=%v)", dir, err)
+		}
+	}
+}
+
 func TestResolvePathsHonorsXDGBases(t *testing.T) {
 	home := t.TempDir()
 	setHome(t, home)

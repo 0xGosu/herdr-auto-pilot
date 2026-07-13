@@ -270,15 +270,43 @@ type Paths struct {
 	StateDir  string
 }
 
-// ResolvePaths determines the config/state dirs, in priority order:
+// ResolvePaths determines the config/state dirs (see resolvePaths for the
+// priority order) and creates them, so callers that go on to open the DB,
+// socket, or config file can rely on the directories existing.
+func ResolvePaths() (Paths, error) {
+	p, err := resolvePaths()
+	if err != nil {
+		return p, err
+	}
+	for _, dir := range []string{p.ConfigDir, p.StateDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return p, fmt.Errorf("create dir %s: %w", dir, err)
+		}
+	}
+	return p, nil
+}
+
+// ResolvePathsNoCreate resolves the config/state dirs with the same priority
+// order as ResolvePaths but creates nothing. Read-only callers that only need
+// to report a path (e.g. `hap state-dir` / `hap config path` / `hap paths`)
+// use this so they stay usable — and side-effect-free — even when a resolved
+// directory is missing under an unwritable parent, which is exactly the kind
+// of broken state an operator runs those diagnostics to inspect.
+func ResolvePathsNoCreate() (Paths, error) {
+	return resolvePaths()
+}
+
+// resolvePaths computes the config/state dirs, in priority order, without
+// creating any directory (the only filesystem access is the read-only
+// dirExists probe used to detect Herdr's layout):
 //
 //  1. HERDR_PLUGIN_CONFIG_DIR / HERDR_PLUGIN_STATE_DIR — set by Herdr for
 //     every command it launches (the plugin contract).
 //  2. Herdr's own plugin directories, when they exist — so running the
 //     binary from a plain shell operates on the same instance the daemon
 //     uses instead of a parallel standalone world.
-//  3. XDG-style standalone directories, created on demand.
-func ResolvePaths() (Paths, error) {
+//  3. XDG-style standalone directories.
+func resolvePaths() (Paths, error) {
 	p := Paths{
 		ConfigDir: os.Getenv("HERDR_PLUGIN_CONFIG_DIR"),
 		StateDir:  os.Getenv("HERDR_PLUGIN_STATE_DIR"),
@@ -301,7 +329,7 @@ func ResolvePaths() (Paths, error) {
 		// standalone state dir (or vice versa) would recreate the split
 		// world this detection exists to prevent. Detection never creates
 		// the layout — an uninstalled plugin stays standalone — but once
-		// either dir exists the missing sibling is created below.
+		// either dir exists the missing sibling is filled in.
 		herdrConfig := filepath.Join(configBase, "herdr", "plugins", "config", "herd-auto-prompter")
 		herdrState := filepath.Join(stateBase, "herdr", "plugins", "herd-auto-prompter")
 		if dirExists(herdrConfig) || dirExists(herdrState) {
@@ -318,11 +346,6 @@ func ResolvePaths() (Paths, error) {
 	}
 	if p.StateDir == "" {
 		p.StateDir = filepath.Join(stateBase, "herd-auto-prompter")
-	}
-	for _, dir := range []string{p.ConfigDir, p.StateDir} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return p, fmt.Errorf("create dir %s: %w", dir, err)
-		}
 	}
 	return p, nil
 }

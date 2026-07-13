@@ -59,6 +59,18 @@ Herdr injects, and without them auto-detects Herdr's plugin directories
 exists — the plugin isn't installed — does it fall back to standalone
 dirs (`~/.config/herd-auto-prompter`, `~/.local/state/herd-auto-prompter`).
 
+To see exactly where those resolved — handy for tailing the daemon log,
+inspecting the DB, or hand-editing `config.toml` — ask `hap`. These are
+read-only, need no daemon, and print the bare path so they compose in
+scripts:
+
+```sh
+bin/hap state-dir            # state dir (DB, logs, socket, lock, match-index)
+bin/hap config path          # the config.toml path (printed even before it exists)
+bin/hap paths                # both, labeled
+cd "$(bin/hap state-dir)"    # e.g. jump into the state dir
+```
+
 ### Open the pane with a hotkey (optional)
 
 Herdr supports custom command keybindings, and the Auto Prompter pane can be

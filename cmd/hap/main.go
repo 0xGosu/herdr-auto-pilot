@@ -59,9 +59,11 @@ Operate:
                         embedding model change (via the daemon when running)
   pause | resume        global pause/kill switch
   kill-history          pause/kill event history
+  state-dir             print the state directory (DB, logs, socket, index)
+  paths                 print resolved config + state paths (labeled)
 
 Configure:
-  config [show|fields|set <field> <value>|set-threshold <situation> <value>]
+  config [show|fields|path|set <field> <value>|set-threshold <situation> <value>]
   rules [list|add <regex>|remove <index>]      never-auto patterns
   task-source [add] [--agent A] [--workspace W] [--template T] <checklist.md> | list | remove <index>
   clear-data --yes      reset learned history + audit data
@@ -97,13 +99,29 @@ func main() {
 }
 
 func run(verb string, args []string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Path-printing verbs are pure diagnostics: they resolve paths WITHOUT
+	// creating directories, opening the store, or touching the daemon — so they
+	// stay usable, and side-effect-free, in exactly the degraded states an
+	// operator runs them to inspect (an unwritable parent dir, a corrupt DB:
+	// "paste your `hap paths`"). Resolve before the creating ResolvePaths below
+	// so none of that filesystem mutation happens on this path.
+	if verb == "state-dir" || verb == "paths" ||
+		(verb == "config" && len(args) > 0 && args[0] == "path") {
+		paths, err := config.ResolvePathsNoCreate()
+		if err != nil {
+			return err
+		}
+		app := &frontend.App{ConfigPath: paths.File(), StateDir: paths.StateDir}
+		return cli.Run(ctx, app, os.Stdout, verb, args)
+	}
+
 	paths, err := config.ResolvePaths()
 	if err != nil {
 		return err
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	switch verb {
 	case "daemon":
