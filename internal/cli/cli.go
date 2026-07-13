@@ -486,8 +486,9 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 		if row, ok := rules[e.Signature]; ok {
 			rule = frontend.RuleSummary(row, gradN)
 		}
-		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\tagent=%s\tsuggestion=%q\trule=[%s]\n",
-			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.Rationale, agent, e.Suggestion, rule)
+		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\tagent=%s\tllm=%s\tsuggestion=%q\trule=[%s]\n",
+			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.Rationale, agent,
+			llmConfCLI(e.LLMConfidence), e.Suggestion, rule)
 	}
 	fmt.Fprintf(out, "\n%d pending; respond with: confirm <id> | resolve <id> --action TEXT [--send] | dismiss <id>...\n", len(esc))
 	return nil
@@ -533,6 +534,15 @@ func dismiss(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 	return nil
 }
 
+// llmConfCLI renders an audit/escalation row's LLM confidence: the 0-100
+// score, or "-" when the row carries no LLM score.
+func llmConfCLI(v *int) string {
+	if v == nil {
+		return "-"
+	}
+	return strconv.Itoa(*v)
+}
+
 // ruleIndex loads the learned signatures keyed by signature, plus the
 // graduation N, for annotating escalation/audit rows with their matched
 // rule. Degrades to an empty index on error — the listing must not fail
@@ -566,9 +576,9 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if row, ok := rules[r.Signature]; ok {
 			rule = string(row.Mode)
 		}
-		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%.2f\trule=%s\t%s\n",
+		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%.2f\tllm=%s\trule=%s\t%s\n",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
-			r.Action, r.Confidence, rule, r.Rationale)
+			r.Action, r.Confidence, llmConfCLI(r.LLMConfidence), rule, r.Rationale)
 	}
 	return nil
 }

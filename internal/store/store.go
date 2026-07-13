@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	action_or_escalation TEXT NOT NULL,
 	input TEXT NOT NULL DEFAULT '',
 	confidence REAL NOT NULL DEFAULT 0,
+	llm_confidence INTEGER,
 	rationale TEXT NOT NULL DEFAULT '',
 	llm_output TEXT NOT NULL DEFAULT '',
 	corrects_audit_id INTEGER NOT NULL DEFAULT 0,
@@ -203,6 +204,9 @@ func (s *Store) migrate() error {
 	for _, ddl := range []string{
 		`ALTER TABLE audit_log ADD COLUMN agent_type TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE audit_log ADD COLUMN pane_excerpt TEXT NOT NULL DEFAULT ''`,
+		// Nullable: NULL = no LLM score (learned/operator/pre-decision rows),
+		// distinct from a reported 0.
+		`ALTER TABLE audit_log ADD COLUMN llm_confidence INTEGER`,
 		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
 		`ALTER TABLE llm_requests ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''`,
 	} {
@@ -288,11 +292,11 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO audit_log (decision_id, agent_id, agent_type, signature, trigger, situation_type,
-				action_or_escalation, input, confidence, rationale, llm_output,
+				action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
 				corrects_audit_id, status, suggestion, pane_excerpt, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
-			a.Action, a.Input, a.Confidence, a.Rationale, a.LLMOutput,
+			a.Action, a.Input, a.Confidence, llmConfArg(a.LLMConfidence), a.Rationale, a.LLMOutput,
 			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt, unix(a.CreatedAt))
 		if err != nil {
 			return err
@@ -990,10 +994,15 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 		var a domain.AuditRecord
 		var situationType string
 		var created int64
+		var llmConf sql.NullInt64
 		if err := rows.Scan(&a.ID, &a.DecisionID, &a.AgentID, &a.AgentType, &a.Signature, &a.Trigger,
-			&situationType, &a.Action, &a.Input, &a.Confidence, &a.Rationale,
+			&situationType, &a.Action, &a.Input, &a.Confidence, &llmConf, &a.Rationale,
 			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &a.PaneExcerpt, &created); err != nil {
 			return nil, err
+		}
+		if llmConf.Valid {
+			v := int(llmConf.Int64)
+			a.LLMConfidence = &v
 		}
 		a.SituationType = domain.SituationType(situationType)
 		a.CreatedAt = fromUnix(created)
@@ -1003,8 +1012,17 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 }
 
 const auditCols = `id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
-	action_or_escalation, input, confidence, rationale, llm_output,
+	action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
 	corrects_audit_id, status, suggestion, pane_excerpt, created_at`
+
+// llmConfArg maps the optional LLM confidence to a SQL argument: nil stores
+// NULL (no LLM score), a value stores the 0-100 score.
+func llmConfArg(v *int) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
 
 // AuditLog returns recent audit records, newest first.
 func (s *Store) AuditLog(ctx context.Context, limit int) ([]domain.AuditRecord, error) {

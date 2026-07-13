@@ -51,6 +51,45 @@ func listModel(t *testing.T, n, height int) Model {
 	return upd.(Model)
 }
 
+func TestAuditAndEscalationRenderLLMConfidence(t *testing.T) {
+	score := 85
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	m := Model{width: 140, height: 40}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.status.AgentNames = map[string]string{}
+	// An LLM-authored row (both scores) and a learned row (no LLM score).
+	msg.audit = []domain.AuditRecord{
+		{ID: 1, SituationType: domain.SituationApproval, Status: "auto", Action: "auto:1",
+			Confidence: 0.5, LLMConfidence: &score, CreatedAt: now},
+		{ID: 2, SituationType: domain.SituationApproval, Status: "auto", Action: "auto:y",
+			Confidence: 1.0, CreatedAt: now},
+	}
+	msg.escalations = []domain.AuditRecord{
+		{ID: 3, SituationType: domain.SituationApproval, Status: "escalated",
+			Rationale: "low", LLMConfidence: &score, CreatedAt: now},
+		{ID: 4, SituationType: domain.SituationApproval, Status: "escalated",
+			Rationale: "shadow", CreatedAt: now},
+	}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+
+	m.tab = tabAudit
+	audit := m.View()
+	// LLM row shows the 0-100 score next to the 0-1 computed conf; the learned
+	// row shows a dash so the column stays aligned.
+	for _, want := range []string{"conf=0.50 llm=85", "conf=1.00 llm=-"} {
+		if !strings.Contains(audit, want) {
+			t.Errorf("audit view missing %q:\n%s", want, audit)
+		}
+	}
+
+	m.tab = tabEscalations
+	esc := m.View()
+	if !strings.Contains(esc, "llm=85") || !strings.Contains(esc, "llm=-") {
+		t.Errorf("escalations view should show llm=85 and llm=-:\n%s", esc)
+	}
+}
+
 // --- List viewport (AR-001..AR-010) ---
 
 func TestListTabsFitPaneWithManyRows(t *testing.T) {

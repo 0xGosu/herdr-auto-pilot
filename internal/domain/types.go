@@ -136,9 +136,12 @@ type Decision struct {
 	OptionID   string // selected option (choice situations)
 	Source     Source
 	Confidence float64
-	Rationale  string
-	Reason     EscalateReason // set when Action == ActionEscalate
-	Suggestion string         // suggested input surfaced with shadow-mode escalations
+	// LLMConfidence carries a consulting LLM's self-reported confidence (0-100)
+	// through to the audit row escalate() writes; nil for non-LLM decisions.
+	LLMConfidence *int
+	Rationale     string
+	Reason        EscalateReason // set when Action == ActionEscalate
+	Suggestion    string         // suggested input surfaced with shadow-mode escalations
 }
 
 // Mode is the per-signature learning state.
@@ -185,16 +188,22 @@ type DecisionRecord struct {
 
 // AuditRecord is one append-only audit trail entry (FR-020, DR-002).
 type AuditRecord struct {
-	ID              int64
-	DecisionID      int64
-	AgentID         string
-	AgentType       string // agent type at decision time (e.g. "claude"); "" on legacy rows
-	Signature       string
-	Trigger         string
-	SituationType   SituationType
-	Action          string // action taken, or "escalated"
-	Input           string
-	Confidence      float64
+	ID            int64
+	DecisionID    int64
+	AgentID       string
+	AgentType     string // agent type at decision time (e.g. "claude"); "" on legacy rows
+	Signature     string
+	Trigger       string
+	SituationType SituationType
+	Action        string // action taken, or "escalated"
+	Input         string
+	Confidence    float64
+	// LLMConfidence is the consulting LLM's self-reported confidence, 0-100
+	// (the same scale as LLMDecision.ConfidentScore). nil means the row did
+	// not come from an LLM decision (a learned rule, an operator action, or a
+	// pre-decision escalation) — distinct from a reported 0. Confidence above
+	// is the computed 0-1 agreement score; both coexist on LLM rows.
+	LLMConfidence   *int
 	Rationale       string
 	LLMOutput       string
 	CorrectsAuditID int64
