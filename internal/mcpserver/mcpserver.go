@@ -181,6 +181,18 @@ type toolCallParams struct {
 type consultContextFields struct {
 	Options  []string `json:"options"`
 	TabCount int      `json:"tab_count"`
+	// TabSelectKinds is per-tab "single"/"multi" (present only when a form has
+	// a multi-select tab). Only a "multi" tab may receive several option
+	// numbers (an array); a scalar/single-select tab or the Submit tab takes
+	// exactly one, so a multi-value entry there is rejected — otherwise the
+	// extra digits would deliver with no advance and shift onto later tabs.
+	TabSelectKinds []string `json:"tab_select_kinds"`
+}
+
+// tabIsMulti reports whether tab i is a multi-select tab per the context's
+// per-tab kinds (absent/short kinds → single-select, the safe default).
+func tabIsMulti(kinds []string, i int) bool {
+	return i < len(kinds) && kinds[i] == "multi"
 }
 
 // resolveSelectOptions turns per-tab 1-based option numbers into the outbound
@@ -206,6 +218,9 @@ func resolveSelectOptions(contextJSON string, selects []selectOption) (action, o
 	for i, g := range selects {
 		if len(g) == 0 {
 			return "", "", fmt.Errorf("select_options[%d] is empty: choose at least one option number", i)
+		}
+		if len(g) > 1 && !tabIsMulti(cc.TabSelectKinds, i) {
+			return "", "", fmt.Errorf("select_options[%d] lists %d numbers but that tab is single-select (only a MULTI-select tab with `[ ]` checkboxes takes several); the Submit tab and single-choice tabs take exactly one", i, len(g))
 		}
 		for _, n := range g {
 			if n < 1 || n > 9 {

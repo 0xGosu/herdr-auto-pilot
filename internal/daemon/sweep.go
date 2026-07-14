@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -191,18 +192,30 @@ func anyMultiSelect(flags []bool) bool {
 }
 
 // reverifyMultiSelect re-checks, immediately before autonomous delivery, that
-// every multi-select tab is STILL all-unchecked and the form is unchanged. The
-// tab-1 staleness re-read (seriesStale) can not see middle tabs, so without
-// this an operator toggling a middle-tab checkbox during a long consult would
-// be blind-toggled into the wrong set (toggling is relative). It re-runs the
-// capture sweep purely as a guard — a non-nil error means the baseline moved,
-// so delivery must be refused. A no-op for forms with no multi-select tab.
+// the multi-select form is UNCHANGED since capture. The tab-1 staleness re-read
+// (seriesStale) can not see middle tabs, so without this an operator toggling a
+// middle-tab checkbox — or a same-tab-count form replacing this one — during a
+// long consult would receive stale answer groups and stale explicit-advance
+// decisions (toggling is relative). It re-runs the capture sweep and then fails
+// CLOSED unless the re-swept aggregate content AND per-tab select kinds match
+// the situation being delivered — sweepFrames alone only guarantees the same
+// tab count and an unchecked baseline. A no-op for forms with no multi-select
+// tab.
 func (d *Daemon) reverifyMultiSelect(ctx context.Context, ks ports.KeystrokeSender, s domain.Situation) error {
 	if !anyMultiSelect(s.TabMultiSelect) {
 		return nil
 	}
-	_, err := d.sweepFrames(ctx, ks, s)
-	return err
+	reswept, err := d.sweepFrames(ctx, ks, s)
+	if err != nil {
+		return err
+	}
+	if reswept.Content != s.Content {
+		return fmt.Errorf("form content changed since capture")
+	}
+	if !slices.Equal(reswept.TabMultiSelect, s.TabMultiSelect) {
+		return fmt.Errorf("per-tab select kinds changed since capture")
+	}
+	return nil
 }
 
 // countChecked reports how many of a frame's checkbox options are already

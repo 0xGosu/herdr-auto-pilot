@@ -17,8 +17,12 @@ import (
 // pane shows ONE question at a time; the header is the only signal that more
 // tabs exist.
 var (
-	mcqTabHeaderRE = regexp.MustCompile(`(?m)^\s*←.*[☐✔].*→\s*$`)
-	mcqTabEntryRE  = regexp.MustCompile(`[☐✔]`)
+	// The tab header marks each question ☐ (unanswered) or ☒ (answered) plus a
+	// final ✔ Submit. ☒ must be counted too — an operator (or the daemon) may
+	// answer a tab before the form is (re)captured, and missing ☒ undercounts
+	// the tabs (verified live: a partially-answered 3-tab form read as 2).
+	mcqTabHeaderRE = regexp.MustCompile(`(?m)^\s*←.*[☐☒✔].*→\s*$`)
+	mcqTabEntryRE  = regexp.MustCompile(`[☐☒✔]`)
 	mcqTabFooterRE = regexp.MustCompile(`(?i)(tab/arrow keys to navigate|tab to switch questions)`)
 	mcqFooterRE    = regexp.MustCompile(`(?im)^.*enter to select.*$`)
 	// digitTokenRE matches one per-tab answer token: a single menu digit, or —

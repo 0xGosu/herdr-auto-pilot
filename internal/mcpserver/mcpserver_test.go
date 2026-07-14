@@ -162,9 +162,10 @@ func TestMCPSelectOptionsValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A MULTI-SELECT tab is answered with an array of option numbers; the mixed
-	// int-or-array shape joins to the comma-grouped per-tab series delivery.
-	stage("req-ms", `{"options":[],"tab_count":3}`)
+	// A MULTI-SELECT tab (per tab_select_kinds) is answered with an array of
+	// option numbers; the mixed int-or-array shape joins to the comma-grouped
+	// per-tab series delivery.
+	stage("req-ms", `{"options":[],"tab_count":3,"tab_select_kinds":["single","multi","single"]}`)
 	c = startServer(t, st, "req-ms")
 	resp = c.call(t, "tools/call", map[string]any{
 		"name": "submit_decision", "arguments": map[string]any{"select_options": []any{1, []int{1, 3}, 2}},
@@ -178,6 +179,17 @@ func TestMCPSelectOptionsValidation(t *testing.T) {
 	}
 	if err := st.UpdateLLMDecisionStatus(ctx, pending[0].ID, "expired"); err != nil {
 		t.Fatal(err)
+	}
+
+	// An array on a SINGLE-select tab (tab 1 here) is rejected: its extra
+	// digits would deliver with no advance and shift onto later tabs.
+	stage("req-ms2", `{"options":[],"tab_count":3,"tab_select_kinds":["single","multi","single"]}`)
+	c = startServer(t, st, "req-ms2")
+	resp = c.call(t, "tools/call", map[string]any{
+		"name": "submit_decision", "arguments": map[string]any{"select_options": []any{[]int{1, 2}, 1, 2}},
+	})
+	if text, _ := json.Marshal(resp); !strings.Contains(string(text), "single-select") {
+		t.Fatalf("array on a single-select tab must be rejected: %s", text)
 	}
 
 	// A single menu takes exactly one integer, bounded by the offered set.

@@ -48,13 +48,8 @@ var mcqMultiPrecheckedFrames = []string{
 	mcqMultiFrames[2],
 }
 
-// sweptSituation mirrors what the daemon builds after the sweep: the frame-1
-// classification with content/options aggregated across every tab.
-func sweptSituation(t *testing.T) domain.Situation {
-	t.Helper()
-	return sweptSituationFrom(t, mcqFrames)
-}
-
+// sweptSituationFrom mirrors what the daemon builds after the sweep: the
+// frame-1 classification with content/options aggregated across every tab.
 func sweptSituationFrom(t *testing.T, frames []string) domain.Situation {
 	t.Helper()
 	s := classifierForTest().Classify("claude", "blocked", frames[0])
@@ -170,6 +165,35 @@ func TestMultiTabSweepMultiSelectDelivery(t *testing.T) {
 	want := "right right " + reset + " right right " + reset + " " + reset + " 1 1 3 right 1"
 	if joined != want {
 		t.Errorf("multi-select keystroke protocol mismatch:\n got %s\nwant %s", joined, want)
+	}
+}
+
+// reverifyMultiSelect fails CLOSED when the live form changed since capture
+// even though the tab count is unchanged and every tab is still unchecked — a
+// same-count replacement or a changed middle tab (which the tab-1 staleness
+// check can not see) must not receive the stale answer groups.
+func TestReverifyMultiSelectRejectsChangedForm(t *testing.T) {
+	h := newHarness(t, "")
+	s := sweptSituationFrom(t, mcqMultiFrames)
+	s.TabMultiSelect = []bool{false, true, false}
+	s.PaneID = "w1:p1"
+	ctx := context.Background()
+
+	// Unchanged form re-verifies clean.
+	h.herdr.setFrames(mcqMultiFrames)
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s); err != nil {
+		t.Fatalf("an unchanged multi-select form must re-verify clean, got %v", err)
+	}
+
+	// The middle tab now shows a DIFFERENT (still-unchecked, same-count) form.
+	changed := []string{
+		mcqMultiFrames[0],
+		"──────\n" + mcqHeader + "\n\nWhich stats to show?\n\n❯ 1. [ ] Latency\n  2. [ ] Errors\n\n" + mcqFooter + "\n",
+		mcqMultiFrames[2],
+	}
+	h.herdr.setFrames(changed)
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s); err == nil {
+		t.Fatal("reverify must reject a form whose content changed since capture")
 	}
 }
 

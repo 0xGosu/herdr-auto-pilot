@@ -59,6 +59,17 @@ func TestMultiTabFormDetectsV2Footer(t *testing.T) {
 	}
 }
 
+func TestMultiTabFormCountsAnsweredTabs(t *testing.T) {
+	// A partially-answered form marks answered tabs ☒ (not ☐). All three tabs
+	// must still be counted (verified live: this read as 2 before the fix).
+	frame := "←  ☒ Agent identity  ☐ Stats to show  ✔ Submit  →\n\n" +
+		"Which stats?\n❯ 1. [ ] Auto-sends\n  2. [ ] Escalations\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+	tabs, ok := MultiTabForm(frame)
+	if !ok || tabs != 3 {
+		t.Fatalf("MultiTabForm(answered tab) = (%d,%v), want (3,true)", tabs, ok)
+	}
+}
+
 func TestMultiTabFormRejectsSingleQuestionForm(t *testing.T) {
 	// The single-question AskUserQuestion form has the "Enter to select"
 	// footer but no tab header and an ↑/↓ (not Tab/Arrow) footer.
