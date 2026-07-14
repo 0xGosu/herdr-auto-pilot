@@ -103,6 +103,17 @@ func (c *CLI) Notify(ctx context.Context, title, body string) error {
 	return err
 }
 
+// FocusPane brings the agent's tab forward, then zooms its exact pane
+// (`tab focus` + `pane zoom --on`). herdr has no absolute pane-focus
+// command, so zooming is the only way to land on one pane among siblings.
+func (c *CLI) FocusPane(ctx context.Context, tabID, paneID string) error {
+	if _, err := c.run(ctx, "tab", "focus", tabID); err != nil {
+		return err
+	}
+	_, err := c.run(ctx, "pane", "zoom", paneID, "--on")
+	return err
+}
+
 // agentListResponse is the JSON envelope `herdr agent list` prints
 // (verified against herdr 0.7).
 type agentListResponse struct {

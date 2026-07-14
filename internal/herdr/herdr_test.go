@@ -354,3 +354,33 @@ func TestPaneInfo(t *testing.T) {
 		t.Error("failing CLI must surface an error")
 	}
 }
+
+func TestFocusPane(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	ctx := context.Background()
+
+	// FocusPane runs `tab focus` then `pane zoom`.
+	if err := cli.FocusPane(ctx, "2:3", "2-1"); err != nil {
+		t.Fatal(err)
+	}
+	calls := fake.Calls()
+	if len(calls) != 2 || calls[0] != "tab focus 2:3" || calls[1] != "pane zoom 2-1 --on" {
+		t.Errorf("FocusPane should run tab focus then pane zoom --on, got %v", calls)
+	}
+}
+
+func TestFocusPaneFailure(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.SetFailing(true)
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.FocusPane(context.Background(), "1:1", "1-1"); err == nil {
+		t.Error("failing CLI should surface an error from FocusPane")
+	}
+}

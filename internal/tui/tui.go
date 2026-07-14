@@ -201,7 +201,7 @@ func (m Model) visibleAgents() []domain.AgentTransition {
 	var out []domain.AgentTransition
 	for _, a := range m.data.status.MonitoredAgents {
 		if m.matchesQuery(tabAgents, m.data.status.AgentName(a.AgentID),
-			a.AgentID, a.AgentType, a.Status) {
+			agentLocation(a, m.data.status), a.AgentID, a.AgentType, a.Status) {
 			out = append(out, a)
 		}
 	}
@@ -561,6 +561,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.detail = nil
+		case "f":
+			if m.detail.agent != nil {
+				return m.focusAgent(*m.detail.agent)
+			}
 		case "esc", "q":
 			m.detail = nil
 		}
@@ -718,7 +722,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// error-severity banner) as a scrollable detail (#83).
 		return m.viewDaemonStderr()
 	case "f":
-		if m.tab == tabSignatures {
+		switch m.tab {
+		case tabSignatures:
 			switch m.sigMode {
 			case "":
 				m.sigMode = domain.ModeShadow
@@ -730,6 +735,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor = 0
 			m.offsets[tabSignatures] = 0
 			m.message = "filter: " + orDash(string(m.sigMode))
+		case tabAgents:
+			return m.focusSelected()
 		}
 	case "a":
 		if m.tab == tabConfig {
@@ -1100,6 +1107,27 @@ func (m Model) renameSelected() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// focusAgent asks herdr to jump to the agent's exact pane (tab focus + zoom).
+func (m Model) focusAgent(a domain.AgentTransition) (tea.Model, tea.Cmd) {
+	if a.TabID == "" || a.PaneID == "" {
+		m.message = "no location known for this agent"
+		return m, nil
+	}
+	m.beginAction()
+	app, tabID, paneID := m.app, a.TabID, a.PaneID
+	return m, m.do("focused agent in herdr", func(ctx context.Context) error {
+		return app.FocusAgent(ctx, tabID, paneID)
+	})
+}
+
+func (m Model) focusSelected() (tea.Model, tea.Cmd) {
+	agents := m.visibleAgents()
+	if m.cursor >= len(agents) {
+		return m, nil
+	}
+	return m.focusAgent(agents[m.cursor])
+}
+
 // --- Detail view (v) ---
 
 // viewSelected opens a full-record overlay for the selected row. The record
@@ -1442,6 +1470,24 @@ func locationLabel(id string, lookup func() (label string, number int, ok bool))
 		return out + " (" + id + ")"
 	}
 	return id
+}
+
+// agentLocation returns the compact "#<workspace>-<tab>" display string for an agent,
+// or "-" if workspace/tab metadata cannot be resolved.
+func agentLocation(a domain.AgentTransition, status frontend.Status) string {
+	if a.WorkspaceID == "" || a.TabID == "" {
+		return "-"
+	}
+	ws, wsOk := status.Workspaces[a.WorkspaceID]
+	tab, tabOk := status.Tabs[a.TabID]
+	// A tab that reports a different WorkspaceID than the agent's own
+	// snapshot means the two are stale relative to each other (e.g. the tab
+	// moved workspaces): show "-" rather than a workspace/tab pairing that
+	// doesn't actually coexist.
+	if !wsOk || !tabOk || (tab.WorkspaceID != "" && tab.WorkspaceID != a.WorkspaceID) {
+		return "-"
+	}
+	return fmt.Sprintf("#%d-%d", ws.Number, tab.Number)
 }
 
 type auditDetailOptions struct {
@@ -1938,6 +1984,9 @@ func (m Model) helpLine() string {
 			return "enter: confirm+send  c: correct (+send?)  x: delete" + retry +
 				preview + "  ↑/↓: scroll  tab: switch tab  " + closeKeys
 		}
+		if m.detail.agent != nil {
+			return "↑/↓: scroll  tab: switch tab  f: focus in herdr" + preview + "  " + closeKeys
+		}
 		return "↑/↓: scroll  tab: switch tab" + preview + "  " + closeKeys
 	}
 	if m.searching {
@@ -1949,7 +1998,7 @@ func (m Model) helpLine() string {
 	}
 	switch m.tab {
 	case tabAgents:
-		return "v: details  n: rename agent  /: search  " + common
+		return "v: details  n: rename agent  f: focus in herdr  /: search  " + common
 	case tabEscalations:
 		return "enter/y: confirm+send  c: correct (+send?)  l: retry LLM  space: mark  x: delete  X: prune old  v: details  /: search  " + common
 	case tabAudit:
@@ -2045,7 +2094,7 @@ func (m Model) renderAgents(b *strings.Builder) {
 		return
 	}
 	header := fmt.Sprintf(agentsRowFmt,
-		"NAME", "ID", "TYPE", "STATUS", "AUTO", "ESC", "CONF", "CORR", "AGE")
+		"NAME", "LOCATION", "TYPE", "STATUS", "AUTO", "ESC", "CONF", "CORR", "AGE")
 	fmt.Fprintln(b, m.styles().section.Render(header))
 	now := m.renderNow()
 	start, end := m.window(len(agents))
@@ -2054,7 +2103,7 @@ func (m Model) renderAgents(b *strings.Builder) {
 		name := orDash(m.data.status.AgentName(a.AgentID))
 		s := m.data.status.StatsFor(a.AgentID)
 		line := fmt.Sprintf(agentsRowFmt,
-			name, a.AgentID, a.AgentType, a.Status,
+			name, agentLocation(a, m.data.status), a.AgentType, a.Status,
 			strconv.Itoa(s.AutoSends), strconv.Itoa(s.Escalations),
 			strconv.Itoa(s.Confirmed), strconv.Itoa(s.Corrections),
 			formatAge(s.FirstSeen, now))
