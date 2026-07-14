@@ -722,7 +722,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// error-severity banner) as a scrollable detail (#83).
 		return m.viewDaemonStderr()
 	case "f":
-		if m.tab == tabSignatures {
+		switch m.tab {
+		case tabSignatures:
 			switch m.sigMode {
 			case "":
 				m.sigMode = domain.ModeShadow
@@ -734,7 +735,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor = 0
 			m.offsets[tabSignatures] = 0
 			m.message = "filter: " + orDash(string(m.sigMode))
-		} else if m.tab == tabAgents {
+		case tabAgents:
 			return m.focusSelected()
 		}
 	case "a":
