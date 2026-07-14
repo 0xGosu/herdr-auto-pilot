@@ -48,11 +48,10 @@ max_error_retries = 2              # per error signature
 # is the agent's short name ({db}/{control} also available). The prompt must
 # come immediately after -p (claude quirk; the plugin auto-repairs it).
 command = [
-  "claude", "-p",
+  "claude", "--model", "opus", "-p",
   "You are hap's auto-answer assistant. Use ONLY get_context and submit_decision.\n\nCall get_context, treat pane_excerpt as ground truth, and follow answer_format. If proposed_task is present, this is a task review: when the agent is ready and current_task is unfinished, prefer @next_task:declared to send it verbatim—do not make small edits. Return rewritten task text only when its details need a major rewrite. If current_task is clearly done, send an instruction for the next unfinished item in pending_tasks. Use @noop if the agent is busy, no suitable task remains, or evidence is ambiguous. Never invent a task.\n\nOtherwise: for approval/choice, select the safest option and deny destructive or irreversible work; for error, give one concrete recovery instruction; for idle, give the sensible next instruction or @noop.\n\nCall submit_decision with select_options for menus, otherwise recommend_action. Always include confident_score (0-100) and a one-sentence rationale.",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
-  "--model", "opus",
 ]
 
 # ── First-consult variant (optional) ──
@@ -64,11 +63,10 @@ command = [
 # If the preferred command exits with an error in under one second without
 # submitting a decision, hap retries once with the other command template.
 # command_start = [
-#   "claude", "-p",
+#   "claude", "--model", "opus", "-p",
 #   "This is your first interaction with this agent. ...same MCP flow as command...",
 #   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
 #   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
-#   "--model", "opus",
 # ]
 
 # ── OpenAI Codex CLI recipe (commented; swap in to use codex) ──
@@ -79,14 +77,14 @@ command = [
 # environment, so the db/control paths must be passed explicitly via
 # {db}/{control}.
 # command = [
-#   "codex", "exec", "--skip-git-repo-check",
+#   "codex", "--model", "gpt-5.6-terra", "exec", "--skip-git-repo-check",
 #   "--dangerously-bypass-approvals-and-sandbox",
 #   "-c", 'mcp_servers.hap.command="{self}"',
 #   "-c", 'mcp_servers.hap.args=["mcp"]',
 #   "-c", 'mcp_servers.hap.env.HAP_REQUEST_ID="{request_id}"',
 #   "-c", 'mcp_servers.hap.env.HAP_DB_PATH="{db}"',
 #   "-c", 'mcp_servers.hap.env.HAP_CONTROL_PATH="{control}"',
-#   "Use only the hap MCP tools. Call get_context, choose the safest response, then call submit_decision with select_options for a menu or recommend_action for literal text/@noop. Always include confident_score and rationale.",
+#   "You are hap's auto-answer assistant. Use ONLY get_context and submit_decision.\n\nCall get_context, treat pane_excerpt as ground truth, and follow answer_format. If proposed_task is present, this is a task review: when the agent is ready and current_task is unfinished, prefer @next_task:declared to send it verbatim—do not make small edits. Return rewritten task text only when its details need a major rewrite. If current_task is clearly done, send an instruction for the next unfinished item in pending_tasks. Use @noop if the agent is busy, no suitable task remains, or evidence is ambiguous. Never invent a task.\n\nOtherwise: for approval/choice, select the safest option and deny destructive or irreversible work; for error, give one concrete recovery instruction; for idle, give the sensible next instruction or @noop.\n\nCall submit_decision with select_options for menus, otherwise recommend_action. Always include confident_score (0-100) and a one-sentence rationale.",
 # ]
 
 timeout_seconds = 120              # codex is slower to start; 180 is a safer value there
@@ -97,9 +95,8 @@ pane_excerpt_chars = 5000          # pane context included in the consult
 # A one-shot text transform, no MCP round-trip: the CLI runs once and its
 # stdout is the rewritten text.
 rewrite_command = [
-  "claude", "-p",
+  "claude", "--model", "haiku", "-p",
   "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
-  "--model", "haiku",
 ]
 
 # ── First-rewrite variant (optional) ──
@@ -109,14 +106,13 @@ rewrite_command = [
 # rewrite_command. Omit or leave empty to reuse rewrite_command.
 # A sub-one-second error exit is retried once with the other rewrite template.
 # rewrite_command_start = [
-#   "claude", "-p",
+#   "claude", "--model", "haiku", "-p",
 #   "First rewrite for this agent. Rewrite this instruction given its screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
-#   "--model", "haiku",
 # ]
 
 # ── Rewrite recipe — OpenAI Codex (commented; swap in to use codex) ──
 # rewrite_command = [
-#   "codex", "exec", "--skip-git-repo-check",
+#   "codex", "--model", "gpt-5.6-luna", "exec", "--skip-git-repo-check",
 #   "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
 # ]
 
@@ -138,10 +134,16 @@ rewrite_fallback_template = "You must act based on the following: {original_text
 # safe default: idle with no task source escalates and hap synthesizes nothing.
 # (Renamed from generate_task_command; the old key no longer loads — update it.)
 # task_generate_command = [
-#   "claude", "-p",
-#   "Suggest concrete next tasks for the coding agent in this project, most important first. Reply with ONLY the tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
-#   "--model", "haiku",
+#   "claude", "--model", "opus", "-p",
+#   "Suggest concrete next tasks (up to 3) for the coding agent in this project, most important first. Reply with ONLY the tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
 # ]
+
+# ── Idle task suggestion — OpenAI Codex (commented; swap in to use codex) ──
+# task_generate_command = [
+#   "codex", "--model", "gpt-5.6-sol", "exec", "--skip-git-repo-check",
+#   "Suggest concrete next tasks (up to 3) for the coding agent in this project, most important first. Reply with ONLY the tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
+# ]
+
 # task_generate_command_start runs INSTEAD on the agent's first generation
 # (tracked independently); omit to reuse task_generate_command.
 # task_generate_command_start = [ ... ]

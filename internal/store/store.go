@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS corrections (
 	corrected_action TEXT NOT NULL,
 	author TEXT NOT NULL DEFAULT 'operator',
 	processed INTEGER NOT NULL DEFAULT 0,
+	sent INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS kill_events (
@@ -210,6 +211,9 @@ func (s *Store) migrate() error {
 		`ALTER TABLE audit_log ADD COLUMN llm_confidence INTEGER`,
 		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
 		`ALTER TABLE llm_requests ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''`,
+		// sent = 1 when the front-end delivered the correction to the agent;
+		// drives the daemon's post-action unblock self-check.
+		`ALTER TABLE corrections ADD COLUMN sent INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
@@ -366,6 +370,17 @@ func (s *Store) MarkCorrectionProcessed(ctx context.Context, id int64) error {
 	})
 }
 
+// MarkCorrectionSent flags a recorded correction as delivered to the agent
+// (front-ends record it first, then flip this once the send succeeds), so the
+// daemon arms the post-action unblock self-check only for delivered corrections.
+func (s *Store) MarkCorrectionSent(ctx context.Context, id int64) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE corrections SET sent = 1 WHERE id = ?`, id)
+		return err
+	})
+}
+
 // StageLLMRequest stores the context for one LLM consultation (daemon-owned).
 func (s *Store) StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64, error) {
 	var id int64
@@ -455,11 +470,15 @@ func (s *Store) UpdateLLMDecisionStatus(ctx context.Context, id int64, status st
 // InsertCorrection appends a front-end-written correction record.
 func (s *Store) InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error) {
 	var id int64
+	sent := 0
+	if c.Sent {
+		sent = 1
+	}
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO corrections (audit_id, corrected_action, author, processed, created_at)
-			VALUES (?, ?, ?, 0, ?)`,
-			c.AuditID, c.CorrectedAction, orDefault(c.Author, "operator"), unix(c.CreatedAt))
+			INSERT INTO corrections (audit_id, corrected_action, author, processed, sent, created_at)
+			VALUES (?, ?, ?, 0, ?, ?)`,
+			c.AuditID, c.CorrectedAction, orDefault(c.Author, "operator"), sent, unix(c.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -1094,7 +1113,7 @@ func (s *Store) DuplicatePendingEscalation(ctx context.Context, agentID, agentTy
 // UnprocessedCorrections returns corrections the daemon has not consumed.
 func (s *Store) UnprocessedCorrections(ctx context.Context) ([]domain.CorrectionRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, audit_id, corrected_action, author, processed, created_at
+		SELECT id, audit_id, corrected_action, author, processed, sent, created_at
 		FROM corrections WHERE processed = 0 ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
@@ -1103,12 +1122,13 @@ func (s *Store) UnprocessedCorrections(ctx context.Context) ([]domain.Correction
 	var out []domain.CorrectionRecord
 	for rows.Next() {
 		var c domain.CorrectionRecord
-		var processed int
+		var processed, sent int
 		var created int64
-		if err := rows.Scan(&c.ID, &c.AuditID, &c.CorrectedAction, &c.Author, &processed, &created); err != nil {
+		if err := rows.Scan(&c.ID, &c.AuditID, &c.CorrectedAction, &c.Author, &processed, &sent, &created); err != nil {
 			return nil, err
 		}
 		c.Processed = processed != 0
+		c.Sent = sent != 0
 		c.CreatedAt = fromUnix(created)
 		out = append(out, c)
 	}

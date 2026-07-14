@@ -476,15 +476,27 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	if action == domain.SuggestGenerateTask {
 		return a.acceptGeneratedTask(ctx, audit, send)
 	}
-	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
-		AuditID: auditID, CorrectedAction: action, Author: a.Author, CreatedAt: time.Now(),
-	}); err != nil {
+	// willSend is the delivery gate. The correction is recorded FIRST (the
+	// learning event, preserved even when delivery fails) but with Sent=false;
+	// it is flipped to Sent=true only AFTER delivery actually succeeds. The
+	// daemon arms the post-action unblock self-check off the Sent flag, so a
+	// failed pane read / form-validation / keystroke series / Send must never
+	// leave a Sent=true correction (which would fire a bogus delivery_failed).
+	willSend := send && action != domain.ActionNoop && a.Herdr != nil && audit.AgentID != ""
+	corrID, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+		AuditID: auditID, CorrectedAction: action, Author: a.Author, Sent: false, CreatedAt: time.Now(),
+	})
+	if err != nil {
 		return err
 	}
+	// markSent flags the correction delivered so the daemon arms the self-check.
+	// Best-effort: the send already succeeded, so a flag-write failure only
+	// skips the (safety-net) check rather than failing the operator's action.
+	markSent := func() { _ = a.Store.MarkCorrectionSent(ctx, corrID) }
 	// A confirmed/resolved noop records the correction — the learning event
 	// — but never writes the sentinel into the pane: "do nothing" means
 	// exactly that.
-	if send && action != domain.ActionNoop && a.Herdr != nil && audit.AgentID != "" {
+	if willSend {
 		outbound := materializeForSend(action, audit)
 		// A numbered menu (Claude approvals/choices) only accepts the
 		// option's digit, not the label. Re-read the pane's CURRENT screen
@@ -511,6 +523,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 			if err := a.deliverTabSeries(ctx, ks, audit.AgentID, groups); err != nil {
 				return fmt.Errorf("correction recorded, but %w", err)
 			}
+			markSent()
 			return a.nudge(ctx, control.KindReload)
 		}
 		if rerr == nil {
@@ -519,6 +532,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		if err := a.Herdr.Send(ctx, audit.AgentID, outbound); err != nil {
 			return fmt.Errorf("correction recorded, but sending to the agent failed: %w", err)
 		}
+		markSent()
 	}
 	return a.nudge(ctx, control.KindReload)
 }
@@ -863,6 +877,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
+	{Key: "limits.verify_unblock_ms", TUIEditable: true},
 	{Key: "safety.disable_seed", TUIEditable: true},
 	{Key: "llm.command"},       // argv template
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
@@ -936,6 +951,11 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.Limits.MaxAutoPromptsPerMinute)
 	case "limits.max_error_retries":
 		return strconv.Itoa(cfg.Limits.MaxErrorRetries)
+	case "limits.verify_unblock_ms":
+		if cfg.Limits.VerifyUnblockMs <= 0 {
+			return "0 (disabled)"
+		}
+		return strconv.Itoa(cfg.Limits.VerifyUnblockMs)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -1049,6 +1069,15 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 		*dst = v
 		return nil
 	}
+	// setNonNegInt allows 0 (used by fields where 0 is a meaningful "disable").
+	setNonNegInt := func(dst *int) error {
+		v, err := strconv.Atoi(value)
+		if err != nil || v < 0 {
+			return fmt.Errorf("%s must be a non-negative integer, got %q", key, value)
+		}
+		*dst = v
+		return nil
+	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		switch key {
 		case "thresholds.idle":
@@ -1071,6 +1100,8 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setInt(&cfg.Limits.MaxAutoPromptsPerMinute)
 		case "limits.max_error_retries":
 			return setInt(&cfg.Limits.MaxErrorRetries)
+		case "limits.verify_unblock_ms":
+			return setNonNegInt(&cfg.Limits.VerifyUnblockMs)
 		case "llm.timeout_seconds":
 			return setInt(&cfg.LLM.TimeoutSeconds)
 		case "llm.auto_act_confidence_threshold":

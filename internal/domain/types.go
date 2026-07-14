@@ -270,7 +270,12 @@ type CorrectionRecord struct {
 	CorrectedAction string
 	Author          string
 	Processed       bool
-	CreatedAt       time.Time
+	// Sent reports whether the front-end actually delivered this corrected
+	// action to the agent pane (confirm/correct with --send). The daemon uses
+	// it to schedule the post-action unblock self-check only for deliveries —
+	// a record-only correction leaves the agent expectedly blocked.
+	Sent      bool
+	CreatedAt time.Time
 }
 
 // KillEvent is one row of the append-only pause/kill/resume event log.

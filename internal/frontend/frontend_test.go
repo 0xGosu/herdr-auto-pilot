@@ -308,10 +308,14 @@ type fakeHerdr struct {
 	inputs  []string
 	pane    string // returned by ReadPane (live menu content)
 	readErr error
+	sendErr error                    // when set, Send fails (delivery failure)
 	agents  []domain.AgentTransition // returned by ListAgents (live statuses)
 }
 
 func (f *fakeHerdr) Send(_ context.Context, paneID, input string) error {
+	if f.sendErr != nil {
+		return f.sendErr
+	}
 	f.panes = append(f.panes, paneID)
 	f.inputs = append(f.inputs, input)
 	return nil
@@ -323,6 +327,95 @@ func (f *fakeHerdr) ReadPane(context.Context, string, int) (string, error) {
 
 func (f *fakeHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
 	return f.agents, nil
+}
+
+// TestResolveMarksSentOnDelivery: a delivered correction is recorded with
+// Sent=true so the daemon arms the post-action unblock self-check.
+func TestResolveMarksSentOnDelivery(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeHerdr{pane: "Do you want to proceed?\n❯ 1. Yes\n  2. No\n"}
+	app.Herdr = fake
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+	if err := app.Resolve(ctx, id, "Yes", true); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || !corr[0].Sent {
+		t.Errorf("delivered correction should be Sent=true: %+v", corr)
+	}
+	if len(fake.inputs) != 1 {
+		t.Errorf("expected one delivery, got %v", fake.inputs)
+	}
+}
+
+// TestResolveRecordOnlyNotSent: a record-only correction (no --send) leaves
+// Sent=false so the daemon does NOT run the self-check on an expectedly-blocked
+// agent.
+func TestResolveRecordOnlyNotSent(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+	if err := app.Resolve(ctx, id, "n", false); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].Sent {
+		t.Errorf("record-only correction should be Sent=false: %+v", corr)
+	}
+}
+
+// TestResolveNoopNeverSent: a @noop resolution sends nothing and is Sent=false
+// even with --send.
+func TestResolveNoopNeverSent(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+	if err := app.Resolve(ctx, id, "@noop", true); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].Sent {
+		t.Errorf("@noop correction must be Sent=false: %+v", corr)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("@noop must not deliver anything, got %v", fake.inputs)
+	}
+}
+
+// TestResolveFailedSendLeavesUnsent: when delivery fails, the correction is
+// still recorded (learning) but stays Sent=false, so the daemon never arms the
+// self-check for an action that never reached the agent.
+func TestResolveFailedSendLeavesUnsent(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeHerdr{pane: "Enter a commit message:\n> ", sendErr: errAny}
+	app.Herdr = fake
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+	if err := app.Resolve(ctx, id, "proceed", true); err == nil {
+		t.Fatal("expected a delivery error")
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 {
+		t.Fatalf("correction must still be recorded on send failure: %+v", corr)
+	}
+	if corr[0].Sent {
+		t.Errorf("a failed send must leave the correction Sent=false: %+v", corr)
+	}
 }
 
 func TestConfirmSendsRenderedDeclaredTaskPrompt(t *testing.T) {
@@ -913,6 +1006,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"limits.max_consecutive_auto_prompts": "5",
 		"limits.max_auto_prompts_per_minute":  "10",
 		"limits.max_error_retries":            "2",
+		"limits.verify_unblock_ms":            "1000",
 		"safety.disable_seed":                 "true",
 		"llm.command":                         `claude -p "decide"`,
 		"llm.command_start":                   `claude -p "first: decide"`,

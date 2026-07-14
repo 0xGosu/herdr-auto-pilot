@@ -63,6 +63,10 @@ type Limits struct {
 	MaxConsecutiveAutoPrompts int `toml:"max_consecutive_auto_prompts"`
 	MaxAutoPromptsPerMinute   int `toml:"max_auto_prompts_per_minute"`
 	MaxErrorRetries           int `toml:"max_error_retries"`
+	// VerifyUnblockMs is the delay before the post-action self-check re-queries
+	// a blocked agent's status to confirm a delivered reply unblocked it; 0
+	// disables the self-check. Default 1000ms.
+	VerifyUnblockMs int `toml:"verify_unblock_ms"`
 }
 
 // LLM configures the optional local LLM/agent CLI fallback (FR-010, IR-005).
@@ -292,6 +296,7 @@ func Default() Config {
 			MaxConsecutiveAutoPrompts: 10,
 			MaxAutoPromptsPerMinute:   3,
 			MaxErrorRetries:           2,
+			VerifyUnblockMs:           1000,
 		},
 		// RewriteTimeoutSeconds stays zero here: Load seeds from Default
 		// before unmarshalling, and a non-zero seed would mask "omitted →
@@ -502,6 +507,9 @@ func (c *Config) fillZeroes() {
 	if c.Limits.MaxErrorRetries <= 0 {
 		c.Limits.MaxErrorRetries = d.Limits.MaxErrorRetries
 	}
+	// VerifyUnblockMs is deliberately NOT restored here: Load seeds it from
+	// Default() (1000), so an absent key keeps the default, while an explicit
+	// 0 must survive to DISABLE the self-check.
 	if c.LLM.TimeoutSeconds <= 0 {
 		c.LLM.TimeoutSeconds = d.LLM.TimeoutSeconds
 	}

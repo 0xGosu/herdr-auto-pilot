@@ -224,6 +224,20 @@ func TestInferNextTask(t *testing.T) {
 			structured: true,
 		},
 		{
+			// Regression: Claude Code pads the ⎿ connector row (the widget's
+			// first item) with a non-breaking space (U+00A0) before the marker.
+			// Go's ASCII-only \s used to skip that whole row, so the resolver
+			// inferred the SECOND item. Verified against a live captured pane.
+			name:      "NBSP-padded connector row keeps the first item",
+			agentType: "claude",
+			transcript: "· Bunning… (29m 52s · ↓ 81.5k tokens)\n" +
+				"  ⎿  ■ Wire daemon self-check into send paths\n" +
+				"     ◻ Wire frontend Resolve self-check\n" +
+				"     ✔ Add verifyunblock shared helper\n",
+			wantTask:   "Wire daemon self-check into send paths",
+			structured: true,
+		},
+		{
 			name:      "all completed yields nothing",
 			agentType: "claude",
 			transcript: "  ⎿  ✔ everything\n" +
