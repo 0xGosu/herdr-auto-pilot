@@ -40,7 +40,8 @@ func testModel(t *testing.T) Model {
 				Status: "escalated", Confidence: 0.42,
 				Trigger:    "Do you want to apply this edit to internal/store/store.go?\n1. Yes\n2. No",
 				Suggestion: "1", Rationale: longRationale,
-				Signature: "approval:1234abcd5678efab", // matches the shadow rule below
+				Signature:   "approval:1234abcd5678efab", // matches the shadow rule below
+				MatchMethod: domain.MatchCosine, MatchScore: 0.93,
 				CreatedAt: time.Date(2026, 7, 9, 11, 0, 0, 0, time.UTC)},
 		},
 		audit: []domain.AuditRecord{
@@ -1019,6 +1020,11 @@ func TestEscalationShowsMatchedRule(t *testing.T) {
 	if !strings.Contains(view, "Matched rule") || !strings.Contains(view, want) {
 		t.Errorf("escalation detail should describe the matched rule %q:\n%s", want, view)
 	}
+	// The detail also explains HOW it matched, naming the governing knob.
+	if !strings.Contains(view, "Matched via") ||
+		!strings.Contains(view, "matched by `similarity_threshold` (cosine 0.93)") {
+		t.Errorf("escalation detail should explain the match method:\n%s", view)
+	}
 	if !strings.Contains(view, "Agent type") {
 		t.Errorf("escalation detail should show the agent type:\n%s", view)
 	}
@@ -1038,6 +1044,37 @@ func TestEscalationWithoutRuleShowsNoneYet(t *testing.T) {
 	m2.tab = tabAudit
 	if list := m2.View(); !strings.Contains(list, "rule=-") {
 		t.Errorf("audit list should dash-mark rows without a rule:\n%s", list)
+	}
+}
+
+func TestEscalationShowsEmbeddingFailureWithoutRule(t *testing.T) {
+	// The embed-failure indicator is NOT rule-gated: it must show even when
+	// nothing matched (a paraphrase that should have matched but embedding was
+	// down). Signature "error:nomatch0000" has no learned rule.
+	m := Model{width: 100, height: 40}
+	upd, _ := m.Update(refreshMsg{
+		escalations: []domain.AuditRecord{
+			{ID: 9, AgentID: "w6:p1", AgentType: "claude", SituationType: domain.SituationError,
+				Status: "escalated", Trigger: "boom", Rationale: "fresh",
+				Signature:  "error:nomatch0000",
+				EmbedError: "embedder degraded after 3 consecutive failures",
+				CreatedAt:  time.Date(2026, 7, 9, 11, 0, 0, 0, time.UTC)},
+		},
+		cfg: func() config.Config { c := config.Default(); c.Learning.GraduationN = 5; return c }(),
+	})
+	m = upd.(Model)
+	m.tab = tabEscalations
+	m = press(t, m, "v")
+	if m.detail == nil {
+		t.Fatal("v should open the escalation detail")
+	}
+	view := m.View()
+	if !strings.Contains(view, "none yet") {
+		t.Errorf("no rule should render the none-yet hint:\n%s", view)
+	}
+	if !strings.Contains(view, "Embedding") ||
+		!strings.Contains(view, "failed: embedder degraded after 3 consecutive failures") {
+		t.Errorf("embed failure must show even without a matched rule:\n%s", view)
 	}
 }
 

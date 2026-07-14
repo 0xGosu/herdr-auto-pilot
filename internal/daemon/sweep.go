@@ -309,7 +309,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "auto:" + dec.Input, Input: dec.Input,
 		Confidence: dec.Confidence, Rationale: dec.Rationale,
-		Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})
 	if err != nil {
 		d.releasePane(s.AgentID)

@@ -245,6 +245,14 @@ type AuditRecord struct {
 	// (per-entry, unlike the signature's first-seen provenance snapshot);
 	// "" on legacy rows and paths with no pane read (herdr unreachable).
 	PaneExcerpt string
+	// MatchMethod / MatchScore / EmbedError record HOW this situation's
+	// signature was resolved to its rule (semantic cosine, BM25 fallback, or
+	// exact hash) and any embedding failure for this event, so an escalation
+	// can explain why it matched. Populated on escalation rows; empty/zero on
+	// auto-send and legacy rows.
+	MatchMethod MatchMethod
+	MatchScore  float64
+	EmbedError  string
 	CreatedAt   time.Time
 }
 

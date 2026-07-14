@@ -77,16 +77,24 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 	sig domain.SignatureResult, s domain.Situation) domain.SignatureResult {
 
 	if sig.Signature == "" || cfg.Embedding.Disabled || !d.semanticReady.Load() {
+		// Non-empty signature with semantic off/not-ready: matching is
+		// exact-hash only, so a rule can only match by exact content hash.
+		if sig.Signature != "" {
+			sig.Match.Method = domain.MatchExact
+		}
 		return sig
 	}
 
 	existing, err := d.opt.Store.GetSignature(ctx, sig.Raw)
 	if err != nil {
+		// Read failed before any match ran: leave MatchNone so we don't assert
+		// an "exact" match that was never actually checked.
 		slog.Warn("semantic resolve: signature read failed; using hash key", "error", err)
 		return sig
 	}
 	if existing != nil {
-		return sig // known situation: cheap deterministic fast path
+		sig.Match.Method = domain.MatchExact // known situation: cheap deterministic fast path
+		return sig
 	}
 
 	scope := match.Scope{SituationType: s.Type, AgentType: s.AgentType}
@@ -99,6 +107,9 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 		v, err := emb.EmbedText(ctx, sig.Salient)
 		switch {
 		case err != nil:
+			// Record the failure for THIS event so the escalation can explain
+			// why it fell back (covers the degraded latch, ErrDegraded).
+			sig.Match.EmbedError = err.Error()
 			slog.Warn("embed failed; trying text match", "error", err)
 		default:
 			vec = v
@@ -109,6 +120,8 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 				slog.Info("semantic match: reusing learned signature",
 					"signature", hit.Signature, "cosine", hit.Score, "raw", sig.Raw)
 				sig.Signature = hit.Signature
+				sig.Match.Method = domain.MatchCosine
+				sig.Match.Score = hit.Score
 				return sig
 			}
 		}
@@ -124,6 +137,8 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 			slog.Info("text match: reusing learned signature",
 				"signature", hit.Signature, "bm25", hit.Score, "raw", sig.Raw)
 			sig.Signature = hit.Signature
+			sig.Match.Method = domain.MatchBM25
+			sig.Match.Score = hit.Score
 			return sig
 		}
 	}

@@ -151,6 +151,20 @@ func TestResolveSignatureMintsThenRemapsSemantically(t *testing.T) {
 	if sig2.Raw != raw2.Raw {
 		t.Errorf("Raw must never be remapped: %s vs %s", sig2.Raw, raw2.Raw)
 	}
+	// The remap records HOW it matched: cosine, with the similarity score.
+	if sig2.Match.Method != domain.MatchCosine {
+		t.Errorf("match method = %q, want cosine", sig2.Match.Method)
+	}
+	if sig2.Match.Score < 0.9 {
+		t.Errorf("cosine score = %.3f, want ≥ 0.9", sig2.Match.Score)
+	}
+	if sig2.Match.EmbedError != "" {
+		t.Errorf("embed did not fail; EmbedError should be empty, got %q", sig2.Match.EmbedError)
+	}
+	// A freshly-minted key records no match method (nothing to explain).
+	if sig1.Match.Method != domain.MatchNone {
+		t.Errorf("new key match method = %q, want none", sig1.Match.Method)
+	}
 	// No new identity is persisted for a remapped situation.
 	if n, _ := d.opt.Store.CountSignatureEmbeddings(ctx); n != 1 {
 		t.Errorf("embedding rows after remap = %d, want 1", n)
@@ -191,6 +205,9 @@ func TestResolveSignatureExactHitSkipsEmbedding(t *testing.T) {
 	if emb.callCount() != before {
 		t.Errorf("exact hit must not embed (calls %d → %d)", before, emb.callCount())
 	}
+	if resolved.Match.Method != domain.MatchExact {
+		t.Errorf("exact hit match method = %q, want exact", resolved.Match.Method)
+	}
 }
 
 func TestResolveSignatureBM25FallbackOnEmbedFailure(t *testing.T) {
@@ -216,12 +233,30 @@ func TestResolveSignatureBM25FallbackOnEmbedFailure(t *testing.T) {
 	if sig2.Signature != sig1.Signature {
 		t.Errorf("BM25 fallback resolved to %s, want %s", sig2.Signature, sig1.Signature)
 	}
+	// The fallback records the BM25 method + score, and the embed failure that
+	// forced it — both surface on the escalation so the operator sees WHY.
+	if sig2.Match.Method != domain.MatchBM25 {
+		t.Errorf("match method = %q, want bm25", sig2.Match.Method)
+	}
+	if sig2.Match.Score <= 0 {
+		t.Errorf("bm25 score = %.3f, want > 0", sig2.Match.Score)
+	}
+	if sig2.Match.EmbedError == "" {
+		t.Error("embed failed for this event; EmbedError should be set")
+	}
 
-	// Unrelated text stays unmatched under BM25 and mints its own key.
+	// Unrelated text stays unmatched under BM25 and mints its own key. The
+	// embed failure is still recorded even though nothing matched.
 	s3 := approvalSituation("launch nuclear missiles")
 	sig3 := d.resolveSignature(ctx, cfg, domain.ComputeSignature(s3), s3)
 	if sig3.Signature == sig1.Signature {
 		t.Error("unrelated text must not BM25-match the learned signature")
+	}
+	if sig3.Match.Method != domain.MatchNone {
+		t.Errorf("unmatched key match method = %q, want none", sig3.Match.Method)
+	}
+	if sig3.Match.EmbedError == "" {
+		t.Error("embed failure should be recorded even when nothing matched")
 	}
 }
 
@@ -257,6 +292,10 @@ func TestResolveSignatureDisabledPassesThrough(t *testing.T) {
 	resolved := d.resolveSignature(context.Background(), cfg, sig, s)
 	if resolved.Signature != sig.Raw || emb.callCount() != 0 {
 		t.Errorf("disabled embedding must pass hash keys through untouched (calls=%d)", emb.callCount())
+	}
+	// Disabled = exact-hash-only matching, so a rule can only match by hash.
+	if resolved.Match.Method != domain.MatchExact {
+		t.Errorf("disabled embedding match method = %q, want exact", resolved.Match.Method)
 	}
 	if n, _ := raw.CountSignatureEmbeddings(context.Background()); n != 0 {
 		t.Errorf("disabled embedding must not persist identity rows, got %d", n)

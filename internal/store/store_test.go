@@ -226,6 +226,65 @@ func TestAuditLLMConfidenceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAuditMatchDetailRoundTrip(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	// A cosine-matched escalation carries method, score, and no embed error.
+	cosID, err := s.AppendAudit(ctx, domain.AuditRecord{
+		Signature: "approval:x", Trigger: "agent-status: blocked", SituationType: domain.SituationApproval,
+		Action: "escalated", Status: "escalated",
+		MatchMethod: domain.MatchCosine, MatchScore: 0.94, CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetAudit(ctx, cosID)
+	if err != nil || got == nil {
+		t.Fatalf("get cosine audit: %v", err)
+	}
+	if got.MatchMethod != domain.MatchCosine || got.MatchScore != 0.94 || got.EmbedError != "" {
+		t.Errorf("cosine round trip = (%q, %.2f, %q), want (cosine, 0.94, \"\")",
+			got.MatchMethod, got.MatchScore, got.EmbedError)
+	}
+
+	// A BM25 fallback triggered by an embed failure carries the error text.
+	bmID, err := s.AppendAudit(ctx, domain.AuditRecord{
+		Signature: "approval:y", Trigger: "agent-status: blocked", SituationType: domain.SituationApproval,
+		Action: "escalated", Status: "escalated",
+		MatchMethod: domain.MatchBM25, MatchScore: 0.42, EmbedError: "embedder degraded",
+		CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetAudit(ctx, bmID)
+	if err != nil || got == nil {
+		t.Fatalf("get bm25 audit: %v", err)
+	}
+	if got.MatchMethod != domain.MatchBM25 || got.MatchScore != 0.42 || got.EmbedError != "embedder degraded" {
+		t.Errorf("bm25 round trip = (%q, %.2f, %q), want (bm25, 0.42, embedder degraded)",
+			got.MatchMethod, got.MatchScore, got.EmbedError)
+	}
+
+	// A legacy/auto row leaves the match fields at their zero values.
+	autoID, err := s.AppendAudit(ctx, domain.AuditRecord{
+		Signature: "approval:z", Trigger: "agent-status: blocked", SituationType: domain.SituationApproval,
+		Action: "auto:1", Status: "auto", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetAudit(ctx, autoID)
+	if err != nil || got == nil {
+		t.Fatalf("get auto audit: %v", err)
+	}
+	if got.MatchMethod != domain.MatchNone || got.MatchScore != 0 || got.EmbedError != "" {
+		t.Errorf("auto row match fields = (%q, %.2f, %q), want zero values",
+			got.MatchMethod, got.MatchScore, got.EmbedError)
+	}
+}
+
 func TestAuditAndCorrectionLineage(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()
