@@ -11,10 +11,43 @@ import (
 // menu that starts at 0 or skips a number is honored, not re-indexed).
 var numberedOptionRE = regexp.MustCompile(`(?m)^[ \t]*(?:[❯>][ \t]*)?(?:(\d+)[.)]|\[(\d+)\])[ \t]+(\S.*?)[ \t]*$`)
 
+// checkboxLabelRE matches the leading `[ ]` / `[x]` checkbox marker that a
+// Claude multi-SELECT question renders in front of each toggleable option
+// (e.g. "1. [ ] Auto-sends" parses to label "[ ] Auto-sends"). The capture
+// group is the box contents: a space (unchecked) or x/X (checked).
+var checkboxLabelRE = regexp.MustCompile(`^\[([ xX])\]`)
+
 // NumberedOption pairs a menu option's displayed number with its label.
 type NumberedOption struct {
 	Number string
 	Label  string
+}
+
+// MultiSelectTab reports whether a captured MCQ frame shows a multi-SELECT
+// question: one whose options carry per-option `[ ]`/`[x]` checkboxes (toggle
+// several with digit keys, then advance). A single-select question renders
+// plain numbered options with no checkbox and returns false.
+func MultiSelectTab(frame string) bool {
+	for _, o := range ParseNumberedOptions(frame) {
+		if checkboxLabelRE.MatchString(o.Label) {
+			return true
+		}
+	}
+	return false
+}
+
+// OptionCheckStates returns, for a multi-select frame, each option digit's
+// current checkbox state (true = checked). Options without a checkbox marker
+// are omitted, so an all-unchecked multi-select tab yields every digit mapped
+// to false. Delivery uses this to verify the toggle baseline before typing.
+func OptionCheckStates(frame string) map[string]bool {
+	states := make(map[string]bool)
+	for _, o := range ParseNumberedOptions(frame) {
+		if m := checkboxLabelRE.FindStringSubmatch(o.Label); m != nil {
+			states[o.Number] = m[1] == "x" || m[1] == "X"
+		}
+	}
+	return states
 }
 
 // ParseNumberedOptions extracts the numbered options from pane content in

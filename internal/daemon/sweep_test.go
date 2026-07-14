@@ -31,15 +31,37 @@ var mcqFrames = []string{
 		"⚠ You have not answered all questions\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n",
 }
 
+// mcqMultiFrames is a 3-tab form whose SECOND tab is multi-select (its options
+// carry `[ ]` checkboxes, all unchecked). Tab 1 is single-select and tab 3 is
+// the footer-less Submit tab.
+var mcqMultiFrames = []string{
+	"──────\n" + mcqHeader + "\n\nWhich backend?\n\n❯ 1. sqlite\n  2. postgres\n\n" + mcqFooter + "\n",
+	"──────\n" + mcqHeader + "\n\nWhich stats to show?\n\n❯ 1. [ ] Auto-sends\n  2. [ ] Escalations\n  3. [ ] Confirmed\n\n" + mcqFooter + "\n",
+	"──────\n" + mcqHeader + "\n\nReview your answers\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n",
+}
+
+// mcqMultiPrecheckedFrames is mcqMultiFrames with the multi-select tab already
+// carrying a selection (`[x]`) — the baseline the sweep must refuse to toggle.
+var mcqMultiPrecheckedFrames = []string{
+	mcqMultiFrames[0],
+	"──────\n" + mcqHeader + "\n\nWhich stats to show?\n\n❯ 1. [ ] Auto-sends\n  2. [x] Escalations\n  3. [ ] Confirmed\n\n" + mcqFooter + "\n",
+	mcqMultiFrames[2],
+}
+
 // sweptSituation mirrors what the daemon builds after the sweep: the frame-1
 // classification with content/options aggregated across every tab.
 func sweptSituation(t *testing.T) domain.Situation {
 	t.Helper()
-	s := classifierForTest().Classify("claude", "blocked", mcqFrames[0])
-	if s.Type != domain.SituationChoice || s.TabCount != 3 {
-		t.Fatalf("fixture must classify as a 3-tab choice, got type=%v tabs=%d", s.Type, s.TabCount)
+	return sweptSituationFrom(t, mcqFrames)
+}
+
+func sweptSituationFrom(t *testing.T, frames []string) domain.Situation {
+	t.Helper()
+	s := classifierForTest().Classify("claude", "blocked", frames[0])
+	if s.Type != domain.SituationChoice || s.TabCount != len(frames) {
+		t.Fatalf("fixture must classify as a %d-tab choice, got type=%v tabs=%d", len(frames), s.Type, s.TabCount)
 	}
-	s.Content = domain.AggregateMCQFrames(mcqFrames)
+	s.Content = domain.AggregateMCQFrames(frames)
 	s.Options = domain.OptionLabels(s.Content)
 	return s
 }
@@ -47,9 +69,13 @@ func sweptSituation(t *testing.T) domain.Situation {
 // seedSeriesRule trains the aggregated signature to autonomous with a
 // digit-series action, mirroring graduated learning.
 func (h *harness) seedSeriesRule(t *testing.T, series string) string {
+	return h.seedSeriesRuleFrom(t, mcqFrames, series)
+}
+
+func (h *harness) seedSeriesRuleFrom(t *testing.T, frames []string, series string) string {
 	t.Helper()
 	ctx := context.Background()
-	s := sweptSituation(t)
+	s := sweptSituationFrom(t, frames)
 	sig := domain.ComputeSignature(s)
 	if sig.Verdict != domain.GuardOK {
 		t.Fatalf("aggregate over-masked: %q", sig.Salient)
@@ -113,6 +139,62 @@ func TestMultiTabSweepAndSeriesDelivery(t *testing.T) {
 	decs, _ := h.raw.DecisionsForSignature(ctx, sig, 10)
 	if len(decs) != 9 || decs[0].ChosenAction != "1 2 1" || decs[0].Source != domain.SourceRule {
 		t.Errorf("series decision not learned: %+v", decs[0])
+	}
+}
+
+// A form with a MULTI-SELECT tab (tab 2) delivers the toggle digits for that
+// tab followed by an explicit advance keystroke — a multi-select tab does not
+// auto-advance — while the single-select tabs still advance on their one digit.
+func TestMultiTabSweepMultiSelectDelivery(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setFrames(mcqMultiFrames)
+	// tab1=option1, tab2 toggles options 1 and 3, submit=option1.
+	sig := h.seedSeriesRuleFrom(t, mcqMultiFrames, "1 1,3 1")
+
+	h.push("agent-mcqmulti", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 10*time.Second, func() bool {
+		decs, _ := h.raw.DecisionsForSignature(ctx, sig, 10)
+		return len(decs) == 9
+	})
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("series must go out as keystrokes, text sent: %v", h.herdr.sentInputs())
+	}
+	joined := strings.Join(h.herdr.keysSent(), " ")
+	reset := strings.TrimSpace(strings.Repeat("left ", 10))
+	// Sweep: 2 rights + 10-left reset; delivery: 10-left reset, then tab1 "1"
+	// (auto-advances), tab2 "1" "3" then explicit "right" (multi-select does
+	// not auto-advance), submit "1".
+	want := "right right " + reset + " " + reset + " 1 1 3 right 1"
+	if joined != want {
+		t.Errorf("multi-select keystroke protocol mismatch:\n got %s\nwant %s", joined, want)
+	}
+}
+
+// A multi-select tab that ALREADY has a selection can not be toggled safely
+// (toggling is relative): the sweep refuses, the form escalates, and no digit
+// is ever pressed.
+func TestMultiTabSweepMultiSelectPrecheckedEscalates(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setFrames(mcqMultiPrecheckedFrames)
+	h.seedSeriesRuleFrom(t, mcqMultiFrames, "1 1,3 1") // even a graduated rule must not fire
+
+	h.push("agent-mcqprechecked", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 10*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	esc, _ := h.raw.PendingEscalations(ctx)
+	if !strings.Contains(esc[0].Rationale, "already has") {
+		t.Errorf("escalation must name the pre-selected baseline: %+v", esc[0])
+	}
+	for _, k := range h.herdr.keysSent() {
+		if k != "right" && k != "left" {
+			t.Errorf("no digit may be pressed when the toggle baseline is unsafe, keys: %v", h.herdr.keysSent())
+		}
 	}
 }
 
@@ -290,7 +372,7 @@ func TestLLMMultiTabConsultAndSeriesPromotion(t *testing.T) {
 		t.Errorf("series audit must carry the swept aggregate, got %q", audits[0].PaneExcerpt)
 	}
 	<-mu
-	for _, want := range []string{`"tab_count":3`, "select_options MUST be a list of exactly 3 integers", "[question 1/3]", "[question 3/3]"} {
+	for _, want := range []string{`"tab_count":3`, "select_options is a list of exactly 3 entries", "[question 1/3]", "[question 3/3]"} {
 		if !strings.Contains(contextJSON, want) {
 			t.Errorf("consult context missing %q: %s", want, contextJSON)
 		}

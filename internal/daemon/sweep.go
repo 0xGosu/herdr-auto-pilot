@@ -29,6 +29,13 @@ const sweepKeyDelay = 250 * time.Millisecond
 // may have left the form focused elsewhere.
 const sweepResetKeys = 10
 
+// sweepAdvanceKey advances to the next tab after a MULTI-SELECT question's
+// toggles. A multi-select tab does not auto-advance on a digit press, so we
+// send this explicitly. Right-arrow matches the capture sweep's proven tab
+// navigation; const-ized so the integration test can switch to "tab" if a
+// real form needs it.
+const sweepAdvanceKey = "right"
+
 // sweepAllowed re-reads the gates that must veto pane interaction BEFORE
 // any sweep keystroke: kill switch (FR-017), rate pause (FR-019), and the
 // never-auto patterns on the visible content (FR-015). Failing any gate —
@@ -121,6 +128,7 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 	s domain.Situation) (domain.Situation, error) {
 
 	frames := make([]string, 0, s.TabCount)
+	multiSelect := make([]bool, 0, s.TabCount)
 	moved := false
 	var sweepErr error
 	for tab := 0; tab < s.TabCount; tab++ {
@@ -144,7 +152,20 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 			sweepErr = fmt.Errorf("tab %d/%d no longer shows the %d-tab form", tab+1, s.TabCount, s.TabCount)
 			break
 		}
+		// A multi-select tab is answered by toggling checkboxes, which is a
+		// RELATIVE flip. We can only reason about the keystrokes if the tab
+		// starts all-unchecked (the observed default); any pre-selected option
+		// means an operator (or a default) already touched it, so escalate the
+		// whole form rather than blind-toggle into the wrong set.
+		multi := domain.MultiSelectTab(frame)
+		if multi {
+			if n := countChecked(frame); n > 0 {
+				sweepErr = fmt.Errorf("tab %d/%d already has %d option(s) selected; cannot auto-toggle safely", tab+1, s.TabCount, n)
+				break
+			}
+		}
 		frames = append(frames, frame)
+		multiSelect = append(multiSelect, multi)
 	}
 
 	if moved {
@@ -162,7 +183,21 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 	swept := s
 	swept.Content = domain.AggregateMCQFrames(frames)
 	swept.Options = domain.OptionLabels(swept.Content)
+	swept.TabMultiSelect = multiSelect
 	return swept, nil
+}
+
+// countChecked reports how many of a frame's checkbox options are already
+// checked (`[x]`). Used to enforce the all-unchecked baseline before an
+// autonomous multi-select toggle.
+func countChecked(frame string) int {
+	n := 0
+	for _, checked := range domain.OptionCheckStates(frame) {
+		if checked {
+			n++
+		}
+	}
+	return n
 }
 
 // handleSweepOutcome resumes the decision pipeline with the aggregated
@@ -223,8 +258,8 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 		escalateWith(domain.ReasonHerdrUnreachable, "keystrokes unavailable")
 		return
 	}
-	seq, ok := domain.ParseDigitSeries(dec.Input)
-	if !ok || len(seq) != s.TabCount {
+	groups, ok := domain.ParseTabSelections(dec.Input)
+	if !ok || len(groups) != s.TabCount {
 		escalateWith(domain.ReasonUnfamiliarOptions,
 			fmt.Sprintf("answer series %q does not fit the %d-tab form", dec.Input, s.TabCount))
 		return
@@ -255,7 +290,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 	go func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery", func() error {
-			if err := d.sendDigitSeries(ctx, ks, s.PaneID, seq); err != nil {
+			if err := d.sendTabSelections(ctx, ks, s.PaneID, groups, s.TabMultiSelect); err != nil {
 				slog.Error("answer series delivery failed", "pane", s.PaneID, "error", err)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 				d.notify(ctx, "Herd Auto Prompter: action delivery failed",
@@ -289,13 +324,13 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 // row is already committed by the caller (FR-024); the keystrokes and the
 // accept/learn/rate writes run off the main loop.
 func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
-	s domain.Situation, sigKey string, llmDec *domain.LLMDecision, seq []string,
+	s domain.Situation, sigKey string, llmDec *domain.LLMDecision, groups [][]string,
 	auditID int64, now time.Time) {
 
 	go func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery-llm", func() error {
-			if err := d.sendDigitSeries(ctx, ks, s.PaneID, seq); err != nil {
+			if err := d.sendTabSelections(ctx, ks, s.PaneID, groups, s.TabMultiSelect); err != nil {
 				slog.Error("LLM answer series delivery failed", "pane", s.PaneID, "error", err)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 				d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
@@ -326,23 +361,28 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 	}()
 }
 
-// sendDigitSeries resets the form to its first question (fixed Left-arrow
-// burst — a human may have tabbed around since capture), then presses one
-// digit per tab in order, pausing between keystrokes so the form can
-// advance and re-render.
-func (d *Daemon) sendDigitSeries(ctx context.Context, ks ports.KeystrokeSender, paneID string, seq []string) error {
+// sendTabSelections resets the form to its first question (fixed Left-arrow
+// burst — a human may have tabbed around since capture), then presses the
+// per-tab answer keystrokes from domain.MultiTabKeys: the toggle digit(s) for
+// each tab, plus an explicit advance after a MULTI-SELECT tab (which does not
+// auto-advance on a digit press). Keystrokes are paced by sweepKeyDelay so the
+// form advances and re-renders between presses.
+func (d *Daemon) sendTabSelections(ctx context.Context, ks ports.KeystrokeSender, paneID string,
+	groups [][]string, tabMultiSelect []bool) error {
+
 	for i := 0; i < sweepResetKeys; i++ {
 		if err := ks.SendKey(ctx, paneID, "left"); err != nil {
 			return fmt.Errorf("reset left-arrow %d/%d: %w", i+1, sweepResetKeys, err)
 		}
 	}
 	time.Sleep(sweepKeyDelay)
-	for i, digit := range seq {
+	keys := domain.MultiTabKeys(groups, tabMultiSelect, sweepAdvanceKey)
+	for i, key := range keys {
 		if i > 0 {
 			time.Sleep(sweepKeyDelay)
 		}
-		if err := ks.SendKey(ctx, paneID, digit); err != nil {
-			return fmt.Errorf("digit %d/%d: %w", i+1, len(seq), err)
+		if err := ks.SendKey(ctx, paneID, key); err != nil {
+			return fmt.Errorf("keystroke %d/%d (%q): %w", i+1, len(keys), key, err)
 		}
 	}
 	return nil

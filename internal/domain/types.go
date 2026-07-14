@@ -69,6 +69,7 @@ type Situation struct {
 	PermissionVerb string   // salient permission verb/action (approval situations)
 	ErrorSummary   string   // salient error text (error situations)
 	TabCount       int      // multi-tab MCQ form: number of tabs incl. Submit (0/1 = single question)
+	TabMultiSelect []bool   // per-tab: true where a question is multi-select (toggle several, then advance); len==TabCount, Submit tab false. Set during the sweep; nil on the non-swept path.
 }
 
 // ActionKind is what the plugin decided to do.

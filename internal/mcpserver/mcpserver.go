@@ -114,15 +114,19 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "submit_decision",
-			"description": "Submit your decision for the pending request. Which field to use depends on the situation_type in get_context: \"approval\" and \"choice\" listing options (or a multi-tab form) MUST be answered with select_options — the 1-based option number(s) shown in the context (single menu: exactly one integer, e.g. [2]; multi-tab question form: one integer per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1]) — while an approval/choice with NO options listed (e.g. a bare y/n prompt) takes recommend_action with the literal text the prompt expects; \"idle\" and \"error\" MUST be answered with recommend_action — the literal reply text (next prompt/task for idle, recovery command/reply for error), and select_options is rejected. In ANY situation, if the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit recommend_action \"@noop\" to explicitly do nothing. When get_context carries a proposed_task (a pre-send task review of an idle agent), decide from the pane whether to send that queued task now: to send it unchanged submit recommend_action \"@next_task:declared\" (the daemon sends proposed_task verbatim — no need to copy it); put literal text in recommend_action only to edit the task or, if current_task is already done, to send the next unfinished item from pending_tasks; or submit \"@noop\" with a rationale to decline (e.g. every task is done). Your confident_score gates this exactly like any other decision — a confident review is applied automatically (the task is sent, or skipped on a decline) and a low-confidence one is surfaced to the operator. ALWAYS include confident_score: the daemon auto-acts only when your confidence meets the operator's threshold, otherwise it asks the operator to confirm — so a missing or low score means your decision is surfaced for human review, not acted on. The daemon re-gates every submission through this confidence gate and the never-auto patterns before acting.",
+			"description": "Submit your decision for the pending request. Which field to use depends on the situation_type in get_context: \"approval\" and \"choice\" listing options (or a multi-tab form) MUST be answered with select_options — the 1-based option number(s) shown in the context (single menu: exactly one integer, e.g. [2]; multi-tab question form: one entry per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1] — and for a MULTI-SELECT tab, whose options show `[ ]` checkboxes, pass an array of the numbers to toggle, e.g. [1, [1, 3], 2]) — while an approval/choice with NO options listed (e.g. a bare y/n prompt) takes recommend_action with the literal text the prompt expects; \"idle\" and \"error\" MUST be answered with recommend_action — the literal reply text (next prompt/task for idle, recovery command/reply for error), and select_options is rejected. In ANY situation, if the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit recommend_action \"@noop\" to explicitly do nothing. When get_context carries a proposed_task (a pre-send task review of an idle agent), decide from the pane whether to send that queued task now: to send it unchanged submit recommend_action \"@next_task:declared\" (the daemon sends proposed_task verbatim — no need to copy it); put literal text in recommend_action only to edit the task or, if current_task is already done, to send the next unfinished item from pending_tasks; or submit \"@noop\" with a rationale to decline (e.g. every task is done). Your confident_score gates this exactly like any other decision — a confident review is applied automatically (the task is sent, or skipped on a decline) and a low-confidence one is surfaced to the operator. ALWAYS include confident_score: the daemon auto-acts only when your confidence meets the operator's threshold, otherwise it asks the operator to confirm — so a missing or low score means your decision is surfaced for human review, not acted on. The daemon re-gates every submission through this confidence gate and the never-auto patterns before acting.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"request_id": map[string]any{"type": "string", "description": "Decision request id (optional; defaults to the current request)"},
 					"recommend_action": map[string]any{"type": "string",
 						"description": "Literal reply text to send to the agent — REQUIRED for idle and error situations, and for approval/choice prompts with no options listed — or \"@noop\" in any situation to explicitly send nothing. Not accepted as the answer to an approval/choice that lists options (use select_options)."},
-					"select_options": map[string]any{"type": "array", "items": map[string]any{"type": "integer", "minimum": 1, "maximum": 9},
-						"description": "REQUIRED answer for approval and choice situations that list options: the chosen option number(s), 1-based. A single menu takes exactly one integer, e.g. [2]. A multi-tab question form takes exactly one integer per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1]. Rejected for idle/error situations."},
+					"select_options": map[string]any{"type": "array",
+						"items": map[string]any{"oneOf": []any{
+							map[string]any{"type": "integer", "minimum": 1, "maximum": 9},
+							map[string]any{"type": "array", "items": map[string]any{"type": "integer", "minimum": 1, "maximum": 9}},
+						}},
+						"description": "REQUIRED answer for approval and choice situations that list options: the chosen option number(s), 1-based. A single menu takes exactly one integer, e.g. [2]. A multi-tab question form takes one entry per tab in tab order, Submit included: an integer for a single-select tab, or an ARRAY of integers to toggle several options on a MULTI-SELECT tab (its options show `[ ]` checkboxes), e.g. [1, [1, 3], 2] toggles options 1 and 3 on tab 2. Rejected for idle/error situations."},
 					"confident_score": map[string]any{"type": "integer", "minimum": 0, "maximum": 100,
 						"description": "REQUIRED. How confident you are in this decision, 0 (a guess) to 100 (certain). This gates auto-action: the daemon only acts automatically when this meets the operator's auto_act_confidence_threshold; below it (or if omitted) the decision is shown to the operator to confirm."},
 					"rationale": map[string]any{"type": "string", "description": "Why this action matches the operator's likely intent"},
@@ -133,14 +137,35 @@ func toolDefinitions() []map[string]any {
 	}
 }
 
+// selectOption is one tab's answer inside submit_decision.select_options: a
+// single option number (single-select tab / single menu) or an array of
+// numbers to TOGGLE (a multi-select tab). It unmarshals from either a JSON
+// integer (2) or a JSON array of integers ([1,3]), so the two answer shapes
+// coexist in one array — e.g. [1, [1,3], 2].
+type selectOption []int
+
+func (so *selectOption) UnmarshalJSON(b []byte) error {
+	var n int
+	if err := json.Unmarshal(b, &n); err == nil {
+		*so = []int{n}
+		return nil
+	}
+	var arr []int
+	if err := json.Unmarshal(b, &arr); err != nil {
+		return fmt.Errorf("select_options entry must be an option number (e.g. 2) or an array of numbers (e.g. [1,3]): %w", err)
+	}
+	*so = arr
+	return nil
+}
+
 type toolCallParams struct {
 	Name      string `json:"name"`
 	Arguments struct {
-		RequestID       string `json:"request_id"`
-		RecommendAction string `json:"recommend_action"`
-		SelectOptions   []int  `json:"select_options"`
-		ConfidentScore  *int   `json:"confident_score"`
-		Rationale       string `json:"rationale"`
+		RequestID       string         `json:"request_id"`
+		RecommendAction string         `json:"recommend_action"`
+		SelectOptions   []selectOption `json:"select_options"`
+		ConfidentScore  *int           `json:"confident_score"`
+		Rationale       string         `json:"rationale"`
 		// Legacy aliases from the pre-rename tool surface; accepted so a
 		// consult started under an older prompt still lands.
 		Action   string `json:"action"`
@@ -158,36 +183,52 @@ type consultContextFields struct {
 	TabCount int      `json:"tab_count"`
 }
 
-// resolveSelectOptions turns 1-based option numbers into the outbound reply
-// the daemon's gates expect: the option's text for a single menu (falling
-// back to the bare digit when the context lists no options — numbered menus
-// accept an already-numeric selection), or the space-joined digit series for
-// a multi-tab form (one digit per tab, Submit included).
-func resolveSelectOptions(contextJSON string, selects []int) (action, optionID string, err error) {
+// resolveSelectOptions turns per-tab 1-based option numbers into the outbound
+// reply the daemon's gates expect: the option's text for a single menu
+// (falling back to the bare digit when the context lists no options — numbered
+// menus accept an already-numeric selection), or the per-tab answer series for
+// a multi-tab form. Each tab contributes one space-separated token; a multi-
+// SELECT tab's several toggles are comma-joined within that token
+// (e.g. [1, [1,3], 2] -> "1 1,3 2"). Delivery decides where to press an
+// explicit advance from the captured per-tab select kind, not from this shape.
+func resolveSelectOptions(contextJSON string, selects []selectOption) (action, optionID string, err error) {
 	var cc consultContextFields
 	// The blob is daemon-authored JSON; if it doesn't parse, degrade to no
 	// options/tabs rather than refusing the submission.
 	_ = json.Unmarshal([]byte(contextJSON), &cc)
 	if cc.TabCount > 1 && len(selects) != cc.TabCount {
-		return "", "", fmt.Errorf("this multi-tab form has %d tabs (Submit included): select_options needs exactly %d integers in tab order, got %d",
+		return "", "", fmt.Errorf("this multi-tab form has %d tabs (Submit included): select_options needs exactly %d entries in tab order, got %d",
 			cc.TabCount, cc.TabCount, len(selects))
 	}
 	if cc.TabCount <= 1 && len(selects) != 1 {
-		return "", "", fmt.Errorf("this situation takes a single choice: select_options needs exactly one integer, got %d", len(selects))
+		return "", "", fmt.Errorf("this situation takes a single choice: select_options needs exactly one option number, got %d", len(selects))
 	}
-	for i, n := range selects {
-		if n < 1 || n > 9 {
-			return "", "", fmt.Errorf("select_options[%d] = %d: option numbers are 1-based menu digits (1-9)", i, n)
+	for i, g := range selects {
+		if len(g) == 0 {
+			return "", "", fmt.Errorf("select_options[%d] is empty: choose at least one option number", i)
+		}
+		for _, n := range g {
+			if n < 1 || n > 9 {
+				return "", "", fmt.Errorf("select_options[%d] = %d: option numbers are 1-based menu digits (1-9)", i, n)
+			}
 		}
 	}
 	if cc.TabCount > 1 {
-		digits := make([]string, len(selects))
-		for i, n := range selects {
-			digits[i] = strconv.Itoa(n)
+		tokens := make([]string, len(selects))
+		for i, g := range selects {
+			digits := make([]string, len(g))
+			for j, n := range g {
+				digits[j] = strconv.Itoa(n)
+			}
+			tokens[i] = strings.Join(digits, ",")
 		}
-		return strings.Join(digits, " "), "", nil
+		return strings.Join(tokens, " "), "", nil
 	}
-	n := selects[0]
+	// Single menu: exactly one option number (a toggle array makes no sense).
+	if len(selects[0]) != 1 {
+		return "", "", fmt.Errorf("this single menu takes exactly one option number, got %d", len(selects[0]))
+	}
+	n := selects[0][0]
 	if len(cc.Options) > 0 {
 		if n > len(cc.Options) {
 			return "", "", fmt.Errorf("select_options[0] = %d but only %d options are offered", n, len(cc.Options))

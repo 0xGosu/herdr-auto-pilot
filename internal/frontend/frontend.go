@@ -38,6 +38,58 @@ const menuReadLines = 40
 const seriesResetKeys = 10
 const seriesKeyDelay = 250 * time.Millisecond
 
+// seriesAdvanceKey advances past a MULTI-SELECT tab after its toggles (mirrors
+// the daemon's sweepAdvanceKey); a single-select tab auto-advances on its digit.
+const seriesAdvanceKey = "right"
+
+// deliverTabSeries answers a multi-tab question form for the operator-confirm
+// path. Unlike the daemon it never swept the form, so it reads each tab as it
+// goes: reset to the first question, then per tab verify the form is still up,
+// detect whether the tab is multi-select (its options show `[ ]` checkboxes),
+// press the chosen digit(s), and — for a multi-select tab — press an explicit
+// advance (a single-select tab auto-advances on its one digit). A multi-select
+// tab that already has a selection is refused: toggling is relative, so a
+// non-empty baseline would produce the wrong set. groups has one entry per tab
+// (validated by the caller against the tab count).
+func (a *App) deliverTabSeries(ctx context.Context, ks ports.KeystrokeSender, agentID string, groups [][]string) error {
+	for i := 0; i < seriesResetKeys; i++ {
+		if err := ks.SendKey(ctx, agentID, "left"); err != nil {
+			return fmt.Errorf("resetting the form failed: %w", err)
+		}
+	}
+	time.Sleep(seriesKeyDelay)
+	for tab, group := range groups {
+		frame, err := a.readVisiblePane(ctx, agentID, menuReadLines)
+		if err != nil {
+			return fmt.Errorf("re-reading tab %d/%d failed: %w", tab+1, len(groups), err)
+		}
+		if tabs, ok := domain.MultiTabForm(frame); !ok || tabs != len(groups) {
+			return fmt.Errorf("the pane no longer shows the %d-tab form at tab %d; answer in the pane", len(groups), tab+1)
+		}
+		multi := domain.MultiSelectTab(frame)
+		if multi {
+			for digit, checked := range domain.OptionCheckStates(frame) {
+				if checked {
+					return fmt.Errorf("tab %d already has option %s selected; answer in the pane", tab+1, digit)
+				}
+			}
+		}
+		for _, digit := range group {
+			if err := ks.SendKey(ctx, agentID, digit); err != nil {
+				return fmt.Errorf("sending option %s on tab %d failed: %w", digit, tab+1, err)
+			}
+			time.Sleep(seriesKeyDelay)
+		}
+		if multi {
+			if err := ks.SendKey(ctx, agentID, seriesAdvanceKey); err != nil {
+				return fmt.Errorf("advancing past tab %d failed: %w", tab+1, err)
+			}
+			time.Sleep(seriesKeyDelay)
+		}
+	}
+	return nil
+}
+
 // readVisiblePane returns the pane's current on-screen content, preferring a
 // visible-source read (which reflects a standing menu) and falling back to
 // the plain recent read when the adapter cannot do visible reads.
@@ -402,37 +454,24 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		// free-text prompt, or a non-menu situation, deliver the literal
 		// reply unchanged.
 		pane, rerr := a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
-		// A digit series ("1 2 3 2 1") answers a multi-tab question form:
-		// one digit keystroke per tab, Submit included — sent as literal
-		// text it would land in the first question's input instead.
-		if seq, isSeries := domain.ParseDigitSeries(outbound); isSeries &&
+		// A per-tab answer series ("1 2 1", or "1 1,3 2" when a tab is multi-
+		// select) answers a multi-tab question form: one keystroke group per
+		// tab, Submit included — sent as literal text it would land in the
+		// first question's input instead.
+		if groups, isSeries := domain.ParseTabSelections(outbound); isSeries &&
 			audit.SituationType == domain.SituationChoice {
 			if rerr != nil {
 				return fmt.Errorf("correction recorded, but the pane could not be read to deliver the answer series: %w", rerr)
 			}
-			if tabs, ok := domain.MultiTabForm(pane); !ok || tabs != len(seq) {
-				return fmt.Errorf("correction recorded, but the pane no longer shows a %d-tab form; answer series not delivered", len(seq))
+			if tabs, ok := domain.MultiTabForm(pane); !ok || tabs != len(groups) {
+				return fmt.Errorf("correction recorded, but the pane no longer shows a %d-tab form; answer series not delivered", len(groups))
 			}
 			ks, ok := a.Herdr.(ports.KeystrokeSender)
 			if !ok {
 				return fmt.Errorf("correction recorded, but this herdr adapter cannot send keystrokes for the answer series")
 			}
-			// Reset to the first question with a fixed Left-arrow burst —
-			// the operator may have tabbed around the form since the
-			// escalation was raised — then answer one digit per tab.
-			for i := 0; i < seriesResetKeys; i++ {
-				if err := ks.SendKey(ctx, audit.AgentID, "left"); err != nil {
-					return fmt.Errorf("correction recorded, but resetting the form failed: %w", err)
-				}
-			}
-			time.Sleep(seriesKeyDelay)
-			for i, digit := range seq {
-				if i > 0 {
-					time.Sleep(seriesKeyDelay)
-				}
-				if err := ks.SendKey(ctx, audit.AgentID, digit); err != nil {
-					return fmt.Errorf("correction recorded, but the answer series failed at digit %d/%d: %w", i+1, len(seq), err)
-				}
+			if err := a.deliverTabSeries(ctx, ks, audit.AgentID, groups); err != nil {
+				return fmt.Errorf("correction recorded, but %w", err)
 			}
 			return a.nudge(ctx, control.KindReload)
 		}

@@ -21,7 +21,11 @@ var (
 	mcqTabEntryRE  = regexp.MustCompile(`[☐✔]`)
 	mcqTabFooterRE = regexp.MustCompile(`(?i)(tab/arrow keys to navigate|tab to switch questions)`)
 	mcqFooterRE    = regexp.MustCompile(`(?im)^.*enter to select.*$`)
-	digitTokenRE   = regexp.MustCompile(`^[1-9]$`)
+	// digitTokenRE matches one per-tab answer token: a single menu digit, or —
+	// for a multi-select tab that toggles several options — a comma-separated
+	// set of digits ("1,3"). There is still exactly ONE token per tab, so the
+	// len(tokens)==TabCount guards hold whether or not a tab is multi-select.
+	digitTokenRE = regexp.MustCompile(`^[1-9](,[1-9])*$`)
 )
 
 // mcqSubmitScreenRE matches the final Submit tab's confirmation body. That
@@ -77,10 +81,13 @@ func MultiTabForm(pane string) (tabs int, ok bool) {
 	return n, true
 }
 
-// ParseDigitSeries parses a space-separated series of menu digits — the
-// answer format for multi-tab forms ("1 2 3 2 1", one digit per tab
-// including the final Submit tab). A single digit is NOT a series: that is
-// an ordinary single-menu answer.
+// ParseDigitSeries parses the space-separated per-tab answer tokens for a
+// multi-tab form ("1 2 3 2 1", one token per tab including the final Submit
+// tab). A token is a menu digit or — for a multi-select tab — a comma-
+// separated set of digits to toggle ("1,3"). There is exactly one token per
+// tab, so callers that gate on len(tokens)==TabCount stay correct. A single
+// token is NOT a series: that is an ordinary single-menu answer. Delivery
+// uses ParseTabSelections to expand each token into its individual digits.
 func ParseDigitSeries(s string) ([]string, bool) {
 	fields := strings.Fields(s)
 	if len(fields) < 2 {
@@ -92,6 +99,30 @@ func ParseDigitSeries(s string) ([]string, bool) {
 		}
 	}
 	return fields, true
+}
+
+// ParseTabSelections expands ParseDigitSeries into per-tab digit lists: each
+// tab's token is comma-split into the option digits to press, with duplicates
+// removed in first-seen order ("1 1,3 2" -> [["1"],["1","3"],["2"]]). The
+// number of groups equals the tab count, so len==TabCount guards still hold.
+func ParseTabSelections(s string) ([][]string, bool) {
+	fields, ok := ParseDigitSeries(s)
+	if !ok {
+		return nil, false
+	}
+	groups := make([][]string, len(fields))
+	for i, f := range fields {
+		seen := make(map[string]bool)
+		var digs []string
+		for _, d := range strings.Split(f, ",") {
+			if !seen[d] {
+				seen[d] = true
+				digs = append(digs, d)
+			}
+		}
+		groups[i] = digs
+	}
+	return groups, true
 }
 
 // ExtractMCQForm returns just the form region of one pane frame: from the

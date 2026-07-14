@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -137,9 +138,13 @@ func TestParseDigitSeries(t *testing.T) {
 	}{
 		{"1 2 3 2 1", 5, true},
 		{" 1  2 ", 2, true},
-		{"1", 0, false},     // single digit = ordinary single-menu answer
-		{"1 2 x", 0, false}, // non-digit token
-		{"12 3", 0, false},  // multi-digit token is not a menu digit
+		{"1 1,3 2", 3, true}, // a multi-select tab toggles several options
+		{"1,2 3", 2, true},   // comma group in the first tab
+		{"1", 0, false},      // single digit = ordinary single-menu answer
+		{"1 2 x", 0, false},  // non-digit token
+		{"12 3", 0, false},   // multi-digit token is not a menu digit
+		{"1, 3", 0, false},   // trailing comma is not a valid group
+		{"1,0 3", 0, false},  // 0 is not a 1-based menu digit
 		{"", 0, false},
 		{"yes no", 0, false},
 	}
@@ -147,6 +152,31 @@ func TestParseDigitSeries(t *testing.T) {
 		seq, ok := ParseDigitSeries(c.in)
 		if ok != c.ok || len(seq) != c.want {
 			t.Errorf("ParseDigitSeries(%q) = (%v,%v), want len %d ok %v", c.in, seq, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestParseTabSelections(t *testing.T) {
+	cases := []struct {
+		in   string
+		want [][]string
+		ok   bool
+	}{
+		{"1 2 1", [][]string{{"1"}, {"2"}, {"1"}}, true},
+		{"1 1,3 2", [][]string{{"1"}, {"1", "3"}, {"2"}}, true},
+		{"1,3,3 2", [][]string{{"1", "3"}, {"2"}}, true}, // duplicate toggle deduped
+		{"1", nil, false},    // single token is not a series
+		{"1 x", nil, false},  // invalid token
+		{"1, 2", nil, false}, // trailing comma
+	}
+	for _, c := range cases {
+		got, ok := ParseTabSelections(c.in)
+		if ok != c.ok {
+			t.Errorf("ParseTabSelections(%q) ok = %v, want %v", c.in, ok, c.ok)
+			continue
+		}
+		if ok && !reflect.DeepEqual(got, c.want) {
+			t.Errorf("ParseTabSelections(%q) = %v, want %v", c.in, got, c.want)
 		}
 	}
 }
