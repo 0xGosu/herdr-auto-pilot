@@ -104,6 +104,103 @@ func TestRunawayGuardBlocksEleventhInMinute(t *testing.T) {
 	}
 }
 
+func TestRunawayGuardWhenPausedRetainsSuggestion(t *testing.T) {
+	// The rate guard's other trip condition — an already-paused agent — must
+	// retain the resolved suggestion exactly like the consecutive/per-minute
+	// trips do, so confirming still delivers and resumes.
+	in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y", "y", "y")
+	in.Rate = AgentRate{Paused: true}
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonRateLimited {
+		t.Fatalf("paused agent must escalate as rate-limited, got %+v", d)
+	}
+	if d.Suggestion != "respond: y" {
+		t.Fatalf("paused rate-limit escalation must remain confirmable, suggestion = %q", d.Suggestion)
+	}
+}
+
+func TestRunawayGuardRetainsNoopSuggestion(t *testing.T) {
+	// A learned noop is a valid resolved candidate too: the rate-limited
+	// escalation must surface the human-readable noop suggestion, not lose
+	// it or leak the raw "@noop" sentinel.
+	in := autonomous(baseInput(SituationApproval), ActionNoop, ActionNoop, ActionNoop, ActionNoop, ActionNoop, ActionNoop, ActionNoop, ActionNoop)
+	in.Rate = AgentRate{ConsecutiveAuto: 5}
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonRateLimited {
+		t.Fatalf("rate-limited noop situation must escalate, got %+v", d)
+	}
+	if d.Suggestion != ActionNoopSuggestion {
+		t.Fatalf("rate-limited noop suggestion = %q, want %q", d.Suggestion, ActionNoopSuggestion)
+	}
+}
+
+func TestRunawayGuardIdleRetainsDeclaredTaskSuggestion(t *testing.T) {
+	// A rate-limited idle situation with a declared task source must retain
+	// the rendered next-task suggestion, not just a bare reason tag.
+	in := baseInput(SituationIdle)
+	in.State = &SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 10}
+	in.DeclaredTask = &DeclaredTask{Task: "write the changelog", Path: "/tasks.md"}
+	in.Rate = AgentRate{ConsecutiveAuto: 5}
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonRateLimited {
+		t.Fatalf("rate-limited idle situation must escalate, got %+v", d)
+	}
+	want := "send next declared task: Your next task is write the changelog. Read the full tasks list at /tasks.md."
+	if d.Suggestion != want {
+		t.Fatalf("suggestion = %q, want %q", d.Suggestion, want)
+	}
+}
+
+func TestRunawayGuardErrorRetainsSuggestion(t *testing.T) {
+	// The Error resolver branch must retain its suggestion under the rate
+	// guard exactly like Approval/Choice/Idle do.
+	in := autonomous(baseInput(SituationError), "retry", "retry", "retry", "retry", "retry", "retry", "retry", "retry")
+	in.Rate = AgentRate{ConsecutiveAuto: 5}
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonRateLimited {
+		t.Fatalf("rate-limited error situation must escalate, got %+v", d)
+	}
+	if d.Suggestion != "on error: retry" {
+		t.Fatalf("suggestion = %q, want %q", d.Suggestion, "on error: retry")
+	}
+}
+
+func TestRunawayGuardChoiceRetainsAnswerSeriesSuggestion(t *testing.T) {
+	// A rate-limited multi-tab MCQ form must retain the full learned digit
+	// series, not a partial or bare-tag suggestion.
+	in := autonomous(baseInput(SituationChoice),
+		"1 2 3 2 1", "1 2 3 2 1", "1 2 3 2 1", "1 2 3 2 1",
+		"1 2 3 2 1", "1 2 3 2 1", "1 2 3 2 1", "1 2 3 2 1")
+	in.Situation.TabCount = 5
+	in.Rate = AgentRate{ConsecutiveAuto: 5}
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonRateLimited {
+		t.Fatalf("rate-limited multi-tab situation must escalate, got %+v", d)
+	}
+	if d.Suggestion != "answer series: 1 2 3 2 1" {
+		t.Fatalf("suggestion = %q, want %q", d.Suggestion, "answer series: 1 2 3 2 1")
+	}
+}
+
+func TestRunawayGuardNoSuggestionWithoutLearnedHistory(t *testing.T) {
+	// A brand-new signature has nothing to resolve yet (ReasonNoHistory): the
+	// rate-limited escalation must degrade to an empty suggestion instead of
+	// panicking or fabricating one. This does not pin the resolve-before-
+	// rate-guard ordering itself (an empty suggestion would also result from
+	// the old tag-only veto) — it guards the no-fabrication property of the
+	// resolve call that ordering change introduced.
+	in := baseInput(SituationApproval)
+	in.State = &SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 10}
+	in.Rate = AgentRate{ConsecutiveAuto: 5}
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonRateLimited {
+		t.Fatalf("rate-limited situation with no history must still escalate as rate-limited, got %+v", d)
+	}
+	if d.Suggestion != "" {
+		t.Fatalf("suggestion with no learned history = %q, want empty", d.Suggestion)
+	}
+}
+
 func TestShadowModeSuggestsNeverActs(t *testing.T) {
 	// FR-004: shadow mode presents a suggestion, takes no action.
 	in := baseInput(SituationApproval)

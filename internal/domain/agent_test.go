@@ -15,6 +15,13 @@ func TestIsPlaceholderAgentRequiresBothFieldsToBeUnknown(t *testing.T) {
 		{name: "real type unknown status", agentType: "claude", status: "unknown", want: false},
 		{name: "unknown type active status", agentType: "undefined", status: "working", want: false},
 		{name: "real agent", agentType: "codex", status: "blocked", want: false},
+		// Detection events never carry a status (it decodes as ""), so the
+		// empty-string form of each field — not just the literal
+		// "undefined"/"unknown" sentinels — must be exercised on both sides.
+		{name: "real type empty status", agentType: "claude", status: "", want: false},
+		{name: "empty type real status", agentType: "", status: "working", want: false},
+		{name: "empty type explicit unknown status", agentType: "", status: "unknown", want: true},
+		{name: "explicit undefined type empty status", agentType: "undefined", status: "", want: true},
 	}
 
 	for _, tt := range tests {

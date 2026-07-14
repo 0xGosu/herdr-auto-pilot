@@ -328,6 +328,30 @@ func TestListAgentsFiltersOnlyDoublePlaceholderRows(t *testing.T) {
 	}
 }
 
+func TestListAgentsFiltersCaseInsensitiveAndEmptyPlaceholders(t *testing.T) {
+	// Placeholder detection must not depend on herdr sending the exact
+	// lowercase sentinel or a non-empty field: mixed case, surrounding
+	// whitespace, and the empty string are all placeholder forms.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	fake.SetAgentList(`{"id":"cli:agent:list","result":{"agents":[` +
+		`{"agent":"UNDEFINED","agent_status":" Unknown ","pane_id":"panel-mixed-case"},` +
+		`{"agent":"","agent_status":"","pane_id":"panel-empty"},` +
+		`{"agent":"claude","agent_status":"","pane_id":"real-empty-status"}` +
+		`],"type":"agent_list"}}`)
+
+	agents, err := cli.ListAgents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].PaneID != "real-empty-status" {
+		t.Fatalf("visible agents = %+v, want only real-empty-status", agents)
+	}
+}
+
 func TestCLIFailureSurfaced(t *testing.T) {
 	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
 	if err != nil {
