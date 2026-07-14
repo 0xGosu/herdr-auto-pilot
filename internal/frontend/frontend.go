@@ -451,6 +451,16 @@ func (a *App) Resume(ctx context.Context) error {
 	return nil
 }
 
+// FocusAgent brings the herdr UI to the agent's exact pane (tab focus + pane
+// zoom). Errors if the adapter doesn't support focusing.
+func (a *App) FocusAgent(ctx context.Context, tabID, paneID string) error {
+	fp, ok := a.Herdr.(ports.FocusPort)
+	if !ok {
+		return fmt.Errorf("focus not supported by this herdr adapter")
+	}
+	return fp.FocusPane(ctx, tabID, paneID)
+}
+
 // Resolve records the operator's response to an escalation or a post-hoc
 // correction of an automated decision (FR-021). action is the chosen reply
 // text; when send is true the input is also delivered to the agent pane

@@ -55,6 +55,12 @@ type KeystrokeSender interface {
 	SendKey(ctx context.Context, paneID, key string) error
 }
 
+// FocusPort is implemented by Herdr adapters that can bring a tab/pane into
+// view. Optional: callers type-assert and report "not supported" when absent.
+type FocusPort interface {
+	FocusPane(ctx context.Context, tabID, paneID string) error
+}
+
 // EventPort is the inbound Herdr event subscription (raw socket).
 type EventPort interface {
 	// Subscribe streams agent-status transitions until ctx is done.

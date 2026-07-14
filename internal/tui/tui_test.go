@@ -1447,3 +1447,200 @@ func TestDetailViewVimLStillSwitchesTabsOffEscalations(t *testing.T) {
 		t.Errorf("l should advance Agents → Escalations, got %v", m.tab)
 	}
 }
+
+func TestAgentLocation(t *testing.T) {
+	tests := []struct {
+		name string
+		a    domain.AgentTransition
+		st   frontend.Status
+		want string
+	}{
+		{
+			name: "happy path: workspace and tab present",
+			a:    domain.AgentTransition{WorkspaceID: "w2", TabID: "w2:t3"},
+			st: frontend.Status{
+				Workspaces: map[string]domain.WorkspaceInfo{"w2": {Number: 2}},
+				Tabs:       map[string]domain.TabInfo{"w2:t3": {Number: 3}},
+			},
+			want: "#2-3",
+		},
+		{
+			name: "empty WorkspaceID",
+			a:    domain.AgentTransition{WorkspaceID: "", TabID: "w1:t1"},
+			st:   frontend.Status{},
+			want: "-",
+		},
+		{
+			name: "empty TabID",
+			a:    domain.AgentTransition{WorkspaceID: "w1", TabID: ""},
+			st:   frontend.Status{},
+			want: "-",
+		},
+		{
+			name: "workspace not in map",
+			a:    domain.AgentTransition{WorkspaceID: "w9", TabID: "w9:t1"},
+			st: frontend.Status{
+				Workspaces: map[string]domain.WorkspaceInfo{},
+				Tabs:       map[string]domain.TabInfo{"w9:t1": {Number: 1}},
+			},
+			want: "-",
+		},
+		{
+			name: "tab not in map",
+			a:    domain.AgentTransition{WorkspaceID: "w1", TabID: "w1:t9"},
+			st: frontend.Status{
+				Workspaces: map[string]domain.WorkspaceInfo{"w1": {Number: 1}},
+				Tabs:       map[string]domain.TabInfo{},
+			},
+			want: "-",
+		},
+		{
+			name: "multiple workspaces and tabs",
+			a:    domain.AgentTransition{WorkspaceID: "w1", TabID: "w1:t2"},
+			st: frontend.Status{
+				Workspaces: map[string]domain.WorkspaceInfo{
+					"w1": {Number: 1},
+					"w2": {Number: 2},
+				},
+				Tabs: map[string]domain.TabInfo{
+					"w1:t1": {Number: 1, WorkspaceID: "w1"},
+					"w1:t2": {Number: 2, WorkspaceID: "w1"},
+					"w2:t1": {Number: 1, WorkspaceID: "w2"},
+				},
+			},
+			want: "#1-2",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := agentLocation(tt.a, tt.st)
+			if got != tt.want {
+				t.Errorf("agentLocation(%+v, ...) = %q, want %q", tt.a, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAgentsTabSearchFilterByLocation(t *testing.T) {
+	// Verify that visibleAgents searches the location string, not the raw AgentID.
+	m := testModel(t)
+	m.tab = tabAgents
+	m.data.status.MonitoredAgents = []domain.AgentTransition{
+		{AgentID: "w1:p1", WorkspaceID: "w1", TabID: "w1:t1", AgentType: "claude"},
+		{AgentID: "w2:p1", WorkspaceID: "w2", TabID: "w2:t1", AgentType: "opus"},
+		{AgentID: "w2:p2", WorkspaceID: "w2", TabID: "w2:t2", AgentType: "claude"},
+	}
+	m.data.status.Workspaces = map[string]domain.WorkspaceInfo{
+		"w1": {Number: 1},
+		"w2": {Number: 2},
+	}
+	m.data.status.Tabs = map[string]domain.TabInfo{
+		"w1:t1": {Number: 1, WorkspaceID: "w1"},
+		"w2:t1": {Number: 1, WorkspaceID: "w2"},
+		"w2:t2": {Number: 2, WorkspaceID: "w2"},
+	}
+
+	m.query[tabAgents] = "2-"
+	visible := m.visibleAgents()
+	if len(visible) != 2 {
+		t.Errorf("query '2-' should match 2 agents in workspace 2, got %d", len(visible))
+	}
+	for _, a := range visible {
+		if a.WorkspaceID != "w2" {
+			t.Errorf("filtered agent should be from workspace 2, got %v", a)
+		}
+	}
+}
+
+func TestFocusAgentKeystrokeOnAgentsList(t *testing.T) {
+	// f on Agents tab list should focus the selected agent.
+	m := testModel(t)
+	m.tab = tabAgents
+	m.app = &frontend.App{
+		Herdr: &focusTestHerdr{},
+	}
+	upd, cmd := m.Update(pressKeyMsg("f"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("f on Agents list should issue a focus command")
+	}
+	// Run the async command and feed its message back, as Bubble Tea's
+	// runtime would, before asserting on the resulting status note.
+	result := cmd()
+	res, ok := result.(actionResultMsg)
+	if !ok {
+		t.Fatalf("focus should return actionResultMsg, got %T", result)
+	}
+	if res.err != nil {
+		t.Fatalf("focus command should succeed: %v", res.err)
+	}
+	upd, _ = m.Update(res)
+	m = upd.(Model)
+	if m.status == nil || !strings.Contains(m.status.text, "focused") {
+		t.Errorf("focus should show a success status, got %+v", m.status)
+	}
+}
+
+func TestFocusAgentKeystrokeOnAgentDetail(t *testing.T) {
+	// f on an agent detail overlay should focus the snapshotted agent.
+	m := testModel(t)
+	m.app = &frontend.App{
+		Herdr: &focusTestHerdr{},
+	}
+	// Open agent detail.
+	m = press(t, m, "v")
+	if m.detail == nil {
+		t.Fatal("v should open agent detail")
+	}
+	agent := m.detail.agent
+	if agent == nil {
+		t.Fatal("agent detail should snapshot the agent")
+	}
+
+	// Press f inside the detail.
+	upd, cmd := m.Update(pressKeyMsg("f"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("f on agent detail should issue a focus command")
+	}
+	result := cmd()
+	res, ok := result.(actionResultMsg)
+	if !ok {
+		t.Fatalf("focus should return actionResultMsg, got %T", result)
+	}
+	if res.err != nil {
+		t.Fatalf("focus command should succeed: %v", res.err)
+	}
+}
+
+func TestFocusAgentNoLocationKnown(t *testing.T) {
+	// focus on an agent with no TabID/PaneID should show an error message, not crash.
+	m := testModel(t)
+	m.tab = tabAgents
+	m.data.status.MonitoredAgents = []domain.AgentTransition{
+		{AgentID: "orphan", WorkspaceID: "", TabID: "", AgentType: "claude"},
+	}
+	upd, cmd := m.Update(pressKeyMsg("f"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Error("focus with no location should not issue a command")
+	}
+	if !strings.Contains(m.message, "no location known") {
+		t.Errorf("expected 'no location known' message, got %q", m.message)
+	}
+}
+
+type focusTestHerdr struct {
+	captureHerdr
+	focused []focusCall
+}
+
+type focusCall struct {
+	tabID  string
+	paneID string
+}
+
+func (h *focusTestHerdr) FocusPane(ctx context.Context, tabID, paneID string) error {
+	h.focused = append(h.focused, focusCall{tabID, paneID})
+	return nil
+}

@@ -1893,3 +1893,41 @@ func TestMatchSummary(t *testing.T) {
 		})
 	}
 }
+
+func TestFocusAgent(t *testing.T) {
+	app, _ := testApp(t)
+	focusHerdr := &focusPortHerdr{}
+	app.Herdr = focusHerdr
+	ctx := context.Background()
+
+	if err := app.FocusAgent(ctx, "2:3", "2-1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(focusHerdr.calls) != 1 || focusHerdr.calls[0].tabID != "2:3" || focusHerdr.calls[0].paneID != "2-1" {
+		t.Errorf("FocusAgent should call FocusPane(2:3, 2-1), got %+v", focusHerdr.calls)
+	}
+}
+
+func TestFocusAgentNotSupported(t *testing.T) {
+	app, _ := testApp(t)
+	app.Herdr = &fakeHerdr{}
+	err := app.FocusAgent(context.Background(), "1:1", "1-1")
+	if err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Errorf("FocusAgent without FocusPort should report not supported, got %v", err)
+	}
+}
+
+type focusPaneCall struct {
+	tabID  string
+	paneID string
+}
+
+type focusPortHerdr struct {
+	fakeHerdr
+	calls []focusPaneCall
+}
+
+func (h *focusPortHerdr) FocusPane(ctx context.Context, tabID, paneID string) error {
+	h.calls = append(h.calls, focusPaneCall{tabID, paneID})
+	return nil
+}
