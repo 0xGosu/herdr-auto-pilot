@@ -415,9 +415,11 @@ func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
 		t.Errorf("confirm should record a declared-task correction: %+v", corr)
 	}
 
-	// The task text was sent to the agent's pane.
-	if len(fake.inputs) != 1 || fake.inputs[0] != taskText {
-		t.Errorf("delivered %v, want the task text %q", fake.inputs, taskText)
+	// The generated task uses the same default prompt as every declared task,
+	// including the newly created task-list path.
+	wantPrompt := domain.DeclaredTask{Task: taskText, Path: path, AgentName: name}.Prompt()
+	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
+		t.Errorf("delivered %v, want the rendered prompt %q", fake.inputs, wantPrompt)
 	}
 	if len(fake.panes) != 1 || fake.panes[0] != "w1:p1" {
 		t.Errorf("delivered to %v, want the audit's agent pane", fake.panes)
@@ -483,9 +485,13 @@ func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
 	if !strings.Contains(string(body), want) {
 		t.Errorf("tasks file = %q, want a checklist %q", body, want)
 	}
-	// Only the first task is sent to the agent.
-	if len(fake.inputs) != 1 || fake.inputs[0] != "Investigate the flaky auth test" {
-		t.Errorf("delivered %v, want only the first task", fake.inputs)
+	// Only the first task is sent to the agent, rendered through the same
+	// default prompt used for later items from the registered source.
+	wantPrompt := domain.DeclaredTask{
+		Task: "Investigate the flaky auth test", Path: path, AgentName: name,
+	}.Prompt()
+	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
+		t.Errorf("delivered %v, want only the first task as %q", fake.inputs, wantPrompt)
 	}
 	// The next declared task is the first pending item, so the queue drives on
 	// later idles.

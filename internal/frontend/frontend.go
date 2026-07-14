@@ -587,8 +587,13 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	}
 
 	if send && a.Herdr != nil {
-		// Only the first task is sent — the operator's "start now" task.
-		if err := a.Herdr.Send(ctx, audit.AgentID, tasks[0]); err != nil {
+		// Only the first task is sent — the operator's "start now" task. Render
+		// it through the same default next-task template used by a declared task
+		// source, so every idle-task handoff includes both the task and its list.
+		prompt := domain.DeclaredTask{
+			Task: tasks[0], Path: path, AgentName: name,
+		}.Prompt()
+		if err := a.Herdr.Send(ctx, audit.AgentID, prompt); err != nil {
 			return fmt.Errorf("task source created, but sending the task to the agent failed: %w", err)
 		}
 	}
