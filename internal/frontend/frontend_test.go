@@ -1700,9 +1700,12 @@ func TestResolveDigitSeriesDeliversKeystrokes(t *testing.T) {
 	if len(fake.inputs) != 0 {
 		t.Errorf("series must not be sent as text, sent %v", fake.inputs)
 	}
-	// A fixed Left-arrow burst resets the form to question 1 first — the
-	// operator may have tabbed around since the escalation was raised.
-	want := strings.TrimSpace(strings.Repeat("left ", 10)) + " 1 2 1"
+	// All-or-nothing delivery: a read-only baseline pre-pass first (reset, then
+	// a Right-arrow walk of tabs 2 and 3) confirms the form is stable and no
+	// multi-select tab is pre-selected, then the delivery pass resets again and
+	// types one digit per (single-select) tab.
+	reset := strings.TrimSpace(strings.Repeat("left ", 10))
+	want := reset + " right right " + reset + " 1 2 1"
 	if got := strings.Join(fake.keys, " "); got != want {
 		t.Errorf("keystrokes = %q, want %q", got, want)
 	}

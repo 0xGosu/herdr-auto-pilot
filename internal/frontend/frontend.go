@@ -31,62 +31,87 @@ import (
 // recover the live numbered menu before delivering the operator's reply.
 const menuReadLines = 40
 
-// seriesResetKeys / seriesKeyDelay mirror the daemon's multi-tab answer
-// protocol (sweepResetKeys / sweepKeyDelay): a fixed Left-arrow burst lands
-// on the first question regardless of form size, and the delay lets the
-// form advance and re-render between keystrokes.
-const seriesResetKeys = 10
+// seriesResetKeys / seriesAdvanceKey alias the shared domain protocol
+// constants so the operator-confirm path navigates a form identically to the
+// daemon's sweep and delivery (single source of truth — domain.MCQ*).
+// seriesKeyDelay mirrors the daemon's sweepKeyDelay pacing.
+const seriesResetKeys = domain.MCQResetKeys
+const seriesAdvanceKey = domain.MCQAdvanceKey
 const seriesKeyDelay = 250 * time.Millisecond
 
-// seriesAdvanceKey advances past a MULTI-SELECT tab after its toggles (mirrors
-// the daemon's sweepAdvanceKey); a single-select tab auto-advances on its digit.
-const seriesAdvanceKey = "right"
-
 // deliverTabSeries answers a multi-tab question form for the operator-confirm
-// path. Unlike the daemon it never swept the form, so it reads each tab as it
-// goes: reset to the first question, then per tab verify the form is still up,
-// detect whether the tab is multi-select (its options show `[ ]` checkboxes),
-// press the chosen digit(s), and — for a multi-select tab — press an explicit
-// advance (a single-select tab auto-advances on its one digit). A multi-select
-// tab that already has a selection is refused: toggling is relative, so a
-// non-empty baseline would produce the wrong set. groups has one entry per tab
-// (validated by the caller against the tab count).
+// path. Unlike the daemon it never swept the form, so it verifies in two
+// passes to stay all-or-nothing (matching the daemon's refuse-before-any-
+// keystroke behavior): first a read-only walk of every tab confirming the form
+// is stable and no multi-select tab already has a selection, then — only if
+// that passes — a delivery pass that toggles. This way a refusal never leaves
+// the form half-answered. groups has one entry per tab (validated by the
+// caller against the tab count).
 func (a *App) deliverTabSeries(ctx context.Context, ks ports.KeystrokeSender, agentID string, groups [][]string) error {
+	multi, err := a.verifyTabBaseline(ctx, ks, agentID, len(groups))
+	if err != nil {
+		return err
+	}
+	if err := a.resetForm(ctx, ks, agentID); err != nil {
+		return err
+	}
+	keys := domain.MultiTabKeys(groups, multi, seriesAdvanceKey)
+	for i, key := range keys {
+		if i > 0 {
+			time.Sleep(seriesKeyDelay)
+		}
+		if err := ks.SendKey(ctx, agentID, key); err != nil {
+			return fmt.Errorf("delivering keystroke %d/%d (%q) failed: %w", i+1, len(keys), key, err)
+		}
+	}
+	return nil
+}
+
+// verifyTabBaseline walks the form read-only (reset, then one Right per tab)
+// and returns each tab's multi-select flag, erroring if the form drifted or a
+// multi-select tab already carries a selection. It toggles nothing, so the
+// caller can refuse before any answer keystroke — an all-or-nothing baseline
+// check that mirrors the daemon's capture-time refusal.
+func (a *App) verifyTabBaseline(ctx context.Context, ks ports.KeystrokeSender, agentID string, tabCount int) ([]bool, error) {
+	if err := a.resetForm(ctx, ks, agentID); err != nil {
+		return nil, err
+	}
+	multi := make([]bool, tabCount)
+	for tab := 0; tab < tabCount; tab++ {
+		if tab > 0 {
+			if err := ks.SendKey(ctx, agentID, seriesAdvanceKey); err != nil {
+				return nil, fmt.Errorf("walking to tab %d failed: %w", tab+1, err)
+			}
+			time.Sleep(seriesKeyDelay)
+		}
+		frame, err := a.readVisiblePane(ctx, agentID, menuReadLines)
+		if err != nil {
+			return nil, fmt.Errorf("re-reading tab %d/%d failed: %w", tab+1, tabCount, err)
+		}
+		if tabs, ok := domain.MultiTabForm(frame); !ok || tabs != tabCount {
+			return nil, fmt.Errorf("the pane no longer shows the %d-tab form at tab %d; answer in the pane", tabCount, tab+1)
+		}
+		if domain.MultiSelectTab(frame) {
+			multi[tab] = true
+			for digit, checked := range domain.OptionCheckStates(frame) {
+				if checked {
+					return nil, fmt.Errorf("tab %d already has option %s selected; answer in the pane", tab+1, digit)
+				}
+			}
+		}
+	}
+	return multi, nil
+}
+
+// resetForm sends the fixed Left-arrow burst that lands focus on the first
+// question, then pauses for the form to re-render.
+func (a *App) resetForm(ctx context.Context, ks ports.KeystrokeSender, agentID string) error {
 	for i := 0; i < seriesResetKeys; i++ {
 		if err := ks.SendKey(ctx, agentID, "left"); err != nil {
 			return fmt.Errorf("resetting the form failed: %w", err)
 		}
 	}
 	time.Sleep(seriesKeyDelay)
-	for tab, group := range groups {
-		frame, err := a.readVisiblePane(ctx, agentID, menuReadLines)
-		if err != nil {
-			return fmt.Errorf("re-reading tab %d/%d failed: %w", tab+1, len(groups), err)
-		}
-		if tabs, ok := domain.MultiTabForm(frame); !ok || tabs != len(groups) {
-			return fmt.Errorf("the pane no longer shows the %d-tab form at tab %d; answer in the pane", len(groups), tab+1)
-		}
-		multi := domain.MultiSelectTab(frame)
-		if multi {
-			for digit, checked := range domain.OptionCheckStates(frame) {
-				if checked {
-					return fmt.Errorf("tab %d already has option %s selected; answer in the pane", tab+1, digit)
-				}
-			}
-		}
-		for _, digit := range group {
-			if err := ks.SendKey(ctx, agentID, digit); err != nil {
-				return fmt.Errorf("sending option %s on tab %d failed: %w", digit, tab+1, err)
-			}
-			time.Sleep(seriesKeyDelay)
-		}
-		if multi {
-			if err := ks.SendKey(ctx, agentID, seriesAdvanceKey); err != nil {
-				return fmt.Errorf("advancing past tab %d failed: %w", tab+1, err)
-			}
-			time.Sleep(seriesKeyDelay)
-		}
-	}
 	return nil
 }
 

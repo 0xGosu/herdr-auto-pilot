@@ -163,10 +163,11 @@ func TestMultiTabSweepMultiSelectDelivery(t *testing.T) {
 	}
 	joined := strings.Join(h.herdr.keysSent(), " ")
 	reset := strings.TrimSpace(strings.Repeat("left ", 10))
-	// Sweep: 2 rights + 10-left reset; delivery: 10-left reset, then tab1 "1"
-	// (auto-advances), tab2 "1" "3" then explicit "right" (multi-select does
-	// not auto-advance), submit "1".
-	want := "right right " + reset + " " + reset + " 1 1 3 right 1"
+	// Capture sweep: 2 rights + reset. Delivery re-verifies the multi-select
+	// baseline (a second capture sweep: 2 rights + reset), then delivers:
+	// reset, tab1 "1" (auto-advances), tab2 "1" "3" then explicit "right"
+	// (multi-select does not auto-advance), submit "1".
+	want := "right right " + reset + " right right " + reset + " " + reset + " 1 1 3 right 1"
 	if joined != want {
 		t.Errorf("multi-select keystroke protocol mismatch:\n got %s\nwant %s", joined, want)
 	}

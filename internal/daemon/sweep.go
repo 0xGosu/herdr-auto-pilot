@@ -23,18 +23,11 @@ import (
 // following read (or the next keystroke).
 const sweepKeyDelay = 250 * time.Millisecond
 
-// sweepResetKeys is a fixed Left-arrow count larger than any real form's
-// tab count, so a reset burst lands on the first question regardless of
-// size — before answer delivery too, since the operator (or a failed reset)
-// may have left the form focused elsewhere.
-const sweepResetKeys = 10
-
-// sweepAdvanceKey advances to the next tab after a MULTI-SELECT question's
-// toggles. A multi-select tab does not auto-advance on a digit press, so we
-// send this explicitly. Right-arrow matches the capture sweep's proven tab
-// navigation; const-ized so the integration test can switch to "tab" if a
-// real form needs it.
-const sweepAdvanceKey = "right"
+// sweepResetKeys / sweepAdvanceKey alias the shared domain protocol constants
+// so the capture sweep, autonomous delivery, and the operator-confirm frontend
+// all navigate a form identically (a single source of truth — domain.MCQ*).
+const sweepResetKeys = domain.MCQResetKeys
+const sweepAdvanceKey = domain.MCQAdvanceKey
 
 // sweepAllowed re-reads the gates that must veto pane interaction BEFORE
 // any sweep keystroke: kill switch (FR-017), rate pause (FR-019), and the
@@ -187,6 +180,31 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 	return swept, nil
 }
 
+// anyMultiSelect reports whether any tab in the swept form is multi-select.
+func anyMultiSelect(flags []bool) bool {
+	for _, m := range flags {
+		if m {
+			return true
+		}
+	}
+	return false
+}
+
+// reverifyMultiSelect re-checks, immediately before autonomous delivery, that
+// every multi-select tab is STILL all-unchecked and the form is unchanged. The
+// tab-1 staleness re-read (seriesStale) can not see middle tabs, so without
+// this an operator toggling a middle-tab checkbox during a long consult would
+// be blind-toggled into the wrong set (toggling is relative). It re-runs the
+// capture sweep purely as a guard — a non-nil error means the baseline moved,
+// so delivery must be refused. A no-op for forms with no multi-select tab.
+func (d *Daemon) reverifyMultiSelect(ctx context.Context, ks ports.KeystrokeSender, s domain.Situation) error {
+	if !anyMultiSelect(s.TabMultiSelect) {
+		return nil
+	}
+	_, err := d.sweepFrames(ctx, ks, s)
+	return err
+}
+
 // countChecked reports how many of a frame's checkbox options are already
 // checked (`[x]`). Used to enforce the all-unchecked baseline before an
 // autonomous multi-select toggle.
@@ -290,6 +308,13 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 	go func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery", func() error {
+			if err := d.reverifyMultiSelect(ctx, ks, s); err != nil {
+				slog.Warn("multi-select baseline moved before delivery; refusing", "pane", s.PaneID, "error", err)
+				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+				d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+					fmt.Sprintf("Agent %s: the multi-select form changed before the answer could be delivered (%v); please review it.", s.AgentID, err))
+				return nil
+			}
 			if err := d.sendTabSelections(ctx, ks, s.PaneID, groups, s.TabMultiSelect); err != nil {
 				slog.Error("answer series delivery failed", "pane", s.PaneID, "error", err)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
@@ -330,6 +355,13 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 	go func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery-llm", func() error {
+			if err := d.reverifyMultiSelect(ctx, ks, s); err != nil {
+				slog.Warn("multi-select baseline moved before LLM delivery; refusing", "pane", s.PaneID, "error", err)
+				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+				d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+					fmt.Sprintf("Agent %s: the multi-select form changed before the answer could be delivered (%v); please review it.", s.AgentID, err))
+				return nil
+			}
 			if err := d.sendTabSelections(ctx, ks, s.PaneID, groups, s.TabMultiSelect); err != nil {
 				slog.Error("LLM answer series delivery failed", "pane", s.PaneID, "error", err)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
