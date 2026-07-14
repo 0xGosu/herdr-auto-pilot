@@ -243,7 +243,10 @@ The plugin never acts on a situation it hasn't learned from you.
    printable key goes into the query — action keys like `q`, `y`, and `x`
    can't fire mid-search. Action outcomes (confirm, resolve, delete, …)
    stay pinned in a status area (`✓`/`✗` plus timestamp) until the next
-   action, so the result of a multi-step operation isn't missed.
+   action, so the result of a multi-step operation isn't missed. Detail
+   views with captured pane content open at the bottom, where coding-agent
+   prompts and results appear; `tui.max_content_height` can cap each preview
+   while retaining its newest trailing lines (`0` keeps the full capture).
 3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
    *and* confidence above the per-situation threshold, that signature becomes
    autonomous: next time, the plugin acts on its own and logs it.
@@ -322,6 +325,7 @@ model_context_window = 0    # 0 = bundled-model default (512 tokens); input is
 # original look — so existing setups see no change.
 [tui]
 max_content_width = 0       # cap variable-width list columns; 0 = full width
+max_content_height = 0      # cap captured-pane preview lines; 0 = unlimited (keeps the tail)
 theme = "high-contrast"
 
 # Optional per-role color overrides, layered on top of the theme; unset
@@ -477,7 +481,7 @@ adds/removes task sources (`t`/`x`), and clears learned data (`X`).
 Simple fields — numbers, booleans, and the `tui.theme` enum, including
 `llm.pane_excerpt_chars`, `llm.task_generate_timeout_seconds`,
 `embedding.model_context_window`, `safety.disable_seed`, and
-`tui.max_content_width` — edit inline (`enter`) or via
+`tui.max_content_width` / `tui.max_content_height` — edit inline (`enter`) or via
 `hap config set <key> <value>`. Free-text fields (`llm.command`,
 `llm.command_start`, `llm.rewrite_command`, `llm.rewrite_command_start`,
 `llm.rewrite_fallback_template`, `llm.task_generate_command`,
@@ -487,7 +491,7 @@ prompt mangles quoted argv values — edit them in `config.toml` or with
 `config set`, which accepts every listed scalar key. The safety indicator
 patterns and `[[capture_delay]]` rules also display read-only on the tab. The
 `[tui.palette]` overrides are edited directly in `config.toml`. Capture delays show the built-in defaults (10000
-ms first event / 500 ms after) when none are configured, and long values are
+ms first event / 2000 ms after) when none are configured, and long values are
 truncated to one line — the full value lives in `config.toml`. Prompts that
 *look* destructive
 but match no pattern are escalated by a suspected-irreversible heuristic

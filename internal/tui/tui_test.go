@@ -286,6 +286,81 @@ func TestDetailViewRewrapsOnResize(t *testing.T) {
 	}
 }
 
+func TestCapturedPanePreviewKeepsTail(t *testing.T) {
+	m := testModel(t)
+	m.data.cfg.TUI.MaxContentHeight = 3
+	rec := domain.AuditRecord{
+		Signature:   "choice:test",
+		PaneExcerpt: "pane-top\npane-middle\npane-tail-1\npane-tail-2\npane-tail-3",
+	}
+	snapshot := "original-top\noriginal-middle\noriginal-tail-1\noriginal-tail-2\noriginal-tail-3"
+	lines := m.auditDetailLines(rec, snapshot, 80)
+	got := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"Current situation (last 3 of 5 lines", "pane-tail-1", "pane-tail-2", "pane-tail-3",
+		"Original situation (last 3 of 5 lines", "original-tail-1", "original-tail-2", "original-tail-3",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("tail-limited preview missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "pane-top") || strings.Contains(got, "pane-middle") ||
+		strings.Contains(got, "original-top") || strings.Contains(got, "original-middle") {
+		t.Errorf("tail-limited preview retained old top lines:\n%s", got)
+	}
+	rule := frontend.SignatureRow{PaneExcerpt: snapshot}
+	ruleLines := strings.Join(m.signatureDetailLines(rule, nil, 5, 80), "\n")
+	if !strings.Contains(ruleLines, "original-tail-3") || strings.Contains(ruleLines, "original-top") {
+		t.Errorf("Rules detail must apply the same tail preview behavior:\n%s", ruleLines)
+	}
+
+	// Zero is genuinely unlimited: no captured lines are discarded.
+	m.data.cfg.TUI.MaxContentHeight = 0
+	got = strings.Join(m.auditDetailLines(rec, snapshot, 80), "\n")
+	if !strings.Contains(got, "pane-top") || !strings.Contains(got, "pane-tail-3") {
+		t.Errorf("unlimited preview should keep the entire capture:\n%s", got)
+	}
+}
+
+func TestCapturedPaneDetailOpensAtBottom(t *testing.T) {
+	m := testModel(t)
+	m.height = 12
+	m.tab = tabAudit
+	var pane strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&pane, "capture-line-%02d\n", i)
+	}
+	m.data.audit[0].PaneExcerpt = strings.TrimRight(pane.String(), "\n")
+	m = press(t, m, "v")
+	if m.detail == nil || m.detail.offset == 0 {
+		t.Fatal("a captured-pane detail should initially be anchored to its bottom")
+	}
+	view := m.View()
+	if !strings.Contains(view, "capture-line-20") {
+		t.Errorf("initial captured-pane view must show the newest bottom line:\n%s", view)
+	}
+	if strings.Contains(view, "capture-line-01") {
+		t.Errorf("small initial viewport unexpectedly shows the oldest pane line:\n%s", view)
+	}
+	if !strings.Contains(view, "earlier line") {
+		t.Errorf("bottom-anchored detail should advertise upward scrolling:\n%s", view)
+	}
+
+	// Rules details load asynchronously, but must land on their Original
+	// situation tail just like Escalation/Audit details.
+	ruleModel := testModel(t)
+	ruleModel.height = 12
+	upd, _ := ruleModel.Update(sigDetailMsg{row: frontend.SignatureRow{
+		SignatureState: domain.SignatureState{Signature: "choice:tail-test"},
+		PaneExcerpt:    strings.ReplaceAll(pane.String(), "capture-", "rule-"),
+	}})
+	ruleModel = upd.(Model)
+	ruleView := ruleModel.View()
+	if !strings.Contains(ruleView, "rule-line-20") || strings.Contains(ruleView, "rule-line-01") {
+		t.Errorf("Rules detail must initially show the bottom of Original situation:\n%s", ruleView)
+	}
+}
+
 func TestWrapText(t *testing.T) {
 	got := wrapText("abcdefgh\nij", 3)
 	want := []string{"abc", "def", "gh", "ij"}

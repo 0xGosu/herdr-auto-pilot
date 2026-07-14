@@ -188,7 +188,7 @@ Verify after any release: `gh release view vX.Y.Z` — expect 3 binaries,
   belongs in a goroutine that funnels results back through a channel
   (see `consultLLM` / `llmResults`).
 - **Attention events are delay-captured** — the classification pane read
-  waits `[[capture_delay]]` (default 10s on an agent's first event, 500ms
+  waits `[[capture_delay]]` (default 10s on an agent's first event, 2000ms
   after) via a per-pane `time.AfterFunc` → `delayedTr`, so the agent TUI
   has painted and event bursts coalesce (latest wins, one capture per
   burst). Daemon tests inherit a 1ms wildcard rule from the harness.

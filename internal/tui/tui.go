@@ -91,12 +91,14 @@ type prompt struct {
 }
 
 // detailView is a full-record overlay opened with `v` on the Agents,
-// Escalations, Audit, and Rules tabs, showing the selected row untruncated.
+// Escalations, Audit, and Rules tabs. Scalar fields stay untruncated; captured
+// pane previews may use the operator-configured tail height.
 type detailView struct {
-	title  string
-	lines  []string                 // wrapped to the pane width at open/resize
-	offset int                      // first visible line (↑/↓ scroll)
-	build  func(width int) []string // rebuilds lines from the snapshot on resize
+	title        string
+	lines        []string                 // wrapped to the pane width at open/resize
+	offset       int                      // first visible line (↑/↓ scroll)
+	build        func(width int) []string // rebuilds lines from the snapshot on resize
+	anchorBottom bool                     // captured-pane details open/follow the terminal tail
 	// confirmID is the escalation's audit id captured at open time, so
 	// enter confirms the record ON SCREEN even if a background refresh
 	// clamped the list cursor. 0 = not a confirmable escalation detail.
@@ -359,10 +361,19 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		wasDetailBottom := false
+		if m.detail != nil {
+			wasDetailBottom = m.detail.offset >= max(0, len(m.detail.lines)-m.detailPageSize())
+		}
 		m.width, m.height = msg.Width, msg.Height
 		if m.detail != nil && m.detail.build != nil {
 			m.detail.lines = m.detail.build(m.wrapWidth())
-			m.detail.offset = min(m.detail.offset, max(0, len(m.detail.lines)-m.detailPageSize()))
+			bottom := max(0, len(m.detail.lines)-m.detailPageSize())
+			if m.detail.anchorBottom && wasDetailBottom {
+				m.detail.offset = bottom
+			} else {
+				m.detail.offset = min(m.detail.offset, bottom)
+			}
 		}
 		m.clampListViewport()
 		return m, nil
@@ -410,11 +421,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		build := func(width int) []string {
 			return m.signatureDetailLines(msg.row, msg.history, gradN, width)
 		}
-		m.detail = &detailView{
+		d := &detailView{
 			title: fmt.Sprintf("Signature %s", shortSig(msg.row.Signature)),
 			lines: build(m.wrapWidth()),
 			build: build,
 		}
+		if msg.row.PaneExcerpt != "" {
+			d.anchorBottom = true
+			d.offset = max(0, len(d.lines)-m.detailPageSize())
+		}
+		m.detail = d
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -1055,6 +1071,13 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 				d.confirmID = r.ID
 				d.escRetryable = m.canRetry(r)
 			}
+			// Captured panes are terminal tails: open at the bottom so the
+			// newest prompt/result is visible first. Earlier metadata remains
+			// available with Up.
+			if r.PaneExcerpt != "" || snapshot != "" {
+				d.anchorBottom = true
+				d.offset = max(0, len(d.lines)-m.detailPageSize())
+			}
 			m.detail = d
 		}
 	}
@@ -1230,6 +1253,28 @@ func (m Model) detailField(lines []string, width int, label, value string) []str
 	return lines
 }
 
+// detailPreviewField appends captured pane content. A configured height is a
+// line cap after wrapping, so it stays stable at the actual display width.
+// Captures are tailed rather than headed: the actionable prompt and latest
+// coding-agent output live at the bottom of the terminal pane.
+func (m Model) detailPreviewField(lines []string, width int, label, value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return lines
+	}
+	wrapped := wrapText(value, width)
+	if limit := m.data.cfg.TUI.MaxContentHeight; limit > 0 && len(wrapped) > limit {
+		omitted := len(wrapped) - limit
+		label = fmt.Sprintf("%s (last %d of %d lines; %d earlier omitted)",
+			label, limit, len(wrapped), omitted)
+		wrapped = wrapped[len(wrapped)-limit:]
+	}
+	lines = append(lines, m.styles().section.Render(label))
+	for _, ln := range wrapped {
+		lines = append(lines, "  "+ln)
+	}
+	return lines
+}
+
 func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 	var lines []string
 	lines = m.detailField(lines, w, "Short name", orDash(m.data.status.AgentName(a.AgentID)))
@@ -1314,11 +1359,11 @@ func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int) []
 	// detail. Legacy rows predate the per-entry column and show only the
 	// provenance block.
 	if r.PaneExcerpt != "" {
-		lines = m.detailField(lines, w, "Current situation", r.PaneExcerpt)
+		lines = m.detailPreviewField(lines, w, "Current situation", r.PaneExcerpt)
 	}
 	if r.Signature != "" {
 		if snapshot != "" {
-			lines = m.detailField(lines, w, "Original situation", snapshot)
+			lines = m.detailPreviewField(lines, w, "Original situation", snapshot)
 		} else {
 			lines = m.detailField(lines, w, "Original situation", "(not captured yet — recorded on the rule's next sighting)")
 		}
@@ -1438,13 +1483,6 @@ func (m Model) signatureDetailLines(row frontend.SignatureRow, history []domain.
 	if !row.UpdatedAt.IsZero() {
 		lines = m.detailField(lines, w, "Updated", row.UpdatedAt.Format(time.RFC3339))
 	}
-	// Rule provenance: what the pane showed when this signature was first
-	// seen — the situation the learned action answers.
-	if row.PaneExcerpt != "" {
-		lines = m.detailField(lines, w, "Original situation", row.PaneExcerpt)
-	} else {
-		lines = m.detailField(lines, w, "Original situation", "(not captured yet — recorded on the rule's next sighting)")
-	}
 	if len(history) > 0 {
 		var b strings.Builder
 		for _, d := range history {
@@ -1460,6 +1498,14 @@ func (m Model) signatureDetailLines(row frontend.SignatureRow, history []domain.
 	if a := row.LastAudit; a != nil {
 		lines = m.detailField(lines, w, "Last audit",
 			fmt.Sprintf("#%d (%s) %s — %s", a.ID, a.Status, a.Action, a.Rationale))
+	}
+	// Keep rule provenance last so a bottom-anchored detail opens on the pane
+	// tail rather than the decision metadata that follows it. This is what the
+	// learned action answers and therefore the most useful first view.
+	if row.PaneExcerpt != "" {
+		lines = m.detailPreviewField(lines, w, "Original situation", row.PaneExcerpt)
+	} else {
+		lines = m.detailField(lines, w, "Original situation", "(not captured yet — recorded on the rule's next sighting)")
 	}
 	return lines
 }
@@ -1809,7 +1855,13 @@ func (m Model) renderDetail(b *strings.Builder) {
 	for _, ln := range lines[start:end] {
 		fmt.Fprintln(b, ln)
 	}
-	if end < len(lines) {
+	switch {
+	case start > 0 && end < len(lines):
+		fmt.Fprintf(b, "%s\n", st.help.Render(fmt.Sprintf(
+			"… %d earlier / %d later line(s) — ↑/↓ to scroll", start, len(lines)-end)))
+	case start > 0:
+		fmt.Fprintf(b, "%s\n", st.help.Render(fmt.Sprintf("… %d earlier line(s) — ↑ to scroll", start)))
+	case end < len(lines):
 		fmt.Fprintf(b, "%s\n", st.help.Render(fmt.Sprintf("… %d more line(s) — ↓ to scroll", len(lines)-end)))
 	}
 	fmt.Fprintf(b, "\n%s", st.help.Render(m.helpLine()))

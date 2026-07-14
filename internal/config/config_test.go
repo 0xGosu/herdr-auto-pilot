@@ -362,9 +362,9 @@ func TestPaneExcerptCharsDefaultsAndOverride(t *testing.T) {
 	}
 }
 
-func TestTUIMaxContentWidthParsed(t *testing.T) {
+func TestTUIContentLimitsParsed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
-	os.WriteFile(path, []byte("[tui]\nmax_content_width = 140\n"), 0o600)
+	os.WriteFile(path, []byte("[tui]\nmax_content_width = 140\nmax_content_height = 12\n"), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
@@ -372,10 +372,13 @@ func TestTUIMaxContentWidthParsed(t *testing.T) {
 	if cfg.TUI.MaxContentWidth != 140 {
 		t.Errorf("max_content_width = %d, want 140", cfg.TUI.MaxContentWidth)
 	}
-	// Omitted → 0 (meaning full terminal width).
+	if cfg.TUI.MaxContentHeight != 12 {
+		t.Errorf("max_content_height = %d, want 12", cfg.TUI.MaxContentHeight)
+	}
+	// Omitted → 0 (meaning full width and unlimited preview height).
 	os.WriteFile(path, []byte("[learning]\ngraduation_n = 5\n"), 0o600)
-	if cfg, _ = Load(path); cfg.TUI.MaxContentWidth != 0 {
-		t.Errorf("omitted max_content_width should default to 0, got %d", cfg.TUI.MaxContentWidth)
+	if cfg, _ = Load(path); cfg.TUI.MaxContentWidth != 0 || cfg.TUI.MaxContentHeight != 0 {
+		t.Errorf("omitted content limits should default to 0, got %+v", cfg.TUI)
 	}
 }
 
@@ -435,7 +438,7 @@ func TestTUIThemeBackwardCompat(t *testing.T) {
 	if cfg, err = Load(path); err != nil {
 		t.Fatalf("file without [tui] must load: %v", err)
 	}
-	if cfg.TUI.MaxContentWidth != 0 || cfg.TUI.Theme != "" ||
+	if cfg.TUI.MaxContentWidth != 0 || cfg.TUI.MaxContentHeight != 0 || cfg.TUI.Theme != "" ||
 		cfg.TUI.Palette != (PaletteOverrides{}) {
 		t.Errorf("missing [tui] must default to zero TUI config, got %+v", cfg.TUI)
 	}
@@ -894,7 +897,7 @@ func TestCaptureDelayRuleMatching(t *testing.T) {
 		want  time.Duration
 	}{
 		{"no rules start default", rules(), "claude", true, 10000 * time.Millisecond},
-		{"no rules event default", rules(), "claude", false, 500 * time.Millisecond},
+		{"no rules event default", rules(), "claude", false, 2000 * time.Millisecond},
 		{"exact match start", rules(CaptureDelayRule{AgentType: "claude", StartMs: 1500, EventMs: 50}), "claude", true, 1500 * time.Millisecond},
 		{"exact match event", rules(CaptureDelayRule{AgentType: "claude", StartMs: 1500, EventMs: 50}), "claude", false, 50 * time.Millisecond},
 		{"first match wins", rules(

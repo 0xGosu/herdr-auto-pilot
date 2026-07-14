@@ -285,7 +285,7 @@ Critical path: **D → C** (config fields before theme resolution) and **A → B
   - _Complexity: Medium_
 
 - [ ] 32\. Render read-only Safety-indicator and capture-delay sections
-  - Extend `buildRuleItems` (tui.go 184–217) with read-only rows: a "Safety indicators" section for `safety.irreversible_indicators` and each `[[safety.indicator_rules]]` entry (pattern + agent scope, config.go 48–59), and a capture-delay section showing each `[[capture_delay]]` rule (config.go 151–155) or the built-in defaults (10000/500 ms) when none are configured. Edit/remove keys on these rows show an informational "edited in config.toml" message (mirroring tui.go 1140) and never mutate config. Classifier manifests stay file-only.
+  - Extend `buildRuleItems` (tui.go 184–217) with read-only rows: a "Safety indicators" section for `safety.irreversible_indicators` and each `[[safety.indicator_rules]]` entry (pattern + agent scope, config.go 48–59), and a capture-delay section showing each `[[capture_delay]]` rule (config.go 151–155) or the built-in defaults (10000/2000 ms) when none are configured. Edit/remove keys on these rows show an informational "edited in config.toml" message (mirroring tui.go 1140) and never mutate config. Classifier manifests stay file-only.
   - Acceptance Criteria:
     - Configured indicator patterns, indicator rules, and capture-delay rules are visible on the Config tab; the defaults row appears when no capture-delay rule exists.
     - `enter`/`e`/`x` on the read-only rows produce the informational message and change nothing.

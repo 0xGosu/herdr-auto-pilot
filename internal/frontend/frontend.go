@@ -871,6 +871,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "embedding.pane_salient_chars", TUIEditable: true},
 	{Key: "embedding.model_context_window", TUIEditable: true},
 	{Key: "tui.max_content_width", TUIEditable: true},
+	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
 }
 
@@ -998,6 +999,11 @@ func FieldValue(cfg config.Config, key string) string {
 			return "0 (full width)"
 		}
 		return strconv.Itoa(cfg.TUI.MaxContentWidth)
+	case "tui.max_content_height":
+		if cfg.TUI.MaxContentHeight == 0 {
+			return "0 (unlimited)"
+		}
+		return strconv.Itoa(cfg.TUI.MaxContentHeight)
 	case "tui.theme":
 		if cfg.TUI.Theme == "" {
 			return "default"
@@ -1178,6 +1184,13 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("tui.max_content_width must be a non-negative integer (0 = full width), got %q", value)
 			}
 			cfg.TUI.MaxContentWidth = v
+			return nil
+		case "tui.max_content_height":
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("tui.max_content_height must be a non-negative integer (0 = unlimited), got %q", value)
+			}
+			cfg.TUI.MaxContentHeight = v
 			return nil
 		case "tui.theme":
 			// `config set` rejects unknown names with the valid list (the

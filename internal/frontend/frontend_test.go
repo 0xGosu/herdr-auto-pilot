@@ -933,6 +933,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"embedding.gpu_layers":                "0",
 		"embedding.model_context_window":      "512",
 		"tui.max_content_width":               "140",
+		"tui.max_content_height":              "12",
 		"tui.theme":                           "dark",
 	}
 
@@ -1075,6 +1076,10 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 		{"tui.max_content_width", "0", false},
 		{"tui.max_content_width", "-1", true},
 		{"tui.max_content_width", "abc", true},
+		{"tui.max_content_height", "12", false},
+		{"tui.max_content_height", "0", false},
+		{"tui.max_content_height", "-1", true},
+		{"tui.max_content_height", "abc", true},
 		{"safety.disable_seed", "true", false},
 		{"safety.disable_seed", "false", false},
 		{"safety.disable_seed", "yes", true},
@@ -1133,6 +1138,9 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 	if err := app.SetField(ctx, "tui.max_content_width", "140"); err != nil {
 		t.Fatal(err)
 	}
+	if err := app.SetField(ctx, "tui.max_content_height", "12"); err != nil {
+		t.Fatal(err)
+	}
 	if err := app.SetField(ctx, "safety.disable_seed", "true"); err != nil {
 		t.Fatal(err)
 	}
@@ -1144,6 +1152,9 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 	}
 	if cfg.TUI.MaxContentWidth != 140 {
 		t.Errorf("tui.max_content_width = %d, want 140", cfg.TUI.MaxContentWidth)
+	}
+	if cfg.TUI.MaxContentHeight != 12 {
+		t.Errorf("tui.max_content_height = %d, want 12", cfg.TUI.MaxContentHeight)
 	}
 	if !cfg.Safety.DisableSeed {
 		t.Error("safety.disable_seed = false, want true (assignment not persisted)")

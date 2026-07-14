@@ -49,7 +49,7 @@ max_error_retries = 2              # per error signature
 # come immediately after -p (claude quirk; the plugin auto-repairs it).
 command = [
   "claude", "-p",
-  "You are the auto-answer assistant for herd-auto-prompter (hap). A coding agent running in a herdr terminal pane has stopped and is waiting for input. Your job: answer exactly as the human operator would, using ONLY the two hap MCP tools.\n\nStep 1 — call get_context. It returns the classified situation:\n- situation_type: 'approval' (permission prompt), 'choice' (menu of options), 'error' (the agent hit a failure), or 'idle' (finished or waiting for its next instruction)\n- options: the menu option texts, when the pane shows a menu\n- permission_verb: what the agent is asking permission to do\n- error_summary: short description of the failure, when situation_type is 'error'\n- pane_excerpt: the recent terminal screen — read it carefully; it is the ground truth for what the agent is doing and asking\n- cwd / foreground_cwd and herdr ids (workspace_id, tab_id, pane_id, agent_id): where the agent is working\n\nStep 2 — decide what the operator would answer:\n- approval / choice with options: choose the safest 1-based option number. Approve routine, reversible work (reading files, edits, builds, tests, linters). DENY anything destructive or hard to reverse: deleting data, force-pushing or hard-resetting git history, production/deploy changes, touching secrets or credentials, mass file operations.\n- approval / choice without options: reply with the literal text the prompt expects.\n- error: reply with one short, concrete instruction telling the agent how to diagnose or fix the failure and continue.\n- idle: reply with the most sensible next instruction based on the pane_excerpt; if no reply is needed, use @noop.\n- If the pane_excerpt is ambiguous or does not match the classified situation, choose the most conservative reply.\n\nStep 3 — call submit_decision. For a menu, pass select_options with the chosen 1-based number (one number per tab for a multi-tab form). Otherwise pass recommend_action with the literal reply, or @noop to send nothing. Always include confident_score (0-100) and a one-sentence rationale.",
+  "You are hap's auto-answer assistant. Use ONLY get_context and submit_decision.\n\nCall get_context, treat pane_excerpt as ground truth, and follow answer_format. If proposed_task is present, this is a task review: when the agent is ready and current_task is unfinished, prefer @next_task:declared to send it verbatim—do not make small edits. Return rewritten task text only when its details need a major rewrite. If current_task is clearly done, send an instruction for the next unfinished item in pending_tasks. Use @noop if the agent is busy, no suitable task remains, or evidence is ambiguous. Never invent a task.\n\nOtherwise: for approval/choice, select the safest option and deny destructive or irreversible work; for error, give one concrete recovery instruction; for idle, give the sensible next instruction or @noop.\n\nCall submit_decision with select_options for menus, otherwise recommend_action. Always include confident_score (0-100) and a one-sentence rationale.",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
   "--model", "opus",
@@ -178,6 +178,7 @@ model_context_window = 0
 # ── TUI ─────────────────────────────────────────────────────────────
 [tui]
 max_content_width = 0      # cap on variable-length list columns; 0 = full terminal width
+max_content_height = 0     # captured-pane preview lines; 0 = unlimited; truncation keeps the bottom
 theme = ""                 # named palette: default | dark | light | high-contrast;
                            # empty/unknown = default (the original look)
 
@@ -202,7 +203,7 @@ theme = ""                 # named palette: default | dark | light | high-contra
 # workspace = ""             # "" or "*" = any; wildcards like "codex-*" work
 # path = "/home/me/project/docs/tasks.md"
 # next_task_template placeholders: {next_task_content}, {task_list_path}, {agent_name}, {cwd}
-# next_task_template = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."
+# next_task_template = "Your next task is {next_task_content}.\nRead the full tasks list at {task_list_path}. Verify task dependencies before starting. Once you have completed your task, mark it as done (`[x]`) in the tasks list.\nIf you are unsure what to do, ask for clarification. When there is no task available, focus on improving the test coverage of this project."
 # When an [llm].command is configured, each determined task is first REVIEWED by
 # the LLM (via the get_context/submit_decision MCP tools): it sees the live pane
 # and decides whether to send the task now (recommend_action) or skip it (@noop).
@@ -228,4 +229,4 @@ theme = ""                 # named palette: default | dark | light | high-contra
 # [[capture_delay]]
 # agent_type = "claude"      # exact agent type, or "*" for any
 # start_ms = 3000            # first event after the agent starts (default 10000)
-# event_ms = 200             # subsequent events (default 500)
+# event_ms = 200             # subsequent events (default 2000)
