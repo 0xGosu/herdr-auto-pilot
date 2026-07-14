@@ -102,6 +102,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	status TEXT NOT NULL DEFAULT '',
 	suggestion TEXT NOT NULL DEFAULT '',
 	pane_excerpt TEXT NOT NULL DEFAULT '',
+	match_method TEXT NOT NULL DEFAULT '',
+	match_score REAL NOT NULL DEFAULT 0,
+	embed_error TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
@@ -209,6 +212,11 @@ func (s *Store) migrate() error {
 		// Nullable: NULL = no LLM score (learned/operator/pre-decision rows),
 		// distinct from a reported 0.
 		`ALTER TABLE audit_log ADD COLUMN llm_confidence INTEGER`,
+		// How an escalation's signature resolved to its rule, plus any
+		// per-event embedding failure (empty/zero on legacy and auto rows).
+		`ALTER TABLE audit_log ADD COLUMN match_method TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE audit_log ADD COLUMN match_score REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE audit_log ADD COLUMN embed_error TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
 		`ALTER TABLE llm_requests ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''`,
 		// sent = 1 when the front-end delivered the correction to the agent;
@@ -298,11 +306,12 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO audit_log (decision_id, agent_id, agent_type, signature, trigger, situation_type,
 				action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
-				corrects_audit_id, status, suggestion, pane_excerpt, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
 			a.Action, a.Input, a.Confidence, llmConfArg(a.LLMConfidence), a.Rationale, a.LLMOutput,
-			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt, unix(a.CreatedAt))
+			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt,
+			string(a.MatchMethod), a.MatchScore, a.EmbedError, unix(a.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -1013,13 +1022,16 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 	for rows.Next() {
 		var a domain.AuditRecord
 		var situationType string
+		var matchMethod string
 		var created int64
 		var llmConf sql.NullInt64
 		if err := rows.Scan(&a.ID, &a.DecisionID, &a.AgentID, &a.AgentType, &a.Signature, &a.Trigger,
 			&situationType, &a.Action, &a.Input, &a.Confidence, &llmConf, &a.Rationale,
-			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &a.PaneExcerpt, &created); err != nil {
+			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &a.PaneExcerpt,
+			&matchMethod, &a.MatchScore, &a.EmbedError, &created); err != nil {
 			return nil, err
 		}
+		a.MatchMethod = domain.MatchMethod(matchMethod)
 		if llmConf.Valid {
 			v := int(llmConf.Int64)
 			a.LLMConfidence = &v
@@ -1033,7 +1045,7 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 
 const auditCols = `id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
 	action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
-	corrects_audit_id, status, suggestion, pane_excerpt, created_at`
+	corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error, created_at`
 
 // llmConfArg maps the optional LLM confidence to a SQL argument: nil stores
 // NULL (no LLM score), a value stores the 0-100 score.

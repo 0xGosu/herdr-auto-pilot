@@ -68,6 +68,39 @@ const overMaskMaxRatio = 0.6
 // stays clear of 512 even before the embedder's own truncation guard.
 const DefaultPaneSalientChars = 500
 
+// MatchMethod identifies how a situation's signature was resolved to its
+// learning key (FR-003), so an escalation can explain WHY it matched a rule.
+type MatchMethod string
+
+const (
+	// MatchNone: a fresh signature, or resolution did not run (over-masked).
+	MatchNone MatchMethod = ""
+	// MatchExact: the raw content hash was already known, or semantic matching
+	// was disabled/not-ready so only exact-hash matching was possible.
+	MatchExact MatchMethod = "exact"
+	// MatchCosine: an embedding cosine similarity met similarity_threshold.
+	MatchCosine MatchMethod = "cosine"
+	// MatchBM25: a normalized BM25 text similarity met bm25_min_score, the
+	// fallback taken when embedding failed or produced no vector.
+	MatchBM25 MatchMethod = "bm25"
+)
+
+// MatchDetail records how a signature was resolved, for operator-facing
+// explanation of an escalation's matched rule. It is populated by the daemon's
+// semantic resolution, not by ComputeSignature.
+type MatchDetail struct {
+	// Method is the path that resolved the learning key.
+	Method MatchMethod
+	// Score is the cosine similarity (MatchCosine) or normalized BM25 score in
+	// (0,1] (MatchBM25); 0 for exact/none.
+	Score float64
+	// EmbedError is the embedding failure message for THIS event, when the
+	// embed call errored (including the degraded latch); "" when embedding
+	// succeeded or was skipped. Set independently of Method — an embed failure
+	// may still resolve via BM25 or mint a new key.
+	EmbedError string
+}
+
 // SignatureResult is the output of signature generation.
 type SignatureResult struct {
 	// Signature is the learning key situations are matched under. Semantic
@@ -78,6 +111,9 @@ type SignatureResult struct {
 	Raw     string
 	Salient string
 	Verdict GuardVerdict
+	// Match records how semantic resolution mapped this signature to its
+	// learning key (zero value until resolveSignature runs).
+	Match MatchDetail
 }
 
 // ComputeSignature derives a stable situation signature (FR-003): situation

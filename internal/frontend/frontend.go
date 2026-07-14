@@ -1440,6 +1440,25 @@ func RuleSummary(row SignatureRow, graduationN int) string {
 	return s
 }
 
+// MatchSummary explains HOW an escalation's situation resolved to its matched
+// rule, naming the config knob that governed the match so operators can tune
+// it. It intentionally omits the threshold VALUE (that lives in live config and
+// can drift from the value at match time); the knob name is stable. Returns ""
+// when there is nothing to explain (a fresh key or a legacy row) — callers show
+// no line in that case.
+func MatchSummary(rec domain.AuditRecord) string {
+	switch rec.MatchMethod {
+	case domain.MatchCosine:
+		return fmt.Sprintf("matched by `similarity_threshold` (cosine %.2f)", rec.MatchScore)
+	case domain.MatchBM25:
+		return fmt.Sprintf("matched by `bm25_min_score` (bm25 %.2f, embedding fallback)", rec.MatchScore)
+	case domain.MatchExact:
+		return "exact content hash"
+	default:
+		return ""
+	}
+}
+
 // IndexSignatures keys signature rows by signature for O(1) rule lookups
 // from escalation/audit rows (they share the signature string; with
 // semantic matching the stored signature is the possibly-remapped learned

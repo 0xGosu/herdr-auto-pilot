@@ -485,10 +485,19 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 		rule := "none yet"
 		if row, ok := rules[e.Signature]; ok {
 			rule = frontend.RuleSummary(row, gradN)
+			// Rule-gated: how this situation resolved to that rule.
+			if via := frontend.MatchSummary(e); via != "" {
+				rule += "; " + via
+			}
 		}
 		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\tagent=%s\tllm=%s\tsuggestion=%q\trule=[%s]\n",
 			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.Rationale, agent,
 			llmConfCLI(e.LLMConfidence), e.Suggestion, rule)
+		// Embedding failure is shown even without a matched rule — it explains
+		// why a paraphrase may have failed to match semantically.
+		if e.EmbedError != "" {
+			fmt.Fprintf(out, "\tembedding failed: %s\n", e.EmbedError)
+		}
 	}
 	fmt.Fprintf(out, "\n%d pending; respond with: confirm <id> | resolve <id> --action TEXT [--send] | dismiss <id>...\n", len(esc))
 	return nil

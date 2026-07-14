@@ -1481,10 +1481,21 @@ func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int, op
 		if row, ok := m.ruleFor(r.Signature); ok {
 			lines = m.detailField(lines, w, "Matched rule",
 				frontend.RuleSummary(row, m.data.cfg.Learning.GraduationN))
+			// How this situation resolved to that rule (rule-gated: no method
+			// label without a rule behind it).
+			if via := frontend.MatchSummary(r); via != "" {
+				lines = m.detailField(lines, w, "Matched via", via)
+			}
 		} else {
 			lines = m.detailField(lines, w, "Matched rule",
 				"none yet — learned when the operator confirms or resolves this")
 		}
+	}
+	// Embedding failure is NOT rule-gated: it is most useful exactly when a
+	// paraphrase that should have matched fell back (or matched nothing)
+	// because embedding was down.
+	if r.EmbedError != "" {
+		lines = m.detailField(lines, w, "Embedding", "failed: "+r.EmbedError)
 	}
 	if r.DecisionID != 0 {
 		lines = m.detailField(lines, w, "Decision id", fmt.Sprintf("%d", r.DecisionID))

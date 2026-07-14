@@ -1615,7 +1615,9 @@ func TestConfigReloadPropagatesWithinBudget(t *testing.T) {
 func TestLLMFallbackStagingRegateAndPromotion(t *testing.T) {
 	// FR-010/SC-5: LLM staged decision is re-gated and promoted; timeout
 	// and no-submit escalate.
-	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	// Pin approval = 0.8 so the seeded 0.73 history stays below threshold and
+	// takes the consult path (the default dropped to 0.70 in c8b3e82).
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n[confidence_thresholds]\napproval = 0.8\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	var requestID atomicString
@@ -1809,7 +1811,9 @@ func (a *atomicString) set(v string) { a.mu.Lock(); a.v = v; a.mu.Unlock() }
 func (a *atomicString) get() string  { a.mu.Lock(); defer a.mu.Unlock(); return a.v }
 
 func TestLLMFailureEscalates(t *testing.T) {
-	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 0\ntimeout_seconds = 1\n"
+	// Pin approval = 0.8 so the seeded 0.73 history stays below threshold and
+	// takes the consult path (the default dropped to 0.70 in c8b3e82).
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 0\ntimeout_seconds = 1\n[confidence_thresholds]\napproval = 0.8\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true
@@ -2289,6 +2293,55 @@ func TestTailTrimsAtRuneBoundary(t *testing.T) {
 	}
 	if got := tail(strings.Repeat("界", 10), 7); !utf8.ValidString(got) {
 		t.Errorf("tail must never emit invalid UTF-8, got %q", got)
+	}
+}
+
+func TestTruncateTailRunesKeepsBottomContext(t *testing.T) {
+	if got := truncateTailRunes("short", 10); got != "short" {
+		t.Errorf("short input must pass through, got %q", got)
+	}
+	if got := truncateTailRunes("abcdef", 3); got != "…def" {
+		t.Errorf("tail cut = %q, want %q", got, "…def")
+	}
+	if got := truncateTailRunes("top界界bottom", 8); got != "…界界bottom" {
+		t.Errorf("rune-safe tail cut = %q, want %q", got, "…界界bottom")
+	}
+}
+
+func TestStoredSituationSnapshotsKeepBottomContext(t *testing.T) {
+	h := newHarness(t, "")
+	pane := "TOP-SCROLLBACK-MARKER\n" + strings.Repeat("old shell output 界\n", 400) + approvalPane
+	h.herdr.setPane(pane)
+
+	h.push("agent-tail-snapshot", "blocked")
+	ctx := context.Background()
+	var current domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		escalations, _ := h.raw.PendingEscalations(ctx)
+		if len(escalations) == 0 {
+			return false
+		}
+		current = escalations[0]
+		return true
+	})
+
+	original, err := h.raw.GetSignatureSnapshot(ctx, current.Signature)
+	if err != nil {
+		t.Fatalf("original situation: %v", err)
+	}
+	for label, got := range map[string]string{
+		"Current situation":  current.PaneExcerpt,
+		"Original situation": original,
+	} {
+		if !strings.HasPrefix(got, "…") || !strings.HasSuffix(got, approvalPane) {
+			t.Errorf("%s must retain the bottom of oversized context, got %q", label, got)
+		}
+		if strings.Contains(got, "TOP-SCROLLBACK-MARKER") {
+			t.Errorf("%s retained the top of oversized context", label)
+		}
+		if n := len([]rune(got)); n != snapshotMaxRunes+1 {
+			t.Errorf("%s length = %d runes, want %d including marker", label, n, snapshotMaxRunes+1)
+		}
 	}
 }
 

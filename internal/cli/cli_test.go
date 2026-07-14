@@ -501,6 +501,27 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 		t.Errorf("unmatched escalation should read none yet, got:\n%s", out)
 	}
 
+	// A cosine-matched escalation (sharing the seeded rule's signature) names
+	// the governing knob next to the rule.
+	st.AppendAudit(context.Background(), domain.AuditRecord{Signature: "approval:aaaa1111bbbb2222",
+		Trigger: "apply?", SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: "shadow mode", Status: "escalated",
+		MatchMethod: domain.MatchCosine, MatchScore: 0.94, CreatedAt: time.Now()})
+	out, _ = run(t, app, "escalations")
+	if !strings.Contains(out, "matched by `similarity_threshold` (cosine 0.94)") {
+		t.Errorf("cosine escalation should name similarity_threshold, got:\n%s", out)
+	}
+
+	// An escalation whose embedding failed shows the failure even with no rule.
+	st.AppendAudit(context.Background(), domain.AuditRecord{Signature: "error:8888eeee",
+		Trigger: "boom", SituationType: domain.SituationError, Action: "escalated",
+		Rationale: "fresh", Status: "escalated", EmbedError: "embedder degraded",
+		CreatedAt: time.Now()})
+	out, _ = run(t, app, "escalations")
+	if !strings.Contains(out, "embedding failed: embedder degraded") {
+		t.Errorf("embed-failure escalation should show the error, got:\n%s", out)
+	}
+
 	out, err = run(t, app, "audit")
 	if err != nil {
 		t.Fatal(err)

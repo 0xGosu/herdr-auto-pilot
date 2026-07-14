@@ -1869,3 +1869,27 @@ func TestSignatureSnapshotAccessor(t *testing.T) {
 		t.Errorf("empty signature should be empty, got %q", got)
 	}
 }
+
+func TestMatchSummary(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  domain.AuditRecord
+		want string
+	}{
+		{"cosine names similarity_threshold",
+			domain.AuditRecord{MatchMethod: domain.MatchCosine, MatchScore: 0.94},
+			"matched by `similarity_threshold` (cosine 0.94)"},
+		{"bm25 names bm25_min_score and notes fallback",
+			domain.AuditRecord{MatchMethod: domain.MatchBM25, MatchScore: 0.42},
+			"matched by `bm25_min_score` (bm25 0.42, embedding fallback)"},
+		{"exact", domain.AuditRecord{MatchMethod: domain.MatchExact}, "exact content hash"},
+		{"none is empty", domain.AuditRecord{MatchMethod: domain.MatchNone}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := frontend.MatchSummary(c.rec); got != c.want {
+				t.Errorf("MatchSummary = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

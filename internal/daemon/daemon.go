@@ -709,7 +709,7 @@ func (d *Daemon) hasOpenEscalation(ctx context.Context, agentID string) bool {
 // than being ignored (the "never a silent drop" architecture rule).
 func (d *Daemon) duplicatePendingEscalation(ctx context.Context, s domain.Situation) bool {
 	dup, err := d.opt.Store.DuplicatePendingEscalation(ctx, s.AgentID, s.AgentType,
-		s.Type, truncateRunes(s.Content, snapshotMaxRunes))
+		s.Type, truncateTailRunes(s.Content, snapshotMaxRunes))
 	if err != nil {
 		slog.Warn("duplicate-escalation check failed; processing event",
 			"agent", s.AgentID, "pane", s.PaneID, "error", err)
@@ -727,7 +727,7 @@ func (d *Daemon) ignoreDuplicate(ctx context.Context, s domain.Situation,
 		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "ignored", Status: "ignored",
 		Rationale:   "duplicated event",
-		PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes),
+		PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
 		CreatedAt:   now,
 	})
 	slog.Info("ignored duplicate event: matching pending escalation exists",
@@ -808,8 +808,9 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 	d.decideAndAct(ctx, situation, tr, agentName, now)
 }
 
-// snapshotMaxRunes caps the stored rule-provenance pane snapshot; big
-// enough for a full classification read or a multi-tab aggregate head.
+// snapshotMaxRunes caps stored Current/Original Situation pane snapshots.
+// Captures keep the tail because shell/CLI results and prompts land at the
+// bottom; older scrollback is discarded first.
 const snapshotMaxRunes = 4000
 
 // decideAndAct is the decision tail shared by handleTransition and the
@@ -835,7 +836,7 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	d.mu.Unlock()
 	if sig.Signature != "" && !saved {
 		if err := d.opt.Store.SaveSignatureSnapshot(ctx, sig.Signature,
-			truncateRunes(situation.Content, snapshotMaxRunes), now); err != nil {
+			truncateTailRunes(situation.Content, snapshotMaxRunes), now); err != nil {
 			slog.Warn("signature snapshot write failed", "error", err)
 		} else {
 			d.mu.Lock()
@@ -956,6 +957,17 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string(runes[:n]) + "…"
+}
+
+// truncateTailRunes shortens shell/CLI context to its final n runes. The
+// actionable prompt or error is normally at the bottom, so stored situation
+// snapshots must discard old scrollback from the top rather than the result.
+func truncateTailRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return "…" + string(runes[len(runes)-n:])
 }
 
 // cancelRewriteExcept invalidates the agent's in-flight rewrite unless it is
@@ -1092,7 +1104,7 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + del.input, Input: del.input,
 		Confidence: dec.Confidence, Rationale: del.rationale, LLMOutput: del.llmOutput,
-		Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
@@ -1171,7 +1183,7 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 		return
 	}
 	// Keep the diagnostic row's excerpt the same size as the normal audit rows.
-	p.Excerpt = truncateRunes(p.Excerpt, snapshotMaxRunes)
+	p.Excerpt = truncateTailRunes(p.Excerpt, snapshotMaxRunes)
 	delay := time.Duration(delayMs) * time.Millisecond
 	time.AfterFunc(delay, func() {
 		_ = logging.Guard("verify-unblock", func() error {
@@ -1212,7 +1224,7 @@ func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "noop", Input: "",
 		Confidence: dec.Confidence, Rationale: dec.Rationale,
-		Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous noop (FR-024)", "error", err)
@@ -1277,7 +1289,13 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		Status:        "escalated", Suggestion: dec.Suggestion,
 		// The content THIS escalation was classified from — per entry,
 		// unlike the signature's first-seen provenance snapshot.
-		PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes),
+		PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
+		// How this situation resolved to its rule (cosine / BM25 / exact) and
+		// any embedding failure for this event, so the operator can see WHY
+		// the matched rule was chosen. Auto-send rows leave these empty.
+		MatchMethod: sig.Match.Method,
+		MatchScore:  sig.Match.Score,
+		EmbedError:  sig.Match.EmbedError,
 		CreatedAt:   now,
 	}
 	if _, err := d.opt.Store.AppendAudit(ctx, rec); err != nil {
@@ -2197,7 +2215,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			SituationType: s.Type, Action: "noop", Input: "",
 			Confidence: computedConf, LLMConfidence: &llmConf,
 			Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
-			Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+			Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 		}); err != nil {
 			slog.Error("audit write failed; blocking LLM noop (FR-024)", "error", err)
 			d.notify(ctx, "Herd Auto Prompter: persistence failure",
@@ -2287,7 +2305,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + llmDec.Action, Input: llmDec.Action,
 		Confidence: computedConf, LLMConfidence: &llmConf,
 		Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
-		Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})
 	if err != nil {
 		slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)

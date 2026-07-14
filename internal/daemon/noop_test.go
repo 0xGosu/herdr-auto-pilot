@@ -69,9 +69,13 @@ func TestLLMNoopPromotionRecordsWithoutSend(t *testing.T) {
 	h.push("agent-llmnoop", "blocked")
 
 	ctx := context.Background()
+	// The promotion writes the audit first, then records the decision and
+	// registers the auto-prompt rate LAST (daemon.go). Wait on that final side
+	// effect so the decision/rate assertions below never race a half-finished
+	// promotion — waiting only for the audit row is too early.
 	waitFor(t, 5*time.Second, func() bool {
-		audits, _ := h.raw.AuditLog(ctx, 10)
-		return len(audits) > 0 && audits[0].Action == "noop"
+		rate, _ := h.raw.GetAgentRate(ctx, "agent-llmnoop")
+		return rate != nil && rate.ConsecutiveAuto == 1
 	})
 	audits, _ := h.raw.AuditLog(ctx, 10)
 	if audits[0].Status != "auto" || audits[0].Trigger != "llm-fallback" || audits[0].Input != "" {
