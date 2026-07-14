@@ -4,6 +4,33 @@ import "testing"
 
 const claudeApproval = "Bash(go test ./...)\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell the agent what to do differently\n"
 
+// A multi-SELECT question renders per-option checkboxes; a single-select one
+// renders plain numbered options.
+const multiSelectFrame = "Which stats should show?\n❯ 1. [ ] Auto-sends\n  2. [x] Escalations\n  3. [ ] Confirmed\n\nEnter to select · Tab to switch questions\n"
+
+func TestMultiSelectTab(t *testing.T) {
+	if !MultiSelectTab(multiSelectFrame) {
+		t.Error("checkbox options must classify as multi-select")
+	}
+	if MultiSelectTab(claudeApproval) {
+		t.Error("plain numbered options must NOT classify as multi-select")
+	}
+}
+
+func TestOptionCheckStates(t *testing.T) {
+	states := OptionCheckStates(multiSelectFrame)
+	if len(states) != 3 {
+		t.Fatalf("want 3 checkbox states, got %d: %+v", len(states), states)
+	}
+	if states["1"] || !states["2"] || states["3"] {
+		t.Errorf("check states wrong: %+v (want only option 2 checked)", states)
+	}
+	// A frame without checkboxes yields no states.
+	if got := OptionCheckStates(claudeApproval); len(got) != 0 {
+		t.Errorf("non-checkbox options must yield no check states, got %+v", got)
+	}
+}
+
 func TestParseNumberedOptions(t *testing.T) {
 	opts := ParseNumberedOptions(claudeApproval)
 	if len(opts) != 2 {

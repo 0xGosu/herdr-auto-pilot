@@ -1622,9 +1622,14 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 	}
 	if s.TabCount > 1 {
 		fields["tab_count"] = s.TabCount
-		fields["answer_format"] = fmt.Sprintf(
-			"this is a multi-tab question form with %d tabs (the final tab is Submit); the pane excerpt lists every question in order. submit_decision select_options MUST be a list of exactly %d integers, one chosen option number per tab including Submit, e.g. [1, 2, 3, 2, 1]",
+		answer := fmt.Sprintf(
+			"this is a multi-tab question form with %d tabs (the final tab is Submit); the pane excerpt lists every question in order. submit_decision select_options is a list of exactly %d entries, one per tab in order including Submit, e.g. [1, 2, 3, 2, 1]",
 			s.TabCount, s.TabCount)
+		if kinds, anyMulti := tabSelectKinds(s.TabMultiSelect); anyMulti {
+			fields["tab_select_kinds"] = kinds
+			answer += ". Some tabs are MULTI-SELECT (tab_select_kinds marks each tab \"single\" or \"multi\"; a multi-select question shows `[ ]` checkboxes on its options): for a multi-select tab pass an ARRAY of the option numbers to toggle instead of a single integer, e.g. [1, [1, 3], 2] chooses option 1 on tab 1, toggles options 1 and 3 on tab 2, and option 2 on tab 3"
+		}
+		fields["answer_format"] = answer
 	} else if len(s.Options) > 0 {
 		fields["answer_format"] = "answer with submit_decision select_options: a one-element list with the 1-based number of the chosen option, e.g. [2]"
 	} else if s.Type == domain.SituationApproval || s.Type == domain.SituationChoice {
@@ -1643,6 +1648,27 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 	}
 	contextJSON, _ := json.Marshal(fields)
 	return contextJSON
+}
+
+// tabSelectKinds renders per-tab select kinds ("single"/"multi") for the LLM
+// consult context and reports whether any tab is multi-select. Returns
+// (nil, false) when no per-tab metadata is present (e.g. a form that was not
+// swept), so the consult falls back to the single-select-only phrasing.
+func tabSelectKinds(multi []bool) ([]string, bool) {
+	if len(multi) == 0 {
+		return nil, false
+	}
+	kinds := make([]string, len(multi))
+	any := false
+	for i, m := range multi {
+		if m {
+			kinds[i] = "multi"
+			any = true
+		} else {
+			kinds[i] = "single"
+		}
+	}
+	return kinds, any
 }
 
 // paneExcerpt reads a deep pane excerpt (last llm.pane_excerpt_chars) for
@@ -2241,8 +2267,8 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				"another pane interaction is in flight for this agent; not delivering concurrently")
 			return
 		}
-		seq, _ := domain.ParseDigitSeries(llmDec.Action)
-		d.deliverSeriesLLM(ctx, ks, s, res.sig.Signature, llmDec, seq, auditID, now)
+		groups, _ := domain.ParseTabSelections(llmDec.Action)
+		d.deliverSeriesLLM(ctx, ks, s, res.sig.Signature, llmDec, groups, auditID, now)
 		return
 	}
 	if err := d.opt.Herdr.Send(ctx, s.PaneID, domain.DeliverKeystroke(s.Type, pane, llmDec.Action)); err != nil {

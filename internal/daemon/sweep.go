@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -23,11 +24,11 @@ import (
 // following read (or the next keystroke).
 const sweepKeyDelay = 250 * time.Millisecond
 
-// sweepResetKeys is a fixed Left-arrow count larger than any real form's
-// tab count, so a reset burst lands on the first question regardless of
-// size — before answer delivery too, since the operator (or a failed reset)
-// may have left the form focused elsewhere.
-const sweepResetKeys = 10
+// sweepResetKeys / sweepAdvanceKey alias the shared domain protocol constants
+// so the capture sweep, autonomous delivery, and the operator-confirm frontend
+// all navigate a form identically (a single source of truth — domain.MCQ*).
+const sweepResetKeys = domain.MCQResetKeys
+const sweepAdvanceKey = domain.MCQAdvanceKey
 
 // sweepAllowed re-reads the gates that must veto pane interaction BEFORE
 // any sweep keystroke: kill switch (FR-017), rate pause (FR-019), and the
@@ -121,6 +122,7 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 	s domain.Situation) (domain.Situation, error) {
 
 	frames := make([]string, 0, s.TabCount)
+	multiSelect := make([]bool, 0, s.TabCount)
 	moved := false
 	var sweepErr error
 	for tab := 0; tab < s.TabCount; tab++ {
@@ -144,7 +146,20 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 			sweepErr = fmt.Errorf("tab %d/%d no longer shows the %d-tab form", tab+1, s.TabCount, s.TabCount)
 			break
 		}
+		// A multi-select tab is answered by toggling checkboxes, which is a
+		// RELATIVE flip. We can only reason about the keystrokes if the tab
+		// starts all-unchecked (the observed default); any pre-selected option
+		// means an operator (or a default) already touched it, so escalate the
+		// whole form rather than blind-toggle into the wrong set.
+		multi := domain.MultiSelectTab(frame)
+		if multi {
+			if n := countChecked(frame); n > 0 {
+				sweepErr = fmt.Errorf("tab %d/%d already has %d option(s) selected; cannot auto-toggle safely", tab+1, s.TabCount, n)
+				break
+			}
+		}
 		frames = append(frames, frame)
+		multiSelect = append(multiSelect, multi)
 	}
 
 	if moved {
@@ -162,7 +177,58 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 	swept := s
 	swept.Content = domain.AggregateMCQFrames(frames)
 	swept.Options = domain.OptionLabels(swept.Content)
+	swept.TabMultiSelect = multiSelect
 	return swept, nil
+}
+
+// anyMultiSelect reports whether any tab in the swept form is multi-select.
+func anyMultiSelect(flags []bool) bool {
+	for _, m := range flags {
+		if m {
+			return true
+		}
+	}
+	return false
+}
+
+// reverifyMultiSelect re-checks, immediately before autonomous delivery, that
+// the multi-select form is UNCHANGED since capture. The tab-1 staleness re-read
+// (seriesStale) can not see middle tabs, so without this an operator toggling a
+// middle-tab checkbox — or a same-tab-count form replacing this one — during a
+// long consult would receive stale answer groups and stale explicit-advance
+// decisions (toggling is relative). It re-runs the capture sweep and then fails
+// CLOSED unless the re-swept aggregate content AND per-tab select kinds match
+// the situation being delivered — sweepFrames alone only guarantees the same
+// tab count and an unchecked baseline. A no-op for forms with no multi-select
+// tab.
+func (d *Daemon) reverifyMultiSelect(ctx context.Context, ks ports.KeystrokeSender, s domain.Situation) error {
+	if !anyMultiSelect(s.TabMultiSelect) {
+		return nil
+	}
+	reswept, err := d.sweepFrames(ctx, ks, s)
+	if err != nil {
+		return err
+	}
+	if reswept.Content != s.Content {
+		return fmt.Errorf("form content changed since capture")
+	}
+	if !slices.Equal(reswept.TabMultiSelect, s.TabMultiSelect) {
+		return fmt.Errorf("per-tab select kinds changed since capture")
+	}
+	return nil
+}
+
+// countChecked reports how many of a frame's checkbox options are already
+// checked (`[x]`). Used to enforce the all-unchecked baseline before an
+// autonomous multi-select toggle.
+func countChecked(frame string) int {
+	n := 0
+	for _, checked := range domain.OptionCheckStates(frame) {
+		if checked {
+			n++
+		}
+	}
+	return n
 }
 
 // handleSweepOutcome resumes the decision pipeline with the aggregated
@@ -223,8 +289,8 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 		escalateWith(domain.ReasonHerdrUnreachable, "keystrokes unavailable")
 		return
 	}
-	seq, ok := domain.ParseDigitSeries(dec.Input)
-	if !ok || len(seq) != s.TabCount {
+	groups, ok := domain.ParseTabSelections(dec.Input)
+	if !ok || len(groups) != s.TabCount {
 		escalateWith(domain.ReasonUnfamiliarOptions,
 			fmt.Sprintf("answer series %q does not fit the %d-tab form", dec.Input, s.TabCount))
 		return
@@ -255,7 +321,14 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 	go func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery", func() error {
-			if err := d.sendDigitSeries(ctx, ks, s.PaneID, seq); err != nil {
+			if err := d.reverifyMultiSelect(ctx, ks, s); err != nil {
+				slog.Warn("multi-select baseline moved before delivery; refusing", "pane", s.PaneID, "error", err)
+				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+				d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+					fmt.Sprintf("Agent %s: the multi-select form changed before the answer could be delivered (%v); please review it.", s.AgentID, err))
+				return nil
+			}
+			if err := d.sendTabSelections(ctx, ks, s.PaneID, groups, s.TabMultiSelect); err != nil {
 				slog.Error("answer series delivery failed", "pane", s.PaneID, "error", err)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 				d.notify(ctx, "Herd Auto Prompter: action delivery failed",
@@ -289,13 +362,20 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 // row is already committed by the caller (FR-024); the keystrokes and the
 // accept/learn/rate writes run off the main loop.
 func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
-	s domain.Situation, sigKey string, llmDec *domain.LLMDecision, seq []string,
+	s domain.Situation, sigKey string, llmDec *domain.LLMDecision, groups [][]string,
 	auditID int64, now time.Time) {
 
 	go func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery-llm", func() error {
-			if err := d.sendDigitSeries(ctx, ks, s.PaneID, seq); err != nil {
+			if err := d.reverifyMultiSelect(ctx, ks, s); err != nil {
+				slog.Warn("multi-select baseline moved before LLM delivery; refusing", "pane", s.PaneID, "error", err)
+				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+				d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+					fmt.Sprintf("Agent %s: the multi-select form changed before the answer could be delivered (%v); please review it.", s.AgentID, err))
+				return nil
+			}
+			if err := d.sendTabSelections(ctx, ks, s.PaneID, groups, s.TabMultiSelect); err != nil {
 				slog.Error("LLM answer series delivery failed", "pane", s.PaneID, "error", err)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 				d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
@@ -326,23 +406,28 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 	}()
 }
 
-// sendDigitSeries resets the form to its first question (fixed Left-arrow
-// burst — a human may have tabbed around since capture), then presses one
-// digit per tab in order, pausing between keystrokes so the form can
-// advance and re-render.
-func (d *Daemon) sendDigitSeries(ctx context.Context, ks ports.KeystrokeSender, paneID string, seq []string) error {
+// sendTabSelections resets the form to its first question (fixed Left-arrow
+// burst — a human may have tabbed around since capture), then presses the
+// per-tab answer keystrokes from domain.MultiTabKeys: the toggle digit(s) for
+// each tab, plus an explicit advance after a MULTI-SELECT tab (which does not
+// auto-advance on a digit press). Keystrokes are paced by sweepKeyDelay so the
+// form advances and re-renders between presses.
+func (d *Daemon) sendTabSelections(ctx context.Context, ks ports.KeystrokeSender, paneID string,
+	groups [][]string, tabMultiSelect []bool) error {
+
 	for i := 0; i < sweepResetKeys; i++ {
 		if err := ks.SendKey(ctx, paneID, "left"); err != nil {
 			return fmt.Errorf("reset left-arrow %d/%d: %w", i+1, sweepResetKeys, err)
 		}
 	}
 	time.Sleep(sweepKeyDelay)
-	for i, digit := range seq {
+	keys := domain.MultiTabKeys(groups, tabMultiSelect, sweepAdvanceKey)
+	for i, key := range keys {
 		if i > 0 {
 			time.Sleep(sweepKeyDelay)
 		}
-		if err := ks.SendKey(ctx, paneID, digit); err != nil {
-			return fmt.Errorf("digit %d/%d: %w", i+1, len(seq), err)
+		if err := ks.SendKey(ctx, paneID, key); err != nil {
+			return fmt.Errorf("keystroke %d/%d (%q): %w", i+1, len(keys), key, err)
 		}
 	}
 	return nil

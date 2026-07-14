@@ -415,9 +415,11 @@ func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
 		t.Errorf("confirm should record a declared-task correction: %+v", corr)
 	}
 
-	// The task text was sent to the agent's pane.
-	if len(fake.inputs) != 1 || fake.inputs[0] != taskText {
-		t.Errorf("delivered %v, want the task text %q", fake.inputs, taskText)
+	// The generated task uses the same default prompt as every declared task,
+	// including the newly created task-list path.
+	wantPrompt := domain.DeclaredTask{Task: taskText, Path: path, AgentName: name}.Prompt()
+	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
+		t.Errorf("delivered %v, want the rendered prompt %q", fake.inputs, wantPrompt)
 	}
 	if len(fake.panes) != 1 || fake.panes[0] != "w1:p1" {
 		t.Errorf("delivered to %v, want the audit's agent pane", fake.panes)
@@ -483,9 +485,13 @@ func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
 	if !strings.Contains(string(body), want) {
 		t.Errorf("tasks file = %q, want a checklist %q", body, want)
 	}
-	// Only the first task is sent to the agent.
-	if len(fake.inputs) != 1 || fake.inputs[0] != "Investigate the flaky auth test" {
-		t.Errorf("delivered %v, want only the first task", fake.inputs)
+	// Only the first task is sent to the agent, rendered through the same
+	// default prompt used for later items from the registered source.
+	wantPrompt := domain.DeclaredTask{
+		Task: "Investigate the flaky auth test", Path: path, AgentName: name,
+	}.Prompt()
+	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
+		t.Errorf("delivered %v, want only the first task as %q", fake.inputs, wantPrompt)
 	}
 	// The next declared task is the first pending item, so the queue drives on
 	// later idles.
@@ -927,6 +933,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"embedding.gpu_layers":                "0",
 		"embedding.model_context_window":      "512",
 		"tui.max_content_width":               "140",
+		"tui.max_content_height":              "12",
 		"tui.theme":                           "dark",
 	}
 
@@ -1069,6 +1076,10 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 		{"tui.max_content_width", "0", false},
 		{"tui.max_content_width", "-1", true},
 		{"tui.max_content_width", "abc", true},
+		{"tui.max_content_height", "12", false},
+		{"tui.max_content_height", "0", false},
+		{"tui.max_content_height", "-1", true},
+		{"tui.max_content_height", "abc", true},
 		{"safety.disable_seed", "true", false},
 		{"safety.disable_seed", "false", false},
 		{"safety.disable_seed", "yes", true},
@@ -1127,6 +1138,9 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 	if err := app.SetField(ctx, "tui.max_content_width", "140"); err != nil {
 		t.Fatal(err)
 	}
+	if err := app.SetField(ctx, "tui.max_content_height", "12"); err != nil {
+		t.Fatal(err)
+	}
 	if err := app.SetField(ctx, "safety.disable_seed", "true"); err != nil {
 		t.Fatal(err)
 	}
@@ -1138,6 +1152,9 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 	}
 	if cfg.TUI.MaxContentWidth != 140 {
 		t.Errorf("tui.max_content_width = %d, want 140", cfg.TUI.MaxContentWidth)
+	}
+	if cfg.TUI.MaxContentHeight != 12 {
+		t.Errorf("tui.max_content_height = %d, want 12", cfg.TUI.MaxContentHeight)
 	}
 	if !cfg.Safety.DisableSeed {
 		t.Error("safety.disable_seed = false, want true (assignment not persisted)")
@@ -1694,9 +1711,12 @@ func TestResolveDigitSeriesDeliversKeystrokes(t *testing.T) {
 	if len(fake.inputs) != 0 {
 		t.Errorf("series must not be sent as text, sent %v", fake.inputs)
 	}
-	// A fixed Left-arrow burst resets the form to question 1 first — the
-	// operator may have tabbed around since the escalation was raised.
-	want := strings.TrimSpace(strings.Repeat("left ", 10)) + " 1 2 1"
+	// All-or-nothing delivery: a read-only baseline pre-pass first (reset, then
+	// a Right-arrow walk of tabs 2 and 3) confirms the form is stable and no
+	// multi-select tab is pre-selected, then the delivery pass resets again and
+	// types one digit per (single-select) tab.
+	reset := strings.TrimSpace(strings.Repeat("left ", 10))
+	want := reset + " right right " + reset + " 1 2 1"
 	if got := strings.Join(fake.keys, " "); got != want {
 		t.Errorf("keystrokes = %q, want %q", got, want)
 	}

@@ -234,6 +234,12 @@ list all configurable fields:
 hap config fields
 ```
 
+print the config file path (even before the file exists):
+
+```bash
+hap config path
+```
+
 set a specific config field:
 
 ```bash
@@ -254,6 +260,7 @@ hap config set safety.disable_seed true
 hap config set embedding.disabled true
 hap config set embedding.similarity_threshold 0.85
 hap config set embedding.gpu_layers 4
+hap config set embedding.model_context_window 512
 hap config set embedding.pane_salient_chars 1000
 hap config set tui.max_content_width 120
 hap config set tui.theme high-contrast
@@ -300,11 +307,15 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `llm.command_start` | (unset) | argv template for the FIRST consult per agent; empty inherits `llm.command` (opt-in) |
 | `llm.rewrite_command` | (unset) | argv template for the one-shot rewrite CLI (see llm rewrite) |
 | `llm.rewrite_command_start` | (unset) | argv template for the FIRST rewrite per agent; empty inherits `llm.rewrite_command` (opt-in) |
+| `llm.task_generate_command` | (unset) | argv template for the one-shot task suggestion given to an idle agent with NO task source (see task sources); empty keeps today's escalate-only behavior |
+| `llm.task_generate_command_start` | (unset) | argv template for the FIRST task generation per agent; empty inherits `llm.task_generate_command` (opt-in) |
+| `llm.task_generate_timeout_seconds` | 0 (inherits `timeout_seconds`) | timeout for one task-generation run |
 | `embedding.disabled` | false | disable semantic matching entirely |
 | `embedding.model_path` | (bundled all-minilm-l6-v2-q8_0.gguf) | path to a .gguf embedding model |
 | `embedding.similarity_threshold` | 0.90 | min cosine similarity to reuse a learned signature |
 | `embedding.bm25_min_score` | 0.35 | min normalized BM25 similarity for text fallback |
 | `embedding.gpu_layers` | 0 | model layers offloaded to GPU (inert in official builds) |
+| `embedding.model_context_window` | 0 (built-in default: 512 for MiniLM) | max tokens fed to the embedder before truncation; MUST NOT exceed what the model supports (over 512 hard-aborts a BERT/MiniLM native lib). raise only when `model_path` points at a larger-window model; values below 256 clamp up |
 | `embedding.pane_salient_chars` | 800 | fallback signature window for idle/unclassified situations (trailing N chars) |
 | `tui.max_content_width` | 0 (full width) | cap variable-width list columns; 0 = full width |
 | `tui.theme` | default | TUI color theme: default, dark, light, high-contrast |
@@ -418,6 +429,8 @@ when every item is checked off, the prompt is still sent with `{next_task_conten
 when an `[llm].command` is configured, each determined task is first reviewed by the llm before it is sent: via the `get_context`/`submit_decision` mcp tools it sees the live pane plus the queued task (`proposed_task`/`current_task`), the checklist path (`task_list_path`), and every remaining item (`pending_tasks`), then either sends the task as-is (`recommend_action` `@next_task:declared`, which sends the queued task verbatim), sends an edited task or a different pending item (literal `recommend_action` text), or declines (`@noop`). the outcome follows `auto_act_confidence_threshold` symmetrically — a confident review is applied automatically (the task is sent, or silently skipped on a decline), a low-confidence one is surfaced for confirmation (the suggestion is the llm's exact recommendation; the original task and reasoning show in the escalation detail). since the default threshold is 999, every review is surfaced until you lower it. this review is on by default; set `llm_review = false` on a `[[task_sources]]` entry (in `config.toml`) to opt that source out.
 
 without a declared task source, the plugin falls back to inferring the next task from the agent's own native todo rendering (currently only `claude` agent type is supported for inference). other agent types skip inference and escalate.
+
+if inference finds nothing (no task source and nothing inferable from the pane) and `llm.task_generate_command` is configured, the plugin runs that CLI once to synthesize a next task for the idle agent (placeholders: `{self}`, `{agent_name}`, `{agent_type}`, `{pane_excerpt}`, `{cwd}`). the CLI's stdout is surfaced as an escalation the operator confirms (writing a per-agent `tasks.md`) or dismisses — the plugin never sends a synthesized task unattended. leave `task_generate_command` unset to keep the default: an idle agent with no task source escalates as `no_task_source` and nothing is synthesized. `task_generate_command_start` is the first-interaction variant (empty inherits `task_generate_command`); `task_generate_timeout_seconds` bounds one run (0 inherits `llm.timeout_seconds`).
 
 ## reset data
 
@@ -562,6 +575,18 @@ also available as env vars: `HAP_REWRITE_TEXT`, `HAP_SITUATION_TYPE`, `HAP_AGENT
 - safety controls still apply to the rewritten text: output matching the never-auto patterns or the irreversible heuristic is discarded in favor of the wrapped original.
 - learning is unaffected: decision history records the original learned action, never the rewritten text.
 
+## resolved paths (diagnostics)
+
+print where hap keeps its config and state — useful when reporting an issue or jumping into the state dir. these resolve paths without creating anything, and work even before the files exist:
+
+```bash
+hap state-dir       # the state directory (DB, logs, socket, lock, match-index)
+hap config path     # the config.toml path
+hap paths           # both, labeled
+```
+
+example: `cd "$(hap state-dir)"` jumps into the state directory.
+
 ## version
 
 ```bash
@@ -660,7 +685,7 @@ hap signatures reembed
 
 ## notes
 
-- `hap status`, `hap agents`, `hap escalations`, `hap audit`, `hap signatures list`, `hap signatures show`, `hap config show`, `hap config fields`, `hap rules list`, `hap task-source list`, `hap kill-history`, and `hap version` are read-only and safe to run anytime.
+- `hap status`, `hap agents`, `hap escalations`, `hap audit`, `hap signatures list`, `hap signatures show`, `hap config show`, `hap config fields`, `hap config path`, `hap rules list`, `hap task-source list`, `hap kill-history`, `hap state-dir`, `hap paths`, and `hap version` are read-only and safe to run anytime.
 - `hap confirm` and `hap resolve` with `--send` will deliver text to an agent pane — be mindful of what you send.
 - `hap dismiss` drops escalations without responding — safe, nothing is sent or learned, audit rows kept as `dismissed`.
 - `hap escalations prune [minutes]` bulk-dismisses old escalations (default 360 minutes).

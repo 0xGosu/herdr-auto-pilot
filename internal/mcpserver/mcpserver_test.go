@@ -145,7 +145,7 @@ func TestMCPSelectOptionsValidation(t *testing.T) {
 	resp := c.call(t, "tools/call", map[string]any{
 		"name": "submit_decision", "arguments": map[string]any{"select_options": []int{1, 2}},
 	})
-	if text, _ := json.Marshal(resp); !strings.Contains(string(text), "exactly 3 integers") {
+	if text, _ := json.Marshal(resp); !strings.Contains(string(text), "exactly 3 entries") {
 		t.Fatalf("wrong series length must error with the expected count: %s", text)
 	}
 	resp = c.call(t, "tools/call", map[string]any{
@@ -160,6 +160,36 @@ func TestMCPSelectOptionsValidation(t *testing.T) {
 	}
 	if err := st.UpdateLLMDecisionStatus(ctx, pending[0].ID, "expired"); err != nil {
 		t.Fatal(err)
+	}
+
+	// A MULTI-SELECT tab (per tab_select_kinds) is answered with an array of
+	// option numbers; the mixed int-or-array shape joins to the comma-grouped
+	// per-tab series delivery.
+	stage("req-ms", `{"options":[],"tab_count":3,"tab_select_kinds":["single","multi","single"]}`)
+	c = startServer(t, st, "req-ms")
+	resp = c.call(t, "tools/call", map[string]any{
+		"name": "submit_decision", "arguments": map[string]any{"select_options": []any{1, []int{1, 3}, 2}},
+	})
+	if text, _ := json.Marshal(resp); !strings.Contains(string(text), "staged") {
+		t.Fatalf("mixed int-or-array series should stage: %s", text)
+	}
+	pending, _ = st.PendingLLMDecisions(ctx)
+	if len(pending) != 1 || pending[0].Action != "1 1,3 2" {
+		t.Fatalf("mixed selects should join to a grouped series, got %+v", pending)
+	}
+	if err := st.UpdateLLMDecisionStatus(ctx, pending[0].ID, "expired"); err != nil {
+		t.Fatal(err)
+	}
+
+	// An array on a SINGLE-select tab (tab 1 here) is rejected: its extra
+	// digits would deliver with no advance and shift onto later tabs.
+	stage("req-ms2", `{"options":[],"tab_count":3,"tab_select_kinds":["single","multi","single"]}`)
+	c = startServer(t, st, "req-ms2")
+	resp = c.call(t, "tools/call", map[string]any{
+		"name": "submit_decision", "arguments": map[string]any{"select_options": []any{[]int{1, 2}, 1, 2}},
+	})
+	if text, _ := json.Marshal(resp); !strings.Contains(string(text), "single-select") {
+		t.Fatalf("array on a single-select tab must be rejected: %s", text)
 	}
 
 	// A single menu takes exactly one integer, bounded by the offered set.
