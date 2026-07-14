@@ -170,6 +170,11 @@ type FrontendStore interface {
 	ReadStore
 
 	InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error)
+	// MarkCorrectionSent flags a recorded correction as delivered to the agent
+	// (front-ends record the correction first, then flip this once delivery
+	// succeeds), so the daemon arms the post-action unblock self-check only for
+	// corrections that actually reached the pane.
+	MarkCorrectionSent(ctx context.Context, id int64) error
 	// InsertLLMRetry queues a request to re-invoke the LLM on an escalation
 	// whose consult failed/timed out; the daemon drains it on reload.
 	InsertLLMRetry(ctx context.Context, auditID int64, now time.Time) (int64, error)

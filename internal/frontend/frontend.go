@@ -463,17 +463,23 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	if action == domain.SuggestGenerateTask {
 		return a.acceptGeneratedTask(ctx, audit, send)
 	}
-	// willSend mirrors the delivery gate below: it records on the correction
-	// whether this action is actually delivered to the agent, so the daemon
-	// (which owns audit writes) can arm the post-action unblock self-check for
-	// operator sends — a record-only correction leaves the agent expectedly
-	// blocked and must NOT trip the check.
+	// willSend is the delivery gate. The correction is recorded FIRST (the
+	// learning event, preserved even when delivery fails) but with Sent=false;
+	// it is flipped to Sent=true only AFTER delivery actually succeeds. The
+	// daemon arms the post-action unblock self-check off the Sent flag, so a
+	// failed pane read / form-validation / keystroke series / Send must never
+	// leave a Sent=true correction (which would fire a bogus delivery_failed).
 	willSend := send && action != domain.ActionNoop && a.Herdr != nil && audit.AgentID != ""
-	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
-		AuditID: auditID, CorrectedAction: action, Author: a.Author, Sent: willSend, CreatedAt: time.Now(),
-	}); err != nil {
+	corrID, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+		AuditID: auditID, CorrectedAction: action, Author: a.Author, Sent: false, CreatedAt: time.Now(),
+	})
+	if err != nil {
 		return err
 	}
+	// markSent flags the correction delivered so the daemon arms the self-check.
+	// Best-effort: the send already succeeded, so a flag-write failure only
+	// skips the (safety-net) check rather than failing the operator's action.
+	markSent := func() { _ = a.Store.MarkCorrectionSent(ctx, corrID) }
 	// A confirmed/resolved noop records the correction — the learning event
 	// — but never writes the sentinel into the pane: "do nothing" means
 	// exactly that.
@@ -504,6 +510,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 			if err := a.deliverTabSeries(ctx, ks, audit.AgentID, groups); err != nil {
 				return fmt.Errorf("correction recorded, but %w", err)
 			}
+			markSent()
 			return a.nudge(ctx, control.KindReload)
 		}
 		if rerr == nil {
@@ -512,6 +519,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		if err := a.Herdr.Send(ctx, audit.AgentID, outbound); err != nil {
 			return fmt.Errorf("correction recorded, but sending to the agent failed: %w", err)
 		}
+		markSent()
 	}
 	return a.nudge(ctx, control.KindReload)
 }

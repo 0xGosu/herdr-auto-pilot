@@ -308,10 +308,14 @@ type fakeHerdr struct {
 	inputs  []string
 	pane    string // returned by ReadPane (live menu content)
 	readErr error
+	sendErr error                    // when set, Send fails (delivery failure)
 	agents  []domain.AgentTransition // returned by ListAgents (live statuses)
 }
 
 func (f *fakeHerdr) Send(_ context.Context, paneID, input string) error {
+	if f.sendErr != nil {
+		return f.sendErr
+	}
 	f.panes = append(f.panes, paneID)
 	f.inputs = append(f.inputs, input)
 	return nil
@@ -387,6 +391,30 @@ func TestResolveNoopNeverSent(t *testing.T) {
 	}
 	if len(fake.inputs) != 0 {
 		t.Errorf("@noop must not deliver anything, got %v", fake.inputs)
+	}
+}
+
+// TestResolveFailedSendLeavesUnsent: when delivery fails, the correction is
+// still recorded (learning) but stays Sent=false, so the daemon never arms the
+// self-check for an action that never reached the agent.
+func TestResolveFailedSendLeavesUnsent(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeHerdr{pane: "Enter a commit message:\n> ", sendErr: errAny}
+	app.Herdr = fake
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+	if err := app.Resolve(ctx, id, "proceed", true); err == nil {
+		t.Fatal("expected a delivery error")
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 {
+		t.Fatalf("correction must still be recorded on send failure: %+v", corr)
+	}
+	if corr[0].Sent {
+		t.Errorf("a failed send must leave the correction Sent=false: %+v", corr)
 	}
 }
 

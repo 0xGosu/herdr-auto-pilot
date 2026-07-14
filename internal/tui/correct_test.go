@@ -123,7 +123,7 @@ func TestCorrectLiveSendPath(t *testing.T) {
 	upd, _ = m.Update(msg.(openSendPromptMsg))
 	m = upd.(Model)
 
-	m, _ = runPromptSubmit(t, m, "y")
+	runPromptSubmit(t, m, "y")
 	corr, _ := st.UnprocessedCorrections(context.Background())
 	if len(corr) != 1 || !corr[0].Sent {
 		t.Errorf("sent correction should be Sent=true: %+v", corr)
@@ -141,7 +141,7 @@ func TestCorrectNonLiveRecordsWithoutSendPrompt(t *testing.T) {
 
 	upd, _ := m.correctByID(id, false)
 	m = upd.(Model)
-	m, msg := runPromptSubmit(t, m, "n")
+	_, msg := runPromptSubmit(t, m, "n")
 	if _, ok := msg.(openSendPromptMsg); ok {
 		t.Fatal("non-live correction must NOT chain a send prompt")
 	}

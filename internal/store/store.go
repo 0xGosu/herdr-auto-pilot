@@ -369,6 +369,17 @@ func (s *Store) MarkCorrectionProcessed(ctx context.Context, id int64) error {
 	})
 }
 
+// MarkCorrectionSent flags a recorded correction as delivered to the agent
+// (front-ends record it first, then flip this once the send succeeds), so the
+// daemon arms the post-action unblock self-check only for delivered corrections.
+func (s *Store) MarkCorrectionSent(ctx context.Context, id int64) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE corrections SET sent = 1 WHERE id = ?`, id)
+		return err
+	})
+}
+
 // StageLLMRequest stores the context for one LLM consultation (daemon-owned).
 func (s *Store) StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64, error) {
 	var id int64
