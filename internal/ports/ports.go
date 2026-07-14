@@ -244,6 +244,9 @@ type ReadStore interface {
 	LLMDecisionByRequest(ctx context.Context, requestID string) (*domain.LLMDecision, error)
 	// AgentNames returns every agent id → short name mapping.
 	AgentNames(ctx context.Context) (map[string]string, error)
+	// AgentStats returns lifetime per-agent counters keyed by agent/pane id,
+	// including agents with zero recorded events (so their FirstSeen shows).
+	AgentStats(ctx context.Context) (map[string]domain.AgentStats, error)
 	// ResolveAgent maps a short name or agent/pane id to the agent id.
 	ResolveAgent(ctx context.Context, target string) (string, error)
 	// ListSignatures returns learning state rows, newest-updated first;

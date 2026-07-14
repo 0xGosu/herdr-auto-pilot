@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_log(agent_id);
 CREATE TABLE IF NOT EXISTS agent_rate (
 	agent_id TEXT PRIMARY KEY,
 	consecutive_auto INTEGER NOT NULL DEFAULT 0,
@@ -1346,6 +1347,50 @@ func (s *Store) AgentNames(ctx context.Context) (map[string]string, error) {
 		names[id] = name
 	}
 	return names, rows.Err()
+}
+
+// AgentStats returns lifetime per-agent counters keyed by agent/pane id.
+// It is keyed off agent_names (LEFT JOIN audit_log) so an agent with zero
+// events still surfaces, carrying its FirstSeen. The counting rules match the
+// daemon write sites: auto-sends are counted by action prefix (a failed send
+// leaves the "auto:" action but flips status to escalated, so counting by
+// action avoids double counting and excludes the "noop" row); escalations are
+// counted by action so they reflect the lifetime total, not just still-pending
+// rows; confirmed vs. corrected split on the rationale literal. The literals
+// come from domain constants shared with the writer so they cannot drift.
+func (s *Store) AgentStats(ctx context.Context) (map[string]domain.AgentStats, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT n.agent_id, n.created_at,
+			SUM(CASE WHEN a.action_or_escalation LIKE ? THEN 1 ELSE 0 END),
+			SUM(CASE WHEN a.action_or_escalation = ? THEN 1 ELSE 0 END),
+			SUM(CASE WHEN a.trigger = ? AND a.rationale = ? THEN 1 ELSE 0 END),
+			SUM(CASE WHEN a.trigger = ? AND a.rationale = ? THEN 1 ELSE 0 END)
+		FROM agent_names n
+		LEFT JOIN audit_log a ON a.agent_id = n.agent_id
+		GROUP BY n.agent_id, n.created_at`,
+		domain.AuditActionAutoPrefix+"%", domain.AuditActionEscalated,
+		domain.TriggerOperatorCorrection, domain.RationaleOperatorConfirmed,
+		domain.TriggerOperatorCorrection, domain.RationaleOperatorCorrected)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	stats := map[string]domain.AgentStats{}
+	for rows.Next() {
+		var id string
+		var created int64
+		var st domain.AgentStats
+		if err := rows.Scan(&id, &created, &st.AutoSends, &st.Escalations,
+			&st.Confirmed, &st.Corrections); err != nil {
+			return nil, err
+		}
+		if id == "" {
+			continue
+		}
+		st.FirstSeen = fromUnix(created)
+		stats[id] = st
+	}
+	return stats, rows.Err()
 }
 
 // LatestPendingLLMRequest returns the newest pending staged request, or nil.

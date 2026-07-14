@@ -83,6 +83,11 @@ type statusNote struct {
 
 type tickMsg time.Time
 
+// clockTickMsg fires once a second to advance the live Age counter on the
+// Agents tab. It only repaints — it never re-queries the store (unlike the
+// slower tickMsg refresh).
+type clockTickMsg time.Time
+
 // prompt is an in-flight inline input.
 type prompt struct {
 	label    string
@@ -142,6 +147,20 @@ type Model struct {
 	searching bool             // search-input mode on the active tab (AR-011)
 	status    *statusNote      // durable action outcome (CR-025)
 	st        *styles          // palette-resolved styles; nil = default palette
+	// now is the clock the live Age counter renders against, advanced by the
+	// 1s clockTickMsg. Zero falls back to time.Now() (see renderNow), so tests
+	// can pin it for deterministic snapshots.
+	now time.Time
+}
+
+// renderNow returns the clock the Agents tab renders Age against: the
+// clock-tick time, or the wall clock when unset (fresh model / tests that
+// don't drive the tick).
+func (m Model) renderNow() time.Time {
+	if m.now.IsZero() {
+		return time.Now()
+	}
+	return m.now
 }
 
 // matchesQuery reports whether any of the row's visible column values
@@ -227,11 +246,16 @@ func New(ctx context.Context, app *frontend.App) Model {
 
 // Init starts the refresh loop.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refresh(), tick())
+	return tea.Batch(m.refresh(), tick(), clockTick())
 }
 
 func tick() tea.Cmd {
 	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+// clockTick drives the 1s Age repaint; it carries no data query.
+func clockTick() tea.Cmd {
+	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg { return clockTickMsg(t) })
 }
 
 func (m Model) refresh() tea.Cmd {
@@ -405,6 +429,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.refresh()
 	case tickMsg:
 		return m, tea.Batch(m.refresh(), tick())
+	case clockTickMsg:
+		// Repaint only: advance the Age clock, never re-query the store.
+		m.now = time.Time(msg)
+		return m, clockTick()
 	case sigDetailMsg:
 		if msg.err != nil {
 			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
@@ -1127,6 +1155,9 @@ func (m Model) listPageSize() int {
 	if m.tab == tabSignatures && m.sigMode != "" {
 		chrome++
 	}
+	if m.tab == tabAgents {
+		chrome++ // the Agents tab renders a column header row
+	}
 	if m.prompt != nil {
 		chrome += 2
 	}
@@ -1306,6 +1337,15 @@ func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 	if !a.At.IsZero() {
 		lines = m.detailField(lines, w, "Last transition", a.At.Format(time.RFC3339))
 	}
+	// Lifetime stats (auto-answered, escalated, operator confirmed/corrected)
+	// and the live age since first seen. Rendered as strings so zero counts
+	// still show (detailField skips empty values).
+	s := m.data.status.StatsFor(a.AgentID)
+	lines = m.detailField(lines, w, "Auto-sends", strconv.Itoa(s.AutoSends))
+	lines = m.detailField(lines, w, "Escalations", strconv.Itoa(s.Escalations))
+	lines = m.detailField(lines, w, "Operator confirmed", strconv.Itoa(s.Confirmed))
+	lines = m.detailField(lines, w, "Operator corrected", strconv.Itoa(s.Corrections))
+	lines = m.detailField(lines, w, "Age", formatAge(s.FirstSeen, m.renderNow()))
 	return lines
 }
 
@@ -1898,6 +1938,11 @@ func (m Model) renderDetail(b *strings.Builder) {
 	fmt.Fprintf(b, "\n%s", st.help.Render(m.helpLine()))
 }
 
+// agentsRowFmt lays out the Agents list: name, id, type, status (all fixed
+// width so the trailing numeric columns line up), then the four lifetime
+// counters right-aligned and the live age last.
+const agentsRowFmt = "%-18s %-12s %-12s %-10s %5s %5s %5s %5s  %s"
+
 func (m Model) renderAgents(b *strings.Builder) {
 	agents := m.visibleAgents()
 	if len(agents) == 0 {
@@ -1908,17 +1953,40 @@ func (m Model) renderAgents(b *strings.Builder) {
 		}
 		return
 	}
+	header := fmt.Sprintf(agentsRowFmt,
+		"NAME", "ID", "TYPE", "STATUS", "AUTO", "ESC", "CONF", "CORR", "AGE")
+	fmt.Fprintln(b, m.styles().section.Render(header))
+	now := m.renderNow()
 	start, end := m.window(len(agents))
 	for i := start; i < end; i++ {
 		a := agents[i]
 		name := orDash(m.data.status.AgentName(a.AgentID))
-		line := fmt.Sprintf("%-18s %-12s %-12s %s", name, a.AgentID, a.AgentType, a.Status)
+		s := m.data.status.StatsFor(a.AgentID)
+		line := fmt.Sprintf(agentsRowFmt,
+			name, a.AgentID, a.AgentType, a.Status,
+			strconv.Itoa(s.AutoSends), strconv.Itoa(s.Escalations),
+			strconv.Itoa(s.Confirmed), strconv.Itoa(s.Corrections),
+			formatAge(s.FirstSeen, now))
 		if i == m.cursor {
 			line = m.styles().selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
 	m.renderMoreRows(b, len(agents)-end)
+}
+
+// formatAge renders the elapsed time since firstSeen as HH:MM:SS (hours may
+// exceed 24). It returns "-" when firstSeen is zero (first-seen unknown).
+func formatAge(firstSeen, now time.Time) string {
+	if firstSeen.IsZero() {
+		return "-"
+	}
+	d := now.Sub(firstSeen)
+	if d < 0 {
+		d = 0
+	}
+	total := int(d.Seconds())
+	return fmt.Sprintf("%02d:%02d:%02d", total/3600, (total%3600)/60, total%60)
 }
 
 // ruleFor resolves the learned rule an audit/escalation row is keyed to

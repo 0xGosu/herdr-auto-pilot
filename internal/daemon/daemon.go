@@ -768,7 +768,7 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 		d.audit(ctx, domain.AuditRecord{
 			AgentID: tr.AgentID, AgentType: tr.AgentType, Trigger: trigger(tr),
 			SituationType: domain.SituationUnclassifiable,
-			Action:        "escalated",
+			Action:        domain.AuditActionEscalated,
 			// Bracketed like every escalate()-built rationale, so the one
 			// path that bypasses escalate() renders identically.
 			Rationale: "[" + string(domain.ReasonHerdrUnreachable) + "]",
@@ -1089,7 +1089,7 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
-		SituationType: s.Type, Action: "auto:" + del.input, Input: del.input,
+		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + del.input, Input: del.input,
 		Confidence: dec.Confidence, Rationale: del.rationale, LLMOutput: del.llmOutput,
 		Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})
@@ -1225,7 +1225,7 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	}
 	rec := domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
-		SituationType: s.Type, Action: "escalated", Confidence: dec.Confidence,
+		SituationType: s.Type, Action: domain.AuditActionEscalated, Confidence: dec.Confidence,
 		LLMConfidence: dec.LLMConfidence,
 		Rationale:     rationale,
 		Status:        "escalated", Suggestion: dec.Suggestion,
@@ -2237,7 +2237,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// Promote: audit-before-act guard applies here too (FR-024).
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
-		SituationType: s.Type, Action: "auto:" + llmDec.Action, Input: llmDec.Action,
+		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + llmDec.Action, Input: llmDec.Action,
 		Confidence: computedConf, LLMConfidence: &llmConf,
 		Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
 		Status: "auto", PaneExcerpt: truncateRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
@@ -2456,7 +2456,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	// correction to something else?
 	suggested := suggestionAction(audit)
 	isConfirmation := suggested != "" && c.CorrectedAction == suggested
-	wasAutonomous := audit.Status == "auto" || strings.HasPrefix(audit.Action, "auto:")
+	wasAutonomous := audit.Status == "auto" || strings.HasPrefix(audit.Action, domain.AuditActionAutoPrefix)
 
 	// Record the operator's decision (corrections count in the recency
 	// window; FR-007).
@@ -2503,9 +2503,9 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	// Correction lineage in the audit trail (DR-005).
 	d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: audit.AgentID, AgentType: state.AgentType, Signature: audit.Signature,
-		Trigger:       "operator-correction",
+		Trigger:       domain.TriggerOperatorCorrection,
 		SituationType: audit.SituationType, Action: "corrected:" + c.CorrectedAction,
-		Input: c.CorrectedAction, Rationale: "operator " + map[bool]string{true: "confirmed", false: "corrected"}[isConfirmation],
+		Input: c.CorrectedAction, Rationale: map[bool]string{true: domain.RationaleOperatorConfirmed, false: domain.RationaleOperatorCorrected}[isConfirmation],
 		CorrectsAuditID: c.AuditID, Status: "resolved", CreatedAt: now,
 	})
 	return d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")

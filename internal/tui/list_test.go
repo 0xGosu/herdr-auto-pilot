@@ -416,6 +416,70 @@ func TestSearchEscEmptyQueryLeavesNoFilter(t *testing.T) {
 	}
 }
 
+func TestAgentsListRendersStatColumns(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	firstSeen := now.Add(-90 * time.Minute) // Age → 01:30:00
+	m := Model{width: 120, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.status.AgentNames = map[string]string{"w1:p1": "alpha"}
+	msg.status.MonitoredAgents = []domain.AgentTransition{
+		{AgentID: "w1:p1", AgentType: "claude", PaneID: "w1:p1", Status: "running"},
+	}
+	msg.status.AgentStats = map[string]domain.AgentStats{
+		"w1:p1": {AutoSends: 12, Escalations: 5, Confirmed: 3, Corrections: 2, FirstSeen: firstSeen},
+	}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+	m.tab = tabAgents
+	m.now = now // pin the Age clock
+
+	view := m.View()
+	// Header labels for all five new columns.
+	for _, want := range []string{"NAME", "STATUS", "AUTO", "ESC", "CONF", "CORR", "AGE"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("agents list missing header %q:\n%s", want, view)
+		}
+	}
+	// The agent's row carries its counts and the live age.
+	var row string
+	for _, ln := range strings.Split(view, "\n") {
+		if strings.Contains(ln, "alpha") {
+			row = ln
+			break
+		}
+	}
+	if row == "" {
+		t.Fatalf("agent row not rendered:\n%s", view)
+	}
+	for _, want := range []string{"12", "5", "3", "2", "01:30:00"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("agent row missing %q: %q", want, row)
+		}
+	}
+}
+
+func TestFormatAge(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name  string
+		first time.Time
+		want  string
+	}{
+		{"zero first-seen", time.Time{}, "-"},
+		{"just now", now, "00:00:00"},
+		{"under an hour", now.Add(-45 * time.Minute), "00:45:00"},
+		{"over a day", now.Add(-25*time.Hour - time.Minute - 5*time.Second), "25:01:05"},
+		{"future clamps to zero", now.Add(time.Hour), "00:00:00"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatAge(tc.first, now); got != tc.want {
+				t.Errorf("formatAge(%v, %v) = %q, want %q", tc.first, now, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSearchEmptyStateMessages(t *testing.T) {
 	cases := []struct {
 		tab  tab
