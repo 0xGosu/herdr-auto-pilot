@@ -458,6 +458,44 @@ func TestAgentsListRendersStatColumns(t *testing.T) {
 	}
 }
 
+func TestAgentDetailAgeTicksWithClock(t *testing.T) {
+	open := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	firstSeen := open.Add(-30 * time.Second) // Age at open → 00:00:30
+	m := Model{width: 100, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.status.AgentNames = map[string]string{"w1:p1": "alpha"}
+	msg.status.MonitoredAgents = []domain.AgentTransition{
+		{AgentID: "w1:p1", AgentType: "claude", PaneID: "w1:p1", Status: "running"},
+	}
+	msg.status.AgentStats = map[string]domain.AgentStats{
+		"w1:p1": {FirstSeen: firstSeen},
+	}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+	m.tab = tabAgents
+	m.cursor = 0
+	m.now = open
+
+	m = press(t, m, "v")
+	if m.detail == nil {
+		t.Fatal("v on the Agents tab should open the detail view")
+	}
+	if !strings.Contains(m.View(), "00:00:30") {
+		t.Fatalf("detail Age at open should be 00:00:30:\n%s", m.View())
+	}
+
+	// A clock tick must advance the detail's live Age (it previously froze:
+	// the build closure captured the open-time clock — PR #105 review).
+	upd, _ = m.Update(clockTickMsg(open.Add(5 * time.Second)))
+	m = upd.(Model)
+	if !strings.Contains(m.View(), "00:00:35") {
+		t.Fatalf("detail Age should advance to 00:00:35 after a clock tick:\n%s", m.View())
+	}
+	if strings.Contains(m.View(), "00:00:30") {
+		t.Errorf("stale Age 00:00:30 must not remain after the tick:\n%s", m.View())
+	}
+}
+
 func TestFormatAge(t *testing.T) {
 	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
 	cases := []struct {

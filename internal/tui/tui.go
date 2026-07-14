@@ -112,6 +112,11 @@ type detailView struct {
 	// cursor. escRetryable snapshots whether "l: retry LLM" is offered.
 	confirmID    int64
 	escRetryable bool
+	// agent snapshots the agent an agents-tab detail was opened for, so the
+	// clock tick can rebuild its lines against the current clock (the live Age
+	// would otherwise freeze at open time — the build closure captures m by
+	// value). nil for non-agent details.
+	agent *domain.AgentTransition
 }
 
 // ruleItem is one navigable row of the Config tab. "indicator" and
@@ -432,6 +437,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case clockTickMsg:
 		// Repaint only: advance the Age clock, never re-query the store.
 		m.now = time.Time(msg)
+		// An open agent detail caches its lines behind a build closure that
+		// captured the open-time clock; rebuild it against the new clock so
+		// its live Age advances too (the list Age already recomputes on paint).
+		if m.detail != nil && m.detail.agent != nil {
+			a := *m.detail.agent
+			build := func(width int, _ bool) []string { return m.agentDetailLines(a, width) }
+			m.detail.build = build
+			m.detail.lines = build(m.wrapWidth(), m.detail.previewExpanded)
+		}
 		return m, clockTick()
 	case sigDetailMsg:
 		if msg.err != nil {
@@ -1072,6 +1086,7 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 				title: fmt.Sprintf("Agent %s", a.AgentID),
 				lines: build(m.wrapWidth(), false),
 				build: build,
+				agent: &a,
 			}
 		}
 	case tabEscalations, tabAudit:
