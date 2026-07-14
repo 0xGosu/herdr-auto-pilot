@@ -10,6 +10,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
 
 // Multi-tab MCQ forms (Claude AskUserQuestion / plan-mode) show ONE question
@@ -353,6 +354,10 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 			}
 			slog.Info("multi-tab answer series delivered",
 				"agent", s.AgentID, "tabs", s.TabCount, "confidence", dec.Confidence, "audit_id", auditID)
+			d.scheduleUnblockCheck(verifyunblock.Params{
+				PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
+				Signature: sig.Signature, Input: dec.Input, Excerpt: s.Content, SituationType: s.Type,
+			})
 			return nil
 		})
 	}()
@@ -401,6 +406,10 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 			d.lastAutoSend[s.AgentID] = now
 			d.mu.Unlock()
 			slog.Info("LLM answer series promoted and delivered", "agent", s.AgentID, "tabs", s.TabCount)
+			d.scheduleUnblockCheck(verifyunblock.Params{
+				PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
+				Signature: sigKey, Input: llmDec.Action, Excerpt: s.Content, SituationType: s.Type,
+			})
 			return nil
 		})
 	}()

@@ -72,6 +72,15 @@ type actionResultMsg struct {
 	err     error
 }
 
+// openSendPromptMsg re-opens a second prompt after a LIVE escalation's
+// correction text is captured, asking whether to also deliver it to the
+// (blocked) agent. Chaining goes through a message because a prompt's onSubmit
+// returns a tea.Cmd and cannot mutate the model directly.
+type openSendPromptMsg struct {
+	id     int64
+	action string
+}
+
 // statusNote is a durable action outcome shown in the status area until
 // the next outcome replaces it (CR-025) — unlike the transient m.message
 // hint line, navigation never clears it.
@@ -403,6 +412,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The status area shrinks the page by 2 — keep the cursor visible.
 		m.clampListViewport()
 		return m, m.refresh()
+	case openSendPromptMsg:
+		return m.openSendPrompt(msg.id, msg.action)
 	case tickMsg:
 		return m, tea.Batch(m.refresh(), tick())
 	case sigDetailMsg:
@@ -469,10 +480,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.detail = nil
 		case "c":
 			// Per-entry actions mirror the list, acting on the snapshotted
-			// escalation id (confirmID), never the live cursor.
+			// escalation id (confirmID), never the live cursor. A non-zero
+			// confirmID is only set for pending escalations, so this is a live
+			// correction (offers the "also send?" step).
 			if id := m.detail.confirmID; id != 0 {
 				m.detail = nil
-				return m.correctByID(id)
+				return m.correctByID(id, true)
 			}
 		case "x", "delete":
 			if id := m.detail.confirmID; id != 0 {
@@ -785,23 +798,58 @@ func (m Model) correctSelected() (tea.Model, tea.Cmd) {
 	if rec == nil {
 		return m, nil
 	}
-	return m.correctByID(rec.ID)
+	return m.correctByID(rec.ID, rec.Status == "escalated")
 }
 
 // correctByID opens the correction prompt for a specific audit id — used by
 // the list and by the detail overlay (which corrects its snapshotted record,
-// not the live cursor).
-func (m Model) correctByID(id int64) (tea.Model, tea.Cmd) {
+// not the live cursor). live reports whether the record is a pending
+// escalation (agent waiting): for those, capturing the action chains a second
+// "also send?" prompt so the corrected reply can be delivered; for a
+// historical record (e.g. correcting a past auto decision) the correction is
+// recorded only, never sent.
+func (m Model) correctByID(id int64, live bool) (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.message = ""
 	m.prompt = &prompt{
 		label: fmt.Sprintf("correct #%d — action to record", id),
 		onSubmit: func(input string) tea.Cmd {
+			if live {
+				// Defer recording to the send prompt so exactly one correction
+				// is written with the chosen send flag.
+				return func() tea.Msg { return openSendPromptMsg{id: id, action: input} }
+			}
 			return func() tea.Msg {
 				if err := app.Resolve(ctx, id, input, false); err != nil {
 					return actionResultMsg{err: err}
 				}
 				return actionResultMsg{message: fmt.Sprintf("correction recorded for #%d", id)}
+			}
+		},
+	}
+	return m, nil
+}
+
+// openSendPrompt is the second step of correcting a live escalation: it asks
+// whether to deliver the corrected action to the blocked agent, then records
+// the correction once with the chosen send flag. It defaults to "n" (record
+// only) so a bare Enter never sends unintentionally.
+func (m Model) openSendPrompt(id int64, action string) (tea.Model, tea.Cmd) {
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	m.prompt = &prompt{
+		label: fmt.Sprintf("send corrected action to the agent now? [y/N] (#%d)", id),
+		input: "n",
+		onSubmit: func(input string) tea.Cmd {
+			send := strings.HasPrefix(strings.ToLower(strings.TrimSpace(input)), "y")
+			return func() tea.Msg {
+				if err := app.Resolve(ctx, id, action, send); err != nil {
+					return actionResultMsg{err: err}
+				}
+				if send {
+					return actionResultMsg{message: fmt.Sprintf("correction recorded and sent for #%d", id)}
+				}
+				return actionResultMsg{message: fmt.Sprintf("correction recorded for #%d (not sent)", id)}
 			}
 		},
 	}
@@ -1804,7 +1852,7 @@ func (m Model) helpLine() string {
 			if m.detail.escRetryable {
 				retry = "  l: retry LLM"
 			}
-			return "enter: confirm+send  c: correct  x: delete" + retry +
+			return "enter: confirm+send  c: correct (+send?)  x: delete" + retry +
 				preview + "  ↑/↓: scroll  tab: switch tab  " + closeKeys
 		}
 		return "↑/↓: scroll  tab: switch tab" + preview + "  " + closeKeys
@@ -1820,7 +1868,7 @@ func (m Model) helpLine() string {
 	case tabAgents:
 		return "v: details  n: rename agent  /: search  " + common
 	case tabEscalations:
-		return "enter/y: confirm+send  c: correct  l: retry LLM  space: mark  x: delete  X: prune old  v: details  /: search  " + common
+		return "enter/y: confirm+send  c: correct (+send?)  l: retry LLM  space: mark  x: delete  X: prune old  v: details  /: search  " + common
 	case tabAudit:
 		return "c: correct decision  v: details  /: search  " + common
 	case tabSignatures:

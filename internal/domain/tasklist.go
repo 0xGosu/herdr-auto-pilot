@@ -151,12 +151,22 @@ func InferNextTask(agentType, transcript string) InferredTask {
 	return infer(transcript)
 }
 
+// claudeWS is the whitespace class used across the Claude todo-widget
+// patterns. Go's regexp (RE2) makes \s ASCII-only ([\t\n\f\r ]), but Claude
+// pads the widget's first row — the ⎿ connector line — with a NON-BREAKING
+// SPACE (U+00A0) between the connector and the status marker. Matching NBSP
+// as whitespace everywhere the widget can inject padding keeps that first
+// item (often the in-progress one) from being dropped, which would make the
+// idle resolver infer the second item as the next task.
+const claudeWS = `[\s\x{00A0}]`
+
 // claudeTodoItemRE matches one line of Claude Code's todo-widget rendering:
 // optional indent, an optional ⎿/└ connector, a status marker rune, then
 // the task text. Marker runes vary across Claude Code versions/fonts —
 // verified against real TUI copies in test/samples/claude_todo_sample*.txt:
-// completed ✔ ✓ ☒, in-progress ■ ▪ ◼ ◾, pending □ ▫ ☐ ◻ ◽.
-var claudeTodoItemRE = regexp.MustCompile(`^\s*(?:[⎿└]\s*)?([✔✓☒■▪◼◾□▫☐◻◽])\s+(\S.*)$`)
+// completed ✔ ✓ ☒, in-progress ■ ▪ ◼ ◾, pending □ ▫ ☐ ◻ ◽. Whitespace slots
+// use claudeWS so the NBSP-padded connector row still parses.
+var claudeTodoItemRE = regexp.MustCompile(`^` + claudeWS + `*(?:[⎿└]` + claudeWS + `*)?([✔✓☒■▪◼◾□▫☐◻◽])` + claudeWS + `+(\S.*)$`)
 
 // claudeTodoHeaderRE matches the widget's header/status line — a spinner
 // glyph (frames vary: · * ✽ ✻ ✶ ✳ ✢, or the ● message bullet), a space,
@@ -165,7 +175,7 @@ var claudeTodoItemRE = regexp.MustCompile(`^\s*(?:[⎿└]\s*)?([✔✓☒■▪
 // the current block so back-to-back renders with no blank line between
 // them never concatenate; requiring the ellipsis keeps an item's wrapped
 // continuation line from ever matching.
-var claudeTodoHeaderRE = regexp.MustCompile(`^\s*[·✻✽✶✳✢*●]\s.*…`)
+var claudeTodoHeaderRE = regexp.MustCompile(`^` + claudeWS + `*[·✻✽✶✳✢*●]` + claudeWS + `.*…`)
 
 // inferClaudeNextTask parses Claude Code's native todo widget, e.g. (a
 // real TUI copy; the header spinner varies — · * ✽ ✻ — and a footer like

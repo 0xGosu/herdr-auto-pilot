@@ -463,15 +463,21 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	if action == domain.SuggestGenerateTask {
 		return a.acceptGeneratedTask(ctx, audit, send)
 	}
+	// willSend mirrors the delivery gate below: it records on the correction
+	// whether this action is actually delivered to the agent, so the daemon
+	// (which owns audit writes) can arm the post-action unblock self-check for
+	// operator sends — a record-only correction leaves the agent expectedly
+	// blocked and must NOT trip the check.
+	willSend := send && action != domain.ActionNoop && a.Herdr != nil && audit.AgentID != ""
 	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
-		AuditID: auditID, CorrectedAction: action, Author: a.Author, CreatedAt: time.Now(),
+		AuditID: auditID, CorrectedAction: action, Author: a.Author, Sent: willSend, CreatedAt: time.Now(),
 	}); err != nil {
 		return err
 	}
 	// A confirmed/resolved noop records the correction — the learning event
 	// — but never writes the sentinel into the pane: "do nothing" means
 	// exactly that.
-	if send && action != domain.ActionNoop && a.Herdr != nil && audit.AgentID != "" {
+	if willSend {
 		outbound := materializeForSend(action, audit)
 		// A numbered menu (Claude approvals/choices) only accepts the
 		// option's digit, not the label. Re-read the pane's CURRENT screen
@@ -850,6 +856,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
+	{Key: "limits.verify_unblock_ms", TUIEditable: true},
 	{Key: "safety.disable_seed", TUIEditable: true},
 	{Key: "llm.command"},       // argv template
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
@@ -923,6 +930,11 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.Limits.MaxAutoPromptsPerMinute)
 	case "limits.max_error_retries":
 		return strconv.Itoa(cfg.Limits.MaxErrorRetries)
+	case "limits.verify_unblock_ms":
+		if cfg.Limits.VerifyUnblockMs <= 0 {
+			return "0 (disabled)"
+		}
+		return strconv.Itoa(cfg.Limits.VerifyUnblockMs)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -1036,6 +1048,15 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 		*dst = v
 		return nil
 	}
+	// setNonNegInt allows 0 (used by fields where 0 is a meaningful "disable").
+	setNonNegInt := func(dst *int) error {
+		v, err := strconv.Atoi(value)
+		if err != nil || v < 0 {
+			return fmt.Errorf("%s must be a non-negative integer, got %q", key, value)
+		}
+		*dst = v
+		return nil
+	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		switch key {
 		case "thresholds.idle":
@@ -1058,6 +1079,8 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setInt(&cfg.Limits.MaxAutoPromptsPerMinute)
 		case "limits.max_error_retries":
 			return setInt(&cfg.Limits.MaxErrorRetries)
+		case "limits.verify_unblock_ms":
+			return setNonNegInt(&cfg.Limits.VerifyUnblockMs)
 		case "llm.timeout_seconds":
 			return setInt(&cfg.LLM.TimeoutSeconds)
 		case "llm.auto_act_confidence_threshold":

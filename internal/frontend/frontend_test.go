@@ -325,6 +325,71 @@ func (f *fakeHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error
 	return f.agents, nil
 }
 
+// TestResolveMarksSentOnDelivery: a delivered correction is recorded with
+// Sent=true so the daemon arms the post-action unblock self-check.
+func TestResolveMarksSentOnDelivery(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeHerdr{pane: "Do you want to proceed?\n❯ 1. Yes\n  2. No\n"}
+	app.Herdr = fake
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+	if err := app.Resolve(ctx, id, "Yes", true); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || !corr[0].Sent {
+		t.Errorf("delivered correction should be Sent=true: %+v", corr)
+	}
+	if len(fake.inputs) != 1 {
+		t.Errorf("expected one delivery, got %v", fake.inputs)
+	}
+}
+
+// TestResolveRecordOnlyNotSent: a record-only correction (no --send) leaves
+// Sent=false so the daemon does NOT run the self-check on an expectedly-blocked
+// agent.
+func TestResolveRecordOnlyNotSent(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+	if err := app.Resolve(ctx, id, "n", false); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].Sent {
+		t.Errorf("record-only correction should be Sent=false: %+v", corr)
+	}
+}
+
+// TestResolveNoopNeverSent: a @noop resolution sends nothing and is Sent=false
+// even with --send.
+func TestResolveNoopNeverSent(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "respond: y", CreatedAt: time.Now(),
+	})
+	if err := app.Resolve(ctx, id, "@noop", true); err != nil {
+		t.Fatal(err)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].Sent {
+		t.Errorf("@noop correction must be Sent=false: %+v", corr)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("@noop must not deliver anything, got %v", fake.inputs)
+	}
+}
+
 func TestConfirmSendsRenderedDeclaredTaskPrompt(t *testing.T) {
 	// The confirm path must deliver the exact rendered prompt carried in the
 	// "send next declared task: " suggestion (the SuggestedAction /
@@ -913,6 +978,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"limits.max_consecutive_auto_prompts": "5",
 		"limits.max_auto_prompts_per_minute":  "10",
 		"limits.max_error_retries":            "2",
+		"limits.verify_unblock_ms":            "1000",
 		"safety.disable_seed":                 "true",
 		"llm.command":                         `claude -p "decide"`,
 		"llm.command_start":                   `claude -p "first: decide"`,

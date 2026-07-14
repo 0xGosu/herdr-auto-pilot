@@ -26,6 +26,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/match"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
 
 // Options configures a Daemon.
@@ -1150,6 +1151,51 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 	slog.Info("automated action delivered",
 		"agent", s.AgentID, "situation", s.Type, "confidence", dec.Confidence,
 		"rationale", del.rationale, "audit_id", auditID)
+
+	d.scheduleUnblockCheck(verifyunblock.Params{
+		PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
+		Signature: sig.Signature, Input: del.input, Excerpt: s.Content, SituationType: s.Type,
+	})
+}
+
+// scheduleUnblockCheck arms the post-action self-check: after the configured
+// delay (limits.verify_unblock_ms) it re-queries the agent's status and, if the
+// agent is STILL blocked, appends a delivery_failed audit row and notifies the
+// operator. It is a no-op when the check is disabled (delay <= 0) or the
+// situation type does not block an agent (idle). The check runs in its own
+// guarded goroutine via time.AfterFunc so it never stalls the monitor loop.
+func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
+	cfg, _, _ := d.snapshot()
+	delayMs := cfg.Limits.VerifyUnblockMs
+	if delayMs <= 0 || !verifyunblock.Relevant(p.SituationType) || p.PaneID == "" {
+		return
+	}
+	// Keep the diagnostic row's excerpt the same size as the normal audit rows.
+	p.Excerpt = truncateRunes(p.Excerpt, snapshotMaxRunes)
+	delay := time.Duration(delayMs) * time.Millisecond
+	time.AfterFunc(delay, func() {
+		_ = logging.Guard("verify-unblock", func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			blocked, _, err := verifyunblock.Check(ctx, d.opt.Herdr, d.opt.Store, p, d.opt.Clock.Now())
+			if err != nil {
+				slog.Warn("post-action unblock self-check failed", "agent", p.AgentID, "error", err)
+				return nil
+			}
+			if blocked {
+				// NOTE: this only checks status == blocked; it cannot tell the
+				// original prompt from a NEW one the agent raised after
+				// answering. A fast agent that answers and immediately blocks on
+				// a follow-up may trip a benign false positive (raise
+				// limits.verify_unblock_ms if that is noisy).
+				slog.Warn("agent still blocked after delivered action",
+					"agent", p.AgentID, "situation", p.SituationType, "input", p.Input)
+				d.notify(ctx, "Herd Auto Prompter: agent still blocked after action",
+					fmt.Sprintf("Agent %s is still blocked ~%dms after the delivered reply — it may not have landed (or the agent raised a new prompt). See hap audit.", p.AgentID, delayMs))
+			}
+			return nil
+		})
+	})
 }
 
 // deliverNoop applies a graduated "do nothing" rule autonomously: audit-first
@@ -2290,6 +2336,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	d.lastAutoSend[s.AgentID] = now
 	d.mu.Unlock()
 	slog.Info("LLM decision promoted and delivered", "agent", s.AgentID, "action", llmDec.Action)
+
+	d.scheduleUnblockCheck(verifyunblock.Params{
+		PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
+		Signature: res.sig.Signature, Input: llmDec.Action, Excerpt: s.Content, SituationType: s.Type,
+	})
 }
 
 // processCorrections consumes front-end-written correction records and
@@ -2303,7 +2354,8 @@ func (d *Daemon) processCorrections(ctx context.Context) {
 		return
 	}
 	for _, c := range corrections {
-		if err := d.applyCorrection(ctx, cfg, c); err != nil {
+		arm, err := d.applyCorrection(ctx, cfg, c)
+		if err != nil {
 			slog.Error("applying correction failed", "correction", c.ID, "error", err)
 			continue
 		}
@@ -2312,6 +2364,11 @@ func (d *Daemon) processCorrections(ctx context.Context) {
 			// would double-record decisions and inflate confidence.
 			slog.Error("marking correction processed failed; aborting batch", "correction", c.ID, "error", err)
 			return
+		}
+		// Arm the post-action self-check only after the correction is committed,
+		// so a correction retried on a transient error never arms it twice.
+		if arm != nil {
+			d.scheduleUnblockCheck(*arm)
 		}
 	}
 }
@@ -2409,13 +2466,19 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) {
 	d.scheduleCapture(ctx, live)
 }
 
-func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domain.CorrectionRecord) error {
+// applyCorrection re-derives the affected signature's learning state from one
+// operator correction. When the correction was DELIVERED to the agent
+// (c.Sent), it returns the params to arm the post-action unblock self-check;
+// the caller arms it only after the correction is committed (see
+// processCorrections), so a correction retried on a transient error never arms
+// the check twice.
+func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domain.CorrectionRecord) (*verifyunblock.Params, error) {
 	audit, err := d.opt.Store.GetAudit(ctx, c.AuditID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if audit == nil {
-		return fmt.Errorf("correction %d references missing audit %d", c.ID, c.AuditID)
+		return nil, fmt.Errorf("correction %d references missing audit %d", c.ID, c.AuditID)
 	}
 	now := d.opt.Clock.Now()
 
@@ -2425,20 +2488,33 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		d.registerHumanInteraction(ctx, audit.AgentID)
 	}
 
+	// A delivered correction (c.Sent) arms the post-action self-check so a
+	// still-blocked agent surfaces a delivery_failed audit row, exactly as the
+	// daemon's own autonomous sends do. (AgentID is the pane id.) The params
+	// are returned rather than armed here so the caller arms once, after commit.
+	var arm *verifyunblock.Params
+	if c.Sent && audit.AgentID != "" {
+		arm = &verifyunblock.Params{
+			PaneID: audit.AgentID, AgentID: audit.AgentID, AgentType: audit.AgentType,
+			Signature: audit.Signature, Input: c.CorrectedAction, Excerpt: audit.PaneExcerpt,
+			SituationType: audit.SituationType,
+		}
+	}
+
 	if audit.Signature == "" {
 		// Nothing learnable (e.g. herdr-unreachable escalation).
-		return d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
+		return arm, d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
 	}
 
 	history, err := d.opt.Store.DecisionsForSignature(ctx, audit.Signature, 50)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	prior := domain.Confidence(history)
 
 	state, err := d.opt.Store.GetSignature(ctx, audit.Signature)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if state == nil {
 		state = &domain.SignatureState{
@@ -2465,7 +2541,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		AgentType: state.AgentType, ChosenAction: c.CorrectedAction,
 		Source: domain.SourceOperator, IsCorrection: !isConfirmation, CreatedAt: now,
 	}); err != nil {
-		return err
+		return nil, err
 	}
 
 	newState := *state
@@ -2483,7 +2559,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 
 	refreshed, err := d.opt.Store.DecisionsForSignature(ctx, audit.Signature, 50)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	conf := domain.Confidence(refreshed)
 	newState.CachedConfidence = conf.Score
@@ -2492,7 +2568,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		thresholds(cfg).ForType(audit.SituationType), cfg.Learning.GraduationN)
 
 	if err := d.opt.Store.UpsertSignature(ctx, newState); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Error corrections clear the retry counter (FR-014).
@@ -2508,7 +2584,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		Input: c.CorrectedAction, Rationale: "operator " + map[bool]string{true: "confirmed", false: "corrected"}[isConfirmation],
 		CorrectsAuditID: c.AuditID, Status: "resolved", CreatedAt: now,
 	})
-	return d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
+	return arm, d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
 }
 
 // expireStaleLLMWork marks dangling pending LLM decisions AND pending consult

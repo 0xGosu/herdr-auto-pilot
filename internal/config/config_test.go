@@ -41,6 +41,43 @@ func TestLoadPartialConfigFillsDefaults(t *testing.T) {
 	if cfg.Embedding.PaneSalientChars != 0 {
 		t.Errorf("unset pane_salient_chars should stay 0 (use-default), got %d", cfg.Embedding.PaneSalientChars)
 	}
+	// verify_unblock_ms is absent here → defaults to 1000.
+	if cfg.Limits.VerifyUnblockMs != Default().Limits.VerifyUnblockMs {
+		t.Errorf("unset verify_unblock_ms should default to %d, got %d",
+			Default().Limits.VerifyUnblockMs, cfg.Limits.VerifyUnblockMs)
+	}
+}
+
+// TestVerifyUnblockMsExplicitZeroDisables: an explicit 0 must survive Load
+// (fillZeroes must not restore the default), so operators can disable the
+// post-action self-check.
+func TestVerifyUnblockMsExplicitZeroDisables(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte("[limits]\nverify_unblock_ms = 0\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.VerifyUnblockMs != 0 {
+		t.Errorf("explicit verify_unblock_ms = 0 must stay 0 (disabled), got %d", cfg.Limits.VerifyUnblockMs)
+	}
+	// A sibling limit omitted in the same [limits] block still gets its default.
+	if cfg.Limits.MaxErrorRetries != Default().Limits.MaxErrorRetries {
+		t.Errorf("sibling default lost: %d", cfg.Limits.MaxErrorRetries)
+	}
+}
+
+// TestVerifyUnblockMsExplicitValueKept: a positive override round-trips.
+func TestVerifyUnblockMsExplicitValueKept(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte("[limits]\nverify_unblock_ms = 250\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.VerifyUnblockMs != 250 {
+		t.Errorf("verify_unblock_ms override lost, got %d", cfg.Limits.VerifyUnblockMs)
+	}
 }
 
 func TestPaneSalientCharsRoundTrip(t *testing.T) {
