@@ -226,10 +226,11 @@ type TUI struct {
 	// (rationale, suggestion, action) in the list views. 0 (the default)
 	// means use the full terminal width, so rows fill a wide monitor.
 	MaxContentWidth int `toml:"max_content_width"`
-	// MaxContentHeight caps the number of wrapped lines shown for captured
-	// pane previews in detail views. When a preview exceeds the cap, its
-	// trailing lines are retained because coding-agent prompts and results
-	// are normally at the bottom. 0 (the default) shows the full capture.
+	// MaxContentHeight caps the number of wrapped lines shown when captured
+	// pane previews are expanded in detail views. Collapsed previews use a
+	// short field-specific tail (normally 3 lines; Escalation Current Situation
+	// uses 10). When expanded content exceeds the cap, its trailing lines are
+	// retained. 0 (the default) shows the full capture.
 	MaxContentHeight int `toml:"max_content_height"`
 	// Theme selects a named TUI palette (see ValidThemes). Empty and
 	// unknown names resolve to "default" — the exact pre-theming look.

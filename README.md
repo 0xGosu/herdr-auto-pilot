@@ -244,9 +244,12 @@ The plugin never acts on a situation it hasn't learned from you.
    can't fire mid-search. Action outcomes (confirm, resolve, delete, …)
    stay pinned in a status area (`✓`/`✗` plus timestamp) until the next
    action, so the result of a multi-step operation isn't missed. Detail
-   views with captured pane content open at the bottom, where coding-agent
-   prompts and results appear; `tui.max_content_height` can cap each preview
-   while retaining its newest trailing lines (`0` keeps the full capture).
+   views always open at the top. Captured situations are collapsed to their
+   title plus a trailing preview (three lines normally; ten for Escalations'
+   Current Situation), and Audit's LLM output uses the same three-line
+   preview. Press `v` again to expand or collapse all previews. Expanded
+   content still retains its newest trailing lines when
+   `tui.max_content_height` caps it (`0` keeps the full content).
 3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
    *and* confidence above the per-situation threshold, that signature becomes
    autonomous: next time, the plugin acts on its own and logs it.
@@ -325,7 +328,7 @@ model_context_window = 0    # 0 = bundled-model default (512 tokens); input is
 # original look — so existing setups see no change.
 [tui]
 max_content_width = 0       # cap variable-width list columns; 0 = full width
-max_content_height = 0      # cap captured-pane preview lines; 0 = unlimited (keeps the tail)
+max_content_height = 0      # expanded long-field lines; 0 = unlimited (collapsed previews use short tails)
 theme = "high-contrast"
 
 # Optional per-role color overrides, layered on top of the theme; unset

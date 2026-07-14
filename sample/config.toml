@@ -178,7 +178,7 @@ model_context_window = 0
 # ── TUI ─────────────────────────────────────────────────────────────
 [tui]
 max_content_width = 0      # cap on variable-length list columns; 0 = full terminal width
-max_content_height = 0     # captured-pane preview lines; 0 = unlimited; truncation keeps the bottom
+max_content_height = 0     # expanded long-field lines; 0 = unlimited; collapsed uses short tails
 theme = ""                 # named palette: default | dark | light | high-contrast;
                            # empty/unknown = default (the original look)
 

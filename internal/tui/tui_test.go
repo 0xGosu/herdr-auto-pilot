@@ -288,66 +288,127 @@ func TestDetailViewRewrapsOnResize(t *testing.T) {
 
 func TestCapturedPanePreviewKeepsTail(t *testing.T) {
 	m := testModel(t)
-	m.data.cfg.TUI.MaxContentHeight = 3
+	m.data.cfg.TUI.MaxContentHeight = 4
 	rec := domain.AuditRecord{
 		Signature:   "choice:test",
+		LLMOutput:   "llm-top\nllm-middle\nllm-tail-1\nllm-tail-2\nllm-tail-3",
 		PaneExcerpt: "pane-top\npane-middle\npane-tail-1\npane-tail-2\npane-tail-3",
 	}
 	snapshot := "original-top\noriginal-middle\noriginal-tail-1\noriginal-tail-2\noriginal-tail-3"
-	lines := m.auditDetailLines(rec, snapshot, 80)
+	collapsedOpts := auditDetailOptions{collapseLLMOutput: true, currentSituationLines: 3}
+	lines := m.auditDetailLines(rec, snapshot, 80, collapsedOpts)
 	got := strings.Join(lines, "\n")
 	for _, want := range []string{
-		"Current situation (last 3 of 5 lines", "pane-tail-1", "pane-tail-2", "pane-tail-3",
-		"Original situation (last 3 of 5 lines", "original-tail-1", "original-tail-2", "original-tail-3",
+		"LLM output (preview: last 3 of 5 lines", "llm-tail-1", "llm-tail-2", "llm-tail-3",
+		"Current situation (preview: last 3 of 5 lines", "pane-tail-1", "pane-tail-2", "pane-tail-3",
+		"Original situation (preview: last 3 of 5 lines", "original-tail-1", "original-tail-2", "original-tail-3",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("tail-limited preview missing %q:\n%s", want, got)
+			t.Errorf("collapsed preview missing %q:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "pane-top") || strings.Contains(got, "pane-middle") ||
+	if strings.Contains(got, "llm-top") || strings.Contains(got, "llm-middle") ||
+		strings.Contains(got, "pane-top") || strings.Contains(got, "pane-middle") ||
 		strings.Contains(got, "original-top") || strings.Contains(got, "original-middle") {
-		t.Errorf("tail-limited preview retained old top lines:\n%s", got)
+		t.Errorf("collapsed preview retained old top lines:\n%s", got)
 	}
 	rule := frontend.SignatureRow{PaneExcerpt: snapshot}
-	ruleLines := strings.Join(m.signatureDetailLines(rule, nil, 5, 80), "\n")
+	ruleLines := strings.Join(m.signatureDetailLines(rule, nil, 5, 80, false), "\n")
 	if !strings.Contains(ruleLines, "original-tail-3") || strings.Contains(ruleLines, "original-top") {
-		t.Errorf("Rules detail must apply the same tail preview behavior:\n%s", ruleLines)
+		t.Errorf("Rules detail must apply the same collapsed-tail behavior:\n%s", ruleLines)
 	}
 
-	// Zero is genuinely unlimited: no captured lines are discarded.
+	// Expanding reveals more context but still honors the configured cap and
+	// retains the bottom of the capture.
+	expandedOpts := collapsedOpts
+	expandedOpts.expanded = true
+	got = strings.Join(m.auditDetailLines(rec, snapshot, 80, expandedOpts), "\n")
+	if !strings.Contains(got, "pane-middle") || !strings.Contains(got, "pane-tail-3") ||
+		strings.Contains(got, "pane-top") || !strings.Contains(got, "llm-middle") ||
+		strings.Contains(got, "llm-top") {
+		t.Errorf("expanded preview should retain the capped four-line tail:\n%s", got)
+	}
+
+	// Zero is genuinely unlimited in expanded mode: no captured lines are discarded.
 	m.data.cfg.TUI.MaxContentHeight = 0
-	got = strings.Join(m.auditDetailLines(rec, snapshot, 80), "\n")
-	if !strings.Contains(got, "pane-top") || !strings.Contains(got, "pane-tail-3") {
+	got = strings.Join(m.auditDetailLines(rec, snapshot, 80, expandedOpts), "\n")
+	if !strings.Contains(got, "pane-top") || !strings.Contains(got, "pane-tail-3") ||
+		!strings.Contains(got, "llm-top") {
 		t.Errorf("unlimited preview should keep the entire capture:\n%s", got)
 	}
 }
 
-func TestCapturedPaneDetailOpensAtBottom(t *testing.T) {
+func TestEscalationCurrentSituationPreviewUsesTenLines(t *testing.T) {
+	m := testModel(t)
+	var pane strings.Builder
+	for i := 1; i <= 12; i++ {
+		fmt.Fprintf(&pane, "escalation-line-%02d\n", i)
+	}
+	rec := domain.AuditRecord{PaneExcerpt: strings.TrimRight(pane.String(), "\n")}
+	got := strings.Join(m.auditDetailLines(rec, "", 80, auditDetailOptions{
+		currentSituationLines: 10,
+	}), "\n")
+	if !strings.Contains(got, "Current situation (preview: last 10 of 12 lines") ||
+		!strings.Contains(got, "escalation-line-03") || !strings.Contains(got, "escalation-line-12") ||
+		strings.Contains(got, "escalation-line-02") {
+		t.Errorf("Escalation Current situation should show its last ten lines:\n%s", got)
+	}
+
+	// Pin the tab-specific wiring, not just the shared renderer option.
+	m.tab = tabEscalations
+	m.data.escalations[0].PaneExcerpt = rec.PaneExcerpt
+	m = press(t, m, "v")
+	detail := strings.Join(m.detail.lines, "\n")
+	if !strings.Contains(detail, "last 10 of 12 lines") || strings.Contains(detail, "escalation-line-02") {
+		t.Errorf("Escalations detail did not select the ten-line Current situation preview:\n%s", detail)
+	}
+}
+
+func TestCapturedPaneDetailStartsAtTopAndTogglesPreview(t *testing.T) {
 	m := testModel(t)
 	m.height = 12
 	m.tab = tabAudit
+	m.data.cfg.TUI.MaxContentHeight = 5
 	var pane strings.Builder
 	for i := 1; i <= 20; i++ {
 		fmt.Fprintf(&pane, "capture-line-%02d\n", i)
 	}
 	m.data.audit[0].PaneExcerpt = strings.TrimRight(pane.String(), "\n")
+	m.data.audit[0].LLMOutput = strings.ReplaceAll(strings.TrimRight(pane.String(), "\n"), "capture-", "llm-")
 	m = press(t, m, "v")
-	if m.detail == nil || m.detail.offset == 0 {
-		t.Fatal("a captured-pane detail should initially be anchored to its bottom")
+	if m.detail == nil || m.detail.offset != 0 {
+		t.Fatal("a captured-pane detail must always open at the top")
 	}
-	view := m.View()
-	if !strings.Contains(view, "capture-line-20") {
-		t.Errorf("initial captured-pane view must show the newest bottom line:\n%s", view)
+	collapsed := strings.Join(m.detail.lines, "\n")
+	if !strings.Contains(collapsed, "capture-line-18") || !strings.Contains(collapsed, "capture-line-20") ||
+		strings.Contains(collapsed, "capture-line-17") || !strings.Contains(collapsed, "llm-line-18") ||
+		strings.Contains(collapsed, "llm-line-17") {
+		t.Errorf("initial detail should contain only the last three captured lines:\n%s", collapsed)
 	}
-	if strings.Contains(view, "capture-line-01") {
-		t.Errorf("small initial viewport unexpectedly shows the oldest pane line:\n%s", view)
-	}
-	if !strings.Contains(view, "earlier line") {
-		t.Errorf("bottom-anchored detail should advertise upward scrolling:\n%s", view)
+	if !strings.Contains(m.helpLine(), "v: expand previews") {
+		t.Errorf("collapsed detail help should advertise expansion: %s", m.helpLine())
 	}
 
-	// Rules details load asynchronously, but must land on their Original
-	// situation tail just like Escalation/Audit details.
+	m = press(t, m, "v")
+	if m.detail == nil || !m.detail.previewExpanded || m.detail.offset != 0 {
+		t.Fatal("v inside a captured detail should expand it and reset to the top")
+	}
+	expanded := strings.Join(m.detail.lines, "\n")
+	if !strings.Contains(expanded, "capture-line-16") || !strings.Contains(expanded, "capture-line-20") ||
+		strings.Contains(expanded, "capture-line-15") || !strings.Contains(expanded, "llm-line-16") ||
+		strings.Contains(expanded, "llm-line-15") {
+		t.Errorf("expanded detail should contain the configured five-line tail:\n%s", expanded)
+	}
+	if !strings.Contains(m.helpLine(), "v: collapse previews") {
+		t.Errorf("expanded detail help should advertise collapse: %s", m.helpLine())
+	}
+	m = press(t, m, "v")
+	if m.detail == nil || m.detail.previewExpanded || m.detail.offset != 0 {
+		t.Fatal("a second v should collapse the situations without closing the detail")
+	}
+
+	// Rules details load asynchronously but follow the same collapsed mode and
+	// top-start invariant.
 	ruleModel := testModel(t)
 	ruleModel.height = 12
 	upd, _ := ruleModel.Update(sigDetailMsg{row: frontend.SignatureRow{
@@ -355,9 +416,10 @@ func TestCapturedPaneDetailOpensAtBottom(t *testing.T) {
 		PaneExcerpt:    strings.ReplaceAll(pane.String(), "capture-", "rule-"),
 	}})
 	ruleModel = upd.(Model)
-	ruleView := ruleModel.View()
-	if !strings.Contains(ruleView, "rule-line-20") || strings.Contains(ruleView, "rule-line-01") {
-		t.Errorf("Rules detail must initially show the bottom of Original situation:\n%s", ruleView)
+	ruleLines := strings.Join(ruleModel.detail.lines, "\n")
+	if ruleModel.detail.offset != 0 || !strings.Contains(ruleLines, "rule-line-20") ||
+		strings.Contains(ruleLines, "rule-line-17") {
+		t.Errorf("Rules detail must start at top with a three-line Original situation preview:\n%s", ruleLines)
 	}
 }
 
