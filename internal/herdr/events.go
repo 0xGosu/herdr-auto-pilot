@@ -166,6 +166,13 @@ func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTr
 			if d.PaneID == "" {
 				return nil
 			}
+			// Some plugin/side-panel panes are announced with Herdr's
+			// placeholder agent values. A detection event has no meaningful
+			// status yet, so the empty status participates in the same two-field
+			// filter used for live agent-list rows.
+			if domain.IsPlaceholderAgent(d.Agent, d.AgentStatus) {
+				return nil
+			}
 			s.upsertPane(d.PaneID, d.WorkspaceID, d.TabID, d.Agent)
 			// Surface the discovery as a transition so the daemon can name
 			// the agent immediately — herdr replays agent_detected for
@@ -246,6 +253,9 @@ func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTrans
 		agentType := d.Agent
 		if agentType == "" {
 			agentType = s.agentLabel(d.PaneID)
+		}
+		if domain.IsPlaceholderAgent(agentType, d.AgentStatus) {
+			return nil
 		}
 		tabID := d.TabID
 		if tabID == "" {
@@ -433,7 +443,7 @@ func (s *Subscriber) listPanes(ctx context.Context) ([]string, error) {
 		if p.TabID != "" {
 			info.tabID = p.TabID
 		}
-		if p.Agent != "" {
+		if !domain.IsPlaceholderAgent(p.Agent, "") {
 			info.agentLabel = p.Agent
 		}
 		s.panes[p.PaneID] = info

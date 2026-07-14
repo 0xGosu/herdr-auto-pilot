@@ -297,7 +297,7 @@ func Default() Config {
 		Learning: Learning{GraduationN: 5},
 		Limits: Limits{
 			MaxConsecutiveAutoPrompts: 10,
-			MaxAutoPromptsPerMinute:   3,
+			MaxAutoPromptsPerMinute:   5,
 			MaxErrorRetries:           2,
 			VerifyUnblockMs:           1000,
 		},

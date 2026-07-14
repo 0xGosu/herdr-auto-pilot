@@ -76,12 +76,16 @@ func TestSuspectedIrreversibleRationaleNamesIndicator(t *testing.T) {
 }
 
 func TestRunawayGuardBlocksSixthConsecutive(t *testing.T) {
-	// FR-019 acceptance: a 6th consecutive auto-prompt is blocked.
+	// FR-019 acceptance: a 6th consecutive auto-prompt is blocked, but the
+	// proposed reply remains available for a human to confirm.
 	in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y", "y", "y")
 	in.Rate = AgentRate{ConsecutiveAuto: 5}
 	d := Decide(in)
 	if d.Action != ActionEscalate || d.Reason != ReasonRateLimited {
 		t.Fatalf("6th consecutive auto-prompt must be blocked, got %+v", d)
+	}
+	if d.Suggestion != "respond: y" {
+		t.Fatalf("rate-limited prompt must remain confirmable, suggestion = %q", d.Suggestion)
 	}
 }
 
@@ -94,6 +98,9 @@ func TestRunawayGuardBlocksEleventhInMinute(t *testing.T) {
 	d := Decide(in)
 	if d.Action != ActionEscalate || d.Reason != ReasonRateLimited {
 		t.Fatalf("11th auto-prompt in a minute must be blocked, got %+v", d)
+	}
+	if d.Suggestion != "respond: y" {
+		t.Fatalf("rate-limited prompt must remain confirmable, suggestion = %q", d.Suggestion)
 	}
 }
 

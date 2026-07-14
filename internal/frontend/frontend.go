@@ -198,7 +198,13 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 	st.PendingEscalations = int(pending)
 	if a.Herdr != nil {
 		if agents, err := a.Herdr.ListAgents(ctx); err == nil {
-			st.MonitoredAgents = agents
+			// Keep the view boundary defensive even if an alternate Herdr
+			// adapter does not normalize placeholder side-panel rows.
+			for _, agent := range agents {
+				if !domain.IsPlaceholderAgent(agent.AgentType, agent.Status) {
+					st.MonitoredAgents = append(st.MonitoredAgents, agent)
+				}
+			}
 		}
 		if loc, ok := a.Herdr.(ports.LocatorPort); ok {
 			if wss, err := loc.ListWorkspaces(ctx); err == nil {

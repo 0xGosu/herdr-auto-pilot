@@ -43,6 +43,60 @@ func TestSubscriberReceivesTransitions(t *testing.T) {
 	t.Fatal("no transition received (IR-001)")
 }
 
+func TestSubscriberIgnoresDoublePlaceholderAgents(t *testing.T) {
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.AddPane("w1:p1", "w1")
+
+	sub := NewSubscriber(srv.SocketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan domain.AgentTransition, 16)
+	go sub.Subscribe(ctx, out)
+
+	// Establish the status subscription with a real transition first.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.PushTransition("w1:p1", "w1", "claude", "working")
+		select {
+		case tr := <-out:
+			if tr.AgentType == "claude" && tr.Status == "working" {
+				goto established
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("status subscription was not established")
+
+established:
+	// Neither a placeholder status update nor a placeholder detection for a
+	// plugin side panel may reach the daemon.
+	srv.PushTransition("w1:p1", "w1", "undefined", "unknown")
+	srv.PushAgentDetected("w1:panel", "w1", "undefined")
+	select {
+	case tr := <-out:
+		t.Fatalf("placeholder agent transition leaked through: %+v", tr)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Only one unknown field is legitimate and must still flow.
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.PushTransition("w1:p1", "w1", "claude", "unknown")
+		select {
+		case tr := <-out:
+			if tr.AgentType == "claude" && tr.Status == "unknown" {
+				return
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("real agent with unknown status was incorrectly filtered")
+}
+
 func TestSubscriberDiscoversNewPanes(t *testing.T) {
 	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
 	if err != nil {
@@ -247,6 +301,30 @@ func TestSendSubmitsWithEnter(t *testing.T) {
 	if len(calls) != 2 || calls[0] != "agent send w1:p1 run the tests" ||
 		calls[1] != "pane send-keys w1:p1 enter" {
 		t.Errorf("send should write text then press enter, got %v", calls)
+	}
+}
+
+func TestListAgentsFiltersOnlyDoublePlaceholderRows(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	fake.SetAgentList(`{"id":"cli:agent:list","result":{"agents":[` +
+		`{"agent":"undefined","agent_status":"unknown","pane_id":"panel"},` +
+		`{"agent":"claude","agent_status":"unknown","pane_id":"real-unknown-status"},` +
+		`{"agent":"undefined","agent_status":"working","pane_id":"active-unknown-type"}` +
+		`],"type":"agent_list"}}`)
+
+	agents, err := cli.ListAgents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("visible agents = %+v, want two non-double-placeholder rows", agents)
+	}
+	if agents[0].PaneID != "real-unknown-status" || agents[1].PaneID != "active-unknown-type" {
+		t.Fatalf("wrong agents survived placeholder filtering: %+v", agents)
 	}
 }
 

@@ -1361,6 +1361,27 @@ func (f *fakeHerdrPort) ListAgents(ctx context.Context) ([]domain.AgentTransitio
 	return f.agents, nil
 }
 
+func TestStatusHidesOnlyDoublePlaceholderAgents(t *testing.T) {
+	app, _ := testApp(t)
+	app.Herdr = &fakeHerdrPort{agents: []domain.AgentTransition{
+		{AgentID: "panel", PaneID: "panel", AgentType: "undefined", Status: "unknown"},
+		{AgentID: "real-unknown-status", PaneID: "real-unknown-status", AgentType: "claude", Status: "unknown"},
+		{AgentID: "active-unknown-type", PaneID: "active-unknown-type", AgentType: "undefined", Status: "working"},
+	}}
+
+	status, err := app.GetStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.MonitoredAgents) != 2 {
+		t.Fatalf("TUI agents = %+v, want two non-double-placeholder rows", status.MonitoredAgents)
+	}
+	if status.MonitoredAgents[0].AgentID != "real-unknown-status" ||
+		status.MonitoredAgents[1].AgentID != "active-unknown-type" {
+		t.Fatalf("wrong agents remained visible: %+v", status.MonitoredAgents)
+	}
+}
+
 func TestRenameLiveButUnnamedAgent(t *testing.T) {
 	// Regression: the TUI/CLI list agents straight from Herdr, but the
 	// daemon only creates a name row when the agent first transitions. A

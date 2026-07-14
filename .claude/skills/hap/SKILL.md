@@ -296,7 +296,7 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `confidence_thresholds.inferred_task_bar` | 0.60 | higher bar for tasks inferred from pane history |
 | `learning.graduation_n` | 5 | consecutive confirmations needed to graduate |
 | `limits.max_consecutive_auto_prompts` | 10 | max consecutive auto-prompts per agent without human interaction |
-| `limits.max_auto_prompts_per_minute` | 3 | rate limit per agent (rolling 1-minute window) |
+| `limits.max_auto_prompts_per_minute` | 5 | rate limit per agent (rolling 1-minute window) |
 | `limits.max_error_retries` | 2 | max retries per error signature |
 | `safety.disable_seed` | false | disable the 38 built-in seed never-auto patterns |
 | `llm.timeout_seconds` | 60 | timeout for LLM fallback calls |
