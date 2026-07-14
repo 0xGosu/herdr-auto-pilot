@@ -416,6 +416,108 @@ func TestSearchEscEmptyQueryLeavesNoFilter(t *testing.T) {
 	}
 }
 
+func TestAgentsListRendersStatColumns(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	firstSeen := now.Add(-90 * time.Minute) // Age → 01:30:00
+	m := Model{width: 120, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.status.AgentNames = map[string]string{"w1:p1": "alpha"}
+	msg.status.MonitoredAgents = []domain.AgentTransition{
+		{AgentID: "w1:p1", AgentType: "claude", PaneID: "w1:p1", Status: "running"},
+	}
+	msg.status.AgentStats = map[string]domain.AgentStats{
+		"w1:p1": {AutoSends: 12, Escalations: 5, Confirmed: 3, Corrections: 2, FirstSeen: firstSeen},
+	}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+	m.tab = tabAgents
+	m.now = now // pin the Age clock
+
+	view := m.View()
+	// Header labels for all five new columns.
+	for _, want := range []string{"NAME", "STATUS", "AUTO", "ESC", "CONF", "CORR", "AGE"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("agents list missing header %q:\n%s", want, view)
+		}
+	}
+	// The agent's row carries its counts and the live age.
+	var row string
+	for _, ln := range strings.Split(view, "\n") {
+		if strings.Contains(ln, "alpha") {
+			row = ln
+			break
+		}
+	}
+	if row == "" {
+		t.Fatalf("agent row not rendered:\n%s", view)
+	}
+	for _, want := range []string{"12", "5", "3", "2", "01:30:00"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("agent row missing %q: %q", want, row)
+		}
+	}
+}
+
+func TestAgentDetailAgeTicksWithClock(t *testing.T) {
+	open := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	firstSeen := open.Add(-30 * time.Second) // Age at open → 00:00:30
+	m := Model{width: 100, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.status.AgentNames = map[string]string{"w1:p1": "alpha"}
+	msg.status.MonitoredAgents = []domain.AgentTransition{
+		{AgentID: "w1:p1", AgentType: "claude", PaneID: "w1:p1", Status: "running"},
+	}
+	msg.status.AgentStats = map[string]domain.AgentStats{
+		"w1:p1": {FirstSeen: firstSeen},
+	}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+	m.tab = tabAgents
+	m.cursor = 0
+	m.now = open
+
+	m = press(t, m, "v")
+	if m.detail == nil {
+		t.Fatal("v on the Agents tab should open the detail view")
+	}
+	if !strings.Contains(m.View(), "00:00:30") {
+		t.Fatalf("detail Age at open should be 00:00:30:\n%s", m.View())
+	}
+
+	// A clock tick must advance the detail's live Age (it previously froze:
+	// the build closure captured the open-time clock — PR #105 review).
+	upd, _ = m.Update(clockTickMsg(open.Add(5 * time.Second)))
+	m = upd.(Model)
+	if !strings.Contains(m.View(), "00:00:35") {
+		t.Fatalf("detail Age should advance to 00:00:35 after a clock tick:\n%s", m.View())
+	}
+	if strings.Contains(m.View(), "00:00:30") {
+		t.Errorf("stale Age 00:00:30 must not remain after the tick:\n%s", m.View())
+	}
+}
+
+func TestFormatAge(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name  string
+		first time.Time
+		want  string
+	}{
+		{"zero first-seen", time.Time{}, "-"},
+		{"just now", now, "00:00:00"},
+		{"under an hour", now.Add(-45 * time.Minute), "00:45:00"},
+		{"over a day", now.Add(-25*time.Hour - time.Minute - 5*time.Second), "25:01:05"},
+		{"future clamps to zero", now.Add(time.Hour), "00:00:00"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatAge(tc.first, now); got != tc.want {
+				t.Errorf("formatAge(%v, %v) = %q, want %q", tc.first, now, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSearchEmptyStateMessages(t *testing.T) {
 	cases := []struct {
 		tab  tab

@@ -548,6 +548,101 @@ func TestLLMRequestDecisionFlow(t *testing.T) {
 	}
 }
 
+func TestAgentStats(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	base := time.Now().Truncate(time.Millisecond)
+
+	// Seed agent_names directly so FirstSeen (created_at) is deterministic.
+	seedName := func(id, name string, created time.Time) {
+		t.Helper()
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO agent_names (agent_id, name, created_at) VALUES (?, ?, ?)`,
+			id, name, unix(created)); err != nil {
+			t.Fatalf("seed name %q: %v", id, err)
+		}
+	}
+	seedName("w1:p1", "alpha", base)
+	seedName("w1:p2", "beta", base) // zero-event agent
+	seedName("", "empty", base)     // defensive: empty agent_id must be skipped
+
+	audit := func(agentID, action, trigger, rationale, status string) {
+		t.Helper()
+		if _, err := s.AppendAudit(ctx, domain.AuditRecord{
+			AgentID: agentID, SituationType: domain.SituationApproval,
+			Trigger: trigger, Action: action, Rationale: rationale,
+			Status: status, CreatedAt: base,
+		}); err != nil {
+			t.Fatalf("append audit: %v", err)
+		}
+	}
+
+	// w1:p1 activity, exercising every counting rule:
+	audit("w1:p1", domain.AuditActionAutoPrefix+"2", "t", "", "auto")      // Auto
+	audit("w1:p1", domain.AuditActionAutoPrefix+"y", "t", "", "escalated") // Auto (failed send: action stays auto:, status flips)
+	audit("w1:p1", "noop", "t", "", "auto")                                // neither (noop excluded)
+	audit("w1:p1", domain.AuditActionEscalated, "t", "", "escalated")      // Esc
+	audit("w1:p1", domain.AuditActionEscalated, "t", "", "resolved")       // Esc (counted by action, even after handling)
+	audit("w1:p1", "corrected:x", domain.TriggerOperatorCorrection,
+		domain.RationaleOperatorConfirmed, "resolved") // Conf
+	audit("w1:p1", "corrected:z", domain.TriggerOperatorCorrection,
+		domain.RationaleOperatorCorrected, "resolved") // Corr
+
+	stats, err := s.AgentStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := stats[""]; ok {
+		t.Errorf("empty agent_id must be skipped, got %+v", stats[""])
+	}
+
+	got := stats["w1:p1"]
+	want := domain.AgentStats{AutoSends: 2, Escalations: 2, Confirmed: 1, Corrections: 1, FirstSeen: base}
+	if got.AutoSends != want.AutoSends || got.Escalations != want.Escalations ||
+		got.Confirmed != want.Confirmed || got.Corrections != want.Corrections {
+		t.Errorf("w1:p1 counts = %+v, want %+v", got, want)
+	}
+	if !got.FirstSeen.Equal(base) {
+		t.Errorf("w1:p1 FirstSeen = %v, want %v", got.FirstSeen, base)
+	}
+
+	// A zero-event agent still surfaces, carrying FirstSeen and zero counts.
+	beta, ok := stats["w1:p2"]
+	if !ok {
+		t.Fatalf("zero-event agent must surface; stats = %+v", stats)
+	}
+	if beta != (domain.AgentStats{FirstSeen: base}) {
+		t.Errorf("zero-event agent = %+v, want only FirstSeen=%v", beta, base)
+	}
+
+	// A rename keeps the same agent_id, so counts are unchanged.
+	if err := s.RenameAgent(ctx, "alpha", "renamed"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.AgentStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after["w1:p1"].AutoSends != want.AutoSends || after["w1:p1"].Escalations != want.Escalations {
+		t.Errorf("rename changed counts: %+v", after["w1:p1"])
+	}
+	if _, ok := after["renamed"]; ok {
+		t.Error("stats must key on agent id, not the new name")
+	}
+
+	// A restart yields a new pane id → a fresh, empty stat set (its audit rows
+	// belong to the old id).
+	seedName("w1:p3", "gamma", base)
+	restart, err := s.AgentStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := restart["w1:p3"]; g.AutoSends != 0 || g.Escalations != 0 || g.Confirmed != 0 || g.Corrections != 0 {
+		t.Errorf("new pane id must start empty, got %+v", g)
+	}
+}
+
 func TestAgentNames(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

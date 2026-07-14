@@ -164,6 +164,11 @@ type Status struct {
 	MonitoredAgents    []domain.AgentTransition
 	// AgentNames maps agent/pane ids to their short names.
 	AgentNames map[string]string
+	// AgentStats maps agent/pane ids to their lifetime counters (auto-sends,
+	// escalations, operator confirmations/corrections, first-seen). Nil when
+	// the stats query failed; a missing key means a live agent with no stats
+	// row yet.
+	AgentStats map[string]domain.AgentStats
 	// Workspaces / Tabs map ids to display metadata (label, number) for
 	// locating agents; empty when the Herdr adapter cannot report them.
 	Workspaces map[string]domain.WorkspaceInfo
@@ -213,6 +218,10 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 	if names, err := a.Store.AgentNames(ctx); err == nil {
 		st.AgentNames = names
 	}
+	// Best-effort, like AgentNames: a stats-query error just leaves it nil.
+	if stats, err := a.Store.AgentStats(ctx); err == nil {
+		st.AgentStats = stats
+	}
 	// One config load serves both embedding summaries so they cannot
 	// disagree about a mid-edit config within a single status snapshot.
 	if cfg, err := config.Load(a.ConfigPath); err != nil {
@@ -244,6 +253,10 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 
 // AgentName returns the short name for an agent id ("" when unnamed).
 func (st Status) AgentName(agentID string) string { return st.AgentNames[agentID] }
+
+// StatsFor returns the lifetime counters for an agent id (a zero-valued
+// AgentStats when none are recorded).
+func (st Status) StatsFor(agentID string) domain.AgentStats { return st.AgentStats[agentID] }
 
 // embeddingStatus summarizes semantic-matching availability from config,
 // model presence on disk, and the persisted signature-embedding count.

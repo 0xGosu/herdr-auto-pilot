@@ -187,6 +187,36 @@ type DecisionRecord struct {
 	CreatedAt     time.Time
 }
 
+// Audit literals shared by the daemon (which writes them into audit_log) and
+// the store (which reads them back for per-agent stats). Kept here so the
+// write and read sites cannot silently drift.
+const (
+	// AuditActionEscalated is the audit_log action for an escalation.
+	AuditActionEscalated = "escalated"
+	// AuditActionAutoPrefix prefixes the action of an autonomous send
+	// ("auto:" + the delivered input); a noop uses "noop", not this prefix.
+	AuditActionAutoPrefix = "auto:"
+	// TriggerOperatorCorrection is the audit_log trigger for the correction/
+	// confirmation lineage row an operator decision writes.
+	TriggerOperatorCorrection = "operator-correction"
+	// RationaleOperatorConfirmed / RationaleOperatorCorrected distinguish a
+	// confirmation from a correction on that lineage row (both carry the same
+	// trigger and a "corrected:" action, so the rationale is the only signal).
+	RationaleOperatorConfirmed = "operator confirmed"
+	RationaleOperatorCorrected = "operator corrected"
+)
+
+// AgentStats are lifetime per-agent counters derived from audit_log, keyed by
+// the herdr pane id. A rename preserves them (same pane id); a restart yields
+// a new pane id and thus a fresh, empty set.
+type AgentStats struct {
+	AutoSends   int
+	Escalations int
+	Confirmed   int
+	Corrections int
+	FirstSeen   time.Time // agent_names.created_at; zero when unknown
+}
+
 // AuditRecord is one append-only audit trail entry (FR-020, DR-002).
 type AuditRecord struct {
 	ID            int64
