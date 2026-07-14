@@ -45,7 +45,16 @@ func (d *Daemon) sweepAllowed(ctx context.Context, s domain.Situation) bool {
 		return false
 	}
 	_, allow, _ := d.snapshot()
-	if _, matched := allow.Match(domain.IrreversibleScanContent(s, "")); matched {
+	// This gate runs BEFORE sweepFrames builds the aggregate, so s.Content is
+	// still the raw first visible frame (scrollback included) while TabCount is
+	// already >1. IrreversibleScanContent's multi-tab branch assumes a
+	// scrollback-free post-sweep aggregate and would rescan that raw scrollback,
+	// letting a stale destructive command above a benign form skip the sweep and
+	// block the answer. Scope to the single visible frame's actionable tail; the
+	// full aggregate is still screened post-sweep in decideAndAct.
+	frame := s
+	frame.TabCount = 1
+	if _, matched := allow.Match(domain.IrreversibleScanContent(frame, "")); matched {
 		return false
 	}
 	return true
