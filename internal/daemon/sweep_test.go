@@ -116,6 +116,45 @@ func TestMultiTabSweepAndSeriesDelivery(t *testing.T) {
 	}
 }
 
+// Regression (PR #101 review): the pre-sweep never-auto gate scopes to the
+// visible frame, not the raw snapshot. A destructive command in stale
+// scrollback above (beyond the tail window of) a benign multi-tab form must
+// not skip the sweep and block the benign auto-answer — the aggregate the
+// real decision screens is scrollback-free anyway.
+func TestSweepIgnoresDestructiveScrollbackAboveMultiTabForm(t *testing.T) {
+	var prefix strings.Builder
+	prefix.WriteString("Earlier: git push --force origin main\n")
+	for i := 0; i < domain.IrreversibleScanTailLines; i++ {
+		prefix.WriteString("filler narration text\n")
+	}
+	frames := make([]string, len(mcqFrames))
+	for i, f := range mcqFrames {
+		frames[i] = prefix.String() + f
+	}
+	h := newHarness(t, "")
+	h.herdr.setFrames(frames)
+	// The aggregate drops scrollback per frame, so the trained signature is the
+	// same one seedSeriesRule builds from mcqFrames.
+	sig := h.seedSeriesRule(t, "1 2 1")
+
+	h.push("agent-mcq-scroll", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 10*time.Second, func() bool {
+		decs, _ := h.raw.DecisionsForSignature(ctx, sig, 10)
+		return len(decs) == 9
+	})
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 0 {
+		t.Errorf("benign multi-tab form must not escalate on stale destructive scrollback: %+v", esc)
+	}
+	if got := strings.Join(h.herdr.keysSent(), " "); !strings.HasSuffix(got, "1 2 1") {
+		t.Errorf("form should have been swept and answered despite stale scrollback, keys: %v", h.herdr.keysSent())
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("series must go out as keystrokes, text sent: %v", h.herdr.sentInputs())
+	}
+}
+
 // A sweep that fails mid-protocol degrades to the single-frame capture and
 // escalates — never a hang, never a partial answer, and NEVER an LLM
 // consult (the consult contract would demand N answers for questions the

@@ -898,9 +898,11 @@ func TestNarrationInScrollbackDoesNotTripHeuristic(t *testing.T) {
 	}
 }
 
-func TestNeverAutoScansFullSnapshotBeyondTailWindow(t *testing.T) {
-	// FR-015 invariant pin: only the heuristic is scoped to the tail window;
-	// the never-auto allowlist must keep scanning the entire snapshot.
+func TestNeverAutoIgnoresDestructiveScrollbackBeyondTailWindow(t *testing.T) {
+	// FR-015 scoping: the never-auto allowlist scans only the actionable region
+	// (pending dialog), not the whole scrollback. A destructive command left in
+	// stale scrollback above the tail window must not veto a benign pending
+	// approval — that was the false-alarm source.
 	var b strings.Builder
 	b.WriteString("Earlier: git push --force origin main\n")
 	for i := 0; i < domain.IrreversibleScanTailLines; i++ {
@@ -913,16 +915,9 @@ func TestNeverAutoScansFullSnapshotBeyondTailWindow(t *testing.T) {
 
 	h.push("agent-n6", "blocked")
 
-	waitFor(t, 3*time.Second, func() bool {
-		esc, _ := h.raw.PendingEscalations(context.Background())
-		return len(esc) == 1
-	})
-	if len(h.herdr.sentInputs()) != 0 {
-		t.Fatal("allowlist-matched content anywhere in the snapshot must block auto-action")
-	}
-	esc, _ := h.raw.PendingEscalations(context.Background())
-	if !contains(esc[0].Rationale, "pattern:") {
-		t.Errorf("escalation should name the matched pattern, got %q", esc[0].Rationale)
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "1" {
+		t.Errorf("benign approval below stale destructive scrollback should auto-act, sent %q", got)
 	}
 }
 

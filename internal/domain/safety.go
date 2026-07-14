@@ -231,8 +231,9 @@ const IrreversibleScanTailLines = 40
 // own narration merely *described* destructive operations (FR-016 is about
 // pending operations, not conversation about them).
 //
-// The never-auto patterns (Match) still scan the full snapshot; only the
-// heuristic is scoped.
+// Both the never-auto match (Match) and this heuristic scan this scoped
+// region: a never-auto pattern anywhere in stale scrollback must not veto a
+// benign pending action, only a match in the actionable region does (FR-015).
 func IrreversibleScanContent(s Situation, declaredTask string) string {
 	switch s.Type {
 	case SituationIdle:

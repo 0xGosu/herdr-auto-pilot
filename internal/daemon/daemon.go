@@ -854,21 +854,24 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		return
 	}
 
-	allowPattern, allowMatched := allow.Match(situation.Content)
-
-	// The heuristic scans only the actionable region (pending dialog +
-	// outbound task text), not the full scrollback: agents narrating *about*
-	// destructive operations must not be flagged perpetually (FR-016).
+	// Both the never-auto match and the suspected-irreversible heuristic scan
+	// only the actionable region (pending dialog + outbound task text), not the
+	// full scrollback: a destructive phrase anywhere in stale scrollback (old
+	// commands, agent narration *about* destructive operations) must not veto a
+	// benign pending action (FR-015/FR-016). A destructive command in the
+	// pending dialog itself still matches.
 	declared := d.declaredTask(ctx, cfg, tr, agentName)
 	declaredPrompt := ""
 	if declared != nil {
 		declaredPrompt = declared.Prompt()
 	}
+	scan := domain.IrreversibleScanContent(situation, declaredPrompt)
+	allowPattern, allowMatched := allow.Match(scan)
+
 	var irrevHit domain.IndicatorHit
 	suspected := false
 	if !allowMatched {
-		irrevHit, suspected = allow.SuspectedIrreversible(situation.AgentType,
-			domain.IrreversibleScanContent(situation, declaredPrompt))
+		irrevHit, suspected = allow.SuspectedIrreversible(situation.AgentType, scan)
 	}
 
 	// Pre-send LLM review of a determined declared task (opt-out per source via
@@ -1872,7 +1875,7 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	// The idle policy tolerates changed content, so the FRESH pane must be
 	// re-screened the way handleTransition screened the original: Decide's
 	// veto ran against content that may no longer be what's on screen.
-	if pattern, matched := allow.Match(current.Content); matched {
+	if pattern, matched := allow.Match(domain.IrreversibleScanContent(current, "")); matched {
 		escalateWith(domain.ReasonNeverAutoMatch,
 			"pattern: "+pattern+" (at rewrite)")
 		return
@@ -2006,7 +2009,15 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(domain.ReasonKilled, "at LLM promotion")
 		return
 	}
-	if pattern, matched := allow.Match(s.Content); matched {
+	// The never-auto match and the heuristic both scan the situation's
+	// actionable region (pending dialog + outbound task text), not the full
+	// scrollback, so stale narration doesn't veto a benign action (FR-015/FR-016).
+	declaredPrompt := ""
+	if dt := d.declaredTaskFor(ctx, s); dt != nil {
+		declaredPrompt = dt.Prompt()
+	}
+	scan := domain.IrreversibleScanContent(s, declaredPrompt)
+	if pattern, matched := allow.Match(scan); matched {
 		reject(domain.ReasonNeverAutoMatch, "pattern: "+pattern)
 		return
 	}
@@ -2022,11 +2033,6 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	}
 	// The heuristic screens the situation's actionable region plus the
 	// outbound text the LLM authored (which is what would actually be sent).
-	declaredPrompt := ""
-	if dt := d.declaredTaskFor(ctx, s); dt != nil {
-		declaredPrompt = dt.Prompt()
-	}
-	scan := domain.IrreversibleScanContent(s, declaredPrompt)
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType, scan); sus {
 		reject(domain.ReasonSuspectedIrrevers,
 			fmt.Sprintf("indicator %s matched %q", hit.Pattern, hit.Excerpt))
