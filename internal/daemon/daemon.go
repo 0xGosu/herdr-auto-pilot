@@ -899,14 +899,14 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	}
 
 	in := domain.DecideInput{
-		Situation:   situation,
-		Signature:   sig,
-		State:       state,
-		History:     history,
-		Thresholds:  thresholds(cfg),
-		GraduationN: cfg.Learning.GraduationN,
-		KillActive:  killActive,
-		Rate:        rate,
+		Situation:            situation,
+		Signature:            sig,
+		State:                state,
+		History:              history,
+		ConfidenceThresholds: confidenceThresholds(cfg),
+		GraduationN:          cfg.Learning.GraduationN,
+		KillActive:           killActive,
+		Rate:                 rate,
 		RateLimits: domain.RateLimits{
 			MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 			MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
@@ -1651,20 +1651,21 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 	// select_options resolver (mcpserver.consultContextFields) — keep the
 	// key names in sync.
 	fields := map[string]any{
-		"situation_type":  s.Type,
-		"agent_type":      s.AgentType,
-		"options":         s.Options,
-		"permission_verb": s.PermissionVerb,
-		"error_summary":   s.ErrorSummary,
-		"pane_excerpt":    excerpt,
-		"workspace_id":    workspaceID,
-		"tab_id":          tabID,
-		"pane_id":         s.PaneID,
-		"agent_id":        s.AgentID,
-		"agent_name":      agentName,
-		"cwd":             info.Cwd,
-		"foreground_cwd":  info.ForegroundCwd,
-		"no_reply_option": "if the agent needs no reply (it finished or is only reporting status), submit_decision with recommend_action \"@noop\" to explicitly do nothing",
+		"situation_type":   s.Type,
+		"agent_type":       s.AgentType,
+		"options":          s.Options,
+		"permission_verb":  s.PermissionVerb,
+		"error_summary":    s.ErrorSummary,
+		"pane_excerpt":     excerpt,
+		"workspace_id":     workspaceID,
+		"tab_id":           tabID,
+		"pane_id":          s.PaneID,
+		"agent_id":         s.AgentID,
+		"agent_session_id": info.AgentSessionID,
+		"agent_name":       agentName,
+		"cwd":              info.Cwd,
+		"foreground_cwd":   info.ForegroundCwd,
+		"no_reply_option":  "if the agent needs no reply (it finished or is only reporting status), submit_decision with recommend_action \"@noop\" to explicitly do nothing",
 	}
 	if s.TabCount > 1 {
 		fields["tab_count"] = s.TabCount
@@ -2565,7 +2566,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	newState.CachedConfidence = conf.Score
 	newState.UpdatedAt = now
 	newState = domain.MaybeGraduate(newState, conf.Score,
-		thresholds(cfg).ForType(audit.SituationType), cfg.Learning.GraduationN)
+		confidenceThresholds(cfg).ForType(audit.SituationType), cfg.Learning.GraduationN)
 
 	if err := d.opt.Store.UpsertSignature(ctx, newState); err != nil {
 		return nil, err
@@ -2830,13 +2831,14 @@ func indicatorRules(s config.Safety) []domain.IndicatorRule {
 	return rules
 }
 
-func thresholds(cfg config.Config) domain.DecideThresholds {
-	return domain.DecideThresholds{
-		Idle:            cfg.Thresholds.Idle,
-		Approval:        cfg.Thresholds.Approval,
-		Choice:          cfg.Thresholds.Choice,
-		Error:           cfg.Thresholds.Error,
-		InferredTaskBar: cfg.Thresholds.InferredTaskBar,
+func confidenceThresholds(cfg config.Config) domain.ConfidenceThresholds {
+	return domain.ConfidenceThresholds{
+		Minimum:         cfg.ConfidenceThresholds.Minimum,
+		Idle:            cfg.ConfidenceThresholds.Idle,
+		Approval:        cfg.ConfidenceThresholds.Approval,
+		Choice:          cfg.ConfidenceThresholds.Choice,
+		Error:           cfg.ConfidenceThresholds.Error,
+		InferredTaskBar: cfg.ConfidenceThresholds.InferredTaskBar,
 	}
 }
 

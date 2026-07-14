@@ -868,11 +868,12 @@ type ConfigFieldDef struct {
 // registry entry is unguarded (the field silently disappears from the TUI
 // and `config fields`), so always add new fields here first.
 var ConfigFields = []ConfigFieldDef{
-	{Key: "thresholds.idle", TUIEditable: true},
-	{Key: "thresholds.approval", TUIEditable: true},
-	{Key: "thresholds.choice", TUIEditable: true},
-	{Key: "thresholds.error", TUIEditable: true},
-	{Key: "thresholds.inferred_task_bar", TUIEditable: true},
+	{Key: "confidence_thresholds.minimum", TUIEditable: true},
+	{Key: "confidence_thresholds.idle", TUIEditable: true},
+	{Key: "confidence_thresholds.approval", TUIEditable: true},
+	{Key: "confidence_thresholds.choice", TUIEditable: true},
+	{Key: "confidence_thresholds.error", TUIEditable: true},
+	{Key: "confidence_thresholds.inferred_task_bar", TUIEditable: true},
 	{Key: "learning.graduation_n", TUIEditable: true},
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
@@ -928,16 +929,18 @@ func FieldTUIEditable(key string) bool {
 // FieldValue renders the current value of a SetField key for display.
 func FieldValue(cfg config.Config, key string) string {
 	switch key {
-	case "thresholds.idle":
-		return fmt.Sprintf("%.2f", cfg.Thresholds.Idle)
-	case "thresholds.approval":
-		return fmt.Sprintf("%.2f", cfg.Thresholds.Approval)
-	case "thresholds.choice":
-		return fmt.Sprintf("%.2f", cfg.Thresholds.Choice)
-	case "thresholds.error":
-		return fmt.Sprintf("%.2f", cfg.Thresholds.Error)
-	case "thresholds.inferred_task_bar":
-		return fmt.Sprintf("%.2f", cfg.Thresholds.InferredTaskBar)
+	case "confidence_thresholds.minimum":
+		return fmt.Sprintf("%.2f", cfg.ConfidenceThresholds.Minimum)
+	case "confidence_thresholds.idle":
+		return fmt.Sprintf("%.2f", cfg.ConfidenceThresholds.Idle)
+	case "confidence_thresholds.approval":
+		return fmt.Sprintf("%.2f", cfg.ConfidenceThresholds.Approval)
+	case "confidence_thresholds.choice":
+		return fmt.Sprintf("%.2f", cfg.ConfidenceThresholds.Choice)
+	case "confidence_thresholds.error":
+		return fmt.Sprintf("%.2f", cfg.ConfidenceThresholds.Error)
+	case "confidence_thresholds.inferred_task_bar":
+		return fmt.Sprintf("%.2f", cfg.ConfidenceThresholds.InferredTaskBar)
 	case "learning.graduation_n":
 		return strconv.Itoa(cfg.Learning.GraduationN)
 	case "embedding.pane_salient_chars":
@@ -1080,16 +1083,18 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		switch key {
-		case "thresholds.idle":
-			return setFloat(&cfg.Thresholds.Idle)
-		case "thresholds.approval":
-			return setFloat(&cfg.Thresholds.Approval)
-		case "thresholds.choice":
-			return setFloat(&cfg.Thresholds.Choice)
-		case "thresholds.error":
-			return setFloat(&cfg.Thresholds.Error)
-		case "thresholds.inferred_task_bar":
-			return setFloat(&cfg.Thresholds.InferredTaskBar)
+		case "confidence_thresholds.minimum":
+			return setFloat(&cfg.ConfidenceThresholds.Minimum)
+		case "confidence_thresholds.idle":
+			return setFloat(&cfg.ConfidenceThresholds.Idle)
+		case "confidence_thresholds.approval":
+			return setFloat(&cfg.ConfidenceThresholds.Approval)
+		case "confidence_thresholds.choice":
+			return setFloat(&cfg.ConfidenceThresholds.Choice)
+		case "confidence_thresholds.error":
+			return setFloat(&cfg.ConfidenceThresholds.Error)
+		case "confidence_thresholds.inferred_task_bar":
+			return setFloat(&cfg.ConfidenceThresholds.InferredTaskBar)
 		case "learning.graduation_n":
 			return setInt(&cfg.Learning.GraduationN)
 		case "embedding.pane_salient_chars":
@@ -1355,7 +1360,7 @@ func (a *App) RemoveTaskSource(ctx context.Context, index int, expectedPath stri
 	})
 }
 
-// SetThreshold updates one per-situation threshold (FR-009) and reloads.
+// SetThreshold updates one confidence threshold (FR-009) and reloads.
 func (a *App) SetThreshold(ctx context.Context, situation string, value float64) error {
 	if value <= 0 || value >= 1 {
 		return fmt.Errorf("threshold must be in (0,1), got %v", value)
@@ -1363,17 +1368,19 @@ func (a *App) SetThreshold(ctx context.Context, situation string, value float64)
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		switch situation {
 		case "idle":
-			cfg.Thresholds.Idle = value
+			cfg.ConfidenceThresholds.Idle = value
 		case "approval":
-			cfg.Thresholds.Approval = value
+			cfg.ConfidenceThresholds.Approval = value
 		case "choice":
-			cfg.Thresholds.Choice = value
+			cfg.ConfidenceThresholds.Choice = value
 		case "error":
-			cfg.Thresholds.Error = value
+			cfg.ConfidenceThresholds.Error = value
 		case "inferred_task_bar":
-			cfg.Thresholds.InferredTaskBar = value
+			cfg.ConfidenceThresholds.InferredTaskBar = value
+		case "minimum":
+			cfg.ConfidenceThresholds.Minimum = value
 		default:
-			return fmt.Errorf("unknown situation %q (idle|approval|choice|error|inferred_task_bar)", situation)
+			return fmt.Errorf("unknown confidence threshold %q (minimum|idle|approval|choice|error|inferred_task_bar)", situation)
 		}
 		return nil
 	})

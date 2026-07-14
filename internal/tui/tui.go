@@ -81,9 +81,10 @@ type openSendPromptMsg struct {
 	action string
 }
 
-// statusNote is a durable action outcome shown in the status area until
-// the next outcome replaces it (CR-025) — unlike the transient m.message
-// hint line, navigation never clears it.
+// statusNote is a durable action outcome shown in the status area until the
+// next mutating action starts (or a later outcome replaces it) — unlike the
+// transient m.message hint line, navigation and read-only actions never clear
+// it.
 type statusNote struct {
 	text string
 	err  bool
@@ -667,8 +668,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.clampListViewport()
 		}
 	case "p":
+		m.beginAction()
 		return m, m.do("automation paused", func(ctx context.Context) error { return m.app.Pause(ctx) })
 	case "r":
+		m.beginAction()
 		return m, m.do("automation resumed", func(ctx context.Context) error { return m.app.Resume(ctx) })
 	case "R":
 		switch d := m.data.status.Drift; {
@@ -679,6 +682,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// model file, so a "requested" toast would be a lie.
 			m.message = "embedding model not found — fix embedding.model_path first"
 		default:
+			m.beginAction()
 			return m, m.do("re-compute requested — daemon is re-embedding in the background",
 				func(ctx context.Context) error { return m.app.RequestReembed(ctx) })
 		}
@@ -762,6 +766,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// beginAction clears the previous durable outcome as soon as a new mutation
+// starts. The new action's result will populate the status area when it
+// completes; navigation and read-only actions deliberately do not call this.
+func (m *Model) beginAction() {
+	m.status = nil
+	m.message = ""
+	m.clampListViewport()
+}
+
 // do runs a mutation and reports its outcome.
 func (m Model) do(okMsg string, fn func(context.Context) error) tea.Cmd {
 	ctx := m.ctx
@@ -830,6 +843,7 @@ func (m Model) confirmSelected() (tea.Model, tea.Cmd) {
 // confirmAuditID confirms+sends a specific escalation by id (used by the
 // list and by the detail overlay, which confirms the record it snapshotted).
 func (m Model) confirmAuditID(id int64) (tea.Model, tea.Cmd) {
+	m.beginAction()
 	return m, m.do(fmt.Sprintf("confirmed #%d and sent", id), func(ctx context.Context) error {
 		return m.app.Confirm(ctx, id, true)
 	})
@@ -852,7 +866,7 @@ func (m Model) correctSelected() (tea.Model, tea.Cmd) {
 // recorded only, never sent.
 func (m Model) correctByID(id int64, live bool) (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
-	m.message = ""
+	m.beginAction()
 	m.prompt = &prompt{
 		label: fmt.Sprintf("correct #%d — action to record", id),
 		onSubmit: func(input string) tea.Cmd {
@@ -901,6 +915,7 @@ func (m Model) openSendPrompt(id int64, action string) (tea.Model, tea.Cmd) {
 // dismissByID dismisses one escalation by id — used by the detail overlay.
 // The list uses deleteEscalations for its marked/cursor batch semantics.
 func (m Model) dismissByID(id int64) (tea.Model, tea.Cmd) {
+	m.beginAction()
 	return m, m.do(fmt.Sprintf("dismissed #%d", id), func(ctx context.Context) error {
 		return m.app.Dismiss(ctx, id)
 	})
@@ -908,6 +923,7 @@ func (m Model) dismissByID(id int64) (tea.Model, tea.Cmd) {
 
 // retryByID re-invokes the LLM on one escalation by id (list and detail).
 func (m Model) retryByID(id int64) (tea.Model, tea.Cmd) {
+	m.beginAction()
 	return m, m.do(fmt.Sprintf("retry LLM queued for #%d", id), func(ctx context.Context) error {
 		return m.app.RetryLLM(ctx, id)
 	})
@@ -1005,7 +1021,7 @@ func (m Model) deleteEscalations() (tea.Model, tea.Cmd) {
 	}
 	app, ctx := m.app, m.ctx
 	desc := describeEscalations(ids)
-	m.message = ""
+	m.beginAction()
 	return m, func() tea.Msg {
 		// Skip-and-continue: a failed id usually means the row was
 		// resolved/confirmed concurrently; the rest still delete.
@@ -1036,7 +1052,7 @@ func (m Model) deleteEscalations() (tea.Model, tea.Cmd) {
 // Enter confirms, esc cancels.
 func (m Model) pruneEscalationsPrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
-	m.message = ""
+	m.beginAction()
 	m.prompt = &prompt{
 		label: "prune escalations older than N minutes — enter confirms, esc cancels",
 		input: strconv.Itoa(frontend.DefaultPruneMinutes),
@@ -1069,7 +1085,7 @@ func (m Model) renameSelected() (tea.Model, tea.Cmd) {
 	current := m.data.status.AgentName(agent.AgentID)
 	target := agent.AgentID
 	app, ctx := m.app, m.ctx
-	m.message = ""
+	m.beginAction()
 	m.prompt = &prompt{
 		label: fmt.Sprintf("rename %s (%s) to", orDash(current), agent.AgentID),
 		onSubmit: func(input string) tea.Cmd {
@@ -1570,7 +1586,7 @@ func (m Model) deleteSignaturePrompt() (tea.Model, tea.Cmd) {
 	}
 	sig, decisions := row.Signature, row.Decisions
 	app, ctx := m.app, m.ctx
-	m.message = ""
+	m.beginAction()
 	m.prompt = &prompt{
 		label: fmt.Sprintf("type 'yes' to delete %s and its %d decision(s)", shortSig(sig), decisions),
 		onSubmit: func(input string) tea.Cmd {
@@ -1673,7 +1689,7 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	}
 	key := item.key
 	app, ctx := m.app, m.ctx
-	m.message = ""
+	m.beginAction()
 	m.prompt = &prompt{
 		label: fmt.Sprintf("set %s (current %s)", key, frontend.FieldValue(m.data.cfg, key)),
 		onSubmit: func(input string) tea.Cmd {
@@ -1690,7 +1706,7 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 
 func (m Model) addPatternPrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
-	m.message = ""
+	m.beginAction()
 	m.prompt = &prompt{
 		label: "add never-auto regex",
 		onSubmit: func(input string) tea.Cmd {
@@ -1707,7 +1723,7 @@ func (m Model) addPatternPrompt() (tea.Model, tea.Cmd) {
 
 func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
-	m.message = ""
+	m.beginAction()
 	m.prompt = &prompt{
 		label: "add task source: <path> [agent] [workspace]",
 		onSubmit: func(input string) tea.Cmd {
@@ -1742,11 +1758,13 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 	app := m.app
 	switch item.kind {
 	case "pattern":
+		m.beginAction()
 		idx, expected := item.index, item.value
 		return m, m.do(fmt.Sprintf("never-auto pattern #%d removed", idx), func(c context.Context) error {
 			return app.RemoveNeverAutoPattern(c, idx, expected)
 		})
 	case "source":
+		m.beginAction()
 		idx, expected := item.index, item.value
 		return m, m.do(fmt.Sprintf("task source #%d removed", idx), func(c context.Context) error {
 			return app.RemoveTaskSource(c, idx, expected)
@@ -1762,7 +1780,7 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 
 func (m Model) clearDataPrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
-	m.message = ""
+	m.beginAction()
 	m.prompt = &prompt{
 		label: "type 'yes' to permanently clear learned history + audit data",
 		onSubmit: func(input string) tea.Cmd {
@@ -1872,9 +1890,8 @@ func (m Model) View() string {
 	if m.message != "" {
 		fmt.Fprintf(&b, "\n%s\n", m.message)
 	}
-	// Durable status area (CR-025): the last action outcome stays readable
-	// until the next one replaces it, styled ok/error from the palette
-	// (CR-026).
+	// Durable status area: the last action outcome stays readable until the
+	// next mutation starts, styled ok/error from the palette (CR-026).
 	if m.status != nil {
 		mark, style := "✓", st.ok
 		if m.status.err {

@@ -117,14 +117,17 @@ func TestVarianceGuard(t *testing.T) {
 
 	// FR-003a acceptance: an even split of contradictory decisions forces
 	// escalation rather than auto-acting.
-	if !VarianceGuardTripped(mk("yes", "no", "yes", "no", "yes", "no")) {
+	if !VarianceGuardTripped(mk("yes", "no", "yes", "no", "yes", "no"), 0.6) {
 		t.Error("even split should trip the variance guard")
 	}
-	if VarianceGuardTripped(mk("yes", "yes", "yes", "yes", "yes", "no")) {
+	if VarianceGuardTripped(mk("yes", "yes", "yes", "yes", "yes", "no"), 0.6) {
 		t.Error("consistent history should not trip the variance guard")
 	}
-	if VarianceGuardTripped(mk("yes", "no")) {
+	if VarianceGuardTripped(mk("yes", "no"), 0.6) {
 		t.Error("tiny histories are governed by graduation, not the variance guard")
+	}
+	if VarianceGuardTripped(mk("yes", "no", "yes", "no", "yes", "no"), 0.5) {
+		t.Error("lower configured minimum should permit this history")
 	}
 }
 

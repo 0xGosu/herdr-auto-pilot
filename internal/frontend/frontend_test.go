@@ -872,14 +872,21 @@ func TestSetThresholdPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, err := app.Config()
-	if err != nil || cfg.Thresholds.Approval != 0.93 {
-		t.Fatalf("threshold not persisted: %+v %v", cfg.Thresholds, err)
+	if err != nil || cfg.ConfidenceThresholds.Approval != 0.93 {
+		t.Fatalf("threshold not persisted: %+v %v", cfg.ConfidenceThresholds, err)
 	}
 	if err := app.SetThreshold(ctx, "approval", 1.5); err == nil {
 		t.Error("out-of-range threshold must be rejected")
 	}
 	if err := app.SetThreshold(ctx, "bogus", 0.5); err == nil {
 		t.Error("unknown situation must be rejected")
+	}
+	if err := app.SetThreshold(ctx, "minimum", 0.55); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = app.Config()
+	if err != nil || cfg.ConfidenceThresholds.Minimum != 0.55 {
+		t.Fatalf("minimum agreement not persisted: %+v %v", cfg.ConfidenceThresholds, err)
 	}
 }
 
@@ -906,9 +913,10 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		key, value string
 		wantErr    bool
 	}{
-		{"thresholds.approval", "0.92", false},
-		{"thresholds.approval", "1.5", true},
-		{"thresholds.approval", "abc", true},
+		{"confidence_thresholds.minimum", "0.55", false},
+		{"confidence_thresholds.approval", "0.92", false},
+		{"confidence_thresholds.approval", "1.5", true},
+		{"confidence_thresholds.approval", "abc", true},
 		{"learning.graduation_n", "7", false},
 		{"learning.graduation_n", "-1", true},
 		{"limits.max_error_retries", "3", false},
@@ -939,7 +947,7 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Thresholds.Approval != 0.92 || cfg.Learning.GraduationN != 7 ||
+	if cfg.ConfidenceThresholds.Approval != 0.92 || cfg.Learning.GraduationN != 7 ||
 		cfg.Limits.MaxErrorRetries != 3 || cfg.LLM.TimeoutSeconds != 90 ||
 		cfg.LLM.AutoActConfidenceThreshold != 70 {
 		t.Errorf("persisted config mismatch: %+v", cfg)
@@ -996,39 +1004,40 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 	// One valid sample value per registry key. When you add a field to
 	// frontend.ConfigFields, add a sample here or this test fails loudly.
 	samples := map[string]string{
-		"thresholds.idle":                     "0.70",
-		"thresholds.approval":                 "0.85",
-		"thresholds.choice":                   "0.85",
-		"thresholds.error":                    "0.90",
-		"thresholds.inferred_task_bar":        "0.95",
-		"learning.graduation_n":               "5",
-		"embedding.pane_salient_chars":        "800",
-		"limits.max_consecutive_auto_prompts": "5",
-		"limits.max_auto_prompts_per_minute":  "10",
-		"limits.max_error_retries":            "2",
-		"limits.verify_unblock_ms":            "1000",
-		"safety.disable_seed":                 "true",
-		"llm.command":                         `claude -p "decide"`,
-		"llm.command_start":                   `claude -p "first: decide"`,
-		"llm.timeout_seconds":                 "60",
-		"llm.auto_act_confidence_threshold":   "70",
-		"llm.pane_excerpt_chars":              "4000",
-		"llm.rewrite_command":                 `claude -p "rewrite: {text}"`,
-		"llm.rewrite_command_start":           `claude -p "first rewrite: {text}"`,
-		"llm.rewrite_timeout_seconds":         "45",
-		"llm.rewrite_fallback_template":       "Act on: {original_text}",
-		"llm.task_generate_command":           `claude -p "suggest a task"`,
-		"llm.task_generate_command_start":     `claude -p "first suggest a task"`,
-		"llm.task_generate_timeout_seconds":   "45",
-		"embedding.disabled":                  "false",
-		"embedding.model_path":                "/models/custom.gguf",
-		"embedding.similarity_threshold":      "0.90",
-		"embedding.bm25_min_score":            "0.35",
-		"embedding.gpu_layers":                "0",
-		"embedding.model_context_window":      "512",
-		"tui.max_content_width":               "140",
-		"tui.max_content_height":              "12",
-		"tui.theme":                           "dark",
+		"confidence_thresholds.minimum":           "0.55",
+		"confidence_thresholds.idle":              "0.70",
+		"confidence_thresholds.approval":          "0.85",
+		"confidence_thresholds.choice":            "0.85",
+		"confidence_thresholds.error":             "0.90",
+		"confidence_thresholds.inferred_task_bar": "0.95",
+		"learning.graduation_n":                   "5",
+		"embedding.pane_salient_chars":            "800",
+		"limits.max_consecutive_auto_prompts":     "5",
+		"limits.max_auto_prompts_per_minute":      "10",
+		"limits.max_error_retries":                "2",
+		"limits.verify_unblock_ms":                "1000",
+		"safety.disable_seed":                     "true",
+		"llm.command":                             `claude -p "decide"`,
+		"llm.command_start":                       `claude -p "first: decide"`,
+		"llm.timeout_seconds":                     "60",
+		"llm.auto_act_confidence_threshold":       "70",
+		"llm.pane_excerpt_chars":                  "4000",
+		"llm.rewrite_command":                     `claude -p "rewrite: {text}"`,
+		"llm.rewrite_command_start":               `claude -p "first rewrite: {text}"`,
+		"llm.rewrite_timeout_seconds":             "45",
+		"llm.rewrite_fallback_template":           "Act on: {original_text}",
+		"llm.task_generate_command":               `claude -p "suggest a task"`,
+		"llm.task_generate_command_start":         `claude -p "first suggest a task"`,
+		"llm.task_generate_timeout_seconds":       "45",
+		"embedding.disabled":                      "false",
+		"embedding.model_path":                    "/models/custom.gguf",
+		"embedding.similarity_threshold":          "0.90",
+		"embedding.bm25_min_score":                "0.35",
+		"embedding.gpu_layers":                    "0",
+		"embedding.model_context_window":          "512",
+		"tui.max_content_width":                   "140",
+		"tui.max_content_height":                  "12",
+		"tui.theme":                               "dark",
 	}
 
 	registry := make(map[string]bool, len(frontend.ConfigFieldKeys))
@@ -1444,7 +1453,7 @@ func TestCLIParityWithSharedLayer(t *testing.T) {
 	// threshold mutation via CLI verb → visible via shared config
 	run("config", "set-threshold", "choice", "0.9")
 	cfg, _ := app.Config()
-	if cfg.Thresholds.Choice != 0.9 {
+	if cfg.ConfidenceThresholds.Choice != 0.9 {
 		t.Error("CLI threshold edit must land in shared config")
 	}
 

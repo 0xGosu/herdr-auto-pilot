@@ -1,5 +1,5 @@
 // Package config loads and reloads the operator-editable TOML configuration
-// (DR-003): thresholds, graduation N, retry/rate ceilings, never-auto
+// (DR-003): confidence thresholds, graduation N, retry/rate ceilings, never-auto
 // patterns, classifier manifests, task sources, and LLM CLI settings.
 package config
 
@@ -14,9 +14,11 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// Thresholds are per-situation-type confidence thresholds (FR-009) plus the
-// higher inferred-task bar for pane-history inference (FR-011).
-type Thresholds struct {
+// ConfidenceThresholds are the minimum history agreement, the
+// per-situation-type confidence thresholds (FR-009), and the higher
+// inferred-task bar for pane-history inference (FR-011).
+type ConfidenceThresholds struct {
+	Minimum         float64 `toml:"minimum"`
 	Idle            float64 `toml:"idle"`
 	Approval        float64 `toml:"approval"`
 	Choice          float64 `toml:"choice"`
@@ -264,15 +266,15 @@ var ValidThemes = []string{"default", "dark", "light", "high-contrast"}
 
 // Config is the full operator configuration.
 type Config struct {
-	Thresholds  Thresholds       `toml:"thresholds"`
-	Learning    Learning         `toml:"learning"`
-	Safety      Safety           `toml:"safety"`
-	Limits      Limits           `toml:"limits"`
-	LLM         LLM              `toml:"llm"`
-	Embedding   Embedding        `toml:"embedding"`
-	TUI         TUI              `toml:"tui"`
-	TaskSources []TaskSource     `toml:"task_sources"`
-	Classifier  []ClassifierRule `toml:"classifier"`
+	ConfidenceThresholds ConfidenceThresholds `toml:"confidence_thresholds"`
+	Learning             Learning             `toml:"learning"`
+	Safety               Safety               `toml:"safety"`
+	Limits               Limits               `toml:"limits"`
+	LLM                  LLM                  `toml:"llm"`
+	Embedding            Embedding            `toml:"embedding"`
+	TUI                  TUI                  `toml:"tui"`
+	TaskSources          []TaskSource         `toml:"task_sources"`
+	Classifier           []ClassifierRule     `toml:"classifier"`
 	// CaptureDelays are optional per-agent-type overrides for the delayed
 	// pane capture; absent rules fall back to built-in defaults (not part
 	// of fillZeroes — optional tables, absent is not "zeroed").
@@ -284,12 +286,13 @@ type Config struct {
 // or partial.
 func Default() Config {
 	return Config{
-		Thresholds: Thresholds{
-			Idle:            0.75,
-			Approval:        0.80,
-			Choice:          0.80,
-			Error:           0.85,
-			InferredTaskBar: 0.90,
+		ConfidenceThresholds: ConfidenceThresholds{
+			Minimum:         0.50,
+			Idle:            0.65,
+			Approval:        0.70,
+			Choice:          0.70,
+			Error:           0.75,
+			InferredTaskBar: 0.60,
 		},
 		Learning: Learning{GraduationN: 5},
 		Limits: Limits{
@@ -425,6 +428,19 @@ func Load(path string) (Config, error) {
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return Default(), fmt.Errorf("parse config %s: %w", path, err)
 	}
+	// Deprecated `[thresholds]` table: load it only when the renamed
+	// `[confidence_thresholds]` table is absent. A later Save emits only the
+	// canonical table name, completing the migration without losing values.
+	var thresholdProbe struct {
+		ConfidenceThresholds *ConfidenceThresholds `toml:"confidence_thresholds"`
+		Legacy               *ConfidenceThresholds `toml:"thresholds"`
+	}
+	_ = toml.Unmarshal(data, &thresholdProbe)
+	if thresholdProbe.ConfidenceThresholds == nil && thresholdProbe.Legacy != nil {
+		slog.Warn("config table `[thresholds]` is deprecated; use `[confidence_thresholds]`",
+			"path", path)
+		cfg.ConfidenceThresholds = *thresholdProbe.Legacy
+	}
 	// Deprecated `allowlist_patterns` alias: merge into never_auto_patterns
 	// (dedupe) and clear, so a later Save migrates the file to the new key
 	// (Save re-encodes the whole struct from toml tags).
@@ -480,20 +496,23 @@ func Load(path string) (Config, error) {
 // inside present sections.
 func (c *Config) fillZeroes() {
 	d := Default()
-	if c.Thresholds.Idle <= 0 {
-		c.Thresholds.Idle = d.Thresholds.Idle
+	if c.ConfidenceThresholds.Minimum <= 0 {
+		c.ConfidenceThresholds.Minimum = d.ConfidenceThresholds.Minimum
 	}
-	if c.Thresholds.Approval <= 0 {
-		c.Thresholds.Approval = d.Thresholds.Approval
+	if c.ConfidenceThresholds.Idle <= 0 {
+		c.ConfidenceThresholds.Idle = d.ConfidenceThresholds.Idle
 	}
-	if c.Thresholds.Choice <= 0 {
-		c.Thresholds.Choice = d.Thresholds.Choice
+	if c.ConfidenceThresholds.Approval <= 0 {
+		c.ConfidenceThresholds.Approval = d.ConfidenceThresholds.Approval
 	}
-	if c.Thresholds.Error <= 0 {
-		c.Thresholds.Error = d.Thresholds.Error
+	if c.ConfidenceThresholds.Choice <= 0 {
+		c.ConfidenceThresholds.Choice = d.ConfidenceThresholds.Choice
 	}
-	if c.Thresholds.InferredTaskBar <= 0 {
-		c.Thresholds.InferredTaskBar = d.Thresholds.InferredTaskBar
+	if c.ConfidenceThresholds.Error <= 0 {
+		c.ConfidenceThresholds.Error = d.ConfidenceThresholds.Error
+	}
+	if c.ConfidenceThresholds.InferredTaskBar <= 0 {
+		c.ConfidenceThresholds.InferredTaskBar = d.ConfidenceThresholds.InferredTaskBar
 	}
 	if c.Learning.GraduationN <= 0 {
 		c.Learning.GraduationN = d.Learning.GraduationN

@@ -1596,8 +1596,8 @@ func TestCorrectionDemotesAutonomousSignature(t *testing.T) {
 
 func TestConfigReloadPropagatesWithinBudget(t *testing.T) {
 	// NFR-009 / SC-2: a config edit + nudge is reflected ≤ 1s.
-	h := newHarness(t, "[thresholds]\napproval = 0.8\n")
-	h.writeConfig(t, "[thresholds]\napproval = 0.99\n")
+	h := newHarness(t, "[confidence_thresholds]\napproval = 0.8\n")
+	h.writeConfig(t, "[confidence_thresholds]\napproval = 0.99\n")
 
 	start := time.Now()
 	if err := control.Nudge(context.Background(), h.ctlPath, control.KindReload); err != nil {
@@ -1605,7 +1605,7 @@ func TestConfigReloadPropagatesWithinBudget(t *testing.T) {
 	}
 	waitFor(t, time.Second, func() bool {
 		cfg, _, _ := h.daemon.snapshot()
-		return cfg.Thresholds.Approval == 0.99
+		return cfg.ConfidenceThresholds.Approval == 0.99
 	})
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("reload took %s, budget is 1s", elapsed)
@@ -2125,6 +2125,7 @@ func TestConsultContextCarriesLocationCwdAndDeepExcerpt(t *testing.T) {
 	h.herdr.paneInfo = domain.PaneInfo{
 		PaneID: "w2:p7", TabID: "w2:t3", WorkspaceID: "w2",
 		Cwd: "/home/op/project", ForegroundCwd: "/home/op/project/sub",
+		AgentSessionID: "ba9a6f5a-ca6a-49dc-bcec-d4869ba97851",
 	}
 	h.herdr.mu.Unlock()
 
@@ -2137,12 +2138,13 @@ func TestConsultContextCarriesLocationCwdAndDeepExcerpt(t *testing.T) {
 
 	m := decodeContext(t, captured.get())
 	for key, want := range map[string]string{
-		"workspace_id":   "w2",
-		"tab_id":         "w2:t3",
-		"pane_id":        "w2:p7",
-		"agent_id":       "w2:p7",
-		"cwd":            "/home/op/project",
-		"foreground_cwd": "/home/op/project/sub",
+		"workspace_id":     "w2",
+		"tab_id":           "w2:t3",
+		"pane_id":          "w2:p7",
+		"agent_id":         "w2:p7",
+		"agent_session_id": "ba9a6f5a-ca6a-49dc-bcec-d4869ba97851",
+		"cwd":              "/home/op/project",
+		"foreground_cwd":   "/home/op/project/sub",
 	} {
 		if got, _ := m[key].(string); got != want {
 			t.Errorf("%s = %q, want %q", key, got, want)

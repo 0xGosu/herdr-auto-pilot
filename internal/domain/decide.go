@@ -54,8 +54,10 @@ func NormalizeNoopAction(s string) string {
 	return s
 }
 
-// DecideThresholds are the per-situation confidence thresholds (FR-009).
-type DecideThresholds struct {
+// ConfidenceThresholds contain the variance-guard minimum agreement and the
+// per-situation confidence thresholds (FR-009).
+type ConfidenceThresholds struct {
+	Minimum         float64
 	Idle            float64
 	Approval        float64
 	Choice          float64
@@ -64,7 +66,7 @@ type DecideThresholds struct {
 }
 
 // ForType returns the base threshold for a situation type.
-func (t DecideThresholds) ForType(st SituationType) float64 {
+func (t ConfidenceThresholds) ForType(st SituationType) float64 {
 	switch st {
 	case SituationIdle:
 		return t.Idle
@@ -82,20 +84,20 @@ func (t DecideThresholds) ForType(st SituationType) float64 {
 // All values are read by the caller (daemon) beforehand; Decide performs no
 // I/O.
 type DecideInput struct {
-	Situation     Situation
-	Signature     SignatureResult
-	State         *SignatureState  // nil when the signature is new
-	History       []DecisionRecord // newest first
-	Thresholds    DecideThresholds
-	GraduationN   int
-	KillActive    bool
-	Rate          AgentRate
-	RateLimits    RateLimits
-	Now           time.Time
-	RetryCount    int // error situations: automated retries so far
-	MaxRetries    int
-	DeclaredTask  *DeclaredTask // resolved declared source (nil = no source matched)
-	LLMConfigured bool
+	Situation            Situation
+	Signature            SignatureResult
+	State                *SignatureState  // nil when the signature is new
+	History              []DecisionRecord // newest first
+	ConfidenceThresholds ConfidenceThresholds
+	GraduationN          int
+	KillActive           bool
+	Rate                 AgentRate
+	RateLimits           RateLimits
+	Now                  time.Time
+	RetryCount           int // error situations: automated retries so far
+	MaxRetries           int
+	DeclaredTask         *DeclaredTask // resolved declared source (nil = no source matched)
+	LLMConfigured        bool
 	// GenerateTaskConfigured reports that llm.task_generate_command is set, so
 	// an idle agent with no task source generates a task suggestion instead of
 	// escalating no_task_source (FR-011 relaxation).
@@ -144,7 +146,7 @@ func Decide(in DecideInput) Decision {
 
 	conf := Confidence(in.History)
 
-	if VarianceGuardTripped(in.History) {
+	if VarianceGuardTripped(in.History, in.ConfidenceThresholds.Minimum) {
 		return esc(ReasonVarianceGuard, "contradictory history", conf.Score, "")
 	}
 
@@ -169,7 +171,7 @@ func Decide(in DecideInput) Decision {
 		return esc(ReasonSuspectedIrrevers, rationale, conf.Score, suggestion)
 	}
 
-	threshold := in.Thresholds.ForType(in.Situation.Type)
+	threshold := in.ConfidenceThresholds.ForType(in.Situation.Type)
 
 	// Resolve the candidate action per situation type.
 	candidate, suggestion, resolveEsc := resolveSituation(in, conf)
@@ -282,7 +284,7 @@ func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggest
 		inferred := InferNextTask(in.Situation.AgentType, in.Situation.Content)
 		if inferred.Structured {
 			// Pane-history inference is held to the higher bar.
-			if conf.Score <= in.Thresholds.InferredTaskBar && in.State != nil && in.State.Mode == ModeAutonomous {
+			if conf.Score <= in.ConfidenceThresholds.InferredTaskBar && in.State != nil && in.State.Mode == ModeAutonomous {
 				return "", "send inferred next task: " + inferred.Task, ReasonBelowThreshold
 			}
 			return ActionNextInferredTask, "send inferred next task: " + inferred.Task, ReasonNone

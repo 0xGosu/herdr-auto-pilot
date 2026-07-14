@@ -288,11 +288,12 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 
 | field | default | description |
 |---|---|---|
-| `thresholds.idle` | 0.75 | confidence threshold for idle agents |
-| `thresholds.approval` | 0.80 | confidence threshold for approval requests |
-| `thresholds.choice` | 0.80 | confidence threshold for choices |
-| `thresholds.error` | 0.85 | confidence threshold for error situations |
-| `thresholds.inferred_task_bar` | 0.90 | higher bar for tasks inferred from pane history |
+| `confidence_thresholds.minimum` | 0.50 | variance guard minimum learned-action agreement |
+| `confidence_thresholds.idle` | 0.65 | confidence threshold for idle agents |
+| `confidence_thresholds.approval` | 0.70 | confidence threshold for approval requests |
+| `confidence_thresholds.choice` | 0.70 | confidence threshold for choices |
+| `confidence_thresholds.error` | 0.75 | confidence threshold for error situations |
+| `confidence_thresholds.inferred_task_bar` | 0.60 | higher bar for tasks inferred from pane history |
 | `learning.graduation_n` | 5 | consecutive confirmations needed to graduate |
 | `limits.max_consecutive_auto_prompts` | 10 | max consecutive auto-prompts per agent without human interaction |
 | `limits.max_auto_prompts_per_minute` | 3 | rate limit per agent (rolling 1-minute window) |

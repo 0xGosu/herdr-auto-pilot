@@ -48,11 +48,12 @@ type TabInfo struct {
 
 // PaneInfo is per-pane metadata read via `herdr pane get` (herdr 0.7).
 type PaneInfo struct {
-	PaneID        string
-	TabID         string
-	WorkspaceID   string
-	Cwd           string // pane working directory; herdr renders a deleted dir with a " (deleted)" suffix
-	ForegroundCwd string // cwd of the foreground process; absent in some herdr responses
+	PaneID         string
+	TabID          string
+	WorkspaceID    string
+	Cwd            string // pane working directory; herdr renders a deleted dir with a " (deleted)" suffix
+	ForegroundCwd  string // cwd of the foreground process; absent in some herdr responses
+	AgentSessionID string // the agent's native session id (agent_session.value); empty when herdr has no stored session reference
 }
 
 // Situation is a classified, attention-requiring state of one agent pane.

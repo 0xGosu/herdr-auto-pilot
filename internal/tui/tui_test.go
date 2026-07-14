@@ -607,7 +607,7 @@ func TestConfigTabKeepsEditing(t *testing.T) {
 		t.Fatal("config items should be built from cfg")
 	}
 	m = press(t, m, "enter")
-	if m.prompt == nil || !strings.Contains(m.prompt.label, "set thresholds.idle") {
+	if m.prompt == nil || !strings.Contains(m.prompt.label, "set confidence_thresholds.minimum") {
 		t.Fatalf("enter on Config tab should edit the selected field, got %+v", m.prompt)
 	}
 	if !strings.Contains(testModel(t).View(), "Config") {

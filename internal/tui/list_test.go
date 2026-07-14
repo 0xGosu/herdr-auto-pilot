@@ -683,7 +683,7 @@ func TestStatusAreaDurableAcrossNavigation(t *testing.T) {
 		t.Errorf("transient hints must not clear the status area:\n%s", view)
 	}
 
-	// The next outcome replaces it; errors render with ✗.
+	// An outcome still replaces it directly; errors render with ✗.
 	upd, _ = m.Update(actionResultMsg{err: errors.New("boom")})
 	m = upd.(Model)
 	view = m.View()
@@ -692,6 +692,33 @@ func TestStatusAreaDurableAcrossNavigation(t *testing.T) {
 	}
 	if strings.Contains(view, "never-auto pattern added") {
 		t.Errorf("new outcome must replace the old status:\n%s", view)
+	}
+}
+
+func TestStatusAreaClearsWhenNextMutationStarts(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+		tab  tab
+	}{
+		{name: "confirm", key: "enter", tab: tabEscalations},
+		{name: "correct", key: "c", tab: tabEscalations},
+		{name: "delete", key: "x", tab: tabEscalations},
+		{name: "pause", key: "p", tab: tabAgents},
+		{name: "resume", key: "r", tab: tabAgents},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := listModel(t, 1, 30)
+			m.tab = tc.tab
+			m.status = &statusNote{text: "deleted escalation #153; audit rows kept as dismissed", at: time.Now()}
+
+			upd, _ := m.Update(pressKeyMsg(tc.key))
+			m = upd.(Model)
+			if m.status != nil {
+				t.Fatalf("%s should clear the previous action result, got %+v", tc.name, m.status)
+			}
+		})
 	}
 }
 

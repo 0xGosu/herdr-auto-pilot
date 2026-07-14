@@ -14,12 +14,12 @@ func baseInput(st SituationType) DecideInput {
 			AgentID:   "a1",
 			Content:   "Do you want to run the unit test suite now? (y/n)",
 		},
-		Signature:   SignatureResult{Signature: "sig", Verdict: GuardOK},
-		Thresholds:  DecideThresholds{Idle: 0.75, Approval: 0.8, Choice: 0.8, Error: 0.85, InferredTaskBar: 0.9},
-		GraduationN: 5,
-		RateLimits:  RateLimits{MaxConsecutive: 5, MaxPerMinute: 10},
-		Now:         time.Now(),
-		MaxRetries:  2,
+		Signature:            SignatureResult{Signature: "sig", Verdict: GuardOK},
+		ConfidenceThresholds: ConfidenceThresholds{Minimum: 0.5, Idle: 0.65, Approval: 0.7, Choice: 0.7, Error: 0.75, InferredTaskBar: 0.6},
+		GraduationN:          5,
+		RateLimits:           RateLimits{MaxConsecutive: 5, MaxPerMinute: 10},
+		Now:                  time.Now(),
+		MaxRetries:           2,
 	}
 }
 
@@ -139,6 +139,7 @@ func TestBelowThresholdConsultsLLMWhenConfigured(t *testing.T) {
 func TestVarianceGuardForcesEscalation(t *testing.T) {
 	// FR-003a: contradictory history escalates even in autonomous mode.
 	in := autonomous(baseInput(SituationApproval), "y", "n", "y", "n", "y", "n", "y", "n")
+	in.ConfidenceThresholds.Minimum = 0.6
 	d := Decide(in)
 	if d.Action != ActionEscalate {
 		t.Fatalf("variance guard must escalate, got %+v", d)
@@ -236,11 +237,12 @@ func TestIdleInferredTaskUnsupportedAgentTypeSkipsTier2(t *testing.T) {
 
 func TestIdleInferredTaskHigherBar(t *testing.T) {
 	content := "  ⎿  ✔ write parser\n     ■ add validation for config fields\n     □ wire logging"
-	// History consistent enough to clear the idle threshold (0.75) but the
-	// test uses a mixed history that stays below the inferred bar (0.9).
+	// History consistent enough to clear the idle threshold but the test uses
+	// a configured 0.9 inferred bar that the mixed history does not clear.
 	in := autonomous(baseInput(SituationIdle),
 		ActionNextInferredTask, ActionNextInferredTask, ActionNextInferredTask,
 		ActionNextInferredTask, ActionNextInferredTask, "something-else")
+	in.ConfidenceThresholds.InferredTaskBar = 0.9
 	in.Situation.Content = content
 	d := Decide(in)
 	if d.Action != ActionEscalate {
@@ -252,6 +254,7 @@ func TestIdleInferredTaskHigherBar(t *testing.T) {
 		ActionNextInferredTask, ActionNextInferredTask, ActionNextInferredTask,
 		ActionNextInferredTask, ActionNextInferredTask, ActionNextInferredTask,
 		ActionNextInferredTask, ActionNextInferredTask)
+	in2.ConfidenceThresholds.InferredTaskBar = 0.9
 	in2.Situation.Content = content
 	d2 := Decide(in2)
 	if d2.Action != ActionSend || d2.Input != "add validation for config fields" {

@@ -106,6 +106,7 @@ func TestDecideVarianceGuardOnMixedNoopHistory(t *testing.T) {
 	// the operator, never an autonomous pick.
 	in := autonomous(baseInput(SituationApproval),
 		ActionNoop, "1", ActionNoop, "1", ActionNoop, "1", ActionNoop, "1")
+	in.ConfidenceThresholds.Minimum = 0.6
 	d := Decide(in)
 	if d.Action != ActionEscalate || d.Reason != ReasonVarianceGuard {
 		t.Fatalf("mixed noop history must trip the variance guard, got %+v", d)

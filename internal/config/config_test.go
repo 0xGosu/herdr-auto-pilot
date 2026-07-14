@@ -14,23 +14,30 @@ func TestLoadMissingFileYieldsDefaults(t *testing.T) {
 		t.Fatalf("missing file must not error: %v", err)
 	}
 	d := Default()
-	if cfg.Thresholds != d.Thresholds || cfg.Learning != d.Learning || cfg.Limits != d.Limits {
+	if cfg.ConfidenceThresholds != d.ConfidenceThresholds || cfg.Learning != d.Learning || cfg.Limits != d.Limits {
 		t.Errorf("expected pure defaults, got %+v", cfg)
+	}
+	want := ConfidenceThresholds{
+		Minimum: 0.50, Idle: 0.65, Approval: 0.70,
+		Choice: 0.70, Error: 0.75, InferredTaskBar: 0.60,
+	}
+	if cfg.ConfidenceThresholds != want {
+		t.Errorf("confidence threshold defaults = %+v, want %+v", cfg.ConfidenceThresholds, want)
 	}
 }
 
 func TestLoadPartialConfigFillsDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
-	os.WriteFile(path, []byte("[thresholds]\napproval = 0.95\n"), 0o600)
+	os.WriteFile(path, []byte("[confidence_thresholds]\napproval = 0.95\n"), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Thresholds.Approval != 0.95 {
-		t.Errorf("explicit value lost: %v", cfg.Thresholds.Approval)
+	if cfg.ConfidenceThresholds.Approval != 0.95 {
+		t.Errorf("explicit value lost: %v", cfg.ConfidenceThresholds.Approval)
 	}
-	if cfg.Thresholds.Idle != Default().Thresholds.Idle {
-		t.Errorf("missing values should fall back to defaults, got %v", cfg.Thresholds.Idle)
+	if cfg.ConfidenceThresholds.Idle != Default().ConfidenceThresholds.Idle {
+		t.Errorf("missing values should fall back to defaults, got %v", cfg.ConfidenceThresholds.Idle)
 	}
 	if cfg.Learning.GraduationN != Default().Learning.GraduationN {
 		t.Errorf("graduation N default lost: %d", cfg.Learning.GraduationN)
@@ -108,30 +115,55 @@ func TestLoadMalformedTOMLRejectedSafely(t *testing.T) {
 func TestPerSituationThresholdsIndependent(t *testing.T) {
 	// FR-009: each threshold independently editable; reload applies changes.
 	path := filepath.Join(t.TempDir(), "config.toml")
-	os.WriteFile(path, []byte("[thresholds]\napproval = 0.9\nidle = 0.6\n"), 0o600)
+	os.WriteFile(path, []byte("[confidence_thresholds]\napproval = 0.9\nidle = 0.6\n"), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Thresholds.Approval <= cfg.Thresholds.Idle {
+	if cfg.ConfidenceThresholds.Approval <= cfg.ConfidenceThresholds.Idle {
 		t.Error("approval should require more confidence than idle per this config")
 	}
 
 	// Simulated reload with an edit.
-	os.WriteFile(path, []byte("[thresholds]\napproval = 0.7\nidle = 0.6\n"), 0o600)
+	os.WriteFile(path, []byte("[confidence_thresholds]\napproval = 0.7\nidle = 0.6\n"), 0o600)
 	cfg2, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg2.Thresholds.Approval != 0.7 {
-		t.Errorf("reload should pick up the edit, got %v", cfg2.Thresholds.Approval)
+	if cfg2.ConfidenceThresholds.Approval != 0.7 {
+		t.Errorf("reload should pick up the edit, got %v", cfg2.ConfidenceThresholds.Approval)
+	}
+}
+
+func TestLegacyThresholdsTableMigratesOnSave(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[thresholds]\nminimum = 0.55\napproval = 0.91\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConfidenceThresholds.Minimum != 0.55 || cfg.ConfidenceThresholds.Approval != 0.91 {
+		t.Fatalf("legacy thresholds not loaded: %+v", cfg.ConfidenceThresholds)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "[confidence_thresholds]") || strings.Contains(text, "[thresholds]") {
+		t.Fatalf("legacy table not migrated on save:\n%s", text)
 	}
 }
 
 func TestSaveRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	cfg := Default()
-	cfg.Thresholds.Choice = 0.88
+	cfg.ConfidenceThresholds.Choice = 0.88
 	cfg.Safety.NeverAutoPatterns = []string{`(?i)restart\s+prod`}
 	cfg.TaskSources = []TaskSource{{Agent: "a1", Path: "/tmp/tasks.md", NextTaskTemplate: "Do {next_task_content} from {task_list_path}"}}
 	if err := Save(path, cfg); err != nil {
@@ -141,7 +173,7 @@ func TestSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Thresholds.Choice != 0.88 || len(got.Safety.NeverAutoPatterns) != 1 || len(got.TaskSources) != 1 {
+	if got.ConfidenceThresholds.Choice != 0.88 || len(got.Safety.NeverAutoPatterns) != 1 || len(got.TaskSources) != 1 {
 		t.Errorf("round trip mismatch: %+v", got)
 	}
 	if got.TaskSources[0].NextTaskTemplate != "Do {next_task_content} from {task_list_path}" {

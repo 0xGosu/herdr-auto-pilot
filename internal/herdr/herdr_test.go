@@ -310,9 +310,12 @@ func TestPaneInfo(t *testing.T) {
 	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
 	ctx := context.Background()
 
-	// Full envelope as printed by real herdr 0.7.
+	// Full envelope as printed by real herdr 0.7, including the nested
+	// agent_session object whose "value" is the agent's native session id.
 	fake.SetPaneInfo(`{"id":"cli:pane:get","result":{"pane":{` +
-		`"agent":"claude","agent_status":"blocked","cwd":"/home/op/project",` +
+		`"agent":"claude","agent_session":{"agent":"claude","kind":"id",` +
+		`"source":"herdr:claude","value":"ba9a6f5a-ca6a-49dc-bcec-d4869ba97851"},` +
+		`"agent_status":"blocked","cwd":"/home/op/project",` +
 		`"foreground_cwd":"/home/op/project/sub","focused":false,"pane_id":"w1:p1",` +
 		`"revision":0,"tab_id":"w1:t1","workspace_id":"w1"},"type":"pane_info"}}`)
 	info, err := cli.PaneInfo(ctx, "w1:p1")
@@ -325,9 +328,13 @@ func TestPaneInfo(t *testing.T) {
 	if info.Cwd != "/home/op/project" || info.ForegroundCwd != "/home/op/project/sub" {
 		t.Errorf("cwd parsing: %+v", info)
 	}
+	if info.AgentSessionID != "ba9a6f5a-ca6a-49dc-bcec-d4869ba97851" {
+		t.Errorf("agent_session.value parsing: %+v", info)
+	}
 
 	// Deleted cwd renders with a literal suffix and no foreground_cwd;
-	// both pass through verbatim / zero-valued.
+	// both pass through verbatim / zero-valued. A pane with no stored
+	// session reference omits agent_session entirely — AgentSessionID zeroes.
 	fake.SetPaneInfo(`{"id":"cli:pane:get","result":{"pane":{` +
 		`"cwd":"/gone/dir (deleted)","pane_id":"w1:p2","tab_id":"w1:t1",` +
 		`"workspace_id":"w1"},"type":"pane_info"}}`)
@@ -336,6 +343,9 @@ func TestPaneInfo(t *testing.T) {
 	}
 	if info.Cwd != "/gone/dir (deleted)" || info.ForegroundCwd != "" {
 		t.Errorf("deleted-cwd handling: %+v", info)
+	}
+	if info.AgentSessionID != "" {
+		t.Errorf("absent agent_session must zero AgentSessionID: %+v", info)
 	}
 
 	// CLI failure surfaces an error.

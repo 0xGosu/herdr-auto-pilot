@@ -152,6 +152,12 @@ type paneGetResponse struct {
 			WorkspaceID   string `json:"workspace_id"`
 			Cwd           string `json:"cwd"`
 			ForegroundCwd string `json:"foreground_cwd"`
+			// agent_session is a read-only object herdr attaches when it has a
+			// stored native session reference; its "value" is the agent's
+			// session id. Absent when no session is stored.
+			AgentSession struct {
+				Value string `json:"value"`
+			} `json:"agent_session"`
 		} `json:"pane"`
 	} `json:"result"`
 }
@@ -169,11 +175,12 @@ func (c *CLI) PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, err
 	}
 	p := resp.Result.Pane
 	return domain.PaneInfo{
-		PaneID:        p.PaneID,
-		TabID:         p.TabID,
-		WorkspaceID:   p.WorkspaceID,
-		Cwd:           p.Cwd,
-		ForegroundCwd: p.ForegroundCwd,
+		PaneID:         p.PaneID,
+		TabID:          p.TabID,
+		WorkspaceID:    p.WorkspaceID,
+		Cwd:            p.Cwd,
+		ForegroundCwd:  p.ForegroundCwd,
+		AgentSessionID: p.AgentSession.Value,
 	}, nil
 }
 

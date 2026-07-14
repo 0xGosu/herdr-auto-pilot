@@ -175,15 +175,12 @@ func overMaskVerdict(masked string) GuardVerdict {
 // can trip (small histories are governed by graduation instead).
 const varianceMinDecisions = 4
 
-// varianceMinAgreement is the minimum recency-weighted top-action share below
-// which the guard trips.
-const varianceMinAgreement = 0.6
-
-// VarianceGuardTripped reports whether history shows contradictory decisions.
-func VarianceGuardTripped(history []DecisionRecord) bool {
+// VarianceGuardTripped reports whether history agreement falls below the
+// operator-configured minimum.
+func VarianceGuardTripped(history []DecisionRecord, minimumAgreement float64) bool {
 	if len(history) < varianceMinDecisions {
 		return false
 	}
 	conf := Confidence(history)
-	return conf.Score < varianceMinAgreement
+	return conf.Score < minimumAgreement
 }

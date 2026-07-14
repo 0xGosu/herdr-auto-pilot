@@ -7,13 +7,14 @@
 # apply live (the daemon is nudged, or picks them up on the next event).
 
 # ── Decision confidence ─────────────────────────────────────────────
-# Per-situation confidence a learned rule must reach before acting.
-[thresholds]
-idle = 0.75
-approval = 0.80
-choice = 0.80
-error = 0.85
-inferred_task_bar = 0.90   # higher bar for tasks inferred from the agent's todo widget
+# Minimum agreement plus per-situation confidence a learned rule must reach.
+[confidence_thresholds]
+minimum = 0.50             # variance guard: lower scores are contradictory history
+idle = 0.65
+approval = 0.70
+choice = 0.70
+error = 0.75
+inferred_task_bar = 0.60   # higher bar for tasks inferred from the agent's todo widget
 
 # ── Shadow-mode learning ────────────────────────────────────────────
 [learning]

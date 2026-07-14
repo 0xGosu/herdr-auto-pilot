@@ -693,7 +693,7 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		return nil
 	case "set-threshold":
 		if len(args) != 3 {
-			return fmt.Errorf("usage: config set-threshold <idle|approval|choice|error|inferred_task_bar> <value>")
+			return fmt.Errorf("usage: config set-threshold <minimum|idle|approval|choice|error|inferred_task_bar> <value>")
 		}
 		v, err := strconv.ParseFloat(args[2], 64)
 		if err != nil {
@@ -717,9 +717,9 @@ func paths(out io.Writer, app *frontend.App) error {
 }
 
 func printConfig(out io.Writer, cfg config.Config) {
-	fmt.Fprintf(out, "thresholds: idle=%.2f approval=%.2f choice=%.2f error=%.2f inferred_task_bar=%.2f\n",
-		cfg.Thresholds.Idle, cfg.Thresholds.Approval, cfg.Thresholds.Choice,
-		cfg.Thresholds.Error, cfg.Thresholds.InferredTaskBar)
+	fmt.Fprintf(out, "confidence thresholds: minimum=%.2f idle=%.2f approval=%.2f choice=%.2f error=%.2f inferred_task_bar=%.2f\n",
+		cfg.ConfidenceThresholds.Minimum, cfg.ConfidenceThresholds.Idle, cfg.ConfidenceThresholds.Approval,
+		cfg.ConfidenceThresholds.Choice, cfg.ConfidenceThresholds.Error, cfg.ConfidenceThresholds.InferredTaskBar)
 	fmt.Fprintf(out, "learning:   graduation_n=%d\n", cfg.Learning.GraduationN)
 	fmt.Fprintf(out, "limits:     consecutive=%d per_minute=%d error_retries=%d\n",
 		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries)

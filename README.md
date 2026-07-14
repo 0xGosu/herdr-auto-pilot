@@ -243,7 +243,8 @@ The plugin never acts on a situation it hasn't learned from you.
    printable key goes into the query — action keys like `q`, `y`, and `x`
    can't fire mid-search. Action outcomes (confirm, resolve, delete, …)
    stay pinned in a status area (`✓`/`✗` plus timestamp) until the next
-   action, so the result of a multi-step operation isn't missed. Detail
+   mutating action starts, so results remain readable without lingering
+   beside the next operation. Detail
    views always open at the top. Captured situations are collapsed to their
    title plus a trailing preview (three lines normally; ten for Escalations'
    Current Situation), and Audit's LLM output uses the same three-line
@@ -289,12 +290,13 @@ at [`sample/config.toml`](sample/config.toml) — copy it in and tune. The
 highlights:
 
 ```toml
-[thresholds]
-idle = 0.75
-approval = 0.80
-choice = 0.80
-error = 0.85
-inferred_task_bar = 0.90   # higher bar for tasks inferred from pane history
+[confidence_thresholds]
+minimum = 0.50             # variance guard: minimum learned-action agreement
+idle = 0.65
+approval = 0.70
+choice = 0.70
+error = 0.75
+inferred_task_bar = 0.60   # higher bar for tasks inferred from pane history
 
 [learning]
 graduation_n = 5           # consecutive confirmations to graduate
@@ -367,6 +369,10 @@ next_task_template = "Your next task is {next_task_content}. Read the full tasks
 # Default: on. Opt this source out with:
 # llm_review = false
 ```
+
+The former `[thresholds]` table is accepted for compatibility. Loading it
+preserves its values, and the next config save rewrites it as
+`[confidence_thresholds]`.
 
 ### Agent short names
 
