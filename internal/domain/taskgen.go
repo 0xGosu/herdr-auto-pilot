@@ -2,6 +2,7 @@ package domain
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -195,6 +196,14 @@ func hasAlphanumeric(s string) bool {
 // rest are pending ("[ ]", picked up by the normal declared-task flow on later
 // idles). Callers pass the result of NormalizeGeneratedTasks; an empty list
 // yields just the header.
+//
+// Each item is prefixed with its 1-based position as a numbered ID with an
+// escaped dot ("1\. ", "2\. ", …) rather than a plain bullet, so a standard
+// markdown task-list parser using a digit/dot-hierarchy ID scheme (e.g. the
+// task-list-md tool) can read the file directly. The backslash keeps the
+// marker from being rendered as a Markdown ordered list. NextDeclaredTask and
+// PendingDeclaredTasks strip this exact marker back off when resolving the
+// bare task text, so the daemon's declared-task flow is unaffected.
 func RenderGeneratedTaskList(agentName string, tasks []string) string {
 	var b strings.Builder
 	b.WriteString("# Tasks for ")
@@ -208,6 +217,8 @@ func RenderGeneratedTaskList(agentName string, tasks []string) string {
 		b.WriteString("- ")
 		b.WriteString(marker)
 		b.WriteString(" ")
+		b.WriteString(strconv.Itoa(i + 1))
+		b.WriteString(`\. `)
 		b.WriteString(t)
 		b.WriteString("\n")
 	}

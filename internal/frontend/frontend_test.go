@@ -478,8 +478,8 @@ func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tasks file not written: %v", err)
 	}
-	if !strings.Contains(string(body), "- [-] "+taskText) {
-		t.Errorf("tasks file = %q, want a single in-progress %q item", body, taskText)
+	if !strings.Contains(string(body), "- [-] 1\\. "+taskText) {
+		t.Errorf("tasks file = %q, want a single numbered in-progress %q item", body, taskText)
 	}
 
 	// The item is parsed as not-actionable, so the declared-task resolver
@@ -574,9 +574,9 @@ func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tasks file not written: %v", err)
 	}
-	want := "- [-] Investigate the flaky auth test\n- [ ] Add a retry guard\n- [ ] Backfill unit tests\n"
+	want := "- [-] 1\\. Investigate the flaky auth test\n- [ ] 2\\. Add a retry guard\n- [ ] 3\\. Backfill unit tests\n"
 	if !strings.Contains(string(body), want) {
-		t.Errorf("tasks file = %q, want a checklist %q", body, want)
+		t.Errorf("tasks file = %q, want a numbered checklist %q", body, want)
 	}
 	// Only the first task is sent to the agent, rendered through the same
 	// default prompt used for later items from the registered source.

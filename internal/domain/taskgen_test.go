@@ -226,9 +226,12 @@ func TestNormalizeGeneratedTasksRealSample(t *testing.T) {
 }
 
 func TestRenderGeneratedTaskList(t *testing.T) {
-	// First task is in-progress "[-]"; the rest are pending "[ ]".
+	// First task is in-progress "[-]"; the rest are pending "[ ]". Each item
+	// carries its 1-based position as a numbered ID with an escaped dot
+	// ("1\. ", "2\. ", …) instead of a plain bullet, so a standard markdown
+	// task-list parser can read the file directly.
 	got := RenderGeneratedTaskList("brave-otter", []string{"first", "second", "third"})
-	want := "# Tasks for brave-otter\n\n- [-] first\n- [ ] second\n- [ ] third\n"
+	want := "# Tasks for brave-otter\n\n- [-] 1\\. first\n- [ ] 2\\. second\n- [ ] 3\\. third\n"
 	if got != want {
 		t.Errorf("RenderGeneratedTaskList =\n%q\nwant\n%q", got, want)
 	}
@@ -236,17 +239,24 @@ func TestRenderGeneratedTaskList(t *testing.T) {
 	// The first (only) item of a single-task list is in-progress, and the
 	// declared-task parser treats it as not-actionable (no next "[ ]").
 	single := RenderGeneratedTaskList("a", []string{"only task"})
-	if !strings.Contains(single, "- [-] only task") {
-		t.Errorf("single task must be in-progress, got %q", single)
+	if !strings.Contains(single, "- [-] 1\\. only task") {
+		t.Errorf("single task must be in-progress and numbered, got %q", single)
 	}
 	if NextDeclaredTask(single) != "" {
 		t.Errorf("an all-in-progress list must have no next declared task, got %q", NextDeclaredTask(single))
 	}
 
 	// A multi-task list's NEXT declared task is the first pending "[ ]" item,
-	// so the normal flow drives the queue after the in-progress one.
+	// so the normal flow drives the queue after the in-progress one. The
+	// resolved text is the bare task — the numbered ID marker is stripped.
 	multi := RenderGeneratedTaskList("a", []string{"doing now", "up next", "later"})
+	if !strings.Contains(multi, "- [ ] 2\\. up next") {
+		t.Errorf("second item must carry numbered ID 2, got %q", multi)
+	}
 	if next := NextDeclaredTask(multi); next != "up next" {
-		t.Errorf("next declared task = %q, want the first pending item %q", next, "up next")
+		t.Errorf("next declared task = %q, want the first pending item %q with its ID marker stripped", next, "up next")
+	}
+	if pending := PendingDeclaredTasks(multi); len(pending) != 2 || pending[0] != "up next" || pending[1] != "later" {
+		t.Errorf("pending declared tasks = %v, want [\"up next\" \"later\"] with ID markers stripped", pending)
 	}
 }
