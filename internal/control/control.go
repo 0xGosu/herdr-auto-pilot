@@ -8,8 +8,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -26,6 +28,38 @@ const (
 	// stale-daemon remedy (`hap daemon --ensure`) applies.
 	KindReembed Kind = "reembed"
 )
+
+const capturePrefix = "capture:"
+
+// CaptureKind returns a targeted manual-capture nudge. The target is carried
+// in the kind so the existing one-field control protocol and server callback
+// remain backward compatible.
+func CaptureKind(target string) (Kind, error) {
+	target = strings.TrimSpace(target)
+	if !validCaptureTarget(target) {
+		return "", fmt.Errorf("invalid capture target %q", target)
+	}
+	return Kind(capturePrefix + target), nil
+}
+
+// CaptureTarget extracts a target from a manual-capture kind.
+func CaptureTarget(kind Kind) (string, bool) {
+	target, ok := strings.CutPrefix(string(kind), capturePrefix)
+	return target, ok && validCaptureTarget(target)
+}
+
+func validCaptureTarget(target string) bool {
+	return target != "" && len(target) <= 256 && target == strings.TrimSpace(target) &&
+		!strings.ContainsAny(target, "\r\n\x00")
+}
+
+func validKind(kind Kind) bool {
+	if kind == KindReload || kind == KindWake || kind == KindReembed {
+		return true
+	}
+	_, ok := CaptureTarget(kind)
+	return ok
+}
 
 type message struct {
 	Kind Kind `json:"kind"`
@@ -77,7 +111,7 @@ func (s *Server) accept() {
 					slog.Warn("malformed control nudge ignored", "error", err)
 					continue
 				}
-				if m.Kind != KindReload && m.Kind != KindWake && m.Kind != KindReembed {
+				if !validKind(m.Kind) {
 					slog.Warn("unknown control nudge kind ignored", "kind", m.Kind)
 					continue
 				}
@@ -150,4 +184,14 @@ func Nudge(ctx context.Context, path string, kind Kind) error {
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = conn.Write(append(data, '\n'))
 	return err
+}
+
+// NudgeCapture asks the daemon to re-run its normal capture pipeline for one
+// live agent, even when startup reconciliation already handled that episode.
+func NudgeCapture(ctx context.Context, path, target string) error {
+	kind, err := CaptureKind(target)
+	if err != nil {
+		return err
+	}
+	return Nudge(ctx, path, kind)
 }

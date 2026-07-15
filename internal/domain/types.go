@@ -32,6 +32,10 @@ type AgentTransition struct {
 	// RetryAuditID marks a daemon-injected transition that re-evaluates a
 	// retired LLM-failure escalation. Transient: Herdr events leave it zero.
 	RetryAuditID int64
+	// ManualCapture marks a CLI-requested re-capture of the live pane. It
+	// follows the normal attention pipeline but is identified in the audit
+	// trigger for operator-visible provenance.
+	ManualCapture bool
 }
 
 // WorkspaceInfo is display metadata for one Herdr workspace.

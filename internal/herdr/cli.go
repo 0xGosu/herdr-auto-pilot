@@ -16,10 +16,11 @@ import (
 )
 
 var (
-	_ ports.InspectorPort     = (*CLI)(nil)
-	_ ports.VisiblePaneReader = (*CLI)(nil)
-	_ ports.KeystrokeSender   = (*CLI)(nil)
-	_ ports.AgentAwareSender  = (*CLI)(nil)
+	_ ports.InspectorPort           = (*CLI)(nil)
+	_ ports.VisiblePaneReader       = (*CLI)(nil)
+	_ ports.KeystrokeSender         = (*CLI)(nil)
+	_ ports.KeystrokeSequenceSender = (*CLI)(nil)
+	_ ports.AgentAwareSender        = (*CLI)(nil)
 )
 
 const codexSecondEnterDelay = 300 * time.Millisecond
@@ -102,6 +103,18 @@ func (c *CLI) send(ctx context.Context, paneID, input string, codex bool) error 
 // question form, digit keys answer numbered menus in place.
 func (c *CLI) SendKey(ctx context.Context, paneID, key string) error {
 	_, err := c.run(ctx, "pane", "send-keys", paneID, key)
+	return err
+}
+
+// SendKeys presses a sequence in one Herdr request. Codex navigation resets
+// use this instead of spawning one CLI process per arrow: its TUI reliably
+// handles the ordered key list as one terminal input operation.
+func (c *CLI) SendKeys(ctx context.Context, paneID string, keys ...string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	args := append([]string{"pane", "send-keys", paneID}, keys...)
+	_, err := c.run(ctx, args...)
 	return err
 }
 

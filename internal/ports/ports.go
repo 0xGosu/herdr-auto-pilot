@@ -71,6 +71,14 @@ type KeystrokeSender interface {
 	SendKey(ctx context.Context, paneID, key string) error
 }
 
+// KeystrokeSequenceSender is the optional batched counterpart used when a TUI
+// must receive one ordered navigation sequence. Herdr supports multiple keys in
+// one `pane send-keys` invocation; callers fall back to KeystrokeSender when
+// this capability is absent.
+type KeystrokeSequenceSender interface {
+	SendKeys(ctx context.Context, paneID string, keys ...string) error
+}
+
 // FocusPort is implemented by Herdr adapters that can bring a tab/pane into
 // view. Optional: callers type-assert and report "not supported" when absent.
 type FocusPort interface {

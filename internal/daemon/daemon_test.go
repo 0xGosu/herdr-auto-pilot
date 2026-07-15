@@ -118,6 +118,15 @@ func (f *fakeHerdr) SendKey(ctx context.Context, paneID, key string) error {
 	return nil
 }
 
+func (f *fakeHerdr) SendKeys(ctx context.Context, paneID string, keys ...string) error {
+	for _, key := range keys {
+		if err := f.SendKey(ctx, paneID, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (f *fakeHerdr) keysSent() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -569,6 +578,27 @@ func TestPipelineAutoApprovesConfidentSignature(t *testing.T) {
 	if !contains(audits[0].PaneExcerpt, "Do you want to proceed") {
 		t.Errorf("auto audit must carry the classified pane content, got %q", audits[0].PaneExcerpt)
 	}
+}
+
+func TestManualCaptureNudgeUsesNormalPipeline(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: "agent-manual", PaneID: "agent-manual", AgentType: "claude", Status: "blocked",
+	}})
+
+	if err := control.NudgeCapture(context.Background(), h.ctlPath, "agent-manual"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(context.Background(), 10)
+		for _, audit := range audits {
+			if audit.AgentID == "agent-manual" && audit.Trigger == "manual-capture: blocked" {
+				return audit.SituationType == domain.SituationApproval
+			}
+		}
+		return false
+	})
 }
 
 func TestLLMPromotionDeliversMenuDigitForLabel(t *testing.T) {

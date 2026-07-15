@@ -85,6 +85,39 @@ func TestReembedNudgeRoundTrip(t *testing.T) {
 	t.Fatal("reembed nudge never reached the handler")
 }
 
+func TestCaptureNudgeRoundTrip(t *testing.T) {
+	path := filepath.Join(testutil.SocketDir(t), "ctl.sock")
+	got := make(chan Kind, 1)
+	srv, err := NewServer(path, func(k Kind) { got <- k })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	if err := NudgeCapture(context.Background(), path, "w2:pB"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case kind := <-got:
+		if target, ok := CaptureTarget(kind); !ok || target != "w2:pB" {
+			t.Fatalf("capture kind %q decoded as target=%q ok=%v", kind, target, ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("capture nudge never reached the handler")
+	}
+
+	for _, target := range []string{"", "bad\nagent", string(make([]byte, 257))} {
+		if _, err := CaptureKind(target); err == nil {
+			t.Errorf("CaptureKind(%q) should fail", target)
+		}
+	}
+	for _, kind := range []Kind{"capture: padded", Kind("capture:" + string(make([]byte, 257)))} {
+		if target, ok := CaptureTarget(kind); ok {
+			t.Errorf("CaptureTarget(%q) = %q, true; want rejected", kind, target)
+		}
+	}
+}
+
 func TestSocketOwnerOnlyPermissions(t *testing.T) {
 	path := filepath.Join(testutil.SocketDir(t), "ctl.sock")
 	srv, err := NewServer(path, func(Kind) {})

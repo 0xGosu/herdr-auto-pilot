@@ -480,13 +480,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 			})
 		case kind := <-d.nudges:
 			logging.Guard("nudge", func() error {
-				switch kind {
-				case control.KindReload:
-					d.reload()
-				case control.KindReembed:
-					// Operator-requested re-compute: force a fresh embedder
-					// (clean degraded latch) and re-run the semantic init.
-					d.reloadWith(true)
+				if target, ok := control.CaptureTarget(kind); ok {
+					d.captureLiveAgent(ctx, target)
+				} else {
+					switch kind {
+					case control.KindReload:
+						d.reload()
+					case control.KindReembed:
+						// Operator-requested re-compute: force a fresh embedder
+						// (clean degraded latch) and re-run the semantic init.
+						d.reloadWith(true)
+					}
 				}
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
@@ -516,6 +520,40 @@ func (d *Daemon) Run(ctx context.Context) error {
 			})
 		}
 	}
+}
+
+// captureLiveAgent resolves a targeted control request against the daemon's
+// current live view, then feeds the current parked state into the same delayed
+// capture pipeline as a real Herdr event. It intentionally bypasses only the
+// reconcile episode/open-escalation guards; downstream duplicate and safety
+// checks remain authoritative.
+func (d *Daemon) captureLiveAgent(ctx context.Context, target string) {
+	agents, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		slog.Error("manual capture: listing agents failed", "target", target, "error", err)
+		return
+	}
+	for _, tr := range agents {
+		if tr.AgentID != target && tr.PaneID != target {
+			continue
+		}
+		switch tr.Status {
+		case "blocked", "idle", "done":
+			tr.ManualCapture = true
+			// The nudge loop runs reconciliation immediately after this method.
+			// Claim the parked episode first so reconcile cannot coalesce a
+			// provenance-less transition over this explicit request.
+			d.mu.Lock()
+			d.episodeHandled[tr.PaneID] = true
+			d.mu.Unlock()
+			slog.Info("manual capture queued", "agent", tr.AgentID, "pane", tr.PaneID, "status", tr.Status)
+			d.scheduleCapture(ctx, tr)
+		default:
+			slog.Warn("manual capture ignored: agent is not parked", "agent", tr.AgentID, "status", tr.Status)
+		}
+		return
+	}
+	slog.Warn("manual capture ignored: live agent not found", "target", target)
 }
 
 // handleTransition evaluates one agent-status transition end to end.
@@ -3034,6 +3072,9 @@ func confidenceThresholds(cfg config.Config) domain.ConfidenceThresholds {
 }
 
 func trigger(tr domain.AgentTransition) string {
+	if tr.ManualCapture {
+		return fmt.Sprintf("manual-capture: %s", tr.Status)
+	}
 	return fmt.Sprintf("agent-status: %s", tr.Status)
 }
 

@@ -8,18 +8,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 func testApp(t *testing.T) (*frontend.App, *store.Store) {
@@ -42,6 +45,71 @@ func run(t *testing.T, app *frontend.App, verb string, args ...string) (string, 
 	var out bytes.Buffer
 	err := cli.Run(context.Background(), app, &out, verb, args)
 	return out.String(), err
+}
+
+type captureHerdr struct {
+	agents []domain.AgentTransition
+}
+
+func (f *captureHerdr) Send(context.Context, string, string) error { return nil }
+func (f *captureHerdr) ReadPane(context.Context, string, int) (string, error) {
+	return "", nil
+}
+func (f *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
+	return f.agents, nil
+}
+
+func TestCaptureCLI(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	if err := st.AssignAgentName(ctx, "pane-live", "vivid-falcon"); err != nil {
+		t.Fatal(err)
+	}
+	app.Herdr = &captureHerdr{agents: []domain.AgentTransition{{
+		AgentID: "pane-live", PaneID: "pane-live", AgentType: "codex", Status: "blocked",
+	}}}
+	app.DaemonInfo = func() (bool, int, string) { return true, 42, buildinfo.Version }
+	sock := filepath.Join(testutil.SocketDir(t), "capture.sock")
+	var mu sync.Mutex
+	var kinds []control.Kind
+	srv, err := control.NewServer(sock, func(k control.Kind) {
+		mu.Lock()
+		defer mu.Unlock()
+		kinds = append(kinds, k)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	app.ControlPath = sock
+
+	out, err := run(t, app, "capture", "vivid-falcon")
+	if err != nil || !strings.Contains(out, "capture queued for vivid-falcon") || !strings.Contains(out, "pane-live") {
+		t.Fatalf("capture output=%q err=%v", out, err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(kinds)
+		mu.Unlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(kinds) != 1 {
+		t.Fatalf("capture nudges = %v", kinds)
+	}
+	if target, ok := control.CaptureTarget(kinds[0]); !ok || target != "pane-live" {
+		t.Fatalf("capture target=%q ok=%v", target, ok)
+	}
+
+	app.DaemonInfo = func() (bool, int, string) { return true, 42, "old-version" }
+	if _, err := run(t, app, "capture", "vivid-falcon"); err == nil || !strings.Contains(err.Error(), "STALE") {
+		t.Fatalf("stale daemon should be rejected, got %v", err)
+	}
 }
 
 func TestStatusShowsDaemonLine(t *testing.T) {

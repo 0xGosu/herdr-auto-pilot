@@ -171,10 +171,16 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 	}
 
 	if moved {
-		for i := 0; i < sweepResetKeys; i++ {
-			if err := ks.SendKey(ctx, s.PaneID, "left"); err != nil {
-				return s, fmt.Errorf("reset left-arrow %d/%d: %w (form may not be on its first question)",
-					i+1, sweepResetKeys, err)
+		if s.MCQKind == domain.MCQCodexQuestions {
+			if err := d.resetCodexForm(ctx, ks, s.PaneID, answerCount); err != nil {
+				return s, err
+			}
+		} else {
+			for i := 0; i < sweepResetKeys; i++ {
+				if err := ks.SendKey(ctx, s.PaneID, "left"); err != nil {
+					return s, fmt.Errorf("reset left-arrow %d/%d: %w (form may not be on its first question)",
+						i+1, sweepResetKeys, err)
+				}
 			}
 		}
 	}
@@ -188,6 +194,51 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 	swept.AnswerMultiSelect = multiSelect
 	swept.TabMultiSelect = multiSelect
 	return swept, nil
+}
+
+// resetCodexForm walks a Codex request_user_input form back to question 1
+// adaptively. Separate Herdr calls can straddle a Codex re-render, so each
+// attempt reads the live index and sends the remaining Left keys as one
+// ordered sequence when supported. Success is a verified question-1 read.
+func (d *Daemon) resetCodexForm(ctx context.Context, ks ports.KeystrokeSender,
+	paneID string, answerCount int) error {
+	for attempt := 0; attempt <= sweepResetKeys; attempt++ {
+		pane, err := d.readVisible(ctx, paneID, d.opt.PaneReadLines)
+		if err != nil {
+			return fmt.Errorf("reset Codex form read: %w", err)
+		}
+		state, ok := domain.CodexMCQForm(pane)
+		if !ok || state.AnswerCount != answerCount {
+			return fmt.Errorf("reset Codex form no longer shows the %d-question form", answerCount)
+		}
+		if state.Current == 1 {
+			return nil
+		}
+		if attempt == sweepResetKeys {
+			break
+		}
+		steps := state.Current - 1
+		if seq, ok := ks.(ports.KeystrokeSequenceSender); ok {
+			keys := make([]string, steps)
+			for i := range keys {
+				keys[i] = "left"
+			}
+			if err := seq.SendKeys(ctx, paneID, keys...); err != nil {
+				return fmt.Errorf("reset Codex form left sequence: %w", err)
+			}
+		} else {
+			for i := 0; i < steps; i++ {
+				if err := ks.SendKey(ctx, paneID, "left"); err != nil {
+					return fmt.Errorf("reset Codex form left-arrow %d/%d: %w", attempt+1, sweepResetKeys, err)
+				}
+				if i+1 < steps {
+					time.Sleep(sweepKeyDelay)
+				}
+			}
+		}
+		time.Sleep(sweepKeyDelay)
+	}
+	return fmt.Errorf("reset Codex form did not reach question 1 after %d attempts", sweepResetKeys)
 }
 
 // anyMultiSelect reports whether any tab in the swept form is multi-select.
@@ -474,12 +525,9 @@ func (d *Daemon) sendCodexSelections(ctx context.Context, ks ports.KeystrokeSend
 			return fmt.Errorf("codex question %d is single-select, got %d selections", i+1, len(group))
 		}
 	}
-	for i := 0; i < sweepResetKeys; i++ {
-		if err := ks.SendKey(ctx, s.PaneID, "left"); err != nil {
-			return fmt.Errorf("reset left-arrow %d/%d: %w", i+1, sweepResetKeys, err)
-		}
+	if err := d.resetCodexForm(ctx, ks, s.PaneID, s.EffectiveAnswerCount()); err != nil {
+		return err
 	}
-	time.Sleep(sweepKeyDelay)
 
 	answerCount := s.EffectiveAnswerCount()
 	for i, group := range groups {

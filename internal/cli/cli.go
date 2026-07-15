@@ -36,6 +36,8 @@ func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, arg
 		return status(ctx, app, out)
 	case "agents":
 		return agents(ctx, app, out)
+	case "capture":
+		return capture(ctx, app, out, args)
 	case "escalations":
 		return escalations(ctx, app, out, args)
 	case "audit":
@@ -81,6 +83,29 @@ func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, arg
 		return clearData(ctx, app, out, args)
 	}
 	return fmt.Errorf("unknown command %q", verb)
+}
+
+func capture(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+		return fmt.Errorf("usage: capture <agent-name-or-pane-id>")
+	}
+	if app.DaemonInfo != nil {
+		running, _, ver := app.DaemonInfo()
+		if !running {
+			return fmt.Errorf("daemon is not running — run: hap daemon --ensure")
+		}
+		if ver != buildinfo.Version {
+			return fmt.Errorf("daemon is STALE (running %s, binary is %s) — run: hap daemon --ensure",
+				daemonlock.VersionLabel(ver), buildinfo.Version)
+		}
+	}
+	agent, err := app.CaptureAgent(ctx, args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "capture queued for %s (%s, %s); check: hap escalations\n",
+		args[0], agent.AgentID, agent.Status)
+	return nil
 }
 
 func signatures(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {

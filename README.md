@@ -238,6 +238,14 @@ The plugin never acts on a situation it hasn't learned from you.
    responding — the audit row is kept as `dismissed`. Deleting a learned
    rule still asks for confirmation, and audit entries can't be deleted
    individually (only the full clear-data reset removes them). CLI:
+
+   `hap capture <agent-name-or-pane-id>` explicitly re-runs the daemon's
+   normal delayed capture pipeline for a live `blocked`, `idle`, or `done`
+   agent. This is useful for testing or re-reading a pane after a daemon
+   restart; classification, MCQ sweeping, safety gates, duplicate handling,
+   automation, and auditing are identical to a real Herdr status event, so a
+   learned or LLM-approved response may be sent.
+
    `dismiss <id>...` and `escalations prune [minutes]`. Long lists scroll
    with the cursor and show a `… N more` line when rows are clipped, and
    `/` opens an incremental search on the *Agents*, *Escalations*,

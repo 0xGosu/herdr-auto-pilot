@@ -1390,6 +1390,49 @@ func TestStatusHidesOnlyDoublePlaceholderAgents(t *testing.T) {
 	}
 }
 
+func TestCaptureAgentResolvesNameAndNudgesDaemon(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	if err := st.AssignAgentName(ctx, "pane-2", "vivid-falcon"); err != nil {
+		t.Fatal(err)
+	}
+	app.Herdr = &fakeHerdrPort{agents: []domain.AgentTransition{
+		{AgentID: "pane-1", PaneID: "pane-1", AgentType: "codex", Status: "working"},
+		{AgentID: "pane-2", PaneID: "pane-2", AgentType: "codex", Status: "blocked"},
+	}}
+	sock := filepath.Join(testutil.SocketDir(t), "capture.sock")
+	got := make(chan control.Kind, 1)
+	srv, err := control.NewServer(sock, func(k control.Kind) { got <- k })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	app.ControlPath = sock
+
+	agent, err := app.CaptureAgent(ctx, "vivid-falcon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.AgentID != "pane-2" || agent.Status != "blocked" {
+		t.Fatalf("resolved agent = %+v", agent)
+	}
+	select {
+	case kind := <-got:
+		if target, ok := control.CaptureTarget(kind); !ok || target != "pane-2" {
+			t.Fatalf("capture target = %q, %v", target, ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("capture nudge not received")
+	}
+
+	if _, err := app.CaptureAgent(ctx, "pane-1"); err == nil || !strings.Contains(err.Error(), "is working") {
+		t.Fatalf("working agent must be rejected, got %v", err)
+	}
+	if _, err := app.CaptureAgent(ctx, "missing"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("missing agent must be rejected, got %v", err)
+	}
+}
+
 func TestRenameLiveButUnnamedAgent(t *testing.T) {
 	// Regression: the TUI/CLI list agents straight from Herdr, but the
 	// daemon only creates a name row when the agent first transitions. A

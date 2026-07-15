@@ -83,7 +83,7 @@ func (a *App) deliverCodexSeries(ctx context.Context, ks ports.KeystrokeSender,
 			return fmt.Errorf("codex question %d is single-select, got %d selections", i+1, len(group))
 		}
 	}
-	if err := a.resetForm(ctx, ks, audit.AgentID); err != nil {
+	if err := a.resetCodexForm(ctx, ks, audit.AgentID, len(groups)); err != nil {
 		return err
 	}
 	answerCount := len(groups)
@@ -167,6 +167,50 @@ func (a *App) deliverCodexSeries(ctx context.Context, ks ports.KeystrokeSender,
 		}
 	}
 	return nil
+}
+
+// resetCodexForm is the operator-delivery counterpart to the daemon's
+// adaptive reset: read the live question index, send the remaining Left keys
+// together when supported, and stop only after question 1 is actually visible.
+func (a *App) resetCodexForm(ctx context.Context, ks ports.KeystrokeSender,
+	agentID string, answerCount int) error {
+	for attempt := 0; attempt <= seriesResetKeys; attempt++ {
+		pane, err := a.readVisiblePane(ctx, agentID, menuReadLines)
+		if err != nil {
+			return fmt.Errorf("resetting Codex form read failed: %w", err)
+		}
+		state, ok := domain.CodexMCQForm(pane)
+		if !ok || state.AnswerCount != answerCount {
+			return fmt.Errorf("the pane no longer shows the %d-question Codex form", answerCount)
+		}
+		if state.Current == 1 {
+			return nil
+		}
+		if attempt == seriesResetKeys {
+			break
+		}
+		steps := state.Current - 1
+		if seq, ok := ks.(ports.KeystrokeSequenceSender); ok {
+			keys := make([]string, steps)
+			for i := range keys {
+				keys[i] = "left"
+			}
+			if err := seq.SendKeys(ctx, agentID, keys...); err != nil {
+				return fmt.Errorf("resetting the Codex form failed: %w", err)
+			}
+		} else {
+			for i := 0; i < steps; i++ {
+				if err := ks.SendKey(ctx, agentID, "left"); err != nil {
+					return fmt.Errorf("resetting the Codex form failed: %w", err)
+				}
+				if i+1 < steps {
+					time.Sleep(seriesKeyDelay)
+				}
+			}
+		}
+		time.Sleep(seriesKeyDelay)
+	}
+	return fmt.Errorf("the Codex form did not return to question 1")
 }
 
 // verifyTabBaseline walks the form read-only (reset, then one Right per tab)
@@ -518,6 +562,57 @@ func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
 		return err
 	}
 	return a.nudge(ctx, control.KindReload)
+}
+
+// CaptureAgent asks the daemon to re-run the normal attention pipeline for a
+// currently parked live agent. Exact pane/agent ids take precedence over the
+// operator-assigned short name.
+func (a *App) CaptureAgent(ctx context.Context, target string) (domain.AgentTransition, error) {
+	if a.Herdr == nil {
+		return domain.AgentTransition{}, fmt.Errorf("herdr is unavailable")
+	}
+	if a.ControlPath == "" {
+		return domain.AgentTransition{}, fmt.Errorf("daemon control socket is unavailable")
+	}
+	agents, err := a.Herdr.ListAgents(ctx)
+	if err != nil {
+		return domain.AgentTransition{}, fmt.Errorf("listing live agents: %w", err)
+	}
+	names, err := a.Store.AgentNames(ctx)
+	if err != nil {
+		return domain.AgentTransition{}, err
+	}
+	var found *domain.AgentTransition
+	for i := range agents {
+		if agents[i].AgentID == target || agents[i].PaneID == target {
+			found = &agents[i]
+			break
+		}
+	}
+	if found == nil {
+		for i := range agents {
+			if names[agents[i].AgentID] == target {
+				found = &agents[i]
+				break
+			}
+		}
+	}
+	if found == nil {
+		return domain.AgentTransition{}, fmt.Errorf("live agent %q not found", target)
+	}
+	switch found.Status {
+	case "blocked", "idle", "done":
+	default:
+		return domain.AgentTransition{}, fmt.Errorf("agent %q is %s; capture requires blocked, idle, or done", target, found.Status)
+	}
+	agentID := found.AgentID
+	if agentID == "" {
+		agentID = found.PaneID
+	}
+	if err := control.NudgeCapture(ctx, a.ControlPath, agentID); err != nil {
+		return domain.AgentTransition{}, fmt.Errorf("requesting capture from daemon: %w", err)
+	}
+	return *found, nil
 }
 
 // Escalations lists pending escalations.

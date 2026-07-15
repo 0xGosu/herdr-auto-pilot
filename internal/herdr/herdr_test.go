@@ -305,6 +305,26 @@ func TestSendSubmitsWithEnter(t *testing.T) {
 	}
 }
 
+func TestSendKeysUsesOneHerdrInvocation(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.SendKeys(context.Background(), "w1:p1", "left", "left"); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fake.Calls(); len(calls) != 1 || calls[0] != "pane send-keys w1:p1 left left" {
+		t.Fatalf("batched keys calls = %v", calls)
+	}
+	if err := cli.SendKeys(context.Background(), "w1:p1"); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fake.Calls(); len(calls) != 1 {
+		t.Fatalf("empty key sequence should be a no-op, calls = %v", calls)
+	}
+}
+
 func TestSendToCodexSubmitsAgainAfterDelay(t *testing.T) {
 	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
 	if err != nil {
