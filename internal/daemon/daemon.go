@@ -1716,7 +1716,7 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		}
 		fields["in_progress_task_count"] = len(review.inProgress)
 		if p := taskPreview(review.inProgress); p != "" {
-			fields["next_in_progress_task"] = p
+			fields["first_in_progress_task"] = p
 		}
 	} else if summary, ok := d.taskSourceSummary(ctx, cfg, s, workspaceID, agentName); ok {
 		fields["task_list_path"] = summary.path
@@ -1725,8 +1725,8 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 			fields["next_pending_task"] = summary.nextPending
 		}
 		fields["in_progress_task_count"] = summary.inProgressCount
-		if summary.nextInProgress != "" {
-			fields["next_in_progress_task"] = summary.nextInProgress
+		if summary.firstInProgress != "" {
+			fields["first_in_progress_task"] = summary.firstInProgress
 		}
 	}
 	// Pre-send declared-task review: the agent is idle with a next task queued.
@@ -2748,11 +2748,11 @@ type taskSourceSummaryFields struct {
 	pendingCount    int
 	nextPending     string
 	inProgressCount int
-	nextInProgress  string
+	firstInProgress string
 }
 
 // taskPreview returns a truncated preview of the first item, or "" when
-// items is empty — the shared rule for whether a get_context "next_*" field
+// items is empty — the shared rule for whether a get_context preview field
 // is included at all.
 func taskPreview(items []string) string {
 	if len(items) == 0 {
@@ -2775,7 +2775,7 @@ func (d *Daemon) taskSourceSummary(ctx context.Context, cfg config.Config, s dom
 		pendingCount:    len(pending),
 		nextPending:     taskPreview(pending),
 		inProgressCount: len(inProgress),
-		nextInProgress:  taskPreview(inProgress),
+		firstInProgress: taskPreview(inProgress),
 	}, true
 }
 
