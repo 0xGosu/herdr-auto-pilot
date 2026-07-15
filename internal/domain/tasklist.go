@@ -23,7 +23,14 @@ var inProgressItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[-\]\s*(.+)$`)
 // item (or NoTaskContent when the list is complete), {task_list_path} is
 // the task-source file path, {agent_name} is the agent's short name, {cwd}
 // is the agent's working directory (the project it is in).
-const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."
+//
+// The default steers the agent to manage its list through the `hap task` CLI
+// with the agent's own name pre-filled in every command (so `hap task
+// {agent_name} done <n>` resolves this exact source). It also spells out the
+// `--path {task_list_path}` form so a source that isn't name-addressable (one
+// scoped by agent type, pane id, workspace, or "any") is still manageable —
+// `hap task {agent_name}` errors on those, and the path form always works.
+const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them and `hap task {agent_name} done <n>` to mark one complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`)."
 
 // NoTaskContent is the {next_task_content} value when a declared list has
 // no unchecked item left: the templated prompt is still delivered so the

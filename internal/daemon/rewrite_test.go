@@ -32,7 +32,11 @@ func idleRewriteHarness(t *testing.T, agent, extraCfg string,
 	h, fr := newHarnessRewriter(t, cfg, rewrite)
 	h.herdr.setPane(idlePane)
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
-	original := fmt.Sprintf("Your next task is step two. Read the full tasks list at %s.", taskFile)
+	name, err := h.raw.EnsureAgentName(context.Background(), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name}).Prompt()
 	return h, fr, original
 }
 

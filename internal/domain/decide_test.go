@@ -145,7 +145,7 @@ func TestRunawayGuardIdleRetainsDeclaredTaskSuggestion(t *testing.T) {
 	if d.Action != ActionEscalate || d.Reason != ReasonRateLimited {
 		t.Fatalf("rate-limited idle situation must escalate, got %+v", d)
 	}
-	want := "send next declared task: Your next task is write the changelog. Read the full tasks list at /tasks.md."
+	want := "send next declared task: " + in.DeclaredTask.Prompt()
 	if d.Suggestion != want {
 		t.Fatalf("suggestion = %q, want %q", d.Suggestion, want)
 	}
@@ -277,7 +277,7 @@ func TestIdleDeclaredTaskSource(t *testing.T) {
 		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
 	in.DeclaredTask = &DeclaredTask{Task: "Implement the config loader", Path: "/docs/tasks.md"}
 	d := Decide(in)
-	want := "Your next task is Implement the config loader. Read the full tasks list at /docs/tasks.md."
+	want := in.DeclaredTask.Prompt()
 	if d.Action != ActionSend || d.Input != want {
 		t.Fatalf("declared task source should drive the next prompt, got %+v", d)
 	}
@@ -306,7 +306,7 @@ func TestIdleDeclaredTaskCompletedListStillSends(t *testing.T) {
 		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
 	in.DeclaredTask = &DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md"}
 	d := Decide(in)
-	want := "Your next task is none. Read the full tasks list at /docs/tasks.md."
+	want := in.DeclaredTask.Prompt()
 	if d.Action != ActionSend || d.Input != want {
 		t.Fatalf("completed declared list should still send the templated prompt, got %+v", d)
 	}

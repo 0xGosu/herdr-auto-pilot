@@ -459,10 +459,12 @@ task doesn't interrupt a working agent; it's picked up on the agent's next idle.
 
 ### template placeholders
 
-the prompt sent to the agent is rendered from a template. the default is:
+the prompt sent to the agent is rendered from a template. the default steers the
+agent to manage its list through the `hap task` CLI with its own name pre-filled
+in every command (and a `--path` fallback for sources that aren't name-addressable):
 
 ```
-Your next task is {next_task_content}. Read the full tasks list at {task_list_path}.
+Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them and `hap task {agent_name} done <n>` to mark one complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`).
 ```
 
 - `{next_task_content}` — the text of the next unchecked item (or `"none"` when the list is complete)

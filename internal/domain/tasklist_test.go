@@ -87,14 +87,14 @@ func TestDeclaredTaskPrompt(t *testing.T) {
 		want string
 	}{
 		{
-			name: "default template",
-			task: DeclaredTask{Task: "add validation", Path: "/docs/tasks.md"},
-			want: "Your next task is add validation. Read the full tasks list at /docs/tasks.md.",
+			name: "default template crafts CLI commands with the agent name and a --path fallback",
+			task: DeclaredTask{Task: "add validation", Path: "/docs/tasks.md", AgentName: "brave-otter"},
+			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks: `hap task brave-otter list` to view them and `hap task brave-otter done <n>` to mark one complete as you go (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`).",
 		},
 		{
 			name: "completed list uses none",
-			task: DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md"},
-			want: "Your next task is none. Read the full tasks list at /docs/tasks.md.",
+			task: DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md", AgentName: "brave-otter"},
+			want: "Your next task is none. Prefer the hap CLI to manage your tasks: `hap task brave-otter list` to view them and `hap task brave-otter done <n>` to mark one complete as you go (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`).",
 		},
 		{
 			name: "custom template",
