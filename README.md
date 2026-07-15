@@ -429,6 +429,16 @@ independently from LLM consults and rewrites. (These keys were renamed from
 `generate_task_command*`; the old spellings no longer load, so update an
 existing config.)
 
+### Task source info in every consult
+
+Whenever an agent has a matching `[[task_sources]]` entry, `get_context`
+carries `task_list_path` (the checklist file), `pending_task_count` (how many
+items are still unchecked), and — only when at least one is pending —
+`next_pending_task` (a truncated preview of the next unchecked item). This is
+included on **every** LLM consult for that agent (approval, choice, error, or
+idle), not just the pre-send task review below, so the LLM always knows the
+agent's backlog state.
+
 ### Reviewing tasks before they are sent (optional)
 
 When an `[llm].command` is configured, each task determined from a

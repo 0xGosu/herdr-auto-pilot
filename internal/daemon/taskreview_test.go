@@ -111,6 +111,15 @@ func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
 	if len(pending) != 2 || pending[0] != "refactor the parser" || pending[1] != "add parser tests" {
 		t.Errorf("pending_tasks = %v, want the two unchecked items in order", pending)
 	}
+	// The always-on task_source summary fields must agree with the review's
+	// own pending_tasks/current_task, since both are set from review.pending
+	// in the review branch.
+	if pc, _ := m["pending_task_count"].(float64); pc != 2 {
+		t.Errorf("pending_task_count = %v, want 2", m["pending_task_count"])
+	}
+	if np, _ := m["next_pending_task"].(string); np != "refactor the parser" {
+		t.Errorf("next_pending_task = %q, want %q", np, "refactor the parser")
+	}
 }
 
 func TestDeclaredTaskLLMReviewSendProposedSentinel(t *testing.T) {
@@ -392,5 +401,92 @@ func TestDeclaredTaskLLMReviewSourceChangedEscalates(t *testing.T) {
 	}
 	if len(h.herdr.sentInputs()) != 0 {
 		t.Errorf("a stale task must not be sent, sent %v", h.herdr.sentInputs())
+	}
+}
+
+func TestConsultContextIncludesMatchedTaskSourceOnApproval(t *testing.T) {
+	// A matched [[task_sources]] entry must surface task info on every
+	// consult, not just the pre-send idle review.
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [ ] refactor the parser\n- [ ] add parser tests\n")
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-ts1\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-ts1", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if lp, _ := m["task_list_path"].(string); lp != taskFile {
+		t.Errorf("task_list_path = %q, want %q", lp, taskFile)
+	}
+	if pc, _ := m["pending_task_count"].(float64); pc != 2 {
+		t.Errorf("pending_task_count = %v, want 2", m["pending_task_count"])
+	}
+	if np, _ := m["next_pending_task"].(string); np != "refactor the parser" {
+		t.Errorf("next_pending_task = %q, want %q", np, "refactor the parser")
+	}
+}
+
+func TestConsultContextMatchedTaskSourceCompletedOmitsNextField(t *testing.T) {
+	// A fully checked-off checklist still matches (path + zero count), but
+	// next_pending_task must be omitted entirely — there is nothing to preview.
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [x] ship it\n")
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-ts2\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-ts2", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if lp, _ := m["task_list_path"].(string); lp != taskFile {
+		t.Errorf("task_list_path = %q, want %q", lp, taskFile)
+	}
+	if pc, _ := m["pending_task_count"].(float64); pc != 0 {
+		t.Errorf("pending_task_count = %v, want 0", m["pending_task_count"])
+	}
+	if _, present := m["next_pending_task"]; present {
+		t.Errorf("next_pending_task must be absent when nothing is pending, got %v", m["next_pending_task"])
+	}
+}
+
+func TestConsultContextNoTaskSourceOmitsTaskFields(t *testing.T) {
+	// No [[task_sources]] entry matches this agent: none of the task_source
+	// summary fields should appear.
+	h := newHarness(t, "")
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-no-ts", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	for _, key := range []string{"task_list_path", "pending_task_count", "next_pending_task"} {
+		if _, present := m[key]; present {
+			t.Errorf("%s must be absent with no matching task source, got %v", key, m[key])
+		}
+	}
+}
+
+func TestConsultContextNextPendingTaskTruncated(t *testing.T) {
+	// A long next-task item is truncated with the standard ellipsis marker.
+	long := strings.Repeat("x", 250)
+	taskFile := writeReviewTaskFile(t, fmt.Sprintf("- [ ] %s\n", long))
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-ts3\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-ts3", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	next, _ := m["next_pending_task"].(string)
+	const wantRunes = 200
+	gotRunes := []rune(next)
+	if len(gotRunes) != wantRunes+1 || gotRunes[wantRunes] != '…' {
+		t.Errorf("next_pending_task = %q (%d runes), want %d chars + ellipsis marker", next, len(gotRunes), wantRunes)
 	}
 }
