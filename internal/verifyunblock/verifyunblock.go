@@ -13,10 +13,9 @@
 // LIMITATION: the check looks only at the agent's reported status
 // (agent_status == "blocked"); it cannot distinguish the original prompt from a
 // NEW one the agent raised after answering. An agent that answers and then
-// immediately blocks on a follow-up prompt within the delay window can trip a
-// benign false-positive delivery_failed row. Operators should read
-// delivery_failed as "still blocked shortly after the action" and raise
-// limits.verify_unblock_ms if a fast multi-prompt agent is noisy.
+// immediately blocks on a follow-up prompt within the fixed one-second delay
+// can trip a benign false-positive delivery_failed row. Operators should read
+// delivery_failed as "still blocked shortly after the action."
 package verifyunblock
 
 import (

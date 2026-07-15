@@ -45,10 +45,13 @@ func TestNeverAutoVetoesRegardlessOfConfidence(t *testing.T) {
 	// confidence or mode.
 	in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y", "y", "y")
 	in.NeverAutoMatched = true
-	in.NeverAutoHit = `git push --force`
+	in.NeverAutoRuleHit = NeverAutoHit{Pattern: `git push --force`, Excerpt: "git push --force"}
 	d := Decide(in)
 	if d.Action != ActionEscalate || d.Reason != ReasonNeverAutoMatch {
 		t.Fatalf("allowlist match must escalate, got %+v", d)
+	}
+	if !strings.Contains(d.Rationale, `git push --force`) || !strings.Contains(d.Rationale, `matched "git push --force"`) {
+		t.Fatalf("never-auto rationale must name pattern and excerpt, got %q", d.Rationale)
 	}
 }
 

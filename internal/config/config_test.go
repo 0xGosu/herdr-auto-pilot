@@ -1,12 +1,23 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func loadWithLogs(path string) (Config, string, error) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(previous)
+	cfg, err := Load(path)
+	return cfg, logs.String(), err
+}
 
 func TestLoadMissingFileYieldsDefaults(t *testing.T) {
 	cfg, err := Load(filepath.Join(t.TempDir(), "nope.toml"))
@@ -48,42 +59,30 @@ func TestLoadPartialConfigFillsDefaults(t *testing.T) {
 	if cfg.Embedding.PaneSalientChars != 0 {
 		t.Errorf("unset pane_salient_chars should stay 0 (use-default), got %d", cfg.Embedding.PaneSalientChars)
 	}
-	// verify_unblock_ms is absent here → defaults to 1000.
-	if cfg.Limits.VerifyUnblockMs != Default().Limits.VerifyUnblockMs {
-		t.Errorf("unset verify_unblock_ms should default to %d, got %d",
-			Default().Limits.VerifyUnblockMs, cfg.Limits.VerifyUnblockMs)
-	}
 }
 
-// TestVerifyUnblockMsExplicitZeroDisables: an explicit 0 must survive Load
-// (fillZeroes must not restore the default), so operators can disable the
-// post-action self-check.
-func TestVerifyUnblockMsExplicitZeroDisables(t *testing.T) {
+func TestDeprecatedVerifyUnblockMsIgnoredAndDroppedOnSave(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
-	os.WriteFile(path, []byte("[limits]\nverify_unblock_ms = 0\n"), 0o600)
-	cfg, err := Load(path)
+	os.WriteFile(path, []byte("[limits]\nverify_unblock_ms = 0\nmax_error_retries = 4\n"), 0o600)
+	cfg, logs, err := loadWithLogs(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Limits.VerifyUnblockMs != 0 {
-		t.Errorf("explicit verify_unblock_ms = 0 must stay 0 (disabled), got %d", cfg.Limits.VerifyUnblockMs)
+	if !strings.Contains(logs, "no longer supported") || !strings.Contains(logs, "always waits 1000ms") {
+		t.Errorf("legacy verify_unblock_ms warning missing or unclear: %q", logs)
 	}
-	// A sibling limit omitted in the same [limits] block still gets its default.
-	if cfg.Limits.MaxErrorRetries != Default().Limits.MaxErrorRetries {
-		t.Errorf("sibling default lost: %d", cfg.Limits.MaxErrorRetries)
+	if cfg.Limits.MaxErrorRetries != 4 {
+		t.Errorf("sibling limit lost: %d", cfg.Limits.MaxErrorRetries)
 	}
-}
-
-// TestVerifyUnblockMsExplicitValueKept: a positive override round-trips.
-func TestVerifyUnblockMsExplicitValueKept(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.toml")
-	os.WriteFile(path, []byte("[limits]\nverify_unblock_ms = 250\n"), 0o600)
-	cfg, err := Load(path)
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Limits.VerifyUnblockMs != 250 {
-		t.Errorf("verify_unblock_ms override lost, got %d", cfg.Limits.VerifyUnblockMs)
+	if strings.Contains(string(data), "verify_unblock_ms") {
+		t.Fatalf("saved config must drop removed verify_unblock_ms:\n%s", data)
 	}
 }
 
@@ -165,6 +164,9 @@ func TestSaveRoundTrip(t *testing.T) {
 	cfg := Default()
 	cfg.ConfidenceThresholds.Choice = 0.88
 	cfg.Safety.NeverAutoPatterns = []string{`(?i)restart\s+prod`}
+	cfg.Safety.NeverAutoRules = []NeverAutoRule{{
+		Pattern: `(?i)compact\s+conversation`, AgentTypes: []string{"codex", "agy"},
+	}}
 	cfg.TaskSources = []TaskSource{{Agent: "a1", Path: "/tmp/tasks.md", NextTaskTemplate: "Do {next_task_content} from {task_list_path}"}}
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
@@ -173,8 +175,13 @@ func TestSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ConfidenceThresholds.Choice != 0.88 || len(got.Safety.NeverAutoPatterns) != 1 || len(got.TaskSources) != 1 {
+	if got.ConfidenceThresholds.Choice != 0.88 || len(got.Safety.NeverAutoPatterns) != 1 ||
+		len(got.Safety.NeverAutoRules) != 1 || len(got.TaskSources) != 1 {
 		t.Errorf("round trip mismatch: %+v", got)
+	}
+	if len(got.Safety.NeverAutoRules) == 1 && (len(got.Safety.NeverAutoRules[0].AgentTypes) != 2 ||
+		got.Safety.NeverAutoRules[0].AgentTypes[1] != "agy") {
+		t.Errorf("scoped never-auto rule round trip mismatch: %+v", got.Safety.NeverAutoRules)
 	}
 	if got.TaskSources[0].NextTaskTemplate != "Do {next_task_content} from {task_list_path}" {
 		t.Errorf("next_task_template round trip mismatch: %+v", got.TaskSources[0])
@@ -210,36 +217,59 @@ llm_review = false
 	}
 }
 
-func TestLoadAgentScopedIndicatorRules(t *testing.T) {
+func TestLoadNeverAutoRulesAndMigrateLegacyIndicators(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	os.WriteFile(path, []byte(`
 [safety]
+never_auto_patterns = ['canonical']
 irreversible_indicators = ['(?i)nuke\s+it']
 
-[[safety.indicator_rules]]
+[[safety.never_auto_rules]]
 pattern = '(?i)compact\s+the\s+conversation'
-agents = ["codex", "agy"]
+agent_types = ["codex", "agy"]
 
 [[safety.indicator_rules]]
 pattern = '(?i)squash\s+the\s+timeline'
 agents = ["*"]
 `), 0o600)
-	cfg, err := Load(path)
+	cfg, logs, err := loadWithLogs(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Safety.IrreversibleIndicators) != 1 {
-		t.Errorf("flat indicators lost: %+v", cfg.Safety.IrreversibleIndicators)
+	for _, deprecated := range []string{"safety.irreversible_indicators", "safety.indicator_rules"} {
+		if !strings.Contains(logs, deprecated) || !strings.Contains(logs, "deprecated") {
+			t.Errorf("migration warning for %s missing: %q", deprecated, logs)
+		}
 	}
-	if len(cfg.Safety.IndicatorRules) != 2 {
-		t.Fatalf("expected 2 indicator rules, got %+v", cfg.Safety.IndicatorRules)
+	if len(cfg.Safety.NeverAutoPatterns) != 2 || cfg.Safety.NeverAutoPatterns[1] != `(?i)nuke\s+it` {
+		t.Errorf("legacy flat indicator not merged: %+v", cfg.Safety.NeverAutoPatterns)
 	}
-	r := cfg.Safety.IndicatorRules[0]
-	if r.Pattern != `(?i)compact\s+the\s+conversation` || len(r.Agents) != 2 || r.Agents[1] != "agy" {
+	if len(cfg.Safety.NeverAutoRules) != 2 {
+		t.Fatalf("expected 2 unified rules, got %+v", cfg.Safety.NeverAutoRules)
+	}
+	r := cfg.Safety.NeverAutoRules[0]
+	if r.Pattern != `(?i)compact\s+the\s+conversation` || len(r.AgentTypes) != 2 || r.AgentTypes[1] != "agy" {
 		t.Errorf("scoped rule mismatch: %+v", r)
 	}
-	if cfg.Safety.IndicatorRules[1].Agents[0] != "*" {
-		t.Errorf("wildcard rule mismatch: %+v", cfg.Safety.IndicatorRules[1])
+	if cfg.Safety.NeverAutoRules[1].AgentTypes[0] != "*" {
+		t.Errorf("legacy wildcard rule mismatch: %+v", cfg.Safety.NeverAutoRules[1])
+	}
+	if cfg.Safety.DeprecatedIrreversibleIndicators != nil || cfg.Safety.DeprecatedIndicatorRules != nil {
+		t.Error("legacy indicator fields must be cleared after migration")
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, "irreversible_indicators") || strings.Contains(text, "indicator_rules") {
+		t.Fatalf("saved config must drop legacy indicator keys:\n%s", text)
+	}
+	if !strings.Contains(text, "never_auto_patterns") || !strings.Contains(text, "never_auto_rules") {
+		t.Fatalf("saved config missing unified never-auto keys:\n%s", text)
 	}
 }
 
@@ -829,6 +859,54 @@ func TestDeprecatedAllowlistPatternsEmptySliceMigrates(t *testing.T) {
 	data, _ := os.ReadFile(path)
 	if strings.Contains(string(data), "allowlist_patterns") {
 		t.Errorf("saved config must not re-emit the deprecated key:\n%s", data)
+	}
+}
+
+func TestDisableNeverAutoSeedPatternsMigration(t *testing.T) {
+	cases := []struct {
+		name string
+		toml string
+		want bool
+	}{
+		{"legacy true migrates", "[safety]\ndisable_seed = true\n", true},
+		{"legacy false migrates", "[safety]\ndisable_seed = false\n", false},
+		{"canonical true loads", "[safety]\ndisable_never_auto_seed_patterns = true\n", true},
+		{"canonical false wins over legacy true", "[safety]\ndisable_seed = true\ndisable_never_auto_seed_patterns = false\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.toml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, logs, err := loadWithLogs(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(tc.toml, "disable_seed") && !strings.Contains(logs, "deprecated") {
+				t.Errorf("legacy disable_seed warning missing: %q", logs)
+			}
+			if cfg.Safety.DisableNeverAutoSeedPatterns != tc.want {
+				t.Errorf("disable_never_auto_seed_patterns = %v, want %v", cfg.Safety.DisableNeverAutoSeedPatterns, tc.want)
+			}
+			if cfg.Safety.DeprecatedDisableSeed != nil {
+				t.Error("deprecated disable_seed field must be cleared after load")
+			}
+			if err := Save(path, cfg); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(data)
+			if strings.Contains(text, "disable_seed =") {
+				t.Fatalf("saved config must not re-emit deprecated disable_seed:\n%s", text)
+			}
+			if !strings.Contains(text, "disable_never_auto_seed_patterns") {
+				t.Fatalf("saved config missing canonical safety key:\n%s", text)
+			}
+		})
 	}
 }
 

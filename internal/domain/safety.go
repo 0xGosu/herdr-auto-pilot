@@ -61,144 +61,201 @@ var SeedNeverAutoPatterns = []string{
 	`(?i)\b(merge|merging)\b[^\n]*\bpull request\b[^\n]*\b(main|master|prod)`,
 }
 
-// IndicatorRule is one suspected-irreversible indicator, optionally scoped
-// to a subset of agent types. An empty Agents list — or one containing "*" —
-// applies the indicator to every agent.
-type IndicatorRule struct {
-	Pattern string
-	Agents  []string
+// NeverAutoRuleKind preserves the behavioral class of a unified matcher rule.
+// Strict rules are explicit never-auto policy; heuristic rules are shipped
+// suspected-irreversible signals. Both share compilation and agent scoping.
+type NeverAutoRuleKind string
+
+const (
+	NeverAutoStrict    NeverAutoRuleKind = "strict"
+	NeverAutoHeuristic NeverAutoRuleKind = "heuristic"
+)
+
+// NeverAutoRuleSource records who supplied a rule for diagnostics.
+type NeverAutoRuleSource string
+
+const (
+	NeverAutoSeed     NeverAutoRuleSource = "seed"
+	NeverAutoOperator NeverAutoRuleSource = "operator"
+)
+
+// NeverAutoRule is one regex in the unified matcher. An empty AgentTypes list
+// — or one containing "*" — applies the rule to every agent type.
+type NeverAutoRule struct {
+	Pattern    string
+	AgentTypes []string
+	Kind       NeverAutoRuleKind
+	Source     NeverAutoRuleSource
 }
 
-// SeedIrreversibleIndicators back the suspected-irreversible-but-unmatched
-// heuristic (FR-016): destructive-operation indicators that, present in a
-// prompt with no never-auto match, bias the plugin toward escalation. The
-// seed rules apply to all agent types; operator rules may scope to a subset.
+func seedHeuristic(pattern string) NeverAutoRule {
+	return NeverAutoRule{Pattern: pattern, Kind: NeverAutoHeuristic, Source: NeverAutoSeed}
+}
+
+// SeedHeuristicNeverAutoRules back the suspected-irreversible-but-unmatched
+// heuristic (FR-016). They live in the unified matcher with metadata that
+// distinguishes them from strict seed rules.
 //
 // A hit escalates unconditionally, so every indicator needs corroboration:
 // a bare verb like "remove" or "drop" appears in everyday refactoring
 // prompts ("remove the unused import") and must not trip the heuristic on
 // its own — only paired with a data/infrastructure target, no-undo
 // language, or a force/credential/production context.
-var SeedIrreversibleIndicators = []IndicatorRule{
+var SeedHeuristicNeverAutoRules = []NeverAutoRule{
 	// Explicit no-undo language — strong enough to stand alone.
-	{Pattern: `(?i)\birreversibl[ey]\b|\bunrecoverabl[ey]\b|\bcannot\s+be\s+(undone|recovered|restored|reversed|reverted)\b|\bcan't\s+be\s+undone\b|\bno\s+undo\b|\blost\s+forever\b|\b(is|are)\s+permanent\b`},
-	{Pattern: `(?i)\bare\s+you\s+absolutely\s+sure\b`},
+	seedHeuristic(`(?i)\birreversibl[ey]\b|\bunrecoverabl[ey]\b|\bcannot\s+be\s+(undone|recovered|restored|reversed|reverted)\b|\bcan't\s+be\s+undone\b|\bno\s+undo\b|\blost\s+forever\b|\b(is|are)\s+permanent\b`),
+	seedHeuristic(`(?i)\bare\s+you\s+absolutely\s+sure\b`),
 	// Destructive verb aimed at a data/infrastructure target. The bridge
 	// allows at most one line break or one blank line: confirmations often
 	// put the verb and its target on adjacent lines ("Delete the
 	// following?\n\n - production backups"), but a verb and target separated
 	// by other lines of text is narration, not a pending operation.
-	{Pattern: `(?i)\b(delet(e[sd]?|ing)|destroy(s|ed|ing)?|remov(e[sd]?|ing)|eras(e[sd]?|ing)|wip(e[sd]?|ing)|purg(e[sd]?|ing)|drop(s|ped|ping)?|truncat(e[sd]?|ing))\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(databases?|tables?|schemas?|backups?|snapshots?|buckets?|volumes?|partitions?|disks?|prod(uction)?|(user|customer|all)\s+data|records?|history|repositor(y|ies)|accounts?)\b`},
-	{Pattern: `(?i)\bpermanently\s+(delet|destroy|remov|eras|wip|purg|discard)`},
+	seedHeuristic(`(?i)\b(delet(e[sd]?|ing)|destroy(s|ed|ing)?|remov(e[sd]?|ing)|eras(e[sd]?|ing)|wip(e[sd]?|ing)|purg(e[sd]?|ing)|drop(s|ped|ping)?|truncat(e[sd]?|ing))\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(databases?|tables?|schemas?|backups?|snapshots?|buckets?|volumes?|partitions?|disks?|prod(uction)?|(user|customer|all)\s+data|records?|history|repositor(y|ies)|accounts?)\b`),
+	seedHeuristic(`(?i)\bpermanently\s+(delet|destroy|remov|eras|wip|purg|discard)`),
 	// Forced overwrites/removals (force-push itself is a seed pattern).
-	{Pattern: `(?i)\bforc(e|ed|ibly)\b[^\n]*\b(overwrit|delet|remov|push)`},
+	seedHeuristic(`(?i)\bforc(e|ed|ibly)\b[^\n]*\b(overwrit|delet|remov|push)`),
 	// Credential / access invalidation.
-	{Pattern: `(?i)\b(revok|rotat|invalidat|regenerat)(e[sd]?|ing|ion)\b[^\n]*\b(access|keys?|tokens?|cert(ificate)?s?|credentials?|secrets?|sessions?|passwords?)\b`},
+	seedHeuristic(`(?i)\b(revok|rotat|invalidat|regenerat)(e[sd]?|ing|ion)\b[^\n]*\b(access|keys?|tokens?|cert(ificate)?s?|credentials?|secrets?|sessions?|passwords?)\b`),
 	// Shipping to shared/production surfaces.
-	{Pattern: `(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing)|push(es|ed|ing)?)\b[^\n]*\b(prod|production|live|public)\b`},
+	seedHeuristic(`(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing)|push(es|ed|ing)?)\b[^\n]*\b(prod|production|live|public)\b`),
 	// Discarding work.
-	{Pattern: `(?i)\b(overwrit(e[sd]?|ing)|clobber(s|ed|ing)?|discard(s|ed|ing)?)\b[^\n]*\b(changes|data|history|work)\b`},
+	seedHeuristic(`(?i)\b(overwrit(e[sd]?|ing)|clobber(s|ed|ing)?|discard(s|ed|ing)?)\b[^\n]*\b(changes|data|history|work)\b`),
 	// A confirmation that itself names a destructive act (same bounded
 	// bridge as the verb/target rule above).
-	{Pattern: `(?i)\bare\s+you\s+sure\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(delet|remov|eras|wip|purg|discard|overwrit|destroy|drop|reset)`},
+	seedHeuristic(`(?i)\bare\s+you\s+sure\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(delet|remov|eras|wip|purg|discard|overwrit|destroy|drop|reset)`),
 }
 
-// compiledIndicator is one indicator rule ready for matching.
-type compiledIndicator struct {
-	re     *regexp.Regexp
-	raw    string
-	agents []string // empty (or containing "*") = all agent types
+// SeedNeverAutoRuleCount is the total number of shipped strict and heuristic
+// rules controlled by safety.disable_never_auto_seed_patterns.
+func SeedNeverAutoRuleCount() int {
+	return len(SeedNeverAutoPatterns) + len(SeedHeuristicNeverAutoRules)
+}
+
+// compiledNeverAutoRule is one unified rule ready for matching.
+type compiledNeverAutoRule struct {
+	rule NeverAutoRule
+	re   *regexp.Regexp
 }
 
 // NeverAutoList is the compiled never-auto matcher plus the suspected-
 // irreversible heuristic.
 type NeverAutoList struct {
-	patterns   []*regexp.Regexp
-	raw        []string
-	indicators []compiledIndicator
+	rules []compiledNeverAutoRule
 }
 
-// NewNeverAutoList compiles seed + operator patterns and heuristic indicators.
+// NewNeverAutoList compiles strict and heuristic rules into one matcher while
+// preserving each rule's source, kind, and agent-type scope.
 // Invalid operator patterns are reported, not silently dropped.
-func NewNeverAutoList(seedEnabled bool, extraPatterns []string, extraIndicators []IndicatorRule) (*NeverAutoList, []error) {
+func NewNeverAutoList(seedEnabled bool, extraPatterns []string, extraRules []NeverAutoRule) (*NeverAutoList, []error) {
 	var errs []error
 	a := &NeverAutoList{}
-	addPatterns := func(pats []string) {
-		for _, p := range pats {
-			re, err := regexp.Compile(p)
+	addRules := func(rules []NeverAutoRule, defaultKind NeverAutoRuleKind, defaultSource NeverAutoRuleSource) {
+		for _, rule := range rules {
+			if rule.Kind == "" {
+				rule.Kind = defaultKind
+			}
+			if rule.Source == "" {
+				rule.Source = defaultSource
+			}
+			re, err := regexp.Compile(rule.Pattern)
 			if err != nil {
-				errs = append(errs, fmt.Errorf("invalid pattern %q: %w", p, err))
+				errs = append(errs, fmt.Errorf("invalid pattern %q: %w", rule.Pattern, err))
 				continue
 			}
-			a.patterns = append(a.patterns, re)
-			a.raw = append(a.raw, p)
-		}
-	}
-	addIndicators := func(rules []IndicatorRule) {
-		for _, r := range rules {
-			re, err := regexp.Compile(r.Pattern)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("invalid pattern %q: %w", r.Pattern, err))
-				continue
-			}
-			a.indicators = append(a.indicators, compiledIndicator{re: re, raw: r.Pattern, agents: r.Agents})
+			a.rules = append(a.rules, compiledNeverAutoRule{rule: rule, re: re})
 		}
 	}
 	if seedEnabled {
-		addPatterns(SeedNeverAutoPatterns)
+		seedRules := make([]NeverAutoRule, 0, len(SeedNeverAutoPatterns))
+		for _, pattern := range SeedNeverAutoPatterns {
+			seedRules = append(seedRules, NeverAutoRule{Pattern: pattern})
+		}
+		addRules(seedRules, NeverAutoStrict, NeverAutoSeed)
+		addRules(SeedHeuristicNeverAutoRules, NeverAutoHeuristic, NeverAutoSeed)
 	}
-	addPatterns(extraPatterns)
-	addIndicators(SeedIrreversibleIndicators)
-	addIndicators(extraIndicators)
+	operatorRules := make([]NeverAutoRule, 0, len(extraPatterns)+len(extraRules))
+	for _, pattern := range extraPatterns {
+		operatorRules = append(operatorRules, NeverAutoRule{Pattern: pattern})
+	}
+	operatorRules = append(operatorRules, extraRules...)
+	addRules(operatorRules, NeverAutoStrict, NeverAutoOperator)
 	return a, errs
 }
 
 // Match returns the first never-auto pattern matching content, if any.
 // A match means the operation may never be automated (FR-015).
-func (a *NeverAutoList) Match(content string) (string, bool) {
-	for i, re := range a.patterns {
-		if re.MatchString(content) {
-			return a.raw[i], true
+func (a *NeverAutoList) Match(agentType, content string) (NeverAutoHit, bool) {
+	for _, compiled := range a.rules {
+		if compiled.rule.Kind != NeverAutoStrict || !ruleAppliesTo(compiled.rule.AgentTypes, agentType) {
+			continue
+		}
+		if loc := compiled.re.FindStringIndex(content); loc != nil {
+			return hitFor(compiled.rule, content[loc[0]:loc[1]]), true
 		}
 	}
-	return "", false
+	return NeverAutoHit{}, false
 }
 
-// IndicatorHit identifies which indicator tripped the suspected-irreversible
-// heuristic and the text it matched, so escalations are debuggable.
-type IndicatorHit struct {
+// NeverAutoHit identifies which unified matcher rule fired and the text it
+// matched. Task 2 will use this metadata in every match diagnostic.
+type NeverAutoHit struct {
 	Pattern string
 	Excerpt string
+	Kind    NeverAutoRuleKind
+	Source  NeverAutoRuleSource
 }
+
+func hitFor(rule NeverAutoRule, matched string) NeverAutoHit {
+	return NeverAutoHit{
+		Pattern: rule.Pattern,
+		Excerpt: excerpt(matched, 80),
+		Kind:    rule.Kind,
+		Source:  rule.Source,
+	}
+}
+
+// Diagnostic renders a match consistently at every safety gate. The pattern
+// and matched source excerpt are always present; kind/source metadata explain
+// whether the rule was shipped or operator-defined and strict or heuristic.
+func (h NeverAutoHit) Diagnostic() string {
+	diagnostic := fmt.Sprintf("pattern %s matched %q", h.Pattern, h.Excerpt)
+	if h.Source != "" || h.Kind != "" {
+		diagnostic += fmt.Sprintf(" (source=%s kind=%s)", h.Source, h.Kind)
+	}
+	return diagnostic
+}
+
+// IndicatorHit keeps the current decision interface stable while heuristic
+// matching moves onto the unified rule representation.
+type IndicatorHit = NeverAutoHit
 
 // SuspectedIrreversible reports whether content exhibits destructive
 // indicators without a never-auto match (FR-016 heuristic), returning the
 // first matching indicator. Only indicators scoped to agentType (or to all
 // agents) are consulted.
 func (a *NeverAutoList) SuspectedIrreversible(agentType, content string) (IndicatorHit, bool) {
-	for _, ind := range a.indicators {
-		if !indicatorAppliesTo(ind.agents, agentType) {
+	for _, compiled := range a.rules {
+		if compiled.rule.Kind != NeverAutoHeuristic || !ruleAppliesTo(compiled.rule.AgentTypes, agentType) {
 			continue
 		}
 		// FindStringIndex, not FindString: a pattern that can match the
 		// empty string must still fire (noisy-safe), just with an empty
 		// excerpt.
-		if loc := ind.re.FindStringIndex(content); loc != nil {
-			return IndicatorHit{Pattern: ind.raw, Excerpt: excerpt(content[loc[0]:loc[1]], 80)}, true
+		if loc := compiled.re.FindStringIndex(content); loc != nil {
+			return hitFor(compiled.rule, content[loc[0]:loc[1]]), true
 		}
 	}
 	return IndicatorHit{}, false
 }
 
-// indicatorAppliesTo reports whether an indicator's agent scope covers the
-// given agent type. An empty scope or a "*" entry covers everything; a blank
-// entry is treated as "*" too — a silently dead safety rule is worse than a
-// noisy one.
-func indicatorAppliesTo(agents []string, agentType string) bool {
-	if len(agents) == 0 {
+// ruleAppliesTo reports whether a rule's agent scope covers the given agent
+// type. An empty scope or a "*" entry covers everything; a blank entry is
+// treated as "*" too — a silently dead safety rule is worse than a noisy one.
+func ruleAppliesTo(agentTypes []string, agentType string) bool {
+	if len(agentTypes) == 0 {
 		return true
 	}
-	for _, ag := range agents {
+	for _, ag := range agentTypes {
 		ag = strings.TrimSpace(ag)
 		if ag == "" || ag == "*" || strings.EqualFold(ag, strings.TrimSpace(agentType)) {
 			return true
@@ -271,8 +328,27 @@ func lastLines(s string, n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
-// Patterns returns the active never-auto patterns (for display).
-func (a *NeverAutoList) Patterns() []string { return a.raw }
+// Rules returns the active unified rules with their metadata intact.
+func (a *NeverAutoList) Rules() []NeverAutoRule {
+	rules := make([]NeverAutoRule, 0, len(a.rules))
+	for _, compiled := range a.rules {
+		rule := compiled.rule
+		rule.AgentTypes = append([]string(nil), rule.AgentTypes...)
+		rules = append(rules, rule)
+	}
+	return rules
+}
+
+// Patterns returns active strict pattern strings for legacy display callers.
+func (a *NeverAutoList) Patterns() []string {
+	var patterns []string
+	for _, compiled := range a.rules {
+		if compiled.rule.Kind == NeverAutoStrict {
+			patterns = append(patterns, compiled.rule.Pattern)
+		}
+	}
+	return patterns
+}
 
 // RateLimits configures the runaway-loop guard (FR-019).
 type RateLimits struct {

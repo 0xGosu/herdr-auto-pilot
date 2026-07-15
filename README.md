@@ -501,7 +501,9 @@ declared-task flow for that source.
 
 Irreversible operations are **never** automated, regardless of confidence.
 The shipped seed covers force-pushes, destructive filesystem/database ops,
-deploys/publishes, credential changes, and more — and is regression-tested in
+deploys/publishes, credential changes, and broader suspected-irreversible
+language. The strict and heuristic seed rules are both controlled by
+`safety.disable_never_auto_seed_patterns` and are regression-tested in
 CI against a maintained corpus of irreversible-operation prompts
 (`internal/domain/testdata/irreversible_corpus.txt`). Extend it with your own
 regex patterns:
@@ -515,12 +517,16 @@ never_auto_patterns = ['(?i)restart\s+the\s+payment\s+service']
 patterns are merged with a warning, and the next config save rewrites the
 file under the new key.)
 
+The pre-rename boolean `safety.disable_seed` also still loads with a warning;
+the next config save rewrites it as
+`safety.disable_never_auto_seed_patterns`.
+
 or `hap rules add '<regex>'` / `rules remove <index>`, or press `a`/`x` on
 the TUI's *Config* tab — which also lists the supported scalar config fields,
 adds/removes task sources (`t`/`x`), and clears learned data (`X`).
 Simple fields — numbers, booleans, and the `tui.theme` enum, including
 `llm.pane_excerpt_chars`, `llm.task_generate_timeout_seconds`,
-`embedding.model_context_window`, `safety.disable_seed`, and
+`embedding.model_context_window`, `safety.disable_never_auto_seed_patterns`, and
 `tui.max_content_width` / `tui.max_content_height` — edit inline (`enter`) or via
 `hap config set <key> <value>`. Free-text fields (`llm.command`,
 `llm.command_start`, `llm.rewrite_command`, `llm.rewrite_command_start`,
@@ -528,8 +534,8 @@ Simple fields — numbers, booleans, and the `tui.theme` enum, including
 `llm.task_generate_command_start`, `embedding.model_path`) show read-only in
 the TUI, because a one-line
 prompt mangles quoted argv values — edit them in `config.toml` or with
-`config set`, which accepts every listed scalar key. The safety indicator
-patterns and `[[capture_delay]]` rules also display read-only on the tab. The
+`config set`, which accepts every listed scalar key. Scoped never-auto rules
+and `[[capture_delay]]` rules also display read-only on the tab. The
 `[tui.palette]` overrides are edited directly in `config.toml`. Capture delays show the built-in defaults (10000
 ms first event / 2000 ms after) when none are configured, and long values are
 truncated to one line — the full value lives in `config.toml`. Prompts that
@@ -542,14 +548,18 @@ don't trip it. It scans only the actionable region (the pending dialog near
 the pane bottom, or the next-task prompt about to be sent when idle), so an
 agent merely *talking about* destructive operations in its narration isn't
 flagged, and the escalation rationale names the indicator and the text it
-matched. Extend it with `irreversible_indicators` regex patterns in
-`[safety]` (all agents), or scope a pattern to specific agent types:
+matched. Add operator regexes to `never_auto_patterns` in `[safety]` (all
+agents), or scope a pattern to specific agent types:
 
 ```toml
-[[safety.indicator_rules]]
+[[safety.never_auto_rules]]
 pattern = '(?i)compact\s+the\s+conversation'
-agents = ["codex", "agy"]   # "*" or omit for all agents
+agent_types = ["codex", "agy"]   # "*" or omit for all agent types
 ```
+
+The legacy `irreversible_indicators` and `[[safety.indicator_rules]]` settings
+still load with warnings and migrate to these unified never-auto forms on the
+next config save.
 
 ### Daemon and semantic-matching health
 

@@ -1097,8 +1097,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
-	{Key: "limits.verify_unblock_ms", TUIEditable: true},
-	{Key: "safety.disable_seed", TUIEditable: true},
+	{Key: "safety.disable_never_auto_seed_patterns", TUIEditable: true},
 	{Key: "llm.command"},       // argv template
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
 	{Key: "llm.timeout_seconds", TUIEditable: true},
@@ -1173,11 +1172,6 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.Limits.MaxAutoPromptsPerMinute)
 	case "limits.max_error_retries":
 		return strconv.Itoa(cfg.Limits.MaxErrorRetries)
-	case "limits.verify_unblock_ms":
-		if cfg.Limits.VerifyUnblockMs <= 0 {
-			return "0 (disabled)"
-		}
-		return strconv.Itoa(cfg.Limits.VerifyUnblockMs)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -1247,8 +1241,8 @@ func FieldValue(cfg config.Config, key string) string {
 			return fmt.Sprintf("%d (default)", embedder.DefaultContextWindow)
 		}
 		return strconv.Itoa(cfg.Embedding.ModelContextWindow)
-	case "safety.disable_seed":
-		return strconv.FormatBool(cfg.Safety.DisableSeed)
+	case "safety.disable_never_auto_seed_patterns":
+		return strconv.FormatBool(cfg.Safety.DisableNeverAutoSeedPatterns)
 	case "tui.max_content_width":
 		if cfg.TUI.MaxContentWidth == 0 {
 			return "0 (full width)"
@@ -1291,15 +1285,6 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 		*dst = v
 		return nil
 	}
-	// setNonNegInt allows 0 (used by fields where 0 is a meaningful "disable").
-	setNonNegInt := func(dst *int) error {
-		v, err := strconv.Atoi(value)
-		if err != nil || v < 0 {
-			return fmt.Errorf("%s must be a non-negative integer, got %q", key, value)
-		}
-		*dst = v
-		return nil
-	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		switch key {
 		case "confidence_thresholds.minimum":
@@ -1329,8 +1314,6 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setInt(&cfg.Limits.MaxAutoPromptsPerMinute)
 		case "limits.max_error_retries":
 			return setInt(&cfg.Limits.MaxErrorRetries)
-		case "limits.verify_unblock_ms":
-			return setNonNegInt(&cfg.Limits.VerifyUnblockMs)
 		case "llm.timeout_seconds":
 			return setInt(&cfg.LLM.TimeoutSeconds)
 		case "llm.auto_act_confidence_threshold":
@@ -1444,12 +1427,12 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			cfg.LLM.PaneExcerptChars = v
 			return nil
-		case "safety.disable_seed":
+		case "safety.disable_never_auto_seed_patterns":
 			v, err := strconv.ParseBool(value)
 			if err != nil {
-				return fmt.Errorf("safety.disable_seed must be true or false, got %q", value)
+				return fmt.Errorf("safety.disable_never_auto_seed_patterns must be true or false, got %q", value)
 			}
-			cfg.Safety.DisableSeed = v
+			cfg.Safety.DisableNeverAutoSeedPatterns = v
 			return nil
 		case "tui.max_content_width":
 			v, err := strconv.Atoi(value)
@@ -1554,7 +1537,8 @@ func JoinCommand(argv []string) string {
 // believes is at that index: removal is refused on mismatch, so a listing
 // gone stale (another front-end edited in between) can never silently delete
 // the wrong never-auto pattern. Seed patterns cannot be removed here;
-// disabling the seed requires the explicit safety.disable_seed TOML edit.
+// disabling the seed requires the explicit
+// safety.disable_never_auto_seed_patterns TOML edit.
 func (a *App) RemoveNeverAutoPattern(ctx context.Context, index int, expected string) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		if index < 0 || index >= len(cfg.Safety.NeverAutoPatterns) {

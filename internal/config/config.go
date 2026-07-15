@@ -41,21 +41,32 @@ type Safety struct {
 	// NeverAutoPatterns. Load merges it (with a warning) and clears it, so
 	// any Save rewrites the file under the new key. Decode-only.
 	DeprecatedAllowlistPatterns []string `toml:"allowlist_patterns"`
-	// DisableSeed disables the shipped seed never-auto patterns (not
-	// recommended).
-	DisableSeed bool `toml:"disable_seed"`
-	// IrreversibleIndicators extends the suspected-irreversible heuristic
-	// for every agent type. Use IndicatorRules to scope a pattern to a
-	// subset of agents.
-	IrreversibleIndicators []string `toml:"irreversible_indicators"`
-	// IndicatorRules extends the suspected-irreversible heuristic with
-	// agent-scoped patterns.
-	IndicatorRules []IndicatorRule `toml:"indicator_rules"`
+	// DisableNeverAutoSeedPatterns disables the shipped seed never-auto
+	// patterns (not recommended).
+	DisableNeverAutoSeedPatterns bool `toml:"disable_never_auto_seed_patterns"`
+	// DeprecatedDisableSeed is the pre-rename key for
+	// DisableNeverAutoSeedPatterns. Load migrates it only when the canonical
+	// key is absent, then clears it so Save emits only the new key.
+	DeprecatedDisableSeed *bool `toml:"disable_seed"`
+	// NeverAutoRules are operator-defined never-auto regexes scoped to agent
+	// types. NeverAutoPatterns is the compact all-agent form.
+	NeverAutoRules []NeverAutoRule `toml:"never_auto_rules"`
+	// DeprecatedIrreversibleIndicators and DeprecatedIndicatorRules are the
+	// pre-unification safety keys. Load merges them into NeverAutoPatterns and
+	// NeverAutoRules, then clears them so Save emits only canonical keys.
+	DeprecatedIrreversibleIndicators []string                  `toml:"irreversible_indicators"`
+	DeprecatedIndicatorRules         []DeprecatedIndicatorRule `toml:"indicator_rules"`
 }
 
-// IndicatorRule is one operator-added suspected-irreversible indicator,
-// optionally scoped to specific agent types ("*" or empty = all agents).
-type IndicatorRule struct {
+// NeverAutoRule is one operator-added never-auto regex, optionally scoped to
+// specific agent types ("*" or empty = all agents).
+type NeverAutoRule struct {
+	Pattern    string   `toml:"pattern"`
+	AgentTypes []string `toml:"agent_types"`
+}
+
+// DeprecatedIndicatorRule decodes the old [[safety.indicator_rules]] shape.
+type DeprecatedIndicatorRule struct {
 	Pattern string   `toml:"pattern"`
 	Agents  []string `toml:"agents"`
 }
@@ -65,10 +76,6 @@ type Limits struct {
 	MaxConsecutiveAutoPrompts int `toml:"max_consecutive_auto_prompts"`
 	MaxAutoPromptsPerMinute   int `toml:"max_auto_prompts_per_minute"`
 	MaxErrorRetries           int `toml:"max_error_retries"`
-	// VerifyUnblockMs is the delay before the post-action self-check re-queries
-	// a blocked agent's status to confirm a delivered reply unblocked it; 0
-	// disables the self-check. Default 1000ms.
-	VerifyUnblockMs int `toml:"verify_unblock_ms"`
 }
 
 // LLM configures the optional local LLM/agent CLI fallback (FR-010, IR-005).
@@ -299,7 +306,6 @@ func Default() Config {
 			MaxConsecutiveAutoPrompts: 10,
 			MaxAutoPromptsPerMinute:   5,
 			MaxErrorRetries:           2,
-			VerifyUnblockMs:           1000,
 		},
 		// RewriteTimeoutSeconds stays zero here: Load seeds from Default
 		// before unmarshalling, and a non-zero seed would mask "omitted →
@@ -462,6 +468,76 @@ func Load(path string) (Config, error) {
 	// a non-nil slice): the encoder skips only nil fields, so anything left
 	// here would be re-emitted under the deprecated key on every Save.
 	cfg.Safety.DeprecatedAllowlistPatterns = nil
+	// Deprecated suspected-irreversible settings now share the operator's
+	// never-auto namespace. Preserve canonical entries first, merge legacy
+	// entries without duplication, and clear decode-only fields so Save
+	// completes the migration.
+	if len(cfg.Safety.DeprecatedIrreversibleIndicators) > 0 {
+		slog.Warn("config key `safety.irreversible_indicators` is deprecated; use `safety.never_auto_patterns` (patterns merged)",
+			"path", path)
+		seen := make(map[string]bool, len(cfg.Safety.NeverAutoPatterns))
+		for _, p := range cfg.Safety.NeverAutoPatterns {
+			seen[p] = true
+		}
+		for _, p := range cfg.Safety.DeprecatedIrreversibleIndicators {
+			if !seen[p] {
+				cfg.Safety.NeverAutoPatterns = append(cfg.Safety.NeverAutoPatterns, p)
+				seen[p] = true
+			}
+		}
+	}
+	cfg.Safety.DeprecatedIrreversibleIndicators = nil
+	if len(cfg.Safety.DeprecatedIndicatorRules) > 0 {
+		slog.Warn("config table `[[safety.indicator_rules]]` is deprecated; use `[[safety.never_auto_rules]]` (rules merged)",
+			"path", path)
+		seen := make(map[string]bool, len(cfg.Safety.NeverAutoRules))
+		for _, r := range cfg.Safety.NeverAutoRules {
+			seen[fmt.Sprintf("%q|%q", r.Pattern, r.AgentTypes)] = true
+		}
+		for _, legacy := range cfg.Safety.DeprecatedIndicatorRules {
+			r := NeverAutoRule{Pattern: legacy.Pattern, AgentTypes: legacy.Agents}
+			key := fmt.Sprintf("%q|%q", r.Pattern, r.AgentTypes)
+			if !seen[key] {
+				cfg.Safety.NeverAutoRules = append(cfg.Safety.NeverAutoRules, r)
+				seen[key] = true
+			}
+		}
+	}
+	cfg.Safety.DeprecatedIndicatorRules = nil
+	// Deprecated `disable_seed`: migrate it only when the canonical key is
+	// absent. An explicit canonical false must win over a stale legacy true,
+	// so probe the raw TOML rather than comparing the decoded bool to its zero
+	// value. Clearing the pointer makes the next Save drop the old key.
+	if cfg.Safety.DeprecatedDisableSeed != nil {
+		var probe struct {
+			Safety struct {
+				Canonical *bool `toml:"disable_never_auto_seed_patterns"`
+			} `toml:"safety"`
+		}
+		_ = toml.Unmarshal(data, &probe)
+		if probe.Safety.Canonical == nil {
+			cfg.Safety.DisableNeverAutoSeedPatterns = *cfg.Safety.DeprecatedDisableSeed
+			slog.Warn("config key `safety.disable_seed` is deprecated; use `safety.disable_never_auto_seed_patterns`",
+				"path", path)
+		} else {
+			slog.Warn("deprecated config key `safety.disable_seed` ignored because `safety.disable_never_auto_seed_patterns` is also set",
+				"path", path)
+		}
+		cfg.Safety.DeprecatedDisableSeed = nil
+	}
+	// `limits.verify_unblock_ms` is no longer configurable. Detect it only to
+	// make the behavior change visible; Save omits it because Limits has no
+	// corresponding field. Post-action verification always waits 1000ms.
+	var verifyProbe struct {
+		Limits struct {
+			VerifyUnblockMs *int `toml:"verify_unblock_ms"`
+		} `toml:"limits"`
+	}
+	_ = toml.Unmarshal(data, &verifyProbe)
+	if verifyProbe.Limits.VerifyUnblockMs != nil {
+		slog.Warn("config key `limits.verify_unblock_ms` is no longer supported and is ignored; unblock verification always waits 1000ms",
+			"path", path, "configured_value", *verifyProbe.Limits.VerifyUnblockMs)
+	}
 	// Deprecated boolean `auto_act`: migrate to the confidence threshold only
 	// when the new key was NOT explicitly set. A magic-number check on the
 	// default (999) can't tell an explicit "never" from the default — 999 is
@@ -526,9 +602,6 @@ func (c *Config) fillZeroes() {
 	if c.Limits.MaxErrorRetries <= 0 {
 		c.Limits.MaxErrorRetries = d.Limits.MaxErrorRetries
 	}
-	// VerifyUnblockMs is deliberately NOT restored here: Load seeds it from
-	// Default() (1000), so an absent key keeps the default, while an explicit
-	// 0 must survive to DISABLE the self-check.
 	if c.LLM.TimeoutSeconds <= 0 {
 		c.LLM.TimeoutSeconds = d.LLM.TimeoutSeconds
 	}

@@ -11,6 +11,15 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
 
+func newVerifyUnblockHarness(t *testing.T, cfgTOML string) *harness {
+	t.Helper()
+	h := newHarness(t, cfgTOML)
+	// Production always waits one second. Keep these asynchronous tests fast
+	// without exposing an operator-configurable delay.
+	h.daemon.verifyUnblockDelay = 20 * time.Millisecond
+	return h
+}
+
 // countDeliveryFailed returns how many audit rows the post-action self-check
 // has written (Status == delivery_failed).
 func (h *harness) countDeliveryFailed() int {
@@ -32,7 +41,7 @@ func (h *harness) countDeliveryFailed() int {
 // the agent is STILL blocked a moment later, the daemon writes a
 // delivery_failed audit row.
 func TestSelfCheckAuditsStillBlocked(t *testing.T) {
-	h := newHarness(t, "[limits]\nverify_unblock_ms = 20\n")
+	h := newVerifyUnblockHarness(t, "")
 	h.herdr.setPane(approvalPane)
 	h.seedAutonomous(approvalPane, domain.SituationApproval, "1")
 	// The agent is reported as still blocked after the send.
@@ -64,7 +73,7 @@ func TestSelfCheckAuditsStillBlocked(t *testing.T) {
 // TestSelfCheckSilentWhenUnblocked: when the agent has left "blocked" by the
 // time the self-check runs, no delivery_failed row is written.
 func TestSelfCheckSilentWhenUnblocked(t *testing.T) {
-	h := newHarness(t, "[limits]\nverify_unblock_ms = 20\n")
+	h := newVerifyUnblockHarness(t, "")
 	h.herdr.setPane(approvalPane)
 	h.seedAutonomous(approvalPane, domain.SituationApproval, "1")
 	// The agent has moved on (no longer blocked).
@@ -80,10 +89,10 @@ func TestSelfCheckSilentWhenUnblocked(t *testing.T) {
 	}
 }
 
-// TestSelfCheckDisabled: verify_unblock_ms = 0 disables the self-check even when
-// the agent stays blocked.
-func TestSelfCheckDisabled(t *testing.T) {
-	h := newHarness(t, "[limits]\nverify_unblock_ms = 0\n")
+// A legacy verify_unblock_ms setting is ignored: verification remains enabled
+// at the fixed production delay (shortened by the test harness).
+func TestSelfCheckLegacyZeroDoesNotDisable(t *testing.T) {
+	h := newVerifyUnblockHarness(t, "[limits]\nverify_unblock_ms = 0\n")
 	h.herdr.setPane(approvalPane)
 	h.seedAutonomous(approvalPane, domain.SituationApproval, "1")
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-off", PaneID: "agent-off", Status: "blocked"}})
@@ -91,10 +100,7 @@ func TestSelfCheckDisabled(t *testing.T) {
 	h.push("agent-off", "blocked")
 
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	time.Sleep(300 * time.Millisecond)
-	if n := h.countDeliveryFailed(); n != 0 {
-		t.Fatalf("disabled self-check wrote %d rows", n)
-	}
+	waitFor(t, 3*time.Second, func() bool { return h.countDeliveryFailed() == 1 })
 }
 
 // seedEscalation inserts a pending approval escalation and returns its audit id,
@@ -116,7 +122,7 @@ func (h *harness) seedEscalationAudit(agentID string) int64 {
 // agent (Sent=true) arms the self-check via the daemon's correction drain; a
 // still-blocked agent gets a delivery_failed row.
 func TestSelfCheckOperatorSendStillBlocked(t *testing.T) {
-	h := newHarness(t, "[limits]\nverify_unblock_ms = 20\n")
+	h := newVerifyUnblockHarness(t, "")
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-op", PaneID: "agent-op", Status: "blocked"}})
 	ctx := context.Background()
 	auditID := h.seedEscalationAudit("agent-op")
@@ -136,7 +142,7 @@ func TestSelfCheckOperatorSendStillBlocked(t *testing.T) {
 // TestSelfCheckOperatorRecordOnly: a record-only correction (Sent=false) never
 // arms the self-check, even against a still-blocked agent.
 func TestSelfCheckOperatorRecordOnly(t *testing.T) {
-	h := newHarness(t, "[limits]\nverify_unblock_ms = 20\n")
+	h := newVerifyUnblockHarness(t, "")
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-ro", PaneID: "agent-ro", Status: "blocked"}})
 	ctx := context.Background()
 	auditID := h.seedEscalationAudit("agent-ro")
@@ -170,7 +176,7 @@ func TestSelfCheckOperatorRecordOnly(t *testing.T) {
 // TestSelfCheckSeriesStillBlocked: the multi-tab series delivery path also arms
 // the self-check.
 func TestSelfCheckSeriesStillBlocked(t *testing.T) {
-	h := newHarness(t, "[limits]\nverify_unblock_ms = 20\n")
+	h := newVerifyUnblockHarness(t, "")
 	h.herdr.setFrames(mcqFrames)
 	h.seedSeriesRule(t, "1 2 1")
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-mcq", PaneID: "agent-mcq", Status: "blocked"}})

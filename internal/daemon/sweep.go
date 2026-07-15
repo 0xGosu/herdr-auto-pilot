@@ -57,7 +57,7 @@ func (d *Daemon) sweepAllowed(ctx context.Context, s domain.Situation) bool {
 	frame := s
 	frame.AnswerCount = 1
 	frame.TabCount = 1
-	if _, matched := allow.Match(domain.IrreversibleScanContent(frame, "")); matched {
+	if _, matched := allow.Match(s.AgentType, domain.IrreversibleScanContent(frame, "")); matched {
 		return false
 	}
 	return true

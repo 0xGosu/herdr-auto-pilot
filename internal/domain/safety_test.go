@@ -37,7 +37,7 @@ func TestSeedNeverAutoCatchesCorpus(t *testing.T) {
 			continue
 		}
 		total++
-		if _, ok := a.Match(line); !ok {
+		if _, ok := a.Match("claude", line); !ok {
 			missed++
 			t.Errorf("corpus entry NOT matched by seed allowlist: %q", line)
 		}
@@ -64,8 +64,8 @@ func TestNeverAutoDoesNotMatchBenignPrompts(t *testing.T) {
 		"Truncate the log line to 80 characters?",
 	}
 	for _, p := range benign {
-		if pat, ok := a.Match(p); ok {
-			t.Errorf("benign prompt matched allowlist pattern %q: %q", pat, p)
+		if hit, ok := a.Match("claude", p); ok {
+			t.Errorf("benign prompt matched allowlist pattern %q: %q", hit.Pattern, p)
 		}
 	}
 }
@@ -75,8 +75,186 @@ func TestOperatorPatternsExtendSeed(t *testing.T) {
 	if len(errs) > 0 {
 		t.Fatalf("compile: %v", errs)
 	}
-	if _, ok := a.Match("Please restart the payment service now"); !ok {
+	hit, ok := a.Match("claude", "Please restart the payment service now")
+	if !ok {
 		t.Error("operator-added pattern should match")
+	} else if hit.Excerpt != "restart the payment service" || hit.Source != NeverAutoOperator || hit.Kind != NeverAutoStrict {
+		t.Errorf("operator hit diagnostics incomplete: %+v", hit)
+	} else {
+		diagnostic := hit.Diagnostic()
+		if !strings.Contains(diagnostic, hit.Pattern) || !strings.Contains(diagnostic, `matched "restart the payment service"`) ||
+			!strings.Contains(diagnostic, "source=operator") || !strings.Contains(diagnostic, "kind=strict") {
+			t.Errorf("formatted diagnostic missing pattern, excerpt, or metadata: %q", diagnostic)
+		}
+	}
+}
+
+func TestDisableSeedRemovesStrictAndHeuristicRules(t *testing.T) {
+	a, errs := NewNeverAutoList(false, []string{`operator-only`}, nil)
+	if len(errs) > 0 {
+		t.Fatalf("compile: %v", errs)
+	}
+	for _, rule := range a.Rules() {
+		if rule.Source == NeverAutoSeed {
+			t.Fatalf("disabled matcher retained shipped rule: %+v", rule)
+		}
+	}
+	if _, ok := a.Match("claude", "git push --force origin main"); ok {
+		t.Error("strict seed pattern must be disabled")
+	}
+	if _, ok := a.SuspectedIrreversible("claude", "This action cannot be undone"); ok {
+		t.Error("heuristic seed rule must be disabled")
+	}
+	if _, ok := a.Match("claude", "operator-only"); !ok {
+		t.Error("disabling shipped rules must not disable operator rules")
+	}
+}
+
+func TestNeverAutoStrictAndHeuristicRegressionMatrix(t *testing.T) {
+	operatorPattern := `(?i)restart\s+the\s+payments\s+service`
+	scopedPattern := `(?i)compact\s+the\s+conversation`
+	operatorRules := []NeverAutoRule{{
+		Pattern: scopedPattern, AgentTypes: []string{"codex"},
+	}}
+	enabled, errs := NewNeverAutoList(true, []string{operatorPattern}, operatorRules)
+	if len(errs) > 0 {
+		t.Fatalf("compile enabled matcher: %v", errs)
+	}
+	disabled, errs := NewNeverAutoList(false, []string{operatorPattern}, operatorRules)
+	if len(errs) > 0 {
+		t.Fatalf("compile disabled matcher: %v", errs)
+	}
+
+	type matchKind string
+	const (
+		strictMatch    matchKind = "strict"
+		heuristicMatch matchKind = "heuristic"
+	)
+	tests := []struct {
+		name        string
+		matcher     *NeverAutoList
+		matchKind   matchKind
+		agentType   string
+		content     string
+		want        bool
+		wantSource  NeverAutoRuleSource
+		wantPattern string
+		wantExcerpt string
+	}{
+		{
+			name: "shipped strict rule", matcher: enabled, matchKind: strictMatch,
+			agentType: "claude", content: "Run git reset --hard now?", want: true,
+			wantSource: NeverAutoSeed, wantPattern: `(?i)git\s+reset\s+--hard`, wantExcerpt: "git reset --hard",
+		},
+		{
+			name: "strict rule does not become heuristic", matcher: enabled, matchKind: heuristicMatch,
+			agentType: "claude", content: "Run git reset --hard now?", want: false,
+		},
+		{
+			name: "shipped heuristic rule", matcher: enabled, matchKind: heuristicMatch,
+			agentType: "claude", content: "This action cannot be undone. Continue?", want: true,
+			wantSource: NeverAutoSeed, wantExcerpt: "cannot be undone",
+		},
+		{
+			name: "heuristic rule does not become strict", matcher: enabled, matchKind: strictMatch,
+			agentType: "claude", content: "This action cannot be undone. Continue?", want: false,
+		},
+		{
+			name: "operator regex is strict", matcher: enabled, matchKind: strictMatch,
+			agentType: "claude", content: "Please RESTART   the payments service.", want: true,
+			wantSource: NeverAutoOperator, wantPattern: operatorPattern, wantExcerpt: "RESTART the payments service",
+		},
+		{
+			name: "scoped operator rule matches agent case insensitively", matcher: enabled, matchKind: strictMatch,
+			agentType: "CODEX", content: "Compact the conversation now.", want: true,
+			wantSource: NeverAutoOperator, wantPattern: scopedPattern, wantExcerpt: "Compact the conversation",
+		},
+		{
+			name: "scoped operator rule rejects another agent", matcher: enabled, matchKind: strictMatch,
+			agentType: "claude", content: "Compact the conversation now.", want: false,
+		},
+		{
+			name: "seed disabling removes strict rule", matcher: disabled, matchKind: strictMatch,
+			agentType: "claude", content: "Run git reset --hard now?", want: false,
+		},
+		{
+			name: "seed disabling removes heuristic rule", matcher: disabled, matchKind: heuristicMatch,
+			agentType: "claude", content: "This action cannot be undone. Continue?", want: false,
+		},
+		{
+			name: "seed disabling preserves operator regex", matcher: disabled, matchKind: strictMatch,
+			agentType: "claude", content: "Restart the payments service.", want: true,
+			wantSource: NeverAutoOperator, wantPattern: operatorPattern, wantExcerpt: "Restart the payments service",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var hit NeverAutoHit
+			var ok bool
+			if tc.matchKind == strictMatch {
+				hit, ok = tc.matcher.Match(tc.agentType, tc.content)
+			} else {
+				hit, ok = tc.matcher.SuspectedIrreversible(tc.agentType, tc.content)
+			}
+			if ok != tc.want {
+				t.Fatalf("matched = %v, want %v (hit %+v)", ok, tc.want, hit)
+			}
+			if !tc.want {
+				return
+			}
+			wantRuleKind := NeverAutoStrict
+			if tc.matchKind == heuristicMatch {
+				wantRuleKind = NeverAutoHeuristic
+			}
+			if hit.Source != tc.wantSource || hit.Kind != wantRuleKind {
+				t.Errorf("metadata = source %q kind %q, want source %q kind %q",
+					hit.Source, hit.Kind, tc.wantSource, wantRuleKind)
+			}
+			if tc.wantPattern != "" && hit.Pattern != tc.wantPattern {
+				t.Errorf("pattern = %q, want %q", hit.Pattern, tc.wantPattern)
+			}
+			if hit.Pattern == "" {
+				t.Error("matched rule must report its pattern")
+			}
+			if hit.Excerpt != tc.wantExcerpt {
+				t.Errorf("excerpt = %q, want %q", hit.Excerpt, tc.wantExcerpt)
+			}
+		})
+	}
+}
+
+func TestUnifiedNeverAutoRulesPreserveMetadataAndScope(t *testing.T) {
+	scopedPattern := `(?i)compact\s+the\s+conversation`
+	a, errs := NewNeverAutoList(true, []string{`operator-global`}, []NeverAutoRule{{
+		Pattern: scopedPattern, AgentTypes: []string{"codex", "agy"},
+	}})
+	if len(errs) > 0 {
+		t.Fatalf("compile: %v", errs)
+	}
+	if _, ok := a.Match("codex", "Compact the conversation now"); !ok {
+		t.Error("scoped strict rule must match a listed agent type")
+	}
+	if _, ok := a.Match("claude", "Compact the conversation now"); ok {
+		t.Error("scoped strict rule must not match an unlisted agent type")
+	}
+
+	var seedStrict, seedHeuristic, operatorGlobal, operatorScoped bool
+	for _, rule := range a.Rules() {
+		switch {
+		case rule.Source == NeverAutoSeed && rule.Kind == NeverAutoStrict:
+			seedStrict = true
+		case rule.Source == NeverAutoSeed && rule.Kind == NeverAutoHeuristic:
+			seedHeuristic = true
+		case rule.Pattern == "operator-global" && rule.Source == NeverAutoOperator && rule.Kind == NeverAutoStrict:
+			operatorGlobal = true
+		case rule.Pattern == scopedPattern && rule.Source == NeverAutoOperator && rule.Kind == NeverAutoStrict && len(rule.AgentTypes) == 2:
+			operatorScoped = true
+		}
+	}
+	if !seedStrict || !seedHeuristic || !operatorGlobal || !operatorScoped {
+		t.Fatalf("unified rule metadata incomplete: seedStrict=%v seedHeuristic=%v operatorGlobal=%v operatorScoped=%v",
+			seedStrict, seedHeuristic, operatorGlobal, operatorScoped)
 	}
 }
 
@@ -178,7 +356,9 @@ func TestSuspectedIrreversibleIgnoresDistantNarration(t *testing.T) {
 func TestEmptyMatchableIndicatorStillFires(t *testing.T) {
 	// A misconfigured operator pattern that can match the empty string must
 	// fire (noisy-safe), not silently disable itself.
-	a, errs := NewNeverAutoList(false, nil, []IndicatorRule{{Pattern: `(?i)(drop prod)?`}})
+	a, errs := NewNeverAutoList(false, nil, []NeverAutoRule{{
+		Pattern: `(?i)(drop prod)?`, Kind: NeverAutoHeuristic, Source: NeverAutoOperator,
+	}})
 	if len(errs) > 0 {
 		t.Fatalf("compile: %v", errs)
 	}
@@ -188,9 +368,9 @@ func TestEmptyMatchableIndicatorStillFires(t *testing.T) {
 }
 
 func TestAgentScopedIndicators(t *testing.T) {
-	rules := []IndicatorRule{
-		{Pattern: `(?i)compact\s+the\s+conversation`, Agents: []string{"codex", "agy"}},
-		{Pattern: `(?i)squash\s+the\s+timeline`, Agents: []string{"*"}},
+	rules := []NeverAutoRule{
+		{Pattern: `(?i)compact\s+the\s+conversation`, AgentTypes: []string{"codex", "agy"}, Kind: NeverAutoHeuristic},
+		{Pattern: `(?i)squash\s+the\s+timeline`, AgentTypes: []string{"*"}, Kind: NeverAutoHeuristic},
 	}
 	a, errs := NewNeverAutoList(false, nil, rules)
 	if len(errs) > 0 {
@@ -210,9 +390,9 @@ func TestAgentScopedIndicators(t *testing.T) {
 
 	// Sloppy scope entries fail noisy, not silently dead: a padded "*" is
 	// still a wildcard and a blank entry is treated as one.
-	padded, errs := NewNeverAutoList(false, nil, []IndicatorRule{
-		{Pattern: `(?i)compact\s+the\s+conversation`, Agents: []string{" * "}},
-		{Pattern: `(?i)squash\s+the\s+timeline`, Agents: []string{""}},
+	padded, errs := NewNeverAutoList(false, nil, []NeverAutoRule{
+		{Pattern: `(?i)compact\s+the\s+conversation`, AgentTypes: []string{" * "}, Kind: NeverAutoHeuristic},
+		{Pattern: `(?i)squash\s+the\s+timeline`, AgentTypes: []string{""}, Kind: NeverAutoHeuristic},
 	})
 	if len(errs) > 0 {
 		t.Fatalf("compile: %v", errs)

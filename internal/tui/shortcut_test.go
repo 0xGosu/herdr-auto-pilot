@@ -28,7 +28,7 @@ func TestConfigQuickShortcutsSectionIsLast(t *testing.T) {
 	if header < 0 || row < header {
 		t.Fatalf("Quick Shortcuts section or install row missing:\n%s", view)
 	}
-	for _, earlier := range []string{"Config\n", "Safety indicators", "Capture delays", "Never-auto patterns", "Task sources"} {
+	for _, earlier := range []string{"Config\n", "Scoped never-auto rules", "Capture delays", "Never-auto patterns", "Task sources"} {
 		if pos := strings.LastIndex(view, earlier); pos > header {
 			t.Errorf("%q rendered below Quick Shortcuts:\n%s", earlier, view)
 		}

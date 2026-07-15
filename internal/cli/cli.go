@@ -761,8 +761,12 @@ func printConfig(out io.Writer, cfg config.Config) {
 		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries)
 	fmt.Fprintf(out, "llm:        configured=%v timeout=%ds auto_act_confidence_threshold=%d\n",
 		len(cfg.LLM.Command) > 0, cfg.LLM.TimeoutSeconds, cfg.LLM.AutoActConfidenceThreshold)
-	fmt.Fprintf(out, "task sources: %d, operator never-auto patterns: %d (+%d seed)\n",
-		len(cfg.TaskSources), len(cfg.Safety.NeverAutoPatterns), len(domain.SeedNeverAutoPatterns))
+	seedCount := domain.SeedNeverAutoRuleCount()
+	if cfg.Safety.DisableNeverAutoSeedPatterns {
+		seedCount = 0
+	}
+	fmt.Fprintf(out, "task sources: %d, operator never-auto rules: %d (+%d seed)\n",
+		len(cfg.TaskSources), len(cfg.Safety.NeverAutoPatterns)+len(cfg.Safety.NeverAutoRules), seedCount)
 }
 
 func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
@@ -771,12 +775,26 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(out, "# seed never-auto patterns (always active unless disable_seed=true)")
-		for _, p := range domain.SeedNeverAutoPatterns {
-			fmt.Fprintf(out, "seed\t\t%s\n", p)
+		if cfg.Safety.DisableNeverAutoSeedPatterns {
+			fmt.Fprintln(out, "# shipped never-auto rules disabled by safety.disable_never_auto_seed_patterns=true")
+		} else {
+			fmt.Fprintln(out, "# shipped never-auto rules")
+			for _, p := range domain.SeedNeverAutoPatterns {
+				fmt.Fprintf(out, "seed strict\t%s\n", p)
+			}
+			for _, r := range domain.SeedHeuristicNeverAutoRules {
+				fmt.Fprintf(out, "seed heuristic\t%s\n", r.Pattern)
+			}
 		}
 		for i, p := range cfg.Safety.NeverAutoPatterns {
 			fmt.Fprintf(out, "operator #%d\t%s\n", i, p)
+		}
+		for i, r := range cfg.Safety.NeverAutoRules {
+			scope := "*"
+			if len(r.AgentTypes) > 0 {
+				scope = strings.Join(r.AgentTypes, ",")
+			}
+			fmt.Fprintf(out, "operator scoped #%d\tagent_types=%s\t%s\n", i, scope, r.Pattern)
 		}
 		return nil
 	}

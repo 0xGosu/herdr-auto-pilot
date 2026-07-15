@@ -34,7 +34,7 @@ if `hap` is already on `PATH`, use it directly.
 
 **escalation** — when confidence is below the threshold, the plugin surfaces the situation to the operator instead of acting automatically.
 
-**never-auto patterns** — destructive operations (force-push, `rm -rf`, deploys, credential changes, etc.) are never automated regardless of confidence. the plugin ships with 38 seed patterns.
+**never-auto patterns** — destructive operations (force-push, `rm -rf`, deploys, credential changes, etc.) are never automated regardless of confidence. the plugin ships with 38 strict seed patterns plus broader heuristic seed rules.
 
 **signatures** — a situation signature is a fingerprint of a classified agent state (volatile data like paths, hashes, timestamps is masked). signatures start in shadow mode and graduate to autonomous after enough consistent confirmations. you can inspect, filter, and delete them via the `signatures` command (alias: `sigs`).
 
@@ -266,7 +266,7 @@ hap config set limits.max_error_retries 3
 hap config set llm.timeout_seconds 120
 hap config set llm.auto_act_confidence_threshold 80
 hap config set llm.pane_excerpt_chars 8000
-hap config set safety.disable_seed true
+hap config set safety.disable_never_auto_seed_patterns true
 hap config set embedding.disabled true
 hap config set embedding.similarity_threshold 0.85
 hap config set embedding.gpu_layers 4
@@ -308,7 +308,7 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `limits.max_consecutive_auto_prompts` | 10 | max consecutive auto-prompts per agent without human interaction |
 | `limits.max_auto_prompts_per_minute` | 5 | rate limit per agent (rolling 1-minute window) |
 | `limits.max_error_retries` | 2 | max retries per error signature |
-| `safety.disable_seed` | false | disable the 38 built-in seed never-auto patterns |
+| `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic never-auto rule |
 | `llm.timeout_seconds` | 60 | timeout for LLM fallback calls |
 | `llm.auto_act_confidence_threshold` | 999 (never) | min LLM self-reported confidence (0-100) to auto-act on a consult decision; below it (or no score) the situation escalates with reason `[llm_low_confidence]`. 999 is unreachable = never auto-act |
 | `llm.pane_excerpt_chars` | 5000 | pane excerpt size in characters for LLM consult/rewrite context |
@@ -333,7 +333,7 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 
 TUI palette colors (`tui.palette.*`) are config.toml-only — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. values are 256-color codes (`"205"`) or hex (`"#ff5faf"`).
 
-some settings are table-valued and live in `config.toml` only (not settable via `hap config set`): `[[capture_delay]]`, `[[task_sources]]`, `[[classifier]]`, `[[safety.indicator_rules]]`, and `safety.irreversible_indicators`.
+some settings are table-valued and live in `config.toml` only (not settable via `hap config set`): `[[capture_delay]]`, `[[task_sources]]`, `[[classifier]]`, and `[[safety.never_auto_rules]]`.
 
 **capture delay** — the classification pane read waits a per-agent delay so the agent TUI has painted and event bursts coalesce. defaults: 10000ms (10s) on an agent's first event, 500ms after. override per agent type:
 
@@ -364,7 +364,7 @@ remove a custom rule by index:
 hap rules remove <index>
 ```
 
-the 38 seed rules cover: force-push, `git reset --hard`, `rm -rf`, `sudo rm`, `DROP TABLE`, `TRUNCATE TABLE`, `DELETE FROM`, deploys to prod, `npm publish`, `terraform apply/destroy`, credential rotation, and more. seed rules are always active unless `safety.disable_seed=true`.
+the 38 strict seed rules cover: force-push, `git reset --hard`, `rm -rf`, `sudo rm`, `DROP TABLE`, `TRUNCATE TABLE`, `DELETE FROM`, deploys to prod, `npm publish`, `terraform apply/destroy`, credential rotation, and more; broader heuristic seed rules catch suspected irreversible language. all shipped rules are active unless `safety.disable_never_auto_seed_patterns=true`. the old `safety.disable_seed` key still loads with a deprecation warning and is rewritten under the new name on the next config save.
 
 the config key for custom patterns is `never_auto_patterns` (the old name `allowlist_patterns` still loads as a deprecated alias):
 
@@ -377,10 +377,12 @@ prompts that look destructive but match no explicit pattern are caught by a susp
 
 ```toml
 # scoped to specific agent types
-[[safety.indicator_rules]]
+[[safety.never_auto_rules]]
 pattern = '(?i)compact\s+the\s+conversation'
-agents = ["codex", "agy"]   # "*" or omit for all agents
+agent_types = ["codex", "agy"]   # "*" or omit for all agent types
 ```
+
+the legacy `irreversible_indicators` and `[[safety.indicator_rules]]` settings still load with warnings and migrate to unified never-auto configuration on the next save.
 
 ## task sources
 

@@ -1023,8 +1023,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"limits.max_consecutive_auto_prompts":     "5",
 		"limits.max_auto_prompts_per_minute":      "10",
 		"limits.max_error_retries":                "2",
-		"limits.verify_unblock_ms":                "1000",
-		"safety.disable_seed":                     "true",
+		"safety.disable_never_auto_seed_patterns": "true",
 		"llm.command":                             `claude -p "decide"`,
 		"llm.command_start":                       `claude -p "first: decide"`,
 		"llm.timeout_seconds":                     "60",
@@ -1191,9 +1190,9 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 		{"tui.max_content_height", "0", false},
 		{"tui.max_content_height", "-1", true},
 		{"tui.max_content_height", "abc", true},
-		{"safety.disable_seed", "true", false},
-		{"safety.disable_seed", "false", false},
-		{"safety.disable_seed", "yes", true},
+		{"safety.disable_never_auto_seed_patterns", "true", false},
+		{"safety.disable_never_auto_seed_patterns", "false", false},
+		{"safety.disable_never_auto_seed_patterns", "yes", true},
 		{"llm.pane_excerpt_chars", "0", false}, // 0 = restore-default sentinel (fillZeroes)
 		{"llm.pane_excerpt_chars", "-5", true},
 		{"llm.pane_excerpt_chars", "abc", true},
@@ -1252,7 +1251,7 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 	if err := app.SetField(ctx, "tui.max_content_height", "12"); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SetField(ctx, "safety.disable_seed", "true"); err != nil {
+	if err := app.SetField(ctx, "safety.disable_never_auto_seed_patterns", "true"); err != nil {
 		t.Fatal(err)
 	}
 	if err := app.SetField(ctx, "llm.task_generate_timeout_seconds", "30"); err != nil {
@@ -1267,8 +1266,8 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 	if cfg.TUI.MaxContentHeight != 12 {
 		t.Errorf("tui.max_content_height = %d, want 12", cfg.TUI.MaxContentHeight)
 	}
-	if !cfg.Safety.DisableSeed {
-		t.Error("safety.disable_seed = false, want true (assignment not persisted)")
+	if !cfg.Safety.DisableNeverAutoSeedPatterns {
+		t.Error("safety.disable_never_auto_seed_patterns = false, want true (assignment not persisted)")
 	}
 	if cfg.LLM.PaneExcerptChars != 4000 {
 		t.Errorf("llm.pane_excerpt_chars = %d, want 4000", cfg.LLM.PaneExcerptChars)
@@ -1536,8 +1535,13 @@ func TestCLIParityWithSharedLayer(t *testing.T) {
 	if out := run("kill-history"); !strings.Contains(out, "active") {
 		t.Errorf("kill history output: %q", out)
 	}
-	if out := run("rules", "list"); !strings.Contains(out, "seed") {
+	if out := run("rules", "list"); !strings.Contains(out, "seed strict") || !strings.Contains(out, "seed heuristic") {
 		t.Errorf("rules output: %q", out)
+	}
+	run("config", "set", "safety.disable_never_auto_seed_patterns", "true")
+	if out := run("rules", "list"); !strings.Contains(out, "shipped never-auto rules disabled") ||
+		strings.Contains(out, "seed strict") || strings.Contains(out, "seed heuristic") {
+		t.Errorf("disabled rules output: %q", out)
 	}
 
 	// generic field editor via CLI verb → shared config
@@ -1546,8 +1550,9 @@ func TestCLIParityWithSharedLayer(t *testing.T) {
 	if cfg.Learning.GraduationN != 8 {
 		t.Error("config set must land in shared config")
 	}
-	if out := run("config", "fields"); !strings.Contains(out, "learning.graduation_n") {
-		t.Errorf("config fields output: %q", out)
+	if out := run("config", "fields"); !strings.Contains(out, "safety.disable_never_auto_seed_patterns") ||
+		strings.Contains(out, "safety.disable_seed") || strings.Contains(out, "limits.verify_unblock_ms") {
+		t.Errorf("config fields output contains stale or missing keys: %q", out)
 	}
 
 	// rules add/remove round trip

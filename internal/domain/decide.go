@@ -102,10 +102,10 @@ type DecideInput struct {
 	// an idle agent with no task source generates a task suggestion instead of
 	// escalating no_task_source (FR-011 relaxation).
 	GenerateTaskConfigured bool
-	// NeverAutoHit and SuspectedIrreversible are precomputed by the caller
+	// NeverAutoRuleHit and SuspectedIrreversible are precomputed by the caller
 	// from the compiled NeverAutoList so the core stays free of regex state.
 	// IrreversibleHit carries the matching indicator for the rationale.
-	NeverAutoHit          string
+	NeverAutoRuleHit      NeverAutoHit
 	NeverAutoMatched      bool
 	SuspectedIrreversible bool
 	IrreversibleHit       IndicatorHit
@@ -140,8 +140,7 @@ func Decide(in DecideInput) Decision {
 		return esc(ReasonOverMasked, "", 0, "")
 	}
 	if in.NeverAutoMatched {
-		return esc(ReasonNeverAutoMatch,
-			fmt.Sprintf("pattern: %s", in.NeverAutoHit), 0, "")
+		return esc(ReasonNeverAutoMatch, in.NeverAutoRuleHit.Diagnostic(), 0, "")
 	}
 
 	conf := Confidence(in.History)
@@ -166,9 +165,7 @@ func Decide(in DecideInput) Decision {
 	if in.SuspectedIrreversible {
 		rationale := ""
 		if in.IrreversibleHit.Pattern != "" {
-			// %s for the pattern: %q would double-escape its backslashes.
-			rationale = fmt.Sprintf("indicator %s matched %q",
-				in.IrreversibleHit.Pattern, in.IrreversibleHit.Excerpt)
+			rationale = in.IrreversibleHit.Diagnostic()
 		}
 		suggestion := conf.TopAction
 		if suggestion == ActionNoop {

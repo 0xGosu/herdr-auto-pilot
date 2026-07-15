@@ -29,6 +29,10 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
 
+// unblockCheckDelay is fixed rather than operator-configurable: post-action
+// delivery verification should behave consistently across installations.
+const unblockCheckDelay = time.Second
+
 // Options configures a Daemon.
 type Options struct {
 	ConfigPath        string
@@ -65,6 +69,9 @@ type Options struct {
 // Daemon is the monitor/decide/act loop.
 type Daemon struct {
 	opt Options
+	// verifyUnblockDelay is initialized from unblockCheckDelay. Tests in this
+	// package shorten it to keep asynchronous verification coverage fast.
+	verifyUnblockDelay time.Duration
 
 	mu         sync.RWMutex
 	cfg        config.Config
@@ -240,28 +247,29 @@ func New(opt Options) (*Daemon, error) {
 		opt.PaneReadLines = 120
 	}
 	d := &Daemon{
-		opt:               opt,
-		transitions:       make(chan domain.AgentTransition, 256),
-		nudges:            make(chan control.Kind, 16),
-		llmResults:        make(chan llmOutcome, 16),
-		rewriteResults:    make(chan rewriteOutcome, 16),
-		taskGenResults:    make(chan taskGenOutcome, 16),
-		sweepResults:      make(chan sweepOutcome, 16),
-		delayedTr:         make(chan domain.AgentTransition, 256),
-		pendingCapture:    map[string]*captureEntry{},
-		captureStarted:    map[string]bool{},
-		episodeHandled:    map[string]bool{},
-		firstConsult:      map[string]bool{},
-		firstRewrite:      map[string]bool{},
-		firstTaskGen:      map[string]bool{},
-		lastAutoSend:      map[string]time.Time{},
-		lastAutoNoop:      map[string]time.Time{},
-		rewriteInFlight:   map[string]rewriteFlight{},
-		sweepInFlight:     map[string]bool{},
-		snapshotSaved:     map[string]bool{},
-		paneCwds:          map[string]paneCwdEntry{},
-		paneCwdRefreshing: map[string]bool{},
-		embedder:          opt.Embedder,
+		opt:                opt,
+		verifyUnblockDelay: unblockCheckDelay,
+		transitions:        make(chan domain.AgentTransition, 256),
+		nudges:             make(chan control.Kind, 16),
+		llmResults:         make(chan llmOutcome, 16),
+		rewriteResults:     make(chan rewriteOutcome, 16),
+		taskGenResults:     make(chan taskGenOutcome, 16),
+		sweepResults:       make(chan sweepOutcome, 16),
+		delayedTr:          make(chan domain.AgentTransition, 256),
+		pendingCapture:     map[string]*captureEntry{},
+		captureStarted:     map[string]bool{},
+		episodeHandled:     map[string]bool{},
+		firstConsult:       map[string]bool{},
+		firstRewrite:       map[string]bool{},
+		firstTaskGen:       map[string]bool{},
+		lastAutoSend:       map[string]time.Time{},
+		lastAutoNoop:       map[string]time.Time{},
+		rewriteInFlight:    map[string]rewriteFlight{},
+		sweepInFlight:      map[string]bool{},
+		snapshotSaved:      map[string]bool{},
+		paneCwds:           map[string]paneCwdEntry{},
+		paneCwdRefreshing:  map[string]bool{},
+		embedder:           opt.Embedder,
 	}
 	if opt.MatchIndexDir != "" {
 		d.matcher = match.New(opt.MatchIndexDir)
@@ -295,8 +303,8 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 		d.snapshotSaved = map[string]bool{}
 	}
 	d.mu.Unlock()
-	allow, errs := domain.NewNeverAutoList(!cfg.Safety.DisableSeed,
-		cfg.Safety.NeverAutoPatterns, indicatorRules(cfg.Safety))
+	allow, errs := domain.NewNeverAutoList(!cfg.Safety.DisableNeverAutoSeedPatterns,
+		cfg.Safety.NeverAutoPatterns, neverAutoRules(cfg.Safety))
 	for _, e := range errs {
 		slog.Warn("never-auto pattern rejected", "error", e)
 	}
@@ -914,7 +922,7 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		declaredPrompt = declared.Prompt()
 	}
 	scan := domain.IrreversibleScanContent(situation, declaredPrompt)
-	allowPattern, allowMatched := allow.Match(scan)
+	allowHit, allowMatched := allow.Match(situation.AgentType, scan)
 
 	var irrevHit domain.IndicatorHit
 	suspected := false
@@ -964,7 +972,7 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		DeclaredTask:           declared,
 		LLMConfigured:          d.llmPort() != nil && d.llmPort().Configured(),
 		GenerateTaskConfigured: d.taskGenPort() != nil,
-		NeverAutoHit:           allowPattern,
+		NeverAutoRuleHit:       allowHit,
 		NeverAutoMatched:       allowMatched,
 		SuspectedIrreversible:  suspected,
 		IrreversibleHit:        irrevHit,
@@ -1076,10 +1084,10 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// line from a task file (or any learned action) naming an irreversible
 	// operation must never be delivered automatically (FR-015).
 	_, allow, _ := d.snapshot()
-	if pattern, matched := allow.Match(dec.Input); matched {
+	if hit, matched := allow.Match(s.AgentType, dec.Input); matched {
 		d.escalate(ctx, s, sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonNeverAutoMatch,
-			Rationale:  "outbound pattern: " + pattern,
+			Rationale:  "outbound: " + hit.Diagnostic(),
 			Confidence: dec.Confidence,
 		}, tr, now)
 		return
@@ -1216,21 +1224,22 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 	})
 }
 
-// scheduleUnblockCheck arms the post-action self-check: after the configured
-// delay (limits.verify_unblock_ms) it re-queries the agent's status and, if the
+// scheduleUnblockCheck arms the post-action self-check: after the fixed
+// one-second delay it re-queries the agent's status and, if the
 // agent is STILL blocked, appends a delivery_failed audit row and notifies the
-// operator. It is a no-op when the check is disabled (delay <= 0) or the
-// situation type does not block an agent (idle). The check runs in its own
-// guarded goroutine via time.AfterFunc so it never stalls the monitor loop.
+// operator. It is a no-op when the situation type does not block an agent
+// (idle). The check runs in its own guarded goroutine via time.AfterFunc so it
+// never stalls the monitor loop.
 func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
-	cfg, _, _ := d.snapshot()
-	delayMs := cfg.Limits.VerifyUnblockMs
-	if delayMs <= 0 || !verifyunblock.Relevant(p.SituationType) || p.PaneID == "" {
+	if !verifyunblock.Relevant(p.SituationType) || p.PaneID == "" {
 		return
 	}
 	// Keep the diagnostic row's excerpt the same size as the normal audit rows.
 	p.Excerpt = truncateTailRunes(p.Excerpt, snapshotMaxRunes)
-	delay := time.Duration(delayMs) * time.Millisecond
+	delay := d.verifyUnblockDelay
+	if delay <= 0 {
+		delay = unblockCheckDelay
+	}
 	time.AfterFunc(delay, func() {
 		_ = logging.Guard("verify-unblock", func() error {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1244,12 +1253,11 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 				// NOTE: this only checks status == blocked; it cannot tell the
 				// original prompt from a NEW one the agent raised after
 				// answering. A fast agent that answers and immediately blocks on
-				// a follow-up may trip a benign false positive (raise
-				// limits.verify_unblock_ms if that is noisy).
+				// a follow-up may trip a benign false positive.
 				slog.Warn("agent still blocked after delivered action",
 					"agent", p.AgentID, "situation", p.SituationType, "input", p.Input)
 				d.notify(ctx, "Herd Auto Prompter: agent still blocked after action",
-					fmt.Sprintf("Agent %s is still blocked ~%dms after the delivered reply — it may not have landed (or the agent raised a new prompt). See hap audit.", p.AgentID, delayMs))
+					fmt.Sprintf("Agent %s is still blocked ~%dms after the delivered reply — it may not have landed (or the agent raised a new prompt). See hap audit.", p.AgentID, delay.Milliseconds()))
 			}
 			return nil
 		})
@@ -1983,12 +1991,12 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	case final == "":
 		degrade("produced empty output")
 	default:
-		if pattern, matched := allow.Match(final); matched {
+		if hit, matched := allow.Match(s.AgentType, final); matched {
 			llmOutput = "discarded rewrite: " + truncateRunes(final, 500)
-			degrade("output matched never-auto pattern " + pattern)
+			degrade("output matched never-auto " + hit.Diagnostic())
 		} else if hit, sus := allow.SuspectedIrreversible(s.AgentType, final); sus {
 			llmOutput = "discarded rewrite: " + truncateRunes(final, 500)
-			degrade(fmt.Sprintf("output tripped irreversible indicator %s (%.60q)", hit.Pattern, hit.Excerpt))
+			degrade("output tripped irreversible " + hit.Diagnostic())
 		}
 	}
 
@@ -2001,13 +2009,12 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 		escalateWith(domain.ReasonKilled, "at rewrite")
 		return
 	}
-	if pattern, matched := allow.Match(final); matched {
-		escalateWith(domain.ReasonNeverAutoMatch, "rewrite pattern: "+pattern)
+	if hit, matched := allow.Match(s.AgentType, final); matched {
+		escalateWith(domain.ReasonNeverAutoMatch, "rewrite: "+hit.Diagnostic())
 		return
 	}
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType, final); sus {
-		escalateWith(domain.ReasonSuspectedIrrevers,
-			fmt.Sprintf("rewrite: indicator %s matched %.60q", hit.Pattern, hit.Excerpt))
+		escalateWith(domain.ReasonSuspectedIrrevers, "rewrite: "+hit.Diagnostic())
 		return
 	}
 	rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
@@ -2055,15 +2062,15 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	// The idle policy tolerates changed content, so the FRESH pane must be
 	// re-screened the way handleTransition screened the original: Decide's
 	// veto ran against content that may no longer be what's on screen.
-	if pattern, matched := allow.Match(domain.IrreversibleScanContent(current, "")); matched {
+	if hit, matched := allow.Match(s.AgentType, domain.IrreversibleScanContent(current, "")); matched {
 		escalateWith(domain.ReasonNeverAutoMatch,
-			"pattern: "+pattern+" (at rewrite)")
+			hit.Diagnostic()+" (at rewrite)")
 		return
 	}
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType,
 		domain.IrreversibleScanContent(current, "")); sus {
 		escalateWith(domain.ReasonSuspectedIrrevers,
-			fmt.Sprintf("indicator %s matched %.60q (at rewrite)", hit.Pattern, hit.Excerpt))
+			hit.Diagnostic()+" (at rewrite)")
 		return
 	}
 
@@ -2208,8 +2215,8 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		declaredPrompt = dt.Prompt()
 	}
 	scan := domain.IrreversibleScanContent(s, declaredPrompt)
-	if pattern, matched := allow.Match(scan); matched {
-		reject(domain.ReasonNeverAutoMatch, "pattern: "+pattern)
+	if hit, matched := allow.Match(s.AgentType, scan); matched {
+		reject(domain.ReasonNeverAutoMatch, hit.Diagnostic())
 		return
 	}
 	// The LLM authors the outbound text, so the never-auto patterns screen the
@@ -2217,22 +2224,20 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// operation past the never-auto screen (FR-015). A noop has no outbound text to
 	// screen.
 	if !isNoop {
-		if pattern, matched := allow.Match(llmDec.Action); matched {
-			reject(domain.ReasonNeverAutoMatch, "LLM action pattern: "+pattern)
+		if hit, matched := allow.Match(s.AgentType, llmDec.Action); matched {
+			reject(domain.ReasonNeverAutoMatch, "LLM action: "+hit.Diagnostic())
 			return
 		}
 	}
 	// The heuristic screens the situation's actionable region plus the
 	// outbound text the LLM authored (which is what would actually be sent).
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType, scan); sus {
-		reject(domain.ReasonSuspectedIrrevers,
-			fmt.Sprintf("indicator %s matched %q", hit.Pattern, hit.Excerpt))
+		reject(domain.ReasonSuspectedIrrevers, hit.Diagnostic())
 		return
 	}
 	if !isNoop {
 		if hit, sus := allow.SuspectedIrreversible(s.AgentType, llmDec.Action); sus {
-			reject(domain.ReasonSuspectedIrrevers,
-				fmt.Sprintf("LLM action: indicator %s matched %q", hit.Pattern, hit.Excerpt))
+			reject(domain.ReasonSuspectedIrrevers, "LLM action: "+hit.Diagnostic())
 			return
 		}
 	}
@@ -3047,15 +3052,15 @@ func (d *Daemon) notify(ctx context.Context, title, body string) {
 	}
 }
 
-// indicatorRules merges the flat (all-agent) operator indicator patterns
-// with the agent-scoped rules into the domain representation.
-func indicatorRules(s config.Safety) []domain.IndicatorRule {
-	rules := make([]domain.IndicatorRule, 0, len(s.IrreversibleIndicators)+len(s.IndicatorRules))
-	for _, p := range s.IrreversibleIndicators {
-		rules = append(rules, domain.IndicatorRule{Pattern: p})
-	}
-	for _, r := range s.IndicatorRules {
-		rules = append(rules, domain.IndicatorRule{Pattern: r.Pattern, Agents: r.Agents})
+// neverAutoRules maps agent-scoped operator configuration into the unified
+// domain matcher. Flat never_auto_patterns are passed separately.
+func neverAutoRules(s config.Safety) []domain.NeverAutoRule {
+	rules := make([]domain.NeverAutoRule, 0, len(s.NeverAutoRules))
+	for _, r := range s.NeverAutoRules {
+		rules = append(rules, domain.NeverAutoRule{
+			Pattern: r.Pattern, AgentTypes: r.AgentTypes,
+			Kind: domain.NeverAutoStrict, Source: domain.NeverAutoOperator,
+		})
 	}
 	return rules
 }

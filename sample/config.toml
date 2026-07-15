@@ -24,13 +24,12 @@ graduation_n = 2           # consecutive consistent confirmations to graduate a 
 [safety]
 never_auto_patterns = []         # extra regexes that ALWAYS escalate (e.g. "rm -rf")
 # allowlist_patterns = []        # DEPRECATED alias for never_auto_patterns (merged on load)
-disable_seed = false             # keep the shipped seed never-auto patterns (recommended)
-irreversible_indicators = []     # extra suspected-irreversible patterns, all agents
+disable_never_auto_seed_patterns = false  # keep all shipped strict + heuristic rules (recommended)
 
-# Agent-scoped irreversible indicator (repeatable):
-# [[safety.indicator_rules]]
+# Agent-scoped never-auto rule (repeatable):
+# [[safety.never_auto_rules]]
 # pattern = "terraform (apply|destroy)"
-# agents  = ["claude", "codex"]     # "*" or empty = all agents
+# agent_types = ["claude", "codex"]  # "*" or empty = all agent types
 
 # ── Rate limits ─────────────────────────────────────────────────────
 [limits]

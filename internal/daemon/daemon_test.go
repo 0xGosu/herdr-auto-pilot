@@ -1116,8 +1116,8 @@ func TestNeverAutoBlocksDestructiveApproval(t *testing.T) {
 		t.Fatal("allowlist-matched operation must never be auto-executed")
 	}
 	esc, _ := h.raw.PendingEscalations(context.Background())
-	if !contains(esc[0].Rationale, "pattern:") {
-		t.Errorf("escalation should name the matched pattern, got %q", esc[0].Rationale)
+	if !contains(esc[0].Rationale, "pattern") || !contains(esc[0].Rationale, `matched "git push --force"`) {
+		t.Errorf("escalation should name the matched pattern and excerpt, got %q", esc[0].Rationale)
 	}
 }
 
@@ -1190,7 +1190,7 @@ func TestIdleNarrationEscalatesWithoutIrreversibleFlag(t *testing.T) {
 
 func TestIrreversibleEscalationCitesIndicator(t *testing.T) {
 	// FR-016 + diagnosability: a destructive-looking pending dialog escalates
-	// and the rationale names the indicator and matched text.
+	// and the rationale names the heuristic pattern and matched text.
 	pane := "Do you want to proceed?\nThis action cannot be undone.\n❯ 1. Yes\n  2. No\n"
 	h := newHarness(t, "")
 	h.herdr.setPane(pane)
@@ -1209,16 +1209,16 @@ func TestIrreversibleEscalationCitesIndicator(t *testing.T) {
 	if !contains(esc[0].Rationale, string(domain.ReasonSuspectedIrrevers)) {
 		t.Fatalf("expected suspected_irreversible, got %q", esc[0].Rationale)
 	}
-	if !contains(esc[0].Rationale, "cannot be undone") || !contains(esc[0].Rationale, "indicator") {
-		t.Errorf("rationale should cite the indicator and matched text, got %q", esc[0].Rationale)
+	if !contains(esc[0].Rationale, "cannot be undone") || !contains(esc[0].Rationale, "pattern") {
+		t.Errorf("rationale should cite the heuristic pattern and matched text, got %q", esc[0].Rationale)
 	}
 }
 
-func TestAgentScopedIndicatorRules(t *testing.T) {
-	// Operator indicator rules scoped to agent types: a rule listing the
+func TestAgentScopedNeverAutoRules(t *testing.T) {
+	// Operator never-auto rules scoped to agent types: a rule listing the
 	// agent applies; a rule scoped to other agents does not.
 	pane := "Do you want to proceed?\nThis will frobnicate the widgets.\n❯ 1. Yes\n  2. No\n"
-	cfgScoped := "[[safety.indicator_rules]]\npattern = '(?i)frobnicate\\s+the\\s+widgets'\nagents = [\"claude\"]\n"
+	cfgScoped := "[[safety.never_auto_rules]]\npattern = '(?i)frobnicate\\s+the\\s+widgets'\nagent_types = [\"claude\"]\n"
 	h := newHarness(t, cfgScoped)
 	h.herdr.setPane(pane)
 	h.seedAutonomous(pane, domain.SituationApproval, "1")
@@ -1232,7 +1232,7 @@ func TestAgentScopedIndicatorRules(t *testing.T) {
 		t.Errorf("scoped rule should apply to a listed agent, got %q", esc[0].Rationale)
 	}
 
-	cfgOther := "[[safety.indicator_rules]]\npattern = '(?i)frobnicate\\s+the\\s+widgets'\nagents = [\"codex\", \"agy\"]\n"
+	cfgOther := "[[safety.never_auto_rules]]\npattern = '(?i)frobnicate\\s+the\\s+widgets'\nagent_types = [\"codex\", \"agy\"]\n"
 	h2 := newHarness(t, cfgOther)
 	h2.herdr.setPane(pane)
 	h2.seedAutonomous(pane, domain.SituationApproval, "1")

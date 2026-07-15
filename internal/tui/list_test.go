@@ -915,14 +915,12 @@ func itemIndex(t *testing.T, m Model, pred func(ruleItem) bool) int {
 
 func TestConfigShowsIndicatorAndCaptureRows(t *testing.T) {
 	cfg := config.Default()
-	cfg.Safety.IrreversibleIndicators = []string{"drop table"}
-	cfg.Safety.IndicatorRules = []config.IndicatorRule{{Pattern: "rm -rf /", Agents: []string{"claude"}}}
+	cfg.Safety.NeverAutoRules = []config.NeverAutoRule{{Pattern: "rm -rf /", AgentTypes: []string{"claude"}}}
 	m := configModel(t, cfg)
 	view := m.View()
 	for _, want := range []string{
-		"Safety indicators (read-only — edit config.toml)",
-		"indicator #0  drop table",
-		"indicator-rule #0  agents=claude  rm -rf /",
+		"Scoped never-auto rules (read-only — edit config.toml)",
+		"never-auto-rule #0  agent_types=claude  rm -rf /",
 		"Capture delays (read-only — edit config.toml)",
 		"defaults  start=10000ms event=2000ms (built-in)", // no [[capture_delay]] configured
 	} {
@@ -935,7 +933,7 @@ func TestConfigShowsIndicatorAndCaptureRows(t *testing.T) {
 	cfg.CaptureDelays = []config.CaptureDelayRule{{AgentType: "claude", StartMs: 500, EventMs: 100}}
 	m = configModel(t, cfg)
 	view = m.View()
-	if !strings.Contains(view, "capture-delay #0  agent=claude start=500ms event=100ms") {
+	if !strings.Contains(view, "capture-delay #0  agent_type=claude start=500ms event=100ms") {
 		t.Errorf("configured capture-delay row missing:\n%s", view)
 	}
 	if strings.Contains(view, "(built-in)") {
@@ -945,8 +943,8 @@ func TestConfigShowsIndicatorAndCaptureRows(t *testing.T) {
 
 func TestConfigReadOnlyRowsRefuseEditAndRemove(t *testing.T) {
 	cfg := config.Default()
-	cfg.Safety.IrreversibleIndicators = []string{"drop table"}
-	kinds := []string{"indicator", "capture"}
+	cfg.Safety.NeverAutoRules = []config.NeverAutoRule{{Pattern: "drop table"}}
+	kinds := []string{"scoped-pattern", "capture"}
 	keys := []string{"enter", "e", "x"}
 	for _, kind := range kinds {
 		for _, key := range keys {

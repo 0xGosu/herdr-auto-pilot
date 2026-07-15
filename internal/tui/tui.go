@@ -140,12 +140,12 @@ type detailView struct {
 	agent *domain.AgentTransition
 }
 
-// ruleItem is one navigable row of the Config tab. "indicator" and
+// ruleItem is one navigable row of the Config tab. "scoped-pattern" and
 // "capture" rows are read-only (AR-034, AR-035): they render for
 // visibility and refuse edit/remove with a config.toml pointer. "shortcut"
 // rows run guarded one-off setup actions.
 type ruleItem struct {
-	kind  string // "field" | "pattern" | "source" | "indicator" | "capture" | "shortcut"
+	kind  string // "field" | "pattern" | "source" | "scoped-pattern" | "capture" | "shortcut"
 	key   string // config field key (fields)
 	index int    // slice index (patterns / sources)
 	value string // pattern text / source path — verified on removal
@@ -372,23 +372,16 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 			label: label,
 		})
 	}
-	// Read-only visibility rows (AR-034, AR-035): the suspected-irreversible
-	// indicator patterns and the capture-delay rules, previously invisible
-	// outside config.toml.
-	for i, p := range cfg.Safety.IrreversibleIndicators {
-		items = append(items, ruleItem{
-			kind: "indicator", index: i, value: p,
-			label: fmt.Sprintf("indicator #%d  %s", i, p),
-		})
-	}
-	for i, r := range cfg.Safety.IndicatorRules {
+	// Read-only visibility rows (AR-034, AR-035): scoped never-auto rules and
+	// capture-delay rules are structured config edited in config.toml.
+	for i, r := range cfg.Safety.NeverAutoRules {
 		scope := "*"
-		if len(r.Agents) > 0 {
-			scope = strings.Join(r.Agents, ",")
+		if len(r.AgentTypes) > 0 {
+			scope = strings.Join(r.AgentTypes, ",")
 		}
 		items = append(items, ruleItem{
-			kind: "indicator", index: len(cfg.Safety.IrreversibleIndicators) + i, value: r.Pattern,
-			label: fmt.Sprintf("indicator-rule #%d  agents=%s  %s", i, scope, r.Pattern),
+			kind: "scoped-pattern", index: i, value: r.Pattern,
+			label: fmt.Sprintf("never-auto-rule #%d  agent_types=%s  %s", i, scope, r.Pattern),
 		})
 	}
 	if len(cfg.CaptureDelays) == 0 {
@@ -407,7 +400,7 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		}
 		items = append(items, ruleItem{
 			kind: "capture", index: i,
-			label: fmt.Sprintf("capture-delay #%d  agent=%s start=%dms event=%dms",
+			label: fmt.Sprintf("capture-delay #%d  agent_type=%s start=%dms event=%dms",
 				i, at, r.StartMs, r.EventMs),
 		})
 	}
@@ -1869,7 +1862,7 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch item.kind {
-	case "indicator", "capture":
+	case "scoped-pattern", "capture":
 		m.message = "read-only — edit config.toml (the daemon reloads on save)"
 		return m, nil
 	case "shortcut":
@@ -1968,7 +1961,7 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 		return m, m.do(fmt.Sprintf("task source #%d removed", idx), func(c context.Context) error {
 			return app.RemoveTaskSource(c, idx, expected)
 		})
-	case "indicator", "capture":
+	case "scoped-pattern", "capture":
 		m.message = "read-only — edit config.toml (the daemon reloads on save)"
 		return m, nil
 	case "shortcut":
@@ -2440,8 +2433,8 @@ func (m Model) renderConfig(b *strings.Builder) {
 					"Never-auto patterns (operator; %s)", m.seedLabel())))
 			case "source":
 				fmt.Fprintf(b, "\n%s\n", st.section.Render("Task sources"))
-			case "indicator":
-				fmt.Fprintf(b, "\n%s\n", st.section.Render("Safety indicators (read-only — edit config.toml)"))
+			case "scoped-pattern":
+				fmt.Fprintf(b, "\n%s\n", st.section.Render("Scoped never-auto rules (read-only — edit config.toml)"))
 			case "capture":
 				fmt.Fprintf(b, "\n%s\n", st.section.Render("Capture delays (read-only — edit config.toml)"))
 			case "shortcut":
@@ -2462,7 +2455,7 @@ func (m Model) renderConfig(b *strings.Builder) {
 
 func (m Model) renderEmptyConfigSections(b *strings.Builder) {
 	st := m.styles()
-	if len(m.data.cfg.Safety.NeverAutoPatterns) == 0 {
+	if len(m.data.cfg.Safety.NeverAutoPatterns) == 0 && len(m.data.cfg.Safety.NeverAutoRules) == 0 {
 		fmt.Fprintf(b, "\n%s\n", st.section.Render(fmt.Sprintf(
 			"Never-auto patterns: none from operator (%s) — press a to add", m.seedLabel())))
 	}
@@ -2471,14 +2464,14 @@ func (m Model) renderEmptyConfigSections(b *strings.Builder) {
 	}
 }
 
-// seedLabel names the shipped seed patterns' state: the count when active,
-// or an explicit marker when safety.disable_seed dropped them (so the
-// Config tab never contradicts the new editable field).
+// seedLabel names the shipped seed patterns' state: the count when active, or
+// an explicit marker when safety.disable_never_auto_seed_patterns dropped them,
+// so the Config tab never contradicts the editable field.
 func (m Model) seedLabel() string {
-	if m.data.cfg.Safety.DisableSeed {
+	if m.data.cfg.Safety.DisableNeverAutoSeedPatterns {
 		return "seed disabled"
 	}
-	return fmt.Sprintf("+%d seed active", len(domain.SeedNeverAutoPatterns))
+	return fmt.Sprintf("+%d seed active", domain.SeedNeverAutoRuleCount())
 }
 
 func (m Model) renderKills(b *strings.Builder) {
