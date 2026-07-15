@@ -20,6 +20,10 @@ func TestGoldenTranscripts(t *testing.T) {
 
 	statusFor := map[string]string{
 		"idle_finished.txt": "idle",
+		"codex_idle.txt":    "idle",
+	}
+	agentTypeFor := map[string]string{
+		"codex_idle.txt": "codex",
 	}
 
 	entries, err := os.ReadDir("testdata/transcripts")
@@ -42,7 +46,11 @@ func TestGoldenTranscripts(t *testing.T) {
 		if status == "" {
 			status = "blocked"
 		}
-		s := c.Classify("claude", status, string(data))
+		agentType := agentTypeFor[name]
+		if agentType == "" {
+			agentType = "claude"
+		}
+		s := c.Classify(agentType, status, string(data))
 		verb := ""
 		if s.PermissionVerb != "" {
 			verb = strings.Fields(s.PermissionVerb)[0]
@@ -382,5 +390,31 @@ func TestApprovalFixturesStillApproval(t *testing.T) {
 		if s := c.Classify("claude", "blocked", string(data)); s.Type != domain.SituationApproval {
 			t.Errorf("%s: type = %v, want approval", name, s.Type)
 		}
+	}
+}
+
+// TestCodexComposerStrippedOnlyForCodex proves the codex composer-line strip
+// (domain.StripCodexComposer) is gated strictly on agent_type == "codex":
+// claude's Content must come out byte-identical to the raw pane, while
+// codex's Content has the "› ..." line gone and keeps the footer.
+func TestCodexComposerStrippedOnlyForCodex(t *testing.T) {
+	c := New(nil)
+	pane := "─ Worked for 10m 49s ─────\n\n› Summarize recent commits\n\n  gpt-5.6-sol high · /workspaces/herdr-auto-pilot\n"
+
+	codex := c.Classify("codex", "idle", pane)
+	if strings.Contains(codex.Content, "›") {
+		t.Errorf("codex situation content must have composer line stripped, got %q", codex.Content)
+	}
+	if !strings.Contains(codex.Content, "gpt-5.6-sol high") {
+		t.Errorf("codex situation content must keep the footer, got %q", codex.Content)
+	}
+
+	claude := c.Classify("claude", "idle", pane)
+	if claude.Content != pane {
+		t.Errorf("claude situation content must be untouched, got %q, want %q", claude.Content, pane)
+	}
+
+	if codex.Content == claude.Content {
+		t.Error("expected codex and claude content to differ after gating")
 	}
 }
