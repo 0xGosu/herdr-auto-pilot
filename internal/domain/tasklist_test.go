@@ -413,3 +413,165 @@ func TestInferNextTask(t *testing.T) {
 		})
 	}
 }
+
+func TestParseChecklist(t *testing.T) {
+	content := "# Backend tasks\n" +
+		"- [x] scaffold\n" +
+		"prose in the middle, not an item\n" +
+		"  * [ ] nested pending\n" +
+		"- [-] in progress\n" +
+		"\n" +
+		"+ [ ] final\n"
+	items := ParseChecklist(content)
+	want := []ChecklistItem{
+		{Index: 1, LineNo: 1, Prefix: "- ", Mark: "x", Done: true, Text: "scaffold"},
+		{Index: 2, LineNo: 3, Prefix: "  * ", Mark: " ", Done: false, Text: "nested pending"},
+		{Index: 3, LineNo: 4, Prefix: "- ", Mark: "-", Done: true, Text: "in progress"},
+		{Index: 4, LineNo: 6, Prefix: "+ ", Mark: " ", Done: false, Text: "final"},
+	}
+	if len(items) != len(want) {
+		t.Fatalf("ParseChecklist returned %d items, want %d: %+v", len(items), len(want), items)
+	}
+	for i := range want {
+		if items[i] != want[i] {
+			t.Errorf("item %d = %+v, want %+v", i, items[i], want[i])
+		}
+	}
+}
+
+// TestChecklistDoneAgreesWithNextDeclared pins the invariant that an item's
+// Done flag (marker != space) agrees with the authoritative unchecked/checked
+// regexes: the first !Done item ParseChecklist reports is exactly the one
+// NextDeclaredTask (the daemon's send path) would pick.
+func TestChecklistDoneAgreesWithNextDeclared(t *testing.T) {
+	cases := []string{
+		"- [x] a\n- [ ] b\n- [ ] c",
+		"- [X] a\n- [-] b\n- [ ] target",
+		"[ ] bare\n[x] done",
+		"- [x] all\n- [X] done",
+	}
+	for _, content := range cases {
+		next := NextDeclaredTask(content)
+		var firstPending string
+		for _, it := range ParseChecklist(content) {
+			if !it.Done {
+				firstPending = it.Text
+				break
+			}
+		}
+		if firstPending != next {
+			t.Errorf("first pending %q disagrees with NextDeclaredTask %q for:\n%s", firstPending, next, content)
+		}
+	}
+}
+
+// TestChecklistNumberingIsAbsolute proves task numbers are file positions, not
+// positions within a status-filtered view: filtering to pending items keeps
+// each item's original Index, so `done <N>` refers to the same item regardless
+// of any filter the operator listed with.
+func TestChecklistNumberingIsAbsolute(t *testing.T) {
+	content := "- [ ] one\n- [x] two\n- [ ] three\n- [x] four\n- [ ] five"
+	items := ParseChecklist(content)
+	var pendingIndexes []int
+	for _, it := range items {
+		if !it.Done {
+			pendingIndexes = append(pendingIndexes, it.Index)
+		}
+	}
+	want := []int{1, 3, 5}
+	if len(pendingIndexes) != len(want) {
+		t.Fatalf("pending indexes = %v, want %v", pendingIndexes, want)
+	}
+	for i := range want {
+		if pendingIndexes[i] != want[i] {
+			t.Fatalf("pending indexes = %v, want %v", pendingIndexes, want)
+		}
+	}
+}
+
+func TestSetChecklistItemDone(t *testing.T) {
+	content := "# tasks\n- [ ] first\n  * [ ] second\n- [x] third"
+	got, err := SetChecklistItemDone(content, 2, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# tasks\n- [ ] first\n  * [x] second\n- [x] third"
+	if got != want {
+		t.Errorf("SetChecklistItemDone marked wrong line:\n got %q\nwant %q", got, want)
+	}
+	// Un-checking a done item preserves prefix and text.
+	back, err := SetChecklistItemDone(want, 3, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantBack := "# tasks\n- [ ] first\n  * [x] second\n- [ ] third"; back != wantBack {
+		t.Errorf("un-check: got %q, want %q", back, wantBack)
+	}
+	if _, err := SetChecklistItemDone(content, 9, true); err == nil {
+		t.Error("out-of-range index must error")
+	}
+}
+
+func TestEditChecklistItemText(t *testing.T) {
+	content := "- [x] old done text\n- [ ] pending"
+	got, err := EditChecklistItemText(content, 1, "new text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Editing preserves the item's done marker.
+	if want := "- [x] new text\n- [ ] pending"; got != want {
+		t.Errorf("EditChecklistItemText: got %q, want %q", got, want)
+	}
+	if _, err := EditChecklistItemText(content, 1, "   "); err == nil {
+		t.Error("empty text must error")
+	}
+	if _, err := EditChecklistItemText(content, 5, "x"); err == nil {
+		t.Error("out-of-range index must error")
+	}
+}
+
+func TestDeleteChecklistItem(t *testing.T) {
+	content := "intro line\n- [ ] a\n- [x] b\n- [ ] c"
+	got, err := DeleteChecklistItem(content, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "intro line\n- [ ] a\n- [ ] c"; got != want {
+		t.Errorf("DeleteChecklistItem: got %q, want %q", got, want)
+	}
+	if _, err := DeleteChecklistItem(content, 9); err == nil {
+		t.Error("out-of-range index must error")
+	}
+}
+
+func TestAppendChecklistItem(t *testing.T) {
+	cases := []struct {
+		name, content, text, want string
+		wantIndex                 int
+	}{
+		{"after last item, reuse bullet", "- [x] a\n- [ ] b\n", "c", "- [x] a\n- [ ] b\n- [ ] c\n", 3},
+		{"no trailing newline", "- [ ] a", "b", "- [ ] a\n- [ ] b", 2},
+		{"nested bullet reused", "  * [ ] a\n", "b", "  * [ ] a\n  * [ ] b\n", 2},
+		{"top-level style, not the nested last item's", "- [ ] a\n  * [ ] sub\n", "b", "- [ ] a\n  * [ ] sub\n- [ ] b\n", 3},
+		{"empty file", "", "first", "- [ ] first\n", 1},
+		{"non-checklist file", "just notes\n", "first", "just notes\n- [ ] first\n", 1},
+		{"trailing prose after list", "- [ ] a\nnotes\n", "b", "- [ ] a\n- [ ] b\nnotes\n", 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, idx, err := AppendChecklistItem(c.content, c.text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != c.want {
+				t.Errorf("content: got %q, want %q", got, c.want)
+			}
+			if idx != c.wantIndex {
+				t.Errorf("index: got %d, want %d", idx, c.wantIndex)
+			}
+		})
+	}
+	if _, _, err := AppendChecklistItem("- [ ] a", "  "); err == nil {
+		t.Error("empty text must error")
+	}
+}

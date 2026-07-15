@@ -1437,6 +1437,195 @@ func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, templat
 	})
 }
 
+// --- Task-item CRUD (the `hap task` surface) -----------------------------
+//
+// These operate on the checklist items INSIDE a task source's markdown file,
+// not on the source config. The daemon re-reads task files live on every idle
+// event (Daemon.declaredTask → ReadTaskFile), so a direct file write is picked
+// up with no config lock and no daemon nudge — writes just go through an
+// atomic temp+rename so a concurrent daemon read never sees a half-written file.
+
+// resolveTaskFilePath finds the checklist file for an agent by matching the
+// task-source Agent selector (the id/name/type the source was registered with)
+// against the token the caller supplied. Exactly one match wins; zero or many
+// is an error, as is a source addressable only by workspace — the caller falls
+// back to --path in those cases. This deliberately does NOT reuse the daemon's
+// declaredTask precedence (live workspace, first-real-task-wins): here we are
+// choosing a file to edit, not a task to send.
+func resolveTaskFilePath(cfg config.Config, agent string) (string, error) {
+	var matches []config.TaskSource
+	workspaceOnly := false
+	for _, src := range cfg.TaskSources {
+		if src.Agent == "" {
+			if src.Workspace != "" && src.Workspace != "*" {
+				workspaceOnly = true
+			}
+			continue
+		}
+		if src.Agent == agent {
+			matches = append(matches, src)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0].Path, nil
+	case 0:
+		if workspaceOnly {
+			return "", fmt.Errorf("no task source is scoped to agent %q; workspace-scoped sources exist but aren't addressable by name — use --path <file>", agent)
+		}
+		return "", fmt.Errorf("no task source for agent %q; add one first: hap task-source add --agent %s <checklist.md>", agent, agent)
+	default:
+		paths := make([]string, len(matches))
+		for i, m := range matches {
+			paths[i] = m.Path
+		}
+		return "", fmt.Errorf("agent %q matches %d task sources (%s); use --path <file> to pick one", agent, len(matches), strings.Join(paths, ", "))
+	}
+}
+
+// taskFilePath resolves the checklist file to operate on: an explicit --path
+// (relative paths are made absolute so they mean what the caller's shell sees)
+// takes precedence; otherwise the agent's configured source is resolved.
+func (a *App) taskFilePath(agent, path string) (string, error) {
+	if path != "" {
+		if abs, err := filepath.Abs(path); err == nil {
+			return abs, nil
+		}
+		return path, nil
+	}
+	if agent == "" {
+		return "", fmt.Errorf("specify an agent name, or --path <file>")
+	}
+	cfg, err := a.Config()
+	if err != nil {
+		return "", err
+	}
+	return resolveTaskFilePath(cfg, agent)
+}
+
+// writeFileAtomic writes data to path via a temp file in the same directory
+// then renames it into place, so a concurrent reader (the daemon) sees either
+// the old or the new file, never a partial write.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".hap-task-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // best-effort cleanup; a no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+// mutateTaskFile reads path, applies fn to its content, writes the result
+// atomically, and returns the re-parsed item list so callers can echo the
+// freshly renumbered checklist.
+func mutateTaskFile(path string, fn func(content string) (string, error)) ([]domain.ChecklistItem, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	out, err := fn(string(data))
+	if err != nil {
+		return nil, err
+	}
+	if err := writeFileAtomic(path, []byte(out), 0o600); err != nil {
+		return nil, err
+	}
+	return domain.ParseChecklist(out), nil
+}
+
+// ListTasks returns every checklist item in the resolved source file, numbered
+// by absolute file position (checked and unchecked alike). Filtering by status
+// is the CLI's job — the numbers here never depend on a filter.
+func (a *App) ListTasks(agent, path string) ([]domain.ChecklistItem, error) {
+	p, err := a.taskFilePath(agent, path)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return nil, err
+	}
+	return domain.ParseChecklist(string(data)), nil
+}
+
+// GetTask returns the single item addressed by its 1-based number.
+func (a *App) GetTask(agent, path string, index int) (domain.ChecklistItem, error) {
+	items, err := a.ListTasks(agent, path)
+	if err != nil {
+		return domain.ChecklistItem{}, err
+	}
+	for _, it := range items {
+		if it.Index == index {
+			return it, nil
+		}
+	}
+	if len(items) == 0 {
+		return domain.ChecklistItem{}, fmt.Errorf("no task #%d: the checklist has no items", index)
+	}
+	return domain.ChecklistItem{}, fmt.Errorf("no task #%d: valid task numbers are 1..%d", index, len(items))
+}
+
+// AddTask appends a new unchecked item and returns the updated list plus the
+// new item's number.
+func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, error) {
+	p, err := a.taskFilePath(agent, path)
+	if err != nil {
+		return nil, 0, err
+	}
+	newIndex := 0
+	items, err := mutateTaskFile(p, func(content string) (string, error) {
+		out, idx, e := domain.AppendChecklistItem(content, text)
+		newIndex = idx
+		return out, e
+	})
+	return items, newIndex, err
+}
+
+// SetTaskDone toggles an item's status and returns the renumbered list.
+func (a *App) SetTaskDone(agent, path string, index int, done bool) ([]domain.ChecklistItem, error) {
+	p, err := a.taskFilePath(agent, path)
+	if err != nil {
+		return nil, err
+	}
+	return mutateTaskFile(p, func(content string) (string, error) {
+		return domain.SetChecklistItemDone(content, index, done)
+	})
+}
+
+// EditTask replaces an item's text (keeping its status) and returns the list.
+func (a *App) EditTask(agent, path string, index int, text string) ([]domain.ChecklistItem, error) {
+	p, err := a.taskFilePath(agent, path)
+	if err != nil {
+		return nil, err
+	}
+	return mutateTaskFile(p, func(content string) (string, error) {
+		return domain.EditChecklistItemText(content, index, text)
+	})
+}
+
+// DeleteTask removes an item and returns the renumbered list.
+func (a *App) DeleteTask(agent, path string, index int) ([]domain.ChecklistItem, error) {
+	p, err := a.taskFilePath(agent, path)
+	if err != nil {
+		return nil, err
+	}
+	return mutateTaskFile(p, func(content string) (string, error) {
+		return domain.DeleteChecklistItem(content, index)
+	})
+}
+
 // SignatureRow is a learned signature enriched for display: the persisted
 // state plus the dominant action and decision count recomputed from history.
 type SignatureRow struct {
