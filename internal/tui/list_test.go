@@ -121,6 +121,52 @@ func TestAuditAndEscalationRenderLLMConfidence(t *testing.T) {
 	}
 }
 
+func TestEscalationColumnsAlignForUnclassifiableSituation(t *testing.T) {
+	score := 85
+	m := Model{width: 180, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.status.AgentNames = map[string]string{"w1:p1": "happy-seal"}
+	const signature = "unclassifiable:shared-order"
+	msg.signatures = []frontend.SignatureRow{{SignatureState: domain.SignatureState{
+		Signature: signature, SituationType: domain.SituationUnclassifiable,
+		AgentType: "codex", Mode: domain.ModeShadow,
+	}}}
+	msg.escalations = []domain.AuditRecord{{
+		ID: 398, AgentID: "w1:p1", AgentType: "codex", Signature: signature,
+		SituationType: domain.SituationUnclassifiable, Status: "escalated",
+		Confidence: 0.42, LLMConfidence: &score, Rationale: "needs review",
+		CreatedAt: time.Date(2026, 7, 9, 8, 32, 21, 0, time.UTC),
+	}}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+	m.tab = tabEscalations
+
+	var header, row string
+	for _, line := range strings.Split(m.View(), "\n") {
+		switch {
+		case strings.Contains(line, "RATIONALE / SUGGESTION"):
+			header = line
+		case strings.Contains(line, "#398"):
+			row = line
+		}
+	}
+	if header == "" || row == "" {
+		t.Fatalf("escalation header or row missing:\n%s", m.View())
+	}
+	for _, pair := range []struct{ heading, value string }{
+		{"SITUATION", "unclassifiable"},
+		{"TYPE", "codex"},
+		{"AGENT", "happy-seal"},
+		{"RULE", "shadow"},
+		{"CONF", "0.42"},
+	} {
+		if hi, vi := strings.Index(header, pair.heading), strings.Index(row, pair.value); hi != vi {
+			t.Errorf("%s column starts at %d but value %q starts at %d\nheader: %q\nrow:    %q",
+				pair.heading, hi, pair.value, vi, header, row)
+		}
+	}
+}
+
 func TestAuditRowsRenderAgentName(t *testing.T) {
 	m := Model{width: 140, height: 30}
 	msg := refreshMsg{cfg: config.Default()}

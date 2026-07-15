@@ -2340,8 +2340,11 @@ func (m Model) renderEscalations(b *strings.Builder) {
 	// and suggestion. LLM is the consulting model's self-reported 0-100 ("-"
 	// when the escalation carries no score, e.g. shadow mode or a safety veto).
 	const (
-		escRowFmt = "%-1s %-6s %-8s %-10s %-8s %-14s %4s %-6s %5s  %s"
-		escPrefix = 72
+		// SITUATION must fit "unclassifiable", the longest domain value.
+		// Allowing it to overflow shifts TYPE and every column after it away
+		// from their headers.
+		escRowFmt = "%-1s %-6s %-8s %-14s %-8s %-14s %4s %-6s %5s  %s"
+		escPrefix = 76
 	)
 	header := fmt.Sprintf(escRowFmt,
 		"", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "RATIONALE / SUGGESTION")
@@ -2360,7 +2363,7 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		rWidth, sWidth := m.budget(escPrefix, e.Suggestion != "")
 		line := fmt.Sprintf(escRowFmt,
 			mark, fmt.Sprintf("#%d", e.ID), e.CreatedAt.Format("15:04:05"), e.SituationType,
-			oneLine(orDash(m.agentTypeFor(e)), 8), agent,
+			oneLine(orDash(m.agentTypeFor(e)), 8), oneLine(agent, 14),
 			llmConfShort(e.LLMConfidence), m.ruleMarker(e.Signature), fmt.Sprintf("%.2f", e.Confidence),
 			oneLine(e.Rationale, rWidth))
 		if e.Suggestion != "" {
