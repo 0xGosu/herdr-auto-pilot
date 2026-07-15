@@ -508,7 +508,7 @@ func TestSignaturesTabRendersRows(t *testing.T) {
 	m.tab = tabSignatures
 	view := m.View()
 	// CR-032: the Rules list renders the FULL signature id, not shortSig.
-	for _, want := range []string{"SIGNATURE", "SITUATION", "AGENT", "MODE", "CONFIRM", "CONF", "TOP ACTION",
+	for _, want := range []string{"SIGNATURE", "SITUATION", "TYPE", "CONF", "MODE", "CONFIRM", "TOP ACTION",
 		"choice:ffff0000eeee1111", "approval:1234abcd5678efab", "autonomous", "shadow", "5/5", "3/5", "0.93"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("signatures tab missing %q:\n%s", want, view)
@@ -1063,7 +1063,7 @@ func TestEscalationWithoutRuleShowsNoneYet(t *testing.T) {
 			break
 		}
 	}
-	if !strings.Contains(list, "RULE") || len(fields) < 9 || fields[8] != "-" {
+	if !strings.Contains(list, "RULE") || len(fields) < 8 || fields[7] != "-" {
 		t.Errorf("audit list should dash-mark rows without a rule:\n%s", list)
 	}
 }
@@ -1611,6 +1611,27 @@ func TestFocusAgentKeystrokeOnAgentsList(t *testing.T) {
 	}
 }
 
+func TestFocusAgentKeystrokeOnEscalationsList(t *testing.T) {
+	// f on Escalations focuses the live pane for the selected record's agent.
+	herdr := &focusTestHerdr{}
+	m := testModel(t)
+	m.tab = tabEscalations
+	m.app = &frontend.App{Herdr: herdr}
+
+	upd, cmd := m.Update(pressKeyMsg("f"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("f on Escalations list should issue a focus command")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok || res.err != nil {
+		t.Fatalf("focus should succeed, got %+v", res)
+	}
+	if len(herdr.focused) != 1 || herdr.focused[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
+		t.Fatalf("focus should target the escalation agent's pane, got %+v", herdr.focused)
+	}
+}
+
 func TestFocusAgentKeystrokeOnAgentDetail(t *testing.T) {
 	// f on an agent detail overlay should focus the snapshotted agent.
 	m := testModel(t)
@@ -1640,6 +1661,35 @@ func TestFocusAgentKeystrokeOnAgentDetail(t *testing.T) {
 	}
 	if res.err != nil {
 		t.Fatalf("focus command should succeed: %v", res.err)
+	}
+}
+
+func TestFocusAgentKeystrokeOnEscalationDetail(t *testing.T) {
+	// The detail snapshots the escalation's agent, independently of the list
+	// cursor, then resolves that agent's current location when f is pressed.
+	herdr := &focusTestHerdr{}
+	m := testModel(t)
+	m.tab = tabEscalations
+	m = press(t, m, "v")
+	if m.detail == nil || m.detail.focusAgentID != "w6:p1" {
+		t.Fatalf("escalation detail should snapshot its agent, got %+v", m.detail)
+	}
+	m.app = &frontend.App{Herdr: herdr}
+
+	upd, cmd := m.Update(pressKeyMsg("f"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("f on escalation detail should issue a focus command")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok || res.err != nil {
+		t.Fatalf("focus should succeed, got %+v", res)
+	}
+	if len(herdr.focused) != 1 || herdr.focused[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
+		t.Fatalf("focus should target the detailed escalation's agent pane, got %+v", herdr.focused)
+	}
+	if m.detail == nil {
+		t.Fatal("f should leave the escalation detail open")
 	}
 }
 

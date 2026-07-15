@@ -129,6 +129,10 @@ type detailView struct {
 	// cursor. escRetryable snapshots whether "l: retry LLM" is offered.
 	confirmID    int64
 	escRetryable bool
+	// focusAgentID is the agent recorded on an escalation detail. Its current
+	// pane coordinates are resolved from live status when `f` is pressed, so a
+	// background refresh or list-cursor move cannot retarget the action.
+	focusAgentID string
 	// agent snapshots the agent an agents-tab detail was opened for, so the
 	// clock tick can rebuild its lines against the current clock (the live Age
 	// would otherwise freeze at open time — the build closure captures m by
@@ -583,6 +587,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.detail.agent != nil {
 				return m.focusAgent(*m.detail.agent)
 			}
+			if m.detail.focusAgentID != "" {
+				return m.focusAgentByID(m.detail.focusAgentID)
+			}
 		case "esc", "q":
 			m.detail = nil
 		}
@@ -775,6 +782,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.message = "filter: " + orDash(string(m.sigMode))
 		case tabAgents:
 			return m.focusSelected()
+		case tabEscalations:
+			return m.focusSelectedEscalation()
 		}
 	case "a":
 		if m.tab == tabConfig {
@@ -1166,6 +1175,27 @@ func (m Model) focusSelected() (tea.Model, tea.Cmd) {
 	return m.focusAgent(agents[m.cursor])
 }
 
+// focusAgentByID resolves an audit record's stable agent id to its current
+// herdr location. Audit rows intentionally do not duplicate pane coordinates,
+// which may change while the TUI is open.
+func (m Model) focusAgentByID(agentID string) (tea.Model, tea.Cmd) {
+	for _, agent := range m.data.status.MonitoredAgents {
+		if agent.AgentID == agentID {
+			return m.focusAgent(agent)
+		}
+	}
+	m.message = "no location known for this agent"
+	return m, nil
+}
+
+func (m Model) focusSelectedEscalation() (tea.Model, tea.Cmd) {
+	rec := m.selectedAudit()
+	if rec == nil {
+		return m, nil
+	}
+	return m.focusAgentByID(rec.AgentID)
+}
+
 // --- Detail view (v) ---
 
 // viewSelected opens a full-record overlay for the selected row. The record
@@ -1253,6 +1283,7 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 			if m.tab == tabEscalations {
 				d.confirmID = r.ID
 				d.escRetryable = m.canRetry(r)
+				d.focusAgentID = r.AgentID
 			}
 			m.detail = d
 		}
@@ -2098,7 +2129,7 @@ func (m Model) helpLine() string {
 			if m.detail.escRetryable {
 				retry = "  l: retry LLM"
 			}
-			return "enter: confirm+send  c: correct (+send?)  x: delete" + retry +
+			return "enter: confirm+send  c: correct (+send?)  x: delete  f: focus in herdr" + retry +
 				preview + "  ↑/↓: scroll  tab: switch tab  " + closeKeys
 		}
 		if m.detail.agent != nil {
@@ -2120,7 +2151,7 @@ func (m Model) helpLine() string {
 	case tabAgents:
 		return "v: details  n: rename agent  f: focus in herdr  /: search  " + common
 	case tabEscalations:
-		return "enter/y: confirm+send  c: correct (+send?)  l: retry LLM  space: mark  x: delete  X: prune old  v: details  /: search  " + common
+		return "enter/y: confirm+send  c: correct (+send?)  l: retry LLM  f: focus in herdr  space: mark  x: delete  X: prune old  v: details  /: search  " + common
 	case tabAudit:
 		return "c: correct decision  v: details  /: search  " + common
 	case tabSignatures:
@@ -2156,18 +2187,18 @@ func (m Model) renderSignatures(b *strings.Builder) {
 			sigW = n
 		}
 	}
-	const rulesRowFmt = "%-*s %-9s %-10s %-11s %7s %5s  %s"
+	const rulesRowFmt = "%-*s %-9s %-10s %5s %-11s %7s  %s"
 	actWidth, _ := m.budget(sigW+49, false)
 	header := fmt.Sprintf(rulesRowFmt, sigW,
-		"SIGNATURE", "SITUATION", "AGENT", "MODE", "CONFIRM", "CONF", "TOP ACTION")
+		"SIGNATURE", "SITUATION", "TYPE", "CONF", "MODE", "CONFIRM", "TOP ACTION")
 	fmt.Fprintln(b, st.section.Render(header))
 	start, end := m.window(len(sigs))
 	for i := start; i < end; i++ {
 		r := sigs[i]
 		line := fmt.Sprintf(rulesRowFmt,
-			sigW, r.Signature, r.SituationType, orDash(r.AgentType), r.Mode,
+			sigW, r.Signature, r.SituationType, orDash(r.AgentType),
+			fmt.Sprintf("%.2f", r.CachedConfidence), r.Mode,
 			fmt.Sprintf("%d/%d", r.ConsecutiveConfirmations, gradN),
-			fmt.Sprintf("%.2f", r.CachedConfidence),
 			oneLine(r.TopAction, actWidth))
 		switch {
 		case i == m.cursor:
@@ -2309,11 +2340,11 @@ func (m Model) renderEscalations(b *strings.Builder) {
 	// and suggestion. LLM is the consulting model's self-reported 0-100 ("-"
 	// when the escalation carries no score, e.g. shadow mode or a safety veto).
 	const (
-		escRowFmt = "%-1s %-6s %-8s %-10s %-8s %-14s %4s %-6s  %s"
-		escPrefix = 66
+		escRowFmt = "%-1s %-6s %-8s %-10s %-8s %-14s %4s %-6s %5s  %s"
+		escPrefix = 72
 	)
 	header := fmt.Sprintf(escRowFmt,
-		"", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "RATIONALE / SUGGESTION")
+		"", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "RATIONALE / SUGGESTION")
 	fmt.Fprintln(b, m.styles().section.Render(header))
 	start, end := m.window(len(esc))
 	for i := start; i < end; i++ {
@@ -2330,7 +2361,7 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		line := fmt.Sprintf(escRowFmt,
 			mark, fmt.Sprintf("#%d", e.ID), e.CreatedAt.Format("15:04:05"), e.SituationType,
 			oneLine(orDash(m.agentTypeFor(e)), 8), agent,
-			llmConfShort(e.LLMConfidence), m.ruleMarker(e.Signature),
+			llmConfShort(e.LLMConfidence), m.ruleMarker(e.Signature), fmt.Sprintf("%.2f", e.Confidence),
 			oneLine(e.Rationale, rWidth))
 		if e.Suggestion != "" {
 			line += "  → " + oneLine(e.Suggestion, sWidth)
@@ -2356,10 +2387,10 @@ func (m Model) renderAudit(b *strings.Builder) {
 	// The final Action column takes the remaining width after these fixed
 	// columns. Conf is the computed 0-1 agreement; LLM is the consulting
 	// model's self-reported 0-100 ("-" when the row has no LLM score).
-	const auditRowFmt = "%-6s %-14s %-14s %-9s %-10s %5s %4s %-6s  %s"
-	actWidth, _ := m.budget(77, false)
+	const auditRowFmt = "%-6s %-14s %-10s %-8s %-14s %4s %-6s %5s %-9s  %s"
+	actWidth, _ := m.budget(86, false)
 	header := fmt.Sprintf(auditRowFmt,
-		"ID", "WHEN", "AGENT", "STATUS", "SITUATION", "CONF", "LLM", "RULE", "ACTION")
+		"ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "ACTION")
 	fmt.Fprintln(b, m.styles().section.Render(header))
 	start, end := m.window(len(rows))
 	for i := start; i < end; i++ {
@@ -2370,8 +2401,8 @@ func (m Model) renderAudit(b *strings.Builder) {
 		}
 		line := fmt.Sprintf(auditRowFmt,
 			fmt.Sprintf("#%d", r.ID), r.CreatedAt.Format("01-02 15:04:05"),
-			oneLine(orDash(agent), 14), r.Status, r.SituationType,
-			fmt.Sprintf("%.2f", r.Confidence), llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature),
+			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), 14),
+			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), fmt.Sprintf("%.2f", r.Confidence), r.Status,
 			oneLine(r.Action, actWidth))
 		if i == m.cursor {
 			line = m.styles().selected.Render(line)

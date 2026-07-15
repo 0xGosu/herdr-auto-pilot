@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -301,6 +302,46 @@ func TestSendSubmitsWithEnter(t *testing.T) {
 	if len(calls) != 2 || calls[0] != "agent send w1:p1 run the tests" ||
 		calls[1] != "pane send-keys w1:p1 enter" {
 		t.Errorf("send should write text then press enter, got %v", calls)
+	}
+}
+
+func TestSendToCodexSubmitsAgainAfterDelay(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	start := time.Now()
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "CoDeX", "run the tests"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < codexSecondEnterDelay {
+		t.Errorf("codex second Enter sent too early: elapsed %v, want at least %v", elapsed, codexSecondEnterDelay)
+	}
+	calls := fake.Calls()
+	want := []string{
+		"agent send w1:p1 run the tests",
+		"pane send-keys w1:p1 enter",
+		"pane send-keys w1:p1 enter",
+	}
+	if fmt.Sprint(calls) != fmt.Sprint(want) {
+		t.Errorf("codex send calls = %v, want %v", calls, want)
+	}
+}
+
+func TestSendToNonCodexDoesNotSubmitAgain(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
+		t.Fatal(err)
+	}
+	calls := fake.Calls()
+	if len(calls) != 2 || calls[0] != "agent send w1:p1 run the tests" ||
+		calls[1] != "pane send-keys w1:p1 enter" {
+		t.Errorf("non-codex send should press Enter once, got %v", calls)
 	}
 }
 

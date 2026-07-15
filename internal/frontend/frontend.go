@@ -545,7 +545,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		if rerr == nil {
 			outbound = domain.DeliverKeystroke(audit.SituationType, pane, outbound)
 		}
-		if err := a.Herdr.Send(ctx, audit.AgentID, outbound); err != nil {
+		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, outbound); err != nil {
 			return fmt.Errorf("correction recorded, but sending to the agent failed: %w", err)
 		}
 		markSent()
@@ -661,7 +661,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		prompt := domain.DeclaredTask{
 			Task: tasks[0], Path: path, AgentName: name,
 		}.Prompt()
-		if err := a.Herdr.Send(ctx, audit.AgentID, prompt); err != nil {
+		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
 			return fmt.Errorf("task source created, but sending the task to the agent failed: %w", err)
 		}
 	}

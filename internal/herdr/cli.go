@@ -19,7 +19,10 @@ var (
 	_ ports.InspectorPort     = (*CLI)(nil)
 	_ ports.VisiblePaneReader = (*CLI)(nil)
 	_ ports.KeystrokeSender   = (*CLI)(nil)
+	_ ports.AgentAwareSender  = (*CLI)(nil)
 )
+
+const codexSecondEnterDelay = 300 * time.Millisecond
 
 // CLI issues one-shot Herdr control actions through the herdr binary
 // (HERDR_BIN_PATH), which stays portable across Unix sockets and Windows
@@ -61,8 +64,34 @@ func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
 // the literal text, then `pane send-keys <pane> enter` submits it (verified
 // against herdr 0.7: agent send alone does not press Enter).
 func (c *CLI) Send(ctx context.Context, paneID, input string) error {
+	return c.send(ctx, paneID, input, false)
+}
+
+// SendToAgent adds a delayed second Enter for Codex. Codex treats rapidly
+// injected text as a paste burst and interprets the first immediate Enter as
+// a newline; after its suppression window expires, the second Enter submits
+// the composed prompt.
+func (c *CLI) SendToAgent(ctx context.Context, paneID, agentType, input string) error {
+	return c.send(ctx, paneID, input, strings.EqualFold(strings.TrimSpace(agentType), "codex"))
+}
+
+func (c *CLI) send(ctx context.Context, paneID, input string, codex bool) error {
 	if _, err := c.run(ctx, "agent", "send", paneID, input); err != nil {
 		return err
+	}
+	if _, err := c.run(ctx, "pane", "send-keys", paneID, "enter"); err != nil {
+		return err
+	}
+	if !codex {
+		return nil
+	}
+
+	timer := time.NewTimer(codexSecondEnterDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
 	}
 	_, err := c.run(ctx, "pane", "send-keys", paneID, "enter")
 	return err

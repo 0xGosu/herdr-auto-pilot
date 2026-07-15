@@ -21,6 +21,22 @@ type HerdrPort interface {
 	ListAgents(ctx context.Context) ([]domain.AgentTransition, error)
 }
 
+// AgentAwareSender is implemented by Herdr adapters that need the agent type
+// to deliver input correctly. Call SendToAgent rather than asserting this
+// interface directly so older/test adapters continue to use HerdrPort.Send.
+type AgentAwareSender interface {
+	SendToAgent(ctx context.Context, paneID, agentType, input string) error
+}
+
+// SendToAgent delivers input through the agent-aware capability when the
+// adapter provides it, otherwise it falls back to the base HerdrPort contract.
+func SendToAgent(ctx context.Context, h HerdrPort, paneID, agentType, input string) error {
+	if sender, ok := h.(AgentAwareSender); ok {
+		return sender.SendToAgent(ctx, paneID, agentType, input)
+	}
+	return h.Send(ctx, paneID, input)
+}
+
 // LocatorPort is implemented by Herdr adapters that can report workspace
 // and tab display metadata (labels, numbers) for locating agents. Optional:
 // callers type-assert and degrade to raw ids when absent.

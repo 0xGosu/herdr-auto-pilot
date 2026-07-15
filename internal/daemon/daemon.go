@@ -1121,7 +1121,7 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 		return
 	}
 
-	if err := d.opt.Herdr.Send(ctx, s.PaneID, del.sendText); err != nil {
+	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType, del.sendText); err != nil {
 		slog.Error("agent send failed; escalating", "pane", s.PaneID, "error", err)
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed",
@@ -2397,7 +2397,8 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		d.deliverSeriesLLM(ctx, ks, s, res.sig.Signature, llmDec, groups, auditID, now)
 		return
 	}
-	if err := d.opt.Herdr.Send(ctx, s.PaneID, domain.DeliverKeystroke(s.Type, pane, llmDec.Action)); err != nil {
+	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType,
+		domain.DeliverKeystroke(s.Type, pane, llmDec.Action)); err != nil {
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
 		return

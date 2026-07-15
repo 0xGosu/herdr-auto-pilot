@@ -51,22 +51,53 @@ func listModel(t *testing.T, n, height int) Model {
 	return upd.(Model)
 }
 
+// assertLineOrder finds the rendered line containing marker and verifies that
+// tokens occur left-to-right in the requested order.
+func assertLineOrder(t *testing.T, view, marker string, tokens ...string) {
+	t.Helper()
+	var line string
+	for _, candidate := range strings.Split(view, "\n") {
+		if strings.Contains(candidate, marker) {
+			line = candidate
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("rendered line containing %q not found:\n%s", marker, view)
+	}
+	from := 0
+	for _, token := range tokens {
+		idx := strings.Index(line[from:], token)
+		if idx < 0 {
+			t.Fatalf("%q does not appear after the preceding columns in line %q", token, line)
+		}
+		from += idx + len(token)
+	}
+}
+
 func TestAuditAndEscalationRenderLLMConfidence(t *testing.T) {
 	score := 85
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
-	m := Model{width: 140, height: 40}
+	m := Model{width: 180, height: 40}
 	msg := refreshMsg{cfg: config.Default()}
-	msg.status.AgentNames = map[string]string{}
+	msg.status.AgentNames = map[string]string{"w1:p1": "patient-lemur"}
+	const signature = "approval:shared-order"
+	msg.signatures = []frontend.SignatureRow{{SignatureState: domain.SignatureState{
+		Signature: signature, SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+	}}}
 	// An LLM-authored row (both scores) and a learned row (no LLM score).
 	msg.audit = []domain.AuditRecord{
-		{ID: 1, SituationType: domain.SituationApproval, Status: "auto", Action: "auto:1",
+		{ID: 1, AgentID: "w1:p1", AgentType: "claude", Signature: signature,
+			SituationType: domain.SituationApproval, Status: "auto", Action: "auto:1",
 			Confidence: 0.5, LLMConfidence: &score, CreatedAt: now},
 		{ID: 2, SituationType: domain.SituationApproval, Status: "auto", Action: "auto:y",
 			Confidence: 1.0, CreatedAt: now},
 	}
 	msg.escalations = []domain.AuditRecord{
-		{ID: 3, SituationType: domain.SituationApproval, Status: "escalated",
-			Rationale: "low", LLMConfidence: &score, CreatedAt: now},
+		{ID: 3, AgentID: "w1:p1", AgentType: "claude", Signature: signature,
+			SituationType: domain.SituationApproval, Status: "escalated",
+			Confidence: 0.25, Rationale: "low", LLMConfidence: &score, CreatedAt: now},
 		{ID: 4, SituationType: domain.SituationApproval, Status: "escalated",
 			Rationale: "shadow", CreatedAt: now},
 	}
@@ -75,18 +106,18 @@ func TestAuditAndEscalationRenderLLMConfidence(t *testing.T) {
 
 	m.tab = tabAudit
 	audit := m.View()
-	// LLM row shows the 0-100 score next to the 0-1 computed conf; the learned
-	// row shows a dash so the column stays aligned.
-	for _, want := range []string{"CONF", "LLM", "0.50   85", "1.00    -"} {
-		if !strings.Contains(audit, want) {
-			t.Errorf("audit view missing %q:\n%s", want, audit)
-		}
+	assertLineOrder(t, audit, "ID", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "ACTION")
+	assertLineOrder(t, audit, "#1", "#1", "approval", "claude", "patient-lemur", "85", "shadow", "0.50", "auto", "auto:1")
+	if !strings.Contains(audit, "1.00") || !strings.Contains(audit, "  - ") {
+		t.Errorf("audit learned row should show computed confidence and no LLM score:\n%s", audit)
 	}
 
 	m.tab = tabEscalations
 	esc := m.View()
-	if !strings.Contains(esc, "LLM") || !strings.Contains(esc, " 85 ") || !strings.Contains(esc, "  - ") {
-		t.Errorf("escalations view should show the LLM header plus 85 and - values:\n%s", esc)
+	assertLineOrder(t, esc, "ID", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "RATIONALE / SUGGESTION")
+	assertLineOrder(t, esc, "#3", "#3", "approval", "claude", "patient-lemur", "85", "shadow", "0.25", "low")
+	if !strings.Contains(esc, "  - ") || !strings.Contains(esc, "0.00") {
+		t.Errorf("escalation without scores should show empty LLM and zero computed confidence:\n%s", esc)
 	}
 }
 
@@ -94,6 +125,7 @@ func TestAuditRowsRenderAgentName(t *testing.T) {
 	m := Model{width: 140, height: 30}
 	msg := refreshMsg{cfg: config.Default()}
 	msg.status.AgentNames = map[string]string{"w1:p1": "patient-lemur"}
+	msg.status.MonitoredAgents = []domain.AgentTransition{{AgentID: "w1:p1", AgentType: "claude"}}
 	msg.audit = []domain.AuditRecord{{
 		ID: 1, AgentID: "w1:p1", SituationType: domain.SituationIdle,
 		Status: "auto", Action: "auto:continue", CreatedAt: time.Now(),
@@ -102,8 +134,9 @@ func TestAuditRowsRenderAgentName(t *testing.T) {
 	m = upd.(Model)
 	m.tab = tabAudit
 
-	if view := m.View(); !strings.Contains(view, "AGENT") || !strings.Contains(view, "patient-lemur") {
-		t.Errorf("audit row should show the resolved agent name:\n%s", view)
+	if view := m.View(); !strings.Contains(view, "AGENT") || !strings.Contains(view, "patient-lemur") ||
+		!strings.Contains(view, "TYPE") || !strings.Contains(view, "claude") {
+		t.Errorf("audit row should show the resolved agent name and live type fallback:\n%s", view)
 	}
 }
 
@@ -112,11 +145,7 @@ func TestEscalationAuditAndRulesListsRenderSingleHeader(t *testing.T) {
 
 	m.tab = tabAudit
 	audit := m.View()
-	for _, heading := range []string{"ID", "WHEN", "AGENT", "STATUS", "SITUATION", "CONF", "LLM", "RULE", "ACTION"} {
-		if !strings.Contains(audit, heading) {
-			t.Errorf("audit header missing %q:\n%s", heading, audit)
-		}
-	}
+	assertLineOrder(t, audit, "ID", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "ACTION")
 	for _, repeated := range []string{"agent=", "conf=", "llm=", "rule="} {
 		if strings.Contains(audit, repeated) {
 			t.Errorf("audit rows should not repeat label %q:\n%s", repeated, audit)
@@ -125,22 +154,14 @@ func TestEscalationAuditAndRulesListsRenderSingleHeader(t *testing.T) {
 
 	m.tab = tabSignatures
 	rules := m.View()
-	for _, heading := range []string{"SIGNATURE", "SITUATION", "AGENT", "MODE", "CONFIRM", "CONF", "TOP ACTION"} {
-		if !strings.Contains(rules, heading) {
-			t.Errorf("rules header missing %q:\n%s", heading, rules)
-		}
-	}
+	assertLineOrder(t, rules, "SIGNATURE", "SIGNATURE", "SITUATION", "TYPE", "CONF", "MODE", "CONFIRM", "TOP ACTION")
 	if strings.Contains(rules, "conf=") {
 		t.Errorf("rules rows should not repeat the confidence label:\n%s", rules)
 	}
 
 	m.tab = tabEscalations
 	escalations := m.View()
-	for _, heading := range []string{"ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "RATIONALE / SUGGESTION"} {
-		if !strings.Contains(escalations, heading) {
-			t.Errorf("escalations header missing %q:\n%s", heading, escalations)
-		}
-	}
+	assertLineOrder(t, escalations, "ID", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "RATIONALE / SUGGESTION")
 	for _, repeated := range []string{"agent=", "llm=", "rule="} {
 		if strings.Contains(escalations, repeated) {
 			t.Errorf("escalation rows should not repeat label %q:\n%s", repeated, escalations)
