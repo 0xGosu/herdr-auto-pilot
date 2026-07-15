@@ -1,4 +1,5 @@
 approval_claude_plan.txt status=blocked type=approval verb=proceed options=4
+approval_codex_plan.txt status=idle type=approval verb=implement options=3
 approval_permission.txt status=blocked type=approval verb=proceed options=3
 approval_yn.txt status=blocked type=approval verb= options=0
 choice_claude_mcq.txt status=blocked type=choice verb= options=5

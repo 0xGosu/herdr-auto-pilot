@@ -132,10 +132,12 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		pane = domain.StripCodexComposer(pane)
 	}
 	s := domain.Situation{AgentType: agentType, Content: pane, Type: domain.SituationUnclassifiable}
+	codexPlanApproval := strings.EqualFold(agentType, "codex") && domain.CodexPlanApprovalForm(pane)
 
-	// Approval and choice are BLOCKED situations (constitution taxonomy): only
-	// a blocked agent is actually waiting on a prompt, so their content rules
-	// are gated on herdr reporting the agent blocked.
+	// Approval and choice are normally BLOCKED situations (constitution
+	// taxonomy): their content rules are gated on herdr reporting the agent
+	// blocked. A footer-anchored Codex Plan approval is the narrow exception
+	// below because Herdr reports that standing form as idle.
 	blocked := agentStatus == "blocked"
 
 	for _, r := range c.rules {
@@ -143,6 +145,12 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 			continue
 		}
 		matched := matchRule(r, pane)
+		// Codex's Plan-mode approval is a structural form, not a generic
+		// permission sentence. Detect it at the approval rule's position so
+		// approval retains priority over numbered-choice parsing.
+		if !matched && r.situation == domain.SituationApproval && codexPlanApproval {
+			matched = true
+		}
 		// Agent MCQ selection prompts render structurally, not as a plain
 		// numbered menu. Detect them at the choice rule's position so approval
 		// still wins and error is still evaluated after choice.
@@ -165,7 +173,13 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		}
 		// A numbered list or "select an option" phrase in ordinary
 		// working/idle output must never read as a live prompt.
-		if (r.situation == domain.SituationApproval || r.situation == domain.SituationChoice) && !blocked {
+		// Herdr currently reports Codex's standing Plan approval as idle. Its
+		// full, footer-anchored structural form is sufficient evidence of a
+		// parked approval at idle/done; working remains excluded, as do all
+		// non-structural approval and choice matches.
+		codexPlanParked := r.situation == domain.SituationApproval && codexPlanApproval &&
+			(agentStatus == "idle" || agentStatus == "done")
+		if (r.situation == domain.SituationApproval || r.situation == domain.SituationChoice) && !blocked && !codexPlanParked {
 			continue
 		}
 		s.Type = r.situation
@@ -220,14 +234,24 @@ func enrich(s *domain.Situation) {
 			s.TabCount = form.AnswerCount
 		}
 	case domain.SituationApproval:
-		if m := permissionVerbRE.FindStringSubmatch(s.Content); m != nil {
+		if strings.EqualFold(s.AgentType, "codex") && domain.CodexPlanApprovalForm(s.Content) {
+			// Stable across the plan body and the volatile "Context: N% used"
+			// description, so equivalent Plan approvals share a signature.
+			s.PermissionVerb = "implement this plan"
+		} else if m := permissionVerbRE.FindStringSubmatch(s.Content); m != nil {
 			s.PermissionVerb = domain.MaskVolatile(strings.TrimSpace(m[1]))
 		} else if m := allowVerbRE.FindStringSubmatch(s.Content); m != nil {
 			s.PermissionVerb = domain.MaskVolatile(strings.TrimSpace(m[1]))
 		}
 		// Approval prompts often carry numbered options (e.g. "1. Yes");
 		// extract them so suggestions and sends can use the exact reply.
-		s.Options = append(s.Options, domain.OptionLabels(s.Content)...)
+		optionRegion := s.Content
+		if strings.EqualFold(s.AgentType, "codex") && domain.CodexPlanApprovalForm(s.Content) {
+			// Plans can themselves contain numbered lists. Only the live form's
+			// three actions are reply options.
+			optionRegion = domain.ExtractCodexPlanApprovalForm(s.Content)
+		}
+		s.Options = append(s.Options, domain.OptionLabels(optionRegion)...)
 	case domain.SituationError:
 		if m := errorLineRE.FindStringSubmatch(s.Content); m != nil {
 			s.ErrorSummary = domain.MaskVolatile(strings.TrimSpace(m[1]))

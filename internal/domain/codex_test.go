@@ -53,6 +53,44 @@ func TestCodexMCQFormSubmitAllAndFalsePositives(t *testing.T) {
 	}
 }
 
+const codexPlanApprovalFrame = `plan tail with a narrated list:
+1. This is plan content, not an approval option.
+
+Implement this plan?
+
+› 1. Yes, implement this plan          Switch to Default and start coding.
+  2. Yes, clear context and implement  Fresh thread. Context: 20% used.
+  3. No, stay in Plan mode             Continue planning with the model.
+
+Press enter to confirm or esc to go back
+`
+
+func TestCodexPlanApprovalForm(t *testing.T) {
+	if !CodexPlanApprovalForm(codexPlanApprovalFrame) {
+		t.Fatal("Codex Plan approval form was not recognized")
+	}
+	region := ExtractCodexPlanApprovalForm(codexPlanApprovalFrame)
+	if strings.Contains(region, "narrated list") || !strings.HasPrefix(region, "Implement this plan?") {
+		t.Fatalf("approval extraction retained plan scrollback: %q", region)
+	}
+	if got := OptionLabels(region); len(got) != 3 || !strings.HasPrefix(got[1], "Yes, clear context and implement") {
+		t.Fatalf("Codex Plan approval options = %v", got)
+	}
+}
+
+func TestCodexPlanApprovalFormRejectsStaleAndIncompleteCopies(t *testing.T) {
+	for _, pane := range []string{
+		codexPlanApprovalFrame + "\nnewer agent output\n",
+		strings.Replace(codexPlanApprovalFrame, "Press enter to confirm or esc to go back", "ordinary footer", 1),
+		strings.Replace(codexPlanApprovalFrame, "No, stay in Plan mode", "Maybe later", 1),
+		"Implement this plan?\n1. Yes, implement this plan\n",
+	} {
+		if CodexPlanApprovalForm(pane) {
+			t.Fatalf("false positive for %q", pane)
+		}
+	}
+}
+
 func TestStripCodexComposer(t *testing.T) {
 	cases := []struct {
 		name string

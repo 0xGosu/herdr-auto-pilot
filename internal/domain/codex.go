@@ -34,7 +34,57 @@ var (
 	codexMCQHeaderRE = regexp.MustCompile(`(?im)^\s*Question\s+(\d+)\s*/\s*(\d+)\s*\((\d+)\s+unanswered\)\s*$`)
 	codexMCQFooterRE = regexp.MustCompile(`(?im)^\s*tab to add notes\s*\|\s*enter to submit (answer|all)\s*\|\s*←/→ to navigate questions\s*\|\s*esc to interrupt\s*$`)
 	codexSelectedRE  = regexp.MustCompile(`(?m)^\s*›\s*(\d+)[.)]\s+`)
+
+	// Codex Plan mode ends with a dedicated three-option approval form. Herdr
+	// currently reports the standing form as idle rather than blocked, so the
+	// form itself must be strong enough to prove that Codex is awaiting an
+	// approval. Requiring the exact header, all three stable action labels, and
+	// the footer at the true end of the capture keeps a narrated or stale copy
+	// in scrollback from becoming a live permission prompt.
+	codexPlanApprovalHeaderRE = regexp.MustCompile(`(?im)^\s*Implement this plan\?\s*$`)
+	codexPlanApprovalFooterRE = regexp.MustCompile(`(?im)^\s*Press enter to confirm or esc to go back\s*\z`)
 )
+
+// CodexPlanApprovalForm reports whether pane contains Codex's live Plan-mode
+// approval form. It deliberately recognizes only that Codex-specific form;
+// callers must additionally gate it on agent_type == "codex".
+func CodexPlanApprovalForm(pane string) bool {
+	region := ExtractCodexPlanApprovalForm(pane)
+	if region == "" {
+		return false
+	}
+	opts := ParseNumberedOptions(region)
+	if len(opts) != 3 || opts[0].Number != "1" || opts[1].Number != "2" || opts[2].Number != "3" {
+		return false
+	}
+	wants := []string{
+		"yes, implement this plan",
+		"yes, clear context and implement",
+		"no, stay in plan mode",
+	}
+	for i, want := range wants {
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(opts[i].Label)), want) {
+			return false
+		}
+	}
+	return true
+}
+
+// ExtractCodexPlanApprovalForm returns the final live approval region, from
+// "Implement this plan?" through its footer. An empty result means the full
+// structural envelope is not standing at the end of the captured pane.
+func ExtractCodexPlanApprovalForm(pane string) string {
+	headers := codexPlanApprovalHeaderRE.FindAllStringIndex(pane, -1)
+	footer := codexPlanApprovalFooterRE.FindStringIndex(pane)
+	if len(headers) == 0 || footer == nil {
+		return ""
+	}
+	header := headers[len(headers)-1]
+	if footer[0] <= header[0] {
+		return ""
+	}
+	return strings.TrimSpace(pane[header[0]:footer[1]])
+}
 
 // CodexMCQForm parses the last live Codex request_user_input render.
 func CodexMCQForm(pane string) (MCQFormState, bool) {

@@ -555,6 +555,17 @@ func classifierForTest() *classify.Classifier {
 
 const approvalPane = "Bash(go test ./...)\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell the agent what to do differently\n"
 
+const codexPlanApprovalPane = `plan tail
+
+Implement this plan?
+
+› 1. Yes, implement this plan          Switch to Default and start coding.
+  2. Yes, clear context and implement  Fresh thread. Context: 20% used.
+  3. No, stay in Plan mode             Continue planning with the model.
+
+Press enter to confirm or esc to go back
+`
+
 func TestPipelineAutoApprovesConfidentSignature(t *testing.T) {
 	h := newHarness(t, "")
 	h.herdr.setPane(approvalPane)
@@ -596,6 +607,35 @@ func TestManualCaptureNudgeUsesNormalPipeline(t *testing.T) {
 			if audit.AgentID == "agent-manual" && audit.Trigger == "manual-capture: blocked" {
 				return audit.SituationType == domain.SituationApproval
 			}
+		}
+		return false
+	})
+}
+
+func TestManualCaptureRecognizesIdleCodexPlanApproval(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(codexPlanApprovalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: "agent-codex-plan", PaneID: "agent-codex-plan", AgentType: "codex", Status: "idle",
+	}})
+
+	if err := control.NudgeCapture(context.Background(), h.ctlPath, "agent-codex-plan"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(context.Background(), 10)
+		for _, audit := range audits {
+			if audit.AgentID != "agent-codex-plan" || audit.Trigger != "manual-capture: idle" {
+				continue
+			}
+			if audit.SituationType != domain.SituationApproval {
+				t.Fatalf("Codex Plan capture situation = %s, want approval", audit.SituationType)
+			}
+			if !strings.HasPrefix(audit.Signature, "approval:") ||
+				!strings.Contains(audit.PaneExcerpt, "Implement this plan?") {
+				t.Fatalf("Codex Plan capture was not preserved precisely: %+v", audit)
+			}
+			return true
 		}
 		return false
 	})

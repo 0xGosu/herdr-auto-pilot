@@ -19,10 +19,12 @@ func TestGoldenTranscripts(t *testing.T) {
 	c := New(nil)
 
 	statusFor := map[string]string{
-		"idle_finished.txt": "idle",
-		"codex_idle.txt":    "idle",
+		"idle_finished.txt":       "idle",
+		"codex_idle.txt":          "idle",
+		"approval_codex_plan.txt": "idle",
 	}
 	agentTypeFor := map[string]string{
+		"approval_codex_plan.txt":     "codex",
 		"codex_idle.txt":              "codex",
 		"choice_codex_mcq.txt":        "codex",
 		"error_codex_interrupted.txt": "codex",
@@ -419,6 +421,35 @@ func TestPlanModeApprovalClassifiesApproval(t *testing.T) {
 	// The same panel content when NOT blocked must not read as a live prompt.
 	if s := c.Classify("claude", "working", string(data)); s.Type == domain.SituationApproval {
 		t.Error("plan-mode panel at non-blocked status must not classify approval")
+	}
+}
+
+func TestCodexPlanModeApprovalClassifiesApprovalAtParkedStatuses(t *testing.T) {
+	c := New(nil)
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "approval_codex_plan.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []string{"blocked", "idle", "done"} {
+		s := c.Classify("codex", status, string(data))
+		if s.Type != domain.SituationApproval {
+			t.Fatalf("Codex Plan approval at %s = %v, want approval", status, s.Type)
+		}
+		if s.PermissionVerb != "implement this plan" {
+			t.Errorf("Codex Plan approval verb = %q", s.PermissionVerb)
+		}
+		if len(s.Options) != 3 {
+			t.Fatalf("Codex Plan approval options = %d (%v), want 3", len(s.Options), s.Options)
+		}
+		if strings.Contains(strings.Join(s.Options, "|"), "This is plan content") {
+			t.Errorf("plan body leaked into approval options: %v", s.Options)
+		}
+	}
+	if s := c.Classify("codex", "working", string(data)); s.Type == domain.SituationApproval {
+		t.Fatal("working Codex pane must not classify a Plan approval")
+	}
+	if s := c.Classify("claude", "idle", string(data)); s.Type == domain.SituationApproval {
+		t.Fatal("Codex Plan approval structure must remain scoped to codex")
 	}
 }
 
