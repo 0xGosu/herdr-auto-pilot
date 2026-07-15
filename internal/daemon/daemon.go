@@ -1392,6 +1392,7 @@ type taskReviewContext struct {
 	listPath       string
 	currentTask    string
 	pending        []string
+	inProgress     []string
 }
 
 // consultDeclaredTask reviews a determined declared task before sending: it
@@ -1459,6 +1460,7 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 			}
 			if data, rerr := d.opt.ReadTaskFile(declared.Path); rerr == nil {
 				review.pending = domain.PendingDeclaredTasks(string(data))
+				review.inProgress = domain.InProgressDeclaredTasks(string(data))
 			} else {
 				slog.Warn("task-review: re-reading task source for pending list failed",
 					"path", declared.Path, "error", rerr)
@@ -1710,13 +1712,39 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 	} else if s.Type == domain.SituationApproval || s.Type == domain.SituationChoice {
 		fields["answer_format"] = "no numbered options were detected on the pane: answer with submit_decision recommend_action — the literal text the prompt expects (e.g. \"y\" for a y/n confirmation)"
 	}
+	// A matched [[task_sources]] entry is surfaced on every consult, not just
+	// the pre-send review below — the LLM should know the agent's backlog
+	// state regardless of what situation triggered this consult. The review
+	// path below already has a fresh read of the same file (review.pending/
+	// review.inProgress), so reuse it there instead of reading the file a
+	// third time.
+	if review != nil {
+		fields["task_list_path"] = review.listPath
+		fields["pending_task_count"] = len(review.pending)
+		if p := taskPreview(review.pending); p != "" {
+			fields["next_pending_task"] = p
+		}
+		fields["in_progress_task_count"] = len(review.inProgress)
+		if p := taskPreview(review.inProgress); p != "" {
+			fields["first_in_progress_task"] = p
+		}
+	} else if summary, ok := d.taskSourceSummary(ctx, cfg, s, workspaceID, agentName); ok {
+		fields["task_list_path"] = summary.path
+		fields["pending_task_count"] = summary.pendingCount
+		if summary.nextPending != "" {
+			fields["next_pending_task"] = summary.nextPending
+		}
+		fields["in_progress_task_count"] = summary.inProgressCount
+		if summary.firstInProgress != "" {
+			fields["first_in_progress_task"] = summary.firstInProgress
+		}
+	}
 	// Pre-send declared-task review: the agent is idle with a next task queued.
 	// Ask the LLM to judge, from the pane, whether sending it now is right —
 	// send it (recommend_action, edited if warranted), pick a different pending
 	// task when the current one is already done, or decline (@noop).
 	if review != nil {
 		fields["proposed_task"] = review.proposedPrompt
-		fields["task_list_path"] = review.listPath
 		fields["current_task"] = review.currentTask
 		fields["pending_tasks"] = review.pending
 		fields["answer_format"] = "this idle agent has a next task ready to send: proposed_task is the exact instruction that would be sent, current_task is that task's text, task_list_path is the checklist file, and pending_tasks lists every remaining task in order. Decide from the pane what to send. To send the queued task unchanged, submit_decision recommend_action \"@next_task:declared\" — the daemon sends proposed_task verbatim, so you never need to copy it. Only put literal text in recommend_action when you are editing the task or, if the pane shows current_task is ALREADY DONE, sending a different still-unfinished item from pending_tasks. To decline — the agent is still busy, every task is done, or nothing should run now — submit_decision recommend_action \"@noop\" with a one-sentence rationale. Always include confident_score: a confident decision is applied automatically (the chosen task is sent, or skipped on a decline), while a low-confidence one is surfaced to the operator"
@@ -2714,28 +2742,35 @@ func (d *Daemon) registerHumanInteraction(ctx context.Context, agentID string) {
 	}
 }
 
-// declaredTask resolves the operator-declared next task for a transition.
-// A task source's agent selector matches the agent/pane id, the agent type,
-// or the agent's short name; the workspace selector matches the workspace's
-// herdr name (label) with "*" wildcards, falling back to the raw workspace
-// id when no name is resolvable. A matched source with a fully completed
-// list still resolves (task content "none") so the templated prompt is
-// delivered; sources with a real remaining task take precedence.
-func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.AgentTransition, agentName string) *domain.DeclaredTask {
-	var completed *domain.DeclaredTask
+// taskSourceMatch is the source-selection result shared by declaredTask
+// (which builds the outbound prompt) and taskSourceSummary (which only needs
+// the winning path + pending items for get_context).
+type taskSourceMatch struct {
+	src  config.TaskSource
+	data []byte
+}
+
+// matchTaskSource walks cfg.TaskSources for a source matching the given
+// agent/workspace selectors, preferring a source with real remaining work
+// over one whose checklist is fully completed (a matched source with a fully
+// completed list still resolves so a templated "all done" prompt or a
+// completed-summary can be built; sources with a real remaining task take
+// precedence over one that is done).
+func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID, agentType, workspaceID, agentName string) (taskSourceMatch, bool) {
+	var completed *taskSourceMatch
 	wsName, wsResolved := "", false
 	for _, src := range cfg.TaskSources {
-		if src.Agent != "" && src.Agent != tr.AgentID && src.Agent != tr.AgentType &&
+		if src.Agent != "" && src.Agent != agentID && src.Agent != agentType &&
 			(agentName == "" || src.Agent != agentName) {
 			continue
 		}
 		if src.Workspace != "" && src.Workspace != "*" {
 			if !wsResolved {
-				wsName, wsResolved = d.workspaceName(ctx, tr.WorkspaceID), true
+				wsName, wsResolved = d.workspaceName(ctx, workspaceID), true
 			}
 			target := wsName
 			if target == "" {
-				target = tr.WorkspaceID
+				target = workspaceID
 			}
 			if !domain.MatchWorkspace(src.Workspace, target) {
 				continue
@@ -2746,31 +2781,93 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 			slog.Warn("task source unreadable", "path", src.Path, "error", err)
 			continue
 		}
-		// Resolve cwd only when the template references it (the common case
-		// does not), keeping the main-loop `pane get` shell-out off the hot
-		// path; a source opts out of the pre-send LLM review with
-		// llm_review=false (nil = the default, on).
-		build := func(task string) *domain.DeclaredTask {
-			cwd := ""
-			if strings.Contains(src.NextTaskTemplate, "{cwd}") {
-				cwd = d.paneCwd(ctx, tr.PaneID)
-			}
-			return &domain.DeclaredTask{
-				Task: task, Path: src.Path, Template: src.NextTaskTemplate,
-				AgentName: agentName, Cwd: cwd,
-				LLMReview: src.LLMReview == nil || *src.LLMReview,
-			}
-		}
-		if task := domain.NextDeclaredTask(string(data)); task != "" {
-			return build(task)
+		if domain.NextDeclaredTask(string(data)) != "" {
+			return taskSourceMatch{src: src, data: data}, true
 		}
 		// Only a real checklist with every item checked counts as completed;
 		// an empty or non-checklist file must not suppress tier-2 inference.
 		if completed == nil && domain.HasChecklistItems(string(data)) {
-			completed = build(domain.NoTaskContent)
+			completed = &taskSourceMatch{src: src, data: data}
 		}
 	}
-	return completed
+	if completed != nil {
+		return *completed, true
+	}
+	return taskSourceMatch{}, false
+}
+
+// taskSummaryMaxRunes bounds the get_context preview of the next pending or
+// in-progress task (short-field truncation, unlike the pane-excerpt-sized
+// limits).
+const taskSummaryMaxRunes = 200
+
+// taskSourceSummaryFields is the get_context task_source surface: present
+// whenever a [[task_sources]] entry matches, independent of situation type.
+type taskSourceSummaryFields struct {
+	path            string
+	pendingCount    int
+	nextPending     string
+	inProgressCount int
+	firstInProgress string
+}
+
+// taskPreview returns a truncated preview of the first item, or "" when
+// items is empty — the shared rule for whether a get_context preview field
+// is included at all.
+func taskPreview(items []string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	return truncateRunes(items[0], taskSummaryMaxRunes)
+}
+
+// taskSourceSummary reports the get_context task_source surface for the
+// given agent/workspace.
+func (d *Daemon) taskSourceSummary(ctx context.Context, cfg config.Config, s domain.Situation, workspaceID, agentName string) (taskSourceSummaryFields, bool) {
+	m, ok := d.matchTaskSource(ctx, cfg, s.AgentID, s.AgentType, workspaceID, agentName)
+	if !ok {
+		return taskSourceSummaryFields{}, false
+	}
+	pending := domain.PendingDeclaredTasks(string(m.data))
+	inProgress := domain.InProgressDeclaredTasks(string(m.data))
+	return taskSourceSummaryFields{
+		path:            m.src.Path,
+		pendingCount:    len(pending),
+		nextPending:     taskPreview(pending),
+		inProgressCount: len(inProgress),
+		firstInProgress: taskPreview(inProgress),
+	}, true
+}
+
+// declaredTask resolves the operator-declared next task for a transition.
+// A task source's agent selector matches the agent/pane id, the agent type,
+// or the agent's short name; the workspace selector matches the workspace's
+// herdr name (label) with "*" wildcards, falling back to the raw workspace
+// id when no name is resolvable. A matched source with a fully completed
+// list still resolves (task content "none") so the templated prompt is
+// delivered; sources with a real remaining task take precedence.
+func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.AgentTransition, agentName string) *domain.DeclaredTask {
+	m, ok := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName)
+	if !ok {
+		return nil
+	}
+	task := domain.NextDeclaredTask(string(m.data))
+	if task == "" {
+		task = domain.NoTaskContent
+	}
+	// Resolve cwd only when the template references it (the common case does
+	// not), keeping the main-loop `pane get` shell-out off the hot path.
+	cwd := ""
+	if strings.Contains(m.src.NextTaskTemplate, "{cwd}") {
+		cwd = d.paneCwd(ctx, tr.PaneID)
+	}
+	return &domain.DeclaredTask{
+		Task: task, Path: m.src.Path, Template: m.src.NextTaskTemplate,
+		AgentName: agentName, Cwd: cwd,
+		// A source opts out of the pre-send LLM review with llm_review=false
+		// (nil = the default, on).
+		LLMReview: m.src.LLMReview == nil || *m.src.LLMReview,
+	}
 }
 
 func (d *Daemon) declaredTaskFor(ctx context.Context, s domain.Situation) *domain.DeclaredTask {

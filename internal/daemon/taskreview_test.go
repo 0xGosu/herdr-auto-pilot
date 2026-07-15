@@ -64,7 +64,7 @@ func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
 	// With an LLM command configured, a determined declared task is reviewed
 	// before sending. An approval (recommend_action with the task text) is
 	// delivered once it clears the confidence gate.
-	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [ ] refactor the parser\n- [ ] add parser tests\n")
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [-] warm caches\n- [ ] refactor the parser\n- [ ] add parser tests\n")
 	idlePane := "All tests pass. Task is complete.\n"
 	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-rev\"\npath = %q\n", taskFile)
 	h := newHarness(t, cfg)
@@ -110,6 +110,21 @@ func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
 	pending, _ := m["pending_tasks"].([]any)
 	if len(pending) != 2 || pending[0] != "refactor the parser" || pending[1] != "add parser tests" {
 		t.Errorf("pending_tasks = %v, want the two unchecked items in order", pending)
+	}
+	// The always-on task_source summary fields must agree with the review's
+	// own pending_tasks/current_task, since both are set from review.pending/
+	// review.inProgress in the review branch.
+	if pc, _ := m["pending_task_count"].(float64); pc != 2 {
+		t.Errorf("pending_task_count = %v, want 2", m["pending_task_count"])
+	}
+	if np, _ := m["next_pending_task"].(string); np != "refactor the parser" {
+		t.Errorf("next_pending_task = %q, want %q", np, "refactor the parser")
+	}
+	if ic, _ := m["in_progress_task_count"].(float64); ic != 1 {
+		t.Errorf("in_progress_task_count = %v, want 1", m["in_progress_task_count"])
+	}
+	if nip, _ := m["first_in_progress_task"].(string); nip != "warm caches" {
+		t.Errorf("first_in_progress_task = %q, want %q", nip, "warm caches")
 	}
 }
 
@@ -473,5 +488,142 @@ func TestDeclaredTaskLLMReviewSourceChangedEscalates(t *testing.T) {
 	}
 	if len(h.herdr.sentInputs()) != 0 {
 		t.Errorf("a stale task must not be sent, sent %v", h.herdr.sentInputs())
+	}
+}
+
+func TestConsultContextIncludesMatchedTaskSourceOnApproval(t *testing.T) {
+	// A matched [[task_sources]] entry must surface task info on every
+	// consult, not just the pre-send idle review.
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [ ] refactor the parser\n- [ ] add parser tests\n")
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-ts1\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-ts1", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if lp, _ := m["task_list_path"].(string); lp != taskFile {
+		t.Errorf("task_list_path = %q, want %q", lp, taskFile)
+	}
+	if pc, _ := m["pending_task_count"].(float64); pc != 2 {
+		t.Errorf("pending_task_count = %v, want 2", m["pending_task_count"])
+	}
+	if np, _ := m["next_pending_task"].(string); np != "refactor the parser" {
+		t.Errorf("next_pending_task = %q, want %q", np, "refactor the parser")
+	}
+}
+
+func TestConsultContextMatchedTaskSourceCompletedOmitsNextField(t *testing.T) {
+	// A fully checked-off checklist still matches (path + zero count), but
+	// next_pending_task must be omitted entirely — there is nothing to preview.
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [x] ship it\n")
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-ts2\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-ts2", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if lp, _ := m["task_list_path"].(string); lp != taskFile {
+		t.Errorf("task_list_path = %q, want %q", lp, taskFile)
+	}
+	if pc, _ := m["pending_task_count"].(float64); pc != 0 {
+		t.Errorf("pending_task_count = %v, want 0", m["pending_task_count"])
+	}
+	if _, present := m["next_pending_task"]; present {
+		t.Errorf("next_pending_task must be absent when nothing is pending, got %v", m["next_pending_task"])
+	}
+}
+
+func TestConsultContextNoTaskSourceOmitsTaskFields(t *testing.T) {
+	// No [[task_sources]] entry matches this agent: none of the task_source
+	// summary fields should appear.
+	h := newHarness(t, "")
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-no-ts", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	for _, key := range []string{"task_list_path", "pending_task_count", "next_pending_task", "in_progress_task_count", "first_in_progress_task"} {
+		if _, present := m[key]; present {
+			t.Errorf("%s must be absent with no matching task source, got %v", key, m[key])
+		}
+	}
+}
+
+func TestConsultContextNextPendingTaskTruncated(t *testing.T) {
+	// A long next-task item is truncated with the standard ellipsis marker.
+	long := strings.Repeat("x", 250)
+	taskFile := writeReviewTaskFile(t, fmt.Sprintf("- [ ] %s\n", long))
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-ts3\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-ts3", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	next, _ := m["next_pending_task"].(string)
+	const wantRunes = 200
+	gotRunes := []rune(next)
+	if len(gotRunes) != wantRunes+1 || gotRunes[wantRunes] != '…' {
+		t.Errorf("next_pending_task = %q (%d runes), want %d chars + ellipsis marker", next, len(gotRunes), wantRunes)
+	}
+}
+
+func TestConsultContextIncludesInProgressTaskOnApproval(t *testing.T) {
+	// A matched [[task_sources]] entry with an in-progress ("[-]") item
+	// surfaces in_progress_task_count/first_in_progress_task alongside the
+	// pending fields, on a non-idle consult.
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [-] refactor the parser\n- [ ] add parser tests\n- [ ] ship it\n")
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-ts4\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-ts4", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if lp, _ := m["task_list_path"].(string); lp != taskFile {
+		t.Errorf("task_list_path = %q, want %q", lp, taskFile)
+	}
+	// "[-]" is not "[ ]", so it must not count toward pending.
+	if pc, _ := m["pending_task_count"].(float64); pc != 2 {
+		t.Errorf("pending_task_count = %v, want 2", m["pending_task_count"])
+	}
+	if ic, _ := m["in_progress_task_count"].(float64); ic != 1 {
+		t.Errorf("in_progress_task_count = %v, want 1", m["in_progress_task_count"])
+	}
+	if nip, _ := m["first_in_progress_task"].(string); nip != "refactor the parser" {
+		t.Errorf("first_in_progress_task = %q, want %q", nip, "refactor the parser")
+	}
+}
+
+func TestConsultContextNoInProgressOmitsFirstInProgressField(t *testing.T) {
+	// A matched source with pending items but nothing marked "[-]" must
+	// report in_progress_task_count 0 and omit first_in_progress_task.
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [ ] refactor the parser\n")
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-ts5\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-ts5", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if ic, _ := m["in_progress_task_count"].(float64); ic != 0 {
+		t.Errorf("in_progress_task_count = %v, want 0", m["in_progress_task_count"])
+	}
+	if _, present := m["first_in_progress_task"]; present {
+		t.Errorf("first_in_progress_task must be absent when nothing is in progress, got %v", m["first_in_progress_task"])
 	}
 }

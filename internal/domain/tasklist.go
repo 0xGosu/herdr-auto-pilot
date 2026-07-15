@@ -12,6 +12,11 @@ import (
 var uncheckedItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[[ ]\]\s*(.+)$`)
 var checkedItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[[xX+\-*]\]\s*(.+)$`)
 
+// inProgressItemRE matches the "[-]" in-progress marker specifically (a
+// subset of checkedItemRE's bracket class) — the convention RenderGeneratedTaskList
+// writes for the one task already sent to the agent (see taskgen.go).
+var inProgressItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[-\]\s*(.+)$`)
+
 // DefaultNextTaskTemplate is the prompt template used when a task source
 // declares none. Placeholders: {next_task_content} is the next unchecked
 // item (or NoTaskContent when the list is complete), {task_list_path} is
@@ -120,6 +125,21 @@ func PendingDeclaredTasks(content string) []string {
 		}
 	}
 	return pending
+}
+
+// InProgressDeclaredTasks returns every checklist item marked "[-]" from an
+// operator-declared task-source file's content, in file order. Returns nil
+// when none are marked in-progress. Used to give the LLM consult context
+// visibility into work already underway, distinct from PendingDeclaredTasks
+// ("[ ]", not yet started).
+func InProgressDeclaredTasks(content string) []string {
+	var inProgress []string
+	for _, line := range strings.Split(content, "\n") {
+		if m := inProgressItemRE.FindStringSubmatch(line); m != nil {
+			inProgress = append(inProgress, strings.TrimSpace(m[1]))
+		}
+	}
+	return inProgress
 }
 
 // InferredTask is a next task inferred from the agent's own transcript.
