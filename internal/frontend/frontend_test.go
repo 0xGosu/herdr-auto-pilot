@@ -478,8 +478,8 @@ func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tasks file not written: %v", err)
 	}
-	if !strings.Contains(string(body), "- [-] "+taskText) {
-		t.Errorf("tasks file = %q, want a single in-progress %q item", body, taskText)
+	if !strings.Contains(string(body), "- [-] 1. "+taskText) {
+		t.Errorf("tasks file = %q, want a single numbered in-progress %q item", body, taskText)
 	}
 
 	// The item is parsed as not-actionable, so the declared-task resolver
@@ -574,12 +574,14 @@ func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tasks file not written: %v", err)
 	}
-	want := "- [-] Investigate the flaky auth test\n- [ ] Add a retry guard\n- [ ] Backfill unit tests\n"
+	want := "- [-] 1. Investigate the flaky auth test\n- [ ] 2. Add a retry guard\n- [ ] 3. Backfill unit tests\n"
 	if !strings.Contains(string(body), want) {
-		t.Errorf("tasks file = %q, want a checklist %q", body, want)
+		t.Errorf("tasks file = %q, want a numbered checklist %q", body, want)
 	}
 	// Only the first task is sent to the agent, rendered through the same
-	// default prompt used for later items from the registered source.
+	// default prompt used for later items from the registered source. The
+	// first task is sent from the raw normalized suggestion (never re-read
+	// from the numbered file), so it stays clean, unnumbered text.
 	wantPrompt := domain.DeclaredTask{
 		Task: "Investigate the flaky auth test", Path: path, AgentName: name,
 	}.Prompt()
@@ -587,9 +589,11 @@ func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
 		t.Errorf("delivered %v, want only the first task as %q", fake.inputs, wantPrompt)
 	}
 	// The next declared task is the first pending item, so the queue drives on
-	// later idles.
-	if next := domain.NextDeclaredTask(string(body)); next != "Add a retry guard" {
-		t.Errorf("next declared task = %q, want the first pending item", next)
+	// later idles. Its numbered ID marker is NOT stripped when read back — it
+	// is sent to the agent as part of the task text, same as any hand-authored
+	// numbered checklist item.
+	if next := domain.NextDeclaredTask(string(body)); next != "2. Add a retry guard" {
+		t.Errorf("next declared task = %q, want the first pending item with its ID marker intact", next)
 	}
 }
 
