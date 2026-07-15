@@ -105,6 +105,13 @@ type prompt struct {
 	onSubmit func(string) tea.Cmd
 }
 
+// confirmation is a single-key Y/n guard for a quick action. Enter accepts
+// the capitalized default (yes); n or Esc cancels without running anything.
+type confirmation struct {
+	label     string
+	onConfirm func() tea.Cmd
+}
+
 // detailView is a full-record overlay opened with `v` on the Agents,
 // Escalations, Audit, and Rules tabs. Scalar fields stay untruncated; captured
 // pane previews may use the operator-configured tail height.
@@ -131,9 +138,10 @@ type detailView struct {
 
 // ruleItem is one navigable row of the Config tab. "indicator" and
 // "capture" rows are read-only (AR-034, AR-035): they render for
-// visibility and refuse edit/remove with a config.toml pointer.
+// visibility and refuse edit/remove with a config.toml pointer. "shortcut"
+// rows run guarded one-off setup actions.
 type ruleItem struct {
-	kind  string // "field" | "pattern" | "source" | "indicator" | "capture"
+	kind  string // "field" | "pattern" | "source" | "indicator" | "capture" | "shortcut"
 	key   string // config field key (fields)
 	index int    // slice index (patterns / sources)
 	value string // pattern text / source path — verified on removal
@@ -153,9 +161,14 @@ type Model struct {
 	marked  map[int64]bool // Escalations tab multi-select (audit ids), space toggles
 	message string
 	prompt  *prompt
+	confirm *confirmation
 	detail  *detailView
 	width   int
 	height  int
+
+	// installShortcut is injectable so the key flow can be tested without
+	// writing /usr/local/bin. A nil value uses installHAPShortcut.
+	installShortcut func() error
 
 	offsets   [tabCount]int    // per-list viewport offset (AR-001)
 	query     [tabCount]string // per-tab search filter (AR-013)
@@ -394,6 +407,11 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 				i, at, r.StartMs, r.EventMs),
 		})
 	}
+	items = append(items, ruleItem{
+		kind:  "shortcut",
+		key:   "install-hap",
+		label: "Create /usr/local/bin/hap symlink to this running binary",
+	})
 	return items
 }
 
@@ -571,6 +589,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.confirm != nil {
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "enter", "y", "Y":
+			confirm := m.confirm
+			m.confirm = nil
+			m.beginAction()
+			return m, confirm.onConfirm()
+		case "esc", "n", "N":
+			m.confirm = nil
+			m.message = "cancelled"
+		}
+		return m, nil
+	}
+
 	if m.prompt != nil {
 		switch msg.Type {
 		case tea.KeyCtrlC:
@@ -691,14 +725,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				func(ctx context.Context) error { return m.app.RequestReembed(ctx) })
 		}
 		return m, nil
-	case "enter", "y":
+	case "enter":
 		switch m.tab {
 		case tabEscalations:
 			return m.confirmSelected()
 		case tabSignatures:
 			return m.viewSignatureDetail()
 		case tabConfig:
-			return m.editSelectedRule()
+			return m.activateSelectedConfig()
+		}
+	case "y":
+		if m.tab == tabEscalations {
+			return m.confirmSelected()
 		}
 	case "e":
 		if m.tab == tabConfig {
@@ -1763,6 +1801,37 @@ func (m Model) selectedRule() *ruleItem {
 	return nil
 }
 
+func (m Model) activateSelectedConfig() (tea.Model, tea.Cmd) {
+	item := m.selectedRule()
+	if item == nil {
+		return m, nil
+	}
+	if item.kind != "shortcut" {
+		return m.editSelectedRule()
+	}
+	if item.key != "install-hap" {
+		return m, nil
+	}
+
+	install := m.installShortcut
+	if install == nil {
+		install = installHAPShortcut
+	}
+	m.message = ""
+	m.confirm = &confirmation{
+		label: "Create /usr/local/bin/hap symlink to the currently running hap binary? [Y/n]",
+		onConfirm: func() tea.Cmd {
+			return func() tea.Msg {
+				if err := install(); err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: "created /usr/local/bin/hap symlink"}
+			}
+		},
+	}
+	return m, nil
+}
+
 func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	item := m.selectedRule()
 	if item == nil {
@@ -1771,6 +1840,9 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	switch item.kind {
 	case "indicator", "capture":
 		m.message = "read-only — edit config.toml (the daemon reloads on save)"
+		return m, nil
+	case "shortcut":
+		m.message = "press enter to run this quick shortcut"
 		return m, nil
 	case "field":
 	default:
@@ -1867,6 +1939,9 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 		})
 	case "indicator", "capture":
 		m.message = "read-only — edit config.toml (the daemon reloads on save)"
+		return m, nil
+	case "shortcut":
+		m.message = "quick shortcuts can't be removed"
 		return m, nil
 	default:
 		m.message = "config fields are edited (enter), not removed"
@@ -1983,6 +2058,9 @@ func (m Model) View() string {
 	if m.prompt != nil {
 		fmt.Fprintf(&b, "\n%s> %s█\n", m.prompt.label, m.prompt.input)
 	}
+	if m.confirm != nil {
+		fmt.Fprintf(&b, "\n%s\n", m.confirm.label)
+	}
 	if m.message != "" {
 		fmt.Fprintf(&b, "\n%s\n", m.message)
 	}
@@ -2031,6 +2109,9 @@ func (m Model) helpLine() string {
 	if m.searching {
 		return "type to filter  backspace: erase  esc/enter: apply & close"
 	}
+	if m.confirm != nil {
+		return "y/enter: confirm  n/esc: cancel"
+	}
 	common := "tab: switch  ↑/↓: select  p: pause  r: resume  q: quit"
 	if d := m.data.status.Drift; d.Detected && !d.ModelMissing {
 		common = "R: re-embed  " + common
@@ -2045,7 +2126,7 @@ func (m Model) helpLine() string {
 	case tabSignatures:
 		return "enter/v: details  x: delete  f: filter mode  /: search  " + common
 	case tabConfig:
-		return "enter/e: edit field  a: add pattern  t: add task source  x: remove  X: clear data  " + common
+		return "enter: edit/run shortcut  e: edit field  a: add pattern  t: add task source  x: remove  X: clear data  " + common
 	}
 	return common
 }
@@ -2307,8 +2388,15 @@ func (m Model) renderConfig(b *strings.Builder) {
 		return
 	}
 	lastKind := ""
+	emptySectionsRendered := false
 	for i, item := range m.items {
 		if item.kind != lastKind {
+			// Empty mutable sections still belong above Quick Shortcuts, which is
+			// intentionally the final section in the Config tab.
+			if item.kind == "shortcut" && !emptySectionsRendered {
+				m.renderEmptyConfigSections(b)
+				emptySectionsRendered = true
+			}
 			lastKind = item.kind
 			switch item.kind {
 			case "field":
@@ -2322,6 +2410,8 @@ func (m Model) renderConfig(b *strings.Builder) {
 				fmt.Fprintf(b, "\n%s\n", st.section.Render("Safety indicators (read-only — edit config.toml)"))
 			case "capture":
 				fmt.Fprintf(b, "\n%s\n", st.section.Render("Capture delays (read-only — edit config.toml)"))
+			case "shortcut":
+				fmt.Fprintf(b, "\n%s\n", st.section.Render("Quick Shortcuts"))
 			}
 		}
 		// Long values (argv templates, paths) truncate to one line (CR-037).
@@ -2331,6 +2421,13 @@ func (m Model) renderConfig(b *strings.Builder) {
 		}
 		fmt.Fprintln(b, line)
 	}
+	if !emptySectionsRendered {
+		m.renderEmptyConfigSections(b)
+	}
+}
+
+func (m Model) renderEmptyConfigSections(b *strings.Builder) {
+	st := m.styles()
 	if len(m.data.cfg.Safety.NeverAutoPatterns) == 0 {
 		fmt.Fprintf(b, "\n%s\n", st.section.Render(fmt.Sprintf(
 			"Never-auto patterns: none from operator (%s) — press a to add", m.seedLabel())))
