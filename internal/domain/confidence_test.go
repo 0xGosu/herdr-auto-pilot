@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -112,6 +113,23 @@ func TestConfirmationBoostCleanHistoryStaysMax(t *testing.T) {
 	recs := opHistory("yes", "yes", "yes")
 	if got := Confidence(recs, 3.0).Score; got != 1.0 {
 		t.Errorf("clean confirmed history should stay 1.0, got %.3f", got)
+	}
+}
+
+func TestConfidenceNonFiniteWeightFailsClosed(t *testing.T) {
+	// A non-finite weight must never yield a NaN/Inf score: NaN comparisons in
+	// the confidence gate are always false, which would let an autonomous rule
+	// bypass the gate. The clamp fails closed to a baseline vote (weight 1).
+	recs := opHistory("yes", "@no", "@no")
+	baseline := Confidence(recs, 1.0).Score
+	for _, w := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		got := Confidence(recs, w).Score
+		if math.IsNaN(got) || math.IsInf(got, 0) {
+			t.Errorf("weight %v produced non-finite score %v", w, got)
+		}
+		if got != baseline {
+			t.Errorf("weight %v should clamp to baseline %.3f, got %.3f", w, baseline, got)
+		}
 	}
 }
 

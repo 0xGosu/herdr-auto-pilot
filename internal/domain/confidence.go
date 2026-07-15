@@ -1,5 +1,7 @@
 package domain
 
+import "math"
+
 // recencyDecay is the per-step decay applied to older decisions when
 // computing the recency-weighted agreement ratio (FR-005). The newest
 // decision has weight 1, the next 0.85, then 0.85², and so on — so recent
@@ -56,8 +58,11 @@ func Confidence(history []DecisionRecord, confirmWeight float64) ConfidenceResul
 	if len(history) == 0 {
 		return ConfidenceResult{}
 	}
-	if confirmWeight < 1 {
-		confirmWeight = 1 // defense in depth: never penalize below baseline
+	if math.IsNaN(confirmWeight) || math.IsInf(confirmWeight, 0) || confirmWeight < 1 {
+		// Fail closed: a non-finite or <1 weight would otherwise produce a
+		// NaN/Inf score that slips past the confidence gate (NaN comparisons are
+		// always false). Clamp to a baseline vote — no boost, never penalize.
+		confirmWeight = 1
 	}
 	weights := map[string]float64{}
 	var total float64

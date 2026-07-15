@@ -113,6 +113,11 @@ func TestConfirmationWeightClampAndOverride(t *testing.T) {
 		{"[learning]\nconfirmation_weight = 0.5\n", Default().Learning.ConfirmationWeight},
 		{"[learning]\nconfirmation_weight = 1.0\n", 1.0},
 		{"[learning]\nconfirmation_weight = 6.0\n", 6.0},
+		// Non-finite values (TOML accepts inf/nan) must fall back — a NaN/Inf
+		// weight would produce a NaN score that bypasses the confidence gate.
+		{"[learning]\nconfirmation_weight = inf\n", Default().Learning.ConfirmationWeight},
+		{"[learning]\nconfirmation_weight = +inf\n", Default().Learning.ConfirmationWeight},
+		{"[learning]\nconfirmation_weight = nan\n", Default().Learning.ConfirmationWeight},
 	}
 	for _, c := range cases {
 		path := filepath.Join(t.TempDir(), "config.toml")

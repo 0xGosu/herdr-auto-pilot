@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -523,9 +524,11 @@ func (c *Config) fillZeroes() {
 	if c.Learning.GraduationN <= 0 {
 		c.Learning.GraduationN = d.Learning.GraduationN
 	}
-	// An explicit 1 disables the boost; only bad (<1) values fall back so a
-	// zero-value/misconfigured weight never silently penalizes confirmations.
-	if c.Learning.ConfirmationWeight < 1 {
+	// An explicit 1 disables the boost; bad values fall back to the default so a
+	// misconfigured weight never silently penalizes confirmations. NaN/±Inf
+	// (TOML accepts inf/nan) are rejected too — a non-finite weight would make
+	// Confidence produce a NaN score that slips past the confidence gate.
+	if w := c.Learning.ConfirmationWeight; w < 1 || math.IsNaN(w) || math.IsInf(w, 0) {
 		c.Learning.ConfirmationWeight = d.Learning.ConfirmationWeight
 	}
 	if c.Limits.MaxConsecutiveAutoPrompts <= 0 {
