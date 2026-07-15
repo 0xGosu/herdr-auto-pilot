@@ -248,7 +248,7 @@ func IrreversibleScanContent(s Situation, declaredTask string) string {
 		// A swept multi-tab aggregate IS the actionable region already
 		// (scrollback was dropped per frame): the tail window would hide
 		// destructive phrasing in the leading questions.
-		if s.TabCount > 1 {
+		if s.EffectiveAnswerCount() > 1 {
 			return strings.Join(append([]string{s.Content}, s.Options...), "\n")
 		}
 		parts := []string{lastLines(s.Content, IrreversibleScanTailLines),

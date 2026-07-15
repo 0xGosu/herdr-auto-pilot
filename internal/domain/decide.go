@@ -319,8 +319,9 @@ func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggest
 		// per tab including the final Submit tab. The series is never in the
 		// offered option set; instead its length must match the captured tab
 		// count — a mismatched answer must never be partially delivered.
-		if in.Situation.TabCount > 1 {
-			if seq, ok := ParseDigitSeries(conf.TopAction); ok && len(seq) == in.Situation.TabCount {
+		answerCount := in.Situation.EffectiveAnswerCount()
+		if answerCount > 1 {
+			if seq, ok := ParseDigitSeries(conf.TopAction); ok && len(seq) == answerCount {
 				return conf.TopAction, "answer series: " + conf.TopAction, ReasonNone
 			}
 			return "", "", ReasonUnfamiliarOptions

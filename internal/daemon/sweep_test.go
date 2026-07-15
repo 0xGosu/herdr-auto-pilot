@@ -3,12 +3,122 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
+
+func codexQuestionFrame(current, total, unanswered int, selected string, submitAll bool) string {
+	verb := "answer"
+	if submitAll {
+		verb = "all"
+	}
+	marker1, marker2 := " ", " "
+	if selected == "1" {
+		marker1 = "›"
+	}
+	if selected == "2" {
+		marker2 = "›"
+	}
+	return fmt.Sprintf("scrollback\nQuestion %d/%d (%d unanswered)\nQuestion number %d?\n\n%s 1. First option\n%s 2. Second option\n\ntab to add notes | enter to submit %s | ←/→ to navigate questions | esc to interrupt\n",
+		current, total, unanswered, current, marker1, marker2, verb)
+}
+
+func TestCodexQuestionSweepAndAdaptiveDelivery(t *testing.T) {
+	h := newHarness(t, "")
+	frames := []string{
+		codexQuestionFrame(1, 2, 2, "1", false),
+		codexQuestionFrame(2, 2, 2, "1", false),
+	}
+	h.herdr.setFrames(frames)
+	s := classifierForTest().Classify("codex", "blocked", frames[0])
+	s.AgentID, s.PaneID = "agent-codex-mcq", "agent-codex-mcq"
+	if s.Type != domain.SituationChoice || s.MCQKind != domain.MCQCodexQuestions || s.EffectiveAnswerCount() != 2 {
+		t.Fatalf("fixture classification = %+v", s)
+	}
+	swept, err := h.daemon.sweepFrames(context.Background(), h.herdr, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(swept.Content, "[question 1/2]") || !strings.Contains(swept.Content, "[question 2/2]") || len(swept.Options) != 4 {
+		t.Fatalf("Codex aggregate/options = %q / %v", swept.Content, swept.Options)
+	}
+	cfg, _, _ := h.daemon.snapshot()
+	consult := string(h.daemon.consultContext(context.Background(), cfg, swept, "codex-agent", nil))
+	for _, want := range []string{`"mcq_kind":"codex_questions"`, `"answer_count":2`, `"question_count":2`, "there is no Submit pseudo-option"} {
+		if !strings.Contains(consult, want) {
+			t.Errorf("Codex consult context missing %q: %s", want, consult)
+		}
+	}
+	if strings.Contains(consult, `"tab_count"`) {
+		t.Errorf("Codex consult context must not advertise Claude tab_count: %s", consult)
+	}
+
+	// Question 1: digit 2 only moves the caret, then Enter commits and
+	// advances. Question 2: digit 1 commits immediately and reveals submit-all.
+	initial := codexQuestionFrame(1, 2, 2, "1", false)
+	selected := codexQuestionFrame(1, 2, 2, "2", false)
+	second := codexQuestionFrame(2, 2, 1, "1", false)
+	ready := codexQuestionFrame(2, 2, 0, "1", true)
+	h.herdr.setKeyScript(initial,
+		[]string{"2", "enter", "1", "enter"},
+		[]string{selected, second, ready, "submitted"})
+	s.Content = domain.AggregateAgentMCQFrames(domain.MCQCodexQuestions, frames)
+	if err := h.daemon.sendCodexSelections(context.Background(), h.herdr, s, [][]string{{"2"}, {"1"}}); err != nil {
+		t.Fatal(err)
+	}
+	keys := strings.Join(h.herdr.keysSent(), " ")
+	wantSuffix := "2 enter 1 enter"
+	if !strings.HasSuffix(keys, wantSuffix) {
+		t.Fatalf("Codex delivery keys = %s, want suffix %s", keys, wantSuffix)
+	}
+}
+
+func TestCodexBlockedMCQEscalatesAsAggregatedChoice(t *testing.T) {
+	h := newHarness(t, "")
+	frames := []string{
+		codexQuestionFrame(1, 2, 2, "1", false),
+		codexQuestionFrame(2, 2, 2, "1", false),
+	}
+	h.herdr.setFrames(frames)
+	h.events.ch <- domain.AgentTransition{
+		AgentID: "agent-codex-escalation", PaneID: "agent-codex-escalation",
+		AgentType: "codex", Status: "blocked",
+	}
+	ctx := context.Background()
+	waitFor(t, 10*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	esc, _ := h.raw.PendingEscalations(ctx)
+	if esc[0].SituationType != domain.SituationChoice || esc[0].AgentType != "codex" {
+		t.Fatalf("Codex MCQ escalation = %+v, want codex choice", esc[0])
+	}
+	if !strings.Contains(esc[0].PaneExcerpt, "[question 2/2]") || strings.Contains(esc[0].Rationale, "unclassifiable") {
+		t.Fatalf("Codex escalation was not fully aggregated/classified: %+v", esc[0])
+	}
+}
+
+func TestCodexAdaptiveDeliveryStopsOnUnexpectedSelection(t *testing.T) {
+	h := newHarness(t, "")
+	initial := codexQuestionFrame(1, 2, 2, "1", false)
+	// The injected "2" causes no visible selection change. Delivery must stop
+	// before Enter or any later-question key can corrupt the form.
+	h.herdr.setKeyScript(initial, []string{"2"}, []string{initial})
+	s := classifierForTest().Classify("codex", "blocked", initial)
+	s.AgentID, s.PaneID = "agent-codex-stale", "agent-codex-stale"
+	err := h.daemon.sendCodexSelections(context.Background(), h.herdr, s, [][]string{{"2"}, {"1"}})
+	if err == nil || !strings.Contains(err.Error(), "was not selected") {
+		t.Fatalf("unexpected transition must fail closed, got %v", err)
+	}
+	keys := h.herdr.keysSent()
+	if len(keys) == 0 || keys[len(keys)-1] != "2" || strings.Contains(strings.Join(keys, " "), "enter") {
+		t.Fatalf("delivery continued after failed selection: %v", keys)
+	}
+}
 
 // Three-tab AskUserQuestion form (2 questions + Submit), one frame per tab
 // exactly as `pane read --source visible` would return them.

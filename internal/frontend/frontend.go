@@ -49,7 +49,11 @@ const seriesKeyDelay = 250 * time.Millisecond
 // that passes — a delivery pass that toggles. This way a refusal never leaves
 // the form half-answered. groups has one entry per tab (validated by the
 // caller against the tab count).
-func (a *App) deliverTabSeries(ctx context.Context, ks ports.KeystrokeSender, agentID string, groups [][]string) error {
+func (a *App) deliverTabSeries(ctx context.Context, ks ports.KeystrokeSender, audit *domain.AuditRecord, groups [][]string) error {
+	if strings.EqualFold(audit.AgentType, "codex") {
+		return a.deliverCodexSeries(ctx, ks, audit, groups)
+	}
+	agentID := audit.AgentID
 	multi, err := a.verifyTabBaseline(ctx, ks, agentID, len(groups))
 	if err != nil {
 		return err
@@ -64,6 +68,102 @@ func (a *App) deliverTabSeries(ctx context.Context, ks ports.KeystrokeSender, ag
 		}
 		if err := ks.SendKey(ctx, agentID, key); err != nil {
 			return fmt.Errorf("delivering keystroke %d/%d (%q) failed: %w", i+1, len(keys), key, err)
+		}
+	}
+	return nil
+}
+
+// deliverCodexSeries mirrors the daemon's adaptive Codex protocol for an
+// operator correction. Digits may commit immediately or merely select the
+// numbered row; live reads determine whether Enter and/or Right is needed.
+func (a *App) deliverCodexSeries(ctx context.Context, ks ports.KeystrokeSender,
+	audit *domain.AuditRecord, groups [][]string) error {
+	for i, group := range groups {
+		if len(group) != 1 {
+			return fmt.Errorf("codex question %d is single-select, got %d selections", i+1, len(group))
+		}
+	}
+	if err := a.resetForm(ctx, ks, audit.AgentID); err != nil {
+		return err
+	}
+	answerCount := len(groups)
+	for i, group := range groups {
+		beforePane, err := a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
+		if err != nil {
+			return fmt.Errorf("re-reading Codex question %d/%d failed: %w", i+1, answerCount, err)
+		}
+		before, ok := domain.CodexMCQForm(beforePane)
+		if !ok || before.AnswerCount != answerCount || before.Current != i+1 || before.Unanswered != answerCount-i {
+			return fmt.Errorf("the Codex form is stale at question %d/%d", i+1, answerCount)
+		}
+		if i == 0 && strings.Contains(audit.PaneExcerpt, "[question 1/") &&
+			domain.ExtractCodexMCQForm(beforePane) != domain.FirstMCQQuestion(audit.PaneExcerpt) {
+			return fmt.Errorf("a different Codex form is showing; answer series not delivered")
+		}
+
+		digit := group[0]
+		if err := ks.SendKey(ctx, audit.AgentID, digit); err != nil {
+			return fmt.Errorf("delivering Codex question %d option %s failed: %w", i+1, digit, err)
+		}
+		time.Sleep(seriesKeyDelay)
+		afterPane, err := a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
+		if err != nil {
+			return fmt.Errorf("re-reading Codex question %d after option failed: %w", i+1, err)
+		}
+		after, standing := domain.CodexMCQForm(afterPane)
+		if !standing {
+			if i == answerCount-1 {
+				return nil
+			}
+			return fmt.Errorf("codex form disappeared after question %d/%d", i+1, answerCount)
+		}
+		if after.Unanswered == before.Unanswered {
+			if after.Current != before.Current || after.SelectedOption != digit {
+				return fmt.Errorf("codex option %s was not selected on question %d", digit, i+1)
+			}
+			if err := ks.SendKey(ctx, audit.AgentID, "enter"); err != nil {
+				return fmt.Errorf("committing Codex question %d failed: %w", i+1, err)
+			}
+			time.Sleep(seriesKeyDelay)
+			afterPane, err = a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
+			if err != nil {
+				return fmt.Errorf("re-reading committed Codex question %d failed: %w", i+1, err)
+			}
+			after, standing = domain.CodexMCQForm(afterPane)
+			if !standing {
+				if i == answerCount-1 {
+					return nil
+				}
+				return fmt.Errorf("codex form disappeared after question %d/%d", i+1, answerCount)
+			}
+		}
+		if after.Unanswered != before.Unanswered-1 {
+			return fmt.Errorf("codex question %d did not commit", i+1)
+		}
+		if i == answerCount-1 {
+			if !after.SubmitAll {
+				return fmt.Errorf("codex answered all questions but submit-all state is not showing")
+			}
+			if err := ks.SendKey(ctx, audit.AgentID, "enter"); err != nil {
+				return fmt.Errorf("submitting Codex answers failed: %w", err)
+			}
+			return nil
+		}
+		if after.Current == i+1 {
+			if err := ks.SendKey(ctx, audit.AgentID, "right"); err != nil {
+				return fmt.Errorf("navigating to Codex question %d failed: %w", i+2, err)
+			}
+			time.Sleep(seriesKeyDelay)
+			pane, err := a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
+			if err != nil {
+				return fmt.Errorf("re-reading Codex question %d failed: %w", i+2, err)
+			}
+			next, ok := domain.CodexMCQForm(pane)
+			if !ok || next.Current != i+2 || next.Unanswered != after.Unanswered {
+				return fmt.Errorf("codex did not navigate to question %d", i+2)
+			}
+		} else if after.Current != i+2 {
+			return fmt.Errorf("codex advanced to unexpected question %d", after.Current)
 		}
 	}
 	return nil
@@ -531,14 +631,20 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 			if rerr != nil {
 				return fmt.Errorf("correction recorded, but the pane could not be read to deliver the answer series: %w", rerr)
 			}
-			if tabs, ok := domain.MultiTabForm(pane); !ok || tabs != len(groups) {
+			form, ok := domain.ParseMCQForm(audit.AgentType, pane)
+			if !ok && audit.AgentType == "" {
+				if tabs, legacyOK := domain.MultiTabForm(pane); legacyOK {
+					form, ok = domain.MCQFormState{Kind: domain.MCQClaudeTabs, AnswerCount: tabs}, true
+				}
+			}
+			if !ok || form.AnswerCount != len(groups) {
 				return fmt.Errorf("correction recorded, but the pane no longer shows a %d-tab form; answer series not delivered", len(groups))
 			}
 			ks, ok := a.Herdr.(ports.KeystrokeSender)
 			if !ok {
 				return fmt.Errorf("correction recorded, but this herdr adapter cannot send keystrokes for the answer series")
 			}
-			if err := a.deliverTabSeries(ctx, ks, audit.AgentID, groups); err != nil {
+			if err := a.deliverTabSeries(ctx, ks, audit, groups); err != nil {
 				return fmt.Errorf("correction recorded, but %w", err)
 			}
 			markSent()

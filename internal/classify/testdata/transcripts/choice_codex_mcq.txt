@@ -1,0 +1,10 @@
+• The main inconsistency is Audit, while Escalations already has the desired semantic block.
+
+Question 1/3 (3 unanswered)
+Should consistency include adding shared columns that the underlying records already provide?
+
+› 1. Add shared columns (Recommended)  Add CONF to Escalations and TYPE to Audit.
+  2. Reorder only                      Keep each tab's current column set.
+  3. None of the above                 Optionally, add details in notes (tab).
+
+tab to add notes | enter to submit answer | ←/→ to navigate questions | esc to interrupt

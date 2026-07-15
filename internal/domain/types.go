@@ -61,22 +61,47 @@ type PaneInfo struct {
 
 // Situation is a classified, attention-requiring state of one agent pane.
 type Situation struct {
-	Type           SituationType
-	AgentID        string
-	AgentType      string
-	PaneID         string
-	TabID          string
-	WorkspaceID    string
-	Status         string   // herdr-reported agent_status (e.g. idle|working|blocked|done|detected); empty when unknown
-	Content        string   // pane snapshot used for classification
-	Options        []string // normalized option set (choice situations)
-	PermissionVerb string   // salient permission verb/action (approval situations)
-	ErrorSummary   string   // salient error text (error situations)
-	TabCount       int      // multi-tab MCQ form: number of tabs incl. Submit (0/1 = single question)
-	TabMultiSelect []bool   // per-tab: true where a question is multi-select (toggle several, then advance); len==TabCount, Submit tab false. Set during the sweep; nil on the non-swept path.
+	Type              SituationType
+	AgentID           string
+	AgentType         string
+	PaneID            string
+	TabID             string
+	WorkspaceID       string
+	Status            string   // herdr-reported agent_status (e.g. idle|working|blocked|done|detected); empty when unknown
+	Content           string   // pane snapshot used for classification
+	Options           []string // normalized option set (choice situations)
+	PermissionVerb    string   // salient permission verb/action (approval situations)
+	ErrorSummary      string   // salient error text (error situations)
+	MCQKind           MCQKind  // agent-specific multi-question protocol; empty for ordinary/single choices
+	AnswerCount       int      // number of answer groups required (0/1 = single question)
+	AnswerMultiSelect []bool   // per-answer multi-select flags; len==AnswerCount after a sweep
+	// TabCount and TabMultiSelect are retained as compatibility aliases for
+	// callers/tests created before MCQKind/AnswerCount. New runtime code sets
+	// both pairs while EffectiveAnswerCount/EffectiveAnswerMultiSelect provide
+	// the one migration boundary.
+	TabCount       int
+	TabMultiSelect []bool
 	// RetryAuditID carries an operator-requested LLM retry through delayed
 	// capture and async consult handling. Zero means the normal auto-act policy.
 	RetryAuditID int64
+}
+
+// EffectiveAnswerCount returns the generalized MCQ answer count, falling
+// back to the legacy Claude-tab field for staged/in-memory compatibility.
+func (s Situation) EffectiveAnswerCount() int {
+	if s.AnswerCount > 0 {
+		return s.AnswerCount
+	}
+	return s.TabCount
+}
+
+// EffectiveAnswerMultiSelect returns generalized per-answer select kinds,
+// falling back to the legacy Claude-tab field.
+func (s Situation) EffectiveAnswerMultiSelect() []bool {
+	if s.AnswerMultiSelect != nil {
+		return s.AnswerMultiSelect
+	}
+	return s.TabMultiSelect
 }
 
 // ActionKind is what the plugin decided to do.

@@ -179,14 +179,27 @@ type toolCallParams struct {
 // side silently degrades single-menu answers to bare digits (the daemon's
 // gates still re-check them).
 type consultContextFields struct {
-	Options  []string `json:"options"`
-	TabCount int      `json:"tab_count"`
+	Options       []string `json:"options"`
+	MCQKind       string   `json:"mcq_kind"`
+	AnswerCount   int      `json:"answer_count"`
+	QuestionCount int      `json:"question_count"`
+	TabCount      int      `json:"tab_count"`
 	// TabSelectKinds is per-tab "single"/"multi" (present only when a form has
 	// a multi-select tab). Only a "multi" tab may receive several option
 	// numbers (an array); a scalar/single-select tab or the Submit tab takes
 	// exactly one, so a multi-value entry there is rejected — otherwise the
 	// extra digits would deliver with no advance and shift onto later tabs.
 	TabSelectKinds []string `json:"tab_select_kinds"`
+}
+
+func (c consultContextFields) effectiveAnswerCount() int {
+	if c.AnswerCount > 0 {
+		return c.AnswerCount
+	}
+	if c.QuestionCount > 0 {
+		return c.QuestionCount
+	}
+	return c.TabCount
 }
 
 // tabIsMulti reports whether tab i is a multi-select tab per the context's
@@ -208,11 +221,16 @@ func resolveSelectOptions(contextJSON string, selects []selectOption) (action, o
 	// The blob is daemon-authored JSON; if it doesn't parse, degrade to no
 	// options/tabs rather than refusing the submission.
 	_ = json.Unmarshal([]byte(contextJSON), &cc)
-	if cc.TabCount > 1 && len(selects) != cc.TabCount {
+	answerCount := cc.effectiveAnswerCount()
+	if answerCount > 1 && len(selects) != answerCount {
+		if cc.MCQKind == "codex_questions" || cc.QuestionCount > 0 {
+			return "", "", fmt.Errorf("this Codex form has %d questions: select_options needs exactly %d entries in question order, got %d",
+				answerCount, answerCount, len(selects))
+		}
 		return "", "", fmt.Errorf("this multi-tab form has %d tabs (Submit included): select_options needs exactly %d entries in tab order, got %d",
-			cc.TabCount, cc.TabCount, len(selects))
+			answerCount, answerCount, len(selects))
 	}
-	if cc.TabCount <= 1 && len(selects) != 1 {
+	if answerCount <= 1 && len(selects) != 1 {
 		return "", "", fmt.Errorf("this situation takes a single choice: select_options needs exactly one option number, got %d", len(selects))
 	}
 	for i, g := range selects {
@@ -228,7 +246,7 @@ func resolveSelectOptions(contextJSON string, selects []selectOption) (action, o
 			}
 		}
 	}
-	if cc.TabCount > 1 {
+	if answerCount > 1 {
 		tokens := make([]string, len(selects))
 		for i, g := range selects {
 			digits := make([]string, len(g))
@@ -303,7 +321,7 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error)
 		if action != domain.ActionNoop {
 			var cc consultContextFields
 			_ = json.Unmarshal([]byte(req.ContextJSON), &cc)
-			hasMenu := len(cc.Options) > 0 || cc.TabCount > 1
+			hasMenu := len(cc.Options) > 0 || cc.effectiveAnswerCount() > 1
 			switch req.SituationType {
 			case domain.SituationApproval, domain.SituationChoice:
 				if hasMenu && len(selects) == 0 {

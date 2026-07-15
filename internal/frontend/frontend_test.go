@@ -1810,12 +1810,35 @@ func TestResolveNormalizesNoopSpelling(t *testing.T) {
 // fakeKeyHerdr adds keystroke support (ports.KeystrokeSender) to fakeHerdr.
 type fakeKeyHerdr struct {
 	fakeHerdr
-	keys []string
+	keys            []string
+	keyScript       []string
+	keyScriptFrames []string
 }
 
 func (f *fakeKeyHerdr) SendKey(_ context.Context, paneID, key string) error {
 	f.keys = append(f.keys, key)
+	if len(f.keyScript) > 0 && len(f.keyScriptFrames) > 0 && key == f.keyScript[0] {
+		f.keyScript = f.keyScript[1:]
+		f.pane = f.keyScriptFrames[0]
+		f.keyScriptFrames = f.keyScriptFrames[1:]
+	}
 	return nil
+}
+
+func frontendCodexFrame(current, total, unanswered int, selected string, submitAll bool) string {
+	verb := "answer"
+	if submitAll {
+		verb = "all"
+	}
+	marker1, marker2 := " ", " "
+	if selected == "1" {
+		marker1 = "›"
+	}
+	if selected == "2" {
+		marker2 = "›"
+	}
+	return fmt.Sprintf("Question %d/%d (%d unanswered)\nQuestion %d?\n%s 1. First\n%s 2. Second\n\ntab to add notes | enter to submit %s | ←/→ to navigate questions | esc to interrupt\n",
+		current, total, unanswered, current, marker1, marker2, verb)
 }
 
 func TestResolveDigitSeriesDeliversKeystrokes(t *testing.T) {
@@ -1877,6 +1900,35 @@ func TestResolveDigitSeriesStaleFormFails(t *testing.T) {
 	corr, _ := st.UnprocessedCorrections(ctx)
 	if len(corr) != 1 {
 		t.Errorf("the correction itself must still be recorded: %+v", corr)
+	}
+}
+
+func TestResolveCodexQuestionSeriesDeliversAdaptiveKeystrokes(t *testing.T) {
+	app, st := testApp(t)
+	initial := frontendCodexFrame(1, 2, 2, "1", false)
+	selected := frontendCodexFrame(1, 2, 2, "2", false)
+	second := frontendCodexFrame(2, 2, 1, "1", false)
+	ready := frontendCodexFrame(2, 2, 0, "1", true)
+	fake := &fakeKeyHerdr{
+		fakeHerdr:       fakeHerdr{pane: initial},
+		keyScript:       []string{"2", "enter", "1", "enter"},
+		keyScriptFrames: []string{selected, second, ready, "submitted"},
+	}
+	app.Herdr = fake
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:codex", AgentType: "codex", SituationType: domain.SituationChoice,
+		Trigger: "t", Action: "escalated", Status: "escalated",
+		Suggestion: "answer series: 2 1", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 0 {
+		t.Fatalf("Codex answer series must use keys, sent text %v", fake.inputs)
+	}
+	if got := strings.Join(fake.keys, " "); !strings.HasSuffix(got, "2 enter 1 enter") {
+		t.Fatalf("Codex adaptive delivery keys = %q", got)
 	}
 }
 

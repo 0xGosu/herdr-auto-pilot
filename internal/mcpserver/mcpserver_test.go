@@ -162,6 +162,31 @@ func TestMCPSelectOptionsValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Codex uses one answer per question and no synthetic Submit entry. The
+	// generalized answer_count contract supersedes tab_count while resolving
+	// to the same delivery series representation.
+	stage("req-codex", `{"options":[],"mcq_kind":"codex_questions","answer_count":3,"question_count":3}`)
+	c = startServer(t, st, "req-codex")
+	resp = c.call(t, "tools/call", map[string]any{
+		"name": "submit_decision", "arguments": map[string]any{"select_options": []int{1, 2}},
+	})
+	if text, _ := json.Marshal(resp); !strings.Contains(string(text), "3 questions") {
+		t.Fatalf("Codex length error must describe questions, not tabs: %s", text)
+	}
+	resp = c.call(t, "tools/call", map[string]any{
+		"name": "submit_decision", "arguments": map[string]any{"select_options": []int{1, 2, 3}},
+	})
+	if text, _ := json.Marshal(resp); !strings.Contains(string(text), "staged") {
+		t.Fatalf("valid Codex question series should stage: %s", text)
+	}
+	pending, _ = st.PendingLLMDecisions(ctx)
+	if len(pending) != 1 || pending[0].Action != "1 2 3" {
+		t.Fatalf("Codex selects should join to a digit series, got %+v", pending)
+	}
+	if err := st.UpdateLLMDecisionStatus(ctx, pending[0].ID, "expired"); err != nil {
+		t.Fatal(err)
+	}
+
 	// A MULTI-SELECT tab (per tab_select_kinds) is answered with an array of
 	// option numbers; the mixed int-or-array shape joins to the comma-grouped
 	// per-tab series delivery.

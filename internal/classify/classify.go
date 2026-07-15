@@ -135,13 +135,11 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 			continue
 		}
 		matched := matchRule(r, pane)
-		// Claude's MCQ selection prompts render structurally (a tab header or
-		// an "Enter to select" navigation footer), not as a plain numbered
-		// menu. Detect them at the choice rule's position so approval still
-		// wins and error is still evaluated after choice (rule order encodes
-		// priority, classify.go docs).
-		if !matched && r.situation == domain.SituationChoice && strings.EqualFold(agentType, "claude") {
-			matched = domain.ClaudeMCQForm(pane)
+		// Agent MCQ selection prompts render structurally, not as a plain
+		// numbered menu. Detect them at the choice rule's position so approval
+		// still wins and error is still evaluated after choice.
+		if !matched && r.situation == domain.SituationChoice {
+			_, matched = domain.ParseMCQForm(agentType, pane)
 		}
 		// Claude's error/retry situations (usage-limit stop, interrupt prompt)
 		// are detected structurally at the error position, after choice, so
@@ -200,7 +198,13 @@ func enrich(s *domain.Situation) {
 		// tells the daemon to sweep the remaining tabs and the answer paths
 		// to expect a digit series (one digit per tab, Submit included).
 		if tabs, ok := domain.MultiTabForm(s.Content); ok {
+			s.MCQKind = domain.MCQClaudeTabs
+			s.AnswerCount = tabs
 			s.TabCount = tabs
+		} else if form, ok := domain.CodexMCQForm(s.Content); ok {
+			s.MCQKind = form.Kind
+			s.AnswerCount = form.AnswerCount
+			s.TabCount = form.AnswerCount
 		}
 	case domain.SituationApproval:
 		if m := permissionVerbRE.FindStringSubmatch(s.Content); m != nil {

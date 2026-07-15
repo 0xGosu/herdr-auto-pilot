@@ -23,7 +23,8 @@ func TestGoldenTranscripts(t *testing.T) {
 		"codex_idle.txt":    "idle",
 	}
 	agentTypeFor := map[string]string{
-		"codex_idle.txt": "codex",
+		"codex_idle.txt":       "codex",
+		"choice_codex_mcq.txt": "codex",
 	}
 
 	entries, err := os.ReadDir("testdata/transcripts")
@@ -155,6 +156,30 @@ func TestClaudeMCQFormsClassifyAsChoice(t *testing.T) {
 				t.Errorf("%s: options missing %q: %v", name, want, s.Options)
 			}
 		}
+	}
+}
+
+func TestCodexMCQFormClassifiesAsChoice(t *testing.T) {
+	c := New(nil)
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "choice_codex_mcq.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.Classify("codex", "blocked", string(data))
+	if s.Type != domain.SituationChoice {
+		t.Fatalf("type = %v, want choice", s.Type)
+	}
+	if s.MCQKind != domain.MCQCodexQuestions || s.EffectiveAnswerCount() != 3 {
+		t.Fatalf("form = %q answers=%d, want codex_questions/3", s.MCQKind, s.EffectiveAnswerCount())
+	}
+	if got := strings.Join(s.Options, "|"); !strings.Contains(got, "Add shared columns") || len(s.Options) != 3 {
+		t.Fatalf("options = %v, want three Codex labels", s.Options)
+	}
+	if idle := c.Classify("codex", "idle", string(data)); idle.Type == domain.SituationChoice {
+		t.Fatal("non-blocked Codex form must not classify as a live choice")
+	}
+	if other := c.Classify("claude", "blocked", string(data)); other.Type == domain.SituationChoice {
+		t.Fatal("Codex structural form must remain scoped to agent_type codex")
 	}
 }
 

@@ -62,6 +62,24 @@ func ClaudeMCQForm(pane string) bool {
 	return mcqSingleFooterRE.MatchString(pane)
 }
 
+// ParseMCQForm recognizes the agent's structural MCQ form and returns the
+// navigation protocol state. It deliberately remains agent-scoped: identical
+// text from another agent is narration, not a license to send keystrokes.
+func ParseMCQForm(agentType, pane string) (MCQFormState, bool) {
+	switch {
+	case strings.EqualFold(agentType, "codex"):
+		return CodexMCQForm(pane)
+	case strings.EqualFold(agentType, "claude"):
+		if tabs, ok := MultiTabForm(pane); ok {
+			return MCQFormState{Kind: MCQClaudeTabs, AnswerCount: tabs}, true
+		}
+		if ClaudeMCQForm(pane) {
+			return MCQFormState{AnswerCount: 1}, true
+		}
+	}
+	return MCQFormState{}, false
+}
+
 // MultiTabForm reports whether pane content shows the multi-tab MCQ variant
 // and how many tabs it has (checkbox entries plus the Submit entry). The tab
 // header is always required; alongside it the pane must carry EITHER the
@@ -147,6 +165,14 @@ func ExtractMCQForm(frame string) string {
 	return strings.TrimRight(region, "\n \t")
 }
 
+// ExtractAgentMCQForm dispatches scrollback trimming to the form variant.
+func ExtractAgentMCQForm(kind MCQKind, frame string) string {
+	if kind == MCQCodexQuestions {
+		return ExtractCodexMCQForm(frame)
+	}
+	return ExtractMCQForm(frame)
+}
+
 // FirstMCQQuestion returns the frame-1 form region embedded in an
 // AggregateMCQFrames result. Delivery-time staleness checks compare it to
 // the live pane: two forms with the SAME tab count but different questions
@@ -167,12 +193,17 @@ func FirstMCQQuestion(aggregate string) string {
 // in order. This aggregate (not any single frame) feeds the signature, the
 // escalation body, and the LLM consult context.
 func AggregateMCQFrames(frames []string) string {
+	return AggregateAgentMCQFrames(MCQClaudeTabs, frames)
+}
+
+// AggregateAgentMCQFrames merges every answer frame in form order.
+func AggregateAgentMCQFrames(kind MCQKind, frames []string) string {
 	var b strings.Builder
 	for i, f := range frames {
 		if i > 0 {
 			b.WriteString("\n\n")
 		}
-		fmt.Fprintf(&b, "[question %d/%d]\n%s", i+1, len(frames), ExtractMCQForm(f))
+		fmt.Fprintf(&b, "[question %d/%d]\n%s", i+1, len(frames), ExtractAgentMCQForm(kind, f))
 	}
 	return b.String()
 }

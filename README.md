@@ -208,13 +208,17 @@ The plugin never acts on a situation it hasn't learned from you.
    situation (idle / approval / choice / error), fingerprints it into a
    *situation signature* (volatile stuff like paths, hashes, and timestamps
    is masked), and — in shadow mode — **escalates with a suggestion**.
-   Claude's AskUserQuestion MCQ forms classify as `choice`; a **multi-tab**
-   form (plan-mode question series, `← ☐ … ✔ Submit →` header) is first
+   Claude's AskUserQuestion and Codex `request_user_input` MCQ forms classify
+   as `choice`. A Claude **multi-tab** form (plan-mode question series,
+   `← ☐ … ✔ Submit →` header) is first
    swept tab-by-tab with arrow keystrokes so the escalation, the signature,
    and the LLM consult see **all** questions, not just the focused one. Its
    answer is a digit series, one digit per tab including Submit (e.g.
    `1 2 3 2 1`), delivered as keystrokes; a series that doesn't match the
-   tab count is never partially delivered.
+   tab count is never partially delivered. Codex question series are likewise
+   swept and aggregated, but their answer series contains one digit per
+   question (no Submit pseudo-option); delivery verifies every live question
+   transition and explicitly submits the completed form.
 2. **Confirm or correct.** In the TUI's *Escalations* tab press `enter` to
    confirm the suggestion (and send it), or `c` to type the correct
    response — `v` shows the full record (trigger, rationale, LLM output,

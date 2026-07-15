@@ -50,6 +50,11 @@ type fakeHerdr struct {
 	// failKeyName fails only SendKey calls for that specific key (e.g.
 	// "left" to break the sweep's reset burst but not its Right sweep).
 	failKeyName string
+	// keyScript updates pane content after selected keystrokes. It models
+	// interactive forms whose visible state changes after a digit/Enter rather
+	// than only after Left/Right navigation.
+	keyScript       []string
+	keyScriptFrames []string
 	// agents is the current agent set ListAgents reports; listAgentsCalls
 	// counts calls so a test can assert the retry guard short-circuits before
 	// resolving the pane.
@@ -93,6 +98,13 @@ func (f *fakeHerdr) SendKey(ctx context.Context, paneID, key string) error {
 		return errors.New("induced keystroke failure")
 	}
 	f.keys = append(f.keys, key)
+	if len(f.keyScript) > 0 && len(f.keyScriptFrames) > 0 && key == f.keyScript[0] {
+		f.keyScript = f.keyScript[1:]
+		f.pane = f.keyScriptFrames[0]
+		f.keyScriptFrames = f.keyScriptFrames[1:]
+		f.frames = nil
+		f.frameIdx = 0
+	}
 	switch key {
 	case "right":
 		if f.frameIdx < len(f.frames)-1 {
@@ -117,6 +129,16 @@ func (f *fakeHerdr) setFrames(frames []string) {
 	defer f.mu.Unlock()
 	f.frames = frames
 	f.frameIdx = 0
+}
+
+func (f *fakeHerdr) setKeyScript(initial string, keys, frames []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pane = initial
+	f.frames = nil
+	f.frameIdx = 0
+	f.keyScript = append([]string(nil), keys...)
+	f.keyScriptFrames = append([]string(nil), frames...)
 }
 
 func (f *fakeHerdr) PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, error) {

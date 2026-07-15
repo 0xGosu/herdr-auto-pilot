@@ -48,13 +48,14 @@ func (d *Daemon) sweepAllowed(ctx context.Context, s domain.Situation) bool {
 	}
 	_, allow, _ := d.snapshot()
 	// This gate runs BEFORE sweepFrames builds the aggregate, so s.Content is
-	// still the raw first visible frame (scrollback included) while TabCount is
+	// still the raw first visible frame (scrollback included) while AnswerCount is
 	// already >1. IrreversibleScanContent's multi-tab branch assumes a
 	// scrollback-free post-sweep aggregate and would rescan that raw scrollback,
 	// letting a stale destructive command above a benign form skip the sweep and
 	// block the answer. Scope to the single visible frame's actionable tail; the
 	// full aggregate is still screened post-sweep in decideAndAct.
 	frame := s
+	frame.AnswerCount = 1
 	frame.TabCount = 1
 	if _, matched := allow.Match(domain.IrreversibleScanContent(frame, "")); matched {
 		return false
@@ -122,14 +123,15 @@ func (d *Daemon) startSweep(ctx context.Context, ks ports.KeystrokeSender,
 func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 	s domain.Situation) (domain.Situation, error) {
 
-	frames := make([]string, 0, s.TabCount)
-	multiSelect := make([]bool, 0, s.TabCount)
+	answerCount := s.EffectiveAnswerCount()
+	frames := make([]string, 0, answerCount)
+	multiSelect := make([]bool, 0, answerCount)
 	moved := false
 	var sweepErr error
-	for tab := 0; tab < s.TabCount; tab++ {
+	for tab := 0; tab < answerCount; tab++ {
 		if tab > 0 {
 			if err := ks.SendKey(ctx, s.PaneID, "right"); err != nil {
-				sweepErr = fmt.Errorf("tab %d/%d right-arrow: %w", tab+1, s.TabCount, err)
+				sweepErr = fmt.Errorf("answer %d/%d right-arrow: %w", tab+1, answerCount, err)
 				break
 			}
 			moved = true
@@ -137,14 +139,19 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 		}
 		frame, err := d.readVisible(ctx, s.PaneID, d.opt.PaneReadLines)
 		if err != nil {
-			sweepErr = fmt.Errorf("tab %d/%d visible read: %w", tab+1, s.TabCount, err)
+			sweepErr = fmt.Errorf("answer %d/%d visible read: %w", tab+1, answerCount, err)
 			break
 		}
 		// The pane must still show the SAME form (a different tab count
 		// means another form replaced it mid-sweep — an aggregate of two
 		// forms is unusable).
-		if tabs, ok := domain.MultiTabForm(frame); !ok || tabs != s.TabCount {
-			sweepErr = fmt.Errorf("tab %d/%d no longer shows the %d-tab form", tab+1, s.TabCount, s.TabCount)
+		state, ok := domain.ParseMCQForm(s.AgentType, frame)
+		if !ok || state.Kind != s.MCQKind || state.AnswerCount != answerCount {
+			sweepErr = fmt.Errorf("answer %d/%d no longer shows the same %d-answer form", tab+1, answerCount, answerCount)
+			break
+		}
+		if s.MCQKind == domain.MCQCodexQuestions && (state.Current != tab+1 || state.Unanswered != answerCount) {
+			sweepErr = fmt.Errorf("codex question %d/%d has unexpected state current=%d unanswered=%d", tab+1, answerCount, state.Current, state.Unanswered)
 			break
 		}
 		// A multi-select tab is answered by toggling checkboxes, which is a
@@ -152,10 +159,10 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 		// starts all-unchecked (the observed default); any pre-selected option
 		// means an operator (or a default) already touched it, so escalate the
 		// whole form rather than blind-toggle into the wrong set.
-		multi := domain.MultiSelectTab(frame)
+		multi := s.MCQKind == domain.MCQClaudeTabs && domain.MultiSelectTab(frame)
 		if multi {
 			if n := countChecked(frame); n > 0 {
-				sweepErr = fmt.Errorf("tab %d/%d already has %d option(s) selected; cannot auto-toggle safely", tab+1, s.TabCount, n)
+				sweepErr = fmt.Errorf("answer %d/%d already has %d option(s) selected; cannot auto-toggle safely", tab+1, answerCount, n)
 				break
 			}
 		}
@@ -176,8 +183,9 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 	}
 
 	swept := s
-	swept.Content = domain.AggregateMCQFrames(frames)
+	swept.Content = domain.AggregateAgentMCQFrames(s.MCQKind, frames)
 	swept.Options = domain.OptionLabels(swept.Content)
+	swept.AnswerMultiSelect = multiSelect
 	swept.TabMultiSelect = multiSelect
 	return swept, nil
 }
@@ -203,7 +211,7 @@ func anyMultiSelect(flags []bool) bool {
 // tab count and an unchecked baseline. A no-op for forms with no multi-select
 // tab.
 func (d *Daemon) reverifyMultiSelect(ctx context.Context, ks ports.KeystrokeSender, s domain.Situation) error {
-	if !anyMultiSelect(s.TabMultiSelect) {
+	if !anyMultiSelect(s.EffectiveAnswerMultiSelect()) {
 		return nil
 	}
 	reswept, err := d.sweepFrames(ctx, ks, s)
@@ -213,7 +221,7 @@ func (d *Daemon) reverifyMultiSelect(ctx context.Context, ks ports.KeystrokeSend
 	if reswept.Content != s.Content {
 		return fmt.Errorf("form content changed since capture")
 	}
-	if !slices.Equal(reswept.TabMultiSelect, s.TabMultiSelect) {
+	if !slices.Equal(reswept.EffectiveAnswerMultiSelect(), s.EffectiveAnswerMultiSelect()) {
 		return fmt.Errorf("per-tab select kinds changed since capture")
 	}
 	return nil
@@ -260,10 +268,11 @@ func (d *Daemon) seriesStale(ctx context.Context, s domain.Situation) string {
 	if err != nil {
 		return "pane re-read failed before series delivery: " + err.Error()
 	}
-	if tabs, ok := domain.MultiTabForm(pane); !ok || tabs != s.TabCount {
+	state, ok := domain.ParseMCQForm(s.AgentType, pane)
+	if !ok || state.Kind != s.MCQKind || state.AnswerCount != s.EffectiveAnswerCount() {
 		return "pane no longer shows the multi-tab form; answer series is stale"
 	}
-	if domain.ExtractMCQForm(pane) != domain.FirstMCQQuestion(s.Content) {
+	if domain.ExtractAgentMCQForm(s.MCQKind, pane) != domain.FirstMCQQuestion(s.Content) {
 		return "a different form is showing (same tab count, different first question); answer series is stale"
 	}
 	return ""
@@ -291,9 +300,10 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 		return
 	}
 	groups, ok := domain.ParseTabSelections(dec.Input)
-	if !ok || len(groups) != s.TabCount {
+	answerCount := s.EffectiveAnswerCount()
+	if !ok || len(groups) != answerCount {
 		escalateWith(domain.ReasonUnfamiliarOptions,
-			fmt.Sprintf("answer series %q does not fit the %d-tab form", dec.Input, s.TabCount))
+			fmt.Sprintf("answer series %q does not fit the %d-answer form", dec.Input, answerCount))
 		return
 	}
 	if why := d.seriesStale(ctx, s); why != "" {
@@ -329,7 +339,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 					fmt.Sprintf("Agent %s: the multi-select form changed before the answer could be delivered (%v); please review it.", s.AgentID, err))
 				return nil
 			}
-			if err := d.sendTabSelections(ctx, ks, s.PaneID, groups, s.TabMultiSelect); err != nil {
+			if err := d.sendTabSelections(ctx, ks, s, groups); err != nil {
 				slog.Error("answer series delivery failed", "pane", s.PaneID, "error", err)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 				d.notify(ctx, "Herd Auto Prompter: action delivery failed",
@@ -353,7 +363,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 				}
 			}
 			slog.Info("multi-tab answer series delivered",
-				"agent", s.AgentID, "tabs", s.TabCount, "confidence", dec.Confidence, "audit_id", auditID)
+				"agent", s.AgentID, "answers", answerCount, "confidence", dec.Confidence, "audit_id", auditID)
 			d.scheduleUnblockCheck(verifyunblock.Params{
 				PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
 				Signature: sig.Signature, Input: dec.Input, Excerpt: s.Content, SituationType: s.Type,
@@ -380,7 +390,7 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 					fmt.Sprintf("Agent %s: the multi-select form changed before the answer could be delivered (%v); please review it.", s.AgentID, err))
 				return nil
 			}
-			if err := d.sendTabSelections(ctx, ks, s.PaneID, groups, s.TabMultiSelect); err != nil {
+			if err := d.sendTabSelections(ctx, ks, s, groups); err != nil {
 				slog.Error("LLM answer series delivery failed", "pane", s.PaneID, "error", err)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 				d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
@@ -405,7 +415,7 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 			d.mu.Lock()
 			d.lastAutoSend[s.AgentID] = now
 			d.mu.Unlock()
-			slog.Info("LLM answer series promoted and delivered", "agent", s.AgentID, "tabs", s.TabCount)
+			slog.Info("LLM answer series promoted and delivered", "agent", s.AgentID, "answers", s.EffectiveAnswerCount())
 			d.scheduleUnblockCheck(verifyunblock.Params{
 				PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
 				Signature: sigKey, Input: llmDec.Action, Excerpt: s.Content, SituationType: s.Type,
@@ -421,7 +431,15 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 // each tab, plus an explicit advance after a MULTI-SELECT tab (which does not
 // auto-advance on a digit press). Keystrokes are paced by sweepKeyDelay so the
 // form advances and re-renders between presses.
-func (d *Daemon) sendTabSelections(ctx context.Context, ks ports.KeystrokeSender, paneID string,
+func (d *Daemon) sendTabSelections(ctx context.Context, ks ports.KeystrokeSender, s domain.Situation,
+	groups [][]string) error {
+	if s.MCQKind == domain.MCQCodexQuestions {
+		return d.sendCodexSelections(ctx, ks, s, groups)
+	}
+	return d.sendClaudeTabSelections(ctx, ks, s.PaneID, groups, s.EffectiveAnswerMultiSelect())
+}
+
+func (d *Daemon) sendClaudeTabSelections(ctx context.Context, ks ports.KeystrokeSender, paneID string,
 	groups [][]string, tabMultiSelect []bool) error {
 
 	for i := 0; i < sweepResetKeys; i++ {
@@ -437,6 +455,109 @@ func (d *Daemon) sendTabSelections(ctx context.Context, ks ports.KeystrokeSender
 		}
 		if err := ks.SendKey(ctx, paneID, key); err != nil {
 			return fmt.Errorf("keystroke %d/%d (%q): %w", i+1, len(keys), key, err)
+		}
+	}
+	return nil
+}
+
+// sendCodexSelections answers a request_user_input form without assuming how
+// a Codex build handles digit shortcuts. A digit may commit and advance, or it
+// may only move the `›` caret; the latter is verified before Enter commits the
+// answer. Every state transition is re-read before the next key is sent.
+func (d *Daemon) sendCodexSelections(ctx context.Context, ks ports.KeystrokeSender,
+	s domain.Situation, groups [][]string) error {
+	if len(groups) != s.EffectiveAnswerCount() {
+		return fmt.Errorf("codex form needs %d answers, got %d", s.EffectiveAnswerCount(), len(groups))
+	}
+	for i, group := range groups {
+		if len(group) != 1 {
+			return fmt.Errorf("codex question %d is single-select, got %d selections", i+1, len(group))
+		}
+	}
+	for i := 0; i < sweepResetKeys; i++ {
+		if err := ks.SendKey(ctx, s.PaneID, "left"); err != nil {
+			return fmt.Errorf("reset left-arrow %d/%d: %w", i+1, sweepResetKeys, err)
+		}
+	}
+	time.Sleep(sweepKeyDelay)
+
+	answerCount := s.EffectiveAnswerCount()
+	for i, group := range groups {
+		beforePane, err := d.readVisible(ctx, s.PaneID, d.opt.PaneReadLines)
+		if err != nil {
+			return fmt.Errorf("codex question %d/%d pre-answer read: %w", i+1, answerCount, err)
+		}
+		before, ok := domain.CodexMCQForm(beforePane)
+		if !ok || before.AnswerCount != answerCount || before.Current != i+1 || before.Unanswered != answerCount-i {
+			return fmt.Errorf("codex question %d/%d is stale (current=%d unanswered=%d)", i+1, answerCount, before.Current, before.Unanswered)
+		}
+
+		digit := group[0]
+		if err := ks.SendKey(ctx, s.PaneID, digit); err != nil {
+			return fmt.Errorf("codex question %d/%d option %s: %w", i+1, answerCount, digit, err)
+		}
+		time.Sleep(sweepKeyDelay)
+		afterPane, err := d.readVisible(ctx, s.PaneID, d.opt.PaneReadLines)
+		if err != nil {
+			return fmt.Errorf("codex question %d/%d post-option read: %w", i+1, answerCount, err)
+		}
+		after, formStanding := domain.CodexMCQForm(afterPane)
+		if !formStanding {
+			if i == answerCount-1 {
+				return nil // final digit committed and submitted atomically
+			}
+			return fmt.Errorf("codex form disappeared after question %d/%d", i+1, answerCount)
+		}
+
+		// An unchanged unanswered count means the digit only moved selection.
+		if after.Unanswered == before.Unanswered {
+			if after.Current != before.Current || after.SelectedOption != digit {
+				return fmt.Errorf("codex option %s was not selected on question %d/%d", digit, i+1, answerCount)
+			}
+			if err := ks.SendKey(ctx, s.PaneID, "enter"); err != nil {
+				return fmt.Errorf("codex question %d/%d commit: %w", i+1, answerCount, err)
+			}
+			time.Sleep(sweepKeyDelay)
+			afterPane, err = d.readVisible(ctx, s.PaneID, d.opt.PaneReadLines)
+			if err != nil {
+				return fmt.Errorf("codex question %d/%d post-commit read: %w", i+1, answerCount, err)
+			}
+			after, formStanding = domain.CodexMCQForm(afterPane)
+			if !formStanding {
+				if i == answerCount-1 {
+					return nil
+				}
+				return fmt.Errorf("codex form disappeared after committing question %d/%d", i+1, answerCount)
+			}
+		}
+		if after.Unanswered != before.Unanswered-1 {
+			return fmt.Errorf("codex question %d/%d did not commit (unanswered %d -> %d)", i+1, answerCount, before.Unanswered, after.Unanswered)
+		}
+
+		if i == answerCount-1 {
+			if !after.SubmitAll {
+				return fmt.Errorf("codex answered all questions but submit-all state is not showing")
+			}
+			if err := ks.SendKey(ctx, s.PaneID, "enter"); err != nil {
+				return fmt.Errorf("codex final submit: %w", err)
+			}
+			return nil
+		}
+		if after.Current == i+1 {
+			if err := ks.SendKey(ctx, s.PaneID, "right"); err != nil {
+				return fmt.Errorf("codex navigate to question %d: %w", i+2, err)
+			}
+			time.Sleep(sweepKeyDelay)
+			pane, err := d.readVisible(ctx, s.PaneID, d.opt.PaneReadLines)
+			if err != nil {
+				return fmt.Errorf("codex question %d navigation read: %w", i+2, err)
+			}
+			next, ok := domain.CodexMCQForm(pane)
+			if !ok || next.Current != i+2 || next.Unanswered != after.Unanswered {
+				return fmt.Errorf("codex did not navigate to question %d", i+2)
+			}
+		} else if after.Current != i+2 {
+			return fmt.Errorf("codex advanced from question %d to unexpected question %d", i+1, after.Current)
 		}
 	}
 	return nil

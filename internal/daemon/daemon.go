@@ -806,7 +806,7 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 	// re-enters decideAndAct. It is gated like any automation — kill
 	// switch, rate pause, never-auto patterns — BEFORE the first keystroke, and
 	// degrades to single-frame when the adapter cannot send keystrokes.
-	if situation.Type == domain.SituationChoice && situation.TabCount > 1 {
+	if situation.Type == domain.SituationChoice && situation.EffectiveAnswerCount() > 1 {
 		if ks, ok := d.opt.Herdr.(ports.KeystrokeSender); ok && d.sweepAllowed(ctx, situation) {
 			d.startSweep(ctx, ks, situation, tr, agentName)
 			return
@@ -1049,7 +1049,7 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 
 	// Multi-tab MCQ forms are answered with a digit series, one keystroke
 	// per tab — never a single mapped label, never rewritten.
-	if s.Type == domain.SituationChoice && s.TabCount > 1 {
+	if s.Type == domain.SituationChoice && s.EffectiveAnswerCount() > 1 {
 		d.deliverSeries(ctx, s, sig, dec, tr, now)
 		return
 	}
@@ -1677,7 +1677,7 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		workspaceID = info.WorkspaceID
 	}
 
-	// "options" and "tab_count" are a wire contract with the mcp server's
+	// "options" and answer-count fields are a wire contract with the MCP server's
 	// select_options resolver (mcpserver.consultContextFields) — keep the
 	// key names in sync.
 	fields := map[string]any{
@@ -1697,12 +1697,22 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		"foreground_cwd":   info.ForegroundCwd,
 		"no_reply_option":  "if the agent needs no reply (it finished or is only reporting status), submit_decision with recommend_action \"@noop\" to explicitly do nothing",
 	}
-	if s.TabCount > 1 {
-		fields["tab_count"] = s.TabCount
-		answer := fmt.Sprintf(
-			"this is a multi-tab question form with %d tabs (the final tab is Submit); the pane excerpt lists every question in order. submit_decision select_options is a list of exactly %d entries, one per tab in order including Submit, e.g. [1, 2, 3, 2, 1]",
-			s.TabCount, s.TabCount)
-		if kinds, anyMulti := tabSelectKinds(s.TabMultiSelect); anyMulti {
+	answerCount := s.EffectiveAnswerCount()
+	if answerCount > 1 {
+		fields["mcq_kind"] = s.MCQKind
+		fields["answer_count"] = answerCount
+		var answer string
+		if s.MCQKind == domain.MCQCodexQuestions {
+			fields["question_count"] = answerCount
+			answer = fmt.Sprintf("this is a Codex multi-question form with %d questions. The pane excerpt lists every question in order. submit_decision select_options must contain exactly %d entries, one choice per question; there is no Submit pseudo-option", answerCount, answerCount)
+		} else {
+			// Retain the established field for prompt/client compatibility.
+			fields["tab_count"] = answerCount
+			answer = fmt.Sprintf(
+				"this is a multi-tab question form with %d tabs (the final tab is Submit); the pane excerpt lists every question in order. submit_decision select_options is a list of exactly %d entries, one per tab in order including Submit, e.g. [1, 2, 3, 2, 1]",
+				answerCount, answerCount)
+		}
+		if kinds, anyMulti := tabSelectKinds(s.EffectiveAnswerMultiSelect()); anyMulti {
 			fields["tab_select_kinds"] = kinds
 			answer += ". Some tabs are MULTI-SELECT (tab_select_kinds marks each tab \"single\" or \"multi\"; a multi-select question shows `[ ]` checkboxes on its options): for a multi-select tab pass an ARRAY of the option numbers to toggle instead of a single integer, e.g. [1, [1, 3], 2] chooses option 1 on tab 1, toggles options 1 and 3 on tab 2, and option 2 on tab 3"
 		}
@@ -1789,7 +1799,7 @@ func (d *Daemon) paneExcerpt(ctx context.Context, cfg config.Config, s domain.Si
 	// order); a fresh read would see only the currently focused tab. Take
 	// the HEAD when it exceeds the excerpt cap — the consult contract says
 	// the questions appear in order, so question 1 must never be cut.
-	if s.TabCount > 1 {
+	if s.EffectiveAnswerCount() > 1 {
 		return truncateRunes(s.Content, chars)
 	}
 	excerpt := s.Content
@@ -2200,16 +2210,20 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(reason, "at LLM promotion")
 		return
 	}
-	// Choice sanity. Multi-tab forms expect a digit series (one digit per
-	// tab, Submit included) — a mismatched length must never be partially
+	// Choice sanity. Multi-question forms expect one token per answer step —
+	// a mismatched length must never be partially
 	// delivered. Single menus require the chosen option to exist in the
 	// offered set. A noop is never an offered option; it deliberately
 	// bypasses both checks.
-	if s.Type == domain.SituationChoice && s.TabCount > 1 && !isNoop {
-		if seq, ok := domain.ParseDigitSeries(llmDec.Action); !ok || len(seq) != s.TabCount {
+	answerCount := s.EffectiveAnswerCount()
+	if s.Type == domain.SituationChoice && answerCount > 1 && !isNoop {
+		if seq, ok := domain.ParseDigitSeries(llmDec.Action); !ok || len(seq) != answerCount {
+			detail := fmt.Sprintf("multi-question form expects a series of %d answer tokens, got %q", answerCount, llmDec.Action)
+			if s.MCQKind != domain.MCQCodexQuestions {
+				detail = fmt.Sprintf("multi-tab form expects a series of %d digits (e.g. \"1 2 3 2 1\"), got %q", answerCount, llmDec.Action)
+			}
 			reject(domain.ReasonUnfamiliarOptions,
-				fmt.Sprintf("multi-tab form expects a series of %d digits (e.g. \"1 2 3 2 1\"), got %q",
-					s.TabCount, llmDec.Action))
+				detail)
 			return
 		}
 	} else if s.Type == domain.SituationChoice && !isNoop && len(s.Options) > 0 {
@@ -2324,14 +2338,15 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	current := cls.Classify(s.AgentType, s.Status, pane)
 	current.AgentID, current.PaneID, current.WorkspaceID = s.AgentID, s.PaneID, s.WorkspaceID
 	current.Status = s.Status
-	if s.TabCount > 1 {
+	if s.EffectiveAnswerCount() > 1 {
 		// Multi-tab situations carry the swept AGGREGATE as content, which
 		// never hashes equal to any single frame: staleness here means the
 		// form is gone, reshaped, or REPLACED — a different form with the
 		// same tab count (consults take minutes) must never receive this
 		// series, so the first question is compared verbatim too.
-		if tabs, ok := domain.MultiTabForm(pane); !ok || tabs != s.TabCount ||
-			domain.ExtractMCQForm(pane) != domain.FirstMCQQuestion(s.Content) {
+		form, ok := domain.ParseMCQForm(s.AgentType, pane)
+		if !ok || form.Kind != s.MCQKind || form.AnswerCount != s.EffectiveAnswerCount() ||
+			domain.ExtractAgentMCQForm(s.MCQKind, pane) != domain.FirstMCQQuestion(s.Content) {
 			reject(domain.ReasonLLMNoSubmit, "stale: form changed during consult")
 			return
 		}
@@ -2379,7 +2394,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// the validated digit series, one keystroke per tab — off the main loop
 	// (the keystrokes take seconds) and mutually exclusive with any sweep.
 	// `pane` is the visible re-read verified current just above.
-	if s.Type == domain.SituationChoice && s.TabCount > 1 {
+	if s.Type == domain.SituationChoice && s.EffectiveAnswerCount() > 1 {
 		ks, ok := d.opt.Herdr.(ports.KeystrokeSender)
 		if !ok {
 			d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")

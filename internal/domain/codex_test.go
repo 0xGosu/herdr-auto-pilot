@@ -1,6 +1,57 @@
 package domain
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+const codexMCQFrame = `Question 1/3 (3 unanswered)
+Which columns should be added?
+
+› 1. Add shared columns (Recommended)  Add CONF and TYPE.
+  2. Reorder only                      Keep the existing columns.
+  3. None of the above                 Add details in notes.
+
+tab to add notes | enter to submit answer | ←/→ to navigate questions | esc to interrupt
+`
+
+func TestCodexMCQForm(t *testing.T) {
+	state, ok := CodexMCQForm("old scrollback\n" + codexMCQFrame)
+	if !ok {
+		t.Fatal("Codex form was not recognized")
+	}
+	if state.Kind != MCQCodexQuestions || state.AnswerCount != 3 || state.Current != 1 || state.Unanswered != 3 || state.SelectedOption != "1" || state.SubmitAll {
+		t.Fatalf("unexpected form state: %+v", state)
+	}
+	region := ExtractCodexMCQForm("old scrollback\n" + codexMCQFrame)
+	if strings.Contains(region, "old scrollback") || strings.Contains(region, "enter to submit") {
+		t.Fatalf("form extraction retained chrome/scrollback: %q", region)
+	}
+	if got := OptionLabels(region); len(got) != 3 || got[1] != "Reorder only                      Keep the existing columns." {
+		t.Fatalf("Codex options = %v", got)
+	}
+}
+
+func TestCodexMCQFormSubmitAllAndFalsePositives(t *testing.T) {
+	single := strings.ReplaceAll(codexMCQFrame, "Question 1/3 (3 unanswered)", "Question 1/1 (1 unanswered)")
+	if state, ok := CodexMCQForm(single); !ok || state.AnswerCount != 1 || state.Current != 1 || state.Unanswered != 1 {
+		t.Fatalf("single-question state = %+v ok=%v", state, ok)
+	}
+	submit := strings.ReplaceAll(strings.ReplaceAll(codexMCQFrame, "Question 1/3 (3 unanswered)", "Question 3/3 (0 unanswered)"), "submit answer", "submit all")
+	state, ok := CodexMCQForm(submit)
+	if !ok || !state.SubmitAll || state.Current != 3 || state.Unanswered != 0 {
+		t.Fatalf("submit-all state = %+v ok=%v", state, ok)
+	}
+	for _, pane := range []string{
+		"Question 1/3 (3 unanswered)\nordinary narration\n",
+		"tab to add notes | enter to submit answer | ←/→ to navigate questions | esc to interrupt\n",
+		strings.Replace(codexMCQFrame, "Question 1/3", "Question 4/3", 1),
+	} {
+		if _, ok := CodexMCQForm(pane); ok {
+			t.Fatalf("false positive for %q", pane)
+		}
+	}
+}
 
 func TestStripCodexComposer(t *testing.T) {
 	cases := []struct {

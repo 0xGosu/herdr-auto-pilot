@@ -9,7 +9,7 @@ import (
 // an optional selection caret, then "N." / "N)" / "[N]", then the label.
 // The number is captured so the displayed digit is delivered verbatim (a
 // menu that starts at 0 or skips a number is honored, not re-indexed).
-var numberedOptionRE = regexp.MustCompile(`(?m)^[ \t]*(?:[❯>][ \t]*)?(?:(\d+)[.)]|\[(\d+)\])[ \t]+(\S.*?)[ \t]*$`)
+var numberedOptionRE = regexp.MustCompile(`(?m)^[ \t]*(?:[❯›>][ \t]*)?(?:(\d+)[.)]|\[(\d+)\])[ \t]+(\S.*?)[ \t]*$`)
 
 // checkboxLabelRE matches the leading `[ ]` / `[x]` checkbox marker that a
 // Claude multi-SELECT question renders in front of each toggleable option
