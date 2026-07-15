@@ -60,6 +60,14 @@ func DefaultRules() []config.ClassifierRule {
 			Regex: nil,
 		},
 		{
+			// Codex's interrupt screen ("Conversation interrupted - tell the
+			// model what to do differently") is detected structurally via
+			// domain.CodexErrorForm at the error position in Classify, same
+			// as Claude above.
+			AgentType: "codex", Situation: "error",
+			Regex: nil,
+		},
+		{
 			AgentType: "*", Situation: "idle",
 			Regex: []string{
 				`(?i)(task|step|work) (is )?(complete|completed|done|finished)`,
@@ -147,6 +155,11 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		if !matched && r.situation == domain.SituationError && strings.EqualFold(agentType, "claude") {
 			_, matched = domain.ClaudeErrorForm(pane)
 		}
+		// Codex's interrupt screen ("Conversation interrupted") is detected
+		// structurally the same way, scoped to codex.
+		if !matched && r.situation == domain.SituationError && strings.EqualFold(agentType, "codex") {
+			_, matched = domain.CodexErrorForm(pane)
+		}
 		if !matched {
 			continue
 		}
@@ -221,6 +234,9 @@ func enrich(s *domain.Situation) {
 		} else if kind, ok := domain.ClaudeErrorForm(s.Content); ok {
 			// Claude's built-in error forms carry no "error:"-prefixed line;
 			// use the stable kind so paraphrases share one signature.
+			s.ErrorSummary = kind
+		} else if kind, ok := domain.CodexErrorForm(s.Content); ok {
+			// Same reasoning as Claude above, for Codex's interrupt screen.
 			s.ErrorSummary = kind
 		}
 	}

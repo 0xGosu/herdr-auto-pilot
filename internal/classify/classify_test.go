@@ -23,8 +23,9 @@ func TestGoldenTranscripts(t *testing.T) {
 		"codex_idle.txt":    "idle",
 	}
 	agentTypeFor := map[string]string{
-		"codex_idle.txt":       "codex",
-		"choice_codex_mcq.txt": "codex",
+		"codex_idle.txt":              "codex",
+		"choice_codex_mcq.txt":        "codex",
+		"error_codex_interrupted.txt": "codex",
 	}
 
 	entries, err := os.ReadDir("testdata/transcripts")
@@ -334,6 +335,24 @@ func TestClaudeErrorSituations(t *testing.T) {
 		// type must NOT classify as error (no rule for it yet).
 		if s := c.Classify("codex", "blocked", string(data)); s.Type == domain.SituationError {
 			t.Errorf("%s on non-claude agent must not classify error, got %v", name, s.Type)
+		}
+	}
+}
+
+func TestCodexErrorSituations(t *testing.T) {
+	c := New(nil)
+	for _, name := range []string{"error_codex_interrupted.txt"} {
+		data, err := os.ReadFile(filepath.Join("testdata", "transcripts", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s := c.Classify("codex", "blocked", string(data)); s.Type != domain.SituationError {
+			t.Errorf("%s: type = %v, want error", name, s.Type)
+		}
+		// Error detection is codex-scoped: the same content on another agent
+		// type must NOT classify as error (no rule for it yet).
+		if s := c.Classify("claude", "blocked", string(data)); s.Type == domain.SituationError {
+			t.Errorf("%s on non-codex agent must not classify error, got %v", name, s.Type)
 		}
 	}
 }
