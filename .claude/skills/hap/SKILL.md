@@ -422,12 +422,49 @@ remove a task source by index:
 hap task-source remove <index>
 ```
 
+### manage the task items (CRUD)
+
+`hap task` edits the checklist items *inside* a source's file (whereas
+`hap task-source` manages which file an agent points at). Address a list either
+by the agent whose task source it is, or with `--path <file>` for any checklist
+(and for workspace-scoped sources, which aren't addressable by agent name).
+
+tasks are numbered by their **position in the file** (1..N, counting checked and
+unchecked alike). the number never changes with a status filter — `done 3`
+always means the third item in the file. numbers *do* shift after `add`/`remove`,
+so every mutating command re-prints the renumbered list. the checkbox is shown
+verbatim, so an in-progress `[-]` item (what the generated-task flow writes for
+the task an agent is actively working) renders as `[-]` and is *not* counted as
+pending (only truly-unchecked `[ ]` items are).
+
+```bash
+hap task backend-dev list                 # all items, with status + number
+hap task backend-dev list --status pending  # or: done | all (default all)
+hap task backend-dev get 3                 # show one item
+hap task backend-dev add "wire up retries" # append a new unchecked item
+hap task backend-dev done 2                # tick item 2 off ([x])
+hap task backend-dev undone 2              # re-open item 2 ([ ])
+hap task backend-dev update 2 "new text"   # edit text, keep status
+hap task backend-dev remove 2              # delete item 2
+
+hap task --path ./docs/tasks.md list       # operate on any checklist file
+```
+
+resolution by agent name matches the `agent` selector a task source was
+registered with (its short name, id, or type). if the name matches no source,
+matches several, or only workspace-scoped sources exist, `hap task` errors and
+tells you to use `--path`. writes go straight to the file (atomically) — the
+daemon re-reads task files live, so no restart or reload is needed. adding a
+task doesn't interrupt a working agent; it's picked up on the agent's next idle.
+
 ### template placeholders
 
-the prompt sent to the agent is rendered from a template. the default is:
+the prompt sent to the agent is rendered from a template. the default steers the
+agent to manage its list through the `hap task` CLI with its own name pre-filled
+in every command (and a `--path` fallback for sources that aren't name-addressable):
 
 ```
-Your next task is {next_task_content}. Read the full tasks list at {task_list_path}.
+Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them and `hap task {agent_name} done <n>` to mark one complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`).
 ```
 
 - `{next_task_content}` — the text of the next unchecked item (or `"none"` when the list is complete)
@@ -696,7 +733,7 @@ hap signatures reembed
 
 ## notes
 
-- `hap status`, `hap agents`, `hap escalations`, `hap audit`, `hap signatures list`, `hap signatures show`, `hap config show`, `hap config fields`, `hap config path`, `hap rules list`, `hap task-source list`, `hap kill-history`, `hap state-dir`, `hap paths`, and `hap version` are read-only and safe to run anytime.
+- `hap status`, `hap agents`, `hap escalations`, `hap audit`, `hap signatures list`, `hap signatures show`, `hap config show`, `hap config fields`, `hap config path`, `hap rules list`, `hap task-source list`, `hap task <agent> list`, `hap task <agent> get`, `hap kill-history`, `hap state-dir`, `hap paths`, and `hap version` are read-only and safe to run anytime.
 - `hap confirm` and `hap resolve` with `--send` will deliver text to an agent pane — be mindful of what you send.
 - `hap dismiss` drops escalations without responding — safe, nothing is sent or learned, audit rows kept as `dismissed`.
 - `hap escalations prune [minutes]` bulk-dismisses old escalations (default 360 minutes).

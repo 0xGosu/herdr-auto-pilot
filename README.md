@@ -352,8 +352,13 @@ error = "#ff5f5f"
 # else the first
 # pending one). Other agent types skip inference entirely and escalate.
 #
-# The prompt sent to the agent is rendered from a template. The default is:
-#   "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."
+# The prompt sent to the agent is rendered from a template. The default steers
+# the agent to manage its list through the hap CLI with its own name pre-filled
+# (and a --path fallback for sources that aren't name-addressable):
+#   "Your next task is {next_task_content}. Prefer the hap CLI to manage your
+#    tasks: `hap task {agent_name} list` to view them and `hap task {agent_name}
+#    done <n>` to mark one complete as you go (if that name isn't recognized,
+#    use `--path {task_list_path}` in place of `{agent_name}`)."
 # When every item is checked off, the prompt is still sent with
 # {next_task_content} = "none", so the template can steer what an idle agent
 # does when the list is done.

@@ -1307,9 +1307,13 @@ func TestIdleDeclaredTaskSourceDrivesNextPrompt(t *testing.T) {
 	h.herdr.setPane(idlePane)
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
+	name, err := h.raw.EnsureAgentName(context.Background(), "agent-9")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.push("agent-9", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := fmt.Sprintf("Your next task is step two. Read the full tasks list at %s.", taskFile)
+	want := (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want templated prompt for next unchecked item %q", got, want)
 	}
@@ -1381,9 +1385,13 @@ func TestIdleDeclaredTaskRealTaskBeatsCompletedSource(t *testing.T) {
 	h.herdr.setPane(idlePane)
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
+	name, err := h.raw.EnsureAgentName(context.Background(), "agent-21")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.push("agent-21", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := fmt.Sprintf("Your next task is real task. Read the full tasks list at %s.", nextFile)
+	want := (&domain.DeclaredTask{Task: "real task", Path: nextFile, AgentName: name}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want the real remaining task to win over the completed source: %q", got, want)
 	}
@@ -1426,9 +1434,13 @@ func TestIdleDeclaredTaskCompletedListSendsNone(t *testing.T) {
 	h.herdr.setPane(idlePane)
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
+	name, err := h.raw.EnsureAgentName(context.Background(), "agent-20")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.push("agent-20", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := fmt.Sprintf("Your next task is none. Read the full tasks list at %s.", taskFile)
+	want := (&domain.DeclaredTask{Task: domain.NoTaskContent, Path: taskFile, AgentName: name}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want completed-list prompt %q", got, want)
 	}
@@ -1448,9 +1460,13 @@ func TestIdleTaskSourceMatchesWorkspaceNameWildcard(t *testing.T) {
 	h.herdr.setPane(idlePane)
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
+	name, err := h.raw.EnsureAgentName(context.Background(), "agent-23")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.pushIn("agent-23", "w7", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := fmt.Sprintf("Your next task is workspace task. Read the full tasks list at %s.", taskFile)
+	want := (&domain.DeclaredTask{Task: "workspace task", Path: taskFile, AgentName: name}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want workspace-name-matched prompt %q", got, want)
 	}
@@ -1493,9 +1509,13 @@ func TestIdleTaskSourceWorkspaceIdFallback(t *testing.T) {
 	h.herdr.setPane(idlePane)
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
+	name, err := h.raw.EnsureAgentName(context.Background(), "agent-25")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.pushIn("agent-25", "w9", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := fmt.Sprintf("Your next task is fallback task. Read the full tasks list at %s.", taskFile)
+	want := (&domain.DeclaredTask{Task: "fallback task", Path: taskFile, AgentName: name}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want id-fallback-matched prompt %q", got, want)
 	}
@@ -1534,7 +1554,7 @@ func TestIdleTaskSourceMatchesAgentShortName(t *testing.T) {
 
 	h.push("agent-15", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := fmt.Sprintf("Your next task is short-name task. Read the full tasks list at %s.", taskFile)
+	want := (&domain.DeclaredTask{Task: "short-name task", Path: taskFile, AgentName: "docs-writer"}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want the short-name-matched task prompt %q", got, want)
 	}

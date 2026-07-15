@@ -152,8 +152,12 @@ func TestDeclaredTaskLLMReviewSendProposedSentinel(t *testing.T) {
 			Rationale: "ready to go", ConfidentScore: 90, Status: "pending"}, nil
 	}
 
+	name, err := h.raw.EnsureAgentName(context.Background(), "agent-sentinel")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.push("agent-sentinel", "idle")
-	want := "Your next task is refactor the parser. Read the full tasks list at " + taskFile + "."
+	want := (&domain.DeclaredTask{Task: "refactor the parser", Path: taskFile, AgentName: name}).Prompt()
 	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sentinel should send the rendered task verbatim, got %q, want %q", got, want)
@@ -186,6 +190,10 @@ func TestDeclaredTaskLLMReviewDeclineEscalates(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	name, err := h.raw.EnsureAgentName(ctx, "agent-dec")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.push("agent-dec", "idle")
 	var esc []domain.AuditRecord
 	waitFor(t, 5*time.Second, func() bool {
@@ -198,7 +206,7 @@ func TestDeclaredTaskLLMReviewDeclineEscalates(t *testing.T) {
 	if esc[0].Suggestion != "LLM suggested: "+domain.ActionNoopSuggestion {
 		t.Errorf("decline suggestion = %q, want the LLM's exact recommendation (no reply)", esc[0].Suggestion)
 	}
-	wantTask := "Your next task is update the changelog. Read the full tasks list at " + taskFile + "."
+	wantTask := (&domain.DeclaredTask{Task: "update the changelog", Path: taskFile, AgentName: name}).Prompt()
 	if !strings.Contains(esc[0].Rationale, wantTask) {
 		t.Errorf("decline rationale should show the original proposed task, got %q", esc[0].Rationale)
 	}
@@ -410,9 +418,13 @@ func TestDeclaredTaskLLMReviewOptOut(t *testing.T) {
 	}
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
+	name, err := h.raw.EnsureAgentName(context.Background(), "agent-opt")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.push("agent-opt", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := "Your next task is write the docs. Read the full tasks list at " + taskFile + "."
+	want := (&domain.DeclaredTask{Task: "write the docs", Path: taskFile, AgentName: name}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("opt-out source should send the templated prompt directly, got %q", got)
 	}

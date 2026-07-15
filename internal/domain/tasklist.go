@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -22,7 +23,14 @@ var inProgressItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[-\]\s*(.+)$`)
 // item (or NoTaskContent when the list is complete), {task_list_path} is
 // the task-source file path, {agent_name} is the agent's short name, {cwd}
 // is the agent's working directory (the project it is in).
-const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}."
+//
+// The default steers the agent to manage its list through the `hap task` CLI
+// with the agent's own name pre-filled in every command (so `hap task
+// {agent_name} done <n>` resolves this exact source). It also spells out the
+// `--path {task_list_path}` form so a source that isn't name-addressable (one
+// scoped by agent type, pane id, workspace, or "any") is still manageable —
+// `hap task {agent_name}` errors on those, and the path form always works.
+const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them and `hap task {agent_name} done <n>` to mark one complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`)."
 
 // NoTaskContent is the {next_task_content} value when a declared list has
 // no unchecked item left: the templated prompt is still delivered so the
@@ -140,6 +148,175 @@ func InProgressDeclaredTasks(content string) []string {
 		}
 	}
 	return inProgress
+}
+
+// checklistItemRE matches a single checklist line, capturing three groups:
+// the prefix (indent plus an optional "- "/"* "/"+ " bullet), the single
+// checkbox marker rune, and the task text. Its marker class is exactly the
+// union of uncheckedItemRE's space and checkedItemRE's [xX+\-*], so an item's
+// done-ness derived here (marker != space) always agrees with what those two
+// authoritative regexes classify — TestChecklistDoneAgreesWithNextDeclared
+// guards that. The prefix is preserved verbatim on rewrite so an item's
+// indentation and bullet style survive a toggle/edit; the whitespace between
+// the checkbox and the text is normalized to a single space.
+var checklistItemRE = regexp.MustCompile(`^(\s*(?:[-*+]\s+)?)\[([ xX+\-*])\]\s*(.+)$`)
+
+// ChecklistItem is one parsed checklist line addressed by its absolute
+// position among all checklist items (FR-011, CRUD surface). Index is the
+// stable-within-a-snapshot task number the `hap task` CLI exposes: it counts
+// checked and unchecked items alike in file order, so it never depends on a
+// status filter. LineNo is the item's 0-based line in the file; Prefix is the
+// original indent+bullet, preserved when the line is rewritten.
+type ChecklistItem struct {
+	Index  int
+	LineNo int
+	Prefix string
+	// Mark is the raw checkbox rune (" ", "x", "X", "+", "-", "*"). Done is the
+	// binary pending/not-pending classification used for filtering; Mark is kept
+	// so a display can render a third state faithfully — notably the "-"
+	// in-progress marker this codebase's own generated-task flow writes for the
+	// task an agent is currently working on (RenderGeneratedTaskList), which
+	// would otherwise read as "[x] done".
+	Mark string
+	Done bool
+	Text string
+}
+
+// ParseChecklist returns every checklist item in content, in file order,
+// numbered from 1. Non-item lines (headers, prose, blanks) are skipped for
+// numbering and left untouched by the mutation helpers below.
+func ParseChecklist(content string) []ChecklistItem {
+	var items []ChecklistItem
+	for lineNo, line := range strings.Split(content, "\n") {
+		m := checklistItemRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		items = append(items, ChecklistItem{
+			Index:  len(items) + 1,
+			LineNo: lineNo,
+			Prefix: m[1],
+			Mark:   m[2],
+			Done:   m[2] != " ",
+			Text:   strings.TrimSpace(m[3]),
+		})
+	}
+	return items
+}
+
+// validateTaskText trims surrounding whitespace and rejects empty or
+// multi-line text. A checklist item is a single physical line, so an embedded
+// newline or carriage return would silently inject extra items — or a forged
+// "[x]" status — into the file while the command reports one task written.
+// Every helper that writes operator-supplied item text goes through this.
+func validateTaskText(text string) (string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", fmt.Errorf("task text must not be empty")
+	}
+	if strings.ContainsAny(text, "\r\n") {
+		return "", fmt.Errorf("task text must be a single line (no embedded newlines)")
+	}
+	return text, nil
+}
+
+// outOfRangeErr reports a task number that names no item, quoting the valid
+// range so a caller (or coding agent) can re-list and retry.
+func outOfRangeErr(index, count int) error {
+	if count == 0 {
+		return fmt.Errorf("no task #%d: the checklist has no items", index)
+	}
+	return fmt.Errorf("no task #%d: valid task numbers are 1..%d", index, count)
+}
+
+// rewriteChecklistLine replaces the target item's line with fn(prefix, marker,
+// text), preserving every other line. index is 1-based over all items.
+func rewriteChecklistLine(content string, index int, fn func(prefix, marker, text string) string) (string, error) {
+	lines := strings.Split(content, "\n")
+	count := 0
+	for i, line := range lines {
+		m := checklistItemRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		count++
+		if count == index {
+			lines[i] = fn(m[1], m[2], strings.TrimSpace(m[3]))
+			return strings.Join(lines, "\n"), nil
+		}
+	}
+	return "", outOfRangeErr(index, count)
+}
+
+// SetChecklistItemDone toggles item index's checkbox to [x] (done) or [ ]
+// (pending), preserving its prefix and text.
+func SetChecklistItemDone(content string, index int, done bool) (string, error) {
+	return rewriteChecklistLine(content, index, func(prefix, _, text string) string {
+		box := "[ ]"
+		if done {
+			box = "[x]"
+		}
+		return prefix + box + " " + text
+	})
+}
+
+// EditChecklistItemText replaces item index's text, preserving its prefix and
+// its current checkbox marker (a done item stays done). The new text must be a
+// non-empty single line.
+func EditChecklistItemText(content string, index int, text string) (string, error) {
+	text, err := validateTaskText(text)
+	if err != nil {
+		return "", err
+	}
+	return rewriteChecklistLine(content, index, func(prefix, marker, _ string) string {
+		return prefix + "[" + marker + "] " + text
+	})
+}
+
+// DeleteChecklistItem removes item index's line entirely, leaving every other
+// line untouched.
+func DeleteChecklistItem(content string, index int) (string, error) {
+	lines := strings.Split(content, "\n")
+	count := 0
+	for i, line := range lines {
+		if !checklistItemRE.MatchString(line) {
+			continue
+		}
+		count++
+		if count == index {
+			lines = append(lines[:i], lines[i+1:]...)
+			return strings.Join(lines, "\n"), nil
+		}
+	}
+	return "", outOfRangeErr(index, count)
+}
+
+// AppendChecklistItem adds a new unchecked item with the given text and
+// returns the updated content plus the new item's 1-based number. The item is
+// inserted just after the last existing checklist item and takes the FIRST
+// item's indent+bullet — usually the list's top-level style — so appending
+// never accidentally nests the new task under a preceding sub-item. With no
+// existing items it is appended at end of file with a default "- " bullet. The
+// text must be a non-empty single line.
+func AppendChecklistItem(content, text string) (string, int, error) {
+	text, err := validateTaskText(text)
+	if err != nil {
+		return "", 0, err
+	}
+	items := ParseChecklist(content)
+	newIndex := len(items) + 1
+	if len(items) == 0 {
+		out := content
+		if out != "" && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		return out + "- [ ] " + text + "\n", newIndex, nil
+	}
+	newLine := items[0].Prefix + "[ ] " + text
+	lines := strings.Split(content, "\n")
+	insertAt := items[len(items)-1].LineNo + 1
+	lines = append(lines[:insertAt], append([]string{newLine}, lines[insertAt:]...)...)
+	return strings.Join(lines, "\n"), newIndex, nil
 }
 
 // InferredTask is a next task inferred from the agent's own transcript.

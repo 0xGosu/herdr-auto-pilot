@@ -736,3 +736,195 @@ func TestPathsCmd(t *testing.T) {
 		t.Errorf("paths must show the labeled state dir, got:\n%s", out)
 	}
 }
+
+// writeTaskFile writes a checklist file in a fresh temp dir and returns its
+// path. Kept off the config dir so the daemon/config lock is never involved.
+func writeTaskFile(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestTaskListStatusFilterPreservesNumbers(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] one\n- [x] two\n- [ ] three\n")
+
+	out, err := run(t, app, "task", "--path", path, "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"#1", "#2", "#3", "one", "two", "three", "3 task(s): 2 pending, 1 done"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("list missing %q, got:\n%s", want, out)
+		}
+	}
+
+	// A pending filter drops item #2 but must keep #1 and #3 numbered by their
+	// absolute file position — never renumbered 1,2.
+	out, err = run(t, app, "task", "--path", path, "list", "--status", "pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "#1") || !strings.Contains(out, "#3") {
+		t.Errorf("pending filter must keep absolute numbers #1 and #3, got:\n%s", out)
+	}
+	if strings.Contains(out, "two") || strings.Contains(out, "#2") {
+		t.Errorf("pending filter must hide the done item #2, got:\n%s", out)
+	}
+
+	if _, err := run(t, app, "task", "--path", path, "list", "--status", "bogus"); err == nil {
+		t.Error("invalid --status must error")
+	}
+}
+
+// TestTaskInProgressMarkerFaithful pins that an in-progress "[-]" item (what
+// this codebase's generated-task flow writes for the active task) renders as
+// "[-]", not "[x]", and is treated as not-pending by the filters.
+func TestTaskInProgressMarkerFaithful(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [-] working on it\n- [ ] queued\n")
+
+	out, err := run(t, app, "task", "--path", path, "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "[-]\tworking on it") {
+		t.Errorf("in-progress marker must render as [-], got:\n%s", out)
+	}
+
+	out, err = run(t, app, "task", "--path", path, "list", "--status", "pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "working on it") {
+		t.Errorf("in-progress item must not count as pending, got:\n%s", out)
+	}
+	if !strings.Contains(out, "queued") {
+		t.Errorf("pending filter must show the truly-unchecked item, got:\n%s", out)
+	}
+}
+
+func TestTaskCRUDByPath(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] first\n- [x] second\n")
+
+	// add appends an unchecked item and echoes the renumbered list.
+	out, err := run(t, app, "task", "--path", path, "add", "third task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "added task #3") || !strings.Contains(out, "third task") {
+		t.Errorf("add must report #3 and echo the list, got:\n%s", out)
+	}
+
+	// done toggles the checkbox in the file.
+	if _, err := run(t, app, "task", "--path", path, "done", "1"); err != nil {
+		t.Fatal(err)
+	}
+	// update edits text but keeps status.
+	if _, err := run(t, app, "task", "--path", path, "update", "1", "first task edited"); err != nil {
+		t.Fatal(err)
+	}
+	// remove deletes item #2 (the done "second").
+	if _, err := run(t, app, "task", "--path", path, "remove", "2"); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "- [x] first task edited\n- [ ] third task\n"
+	if string(data) != want {
+		t.Errorf("file after CRUD:\n got %q\nwant %q", string(data), want)
+	}
+
+	// get returns a single item by number.
+	out, err = run(t, app, "task", "--path", path, "get", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "first task edited") || !strings.Contains(out, "[x]") {
+		t.Errorf("get #1 must show the edited done item, got:\n%s", out)
+	}
+
+	if _, err := run(t, app, "task", "--path", path, "get", "99"); err == nil {
+		t.Error("out-of-range get must error")
+	}
+}
+
+func TestTaskByAgentResolvesSource(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] alpha\n- [ ] beta\n")
+	if err := app.AddTaskSource(context.Background(), "backend", "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "task", "backend", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "alpha") || !strings.Contains(out, "beta") {
+		t.Errorf("agent-resolved list must show the source's items, got:\n%s", out)
+	}
+
+	if _, err := run(t, app, "task", "backend", "done", "2"); err != nil {
+		t.Fatal(err)
+	}
+	// AddTaskSource abs-resolves the path, so read it back from the source.
+	cfg, _ := app.Config()
+	data, _ := os.ReadFile(cfg.TaskSources[0].Path)
+	if want := "- [ ] alpha\n- [x] beta\n"; string(data) != want {
+		t.Errorf("done via agent name:\n got %q\nwant %q", string(data), want)
+	}
+}
+
+func TestTaskResolutionErrors(t *testing.T) {
+	app, _ := testApp(t)
+	pathA := writeTaskFile(t, "- [ ] a\n")
+	pathB := writeTaskFile(t, "- [ ] b\n")
+
+	// Unknown agent → error pointing at task-source add.
+	if _, err := run(t, app, "task", "ghost", "list"); err == nil {
+		t.Error("unknown agent must error")
+	} else if !strings.Contains(err.Error(), "task-source add") {
+		t.Errorf("unknown-agent error should suggest adding a source, got: %v", err)
+	}
+
+	// Workspace-only source (empty agent) is not addressable by name.
+	if err := app.AddTaskSource(context.Background(), "", "codex-*", pathA, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, app, "task", "anyone", "list"); err == nil {
+		t.Error("workspace-only source must not be addressable by agent name")
+	} else if !strings.Contains(err.Error(), "--path") {
+		t.Errorf("workspace-only error should point at --path, got: %v", err)
+	}
+
+	// Two sources for the same agent → ambiguous.
+	if err := app.AddTaskSource(context.Background(), "dup", "", pathA, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(context.Background(), "dup", "", pathB, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, app, "task", "dup", "list"); err == nil {
+		t.Error("ambiguous agent must error")
+	} else if !strings.Contains(err.Error(), "matches 2 task sources") {
+		t.Errorf("ambiguous error should name the count, got: %v", err)
+	}
+}
+
+func TestTaskMissingTargetOrOp(t *testing.T) {
+	app, _ := testApp(t)
+	if _, err := run(t, app, "task"); err == nil {
+		t.Error("task with no args must show usage error")
+	}
+	path := writeTaskFile(t, "- [ ] a\n")
+	if _, err := run(t, app, "task", "--path", path); err == nil {
+		t.Error("task with a target but no op must error")
+	}
+}

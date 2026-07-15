@@ -1960,3 +1960,65 @@ func (h *focusPortHerdr) FocusPane(ctx context.Context, tabID, paneID string) er
 	h.calls = append(h.calls, focusPaneCall{tabID, paneID})
 	return nil
 }
+
+// TestConcurrentTaskMutationsDoNotLose exercises the per-path lock in
+// mutateTaskFile: many concurrent AddTask calls on the same checklist must all
+// land, since each read-modify-rename is serialized. Without the lock, two
+// mutations reading the same content would have the last rename drop the other.
+func TestConcurrentTaskMutationsDoNotLose(t *testing.T) {
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _, errs[i] = app.AddTask("", path, fmt.Sprintf("task-%d", i))
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent AddTask #%d failed: %v", i, err)
+		}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := domain.ParseChecklist(string(data))
+	if len(items) != n+1 { // seed + n added
+		t.Fatalf("after %d concurrent adds got %d items, want %d — a mutation was lost", n, len(items), n+1)
+	}
+}
+
+// TestMutatePreservesFileMode covers the reviewer's compatibility fix: editing
+// a normal 0644 checklist must not narrow it to 0600 on every write.
+func TestMutatePreservesFileMode(t *testing.T) {
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] a\n- [ ] b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil { // defeat umask so the baseline is exactly 0644
+		t.Fatal(err)
+	}
+
+	if _, err := app.SetTaskDone("", path, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Errorf("file mode after edit = %o, want preserved 0644 (not narrowed to 0600)", got)
+	}
+}

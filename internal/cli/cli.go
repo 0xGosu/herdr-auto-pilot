@@ -71,6 +71,8 @@ func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, arg
 		return rules(ctx, app, out, args)
 	case "task-source":
 		return taskSource(ctx, app, out, args)
+	case "task":
+		return task(ctx, app, out, args)
 	case "rename":
 		return rename(ctx, app, out, args)
 	case "signatures", "sigs":
@@ -842,6 +844,203 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	}
 	fmt.Fprintf(out, "task source added: %s\n", fs.Arg(0))
 	return nil
+}
+
+// task manages the checklist ITEMS inside a task source's file (as opposed to
+// task-source, which manages the source config). The target is either a
+// positional <agent> (resolved to its configured task source) or --path <file>
+// to operate on any checklist directly. Tasks are addressed by their 1-based
+// position among all items in the file; every mutating op re-prints the
+// renumbered list so the caller always sees fresh numbers.
+func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | done <n> | undone <n> | update <n> <text> | remove <n>"
+	agent, path, args, err := taskTarget(args)
+	if err != nil {
+		return err
+	}
+	if agent == "" && path == "" {
+		return fmt.Errorf("%s", usage)
+	}
+	if len(args) == 0 {
+		return fmt.Errorf("%s", usage)
+	}
+	op, rest := args[0], args[1:]
+	switch op {
+	case "list", "ls":
+		return taskList(app, out, agent, path, rest)
+	case "get", "show":
+		idx, err := taskIndexArg(rest)
+		if err != nil {
+			return err
+		}
+		it, err := app.GetTask(agent, path, idx)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(out, formatTask(it))
+		return nil
+	case "add", "create":
+		text := strings.TrimSpace(strings.Join(rest, " "))
+		if text == "" {
+			return fmt.Errorf("usage: task %s add <text>", taskTargetLabel(agent, path))
+		}
+		items, idx, err := app.AddTask(agent, path, text)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "added task #%d\n", idx)
+		printTaskList(out, items, "all")
+		return nil
+	case "done", "check":
+		return taskToggle(app, out, agent, path, rest, true)
+	case "undone", "uncheck", "reopen":
+		return taskToggle(app, out, agent, path, rest, false)
+	case "update", "edit":
+		if len(rest) < 2 {
+			return fmt.Errorf("usage: task %s update <n> <text>", taskTargetLabel(agent, path))
+		}
+		idx, err := taskIndexArg(rest[:1])
+		if err != nil {
+			return err
+		}
+		text := strings.TrimSpace(strings.Join(rest[1:], " "))
+		items, err := app.EditTask(agent, path, idx, text)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "updated task #%d\n", idx)
+		printTaskList(out, items, "all")
+		return nil
+	case "remove", "rm", "delete", "del":
+		idx, err := taskIndexArg(rest)
+		if err != nil {
+			return err
+		}
+		items, err := app.DeleteTask(agent, path, idx)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "removed task #%d\n", idx)
+		printTaskList(out, items, "all")
+		return nil
+	}
+	return fmt.Errorf("unknown task op %q\n%s", op, usage)
+}
+
+// taskTarget peels the leading target off a `task` argument list: either
+// --path <file> (also --path=<file>) or a positional <agent>. It returns the
+// resolved agent/path and the remaining args (the op and its arguments).
+func taskTarget(args []string) (agent, path string, rest []string, err error) {
+	if len(args) == 0 {
+		return "", "", nil, nil
+	}
+	switch {
+	case args[0] == "--path" || args[0] == "-path":
+		if len(args) < 2 {
+			return "", "", nil, fmt.Errorf("--path requires a file argument")
+		}
+		return "", args[1], args[2:], nil
+	case strings.HasPrefix(args[0], "--path="):
+		return "", strings.TrimPrefix(args[0], "--path="), args[1:], nil
+	case strings.HasPrefix(args[0], "-"):
+		return "", "", nil, fmt.Errorf("expected an agent name or --path <file> before the task op, got %q", args[0])
+	default:
+		return args[0], "", args[1:], nil
+	}
+}
+
+func taskTargetLabel(agent, path string) string {
+	if path != "" {
+		return "--path " + path
+	}
+	return agent
+}
+
+func taskIndexArg(args []string) (int, error) {
+	if len(args) == 0 {
+		return 0, fmt.Errorf("a task number is required (see: task ... list)")
+	}
+	n, err := strconv.Atoi(args[0])
+	if err != nil {
+		return 0, fmt.Errorf("invalid task number %q", args[0])
+	}
+	if n < 1 {
+		return 0, fmt.Errorf("task number must be 1 or greater, got %d", n)
+	}
+	return n, nil
+}
+
+func taskToggle(app *frontend.App, out io.Writer, agent, path string, rest []string, done bool) error {
+	idx, err := taskIndexArg(rest)
+	if err != nil {
+		return err
+	}
+	items, err := app.SetTaskDone(agent, path, idx, done)
+	if err != nil {
+		return err
+	}
+	state := "done"
+	if !done {
+		state = "pending"
+	}
+	fmt.Fprintf(out, "task #%d marked %s\n", idx, state)
+	printTaskList(out, items, "all")
+	return nil
+}
+
+func taskList(app *frontend.App, out io.Writer, agent, path string, args []string) error {
+	fs := flag.NewFlagSet("task list", flag.ContinueOnError)
+	status := fs.String("status", "all", "filter by status: all|pending|done")
+	fs.SetOutput(out)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	switch *status {
+	case "all", "pending", "done":
+	default:
+		return fmt.Errorf("invalid --status %q (all|pending|done)", *status)
+	}
+	items, err := app.ListTasks(agent, path)
+	if err != nil {
+		return err
+	}
+	printTaskList(out, items, *status)
+	return nil
+}
+
+// formatTask renders one item, preserving its raw checkbox rune so an
+// in-progress "[-]" (or any non-standard marker) is shown as-is rather than
+// collapsed to "[x]".
+func formatTask(it domain.ChecklistItem) string {
+	return fmt.Sprintf("#%d\t[%s]\t%s", it.Index, it.Mark, it.Text)
+}
+
+// printTaskList prints items matching the status filter, numbered by absolute
+// file position (the number never depends on the filter), then a count summary.
+func printTaskList(out io.Writer, items []domain.ChecklistItem, status string) {
+	shown, done := 0, 0
+	for _, it := range items {
+		if it.Done {
+			done++
+		}
+		if status == "pending" && it.Done {
+			continue
+		}
+		if status == "done" && !it.Done {
+			continue
+		}
+		fmt.Fprintln(out, formatTask(it))
+		shown++
+	}
+	if shown == 0 {
+		if len(items) == 0 {
+			fmt.Fprintln(out, "no tasks in this list")
+		} else {
+			fmt.Fprintf(out, "no %s tasks (%d total)\n", status, len(items))
+		}
+		return
+	}
+	fmt.Fprintf(out, "%d task(s): %d pending, %d done\n", len(items), len(items)-done, done)
 }
 
 func clearData(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {

@@ -66,6 +66,9 @@ Configure:
   config [show|fields|path|set <field> <value>|set-threshold <situation> <value>]
   rules [list|add <regex>|remove <index>]      never-auto patterns
   task-source [add] [--agent A] [--workspace W] [--template T] <checklist.md> | list | remove <index>
+  task [<agent> | --path F] list [--status all|pending|done] | get <n> | add <text>
+                        | done <n> | undone <n> | update <n> <text> | remove <n>
+                        CRUD the checklist items in an agent's task list
   clear-data --yes      reset learned history + audit data
 
   version               print version
