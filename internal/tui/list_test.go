@@ -77,7 +77,7 @@ func TestAuditAndEscalationRenderLLMConfidence(t *testing.T) {
 	audit := m.View()
 	// LLM row shows the 0-100 score next to the 0-1 computed conf; the learned
 	// row shows a dash so the column stays aligned.
-	for _, want := range []string{"conf=0.50 llm=85", "conf=1.00 llm=-"} {
+	for _, want := range []string{"CONF", "LLM", "0.50   85", "1.00    -"} {
 		if !strings.Contains(audit, want) {
 			t.Errorf("audit view missing %q:\n%s", want, audit)
 		}
@@ -85,8 +85,66 @@ func TestAuditAndEscalationRenderLLMConfidence(t *testing.T) {
 
 	m.tab = tabEscalations
 	esc := m.View()
-	if !strings.Contains(esc, "llm=85") || !strings.Contains(esc, "llm=-") {
-		t.Errorf("escalations view should show llm=85 and llm=-:\n%s", esc)
+	if !strings.Contains(esc, "LLM") || !strings.Contains(esc, " 85 ") || !strings.Contains(esc, "  - ") {
+		t.Errorf("escalations view should show the LLM header plus 85 and - values:\n%s", esc)
+	}
+}
+
+func TestAuditRowsRenderAgentName(t *testing.T) {
+	m := Model{width: 140, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.status.AgentNames = map[string]string{"w1:p1": "patient-lemur"}
+	msg.audit = []domain.AuditRecord{{
+		ID: 1, AgentID: "w1:p1", SituationType: domain.SituationIdle,
+		Status: "auto", Action: "auto:continue", CreatedAt: time.Now(),
+	}}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+	m.tab = tabAudit
+
+	if view := m.View(); !strings.Contains(view, "AGENT") || !strings.Contains(view, "patient-lemur") {
+		t.Errorf("audit row should show the resolved agent name:\n%s", view)
+	}
+}
+
+func TestEscalationAuditAndRulesListsRenderSingleHeader(t *testing.T) {
+	m := testModel(t)
+
+	m.tab = tabAudit
+	audit := m.View()
+	for _, heading := range []string{"ID", "WHEN", "AGENT", "STATUS", "SITUATION", "CONF", "LLM", "RULE", "ACTION"} {
+		if !strings.Contains(audit, heading) {
+			t.Errorf("audit header missing %q:\n%s", heading, audit)
+		}
+	}
+	for _, repeated := range []string{"agent=", "conf=", "llm=", "rule="} {
+		if strings.Contains(audit, repeated) {
+			t.Errorf("audit rows should not repeat label %q:\n%s", repeated, audit)
+		}
+	}
+
+	m.tab = tabSignatures
+	rules := m.View()
+	for _, heading := range []string{"SIGNATURE", "SITUATION", "AGENT", "MODE", "CONFIRM", "CONF", "TOP ACTION"} {
+		if !strings.Contains(rules, heading) {
+			t.Errorf("rules header missing %q:\n%s", heading, rules)
+		}
+	}
+	if strings.Contains(rules, "conf=") {
+		t.Errorf("rules rows should not repeat the confidence label:\n%s", rules)
+	}
+
+	m.tab = tabEscalations
+	escalations := m.View()
+	for _, heading := range []string{"ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "RATIONALE / SUGGESTION"} {
+		if !strings.Contains(escalations, heading) {
+			t.Errorf("escalations header missing %q:\n%s", heading, escalations)
+		}
+	}
+	for _, repeated := range []string{"agent=", "llm=", "rule="} {
+		if strings.Contains(escalations, repeated) {
+			t.Errorf("escalation rows should not repeat label %q:\n%s", repeated, escalations)
+		}
 	}
 }
 
@@ -139,36 +197,38 @@ func TestListTabsFitPaneWithManyRows(t *testing.T) {
 }
 
 func TestListWindowFollowsCursor(t *testing.T) {
-	m := listModel(t, 40, 12) // page size 6
+	m := listModel(t, 40, 12) // page size 5: table header uses one row
 	m.tab = tabEscalations
-	if page := m.listPageSize(); page != 6 {
-		t.Fatalf("expected page size 6 at height 12, got %d", page)
+	page := m.listPageSize()
+	if page != 5 {
+		t.Fatalf("expected page size 5 at height 12, got %d", page)
 	}
 	view := m.View()
 	if !strings.Contains(view, "rationale-row-00") {
 		t.Errorf("initial window should start at row 0:\n%s", view)
 	}
-	if strings.Contains(view, "rationale-row-06") {
-		t.Errorf("row 6 must be clipped below the initial window:\n%s", view)
+	if strings.Contains(view, fmt.Sprintf("rationale-row-%02d", page)) {
+		t.Errorf("row %d must be clipped below the initial window:\n%s", page, view)
 	}
-	if !strings.Contains(view, "… 34 more row(s) — ↓ to scroll") {
-		t.Errorf("expected the more-rows indicator for 34 clipped rows:\n%s", view)
+	if want := fmt.Sprintf("… %d more row(s) — ↓ to scroll", 40-page); !strings.Contains(view, want) {
+		t.Errorf("expected the more-rows indicator %q:\n%s", want, view)
 	}
 
 	// Moving below the window scrolls it down (AR-003).
-	for i := 0; i < 6; i++ {
+	for i := 0; i < page; i++ {
 		m = press(t, m, "down")
 	}
-	if m.cursor != 6 || m.offsets[tabEscalations] != 1 {
-		t.Fatalf("cursor=%d offset=%d after 6 downs, want cursor=6 offset=1", m.cursor, m.offsets[tabEscalations])
+	if m.cursor != page || m.offsets[tabEscalations] != 1 {
+		t.Fatalf("cursor=%d offset=%d after %d downs, want cursor=%d offset=1",
+			m.cursor, m.offsets[tabEscalations], page, page)
 	}
 	view = m.View()
-	if strings.Contains(view, "rationale-row-00") || !strings.Contains(view, "rationale-row-06") {
+	if strings.Contains(view, "rationale-row-00") || !strings.Contains(view, fmt.Sprintf("rationale-row-%02d", page)) {
 		t.Errorf("window should have scrolled to keep the cursor visible:\n%s", view)
 	}
 
 	// Moving back above the window scrolls it up (AR-004).
-	for i := 0; i < 6; i++ {
+	for i := 0; i < page; i++ {
 		m = press(t, m, "up")
 	}
 	if m.cursor != 0 || m.offsets[tabEscalations] != 0 {
@@ -179,8 +239,8 @@ func TestListWindowFollowsCursor(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		m = press(t, m, "down")
 	}
-	if m.cursor != 39 || m.offsets[tabEscalations] != 34 {
-		t.Errorf("cursor=%d offset=%d at the bottom, want 39/34", m.cursor, m.offsets[tabEscalations])
+	if m.cursor != 39 || m.offsets[tabEscalations] != 40-page {
+		t.Errorf("cursor=%d offset=%d at the bottom, want 39/%d", m.cursor, m.offsets[tabEscalations], 40-page)
 	}
 	view = m.View()
 	if !strings.Contains(view, "rationale-row-39") || strings.Contains(view, "more row(s)") {
@@ -220,8 +280,8 @@ func TestResizeClampsListViewport(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		m = press(t, m, "down")
 	}
-	if m.offsets[tabEscalations] != 34 {
-		t.Fatalf("precondition: offset should be 34, got %d", m.offsets[tabEscalations])
+	if want := 40 - m.listPageSize(); m.offsets[tabEscalations] != want {
+		t.Fatalf("precondition: offset should be %d, got %d", want, m.offsets[tabEscalations])
 	}
 	// Growing the pane makes the old offset invalid; it must clamp so the
 	// last page stays full (CR-007).

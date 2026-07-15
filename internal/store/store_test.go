@@ -393,6 +393,21 @@ func TestDuplicatePendingEscalation(t *testing.T) {
 	if !dup(rec) {
 		t.Error("identical escalated row should match")
 	}
+	// An explicitly queued LLM retry must be allowed to re-evaluate identical
+	// pane content instead of deduplicating against its own source escalation.
+	retryID, err := s.InsertLLMRetry(ctx, id, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dup(rec) {
+		t.Error("escalation queued for LLM retry should be excluded from deduplication")
+	}
+	if err := s.MarkLLMRetryProcessed(ctx, retryID); err != nil {
+		t.Fatal(err)
+	}
+	if !dup(rec) {
+		t.Error("a processed retry without retirement should restore normal deduplication")
+	}
 	// Any field differing breaks the match.
 	for name, mut := range map[string]func(domain.AuditRecord) domain.AuditRecord{
 		"agent_id":     func(r domain.AuditRecord) domain.AuditRecord { r.AgentID = "agent-2"; return r },
@@ -411,6 +426,35 @@ func TestDuplicatePendingEscalation(t *testing.T) {
 	}
 	if dup(rec) {
 		t.Error("resolved escalation should not count as a pending duplicate")
+	}
+}
+
+func TestRetireEscalationForRetry(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	id, err := s.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-1", SituationType: domain.SituationApproval, Trigger: "blocked",
+		Action: "escalated", Status: "escalated", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	retired, err := s.RetireEscalationForRetry(ctx, id)
+	if err != nil || !retired {
+		t.Fatalf("retire pending escalation = %v, %v; want true, nil", retired, err)
+	}
+	rec, _ := s.GetAudit(ctx, id)
+	if rec == nil || rec.Status != "retried" {
+		t.Fatalf("retired audit row = %+v, want status retried", rec)
+	}
+	if esc, _ := s.PendingEscalations(ctx); len(esc) != 0 {
+		t.Errorf("retried escalation must leave the pending set: %+v", esc)
+	}
+
+	retired, err = s.RetireEscalationForRetry(ctx, id)
+	if err != nil || retired {
+		t.Errorf("second retirement = %v, %v; want false, nil", retired, err)
 	}
 }
 

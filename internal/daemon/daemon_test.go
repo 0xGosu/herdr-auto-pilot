@@ -590,6 +590,158 @@ func TestAutoActDeliversMenuDigitForLabelAction(t *testing.T) {
 	}
 }
 
+// TestConfirmDrivenShadowToAutoPromotion is the end-to-end regression for the
+// live-observed learning loop: an operator's repeated confirmations of a
+// shadow-mode approval grow the rule's agreement and promote it from shadow to
+// autonomous once GraduationN consistent confirmations AND a confidence above
+// threshold both hold — after which the daemon auto-answers the approval with
+// the numbered-menu DIGIT (not the learned label text). Guards three things at
+// once: confirm-driven promotion, confidence growth, and menu-digit selection.
+func TestConfirmDrivenShadowToAutoPromotion(t *testing.T) {
+	const graduationN = 3
+	h := newHarness(t, fmt.Sprintf("[learning]\ngraduation_n = %d\n", graduationN))
+	h.herdr.setPane(approvalPane)
+	ctx := context.Background()
+
+	// The learned action is the option LABEL "Yes" (approvalPane offers
+	// "1. Yes / 2. No, ..."); proving the auto-act delivers digit "1" is the
+	// menu-digit-selection half of the regression.
+	const learned = "Yes"
+
+	// Seed a MIXED shadow history so agreement starts below 1.0 and can be
+	// observed to climb as consistent confirmations accumulate (an all-
+	// consistent history pins the recency-weighted agreement at 1.0 — no growth
+	// to assert). "No" is the oldest decision; two "Yes" keep it dominant.
+	s := classifierForTest().Classify("claude", "blocked", approvalPane)
+	if s.Type != domain.SituationApproval {
+		t.Fatalf("fixture classifies as %v, want approval", s.Type)
+	}
+	sig := domain.ComputeSignature(s)
+	for i, action := range []string{"No", learned, learned} { // oldest → newest
+		if _, err := h.raw.RecordDecision(ctx, domain.DecisionRecord{
+			Signature: sig.Signature, SituationType: domain.SituationApproval,
+			AgentType: "claude", ChosenAction: action, Source: domain.SourceOperator,
+			CreatedAt: time.Now().Add(-time.Duration(3-i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+
+	// Phase 1: each shadow escalation is confirmed record-only (like
+	// `hap confirm` — a learning event, no pane send), growing the rule until
+	// it graduates on the GraduationN-th confirmation.
+	var confidences []float64
+	for i := 1; i <= graduationN; i++ {
+		h.push("agent-promote", "blocked")
+
+		var esc domain.AuditRecord
+		waitFor(t, 3*time.Second, func() bool {
+			pend, _ := h.raw.PendingEscalations(ctx)
+			if len(pend) != 1 {
+				return false
+			}
+			esc = pend[0]
+			return true
+		})
+		// Shadow mode must never act: no input has reached the pane yet.
+		if n := len(h.herdr.sentInputs()); n != 0 {
+			t.Fatalf("shadow mode sent %d inputs before graduation; want 0", n)
+		}
+		if esc.Suggestion != "respond: "+learned {
+			t.Fatalf("shadow escalation suggestion = %q, want %q", esc.Suggestion, "respond: "+learned)
+		}
+
+		// Operator confirms the suggested action (learn-only, send=false).
+		if err := app.Confirm(ctx, esc.ID, false); err != nil {
+			t.Fatal(err)
+		}
+
+		// Wait for the confirmation to be learned AND the escalation resolved —
+		// both, so the next push re-escalates instead of tripping the
+		// duplicate-pending guard.
+		var st *domain.SignatureState
+		waitFor(t, 3*time.Second, func() bool {
+			st, _ = h.raw.GetSignature(ctx, sig.Signature)
+			pend, _ := h.raw.PendingEscalations(ctx)
+			return st != nil && st.ConsecutiveConfirmations == i && len(pend) == 0
+		})
+
+		wantMode := domain.ModeShadow
+		if i >= graduationN {
+			wantMode = domain.ModeAutonomous
+		}
+		if st.Mode != wantMode {
+			t.Fatalf("after %d confirmation(s): mode = %q, want %q", i, st.Mode, wantMode)
+		}
+		confidences = append(confidences, st.CachedConfidence)
+	}
+
+	// Confidence growth: the recency-weighted agreement climbs with each
+	// consistent confirmation (do not assert exact floats — assert the curve).
+	for i := 1; i < len(confidences); i++ {
+		if !(confidences[i] > confidences[i-1]) {
+			t.Errorf("confidence must grow with each confirmation, got %v", confidences)
+			break
+		}
+	}
+	// A friendlier restatement of the loop invariant above (strict growth at
+	// every step implies last > first): it surfaces a clearer message if the
+	// per-step check ever regresses to a partial climb.
+	if !(confidences[len(confidences)-1] > confidences[0]) {
+		t.Errorf("final confidence %.3f must exceed initial %.3f",
+			confidences[len(confidences)-1], confidences[0])
+	}
+
+	// Each confirmation was recorded as an operator-confirmed learning event
+	// (DR-005 lineage) — the surface `hap audit` reads back.
+	audits, err := h.raw.AuditLog(ctx, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmed := 0
+	for _, a := range audits {
+		if a.Trigger == domain.TriggerOperatorCorrection && a.Rationale == domain.RationaleOperatorConfirmed {
+			confirmed++
+		}
+	}
+	if confirmed != graduationN {
+		t.Errorf("operator-confirmed lineage rows = %d, want %d", confirmed, graduationN)
+	}
+
+	// Phase 2: now autonomous, the next matching approval is AUTO-answered with
+	// the menu DIGIT for the learned LABEL — no operator in the loop.
+	h.push("agent-promote", "blocked")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "1" {
+		t.Errorf("auto-act delivered %q, want the menu digit \"1\" for label %q", got, learned)
+	}
+
+	// The auto-act audit row carries the learned-rule rationale (the surface
+	// operators read as "... chosen N times (agreement ... > threshold ...)").
+	var auto *domain.AuditRecord
+	post, err := h.raw.AuditLog(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range post {
+		if post[i].Status == "auto" {
+			auto = &post[i]
+			break
+		}
+	}
+	if auto == nil {
+		t.Fatal("no auto-act audit row after graduation")
+	}
+	if !contains(auto.Rationale, "chosen") || !contains(auto.Rationale, "agreement") {
+		t.Errorf("auto-act rationale missing learned-rule surface: %q", auto.Rationale)
+	}
+	if auto.Input != learned {
+		t.Errorf("auto-act audit input = %q, want %q", auto.Input, learned)
+	}
+}
+
 func TestPipelineShadowModeEscalatesWithSuggestion(t *testing.T) {
 	h := newHarness(t, "")
 	h.herdr.setPane(approvalPane)
@@ -1870,9 +2022,10 @@ func TestLLMFailureEscalates(t *testing.T) {
 	}
 }
 
-func TestRetryLLMReDrivesConsultOnLivePane(t *testing.T) {
+func TestRetryLLMReDrivesConsultAsFreshEscalation(t *testing.T) {
 	// A failed consult leaves a retryable escalation; a queued retry re-drives
-	// a fresh consult against the agent's live pane, which this time delivers.
+	// a fresh consult against the agent's live pane. Even a high-confidence
+	// result returns to the operator as a new escalation instead of auto-acting.
 	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
@@ -1889,14 +2042,15 @@ func TestRetryLLMReDrivesConsultOnLivePane(t *testing.T) {
 			// First consult times out → the escalation the operator retries.
 			return nil, errors.New("llm timeout after 5s without submit_decision")
 		}
-		// The retry consult submits with high confidence and is promoted.
+		// The retry consult submits with high confidence, but retry intent forces
+		// the result back to human review.
 		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
 			RequestID: req.RequestID, Signature: req.Signature,
 			SituationType: req.SituationType, AgentType: req.AgentType,
-			Action: "1", Rationale: "operator always approves", ConfidentScore: 80, Status: "pending", CreatedAt: time.Now(),
+			Action: "@noop", Rationale: "no reply is needed", ConfidentScore: 99, Status: "pending", CreatedAt: time.Now(),
 		})
-		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "1",
-			Rationale: "operator always approves", ConfidentScore: 80, Status: "pending"}, nil
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "@noop",
+			Rationale: "no reply is needed", ConfidentScore: 99, Status: "pending"}, nil
 	}
 
 	ctx := context.Background()
@@ -1925,10 +2079,100 @@ func TestRetryLLMReDrivesConsultOnLivePane(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The retry re-drove the consult, which this time delivered the digit.
-	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	if got := h.herdr.sentInputs()[0]; got != "1" {
-		t.Errorf("retry consult delivered %q, want \"1\"", got)
+	// The retry re-drove the consult and created a distinct review item.
+	var fresh domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		pending, _ := h.raw.PendingEscalations(ctx)
+		for _, row := range pending {
+			if row.AgentID == "agent-retry" && row.ID != esc[0].ID {
+				fresh = row
+				return true
+			}
+		}
+		return false
+	})
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Fatalf("retry result must not auto-act, sent inputs: %q", got)
+	}
+	if fresh.Suggestion != "LLM suggested: "+domain.ActionNoopSuggestion {
+		t.Errorf("fresh escalation suggestion = %q, want a no-reply suggestion", fresh.Suggestion)
+	}
+	if !strings.Contains(fresh.Rationale, "["+string(domain.ReasonLLMRetry)+"]") ||
+		!strings.Contains(fresh.Rationale, fmt.Sprintf("#%d", esc[0].ID)) ||
+		!strings.Contains(fresh.Rationale, "no reply is needed") {
+		t.Errorf("fresh escalation should identify its retry source, got %q", fresh.Rationale)
+	}
+	if original, _ := h.raw.GetAudit(ctx, esc[0].ID); original == nil || original.Status != "retried" {
+		t.Errorf("accepted retry must retire its source escalation, got %+v", original)
+	}
+}
+
+func TestRetryLLMOutcomeNeverAutoActs(t *testing.T) {
+	// Exercise the promotion boundary without starting Run (and therefore
+	// without a control socket): retry provenance must override a high model
+	// confidence and turn @noop into a fresh, reviewable escalation.
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("[llm]\nauto_act_confidence_threshold = 50\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+	fh := &fakeHerdr{}
+	d, err := New(Options{ConfigPath: cfgPath, Store: raw, Herdr: fh, LLM: &fakeLLM{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	s := domain.Situation{
+		Type: domain.SituationApproval, AgentID: "agent-retry-boundary",
+		AgentType: "claude", PaneID: "pane-retry-boundary", Status: "blocked",
+		Content: approvalPane, RetryAuditID: 297,
+	}
+	sig := domain.ComputeSignature(s)
+	request := domain.LLMRequest{
+		RequestID: "retry-boundary-request", AgentID: s.AgentID,
+		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
+		RetryAuditID: 297,
+	}
+	decisionID, err := raw.InsertLLMDecision(ctx, domain.LLMDecision{
+		RequestID: request.RequestID, Signature: sig.Signature,
+		SituationType: s.Type, AgentType: s.AgentType,
+		Action: "@noop", Rationale: "no reply is needed", ConfidentScore: 99,
+		Status: "pending", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.handleLLMOutcome(ctx, llmOutcome{
+		situation: s, sig: sig, request: request,
+		decision: &domain.LLMDecision{
+			ID: decisionID, RequestID: request.RequestID, Action: "@noop",
+			Rationale: "no reply is needed", ConfidentScore: 99, Status: "pending",
+		},
+	})
+
+	if got := fh.sentInputs(); len(got) != 0 {
+		t.Fatalf("retry result auto-acted, sent inputs: %q", got)
+	}
+	pending, err := raw.PendingEscalations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("retry result created %d pending escalations, want 1: %+v", len(pending), pending)
+	}
+	if pending[0].Suggestion != "LLM suggested: "+domain.ActionNoopSuggestion {
+		t.Errorf("retry suggestion = %q, want no-reply suggestion", pending[0].Suggestion)
+	}
+	if !strings.Contains(pending[0].Rationale, "[llm_retry]") ||
+		!strings.Contains(pending[0].Rationale, "#297") ||
+		!strings.Contains(pending[0].Rationale, "no reply is needed") {
+		t.Errorf("retry rationale lost provenance or fresh reasoning: %q", pending[0].Rationale)
 	}
 }
 
@@ -1972,6 +2216,9 @@ func TestRetryLLMGuardSkipsWhileConsultInFlight(t *testing.T) {
 	if len(h.herdr.sentInputs()) != 0 {
 		t.Fatal("a guarded retry must not send anything")
 	}
+	if original, _ := h.raw.GetAudit(ctx, id); original == nil || original.Status != "escalated" {
+		t.Errorf("a guarded retry must leave its source escalation pending, got %+v", original)
+	}
 
 	// Once the consult resolves, a fresh retry is allowed to resolve the pane.
 	if err := h.raw.UpdateLLMRequestStatus(ctx, "req-agent-busy-1", "done"); err != nil {
@@ -1984,6 +2231,34 @@ func TestRetryLLMGuardSkipsWhileConsultInFlight(t *testing.T) {
 	h.daemon.processLLMRetries(ctx)
 	if n := h.herdr.listAgentsCallCount() - base; n == 0 {
 		t.Error("after the consult resolved, the retry should resolve the agent's pane")
+	}
+	if original, _ := h.raw.GetAudit(ctx, id); original == nil || original.Status != "retried" {
+		t.Errorf("accepted retry must retire its source escalation, got %+v", original)
+	}
+}
+
+func TestRetryLLMTransientPendingCheckFailureStaysQueued(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	id, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-transient", Signature: "sig", Trigger: "agent-status: blocked",
+		SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: "[llm_timeout] llm timeout", Status: "escalated", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.raw.InsertLLMRetry(ctx, id, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	h.store.(*failingStore).setFailPending(true)
+	h.daemon.processLLMRetries(ctx)
+	if q, _ := h.raw.UnprocessedLLMRetries(ctx); len(q) != 1 || q[0].AuditID != id {
+		t.Errorf("transient pending-check failure must preserve the queued retry, got %+v", q)
+	}
+	if original, _ := h.raw.GetAudit(ctx, id); original == nil || original.Status != "escalated" {
+		t.Errorf("transient retry failure must leave its source pending, got %+v", original)
 	}
 }
 
@@ -2015,6 +2290,9 @@ func TestRetryLLMAgentGoneNotifies(t *testing.T) {
 	}
 	if len(h.herdr.sentInputs()) != 0 {
 		t.Fatal("no send for a vanished agent")
+	}
+	if original, _ := h.raw.GetAudit(ctx, id); original == nil || original.Status != "escalated" {
+		t.Errorf("a retry for a vanished agent was not accepted and must stay pending, got %+v", original)
 	}
 }
 
@@ -2077,6 +2355,9 @@ func TestRetryLLMRefreshesLiveHerdrStatus(t *testing.T) {
 	if redriven.AgentType != "claude" {
 		t.Errorf("re-driven escalation agent type = %q, want \"claude\" (live from agent list)",
 			redriven.AgentType)
+	}
+	if original, _ := h.raw.GetAudit(ctx, seed); original == nil || original.Status != "retried" {
+		t.Errorf("re-driven retry must retire its source escalation, got %+v", original)
 	}
 }
 

@@ -18,7 +18,7 @@ inferred_task_bar = 0.60   # higher bar for tasks inferred from the agent's todo
 
 # ── Shadow-mode learning ────────────────────────────────────────────
 [learning]
-graduation_n = 5           # consecutive consistent confirmations to graduate a rule
+graduation_n = 2           # consecutive consistent confirmations to graduate a rule (1-10)
 
 # ── Safety (never-auto) ─────────────────────────────────────────────
 [safety]

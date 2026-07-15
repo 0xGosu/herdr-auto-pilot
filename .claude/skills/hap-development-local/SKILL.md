@@ -216,6 +216,28 @@ classification. cross-check the shape:
   workspace's only tab: `herdr tab create --workspace w4` (add a scratch tab so
   the workspace survives) **then** `herdr tab close w4:t1` (the agent's tab).
   Closing the last tab directly can take the workspace with it.
+- **`hap confirm` on a SHADOW escalation only learns — it does not send** — the
+  audit row reads `resolved … corrected:<action> … operator confirmed`, and the
+  menu stays up (shadow rules observe only). To also deliver, use
+  `hap confirm <id> --send` (or `hap resolve <id> --action … --send`). Each
+  confirm records a learning event and bumps the signature's confirmation count;
+  once consistent confirmations reach `learning.graduation_n` **and** agreement
+  clears the situation threshold, the signature graduates shadow→autonomous and
+  the daemon starts auto-answering matches on its own. Verified live driving one
+  agent to an approval: repeated `hap confirm`s promoted the rule and the
+  recency-weighted agreement climbed `0.81 → 0.86 → 0.92 → 0.96` across
+  successive auto-decisions (audit rows escalated `[shadow_mode]` → `auto`, each
+  rationale "…chosen N times (agreement … > threshold …)"). This loop is pinned
+  by `TestConfirmDrivenShadowToAutoPromotion` in `internal/daemon/daemon_test.go`.
+- **once a signature goes autonomous, STOP hand-sending menu digits** — the
+  daemon now answers that approval itself. If you also press the digit, both
+  keystrokes land: one selects the menu, the extra digit drops into the
+  now-empty input box as literal text (`❯ 1`) — cosmetic, but it looks like a
+  bug and can prepend to the agent's next prompt. After a rule graduates, let
+  the daemon own approvals; only intervene via `hap` (`confirm`/`resolve`/
+  `dismiss`), never by racing keystrokes into the pane. (A test agent parked in
+  `/tmp` with no task source also fires recurring `idle [no_task_source]`
+  escalations between API retries — expected noise, ignore.)
 
 ## quick reference
 

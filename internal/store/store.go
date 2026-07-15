@@ -1106,15 +1106,21 @@ func (s *Store) PendingEscalations(ctx context.Context) ([]domain.AuditRecord, e
 // exists for the same agent + agent type + situation type + exact pane content.
 // It backs the daemon's live-event dedup: a fresh transition whose captured
 // situation matches an escalation still awaiting the user is a duplicate and is
-// ignored. Cheaper than PendingEscalations — it never materializes the
-// (pane-excerpt-heavy) rows. The caller must pass the pane excerpt already
-// truncated the same way escalate() stores it, so the comparison lines up.
+// ignored. Escalations with an unprocessed LLM retry are excluded: the retry
+// explicitly asks to re-evaluate the same content, so its source row must not
+// suppress that recapture. Once accepted, the daemon retires the source row
+// before marking the queued retry processed. Cheaper than PendingEscalations —
+// it never materializes the (pane-excerpt-heavy) rows. The caller must pass the
+// pane excerpt already truncated the same way escalate() stores it, so the
+// comparison lines up.
 func (s *Store) DuplicatePendingEscalation(ctx context.Context, agentID, agentType string,
 	sitType domain.SituationType, paneExcerpt string) (bool, error) {
 	var exists int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM audit_log WHERE status = 'escalated'
-			AND agent_id = ? AND agent_type = ? AND situation_type = ? AND pane_excerpt = ?)`,
+		`SELECT EXISTS(SELECT 1 FROM audit_log a WHERE a.status = 'escalated'
+			AND a.agent_id = ? AND a.agent_type = ? AND a.situation_type = ? AND a.pane_excerpt = ?
+			AND NOT EXISTS (SELECT 1 FROM llm_retries r
+				WHERE r.audit_id = a.id AND r.processed = 0))`,
 		agentID, agentType, string(sitType), paneExcerpt).Scan(&exists)
 	if err != nil {
 		return false, err
@@ -1178,6 +1184,28 @@ func (s *Store) MarkLLMRetryProcessed(ctx context.Context, id int64) error {
 			`UPDATE llm_retries SET processed = 1 WHERE id = ?`, id)
 		return err
 	})
+}
+
+// RetireEscalationForRetry removes an accepted retry's source escalation from
+// the pending set without deleting its audit history. The guarded transition
+// prevents a late retry from overwriting a concurrent confirm or dismissal.
+func (s *Store) RetireEscalationForRetry(ctx context.Context, auditID int64) (bool, error) {
+	var retired bool
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE audit_log SET status = 'retried' WHERE id = ? AND status = 'escalated'`,
+			auditID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		retired = n == 1
+		return nil
+	})
+	return retired, err
 }
 
 // GetAgentRate returns runaway counters for an agent (zero value when absent).

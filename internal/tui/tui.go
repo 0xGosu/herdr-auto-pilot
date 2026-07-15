@@ -1262,8 +1262,8 @@ func (m Model) listPageSize() int {
 	if m.tab == tabSignatures && m.sigMode != "" {
 		chrome++
 	}
-	if m.tab == tabAgents {
-		chrome++ // the Agents tab renders a column header row
+	if m.tab == tabAgents || m.tab == tabEscalations || m.tab == tabAudit || m.tab == tabSignatures {
+		chrome++ // these list tabs render a column header row
 	}
 	if m.prompt != nil {
 		chrome += 2
@@ -1441,6 +1441,7 @@ func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 	lines = m.detailField(lines, w, "Pane", a.PaneID)
 	lines = m.detailField(lines, w, "Type", a.AgentType)
 	lines = m.detailField(lines, w, "Status", a.Status)
+	lines = m.detailField(lines, w, "Task source", m.agentTaskSources(a))
 	if !a.At.IsZero() {
 		lines = m.detailField(lines, w, "Last transition", a.At.Format(time.RFC3339))
 	}
@@ -1454,6 +1455,37 @@ func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 	lines = m.detailField(lines, w, "Operator corrected", strconv.Itoa(s.Corrections))
 	lines = m.detailField(lines, w, "Age", formatAge(s.FirstSeen, m.renderNow()))
 	return lines
+}
+
+// agentTaskSources returns the configured task-source paths whose agent and
+// workspace selectors match a live agent. The selector rules mirror the
+// daemon's declaredTask resolver; multiple matching sources are shown because
+// the daemon may skip a completed/unreadable source in favor of another one.
+func (m Model) agentTaskSources(a domain.AgentTransition) string {
+	agentName := m.data.status.AgentName(a.AgentID)
+	workspaceName := ""
+	if ws, ok := m.data.status.Workspaces[a.WorkspaceID]; ok {
+		workspaceName = ws.Label
+	}
+	if workspaceName == "" {
+		workspaceName = a.WorkspaceID
+	}
+
+	var paths []string
+	for _, src := range m.data.cfg.TaskSources {
+		if src.Agent != "" && src.Agent != a.AgentID && src.Agent != a.AgentType &&
+			(agentName == "" || src.Agent != agentName) {
+			continue
+		}
+		if !domain.MatchWorkspace(src.Workspace, workspaceName) || src.Path == "" {
+			continue
+		}
+		paths = append(paths, src.Path)
+	}
+	if len(paths) == 0 {
+		return "N/A"
+	}
+	return strings.Join(paths, ", ")
 }
 
 // locationLabel renders `#<number> "<label>" (<id>)` for a workspace/tab,
@@ -1472,8 +1504,11 @@ func locationLabel(id string, lookup func() (label string, number int, ok bool))
 	return id
 }
 
-// agentLocation returns the compact "#<workspace>-<tab>" display string for an agent,
-// or "-" if workspace/tab metadata cannot be resolved.
+// agentLocation returns the compact "#<workspace>-<tab-name>" display string
+// for an agent, or "-" if workspace/tab metadata cannot be resolved. Herdr's
+// tab Number is its position in the global tab list, while Label is the name
+// shown to the operator (commonly "1", "2", "3", ...), so the label is the
+// useful locator here. Legacy/unnamed tabs fall back to Number.
 func agentLocation(a domain.AgentTransition, status frontend.Status) string {
 	if a.WorkspaceID == "" || a.TabID == "" {
 		return "-"
@@ -1487,7 +1522,11 @@ func agentLocation(a domain.AgentTransition, status frontend.Status) string {
 	if !wsOk || !tabOk || (tab.WorkspaceID != "" && tab.WorkspaceID != a.WorkspaceID) {
 		return "-"
 	}
-	return fmt.Sprintf("#%d-%d", ws.Number, tab.Number)
+	tabName := tab.Label
+	if tabName == "" {
+		tabName = strconv.Itoa(tab.Number)
+	}
+	return fmt.Sprintf("#%d-%s", ws.Number, tabName)
 }
 
 type auditDetailOptions struct {
@@ -2028,7 +2067,7 @@ func (m Model) renderSignatures(b *strings.Builder) {
 	}
 	gradN := m.data.cfg.Learning.GraduationN
 	// The signature column sizes to the widest visible id so the full id
-	// renders untruncated (CR-032); the fixed columns after it are ~48
+	// renders untruncated (CR-032); the fixed columns after it are 49
 	// cells, so the action budget shifts right with the column.
 	sigW := 18
 	for _, r := range sigs {
@@ -2036,13 +2075,18 @@ func (m Model) renderSignatures(b *strings.Builder) {
 			sigW = n
 		}
 	}
-	actWidth, _ := m.budget(sigW+48, false)
+	const rulesRowFmt = "%-*s %-9s %-10s %-11s %7s %5s  %s"
+	actWidth, _ := m.budget(sigW+49, false)
+	header := fmt.Sprintf(rulesRowFmt, sigW,
+		"SIGNATURE", "SITUATION", "AGENT", "MODE", "CONFIRM", "CONF", "TOP ACTION")
+	fmt.Fprintln(b, st.section.Render(header))
 	start, end := m.window(len(sigs))
 	for i := start; i < end; i++ {
 		r := sigs[i]
-		line := fmt.Sprintf("%-*s %-9s %-10s %-11s %d/%d conf=%.2f  %s",
+		line := fmt.Sprintf(rulesRowFmt,
 			sigW, r.Signature, r.SituationType, orDash(r.AgentType), r.Mode,
-			r.ConsecutiveConfirmations, gradN, r.CachedConfidence,
+			fmt.Sprintf("%d/%d", r.ConsecutiveConfirmations, gradN),
+			fmt.Sprintf("%.2f", r.CachedConfidence),
 			oneLine(r.TopAction, actWidth))
 		switch {
 		case i == m.cursor:
@@ -2103,7 +2147,7 @@ func (m Model) renderAgents(b *strings.Builder) {
 		name := orDash(m.data.status.AgentName(a.AgentID))
 		s := m.data.status.StatsFor(a.AgentID)
 		line := fmt.Sprintf(agentsRowFmt,
-			name, agentLocation(a, m.data.status), a.AgentType, a.Status,
+			name, oneLine(agentLocation(a, m.data.status), 12), a.AgentType, a.Status,
 			strconv.Itoa(s.AutoSends), strconv.Itoa(s.Escalations),
 			strconv.Itoa(s.Confirmed), strconv.Itoa(s.Corrections),
 			formatAge(s.FirstSeen, now))
@@ -2180,10 +2224,16 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		}
 		return
 	}
-	// Prefix: "<mark> #%-5d %-8s %-10s %-8s agent=%-14s llm=%-4s rule=%-6s "
-	// → 80 cells. llm is the consulting LLM's self-reported 0-100 ("-" when the
-	// escalation carries no LLM score, e.g. shadow-mode or a safety veto).
-	const escPrefix = 80
+	// The final details column shares the remaining width between rationale
+	// and suggestion. LLM is the consulting model's self-reported 0-100 ("-"
+	// when the escalation carries no score, e.g. shadow mode or a safety veto).
+	const (
+		escRowFmt = "%-1s %-6s %-8s %-10s %-8s %-14s %4s %-6s  %s"
+		escPrefix = 66
+	)
+	header := fmt.Sprintf(escRowFmt,
+		"", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "RATIONALE / SUGGESTION")
+	fmt.Fprintln(b, m.styles().section.Render(header))
 	start, end := m.window(len(esc))
 	for i := start; i < end; i++ {
 		e := esc[i]
@@ -2196,8 +2246,8 @@ func (m Model) renderEscalations(b *strings.Builder) {
 			mark = "✓"
 		}
 		rWidth, sWidth := m.budget(escPrefix, e.Suggestion != "")
-		line := fmt.Sprintf("%s #%-5d %-8s %-10s %-8s agent=%-14s llm=%-4s rule=%-6s %s",
-			mark, e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType,
+		line := fmt.Sprintf(escRowFmt,
+			mark, fmt.Sprintf("#%d", e.ID), e.CreatedAt.Format("15:04:05"), e.SituationType,
 			oneLine(orDash(m.agentTypeFor(e)), 8), agent,
 			llmConfShort(e.LLMConfidence), m.ruleMarker(e.Signature),
 			oneLine(e.Rationale, rWidth))
@@ -2222,16 +2272,25 @@ func (m Model) renderAudit(b *strings.Builder) {
 		}
 		return
 	}
-	// Prefix up to the action column is ~53 fixed cells + "rule=%-6s " (12) +
-	// "llm=%-4s " (9). conf is the computed 0-1 agreement; llm is the
-	// consulting LLM's self-reported 0-100 ("-" when the row has no LLM score).
-	actWidth, _ := m.budget(74, false)
+	// The final Action column takes the remaining width after these fixed
+	// columns. Conf is the computed 0-1 agreement; LLM is the consulting
+	// model's self-reported 0-100 ("-" when the row has no LLM score).
+	const auditRowFmt = "%-6s %-14s %-14s %-9s %-10s %5s %4s %-6s  %s"
+	actWidth, _ := m.budget(77, false)
+	header := fmt.Sprintf(auditRowFmt,
+		"ID", "WHEN", "AGENT", "STATUS", "SITUATION", "CONF", "LLM", "RULE", "ACTION")
+	fmt.Fprintln(b, m.styles().section.Render(header))
 	start, end := m.window(len(rows))
 	for i := start; i < end; i++ {
 		r := rows[i]
-		line := fmt.Sprintf("#%-5d %-14s %-9s %-10s conf=%.2f llm=%-4s rule=%-6s %s",
-			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
-			r.Confidence, llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature),
+		agent := m.data.status.AgentName(r.AgentID)
+		if agent == "" {
+			agent = r.AgentID
+		}
+		line := fmt.Sprintf(auditRowFmt,
+			fmt.Sprintf("#%d", r.ID), r.CreatedAt.Format("01-02 15:04:05"),
+			oneLine(orDash(agent), 14), r.Status, r.SituationType,
+			fmt.Sprintf("%.2f", r.Confidence), llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature),
 			oneLine(r.Action, actWidth))
 		if i == m.cursor {
 			line = m.styles().selected.Render(line)

@@ -150,6 +150,10 @@ type DaemonStore interface {
 	MarkCorrectionProcessed(ctx context.Context, id int64) error
 	// MarkLLMRetryProcessed marks a queued LLM-retry request consumed.
 	MarkLLMRetryProcessed(ctx context.Context, id int64) error
+	// RetireEscalationForRetry atomically moves the source escalation from
+	// "escalated" to "retried" once a retry passes the daemon's guards.
+	// False means another action already retired or resolved the escalation.
+	RetireEscalationForRetry(ctx context.Context, auditID int64) (bool, error)
 	// EnsureAgentName returns the agent's short name, generating one on
 	// first sight (insert-if-absent only; renames stay operator-owned).
 	EnsureAgentName(ctx context.Context, agentID string) (string, error)

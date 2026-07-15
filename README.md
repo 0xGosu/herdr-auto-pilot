@@ -299,7 +299,7 @@ error = 0.75
 inferred_task_bar = 0.60   # higher bar for tasks inferred from pane history
 
 [learning]
-graduation_n = 5           # consecutive confirmations to graduate
+graduation_n = 2           # consecutive confirmations to graduate (1-10)
 
 [limits]
 max_consecutive_auto_prompts = 10  # per agent, without human interaction

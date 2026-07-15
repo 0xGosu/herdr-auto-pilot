@@ -1112,7 +1112,12 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 		case "confidence_thresholds.inferred_task_bar":
 			return setFloat(&cfg.ConfidenceThresholds.InferredTaskBar)
 		case "learning.graduation_n":
-			return setInt(&cfg.Learning.GraduationN)
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 1 || v > 10 {
+				return fmt.Errorf("learning.graduation_n must be an integer between 1 and 10, got %q", value)
+			}
+			cfg.Learning.GraduationN = v
+			return nil
 		case "embedding.pane_salient_chars":
 			return setInt(&cfg.Embedding.PaneSalientChars)
 		case "limits.max_consecutive_auto_prompts":

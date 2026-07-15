@@ -284,7 +284,7 @@ func TestSignaturesList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"approval:aaaa111…", "choice:cccc3333", "shadow", "autonomous", "3/5", "top=\"1\"", "2 signature(s)"} {
+	for _, want := range []string{"approval:aaaa111…", "choice:cccc3333", "shadow", "autonomous", "3/2", "top=\"1\"", "2 signature(s)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("list output missing %q:\n%s", want, out)
 		}
@@ -324,7 +324,7 @@ func TestSignaturesShow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"approval:aaaa1111bbbb2222", "streak: 3/5", "top action:  \"1\" over 2 decision(s)",
+	for _, want := range []string{"approval:aaaa1111bbbb2222", "streak: 3/2", "top action:  \"1\" over 2 decision(s)",
 		"original situation:", "terraform apply", "recent decisions", "last audit", "shadow mode"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("show output missing %q:\n%s", want, out)
@@ -488,7 +488,7 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, `rule=[shadow — 3/5 confirmations, confidence 0.75, top action "1" over 2 decision(s)]`) {
+	if !strings.Contains(out, `rule=[shadow — 3/2 confirmations, confidence 0.75, top action "1" over 2 decision(s)]`) {
 		t.Errorf("escalations should name the matched rule, got:\n%s", out)
 	}
 

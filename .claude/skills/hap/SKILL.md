@@ -130,6 +130,16 @@ hap resolve <id> --action "yes, proceed" --send
 - use `--action @noop` to record that no reply was needed (nothing is ever sent)
 - `hap correct` is an alias for `hap resolve`
 
+**once a situation graduates to autonomous, let the daemon answer it — don't
+also drive the pane by hand.** confirming (`--send`) an approval a few times is
+how a shadow signature earns its way to autonomous; after it graduates the
+daemon auto-answers matching prompts itself, delivering the numbered-menu digit.
+if you *also* type the menu digit into the pane you race the daemon: both
+keystrokes land, one picks the menu and the extra digit lands in the input box
+as stray text. respond through `hap` (`confirm` / `resolve` / `dismiss`), not by
+typing into the agent pane, and once a rule is autonomous leave its approvals to
+the daemon.
+
 dismiss pending escalations without responding (audit rows kept, nothing sent or learned):
 
 ```bash
@@ -294,7 +304,7 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `confidence_thresholds.choice` | 0.70 | confidence threshold for choices |
 | `confidence_thresholds.error` | 0.75 | confidence threshold for error situations |
 | `confidence_thresholds.inferred_task_bar` | 0.60 | higher bar for tasks inferred from pane history |
-| `learning.graduation_n` | 5 | consecutive confirmations needed to graduate |
+| `learning.graduation_n` | 2 | consecutive confirmations needed to graduate (1-10) |
 | `limits.max_consecutive_auto_prompts` | 10 | max consecutive auto-prompts per agent without human interaction |
 | `limits.max_auto_prompts_per_minute` | 5 | rate limit per agent (rolling 1-minute window) |
 | `limits.max_error_retries` | 2 | max retries per error signature |

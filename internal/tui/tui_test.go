@@ -97,7 +97,9 @@ func press(t *testing.T, m Model, keys ...string) Model {
 }
 
 func TestDetailViewAgents(t *testing.T) {
-	m := press(t, testModel(t), "v")
+	m := testModel(t)
+	m.data.cfg.TaskSources = []config.TaskSource{{Agent: "brave-otter", Path: "/work/tasks.md"}}
+	m = press(t, m, "v")
 	if m.detail == nil {
 		t.Fatal("v on Agents tab should open the detail view")
 	}
@@ -105,10 +107,20 @@ func TestDetailViewAgents(t *testing.T) {
 	// Location shows workspace/tab number+label with ids, plus the pane.
 	for _, want := range []string{"Agent w6:p1", "brave-otter",
 		`#6 "v013-check" (w6)`, `#1 "1" (w6:t1)`, "Pane", "w6:p1",
-		"blocked", "2026-07-09T10:00:00Z"} {
+		"blocked", "Task source", "/work/tasks.md", "2026-07-09T10:00:00Z"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("agent detail view missing %q:\n%s", want, view)
 		}
+	}
+}
+
+func TestDetailViewAgentWithoutMatchingTaskSourceShowsNA(t *testing.T) {
+	m := testModel(t)
+	m.data.cfg.TaskSources = []config.TaskSource{{Agent: "somebody-else", Path: "/work/tasks.md"}}
+	m = press(t, m, "v")
+	view := m.View()
+	if !strings.Contains(view, "Task source") || !strings.Contains(view, "N/A") {
+		t.Errorf("agent detail should show N/A without a matching task source:\n%s", view)
 	}
 }
 
@@ -496,7 +508,8 @@ func TestSignaturesTabRendersRows(t *testing.T) {
 	m.tab = tabSignatures
 	view := m.View()
 	// CR-032: the Rules list renders the FULL signature id, not shortSig.
-	for _, want := range []string{"choice:ffff0000eeee1111", "approval:1234abcd5678efab", "autonomous", "shadow", "5/5", "3/5", "conf=0.93"} {
+	for _, want := range []string{"SIGNATURE", "SITUATION", "AGENT", "MODE", "CONFIRM", "CONF", "TOP ACTION",
+		"choice:ffff0000eeee1111", "approval:1234abcd5678efab", "autonomous", "shadow", "5/5", "3/5", "0.93"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("signatures tab missing %q:\n%s", want, view)
 		}
@@ -1006,7 +1019,7 @@ func TestEscalationShowsMatchedRule(t *testing.T) {
 	m.tab = tabEscalations
 
 	list := m.View()
-	if !strings.Contains(list, "rule=shadow") {
+	if !strings.Contains(list, "RULE") || !strings.Contains(list, "shadow") {
 		t.Errorf("escalation list should mark the matched rule mode:\n%s", list)
 	}
 
@@ -1039,10 +1052,18 @@ func TestEscalationWithoutRuleShowsNoneYet(t *testing.T) {
 	if !strings.Contains(view, "none yet — learned when the operator confirms or resolves this") {
 		t.Errorf("unmatched signature should render the none-yet hint:\n%s", view)
 	}
-	// And its list row shows the dash marker.
+	// And its list row shows the dash marker in the RULE column.
 	m2 := testModel(t)
 	m2.tab = tabAudit
-	if list := m2.View(); !strings.Contains(list, "rule=-") {
+	list := m2.View()
+	var fields []string
+	for _, line := range strings.Split(list, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#7") {
+			fields = strings.Fields(line)
+			break
+		}
+	}
+	if !strings.Contains(list, "RULE") || len(fields) < 9 || fields[8] != "-" {
 		t.Errorf("audit list should dash-mark rows without a rule:\n%s", list)
 	}
 }
@@ -1456,13 +1477,22 @@ func TestAgentLocation(t *testing.T) {
 		want string
 	}{
 		{
-			name: "happy path: workspace and tab present",
+			name: "uses tab label instead of global tab number",
 			a:    domain.AgentTransition{WorkspaceID: "w2", TabID: "w2:t3"},
 			st: frontend.Status{
 				Workspaces: map[string]domain.WorkspaceInfo{"w2": {Number: 2}},
-				Tabs:       map[string]domain.TabInfo{"w2:t3": {Number: 3}},
+				Tabs:       map[string]domain.TabInfo{"w2:t3": {Label: "3", Number: 7}},
 			},
 			want: "#2-3",
+		},
+		{
+			name: "falls back to tab number without label",
+			a:    domain.AgentTransition{WorkspaceID: "w2", TabID: "w2:t3"},
+			st: frontend.Status{
+				Workspaces: map[string]domain.WorkspaceInfo{"w2": {Number: 2}},
+				Tabs:       map[string]domain.TabInfo{"w2:t3": {Number: 7}},
+			},
+			want: "#2-7",
 		},
 		{
 			name: "empty WorkspaceID",

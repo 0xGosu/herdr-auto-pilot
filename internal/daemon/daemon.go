@@ -600,7 +600,8 @@ func (d *Daemon) cancelCapture(paneID string) {
 // captureEntry is one pane's pending delayed capture; the pointer identity
 // doubles as the generation token that closes the Timer.Stop race.
 type captureEntry struct {
-	timer *time.Timer
+	timer        *time.Timer
+	retryAuditID int64
 }
 
 // scheduleCapture (re)arms the pane's capture timer: a newer event cancels
@@ -611,11 +612,17 @@ func (d *Daemon) scheduleCapture(ctx context.Context, tr domain.AgentTransition)
 	d.mu.Lock()
 	if p := d.pendingCapture[tr.PaneID]; p != nil {
 		p.timer.Stop()
+		// A regular attention event may arrive while an operator-requested
+		// retry is settling. Coalescing must not erase the retry intent, or
+		// the resulting high-confidence decision could be auto-promoted.
+		if tr.RetryAuditID == 0 {
+			tr.RetryAuditID = p.retryAuditID
+		}
 	}
 	// The start delay applies until the pane's FIRST capture actually
 	// fires — a burst of events during startup keeps the longer settle.
 	delay := cfg.CaptureDelay(tr.AgentType, !d.captureStarted[tr.PaneID])
-	entry := &captureEntry{}
+	entry := &captureEntry{retryAuditID: tr.RetryAuditID}
 	entry.timer = time.AfterFunc(delay, func() {
 		d.mu.Lock()
 		current := d.pendingCapture[tr.PaneID] == entry
@@ -783,6 +790,7 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 	situation.PaneID = tr.PaneID
 	situation.TabID = tr.TabID
 	situation.WorkspaceID = tr.WorkspaceID
+	situation.RetryAuditID = tr.RetryAuditID
 	// Keep herdr's reported agent_status with the situation: downstream
 	// sites (the async LLM path) must render the REAL status in triggers,
 	// never a fabricated one.
@@ -1345,6 +1353,7 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 		RequestID: fmt.Sprintf("req-%s-%d", s.AgentID, now.UnixNano()),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now, First: first,
+		RetryAuditID: s.RetryAuditID,
 	}
 	go func() {
 		outcome := llmOutcome{situation: s, sig: sig, request: req}
@@ -1421,6 +1430,7 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
 		TaskReview: true, ProposedTask: proposed,
 		SourcePath: declared.Path, ReviewedTask: declared.Task,
+		RetryAuditID: s.RetryAuditID,
 	}
 	// Stage the pending row synchronously (context filled off-loop below) so a
 	// second idle event cannot race past the guard before the goroutine
@@ -2055,6 +2065,17 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				why += "; " + conf
 			}
 		}
+		// A retry result is itself the thing the operator asked to inspect, so
+		// preserve the model's fresh rationale even for ordinary pane consults.
+		// Task reviews append it in the richer block below.
+		if res.request.RetryAuditID != 0 && !res.request.TaskReview {
+			if r := strings.TrimSpace(llmDec.Rationale); r != "" {
+				if why != "" {
+					why += "; "
+				}
+				why += "LLM: " + r
+			}
+		}
 		// A task review's suggestion is the LLM's EXACT recommendation (the
 		// possibly-rewritten task, or "[no reply]" when it declined). Ride the
 		// LLM's reasoning and the ORIGINAL queued task on the rationale so the
@@ -2173,6 +2194,15 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			reject(domain.ReasonUnfamiliarOptions, "LLM option not offered")
 			return
 		}
+	}
+	// A retry is an explicit request for another LLM opinion, not permission
+	// to auto-act. Once all safety and option-validity checks pass, surface
+	// that opinion as a fresh escalation regardless of confidence. This also
+	// turns a high-confidence @noop into a reviewable "[no reply]" suggestion.
+	if res.request.RetryAuditID != 0 {
+		reject(domain.ReasonLLMRetry,
+			fmt.Sprintf("operator-requested retry of audit #%d", res.request.RetryAuditID))
+		return
 	}
 	// Confidence gate: auto-act only when the LLM's self-reported confidence
 	// meets the operator's threshold. A missing score (-1) is below any
@@ -2395,8 +2425,8 @@ func (d *Daemon) processCorrections(ctx context.Context) {
 // processLLMRetries drains operator-queued LLM-retry requests: for each, it
 // re-drives a fresh consult on the escalation's agent by re-injecting an
 // attention transition for the agent's LIVE pane (the normal
-// read→classify→decide→consult pipeline). Every request is marked processed —
-// a retry is best-effort; the operator re-queues if it doesn't take.
+// read→classify→decide→consult pipeline). Terminal outcomes are marked
+// processed; transient store/Herdr failures stay queued for the next sweep.
 func (d *Daemon) processLLMRetries(ctx context.Context) {
 	retries, err := d.opt.Store.UnprocessedLLMRetries(ctx)
 	if err != nil {
@@ -2404,7 +2434,9 @@ func (d *Daemon) processLLMRetries(ctx context.Context) {
 		return
 	}
 	for _, r := range retries {
-		d.applyLLMRetry(ctx, r)
+		if !d.applyLLMRetry(ctx, r) {
+			continue
+		}
 		if err := d.opt.Store.MarkLLMRetryProcessed(ctx, r.ID); err != nil {
 			// A duplicate on the next sweep only re-injects a coalesced
 			// capture and re-hits the pending-consult guard — harmless, so
@@ -2416,16 +2448,18 @@ func (d *Daemon) processLLMRetries(ctx context.Context) {
 
 // applyLLMRetry re-injects one retry request. It resolves the escalation's
 // agent to its live pane and schedules an attention capture, guarding against
-// stacking a retry onto a consult that is still running.
-func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) {
+// stacking a retry onto a consult that is still running. The return value says
+// whether the queue item reached a terminal outcome and may be marked
+// processed; false preserves transient failures for the next sweep.
+func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) bool {
 	audit, err := d.opt.Store.GetAudit(ctx, r.AuditID)
 	if err != nil {
 		slog.Error("llm retry: reading audit failed", "retry", r.ID, "audit", r.AuditID, "error", err)
-		return
+		return false
 	}
 	if audit == nil || audit.AgentID == "" {
 		slog.Warn("llm retry: audit missing or has no agent", "retry", r.ID, "audit", r.AuditID)
-		return
+		return true
 	}
 	agentID := audit.AgentID
 
@@ -2434,10 +2468,10 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) {
 	// resolves; expireStaleLLMWork clears an abandoned one after 2×timeout.
 	if pending, err := d.opt.Store.HasPendingLLMConsult(ctx, agentID); err != nil {
 		slog.Error("llm retry: pending-consult check failed", "agent", agentID, "error", err)
-		return
+		return false
 	} else if pending {
 		slog.Info("llm retry skipped: consult already in flight", "agent", agentID)
-		return
+		return true
 	}
 
 	// Resolve the agent to its current pane AND its live herdr state — retry
@@ -2448,7 +2482,7 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) {
 	agents, err := d.opt.Herdr.ListAgents(ctx)
 	if err != nil {
 		slog.Error("llm retry: listing agents failed", "agent", agentID, "error", err)
-		return
+		return false
 	}
 	var live domain.AgentTransition
 	var found bool
@@ -2466,8 +2500,28 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) {
 		}
 		d.notify(ctx, "Herd Auto Prompter: retry skipped",
 			fmt.Sprintf("Agent %s is no longer present — cannot re-invoke the LLM.", label))
-		return
+		return true
 	}
+
+	// The retry is now accepted: its consult is not competing with an
+	// in-flight one and its agent still has a live pane. Retire the source
+	// escalation before scheduling the recapture. This removes the stale
+	// failure from the pending list and prevents duplicatePendingEscalation
+	// from mistaking the explicitly requested retry for a duplicate of itself.
+	// A retry failure writes a fresh retryable escalation; a successful LLM
+	// result writes a fresh llm_retry escalation for operator review.
+	retired, err := d.opt.Store.RetireEscalationForRetry(ctx, r.AuditID)
+	if err != nil {
+		slog.Error("llm retry: retiring source escalation failed",
+			"retry", r.ID, "audit", r.AuditID, "agent", agentID, "error", err)
+		return false
+	}
+	if !retired {
+		slog.Info("llm retry skipped: source escalation no longer pending",
+			"retry", r.ID, "audit", r.AuditID, "agent", agentID)
+		return true
+	}
+	live.RetryAuditID = r.AuditID
 
 	// Re-drive the attention pipeline with the live transition. scheduleCapture
 	// fires unconditionally (it re-enters via delayedTr → handleAttention, not
@@ -2481,8 +2535,11 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) {
 	// path (and if the agent has since started working, it is no longer idle and
 	// no stale suggestion is regenerated). scheduleCapture coalesces per pane, so
 	// rapid double-retries collapse into one capture.
-	slog.Info("llm retry: re-driving consult", "agent", agentID, "pane", live.PaneID, "status", live.Status)
+	slog.Info("llm retry: source escalation retired; re-driving consult",
+		"retry", r.ID, "audit", r.AuditID, "agent", agentID,
+		"pane", live.PaneID, "status", live.Status)
 	d.scheduleCapture(ctx, live)
+	return true
 }
 
 // applyCorrection re-derives the affected signature's learning state from one

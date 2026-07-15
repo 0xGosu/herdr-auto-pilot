@@ -243,6 +243,87 @@ func TestDeclaredTaskLLMReviewConfidentDeclineSkips(t *testing.T) {
 	}
 }
 
+func TestRetryDeclaredTaskReviewConfidentNoopEscalates(t *testing.T) {
+	// Retrying a failed task review asks for a fresh opinion, not an automatic
+	// decision. A high-confidence @noop must therefore become a new escalation
+	// with a human-readable no-reply suggestion.
+	taskFile := writeReviewTaskFile(t, "- [ ] update the changelog\n")
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-retry-noop\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.llm.configured = true
+
+	var mu sync.Mutex
+	consults := 0
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		mu.Lock()
+		consults++
+		n := consults
+		mu.Unlock()
+		if n == 1 {
+			return nil, errors.New("llm timeout after 5s without submit_decision")
+		}
+		id, err := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "@noop", Rationale: "the task is already done", ConfidentScore: 99,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "@noop",
+			Rationale: "the task is already done", ConfidentScore: 99, Status: "pending"}, nil
+	}
+
+	ctx := context.Background()
+	h.push("agent-retry-noop", "idle")
+	var original domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		pending, _ := h.raw.PendingEscalations(ctx)
+		if len(pending) != 1 {
+			return false
+		}
+		original = pending[0]
+		return domain.IsRetryableLLMEscalation(&original)
+	})
+
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: "agent-retry-noop", AgentType: "claude",
+		PaneID: "agent-retry-noop", Status: "idle",
+	}})
+	if _, err := h.raw.InsertLLMRetry(ctx, original.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	h.daemon.processLLMRetries(ctx)
+
+	var fresh domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		pending, _ := h.raw.PendingEscalations(ctx)
+		for _, row := range pending {
+			if row.AgentID == "agent-retry-noop" && row.ID != original.ID {
+				fresh = row
+				return true
+			}
+		}
+		return false
+	})
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Fatalf("retry noop must not send input, got %q", got)
+	}
+	if fresh.Suggestion != "LLM suggested: "+domain.ActionNoopSuggestion {
+		t.Errorf("retry noop suggestion = %q, want a no-reply suggestion", fresh.Suggestion)
+	}
+	if !strings.Contains(fresh.Rationale, "["+string(domain.ReasonLLMRetry)+"]") ||
+		!strings.Contains(fresh.Rationale, "the task is already done") {
+		t.Errorf("retry noop rationale should contain retry provenance and LLM reasoning, got %q", fresh.Rationale)
+	}
+	if retired, _ := h.raw.GetAudit(ctx, original.ID); retired == nil || retired.Status != "retried" {
+		t.Errorf("retry must retire its source escalation, got %+v", retired)
+	}
+}
+
 func TestDeclaredTaskLLMReviewDeclineDoesNotReconsult(t *testing.T) {
 	// Once a decline is escalated, a repeat idle event for the same situation
 	// is ignored — it must not spend another LLM review while the operator's

@@ -471,6 +471,10 @@ func TestTaskGenFailureIsRetryable(t *testing.T) {
 	if IsRetryableLLMEscalation(notRetryable) {
 		t.Errorf("no_task_source escalation must not be retryable")
 	}
+	retryResult := &AuditRecord{Status: "escalated", Rationale: "[llm_retry] fresh opinion"}
+	if IsRetryableLLMEscalation(retryResult) {
+		t.Errorf("a successful retry result must not recursively offer LLM retry")
+	}
 }
 
 func TestUnfamiliarOptionsConsultLLMWhenConfigured(t *testing.T) {

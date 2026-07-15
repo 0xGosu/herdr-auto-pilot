@@ -29,6 +29,9 @@ type AgentTransition struct {
 	WorkspaceID string
 	Status      string // idle | working | blocked | done | unknown | detected
 	At          time.Time
+	// RetryAuditID marks a daemon-injected transition that re-evaluates a
+	// retired LLM-failure escalation. Transient: Herdr events leave it zero.
+	RetryAuditID int64
 }
 
 // WorkspaceInfo is display metadata for one Herdr workspace.
@@ -71,6 +74,9 @@ type Situation struct {
 	ErrorSummary   string   // salient error text (error situations)
 	TabCount       int      // multi-tab MCQ form: number of tabs incl. Submit (0/1 = single question)
 	TabMultiSelect []bool   // per-tab: true where a question is multi-select (toggle several, then advance); len==TabCount, Submit tab false. Set during the sweep; nil on the non-swept path.
+	// RetryAuditID carries an operator-requested LLM retry through delayed
+	// capture and async consult handling. Zero means the normal auto-act policy.
+	RetryAuditID int64
 }
 
 // ActionKind is what the plugin decided to do.
@@ -129,6 +135,10 @@ const (
 	// produced no usable task. The failure rationale is surfaced and the
 	// escalation is retryable (like a failed consult).
 	ReasonTaskGenFailed EscalateReason = "task_gen_failed"
+	// ReasonLLMRetry is a successful operator-requested retry result. Retry
+	// results always return to the operator as fresh escalations regardless of
+	// confidence; they never auto-act.
+	ReasonLLMRetry EscalateReason = "llm_retry"
 )
 
 // Decision is the outcome of the pure decision core for one situation.
@@ -239,7 +249,7 @@ type AuditRecord struct {
 	Rationale       string
 	LLMOutput       string
 	CorrectsAuditID int64
-	Status          string // "auto" | "escalated" | "resolved" | "dismissed"
+	Status          string // "auto" | "escalated" | "resolved" | "dismissed" | "retried"
 	Suggestion      string
 	// PaneExcerpt is the pane content THIS record was classified from
 	// (per-entry, unlike the signature's first-seen provenance snapshot);
@@ -354,6 +364,10 @@ type LLMRequest struct {
 	// changed since review (checked off / edited). Transient.
 	SourcePath   string
 	ReviewedTask string
+	// RetryAuditID identifies the retired escalation whose operator-requested
+	// retry produced this consult. Transient and intentionally not persisted;
+	// a non-zero value forces the successful result into a fresh escalation.
+	RetryAuditID int64
 }
 
 // LLMRetry is a front-end-written request to re-invoke the LLM on an

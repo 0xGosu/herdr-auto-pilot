@@ -294,7 +294,7 @@ func Default() Config {
 			Error:           0.75,
 			InferredTaskBar: 0.60,
 		},
-		Learning: Learning{GraduationN: 5},
+		Learning: Learning{GraduationN: 2},
 		Limits: Limits{
 			MaxConsecutiveAutoPrompts: 10,
 			MaxAutoPromptsPerMinute:   5,
