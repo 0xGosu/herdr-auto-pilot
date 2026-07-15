@@ -571,6 +571,9 @@ func ruleIndex(ctx context.Context, app *frontend.App) (map[string]frontend.Sign
 }
 
 func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) > 0 && args[0] == "reclassify-codex-mcq" {
+		return auditReclassifyCodexMCQ(ctx, app, out, args[1:])
+	}
 	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
 	limit := fs.Int("limit", 30, "number of records")
 	fs.SetOutput(out)
@@ -590,6 +593,48 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%.2f\tllm=%s\trule=%s\t%s\n",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
 			r.Action, r.Confidence, llmConfCLI(r.LLMConfidence), rule, r.Rationale)
+	}
+	return nil
+}
+
+func auditReclassifyCodexMCQ(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	fs := flag.NewFlagSet("audit reclassify-codex-mcq", flag.ContinueOnError)
+	id := fs.Int64("id", 0, "restrict to one audit row")
+	apply := fs.Bool("apply", false, "apply the previewed historical repair")
+	fs.SetOutput(out)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *id < 0 {
+		return fmt.Errorf("usage: audit reclassify-codex-mcq [--id N] [--apply]")
+	}
+	rows, err := app.ReclassifyCodexMCQAudits(ctx, *id, *apply)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(out, "no unclassifiable Codex MCQ audit rows found")
+		return nil
+	}
+	changed := 0
+	for _, row := range rows {
+		state := "would reclassify"
+		if *apply {
+			if row.Applied {
+				state = "reclassified"
+				changed++
+			} else {
+				state = "skipped (changed since preview)"
+			}
+		}
+		fmt.Fprintf(out, "#%d\t%s\t%s -> choice\t%s -> %s\tquestions=%d\tvisible-options=%d\n",
+			row.ID, state, domain.SituationUnclassifiable, row.OldSignature,
+			row.NewSignature, row.QuestionCount, row.VisibleOptions)
+	}
+	if *apply {
+		fmt.Fprintf(out, "reclassified %d of %d eligible audit row(s); status and operator fields preserved\n", changed, len(rows))
+	} else {
+		fmt.Fprintln(out, "dry run only; rerun with --apply to write these historical corrections")
 	}
 	return nil
 }

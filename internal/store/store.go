@@ -1069,6 +1069,56 @@ func (s *Store) AuditLog(ctx context.Context, limit int) ([]domain.AuditRecord, 
 	return s.scanAudits(rows)
 }
 
+// CodexMCQAuditCandidates returns the narrow set eligible for the optional
+// historical repair. The front-end still parses pane_excerpt structurally;
+// SQL filtering alone never decides that a row is an MCQ.
+func (s *Store) CodexMCQAuditCandidates(ctx context.Context, auditID int64) ([]domain.AuditRecord, error) {
+	query := `SELECT ` + auditCols + ` FROM audit_log
+		WHERE lower(agent_type) = 'codex' AND situation_type = 'unclassifiable'`
+	var args []any
+	if auditID > 0 {
+		query += ` AND id = ?`
+		args = append(args, auditID)
+	}
+	query += ` ORDER BY id ASC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return s.scanAudits(rows)
+}
+
+// ReclassifyCodexMCQAudit applies a previewed repair with optimistic guards.
+// It changes classification metadata only and records first-seen provenance
+// for the new signature in the same transaction.
+func (s *Store) ReclassifyCodexMCQAudit(ctx context.Context, auditID int64, oldSignature,
+	newSignature, paneExcerpt, rationale string, snapshotAt time.Time) (bool, error) {
+	var changed bool
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE audit_log
+			SET situation_type = 'choice', signature = ?, rationale = ?
+			WHERE id = ? AND lower(agent_type) = 'codex'
+			  AND situation_type = 'unclassifiable' AND signature = ? AND pane_excerpt = ?`,
+			newSignature, rationale, auditID, oldSignature, paneExcerpt)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		changed = n == 1
+		if !changed || newSignature == "" || paneExcerpt == "" {
+			return nil
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO signature_snapshots (signature, pane_excerpt, created_at)
+			VALUES (?, ?, ?)`, newSignature, paneExcerpt, unix(snapshotAt))
+		return err
+	})
+	return changed, err
+}
+
 // GetAudit returns one audit record by id, or nil.
 func (s *Store) GetAudit(ctx context.Context, id int64) (*domain.AuditRecord, error) {
 	rows, err := s.db.QueryContext(ctx,

@@ -4,8 +4,9 @@
 // name rows, TOML) directly, then nudge the daemon's control socket to
 // reload; front-ends never write daemon-owned hot-path rows (agent_names
 // is insert-if-absent from both sides and not part of that partition).
-// One maintenance exception: ReembedStandalone rewrites the daemon-owned
-// signature_embeddings rows, and only when no daemon is running.
+// Explicit maintenance exceptions: ReembedStandalone rewrites daemon-owned
+// signature_embeddings rows only when no daemon is running, and the Codex MCQ
+// audit backfill performs narrowly guarded historical metadata repairs.
 package frontend
 
 import (
@@ -528,6 +529,72 @@ func (a *App) Escalations(ctx context.Context) ([]domain.AuditRecord, error) {
 // Audit lists recent audit records.
 func (a *App) Audit(ctx context.Context, limit int) ([]domain.AuditRecord, error) {
 	return a.Store.AuditLog(ctx, limit)
+}
+
+// CodexMCQAuditReclassification describes one historical audit repair. It is
+// returned for both previews and applied runs so the CLI can show exactly what
+// would change without duplicating classification logic.
+type CodexMCQAuditReclassification struct {
+	ID             int64
+	Status         string
+	OldSignature   string
+	NewSignature   string
+	QuestionCount  int
+	VisibleOptions int
+	Applied        bool
+}
+
+const codexMCQReclassificationRationale = "historical reclassification: Codex MCQ form"
+
+// ReclassifyCodexMCQAudits previews or applies the opt-in historical repair
+// for Codex MCQ rows written as unclassifiable before Codex form support. It
+// deliberately preserves status, action, suggestion, input, and lineage.
+func (a *App) ReclassifyCodexMCQAudits(ctx context.Context, auditID int64, apply bool) ([]CodexMCQAuditReclassification, error) {
+	recs, err := a.Store.CodexMCQAuditCandidates(ctx, auditID)
+	if err != nil {
+		return nil, err
+	}
+	var out []CodexMCQAuditReclassification
+	for _, rec := range recs {
+		form, ok := domain.CodexMCQForm(rec.PaneExcerpt)
+		if !ok {
+			continue
+		}
+		options := domain.OptionLabels(rec.PaneExcerpt)
+		sig := domain.ComputeSignature(domain.Situation{
+			Type:        domain.SituationChoice,
+			AgentType:   rec.AgentType,
+			Content:     rec.PaneExcerpt,
+			Options:     options,
+			MCQKind:     form.Kind,
+			AnswerCount: form.AnswerCount,
+			TabCount:    form.AnswerCount,
+		})
+		if sig.Verdict != domain.GuardOK || sig.Signature == "" {
+			continue
+		}
+		item := CodexMCQAuditReclassification{
+			ID: rec.ID, Status: rec.Status, OldSignature: rec.Signature,
+			NewSignature: sig.Signature, QuestionCount: form.AnswerCount,
+			VisibleOptions: len(options),
+		}
+		if apply {
+			rationale := codexMCQReclassificationRationale
+			if strings.TrimSpace(rec.Rationale) != "" {
+				rationale += "; " + rec.Rationale
+			}
+			item.Applied, err = a.Store.ReclassifyCodexMCQAudit(ctx, rec.ID,
+				rec.Signature, sig.Signature, rec.PaneExcerpt, rationale, rec.CreatedAt)
+			if err != nil {
+				return nil, fmt.Errorf("reclassifying audit #%d: %w", rec.ID, err)
+			}
+		}
+		out = append(out, item)
+	}
+	if auditID > 0 && len(out) == 0 {
+		return nil, fmt.Errorf("audit #%d is not an unclassifiable Codex MCQ row", auditID)
+	}
+	return out, nil
 }
 
 // KillHistory lists the pause/kill event history.

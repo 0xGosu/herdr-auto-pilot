@@ -798,6 +798,14 @@ Invariants:
   trigger, situation, action or escalation reason, confidence, rationale, and
   (for LLM decisions) captured output. `audit` / the *Audit* tab shows it;
   corrections keep their lineage to the original decision.
+- Historical Codex MCQ rows captured before Codex form support can be repaired
+  explicitly with `hap audit reclassify-codex-mcq`. The command is a dry run by
+  default; add `--id N` to target one row and `--apply` to write the displayed
+  `unclassifiable` → `choice` changes. Status, actions, suggestions, corrections,
+  and timestamps are preserved; only rows whose stored excerpt still parses as
+  a Codex MCQ are eligible. Because the audit stores the visible question at
+  capture time, this cannot reconstruct historical questions that were never
+  captured.
 - `clear-data --yes` resets all learned history and audit data (it never
   leaves your machine in the first place).
 
