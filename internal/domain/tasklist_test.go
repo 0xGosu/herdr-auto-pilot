@@ -51,6 +51,35 @@ func TestPendingDeclaredTasks(t *testing.T) {
 	}
 }
 
+func TestInProgressDeclaredTasks(t *testing.T) {
+	cases := []struct {
+		name, content string
+		want          []string
+	}{
+		{"one in-progress ahead of pending", "- [-] a\n- [ ] b\n- [ ] c", []string{"a"}},
+		{"none in-progress", "- [x] a\n- [ ] b", nil},
+		{"empty file", "", nil},
+		{"multiple in-progress preserve order", "- [-] first\n- [x] middle\n- [-] last", []string{"first", "last"}},
+		{"other checked markers are not in-progress", "- [x] a\n- [X] b\n- [+] c\n- [*] d", nil},
+		{"plain checkbox", "[-] bare one", []string{"bare one"}},
+		{"bullet glued to bracket does not match", "-[-] not a bullet item", nil},
+		{"marker glued to its text still matches", "- [-]glued text", []string{"glued text"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := InProgressDeclaredTasks(c.content)
+			if len(got) != len(c.want) {
+				t.Fatalf("InProgressDeclaredTasks(%q) = %v, want %v", c.content, got, c.want)
+			}
+			for i := range c.want {
+				if got[i] != c.want[i] {
+					t.Errorf("item %d = %q, want %q", i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestDeclaredTaskPrompt(t *testing.T) {
 	cases := []struct {
 		name string

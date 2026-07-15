@@ -459,7 +459,7 @@ both directories are recreated automatically — the daemon restarts on the next
 
 when no confident learned rule applies, the plugin can consult a local LLM. the model uses the plugin's MCP server (`hap mcp` — tools `get_context` and `submit_decision`). common CLI misconfigurations are auto-repaired at launch.
 
-`get_context` returns: classified situation (type, options, permission verb, error summary), a pane excerpt (last `pane_excerpt_chars` characters), the agent's herdr location (`workspace_id`, `tab_id`, `pane_id`, `agent_id`), the agent's hap-owned short name (`agent_name`), and the pane's working directory (`cwd`, `foreground_cwd`). Whenever the agent has a matching `[[task_sources]]` entry, it also carries `task_list_path`, `pending_task_count`, and (only when at least one task is pending) a truncated `next_pending_task` — on every consult, not just the pre-send task review below.
+`get_context` returns: classified situation (type, options, permission verb, error summary), a pane excerpt (last `pane_excerpt_chars` characters), the agent's herdr location (`workspace_id`, `tab_id`, `pane_id`, `agent_id`), the agent's hap-owned short name (`agent_name`), and the pane's working directory (`cwd`, `foreground_cwd`). Whenever the agent has a matching `[[task_sources]]` entry, it also carries `task_list_path`, `pending_task_count` (items marked `[ ]`) with a truncated `next_pending_task`, and `in_progress_task_count` (items marked `[-]`) with a truncated `next_in_progress_task` — the `next_*` field only appears when its count is at least 1 — on every consult, not just the pre-send task review below.
 
 `submit_decision` enforces a per-situation contract:
 - `approval`/`choice` with listed options → use `select_options` (1-based option numbers)

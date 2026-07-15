@@ -1383,6 +1383,7 @@ type taskReviewContext struct {
 	listPath       string
 	currentTask    string
 	pending        []string
+	inProgress     []string
 }
 
 // consultDeclaredTask reviews a determined declared task before sending: it
@@ -1449,6 +1450,7 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 			}
 			if data, rerr := d.opt.ReadTaskFile(declared.Path); rerr == nil {
 				review.pending = domain.PendingDeclaredTasks(string(data))
+				review.inProgress = domain.InProgressDeclaredTasks(string(data))
 			} else {
 				slog.Warn("task-review: re-reading task source for pending list failed",
 					"path", declared.Path, "error", rerr)
@@ -1703,19 +1705,28 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 	// A matched [[task_sources]] entry is surfaced on every consult, not just
 	// the pre-send review below — the LLM should know the agent's backlog
 	// state regardless of what situation triggered this consult. The review
-	// path below already has a fresh read of the same file (review.pending),
-	// so reuse it there instead of reading the file a third time.
+	// path below already has a fresh read of the same file (review.pending/
+	// review.inProgress), so reuse it there instead of reading the file a
+	// third time.
 	if review != nil {
 		fields["task_list_path"] = review.listPath
 		fields["pending_task_count"] = len(review.pending)
-		if len(review.pending) > 0 {
-			fields["next_pending_task"] = truncateRunes(review.pending[0], taskSummaryMaxRunes)
+		if p := taskPreview(review.pending); p != "" {
+			fields["next_pending_task"] = p
 		}
-	} else if path, count, next, ok := d.taskSourceSummary(ctx, cfg, s, workspaceID, agentName); ok {
-		fields["task_list_path"] = path
-		fields["pending_task_count"] = count
-		if next != "" {
-			fields["next_pending_task"] = next
+		fields["in_progress_task_count"] = len(review.inProgress)
+		if p := taskPreview(review.inProgress); p != "" {
+			fields["next_in_progress_task"] = p
+		}
+	} else if summary, ok := d.taskSourceSummary(ctx, cfg, s, workspaceID, agentName); ok {
+		fields["task_list_path"] = summary.path
+		fields["pending_task_count"] = summary.pendingCount
+		if summary.nextPending != "" {
+			fields["next_pending_task"] = summary.nextPending
+		}
+		fields["in_progress_task_count"] = summary.inProgressCount
+		if summary.nextInProgress != "" {
+			fields["next_in_progress_task"] = summary.nextInProgress
 		}
 	}
 	// Pre-send declared-task review: the agent is idle with a next task queued.
@@ -2725,24 +2736,47 @@ func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID
 	return taskSourceMatch{}, false
 }
 
-// taskSummaryMaxRunes bounds the get_context preview of the next pending
-// task (short-field truncation, unlike the pane-excerpt-sized limits).
+// taskSummaryMaxRunes bounds the get_context preview of the next pending or
+// in-progress task (short-field truncation, unlike the pane-excerpt-sized
+// limits).
 const taskSummaryMaxRunes = 200
 
-// taskSourceSummary reports the get_context task_source surface: present
-// whenever a [[task_sources]] entry matches the given agent/workspace,
-// independent of situation type.
-func (d *Daemon) taskSourceSummary(ctx context.Context, cfg config.Config, s domain.Situation, workspaceID, agentName string) (path string, pendingCount int, nextPending string, ok bool) {
+// taskSourceSummaryFields is the get_context task_source surface: present
+// whenever a [[task_sources]] entry matches, independent of situation type.
+type taskSourceSummaryFields struct {
+	path            string
+	pendingCount    int
+	nextPending     string
+	inProgressCount int
+	nextInProgress  string
+}
+
+// taskPreview returns a truncated preview of the first item, or "" when
+// items is empty — the shared rule for whether a get_context "next_*" field
+// is included at all.
+func taskPreview(items []string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	return truncateRunes(items[0], taskSummaryMaxRunes)
+}
+
+// taskSourceSummary reports the get_context task_source surface for the
+// given agent/workspace.
+func (d *Daemon) taskSourceSummary(ctx context.Context, cfg config.Config, s domain.Situation, workspaceID, agentName string) (taskSourceSummaryFields, bool) {
 	m, ok := d.matchTaskSource(ctx, cfg, s.AgentID, s.AgentType, workspaceID, agentName)
 	if !ok {
-		return "", 0, "", false
+		return taskSourceSummaryFields{}, false
 	}
 	pending := domain.PendingDeclaredTasks(string(m.data))
-	next := ""
-	if len(pending) > 0 {
-		next = truncateRunes(pending[0], taskSummaryMaxRunes)
-	}
-	return m.src.Path, len(pending), next, true
+	inProgress := domain.InProgressDeclaredTasks(string(m.data))
+	return taskSourceSummaryFields{
+		path:            m.src.Path,
+		pendingCount:    len(pending),
+		nextPending:     taskPreview(pending),
+		inProgressCount: len(inProgress),
+		nextInProgress:  taskPreview(inProgress),
+	}, true
 }
 
 // declaredTask resolves the operator-declared next task for a transition.

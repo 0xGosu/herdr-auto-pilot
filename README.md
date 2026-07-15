@@ -433,10 +433,13 @@ existing config.)
 
 Whenever an agent has a matching `[[task_sources]]` entry, `get_context`
 carries `task_list_path` (the checklist file), `pending_task_count` (how many
-items are still unchecked), and — only when at least one is pending —
-`next_pending_task` (a truncated preview of the next unchecked item). This is
-included on **every** LLM consult for that agent (approval, choice, error, or
-idle), not just the pre-send task review below, so the LLM always knows the
+items are still unchecked, `[ ]`) with `next_pending_task` (a truncated
+preview of the first, only when at least one is pending), and
+`in_progress_task_count` (how many items are marked `[-]`) with
+`next_in_progress_task` (a truncated preview of the first, only when at least
+one is in progress). This is included on **every** LLM consult for that agent
+(approval, choice, error, or idle), not just the pre-send task review below,
+so the LLM always knows the
 agent's backlog state.
 
 ### Reviewing tasks before they are sent (optional)

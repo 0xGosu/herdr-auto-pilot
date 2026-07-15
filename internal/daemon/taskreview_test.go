@@ -64,7 +64,7 @@ func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
 	// With an LLM command configured, a determined declared task is reviewed
 	// before sending. An approval (recommend_action with the task text) is
 	// delivered once it clears the confidence gate.
-	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [ ] refactor the parser\n- [ ] add parser tests\n")
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [-] warm caches\n- [ ] refactor the parser\n- [ ] add parser tests\n")
 	idlePane := "All tests pass. Task is complete.\n"
 	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-rev\"\npath = %q\n", taskFile)
 	h := newHarness(t, cfg)
@@ -112,13 +112,19 @@ func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
 		t.Errorf("pending_tasks = %v, want the two unchecked items in order", pending)
 	}
 	// The always-on task_source summary fields must agree with the review's
-	// own pending_tasks/current_task, since both are set from review.pending
-	// in the review branch.
+	// own pending_tasks/current_task, since both are set from review.pending/
+	// review.inProgress in the review branch.
 	if pc, _ := m["pending_task_count"].(float64); pc != 2 {
 		t.Errorf("pending_task_count = %v, want 2", m["pending_task_count"])
 	}
 	if np, _ := m["next_pending_task"].(string); np != "refactor the parser" {
 		t.Errorf("next_pending_task = %q, want %q", np, "refactor the parser")
+	}
+	if ic, _ := m["in_progress_task_count"].(float64); ic != 1 {
+		t.Errorf("in_progress_task_count = %v, want 1", m["in_progress_task_count"])
+	}
+	if nip, _ := m["next_in_progress_task"].(string); nip != "warm caches" {
+		t.Errorf("next_in_progress_task = %q, want %q", nip, "warm caches")
 	}
 }
 
@@ -463,7 +469,7 @@ func TestConsultContextNoTaskSourceOmitsTaskFields(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
 
 	m := decodeContext(t, captured.get())
-	for _, key := range []string{"task_list_path", "pending_task_count", "next_pending_task"} {
+	for _, key := range []string{"task_list_path", "pending_task_count", "next_pending_task", "in_progress_task_count", "next_in_progress_task"} {
 		if _, present := m[key]; present {
 			t.Errorf("%s must be absent with no matching task source, got %v", key, m[key])
 		}
@@ -488,5 +494,55 @@ func TestConsultContextNextPendingTaskTruncated(t *testing.T) {
 	gotRunes := []rune(next)
 	if len(gotRunes) != wantRunes+1 || gotRunes[wantRunes] != '…' {
 		t.Errorf("next_pending_task = %q (%d runes), want %d chars + ellipsis marker", next, len(gotRunes), wantRunes)
+	}
+}
+
+func TestConsultContextIncludesInProgressTaskOnApproval(t *testing.T) {
+	// A matched [[task_sources]] entry with an in-progress ("[-]") item
+	// surfaces in_progress_task_count/next_in_progress_task alongside the
+	// pending fields, on a non-idle consult.
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [-] refactor the parser\n- [ ] add parser tests\n- [ ] ship it\n")
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-ts4\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-ts4", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if lp, _ := m["task_list_path"].(string); lp != taskFile {
+		t.Errorf("task_list_path = %q, want %q", lp, taskFile)
+	}
+	// "[-]" is not "[ ]", so it must not count toward pending.
+	if pc, _ := m["pending_task_count"].(float64); pc != 2 {
+		t.Errorf("pending_task_count = %v, want 2", m["pending_task_count"])
+	}
+	if ic, _ := m["in_progress_task_count"].(float64); ic != 1 {
+		t.Errorf("in_progress_task_count = %v, want 1", m["in_progress_task_count"])
+	}
+	if nip, _ := m["next_in_progress_task"].(string); nip != "refactor the parser" {
+		t.Errorf("next_in_progress_task = %q, want %q", nip, "refactor the parser")
+	}
+}
+
+func TestConsultContextNoInProgressOmitsNextInProgressField(t *testing.T) {
+	// A matched source with pending items but nothing marked "[-]" must
+	// report in_progress_task_count 0 and omit next_in_progress_task.
+	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [ ] refactor the parser\n")
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-ts5\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	captured := captureConsultContext(h)
+	h.herdr.setPane(approvalPane)
+
+	h.push("agent-ts5", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return captured.get() != "" })
+
+	m := decodeContext(t, captured.get())
+	if ic, _ := m["in_progress_task_count"].(float64); ic != 0 {
+		t.Errorf("in_progress_task_count = %v, want 0", m["in_progress_task_count"])
+	}
+	if _, present := m["next_in_progress_task"]; present {
+		t.Errorf("next_in_progress_task must be absent when nothing is in progress, got %v", m["next_in_progress_task"])
 	}
 }
