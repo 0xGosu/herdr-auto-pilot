@@ -622,7 +622,7 @@ hap task-source add --agent frontend-dev ./docs/frontend-tasks.md
 hap task-source add --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
 
 # lower the graduation bar during initial training
-hap config set learning.graduation_n 3
+hap config set learning.graduation_n 1
 ```
 
 ### handle a batch of escalations
