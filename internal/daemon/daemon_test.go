@@ -1811,6 +1811,40 @@ func TestCorrectionDoesNotDemoteGraduatedSignature(t *testing.T) {
 	}
 }
 
+func TestResetFloorSuppressesAutoActButKeepsSuggestion(t *testing.T) {
+	// After a reset stamps a decision-id floor above all existing decisions,
+	// the post-floor history is empty → confidence 0, so a would-be autonomous
+	// rule must NOT auto-act; it escalates instead, still suggesting the learned
+	// answer from full history.
+	h := newHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	sigKey := h.seedAutonomous(approvalPane, domain.SituationApproval, "1")
+	ctx := context.Background()
+
+	newest, err := h.raw.DecisionsForSignature(ctx, sigKey, 1)
+	if err != nil || len(newest) == 0 {
+		t.Fatalf("seed decisions: %v %v", newest, err)
+	}
+	st, _ := h.raw.GetSignature(ctx, sigKey)
+	st.DecisionFloorID = newest[0].ID // floor above every seeded decision
+	if err := h.raw.UpsertSignature(ctx, *st); err != nil {
+		t.Fatal(err)
+	}
+
+	h.push("agent-floor", "blocked")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if n := len(h.herdr.sentInputs()); n != 0 {
+		t.Fatalf("a floored rule has 0 post-floor confidence and must not auto-act; sent %d", n)
+	}
+	esc, _ := h.raw.PendingEscalations(ctx)
+	if !strings.Contains(esc[0].Suggestion, "1") {
+		t.Errorf("floored rule should still suggest its learned answer, got %q", esc[0].Suggestion)
+	}
+}
+
 func TestConfigReloadPropagatesWithinBudget(t *testing.T) {
 	// NFR-009 / SC-2: a config edit + nudge is reflected ≤ 1s.
 	h := newHarness(t, "[confidence_thresholds]\napproval = 0.8\n")

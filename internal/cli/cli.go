@@ -304,9 +304,10 @@ func signaturesDelete(ctx context.Context, app *frontend.App, out io.Writer, arg
 	return nil
 }
 
-// signaturesReset returns a graduated signature to shadow mode with a zero
-// consecutive-confirmation count (graduation is otherwise permanent). Decision
-// history is kept; the rule must re-earn N confirmations to re-graduate.
+// signaturesReset returns a signature to a fresh rule: shadow mode, zero
+// consecutive-confirmation count, and a cleared confidence (pre-reset decisions
+// stop counting). Decision history is kept and the learned answer is retained;
+// the rule must re-earn N confirmations to re-graduate.
 func signaturesReset(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	prefix, rest := splitLeadingID(args)
 	fs := flag.NewFlagSet("signatures reset", flag.ContinueOnError)
@@ -330,9 +331,9 @@ func signaturesReset(ctx context.Context, app *frontend.App, out io.Writer, args
 		target = row.Signature
 		printSignatureRow(out, row, graduationN(app))
 		if !stdinIsTTY() {
-			return fmt.Errorf("resetting a signature returns it to shadow mode; rerun as: signatures reset %s --yes", row.Signature)
+			return fmt.Errorf("resetting a signature clears its confidence and streak; rerun as: signatures reset %s --yes", row.Signature)
 		}
-		fmt.Fprintf(out, "type 'yes' to reset %s to shadow (streak → 0): ", shortSignature(row.Signature))
+		fmt.Fprintf(out, "type 'yes' to reset %s to a fresh rule (shadow, streak → 0, confidence cleared): ", shortSignature(row.Signature))
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		if err != nil && line == "" {
 			return fmt.Errorf("read confirmation: %w", err)
@@ -346,7 +347,7 @@ func signaturesReset(ctx context.Context, app *frontend.App, out io.Writer, args
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "reset signature %s to shadow mode; decision history kept\n", sig)
+	fmt.Fprintf(out, "reset signature %s to a fresh rule (shadow, streak 0, confidence cleared); decision history kept\n", sig)
 	return nil
 }
 

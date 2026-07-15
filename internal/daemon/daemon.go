@@ -2264,6 +2264,14 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(domain.ReasonPersistenceFailed, err.Error())
 		return
 	}
+	// Exclude pre-reset decisions from the confidence the variance guard checks
+	// and the score written to the audit row (id > the signature's floor).
+	// Best-effort: a missing/failed state read just leaves full history in play.
+	if res.sig.Signature != "" {
+		if st, err := d.opt.Store.GetSignature(ctx, res.sig.Signature); err == nil && st != nil {
+			history = domain.DecisionsSince(history, st.DecisionFloorID)
+		}
+	}
 	// The variance guard compares the LLM's action to the signature's dominant
 	// learned action; it does not apply to a declared-task review, whose action
 	// is novel task text (each task differs) rather than a repeated answer.
@@ -2634,7 +2642,6 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	if err != nil {
 		return nil, err
 	}
-	prior := domain.Confidence(history, cfg.Learning.ConfirmationWeight)
 
 	state, err := d.opt.Store.GetSignature(ctx, audit.Signature)
 	if err != nil {
@@ -2651,6 +2658,10 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 			state.AgentType = at
 		}
 	}
+
+	// Confidence/graduation see only post-reset decisions (id > the floor); the
+	// full history above still feeds agent-type healing.
+	prior := domain.Confidence(domain.DecisionsSince(history, state.DecisionFloorID), cfg.Learning.ConfirmationWeight)
 
 	// Was this a confirmation of the suggested/learned action, or a
 	// correction to something else?
@@ -2688,7 +2699,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	if err != nil {
 		return nil, err
 	}
-	conf := domain.Confidence(refreshed, cfg.Learning.ConfirmationWeight)
+	conf := domain.Confidence(domain.DecisionsSince(refreshed, newState.DecisionFloorID), cfg.Learning.ConfirmationWeight)
 	newState.CachedConfidence = conf.Score
 	newState.UpdatedAt = now
 	newState = domain.MaybeGraduate(newState, conf.Score,

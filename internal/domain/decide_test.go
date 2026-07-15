@@ -41,6 +41,28 @@ func TestKillSwitchVetoesEverything(t *testing.T) {
 	}
 }
 
+func TestDecisionFloorGatesButKeepsSuggestion(t *testing.T) {
+	// A reset rule stamps a floor above all its current decisions, so post-floor
+	// history is empty: confidence is 0 (below threshold) and it escalates —
+	// but it STILL suggests its learned answer, drawn from full history.
+	in := baseInput(SituationApproval)
+	in.State = &SignatureState{Mode: ModeAutonomous, DecisionFloorID: 100}
+	in.History = []DecisionRecord{
+		{ID: 5, ChosenAction: "y", Source: SourceOperator},
+		{ID: 3, ChosenAction: "y", Source: SourceOperator},
+	}
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonBelowThreshold {
+		t.Fatalf("post-floor-empty rule must escalate below threshold, got %+v", d)
+	}
+	if d.Suggestion != "respond: y" {
+		t.Errorf("reset rule must still suggest the learned answer, got %q", d.Suggestion)
+	}
+	if d.Confidence != 0 {
+		t.Errorf("post-floor confidence should be 0, got %.3f", d.Confidence)
+	}
+}
+
 func TestNeverAutoVetoesRegardlessOfConfidence(t *testing.T) {
 	// FR-015 safety invariant: an allowlist match escalates regardless of
 	// confidence or mode.

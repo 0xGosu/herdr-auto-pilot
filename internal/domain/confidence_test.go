@@ -115,6 +115,27 @@ func TestConfirmationBoostCleanHistoryStaysMax(t *testing.T) {
 	}
 }
 
+func TestDecisionsSince(t *testing.T) {
+	recs := []DecisionRecord{ // newest first, as the store returns
+		{ID: 10, ChosenAction: "yes"},
+		{ID: 7, ChosenAction: "no"},
+		{ID: 4, ChosenAction: "yes"},
+	}
+	// floor <= 0 keeps everything.
+	if got := DecisionsSince(recs, 0); len(got) != 3 {
+		t.Errorf("floor 0 must keep all, got %d", len(got))
+	}
+	// floor excludes ids <= floor.
+	got := DecisionsSince(recs, 7)
+	if len(got) != 1 || got[0].ID != 10 {
+		t.Errorf("floor 7 should keep only id 10, got %+v", got)
+	}
+	// floor above everything yields empty.
+	if got := DecisionsSince(recs, 99); len(got) != 0 {
+		t.Errorf("floor above all should yield empty, got %d", len(got))
+	}
+}
+
 func TestConfirmationWeightBelowOneClampsToBaseline(t *testing.T) {
 	// A weight < 1 must never penalize a confirmation below a baseline vote.
 	recs := opHistory("yes", "@no", "@no")

@@ -27,6 +27,25 @@ type ConfidenceResult struct {
 	Decisions int
 }
 
+// DecisionsSince returns the decisions newer than a signature's reset floor
+// (id > floorID), preserving order. floorID <= 0 returns history unchanged (no
+// reset). It excludes pre-reset decisions from confidence and graduation while
+// leaving the rows intact for history/audit. history is the newest-first window
+// the store returns, so post-floor decisions (the highest ids) are always
+// present in it.
+func DecisionsSince(history []DecisionRecord, floorID int64) []DecisionRecord {
+	if floorID <= 0 {
+		return history
+	}
+	out := make([]DecisionRecord, 0, len(history))
+	for _, d := range history {
+		if d.ID > floorID {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 // Confidence computes the recency-weighted agreement ratio over a
 // signature's decision history (FR-005). history must be ordered newest
 // first, as returned by the store. confirmWeight boosts operator

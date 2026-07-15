@@ -32,13 +32,18 @@ func ObserveConfirmation(state SignatureState, consistent bool) SignatureState {
 }
 
 // ResetGraduation is the explicit operator reset (CLI/TUI): it returns a
-// signature to shadow mode with a zero consecutive-confirmation count. This is
-// the ONLY path that demotes a graduated signature — corrections no longer do
-// (permanent graduation). A reset signature must re-earn N consecutive
-// consistent confirmations (FR-006) before it can act autonomously again.
+// signature to shadow mode with a zero consecutive-confirmation count and a
+// fresh confidence (1.0). This is the ONLY path that demotes a graduated
+// signature — corrections no longer do (permanent graduation). A reset
+// signature must re-earn N consecutive consistent confirmations (FR-006) before
+// it can act autonomously again. The caller stamps DecisionFloorID so pre-reset
+// decisions stop counting toward confidence/graduation (history rows are kept);
+// CachedConfidence is a display snapshot the daemon recomputes on the first
+// re-confirm.
 func ResetGraduation(state SignatureState) SignatureState {
 	state.Mode = ModeShadow
 	state.ConsecutiveConfirmations = 0
+	state.CachedConfidence = 1.0
 	return state
 }
 

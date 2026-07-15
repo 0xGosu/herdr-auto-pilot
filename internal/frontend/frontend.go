@@ -2002,6 +2002,14 @@ func (a *App) ResetSignatureGraduation(ctx context.Context, prefix string) (stri
 		return "", fmt.Errorf("no learned signature %s", sig)
 	}
 	reset := domain.ResetGraduation(*st)
+	// Stamp the decision-id floor at the newest decision so pre-reset decisions
+	// stop counting toward confidence/graduation (rows are kept). No decisions
+	// yet → keep the existing floor.
+	if newest, err := a.Store.DecisionsForSignature(ctx, sig, 1); err != nil {
+		return "", err
+	} else if len(newest) > 0 {
+		reset.DecisionFloorID = newest[0].ID
+	}
 	reset.UpdatedAt = time.Now()
 	if err := a.Store.UpsertSignature(ctx, reset); err != nil {
 		return "", err

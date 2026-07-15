@@ -197,8 +197,14 @@ type SignatureState struct {
 	Mode                     Mode
 	ConsecutiveConfirmations int
 	CachedConfidence         float64
-	GuardState               string
-	UpdatedAt                time.Time
+	// DecisionFloorID excludes pre-reset decisions from confidence and
+	// graduation: only decisions with id > DecisionFloorID count. Stamped by an
+	// operator reset (ResetGraduation) to the newest decision id at that moment,
+	// so a reset rule starts confidence-fresh while its history rows are kept.
+	// 0 (the default) counts all history.
+	DecisionFloorID int64
+	GuardState      string
+	UpdatedAt       time.Time
 }
 
 // SignatureFilter narrows a learned-signature listing; zero-valued fields

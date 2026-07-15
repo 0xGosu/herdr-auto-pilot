@@ -418,12 +418,12 @@ func TestSignaturesReset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "reset signature choice:cccc3333 to shadow mode") {
+	if !strings.Contains(out, "reset signature choice:cccc3333 to a fresh rule") {
 		t.Errorf("reset output:\n%s", out)
 	}
 	sig, _ := st.GetSignature(ctx, "choice:cccc3333")
-	if sig == nil || sig.Mode != domain.ModeShadow || sig.ConsecutiveConfirmations != 0 {
-		t.Errorf("reset must return the signature to shadow with a zero streak: %+v", sig)
+	if sig == nil || sig.Mode != domain.ModeShadow || sig.ConsecutiveConfirmations != 0 || sig.CachedConfidence != 1.0 {
+		t.Errorf("reset must return the signature to a fresh shadow rule (streak 0, confidence 1.0): %+v", sig)
 	}
 }
 

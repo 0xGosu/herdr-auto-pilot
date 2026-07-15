@@ -643,8 +643,8 @@ func TestSignatureResetPromptFlow(t *testing.T) {
 		t.Fatalf("yes should reset, got %+v", msg)
 	}
 	sig, _ := st.GetSignature(ctx, "approval:deadbeef00112233")
-	if sig == nil || sig.Mode != domain.ModeShadow || sig.ConsecutiveConfirmations != 0 {
-		t.Errorf("reset must return the signature to shadow with a zero streak: %+v", sig)
+	if sig == nil || sig.Mode != domain.ModeShadow || sig.ConsecutiveConfirmations != 0 || sig.CachedConfidence != 1.0 {
+		t.Errorf("reset must return the signature to a fresh shadow rule (streak 0, confidence 1.0): %+v", sig)
 	}
 	if recs, _ := st.DecisionsForSignature(ctx, "approval:deadbeef00112233", 10); len(recs) != 1 {
 		t.Error("reset must keep decision history")

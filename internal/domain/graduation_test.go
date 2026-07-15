@@ -55,7 +55,7 @@ func TestResetGraduationReturnsToShadow(t *testing.T) {
 	// The explicit operator reset is the ONLY path back to shadow now that
 	// graduation is permanent: mode→shadow, count→0, then must re-earn N.
 	const n = 5
-	state := SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 12}
+	state := SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 12, CachedConfidence: 0.3}
 	state = ResetGraduation(state)
 
 	if state.Mode != ModeShadow {
@@ -63,6 +63,9 @@ func TestResetGraduationReturnsToShadow(t *testing.T) {
 	}
 	if state.ConsecutiveConfirmations != 0 {
 		t.Fatalf("reset must zero the consecutive count, got %d", state.ConsecutiveConfirmations)
+	}
+	if state.CachedConfidence != 1.0 {
+		t.Fatalf("reset must clear confidence to a fresh 1.0, got %.3f", state.CachedConfidence)
 	}
 
 	// High residual confidence alone cannot re-graduate.

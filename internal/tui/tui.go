@@ -1775,9 +1775,10 @@ func (m Model) deleteSignaturePrompt() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// resetGraduationPrompt returns the selected signature to shadow mode with a
-// zero confirmation count (graduation is otherwise permanent). Decision history
-// is kept; the rule must re-earn N confirmations to re-graduate.
+// resetGraduationPrompt returns the selected signature to a fresh rule: shadow
+// mode, zero confirmation count, and a cleared confidence (pre-reset decisions
+// stop counting). Decision history is kept and the learned answer retained; the
+// rule must re-earn N confirmations to re-graduate.
 func (m Model) resetGraduationPrompt() (tea.Model, tea.Cmd) {
 	row := m.selectedSignature()
 	if row == nil {
@@ -1787,7 +1788,7 @@ func (m Model) resetGraduationPrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
 	m.prompt = &prompt{
-		label: fmt.Sprintf("type 'yes' to reset %s to shadow (streak → 0)", shortSig(sig)),
+		label: fmt.Sprintf("type 'yes' to reset %s to a fresh rule (shadow, streak → 0, confidence cleared)", shortSig(sig)),
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
 				if input != "yes" {
@@ -1798,7 +1799,7 @@ func (m Model) resetGraduationPrompt() (tea.Model, tea.Cmd) {
 					return actionResultMsg{err: err}
 				}
 				return actionResultMsg{message: fmt.Sprintf(
-					"reset %s to shadow mode; decision history kept", shortSig(reset))}
+					"reset %s to a fresh rule (shadow, streak 0, confidence cleared); history kept", shortSig(reset))}
 			}
 		},
 	}

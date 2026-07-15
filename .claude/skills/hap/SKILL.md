@@ -223,9 +223,12 @@ delete a signature you no longer trust (erases its decision history; audit rows 
 hap signatures delete approval:9f2c --yes
 ```
 
-reset a graduated signature back to shadow mode (streak → 0; decision history kept). the
-only way to demote an autonomous rule now that graduation is permanent — it must re-earn
-`learning.graduation_n` confirmations to re-graduate:
+reset a signature back to a fresh rule: shadow mode, streak → 0, and confidence cleared to a
+fresh 1.0. all decision rows are **kept** (and the rule still suggests its learned answer),
+but decisions recorded before the reset no longer count toward confidence or graduation — the
+rule behaves confidence-new and must re-earn `learning.graduation_n` confirmations to
+re-graduate. this is the only way to demote an autonomous rule now that graduation is
+permanent:
 
 ```bash
 hap signatures reset approval:9f2c --yes
@@ -750,7 +753,7 @@ hap signatures reembed
 - `hap dismiss` drops escalations without responding — safe, nothing is sent or learned, audit rows kept as `dismissed`.
 - `hap escalations prune [minutes]` bulk-dismisses old escalations (default 360 minutes).
 - `hap signatures delete` erases the signature's decision history (audit rows are kept) — the plugin must re-learn that situation from scratch.
-- `hap signatures reset` returns a graduated signature to shadow mode (streak → 0) but **keeps** its decision history — the only way to demote an autonomous rule (graduation is permanent; corrections no longer demote). It must re-earn `learning.graduation_n` confirmations to re-graduate.
+- `hap signatures reset` returns a signature to a fresh rule — shadow mode, streak → 0, confidence cleared to 1.0 — while **keeping** its decision history (pre-reset decisions no longer count toward confidence/graduation, and the learned answer is still suggested). The only way to demote an autonomous rule (graduation is permanent; corrections no longer demote). It must re-earn `learning.graduation_n` confirmations to re-graduate.
 - `hap signatures reembed` re-computes stored embeddings after an embedding model change; use `--force` to retry a previously failed pass.
 - `hap pause` is the emergency kill switch — use it if automation is misbehaving.
 - `hap clear-data --yes` is irreversible — it resets all learned patterns but keeps config.
