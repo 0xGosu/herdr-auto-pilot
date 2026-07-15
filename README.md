@@ -303,7 +303,7 @@ graduation_n = 5           # consecutive confirmations to graduate
 
 [limits]
 max_consecutive_auto_prompts = 10  # per agent, without human interaction
-max_auto_prompts_per_minute = 3    # per agent
+max_auto_prompts_per_minute = 5    # per agent
 max_error_retries = 2              # per error signature
 
 # Semantic rule matching: situations are matched to learned rules by

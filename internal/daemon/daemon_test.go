@@ -16,6 +16,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/classify"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
@@ -1100,14 +1101,23 @@ func TestRunawayGuardPausesAgent(t *testing.T) {
 		want := i + 1
 		waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == want })
 	}
-	// 6th: blocked + escalated.
+	// 6th: blocked + escalated, retaining the blocked action so the operator
+	// can explicitly confirm and send it.
 	h.push("agent-8", "blocked")
+	var escalation domain.AuditRecord
 	waitFor(t, 3*time.Second, func() bool {
 		esc, _ := h.raw.PendingEscalations(context.Background())
-		return len(esc) == 1
+		if len(esc) != 1 {
+			return false
+		}
+		escalation = esc[0]
+		return true
 	})
 	if len(h.herdr.sentInputs()) != 5 {
 		t.Fatalf("6th consecutive prompt must be blocked; sent %d", len(h.herdr.sentInputs()))
+	}
+	if escalation.Suggestion != "respond: 1" {
+		t.Fatalf("rate-limit escalation must carry the blocked action, got %q", escalation.Suggestion)
 	}
 	// escalate() persists the pause AFTER the escalation audit row, so the
 	// pause may not be visible yet when PendingEscalations first reports 1 —
@@ -1117,8 +1127,16 @@ func TestRunawayGuardPausesAgent(t *testing.T) {
 		return rate.Paused
 	})
 
-	// Human interaction (agent starts working without our input) resumes.
-	h.push("agent-8", "working")
+	// Confirming the escalation is a human-initiated send: it delivers the
+	// retained action and resumes this agent's automation.
+	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	if err := app.Confirm(context.Background(), escalation.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 6 })
+	if got := h.herdr.sentInputs()[5]; got != "1" {
+		t.Fatalf("confirmed rate-limited action = %q, want %q", got, "1")
+	}
 	waitFor(t, 3*time.Second, func() bool {
 		r, _ := h.raw.GetAgentRate(context.Background(), "agent-8")
 		return !r.Paused && r.ConsecutiveAuto == 0

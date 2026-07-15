@@ -150,8 +150,15 @@ func Decide(in DecideInput) Decision {
 		return esc(ReasonVarianceGuard, "contradictory history", conf.Score, "")
 	}
 
+	// Resolve the would-be action before applying the rate guard. Resolution is
+	// pure and does not authorize a send; it gives a rate-limit escalation the
+	// same confirmable suggestion that would otherwise have been acted on.
+	// Without this, the early safety veto produced a tag-only escalation that
+	// the operator could not confirm.
+	candidate, suggestion, resolveEsc := resolveSituation(in, conf)
+
 	if ok, reason := CheckRate(in.Rate, in.Now, in.RateLimits); !ok {
-		return esc(reason, "", conf.Score, "")
+		return esc(reason, "", conf.Score, suggestion)
 	}
 
 	// The suspected-irreversible heuristic biases to escalation before any
@@ -173,8 +180,6 @@ func Decide(in DecideInput) Decision {
 
 	threshold := in.ConfidenceThresholds.ForType(in.Situation.Type)
 
-	// Resolve the candidate action per situation type.
-	candidate, suggestion, resolveEsc := resolveSituation(in, conf)
 	if resolveEsc != ReasonNone {
 		// "No confident learned rule applies" is exactly the LLM fallback's
 		// job (FR-010): a signature with no history yet, or a learned option

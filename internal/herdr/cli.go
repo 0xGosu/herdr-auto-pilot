@@ -140,6 +140,12 @@ func (c *CLI) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) 
 	}
 	var agents []domain.AgentTransition
 	for _, a := range resp.Result.Agents {
+		// Herdr can expose non-agent plugin/side-panel panes as placeholder
+		// rows (for example agent=undefined, agent_status=unknown). They are
+		// not monitorable agents and must not leak into the HAP TUI.
+		if domain.IsPlaceholderAgent(a.Agent, a.AgentStatus) {
+			continue
+		}
 		agents = append(agents, domain.AgentTransition{
 			AgentID:     a.PaneID,
 			PaneID:      a.PaneID,
