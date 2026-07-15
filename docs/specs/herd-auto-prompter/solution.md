@@ -172,7 +172,7 @@ sequenceDiagram
 
 **Responsibilities.** Compute recency-weighted agreement ratio (FR-005), enforce per-situation thresholds (FR-009) and graduation N (FR-006), apply per-situation resolution (FR-011–FR-014), decide `act | escalate | consult-LLM`.
 **Key Components.**
-- Confidence calculator; graduation/demotion state machine (FR-006/FR-007).
+- Confidence calculator (with operator-confirmation boost, FR-005); permanent-graduation state machine + operator reset (FR-006/FR-007).
 - **Idle resolver (FR-011)** — two-tier next-task resolution: (1) operator-declared task source (next unchecked item); (2) fallback pane-history inference **only** from an explicit structured signal (agent-emitted todo/checklist/numbered plan), held to the **higher inferred-task bar** than declared-source tasks; free-form prose is not inferable; if neither yields a sufficiently-confident next task → escalate.
 - **Approval / choice resolvers (FR-012/FR-013)** — learned yes/no or learned option match; unfamiliar option set → escalate.
 - **Error resolver (FR-014)** — learned retry/skip/escalate bounded by the per-error-signature retry ceiling (default 2), read from the daemon-owned `error_retries` counter; on exhaustion → force escalate.
@@ -201,9 +201,9 @@ sequenceDiagram
 
 ### Learning Subsystem (domain, daemon-owned writer)
 
-**Responsibilities.** Record confirmations/corrections (FR-004), update graduation counters, drive demotion on correction (FR-007), maintain correction lineage (DR-005). Operator *correction records* are written directly by front-ends; the daemon **re-derives** the affected signature's counters from those records on reload — front-ends never write signature counters.
-**Key Components.** Decision recorder, graduation counter updater, correction re-deriver.
-**Key Interfaces.** `Observe(signature, chosen, source)`, `ApplyCorrection(record)`.
+**Responsibilities.** Record confirmations/corrections (FR-004), update graduation counters, keep graduation permanent — a correction records a decision but never auto-demotes a graduated signature (FR-007) — and maintain correction lineage (DR-005). Operator *correction records* are written directly by front-ends; the daemon **re-derives** the affected signature's counters from those records on reload — front-ends never write signature counters on the learning hot path. The sole exception is an explicit operator **reset** command, which writes a graduated signature back to shadow (mode + zero count) directly from the front-end.
+**Key Components.** Decision recorder, graduation counter updater, correction re-deriver, operator reset.
+**Key Interfaces.** `Observe(signature, chosen, source)`, `ApplyCorrection(record)`, `ResetGraduation(signature)`.
 **Data Models.** `decisions`, `signatures` (daemon-written), `corrections` (front-end-written records).
 **Dependencies.** StorePort.
 **Error Handling.** Persistence failure → block auto-act (FR-024), notify.

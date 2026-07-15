@@ -1669,6 +1669,40 @@ func TestDeleteSignatureNudgesReload(t *testing.T) {
 	}
 }
 
+func TestResetSignatureGraduationThroughApp(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:grad", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeAutonomous, ConsecutiveConfirmations: 9,
+		CachedConfidence: 1.0, UpdatedAt: now,
+	})
+	st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:grad",
+		SituationType: domain.SituationApproval, AgentType: "claude",
+		ChosenAction: "1", Source: domain.SourceOperator, CreatedAt: now})
+
+	sig, err := app.ResetSignatureGraduation(ctx, "approval:g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sig != "approval:grad" {
+		t.Errorf("reset resolved sig = %q, want approval:grad", sig)
+	}
+	got, _ := st.GetSignature(ctx, "approval:grad")
+	if got == nil || got.Mode != domain.ModeShadow || got.ConsecutiveConfirmations != 0 {
+		t.Errorf("reset must return the signature to shadow with a zero streak: %+v", got)
+	}
+	// Decision history is kept (a reset is not a delete).
+	if decs, _ := st.DecisionsForSignature(ctx, "approval:grad", 10); len(decs) != 1 {
+		t.Errorf("reset must keep decision history, got %d", len(decs))
+	}
+	// Unknown prefix surfaces the resolution error.
+	if _, err := app.ResetSignatureGraduation(ctx, "nope:xyz"); err == nil {
+		t.Error("prefix resolution error must surface")
+	}
+}
+
 // fakeLocatorPort is a fakeHerdrPort that also reports workspace/tab
 // metadata (ports.LocatorPort).
 type fakeLocatorPort struct {

@@ -89,6 +89,7 @@ type DecideInput struct {
 	State                *SignatureState  // nil when the signature is new
 	History              []DecisionRecord // newest first
 	ConfidenceThresholds ConfidenceThresholds
+	ConfirmationWeight   float64 // operator-confirmation boost for Confidence
 	GraduationN          int
 	KillActive           bool
 	Rate                 AgentRate
@@ -144,9 +145,9 @@ func Decide(in DecideInput) Decision {
 			fmt.Sprintf("pattern: %s", in.NeverAutoHit), 0, "")
 	}
 
-	conf := Confidence(in.History)
+	conf := Confidence(in.History, in.ConfirmationWeight)
 
-	if VarianceGuardTripped(in.History, in.ConfidenceThresholds.Minimum) {
+	if VarianceGuardTripped(in.History, in.ConfidenceThresholds.Minimum, in.ConfirmationWeight) {
 		return esc(ReasonVarianceGuard, "contradictory history", conf.Score, "")
 	}
 

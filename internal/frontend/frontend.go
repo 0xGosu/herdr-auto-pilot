@@ -259,6 +259,18 @@ func (a *App) nudge(ctx context.Context, kind control.Kind) error {
 	return nil
 }
 
+// confirmationWeight resolves the operator-confirmation boost for display-side
+// Confidence calls so a listed/detailed signature scores the same way the
+// daemon does. Config is best-effort here (display only): a read error falls
+// back to the documented default rather than failing the listing.
+func (a *App) confirmationWeight() float64 {
+	cfg, err := a.Config()
+	if err != nil {
+		return domain.DefaultConfirmationWeight
+	}
+	return cfg.Learning.ConfirmationWeight
+}
+
 // Status summarizes daemon-relevant state.
 type Status struct {
 	Paused             bool
@@ -1900,7 +1912,7 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 		if err != nil {
 			return nil, err
 		}
-		conf := domain.Confidence(history)
+		conf := domain.Confidence(history, a.confirmationWeight())
 		rows = append(rows, SignatureRow{
 			SignatureState: st, TopAction: conf.TopAction, Decisions: conf.Decisions,
 		})
@@ -1927,7 +1939,7 @@ func (a *App) SignatureDetail(ctx context.Context, prefix string) (SignatureRow,
 	if err != nil {
 		return row, nil, err
 	}
-	conf := domain.Confidence(history)
+	conf := domain.Confidence(history, a.confirmationWeight())
 	row = SignatureRow{SignatureState: *st, TopAction: conf.TopAction, Decisions: conf.Decisions}
 	audit, err := a.Store.LatestAuditForSignature(ctx, sig)
 	if err != nil {
@@ -1969,6 +1981,32 @@ func (a *App) DeleteSignature(ctx context.Context, prefix string) (string, int64
 		return "", 0, err
 	}
 	return sig, decisions, a.nudge(ctx, control.KindReload)
+}
+
+// ResetSignatureGraduation resolves the prefix and returns a graduated
+// signature to shadow mode with a zero consecutive-confirmation count (the
+// only path back to shadow now that graduation is permanent; see
+// domain.ResetGraduation). Decision history is kept — the rule must re-earn N
+// confirmations to re-graduate. Returns the resolved key. Nudges the daemon to
+// drop any in-memory state.
+func (a *App) ResetSignatureGraduation(ctx context.Context, prefix string) (string, error) {
+	sig, err := a.Store.ResolveSignature(ctx, prefix)
+	if err != nil {
+		return "", err
+	}
+	st, err := a.Store.GetSignature(ctx, sig)
+	if err != nil {
+		return "", err
+	}
+	if st == nil {
+		return "", fmt.Errorf("no learned signature %s", sig)
+	}
+	reset := domain.ResetGraduation(*st)
+	reset.UpdatedAt = time.Now()
+	if err := a.Store.UpsertSignature(ctx, reset); err != nil {
+		return "", err
+	}
+	return sig, a.nudge(ctx, control.KindReload)
 }
 
 // ClearData resets learned history and audit data (DR-004).

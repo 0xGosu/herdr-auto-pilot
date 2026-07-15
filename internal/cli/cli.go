@@ -96,6 +96,8 @@ func signatures(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		return signaturesShow(ctx, app, out, args)
 	case "delete":
 		return signaturesDelete(ctx, app, out, args)
+	case "reset":
+		return signaturesReset(ctx, app, out, args)
 	case "reembed":
 		return signaturesReembed(ctx, app, out, args)
 	}
@@ -103,7 +105,7 @@ func signatures(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	if strings.HasPrefix(sub, "-") {
 		return signaturesList(ctx, app, out, append([]string{sub}, args...))
 	}
-	return fmt.Errorf("usage: signatures [list|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]|reembed [--force]]")
+	return fmt.Errorf("usage: signatures [list|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]|reset <sig-or-prefix> [--yes]|reembed [--force]]")
 }
 
 // signaturesReembed re-computes stored signature embeddings for the
@@ -299,6 +301,52 @@ func signaturesDelete(ctx context.Context, app *frontend.App, out io.Writer, arg
 		return err
 	}
 	fmt.Fprintf(out, "deleted signature %s and %d decision(s); audit rows kept\n", sig, decisions)
+	return nil
+}
+
+// signaturesReset returns a graduated signature to shadow mode with a zero
+// consecutive-confirmation count (graduation is otherwise permanent). Decision
+// history is kept; the rule must re-earn N confirmations to re-graduate.
+func signaturesReset(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	prefix, rest := splitLeadingID(args)
+	fs := flag.NewFlagSet("signatures reset", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "skip the interactive confirmation")
+	fs.SetOutput(out)
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if prefix == "" && fs.NArg() > 0 {
+		prefix = fs.Arg(0)
+	}
+	if prefix == "" {
+		return fmt.Errorf("usage: signatures reset <sig-or-prefix> [--yes]")
+	}
+	target := prefix
+	if !*yes {
+		row, _, err := app.SignatureDetail(ctx, prefix)
+		if err != nil {
+			return err
+		}
+		target = row.Signature
+		printSignatureRow(out, row, graduationN(app))
+		if !stdinIsTTY() {
+			return fmt.Errorf("resetting a signature returns it to shadow mode; rerun as: signatures reset %s --yes", row.Signature)
+		}
+		fmt.Fprintf(out, "type 'yes' to reset %s to shadow (streak → 0): ", shortSignature(row.Signature))
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && line == "" {
+			return fmt.Errorf("read confirmation: %w", err)
+		}
+		if strings.TrimSpace(line) != "yes" {
+			fmt.Fprintln(out, "aborted")
+			return nil
+		}
+	}
+	sig, err := app.ResetSignatureGraduation(ctx, target)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "reset signature %s to shadow mode; decision history kept\n", sig)
 	return nil
 }
 

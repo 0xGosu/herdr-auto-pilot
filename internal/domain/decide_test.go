@@ -16,6 +16,7 @@ func baseInput(st SituationType) DecideInput {
 		},
 		Signature:            SignatureResult{Signature: "sig", Verdict: GuardOK},
 		ConfidenceThresholds: ConfidenceThresholds{Minimum: 0.5, Idle: 0.65, Approval: 0.7, Choice: 0.7, Error: 0.75, InferredTaskBar: 0.6},
+		ConfirmationWeight:   DefaultConfirmationWeight,
 		GraduationN:          5,
 		RateLimits:           RateLimits{MaxConsecutive: 5, MaxPerMinute: 10},
 		Now:                  time.Now(),

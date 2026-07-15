@@ -1762,9 +1762,10 @@ func TestErrorRetryCeilingEndToEnd(t *testing.T) {
 	}
 }
 
-func TestCorrectionDemotesAutonomousSignature(t *testing.T) {
-	// FR-007 + FR-021 via the control socket: a front-end-written
-	// correction demotes the signature on reload.
+func TestCorrectionDoesNotDemoteGraduatedSignature(t *testing.T) {
+	// Permanent graduation (revised FR-007) via the control socket: a
+	// front-end-written correction of an autonomous decision records the
+	// decision but never demotes the signature or changes its frozen streak.
 	h := newHarness(t, "")
 	h.herdr.setPane(approvalPane)
 	sigKey := h.seedAutonomous(approvalPane, domain.SituationApproval, "1")
@@ -1783,10 +1784,8 @@ func TestCorrectionDemotesAutonomousSignature(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for the lineage audit — the LAST write applyCorrection makes
-	// before resolving — so every earlier effect (demotion included) is
-	// durably visible when we assert; waiting on the demotion alone raced
-	// the lineage append on slow runners.
+	// Wait for the lineage audit — the LAST write applyCorrection makes before
+	// resolving — so every earlier effect is durably visible when we assert.
 	waitFor(t, 3*time.Second, func() bool {
 		log, _ := h.raw.AuditLog(ctx, 5)
 		for _, r := range log {
@@ -1801,8 +1800,14 @@ func TestCorrectionDemotesAutonomousSignature(t *testing.T) {
 	if err != nil || st == nil {
 		t.Fatalf("signature state: %v %v", st, err)
 	}
-	if st.Mode != domain.ModeShadow || st.ConsecutiveConfirmations != 0 {
-		t.Errorf("correction must demote to shadow with a reset streak: %+v", st)
+	if st.Mode != domain.ModeAutonomous || st.ConsecutiveConfirmations != 8 {
+		t.Errorf("correcting a graduated rule must leave it autonomous with a frozen streak: %+v", st)
+	}
+
+	// The correction is still recorded as a decision, so the recency-weighted
+	// confidence reflects it (drops below the seeded 1.0).
+	if st.CachedConfidence >= 1.0 {
+		t.Errorf("correction should still lower cached confidence, got %.3f", st.CachedConfidence)
 	}
 }
 

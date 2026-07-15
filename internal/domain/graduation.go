@@ -1,19 +1,28 @@
 package domain
 
-// Graduation / demotion state machine (FR-006, FR-007).
+// Graduation state machine (FR-006, FR-007 revised).
 //
 // A signature graduates from shadow to autonomous mode only when BOTH
 // (a) the operator provided N consecutive consistent confirmations and
-// (b) confidence exceeds the applicable threshold. A correction demotes the
-// signature back to shadow and resets the consecutive count to zero; the
-// agreement ratio is not additionally discounted beyond recording the
-// corrected decision itself.
+// (b) confidence exceeds the applicable threshold.
+//
+// Graduation is PERMANENT (revised FR-007): once a signature is autonomous, its
+// consecutive-confirmation count is frozen and a later correction no longer
+// demotes it — the correction is still recorded as a decision, so the
+// recency-weighted confidence (FR-005) reflects it and the confidence gate
+// (FR-008) still applies, but the mode never auto-reverts. The ONLY path back
+// to shadow is an explicit operator reset (ResetGraduation), driven from the
+// CLI/TUI.
 
 // ObserveConfirmation updates state for an operator confirmation of the
 // suggested/learned action. consistent is true when the confirmed action
 // matches the signature's current dominant action (or the state's streak
-// action for the first confirmations).
+// action for the first confirmations). Once the signature is autonomous the
+// count is frozen (permanent graduation), so this is a no-op there.
 func ObserveConfirmation(state SignatureState, consistent bool) SignatureState {
+	if state.Mode == ModeAutonomous {
+		return state // frozen: a graduated rule's count never changes until reset
+	}
 	if consistent {
 		state.ConsecutiveConfirmations++
 	} else {
@@ -22,10 +31,12 @@ func ObserveConfirmation(state SignatureState, consistent bool) SignatureState {
 	return state
 }
 
-// ObserveCorrection demotes the signature after an operator correction of an
-// autonomous or suggested decision (FR-007): back to shadow mode with a zero
-// consecutive-confirmation count.
-func ObserveCorrection(state SignatureState) SignatureState {
+// ResetGraduation is the explicit operator reset (CLI/TUI): it returns a
+// signature to shadow mode with a zero consecutive-confirmation count. This is
+// the ONLY path that demotes a graduated signature — corrections no longer do
+// (permanent graduation). A reset signature must re-earn N consecutive
+// consistent confirmations (FR-006) before it can act autonomously again.
+func ResetGraduation(state SignatureState) SignatureState {
 	state.Mode = ModeShadow
 	state.ConsecutiveConfirmations = 0
 	return state

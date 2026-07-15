@@ -6,6 +6,16 @@ package domain
 // decisions shift the score more than older ones.
 const recencyDecay = 0.85
 
+// DefaultConfirmationWeight is the multiplier applied to an operator
+// CONFIRMATION (an accepted confirm/send of the suggested action) when
+// computing the agreement ratio. An explicit operator confirmation is a much
+// stronger learning signal than a passive auto-send or an aging decision, so
+// it counts for more, lifting a contested signature's confidence toward its
+// threshold faster. Corrections and dismissals are unaffected — the graduation
+// rule (consecutive confirmations + threshold) is unchanged; only how
+// confidence is computed changes. Configurable via learning.confirmation_weight.
+const DefaultConfirmationWeight = 3.0
+
 // ConfidenceResult carries the recency-weighted agreement ratio and the
 // action it agrees on.
 type ConfidenceResult struct {
@@ -19,17 +29,27 @@ type ConfidenceResult struct {
 
 // Confidence computes the recency-weighted agreement ratio over a
 // signature's decision history (FR-005). history must be ordered newest
-// first, as returned by the store.
-func Confidence(history []DecisionRecord) ConfidenceResult {
+// first, as returned by the store. confirmWeight boosts operator
+// confirmations (Source == SourceOperator && !IsCorrection); pass a value < 1
+// (e.g. the zero value) to disable the boost — it is clamped up to 1 so a
+// confirmation never counts for less than a baseline vote.
+func Confidence(history []DecisionRecord, confirmWeight float64) ConfidenceResult {
 	if len(history) == 0 {
 		return ConfidenceResult{}
+	}
+	if confirmWeight < 1 {
+		confirmWeight = 1 // defense in depth: never penalize below baseline
 	}
 	weights := map[string]float64{}
 	var total float64
 	w := 1.0
 	for _, d := range history {
-		weights[d.ChosenAction] += w
-		total += w
+		weight := w
+		if d.Source == SourceOperator && !d.IsCorrection {
+			weight *= confirmWeight
+		}
+		weights[d.ChosenAction] += weight
+		total += weight
 		w *= recencyDecay
 	}
 	var top string

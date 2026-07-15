@@ -42,6 +42,9 @@ func TestLoadPartialConfigFillsDefaults(t *testing.T) {
 	if cfg.Learning.GraduationN != Default().Learning.GraduationN {
 		t.Errorf("graduation N default lost: %d", cfg.Learning.GraduationN)
 	}
+	if cfg.Learning.ConfirmationWeight != Default().Learning.ConfirmationWeight {
+		t.Errorf("confirmation_weight default lost: %v", cfg.Learning.ConfirmationWeight)
+	}
 	// PaneSalientChars is unset here: 0 is the valid "use the built-in
 	// default" sentinel (the domain layer applies DefaultPaneSalientChars),
 	// so fillZeroes must leave it at 0 rather than freezing a value.
@@ -96,6 +99,31 @@ func TestPaneSalientCharsRoundTrip(t *testing.T) {
 	}
 	if cfg.Embedding.PaneSalientChars != 1200 {
 		t.Errorf("explicit pane_salient_chars lost: %d", cfg.Embedding.PaneSalientChars)
+	}
+}
+
+func TestConfirmationWeightClampAndOverride(t *testing.T) {
+	// A weight < 1 is invalid (would penalize confirmations) → falls back to
+	// the default; an explicit 1.0 (boost disabled) and >1 are preserved.
+	cases := []struct {
+		toml string
+		want float64
+	}{
+		{"[learning]\nconfirmation_weight = 0.0\n", Default().Learning.ConfirmationWeight},
+		{"[learning]\nconfirmation_weight = 0.5\n", Default().Learning.ConfirmationWeight},
+		{"[learning]\nconfirmation_weight = 1.0\n", 1.0},
+		{"[learning]\nconfirmation_weight = 6.0\n", 6.0},
+	}
+	for _, c := range cases {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		os.WriteFile(path, []byte(c.toml), 0o600)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("load %q: %v", c.toml, err)
+		}
+		if cfg.Learning.ConfirmationWeight != c.want {
+			t.Errorf("%q → confirmation_weight %.2f, want %.2f", c.toml, cfg.Learning.ConfirmationWeight, c.want)
+		}
 	}
 }
 

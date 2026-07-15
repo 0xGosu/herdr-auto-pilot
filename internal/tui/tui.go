@@ -809,6 +809,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.message = "audit log is append-only — entries can't be deleted individually"
 			m.scrollCursorIntoView() // the hint line shrinks the page
 		}
+	case "0":
+		if m.tab == tabSignatures {
+			return m.resetGraduationPrompt()
+		}
 	case "X":
 		switch m.tab {
 		case tabEscalations:
@@ -1771,6 +1775,36 @@ func (m Model) deleteSignaturePrompt() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// resetGraduationPrompt returns the selected signature to shadow mode with a
+// zero confirmation count (graduation is otherwise permanent). Decision history
+// is kept; the rule must re-earn N confirmations to re-graduate.
+func (m Model) resetGraduationPrompt() (tea.Model, tea.Cmd) {
+	row := m.selectedSignature()
+	if row == nil {
+		return m, nil
+	}
+	sig := row.Signature
+	app, ctx := m.app, m.ctx
+	m.beginAction()
+	m.prompt = &prompt{
+		label: fmt.Sprintf("type 'yes' to reset %s to shadow (streak → 0)", shortSig(sig)),
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				if input != "yes" {
+					return actionResultMsg{message: "reset aborted"}
+				}
+				reset, err := app.ResetSignatureGraduation(ctx, sig)
+				if err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: fmt.Sprintf(
+					"reset %s to shadow mode; decision history kept", shortSig(reset))}
+			}
+		},
+	}
+	return m, nil
+}
+
 // signatureDetailLines renders the full-record overlay for one signature.
 func (m Model) signatureDetailLines(row frontend.SignatureRow, history []domain.DecisionRecord, graduationN, w int, expanded bool) []string {
 	var lines []string
@@ -2155,7 +2189,7 @@ func (m Model) helpLine() string {
 	case tabAudit:
 		return "c: correct decision  v: details  /: search  " + common
 	case tabSignatures:
-		return "enter/v: details  x: delete  f: filter mode  /: search  " + common
+		return "enter/v: details  x: delete  0: reset  f: filter mode  /: search  " + common
 	case tabConfig:
 		return "enter: edit/run shortcut  e: edit field  a: add pattern  t: add task source  x: remove  X: clear data  " + common
 	}
