@@ -141,11 +141,10 @@ type TaskGeneratorPort interface {
 
 // StorePort is the persistence boundary. Write-ownership is partitioned:
 // daemon-exclusive writers for signatures/agent_rate/error_retries/decisions,
-// daemon-emitted audit rows, and signature_embeddings (with maintenance
+// daemon-emitted audit rows, and signature_embeddings (with one maintenance
 // exception: `hap signatures reembed` rewrites signature_embeddings from the
-// CLI process when no daemon is running, and the explicitly requested Codex
-// MCQ audit backfill repairs historical classification fields); front-ends
-// write corrections/kill_events; the mcp process writes llm_decisions only.
+// CLI process when no daemon is running); front-ends write
+// corrections/kill_events; the mcp process writes llm_decisions only.
 type StorePort interface {
 	DaemonStore
 	FrontendStore
@@ -233,14 +232,6 @@ type FrontendStore interface {
 	// DismissEscalationsBefore dismisses every pending escalation created
 	// before cutoff, returning how many were dismissed.
 	DismissEscalationsBefore(ctx context.Context, cutoff time.Time) (int64, error)
-	// CodexMCQAuditCandidates returns historical Codex rows still classified
-	// as unclassifiable. A positive auditID restricts the repair preview to one
-	// row; structural MCQ validation remains in the front-end domain layer.
-	CodexMCQAuditCandidates(ctx context.Context, auditID int64) ([]domain.AuditRecord, error)
-	// ReclassifyCodexMCQAudit atomically changes only classification metadata
-	// when the row still matches the previewed Codex/unclassifiable state.
-	ReclassifyCodexMCQAudit(ctx context.Context, auditID int64, oldSignature,
-		newSignature, paneExcerpt, rationale string, snapshotAt time.Time) (bool, error)
 	ClearLearnedData(ctx context.Context) error
 }
 

@@ -1417,30 +1417,3 @@ func TestExpireStalePendingLLMRequestsReleasesGuard(t *testing.T) {
 		t.Error("a fresh pending request must not be expired")
 	}
 }
-
-func TestReclassifyCodexMCQAuditOptimisticGuard(t *testing.T) {
-	s, _ := openTestStore(t)
-	ctx := context.Background()
-	excerpt := "Question 1/1 (1 unanswered)\nPick one\n1. One\ntab to add notes | enter to submit answer | ←/→ to navigate questions | esc to interrupt"
-	id, err := s.AppendAudit(ctx, domain.AuditRecord{
-		AgentType: "codex", Signature: "unclassifiable:old",
-		SituationType: domain.SituationUnclassifiable, PaneExcerpt: excerpt,
-		Status: "dismissed", CreatedAt: time.Unix(1234, 0),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	changed, err := s.ReclassifyCodexMCQAudit(ctx, id, "wrong-preview-signature",
-		"choice:new", excerpt, "repair", time.Unix(1234, 0))
-	if err != nil || changed {
-		t.Fatalf("stale preview guard: changed=%v err=%v", changed, err)
-	}
-	rec, _ := s.GetAudit(ctx, id)
-	if rec.SituationType != domain.SituationUnclassifiable || rec.Signature != "unclassifiable:old" {
-		t.Fatalf("guarded repair mutated row: %+v", rec)
-	}
-	if snapshot, _ := s.GetSignatureSnapshot(ctx, "choice:new"); snapshot != "" {
-		t.Fatalf("failed repair wrote snapshot %q", snapshot)
-	}
-}

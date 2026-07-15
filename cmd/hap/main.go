@@ -53,8 +53,6 @@ Operate:
   dismiss <id>...       drop pending escalation(s) without responding
                         (audit rows kept; nothing sent or learned)
   audit [--limit N]     show the audit log
-  audit reclassify-codex-mcq [--id N] [--apply]   preview/apply historical
-                        unclassifiable -> choice repairs for Codex MCQ rows
   signatures [list|show <sig>|delete <sig> [--yes]]   learned signatures (alias: sigs)
                         list filters: --type T --mode M --agent-type A --min-conf C
   signatures reembed [--force]   re-compute stored embeddings after an
