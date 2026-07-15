@@ -1775,6 +1775,9 @@ func (d *Daemon) paneExcerpt(ctx context.Context, cfg config.Config, s domain.Si
 		slog.Warn("deep pane read for LLM context failed; using classification snapshot",
 			"pane", s.PaneID, "error", err)
 	}
+	if strings.EqualFold(s.AgentType, "codex") {
+		excerpt = domain.StripCodexComposer(excerpt)
+	}
 	return tail(excerpt, chars)
 }
 

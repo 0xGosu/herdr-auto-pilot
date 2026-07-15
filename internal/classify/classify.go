@@ -120,6 +120,9 @@ func New(operatorRules []config.ClassifierRule) *Classifier {
 // Classify assigns pane content to exactly one situation type or
 // unclassifiable (FR-002). agentStatus is Herdr's semantic agent state.
 func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situation {
+	if strings.EqualFold(agentType, "codex") {
+		pane = domain.StripCodexComposer(pane)
+	}
 	s := domain.Situation{AgentType: agentType, Content: pane, Type: domain.SituationUnclassifiable}
 
 	// Approval and choice are BLOCKED situations (constitution taxonomy): only
