@@ -528,6 +528,17 @@ func TestEditChecklistItemText(t *testing.T) {
 	if _, err := EditChecklistItemText(content, 5, "x"); err == nil {
 		t.Error("out-of-range index must error")
 	}
+	// An embedded newline must be rejected — it would inject an extra item (and
+	// a forged status) rather than editing one line.
+	for _, bad := range []string{"one\n- [x] injected", "a\r- [x] injected", "line1\nline2"} {
+		if _, err := EditChecklistItemText(content, 1, bad); err == nil {
+			t.Errorf("EditChecklistItemText must reject embedded newline in %q", bad)
+		}
+	}
+	// The item is unchanged after a rejected edit (validation happens before rewrite).
+	if got, _ := EditChecklistItemText(content, 1, "clean text"); got == content {
+		t.Error("a valid edit should change the content")
+	}
 }
 
 func TestDeleteChecklistItem(t *testing.T) {
@@ -573,5 +584,12 @@ func TestAppendChecklistItem(t *testing.T) {
 	}
 	if _, _, err := AppendChecklistItem("- [ ] a", "  "); err == nil {
 		t.Error("empty text must error")
+	}
+	// Embedded CR/LF must be rejected so `add` can never inject a second item
+	// (or a forged "[x]" status) while reporting a single task.
+	for _, bad := range []string{"one\n- [x] injected", "a\r\n- [x] injected", "a\rb"} {
+		if _, _, err := AppendChecklistItem("- [ ] a", bad); err == nil {
+			t.Errorf("AppendChecklistItem must reject embedded newline in %q", bad)
+		}
 	}
 }

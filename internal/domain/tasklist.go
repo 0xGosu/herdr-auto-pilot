@@ -204,6 +204,22 @@ func ParseChecklist(content string) []ChecklistItem {
 	return items
 }
 
+// validateTaskText trims surrounding whitespace and rejects empty or
+// multi-line text. A checklist item is a single physical line, so an embedded
+// newline or carriage return would silently inject extra items — or a forged
+// "[x]" status — into the file while the command reports one task written.
+// Every helper that writes operator-supplied item text goes through this.
+func validateTaskText(text string) (string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", fmt.Errorf("task text must not be empty")
+	}
+	if strings.ContainsAny(text, "\r\n") {
+		return "", fmt.Errorf("task text must be a single line (no embedded newlines)")
+	}
+	return text, nil
+}
+
 // outOfRangeErr reports a task number that names no item, quoting the valid
 // range so a caller (or coding agent) can re-list and retry.
 func outOfRangeErr(index, count int) error {
@@ -245,12 +261,12 @@ func SetChecklistItemDone(content string, index int, done bool) (string, error) 
 }
 
 // EditChecklistItemText replaces item index's text, preserving its prefix and
-// its current checkbox marker (a done item stays done). The new text must be
-// non-empty.
+// its current checkbox marker (a done item stays done). The new text must be a
+// non-empty single line.
 func EditChecklistItemText(content string, index int, text string) (string, error) {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return "", fmt.Errorf("task text must not be empty")
+	text, err := validateTaskText(text)
+	if err != nil {
+		return "", err
 	}
 	return rewriteChecklistLine(content, index, func(prefix, marker, _ string) string {
 		return prefix + "[" + marker + "] " + text
@@ -281,11 +297,11 @@ func DeleteChecklistItem(content string, index int) (string, error) {
 // item's indent+bullet — usually the list's top-level style — so appending
 // never accidentally nests the new task under a preceding sub-item. With no
 // existing items it is appended at end of file with a default "- " bullet. The
-// text must be non-empty.
+// text must be a non-empty single line.
 func AppendChecklistItem(content, text string) (string, int, error) {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return "", 0, fmt.Errorf("task text must not be empty")
+	text, err := validateTaskText(text)
+	if err != nil {
+		return "", 0, err
 	}
 	items := ParseChecklist(content)
 	newIndex := len(items) + 1

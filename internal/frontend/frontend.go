@@ -10,6 +10,8 @@ package frontend
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1527,10 +1529,40 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return os.Rename(tmpName, path)
 }
 
+// taskLockPath returns a stable, hap-owned lock-file path for a task file,
+// keyed by the file's (already absolute) path. Keeping the lock in a shared
+// temp dir — rather than a `<file>.lock` sidecar — serializes concurrent
+// mutations without dropping a stray lock file into the user's repo next to a
+// --path checklist.
+func taskLockPath(path string) string {
+	sum := sha256.Sum256([]byte(path))
+	return filepath.Join(os.TempDir(), "hap-task-locks", hex.EncodeToString(sum[:16])+".lock")
+}
+
 // mutateTaskFile reads path, applies fn to its content, writes the result
 // atomically, and returns the re-parsed item list so callers can echo the
-// freshly renumbered checklist.
+// freshly renumbered checklist. The whole read-modify-rename is serialized
+// under a per-path advisory lock so two concurrent `hap task` mutations (e.g.
+// add racing done) can't both derive from the same content and have the last
+// rename silently drop the other — the atomic rename alone only guards a
+// reader against a partial write, not two writers against each other.
 func mutateTaskFile(path string, fn func(content string) (string, error)) ([]domain.ChecklistItem, error) {
+	lockPath := taskLockPath(path)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return nil, err
+	}
+	unlock, err := lockFile(lockPath)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	// Preserve the checklist's existing permission bits: a user's 0644 --path
+	// file must not be narrowed to 0600 on every edit.
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -1539,7 +1571,7 @@ func mutateTaskFile(path string, fn func(content string) (string, error)) ([]dom
 	if err != nil {
 		return nil, err
 	}
-	if err := writeFileAtomic(path, []byte(out), 0o600); err != nil {
+	if err := writeFileAtomic(path, []byte(out), info.Mode().Perm()); err != nil {
 		return nil, err
 	}
 	return domain.ParseChecklist(out), nil
