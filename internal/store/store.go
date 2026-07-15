@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS signatures (
 	mode TEXT NOT NULL DEFAULT 'shadow',
 	consecutive_confirmations INTEGER NOT NULL DEFAULT 0,
 	cached_confidence REAL NOT NULL DEFAULT 0,
+	decision_floor_id INTEGER NOT NULL DEFAULT 0,
 	guard_state TEXT NOT NULL DEFAULT '',
 	updated_at INTEGER NOT NULL
 );
@@ -222,6 +223,9 @@ func (s *Store) migrate() error {
 		// sent = 1 when the front-end delivered the correction to the agent;
 		// drives the daemon's post-action unblock self-check.
 		`ALTER TABLE corrections ADD COLUMN sent INTEGER NOT NULL DEFAULT 0`,
+		// Per-signature decision-id floor: decisions with id <= this are kept
+		// but excluded from confidence/graduation (stamped by an operator reset).
+		`ALTER TABLE signatures ADD COLUMN decision_floor_id INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
@@ -265,17 +269,18 @@ func (s *Store) UpsertSignature(ctx context.Context, sig domain.SignatureState) 
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO signatures (signature, situation_type, agent_type, mode,
-				consecutive_confirmations, cached_confidence, guard_state, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+				consecutive_confirmations, cached_confidence, decision_floor_id, guard_state, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(signature) DO UPDATE SET
 				agent_type=excluded.agent_type,
 				mode=excluded.mode,
 				consecutive_confirmations=excluded.consecutive_confirmations,
 				cached_confidence=excluded.cached_confidence,
+				decision_floor_id=excluded.decision_floor_id,
 				guard_state=excluded.guard_state,
 				updated_at=excluded.updated_at`,
 			sig.Signature, string(sig.SituationType), sig.AgentType, string(sig.Mode),
-			sig.ConsecutiveConfirmations, sig.CachedConfidence, sig.GuardState, unix(sig.UpdatedAt))
+			sig.ConsecutiveConfirmations, sig.CachedConfidence, sig.DecisionFloorID, sig.GuardState, unix(sig.UpdatedAt))
 		return err
 	})
 }
@@ -673,13 +678,13 @@ func (s *Store) InsertLLMDecision(ctx context.Context, d domain.LLMDecision) (in
 func (s *Store) GetSignature(ctx context.Context, signature string) (*domain.SignatureState, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT signature, situation_type, agent_type, mode, consecutive_confirmations,
-			cached_confidence, guard_state, updated_at
+			cached_confidence, decision_floor_id, guard_state, updated_at
 		FROM signatures WHERE signature = ?`, signature)
 	var st domain.SignatureState
 	var situationType, mode string
 	var updated int64
 	err := row.Scan(&st.Signature, &situationType, &st.AgentType, &mode,
-		&st.ConsecutiveConfirmations, &st.CachedConfidence, &st.GuardState, &updated)
+		&st.ConsecutiveConfirmations, &st.CachedConfidence, &st.DecisionFloorID, &st.GuardState, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -729,7 +734,7 @@ func (s *Store) DecisionsForSignature(ctx context.Context, signature string, lim
 func (s *Store) ListSignatures(ctx context.Context, f domain.SignatureFilter) ([]domain.SignatureState, error) {
 	query := `
 		SELECT signature, situation_type, agent_type, mode, consecutive_confirmations,
-			cached_confidence, guard_state, updated_at
+			cached_confidence, decision_floor_id, guard_state, updated_at
 		FROM signatures WHERE 1=1`
 	var args []any
 	if f.SituationType != "" {
@@ -760,7 +765,7 @@ func (s *Store) ListSignatures(ctx context.Context, f domain.SignatureFilter) ([
 		var situationType, mode string
 		var updated int64
 		if err := rows.Scan(&st.Signature, &situationType, &st.AgentType, &mode,
-			&st.ConsecutiveConfirmations, &st.CachedConfidence, &st.GuardState, &updated); err != nil {
+			&st.ConsecutiveConfirmations, &st.CachedConfidence, &st.DecisionFloorID, &st.GuardState, &updated); err != nil {
 			return nil, err
 		}
 		st.SituationType = domain.SituationType(situationType)

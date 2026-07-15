@@ -57,7 +57,7 @@ hap is not a wrapper around the coding agents; it observes and drives them from 
 5. **decide** — if a confident, graduated (autonomous) rule applies and passes every safety gate (kill switch, never-auto patterns, irreversible heuristic, rate/retry guards), the daemon **acts**. otherwise it **escalates** to the operator — or first **consults the local LLM** (if configured), whose suggestion is re-gated through the same safety controls.
 6. **act** — the chosen reply is delivered back into the pane through herdr: `agent send <pane> <text>` writes the text, then `pane send-keys <pane> enter` submits it (herdr's `agent send` does not press Enter on its own). a numbered menu (`1. Yes / 2. No`) is mapped to its **digit** via `MenuKeystroke` before sending — herdr menus accept the number, not the label. a `@noop` decision records/learns but sends nothing.
 
-**shadow → autonomous.** a new signature starts in shadow mode: the daemon escalates with a suggestion, the operator confirms or corrects, and after enough consistent confirmations (`learning.graduation_n`) the signature graduates and the daemon acts on it unattended. corrections demote it back to shadow.
+**shadow → autonomous.** a new signature starts in shadow mode: the daemon escalates with a suggestion, the operator confirms or corrects, and after enough consistent confirmations (`learning.graduation_n`) the signature graduates and the daemon acts on it unattended. an operator confirm/send weighs extra toward confidence (`learning.confirmation_weight`, default 3×), so confirmed rules build confidence faster. **graduation is permanent**: once autonomous the confirmation count is frozen and a later correction no longer demotes the rule (the correction is still recorded, so confidence — and the confidence gate — reflect it). the only way back to shadow is an explicit `hap signatures reset` (or the Rules-tab reset key).
 
 **everything is out-of-process and fail-safe.** the daemon never blocks the agent and never modifies the agent's process — it only reads panes and sends keystrokes, exactly as a human operator would. shelling out to the LLM CLI or doing deep pane reads happens in goroutines so the single select loop keeps serving all agents; any error resolves to escalate + audit, never a crash.
 
@@ -223,6 +223,17 @@ delete a signature you no longer trust (erases its decision history; audit rows 
 hap signatures delete approval:9f2c --yes
 ```
 
+reset a signature back to a fresh rule: shadow mode, streak → 0, and confidence cleared to a
+fresh 1.0. all decision rows are **kept** (and the rule still suggests its learned answer),
+but decisions recorded before the reset no longer count toward confidence or graduation — the
+rule behaves confidence-new and must re-earn `learning.graduation_n` confirmations to
+re-graduate. this is the only way to demote an autonomous rule now that graduation is
+permanent:
+
+```bash
+hap signatures reset approval:9f2c --yes
+```
+
 re-compute stored embeddings after changing the embedding model:
 
 ```bash
@@ -305,6 +316,7 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `confidence_thresholds.error` | 0.75 | confidence threshold for error situations |
 | `confidence_thresholds.inferred_task_bar` | 0.60 | higher bar for tasks inferred from pane history |
 | `learning.graduation_n` | 2 | consecutive confirmations needed to graduate (1-10) |
+| `learning.confirmation_weight` | 3.0 | vote-weight multiplier for an operator confirmation in the confidence ratio (1 disables the boost) |
 | `limits.max_consecutive_auto_prompts` | 10 | max consecutive auto-prompts per agent without human interaction |
 | `limits.max_auto_prompts_per_minute` | 5 | rate limit per agent (rolling 1-minute window) |
 | `limits.max_error_retries` | 2 | max retries per error signature |
@@ -724,6 +736,9 @@ hap signatures show approval:9f2c
 # delete one that's no longer relevant
 hap signatures delete idle:3a1b --yes
 
+# reset a graduated rule back to shadow (streak → 0; history kept)
+hap signatures reset approval:9f2c --yes
+
 # re-compute embeddings after switching embedding model
 hap signatures reembed
 ```
@@ -740,6 +755,7 @@ hap signatures reembed
 - `hap dismiss` drops escalations without responding — safe, nothing is sent or learned, audit rows kept as `dismissed`.
 - `hap escalations prune [minutes]` bulk-dismisses old escalations (default 360 minutes).
 - `hap signatures delete` erases the signature's decision history (audit rows are kept) — the plugin must re-learn that situation from scratch.
+- `hap signatures reset` returns a signature to a fresh rule — shadow mode, streak → 0, confidence cleared to 1.0 — while **keeping** its decision history (pre-reset decisions no longer count toward confidence/graduation, and the learned answer is still suggested). The only way to demote an autonomous rule (graduation is permanent; corrections no longer demote). It must re-earn `learning.graduation_n` confirmations to re-graduate.
 - `hap signatures reembed` re-computes stored embeddings after an embedding model change; use `--force` to retry a previously failed pass.
 - `hap pause` is the emergency kill switch — use it if automation is misbehaving.
 - `hap clear-data --yes` is irreversible — it resets all learned patterns but keeps config.

@@ -229,6 +229,10 @@ type FrontendStore interface {
 	// may recreate the signature from an in-flight event; the recreated
 	// state starts from zero, which is what deletion means.
 	DeleteSignature(ctx context.Context, signature string) (int64, error)
+	// UpsertSignature writes a signature's learning state. Front-ends use it
+	// only for explicit operator commands (e.g. ResetGraduation) — never the
+	// learning hot path, which the daemon owns.
+	UpsertSignature(ctx context.Context, s domain.SignatureState) error
 	// DismissEscalation flips one pending escalation to "dismissed" without
 	// recording a correction; the audit row is kept (append-only, FR-020).
 	// Errors when the record is not a pending escalation.

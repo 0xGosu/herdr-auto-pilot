@@ -614,6 +614,43 @@ func TestSignatureDeletePromptFlow(t *testing.T) {
 	}
 }
 
+func TestSignatureResetPromptFlow(t *testing.T) {
+	m, _, st := appModel(t)
+	ctx := context.Background()
+
+	// 0 opens the type-yes reset prompt.
+	m = press(t, m, "0")
+	if m.prompt == nil || !strings.Contains(m.prompt.label, "type 'yes' to reset approval:deadbee…") {
+		t.Fatalf("0 should open the reset prompt, got %+v", m.prompt)
+	}
+	// Any other input aborts, leaving the signature untouched.
+	m = press(t, m, "n", "o")
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if msg, ok := cmd().(actionResultMsg); !ok || msg.message != "reset aborted" {
+		t.Fatalf("non-yes input must abort, got %+v", msg)
+	}
+	if sig, _ := st.GetSignature(ctx, "approval:deadbeef00112233"); sig.ConsecutiveConfirmations != 2 {
+		t.Fatal("aborted reset must not change the streak")
+	}
+
+	// Typing yes resets to shadow with a zero streak; decision history kept.
+	m = press(t, m, "0", "y", "e", "s")
+	upd, cmd = m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	msg, ok := cmd().(actionResultMsg)
+	if !ok || msg.err != nil || !strings.Contains(msg.message, "reset approval:deadbee…") {
+		t.Fatalf("yes should reset, got %+v", msg)
+	}
+	sig, _ := st.GetSignature(ctx, "approval:deadbeef00112233")
+	if sig == nil || sig.Mode != domain.ModeShadow || sig.ConsecutiveConfirmations != 0 || sig.CachedConfidence != 1.0 {
+		t.Errorf("reset must return the signature to a fresh shadow rule (streak 0, confidence 1.0): %+v", sig)
+	}
+	if recs, _ := st.DecisionsForSignature(ctx, "approval:deadbeef00112233", 10); len(recs) != 1 {
+		t.Error("reset must keep decision history")
+	}
+}
+
 func TestConfigTabKeepsEditing(t *testing.T) {
 	m := testModel(t)
 	m.tab = tabConfig

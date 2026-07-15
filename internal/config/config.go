@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -29,6 +30,10 @@ type ConfidenceThresholds struct {
 // Learning controls shadow-mode graduation (FR-006).
 type Learning struct {
 	GraduationN int `toml:"graduation_n"`
+	// ConfirmationWeight multiplies the vote weight of an operator confirmation
+	// when computing a signature's confidence (FR-005). >1 grades confirmed
+	// rules higher; 1 disables the boost. Values <1 fall back to the default.
+	ConfirmationWeight float64 `toml:"confirmation_weight"`
 }
 
 // Safety holds the never-auto patterns and heuristic configuration (FR-015/016).
@@ -301,7 +306,9 @@ func Default() Config {
 			Error:           0.75,
 			InferredTaskBar: 0.60,
 		},
-		Learning: Learning{GraduationN: 2},
+		// ConfirmationWeight mirrors domain.DefaultConfirmationWeight (kept a
+		// literal here so config stays decoupled from the domain package).
+		Learning: Learning{GraduationN: 2, ConfirmationWeight: 3.0},
 		Limits: Limits{
 			MaxConsecutiveAutoPrompts: 10,
 			MaxAutoPromptsPerMinute:   5,
@@ -592,6 +599,13 @@ func (c *Config) fillZeroes() {
 	}
 	if c.Learning.GraduationN <= 0 {
 		c.Learning.GraduationN = d.Learning.GraduationN
+	}
+	// An explicit 1 disables the boost; bad values fall back to the default so a
+	// misconfigured weight never silently penalizes confirmations. NaN/±Inf
+	// (TOML accepts inf/nan) are rejected too — a non-finite weight would make
+	// Confidence produce a NaN score that slips past the confidence gate.
+	if w := c.Learning.ConfirmationWeight; w < 1 || math.IsNaN(w) || math.IsInf(w, 0) {
+		c.Learning.ConfirmationWeight = d.Learning.ConfirmationWeight
 	}
 	if c.Limits.MaxConsecutiveAutoPrompts <= 0 {
 		c.Limits.MaxConsecutiveAutoPrompts = d.Limits.MaxConsecutiveAutoPrompts

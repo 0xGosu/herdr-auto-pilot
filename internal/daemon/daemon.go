@@ -959,6 +959,7 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		State:                state,
 		History:              history,
 		ConfidenceThresholds: confidenceThresholds(cfg),
+		ConfirmationWeight:   cfg.Learning.ConfirmationWeight,
 		GraduationN:          cfg.Learning.GraduationN,
 		KillActive:           killActive,
 		Rate:                 rate,
@@ -2306,11 +2307,19 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(domain.ReasonPersistenceFailed, err.Error())
 		return
 	}
+	// Exclude pre-reset decisions from the confidence the variance guard checks
+	// and the score written to the audit row (id > the signature's floor).
+	// Best-effort: a missing/failed state read just leaves full history in play.
+	if res.sig.Signature != "" {
+		if st, err := d.opt.Store.GetSignature(ctx, res.sig.Signature); err == nil && st != nil {
+			history = domain.DecisionsSince(history, st.DecisionFloorID)
+		}
+	}
 	// The variance guard compares the LLM's action to the signature's dominant
 	// learned action; it does not apply to a declared-task review, whose action
 	// is novel task text (each task differs) rather than a repeated answer.
 	if !res.request.TaskReview {
-		if conf := domain.Confidence(history); conf.TopAction != "" && conf.TopAction != llmDec.Action {
+		if conf := domain.Confidence(history, cfg.Learning.ConfirmationWeight); conf.TopAction != "" && conf.TopAction != llmDec.Action {
 			reject(domain.ReasonVarianceGuard, "LLM contradicts history")
 			return
 		}
@@ -2319,7 +2328,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// Both scores land on the auto-acted audit row: the computed 0-1 agreement
 	// over this signature's history AND the LLM's self-reported 0-100 (>= 0
 	// here — a lower score would have escalated at the gate above).
-	computedConf := domain.Confidence(history).Score
+	computedConf := domain.Confidence(history, cfg.Learning.ConfirmationWeight).Score
 	llmConf := llmDec.ConfidentScore
 
 	if isNoop {
@@ -2676,7 +2685,6 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	if err != nil {
 		return nil, err
 	}
-	prior := domain.Confidence(history)
 
 	state, err := d.opt.Store.GetSignature(ctx, audit.Signature)
 	if err != nil {
@@ -2693,6 +2701,10 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 			state.AgentType = at
 		}
 	}
+
+	// Confidence/graduation see only post-reset decisions (id > the floor); the
+	// full history above still feeds agent-type healing.
+	prior := domain.Confidence(domain.DecisionsSince(history, state.DecisionFloorID), cfg.Learning.ConfirmationWeight)
 
 	// Was this a confirmation of the suggested/learned action, or a
 	// correction to something else?
@@ -2715,8 +2727,11 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		consistent := prior.TopAction == "" || prior.TopAction == c.CorrectedAction
 		newState = domain.ObserveConfirmation(newState, consistent)
 	} else if wasAutonomous {
-		// Correcting an autonomous decision demotes the signature (FR-007).
-		newState = domain.ObserveCorrection(newState)
+		// Permanent graduation (revised FR-007): correcting a graduated rule
+		// records the decision above (so confidence reflects it and the
+		// confidence gate still applies) but never demotes it or changes its
+		// frozen count. Only an operator reset (ResetGraduation) returns it to
+		// shadow. newState is intentionally left unchanged here.
 	} else {
 		// Correcting a shadow suggestion: the corrected action starts its
 		// own streak.
@@ -2727,7 +2742,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	if err != nil {
 		return nil, err
 	}
-	conf := domain.Confidence(refreshed)
+	conf := domain.Confidence(domain.DecisionsSince(refreshed, newState.DecisionFloorID), cfg.Learning.ConfirmationWeight)
 	newState.CachedConfidence = conf.Score
 	newState.UpdatedAt = now
 	newState = domain.MaybeGraduate(newState, conf.Score,

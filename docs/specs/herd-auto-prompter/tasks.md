@@ -107,10 +107,10 @@ Implementation plan derived from the constitution, requirements, and solution sp
   - _Requirements: FR-005, DR-001_
   - _Complexity: Medium_
 
-- [x] 11\. Graduation / demotion state machine
-  - Implement shadow→autonomous graduation (N consecutive consistent confirmations AND above threshold) and demotion on correction (reset consecutive count to zero; ratio not additionally discounted).
+- [x] 11\. Graduation state machine (permanent graduation)
+  - Implement shadow→autonomous graduation (N consecutive consistent confirmations AND above threshold). Graduation is permanent: once autonomous the count is frozen and a correction no longer demotes (it is still recorded, so confidence/gate reflect it). The only path back to shadow is an explicit operator reset (CLI/TUI).
   - Acceptance Criteria (unit):
-    - < N confirmations stays shadow even at high confidence; correction resets count and requires N fresh confirmations before re-graduation.
+    - < N confirmations stays shadow even at high confidence; a correction of an autonomous rule leaves it autonomous with an unchanged count; an operator reset returns it to shadow with a zero count, requiring N fresh confirmations before re-graduation.
   - _Dependencies: 10_
   - _Requirements: FR-006, FR-007_
   - _Complexity: Medium_
@@ -243,7 +243,7 @@ Implementation plan derived from the constitution, requirements, and solution sp
 - [x] 26\. Shadow-mode observation & decision recording
   - Record confirmations/corrections as learning events feeding confidence/graduation. (Reload-triggered re-derivation of signature counters is verified in Task 27, once the control-socket reload path exists.)
   - Acceptance Criteria (unit + integration):
-    - Confirm stores the chosen action; correct stores the corrected action; graduation/demotion state transitions behave per FR-006/007 given a direct in-process apply.
+    - Confirm stores the chosen action; correct stores the corrected action; graduation/reset state transitions behave per FR-006/007 given a direct in-process apply.
   - _Dependencies: 11, 6_
   - _Requirements: FR-004, FR-006, FR-007, DR-001, DR-005_
   - _Complexity: Medium_
@@ -251,7 +251,7 @@ Implementation plan derived from the constitution, requirements, and solution sp
 - [x] 27\. Correction-driven re-derivation on reload
   - On reload nudge, consume new front-end-written correction records and re-derive affected signature mode/counters (no front-end writes to hot-path rows).
   - Acceptance Criteria:
-    - A correction submitted from TUI/CLI demotes the signature after the daemon reloads; hot-path rows only ever written by the daemon.
+    - A correction submitted from TUI/CLI is recorded as a decision after the daemon reloads and (under permanent graduation) leaves an autonomous signature autonomous; hot-path counter rows only ever written by the daemon. Operator reset (an explicit command) is the sole front-end path that writes a signature back to shadow.
   - _Dependencies: 26, 30_
   - _Requirements: FR-007, Solution §Concurrency & Durability Model_
   - _Complexity: Medium_

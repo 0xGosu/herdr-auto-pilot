@@ -460,6 +460,41 @@ func TestSignaturesDelete(t *testing.T) {
 	}
 }
 
+func TestSignaturesReset(t *testing.T) {
+	app, st := testApp(t)
+	seedSignatures(t, st)
+	ctx := context.Background()
+
+	// choice:cccc3333 is seeded autonomous with a streak of 5.
+	if sig, _ := st.GetSignature(ctx, "choice:cccc3333"); sig == nil || sig.Mode != domain.ModeAutonomous {
+		t.Fatal("precondition: choice:cccc3333 must start autonomous")
+	}
+
+	// Without --yes on non-TTY stdin, reset must refuse but still print the row.
+	out, err := run(t, app, "signatures", "reset", "choice:")
+	if err == nil || !strings.Contains(err.Error(), "--yes") {
+		t.Fatalf("non-TTY reset without --yes must refuse with a --yes hint, got %v", err)
+	}
+	if !strings.Contains(out, "choice:cccc3333") {
+		t.Errorf("refusal should print the row first:\n%s", out)
+	}
+	if sig, _ := st.GetSignature(ctx, "choice:cccc3333"); sig.Mode != domain.ModeAutonomous {
+		t.Fatal("signature must not be reset without confirmation")
+	}
+
+	out, err = run(t, app, "signatures", "reset", "choice:", "--yes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "reset signature choice:cccc3333 to a fresh rule") {
+		t.Errorf("reset output:\n%s", out)
+	}
+	sig, _ := st.GetSignature(ctx, "choice:cccc3333")
+	if sig == nil || sig.Mode != domain.ModeShadow || sig.ConsecutiveConfirmations != 0 || sig.CachedConfidence != 1.0 {
+		t.Errorf("reset must return the signature to a fresh shadow rule (streak 0, confidence 1.0): %+v", sig)
+	}
+}
+
 func TestDismissCLI(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()

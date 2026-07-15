@@ -1717,6 +1717,51 @@ func TestDeleteSignatureNudgesReload(t *testing.T) {
 	}
 }
 
+func TestResetSignatureGraduationThroughApp(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:grad", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeAutonomous, ConsecutiveConfirmations: 9,
+		CachedConfidence: 0.4, UpdatedAt: now,
+	})
+	var lastID int64
+	for _, a := range []string{"1", "1"} {
+		lastID, _ = st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:grad",
+			SituationType: domain.SituationApproval, AgentType: "claude",
+			ChosenAction: a, Source: domain.SourceOperator, CreatedAt: now})
+	}
+
+	sig, err := app.ResetSignatureGraduation(ctx, "approval:g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sig != "approval:grad" {
+		t.Errorf("reset resolved sig = %q, want approval:grad", sig)
+	}
+	got, _ := st.GetSignature(ctx, "approval:grad")
+	if got == nil || got.Mode != domain.ModeShadow || got.ConsecutiveConfirmations != 0 {
+		t.Errorf("reset must return the signature to shadow with a zero streak: %+v", got)
+	}
+	// Reset clears confidence (fresh 1.0) and stamps the floor at the newest
+	// decision id so pre-reset decisions stop counting.
+	if got.CachedConfidence != 1.0 {
+		t.Errorf("reset must set cached confidence to 1.0, got %.3f", got.CachedConfidence)
+	}
+	if got.DecisionFloorID != lastID {
+		t.Errorf("reset floor = %d, want newest decision id %d", got.DecisionFloorID, lastID)
+	}
+	// Decision history is kept (a reset is not a delete).
+	if decs, _ := st.DecisionsForSignature(ctx, "approval:grad", 10); len(decs) != 2 {
+		t.Errorf("reset must keep decision history, got %d", len(decs))
+	}
+	// Unknown prefix surfaces the resolution error.
+	if _, err := app.ResetSignatureGraduation(ctx, "nope:xyz"); err == nil {
+		t.Error("prefix resolution error must surface")
+	}
+}
+
 // fakeLocatorPort is a fakeHerdrPort that also reports workspace/tab
 // metadata (ports.LocatorPort).
 type fakeLocatorPort struct {

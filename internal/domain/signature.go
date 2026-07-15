@@ -213,10 +213,10 @@ const varianceMinDecisions = 4
 
 // VarianceGuardTripped reports whether history agreement falls below the
 // operator-configured minimum.
-func VarianceGuardTripped(history []DecisionRecord, minimumAgreement float64) bool {
+func VarianceGuardTripped(history []DecisionRecord, minimumAgreement, confirmWeight float64) bool {
 	if len(history) < varianceMinDecisions {
 		return false
 	}
-	conf := Confidence(history)
+	conf := Confidence(history, confirmWeight)
 	return conf.Score < minimumAgreement
 }

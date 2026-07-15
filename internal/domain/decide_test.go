@@ -16,6 +16,7 @@ func baseInput(st SituationType) DecideInput {
 		},
 		Signature:            SignatureResult{Signature: "sig", Verdict: GuardOK},
 		ConfidenceThresholds: ConfidenceThresholds{Minimum: 0.5, Idle: 0.65, Approval: 0.7, Choice: 0.7, Error: 0.75, InferredTaskBar: 0.6},
+		ConfirmationWeight:   DefaultConfirmationWeight,
 		GraduationN:          5,
 		RateLimits:           RateLimits{MaxConsecutive: 5, MaxPerMinute: 10},
 		Now:                  time.Now(),
@@ -37,6 +38,28 @@ func TestKillSwitchVetoesEverything(t *testing.T) {
 	d := Decide(in)
 	if d.Action != ActionEscalate || d.Reason != ReasonKilled {
 		t.Fatalf("kill switch must escalate, got %+v", d)
+	}
+}
+
+func TestDecisionFloorGatesButKeepsSuggestion(t *testing.T) {
+	// A reset rule stamps a floor above all its current decisions, so post-floor
+	// history is empty: confidence is 0 (below threshold) and it escalates —
+	// but it STILL suggests its learned answer, drawn from full history.
+	in := baseInput(SituationApproval)
+	in.State = &SignatureState{Mode: ModeAutonomous, DecisionFloorID: 100}
+	in.History = []DecisionRecord{
+		{ID: 5, ChosenAction: "y", Source: SourceOperator},
+		{ID: 3, ChosenAction: "y", Source: SourceOperator},
+	}
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonBelowThreshold {
+		t.Fatalf("post-floor-empty rule must escalate below threshold, got %+v", d)
+	}
+	if d.Suggestion != "respond: y" {
+		t.Errorf("reset rule must still suggest the learned answer, got %q", d.Suggestion)
+	}
+	if d.Confidence != 0 {
+		t.Errorf("post-floor confidence should be 0, got %.3f", d.Confidence)
 	}
 }
 

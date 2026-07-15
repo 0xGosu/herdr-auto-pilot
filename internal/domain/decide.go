@@ -89,6 +89,7 @@ type DecideInput struct {
 	State                *SignatureState  // nil when the signature is new
 	History              []DecisionRecord // newest first
 	ConfidenceThresholds ConfidenceThresholds
+	ConfirmationWeight   float64 // operator-confirmation boost for Confidence
 	GraduationN          int
 	KillActive           bool
 	Rate                 AgentRate
@@ -143,9 +144,22 @@ func Decide(in DecideInput) Decision {
 		return esc(ReasonNeverAutoMatch, in.NeverAutoRuleHit.Diagnostic(), 0, "")
 	}
 
-	conf := Confidence(in.History)
+	// Confidence and the variance guard consider only post-reset decisions (id
+	// > the signature's floor); pre-reset rows are kept but no longer count. The
+	// suggested action, however, still comes from the FULL learned history: a
+	// reset rule keeps offering its learned answer while its score/graduation
+	// start fresh, so re-earning trust is just re-confirming it.
+	var floor int64
+	if in.State != nil {
+		floor = in.State.DecisionFloorID
+	}
+	post := DecisionsSince(in.History, floor)
+	conf := Confidence(post, in.ConfirmationWeight)
+	if len(post) == 0 {
+		conf.TopAction = Confidence(in.History, in.ConfirmationWeight).TopAction
+	}
 
-	if VarianceGuardTripped(in.History, in.ConfidenceThresholds.Minimum) {
+	if VarianceGuardTripped(post, in.ConfidenceThresholds.Minimum, in.ConfirmationWeight) {
 		return esc(ReasonVarianceGuard, "contradictory history", conf.Score, "")
 	}
 

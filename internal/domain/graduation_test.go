@@ -39,25 +39,39 @@ func TestInconsistentConfirmationRestartsStreak(t *testing.T) {
 	}
 }
 
-func TestCorrectionDemotesToShadowAndResetsCount(t *testing.T) {
-	// FR-007 acceptance: after a correction the signature is in shadow mode
-	// with a zero consecutive-confirmation count and must re-earn N fresh
-	// confirmations even if residual confidence stays high.
+func TestConfirmationFrozenAfterGraduation(t *testing.T) {
+	// Permanent graduation: once autonomous the consecutive count is frozen,
+	// so further confirmations (consistent or not) never change it.
+	state := SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 7}
+	state = ObserveConfirmation(state, true)
+	state = ObserveConfirmation(state, false)
+	if state.Mode != ModeAutonomous || state.ConsecutiveConfirmations != 7 {
+		t.Fatalf("autonomous count must freeze, got mode=%s count=%d",
+			state.Mode, state.ConsecutiveConfirmations)
+	}
+}
+
+func TestResetGraduationReturnsToShadow(t *testing.T) {
+	// The explicit operator reset is the ONLY path back to shadow now that
+	// graduation is permanent: mode→shadow, count→0, then must re-earn N.
 	const n = 5
-	state := SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 12}
-	state = ObserveCorrection(state)
+	state := SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 12, CachedConfidence: 0.3}
+	state = ResetGraduation(state)
 
 	if state.Mode != ModeShadow {
-		t.Fatal("correction must demote to shadow mode")
+		t.Fatal("reset must return the signature to shadow mode")
 	}
 	if state.ConsecutiveConfirmations != 0 {
-		t.Fatalf("correction must reset the consecutive count, got %d", state.ConsecutiveConfirmations)
+		t.Fatalf("reset must zero the consecutive count, got %d", state.ConsecutiveConfirmations)
+	}
+	if state.CachedConfidence != 1.0 {
+		t.Fatalf("reset must clear confidence to a fresh 1.0, got %.3f", state.CachedConfidence)
 	}
 
 	// High residual confidence alone cannot re-graduate.
 	state = MaybeGraduate(state, 0.97, 0.8, n)
 	if state.Mode != ModeShadow {
-		t.Error("demoted signature must re-earn N confirmations before re-graduating")
+		t.Error("a reset signature must re-earn N confirmations before re-graduating")
 	}
 
 	for i := 0; i < n; i++ {

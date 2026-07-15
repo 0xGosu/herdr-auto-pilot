@@ -53,7 +53,8 @@ func TestSignatureRoundTrip(t *testing.T) {
 	st := domain.SignatureState{
 		Signature: "approval:abc", SituationType: domain.SituationApproval,
 		AgentType: "claude", Mode: domain.ModeShadow,
-		ConsecutiveConfirmations: 3, CachedConfidence: 0.72, UpdatedAt: time.Now(),
+		ConsecutiveConfirmations: 3, CachedConfidence: 0.72,
+		DecisionFloorID: 42, UpdatedAt: time.Now(),
 	}
 	if err := s.UpsertSignature(ctx, st); err != nil {
 		t.Fatal(err)
@@ -62,7 +63,7 @@ func TestSignatureRoundTrip(t *testing.T) {
 	if err != nil || got == nil {
 		t.Fatalf("get: %v %v", got, err)
 	}
-	if got.Mode != domain.ModeShadow || got.ConsecutiveConfirmations != 3 {
+	if got.Mode != domain.ModeShadow || got.ConsecutiveConfirmations != 3 || got.DecisionFloorID != 42 {
 		t.Errorf("round trip mismatch: %+v", got)
 	}
 
