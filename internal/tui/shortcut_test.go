@@ -107,7 +107,16 @@ func TestEnsureExecutableSymlinkCreatesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := filepath.Abs(source)
+	// ensureExecutableSymlink resolves the source through EvalSymlinks before
+	// linking, so the expected value must resolve it the same way. On macOS a
+	// t.TempDir() path lives under the /var → /private/var symlink, so a plain
+	// filepath.Abs(source) would mismatch the resolved link target (no-op on
+	// Linux, where the temp dir has no such indirection).
+	resolved, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.Abs(resolved)
 	if err != nil {
 		t.Fatal(err)
 	}
