@@ -12,22 +12,6 @@ import (
 var uncheckedItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[[ ]\]\s*(.+)$`)
 var checkedItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[[xX+\-*]\]\s*(.+)$`)
 
-// generatedTaskIDRE matches the numbered ID marker RenderGeneratedTaskList
-// currently writes ("1\. ", "2\. ", …); the pattern also accepts a
-// hierarchical form ("2.1\. ") for forward compatibility, though nothing
-// generates that yet. The escaped dot is the deliberate signal that
-// distinguishes a generator-written ID from operator-typed numbering in a
-// hand-authored file ("1. done" is left as literal task text) — only the
-// backslash-escaped form is stripped.
-var generatedTaskIDRE = regexp.MustCompile(`^\d+(?:\.\d+)*\\\.\s+`)
-
-// stripGeneratedTaskID removes a RenderGeneratedTaskList numbered-ID marker
-// from the front of a checklist item's captured text, if present, so the
-// resolved task text matches what was originally generated.
-func stripGeneratedTaskID(s string) string {
-	return generatedTaskIDRE.ReplaceAllString(s, "")
-}
-
 // DefaultNextTaskTemplate is the prompt template used when a task source
 // declares none. Placeholders: {next_task_content} is the next unchecked
 // item (or NoTaskContent when the list is complete), {task_list_path} is
@@ -116,7 +100,7 @@ func HasChecklistItems(content string) bool {
 func NextDeclaredTask(content string) string {
 	for _, line := range strings.Split(content, "\n") {
 		if m := uncheckedItemRE.FindStringSubmatch(line); m != nil {
-			return stripGeneratedTaskID(strings.TrimSpace(m[1]))
+			return strings.TrimSpace(m[1])
 		}
 	}
 	return ""
@@ -132,7 +116,7 @@ func PendingDeclaredTasks(content string) []string {
 	var pending []string
 	for _, line := range strings.Split(content, "\n") {
 		if m := uncheckedItemRE.FindStringSubmatch(line); m != nil {
-			pending = append(pending, stripGeneratedTaskID(strings.TrimSpace(m[1])))
+			pending = append(pending, strings.TrimSpace(m[1]))
 		}
 	}
 	return pending

@@ -227,11 +227,12 @@ func TestNormalizeGeneratedTasksRealSample(t *testing.T) {
 
 func TestRenderGeneratedTaskList(t *testing.T) {
 	// First task is in-progress "[-]"; the rest are pending "[ ]". Each item
-	// carries its 1-based position as a numbered ID with an escaped dot
-	// ("1\. ", "2\. ", …) instead of a plain bullet, so a standard markdown
-	// task-list parser can read the file directly.
+	// carries its 1-based position as a numbered ID ("1. ", "2. ", …) instead
+	// of a plain bullet, so a standard markdown task-list parser can read the
+	// file directly (the ID sits after the checkbox, not at the start of the
+	// line, so it is never read as a Markdown ordered list).
 	got := RenderGeneratedTaskList("brave-otter", []string{"first", "second", "third"})
-	want := "# Tasks for brave-otter\n\n- [-] 1\\. first\n- [ ] 2\\. second\n- [ ] 3\\. third\n"
+	want := "# Tasks for brave-otter\n\n- [-] 1. first\n- [ ] 2. second\n- [ ] 3. third\n"
 	if got != want {
 		t.Errorf("RenderGeneratedTaskList =\n%q\nwant\n%q", got, want)
 	}
@@ -239,7 +240,7 @@ func TestRenderGeneratedTaskList(t *testing.T) {
 	// The first (only) item of a single-task list is in-progress, and the
 	// declared-task parser treats it as not-actionable (no next "[ ]").
 	single := RenderGeneratedTaskList("a", []string{"only task"})
-	if !strings.Contains(single, "- [-] 1\\. only task") {
+	if !strings.Contains(single, "- [-] 1. only task") {
 		t.Errorf("single task must be in-progress and numbered, got %q", single)
 	}
 	if NextDeclaredTask(single) != "" {
@@ -248,15 +249,17 @@ func TestRenderGeneratedTaskList(t *testing.T) {
 
 	// A multi-task list's NEXT declared task is the first pending "[ ]" item,
 	// so the normal flow drives the queue after the in-progress one. The
-	// resolved text is the bare task — the numbered ID marker is stripped.
+	// numbered ID marker is NOT stripped — it is indistinguishable from (and
+	// therefore treated exactly like) numbering an operator already may type
+	// into a hand-authored checklist, which is sent to the agent verbatim.
 	multi := RenderGeneratedTaskList("a", []string{"doing now", "up next", "later"})
-	if !strings.Contains(multi, "- [ ] 2\\. up next") {
+	if !strings.Contains(multi, "- [ ] 2. up next") {
 		t.Errorf("second item must carry numbered ID 2, got %q", multi)
 	}
-	if next := NextDeclaredTask(multi); next != "up next" {
-		t.Errorf("next declared task = %q, want the first pending item %q with its ID marker stripped", next, "up next")
+	if next := NextDeclaredTask(multi); next != "2. up next" {
+		t.Errorf("next declared task = %q, want the first pending item %q with its ID marker intact", next, "2. up next")
 	}
-	if pending := PendingDeclaredTasks(multi); len(pending) != 2 || pending[0] != "up next" || pending[1] != "later" {
-		t.Errorf("pending declared tasks = %v, want [\"up next\" \"later\"] with ID markers stripped", pending)
+	if pending := PendingDeclaredTasks(multi); len(pending) != 2 || pending[0] != "2. up next" || pending[1] != "3. later" {
+		t.Errorf("pending declared tasks = %v, want [\"2. up next\" \"3. later\"] with ID markers intact", pending)
 	}
 }
