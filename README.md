@@ -371,9 +371,13 @@ error = "#ff5f5f"
 #    tasks: `hap task {agent_name} list` to view them and `hap task {agent_name}
 #    done <n>` to mark one complete as you go (if that name isn't recognized,
 #    use `--path {task_list_path}` in place of `{agent_name}`)."
-# When every item is checked off, the prompt is still sent with
-# {next_task_content} = "none", so the template can steer what an idle agent
-# does when the list is done.
+# When every item is checked off, the templated prompt is never sent: the
+# plugin escalates a confirmable @noop suggestion ("No more pending tasks")
+# instead — unless BOTH llm.task_generate_command and
+# llm.task_generate_command_start are configured, in which case it generates
+# more tasks for the agent instead of escalating (see "Suggesting tasks when
+# no source exists" below; the same generation flow refills an exhausted
+# source, always via task_generate_command since a list already exists).
 [[task_sources]]
 agent = "brave-otter" # agent short name, pane id, or type ("" = any)
 workspace = ""        # workspace name; "" or "*" = any, "*" wildcards work
@@ -410,13 +414,22 @@ bin/hap task-source --agent backend-dev --template 'Do this next: {next_task_con
 
 (Or in the TUI: select the agent and press `n`.)
 
-### Suggesting tasks when no source exists (optional)
+### Suggesting tasks when no source exists, or a source runs out (optional)
 
 If an idle agent has neither a matching `[[task_sources]]` entry nor an
 inferable native todo, `llm.task_generate_command` can run a one-shot local
 CLI to propose one or more next tasks. This is opt-in: without the command,
 the safe default remains a `no_task_source` escalation and hap invents
 nothing.
+
+The same generation flow also refills a declared `[[task_sources]]` entry
+once its checklist is fully checked off — but only when BOTH
+`llm.task_generate_command` and `llm.task_generate_command_start` are
+configured (stricter than the no-source case above, since it replaces content
+in a source that already had operator-relevant tasks). Without both commands
+set, an exhausted source escalates `task_source_exhausted` — a confirmable
+@noop suggestion ("No more pending tasks") — instead of generating or sending
+the old templated "none" prompt.
 
 The command's stdout may be plain lines or a Markdown list/checklist. Hap
 normalizes it and surfaces it as an escalation; it never auto-accepts a
@@ -425,8 +438,8 @@ generated task. Confirming the suggestion creates
 registers the file as that agent's task source, and sends only the first task.
 Later idle events consume the remaining tasks through the normal declared-task
 flow. Dismiss it with `x`; if generation failed or timed out, press `l` to
-retry. Suggestions are dropped or refused if the agent has started working or
-gained a task source in the meantime.
+retry. Suggestions are dropped or refused if the agent has started working, or
+now has a task source with a real pending item, in the meantime.
 
 ```toml
 [llm]
@@ -442,8 +455,11 @@ task_generate_command = [
 
 Available placeholders are `{self}`, `{agent_name}`, `{agent_type}`,
 `{pane_excerpt}`, and `{cwd}`. The first-generation state is tracked
-independently from LLM consults and rewrites. (These keys were renamed from
-`generate_task_command*`; the old spellings no longer load, so update an
+independently from LLM consults and rewrites, and only applies to the
+no-source-at-all case: `task_generate_command_start` bootstraps a list from
+nothing, so refilling an already-exhausted declared source is never treated
+as "first" — it always uses `task_generate_command`. (These keys were renamed
+from `generate_task_command*`; the old spellings no longer load, so update an
 existing config.)
 
 ### Task source info in every consult

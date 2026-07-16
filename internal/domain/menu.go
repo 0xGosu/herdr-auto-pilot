@@ -109,24 +109,27 @@ func MenuKeystroke(content, chosen string) (string, bool) {
 	return chosen, false
 }
 
-// DeliverOutbound maps a chosen reply to the numbered-menu digit, but ONLY
-// for approval/choice situations. Free-text prompts — idle next-task prompts,
-// error-retry commands — are always delivered literally, so a pane that
-// happens to contain an ordinary numbered list (e.g. a summary "1. ran tests")
-// can never hijack the reply into a bare digit. paneContent is the live
+// DeliverOutbound maps a chosen reply to the numbered-menu digit for
+// approval/choice situations and Codex's structural rate-limit error modal.
+// Other error retries and idle prompts remain literal free text, so an
+// ordinary numbered list cannot hijack their reply into a bare digit.
+// agentType is required because the rate-limit shape has Codex-only semantics;
+// approval and choice menus remain agent-agnostic. paneContent is the live
 // screen. The bool reports whether a menu digit was mapped: false means the
 // returned text is free text (callers deciding whether to rewrite literal
 // outbound text key off this).
-func DeliverOutbound(sitType SituationType, paneContent, chosen string) (string, bool) {
-	if sitType != SituationApproval && sitType != SituationChoice {
+func DeliverOutbound(sitType SituationType, agentType, paneContent, chosen string) (string, bool) {
+	menuSituation := sitType == SituationApproval || sitType == SituationChoice ||
+		(sitType == SituationError && strings.EqualFold(strings.TrimSpace(agentType), "codex") && CodexRateLimitForm(paneContent))
+	if !menuSituation {
 		return chosen, false
 	}
 	return MenuKeystroke(paneContent, chosen)
 }
 
 // DeliverKeystroke is DeliverOutbound for callers that only need the text.
-func DeliverKeystroke(sitType SituationType, paneContent, chosen string) string {
-	out, _ := DeliverOutbound(sitType, paneContent, chosen)
+func DeliverKeystroke(sitType SituationType, agentType, paneContent, chosen string) string {
+	out, _ := DeliverOutbound(sitType, agentType, paneContent, chosen)
 	return out
 }
 

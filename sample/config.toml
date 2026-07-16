@@ -132,6 +132,13 @@ rewrite_fallback_template = "You must act based on the following: {original_text
 # the agent starts working before it is surfaced/confirmed. Placeholders:
 # {self}, {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. Omit to keep the
 # safe default: idle with no task source escalates and hap synthesizes nothing.
+#
+# The same command also refills a declared [[task_sources]] entry once its
+# checklist is fully checked off — but ONLY when BOTH task_generate_command
+# and task_generate_command_start are set (below); a list already exists in
+# that case, so task_generate_command is always used, never *_start. Without
+# both set, an exhausted source escalates a confirmable @noop suggestion
+# ("No more pending tasks") instead of the old "none" prompt.
 # (Renamed from generate_task_command; the old key no longer loads — update it.)
 # task_generate_command = [
 #   "claude", "--model", "opus", "-p",
@@ -199,7 +206,11 @@ theme = ""                 # named palette: default | dark | light | high-contra
 # ── Declared task lists for idle agents (repeatable) ────────────────
 # Without a declared source, the plugin falls back to inferring the next
 # task from the agent's own todo rendering, held to inferred_task_bar, then
-# uses generate_task_command (when configured) to surface a suggestion.
+# uses task_generate_command (when configured) to surface a suggestion. When
+# a declared source's checklist is fully checked off, the templated prompt is
+# never sent: it escalates a confirmable @noop ("No more pending tasks")
+# unless BOTH task_generate_command and task_generate_command_start are set,
+# in which case more tasks are generated instead (see above).
 # [[task_sources]]
 # agent = ""                 # short name, pane id, or type; "" = any
 # workspace = ""             # "" or "*" = any; wildcards like "codex-*" work

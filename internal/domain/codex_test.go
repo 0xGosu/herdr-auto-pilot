@@ -91,6 +91,48 @@ func TestCodexPlanApprovalFormRejectsStaleAndIncompleteCopies(t *testing.T) {
 	}
 }
 
+const codexRateLimitFrame = `older numbered narration:
+1. This is not a modal option.
+
+Approaching rate limits
+Switch to gpt-5.4-mini for lower credit usage?
+
+› 1. Switch to gpt-5.4-mini                 Small, fast, and cost-efficient model for simpler coding tasks.
+  2. Keep current model
+  3. Keep current model (never show again)  Hide future rate limit reminders about switching models.
+
+Press enter to confirm or esc to go back
+`
+
+func TestCodexRateLimitForm(t *testing.T) {
+	if !CodexRateLimitForm(codexRateLimitFrame) {
+		t.Fatal("Codex rate-limit modal was not recognized")
+	}
+	region := ExtractCodexRateLimitForm(codexRateLimitFrame)
+	if strings.Contains(region, "older numbered narration") {
+		t.Fatalf("rate-limit extraction retained scrollback: %q", region)
+	}
+	if got := OptionLabels(region); len(got) != 3 || !strings.HasPrefix(got[0], "Switch to gpt-5.4-mini") {
+		t.Fatalf("rate-limit options = %v", got)
+	}
+	if kind, ok := CodexErrorForm(codexRateLimitFrame); !ok || kind != CodexErrorRateLimit {
+		t.Fatalf("CodexErrorForm = (%q, %v), want (%q, true)", kind, ok, CodexErrorRateLimit)
+	}
+}
+
+func TestCodexRateLimitFormRejectsStaleAndIncompleteCopies(t *testing.T) {
+	for _, pane := range []string{
+		codexRateLimitFrame + "\nnewer output\n",
+		strings.Replace(codexRateLimitFrame, "Press enter to confirm or esc to go back", "ordinary footer", 1),
+		strings.Replace(codexRateLimitFrame, "Keep current model (never show again)", "Maybe later", 1),
+		"Approaching rate limits\nSwitch to gpt-5.4-mini for lower credit usage?\n",
+	} {
+		if CodexRateLimitForm(pane) {
+			t.Fatalf("false positive for %q", pane)
+		}
+	}
+}
+
 func TestStripCodexComposer(t *testing.T) {
 	cases := []struct {
 		name string

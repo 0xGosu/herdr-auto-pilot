@@ -89,28 +89,31 @@ func TestMenuKeystrokeAmbiguousPrefixStaysLiteral(t *testing.T) {
 func TestDeliverOutbound(t *testing.T) {
 	menu := "Allow this tool?\n❯ 1. Yes\n  2. No\n"
 	tests := []struct {
-		name    string
-		sitType SituationType
-		content string
-		chosen  string
-		want    string
-		mapped  bool
+		name      string
+		sitType   SituationType
+		agentType string
+		content   string
+		chosen    string
+		want      string
+		mapped    bool
 	}{
-		{"approval label maps to digit", SituationApproval, menu, "Yes", "1", true},
-		{"choice numeric selection maps", SituationChoice, menu, "2", "2", true},
-		{"approval free text without menu stays literal", SituationApproval, "Enter a message:", "looks good", "looks good", false},
-		{"idle never maps even over a numbered list", SituationIdle, "done:\n1. ran tests\n2. built", "continue with the plan", "continue with the plan", false},
-		{"error retry command stays literal", SituationError, menu, "go test ./...", "go test ./...", false},
+		{"approval label maps to digit", SituationApproval, "claude", menu, "Yes", "1", true},
+		{"choice numeric selection maps", SituationChoice, "claude", menu, "2", "2", true},
+		{"approval free text without menu stays literal", SituationApproval, "claude", "Enter a message:", "looks good", "looks good", false},
+		{"idle never maps even over a numbered list", SituationIdle, "codex", "done:\n1. ran tests\n2. built", "continue with the plan", "continue with the plan", false},
+		{"error retry command stays literal", SituationError, "claude", menu, "go test ./...", "go test ./...", false},
+		{"Codex rate-limit error option maps", SituationError, "codex", codexRateLimitFrame, "Keep current model", "2", true},
+		{"non-Codex rate-limit-shaped error stays literal", SituationError, "claude", codexRateLimitFrame, "Keep current model", "Keep current model", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, mapped := DeliverOutbound(tc.sitType, tc.content, tc.chosen)
+			got, mapped := DeliverOutbound(tc.sitType, tc.agentType, tc.content, tc.chosen)
 			if got != tc.want || mapped != tc.mapped {
 				t.Errorf("DeliverOutbound(%v, %q) = (%q, %v), want (%q, %v)",
 					tc.sitType, tc.chosen, got, mapped, tc.want, tc.mapped)
 			}
 			// DeliverKeystroke must stay in lockstep with DeliverOutbound.
-			if ks := DeliverKeystroke(tc.sitType, tc.content, tc.chosen); ks != got {
+			if ks := DeliverKeystroke(tc.sitType, tc.agentType, tc.content, tc.chosen); ks != got {
 				t.Errorf("DeliverKeystroke = %q, DeliverOutbound text = %q", ks, got)
 			}
 		})

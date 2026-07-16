@@ -39,6 +39,9 @@ func TestKillSwitchVetoesEverything(t *testing.T) {
 	if d.Action != ActionEscalate || d.Reason != ReasonKilled {
 		t.Fatalf("kill switch must escalate, got %+v", d)
 	}
+	if d.Confidence != 1 {
+		t.Errorf("veto must still report the rule's actual confidence, got %.3f", d.Confidence)
+	}
 }
 
 func TestDecisionFloorGatesButKeepsSuggestion(t *testing.T) {
@@ -75,6 +78,9 @@ func TestNeverAutoVetoesRegardlessOfConfidence(t *testing.T) {
 	}
 	if !strings.Contains(d.Rationale, `git push --force`) || !strings.Contains(d.Rationale, `matched "git push --force"`) {
 		t.Fatalf("never-auto rationale must name pattern and excerpt, got %q", d.Rationale)
+	}
+	if d.Confidence != 1 {
+		t.Errorf("veto must still report the rule's actual confidence, got %.3f", d.Confidence)
 	}
 }
 
@@ -280,18 +286,25 @@ func TestVarianceGuardForcesEscalation(t *testing.T) {
 }
 
 func TestOverMaskedEscalates(t *testing.T) {
-	in := baseInput(SituationApproval)
+	in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y", "y", "y")
 	in.Signature.Verdict = GuardOverMasked
 	d := Decide(in)
 	if d.Action != ActionEscalate || d.Reason != ReasonOverMasked {
 		t.Fatalf("over-masked must escalate, got %+v", d)
 	}
+	if d.Confidence != 1 {
+		t.Errorf("veto must still report the rule's actual confidence, got %.3f", d.Confidence)
+	}
 }
 
 func TestUnclassifiableEscalates(t *testing.T) {
-	d := Decide(baseInput(SituationUnclassifiable))
+	in := autonomous(baseInput(SituationUnclassifiable), "y", "y", "y", "y", "y", "y", "y", "y")
+	d := Decide(in)
 	if d.Action != ActionEscalate || d.Reason != ReasonUnclassifiable {
 		t.Fatalf("unclassifiable must escalate, got %+v", d)
+	}
+	if d.Confidence != 1 {
+		t.Errorf("veto must still report the rule's actual confidence, got %.3f", d.Confidence)
 	}
 }
 
@@ -324,17 +337,52 @@ func TestIdleDeclaredTaskCustomTemplate(t *testing.T) {
 	}
 }
 
-func TestIdleDeclaredTaskCompletedListStillSends(t *testing.T) {
-	// A matched source whose checklist is complete still delivers the
-	// templated prompt with task content "none" — never an escalation.
+func TestIdleDeclaredTaskExhaustedEscalatesWithoutGenerateConfig(t *testing.T) {
+	// A matched source whose checklist is complete never sends the templated
+	// "none" prompt: without a generate-task opt-in it escalates a
+	// confirmable @noop suggestion instead.
 	in := autonomous(baseInput(SituationIdle),
 		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
 		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
 	in.DeclaredTask = &DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md"}
 	d := Decide(in)
-	want := in.DeclaredTask.Prompt()
-	if d.Action != ActionSend || d.Input != want {
-		t.Fatalf("completed declared list should still send the templated prompt, got %+v", d)
+	if d.Action != ActionEscalate || d.Reason != ReasonTaskSourceExhausted {
+		t.Fatalf("exhausted declared list must escalate task_source_exhausted, got %+v", d)
+	}
+	if d.Suggestion != ActionNoopSuggestion {
+		t.Errorf("exhausted declared list should suggest doing nothing, got %q", d.Suggestion)
+	}
+	if d.Rationale != "No more pending tasks" {
+		t.Errorf("exhausted declared list rationale mismatch, got %q", d.Rationale)
+	}
+}
+
+func TestIdleDeclaredTaskExhaustedRequiresBothGenerateCommands(t *testing.T) {
+	// Generating more tasks for an exhausted declared source needs BOTH
+	// task_generate_command and task_generate_command_start configured — a
+	// stricter opt-in than the no-task-source-at-all case. Only the base
+	// command being set must still escalate, not generate.
+	in := autonomous(baseInput(SituationIdle),
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
+	in.DeclaredTask = &DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md"}
+	in.GenerateTaskConfigured = true
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonTaskSourceExhausted {
+		t.Fatalf("exhausted declared list with only the base command configured must still escalate, got %+v", d)
+	}
+}
+
+func TestIdleDeclaredTaskExhaustedGeneratesWhenBothConfigured(t *testing.T) {
+	in := autonomous(baseInput(SituationIdle),
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
+	in.DeclaredTask = &DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md"}
+	in.GenerateTaskConfigured = true
+	in.GenerateTaskStartConfigured = true
+	d := Decide(in)
+	if d.Action != ActionGenerateTask {
+		t.Fatalf("exhausted declared list with both generate commands configured should generate more tasks, got %+v", d)
 	}
 }
 

@@ -19,15 +19,17 @@ func TestGoldenTranscripts(t *testing.T) {
 	c := New(nil)
 
 	statusFor := map[string]string{
-		"idle_finished.txt":       "idle",
-		"codex_idle.txt":          "idle",
-		"approval_codex_plan.txt": "idle",
+		"idle_finished.txt":          "idle",
+		"codex_idle.txt":             "idle",
+		"approval_codex_plan.txt":    "idle",
+		"error_codex_rate_limit.txt": "idle",
 	}
 	agentTypeFor := map[string]string{
 		"approval_codex_plan.txt":     "codex",
 		"codex_idle.txt":              "codex",
 		"choice_codex_mcq.txt":        "codex",
 		"error_codex_interrupted.txt": "codex",
+		"error_codex_rate_limit.txt":  "codex",
 	}
 
 	entries, err := os.ReadDir("testdata/transcripts")
@@ -343,7 +345,7 @@ func TestClaudeErrorSituations(t *testing.T) {
 
 func TestCodexErrorSituations(t *testing.T) {
 	c := New(nil)
-	for _, name := range []string{"error_codex_interrupted.txt"} {
+	for _, name := range []string{"error_codex_interrupted.txt", "error_codex_rate_limit.txt"} {
 		data, err := os.ReadFile(filepath.Join("testdata", "transcripts", name))
 		if err != nil {
 			t.Fatal(err)
@@ -356,6 +358,26 @@ func TestCodexErrorSituations(t *testing.T) {
 		if s := c.Classify("claude", "blocked", string(data)); s.Type == domain.SituationError {
 			t.Errorf("%s on non-codex agent must not classify error, got %v", name, s.Type)
 		}
+	}
+}
+
+func TestCodexRateLimitErrorCarriesApprovalLikeOptions(t *testing.T) {
+	c := New(nil)
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "error_codex_rate_limit.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []string{"blocked", "idle", "done"} {
+		s := c.Classify("codex", status, string(data))
+		if s.Type != domain.SituationError || s.ErrorSummary != domain.CodexErrorRateLimit {
+			t.Fatalf("rate-limit modal at %s = type %v summary %q", status, s.Type, s.ErrorSummary)
+		}
+		if len(s.Options) != 3 || !strings.HasPrefix(s.Options[0], "Switch to gpt-5.4-mini") || s.Options[1] != "Keep current model" {
+			t.Fatalf("rate-limit options at %s = %v", status, s.Options)
+		}
+	}
+	if other := c.Classify("claude", "blocked", string(data)); other.Type == domain.SituationError {
+		t.Fatal("Codex rate-limit modal must remain scoped to codex")
 	}
 }
 

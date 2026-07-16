@@ -758,7 +758,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 			return a.nudge(ctx, control.KindReload)
 		}
 		if rerr == nil {
-			outbound = domain.DeliverKeystroke(audit.SituationType, pane, outbound)
+			outbound = domain.DeliverKeystroke(audit.SituationType, audit.AgentType, pane, outbound)
 		}
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, outbound); err != nil {
 			return fmt.Errorf("correction recorded, but sending to the agent failed: %w", err)

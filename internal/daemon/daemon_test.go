@@ -1513,9 +1513,9 @@ func TestIdleNonChecklistTaskFileDoesNotResolve(t *testing.T) {
 	}
 }
 
-func TestIdleDeclaredTaskCompletedListSendsNone(t *testing.T) {
-	// A matched source with every item checked still delivers the templated
-	// prompt with task content "none" instead of escalating.
+func TestIdleDeclaredTaskCompletedListEscalatesNoop(t *testing.T) {
+	// A matched source with every item checked never delivers the templated
+	// "none" prompt: it escalates a confirmable @noop suggestion instead.
 	dir := t.TempDir()
 	taskFile := filepath.Join(dir, "tasks.md")
 	os.WriteFile(taskFile, []byte("- [x] step one\n- [x] step two\n"), 0o600)
@@ -1526,15 +1526,21 @@ func TestIdleDeclaredTaskCompletedListSendsNone(t *testing.T) {
 	h.herdr.setPane(idlePane)
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
-	name, err := h.raw.EnsureAgentName(context.Background(), "agent-20")
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := context.Background()
 	h.push("agent-20", "idle")
-	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := (&domain.DeclaredTask{Task: domain.NoTaskContent, Path: taskFile, AgentName: name}).Prompt()
-	if got := h.herdr.sentInputs()[0]; got != want {
-		t.Errorf("sent %q, want completed-list prompt %q", got, want)
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if !strings.Contains(esc[0].Rationale, string(domain.ReasonTaskSourceExhausted)) {
+		t.Errorf("rationale should carry the exhausted tag, got %q", esc[0].Rationale)
+	}
+	if esc[0].Suggestion != domain.ActionNoopSuggestion {
+		t.Errorf("completed source should suggest doing nothing, got %q", esc[0].Suggestion)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("no templated \"none\" prompt may be sent for a completed source")
 	}
 }
 
@@ -1805,6 +1811,102 @@ func TestIdleTaskGenDropsStaleSuggestion(t *testing.T) {
 	}
 	if len(h.herdr.sentInputs()) != 0 {
 		t.Errorf("nothing may be sent for a dropped suggestion, got %v", h.herdr.sentInputs())
+	}
+}
+
+func TestIdleDeclaredTaskExhaustedGeneratesMoreTasks(t *testing.T) {
+	// With BOTH task_generate_command and task_generate_command_start
+	// configured, an exhausted declared source generates more tasks instead
+	// of escalating @noop — and the suggestion must actually surface
+	// (regression: handleTaskGenOutcome's staleness re-check used to treat
+	// the same still-matched exhausted source as "now has a task source" and
+	// silently drop every exhausted-source suggestion). The very first
+	// generation for this agent must still use the base command, not
+	// task_generate_command_start — a list already exists, so this is never
+	// a bootstrap-from-nothing generation.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	os.WriteFile(taskFile, []byte("- [x] old task\n"), 0o600)
+
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf(
+		"[[task_sources]]\nagent = \"agent-41\"\npath = %q\n\n[llm]\ntask_generate_command = [\"fake\"]\ntask_generate_command_start = [\"fake-start\"]\n",
+		taskFile)
+	h, tg := newHarnessTaskGen(t, cfg, func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return "Add more regression tests", nil
+	})
+	h.herdr.setPane(idlePane)
+
+	ctx := context.Background()
+	h.push("agent-41", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	want := domain.SuggestTaskPrefix + "Add more regression tests"
+	if esc[0].Suggestion != want {
+		t.Errorf("escalation suggestion = %q, want %q", esc[0].Suggestion, want)
+	}
+	if !strings.Contains(esc[0].Rationale, string(domain.ReasonTaskSourceExhausted)) {
+		t.Errorf("escalation should be tagged task_source_exhausted, got %q", esc[0].Rationale)
+	}
+	if domain.IsRetryableLLMEscalation(&esc[0]) {
+		t.Error("a successful task suggestion must NOT be retryable (operator confirms/dismisses)")
+	}
+	calls := tg.genCalls()
+	if len(calls) != 1 {
+		t.Fatalf("generator should be called once, got %d", len(calls))
+	}
+	if calls[0].First {
+		t.Error("an exhausted declared source already has a list; generation must use the base command, not task_generate_command_start")
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("nothing may be sent to the pane before the operator confirms")
+	}
+}
+
+func TestGenerateTaskFirstFlagIndependentOfExhaustedSource(t *testing.T) {
+	// Regression: a generation triggered by an EXHAUSTED declared source must
+	// never mark firstTaskGen for the agent — that map tracks only the
+	// no-task-source-at-all path's own "first ever" state. If the exhausted
+	// path polluted it, a LATER no-source bootstrap for the same agent (e.g.
+	// its exhausted source's file is later removed) would incorrectly skip
+	// task_generate_command_start and use the regular command instead.
+	h, tg := newHarnessTaskGen(t, "[llm]\ntask_generate_command = [\"fake\"]\ntask_generate_command_start = [\"fake-start\"]\n",
+		func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+			return "a generated task", nil
+		})
+
+	ctx := context.Background()
+	cfg, _, _ := h.daemon.snapshot()
+	agentID := "agent-99"
+	sig := domain.SignatureResult{Signature: "sig-99"}
+	situation := domain.Situation{Type: domain.SituationIdle, AgentID: agentID, AgentType: "claude"}
+	tr := domain.AgentTransition{AgentID: agentID, PaneID: agentID, Status: "idle"}
+
+	// First call: triggered by an EXHAUSTED declared source. Each call needs
+	// its own timestamp — generateTask derives the staged request's unique id
+	// from it (gentask-<agent>-<nanos>), and a repeated value collides.
+	h.daemon.generateTask(ctx, cfg, situation, sig, tr, time.Now(), true)
+	waitFor(t, 3*time.Second, func() bool {
+		pending, _ := h.raw.HasPendingLLMConsult(ctx, agentID)
+		return !pending && len(tg.genCalls()) == 1
+	})
+
+	// Second call: the SAME agent later has NO task source at all.
+	h.daemon.generateTask(ctx, cfg, situation, sig, tr, time.Now(), false)
+	waitFor(t, 3*time.Second, func() bool {
+		pending, _ := h.raw.HasPendingLLMConsult(ctx, agentID)
+		return !pending && len(tg.genCalls()) == 2
+	})
+
+	calls := tg.genCalls()
+	if calls[0].First {
+		t.Error("exhausted-source generation must never report First=true")
+	}
+	if !calls[1].First {
+		t.Error("a later no-source generation for the same agent must still see First=true — firstTaskGen must not be polluted by the exhausted-source path")
 	}
 }
 

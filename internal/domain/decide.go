@@ -103,6 +103,13 @@ type DecideInput struct {
 	// an idle agent with no task source generates a task suggestion instead of
 	// escalating no_task_source (FR-011 relaxation).
 	GenerateTaskConfigured bool
+	// GenerateTaskStartConfigured reports that llm.task_generate_command_start
+	// is also set. An exhausted DECLARED task source (every item checked off)
+	// only generates more tasks instead of escalating task_source_exhausted
+	// when BOTH commands are configured — a stricter, explicit opt-in than the
+	// no-task-source-at-all case above, since it replaces content in a source
+	// that already had operator-relevant tasks.
+	GenerateTaskStartConfigured bool
 	// NeverAutoRuleHit and SuspectedIrreversible are precomputed by the caller
 	// from the compiled NeverAutoList so the core stays free of regex state.
 	// IrreversibleHit carries the matching indicator for the rationale.
@@ -127,28 +134,13 @@ func Decide(in DecideInput) Decision {
 		}
 	}
 
-	// Safety controls veto first (Constitution: safety over throughput).
-	// Rationales are tag-only where the reason token self-explains — the
-	// escalation line's budget belongs to the suggestion, not to prose
-	// repeating the tag or the operator's own config.
-	if in.KillActive {
-		return esc(ReasonKilled, "", 0, "")
-	}
-	if in.Situation.Type == SituationUnclassifiable {
-		return esc(ReasonUnclassifiable, "", 0, "")
-	}
-	if in.Signature.Verdict == GuardOverMasked {
-		return esc(ReasonOverMasked, "", 0, "")
-	}
-	if in.NeverAutoMatched {
-		return esc(ReasonNeverAutoMatch, in.NeverAutoRuleHit.Diagnostic(), 0, "")
-	}
-
-	// Confidence and the variance guard consider only post-reset decisions (id
-	// > the signature's floor); pre-reset rows are kept but no longer count. The
-	// suggested action, however, still comes from the FULL learned history: a
-	// reset rule keeps offering its learned answer while its score/graduation
-	// start fresh, so re-earning trust is just re-confirming it.
+	// Confidence considers only post-reset decisions (id > the signature's
+	// floor); pre-reset rows are kept but no longer count. The suggested
+	// action, however, still comes from the FULL learned history: a reset
+	// rule keeps offering its learned answer while its score/graduation start
+	// fresh, so re-earning trust is just re-confirming it. Computed before the
+	// safety vetoes below so an escalation forced by one of them still
+	// reports the rule's actual confidence instead of a bare 0.
 	var floor int64
 	if in.State != nil {
 		floor = in.State.DecisionFloorID
@@ -157,6 +149,23 @@ func Decide(in DecideInput) Decision {
 	conf := Confidence(post, in.ConfirmationWeight)
 	if len(post) == 0 {
 		conf.TopAction = Confidence(in.History, in.ConfirmationWeight).TopAction
+	}
+
+	// Safety controls veto first (Constitution: safety over throughput).
+	// Rationales are tag-only where the reason token self-explains — the
+	// escalation line's budget belongs to the suggestion, not to prose
+	// repeating the tag or the operator's own config.
+	if in.KillActive {
+		return esc(ReasonKilled, "", conf.Score, "")
+	}
+	if in.Situation.Type == SituationUnclassifiable {
+		return esc(ReasonUnclassifiable, "", conf.Score, "")
+	}
+	if in.Signature.Verdict == GuardOverMasked {
+		return esc(ReasonOverMasked, "", conf.Score, "")
+	}
+	if in.NeverAutoMatched {
+		return esc(ReasonNeverAutoMatch, in.NeverAutoRuleHit.Diagnostic(), conf.Score, "")
 	}
 
 	if VarianceGuardTripped(post, in.ConfidenceThresholds.Minimum, in.ConfirmationWeight) {
@@ -212,6 +221,20 @@ func Decide(in DecideInput) Decision {
 			in.GenerateTaskConfigured {
 			return Decision{Action: ActionGenerateTask, Confidence: conf.Score,
 				Rationale: "idle with no task source; generating a task suggestion"}
+		}
+		// A declared task source that matched but has nothing left to do never
+		// sends the templated "none" prompt. Generating more tasks requires
+		// BOTH task_generate_command and task_generate_command_start — a
+		// stricter, explicit opt-in than the no-source case above, since this
+		// replaces content in a source that already had operator-relevant
+		// tasks. Without that opt-in, the safe default is a confirmable @noop
+		// suggestion: the list is done, nothing to send.
+		if in.Situation.Type == SituationIdle && resolveEsc == ReasonTaskSourceExhausted {
+			if in.GenerateTaskConfigured && in.GenerateTaskStartConfigured {
+				return Decision{Action: ActionGenerateTask, Confidence: conf.Score,
+					Rationale: "declared task source exhausted; generating more tasks"}
+			}
+			return esc(ReasonTaskSourceExhausted, "No more pending tasks", conf.Score, ActionNoopSuggestion)
 		}
 		return esc(resolveEsc, rationaleFor(resolveEsc), conf.Score, suggestion)
 	}
@@ -291,10 +314,14 @@ func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggest
 		if conf.TopAction == ActionNoop {
 			return ActionNoop, ActionNoopSuggestion, ReasonNone
 		}
-		// Two-tier next-task resolution (FR-011). A matched source always
-		// yields a candidate — even a completed list, whose templated prompt
-		// (task content "none") lets the operator steer idle agents.
+		// Two-tier next-task resolution (FR-011). A matched source with a real
+		// pending item drives the next prompt; a matched source whose
+		// checklist is fully checked off never sends the templated "none"
+		// prompt — Decide() escalates or generates more tasks instead.
 		if in.DeclaredTask != nil {
+			if in.DeclaredTask.Task == NoTaskContent {
+				return "", "", ReasonTaskSourceExhausted
+			}
 			return ActionNextDeclaredTask, "send next declared task: " + in.DeclaredTask.Prompt(), ReasonNone
 		}
 		inferred := InferNextTask(in.Situation.AgentType, in.Situation.Content)

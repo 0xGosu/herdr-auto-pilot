@@ -135,17 +135,28 @@ type LLM struct {
 	RewriteFallbackTemplate string `toml:"rewrite_fallback_template"`
 	// GenerateTaskCommand is the argv template for the one-shot task
 	// suggestion an idle agent gets when it has NO task source (no declared
-	// [[task_sources]] and nothing inferable from the pane). Placeholders:
-	// {self}, {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. The suggested
-	// task is read from the CLI's stdout and surfaced as an escalation the
-	// operator confirms (writing a per-agent tasks.md) or dismisses. Empty
-	// keeps today's behavior: idle with no task source escalates as
-	// no_task_source and the plugin never synthesizes a prompt (FR-011).
+	// [[task_sources]] and nothing inferable from the pane) — or when a
+	// declared source matched but its checklist is fully checked off, AND
+	// GenerateTaskCommandStart is also set (see below). Placeholders: {self},
+	// {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. The suggested task is
+	// read from the CLI's stdout and surfaced as an escalation the operator
+	// confirms (writing a per-agent tasks.md) or dismisses. Empty keeps
+	// today's behavior: idle with no task source escalates as no_task_source
+	// and the plugin never synthesizes a prompt (FR-011); an exhausted
+	// declared source escalates task_source_exhausted (a confirmable @noop
+	// suggestion, "No more pending tasks") instead of sending the templated
+	// "none" prompt.
 	GenerateTaskCommand []string `toml:"task_generate_command"`
 	// GenerateTaskCommandStart is the argv template used on the FIRST task
 	// generation per agent (same first-interaction boundary as CommandStart).
-	// Same placeholders as GenerateTaskCommand. Empty inherits
-	// GenerateTaskCommand; tracked independently of the consult "first".
+	// Same placeholders as GenerateTaskCommand. For the no-task-source-at-all
+	// case, empty inherits GenerateTaskCommand (tracked independently of the
+	// consult "first"). For an EXHAUSTED declared source, generating more
+	// tasks instead of escalating requires BOTH GenerateTaskCommand and this
+	// field to be set — a stricter, explicit opt-in, since it replaces
+	// content in a source that already had operator-relevant tasks; a list
+	// already exists in that case, so GenerateTaskCommandStart is never
+	// selected there (only GenerateTaskCommand is used, every time).
 	GenerateTaskCommandStart []string `toml:"task_generate_command_start,omitempty"`
 	// GenerateTaskTimeoutSeconds bounds one task-generation run; zero or
 	// omitted inherits timeout_seconds.

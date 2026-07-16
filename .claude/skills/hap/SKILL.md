@@ -330,8 +330,8 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `llm.command_start` | (unset) | argv template for the FIRST consult per agent; empty inherits `llm.command` (opt-in) |
 | `llm.rewrite_command` | (unset) | argv template for the one-shot rewrite CLI (see llm rewrite) |
 | `llm.rewrite_command_start` | (unset) | argv template for the FIRST rewrite per agent; empty inherits `llm.rewrite_command` (opt-in) |
-| `llm.task_generate_command` | (unset) | argv template for the one-shot task suggestion given to an idle agent with NO task source (see task sources); empty keeps today's escalate-only behavior |
-| `llm.task_generate_command_start` | (unset) | argv template for the FIRST task generation per agent; empty inherits `llm.task_generate_command` (opt-in) |
+| `llm.task_generate_command` | (unset) | argv template for the one-shot task suggestion given to an idle agent with NO task source, or a declared source that ran out (see task sources); empty keeps escalate-only behavior |
+| `llm.task_generate_command_start` | (unset) | argv template for the FIRST task generation per agent (no-source case only; empty inherits `llm.task_generate_command`); an exhausted declared source only generates more tasks when BOTH this and `llm.task_generate_command` are set, and always uses `llm.task_generate_command` (never this) since a list already exists |
 | `llm.task_generate_timeout_seconds` | 0 (inherits `timeout_seconds`) | timeout for one task-generation run |
 | `embedding.disabled` | false | disable semantic matching entirely |
 | `embedding.model_path` | (bundled all-minilm-l6-v2-q8_0.gguf) | path to a .gguf embedding model |
