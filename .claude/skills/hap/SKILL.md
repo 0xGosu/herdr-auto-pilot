@@ -168,6 +168,10 @@ resume automation:
 hap resume
 ```
 
+while paused, situations still classify and escalate — nothing is auto-answered — and those
+escalations carry the rationale `[daemon_paused]`, meaning "the operator paused automation",
+not that anything crashed.
+
 view pause/resume history:
 
 ```bash

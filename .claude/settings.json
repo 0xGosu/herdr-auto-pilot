@@ -45,7 +45,7 @@
       }
     }
   },
-  "advisorModel": "fable",
+  "advisorModel": "opus",
   "alwaysThinkingEnabled": true,
   "autoUpdatesChannel": "latest",
   "autoUpdate": true

@@ -85,7 +85,7 @@ func TestDecideKillSwitchVetoesNoop(t *testing.T) {
 	in := autonomous(baseInput(SituationApproval), noopHistory()...)
 	in.KillActive = true
 	d := Decide(in)
-	if d.Action != ActionEscalate || d.Reason != ReasonKilled {
+	if d.Action != ActionEscalate || d.Reason != ReasonDaemonPaused {
 		t.Fatalf("kill switch must veto noop rules too, got %+v", d)
 	}
 }

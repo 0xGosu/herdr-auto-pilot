@@ -36,11 +36,17 @@ func TestKillSwitchVetoesEverything(t *testing.T) {
 	in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y", "y", "y")
 	in.KillActive = true
 	d := Decide(in)
-	if d.Action != ActionEscalate || d.Reason != ReasonKilled {
+	if d.Action != ActionEscalate || d.Reason != ReasonDaemonPaused {
 		t.Fatalf("kill switch must escalate, got %+v", d)
 	}
 	if d.Confidence != 1 {
 		t.Errorf("veto must still report the rule's actual confidence, got %.3f", d.Confidence)
+	}
+	// The token is operator-facing, not an internal name: the daemon renders it
+	// as the escalation's RATIONALE ("[daemon_paused]"), and it must say the
+	// operator paused automation rather than implying something crashed.
+	if ReasonDaemonPaused != "daemon_paused" {
+		t.Errorf("the pause veto's reason token reaches the operator, got %q", ReasonDaemonPaused)
 	}
 }
 

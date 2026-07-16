@@ -273,7 +273,7 @@ func TestRewriteKillSwitchMidFlightEscalates(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool {
 		audits, _ := h.raw.AuditLog(context.Background(), 10)
 		for _, a := range audits {
-			if a.Status == "escalated" && strings.Contains(a.Rationale, "[killed]") {
+			if a.Status == "escalated" && strings.Contains(a.Rationale, "[daemon_paused]") {
 				return true
 			}
 		}

@@ -2064,7 +2064,7 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	// changed since Decide ran (kill switch, rate, the pane itself).
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
-		escalateWith(domain.ReasonKilled, "at rewrite")
+		escalateWith(domain.ReasonDaemonPaused, "at rewrite")
 		return
 	}
 	if hit, matched := allow.Match(s.AgentType, final); matched {
@@ -2262,7 +2262,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// bypass safety controls.
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
-		reject(domain.ReasonKilled, "at LLM promotion")
+		reject(domain.ReasonDaemonPaused, "at LLM promotion")
 		return
 	}
 	// The never-auto match and the heuristic both scan the situation's
