@@ -145,9 +145,13 @@ const (
 	ReasonSuspectedIrrevers EscalateReason = "suspected_irreversible"
 	ReasonRateLimited       EscalateReason = "rate_limited"
 	ReasonRetryExhausted    EscalateReason = "retry_exhausted"
-	ReasonKilled            EscalateReason = "killed"
-	ReasonLLMTimeout        EscalateReason = "llm_timeout"
-	ReasonLLMNoSubmit       EscalateReason = "llm_no_submit"
+	// ReasonDaemonPaused: the operator's pause/kill switch is active, so the
+	// daemon escalated instead of acting. Named for what the operator did
+	// (`p` in the TUI / `hap pause`) — "killed" read like a crash. Audit rows
+	// written before this rename carry the old "[killed]" tag.
+	ReasonDaemonPaused EscalateReason = "daemon_paused"
+	ReasonLLMTimeout   EscalateReason = "llm_timeout"
+	ReasonLLMNoSubmit  EscalateReason = "llm_no_submit"
 	// ReasonLLMLowConfidence: the LLM answered, but its self-reported
 	// confidence was below the operator's auto_act_confidence_threshold (or
 	// it reported no score), so the suggestion is surfaced for confirmation

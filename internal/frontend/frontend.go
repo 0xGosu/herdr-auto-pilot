@@ -320,6 +320,12 @@ type Status struct {
 	LatestKill         *domain.KillEvent
 	PendingEscalations int
 	MonitoredAgents    []domain.AgentTransition
+	// AgentsKnown reports that MonitoredAgents actually reflects herdr: false
+	// means the agent list could not be read (no adapter, or the query
+	// failed), which is NOT the same as "no agents are running" — an empty
+	// MonitoredAgents cannot tell the two apart on its own. Callers that
+	// would act on an agent's ABSENCE must check this first.
+	AgentsKnown bool
 	// AgentNames maps agent/pane ids to their short names.
 	AgentNames map[string]string
 	// AgentStats maps agent/pane ids to their lifetime counters (auto-sends,
@@ -356,6 +362,7 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 	st.PendingEscalations = int(pending)
 	if a.Herdr != nil {
 		if agents, err := a.Herdr.ListAgents(ctx); err == nil {
+			st.AgentsKnown = true
 			// Keep the view boundary defensive even if an alternate Herdr
 			// adapter does not normalize placeholder side-panel rows.
 			for _, agent := range agents {
@@ -1132,6 +1139,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.max_content_width", TUIEditable: true},
 	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
+	{Key: "tui.terminal_bell", TUIEditable: true},
 }
 
 // ConfigFieldKeys lists every scalar config field editable via SetField, in
@@ -1270,6 +1278,8 @@ func FieldValue(cfg config.Config, key string) string {
 			return "default"
 		}
 		return cfg.TUI.Theme
+	case "tui.terminal_bell":
+		return strconv.FormatBool(cfg.TUI.TerminalBell)
 	}
 	return ""
 }
@@ -1477,6 +1487,13 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			return fmt.Errorf("tui.theme must be one of %s, got %q",
 				strings.Join(config.ValidThemes, ", "), value)
+		case "tui.terminal_bell":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("tui.terminal_bell must be true or false, got %q", value)
+			}
+			cfg.TUI.TerminalBell = v
+			return nil
 		}
 		return fmt.Errorf("unknown config field %q", key)
 	})
@@ -1727,11 +1744,24 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 }
 
 // taskLockPath returns a stable, hap-owned lock-file path for a task file,
-// keyed by the file's (already absolute) path. Keeping the lock in a shared
-// temp dir — rather than a `<file>.lock` sidecar — serializes concurrent
-// mutations without dropping a stray lock file into the user's repo next to a
-// --path checklist.
+// keyed by the file's canonical path. Keeping the lock in a shared temp dir —
+// rather than a `<file>.lock` sidecar — serializes concurrent mutations
+// without dropping a stray lock file into the user's repo next to a --path
+// checklist.
+//
+// The path is canonicalized (absolute + symlinks resolved, best-effort) so
+// every caller — the CLI, the TUI's add/edit, and the TUI's bulk toggle/delete
+// (which passes an already symlink-resolved path) — hashes to the SAME key for
+// one physical file. Without this, a symlinked path component (e.g. macOS
+// /var vs /private/var) would yield two different locks and stop serializing
+// concurrent mutations of the same checklist.
 func taskLockPath(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
 	sum := sha256.Sum256([]byte(path))
 	return filepath.Join(os.TempDir(), "hap-task-locks", hex.EncodeToString(sum[:16])+".lock")
 }
@@ -1774,6 +1804,262 @@ func mutateTaskFile(path string, fn func(content string) (string, error)) ([]dom
 	return domain.ParseChecklist(out), nil
 }
 
+// TaskSourcePathFor resolves the checklist file behind an agent's task
+// source (the CLI's exactly-one-wins rules), absolutized — the exported
+// form of taskFilePath for callers that need the path itself (task send).
+func (a *App) TaskSourcePathFor(agent string) (string, error) {
+	p, err := a.taskFilePath(agent, "")
+	if err != nil {
+		return "", err
+	}
+	if abs, e := filepath.Abs(p); e == nil {
+		p = abs
+	}
+	return p, nil
+}
+
+// TaskSourceTemplateFor returns the next-task template of the task source
+// registered for agent at sourcePath — "" (the default template) when the
+// matching entry declares none. A config read failure is an error, not a
+// silent fallback to the default template.
+func (a *App) TaskSourceTemplateFor(agent, sourcePath string) (string, error) {
+	cfg, err := a.Config()
+	if err != nil {
+		return "", err
+	}
+	for _, src := range cfg.TaskSources {
+		p := src.Path
+		if abs, e := filepath.Abs(p); e == nil {
+			p = abs
+		}
+		if src.Agent == agent && p == sourcePath {
+			return src.NextTaskTemplate, nil
+		}
+	}
+	return "", nil
+}
+
+// requireIdleAgent re-resolves the agent behind paneID and refuses unless it
+// is still cleanly idle. The caller's own status read is stale by then — as
+// old as the operator's confirmation, or as a --yes script's earlier check —
+// and delivering into a working agent's live conversation is exactly what the
+// idle-only rule exists to prevent. An unreadable agent list fails CLOSED:
+// "we could not ask" is not "it is idle" (the same boundary as
+// Status.AgentsKnown).
+func (a *App) requireIdleAgent(ctx context.Context, paneID, agentName string) error {
+	agents, err := a.Herdr.ListAgents(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot confirm %s is still idle, so nothing was sent: %w", agentName, err)
+	}
+	for _, ag := range agents {
+		if ag.PaneID != paneID {
+			continue
+		}
+		if domain.AgentBusy(ag.Status) {
+			return fmt.Errorf("agent %s is %s — a task can only be sent to a cleanly idle agent",
+				agentName, ag.Status)
+		}
+		return nil
+	}
+	return fmt.Errorf("agent %s is no longer live — refresh and retry", agentName)
+}
+
+// reserveTask claims item index for delivery: it verifies the item still
+// carries exactly taskText AND is still pending, then marks it [-], as ONE
+// locked read-modify-write. Checking and claiming must be atomic — a
+// concurrent edit slipping between them is what would let the same task be
+// delivered twice.
+func reserveTask(index int, taskText string) func(string) (string, error) {
+	return func(content string) (string, error) {
+		if err := expectTaskText(content, index, taskText); err != nil {
+			return "", err
+		}
+		for _, it := range domain.ParseChecklist(content) {
+			if it.Index == index && it.Done {
+				// Done covers [x] and [-] alike: either way it is not a
+				// pending task waiting to be handed out.
+				return "", fmt.Errorf("task #%d is no longer pending — refresh and retry", index)
+			}
+		}
+		return domain.MarkChecklistItemInProgress(content, index)
+	}
+}
+
+// SendTaskToAgent delivers one specific pending checklist item to a live
+// agent's pane, rendered through the task source's next-task template — the
+// operator-initiated twin of the daemon's idle-time declared-task send.
+//
+// The order here is load-bearing: the agent is re-checked idle, then the item
+// is RESERVED (verified and marked [-] under the file lock), and only then
+// delivered. Marking after delivery would mean a guarded failure could be
+// reported once the pane already had the task, leaving the item [ ] — which
+// the daemon's idle flow would then hand out a second time. Reserving first
+// makes the failure modes safe in the other direction: a send that fails
+// rolls the item back to [ ], and a rollback that also fails leaves it [-],
+// which merely parks the task (the daemon only ever sends [ ] items) instead
+// of duplicating work in the agent.
+//
+// As an operator action it is exempt from the pause switch, matching
+// Resolve/Confirm.
+func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName, sourcePath, template string, index int, taskText string) error {
+	if a.Herdr == nil {
+		return fmt.Errorf("herdr unavailable — cannot send")
+	}
+	if paneID == "" {
+		return fmt.Errorf("no pane known for this agent")
+	}
+	if err := a.requireIdleAgent(ctx, paneID, agentName); err != nil {
+		return err
+	}
+	// Resolve {cwd} before reserving: it shells out to herdr, and a failure
+	// here should not have to unwind a reservation. Only when the template
+	// the prompt will actually render through references it.
+	cwd := ""
+	if strings.Contains(domain.TemplateOrDefault(template), "{cwd}") {
+		cwd = a.paneCwd(ctx, paneID)
+	}
+	if _, err := mutateTaskFile(sourcePath, reserveTask(index, taskText)); err != nil {
+		// Name the phase: reserveTask's own refusals are self-describing, but
+		// a lock/read/write failure would otherwise surface as a bare os
+		// error in a flow whose first question is "did it send?".
+		return fmt.Errorf("reserving task #%d (nothing was sent): %w", index, err)
+	}
+	prompt := domain.DeclaredTask{
+		Task: taskText, Path: sourcePath, Template: template, AgentName: agentName, Cwd: cwd,
+	}.Prompt()
+	if err := ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt); err != nil {
+		if _, rbErr := mutateTaskFile(sourcePath, releaseTask(index, taskText)); rbErr != nil {
+			return fmt.Errorf("send failed (%w) and task #%d could not be returned to [ ] (%v) — "+
+				"it stays [-] and no agent will pick it up until you clear it", err, index, rbErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// releaseTask undoes a reservation after a failed delivery, returning the item
+// to [ ]. It is claim-scoped: it only resets an item that still carries this
+// reservation's text AND is still [-]. Resetting on text alone would let a
+// rollback silently re-open work somebody else completed in the meantime —
+// and re-arm it for the daemon. Anything else is left [-], which merely parks
+// the task rather than risking a second delivery.
+func releaseTask(index int, taskText string) func(string) (string, error) {
+	return func(content string) (string, error) {
+		if err := expectTaskText(content, index, taskText); err != nil {
+			return "", err
+		}
+		for _, it := range domain.ParseChecklist(content) {
+			if it.Index == index && it.Mark != domain.MarkInProgress {
+				return "", fmt.Errorf("task #%d is now [%s], not the [-] this send reserved", index, it.Mark)
+			}
+		}
+		return domain.SetChecklistItemDone(content, index, false)
+	}
+}
+
+// paneCwd resolves the pane's working directory for {cwd}, preferring the
+// foreground process's cwd exactly as the daemon's declared-task path does,
+// so one template renders the same whoever sends it. Best-effort: the
+// inspector is an optional herdr capability and an empty {cwd} must never
+// block a send.
+func (a *App) paneCwd(ctx context.Context, paneID string) string {
+	insp, ok := a.Herdr.(ports.InspectorPort)
+	if !ok {
+		return ""
+	}
+	pi, err := insp.PaneInfo(ctx, paneID)
+	if err != nil {
+		return ""
+	}
+	if pi.ForegroundCwd != "" {
+		return pi.ForegroundCwd
+	}
+	return pi.Cwd
+}
+
+// readChecklist reads and parses a checklist file.
+func readChecklist(path string) ([]domain.ChecklistItem, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return domain.ParseChecklist(string(data)), nil
+}
+
+// TaskGroup is one configured task source plus its parsed checklist, for the
+// aggregated all-agents view (TUI Tasks tab). Err carries a per-source read
+// failure (missing/unreadable file) so one bad source never hides the rest.
+type TaskGroup struct {
+	Source config.TaskSource
+	Index  int // position in cfg.TaskSources (stable group identity)
+	Items  []domain.ChecklistItem
+	Err    string // "" = read OK
+}
+
+// TaskGroups parses every configured task source's checklist, in config
+// order. It takes the already-loaded cfg so a refresh snapshot's config and
+// its task groups can never disagree. Duplicate paths each get their own
+// group — they are distinct config entries, exactly as the Config tab lists
+// them. This deliberately does NOT reuse resolveTaskFilePath: its
+// exactly-one-source-per-agent semantics pick a file to edit, while the
+// aggregate shows every source as configured.
+func TaskGroups(cfg config.Config) []TaskGroup {
+	groups := make([]TaskGroup, 0, len(cfg.TaskSources))
+	for i, src := range cfg.TaskSources {
+		g := TaskGroup{Source: src, Index: i}
+		if src.Path == "" {
+			g.Err = "no path configured"
+		} else if items, err := readChecklist(src.Path); err != nil {
+			g.Err = err.Error()
+		} else {
+			g.Items = items
+		}
+		groups = append(groups, g)
+	}
+	return groups
+}
+
+// UnfinishedTasks counts items that are neither completed nor abandoned —
+// pending "[ ]" AND in-progress "[-]" — skipping unreadable sources like
+// PendingTasks does.
+//
+// It exists because ChecklistItem.Done is a pending/not-pending flag, not a
+// "completed" flag: ParseChecklist sets Done for every mark except " ", so a
+// "[-]" item an agent is mid-way through reads as Done and PendingTasks
+// counts it as zero work left. Callers asking "is this list finished?" (as
+// opposed to "is there anything to send?") must use this instead.
+func UnfinishedTasks(groups []TaskGroup) int {
+	n := 0
+	for _, g := range groups {
+		if g.Err != "" {
+			continue
+		}
+		for _, it := range g.Items {
+			if !it.Done || it.Mark == domain.MarkInProgress {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// PendingTasks counts unchecked items across groups, skipping unreadable
+// sources (their contents are unknown, not zero).
+func PendingTasks(groups []TaskGroup) int {
+	n := 0
+	for _, g := range groups {
+		if g.Err != "" {
+			continue
+		}
+		for _, it := range g.Items {
+			if !it.Done {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 // ListTasks returns every checklist item in the resolved source file, numbered
 // by absolute file position (checked and unchecked alike). Filtering by status
 // is the CLI's job — the numbers here never depend on a filter.
@@ -1782,11 +2068,7 @@ func (a *App) ListTasks(agent, path string) ([]domain.ChecklistItem, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return nil, err
-	}
-	return domain.ParseChecklist(string(data)), nil
+	return readChecklist(p)
 }
 
 // GetTask returns the single item addressed by its 1-based number.
@@ -1806,53 +2088,148 @@ func (a *App) GetTask(agent, path string, index int) (domain.ChecklistItem, erro
 	return domain.ChecklistItem{}, fmt.Errorf("no task #%d: valid task numbers are 1..%d", index, len(items))
 }
 
+// taskSourceLimit returns the max_tasks cap of the [[task_sources]] entry that
+// owns resolvedPath, or 0 (no cap) when resolvedPath is not a registered
+// source file. The cap is a per-source setting, so an ad-hoc --path checklist
+// that is not a managed task source is left uncapped. Matched by absolute path
+// so it applies to both agent- and path-addressed adds of a registered source.
+// A config read error also yields 0 (fail-open: never block an add on it).
+func (a *App) taskSourceLimit(resolvedPath string) int {
+	cfg, err := a.Config()
+	if err != nil {
+		return 0
+	}
+	// Abs both sides: the agent-addressed path comes back from
+	// resolveTaskFilePath as the raw config spelling (possibly relative),
+	// while a --path add is already absolute — normalize so a relative
+	// [[task_sources]] path still matches and stays capped.
+	if abs, e := filepath.Abs(resolvedPath); e == nil {
+		resolvedPath = abs
+	}
+	for _, src := range cfg.TaskSources {
+		sp := src.Path
+		if abs, e := filepath.Abs(sp); e == nil {
+			sp = abs
+		}
+		if sp == resolvedPath {
+			return src.MaxTasksLimit()
+		}
+	}
+	return 0
+}
+
 // AddTask appends a new unchecked item and returns the updated list plus the
-// new item's number.
+// new item's number. Text containing line breaks stays ONE task: the breaks
+// are stored as literal `\n` sequences (a checklist item is one physical
+// line) and converted back to real newlines when the task is sent to an
+// agent (DeclaredTask.Prompt). The add is rejected when it would push the
+// checklist past the source's max_tasks cap (the same limit the daemon's
+// generation gate enforces), so a manual add cannot grow a list the daemon
+// would then refuse to refill.
 func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, error) {
 	p, err := a.taskFilePath(agent, path)
 	if err != nil {
 		return nil, 0, err
 	}
+	limit := a.taskSourceLimit(p)
 	newIndex := 0
 	items, err := mutateTaskFile(p, func(content string) (string, error) {
-		out, idx, e := domain.AppendChecklistItem(content, text)
+		// Checked inside the lock (like expectTaskText) so a racing add cannot
+		// slip the count over the cap. limit == 0 means no cap (the file is
+		// not a registered task source).
+		if current := len(domain.ParseChecklist(content)); limit > 0 && current+1 > limit {
+			who := ""
+			if agent != "" {
+				who = fmt.Sprintf(" for agent %q", agent)
+			}
+			return "", fmt.Errorf("maximum number of tasks reached%s (%d items, cap %d) — clean up the task list to make room for new tasks", who, current, limit)
+		}
+		// Trim before encoding: raw text that is only whitespace/line breaks
+		// must be rejected, not stored as literal `\n` sequences.
+		if strings.TrimSpace(text) == "" {
+			return "", fmt.Errorf("task text must not be empty")
+		}
+		out, idx, e := domain.AppendChecklistItem(content, domain.EncodeTaskNewlines(strings.TrimSpace(text)))
 		newIndex = idx
 		return out, e
 	})
 	return items, newIndex, err
 }
 
-// SetTaskDone toggles an item's status and returns the renumbered list.
-func (a *App) SetTaskDone(agent, path string, index int, done bool) ([]domain.ChecklistItem, error) {
+// expectTaskText guards a checklist mutation against a file that changed
+// while the operator had a prompt or confirmation open: inside the same
+// locked read-modify-write, it verifies task #index still carries exactly
+// the text the caller resolved the number against. Task numbers are
+// positional and renumber on every delete, so without this a stale index
+// would silently mutate a different line.
+func expectTaskText(content string, index int, want string) error {
+	for _, it := range domain.ParseChecklist(content) {
+		if it.Index != index {
+			continue
+		}
+		if it.Text != want {
+			return fmt.Errorf("task #%d is now %q, not %q — the checklist changed; refresh and retry", index, it.Text, want)
+		}
+		return nil
+	}
+	return fmt.Errorf("task #%d no longer exists — the checklist changed; refresh and retry", index)
+}
+
+// guardedMutation wraps a checklist mutation with the optional expected-text
+// check the TUI's captured-at-keypress actions pass (the CLI omits it).
+func guardedMutation(index int, expectText []string, fn func(string) (string, error)) func(string) (string, error) {
+	return func(content string) (string, error) {
+		if len(expectText) > 0 {
+			if err := expectTaskText(content, index, expectText[0]); err != nil {
+				return "", err
+			}
+		}
+		return fn(content)
+	}
+}
+
+// SetTaskDone toggles an item's status and returns the renumbered list. An
+// optional expectText aborts (inside the file lock) if the item's text no
+// longer matches — see expectTaskText.
+func (a *App) SetTaskDone(agent, path string, index int, done bool, expectText ...string) ([]domain.ChecklistItem, error) {
 	p, err := a.taskFilePath(agent, path)
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, func(content string) (string, error) {
+	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
 		return domain.SetChecklistItemDone(content, index, done)
-	})
+	}))
 }
 
 // EditTask replaces an item's text (keeping its status) and returns the list.
-func (a *App) EditTask(agent, path string, index int, text string) ([]domain.ChecklistItem, error) {
+// Line breaks in the new text are stored as literal `\n` sequences — the item
+// stays one task on one line (see AddTask). An optional expectText aborts
+// (inside the file lock) if the item's stored text no longer matches — see
+// expectTaskText.
+func (a *App) EditTask(agent, path string, index int, text string, expectText ...string) ([]domain.ChecklistItem, error) {
 	p, err := a.taskFilePath(agent, path)
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, func(content string) (string, error) {
-		return domain.EditChecklistItemText(content, index, text)
-	})
+	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
+		if strings.TrimSpace(text) == "" {
+			return "", fmt.Errorf("task text must not be empty")
+		}
+		return domain.EditChecklistItemText(content, index, domain.EncodeTaskNewlines(strings.TrimSpace(text)))
+	}))
 }
 
-// DeleteTask removes an item and returns the renumbered list.
-func (a *App) DeleteTask(agent, path string, index int) ([]domain.ChecklistItem, error) {
+// DeleteTask removes an item and returns the renumbered list. An optional
+// expectText aborts (inside the file lock) if the item's text no longer
+// matches — see expectTaskText.
+func (a *App) DeleteTask(agent, path string, index int, expectText ...string) ([]domain.ChecklistItem, error) {
 	p, err := a.taskFilePath(agent, path)
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, func(content string) (string, error) {
+	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
 		return domain.DeleteChecklistItem(content, index)
-	})
+	}))
 }
 
 // SignatureRow is a learned signature enriched for display: the persisted

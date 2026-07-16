@@ -1578,6 +1578,28 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 		return
 	}
 
+	// A source that has grown past its max_tasks cap must not be topped up:
+	// refilling an already-long list just buries the operator, so warn and
+	// skip until they prune it. Only the exhausted branch carries a
+	// [[task_sources]] entry (and thus a max_tasks); the no-source branch is
+	// bootstrapping an empty list, which can never be over the cap. This must
+	// stay above StageLLMRequest below — returning after staging would orphan
+	// a pending-consult row that the in-flight guard then trips on forever.
+	if sourceExhausted {
+		agentName, _ := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
+		if m, ok := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName); ok {
+			if n, limit := len(domain.ParseChecklist(string(m.data))), m.src.MaxTasksLimit(); n > limit {
+				name := agentName
+				if name == "" {
+					name = s.AgentID
+				}
+				slog.Warn("maximum number of tasks reached — clean up the task list to make room for new tasks; skipping task generation",
+					"agent", name, "tasks", n, "max_tasks", limit, "path", m.src.Path)
+				return
+			}
+		}
+	}
+
 	// task_generate_command_start is only for bootstrapping a list from
 	// nothing: when a declared source already exists (even exhausted), a list
 	// already exists, so this is never a "first" generation. That case must
@@ -2042,7 +2064,7 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	// changed since Decide ran (kill switch, rate, the pane itself).
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
-		escalateWith(domain.ReasonKilled, "at rewrite")
+		escalateWith(domain.ReasonDaemonPaused, "at rewrite")
 		return
 	}
 	if hit, matched := allow.Match(s.AgentType, final); matched {
@@ -2240,7 +2262,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// bypass safety controls.
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
-		reject(domain.ReasonKilled, "at LLM promotion")
+		reject(domain.ReasonDaemonPaused, "at LLM promotion")
 		return
 	}
 	// The never-auto match and the heuristic both scan the situation's
@@ -2969,8 +2991,11 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 	}
 	// Resolve cwd only when the template references it (the common case does
 	// not), keeping the main-loop `pane get` shell-out off the hot path.
+	// Via TemplateOrDefault, so this asks the same question the frontend's
+	// manual send does — the template that will actually render, default
+	// included, not just the source's own field.
 	cwd := ""
-	if strings.Contains(m.src.NextTaskTemplate, "{cwd}") {
+	if strings.Contains(domain.TemplateOrDefault(m.src.NextTaskTemplate), "{cwd}") {
 		cwd = d.paneCwd(ctx, tr.PaneID)
 	}
 	return &domain.DeclaredTask{

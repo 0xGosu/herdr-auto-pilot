@@ -37,6 +37,12 @@ const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer t
 // operator's template can steer what the agent does next.
 const NoTaskContent = "none"
 
+// MarkInProgress is the ChecklistItem.Mark of a task that has been handed to
+// an agent but not finished ("[-]"). It is the third state between "[ ]" and
+// "[x]", and the reason ChecklistItem.Done alone cannot answer "is this list
+// finished?" — see the Done field's doc.
+const MarkInProgress = "-"
+
 // DeclaredTask is the resolved operator-declared next task (FR-011): the
 // task content plus the source it came from, so the outbound prompt can be
 // rendered from the source's template.
@@ -53,16 +59,27 @@ type DeclaredTask struct {
 	LLMReview bool
 }
 
+// TemplateOrDefault resolves a task source's next-task template, falling back
+// to DefaultNextTaskTemplate for an unset one. Prompt renders through it, and
+// it is exported so a caller can inspect the template it is ABOUT to render —
+// notably to skip resolving {cwd} (a herdr round-trip) when nothing
+// references it. Reading t.Template directly would miss the default.
+func TemplateOrDefault(template string) string {
+	if template == "" {
+		return DefaultNextTaskTemplate
+	}
+	return template
+}
+
 // Prompt renders the outbound prompt from the source's template. A single
 // pass substitutes every placeholder, so placeholder-like text inside the
-// task content or path is never re-expanded.
+// task content or path is never re-expanded. Literal `\n` sequences in the
+// task content become real newlines here — the sending side of the
+// one-line-per-item storage encoding (see EncodeTaskNewlines).
 func (t DeclaredTask) Prompt() string {
-	tpl := t.Template
-	if tpl == "" {
-		tpl = DefaultNextTaskTemplate
-	}
+	tpl := TemplateOrDefault(t.Template)
 	return strings.NewReplacer(
-		"{next_task_content}", t.Task,
+		"{next_task_content}", DecodeTaskNewlines(t.Task),
 		"{task_list_path}", t.Path,
 		"{agent_name}", t.AgentName,
 		"{cwd}", t.Cwd,
@@ -260,6 +277,15 @@ func SetChecklistItemDone(content string, index int, done bool) (string, error) 
 	})
 }
 
+// MarkChecklistItemInProgress sets item index's checkbox to the [-]
+// in-progress marker (what the generated-task flow writes for the task an
+// agent is actively working), preserving its prefix and text.
+func MarkChecklistItemInProgress(content string, index int) (string, error) {
+	return rewriteChecklistLine(content, index, func(prefix, _, text string) string {
+		return prefix + "[" + MarkInProgress + "] " + text
+	})
+}
+
 // EditChecklistItemText replaces item index's text, preserving its prefix and
 // its current checkbox marker (a done item stays done). The new text must be a
 // non-empty single line.
@@ -271,6 +297,28 @@ func EditChecklistItemText(content string, index int, text string) (string, erro
 	return rewriteChecklistLine(content, index, func(prefix, marker, _ string) string {
 		return prefix + "[" + marker + "] " + text
 	})
+}
+
+// A checklist item is one physical line, but a task's content may span
+// several: embedded line breaks are stored as the literal two-character
+// sequence `\n` and converted back to real newlines only when the task is
+// rendered into an agent prompt (DeclaredTask.Prompt). Hand-written `\n` in
+// tasks.md gets the same treatment. The encoding is deliberately not
+// escaped: backslash-n in task text ALWAYS means a line break, so a task
+// cannot deliver a literal `\n` (e.g. in a regex) to the agent — the
+// documented trade-off for hand-editable files.
+
+// EncodeTaskNewlines makes multi-line task text storable on one checklist
+// line: every line-break flavor (\r\n, \n, bare \r) becomes the literal
+// two-character sequence `\n`.
+func EncodeTaskNewlines(s string) string {
+	return strings.NewReplacer("\r\n", `\n`, "\n", `\n`, "\r", `\n`).Replace(s)
+}
+
+// DecodeTaskNewlines is the sending-side inverse: literal `\n` sequences in
+// stored task text become real newlines.
+func DecodeTaskNewlines(s string) string {
+	return strings.ReplaceAll(s, `\n`, "\n")
 }
 
 // DeleteChecklistItem removes item index's line entirely, leaving every other

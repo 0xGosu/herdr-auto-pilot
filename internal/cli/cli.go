@@ -945,7 +945,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 // position among all items in the file; every mutating op re-prints the
 // renumbered list so the caller always sees fresh numbers.
 func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | done <n> | undone <n> | update <n> <text> | remove <n>"
+	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | done <n> | undone <n> | update <n> <text> | remove <n> | send <n> [--yes]"
 	agent, path, args, err := taskTarget(args)
 	if err != nil {
 		return err
@@ -1015,8 +1015,121 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 		fmt.Fprintf(out, "removed task #%d\n", idx)
 		printTaskList(out, items, "all")
 		return nil
+	case "send":
+		return taskSend(ctx, app, out, agent, path, rest)
 	}
 	return fmt.Errorf("unknown task op %q\n%s", op, usage)
+}
+
+// stdin is the confirmation input for interactive prompts, injectable so
+// tests can script the y/n answer.
+var stdin io.Reader = os.Stdin
+
+// taskSend delivers pending task #n to the named live agent — the CLI twin
+// of the TUI Tasks tab's enter/y. It asks for y/N confirmation (skipped with
+// --yes) and, like the TUI, refuses done/in-progress tasks and agents that
+// are not cleanly idle. On success the item is marked [-] in progress (done
+// inside App.SendTaskToAgent, guarded against a checklist that changed).
+func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path string, rest []string) error {
+	skipConfirm := false
+	var idxArgs []string
+	for _, a := range rest {
+		if a == "--yes" || a == "-y" {
+			skipConfirm = true
+			continue
+		}
+		idxArgs = append(idxArgs, a)
+	}
+	if agent == "" {
+		return fmt.Errorf("task send needs an agent name (a --path list has no agent to send to)")
+	}
+	idx, err := taskIndexArg(idxArgs)
+	if err != nil {
+		return err
+	}
+	it, err := app.GetTask(agent, path, idx)
+	if err != nil {
+		return err
+	}
+	if it.Done {
+		return fmt.Errorf("task #%d is %q — only a pending [ ] task can be sent", idx, it.Mark)
+	}
+	status, err := app.GetStatus(ctx)
+	if err != nil {
+		return err
+	}
+	// Resolve the live agent by id or short name first; fall back to the
+	// agent-type selector form (exactly one live agent of that type wins,
+	// mirroring resolveTaskFilePath's rules).
+	var live *domain.AgentTransition
+	for i, a := range status.MonitoredAgents {
+		if a.AgentID == agent || status.AgentName(a.AgentID) == agent {
+			live = &status.MonitoredAgents[i]
+			break
+		}
+	}
+	if live == nil {
+		typeMatches := 0
+		for i, a := range status.MonitoredAgents {
+			if a.AgentType == agent {
+				live = &status.MonitoredAgents[i]
+				typeMatches++
+			}
+		}
+		if typeMatches > 1 {
+			return fmt.Errorf("%d live agents are of type %q — use the agent id or short name", typeMatches, agent)
+		}
+	}
+	if live == nil {
+		return fmt.Errorf("no live agent named %q — see: hap agents", agent)
+	}
+	if domain.AgentBusy(live.Status) {
+		return fmt.Errorf("agent %s is %s — a task can only be sent to a cleanly idle agent", agent, live.Status)
+	}
+	sourcePath, err := app.TaskSourcePathFor(agent)
+	if err != nil {
+		return err
+	}
+	template, err := app.TaskSourceTemplateFor(agent, sourcePath)
+	if err != nil {
+		return err
+	}
+	if !skipConfirm {
+		// Scripted (non-TTY) runs must opt in explicitly, matching the
+		// signatures delete/reset confirmations; tests inject stdin.
+		if stdin == os.Stdin && !stdinIsTTY() {
+			return fmt.Errorf("confirmation needs a terminal; rerun as: task %s send %d --yes", agent, idx)
+		}
+		fmt.Fprintf(out, "send task #%d (%s) to %s? [y/N] ", idx, oneLineText(it.Text, 60), agent)
+		answer := ""
+		if _, err := fmt.Fscanln(stdin, &answer); err != nil {
+			answer = "" // EOF or a bare newline both read as the default No
+		}
+		if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+			fmt.Fprintln(out, "aborted — task unchanged")
+			return nil
+		}
+	}
+	// No extra wrapping: SendTaskToAgent's errors already state the phase.
+	// It reserves the item before delivering, so an error here is either a
+	// pre-delivery refusal (the agent stopped being idle, the checklist
+	// moved) or a delivery failure whose reservation was rolled back —
+	// either way the task is not in the agent, and retrying is safe.
+	if err := app.SendTaskToAgent(ctx, live.PaneID, live.AgentType, agent, sourcePath, template, idx, it.Text); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "task #%d sent to %s and marked [-] in progress\n", idx, agent)
+	return nil
+}
+
+// oneLineText compacts task text for the confirmation prompt, truncating by
+// runes so multi-byte text never splits into mojibake.
+func oneLineText(s string, limit int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if r := []rune(s); len(r) > limit {
+		s = string(r[:limit-1]) + "…"
+	}
+	return s
 }
 
 // taskTarget peels the leading target off a `task` argument list: either

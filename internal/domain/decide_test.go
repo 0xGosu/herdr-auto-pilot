@@ -36,7 +36,7 @@ func TestKillSwitchVetoesEverything(t *testing.T) {
 	in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y", "y", "y")
 	in.KillActive = true
 	d := Decide(in)
-	if d.Action != ActionEscalate || d.Reason != ReasonKilled {
+	if d.Action != ActionEscalate || d.Reason != ReasonDaemonPaused {
 		t.Fatalf("kill switch must escalate, got %+v", d)
 	}
 	if d.Confidence != 1 {

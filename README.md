@@ -41,14 +41,55 @@ herdr plugin install 0xGosu/herdr-auto-pilot --ref v0.1.2
 herdr plugin install 0xGosu/herdr-auto-pilot --yes
 ```
 
-That's it. The monitoring daemon starts automatically when an agent appears in
-the herd, and the **Auto Prompter** pane (TUI) is available from Herdr's pane
-commands. Everything the TUI does is also a CLI verb on the same binary:
+The monitoring daemon starts automatically when an agent appears in the herd.
+Use the following recommended setup to make the **Auto Prompter** pane (TUI)
+and its CLI convenient to access from the host machine.
+
+### Open the pane with a hotkey (recommended)
+
+Herdr supports custom command keybindings, and the Auto Prompter pane can be
+opened from the CLI. Add this recommended binding to
+`~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+a"
+type = "shell"
+command = "herdr plugin pane open --plugin herd-auto-prompter --entrypoint control"
+description = "Open Auto Prompter pane"
+```
+
+Then apply it with `herdr server reload-config` (no restart needed). Now
+`ctrl+b` (Herdr's default prefix) followed by `a` opens the pane.
+
+Notes:
+
+- The pane opens as a tab (the placement declared in the plugin manifest);
+  override with `--placement split|overlay|zoomed` in the command if you prefer.
+- `prefix+a` is unused by Herdr's default bindings. Direct (no-prefix) chords
+  like `key = "ctrl+alt+a"` also work — ctrl+letter, function keys, and
+  explicit modified chords are the most reliable.
+
+### Make the CLI available from any shell
+
+Open the **Auto Prompter** pane with the hotkey above, switch to the **Config**
+tab, select **Create /usr/local/bin/hap symlink to this running binary** under
+**Quick Shortcuts**, and press `enter` to confirm. This makes `hap` available
+from any shell (provided `/usr/local/bin` is on your `PATH`).
+
+After creating the symlink, you can also launch the TUI directly from any Bash
+shell instead of opening the Herdr pane with the hotkey:
 
 ```sh
-bin/hap status         # from the plugin dir, or put it on PATH
-bin/hap escalations
-bin/hap pause          # global kill switch
+hap tui
+```
+
+Everything the TUI does is also a CLI verb on the same binary:
+
+```sh
+hap status         # from any shell after creating the symlink above
+hap escalations
+hap pause          # global kill switch
 ```
 
 Run from any shell, `hap` operates on the same instance the daemon uses:
@@ -65,36 +106,11 @@ read-only, need no daemon, and print the bare path so they compose in
 scripts:
 
 ```sh
-bin/hap state-dir            # state dir (DB, logs, socket, lock, match-index)
-bin/hap config path          # the config.toml path (printed even before it exists)
-bin/hap paths                # both, labeled
-cd "$(bin/hap state-dir)"    # e.g. jump into the state dir
+hap state-dir            # state dir (DB, logs, socket, lock, match-index)
+hap config path          # the config.toml path (printed even before it exists)
+hap paths                # both, labeled
+cd "$(hap state-dir)"    # e.g. jump into the state dir
 ```
-
-### Open the pane with a hotkey (optional)
-
-Herdr supports custom command keybindings, and the Auto Prompter pane can be
-opened from the CLI — so you can bind it to a key. Add this to
-`~/.config/herdr/config.toml`:
-
-```toml
-[[keys.command]]
-key = "prefix+a"
-type = "shell"
-command = "herdr plugin pane open --plugin herd-auto-prompter --entrypoint control"
-description = "Open Auto Prompter pane"
-```
-
-Then apply it with `herdr server reload-config` (no restart needed). Now
-`ctrl+b` (Herdr's default prefix) followed by `a` opens the pane.
-
-Notes:
-
-- The pane opens as a split (the placement declared in the plugin manifest);
-  override with `--placement overlay|tab|zoomed` in the command if you prefer.
-- `prefix+a` is unused by Herdr's default bindings. Direct (no-prefix) chords
-  like `key = "ctrl+alt+a"` also work — ctrl+letter, function keys, and
-  explicit modified chords are the most reliable.
 
 ## Architecture
 
@@ -107,48 +123,39 @@ sends input directly to an agent process; it observes and controls the agent's
 pane through Herdr.
 
 ```mermaid
-flowchart LR
-    O["Operator"]
-
-    subgraph HR["Herdr runtime"]
-        H["Herdr server<br/>events and pane control"]
-        A["Coding agent<br/>running in a Herdr pane"]
+flowchart TB
+    subgraph HR["Herdr"]
+        direction LR
+        A["Coding agent needs input"] --> H["Status and screen events"]
     end
 
-    subgraph HP["Herd Auto Prompter plugin"]
-        E["Plugin event hooks<br/>hap daemon --ensure"]
-        D["hap daemon<br/>capture → classify → match → decide → gate"]
-        F["hap TUI / CLI<br/>operator controls"]
-        W["hap embed-worker<br/>llama.cpp embeddings"]
-        L["Optional LLM / agent CLI<br/>hap mcp for consults"]
+    H --> M
+
+    subgraph HP["Auto Prompter"]
+        direction LR
+        M["Monitor and<br/>classify"] --> D["Match a learned choice<br/>or get an AI suggestion"]
+        D --> G{"Pass safety and<br/>confidence checks?"}
     end
 
-    subgraph LS["Local state"]
-        CFG["config.toml<br/>thresholds, safety, tasks, LLM"]
-        DB[("SQLite + match index<br/>rules, decisions, audit, escalations")]
+    subgraph LS["Local data"]
+        direction LR
+        C["Config and<br/>safety rules"]
+        L[("Learned choices,<br/>corrections, and audit history")]
     end
 
-    A -->|screen output and status| H
-    H -->|keyboard input| A
-    H -->|workspace.created / pane.agent_detected| E
-    E --> D
-    H -->|agent-status events over local socket| D
-    D -->|pane read/get, agent list| H
-    D -->|agent send, send-keys, notifications| H
-
-    D <-->|semantic match requests| W
-    D <-->|consult, rewrite, or task suggestion| L
-    D <-->|read/write| DB
-    CFG -.->|live reload| D
-
-    O <--> F
-    H -.->|notifications| O
-    H -.->|hosts the TUI pane| F
-    F -->|operator-confirmed input| H
-    F -->|configuration changes| CFG
-    F -->|confirmations, corrections, pause, audit| DB
-    F -.->|reload / wake nudge| D
+    AI["Optional AI helper"] -.-> D
+    C --> G
+    L --> D
+    G -->|Yes| R["Herdr sends the response<br/>and the agent continues"]
+    G -->|No| F["Escalation appears<br/>in the TUI / CLI"]
+    F --> O["You review,<br/>confirm, or correct"]
+    O -->|Confirmed response| R
 ```
+
+In the diagram, **Auto Prompter** includes the background daemon and the
+user-facing TUI/CLI. The **optional AI helper** is any configured local LLM or
+agent CLI, and it can only propose a response. **Local data** covers
+`config.toml` plus the SQLite learning and audit database.
 
 ### Runtime flow
 
@@ -156,49 +163,52 @@ flowchart LR
    `workspace.created` and `pane.agent_detected`. A hook runs
    `hap daemon --ensure`, which starts one version-checked, lock-guarded daemon
    for the whole herd and returns immediately.
-2. **Herdr reports an agent transition.** The daemon subscribes to Herdr's
+2. **Herdr reports status and screen events.** The daemon subscribes to Herdr's
    local event socket for pane discovery and agent-status changes. When an
    agent becomes idle, blocked, done, or otherwise needs attention, the daemon
    waits for the agent interface to paint, then asks Herdr to read the pane
    and its metadata. Reconnects replay existing panes, so agents that predate
    the daemon are reconciled too.
-3. **Hap interprets the screen.** It classifies the captured situation as
-   idle, approval, choice, or error; masks volatile text into a stable
-   signature; and looks for a learned rule. Semantic lookup runs in the
-   isolated `hap embed-worker`, with BM25 and exact matching as fallbacks.
-4. **The daemon makes and re-checks the decision.** Learned confidence,
-   graduation state, optional task sources, and any LLM suggestion feed the
-   decision pipeline. Before delivery, every result passes the same kill
-   switch, never-auto patterns, suspected-irreversible check, rate/retry
+3. **Auto Prompter monitors, classifies, and matches.** It classifies the
+   captured situation as idle, approval, choice, or error; masks volatile text
+   into a stable signature; and looks for a learned rule. Semantic lookup runs
+   in the isolated `hap embed-worker`, with BM25 and exact matching as
+   fallbacks.
+4. **Every proposed response passes confidence and safety checks.** Learned
+   confidence, graduation state, optional task sources, and any AI suggestion
+   feed the same decision pipeline. Before delivery, every result passes the
+   kill switch, never-auto patterns, suspected-irreversible check, rate/retry
    ceilings, audit-before-action rule, and live-pane staleness check.
-5. **Herdr delivers an approved response.** Hap calls Herdr's CLI to send text
+5. **Herdr sends an approved response.** Hap calls Herdr's CLI to send text
    and Enter, or individual keystrokes for numbered and multi-tab forms. Herdr
    injects that input into the agent pane; the agent resumes, and later status
    changes begin the cycle again. A `@noop` decision is audited but sends no
    input.
-6. **Uncertain decisions return to the operator.** The daemon writes an audit
-   row and escalation, then asks Herdr to show a notification. The TUI and CLI
-   read the same local state. Confirming, correcting, dismissing, pausing, or
-   changing config writes operator-owned state. A confirmed/corrected reply is
-   a human-initiated action, so the frontend records it and sends it through
-   Herdr directly; it then sends a lightweight nudge to the daemon, which
-   reloads the new learning/config state without restarting.
+6. **Uncertain decisions become escalations for you.** The daemon writes an
+   audit row and escalation, then asks Herdr to show a notification. The TUI
+   and CLI read the same local state. Confirming, correcting, dismissing,
+   pausing, or changing config updates that local state. A confirmed/corrected
+   reply is a human-initiated action, so the frontend records it and sends it
+   through Herdr directly; it then sends a lightweight nudge to the daemon,
+   which reloads the new learning/config state without restarting.
 
-### Optional LLM path
+### Optional AI helper path
 
 For an unknown situation, the daemon may launch the configured local
 LLM/agent CLI. Consults attach a short-lived `hap mcp` server: the model reads
 the staged context with `get_context` and returns a structured decision with
 `submit_decision`. Rewrites and idle-task generation are one-shot commands
 whose stdout is treated as a proposed result. In every case the daemon — not
-the model or MCP process — owns the final decision, re-applies safety and
-staleness checks, and either sends through Herdr or escalates.
+the model or MCP process — owns the final decision, runs the proposal through
+the same confidence, safety, and staleness checks, and either sends through
+Herdr or escalates.
 
-SQLite stores learned signatures, decisions, audit records, escalations,
-operator corrections, and safety counters. `config.toml` remains the
-hand-editable source for thresholds, safety rules, task sources, embedding,
-LLM, and TUI settings. Both live under the local plugin directories described
-in Quickstart; no learning state is stored in Herdr or in an agent's context.
+SQLite stores learned choices as signatures and decisions, along with audit
+records, escalations, user corrections, and safety counters. `config.toml`
+remains the hand-editable source for thresholds, safety rules, task sources,
+embedding, LLM, and TUI settings. Both live under the local plugin directories
+described in Quickstart; no learning state is stored in Herdr or in an agent's
+context.
 
 ## How it learns (shadow mode)
 
@@ -248,7 +258,7 @@ The plugin never acts on a situation it hasn't learned from you.
 
    `dismiss <id>...` and `escalations prune [minutes]`. Long lists scroll
    with the cursor and show a `… N more` line when rows are clipped, and
-   `/` opens an incremental search on the *Agents*, *Escalations*,
+   `/` opens an incremental search on the *Agents*, *Tasks*, *Escalations*,
    *Audit*, and *Rules* tabs — case-insensitive substring over the visible
    columns. `esc`/`enter` closes the search input keeping the filter,
    backspacing the query to empty clears it, and while typing, every
@@ -287,9 +297,9 @@ its decision history too (audit rows are kept), so it re-learns from
 scratch. Signatures are addressed by unique prefix, git-style:
 
 ```sh
-bin/hap signatures                      # list (--type, --mode, --agent-type, --min-conf)
-bin/hap signatures show approval:9f2c   # full detail by unique prefix
-bin/hap signatures delete approval:9f2c --yes
+hap signatures                      # list (--type, --mode, --agent-type, --min-conf)
+hap signatures show approval:9f2c   # full detail by unique prefix
+hap signatures delete approval:9f2c --yes
 ```
 
 ## Configuration
@@ -402,17 +412,95 @@ Every monitored agent automatically gets a short friendly two-word name
 on its first blocked prompt — because pane ids like `w6:p1` are not
 operator-friendly. The TUI's agent detail (`v`) also shows exactly where
 the agent lives: workspace, tab, and pane, each with its number, label,
-and id. Use the name in task-source selectors, and rename agents to
-whatever fits your workflow:
+and id, plus the matching **task source** (if any). From that detail view,
+`t` jumps to the *Tasks* tab at this agent's source, where its checklist —
+and the source entry itself — can be managed. Use the name in task-source
+selectors, and rename agents to whatever fits your workflow:
 
 ```sh
-bin/hap agents                      # short name, pane id, type, status
-bin/hap rename brave-otter backend-dev
-bin/hap task-source --agent backend-dev ./docs/backend-tasks.md
-bin/hap task-source --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
+hap agents                      # short name, pane id, type, status
+hap rename brave-otter backend-dev
+hap task-source --agent backend-dev ./docs/backend-tasks.md
+hap task-source --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
 ```
 
 (Or in the TUI: select the agent and press `n`.)
+
+### The Tasks tab
+
+The TUI's *Tasks* tab aggregates the checklist items of **every** configured
+task source into one list — a header row per source (with the live agent it
+currently feeds, if any) and its checklist items underneath, done and pending
+alike. Long source paths are display-truncated to their tail (`…/dir/file.md`,
+the file name always preserved); the full path stays searchable and shows in
+the task detail view. It's the same checklist state the `hap task` CLI edits,
+so changes made either way stay in sync (the daemon re-reads the file live on
+each idle event).
+
+Manage items without leaving the pane:
+
+- `enter`/`y` — send the pending task under the cursor to the live agent its
+  source feeds, rendered through the source's next-task template, behind a
+  `Y/n` confirmation. Only a truly pending `[ ]` task on a **cleanly idle**
+  agent qualifies — done (`[x]`) and in-progress (`[-]`) tasks, and
+  working/blocked agents, are refused (the daemon's own idle-only rule). The
+  agent is re-checked idle *at the moment of delivery*, not just when the
+  question is asked, so a confirmation left open while the agent picks up
+  work refuses rather than interrupting it. The task is marked `[-]` in
+  progress **before** it is delivered, which is what keeps the daemon from
+  handing the same item out again; a delivery that fails returns it to
+  `[ ]`. The CLI twin is `hap task <agent> send <n> [--yes]`.
+- `v` — open a task's detail view: full multi-line text, status, the
+  source's full path and selectors, and the live agents it feeds. `enter`/
+  `y`, `e`, `x`, and `f` keep working inside the detail, acting on the item
+  shown.
+- `a` — add a task to the source under the cursor
+- `e` — edit the text of the task under the cursor
+- `d` — toggle a task done/undone
+- `x` — delete a task; on a **source's header row**, retire the whole
+  source (see below)
+- `space` — mark a run of tasks, so `d`/`x` act on all of them at once
+  (with nothing marked, they act on the row under the cursor)
+- `f` — focus the live agent this source feeds, in herdr
+- `/` — incremental search over the visible columns
+
+The add and edit prompts accept multi-line task text: **Shift+Enter inserts
+a line break** (Ctrl+J works on terminals that can't report Shift+Enter) and
+the input box expands one line per break; **Enter submits**, Esc cancels.
+A task always stays ONE checklist line: line breaks are stored as the
+literal two-character sequence `\n` in tasks.md (hand-written `\n` works
+too) and are converted back to real newlines when the task is sent to an
+agent — which means backslash-n in task text always reads as a line break,
+never as those two literal characters. The edit prompt decodes stored `\n`
+back into real lines, and the detail view shows the task as the agent will
+receive it.
+
+The manual send is independent of the daemon, but marking the sent task
+`[-]` keeps the two in step: the daemon's own idle-time declared-task flow
+only ever picks the first still-pending `[ ]` item.
+
+Edits are guarded against a checklist that changed underneath you: an action
+captured against a row aborts (rather than mutating the wrong line) if that
+task's text no longer matches when the write runs.
+
+**Retiring a whole source.** Pressing `x` on a source's *header row* removes
+its `[[task_sources]]` entry, behind a `y/n` confirmation — but only once the
+source can no longer be serving anyone: either **no live agent matches** its
+selectors, or **every task in it is finished**. A source that still feeds a
+live agent and still has unfinished work refuses, naming the agent and what's
+left. In-progress `[-]` tasks count as unfinished, so a source can't be pulled
+out from under an agent that is mid-task. Both *unknowns* refuse too, since
+neither is evidence of safety: an agent list herdr won't answer isn't an empty
+herd, and a checklist that won't read isn't an empty checklist. (A source no
+live agent matches stays retirable whatever its file says — that's what keeps
+a broken entry cleanable from this tab.) Removal takes the config entry
+only — **the checklist file stays on disk**, since sources are often
+hand-written docs hap never created; re-adding the source brings the list back
+untouched. (With items marked via `space`, `x` still deletes those items — the
+selection wins.) To retire a source the guard refuses, use the *Config* tab's
+`x` or `hap task-source remove <index>`, which are unguarded by design. To
+point an agent at a source in the first place, use `hap task-source add` or
+the *Config* tab's `t`.
 
 ### Suggesting tasks when no source exists, or a source runs out (optional)
 
@@ -430,6 +518,19 @@ in a source that already had operator-relevant tasks). Without both commands
 set, an exhausted source escalates `task_source_exhausted` — a confirmable
 @noop suggestion ("No more pending tasks") — instead of generating or sending
 the old templated "none" prompt.
+
+Refill is capped per source by `max_tasks` (default **20**): once a source's
+file holds more than that many checklist items (done, in-progress, and pending
+counted alike) and its pending items are exhausted, the daemon logs a warning
+("Maximum number of tasks reached for agent … — clean up the task list to make
+room for new tasks") and **skips** generation for that agent instead of piling
+more onto an already-long list. The **same cap also gates manual creation** —
+adding tasks (the Tasks tab's `a`, or `hap task … add`) to a registered source
+is rejected once it would push the list past `max_tasks` — so a hand-added list
+can't grow past what the daemon would then refuse to refill. Prune the checklist
+(or raise `max_tasks` on the `[[task_sources]]` entry) to resume. Sending the
+remaining pending items of a source under its cap is unaffected, and a `--path`
+file that isn't a registered `[[task_sources]]` entry is never capped.
 
 The command's stdout may be plain lines or a Markdown list/checklist. Hap
 normalizes it and surfaces it as an escalation; it never auto-accepts a
@@ -542,9 +643,11 @@ the TUI's *Config* tab — which also lists the supported scalar config fields,
 adds/removes task sources (`t`/`x`), and clears learned data (`X`).
 Simple fields — numbers, booleans, and the `tui.theme` enum, including
 `llm.pane_excerpt_chars`, `llm.task_generate_timeout_seconds`,
-`embedding.model_context_window`, `safety.disable_never_auto_seed_patterns`, and
-`tui.max_content_width` / `tui.max_content_height` — edit inline (`enter`) or via
-`hap config set <key> <value>`. Free-text fields (`llm.command`,
+`embedding.model_context_window`, `safety.disable_never_auto_seed_patterns`,
+`tui.max_content_width` / `tui.max_content_height`, and `tui.terminal_bell`
+(on by default — rings the terminal bell on a new escalation, and when the
+kill switch is paused by a *different* process than the TUI you're in) — edit
+inline (`enter`) or via `hap config set <key> <value>`. Free-text fields (`llm.command`,
 `llm.command_start`, `llm.rewrite_command`, `llm.rewrite_command_start`,
 `llm.rewrite_fallback_template`, `llm.task_generate_command`,
 `llm.task_generate_command_start`, `embedding.model_path`) show read-only in
@@ -842,7 +945,7 @@ Two levels, depending on how much you want gone:
 - **Reset learned data (the supported path):**
 
   ```sh
-  bin/hap clear-data --yes
+  hap clear-data --yes
   ```
 
   This empties every learning-related table in the SQLite database
@@ -863,7 +966,7 @@ Two levels, depending on how much you want gone:
 
   Both directories are recreated fresh automatically — the daemon restarts
   on the next `pane.agent_detected`/`workspace.created` event, or
-  immediately via `bin/hap daemon --ensure`.
+  immediately via `hap daemon --ensure`.
 
 Prefer `clear-data` unless you also want your config gone; it's the only
 path that keeps the daemon running through the wipe.

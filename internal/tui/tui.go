@@ -1,7 +1,8 @@
 // Package tui is the primary control surface, run as a Herdr pane. It
 // mirrors every CLI capability (FR-022): monitored agents (with rename),
 // pending escalations (confirm/correct), the audit log (post-hoc
-// correction), learned signatures (Rules tab: inspect/filter/delete),
+// correction), the aggregated task lists of every configured task source
+// (Tasks tab), learned signatures (Rules tab: inspect/filter/delete),
 // configuration (Config tab: fields, never-auto patterns, task sources,
 // clear-data), and the pause/kill switch with history.
 package tui
@@ -9,7 +10,11 @@ package tui
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +31,7 @@ type tab int
 
 const (
 	tabAgents tab = iota
+	tabTasks      // aggregated checklist items of every configured task source
 	tabEscalations
 	tabAudit
 	tabSignatures // "Rules": learned signatures (list/inspect/delete)
@@ -34,12 +40,12 @@ const (
 	tabCount
 )
 
-var tabNames = []string{"Agents", "Escalations", "Audit", "Rules", "Config", "Pause/Kill"}
+var tabNames = []string{"Agents", "Tasks", "Escalations", "Audit", "Rules", "Config", "Pause/Kill"}
 
 // isList reports whether t renders a scrollable, searchable row list.
 // Config and Pause/Kill keep their existing unwindowed navigation (AR-032).
 func (t tab) isList() bool {
-	return t == tabAgents || t == tabEscalations || t == tabAudit || t == tabSignatures
+	return t == tabAgents || t == tabTasks || t == tabEscalations || t == tabAudit || t == tabSignatures
 }
 
 type refreshMsg struct {
@@ -48,6 +54,7 @@ type refreshMsg struct {
 	audit       []domain.AuditRecord
 	kills       []domain.KillEvent
 	signatures  []frontend.SignatureRow
+	tasks       []frontend.TaskGroup
 	cfg         config.Config
 	// daemonHealth combines lock + heartbeat + crash-loop state for the health
 	// banner, so the operator sees a hung/degraded/crash-looping daemon that
@@ -70,6 +77,11 @@ type sigDetailMsg struct {
 type actionResultMsg struct {
 	message string
 	err     error
+	// pauseAction marks a result produced by the "p" pause action
+	// (success or failure), so Update can clear a stale Model.pausePending
+	// if the pause request itself failed (the state never transitioned, so
+	// nothing will consume the flag otherwise).
+	pauseAction bool
 }
 
 // openSendPromptMsg re-opens a second prompt after a LIVE escalation's
@@ -103,6 +115,54 @@ type prompt struct {
 	label    string
 	input    string
 	onSubmit func(string) tea.Cmd
+	// multiline lets shift+enter (and ctrl+j, which works on terminals that
+	// can't report shift+enter) insert a literal newline; the input box
+	// expands one rendered line per break, and enter submits as always.
+	// Pasted CR/LF line breaks are kept regardless. Only prompts whose
+	// consumer understands multi-line text opt in.
+	multiline bool
+}
+
+// promptNewlines normalizes any line-break flavor (\r\n, bare \r — common in
+// terminal bracketed paste) to \n so the prompt renders one input line per
+// break and the height accounting can count them.
+var promptNewlines = strings.NewReplacer("\r\n", "\n", "\r", "\n")
+
+// shiftEnterSeqs are the String() forms bubbletea gives the two standard
+// shift+enter escape sequences — xterm modifyOtherKeys (ESC[27;2;13~, what
+// herdr transmits) and the kitty keyboard protocol (ESC[13;2u). bubbletea
+// v1 has no native shift+enter key type: both arrive as an unrecognized-CSI
+// message (an unexported type), so they are matched by their stable String()
+// rendering instead.
+var shiftEnterSeqs = map[string]bool{
+	fmt.Sprintf("?CSI%+v?", []byte("27;2;13~")): true,
+	fmt.Sprintf("?CSI%+v?", []byte("13;2u")):    true,
+}
+
+// isShiftEnter reports whether msg is a shift+enter keypress delivered as an
+// unrecognized CSI sequence (see shiftEnterSeqs; verified against bubbletea
+// v1.3.10 — re-check the String() rendering on a bubbletea upgrade). A real
+// "shift+enter" KeyMsg is also accepted, so a future bubbletea that learns
+// the sequence natively keeps working.
+func isShiftEnter(msg tea.Msg) bool {
+	if k, isKey := msg.(tea.KeyMsg); isKey {
+		return k.String() == "shift+enter"
+	}
+	s, ok := msg.(fmt.Stringer)
+	return ok && shiftEnterSeqs[s.String()]
+}
+
+// submitPrompt closes the open prompt and runs its onSubmit with the trimmed
+// input; all-whitespace input cancels.
+func (m Model) submitPrompt() (tea.Model, tea.Cmd) {
+	p := m.prompt
+	m.prompt = nil
+	input := strings.TrimSpace(p.input)
+	if input == "" {
+		m.message = "cancelled"
+		return m, nil
+	}
+	return m, p.onSubmit(input)
 }
 
 // confirmation is a single-key Y/n guard for a quick action. Enter accepts
@@ -110,6 +170,17 @@ type prompt struct {
 type confirmation struct {
 	label     string
 	onConfirm func() tea.Cmd
+	// clearsTaskMarks consumes the Tasks tab multi-select on ACCEPT: the
+	// action's targets were captured at prompt-open and task marks are
+	// positional (they renumber after a delete), so they cannot survive the
+	// action — but a cancel must keep the operator's selection intact.
+	clearsTaskMarks bool
+	// revalidate re-checks the action's precondition against the CURRENT
+	// model when the operator accepts, since a refresh can land between the
+	// question and the answer. Nil skips the re-check (the action carries its
+	// own staleness guard, as the task mutations' expected-text does).
+	// Returning false aborts with the returned reason.
+	revalidate func(Model) (string, bool)
 }
 
 // detailView is a full-record overlay opened with `v` on the Agents,
@@ -133,11 +204,24 @@ type detailView struct {
 	// pane coordinates are resolved from live status when `f` is pressed, so a
 	// background refresh or list-cursor move cannot retarget the action.
 	focusAgentID string
+	// ruleDetail marks an escalation/audit overlay, and ruleSignature snapshots
+	// the record's signature so `t: see rule` jumps to the rule of the record ON
+	// SCREEN (same reason as confirmID/focusAgentID). The bool is what gates the
+	// binding, not a non-empty signature: an over-masked record legitimately has
+	// none, and must report that rather than silently no-op — while `t` on an
+	// unrelated overlay (a signature or the daemon-stderr view, which also leave
+	// `agent` nil) must do nothing at all.
+	ruleDetail    bool
+	ruleSignature string
 	// agent snapshots the agent an agents-tab detail was opened for, so the
 	// clock tick can rebuild its lines against the current clock (the live Age
 	// would otherwise freeze at open time — the build closure captures m by
 	// value). nil for non-agent details.
 	agent *domain.AgentTransition
+	// task snapshots the checklist item a Tasks-tab detail was opened for, so
+	// the in-overlay actions (e/x/f) act on the item ON SCREEN even if a
+	// background refresh moved the list cursor. nil for non-task details.
+	task *taskRow
 }
 
 // ruleItem is one navigable row of the Config tab. "scoped-pattern" and
@@ -158,22 +242,29 @@ type Model struct {
 	ctx context.Context
 
 	tab     tab
-	cursor  int
 	data    refreshMsg
 	items   []ruleItem     // Config tab rows, rebuilt on refresh
 	sigMode domain.Mode    // Rules tab display filter: "" = all
 	marked  map[int64]bool // Escalations tab multi-select (audit ids), space toggles
-	message string
-	prompt  *prompt
-	confirm *confirmation
-	detail  *detailView
-	width   int
-	height  int
+	// taskMarks is the Tasks tab multi-select, keyed by taskMarkKey
+	// (group index + item number). Space toggles; d/x consume the set.
+	taskMarks map[string]bool
+	message   string
+	prompt    *prompt
+	confirm   *confirmation
+	detail    *detailView
+	width     int
+	height    int
 
 	// installShortcut is injectable so the key flow can be tested without
 	// writing /usr/local/bin. A nil value uses installHAPShortcut.
 	installShortcut func() error
 
+	// cursors is the selected row of each tab, remembered across tab switches
+	// so returning to a tab restores the row you left it on (CR-038). Only the
+	// active tab's entry is ever read — a background tab's row set can shift
+	// under its remembered cursor, so arriveAtTab clamps on arrival.
+	cursors   [tabCount]int
 	offsets   [tabCount]int    // per-list viewport offset (AR-001)
 	query     [tabCount]string // per-tab search filter (AR-013)
 	searching bool             // search-input mode on the active tab (AR-011)
@@ -183,6 +274,34 @@ type Model struct {
 	// 1s clockTickMsg. Zero falls back to time.Now() (see renderNow), so tests
 	// can pin it for deterministic snapshots.
 	now time.Time
+
+	// bellOut is where the terminal bell (ASCII BEL) is written; nil is a
+	// safe no-op so tests never touch real IO. Run() wires it to os.Stdout.
+	bellOut io.Writer
+	// initialized is false until the first successful (err == nil)
+	// refreshMsg has been processed. It gates all bell logic: without it,
+	// the very first refresh would look like a 0-to-N transition against
+	// the model's zero-valued starting state and ring for escalations or a
+	// pause that already existed before the TUI even started.
+	initialized bool
+	// lastMaxEscalationID / lastPaused are the bell-diffing baseline from
+	// the last successful refresh. Deliberately not derived from m.data,
+	// since the refreshMsg handler overwrites m.data unconditionally even
+	// on a failed refresh.
+	lastMaxEscalationID int64
+	lastPaused          bool
+	// pausePending is set synchronously the instant "p" is pressed (before
+	// the pause request is dispatched), and consumed by the next refreshMsg
+	// that observes the false-to-true Paused transition. Setting it
+	// synchronously — rather than waiting for the pause request's result —
+	// matters because Bubble Tea commands run concurrently: the periodic
+	// poll's refreshMsg can otherwise be processed before this instance's
+	// own actionResultMsg, making a self-caused pause look externally
+	// caused. Since Update processes messages one at a time in arrival
+	// order, a flag set during the "p" keypress's own Update call is
+	// already true for every message processed afterward, regardless of
+	// which goroutine's result lands first.
+	pausePending bool
 }
 
 // renderNow returns the clock the Agents tab renders Age against: the
@@ -220,6 +339,133 @@ func (m Model) visibleAgents() []domain.AgentTransition {
 		if m.matchesQuery(tabAgents, m.data.status.AgentName(a.AgentID),
 			agentLocation(a, m.data.status), a.AgentID, a.AgentType, a.Status) {
 			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// taskRow is one flat row of the Tasks tab: a task-source group header, a
+// checklist item, a per-group error line, or an empty-list note. Flat rows
+// keep cursor/offset/search identical to the other list tabs.
+type taskRow struct {
+	text       string   // unstyled rendered content
+	fields     []string // searchable values (AR-013)
+	header     bool
+	errRow     bool
+	done       bool
+	inProgress bool   // raw mark "-": started but not finished
+	group      int    // index into m.data.tasks (== cfg.TaskSources index)
+	item       int    // 1-based checklist item number; 0 = not an item row
+	path       string // the group's checklist file
+	itemText   string // the item's raw (untruncated) text; "" for non-item rows
+}
+
+// taskMarkKey identifies a checklist item for multi-select. Keyed by group
+// (config entry) rather than path so duplicate-path sources mark
+// independently; actions dedupe by (path, item) before mutating the file.
+func taskMarkKey(group, item int) string { return fmt.Sprintf("%d#%d", group, item) }
+
+// taskRows lays out the aggregated Tasks tab: one header per configured task
+// source (annotated with the live agents it currently matches), followed by
+// its checklist items in file order — or a single error/empty note.
+func (m Model) taskRows() []taskRow {
+	// Invert agentTaskSourceMatches: live agent names per source index, so a
+	// header shows who the source currently feeds (same selector semantics as
+	// the agent detail's "Task source" field).
+	live := map[int][]string{}
+	for _, a := range m.data.status.MonitoredAgents {
+		name := m.data.status.AgentName(a.AgentID)
+		if name == "" {
+			name = a.AgentID
+		}
+		for _, idx := range m.agentTaskSourceMatches(a) {
+			live[idx] = append(live[idx], name)
+		}
+	}
+	var rows []taskRow
+	for _, g := range m.data.tasks {
+		sel, ws := g.Source.Agent, g.Source.Workspace
+		if sel == "" {
+			sel = "*"
+		}
+		if ws == "" {
+			ws = "*"
+		}
+		hdr := fmt.Sprintf("#%d agent=%s ws=%s  %s", g.Index, sel, ws,
+			truncatePathKeepBase(g.Source.Path, taskPathDisplayWidth))
+		if names := live[g.Index]; len(names) > 0 {
+			hdr += "  → " + strings.Join(names, ", ")
+		}
+		pending := 0
+		for _, it := range g.Items {
+			if !it.Done {
+				pending++
+			}
+		}
+		if g.Err == "" {
+			hdr += fmt.Sprintf("  (%d pending / %d)", pending, len(g.Items))
+		}
+		// Fields include the rendered #N tokens so users can filter by what
+		// they see, matching filterAudit. Every row is width-bounded: a wrapped
+		// line would break the one-row-one-line accounting window/listPageSize
+		// depend on.
+		hfields := []string{fmt.Sprintf("#%d", g.Index), sel, ws, g.Source.Path,
+			strings.Join(live[g.Index], " ")}
+		rows = append(rows, taskRow{text: oneLine(hdr, max(20, m.contentWidth())),
+			fields: hfields, header: true, group: g.Index, path: g.Source.Path})
+		switch {
+		case g.Err != "":
+			rows = append(rows, taskRow{text: oneLine("  ✗ "+g.Err, max(20, m.contentWidth())),
+				fields: append([]string{g.Err}, hfields...), errRow: true,
+				group: g.Index, path: g.Source.Path})
+		case len(g.Items) == 0:
+			rows = append(rows, taskRow{text: "  (no tasks in this list)", fields: hfields,
+				group: g.Index, path: g.Source.Path})
+		default:
+			for _, it := range g.Items {
+				markCh := "  "
+				if m.taskMarks[taskMarkKey(g.Index, it.Index)] {
+					markCh = "✓ "
+				}
+				rows = append(rows, taskRow{
+					text:       fmt.Sprintf("%s#%d [%s] %s", markCh, it.Index, it.Mark, oneLine(it.Text, max(20, m.contentWidth()-12))),
+					fields:     append([]string{fmt.Sprintf("#%d", it.Index), it.Text, it.Mark}, hfields...),
+					done:       it.Done,
+					inProgress: it.Mark == domain.MarkInProgress,
+					group:      g.Index,
+					item:       it.Index,
+					path:       g.Source.Path,
+					itemText:   it.Text,
+				})
+			}
+		}
+	}
+	return rows
+}
+
+// visibleTaskRows applies the Tasks tab search filter. Item/error rows carry
+// their group's header fields, so filtering by agent/path keeps the whole
+// group; a header also stays when any of its children match, so a matched
+// item is never orphaned from its source context.
+func (m Model) visibleTaskRows() []taskRow {
+	rows := m.taskRows()
+	if m.query[tabTasks] == "" {
+		return rows
+	}
+	var out []taskRow
+	for i := 0; i < len(rows); i++ {
+		if !rows[i].header {
+			if m.matchesQuery(tabTasks, rows[i].fields...) {
+				out = append(out, rows[i])
+			}
+			continue
+		}
+		keep := m.matchesQuery(tabTasks, rows[i].fields...)
+		for j := i + 1; !keep && j < len(rows) && !rows[j].header; j++ {
+			keep = m.matchesQuery(tabTasks, rows[j].fields...)
+		}
+		if keep {
+			out = append(out, rows[i])
 		}
 	}
 	return out
@@ -336,6 +582,10 @@ func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 		return msg
 	}
 	msg.cfg, msg.err = app.Config()
+	if msg.err != nil {
+		return msg
+	}
+	msg.tasks = frontend.TaskGroups(msg.cfg)
 	return msg
 }
 
@@ -414,6 +664,15 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 
 // Update handles events.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// shift+enter reaches bubbletea v1 as an unrecognized CSI message, not a
+	// KeyMsg — catch it here. It only ever means "insert a newline" in a
+	// multiline prompt; everywhere else it is ignored like any unknown key.
+	if isShiftEnter(msg) {
+		if m.prompt != nil && m.prompt.multiline {
+			m.prompt.input += "\n"
+		}
+		return m, nil
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -425,6 +684,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clampListViewport()
 		return m, nil
 	case refreshMsg:
+		if msg.err == nil {
+			if m.initialized && msg.cfg.TUI.TerminalBell {
+				// Trigger 1: any escalation newer than the last successful
+				// poll. One bell per poll cycle even if several appeared at
+				// once — beeping N times for a burst is worse UX.
+				if maxEscalationID(msg.escalations) > m.lastMaxEscalationID {
+					m.ringBell()
+				}
+				// Trigger 2: pause just became active, and NOT because this
+				// instance's own "p" press caused it (pausePending, set
+				// synchronously at keypress time — see its doc comment).
+				if !m.lastPaused && msg.status.Paused {
+					if m.pausePending {
+						m.pausePending = false
+					} else {
+						m.ringBell()
+					}
+				}
+			}
+			m.lastMaxEscalationID = maxEscalationID(msg.escalations)
+			m.lastPaused = msg.status.Paused
+			m.initialized = true
+		}
 		m.data = msg
 		m.items = buildRuleItems(msg.cfg)
 		// A failed refresh carries a zero config; keep the current palette
@@ -447,8 +729,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		// Same for task marks: an item deleted (or renumbered away by an
+		// external edit) must not leave a mark pointing at nothing.
+		if len(m.taskMarks) > 0 {
+			valid := map[string]bool{}
+			for _, g := range msg.tasks {
+				for _, it := range g.Items {
+					valid[taskMarkKey(g.Index, it.Index)] = true
+				}
+			}
+			for k := range m.taskMarks {
+				if !valid[k] {
+					delete(m.taskMarks, k)
+				}
+			}
+		}
 		return m, nil
 	case actionResultMsg:
+		if msg.pauseAction && msg.err != nil {
+			// The pause request itself failed, so Paused never transitions
+			// and the refreshMsg diff above will never consume the flag —
+			// clear it here so it doesn't wrongly suppress some later,
+			// unrelated external pause.
+			m.pausePending = false
+		}
 		if msg.err != nil {
 			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
 		} else if msg.message != "" {
@@ -515,18 +819,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// move on, no extra esc needed. (On an escalation detail, `l` is
 			// "retry LLM" instead — vim-right still switches via "right".)
 			m.detail = nil
-			m.tab = (m.tab + 1) % tabCount
-			m.cursor = 0
-			m.offsets[m.tab] = 0
 			m.searching = false
 			m.message = ""
+			m.arriveAtTab((m.tab + 1) % tabCount)
 		case "shift+tab", "left", "h":
 			m.detail = nil
-			m.tab = (m.tab + tabCount - 1) % tabCount
-			m.cursor = 0
-			m.offsets[m.tab] = 0
 			m.searching = false
 			m.message = ""
+			m.arriveAtTab((m.tab + tabCount - 1) % tabCount)
 		case "enter":
 			// On an escalation's detail view, Enter confirms+sends the
 			// record shown (by its snapshotted id, not the live cursor) and
@@ -535,7 +835,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.detail = nil
 				return m.confirmAuditID(id)
 			}
+			// On a task detail, Enter sends the snapshotted pending task to
+			// its agent (the guards in sendTaskRow refuse non-pending items).
+			if r := m.detail.task; r != nil {
+				m.detail = nil
+				return m.sendTaskRow(*r)
+			}
 			m.detail = nil
+		case "y":
+			if r := m.detail.task; r != nil {
+				m.detail = nil
+				return m.sendTaskRow(*r)
+			}
 		case "c":
 			// Per-entry actions mirror the list, acting on the snapshotted
 			// escalation id (confirmID), never the live cursor. A non-zero
@@ -545,10 +856,27 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.detail = nil
 				return m.correctByID(id, true)
 			}
+		case "e":
+			// On a task detail, e edits the snapshotted item (the prompt
+			// replaces the overlay; the expected-text guard still protects
+			// against the file changing since the snapshot).
+			if r := m.detail.task; r != nil {
+				m.detail = nil
+				return m.editTaskRowPrompt(*r)
+			}
 		case "x", "delete":
 			if id := m.detail.confirmID; id != 0 {
 				m.detail = nil
 				return m.dismissByID(id)
+			}
+			if r := m.detail.task; r != nil {
+				// clearsMarks=true even though the overlay ignores marks: the
+				// delete renumbers every later item, so surviving positional
+				// marks would silently retarget.
+				m.detail = nil
+				return m.confirmDeleteTaskTargets([]taskTarget{{
+					path: canonicalTaskPath(r.path), item: r.item, done: r.done, text: r.itemText,
+				}}, true)
 			}
 		case "l":
 			// On an escalation detail, `l` retries the LLM on the snapshotted
@@ -563,11 +891,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.retryByID(id)
 			}
 			m.detail = nil
-			m.tab = (m.tab + 1) % tabCount
-			m.cursor = 0
-			m.offsets[m.tab] = 0
 			m.searching = false
 			m.message = ""
+			m.arriveAtTab((m.tab + 1) % tabCount)
 		case "v":
 			if m.detail.hasExpandablePreview && m.detail.build != nil {
 				m.detail.previewExpanded = !m.detail.previewExpanded
@@ -583,6 +909,20 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.detail.focusAgentID != "" {
 				return m.focusAgentByID(m.detail.focusAgentID)
 			}
+			if r := m.detail.task; r != nil {
+				return m.focusTaskGroupAgent(r.group)
+			}
+		case "t":
+			if m.detail.agent != nil {
+				return m.showAgentTasks(*m.detail.agent)
+			}
+			// Gated on the marker, not on a non-empty signature: a record with
+			// no signature must report why (as the list does), while `t` on a
+			// signature/stderr overlay — which also leave `agent` nil — does
+			// nothing.
+			if m.detail.ruleDetail {
+				return m.showRuleFor(m.detail.ruleSignature)
+			}
 		case "esc", "q":
 			m.detail = nil
 		}
@@ -596,6 +936,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter", "y", "Y":
 			confirm := m.confirm
 			m.confirm = nil
+			// A refresh can land between the question and the answer, so the
+			// answer is only as good as the state it is re-checked against.
+			if confirm.revalidate != nil {
+				if reason, ok := confirm.revalidate(m); !ok {
+					m.message = reason
+					return m, nil
+				}
+			}
+			if confirm.clearsTaskMarks {
+				m.taskMarks = nil
+			}
 			m.beginAction()
 			return m, confirm.onConfirm()
 		case "esc", "n", "N":
@@ -610,14 +961,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC:
 			return m, tea.Quit
 		case tea.KeyEnter:
-			p := m.prompt
-			m.prompt = nil
-			input := strings.TrimSpace(p.input)
-			if input == "" {
-				m.message = "cancelled"
-				return m, nil
-			}
-			return m, p.onSubmit(input)
+			return m.submitPrompt()
 		case tea.KeyEsc:
 			m.prompt = nil
 			m.message = "cancelled"
@@ -629,6 +973,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case tea.KeySpace:
 			m.prompt.input += " "
+			return m, nil
+		case tea.KeyCtrlJ:
+			if m.prompt.multiline {
+				m.prompt.input += "\n"
+			}
 			return m, nil
 		case tea.KeyRunes:
 			// Only printable input; key names like "up"/"home" must not
@@ -672,24 +1021,20 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.String() == "l" && m.tab == tabEscalations {
 			return m.retrySelected()
 		}
-		m.tab = (m.tab + 1) % tabCount
-		m.cursor = 0
-		m.offsets[m.tab] = 0
 		m.message = ""
+		m.arriveAtTab((m.tab + 1) % tabCount)
 	case "shift+tab", "left", "h":
-		m.tab = (m.tab + tabCount - 1) % tabCount
-		m.cursor = 0
-		m.offsets[m.tab] = 0
 		m.message = ""
+		m.arriveAtTab((m.tab + tabCount - 1) % tabCount)
 	case "up", "k":
-		if m.cursor > 0 {
-			m.cursor--
+		if m.cursors[m.tab] > 0 {
+			m.cursors[m.tab]--
 		}
 		m.scrollCursorIntoView()
 		m.message = ""
 	case "down", "j":
-		if m.cursor < m.rowCount()-1 {
-			m.cursor++
+		if m.cursors[m.tab] < m.rowCount()-1 {
+			m.cursors[m.tab]++
 		}
 		m.scrollCursorIntoView()
 		m.message = ""
@@ -707,7 +1052,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "p":
 		m.beginAction()
-		return m, m.do("automation paused", func(ctx context.Context) error { return m.app.Pause(ctx) })
+		// Set synchronously (before the request is dispatched) — see
+		// Model.pausePending's doc comment for why this matters.
+		m.pausePending = true
+		return m, m.pauseCmd()
 	case "r":
 		m.beginAction()
 		return m, m.do("automation resumed", func(ctx context.Context) error { return m.app.Resume(ctx) })
@@ -727,6 +1075,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		switch m.tab {
+		case tabTasks:
+			return m.sendSelectedTask()
 		case tabEscalations:
 			return m.confirmSelected()
 		case tabSignatures:
@@ -735,12 +1085,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.activateSelectedConfig()
 		}
 	case "y":
-		if m.tab == tabEscalations {
+		switch m.tab {
+		case tabEscalations:
 			return m.confirmSelected()
+		case tabTasks:
+			return m.sendSelectedTask()
 		}
 	case "e":
-		if m.tab == tabConfig {
+		switch m.tab {
+		case tabConfig:
 			return m.editSelectedRule()
+		case tabTasks:
+			return m.editTaskPrompt()
+		}
+	case "d":
+		if m.tab == tabTasks {
+			return m.toggleTasksDone()
 		}
 	case "c":
 		if m.tab == tabEscalations || m.tab == tabAudit {
@@ -770,30 +1130,45 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			default:
 				m.sigMode = ""
 			}
-			m.cursor = 0
+			m.cursors[m.tab] = 0
 			m.offsets[tabSignatures] = 0
 			m.message = "filter: " + orDash(string(m.sigMode))
 		case tabAgents:
 			return m.focusSelected()
 		case tabEscalations:
 			return m.focusSelectedEscalation()
+		case tabTasks:
+			return m.focusSelectedTaskAgent()
 		}
 	case "a":
-		if m.tab == tabConfig {
+		switch m.tab {
+		case tabConfig:
 			return m.addPatternPrompt()
+		case tabTasks:
+			return m.addTaskPrompt()
 		}
 	case "t":
-		if m.tab == tabConfig {
+		switch m.tab {
+		case tabConfig:
 			return m.addTaskSourcePrompt()
+		case tabAgents:
+			return m.showSelectedAgentTasks()
+		case tabEscalations, tabAudit:
+			return m.showSelectedRule()
 		}
 	case " ":
-		if m.tab == tabEscalations {
+		switch m.tab {
+		case tabEscalations:
 			return m.toggleMarkSelected()
+		case tabTasks:
+			return m.toggleTaskMarkSelected()
 		}
 	case "x", "delete":
 		switch m.tab {
 		case tabEscalations:
 			return m.deleteEscalations()
+		case tabTasks:
+			return m.deleteTasksPrompt()
 		case tabSignatures:
 			return m.deleteSignaturePrompt()
 		case tabConfig:
@@ -837,6 +1212,53 @@ func (m Model) do(okMsg string, fn func(context.Context) error) tea.Cmd {
 	}
 }
 
+// maxEscalationID returns the highest AuditRecord.ID among rows (0 if
+// empty). audit_log ids are assigned by SQLite's autoincrement PK and never
+// reused, so any pending escalation with an id greater than a previously
+// observed max is unambiguously new.
+func maxEscalationID(rows []domain.AuditRecord) int64 {
+	var highest int64
+	for _, r := range rows {
+		if r.ID > highest {
+			highest = r.ID
+		}
+	}
+	return highest
+}
+
+// ringBell emits a single ASCII BEL (0x07). A nil bellOut (the default in
+// tests and unless Run() wires it) makes this a safe no-op.
+//
+// This writes directly to bellOut (os.Stdout in Run()) rather than through
+// Bubble Tea's own output helpers: tea.Println/tea.Printf are silently
+// dropped whenever the alt screen is active (see bubbletea's
+// standardRenderer's printLineMessage handling) — verified against the
+// vendored source — and this TUI always runs with tea.WithAltScreen(), so
+// those helpers would make the whole feature a no-op. The renderer's frame
+// flush writes to the same fd from its own goroutine, but a lone BEL is a
+// single byte — a single Write() of one byte cannot be torn by a
+// concurrent Write() of another buffer, so the worst case is a one-frame-
+// late beep, never output corruption.
+func (m Model) ringBell() {
+	if m.bellOut == nil {
+		return
+	}
+	_, _ = m.bellOut.Write([]byte{0x07})
+}
+
+// pauseCmd activates the pause/kill switch, tagging its result as
+// pauseAction so Update can clear Model.pausePending if the request itself
+// failed — the generic do() helper has no channel for that extra signal.
+func (m Model) pauseCmd() tea.Cmd {
+	app, ctx := m.app, m.ctx
+	return func() tea.Msg {
+		if err := app.Pause(ctx); err != nil {
+			return actionResultMsg{err: err, pauseAction: true}
+		}
+		return actionResultMsg{message: "automation paused", pauseAction: true}
+	}
+}
+
 // rowCountFor counts tab t's currently visible rows: search-filter-aware
 // for the four list tabs (CR-008); Config and Pause/Kill keep their raw
 // counts so their navigation is untouched (AR-032).
@@ -844,6 +1266,8 @@ func (m Model) rowCountFor(t tab) int {
 	switch t {
 	case tabAgents:
 		return len(m.visibleAgents())
+	case tabTasks:
+		return len(m.visibleTaskRows())
 	case tabEscalations:
 		return len(m.visibleEscalations())
 	case tabAudit:
@@ -863,12 +1287,12 @@ func (m Model) rowCount() int { return m.rowCountFor(m.tab) }
 func (m Model) selectedAudit() *domain.AuditRecord {
 	switch m.tab {
 	case tabEscalations:
-		if esc := m.visibleEscalations(); m.cursor < len(esc) {
-			return &esc[m.cursor]
+		if esc := m.visibleEscalations(); m.cursors[m.tab] < len(esc) {
+			return &esc[m.cursors[m.tab]]
 		}
 	case tabAudit:
-		if rows := m.visibleAudit(); m.cursor < len(rows) {
-			return &rows[m.cursor]
+		if rows := m.visibleAudit(); m.cursors[m.tab] < len(rows) {
+			return &rows[m.cursors[m.tab]]
 		}
 	}
 	return nil
@@ -1018,8 +1442,8 @@ func (m Model) toggleMarkSelected() (tea.Model, tea.Cmd) {
 	} else {
 		m.message = fmt.Sprintf("%d marked — x deletes them", len(m.marked))
 	}
-	if m.cursor < m.rowCount()-1 {
-		m.cursor++
+	if m.cursors[m.tab] < m.rowCount()-1 {
+		m.cursors[m.tab]++
 	}
 	// The advance can walk the cursor past the window's bottom edge (and
 	// the mark message shrinks the page): keep the cursor row visible
@@ -1125,14 +1549,541 @@ func (m Model) pruneEscalationsPrompt() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// --- Tasks tab CRUD (mirrors `hap task` add/edit/done/undone/delete) ---
+
+// selectedTaskRow returns the Tasks row under the cursor (header, item, or
+// error/note row), nil when the tab is empty or the cursor is out of range.
+func (m Model) selectedTaskRow() *taskRow {
+	rows := m.visibleTaskRows()
+	if m.cursors[m.tab] >= len(rows) {
+		return nil
+	}
+	return &rows[m.cursors[m.tab]]
+}
+
+// taskTarget is one concrete checklist item an action applies to, captured at
+// keypress time so an async command never re-resolves against a moved cursor
+// or a refreshed snapshot. text is passed to the App mutation as its
+// expected-text guard: task numbers are positional, so if the file changes
+// while a prompt/confirm is open the mutation aborts instead of silently
+// hitting a renumbered line.
+type taskTarget struct {
+	path string
+	item int
+	done bool
+	text string
+}
+
+// truncatePathKeepBase shortens a long path for one-line display, always
+// preserving the final path element: "…/<tail>" keeps as many trailing
+// directories as fit within limit display cells. The full path stays in the
+// row's search fields and the detail view.
+func truncatePathKeepBase(p string, limit int) string {
+	if runewidth.StringWidth(p) <= limit {
+		return p
+	}
+	base := filepath.Base(p)
+	out := "…/" + base
+	dirs := strings.Split(strings.Trim(strings.TrimSuffix(p, base), "/"), "/")
+	for i := len(dirs) - 1; i >= 0; i-- {
+		cand := "…/" + strings.Join(dirs[i:], "/") + "/" + base
+		if runewidth.StringWidth(cand) > limit {
+			break
+		}
+		out = cand
+	}
+	// A basename longer than the limit still gets bounded (tail-truncated).
+	return oneLine(out, limit)
+}
+
+// taskPathDisplayWidth is the header/prompt budget for a task source path —
+// wide enough to keep distinguishing directories, short enough that the
+// pending count and live-agent names survive on ordinary pane widths.
+const taskPathDisplayWidth = 44
+
+// canonicalTaskPath normalizes a source path for identity comparisons (the
+// duplicate dedupe and the per-file delete ordering): absolute + symlinks
+// resolved, best-effort. Two config spellings of one file (relative vs
+// absolute, /var vs /private/var) must not slip past the dedupe and mutate
+// the same line twice.
+func canonicalTaskPath(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+	return p
+}
+
+// markedTaskTargets returns the marked items (in list order) or, with no
+// marks, the item under the cursor. Duplicate-path sources can mark the same
+// physical item twice; targets dedupe by canonical (path, item) so a bulk
+// action never mutates one file line twice.
+func (m Model) markedTaskTargets() []taskTarget {
+	var targets []taskTarget
+	seen := map[string]bool{}
+	for _, g := range m.data.tasks {
+		for _, it := range g.Items {
+			if !m.taskMarks[taskMarkKey(g.Index, it.Index)] {
+				continue
+			}
+			p := canonicalTaskPath(g.Source.Path)
+			key := p + "\x00" + strconv.Itoa(it.Index)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			targets = append(targets, taskTarget{path: p, item: it.Index, done: it.Done, text: it.Text})
+		}
+	}
+	if len(targets) == 0 {
+		if r := m.selectedTaskRow(); r != nil && r.item > 0 {
+			targets = append(targets, taskTarget{
+				path: canonicalTaskPath(r.path), item: r.item, done: r.done, text: r.itemText})
+		}
+	}
+	return targets
+}
+
+// describeTasks names the action targets compactly: "task #3" or
+// "3 tasks (#1 #2 #5)", eliding a long list.
+func describeTasks(targets []taskTarget) string {
+	if len(targets) == 1 {
+		return fmt.Sprintf("task #%d", targets[0].item)
+	}
+	var parts []string
+	for i, tg := range targets {
+		if i == 6 {
+			parts = append(parts, "…")
+			break
+		}
+		parts = append(parts, fmt.Sprintf("#%d", tg.item))
+	}
+	return fmt.Sprintf("%d tasks (%s)", len(targets), strings.Join(parts, " "))
+}
+
+// toggleTaskMarkSelected flips the multi-select mark on the checklist item
+// under the cursor and advances, so repeated space marks a run of rows.
+func (m Model) toggleTaskMarkSelected() (tea.Model, tea.Cmd) {
+	r := m.selectedTaskRow()
+	if r == nil || r.item == 0 {
+		m.message = "space marks checklist items — move the cursor onto a task"
+		return m, nil
+	}
+	if m.taskMarks == nil {
+		m.taskMarks = map[string]bool{}
+	}
+	key := taskMarkKey(r.group, r.item)
+	if m.taskMarks[key] {
+		delete(m.taskMarks, key)
+	} else {
+		m.taskMarks[key] = true
+	}
+	if len(m.taskMarks) == 0 {
+		m.message = "no marks — d/x act on the row under the cursor"
+	} else {
+		m.message = fmt.Sprintf("%d marked — d toggles done, x deletes", len(m.taskMarks))
+	}
+	if m.cursors[m.tab] < m.rowCount()-1 {
+		m.cursors[m.tab]++
+	}
+	m.scrollCursorIntoView()
+	return m, nil
+}
+
+// toggleTasksDone flips done/pending on the marked items (or the cursor row),
+// each item individually — mirroring `hap task done`/`undone`. Toggling never
+// renumbers, so per-item failures skip and continue safely.
+func (m Model) toggleTasksDone() (tea.Model, tea.Cmd) {
+	targets := m.markedTaskTargets()
+	if len(targets) == 0 {
+		m.message = "d toggles done — move the cursor onto a task or mark with space"
+		return m, nil
+	}
+	app, desc := m.app, describeTasks(targets)
+	m.taskMarks = nil // the action consumes the selection
+	m.beginAction()
+	return m, func() tea.Msg {
+		toggled := 0
+		var skipped []string
+		var firstErr error
+		for _, tg := range targets {
+			if _, err := app.SetTaskDone("", tg.path, tg.item, !tg.done, tg.text); err != nil {
+				skipped = append(skipped, fmt.Sprintf("#%d", tg.item))
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			toggled++
+		}
+		if firstErr != nil {
+			return actionResultMsg{err: fmt.Errorf("toggled %d, skipped %s: %w",
+				toggled, strings.Join(skipped, " "), firstErr)}
+		}
+		return actionResultMsg{message: fmt.Sprintf("toggled %s", desc)}
+	}
+}
+
+// deleteTasksPrompt confirms then deletes the marked items (or the cursor
+// row). Unlike dismissing an escalation, this destroys checklist lines the
+// operator wrote, so it gets the y/n guard.
+func (m Model) deleteTasksPrompt() (tea.Model, tea.Cmd) {
+	targets := m.markedTaskTargets()
+	if len(targets) == 0 {
+		// Nothing marked and the cursor is on a source header: x retires the
+		// whole source instead. Marks keep winning (markedTaskTargets is
+		// consulted first), so this never shadows a bulk item delete.
+		if r := m.selectedTaskRow(); r != nil && r.header {
+			return m.removeTaskSourcePrompt(r.group)
+		}
+		m.message = "x deletes a task — move the cursor onto one or mark with space"
+		return m, nil
+	}
+	return m.confirmDeleteTaskTargets(targets, true)
+}
+
+// taskSourceRemovable reports whether a task source may be retired from the
+// Tasks tab, and if not, why. A source is removable only once it cannot be
+// serving anyone: no live agent matches its selectors, or every task in it is
+// genuinely finished.
+//
+// Both "unknown" inputs fail closed, because neither is evidence of safety:
+// an agent list herdr would not answer is not an empty herd, and a checklist
+// that would not read is not an empty checklist. Either can still hide live
+// work. The unguarded Config-tab `x` and `hap task-source remove` remain the
+// force path for an entry this refuses.
+func (m Model) taskSourceRemovable(g frontend.TaskGroup) (string, bool) {
+	// UnfinishedTasks, not PendingTasks: an agent mid-task has "[-]" items,
+	// which read as Done and would make a live source look finished. A
+	// finished list is removable whoever it feeds, so this needs no agent.
+	if g.Err == "" && frontend.UnfinishedTasks([]frontend.TaskGroup{g}) == 0 {
+		return "", true
+	}
+	if !m.data.status.AgentsKnown {
+		return fmt.Sprintf("task source #%d: herdr can't say which agent it feeds — "+
+			"retry, or remove the entry on the Config tab (x)", g.Index), false
+	}
+	// Nothing matches the selectors, so the source feeds nobody — retirable
+	// whatever its file does or doesn't say. This is the case that keeps a
+	// broken entry (unreadable path, dead agent) cleanable from this tab.
+	agent := m.taskGroupAgent(g.Index)
+	if agent == nil {
+		return "", true
+	}
+	name := m.data.status.AgentName(agent.AgentID)
+	if name == "" {
+		name = agent.AgentID
+	}
+	if g.Err != "" {
+		return fmt.Sprintf("task source #%d feeds %s but its checklist can't be read, so its "+
+			"remaining work is unknown — fix the path, or remove the entry on the Config tab (x)",
+			g.Index, name), false
+	}
+	return fmt.Sprintf("task source #%d still feeds %s and has %d unfinished task(s) — "+
+		"finish them, or remove the entry on the Config tab (x)", g.Index, name,
+		frontend.UnfinishedTasks([]frontend.TaskGroup{g})), false
+}
+
+// removeTaskSourcePrompt confirms, then removes the task source's config
+// entry. The checklist file itself is deliberately left on disk: sources are
+// often hand-written docs hap did not create and could not restore, and
+// re-adding the source brings the list back untouched.
+func (m Model) removeTaskSourcePrompt(group int) (tea.Model, tea.Cmd) {
+	if group < 0 || group >= len(m.data.tasks) {
+		return m, nil
+	}
+	g, app := m.data.tasks[group], m.app
+	if reason, ok := m.taskSourceRemovable(g); !ok {
+		m.message = reason
+		return m, nil
+	}
+	// g.Index is the config index and g.Source.Path the raw (untruncated)
+	// path the header only displays abbreviated — RemoveTaskSource re-checks
+	// both, so a config that shifted underneath aborts instead of removing a
+	// neighbour.
+	remove := m.do(fmt.Sprintf("task source #%d removed (checklist file kept)", g.Index),
+		func(c context.Context) error {
+			return app.RemoveTaskSource(c, g.Index, g.Source.Path)
+		})
+	// A source with no path configured has no file name to name it by.
+	name := filepath.Base(g.Source.Path)
+	if g.Source.Path == "" {
+		name = "no path configured"
+	}
+	m.confirm = &confirmation{
+		label: fmt.Sprintf("remove task source #%d (%s)? its checklist file is kept",
+			g.Index, name),
+		// Removing an entry shifts every later config index down one, so a
+		// positional group#item mark would silently retarget a different
+		// source. Unreachable while this path requires an empty mark set, but
+		// wrong to leave true by accident.
+		clearsTaskMarks: true,
+		// Removability was true when the question was asked; the 2s poll can
+		// land before the answer. A finished list is exactly the state that
+		// makes a source removable AND triggers the daemon to regenerate
+		// tasks into it, so re-check rather than retire a source that just
+		// picked up work (or an agent).
+		revalidate: func(cur Model) (string, bool) {
+			for _, now := range cur.data.tasks {
+				if now.Index == g.Index && now.Source.Path == g.Source.Path {
+					return cur.taskSourceRemovable(now)
+				}
+			}
+			return fmt.Sprintf("task source #%d changed since it was listed — re-check and retry",
+				g.Index), false
+		},
+		onConfirm: func() tea.Cmd { return remove },
+	}
+	return m, nil
+}
+
+// confirmDeleteTaskTargets is the shared delete flow behind the list `x`
+// (marked/cursor targets) and the detail overlay `x` (the single snapshotted
+// item). Every delete renumbers, so both paths consume the positional marks
+// on accept; clearsMarks stays a parameter only for a future non-renumbering
+// caller.
+func (m Model) confirmDeleteTaskTargets(targets []taskTarget, clearsMarks bool) (tea.Model, tea.Cmd) {
+	app, desc := m.app, describeTasks(targets) // name them in list order
+	// Delete bottom-up per file: removing a line renumbers everything after
+	// it, so descending item order keeps the remaining targets valid.
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].path != targets[j].path {
+			return targets[i].path < targets[j].path
+		}
+		return targets[i].item > targets[j].item
+	})
+	m.confirm = &confirmation{
+		label:           fmt.Sprintf("delete %s?", desc),
+		clearsTaskMarks: clearsMarks, // accept consumes the selection; cancel keeps it
+		onConfirm: func() tea.Cmd {
+			return func() tea.Msg {
+				deleted := 0
+				for _, tg := range targets {
+					if _, err := app.DeleteTask("", tg.path, tg.item, tg.text); err != nil {
+						// Stop, don't skip: a failure here usually means the
+						// file changed under us, and later (lower) indices
+						// may already point at different lines.
+						return actionResultMsg{err: fmt.Errorf("deleted %d of %d: %w",
+							deleted, len(targets), err)}
+					}
+					deleted++
+				}
+				return actionResultMsg{message: fmt.Sprintf("deleted %s", desc)}
+			}
+		},
+	}
+	return m, nil
+}
+
+// addTaskPrompt appends a task to the checklist of the source under the
+// cursor (any of its rows — header included — names the target file).
+func (m Model) addTaskPrompt() (tea.Model, tea.Cmd) {
+	r := m.selectedTaskRow()
+	if r == nil {
+		m.message = "no task source — add one on the Config tab first (t)"
+		return m, nil
+	}
+	if r.path == "" {
+		m.message = "this source has no path configured — edit config.toml"
+		return m, nil
+	}
+	app, path := m.app, r.path
+	m.beginAction()
+	m.prompt = &prompt{
+		label: fmt.Sprintf("new task(s) for %s — enter: add, shift+enter: new line, esc: cancel",
+			truncatePathKeepBase(path, taskPathDisplayWidth)),
+		multiline: true,
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				_, n, err := app.AddTask("", path, input)
+				if err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: fmt.Sprintf("added task #%d", n)}
+			}
+		},
+	}
+	return m, nil
+}
+
+// editTaskPrompt rewrites the text of the single item under the cursor,
+// pre-filled with the current text. Deliberately not a bulk action — the
+// same replacement text on many items is never what the operator wants.
+func (m Model) editTaskPrompt() (tea.Model, tea.Cmd) {
+	r := m.selectedTaskRow()
+	if r == nil || r.item == 0 {
+		m.message = "e edits a task — move the cursor onto one"
+		return m, nil
+	}
+	return m.editTaskRowPrompt(*r)
+}
+
+// editTaskRowPrompt opens the edit prompt for a snapshotted item row — the
+// shared core behind the list `e` and the detail overlay `e`. Stored literal
+// `\n` sequences pre-fill as real line breaks (the box expands) and are
+// re-encoded on save, so the item stays one physical checklist line.
+func (m Model) editTaskRowPrompt(r taskRow) (tea.Model, tea.Cmd) {
+	app, path, idx, stored := m.app, r.path, r.item, r.itemText
+	m.beginAction()
+	m.prompt = &prompt{
+		label:     fmt.Sprintf("edit task #%d — enter: save, shift+enter: new line, esc: cancel", idx),
+		input:     domain.DecodeTaskNewlines(stored),
+		multiline: true,
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				if _, err := app.EditTask("", path, idx, input, stored); err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: fmt.Sprintf("task #%d updated", idx)}
+			}
+		},
+	}
+	return m, nil
+}
+
+// focusSelectedTaskAgent jumps to the live agent this task source currently
+// feeds (the header's "→ name" annotation), reusing the selector match.
+func (m Model) focusSelectedTaskAgent() (tea.Model, tea.Cmd) {
+	r := m.selectedTaskRow()
+	if r == nil {
+		return m, nil
+	}
+	return m.focusTaskGroupAgent(r.group)
+}
+
+// focusTaskGroupAgent focuses the first live agent whose selectors match the
+// given task source (config index) — shared by the list and detail `f`.
+func (m Model) focusTaskGroupAgent(group int) (tea.Model, tea.Cmd) {
+	for _, a := range m.data.status.MonitoredAgents {
+		for _, idx := range m.agentTaskSourceMatches(a) {
+			if idx == group {
+				return m.focusAgent(a)
+			}
+		}
+	}
+	m.message = "no live agent matches this task source"
+	return m, nil
+}
+
+// taskGroupAgent resolves the first live agent whose selectors match the
+// given task source, mirroring the header's "→ name" annotation.
+func (m Model) taskGroupAgent(group int) *domain.AgentTransition {
+	for _, a := range m.data.status.MonitoredAgents {
+		for _, idx := range m.agentTaskSourceMatches(a) {
+			if idx == group {
+				return &a
+			}
+		}
+	}
+	return nil
+}
+
+// sendSelectedTask delivers the pending task under the cursor to the live
+// agent its source feeds (enter/y on the Tasks tab).
+func (m Model) sendSelectedTask() (tea.Model, tea.Cmd) {
+	r := m.selectedTaskRow()
+	if r == nil || r.item == 0 {
+		return m, nil
+	}
+	return m.sendTaskRow(*r)
+}
+
+// sendTaskRow is the shared enter/y send behind the list and the detail
+// overlay: it renders the snapshotted item through the source's next-task
+// template and delivers it to the matched live agent's pane. Only a truly
+// pending "[ ]" item qualifies — done and in-progress items are refused, as
+// is an agent that is not cleanly idle (sending into a working or blocked
+// agent would splice into its stream mid-flight; the daemon's declared-task
+// flow has the same idle-only rule).
+func (m Model) sendTaskRow(r taskRow) (tea.Model, tea.Cmd) {
+	if r.done || r.inProgress {
+		m.message = "only a pending [ ] task can be sent — this one is done or in progress"
+		return m, nil
+	}
+	agent := m.taskGroupAgent(r.group)
+	if agent == nil {
+		m.message = "no live agent matches this task source"
+		return m, nil
+	}
+	if domain.AgentBusy(agent.Status) {
+		m.message = fmt.Sprintf("agent %s is %s — a task can only be sent to a cleanly idle agent",
+			m.data.status.AgentName(agent.AgentID), agent.Status)
+		return m, nil
+	}
+	name := m.data.status.AgentName(agent.AgentID)
+	if name == "" {
+		name = agent.AgentID
+	}
+	// The template comes from the live config, so make sure it still belongs
+	// to the snapshotted file: a task-source change while a detail overlay
+	// was open must not pair one source's text with another's template.
+	if r.group >= len(m.data.tasks) || m.data.tasks[r.group].Source.Path != r.path {
+		m.message = "task sources changed — refresh and retry"
+		return m, nil
+	}
+	template := m.data.tasks[r.group].Source.NextTaskTemplate
+	app := m.app
+	paneID, agentType, path, text, item := agent.PaneID, agent.AgentType, canonicalTaskPath(r.path), r.itemText, r.item
+	send := m.do(fmt.Sprintf("task #%d sent to %s and marked [-] in progress", item, name),
+		func(c context.Context) error {
+			return app.SendTaskToAgent(c, paneID, agentType, name, path, template, item, text)
+		})
+	m.confirm = &confirmation{
+		label:     fmt.Sprintf("send task #%d to %s?", item, name),
+		onConfirm: func() tea.Cmd { return send },
+	}
+	return m, nil
+}
+
+// taskDetailLines renders the full, untruncated record of one checklist item
+// for the detail overlay: status, complete text, and its source's identity.
+func (m Model) taskDetailLines(r taskRow, width int) []string {
+	w := max(20, width)
+	status := "pending"
+	switch {
+	case r.inProgress:
+		status = "in progress [-]"
+	case r.done:
+		status = "done [x]"
+	}
+	var lines []string
+	lines = m.detailField(lines, w, "Task", fmt.Sprintf("#%d", r.item))
+	lines = m.detailField(lines, w, "Status", status)
+	// Stored literal `\n` sequences render as real line breaks here — the
+	// detail shows the task as the agent will receive it.
+	lines = m.detailField(lines, w, "Text", domain.DecodeTaskNewlines(r.itemText))
+	lines = m.detailField(lines, w, "Source file", r.path)
+	if r.group < len(m.data.tasks) {
+		src := m.data.tasks[r.group].Source
+		lines = m.detailField(lines, w, "Agent selector", orDash(src.Agent))
+		lines = m.detailField(lines, w, "Workspace", orDash(src.Workspace))
+	}
+	var live []string
+	for _, a := range m.data.status.MonitoredAgents {
+		for _, idx := range m.agentTaskSourceMatches(a) {
+			if idx == r.group {
+				name := m.data.status.AgentName(a.AgentID)
+				if name == "" {
+					name = a.AgentID
+				}
+				live = append(live, name)
+			}
+		}
+	}
+	lines = m.detailField(lines, w, "Live agents", orDash(strings.Join(live, ", ")))
+	return lines
+}
+
 // --- Agent rename ---
 
 func (m Model) renameSelected() (tea.Model, tea.Cmd) {
 	agents := m.visibleAgents()
-	if m.cursor >= len(agents) {
+	if m.cursors[m.tab] >= len(agents) {
 		return m, nil
 	}
-	agent := agents[m.cursor]
+	agent := agents[m.cursors[m.tab]]
 	current := m.data.status.AgentName(agent.AgentID)
 	target := agent.AgentID
 	app, ctx := m.app, m.ctx
@@ -1166,10 +2117,10 @@ func (m Model) focusAgent(a domain.AgentTransition) (tea.Model, tea.Cmd) {
 
 func (m Model) focusSelected() (tea.Model, tea.Cmd) {
 	agents := m.visibleAgents()
-	if m.cursor >= len(agents) {
+	if m.cursors[m.tab] >= len(agents) {
 		return m, nil
 	}
-	return m.focusAgent(agents[m.cursor])
+	return m.focusAgent(agents[m.cursors[m.tab]])
 }
 
 // focusAgentByID resolves an audit record's stable agent id to its current
@@ -1223,7 +2174,10 @@ func (m Model) viewDaemonStderr() (tea.Model, tea.Cmd) {
 		}
 		return lines
 	}
-	m.message = ""
+	// Clear the durable action banner too: renderDetail surfaces it inside the
+	// overlay (for in-overlay actions like "t: see tasks" refusing), so a stale
+	// list-view outcome must not leak into a freshly opened, unrelated detail.
+	m.message, m.status = "", nil
 	m.detail = &detailView{
 		title: "Daemon captured output (last crash)",
 		lines: build(m.wrapWidth(), false),
@@ -1235,15 +2189,27 @@ func (m Model) viewDaemonStderr() (tea.Model, tea.Cmd) {
 func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 	switch m.tab {
 	case tabAgents:
-		if agents := m.visibleAgents(); m.cursor < len(agents) {
-			a := agents[m.cursor]
+		if agents := m.visibleAgents(); m.cursors[m.tab] < len(agents) {
+			a := agents[m.cursors[m.tab]]
 			build := func(width int, _ bool) []string { return m.agentDetailLines(a, width) }
-			m.message = ""
+			m.message, m.status = "", nil
 			m.detail = &detailView{
 				title: fmt.Sprintf("Agent %s", a.AgentID),
 				lines: build(m.wrapWidth(), false),
 				build: build,
 				agent: &a,
+			}
+		}
+	case tabTasks:
+		if r := m.selectedTaskRow(); r != nil && r.item > 0 {
+			row := *r
+			build := func(width int, _ bool) []string { return m.taskDetailLines(row, width) }
+			m.message, m.status = "", nil
+			m.detail = &detailView{
+				title: fmt.Sprintf("Task #%d", row.item),
+				lines: build(m.wrapWidth(), false),
+				build: build,
+				task:  &row,
 			}
 		}
 	case tabEscalations, tabAudit:
@@ -1267,12 +2233,16 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 					currentSituationLines: currentPreviewLines,
 				})
 			}
-			m.message = ""
+			m.message, m.status = "", nil
 			d := &detailView{
 				title:                fmt.Sprintf("%s #%d", kind, r.ID),
 				lines:                build(m.wrapWidth(), false),
 				build:                build,
 				hasExpandablePreview: r.PaneExcerpt != "" || snapshot != "" || (isAudit && r.LLMOutput != ""),
+				// Both kinds carry a signature, so `t: see rule` works from an
+				// audit detail exactly as it does from an escalation's.
+				ruleDetail:    true,
+				ruleSignature: r.Signature,
 			}
 			// Only the Escalations detail is confirmable via enter and
 			// carries the per-entry actions (c/x/l), which act on this
@@ -1332,7 +2302,8 @@ func (m Model) listPageSize() int {
 		chrome++ // these list tabs render a column header row
 	}
 	if m.prompt != nil {
-		chrome += 2
+		// blank + label line + one line per line break in the expanded input.
+		chrome += 2 + strings.Count(promptNewlines.Replace(m.prompt.input), "\n")
 	}
 	if m.message != "" {
 		chrome += 2
@@ -1354,32 +2325,53 @@ func (m Model) window(n int) (start, end int) {
 	return start, end
 }
 
+// arriveAtTab switches to t, restoring the row and scroll position the
+// operator left it on (CR-038). Both are per-tab state that simply persists;
+// arriving is where they must be re-validated, because a background tab's rows
+// can be deleted or filtered away under its remembered cursor. Nothing reads an
+// inactive tab's cursor — every selected* helper and renderer works off m.tab —
+// so clamping on arrival is both sufficient and the only correct moment.
+//
+// Call this LAST at a switch site: clampListViewport sizes the page via
+// listPageSize, which reads m.message, m.status, m.searching, m.query[m.tab],
+// m.sigMode and m.prompt — so clamping before those settle computes the offset
+// against stale chrome.
+func (m *Model) arriveAtTab(t tab) {
+	m.tab = t
+	m.clampListViewport()
+}
+
 // scrollCursorIntoView moves the active list tab's offset so the shared
 // cursor stays visible (AR-003, AR-004).
 func (m *Model) scrollCursorIntoView() {
 	if !m.tab.isList() {
 		return
 	}
-	if m.cursor < m.offsets[m.tab] {
-		m.offsets[m.tab] = m.cursor
+	if m.cursors[m.tab] < m.offsets[m.tab] {
+		m.offsets[m.tab] = m.cursors[m.tab]
 	}
-	if page := m.listPageSize(); m.cursor >= m.offsets[m.tab]+page {
-		m.offsets[m.tab] = m.cursor - page + 1
+	if page := m.listPageSize(); m.cursors[m.tab] >= m.offsets[m.tab]+page {
+		m.offsets[m.tab] = m.cursors[m.tab] - page + 1
 	}
 }
 
 // clampListViewport keeps every list tab's offset within
-// [0, rowCount−pageSize] and the shared cursor within the active tab's
-// visible (filtered) rows (CR-007, CR-008, CR-016).
+// [0, rowCount−pageSize] and the active tab's cursor within its visible
+// (filtered) rows (CR-007, CR-008, CR-016). The cursor clamp stays OUTSIDE the
+// list-only loop on purpose: Config and Pause/Kill render unwindowed (no
+// offset) but still track a cursor, and rowCountFor covers them.
 func (m *Model) clampListViewport() {
 	page := m.listPageSize()
-	for _, t := range []tab{tabAgents, tabEscalations, tabAudit, tabSignatures} {
+	for t := tab(0); t < tabCount; t++ {
+		if !t.isList() {
+			continue
+		}
 		if maxOff := max(0, m.rowCountFor(t)-page); m.offsets[t] > maxOff {
 			m.offsets[t] = maxOff
 		}
 	}
-	if m.cursor >= m.rowCount() {
-		m.cursor = max(0, m.rowCount()-1)
+	if m.cursors[m.tab] >= m.rowCount() {
+		m.cursors[m.tab] = max(0, m.rowCount()-1)
 	}
 	m.scrollCursorIntoView()
 }
@@ -1515,19 +2507,21 @@ func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 	// and the live age since first seen. Rendered as strings so zero counts
 	// still show (detailField skips empty values).
 	s := m.data.status.StatsFor(a.AgentID)
-	lines = m.detailField(lines, w, "Auto-sends", strconv.Itoa(s.AutoSends))
 	lines = m.detailField(lines, w, "Escalations", strconv.Itoa(s.Escalations))
+	lines = m.detailField(lines, w, "Auto-sends", strconv.Itoa(s.AutoSends))
 	lines = m.detailField(lines, w, "Operator confirmed", strconv.Itoa(s.Confirmed))
 	lines = m.detailField(lines, w, "Operator corrected", strconv.Itoa(s.Corrections))
 	lines = m.detailField(lines, w, "Age", formatAge(s.FirstSeen, m.renderNow()))
 	return lines
 }
 
-// agentTaskSources returns the configured task-source paths whose agent and
+// agentTaskSourceMatches returns the cfg.TaskSources indices whose agent and
 // workspace selectors match a live agent. The selector rules mirror the
-// daemon's declaredTask resolver; multiple matching sources are shown because
-// the daemon may skip a completed/unreadable source in favor of another one.
-func (m Model) agentTaskSources(a domain.AgentTransition) string {
+// daemon's declaredTask resolver; multiple matches can come back because the
+// daemon may skip a completed/unreadable source in favor of another one — or
+// because a source's selectors are broad enough to also apply to other
+// agents (an empty/type-level Agent selector, or a wildcard Workspace).
+func (m Model) agentTaskSourceMatches(a domain.AgentTransition) []int {
 	agentName := m.data.status.AgentName(a.AgentID)
 	workspaceName := ""
 	if ws, ok := m.data.status.Workspaces[a.WorkspaceID]; ok {
@@ -1537,8 +2531,8 @@ func (m Model) agentTaskSources(a domain.AgentTransition) string {
 		workspaceName = a.WorkspaceID
 	}
 
-	var paths []string
-	for _, src := range m.data.cfg.TaskSources {
+	var indices []int
+	for i, src := range m.data.cfg.TaskSources {
 		if src.Agent != "" && src.Agent != a.AgentID && src.Agent != a.AgentType &&
 			(agentName == "" || src.Agent != agentName) {
 			continue
@@ -1546,12 +2540,61 @@ func (m Model) agentTaskSources(a domain.AgentTransition) string {
 		if !domain.MatchWorkspace(src.Workspace, workspaceName) || src.Path == "" {
 			continue
 		}
-		paths = append(paths, src.Path)
+		indices = append(indices, i)
 	}
-	if len(paths) == 0 {
+	return indices
+}
+
+// agentTaskSources returns the configured task-source paths matching a live
+// agent (see agentTaskSourceMatches), joined for display; "N/A" if none.
+func (m Model) agentTaskSources(a domain.AgentTransition) string {
+	indices := m.agentTaskSourceMatches(a)
+	if len(indices) == 0 {
 		return "N/A"
 	}
+	paths := make([]string, len(indices))
+	for i, idx := range indices {
+		paths[i] = m.data.cfg.TaskSources[idx].Path
+	}
 	return strings.Join(paths, ", ")
+}
+
+// agentTaskCount renders the Agents list TASK column: "<total> (<pending>)"
+// across every readable task source feeding the agent (an agent can match
+// more than one — see agentTaskSourceMatches). "-" means no source is
+// configured; "err" means every matching source failed to read, which would
+// otherwise render as a truthful-looking "0 (0)". A partial read (one source
+// readable, another broken) reports the plain count of what could be read,
+// mirroring frontend.PendingTasks. Pending is "not done", matching the Tasks
+// tab's own header — so an in-progress "[-]" item counts as neither.
+func (m Model) agentTaskCount(a domain.AgentTransition) string {
+	indices := m.agentTaskSourceMatches(a)
+	if len(indices) == 0 {
+		return "-"
+	}
+	total, pending, read := 0, 0, false
+	for _, idx := range indices {
+		// frontend.TaskGroups builds one group per cfg source, in order, so a
+		// cfg index addresses its group directly (as sendTaskRow does).
+		if idx >= len(m.data.tasks) {
+			continue
+		}
+		g := m.data.tasks[idx]
+		if g.Err != "" {
+			continue
+		}
+		read = true
+		total += len(g.Items)
+		for _, it := range g.Items {
+			if !it.Done {
+				pending++
+			}
+		}
+	}
+	if !read {
+		return "err"
+	}
+	return fmt.Sprintf("%d (%d)", total, pending)
 }
 
 // locationLabel renders `#<number> "<label>" (<id>)` for a workspace/tab,
@@ -1572,9 +2615,11 @@ func locationLabel(id string, lookup func() (label string, number int, ok bool))
 
 // agentLocation returns the compact "#<workspace>-<tab-name>" display string
 // for an agent, or "-" if workspace/tab metadata cannot be resolved. Herdr's
-// tab Number is its position in the global tab list, while Label is the name
-// shown to the operator (commonly "1", "2", "3", ...), so the label is the
-// useful locator here. Legacy/unnamed tabs fall back to Number.
+// tab Number is a per-workspace counter (it can collide across workspaces —
+// two different workspaces can each have a tab numbered 7), while Label is
+// the per-workspace position shown to the operator (commonly "1", "2", "3",
+// ...), so the label is the useful locator here. Legacy/unnamed tabs fall
+// back to Number.
 func agentLocation(a domain.AgentTransition, status frontend.Status) string {
 	if a.WorkspaceID == "" || a.TabID == "" {
 		return "-"
@@ -1719,8 +2764,8 @@ func wrapText(s string, width int) []string {
 
 func (m Model) selectedSignature() *frontend.SignatureRow {
 	sigs := m.visibleSignatures()
-	if m.tab == tabSignatures && m.cursor < len(sigs) {
-		return &sigs[m.cursor]
+	if m.tab == tabSignatures && m.cursors[m.tab] < len(sigs) {
+		return &sigs[m.cursors[m.tab]]
 	}
 	return nil
 }
@@ -1734,7 +2779,7 @@ func (m Model) viewSignatureDetail() (tea.Model, tea.Cmd) {
 	}
 	sig := row.Signature
 	app, ctx := m.app, m.ctx
-	m.message = ""
+	m.message, m.status = "", nil
 	return m, func() tea.Msg {
 		detail, history, err := app.SignatureDetail(ctx, sig)
 		return sigDetailMsg{row: detail, history: history, err: err}
@@ -1854,8 +2899,8 @@ func shortSig(sig string) string {
 // --- Config tab editing ---
 
 func (m Model) selectedRule() *ruleItem {
-	if m.tab == tabConfig && m.cursor < len(m.items) {
-		return &m.items[m.cursor]
+	if m.tab == tabConfig && m.cursors[m.tab] < len(m.items) {
+		return &m.items[m.cursors[m.tab]]
 	}
 	return nil
 }
@@ -1977,6 +3022,153 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// showSelectedAgentTasks jumps to the Tasks tab for the agent under the
+// cursor (t on the Agents list), mirroring focusSelected's "f".
+func (m Model) showSelectedAgentTasks() (tea.Model, tea.Cmd) {
+	agents := m.visibleAgents()
+	if m.cursors[m.tab] >= len(agents) {
+		return m, nil
+	}
+	return m.showAgentTasks(agents[m.cursors[m.tab]])
+}
+
+// showAgentTasks jumps to the Tasks tab with the given agent's task source
+// selected (its header row under the cursor), so the agent's checklist is one
+// keystroke away instead of a hunt through every configured source — shared by
+// the Agents list and detail "t". A source's Agent/Workspace selectors can be
+// broad enough to match several entries (see agentTaskSourceMatches); unlike a
+// destructive clear, selecting one is safe to guess, so the first match wins
+// and the banner names the rest. Removing a task source stays on the Config
+// tab ("x: remove").
+func (m Model) showAgentTasks(a domain.AgentTransition) (tea.Model, tea.Cmd) {
+	indices := m.agentTaskSourceMatches(a)
+	if len(indices) == 0 {
+		m.message = "no task source configured for this agent — add one on the Config tab (t)"
+		m.scrollCursorIntoView() // the hint line shrinks the page
+		return m, nil
+	}
+	group := indices[0]
+
+	m.detail = nil
+	m.tab = tabTasks
+	m.searching = false
+	m.message = ""
+	cursor, ok := m.taskGroupHeaderRow(group)
+	if !ok && m.query[tabTasks] != "" {
+		// The Tasks search filter hides the very row being jumped to; a jump
+		// that lands nowhere is worse than a dropped filter, so clear it.
+		m.query[tabTasks] = ""
+		cursor, ok = m.taskGroupHeaderRow(group)
+	}
+	m.offsets[tabTasks] = 0
+	if !ok {
+		// cfg lists the source but the daemon hasn't reported its task list
+		// yet (the poll and the config read can disagree for a tick).
+		m.cursors[m.tab] = 0
+		m.message = fmt.Sprintf("task source #%d (%s) isn't loaded yet — it appears on the next refresh",
+			group, m.data.cfg.TaskSources[group].Path)
+		return m, nil
+	}
+	m.cursors[m.tab] = cursor
+	if len(indices) > 1 {
+		paths := make([]string, 0, len(indices)-1)
+		for _, idx := range indices[1:] {
+			paths = append(paths, m.data.cfg.TaskSources[idx].Path)
+		}
+		m.message = fmt.Sprintf("agent matches %d task sources — showing the first; also: %s",
+			len(indices), strings.Join(paths, ", "))
+	}
+	m.scrollCursorIntoView() // after the banner: it shrinks the page by 2
+	return m, nil
+}
+
+// taskGroupHeaderRow locates a task source's header row among the currently
+// visible (filtered) Tasks rows, reporting whether the search filter or a
+// not-yet-loaded task list left it off screen.
+func (m Model) taskGroupHeaderRow(group int) (int, bool) {
+	for i, r := range m.visibleTaskRows() {
+		if r.header && r.group == group {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// showSelectedRule jumps to the Rules tab for the escalation/audit row under
+// the cursor (t on either list), mirroring showSelectedAgentTasks. selectedAudit
+// already serves both tabs and bounds-checks the cursor.
+func (m Model) showSelectedRule() (tea.Model, tea.Cmd) {
+	rec := m.selectedAudit()
+	if rec == nil {
+		return m, nil
+	}
+	return m.showRuleFor(rec.Signature)
+}
+
+// showRuleFor jumps to the Rules tab with the rule a record is keyed to already
+// selected (AR-039) — shared by the Escalations/Audit lists and their detail
+// overlays, since a record and its rule share the signature string (see
+// ruleFor). Reading the rule behind a decision otherwise means switching tabs
+// and matching the id by eye.
+//
+// The two "can't jump" cases are different truths and get different messages: no
+// signature at all means the mask guard tripped and this situation can NEVER
+// have a rule, while a signature with no rule yet just means nobody has
+// confirmed one.
+func (m Model) showRuleFor(signature string) (tea.Model, tea.Cmd) {
+	if signature == "" {
+		m.message = "no signature on this record — an over-masked situation never matches a rule"
+		m.scrollCursorIntoView() // the hint line shrinks the page
+		return m, nil
+	}
+	if _, ok := m.ruleFor(signature); !ok {
+		m.message = fmt.Sprintf("no rule learned for %s yet — one appears once you confirm or resolve it",
+			shortSig(signature))
+		m.scrollCursorIntoView()
+		return m, nil
+	}
+
+	m.detail = nil
+	m.searching = false
+	m.message = ""
+	cursor, ok := m.ruleRowFor(signature)
+	if !ok {
+		// Hidden by the Rules tab's own filters — it composes a search query
+		// AND the f mode cycle, so either can bury the target. ruleFor already
+		// proved the rule exists, so clearing both makes the retry land.
+		m.query[tabSignatures] = ""
+		m.sigMode = ""
+		cursor, ok = m.ruleRowFor(signature)
+	}
+	m.tab = tabSignatures
+	m.offsets[tabSignatures] = 0
+	if !ok {
+		// Unreachable today — with both filters cleared visibleSignatures is
+		// m.data.signatures verbatim, which ruleFor just found the rule in.
+		// Kept as a guard in case the Rules tab grows a third filter that this
+		// jump doesn't know to clear.
+		m.cursors[m.tab] = 0
+		m.message = fmt.Sprintf("rule %s is no longer listed — refresh and retry", shortSig(signature))
+		m.scrollCursorIntoView()
+		return m, nil
+	}
+	m.cursors[m.tab] = cursor
+	m.scrollCursorIntoView()
+	return m, nil
+}
+
+// ruleRowFor locates a rule among the currently visible (filtered) Rules rows,
+// reporting whether the search query or the sigMode filter left it off screen.
+// ruleFor is the unfiltered lookup and returns the row, not a cursor position.
+func (m Model) ruleRowFor(signature string) (int, bool) {
+	for i, r := range m.visibleSignatures() {
+		if r.Signature == signature {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 	item := m.selectedRule()
 	if item == nil {
@@ -2047,6 +3239,11 @@ func (m Model) View() string {
 		if i == int(tabEscalations) && len(m.data.escalations) > 0 {
 			label = fmt.Sprintf(" %s(%d) ", name, len(m.data.escalations))
 		}
+		if i == int(tabTasks) {
+			if p := frontend.PendingTasks(m.data.tasks); p > 0 {
+				label = fmt.Sprintf(" %s(%d) ", name, p)
+			}
+		}
 		if tab(i) == m.tab {
 			tabs = append(tabs, st.activeTab.Render(label))
 		} else {
@@ -2102,6 +3299,8 @@ func (m Model) View() string {
 	switch m.tab {
 	case tabAgents:
 		m.renderAgents(&b)
+	case tabTasks:
+		m.renderTasks(&b)
 	case tabEscalations:
 		m.renderEscalations(&b)
 	case tabAudit:
@@ -2115,7 +3314,14 @@ func (m Model) View() string {
 	}
 
 	if m.prompt != nil {
-		fmt.Fprintf(&b, "\n%s> %s█\n", m.prompt.label, m.prompt.input)
+		// A multiline input expands the box: one rendered line per line break,
+		// continuation lines indented under the label, cursor on the last.
+		lines := strings.Split(promptNewlines.Replace(m.prompt.input), "\n")
+		fmt.Fprintf(&b, "\n%s> %s", m.prompt.label, lines[0])
+		for _, l := range lines[1:] {
+			fmt.Fprintf(&b, "\n  %s", l)
+		}
+		fmt.Fprint(&b, "█\n")
 	}
 	if m.confirm != nil {
 		fmt.Fprintf(&b, "\n%s\n", m.confirm.label)
@@ -2152,18 +3358,30 @@ func (m Model) helpLine() string {
 				preview = "  v: expand previews"
 			}
 		}
+		// Derived from the marker that actually gates `t`, not from confirmID:
+		// an audit detail is rule-bearing too, but carries no confirmID (only a
+		// pending escalation does), so keying the hint off confirmID would leave
+		// the key working and unadvertised on the Audit tab — where "which rule
+		// decided this?" is the likeliest question.
+		rule := ""
+		if m.detail.ruleDetail {
+			rule = "  t: see rule"
+		}
 		if m.detail.confirmID != 0 {
 			retry := ""
 			if m.detail.escRetryable {
 				retry = "  l: retry LLM"
 			}
-			return "enter: confirm+send  c: correct (+send?)  x: delete  f: focus in herdr" + retry +
+			return "enter: confirm+send  c: correct (+send?)  x: delete  f: focus in herdr" + rule + retry +
 				preview + "  ↑/↓: scroll  tab: switch tab  " + closeKeys
 		}
 		if m.detail.agent != nil {
-			return "↑/↓: scroll  tab: switch tab  f: focus in herdr" + preview + "  " + closeKeys
+			return "↑/↓: scroll  tab: switch tab  f: focus in herdr  t: see tasks" + preview + "  " + closeKeys
 		}
-		return "↑/↓: scroll  tab: switch tab" + preview + "  " + closeKeys
+		if m.detail.task != nil {
+			return "enter/y: send to agent  e: edit  x: delete  f: focus in herdr  ↑/↓: scroll  tab: switch tab  " + closeKeys
+		}
+		return "↑/↓: scroll  tab: switch tab" + rule + preview + "  " + closeKeys
 	}
 	if m.searching {
 		return "type to filter  backspace: erase  esc/enter: apply & close"
@@ -2177,17 +3395,53 @@ func (m Model) helpLine() string {
 	}
 	switch m.tab {
 	case tabAgents:
-		return "v: details  n: rename agent  f: focus in herdr  /: search  " + common
+		return "v: details  n: rename agent  f: focus in herdr  t: see tasks  /: search  " + common
+	case tabTasks:
+		return "enter/y: send to agent  v: details  a: add  e: edit  d: done/undone  x: delete (source on a header)  space: mark  f: focus in herdr  /: search  " + common
 	case tabEscalations:
-		return "enter/y: confirm+send  c: correct (+send?)  l: retry LLM  f: focus in herdr  space: mark  x: delete  X: prune old  v: details  /: search  " + common
+		return "enter/y: confirm+send  c: correct (+send?)  l: retry LLM  f: focus in herdr  t: see rule  space: mark  x: delete  X: prune old  v: details  /: search  " + common
 	case tabAudit:
-		return "c: correct decision  v: details  /: search  " + common
+		return "c: correct decision  v: details  t: see rule  /: search  " + common
 	case tabSignatures:
 		return "enter/v: details  x: delete  0: reset  f: filter mode  /: search  " + common
 	case tabConfig:
 		return "enter: edit/run shortcut  e: edit field  a: add pattern  t: add task source  x: remove  X: clear data  " + common
 	}
 	return common
+}
+
+// renderTasks draws the aggregated task list of every configured task source
+// (the Tasks tab): a header row per source, its checklist items under it.
+func (m Model) renderTasks(b *strings.Builder) {
+	st := m.styles()
+	rows := m.visibleTaskRows()
+	if len(rows) == 0 {
+		if len(m.data.tasks) > 0 {
+			fmt.Fprintln(b, st.help.Render("no tasks match the filter — / edits, backspace clears"))
+			return
+		}
+		fmt.Fprintln(b, st.help.Render("no task sources configured — press t on the Config tab, or: hap task-source add"))
+		return
+	}
+	start, end := m.window(len(rows))
+	for i := start; i < end; i++ {
+		r := rows[i]
+		line := r.text
+		switch {
+		case i == m.cursors[m.tab]:
+			line = st.selected.Render(line)
+		case r.header:
+			line = st.section.Render(line)
+		case r.errRow:
+			line = st.err.Render(line)
+		case r.inProgress:
+			line = st.warn.Render(line)
+		case r.done:
+			line = st.help.Render(line)
+		}
+		fmt.Fprintln(b, line)
+	}
+	m.renderMoreRows(b, len(rows)-end)
 }
 
 // renderSignatures draws the learned-signature list (the Rules tab).
@@ -2229,7 +3483,7 @@ func (m Model) renderSignatures(b *strings.Builder) {
 			fmt.Sprintf("%d/%d", r.ConsecutiveConfirmations, gradN),
 			oneLine(r.TopAction, actWidth))
 		switch {
-		case i == m.cursor:
+		case i == m.cursors[m.tab]:
 			line = st.selected.Render(line)
 		case r.Mode == domain.ModeAutonomous:
 			line = st.ok.Render(line)
@@ -2259,13 +3513,29 @@ func (m Model) renderDetail(b *strings.Builder) {
 	case end < len(lines):
 		fmt.Fprintf(b, "%s\n", st.help.Render(fmt.Sprintf("… %d more line(s) — ↓ to scroll", len(lines)-end)))
 	}
+	// Per-entry actions available from inside the overlay (e.g. "t: see
+	// tasks") report their outcome the same way list-view actions do —
+	// without these, a refusal (no match) or a success banner would be
+	// silently invisible while the overlay stays open.
+	if m.message != "" {
+		fmt.Fprintf(b, "\n%s\n", m.message)
+	}
+	if m.status != nil {
+		mark, style := "✓", st.ok
+		if m.status.err {
+			mark, style = "✗", st.err
+		}
+		text := oneLine(m.status.text, max(20, m.contentWidth()-12))
+		fmt.Fprintf(b, "\n%s\n", style.Render(
+			fmt.Sprintf("%s %s  %s", mark, text, m.status.at.Format("15:04:05"))))
+	}
 	fmt.Fprintf(b, "\n%s", st.help.Render(m.helpLine()))
 }
 
 // agentsRowFmt lays out the Agents list: name, id, type, status (all fixed
-// width so the trailing numeric columns line up), then the four lifetime
-// counters right-aligned and the live age last.
-const agentsRowFmt = "%-18s %-12s %-12s %-10s %5s %5s %5s %5s  %s"
+// width so the trailing numeric columns line up), the agent's task count, then
+// the four lifetime counters right-aligned and the live age last.
+const agentsRowFmt = "%-18s %-12s %-12s %-10s %7s %5s %5s %5s %5s  %s"
 
 func (m Model) renderAgents(b *strings.Builder) {
 	agents := m.visibleAgents()
@@ -2277,9 +3547,13 @@ func (m Model) renderAgents(b *strings.Builder) {
 		}
 		return
 	}
+	// Rows are clamped to the content width: a wrapped line would break the
+	// one-row-one-line accounting window()/listPageSize() depend on, exactly
+	// as renderTasks guards its own headers.
+	rowWidth := max(20, m.contentWidth())
 	header := fmt.Sprintf(agentsRowFmt,
-		"NAME", "LOCATION", "TYPE", "STATUS", "AUTO", "ESC", "CONF", "CORR", "AGE")
-	fmt.Fprintln(b, m.styles().section.Render(header))
+		"NAME", "LOCATION", "TYPE", "STATUS", "TASK", "ESCA", "AUTO", "CONF", "CORR", "AGE")
+	fmt.Fprintln(b, m.styles().section.Render(oneLine(header, rowWidth)))
 	now := m.renderNow()
 	start, end := m.window(len(agents))
 	for i := start; i < end; i++ {
@@ -2288,10 +3562,12 @@ func (m Model) renderAgents(b *strings.Builder) {
 		s := m.data.status.StatsFor(a.AgentID)
 		line := fmt.Sprintf(agentsRowFmt,
 			name, oneLine(agentLocation(a, m.data.status), 12), a.AgentType, a.Status,
-			strconv.Itoa(s.AutoSends), strconv.Itoa(s.Escalations),
+			oneLine(m.agentTaskCount(a), 7),
+			strconv.Itoa(s.Escalations), strconv.Itoa(s.AutoSends),
 			strconv.Itoa(s.Confirmed), strconv.Itoa(s.Corrections),
 			formatAge(s.FirstSeen, now))
-		if i == m.cursor {
+		line = oneLine(line, rowWidth)
+		if i == m.cursors[m.tab] {
 			line = m.styles().selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
@@ -2397,7 +3673,7 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		if e.Suggestion != "" {
 			line += "  → " + oneLine(e.Suggestion, sWidth)
 		}
-		if i == m.cursor {
+		if i == m.cursors[m.tab] {
 			line = m.styles().selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
@@ -2435,7 +3711,7 @@ func (m Model) renderAudit(b *strings.Builder) {
 			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), 14),
 			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), fmt.Sprintf("%.2f", r.Confidence), r.Status,
 			oneLine(r.Action, actWidth))
-		if i == m.cursor {
+		if i == m.cursors[m.tab] {
 			line = m.styles().selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
@@ -2478,7 +3754,7 @@ func (m Model) renderConfig(b *strings.Builder) {
 		}
 		// Long values (argv templates, paths) truncate to one line (CR-037).
 		line := "  " + oneLine(item.label, m.contentWidth()-2)
-		if i == m.cursor {
+		if i == m.cursors[m.tab] {
 			line = st.selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
@@ -2517,7 +3793,7 @@ func (m Model) renderKills(b *strings.Builder) {
 	for i, e := range m.data.kills {
 		line := fmt.Sprintf("#%-4d %-20s %-8s by %s",
 			e.ID, e.CreatedAt.Format(time.RFC3339), e.State, e.Author)
-		if i == m.cursor {
+		if i == m.cursors[m.tab] {
 			line = m.styles().selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
@@ -2560,7 +3836,9 @@ func llmConfShort(v *int) string {
 
 // Run starts the TUI program.
 func Run(ctx context.Context, app *frontend.App) error {
-	p := tea.NewProgram(New(ctx, app), tea.WithAltScreen())
+	m := New(ctx, app)
+	m.bellOut = os.Stdout
+	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }

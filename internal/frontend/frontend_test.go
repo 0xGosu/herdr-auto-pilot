@@ -1099,6 +1099,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"tui.max_content_width":                   "140",
 		"tui.max_content_height":                  "12",
 		"tui.theme":                               "dark",
+		"tui.terminal_bell":                       "true",
 	}
 
 	registry := make(map[string]bool, len(frontend.ConfigFieldKeys))
@@ -2219,5 +2220,657 @@ func TestMutatePreservesFileMode(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o644 {
 		t.Errorf("file mode after edit = %o, want preserved 0644 (not narrowed to 0600)", got)
+	}
+}
+
+// TestTaskGroups covers the aggregated all-sources view (TUI Tasks tab): one
+// group per config entry in config order, per-source read failures isolated
+// to their own group, duplicate paths read independently.
+func TestTaskGroups(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(good, []byte("# plan\n- [ ] a\n- [x] b\n- [-] c\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(dir, "prose.md")
+	if err := os.WriteFile(empty, []byte("# notes\nno checklist here\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "gone.md")
+
+	cfg := config.Config{TaskSources: []config.TaskSource{
+		{Agent: "brave-otter", Workspace: "w1", Path: good},
+		{Agent: "codex", Path: missing},
+		{Agent: "empty-path"},
+		{Workspace: "*", Path: good}, // duplicate path, its own group
+		{Agent: "quiet", Path: empty},
+	}}
+	groups := frontend.TaskGroups(cfg)
+	if len(groups) != len(cfg.TaskSources) {
+		t.Fatalf("got %d groups, want %d", len(groups), len(cfg.TaskSources))
+	}
+	for i, g := range groups {
+		if g.Index != i || g.Source.Path != cfg.TaskSources[i].Path {
+			t.Errorf("group %d: Index=%d Path=%q, want config order preserved", i, g.Index, g.Source.Path)
+		}
+	}
+
+	if g := groups[0]; g.Err != "" || len(g.Items) != 3 {
+		t.Fatalf("readable source: Err=%q items=%d, want no error and 3 items", g.Err, len(g.Items))
+	}
+	wantItems := []struct {
+		mark string
+		done bool
+		text string
+	}{{" ", false, "a"}, {"x", true, "b"}, {"-", true, "c"}}
+	for i, want := range wantItems {
+		it := groups[0].Items[i]
+		if it.Mark != want.mark || it.Done != want.done || it.Text != want.text || it.Index != i+1 {
+			t.Errorf("item %d = %+v, want mark=%q done=%v text=%q", i, it, want.mark, want.done, want.text)
+		}
+	}
+
+	if g := groups[1]; g.Err == "" || len(g.Items) != 0 {
+		t.Errorf("missing file: Err=%q items=%d, want an error and no items", g.Err, len(g.Items))
+	}
+	if g := groups[2]; g.Err != "no path configured" {
+		t.Errorf("empty path: Err=%q, want \"no path configured\"", g.Err)
+	}
+	if g := groups[3]; g.Err != "" || len(g.Items) != 3 {
+		t.Errorf("duplicate path: Err=%q items=%d, want an independent readable group", g.Err, len(g.Items))
+	}
+	if g := groups[4]; g.Err != "" || len(g.Items) != 0 {
+		t.Errorf("readable file without checklist items: Err=%q items=%d, want no error and no items", g.Err, len(g.Items))
+	}
+}
+
+func TestTaskGroupsEmptyConfig(t *testing.T) {
+	if groups := frontend.TaskGroups(config.Config{}); len(groups) != 0 {
+		t.Errorf("no task sources should yield no groups, got %d", len(groups))
+	}
+}
+
+// TestTaskMutationsVerifyExpectedText pins the optional expected-text guard:
+// a mutation whose caller resolved the task number against a checklist that
+// has since changed must abort inside the lock, leaving the file untouched.
+func TestTaskMutationsVerifyExpectedText(t *testing.T) {
+	app, _ := testApp(t)
+	newFile := func() string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "tasks.md")
+		if err := os.WriteFile(path, []byte("- [ ] alpha\n- [x] beta\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	cases := []struct {
+		name   string
+		run    func(path string, expect ...string) error
+		expect string // guard value; the file's task #1 is "alpha"
+	}{
+		{"done", func(p string, e ...string) error {
+			_, err := app.SetTaskDone("", p, 1, true, e...)
+			return err
+		}, "stale"},
+		{"edit", func(p string, e ...string) error {
+			_, err := app.EditTask("", p, 1, "rewritten", e...)
+			return err
+		}, "stale"},
+		{"delete", func(p string, e ...string) error {
+			_, err := app.DeleteTask("", p, 1, e...)
+			return err
+		}, "stale"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := newFile()
+			if err := tc.run(path, tc.expect); err == nil || !strings.Contains(err.Error(), "checklist changed") {
+				t.Fatalf("mismatched expected text should abort, got %v", err)
+			}
+			data, _ := os.ReadFile(path)
+			if string(data) != "- [ ] alpha\n- [x] beta\n" {
+				t.Errorf("aborted %s must not modify the file, got:\n%s", tc.name, data)
+			}
+			// The matching text (and the no-guard CLI form) still mutates.
+			if err := tc.run(path, "alpha"); err != nil {
+				t.Fatalf("matching expected text should pass: %v", err)
+			}
+			if err := tc.run(newFile()); err != nil {
+				t.Fatalf("guard must stay optional for CLI callers: %v", err)
+			}
+		})
+	}
+	// An out-of-range number reports "no longer exists".
+	path := newFile()
+	if _, err := app.DeleteTask("", path, 9, "alpha"); err == nil || !strings.Contains(err.Error(), "no longer exists") {
+		t.Errorf("vanished task number should abort with a refresh hint, got %v", err)
+	}
+}
+
+// TestEditTaskMultiline: line breaks in the new text are stored as literal
+// `\n` — the item stays ONE task on one physical line, its status and the
+// rest of the file untouched — and the expected-text guard still composes.
+func TestEditTaskMultiline(t *testing.T) {
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [x] one\n- [ ] two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	items, err := app.EditTask("", path, 1, "first\nsecond", "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("a multi-line edit must not change the item count, got %d: %+v", len(items), items)
+	}
+	data, _ := os.ReadFile(path)
+	if want := "- [x] first\\nsecond\n- [ ] two\n"; string(data) != want {
+		t.Errorf("multiline edit should store literal \\n:\ngot  %q\nwant %q", data, want)
+	}
+	if _, err := app.EditTask("", path, 1, "a\nb", "stale"); err == nil {
+		t.Error("guard must still abort a stale multiline edit")
+	}
+	// Bare-\r line breaks (terminal bracketed paste) encode the same way.
+	if _, err := app.EditTask("", path, 2, "cr-a\rcr-b"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(path)
+	if !strings.Contains(string(data), `- [ ] cr-a\ncr-b`) {
+		t.Errorf("CR paste should encode to literal \\n, got %q", data)
+	}
+}
+
+// TestAddTaskMultiline: newline-bearing text appends ONE item with the
+// breaks stored as literal `\n` (leading/trailing whitespace trimmed).
+func TestAddTaskMultiline(t *testing.T) {
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [x] done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	items, n, err := app.AddTask("", path, "one\r\ntwo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 || len(items) != 2 {
+		t.Fatalf("got new index %d and %d items, want 2 and 2", n, len(items))
+	}
+	data, _ := os.ReadFile(path)
+	if want := "- [x] done\n- [ ] one\\ntwo\n"; string(data) != want {
+		t.Errorf("multiline add:\ngot  %q\nwant %q", data, want)
+	}
+	if _, _, err := app.AddTask("", path, " \n \r "); err == nil {
+		t.Error("all-blank multiline text must error")
+	}
+	// A literal backslash-n TYPED in the text is indistinguishable from an
+	// encoded break by design: it is stored verbatim and will be delivered
+	// as a real newline (the documented ambiguity of the `\n` encoding).
+	if _, _, err := app.AddTask("", path, `uses \n escape`); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(path)
+	if !strings.Contains(string(data), `- [ ] uses \n escape`) {
+		t.Errorf("typed literal \\n must be stored verbatim, got %q", data)
+	}
+}
+
+// TestSendTaskToAgent: the pending task is re-verified against the live file
+// (freshness guard), rendered through the source's template — stored `\n`
+// decoded to real newlines — and delivered to the agent's pane.
+func TestSendTaskToAgent(t *testing.T) {
+	app, _ := testApp(t)
+	h := &sendCaptureHerdr{agents: idleAt("w1:p2")}
+	app.Herdr = h
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte(`- [ ] step one\nstep two`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "brave-otter",
+		path, "", 1, `step one\nstep two`); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("expected one delivery, got %v", h.sent)
+	}
+	for _, want := range []string{"step one\nstep two", "brave-otter", path} {
+		if !strings.Contains(h.sent[0], want) {
+			t.Errorf("sent prompt missing %q:\n%s", want, h.sent[0])
+		}
+	}
+	// A successful send marks the item [-] in progress.
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), `- [-] step one\nstep two`) {
+		t.Errorf("sent task should be marked in progress, got %q", data)
+	}
+
+	// Freshness guard: a task completed or rewritten since the snapshot
+	// refuses to send instead of re-delivering stale work.
+	if err := os.WriteFile(path, []byte(`- [x] step one\nstep two`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", 1, `step one\nstep two`); err == nil ||
+		!strings.Contains(err.Error(), "no longer pending") {
+		t.Errorf("completed task must refuse to send, got %v", err)
+	}
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", 1, "different text"); err == nil ||
+		!strings.Contains(err.Error(), "the checklist changed") {
+		t.Errorf("rewritten task must refuse to send, got %v", err)
+	}
+	if len(h.sent) != 1 {
+		t.Errorf("refused sends must not deliver, got %v", h.sent)
+	}
+
+	// Guards: no herdr / no pane.
+	app.Herdr = nil
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", 1, "t"); err == nil {
+		t.Error("nil herdr must refuse")
+	}
+	app.Herdr = h
+	if err := app.SendTaskToAgent(ctx, "", "claude", "n", path, "", 1, "t"); err == nil {
+		t.Error("empty pane must refuse")
+	}
+}
+
+// TestSendTaskToAgentRechecksIdle pins the guard against the window between
+// the caller's status read and delivery: the operator's confirmation (or a
+// --yes script) can be seconds stale, and a task must never land in a working
+// agent's live conversation.
+func TestSendTaskToAgentRechecksIdle(t *testing.T) {
+	newApp := func(t *testing.T, h *sendCaptureHerdr) (*frontend.App, string) {
+		t.Helper()
+		app, _ := testApp(t)
+		app.Herdr = h
+		path := filepath.Join(t.TempDir(), "tasks.md")
+		if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return app, path
+	}
+	ctx := context.Background()
+	// The agent started working after the caller looked.
+	busy := &sendCaptureHerdr{agents: []domain.AgentTransition{
+		{AgentID: "w1:p2", PaneID: "w1:p2", AgentType: "claude", Status: "working"}}}
+	app, path := newApp(t, busy)
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err == nil ||
+		!strings.Contains(err.Error(), "cleanly idle") {
+		t.Errorf("a now-busy agent must refuse, got %v", err)
+	}
+	if len(busy.sent) != 0 {
+		t.Errorf("refused send must not deliver, got %v", busy.sent)
+	}
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [ ] work") {
+		t.Errorf("refused send must leave the task pending, got %q", data)
+	}
+	// The agent vanished entirely.
+	gone := &sendCaptureHerdr{}
+	app, path = newApp(t, gone)
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err == nil ||
+		!strings.Contains(err.Error(), "no longer live") {
+		t.Errorf("a vanished agent must refuse, got %v", err)
+	}
+	// An unreadable agent list is not an idle agent: fail closed.
+	app, path = newApp(t, nil)
+	app.Herdr = &failingAgentsHerdr{}
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err == nil ||
+		!strings.Contains(err.Error(), "nothing was sent") {
+		t.Errorf("an unreadable agent list must refuse, got %v", err)
+	}
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [ ] work") {
+		t.Errorf("refused send must leave the task pending, got %q", data)
+	}
+}
+
+// TestSendTaskToAgentReservesBeforeDelivering pins the ordering: the item is
+// marked [-] BEFORE the pane receives it, so no guarded failure can be
+// reported after delivery and leave the task [ ] for the daemon to hand out a
+// second time. A failed delivery rolls the reservation back.
+func TestSendTaskToAgentReservesBeforeDelivering(t *testing.T) {
+	ctx := context.Background()
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The reservation must already be on disk by the time Send is called.
+	var atSend string
+	h := &sendCaptureHerdr{agents: idleAt("w1:p2")}
+	app.Herdr = &reserveProbeHerdr{sendCaptureHerdr: h, path: path, seen: &atSend}
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(atSend, "- [-] work") {
+		t.Errorf("task must be reserved [-] BEFORE delivery, file at send time was %q", atSend)
+	}
+	// A delivery that fails returns the task to [ ] rather than parking it.
+	app2, _ := testApp(t)
+	path2 := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path2, []byte("- [ ] work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app2.Herdr = &sendCaptureHerdr{agents: idleAt("w1:p2"), sendErr: errors.New("pane gone")}
+	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2, "", 1, "work"); err == nil ||
+		!strings.Contains(err.Error(), "pane gone") {
+		t.Errorf("a failed delivery must surface its error, got %v", err)
+	}
+	if data, _ := os.ReadFile(path2); !strings.Contains(string(data), "- [ ] work") {
+		t.Errorf("a failed delivery must roll the reservation back to [ ], got %q", data)
+	}
+}
+
+// reserveProbeHerdr snapshots the checklist file at the moment of delivery.
+type reserveProbeHerdr struct {
+	*sendCaptureHerdr
+	path string
+	seen *string
+}
+
+func (c *reserveProbeHerdr) Send(ctx context.Context, pane, input string) error {
+	data, _ := os.ReadFile(c.path)
+	*c.seen = string(data)
+	return c.sendCaptureHerdr.Send(ctx, pane, input)
+}
+
+// racingHerdr rewrites the checklist during the delivery — standing in for
+// another operator acting inside the send's lock-release window — and then
+// fails the send, forcing the rollback to confront the change.
+type racingHerdr struct {
+	sendCaptureHerdr
+	path, write string
+}
+
+func (c *racingHerdr) Send(context.Context, string, string) error {
+	_ = os.WriteFile(c.path, []byte(c.write), 0o644)
+	return errors.New("pane gone")
+}
+
+// TestSendTaskToAgentRollbackIsClaimScoped: the rollback only reopens an item
+// that is still the [-] this send reserved. Someone else's completion landing
+// in the window must survive — reopening it would both discard their work and
+// re-arm the task for the daemon.
+func TestSendTaskToAgentRollbackIsClaimScoped(t *testing.T) {
+	ctx := context.Background()
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app.Herdr = &racingHerdr{
+		sendCaptureHerdr: sendCaptureHerdr{agents: idleAt("w1:p2")},
+		path:             path,
+		write:            "- [x] work\n", // completed by someone else mid-send
+	}
+	err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work")
+	if err == nil || !strings.Contains(err.Error(), "pane gone") {
+		t.Errorf("the delivery failure must still surface, got %v", err)
+	}
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [x] work") {
+		t.Errorf("a concurrent completion must not be reopened by the rollback, got %q", data)
+	}
+}
+
+// TestSendTaskToAgentRendersCwd pins that a manual send fills {cwd} the same
+// way the daemon's declared-task path does — one template must not render
+// differently depending on who sent it.
+func TestSendTaskToAgentRendersCwd(t *testing.T) {
+	ctx := context.Background()
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := &sendInspectHerdr{
+		sendCaptureHerdr: sendCaptureHerdr{agents: idleAt("w1:p2")},
+		info:             domain.PaneInfo{Cwd: "/repo", ForegroundCwd: "/repo/sub"},
+	}
+	app.Herdr = h
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path,
+		"do {next_task_content} in {cwd}", 1, "work"); err != nil {
+		t.Fatal(err)
+	}
+	// The foreground cwd wins, exactly as the daemon's resolver prefers it.
+	if len(h.sent) != 1 || !strings.Contains(h.sent[0], "do work in /repo/sub") {
+		t.Errorf("{cwd} should render the foreground cwd, got %v", h.sent)
+	}
+	// An adapter without the optional inspector still sends, with {cwd} empty.
+	app2, _ := testApp(t)
+	plain := &sendCaptureHerdr{agents: idleAt("w1:p2")}
+	app2.Herdr = plain
+	path2 := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path2, []byte("- [ ] work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2,
+		"do {next_task_content} in {cwd}", 1, "work"); err != nil {
+		t.Errorf("a missing inspector must never block a send, got %v", err)
+	}
+	// Exactly, not Contains: "do work in " is a prefix of a resolved cwd too,
+	// so a substring check could not tell an empty {cwd} from a filled one.
+	if len(plain.sent) != 1 || plain.sent[0] != "do work in " {
+		t.Errorf("expected a delivery with an empty cwd, got %q", plain.sent)
+	}
+}
+
+// sendCaptureHerdr records deliveries and reports the agents it is given, so
+// SendTaskToAgent's just-before-delivery idle re-check can resolve the pane.
+// sendErr makes the delivery itself fail (the rollback path).
+type sendCaptureHerdr struct {
+	sent    []string
+	agents  []domain.AgentTransition
+	sendErr error
+}
+
+func (c *sendCaptureHerdr) Send(_ context.Context, _, input string) error {
+	if c.sendErr != nil {
+		return c.sendErr
+	}
+	c.sent = append(c.sent, input)
+	return nil
+}
+func (c *sendCaptureHerdr) ReadPane(context.Context, string, int) (string, error) { return "", nil }
+func (c *sendCaptureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
+	return c.agents, nil
+}
+
+// idleAt builds the one-agent listing the send path expects.
+func idleAt(paneID string) []domain.AgentTransition {
+	return []domain.AgentTransition{{AgentID: paneID, PaneID: paneID, AgentType: "claude", Status: "idle"}}
+}
+
+// sendInspectHerdr adds the optional InspectorPort so {cwd} can resolve.
+type sendInspectHerdr struct {
+	sendCaptureHerdr
+	info domain.PaneInfo
+}
+
+func (c *sendInspectHerdr) PaneInfo(context.Context, string) (domain.PaneInfo, error) {
+	return c.info, nil
+}
+
+// TestAddTaskRespectsMaxTasksCap: a manual add to a registered source is
+// rejected once it would push the checklist past the source's max_tasks cap,
+// while an ad-hoc --path file (no registered source) is uncapped.
+func TestAddTaskRespectsMaxTasksCap(t *testing.T) {
+	app, _ := testApp(t)
+	dir := filepath.Dir(app.ConfigPath)
+	taskFile := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(taskFile, []byte("- [ ] one\n- [x] two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Register the file as a source capped at 3.
+	cfgToml := fmt.Sprintf("[[task_sources]]\nagent = \"builder\"\npath = %q\nmax_tasks = 3\n", taskFile)
+	if err := os.WriteFile(app.ConfigPath, []byte(cfgToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2 items → adding one more reaches the cap (3), still allowed.
+	if _, _, err := app.AddTask("builder", "", "three"); err != nil {
+		t.Fatalf("adding up to the cap must succeed: %v", err)
+	}
+	// 3 items → the next add would be 4 > 3, rejected with the cap message.
+	_, _, err := app.AddTask("builder", "", "four")
+	if err == nil || !strings.Contains(err.Error(), "maximum number of tasks reached") {
+		t.Fatalf("adding past the cap must be rejected with the cap message, got %v", err)
+	}
+
+	// A line-break-bearing add stays ONE task (stored with literal `\n`), so
+	// it counts once against the cap: 2 items + 1 multi-line task = 3 ≤ cap.
+	if err := os.WriteFile(taskFile, []byte("- [ ] a\n- [x] b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.AddTask("builder", "", "c1\nc2\nc3"); err != nil {
+		t.Fatalf("a multi-line add is one task and must fit the cap: %v", err)
+	}
+	if data, _ := os.ReadFile(taskFile); len(domain.ParseChecklist(string(data))) != 3 {
+		t.Errorf("multi-line text must store as a single item, got %q", data)
+	}
+
+	// An unregistered --path file has no source entry and is uncapped.
+	adhoc := filepath.Join(dir, "adhoc.md")
+	if err := os.WriteFile(adhoc, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, _, err := app.AddTask("", adhoc, fmt.Sprintf("t%d", i)); err != nil {
+			t.Fatalf("an unregistered --path file must be uncapped; add %d failed: %v", i, err)
+		}
+	}
+}
+
+// TestPendingTasks: only unchecked ("[ ]") items count, and unreadable
+// sources are skipped (their contents are unknown, not zero).
+func TestPendingTasks(t *testing.T) {
+	groups := []frontend.TaskGroup{
+		{Items: []domain.ChecklistItem{{Mark: " "}, {Mark: "x", Done: true}, {Mark: " "}}},
+		{Err: "open: no such file", Items: []domain.ChecklistItem{{Mark: " "}}},
+		{Items: []domain.ChecklistItem{{Mark: "-", Done: true}}},
+	}
+	if got := frontend.PendingTasks(groups); got != 2 {
+		t.Errorf("PendingTasks = %d, want 2 (errored group skipped, done/in-progress not pending)", got)
+	}
+}
+
+func TestUnfinishedTasks(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		items []domain.ChecklistItem
+		want  int
+	}{
+		{"pending counts", []domain.ChecklistItem{{Mark: " "}, {Mark: " "}}, 2},
+		{"in progress counts", []domain.ChecklistItem{{Mark: "-", Done: true}}, 1},
+		{"completed marks do not", []domain.ChecklistItem{
+			{Mark: "x", Done: true}, {Mark: "X", Done: true},
+			{Mark: "+", Done: true}, {Mark: "*", Done: true}}, 0},
+		{"mixed", []domain.ChecklistItem{
+			{Mark: " "}, {Mark: "-", Done: true}, {Mark: "x", Done: true}}, 2},
+		{"empty list", nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := frontend.UnfinishedTasks([]frontend.TaskGroup{{Items: tc.items}})
+			if got != tc.want {
+				t.Errorf("UnfinishedTasks = %d, want %d", got, tc.want)
+			}
+		})
+	}
+	// Unreadable sources are unknown, not zero — same rule as PendingTasks.
+	errored := []frontend.TaskGroup{{Err: "open: no such file", Items: []domain.ChecklistItem{{Mark: " "}}}}
+	if got := frontend.UnfinishedTasks(errored); got != 0 {
+		t.Errorf("UnfinishedTasks(errored) = %d, want 0 (skipped)", got)
+	}
+	// The reason this function exists: an agent mid-task leaves "[-]" items,
+	// which Done (a pending/not-pending flag) reports as finished. A caller
+	// asking "is this list done?" must not use PendingTasks.
+	working := []frontend.TaskGroup{{Items: []domain.ChecklistItem{{Mark: "-", Done: true}}}}
+	if p, u := frontend.PendingTasks(working), frontend.UnfinishedTasks(working); p != 0 || u != 1 {
+		t.Errorf("in-progress list: PendingTasks = %d (want 0), UnfinishedTasks = %d (want 1)", p, u)
+	}
+}
+
+// TestStatusAgentsKnown pins the distinction callers act on: a failed agent
+// query and a genuinely empty herd both leave MonitoredAgents empty, so
+// GetStatus must say which one happened. Anything deciding on an agent's
+// ABSENCE (the Tasks tab's source removal) is unsafe without it.
+func TestStatusAgentsKnown(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		herdr ports.HerdrPort
+		want  bool
+	}{
+		{"query failed", &failingAgentsHerdr{}, false},
+		{"no adapter", nil, false},
+		{"empty herd", &emptyAgentsHerdr{}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, _ := testApp(t)
+			app.Herdr = tc.herdr
+			st, err := app.GetStatus(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.AgentsKnown != tc.want {
+				t.Errorf("AgentsKnown = %v, want %v", st.AgentsKnown, tc.want)
+			}
+			if len(st.MonitoredAgents) != 0 {
+				t.Errorf("all cases report zero agents, got %d", len(st.MonitoredAgents))
+			}
+		})
+	}
+}
+
+type failingAgentsHerdr struct{}
+
+func (f *failingAgentsHerdr) Send(context.Context, string, string) error { return nil }
+func (f *failingAgentsHerdr) ReadPane(context.Context, string, int) (string, error) {
+	return "", nil
+}
+func (f *failingAgentsHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
+	return nil, errors.New("herdr unreachable")
+}
+
+type emptyAgentsHerdr struct{}
+
+func (e *emptyAgentsHerdr) Send(context.Context, string, string) error { return nil }
+func (e *emptyAgentsHerdr) ReadPane(context.Context, string, int) (string, error) {
+	return "", nil
+}
+func (e *emptyAgentsHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
+	return nil, nil
+}
+
+// TestRemoveTaskSourceKeepsChecklistFile pins the contract the TUI's Tasks-tab
+// `x` advertises: removing a source retires the config entry only. Source
+// files are often hand-written docs hap never created and could not restore.
+func TestRemoveTaskSourceKeepsChecklistFile(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] keep me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "a1", "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 {
+		t.Fatalf("want 1 task source, got %d", len(cfg.TaskSources))
+	}
+	if err := app.RemoveTaskSource(ctx, 0, cfg.TaskSources[0].Path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 0 {
+		t.Errorf("entry should be gone, got %d source(s)", len(cfg.TaskSources))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("checklist file must survive removal: %v", err)
+	}
+	if string(data) != "- [ ] keep me\n" {
+		t.Errorf("checklist file must be untouched, got %q", data)
 	}
 }

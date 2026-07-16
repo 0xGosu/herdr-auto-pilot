@@ -156,7 +156,7 @@ func Decide(in DecideInput) Decision {
 	// escalation line's budget belongs to the suggestion, not to prose
 	// repeating the tag or the operator's own config.
 	if in.KillActive {
-		return esc(ReasonKilled, "", conf.Score, "")
+		return esc(ReasonDaemonPaused, "", conf.Score, "")
 	}
 	if in.Situation.Type == SituationUnclassifiable {
 		return esc(ReasonUnclassifiable, "", conf.Score, "")

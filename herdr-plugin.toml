@@ -17,7 +17,7 @@ command = ["bash", "scripts/install.sh"]
 [[panes]]
 id = "control"
 title = "Auto Prompter"
-placement = "split"
+placement = "tab"
 command = ["./bin/hap", "tui"]
 
 # The monitoring daemon is ensured (started once, flock-guarded) whenever an

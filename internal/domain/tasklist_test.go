@@ -3,6 +3,7 @@ package domain
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -538,6 +539,49 @@ func TestEditChecklistItemText(t *testing.T) {
 	// The item is unchanged after a rejected edit (validation happens before rewrite).
 	if got, _ := EditChecklistItemText(content, 1, "clean text"); got == content {
 		t.Error("a valid edit should change the content")
+	}
+}
+
+// TestTaskNewlineEncoding pins the one-line-per-item storage encoding: real
+// line breaks become the literal two-character `\n` on write, and stored
+// `\n` becomes real newlines only when the task is rendered into a prompt.
+func TestTaskNewlineEncoding(t *testing.T) {
+	if got, want := EncodeTaskNewlines("a\r\nb\rc\nd"), `a\nb\nc\nd`; got != want {
+		t.Errorf("EncodeTaskNewlines = %q, want %q", got, want)
+	}
+	if got, want := DecodeTaskNewlines(`x\ny`), "x\ny"; got != want {
+		t.Errorf("DecodeTaskNewlines = %q, want %q", got, want)
+	}
+	// Round-trip: what the edit prompt decodes re-encodes identically.
+	stored := `step one\nstep two`
+	if got := EncodeTaskNewlines(DecodeTaskNewlines(stored)); got != stored {
+		t.Errorf("encode(decode(%q)) = %q, want round-trip identity", stored, got)
+	}
+	// The encoded form survives the single-line checklist validation.
+	if _, _, err := AppendChecklistItem("", EncodeTaskNewlines("one\ntwo")); err != nil {
+		t.Errorf("encoded multi-line text must be storable: %v", err)
+	}
+	// Prompt() is the sending side: stored `\n` renders as real newlines in
+	// {next_task_content}, and only there (the path is untouched).
+	p := DeclaredTask{Task: `step one\nstep two`, Path: `/tmp/a\nb.md`, AgentName: "otter"}.Prompt()
+	if !strings.Contains(p, "step one\nstep two") {
+		t.Errorf("Prompt should decode task newlines, got %q", p)
+	}
+	if !strings.Contains(p, `/tmp/a\nb.md`) {
+		t.Errorf("Prompt must not decode non-task fields, got %q", p)
+	}
+}
+
+func TestMarkChecklistItemInProgress(t *testing.T) {
+	got, err := MarkChecklistItemInProgress("- [ ] a\n- [x] b", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "- [-] a\n- [x] b"; got != want {
+		t.Errorf("MarkChecklistItemInProgress: got %q, want %q", got, want)
+	}
+	if _, err := MarkChecklistItemInProgress("- [ ] a", 5); err == nil {
+		t.Error("out-of-range index must error")
 	}
 }
 

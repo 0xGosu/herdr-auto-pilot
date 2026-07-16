@@ -9,8 +9,8 @@ has the full ground rules; this file is the day-to-day working reference.
 
 Prefer these for how-to detail — this file keeps only what must stay in view.
 - **`herdr`** — drive herdr from inside it (workspaces, tabs, panes, agents, waits).
-- **`hap`** — operate the plugin: status, escalations, config, safety rules, task
-  sources, LLM fallback, and the runtime architecture (monitor loop, semantic matching).
+- **`hap`** — operate the plugin via its CLI `hap`: agent's status, agent's tasks, escalations, config, safety rules, task
+  sources.
 - **`hap-development-local`** — the local dev loop: link the working tree, rebuild,
   hot-swap the daemon (`hap daemon --ensure`), and live-test against a real agent.
 
@@ -83,9 +83,14 @@ ticket/issue id**. Examples:
 - Pre-commit hooks also check large files, secrets, trailing whitespace, and line
   endings — let them run (don't `--no-verify`).
 - Never commit directly to `main`. Branch (`feat/…`, `fix/…`), open a PR.
-- For any non-trivial change, prefer an isolated worktree (`worktree-agent-noN` beside
-  the repo) so `main`'s checkout stays clean; remove the worktree and delete the branch
-  (local + origin) after merge.
+- For any non-trivial change, use the **`git-worktree`** skill to create a new isolated
+  worktree from `main` (`worktree-agent-noN` beside the repo) so `main`'s checkout stays
+  clean; remove the worktree and delete the branch (local + origin) after merge.
+- If the current repository has many uncommitted changes, or you detect or suspect that
+  another agent is working in parallel in the same repository, pause before making more
+  changes. Stage only your own changes, then use the **`git-worktree`** skill to create a
+  new worktree from `main` that includes those staged changes, and continue there without
+  disturbing the other work in progress.
 
 ## Version bump & release
 

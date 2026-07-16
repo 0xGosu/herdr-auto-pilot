@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -285,9 +286,9 @@ func TestListWindowFollowsCursor(t *testing.T) {
 	for i := 0; i < page; i++ {
 		m = press(t, m, "down")
 	}
-	if m.cursor != page || m.offsets[tabEscalations] != 1 {
+	if m.cursors[m.tab] != page || m.offsets[tabEscalations] != 1 {
 		t.Fatalf("cursor=%d offset=%d after %d downs, want cursor=%d offset=1",
-			m.cursor, m.offsets[tabEscalations], page, page)
+			m.cursors[m.tab], m.offsets[tabEscalations], page, page)
 	}
 	view = m.View()
 	if strings.Contains(view, "rationale-row-00") || !strings.Contains(view, fmt.Sprintf("rationale-row-%02d", page)) {
@@ -298,16 +299,16 @@ func TestListWindowFollowsCursor(t *testing.T) {
 	for i := 0; i < page; i++ {
 		m = press(t, m, "up")
 	}
-	if m.cursor != 0 || m.offsets[tabEscalations] != 0 {
-		t.Errorf("cursor=%d offset=%d after scrolling back up, want 0/0", m.cursor, m.offsets[tabEscalations])
+	if m.cursors[m.tab] != 0 || m.offsets[tabEscalations] != 0 {
+		t.Errorf("cursor=%d offset=%d after scrolling back up, want 0/0", m.cursors[m.tab], m.offsets[tabEscalations])
 	}
 
 	// Over-scrolling clamps at the last row; the indicator disappears.
 	for i := 0; i < 100; i++ {
 		m = press(t, m, "down")
 	}
-	if m.cursor != 39 || m.offsets[tabEscalations] != 40-page {
-		t.Errorf("cursor=%d offset=%d at the bottom, want 39/%d", m.cursor, m.offsets[tabEscalations], 40-page)
+	if m.cursors[m.tab] != 39 || m.offsets[tabEscalations] != 40-page {
+		t.Errorf("cursor=%d offset=%d at the bottom, want 39/%d", m.cursors[m.tab], m.offsets[tabEscalations], 40-page)
 	}
 	view = m.View()
 	if !strings.Contains(view, "rationale-row-39") || strings.Contains(view, "more row(s)") {
@@ -315,29 +316,161 @@ func TestListWindowFollowsCursor(t *testing.T) {
 	}
 }
 
-func TestTabSwitchResetsCursorAndOffset(t *testing.T) {
+// TestTabSwitchRemembersCursorAndOffset pins CR-038: each tab remembers the row
+// you left it on, alongside the per-tab offset and search filter, so switching
+// away and back keeps your place.
+func TestTabSwitchRemembersCursorAndOffset(t *testing.T) {
 	m := listModel(t, 40, 12)
 	m.tab = tabAgents
 	for i := 0; i < 10; i++ {
 		m = press(t, m, "down")
 	}
-	if m.cursor == 0 || m.offsets[tabAgents] == 0 {
+	agentsCursor, agentsOffset := m.cursors[tabAgents], m.offsets[tabAgents]
+	if agentsCursor == 0 || agentsOffset == 0 {
 		t.Fatal("precondition: agents tab should be scrolled")
 	}
+
+	// An unvisited tab still starts at the top.
 	m = press(t, m, "tab")
-	if m.tab != tabEscalations || m.cursor != 0 || m.offsets[tabEscalations] != 0 {
-		t.Errorf("tab switch must reset cursor and the new tab's offset, got tab=%v cursor=%d offset=%d",
-			m.tab, m.cursor, m.offsets[tabEscalations])
+	if m.tab != tabTasks || m.cursors[m.tab] != 0 || m.offsets[tabTasks] != 0 {
+		t.Errorf("an unvisited tab should start at row 0, got tab=%v cursor=%d offset=%d",
+			m.tab, m.cursors[m.tab], m.offsets[tabTasks])
 	}
-	// Backwards too.
-	for i := 0; i < 10; i++ {
-		m = press(t, m, "down")
-	}
+
+	// Coming back restores the row AND the scroll position, not just the row:
+	// the offset used to be zeroed on arrival, which would pin the restored row
+	// to the bottom of the page.
 	upd, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
 	m = upd.(Model)
-	if m.tab != tabAgents || m.cursor != 0 || m.offsets[tabAgents] != 0 {
-		t.Errorf("shift+tab must reset cursor and the new tab's offset, got tab=%v cursor=%d offset=%d",
-			m.tab, m.cursor, m.offsets[tabAgents])
+	if m.tab != tabAgents || m.cursors[m.tab] != agentsCursor || m.offsets[tabAgents] != agentsOffset {
+		t.Errorf("returning to Agents should restore cursor=%d offset=%d, got tab=%v cursor=%d offset=%d",
+			agentsCursor, agentsOffset, m.tab, m.cursors[m.tab], m.offsets[tabAgents])
+	}
+	// The remembered row is the one actually highlighted, not just stored.
+	if !strings.Contains(m.View(), "agent-name-10") {
+		t.Errorf("the remembered row should be on screen after returning:\n%s", m.View())
+	}
+
+	// Each tab remembers its own row independently.
+	m = press(t, m, "tab") // Tasks
+	m = press(t, m, "tab") // Escalations
+	for i := 0; i < 3; i++ {
+		m = press(t, m, "down")
+	}
+	if m.cursors[tabEscalations] != 3 {
+		t.Fatalf("precondition: escalations cursor should be 3, got %d", m.cursors[tabEscalations])
+	}
+	m = press(t, m, "tab") // Audit
+	m = press(t, m, "shift+tab")
+	if m.tab != tabEscalations || m.cursors[m.tab] != 3 {
+		t.Errorf("Escalations should remember its own row 3, got tab=%v cursor=%d", m.tab, m.cursors[m.tab])
+	}
+	if m.cursors[tabAgents] != agentsCursor {
+		t.Errorf("Agents' remembered row should be untouched by other tabs, got %d want %d",
+			m.cursors[tabAgents], agentsCursor)
+	}
+}
+
+// TestTabSwitchFromDetailOverlayRemembersCursor covers the three switch sites
+// inside the detail overlay, which the list-key tests never reach: they must
+// close the overlay and drop search mode before arriving, and still remember the
+// row underneath. `h`/`l` are vim aliases onto the same paths.
+func TestTabSwitchFromDetailOverlayRemembersCursor(t *testing.T) {
+	for _, key := range []string{"tab", "right", "l"} {
+		t.Run(key, func(t *testing.T) {
+			m := listModel(t, 40, 12)
+			m.tab = tabAgents
+			for i := 0; i < 10; i++ {
+				m = press(t, m, "down")
+			}
+			want := m.cursors[tabAgents]
+			m = press(t, m, "v") // open an agent detail
+			if m.detail == nil {
+				t.Fatal("precondition: v should open a detail overlay")
+			}
+
+			m = press(t, m, key)
+			if m.detail != nil {
+				t.Errorf("%q from an overlay should close it", key)
+			}
+			if m.tab != tabTasks {
+				t.Fatalf("%q should land on Tasks, got %v", key, m.tab)
+			}
+			if m.searching {
+				t.Errorf("%q should leave search mode", key)
+			}
+
+			// And back: the row under the overlay is still remembered.
+			m = press(t, m, "shift+tab")
+			if m.tab != tabAgents || m.cursors[m.tab] != want {
+				t.Errorf("returning should restore cursor %d, got tab=%v cursor=%d",
+					want, m.tab, m.cursors[m.tab])
+			}
+		})
+	}
+}
+
+// TestTabSwitchClampsStaleRememberedCursor pins the arrival clamp: a background
+// tab's rows can vanish under its remembered cursor while the operator is
+// elsewhere, and nothing re-validates it until they come back.
+func TestTabSwitchClampsStaleRememberedCursor(t *testing.T) {
+	m := listModel(t, 40, 12)
+	m.tab = tabEscalations
+	for i := 0; i < 30; i++ {
+		m = press(t, m, "down")
+	}
+	if m.cursors[tabEscalations] != 30 {
+		t.Fatalf("precondition: escalations cursor should be 30, got %d", m.cursors[tabEscalations])
+	}
+
+	// Leave, then the poll delivers a much shorter list.
+	m = press(t, m, "tab") // Audit
+	shrunk := m.data
+	shrunk.escalations = shrunk.escalations[:2]
+	upd, _ := m.Update(shrunk)
+	m = upd.(Model)
+
+	// Coming back must clamp to the last surviving row, not dangle at 30.
+	m = press(t, m, "shift+tab")
+	if m.tab != tabEscalations {
+		t.Fatalf("expected to arrive on Escalations, got %v", m.tab)
+	}
+	if m.cursors[m.tab] != 1 {
+		t.Errorf("a stale remembered cursor should clamp to the last row (1), got %d", m.cursors[m.tab])
+	}
+	if start, end := m.window(m.rowCount()); m.cursors[m.tab] < start || m.cursors[m.tab] >= end {
+		t.Errorf("cursor %d outside the rendered window [%d,%d)", m.cursors[m.tab], start, end)
+	}
+	if m.selectedAudit() == nil {
+		t.Error("a clamped cursor should still select a real row")
+	}
+}
+
+// TestTabSwitchClampsStaleCursorOnConfig guards the non-list tabs: Config
+// renders unwindowed (no offset) but still tracks a cursor, which is why the
+// cursor clamp sits outside clampListViewport's list-only loop.
+func TestTabSwitchClampsStaleCursorOnConfig(t *testing.T) {
+	m := listModel(t, 40, 12)
+	m.tab = tabConfig
+	m.cursors[tabConfig] = len(m.items) - 1
+	if m.cursors[tabConfig] <= 0 {
+		t.Fatalf("precondition: config should have rows, got %d", len(m.items))
+	}
+	last := m.cursors[tabConfig]
+
+	m = press(t, m, "tab") // leave Config
+	// Config rows are rebuilt from cfg on refresh; shrink them underneath.
+	m.items = m.items[:2]
+	m = press(t, m, "shift+tab")
+	if m.tab != tabConfig {
+		t.Fatalf("expected to arrive back on Config, got %v", m.tab)
+	}
+	if m.cursors[m.tab] != 1 {
+		t.Errorf("a stale Config cursor (%d) should clamp to the last row (1), got %d",
+			last, m.cursors[m.tab])
+	}
+	if m.selectedRule() == nil {
+		t.Error("a clamped Config cursor should still select a real row")
 	}
 }
 
@@ -357,8 +490,8 @@ func TestResizeClampsListViewport(t *testing.T) {
 	if page := m.listPageSize(); m.offsets[tabEscalations] != 40-page {
 		t.Errorf("offset=%d after resize, want %d (rowCount-page)", m.offsets[tabEscalations], 40-page)
 	}
-	if m.cursor != 39 {
-		t.Errorf("resize must not move the cursor, got %d", m.cursor)
+	if m.cursors[m.tab] != 39 {
+		t.Errorf("resize must not move the cursor, got %d", m.cursors[m.tab])
 	}
 }
 
@@ -372,9 +505,9 @@ func TestRefreshClampsCursorToVisibleRows(t *testing.T) {
 	small := listModel(t, 3, 12)
 	upd, _ := m.Update(small.data)
 	m = upd.(Model)
-	if m.cursor != 2 || m.offsets[tabEscalations] != 0 {
+	if m.cursors[m.tab] != 2 || m.offsets[tabEscalations] != 0 {
 		t.Errorf("refresh should clamp cursor/offset to 3 rows, got cursor=%d offset=%d",
-			m.cursor, m.offsets[tabEscalations])
+			m.cursors[m.tab], m.offsets[tabEscalations])
 	}
 
 	// The refresh clamp operates on the FILTERED count (CR-008): with an
@@ -386,8 +519,8 @@ func TestRefreshClampsCursorToVisibleRows(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		m = press(t, m, "down")
 	}
-	if m.cursor != 9 {
-		t.Fatalf("precondition: cursor should sit on the last of 10 filtered rows, got %d", m.cursor)
+	if m.cursors[m.tab] != 9 {
+		t.Fatalf("precondition: cursor should sit on the last of 10 filtered rows, got %d", m.cursors[m.tab])
 	}
 	shrunk := listModel(t, 32, 12) // filtered rows left: 30, 31
 	upd, _ = m.Update(shrunk.data)
@@ -395,9 +528,9 @@ func TestRefreshClampsCursorToVisibleRows(t *testing.T) {
 	if got := len(m.visibleEscalations()); got != 2 {
 		t.Fatalf("filter should leave 2 rows after the refresh, got %d", got)
 	}
-	if m.cursor != 1 || m.offsets[tabEscalations] != 0 {
+	if m.cursors[m.tab] != 1 || m.offsets[tabEscalations] != 0 {
 		t.Errorf("refresh must clamp to the filtered count, got cursor=%d offset=%d",
-			m.cursor, m.offsets[tabEscalations])
+			m.cursors[m.tab], m.offsets[tabEscalations])
 	}
 }
 
@@ -410,13 +543,13 @@ func TestSpaceMarkKeepsCursorInWindow(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		m = press(t, m, " ")
 		off, page := m.offsets[tabEscalations], m.listPageSize()
-		if m.cursor < off || m.cursor >= off+page {
-			t.Fatalf("after %d marks cursor %d left the window [%d,%d)", i+1, m.cursor, off, off+page)
+		if m.cursors[m.tab] < off || m.cursors[m.tab] >= off+page {
+			t.Fatalf("after %d marks cursor %d left the window [%d,%d)", i+1, m.cursors[m.tab], off, off+page)
 		}
 	}
-	if m.cursor != 10 || len(m.marked) != 10 {
+	if m.cursors[m.tab] != 10 || len(m.marked) != 10 {
 		t.Errorf("10 spaces should mark 10 rows and advance to row 10, got cursor=%d marked=%d",
-			m.cursor, len(m.marked))
+			m.cursors[m.tab], len(m.marked))
 	}
 }
 
@@ -561,27 +694,125 @@ func TestAgentsListRendersStatColumns(t *testing.T) {
 	m.now = now // pin the Age clock
 
 	view := m.View()
-	// Header labels for all five new columns.
-	for _, want := range []string{"NAME", "STATUS", "AUTO", "ESC", "CONF", "CORR", "AGE"} {
-		if !strings.Contains(view, want) {
-			t.Errorf("agents list missing header %q:\n%s", want, view)
-		}
-	}
-	// The agent's row carries its counts and the live age.
-	var row string
+	var header, row string
 	for _, ln := range strings.Split(view, "\n") {
-		if strings.Contains(ln, "alpha") {
+		switch {
+		case header == "" && strings.Contains(ln, "NAME"):
+			header = ln
+		case strings.Contains(ln, "alpha"):
 			row = ln
-			break
 		}
 	}
-	if row == "" {
-		t.Fatalf("agent row not rendered:\n%s", view)
+	if header == "" || row == "" {
+		t.Fatalf("agents header/row not rendered:\n%s", view)
 	}
-	for _, want := range []string{"12", "5", "3", "2", "01:30:00"} {
-		if !strings.Contains(row, want) {
-			t.Errorf("agent row missing %q: %q", want, row)
+	// Column ORDER, not just presence: TASK sits after STATUS, and the
+	// lifetime counters run ESCA → AUTO → CONF → CORR.
+	wantHeaders := []string{"NAME", "LOCATION", "TYPE", "STATUS", "TASK", "ESCA", "AUTO", "CONF", "CORR", "AGE"}
+	if got := strings.Fields(header); !slices.Equal(got, wantHeaders) {
+		t.Errorf("agents header columns = %v, want %v", got, wantHeaders)
+	}
+	// The row's values line up under those headers. LOCATION is "-" (no
+	// workspace/tab metadata in this fixture) and so is TASK (no task source
+	// configured); escalations (5) precede auto-sends (12), which a
+	// containment check would happily miss.
+	wantRow := []string{"alpha", "-", "claude", "running", "-", "5", "12", "3", "2", "01:30:00"}
+	if got := strings.Fields(row); !slices.Equal(got, wantRow) {
+		t.Errorf("agent row = %v, want %v", got, wantRow)
+	}
+}
+
+func TestAgentsListRowsFitContentWidth(t *testing.T) {
+	// The Agents row is the widest list row (it grew with the TASK column). A
+	// row that wraps silently becomes two screen lines, breaking the
+	// one-row-one-line accounting window()/listPageSize() depend on — so both
+	// the header and every row stay inside contentWidth.
+	m := Model{height: 30}
+	upd, _ := m.Update(refreshMsg{
+		cfg: config.Default(),
+		status: frontend.Status{
+			AgentNames: map[string]string{"w1:p1": "an-agent-with-a-very-long-name"},
+			MonitoredAgents: []domain.AgentTransition{
+				{AgentID: "w1:p1", AgentType: "claude", PaneID: "w1:p1", Status: "running",
+					WorkspaceID: "w1", TabID: "w1:t1"},
+			},
+			Workspaces: map[string]domain.WorkspaceInfo{
+				"w1": {ID: "w1", Label: "a-long-workspace-label", Number: 1},
+			},
+			AgentStats: map[string]domain.AgentStats{
+				"w1:p1": {AutoSends: 123456, Escalations: 123456, FirstSeen: time.Now().Add(-time.Hour)},
+			},
+		},
+	})
+	m = upd.(Model)
+	m.tab = tabAgents
+	for _, w := range []int{60, 80, 92, 120} {
+		m.width = w
+		for _, ln := range strings.Split(m.View(), "\n") {
+			// Only the list rows are clamped; the title/tabs/help line are not.
+			if !strings.Contains(ln, "NAME") && !strings.Contains(ln, "an-agent") {
+				continue
+			}
+			if got := runewidth.StringWidth(ln); got > m.contentWidth() {
+				t.Errorf("width=%d: agents row is %d cells wide, over contentWidth %d — it will wrap: %q",
+					w, got, m.contentWidth(), ln)
+			}
 		}
+	}
+}
+
+// TestAgentsListPreservesHerdrOrder pins down that the Agents tab never
+// reorders MonitoredAgents: that slice already arrives in herdr's own
+// `agent list` order (internal/herdr/cli.go's ListAgents passes the JSON
+// array through untouched, and frontend.App.GetStatus only filters
+// placeholders, never resorts), so the display layer's job is simply to not
+// break that — no workspace/tab/pane comparator belongs here, since
+// AgentTransition carries no intra-tab pane ordinal to reconstruct one
+// correctly.
+func TestAgentsListPreservesHerdrOrder(t *testing.T) {
+	m := Model{width: 120, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	// Deliberately NOT alphabetical/numeric — a naive incidental sort
+	// (by AgentID, PaneID, or AgentType) would visibly reorder this set,
+	// while preserving herdr's arrival order would not.
+	msg.status.AgentNames = map[string]string{
+		"w2:pA": "happy-seal", "w2:pC": "cosmic-yak",
+		"w3:p9": "eager-falcon", "w3:pB": "patient-lemur",
+	}
+	msg.status.MonitoredAgents = []domain.AgentTransition{
+		{AgentID: "w2:pA", PaneID: "w2:pA", AgentType: "codex", Status: "idle"},
+		{AgentID: "w2:pC", PaneID: "w2:pC", AgentType: "codex", Status: "idle"},
+		{AgentID: "w3:p9", PaneID: "w3:p9", AgentType: "claude", Status: "working"},
+		{AgentID: "w3:pB", PaneID: "w3:pB", AgentType: "claude", Status: "idle"},
+	}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+
+	got := m.visibleAgents()
+	want := []string{"w2:pA", "w2:pC", "w3:p9", "w3:pB"}
+	if len(got) != len(want) {
+		t.Fatalf("visibleAgents() returned %d rows, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i].AgentID != w {
+			t.Fatalf("visibleAgents()[%d] = %q, want %q (order must match herdr's agent list): %+v",
+				i, got[i].AgentID, w, got)
+		}
+	}
+
+	// The rendered view must show the same order, not just the slice.
+	m.tab = tabAgents
+	view := m.View()
+	lastIdx := -1
+	for i, name := range []string{"happy-seal", "cosmic-yak", "eager-falcon", "patient-lemur"} {
+		idx := strings.Index(view, name)
+		if idx == -1 {
+			t.Fatalf("agent %q not rendered:\n%s", name, view)
+		}
+		if idx <= lastIdx {
+			t.Fatalf("agent %q (row %d) rendered out of herdr order:\n%s", name, i, view)
+		}
+		lastIdx = idx
 	}
 }
 
@@ -600,7 +831,7 @@ func TestAgentDetailAgeTicksWithClock(t *testing.T) {
 	upd, _ := m.Update(msg)
 	m = upd.(Model)
 	m.tab = tabAgents
-	m.cursor = 0
+	m.cursors[m.tab] = 0
 	m.now = open
 
 	m = press(t, m, "v")
@@ -713,15 +944,15 @@ func TestQueryEditClampsCursorAndOffset(t *testing.T) {
 	if n := len(m.visibleEscalations()); n != 10 {
 		t.Fatalf("filter should match 10 rows, got %d", n)
 	}
-	if m.cursor >= 10 {
-		t.Errorf("cursor=%d must clamp to the filtered count", m.cursor)
+	if m.cursors[m.tab] >= 10 {
+		t.Errorf("cursor=%d must clamp to the filtered count", m.cursors[m.tab])
 	}
 	page := m.listPageSize()
 	if off := m.offsets[tabEscalations]; off > 10-page {
 		t.Errorf("offset=%d must clamp to rowCount-page (%d)", off, 10-page)
 	}
-	if off := m.offsets[tabEscalations]; m.cursor < off || m.cursor >= off+page {
-		t.Errorf("cursor %d must stay inside the window [%d,%d)", m.cursor, off, off+page)
+	if off := m.offsets[tabEscalations]; m.cursors[m.tab] < off || m.cursors[m.tab] >= off+page {
+		t.Errorf("cursor %d must stay inside the window [%d,%d)", m.cursors[m.tab], off, off+page)
 	}
 }
 
@@ -757,8 +988,8 @@ func TestFilteredSelectionConfirms(t *testing.T) {
 	if got := m.visibleEscalations(); len(got) != 1 || got[0].ID != idA {
 		t.Fatalf("filter should leave only escalation A, got %+v", got)
 	}
-	if m.cursor != 0 {
-		t.Fatalf("cursor should be 0, got %d", m.cursor)
+	if m.cursors[m.tab] != 0 {
+		t.Fatalf("cursor should be 0, got %d", m.cursors[m.tab])
 	}
 
 	upd, cmd := m.Update(pressKeyMsg("enter"))
@@ -950,7 +1181,7 @@ func TestConfigReadOnlyRowsRefuseEditAndRemove(t *testing.T) {
 		for _, key := range keys {
 			t.Run(kind+"/"+key, func(t *testing.T) {
 				m := configModel(t, cfg)
-				m.cursor = itemIndex(t, m, func(it ruleItem) bool { return it.kind == kind })
+				m.cursors[m.tab] = itemIndex(t, m, func(it ruleItem) bool { return it.kind == kind })
 				upd, cmd := m.Update(pressKeyMsg(key))
 				m = upd.(Model)
 				if cmd != nil {
@@ -973,7 +1204,7 @@ func TestConfigTUIReadOnlyFieldsNoPrompt(t *testing.T) {
 		for _, k := range []string{"enter", "e"} {
 			t.Run(key+"/"+k, func(t *testing.T) {
 				m := configModel(t, config.Default())
-				m.cursor = itemIndex(t, m, func(it ruleItem) bool { return it.kind == "field" && it.key == key })
+				m.cursors[m.tab] = itemIndex(t, m, func(it ruleItem) bool { return it.kind == "field" && it.key == key })
 				upd, cmd := m.Update(pressKeyMsg(k))
 				m = upd.(Model)
 				if cmd != nil || m.prompt != nil {
@@ -988,7 +1219,7 @@ func TestConfigTUIReadOnlyFieldsNoPrompt(t *testing.T) {
 	}
 	// An editable field still opens the prompt.
 	m := configModel(t, config.Default())
-	m.cursor = itemIndex(t, m, func(it ruleItem) bool { return it.kind == "field" && it.key == "llm.timeout_seconds" })
+	m.cursors[m.tab] = itemIndex(t, m, func(it ruleItem) bool { return it.kind == "field" && it.key == "llm.timeout_seconds" })
 	m = press(t, m, "enter")
 	if m.prompt == nil || !strings.Contains(m.prompt.label, "set llm.timeout_seconds") {
 		t.Errorf("editable field should open the edit prompt, got %+v", m.prompt)
@@ -1044,8 +1275,8 @@ func TestNonListTabsIgnoreSearch(t *testing.T) {
 	// Config navigation still walks its unfiltered rows.
 	m := configModel(t, config.Default())
 	m = press(t, m, "down", "down")
-	if m.cursor != 2 {
-		t.Errorf("Config cursor navigation should be unchanged, got %d", m.cursor)
+	if m.cursors[m.tab] != 2 {
+		t.Errorf("Config cursor navigation should be unchanged, got %d", m.cursors[m.tab])
 	}
 }
 

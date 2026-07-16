@@ -123,7 +123,7 @@ sequenceDiagram
             D->>H: notification show (escalation)
             D->>O: surface in TUI
         end
-    else low confidence / unclassifiable / never-auto / rate / retry-exhausted / killed
+    else low confidence / unclassifiable / never-auto / rate / retry-exhausted / daemon-paused
         D->>S: audit (escalated)
         D->>H: notification show (escalation)
         D->>O: surface in TUI
@@ -376,7 +376,7 @@ This section makes the coordination model explicit so the single-writer question
 
 ### Error Codes / semantics
 
-Every rejected/failed path resolves to **escalate + audit**, never silent drop: `unclassifiable`, `below_threshold`, `variance_guard`, `over_masked`, `never_auto_match` (formerly `allowlist_match`), `suspected_irreversible`, `rate_limited`, `retry_exhausted`, `killed`, `llm_timeout`, `llm_no_submit`, `herdr_unreachable`, `persistence_failed`.
+Every rejected/failed path resolves to **escalate + audit**, never silent drop: `unclassifiable`, `below_threshold`, `variance_guard`, `over_masked`, `never_auto_match` (formerly `allowlist_match`), `suspected_irreversible`, `rate_limited`, `retry_exhausted`, `daemon_paused` (formerly `killed`), `llm_timeout`, `llm_no_submit`, `herdr_unreachable`, `persistence_failed`.
 
 ## Security Architecture
 

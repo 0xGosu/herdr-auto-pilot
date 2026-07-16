@@ -432,8 +432,8 @@ func TestKillSwitchBlocksSweep(t *testing.T) {
 		return len(esc) == 1
 	})
 	esc, _ := h.raw.PendingEscalations(ctx)
-	if !strings.Contains(esc[0].Rationale, "kill") {
-		t.Errorf("escalation should carry the kill reason: %+v", esc[0])
+	if !strings.Contains(esc[0].Rationale, "[daemon_paused]") {
+		t.Errorf("escalation should carry the paused reason: %+v", esc[0])
 	}
 	if keys := h.herdr.keysSent(); len(keys) != 0 {
 		t.Errorf("kill switch must block sweep keystrokes, sent %v", keys)

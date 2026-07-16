@@ -230,6 +230,26 @@ type TaskSource struct {
 	// escalated to the operator. nil (unset) defaults to on; set
 	// llm_review=false to opt out and keep the plain declared-task flow.
 	LLMReview *bool `toml:"llm_review,omitempty"`
+	// MaxTasks caps how many checklist items (done, in-progress, and pending
+	// alike) this source may hold before LLM task generation stops refilling
+	// it: once the file has more than MaxTasks items and its pending items are
+	// exhausted, the daemon logs a warning and skips generation instead of
+	// piling more onto an already-long list — the operator prunes it to make
+	// room. 0 (unset) uses DefaultMaxTasks; see MaxTasksLimit.
+	MaxTasks int `toml:"max_tasks,omitempty"`
+}
+
+// DefaultMaxTasks is the fallback for TaskSource.MaxTasks when unset (0).
+const DefaultMaxTasks = 20
+
+// MaxTasksLimit returns the source's task cap, substituting DefaultMaxTasks
+// when unset. Resolved dynamically (like GenerateTaskTimeout) rather than via
+// fillZeroes, which does not walk the TaskSources slice.
+func (s TaskSource) MaxTasksLimit() int {
+	if s.MaxTasks <= 0 {
+		return DefaultMaxTasks
+	}
+	return s.MaxTasks
 }
 
 // ClassifierRule is one manifest rule classifying pane content (FR-002).
@@ -267,6 +287,12 @@ type TUI struct {
 	// Palette overrides individual color roles on top of the selected
 	// theme; unset roles inherit the theme's value.
 	Palette PaletteOverrides `toml:"palette,omitempty"`
+	// TerminalBell rings the terminal bell (ASCII BEL, \a) on two events
+	// while the TUI is running: (1) any new escalation appearing since the
+	// last poll, and (2) the global pause/kill switch becoming active
+	// because of a DIFFERENT process (another TUI instance, or `hap
+	// pause`) — not when this instance's own operator pressed "p".
+	TerminalBell bool `toml:"terminal_bell"`
 }
 
 // PaletteOverrides are optional per-role color overrides for the TUI
@@ -333,6 +359,7 @@ func Default() Config {
 			SimilarityThreshold: 0.90,
 			BM25MinScore:        0.35,
 		},
+		TUI: TUI{TerminalBell: true},
 	}
 }
 

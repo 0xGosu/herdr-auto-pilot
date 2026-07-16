@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +79,8 @@ func pressKeyMsg(k string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	case "tab":
 		return tea.KeyMsg{Type: tea.KeyTab}
+	case "ctrl+j":
+		return tea.KeyMsg{Type: tea.KeyCtrlJ}
 	case "down":
 		return tea.KeyMsg{Type: tea.KeyDown}
 	case "up":
@@ -112,6 +115,15 @@ func TestDetailViewAgents(t *testing.T) {
 			t.Errorf("agent detail view missing %q:\n%s", want, view)
 		}
 	}
+	// The counters read in the same order as the Agents list columns
+	// (ESCA → AUTO → CONF → CORR), so the two surfaces agree.
+	esc, auto := strings.Index(view, "Escalations"), strings.Index(view, "Auto-sends")
+	if esc < 0 || auto < 0 {
+		t.Fatalf("detail view should show both counters, got Escalations=%d Auto-sends=%d:\n%s", esc, auto, view)
+	}
+	if esc > auto {
+		t.Errorf("detail view should list Escalations before Auto-sends, matching the list columns:\n%s", view)
+	}
 }
 
 func TestDetailViewAgentWithoutMatchingTaskSourceShowsNA(t *testing.T) {
@@ -121,6 +133,684 @@ func TestDetailViewAgentWithoutMatchingTaskSourceShowsNA(t *testing.T) {
 	view := m.View()
 	if !strings.Contains(view, "Task source") || !strings.Contains(view, "N/A") {
 		t.Errorf("agent detail should show N/A without a matching task source:\n%s", view)
+	}
+}
+
+// agentTaskSourceDetailModel seeds the given task sources and their loaded
+// task lists, then opens the Agents detail view for the single monitored
+// agent ("w6:p1", type "claude", named "brave-otter") — the fixture behind
+// the detail view's "t: see tasks" jump.
+func agentTaskSourceDetailModel(t *testing.T, sources []config.TaskSource, groups []frontend.TaskGroup) Model {
+	t.Helper()
+	m := testModel(t)
+	m.data.cfg.TaskSources = sources
+	m.data.tasks = groups
+	m.tab = tabAgents
+	m.cursors[m.tab] = 0
+	m = press(t, m, "v")
+	if m.detail == nil || m.detail.agent == nil {
+		t.Fatal("v on Agents tab should open an agent detail view")
+	}
+	return m
+}
+
+// taskGroupsFor builds one loaded, single-item task group per source, so each
+// gets a header row on the Tasks tab.
+func taskGroupsFor(sources []config.TaskSource) []frontend.TaskGroup {
+	groups := make([]frontend.TaskGroup, len(sources))
+	for i, src := range sources {
+		groups[i] = frontend.TaskGroup{Source: src, Index: i, Items: []domain.ChecklistItem{
+			{Index: 1, Mark: " ", Text: "task in " + src.Path},
+		}}
+	}
+	return groups
+}
+
+func TestSeeAgentTasksSelectsTheAgentsSource(t *testing.T) {
+	// The matching entry sits at index 1, behind an unrelated one at index 0
+	// — pins that the jump lands on the agent's own source, not on row 0.
+	sources := []config.TaskSource{
+		{Agent: "somebody-else", Path: "/other.md"},
+		{Agent: "brave-otter", Path: "/work/tasks.md"},
+	}
+	m := agentTaskSourceDetailModel(t, sources, taskGroupsFor(sources))
+	upd, cmd := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("t on an agent detail must not run any mutation — it only navigates")
+	}
+	if m.tab != tabTasks {
+		t.Errorf("t should switch to the Tasks tab, got %v", m.tab)
+	}
+	if m.detail != nil {
+		t.Error("the detail overlay should close on the jump to Tasks")
+	}
+	rows := m.visibleTaskRows()
+	if m.cursors[m.tab] >= len(rows) {
+		t.Fatalf("cursor %d out of range (%d rows)", m.cursors[m.tab], len(rows))
+	}
+	if r := rows[m.cursors[m.tab]]; !r.header || r.group != 1 {
+		t.Errorf("cursor should sit on the header row of task source #1, got %+v", r)
+	}
+	if !strings.Contains(m.View(), "/work/tasks.md") {
+		t.Errorf("the selected source should be visible on the Tasks tab:\n%s", m.View())
+	}
+}
+
+func TestSeeAgentTasksClearsAFilterHidingTheSource(t *testing.T) {
+	sources := []config.TaskSource{
+		{Agent: "somebody-else", Path: "/other.md"},
+		{Agent: "brave-otter", Path: "/work/tasks.md"},
+	}
+	m := agentTaskSourceDetailModel(t, sources, taskGroupsFor(sources))
+	// A stale Tasks filter that matches only the unrelated source would hide
+	// the jump target; landing beats keeping the filter.
+	m.query[tabTasks] = "/other.md"
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.query[tabTasks] != "" {
+		t.Errorf("a filter hiding the target source should be cleared, got %q", m.query[tabTasks])
+	}
+	rows := m.visibleTaskRows()
+	if m.cursors[m.tab] >= len(rows) || rows[m.cursors[m.tab]].group != 1 || !rows[m.cursors[m.tab]].header {
+		t.Errorf("cursor should sit on task source #1's header after the filter clears, got %+v (cursor %d)",
+			rows, m.cursors[m.tab])
+	}
+}
+
+func TestSeeAgentTasksKeepsAFilterThatShowsTheSource(t *testing.T) {
+	sources := []config.TaskSource{
+		{Agent: "somebody-else", Path: "/other.md"},
+		{Agent: "brave-otter", Path: "/work/tasks.md"},
+	}
+	m := agentTaskSourceDetailModel(t, sources, taskGroupsFor(sources))
+	m.query[tabTasks] = "/work/tasks.md"
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.query[tabTasks] != "/work/tasks.md" {
+		t.Errorf("a filter that still shows the target must be left alone, got %q", m.query[tabTasks])
+	}
+	rows := m.visibleTaskRows()
+	if m.cursors[m.tab] >= len(rows) || rows[m.cursors[m.tab]].group != 1 {
+		t.Errorf("cursor should sit on task source #1's header, got cursor %d of %d rows", m.cursors[m.tab], len(rows))
+	}
+}
+
+func TestSeeAgentTasksNoMatchIsNoop(t *testing.T) {
+	sources := []config.TaskSource{{Agent: "somebody-else", Path: "/work/tasks.md"}}
+	m := agentTaskSourceDetailModel(t, sources, taskGroupsFor(sources))
+	upd, cmd := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("t with no matching task source must not run a command")
+	}
+	if m.tab != tabAgents {
+		t.Errorf("t with no matching task source should stay on the Agents tab, got %v", m.tab)
+	}
+	if m.detail == nil {
+		t.Fatal("the detail overlay should remain open")
+	}
+	if !strings.Contains(m.View(), "no task source configured") {
+		t.Errorf("the no-match hint must actually render in the overlay, got:\n%s", m.View())
+	}
+}
+
+func TestSeeAgentTasksMultipleMatchesShowsTheFirst(t *testing.T) {
+	sources := []config.TaskSource{
+		{Agent: "brave-otter", Path: "/work/a.md"},
+		{Agent: "claude", Path: "/work/b.md"}, // matches by AgentType too
+	}
+	m := agentTaskSourceDetailModel(t, sources, taskGroupsFor(sources))
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.tab != tabTasks {
+		t.Fatalf("t should switch to the Tasks tab, got %v", m.tab)
+	}
+	rows := m.visibleTaskRows()
+	if m.cursors[m.tab] >= len(rows) || rows[m.cursors[m.tab]].group != 0 {
+		t.Errorf("an ambiguous match should select the first source, got cursor %d of %d rows", m.cursors[m.tab], len(rows))
+	}
+	// The banner names what was skipped, so the pick isn't silently arbitrary.
+	if !strings.Contains(m.message, "matches 2 task sources") || !strings.Contains(m.message, "/work/b.md") {
+		t.Errorf("expected a banner naming the other source, got %q", m.message)
+	}
+	// "showing the first" appears only in the banner — /work/b.md alone would
+	// also match group 1's header row, passing even if the banner vanished.
+	if !strings.Contains(m.View(), "showing the first") {
+		t.Errorf("the banner must actually render on the Tasks tab, got:\n%s", m.View())
+	}
+}
+
+func TestSeeAgentTasksSourceNotLoadedYet(t *testing.T) {
+	// cfg lists the source but the task poll hasn't reported it yet: switch
+	// anyway and say why, rather than land on an unrelated source's row.
+	m := agentTaskSourceDetailModel(t, []config.TaskSource{{Agent: "brave-otter", Path: "/work/tasks.md"}}, nil)
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.tab != tabTasks {
+		t.Errorf("t should still switch to the Tasks tab, got %v", m.tab)
+	}
+	if m.cursors[m.tab] != 0 {
+		t.Errorf("cursor should stay at 0 when the source has no rows, got %d", m.cursors[m.tab])
+	}
+	if !strings.Contains(m.message, "isn't loaded yet") || !strings.Contains(m.message, "/work/tasks.md") {
+		t.Errorf("expected a not-loaded-yet hint naming the source, got %q", m.message)
+	}
+	if !strings.Contains(m.View(), "isn't loaded yet") {
+		t.Errorf("the not-loaded-yet hint must actually render, got:\n%s", m.View())
+	}
+}
+
+// ruleJumpModel puts three escalations (and the same three as audit rows) on
+// the model: one whose rule exists, one with no signature at all, and one whose
+// signature has no learned rule. The target rule sits at index 1 of two, so a
+// jump that ignored the signature and landed on row 0 would be caught.
+func ruleJumpModel(t *testing.T) Model {
+	t.Helper()
+	const wanted = "approval:1234abcd5678efab"
+	recs := []domain.AuditRecord{
+		{ID: 41, AgentID: "w6:p1", AgentType: "claude", SituationType: domain.SituationApproval,
+			Status: "escalated", Signature: wanted, Rationale: "has-a-rule",
+			CreatedAt: time.Date(2026, 7, 9, 11, 0, 0, 0, time.UTC)},
+		{ID: 42, AgentID: "w6:p1", AgentType: "claude", SituationType: domain.SituationUnclassifiable,
+			Status: "escalated", Signature: "", Rationale: "over-masked",
+			CreatedAt: time.Date(2026, 7, 9, 11, 1, 0, 0, time.UTC)},
+		{ID: 43, AgentID: "w6:p1", AgentType: "claude", SituationType: domain.SituationApproval,
+			Status: "escalated", Signature: "approval:notlearnedyet00", Rationale: "no-rule-yet",
+			CreatedAt: time.Date(2026, 7, 9, 11, 2, 0, 0, time.UTC)},
+		// A second record on the same rule, parked at a non-zero row so a test
+		// can prove the jump leaves the departing tab's remembered row alone
+		// (row 0 would be indistinguishable from the zero value).
+		{ID: 44, AgentID: "w6:p1", AgentType: "claude", SituationType: domain.SituationApproval,
+			Status: "escalated", Signature: wanted, Rationale: "has-a-rule-too",
+			CreatedAt: time.Date(2026, 7, 9, 11, 3, 0, 0, time.UTC)},
+	}
+	m := Model{width: 140, height: 30}
+	upd, _ := m.Update(refreshMsg{
+		cfg:         config.Default(),
+		escalations: recs,
+		audit:       recs,
+		status: frontend.Status{
+			MonitoredAgents: []domain.AgentTransition{
+				{AgentID: "w6:p1", AgentType: "claude", PaneID: "w6:p1", Status: "blocked"},
+			},
+			AgentNames: map[string]string{"w6:p1": "brave-otter"},
+		},
+		signatures: []frontend.SignatureRow{
+			{SignatureState: domain.SignatureState{
+				Signature: "choice:ffff0000eeee1111", SituationType: domain.SituationChoice,
+				AgentType: "codex", Mode: domain.ModeAutonomous}, TopAction: "2"},
+			{SignatureState: domain.SignatureState{
+				Signature: wanted, SituationType: domain.SituationApproval,
+				AgentType: "claude", Mode: domain.ModeShadow}, TopAction: "1"},
+		},
+	})
+	m = upd.(Model)
+	m.tab = tabEscalations
+	m.cursors[tabEscalations] = 0
+	return m
+}
+
+func TestSeeRuleFromEscalationsList(t *testing.T) {
+	m := ruleJumpModel(t)
+	if !strings.Contains(m.helpLine(), "t: see rule") {
+		t.Errorf("the Escalations help should advertise t, got %q", m.helpLine())
+	}
+	upd, cmd := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("t must not run any mutation — it only navigates")
+	}
+	if m.tab != tabSignatures {
+		t.Fatalf("t should switch to the Rules tab, got %v", m.tab)
+	}
+	sigs := m.visibleSignatures()
+	if m.cursors[m.tab] >= len(sigs) {
+		t.Fatalf("cursor %d out of range (%d rules)", m.cursors[m.tab], len(sigs))
+	}
+	if got := sigs[m.cursors[m.tab]].Signature; got != "approval:1234abcd5678efab" {
+		t.Errorf("cursor should sit on the escalation's own rule, got %q", got)
+	}
+}
+
+// TestSeeRuleLeavesDepartingTabMemory pins the seam between the two features: a
+// jump writes only the DESTINATION tab's row. An implementation that also wrote
+// the departing tab's slot would pass every other see-rule test while quietly
+// losing the operator's place on Escalations.
+func TestSeeRuleLeavesDepartingTabMemory(t *testing.T) {
+	m := ruleJumpModel(t)
+	m.cursors[tabEscalations] = 3 // the second record keyed to the same rule
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.tab != tabSignatures {
+		t.Fatalf("t should switch to the Rules tab, got %v", m.tab)
+	}
+	if m.cursors[tabSignatures] != 1 {
+		t.Fatalf("precondition: the rule sits at Rules row 1, got %d", m.cursors[tabSignatures])
+	}
+	if m.cursors[tabEscalations] != 3 {
+		t.Errorf("the jump should leave Escalations' remembered row (3) alone, got %d",
+			m.cursors[tabEscalations])
+	}
+	// And it survives the round trip back.
+	m = press(t, m, "shift+tab") // Audit
+	m = press(t, m, "shift+tab") // Escalations
+	if m.tab != tabEscalations || m.cursors[m.tab] != 3 {
+		t.Errorf("returning to Escalations should restore row 3, got tab=%v cursor=%d", m.tab, m.cursors[m.tab])
+	}
+}
+
+func TestSeeRuleFromAuditList(t *testing.T) {
+	// Audit rows carry the same signature, so t works there identically.
+	m := ruleJumpModel(t)
+	m.tab = tabAudit
+	m.cursors[tabAudit] = 0
+	if !strings.Contains(m.helpLine(), "t: see rule") {
+		t.Errorf("the Audit help should advertise t, got %q", m.helpLine())
+	}
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.tab != tabSignatures {
+		t.Fatalf("t on Audit should switch to the Rules tab, got %v", m.tab)
+	}
+	if got := m.visibleSignatures()[m.cursors[m.tab]].Signature; got != "approval:1234abcd5678efab" {
+		t.Errorf("cursor should sit on the audited record's rule, got %q", got)
+	}
+}
+
+// Both overlay kinds are rule-bearing. Table-driven so the audit detail can't
+// silently drift from the escalation one: only an escalation carries a
+// confirmID, so help derived from that would leave `t` working-but-unadvertised
+// on the Audit tab.
+func TestSeeRuleFromDetailOverlay(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tab  tab
+	}{
+		{"escalation", tabEscalations},
+		{"audit", tabAudit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := ruleJumpModel(t)
+			m.tab = tc.tab
+			m.cursors[tc.tab] = 0
+			m = press(t, m, "v")
+			if m.detail == nil || !m.detail.ruleDetail {
+				t.Fatalf("v on a %s should open a rule-bearing detail", tc.name)
+			}
+			if !strings.Contains(m.helpLine(), "t: see rule") {
+				t.Errorf("the %s detail help should advertise t, got %q", tc.name, m.helpLine())
+			}
+			upd, _ := m.Update(pressKeyMsg("t"))
+			m = upd.(Model)
+			if m.detail != nil {
+				t.Error("the overlay should close on the jump")
+			}
+			if m.tab != tabSignatures {
+				t.Fatalf("t should switch to the Rules tab, got %v", m.tab)
+			}
+			if got := m.visibleSignatures()[m.cursors[m.tab]].Signature; got != "approval:1234abcd5678efab" {
+				t.Errorf("cursor should sit on the rule, got %q", got)
+			}
+		})
+	}
+}
+
+func TestSeeRuleClearsBothRulesFilters(t *testing.T) {
+	// The Rules tab composes a search query AND the f mode filter; either can
+	// bury the target, and both must give way so the jump lands.
+	m := ruleJumpModel(t)
+	m.query[tabSignatures] = "choice" // matches only the OTHER rule
+	m.sigMode = domain.ModeAutonomous // the target is shadow
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.query[tabSignatures] != "" || m.sigMode != "" {
+		t.Errorf("both filters should be cleared, got query=%q sigMode=%q", m.query[tabSignatures], m.sigMode)
+	}
+	if got := m.visibleSignatures()[m.cursors[m.tab]].Signature; got != "approval:1234abcd5678efab" {
+		t.Errorf("cursor should sit on the rule once the filters clear, got %q", got)
+	}
+}
+
+func TestSeeRuleKeepsFiltersThatShowTheRule(t *testing.T) {
+	m := ruleJumpModel(t)
+	m.query[tabSignatures] = "approval" // already shows the target
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.query[tabSignatures] != "approval" {
+		t.Errorf("a filter that still shows the target must be left alone, got %q", m.query[tabSignatures])
+	}
+	if got := m.visibleSignatures()[m.cursors[m.tab]].Signature; got != "approval:1234abcd5678efab" {
+		t.Errorf("cursor should sit on the rule, got %q", got)
+	}
+}
+
+func TestSeeRuleNoSignatureAndNoRuleYetDiffer(t *testing.T) {
+	// Two different truths: an over-masked record can NEVER have a rule, while
+	// a signature with no rule just hasn't been confirmed yet.
+	for _, tc := range []struct {
+		name, want string
+		cursor     int
+	}{
+		{"over-masked", "no signature on this record", 1},
+		{"not learned yet", "no rule learned for", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := ruleJumpModel(t)
+			m.cursors[tabEscalations] = tc.cursor
+			upd, cmd := m.Update(pressKeyMsg("t"))
+			m = upd.(Model)
+			if cmd != nil {
+				t.Fatal("a refused jump must not run a command")
+			}
+			if m.tab != tabEscalations {
+				t.Errorf("a refused jump should stay on Escalations, got %v", m.tab)
+			}
+			if !strings.Contains(m.View(), tc.want) {
+				t.Errorf("expected %q to render, got:\n%s", tc.want, m.View())
+			}
+		})
+	}
+}
+
+func TestSeeRuleFromDetailOfRecordWithNoSignature(t *testing.T) {
+	// The detail of an over-masked record must explain itself exactly like the
+	// list does. Gating the binding on a non-empty signature (rather than on
+	// the ruleDetail marker) would make this key silently do nothing.
+	m := ruleJumpModel(t)
+	m.cursors[tabEscalations] = 1 // the record with no signature
+	m = press(t, m, "v")
+	if m.detail == nil || !m.detail.ruleDetail || m.detail.ruleSignature != "" {
+		t.Fatalf("precondition: expected a rule-bearing detail with an empty signature, got %+v", m.detail)
+	}
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.tab != tabEscalations {
+		t.Errorf("a refused jump should not navigate, got %v", m.tab)
+	}
+	if !strings.Contains(m.View(), "no signature on this record") {
+		t.Errorf("the overlay should say why it can't jump, got:\n%s", m.View())
+	}
+}
+
+func TestSeeRuleIgnoredOnUnrelatedDetail(t *testing.T) {
+	// A signature detail also leaves detail.agent nil — t must not fire the
+	// "no rule" path there.
+	m := ruleJumpModel(t)
+	m.detail = &detailView{title: "Signature approval:x", lines: []string{"unrelated overlay"}}
+	upd, cmd := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("t on an unrelated overlay must not run a command")
+	}
+	if m.detail == nil {
+		t.Error("t on an unrelated overlay should leave it open")
+	}
+	if m.tab != tabEscalations {
+		t.Errorf("t on an unrelated overlay must not navigate, got %v", m.tab)
+	}
+	if m.message != "" {
+		t.Errorf("t on an unrelated overlay should say nothing, got %q", m.message)
+	}
+}
+
+func TestAgentsListTaskColumn(t *testing.T) {
+	// "<total> (<pending>)" for the agent's own source; agents with no source
+	// read "-", and an unreadable source must not render a truthful-looking
+	// "0 (0)".
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{
+		{Agent: "brave-otter", Path: "/work/tasks.md"},
+		{Agent: "swift-hawk", Path: "/work/broken.md"},
+	}
+	m := Model{width: 120, height: 30}
+	upd, _ := m.Update(refreshMsg{
+		cfg: cfg,
+		status: frontend.Status{
+			MonitoredAgents: []domain.AgentTransition{
+				{AgentID: "w1:p1", AgentType: "claude", PaneID: "w1:p1", Status: "idle"},
+				{AgentID: "w1:p2", AgentType: "codex", PaneID: "w1:p2", Status: "idle"},
+				{AgentID: "w1:p3", AgentType: "codex", PaneID: "w1:p3", Status: "idle"},
+			},
+			AgentNames: map[string]string{"w1:p1": "brave-otter", "w1:p2": "swift-hawk", "w1:p3": "lone-wolf"},
+		},
+		tasks: []frontend.TaskGroup{
+			{Source: cfg.TaskSources[0], Index: 0, Items: []domain.ChecklistItem{
+				{Index: 1, Mark: " ", Text: "pending one"},
+				{Index: 2, Mark: " ", Text: "pending two"},
+				{Index: 3, Mark: "x", Done: true, Text: "done one"},
+				{Index: 4, Mark: "x", Done: true, Text: "done two"},
+				{Index: 5, Mark: "-", Done: true, Text: "in progress"},
+			}},
+			{Source: cfg.TaskSources[1], Index: 1, Err: "open /work/broken.md: no such file or directory"},
+		},
+	})
+	m = upd.(Model)
+	m.tab = tabAgents
+
+	rows := map[string][]string{}
+	for _, ln := range strings.Split(m.View(), "\n") {
+		if f := strings.Fields(ln); len(f) > 5 {
+			rows[f[0]] = f
+		}
+	}
+	// Whole rows, not field offsets: TASK's "5 (2)" splits into two fields, so
+	// indexing a single column silently reads the wrong one as soon as the
+	// layout shifts. LOCATION and AGE are "-" (no workspace metadata, no
+	// stats), and the four counters are all 0.
+	for _, tc := range []struct {
+		agent string
+		want  []string
+	}{
+		// 5 items: 2 pending, 2 done, 1 in-progress (which counts as done).
+		{"brave-otter", []string{"brave-otter", "-", "claude", "idle", "5", "(2)", "0", "0", "0", "0", "-"}},
+		// Source configured but unreadable — never a truthful-looking "0 (0)".
+		{"swift-hawk", []string{"swift-hawk", "-", "codex", "idle", "err", "0", "0", "0", "0", "-"}},
+		// No task source matches this agent at all.
+		{"lone-wolf", []string{"lone-wolf", "-", "codex", "idle", "-", "0", "0", "0", "0", "-"}},
+	} {
+		got, ok := rows[tc.agent]
+		if !ok {
+			t.Fatalf("row for %s not rendered:\n%s", tc.agent, m.View())
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("%s row = %v, want %v", tc.agent, got, tc.want)
+		}
+	}
+}
+
+func TestSeeAgentTasksFromAgentsList(t *testing.T) {
+	// The same jump without opening the detail overlay first: t on the Agents
+	// list acts on the agent under the cursor.
+	sources := []config.TaskSource{
+		{Agent: "somebody-else", Path: "/other.md"},
+		{Agent: "brave-otter", Path: "/work/tasks.md"},
+	}
+	m := agentTaskSourceDetailModel(t, sources, taskGroupsFor(sources))
+	m.detail = nil // back to the list
+	m.tab = tabAgents
+	m.cursors[m.tab] = 0
+	// Checked before the jump: afterwards helpLine() describes the Tasks tab.
+	if !strings.Contains(m.helpLine(), "t: see tasks") {
+		t.Errorf("the Agents list help should advertise t, got %q", m.helpLine())
+	}
+	upd, cmd := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("t on the Agents list must not run any mutation — it only navigates")
+	}
+	if m.tab != tabTasks {
+		t.Fatalf("t on the Agents list should switch to the Tasks tab, got %v", m.tab)
+	}
+	rows := m.visibleTaskRows()
+	if m.cursors[m.tab] >= len(rows) || !rows[m.cursors[m.tab]].header || rows[m.cursors[m.tab]].group != 1 {
+		t.Errorf("cursor should sit on the header row of task source #1, got cursor %d of %d rows",
+			m.cursors[m.tab], len(rows))
+	}
+}
+
+func TestSeeAgentTasksFromAgentsListNoMatchIsNoop(t *testing.T) {
+	sources := []config.TaskSource{{Agent: "somebody-else", Path: "/work/tasks.md"}}
+	m := agentTaskSourceDetailModel(t, sources, taskGroupsFor(sources))
+	m.detail = nil
+	m.tab = tabAgents
+	m.cursors[m.tab] = 0
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.tab != tabAgents {
+		t.Errorf("t with no matching task source should stay on the Agents tab, got %v", m.tab)
+	}
+	if !strings.Contains(m.View(), "no task source configured") {
+		t.Errorf("the no-match hint must render on the Agents list, got:\n%s", m.View())
+	}
+}
+
+// multiAgentTasksModel puts three agents on the Agents list, each with its own
+// task source, so a jump can only land correctly by resolving the agent under
+// the cursor — a one-agent fixture would pass even if the cursor were ignored.
+func multiAgentTasksModel(t *testing.T) Model {
+	t.Helper()
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{
+		{Agent: "alpha", Path: "/work/alpha.md"},
+		{Agent: "beta", Path: "/work/beta.md"},
+		{Agent: "gamma", Path: "/work/gamma.md"},
+	}
+	m := Model{width: 100, height: 30}
+	upd, _ := m.Update(refreshMsg{
+		cfg: cfg,
+		status: frontend.Status{
+			MonitoredAgents: []domain.AgentTransition{
+				{AgentID: "w1:p1", AgentType: "claude", PaneID: "w1:p1", Status: "idle"},
+				{AgentID: "w1:p2", AgentType: "codex", PaneID: "w1:p2", Status: "idle"},
+				{AgentID: "w1:p3", AgentType: "claude", PaneID: "w1:p3", Status: "idle"},
+			},
+			AgentNames: map[string]string{"w1:p1": "alpha", "w1:p2": "beta", "w1:p3": "gamma"},
+		},
+		tasks: taskGroupsFor(cfg.TaskSources),
+	})
+	m = upd.(Model)
+	m.tab = tabAgents
+	return m
+}
+
+func TestSeeAgentTasksFromAgentsListUsesCursorAgent(t *testing.T) {
+	// Cursor on the SECOND agent must select the second agent's source.
+	m := multiAgentTasksModel(t)
+	m.cursors[m.tab] = 1
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.tab != tabTasks {
+		t.Fatalf("t should switch to the Tasks tab, got %v", m.tab)
+	}
+	rows := m.visibleTaskRows()
+	if m.cursors[m.tab] >= len(rows) || rows[m.cursors[m.tab]].group != 1 || rows[m.cursors[m.tab]].path != "/work/beta.md" {
+		t.Errorf("cursor on agent #1 (beta) should select /work/beta.md, got %+v", rows[m.cursors[m.tab]])
+	}
+}
+
+func TestSeeAgentTasksFromAgentsListUsesFilteredList(t *testing.T) {
+	// With an Agents filter active, cursor 0 means the first VISIBLE agent —
+	// reading the raw MonitoredAgents slice here would land on alpha instead.
+	m := multiAgentTasksModel(t)
+	m.query[tabAgents] = "gamma"
+	if agents := m.visibleAgents(); len(agents) != 1 || m.data.status.AgentName(agents[0].AgentID) != "gamma" {
+		t.Fatalf("fixture: the filter should leave only gamma, got %v", agents)
+	}
+	m.cursors[m.tab] = 0
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	rows := m.visibleTaskRows()
+	if m.cursors[m.tab] >= len(rows) || rows[m.cursors[m.tab]].path != "/work/gamma.md" {
+		t.Errorf("cursor 0 of the filtered list should select gamma's source, got %+v", rows[m.cursors[m.tab]])
+	}
+}
+
+func TestSeeAgentTasksNoMatchKeepsAgentsCursorVisible(t *testing.T) {
+	// The no-match hint is a rendered line, so it shrinks the page by 2. A
+	// bottom-edge cursor must be scrolled back into the visible window rather
+	// than silently dropping off it.
+	m := Model{width: 100, height: 30}
+	agents := make([]domain.AgentTransition, 0, 23)
+	names := map[string]string{}
+	for i := range 23 {
+		id := fmt.Sprintf("w1:p%d", i)
+		agents = append(agents, domain.AgentTransition{
+			AgentID: id, AgentType: "claude", PaneID: id, Status: "idle",
+		})
+		names[id] = fmt.Sprintf("agent-%02d", i)
+	}
+	upd, _ := m.Update(refreshMsg{
+		cfg:    config.Default(), // no task sources → every agent is a no-match
+		status: frontend.Status{MonitoredAgents: agents, AgentNames: names},
+	})
+	m = upd.(Model)
+	m.tab = tabAgents
+	m.cursors[m.tab] = 22 // last row, at the bottom edge of the page
+	m.offsets[tabAgents] = 0
+
+	upd, _ = m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if m.tab != tabAgents {
+		t.Fatalf("a no-match t must not navigate, got %v", m.tab)
+	}
+	start, end := m.window(len(m.visibleAgents()))
+	if m.cursors[m.tab] < start || m.cursors[m.tab] >= end {
+		t.Errorf("cursor %d fell outside the rendered window [%d,%d) once the hint shrank the page",
+			m.cursors[m.tab], start, end)
+	}
+	if !strings.Contains(m.View(), "agent-22") {
+		t.Errorf("the selected agent must still be on screen alongside the hint:\n%s", m.View())
+	}
+}
+
+func TestSeeAgentTasksFromEmptyAgentsListIsNoop(t *testing.T) {
+	// An empty (or filtered-to-nothing) list leaves the cursor pointing at no
+	// agent — t must not panic or navigate.
+	m := testModel(t)
+	m.data.status.MonitoredAgents = nil
+	m.tab = tabAgents
+	m.cursors[m.tab] = 0
+	upd, cmd := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("t on an empty Agents list must not run a command")
+	}
+	if m.tab != tabAgents {
+		t.Errorf("t on an empty Agents list should not navigate, got %v", m.tab)
+	}
+}
+
+func TestSeeAgentTasksScrollsTheTargetIntoView(t *testing.T) {
+	// A source far down the list must be scrolled to, not just pointed at.
+	// The multi-match banner is the trap: it shrinks the page by 2, so an
+	// offset computed before it is set leaves the cursor below the fold.
+	sources := make([]config.TaskSource, 0, 22)
+	for i := range 20 {
+		sources = append(sources, config.TaskSource{
+			Agent: "somebody-else", Path: fmt.Sprintf("/other%d.md", i),
+		})
+	}
+	sources = append(sources,
+		config.TaskSource{Agent: "brave-otter", Path: "/work/a.md"},
+		config.TaskSource{Agent: "claude", Path: "/work/b.md"}) // a second match → banner
+	m := agentTaskSourceDetailModel(t, sources, taskGroupsFor(sources))
+	upd, _ := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+
+	rows := m.visibleTaskRows()
+	if m.cursors[m.tab] >= len(rows) || rows[m.cursors[m.tab]].group != 20 {
+		t.Fatalf("cursor should sit on task source #20's header, got cursor %d of %d rows", m.cursors[m.tab], len(rows))
+	}
+	// window() is the accounting renderTasks itself uses, so this pins what is
+	// actually on screen rather than re-deriving the page size.
+	start, end := m.window(len(rows))
+	if m.cursors[m.tab] < start || m.cursors[m.tab] >= end {
+		t.Errorf("cursor %d is outside the rendered window [%d,%d) — the jump landed off screen",
+			m.cursors[m.tab], start, end)
+	}
+	if !strings.Contains(m.View(), "/work/a.md") {
+		t.Errorf("the selected source must be on screen after the jump:\n%s", m.View())
 	}
 }
 
@@ -145,8 +835,8 @@ func TestDetailViewTabSwitches(t *testing.T) {
 	if m.detail != nil {
 		t.Error("tab should close the detail view")
 	}
-	if m.tab != tabEscalations {
-		t.Errorf("tab should advance to Escalations, got %v", m.tab)
+	if m.tab != tabTasks {
+		t.Errorf("tab should advance to Tasks, got %v", m.tab)
 	}
 	// shift+tab goes backwards from an open detail too.
 	m.tab = tabAudit
@@ -724,14 +1414,23 @@ func TestMaxContentWidthCapsRows(t *testing.T) {
 }
 
 // captureHerdr records inputs delivered to the agent pane.
-type captureHerdr struct{ sent []string }
+// captureHerdr records deliveries and reports the agents it is given. agents
+// stays nil by default — a herdr that answers "no agents are running", which
+// is what most Tasks-tab tests want; the send path needs a live one, so those
+// harnesses populate it.
+type captureHerdr struct {
+	sent   []string
+	agents []domain.AgentTransition
+}
 
 func (c *captureHerdr) Send(_ context.Context, _, input string) error {
 	c.sent = append(c.sent, input)
 	return nil
 }
-func (c *captureHerdr) ReadPane(context.Context, string, int) (string, error)        { return "", nil }
-func (c *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) { return nil, nil }
+func (c *captureHerdr) ReadPane(context.Context, string, int) (string, error) { return "", nil }
+func (c *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
+	return c.agents, nil
+}
 
 func TestEscalationDetailEnterConfirmsAndCloses(t *testing.T) {
 	// v opens the escalation detail; enter there must confirm+send and return
@@ -829,7 +1528,7 @@ func TestEscalationDetailEnterConfirmsSnapshotNotClampedCursor(t *testing.T) {
 	// Point the cursor at escalation B and open its detail.
 	for i := range m.data.escalations {
 		if m.data.escalations[i].ID == idB {
-			m.cursor = i
+			m.cursors[m.tab] = i
 		}
 	}
 	m = press(t, m, "v")
@@ -883,7 +1582,7 @@ func escalationsModel(t *testing.T) (Model, *frontend.App, *store.Store, int64, 
 	upd, _ := m.Update(refreshData(ctx, app))
 	m = upd.(Model)
 	m.tab = tabEscalations
-	m.cursor = 0
+	m.cursors[m.tab] = 0
 	esc := m.data.escalations
 	if len(esc) != 2 || esc[0].ID != oldID {
 		t.Fatalf("expected the old escalation #%d on top of 2 pending, got %+v", oldID, esc)
@@ -896,8 +1595,8 @@ func TestEscalationMarkToggleAndRender(t *testing.T) {
 
 	// Space marks the cursor row (the old escalation on top) and advances.
 	m = press(t, m, " ")
-	if !m.marked[oldID] || m.cursor != 1 {
-		t.Fatalf("space should mark #%d and advance, got marked=%v cursor=%d", oldID, m.marked, m.cursor)
+	if !m.marked[oldID] || m.cursors[m.tab] != 1 {
+		t.Fatalf("space should mark #%d and advance, got marked=%v cursor=%d", oldID, m.marked, m.cursors[m.tab])
 	}
 	if !strings.Contains(m.View(), "✓") {
 		t.Errorf("marked row should render the ✓ marker:\n%s", m.View())
@@ -912,7 +1611,7 @@ func TestEscalationMarkToggleAndRender(t *testing.T) {
 	if !m.marked[freshID] {
 		t.Fatalf("second space should mark #%d, got %v", freshID, m.marked)
 	}
-	m.cursor = 0
+	m.cursors[m.tab] = 0
 	m = press(t, m, " ")
 	if m.marked[oldID] || !m.marked[freshID] {
 		t.Errorf("space on a marked row should unmark it, got %v", m.marked)
@@ -988,7 +1687,7 @@ func TestAuditTabDeleteRefused(t *testing.T) {
 	for m.tab != tabAudit {
 		m = press(t, m, "tab")
 	}
-	m.cursor = 0
+	m.cursors[m.tab] = 0
 	upd, cmd := m.Update(pressKeyMsg("x"))
 	m = upd.(Model)
 	if cmd != nil {
@@ -1143,7 +1842,7 @@ func TestEscalationDetailShowsCurrentAndOriginalSituation(t *testing.T) {
 	// by every entry resolving to that rule.
 	m, _, _ := appModel(t)
 	m.tab = tabEscalations
-	m.cursor = 0
+	m.cursors[m.tab] = 0
 	m = press(t, m, "v")
 	if m.detail == nil {
 		t.Fatal("v should open the escalation detail")
@@ -1174,7 +1873,7 @@ func TestEscalationDetailCurrentOnlyWithoutRule(t *testing.T) {
 	upd, _ := m.Update(refreshData(ctx, app))
 	m = upd.(Model)
 	m.tab = tabEscalations
-	m.cursor = 0 // newest first
+	m.cursors[m.tab] = 0 // newest first
 	m = press(t, m, "v")
 	view := m.View()
 	if !strings.Contains(view, "Current situation") || !strings.Contains(view, "scratch.txt") {
@@ -1501,8 +2200,8 @@ func TestDetailViewVimLStillSwitchesTabsOffEscalations(t *testing.T) {
 	if m.detail != nil {
 		t.Error("l should close the Agents detail (vim-right)")
 	}
-	if m.tab != tabEscalations {
-		t.Errorf("l should advance Agents → Escalations, got %v", m.tab)
+	if m.tab != tabTasks {
+		t.Errorf("l should advance Agents → Tasks, got %v", m.tab)
 	}
 }
 

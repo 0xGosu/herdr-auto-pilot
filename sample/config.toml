@@ -140,21 +140,21 @@ rewrite_fallback_template = "You must act based on the following: {original_text
 # both set, an exhausted source escalates a confirmable @noop suggestion
 # ("No more pending tasks") instead of the old "none" prompt.
 # (Renamed from generate_task_command; the old key no longer loads — update it.)
-# task_generate_command = [
-#   "claude", "--model", "opus", "-p",
-#   "Suggest concrete next tasks (up to 3) for the coding agent in this project, most important first. Reply with ONLY the tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
-# ]
+task_generate_command = [
+  "claude", "--model", "opus", "-p",
+  "Suggest up to 3 concrete next tasks for this project's coding agent, in priority order. Reply ONLY with tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
+]
 
 # ── Idle task suggestion — OpenAI Codex (commented; swap in to use codex) ──
 # task_generate_command = [
 #   "codex", "--model", "gpt-5.6-sol", "exec", "--skip-git-repo-check",
-#   "Suggest concrete next tasks (up to 3) for the coding agent in this project, most important first. Reply with ONLY the tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
+#   "Suggest up to 3 concrete next tasks for this project's coding agent, in priority order. Reply ONLY with tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
 # ]
 
-# task_generate_command_start runs INSTEAD on the agent's first generation
+# task_generate_command_start runs INSTEAD on the agent's first task generation
 # (tracked independently); omit to reuse task_generate_command.
 # task_generate_command_start = [ ... ]
-# task_generate_timeout_seconds = 60   # omitted: inherits timeout_seconds
+task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_seconds
 
 
 # ── Semantic rule matching (vector embeddings) ──────────────────────
@@ -190,6 +190,8 @@ max_content_width = 0      # cap on variable-length list columns; 0 = full termi
 max_content_height = 0     # expanded long-field lines; 0 = unlimited; collapsed uses short tails
 theme = ""                 # named palette: default | dark | light | high-contrast;
                            # empty/unknown = default (the original look)
+terminal_bell = true       # ring the terminal bell (\a) on new escalations and on
+                           # pauses caused by a different process; default on
 
 # Optional per-role color overrides layered on the selected theme; unset
 # roles inherit the theme. Values are terminal colors ("205", "#ff5faf").
@@ -226,6 +228,12 @@ theme = ""                 # named palette: default | dark | light | high-contra
 # recommendation and the original task). Default: on. Opt a source out to keep
 # the plain declared-task flow:
 # llm_review = false
+# Cap how many checklist items (done, in-progress, and pending) this source may
+# hold before LLM task generation stops refilling it: once the file has MORE
+# than max_tasks items and its pending items are exhausted, the daemon logs a
+# warning and skips generation instead of piling more onto an already-long list
+# — prune the checklist to make room. Default: 20 when unset.
+# max_tasks = 20
 
 # ── Custom classifier rules (repeatable, extend the built-ins) ──────
 # [[classifier]]
