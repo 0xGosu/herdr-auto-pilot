@@ -1572,9 +1572,11 @@ func locationLabel(id string, lookup func() (label string, number int, ok bool))
 
 // agentLocation returns the compact "#<workspace>-<tab-name>" display string
 // for an agent, or "-" if workspace/tab metadata cannot be resolved. Herdr's
-// tab Number is its position in the global tab list, while Label is the name
-// shown to the operator (commonly "1", "2", "3", ...), so the label is the
-// useful locator here. Legacy/unnamed tabs fall back to Number.
+// tab Number is a per-workspace counter (it can collide across workspaces —
+// two different workspaces can each have a tab numbered 7), while Label is
+// the per-workspace position shown to the operator (commonly "1", "2", "3",
+// ...), so the label is the useful locator here. Legacy/unnamed tabs fall
+// back to Number.
 func agentLocation(a domain.AgentTransition, status frontend.Status) string {
 	if a.WorkspaceID == "" || a.TabID == "" {
 		return "-"

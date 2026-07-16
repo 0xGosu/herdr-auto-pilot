@@ -585,6 +585,61 @@ func TestAgentsListRendersStatColumns(t *testing.T) {
 	}
 }
 
+// TestAgentsListPreservesHerdrOrder pins down that the Agents tab never
+// reorders MonitoredAgents: that slice already arrives in herdr's own
+// `agent list` order (internal/herdr/cli.go's ListAgents passes the JSON
+// array through untouched, and frontend.App.GetStatus only filters
+// placeholders, never resorts), so the display layer's job is simply to not
+// break that — no workspace/tab/pane comparator belongs here, since
+// AgentTransition carries no intra-tab pane ordinal to reconstruct one
+// correctly.
+func TestAgentsListPreservesHerdrOrder(t *testing.T) {
+	m := Model{width: 120, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	// Deliberately NOT alphabetical/numeric — a naive incidental sort
+	// (by AgentID, PaneID, or AgentType) would visibly reorder this set,
+	// while preserving herdr's arrival order would not.
+	msg.status.AgentNames = map[string]string{
+		"w2:pA": "happy-seal", "w2:pC": "cosmic-yak",
+		"w3:p9": "eager-falcon", "w3:pB": "patient-lemur",
+	}
+	msg.status.MonitoredAgents = []domain.AgentTransition{
+		{AgentID: "w2:pA", PaneID: "w2:pA", AgentType: "codex", Status: "idle"},
+		{AgentID: "w2:pC", PaneID: "w2:pC", AgentType: "codex", Status: "idle"},
+		{AgentID: "w3:p9", PaneID: "w3:p9", AgentType: "claude", Status: "working"},
+		{AgentID: "w3:pB", PaneID: "w3:pB", AgentType: "claude", Status: "idle"},
+	}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+
+	got := m.visibleAgents()
+	want := []string{"w2:pA", "w2:pC", "w3:p9", "w3:pB"}
+	if len(got) != len(want) {
+		t.Fatalf("visibleAgents() returned %d rows, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i].AgentID != w {
+			t.Fatalf("visibleAgents()[%d] = %q, want %q (order must match herdr's agent list): %+v",
+				i, got[i].AgentID, w, got)
+		}
+	}
+
+	// The rendered view must show the same order, not just the slice.
+	m.tab = tabAgents
+	view := m.View()
+	var lastIdx int = -1
+	for i, name := range []string{"happy-seal", "cosmic-yak", "eager-falcon", "patient-lemur"} {
+		idx := strings.Index(view, name)
+		if idx == -1 {
+			t.Fatalf("agent %q not rendered:\n%s", name, view)
+		}
+		if idx <= lastIdx {
+			t.Fatalf("agent %q (row %d) rendered out of herdr order:\n%s", name, i, view)
+		}
+		lastIdx = idx
+	}
+}
+
 func TestAgentDetailAgeTicksWithClock(t *testing.T) {
 	open := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
 	firstSeen := open.Add(-30 * time.Second) // Age at open → 00:00:30
