@@ -154,6 +154,39 @@ func TestDecisionsSince(t *testing.T) {
 	}
 }
 
+func TestLiveConfidencePostFloorWithTopActionFallback(t *testing.T) {
+	// LiveConfidence is the single source of truth shared by Decide and every
+	// operator-facing view, so both halves of its contract are pinned here.
+	recs := []DecisionRecord{
+		{ID: 10, ChosenAction: "yes"},
+		{ID: 9, ChosenAction: "yes"},
+		{ID: 8, ChosenAction: "no"},
+	}
+	// No floor: identical to a plain Confidence over the whole history.
+	full := LiveConfidence(recs, 0, 1.0)
+	if want := Confidence(recs, 1.0); full != want {
+		t.Errorf("floor 0 must match Confidence: got %+v want %+v", full, want)
+	}
+	// A floor narrows the score to post-reset decisions only.
+	post := LiveConfidence(recs, 9, 1.0)
+	if post.Score != 1 || post.Decisions != 1 || post.TopAction != "yes" {
+		t.Errorf("floor 9 should score only id 10, got %+v", post)
+	}
+	// A floor above everything: no evidence, but the rule still names the
+	// action it learned so a reset rule keeps offering its answer.
+	reset := LiveConfidence(recs, 99, 1.0)
+	if reset.Score != 0 || reset.Decisions != 0 {
+		t.Errorf("a fully-reset rule must carry no post-floor evidence, got %+v", reset)
+	}
+	if reset.TopAction != "yes" {
+		t.Errorf("TopAction must fall back to full history, got %q", reset.TopAction)
+	}
+	// Empty history has nothing to fall back to.
+	if got := LiveConfidence(nil, 0, 1.0); got.TopAction != "" || got.Score != 0 {
+		t.Errorf("empty history must stay zero, got %+v", got)
+	}
+}
+
 func TestConfirmationWeightBelowOneClampsToBaseline(t *testing.T) {
 	// A weight < 1 must never penalize a confirmation below a baseline vote.
 	recs := opHistory("yes", "@no", "@no")

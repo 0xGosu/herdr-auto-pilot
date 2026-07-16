@@ -135,21 +135,19 @@ func Decide(in DecideInput) Decision {
 	}
 
 	// Confidence considers only post-reset decisions (id > the signature's
-	// floor); pre-reset rows are kept but no longer count. The suggested
-	// action, however, still comes from the FULL learned history: a reset
-	// rule keeps offering its learned answer while its score/graduation start
-	// fresh, so re-earning trust is just re-confirming it. Computed before the
-	// safety vetoes below so an escalation forced by one of them still
-	// reports the rule's actual confidence instead of a bare 0.
+	// floor); pre-reset rows are kept but no longer count. LiveConfidence owns
+	// that rule (including the full-history TopAction fallback for a reset
+	// rule), and the operator-facing views resolve confidence through the SAME
+	// function — that is what keeps a displayed score from drifting away from
+	// the one gated on here. Computed before the safety vetoes below so an
+	// escalation forced by one of them still reports the rule's actual
+	// confidence instead of a bare 0.
 	var floor int64
 	if in.State != nil {
 		floor = in.State.DecisionFloorID
 	}
 	post := DecisionsSince(in.History, floor)
-	conf := Confidence(post, in.ConfirmationWeight)
-	if len(post) == 0 {
-		conf.TopAction = Confidence(in.History, in.ConfirmationWeight).TopAction
-	}
+	conf := LiveConfidence(in.History, floor, in.ConfirmationWeight)
 
 	// Safety controls veto first (Constitution: safety over throughput).
 	// Rationales are tag-only where the reason token self-explains — the
@@ -168,16 +166,35 @@ func Decide(in DecideInput) Decision {
 		return esc(ReasonNeverAutoMatch, in.NeverAutoRuleHit.Diagnostic(), conf.Score, "")
 	}
 
-	if VarianceGuardTripped(post, in.ConfidenceThresholds.Minimum, in.ConfirmationWeight) {
-		return esc(ReasonVarianceGuard, "contradictory history", conf.Score, "")
-	}
-
-	// Resolve the would-be action before applying the rate guard. Resolution is
-	// pure and does not authorize a send; it gives a rate-limit escalation the
-	// same confirmable suggestion that would otherwise have been acted on.
-	// Without this, the early safety veto produced a tag-only escalation that
-	// the operator could not confirm.
+	// Resolve the would-be action before applying the variance and rate guards.
+	// Resolution is pure and does not authorize a send; it gives a guarded
+	// escalation the same confirmable suggestion that would otherwise have been
+	// acted on. Without this, the early safety veto produced a tag-only
+	// escalation that the operator could not confirm.
 	candidate, suggestion, resolveEsc := resolveSituation(in, conf)
+
+	// A contradictory history still has a resolved action worth surfacing: the
+	// guard withholds AUTONOMY, not information. The operator confirming it is
+	// an explicit human decision, which is the whole point of escalating.
+	// This guard preempts the suspected-irreversible check below, so carry that
+	// diagnostic here too: a confirmable line must still name why the action
+	// looked destructive (FR-016).
+	if VarianceGuardTripped(post, in.ConfidenceThresholds.Minimum, in.ConfirmationWeight) {
+		rationale := "contradictory history"
+		if in.SuspectedIrreversible && in.IrreversibleHit.Pattern != "" {
+			rationale += "; " + in.IrreversibleHit.Diagnostic()
+		}
+		// Sometimes there is genuinely nothing to resolve (an unfamiliar option
+		// set, no task source). Name that cause as well, so an escalation the
+		// operator CANNOT confirm at least says why. Deliberately rationale-only:
+		// falling through to the resolveEsc handling below would let a
+		// variance-tripped signature reach the LLM-consult branch, and the guard
+		// must keep forcing escalation.
+		if suggestion == "" && resolveEsc != ReasonNone {
+			rationale += "; " + string(resolveEsc)
+		}
+		return esc(ReasonVarianceGuard, rationale, conf.Score, suggestion)
+	}
 
 	if ok, reason := CheckRate(in.Rate, in.Now, in.RateLimits); !ok {
 		return esc(reason, "", conf.Score, suggestion)

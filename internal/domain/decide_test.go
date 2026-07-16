@@ -285,6 +285,133 @@ func TestVarianceGuardForcesEscalation(t *testing.T) {
 	}
 }
 
+func TestVarianceGuardSurfacesConfirmableSuggestion(t *testing.T) {
+	// A variance escalation that carries no suggestion is unconfirmable —
+	// `hap confirm` rejects it with "carries no suggestion to confirm", leaving
+	// the operator no way to accept an action they can see is still correct.
+	// The guard withholds autonomy, not information.
+	tests := []struct {
+		name    string
+		sitType SituationType
+		actions []string
+		options []string
+		want    string
+	}{
+		{
+			// The live repro: an idle rule whose plurality action is @noop but
+			// whose history is contradictory enough to trip the guard. The
+			// human-readable form is surfaced; raw "@noop" never reaches an
+			// operator and round-trips back to the sentinel on confirm.
+			name:    "idle noop rule",
+			sitType: SituationIdle,
+			actions: []string{ActionNoop, "task a", ActionNoop, "task b", ActionNoop, "task c"},
+			want:    ActionNoopSuggestion,
+		},
+		{
+			name:    "approval rule",
+			sitType: SituationApproval,
+			actions: []string{"y", "n", "y", "n", "y", "n"},
+			want:    "respond: y",
+		},
+		{
+			name:    "choice rule",
+			sitType: SituationChoice,
+			actions: []string{"use pnpm", "use npm", "use pnpm", "use npm", "use pnpm", "use npm"},
+			options: []string{"use npm", "use pnpm", "use yarn"},
+			want:    "choose: use pnpm",
+		},
+		{
+			name:    "error rule",
+			sitType: SituationError,
+			actions: []string{"retry", "abort", "retry", "abort", "retry", "abort"},
+			want:    "on error: retry",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			in := autonomous(baseInput(tc.sitType), tc.actions...)
+			in.ConfidenceThresholds.Minimum = 0.6
+			in.Situation.Options = tc.options
+			d := Decide(in)
+			if d.Action != ActionEscalate || d.Reason != ReasonVarianceGuard {
+				t.Fatalf("expected variance_guard escalation, got %+v", d)
+			}
+			if d.Suggestion != tc.want {
+				t.Errorf("suggestion = %q, want %q", d.Suggestion, tc.want)
+			}
+		})
+	}
+}
+
+func TestVarianceGuardNamesWhyNothingIsConfirmable(t *testing.T) {
+	// Some situations resolve to nothing at all — an unfamiliar option set here.
+	// The guard still escalates with no suggestion (there IS no action to
+	// offer), so the rationale must at least name that cause; otherwise the
+	// operator gets a bare "[variance_guard] contradictory history" with an
+	// empty suggestion and no way to tell why it cannot be confirmed.
+	in := autonomous(baseInput(SituationChoice),
+		"use pnpm", "use npm", "use pnpm", "use npm", "use pnpm", "use npm")
+	in.ConfidenceThresholds.Minimum = 0.6
+	in.Situation.Options = []string{"use bun", "use deno"} // learned action absent
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonVarianceGuard {
+		t.Fatalf("the guard must still force escalation, got %+v", d)
+	}
+	if d.Suggestion != "" {
+		t.Errorf("nothing is resolvable, so nothing may be suggested, got %q", d.Suggestion)
+	}
+	if !strings.Contains(d.Rationale, string(ReasonUnfamiliarOptions)) {
+		t.Errorf("rationale must name why there is nothing to confirm, got %q", d.Rationale)
+	}
+	// A resolvable case must NOT get the extra tag — it has a real suggestion.
+	ok := autonomous(baseInput(SituationApproval), "y", "n", "y", "n", "y", "n")
+	ok.ConfidenceThresholds.Minimum = 0.6
+	if got := Decide(ok); strings.Contains(got.Rationale, string(ReasonUnfamiliarOptions)) {
+		t.Errorf("a confirmable escalation must not carry a resolve-failure tag, got %q", got.Rationale)
+	}
+}
+
+func TestNeverAutoVetoOutranksVarianceGuardAndStaysUnconfirmable(t *testing.T) {
+	// Safety invariant: surfacing a suggestion on the GUARDED paths (variance,
+	// rate) must never leak one onto the VETO paths. A never-auto match is
+	// non-confirmable by design — the veto returns before the situation is
+	// resolved at all, so hoisting resolution any higher would silently make a
+	// matched destructive pattern one-key confirmable.
+	in := autonomous(baseInput(SituationApproval), "y", "n", "y", "n", "y", "n")
+	in.ConfidenceThresholds.Minimum = 0.6 // the variance guard would otherwise trip
+	in.NeverAutoMatched = true
+	in.NeverAutoRuleHit = NeverAutoHit{Pattern: "rm -rf"}
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonNeverAutoMatch {
+		t.Fatalf("never-auto must outrank the variance guard, got %+v", d)
+	}
+	if d.Suggestion != "" {
+		t.Errorf("a never-auto veto must stay non-confirmable, got %q", d.Suggestion)
+	}
+}
+
+func TestVarianceGuardKeepsIrreversibleDiagnostic(t *testing.T) {
+	// The variance guard preempts the suspected-irreversible check, so a
+	// destructive-looking action with contradictory history escalates as
+	// variance_guard. Now that the line is confirmable, it must still name why
+	// the action looked destructive (FR-016) instead of only "contradictory
+	// history".
+	in := autonomous(baseInput(SituationApproval), "y", "n", "y", "n", "y", "n")
+	in.ConfidenceThresholds.Minimum = 0.6
+	in.SuspectedIrreversible = true
+	in.IrreversibleHit = IndicatorHit{Pattern: "rm -rf"}
+	d := Decide(in)
+	if d.Reason != ReasonVarianceGuard {
+		t.Fatalf("expected variance_guard, got %+v", d)
+	}
+	if !strings.Contains(d.Rationale, "contradictory history") {
+		t.Errorf("rationale must keep the guard's own reason, got %q", d.Rationale)
+	}
+	if !strings.Contains(d.Rationale, "rm -rf") {
+		t.Errorf("rationale must name the irreversible indicator, got %q", d.Rationale)
+	}
+}
+
 func TestOverMaskedEscalates(t *testing.T) {
 	in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y", "y", "y")
 	in.Signature.Verdict = GuardOverMasked

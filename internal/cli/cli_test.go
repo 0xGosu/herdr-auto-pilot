@@ -352,9 +352,18 @@ func TestSignaturesList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"approval:aaaa111…", "choice:cccc3333", "shadow", "autonomous", "3/2", "top=\"1\"", "2 signature(s)"} {
+	// conf= is the LIVE score, never the cached snapshot the fixture seeds:
+	// approval is unanimous over 2 decisions (live 1.00, cached 0.75) and choice
+	// has no decisions at all (live 0.00, cached 0.92).
+	for _, want := range []string{"approval:aaaa111…", "choice:cccc3333", "shadow", "autonomous", "3/2", "top=\"1\"",
+		"conf=1.00", "conf=0.00", "2 signature(s)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("list output missing %q:\n%s", want, out)
+		}
+	}
+	for _, stale := range []string{"conf=0.75", "conf=0.92"} {
+		if strings.Contains(out, stale) {
+			t.Errorf("list rendered the stale cached snapshot %q:\n%s", stale, out)
 		}
 	}
 	// Newest-updated first.
@@ -371,9 +380,15 @@ func TestSignaturesList(t *testing.T) {
 	if err != nil || strings.Contains(out, "choice:") || !strings.Contains(out, "approval:") {
 		t.Errorf("bare-flag type filter failed (%v):\n%s", err, out)
 	}
+	// --min-conf selects on the LIVE score, not the cached snapshot — and the
+	// seeded rules disagree in OPPOSITE directions, so this pins both. The
+	// approval rule is unanimous over its history (live 1.00, cached 0.75) and
+	// must stay; the choice rule has no decisions at all (live 0.00, cached
+	// 0.92) and must go. The old SQL filter on cached_confidence got both
+	// backwards: it dropped the confident rule and kept the empty one.
 	out, err = run(t, app, "signatures", "list", "--min-conf", "0.9")
-	if err != nil || strings.Contains(out, "approval:") {
-		t.Errorf("min-conf filter failed (%v):\n%s", err, out)
+	if err != nil || !strings.Contains(out, "approval:") || strings.Contains(out, "choice:") {
+		t.Errorf("min-conf must filter on the live score (%v):\n%s", err, out)
 	}
 
 	// Empty state.
@@ -392,7 +407,10 @@ func TestSignaturesShow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"approval:aaaa1111bbbb2222", "streak: 3/2", "top action:  \"1\" over 2 decision(s)",
+	// "confidence: 1.00" is the live score over the seeded history; the fixture's
+	// cached snapshot is 0.75 and must never surface.
+	for _, want := range []string{"approval:aaaa1111bbbb2222", "streak: 3/2", "confidence: 1.00",
+		"top action:  \"1\" over 2 decision(s)",
 		"original situation:", "terraform apply", "recent decisions", "last audit", "shadow mode"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("show output missing %q:\n%s", want, out)
@@ -591,7 +609,10 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, `rule=[shadow — 3/2 confirmations, confidence 0.75, top action "1" over 2 decision(s)]`) {
+	// confidence is the LIVE score over the seeded history (2 unanimous
+	// decisions = 1.00), not the 0.75 CachedConfidence snapshot the row carries:
+	// that field goes stale between confirms and must never reach an operator.
+	if !strings.Contains(out, `rule=[shadow — 3/2 confirmations, confidence 1.00, top action "1" over 2 decision(s)]`) {
 		t.Errorf("escalations should name the matched rule, got:\n%s", out)
 	}
 

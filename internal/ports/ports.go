@@ -293,7 +293,12 @@ type ReadStore interface {
 	// ResolveAgent maps a short name or agent/pane id to the agent id.
 	ResolveAgent(ctx context.Context, target string) (string, error)
 	// ListSignatures returns learning state rows, newest-updated first;
-	// zero-valued filter fields are ignored.
+	// zero-valued filter fields are ignored. MinConfidence is NOT applied here
+	// and an implementation MUST NOT try: it filters the live score, which only
+	// the listing front-end can compute (it holds the history). Filtering on the
+	// stored cached_confidence snapshot instead is a real bug that shipped once —
+	// it drifts both ways, so it drops live-confident rules and keeps
+	// contradictory ones. See domain.SignatureFilter.
 	ListSignatures(ctx context.Context, f domain.SignatureFilter) ([]domain.SignatureState, error)
 	// ResolveSignature expands a unique signature prefix to the full key,
 	// erroring on no match or ambiguity.

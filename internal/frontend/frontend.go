@@ -2241,12 +2241,28 @@ func (a *App) DeleteTask(agent, path string, index int, expectText ...string) ([
 }
 
 // SignatureRow is a learned signature enriched for display: the persisted
-// state plus the dominant action and decision count recomputed from history.
+// state plus the confidence, dominant action, and decision count recomputed
+// from history.
 type SignatureRow struct {
 	domain.SignatureState
-	TopAction string
+	// Confidence is the LIVE score (domain.LiveConfidence over post-floor
+	// history) — what the decision core would gate on right now. Always display
+	// this, never the embedded SignatureState.CachedConfidence: that snapshot is
+	// only refreshed on a confirm/correct and is stamped to a fake 1.0 by a
+	// reset, so it drifts from the score that actually drives decisions.
+	Confidence float64
+	TopAction  string
+	// Decisions counts only the decisions behind Confidence (post-floor), so it
+	// belongs beside a confidence figure. It is NOT how much history exists:
+	// use TotalDecisions for anything describing the stored rows themselves.
 	Decisions int
-	LastAudit *domain.AuditRecord
+	// TotalDecisions counts every decision row the rule holds, floor included.
+	// DeleteSignature erases them all regardless of the floor, so the delete
+	// prompts must quote THIS — a reset rule has Decisions == 0 while still
+	// carrying history, and a confirmation that says "0 decision(s)" before
+	// erasing N understates what the operator is about to lose.
+	TotalDecisions int
+	LastAudit      *domain.AuditRecord
 	// PaneExcerpt is the pane snapshot the signature was first seen with
 	// (rule provenance); "" for rules learned before snapshots existed.
 	PaneExcerpt string
@@ -2257,7 +2273,7 @@ type SignatureRow struct {
 // wording so operators see the same rule either way).
 func RuleSummary(row SignatureRow, graduationN int) string {
 	s := fmt.Sprintf("%s — %d/%d confirmations, confidence %.2f",
-		row.Mode, row.ConsecutiveConfirmations, graduationN, row.CachedConfidence)
+		row.Mode, row.ConsecutiveConfirmations, graduationN, row.Confidence)
 	if row.TopAction != "" {
 		s += fmt.Sprintf(", top action %q over %d decision(s)", row.TopAction, row.Decisions)
 	}
@@ -2295,9 +2311,12 @@ func IndexSignatures(rows []SignatureRow) map[string]SignatureRow {
 	return idx
 }
 
-// Signatures lists learned signatures (newest-updated first) enriched with
-// their top action and decision count. Per-row history reads are N+1 at
-// operator scale; a SQL aggregate is a future optimization if lists grow.
+// Signatures lists learned signatures (newest-updated first) enriched from each
+// rule's history with its live confidence, top action, and decision counts. It
+// also DROPS rows below f.MinConfidence: that filter needs the live score, so it
+// cannot live in the store's SQL (see domain.SignatureFilter). Per-row history
+// reads are N+1 at operator scale; a SQL aggregate is a future optimization if
+// lists grow.
 func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]SignatureRow, error) {
 	states, err := a.Store.ListSignatures(ctx, f)
 	if err != nil {
@@ -2309,9 +2328,16 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 		if err != nil {
 			return nil, err
 		}
-		conf := domain.Confidence(history, a.confirmationWeight())
+		conf := domain.LiveConfidence(history, st.DecisionFloorID, a.confirmationWeight())
+		// min-conf filters the LIVE score here, not cached_confidence in SQL:
+		// the store cannot do it correctly (see domain.SignatureFilter).
+		if f.MinConfidence > 0 && conf.Score < f.MinConfidence {
+			continue
+		}
 		rows = append(rows, SignatureRow{
-			SignatureState: st, TopAction: conf.TopAction, Decisions: conf.Decisions,
+			SignatureState: st, Confidence: conf.Score,
+			TopAction: conf.TopAction, Decisions: conf.Decisions,
+			TotalDecisions: len(history),
 		})
 	}
 	return rows, nil
@@ -2336,8 +2362,10 @@ func (a *App) SignatureDetail(ctx context.Context, prefix string) (SignatureRow,
 	if err != nil {
 		return row, nil, err
 	}
-	conf := domain.Confidence(history, a.confirmationWeight())
-	row = SignatureRow{SignatureState: *st, TopAction: conf.TopAction, Decisions: conf.Decisions}
+	conf := domain.LiveConfidence(history, st.DecisionFloorID, a.confirmationWeight())
+	row = SignatureRow{SignatureState: *st, Confidence: conf.Score,
+		TopAction: conf.TopAction, Decisions: conf.Decisions,
+		TotalDecisions: len(history)}
 	audit, err := a.Store.LatestAuditForSignature(ctx, sig)
 	if err != nil {
 		return row, nil, err

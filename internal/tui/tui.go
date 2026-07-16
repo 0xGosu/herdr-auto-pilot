@@ -2791,7 +2791,9 @@ func (m Model) deleteSignaturePrompt() (tea.Model, tea.Cmd) {
 	if row == nil {
 		return m, nil
 	}
-	sig, decisions := row.Signature, row.Decisions
+	// TotalDecisions, not Decisions: the delete erases every row the rule holds,
+	// floor or no floor.
+	sig, decisions := row.Signature, row.TotalDecisions
 	app, ctx := m.app, m.ctx
 	m.beginAction()
 	m.prompt = &prompt{
@@ -2852,7 +2854,7 @@ func (m Model) signatureDetailLines(row frontend.SignatureRow, history []domain.
 	lines = m.detailField(lines, w, "Agent type", orDash(row.AgentType))
 	lines = m.detailField(lines, w, "Mode", string(row.Mode))
 	lines = m.detailField(lines, w, "Streak", fmt.Sprintf("%d/%d confirmations toward graduation", row.ConsecutiveConfirmations, graduationN))
-	lines = m.detailField(lines, w, "Confidence", fmt.Sprintf("%.2f (cached)", row.CachedConfidence))
+	lines = m.detailField(lines, w, "Confidence", fmt.Sprintf("%.2f", row.Confidence))
 	if row.TopAction != "" {
 		lines = m.detailField(lines, w, "Top action", fmt.Sprintf("%q over %d decision(s)", row.TopAction, row.Decisions))
 	}
@@ -3479,7 +3481,7 @@ func (m Model) renderSignatures(b *strings.Builder) {
 		r := sigs[i]
 		line := fmt.Sprintf(rulesRowFmt,
 			sigW, r.Signature, r.SituationType, orDash(r.AgentType),
-			fmt.Sprintf("%.2f", r.CachedConfidence), r.Mode,
+			fmt.Sprintf("%.2f", r.Confidence), r.Mode,
 			fmt.Sprintf("%d/%d", r.ConsecutiveConfirmations, gradN),
 			oneLine(r.TopAction, actWidth))
 		switch {

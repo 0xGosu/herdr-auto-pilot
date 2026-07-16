@@ -1698,6 +1698,183 @@ func TestSignaturesEnrichmentAndFilter(t *testing.T) {
 	}
 }
 
+func TestSignaturesRenderLiveConfidenceNotCachedSnapshot(t *testing.T) {
+	// The Rules tab CONF column, `hap signatures`, and the escalation rule line
+	// all render SignatureRow.Confidence. It must be the score the decision core
+	// gates on RIGHT NOW, recomputed from history — never the persisted
+	// CachedConfidence, which is refreshed only on a confirm/correct and so
+	// drifts as ordinary decisions accumulate. The live symptom: a rule the core
+	// scored 0.45 displayed "confidence 1.00" beside its own
+	// "[variance_guard] contradictory history" escalation.
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:drift", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		CachedConfidence: 1.0, // a stale snapshot from an earlier, unanimous moment
+		UpdatedAt:        now,
+	})
+	// Contradictory history: recency-weighted agreement lands near 0.54.
+	for _, a := range []string{"y", "n", "y", "n"} {
+		st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:drift",
+			SituationType: domain.SituationApproval, AgentType: "claude",
+			ChosenAction: a, CreatedAt: now})
+	}
+
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("Signatures: %+v, %v", rows, err)
+	}
+	if got := rows[0].Confidence; got <= 0.50 || got >= 0.60 {
+		t.Errorf("confidence must be recomputed live (~0.54), got %.4f", got)
+	}
+	if rows[0].Confidence == rows[0].CachedConfidence {
+		t.Error("confidence must not be the stale cached snapshot")
+	}
+	// RuleSummary feeds the escalation line the operator reads.
+	if s := frontend.RuleSummary(rows[0], 3); !strings.Contains(s, "confidence 0.54") {
+		t.Errorf("rule summary must quote the live score, got %q", s)
+	}
+
+	// A RESET rule is the sharpest case: ResetGraduation stamps a fake 1.0 and
+	// the floor excludes every decision, so the row must read as "no post-reset
+	// evidence yet" (0.00) while still naming the action it learned.
+	hist, err := st.DecisionsForSignature(ctx, "approval:drift", 50)
+	if err != nil || len(hist) == 0 {
+		t.Fatalf("history: %+v, %v", hist, err)
+	}
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:drift", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		CachedConfidence: 1.0,
+		DecisionFloorID:  hist[0].ID, // newest id: nothing survives the floor
+		UpdatedAt:        now,
+	})
+	rows, err = app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("Signatures after reset: %+v, %v", rows, err)
+	}
+	if rows[0].Confidence != 0 || rows[0].Decisions != 0 {
+		t.Errorf("a reset rule has no post-floor evidence: conf=%.2f n=%d",
+			rows[0].Confidence, rows[0].Decisions)
+	}
+	if rows[0].TopAction == "" {
+		t.Error("a reset rule must still name its learned action (full-history fallback)")
+	}
+}
+
+func TestSignaturesMinConfidenceFiltersLiveScoreBothDirections(t *testing.T) {
+	// --min-conf must select on the LIVE score. The stale cached snapshot drifts
+	// BOTH ways, so a SQL filter on it fails in both: it would drop a
+	// live-confident rule (cached low) and keep a contradictory one (cached
+	// high) that visibly renders below the cutoff.
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	// Live 1.00 (unanimous) but cached far below the cutoff — must be KEPT.
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:livehigh", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		CachedConfidence: 0.10, UpdatedAt: now,
+	})
+	for i := 0; i < 3; i++ {
+		st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:livehigh",
+			SituationType: domain.SituationApproval, ChosenAction: "y", CreatedAt: now})
+	}
+	// Live ~0.54 (contradictory) but cached 1.00 — must be DROPPED.
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:livelow", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		CachedConfidence: 1.00, UpdatedAt: now.Add(time.Second),
+	})
+	for _, a := range []string{"y", "n", "y", "n"} {
+		st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:livelow",
+			SituationType: domain.SituationApproval, ChosenAction: a, CreatedAt: now})
+	}
+
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{MinConfidence: 0.9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Signature != "approval:livehigh" {
+		t.Fatalf("min-conf must select on the live score, got %+v", rows)
+	}
+	// Nothing below the cutoff may survive — the operator-visible invariant.
+	for _, r := range rows {
+		if r.Confidence < 0.9 {
+			t.Errorf("row %s renders %.2f, below the 0.90 cutoff", r.Signature, r.Confidence)
+		}
+	}
+	// Sanity: without the filter both rules are listed.
+	if all, err := app.Signatures(ctx, domain.SignatureFilter{}); err != nil || len(all) != 2 {
+		t.Errorf("unfiltered listing should hold both: %+v, %v", all, err)
+	}
+}
+
+func TestSignatureRowTotalDecisionsIgnoresResetFloor(t *testing.T) {
+	// The delete prompts quote TotalDecisions because DeleteSignature erases
+	// every row regardless of the floor. A RESET rule is the trap: Decisions
+	// (post-floor, for the confidence line) is 0 while N rows still exist, so
+	// quoting Decisions would confirm "delete ... and its 0 decision(s)" and
+	// then destroy N.
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:reset", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+	})
+	for i := 0; i < 3; i++ {
+		st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:reset",
+			SituationType: domain.SituationApproval, ChosenAction: "y", CreatedAt: now})
+	}
+	hist, err := st.DecisionsForSignature(ctx, "approval:reset", 50)
+	if err != nil || len(hist) != 3 {
+		t.Fatalf("seed history: %+v, %v", hist, err)
+	}
+	// Reset: floor above every decision, exactly like ResetGraduation stamps.
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:reset", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		CachedConfidence: 1.0, DecisionFloorID: hist[0].ID, UpdatedAt: now,
+	})
+
+	row, _, err := app.SignatureDetail(ctx, "approval:reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Decisions != 0 {
+		t.Errorf("post-floor Decisions should be 0, got %d", row.Decisions)
+	}
+	if row.TotalDecisions != 3 {
+		t.Errorf("TotalDecisions must count every stored row, got %d", row.TotalDecisions)
+	}
+	// The prompt's count must match what the delete actually erases.
+	_, n, err := app.DeleteSignature(ctx, "approval:reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(n) != row.TotalDecisions {
+		t.Errorf("delete erased %d decisions but the prompt would have quoted %d", n, row.TotalDecisions)
+	}
+
+	// Listing rows carry the same count.
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:live", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+	})
+	st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:live",
+		SituationType: domain.SituationApproval, ChosenAction: "y", CreatedAt: now})
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("Signatures: %+v, %v", rows, err)
+	}
+	if rows[0].TotalDecisions != 1 {
+		t.Errorf("listing row TotalDecisions = %d, want 1", rows[0].TotalDecisions)
+	}
+}
+
 func TestSignatureDetail(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()

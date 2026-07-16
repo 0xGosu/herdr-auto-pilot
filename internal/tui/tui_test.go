@@ -56,15 +56,15 @@ func testModel(t *testing.T) Model {
 			{SignatureState: domain.SignatureState{
 				Signature: "choice:ffff0000eeee1111", SituationType: domain.SituationChoice,
 				AgentType: "codex", Mode: domain.ModeAutonomous,
-				ConsecutiveConfirmations: 5, CachedConfidence: 0.93,
-				UpdatedAt: time.Date(2026, 7, 9, 12, 30, 0, 0, time.UTC)},
-				TopAction: "2", Decisions: 6},
+				ConsecutiveConfirmations: 5,
+				UpdatedAt:                time.Date(2026, 7, 9, 12, 30, 0, 0, time.UTC)},
+				Confidence: 0.93, TopAction: "2", Decisions: 6},
 			{SignatureState: domain.SignatureState{
 				Signature: "approval:1234abcd5678efab", SituationType: domain.SituationApproval,
 				AgentType: "claude", Mode: domain.ModeShadow,
-				ConsecutiveConfirmations: 3, CachedConfidence: 0.71,
-				UpdatedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)},
-				TopAction: "1", Decisions: 4},
+				ConsecutiveConfirmations: 3,
+				UpdatedAt:                time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)},
+				Confidence: 0.71, TopAction: "1", Decisions: 4},
 		},
 		cfg: func() config.Config { c := config.Default(); c.Learning.GraduationN = 5; return c }(),
 	})

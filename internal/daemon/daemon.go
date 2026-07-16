@@ -249,7 +249,7 @@ func New(opt Options) (*Daemon, error) {
 		opt.ReadTaskFile = os.ReadFile
 	}
 	if opt.PaneReadLines <= 0 {
-		opt.PaneReadLines = 120
+		opt.PaneReadLines = 50
 	}
 	d := &Daemon{
 		opt:                opt,

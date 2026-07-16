@@ -730,7 +730,9 @@ func (s *Store) DecisionsForSignature(ctx context.Context, signature string, lim
 }
 
 // ListSignatures returns learning state rows, newest-updated first.
-// Zero-valued filter fields are ignored.
+// Zero-valued filter fields are ignored, and so is MinConfidence — it filters
+// the live score, which only the listing front-end can compute (see
+// domain.SignatureFilter and ports.SignaturePort).
 func (s *Store) ListSignatures(ctx context.Context, f domain.SignatureFilter) ([]domain.SignatureState, error) {
 	query := `
 		SELECT signature, situation_type, agent_type, mode, consecutive_confirmations,
@@ -749,10 +751,9 @@ func (s *Store) ListSignatures(ctx context.Context, f domain.SignatureFilter) ([
 		query += ` AND mode = ?`
 		args = append(args, string(f.Mode))
 	}
-	if f.MinConfidence > 0 {
-		query += ` AND cached_confidence >= ?`
-		args = append(args, f.MinConfidence)
-	}
+	// f.MinConfidence is intentionally NOT filtered here: the only confidence
+	// this table holds is the stale cached_confidence snapshot. The listing
+	// front-end applies it to the live score (see domain.SignatureFilter).
 	query += ` ORDER BY updated_at DESC, signature ASC`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {

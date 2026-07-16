@@ -2835,6 +2835,9 @@ func TestConsultContextCarriesLocationCwdAndDeepExcerpt(t *testing.T) {
 	// The deep read asks for pane_excerpt_chars/10 lines; the shallow
 	// classification read keeps the PaneReadLines default.
 	lines := h.herdr.readLineCalls()
+	if len(lines) < 1 || lines[0] != 50 {
+		t.Errorf("classification read should request 50 lines, got calls %v", lines)
+	}
 	if len(lines) < 2 || lines[len(lines)-1] != 500 {
 		t.Errorf("deep read should request 500 lines, got calls %v", lines)
 	}
@@ -2887,7 +2890,7 @@ func TestConsultContextFallsBackToClassificationSnapshot(t *testing.T) {
 	captured := captureConsultContext(h)
 	h.herdr.setPane(approvalPane)
 	h.herdr.mu.Lock()
-	h.herdr.failReadOver = 120 // classification read (120 lines) passes, deep read fails
+	h.herdr.failReadOver = 50 // classification read (50 lines) passes, deep read fails
 	h.herdr.mu.Unlock()
 
 	h.push("agent-fb", "blocked")
