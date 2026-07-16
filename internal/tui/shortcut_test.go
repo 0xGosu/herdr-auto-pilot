@@ -12,7 +12,7 @@ import (
 func shortcutModel(t *testing.T, install func() error) Model {
 	t.Helper()
 	m := configModel(t, config.Default())
-	m.cursor = itemIndex(t, m, func(item ruleItem) bool {
+	m.cursors[m.tab] = itemIndex(t, m, func(item ruleItem) bool {
 		return item.kind == "shortcut" && item.key == "install-hap"
 	})
 	m.installShortcut = install

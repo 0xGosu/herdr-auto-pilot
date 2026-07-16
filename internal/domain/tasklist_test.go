@@ -572,6 +572,19 @@ func TestTaskNewlineEncoding(t *testing.T) {
 	}
 }
 
+func TestMarkChecklistItemInProgress(t *testing.T) {
+	got, err := MarkChecklistItemInProgress("- [ ] a\n- [x] b", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "- [-] a\n- [x] b"; got != want {
+		t.Errorf("MarkChecklistItemInProgress: got %q, want %q", got, want)
+	}
+	if _, err := MarkChecklistItemInProgress("- [ ] a", 5); err == nil {
+		t.Error("out-of-range index must error")
+	}
+}
+
 func TestDeleteChecklistItem(t *testing.T) {
 	content := "intro line\n- [ ] a\n- [x] b\n- [ ] c"
 	got, err := DeleteChecklistItem(content, 2)

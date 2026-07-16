@@ -437,10 +437,16 @@ remove a task source by index:
 hap task-source remove <index>
 ```
 
-in the TUI you can also clear the source feeding one agent from its detail view
-(Agents tab → `v` → `t`): it removes the single `[[task_sources]]` entry
-matching that agent, and refuses (naming the candidates) when zero or more than
-one match, so a broad selector is never silently dropped for everyone.
+this removes the `[[task_sources]]` entry only — the checklist file is left on
+disk. it is unguarded and unconfirmed: it removes the entry even while a live
+agent is mid-task on it, which makes it the force path.
+
+the TUI twin is `x` on a source's header row in the **Tasks** tab. same
+config-only removal, but behind a `y/n` confirmation AND a guard: it only
+offers removal once **no live agent matches** the source, or **every task in it
+is finished** (`[-]` in-progress counts as unfinished). otherwise it refuses and
+points back at the config tab / this command.
+
 
 ### manage the task items (CRUD)
 
@@ -466,8 +472,19 @@ hap task backend-dev done 2                # tick item 2 off ([x])
 hap task backend-dev undone 2              # re-open item 2 ([ ])
 hap task backend-dev update 2 "new text"   # edit text, keep status
 hap task backend-dev remove 2              # delete item 2
+hap task backend-dev send 3 [--yes]        # deliver pending item 3 to the live
+#   agent NOW (y/N confirmation unless --yes). only a pending [ ] item on a
+#   cleanly idle agent qualifies; a successful send marks it [-] in progress
+#   so the daemon's own idle-time flow won't re-send it.
 
 hap task --path ./docs/tasks.md list       # operate on any checklist file
+
+# multi-line text stays ONE task: real line breaks (CR/LF flavors ok) are
+# stored as the literal two-character sequence \n on the item's single line,
+# and converted back to real newlines when the task is sent to an agent.
+# hand-writing \n directly in tasks.md works the same way.
+hap task backend-dev add $'wire up retries\nadd backoff jitter'   # 1 item: "wire up retries\nadd backoff jitter"
+hap task backend-dev update 2 'part one\npart two'                # literal \n is kept as-is
 ```
 
 resolution by agent name matches the `agent` selector a task source was
@@ -478,12 +495,26 @@ daemon re-reads task files live, so no restart or reload is needed. adding a
 task doesn't interrupt a working agent; it's picked up on the agent's next idle.
 
 the TUI's **Tasks tab** does the same CRUD without the CLI: it aggregates every
-configured source's checklist into one list (a header per source, its items
-under it) and edits them in place — `a` add, `e` edit, `d` done/undone, `x`
-delete, `space` to mark a run so `d`/`x` act on all marked at once, `f` to focus
-the live agent a source feeds, `/` to search. an action captured against a row
-aborts if that task's text changed before the write lands, so a stale keypress
-never mutates the wrong (renumbered) line.
+configured source's checklist into one list (a header per source with a
+tail-truncated path — `…/dir/file.md`, file name preserved, full path still
+searchable — its items under it) and edits them in place — `enter`/`y` sends
+the pending `[ ]` task under the cursor to the cleanly idle agent its source
+feeds behind a Y/n confirmation, marking it `[-]` on success (done/in-progress
+tasks and busy agents are refused), `v` opens a task
+detail (full decoded text, full source path, live agents; `enter`/`y`, `e`,
+`x`, `f` keep working inside it), `a` add, `e` edit, `d` done/undone, `x`
+delete, `space` to mark a run so `d`/`x` act on all marked at once, `f` to
+focus the live agent a source feeds, `/` to search. `x` **on a source's header
+row** retires the whole source (config entry only, checklist file kept) behind
+a y/n confirmation — offered only when no live agent matches it or every task
+is finished, `[-]` counting as unfinished; marked items win over it. the
+add/edit prompts take
+multi-line task text: **shift+enter inserts a line break** (ctrl+j on
+terminals that can't report it), the box expands one line per break, **enter
+submits** — stored as the literal `\n` encoding above, decoded back when the
+prompt pre-fills. an action captured against a row aborts if that task's text
+changed before the write lands, so a stale keypress never mutates the wrong
+(renumbered) line.
 
 ### template placeholders
 
@@ -508,7 +539,7 @@ without a declared task source, the plugin falls back to inferring the next task
 
 if inference finds nothing (no task source and nothing inferable from the pane) and `llm.task_generate_command` is configured, the plugin runs that CLI once to synthesize a next task for the idle agent (placeholders: `{self}`, `{agent_name}`, `{agent_type}`, `{pane_excerpt}`, `{cwd}`). the CLI's stdout is surfaced as an escalation the operator confirms (writing a per-agent `tasks.md`) or dismisses — the plugin never sends a synthesized task unattended. leave `task_generate_command` unset to keep the default: an idle agent with no task source escalates as `no_task_source` and nothing is synthesized. `task_generate_command_start` is the first-interaction variant (empty inherits `task_generate_command`); `task_generate_timeout_seconds` bounds one run (0 inherits `llm.timeout_seconds`).
 
-**`max_tasks` (per `[[task_sources]]`, default 20)** caps how large a source's checklist may grow before generation stops refilling it. once the file holds MORE than `max_tasks` items — done, in-progress, and pending counted alike — and its pending items are exhausted, the daemon logs a warning (`maximum number of tasks reached … skipping task generation`, with the agent name) and skips generation for that agent instead of appending to an already-long list. prune the checklist (or raise `max_tasks`) to resume. this gates only LLM *generation*; sending the pending items of an under-cap source is unaffected, and the no-task-source bootstrap case (no `[[task_sources]]` entry) is never capped.
+**`max_tasks` (per `[[task_sources]]`, default 20)** caps how large a source's checklist may grow. once the file holds MORE than `max_tasks` items — done, in-progress, and pending counted alike — and its pending items are exhausted, the daemon logs a warning (`maximum number of tasks reached … skipping task generation`, with the agent name) and skips LLM generation for that agent instead of appending to an already-long list. the **same cap gates manual creation**: adding tasks (the Tasks-tab `a`, or `hap task … add`) to a registered source is rejected once it would push the list past `max_tasks` (`maximum number of tasks reached …`), so a hand-added list can't grow past what the daemon would then refuse to refill. prune the checklist (or raise `max_tasks`) to resume. sending the pending items of an under-cap source is unaffected; the no-task-source bootstrap case (no `[[task_sources]]` entry) and an ad-hoc `--path` file that is not a registered source are never capped.
 
 ## reset data
 

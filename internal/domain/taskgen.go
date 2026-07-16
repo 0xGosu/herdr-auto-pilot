@@ -215,7 +215,7 @@ func RenderGeneratedTaskList(agentName string, tasks []string) string {
 	for i, t := range tasks {
 		marker := "[ ]"
 		if i == 0 {
-			marker = "[-]"
+			marker = "[" + MarkInProgress + "]"
 		}
 		b.WriteString("- ")
 		b.WriteString(marker)

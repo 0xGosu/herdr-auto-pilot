@@ -320,6 +320,12 @@ type Status struct {
 	LatestKill         *domain.KillEvent
 	PendingEscalations int
 	MonitoredAgents    []domain.AgentTransition
+	// AgentsKnown reports that MonitoredAgents actually reflects herdr: false
+	// means the agent list could not be read (no adapter, or the query
+	// failed), which is NOT the same as "no agents are running" — an empty
+	// MonitoredAgents cannot tell the two apart on its own. Callers that
+	// would act on an agent's ABSENCE must check this first.
+	AgentsKnown bool
 	// AgentNames maps agent/pane ids to their short names.
 	AgentNames map[string]string
 	// AgentStats maps agent/pane ids to their lifetime counters (auto-sends,
@@ -356,6 +362,7 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 	st.PendingEscalations = int(pending)
 	if a.Herdr != nil {
 		if agents, err := a.Herdr.ListAgents(ctx); err == nil {
+			st.AgentsKnown = true
 			// Keep the view boundary defensive even if an alternate Herdr
 			// adapter does not normalize placeholder side-panel rows.
 			for _, agent := range agents {
@@ -1797,25 +1804,90 @@ func mutateTaskFile(path string, fn func(content string) (string, error)) ([]dom
 	return domain.ParseChecklist(out), nil
 }
 
+// TaskSourcePathFor resolves the checklist file behind an agent's task
+// source (the CLI's exactly-one-wins rules), absolutized — the exported
+// form of taskFilePath for callers that need the path itself (task send).
+func (a *App) TaskSourcePathFor(agent string) (string, error) {
+	p, err := a.taskFilePath(agent, "")
+	if err != nil {
+		return "", err
+	}
+	if abs, e := filepath.Abs(p); e == nil {
+		p = abs
+	}
+	return p, nil
+}
+
+// TaskSourceTemplateFor returns the next-task template of the task source
+// registered for agent at sourcePath — "" (the default template) when the
+// matching entry declares none. A config read failure is an error, not a
+// silent fallback to the default template.
+func (a *App) TaskSourceTemplateFor(agent, sourcePath string) (string, error) {
+	cfg, err := a.Config()
+	if err != nil {
+		return "", err
+	}
+	for _, src := range cfg.TaskSources {
+		p := src.Path
+		if abs, e := filepath.Abs(p); e == nil {
+			p = abs
+		}
+		if src.Agent == agent && p == sourcePath {
+			return src.NextTaskTemplate, nil
+		}
+	}
+	return "", nil
+}
+
 // SendTaskToAgent delivers one specific pending checklist item to a live
 // agent's pane, rendered through the task source's next-task template — the
-// operator-initiated twin of the daemon's idle-time declared-task send. Like
-// that flow (and unlike the generated-task flow) it never mutates the
-// checklist: the template steers the agent to self-mark progress via the
-// `hap task` CLI. As an operator action it is exempt from the pause switch,
-// matching Resolve/Confirm; the caller is expected to refuse busy agents
-// (the daemon only ever task-prompts a cleanly idle one).
-func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName, sourcePath, template, taskText string) error {
+// operator-initiated twin of the daemon's idle-time declared-task send.
+// Before delivering, the checklist is re-read and the send refused unless
+// task #index still carries exactly taskText and is still pending — the
+// caller's snapshot may be as old as an open detail overlay, and a task
+// completed or renumbered meanwhile must not be re-delivered (the same
+// freshness convention as expectTaskText). After a successful delivery the
+// item is marked [-] in progress (guarded by the same expected text), which
+// also keeps the daemon's own idle-time flow from re-sending it. As an
+// operator action it is exempt from the pause switch, matching
+// Resolve/Confirm; the caller is expected to refuse busy agents (the daemon
+// only ever task-prompts a cleanly idle one).
+func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName, sourcePath, template string, index int, taskText string) error {
 	if a.Herdr == nil {
 		return fmt.Errorf("herdr unavailable — cannot send")
 	}
 	if paneID == "" {
 		return fmt.Errorf("no pane known for this agent")
 	}
+	items, err := readChecklist(sourcePath)
+	if err != nil {
+		return fmt.Errorf("re-reading the checklist: %w", err)
+	}
+	fresh := false
+	for _, it := range items {
+		if it.Index == index && it.Text == taskText {
+			if it.Done {
+				return fmt.Errorf("task #%d is no longer pending — refresh and retry", index)
+			}
+			fresh = true
+			break
+		}
+	}
+	if !fresh {
+		return fmt.Errorf("task #%d changed since it was selected — refresh and retry", index)
+	}
 	prompt := domain.DeclaredTask{
 		Task: taskText, Path: sourcePath, Template: template, AgentName: agentName,
 	}.Prompt()
-	return ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt)
+	if err := ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt); err != nil {
+		return err
+	}
+	if _, err := mutateTaskFile(sourcePath, guardedMutation(index, []string{taskText}, func(content string) (string, error) {
+		return domain.MarkChecklistItemInProgress(content, index)
+	})); err != nil {
+		return fmt.Errorf("task sent, but marking it in-progress failed: %w", err)
+	}
+	return nil
 }
 
 // readChecklist reads and parses a checklist file.
@@ -1858,6 +1930,30 @@ func TaskGroups(cfg config.Config) []TaskGroup {
 		groups = append(groups, g)
 	}
 	return groups
+}
+
+// UnfinishedTasks counts items that are neither completed nor abandoned —
+// pending "[ ]" AND in-progress "[-]" — skipping unreadable sources like
+// PendingTasks does.
+//
+// It exists because ChecklistItem.Done is a pending/not-pending flag, not a
+// "completed" flag: ParseChecklist sets Done for every mark except " ", so a
+// "[-]" item an agent is mid-way through reads as Done and PendingTasks
+// counts it as zero work left. Callers asking "is this list finished?" (as
+// opposed to "is there anything to send?") must use this instead.
+func UnfinishedTasks(groups []TaskGroup) int {
+	n := 0
+	for _, g := range groups {
+		if g.Err != "" {
+			continue
+		}
+		for _, it := range g.Items {
+			if !it.Done || it.Mark == domain.MarkInProgress {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // PendingTasks counts unchecked items across groups, skipping unreadable

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -235,7 +236,10 @@ func taskAppModel(t *testing.T) (Model, *frontend.App, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	app := &frontend.App{Store: st, ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	// A herdr adapter reporting zero agents — "no agent matches this source",
+	// as opposed to a nil Herdr's "the agent list could not be read".
+	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
+		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
 	ctx := context.Background()
 	path := filepath.Join(dir, "tasks.md")
 	if err := os.WriteFile(path, []byte("- [ ] alpha\n- [x] beta\n- [-] gamma\n"), 0o644); err != nil {
@@ -288,8 +292,8 @@ func TestTasksTabSpaceMarksAndAdvances(t *testing.T) {
 	if !m.taskMarks[taskMarkKey(0, 1)] {
 		t.Fatalf("space on item #1 should mark it, got %v", m.taskMarks)
 	}
-	if m.cursor != 2 {
-		t.Errorf("space should advance the cursor to the next row, got %d", m.cursor)
+	if m.cursors[m.tab] != 2 {
+		t.Errorf("space should advance the cursor to the next row, got %d", m.cursors[m.tab])
 	}
 	if view := m.View(); !strings.Contains(view, "✓ #1 [ ] write the parser") {
 		t.Errorf("marked item should render a ✓ column:\n%s", view)
@@ -393,7 +397,7 @@ func TestTasksTabDuplicatePathBulkActionsDedupe(t *testing.T) {
 
 	markItemOneInBothGroups := func(m Model) Model {
 		t.Helper()
-		m.cursor = 0
+		m.cursors[m.tab] = 0
 		m.offsets[tabTasks] = 0
 		for g := 0; g < 2; g++ {
 			for m.selectedTaskRow() == nil || m.selectedTaskRow().group != g || m.selectedTaskRow().item != 1 {
@@ -469,7 +473,7 @@ func TestTasksTabAddPrompt(t *testing.T) {
 	upd, _ := m.Update(pressKeyMsg("a"))
 	m = upd.(Model)
 	// The label names the file (the directory may be display-truncated).
-	if m.prompt == nil || !strings.Contains(m.prompt.label, "new task for ") ||
+	if m.prompt == nil || !strings.Contains(m.prompt.label, "new task(s) for ") ||
 		!strings.Contains(m.prompt.label, filepath.Base(path)) {
 		t.Fatalf("a should open the add prompt naming the file, got %+v", m.prompt)
 	}
@@ -484,6 +488,105 @@ func TestTasksTabAddPrompt(t *testing.T) {
 	}
 	if m.status == nil || !strings.Contains(m.status.text, "added task #4") {
 		t.Errorf("add should report the new task number, got %+v", m.status)
+	}
+}
+
+// shiftEnterMsg mimics the unrecognized-CSI message bubbletea delivers for a
+// terminal's shift+enter escape sequence (an unexported type upstream — only
+// its String() rendering is observable, which is what isShiftEnter matches).
+type shiftEnterMsg struct{ seq string }
+
+func (s shiftEnterMsg) String() string { return fmt.Sprintf("?CSI%+v?", []byte(s.seq)) }
+
+func shiftEnter(t *testing.T, m Model, seq string) Model {
+	t.Helper()
+	upd, _ := m.Update(shiftEnterMsg{seq: seq})
+	return upd.(Model)
+}
+
+// TestAddPromptShiftEnterKeepsOneTask: in the add prompt, shift+enter
+// inserts a line break (the box expands — no ⏎ placeholder), enter submits,
+// and a two-line input stays ONE task stored with a literal `\n`. Appending
+// never renumbers, so existing marks survive.
+func TestAddPromptShiftEnterKeepsOneTask(t *testing.T) {
+	m, _, path := taskAppModel(t)
+	m = press(t, m, "down", " ") // mark #1 (cursor advances)
+	m = press(t, m, "a")
+	if m.prompt == nil || !m.prompt.multiline {
+		t.Fatal("add prompt should accept multiline input")
+	}
+	m = press(t, m, "one")
+	m = shiftEnter(t, m, "27;2;13~") // xterm modifyOtherKeys — what herdr sends
+	m = press(t, m, "two")
+	view := m.View()
+	if strings.Contains(view, "⏎") {
+		t.Errorf("the input box should expand instead of rendering ⏎:\n%s", view)
+	}
+	if !strings.Contains(view, "one\n  two█") {
+		t.Errorf("continuation lines should render under the label:\n%s", view)
+	}
+	// A trailing break puts the cursor on its own empty continuation line
+	// (normal editor behavior); submit trims it away.
+	m = shiftEnter(t, m, "27;2;13~")
+	if view := m.View(); !strings.Contains(view, "one\n  two\n  █") {
+		t.Errorf("trailing break should render the cursor on an empty line:\n%s", view)
+	}
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if len(m.taskMarks) != 1 {
+		t.Errorf("append never renumbers — marks must survive a multiline add, got %v", m.taskMarks)
+	}
+	if _, res := runAction(t, m, cmd); res.err != nil {
+		t.Fatal(res.err)
+	}
+	got := readTasks(t, path)
+	if !strings.Contains(got, `- [ ] one\ntwo`) {
+		t.Errorf("a two-line add should append ONE task with a literal \\n, got:\n%s", got)
+	}
+}
+
+// TestShiftEnterEncodingsAndScope: both standard shift+enter encodings are
+// recognized, and outside a multiline prompt the sequence is inert.
+func TestShiftEnterEncodingsAndScope(t *testing.T) {
+	m, _, _ := taskAppModel(t)
+	// Outside any prompt: no crash, no effect.
+	m = shiftEnter(t, m, "27;2;13~")
+	if m.prompt != nil {
+		t.Fatal("shift+enter outside a prompt must be inert")
+	}
+	// In a single-line prompt (rename, needs a populated Agents tab): inert.
+	sm := testModel(t)
+	sm = press(t, sm, "n")
+	if sm.prompt == nil || sm.prompt.multiline {
+		t.Fatalf("rename prompt should be single-line, got %+v", sm.prompt)
+	}
+	sm = shiftEnter(t, sm, "13;2u") // kitty encoding
+	if strings.Contains(sm.prompt.input, "\n") {
+		t.Error("shift+enter must not insert a newline in a single-line prompt")
+	}
+	// In a multiline prompt: both encodings insert a newline.
+	m.tab = tabTasks
+	m.cursors[m.tab] = 1
+	m = press(t, m, "e")
+	for _, seq := range []string{"27;2;13~", "13;2u"} {
+		before := strings.Count(m.prompt.input, "\n")
+		m = shiftEnter(t, m, seq)
+		if got := strings.Count(m.prompt.input, "\n"); got != before+1 {
+			t.Errorf("encoding %q should insert a newline, got %d breaks (want %d)", seq, got, before+1)
+		}
+	}
+}
+
+// TestMultilinePromptExpandsPageAccounting: every inserted line break costs
+// one list row, so the expanded prompt never overflows the pane.
+func TestMultilinePromptExpandsPageAccounting(t *testing.T) {
+	m, _, _ := taskAppModel(t)
+	m = press(t, m, "down", "e")
+	base := m.listPageSize()
+	m = shiftEnter(t, m, "27;2;13~")
+	m = shiftEnter(t, m, "27;2;13~")
+	if got := m.listPageSize(); got != base-2 {
+		t.Errorf("two inserted breaks should shrink the page by 2, got %d (base %d)", got, base)
 	}
 }
 
@@ -578,14 +681,24 @@ func TestTaskDetailEditAction(t *testing.T) {
 
 func TestTaskDetailDeleteAction(t *testing.T) {
 	m, _, path := taskAppModel(t)
-	m = press(t, m, "down", "v")
+	// Mark #3 first: a delete renumbers later items, so accepting the detail
+	// delete must also consume the positional marks (they'd retarget).
+	m = press(t, m, "down", "down", "down", " ")
+	m = press(t, m, "up", "up", "v")
+	if m.detail == nil || m.detail.task == nil || m.detail.task.item != 1 {
+		t.Fatalf("detail should be open on item #1, got %+v", m.detail)
+	}
 	upd, _ := m.Update(pressKeyMsg("x"))
 	m = upd.(Model)
 	if m.detail != nil || m.confirm == nil || !strings.Contains(m.confirm.label, "delete task #1?") {
 		t.Fatalf("detail x should close the overlay and confirm, got detail=%v confirm=%+v", m.detail != nil, m.confirm)
 	}
 	upd, cmd := m.Update(pressKeyMsg("y"))
-	if _, res := runAction(t, upd.(Model), cmd); res.err != nil {
+	m = upd.(Model)
+	if len(m.taskMarks) != 0 {
+		t.Errorf("detail delete renumbers later items — accepting it must consume marks, got %v", m.taskMarks)
+	}
+	if _, res := runAction(t, m, cmd); res.err != nil {
 		t.Fatal(res.err)
 	}
 	if got := readTasks(t, path); strings.Contains(got, "alpha") {
@@ -640,32 +753,284 @@ func TestTruncatePathKeepBase(t *testing.T) {
 		{"/tmp/tasks.md", "/tmp/tasks.md"},                            // short: unchanged
 		{"/a/b/c/d/e/f/g/h/tasks.md", "…/e/f/g/h/tasks.md"},           // keeps trailing dirs that fit
 		{"/aaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbb/tasks.md", "…/tasks.md"}, // only the base fits
+		// Wide runes are measured in display cells: "…/計画/タスク一覧.md"
+		// is 20 cells, so only the 15-cell basename form fits the limit.
+		{"/deep/dir/計画/タスク一覧.md", "…/タスク一覧.md"},
 	}
 	for _, tc := range cases {
 		if got := truncatePathKeepBase(tc.path, 18); got != tc.want {
 			t.Errorf("truncatePathKeepBase(%q, 18) = %q, want %q", tc.path, got, tc.want)
 		}
 	}
+	// A basename wider than the limit is itself bounded (oneLine fallback).
+	if got := truncatePathKeepBase("/dir/an-extremely-long-checklist-file-name.md", 18); runewidth.StringWidth(got) > 18 {
+		t.Errorf("oversized basename must still be bounded, got %q (%d cells)", got, runewidth.StringWidth(got))
+	}
 }
 
-func TestEditPromptCtrlJSplitsIntoTasks(t *testing.T) {
+// TestEditPromptShiftEnterEncodesNewline: a line break added with
+// shift+enter is stored as a literal `\n` on the SAME task line — the item
+// count never changes, so positional marks survive — and re-opening the
+// edit decodes it back into the expanded box (round trip).
+func TestEditPromptShiftEnterEncodesNewline(t *testing.T) {
 	m, _, path := taskAppModel(t)
-	m = press(t, m, "down", "e")
+	m = press(t, m, "down", "down", "down", " ") // mark #3
+	m = press(t, m, "up", "up", "e")
 	if m.prompt == nil || !m.prompt.multiline {
 		t.Fatal("task edit prompt should accept multiline input")
 	}
-	m = press(t, m, "ctrl+j")
+	m = shiftEnter(t, m, "27;2;13~")
 	m = press(t, m, "omega")
-	if view := m.View(); !strings.Contains(view, "alpha⏎omega") {
-		t.Errorf("prompt should render the newline as ⏎:\n%s", view)
+	if view := m.View(); !strings.Contains(view, "alpha\n  omega█") {
+		t.Errorf("the box should expand to show the new line:\n%s", view)
 	}
 	upd, cmd := m.Update(pressKeyMsg("enter"))
-	if _, res := runAction(t, upd.(Model), cmd); res.err != nil {
+	m = upd.(Model)
+	if len(m.taskMarks) != 1 {
+		t.Errorf("an edit never renumbers — marks must survive, got %v", m.taskMarks)
+	}
+	m, res := runAction(t, m, cmd)
+	if res.err != nil {
 		t.Fatal(res.err)
 	}
 	got := readTasks(t, path)
-	if want := "- [ ] alpha\n- [ ] omega\n- [x] beta\n- [-] gamma\n"; got != want {
-		t.Errorf("multiline edit should split into tasks after the edited item:\ngot  %q\nwant %q", got, want)
+	if want := "- [ ] alpha\\nomega\n- [x] beta\n- [-] gamma\n"; got != want {
+		t.Errorf("the break should be stored as a literal \\n on one line:\ngot  %q\nwant %q", got, want)
+	}
+	// Round trip: re-opening the edit decodes the stored `\n` for the box.
+	upd2, _ := m.Update(refreshData(m.ctx, m.app))
+	m = upd2.(Model)
+	m.tab = tabTasks
+	m.cursors[m.tab] = 1
+	m = press(t, m, "e")
+	if m.prompt == nil || m.prompt.input != "alpha\nomega" {
+		t.Fatalf("edit prefill should decode stored \\n, got %+v", m.prompt)
+	}
+}
+
+// sendTaskModel builds a Tasks tab backed by a REAL checklist file (the send
+// path re-reads it as a freshness guard) with a capture herdr wired, the
+// matched agent cleanly idle, a custom next-task template, and a stored `\n`
+// in item #1 so the send-side decode is observable. Rows: header, #1 pending,
+// #2 done, #3 in-progress, then the agentless codex group.
+func sendTaskModel(t *testing.T) (Model, *captureHerdr, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path,
+		[]byte(`- [ ] write the parser\nstart with the lexer`+"\n- [x] done thing\n- [-] wip thing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{
+		{Agent: "brave-otter", Path: path, NextTaskTemplate: "DO: {next_task_content} ({agent_name})"},
+		{Agent: "codex", Path: "/work/missing.md"},
+	}
+	h := &captureHerdr{}
+	m := Model{width: 100, height: 30, app: &frontend.App{Herdr: h}}
+	upd, _ := m.Update(refreshMsg{
+		status: frontend.Status{
+			MonitoredAgents: []domain.AgentTransition{
+				{AgentID: "w6:p1", AgentType: "claude", PaneID: "w6:p1", TabID: "w6:t1",
+					WorkspaceID: "w6", Status: "idle"},
+			},
+			AgentNames: map[string]string{"w6:p1": "brave-otter"},
+		},
+		cfg: cfg,
+		tasks: []frontend.TaskGroup{
+			{Source: cfg.TaskSources[0], Index: 0, Items: []domain.ChecklistItem{
+				{Index: 1, Mark: " ", Text: `write the parser\nstart with the lexer`},
+				{Index: 2, Mark: "x", Done: true, Text: "done thing"},
+				{Index: 3, Mark: "-", Done: true, Text: "wip thing"},
+			}},
+			{Source: cfg.TaskSources[1], Index: 1, Err: "open /work/missing.md: no such file or directory"},
+		},
+	})
+	m = upd.(Model)
+	m.tab = tabTasks
+	return m, h, path
+}
+
+func TestTasksSendPendingTask(t *testing.T) {
+	for _, key := range []string{"enter", "y"} {
+		m, h, path := sendTaskModel(t)
+		m = press(t, m, "down") // pending item #1
+		upd, _ := m.Update(pressKeyMsg(key))
+		m = upd.(Model)
+		// The send asks for Y/n confirmation first; n aborts untouched.
+		if m.confirm == nil || !strings.Contains(m.confirm.label, "send task #1 to brave-otter?") {
+			t.Fatalf("%s: send should ask for confirmation, got %+v", key, m.confirm)
+		}
+		m = press(t, m, "n")
+		if len(h.sent) != 0 {
+			t.Fatalf("%s: n must abort the send, got %v", key, h.sent)
+		}
+		if got := readTasks(t, path); !strings.Contains(got, `- [ ] write the parser`) {
+			t.Fatalf("%s: aborted send must keep the task pending:\n%s", key, got)
+		}
+		// Re-trigger and accept.
+		upd, _ = m.Update(pressKeyMsg(key))
+		m = upd.(Model)
+		upd, cmd := m.Update(pressKeyMsg("y"))
+		m, res := runAction(t, upd.(Model), cmd)
+		if res.err != nil {
+			t.Fatalf("%s: %v", key, res.err)
+		}
+		if len(h.sent) != 1 {
+			t.Fatalf("%s should deliver exactly once, got %v", key, h.sent)
+		}
+		// The prompt is rendered through the source's custom template with the
+		// stored `\n` decoded to a real newline.
+		for _, want := range []string{"DO: write the parser\nstart with the lexer", "(brave-otter)"} {
+			if !strings.Contains(h.sent[0], want) {
+				t.Errorf("%s: sent prompt missing %q:\n%s", key, want, h.sent[0])
+			}
+		}
+		if m.status == nil || !strings.Contains(m.status.text, "task #1 sent to brave-otter") {
+			t.Errorf("%s: send should report its outcome, got %+v", key, m.status)
+		}
+		// The confirmed send marks the task [-] in progress in the file.
+		if got := readTasks(t, path); !strings.Contains(got, `- [-] write the parser\nstart with the lexer`) {
+			t.Errorf("%s: sent task should be marked in progress, got:\n%s", key, got)
+		}
+	}
+}
+
+func TestTasksSendRefusals(t *testing.T) {
+	// Done and in-progress items are never sendable.
+	for _, row := range []struct {
+		downs int
+		name  string
+	}{{2, "done [x]"}, {3, "in-progress [-]"}} {
+		m, h, _ := sendTaskModel(t)
+		for i := 0; i < row.downs; i++ {
+			m = press(t, m, "down")
+		}
+		upd, cmd := m.Update(pressKeyMsg("enter"))
+		m = upd.(Model)
+		if cmd != nil || m.confirm != nil || len(h.sent) != 0 || !strings.Contains(m.message, "only a pending [ ] task") {
+			t.Errorf("%s must be refused before any confirmation, got cmd=%v confirm=%v sent=%v message=%q",
+				row.name, cmd != nil, m.confirm != nil, h.sent, m.message)
+		}
+	}
+	// A busy agent is refused (the daemon's idle-only rule).
+	m, h, _ := sendTaskModel(t)
+	m.data.status.MonitoredAgents[0].Status = "working"
+	m = press(t, m, "down")
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if cmd != nil || m.confirm != nil || len(h.sent) != 0 || !strings.Contains(m.message, "cleanly idle") {
+		t.Errorf("busy agent must be refused, got cmd=%v sent=%v message=%q", cmd != nil, h.sent, m.message)
+	}
+}
+
+func TestTasksSendNoLiveAgent(t *testing.T) {
+	m, h, _ := sendTaskModel(t)
+	// Give the codex group (no matching live agent, selector "codex") an item.
+	m.data.tasks[1].Err = ""
+	m.data.tasks[1].Items = []domain.ChecklistItem{{Index: 1, Mark: " ", Text: "orphan"}}
+	// Navigate to that item.
+	for m.selectedTaskRow() == nil || m.selectedTaskRow().group != 1 || m.selectedTaskRow().item != 1 {
+		m = press(t, m, "down")
+		if m.cursors[m.tab] > 12 {
+			t.Fatal("never reached the codex item")
+		}
+	}
+	upd, cmd := m.Update(pressKeyMsg("y"))
+	m = upd.(Model)
+	if cmd != nil || len(h.sent) != 0 || !strings.Contains(m.message, "no live agent matches") {
+		t.Errorf("unmatched source must be refused, got cmd=%v sent=%v message=%q", cmd != nil, h.sent, m.message)
+	}
+}
+
+func TestTaskDetailSendAction(t *testing.T) {
+	for _, key := range []string{"enter", "y"} {
+		m, h, _ := sendTaskModel(t)
+		m = press(t, m, "down", "v")
+		if m.detail == nil || m.detail.task == nil {
+			t.Fatal("detail should be open on item #1")
+		}
+		upd, _ := m.Update(pressKeyMsg(key))
+		m = upd.(Model)
+		if m.detail != nil {
+			t.Errorf("%s on a task detail should close the overlay", key)
+		}
+		if m.confirm == nil {
+			t.Fatalf("%s on a task detail should ask for confirmation", key)
+		}
+		upd, cmd := m.Update(pressKeyMsg("y"))
+		if _, res := runAction(t, upd.(Model), cmd); res.err != nil {
+			t.Fatal(res.err)
+		}
+		if len(h.sent) != 1 || !strings.Contains(h.sent[0], "write the parser") {
+			t.Errorf("%s: detail send should deliver the snapshotted task, got %v", key, h.sent)
+		}
+	}
+	// A done item in the detail refuses to send (before any confirmation).
+	m, h, _ := sendTaskModel(t)
+	m = press(t, m, "down", "down", "v")
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if cmd != nil || m.confirm != nil || len(h.sent) != 0 || !strings.Contains(m.message, "only a pending [ ] task") {
+		t.Errorf("done task in detail must refuse to send, got sent=%v message=%q", h.sent, m.message)
+	}
+}
+
+// TestTaskDetailShowsDecodedNewlines: the detail's Text field renders the
+// stored `\n` as real line breaks — the task as the agent will receive it.
+func TestTaskDetailShowsDecodedNewlines(t *testing.T) {
+	m, _, _ := sendTaskModel(t)
+	m = press(t, m, "down", "v")
+	view := m.View()
+	if !strings.Contains(view, "write the parser") || !strings.Contains(view, "start with the lexer") ||
+		strings.Contains(view, `parser\nstart`) {
+		t.Errorf("detail should decode stored \\n into real lines:\n%s", view)
+	}
+}
+
+// TestTasksSendHeaderRowIsNoop: enter/y on a group header does nothing.
+func TestTasksSendHeaderRowIsNoop(t *testing.T) {
+	m, h, _ := sendTaskModel(t)
+	_, cmd := m.Update(pressKeyMsg("enter")) // cursor 0 = header
+	if cmd != nil || len(h.sent) != 0 {
+		t.Errorf("enter on a header must be a no-op, got cmd=%v sent=%v", cmd != nil, h.sent)
+	}
+}
+
+// TestTasksSendRefusesStaleSnapshot pins the freshness guard end-to-end: the
+// detail overlay's snapshot goes stale (the agent completed the task) and
+// the send must abort instead of re-delivering.
+func TestTasksSendRefusesStaleSnapshot(t *testing.T) {
+	m, h, path := sendTaskModel(t)
+	m = press(t, m, "down", "v") // snapshot item #1 in the overlay
+	// The agent completes the task while the overlay is open.
+	if err := os.WriteFile(path,
+		[]byte(`- [x] write the parser\nstart with the lexer`+"\n- [x] done thing\n- [-] wip thing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	upd, _ := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if m.confirm == nil {
+		t.Fatal("send should ask for confirmation")
+	}
+	upd, cmd := m.Update(pressKeyMsg("y"))
+	_, res := runAction(t, upd.(Model), cmd)
+	if res.err == nil || !strings.Contains(res.err.Error(), "no longer pending") {
+		t.Fatalf("stale snapshot should refuse to send, got %+v", res)
+	}
+	if len(h.sent) != 0 {
+		t.Errorf("refused send must not deliver, got %v", h.sent)
+	}
+}
+
+func TestPromptCtrlJIgnoredWhenNotMultiline(t *testing.T) {
+	m := testModel(t) // Agents tab
+	m = press(t, m, "n")
+	if m.prompt == nil || m.prompt.multiline {
+		t.Fatalf("rename prompt should be single-line, got %+v", m.prompt)
+	}
+	m = press(t, m, "a", "ctrl+j", "b")
+	if m.prompt.input != "ab" {
+		t.Errorf("ctrl+j must be ignored on a single-line prompt, got %q", m.prompt.input)
 	}
 }
 
@@ -682,5 +1047,224 @@ func TestTasksMarksPrunedOnRefresh(t *testing.T) {
 	m = upd.(Model)
 	if len(m.taskMarks) != 0 {
 		t.Errorf("marks for vanished items must be pruned on refresh, got %v", m.taskMarks)
+	}
+}
+
+// removeSourceModel wires ONE task source whose selector matches a live,
+// idle agent ("brave-otter"), with the given checklist state, so the
+// Tasks-tab `x` eligibility guard can be driven directly. The cursor starts
+// on the group's header row.
+func removeSourceModel(t *testing.T, items []domain.ChecklistItem, groupErr string) Model {
+	t.Helper()
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{{Agent: "brave-otter", Path: "/work/tasks.md"}}
+	m := Model{width: 100, height: 30}
+	upd, _ := m.Update(refreshMsg{
+		status: frontend.Status{
+			AgentsKnown: true,
+			MonitoredAgents: []domain.AgentTransition{
+				{AgentID: "w6:p1", AgentType: "claude", PaneID: "w6:p1", WorkspaceID: "w6", Status: "idle"},
+			},
+			AgentNames: map[string]string{"w6:p1": "brave-otter"},
+		},
+		cfg:   cfg,
+		tasks: []frontend.TaskGroup{{Source: cfg.TaskSources[0], Index: 0, Items: items, Err: groupErr}},
+	})
+	m = upd.(Model)
+	m.tab = tabTasks
+	return m
+}
+
+// TestTasksRemoveSourceEligibility pins the guard: a source that still feeds a
+// live agent may only be retired once its list is genuinely finished.
+func TestTasksRemoveSourceEligibility(t *testing.T) {
+	done := func(mark string) domain.ChecklistItem {
+		return domain.ChecklistItem{Index: 1, Mark: mark, Done: true, Text: "t"}
+	}
+	for _, tc := range []struct {
+		name     string
+		items    []domain.ChecklistItem
+		groupErr string
+		want     bool // true = offers the confirmation
+	}{
+		{name: "all done", items: []domain.ChecklistItem{done("x")}, want: true},
+		{name: "empty list", want: true},
+		{name: "unreadable file", groupErr: "open /work/tasks.md: no such file", want: true},
+		{name: "pending task blocks", items: []domain.ChecklistItem{
+			{Index: 1, Mark: " ", Text: "todo"}}, want: false},
+		// The [-] case: Done is a pending/not-pending flag, so an agent
+		// mid-task looks finished to PendingTasks. It must still block.
+		{name: "in-progress task blocks", items: []domain.ChecklistItem{done("-")}, want: false},
+		{name: "in-progress blocks even when every other task is done", items: []domain.ChecklistItem{
+			{Index: 1, Mark: "x", Done: true, Text: "a"},
+			{Index: 2, Mark: "-", Done: true, Text: "b"}}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := removeSourceModel(t, tc.items, tc.groupErr)
+			m = press(t, m, "x")
+			if tc.want {
+				if m.confirm == nil {
+					t.Fatalf("x on the header should offer removal, got message %q", m.message)
+				}
+				if !strings.Contains(m.confirm.label, "remove task source #0") ||
+					!strings.Contains(m.confirm.label, "checklist file is kept") {
+					t.Errorf("confirmation should name the source and keep the file, got %q", m.confirm.label)
+				}
+				return
+			}
+			if m.confirm != nil {
+				t.Fatalf("a source still feeding a live agent must not be removable, got %q", m.confirm.label)
+			}
+			if !strings.Contains(m.message, "still feeds brave-otter") ||
+				!strings.Contains(m.message, "Config tab") {
+				t.Errorf("refusal should name the agent and the escape hatch, got %q", m.message)
+			}
+		})
+	}
+}
+
+// TestTasksRemoveSourceUnknownAgentsFailsClosed pins the guard against a
+// herdr that cannot be reached: GetStatus reports an EMPTY agent list on a
+// failed query, which must not read as "no agent matches this source" and
+// retire a source that is feeding one. A finished list stays removable —
+// that arm never needed the agent list.
+func TestTasksRemoveSourceUnknownAgentsFailsClosed(t *testing.T) {
+	unfinished := []domain.ChecklistItem{{Index: 1, Mark: " ", Text: "todo"}}
+	m := removeSourceModel(t, unfinished, "")
+	m.data.status.AgentsKnown = false // herdr query failed
+	m.data.status.MonitoredAgents = nil
+	m = press(t, m, "x")
+	if m.confirm != nil {
+		t.Fatalf("an unknown agent list must not be read as 'no agent matches', got %q", m.confirm.label)
+	}
+	if !strings.Contains(m.message, "herdr can't say which agent it feeds") {
+		t.Errorf("refusal should name the real cause, got %q", m.message)
+	}
+	// All tasks done: removable regardless of what herdr can tell us.
+	m = removeSourceModel(t, []domain.ChecklistItem{{Index: 1, Mark: "x", Done: true, Text: "t"}}, "")
+	m.data.status.AgentsKnown = false
+	m.data.status.MonitoredAgents = nil
+	m = press(t, m, "x")
+	if m.confirm == nil {
+		t.Errorf("a finished list should stay removable, got message %q", m.message)
+	}
+}
+
+// TestTasksRemoveSourceRevalidatesOnConfirm pins the window between the
+// question and the answer: the 2s poll can land in it, and a finished list is
+// exactly the state that both makes a source removable AND prompts the daemon
+// to regenerate tasks into it. Accepting must re-check, not fire the decision
+// the operator made against stale data.
+func TestTasksRemoveSourceRevalidatesOnConfirm(t *testing.T) {
+	finished := []domain.ChecklistItem{{Index: 1, Mark: "x", Done: true, Text: "old"}}
+	m := removeSourceModel(t, finished, "")
+	m = press(t, m, "x")
+	if m.confirm == nil {
+		t.Fatal("a finished list should offer removal")
+	}
+	// The daemon regenerates the exhausted list: a fresh [-] item appears.
+	cfg := m.data.cfg
+	upd, _ := m.Update(refreshMsg{
+		status: m.data.status,
+		cfg:    cfg,
+		tasks: []frontend.TaskGroup{{Source: cfg.TaskSources[0], Index: 0, Items: []domain.ChecklistItem{
+			{Index: 1, Mark: "-", Done: true, Text: "regenerated task"},
+		}}},
+	})
+	m = upd.(Model)
+	if m.confirm == nil {
+		t.Fatal("a refresh should not silently drop the pending confirmation")
+	}
+	upd, cmd := m.Update(pressKeyMsg("y"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("accepting a no-longer-removable source must not run the removal")
+	}
+	if !strings.Contains(m.message, "still feeds brave-otter") {
+		t.Errorf("abort should explain what changed, got %q", m.message)
+	}
+}
+
+// TestTasksRemoveSourceRemovesEntryKeepsFile drives the whole flow against a
+// real config + checklist file: no live agent matches, so the source is
+// retirable even with a pending task.
+func TestTasksRemoveSourceRemovesEntryKeepsFile(t *testing.T) {
+	m, app, path := taskAppModel(t) // no monitored agents
+	if got := readTasks(t, path); !strings.Contains(got, "- [ ] alpha") {
+		t.Fatalf("fixture should start with a pending task, got %q", got)
+	}
+	m = press(t, m, "x") // cursor starts on the header row
+	if m.confirm == nil {
+		t.Fatalf("an unmatched source should be removable, got message %q", m.message)
+	}
+	upd, cmd := m.Update(pressKeyMsg("y"))
+	m, res := runAction(t, upd.(Model), cmd)
+	if res.err != nil {
+		t.Fatalf("removal failed: %v", res.err)
+	}
+	if m.status == nil || !strings.Contains(m.status.text, "task source #0 removed") ||
+		!strings.Contains(m.status.text, "checklist file kept") {
+		t.Errorf("success should say the file was kept, got %+v", m.status)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 0 {
+		t.Errorf("config entry should be gone, got %+v", cfg.TaskSources)
+	}
+	// The contract the confirmation advertised.
+	if got := readTasks(t, path); !strings.Contains(got, "- [ ] alpha") {
+		t.Errorf("checklist file must survive, got %q", got)
+	}
+}
+
+func TestTasksRemoveSourceCancelKeepsEntry(t *testing.T) {
+	m, app, _ := taskAppModel(t)
+	m = press(t, m, "x")
+	if m.confirm == nil {
+		t.Fatal("expected a confirmation")
+	}
+	m = press(t, m, "n")
+	if m.confirm != nil {
+		t.Errorf("n should dismiss the confirmation, got %+v", m.confirm)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 {
+		t.Errorf("cancelled removal must keep the entry, got %+v", cfg.TaskSources)
+	}
+}
+
+// TestTasksMarkedItemsWinOverSourceRemoval pins the precedence: marks are
+// consulted first, so x on a header with items marked still deletes those
+// items and leaves the source alone.
+func TestTasksMarkedItemsWinOverSourceRemoval(t *testing.T) {
+	m, app, path := taskAppModel(t)
+	m = press(t, m, "down", " ") // mark item #1, cursor advances
+	m.cursors[m.tab] = 0         // back onto the header
+	m = press(t, m, "x")
+	if m.confirm == nil {
+		t.Fatal("expected a confirmation")
+	}
+	if !strings.Contains(m.confirm.label, "delete task #1") {
+		t.Fatalf("marked items must win over source removal, got %q", m.confirm.label)
+	}
+	upd, cmd := m.Update(pressKeyMsg("y"))
+	m, res := runAction(t, upd.(Model), cmd)
+	if res.err != nil {
+		t.Fatalf("delete failed: %v", res.err)
+	}
+	if got := readTasks(t, path); strings.Contains(got, "alpha") {
+		t.Errorf("marked item should be deleted, got %q", got)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 {
+		t.Errorf("source must survive an item delete, got %+v", cfg.TaskSources)
 	}
 }
