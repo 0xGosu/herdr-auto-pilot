@@ -101,6 +101,7 @@ func TestDeliverOutbound(t *testing.T) {
 		{"approval free text without menu stays literal", SituationApproval, "Enter a message:", "looks good", "looks good", false},
 		{"idle never maps even over a numbered list", SituationIdle, "done:\n1. ran tests\n2. built", "continue with the plan", "continue with the plan", false},
 		{"error retry command stays literal", SituationError, menu, "go test ./...", "go test ./...", false},
+		{"Codex rate-limit error option maps", SituationError, codexRateLimitFrame, "Keep current model", "2", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -352,6 +352,35 @@ func TestResolveMarksSentOnDelivery(t *testing.T) {
 	}
 }
 
+func TestConfirmCodexRateLimitErrorSendsSelectedMenuDigit(t *testing.T) {
+	app, st := testApp(t)
+	pane := "Approaching rate limits\n" +
+		"Switch to gpt-5.4-mini for lower credit usage?\n\n" +
+		"› 1. Switch to gpt-5.4-mini                 Small, fast, and cost-efficient model for simpler coding tasks.\n" +
+		"  2. Keep current model\n" +
+		"  3. Keep current model (never show again)  Hide future rate limit reminders about switching models.\n\n" +
+		"Press enter to confirm or esc to go back\n"
+	fake := &fakeHerdr{pane: pane}
+	app.Herdr = fake
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "codex-pane", AgentType: "codex", SituationType: domain.SituationError,
+		Trigger: "agent-status: idle", Action: "escalated", Status: "escalated",
+		Suggestion: "on error: Keep current model", PaneExcerpt: pane, CreatedAt: time.Now(),
+	})
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 1 || fake.inputs[0] != "2" {
+		t.Fatalf("Codex rate-limit confirmation sent %v, want menu digit 2", fake.inputs)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].CorrectedAction != "Keep current model" || !corr[0].Sent {
+		t.Fatalf("rate-limit confirmation correction = %+v", corr)
+	}
+}
+
 // TestResolveRecordOnlyNotSent: a record-only correction (no --send) leaves
 // Sent=false so the daemon does NOT run the self-check on an expectedly-blocked
 // agent.

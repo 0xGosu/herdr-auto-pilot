@@ -60,10 +60,9 @@ func DefaultRules() []config.ClassifierRule {
 			Regex: nil,
 		},
 		{
-			// Codex's interrupt screen ("Conversation interrupted - tell the
-			// model what to do differently") is detected structurally via
-			// domain.CodexErrorForm at the error position in Classify, same
-			// as Claude above.
+			// Codex's interrupt screen and footer-anchored rate-limit model
+			// switch modal are detected structurally via domain.CodexErrorForm
+			// at the error position in Classify, same as Claude above.
 			AgentType: "codex", Situation: "error",
 			Regex: nil,
 		},
@@ -133,6 +132,7 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 	}
 	s := domain.Situation{AgentType: agentType, Content: pane, Type: domain.SituationUnclassifiable}
 	codexPlanApproval := strings.EqualFold(agentType, "codex") && domain.CodexPlanApprovalForm(pane)
+	codexRateLimit := strings.EqualFold(agentType, "codex") && domain.CodexRateLimitForm(pane)
 
 	// Approval and choice are normally BLOCKED situations (constitution
 	// taxonomy): their content rules are gated on herdr reporting the agent
@@ -145,6 +145,13 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 			continue
 		}
 		matched := matchRule(r, pane)
+		// The Codex rate-limit modal says "Press enter to confirm", which also
+		// matches the generic approval rule. Its full footer-anchored structure
+		// identifies an error/remediation choice, so keep it at the error rule's
+		// position regardless of agent status.
+		if r.situation == domain.SituationApproval && codexRateLimit {
+			matched = false
+		}
 		// Codex's Plan-mode approval is a structural form, not a generic
 		// permission sentence. Detect it at the approval rule's position so
 		// approval retains priority over numbered-choice parsing.
@@ -163,8 +170,8 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		if !matched && r.situation == domain.SituationError && strings.EqualFold(agentType, "claude") {
 			_, matched = domain.ClaudeErrorForm(pane)
 		}
-		// Codex's interrupt screen ("Conversation interrupted") is detected
-		// structurally the same way, scoped to codex.
+		// Codex's interrupt screen and rate-limit model switch modal are
+		// detected structurally the same way, scoped to codex.
 		if !matched && r.situation == domain.SituationError && strings.EqualFold(agentType, "codex") {
 			_, matched = domain.CodexErrorForm(pane)
 		}
@@ -260,8 +267,11 @@ func enrich(s *domain.Situation) {
 			// use the stable kind so paraphrases share one signature.
 			s.ErrorSummary = kind
 		} else if kind, ok := domain.CodexErrorForm(s.Content); ok {
-			// Same reasoning as Claude above, for Codex's interrupt screen.
+			// Same reasoning as Claude above, for Codex's built-in error forms.
 			s.ErrorSummary = kind
+		}
+		if strings.EqualFold(s.AgentType, "codex") && domain.CodexRateLimitForm(s.Content) {
+			s.Options = append(s.Options, domain.OptionLabels(domain.ExtractCodexRateLimitForm(s.Content))...)
 		}
 	}
 }
