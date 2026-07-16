@@ -190,6 +190,8 @@ max_content_width = 0      # cap on variable-length list columns; 0 = full termi
 max_content_height = 0     # expanded long-field lines; 0 = unlimited; collapsed uses short tails
 theme = ""                 # named palette: default | dark | light | high-contrast;
                            # empty/unknown = default (the original look)
+terminal_bell = true       # ring the terminal bell (\a) on new escalations and on
+                           # pauses caused by a different process; default on
 
 # Optional per-role color overrides layered on the selected theme; unset
 # roles inherit the theme. Values are terminal colors ("205", "#ff5faf").

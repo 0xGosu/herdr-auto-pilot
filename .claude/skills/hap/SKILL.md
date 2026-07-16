@@ -342,6 +342,7 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `embedding.pane_salient_chars` | 800 | fallback signature window for idle/unclassified situations (trailing N chars) |
 | `tui.max_content_width` | 0 (full width) | cap variable-width list columns; 0 = full width |
 | `tui.theme` | default | TUI color theme: default, dark, light, high-contrast |
+| `tui.terminal_bell` | true | ring the terminal bell (\a) on new escalations and on pauses caused by a different process |
 
 TUI palette colors (`tui.palette.*`) are config.toml-only — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. values are 256-color codes (`"205"`) or hex (`"#ff5faf"`).
 
@@ -436,6 +437,11 @@ remove a task source by index:
 hap task-source remove <index>
 ```
 
+in the TUI you can also clear the source feeding one agent from its detail view
+(Agents tab → `v` → `t`): it removes the single `[[task_sources]]` entry
+matching that agent, and refuses (naming the candidates) when zero or more than
+one match, so a broad selector is never silently dropped for everyone.
+
 ### manage the task items (CRUD)
 
 `hap task` edits the checklist items *inside* a source's file (whereas
@@ -470,6 +476,14 @@ matches several, or only workspace-scoped sources exist, `hap task` errors and
 tells you to use `--path`. writes go straight to the file (atomically) — the
 daemon re-reads task files live, so no restart or reload is needed. adding a
 task doesn't interrupt a working agent; it's picked up on the agent's next idle.
+
+the TUI's **Tasks tab** does the same CRUD without the CLI: it aggregates every
+configured source's checklist into one list (a header per source, its items
+under it) and edits them in place — `a` add, `e` edit, `d` done/undone, `x`
+delete, `space` to mark a run so `d`/`x` act on all marked at once, `f` to focus
+the live agent a source feeds, `/` to search. an action captured against a row
+aborts if that task's text changed before the write lands, so a stale keypress
+never mutates the wrong (renumbered) line.
 
 ### template placeholders
 

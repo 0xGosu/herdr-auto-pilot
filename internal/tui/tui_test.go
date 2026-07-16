@@ -78,6 +78,8 @@ func pressKeyMsg(k string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEnter}
 	case "tab":
 		return tea.KeyMsg{Type: tea.KeyTab}
+	case "ctrl+j":
+		return tea.KeyMsg{Type: tea.KeyCtrlJ}
 	case "down":
 		return tea.KeyMsg{Type: tea.KeyDown}
 	case "up":
@@ -124,6 +126,146 @@ func TestDetailViewAgentWithoutMatchingTaskSourceShowsNA(t *testing.T) {
 	}
 }
 
+// agentTaskSourceDetailModel builds a Model wired to a real store/App (so
+// RemoveTaskSource's config.toml read-modify-write is exercised for real),
+// seeds the given task-source entries, and opens the Agents detail view for
+// a single monitored agent (id "w1:p2", type "claude").
+func agentTaskSourceDetailModel(t *testing.T, sources []config.TaskSource) (Model, *frontend.App) {
+	t.Helper()
+	m, app, _ := appModel(t)
+	ctx := context.Background()
+	for _, src := range sources {
+		if err := app.AddTaskSource(ctx, src.Agent, src.Workspace, src.Path, src.NextTaskTemplate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upd, _ := m.Update(refreshMsg{
+		cfg: cfg,
+		status: frontend.Status{
+			MonitoredAgents: []domain.AgentTransition{
+				{AgentID: "w1:p2", AgentType: "claude", PaneID: "w1:p2", WorkspaceID: "w1", TabID: "w1:t1", Status: "idle"},
+			},
+		},
+	})
+	m = upd.(Model)
+	m.tab = tabAgents
+	m.cursor = 0
+	m = press(t, m, "v")
+	if m.detail == nil || m.detail.agent == nil {
+		t.Fatal("v on Agents tab should open an agent detail view")
+	}
+	return m, app
+}
+
+func TestClearAgentTaskSourceSingleMatchRemovesIt(t *testing.T) {
+	// The matching entry sits at index 1, behind an unrelated one at index 0
+	// — pins that clearAgentTaskSource indexes into the real cfg.TaskSources
+	// slice, not a position within the filtered match list.
+	m, app := agentTaskSourceDetailModel(t, []config.TaskSource{
+		{Agent: "somebody-else", Path: "/other.md"},
+		{Agent: "w1:p2", Path: "/work/tasks.md"},
+	})
+	upd, cmd := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("t on an agent detail with one matching task source should return a command")
+	}
+	msg, ok := cmd().(actionResultMsg)
+	if !ok || msg.err != nil || !strings.Contains(msg.message, "task source #1 cleared") {
+		t.Fatalf("expected a cleared-task-source result naming index 1, got %+v", msg)
+	}
+	cfg, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 || cfg.TaskSources[0].Path != "/other.md" {
+		t.Errorf("only the matching (index-1) task source should have been removed, got %+v", cfg.TaskSources)
+	}
+
+	// The overlay stays open (mirroring the "f: focus" action), and feeding
+	// the actionResultMsg back through Update reports the success banner.
+	upd, _ = m.Update(msg)
+	m = upd.(Model)
+	if m.detail == nil || m.detail.agent == nil {
+		t.Fatal("the agent detail view should remain open after a successful clear")
+	}
+	if !strings.Contains(m.View(), "task source #1 cleared") {
+		t.Errorf("the success banner should be visible in the detail overlay:\n%s", m.View())
+	}
+
+	// A subsequent refresh (as the real 2s poll would deliver) plus the 1s
+	// clock tick rebuilds the open detail's lines against live cfg — the
+	// "Task source" field must self-correct to N/A, not show stale data.
+	cfg2, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upd, _ = m.Update(refreshMsg{cfg: cfg2, status: m.data.status})
+	m = upd.(Model)
+	upd, _ = m.Update(clockTickMsg(time.Now()))
+	m = upd.(Model)
+	if !strings.Contains(m.View(), "N/A") {
+		t.Errorf("Task source should self-correct to N/A after the clear, got:\n%s", m.View())
+	}
+}
+
+func TestClearAgentTaskSourceNoMatchIsNoop(t *testing.T) {
+	m, app := agentTaskSourceDetailModel(t, []config.TaskSource{
+		{Agent: "somebody-else", Path: "/work/tasks.md"},
+	})
+	upd, cmd := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("t with no matching task source must not run any mutation")
+	}
+	if !strings.Contains(m.message, "no task source configured") {
+		t.Errorf("expected a no-match hint, got %q", m.message)
+	}
+	if m.detail == nil {
+		t.Fatal("the detail overlay should remain open")
+	}
+	if !strings.Contains(m.View(), "no task source configured") {
+		t.Errorf("the no-match hint must actually render in the overlay, got:\n%s", m.View())
+	}
+	cfg, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 {
+		t.Errorf("the unrelated task source must be left alone, got %+v", cfg.TaskSources)
+	}
+}
+
+func TestClearAgentTaskSourceMultipleMatchesRefuses(t *testing.T) {
+	m, app := agentTaskSourceDetailModel(t, []config.TaskSource{
+		{Agent: "w1:p2", Path: "/work/a.md"},
+		{Agent: "claude", Path: "/work/b.md"}, // matches by AgentType too
+	})
+	upd, cmd := m.Update(pressKeyMsg("t"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("t with multiple matching task sources must not guess which to remove")
+	}
+	if !strings.Contains(m.message, "matches 2 task sources") ||
+		!strings.Contains(m.message, "/work/a.md") || !strings.Contains(m.message, "/work/b.md") {
+		t.Errorf("expected an ambiguity hint naming both sources, got %q", m.message)
+	}
+	if !strings.Contains(m.View(), "matches 2 task sources") {
+		t.Errorf("the ambiguity hint must actually render in the overlay, got:\n%s", m.View())
+	}
+	cfg, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Errorf("neither task source should have been removed, got %+v", cfg.TaskSources)
+	}
+}
+
 func TestDetailViewAgentLocationFallsBackToIDs(t *testing.T) {
 	m := testModel(t)
 	m.data.status.Workspaces = nil
@@ -145,8 +287,8 @@ func TestDetailViewTabSwitches(t *testing.T) {
 	if m.detail != nil {
 		t.Error("tab should close the detail view")
 	}
-	if m.tab != tabEscalations {
-		t.Errorf("tab should advance to Escalations, got %v", m.tab)
+	if m.tab != tabTasks {
+		t.Errorf("tab should advance to Tasks, got %v", m.tab)
 	}
 	// shift+tab goes backwards from an open detail too.
 	m.tab = tabAudit
@@ -1501,8 +1643,8 @@ func TestDetailViewVimLStillSwitchesTabsOffEscalations(t *testing.T) {
 	if m.detail != nil {
 		t.Error("l should close the Agents detail (vim-right)")
 	}
-	if m.tab != tabEscalations {
-		t.Errorf("l should advance Agents → Escalations, got %v", m.tab)
+	if m.tab != tabTasks {
+		t.Errorf("l should advance Agents → Tasks, got %v", m.tab)
 	}
 }
 

@@ -273,6 +273,48 @@ func EditChecklistItemText(content string, index int, text string) (string, erro
 	})
 }
 
+// ReplaceChecklistItemLines replaces item index with one item per entry of
+// texts: the first keeps the item's checkbox marker (a done item stays done),
+// the rest become new unchecked items with the same indent+bullet, inserted
+// in order right after it. Each text must be a non-empty single line — this
+// is how multi-line input (one physical line per item) enters a checklist
+// without an embedded newline ever forging status or extra items.
+func ReplaceChecklistItemLines(content string, index int, texts []string) (string, error) {
+	if len(texts) == 0 {
+		return "", fmt.Errorf("task text must not be empty")
+	}
+	clean := make([]string, len(texts))
+	for i, t := range texts {
+		v, err := validateTaskText(t)
+		if err != nil {
+			return "", err
+		}
+		clean[i] = v
+	}
+	lines := strings.Split(content, "\n")
+	count := 0
+	for i, line := range lines {
+		m := checklistItemRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		count++
+		if count != index {
+			continue
+		}
+		repl := []string{m[1] + "[" + m[2] + "] " + clean[0]}
+		for _, t := range clean[1:] {
+			repl = append(repl, m[1]+"[ ] "+t)
+		}
+		out := make([]string, 0, len(lines)+len(repl)-1)
+		out = append(out, lines[:i]...)
+		out = append(out, repl...)
+		out = append(out, lines[i+1:]...)
+		return strings.Join(out, "\n"), nil
+	}
+	return "", outOfRangeErr(index, count)
+}
+
 // DeleteChecklistItem removes item index's line entirely, leaving every other
 // line untouched.
 func DeleteChecklistItem(content string, index int) (string, error) {

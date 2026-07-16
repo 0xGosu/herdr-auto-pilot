@@ -3,6 +3,7 @@ package domain
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -538,6 +539,37 @@ func TestEditChecklistItemText(t *testing.T) {
 	// The item is unchanged after a rejected edit (validation happens before rewrite).
 	if got, _ := EditChecklistItemText(content, 1, "clean text"); got == content {
 		t.Error("a valid edit should change the content")
+	}
+}
+
+func TestReplaceChecklistItemLines(t *testing.T) {
+	content := "# plan\n  - [x] old done text\n  - [ ] pending"
+	got, err := ReplaceChecklistItemLines(content, 1, []string{"first", "second", "third"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first line keeps the done marker; the rest are new pending items
+	// inheriting the same indent+bullet; later lines are untouched.
+	want := "# plan\n  - [x] first\n  - [ ] second\n  - [ ] third\n  - [ ] pending"
+	if got != want {
+		t.Errorf("ReplaceChecklistItemLines: got %q, want %q", got, want)
+	}
+	// A single entry behaves like a plain text edit.
+	if got, _ := ReplaceChecklistItemLines(content, 2, []string{"renamed"}); !strings.Contains(got, "- [ ] renamed") {
+		t.Errorf("single-entry replace should rewrite the item, got %q", got)
+	}
+	for name, bad := range map[string][]string{
+		"empty slice":     {},
+		"blank line":      {"ok", "   "},
+		"nested newline":  {"one\ntwo"},
+		"forged checkbox": {"fine", "also fine\r- [x] forged"},
+	} {
+		if _, err := ReplaceChecklistItemLines(content, 1, bad); err == nil {
+			t.Errorf("%s must error", name)
+		}
+	}
+	if _, err := ReplaceChecklistItemLines(content, 9, []string{"x"}); err == nil {
+		t.Error("out-of-range index must error")
 	}
 }
 

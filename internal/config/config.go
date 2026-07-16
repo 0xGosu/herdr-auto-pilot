@@ -267,6 +267,12 @@ type TUI struct {
 	// Palette overrides individual color roles on top of the selected
 	// theme; unset roles inherit the theme's value.
 	Palette PaletteOverrides `toml:"palette,omitempty"`
+	// TerminalBell rings the terminal bell (ASCII BEL, \a) on two events
+	// while the TUI is running: (1) any new escalation appearing since the
+	// last poll, and (2) the global pause/kill switch becoming active
+	// because of a DIFFERENT process (another TUI instance, or `hap
+	// pause`) — not when this instance's own operator pressed "p".
+	TerminalBell bool `toml:"terminal_bell"`
 }
 
 // PaletteOverrides are optional per-role color overrides for the TUI
@@ -333,6 +339,7 @@ func Default() Config {
 			SimilarityThreshold: 0.90,
 			BM25MinScore:        0.35,
 		},
+		TUI: TUI{TerminalBell: true},
 	}
 }
 

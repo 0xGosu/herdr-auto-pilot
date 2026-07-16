@@ -1099,6 +1099,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"tui.max_content_width":                   "140",
 		"tui.max_content_height":                  "12",
 		"tui.theme":                               "dark",
+		"tui.terminal_bell":                       "true",
 	}
 
 	registry := make(map[string]bool, len(frontend.ConfigFieldKeys))
@@ -2219,5 +2220,167 @@ func TestMutatePreservesFileMode(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o644 {
 		t.Errorf("file mode after edit = %o, want preserved 0644 (not narrowed to 0600)", got)
+	}
+}
+
+// TestTaskGroups covers the aggregated all-sources view (TUI Tasks tab): one
+// group per config entry in config order, per-source read failures isolated
+// to their own group, duplicate paths read independently.
+func TestTaskGroups(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(good, []byte("# plan\n- [ ] a\n- [x] b\n- [-] c\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(dir, "prose.md")
+	if err := os.WriteFile(empty, []byte("# notes\nno checklist here\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "gone.md")
+
+	cfg := config.Config{TaskSources: []config.TaskSource{
+		{Agent: "brave-otter", Workspace: "w1", Path: good},
+		{Agent: "codex", Path: missing},
+		{Agent: "empty-path"},
+		{Workspace: "*", Path: good}, // duplicate path, its own group
+		{Agent: "quiet", Path: empty},
+	}}
+	groups := frontend.TaskGroups(cfg)
+	if len(groups) != len(cfg.TaskSources) {
+		t.Fatalf("got %d groups, want %d", len(groups), len(cfg.TaskSources))
+	}
+	for i, g := range groups {
+		if g.Index != i || g.Source.Path != cfg.TaskSources[i].Path {
+			t.Errorf("group %d: Index=%d Path=%q, want config order preserved", i, g.Index, g.Source.Path)
+		}
+	}
+
+	if g := groups[0]; g.Err != "" || len(g.Items) != 3 {
+		t.Fatalf("readable source: Err=%q items=%d, want no error and 3 items", g.Err, len(g.Items))
+	}
+	wantItems := []struct {
+		mark string
+		done bool
+		text string
+	}{{" ", false, "a"}, {"x", true, "b"}, {"-", true, "c"}}
+	for i, want := range wantItems {
+		it := groups[0].Items[i]
+		if it.Mark != want.mark || it.Done != want.done || it.Text != want.text || it.Index != i+1 {
+			t.Errorf("item %d = %+v, want mark=%q done=%v text=%q", i, it, want.mark, want.done, want.text)
+		}
+	}
+
+	if g := groups[1]; g.Err == "" || len(g.Items) != 0 {
+		t.Errorf("missing file: Err=%q items=%d, want an error and no items", g.Err, len(g.Items))
+	}
+	if g := groups[2]; g.Err != "no path configured" {
+		t.Errorf("empty path: Err=%q, want \"no path configured\"", g.Err)
+	}
+	if g := groups[3]; g.Err != "" || len(g.Items) != 3 {
+		t.Errorf("duplicate path: Err=%q items=%d, want an independent readable group", g.Err, len(g.Items))
+	}
+	if g := groups[4]; g.Err != "" || len(g.Items) != 0 {
+		t.Errorf("readable file without checklist items: Err=%q items=%d, want no error and no items", g.Err, len(g.Items))
+	}
+}
+
+func TestTaskGroupsEmptyConfig(t *testing.T) {
+	if groups := frontend.TaskGroups(config.Config{}); len(groups) != 0 {
+		t.Errorf("no task sources should yield no groups, got %d", len(groups))
+	}
+}
+
+// TestTaskMutationsVerifyExpectedText pins the optional expected-text guard:
+// a mutation whose caller resolved the task number against a checklist that
+// has since changed must abort inside the lock, leaving the file untouched.
+func TestTaskMutationsVerifyExpectedText(t *testing.T) {
+	app, _ := testApp(t)
+	newFile := func() string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "tasks.md")
+		if err := os.WriteFile(path, []byte("- [ ] alpha\n- [x] beta\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	cases := []struct {
+		name   string
+		run    func(path string, expect ...string) error
+		expect string // guard value; the file's task #1 is "alpha"
+	}{
+		{"done", func(p string, e ...string) error {
+			_, err := app.SetTaskDone("", p, 1, true, e...)
+			return err
+		}, "stale"},
+		{"edit", func(p string, e ...string) error {
+			_, err := app.EditTask("", p, 1, "rewritten", e...)
+			return err
+		}, "stale"},
+		{"delete", func(p string, e ...string) error {
+			_, err := app.DeleteTask("", p, 1, e...)
+			return err
+		}, "stale"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := newFile()
+			if err := tc.run(path, tc.expect); err == nil || !strings.Contains(err.Error(), "checklist changed") {
+				t.Fatalf("mismatched expected text should abort, got %v", err)
+			}
+			data, _ := os.ReadFile(path)
+			if string(data) != "- [ ] alpha\n- [x] beta\n" {
+				t.Errorf("aborted %s must not modify the file, got:\n%s", tc.name, data)
+			}
+			// The matching text (and the no-guard CLI form) still mutates.
+			if err := tc.run(path, "alpha"); err != nil {
+				t.Fatalf("matching expected text should pass: %v", err)
+			}
+			if err := tc.run(newFile()); err != nil {
+				t.Fatalf("guard must stay optional for CLI callers: %v", err)
+			}
+		})
+	}
+	// An out-of-range number reports "no longer exists".
+	path := newFile()
+	if _, err := app.DeleteTask("", path, 9, "alpha"); err == nil || !strings.Contains(err.Error(), "no longer exists") {
+		t.Errorf("vanished task number should abort with a refresh hint, got %v", err)
+	}
+}
+
+// TestEditTaskMultiline: newline-bearing text splits into one item per line —
+// the addressed item keeps its status, following lines become pending items —
+// and the expected-text guard still composes.
+func TestEditTaskMultiline(t *testing.T) {
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [x] one\n- [ ] two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	items, err := app.EditTask("", path, 1, "first\n  second  \n\nthird", "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("got %d items, want 4: %+v", len(items), items)
+	}
+	data, _ := os.ReadFile(path)
+	if want := "- [x] first\n- [ ] second\n- [ ] third\n- [ ] two\n"; string(data) != want {
+		t.Errorf("multiline edit:\ngot  %q\nwant %q", data, want)
+	}
+	if _, err := app.EditTask("", path, 1, "a\nb", "stale"); err == nil {
+		t.Error("guard must still abort a stale multiline edit")
+	}
+}
+
+// TestPendingTasks: only unchecked ("[ ]") items count, and unreadable
+// sources are skipped (their contents are unknown, not zero).
+func TestPendingTasks(t *testing.T) {
+	groups := []frontend.TaskGroup{
+		{Items: []domain.ChecklistItem{{Mark: " "}, {Mark: "x", Done: true}, {Mark: " "}}},
+		{Err: "open: no such file", Items: []domain.ChecklistItem{{Mark: " "}}},
+		{Items: []domain.ChecklistItem{{Mark: "-", Done: true}}},
+	}
+	if got := frontend.PendingTasks(groups); got != 2 {
+		t.Errorf("PendingTasks = %d, want 2 (errored group skipped, done/in-progress not pending)", got)
 	}
 }

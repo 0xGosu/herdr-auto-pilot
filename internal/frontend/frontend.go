@@ -1132,6 +1132,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.max_content_width", TUIEditable: true},
 	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
+	{Key: "tui.terminal_bell", TUIEditable: true},
 }
 
 // ConfigFieldKeys lists every scalar config field editable via SetField, in
@@ -1270,6 +1271,8 @@ func FieldValue(cfg config.Config, key string) string {
 			return "default"
 		}
 		return cfg.TUI.Theme
+	case "tui.terminal_bell":
+		return strconv.FormatBool(cfg.TUI.TerminalBell)
 	}
 	return ""
 }
@@ -1477,6 +1480,13 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			return fmt.Errorf("tui.theme must be one of %s, got %q",
 				strings.Join(config.ValidThemes, ", "), value)
+		case "tui.terminal_bell":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("tui.terminal_bell must be true or false, got %q", value)
+			}
+			cfg.TUI.TerminalBell = v
+			return nil
 		}
 		return fmt.Errorf("unknown config field %q", key)
 	})
@@ -1727,11 +1737,24 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 }
 
 // taskLockPath returns a stable, hap-owned lock-file path for a task file,
-// keyed by the file's (already absolute) path. Keeping the lock in a shared
-// temp dir — rather than a `<file>.lock` sidecar — serializes concurrent
-// mutations without dropping a stray lock file into the user's repo next to a
-// --path checklist.
+// keyed by the file's canonical path. Keeping the lock in a shared temp dir —
+// rather than a `<file>.lock` sidecar — serializes concurrent mutations
+// without dropping a stray lock file into the user's repo next to a --path
+// checklist.
+//
+// The path is canonicalized (absolute + symlinks resolved, best-effort) so
+// every caller — the CLI, the TUI's add/edit, and the TUI's bulk toggle/delete
+// (which passes an already symlink-resolved path) — hashes to the SAME key for
+// one physical file. Without this, a symlinked path component (e.g. macOS
+// /var vs /private/var) would yield two different locks and stop serializing
+// concurrent mutations of the same checklist.
 func taskLockPath(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
 	sum := sha256.Sum256([]byte(path))
 	return filepath.Join(os.TempDir(), "hap-task-locks", hex.EncodeToString(sum[:16])+".lock")
 }
@@ -1774,6 +1797,65 @@ func mutateTaskFile(path string, fn func(content string) (string, error)) ([]dom
 	return domain.ParseChecklist(out), nil
 }
 
+// readChecklist reads and parses a checklist file.
+func readChecklist(path string) ([]domain.ChecklistItem, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return domain.ParseChecklist(string(data)), nil
+}
+
+// TaskGroup is one configured task source plus its parsed checklist, for the
+// aggregated all-agents view (TUI Tasks tab). Err carries a per-source read
+// failure (missing/unreadable file) so one bad source never hides the rest.
+type TaskGroup struct {
+	Source config.TaskSource
+	Index  int // position in cfg.TaskSources (stable group identity)
+	Items  []domain.ChecklistItem
+	Err    string // "" = read OK
+}
+
+// TaskGroups parses every configured task source's checklist, in config
+// order. It takes the already-loaded cfg so a refresh snapshot's config and
+// its task groups can never disagree. Duplicate paths each get their own
+// group — they are distinct config entries, exactly as the Config tab lists
+// them. This deliberately does NOT reuse resolveTaskFilePath: its
+// exactly-one-source-per-agent semantics pick a file to edit, while the
+// aggregate shows every source as configured.
+func TaskGroups(cfg config.Config) []TaskGroup {
+	groups := make([]TaskGroup, 0, len(cfg.TaskSources))
+	for i, src := range cfg.TaskSources {
+		g := TaskGroup{Source: src, Index: i}
+		if src.Path == "" {
+			g.Err = "no path configured"
+		} else if items, err := readChecklist(src.Path); err != nil {
+			g.Err = err.Error()
+		} else {
+			g.Items = items
+		}
+		groups = append(groups, g)
+	}
+	return groups
+}
+
+// PendingTasks counts unchecked items across groups, skipping unreadable
+// sources (their contents are unknown, not zero).
+func PendingTasks(groups []TaskGroup) int {
+	n := 0
+	for _, g := range groups {
+		if g.Err != "" {
+			continue
+		}
+		for _, it := range g.Items {
+			if !it.Done {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 // ListTasks returns every checklist item in the resolved source file, numbered
 // by absolute file position (checked and unchecked alike). Filtering by status
 // is the CLI's job — the numbers here never depend on a filter.
@@ -1782,11 +1864,7 @@ func (a *App) ListTasks(agent, path string) ([]domain.ChecklistItem, error) {
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return nil, err
-	}
-	return domain.ParseChecklist(string(data)), nil
+	return readChecklist(p)
 }
 
 // GetTask returns the single item addressed by its 1-based number.
@@ -1822,37 +1900,86 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 	return items, newIndex, err
 }
 
-// SetTaskDone toggles an item's status and returns the renumbered list.
-func (a *App) SetTaskDone(agent, path string, index int, done bool) ([]domain.ChecklistItem, error) {
+// expectTaskText guards a checklist mutation against a file that changed
+// while the operator had a prompt or confirmation open: inside the same
+// locked read-modify-write, it verifies task #index still carries exactly
+// the text the caller resolved the number against. Task numbers are
+// positional and renumber on every delete, so without this a stale index
+// would silently mutate a different line.
+func expectTaskText(content string, index int, want string) error {
+	for _, it := range domain.ParseChecklist(content) {
+		if it.Index != index {
+			continue
+		}
+		if it.Text != want {
+			return fmt.Errorf("task #%d is now %q, not %q — the checklist changed; refresh and retry", index, it.Text, want)
+		}
+		return nil
+	}
+	return fmt.Errorf("task #%d no longer exists — the checklist changed; refresh and retry", index)
+}
+
+// guardedMutation wraps a checklist mutation with the optional expected-text
+// check the TUI's captured-at-keypress actions pass (the CLI omits it).
+func guardedMutation(index int, expectText []string, fn func(string) (string, error)) func(string) (string, error) {
+	return func(content string) (string, error) {
+		if len(expectText) > 0 {
+			if err := expectTaskText(content, index, expectText[0]); err != nil {
+				return "", err
+			}
+		}
+		return fn(content)
+	}
+}
+
+// SetTaskDone toggles an item's status and returns the renumbered list. An
+// optional expectText aborts (inside the file lock) if the item's text no
+// longer matches — see expectTaskText.
+func (a *App) SetTaskDone(agent, path string, index int, done bool, expectText ...string) ([]domain.ChecklistItem, error) {
 	p, err := a.taskFilePath(agent, path)
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, func(content string) (string, error) {
+	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
 		return domain.SetChecklistItemDone(content, index, done)
-	})
+	}))
 }
 
 // EditTask replaces an item's text (keeping its status) and returns the list.
-func (a *App) EditTask(agent, path string, index int, text string) ([]domain.ChecklistItem, error) {
+// Text containing newlines splits into multiple items: the first line rewrites
+// the addressed item (keeping its status), each further non-blank line becomes
+// a new pending item right after it. An optional expectText aborts (inside the
+// file lock) if the item's text no longer matches — see expectTaskText.
+func (a *App) EditTask(agent, path string, index int, text string, expectText ...string) ([]domain.ChecklistItem, error) {
 	p, err := a.taskFilePath(agent, path)
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, func(content string) (string, error) {
+	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
+		if strings.ContainsAny(text, "\r\n") {
+			var texts []string
+			for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+				if line = strings.TrimSpace(line); line != "" {
+					texts = append(texts, line)
+				}
+			}
+			return domain.ReplaceChecklistItemLines(content, index, texts)
+		}
 		return domain.EditChecklistItemText(content, index, text)
-	})
+	}))
 }
 
-// DeleteTask removes an item and returns the renumbered list.
-func (a *App) DeleteTask(agent, path string, index int) ([]domain.ChecklistItem, error) {
+// DeleteTask removes an item and returns the renumbered list. An optional
+// expectText aborts (inside the file lock) if the item's text no longer
+// matches — see expectTaskText.
+func (a *App) DeleteTask(agent, path string, index int, expectText ...string) ([]domain.ChecklistItem, error) {
 	p, err := a.taskFilePath(agent, path)
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, func(content string) (string, error) {
+	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
 		return domain.DeleteChecklistItem(content, index)
-	})
+	}))
 }
 
 // SignatureRow is a learned signature enriched for display: the persisted

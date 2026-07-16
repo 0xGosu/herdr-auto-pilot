@@ -325,9 +325,9 @@ func TestTabSwitchResetsCursorAndOffset(t *testing.T) {
 		t.Fatal("precondition: agents tab should be scrolled")
 	}
 	m = press(t, m, "tab")
-	if m.tab != tabEscalations || m.cursor != 0 || m.offsets[tabEscalations] != 0 {
+	if m.tab != tabTasks || m.cursor != 0 || m.offsets[tabTasks] != 0 {
 		t.Errorf("tab switch must reset cursor and the new tab's offset, got tab=%v cursor=%d offset=%d",
-			m.tab, m.cursor, m.offsets[tabEscalations])
+			m.tab, m.cursor, m.offsets[tabTasks])
 	}
 	// Backwards too.
 	for i := 0; i < 10; i++ {
@@ -627,7 +627,7 @@ func TestAgentsListPreservesHerdrOrder(t *testing.T) {
 	// The rendered view must show the same order, not just the slice.
 	m.tab = tabAgents
 	view := m.View()
-	var lastIdx int = -1
+	lastIdx := -1
 	for i, name := range []string{"happy-seal", "cosmic-yak", "eager-falcon", "patient-lemur"} {
 		idx := strings.Index(view, name)
 		if idx == -1 {
