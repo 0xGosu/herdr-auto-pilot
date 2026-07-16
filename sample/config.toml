@@ -228,6 +228,12 @@ terminal_bell = true       # ring the terminal bell (\a) on new escalations and 
 # recommendation and the original task). Default: on. Opt a source out to keep
 # the plain declared-task flow:
 # llm_review = false
+# Cap how many checklist items (done, in-progress, and pending) this source may
+# hold before LLM task generation stops refilling it: once the file has MORE
+# than max_tasks items and its pending items are exhausted, the daemon logs a
+# warning and skips generation instead of piling more onto an already-long list
+# — prune the checklist to make room. Default: 20 when unset.
+# max_tasks = 20
 
 # ── Custom classifier rules (repeatable, extend the built-ins) ──────
 # [[classifier]]

@@ -250,6 +250,43 @@ llm_review = false
 	}
 }
 
+func TestTaskSourceMaxTasksParsingAndDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte(`
+[[task_sources]]
+agent = "a1"
+path = "/tmp/one.md"
+
+[[task_sources]]
+agent = "a2"
+path = "/tmp/two.md"
+max_tasks = 5
+`), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Fatalf("want 2 task sources, got %d", len(cfg.TaskSources))
+	}
+	// Unset max_tasks stays 0 on the struct but resolves to the default.
+	if cfg.TaskSources[0].MaxTasks != 0 {
+		t.Errorf("unset max_tasks should stay 0, got %d", cfg.TaskSources[0].MaxTasks)
+	}
+	if got := cfg.TaskSources[0].MaxTasksLimit(); got != DefaultMaxTasks {
+		t.Errorf("unset max_tasks should resolve to DefaultMaxTasks (%d), got %d", DefaultMaxTasks, got)
+	}
+	// An explicit value parses and is used verbatim.
+	if cfg.TaskSources[1].MaxTasks != 5 || cfg.TaskSources[1].MaxTasksLimit() != 5 {
+		t.Errorf("explicit max_tasks=5 should parse and resolve to 5, got %d / %d",
+			cfg.TaskSources[1].MaxTasks, cfg.TaskSources[1].MaxTasksLimit())
+	}
+	// A non-positive value falls back to the default (guards a hand-edited 0/-1).
+	if got := (TaskSource{MaxTasks: -1}).MaxTasksLimit(); got != DefaultMaxTasks {
+		t.Errorf("non-positive max_tasks should resolve to DefaultMaxTasks (%d), got %d", DefaultMaxTasks, got)
+	}
+}
+
 func TestLoadNeverAutoRulesAndMigrateLegacyIndicators(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	os.WriteFile(path, []byte(`

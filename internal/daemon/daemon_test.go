@@ -1910,6 +1910,50 @@ func TestGenerateTaskFirstFlagIndependentOfExhaustedSource(t *testing.T) {
 	}
 }
 
+func TestIdleTaskGenSkipsWhenOverMaxTasks(t *testing.T) {
+	// A source with more items than its max_tasks cap must NOT be topped up:
+	// generateTask logs a warning and returns without staging an LLM request
+	// or invoking the generator. Asserting "no staged request" (not just "no
+	// escalation") is the load-bearing check — StageLLMRequest runs
+	// synchronously before the generation goroutine, so a regression that
+	// failed to skip would leave HasPendingLLMConsult == true the instant the
+	// call returns.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	// Four items (all done → pending exhausted, so generation would fire) with
+	// max_tasks = 3, i.e. 4 > 3 → over the cap.
+	os.WriteFile(taskFile, []byte("- [x] a\n- [x] b\n- [x] c\n- [x] d\n"), 0o600)
+
+	cfg := fmt.Sprintf(
+		"[[task_sources]]\nagent = \"agent-77\"\npath = %q\nmax_tasks = 3\n\n[llm]\ntask_generate_command = [\"fake\"]\ntask_generate_command_start = [\"fake-start\"]\n",
+		taskFile)
+	h, tg := newHarnessTaskGen(t, cfg, func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return "should never be generated", nil
+	})
+
+	ctx := context.Background()
+	loaded, _, _ := h.daemon.snapshot()
+	agentID := "agent-77"
+	sig := domain.SignatureResult{Signature: "sig-77"}
+	situation := domain.Situation{Type: domain.SituationIdle, AgentID: agentID, AgentType: "claude"}
+	tr := domain.AgentTransition{AgentID: agentID, PaneID: agentID, Status: "idle"}
+
+	// sourceExhausted = true: the branch that carries a [[task_sources]] entry.
+	h.daemon.generateTask(ctx, loaded, situation, sig, tr, time.Now(), true)
+
+	// Synchronous, race-free: if the skip did NOT happen, StageLLMRequest would
+	// already have registered a pending consult by now.
+	if pending, _ := h.raw.HasPendingLLMConsult(ctx, agentID); pending {
+		t.Fatal("over-limit source must skip generation without staging an LLM request")
+	}
+	if n := len(tg.genCalls()); n != 0 {
+		t.Fatalf("generator must not be invoked for an over-limit source, got %d call(s)", n)
+	}
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 0 {
+		t.Fatalf("skipping generation must not escalate, got %d escalation(s)", len(esc))
+	}
+}
+
 func TestErrorRetryCeilingEndToEnd(t *testing.T) {
 	// FR-014: up to 2 automated retries per error signature; 3rd escalates.
 	// A Claude error/retry situation (interrupt prompt) — generic build-log

@@ -470,6 +470,16 @@ set, an exhausted source escalates `task_source_exhausted` — a confirmable
 @noop suggestion ("No more pending tasks") — instead of generating or sending
 the old templated "none" prompt.
 
+Refill is capped per source by `max_tasks` (default **20**): once a source's
+file holds more than that many checklist items (done, in-progress, and pending
+counted alike) and its pending items are exhausted, the daemon logs a warning
+("Maximum number of tasks reached for agent … — clean up the task list to make
+room for new tasks") and **skips** generation for that agent instead of piling
+more onto an already-long list. Prune the checklist (or raise `max_tasks` on
+the `[[task_sources]]` entry) to resume refilling. This only affects LLM
+*generation*; sending the remaining pending items of a source under its cap is
+unaffected.
+
 The command's stdout may be plain lines or a Markdown list/checklist. Hap
 normalizes it and surfaces it as an escalation; it never auto-accepts a
 generated task. Confirming the suggestion creates

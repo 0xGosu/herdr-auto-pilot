@@ -508,6 +508,8 @@ without a declared task source, the plugin falls back to inferring the next task
 
 if inference finds nothing (no task source and nothing inferable from the pane) and `llm.task_generate_command` is configured, the plugin runs that CLI once to synthesize a next task for the idle agent (placeholders: `{self}`, `{agent_name}`, `{agent_type}`, `{pane_excerpt}`, `{cwd}`). the CLI's stdout is surfaced as an escalation the operator confirms (writing a per-agent `tasks.md`) or dismisses — the plugin never sends a synthesized task unattended. leave `task_generate_command` unset to keep the default: an idle agent with no task source escalates as `no_task_source` and nothing is synthesized. `task_generate_command_start` is the first-interaction variant (empty inherits `task_generate_command`); `task_generate_timeout_seconds` bounds one run (0 inherits `llm.timeout_seconds`).
 
+**`max_tasks` (per `[[task_sources]]`, default 20)** caps how large a source's checklist may grow before generation stops refilling it. once the file holds MORE than `max_tasks` items — done, in-progress, and pending counted alike — and its pending items are exhausted, the daemon logs a warning (`maximum number of tasks reached … skipping task generation`, with the agent name) and skips generation for that agent instead of appending to an already-long list. prune the checklist (or raise `max_tasks`) to resume. this gates only LLM *generation*; sending the pending items of an under-cap source is unaffected, and the no-task-source bootstrap case (no `[[task_sources]]` entry) is never capped.
+
 ## reset data
 
 ### reset learned data (keeps config)
