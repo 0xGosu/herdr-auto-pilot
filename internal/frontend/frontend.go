@@ -1025,12 +1025,7 @@ func SuggestedAction(audit *domain.AuditRecord) string {
 	if strings.HasPrefix(sug, domain.SuggestTaskPrefix) {
 		return domain.SuggestGenerateTask
 	}
-	for _, p := range []string{"respond: ", "choose: ", "answer series: ", "on error: ", "LLM suggested: "} {
-		if len(sug) > len(p) && sug[:len(p)] == p {
-			sug = sug[len(p):]
-			break
-		}
-	}
+	sug = stripSourcePrefix(sug)
 	for _, p := range []string{"send next declared task: ", "send inferred next task: "} {
 		if len(sug) > len(p) && sug[:len(p)] == p {
 			if p == "send next declared task: " {
@@ -1047,13 +1042,31 @@ func SuggestedAction(audit *domain.AuditRecord) string {
 	return sug
 }
 
+// stripSourcePrefix removes the leading "who suggested this and how" label from
+// an escalation suggestion, leaving the action-bearing remainder. The
+// task-send prefixes are deliberately NOT here: they can ride behind
+// "LLM suggested: ", so both layers must be peeled in order.
+func stripSourcePrefix(sug string) string {
+	for _, p := range []string{"respond: ", "choose: ", "answer series: ", "on error: ", "LLM suggested: "} {
+		if len(sug) > len(p) && sug[:len(p)] == p {
+			return sug[len(p):]
+		}
+	}
+	return sug
+}
+
 // materializeForSend converts symbolic learned actions into the concrete
-// suggestion text when the operator asks to send.
+// suggestion text when the operator asks to send. It peels the source prefix
+// first, exactly as SuggestedAction does: an LLM task review suggests
+// "LLM suggested: send next declared task: <text>", and matching the task-send
+// prefix against the unpeeled string would miss, returning the raw
+// "@next_task:declared" sentinel — which Resolve would then type into the pane.
 func materializeForSend(action string, audit *domain.AuditRecord) string {
 	if action == domain.ActionNextDeclaredTask || action == domain.ActionNextInferredTask {
+		sug := stripSourcePrefix(audit.Suggestion)
 		for _, p := range []string{"send next declared task: ", "send inferred next task: "} {
-			if len(audit.Suggestion) > len(p) && audit.Suggestion[:len(p)] == p {
-				return audit.Suggestion[len(p):]
+			if len(sug) > len(p) && sug[:len(p)] == p {
+				return sug[len(p):]
 			}
 		}
 	}

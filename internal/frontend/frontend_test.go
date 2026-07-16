@@ -474,31 +474,47 @@ func TestResolveFailedSendLeavesUnsent(t *testing.T) {
 
 func TestConfirmSendsRenderedDeclaredTaskPrompt(t *testing.T) {
 	// The confirm path must deliver the exact rendered prompt carried in the
-	// "send next declared task: " suggestion (the SuggestedAction /
-	// materializeForSend contract), while recording the symbolic action.
-	app, st := testApp(t)
-	fake := &fakeHerdr{}
-	app.Herdr = fake
-	ctx := context.Background()
-
+	// suggestion (the SuggestedAction / materializeForSend contract), while
+	// recording the symbolic action. An LLM task review wraps that suggestion in
+	// "LLM suggested: ", so both layers must be peeled — matching the task-send
+	// prefix against the unpeeled string would miss and type the raw
+	// "@next_task:declared" sentinel into the agent's pane.
 	prompt := domain.DeclaredTask{Task: "step two", Path: "/docs/tasks.md"}.Prompt()
-	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: "w1:p1", SituationType: domain.SituationIdle, Trigger: "t",
-		Action: "escalated", Status: "escalated",
-		Suggestion: "send next declared task: " + prompt, CreatedAt: time.Now(),
-	})
-	if err := app.Confirm(ctx, id, true); err != nil {
-		t.Fatal(err)
-	}
-	corr, _ := st.UnprocessedCorrections(ctx)
-	if len(corr) != 1 || corr[0].CorrectedAction != domain.ActionNextDeclaredTask {
-		t.Errorf("confirm should record the symbolic declared-task action: %+v", corr)
-	}
-	if len(fake.inputs) != 1 || fake.inputs[0] != prompt {
-		t.Errorf("delivered %v, want the rendered prompt %q", fake.inputs, prompt)
-	}
-	if len(fake.panes) != 1 || fake.panes[0] != "w1:p1" {
-		t.Errorf("delivered to %v, want the audit's agent pane", fake.panes)
+	for _, tc := range []struct {
+		name       string
+		suggestion string
+		want       string
+	}{
+		{"declared", "send next declared task: " + prompt, domain.ActionNextDeclaredTask},
+		{"inferred", "send inferred next task: " + prompt, domain.ActionNextInferredTask},
+		{"llm-reviewed declared", "LLM suggested: send next declared task: " + prompt, domain.ActionNextDeclaredTask},
+		{"llm-reviewed inferred", "LLM suggested: send inferred next task: " + prompt, domain.ActionNextInferredTask},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, st := testApp(t)
+			fake := &fakeHerdr{}
+			app.Herdr = fake
+			ctx := context.Background()
+
+			id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+				AgentID: "w1:p1", SituationType: domain.SituationIdle, Trigger: "t",
+				Action: "escalated", Status: "escalated",
+				Suggestion: tc.suggestion, CreatedAt: time.Now(),
+			})
+			if err := app.Confirm(ctx, id, true); err != nil {
+				t.Fatal(err)
+			}
+			corr, _ := st.UnprocessedCorrections(ctx)
+			if len(corr) != 1 || corr[0].CorrectedAction != tc.want {
+				t.Errorf("confirm should record the symbolic action %q: %+v", tc.want, corr)
+			}
+			if len(fake.inputs) != 1 || fake.inputs[0] != prompt {
+				t.Errorf("delivered %v, want the rendered prompt %q", fake.inputs, prompt)
+			}
+			if len(fake.panes) != 1 || fake.panes[0] != "w1:p1" {
+				t.Errorf("delivered to %v, want the audit's agent pane", fake.panes)
+			}
+		})
 	}
 }
 
