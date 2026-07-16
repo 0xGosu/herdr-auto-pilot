@@ -55,14 +55,16 @@ type DeclaredTask struct {
 
 // Prompt renders the outbound prompt from the source's template. A single
 // pass substitutes every placeholder, so placeholder-like text inside the
-// task content or path is never re-expanded.
+// task content or path is never re-expanded. Literal `\n` sequences in the
+// task content become real newlines here — the sending side of the
+// one-line-per-item storage encoding (see EncodeTaskNewlines).
 func (t DeclaredTask) Prompt() string {
 	tpl := t.Template
 	if tpl == "" {
 		tpl = DefaultNextTaskTemplate
 	}
 	return strings.NewReplacer(
-		"{next_task_content}", t.Task,
+		"{next_task_content}", DecodeTaskNewlines(t.Task),
 		"{task_list_path}", t.Path,
 		"{agent_name}", t.AgentName,
 		"{cwd}", t.Cwd,
@@ -273,46 +275,23 @@ func EditChecklistItemText(content string, index int, text string) (string, erro
 	})
 }
 
-// ReplaceChecklistItemLines replaces item index with one item per entry of
-// texts: the first keeps the item's checkbox marker (a done item stays done),
-// the rest become new unchecked items with the same indent+bullet, inserted
-// in order right after it. Each text must be a non-empty single line — this
-// is how multi-line input (one physical line per item) enters a checklist
-// without an embedded newline ever forging status or extra items.
-func ReplaceChecklistItemLines(content string, index int, texts []string) (string, error) {
-	if len(texts) == 0 {
-		return "", fmt.Errorf("task text must not be empty")
-	}
-	clean := make([]string, len(texts))
-	for i, t := range texts {
-		v, err := validateTaskText(t)
-		if err != nil {
-			return "", err
-		}
-		clean[i] = v
-	}
-	lines := strings.Split(content, "\n")
-	count := 0
-	for i, line := range lines {
-		m := checklistItemRE.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		count++
-		if count != index {
-			continue
-		}
-		repl := []string{m[1] + "[" + m[2] + "] " + clean[0]}
-		for _, t := range clean[1:] {
-			repl = append(repl, m[1]+"[ ] "+t)
-		}
-		out := make([]string, 0, len(lines)+len(repl)-1)
-		out = append(out, lines[:i]...)
-		out = append(out, repl...)
-		out = append(out, lines[i+1:]...)
-		return strings.Join(out, "\n"), nil
-	}
-	return "", outOfRangeErr(index, count)
+// A checklist item is one physical line, but a task's content may span
+// several: embedded line breaks are stored as the literal two-character
+// sequence `\n` and converted back to real newlines only when the task is
+// rendered into an agent prompt (DeclaredTask.Prompt). Hand-written `\n` in
+// tasks.md gets the same treatment.
+
+// EncodeTaskNewlines makes multi-line task text storable on one checklist
+// line: every line-break flavor (\r\n, \n, bare \r) becomes the literal
+// two-character sequence `\n`.
+func EncodeTaskNewlines(s string) string {
+	return strings.NewReplacer("\r\n", `\n`, "\n", `\n`, "\r", `\n`).Replace(s)
+}
+
+// DecodeTaskNewlines is the sending-side inverse: literal `\n` sequences in
+// stored task text become real newlines.
+func DecodeTaskNewlines(s string) string {
+	return strings.ReplaceAll(s, `\n`, "\n")
 }
 
 // DeleteChecklistItem removes item index's line entirely, leaving every other

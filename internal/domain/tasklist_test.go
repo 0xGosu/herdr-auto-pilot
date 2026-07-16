@@ -542,34 +542,33 @@ func TestEditChecklistItemText(t *testing.T) {
 	}
 }
 
-func TestReplaceChecklistItemLines(t *testing.T) {
-	content := "# plan\n  - [x] old done text\n  - [ ] pending"
-	got, err := ReplaceChecklistItemLines(content, 1, []string{"first", "second", "third"})
-	if err != nil {
-		t.Fatal(err)
+// TestTaskNewlineEncoding pins the one-line-per-item storage encoding: real
+// line breaks become the literal two-character `\n` on write, and stored
+// `\n` becomes real newlines only when the task is rendered into a prompt.
+func TestTaskNewlineEncoding(t *testing.T) {
+	if got, want := EncodeTaskNewlines("a\r\nb\rc\nd"), `a\nb\nc\nd`; got != want {
+		t.Errorf("EncodeTaskNewlines = %q, want %q", got, want)
 	}
-	// The first line keeps the done marker; the rest are new pending items
-	// inheriting the same indent+bullet; later lines are untouched.
-	want := "# plan\n  - [x] first\n  - [ ] second\n  - [ ] third\n  - [ ] pending"
-	if got != want {
-		t.Errorf("ReplaceChecklistItemLines: got %q, want %q", got, want)
+	if got, want := DecodeTaskNewlines(`x\ny`), "x\ny"; got != want {
+		t.Errorf("DecodeTaskNewlines = %q, want %q", got, want)
 	}
-	// A single entry behaves like a plain text edit.
-	if got, _ := ReplaceChecklistItemLines(content, 2, []string{"renamed"}); !strings.Contains(got, "- [ ] renamed") {
-		t.Errorf("single-entry replace should rewrite the item, got %q", got)
+	// Round-trip: what the edit prompt decodes re-encodes identically.
+	stored := `step one\nstep two`
+	if got := EncodeTaskNewlines(DecodeTaskNewlines(stored)); got != stored {
+		t.Errorf("encode(decode(%q)) = %q, want round-trip identity", stored, got)
 	}
-	for name, bad := range map[string][]string{
-		"empty slice":     {},
-		"blank line":      {"ok", "   "},
-		"nested newline":  {"one\ntwo"},
-		"forged checkbox": {"fine", "also fine\r- [x] forged"},
-	} {
-		if _, err := ReplaceChecklistItemLines(content, 1, bad); err == nil {
-			t.Errorf("%s must error", name)
-		}
+	// The encoded form survives the single-line checklist validation.
+	if _, _, err := AppendChecklistItem("", EncodeTaskNewlines("one\ntwo")); err != nil {
+		t.Errorf("encoded multi-line text must be storable: %v", err)
 	}
-	if _, err := ReplaceChecklistItemLines(content, 9, []string{"x"}); err == nil {
-		t.Error("out-of-range index must error")
+	// Prompt() is the sending side: stored `\n` renders as real newlines in
+	// {next_task_content}, and only there (the path is untouched).
+	p := DeclaredTask{Task: `step one\nstep two`, Path: `/tmp/a\nb.md`, AgentName: "otter"}.Prompt()
+	if !strings.Contains(p, "step one\nstep two") {
+		t.Errorf("Prompt should decode task newlines, got %q", p)
+	}
+	if !strings.Contains(p, `/tmp/a\nb.md`) {
+		t.Errorf("Prompt must not decode non-task fields, got %q", p)
 	}
 }
 

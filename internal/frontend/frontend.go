@@ -1797,6 +1797,27 @@ func mutateTaskFile(path string, fn func(content string) (string, error)) ([]dom
 	return domain.ParseChecklist(out), nil
 }
 
+// SendTaskToAgent delivers one specific pending checklist item to a live
+// agent's pane, rendered through the task source's next-task template — the
+// operator-initiated twin of the daemon's idle-time declared-task send. Like
+// that flow (and unlike the generated-task flow) it never mutates the
+// checklist: the template steers the agent to self-mark progress via the
+// `hap task` CLI. As an operator action it is exempt from the pause switch,
+// matching Resolve/Confirm; the caller is expected to refuse busy agents
+// (the daemon only ever task-prompts a cleanly idle one).
+func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName, sourcePath, template, taskText string) error {
+	if a.Herdr == nil {
+		return fmt.Errorf("herdr unavailable — cannot send")
+	}
+	if paneID == "" {
+		return fmt.Errorf("no pane known for this agent")
+	}
+	prompt := domain.DeclaredTask{
+		Task: taskText, Path: sourcePath, Template: template, AgentName: agentName,
+	}.Prompt()
+	return ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt)
+}
+
 // readChecklist reads and parses a checklist file.
 func readChecklist(path string) ([]domain.ChecklistItem, error) {
 	data, err := os.ReadFile(path)
@@ -1884,16 +1905,68 @@ func (a *App) GetTask(agent, path string, index int) (domain.ChecklistItem, erro
 	return domain.ChecklistItem{}, fmt.Errorf("no task #%d: valid task numbers are 1..%d", index, len(items))
 }
 
+// taskSourceLimit returns the max_tasks cap of the [[task_sources]] entry that
+// owns resolvedPath, or 0 (no cap) when resolvedPath is not a registered
+// source file. The cap is a per-source setting, so an ad-hoc --path checklist
+// that is not a managed task source is left uncapped. Matched by absolute path
+// so it applies to both agent- and path-addressed adds of a registered source.
+// A config read error also yields 0 (fail-open: never block an add on it).
+func (a *App) taskSourceLimit(resolvedPath string) int {
+	cfg, err := a.Config()
+	if err != nil {
+		return 0
+	}
+	// Abs both sides: the agent-addressed path comes back from
+	// resolveTaskFilePath as the raw config spelling (possibly relative),
+	// while a --path add is already absolute — normalize so a relative
+	// [[task_sources]] path still matches and stays capped.
+	if abs, e := filepath.Abs(resolvedPath); e == nil {
+		resolvedPath = abs
+	}
+	for _, src := range cfg.TaskSources {
+		sp := src.Path
+		if abs, e := filepath.Abs(sp); e == nil {
+			sp = abs
+		}
+		if sp == resolvedPath {
+			return src.MaxTasksLimit()
+		}
+	}
+	return 0
+}
+
 // AddTask appends a new unchecked item and returns the updated list plus the
-// new item's number.
+// new item's number. Text containing line breaks stays ONE task: the breaks
+// are stored as literal `\n` sequences (a checklist item is one physical
+// line) and converted back to real newlines when the task is sent to an
+// agent (DeclaredTask.Prompt). The add is rejected when it would push the
+// checklist past the source's max_tasks cap (the same limit the daemon's
+// generation gate enforces), so a manual add cannot grow a list the daemon
+// would then refuse to refill.
 func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, error) {
 	p, err := a.taskFilePath(agent, path)
 	if err != nil {
 		return nil, 0, err
 	}
+	limit := a.taskSourceLimit(p)
 	newIndex := 0
 	items, err := mutateTaskFile(p, func(content string) (string, error) {
-		out, idx, e := domain.AppendChecklistItem(content, text)
+		// Checked inside the lock (like expectTaskText) so a racing add cannot
+		// slip the count over the cap. limit == 0 means no cap (the file is
+		// not a registered task source).
+		if current := len(domain.ParseChecklist(content)); limit > 0 && current+1 > limit {
+			who := ""
+			if agent != "" {
+				who = fmt.Sprintf(" for agent %q", agent)
+			}
+			return "", fmt.Errorf("maximum number of tasks reached%s (%d items, cap %d) — clean up the task list to make room for new tasks", who, current, limit)
+		}
+		// Trim before encoding: raw text that is only whitespace/line breaks
+		// must be rejected, not stored as literal `\n` sequences.
+		if strings.TrimSpace(text) == "" {
+			return "", fmt.Errorf("task text must not be empty")
+		}
+		out, idx, e := domain.AppendChecklistItem(content, domain.EncodeTaskNewlines(strings.TrimSpace(text)))
 		newIndex = idx
 		return out, e
 	})
@@ -1946,26 +2019,20 @@ func (a *App) SetTaskDone(agent, path string, index int, done bool, expectText .
 }
 
 // EditTask replaces an item's text (keeping its status) and returns the list.
-// Text containing newlines splits into multiple items: the first line rewrites
-// the addressed item (keeping its status), each further non-blank line becomes
-// a new pending item right after it. An optional expectText aborts (inside the
-// file lock) if the item's text no longer matches — see expectTaskText.
+// Line breaks in the new text are stored as literal `\n` sequences — the item
+// stays one task on one line (see AddTask). An optional expectText aborts
+// (inside the file lock) if the item's stored text no longer matches — see
+// expectTaskText.
 func (a *App) EditTask(agent, path string, index int, text string, expectText ...string) ([]domain.ChecklistItem, error) {
 	p, err := a.taskFilePath(agent, path)
 	if err != nil {
 		return nil, err
 	}
 	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
-		if strings.ContainsAny(text, "\r\n") {
-			var texts []string
-			for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
-				if line = strings.TrimSpace(line); line != "" {
-					texts = append(texts, line)
-				}
-			}
-			return domain.ReplaceChecklistItemLines(content, index, texts)
+		if strings.TrimSpace(text) == "" {
+			return "", fmt.Errorf("task text must not be empty")
 		}
-		return domain.EditChecklistItemText(content, index, text)
+		return domain.EditChecklistItemText(content, index, domain.EncodeTaskNewlines(strings.TrimSpace(text)))
 	}))
 }
 

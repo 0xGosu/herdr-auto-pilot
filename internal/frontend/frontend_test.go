@@ -2347,28 +2347,154 @@ func TestTaskMutationsVerifyExpectedText(t *testing.T) {
 	}
 }
 
-// TestEditTaskMultiline: newline-bearing text splits into one item per line —
-// the addressed item keeps its status, following lines become pending items —
-// and the expected-text guard still composes.
+// TestEditTaskMultiline: line breaks in the new text are stored as literal
+// `\n` — the item stays ONE task on one physical line, its status and the
+// rest of the file untouched — and the expected-text guard still composes.
 func TestEditTaskMultiline(t *testing.T) {
 	app, _ := testApp(t)
 	path := filepath.Join(t.TempDir(), "tasks.md")
 	if err := os.WriteFile(path, []byte("- [x] one\n- [ ] two\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	items, err := app.EditTask("", path, 1, "first\n  second  \n\nthird", "one")
+	items, err := app.EditTask("", path, 1, "first\nsecond", "one")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 4 {
-		t.Fatalf("got %d items, want 4: %+v", len(items), items)
+	if len(items) != 2 {
+		t.Fatalf("a multi-line edit must not change the item count, got %d: %+v", len(items), items)
 	}
 	data, _ := os.ReadFile(path)
-	if want := "- [x] first\n- [ ] second\n- [ ] third\n- [ ] two\n"; string(data) != want {
-		t.Errorf("multiline edit:\ngot  %q\nwant %q", data, want)
+	if want := "- [x] first\\nsecond\n- [ ] two\n"; string(data) != want {
+		t.Errorf("multiline edit should store literal \\n:\ngot  %q\nwant %q", data, want)
 	}
 	if _, err := app.EditTask("", path, 1, "a\nb", "stale"); err == nil {
 		t.Error("guard must still abort a stale multiline edit")
+	}
+	// Bare-\r line breaks (terminal bracketed paste) encode the same way.
+	if _, err := app.EditTask("", path, 2, "cr-a\rcr-b"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(path)
+	if !strings.Contains(string(data), `- [ ] cr-a\ncr-b`) {
+		t.Errorf("CR paste should encode to literal \\n, got %q", data)
+	}
+}
+
+// TestAddTaskMultiline: newline-bearing text appends ONE item with the
+// breaks stored as literal `\n` (leading/trailing whitespace trimmed).
+func TestAddTaskMultiline(t *testing.T) {
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [x] done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	items, n, err := app.AddTask("", path, "one\r\ntwo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 || len(items) != 2 {
+		t.Fatalf("got new index %d and %d items, want 2 and 2", n, len(items))
+	}
+	data, _ := os.ReadFile(path)
+	if want := "- [x] done\n- [ ] one\\ntwo\n"; string(data) != want {
+		t.Errorf("multiline add:\ngot  %q\nwant %q", data, want)
+	}
+	if _, _, err := app.AddTask("", path, " \n \r "); err == nil {
+		t.Error("all-blank multiline text must error")
+	}
+}
+
+// TestSendTaskToAgent: the pending task is rendered through the source's
+// template — stored `\n` decoded to real newlines — and delivered to the
+// agent's pane via the herdr port.
+func TestSendTaskToAgent(t *testing.T) {
+	app, _ := testApp(t)
+	h := &sendCaptureHerdr{}
+	app.Herdr = h
+	err := app.SendTaskToAgent(context.Background(), "w1:p2", "claude", "brave-otter",
+		"/work/tasks.md", "", `step one\nstep two`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("expected one delivery, got %v", h.sent)
+	}
+	sent := h.sent[0]
+	for _, want := range []string{"step one\nstep two", "brave-otter", "/work/tasks.md"} {
+		if !strings.Contains(sent, want) {
+			t.Errorf("sent prompt missing %q:\n%s", want, sent)
+		}
+	}
+	// Guards: no herdr / no pane.
+	app.Herdr = nil
+	if err := app.SendTaskToAgent(context.Background(), "w1:p2", "claude", "n", "p", "", "t"); err == nil {
+		t.Error("nil herdr must refuse")
+	}
+	app.Herdr = h
+	if err := app.SendTaskToAgent(context.Background(), "", "claude", "n", "p", "", "t"); err == nil {
+		t.Error("empty pane must refuse")
+	}
+}
+
+// sendCaptureHerdr records pane deliveries.
+type sendCaptureHerdr struct{ sent []string }
+
+func (c *sendCaptureHerdr) Send(_ context.Context, _, input string) error {
+	c.sent = append(c.sent, input)
+	return nil
+}
+func (c *sendCaptureHerdr) ReadPane(context.Context, string, int) (string, error) { return "", nil }
+func (c *sendCaptureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
+	return nil, nil
+}
+
+// TestAddTaskRespectsMaxTasksCap: a manual add to a registered source is
+// rejected once it would push the checklist past the source's max_tasks cap,
+// while an ad-hoc --path file (no registered source) is uncapped.
+func TestAddTaskRespectsMaxTasksCap(t *testing.T) {
+	app, _ := testApp(t)
+	dir := filepath.Dir(app.ConfigPath)
+	taskFile := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(taskFile, []byte("- [ ] one\n- [x] two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Register the file as a source capped at 3.
+	cfgToml := fmt.Sprintf("[[task_sources]]\nagent = \"builder\"\npath = %q\nmax_tasks = 3\n", taskFile)
+	if err := os.WriteFile(app.ConfigPath, []byte(cfgToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2 items → adding one more reaches the cap (3), still allowed.
+	if _, _, err := app.AddTask("builder", "", "three"); err != nil {
+		t.Fatalf("adding up to the cap must succeed: %v", err)
+	}
+	// 3 items → the next add would be 4 > 3, rejected with the cap message.
+	_, _, err := app.AddTask("builder", "", "four")
+	if err == nil || !strings.Contains(err.Error(), "maximum number of tasks reached") {
+		t.Fatalf("adding past the cap must be rejected with the cap message, got %v", err)
+	}
+
+	// A line-break-bearing add stays ONE task (stored with literal `\n`), so
+	// it counts once against the cap: 2 items + 1 multi-line task = 3 ≤ cap.
+	if err := os.WriteFile(taskFile, []byte("- [ ] a\n- [x] b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.AddTask("builder", "", "c1\nc2\nc3"); err != nil {
+		t.Fatalf("a multi-line add is one task and must fit the cap: %v", err)
+	}
+	if data, _ := os.ReadFile(taskFile); len(domain.ParseChecklist(string(data))) != 3 {
+		t.Errorf("multi-line text must store as a single item, got %q", data)
+	}
+
+	// An unregistered --path file has no source entry and is uncapped.
+	adhoc := filepath.Join(dir, "adhoc.md")
+	if err := os.WriteFile(adhoc, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, _, err := app.AddTask("", adhoc, fmt.Sprintf("t%d", i)); err != nil {
+			t.Fatalf("an unregistered --path file must be uncapped; add %d failed: %v", i, err)
+		}
 	}
 }
 
