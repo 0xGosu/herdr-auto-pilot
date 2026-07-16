@@ -1414,14 +1414,23 @@ func TestMaxContentWidthCapsRows(t *testing.T) {
 }
 
 // captureHerdr records inputs delivered to the agent pane.
-type captureHerdr struct{ sent []string }
+// captureHerdr records deliveries and reports the agents it is given. agents
+// stays nil by default — a herdr that answers "no agents are running", which
+// is what most Tasks-tab tests want; the send path needs a live one, so those
+// harnesses populate it.
+type captureHerdr struct {
+	sent   []string
+	agents []domain.AgentTransition
+}
 
 func (c *captureHerdr) Send(_ context.Context, _, input string) error {
 	c.sent = append(c.sent, input)
 	return nil
 }
-func (c *captureHerdr) ReadPane(context.Context, string, int) (string, error)        { return "", nil }
-func (c *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) { return nil, nil }
+func (c *captureHerdr) ReadPane(context.Context, string, int) (string, error) { return "", nil }
+func (c *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
+	return c.agents, nil
+}
 
 func TestEscalationDetailEnterConfirmsAndCloses(t *testing.T) {
 	// v opens the escalation detail; enter there must confirm+send and return

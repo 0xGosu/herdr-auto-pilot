@@ -1110,9 +1110,11 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 			return nil
 		}
 	}
-	// No extra wrapping: SendTaskToAgent's errors already state the phase —
-	// in particular "task sent, but marking it in-progress failed" must not
-	// read as "send failed", or a retry would double-deliver.
+	// No extra wrapping: SendTaskToAgent's errors already state the phase.
+	// It reserves the item before delivering, so an error here is either a
+	// pre-delivery refusal (the agent stopped being idle, the checklist
+	// moved) or a delivery failure whose reservation was rolled back —
+	// either way the task is not in the agent, and retrying is safe.
 	if err := app.SendTaskToAgent(ctx, live.PaneID, live.AgentType, agent, sourcePath, template, idx, it.Text); err != nil {
 		return err
 	}

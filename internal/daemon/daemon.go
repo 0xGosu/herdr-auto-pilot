@@ -2991,8 +2991,11 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 	}
 	// Resolve cwd only when the template references it (the common case does
 	// not), keeping the main-loop `pane get` shell-out off the hot path.
+	// Via TemplateOrDefault, so this asks the same question the frontend's
+	// manual send does — the template that will actually render, default
+	// included, not just the source's own field.
 	cwd := ""
-	if strings.Contains(m.src.NextTaskTemplate, "{cwd}") {
+	if strings.Contains(domain.TemplateOrDefault(m.src.NextTaskTemplate), "{cwd}") {
 		cwd = d.paneCwd(ctx, tr.PaneID)
 	}
 	return &domain.DeclaredTask{

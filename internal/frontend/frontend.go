@@ -1839,19 +1839,68 @@ func (a *App) TaskSourceTemplateFor(agent, sourcePath string) (string, error) {
 	return "", nil
 }
 
+// requireIdleAgent re-resolves the agent behind paneID and refuses unless it
+// is still cleanly idle. The caller's own status read is stale by then — as
+// old as the operator's confirmation, or as a --yes script's earlier check —
+// and delivering into a working agent's live conversation is exactly what the
+// idle-only rule exists to prevent. An unreadable agent list fails CLOSED:
+// "we could not ask" is not "it is idle" (the same boundary as
+// Status.AgentsKnown).
+func (a *App) requireIdleAgent(ctx context.Context, paneID, agentName string) error {
+	agents, err := a.Herdr.ListAgents(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot confirm %s is still idle, so nothing was sent: %w", agentName, err)
+	}
+	for _, ag := range agents {
+		if ag.PaneID != paneID {
+			continue
+		}
+		if domain.AgentBusy(ag.Status) {
+			return fmt.Errorf("agent %s is %s — a task can only be sent to a cleanly idle agent",
+				agentName, ag.Status)
+		}
+		return nil
+	}
+	return fmt.Errorf("agent %s is no longer live — refresh and retry", agentName)
+}
+
+// reserveTask claims item index for delivery: it verifies the item still
+// carries exactly taskText AND is still pending, then marks it [-], as ONE
+// locked read-modify-write. Checking and claiming must be atomic — a
+// concurrent edit slipping between them is what would let the same task be
+// delivered twice.
+func reserveTask(index int, taskText string) func(string) (string, error) {
+	return func(content string) (string, error) {
+		if err := expectTaskText(content, index, taskText); err != nil {
+			return "", err
+		}
+		for _, it := range domain.ParseChecklist(content) {
+			if it.Index == index && it.Done {
+				// Done covers [x] and [-] alike: either way it is not a
+				// pending task waiting to be handed out.
+				return "", fmt.Errorf("task #%d is no longer pending — refresh and retry", index)
+			}
+		}
+		return domain.MarkChecklistItemInProgress(content, index)
+	}
+}
+
 // SendTaskToAgent delivers one specific pending checklist item to a live
 // agent's pane, rendered through the task source's next-task template — the
 // operator-initiated twin of the daemon's idle-time declared-task send.
-// Before delivering, the checklist is re-read and the send refused unless
-// task #index still carries exactly taskText and is still pending — the
-// caller's snapshot may be as old as an open detail overlay, and a task
-// completed or renumbered meanwhile must not be re-delivered (the same
-// freshness convention as expectTaskText). After a successful delivery the
-// item is marked [-] in progress (guarded by the same expected text), which
-// also keeps the daemon's own idle-time flow from re-sending it. As an
-// operator action it is exempt from the pause switch, matching
-// Resolve/Confirm; the caller is expected to refuse busy agents (the daemon
-// only ever task-prompts a cleanly idle one).
+//
+// The order here is load-bearing: the agent is re-checked idle, then the item
+// is RESERVED (verified and marked [-] under the file lock), and only then
+// delivered. Marking after delivery would mean a guarded failure could be
+// reported once the pane already had the task, leaving the item [ ] — which
+// the daemon's idle flow would then hand out a second time. Reserving first
+// makes the failure modes safe in the other direction: a send that fails
+// rolls the item back to [ ], and a rollback that also fails leaves it [-],
+// which merely parks the task (the daemon only ever sends [ ] items) instead
+// of duplicating work in the agent.
+//
+// As an operator action it is exempt from the pause switch, matching
+// Resolve/Confirm.
 func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName, sourcePath, template string, index int, taskText string) error {
 	if a.Herdr == nil {
 		return fmt.Errorf("herdr unavailable — cannot send")
@@ -1859,35 +1908,73 @@ func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName,
 	if paneID == "" {
 		return fmt.Errorf("no pane known for this agent")
 	}
-	items, err := readChecklist(sourcePath)
-	if err != nil {
-		return fmt.Errorf("re-reading the checklist: %w", err)
-	}
-	fresh := false
-	for _, it := range items {
-		if it.Index == index && it.Text == taskText {
-			if it.Done {
-				return fmt.Errorf("task #%d is no longer pending — refresh and retry", index)
-			}
-			fresh = true
-			break
-		}
-	}
-	if !fresh {
-		return fmt.Errorf("task #%d changed since it was selected — refresh and retry", index)
-	}
-	prompt := domain.DeclaredTask{
-		Task: taskText, Path: sourcePath, Template: template, AgentName: agentName,
-	}.Prompt()
-	if err := ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt); err != nil {
+	if err := a.requireIdleAgent(ctx, paneID, agentName); err != nil {
 		return err
 	}
-	if _, err := mutateTaskFile(sourcePath, guardedMutation(index, []string{taskText}, func(content string) (string, error) {
-		return domain.MarkChecklistItemInProgress(content, index)
-	})); err != nil {
-		return fmt.Errorf("task sent, but marking it in-progress failed: %w", err)
+	// Resolve {cwd} before reserving: it shells out to herdr, and a failure
+	// here should not have to unwind a reservation. Only when the template
+	// the prompt will actually render through references it.
+	cwd := ""
+	if strings.Contains(domain.TemplateOrDefault(template), "{cwd}") {
+		cwd = a.paneCwd(ctx, paneID)
+	}
+	if _, err := mutateTaskFile(sourcePath, reserveTask(index, taskText)); err != nil {
+		// Name the phase: reserveTask's own refusals are self-describing, but
+		// a lock/read/write failure would otherwise surface as a bare os
+		// error in a flow whose first question is "did it send?".
+		return fmt.Errorf("reserving task #%d (nothing was sent): %w", index, err)
+	}
+	prompt := domain.DeclaredTask{
+		Task: taskText, Path: sourcePath, Template: template, AgentName: agentName, Cwd: cwd,
+	}.Prompt()
+	if err := ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt); err != nil {
+		if _, rbErr := mutateTaskFile(sourcePath, releaseTask(index, taskText)); rbErr != nil {
+			return fmt.Errorf("send failed (%w) and task #%d could not be returned to [ ] (%v) — "+
+				"it stays [-] and no agent will pick it up until you clear it", err, index, rbErr)
+		}
+		return err
 	}
 	return nil
+}
+
+// releaseTask undoes a reservation after a failed delivery, returning the item
+// to [ ]. It is claim-scoped: it only resets an item that still carries this
+// reservation's text AND is still [-]. Resetting on text alone would let a
+// rollback silently re-open work somebody else completed in the meantime —
+// and re-arm it for the daemon. Anything else is left [-], which merely parks
+// the task rather than risking a second delivery.
+func releaseTask(index int, taskText string) func(string) (string, error) {
+	return func(content string) (string, error) {
+		if err := expectTaskText(content, index, taskText); err != nil {
+			return "", err
+		}
+		for _, it := range domain.ParseChecklist(content) {
+			if it.Index == index && it.Mark != domain.MarkInProgress {
+				return "", fmt.Errorf("task #%d is now [%s], not the [-] this send reserved", index, it.Mark)
+			}
+		}
+		return domain.SetChecklistItemDone(content, index, false)
+	}
+}
+
+// paneCwd resolves the pane's working directory for {cwd}, preferring the
+// foreground process's cwd exactly as the daemon's declared-task path does,
+// so one template renders the same whoever sends it. Best-effort: the
+// inspector is an optional herdr capability and an empty {cwd} must never
+// block a send.
+func (a *App) paneCwd(ctx context.Context, paneID string) string {
+	insp, ok := a.Herdr.(ports.InspectorPort)
+	if !ok {
+		return ""
+	}
+	pi, err := insp.PaneInfo(ctx, paneID)
+	if err != nil {
+		return ""
+	}
+	if pi.ForegroundCwd != "" {
+		return pi.ForegroundCwd
+	}
+	return pi.Cwd
 }
 
 // readChecklist reads and parses a checklist file.

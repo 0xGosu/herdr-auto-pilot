@@ -825,15 +825,19 @@ func sendTaskModel(t *testing.T) (Model, *captureHerdr, string) {
 		{Agent: "brave-otter", Path: path, NextTaskTemplate: "DO: {next_task_content} ({agent_name})"},
 		{Agent: "codex", Path: "/work/missing.md"},
 	}
-	h := &captureHerdr{}
+	live := []domain.AgentTransition{
+		{AgentID: "w6:p1", AgentType: "claude", PaneID: "w6:p1", TabID: "w6:t1",
+			WorkspaceID: "w6", Status: "idle"},
+	}
+	// The fake must report the agent too: the send re-checks it is still idle
+	// against herdr immediately before delivering, not against this snapshot.
+	h := &captureHerdr{agents: live}
 	m := Model{width: 100, height: 30, app: &frontend.App{Herdr: h}}
 	upd, _ := m.Update(refreshMsg{
 		status: frontend.Status{
-			MonitoredAgents: []domain.AgentTransition{
-				{AgentID: "w6:p1", AgentType: "claude", PaneID: "w6:p1", TabID: "w6:t1",
-					WorkspaceID: "w6", Status: "idle"},
-			},
-			AgentNames: map[string]string{"w6:p1": "brave-otter"},
+			AgentsKnown:     true,
+			MonitoredAgents: live,
+			AgentNames:      map[string]string{"w6:p1": "brave-otter"},
 		},
 		cfg: cfg,
 		tasks: []frontend.TaskGroup{
@@ -1085,11 +1089,17 @@ func TestTasksRemoveSourceEligibility(t *testing.T) {
 		name     string
 		items    []domain.ChecklistItem
 		groupErr string
-		want     bool // true = offers the confirmation
+		want     bool   // true = offers the confirmation
+		wantMsg  string // substring of the refusal, when want is false
 	}{
 		{name: "all done", items: []domain.ChecklistItem{done("x")}, want: true},
 		{name: "empty list", want: true},
-		{name: "unreadable file", groupErr: "open /work/tasks.md: no such file", want: true},
+		// An unreadable checklist hides whether work remains, so while an
+		// agent still matches the source it is not evidence of safety —
+		// the same fail-closed boundary as an unknown agent list.
+		{name: "unreadable file blocks while an agent matches",
+			groupErr: "open /work/tasks.md: no such file", want: false,
+			wantMsg: "checklist can't be read"},
 		{name: "pending task blocks", items: []domain.ChecklistItem{
 			{Index: 1, Mark: " ", Text: "todo"}}, want: false},
 		// The [-] case: Done is a pending/not-pending flag, so an agent
@@ -1115,12 +1125,25 @@ func TestTasksRemoveSourceEligibility(t *testing.T) {
 			if m.confirm != nil {
 				t.Fatalf("a source still feeding a live agent must not be removable, got %q", m.confirm.label)
 			}
-			if !strings.Contains(m.message, "still feeds brave-otter") ||
-				!strings.Contains(m.message, "Config tab") {
-				t.Errorf("refusal should name the agent and the escape hatch, got %q", m.message)
+			want := tc.wantMsg
+			if want == "" {
+				want = "still feeds brave-otter"
+			}
+			if !strings.Contains(m.message, want) || !strings.Contains(m.message, "Config tab") {
+				t.Errorf("refusal should say %q and name the escape hatch, got %q", want, m.message)
 			}
 		})
 	}
+	// ...but a broken entry nothing matches stays cleanable from this tab:
+	// no agent means the source feeds nobody, whatever its file says.
+	t.Run("unreadable file with no matching agent is removable", func(t *testing.T) {
+		m := removeSourceModel(t, nil, "open /work/tasks.md: no such file")
+		m.data.status.MonitoredAgents = nil // AgentsKnown stays true
+		m = press(t, m, "x")
+		if m.confirm == nil {
+			t.Errorf("an unmatched broken source should be removable, got %q", m.message)
+		}
+	})
 }
 
 // TestTasksRemoveSourceUnknownAgentsFailsClosed pins the guard against a

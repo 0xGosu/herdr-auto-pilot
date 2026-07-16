@@ -443,10 +443,13 @@ Manage items without leaving the pane:
   source feeds, rendered through the source's next-task template, behind a
   `Y/n` confirmation. Only a truly pending `[ ]` task on a **cleanly idle**
   agent qualifies — done (`[x]`) and in-progress (`[-]`) tasks, and
-  working/blocked agents, are refused (the daemon's own idle-only rule). A
-  confirmed send marks the task `[-]` in progress, which also keeps the
-  daemon from re-sending it. The CLI twin is
-  `hap task <agent> send <n> [--yes]`.
+  working/blocked agents, are refused (the daemon's own idle-only rule). The
+  agent is re-checked idle *at the moment of delivery*, not just when the
+  question is asked, so a confirmation left open while the agent picks up
+  work refuses rather than interrupting it. The task is marked `[-]` in
+  progress **before** it is delivered, which is what keeps the daemon from
+  handing the same item out again; a delivery that fails returns it to
+  `[ ]`. The CLI twin is `hap task <agent> send <n> [--yes]`.
 - `v` — open a task's detail view: full multi-line text, status, the
   source's full path and selectors, and the live agents it feeds. `enter`/
   `y`, `e`, `x`, and `f` keep working inside the detail, acting on the item
@@ -486,7 +489,11 @@ source can no longer be serving anyone: either **no live agent matches** its
 selectors, or **every task in it is finished**. A source that still feeds a
 live agent and still has unfinished work refuses, naming the agent and what's
 left. In-progress `[-]` tasks count as unfinished, so a source can't be pulled
-out from under an agent that is mid-task. Removal takes the config entry
+out from under an agent that is mid-task. Both *unknowns* refuse too, since
+neither is evidence of safety: an agent list herdr won't answer isn't an empty
+herd, and a checklist that won't read isn't an empty checklist. (A source no
+live agent matches stays retirable whatever its file says — that's what keeps
+a broken entry cleanable from this tab.) Removal takes the config entry
 only — **the checklist file stays on disk**, since sources are often
 hand-written docs hap never created; re-adding the source brings the list back
 untouched. (With items marked via `space`, `x` still deletes those items — the

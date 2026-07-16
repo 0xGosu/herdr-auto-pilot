@@ -478,8 +478,10 @@ hap task backend-dev update 2 "new text"   # edit text, keep status
 hap task backend-dev remove 2              # delete item 2
 hap task backend-dev send 3 [--yes]        # deliver pending item 3 to the live
 #   agent NOW (y/N confirmation unless --yes). only a pending [ ] item on a
-#   cleanly idle agent qualifies; a successful send marks it [-] in progress
-#   so the daemon's own idle-time flow won't re-send it.
+#   cleanly idle agent qualifies — idleness is re-checked at the moment of
+#   delivery, so a stale --yes cannot interrupt an agent that has since picked
+#   up work. the item is marked [-] BEFORE delivery (that mark is what stops
+#   the daemon's idle-time flow re-sending it); a failed send returns it to [ ].
 
 hap task --path ./docs/tasks.md list       # operate on any checklist file
 
@@ -511,8 +513,9 @@ delete, `space` to mark a run so `d`/`x` act on all marked at once, `f` to
 focus the live agent a source feeds, `/` to search. `x` **on a source's header
 row** retires the whole source (config entry only, checklist file kept) behind
 a y/n confirmation — offered only when no live agent matches it or every task
-is finished, `[-]` counting as unfinished; marked items win over it. the
-add/edit prompts take
+is finished, `[-]` counting as unfinished; an unknown agent list or an
+unreadable checklist refuse too (unknown is not evidence of safety), and
+marked items win over it. the add/edit prompts take
 multi-line task text: **shift+enter inserts a line break** (ctrl+j on
 terminals that can't report it), the box expands one line per break, **enter
 submits** — stored as the literal `\n` encoding above, decoded back when the

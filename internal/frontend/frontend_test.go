@@ -2419,7 +2419,7 @@ func TestAddTaskMultiline(t *testing.T) {
 // decoded to real newlines — and delivered to the agent's pane.
 func TestSendTaskToAgent(t *testing.T) {
 	app, _ := testApp(t)
-	h := &sendCaptureHerdr{}
+	h := &sendCaptureHerdr{agents: idleAt("w1:p2")}
 	app.Herdr = h
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "tasks.md")
@@ -2453,7 +2453,7 @@ func TestSendTaskToAgent(t *testing.T) {
 		t.Errorf("completed task must refuse to send, got %v", err)
 	}
 	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", 1, "different text"); err == nil ||
-		!strings.Contains(err.Error(), "changed since it was selected") {
+		!strings.Contains(err.Error(), "the checklist changed") {
 		t.Errorf("rewritten task must refuse to send, got %v", err)
 	}
 	if len(h.sent) != 1 {
@@ -2471,16 +2471,219 @@ func TestSendTaskToAgent(t *testing.T) {
 	}
 }
 
-// sendCaptureHerdr records pane deliveries.
-type sendCaptureHerdr struct{ sent []string }
+// TestSendTaskToAgentRechecksIdle pins the guard against the window between
+// the caller's status read and delivery: the operator's confirmation (or a
+// --yes script) can be seconds stale, and a task must never land in a working
+// agent's live conversation.
+func TestSendTaskToAgentRechecksIdle(t *testing.T) {
+	newApp := func(t *testing.T, h *sendCaptureHerdr) (*frontend.App, string) {
+		t.Helper()
+		app, _ := testApp(t)
+		app.Herdr = h
+		path := filepath.Join(t.TempDir(), "tasks.md")
+		if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return app, path
+	}
+	ctx := context.Background()
+	// The agent started working after the caller looked.
+	busy := &sendCaptureHerdr{agents: []domain.AgentTransition{
+		{AgentID: "w1:p2", PaneID: "w1:p2", AgentType: "claude", Status: "working"}}}
+	app, path := newApp(t, busy)
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err == nil ||
+		!strings.Contains(err.Error(), "cleanly idle") {
+		t.Errorf("a now-busy agent must refuse, got %v", err)
+	}
+	if len(busy.sent) != 0 {
+		t.Errorf("refused send must not deliver, got %v", busy.sent)
+	}
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [ ] work") {
+		t.Errorf("refused send must leave the task pending, got %q", data)
+	}
+	// The agent vanished entirely.
+	gone := &sendCaptureHerdr{}
+	app, path = newApp(t, gone)
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err == nil ||
+		!strings.Contains(err.Error(), "no longer live") {
+		t.Errorf("a vanished agent must refuse, got %v", err)
+	}
+	// An unreadable agent list is not an idle agent: fail closed.
+	app, path = newApp(t, nil)
+	app.Herdr = &failingAgentsHerdr{}
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err == nil ||
+		!strings.Contains(err.Error(), "nothing was sent") {
+		t.Errorf("an unreadable agent list must refuse, got %v", err)
+	}
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [ ] work") {
+		t.Errorf("refused send must leave the task pending, got %q", data)
+	}
+}
+
+// TestSendTaskToAgentReservesBeforeDelivering pins the ordering: the item is
+// marked [-] BEFORE the pane receives it, so no guarded failure can be
+// reported after delivery and leave the task [ ] for the daemon to hand out a
+// second time. A failed delivery rolls the reservation back.
+func TestSendTaskToAgentReservesBeforeDelivering(t *testing.T) {
+	ctx := context.Background()
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The reservation must already be on disk by the time Send is called.
+	var atSend string
+	h := &sendCaptureHerdr{agents: idleAt("w1:p2")}
+	app.Herdr = &reserveProbeHerdr{sendCaptureHerdr: h, path: path, seen: &atSend}
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(atSend, "- [-] work") {
+		t.Errorf("task must be reserved [-] BEFORE delivery, file at send time was %q", atSend)
+	}
+	// A delivery that fails returns the task to [ ] rather than parking it.
+	app2, _ := testApp(t)
+	path2 := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path2, []byte("- [ ] work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app2.Herdr = &sendCaptureHerdr{agents: idleAt("w1:p2"), sendErr: errors.New("pane gone")}
+	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2, "", 1, "work"); err == nil ||
+		!strings.Contains(err.Error(), "pane gone") {
+		t.Errorf("a failed delivery must surface its error, got %v", err)
+	}
+	if data, _ := os.ReadFile(path2); !strings.Contains(string(data), "- [ ] work") {
+		t.Errorf("a failed delivery must roll the reservation back to [ ], got %q", data)
+	}
+}
+
+// reserveProbeHerdr snapshots the checklist file at the moment of delivery.
+type reserveProbeHerdr struct {
+	*sendCaptureHerdr
+	path string
+	seen *string
+}
+
+func (c *reserveProbeHerdr) Send(ctx context.Context, pane, input string) error {
+	data, _ := os.ReadFile(c.path)
+	*c.seen = string(data)
+	return c.sendCaptureHerdr.Send(ctx, pane, input)
+}
+
+// racingHerdr rewrites the checklist during the delivery — standing in for
+// another operator acting inside the send's lock-release window — and then
+// fails the send, forcing the rollback to confront the change.
+type racingHerdr struct {
+	sendCaptureHerdr
+	path, write string
+}
+
+func (c *racingHerdr) Send(context.Context, string, string) error {
+	_ = os.WriteFile(c.path, []byte(c.write), 0o644)
+	return errors.New("pane gone")
+}
+
+// TestSendTaskToAgentRollbackIsClaimScoped: the rollback only reopens an item
+// that is still the [-] this send reserved. Someone else's completion landing
+// in the window must survive — reopening it would both discard their work and
+// re-arm the task for the daemon.
+func TestSendTaskToAgentRollbackIsClaimScoped(t *testing.T) {
+	ctx := context.Background()
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app.Herdr = &racingHerdr{
+		sendCaptureHerdr: sendCaptureHerdr{agents: idleAt("w1:p2")},
+		path:             path,
+		write:            "- [x] work\n", // completed by someone else mid-send
+	}
+	err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work")
+	if err == nil || !strings.Contains(err.Error(), "pane gone") {
+		t.Errorf("the delivery failure must still surface, got %v", err)
+	}
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [x] work") {
+		t.Errorf("a concurrent completion must not be reopened by the rollback, got %q", data)
+	}
+}
+
+// TestSendTaskToAgentRendersCwd pins that a manual send fills {cwd} the same
+// way the daemon's declared-task path does — one template must not render
+// differently depending on who sent it.
+func TestSendTaskToAgentRendersCwd(t *testing.T) {
+	ctx := context.Background()
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := &sendInspectHerdr{
+		sendCaptureHerdr: sendCaptureHerdr{agents: idleAt("w1:p2")},
+		info:             domain.PaneInfo{Cwd: "/repo", ForegroundCwd: "/repo/sub"},
+	}
+	app.Herdr = h
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path,
+		"do {next_task_content} in {cwd}", 1, "work"); err != nil {
+		t.Fatal(err)
+	}
+	// The foreground cwd wins, exactly as the daemon's resolver prefers it.
+	if len(h.sent) != 1 || !strings.Contains(h.sent[0], "do work in /repo/sub") {
+		t.Errorf("{cwd} should render the foreground cwd, got %v", h.sent)
+	}
+	// An adapter without the optional inspector still sends, with {cwd} empty.
+	app2, _ := testApp(t)
+	plain := &sendCaptureHerdr{agents: idleAt("w1:p2")}
+	app2.Herdr = plain
+	path2 := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path2, []byte("- [ ] work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2,
+		"do {next_task_content} in {cwd}", 1, "work"); err != nil {
+		t.Errorf("a missing inspector must never block a send, got %v", err)
+	}
+	// Exactly, not Contains: "do work in " is a prefix of a resolved cwd too,
+	// so a substring check could not tell an empty {cwd} from a filled one.
+	if len(plain.sent) != 1 || plain.sent[0] != "do work in " {
+		t.Errorf("expected a delivery with an empty cwd, got %q", plain.sent)
+	}
+}
+
+// sendCaptureHerdr records deliveries and reports the agents it is given, so
+// SendTaskToAgent's just-before-delivery idle re-check can resolve the pane.
+// sendErr makes the delivery itself fail (the rollback path).
+type sendCaptureHerdr struct {
+	sent    []string
+	agents  []domain.AgentTransition
+	sendErr error
+}
 
 func (c *sendCaptureHerdr) Send(_ context.Context, _, input string) error {
+	if c.sendErr != nil {
+		return c.sendErr
+	}
 	c.sent = append(c.sent, input)
 	return nil
 }
 func (c *sendCaptureHerdr) ReadPane(context.Context, string, int) (string, error) { return "", nil }
 func (c *sendCaptureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
-	return nil, nil
+	return c.agents, nil
+}
+
+// idleAt builds the one-agent listing the send path expects.
+func idleAt(paneID string) []domain.AgentTransition {
+	return []domain.AgentTransition{{AgentID: paneID, PaneID: paneID, AgentType: "claude", Status: "idle"}}
+}
+
+// sendInspectHerdr adds the optional InspectorPort so {cwd} can resolve.
+type sendInspectHerdr struct {
+	sendCaptureHerdr
+	info domain.PaneInfo
+}
+
+func (c *sendInspectHerdr) PaneInfo(context.Context, string) (domain.PaneInfo, error) {
+	return c.info, nil
 }
 
 // TestAddTaskRespectsMaxTasksCap: a manual add to a registered source is

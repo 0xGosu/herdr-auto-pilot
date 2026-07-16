@@ -59,16 +59,25 @@ type DeclaredTask struct {
 	LLMReview bool
 }
 
+// TemplateOrDefault resolves a task source's next-task template, falling back
+// to DefaultNextTaskTemplate for an unset one. Prompt renders through it, and
+// it is exported so a caller can inspect the template it is ABOUT to render —
+// notably to skip resolving {cwd} (a herdr round-trip) when nothing
+// references it. Reading t.Template directly would miss the default.
+func TemplateOrDefault(template string) string {
+	if template == "" {
+		return DefaultNextTaskTemplate
+	}
+	return template
+}
+
 // Prompt renders the outbound prompt from the source's template. A single
 // pass substitutes every placeholder, so placeholder-like text inside the
 // task content or path is never re-expanded. Literal `\n` sequences in the
 // task content become real newlines here — the sending side of the
 // one-line-per-item storage encoding (see EncodeTaskNewlines).
 func (t DeclaredTask) Prompt() string {
-	tpl := t.Template
-	if tpl == "" {
-		tpl = DefaultNextTaskTemplate
-	}
+	tpl := TemplateOrDefault(t.Template)
 	return strings.NewReplacer(
 		"{next_task_content}", DecodeTaskNewlines(t.Task),
 		"{task_list_path}", t.Path,

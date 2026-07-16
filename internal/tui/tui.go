@@ -1747,29 +1747,27 @@ func (m Model) deleteTasksPrompt() (tea.Model, tea.Cmd) {
 // taskSourceRemovable reports whether a task source may be retired from the
 // Tasks tab, and if not, why. A source is removable only once it cannot be
 // serving anyone: no live agent matches its selectors, or every task in it is
-// genuinely finished. An unreadable source is removable too — the daemon
-// logs-and-skips those, so the entry feeds nobody and there is no checklist to
-// lose (slightly beyond the literal rule, deliberately: a broken entry should
-// be retirable from the tab that shows it as broken).
+// genuinely finished.
+//
+// Both "unknown" inputs fail closed, because neither is evidence of safety:
+// an agent list herdr would not answer is not an empty herd, and a checklist
+// that would not read is not an empty checklist. Either can still hide live
+// work. The unguarded Config-tab `x` and `hap task-source remove` remain the
+// force path for an entry this refuses.
 func (m Model) taskSourceRemovable(g frontend.TaskGroup) (string, bool) {
-	if g.Err != "" {
-		return "", true
-	}
 	// UnfinishedTasks, not PendingTasks: an agent mid-task has "[-]" items,
 	// which read as Done and would make a live source look finished. A
 	// finished list is removable whoever it feeds, so this needs no agent.
-	left := frontend.UnfinishedTasks([]frontend.TaskGroup{g})
-	if left == 0 {
+	if g.Err == "" && frontend.UnfinishedTasks([]frontend.TaskGroup{g}) == 0 {
 		return "", true
 	}
-	// Only the "nothing matches it" arm needs the agent list — and an empty
-	// list means "herdr didn't answer" just as readily as "no agents are
-	// running". Fail closed rather than retire a source that may well be
-	// feeding someone right now; the Config tab still removes it outright.
 	if !m.data.status.AgentsKnown {
-		return fmt.Sprintf("task source #%d has %d unfinished task(s) and herdr can't say which "+
-			"agent it feeds — retry, or remove the entry on the Config tab (x)", g.Index, left), false
+		return fmt.Sprintf("task source #%d: herdr can't say which agent it feeds — "+
+			"retry, or remove the entry on the Config tab (x)", g.Index), false
 	}
+	// Nothing matches the selectors, so the source feeds nobody — retirable
+	// whatever its file does or doesn't say. This is the case that keeps a
+	// broken entry (unreadable path, dead agent) cleanable from this tab.
 	agent := m.taskGroupAgent(g.Index)
 	if agent == nil {
 		return "", true
@@ -1778,8 +1776,14 @@ func (m Model) taskSourceRemovable(g frontend.TaskGroup) (string, bool) {
 	if name == "" {
 		name = agent.AgentID
 	}
+	if g.Err != "" {
+		return fmt.Sprintf("task source #%d feeds %s but its checklist can't be read, so its "+
+			"remaining work is unknown — fix the path, or remove the entry on the Config tab (x)",
+			g.Index, name), false
+	}
 	return fmt.Sprintf("task source #%d still feeds %s and has %d unfinished task(s) — "+
-		"finish them, or remove the entry on the Config tab (x)", g.Index, name, left), false
+		"finish them, or remove the entry on the Config tab (x)", g.Index, name,
+		frontend.UnfinishedTasks([]frontend.TaskGroup{g})), false
 }
 
 // removeTaskSourcePrompt confirms, then removes the task source's config
