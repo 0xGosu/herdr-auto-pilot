@@ -25,6 +25,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
+	"github.com/0xGosu/herdr-auto-pilot/internal/mcqdeliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/reembed"
 )
@@ -58,19 +59,13 @@ func (a *App) deliverTabSeries(ctx context.Context, ks ports.KeystrokeSender, au
 	if err != nil {
 		return err
 	}
-	if err := a.resetForm(ctx, ks, agentID); err != nil {
-		return err
-	}
-	keys := domain.MultiTabKeys(groups, multi, seriesAdvanceKey)
-	for i, key := range keys {
-		if i > 0 {
-			time.Sleep(seriesKeyDelay)
-		}
-		if err := ks.SendKey(ctx, agentID, key); err != nil {
-			return fmt.Errorf("delivering keystroke %d/%d (%q) failed: %w", i+1, len(keys), key, err)
-		}
-	}
-	return nil
+	return mcqdeliver.ClaudeTabs(ctx, mcqdeliver.Config{
+		Keys:      ks,
+		Read:      a.readVisiblePane,
+		PaneID:    agentID,
+		ReadLines: menuReadLines,
+		KeyDelay:  seriesKeyDelay,
+	}, groups, multi)
 }
 
 // deliverCodexSeries mirrors the daemon's adaptive Codex protocol for an

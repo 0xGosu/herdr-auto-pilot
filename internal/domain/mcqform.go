@@ -30,6 +30,11 @@ var (
 	// set of digits ("1,3"). There is still exactly ONE token per tab, so the
 	// len(tokens)==TabCount guards hold whether or not a tab is multi-select.
 	digitTokenRE = regexp.MustCompile(`^[1-9](,[1-9])*$`)
+	// mcqTabCaretRE matches the option the selection caret currently sits on
+	// ("❯ 2. Square" -> "2"). Delivery must confirm the caret reached the
+	// intended option before pressing Enter, or Enter would commit whatever
+	// option the caret happened to rest on.
+	mcqTabCaretRE = regexp.MustCompile(`(?m)^[ \t]*❯[ \t]*(\d+)[.)][ \t]+`)
 )
 
 // mcqSubmitScreenRE matches the final Submit tab's confirmation body. That
@@ -101,6 +106,70 @@ func MultiTabForm(pane string) (tabs int, ok bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// ClaudeTabForm parses the LIVE multi-tab render into the state a delivery
+// keystroke can be verified against: how many question tabs still owe an
+// answer, and which option the caret sits on.
+//
+// It exists because Claude renders the SAME form with two different key
+// protocols, decided per tab by whether its options carry a preview
+// (verified live 2026-07-16, Claude Code / Haiku 4.5):
+//
+//   - plain options ("1. Apple" / "2. Banana"): the DIGIT selects and commits,
+//     auto-advancing to the next tab.
+//   - options with previews (option list left, preview box right, "Notes:
+//     press n to add notes"): the digit only MOVES THE CARET, exactly like
+//     ↑/↓ — ENTER is what commits and advances.
+//
+// The footer is identical in both ("Enter to select · ↑/↓ to navigate · …")
+// and never advertises digits, so the binding cannot be told apart by
+// rendering alone — and a form can mix the two (a preview form's generated
+// Submit tab renders plain). Delivery therefore presses the digit, re-reads,
+// and only presses Enter if the answer did not commit; see internal/mcqdeliver.
+// Blind digit-only delivery is a silent no-op on preview tabs.
+func ClaudeTabForm(pane string) (MCQFormState, bool) {
+	total, ok := MultiTabForm(pane)
+	if !ok {
+		return MCQFormState{}, false
+	}
+	headers := mcqTabHeaderRE.FindAllStringIndex(pane, -1)
+	last := headers[len(headers)-1]
+	// An answered tab renders ☒ and the Submit entry renders ✔, so ☐ alone
+	// counts the tabs that still owe an answer — the Claude analogue of
+	// Codex's "(N unanswered)" counter, and the signal that tells delivery
+	// whether a keystroke actually committed.
+	state := MCQFormState{
+		Kind:        MCQClaudeTabs,
+		AnswerCount: total,
+		Unanswered:  strings.Count(pane[last[0]:last[1]], "☐"),
+	}
+	// Scope the caret search to the live form: from the last header down to
+	// its footer, so a stale render (or the composer) can not supply it.
+	region := pane[last[0]:]
+	if end := mcqFooterRE.FindStringIndex(region); end != nil {
+		region = region[:end[0]]
+	}
+	if m := mcqTabCaretRE.FindStringSubmatch(region); m != nil {
+		state.SelectedOption = m[1]
+	}
+	state.Question = claudeTabQuestion(region)
+	return state, true
+}
+
+// claudeTabQuestion returns the tab's question line — the first non-empty line
+// after the tab header. It is the only per-tab identity the render exposes (the
+// header carries no "1/3" index), and unlike the option lines it is stable
+// while the caret moves: in the preview layout the option lines carry the
+// preview box, whose CONTENT changes with the focused option.
+func claudeTabQuestion(region string) string {
+	lines := strings.Split(region, "\n")
+	for _, line := range lines[1:] { // lines[0] is the header itself
+		if t := strings.TrimSpace(line); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 // ParseDigitSeries parses the space-separated per-tab answer tokens for a

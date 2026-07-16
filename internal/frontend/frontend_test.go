@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1977,6 +1978,15 @@ type fakeKeyHerdr struct {
 	keys            []string
 	keyScript       []string
 	keyScriptFrames []string
+	// mcqTabs, when > 0, simulates a live Claude multi-tab form of that many
+	// tabs (Submit included) in the PLAIN rendering: a digit commits the
+	// current tab's answer (its ☐ becomes ☒) and advances, and the Submit
+	// tab's digit submits the form away. Delivery verifies every keystroke
+	// against the pane (see internal/mcqdeliver), so a fake whose content never
+	// reacts to a digit can not deliver at all.
+	mcqTabs      int
+	mcqAnswered  int
+	mcqSubmitted bool
 }
 
 func (f *fakeKeyHerdr) SendKey(_ context.Context, paneID, key string) error {
@@ -1986,7 +1996,44 @@ func (f *fakeKeyHerdr) SendKey(_ context.Context, paneID, key string) error {
 		f.pane = f.keyScriptFrames[0]
 		f.keyScriptFrames = f.keyScriptFrames[1:]
 	}
+	if f.mcqTabs > 0 && !f.mcqSubmitted {
+		if _, err := strconv.Atoi(key); err == nil {
+			if f.mcqAnswered >= f.mcqTabs-1 {
+				f.mcqSubmitted = true // the Submit tab's digit
+			} else {
+				f.mcqAnswered++
+			}
+		}
+	}
 	return nil
+}
+
+// ReadPane serves the simulated form when one is configured: the header's ☐
+// marks reflect how many tabs a digit has answered, and once submitted the
+// form is gone.
+func (f *fakeKeyHerdr) ReadPane(ctx context.Context, paneID string, lines int) (string, error) {
+	if f.mcqTabs == 0 {
+		return f.fakeHerdr.ReadPane(ctx, paneID, lines)
+	}
+	if f.readErr != nil {
+		return "", f.readErr
+	}
+	if f.mcqSubmitted {
+		return "⏺ Answers received.\n\n❯ \n", nil
+	}
+	marks := make([]string, 0, f.mcqTabs-1)
+	for i := 0; i < f.mcqTabs-1; i++ {
+		if i < f.mcqAnswered {
+			marks = append(marks, "☒ Q"+strconv.Itoa(i+1))
+		} else {
+			marks = append(marks, "☐ Q"+strconv.Itoa(i+1))
+		}
+	}
+	// The question line must change per tab: delivery compares it across a
+	// keystroke to prove the form did not silently move to another tab.
+	return "←  " + strings.Join(marks, "  ") + "  ✔ Submit  →\n\nQuestion " +
+		strconv.Itoa(f.mcqAnswered+1) + "?\n❯ 1. sqlite\n  2. postgres\n\n" +
+		"Enter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel\n", nil
 }
 
 func frontendCodexFrame(current, total, unanswered int, selected string, submitAll bool) string {
@@ -2009,9 +2056,7 @@ func TestResolveDigitSeriesDeliversKeystrokes(t *testing.T) {
 	// Confirming a multi-tab answer series delivers one digit keystroke per
 	// tab (Submit included) — never the series as literal text.
 	app, st := testApp(t)
-	fake := &fakeKeyHerdr{fakeHerdr: fakeHerdr{
-		pane: "←  ☐ Q one  ☐ Q two  ✔ Submit  →\n\nWhich backend?\n❯ 1. sqlite\n  2. postgres\n\nEnter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel\n",
-	}}
+	fake := &fakeKeyHerdr{mcqTabs: 3}
 	app.Herdr = fake
 	ctx := context.Background()
 

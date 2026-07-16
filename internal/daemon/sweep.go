@@ -9,6 +9,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
+	"github.com/0xGosu/herdr-auto-pilot/internal/mcqdeliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
@@ -25,11 +26,10 @@ import (
 // following read (or the next keystroke).
 const sweepKeyDelay = 250 * time.Millisecond
 
-// sweepResetKeys / sweepAdvanceKey alias the shared domain protocol constants
-// so the capture sweep, autonomous delivery, and the operator-confirm frontend
-// all navigate a form identically (a single source of truth — domain.MCQ*).
+// sweepResetKeys aliases the shared domain protocol constant so the capture
+// sweep, autonomous delivery, and the operator-confirm frontend all navigate a
+// form identically (a single source of truth — domain.MCQ*).
 const sweepResetKeys = domain.MCQResetKeys
-const sweepAdvanceKey = domain.MCQAdvanceKey
 
 // sweepAllowed re-reads the gates that must veto pane interaction BEFORE
 // any sweep keystroke: kill switch (FR-017), rate pause (FR-019), and the
@@ -477,11 +477,10 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 }
 
 // sendTabSelections resets the form to its first question (fixed Left-arrow
-// burst — a human may have tabbed around since capture), then presses the
-// per-tab answer keystrokes from domain.MultiTabKeys: the toggle digit(s) for
-// each tab, plus an explicit advance after a MULTI-SELECT tab (which does not
-// auto-advance on a digit press). Keystrokes are paced by sweepKeyDelay so the
-// form advances and re-renders between presses.
+// burst — a human may have tabbed around since capture), then answers each tab
+// in order via the shared mcqdeliver protocol, which verifies every keystroke
+// landed. Keystrokes are paced by sweepKeyDelay so the form re-renders between
+// presses.
 func (d *Daemon) sendTabSelections(ctx context.Context, ks ports.KeystrokeSender, s domain.Situation,
 	groups [][]string) error {
 	if s.MCQKind == domain.MCQCodexQuestions {
@@ -493,22 +492,13 @@ func (d *Daemon) sendTabSelections(ctx context.Context, ks ports.KeystrokeSender
 func (d *Daemon) sendClaudeTabSelections(ctx context.Context, ks ports.KeystrokeSender, paneID string,
 	groups [][]string, tabMultiSelect []bool) error {
 
-	for i := 0; i < sweepResetKeys; i++ {
-		if err := ks.SendKey(ctx, paneID, "left"); err != nil {
-			return fmt.Errorf("reset left-arrow %d/%d: %w", i+1, sweepResetKeys, err)
-		}
-	}
-	time.Sleep(sweepKeyDelay)
-	keys := domain.MultiTabKeys(groups, tabMultiSelect, sweepAdvanceKey)
-	for i, key := range keys {
-		if i > 0 {
-			time.Sleep(sweepKeyDelay)
-		}
-		if err := ks.SendKey(ctx, paneID, key); err != nil {
-			return fmt.Errorf("keystroke %d/%d (%q): %w", i+1, len(keys), key, err)
-		}
-	}
-	return nil
+	return mcqdeliver.ClaudeTabs(ctx, mcqdeliver.Config{
+		Keys:      ks,
+		Read:      d.readVisible,
+		PaneID:    paneID,
+		ReadLines: d.opt.PaneReadLines,
+		KeyDelay:  sweepKeyDelay,
+	}, groups, tabMultiSelect)
 }
 
 // sendCodexSelections answers a request_user_input form without assuming how

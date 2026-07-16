@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +48,17 @@ type fakeHerdr struct {
 	frames   []string
 	frameIdx int
 	failKeys bool
+	// mcqAnswered marks which multi-tab frames a digit has ANSWERED, and
+	// mcqSubmitted whether the form has been submitted away. Delivery verifies
+	// each keystroke against the pane, so the fake has to model what a digit
+	// actually does to a real form (see internal/mcqdeliver): on a
+	// single-select tab it commits the answer and auto-advances (the tab's ☐
+	// becomes ☒), on the Submit tab it submits and the form disappears, and on
+	// a multi-select tab it only toggles a checkbox — no answer, no advance.
+	// Without this, every read returns the same all-unanswered header and no
+	// delivery can ever verify.
+	mcqAnswered  []bool
+	mcqSubmitted bool
 	// failKeyName fails only SendKey calls for that specific key (e.g.
 	// "left" to break the sweep's reset burst but not its Right sweep).
 	failKeyName string
@@ -86,9 +98,37 @@ func (f *fakeHerdr) ReadPane(ctx context.Context, paneID string, lines int) (str
 		return "", errors.New("induced deep read failure")
 	}
 	if len(f.frames) > 0 {
-		return f.frames[f.frameIdx], nil
+		return f.renderFrame(), nil
 	}
 	return f.pane, nil
+}
+
+// renderFrame serves the focused multi-tab frame with the tab header's ☐ marks
+// updated to ☒ for tabs a digit has already answered — what a real form shows
+// and what delivery reads back to verify a keystroke landed. Once submitted,
+// the form is gone and the pane shows ordinary agent output.
+func (f *fakeHerdr) renderFrame() string {
+	if f.mcqSubmitted {
+		return "⏺ Answers received. Working on it now.\n\n❯ \n"
+	}
+	// One pass over the ORIGINAL ☐ positions: replacing them one at a time
+	// would renumber the ones still to come.
+	var b strings.Builder
+	rest := f.frames[f.frameIdx]
+	for tab := 0; ; tab++ {
+		i := strings.Index(rest, "☐")
+		if i < 0 {
+			b.WriteString(rest)
+			return b.String()
+		}
+		b.WriteString(rest[:i])
+		if tab < len(f.mcqAnswered) && f.mcqAnswered[tab] {
+			b.WriteString("☒")
+		} else {
+			b.WriteString("☐")
+		}
+		rest = rest[i+len("☐"):]
+	}
 }
 
 func (f *fakeHerdr) SendKey(ctx context.Context, paneID, key string) error {
@@ -114,8 +154,38 @@ func (f *fakeHerdr) SendKey(ctx context.Context, paneID, key string) error {
 		if f.frameIdx > 0 {
 			f.frameIdx--
 		}
+	default:
+		f.pressMCQDigit(key)
 	}
 	return nil
+}
+
+// pressMCQDigit models what a digit does to the simulated multi-tab form.
+// These frames are the PLAIN rendering, where a digit commits and advances;
+// the preview rendering (digit moves the caret only, Enter commits) is covered
+// against a real Claude in test/integration and by internal/mcqdeliver's own
+// fake, so a digit here must never be a no-op or delivery could not verify.
+func (f *fakeHerdr) pressMCQDigit(key string) {
+	if len(f.frames) == 0 || f.mcqSubmitted {
+		return
+	}
+	if _, err := strconv.Atoi(key); err != nil {
+		return
+	}
+	if len(f.mcqAnswered) < len(f.frames) {
+		f.mcqAnswered = make([]bool, len(f.frames))
+	}
+	// A multi-select tab toggles a checkbox: no answer, no advance.
+	if domain.MultiSelectTab(f.frames[f.frameIdx]) {
+		return
+	}
+	// The last frame is the Submit tab: its digit submits the form away.
+	if f.frameIdx == len(f.frames)-1 {
+		f.mcqSubmitted = true
+		return
+	}
+	f.mcqAnswered[f.frameIdx] = true
+	f.frameIdx++
 }
 
 func (f *fakeHerdr) SendKeys(ctx context.Context, paneID string, keys ...string) error {
