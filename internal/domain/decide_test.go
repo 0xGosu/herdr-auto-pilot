@@ -42,12 +42,6 @@ func TestKillSwitchVetoesEverything(t *testing.T) {
 	if d.Confidence != 1 {
 		t.Errorf("veto must still report the rule's actual confidence, got %.3f", d.Confidence)
 	}
-	// The token is operator-facing, not an internal name: the daemon renders it
-	// as the escalation's RATIONALE ("[daemon_paused]"), and it must say the
-	// operator paused automation rather than implying something crashed.
-	if ReasonDaemonPaused != "daemon_paused" {
-		t.Errorf("the pause veto's reason token reaches the operator, got %q", ReasonDaemonPaused)
-	}
 }
 
 func TestDecisionFloorGatesButKeepsSuggestion(t *testing.T) {

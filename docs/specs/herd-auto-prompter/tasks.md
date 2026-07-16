@@ -184,7 +184,7 @@ Implementation plan derived from the constitution, requirements, and solution sp
   - _Complexity: Medium_
 
 - [x] 20\. Escalation-on-uncertainty consolidation
-  - Route every uncertain path (unclassifiable, below-threshold, variance/over-masking guard, suspected-irreversible, rate/retry-exhausted, killed) to escalate + audit + notify.
+  - Route every uncertain path (unclassifiable, below-threshold, variance/over-masking guard, suspected-irreversible, rate/retry-exhausted, daemon-paused) to escalate + audit + notify.
   - Acceptance Criteria:
     - Each error-code path takes no agent action and produces an audit record + escalation surface.
   - _Dependencies: 8, 12, 16, 18, 19_
