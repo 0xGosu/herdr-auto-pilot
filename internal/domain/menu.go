@@ -113,12 +113,14 @@ func MenuKeystroke(content, chosen string) (string, bool) {
 // approval/choice situations and Codex's structural rate-limit error modal.
 // Other error retries and idle prompts remain literal free text, so an
 // ordinary numbered list cannot hijack their reply into a bare digit.
-// paneContent is the live screen. The bool reports whether a menu digit was
-// mapped: false means the returned text is free text (callers deciding whether
-// to rewrite literal outbound text key off this).
-func DeliverOutbound(sitType SituationType, paneContent, chosen string) (string, bool) {
+// agentType is required because the rate-limit shape has Codex-only semantics;
+// approval and choice menus remain agent-agnostic. paneContent is the live
+// screen. The bool reports whether a menu digit was mapped: false means the
+// returned text is free text (callers deciding whether to rewrite literal
+// outbound text key off this).
+func DeliverOutbound(sitType SituationType, agentType, paneContent, chosen string) (string, bool) {
 	menuSituation := sitType == SituationApproval || sitType == SituationChoice ||
-		(sitType == SituationError && CodexRateLimitForm(paneContent))
+		(sitType == SituationError && strings.EqualFold(strings.TrimSpace(agentType), "codex") && CodexRateLimitForm(paneContent))
 	if !menuSituation {
 		return chosen, false
 	}
@@ -126,8 +128,8 @@ func DeliverOutbound(sitType SituationType, paneContent, chosen string) (string,
 }
 
 // DeliverKeystroke is DeliverOutbound for callers that only need the text.
-func DeliverKeystroke(sitType SituationType, paneContent, chosen string) string {
-	out, _ := DeliverOutbound(sitType, paneContent, chosen)
+func DeliverKeystroke(sitType SituationType, agentType, paneContent, chosen string) string {
+	out, _ := DeliverOutbound(sitType, agentType, paneContent, chosen)
 	return out
 }
 

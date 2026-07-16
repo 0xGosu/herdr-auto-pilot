@@ -1115,7 +1115,7 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// not the label text; deliver the keystroke the menu expects. Free-text
 	// situations deliver the literal reply. s.Content is the classification
 	// snapshot, which carries the menu for the situation being acted on.
-	outbound, menuMapped := domain.DeliverOutbound(s.Type, s.Content, dec.Input)
+	outbound, menuMapped := domain.DeliverOutbound(s.Type, s.AgentType, s.Content, dec.Input)
 
 	// Literal free text can be adapted to the live pane by the optional
 	// rewrite CLI; menu digits must reach the menu untouched. The send
@@ -2500,7 +2500,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		return
 	}
 	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType,
-		domain.DeliverKeystroke(s.Type, pane, llmDec.Action)); err != nil {
+		domain.DeliverKeystroke(s.Type, s.AgentType, pane, llmDec.Action)); err != nil {
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
 		return

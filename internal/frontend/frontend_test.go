@@ -381,6 +381,31 @@ func TestConfirmCodexRateLimitErrorSendsSelectedMenuDigit(t *testing.T) {
 	}
 }
 
+func TestConfirmNonCodexRateLimitShapedErrorStaysLiteral(t *testing.T) {
+	app, st := testApp(t)
+	pane := "Approaching rate limits\n" +
+		"Switch to gpt-5.4-mini for lower credit usage?\n\n" +
+		"› 1. Switch to gpt-5.4-mini                 Small, fast, and cost-efficient model for simpler coding tasks.\n" +
+		"  2. Keep current model\n" +
+		"  3. Keep current model (never show again)  Hide future rate limit reminders about switching models.\n\n" +
+		"Press enter to confirm or esc to go back\n"
+	fake := &fakeHerdr{pane: pane}
+	app.Herdr = fake
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "claude-pane", AgentType: "claude", SituationType: domain.SituationError,
+		Trigger: "agent-status: blocked", Action: "escalated", Status: "escalated",
+		Suggestion: "on error: Keep current model", PaneExcerpt: pane, CreatedAt: time.Now(),
+	})
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 1 || fake.inputs[0] != "Keep current model" {
+		t.Fatalf("non-Codex rate-limit-shaped error sent %v, want literal reply", fake.inputs)
+	}
+}
+
 // TestResolveRecordOnlyNotSent: a record-only correction (no --send) leaves
 // Sent=false so the daemon does NOT run the self-check on an expectedly-blocked
 // agent.
