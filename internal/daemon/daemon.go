@@ -221,6 +221,11 @@ type taskGenOutcome struct {
 	request   domain.LLMRequest
 	task      string
 	err       error
+	// reason is the escalate reason that triggered this generation —
+	// ReasonNoTaskSource (no source at all) or ReasonTaskSourceExhausted (a
+	// declared source matched but ran out) — carried through so the eventual
+	// success escalation is tagged with the reason that actually applies.
+	reason domain.EscalateReason
 }
 
 // sweepOutcome carries a finished multi-tab form sweep back into the main
@@ -967,16 +972,17 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 			MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 			MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
 		},
-		Now:                    now,
-		RetryCount:             retries,
-		MaxRetries:             cfg.Limits.MaxErrorRetries,
-		DeclaredTask:           declared,
-		LLMConfigured:          d.llmPort() != nil && d.llmPort().Configured(),
-		GenerateTaskConfigured: d.taskGenPort() != nil,
-		NeverAutoRuleHit:       allowHit,
-		NeverAutoMatched:       allowMatched,
-		SuspectedIrreversible:  suspected,
-		IrreversibleHit:        irrevHit,
+		Now:                         now,
+		RetryCount:                  retries,
+		MaxRetries:                  cfg.Limits.MaxErrorRetries,
+		DeclaredTask:                declared,
+		LLMConfigured:               d.llmPort() != nil && d.llmPort().Configured(),
+		GenerateTaskConfigured:      d.taskGenPort() != nil,
+		GenerateTaskStartConfigured: len(cfg.LLM.GenerateTaskCommandStart) > 0,
+		NeverAutoRuleHit:            allowHit,
+		NeverAutoMatched:            allowMatched,
+		SuspectedIrreversible:       suspected,
+		IrreversibleHit:             irrevHit,
 	}
 
 	decision := domain.Decide(in)
@@ -998,7 +1004,11 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	case domain.ActionConsult:
 		d.consultLLM(ctx, cfg, situation, sig, now)
 	case domain.ActionGenerateTask:
-		d.generateTask(ctx, cfg, situation, sig, tr, now)
+		// ActionGenerateTask for an idle situation only fires when there's no
+		// REAL pending task: declared != nil here means a task source matched
+		// but its checklist is exhausted (Task == NoTaskContent), not that
+		// none was ever declared.
+		d.generateTask(ctx, cfg, situation, sig, tr, now, declared != nil)
 	default:
 		d.escalate(ctx, situation, sig, decision, tr, now)
 	}
@@ -1542,14 +1552,18 @@ func (d *Daemon) taskGenPort() ports.TaskGeneratorPort {
 }
 
 // generateTask asks the operator LLM to SUGGEST a task for an idle agent that
-// has no task source (FR-011 relaxation). Like consultLLM the subprocess runs
-// in a goroutine — it shells out to herdr for the pane excerpt and cwd — and
-// the suggestion funnels back through handleTaskGenOutcome as an escalation the
+// has no real pending task — either no task source at all, or a declared
+// source whose checklist is exhausted (FR-011 relaxation, and its
+// task-source-exhausted extension). Like consultLLM the subprocess runs in a
+// goroutine — it shells out to herdr for the pane excerpt and cwd — and the
+// suggestion funnels back through handleTaskGenOutcome as an escalation the
 // operator confirms or dismisses; it is never auto-acted. A pending
 // llm_requests row guards against concurrent generations from bursty idle
-// events and lets `l`-retry reuse the same in-flight check.
+// events and lets `l`-retry reuse the same in-flight check. sourceExhausted
+// reports whether a declared source currently matches (exhausted) rather
+// than none existing at all — see the First computation below.
 func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.Situation,
-	sig domain.SignatureResult, tr domain.AgentTransition, now time.Time) {
+	sig domain.SignatureResult, tr domain.AgentTransition, now time.Time, sourceExhausted bool) {
 
 	tg := d.taskGenPort()
 	if tg == nil {
@@ -1564,12 +1578,28 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 		return
 	}
 
-	// The first generation for this agent selects task_generate_command_start
-	// (when configured); mark it consumed on the main loop, before the goroutine.
+	// task_generate_command_start is only for bootstrapping a list from
+	// nothing: when a declared source already exists (even exhausted), a list
+	// already exists, so this is never a "first" generation. That case must
+	// NOT touch firstTaskGen — it tracks the no-source path's own "has
+	// generation ever fired for this agent" independently, so a LATER no-
+	// source bootstrap for the same agent (e.g. its exhausted source's file
+	// is later deleted) still correctly sees first=true and selects
+	// task_generate_command_start.
 	d.mu.Lock()
-	first := !d.firstTaskGen[s.AgentID]
-	d.firstTaskGen[s.AgentID] = true
+	var first bool
+	if sourceExhausted {
+		first = false
+	} else {
+		first = !d.firstTaskGen[s.AgentID]
+		d.firstTaskGen[s.AgentID] = true
+	}
 	d.mu.Unlock()
+
+	reason := domain.ReasonNoTaskSource
+	if sourceExhausted {
+		reason = domain.ReasonTaskSourceExhausted
+	}
 
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("gentask-%s-%d", s.AgentID, now.UnixNano()),
@@ -1588,7 +1618,7 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 	}
 
 	go func() {
-		outcome := taskGenOutcome{situation: s, sig: sig, tr: tr, request: req}
+		outcome := taskGenOutcome{situation: s, sig: sig, tr: tr, request: req, reason: reason}
 		err := logging.Guard("generate-task", func() error {
 			agentName, nerr := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
 			if nerr != nil {
@@ -1640,16 +1670,20 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 
 	// Staleness: generation took up to its timeout — never surface a suggestion
 	// for an agent that moved on. If the agent STARTED WORKING (its live herdr
-	// status is no longer idle/done), or it now has a matching task source, the
-	// suggestion is moot — drop it instead of leaving a stale, confirmable
-	// escalation. Unknown status (list error / agent absent) falls through and
-	// still surfaces the outcome (fail-safe). The confirm path re-checks too,
-	// since the operator may act minutes later.
+	// status is no longer idle/done), or it now has a matching task source
+	// with a REAL pending item, the suggestion is moot — drop it instead of
+	// leaving a stale, confirmable escalation. A still-exhausted declared
+	// source (the res.reason == ReasonTaskSourceExhausted trigger) must NOT
+	// count as "now has a task source": it's the same exhausted source that
+	// triggered this generation, and dropping here would silently discard
+	// every exhausted-source suggestion. Unknown status (list error / agent
+	// absent) falls through and still surfaces the outcome (fail-safe). The
+	// confirm path re-checks too, since the operator may act minutes later.
 	if d.agentNotCleanlyIdle(ctx, s.AgentID) {
 		slog.Info("generate-task: agent no longer idle; dropping suggestion", "agent", s.AgentID)
 		return
 	}
-	if d.declaredTaskFor(ctx, s) != nil {
+	if dt := d.declaredTaskFor(ctx, s); dt != nil && dt.Task != domain.NoTaskContent {
 		slog.Info("generate-task: agent now has a task source; dropping suggestion", "agent", s.AgentID)
 		return
 	}
@@ -1666,12 +1700,13 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 		return
 	}
 
-	// Success: surface the suggestion for confirmation. The reason stays
-	// no_task_source (the agent IS still without a source) so the escalation
-	// is NOT retryable — the operator confirms or dismisses it — while the
-	// suggestion carries the generated task for the confirm path.
+	// Success: surface the suggestion for confirmation. The reason carries
+	// what triggered this generation (no_task_source, or
+	// task_source_exhausted for a declared source that ran out) so the
+	// escalation stays NOT retryable — the operator confirms or dismisses it
+	// — while the suggestion carries the generated task for the confirm path.
 	d.escalate(ctx, s, res.sig, domain.Decision{
-		Action: domain.ActionEscalate, Reason: domain.ReasonNoTaskSource,
+		Action: domain.ActionEscalate, Reason: res.reason,
 		Suggestion: domain.SuggestTaskPrefix + res.task,
 	}, res.tr, now)
 }
@@ -2918,8 +2953,11 @@ func (d *Daemon) taskSourceSummary(ctx context.Context, cfg config.Config, s dom
 // or the agent's short name; the workspace selector matches the workspace's
 // herdr name (label) with "*" wildcards, falling back to the raw workspace
 // id when no name is resolvable. A matched source with a fully completed
-// list still resolves (task content "none") so the templated prompt is
-// delivered; sources with a real remaining task take precedence.
+// list still resolves (task content NoTaskContent, "none") so callers can
+// tell "matched but exhausted" from "nothing matched" — the decision core
+// (domain.Decide) never sends that templated "none" prompt, escalating or
+// generating more tasks instead; sources with a real remaining task take
+// precedence.
 func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.AgentTransition, agentName string) *domain.DeclaredTask {
 	m, ok := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName)
 	if !ok {

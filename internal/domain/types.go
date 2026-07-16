@@ -152,11 +152,17 @@ const (
 	// confidence was below the operator's auto_act_confidence_threshold (or
 	// it reported no score), so the suggestion is surfaced for confirmation
 	// instead of being auto-acted.
-	ReasonLLMLowConfidence     EscalateReason = "llm_low_confidence"
-	ReasonHerdrUnreachable     EscalateReason = "herdr_unreachable"
-	ReasonPersistenceFailed    EscalateReason = "persistence_failed"
-	ReasonShadowMode           EscalateReason = "shadow_mode"
-	ReasonNoTaskSource         EscalateReason = "no_task_source"
+	ReasonLLMLowConfidence  EscalateReason = "llm_low_confidence"
+	ReasonHerdrUnreachable  EscalateReason = "herdr_unreachable"
+	ReasonPersistenceFailed EscalateReason = "persistence_failed"
+	ReasonShadowMode        EscalateReason = "shadow_mode"
+	ReasonNoTaskSource      EscalateReason = "no_task_source"
+	// ReasonTaskSourceExhausted: a declared task source matched but every
+	// item is checked off. Not retryable — the operator confirms or
+	// dismisses it (or, when both task_generate_command and
+	// task_generate_command_start are configured, the plugin generates more
+	// tasks instead of escalating this reason at all).
+	ReasonTaskSourceExhausted  EscalateReason = "task_source_exhausted"
 	ReasonUnfamiliarOptions    EscalateReason = "unfamiliar_options"
 	ReasonNoHistory            EscalateReason = "no_history"
 	ReasonNotConsecutiveEnough EscalateReason = "graduation_pending"
