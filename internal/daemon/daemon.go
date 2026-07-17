@@ -2320,6 +2320,9 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 		note = "rewrite affirmed original (@rewrite:nochange)"
 		llmOutput = domain.RewriteNoChange
 	default:
+		// The CLI's actual output always lands on the audit row (LLMOutput)
+		// — on a clean rewrite it is also the delivered text.
+		llmOutput = final
 		if hit, matched := allow.Match(s.AgentType, final); matched {
 			llmOutput = "discarded rewrite: " + truncateRunes(final, 500)
 			degrade("output matched never-auto " + hit.Diagnostic())

@@ -75,6 +75,9 @@ func TestRewriteAppliedToIdleDeclaredTask(t *testing.T) {
 	if audits[0].Input != "REWRITTEN: please do step two" || audits[0].Status != "auto" {
 		t.Errorf("audit should carry the delivered text: %+v", audits[0])
 	}
+	if audits[0].LLMOutput != "REWRITTEN: please do step two" {
+		t.Errorf("audit LLMOutput should carry the CLI's actual output: %q", audits[0].LLMOutput)
+	}
 	if !strings.Contains(audits[0].Rationale, "rewritten by llm.rewrite_command") ||
 		!strings.Contains(audits[0].Rationale, "step two") {
 		t.Errorf("audit rationale should note the rewrite and the original: %q", audits[0].Rationale)
