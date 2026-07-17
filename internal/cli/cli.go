@@ -204,7 +204,7 @@ func signaturesList(ctx context.Context, app *frontend.App, out io.Writer, args 
 	situation := fs.String("type", "", "filter by situation type (idle|approval|choice|error)")
 	mode := fs.String("mode", "", "filter by mode (shadow|autonomous)")
 	agentType := fs.String("agent-type", "", "filter by agent type")
-	minConf := fs.Float64("min-conf", 0, "filter by minimum cached confidence")
+	minConf := fs.Float64("min-conf", 0, "filter by minimum live confidence")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -239,9 +239,9 @@ func signaturesList(ctx context.Context, app *frontend.App, out io.Writer, args 
 	}
 	graduationN := graduationN(app)
 	for _, r := range rows {
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d/%d\tconf=%.2f\ttop=%q\t%s\n",
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d/%d\tconf=%s\ttop=%q\t%s\n",
 			shortSignature(r.Signature), r.SituationType, orDash(r.AgentType), r.Mode,
-			r.ConsecutiveConfirmations, graduationN, r.CachedConfidence,
+			r.ConsecutiveConfirmations, graduationN, frontend.ConfidenceLabel(r.Confidence),
 			r.TopAction, r.UpdatedAt.Format("01-02 15:04:05"))
 	}
 	fmt.Fprintf(out, "\n%d signature(s); inspect with: signatures show <prefix>\n", len(rows))
@@ -311,7 +311,9 @@ func signaturesDelete(ctx context.Context, app *frontend.App, out io.Writer, arg
 		if !stdinIsTTY() {
 			return fmt.Errorf("deleting a signature erases its learned history; rerun as: signatures delete %s --yes", row.Signature)
 		}
-		fmt.Fprintf(out, "type 'yes' to delete %s and its %d decision(s): ", shortSignature(row.Signature), row.Decisions)
+		// TotalDecisions, not Decisions: the delete erases every row the rule
+		// holds, floor or no floor.
+		fmt.Fprintf(out, "type 'yes' to delete %s and its %d decision(s): ", shortSignature(row.Signature), row.TotalDecisions)
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		if err != nil && line == "" {
 			return fmt.Errorf("read confirmation: %w", err)
@@ -379,8 +381,8 @@ func signaturesReset(ctx context.Context, app *frontend.App, out io.Writer, args
 func printSignatureRow(out io.Writer, r frontend.SignatureRow, graduationN int) {
 	fmt.Fprintf(out, "signature:   %s\n", r.Signature)
 	fmt.Fprintf(out, "situation:   %s\tagent type: %s\n", r.SituationType, orDash(r.AgentType))
-	fmt.Fprintf(out, "mode:        %s\tstreak: %d/%d\tconfidence: %.2f\n",
-		r.Mode, r.ConsecutiveConfirmations, graduationN, r.CachedConfidence)
+	fmt.Fprintf(out, "mode:        %s\tstreak: %d/%d\tconfidence: %s\n",
+		r.Mode, r.ConsecutiveConfirmations, graduationN, frontend.ConfidenceLabel(r.Confidence))
 	fmt.Fprintf(out, "top action:  %q over %d decision(s)\n", r.TopAction, r.Decisions)
 	fmt.Fprintf(out, "updated:     %s\n", r.UpdatedAt.Format(time.RFC3339))
 }
@@ -661,9 +663,9 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if row, ok := rules[r.Signature]; ok {
 			rule = string(row.Mode)
 		}
-		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%.2f\tllm=%s\trule=%s\t%s\n",
+		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%s\tllm=%s\trule=%s\t%s\n",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
-			r.Action, r.Confidence, llmConfCLI(r.LLMConfidence), rule, r.Rationale)
+			r.Action, frontend.ConfidenceLabel(r.Confidence), llmConfCLI(r.LLMConfidence), rule, r.Rationale)
 	}
 	return nil
 }

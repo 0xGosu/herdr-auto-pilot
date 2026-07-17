@@ -62,7 +62,10 @@ go test -tags "integration vectors cpu" ./test/integration/ -v      # include th
   claude's auto-approved dirs (`/tmp`, `/workspaces`, `~/.claude`) and touches a `$HOME`
   dotfile; `TestRealEmbeddingSemanticMatch` (needs `vectors cpu`) drives a real llama.cpp
   model + FAISS index so a rule learned for one approval auto-answers a paraphrase
-  (cosine ≥ 0.90) and leaves an unrelated one alone — skips without the model.
+  (cosine ≥ 0.90) and leaves an unrelated one alone — skips without the model;
+  `TestRealClaudePreviewMCQDelivery` (needs `HAP_ITEST_CLAUDE=1`) drives a real
+  AskUserQuestion form whose options carry PREVIEWS and asserts the answers actually land —
+  the rendering where a digit only moves the caret, which blind digit delivery no-oped on.
 
 **Recommended: run the integration suite once after finishing any feature**, before the
 PR — the unit suite fakes herdr, so only this catches real CLI-shape drift (e.g.
@@ -202,6 +205,15 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
   only accepts the option's number; sending the literal label ("Yes") is silently ignored — it
   reads as "nothing happened" on confirm. Map the chosen option to its digit with
   `domain.MenuKeystroke` before delivering (both the daemon `act` and frontend confirm paths do).
+- **A digit does NOT always commit — AskUserQuestion has two protocols, per tab.** Verified live
+  (2026-07-16): on **plain** options (`1. Apple / 2. Banana`) the digit selects AND auto-advances,
+  but on **preview** options (option list left, `┌──┐` preview box right, `Notes: press n to add
+  notes`) the digit only **moves the caret** like ↑/↓ — **Enter** commits and advances. The footer
+  is identical in both and never mentions digits, and one form mixes them (a preview form's
+  generated Submit tab renders plain). Blind digit-only delivery is a silent no-op on preview
+  forms: nothing is answered and the agent stays blocked. Never plan a whole keystroke series up
+  front — `internal/mcqdeliver` presses the digit, re-reads, and only presses Enter if the answer
+  did not commit (and refuses if the caret never reached the chosen option).
 - **`pane read --source recent` is a consuming delta**, not the screen: after one read (e.g. the
   daemon's classification read) it can return just the cursor line. To recover a standing menu at
   confirm time, read `--source visible` (`herdr.CLI.ReadPaneVisible` / `ports.VisiblePaneReader`).
@@ -220,6 +232,7 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
 | `internal/domain` | pure decision core, signatures, safety heuristics |
 | `internal/daemon` | monitor loop: subscribe → classify → decide → act/escalate |
 | `internal/classify` | pane-content classifier + golden fixtures |
+| `internal/mcqdeliver` | answers a live multi-tab MCQ form, verifying each keystroke landed |
 | `internal/llm` | operator LLM CLI adapter (argv template, auto-repair) |
 | `internal/mcpserver` | stdio MCP server (`get_context`, `submit_decision`) |
 | `internal/herdr` | herdr CLI + events-socket adapters |

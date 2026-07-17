@@ -27,6 +27,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/herdr"
+	"github.com/0xGosu/herdr-auto-pilot/internal/mcqdeliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
@@ -365,4 +366,96 @@ func TestRealClaudeConsult(t *testing.T) {
 	}
 	pane1, _ := cli.ReadPaneVisible(ctx, pane, 40)
 	t.Fatalf("claude did not proceed after confirm; the menu digit did not land.\npane:\n%s", pane1)
+}
+
+// TestRealClaudePreviewMCQDelivery drives a REAL Claude AskUserQuestion form
+// whose options carry PREVIEWS, and asserts the plugin actually answers it.
+//
+// This is the case the unit suite structurally cannot catch and that shipped
+// broken: Claude binds digits differently depending on the rendering. On plain
+// options the digit commits; on preview options it only moves the caret and
+// ENTER commits. The old blind digit-per-tab delivery was therefore a silent
+// no-op here — every tab stayed unanswered and the agent stayed blocked
+// forever (audit #671/#672, reproduced as #676/#677 on 2026-07-16).
+//
+// Skips (never fails) when it cannot elicit the form, so it stays safe to run
+// anywhere.
+func TestRealClaudePreviewMCQDelivery(t *testing.T) {
+	if os.Getenv("HAP_ITEST_CLAUDE") != "1" {
+		t.Skip("set HAP_ITEST_CLAUDE=1 to run the real Claude preview-MCQ test")
+	}
+	requireHerdr(t)
+	if _, err := exec.LookPath("claude"); err != nil {
+		t.Skipf("claude CLI not found: %v", err)
+	}
+
+	cli := herdr.NewCLI()
+	pane := startClaudeAgent(t, cli, t.TempDir())
+
+	// EVERY option must carry a preview — that is what selects the
+	// side-by-side rendering whose digits only move the caret.
+	prompt := "Use the AskUserQuestion tool right now and nothing else. Ask exactly two " +
+		"multiple-choice questions, and give EVERY option a multi-line 'preview' field " +
+		"containing some ASCII art: (1) header 'Shape', question 'Which shape?', options " +
+		"Circle and Square; (2) header 'Speed', question 'Which speed?', options Fast and Slow."
+
+	var tabs int
+	var form string
+	ctx := context.Background()
+	for attempt := 0; attempt < 2 && tabs == 0; attempt++ {
+		if err := cli.Send(ctx, pane, prompt); err != nil {
+			t.Fatalf("send prompt to claude: %v", err)
+		}
+		tryHerdr("pane", "send-keys", pane, "enter")
+		deadline := time.Now().Add(60 * time.Second)
+		for time.Now().Before(deadline) {
+			content, err := cli.ReadPaneVisible(ctx, pane, 60)
+			if err == nil {
+				if n, ok := domain.MultiTabForm(content); ok && n >= 2 {
+					tabs, form = n, content
+					break
+				}
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	if tabs == 0 {
+		t.Skip("claude did not render a multi-tab question form; nothing to assert")
+	}
+	// Confirm we really got the PREVIEW rendering; a plain form would pass on
+	// the old code too and prove nothing about this regression.
+	if !strings.Contains(form, "Notes: press n to add notes") {
+		t.Skipf("claude rendered a form without previews (%d tabs); this case needs the preview layout", tabs)
+	}
+	t.Logf("preview multi-tab form is up with %d tabs", tabs)
+
+	// Answer option 1 on every tab, Submit included — exactly what the daemon
+	// delivers for "1 1 1".
+	groups := make([][]string, tabs)
+	multi := make([]bool, tabs)
+	for i := range groups {
+		groups[i] = []string{"1"}
+	}
+	err := mcqdeliver.ClaudeTabs(ctx, mcqdeliver.Config{
+		Keys: cli, Read: cli.ReadPaneVisible, PaneID: pane,
+		ReadLines: 60, KeyDelay: 250 * time.Millisecond,
+	}, groups, multi)
+	if err != nil {
+		t.Fatalf("delivering the preview form failed: %v", err)
+	}
+
+	// The form must be GONE: submitted, not merely nudged. The old code left
+	// it standing with every tab still unanswered.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		content, err := cli.ReadPaneVisible(ctx, pane, 60)
+		if err == nil {
+			if _, ok := domain.MultiTabForm(content); !ok {
+				return // submitted — the answers landed
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	last, _ := cli.ReadPaneVisible(ctx, pane, 60)
+	t.Fatalf("the preview form is still standing; the answers did not land.\npane:\n%s", last)
 }

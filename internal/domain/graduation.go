@@ -37,9 +37,12 @@ func ObserveConfirmation(state SignatureState, consistent bool) SignatureState {
 // signature — corrections no longer do (permanent graduation). A reset
 // signature must re-earn N consecutive consistent confirmations (FR-006) before
 // it can act autonomously again. The caller stamps DecisionFloorID so pre-reset
-// decisions stop counting toward confidence/graduation (history rows are kept);
-// CachedConfidence is a display snapshot the daemon recomputes on the first
-// re-confirm.
+// decisions stop counting toward confidence/graduation (history rows are kept).
+//
+// The CachedConfidence = 1.0 below is NOT what anyone sees: it is a persisted
+// snapshot that nothing gates on and no view renders (see SignatureState). A
+// reset rule DISPLAYS 0.00 — LiveConfidence scores post-floor decisions, of
+// which a reset has none — which is the honest reading of "must re-earn trust".
 func ResetGraduation(state SignatureState) SignatureState {
 	state.Mode = ModeShadow
 	state.ConsecutiveConfirmations = 0

@@ -249,7 +249,7 @@ func New(opt Options) (*Daemon, error) {
 		opt.ReadTaskFile = os.ReadFile
 	}
 	if opt.PaneReadLines <= 0 {
-		opt.PaneReadLines = 120
+		opt.PaneReadLines = 50
 	}
 	d := &Daemon{
 		opt:                opt,
@@ -2806,6 +2806,32 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 			Signature: audit.Signature, SituationType: audit.SituationType,
 			AgentType: agentTypeOf(history, audit), Mode: domain.ModeShadow,
 		}
+		// A rule begins when the OPERATOR first speaks, so it starts on a clean
+		// slate: floor out every decision that predates this one. Before a state
+		// row exists every decision is SourceLLM (SourceRule needs a graduated
+		// rule, i.e. a row), so this can only ever discard the LLM's own guesses
+		// — never operator evidence, of which there is none yet by definition.
+		// (Modulo one narrow window: the decision below and the state row are
+		// written without a shared transaction, so a crash between them orphans
+		// an operator decision that the next correction floors out. Harmless —
+		// that rule restarts at 1.00, which is what this wants anyway.)
+		//
+		// Those guesses are not agreement about anything: an LLM that answered
+		// the same situation six different ways would otherwise hand its brand
+		// new rule a contradictory history it never earned, scoring it below the
+		// variance-guard floor and pinning it there — visibly inconsistent, since
+		// the operator has agreed with it exactly once and never disagreed. The
+		// rows are KEPT (the floor only hides them from confidence/graduation),
+		// so history and audit stay intact.
+		//
+		// history is read BEFORE the operator's decision is recorded below, so
+		// history[0] is the newest PRE-EXISTING decision: the new one lands above
+		// the floor and counts, giving the fresh rule 1.00 over its single
+		// operator decision. (Contrast ResetGraduation, which floors the newest
+		// decision INCLUDING itself — a reset has no evidence yet and reads "-".)
+		if len(history) > 0 {
+			state.DecisionFloorID = history[0].ID
+		}
 	} else if state.AgentType == "" || state.AgentType == "unknown" {
 		// Heal rules learned before the audit carried an agent type.
 		if at := agentTypeOf(history, audit); at != "unknown" {
@@ -2821,7 +2847,6 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	// correction to something else?
 	suggested := suggestionAction(audit)
 	isConfirmation := suggested != "" && c.CorrectedAction == suggested
-	wasAutonomous := audit.Status == "auto" || strings.HasPrefix(audit.Action, domain.AuditActionAutoPrefix)
 
 	// Record the operator's decision (corrections count in the recency
 	// window; FR-007).
@@ -2833,16 +2858,18 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		return nil, err
 	}
 
+	// Permanent graduation (revised FR-007) is enforced inside
+	// ObserveConfirmation, which freezes a graduated rule's count outright — so
+	// both paths below can call it unconditionally. Do NOT reintroduce an
+	// `audit.Status == "auto"` guard here: that proxy does not mean "a graduated
+	// rule acted". It also matches an LLM auto-act on a signature with no rule
+	// at all, and an auto row from before a reset — in both cases skipping
+	// ObserveConfirmation stranded the streak at 0, so the rule could never
+	// (re-)graduate no matter how often the operator confirmed it.
 	newState := *state
 	if isConfirmation {
 		consistent := prior.TopAction == "" || prior.TopAction == c.CorrectedAction
 		newState = domain.ObserveConfirmation(newState, consistent)
-	} else if wasAutonomous {
-		// Permanent graduation (revised FR-007): correcting a graduated rule
-		// records the decision above (so confidence reflects it and the
-		// confidence gate still applies) but never demotes it or changes its
-		// frozen count. Only an operator reset (ResetGraduation) returns it to
-		// shadow. newState is intentionally left unchanged here.
 	} else {
 		// Correcting a shadow suggestion: the corrected action starts its
 		// own streak.

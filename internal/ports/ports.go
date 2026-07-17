@@ -262,6 +262,10 @@ type MCPStore interface {
 type ReadStore interface {
 	GetSignature(ctx context.Context, signature string) (*domain.SignatureState, error)
 	DecisionsForSignature(ctx context.Context, signature string, limit int) ([]domain.DecisionRecord, error)
+	// CountDecisionsForSignature counts ALL of a signature's decisions, with no
+	// window — what a delete actually erases. Never derive that count from
+	// DecisionsForSignature's capped slice.
+	CountDecisionsForSignature(ctx context.Context, signature string) (int, error)
 	LatestKillEvent(ctx context.Context) (*domain.KillEvent, error)
 	KillEvents(ctx context.Context, limit int) ([]domain.KillEvent, error)
 	AuditLog(ctx context.Context, limit int) ([]domain.AuditRecord, error)
@@ -293,7 +297,12 @@ type ReadStore interface {
 	// ResolveAgent maps a short name or agent/pane id to the agent id.
 	ResolveAgent(ctx context.Context, target string) (string, error)
 	// ListSignatures returns learning state rows, newest-updated first;
-	// zero-valued filter fields are ignored.
+	// zero-valued filter fields are ignored. MinConfidence is NOT applied here
+	// and an implementation MUST NOT try: it filters the live score, which only
+	// the listing front-end can compute (it holds the history). Filtering on the
+	// stored cached_confidence snapshot instead is a real bug that shipped once —
+	// it drifts both ways, so it drops live-confident rules and keeps
+	// contradictory ones. See domain.SignatureFilter.
 	ListSignatures(ctx context.Context, f domain.SignatureFilter) ([]domain.SignatureState, error)
 	// ResolveSignature expands a unique signature prefix to the full key,
 	// erroring on no match or ambiguity.

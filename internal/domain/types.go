@@ -210,7 +210,13 @@ type SignatureState struct {
 	AgentType                string
 	Mode                     Mode
 	ConsecutiveConfirmations int
-	CachedConfidence         float64
+	// CachedConfidence is a persisted snapshot, NOT the live score: it is
+	// refreshed only on a confirm/correct and stamped to a fake 1.0 by
+	// ResetGraduation, so it drifts as ordinary decisions accumulate. Nothing
+	// gates on it and no view renders it — operator-facing confidence comes from
+	// LiveConfidence over current history. Kept for schema compatibility and
+	// audit forensics; do not display it.
+	CachedConfidence float64
 	// DecisionFloorID excludes pre-reset decisions from confidence and
 	// graduation: only decisions with id > DecisionFloorID count. Stamped by an
 	// operator reset (ResetGraduation) to the newest decision id at that moment,
@@ -227,7 +233,14 @@ type SignatureFilter struct {
 	SituationType SituationType // "" = any
 	AgentType     string        // "" = any
 	Mode          Mode          // "" = any (shadow | autonomous)
-	MinConfidence float64       // 0 = any
+	// MinConfidence filters on the LIVE score (LiveConfidence over current
+	// history), so it is applied by the listing front-end — which loads that
+	// history — NOT by the store. It deliberately cannot be a SQL predicate:
+	// the only confidence the signatures table holds is the stale
+	// CachedConfidence, which drifts in BOTH directions, so filtering on it
+	// would drop rules that are live-confident and keep ones that visibly are
+	// not. 0 = any.
+	MinConfidence float64
 }
 
 // DecisionRecord is one learned/observed decision for a signature (DR-001).

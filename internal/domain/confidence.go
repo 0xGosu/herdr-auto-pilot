@@ -48,6 +48,29 @@ func DecisionsSince(history []DecisionRecord, floorID int64) []DecisionRecord {
 	return out
 }
 
+// LiveConfidence is the confidence the decision core gates on RIGHT NOW for a
+// signature: the recency-weighted agreement over post-floor decisions only.
+// The TopAction, however, still comes from the FULL learned history when the
+// floor excludes everything — a reset rule keeps naming its learned answer
+// while its score starts fresh, so re-earning trust is just re-confirming it.
+//
+// Decide() and every operator-facing view (the TUI Rules tab, `hap signatures`,
+// the escalation rule line) MUST resolve confidence through this one function.
+// They drifted before: the views rendered the persisted CachedConfidence
+// snapshot — refreshed only on a confirm/correct, and stamped to a fake 1.0 by
+// ResetGraduation — so a rule the core scored 0.45 displayed as 1.00 next to
+// its own "contradictory history" escalation.
+func LiveConfidence(history []DecisionRecord, floorID int64, confirmWeight float64) ConfidenceResult {
+	post := DecisionsSince(history, floorID)
+	conf := Confidence(post, confirmWeight)
+	if len(post) == 0 {
+		// Only TopAction falls back; Score and Decisions stay zero so a reset
+		// rule reads as "no post-reset evidence yet", not as agreement.
+		conf.TopAction = Confidence(history, confirmWeight).TopAction
+	}
+	return conf
+}
+
 // Confidence computes the recency-weighted agreement ratio over a
 // signature's decision history (FR-005). history must be ordered newest
 // first, as returned by the store. confirmWeight boosts operator

@@ -858,7 +858,11 @@ func TestListSignaturesFiltersAndOrder(t *testing.T) {
 		{"by situation", domain.SignatureFilter{SituationType: domain.SituationApproval}, []string{"approval:ccc", "approval:aaa"}},
 		{"by agent type", domain.SignatureFilter{AgentType: "codex"}, []string{"choice:bbb", "approval:ccc"}},
 		{"by mode", domain.SignatureFilter{Mode: domain.ModeAutonomous}, []string{"choice:bbb", "approval:ccc"}},
-		{"by min confidence", domain.SignatureFilter{MinConfidence: 0.86}, []string{"choice:bbb"}},
+		// MinConfidence is NOT a store concern: it filters the live score, which
+		// only the front-end can compute (it holds the history). The store must
+		// ignore it rather than silently filter on the stale cached snapshot.
+		{"min confidence ignored by the store", domain.SignatureFilter{MinConfidence: 0.86},
+			[]string{"choice:bbb", "approval:ccc", "approval:aaa"}},
 		{"combined", domain.SignatureFilter{AgentType: "codex", SituationType: domain.SituationApproval}, []string{"approval:ccc"}},
 		{"no match", domain.SignatureFilter{AgentType: "gemini"}, nil},
 	}

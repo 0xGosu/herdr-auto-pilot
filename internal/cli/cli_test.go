@@ -352,9 +352,20 @@ func TestSignaturesList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"approval:aaaa111…", "choice:cccc3333", "shadow", "autonomous", "3/2", "top=\"1\"", "2 signature(s)"} {
+	// conf= is the LIVE score, never the cached snapshot the fixture seeds:
+	// approval is unanimous over 2 decisions (live 1.00, cached 0.75) so it
+	// reads 1.00, while choice has no decisions at all — never scored, so "-"
+	// rather than a 0.00 that would look like measured no-confidence (its
+	// cached 0.92 must not surface either).
+	for _, want := range []string{"approval:aaaa111…", "choice:cccc3333", "shadow", "autonomous", "3/2", "top=\"1\"",
+		"conf=1.00", "conf=-", "2 signature(s)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("list output missing %q:\n%s", want, out)
+		}
+	}
+	for _, stale := range []string{"conf=0.75", "conf=0.92"} {
+		if strings.Contains(out, stale) {
+			t.Errorf("list rendered the stale cached snapshot %q:\n%s", stale, out)
 		}
 	}
 	// Newest-updated first.
@@ -371,9 +382,15 @@ func TestSignaturesList(t *testing.T) {
 	if err != nil || strings.Contains(out, "choice:") || !strings.Contains(out, "approval:") {
 		t.Errorf("bare-flag type filter failed (%v):\n%s", err, out)
 	}
+	// --min-conf selects on the LIVE score, not the cached snapshot — and the
+	// seeded rules disagree in OPPOSITE directions, so this pins both. The
+	// approval rule is unanimous over its history (live 1.00, cached 0.75) and
+	// must stay; the choice rule has no decisions at all (live 0.00, cached
+	// 0.92) and must go. The old SQL filter on cached_confidence got both
+	// backwards: it dropped the confident rule and kept the empty one.
 	out, err = run(t, app, "signatures", "list", "--min-conf", "0.9")
-	if err != nil || strings.Contains(out, "approval:") {
-		t.Errorf("min-conf filter failed (%v):\n%s", err, out)
+	if err != nil || !strings.Contains(out, "approval:") || strings.Contains(out, "choice:") {
+		t.Errorf("min-conf must filter on the live score (%v):\n%s", err, out)
 	}
 
 	// Empty state.
@@ -392,7 +409,10 @@ func TestSignaturesShow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"approval:aaaa1111bbbb2222", "streak: 3/2", "top action:  \"1\" over 2 decision(s)",
+	// "confidence: 1.00" is the live score over the seeded history; the fixture's
+	// cached snapshot is 0.75 and must never surface.
+	for _, want := range []string{"approval:aaaa1111bbbb2222", "streak: 3/2", "confidence: 1.00",
+		"top action:  \"1\" over 2 decision(s)",
 		"original situation:", "terraform apply", "recent decisions", "last audit", "shadow mode"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("show output missing %q:\n%s", want, out)
@@ -591,7 +611,10 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, `rule=[shadow — 3/2 confirmations, confidence 0.75, top action "1" over 2 decision(s)]`) {
+	// confidence is the LIVE score over the seeded history (2 unanimous
+	// decisions = 1.00), not the 0.75 CachedConfidence snapshot the row carries:
+	// that field goes stale between confirms and must never reach an operator.
+	if !strings.Contains(out, `rule=[shadow — 3/2 confirmations, confidence 1.00, top action "1" over 2 decision(s)]`) {
 		t.Errorf("escalations should name the matched rule, got:\n%s", out)
 	}
 
@@ -625,12 +648,31 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 		t.Errorf("embed-failure escalation should show the error, got:\n%s", out)
 	}
 
+	// A rule-less row that WAS scored: the core scores live history, which can
+	// exist before the rule row does, so this must keep its number.
+	st.AppendAudit(context.Background(), domain.AuditRecord{Signature: "error:7777cccc",
+		Trigger: "boom", SituationType: domain.SituationError, Action: "escalated",
+		Rationale: "scored before any rule existed", Status: "escalated", Confidence: 0.91,
+		CreatedAt: time.Now()})
+
 	out, err = run(t, app, "audit")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "rule=shadow") || !strings.Contains(out, "rule=-") {
 		t.Errorf("audit rows should carry the rule mode marker (or dash), got:\n%s", out)
+	}
+	// A decision that was never scored reads "-", never "0.00" — the latter
+	// looks like measured no-confidence.
+	if !strings.Contains(out, "conf=-") {
+		t.Errorf("an unscored audit row should read conf=-, got:\n%s", out)
+	}
+	if strings.Contains(out, "conf=0.00") {
+		t.Errorf("an unscored row must never render as 0.00, got:\n%s", out)
+	}
+	// A recorded score is a snapshot and always renders, rule or no rule.
+	if !strings.Contains(out, "conf=0.91") {
+		t.Errorf("a scored row must keep its number even with no rule, got:\n%s", out)
 	}
 }
 

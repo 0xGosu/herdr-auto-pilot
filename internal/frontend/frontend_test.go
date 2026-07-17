@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1697,6 +1698,282 @@ func TestSignaturesEnrichmentAndFilter(t *testing.T) {
 	}
 }
 
+func TestSignaturesRenderLiveConfidenceNotCachedSnapshot(t *testing.T) {
+	// The Rules tab CONF column, `hap signatures`, and the escalation rule line
+	// all render SignatureRow.Confidence. It must be the score the decision core
+	// gates on RIGHT NOW, recomputed from history — never the persisted
+	// CachedConfidence, which is refreshed only on a confirm/correct and so
+	// drifts as ordinary decisions accumulate. The live symptom: a rule the core
+	// scored 0.45 displayed "confidence 1.00" beside its own
+	// "[variance_guard] contradictory history" escalation.
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:drift", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		CachedConfidence: 1.0, // a stale snapshot from an earlier, unanimous moment
+		UpdatedAt:        now,
+	})
+	// Contradictory history: recency-weighted agreement lands near 0.54.
+	for _, a := range []string{"y", "n", "y", "n"} {
+		st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:drift",
+			SituationType: domain.SituationApproval, AgentType: "claude",
+			ChosenAction: a, CreatedAt: now})
+	}
+
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("Signatures: %+v, %v", rows, err)
+	}
+	if got := rows[0].Confidence; got <= 0.50 || got >= 0.60 {
+		t.Errorf("confidence must be recomputed live (~0.54), got %.4f", got)
+	}
+	if rows[0].Confidence == rows[0].CachedConfidence {
+		t.Error("confidence must not be the stale cached snapshot")
+	}
+	// RuleSummary feeds the escalation line the operator reads.
+	if s := frontend.RuleSummary(rows[0], 3); !strings.Contains(s, "confidence 0.54") {
+		t.Errorf("rule summary must quote the live score, got %q", s)
+	}
+
+	// A RESET rule is the sharpest case: ResetGraduation stamps a fake 1.0 and
+	// the floor excludes every decision, so the row must read as "no post-reset
+	// evidence yet" (0.00) while still naming the action it learned.
+	hist, err := st.DecisionsForSignature(ctx, "approval:drift", 50)
+	if err != nil || len(hist) == 0 {
+		t.Fatalf("history: %+v, %v", hist, err)
+	}
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:drift", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		CachedConfidence: 1.0,
+		DecisionFloorID:  hist[0].ID, // newest id: nothing survives the floor
+		UpdatedAt:        now,
+	})
+	rows, err = app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("Signatures after reset: %+v, %v", rows, err)
+	}
+	if rows[0].Confidence != 0 || rows[0].Decisions != 0 {
+		t.Errorf("a reset rule has no post-floor evidence: conf=%.2f n=%d",
+			rows[0].Confidence, rows[0].Decisions)
+	}
+	if rows[0].TopAction == "" {
+		t.Error("a reset rule must still name its learned action (full-history fallback)")
+	}
+}
+
+func TestSignaturesMinConfidenceFiltersLiveScoreBothDirections(t *testing.T) {
+	// --min-conf must select on the LIVE score. The stale cached snapshot drifts
+	// BOTH ways, so a SQL filter on it fails in both: it would drop a
+	// live-confident rule (cached low) and keep a contradictory one (cached
+	// high) that visibly renders below the cutoff.
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	// Live 1.00 (unanimous) but cached far below the cutoff — must be KEPT.
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:livehigh", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		CachedConfidence: 0.10, UpdatedAt: now,
+	})
+	for i := 0; i < 3; i++ {
+		st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:livehigh",
+			SituationType: domain.SituationApproval, ChosenAction: "y", CreatedAt: now})
+	}
+	// Live ~0.54 (contradictory) but cached 1.00 — must be DROPPED.
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:livelow", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		CachedConfidence: 1.00, UpdatedAt: now.Add(time.Second),
+	})
+	for _, a := range []string{"y", "n", "y", "n"} {
+		st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:livelow",
+			SituationType: domain.SituationApproval, ChosenAction: a, CreatedAt: now})
+	}
+
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{MinConfidence: 0.9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Signature != "approval:livehigh" {
+		t.Fatalf("min-conf must select on the live score, got %+v", rows)
+	}
+	// Nothing below the cutoff may survive — the operator-visible invariant.
+	for _, r := range rows {
+		if r.Confidence < 0.9 {
+			t.Errorf("row %s renders %.2f, below the 0.90 cutoff", r.Signature, r.Confidence)
+		}
+	}
+	// Sanity: without the filter both rules are listed.
+	if all, err := app.Signatures(ctx, domain.SignatureFilter{}); err != nil || len(all) != 2 {
+		t.Errorf("unfiltered listing should hold both: %+v, %v", all, err)
+	}
+}
+
+func TestSignatureRowTotalDecisionsIgnoresResetFloor(t *testing.T) {
+	// The delete prompts quote TotalDecisions because DeleteSignature erases
+	// every row regardless of the floor. A RESET rule is the trap: Decisions
+	// (post-floor, for the confidence line) is 0 while N rows still exist, so
+	// quoting Decisions would confirm "delete ... and its 0 decision(s)" and
+	// then destroy N.
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:reset", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+	})
+	for i := 0; i < 3; i++ {
+		st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:reset",
+			SituationType: domain.SituationApproval, ChosenAction: "y", CreatedAt: now})
+	}
+	hist, err := st.DecisionsForSignature(ctx, "approval:reset", 50)
+	if err != nil || len(hist) != 3 {
+		t.Fatalf("seed history: %+v, %v", hist, err)
+	}
+	// Reset: floor above every decision, exactly like ResetGraduation stamps.
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:reset", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		CachedConfidence: 1.0, DecisionFloorID: hist[0].ID, UpdatedAt: now,
+	})
+
+	row, _, err := app.SignatureDetail(ctx, "approval:reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Decisions != 0 {
+		t.Errorf("post-floor Decisions should be 0, got %d", row.Decisions)
+	}
+	if row.TotalDecisions != 3 {
+		t.Errorf("TotalDecisions must count every stored row, got %d", row.TotalDecisions)
+	}
+	// The prompt's count must match what the delete actually erases.
+	_, n, err := app.DeleteSignature(ctx, "approval:reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(n) != row.TotalDecisions {
+		t.Errorf("delete erased %d decisions but the prompt would have quoted %d", n, row.TotalDecisions)
+	}
+
+	// Listing rows carry the same count.
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:live", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+	})
+	st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:live",
+		SituationType: domain.SituationApproval, ChosenAction: "y", CreatedAt: now})
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("Signatures: %+v, %v", rows, err)
+	}
+	if rows[0].TotalDecisions != 1 {
+		t.Errorf("listing row TotalDecisions = %d, want 1", rows[0].TotalDecisions)
+	}
+}
+
+func TestConfidenceLabelDashWhenNeverScored(t *testing.T) {
+	// 0.00 is unreachable as a real agreement score — it is topWeight/total over
+	// a non-empty history, so it is always strictly positive. A stored 0 can
+	// therefore only mean "the core never scored this", and rendering it as
+	// "0.00" says the opposite: measured, and found no confidence.
+	tests := []struct {
+		name string
+		conf float64
+		want string
+	}{
+		{"never scored", 0, "-"},
+		// Recency decay bounds the weight total, so a real score never lands
+		// near zero: ~0.15 is about the floor and 0.24 is the lowest ever seen
+		// in the wild. Nothing genuine gets close to rounding to "0.00".
+		{"about the real floor", 0.15, "0.15"},
+		{"lowest score actually observed in the wild", 0.24, "0.24"},
+		{"contradictory but measured", 0.45, "0.45"},
+		{"unanimous", 1, "1.00"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := frontend.ConfidenceLabel(tc.conf); got != tc.want {
+				t.Errorf("ConfidenceLabel(%v) = %q, want %q", tc.conf, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRuleSummaryShowsDashForUnscoredRule(t *testing.T) {
+	// A rule reset to re-earn trust has no post-reset evidence, so its live
+	// score is 0 — "confidence -" says "not scored yet", where "confidence 0.00"
+	// would claim the rule was measured and found worthless.
+	reset := signatureRowFor(domain.ModeShadow, 0, "1")
+	if s := frontend.RuleSummary(reset, 3); !strings.Contains(s, "confidence -") {
+		t.Errorf("a reset rule's summary must read \"confidence -\", got %q", s)
+	}
+	scored := signatureRowFor(domain.ModeShadow, 0.45, "1")
+	if s := frontend.RuleSummary(scored, 3); !strings.Contains(s, "confidence 0.45") {
+		t.Errorf("a measured rule keeps its number, got %q", s)
+	}
+}
+
+// signatureRowFor builds a display row for rule-summary assertions.
+func signatureRowFor(mode domain.Mode, conf float64, top string) frontend.SignatureRow {
+	return frontend.SignatureRow{
+		SignatureState: domain.SignatureState{
+			Signature: "approval:x", SituationType: domain.SituationApproval,
+			Mode: mode, ConsecutiveConfirmations: 1,
+		},
+		Confidence: conf, TopAction: top, Decisions: 0,
+	}
+}
+
+func TestTotalDecisionsCountsBeyondTheHistoryWindow(t *testing.T) {
+	// The delete prompts quote TotalDecisions, and DeleteSignature erases every
+	// row with one unfiltered DELETE while nothing prunes the table — so a rule
+	// outlives any read window. Deriving the count from the 50-row history slice
+	// would confirm "and its 50 decision(s)" and then destroy 63.
+	const total = 63
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:long", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+	})
+	for i := 0; i < total; i++ {
+		if _, err := st.RecordDecision(ctx, domain.DecisionRecord{
+			Signature: "approval:long", SituationType: domain.SituationApproval,
+			ChosenAction: "y", CreatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	row, _, err := app.SignatureDetail(ctx, "approval:long")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.TotalDecisions != total {
+		t.Errorf("detail TotalDecisions = %d, want %d (the window would cap it at 50)", row.TotalDecisions, total)
+	}
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("Signatures: %+v, %v", rows, err)
+	}
+	if rows[0].TotalDecisions != total {
+		t.Errorf("listing TotalDecisions = %d, want %d", rows[0].TotalDecisions, total)
+	}
+	// The count the prompt quotes must equal what the delete actually erases.
+	_, deleted, err := app.DeleteSignature(ctx, "approval:long")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(deleted) != row.TotalDecisions {
+		t.Errorf("delete erased %d decisions but the prompt quoted %d", deleted, row.TotalDecisions)
+	}
+}
+
 func TestSignatureDetail(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
@@ -1977,6 +2254,15 @@ type fakeKeyHerdr struct {
 	keys            []string
 	keyScript       []string
 	keyScriptFrames []string
+	// mcqTabs, when > 0, simulates a live Claude multi-tab form of that many
+	// tabs (Submit included) in the PLAIN rendering: a digit commits the
+	// current tab's answer (its ☐ becomes ☒) and advances, and the Submit
+	// tab's digit submits the form away. Delivery verifies every keystroke
+	// against the pane (see internal/mcqdeliver), so a fake whose content never
+	// reacts to a digit can not deliver at all.
+	mcqTabs      int
+	mcqAnswered  int
+	mcqSubmitted bool
 }
 
 func (f *fakeKeyHerdr) SendKey(_ context.Context, paneID, key string) error {
@@ -1986,7 +2272,44 @@ func (f *fakeKeyHerdr) SendKey(_ context.Context, paneID, key string) error {
 		f.pane = f.keyScriptFrames[0]
 		f.keyScriptFrames = f.keyScriptFrames[1:]
 	}
+	if f.mcqTabs > 0 && !f.mcqSubmitted {
+		if _, err := strconv.Atoi(key); err == nil {
+			if f.mcqAnswered >= f.mcqTabs-1 {
+				f.mcqSubmitted = true // the Submit tab's digit
+			} else {
+				f.mcqAnswered++
+			}
+		}
+	}
 	return nil
+}
+
+// ReadPane serves the simulated form when one is configured: the header's ☐
+// marks reflect how many tabs a digit has answered, and once submitted the
+// form is gone.
+func (f *fakeKeyHerdr) ReadPane(ctx context.Context, paneID string, lines int) (string, error) {
+	if f.mcqTabs == 0 {
+		return f.fakeHerdr.ReadPane(ctx, paneID, lines)
+	}
+	if f.readErr != nil {
+		return "", f.readErr
+	}
+	if f.mcqSubmitted {
+		return "⏺ Answers received.\n\n❯ \n", nil
+	}
+	marks := make([]string, 0, f.mcqTabs-1)
+	for i := 0; i < f.mcqTabs-1; i++ {
+		if i < f.mcqAnswered {
+			marks = append(marks, "☒ Q"+strconv.Itoa(i+1))
+		} else {
+			marks = append(marks, "☐ Q"+strconv.Itoa(i+1))
+		}
+	}
+	// The question line must change per tab: delivery compares it across a
+	// keystroke to prove the form did not silently move to another tab.
+	return "←  " + strings.Join(marks, "  ") + "  ✔ Submit  →\n\nQuestion " +
+		strconv.Itoa(f.mcqAnswered+1) + "?\n❯ 1. sqlite\n  2. postgres\n\n" +
+		"Enter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel\n", nil
 }
 
 func frontendCodexFrame(current, total, unanswered int, selected string, submitAll bool) string {
@@ -2009,9 +2332,7 @@ func TestResolveDigitSeriesDeliversKeystrokes(t *testing.T) {
 	// Confirming a multi-tab answer series delivers one digit keystroke per
 	// tab (Submit included) — never the series as literal text.
 	app, st := testApp(t)
-	fake := &fakeKeyHerdr{fakeHerdr: fakeHerdr{
-		pane: "←  ☐ Q one  ☐ Q two  ✔ Submit  →\n\nWhich backend?\n❯ 1. sqlite\n  2. postgres\n\nEnter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel\n",
-	}}
+	fake := &fakeKeyHerdr{mcqTabs: 3}
 	app.Herdr = fake
 	ctx := context.Background()
 

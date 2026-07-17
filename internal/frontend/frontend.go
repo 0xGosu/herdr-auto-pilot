@@ -25,6 +25,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
+	"github.com/0xGosu/herdr-auto-pilot/internal/mcqdeliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/reembed"
 )
@@ -58,19 +59,13 @@ func (a *App) deliverTabSeries(ctx context.Context, ks ports.KeystrokeSender, au
 	if err != nil {
 		return err
 	}
-	if err := a.resetForm(ctx, ks, agentID); err != nil {
-		return err
-	}
-	keys := domain.MultiTabKeys(groups, multi, seriesAdvanceKey)
-	for i, key := range keys {
-		if i > 0 {
-			time.Sleep(seriesKeyDelay)
-		}
-		if err := ks.SendKey(ctx, agentID, key); err != nil {
-			return fmt.Errorf("delivering keystroke %d/%d (%q) failed: %w", i+1, len(keys), key, err)
-		}
-	}
-	return nil
+	return mcqdeliver.ClaudeTabs(ctx, mcqdeliver.Config{
+		Keys:      ks,
+		Read:      a.readVisiblePane,
+		PaneID:    agentID,
+		ReadLines: menuReadLines,
+		KeyDelay:  seriesKeyDelay,
+	}, groups, multi)
 }
 
 // deliverCodexSeries mirrors the daemon's adaptive Codex protocol for an
@@ -2246,23 +2241,62 @@ func (a *App) DeleteTask(agent, path string, index int, expectText ...string) ([
 }
 
 // SignatureRow is a learned signature enriched for display: the persisted
-// state plus the dominant action and decision count recomputed from history.
+// state plus the confidence, dominant action, and decision count recomputed
+// from history.
 type SignatureRow struct {
 	domain.SignatureState
-	TopAction string
+	// Confidence is the LIVE score (domain.LiveConfidence over post-floor
+	// history) — what the decision core would gate on right now. Always display
+	// this, never the embedded SignatureState.CachedConfidence: that snapshot is
+	// only refreshed on a confirm/correct and is stamped to a fake 1.0 by a
+	// reset, so it drifts from the score that actually drives decisions.
+	Confidence float64
+	TopAction  string
+	// Decisions counts only the decisions behind Confidence (post-floor), so it
+	// belongs beside a confidence figure. It is NOT how much history exists:
+	// use TotalDecisions for anything describing the stored rows themselves.
 	Decisions int
-	LastAudit *domain.AuditRecord
+	// TotalDecisions counts every decision row the rule holds — floor included
+	// and UNWINDOWED (an exact COUNT, not the length of a capped read).
+	// DeleteSignature erases them all in one unfiltered DELETE and nothing
+	// prunes the table, so the delete prompts must quote THIS. Both ways of
+	// deriving it from other fields understate the loss in the very
+	// confirmation meant to prevent it: a reset rule has Decisions == 0 while
+	// still carrying history, and a long-lived rule outgrows any read window.
+	TotalDecisions int
+	LastAudit      *domain.AuditRecord
 	// PaneExcerpt is the pane snapshot the signature was first seen with
 	// (rule provenance); "" for rules learned before snapshots existed.
 	PaneExcerpt string
+}
+
+// ConfidenceLabel renders an agreement score for operators, or "-" when there
+// is no score: 0 means the decision core never scored it — a situation met
+// before it had any learned history, a rule reset to re-earn trust, or a row
+// (such as a correction) that carries no core score at all.
+//
+// 0.00 is unreachable as a real result, which is what makes the test exact
+// rather than a heuristic: agreement is topWeight/total, the newest decision
+// always contributes a weight of at least 1, and recency decay bounds the total,
+// so every genuine score is comfortably above zero (in practice no lower than
+// ~0.15 — the lowest ever observed in the wild is 0.24). Confidence() returns
+// the zero value ONLY for empty history. So a rendered "0.00" always meant "not
+// measured", while reading as "measured, and found no confidence" — the
+// opposite. Every CONF an operator sees (escalations, audit, rules — TUI and
+// CLI) goes through here so the wording cannot drift.
+func ConfidenceLabel(conf float64) string {
+	if conf == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.2f", conf)
 }
 
 // RuleSummary renders a one-line description of the learned rule backing a
 // signature, for escalation/audit views (TUI detail and CLI share the
 // wording so operators see the same rule either way).
 func RuleSummary(row SignatureRow, graduationN int) string {
-	s := fmt.Sprintf("%s — %d/%d confirmations, confidence %.2f",
-		row.Mode, row.ConsecutiveConfirmations, graduationN, row.CachedConfidence)
+	s := fmt.Sprintf("%s — %d/%d confirmations, confidence %s",
+		row.Mode, row.ConsecutiveConfirmations, graduationN, ConfidenceLabel(row.Confidence))
 	if row.TopAction != "" {
 		s += fmt.Sprintf(", top action %q over %d decision(s)", row.TopAction, row.Decisions)
 	}
@@ -2300,9 +2334,12 @@ func IndexSignatures(rows []SignatureRow) map[string]SignatureRow {
 	return idx
 }
 
-// Signatures lists learned signatures (newest-updated first) enriched with
-// their top action and decision count. Per-row history reads are N+1 at
-// operator scale; a SQL aggregate is a future optimization if lists grow.
+// Signatures lists learned signatures (newest-updated first) enriched from each
+// rule's history with its live confidence, top action, and decision counts. It
+// also DROPS rows below f.MinConfidence: that filter needs the live score, so it
+// cannot live in the store's SQL (see domain.SignatureFilter). Per-row history
+// reads are N+1 at operator scale; a SQL aggregate is a future optimization if
+// lists grow.
 func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]SignatureRow, error) {
 	states, err := a.Store.ListSignatures(ctx, f)
 	if err != nil {
@@ -2314,9 +2351,22 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 		if err != nil {
 			return nil, err
 		}
-		conf := domain.Confidence(history, a.confirmationWeight())
+		conf := domain.LiveConfidence(history, st.DecisionFloorID, a.confirmationWeight())
+		// min-conf filters the LIVE score here, not cached_confidence in SQL:
+		// the store cannot do it correctly (see domain.SignatureFilter).
+		if f.MinConfidence > 0 && conf.Score < f.MinConfidence {
+			continue
+		}
+		// An exact count, not len(history): history is a capped window, and the
+		// delete prompts this feeds erase every row.
+		total, err := a.Store.CountDecisionsForSignature(ctx, st.Signature)
+		if err != nil {
+			return nil, err
+		}
 		rows = append(rows, SignatureRow{
-			SignatureState: st, TopAction: conf.TopAction, Decisions: conf.Decisions,
+			SignatureState: st, Confidence: conf.Score,
+			TopAction: conf.TopAction, Decisions: conf.Decisions,
+			TotalDecisions: total,
 		})
 	}
 	return rows, nil
@@ -2341,8 +2391,16 @@ func (a *App) SignatureDetail(ctx context.Context, prefix string) (SignatureRow,
 	if err != nil {
 		return row, nil, err
 	}
-	conf := domain.Confidence(history, a.confirmationWeight())
-	row = SignatureRow{SignatureState: *st, TopAction: conf.TopAction, Decisions: conf.Decisions}
+	conf := domain.LiveConfidence(history, st.DecisionFloorID, a.confirmationWeight())
+	// An exact count, not len(history): history is a capped window, and the
+	// delete prompts this feeds erase every row.
+	total, err := a.Store.CountDecisionsForSignature(ctx, sig)
+	if err != nil {
+		return row, nil, err
+	}
+	row = SignatureRow{SignatureState: *st, Confidence: conf.Score,
+		TopAction: conf.TopAction, Decisions: conf.Decisions,
+		TotalDecisions: total}
 	audit, err := a.Store.LatestAuditForSignature(ctx, sig)
 	if err != nil {
 		return row, nil, err

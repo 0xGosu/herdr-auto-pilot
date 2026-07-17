@@ -279,3 +279,117 @@ func TestIrreversibleScanCoversWholeAggregate(t *testing.T) {
 		t.Fatal("single-question scan should keep the tail window scoping")
 	}
 }
+
+// claudePreviewFrame is a real capture (audit #671, reproduced live 2026-07-16)
+// of the PREVIEW rendering: option list left, preview box right, "Notes: press
+// n to add notes", and an unnumbered "Chat about this". On this rendering a
+// digit only moves the caret — Enter commits.
+const claudePreviewFrame = `←  ☐ Shape  ☐ Speed  ✔ Submit  →
+
+Which shape?
+
+❯ 1. Circle                       ┌──────────────┐
+  2. Square                       │ ****         │
+                                  └──────────────┘
+
+                                  Notes: press n to add notes
+
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel`
+
+// claudePlainFrame is the PLAIN rendering (audit #674): plain numbered options,
+// no preview box. A digit selects and commits here.
+const claudePlainFrame = `←  ☒ Color  ☐ Size  ✔ Submit  →
+
+Which size?
+
+  1. Small
+     Small
+❯ 2. Large
+     Large
+  3. Type something.
+
+Enter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel`
+
+// claudeSubmitFrame is the final Submit tab, which drops the navigation footer
+// (issue #95) and carries the confirmation body instead.
+const claudeSubmitFrame = `←  ☒ Shape  ☒ Speed  ✔ Submit  →
+
+Review your answers
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel`
+
+func TestClaudeTabForm(t *testing.T) {
+	tests := []struct {
+		name           string
+		pane           string
+		wantOK         bool
+		wantCount      int
+		wantUnanswered int
+		wantCaret      string
+	}{
+		{
+			name: "preview tab: both questions unanswered, caret on option 1",
+			pane: claudePreviewFrame, wantOK: true,
+			wantCount: 3, wantUnanswered: 2, wantCaret: "1",
+		},
+		{
+			name: "plain tab: one answered (☒), caret moved to option 2",
+			pane: claudePlainFrame, wantOK: true,
+			wantCount: 3, wantUnanswered: 1, wantCaret: "2",
+		},
+		{
+			name: "submit tab: all answered, footer-less confirmation body",
+			pane: claudeSubmitFrame, wantOK: true,
+			wantCount: 3, wantUnanswered: 0, wantCaret: "1",
+		},
+		{
+			name:   "not a multi-tab form",
+			pane:   "just some agent narration\n1. not a form",
+			wantOK: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ClaudeTabForm(tc.pane)
+			if ok != tc.wantOK {
+				t.Fatalf("ClaudeTabForm ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				return
+			}
+			if got.Kind != MCQClaudeTabs {
+				t.Errorf("Kind = %q, want %q", got.Kind, MCQClaudeTabs)
+			}
+			if got.AnswerCount != tc.wantCount {
+				t.Errorf("AnswerCount = %d, want %d", got.AnswerCount, tc.wantCount)
+			}
+			if got.Unanswered != tc.wantUnanswered {
+				t.Errorf("Unanswered = %d, want %d", got.Unanswered, tc.wantUnanswered)
+			}
+			if got.SelectedOption != tc.wantCaret {
+				t.Errorf("SelectedOption = %q, want %q", got.SelectedOption, tc.wantCaret)
+			}
+		})
+	}
+}
+
+// The composer line ("❯ " + typed text) and stale scrollback renders must never
+// supply the caret — only the LAST live form does.
+func TestClaudeTabFormIgnoresComposerAndStaleRenders(t *testing.T) {
+	pane := "❯ 9. an old stale render\n\n" + claudePreviewFrame + "\n\n❯ what should I do next?\n"
+	got, ok := ClaudeTabForm(pane)
+	if !ok {
+		t.Fatal("ClaudeTabForm should still parse the live form")
+	}
+	if got.SelectedOption != "1" {
+		t.Errorf("SelectedOption = %q, want %q (the live form's caret)", got.SelectedOption, "1")
+	}
+	if got.Unanswered != 2 {
+		t.Errorf("Unanswered = %d, want 2", got.Unanswered)
+	}
+}

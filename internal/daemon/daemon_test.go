@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +48,17 @@ type fakeHerdr struct {
 	frames   []string
 	frameIdx int
 	failKeys bool
+	// mcqAnswered marks which multi-tab frames a digit has ANSWERED, and
+	// mcqSubmitted whether the form has been submitted away. Delivery verifies
+	// each keystroke against the pane, so the fake has to model what a digit
+	// actually does to a real form (see internal/mcqdeliver): on a
+	// single-select tab it commits the answer and auto-advances (the tab's ☐
+	// becomes ☒), on the Submit tab it submits and the form disappears, and on
+	// a multi-select tab it only toggles a checkbox — no answer, no advance.
+	// Without this, every read returns the same all-unanswered header and no
+	// delivery can ever verify.
+	mcqAnswered  []bool
+	mcqSubmitted bool
 	// failKeyName fails only SendKey calls for that specific key (e.g.
 	// "left" to break the sweep's reset burst but not its Right sweep).
 	failKeyName string
@@ -86,9 +98,37 @@ func (f *fakeHerdr) ReadPane(ctx context.Context, paneID string, lines int) (str
 		return "", errors.New("induced deep read failure")
 	}
 	if len(f.frames) > 0 {
-		return f.frames[f.frameIdx], nil
+		return f.renderFrame(), nil
 	}
 	return f.pane, nil
+}
+
+// renderFrame serves the focused multi-tab frame with the tab header's ☐ marks
+// updated to ☒ for tabs a digit has already answered — what a real form shows
+// and what delivery reads back to verify a keystroke landed. Once submitted,
+// the form is gone and the pane shows ordinary agent output.
+func (f *fakeHerdr) renderFrame() string {
+	if f.mcqSubmitted {
+		return "⏺ Answers received. Working on it now.\n\n❯ \n"
+	}
+	// One pass over the ORIGINAL ☐ positions: replacing them one at a time
+	// would renumber the ones still to come.
+	var b strings.Builder
+	rest := f.frames[f.frameIdx]
+	for tab := 0; ; tab++ {
+		i := strings.Index(rest, "☐")
+		if i < 0 {
+			b.WriteString(rest)
+			return b.String()
+		}
+		b.WriteString(rest[:i])
+		if tab < len(f.mcqAnswered) && f.mcqAnswered[tab] {
+			b.WriteString("☒")
+		} else {
+			b.WriteString("☐")
+		}
+		rest = rest[i+len("☐"):]
+	}
 }
 
 func (f *fakeHerdr) SendKey(ctx context.Context, paneID, key string) error {
@@ -114,8 +154,38 @@ func (f *fakeHerdr) SendKey(ctx context.Context, paneID, key string) error {
 		if f.frameIdx > 0 {
 			f.frameIdx--
 		}
+	default:
+		f.pressMCQDigit(key)
 	}
 	return nil
+}
+
+// pressMCQDigit models what a digit does to the simulated multi-tab form.
+// These frames are the PLAIN rendering, where a digit commits and advances;
+// the preview rendering (digit moves the caret only, Enter commits) is covered
+// against a real Claude in test/integration and by internal/mcqdeliver's own
+// fake, so a digit here must never be a no-op or delivery could not verify.
+func (f *fakeHerdr) pressMCQDigit(key string) {
+	if len(f.frames) == 0 || f.mcqSubmitted {
+		return
+	}
+	if _, err := strconv.Atoi(key); err != nil {
+		return
+	}
+	if len(f.mcqAnswered) < len(f.frames) {
+		f.mcqAnswered = make([]bool, len(f.frames))
+	}
+	// A multi-select tab toggles a checkbox: no answer, no advance.
+	if domain.MultiSelectTab(f.frames[f.frameIdx]) {
+		return
+	}
+	// The last frame is the Submit tab: its digit submits the form away.
+	if f.frameIdx == len(f.frames)-1 {
+		f.mcqSubmitted = true
+		return
+	}
+	f.mcqAnswered[f.frameIdx] = true
+	f.frameIdx++
 }
 
 func (f *fakeHerdr) SendKeys(ctx context.Context, paneID string, keys ...string) error {
@@ -689,6 +759,205 @@ func TestAutoActDeliversMenuDigitForLabelAction(t *testing.T) {
 // threshold both hold — after which the daemon auto-answers the approval with
 // the numbered-menu DIGIT (not the learned label text). Guards three things at
 // once: confirm-driven promotion, confidence growth, and menu-digit selection.
+// seedLLMHistory records `actions` as SourceLLM decisions for the signature of
+// `pane` WITHOUT a state row — exactly what the LLM auto path produces: history
+// that scores, drives the variance guard, and yet backs no rule at all.
+func seedLLMHistory(t *testing.T, h *harness, pane string, st domain.SituationType, actions ...string) string {
+	t.Helper()
+	ctx := context.Background()
+	status := "blocked"
+	if st == domain.SituationIdle {
+		status = "idle"
+	}
+	s := classifierForTest().Classify("claude", status, pane)
+	if s.Type != st {
+		t.Fatalf("fixture classifies as %v, want %v", s.Type, st)
+	}
+	sig := domain.ComputeSignature(s)
+	if sig.Verdict != domain.GuardOK {
+		// Fail here, not at a distant waitFor: an over-masked situation
+		// escalates as over_masked and never reaches the path under test.
+		t.Fatalf("seed situation over-masked: %q", sig.Salient)
+	}
+	for i, a := range actions { // oldest → newest
+		if _, err := h.raw.RecordDecision(ctx, domain.DecisionRecord{
+			Signature: sig.Signature, SituationType: st, AgentType: "claude",
+			ChosenAction: a, Source: domain.SourceLLM,
+			CreatedAt: time.Now().Add(-time.Duration(len(actions)-i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if state, _ := h.raw.GetSignature(ctx, sig.Signature); state != nil {
+		t.Fatalf("fixture must have no state row, got %+v", state)
+	}
+	return sig.Signature
+}
+
+func TestFirstOperatorDecisionFloorsPriorLLMGuesses(t *testing.T) {
+	// A rule begins when the operator first speaks. The LLM's earlier guesses
+	// are not agreement about anything — here it answered the same approval
+	// four different ways — so a rule born from them would inherit a
+	// contradictory history it never earned (~0.4, under the variance floor) and
+	// be pinned there despite the operator having agreed once and never
+	// disagreed. The new rule starts clean at 1.00 over its single operator
+	// decision, and the LLM rows are KEPT for audit, merely floored out.
+	h := newHarness(t, "[learning]\ngraduation_n = 3\n")
+	h.herdr.setPane(approvalPane)
+	ctx := context.Background()
+	// Four DISTINCT answers, as the live pathology showed (one signature drew 6
+	// distinct actions from the LLM and scored 0.24). Distinctness is the whole
+	// point: repeat an action and its weight accumulates, lifting the score back
+	// over the floor and leaving nothing for the guard to catch.
+	sig := seedLLMHistory(t, h, approvalPane, domain.SituationApproval,
+		"No", "@noop", "No, and tell the agent what to do differently", "Yes")
+
+	before, err := h.raw.DecisionsForSignature(ctx, sig, 50)
+	if err != nil || len(before) != 4 {
+		t.Fatalf("seed history: %d rows, %v", len(before), err)
+	}
+	if got := domain.Confidence(before, domain.DefaultConfirmationWeight).Score; got >= 0.5 {
+		t.Fatalf("fixture must be contradictory (<0.5) to be meaningful, got %.3f", got)
+	}
+
+	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	h.push("agent-floor", "blocked")
+	var esc domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		pend, _ := h.raw.PendingEscalations(ctx)
+		if len(pend) != 1 {
+			return false
+		}
+		esc = pend[0]
+		return true
+	})
+	if err := app.Resolve(ctx, esc.ID, "Yes", false); err != nil {
+		t.Fatal(err)
+	}
+
+	var st *domain.SignatureState
+	waitFor(t, 3*time.Second, func() bool {
+		st, _ = h.raw.GetSignature(ctx, sig)
+		return st != nil
+	})
+	if st.DecisionFloorID != before[0].ID {
+		t.Errorf("floor = %d, want the newest pre-existing decision %d", st.DecisionFloorID, before[0].ID)
+	}
+	if st.CachedConfidence != 1 {
+		t.Errorf("a fresh rule scores 1.00 over its one operator decision, got %.4f", st.CachedConfidence)
+	}
+	// The floor hides the LLM rows from scoring; it must not delete them.
+	after, _ := h.raw.DecisionsForSignature(ctx, sig, 50)
+	if len(after) != 5 {
+		t.Errorf("history rows = %d, want 5 (4 LLM + 1 operator) — the floor must keep them", len(after))
+	}
+	if n := len(domain.DecisionsSince(after, st.DecisionFloorID)); n != 1 {
+		t.Errorf("post-floor decisions = %d, want only the operator's 1", n)
+	}
+	// 1.00 must not smuggle in autonomy: the streak still gates it.
+	if st.Mode != domain.ModeShadow {
+		t.Errorf("a fresh rule stays shadow at 1.00, got %q", st.Mode)
+	}
+	if st.ConsecutiveConfirmations != 1 {
+		t.Errorf("streak = %d, want 1", st.ConsecutiveConfirmations)
+	}
+}
+
+func TestCorrectingLLMAutoRowWithNoRuleStartsStreak(t *testing.T) {
+	// An LLM auto-act writes audit.Status "auto" for a signature that has NO
+	// rule. That must not be mistaken for "a graduated rule acted": treating it
+	// so skipped ObserveConfirmation and stranded the new rule's streak at 0, so
+	// it could never graduate however often the operator confirmed. Rule
+	// creation reads the same from either origin — auto or escalated.
+	h := newHarness(t, "[learning]\ngraduation_n = 3\n")
+	ctx := context.Background()
+	sig := seedLLMHistory(t, h, approvalPane, domain.SituationApproval, "Yes", "No")
+
+	// An auto-origin audit row, exactly as the LLM auto path leaves it: status
+	// "auto", an "auto:" action, and no suggestion to confirm.
+	auditID, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		Signature: sig, AgentID: "agent-auto", AgentType: "claude",
+		SituationType: domain.SituationApproval, Trigger: approvalPane,
+		Action: domain.AuditActionAutoPrefix + "Yes", Status: "auto",
+		Rationale: "llm auto-acted", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	if err := app.Resolve(ctx, auditID, "Yes", false); err != nil {
+		t.Fatal(err)
+	}
+	var st *domain.SignatureState
+	waitFor(t, 3*time.Second, func() bool {
+		st, _ = h.raw.GetSignature(ctx, sig)
+		return st != nil
+	})
+	if st.ConsecutiveConfirmations != 1 {
+		t.Errorf("streak = %d, want 1 — an auto row with no rule must start the streak", st.ConsecutiveConfirmations)
+	}
+	if st.Mode != domain.ModeShadow {
+		t.Errorf("mode = %q, want shadow", st.Mode)
+	}
+	if st.CachedConfidence != 1 {
+		t.Errorf("confidence = %.4f, want 1.00", st.CachedConfidence)
+	}
+}
+
+func TestCorrectingGraduatedRuleKeepsFrozenStreak(t *testing.T) {
+	// The safety invariant the removed `wasAutonomous` branch was there to
+	// protect: permanent graduation (FR-007). It still holds, because
+	// ObserveConfirmation freezes an autonomous rule itself — correcting one
+	// records the decision (confidence moves) but never demotes it or touches
+	// its frozen count. Only an operator reset returns it to shadow.
+	h := newHarness(t, "[learning]\ngraduation_n = 3\n")
+	ctx := context.Background()
+	sig := h.seedAutonomous(approvalPane, domain.SituationApproval, "Yes")
+	before, _ := h.raw.GetSignature(ctx, sig)
+	seeded, _ := h.raw.DecisionsForSignature(ctx, sig, 50)
+
+	auditID, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		Signature: sig, AgentID: "agent-grad", AgentType: "claude",
+		SituationType: domain.SituationApproval, Trigger: approvalPane,
+		Action: domain.AuditActionAutoPrefix + "Yes", Status: "auto",
+		Rationale: "rule auto-acted", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	// Correct it to a DIFFERENT action — the case most likely to demote.
+	if err := app.Resolve(ctx, auditID, "No", false); err != nil {
+		t.Fatal(err)
+	}
+	// Wait on the correction being RECORDED, not on UpdatedAt moving: timestamps
+	// are millisecond-resolution, so a same-millisecond write would leave
+	// UpdatedAt.After false and hang this to a timeout.
+	var st *domain.SignatureState
+	waitFor(t, 3*time.Second, func() bool {
+		now, _ := h.raw.DecisionsForSignature(ctx, sig, 50)
+		if len(now) != len(seeded)+1 {
+			return false
+		}
+		st, _ = h.raw.GetSignature(ctx, sig)
+		return st != nil
+	})
+	if st.Mode != domain.ModeAutonomous {
+		t.Errorf("a graduated rule must never be demoted by a correction, got %q", st.Mode)
+	}
+	if st.ConsecutiveConfirmations != before.ConsecutiveConfirmations {
+		t.Errorf("frozen count changed: %d -> %d",
+			before.ConsecutiveConfirmations, st.ConsecutiveConfirmations)
+	}
+	// A graduated rule already has a state row, so nothing gets floored.
+	if st.DecisionFloorID != before.DecisionFloorID {
+		t.Errorf("an existing rule's floor must not move: %d -> %d",
+			before.DecisionFloorID, st.DecisionFloorID)
+	}
+}
+
 func TestConfirmDrivenShadowToAutoPromotion(t *testing.T) {
 	const graduationN = 3
 	h := newHarness(t, fmt.Sprintf("[learning]\ngraduation_n = %d\n", graduationN))
@@ -717,6 +986,17 @@ func TestConfirmDrivenShadowToAutoPromotion(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// The state row is part of the fixture, not decoration: operator decisions
+	// only ever exist alongside one (applyCorrection writes both together), and
+	// a rule created from scratch floors out everything that predates it. Seed
+	// only the decisions and the first confirmation would create the rule, floor
+	// this history away, and pin agreement at 1.00 — no climb left to observe.
+	if err := h.raw.UpsertSignature(ctx, domain.SignatureState{
+		Signature: sig.Signature, SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
 	}
 
 	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
@@ -2765,6 +3045,9 @@ func TestConsultContextCarriesLocationCwdAndDeepExcerpt(t *testing.T) {
 	// The deep read asks for pane_excerpt_chars/10 lines; the shallow
 	// classification read keeps the PaneReadLines default.
 	lines := h.herdr.readLineCalls()
+	if len(lines) < 1 || lines[0] != 50 {
+		t.Errorf("classification read should request 50 lines, got calls %v", lines)
+	}
 	if len(lines) < 2 || lines[len(lines)-1] != 500 {
 		t.Errorf("deep read should request 500 lines, got calls %v", lines)
 	}
@@ -2817,7 +3100,7 @@ func TestConsultContextFallsBackToClassificationSnapshot(t *testing.T) {
 	captured := captureConsultContext(h)
 	h.herdr.setPane(approvalPane)
 	h.herdr.mu.Lock()
-	h.herdr.failReadOver = 120 // classification read (120 lines) passes, deep read fails
+	h.herdr.failReadOver = 50 // classification read (50 lines) passes, deep read fails
 	h.herdr.mu.Unlock()
 
 	h.push("agent-fb", "blocked")

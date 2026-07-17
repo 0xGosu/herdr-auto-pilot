@@ -25,6 +25,12 @@ type MCQFormState struct {
 	Unanswered     int
 	SelectedOption string
 	SubmitAll      bool
+	// Question identifies WHICH tab is on screen for forms whose UI exposes no
+	// tab index. Codex numbers its questions ("Question 1/3"), so it uses
+	// Current; Claude's tab header does not, so ClaudeTabForm fills this with
+	// the question line instead and delivery compares it across a keystroke to
+	// prove the form did not move to another tab. Empty for Codex.
+	Question string
 }
 
 var (
