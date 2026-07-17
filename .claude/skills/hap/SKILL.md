@@ -447,12 +447,6 @@ this removes the `[[task_sources]]` entry only — the checklist file is left on
 disk. it is unguarded and unconfirmed: it removes the entry even while a live
 agent is mid-task on it, which makes it the force path.
 
-the TUI twin is `x` on a source's header row in the **Tasks** tab. same
-config-only removal, but behind a `y/n` confirmation AND a guard: it only
-offers removal once **no live agent matches** the source, or **every task in it
-is finished** (`[-]` in-progress counts as unfinished). otherwise it refuses and
-points back at the config tab / this command.
-
 
 ### manage the task items (CRUD)
 

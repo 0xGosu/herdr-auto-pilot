@@ -7,19 +7,22 @@ herd, detects when an agent needs input — finished a step, waiting on an
 approval, stuck on a multiple-choice question, or stalled on an error — and
 automatically supplies the next prompt or the correct response, *the way you
 would*. It learns from your own past decisions in a supervised shadow mode,
-acts autonomously only when its confidence clears your thresholds, and
-escalates to you when it isn't sure. Everything it does is audited and
-correctable.
+can follow task lists you explicitly configure, and can optionally consult an
+LLM/agent CLI. Autonomous actions must clear the applicable confidence and
+safety gates; uncertain ones escalate to you. Everything it does is audited
+and correctable.
 
-- **Learned, not guessed** — every automated choice traces back to your own
-  confirmed decisions.
-- **Confidence-gated** — below the per-situation threshold it escalates, never
-  guesses.
+- **Learned rules, not guesses** — every action taken from a learned rule
+  traces back to your confirmed decisions. Explicit task sources and the
+  opt-in LLM helper are separate, clearly audited paths.
+- **Confidence-gated** — learned rules and optional LLM suggestions use their
+  own configured thresholds; below the applicable threshold they escalate.
 - **Safety first** — never-auto patterns (force-push, destructive ops,
   deploys, credential changes, …), a global pause/kill switch, a runaway-loop
   guard, and an error-retry ceiling all veto automation.
-- **Fully local** — learning data, history, and the audit log live in SQLite
-  on your machine. No telemetry, no cloud calls.
+- **Local by default** — learning data, history, and the audit log live in
+  SQLite on your machine. Hap sends no telemetry and makes no cloud call of
+  its own; an optional CLI you configure may use its provider's service.
 
 ## Quickstart
 
@@ -37,7 +40,7 @@ Pin a release (recommended for reproducible installs), or install
 non-interactively:
 
 ```sh
-herdr plugin install 0xGosu/herdr-auto-pilot --ref v0.1.2
+herdr plugin install 0xGosu/herdr-auto-pilot --ref v0.4.0
 herdr plugin install 0xGosu/herdr-auto-pilot --yes
 ```
 
@@ -210,9 +213,11 @@ embedding, LLM, and TUI settings. Both live under the local plugin directories
 described in Quickstart; no learning state is stored in Herdr or in an agent's
 context.
 
-## How it learns (shadow mode)
+## How learned rules work (shadow mode)
 
-The plugin never acts on a situation it hasn't learned from you.
+A learned rule never acts on a situation before you have taught it. Explicit
+task sources and opt-in LLM auto-actions are separate paths; they use their own
+gates and remain visible in the same audit trail.
 
 1. **Observe.** When an agent needs input, the plugin classifies the
    situation (idle / approval / choice / error), fingerprints it into a
@@ -224,8 +229,11 @@ The plugin never acts on a situation it hasn't learned from you.
    swept tab-by-tab with arrow keystrokes so the escalation, the signature,
    and the LLM consult see **all** questions, not just the focused one. Its
    answer is a digit series, one digit per tab including Submit (e.g.
-   `1 2 3 2 1`), delivered as keystrokes; a series that doesn't match the
-   tab count is never partially delivered. Codex question series are likewise
+   `1 2 3 2 1`). Delivery adapts per tab: a digit commits a plain option, but
+   on Claude's preview layout it only moves the caret, so hap re-reads the live
+   form and presses Enter only after verifying the intended option is selected.
+   Unexpected transitions fail closed, and a series that doesn't match the tab
+   count is never partially delivered. Codex question series are likewise
    swept and aggregated, but their answer series contains one digit per
    question (no Submit pseudo-option); delivery verifies every live question
    transition and explicitly submits the completed form.
@@ -273,18 +281,35 @@ The plugin never acts on a situation it hasn't learned from you.
    preview. Press `v` again to expand or collapse all previews. Expanded
    content still retains its newest trailing lines when
    `tui.max_content_height` caps it (`0` keeps the full content).
-3. **Graduate.** After **5 consecutive consistent confirmations** (configurable)
-   *and* confidence above the per-situation threshold, that signature becomes
-   autonomous: next time, the plugin acts on its own and logs it.
+3. **Graduate.** After **2 consecutive consistent confirmations** by default
+   (configurable from 1–10) *and* confidence above the per-situation threshold,
+   that signature becomes autonomous: next time, the plugin acts on its own
+   and logs it. Confirmations carry extra confidence weight (3× by default),
+   because an explicit operator answer is stronger evidence than an automated
+   observation.
 4. **Stay in control.** Correct any automated decision post-hoc (TUI *Audit*
-   tab or `resolve <audit-id> --action ...`). A correction demotes the
-   signature back to shadow mode — it must re-earn your trust.
+   tab or `resolve <audit-id> --action ...`). The correction is recorded and
+   immediately affects the rule's live confidence gate, but graduation is
+   permanent: it does not silently change an autonomous rule back to shadow.
+   To retrain one from a clean confidence/streak boundary, select it on the TUI
+   *Rules* tab and press `0`, or run `hap signatures reset <prefix> --yes`.
+   Reset keeps the audit and decision history (and the learned answer), but
+   excludes pre-reset decisions from confidence and graduation; the rule must
+   earn the configured confirmations again.
+
+When the first operator response creates a rule, earlier LLM-only guesses for
+that signature remain in history for audit but do not seed the new rule's
+confidence. The rule begins with the operator evidence that actually taught it.
 
 ### Inspecting what it has learned
 
 Every learned signature is visible on the TUI's *Rules* tab and via the
 `signatures` CLI (alias `sigs`): mode, confirmation streak toward
-graduation, confidence, and the action it learned. Press `enter`/`v` for
+graduation, confidence, and the action it learned. The Rules view and
+`--min-conf` filter recompute live confidence from the current post-reset
+decision history rather than using a stale stored snapshot. In rule, audit,
+and escalation confidence fields, a `-` means that item has not been scored
+yet; it is not a measured `0.00`. Press `enter`/`v` for
 the full record — including the **original situation**, the pane snapshot
 first captured for the rule, so you can see exactly what a rule answers,
 not just the action it sends (rules learned before this feature pick it
@@ -299,6 +324,7 @@ scratch. Signatures are addressed by unique prefix, git-style:
 ```sh
 hap signatures                      # list (--type, --mode, --agent-type, --min-conf)
 hap signatures show approval:9f2c   # full detail by unique prefix
+hap signatures reset approval:9f2c --yes # shadow + fresh streak/confidence; history kept
 hap signatures delete approval:9f2c --yes
 ```
 
@@ -322,6 +348,7 @@ inferred_task_bar = 0.60   # higher bar for tasks inferred from pane history
 
 [learning]
 graduation_n = 2           # consecutive confirmations to graduate (1-10)
+confirmation_weight = 3.0  # confidence weight for an operator confirmation (>=1)
 
 [limits]
 max_consecutive_auto_prompts = 10  # per agent, without human interaction
@@ -609,6 +636,15 @@ irreversible heuristic, rate limits):
 
 Because the default threshold is `999` (never auto-act), every review is
 surfaced for confirmation until you lower `auto_act_confidence_threshold`.
+
+For learning, every accepted task-review send is stored symbolically as
+`@next_task:declared`, whether the LLM approved the queued task verbatim,
+copied it, edited it, or chose another pending item. The pane still receives
+the real task text. This teaches the reusable decision “send the next declared
+task” instead of treating each task's one-off wording as a different action;
+an operator confirmation of a low-confidence review learns the same symbolic
+action. The sentinel is rejected if an LLM submits it outside a task review
+that actually carries a proposed task.
 
 This is **on by default** whenever the LLM command exists; set
 `llm_review = false` on a `[[task_sources]]` entry to keep the plain
