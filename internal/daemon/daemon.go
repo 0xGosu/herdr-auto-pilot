@@ -607,6 +607,14 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// that moved on (the consuming recent-delta still holds the old
 		// menu AND the answer) — activity supersedes it.
 		d.cancelCapture(tr.PaneID)
+		// Same for an in-flight rewrite: its situation no longer stands,
+		// whoever caused the resume. registerHumanInteraction below also
+		// cancels, but only when the resume counts as human — a self-flap
+		// within 10s of our own last auto action would otherwise leave the
+		// flight live, and a late "@noop" outcome (which skips the
+		// staleness re-read) would stamp audit/rate side effects for a
+		// pane that already moved on.
+		d.cancelRewriteExcept(tr.AgentID, "")
 		// Genuine progress ends the pane's parked episode: re-arm the
 		// subscribe-time reconcile so a fresh block/idle/done is surfaced (#49).
 		d.mu.Lock()
@@ -1072,7 +1080,7 @@ func (d *Daemon) cancelRewriteExcept(agentID, keepSig string) {
 	delete(d.rewriteInFlight, agentID)
 	d.mu.Unlock()
 	fl.cancel()
-	slog.Info("in-flight rewrite superseded by a newer decision", "agent", agentID)
+	slog.Info("in-flight rewrite superseded", "agent", agentID)
 }
 
 // readDecisionState gathers all store reads for one decision. The latest

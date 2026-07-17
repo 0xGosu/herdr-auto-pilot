@@ -635,6 +635,54 @@ func TestRewriteNoopKillSwitchEscalates(t *testing.T) {
 	}
 }
 
+func TestRewriteNoopDroppedWhenAgentResumes(t *testing.T) {
+	// The agent resumes working while the rewrite is in flight: the flight
+	// is cancelled on the transition, so a late "@noop" outcome — which
+	// deliberately skips the staleness re-read — must apply NO side
+	// effects: no noop audit row, no runaway-counter advance.
+	cancelled := make(chan struct{}, 1)
+	release := make(chan struct{})
+	h, fr, _ := idleRewriteHarness(t, "agent-rw23", "",
+		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
+			select {
+			case <-ctx.Done():
+				cancelled <- struct{}{}
+				return "", ctx.Err()
+			case <-release:
+				return "@noop", nil
+			}
+		})
+
+	h.push("agent-rw23", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(fr.rewriteCalls()) == 1 })
+	h.push("agent-rw23", "working") // resume supersedes the flight
+
+	waitFor(t, 3*time.Second, func() bool {
+		select {
+		case <-cancelled:
+			return true
+		default:
+			return false
+		}
+	})
+	close(release)
+	time.Sleep(300 * time.Millisecond)
+
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("a superseded flight must not send, sent %v", got)
+	}
+	audits, _ := h.raw.AuditLog(context.Background(), 10)
+	for _, a := range audits {
+		if a.Action == "noop" {
+			t.Errorf("stale noop must leave no audit row: %+v", a)
+		}
+	}
+	rate, err := h.raw.GetAgentRate(context.Background(), "agent-rw23")
+	if err != nil || rate.ConsecutiveAuto != 0 {
+		t.Errorf("stale noop must not advance the runaway counter: %+v (%v)", rate, err)
+	}
+}
+
 func TestRewriteNoopAuditFailureNotifies(t *testing.T) {
 	// FR-024 holds for the noop path too: no audit record, no state
 	// advance — and the operator is notified.
