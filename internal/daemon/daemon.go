@@ -1136,6 +1136,29 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		return
 	}
 
+	// Claude's "Select remote environment" picker commits per a per-build
+	// protocol (the digit may only move the caret), so answer it adaptively
+	// via verified keystrokes. Without the keystroke capability this FAILS
+	// CLOSED to escalation: the plain text send below would type the literal
+	// label + Enter, and under the caret binding Enter commits whatever
+	// option the caret rests on — a rule learned on another project's
+	// environment list must never launch the wrong cloud environment.
+	if s.Type == domain.SituationApproval && strings.EqualFold(s.AgentType, "claude") {
+		if _, isRemoteEnv := domain.ClaudeRemoteEnvForm(s.Content); isRemoteEnv {
+			ks, ok := d.opt.Herdr.(ports.KeystrokeSender)
+			if !ok {
+				d.escalate(ctx, s, sig, domain.Decision{
+					Action: domain.ActionEscalate, Reason: domain.ReasonHerdrUnreachable,
+					Rationale:  "keystrokes unavailable; the remote-environment picker needs verified keystrokes",
+					Confidence: dec.Confidence, Suggestion: "respond: " + dec.Input,
+				}, tr, now)
+				return
+			}
+			d.deliverRemoteEnv(ctx, ks, s, sig, dec, tr, now)
+			return
+		}
+	}
+
 	// Numbered menus (Claude approvals/choices) accept the option's digit,
 	// not the label text; deliver the keystroke the menu expects. Free-text
 	// situations deliver the literal reply. s.Content is the classification
@@ -2714,6 +2737,31 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		d.deliverSeriesLLM(ctx, ks, s, res.sig, tr, llmDec, groups,
 			computedConf, &llmConf, now)
 		return
+	}
+	// Claude's remote-environment picker takes the adaptive keystroke
+	// deliverer for the same reason as the act path: its commit protocol is
+	// per-build, so a blind digit + Enter send could no-op or double-commit.
+	// The freshness gate above only proves SOME picker is standing (the
+	// approval salient is verb-only); the deliverer's live label→digit
+	// mapping is what rejects a swapped environment list. Without keystroke
+	// support this fails closed to escalation, like the multi-tab branch —
+	// the generic send below could commit whatever the caret rests on.
+	if s.Type == domain.SituationApproval && strings.EqualFold(s.AgentType, "claude") {
+		if _, isRemoteEnv := domain.ClaudeRemoteEnvForm(pane); isRemoteEnv {
+			ks, ok := d.opt.Herdr.(ports.KeystrokeSender)
+			if !ok {
+				reject(domain.ReasonHerdrUnreachable,
+					"herdr adapter cannot send keystrokes; the remote-environment picker needs them")
+				return
+			}
+			if !d.acquirePane(s.AgentID) {
+				reject(domain.ReasonRateLimited,
+					"another pane interaction is in flight for this agent; not delivering concurrently")
+				return
+			}
+			d.deliverRemoteEnvLLM(ctx, ks, s, res.sig, tr, llmDec, computedConf, &llmConf, now)
+			return
+		}
 	}
 	executed := d.withAgentAutomation(ctx, s, res.sig, tr, llmDec.Action,
 		computedConf, &llmConf, llmDec.CapturedOutput, now, func() {

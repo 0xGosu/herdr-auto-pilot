@@ -91,7 +91,13 @@ func OptionLabels(content string) []string {
 // matches no option: free-text prompts (a typed reply, an error-retry
 // command) must be delivered literally, so callers send chosen unchanged.
 func MenuKeystroke(content, chosen string) (string, bool) {
-	opts := ParseNumberedOptions(content)
+	return MenuKeystrokeFrom(ParseNumberedOptions(content), chosen)
+}
+
+// MenuKeystrokeFrom is MenuKeystroke over an already-parsed option set, for
+// callers whose options carry normalized labels the raw pane does not (e.g.
+// the remote-environment picker strips the ✔ marker from the default entry).
+func MenuKeystrokeFrom(opts []NumberedOption, chosen string) (string, bool) {
 	if len(opts) == 0 {
 		return chosen, false
 	}

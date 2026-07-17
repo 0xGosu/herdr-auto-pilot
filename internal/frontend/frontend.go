@@ -795,6 +795,47 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 			markSent()
 			return a.nudge(ctx, control.KindReload)
 		}
+		// Claude's remote-environment picker commits per a per-build
+		// protocol (the digit may only move the caret), so a standing picker
+		// is answered via the adaptive keystroke deliverer. The situation is
+		// identified from the audit's own pane capture as well as the live
+		// read: a failed or stale read must REFUSE, never fall through to the
+		// literal-label send below — its trailing Enter could commit whatever
+		// option the caret rests on and launch the wrong cloud environment. A
+		// keystroke-less adapter falls through ONLY when the reply maps to a
+		// live option digit (safe under both bindings).
+		if audit.SituationType == domain.SituationApproval && strings.EqualFold(audit.AgentType, "claude") {
+			_, wasRemoteEnv := domain.ClaudeRemoteEnvForm(audit.PaneExcerpt)
+			var form domain.RemoteEnvForm
+			live := false
+			if rerr == nil {
+				form, live = domain.ClaudeRemoteEnvForm(pane)
+			}
+			if wasRemoteEnv || live {
+				if rerr != nil {
+					return fmt.Errorf("correction recorded, but the pane could not be read to answer the remote environment picker: %w", rerr)
+				}
+				if !live {
+					return fmt.Errorf("correction recorded, but the pane no longer shows the remote environment picker")
+				}
+				if ks, ok := a.Herdr.(ports.KeystrokeSender); ok {
+					if err := mcqdeliver.ClaudeRemoteEnv(ctx, mcqdeliver.Config{
+						Keys:      ks,
+						Read:      a.readVisiblePane,
+						PaneID:    audit.AgentID,
+						ReadLines: menuReadLines,
+						KeyDelay:  seriesKeyDelay,
+					}, outbound); err != nil {
+						return fmt.Errorf("correction recorded, but %w", err)
+					}
+					markSent()
+					return a.nudge(ctx, control.KindReload)
+				}
+				if _, mapped := domain.MenuKeystrokeFrom(form.Options, domain.TrimRemoteEnvCheck(outbound)); !mapped {
+					return fmt.Errorf("correction recorded, but %q matches none of the offered environments and this herdr adapter cannot send verified keystrokes", outbound)
+				}
+			}
+		}
 		if rerr == nil {
 			outbound = domain.DeliverKeystroke(audit.SituationType, audit.AgentType, pane, outbound)
 		}

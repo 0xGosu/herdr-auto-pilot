@@ -19,10 +19,11 @@ func TestGoldenTranscripts(t *testing.T) {
 	c := New(nil)
 
 	statusFor := map[string]string{
-		"idle_finished.txt":          "idle",
-		"codex_idle.txt":             "idle",
-		"approval_codex_plan.txt":    "idle",
-		"error_codex_rate_limit.txt": "idle",
+		"idle_finished.txt":              "idle",
+		"codex_idle.txt":                 "idle",
+		"approval_codex_plan.txt":        "idle",
+		"error_codex_rate_limit.txt":     "idle",
+		"approval_claude_remote_env.txt": "idle",
 	}
 	agentTypeFor := map[string]string{
 		"approval_codex_plan.txt":     "codex",
@@ -472,6 +473,46 @@ func TestCodexPlanModeApprovalClassifiesApprovalAtParkedStatuses(t *testing.T) {
 	}
 	if s := c.Classify("claude", "idle", string(data)); s.Type == domain.SituationApproval {
 		t.Fatal("Codex Plan approval structure must remain scoped to codex")
+	}
+}
+
+func TestClaudeRemoteEnvClassifiesApprovalAtParkedStatuses(t *testing.T) {
+	// Claude's "Select remote environment" picker (remote sub-agent launch)
+	// stands while Herdr reports the pane idle, so it is a parked structural
+	// approval — like Codex's Plan approval — at blocked/idle/done, never at
+	// working, and scoped strictly to agent_type claude.
+	c := New(nil)
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "approval_claude_remote_env.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []string{"blocked", "idle", "done"} {
+		s := c.Classify("claude", status, string(data))
+		if s.Type != domain.SituationApproval {
+			t.Fatalf("remote-env picker at %s = %v, want approval", status, s.Type)
+		}
+		if s.PermissionVerb != "select remote environment" {
+			t.Errorf("remote-env picker verb = %q", s.PermissionVerb)
+		}
+		if len(s.Options) != 4 {
+			t.Fatalf("remote-env picker options = %d (%v), want 4", len(s.Options), s.Options)
+		}
+		// The default environment's ✔ marker is UI state, not part of the
+		// label; a rule learned from the clean label must match either way.
+		if s.Options[0] != "herdr-auto-pilot (env_01F41H1jxkGrT2zj55CqE4WQ)" {
+			t.Errorf("remote-env picker option 1 = %q, want the ✔ stripped", s.Options[0])
+		}
+	}
+	if s := c.Classify("claude", "working", string(data)); s.Type == domain.SituationApproval {
+		t.Fatal("working claude pane must not classify the remote-env picker as approval")
+	}
+	if s := c.Classify("codex", "idle", string(data)); s.Type == domain.SituationApproval {
+		t.Fatal("remote-env picker structure must remain scoped to claude")
+	}
+	// Its footer also matches the single-question MCQ shape; approval must
+	// keep priority over choice at blocked status too.
+	if s := c.Classify("claude", "blocked", string(data)); s.Type == domain.SituationChoice {
+		t.Fatal("remote-env picker must classify approval, not choice")
 	}
 }
 

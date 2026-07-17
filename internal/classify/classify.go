@@ -133,6 +133,10 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 	s := domain.Situation{AgentType: agentType, Content: pane, Type: domain.SituationUnclassifiable}
 	codexPlanApproval := strings.EqualFold(agentType, "codex") && domain.CodexPlanApprovalForm(pane)
 	codexRateLimit := strings.EqualFold(agentType, "codex") && domain.CodexRateLimitForm(pane)
+	claudeRemoteEnv := false
+	if strings.EqualFold(agentType, "claude") {
+		_, claudeRemoteEnv = domain.ClaudeRemoteEnvForm(pane)
+	}
 
 	// Approval and choice are normally BLOCKED situations (constitution
 	// taxonomy): their content rules are gated on herdr reporting the agent
@@ -156,6 +160,13 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		// permission sentence. Detect it at the approval rule's position so
 		// approval retains priority over numbered-choice parsing.
 		if !matched && r.situation == domain.SituationApproval && codexPlanApproval {
+			matched = true
+		}
+		// Claude's "Select remote environment" picker (remote sub-agent
+		// launch) is likewise a structural approval: its footer also matches
+		// the single-question MCQ shape, so detecting it here keeps approval's
+		// priority over the choice-position ParseMCQForm hook.
+		if !matched && r.situation == domain.SituationApproval && claudeRemoteEnv {
 			matched = true
 		}
 		// Agent MCQ selection prompts render structurally, not as a plain
@@ -186,7 +197,12 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		// non-structural approval and choice matches.
 		codexPlanParked := r.situation == domain.SituationApproval && codexPlanApproval &&
 			(agentStatus == "idle" || agentStatus == "done")
-		if (r.situation == domain.SituationApproval || r.situation == domain.SituationChoice) && !blocked && !codexPlanParked {
+		// Herdr likewise reports Claude's standing remote-environment picker
+		// as idle (verified live 2026-07-17). Same reasoning, same statuses:
+		// working stays excluded.
+		claudeRemoteEnvParked := r.situation == domain.SituationApproval && claudeRemoteEnv &&
+			(agentStatus == "idle" || agentStatus == "done")
+		if (r.situation == domain.SituationApproval || r.situation == domain.SituationChoice) && !blocked && !codexPlanParked && !claudeRemoteEnvParked {
 			continue
 		}
 		s.Type = r.situation
@@ -241,6 +257,17 @@ func enrich(s *domain.Situation) {
 			s.TabCount = form.AnswerCount
 		}
 	case domain.SituationApproval:
+		if strings.EqualFold(s.AgentType, "claude") {
+			if form, ok := domain.ClaudeRemoteEnvForm(s.Content); ok {
+				// Stable across projects and environment lists, so equivalent
+				// pickers share one signature; the env labels are the learned
+				// ACTION, not the key. Delivery re-maps the learned label onto
+				// the live option set and fails closed when it is absent.
+				s.PermissionVerb = "select remote environment"
+				s.Options = append(s.Options, form.OptionLabels()...)
+				return
+			}
+		}
 		if strings.EqualFold(s.AgentType, "codex") && domain.CodexPlanApprovalForm(s.Content) {
 			// Stable across the plan body and the volatile "Context: N% used"
 			// description, so equivalent Plan approvals share a signature.

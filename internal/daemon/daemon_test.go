@@ -3599,3 +3599,177 @@ func TestSignatureSnapshotRecordedOnFirstSighting(t *testing.T) {
 		t.Errorf("later sighting must not overwrite the original snapshot")
 	}
 }
+
+// --- Claude "Select remote environment" picker (remote sub-agent launch) ---
+
+// remoteEnvPane is a live capture shape: Herdr reports the pane IDLE while
+// this modal stands, so it classifies via the parked-approval exception.
+const remoteEnvPane = `● 2 background agents launched (↓ to manage)
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select remote environment
+
+   Configure environments at: https://claude.ai/code
+
+   ❯ 1. herdr-auto-pilot (env_01F41H1jxkGrT2zj55CqE4WQ) ✔
+     2. myspec-monorepo (env_01CASfztpZp7mYRJPK41sGvK)
+     3. Full-access (env_011CUW5BKtc4vkq5q1uSp7MY)
+     4. Default (env_011CUKn5Aj1q6ujg5PFvEhTE)
+
+   Enter to select · Esc to cancel
+`
+
+// remoteEnvPaneCaret3 is the same picker after a "3" keystroke under the
+// caret-only binding (digit moves ❯, Enter commits).
+const remoteEnvPaneCaret3 = `   Select remote environment
+
+   Configure environments at: https://claude.ai/code
+
+     1. herdr-auto-pilot (env_01F41H1jxkGrT2zj55CqE4WQ) ✔
+     2. myspec-monorepo (env_01CASfztpZp7mYRJPK41sGvK)
+   ❯ 3. Full-access (env_011CUW5BKtc4vkq5q1uSp7MY)
+     4. Default (env_011CUKn5Aj1q6ujg5PFvEhTE)
+
+   Enter to select · Esc to cancel
+`
+
+const remoteEnvClosedPane = "● Environment selected. Launching remote agent…\n"
+
+// The headline regression: the picker at IDLE status must classify as an
+// approval and raise an escalation — before this support it classified idle
+// and was dismissed as over_masked, leaving the agent silently blocked.
+func TestRemoteEnvPickerAtIdleEscalatesAsApproval(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(remoteEnvPane)
+
+	h.push("agent-env", "idle")
+
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(context.Background())
+		return len(esc) == 1
+	})
+	esc, _ := h.raw.PendingEscalations(context.Background())
+	if esc[0].SituationType != domain.SituationApproval {
+		t.Fatalf("situation = %s, want approval", esc[0].SituationType)
+	}
+	if !strings.HasPrefix(esc[0].Signature, "approval:") {
+		t.Errorf("signature = %q, want an approval signature", esc[0].Signature)
+	}
+	if strings.Contains(esc[0].Rationale, "over_masked") {
+		t.Errorf("picker must not be dismissed as over_masked: %+v", esc[0])
+	}
+	if len(h.herdr.sentInputs()) != 0 || len(h.herdr.keysSent()) != 0 {
+		t.Fatal("a first sighting must escalate, not answer")
+	}
+}
+
+// A graduated rule answers the picker adaptively via verified keystrokes —
+// here the caret-only binding: the digit moves ❯, Enter commits. The learned
+// LABEL is what history stores; the live digit is derived per delivery.
+func TestAutoActDeliversRemoteEnvSelectionAdaptively(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(remoteEnvPane)
+	h.seedAutonomous(remoteEnvPane, domain.SituationApproval, "Full-access (env_011CUW5BKtc4vkq5q1uSp7MY)")
+	h.herdr.mu.Lock()
+	h.herdr.keyScript = []string{"3", "enter"}
+	h.herdr.keyScriptFrames = []string{remoteEnvPaneCaret3, remoteEnvClosedPane}
+	h.herdr.mu.Unlock()
+
+	h.push("agent-env-auto", "idle")
+
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.keysSent()) == 2 })
+	if got := strings.Join(h.herdr.keysSent(), ","); got != "3,enter" {
+		t.Errorf("keys = %q, want \"3,enter\"", got)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("the picker must be answered with keystrokes, not a text send: %v", h.herdr.sentInputs())
+	}
+	audits, err := h.raw.AuditLog(context.Background(), 10)
+	if err != nil || len(audits) == 0 {
+		t.Fatalf("audit log: %v %v", audits, err)
+	}
+	if audits[0].Status != "auto" || !strings.HasPrefix(audits[0].Input, "Full-access") {
+		t.Errorf("audit record mismatch: %+v", audits[0])
+	}
+}
+
+// The cross-project backstop end to end: the picker's approval signature is
+// global (verb-only), so a rule learned on another project's environment list
+// resolves here — and its label matches nothing on the live menu. Delivery
+// must refuse before any keystroke and flip the audit to escalated.
+func TestAutoActRemoteEnvUnknownLabelEscalates(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(remoteEnvPane)
+	h.seedAutonomous(remoteEnvPane, domain.SituationApproval, "other-project (env_01ZZZZZZZZZZZZZZZZZZZZZZZZ)")
+
+	h.push("agent-env-x", "idle")
+
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(context.Background(), 10)
+		return len(audits) > 0 && audits[0].Status == "escalated"
+	})
+	if got := h.herdr.keysSent(); len(got) != 0 {
+		t.Fatalf("no keystroke may be sent for an unmappable label, got %v", got)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("no text may be sent for an unmappable label")
+	}
+}
+
+// The LLM promotion path answers the picker through the same adaptive
+// deliverer — here the digit-commits binding (no Enter needed).
+func TestLLMPromotionDeliversRemoteEnvSelection(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(remoteEnvPane)
+	h.herdr.mu.Lock()
+	h.herdr.keyScript = []string{"2"}
+	h.herdr.keyScriptFrames = []string{remoteEnvClosedPane}
+	h.herdr.mu.Unlock()
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "myspec-monorepo (env_01CASfztpZp7mYRJPK41sGvK)", Rationale: "project default",
+			ConfidentScore: 90, Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID,
+			Action:    "myspec-monorepo (env_01CASfztpZp7mYRJPK41sGvK)",
+			Rationale: "project default", ConfidentScore: 90, Status: "pending"}, nil
+	}
+
+	h.push("agent-env-llm", "idle")
+
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.keysSent()) == 1 })
+	if got := h.herdr.keysSent()[0]; got != "2" {
+		t.Errorf("key = %q, want the live menu digit \"2\"", got)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("the picker must be answered with keystrokes, not a text send: %v", h.herdr.sentInputs())
+	}
+}
+
+// A keystroke-less adapter must fail CLOSED on the picker: the plain text
+// send would type the literal label + Enter, and under the caret binding
+// Enter commits whatever option the caret rests on — so the daemon escalates
+// instead of falling through.
+func TestAutoActRemoteEnvWithoutKeystrokesEscalates(t *testing.T) {
+	h := newHarnessWrapped(t, "", func(f *fakeHerdr) ports.HerdrPort {
+		return inspectorlessHerdr{f}
+	})
+	h.herdr.setPane(remoteEnvPane)
+	h.seedAutonomous(remoteEnvPane, domain.SituationApproval, "Full-access (env_011CUW5BKtc4vkq5q1uSp7MY)")
+
+	h.push("agent-env-nokeys", "idle")
+
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(context.Background())
+		return len(esc) == 1
+	})
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatalf("no text may be sent without verified keystrokes, sent %v", h.herdr.sentInputs())
+	}
+	if len(h.herdr.keysSent()) != 0 {
+		t.Fatalf("no keystroke path exists on this adapter, sent %v", h.herdr.keysSent())
+	}
+}

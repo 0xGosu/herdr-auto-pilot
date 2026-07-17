@@ -26,7 +26,7 @@ if `hap` is already on `PATH`, use it directly.
 
 **situation types** — the plugin classifies agent states into four types:
 - `idle` — agent finished and is waiting for the next prompt
-- `approval` — agent is asking for permission (e.g. tool approval)
+- `approval` — agent is asking for permission (e.g. tool approval; also structural forms herdr reports as idle, like Codex's Plan approval and Claude's "Select remote environment" picker for remote sub-agents)
 - `choice` — agent presents a multiple-choice question
 - `error` — agent hit an error and is waiting for guidance
 
