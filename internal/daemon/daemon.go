@@ -2582,24 +2582,6 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		}
 	}
 
-	// The operator may disable the agent while a consult is running. Let all
-	// rejection paths above raise their normal (auto-dismissed) escalation,
-	// but stop a promotable action here before any audit-as-auto or pane send.
-	if disabled, err := d.opt.Store.AgentDisabled(ctx, s.AgentID); err != nil {
-		reject(domain.ReasonPersistenceFailed, "disabled-state read after LLM consult: "+err.Error())
-		return
-	} else if disabled {
-		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
-		var llmConf *int
-		if llmDec.ConfidentScore >= 0 {
-			llmConf = &llmDec.ConfidentScore
-		}
-		d.auditAgentDisabled(ctx, s, res.sig, tr, llmDec.Action,
-			domain.Confidence(history, cfg.Learning.ConfirmationWeight).Score,
-			llmConf, llmDec.CapturedOutput, now)
-		return
-	}
-
 	// Both scores land on the auto-acted audit row: the computed 0-1 agreement
 	// over this signature's history AND the LLM's self-reported 0-100 (>= 0
 	// here — a lower score would have escalated at the gate above).
@@ -2611,43 +2593,52 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		// staleness re-read is skipped on purpose: it exists solely to
 		// prevent stale *injections*, a stale noop is harmless, and
 		// rejecting it would recreate the very escalation noise the noop
-		// resolves. Audit-before-act still applies (FR-024).
-		if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-			AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
-			SituationType: s.Type, Action: "noop", Input: "",
-			Confidence: computedConf, LLMConfidence: &llmConf,
-			Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
-			Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
-		}); err != nil {
-			slog.Error("audit write failed; blocking LLM noop (FR-024)", "error", err)
-			d.notify(ctx, "Herd Auto Prompter: persistence failure",
-				"An LLM-derived no-op was blocked because its audit record could not be written.")
-			return
-		}
-		if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "accepted"); err != nil {
-			slog.Error("llm decision status update failed", "error", err)
-		}
-		if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
-			Signature: res.sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-			ChosenAction: domain.ActionNoop, Source: domain.SourceLLM, CreatedAt: now,
-		}); err != nil {
-			slog.Error("decision record write failed", "error", err)
-		}
-		// The runaway counter still advances (D3): a self-flapping agent
-		// must not consult-and-noop silently forever. lastAutoSend stays
-		// untouched (nothing was sent); lastAutoNoop is stamped so a
-		// self-resuming flap does not reset that counter.
-		if rate2, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
-			updated := domain.RegisterAutoPrompt(*rate2, now)
-			updated.AgentID = s.AgentID
-			if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
-				slog.Error("agent rate update failed", "error", err)
+		// resolves. Audit-before-act still applies (FR-024), and the final
+		// lifecycle barrier prevents learning or rate advancement after disable.
+		executed := d.withAgentAutomation(ctx, s, res.sig, tr, "",
+			computedConf, &llmConf, llmDec.CapturedOutput, now, func() {
+				if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+					AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
+					SituationType: s.Type, Action: "noop", Input: "",
+					Confidence: computedConf, LLMConfidence: &llmConf,
+					Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
+					Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+				}); err != nil {
+					slog.Error("audit write failed; blocking LLM noop (FR-024)", "error", err)
+					d.notify(ctx, "Herd Auto Prompter: persistence failure",
+						"An LLM-derived no-op was blocked because its audit record could not be written.")
+					return
+				}
+				if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "accepted"); err != nil {
+					slog.Error("llm decision status update failed", "error", err)
+				}
+				if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
+					Signature: res.sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
+					ChosenAction: domain.ActionNoop, Source: domain.SourceLLM, CreatedAt: now,
+				}); err != nil {
+					slog.Error("decision record write failed", "error", err)
+				}
+				// The runaway counter still advances (D3): a self-flapping agent
+				// must not consult-and-noop silently forever. lastAutoSend stays
+				// untouched (nothing was sent); lastAutoNoop is stamped so a
+				// self-resuming flap does not reset that counter.
+				if rate2, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
+					updated := domain.RegisterAutoPrompt(*rate2, now)
+					updated.AgentID = s.AgentID
+					if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
+						slog.Error("agent rate update failed", "error", err)
+					}
+				}
+				d.mu.Lock()
+				d.lastAutoNoop[s.AgentID] = now
+				d.mu.Unlock()
+				slog.Info("LLM noop accepted: no reply sent", "agent", s.AgentID)
+			})
+		if !executed {
+			if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected"); err != nil {
+				slog.Error("llm decision status update failed", "error", err)
 			}
 		}
-		d.mu.Lock()
-		d.lastAutoNoop[s.AgentID] = now
-		d.mu.Unlock()
-		slog.Info("LLM noop accepted: no reply sent", "agent", s.AgentID)
 		return
 	}
 
