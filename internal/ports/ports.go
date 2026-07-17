@@ -274,11 +274,11 @@ type ReadStore interface {
 	// CountPendingEscalations counts pending escalations without fetching
 	// the (pane-excerpt-heavy) rows.
 	CountPendingEscalations(ctx context.Context) (int64, error)
-	// DuplicatePendingEscalation reports whether an unresolved escalation
-	// already exists for the same agent + agent type + situation type +
-	// exact pane excerpt — the daemon's live-event dedup key.
-	DuplicatePendingEscalation(ctx context.Context, agentID, agentType string,
-		sitType domain.SituationType, paneExcerpt string) (bool, error)
+	// PendingEscalationExcerpts returns the pane excerpts of every escalation
+	// still awaiting the operator for this agent + agent type (any age) — the
+	// candidate set for the daemon's duplicate-ask check. The excerpt
+	// comparison itself lives in domain.DuplicatesPendingEscalation.
+	PendingEscalationExcerpts(ctx context.Context, agentID, agentType string) ([]domain.PendingEscalation, error)
 	UnprocessedCorrections(ctx context.Context) ([]domain.CorrectionRecord, error)
 	// UnprocessedLLMRetries returns queued LLM-retry requests in order.
 	UnprocessedLLMRetries(ctx context.Context) ([]domain.LLMRetry, error)

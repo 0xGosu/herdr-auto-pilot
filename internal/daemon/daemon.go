@@ -754,36 +754,53 @@ func (d *Daemon) hasOpenEscalation(ctx context.Context, agentID string) bool {
 	return false
 }
 
-// duplicatePendingEscalation reports whether the captured situation exactly
-// matches an escalation the user has not yet handled. It is the content-level
-// sibling of hasOpenEscalation (which is pane/agent-level and used by the
-// reconcile sweep): finer, so a genuinely new situation on a pane that already
-// has an open escalation still gets processed. The pane excerpt is truncated
-// exactly as escalate() stores it so the comparison lines up.
+// duplicatePendingEscalation reports whether the captured situation repeats an
+// escalation the operator has not yet handled — so re-raising it would ask the
+// same question twice. Herdr re-delivers an attention event for one agent after
+// a delay (the agent flips done->idle when the operator reads the pane), and
+// the exact-string check it replaces missed those re-fires because the pane's
+// volatile chrome (a spinner tick, an elapsed/countdown counter) had moved on.
+//
+// The key is agent + agent type + the NORMALIZED pane content
+// (domain.NormalizeForDedup elides that chrome). The agent status is
+// deliberately excluded — it is the field that legitimately CHANGES between the
+// duplicates — and so are trigger() (which embeds it) and situation_type (which
+// the classifier DERIVES from it). See domain.DuplicatesPendingEscalation.
+//
+// It runs only where escalations are raised (escalate() and the
+// pane-read-failure path), NOT before the decision core: the rate guard, retry
+// ceiling, and shadow-mode learning all work by re-processing repeated
+// identical events, so suppressing those would bypass a safety control.
+//
+// It is the content-level sibling of hasOpenEscalation (which is
+// pane/agent-level and used by the reconcile sweep): finer, so a genuinely new
+// situation on a pane that already has an open escalation still gets processed.
+// The pane excerpt is truncated exactly as the write paths store it so the
+// comparison lines up.
 //
 // Fails OPEN (returns false) on a store error — the opposite of
 // hasOpenEscalation. Dropping a real event silently is worse than
-// re-processing one, so on doubt the event proceeds to escalate/act rather
-// than being ignored (the "never a silent drop" architecture rule).
+// re-processing one, so on doubt the event proceeds to escalate rather than
+// being ignored (the "never a silent drop" architecture rule).
 func (d *Daemon) duplicatePendingEscalation(ctx context.Context, s domain.Situation) bool {
-	dup, err := d.opt.Store.DuplicatePendingEscalation(ctx, s.AgentID, s.AgentType,
-		s.Type, truncateTailRunes(s.Content, snapshotMaxRunes))
+	pending, err := d.opt.Store.PendingEscalationExcerpts(ctx, s.AgentID, s.AgentType)
 	if err != nil {
 		slog.Warn("duplicate-escalation check failed; processing event",
 			"agent", s.AgentID, "pane", s.PaneID, "error", err)
 		return false
 	}
-	return dup
+	return domain.DuplicatesPendingEscalation(s.Type,
+		truncateTailRunes(s.Content, snapshotMaxRunes), pending)
 }
 
-// ignoreDuplicate audits a no-op for an event whose situation already has an
-// identical pending escalation awaiting the operator. Shared by escalate() and
+// ignoreDuplicate audits a no-op for an event whose situation already has a
+// matching pending escalation awaiting the operator. Shared by escalate() and
 // the pane-read-failure path so both routes record duplicates the same way.
 func (d *Daemon) ignoreDuplicate(ctx context.Context, s domain.Situation,
 	tr domain.AgentTransition, now time.Time) {
 	d.audit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
-		SituationType: s.Type, Action: "ignored", Status: "ignored",
+		SituationType: s.Type, Action: "ignored", Status: domain.AuditStatusIgnored,
 		Rationale:   "duplicated event",
 		PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
 		CreatedAt:   now,
@@ -814,8 +831,9 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 		// This escalation bypasses escalate() (no pane to classify), so apply
 		// the same dedup here: a persistent outage delivers the same blocked
 		// event repeatedly and must not pile up identical pending rows. The
-		// unreadable pane has no excerpt, so the key collapses to agent + type
-		// + unclassifiable — exactly matching the row this path writes.
+		// unreadable pane has no excerpt, so the empty-content fallback in
+		// domain.DuplicatesPendingEscalation keys on the situation type, which
+		// keeps this from matching a pending escalation of a different kind.
 		failed := domain.Situation{
 			AgentID: tr.AgentID, AgentType: tr.AgentType, PaneID: tr.PaneID,
 			Type: domain.SituationUnclassifiable,
@@ -1351,16 +1369,16 @@ func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain
 func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
 
-	// Dedup: if this exact situation is already awaiting the user in the
-	// pending-escalation queue (same agent + type + situation type + pane
-	// content), re-raising it would just be a duplicate ask. Ignore the event
-	// (no ops) and record why. Gating here rather than before decideAndAct
-	// means only a would-be duplicate ESCALATION is suppressed — a situation
-	// that can now auto-answer (e.g. after a kill-switch resume) still acts.
-	// escalate() is where almost every escalation is born, so this also caps
-	// escalation storms from the async LLM/rewrite/taskgen rejection paths.
-	// (The one escalation that bypasses escalate() — the pane-read-failure
-	// path in handleAttention — is dedup'd there directly.)
+	// Dedup: if this situation is already awaiting the user in the
+	// pending-escalation queue, re-raising it would just be a duplicate ask.
+	// Ignore the event (no ops) and record why. Gating here rather than before
+	// decideAndAct means only a would-be duplicate ESCALATION is suppressed — a
+	// situation that can now auto-answer (e.g. after a kill-switch resume) still
+	// acts, and the rate guard / retry ceiling still see every repeated
+	// identical event. escalate() is where almost every escalation is born, so
+	// this also caps escalation storms from the async LLM/rewrite/taskgen
+	// rejection paths. (The one escalation that bypasses escalate() — the
+	// pane-read-failure path in handleAttention — is dedup'd there directly.)
 	if d.duplicatePendingEscalation(ctx, s) {
 		d.ignoreDuplicate(ctx, s, tr, now)
 		return
@@ -2716,8 +2734,8 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) bool {
 	// The retry is now accepted: its consult is not competing with an
 	// in-flight one and its agent still has a live pane. Retire the source
 	// escalation before scheduling the recapture. This removes the stale
-	// failure from the pending list and prevents duplicatePendingEscalation
-	// from mistaking the explicitly requested retry for a duplicate of itself.
+	// failure from the pending list and prevents the duplicate check from
+	// mistaking the explicitly requested retry for a duplicate of itself.
 	// A retry failure writes a fresh retryable escalation; a successful LLM
 	// result writes a fresh llm_retry escalation for operator review.
 	retired, err := d.opt.Store.RetireEscalationForRetry(ctx, r.AuditID)

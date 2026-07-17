@@ -30,7 +30,7 @@ import (
 // agent still blocked. It is distinct from the decision-audit statuses
 // ("auto"/"escalated"/"resolved"/"dismissed") so it shows plainly in
 // `hap audit` without matching the pending-escalation filters.
-const StatusFailed = "delivery_failed"
+const StatusFailed = domain.AuditStatusDeliveryFailed
 
 // reasonStillBlocked prefixes the failure Rationale (mirrors the daemon's
 // bracketed reason convention).
