@@ -1875,6 +1875,59 @@ func TestSignatureRowTotalDecisionsIgnoresResetFloor(t *testing.T) {
 	}
 }
 
+func TestConfidenceLabelDashWhenNeverScored(t *testing.T) {
+	// 0.00 is unreachable as a real agreement score — it is topWeight/total over
+	// a non-empty history, so it is always strictly positive. A stored 0 can
+	// therefore only mean "the core never scored this", and rendering it as
+	// "0.00" says the opposite: measured, and found no confidence.
+	tests := []struct {
+		name string
+		conf float64
+		want string
+	}{
+		{"never scored", 0, "-"},
+		// Recency decay bounds the weight total, so a real score never lands
+		// near zero: ~0.15 is about the floor and 0.24 is the lowest ever seen
+		// in the wild. Nothing genuine gets close to rounding to "0.00".
+		{"about the real floor", 0.15, "0.15"},
+		{"lowest score actually observed in the wild", 0.24, "0.24"},
+		{"contradictory but measured", 0.45, "0.45"},
+		{"unanimous", 1, "1.00"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := frontend.ConfidenceLabel(tc.conf); got != tc.want {
+				t.Errorf("ConfidenceLabel(%v) = %q, want %q", tc.conf, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRuleSummaryShowsDashForUnscoredRule(t *testing.T) {
+	// A rule reset to re-earn trust has no post-reset evidence, so its live
+	// score is 0 — "confidence -" says "not scored yet", where "confidence 0.00"
+	// would claim the rule was measured and found worthless.
+	reset := signatureRowFor(domain.ModeShadow, 0, "1")
+	if s := frontend.RuleSummary(reset, 3); !strings.Contains(s, "confidence -") {
+		t.Errorf("a reset rule's summary must read \"confidence -\", got %q", s)
+	}
+	scored := signatureRowFor(domain.ModeShadow, 0.45, "1")
+	if s := frontend.RuleSummary(scored, 3); !strings.Contains(s, "confidence 0.45") {
+		t.Errorf("a measured rule keeps its number, got %q", s)
+	}
+}
+
+// signatureRowFor builds a display row for rule-summary assertions.
+func signatureRowFor(mode domain.Mode, conf float64, top string) frontend.SignatureRow {
+	return frontend.SignatureRow{
+		SignatureState: domain.SignatureState{
+			Signature: "approval:x", SituationType: domain.SituationApproval,
+			Mode: mode, ConsecutiveConfirmations: 1,
+		},
+		Confidence: conf, TopAction: top, Decisions: 0,
+	}
+}
+
 func TestSignatureDetail(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()

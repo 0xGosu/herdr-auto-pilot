@@ -117,8 +117,17 @@ func TestAuditAndEscalationRenderLLMConfidence(t *testing.T) {
 	esc := m.View()
 	assertLineOrder(t, esc, "ID", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "RATIONALE / SUGGESTION")
 	assertLineOrder(t, esc, "#3", "#3", "approval", "claude", "patient-lemur", "85", "shadow", "0.25", "low")
-	if !strings.Contains(esc, "  - ") || !strings.Contains(esc, "0.00") {
-		t.Errorf("escalation without scores should show empty LLM and zero computed confidence:\n%s", esc)
+	// #4 carries neither score: the LLM never ran, and the core never scored it
+	// (no learned history yet). Every column on this row renders a dash, so the
+	// CONF cell is pinned by its adjacency to the rationale — CONF is the last
+	// field before it. A bare Contains(esc, "-") would pass on any of the other
+	// dashes and prove nothing.
+	assertLineOrder(t, esc, "#4", "#4", "approval", "-  shadow")
+	// "0.00" would claim the rule was measured and found worthless — the
+	// opposite of "not measured", and unreachable anyway: agreement over any
+	// real history is always above zero.
+	if strings.Contains(esc, "0.00") {
+		t.Errorf("an unscored escalation must never render CONF as 0.00:\n%s", esc)
 	}
 }
 

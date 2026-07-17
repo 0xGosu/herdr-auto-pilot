@@ -2657,7 +2657,7 @@ func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int, op
 	lines = m.detailField(lines, w, "Situation", string(r.SituationType))
 	lines = m.detailField(lines, w, "Agent", agent)
 	lines = m.detailField(lines, w, "Agent type", m.agentTypeFor(r))
-	lines = m.detailField(lines, w, "Confidence", fmt.Sprintf("%.2f", r.Confidence))
+	lines = m.detailField(lines, w, "Confidence", frontend.ConfidenceLabel(r.Confidence))
 	if r.LLMConfidence != nil {
 		lines = m.detailField(lines, w, "LLM confidence",
 			fmt.Sprintf("%d/100", *r.LLMConfidence))
@@ -2854,7 +2854,7 @@ func (m Model) signatureDetailLines(row frontend.SignatureRow, history []domain.
 	lines = m.detailField(lines, w, "Agent type", orDash(row.AgentType))
 	lines = m.detailField(lines, w, "Mode", string(row.Mode))
 	lines = m.detailField(lines, w, "Streak", fmt.Sprintf("%d/%d confirmations toward graduation", row.ConsecutiveConfirmations, graduationN))
-	lines = m.detailField(lines, w, "Confidence", fmt.Sprintf("%.2f", row.Confidence))
+	lines = m.detailField(lines, w, "Confidence", frontend.ConfidenceLabel(row.Confidence))
 	if row.TopAction != "" {
 		lines = m.detailField(lines, w, "Top action", fmt.Sprintf("%q over %d decision(s)", row.TopAction, row.Decisions))
 	}
@@ -3481,7 +3481,7 @@ func (m Model) renderSignatures(b *strings.Builder) {
 		r := sigs[i]
 		line := fmt.Sprintf(rulesRowFmt,
 			sigW, r.Signature, r.SituationType, orDash(r.AgentType),
-			fmt.Sprintf("%.2f", r.Confidence), r.Mode,
+			frontend.ConfidenceLabel(r.Confidence), r.Mode,
 			fmt.Sprintf("%d/%d", r.ConsecutiveConfirmations, gradN),
 			oneLine(r.TopAction, actWidth))
 		switch {
@@ -3670,7 +3670,7 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		line := fmt.Sprintf(escRowFmt,
 			mark, fmt.Sprintf("#%d", e.ID), e.CreatedAt.Format("15:04:05"), e.SituationType,
 			oneLine(orDash(m.agentTypeFor(e)), 8), oneLine(agent, 14),
-			llmConfShort(e.LLMConfidence), m.ruleMarker(e.Signature), fmt.Sprintf("%.2f", e.Confidence),
+			llmConfShort(e.LLMConfidence), m.ruleMarker(e.Signature), frontend.ConfidenceLabel(e.Confidence),
 			oneLine(e.Rationale, rWidth))
 		if e.Suggestion != "" {
 			line += "  → " + oneLine(e.Suggestion, sWidth)
@@ -3694,8 +3694,9 @@ func (m Model) renderAudit(b *strings.Builder) {
 		return
 	}
 	// The final Action column takes the remaining width after these fixed
-	// columns. Conf is the computed 0-1 agreement; LLM is the consulting
-	// model's self-reported 0-100 ("-" when the row has no LLM score).
+	// columns. Conf is the computed 0-1 agreement ("-" when the row was never
+	// scored — see frontend.ConfidenceLabel); LLM is the consulting model's
+	// self-reported 0-100 ("-" when the row has no LLM score).
 	const auditRowFmt = "%-6s %-14s %-10s %-8s %-14s %4s %-6s %5s %-9s  %s"
 	actWidth, _ := m.budget(86, false)
 	header := fmt.Sprintf(auditRowFmt,
@@ -3711,7 +3712,7 @@ func (m Model) renderAudit(b *strings.Builder) {
 		line := fmt.Sprintf(auditRowFmt,
 			fmt.Sprintf("#%d", r.ID), r.CreatedAt.Format("01-02 15:04:05"),
 			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), 14),
-			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), fmt.Sprintf("%.2f", r.Confidence), r.Status,
+			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), frontend.ConfidenceLabel(r.Confidence), r.Status,
 			oneLine(r.Action, actWidth))
 		if i == m.cursors[m.tab] {
 			line = m.styles().selected.Render(line)

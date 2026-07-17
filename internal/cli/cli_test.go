@@ -353,10 +353,12 @@ func TestSignaturesList(t *testing.T) {
 		t.Fatal(err)
 	}
 	// conf= is the LIVE score, never the cached snapshot the fixture seeds:
-	// approval is unanimous over 2 decisions (live 1.00, cached 0.75) and choice
-	// has no decisions at all (live 0.00, cached 0.92).
+	// approval is unanimous over 2 decisions (live 1.00, cached 0.75) so it
+	// reads 1.00, while choice has no decisions at all — never scored, so "-"
+	// rather than a 0.00 that would look like measured no-confidence (its
+	// cached 0.92 must not surface either).
 	for _, want := range []string{"approval:aaaa111…", "choice:cccc3333", "shadow", "autonomous", "3/2", "top=\"1\"",
-		"conf=1.00", "conf=0.00", "2 signature(s)"} {
+		"conf=1.00", "conf=-", "2 signature(s)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("list output missing %q:\n%s", want, out)
 		}
@@ -646,12 +648,31 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 		t.Errorf("embed-failure escalation should show the error, got:\n%s", out)
 	}
 
+	// A rule-less row that WAS scored: the core scores live history, which can
+	// exist before the rule row does, so this must keep its number.
+	st.AppendAudit(context.Background(), domain.AuditRecord{Signature: "error:7777cccc",
+		Trigger: "boom", SituationType: domain.SituationError, Action: "escalated",
+		Rationale: "scored before any rule existed", Status: "escalated", Confidence: 0.91,
+		CreatedAt: time.Now()})
+
 	out, err = run(t, app, "audit")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out, "rule=shadow") || !strings.Contains(out, "rule=-") {
 		t.Errorf("audit rows should carry the rule mode marker (or dash), got:\n%s", out)
+	}
+	// A decision that was never scored reads "-", never "0.00" — the latter
+	// looks like measured no-confidence.
+	if !strings.Contains(out, "conf=-") {
+		t.Errorf("an unscored audit row should read conf=-, got:\n%s", out)
+	}
+	if strings.Contains(out, "conf=0.00") {
+		t.Errorf("an unscored row must never render as 0.00, got:\n%s", out)
+	}
+	// A recorded score is a snapshot and always renders, rule or no rule.
+	if !strings.Contains(out, "conf=0.91") {
+		t.Errorf("a scored row must keep its number even with no rule, got:\n%s", out)
 	}
 }
 

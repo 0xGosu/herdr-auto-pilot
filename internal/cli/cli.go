@@ -239,9 +239,9 @@ func signaturesList(ctx context.Context, app *frontend.App, out io.Writer, args 
 	}
 	graduationN := graduationN(app)
 	for _, r := range rows {
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d/%d\tconf=%.2f\ttop=%q\t%s\n",
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d/%d\tconf=%s\ttop=%q\t%s\n",
 			shortSignature(r.Signature), r.SituationType, orDash(r.AgentType), r.Mode,
-			r.ConsecutiveConfirmations, graduationN, r.Confidence,
+			r.ConsecutiveConfirmations, graduationN, frontend.ConfidenceLabel(r.Confidence),
 			r.TopAction, r.UpdatedAt.Format("01-02 15:04:05"))
 	}
 	fmt.Fprintf(out, "\n%d signature(s); inspect with: signatures show <prefix>\n", len(rows))
@@ -381,8 +381,8 @@ func signaturesReset(ctx context.Context, app *frontend.App, out io.Writer, args
 func printSignatureRow(out io.Writer, r frontend.SignatureRow, graduationN int) {
 	fmt.Fprintf(out, "signature:   %s\n", r.Signature)
 	fmt.Fprintf(out, "situation:   %s\tagent type: %s\n", r.SituationType, orDash(r.AgentType))
-	fmt.Fprintf(out, "mode:        %s\tstreak: %d/%d\tconfidence: %.2f\n",
-		r.Mode, r.ConsecutiveConfirmations, graduationN, r.Confidence)
+	fmt.Fprintf(out, "mode:        %s\tstreak: %d/%d\tconfidence: %s\n",
+		r.Mode, r.ConsecutiveConfirmations, graduationN, frontend.ConfidenceLabel(r.Confidence))
 	fmt.Fprintf(out, "top action:  %q over %d decision(s)\n", r.TopAction, r.Decisions)
 	fmt.Fprintf(out, "updated:     %s\n", r.UpdatedAt.Format(time.RFC3339))
 }
@@ -663,9 +663,9 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if row, ok := rules[r.Signature]; ok {
 			rule = string(row.Mode)
 		}
-		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%.2f\tllm=%s\trule=%s\t%s\n",
+		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%s\tllm=%s\trule=%s\t%s\n",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
-			r.Action, r.Confidence, llmConfCLI(r.LLMConfidence), rule, r.Rationale)
+			r.Action, frontend.ConfidenceLabel(r.Confidence), llmConfCLI(r.LLMConfidence), rule, r.Rationale)
 	}
 	return nil
 }

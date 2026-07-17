@@ -1193,6 +1193,64 @@ func appModel(t *testing.T) (Model, *frontend.App, *store.Store) {
 	return m, app, st
 }
 
+func TestEscalationsAndAuditTabsRenderDashForUnscoredRows(t *testing.T) {
+	// End-to-end through both tabs' renderers. The fixture deliberately fills
+	// every OTHER column that can emit a dash (agent type, LLM score, and a
+	// matched rule), so the dash following "shadow" can only be CONF — a bare
+	// Contains(view, "-") would pass on orDash'd columns, llmConfShort, or even
+	// the audit timestamp's own hyphens, and would keep passing if CONF
+	// regressed to "" or "0.0".
+	score := 85
+	sig := "idle:known"
+	at := time.Date(2026, 7, 9, 11, 0, 0, 0, time.UTC)
+	m := Model{width: 140, height: 30}
+	upd, _ := m.Update(refreshMsg{
+		status: frontend.Status{AgentNames: map[string]string{"w6:p1": "brave-otter"}},
+		escalations: []domain.AuditRecord{
+			{ID: 51, AgentID: "w6:p1", AgentType: "claude", SituationType: domain.SituationIdle,
+				Status: "escalated", Confidence: 0, LLMConfidence: &score,
+				Rationale: "unscored", Signature: sig, CreatedAt: at},
+			{ID: 52, AgentID: "w6:p1", AgentType: "claude", SituationType: domain.SituationIdle,
+				Status: "escalated", Confidence: 0.45, LLMConfidence: &score,
+				Rationale: "measured", Signature: sig, CreatedAt: at},
+		},
+		audit: []domain.AuditRecord{
+			{ID: 53, AgentID: "w6:p1", AgentType: "claude", SituationType: domain.SituationIdle,
+				Status: "escalated", Confidence: 0, LLMConfidence: &score, Action: "esc",
+				Rationale: "unscored", Signature: sig, CreatedAt: at},
+			{ID: 54, AgentID: "w6:p1", AgentType: "claude", SituationType: domain.SituationIdle,
+				Status: "escalated", Confidence: 0.45, LLMConfidence: &score, Action: "esc",
+				Rationale: "measured", Signature: sig, CreatedAt: at},
+		},
+		signatures: []frontend.SignatureRow{
+			{SignatureState: domain.SignatureState{
+				Signature: sig, SituationType: domain.SituationIdle,
+				Mode: domain.ModeShadow, UpdatedAt: at},
+				Confidence: 0.45, TopAction: "1", Decisions: 2},
+		},
+		cfg: config.Default(),
+	})
+	m = upd.(Model)
+
+	// Escalations: CONF is the field between the RULE marker and the rationale.
+	m.tab = tabEscalations
+	esc := m.View()
+	assertLineOrder(t, esc, "#51", "#51", "idle", "claude", "brave-otter", "85", "shadow", "-", "unscored")
+	assertLineOrder(t, esc, "#52", "#52", "idle", "claude", "brave-otter", "85", "shadow", "0.45", "measured")
+	if strings.Contains(esc, "0.00") {
+		t.Errorf("an unscored escalation must never render CONF as 0.00:\n%s", esc)
+	}
+
+	// Audit: CONF sits between the RULE marker and STATUS.
+	m.tab = tabAudit
+	audit := m.View()
+	assertLineOrder(t, audit, "#53", "#53", "idle", "claude", "brave-otter", "85", "shadow", "-", "escalated")
+	assertLineOrder(t, audit, "#54", "#54", "idle", "claude", "brave-otter", "85", "shadow", "0.45", "escalated")
+	if strings.Contains(audit, "0.00") {
+		t.Errorf("an unscored audit row must never render CONF as 0.00:\n%s", audit)
+	}
+}
+
 func TestSignaturesTabRendersRows(t *testing.T) {
 	m := testModel(t)
 	m.tab = tabSignatures

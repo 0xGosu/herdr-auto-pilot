@@ -2268,12 +2268,33 @@ type SignatureRow struct {
 	PaneExcerpt string
 }
 
+// ConfidenceLabel renders an agreement score for operators, or "-" when there
+// is no score: 0 means the decision core never scored it — a situation met
+// before it had any learned history, a rule reset to re-earn trust, or a row
+// (such as a correction) that carries no core score at all.
+//
+// 0.00 is unreachable as a real result, which is what makes the test exact
+// rather than a heuristic: agreement is topWeight/total, the newest decision
+// always contributes a weight of at least 1, and recency decay bounds the total,
+// so every genuine score is comfortably above zero (in practice no lower than
+// ~0.15 — the lowest ever observed in the wild is 0.24). Confidence() returns
+// the zero value ONLY for empty history. So a rendered "0.00" always meant "not
+// measured", while reading as "measured, and found no confidence" — the
+// opposite. Every CONF an operator sees (escalations, audit, rules — TUI and
+// CLI) goes through here so the wording cannot drift.
+func ConfidenceLabel(conf float64) string {
+	if conf == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.2f", conf)
+}
+
 // RuleSummary renders a one-line description of the learned rule backing a
 // signature, for escalation/audit views (TUI detail and CLI share the
 // wording so operators see the same rule either way).
 func RuleSummary(row SignatureRow, graduationN int) string {
-	s := fmt.Sprintf("%s — %d/%d confirmations, confidence %.2f",
-		row.Mode, row.ConsecutiveConfirmations, graduationN, row.Confidence)
+	s := fmt.Sprintf("%s — %d/%d confirmations, confidence %s",
+		row.Mode, row.ConsecutiveConfirmations, graduationN, ConfidenceLabel(row.Confidence))
 	if row.TopAction != "" {
 		s += fmt.Sprintf(", top action %q over %d decision(s)", row.TopAction, row.Decisions)
 	}
