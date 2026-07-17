@@ -795,6 +795,35 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 			markSent()
 			return a.nudge(ctx, control.KindReload)
 		}
+		// Claude's remote-environment picker commits per an unverified
+		// protocol (the digit may only move the caret), so a standing picker
+		// is answered via the adaptive keystroke deliverer. A keystroke-less
+		// adapter falls through to the plain digit + Enter send below ONLY
+		// when the reply maps to a live option — an unmappable label would be
+		// typed literally and its Enter could commit whatever option the
+		// caret rests on (launching the wrong cloud environment), so that
+		// case fails closed even on an operator's explicit confirm.
+		if rerr == nil && audit.SituationType == domain.SituationApproval &&
+			strings.EqualFold(audit.AgentType, "claude") {
+			if form, isRemoteEnv := domain.ClaudeRemoteEnvForm(pane); isRemoteEnv {
+				if ks, ok := a.Herdr.(ports.KeystrokeSender); ok {
+					if err := mcqdeliver.ClaudeRemoteEnv(ctx, mcqdeliver.Config{
+						Keys:      ks,
+						Read:      a.readVisiblePane,
+						PaneID:    audit.AgentID,
+						ReadLines: menuReadLines,
+						KeyDelay:  seriesKeyDelay,
+					}, outbound); err != nil {
+						return fmt.Errorf("correction recorded, but %w", err)
+					}
+					markSent()
+					return a.nudge(ctx, control.KindReload)
+				}
+				if _, mapped := domain.MenuKeystrokeFrom(form.Options, domain.TrimRemoteEnvCheck(outbound)); !mapped {
+					return fmt.Errorf("correction recorded, but %q matches none of the offered environments and this herdr adapter cannot send verified keystrokes", outbound)
+				}
+			}
+		}
 		if rerr == nil {
 			outbound = domain.DeliverKeystroke(audit.SituationType, audit.AgentType, pane, outbound)
 		}

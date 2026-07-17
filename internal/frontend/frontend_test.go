@@ -3211,3 +3211,137 @@ func TestRemoveTaskSourceKeepsChecklistFile(t *testing.T) {
 		t.Errorf("checklist file must be untouched, got %q", data)
 	}
 }
+
+// --- Claude "Select remote environment" picker ---
+
+const frontRemoteEnvPane = `   Select remote environment
+
+   Configure environments at: https://claude.ai/code
+
+   ❯ 1. herdr-auto-pilot (env_01F41H1jxkGrT2zj55CqE4WQ) ✔
+     2. myspec-monorepo (env_01CASfztpZp7mYRJPK41sGvK)
+     3. Full-access (env_011CUW5BKtc4vkq5q1uSp7MY)
+     4. Default (env_011CUKn5Aj1q6ujg5PFvEhTE)
+
+   Enter to select · Esc to cancel
+`
+
+const frontRemoteEnvPaneCaret4 = `   Select remote environment
+
+   Configure environments at: https://claude.ai/code
+
+     1. herdr-auto-pilot (env_01F41H1jxkGrT2zj55CqE4WQ) ✔
+     2. myspec-monorepo (env_01CASfztpZp7mYRJPK41sGvK)
+     3. Full-access (env_011CUW5BKtc4vkq5q1uSp7MY)
+   ❯ 4. Default (env_011CUKn5Aj1q6ujg5PFvEhTE)
+
+   Enter to select · Esc to cancel
+`
+
+// Confirming a remote-environment escalation on a keystroke-capable adapter
+// must answer the standing picker adaptively (digit → verify → Enter), never
+// a text send, and mark the correction sent only after the picker commits.
+func TestConfirmDeliversRemoteEnvSelectionAdaptively(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeKeyHerdr{
+		fakeHerdr:       fakeHerdr{pane: frontRemoteEnvPane},
+		keyScript:       []string{"4", "enter"},
+		keyScriptFrames: []string{frontRemoteEnvPaneCaret4, "● Launching remote agent…\n"},
+	}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", AgentType: "claude", SituationType: domain.SituationApproval,
+		Trigger: "t", Action: "escalated", Status: "escalated",
+		Suggestion: "LLM suggested: Default (env_011CUKn5Aj1q6ujg5PFvEhTE)", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(fake.keys, ","); got != "4,enter" {
+		t.Errorf("keys = %q, want \"4,enter\"", got)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("the picker must be answered with keystrokes, not a text send: %v", fake.inputs)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || !corr[0].Sent {
+		t.Errorf("correction should be recorded and marked sent: %+v", corr)
+	}
+}
+
+// A failed adaptive delivery (the picker refuses the label) keeps the
+// correction recorded but NOT sent, and surfaces the error to the operator.
+func TestConfirmRemoteEnvUnknownLabelKeepsCorrectionUnsent(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: frontRemoteEnvPane}}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", AgentType: "claude", SituationType: domain.SituationApproval,
+		Trigger: "t", Action: "escalated", Status: "escalated",
+		Suggestion: "LLM suggested: other-project (env_01ZZZZZZZZZZZZZZZZZZZZZZZZ)", CreatedAt: time.Now(),
+	})
+	err := app.Confirm(ctx, id, true)
+	if err == nil || !strings.Contains(err.Error(), "correction recorded") {
+		t.Fatalf("err = %v, want a correction-recorded delivery failure", err)
+	}
+	if len(fake.keys) != 0 {
+		t.Errorf("no keystroke may be sent for an unmappable label, got %v", fake.keys)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].Sent {
+		t.Errorf("correction should be recorded but unsent: %+v", corr)
+	}
+}
+
+// A keystroke-less adapter must fall back to the plain digit text send rather
+// than failing the operator's explicit confirm.
+func TestConfirmRemoteEnvKeystrokelessFallsBackToTextSend(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeHerdr{pane: frontRemoteEnvPane}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", AgentType: "claude", SituationType: domain.SituationApproval,
+		Trigger: "t", Action: "escalated", Status: "escalated",
+		Suggestion: "LLM suggested: Default (env_011CUKn5Aj1q6ujg5PFvEhTE)", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 1 || fake.inputs[0] != "4" {
+		t.Errorf("delivered %v, want the mapped menu digit [\"4\"]", fake.inputs)
+	}
+}
+
+// A keystroke-less adapter with an UNMAPPABLE label must fail closed even on
+// an operator's explicit confirm: the plain text send would type the literal
+// label + Enter, and under the caret binding Enter commits whatever option
+// the caret rests on. Only a mappable label may fall through to a digit send.
+func TestConfirmRemoteEnvKeystrokelessUnknownLabelFailsClosed(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeHerdr{pane: frontRemoteEnvPane}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", AgentType: "claude", SituationType: domain.SituationApproval,
+		Trigger: "t", Action: "escalated", Status: "escalated",
+		Suggestion: "LLM suggested: other-project (env_01ZZZZZZZZZZZZZZZZZZZZZZZZ)", CreatedAt: time.Now(),
+	})
+	err := app.Confirm(ctx, id, true)
+	if err == nil || !strings.Contains(err.Error(), "none of the offered environments") {
+		t.Fatalf("err = %v, want an unmappable-label refusal", err)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("nothing may be sent for an unmappable label, sent %v", fake.inputs)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].Sent {
+		t.Errorf("correction should be recorded but unsent: %+v", corr)
+	}
+}

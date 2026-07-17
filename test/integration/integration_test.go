@@ -194,6 +194,127 @@ func TestRealConfirmDeliversMenuDigit(t *testing.T) {
 	t.Fatal("confirm did not drive the menu selection (send did not land)")
 }
 
+// startRemoteEnvAgent spawns a scratch agent that renders Claude's "Select
+// remote environment" picker in the CARET binding (a digit moves ❯, Enter
+// commits — the stricter of the two possible protocols) and returns its pane
+// id. The committed environment label is written to markerPath.
+func startRemoteEnvAgent(t *testing.T, markerPath string) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "remote_env.sh")
+	body := `#!/bin/bash
+caret=1
+render() {
+  printf '\033[2J\033[H'
+  echo '   Select remote environment'
+  echo
+  echo '   Configure environments at: https://claude.ai/code'
+  echo
+  for i in 1 2 3 4; do
+    mark='  '; [ "$i" -eq "$caret" ] && mark='❯ '
+    suffix=''; [ "$i" -eq 1 ] && suffix=' ✔'
+    echo "   ${mark}${i}. Env-${i} (env_0${i}ABCDEFGHIJKLMNOPQRSTUVWX)${suffix}"
+  done
+  echo
+  echo '   Enter to select · Esc to cancel'
+}
+render
+while IFS= read -r -s -n1 key; do
+  case "$key" in
+    [1-4]) caret=$key; render ;;
+    '') echo "Env-${caret}" > 'MARKER'; printf '\033[2J\033[H'; echo 'Environment selected.'; break ;;
+  esac
+done
+sleep 60
+`
+	body = strings.ReplaceAll(body, "MARKER", markerPath)
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	out := runHerdr(t, "agent", "start", "hapitest", "--cwd", "/tmp", "--no-focus",
+		"--", "bash", script)
+	var resp struct {
+		Result struct {
+			Agent struct {
+				PaneID string `json:"pane_id"`
+			} `json:"agent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("parse agent start output: %v (%s)", err, out)
+	}
+	pane := resp.Result.Agent.PaneID
+	if pane == "" {
+		t.Fatalf("no pane id in agent start output: %s", out)
+	}
+	t.Cleanup(func() { tryHerdr("pane", "close", pane) })
+	return pane
+}
+
+// TestRealConfirmDeliversRemoteEnvSelection drives the remote-environment
+// picker end to end against a real herdr: an operator confirming the learned
+// environment LABEL must land the selection via the adaptive keystroke
+// deliverer (digit moves the caret, Enter commits) — a plain text send would
+// leave the picker standing.
+func TestRealConfirmDeliversRemoteEnvSelection(t *testing.T) {
+	requireHerdr(t)
+	cli := herdr.NewCLI()
+	marker := filepath.Join(t.TempDir(), "picked")
+	pane := startRemoteEnvAgent(t, marker)
+
+	// Wait for the picker to render; fail loudly if it never does — falling
+	// through would produce a far less diagnosable Confirm error (or even a
+	// stray text send into the pane).
+	rendered := false
+	lastRead := ""
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if content, err := cli.ReadPaneVisible(context.Background(), pane, 20); err == nil {
+			lastRead = content
+			if _, ok := domain.ClaudeRemoteEnvForm(content); ok {
+				rendered = true
+				break
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !rendered {
+		t.Fatalf("picker never rendered; last read %q", lastRead)
+	}
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "hap.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	app := &frontend.App{Store: st, Herdr: cli, Author: "itest"}
+
+	ctx := context.Background()
+	id, err := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: pane, AgentType: "claude", SituationType: domain.SituationApproval,
+		Trigger: "t", Action: "escalated", Status: "escalated",
+		Suggestion: "LLM suggested: Env-3 (env_03ABCDEFGHIJKLMNOPQRSTUVWX)", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(marker); err == nil {
+			if got := strings.TrimSpace(string(b)); got == "Env-3" {
+				return // caret reached option 3 and Enter committed it
+			} else {
+				t.Fatalf("picker committed %q, want Env-3", got)
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("confirm did not commit the environment selection")
+}
+
 // claudeModel is the model alias the real-claude cases run with; haiku keeps
 // responses fast. Override with HAP_ITEST_CLAUDE_MODEL.
 func claudeModel() string {
