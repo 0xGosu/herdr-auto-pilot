@@ -224,12 +224,20 @@ type PendingEscalation struct {
 // tail window of a longer transcript — herdr's pane read is itself a
 // tail-anchored window, so a capture can be head-shifted, its first line cut
 // mid-line, WITHOUT hitting the daemon's rune cap (verified: the #816/#817
-// excerpts measured 3930/3901 runes against the 4000 cap). A small capture,
-// by contrast, is a complete pane whose first line is real, possibly the only
-// discriminating content: two approvals for different commands share every
-// menu line below the first — dropping it would collapse them, a silent drop
-// of a real question. A cap of 0 or less disables the suffix compare
-// entirely. See suffixDuplicate for the degenerate-length guard.
+// excerpts measured 3930/3901 runes against the 4000 cap; NO observable
+// provenance says whether a capture's head was cut, so size is the available
+// proxy). A small capture, by contrast, is a complete pane whose first line
+// is real, possibly the only discriminating content: two approvals for
+// different commands share every menu line below the first — dropping it
+// would collapse them, a silent drop of a real question. A cap of 0 or less
+// disables the suffix compare entirely.
+//
+// Because a complete pane can also exceed half the cap, size alone is not
+// trusted with the first line: firstLineExplained additionally requires the
+// dropped line to be a cut fragment of content the OTHER capture retains,
+// which is what a genuinely head-shifted window looks like and what two
+// first-line-discriminated questions never do. See suffixDuplicate for the
+// degenerate-length guard.
 func DuplicatesPendingEscalation(sitType SituationType, excerpt string, snapshotCap int, pending []PendingEscalation) bool {
 	key := NormalizeForDedup(excerpt)
 	freshWindowed := snapshotCap > 0 && utf8.RuneCountInString(excerpt)*2 >= snapshotCap
@@ -243,11 +251,36 @@ func DuplicatesPendingEscalation(sitType SituationType, excerpt string, snapshot
 			return true
 		}
 		if freshWindowed && utf8.RuneCountInString(p.PaneExcerpt)*2 >= snapshotCap &&
+			firstLineExplained(excerpt, p.PaneExcerpt) &&
 			suffixDuplicate(suffixKey, NormalizeForDedup(dropFirstLine(p.PaneExcerpt))) {
 			return true
 		}
 	}
 	return false
+}
+
+// firstLineExplained reports whether either capture's first line — the line
+// dropFirstLine discards before the suffix compare — is explainable as a cut
+// fragment of content the OTHER capture retains. Two tail windows onto one
+// screen always satisfy this: the more-shifted window's first line is a
+// fragment of a line the less-shifted window still holds (even two different
+// mid-line cuts of the same line satisfy it, the shorter fragment being a
+// substring of the longer). Two different questions whose only difference IS
+// their first line — a complete pane's command line above an identical menu —
+// satisfy neither direction, so the suffix compare never sees them. A
+// mutated-in-place first line (a chrome counter that ticked at the window
+// head) fails both directions and escalates: fail open, exactly the pre-fix
+// behavior.
+func firstLineExplained(a, b string) bool {
+	return firstLineIn(a, b) || firstLineIn(b, a)
+}
+
+// firstLineIn reports whether src's trimmed first line appears in other. A
+// blank first line is trivially explained — dropping it discards nothing.
+func firstLineIn(src, other string) bool {
+	first, _, _ := strings.Cut(src, "\n")
+	first = strings.TrimSpace(first)
+	return first == "" || strings.Contains(other, first)
 }
 
 // dropFirstLine removes the first line of a tail-windowed capture: both the

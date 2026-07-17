@@ -247,22 +247,40 @@ func TestDuplicatesPendingEscalation(t *testing.T) {
 		{
 			// ...but on tail-windowed captures the first line is a cut
 			// fragment of scrollback, not content: two windows identical
-			// below it are the same standing screen.
+			// below it are the same standing screen. The fresh window is
+			// shifted further, so its first line is a fragment of the
+			// pending capture's first line (firstLineExplained holds).
 			"tail windows differing only in the cut first line duplicate",
 			SituationIdle,
-			"ted mid-line by truncation\n\n● Tests pass.\n\n● Done — PR open.\n\n❯ \nstatus bar",
+			"mid-line by truncation\n\n● Tests pass.\n\n● Done — PR open.\n\n❯ \nstatus bar",
 			70,
 			[]PendingEscalation{pend(SituationIdle,
-				"cut differently, same tail\n\n● Tests pass.\n\n● Done — PR open.\n\n❯ \nstatus bar")},
+				"some content cut mid-line by truncation\n\n● Tests pass.\n\n● Done — PR open.\n\n❯ \nstatus bar")},
 			true,
+		},
+		{
+			// PR #153 review (charliecreates): a COMPLETE pane can also
+			// exceed half the cap, so size alone must not admit two
+			// questions whose only difference is their first command line —
+			// neither first line appears in the other capture, so
+			// firstLineExplained refuses before any suffix is compared.
+			"complete pane above half-cap with discriminating first line is NOT a duplicate",
+			SituationApproval,
+			"Bash(npm install)\n\nlots of identical build output here\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n",
+			100,
+			[]PendingEscalation{pend(SituationApproval,
+				"Bash(go test ./...)\n\nlots of identical build output here\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n")},
+			false,
 		},
 		{
 			// The trailing few hundred runes of any capture of one pane are
 			// near-constant chrome (prompt box, status bar), so a much shorter
 			// capture must not tail-match a long one: the length-ratio guard
-			// refuses before the question region is even compared.
+			// refuses before the question region is even compared. The first
+			// line is a fragment of the pending capture (firstLineExplained
+			// holds), so the ratio guard is what refuses here.
 			"short chrome-tail capture does not match a long screen",
-			SituationIdle, "first line cut\n❯ \nstatus bar", 25,
+			SituationIdle, "buried in it — proceed?\n❯ \nstatus bar", 25,
 			[]PendingEscalation{pend(SituationIdle,
 				"● A long transcript.\n\n● With a real question buried in it — proceed?\n\n● More content to make it long.\n\n❯ \nstatus bar")},
 			false,
