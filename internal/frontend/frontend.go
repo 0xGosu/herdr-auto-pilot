@@ -797,15 +797,27 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		}
 		// Claude's remote-environment picker commits per a per-build
 		// protocol (the digit may only move the caret), so a standing picker
-		// is answered via the adaptive keystroke deliverer. A keystroke-less
-		// adapter falls through to the plain digit + Enter send below ONLY
-		// when the reply maps to a live option — an unmappable label would be
-		// typed literally and its Enter could commit whatever option the
-		// caret rests on (launching the wrong cloud environment), so that
-		// case fails closed even on an operator's explicit confirm.
-		if rerr == nil && audit.SituationType == domain.SituationApproval &&
-			strings.EqualFold(audit.AgentType, "claude") {
-			if form, isRemoteEnv := domain.ClaudeRemoteEnvForm(pane); isRemoteEnv {
+		// is answered via the adaptive keystroke deliverer. The situation is
+		// identified from the audit's own pane capture as well as the live
+		// read: a failed or stale read must REFUSE, never fall through to the
+		// literal-label send below — its trailing Enter could commit whatever
+		// option the caret rests on and launch the wrong cloud environment. A
+		// keystroke-less adapter falls through ONLY when the reply maps to a
+		// live option digit (safe under both bindings).
+		if audit.SituationType == domain.SituationApproval && strings.EqualFold(audit.AgentType, "claude") {
+			_, wasRemoteEnv := domain.ClaudeRemoteEnvForm(audit.PaneExcerpt)
+			var form domain.RemoteEnvForm
+			live := false
+			if rerr == nil {
+				form, live = domain.ClaudeRemoteEnvForm(pane)
+			}
+			if wasRemoteEnv || live {
+				if rerr != nil {
+					return fmt.Errorf("correction recorded, but the pane could not be read to answer the remote environment picker: %w", rerr)
+				}
+				if !live {
+					return fmt.Errorf("correction recorded, but the pane no longer shows the remote environment picker")
+				}
 				if ks, ok := a.Herdr.(ports.KeystrokeSender); ok {
 					if err := mcqdeliver.ClaudeRemoteEnv(ctx, mcqdeliver.Config{
 						Keys:      ks,

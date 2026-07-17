@@ -95,6 +95,22 @@ func TestClaudeRemoteEnvFormLastTitleWins(t *testing.T) {
 	}
 }
 
+func TestClaudeRemoteEnvFormTwoCompleteRendersParsesLive(t *testing.T) {
+	// A capture holding TWO complete renders (an earlier one WITH its footer,
+	// then the live one) must pair the live title with the live footer — a
+	// first-footer pairing would reject the live frame and reintroduce the
+	// silent-block failure this detector exists to fix. The earlier render's
+	// options differ so the assertion proves which render was parsed.
+	earlier := strings.ReplaceAll(remoteEnvPicker, "herdr-auto-pilot", "old-project")
+	form, ok := ClaudeRemoteEnvForm(earlier + "\n● narration between renders\n\n" + remoteEnvPicker)
+	if !ok {
+		t.Fatal("capture with two complete renders must parse as the live form")
+	}
+	if len(form.Options) != 4 || !strings.HasPrefix(form.Options[0].Label, "herdr-auto-pilot") {
+		t.Fatalf("parsed the wrong render: %+v", form.Options)
+	}
+}
+
 func TestClaudeRemoteEnvApprovalSignaturePassesOverMaskGuard(t *testing.T) {
 	// The enriched approval situation must produce a stable, unmasked salient
 	// so the decision core never dismisses the picker as over_masked (the

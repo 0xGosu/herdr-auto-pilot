@@ -3345,3 +3345,57 @@ func TestConfirmRemoteEnvKeystrokelessUnknownLabelFailsClosed(t *testing.T) {
 		t.Errorf("correction should be recorded but unsent: %+v", corr)
 	}
 }
+
+// A read failure on a remote-environment approval must REFUSE, never fall
+// through to the literal-label text send — its trailing Enter could commit
+// whatever option the caret rests on. The situation is identified from the
+// audit's own pane capture, so the refusal works exactly when the live pane
+// is unreadable.
+func TestConfirmRemoteEnvReadFailureFailsClosed(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeKeyHerdr{fakeHerdr: fakeHerdr{readErr: errAny}}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", AgentType: "claude", SituationType: domain.SituationApproval,
+		Trigger: "t", Action: "escalated", Status: "escalated",
+		Suggestion:  "LLM suggested: Default (env_011CUKn5Aj1q6ujg5PFvEhTE)",
+		PaneExcerpt: frontRemoteEnvPane, CreatedAt: time.Now(),
+	})
+	err := app.Confirm(ctx, id, true)
+	if err == nil || !strings.Contains(err.Error(), "could not be read") {
+		t.Fatalf("err = %v, want a read-failure refusal", err)
+	}
+	if len(fake.inputs) != 0 || len(fake.keys) != 0 {
+		t.Errorf("nothing may be sent when the pane is unreadable: inputs=%v keys=%v", fake.inputs, fake.keys)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].Sent {
+		t.Errorf("correction should be recorded but unsent: %+v", corr)
+	}
+}
+
+// The picker no longer standing (already answered, or the pane moved on) must
+// refuse too — identified via the audit capture, so the literal label is
+// never typed into whatever replaced the picker.
+func TestConfirmRemoteEnvGonePickerFailsClosed(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: "● Environment selected. Launching remote agent…\n"}}
+	app.Herdr = fake
+	ctx := context.Background()
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", AgentType: "claude", SituationType: domain.SituationApproval,
+		Trigger: "t", Action: "escalated", Status: "escalated",
+		Suggestion:  "LLM suggested: Default (env_011CUKn5Aj1q6ujg5PFvEhTE)",
+		PaneExcerpt: frontRemoteEnvPane, CreatedAt: time.Now(),
+	})
+	err := app.Confirm(ctx, id, true)
+	if err == nil || !strings.Contains(err.Error(), "no longer shows") {
+		t.Fatalf("err = %v, want a picker-gone refusal", err)
+	}
+	if len(fake.inputs) != 0 || len(fake.keys) != 0 {
+		t.Errorf("nothing may be sent when the picker is gone: inputs=%v keys=%v", fake.inputs, fake.keys)
+	}
+}

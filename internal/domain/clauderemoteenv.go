@@ -44,13 +44,17 @@ type RemoteEnvForm struct {
 // in classify.Classify if that happens).
 func ClaudeRemoteEnvForm(pane string) (RemoteEnvForm, bool) {
 	titles := claudeRemoteEnvTitleRE.FindAllStringIndex(pane, -1)
-	footer := claudeRemoteEnvFooterRE.FindStringIndex(pane)
-	if len(titles) == 0 || footer == nil {
+	footers := claudeRemoteEnvFooterRE.FindAllStringIndex(pane, -1)
+	if len(titles) == 0 || len(footers) == 0 {
 		return RemoteEnvForm{}, false
 	}
-	// Last title occurrence is the live render (a consuming "recent" read can
-	// carry earlier renders above the current one).
+	// Last title and last footer are the live render (a consuming "recent"
+	// read can carry earlier complete renders above the current one). The \z
+	// anchor already makes an earlier render's footer unmatchable, but pair
+	// last-with-last anyway so relaxing the anchor can never re-pair the live
+	// title with a stale footer.
 	title := titles[len(titles)-1]
+	footer := footers[len(footers)-1]
 	if footer[0] <= title[0] {
 		return RemoteEnvForm{}, false
 	}
