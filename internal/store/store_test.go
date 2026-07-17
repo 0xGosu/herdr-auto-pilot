@@ -443,6 +443,51 @@ func TestPendingEscalationExcerpts(t *testing.T) {
 	}
 }
 
+// TestPendingEscalationExcerptsBounded pins the hot-path bound: the
+// duplicate-ask check runs on the daemon's synchronous event loop, so a large
+// unresolved-escalation backlog for one agent must not make the fetch (and the
+// Go-side normalization the daemon does over it) grow without limit. Seed more
+// than the cap and assert the query returns at most PendingEscalationDedupLimit
+// rows, newest first (so a re-delivery of a recent screen is still covered).
+func TestPendingEscalationExcerptsBounded(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	total := PendingEscalationDedupLimit + 25
+	for i := 0; i < total; i++ {
+		if _, err := s.AppendAudit(ctx, domain.AuditRecord{
+			AgentID: "agent-1", AgentType: "claude", Trigger: "x",
+			SituationType: domain.SituationApproval, Action: "escalated", Status: "escalated",
+			PaneExcerpt: fmt.Sprintf("pending screen %d", i),
+			CreatedAt:   now.Add(time.Duration(i) * time.Millisecond),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.PendingEscalationExcerpts(ctx, "agent-1", "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != PendingEscalationDedupLimit {
+		t.Fatalf("fetch not bounded: got %d rows, want %d", len(got), PendingEscalationDedupLimit)
+	}
+	// Newest-first: the most recently seeded screen is present, so a re-delivery
+	// of the agent's current (recent) screen still dedups.
+	newest := fmt.Sprintf("pending screen %d", total-1)
+	found := false
+	for _, p := range got {
+		if p.PaneExcerpt == newest {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("newest pending escalation %q missing from the bounded window", newest)
+	}
+}
+
 func TestRetireEscalationForRetry(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

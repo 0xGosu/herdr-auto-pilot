@@ -1125,14 +1125,32 @@ func (s *Store) PendingEscalations(ctx context.Context) ([]domain.AuditRecord, e
 	return s.scanAudits(rows)
 }
 
-// PendingEscalationExcerpts returns the pane excerpts of every escalation still
-// awaiting the operator for this agent + agent type, regardless of age — the
-// candidate set for the daemon's duplicate-ask check. It is NOT scoped by
-// situation_type: that field is DERIVED from the agent status (the classifier
-// gates the approval/choice rules on herdr reporting "blocked"), so one
-// standing screen re-fired as idle reclassifies, and scoping by it would miss
-// the very re-delivery this dedups. The excerpt comparison, which is the real
-// key, happens in domain.DuplicatesPendingEscalation.
+// PendingEscalationDedupLimit bounds how many pending escalations the daemon
+// pulls per duplicate-ask check. The check runs on the synchronous event loop
+// and normalizes each returned excerpt (up to snapshotMaxRunes) in Go, so the
+// fetch is capped to keep that work constant regardless of how large an agent's
+// unresolved-escalation backlog grows (NFR-001/NFR-002). Correctness holds in
+// practice: an agent shows one screen at a time and the dedup itself stops
+// identical escalations from stacking, so a re-delivery always matches a RECENT
+// escalation — well inside this newest-first window. The limit is generous
+// (~100× a realistic agent's pending count); should it ever be exceeded, the
+// worst case is one redundant operator ask, never a silent drop.
+const PendingEscalationDedupLimit = 128
+
+// PendingEscalationExcerpts returns the pane excerpts of the most recent pending
+// escalations awaiting the operator for this agent + agent type (newest first,
+// capped at PendingEscalationDedupLimit) — the candidate set for the daemon's
+// duplicate-ask check. It is NOT scoped by situation_type: that field is DERIVED
+// from the agent status (the classifier gates the approval/choice rules on herdr
+// reporting "blocked"), so one standing screen re-fired as idle reclassifies,
+// and scoping by it would miss the very re-delivery this dedups. The excerpt
+// comparison, which is the real key, happens in
+// domain.DuplicatesPendingEscalation.
+//
+// The status='escalated' filter is served by idx_audit_status, and pending
+// escalations are globally few (the dedup prevents identical ones from
+// stacking), so the scan stays bounded; the LIMIT additionally caps the Go-side
+// normalization.
 //
 // Escalations with an unprocessed LLM retry are excluded: the retry explicitly
 // asks to re-evaluate this exact content, so its source row must not suppress
@@ -1143,8 +1161,8 @@ func (s *Store) PendingEscalationExcerpts(ctx context.Context, agentID, agentTyp
 			WHERE a.status = 'escalated' AND a.agent_id = ? AND a.agent_type = ?
 			  AND NOT EXISTS (SELECT 1 FROM llm_retries r
 					WHERE r.audit_id = a.id AND r.processed = 0)
-			ORDER BY a.id DESC`,
-		agentID, agentType)
+			ORDER BY a.id DESC LIMIT ?`,
+		agentID, agentType, PendingEscalationDedupLimit)
 	if err != nil {
 		return nil, err
 	}
