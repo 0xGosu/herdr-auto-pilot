@@ -1041,6 +1041,38 @@ func TestCapturedPanePreviewKeepsTail(t *testing.T) {
 	}
 }
 
+func TestAuditDetailShowsInputForDeliveredRow(t *testing.T) {
+	// A delivered auto row always carries the sent text: the detail view
+	// must render its Input section (empty fields are hidden, so this pins
+	// that Input is never empty-hidden on a delivered row — including a
+	// rewritten one, where Input and LLM output both carry real content).
+	m := testModel(t)
+	rec := domain.AuditRecord{
+		Status:    "auto",
+		Action:    "auto: REWRITTEN: please do step two",
+		Input:     "REWRITTEN: please do step two",
+		LLMOutput: "REWRITTEN: please do step two",
+		Rationale: "declared task; rewritten by llm.rewrite_command (original: \"step two\")",
+	}
+	got := strings.Join(m.auditDetailLines(rec, "", 80, auditDetailOptions{}), "\n")
+	for _, want := range []string{"Input", "REWRITTEN: please do step two", "LLM output"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("delivered auto row detail missing %q:\n%s", want, got)
+		}
+	}
+
+	// A noop row sends nothing — Input is genuinely empty and the section
+	// is hidden by design, not missing.
+	noop := domain.AuditRecord{
+		Status: "auto", Action: "noop", Input: "",
+		Rationale: "rewrite declined to send (@noop)",
+	}
+	got = strings.Join(m.auditDetailLines(noop, "", 80, auditDetailOptions{}), "\n")
+	if strings.Contains(got, "Input") {
+		t.Errorf("empty Input must stay hidden on a noop row:\n%s", got)
+	}
+}
+
 func TestEscalationCurrentSituationPreviewUsesTenLines(t *testing.T) {
 	m := testModel(t)
 	var pane strings.Builder
