@@ -83,7 +83,8 @@ last kill event:     resumed by operator at 2026-07-11T21:49:30+08:00
 
 ## list agents
 
-see all monitored agents with their short names, pane ids, types, and statuses:
+see all monitored agents with their short names, pane ids, types, statuses,
+and automation state:
 
 ```bash
 hap agents
@@ -91,9 +92,9 @@ hap agents
 
 output:
 ```
-brave-otter  w6:p1   claude   idle
-cool-fox     w6:p3   claude   working
-swift-hawk   w8:p1   codex    done
+brave-otter  w6:p1   claude   idle      enabled
+cool-fox     w6:p3   claude   working   disabled
+swift-hawk   w8:p1   codex    done      enabled
 ```
 
 ## rename an agent
@@ -103,6 +104,20 @@ give an agent a friendly name (used by task sources and for readability):
 ```bash
 hap rename brave-otter backend-dev
 ```
+
+disable or enable automation for one agent without removing it from the
+Agents list:
+
+```bash
+hap disable backend-dev
+hap enable backend-dev
+```
+
+in the TUI Agents tab, `x` disables the selected agent after a `Y/n`
+confirmation and `e` enables it. disabled agents show `DISABLED`. autonomous
+actions are suppressed and audited as `denied` with `[agent_disabled]`;
+escalations are immediately audited as `dismissed` with the same rationale and
+never enter the pending queue.
 
 ## manage escalations
 

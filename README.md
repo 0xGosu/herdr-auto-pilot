@@ -12,6 +12,19 @@ LLM/agent CLI. Autonomous actions must clear the applicable confidence and
 safety gates; uncertain ones escalate to you. Everything it does is audited
 and correctable.
 
+> [!IMPORTANT]
+> **Agent compatibility:** Herd Auto Prompter is developed and extensively
+> tested against **Claude Code** (`claude`) and the **OpenAI Codex CLI**
+> (`codex`). These are the primary supported coding-agent types.
+>
+> Other coding agents are best-effort and have not received the same level of
+> integration and regression testing. Their status events, prompts, menus, and
+> terminal UI formats may differ, so agents such as **OpenCode** (`opencode`),
+> **Antigravity CLI** (`agy`), and other types may be misclassified or may not
+> work reliably. Keep shadow mode and conservative confidence thresholds in
+> place while evaluating an additional agent type, and review its audit trail
+> before allowing autonomous actions.
+
 - **Learned rules, not guesses** — every action taken from a learned rule
   traces back to your confirmed decisions. Explicit task sources and the
   opt-in LLM helper are separate, clearly audited paths.
@@ -445,13 +458,21 @@ and the source entry itself — can be managed. Use the name in task-source
 selectors, and rename agents to whatever fits your workflow:
 
 ```sh
-hap agents                      # short name, pane id, type, status
+hap agents                      # short name, pane id, type, status, automation
 hap rename brave-otter backend-dev
+hap disable backend-dev         # stop automation for only this agent
+hap enable backend-dev          # allow automation again
 hap task-source --agent backend-dev ./docs/backend-tasks.md
 hap task-source --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
 ```
 
-(Or in the TUI: select the agent and press `n`.)
+(Or in the TUI: select the agent and press `n` to rename it, `x` to disable
+it behind a `Y/n` confirmation, or `e` to enable it again. A disabled live
+agent remains in the list with `DISABLED` in its status column. HAP never
+performs autonomous pane actions for it: would-be actions are audited as
+`denied` with rationale `[agent_disabled]`, while would-be escalations are
+written directly as `dismissed` with the same tag and never enter the pending
+queue.)
 
 ### The Tasks tab
 
@@ -971,6 +992,11 @@ Invariants:
   trigger, situation, action or escalation reason, confidence, rationale, and
   (for LLM decisions) captured output. `audit` / the *Audit* tab shows it;
   corrections keep their lineage to the original decision.
+- Escalations whose target is no longer present in an authoritative Herdr
+  agent snapshot are written directly as `dismissed` with `[agent_not_live]`.
+  Disabled agents use `[agent_disabled]`; their suppressed autonomous actions
+  are written as `denied`. These lifecycle outcomes remain visible without
+  notifying the operator or creating a stale pending escalation.
 - `clear-data --yes` resets all learned history and audit data (it never
   leaves your machine in the first place).
 

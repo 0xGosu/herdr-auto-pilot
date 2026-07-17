@@ -100,6 +100,55 @@ func TestLLMNoopPromotionRecordsWithoutSend(t *testing.T) {
 	}
 }
 
+func TestLLMNoopDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(approvalPane)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "@noop", Rationale: "no reply needed", ConfidentScore: 80,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "@noop",
+			Rationale: "no reply needed", ConfidentScore: 80, Status: "pending"}, nil
+	}
+	gate := &pausingAutomationStore{
+		StorePort: h.store, reached: make(chan struct{}), resume: make(chan struct{}),
+	}
+	h.daemon.opt.Store = gate
+	h.push("agent-llmnoop-disabled", "blocked")
+	select {
+	case <-gate.reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("LLM noop did not reach its final lifecycle barrier")
+	}
+	ctx := context.Background()
+	if err := h.raw.SetAgentDisabled(ctx, "agent-llmnoop-disabled", true); err != nil {
+		t.Fatal(err)
+	}
+	close(gate.resume)
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(ctx, 10)
+		return len(audits) == 1 && audits[0].Status == "denied"
+	})
+
+	audits, _ := h.raw.AuditLog(ctx, 10)
+	if audits[0].Action != domain.AuditActionDenied || audits[0].Rationale != "[agent_disabled]" {
+		t.Fatalf("LLM noop denied audit = %+v", audits[0])
+	}
+	decs, _ := h.raw.DecisionsForSignature(ctx, audits[0].Signature, 10)
+	if len(decs) != 0 {
+		t.Fatalf("disabled LLM noop was learned: %+v", decs)
+	}
+	rate, err := h.raw.GetAgentRate(ctx, "agent-llmnoop-disabled")
+	if err != nil || rate.ConsecutiveAuto != 0 {
+		t.Fatalf("disabled LLM noop advanced rate: rate=%+v err=%v", rate, err)
+	}
+}
+
 // Below the confidence threshold (default 999 = never), an LLM @noop surfaces
 // as a human-readable suggestion; confirming it records the @noop as a
 // learning event (end-to-end: accepted noop escalation becomes learned history).

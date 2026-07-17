@@ -323,6 +323,9 @@ type Status struct {
 	AgentsKnown bool
 	// AgentNames maps agent/pane ids to their short names.
 	AgentNames map[string]string
+	// DisabledAgents contains agent/pane ids whose HAP automation has been
+	// disabled by the operator. They remain visible in MonitoredAgents.
+	DisabledAgents map[string]bool
 	// AgentStats maps agent/pane ids to their lifetime counters (auto-sends,
 	// escalations, operator confirmations/corrections, first-seen). Nil when
 	// the stats query failed; a missing key means a live agent with no stats
@@ -384,6 +387,9 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 	if names, err := a.Store.AgentNames(ctx); err == nil {
 		st.AgentNames = names
 	}
+	if disabled, err := a.Store.DisabledAgents(ctx); err == nil {
+		st.DisabledAgents = disabled
+	}
 	// Best-effort, like AgentNames: a stats-query error just leaves it nil.
 	if stats, err := a.Store.AgentStats(ctx); err == nil {
 		st.AgentStats = stats
@@ -419,6 +425,9 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 
 // AgentName returns the short name for an agent id ("" when unnamed).
 func (st Status) AgentName(agentID string) string { return st.AgentNames[agentID] }
+
+// AgentDisabled reports the persistent operator-owned automation state.
+func (st Status) AgentDisabled(agentID string) bool { return st.DisabledAgents[agentID] }
 
 // StatsFor returns the lifetime counters for an agent id (a zero-valued
 // AgentStats when none are recorded).
@@ -570,6 +579,33 @@ func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
 				err = a.Store.AssignAgentName(ctx, agent.AgentID, newName)
 				break
 			}
+		}
+	}
+	if err != nil {
+		return err
+	}
+	return a.nudge(ctx, control.KindReload)
+}
+
+// SetAgentDisabled changes whether HAP may perform autonomous work for an
+// agent. A currently live but not-yet-named agent is named first so its state
+// remains visible and addressable after it exits.
+func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool) error {
+	err := a.Store.SetAgentDisabled(ctx, target, disabled)
+	if errors.Is(err, ports.ErrUnknownAgent) && a.Herdr != nil {
+		agents, listErr := a.Herdr.ListAgents(ctx)
+		if listErr != nil {
+			return fmt.Errorf("%w (and the live agent list is unavailable: %v)", err, listErr)
+		}
+		for _, agent := range agents {
+			if agent.AgentID != target && agent.PaneID != target {
+				continue
+			}
+			if _, nameErr := a.Store.EnsureAgentName(ctx, agent.AgentID); nameErr != nil {
+				return nameErr
+			}
+			err = a.Store.SetAgentDisabled(ctx, agent.AgentID, disabled)
+			break
 		}
 	}
 	if err != nil {

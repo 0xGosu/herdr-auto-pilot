@@ -336,8 +336,12 @@ func (m Model) visibleAgents() []domain.AgentTransition {
 	}
 	var out []domain.AgentTransition
 	for _, a := range m.data.status.MonitoredAgents {
+		automation := "enabled"
+		if m.data.status.AgentDisabled(a.AgentID) {
+			automation = "disabled"
+		}
 		if m.matchesQuery(tabAgents, m.data.status.AgentName(a.AgentID),
-			agentLocation(a, m.data.status), a.AgentID, a.AgentType, a.Status) {
+			agentLocation(a, m.data.status), a.AgentID, a.AgentType, a.Status, automation) {
 			out = append(out, a)
 		}
 	}
@@ -857,6 +861,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.correctByID(id, true)
 			}
 		case "e":
+			if a := m.detail.agent; a != nil {
+				m.detail = nil
+				return m.enableAgent(*a)
+			}
 			// On a task detail, e edits the snapshotted item (the prompt
 			// replaces the overlay; the expected-text guard still protects
 			// against the file changing since the snapshot).
@@ -865,6 +873,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.editTaskRowPrompt(*r)
 			}
 		case "x", "delete":
+			if a := m.detail.agent; a != nil {
+				m.detail = nil
+				return m.disableAgentPrompt(*a)
+			}
 			if id := m.detail.confirmID; id != 0 {
 				m.detail = nil
 				return m.dismissByID(id)
@@ -1093,6 +1105,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "e":
 		switch m.tab {
+		case tabAgents:
+			return m.enableSelectedAgent()
 		case tabConfig:
 			return m.editSelectedRule()
 		case tabTasks:
@@ -1165,6 +1179,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "x", "delete":
 		switch m.tab {
+		case tabAgents:
+			return m.disableSelectedAgentPrompt()
 		case tabEscalations:
 			return m.deleteEscalations()
 		case tabTasks:
@@ -2102,6 +2118,58 @@ func (m Model) renameSelected() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) disableSelectedAgentPrompt() (tea.Model, tea.Cmd) {
+	agents := m.visibleAgents()
+	if m.cursors[m.tab] >= len(agents) {
+		return m, nil
+	}
+	return m.disableAgentPrompt(agents[m.cursors[m.tab]])
+}
+
+func (m Model) disableAgentPrompt(agent domain.AgentTransition) (tea.Model, tea.Cmd) {
+	if m.data.status.AgentDisabled(agent.AgentID) {
+		m.message = "agent is already disabled"
+		return m, nil
+	}
+	app, agentID := m.app, agent.AgentID
+	name := orDash(m.data.status.AgentName(agentID))
+	m.confirm = &confirmation{
+		label: fmt.Sprintf("disable agent %s (%s)? [Y/n]", name, agentID),
+		onConfirm: func() tea.Cmd {
+			return m.do(fmt.Sprintf("agent %s disabled", name), func(ctx context.Context) error {
+				return app.SetAgentDisabled(ctx, agentID, true)
+			})
+		},
+		revalidate: func(current Model) (string, bool) {
+			if current.data.status.AgentDisabled(agentID) {
+				return "agent is already disabled", false
+			}
+			return "", true
+		},
+	}
+	return m, nil
+}
+
+func (m Model) enableSelectedAgent() (tea.Model, tea.Cmd) {
+	agents := m.visibleAgents()
+	if m.cursors[m.tab] >= len(agents) {
+		return m, nil
+	}
+	return m.enableAgent(agents[m.cursors[m.tab]])
+}
+
+func (m Model) enableAgent(agent domain.AgentTransition) (tea.Model, tea.Cmd) {
+	if !m.data.status.AgentDisabled(agent.AgentID) {
+		m.message = "agent is already enabled"
+		return m, nil
+	}
+	name := orDash(m.data.status.AgentName(agent.AgentID))
+	m.beginAction()
+	return m, m.do(fmt.Sprintf("agent %s enabled", name), func(ctx context.Context) error {
+		return m.app.SetAgentDisabled(ctx, agent.AgentID, false)
+	})
+}
+
 // focusAgent asks herdr to jump to the agent's exact pane (tab focus + zoom).
 func (m Model) focusAgent(a domain.AgentTransition) (tea.Model, tea.Cmd) {
 	if a.TabID == "" || a.PaneID == "" {
@@ -2498,7 +2566,11 @@ func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 		}))
 	lines = m.detailField(lines, w, "Pane", a.PaneID)
 	lines = m.detailField(lines, w, "Type", a.AgentType)
-	lines = m.detailField(lines, w, "Status", a.Status)
+	status := a.Status
+	if m.data.status.AgentDisabled(a.AgentID) {
+		status += " [DISABLED]"
+	}
+	lines = m.detailField(lines, w, "Status", status)
 	lines = m.detailField(lines, w, "Task source", m.agentTaskSources(a))
 	if !a.At.IsZero() {
 		lines = m.detailField(lines, w, "Last transition", a.At.Format(time.RFC3339))
@@ -3378,7 +3450,7 @@ func (m Model) helpLine() string {
 				preview + "  ↑/↓: scroll  tab: switch tab  " + closeKeys
 		}
 		if m.detail.agent != nil {
-			return "↑/↓: scroll  tab: switch tab  f: focus in herdr  t: see tasks" + preview + "  " + closeKeys
+			return "x: disable  e: enable  ↑/↓: scroll  tab: switch tab  f: focus in herdr  t: see tasks" + preview + "  " + closeKeys
 		}
 		if m.detail.task != nil {
 			return "enter/y: send to agent  e: edit  x: delete  f: focus in herdr  ↑/↓: scroll  tab: switch tab  " + closeKeys
@@ -3397,7 +3469,7 @@ func (m Model) helpLine() string {
 	}
 	switch m.tab {
 	case tabAgents:
-		return "v: details  n: rename agent  f: focus in herdr  t: see tasks  /: search  " + common
+		return "v: details  x: disable  e: enable  n: rename agent  f: focus in herdr  t: see tasks  /: search  " + common
 	case tabTasks:
 		return "enter/y: send to agent  v: details  a: add  e: edit  d: done/undone  x: delete (source on a header)  space: mark  f: focus in herdr  /: search  " + common
 	case tabEscalations:
@@ -3562,8 +3634,12 @@ func (m Model) renderAgents(b *strings.Builder) {
 		a := agents[i]
 		name := orDash(m.data.status.AgentName(a.AgentID))
 		s := m.data.status.StatsFor(a.AgentID)
+		status := a.Status
+		if m.data.status.AgentDisabled(a.AgentID) {
+			status = "DISABLED"
+		}
 		line := fmt.Sprintf(agentsRowFmt,
-			name, oneLine(agentLocation(a, m.data.status), 12), a.AgentType, a.Status,
+			name, oneLine(agentLocation(a, m.data.status), 12), a.AgentType, status,
 			oneLine(m.agentTaskCount(a), 7),
 			strconv.Itoa(s.Escalations), strconv.Itoa(s.AutoSends),
 			strconv.Itoa(s.Confirmed), strconv.Itoa(s.Corrections),

@@ -38,6 +38,10 @@ const sweepResetKeys = domain.MCQResetKeys
 // single-frame situation proceeds to decideAndAct, which escalates with the
 // proper reason.
 func (d *Daemon) sweepAllowed(ctx context.Context, s domain.Situation) bool {
+	disabled, err := d.opt.Store.AgentDisabled(ctx, s.AgentID)
+	if err != nil || disabled {
+		return false
+	}
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
 		return false
@@ -344,7 +348,6 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 			Confidence: dec.Confidence, Suggestion: "answer series: " + dec.Input,
 		}, tr, now)
 	}
-
 	ks, ok := d.opt.Herdr.(ports.KeystrokeSender)
 	if !ok {
 		escalateWith(domain.ReasonHerdrUnreachable, "keystrokes unavailable")
@@ -366,111 +369,131 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 		return
 	}
 
-	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
-		SituationType: s.Type, Action: "auto:" + dec.Input, Input: dec.Input,
-		Confidence: dec.Confidence, Rationale: dec.Rationale,
-		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
-	})
-	if err != nil {
-		d.releasePane(s.AgentID)
-		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
-		d.notify(ctx, "Herd Auto Prompter: persistence failure",
-			"An automated action was blocked because its audit record could not be written.")
-		return
-	}
-
 	go func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery", func() error {
-			if err := d.reverifyMultiSelect(ctx, ks, s); err != nil {
-				slog.Warn("multi-select baseline moved before delivery; refusing", "pane", s.PaneID, "error", err)
-				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
-				d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
-					fmt.Sprintf("Agent %s: the multi-select form changed before the answer could be delivered (%v); please review it.", s.AgentID, err))
-				return nil
-			}
-			if err := d.sendTabSelections(ctx, ks, s, groups); err != nil {
-				slog.Error("answer series delivery failed", "pane", s.PaneID, "error", err)
-				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
-				d.notify(ctx, "Herd Auto Prompter: action delivery failed",
-					fmt.Sprintf("Agent %s: multi-tab answer series failed mid-delivery (%v); please review the form.", s.AgentID, err))
-				return nil
-			}
-			d.mu.Lock()
-			d.lastAutoSend[s.AgentID] = now
-			d.mu.Unlock()
-			if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
-				Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-				ChosenAction: dec.Input, Source: dec.Source, Confidence: dec.Confidence, CreatedAt: now,
-			}); err != nil {
-				slog.Error("decision record write failed", "error", err)
-			}
-			if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
-				updated := domain.RegisterAutoPrompt(*rate, now)
-				updated.AgentID = s.AgentID
-				if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
-					slog.Error("agent rate update failed", "error", err)
+			d.withAgentAutomation(ctx, s, sig, tr, dec.Input, dec.Confidence, nil, "", now, func() {
+				auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+					AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
+					SituationType: s.Type, Action: "auto:" + dec.Input, Input: dec.Input,
+					Confidence: dec.Confidence, Rationale: dec.Rationale,
+					Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+				})
+				if err != nil {
+					slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
+					d.notify(ctx, "Herd Auto Prompter: persistence failure",
+						"An automated action was blocked because its audit record could not be written.")
+					return
 				}
-			}
-			slog.Info("multi-tab answer series delivered",
-				"agent", s.AgentID, "answers", answerCount, "confidence", dec.Confidence, "audit_id", auditID)
-			d.scheduleUnblockCheck(verifyunblock.Params{
-				PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
-				Signature: sig.Signature, Input: dec.Input, Excerpt: s.Content, SituationType: s.Type,
+				if err := d.reverifyMultiSelect(ctx, ks, s); err != nil {
+					slog.Warn("multi-select baseline moved before delivery; refusing", "pane", s.PaneID, "error", err)
+					d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+					d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+						fmt.Sprintf("Agent %s: the multi-select form changed before the answer could be delivered (%v); please review it.", s.AgentID, err))
+					return
+				}
+				if err := d.sendTabSelections(ctx, ks, s, groups); err != nil {
+					slog.Error("answer series delivery failed", "pane", s.PaneID, "error", err)
+					d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+					d.notify(ctx, "Herd Auto Prompter: action delivery failed",
+						fmt.Sprintf("Agent %s: multi-tab answer series failed mid-delivery (%v); please review the form.", s.AgentID, err))
+					return
+				}
+				d.mu.Lock()
+				d.lastAutoSend[s.AgentID] = now
+				d.mu.Unlock()
+				if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
+					Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
+					ChosenAction: dec.Input, Source: dec.Source, Confidence: dec.Confidence, CreatedAt: now,
+				}); err != nil {
+					slog.Error("decision record write failed", "error", err)
+				}
+				if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
+					updated := domain.RegisterAutoPrompt(*rate, now)
+					updated.AgentID = s.AgentID
+					if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
+						slog.Error("agent rate update failed", "error", err)
+					}
+				}
+				slog.Info("multi-tab answer series delivered",
+					"agent", s.AgentID, "answers", answerCount, "confidence", dec.Confidence, "audit_id", auditID)
+				d.scheduleUnblockCheck(verifyunblock.Params{
+					PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
+					Signature: sig.Signature, Input: dec.Input, Excerpt: s.Content, SituationType: s.Type,
+				})
 			})
 			return nil
 		})
 	}()
 }
 
-// deliverSeriesLLM is the promotion-path twin of deliverSeries: the audit
-// row is already committed by the caller (FR-024); the keystrokes and the
-// accept/learn/rate writes run off the main loop.
+// deliverSeriesLLM is the promotion-path twin of deliverSeries. Its final
+// disabled check, audit, keystrokes, and accept/learn/rate writes run under the
+// same cross-process lifecycle barrier, off the main loop.
 func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
-	s domain.Situation, sigKey string, llmDec *domain.LLMDecision, groups [][]string,
-	auditID int64, now time.Time) {
+	s domain.Situation, sig domain.SignatureResult, tr domain.AgentTransition,
+	llmDec *domain.LLMDecision, groups [][]string, confidence float64,
+	llmConfidence *int, now time.Time) {
 
 	go func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery-llm", func() error {
-			if err := d.reverifyMultiSelect(ctx, ks, s); err != nil {
-				slog.Warn("multi-select baseline moved before LLM delivery; refusing", "pane", s.PaneID, "error", err)
-				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
-				d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
-					fmt.Sprintf("Agent %s: the multi-select form changed before the answer could be delivered (%v); please review it.", s.AgentID, err))
-				return nil
+			executed := d.withAgentAutomation(ctx, s, sig, tr, llmDec.Action,
+				confidence, llmConfidence, llmDec.CapturedOutput, now, func() {
+					auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+						AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: "llm-fallback",
+						SituationType: s.Type, Action: domain.AuditActionAutoPrefix + llmDec.Action, Input: llmDec.Action,
+						Confidence: confidence, LLMConfidence: llmConfidence,
+						Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
+						Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+					})
+					if err != nil {
+						slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)
+						d.notify(ctx, "Herd Auto Prompter: persistence failure",
+							"An LLM-derived action was blocked because its audit record could not be written.")
+						return
+					}
+					if err := d.reverifyMultiSelect(ctx, ks, s); err != nil {
+						slog.Warn("multi-select baseline moved before LLM delivery; refusing", "pane", s.PaneID, "error", err)
+						d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+						d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+							fmt.Sprintf("Agent %s: the multi-select form changed before the answer could be delivered (%v); please review it.", s.AgentID, err))
+						return
+					}
+					if err := d.sendTabSelections(ctx, ks, s, groups); err != nil {
+						slog.Error("LLM answer series delivery failed", "pane", s.PaneID, "error", err)
+						d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+						d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
+						return
+					}
+					if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "accepted"); err != nil {
+						slog.Error("llm decision status update failed", "error", err)
+					}
+					if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
+						Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
+						ChosenAction: llmDec.Action, Source: domain.SourceLLM, CreatedAt: now,
+					}); err != nil {
+						slog.Error("decision record write failed", "error", err)
+					}
+					if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
+						updated := domain.RegisterAutoPrompt(*rate, now)
+						updated.AgentID = s.AgentID
+						if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
+							slog.Error("agent rate update failed", "error", err)
+						}
+					}
+					d.mu.Lock()
+					d.lastAutoSend[s.AgentID] = now
+					d.mu.Unlock()
+					slog.Info("LLM answer series promoted and delivered", "agent", s.AgentID, "answers", s.EffectiveAnswerCount())
+					d.scheduleUnblockCheck(verifyunblock.Params{
+						PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
+						Signature: sig.Signature, Input: llmDec.Action, Excerpt: s.Content, SituationType: s.Type,
+					})
+				})
+			if !executed {
+				d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
 			}
-			if err := d.sendTabSelections(ctx, ks, s, groups); err != nil {
-				slog.Error("LLM answer series delivery failed", "pane", s.PaneID, "error", err)
-				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
-				d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
-				return nil
-			}
-			if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "accepted"); err != nil {
-				slog.Error("llm decision status update failed", "error", err)
-			}
-			if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
-				Signature: sigKey, SituationType: s.Type, AgentType: s.AgentType,
-				ChosenAction: llmDec.Action, Source: domain.SourceLLM, CreatedAt: now,
-			}); err != nil {
-				slog.Error("decision record write failed", "error", err)
-			}
-			if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
-				updated := domain.RegisterAutoPrompt(*rate, now)
-				updated.AgentID = s.AgentID
-				if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
-					slog.Error("agent rate update failed", "error", err)
-				}
-			}
-			d.mu.Lock()
-			d.lastAutoSend[s.AgentID] = now
-			d.mu.Unlock()
-			slog.Info("LLM answer series promoted and delivered", "agent", s.AgentID, "answers", s.EffectiveAnswerCount())
-			d.scheduleUnblockCheck(verifyunblock.Params{
-				PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
-				Signature: sigKey, Input: llmDec.Action, Excerpt: s.Content, SituationType: s.Type,
-			})
 			return nil
 		})
 	}()

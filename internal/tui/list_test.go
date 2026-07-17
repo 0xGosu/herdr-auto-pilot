@@ -731,6 +731,38 @@ func TestAgentsListRendersStatColumns(t *testing.T) {
 	}
 }
 
+func TestAgentsDisabledIndicatorAndKeys(t *testing.T) {
+	m := Model{width: 120, height: 30}
+	upd, _ := m.Update(refreshMsg{status: frontend.Status{
+		MonitoredAgents: []domain.AgentTransition{{
+			AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "codex", Status: "idle",
+		}},
+		AgentNames:     map[string]string{"w1:p1": "quiet-orca"},
+		DisabledAgents: map[string]bool{"w1:p1": true},
+	}})
+	m = upd.(Model)
+	m.tab = tabAgents
+	if view := m.View(); !strings.Contains(view, "DISABLED") {
+		t.Fatalf("disabled agent needs a clear list indicator:\n%s", view)
+	}
+
+	// e is immediate (no confirmation); with no app attached this still proves
+	// the key dispatch reaches the enable action and returns its command.
+	upd, cmd := m.Update(pressKeyMsg("e"))
+	if cmd == nil {
+		t.Fatal("e on a disabled agent should issue an enable command")
+	}
+	m = upd.(Model)
+
+	// An enabled snapshot must require Y/n confirmation before x mutates it.
+	m.data.status.DisabledAgents = nil
+	upd, cmd = m.Update(pressKeyMsg("x"))
+	m = upd.(Model)
+	if cmd != nil || m.confirm == nil || !strings.Contains(m.confirm.label, "[Y/n]") {
+		t.Fatalf("x should open Y/n disable confirmation, cmd=%v confirm=%+v", cmd != nil, m.confirm)
+	}
+}
+
 func TestAgentsListRowsFitContentWidth(t *testing.T) {
 	// The Agents row is the widest list row (it grew with the TASK column). A
 	// row that wraps silently becomes two screen lines, breaking the

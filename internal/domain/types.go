@@ -262,6 +262,9 @@ type DecisionRecord struct {
 const (
 	// AuditActionEscalated is the audit_log action for an escalation.
 	AuditActionEscalated = "escalated"
+	// AuditActionDenied records an autonomous action suppressed by an
+	// operator-owned guard such as a disabled agent.
+	AuditActionDenied = "denied"
 	// AuditActionAutoPrefix prefixes the action of an autonomous send
 	// ("auto:" + the delivered input); a noop uses "noop", not this prefix.
 	AuditActionAutoPrefix = "auto:"

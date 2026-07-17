@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -862,6 +863,97 @@ func TestAgentNames(t *testing.T) {
 	}
 	if names["w1:p1"] != "reviewer" || names["w2:p1"] != other {
 		t.Errorf("names map: %v", names)
+	}
+}
+
+func TestAgentDisabledState(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	if err := s.AssignAgentName(ctx, "w1:p1", "builder"); err != nil {
+		t.Fatal(err)
+	}
+	if disabled, err := s.AgentDisabled(ctx, "w1:p1"); err != nil || disabled {
+		t.Fatalf("new agent disabled=%v err=%v, want enabled", disabled, err)
+	}
+	if err := s.SetAgentDisabled(ctx, "builder", true); err != nil {
+		t.Fatal(err)
+	}
+	if disabled, err := s.AgentDisabled(ctx, "w1:p1"); err != nil || !disabled {
+		t.Fatalf("disabled=%v err=%v, want true", disabled, err)
+	}
+	all, err := s.DisabledAgents(ctx)
+	if err != nil || !all["w1:p1"] {
+		t.Fatalf("disabled agents=%v err=%v", all, err)
+	}
+	if err := s.RenameAgent(ctx, "builder", "reviewer"); err != nil {
+		t.Fatal(err)
+	}
+	if disabled, _ := s.AgentDisabled(ctx, "w1:p1"); !disabled {
+		t.Error("rename must preserve disabled state")
+	}
+	if err := s.SetAgentDisabled(ctx, "reviewer", false); err != nil {
+		t.Fatal(err)
+	}
+	if disabled, _ := s.AgentDisabled(ctx, "w1:p1"); disabled {
+		t.Error("enable did not clear disabled state")
+	}
+	if err := s.SetAgentDisabled(ctx, "unknown", true); err == nil {
+		t.Error("unknown target must be rejected")
+	}
+}
+
+func TestAgentDisableIsBarrierForInFlightAutomation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "barrier.db")
+	actionStore, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer actionStore.Close()
+	operatorStore, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer operatorStore.Close()
+	ctx := context.Background()
+	if err := actionStore.AssignAgentName(ctx, "w1:p1", "builder"); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	actionDone := make(chan error, 1)
+	go func() {
+		disabled, err := actionStore.WithAgentAutomation(ctx, "w1:p1", func() {
+			close(started)
+			<-release
+		})
+		if err == nil && disabled {
+			err = errors.New("enabled action was unexpectedly denied")
+		}
+		actionDone <- err
+	}()
+	<-started
+
+	disableDone := make(chan error, 1)
+	go func() { disableDone <- operatorStore.SetAgentDisabled(ctx, "builder", true) }()
+	select {
+	case err := <-disableDone:
+		t.Fatalf("disable crossed an in-flight automation barrier: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-actionDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-disableDone; err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	disabled, err := actionStore.WithAgentAutomation(ctx, "w1:p1", func() { called = true })
+	if err != nil || !disabled || called {
+		t.Fatalf("post-disable action: disabled=%v called=%v err=%v", disabled, called, err)
 	}
 }
 

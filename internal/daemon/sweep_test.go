@@ -84,10 +84,12 @@ func TestCodexBlockedMCQEscalatesAsAggregatedChoice(t *testing.T) {
 		codexQuestionFrame(2, 2, 2, "1", false),
 	}
 	h.herdr.setFrames(frames)
-	h.events.ch <- domain.AgentTransition{
+	tr := domain.AgentTransition{
 		AgentID: "agent-codex-escalation", PaneID: "agent-codex-escalation",
 		AgentType: "codex", Status: "blocked",
 	}
+	h.herdr.observeTransition(tr)
+	h.events.ch <- tr
 	ctx := context.Background()
 	waitFor(t, 10*time.Second, func() bool {
 		esc, _ := h.raw.PendingEscalations(ctx)
@@ -518,6 +520,49 @@ func TestLLMMultiTabConsultAndSeriesPromotion(t *testing.T) {
 	keys := strings.Join(h.herdr.keysSent(), " ")
 	if !strings.HasSuffix(keys, "1 2 1") {
 		t.Errorf("promoted series keystrokes missing: %v", keys)
+	}
+}
+
+func TestLLMMultiTabSeriesDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setFrames(mcqFrames)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "1 2 1", Rationale: "defaults", ConfidentScore: 80,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "1 2 1",
+			Rationale: "defaults", ConfidentScore: 80, Status: "pending"}, nil
+	}
+	gate := &pausingAutomationStore{
+		StorePort: h.store, reached: make(chan struct{}), resume: make(chan struct{}),
+	}
+	h.daemon.opt.Store = gate
+	h.push("agent-mcqllm-disabled", "blocked")
+	select {
+	case <-gate.reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("LLM series did not reach its final lifecycle barrier")
+	}
+	if err := h.raw.SetAgentDisabled(context.Background(), "agent-mcqllm-disabled", true); err != nil {
+		t.Fatal(err)
+	}
+	keysBefore := len(h.herdr.keysSent())
+	close(gate.resume)
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(context.Background(), 10)
+		return len(audits) == 1 && audits[0].Status == "denied"
+	})
+	if keysAfter := len(h.herdr.keysSent()); keysAfter != keysBefore {
+		t.Fatalf("LLM series sent %d keystroke(s) after disable won barrier", keysAfter-keysBefore)
+	}
+	audits, _ := h.raw.AuditLog(context.Background(), 10)
+	if audits[0].Action != domain.AuditActionDenied || audits[0].Rationale != "[agent_disabled]" {
+		t.Fatalf("LLM series denied audit = %+v", audits[0])
 	}
 }
 
