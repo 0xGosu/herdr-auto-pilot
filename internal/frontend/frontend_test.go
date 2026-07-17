@@ -1928,6 +1928,52 @@ func signatureRowFor(mode domain.Mode, conf float64, top string) frontend.Signat
 	}
 }
 
+func TestTotalDecisionsCountsBeyondTheHistoryWindow(t *testing.T) {
+	// The delete prompts quote TotalDecisions, and DeleteSignature erases every
+	// row with one unfiltered DELETE while nothing prunes the table — so a rule
+	// outlives any read window. Deriving the count from the 50-row history slice
+	// would confirm "and its 50 decision(s)" and then destroy 63.
+	const total = 63
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:long", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+	})
+	for i := 0; i < total; i++ {
+		if _, err := st.RecordDecision(ctx, domain.DecisionRecord{
+			Signature: "approval:long", SituationType: domain.SituationApproval,
+			ChosenAction: "y", CreatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	row, _, err := app.SignatureDetail(ctx, "approval:long")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.TotalDecisions != total {
+		t.Errorf("detail TotalDecisions = %d, want %d (the window would cap it at 50)", row.TotalDecisions, total)
+	}
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("Signatures: %+v, %v", rows, err)
+	}
+	if rows[0].TotalDecisions != total {
+		t.Errorf("listing TotalDecisions = %d, want %d", rows[0].TotalDecisions, total)
+	}
+	// The count the prompt quotes must equal what the delete actually erases.
+	_, deleted, err := app.DeleteSignature(ctx, "approval:long")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(deleted) != row.TotalDecisions {
+		t.Errorf("delete erased %d decisions but the prompt quoted %d", deleted, row.TotalDecisions)
+	}
+}
+
 func TestSignatureDetail(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()

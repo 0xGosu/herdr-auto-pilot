@@ -262,6 +262,10 @@ type MCPStore interface {
 type ReadStore interface {
 	GetSignature(ctx context.Context, signature string) (*domain.SignatureState, error)
 	DecisionsForSignature(ctx context.Context, signature string, limit int) ([]domain.DecisionRecord, error)
+	// CountDecisionsForSignature counts ALL of a signature's decisions, with no
+	// window — what a delete actually erases. Never derive that count from
+	// DecisionsForSignature's capped slice.
+	CountDecisionsForSignature(ctx context.Context, signature string) (int, error)
 	LatestKillEvent(ctx context.Context) (*domain.KillEvent, error)
 	KillEvents(ctx context.Context, limit int) ([]domain.KillEvent, error)
 	AuditLog(ctx context.Context, limit int) ([]domain.AuditRecord, error)

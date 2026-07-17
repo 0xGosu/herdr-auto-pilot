@@ -2256,11 +2256,13 @@ type SignatureRow struct {
 	// belongs beside a confidence figure. It is NOT how much history exists:
 	// use TotalDecisions for anything describing the stored rows themselves.
 	Decisions int
-	// TotalDecisions counts every decision row the rule holds, floor included.
-	// DeleteSignature erases them all regardless of the floor, so the delete
-	// prompts must quote THIS — a reset rule has Decisions == 0 while still
-	// carrying history, and a confirmation that says "0 decision(s)" before
-	// erasing N understates what the operator is about to lose.
+	// TotalDecisions counts every decision row the rule holds — floor included
+	// and UNWINDOWED (an exact COUNT, not the length of a capped read).
+	// DeleteSignature erases them all in one unfiltered DELETE and nothing
+	// prunes the table, so the delete prompts must quote THIS. Both ways of
+	// deriving it from other fields understate the loss in the very
+	// confirmation meant to prevent it: a reset rule has Decisions == 0 while
+	// still carrying history, and a long-lived rule outgrows any read window.
 	TotalDecisions int
 	LastAudit      *domain.AuditRecord
 	// PaneExcerpt is the pane snapshot the signature was first seen with
@@ -2355,10 +2357,16 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 		if f.MinConfidence > 0 && conf.Score < f.MinConfidence {
 			continue
 		}
+		// An exact count, not len(history): history is a capped window, and the
+		// delete prompts this feeds erase every row.
+		total, err := a.Store.CountDecisionsForSignature(ctx, st.Signature)
+		if err != nil {
+			return nil, err
+		}
 		rows = append(rows, SignatureRow{
 			SignatureState: st, Confidence: conf.Score,
 			TopAction: conf.TopAction, Decisions: conf.Decisions,
-			TotalDecisions: len(history),
+			TotalDecisions: total,
 		})
 	}
 	return rows, nil
@@ -2384,9 +2392,15 @@ func (a *App) SignatureDetail(ctx context.Context, prefix string) (SignatureRow,
 		return row, nil, err
 	}
 	conf := domain.LiveConfidence(history, st.DecisionFloorID, a.confirmationWeight())
+	// An exact count, not len(history): history is a capped window, and the
+	// delete prompts this feeds erase every row.
+	total, err := a.Store.CountDecisionsForSignature(ctx, sig)
+	if err != nil {
+		return row, nil, err
+	}
 	row = SignatureRow{SignatureState: *st, Confidence: conf.Score,
 		TopAction: conf.TopAction, Decisions: conf.Decisions,
-		TotalDecisions: len(history)}
+		TotalDecisions: total}
 	audit, err := a.Store.LatestAuditForSignature(ctx, sig)
 	if err != nil {
 		return row, nil, err
