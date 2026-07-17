@@ -218,9 +218,11 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
   blocked.** Herdr shows no blocked status while the modal stands (verified live 2026-07-17), so
   hap detects it structurally (`domain.ClaudeRemoteEnvForm`: title + `❯ N.` options + end-anchored
   "Enter to select · Esc to cancel" footer) and classifies it as a parked APPROVAL at idle/done —
-  same exception pattern as Codex's Plan approval. Its commit protocol is unverified, so all
-  paths answer it adaptively via `mcqdeliver.ClaudeRemoteEnv` (digit → verify caret → Enter),
-  failing closed when the learned label matches none of the offered environments.
+  same exception pattern as Codex's Plan approval. Verified live (2026-07-17): despite the
+  "Enter to select" footer, the digit alone COMMITS the selection (the picker closes, no Enter) —
+  but all paths still answer it adaptively via `mcqdeliver.ClaudeRemoteEnv` (digit → verify
+  caret → Enter only if still standing) in case a build ships the caret binding, failing closed
+  when the learned label matches none of the offered environments.
 - **`pane read --source recent` is a consuming delta**, not the screen: after one read (e.g. the
   daemon's classification read) it can return just the cursor line. To recover a standing menu at
   confirm time, read `--source visible` (`herdr.CLI.ReadPaneVisible` / `ports.VisiblePaneReader`).

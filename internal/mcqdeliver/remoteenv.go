@@ -20,11 +20,12 @@ import (
 // another project's environment list must never commit whatever the caret
 // happens to rest on.
 //
-// The picker's commit protocol is unverified ("Enter to select" suggests the
-// digit only moves the caret, but Claude has shipped both bindings for
-// identically-footered forms), so delivery is ADAPTIVE like answerTab: press
-// the digit, re-read, and press Enter only if the picker is still standing
-// with the caret verified on the chosen option.
+// Verified live 2026-07-17: the current Claude build COMMITS on the digit
+// alone (the picker closes immediately; Enter is never needed), despite the
+// "Enter to select" footer. Claude has shipped both bindings for
+// identically-footered forms though, so delivery stays ADAPTIVE like
+// answerTab: press the digit, re-read, and press Enter only if the picker is
+// still standing with the caret verified on the chosen option.
 func ClaudeRemoteEnv(ctx context.Context, c Config, chosen string) error {
 	form, ok, err := c.remoteEnvState(ctx)
 	if err != nil {

@@ -1136,7 +1136,7 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		return
 	}
 
-	// Claude's "Select remote environment" picker has an unverified commit
+	// Claude's "Select remote environment" picker commits per a per-build
 	// protocol (the digit may only move the caret), so answer it adaptively
 	// via verified keystrokes. Without the keystroke capability this FAILS
 	// CLOSED to escalation: the plain text send below would type the literal
@@ -2740,7 +2740,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	}
 	// Claude's remote-environment picker takes the adaptive keystroke
 	// deliverer for the same reason as the act path: its commit protocol is
-	// unverified, so a blind digit + Enter send could no-op or double-commit.
+	// per-build, so a blind digit + Enter send could no-op or double-commit.
 	// The freshness gate above only proves SOME picker is standing (the
 	// approval salient is verb-only); the deliverer's live label→digit
 	// mapping is what rejects a swapped environment list. Without keystroke

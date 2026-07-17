@@ -795,7 +795,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 			markSent()
 			return a.nudge(ctx, control.KindReload)
 		}
-		// Claude's remote-environment picker commits per an unverified
+		// Claude's remote-environment picker commits per a per-build
 		// protocol (the digit may only move the caret), so a standing picker
 		// is answered via the adaptive keystroke deliverer. A keystroke-less
 		// adapter falls through to the plain digit + Enter send below ONLY
