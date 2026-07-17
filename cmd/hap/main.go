@@ -71,7 +71,8 @@ Configure:
   rules [list|add <regex>|remove <index>]      never-auto patterns
   task-source [add] [--agent A] [--workspace W] [--template T] <checklist.md> | list | remove <index>
   task [<agent> | --path F] list [--status all|pending|done] | get <n> | add <text>
-                        | done <n> | undone <n> | update <n> <text> | remove <n>
+                        | start <n> | done <n> | undone <n> | update <n> <text>
+                        | remove <n> | send <n> [--yes]
                         CRUD the checklist items in an agent's task list
   clear-data --yes      reset learned history + audit data
 
