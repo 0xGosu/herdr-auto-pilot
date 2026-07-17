@@ -110,9 +110,9 @@ func TestRewriteSkippedForMenuMappedApproval(t *testing.T) {
 	}
 }
 
-func TestRewriteFailureSendsFallbackWrappedOriginal(t *testing.T) {
+func TestRewriteFailureSendsOriginalAsIs(t *testing.T) {
 	// A rewrite failure never blocks the send — the original is delivered
-	// inside the default quoting template.
+	// exactly as it was, unwrapped (the default fallback is passthrough).
 	h, _, original := idleRewriteHarness(t, "agent-rw3", "",
 		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
 			return "", errors.New("induced rewrite failure")
@@ -120,9 +120,8 @@ func TestRewriteFailureSendsFallbackWrappedOriginal(t *testing.T) {
 
 	h.push("agent-rw3", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := "You must act based on the following: " + original
-	if got := h.herdr.sentInputs()[0]; got != want {
-		t.Errorf("sent %q, want fallback-wrapped original %q", got, want)
+	if got := h.herdr.sentInputs()[0]; got != original {
+		t.Errorf("sent %q, want the original as-is %q", got, original)
 	}
 
 	audits, _ := h.raw.AuditLog(context.Background(), 10)
@@ -153,7 +152,7 @@ func TestRewriteCustomFallbackTemplate(t *testing.T) {
 func TestRewrittenTextTrippingNeverAutoFallsBack(t *testing.T) {
 	// SC-5/FR-015: the rewriter is an LLM authoring outbound text — output
 	// naming an irreversible operation is discarded and the safe original
-	// (wrapped) is delivered instead.
+	// is delivered as-is instead.
 	h, _, original := idleRewriteHarness(t, "agent-rw5", "",
 		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
 			return "sounds good, just force-push the branch afterwards", nil
@@ -161,9 +160,8 @@ func TestRewrittenTextTrippingNeverAutoFallsBack(t *testing.T) {
 
 	h.push("agent-rw5", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := "You must act based on the following: " + original
-	if got := h.herdr.sentInputs()[0]; got != want {
-		t.Errorf("sent %q, want the dangerous rewrite discarded for %q", got, want)
+	if got := h.herdr.sentInputs()[0]; got != original {
+		t.Errorf("sent %q, want the dangerous rewrite discarded for the original %q", got, original)
 	}
 	audits, _ := h.raw.AuditLog(context.Background(), 10)
 	if len(audits) == 0 || !strings.Contains(audits[0].Rationale, "never-auto") {
@@ -431,5 +429,237 @@ func TestRewriteAuditFailureBlocksSend(t *testing.T) {
 	})
 	if got := h.herdr.sentInputs(); len(got) != 0 {
 		t.Errorf("audit failure must block the send (FR-024), sent %v", got)
+	}
+}
+
+func TestRewriteEmptyOutputSendsOriginal(t *testing.T) {
+	// Empty rewriter output (no adapter error) degrades to the original,
+	// delivered exactly as it was.
+	h, _, original := idleRewriteHarness(t, "agent-rw15", "",
+		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
+			return "", nil
+		})
+
+	h.push("agent-rw15", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != original {
+		t.Errorf("sent %q, want the original as-is %q", got, original)
+	}
+	audits, _ := h.raw.AuditLog(context.Background(), 10)
+	if len(audits) == 0 || !strings.Contains(audits[0].Rationale, "empty output") {
+		t.Errorf("audit rationale should note the empty rewrite: %+v", audits)
+	}
+}
+
+func TestRewriteNoChangeSendsOriginalVerbatim(t *testing.T) {
+	// "@rewrite:nochange" affirms the original: it is sent verbatim, even
+	// when a custom fallback template is configured — the template frames
+	// failures, not agreements.
+	extra := "[llm]\nrewrite_fallback_template = \"Operator rule says: {original_text}\"\n"
+	h, _, original := idleRewriteHarness(t, "agent-rw16", extra,
+		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
+			return "  @Rewrite:NoChange \n", nil
+		})
+
+	h.push("agent-rw16", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != original {
+		t.Errorf("sent %q, want the original verbatim %q", got, original)
+	}
+	audits, _ := h.raw.AuditLog(context.Background(), 10)
+	if len(audits) == 0 || !strings.Contains(audits[0].Rationale, "@rewrite:nochange") {
+		t.Errorf("audit rationale should note the nochange sentinel: %+v", audits)
+	}
+	// Learning stays symbolic — the sentinel must not enter history.
+	if len(audits) > 0 {
+		decs, _ := h.raw.DecisionsForSignature(context.Background(), audits[0].Signature, 50)
+		if len(decs) == 0 || decs[0].ChosenAction != domain.ActionNextDeclaredTask {
+			t.Errorf("learned action drifted: %+v", decs)
+		}
+	}
+}
+
+func TestRewriteNoopSendsNothing(t *testing.T) {
+	// "@noop": the LLM vetoed the send. Nothing reaches the pane, a noop
+	// audit row lands, the runaway counter advances — and the learned rule
+	// is untouched (no @noop decision recorded, so the veto cannot stand
+	// the declared-task rule down permanently).
+	h, _, original := idleRewriteHarness(t, "agent-rw17", "",
+		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
+			return "@noop", nil
+		})
+
+	h.push("agent-rw17", "idle")
+	// The rate write is the LAST persistence step in deliverRewriteNoop;
+	// waiting on it (not the audit, which lands first) avoids racing the
+	// delivery tail.
+	waitFor(t, 3*time.Second, func() bool {
+		rate, err := h.raw.GetAgentRate(context.Background(), "agent-rw17")
+		return err == nil && rate.ConsecutiveAuto == 1
+	})
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("@noop must not send, sent %v", got)
+	}
+
+	audits, _ := h.raw.AuditLog(context.Background(), 10)
+	if len(audits) == 0 || audits[0].Status != "auto" || audits[0].Action != "noop" {
+		t.Fatalf("want a noop auto audit row first, got %+v", audits)
+	}
+	noop := audits[0]
+	if noop.Input != "" || noop.LLMOutput != domain.ActionNoop {
+		t.Errorf("noop audit row malformed: %+v", noop)
+	}
+	if !strings.Contains(noop.Rationale, "rewrite declined to send") ||
+		!strings.Contains(noop.Rationale, original[:20]) {
+		t.Errorf("noop rationale should carry the veto and the original: %q", noop.Rationale)
+	}
+
+	decs, err := h.raw.DecisionsForSignature(context.Background(), noop.Signature, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, dec := range decs {
+		if dec.ChosenAction == domain.ActionNoop {
+			t.Errorf("rewrite noop must not be recorded as a decision: %+v", dec)
+		}
+	}
+}
+
+func TestRewriteNoopRateGuardEscalates(t *testing.T) {
+	// A saturated runaway counter beats even a noop outcome: the situation
+	// escalates (suggesting "do nothing") instead of silently nooping —
+	// the operator must see a rate-limited agent, whatever the LLM said.
+	release := make(chan struct{})
+	h, fr, _ := idleRewriteHarness(t, "agent-rw22", "",
+		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
+			<-release
+			return "@noop", nil
+		})
+
+	h.push("agent-rw22", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(fr.rewriteCalls()) == 1 })
+	h.raw.UpdateAgentRate(context.Background(), domain.AgentRate{
+		AgentID: "agent-rw22", ConsecutiveAuto: 1000, WindowStart: time.Now(), CountInWindow: 1000,
+	})
+	close(release)
+
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(context.Background(), 10)
+		for _, a := range audits {
+			if a.Status == "escalated" && strings.Contains(a.Rationale, "[rate_limited]") {
+				return true
+			}
+		}
+		return false
+	})
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("rate guard must block everything, sent %v", got)
+	}
+	audits, _ := h.raw.AuditLog(context.Background(), 10)
+	for _, a := range audits {
+		if a.Status == "escalated" && a.Suggestion != domain.ActionNoopSuggestion {
+			t.Errorf("escalation should suggest doing nothing, got %q", a.Suggestion)
+		}
+		if a.Status == "auto" {
+			t.Errorf("a rate-limited noop must not audit as auto: %+v", a)
+		}
+	}
+}
+
+func TestRewriteNoopSentinelSpellingExact(t *testing.T) {
+	// Case and surrounding whitespace are tolerated on the sentinel...
+	h, _, _ := idleRewriteHarness(t, "agent-rw18", "",
+		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
+			return " @NoOp \n", nil
+		})
+	h.push("agent-rw18", "idle")
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(context.Background(), 10)
+		return len(audits) > 0 && audits[0].Action == "noop"
+	})
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("case-variant @noop must stand down, sent %v", got)
+	}
+
+	// ...but a bare "noop" is free text a rewrite could legitimately
+	// produce, so it is delivered literally.
+	h2, _, _ := idleRewriteHarness(t, "agent-rw19", "",
+		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
+			return "noop", nil
+		})
+	h2.push("agent-rw19", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(h2.herdr.sentInputs()) == 1 })
+	if got := h2.herdr.sentInputs()[0]; got != "noop" {
+		t.Errorf("bare noop is not a sentinel; sent %q, want literal \"noop\"", got)
+	}
+}
+
+func TestRewriteNoopKillSwitchEscalates(t *testing.T) {
+	// A kill switch raised mid-flight still wins over a noop outcome, and
+	// the escalation suggests doing nothing — not sending the original the
+	// LLM just vetoed.
+	release := make(chan struct{})
+	h, fr, _ := idleRewriteHarness(t, "agent-rw20", "",
+		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
+			<-release
+			return "@noop", nil
+		})
+
+	h.push("agent-rw20", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(fr.rewriteCalls()) == 1 })
+	h.raw.InsertKillEvent(context.Background(), domain.KillEvent{
+		State: "active", Scope: "global", Author: "test", CreatedAt: time.Now(),
+	})
+	close(release)
+
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(context.Background(), 10)
+		for _, a := range audits {
+			if a.Status == "escalated" && strings.Contains(a.Rationale, "[daemon_paused]") {
+				return true
+			}
+		}
+		return false
+	})
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("kill switch must block everything, sent %v", got)
+	}
+	audits, _ := h.raw.AuditLog(context.Background(), 10)
+	for _, a := range audits {
+		if a.Status == "escalated" && a.Suggestion != domain.ActionNoopSuggestion {
+			t.Errorf("escalation should suggest doing nothing, got %q", a.Suggestion)
+		}
+		if a.Status == "auto" {
+			t.Errorf("nothing may auto-run under the kill switch: %+v", a)
+		}
+	}
+}
+
+func TestRewriteNoopAuditFailureNotifies(t *testing.T) {
+	// FR-024 holds for the noop path too: no audit record, no state
+	// advance — and the operator is notified.
+	release := make(chan struct{})
+	h, fr, _ := idleRewriteHarness(t, "agent-rw21", "",
+		func(ctx context.Context, req domain.RewriteRequest) (string, error) {
+			<-release
+			return "@noop", nil
+		})
+
+	h.push("agent-rw21", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(fr.rewriteCalls()) == 1 })
+	h.store.(*failingStore).setFailAudit(true)
+	close(release)
+
+	waitFor(t, 3*time.Second, func() bool {
+		for _, n := range h.herdr.notified() {
+			if strings.Contains(n, "persistence failure") {
+				return true
+			}
+		}
+		return false
+	})
+	rate, err := h.raw.GetAgentRate(context.Background(), "agent-rw21")
+	if err != nil || rate.ConsecutiveAuto != 0 {
+		t.Errorf("blocked noop must not advance the runaway counter: %+v (%v)", rate, err)
 	}
 }

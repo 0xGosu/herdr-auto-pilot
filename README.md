@@ -920,12 +920,12 @@ text**.
 [llm]
 rewrite_command = [
   "claude", "-p",
-  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
+  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text — or @rewrite:nochange if the instruction is already right as-is, or @noop if nothing should be sent at all.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
   "--model", "haiku",
 ]
 rewrite_timeout_seconds = 30   # omitted: inherits timeout_seconds
-# Wraps the original when the rewrite fails (never blocks the send):
-rewrite_fallback_template = "You must act based on the following: {original_text}"
+# On rewrite failure the ORIGINAL text is sent as-is; set this only to wrap it:
+# rewrite_fallback_template = "You must act based on the following: {original_text}"
 # Optional: runs instead of rewrite_command on the agent's FIRST rewrite
 # (same first-interaction boundary as command_start, tracked independently;
 # empty inherits rewrite_command):
@@ -935,7 +935,8 @@ rewrite_fallback_template = "You must act based on the following: {original_text
 As with consult commands, a rewrite command that exits with an error in under
 one second is retried once with the other configured rewrite template
 (`rewrite_command` ↔ `rewrite_command_start`). Timeouts and clean empty or
-oversized output use the normal rewrite fallback instead of retrying.
+oversized output deliver the original as-is (or your
+`rewrite_fallback_template`) instead of retrying.
 
 Placeholders in `rewrite_command`: `{text}` (the literal reply a rule
 resolved to), `{situation_type}`, `{agent_type}`, `{agent_name}` (the
@@ -953,13 +954,22 @@ Invariants:
 - **Numbered-menu answers are never rewritten** — a mapped digit reaches
   the menu untouched. Only literal free text goes through the rewriter.
 - **A rewrite failure never blocks the send**: on error, timeout, or empty
-  output the original text is delivered wrapped in
+  output the original text is delivered exactly as it was. Set
   `rewrite_fallback_template` (`{original_text}`, `{agent_name}`
-  placeholders; empty or `{original_text}`-less templates fall back to the
-  built-in default).
+  placeholders) to wrap it instead; empty or `{original_text}`-less
+  templates fall back to the as-is default.
+- **`@rewrite:nochange` sends the original verbatim** — the rewrite CLI can
+  reply with just this sentinel to affirm the instruction, bypassing any
+  configured fallback template. All safety re-gates still run on the
+  original.
+- **`@noop` sends nothing at all** — the rewrite CLI judged that no reply is
+  better than this send. The veto is audited as a `noop` row and the runaway
+  counter still advances, but nothing is learned from it (the underlying
+  rule is untouched). Only the exact `@`-prefixed sentinel counts; a bare
+  `noop` is delivered as literal text.
 - **Safety controls still apply to the rewritten text**: output matching
   the never-auto patterns or the irreversible-operation heuristic is
-  discarded in favor of the wrapped original; if even that trips, the
+  discarded in favor of the original; if even that trips, the
   situation escalates instead of sending. Kill switch, rate guard, and a
   staleness re-check (the pane must still show the same situation) run
   again at delivery time.
