@@ -468,6 +468,7 @@ hap task backend-dev list                 # all items, with status + number
 hap task backend-dev list --status pending  # or: done | all (default all)
 hap task backend-dev get 3                 # show one item
 hap task backend-dev add "wire up retries" # append a new unchecked item
+hap task backend-dev start 2               # mark item 2 in-progress ([-])
 hap task backend-dev done 2                # tick item 2 off ([x])
 hap task backend-dev undone 2              # re-open item 2 ([ ])
 hap task backend-dev update 2 "new text"   # edit text, keep status
@@ -526,7 +527,7 @@ agent to manage its list through the `hap task` CLI with its own name pre-filled
 in every command (and a `--path` fallback for sources that aren't name-addressable):
 
 ```
-Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them and `hap task {agent_name} done <n>` to mark one complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`).
+Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them, `hap task {agent_name} start <n>` to mark one in-progress when you begin working on it, and `hap task {agent_name} done <n>` to mark it complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`).
 ```
 
 - `{next_task_content}` — the text of the next unchecked item (or `"none"` when the list is complete)

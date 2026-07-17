@@ -1001,6 +1001,65 @@ func TestTaskCRUDByPath(t *testing.T) {
 	}
 }
 
+// TestTaskStartMarksInProgress covers the `task start` op the default
+// next-task template steers agents to run when they begin a task: it writes
+// the [-] in-progress marker (the same one the send path's reserveTask uses).
+func TestTaskStartMarksInProgress(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] first\n- [ ] second\n")
+
+	out, err := run(t, app, "task", "--path", path, "start", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "task #2 marked in-progress") {
+		t.Errorf("start must report the item as in-progress, got:\n%s", out)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "- [ ] first\n- [-] second\n"
+	if string(data) != want {
+		t.Errorf("file after start:\n got %q\nwant %q", string(data), want)
+	}
+
+	// wip is an alias for start.
+	if _, err := run(t, app, "task", "--path", path, "wip", "1"); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "- [-] first\n- [-] second\n"; string(data) != want {
+		t.Errorf("file after wip:\n got %q\nwant %q", string(data), want)
+	}
+
+	// start on a done item re-opens it as in-progress (marker rewritten
+	// unconditionally, like done/undone).
+	if _, err := run(t, app, "task", "--path", path, "done", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, app, "task", "--path", path, "start", "1"); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "- [-] first\n- [-] second\n"; string(data) != want {
+		t.Errorf("file after re-opening a done item:\n got %q\nwant %q", string(data), want)
+	}
+
+	if _, err := run(t, app, "task", "--path", path, "start", "99"); err == nil {
+		t.Error("out-of-range start must error")
+	}
+	if _, err := run(t, app, "task", "--path", path, "start"); err == nil {
+		t.Error("start without a task number must error")
+	}
+}
+
 func TestTaskByAgentResolvesSource(t *testing.T) {
 	app, _ := testApp(t)
 	path := writeTaskFile(t, "- [ ] alpha\n- [ ] beta\n")

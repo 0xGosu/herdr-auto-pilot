@@ -2209,6 +2209,22 @@ func (a *App) SetTaskDone(agent, path string, index int, done bool, expectText .
 	}))
 }
 
+// MarkTaskInProgress sets an item's checkbox to the [-] in-progress marker —
+// what an agent runs (`hap task <agent> start <n>`) when it begins working a
+// task, and the same marker the send path's reserveTask writes. Like
+// SetTaskDone it rewrites the marker unconditionally (starting a done item
+// re-opens it as in-progress). An optional expectText aborts (inside the file
+// lock) if the item's text no longer matches — see expectTaskText.
+func (a *App) MarkTaskInProgress(agent, path string, index int, expectText ...string) ([]domain.ChecklistItem, error) {
+	p, err := a.taskFilePath(agent, path)
+	if err != nil {
+		return nil, err
+	}
+	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
+		return domain.MarkChecklistItemInProgress(content, index)
+	}))
+}
+
 // EditTask replaces an item's text (keeping its status) and returns the list.
 // Line breaks in the new text are stored as literal `\n` sequences — the item
 // stays one task on one line (see AddTask). An optional expectText aborts

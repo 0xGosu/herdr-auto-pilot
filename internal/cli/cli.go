@@ -947,7 +947,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 // position among all items in the file; every mutating op re-prints the
 // renumbered list so the caller always sees fresh numbers.
 func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | done <n> | undone <n> | update <n> <text> | remove <n> | send <n> [--yes]"
+	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | send <n> [--yes]"
 	agent, path, args, err := taskTarget(args)
 	if err != nil {
 		return err
@@ -985,6 +985,8 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 		fmt.Fprintf(out, "added task #%d\n", idx)
 		printTaskList(out, items, "all")
 		return nil
+	case "start", "wip":
+		return taskStart(app, out, agent, path, rest)
 	case "done", "check":
 		return taskToggle(app, out, agent, path, rest, true)
 	case "undone", "uncheck", "reopen":
@@ -1191,6 +1193,22 @@ func taskToggle(app *frontend.App, out io.Writer, agent, path string, rest []str
 		state = "pending"
 	}
 	fmt.Fprintf(out, "task #%d marked %s\n", idx, state)
+	printTaskList(out, items, "all")
+	return nil
+}
+
+// taskStart marks item n with the [-] in-progress marker — the op the default
+// next-task template tells an agent to run when it begins working a task.
+func taskStart(app *frontend.App, out io.Writer, agent, path string, rest []string) error {
+	idx, err := taskIndexArg(rest)
+	if err != nil {
+		return err
+	}
+	items, err := app.MarkTaskInProgress(agent, path, idx)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "task #%d marked in-progress\n", idx)
 	printTaskList(out, items, "all")
 	return nil
 }

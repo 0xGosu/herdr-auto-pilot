@@ -405,9 +405,11 @@ error = "#ff5f5f"
 # the agent to manage its list through the hap CLI with its own name pre-filled
 # (and a --path fallback for sources that aren't name-addressable):
 #   "Your next task is {next_task_content}. Prefer the hap CLI to manage your
-#    tasks: `hap task {agent_name} list` to view them and `hap task {agent_name}
-#    done <n>` to mark one complete as you go (if that name isn't recognized,
-#    use `--path {task_list_path}` in place of `{agent_name}`)."
+#    tasks: `hap task {agent_name} list` to view them, `hap task {agent_name}
+#    start <n>` to mark one in-progress when you begin working on it, and
+#    `hap task {agent_name} done <n>` to mark it complete as you go (if that
+#    name isn't recognized, use `--path {task_list_path}` in place of
+#    `{agent_name}`)."
 # When every item is checked off, the templated prompt is never sent: the
 # plugin escalates a confirmable @noop suggestion ("No more pending tasks")
 # instead — unless BOTH llm.task_generate_command and
