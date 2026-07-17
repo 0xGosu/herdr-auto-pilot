@@ -11,14 +11,18 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -30,7 +34,8 @@ import (
 
 // Store is the SQLite-backed implementation of ports.StorePort.
 type Store struct {
-	db *sql.DB
+	db           *sql.DB
+	agentLockDir string
 }
 
 // Open opens (creating if needed) the database at path with WAL mode and a
@@ -50,7 +55,7 @@ func Open(path string) (*Store, error) {
 	}
 	// SQLite serializes writers; a small pool avoids needless SQLITE_BUSY.
 	db.SetMaxOpenConns(2)
-	s := &Store{db: db}
+	s := &Store{db: db, agentLockDir: filepath.Join(filepath.Dir(path), "agent-automation-locks")}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -1473,6 +1478,11 @@ func (s *Store) SetAgentDisabled(ctx context.Context, target string, disabled bo
 	if err != nil {
 		return err
 	}
+	unlock, err := s.lockAgentAutomation(ctx, agentID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	value := 0
 	if disabled {
 		value = 1
@@ -1490,6 +1500,56 @@ func (s *Store) SetAgentDisabled(ctx context.Context, target string, disabled bo
 		return fmt.Errorf("no agent known as %q: %w", target, ports.ErrUnknownAgent)
 	}
 	return nil
+}
+
+// WithAgentAutomation is the final cross-process lifecycle barrier around an
+// autonomous action. The file lock gives SetAgentDisabled and the daemon one
+// total order: either disable commits first and fn is skipped, or the action
+// completes before disable can commit and return to the operator.
+func (s *Store) WithAgentAutomation(ctx context.Context, agentID string,
+	fn func()) (bool, error) {
+	unlock, err := s.lockAgentAutomation(ctx, agentID)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	disabled, err := s.AgentDisabled(ctx, agentID)
+	if err != nil || disabled {
+		return disabled, err
+	}
+	fn()
+	return false, nil
+}
+
+func (s *Store) lockAgentAutomation(ctx context.Context, agentID string) (func(), error) {
+	if err := os.MkdirAll(s.agentLockDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create agent automation lock directory: %w", err)
+	}
+	sum := sha256.Sum256([]byte(agentID))
+	path := filepath.Join(s.agentLockDir, fmt.Sprintf("%x.lock", sum[:16]))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open agent automation lock: %w", err)
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() {
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				_ = f.Close()
+			}, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			_ = f.Close()
+			return nil, fmt.Errorf("lock agent automation: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 // AgentDisabled reports whether automation is disabled for an agent id.

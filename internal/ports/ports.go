@@ -163,6 +163,10 @@ type StorePort interface {
 // DaemonStore is the daemon-exclusive write surface plus shared reads.
 type DaemonStore interface {
 	ReadStore
+	// WithAgentAutomation serializes a final disabled-state check and an
+	// autonomous action against SetAgentDisabled across processes. It returns
+	// disabled=true without calling fn when the operator disabled the agent.
+	WithAgentAutomation(ctx context.Context, agentID string, fn func()) (disabled bool, err error)
 
 	UpsertSignature(ctx context.Context, s domain.SignatureState) error
 	RecordDecision(ctx context.Context, d domain.DecisionRecord) (int64, error)

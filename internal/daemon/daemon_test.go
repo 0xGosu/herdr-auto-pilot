@@ -427,6 +427,27 @@ type failingStore struct {
 	failDedup   bool
 }
 
+// pausingAutomationStore lets a test stop immediately before the real
+// cross-process lifecycle claim, so an operator disable can deterministically
+// win the race and prove the delivery path rechecks under the barrier.
+type pausingAutomationStore struct {
+	ports.StorePort
+	reached chan struct{}
+	resume  chan struct{}
+	once    sync.Once
+}
+
+func (s *pausingAutomationStore) WithAgentAutomation(ctx context.Context,
+	agentID string, fn func()) (bool, error) {
+	s.once.Do(func() { close(s.reached) })
+	select {
+	case <-s.resume:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	return s.StorePort.WithAgentAutomation(ctx, agentID, fn)
+}
+
 func (f *failingStore) setFailAudit(v bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -782,6 +803,48 @@ func TestLLMPromotionDeliversMenuDigitForLabel(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
 	if got := h.herdr.sentInputs()[0]; got != "1" {
 		t.Errorf("promoted LLM label \"Yes\" delivered as %q, want digit \"1\"", got)
+	}
+}
+
+func TestLLMPromotionDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(approvalPane)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "Yes", Rationale: "approve", ConfidentScore: 80,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "Yes",
+			Rationale: "approve", ConfidentScore: 80, Status: "pending"}, nil
+	}
+	gate := &pausingAutomationStore{
+		StorePort: h.store, reached: make(chan struct{}), resume: make(chan struct{}),
+	}
+	h.daemon.opt.Store = gate
+	h.push("agent-llm-disabled", "blocked")
+	select {
+	case <-gate.reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("LLM promotion did not reach its final lifecycle barrier")
+	}
+	if err := h.raw.SetAgentDisabled(context.Background(), "agent-llm-disabled", true); err != nil {
+		t.Fatal(err)
+	}
+	close(gate.resume)
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(context.Background(), 10)
+		return len(audits) == 1 && audits[0].Status == "denied"
+	})
+	if sent := h.herdr.sentInputs(); len(sent) != 0 {
+		t.Fatalf("LLM promotion crossed disable barrier: %v", sent)
+	}
+	audits, _ := h.raw.AuditLog(context.Background(), 10)
+	if audits[0].Action != domain.AuditActionDenied || audits[0].Rationale != "[agent_disabled]" {
+		t.Fatalf("LLM denied audit = %+v", audits[0])
 	}
 }
 
@@ -1852,7 +1915,13 @@ func TestRunawayGuardPausesAgent(t *testing.T) {
 	})
 
 	// Confirming the escalation is a human-initiated send: it delivers the
-	// retained action and resumes this agent's automation.
+	// retained action and resumes this agent's automation. Confirmation also
+	// reloads the daemon, so pin the authoritative post-send snapshot to working;
+	// otherwise reconciliation can re-drive the intentionally stale blocked
+	// event and immediately pause the agent again.
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: "agent-8", PaneID: "agent-8", AgentType: "claude", Status: "working",
+	}})
 	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
 	if err := app.Confirm(context.Background(), escalation.ID, true); err != nil {
 		t.Fatal(err)
@@ -2338,11 +2407,21 @@ func TestDisabledAgentDeniesAutonomousAction(t *testing.T) {
 	if _, err := h.raw.EnsureAgentName(ctx, "agent-disabled"); err != nil {
 		t.Fatal(err)
 	}
+	gate := &pausingAutomationStore{
+		StorePort: h.store, reached: make(chan struct{}), resume: make(chan struct{}),
+	}
+	h.daemon.opt.Store = gate
+
+	h.push("agent-disabled", "blocked")
+	select {
+	case <-gate.reached:
+	case <-time.After(3 * time.Second):
+		t.Fatal("autonomous delivery did not reach its final lifecycle barrier")
+	}
 	if err := h.raw.SetAgentDisabled(ctx, "agent-disabled", true); err != nil {
 		t.Fatal(err)
 	}
-
-	h.push("agent-disabled", "blocked")
+	close(gate.resume)
 	waitFor(t, 3*time.Second, func() bool {
 		audits, _ := h.raw.AuditLog(ctx, 10)
 		return len(audits) == 1

@@ -523,6 +523,49 @@ func TestLLMMultiTabConsultAndSeriesPromotion(t *testing.T) {
 	}
 }
 
+func TestLLMMultiTabSeriesDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setFrames(mcqFrames)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "1 2 1", Rationale: "defaults", ConfidentScore: 80,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "1 2 1",
+			Rationale: "defaults", ConfidentScore: 80, Status: "pending"}, nil
+	}
+	gate := &pausingAutomationStore{
+		StorePort: h.store, reached: make(chan struct{}), resume: make(chan struct{}),
+	}
+	h.daemon.opt.Store = gate
+	h.push("agent-mcqllm-disabled", "blocked")
+	select {
+	case <-gate.reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("LLM series did not reach its final lifecycle barrier")
+	}
+	if err := h.raw.SetAgentDisabled(context.Background(), "agent-mcqllm-disabled", true); err != nil {
+		t.Fatal(err)
+	}
+	keysBefore := len(h.herdr.keysSent())
+	close(gate.resume)
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(context.Background(), 10)
+		return len(audits) == 1 && audits[0].Status == "denied"
+	})
+	if keysAfter := len(h.herdr.keysSent()); keysAfter != keysBefore {
+		t.Fatalf("LLM series sent %d keystroke(s) after disable won barrier", keysAfter-keysBefore)
+	}
+	audits, _ := h.raw.AuditLog(context.Background(), 10)
+	if audits[0].Action != domain.AuditActionDenied || audits[0].Rationale != "[agent_disabled]" {
+		t.Fatalf("LLM series denied audit = %+v", audits[0])
+	}
+}
+
 // A DIFFERENT form with the same tab count showing at promotion time must
 // reject the series: consults take minutes and forms can be replaced.
 func TestLLMMultiTabDifferentFormRejected(t *testing.T) {
