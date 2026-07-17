@@ -262,7 +262,14 @@ case "$1 $2" in
     cat %q.paneinfo 2>/dev/null
     ;;
   "agent list")
-    cat %q.agents 2>/dev/null
+    agents_dir=%q.agents.d
+    if [ -d "$agents_dir" ] && [ -n "$(ls -A "$agents_dir" 2>/dev/null)" ]; then
+      first="$agents_dir/$(ls "$agents_dir" | head -n 1)"
+      cat "$first"
+      if [ "$(ls "$agents_dir" | wc -l)" -gt 1 ]; then rm -f "$first"; fi
+    else
+      cat %q.agents 2>/dev/null
+    fi
     ;;
   "workspace list")
     cat %q.workspaces 2>/dev/null
@@ -272,7 +279,7 @@ case "$1 $2" in
     ;;
 esac
 exit 0
-`, f.LogPath, f.FailFlag, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
+`, f.LogPath, f.FailFlag, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
 	if err := os.WriteFile(f.BinPath, []byte(script), 0o700); err != nil {
 		return nil, err
 	}
@@ -292,6 +299,30 @@ func (f *FakeCLI) SetPaneInfo(content string) error {
 // SetAgentList sets the raw JSON `agent list` returns.
 func (f *FakeCLI) SetAgentList(content string) error {
 	return os.WriteFile(f.PaneFile+".agents", []byte(content), 0o600)
+}
+
+// SetAgentListSequence makes successive `agent list` invocations return each
+// JSON in turn; the final entry repeats forever and permanently shadows
+// SetAgentList for this fake. It replaces any sequence set earlier; calling
+// it with no arguments removes the sequence so SetAgentList applies again.
+func (f *FakeCLI) SetAgentListSequence(responses ...string) error {
+	dir := f.PaneFile + ".agents.d"
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	if len(responses) == 0 {
+		return nil
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return err
+	}
+	for i, r := range responses {
+		name := filepath.Join(dir, fmt.Sprintf("%03d", i+1))
+		if err := os.WriteFile(name, []byte(r), 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SetWorkspaceList sets the raw JSON `workspace list` returns.
