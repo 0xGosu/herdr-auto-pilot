@@ -96,7 +96,7 @@ pane_excerpt_chars = 5000          # pane context included in the consult
 # stdout is the rewritten text.
 rewrite_command = [
   "claude", "--model", "haiku", "-p",
-  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
+  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text — or @rewrite:nochange if the instruction is already right as-is, or @noop if nothing should be sent at all.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
 ]
 
 # ── First-rewrite variant (optional) ──
@@ -107,17 +107,20 @@ rewrite_command = [
 # A sub-one-second error exit is retried once with the other rewrite template.
 # rewrite_command_start = [
 #   "claude", "--model", "haiku", "-p",
-#   "First rewrite for this agent. Rewrite this instruction given its screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
+#   "First rewrite for this agent. Rewrite this instruction given its screen. Reply with ONLY the rewritten text — or @rewrite:nochange if the instruction is already right as-is, or @noop if nothing should be sent at all.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
 # ]
 
 # ── Rewrite recipe — OpenAI Codex (commented; swap in to use codex) ──
 # rewrite_command = [
 #   "codex", "--model", "gpt-5.6-luna", "exec", "--skip-git-repo-check",
-#   "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
+#   "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text — or @rewrite:nochange if the instruction is already right as-is, or @noop if nothing should be sent at all.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
 # ]
 
 rewrite_timeout_seconds = 60       # omitted: inherits timeout_seconds
-rewrite_fallback_template = "You must act based on the following: {original_text}"
+# On rewrite failure/timeout/empty output the ORIGINAL text is sent as-is.
+# Set rewrite_fallback_template only to wrap it instead (placeholders:
+# {original_text}, {agent_name}).
+# rewrite_fallback_template = "You must act based on the following: {original_text}"
 
 # ── Idle task suggestion (optional) ──
 # When an agent goes idle with NO task source (no [[task_sources]] matches it

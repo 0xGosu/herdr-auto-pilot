@@ -346,7 +346,7 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `llm.auto_act_confidence_threshold` | 999 (never) | min LLM self-reported confidence (0-100) to auto-act on a consult decision; below it (or no score) the situation escalates with reason `[llm_low_confidence]`. 999 is unreachable = never auto-act |
 | `llm.pane_excerpt_chars` | 5000 | pane excerpt size in characters for LLM consult/rewrite context |
 | `llm.rewrite_timeout_seconds` | 60 | timeout for rewrite calls |
-| `llm.rewrite_fallback_template` | `You must act based on the following: {original_text}` | wraps original text when rewrite fails (placeholders: `{original_text}`, `{agent_name}`) |
+| `llm.rewrite_fallback_template` | `{original_text}` (original sent as-is) | optional wrapper around the original when the rewrite fails (placeholders: `{original_text}`, `{agent_name}`) |
 | `llm.command` | (unset) | argv template for the consult fallback CLI (see llm fallback config) |
 | `llm.command_start` | (unset) | argv template for the FIRST consult per agent; empty inherits `llm.command` (opt-in) |
 | `llm.rewrite_command` | (unset) | argv template for the one-shot rewrite CLI (see llm rewrite) |
@@ -677,11 +677,12 @@ when a learned rule resolves to literal free text (idle next-task prompt, error 
 [llm]
 rewrite_command = [
   "claude", "-p",
-  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
+  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text — or @rewrite:nochange if the instruction is already right as-is, or @noop if nothing should be sent at all.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
   "--model", "haiku",
 ]
 rewrite_timeout_seconds = 30
-rewrite_fallback_template = "You must act based on the following: {original_text}"
+# optional — on failure the original is sent as-is; set this only to wrap it:
+# rewrite_fallback_template = "You must act based on the following: {original_text}"
 ```
 
 ### rewrite placeholders
@@ -699,8 +700,10 @@ also available as env vars: `HAP_REWRITE_TEXT`, `HAP_SITUATION_TYPE`, `HAP_AGENT
 ### rewrite invariants
 
 - numbered-menu answers are never rewritten — a mapped digit reaches the menu untouched. only literal free text goes through the rewriter.
-- a rewrite failure never blocks the send: on error, timeout, or empty output the original text is delivered wrapped in `rewrite_fallback_template`.
-- safety controls still apply to the rewritten text: output matching the never-auto patterns or the irreversible heuristic is discarded in favor of the wrapped original.
+- a rewrite failure never blocks the send: on error, timeout, or empty output the original text is delivered as-is (or wrapped in `rewrite_fallback_template` when configured).
+- `@rewrite:nochange` output sends the original verbatim (bypassing any fallback template); all safety re-gates still run on it.
+- `@noop` output sends nothing at all — audited as a `noop` row, runaway counter still advances, nothing learned. only the exact `@`-prefixed sentinel counts; a bare `noop` is delivered literally.
+- safety controls still apply to the rewritten text: output matching the never-auto patterns or the irreversible heuristic is discarded in favor of the original.
 - learning is unaffected: decision history records the original learned action, never the rewritten text.
 
 ## resolved paths (diagnostics)

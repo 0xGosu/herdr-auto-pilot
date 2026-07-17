@@ -24,17 +24,38 @@ type RewriteRequest struct {
 	First bool
 }
 
-// DefaultRewriteFallbackTemplate wraps the original text when the rewrite
-// CLI fails: the send must never be blocked by a rewrite failure, so the
-// already-safety-screened original is delivered inside a quoting frame.
-// Placeholders: {original_text}, {agent_name} (the agent's short name).
-const DefaultRewriteFallbackTemplate = "You must act based on the following: {original_text}"
+// DefaultRewriteFallbackTemplate is the failure-path template: the send must
+// never be blocked by a rewrite failure, so the already-safety-screened
+// original is delivered as-is by default. Set llm.rewrite_fallback_template
+// to opt into wrapping it (placeholders: {original_text}, {agent_name}).
+const DefaultRewriteFallbackTemplate = "{original_text}"
+
+// RewriteNoChange is the rewrite CLI's "the original is already right"
+// sentinel: the daemon sends the original text verbatim, bypassing any
+// configured fallback template. The companion "@noop" (ActionNoop) means
+// "send nothing at all".
+const RewriteNoChange = "@rewrite:nochange"
+
+// IsRewriteNoChange reports whether trimmed rewrite output is the
+// no-change sentinel (case-insensitive).
+func IsRewriteNoChange(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), RewriteNoChange)
+}
+
+// IsRewriteNoop reports whether trimmed rewrite output is the noop sentinel
+// (case-insensitive). Unlike NormalizeNoopAction on the consult path, bare
+// spellings ("noop", "no_op", "no-op") are deliberately NOT accepted:
+// rewrite output is free text destined for a pane, and a bare "noop" could
+// be a legitimate rewritten reply — only the @ prefix marks LLM intent.
+func IsRewriteNoop(s string) bool {
+	return strings.EqualFold(strings.TrimSpace(s), ActionNoop)
+}
 
 // ApplyRewriteFallback renders the failure-path outbound text. An empty
 // template — or one missing the {original_text} placeholder, which would
-// silently drop the learned action — falls back to the default. A single
-// substitution pass means placeholder-like text inside the original is
-// never re-expanded. agentName fills {agent_name}.
+// silently drop the learned action — falls back to the default
+// (passthrough). A single substitution pass means placeholder-like text
+// inside the original is never re-expanded. agentName fills {agent_name}.
 func ApplyRewriteFallback(template, original, agentName string) string {
 	if !strings.Contains(template, "{original_text}") {
 		template = DefaultRewriteFallbackTemplate

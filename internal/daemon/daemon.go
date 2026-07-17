@@ -607,6 +607,14 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// that moved on (the consuming recent-delta still holds the old
 		// menu AND the answer) — activity supersedes it.
 		d.cancelCapture(tr.PaneID)
+		// Same for an in-flight rewrite: its situation no longer stands,
+		// whoever caused the resume. registerHumanInteraction below also
+		// cancels, but only when the resume counts as human — a self-flap
+		// within 10s of our own last auto action would otherwise leave the
+		// flight live, and a late "@noop" outcome (which skips the
+		// staleness re-read) would stamp audit/rate side effects for a
+		// pane that already moved on.
+		d.cancelRewriteExcept(tr.AgentID, "")
 		// Genuine progress ends the pane's parked episode: re-arm the
 		// subscribe-time reconcile so a fresh block/idle/done is surfaced (#49).
 		d.mu.Lock()
@@ -1072,7 +1080,7 @@ func (d *Daemon) cancelRewriteExcept(agentID, keepSig string) {
 	delete(d.rewriteInFlight, agentID)
 	d.mu.Unlock()
 	fl.cancel()
-	slog.Info("in-flight rewrite superseded by a newer decision", "agent", agentID)
+	slog.Info("in-flight rewrite superseded", "agent", agentID)
 }
 
 // readDecisionState gathers all store reads for one decision. The latest
@@ -1406,6 +1414,51 @@ func (d *Daemon) deliverNoopClaimed(ctx context.Context, s domain.Situation,
 
 	slog.Info("learned noop applied: no reply sent",
 		"agent", s.AgentID, "situation", s.Type, "confidence", dec.Confidence, "audit_id", auditID)
+}
+
+// deliverRewriteNoop stands the daemon down after the rewrite CLI vetoed a
+// send ("@noop"): audit-first (FR-024), then the rate write — nothing is
+// sent. Unlike deliverNoop and the consult noop, NO decision is recorded:
+// this is a delivery-time contextual veto of an already-learned action, not
+// a decision about the signature — recorded @noop rows could win the
+// plurality and permanently stand the learned rule down (see the
+// llmLearnedAction warning) or trip the variance guard on later consults.
+// The runaway counter still advances (D3) and lastAutoNoop is stamped, so
+// a rewrite-noop loop eventually escalates instead of spinning silently.
+func (d *Daemon) deliverRewriteNoop(ctx context.Context, res rewriteOutcome, now time.Time) {
+	s := res.situation
+	d.withAgentAutomation(ctx, s, res.sig, res.tr, "", res.dec.Confidence, nil,
+		domain.ActionNoop, now, func() {
+			original := truncateRunes(res.dec.Input, 200)
+			auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+				AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature,
+				Trigger: trigger(res.tr), SituationType: s.Type, Action: "noop", Input: "",
+				Confidence: res.dec.Confidence,
+				Rationale: fmt.Sprintf("%s; rewrite declined to send (@noop) (original: %q)",
+					res.dec.Rationale, original),
+				LLMOutput: domain.ActionNoop,
+				Status:    "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
+				CreatedAt: now,
+			})
+			if err != nil {
+				slog.Error("audit write failed; blocking rewrite noop (FR-024)", "error", err)
+				d.notify(ctx, "Herd Auto Prompter: persistence failure",
+					"A rewrite-declined no-op was blocked because its audit record could not be written.")
+				return
+			}
+			if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
+				updated := domain.RegisterAutoPrompt(*rate, now)
+				updated.AgentID = s.AgentID
+				if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
+					slog.Error("agent rate update failed", "error", err)
+				}
+			}
+			d.mu.Lock()
+			d.lastAutoNoop[s.AgentID] = now
+			d.mu.Unlock()
+			slog.Info("rewrite noop: no reply sent",
+				"agent", s.AgentID, "situation", s.Type, "audit_id", auditID)
+		})
 }
 
 // escalate records and surfaces an escalation: no input is sent (FR-018).
@@ -2190,8 +2243,12 @@ func rewriteSuggestion(sitType domain.SituationType, learned, original string) s
 // handleRewriteOutcome finalizes an async outbound rewrite: the rewritten
 // text is re-gated through every safety control (the rewriter is an LLM
 // authoring outbound text — FR-015 applies) and delivered. A rewrite
-// failure degrades to the fallback-wrapped original rather than blocking
-// the send; only safety trips on that wrapped form escalate.
+// failure never blocks the send — it degrades to the original as-is (or
+// the configured rewrite_fallback_template); only safety trips on that
+// degraded form escalate. Two sentinels short-circuit the rewrite:
+// "@rewrite:nochange" sends the original verbatim (bypassing any fallback
+// template), and "@noop" sends nothing at all — the LLM judged that no
+// reply is better than this send.
 func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	s := res.situation
 
@@ -2221,16 +2278,25 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 		return
 	}
 
+	isNoop := false
 	escalateWith := func(reason domain.EscalateReason, why string) {
+		suggestion := rewriteSuggestion(s.Type, res.learned, res.dec.Input)
+		if isNoop {
+			// The LLM advised silence — suggesting the original send would
+			// invert that. The suggestion text round-trips to @noop on a
+			// confirm (suggestionAction); raw "@noop" is never shown.
+			suggestion = domain.ActionNoopSuggestion
+		}
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: reason, Rationale: why,
 			Confidence: res.dec.Confidence,
-			Suggestion: rewriteSuggestion(s.Type, res.learned, res.dec.Input),
+			Suggestion: suggestion,
 		}, res.tr, now)
 	}
 
 	// Final text: the rewrite, or — on any failure, including safety trips
-	// on the rewritten form — the fallback-wrapped original.
+	// on the rewritten form — the original via the fallback template
+	// (passthrough by default).
 	final := strings.TrimSpace(res.rewritten)
 	note := "rewritten by llm.rewrite_command"
 	llmOutput := ""
@@ -2244,7 +2310,19 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 		llmOutput = res.err.Error()
 	case final == "":
 		degrade("produced empty output")
+	case domain.IsRewriteNoop(final):
+		// Handled after the kill-switch check below: nothing will be sent.
+		isNoop = true
+	case domain.IsRewriteNoChange(final):
+		// The LLM affirmed the original — send it verbatim, bypassing even
+		// a custom fallback template (that frames failures, not agreements).
+		final = res.dec.Input
+		note = "rewrite affirmed original (@rewrite:nochange)"
+		llmOutput = domain.RewriteNoChange
 	default:
+		// The CLI's actual output always lands on the audit row (LLMOutput)
+		// — on a clean rewrite it is also the delivered text.
+		llmOutput = final
 		if hit, matched := allow.Match(s.AgentType, final); matched {
 			llmOutput = "discarded rewrite: " + truncateRunes(final, 500)
 			degrade("output matched never-auto " + hit.Diagnostic())
@@ -2261,6 +2339,28 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
 		escalateWith(domain.ReasonDaemonPaused, "at rewrite")
+		return
+	}
+	if isNoop {
+		// The rewrite CLI vetoed the send ("@noop"): nothing goes to the
+		// pane. The rate guard still runs (D3 — a noop-forever loop must
+		// eventually hit the consecutive ceiling and surface to a human),
+		// but the never-auto screens and the staleness re-read are skipped:
+		// they vet outbound text and stale injections, and there is no send.
+		rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
+		if err != nil {
+			// Fail closed: an unreadable rate row must not skip the guard.
+			escalateWith(domain.ReasonPersistenceFailed, "rate read failed at rewrite: "+err.Error())
+			return
+		}
+		if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
+			MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
+			MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
+		}); !ok {
+			escalateWith(reason, "at rewrite")
+			return
+		}
+		d.deliverRewriteNoop(ctx, res, now)
 		return
 	}
 	if hit, matched := allow.Match(s.AgentType, final); matched {

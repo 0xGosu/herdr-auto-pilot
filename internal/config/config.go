@@ -129,9 +129,10 @@ type LLM struct {
 	// RewriteTimeoutSeconds bounds one rewrite run; zero or omitted
 	// inherits timeout_seconds.
 	RewriteTimeoutSeconds int `toml:"rewrite_timeout_seconds"`
-	// RewriteFallbackTemplate wraps the original text when the rewrite
-	// fails (placeholders {original_text}, {agent_name}). Empty uses the
-	// built-in default; a rewrite failure never blocks the send.
+	// RewriteFallbackTemplate optionally wraps the original text when the
+	// rewrite fails (placeholders {original_text}, {agent_name}). Empty
+	// uses the built-in default, which sends the original as-is; a rewrite
+	// failure never blocks the send.
 	RewriteFallbackTemplate string `toml:"rewrite_fallback_template"`
 	// GenerateTaskCommand is the argv template for the one-shot task
 	// suggestion an idle agent gets when it has NO task source (no declared
