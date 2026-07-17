@@ -1011,6 +1011,14 @@ func TestConfirmDrivenShadowToAutoPromotion(t *testing.T) {
 	const graduationN = 3
 	h := newHarness(t, fmt.Sprintf("[learning]\ngraduation_n = %d\n", graduationN))
 	h.herdr.setPane(approvalPane)
+	// Confirmation nudges reload, whose reconcile pass re-drives live parked
+	// agents. This test injects each blocked event explicitly and is about the
+	// learning transition, not reconciliation, so keep the authoritative live
+	// snapshot working to prevent a background re-drive racing the next loop.
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: "agent-promote", PaneID: "agent-promote",
+		AgentType: "claude", Status: "working",
+	}})
 	ctx := context.Background()
 
 	// The learned action is the option LABEL "Yes" (approvalPane offers
