@@ -1125,30 +1125,41 @@ func (s *Store) PendingEscalations(ctx context.Context) ([]domain.AuditRecord, e
 	return s.scanAudits(rows)
 }
 
-// DuplicatePendingEscalation reports whether an unresolved escalation already
-// exists for the same agent + agent type + situation type + exact pane content.
-// It backs the daemon's live-event dedup: a fresh transition whose captured
-// situation matches an escalation still awaiting the user is a duplicate and is
-// ignored. Escalations with an unprocessed LLM retry are excluded: the retry
-// explicitly asks to re-evaluate the same content, so its source row must not
-// suppress that recapture. Once accepted, the daemon retires the source row
-// before marking the queued retry processed. Cheaper than PendingEscalations —
-// it never materializes the (pane-excerpt-heavy) rows. The caller must pass the
-// pane excerpt already truncated the same way escalate() stores it, so the
-// comparison lines up.
-func (s *Store) DuplicatePendingEscalation(ctx context.Context, agentID, agentType string,
-	sitType domain.SituationType, paneExcerpt string) (bool, error) {
-	var exists int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM audit_log a WHERE a.status = 'escalated'
-			AND a.agent_id = ? AND a.agent_type = ? AND a.situation_type = ? AND a.pane_excerpt = ?
-			AND NOT EXISTS (SELECT 1 FROM llm_retries r
-				WHERE r.audit_id = a.id AND r.processed = 0))`,
-		agentID, agentType, string(sitType), paneExcerpt).Scan(&exists)
+// PendingEscalationExcerpts returns the pane excerpts of every escalation still
+// awaiting the operator for this agent + agent type, regardless of age — the
+// candidate set for the daemon's duplicate-ask check. It is NOT scoped by
+// situation_type: that field is DERIVED from the agent status (the classifier
+// gates the approval/choice rules on herdr reporting "blocked"), so one
+// standing screen re-fired as idle reclassifies, and scoping by it would miss
+// the very re-delivery this dedups. The excerpt comparison, which is the real
+// key, happens in domain.DuplicatesPendingEscalation.
+//
+// Escalations with an unprocessed LLM retry are excluded: the retry explicitly
+// asks to re-evaluate this exact content, so its source row must not suppress
+// the recapture (mirrors the pre-existing dedup query).
+func (s *Store) PendingEscalationExcerpts(ctx context.Context, agentID, agentType string) ([]domain.PendingEscalation, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT situation_type, pane_excerpt FROM audit_log a
+			WHERE a.status = 'escalated' AND a.agent_id = ? AND a.agent_type = ?
+			  AND NOT EXISTS (SELECT 1 FROM llm_retries r
+					WHERE r.audit_id = a.id AND r.processed = 0)
+			ORDER BY a.id DESC`,
+		agentID, agentType)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return exists != 0, nil
+	defer rows.Close()
+	var out []domain.PendingEscalation
+	for rows.Next() {
+		var sit, excerpt string
+		if err := rows.Scan(&sit, &excerpt); err != nil {
+			return nil, err
+		}
+		out = append(out, domain.PendingEscalation{
+			SituationType: domain.SituationType(sit), PaneExcerpt: excerpt,
+		})
+	}
+	return out, rows.Err()
 }
 
 // UnprocessedCorrections returns corrections the daemon has not consumed.

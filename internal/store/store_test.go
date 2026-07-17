@@ -369,64 +369,77 @@ func TestPendingEscalations(t *testing.T) {
 	}
 }
 
-func TestDuplicatePendingEscalation(t *testing.T) {
+func TestPendingEscalationExcerpts(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()
-	rec := domain.AuditRecord{
-		AgentID: "agent-1", AgentType: "claude", Trigger: "x",
-		SituationType: domain.SituationChoice, Action: "escalated",
-		Status: "escalated", PaneExcerpt: "pick a package manager: 1. pnpm 2. npm",
-		CreatedAt: time.Now(),
-	}
-	id, err := s.AppendAudit(ctx, rec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	now := time.Now()
 
-	dup := func(r domain.AuditRecord) bool {
-		got, err := s.DuplicatePendingEscalation(ctx, r.AgentID, r.AgentType, r.SituationType, r.PaneExcerpt)
+	var pendingID int64
+	seed := func(agentID, agentType string, sit domain.SituationType, status, excerpt string, at time.Time) int64 {
+		id, err := s.AppendAudit(ctx, domain.AuditRecord{
+			AgentID: agentID, AgentType: agentType, Trigger: "x",
+			SituationType: sit, Action: status, Status: status,
+			PaneExcerpt: excerpt, CreatedAt: at,
+		})
 		if err != nil {
-			t.Fatalf("DuplicatePendingEscalation: %v", err)
+			t.Fatal(err)
 		}
-		return got
+		return id
 	}
 
-	if !dup(rec) {
-		t.Error("identical escalated row should match")
+	// A pending escalation, however old, is a candidate (unbounded in time).
+	pendingID = seed("agent-1", "claude", domain.SituationApproval, "escalated", "allow bash?", now.Add(-10*time.Minute))
+	// A different situation_type escalation for the same agent is ALSO returned
+	// (the query is deliberately not type-scoped).
+	seed("agent-1", "claude", domain.SituationError, "escalated", "some error", now.Add(-20*time.Second))
+	// Non-escalated rows are never candidates.
+	seed("agent-1", "claude", domain.SituationIdle, "auto", "an auto send", now)
+	seed("agent-1", "claude", domain.SituationApproval, "resolved", "a resolved ask", now)
+	seed("agent-1", "claude", domain.SituationApproval, "dismissed", "a dismissed ask", now)
+	// A different agent / agent_type is out of scope.
+	seed("agent-2", "claude", domain.SituationApproval, "escalated", "other agent", now)
+	seed("agent-1", "codex", domain.SituationApproval, "escalated", "other type", now)
+
+	excerpts := func() map[string]bool {
+		got, err := s.PendingEscalationExcerpts(ctx, "agent-1", "claude")
+		if err != nil {
+			t.Fatalf("PendingEscalationExcerpts: %v", err)
+		}
+		m := map[string]bool{}
+		for _, p := range got {
+			m[p.PaneExcerpt] = true
+		}
+		return m
 	}
-	// An explicitly queued LLM retry must be allowed to re-evaluate identical
-	// pane content instead of deduplicating against its own source escalation.
-	retryID, err := s.InsertLLMRetry(ctx, id, time.Now())
+
+	got := excerpts()
+	for _, w := range []string{"allow bash?", "some error"} {
+		if !got[w] {
+			t.Errorf("expected pending escalation %q, got %v", w, got)
+		}
+	}
+	for _, unwanted := range []string{
+		"an auto send", "a resolved ask", "a dismissed ask", "other agent", "other type",
+	} {
+		if got[unwanted] {
+			t.Errorf("did not expect candidate %q", unwanted)
+		}
+	}
+
+	// An explicitly queued LLM retry excludes its source escalation, so it
+	// cannot dedup against its own recapture; a processed retry restores it.
+	retryID, err := s.InsertLLMRetry(ctx, pendingID, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dup(rec) {
-		t.Error("escalation queued for LLM retry should be excluded from deduplication")
+	if excerpts()["allow bash?"] {
+		t.Error("escalation queued for LLM retry should be excluded")
 	}
 	if err := s.MarkLLMRetryProcessed(ctx, retryID); err != nil {
 		t.Fatal(err)
 	}
-	if !dup(rec) {
-		t.Error("a processed retry without retirement should restore normal deduplication")
-	}
-	// Any field differing breaks the match.
-	for name, mut := range map[string]func(domain.AuditRecord) domain.AuditRecord{
-		"agent_id":     func(r domain.AuditRecord) domain.AuditRecord { r.AgentID = "agent-2"; return r },
-		"agent_type":   func(r domain.AuditRecord) domain.AuditRecord { r.AgentType = "codex"; return r },
-		"situation":    func(r domain.AuditRecord) domain.AuditRecord { r.SituationType = domain.SituationIdle; return r },
-		"pane_excerpt": func(r domain.AuditRecord) domain.AuditRecord { r.PaneExcerpt = "something else"; return r },
-	} {
-		if dup(mut(rec)) {
-			t.Errorf("differing %s should not match", name)
-		}
-	}
-
-	// A non-escalated (resolved/dismissed) row is not a pending duplicate.
-	if err := s.UpdateAuditStatus(ctx, id, "resolved"); err != nil {
-		t.Fatal(err)
-	}
-	if dup(rec) {
-		t.Error("resolved escalation should not count as a pending duplicate")
+	if !excerpts()["allow bash?"] {
+		t.Error("a processed retry should restore the candidate")
 	}
 }
 

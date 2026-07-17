@@ -394,6 +394,7 @@ type failingStore struct {
 	mu          sync.Mutex
 	failAudit   bool
 	failPending bool
+	failDedup   bool
 }
 
 func (f *failingStore) setFailAudit(v bool) {
@@ -406,6 +407,12 @@ func (f *failingStore) setFailPending(v bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failPending = v
+}
+
+func (f *failingStore) setFailDedup(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failDedup = v
 }
 
 func (f *failingStore) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, error) {
@@ -426,6 +433,16 @@ func (f *failingStore) HasPendingLLMConsult(ctx context.Context, agentID string)
 		return false, errors.New("induced pending-check failure")
 	}
 	return f.StorePort.HasPendingLLMConsult(ctx, agentID)
+}
+
+func (f *failingStore) PendingEscalationExcerpts(ctx context.Context, agentID, agentType string) ([]domain.PendingEscalation, error) {
+	f.mu.Lock()
+	fail := f.failDedup
+	f.mu.Unlock()
+	if fail {
+		return nil, errors.New("induced dedup-check failure")
+	}
+	return f.StorePort.PendingEscalationExcerpts(ctx, agentID, agentType)
 }
 
 // --- harness ---
@@ -1150,6 +1167,62 @@ func TestPipelineShadowModeEscalatesWithSuggestion(t *testing.T) {
 // otherApprovalPane is a distinct approval (different command → different
 // classified content/signature) used to prove content-level dedup.
 const otherApprovalPane = "Bash(npm install)\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell the agent what to do differently\n"
+
+// chromedApproval renders the approval with a leading spinner/status line that
+// ticks a timer between captures — the volatile agent-TUI chrome that
+// NormalizeForDedup elides so two captures of one standing screen read equal.
+func chromedApproval(seconds int) string {
+	return fmt.Sprintf("✻ Baking… (%ds · esc to interrupt)\n%s", seconds, approvalPane)
+}
+
+// TestPipelineDedupAbsorbsChromeJitter is the headline improvement over the
+// old exact-match dedup: an escalation is raised, then herdr re-delivers the
+// same screen (as idle, when the operator reads the pane) with only the
+// spinner's elapsed counter ticked. The old exact `pane_excerpt = ?` check
+// missed that re-fire and raised a duplicate ask; the normalized check catches
+// it — one pending escalation, one ignored row.
+func TestPipelineDedupAbsorbsChromeJitter(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setPane(chromedApproval(12))
+
+	// No learned rule → the approval escalates.
+	h.push("agent-dup", "blocked")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+
+	// Same screen re-delivered as idle with the timer ticked: the pane content
+	// differs only in the chrome line, and the re-classification to idle must
+	// not matter (situation_type is excluded from the key).
+	h.herdr.setPane(chromedApproval(14))
+	h.push("agent-dup", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(ignoredRows(t, h)) == 1 })
+
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 1 {
+		t.Fatalf("chrome-jittered re-delivery raised a duplicate ask: got %d, want 1", len(esc))
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("duplicate escalation must not send input")
+	}
+}
+
+// TestPipelineDedupFailsOpen: a store error in the duplicate-ask check must not
+// drop a real event ("never a silent drop") — it is processed instead.
+func TestPipelineDedupFailsOpen(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	h.store.(*failingStore).setFailDedup(true)
+
+	h.push("agent-dup", "blocked")
+	// The event still escalates despite the dedup query failing.
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+}
 
 // ignoredRows returns every audit row the daemon marked as an ignored
 // duplicate event.

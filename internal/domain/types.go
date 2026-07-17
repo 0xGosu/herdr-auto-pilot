@@ -275,6 +275,16 @@ const (
 	RationaleOperatorCorrected = "operator corrected"
 )
 
+// audit_log Status literals shared across packages.
+const (
+	// AuditStatusIgnored: a duplicate event the daemon dropped as a repeat of a
+	// pending escalation.
+	AuditStatusIgnored = "ignored"
+	// AuditStatusDeliveryFailed: a delivered action left the agent still
+	// blocked (verifyunblock's diagnostic).
+	AuditStatusDeliveryFailed = "delivery_failed"
+)
+
 // AgentStats are lifetime per-agent counters derived from audit_log, keyed by
 // the herdr pane id. A rename preserves them (same pane id); a restart yields
 // a new pane id and thus a fresh, empty set.
