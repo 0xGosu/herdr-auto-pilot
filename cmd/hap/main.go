@@ -44,10 +44,12 @@ Core:
 
 Operate:
   status                automation state, pending escalations, agents
-  agents                list monitored agents (short name, id, type, status)
+  agents                list agents (short name, id, type, status, automation)
   capture <agent>       re-run the normal capture pipeline for a live
                         blocked/idle/done agent (name or pane id)
   rename <agent> <name> give an agent a short name (used by task sources)
+  disable <agent>       disable autonomous actions for one agent
+  enable <agent>        re-enable autonomous actions for one agent
   escalations [prune [minutes]]  list pending escalations; prune dismisses
                         those older than N minutes (default 360)
   confirm <id> [--send]         confirm an escalation's suggested action

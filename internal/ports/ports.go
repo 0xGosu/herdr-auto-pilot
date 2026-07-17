@@ -224,6 +224,8 @@ type FrontendStore interface {
 	// first sight. Front-ends use it to name live agents the daemon has
 	// not observed yet (insert-if-absent; renames stay operator-owned).
 	EnsureAgentName(ctx context.Context, agentID string) (string, error)
+	// SetAgentDisabled changes the persistent operator-owned automation state.
+	SetAgentDisabled(ctx context.Context, target string, disabled bool) error
 	// DeleteSignature removes one learned signature with its decision
 	// history and error-retry row, returning the decision count. The daemon
 	// may recreate the signature from an in-flight event; the recreated
@@ -291,6 +293,10 @@ type ReadStore interface {
 	LLMDecisionByRequest(ctx context.Context, requestID string) (*domain.LLMDecision, error)
 	// AgentNames returns every agent id → short name mapping.
 	AgentNames(ctx context.Context) (map[string]string, error)
+	// AgentDisabled reports whether automation is disabled for one agent id.
+	AgentDisabled(ctx context.Context, agentID string) (bool, error)
+	// DisabledAgents returns all disabled agent ids for operator-facing views.
+	DisabledAgents(ctx context.Context) (map[string]bool, error)
 	// AgentStats returns lifetime per-agent counters keyed by agent/pane id,
 	// including agents with zero recorded events (so their FirstSeen shows).
 	AgentStats(ctx context.Context) (map[string]domain.AgentStats, error)

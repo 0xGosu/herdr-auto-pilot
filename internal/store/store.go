@@ -178,6 +178,7 @@ INSERT OR IGNORE INTO operator (id, label) VALUES ('operator', 'Operator');
 CREATE TABLE IF NOT EXISTS agent_names (
 	agent_id TEXT PRIMARY KEY,
 	name TEXT NOT NULL UNIQUE,
+	disabled INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS signature_embeddings (
@@ -226,6 +227,9 @@ func (s *Store) migrate() error {
 		// Per-signature decision-id floor: decisions with id <= this are kept
 		// but excluded from confidence/graduation (stamped by an operator reset).
 		`ALTER TABLE signatures ADD COLUMN decision_floor_id INTEGER NOT NULL DEFAULT 0`,
+		// Operator-owned per-agent automation switch. Kept on agent_names so
+		// renames preserve it and disabled agents remain visible by name.
+		`ALTER TABLE agent_names ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
@@ -1459,6 +1463,64 @@ func (s *Store) AgentNames(ctx context.Context) (map[string]string, error) {
 		names[id] = name
 	}
 	return names, rows.Err()
+}
+
+// SetAgentDisabled changes the operator-owned automation state for a known
+// agent. target may be its short name or pane/agent id. Unknown targets are
+// rejected rather than creating invisible state for a typo.
+func (s *Store) SetAgentDisabled(ctx context.Context, target string, disabled bool) error {
+	agentID, err := s.ResolveAgent(ctx, target)
+	if err != nil {
+		return err
+	}
+	value := 0
+	if disabled {
+		value = 1
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agent_names SET disabled = ? WHERE agent_id = ?`, value, agentID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("no agent known as %q: %w", target, ports.ErrUnknownAgent)
+	}
+	return nil
+}
+
+// AgentDisabled reports whether automation is disabled for an agent id.
+// Unnamed/unknown ids are enabled by default.
+func (s *Store) AgentDisabled(ctx context.Context, agentID string) (bool, error) {
+	var disabled int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT disabled FROM agent_names WHERE agent_id = ?`, agentID).Scan(&disabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return disabled != 0, err
+}
+
+// DisabledAgents returns the disabled agent ids for operator-facing views.
+func (s *Store) DisabledAgents(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT agent_id FROM agent_names WHERE disabled != 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	disabled := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		disabled[id] = true
+	}
+	return disabled, rows.Err()
 }
 
 // AgentStats returns lifetime per-agent counters keyed by agent/pane id.

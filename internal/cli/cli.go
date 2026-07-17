@@ -77,6 +77,10 @@ func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, arg
 		return task(ctx, app, out, args)
 	case "rename":
 		return rename(ctx, app, out, args)
+	case "disable":
+		return setAgentDisabled(ctx, app, out, args, true)
+	case "enable":
+		return setAgentDisabled(ctx, app, out, args, false)
 	case "signatures", "sigs":
 		return signatures(ctx, app, out, args)
 	case "clear-data":
@@ -427,6 +431,24 @@ func rename(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	return nil
 }
 
+func setAgentDisabled(ctx context.Context, app *frontend.App, out io.Writer,
+	args []string, disabled bool) error {
+	verb := "enable"
+	state := "enabled"
+	if disabled {
+		verb = "disable"
+		state = "disabled"
+	}
+	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+		return fmt.Errorf("usage: %s <agent-name-or-pane-id>", verb)
+	}
+	if err := app.SetAgentDisabled(ctx, args[0], disabled); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "agent %q %s\n", args[0], state)
+	return nil
+}
+
 func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	st, err := app.GetStatus(ctx)
 	if err != nil {
@@ -530,7 +552,12 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		if name == "" {
 			name = "-"
 		}
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", name, a.AgentID, a.AgentType, a.Status)
+		automation := "enabled"
+		if st.AgentDisabled(a.AgentID) {
+			automation = "disabled"
+		}
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\n",
+			name, a.AgentID, a.AgentType, a.Status, automation)
 	}
 	return nil
 }

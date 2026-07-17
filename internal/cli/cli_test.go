@@ -112,6 +112,40 @@ func TestCaptureCLI(t *testing.T) {
 	}
 }
 
+func TestDisableEnableAgentCLI(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	if err := st.AssignAgentName(ctx, "pane-live", "vivid-falcon"); err != nil {
+		t.Fatal(err)
+	}
+	app.Herdr = &captureHerdr{agents: []domain.AgentTransition{{
+		AgentID: "pane-live", PaneID: "pane-live", AgentType: "codex", Status: "idle",
+	}}}
+
+	out, err := run(t, app, "disable", "vivid-falcon")
+	if err != nil || !strings.Contains(out, "disabled") {
+		t.Fatalf("disable output=%q err=%v", out, err)
+	}
+	if disabled, _ := st.AgentDisabled(ctx, "pane-live"); !disabled {
+		t.Fatal("disable command did not persist state")
+	}
+	out, err = run(t, app, "agents")
+	if err != nil || !strings.Contains(out, "\tdisabled\n") {
+		t.Fatalf("agents must show disabled indicator, output=%q err=%v", out, err)
+	}
+
+	out, err = run(t, app, "enable", "pane-live")
+	if err != nil || !strings.Contains(out, "enabled") {
+		t.Fatalf("enable output=%q err=%v", out, err)
+	}
+	if disabled, _ := st.AgentDisabled(ctx, "pane-live"); disabled {
+		t.Fatal("enable command did not clear state")
+	}
+	if _, err := run(t, app, "disable", "not-an-agent"); err == nil {
+		t.Fatal("unknown disable target must fail")
+	}
+}
+
 func TestStatusShowsDaemonLine(t *testing.T) {
 	app, _ := testApp(t)
 

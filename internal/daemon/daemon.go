@@ -828,29 +828,18 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 		// Herdr unreachable / pane read failure: no automated action, log,
 		// notify (FR-023); the subscriber's backoff handles reconnection.
 		slog.Warn("pane read failed; taking no action", "pane", tr.PaneID, "error", err)
-		// This escalation bypasses escalate() (no pane to classify), so apply
-		// the same dedup here: a persistent outage delivers the same blocked
-		// event repeatedly and must not pile up identical pending rows. The
-		// unreadable pane has no excerpt, so the empty-content fallback in
-		// domain.DuplicatesPendingEscalation keys on the situation type, which
-		// keeps this from matching a pending escalation of a different kind.
+		// Route even this unclassifiable failure through escalate() so its
+		// lifecycle auto-dismiss and dedup rules are identical to every other
+		// escalation. The unreadable pane has no excerpt, so the normalized
+		// dedup's empty-content fallback keys on the situation type.
 		failed := domain.Situation{
 			AgentID: tr.AgentID, AgentType: tr.AgentType, PaneID: tr.PaneID,
 			Type: domain.SituationUnclassifiable,
 		}
-		if d.duplicatePendingEscalation(ctx, failed) {
-			d.ignoreDuplicate(ctx, failed, tr, now)
-			return
-		}
-		d.audit(ctx, domain.AuditRecord{
-			AgentID: tr.AgentID, AgentType: tr.AgentType, Trigger: trigger(tr),
-			SituationType: domain.SituationUnclassifiable,
-			Action:        domain.AuditActionEscalated,
-			// Bracketed like every escalate()-built rationale, so the one
-			// path that bypasses escalate() renders identically.
-			Rationale: "[" + string(domain.ReasonHerdrUnreachable) + "]",
-			Status:    "escalated", CreatedAt: now,
-		})
+		d.escalate(ctx, failed, domain.SignatureResult{}, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonHerdrUnreachable,
+			Rationale: err.Error(),
+		}, tr, now)
 		return
 	}
 
@@ -932,6 +921,15 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		}, tr, now)
 		return
 	}
+	disabled, err := d.opt.Store.AgentDisabled(ctx, situation.AgentID)
+	if err != nil {
+		slog.Error("disabled-state read failed; escalating", "error", err)
+		d.escalate(ctx, situation, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonPersistenceFailed,
+			Rationale: "disabled-state read: " + err.Error(),
+		}, tr, now)
+		return
+	}
 
 	// Both the never-auto match and the suspected-irreversible heuristic scan
 	// only the actionable region (pending dialog + outbound task text), not the
@@ -962,7 +960,7 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	// suspected-irreversible) escalate normally instead of spending a consult.
 	if situation.Type == domain.SituationIdle && declared != nil &&
 		declared.Task != domain.NoTaskContent && declared.LLMReview &&
-		!killActive && !allowMatched && !suspected &&
+		!disabled && !killActive && !allowMatched && !suspected &&
 		d.llmPort() != nil && d.llmPort().Configured() {
 		// A matching escalation already awaiting the operator (e.g. a prior
 		// decline of this same task) means the situation is handled: don't
@@ -1004,6 +1002,15 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	}
 
 	decision := domain.Decide(in)
+	if disabled {
+		if decision.Action == domain.ActionEscalate {
+			d.escalate(ctx, situation, sig, decision, tr, now)
+		} else {
+			d.auditAgentDisabled(ctx, situation, sig, tr, decision.Input,
+				decision.Confidence, nil, "", now)
+		}
+		return
+	}
 
 	// Any newer decision for this agent owns the pane: an in-flight rewrite
 	// for a DIFFERENT situation must never deliver behind it. A same-
@@ -1208,6 +1215,16 @@ type delivery struct {
 // and counter writes.
 func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, del delivery, now time.Time) {
+	if disabled, err := d.opt.Store.AgentDisabled(ctx, s.AgentID); err != nil {
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonPersistenceFailed,
+			Rationale: "disabled-state read before send: " + err.Error(),
+		}, tr, now)
+		return
+	} else if disabled {
+		d.auditAgentDisabled(ctx, s, sig, tr, del.input, dec.Confidence, nil, del.llmOutput, now)
+		return
+	}
 
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
@@ -1328,6 +1345,16 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 // human interaction and reset that counter.
 func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
+	if disabled, err := d.opt.Store.AgentDisabled(ctx, s.AgentID); err != nil {
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonPersistenceFailed,
+			Rationale: "disabled-state read before noop: " + err.Error(),
+		}, tr, now)
+		return
+	} else if disabled {
+		d.auditAgentDisabled(ctx, s, sig, tr, "", dec.Confidence, nil, "", now)
+		return
+	}
 
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
@@ -1368,18 +1395,20 @@ func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain
 // escalate records and surfaces an escalation: no input is sent (FR-018).
 func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
+	autoDismissReason := d.escalationAutoDismissReason(ctx, s.AgentID)
 
-	// Dedup: if this situation is already awaiting the user in the
+	// Dedup: if this normalized situation is already awaiting the user in the
 	// pending-escalation queue, re-raising it would just be a duplicate ask.
 	// Ignore the event (no ops) and record why. Gating here rather than before
 	// decideAndAct means only a would-be duplicate ESCALATION is suppressed — a
 	// situation that can now auto-answer (e.g. after a kill-switch resume) still
-	// acts, and the rate guard / retry ceiling still see every repeated
-	// identical event. escalate() is where almost every escalation is born, so
-	// this also caps escalation storms from the async LLM/rewrite/taskgen
-	// rejection paths. (The one escalation that bypasses escalate() — the
-	// pane-read-failure path in handleAttention — is dedup'd there directly.)
-	if d.duplicatePendingEscalation(ctx, s) {
+	// acts, and the rate guard / retry ceiling still see every repeated event.
+	// escalate() is where almost every escalation is born, so this also caps
+	// escalation storms from the async LLM/rewrite/taskgen rejection paths.
+	// A proven-gone/disabled agent still gets an audit row below, so the
+	// automatic dismissal remains visible in history. Do not let an older
+	// pending row turn that lifecycle decision into an opaque "duplicate".
+	if autoDismissReason == "" && d.duplicatePendingEscalation(ctx, s) {
 		d.ignoreDuplicate(ctx, s, tr, now)
 		return
 	}
@@ -1407,6 +1436,21 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		EmbedError:  sig.Match.EmbedError,
 		CreatedAt:   now,
 	}
+	if autoDismissReason != "" {
+		// Store the would-be escalation directly as dismissed. This is atomic
+		// from the front-end's perspective (it can never flash in the pending
+		// queue), while Action="escalated" plus Status="dismissed" preserves
+		// the same append-only audit shape as an operator dismissal.
+		rec.Status = "dismissed"
+		rec.Rationale += " [" + autoDismissReason + "]"
+		if _, err := d.opt.Store.AppendAudit(ctx, rec); err != nil {
+			slog.Error("audit write failed for auto-dismissed escalation", "error", err)
+			return
+		}
+		slog.Info("escalation auto-dismissed: agent unavailable",
+			"agent", s.AgentID, "situation", s.Type, "reason", autoDismissReason)
+		return
+	}
 	if _, err := d.opt.Store.AppendAudit(ctx, rec); err != nil {
 		slog.Error("audit write failed for escalation", "error", err)
 	}
@@ -1433,6 +1477,59 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	slog.Info("escalated", "agent", s.AgentID, "situation", s.Type,
 		"reason", dec.Reason, "suggestion", dec.Suggestion,
 		"version", buildinfo.Version)
+}
+
+const (
+	autoDismissAgentNotLive  = "agent_not_live"
+	autoDismissAgentDisabled = "agent_disabled"
+)
+
+// escalationAutoDismissReason returns a non-empty audit tag only when Herdr
+// authoritatively reports that an escalation's target cannot receive operator
+// attention: a successful live-agent snapshot omits it, or reports it disabled.
+// List failures are inconclusive and deliberately keep the escalation visible.
+func (d *Daemon) escalationAutoDismissReason(ctx context.Context, agentID string) string {
+	if disabled, err := d.opt.Store.AgentDisabled(ctx, agentID); err == nil && disabled {
+		return autoDismissAgentDisabled
+	} else if err != nil {
+		slog.Warn("disabled-state read failed while raising escalation",
+			"agent", agentID, "error", err)
+	}
+	if agentID == "" || d.opt.Herdr == nil {
+		return ""
+	}
+	agents, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, agent := range agents {
+		if agent.AgentID != agentID {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(agent.Status), "disabled") {
+			return autoDismissAgentDisabled
+		}
+		return ""
+	}
+	return autoDismissAgentNotLive
+}
+
+// auditAgentDisabled records the autonomous action that would have happened,
+// without sending, learning, or advancing the rate counter. The exact
+// rationale tag is intentionally stable for audit consumers.
+func (d *Daemon) auditAgentDisabled(ctx context.Context, s domain.Situation,
+	sig domain.SignatureResult, tr domain.AgentTransition, input string,
+	confidence float64, llmConfidence *int, llmOutput string, now time.Time) {
+	d.audit(ctx, domain.AuditRecord{
+		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature,
+		Trigger: trigger(tr), SituationType: s.Type,
+		Action: domain.AuditActionDenied, Input: input, Confidence: confidence,
+		LLMConfidence: llmConfidence, LLMOutput: llmOutput,
+		Rationale: "[agent_disabled]", Status: "denied",
+		PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+	})
+	slog.Info("autonomous action denied: agent disabled",
+		"agent", s.AgentID, "situation", s.Type, "input", input)
 }
 
 // consultLLM assembles the consult context, stages the request, and
@@ -1789,6 +1886,11 @@ func (d *Daemon) agentNotCleanlyIdle(ctx context.Context, agentID string) bool {
 	}
 	for _, a := range agents {
 		if a.AgentID == agentID {
+			// Disabled is an unavailable lifecycle state, not merely a busy
+			// agent. Let escalate() create the required dismissed audit row.
+			if strings.EqualFold(strings.TrimSpace(a.Status), "disabled") {
+				return false
+			}
 			return domain.AgentBusy(a.Status)
 		}
 	}
@@ -2068,6 +2170,17 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 
 	cfg, allow, cls := d.snapshot()
 	now := d.opt.Clock.Now()
+	if disabled, err := d.opt.Store.AgentDisabled(ctx, s.AgentID); err == nil && disabled {
+		d.auditAgentDisabled(ctx, s, res.sig, res.tr, res.dec.Input,
+			res.dec.Confidence, nil, res.rewritten, now)
+		return
+	} else if err != nil {
+		d.escalate(ctx, s, res.sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonPersistenceFailed,
+			Rationale: "disabled-state read after rewrite: " + err.Error(),
+		}, res.tr, now)
+		return
+	}
 
 	escalateWith := func(reason domain.EscalateReason, why string) {
 		d.escalate(ctx, s, res.sig, domain.Decision{
@@ -2451,6 +2564,24 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			reject(domain.ReasonVarianceGuard, "LLM contradicts history")
 			return
 		}
+	}
+
+	// The operator may disable the agent while a consult is running. Let all
+	// rejection paths above raise their normal (auto-dismissed) escalation,
+	// but stop a promotable action here before any audit-as-auto or pane send.
+	if disabled, err := d.opt.Store.AgentDisabled(ctx, s.AgentID); err != nil {
+		reject(domain.ReasonPersistenceFailed, "disabled-state read after LLM consult: "+err.Error())
+		return
+	} else if disabled {
+		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
+		var llmConf *int
+		if llmDec.ConfidentScore >= 0 {
+			llmConf = &llmDec.ConfidentScore
+		}
+		d.auditAgentDisabled(ctx, s, res.sig, tr, llmDec.Action,
+			domain.Confidence(history, cfg.Learning.ConfirmationWeight).Score,
+			llmConf, llmDec.CapturedOutput, now)
+		return
 	}
 
 	// Both scores land on the auto-acted audit row: the computed 0-1 agreement

@@ -38,6 +38,10 @@ const sweepResetKeys = domain.MCQResetKeys
 // single-frame situation proceeds to decideAndAct, which escalates with the
 // proper reason.
 func (d *Daemon) sweepAllowed(ctx context.Context, s domain.Situation) bool {
+	disabled, err := d.opt.Store.AgentDisabled(ctx, s.AgentID)
+	if err != nil || disabled {
+		return false
+	}
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
 		return false
@@ -343,6 +347,13 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 			Action: domain.ActionEscalate, Reason: reason, Rationale: why,
 			Confidence: dec.Confidence, Suggestion: "answer series: " + dec.Input,
 		}, tr, now)
+	}
+	if disabled, err := d.opt.Store.AgentDisabled(ctx, s.AgentID); err != nil {
+		escalateWith(domain.ReasonPersistenceFailed, "disabled-state read before series: "+err.Error())
+		return
+	} else if disabled {
+		d.auditAgentDisabled(ctx, s, sig, tr, dec.Input, dec.Confidence, nil, "", now)
+		return
 	}
 
 	ks, ok := d.opt.Herdr.(ports.KeystrokeSender)

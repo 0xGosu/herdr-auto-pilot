@@ -72,6 +72,8 @@ type fakeHerdr struct {
 	// resolving the pane.
 	agents          []domain.AgentTransition
 	listAgentsCalls int
+	agentsPinned    bool
+	failListAgents  bool
 }
 
 func (f *fakeHerdr) Send(ctx context.Context, paneID, input string) error {
@@ -239,6 +241,9 @@ func (f *fakeHerdr) ListAgents(ctx context.Context) ([]domain.AgentTransition, e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.listAgentsCalls++
+	if f.failListAgents {
+		return nil, errors.New("induced agent-list failure")
+	}
 	return append([]domain.AgentTransition(nil), f.agents...), nil
 }
 
@@ -246,6 +251,31 @@ func (f *fakeHerdr) setAgents(agents []domain.AgentTransition) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.agents = agents
+	f.agentsPinned = true
+}
+
+func (f *fakeHerdr) setFailListAgents(fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failListAgents = fail
+}
+
+// observeTransition keeps the fake's live snapshot aligned with pushed Herdr
+// events. Tests that call setAgents pin an explicit later snapshot (for example,
+// "working" after a blocked event), which must not be overwritten here.
+func (f *fakeHerdr) observeTransition(tr domain.AgentTransition) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.agentsPinned {
+		return
+	}
+	for i := range f.agents {
+		if f.agents[i].AgentID == tr.AgentID {
+			f.agents[i] = tr
+			return
+		}
+	}
+	f.agents = append(f.agents, tr)
 }
 
 func (f *fakeHerdr) listAgentsCallCount() int {
@@ -587,10 +617,12 @@ func (h *harness) push(agentID, status string) {
 }
 
 func (h *harness) pushIn(agentID, workspaceID, status string) {
-	h.events.ch <- domain.AgentTransition{
+	tr := domain.AgentTransition{
 		AgentID: agentID, PaneID: agentID, WorkspaceID: workspaceID,
 		AgentType: "claude", Status: status,
 	}
+	h.herdr.observeTransition(tr)
+	h.events.ch <- tr
 }
 
 // seedAutonomous trains a signature to autonomous mode with a consistent
@@ -1290,6 +1322,94 @@ func TestPipelineIgnoresDuplicateEvent(t *testing.T) {
 	}
 }
 
+func TestEscalationAutoDismissesUnavailableAgentWithAudit(t *testing.T) {
+	tests := []struct {
+		name          string
+		agents        []domain.AgentTransition
+		failList      bool
+		storeDisabled bool
+		wantStatus    string
+		wantTag       string
+		wantPending   int
+		wantNotified  bool
+	}{
+		{
+			name: "agent no longer live", wantStatus: "dismissed",
+			wantTag: "[agent_not_live]", wantPending: 0,
+		},
+		{
+			name:       "agent disabled",
+			agents:     []domain.AgentTransition{{AgentID: "agent-target", Status: " disabled "}},
+			wantStatus: "dismissed", wantTag: "[agent_disabled]", wantPending: 0,
+		},
+		{
+			name: "agent disabled in HAP", storeDisabled: true,
+			agents:     []domain.AgentTransition{{AgentID: "agent-target", Status: "idle"}},
+			wantStatus: "dismissed", wantTag: "[agent_disabled]", wantPending: 0,
+		},
+		{
+			name:       "agent live",
+			agents:     []domain.AgentTransition{{AgentID: "agent-target", Status: "idle"}},
+			wantStatus: "escalated", wantPending: 1, wantNotified: true,
+		},
+		{
+			name:     "agent list unavailable is inconclusive",
+			failList: true, wantStatus: "escalated", wantPending: 1, wantNotified: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.herdr.setAgents(tt.agents)
+			h.herdr.setFailListAgents(tt.failList)
+			ctx := context.Background()
+			if tt.storeDisabled {
+				if _, err := h.raw.EnsureAgentName(ctx, "agent-target"); err != nil {
+					t.Fatal(err)
+				}
+				if err := h.raw.SetAgentDisabled(ctx, "agent-target", true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s := domain.Situation{
+				AgentID: "agent-target", PaneID: "agent-target", AgentType: "claude",
+				Type: domain.SituationApproval, Status: "blocked", Content: approvalPane,
+			}
+			h.daemon.escalate(ctx, s, domain.ComputeSignature(s), domain.Decision{
+				Action: domain.ActionEscalate, Reason: domain.ReasonNoHistory,
+			}, domain.AgentTransition{
+				AgentID: s.AgentID, PaneID: s.PaneID, AgentType: s.AgentType, Status: s.Status,
+			}, time.Now())
+
+			audits, err := h.raw.AuditLog(ctx, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(audits) != 1 {
+				t.Fatalf("audit rows = %d, want 1: %+v", len(audits), audits)
+			}
+			if audits[0].Action != domain.AuditActionEscalated || audits[0].Status != tt.wantStatus {
+				t.Errorf("audit action/status = %q/%q, want %q/%q",
+					audits[0].Action, audits[0].Status, domain.AuditActionEscalated, tt.wantStatus)
+			}
+			if tt.wantTag != "" && !strings.Contains(audits[0].Rationale, tt.wantTag) {
+				t.Errorf("audit rationale = %q, want tag %q", audits[0].Rationale, tt.wantTag)
+			}
+			pending, err := h.raw.PendingEscalations(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pending) != tt.wantPending {
+				t.Errorf("pending escalations = %d, want %d", len(pending), tt.wantPending)
+			}
+			if notified := len(h.herdr.notified()) > 0; notified != tt.wantNotified {
+				t.Errorf("notification present = %v, want %v", notified, tt.wantNotified)
+			}
+		})
+	}
+}
+
 // TestReconcileEscalatesAlreadyParkedAgent covers #49: an agent already
 // blocked at subscribe time (never delivered as a pane.agent_status_changed
 // transition) is surfaced by reconcileAttention through the normal
@@ -1638,9 +1758,8 @@ func TestPaneReadFailureTakesNoAction(t *testing.T) {
 
 func TestPaneReadFailureDedupsDuplicateEvents(t *testing.T) {
 	// A persistent Herdr/pane-read outage delivers the same blocked event
-	// repeatedly. That escalation path bypasses escalate() (there is no pane
-	// to classify), so it must dedup inline — an outage must not pile up one
-	// identical pending escalation per event.
+	// repeatedly. The unreadable-pane escalation still has to enforce the same
+	// content-level dedup rule even though there is no pane content to classify.
 	h := newHarness(t, "")
 	h.herdr.failRead = true
 	ctx := context.Background()
@@ -2164,6 +2283,71 @@ func TestIdleTaskGenDropsStaleSuggestion(t *testing.T) {
 	}
 	if len(h.herdr.sentInputs()) != 0 {
 		t.Errorf("nothing may be sent for a dropped suggestion, got %v", h.herdr.sentInputs())
+	}
+}
+
+func TestIdleTaskGenAutoDismissesWhenAgentExits(t *testing.T) {
+	// Regression for an LLM generation that outlives its Codex process: Herdr
+	// successfully reports that the originating agent is gone, so the outcome
+	// must remain in Audit as dismissed and never enter the pending queue.
+	var h *harness
+	h, tg := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		h.herdr.setAgents(nil)
+		return "Implement the next repository task", nil
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	h.push("agent-exited", "idle")
+	waitFor(t, 3*time.Second, func() bool {
+		pending, _ := h.raw.HasPendingLLMConsult(ctx, "agent-exited")
+		return !pending && len(tg.genCalls()) == 1
+	})
+
+	if pending, _ := h.raw.PendingEscalations(ctx); len(pending) != 0 {
+		t.Fatalf("exited agent left %d pending escalation(s), want 0", len(pending))
+	}
+	audits, err := h.raw.AuditLog(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 1 || audits[0].Status != "dismissed" {
+		t.Fatalf("task-generation audit = %+v, want one dismissed row", audits)
+	}
+	if !strings.Contains(audits[0].Rationale, "[agent_not_live]") {
+		t.Errorf("dismissed audit rationale = %q, missing lifecycle reason", audits[0].Rationale)
+	}
+	if got := len(h.herdr.notified()); got != 0 {
+		t.Errorf("auto-dismissed escalation raised %d notification(s), want 0", got)
+	}
+}
+
+func TestDisabledAgentDeniesAutonomousAction(t *testing.T) {
+	h := newHarness(t, "[learning]\ngraduation_n = 3\n")
+	h.herdr.setPane(approvalPane)
+	h.seedAutonomous(approvalPane, domain.SituationApproval, "Yes")
+	ctx := context.Background()
+	if _, err := h.raw.EnsureAgentName(ctx, "agent-disabled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raw.SetAgentDisabled(ctx, "agent-disabled", true); err != nil {
+		t.Fatal(err)
+	}
+
+	h.push("agent-disabled", "blocked")
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(ctx, 10)
+		return len(audits) == 1
+	})
+	audits, _ := h.raw.AuditLog(ctx, 10)
+	if got := audits[0]; got.Action != domain.AuditActionDenied || got.Status != "denied" || got.Rationale != "[agent_disabled]" {
+		t.Fatalf("disabled action audit = %+v, want denied/[agent_disabled]", got)
+	}
+	if sent := h.herdr.sentInputs(); len(sent) != 0 {
+		t.Fatalf("disabled agent received autonomous input: %v", sent)
+	}
+	if pending, _ := h.raw.PendingEscalations(ctx); len(pending) != 0 {
+		t.Fatalf("disabled autonomous decision left pending escalations: %+v", pending)
 	}
 }
 
@@ -2772,6 +2956,10 @@ func TestRetryLLMOutcomeNeverAutoActs(t *testing.T) {
 	}
 	t.Cleanup(func() { raw.Close() })
 	fh := &fakeHerdr{}
+	fh.setAgents([]domain.AgentTransition{{
+		AgentID: "agent-retry-boundary", PaneID: "pane-retry-boundary",
+		AgentType: "claude", Status: "blocked",
+	}})
 	d, err := New(Options{ConfigPath: cfgPath, Store: raw, Herdr: fh, LLM: &fakeLLM{}})
 	if err != nil {
 		t.Fatal(err)

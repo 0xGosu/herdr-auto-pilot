@@ -84,10 +84,12 @@ func TestCodexBlockedMCQEscalatesAsAggregatedChoice(t *testing.T) {
 		codexQuestionFrame(2, 2, 2, "1", false),
 	}
 	h.herdr.setFrames(frames)
-	h.events.ch <- domain.AgentTransition{
+	tr := domain.AgentTransition{
 		AgentID: "agent-codex-escalation", PaneID: "agent-codex-escalation",
 		AgentType: "codex", Status: "blocked",
 	}
+	h.herdr.observeTransition(tr)
+	h.events.ch <- tr
 	ctx := context.Background()
 	waitFor(t, 10*time.Second, func() bool {
 		esc, _ := h.raw.PendingEscalations(ctx)

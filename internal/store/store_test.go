@@ -865,6 +865,42 @@ func TestAgentNames(t *testing.T) {
 	}
 }
 
+func TestAgentDisabledState(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	if err := s.AssignAgentName(ctx, "w1:p1", "builder"); err != nil {
+		t.Fatal(err)
+	}
+	if disabled, err := s.AgentDisabled(ctx, "w1:p1"); err != nil || disabled {
+		t.Fatalf("new agent disabled=%v err=%v, want enabled", disabled, err)
+	}
+	if err := s.SetAgentDisabled(ctx, "builder", true); err != nil {
+		t.Fatal(err)
+	}
+	if disabled, err := s.AgentDisabled(ctx, "w1:p1"); err != nil || !disabled {
+		t.Fatalf("disabled=%v err=%v, want true", disabled, err)
+	}
+	all, err := s.DisabledAgents(ctx)
+	if err != nil || !all["w1:p1"] {
+		t.Fatalf("disabled agents=%v err=%v", all, err)
+	}
+	if err := s.RenameAgent(ctx, "builder", "reviewer"); err != nil {
+		t.Fatal(err)
+	}
+	if disabled, _ := s.AgentDisabled(ctx, "w1:p1"); !disabled {
+		t.Error("rename must preserve disabled state")
+	}
+	if err := s.SetAgentDisabled(ctx, "reviewer", false); err != nil {
+		t.Fatal(err)
+	}
+	if disabled, _ := s.AgentDisabled(ctx, "w1:p1"); disabled {
+		t.Error("enable did not clear disabled state")
+	}
+	if err := s.SetAgentDisabled(ctx, "unknown", true); err == nil {
+		t.Error("unknown target must be rejected")
+	}
+}
+
 func TestClearLearnedData(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()
