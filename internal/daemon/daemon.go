@@ -770,10 +770,15 @@ func (d *Daemon) hasOpenEscalation(ctx context.Context, agentID string) bool {
 // volatile chrome (a spinner tick, an elapsed/countdown counter) had moved on.
 //
 // The key is agent + agent type + the NORMALIZED pane content
-// (domain.NormalizeForDedup elides that chrome). The agent status is
-// deliberately excluded — it is the field that legitimately CHANGES between the
-// duplicates — and so are trigger() (which embeds it) and situation_type (which
-// the classifier DERIVES from it). See domain.DuplicatesPendingEscalation.
+// (domain.NormalizeForDedup elides that chrome, and deletes Claude's ※-led
+// recap/tip blocks, which appear on their own on a settled screen). The agent
+// status is deliberately excluded — it is the field that legitimately CHANGES
+// between the duplicates — and so are trigger() (which embeds it) and
+// situation_type (which the classifier DERIVES from it). A capture whose
+// tail-anchored window merely shifted (an appearing note block pushed old
+// text off the head) is also recognized, via a suffix compare gated on both
+// captures filling at least half of snapshotMaxRunes. See
+// domain.DuplicatesPendingEscalation.
 //
 // It runs only where escalations are raised (escalate() and the
 // pane-read-failure path), NOT before the decision core: the rate guard, retry
@@ -798,7 +803,7 @@ func (d *Daemon) duplicatePendingEscalation(ctx context.Context, s domain.Situat
 		return false
 	}
 	return domain.DuplicatesPendingEscalation(s.Type,
-		truncateTailRunes(s.Content, snapshotMaxRunes), pending)
+		truncateTailRunes(s.Content, snapshotMaxRunes), snapshotMaxRunes, pending)
 }
 
 // ignoreDuplicate audits a no-op for an event whose situation already has a
