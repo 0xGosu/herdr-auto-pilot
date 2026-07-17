@@ -1149,6 +1149,32 @@ func (d *Daemon) learnedAction(ctx context.Context, s domain.Situation, dec doma
 	return dec.Input
 }
 
+// llmLearnedAction is the action recorded in decision history for an LLM
+// decision — the counterpart of learnedAction on the consult path.
+//
+// A task-review send learns SYMBOLICALLY, whatever the LLM actually sent: the
+// rule is "send the next declared task", not the text of one particular task.
+// Recording the literal text instead would bucket every task separately in
+// domain.Confidence, which groups on the raw action string — the signature
+// would never reach agreement, and a couple of @noop records could even win
+// the plurality and stand the agent down (resolveSituation checks @noop before
+// the declared task). A task review always has a declared task
+// (consultDeclaredTask), so there is no inferred variant to distinguish here.
+//
+// Every other situation (approval / choice / error, and an idle consult with no
+// task source, where the LLM authors free text) learns llmDec.Action — which is
+// exactly what gets delivered below. Deliberately NOT llmDec.OptionID, even
+// though learnedAction prefers dec.OptionID: that one comes from domain.Decide
+// and agrees with the send by construction, whereas llmDec.OptionID is supplied
+// by the model and can survive unresolved on the legacy option_id alias, which
+// would learn an answer the daemon never sent.
+func (d *Daemon) llmLearnedAction(llmDec *domain.LLMDecision, taskReviewSend bool) string {
+	if taskReviewSend {
+		return domain.ActionNextDeclaredTask
+	}
+	return llmDec.Action
+}
+
 // delivery describes one autonomous send: what to write to the pane, what
 // to audit, and what to learn.
 type delivery struct {
@@ -2180,13 +2206,31 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// row staged by an older binary (or written directly) must not slip a
 	// noop spelling into the pane as literal text.
 	llmDec.Action = domain.NormalizeNoopAction(llmDec.Action)
+	// A task-review send — the LLM approved the queued task, edited it, or
+	// picked another pending item. Only a decline (@noop) is not one, so
+	// classify AFTER the noop normalization above. The action is symbolic for
+	// learning (llmLearnedAction) but literal for the gates and the send below.
+	taskReviewSend := res.request.TaskReview && res.request.ProposedTask != "" &&
+		!domain.IsNoopAction(llmDec.Action)
 	// Task-review shorthand: the LLM may approve the queued task verbatim with
 	// the send-proposed sentinel instead of re-typing it. Expand it to the
 	// reviewed task BEFORE the re-gates/send so every safety scan and the
 	// escalation suggestion operate on the real instruction, never the sentinel.
-	if res.request.TaskReview && res.request.ProposedTask != "" &&
-		llmDec.Action == domain.ActionSendProposed {
+	if taskReviewSend && llmDec.Action == domain.ActionSendProposed {
 		llmDec.Action = res.request.ProposedTask
+	}
+	// The sentinel only means "send the reviewed task" on a task review that
+	// carries one. Anywhere else there is nothing to expand it to, so it must
+	// never reach the pane as literal text. Escalate WITHOUT a suggestion
+	// rather than via reject(), which would surface the raw sentinel as
+	// confirmable — an operator confirm --send would then type it into the pane.
+	if llmDec.Action == domain.ActionSendProposed {
+		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
+		d.escalate(ctx, s, res.sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonLLMNoSubmit,
+			Rationale: "LLM submitted the send-proposed sentinel outside a task review with a proposed task",
+		}, tr, now)
+		return
 	}
 	isNoop := domain.IsNoopAction(llmDec.Action)
 	if isNoop {
@@ -2198,6 +2242,12 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		if isNoop {
 			// Raw "@noop" is never surfaced to humans.
 			suggested = domain.ActionNoopSuggestion
+		} else if taskReviewSend {
+			// Carry the task-send prefix so a confirm round-trips to the
+			// symbolic action (suggestionAction / frontend.SuggestedAction)
+			// while the operator still sees the real instruction, and
+			// materializeForSend can recover it for a confirm --send.
+			suggested = "send next declared task: " + suggested
 		}
 		// Surface the agent's self-reported confidence on the escalation so
 		// the operator can weigh the suggestion (-1 = not reported).
@@ -2373,8 +2423,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		}
 	}
 	// The variance guard compares the LLM's action to the signature's dominant
-	// learned action; it does not apply to a declared-task review, whose action
-	// is novel task text (each task differs) rather than a repeated answer.
+	// learned action; it does not apply to a declared-task review. A review's
+	// history is symbolic ("@next_task:declared") while llmDec.Action here is
+	// the expanded task text, so the two never compare equal — the guard would
+	// reject every review. The review has its own gate: the LLM judged the live
+	// pane, and the re-gates below still apply.
 	if !res.request.TaskReview {
 		if conf := domain.Confidence(history, cfg.Learning.ConfirmationWeight); conf.TopAction != "" && conf.TopAction != llmDec.Action {
 			reject(domain.ReasonVarianceGuard, "LLM contradicts history")
@@ -2530,7 +2583,8 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "accepted")
 	d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
 		Signature: res.sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-		ChosenAction: llmDec.Action, Source: domain.SourceLLM, CreatedAt: now,
+		ChosenAction: d.llmLearnedAction(llmDec, taskReviewSend),
+		Source:       domain.SourceLLM, CreatedAt: now,
 	})
 	if rate2, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
 		updated := domain.RegisterAutoPrompt(*rate2, now)

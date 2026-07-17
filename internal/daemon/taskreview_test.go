@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
@@ -161,6 +162,251 @@ func TestDeclaredTaskLLMReviewSendProposedSentinel(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sentinel should send the rendered task verbatim, got %q, want %q", got, want)
+	}
+}
+
+// reviewConsult returns a consult stub that stages and returns one LLM decision
+// with the given action and score — the shape every task-review test needs.
+func reviewConsult(h *harness, action string, score int) func(context.Context, domain.LLMRequest) (*domain.LLMDecision, error) {
+	return func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		id, err := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: action, Rationale: "reviewed the pane", ConfidentScore: score,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: action,
+			Rationale: "reviewed the pane", ConfidentScore: score, Status: "pending"}, nil
+	}
+}
+
+// onlyDecision waits for exactly one decision recorded against the signature
+// of the most recent audit row, and returns it. The signature is read from the
+// audit log rather than ListSignatures: a signature only gets a state row once
+// it is observed for learning, which has not happened on the auto path.
+func onlyDecision(t *testing.T, h *harness) domain.DecisionRecord {
+	t.Helper()
+	ctx := context.Background()
+	var got []domain.DecisionRecord
+	waitFor(t, 5*time.Second, func() bool {
+		audits, err := h.raw.AuditLog(ctx, 1)
+		if err != nil || len(audits) == 0 || audits[0].Signature == "" {
+			return false
+		}
+		got, err = h.raw.DecisionsForSignature(ctx, audits[0].Signature, 10)
+		return err == nil && len(got) == 1
+	})
+	if len(got) != 1 {
+		t.Fatalf("want exactly 1 recorded decision, got %d: %+v", len(got), got)
+	}
+	return got[0]
+}
+
+// A task-review send must learn the SYMBOLIC action, whatever text the LLM
+// actually sent: the rule is "send the next declared task", not the text of one
+// particular task. Learning the literal instead buckets every task separately
+// in domain.Confidence, so the signature never agrees with itself — and a
+// couple of @noop records can win the plurality and stand the agent down.
+// The pane must still receive the real task text in every case.
+func TestDeclaredTaskLLMReviewLearnsSymbolicAction(t *testing.T) {
+	edited := "Your next task is refactor the parser (start with the lexer)."
+	for _, tc := range []struct {
+		name     string
+		action   func(proposed string) string
+		wantSent func(proposed string) string
+	}{
+		{
+			// The shorthand: the LLM approves without re-typing the task.
+			name:     "sentinel",
+			action:   func(string) string { return domain.ActionSendProposed },
+			wantSent: func(proposed string) string { return proposed },
+		},
+		{
+			// The LLM copied the task text instead of using the sentinel —
+			// same decision, so it must learn the same symbolic action.
+			name:     "literal copy",
+			action:   func(proposed string) string { return proposed },
+			wantSent: func(proposed string) string { return proposed },
+		},
+		{
+			// An edited task still sends the LLM's text but learns
+			// symbolically: the edit is situational, not a reusable rule.
+			name:     "edited",
+			action:   func(string) string { return edited },
+			wantSent: func(string) string { return edited },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			taskFile := writeReviewTaskFile(t, "- [ ] refactor the parser\n")
+			cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-sym\"\npath = %q\n", taskFile)
+			h := newHarness(t, cfg)
+			h.herdr.setPane("All tests pass. Task is complete.\n")
+			h.llm.configured = true
+
+			name, err := h.raw.EnsureAgentName(context.Background(), "agent-sym")
+			if err != nil {
+				t.Fatal(err)
+			}
+			proposed := (&domain.DeclaredTask{Task: "refactor the parser", Path: taskFile, AgentName: name}).Prompt()
+			h.llm.consult = reviewConsult(h, tc.action(proposed), 90)
+
+			h.push("agent-sym", "idle")
+			waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+			if got, want := h.herdr.sentInputs()[0], tc.wantSent(proposed); got != want {
+				t.Errorf("sent %q, want the real task text %q", got, want)
+			}
+			rec := onlyDecision(t, h)
+			if rec.ChosenAction != domain.ActionNextDeclaredTask {
+				t.Errorf("learned %q, want the symbolic %q", rec.ChosenAction, domain.ActionNextDeclaredTask)
+			}
+			if rec.Source != domain.SourceLLM {
+				t.Errorf("learned source = %q, want %q", rec.Source, domain.SourceLLM)
+			}
+		})
+	}
+}
+
+func TestDeclaredTaskLLMReviewEscalationSuggestionRoundTrips(t *testing.T) {
+	// A sub-threshold review escalates. Its suggestion must carry the task-send
+	// prefix so a confirm round-trips to the symbolic action, while the operator
+	// still reads the real instruction.
+	taskFile := writeReviewTaskFile(t, "- [ ] refactor the parser\n")
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 95\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-rt\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane("All tests pass. Task is complete.\n")
+	h.llm.configured = true
+	h.llm.consult = reviewConsult(h, domain.ActionSendProposed, 40)
+
+	ctx := context.Background()
+	name, err := h.raw.EnsureAgentName(ctx, "agent-rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposed := (&domain.DeclaredTask{Task: "refactor the parser", Path: taskFile, AgentName: name}).Prompt()
+	h.push("agent-rt", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	want := "LLM suggested: send next declared task: " + proposed
+	if esc[0].Suggestion != want {
+		t.Errorf("suggestion = %q, want %q", esc[0].Suggestion, want)
+	}
+	if got := suggestionAction(&esc[0]); got != domain.ActionNextDeclaredTask {
+		t.Errorf("suggestion should round-trip to the symbolic action, got %q", got)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Errorf("an escalated review must not send, sent %v", h.herdr.sentInputs())
+	}
+}
+
+func TestDeclaredTaskReviewCorrectionLearnsSymbolic(t *testing.T) {
+	// Confirming an escalated task review must learn the SYMBOLIC action too —
+	// the operator agreed with "send the next declared task", not with this
+	// task's text. This is the second half of the leak: the suggestion carries
+	// the real text, and the confirm flow round-trips it back to the sentinel.
+	taskFile := writeReviewTaskFile(t, "- [ ] refactor the parser\n")
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 95\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-corr\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane("All tests pass. Task is complete.\n")
+	h.llm.configured = true
+	h.llm.consult = reviewConsult(h, domain.ActionSendProposed, 40)
+
+	ctx := context.Background()
+	if _, err := h.raw.EnsureAgentName(ctx, "agent-corr"); err != nil {
+		t.Fatal(err)
+	}
+	h.push("agent-corr", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+
+	// The operator confirms via the same round-trip the front-ends use.
+	action := frontendSuggestedAction(esc[0])
+	if action != domain.ActionNextDeclaredTask {
+		t.Fatalf("confirm resolves suggestion to %q, want %q", action, domain.ActionNextDeclaredTask)
+	}
+	if _, err := h.raw.InsertCorrection(ctx, domain.CorrectionRecord{
+		AuditID: esc[0].ID, CorrectedAction: action, Author: "operator", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		st, _ := h.raw.GetSignature(ctx, esc[0].Signature)
+		return st != nil && st.ConsecutiveConfirmations >= 1
+	})
+	decs, _ := h.raw.DecisionsForSignature(ctx, esc[0].Signature, 10)
+	if len(decs) == 0 || decs[0].ChosenAction != domain.ActionNextDeclaredTask {
+		t.Fatalf("confirmed review must learn the symbolic action: %+v", decs)
+	}
+	if decs[0].Source != domain.SourceOperator {
+		t.Errorf("learned source = %q, want %q", decs[0].Source, domain.SourceOperator)
+	}
+	// The suggestion round-trips exactly, so this reads as a confirmation of
+	// what was suggested rather than a correction away from it.
+	if decs[0].IsCorrection {
+		t.Errorf("confirming the suggested action must not record a correction: %+v", decs[0])
+	}
+}
+
+func TestLLMApprovalStillLearnsLiteralAction(t *testing.T) {
+	// The symbolic rewrite is scoped to task reviews. An ordinary approval
+	// consult shares the same RecordDecision call and must keep learning what
+	// the LLM actually answered.
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(approvalPane)
+	h.llm.configured = true
+	h.llm.consult = reviewConsult(h, "y", 90)
+
+	h.push("agent-appr", "blocked")
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	rec := onlyDecision(t, h)
+	if rec.ChosenAction != "y" {
+		t.Errorf("an approval must still learn the literal answer, got %q", rec.ChosenAction)
+	}
+}
+
+func TestLLMSendProposedSentinelOutsideTaskReviewEscalates(t *testing.T) {
+	// The sentinel is only expandable on a task review carrying a proposed
+	// task. Submitted anywhere else it has no meaning, so it must escalate
+	// rather than reach the pane as literal text.
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane("Do you want to proceed?\n1. Yes\n2. No\n")
+	h.llm.configured = true
+	h.llm.consult = reviewConsult(h, domain.ActionSendProposed, 90)
+
+	ctx := context.Background()
+	h.push("agent-stray", "blocked")
+	var esc []domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	for _, sent := range h.herdr.sentInputs() {
+		if strings.Contains(sent, domain.ActionSendProposed) {
+			t.Errorf("the raw sentinel must never reach the pane, sent %q", sent)
+		}
+	}
+	// The defining property: escalate with NO suggestion. Routing this through
+	// reject() instead would surface "LLM suggested: @next_task:declared" as
+	// confirmable, and a confirm --send would type the sentinel into the pane —
+	// while this test's send assertion above still passed.
+	if esc[0].Suggestion != "" {
+		t.Errorf("an unexpandable sentinel must not be surfaced as confirmable, suggestion = %q", esc[0].Suggestion)
+	}
+	if !strings.Contains(esc[0].Rationale, string(domain.ReasonLLMNoSubmit)) {
+		t.Errorf("want an %s escalation, got rationale %q", domain.ReasonLLMNoSubmit, esc[0].Rationale)
 	}
 }
 
