@@ -5,13 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
@@ -21,9 +24,21 @@ var (
 	_ ports.KeystrokeSender         = (*CLI)(nil)
 	_ ports.KeystrokeSequenceSender = (*CLI)(nil)
 	_ ports.AgentAwareSender        = (*CLI)(nil)
+	_ ports.SubmitRetryWaiter       = (*CLI)(nil)
 )
 
-const codexSecondEnterDelay = 300 * time.Millisecond
+const (
+	codexSecondEnterDelay = 300 * time.Millisecond
+	// submitRetryBaseDelay is the first status-gated retry-Enter delay;
+	// each subsequent retry doubles it (300, 600, 1200, 2400ms).
+	submitRetryBaseDelay = 300 * time.Millisecond
+	// submitRetryMax caps the status-gated retry Enters per send.
+	submitRetryMax = 4
+	// statusProbeTimeout bounds each retry-loop herdr query (status poll,
+	// pane read) so a wedged herdr costs at most ~2s per probe instead of
+	// the full CLI timeout, keeping the caller's worst-case stall bounded.
+	statusProbeTimeout = 2 * time.Second
+)
 
 // CLI issues one-shot Herdr control actions through the herdr binary
 // (HERDR_BIN_PATH), which stays portable across Unix sockets and Windows
@@ -31,6 +46,15 @@ const codexSecondEnterDelay = 300 * time.Millisecond
 type CLI struct {
 	BinPath string
 	Timeout time.Duration
+	// retryBaseDelay overrides submitRetryBaseDelay in tests (0 = default).
+	retryBaseDelay time.Duration
+
+	// Submit-retry workers run detached from the send call (the daemon's
+	// monitor loop must never absorb their backoff sleeps); a newer send to
+	// the same pane supersedes the previous worker.
+	retryMu      sync.Mutex
+	retryCancels map[string]context.CancelFunc
+	retryWG      sync.WaitGroup
 }
 
 // NewCLI resolves the herdr binary from HERDR_BIN_PATH (falling back to
@@ -65,37 +89,183 @@ func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
 // the literal text, then `pane send-keys <pane> enter` submits it (verified
 // against herdr 0.7: agent send alone does not press Enter).
 func (c *CLI) Send(ctx context.Context, paneID, input string) error {
-	return c.send(ctx, paneID, input, false)
+	return c.send(ctx, paneID, input, sendBehavior{})
 }
 
-// SendToAgent adds a delayed second Enter for Codex. Codex treats rapidly
+// sendBehavior selects the per-agent-type submit hardening applied by send.
+type sendBehavior struct {
+	codexDoubleEnter bool // unconditional Enter after codexSecondEnterDelay
+	retrySubmit      bool // status-gated exponential retry Enters
+}
+
+// SendToAgent hardens submission per agent type. Codex treats rapidly
 // injected text as a paste burst and interprets the first immediate Enter as
-// a newline; after its suppression window expires, the second Enter submits
-// the composed prompt.
+// a newline, so it always gets a delayed second Enter. Codex and Claude
+// additionally get status-gated retry Enters: when the agent was idle/done
+// before the send and its status has not moved afterwards, Enter is pressed
+// again with exponential backoff until the status changes (submitRetryMax
+// attempts max).
 func (c *CLI) SendToAgent(ctx context.Context, paneID, agentType, input string) error {
-	return c.send(ctx, paneID, input, strings.EqualFold(strings.TrimSpace(agentType), "codex"))
+	kind := strings.ToLower(strings.TrimSpace(agentType))
+	return c.send(ctx, paneID, input, sendBehavior{
+		codexDoubleEnter: kind == "codex",
+		retrySubmit:      kind == "codex" || kind == "claude",
+	})
 }
 
-func (c *CLI) send(ctx context.Context, paneID, input string, codex bool) error {
+func (c *CLI) send(ctx context.Context, paneID, input string, b sendBehavior) error {
+	// Snapshot BEFORE the send; only a cleanly idle/done agent arms the
+	// retry loop — a blocked agent's standing menu must never receive stray
+	// Enters (they could commit a default option).
+	preStatus, retry := "", false
+	if b.retrySubmit {
+		if st, ok := c.probeAgentStatus(ctx, paneID); ok && st != "" && !domain.AgentBusy(st) {
+			preStatus, retry = st, true
+		}
+	}
 	if _, err := c.run(ctx, "agent", "send", paneID, input); err != nil {
 		return err
 	}
 	if _, err := c.run(ctx, "pane", "send-keys", paneID, "enter"); err != nil {
 		return err
 	}
-	if !codex {
-		return nil
+	if b.codexDoubleEnter {
+		if err := sleepCtx(ctx, codexSecondEnterDelay); err != nil {
+			return err
+		}
+		if _, err := c.run(ctx, "pane", "send-keys", paneID, "enter"); err != nil {
+			return err
+		}
 	}
+	if retry {
+		c.spawnSubmitRetry(ctx, paneID, preStatus)
+	}
+	return nil
+}
 
-	timer := time.NewTimer(codexSecondEnterDelay)
+// spawnSubmitRetry runs the retry loop in its own guarded goroutine so the
+// caller — notably the daemon's monitor select loop — never absorbs the
+// backoff sleeps and probe subprocess calls (same no-stall pattern as the
+// daemon's post-action unblock self-check). The worker inherits the caller's
+// ctx, so daemon shutdown cancels it; a newer send to the same pane cancels
+// the previous worker to keep at most one Enter-presser per pane. One-shot
+// processes drain workers via WaitSubmitRetries before exiting.
+func (c *CLI) spawnSubmitRetry(ctx context.Context, paneID, preStatus string) {
+	rctx, cancel := context.WithCancel(ctx)
+	c.retryMu.Lock()
+	if c.retryCancels == nil {
+		c.retryCancels = make(map[string]context.CancelFunc)
+	}
+	if prev, ok := c.retryCancels[paneID]; ok {
+		prev()
+	}
+	c.retryCancels[paneID] = cancel
+	c.retryMu.Unlock()
+	c.retryWG.Add(1)
+	go func() {
+		defer c.retryWG.Done()
+		defer cancel()
+		_ = logging.Guard("submit-retry", func() error {
+			c.retrySubmitEnter(rctx, paneID, preStatus)
+			return nil
+		})
+	}()
+}
+
+// WaitSubmitRetries blocks until every in-flight submit-retry worker has
+// finished (ports.SubmitRetryWaiter). One-shot commands call it before the
+// process exits so pending retries are not silently lost; long-lived callers
+// (the daemon, the TUI while running) never need to.
+func (c *CLI) WaitSubmitRetries() {
+	c.retryWG.Wait()
+}
+
+// retrySubmitEnter is the best-effort submit self-heal: while the agent's
+// status has not moved off its pre-send value, press Enter again with
+// exponential backoff. It never returns an error — the primary delivery
+// already succeeded, and failing the whole send here would falsely mark a
+// delivered action as escalated. A status-read failure or a vanished pane
+// stops the loop (fail safe).
+func (c *CLI) retrySubmitEnter(ctx context.Context, paneID, preStatus string) {
+	delay := c.retryBaseDelay
+	if delay <= 0 {
+		delay = submitRetryBaseDelay
+	}
+	for attempt := 0; attempt < submitRetryMax; attempt++ {
+		if err := sleepCtx(ctx, delay); err != nil {
+			return
+		}
+		st, ok := c.probeAgentStatus(ctx, paneID)
+		if !ok || st != preStatus {
+			return
+		}
+		// Some approval modals park at idle/done (Claude's remote-env
+		// picker, Codex's Plan approval), so the status gate alone cannot
+		// prove the pane is safe: a stray Enter into such a modal commits
+		// its highlighted option. Re-check the visible pane before every
+		// press and stop the moment a standing form appears.
+		if c.paneShowsStandingForm(ctx, paneID) {
+			return
+		}
+		if _, err := c.run(ctx, "pane", "send-keys", paneID, "enter"); err != nil {
+			slog.Warn("submit-retry enter failed", "pane", paneID, "error", err)
+			return
+		}
+		delay *= 2
+	}
+}
+
+// probeAgentStatus returns the pane's current agent status via `agent list`
+// under statusProbeTimeout; ok=false when the list fails or the pane is
+// absent.
+func (c *CLI) probeAgentStatus(ctx context.Context, paneID string) (string, bool) {
+	ctx, cancel := context.WithTimeout(ctx, statusProbeTimeout)
+	defer cancel()
+	agents, err := c.ListAgents(ctx)
+	if err != nil {
+		return "", false
+	}
+	for _, a := range agents {
+		if a.PaneID == paneID {
+			return a.Status, true
+		}
+	}
+	return "", false
+}
+
+// paneShowsStandingForm reports whether the visible pane renders a structural
+// approval form that a bare Enter could commit. An unreadable pane counts as
+// a form (fail safe: skip the retry rather than press blind). Only the
+// end-anchored structural detectors are used — a generic numbered-list match
+// would false-positive on ordinary agent output in scrollback.
+func (c *CLI) paneShowsStandingForm(ctx context.Context, paneID string) bool {
+	ctx, cancel := context.WithTimeout(ctx, statusProbeTimeout)
+	defer cancel()
+	content, err := c.ReadPaneVisible(ctx, paneID, 60)
+	if err != nil {
+		return true
+	}
+	if _, ok := domain.ClaudeRemoteEnvForm(content); ok {
+		return true
+	}
+	if domain.CodexPlanApprovalForm(content) {
+		return true
+	}
+	if _, ok := domain.MultiTabForm(content); ok {
+		return true
+	}
+	return false
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-timer.C:
+		return nil
 	}
-	_, err := c.run(ctx, "pane", "send-keys", paneID, "enter")
-	return err
 }
 
 // SendKey presses a single key in the pane (`pane send-keys`) without

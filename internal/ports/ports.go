@@ -28,6 +28,15 @@ type AgentAwareSender interface {
 	SendToAgent(ctx context.Context, paneID, agentType, input string) error
 }
 
+// SubmitRetryWaiter is implemented by adapters whose SendToAgent spawns
+// asynchronous submit-retry workers (extra Enters pressed while an idle
+// agent's status has not moved). One-shot processes type-assert and wait
+// before exiting so in-flight retries are not silently lost; long-lived
+// callers never need to.
+type SubmitRetryWaiter interface {
+	WaitSubmitRetries()
+}
+
 // SendToAgent delivers input through the agent-aware capability when the
 // adapter provides it, otherwise it falls back to the base HerdrPort contract.
 func SendToAgent(ctx context.Context, h HerdrPort, paneID, agentType, input string) error {

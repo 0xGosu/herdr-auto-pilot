@@ -325,9 +325,31 @@ func TestSendKeysUsesOneHerdrInvocation(t *testing.T) {
 	}
 }
 
+// agentListJSON renders the herdr `agent list` envelope with one agent row.
+func agentListJSON(agentType, status, paneID string) string {
+	return fmt.Sprintf(`{"id":"cli:agent:list","result":{"agents":[`+
+		`{"agent":%q,"agent_status":%q,"pane_id":%q,"workspace_id":"w1"}],"type":"agent_list"}}`,
+		agentType, status, paneID)
+}
+
+func countCalls(calls []string, call string) int {
+	n := 0
+	for _, c := range calls {
+		if c == call {
+			n++
+		}
+	}
+	return n
+}
+
 func TestSendToCodexSubmitsAgainAfterDelay(t *testing.T) {
 	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
 	if err != nil {
+		t.Fatal(err)
+	}
+	// A blocked agent (menu answer) is retry-ineligible: codex must still get
+	// exactly its one guaranteed second Enter.
+	if err := fake.SetAgentList(agentListJSON("codex", "blocked", "w1:p1")); err != nil {
 		t.Fatal(err)
 	}
 	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
@@ -340,6 +362,7 @@ func TestSendToCodexSubmitsAgainAfterDelay(t *testing.T) {
 	}
 	calls := fake.Calls()
 	want := []string{
+		"agent list",
 		"agent send w1:p1 run the tests",
 		"pane send-keys w1:p1 enter",
 		"pane send-keys w1:p1 enter",
@@ -349,9 +372,14 @@ func TestSendToCodexSubmitsAgainAfterDelay(t *testing.T) {
 	}
 }
 
-func TestSendToNonCodexDoesNotSubmitAgain(t *testing.T) {
+func TestSendToBlockedClaudeDoesNotSubmitAgain(t *testing.T) {
 	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
 	if err != nil {
+		t.Fatal(err)
+	}
+	// Blocked = a standing menu; stray retry Enters could commit a default
+	// option, so the send must press Enter exactly once.
+	if err := fake.SetAgentList(agentListJSON("claude", "blocked", "w1:p1")); err != nil {
 		t.Fatal(err)
 	}
 	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
@@ -359,9 +387,234 @@ func TestSendToNonCodexDoesNotSubmitAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := fake.Calls()
+	want := []string{
+		"agent list",
+		"agent send w1:p1 run the tests",
+		"pane send-keys w1:p1 enter",
+	}
+	if fmt.Sprint(calls) != fmt.Sprint(want) {
+		t.Errorf("blocked claude send calls = %v, want %v", calls, want)
+	}
+}
+
+func TestSendToUnknownAgentTypeSkipsSubmitHardening(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "gemini", "run the tests"); err != nil {
+		t.Fatal(err)
+	}
+	calls := fake.Calls()
 	if len(calls) != 2 || calls[0] != "agent send w1:p1 run the tests" ||
 		calls[1] != "pane send-keys w1:p1 enter" {
-		t.Errorf("non-codex send should press Enter once, got %v", calls)
+		t.Errorf("unknown-type send should press Enter once with no status check, got %v", calls)
+	}
+}
+
+func TestSendToClaudeRetriesUntilStatusChanges(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetAgentListSequence(
+		agentListJSON("claude", "idle", "w1:p1"),    // snapshot
+		agentListJSON("claude", "idle", "w1:p1"),    // poll 1: unchanged → retry Enter
+		agentListJSON("claude", "working", "w1:p1"), // poll 2: changed → stop
+	); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second, retryBaseDelay: 5 * time.Millisecond}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
+		t.Fatal(err)
+	}
+	cli.WaitSubmitRetries()
+	calls := fake.Calls()
+	if got := countCalls(calls, "pane send-keys w1:p1 enter"); got != 2 {
+		t.Errorf("want initial Enter + exactly one retry Enter, got %d in %v", got, calls)
+	}
+	if got := countCalls(calls, "agent list"); got != 3 {
+		t.Errorf("want snapshot + two polls, got %d agent list calls in %v", got, calls)
+	}
+}
+
+func TestSendToClaudeStopsAfterMaxRetries(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetAgentList(agentListJSON("claude", "idle", "w1:p1")); err != nil {
+		t.Fatal(err)
+	}
+	base := 20 * time.Millisecond
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second, retryBaseDelay: base}
+	start := time.Now()
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
+		t.Fatal(err)
+	}
+	cli.WaitSubmitRetries()
+	// Exponential schedule: base + 2base + 4base + 8base.
+	if wantMin := 15 * base; time.Since(start) < wantMin {
+		t.Errorf("retries finished too early: elapsed %v, want at least %v", time.Since(start), wantMin)
+	}
+	calls := fake.Calls()
+	if got := countCalls(calls, "pane send-keys w1:p1 enter"); got != 1+submitRetryMax {
+		t.Errorf("want initial Enter + %d retries, got %d in %v", submitRetryMax, got, calls)
+	}
+	if got := countCalls(calls, "agent list"); got != 1+submitRetryMax {
+		t.Errorf("want snapshot + %d polls, got %d agent list calls in %v", submitRetryMax, got, calls)
+	}
+}
+
+func TestSendToIdleCodexRetriesAfterGuaranteedEnter(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetAgentListSequence(
+		agentListJSON("codex", "idle", "w1:p1"),    // snapshot
+		agentListJSON("codex", "working", "w1:p1"), // poll 1: changed → stop
+	); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second, retryBaseDelay: 5 * time.Millisecond}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "codex", "run the tests"); err != nil {
+		t.Fatal(err)
+	}
+	cli.WaitSubmitRetries()
+	calls := fake.Calls()
+	if got := countCalls(calls, "pane send-keys w1:p1 enter"); got != 2 {
+		t.Errorf("want initial + guaranteed Enter only, got %d in %v", got, calls)
+	}
+	if got := countCalls(calls, "agent list"); got != 2 {
+		t.Errorf("want snapshot + one poll, got %d agent list calls in %v", got, calls)
+	}
+}
+
+func TestSendSnapshotFailureDisablesRetries(t *testing.T) {
+	for _, tc := range []struct {
+		agentType  string
+		wantEnters int
+	}{
+		{"claude", 1},
+		{"codex", 2}, // the guaranteed second Enter never depends on status
+	} {
+		t.Run(tc.agentType, func(t *testing.T) {
+			fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			// No agent list configured: the snapshot fails, so no retries.
+			cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second, retryBaseDelay: 5 * time.Millisecond}
+			if err := cli.SendToAgent(context.Background(), "w1:p1", tc.agentType, "run the tests"); err != nil {
+				t.Fatal(err)
+			}
+			cli.WaitSubmitRetries()
+			calls := fake.Calls()
+			if got := countCalls(calls, "pane send-keys w1:p1 enter"); got != tc.wantEnters {
+				t.Errorf("want %d Enters, got %d in %v", tc.wantEnters, got, calls)
+			}
+			if got := countCalls(calls, "agent list"); got != 1 {
+				t.Errorf("want only the snapshot attempt, got %d agent list calls in %v", got, calls)
+			}
+		})
+	}
+}
+
+func TestSendRetryStopsOnListFailureMidLoop(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetAgentListSequence(
+		agentListJSON("claude", "idle", "w1:p1"), // snapshot
+		"not-json",                               // poll 1: unreadable → stop
+	); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second, retryBaseDelay: 5 * time.Millisecond}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
+		t.Fatal(err)
+	}
+	cli.WaitSubmitRetries()
+	if got := countCalls(fake.Calls(), "pane send-keys w1:p1 enter"); got != 1 {
+		t.Errorf("mid-loop list failure must stop retries, got %d Enters in %v", got, fake.Calls())
+	}
+}
+
+func TestSendRetryStopsWhenPaneVanishes(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetAgentListSequence(
+		agentListJSON("claude", "idle", "w1:p1"), // snapshot
+		agentListJSON("claude", "idle", "w1:p9"), // poll 1: pane gone → stop
+	); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second, retryBaseDelay: 5 * time.Millisecond}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
+		t.Fatal(err)
+	}
+	cli.WaitSubmitRetries()
+	if got := countCalls(fake.Calls(), "pane send-keys w1:p1 enter"); got != 1 {
+		t.Errorf("vanished pane must stop retries, got %d Enters in %v", got, fake.Calls())
+	}
+}
+
+func TestSendRetryStopsWhenStandingFormAppears(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Claude's remote-env picker parks at IDLE, so the status gate alone
+	// cannot exclude it: the pre-press pane re-check must refuse the Enter
+	// (a stray Enter would commit the highlighted environment).
+	if err := fake.SetAgentList(agentListJSON("claude", "idle", "w1:p1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetPaneContent("Select remote environment\n" +
+		"❯ 1. Default (env-default) ✔\n" +
+		"  2. Ubuntu 22 (env-ubuntu)\n" +
+		"Enter to select · Esc to cancel"); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second, retryBaseDelay: 5 * time.Millisecond}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
+		t.Fatal(err)
+	}
+	cli.WaitSubmitRetries()
+	if got := countCalls(fake.Calls(), "pane send-keys w1:p1 enter"); got != 1 {
+		t.Errorf("standing form must stop retry Enters, got %d in %v", got, fake.Calls())
+	}
+}
+
+func TestSendRetryStopsOnContextCancel(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetAgentList(agentListJSON("claude", "idle", "w1:p1")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second, retryBaseDelay: 30 * time.Second}
+	// The worker swallows the ctx error: the primary delivery already landed.
+	if err := cli.SendToAgent(ctx, "w1:p1", "claude", "run the tests"); err != nil {
+		t.Fatal(err)
+	}
+	// Cancelling the caller's ctx must interrupt the worker's 30s retry wait.
+	cancel()
+	start := time.Now()
+	cli.WaitSubmitRetries()
+	if elapsed := time.Since(start); elapsed >= 10*time.Second {
+		t.Errorf("cancelled retry wait should return promptly, took %v", elapsed)
+	}
+	if got := countCalls(fake.Calls(), "pane send-keys w1:p1 enter"); got != 1 {
+		t.Errorf("cancelled ctx must stop retries, got %d Enters in %v", got, fake.Calls())
 	}
 }
 

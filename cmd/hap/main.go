@@ -148,6 +148,7 @@ func run(verb string, args []string) error {
 			return err
 		}
 		defer closeStore()
+		defer drainSubmitRetries(app)
 		if _, err := logging.Setup(paths.StateDir, false); err != nil {
 			return err
 		}
@@ -158,7 +159,17 @@ func run(verb string, args []string) error {
 			return err
 		}
 		defer closeStore()
+		defer drainSubmitRetries(app)
 		return cli.Run(ctx, app, os.Stdout, verb, args)
+	}
+}
+
+// drainSubmitRetries waits for in-flight submit-retry Enter workers before a
+// one-shot process (or a closing TUI) exits, so a prompt whose first Enter
+// did not take still gets its retries.
+func drainSubmitRetries(app *frontend.App) {
+	if w, ok := app.Herdr.(ports.SubmitRetryWaiter); ok {
+		w.WaitSubmitRetries()
 	}
 }
 
