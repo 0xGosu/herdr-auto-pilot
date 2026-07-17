@@ -10,9 +10,11 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
@@ -22,6 +24,7 @@ var (
 	_ ports.KeystrokeSender         = (*CLI)(nil)
 	_ ports.KeystrokeSequenceSender = (*CLI)(nil)
 	_ ports.AgentAwareSender        = (*CLI)(nil)
+	_ ports.SubmitRetryWaiter       = (*CLI)(nil)
 )
 
 const (
@@ -45,6 +48,13 @@ type CLI struct {
 	Timeout time.Duration
 	// retryBaseDelay overrides submitRetryBaseDelay in tests (0 = default).
 	retryBaseDelay time.Duration
+
+	// Submit-retry workers run detached from the send call (the daemon's
+	// monitor loop must never absorb their backoff sleeps); a newer send to
+	// the same pane supersedes the previous worker.
+	retryMu      sync.Mutex
+	retryCancels map[string]context.CancelFunc
+	retryWG      sync.WaitGroup
 }
 
 // NewCLI resolves the herdr binary from HERDR_BIN_PATH (falling back to
@@ -128,9 +138,46 @@ func (c *CLI) send(ctx context.Context, paneID, input string, b sendBehavior) er
 		}
 	}
 	if retry {
-		c.retrySubmitEnter(ctx, paneID, preStatus)
+		c.spawnSubmitRetry(ctx, paneID, preStatus)
 	}
 	return nil
+}
+
+// spawnSubmitRetry runs the retry loop in its own guarded goroutine so the
+// caller — notably the daemon's monitor select loop — never absorbs the
+// backoff sleeps and probe subprocess calls (same no-stall pattern as the
+// daemon's post-action unblock self-check). The worker inherits the caller's
+// ctx, so daemon shutdown cancels it; a newer send to the same pane cancels
+// the previous worker to keep at most one Enter-presser per pane. One-shot
+// processes drain workers via WaitSubmitRetries before exiting.
+func (c *CLI) spawnSubmitRetry(ctx context.Context, paneID, preStatus string) {
+	rctx, cancel := context.WithCancel(ctx)
+	c.retryMu.Lock()
+	if c.retryCancels == nil {
+		c.retryCancels = make(map[string]context.CancelFunc)
+	}
+	if prev, ok := c.retryCancels[paneID]; ok {
+		prev()
+	}
+	c.retryCancels[paneID] = cancel
+	c.retryMu.Unlock()
+	c.retryWG.Add(1)
+	go func() {
+		defer c.retryWG.Done()
+		defer cancel()
+		_ = logging.Guard("submit-retry", func() error {
+			c.retrySubmitEnter(rctx, paneID, preStatus)
+			return nil
+		})
+	}()
+}
+
+// WaitSubmitRetries blocks until every in-flight submit-retry worker has
+// finished (ports.SubmitRetryWaiter). One-shot commands call it before the
+// process exits so pending retries are not silently lost; long-lived callers
+// (the daemon, the TUI while running) never need to.
+func (c *CLI) WaitSubmitRetries() {
+	c.retryWG.Wait()
 }
 
 // retrySubmitEnter is the best-effort submit self-heal: while the agent's

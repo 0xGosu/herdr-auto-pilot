@@ -429,6 +429,7 @@ func TestSendToClaudeRetriesUntilStatusChanges(t *testing.T) {
 	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
 		t.Fatal(err)
 	}
+	cli.WaitSubmitRetries()
 	calls := fake.Calls()
 	if got := countCalls(calls, "pane send-keys w1:p1 enter"); got != 2 {
 		t.Errorf("want initial Enter + exactly one retry Enter, got %d in %v", got, calls)
@@ -452,6 +453,7 @@ func TestSendToClaudeStopsAfterMaxRetries(t *testing.T) {
 	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
 		t.Fatal(err)
 	}
+	cli.WaitSubmitRetries()
 	// Exponential schedule: base + 2base + 4base + 8base.
 	if wantMin := 15 * base; time.Since(start) < wantMin {
 		t.Errorf("retries finished too early: elapsed %v, want at least %v", time.Since(start), wantMin)
@@ -480,6 +482,7 @@ func TestSendToIdleCodexRetriesAfterGuaranteedEnter(t *testing.T) {
 	if err := cli.SendToAgent(context.Background(), "w1:p1", "codex", "run the tests"); err != nil {
 		t.Fatal(err)
 	}
+	cli.WaitSubmitRetries()
 	calls := fake.Calls()
 	if got := countCalls(calls, "pane send-keys w1:p1 enter"); got != 2 {
 		t.Errorf("want initial + guaranteed Enter only, got %d in %v", got, calls)
@@ -507,6 +510,7 @@ func TestSendSnapshotFailureDisablesRetries(t *testing.T) {
 			if err := cli.SendToAgent(context.Background(), "w1:p1", tc.agentType, "run the tests"); err != nil {
 				t.Fatal(err)
 			}
+			cli.WaitSubmitRetries()
 			calls := fake.Calls()
 			if got := countCalls(calls, "pane send-keys w1:p1 enter"); got != tc.wantEnters {
 				t.Errorf("want %d Enters, got %d in %v", tc.wantEnters, got, calls)
@@ -533,6 +537,7 @@ func TestSendRetryStopsOnListFailureMidLoop(t *testing.T) {
 	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
 		t.Fatal(err)
 	}
+	cli.WaitSubmitRetries()
 	if got := countCalls(fake.Calls(), "pane send-keys w1:p1 enter"); got != 1 {
 		t.Errorf("mid-loop list failure must stop retries, got %d Enters in %v", got, fake.Calls())
 	}
@@ -553,6 +558,7 @@ func TestSendRetryStopsWhenPaneVanishes(t *testing.T) {
 	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
 		t.Fatal(err)
 	}
+	cli.WaitSubmitRetries()
 	if got := countCalls(fake.Calls(), "pane send-keys w1:p1 enter"); got != 1 {
 		t.Errorf("vanished pane must stop retries, got %d Enters in %v", got, fake.Calls())
 	}
@@ -579,6 +585,7 @@ func TestSendRetryStopsWhenStandingFormAppears(t *testing.T) {
 	if err := cli.SendToAgent(context.Background(), "w1:p1", "claude", "run the tests"); err != nil {
 		t.Fatal(err)
 	}
+	cli.WaitSubmitRetries()
 	if got := countCalls(fake.Calls(), "pane send-keys w1:p1 enter"); got != 1 {
 		t.Errorf("standing form must stop retry Enters, got %d in %v", got, fake.Calls())
 	}
@@ -592,17 +599,17 @@ func TestSendRetryStopsOnContextCancel(t *testing.T) {
 	if err := fake.SetAgentList(agentListJSON("claude", "idle", "w1:p1")); err != nil {
 		t.Fatal(err)
 	}
-	// The ctx budget must comfortably cover the three subprocess spawns
-	// before the retry sleep (snapshot, agent send, send-keys) so only the
-	// 30s retry wait can hit the deadline.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second, retryBaseDelay: 30 * time.Second}
-	start := time.Now()
-	// The loop swallows the ctx error: the primary delivery already landed.
+	// The worker swallows the ctx error: the primary delivery already landed.
 	if err := cli.SendToAgent(ctx, "w1:p1", "claude", "run the tests"); err != nil {
 		t.Fatal(err)
 	}
+	// Cancelling the caller's ctx must interrupt the worker's 30s retry wait.
+	cancel()
+	start := time.Now()
+	cli.WaitSubmitRetries()
 	if elapsed := time.Since(start); elapsed >= 10*time.Second {
 		t.Errorf("cancelled retry wait should return promptly, took %v", elapsed)
 	}

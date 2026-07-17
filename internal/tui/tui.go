@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -240,6 +241,11 @@ type ruleItem struct {
 type Model struct {
 	app *frontend.App
 	ctx context.Context
+	// inflight counts mutation Cmds handed to bubbletea, which does NOT wait
+	// for them on quit; Run drains it so a send confirmed just before 'q'
+	// still completes (and spawns its submit retries) before the process
+	// exits. Pointer: Model is copied by value on every update.
+	inflight *sync.WaitGroup
 
 	tab     tab
 	data    refreshMsg
@@ -523,7 +529,7 @@ func (m Model) visibleSignatures() []frontend.SignatureRow {
 
 // New creates the TUI model.
 func New(ctx context.Context, app *frontend.App) Model {
-	return Model{app: app, ctx: ctx}
+	return Model{app: app, ctx: ctx, inflight: &sync.WaitGroup{}}
 }
 
 // Init starts the refresh loop.
@@ -1217,10 +1223,19 @@ func (m *Model) beginAction() {
 	m.clampListViewport()
 }
 
-// do runs a mutation and reports its outcome.
+// do runs a mutation and reports its outcome. The inflight Add happens here,
+// on the update loop — before Program.Run can return — so Run's drain never
+// races the counter from zero (bubbletea always launches a returned Cmd, so
+// the paired Done is guaranteed).
 func (m Model) do(okMsg string, fn func(context.Context) error) tea.Cmd {
-	ctx := m.ctx
+	ctx, wg := m.ctx, m.inflight
+	if wg != nil {
+		wg.Add(1)
+	}
 	return func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
 		if err := fn(ctx); err != nil {
 			return actionResultMsg{err: err}
 		}
@@ -3919,5 +3934,15 @@ func Run(ctx context.Context, app *frontend.App) error {
 	m.bellOut = os.Stdout
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
+	// bubbletea does not wait for in-flight Cmd goroutines on quit; drain
+	// them (bounded, in case a Cmd was somehow never launched) so a send
+	// confirmed right before quitting still lands and registers its submit
+	// retries before main's exit drain runs.
+	done := make(chan struct{})
+	go func() { m.inflight.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+	}
 	return err
 }
