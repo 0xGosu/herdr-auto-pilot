@@ -334,15 +334,30 @@ func Decide(in DecideInput) Decision {
 func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggestion string, escReason EscalateReason) {
 	switch in.Situation.Type {
 	case SituationIdle:
-		// A learned noop beats task resolution only when the OPERATOR (or a
-		// rule graduated from operator confirmations) said "leave this one
-		// alone" — that outranks re-sending tasks. A noop plurality built
-		// purely from LLM guesses does NOT outrank a declared task source:
-		// one consult-time "@noop" on an exhausted list would otherwise
-		// permanently park the task_source_exhausted → generation refill path
-		// (#175). Without a declared source there is nothing to park, so an
-		// LLM-learned noop still silences a chatty idle agent (the original
-		// nudge-loop case) instead of escalating no_task_source forever.
+		// A learned noop never silently parks REAL pending work. The
+		// declared-source state is not part of the idle signature, so a noop
+		// learned on "nothing to do" screens reuses on screens where the
+		// source has pending items — and an autonomous noop rule would then
+		// swallow the list with zero escalations, its self-recorded rule
+		// votes entrenching the plurality beyond what corrections can flip
+		// (#175, second live occurrence). Provenance cannot break that tie
+		// (the operator noops backing such a rule were given on the no-work
+		// screens), so the conflict escalates for the operator, suggesting
+		// the next declared task; confirming delivers it and teaches
+		// @next_task:declared.
+		if conf.TopAction == ActionNoop &&
+			in.DeclaredTask != nil && in.DeclaredTask.Task != NoTaskContent {
+			return "", "send next declared task: " + in.DeclaredTask.Prompt(), ReasonNoopVsPendingTasks
+		}
+		// With no pending work there is nothing to park, and a learned noop
+		// keeps its precedence — for an exhausted source only when the
+		// OPERATOR (or a rule graduated from operator confirmations) said
+		// "leave this one alone": a noop plurality built purely from LLM
+		// guesses must not park the task_source_exhausted → generation
+		// refill path (#175). Without a declared source, any provenance
+		// suffices: an LLM-learned noop still silences a chatty idle agent
+		// (the original nudge-loop case) instead of escalating
+		// no_task_source forever.
 		if conf.TopAction == ActionNoop && (conf.TopActionOperatorBacked || in.DeclaredTask == nil) {
 			return ActionNoop, ActionNoopSuggestion, ReasonNone
 		}
@@ -458,6 +473,8 @@ func rationaleFor(r EscalateReason) string {
 	switch r {
 	case ReasonUnfamiliarOptions:
 		return "learned option not offered"
+	case ReasonNoopVsPendingTasks:
+		return "learned noop rule, but the declared source has pending tasks"
 	default:
 		return "" // tag-only: [reason] says it all
 	}

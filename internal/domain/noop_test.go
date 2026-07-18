@@ -57,36 +57,47 @@ func TestDecideNoopChoiceBypassesOptionSet(t *testing.T) {
 	}
 }
 
-func TestDecideIdleNoopBeatsDeclaredTask(t *testing.T) {
-	// The OPERATOR repeatedly said "leave this one alone": that outranks
-	// re-sending the declared next task. Rule-sourced rows count the same —
-	// a graduated rule implies past operator confirmation.
-	for _, src := range []Source{SourceOperator, SourceRule} {
-		in := autonomous(baseInput(SituationIdle))
-		in.History = sourcedHistory(src, noopHistory()...)
-		in.DeclaredTask = &DeclaredTask{Task: "build the parser"}
-		d := Decide(in)
-		if d.Action != ActionKindNoop {
-			t.Fatalf("%s: idle noop must beat the declared task, got %+v", src, d)
+func TestDecideIdlePendingTasksEscalateOverNoopRule(t *testing.T) {
+	// A noop plurality — WHATEVER its provenance — never silently parks a
+	// declared source with real pending items (#175, second live
+	// occurrence): the operator noops backing an autonomous noop rule were
+	// given on no-work screens, and the source state is not part of the
+	// signature. The conflict escalates with the next declared task as the
+	// confirmable suggestion, in autonomous and shadow mode alike.
+	for _, src := range []Source{SourceOperator, SourceRule, SourceLLM} {
+		for _, mode := range []Mode{ModeAutonomous, ModeShadow} {
+			in := baseInput(SituationIdle)
+			in.State = &SignatureState{Mode: mode, ConsecutiveConfirmations: 8}
+			in.History = sourcedHistory(src, noopHistory()...)
+			in.DeclaredTask = &DeclaredTask{Task: "build the parser"}
+			d := Decide(in)
+			if d.Action != ActionEscalate || d.Reason != ReasonNoopVsPendingTasks {
+				t.Fatalf("%s/%s: pending declared work must escalate over a noop rule, got %+v", src, mode, d)
+			}
+			if !strings.Contains(d.Suggestion, "build the parser") {
+				t.Errorf("%s/%s: suggestion should carry the declared task, got %q", src, mode, d.Suggestion)
+			}
+			if d.Input != "" {
+				t.Errorf("%s/%s: nothing may be sent, got input %q", src, mode, d.Input)
+			}
 		}
 	}
 }
 
-func TestDecideIdleLLMNoopYieldsToDeclaredTask(t *testing.T) {
-	// A noop plurality built purely from LLM guesses must NOT outrank a
-	// declared task source (#175): operator-declared intent wins. The
-	// signature is shadow (LLM decisions never graduate a rule), so the
-	// declared task surfaces as a confirmable suggestion.
-	in := baseInput(SituationIdle)
-	in.State = &SignatureState{Mode: ModeShadow}
-	in.History = sourcedHistory(SourceLLM, noopHistory()...)
-	in.DeclaredTask = &DeclaredTask{Task: "build the parser"}
-	d := Decide(in)
-	if d.Action != ActionEscalate || d.Reason != ReasonShadowMode {
-		t.Fatalf("shadow LLM-noop signature must escalate the declared task, got %+v", d)
-	}
-	if !strings.Contains(d.Suggestion, "build the parser") {
-		t.Errorf("suggestion should carry the declared task, got %q", d.Suggestion)
+func TestDecideIdleOperatorNoopStillQuietOnExhaustedSource(t *testing.T) {
+	// The noop-vs-pending escalation is about REAL pending work only: with
+	// the declared list fully checked off, an operator-backed noop keeps
+	// the exhausted source quiet (the #176 self-heal — confirming the
+	// task_source_exhausted escalation's @noop suggestion earns exactly
+	// this silence).
+	for _, src := range []Source{SourceOperator, SourceRule} {
+		in := autonomous(baseInput(SituationIdle))
+		in.History = sourcedHistory(src, noopHistory()...)
+		in.DeclaredTask = &DeclaredTask{Task: NoTaskContent}
+		d := Decide(in)
+		if d.Action != ActionKindNoop {
+			t.Fatalf("%s: operator noop must keep an exhausted source quiet, got %+v", src, d)
+		}
 	}
 }
 

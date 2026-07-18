@@ -172,7 +172,17 @@ const (
 	// dismisses it (or, when both task_generate_command and
 	// task_generate_command_start are configured, the plugin generates more
 	// tasks instead of escalating this reason at all).
-	ReasonTaskSourceExhausted  EscalateReason = "task_source_exhausted"
+	ReasonTaskSourceExhausted EscalateReason = "task_source_exhausted"
+	// ReasonNoopVsPendingTasks: the learned plurality says "do nothing" but
+	// the agent's declared task source still has pending items. The source
+	// state is not part of the idle signature, so a noop learned on
+	// "nothing to do" screens reuses on screens where the source has real
+	// work — and an autonomous noop rule would otherwise park that work
+	// silently, its rule-sourced self-votes entrenching the plurality beyond
+	// what corrections can flip (#175). Escalated regardless of the noop's
+	// provenance; the suggestion carries the next declared task, so
+	// confirming both delivers it and teaches @next_task:declared.
+	ReasonNoopVsPendingTasks   EscalateReason = "noop_vs_pending_tasks"
 	ReasonUnfamiliarOptions    EscalateReason = "unfamiliar_options"
 	ReasonNoHistory            EscalateReason = "no_history"
 	ReasonNotConsecutiveEnough EscalateReason = "graduation_pending"

@@ -2256,6 +2256,45 @@ func TestIdleDeclaredTaskCompletedListEscalatesNoop(t *testing.T) {
 	}
 }
 
+func TestIdleAutonomousNoopRuleEscalatesPendingDeclaredTasks(t *testing.T) {
+	// #175 second live occurrence: a graduated, operator-backed noop rule
+	// (learned on no-work screens) matches an idle screen whose declared
+	// source has real pending items. Standing down silently would park the
+	// list forever with zero escalations — the conflict must escalate with
+	// the next declared task as the confirmable suggestion instead.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	os.WriteFile(taskFile, []byte("- [x] step one\n- [ ] step two\n"), 0o600)
+
+	idlePane := "All tests pass. Task is complete.\n"
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-42\"\npath = %q\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNoop)
+
+	ctx := context.Background()
+	name, err := h.raw.EnsureAgentName(ctx, "agent-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.push("agent-42", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if !strings.Contains(esc[0].Rationale, string(domain.ReasonNoopVsPendingTasks)) {
+		t.Errorf("rationale should carry the noop-vs-pending tag, got %q", esc[0].Rationale)
+	}
+	want := "send next declared task: " + (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name}).Prompt()
+	if esc[0].Suggestion != want {
+		t.Errorf("suggestion = %q, want %q", esc[0].Suggestion, want)
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("the conflict must not deliver anything autonomously")
+	}
+}
+
 func TestIdleTaskSourceMatchesWorkspaceNameWildcard(t *testing.T) {
 	// The workspace selector matches the workspace's herdr name (label)
 	// with "*" wildcards, not the raw workspace id.
