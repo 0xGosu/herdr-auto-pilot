@@ -1052,7 +1052,7 @@ func TestAuditDetailShowsInputForDeliveredRow(t *testing.T) {
 		Action:    "auto: REWRITTEN: please do step two",
 		Input:     "REWRITTEN: please do step two",
 		LLMOutput: "REWRITTEN: please do step two",
-		Rationale: "declared task; rewritten by llm.rewrite_command (original: \"step two\")",
+		Rationale: "learned reply; rewritten by llm.command (rewrite action) (original: \"step two\")",
 	}
 	got := strings.Join(m.auditDetailLines(rec, "", 80, auditDetailOptions{}), "\n")
 	for _, want := range []string{"Input", "REWRITTEN: please do step two", "LLM output"} {
@@ -1065,7 +1065,7 @@ func TestAuditDetailShowsInputForDeliveredRow(t *testing.T) {
 	// is hidden by design, not missing.
 	noop := domain.AuditRecord{
 		Status: "auto", Action: "noop", Input: "",
-		Rationale: "rewrite declined to send (@noop)",
+		Rationale: "llm review declined to send (@noop)",
 	}
 	got = strings.Join(m.auditDetailLines(noop, "", 80, auditDetailOptions{}), "\n")
 	if strings.Contains(got, "Input") {

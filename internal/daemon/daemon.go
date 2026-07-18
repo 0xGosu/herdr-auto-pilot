@@ -89,12 +89,12 @@ type Daemon struct {
 	semanticReady atomic.Bool
 	semanticGen   atomic.Int64
 
-	transitions    chan domain.AgentTransition
-	nudges         chan control.Kind
-	llmResults     chan llmOutcome
-	rewriteResults chan rewriteOutcome
-	taskGenResults chan taskGenOutcome
-	sweepResults   chan sweepOutcome
+	transitions         chan domain.AgentTransition
+	nudges              chan control.Kind
+	llmResults          chan llmOutcome
+	actionReviewResults chan actionReviewOutcome
+	taskGenResults      chan taskGenOutcome
+	sweepResults        chan sweepOutcome
 	// delayedTr re-enters attention transitions whose capture delay has
 	// elapsed; the pane read happens back on the main loop, like every
 	// other pipeline entry point.
@@ -114,21 +114,19 @@ type Daemon struct {
 	// Guarded by mu.
 	episodeHandled map[string]bool
 
-	// firstConsult / firstRewrite mark agents whose first LLM consult /
-	// rewrite has fired, so the first interaction can use command_start /
-	// rewrite_command_start and every later one uses the base template. Keyed
-	// by agentID (== paneID in herdr), tracked independently of each other.
+	// firstConsult marks agents whose first LLM consult has fired, so the
+	// first interaction can use command_start and every later one uses the
+	// base template. Keyed by agentID (== paneID in herdr).
 	// NOT reset on "detected": that event also fires on every subscriber
 	// reconnect (pane-topology change), which would re-fire the kickoff
 	// prompt mid-session for long-running agents. A genuinely new agent
 	// almost always arrives in a new pane (new key → first=true naturally);
 	// the rare pane-id reuse forgoes re-priming rather than re-prime on every
-	// reconnect. Both guarded by mu.
+	// reconnect. Guarded by mu.
 	firstConsult map[string]bool
-	firstRewrite map[string]bool
 	// firstTaskGen marks agents whose first idle task generation has fired, so
 	// the first one can use task_generate_command_start. Same keying/semantics
-	// as firstConsult/firstRewrite; guarded by mu.
+	// as firstConsult; guarded by mu.
 	firstTaskGen map[string]bool
 
 	// configured flips after the first successful reload so reloadEmbedder
@@ -144,11 +142,11 @@ type Daemon struct {
 	lastAutoSend map[string]time.Time
 	lastAutoNoop map[string]time.Time
 
-	// rewriteInFlight tracks the one live outbound-text rewrite per agent;
-	// the token lets the outcome handler drop superseded results. Guarded
-	// by mu alongside rewriteSeq.
-	rewriteInFlight map[string]rewriteFlight
-	rewriteSeq      uint64
+	// actionReviewInFlight tracks the one live outbound action review per
+	// agent; the token lets the outcome handler drop superseded results.
+	// Guarded by mu alongside actionReviewSeq.
+	actionReviewInFlight map[string]actionReviewFlight
+	actionReviewSeq      uint64
 
 	// sweepInFlight dedupes the one live multi-tab form sweep per agent
 	// (guarded by mu); outcomes return through sweepResults.
@@ -187,25 +185,31 @@ type llmOutcome struct {
 	err       error
 }
 
-// rewriteFlight is the registry entry for one in-flight outbound rewrite.
-type rewriteFlight struct {
+// actionReviewFlight is the registry entry for one in-flight outbound action
+// review. requestID names the staged llm_requests row so a cancelled flight
+// can expire it (a lingering pending row would block other consults for this
+// agent until expireStaleLLMWork reclaims it).
+type actionReviewFlight struct {
 	signature string
+	requestID string
 	token     uint64
 	cancel    context.CancelFunc
 }
 
-// rewriteOutcome carries a finished rewrite back into the main loop. The
-// fallback template is snapshotted at handoff so a config reload mid-flight
-// cannot change the failure behavior of an already-launched rewrite.
-type rewriteOutcome struct {
+// actionReviewOutcome carries a finished action review back into the main
+// loop. The fallback template is snapshotted at handoff so a config reload
+// mid-flight cannot change the failure behavior of an already-launched
+// review.
+type actionReviewOutcome struct {
 	situation domain.Situation
 	sig       domain.SignatureResult
 	tr        domain.AgentTransition
 	dec       domain.Decision
 	learned   string // original learned form for RecordDecision
-	fallback  string // snapshotted rewrite_fallback_template
+	fallback  string // snapshotted rewrite_action_fallback_template
 	agentName string // agent short name, for {agent_name}
-	rewritten string
+	request   domain.LLMRequest
+	decision  *domain.LLMDecision
 	err       error
 	token     uint64
 }
@@ -252,29 +256,28 @@ func New(opt Options) (*Daemon, error) {
 		opt.PaneReadLines = 50
 	}
 	d := &Daemon{
-		opt:                opt,
-		verifyUnblockDelay: unblockCheckDelay,
-		transitions:        make(chan domain.AgentTransition, 256),
-		nudges:             make(chan control.Kind, 16),
-		llmResults:         make(chan llmOutcome, 16),
-		rewriteResults:     make(chan rewriteOutcome, 16),
-		taskGenResults:     make(chan taskGenOutcome, 16),
-		sweepResults:       make(chan sweepOutcome, 16),
-		delayedTr:          make(chan domain.AgentTransition, 256),
-		pendingCapture:     map[string]*captureEntry{},
-		captureStarted:     map[string]bool{},
-		episodeHandled:     map[string]bool{},
-		firstConsult:       map[string]bool{},
-		firstRewrite:       map[string]bool{},
-		firstTaskGen:       map[string]bool{},
-		lastAutoSend:       map[string]time.Time{},
-		lastAutoNoop:       map[string]time.Time{},
-		rewriteInFlight:    map[string]rewriteFlight{},
-		sweepInFlight:      map[string]bool{},
-		snapshotSaved:      map[string]bool{},
-		paneCwds:           map[string]paneCwdEntry{},
-		paneCwdRefreshing:  map[string]bool{},
-		embedder:           opt.Embedder,
+		opt:                  opt,
+		verifyUnblockDelay:   unblockCheckDelay,
+		transitions:          make(chan domain.AgentTransition, 256),
+		nudges:               make(chan control.Kind, 16),
+		llmResults:           make(chan llmOutcome, 16),
+		actionReviewResults:  make(chan actionReviewOutcome, 16),
+		taskGenResults:       make(chan taskGenOutcome, 16),
+		sweepResults:         make(chan sweepOutcome, 16),
+		delayedTr:            make(chan domain.AgentTransition, 256),
+		pendingCapture:       map[string]*captureEntry{},
+		captureStarted:       map[string]bool{},
+		episodeHandled:       map[string]bool{},
+		firstConsult:         map[string]bool{},
+		firstTaskGen:         map[string]bool{},
+		lastAutoSend:         map[string]time.Time{},
+		lastAutoNoop:         map[string]time.Time{},
+		actionReviewInFlight: map[string]actionReviewFlight{},
+		sweepInFlight:        map[string]bool{},
+		snapshotSaved:        map[string]bool{},
+		paneCwds:             map[string]paneCwdEntry{},
+		paneCwdRefreshing:    map[string]bool{},
+		embedder:             opt.Embedder,
 	}
 	if opt.MatchIndexDir != "" {
 		d.matcher = match.New(opt.MatchIndexDir)
@@ -516,9 +519,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.handleLLMOutcome(ctx, res)
 				return nil
 			})
-		case res := <-d.rewriteResults:
-			logging.Guard("rewrite-result", func() error {
-				d.handleRewriteOutcome(ctx, res)
+		case res := <-d.actionReviewResults:
+			logging.Guard("action-review-result", func() error {
+				d.handleActionReviewOutcome(ctx, res)
 				return nil
 			})
 		case res := <-d.taskGenResults:
@@ -607,14 +610,14 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// that moved on (the consuming recent-delta still holds the old
 		// menu AND the answer) — activity supersedes it.
 		d.cancelCapture(tr.PaneID)
-		// Same for an in-flight rewrite: its situation no longer stands,
-		// whoever caused the resume. registerHumanInteraction below also
-		// cancels, but only when the resume counts as human — a self-flap
-		// within 10s of our own last auto action would otherwise leave the
-		// flight live, and a late "@noop" outcome (which skips the
+		// Same for an in-flight action review: its situation no longer
+		// stands, whoever caused the resume. registerHumanInteraction below
+		// also cancels, but only when the resume counts as human — a
+		// self-flap within 10s of our own last auto action would otherwise
+		// leave the flight live, and a late "@noop" outcome (which skips the
 		// staleness re-read) would stamp audit/rate side effects for a
 		// pane that already moved on.
-		d.cancelRewriteExcept(tr.AgentID, "")
+		d.cancelActionReviewExcept(ctx, tr.AgentID, "")
 		// Genuine progress ends the pane's parked episode: re-arm the
 		// subscribe-time reconcile so a fresh block/idle/done is surfaced (#49).
 		d.mu.Lock()
@@ -892,6 +895,11 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 // bottom; older scrollback is discarded first.
 const snapshotMaxRunes = 4000
 
+// maxReviewOutput caps the accepted action-review replacement text (matches
+// the LLM adapter's 16KB capture cap): the result is typed into a pane, so
+// runaway output degrades to the fallback instead of being trimmed.
+const maxReviewOutput = 16 * 1024
+
 // decideAndAct is the decision tail shared by handleTransition and the
 // multi-tab sweep outcome: signature, state reads, safety inputs, the pure
 // decision core, and dispatch.
@@ -1025,14 +1033,14 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		return
 	}
 
-	// Any newer decision for this agent owns the pane: an in-flight rewrite
-	// for a DIFFERENT situation must never deliver behind it. A same-
-	// signature send is kept — startRewrite drops it as a duplicate.
+	// Any newer decision for this agent owns the pane: an in-flight action
+	// review for a DIFFERENT situation must never deliver behind it. A same-
+	// signature send is kept — startActionReview drops it as a duplicate.
 	keepSig := ""
 	if decision.Action == domain.ActionSend {
 		keepSig = sig.Signature
 	}
-	d.cancelRewriteExcept(situation.AgentID, keepSig)
+	d.cancelActionReviewExcept(ctx, situation.AgentID, keepSig)
 
 	switch decision.Action {
 	case domain.ActionSend:
@@ -1073,19 +1081,25 @@ func truncateTailRunes(s string, n int) string {
 	return "…" + string(runes[len(runes)-n:])
 }
 
-// cancelRewriteExcept invalidates the agent's in-flight rewrite unless it is
-// for keepSig. The cancelled flight's outcome is dropped by the token check.
-func (d *Daemon) cancelRewriteExcept(agentID, keepSig string) {
+// cancelActionReviewExcept invalidates the agent's in-flight action review
+// unless it is for keepSig. The cancelled flight's outcome is dropped by the
+// token check; its staged llm_requests row is expired best-effort so it does
+// not block other consults for this agent until expireStaleLLMWork.
+func (d *Daemon) cancelActionReviewExcept(ctx context.Context, agentID, keepSig string) {
 	d.mu.Lock()
-	fl, ok := d.rewriteInFlight[agentID]
+	fl, ok := d.actionReviewInFlight[agentID]
 	if !ok || (keepSig != "" && fl.signature == keepSig) {
 		d.mu.Unlock()
 		return
 	}
-	delete(d.rewriteInFlight, agentID)
+	delete(d.actionReviewInFlight, agentID)
 	d.mu.Unlock()
 	fl.cancel()
-	slog.Info("in-flight rewrite superseded", "agent", agentID)
+	if err := d.opt.Store.UpdateLLMRequestStatus(ctx, fl.requestID, "expired"); err != nil {
+		slog.Error("expiring superseded action-review request failed",
+			"request", fl.requestID, "error", err)
+	}
+	slog.Info("in-flight action review superseded", "agent", agentID)
 }
 
 // readDecisionState gathers all store reads for one decision. The latest
@@ -1132,7 +1146,7 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// The never-auto patterns also screen the OUTBOUND text: a next-task
 	// line from a task file (or any learned action) naming an irreversible
 	// operation must never be delivered automatically (FR-015).
-	_, allow, _ := d.snapshot()
+	cfg, allow, _ := d.snapshot()
 	if hit, matched := allow.Match(s.AgentType, dec.Input); matched {
 		d.escalate(ctx, s, sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonNeverAutoMatch,
@@ -1178,18 +1192,23 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// snapshot, which carries the menu for the situation being acted on.
 	outbound, menuMapped := domain.DeliverOutbound(s.Type, s.AgentType, s.Content, dec.Input)
 
-	// Literal free text can be adapted to the live pane by the optional
-	// rewrite CLI; menu digits must reach the menu untouched. The send
-	// completes asynchronously via handleRewriteOutcome, so the learned
+	// Literal free text can be adapted to the live pane by the consult LLM
+	// (llm.enable_rewrite_action); menu digits must reach the menu
+	// untouched, and a declared task from a [[task_sources]] is never
+	// reviewed here — the source's enable_llm_review gate owns that (an
+	// opted-out or LLM-less source delivers its tasks verbatim). The send
+	// completes asynchronously via handleActionReviewOutcome, so the learned
 	// action is pinned NOW — situation state may drift before delivery.
-	if rw, ok := d.llmPort().(ports.RewriterPort); ok && rw.RewriteConfigured() &&
-		!menuMapped && dec.Input != "" {
-		d.startRewrite(ctx, rw, s, sig, dec, tr, d.learnedAction(ctx, s, dec))
-		return
+	if cfg.LLM.EnableRewriteAction && !menuMapped && dec.Input != "" &&
+		d.llmPort() != nil && d.llmPort().Configured() {
+		if learned := d.learnedAction(ctx, s, dec); learned != domain.ActionNextDeclaredTask {
+			d.startActionReview(ctx, s, sig, dec, tr, learned)
+			return
+		}
 	}
 
 	// learned stays empty: deliverAutonomous computes it after the send,
-	// exactly as the pre-rewrite code did.
+	// exactly as the pre-review code did.
 	d.deliverAutonomous(ctx, s, sig, dec, tr, delivery{
 		sendText: outbound, input: dec.Input, rationale: dec.Rationale,
 	}, now)
@@ -1242,35 +1261,47 @@ type delivery struct {
 	sendText  string // exactly what is written to the pane
 	input     string // audit Input and the "auto:" action label
 	rationale string
-	llmOutput string // rewrite CLI diagnostics, when applicable
+	llmOutput string // LLM review diagnostics, when applicable
 	learned   string // ChosenAction recorded for learning
+	// llmConfidence is the review LLM's self-reported score (0-100) for the
+	// audit row; nil when no LLM was involved or none was reported. Recorded
+	// for observability only — the action-review path never gates on it.
+	llmConfidence *int
 }
 
 // deliverAutonomous is the shared tail of every autonomous rule-path send:
 // pre-action audit guard (FR-024), delivery, and the daemon-owned learning
-// and counter writes.
+// and counter writes. It reports whether the input actually reached the
+// pane — false covers the lifecycle-barrier refusal, a blocked audit write,
+// and a failed send — so callers accounting for an LLM decision's fate
+// (handleActionReviewOutcome) never record an undelivered action as applied.
 func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
-	dec domain.Decision, tr domain.AgentTransition, del delivery, now time.Time) {
-	d.withAgentAutomation(ctx, s, sig, tr, del.input, dec.Confidence, nil, del.llmOutput, now,
-		func() { d.deliverAutonomousClaimed(ctx, s, sig, dec, tr, del, now) })
+	dec domain.Decision, tr domain.AgentTransition, del delivery, now time.Time) bool {
+	sent := false
+	executed := d.withAgentAutomation(ctx, s, sig, tr, del.input, dec.Confidence, del.llmConfidence, del.llmOutput, now,
+		func() { sent = d.deliverAutonomousClaimed(ctx, s, sig, dec, tr, del, now) })
+	return executed && sent
 }
 
 // deliverAutonomousClaimed runs while the cross-process per-agent lifecycle
 // barrier is held, so SetAgentDisabled cannot commit between audit and send.
+// Returns true once the input was sent to the pane (post-send bookkeeping
+// failures do not retract that).
 func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situation,
 	sig domain.SignatureResult, dec domain.Decision, tr domain.AgentTransition,
-	del delivery, now time.Time) {
+	del delivery, now time.Time) bool {
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + del.input, Input: del.input,
-		Confidence: dec.Confidence, Rationale: del.rationale, LLMOutput: del.llmOutput,
+		Confidence: dec.Confidence, LLMConfidence: del.llmConfidence,
+		Rationale: del.rationale, LLMOutput: del.llmOutput,
 		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
 		d.notify(ctx, "Herd Auto Prompter: persistence failure",
 			"An automated action was blocked because its audit record could not be written.")
-		return
+		return false
 	}
 
 	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType, del.sendText); err != nil {
@@ -1278,15 +1309,15 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed",
 			fmt.Sprintf("Agent %s: could not deliver the decided input; please review.", s.AgentID))
-		return
+		return false
 	}
 
 	d.mu.Lock()
 	d.lastAutoSend[s.AgentID] = now
 	d.mu.Unlock()
 
-	// Learning + counters (daemon-owned hot-path rows). The rewrite path
-	// pins the learned action at decision time; the synchronous path
+	// Learning + counters (daemon-owned hot-path rows). The action-review
+	// path pins the learned action at decision time; the synchronous path
 	// resolves it here, after the send, as it always has.
 	learned := del.learned
 	if learned == "" {
@@ -1328,6 +1359,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
 		Signature: sig.Signature, Input: del.input, Excerpt: s.Content, SituationType: s.Type,
 	})
+	return true
 }
 
 // scheduleUnblockCheck arms the post-action self-check: after the fixed
@@ -1421,36 +1453,45 @@ func (d *Daemon) deliverNoopClaimed(ctx context.Context, s domain.Situation,
 		"agent", s.AgentID, "situation", s.Type, "confidence", dec.Confidence, "audit_id", auditID)
 }
 
-// deliverRewriteNoop stands the daemon down after the rewrite CLI vetoed a
-// send ("@noop"): audit-first (FR-024), then the rate write — nothing is
+// deliverActionReviewNoop stands the daemon down after the review LLM vetoed
+// a send ("@noop"): audit-first (FR-024), then the rate write — nothing is
 // sent. Unlike deliverNoop and the consult noop, NO decision is recorded:
 // this is a delivery-time contextual veto of an already-learned action, not
 // a decision about the signature — recorded @noop rows could win the
 // plurality and permanently stand the learned rule down (see the
 // llmLearnedAction warning) or trip the variance guard on later consults.
 // The runaway counter still advances (D3) and lastAutoNoop is stamped, so
-// a rewrite-noop loop eventually escalates instead of spinning silently.
-func (d *Daemon) deliverRewriteNoop(ctx context.Context, res rewriteOutcome, now time.Time) {
+// a review-noop loop eventually escalates instead of spinning silently.
+func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOutcome,
+	llmConf *int, now time.Time) {
 	s := res.situation
-	d.withAgentAutomation(ctx, s, res.sig, res.tr, "", res.dec.Confidence, nil,
+	rationale := fmt.Sprintf("%s; llm review declined to send (@noop) (original: %q)",
+		res.dec.Rationale, truncateRunes(res.dec.Input, 200))
+	if res.decision != nil && strings.TrimSpace(res.decision.Rationale) != "" {
+		rationale += "; LLM: " + strings.TrimSpace(res.decision.Rationale)
+	}
+	// applied flips once the veto's audit row is durably written — an audit
+	// failure blocks the stand-down (FR-024), so the decision must not
+	// resolve as accepted for it.
+	applied := false
+	executed := d.withAgentAutomation(ctx, s, res.sig, res.tr, "", res.dec.Confidence, llmConf,
 		domain.ActionNoop, now, func() {
-			original := truncateRunes(res.dec.Input, 200)
 			auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 				AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature,
 				Trigger: trigger(res.tr), SituationType: s.Type, Action: "noop", Input: "",
-				Confidence: res.dec.Confidence,
-				Rationale: fmt.Sprintf("%s; rewrite declined to send (@noop) (original: %q)",
-					res.dec.Rationale, original),
+				Confidence: res.dec.Confidence, LLMConfidence: llmConf,
+				Rationale: rationale,
 				LLMOutput: domain.ActionNoop,
 				Status:    "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
 				CreatedAt: now,
 			})
 			if err != nil {
-				slog.Error("audit write failed; blocking rewrite noop (FR-024)", "error", err)
+				slog.Error("audit write failed; blocking review noop (FR-024)", "error", err)
 				d.notify(ctx, "Herd Auto Prompter: persistence failure",
-					"A rewrite-declined no-op was blocked because its audit record could not be written.")
+					"A review-declined no-op was blocked because its audit record could not be written.")
 				return
 			}
+			applied = true
 			if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
 				updated := domain.RegisterAutoPrompt(*rate, now)
 				updated.AgentID = s.AgentID
@@ -1461,9 +1502,18 @@ func (d *Daemon) deliverRewriteNoop(ctx context.Context, res rewriteOutcome, now
 			d.mu.Lock()
 			d.lastAutoNoop[s.AgentID] = now
 			d.mu.Unlock()
-			slog.Info("rewrite noop: no reply sent",
+			slog.Info("action-review noop: no reply sent",
 				"agent", s.AgentID, "situation", s.Type, "audit_id", auditID)
 		})
+	if res.decision != nil {
+		status := "accepted"
+		if !executed || !applied {
+			status = "rejected"
+		}
+		if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, status); err != nil {
+			slog.Error("llm decision status update failed", "error", err)
+		}
+	}
 }
 
 // escalate records and surfaces an escalation: no input is sent (FR-018).
@@ -1478,7 +1528,7 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	// situation that can now auto-answer (e.g. after a kill-switch resume) still
 	// acts, and the rate guard / retry ceiling still see every repeated event.
 	// escalate() is where almost every escalation is born, so this also caps
-	// escalation storms from the async LLM/rewrite/taskgen rejection paths.
+	// escalation storms from the async LLM/action-review/taskgen rejection paths.
 	// A proven-gone/disabled agent still gets an audit row below, so the
 	// automatic dismissal remains visible in history. Do not let an older
 	// pending row turn that lifecycle decision into an opaque "duplicate".
@@ -1660,7 +1710,7 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 				agentName = ""
 			}
 			req.AgentName = agentName
-			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, nil))
+			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, nil, ""))
 			if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
 				return fmt.Errorf("staging LLM request failed: %w", err)
 			}
@@ -1762,7 +1812,7 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 			}
 			// Fill the context on the already-staged row before the CLI reads
 			// it via get_context.
-			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, review))
+			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, review, ""))
 			if err := d.opt.Store.UpdateLLMRequestContext(ctx, req.RequestID, req.ContextJSON); err != nil {
 				return fmt.Errorf("staging LLM request context failed: %w", err)
 			}
@@ -1996,13 +2046,17 @@ func (d *Daemon) agentNotCleanlyIdle(ctx context.Context, agentID string) bool {
 
 // consultContext builds the JSON context handed to the LLM CLI via the
 // get_context MCP tool: the classified situation, a pane excerpt, the
-// agent's herdr location, and the pane working directory.
-// consultContext builds the get_context blob for one consult. review is
+// agent's herdr location, and the pane working directory. review is
 // non-nil only for a pre-send declared-task review: it adds proposed_task (the
 // rendered task under review), task_list_path, current_task, and pending_tasks,
 // with an answer_format that frames submit_decision as send (recommend_action)
 // vs. decline (@noop) — and lets the LLM pick a different pending task.
-func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation, agentName string, review *taskReviewContext) []byte {
+// proposedAction is non-empty only for a pre-delivery action review
+// (llm.enable_rewrite_action): it adds proposed_action (the learned reply
+// about to be typed into the pane) with an answer_format that frames
+// submit_decision as adapt (literal text) vs. affirm
+// (@proposed_action:send) vs. veto (@noop).
+func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation, agentName string, review *taskReviewContext, proposedAction string) []byte {
 	excerpt := d.paneExcerpt(ctx, cfg, s)
 
 	// Pane location and cwd come from `pane get`; degrade to empty values
@@ -2106,6 +2160,15 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		fields["pending_tasks"] = review.pending
 		fields["answer_format"] = "this idle agent has a next task ready to send: proposed_task is the exact instruction that would be sent, current_task is that task's text, task_list_path is the checklist file, and pending_tasks lists every remaining task in order. Decide from the pane what to send. To send the queued task unchanged, submit_decision recommend_action \"@next_task:declared\" — the daemon sends proposed_task verbatim, so you never need to copy it. Only put literal text in recommend_action when you are editing the task or, if the pane shows current_task is ALREADY DONE, sending a different still-unfinished item from pending_tasks. To decline — the agent is still busy, every task is done, or nothing should run now — submit_decision recommend_action \"@noop\" with a one-sentence rationale. Always include confident_score: a confident decision is applied automatically (the chosen task is sent, or skipped on a decline), while a low-confidence one is surfaced to the operator"
 	}
+	// Pre-delivery action review: a learned rule already resolved the reply;
+	// ask the LLM to adapt it to the live pane, affirm it, or veto the send.
+	// A review failure or veto never surfaces here — the daemon falls back to
+	// sending the original (handleActionReviewOutcome), so the instruction
+	// frames the review as advisory, not gating.
+	if proposedAction != "" {
+		fields["proposed_action"] = proposedAction
+		fields["answer_format"] = "this agent's automation resolved a learned reply that is about to be typed into the pane: proposed_action is the exact text. Review it against the live pane. To send it unchanged, submit_decision recommend_action \"@proposed_action:send\". To adapt it to what the pane currently shows, put the full replacement text in recommend_action — it is sent verbatim, so never submit commentary or partial edits. If nothing should be sent at all (the pane resolved itself, or a reply would do harm), submit_decision recommend_action \"@noop\" with a one-sentence rationale. If the review cannot decide, the daemon sends the original text unchanged"
+	}
 	contextJSON, _ := json.Marshal(fields)
 	return contextJSON
 }
@@ -2166,69 +2229,143 @@ func (d *Daemon) paneExcerpt(ctx context.Context, cfg config.Config, s domain.Si
 	return tail(excerpt, chars)
 }
 
-// startRewrite hands a literal outbound text to the rewrite CLI. The
-// subprocess runs in a goroutine — it must never stall the main loop — and
-// the send completes in handleRewriteOutcome. One flight per agent: a
-// duplicate transition for the same signature is dropped, a new situation
-// cancels and supersedes the old flight.
-func (d *Daemon) startRewrite(ctx context.Context, rw ports.RewriterPort, s domain.Situation,
+// startActionReview hands a literal outbound text to the consult LLM
+// (llm.enable_rewrite_action) for a pre-delivery review. The subprocess runs
+// in a goroutine — it must never stall the main loop — and the send completes
+// in handleActionReviewOutcome. One flight per agent: a duplicate transition
+// for the same signature is dropped, a new situation cancels and supersedes
+// the old flight. The review must never block the send: a pending consult
+// already in flight for this agent, or a staging failure, delivers the
+// original text directly instead of stacking or dropping.
+func (d *Daemon) startActionReview(ctx context.Context, s domain.Situation,
 	sig domain.SignatureResult, dec domain.Decision, tr domain.AgentTransition, learned string) {
 
-	cfg, _, _ := d.snapshot()
+	cfg, allow, _ := d.snapshot()
+	now := d.opt.Clock.Now()
+	llm := d.llmPort()
 
-	d.mu.Lock()
-	if fl, ok := d.rewriteInFlight[s.AgentID]; ok {
-		if fl.signature == sig.Signature {
-			d.mu.Unlock()
-			slog.Info("rewrite already in flight for this situation; dropping duplicate",
-				"agent", s.AgentID)
+	// A review that never runs is a review failure: deliver the original
+	// through the same fallback template as handleActionReviewOutcome's
+	// degrade path, so the operator's failure framing is consistent
+	// wherever the review died (passthrough by default). The wrapped form
+	// is re-screened like the handler's — act() only vetted the raw
+	// original, and a template's framing could complete a pattern it
+	// did not (SC-5).
+	deliverOriginal := func(why string) {
+		slog.Warn("action review skipped; sending original", "agent", s.AgentID, "reason", why)
+		agentName, err := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
+		if err != nil {
+			agentName = ""
+		}
+		outbound := domain.ApplyRewriteFallback(cfg.LLM.RewriteActionFallbackTemplate, dec.Input, agentName)
+		escalateFallback := func(reason domain.EscalateReason, why string) {
+			d.escalate(ctx, s, sig, domain.Decision{
+				Action: domain.ActionEscalate, Reason: reason,
+				Rationale:  "action-review fallback: " + why,
+				Confidence: dec.Confidence,
+				Suggestion: actionReviewSuggestion(s.Type, learned, dec.Input),
+			}, tr, now)
+		}
+		if hit, matched := allow.Match(s.AgentType, outbound); matched {
+			escalateFallback(domain.ReasonNeverAutoMatch, hit.Diagnostic())
 			return
 		}
-		fl.cancel() // a newer situation owns the pane now
+		if hit, sus := allow.SuspectedIrreversible(s.AgentType, outbound); sus {
+			escalateFallback(domain.ReasonSuspectedIrrevers, hit.Diagnostic())
+			return
+		}
+		d.deliverAutonomous(ctx, s, sig, dec, tr, delivery{
+			sendText: outbound, input: outbound,
+			rationale: dec.Rationale + "; action review skipped (" + why + "); fallback template applied",
+			learned:   learned,
+		}, now)
 	}
-	d.rewriteSeq++
-	token := d.rewriteSeq
+
+	// One flight per agent: a duplicate transition for the same signature is
+	// dropped (its review is already running). A DIFFERENT-signature flight
+	// cannot exist here — decideAndAct cancels (and expires) it before act()
+	// dispatches — so any other pending consult row below is a foreign one.
+	d.mu.Lock()
+	if fl, ok := d.actionReviewInFlight[s.AgentID]; ok && fl.signature == sig.Signature {
+		d.mu.Unlock()
+		slog.Info("action review already in flight for this situation; dropping duplicate",
+			"agent", s.AgentID)
+		return
+	}
+	d.mu.Unlock()
+
+	// Don't stack onto a consult already in flight for this agent (same
+	// guard as task review) — but unlike a review-gated flow, degrade to
+	// the direct send rather than dropping the learned action.
+	if pending, err := d.opt.Store.HasPendingLLMConsult(ctx, s.AgentID); err != nil {
+		deliverOriginal("pending-consult check failed: " + err.Error())
+		return
+	} else if pending {
+		deliverOriginal("consult already in flight")
+		return
+	}
+
+	// A review consults the operator's command, but the priming/first-consult
+	// variant is meant for answering pane prompts, not reviewing outbound
+	// text — always use the base command (First stays false, same rationale
+	// as consultDeclaredTask).
+	req := domain.LLMRequest{
+		RequestID: fmt.Sprintf("actreview-%s-%d", s.AgentID, now.UnixNano()),
+		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
+		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
+		ActionReview: true, ProposedAction: dec.Input,
+	}
+	// Stage the pending row synchronously (context filled off-loop below) so
+	// a second transition cannot race past the pending-consult guard before
+	// the goroutine registers anything. Mirrors consultDeclaredTask.
+	if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
+		deliverOriginal("staging failed: " + err.Error())
+		return
+	}
+
 	rctx, cancel := context.WithCancel(ctx)
-	d.rewriteInFlight[s.AgentID] = rewriteFlight{signature: sig.Signature, token: token, cancel: cancel}
-	// The first rewrite for this agent selects rewrite_command_start (when
-	// configured); consumed here, past the duplicate-drop, under the same
-	// lock. Tracked independently of the consult "first".
-	first := !d.firstRewrite[s.AgentID]
-	d.firstRewrite[s.AgentID] = true
+	d.mu.Lock()
+	d.actionReviewSeq++
+	token := d.actionReviewSeq
+	d.actionReviewInFlight[s.AgentID] = actionReviewFlight{
+		signature: sig.Signature, requestID: req.RequestID, token: token, cancel: cancel,
+	}
 	d.mu.Unlock()
 
 	go func() {
 		// The short name rides on the request ({agent_name}) and is reused
-		// for the fallback template if the rewrite degrades; degrade to "".
+		// for the fallback template if the review degrades; degrade to "".
 		agentName, err := d.opt.Store.EnsureAgentName(rctx, s.AgentID)
 		if err != nil {
 			agentName = ""
 		}
-		outcome := rewriteOutcome{
+		outcome := actionReviewOutcome{
 			situation: s, sig: sig, tr: tr, dec: dec, learned: learned,
-			fallback: cfg.LLM.RewriteFallbackTemplate, agentName: agentName, token: token,
+			fallback: cfg.LLM.RewriteActionFallbackTemplate, agentName: agentName,
+			token: token,
 		}
-		outcome.err = logging.Guard("llm-rewrite", func() error {
-			req := domain.RewriteRequest{
-				Text: dec.Input, SituationType: s.Type, AgentType: s.AgentType,
-				PaneExcerpt: d.paneExcerpt(rctx, cfg, s), AgentName: agentName,
-				First: first,
+		outcome.err = logging.Guard("llm-action-review", func() error {
+			req.AgentName = agentName
+			req.ContextJSON = string(d.consultContext(rctx, cfg, s, agentName, nil, dec.Input))
+			if err := d.opt.Store.UpdateLLMRequestContext(rctx, req.RequestID, req.ContextJSON); err != nil {
+				return fmt.Errorf("staging LLM request context failed: %w", err)
 			}
-			text, err := rw.Rewrite(rctx, req)
-			outcome.rewritten = text
+			decision, err := llm.Consult(rctx, req)
+			outcome.decision = decision
 			return err
 		})
+		outcome.request = req
 		select {
-		case d.rewriteResults <- outcome:
+		case d.actionReviewResults <- outcome:
 		case <-ctx.Done():
 		}
 	}()
 }
 
-// rewriteSuggestion formats the original action as an escalation suggestion
-// the front-ends' Confirm flow can replay (same prefixes SuggestedAction
-// parses), for the rare case a rewrite outcome must escalate.
-func rewriteSuggestion(sitType domain.SituationType, learned, original string) string {
+// actionReviewSuggestion formats the original action as an escalation
+// suggestion the front-ends' Confirm flow can replay (same prefixes
+// SuggestedAction parses), for the rare case a review outcome must escalate.
+func actionReviewSuggestion(sitType domain.SituationType, learned, original string) string {
 	switch sitType {
 	case domain.SituationApproval:
 		return "respond: " + original
@@ -2245,94 +2382,149 @@ func rewriteSuggestion(sitType domain.SituationType, learned, original string) s
 	return original
 }
 
-// handleRewriteOutcome finalizes an async outbound rewrite: the rewritten
-// text is re-gated through every safety control (the rewriter is an LLM
-// authoring outbound text — FR-015 applies) and delivered. A rewrite
-// failure never blocks the send — it degrades to the original as-is (or
-// the configured rewrite_fallback_template); only safety trips on that
-// degraded form escalate. Two sentinels short-circuit the rewrite:
-// "@rewrite:nochange" sends the original verbatim (bypassing any fallback
-// template), and "@noop" sends nothing at all — the LLM judged that no
-// reply is better than this send.
-func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
+// handleActionReviewOutcome finalizes an async outbound action review: the
+// reviewed text is re-gated through every safety control (the reviewer is an
+// LLM authoring outbound text — FR-015 applies) and delivered. A review
+// failure never blocks the send — it degrades to the original as-is (or the
+// configured rewrite_action_fallback_template); only safety trips on that
+// degraded form escalate. The consult confidence gate deliberately does NOT
+// apply here (the review is advisory; a learned rule already earned the
+// send), though the LLM's self-reported score still lands on the audit row.
+// Two sentinels short-circuit the review: "@proposed_action:send" sends the
+// original verbatim (bypassing any fallback template), and "@noop" sends
+// nothing at all — the LLM judged that no reply is better than this send.
+func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReviewOutcome) {
 	s := res.situation
 
 	// A superseded flight must never send: a newer situation owns the pane.
+	// Its staged row was already expired by cancelActionReviewExcept, so
+	// only the live flight's row is resolved to "done" below — a late
+	// outcome must not repaint cancelled work as completed.
 	d.mu.Lock()
-	fl, ok := d.rewriteInFlight[s.AgentID]
+	fl, ok := d.actionReviewInFlight[s.AgentID]
 	if !ok || fl.token != res.token {
 		d.mu.Unlock()
-		slog.Info("rewrite outcome superseded; dropping", "agent", s.AgentID)
+		slog.Info("action-review outcome superseded; dropping", "agent", s.AgentID)
+		if res.decision != nil {
+			if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "expired"); err != nil {
+				slog.Error("llm decision status update failed", "error", err)
+			}
+		}
 		return
 	}
-	delete(d.rewriteInFlight, s.AgentID)
+	delete(d.actionReviewInFlight, s.AgentID)
 	d.mu.Unlock()
 	fl.cancel()
+
+	// Resolving the request keeps llm_requests hygienic on every later exit
+	// path (mirrors handleLLMOutcome); a failed write is reclaimed by
+	// expireStaleLLMWork.
+	if err := d.opt.Store.UpdateLLMRequestStatus(ctx, res.request.RequestID, "done"); err != nil {
+		slog.Error("marking action-review request done failed",
+			"request", res.request.RequestID, "error", err)
+	}
+
+	// The submitted action, defensively re-normalized like handleLLMOutcome
+	// (a row staged by an older binary must not slip a noop spelling into
+	// the pane as literal text). The self-reported score rides on the audit
+	// row for observability; it never gates the review.
+	reviewed := ""
+	var llmConf *int
+	if res.decision != nil {
+		reviewed = domain.NormalizeNoopAction(res.decision.Action)
+		if res.decision.ConfidentScore >= 0 {
+			score := res.decision.ConfidentScore
+			llmConf = &score
+		}
+	}
 
 	cfg, allow, cls := d.snapshot()
 	now := d.opt.Clock.Now()
 	if disabled, err := d.opt.Store.AgentDisabled(ctx, s.AgentID); err == nil && disabled {
 		d.auditAgentDisabled(ctx, s, res.sig, res.tr, res.dec.Input,
-			res.dec.Confidence, nil, res.rewritten, now)
+			res.dec.Confidence, llmConf, reviewed, now)
+		if res.decision != nil {
+			d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "rejected")
+		}
 		return
 	} else if err != nil {
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonPersistenceFailed,
-			Rationale: "disabled-state read after rewrite: " + err.Error(),
+			Rationale: "disabled-state read after action review: " + err.Error(),
 		}, res.tr, now)
 		return
 	}
 
 	isNoop := false
 	escalateWith := func(reason domain.EscalateReason, why string) {
-		suggestion := rewriteSuggestion(s.Type, res.learned, res.dec.Input)
+		suggestion := actionReviewSuggestion(s.Type, res.learned, res.dec.Input)
 		if isNoop {
 			// The LLM advised silence — suggesting the original send would
 			// invert that. The suggestion text round-trips to @noop on a
 			// confirm (suggestionAction); raw "@noop" is never shown.
 			suggestion = domain.ActionNoopSuggestion
 		}
+		if res.decision != nil {
+			d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "rejected")
+		}
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: reason, Rationale: why,
-			Confidence: res.dec.Confidence,
+			Confidence: res.dec.Confidence, LLMConfidence: llmConf,
 			Suggestion: suggestion,
 		}, res.tr, now)
 	}
 
-	// Final text: the rewrite, or — on any failure, including safety trips
-	// on the rewritten form — the original via the fallback template
+	// Final text: the reviewed action, or — on any failure, including safety
+	// trips on the reviewed form — the original via the fallback template
 	// (passthrough by default).
-	final := strings.TrimSpace(res.rewritten)
-	note := "rewritten by llm.rewrite_command"
+	final := strings.TrimSpace(reviewed)
+	note := "rewritten by llm.command (rewrite action)"
 	llmOutput := ""
+	// discarded marks a degraded review, so the decision row is resolved as
+	// rejected below — the model's output was NOT what got delivered.
+	discarded := false
 	degrade := func(why string) {
+		discarded = true
 		final = domain.ApplyRewriteFallback(res.fallback, res.dec.Input, res.agentName)
-		note = "rewrite " + why + "; fallback template applied"
+		note = "action review " + why + "; fallback template applied"
 	}
 	switch {
 	case res.err != nil:
 		degrade(fmt.Sprintf("failed (%v)", res.err))
 		llmOutput = res.err.Error()
-	case final == "":
-		degrade("produced empty output")
-	case domain.IsRewriteNoop(final):
+	case res.decision == nil:
+		degrade("returned no decision")
+	case domain.IsNoopAction(final):
 		// Handled after the kill-switch check below: nothing will be sent.
 		isNoop = true
-	case domain.IsRewriteNoChange(final):
+	case strings.EqualFold(final, domain.ActionSendProposedAction):
 		// The LLM affirmed the original — send it verbatim, bypassing even
 		// a custom fallback template (that frames failures, not agreements).
 		final = res.dec.Input
-		note = "rewrite affirmed original (@rewrite:nochange)"
-		llmOutput = domain.RewriteNoChange
+		note = "review affirmed original (" + domain.ActionSendProposedAction + ")"
+		llmOutput = domain.ActionSendProposedAction
+	case final == "":
+		degrade("produced empty output")
+	case final == domain.ActionSendProposed:
+		// The task-review sentinel is meaningless here and must never reach
+		// the pane as literal text.
+		llmOutput = "discarded review: " + final
+		degrade("submitted the task-review sentinel outside a task review")
+	case len(final) > maxReviewOutput:
+		// The result is SENT to a pane — a truncated half-instruction is
+		// worse than the safe fallback, so oversized output degrades.
+		llmOutput = fmt.Sprintf("discarded review: oversized output (%d bytes > %d cap)",
+			len(final), maxReviewOutput)
+		degrade("produced oversized output")
 	default:
-		// The CLI's actual output always lands on the audit row (LLMOutput)
-		// — on a clean rewrite it is also the delivered text.
+		// The LLM's actual output always lands on the audit row (LLMOutput)
+		// — on a clean review it is also the delivered text.
 		llmOutput = final
 		if hit, matched := allow.Match(s.AgentType, final); matched {
-			llmOutput = "discarded rewrite: " + truncateRunes(final, 500)
+			llmOutput = "discarded review: " + truncateRunes(final, 500)
 			degrade("output matched never-auto " + hit.Diagnostic())
 		} else if hit, sus := allow.SuspectedIrreversible(s.AgentType, final); sus {
-			llmOutput = "discarded rewrite: " + truncateRunes(final, 500)
+			llmOutput = "discarded review: " + truncateRunes(final, 500)
 			degrade("output tripped irreversible " + hit.Diagnostic())
 		}
 	}
@@ -2343,11 +2535,11 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	// changed since Decide ran (kill switch, rate, the pane itself).
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
-		escalateWith(domain.ReasonDaemonPaused, "at rewrite")
+		escalateWith(domain.ReasonDaemonPaused, "at action review")
 		return
 	}
 	if isNoop {
-		// The rewrite CLI vetoed the send ("@noop"): nothing goes to the
+		// The review LLM vetoed the send ("@noop"): nothing goes to the
 		// pane. The rate guard still runs (D3 — a noop-forever loop must
 		// eventually hit the consecutive ceiling and surface to a human),
 		// but the never-auto screens and the staleness re-read are skipped:
@@ -2355,42 +2547,42 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 		rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
 		if err != nil {
 			// Fail closed: an unreadable rate row must not skip the guard.
-			escalateWith(domain.ReasonPersistenceFailed, "rate read failed at rewrite: "+err.Error())
+			escalateWith(domain.ReasonPersistenceFailed, "rate read failed at action review: "+err.Error())
 			return
 		}
 		if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 			MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 			MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
 		}); !ok {
-			escalateWith(reason, "at rewrite")
+			escalateWith(reason, "at action review")
 			return
 		}
-		d.deliverRewriteNoop(ctx, res, now)
+		d.deliverActionReviewNoop(ctx, res, llmConf, now)
 		return
 	}
 	if hit, matched := allow.Match(s.AgentType, final); matched {
-		escalateWith(domain.ReasonNeverAutoMatch, "rewrite: "+hit.Diagnostic())
+		escalateWith(domain.ReasonNeverAutoMatch, "action review: "+hit.Diagnostic())
 		return
 	}
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType, final); sus {
-		escalateWith(domain.ReasonSuspectedIrrevers, "rewrite: "+hit.Diagnostic())
+		escalateWith(domain.ReasonSuspectedIrrevers, "action review: "+hit.Diagnostic())
 		return
 	}
 	rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
 	if err != nil {
 		// Fail closed: an unreadable rate row must not skip the guard.
-		escalateWith(domain.ReasonPersistenceFailed, "rate read failed at rewrite: "+err.Error())
+		escalateWith(domain.ReasonPersistenceFailed, "rate read failed at action review: "+err.Error())
 		return
 	}
 	if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
 	}); !ok {
-		escalateWith(reason, "at rewrite")
+		escalateWith(reason, "at action review")
 		return
 	}
 
-	// Staleness: the rewrite took up to its timeout — never inject into a
+	// Staleness: the review took up to its timeout — never inject into a
 	// pane that moved on. Re-classify the visible screen with the original
 	// transition status. Signature equality is required only for
 	// approval/choice/error: idle signatures hash a masked content head
@@ -2405,8 +2597,11 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	current.AgentID, current.PaneID, current.WorkspaceID = s.AgentID, s.PaneID, s.WorkspaceID
 	current.Status = res.tr.Status
 	if current.Type != s.Type {
-		slog.Info("situation changed during rewrite; dropping send",
+		slog.Info("situation changed during action review; dropping send",
 			"agent", s.AgentID, "was", s.Type, "now", current.Type)
+		if res.decision != nil {
+			d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "expired")
+		}
 		return
 	}
 	if s.Type != domain.SituationIdle {
@@ -2414,7 +2609,10 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 		// semantically remapped onto another key, but Raw always reflects
 		// the pane content as read, so equal Raw means the pane held still.
 		if freshSig := domain.ComputeSignatureN(current, cfg.Embedding.PaneSalientChars); freshSig.Raw != res.sig.Raw {
-			slog.Info("signature changed during rewrite; dropping send", "agent", s.AgentID)
+			slog.Info("signature changed during action review; dropping send", "agent", s.AgentID)
+			if res.decision != nil {
+				d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "expired")
+			}
 			return
 		}
 	}
@@ -2423,24 +2621,38 @@ func (d *Daemon) handleRewriteOutcome(ctx context.Context, res rewriteOutcome) {
 	// veto ran against content that may no longer be what's on screen.
 	if hit, matched := allow.Match(s.AgentType, domain.IrreversibleScanContent(current, "")); matched {
 		escalateWith(domain.ReasonNeverAutoMatch,
-			hit.Diagnostic()+" (at rewrite)")
+			hit.Diagnostic()+" (at action review)")
 		return
 	}
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType,
 		domain.IrreversibleScanContent(current, "")); sus {
 		escalateWith(domain.ReasonSuspectedIrrevers,
-			hit.Diagnostic()+" (at rewrite)")
+			hit.Diagnostic()+" (at action review)")
 		return
 	}
 
 	original := truncateRunes(res.dec.Input, 200)
-	d.deliverAutonomous(ctx, s, res.sig, res.dec, res.tr, delivery{
-		sendText:  final,
-		input:     final,
-		rationale: fmt.Sprintf("%s; %s (original: %q)", res.dec.Rationale, note, original),
-		llmOutput: llmOutput,
-		learned:   res.learned,
+	delivered := d.deliverAutonomous(ctx, s, res.sig, res.dec, res.tr, delivery{
+		sendText:      final,
+		input:         final,
+		rationale:     fmt.Sprintf("%s; %s (original: %q)", res.dec.Rationale, note, original),
+		llmOutput:     llmOutput,
+		learned:       res.learned,
+		llmConfidence: llmConf,
 	}, now)
+	if res.decision != nil {
+		// Resolve the decision AFTER delivery so the trail stays honest: a
+		// degraded review delivered the fallback (its output was discarded),
+		// and a blocked audit write or failed send delivered nothing — both
+		// are rejected, never accepted.
+		status := "accepted"
+		if discarded || !delivered {
+			status = "rejected"
+		}
+		if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, status); err != nil {
+			slog.Error("llm decision status update failed", "error", err)
+		}
+	}
 }
 
 // handleLLMOutcome re-gates a staged LLM submission through the same safety
@@ -2494,16 +2706,19 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	if taskReviewSend && llmDec.Action == domain.ActionSendProposed {
 		llmDec.Action = res.request.ProposedTask
 	}
-	// The sentinel only means "send the reviewed task" on a task review that
-	// carries one. Anywhere else there is nothing to expand it to, so it must
-	// never reach the pane as literal text. Escalate WITHOUT a suggestion
-	// rather than via reject(), which would surface the raw sentinel as
-	// confirmable — an operator confirm --send would then type it into the pane.
-	if llmDec.Action == domain.ActionSendProposed {
+	// The sentinels only mean something on the consult that carries their
+	// referent: "send the reviewed task" on a task review, "send the
+	// proposed action" on an action review (which never enters this
+	// function — see handleActionReviewOutcome). Anywhere else there is
+	// nothing to expand them to, so they must never reach the pane as
+	// literal text. Escalate WITHOUT a suggestion rather than via reject(),
+	// which would surface the raw sentinel as confirmable — an operator
+	// confirm --send would then type it into the pane.
+	if llmDec.Action == domain.ActionSendProposed || llmDec.Action == domain.ActionSendProposedAction {
 		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonLLMNoSubmit,
-			Rationale: "LLM submitted the send-proposed sentinel outside a task review with a proposed task",
+			Rationale: fmt.Sprintf("LLM submitted the %q sentinel outside the review that defines it", llmDec.Action),
 		}, tr, now)
 		return
 	}
@@ -3253,8 +3468,8 @@ func (d *Daemon) expireStaleLLMWork(ctx context.Context) {
 }
 
 func (d *Daemon) registerHumanInteraction(ctx context.Context, agentID string) {
-	// The human owns the pane now: a pending rewritten send is moot.
-	d.cancelRewriteExcept(agentID, "")
+	// The human owns the pane now: a pending reviewed send is moot.
+	d.cancelActionReviewExcept(ctx, agentID, "")
 	rate, err := d.opt.Store.GetAgentRate(ctx, agentID)
 	if err != nil {
 		return
@@ -3396,7 +3611,7 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 		AgentName: agentName, Cwd: cwd,
 		// A source opts out of the pre-send LLM review with llm_review=false
 		// (nil = the default, on).
-		LLMReview: m.src.LLMReview == nil || *m.src.LLMReview,
+		LLMReview: m.src.EnableLLMReview == nil || *m.src.EnableLLMReview,
 	}
 }
 

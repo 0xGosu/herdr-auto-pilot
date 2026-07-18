@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -222,8 +223,10 @@ func TestSaveRoundTrip(t *testing.T) {
 }
 
 func TestTaskSourceLLMReviewParsing(t *testing.T) {
-	// llm_review is opt-out: unset stays nil (the daemon treats nil as on),
-	// and an explicit false is preserved so a source can opt out.
+	// enable_llm_review is opt-out: unset stays nil (the daemon treats nil
+	// as on), an explicit false is preserved so a source can opt out, and
+	// the legacy llm_review key migrates per element (an explicit new key
+	// wins over the legacy one).
 	path := filepath.Join(t.TempDir(), "config.toml")
 	os.WriteFile(path, []byte(`
 [[task_sources]]
@@ -233,20 +236,58 @@ path = "/tmp/one.md"
 [[task_sources]]
 agent = "a2"
 path = "/tmp/two.md"
+enable_llm_review = false
+
+[[task_sources]]
+agent = "a3"
+path = "/tmp/three.md"
 llm_review = false
+
+[[task_sources]]
+agent = "a4"
+path = "/tmp/four.md"
+llm_review = false
+enable_llm_review = true
 `), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.TaskSources) != 2 {
-		t.Fatalf("want 2 task sources, got %d", len(cfg.TaskSources))
+	if len(cfg.TaskSources) != 4 {
+		t.Fatalf("want 4 task sources, got %d", len(cfg.TaskSources))
 	}
-	if cfg.TaskSources[0].LLMReview != nil {
-		t.Errorf("unset llm_review should stay nil (default on), got %v", *cfg.TaskSources[0].LLMReview)
+	if cfg.TaskSources[0].EnableLLMReview != nil {
+		t.Errorf("unset enable_llm_review should stay nil (default on), got %v", *cfg.TaskSources[0].EnableLLMReview)
 	}
-	if cfg.TaskSources[1].LLMReview == nil || *cfg.TaskSources[1].LLMReview {
-		t.Errorf("explicit llm_review=false should parse as a non-nil false, got %v", cfg.TaskSources[1].LLMReview)
+	if cfg.TaskSources[1].EnableLLMReview == nil || *cfg.TaskSources[1].EnableLLMReview {
+		t.Errorf("explicit enable_llm_review=false should parse as a non-nil false, got %v", cfg.TaskSources[1].EnableLLMReview)
+	}
+	if cfg.TaskSources[2].EnableLLMReview == nil || *cfg.TaskSources[2].EnableLLMReview {
+		t.Errorf("legacy llm_review=false should migrate to enable_llm_review, got %v", cfg.TaskSources[2].EnableLLMReview)
+	}
+	if cfg.TaskSources[3].EnableLLMReview == nil || !*cfg.TaskSources[3].EnableLLMReview {
+		t.Errorf("explicit enable_llm_review must win over legacy llm_review, got %v", cfg.TaskSources[3].EnableLLMReview)
+	}
+	for i, src := range cfg.TaskSources {
+		if src.DeprecatedLLMReview != nil {
+			t.Errorf("source %d: deprecated llm_review must be cleared after Load", i)
+		}
+	}
+	// A Save re-emits only the new key.
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "enable_llm_review = ") {
+		t.Errorf("re-saved config must use the new key: %s", raw)
+	}
+	// Keys are indented under their table by the encoder, so match anywhere
+	// on a line, not just column 0.
+	if regexp.MustCompile(`(?m)^\s*llm_review\s*=`).Match(raw) {
+		t.Errorf("re-saved config must drop the legacy key: %s", raw)
 	}
 }
 
@@ -613,72 +654,38 @@ func TestTUIThemeBackwardCompat(t *testing.T) {
 	}
 }
 
-func TestRewriteConfigKeys(t *testing.T) {
+func TestRewriteActionConfigKeys(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 
-	// Omitted entirely: disabled command, timeout inherits the default
-	// consult timeout, template empty (domain resolves the default).
+	// Omitted entirely: the review is off, template empty (domain resolves
+	// the default).
 	os.WriteFile(path, []byte("[llm]\ncommand = [\"claude\"]\n"), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.LLM.RewriteCommand) != 0 {
-		t.Errorf("rewrite_command should default empty, got %v", cfg.LLM.RewriteCommand)
+	if cfg.LLM.EnableRewriteAction {
+		t.Error("enable_rewrite_action must default to false")
 	}
-	// Inheritance is resolved at use time, never materialized: a later Save
-	// must not freeze the inherited value into config.toml.
-	if cfg.LLM.RewriteTimeoutSeconds != 0 {
-		t.Errorf("omitted rewrite timeout should stay 0 (inherit at use time), got %d", cfg.LLM.RewriteTimeoutSeconds)
-	}
-	if cfg.RewriteTimeout() != 60*time.Second {
-		t.Errorf("RewriteTimeout() = %v, want inherited default 60s", cfg.RewriteTimeout())
-	}
-	if cfg.LLM.RewriteFallbackTemplate != "" {
-		t.Errorf("fallback template should stay empty (domain default applies), got %q", cfg.LLM.RewriteFallbackTemplate)
+	if cfg.LLM.RewriteActionFallbackTemplate != "" {
+		t.Errorf("fallback template should stay empty (domain default applies), got %q", cfg.LLM.RewriteActionFallbackTemplate)
 	}
 
-	// Omitted rewrite timeout inherits a CUSTOM consult timeout — even
-	// after a Save/Load cycle (the zero survives the round trip).
-	os.WriteFile(path, []byte("[llm]\ntimeout_seconds = 120\n"), 0o600)
-	if cfg, err = Load(path); err != nil {
-		t.Fatal(err)
-	}
-	if cfg.RewriteTimeout() != 120*time.Second {
-		t.Errorf("RewriteTimeout() = %v, want inherited 120s", cfg.RewriteTimeout())
-	}
-	if err := Save(path, cfg); err != nil {
-		t.Fatal(err)
-	}
-	if cfg, err = Load(path); err != nil {
-		t.Fatal(err)
-	}
-	if cfg.LLM.RewriteTimeoutSeconds != 0 || cfg.RewriteTimeout() != 120*time.Second {
-		t.Errorf("Save must not freeze the inherited timeout: raw=%d effective=%v",
-			cfg.LLM.RewriteTimeoutSeconds, cfg.RewriteTimeout())
-	}
-
-	// Explicit values are honored verbatim.
+	// Explicit values are honored verbatim and survive a round trip.
 	os.WriteFile(path, []byte(`[llm]
-timeout_seconds = 120
-rewrite_command = ["claude", "-p", "rewrite: {text}"]
-rewrite_timeout_seconds = 30
-rewrite_fallback_template = "Do this: {original_text}"
+command = ["claude"]
+enable_rewrite_action = true
+rewrite_action_fallback_template = "Do this: {original_text}"
 `), 0o600)
 	if cfg, err = Load(path); err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.LLM.RewriteCommand) != 3 || cfg.LLM.RewriteCommand[2] != "rewrite: {text}" {
-		t.Errorf("rewrite_command lost: %v", cfg.LLM.RewriteCommand)
+	if !cfg.LLM.EnableRewriteAction {
+		t.Error("enable_rewrite_action = true lost")
 	}
-	if cfg.LLM.RewriteTimeoutSeconds != 30 {
-		t.Errorf("explicit rewrite timeout lost: %d", cfg.LLM.RewriteTimeoutSeconds)
+	if cfg.LLM.RewriteActionFallbackTemplate != "Do this: {original_text}" {
+		t.Errorf("fallback template lost: %q", cfg.LLM.RewriteActionFallbackTemplate)
 	}
-	if cfg.LLM.RewriteFallbackTemplate != "Do this: {original_text}" {
-		t.Errorf("fallback template lost: %q", cfg.LLM.RewriteFallbackTemplate)
-	}
-
-	// Save/Load round trip keeps all three keys.
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -686,9 +693,81 @@ rewrite_fallback_template = "Do this: {original_text}"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rt.LLM.RewriteCommand) != 3 || rt.LLM.RewriteTimeoutSeconds != 30 ||
-		rt.LLM.RewriteFallbackTemplate != "Do this: {original_text}" {
-		t.Errorf("round trip lost rewrite keys: %+v", rt.LLM)
+	if !rt.LLM.EnableRewriteAction || rt.LLM.RewriteActionFallbackTemplate != "Do this: {original_text}" {
+		t.Errorf("round trip lost rewrite-action keys: %+v", rt.LLM)
+	}
+}
+
+func TestRewriteFallbackTemplateLegacyKeyMigrates(t *testing.T) {
+	// The renamed rewrite_fallback_template seeds the new key on Load (with
+	// a warning), an explicit new key wins, and a Save re-emits only the new
+	// key.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte("[llm]\nrewrite_fallback_template = \"Old: {original_text}\"\n"), 0o600)
+	cfg, logs, err := loadWithLogs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.RewriteActionFallbackTemplate != "Old: {original_text}" {
+		t.Errorf("legacy template should migrate, got %q", cfg.LLM.RewriteActionFallbackTemplate)
+	}
+	if cfg.LLM.DeprecatedRewriteFallbackTemplate != "" {
+		t.Error("deprecated field must be cleared after Load")
+	}
+	if !strings.Contains(logs, "rewrite_fallback_template") || !strings.Contains(logs, "deprecated") {
+		t.Errorf("migration should warn about the deprecated key, logs: %s", logs)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), "rewrite_action_fallback_template") ||
+		regexp.MustCompile(`(?m)^\s*rewrite_fallback_template\s*=`).Match(raw) {
+		t.Errorf("re-saved config must carry only the new key: %s", raw)
+	}
+
+	// An explicit new key wins over the legacy one.
+	os.WriteFile(path, []byte(`[llm]
+rewrite_fallback_template = "Old: {original_text}"
+rewrite_action_fallback_template = "New: {original_text}"
+`), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.RewriteActionFallbackTemplate != "New: {original_text}" {
+		t.Errorf("explicit new key must win, got %q", cfg.LLM.RewriteActionFallbackTemplate)
+	}
+}
+
+func TestRemovedRewriteKeysWarnAndDrop(t *testing.T) {
+	// The dedicated rewrite CLI keys are gone: they load without error, warn
+	// once (naming the replacement), never enable the review, and a Save
+	// drops them.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte(`[llm]
+command = ["claude"]
+rewrite_command = ["claude", "-p", "rewrite: {text}"]
+rewrite_command_start = ["claude", "-p", "first: {text}"]
+rewrite_timeout_seconds = 30
+`), 0o600)
+	cfg, logs, err := loadWithLogs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.EnableRewriteAction {
+		t.Error("removed keys must NOT auto-enable the action review")
+	}
+	if !strings.Contains(logs, "rewrite_command") || !strings.Contains(logs, "enable_rewrite_action") {
+		t.Errorf("load should warn about removed keys and name the replacement, logs: %s", logs)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	for _, gone := range []string{"rewrite_command", "rewrite_timeout_seconds"} {
+		if strings.Contains(string(raw), gone) {
+			t.Errorf("re-saved config must drop removed key %q: %s", gone, raw)
+		}
 	}
 }
 
@@ -768,7 +847,7 @@ task_generate_timeout_seconds = 45
 func TestCommandStartConfigKeys(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 
-	// Omitted: both start variants default empty (inherit at use time).
+	// Omitted: the start variant defaults empty (inherits at use time).
 	os.WriteFile(path, []byte("[llm]\ncommand = [\"claude\"]\n"), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
@@ -777,25 +856,17 @@ func TestCommandStartConfigKeys(t *testing.T) {
 	if len(cfg.LLM.CommandStart) != 0 {
 		t.Errorf("command_start should default empty, got %v", cfg.LLM.CommandStart)
 	}
-	if len(cfg.LLM.RewriteCommandStart) != 0 {
-		t.Errorf("rewrite_command_start should default empty, got %v", cfg.LLM.RewriteCommandStart)
-	}
 
 	// Explicit values are honored and survive a Save/Load round trip.
 	os.WriteFile(path, []byte(`[llm]
 command = ["claude", "-p", "ongoing"]
 command_start = ["claude", "-p", "first: {agent_name}", "--model", "opus"]
-rewrite_command = ["claude", "-p", "rewrite: {text}"]
-rewrite_command_start = ["claude", "-p", "first rewrite: {text}"]
 `), 0o600)
 	if cfg, err = Load(path); err != nil {
 		t.Fatal(err)
 	}
 	if len(cfg.LLM.CommandStart) != 5 || cfg.LLM.CommandStart[2] != "first: {agent_name}" {
 		t.Errorf("command_start lost: %v", cfg.LLM.CommandStart)
-	}
-	if len(cfg.LLM.RewriteCommandStart) != 3 || cfg.LLM.RewriteCommandStart[2] != "first rewrite: {text}" {
-		t.Errorf("rewrite_command_start lost: %v", cfg.LLM.RewriteCommandStart)
 	}
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
@@ -804,7 +875,7 @@ rewrite_command_start = ["claude", "-p", "first rewrite: {text}"]
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rt.LLM.CommandStart) != 5 || len(rt.LLM.RewriteCommandStart) != 3 {
+	if len(rt.LLM.CommandStart) != 5 {
 		t.Errorf("round trip lost start keys: %+v", rt.LLM)
 	}
 }

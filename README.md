@@ -213,7 +213,8 @@ agent CLI, and it can only propose a response. **Local data** covers
 For an unknown situation, the daemon may launch the configured local
 LLM/agent CLI. Consults attach a short-lived `hap mcp` server: the model reads
 the staged context with `get_context` and returns a structured decision with
-`submit_decision`. Rewrites and idle-task generation are one-shot commands
+`submit_decision`. Pre-delivery action reviews and pre-send task reviews ride
+the same consult round-trip; idle-task generation is a one-shot command
 whose stdout is treated as a proposed result. In every case the daemon — not
 the model or MCP process — owns the final decision, runs the proposal through
 the same confidence, safety, and staleness checks, and either sends through
@@ -440,7 +441,7 @@ next_task_template = "Your next task is {next_task_content}. Read the full tasks
 # When an [llm].command is configured, each determined task is first reviewed by
 # the LLM before it is sent (see "Reviewing tasks before they are sent" below).
 # Default: on. Opt this source out with:
-# llm_review = false
+# enable_llm_review = false
 ```
 
 The former `[thresholds]` table is accepted for compatibility. Loading it
@@ -670,8 +671,9 @@ action. The sentinel is rejected if an LLM submits it outside a task review
 that actually carries a proposed task.
 
 This is **on by default** whenever the LLM command exists; set
-`llm_review = false` on a `[[task_sources]]` entry to keep the plain
-declared-task flow for that source.
+`enable_llm_review = false` on a `[[task_sources]]` entry to keep the plain
+declared-task flow for that source. (The former `llm_review` key still loads
+and migrates to the new name on the next config save.)
 
 ### Never-auto patterns
 
@@ -707,8 +709,8 @@ Simple fields — numbers, booleans, and the `tui.theme` enum, including
 (on by default — rings the terminal bell on a new escalation, and when the
 kill switch is paused by a *different* process than the TUI you're in) — edit
 inline (`enter`) or via `hap config set <key> <value>`. Free-text fields (`llm.command`,
-`llm.command_start`, `llm.rewrite_command`, `llm.rewrite_command_start`,
-`llm.rewrite_fallback_template`, `llm.task_generate_command`,
+`llm.command_start`, `llm.rewrite_action_fallback_template`,
+`llm.task_generate_command`,
 `llm.task_generate_command_start`, `embedding.model_path`) show read-only in
 the TUI, because a one-line
 prompt mangles quoted argv values — edit them in `config.toml` or with
@@ -907,75 +909,69 @@ that silently stands down), but nothing is ever sent to the pane. Note: a
 learned idle noop suppresses task sends for that signature until you
 correct it or delete the signature.
 
-### LLM rewrite of literal replies (optional)
+### LLM review of literal replies (optional)
 
 When a learned rule resolves to **literal free text** — an idle next-task
 prompt, an error retry command, a free-text approval reply — the plugin can
-pass that text through a one-shot LLM CLI to adapt it to what's actually on
-the agent's screen before sending. Unlike the consult fallback there is no
-MCP round-trip: the CLI is run once and its **stdout is the rewritten
-text**.
+have the consult LLM (`llm.command`) review and adapt that text to what's
+actually on the agent's screen before sending. The review rides the same
+`get_context`/`submit_decision` MCP round-trip as any consult: the context
+carries `proposed_action` (the exact text about to be sent), and the model
+submits the adapted text, `@proposed_action:send` to affirm the original, or
+`@noop` to send nothing.
 
 ```toml
 [llm]
-rewrite_command = [
-  "claude", "-p",
-  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text — or @rewrite:nochange if the instruction is already right as-is, or @noop if nothing should be sent at all.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
-  "--model", "haiku",
-]
-rewrite_timeout_seconds = 30   # omitted: inherits timeout_seconds
-# On rewrite failure the ORIGINAL text is sent as-is; set this only to wrap it:
-# rewrite_fallback_template = "You must act based on the following: {original_text}"
-# Optional: runs instead of rewrite_command on the agent's FIRST rewrite
-# (same first-interaction boundary as command_start, tracked independently;
-# empty inherits rewrite_command):
-# rewrite_command_start = [ "claude", "-p", "...first-rewrite prompt...", "--model", "haiku" ]
+command = [ ... ]              # required — the review uses the consult CLI
+enable_rewrite_action = true   # default: false
+# On review failure the ORIGINAL text is sent as-is; set this only to wrap it:
+# rewrite_action_fallback_template = "You must act based on the following: {original_text}"
 ```
 
-As with consult commands, a rewrite command that exits with an error in under
-one second is retried once with the other configured rewrite template
-(`rewrite_command` ↔ `rewrite_command_start`). Timeouts and clean empty or
-oversized output deliver the original as-is (or your
-`rewrite_fallback_template`) instead of retrying.
-
-Placeholders in `rewrite_command`: `{text}` (the literal reply a rule
-resolved to), `{situation_type}`, `{agent_type}`, `{agent_name}` (the
-agent's short name), `{pane_excerpt}` (last `pane_excerpt_chars` characters
-of the live pane). The same CLI auto-repair as `llm.command` applies (on the
-raw template, before substitution). No shell is involved — each element is
-one argv entry — but `{text}` and `{pane_excerpt}` carry untrusted pane
-content: embed them inside a prompt string (as in the example) rather than as
-standalone argv elements, so a value starting with `-` can never be parsed as
-a flag; the same values are also available as `HAP_REWRITE_TEXT` /
-`HAP_SITUATION_TYPE` / `HAP_AGENT_TYPE` / `HAP_AGENT_NAME` env vars.
+> Upgrading? The former dedicated rewrite CLI keys — `llm.rewrite_command`,
+> `llm.rewrite_command_start`, `llm.rewrite_timeout_seconds` — were removed
+> in favor of this consult-based review; they are ignored with a warning and
+> dropped on the next config save. `llm.rewrite_fallback_template` was
+> renamed to `llm.rewrite_action_fallback_template` (the old key migrates
+> automatically). Rewriting stays OFF until you set
+> `enable_rewrite_action = true`.
 
 Invariants:
 
-- **Numbered-menu answers are never rewritten** — a mapped digit reaches
-  the menu untouched. Only literal free text goes through the rewriter.
-- **A rewrite failure never blocks the send**: on error, timeout, or empty
+- **Numbered-menu answers are never reviewed** — a mapped digit reaches
+  the menu untouched. Only literal free text goes through the review.
+- **Declared tasks are never reviewed here** — a task from a
+  `[[task_sources]]` entry is covered by that source's `enable_llm_review`
+  gate, and a source that opted out delivers its tasks verbatim.
+- **A review failure never blocks the send**: on error, timeout, or empty
   output the original text is delivered exactly as it was. Set
-  `rewrite_fallback_template` (`{original_text}`, `{agent_name}`
+  `rewrite_action_fallback_template` (`{original_text}`, `{agent_name}`
   placeholders) to wrap it instead; empty or `{original_text}`-less
-  templates fall back to the as-is default.
-- **`@rewrite:nochange` sends the original verbatim** — the rewrite CLI can
+  templates fall back to the as-is default. The consult
+  `auto_act_confidence_threshold` deliberately does NOT apply — the learned
+  rule already earned the send, so an unsure review degrades to the
+  original instead of escalating (the model's `confident_score` still lands
+  on the audit row).
+- **`@proposed_action:send` sends the original verbatim** — the model can
   reply with just this sentinel to affirm the instruction, bypassing any
   configured fallback template. All safety re-gates still run on the
   original.
-- **`@noop` sends nothing at all** — the rewrite CLI judged that no reply is
+- **`@noop` sends nothing at all** — the model judged that no reply is
   better than this send. The veto is audited as a `noop` row and the runaway
   counter still advances, but nothing is learned from it (the underlying
-  rule is untouched). Only the exact `@`-prefixed sentinel counts; a bare
-  `noop` is delivered as literal text.
-- **Safety controls still apply to the rewritten text**: output matching
+  rule is untouched). Bare spellings (`noop`, `no_op`, `no-op`) normalize to
+  the sentinel, as on every consult.
+- **Safety controls still apply to the reviewed text**: output matching
   the never-auto patterns or the irreversible-operation heuristic is
   discarded in favor of the original; if even that trips, the
   situation escalates instead of sending. Kill switch, rate guard, and a
   staleness re-check (the pane must still show the same situation) run
   again at delivery time.
 - **Learning is unaffected**: decision history records the original
-  learned action, never the rewritten text, so rule confidence and the
+  learned action, never the adapted text, so rule confidence and the
   variance guard keep working.
+- **Cost note**: every reviewed send is one full consult (an MCP
+  round-trip), so latency and token spend are those of `llm.command`.
 
 #### Troubleshooting the fallback
 

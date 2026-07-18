@@ -38,6 +38,14 @@ const (
 // the literal sentinel. Only meaningful for a task-review consult.
 const ActionSendProposed = "@next_task:declared"
 
+// ActionSendProposedAction is the action-review counterpart of
+// ActionSendProposed: instead of re-typing the reviewed outbound text into
+// recommend_action, the LLM submits this sentinel to send the request's
+// ProposedAction unchanged. The daemon expands it before delivery, so the
+// agent never receives the literal sentinel. Only meaningful for an
+// action-review consult (llm.enable_rewrite_action).
+const ActionSendProposedAction = "@proposed_action:send"
+
 // IsNoopAction reports whether a learned/submitted action is the noop
 // sentinel.
 func IsNoopAction(s string) bool { return s == ActionNoop }

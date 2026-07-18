@@ -2,54 +2,19 @@ package domain
 
 import "strings"
 
-// Rewrite support for literal outbound text (llm.rewrite_command): when a
-// learned rule resolves to free text (an idle next-task prompt, an error
-// retry command, a free-text approval reply), the daemon can hand it to a
-// one-shot LLM CLI to adapt it to the live pane before delivery. These are
-// the pure pieces; the subprocess lives in internal/llm.
-
-// RewriteRequest is everything the rewrite CLI template can reference.
-type RewriteRequest struct {
-	// Text is the literal outbound text a learned rule resolved to.
-	Text          string
-	SituationType SituationType
-	AgentType     string
-	// PaneExcerpt is the tail of the live pane, for {pane_excerpt}.
-	PaneExcerpt string
-	// AgentName is the agent's short name, for {agent_name}.
-	AgentName string
-	// First marks this as the agent's first rewrite this daemon lifetime,
-	// selecting llm.rewrite_command_start when configured. Tracked
-	// independently of the consult "first".
-	First bool
-}
+// Action-review fallback support (llm.enable_rewrite_action): when a learned
+// rule resolves to free text, the daemon can hand it to the consult LLM to
+// adapt it to the live pane before delivery. The review must never block the
+// send — on any failure the already-safety-screened original is delivered via
+// the fallback template below. The consult subprocess lives in internal/llm;
+// the review flow in internal/daemon.
 
 // DefaultRewriteFallbackTemplate is the failure-path template: the send must
-// never be blocked by a rewrite failure, so the already-safety-screened
-// original is delivered as-is by default. Set llm.rewrite_fallback_template
-// to opt into wrapping it (placeholders: {original_text}, {agent_name}).
+// never be blocked by a review failure, so the already-safety-screened
+// original is delivered as-is by default. Set
+// llm.rewrite_action_fallback_template to opt into wrapping it (placeholders:
+// {original_text}, {agent_name}).
 const DefaultRewriteFallbackTemplate = "{original_text}"
-
-// RewriteNoChange is the rewrite CLI's "the original is already right"
-// sentinel: the daemon sends the original text verbatim, bypassing any
-// configured fallback template. The companion "@noop" (ActionNoop) means
-// "send nothing at all".
-const RewriteNoChange = "@rewrite:nochange"
-
-// IsRewriteNoChange reports whether trimmed rewrite output is the
-// no-change sentinel (case-insensitive).
-func IsRewriteNoChange(s string) bool {
-	return strings.EqualFold(strings.TrimSpace(s), RewriteNoChange)
-}
-
-// IsRewriteNoop reports whether trimmed rewrite output is the noop sentinel
-// (case-insensitive). Unlike NormalizeNoopAction on the consult path, bare
-// spellings ("noop", "no_op", "no-op") are deliberately NOT accepted:
-// rewrite output is free text destined for a pane, and a bare "noop" could
-// be a legitimate rewritten reply — only the @ prefix marks LLM intent.
-func IsRewriteNoop(s string) bool {
-	return strings.EqualFold(strings.TrimSpace(s), ActionNoop)
-}
 
 // ApplyRewriteFallback renders the failure-path outbound text. An empty
 // template — or one missing the {original_text} placeholder, which would

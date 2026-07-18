@@ -1240,7 +1240,7 @@ func TestConfigReadOnlyRowsRefuseEditAndRemove(t *testing.T) {
 }
 
 func TestConfigTUIReadOnlyFieldsNoPrompt(t *testing.T) {
-	readOnly := []string{"llm.command", "llm.command_start", "llm.rewrite_command", "llm.rewrite_command_start", "llm.rewrite_fallback_template", "embedding.model_path"}
+	readOnly := []string{"llm.command", "llm.command_start", "llm.rewrite_action_fallback_template", "embedding.model_path"}
 	for _, key := range readOnly {
 		for _, k := range []string{"enter", "e"} {
 			t.Run(key+"/"+k, func(t *testing.T) {

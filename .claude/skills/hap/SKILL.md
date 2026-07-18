@@ -344,13 +344,11 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic never-auto rule |
 | `llm.timeout_seconds` | 60 | timeout for LLM fallback calls |
 | `llm.auto_act_confidence_threshold` | 999 (never) | min LLM self-reported confidence (0-100) to auto-act on a consult decision; below it (or no score) the situation escalates with reason `[llm_low_confidence]`. 999 is unreachable = never auto-act |
-| `llm.pane_excerpt_chars` | 5000 | pane excerpt size in characters for LLM consult/rewrite context |
-| `llm.rewrite_timeout_seconds` | 60 | timeout for rewrite calls |
-| `llm.rewrite_fallback_template` | `{original_text}` (original sent as-is) | optional wrapper around the original when the rewrite fails (placeholders: `{original_text}`, `{agent_name}`) |
+| `llm.pane_excerpt_chars` | 5000 | pane excerpt size in characters for LLM consult context |
+| `llm.enable_rewrite_action` | false | have the consult LLM review/adapt learned free-text replies before delivery (see llm action review) |
+| `llm.rewrite_action_fallback_template` | `{original_text}` (original sent as-is) | optional wrapper around the original when the action review fails (placeholders: `{original_text}`, `{agent_name}`) |
 | `llm.command` | (unset) | argv template for the consult fallback CLI (see llm fallback config) |
 | `llm.command_start` | (unset) | argv template for the FIRST consult per agent; empty inherits `llm.command` (opt-in) |
-| `llm.rewrite_command` | (unset) | argv template for the one-shot rewrite CLI (see llm rewrite) |
-| `llm.rewrite_command_start` | (unset) | argv template for the FIRST rewrite per agent; empty inherits `llm.rewrite_command` (opt-in) |
 | `llm.task_generate_command` | (unset) | argv template for the one-shot task suggestion given to an idle agent with NO task source, or a declared source that ran out (see task sources); empty keeps escalate-only behavior |
 | `llm.task_generate_command_start` | (unset) | argv template for the FIRST task generation per agent (no-source case only; empty inherits `llm.task_generate_command`); an exhausted declared source only generates more tasks when BOTH this and `llm.task_generate_command` are set, and always uses `llm.task_generate_command` (never this) since a list already exists |
 | `llm.task_generate_timeout_seconds` | 0 (inherits `timeout_seconds`) | timeout for one task-generation run |
@@ -552,7 +550,7 @@ Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: 
 
 when every item is checked off, the prompt is still sent with `{next_task_content} = "none"`, so the template can steer what an idle agent does when the list is done.
 
-when an `[llm].command` is configured, each determined task is first reviewed by the llm before it is sent: via the `get_context`/`submit_decision` mcp tools it sees the live pane plus the queued task (`proposed_task`/`current_task`), the checklist path (`task_list_path`), and every remaining item (`pending_tasks`), then either sends the task as-is (`recommend_action` `@next_task:declared`, which sends the queued task verbatim), sends an edited task or a different pending item (literal `recommend_action` text), or declines (`@noop`). the outcome follows `auto_act_confidence_threshold` symmetrically — a confident review is applied automatically (the task is sent, or silently skipped on a decline), a low-confidence one is surfaced for confirmation (the suggestion is the llm's exact recommendation; the original task and reasoning show in the escalation detail). since the default threshold is 999, every review is surfaced until you lower it. this review is on by default; set `llm_review = false` on a `[[task_sources]]` entry (in `config.toml`) to opt that source out.
+when an `[llm].command` is configured, each determined task is first reviewed by the llm before it is sent: via the `get_context`/`submit_decision` mcp tools it sees the live pane plus the queued task (`proposed_task`/`current_task`), the checklist path (`task_list_path`), and every remaining item (`pending_tasks`), then either sends the task as-is (`recommend_action` `@next_task:declared`, which sends the queued task verbatim), sends an edited task or a different pending item (literal `recommend_action` text), or declines (`@noop`). the outcome follows `auto_act_confidence_threshold` symmetrically — a confident review is applied automatically (the task is sent, or silently skipped on a decline), a low-confidence one is surfaced for confirmation (the suggestion is the llm's exact recommendation; the original task and reasoning show in the escalation detail). since the default threshold is 999, every review is surfaced until you lower it. this review is on by default; set `enable_llm_review = false` on a `[[task_sources]]` entry (in `config.toml`) to opt that source out (the former `llm_review` key still loads and migrates on the next save).
 
 without a declared task source, the plugin falls back to inferring the next task from the agent's own native todo rendering (currently only `claude` agent type is supported for inference). other agent types skip inference and escalate.
 
@@ -669,42 +667,30 @@ command_start = ["claude", "-p", "...", "--model", "opus"]   # first consult per
 
 every LLM suggestion is re-gated through the never-auto patterns, kill switch, and rate guards. the LLM may act automatically only when its self-reported confidence score meets `auto_act_confidence_threshold` (0-100; default 999 = never) AND the action doesn't contradict learned history; below the threshold, with no reported score, or on timeout / no submission, the situation escalates. the old boolean `auto_act` still loads as a deprecated alias (`true` → threshold 0, `false` → 999) and is migrated on next save.
 
-## llm rewrite (optional)
+## llm action review (optional)
 
-when a learned rule resolves to literal free text (idle next-task prompt, error retry command, free-text approval reply), the plugin can pass that text through a one-shot LLM CLI to adapt it to what's actually on the agent's screen before sending. unlike the consult fallback there is no MCP round-trip: the CLI is run once and its stdout is the rewritten text.
+when a learned rule resolves to literal free text (idle next-task prompt, error retry command, free-text approval reply — never menu digits, and never a declared task from a `[[task_sources]]`, whose `enable_llm_review` gate owns that), the consult LLM (`llm.command`) can review/adapt that text to what's actually on the agent's screen before sending. the review rides the same `get_context`/`submit_decision` MCP round-trip as any consult: `get_context` carries `proposed_action` (the exact text about to be sent), and the model submits the adapted text, `@proposed_action:send` to affirm the original, or `@noop` to send nothing.
 
 ```toml
 [llm]
-rewrite_command = [
-  "claude", "-p",
-  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text — or @rewrite:nochange if the instruction is already right as-is, or @noop if nothing should be sent at all.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
-  "--model", "haiku",
-]
-rewrite_timeout_seconds = 30
+command = [ ... ]              # required — the review uses the consult CLI
+enable_rewrite_action = true   # default: false
 # optional — on failure the original is sent as-is; set this only to wrap it:
-# rewrite_fallback_template = "You must act based on the following: {original_text}"
+# rewrite_action_fallback_template = "You must act based on the following: {original_text}"
 ```
 
-### rewrite placeholders
+upgrading: the former one-shot rewrite CLI keys (`llm.rewrite_command`, `llm.rewrite_command_start`, `llm.rewrite_timeout_seconds`) were removed — they load with a warning and are dropped on the next save; `llm.rewrite_fallback_template` migrates to `llm.rewrite_action_fallback_template`. rewriting stays OFF until `enable_rewrite_action = true` is set.
 
-- `{text}` — the literal reply a rule resolved to
-- `{situation_type}` — the classified situation type
-- `{agent_type}` — the agent type (claude, codex, agy, etc.)
-- `{pane_excerpt}` — last `pane_excerpt_chars` characters of the live pane
-- `{agent_name}` — the agent's hap-owned short name
+### action review invariants
 
-also available as env vars: `HAP_REWRITE_TEXT`, `HAP_SITUATION_TYPE`, `HAP_AGENT_TYPE`, `HAP_AGENT_NAME`.
-
-`rewrite_command_start` is the first-interaction variant of `rewrite_command` (same placeholders): used on the FIRST rewrite for a freshly detected agent, then `rewrite_command` for the rest. empty inherits `rewrite_command` (opt-in), and its "first" is tracked independently of `command_start`'s.
-
-### rewrite invariants
-
-- numbered-menu answers are never rewritten — a mapped digit reaches the menu untouched. only literal free text goes through the rewriter.
-- a rewrite failure never blocks the send: on error, timeout, or empty output the original text is delivered as-is (or wrapped in `rewrite_fallback_template` when configured).
-- `@rewrite:nochange` output sends the original verbatim (bypassing any fallback template); all safety re-gates still run on it.
-- `@noop` output sends nothing at all — audited as a `noop` row, runaway counter still advances, nothing learned. only the exact `@`-prefixed sentinel counts; a bare `noop` is delivered literally.
-- safety controls still apply to the rewritten text: output matching the never-auto patterns or the irreversible heuristic is discarded in favor of the original.
-- learning is unaffected: decision history records the original learned action, never the rewritten text.
+- numbered-menu answers are never reviewed — a mapped digit reaches the menu untouched. only literal free text goes through the review.
+- declared tasks from `[[task_sources]]` are never action-reviewed — the source's `enable_llm_review` gate owns task review; an opted-out source delivers its tasks verbatim.
+- a review failure never blocks the send: on error, timeout, empty or invalid output the original text is delivered as-is (or wrapped in `rewrite_action_fallback_template` when configured). `auto_act_confidence_threshold` does NOT apply — an unsure review degrades to the original instead of escalating (the `confident_score` still lands on the audit row).
+- `@proposed_action:send` sends the original verbatim (bypassing any fallback template); all safety re-gates still run on it.
+- `@noop` sends nothing at all — audited as a `noop` row, runaway counter still advances, nothing learned. bare spellings (`noop`, `no_op`, `no-op`) normalize to the sentinel, as on every consult.
+- safety controls still apply to the reviewed text: output matching the never-auto patterns or the irreversible heuristic is discarded in favor of the original; kill switch, rate guard, and a staleness re-check run again at delivery time.
+- learning is unaffected: decision history records the original learned action, never the adapted text.
+- cost: every reviewed send is one full consult (MCP round-trip) on `llm.command`.
 
 ## resolved paths (diagnostics)
 

@@ -114,26 +114,25 @@ type LLM struct {
 	// in the consult context handed to the LLM. Zero or omitted restores
 	// the 5000-char default.
 	PaneExcerptChars int `toml:"pane_excerpt_chars"`
-	// RewriteCommand is the argv template for the one-shot rewrite of
-	// literal outbound text (idle next-task prompts, error retry commands,
-	// free-text replies — never menu digits); placeholders {text},
-	// {situation_type}, {agent_type}, {agent_name}, {pane_excerpt}. The
-	// rewritten text is read from the CLI's stdout. Empty means literal
-	// text is sent unchanged.
-	RewriteCommand []string `toml:"rewrite_command"`
-	// RewriteCommandStart is the argv template used on the FIRST rewrite per
-	// agent (same first-interaction boundary as CommandStart). Same
-	// placeholders as RewriteCommand. Empty inherits RewriteCommand, so the
-	// feature is opt-in; it is tracked independently of CommandStart's "first".
-	RewriteCommandStart []string `toml:"rewrite_command_start"`
-	// RewriteTimeoutSeconds bounds one rewrite run; zero or omitted
-	// inherits timeout_seconds.
-	RewriteTimeoutSeconds int `toml:"rewrite_timeout_seconds"`
-	// RewriteFallbackTemplate optionally wraps the original text when the
-	// rewrite fails (placeholders {original_text}, {agent_name}). Empty
-	// uses the built-in default, which sends the original as-is; a rewrite
-	// failure never blocks the send.
-	RewriteFallbackTemplate string `toml:"rewrite_fallback_template"`
+	// EnableRewriteAction opts learned free-text sends (idle next-task
+	// prompts, error retry commands, free-text replies — never menu digits,
+	// and never a declared task from a [[task_sources]], whose
+	// enable_llm_review gate owns that) into a pre-delivery review by the
+	// consult LLM (Command): the LLM adapts the text to the live pane,
+	// affirms it unchanged, or vetoes the send. Requires Command; the review
+	// never blocks the send — on any failure the original text is delivered
+	// via RewriteActionFallbackTemplate.
+	EnableRewriteAction bool `toml:"enable_rewrite_action"`
+	// RewriteActionFallbackTemplate optionally wraps the original text when
+	// the action review fails (placeholders {original_text}, {agent_name}).
+	// Empty uses the built-in default, which sends the original as-is; a
+	// review failure never blocks the send.
+	RewriteActionFallbackTemplate string `toml:"rewrite_action_fallback_template"`
+	// DeprecatedRewriteFallbackTemplate is the renamed
+	// `rewrite_fallback_template` key, kept only to migrate existing configs:
+	// on Load it seeds RewriteActionFallbackTemplate when that is unset, then
+	// it is cleared — omitempty makes the next Save drop the old key.
+	DeprecatedRewriteFallbackTemplate string `toml:"rewrite_fallback_template,omitempty"`
 	// GenerateTaskCommand is the argv template for the one-shot task
 	// suggestion an idle agent gets when it has NO task source (no declared
 	// [[task_sources]] and nothing inferable from the pane) — or when a
@@ -224,13 +223,19 @@ type TaskSource struct {
 	// complete), {task_list_path}, {agent_name} (the agent's short name), and
 	// {cwd} (the agent's working directory). Empty uses the built-in default.
 	NextTaskTemplate string `toml:"next_task_template,omitempty"`
-	// LLMReview gates the pre-send LLM review of this source's determined
-	// tasks. When an [llm].command is configured, a determined task is first
-	// reviewed by the LLM (via the get_context/submit_decision MCP tools),
-	// which decides whether to send it now given the live pane; a decline is
-	// escalated to the operator. nil (unset) defaults to on; set
-	// llm_review=false to opt out and keep the plain declared-task flow.
-	LLMReview *bool `toml:"llm_review,omitempty"`
+	// EnableLLMReview gates the pre-send LLM review of this source's
+	// determined tasks. When an [llm].command is configured, a determined
+	// task is first reviewed by the LLM (via the get_context/submit_decision
+	// MCP tools), which decides whether to send it now given the live pane; a
+	// decline is escalated to the operator. nil (unset) defaults to on; set
+	// enable_llm_review=false to opt out and keep the plain declared-task
+	// flow.
+	EnableLLMReview *bool `toml:"enable_llm_review,omitempty"`
+	// DeprecatedLLMReview is the renamed `llm_review` key, kept only to
+	// migrate existing configs: on Load it seeds EnableLLMReview when that is
+	// unset, then it is cleared so the next Save rewrites the file under the
+	// new key.
+	DeprecatedLLMReview *bool `toml:"llm_review,omitempty"`
 	// MaxTasks caps how many checklist items (done, in-progress, and pending
 	// alike) this source may hold before LLM task generation stops refilling
 	// it: once the file has more than MaxTasks items and its pending items are
@@ -352,9 +357,6 @@ func Default() Config {
 			MaxAutoPromptsPerMinute:   5,
 			MaxErrorRetries:           2,
 		},
-		// RewriteTimeoutSeconds stays zero here: Load seeds from Default
-		// before unmarshalling, and a non-zero seed would mask "omitted →
-		// inherit timeout_seconds" in fillZeroes.
 		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 999},
 		Embedding: Embedding{
 			SimilarityThreshold: 0.90,
@@ -610,6 +612,57 @@ func Load(path string) (Config, error) {
 		}
 		cfg.LLM.DeprecatedAutoAct = nil
 	}
+	// The dedicated rewrite CLI was removed: rewriting is now a consult-LLM
+	// review opted into with `llm.enable_rewrite_action`. Detect the removed
+	// keys only to make the change visible; Save omits them because LLM has
+	// no corresponding fields. Deliberately NOT auto-enabled.
+	var rewriteProbe struct {
+		LLM struct {
+			Command        *[]string `toml:"rewrite_command"`
+			CommandStart   *[]string `toml:"rewrite_command_start"`
+			TimeoutSeconds *int      `toml:"rewrite_timeout_seconds"`
+		} `toml:"llm"`
+	}
+	_ = toml.Unmarshal(data, &rewriteProbe)
+	if rewriteProbe.LLM.Command != nil || rewriteProbe.LLM.CommandStart != nil ||
+		rewriteProbe.LLM.TimeoutSeconds != nil {
+		slog.Warn("config keys `llm.rewrite_command`, `llm.rewrite_command_start`, and `llm.rewrite_timeout_seconds` are no longer supported and are ignored; set `llm.enable_rewrite_action = true` to have the consult LLM (`llm.command`) rewrite outbound text instead",
+			"path", path)
+	}
+	// Renamed `rewrite_fallback_template` → `rewrite_action_fallback_template`:
+	// migrate only when the new key is unset (a set new key always wins — an
+	// empty canonical value is indistinguishable from absent, and empty means
+	// the built-in passthrough anyway). Clearing the deprecated field makes
+	// the next Save drop the old key.
+	if cfg.LLM.DeprecatedRewriteFallbackTemplate != "" {
+		if cfg.LLM.RewriteActionFallbackTemplate == "" {
+			cfg.LLM.RewriteActionFallbackTemplate = cfg.LLM.DeprecatedRewriteFallbackTemplate
+			slog.Warn("config key `llm.rewrite_fallback_template` is deprecated; use `llm.rewrite_action_fallback_template`",
+				"path", path)
+		} else {
+			slog.Warn("deprecated config key `llm.rewrite_fallback_template` ignored because `llm.rewrite_action_fallback_template` is also set",
+				"path", path)
+		}
+		cfg.LLM.DeprecatedRewriteFallbackTemplate = ""
+	}
+	// Renamed task-source `llm_review` → `enable_llm_review`, migrated per
+	// element (the key lives on [[task_sources]] entries). A set new key wins;
+	// clearing the deprecated pointer makes the next Save drop the old key.
+	for i := range cfg.TaskSources {
+		src := &cfg.TaskSources[i]
+		if src.DeprecatedLLMReview == nil {
+			continue
+		}
+		if src.EnableLLMReview == nil {
+			src.EnableLLMReview = src.DeprecatedLLMReview
+			slog.Warn("task_sources key `llm_review` is deprecated; use `enable_llm_review`",
+				"path", path, "source", src.Path)
+		} else {
+			slog.Warn("deprecated task_sources key `llm_review` ignored because `enable_llm_review` is also set",
+				"path", path, "source", src.Path)
+		}
+		src.DeprecatedLLMReview = nil
+	}
 	cfg.fillZeroes()
 	return cfg, nil
 }
@@ -667,9 +720,6 @@ func (c *Config) fillZeroes() {
 	if c.LLM.AutoActConfidenceThreshold < 0 {
 		c.LLM.AutoActConfidenceThreshold = d.LLM.AutoActConfidenceThreshold
 	}
-	// RewriteTimeoutSeconds is deliberately NOT filled: it inherits its
-	// sibling timeout_seconds dynamically (RewriteTimeout), and a Save
-	// after filling would freeze the inherited value into config.toml.
 	if c.Embedding.SimilarityThreshold <= 0 || c.Embedding.SimilarityThreshold >= 1 {
 		c.Embedding.SimilarityThreshold = d.Embedding.SimilarityThreshold
 	}
@@ -684,15 +734,6 @@ func (c *Config) fillZeroes() {
 // LLMTimeout returns the configured LLM timeout as a duration.
 func (c Config) LLMTimeout() time.Duration {
 	return time.Duration(c.LLM.TimeoutSeconds) * time.Second
-}
-
-// RewriteTimeout returns the rewrite timeout: rewrite_timeout_seconds, or —
-// when zero/omitted — the consult timeout_seconds.
-func (c Config) RewriteTimeout() time.Duration {
-	if c.LLM.RewriteTimeoutSeconds <= 0 {
-		return c.LLMTimeout()
-	}
-	return time.Duration(c.LLM.RewriteTimeoutSeconds) * time.Second
 }
 
 // GenerateTaskTimeout returns the task-generation timeout:

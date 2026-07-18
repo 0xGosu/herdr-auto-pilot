@@ -40,8 +40,8 @@ max_error_retries = 2              # per error signature
 # ── Operator LLM (consulted on unknown situations) ──────────────────
 # Omit this whole section to escalate unknown situations directly to you.
 # Two recipes are shown below — Claude Code is active; the OpenAI Codex
-# equivalent is commented out. Enable ONE `command` / `rewrite_command`
-# pair (comment the Claude keys and uncomment the Codex ones to switch).
+# equivalent is commented out. Enable ONE `command` (comment the Claude
+# keys and uncomment the Codex ones to switch).
 [llm]
 # ── Claude Code recipe (active) ──
 # {self} = the hap binary, {request_id} is filled per consult, {agent_name}
@@ -91,36 +91,22 @@ timeout_seconds = 120              # codex is slower to start; 180 is a safer va
 auto_act_confidence_threshold = 999  # auto-act only when the LLM confidence (0-100) is >= this; 999 = never (surface for confirmation)
 pane_excerpt_chars = 5000          # pane context included in the consult
 
-# ── Rewrite recipe — Claude Code (active) ──
-# A one-shot text transform, no MCP round-trip: the CLI runs once and its
-# stdout is the rewritten text.
-rewrite_command = [
-  "claude", "--model", "haiku", "-p",
-  "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text — or @rewrite:nochange if the instruction is already right as-is, or @noop if nothing should be sent at all.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
-]
-
-# ── First-rewrite variant (optional) ──
-# rewrite_command_start runs INSTEAD of rewrite_command on an agent's first
-# rewrite this daemon lifetime (same first-interaction boundary as
-# command_start, tracked independently). Same placeholders as
-# rewrite_command. Omit or leave empty to reuse rewrite_command.
-# A sub-one-second error exit is retried once with the other rewrite template.
-# rewrite_command_start = [
-#   "claude", "--model", "haiku", "-p",
-#   "First rewrite for this agent. Rewrite this instruction given its screen. Reply with ONLY the rewritten text — or @rewrite:nochange if the instruction is already right as-is, or @noop if nothing should be sent at all.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
-# ]
-
-# ── Rewrite recipe — OpenAI Codex (commented; swap in to use codex) ──
-# rewrite_command = [
-#   "codex", "--model", "gpt-5.6-luna", "exec", "--skip-git-repo-check",
-#   "Rewrite this instruction for the coding agent given its current screen. Reply with ONLY the rewritten text — or @rewrite:nochange if the instruction is already right as-is, or @noop if nothing should be sent at all.\n\nInstruction: {text}\n\nScreen:\n{pane_excerpt}",
-# ]
-
-rewrite_timeout_seconds = 60       # omitted: inherits timeout_seconds
-# On rewrite failure/timeout/empty output the ORIGINAL text is sent as-is.
-# Set rewrite_fallback_template only to wrap it instead (placeholders:
+# ── Outbound action review (optional) ──
+# When a LEARNED rule resolves to free text (an idle next-task prompt, an
+# error retry command, a free-text approval reply — never menu digits, and
+# never a declared task from [[task_sources]], whose enable_llm_review gate
+# owns that), the consult LLM above can review/adapt it to the live pane
+# before delivery. The consult's get_context carries proposed_action; the
+# LLM replies with the adapted text, "@proposed_action:send" to send the
+# original unchanged, or "@noop" to send nothing. The review is advisory
+# and NEVER blocks the send: on failure, timeout, or indecision the
+# original text is delivered (auto_act_confidence_threshold does not apply
+# here). Requires `command`; each reviewed send spends one consult.
+# enable_rewrite_action = true
+# On review failure the ORIGINAL text is sent as-is. Set
+# rewrite_action_fallback_template only to wrap it instead (placeholders:
 # {original_text}, {agent_name}).
-# rewrite_fallback_template = "You must act based on the following: {original_text}"
+# rewrite_action_fallback_template = "You must act based on the following: {original_text}"
 
 # ── Idle task suggestion (optional) ──
 # When an agent goes idle with NO task source (no [[task_sources]] matches it
@@ -230,7 +216,7 @@ terminal_bell = true       # ring the terminal bell (\a) on new escalations and 
 # a low-confidence one is surfaced for you to confirm (showing the LLM's
 # recommendation and the original task). Default: on. Opt a source out to keep
 # the plain declared-task flow:
-# llm_review = false
+# enable_llm_review = false
 # Cap how many checklist items (done, in-progress, and pending) this source may
 # hold before LLM task generation stops refilling it: once the file has MORE
 # than max_tasks items and its pending items are exhausted, the daemon logs a

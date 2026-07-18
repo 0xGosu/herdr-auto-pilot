@@ -104,7 +104,7 @@ func toolDefinitions() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        "get_context",
-			"description": "Get the situation context for the pending Herd Auto Prompter decision request: situation type, agent type, options, permission verb, error summary, a pane excerpt (last N chars of the pane), the agent's herdr location (workspace_id, tab_id, pane_id, agent_id — usable with read-only herdr CLI queries such as `herdr pane get <pane_id>` or `herdr pane read <pane_id>`), the agent's native session id (agent_session_id — the agent CLI's own session identifier, e.g. a Claude/Codex session UUID; empty when herdr has no stored session reference), the agent's friendly short name (agent_name), and the pane's working directory (cwd/foreground_cwd; advisory — a deleted dir carries a ' (deleted)' suffix and either may be empty). Whenever the agent has a matching [[task_sources]] entry, the context also carries task_list_path (the checklist file), pending_task_count (how many items are still unchecked \"[ ]\") with next_pending_task (a truncated preview of the first, only when pending_task_count > 0), and in_progress_task_count (how many items are marked \"[-]\" — this may be the task the agent is currently working on) with first_in_progress_task (a truncated preview of the first, only when in_progress_task_count > 0). For a pre-send task review specifically, the context additionally carries proposed_task (the exact instruction that would be sent for the queued task), current_task (that task's full text), and pending_tasks (every remaining task in order) — decide whether to send it now, or pick a different pending task if current_task is already done (see submit_decision). answer_format, when present, states which submit_decision field the current situation expects.",
+			"description": "Get the situation context for the pending Herd Auto Prompter decision request: situation type, agent type, options, permission verb, error summary, a pane excerpt (last N chars of the pane), the agent's herdr location (workspace_id, tab_id, pane_id, agent_id — usable with read-only herdr CLI queries such as `herdr pane get <pane_id>` or `herdr pane read <pane_id>`), the agent's native session id (agent_session_id — the agent CLI's own session identifier, e.g. a Claude/Codex session UUID; empty when herdr has no stored session reference), the agent's friendly short name (agent_name), and the pane's working directory (cwd/foreground_cwd; advisory — a deleted dir carries a ' (deleted)' suffix and either may be empty). Whenever the agent has a matching [[task_sources]] entry, the context also carries task_list_path (the checklist file), pending_task_count (how many items are still unchecked \"[ ]\") with next_pending_task (a truncated preview of the first, only when pending_task_count > 0), and in_progress_task_count (how many items are marked \"[-]\" — this may be the task the agent is currently working on) with first_in_progress_task (a truncated preview of the first, only when in_progress_task_count > 0). For a pre-send task review specifically, the context additionally carries proposed_task (the exact instruction that would be sent for the queued task), current_task (that task's full text), and pending_tasks (every remaining task in order) — decide whether to send it now, or pick a different pending task if current_task is already done (see submit_decision). For a pre-delivery action review, the context instead carries proposed_action — the exact learned reply the daemon is about to type into the pane — to adapt, affirm, or veto (see submit_decision). answer_format, when present, states which submit_decision field the current situation expects.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -114,7 +114,7 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "submit_decision",
-			"description": "Submit your decision for the pending request. Which field to use depends on the situation_type in get_context: \"approval\" and \"choice\" listing options (or a multi-tab form) MUST be answered with select_options — the 1-based option number(s) shown in the context (single menu: exactly one integer, e.g. [2]; multi-tab question form: one entry per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1] — and for a MULTI-SELECT tab, whose options show `[ ]` checkboxes, pass an array of the numbers to toggle, e.g. [1, [1, 3], 2]) — while an approval/choice with NO options listed (e.g. a bare y/n prompt) takes recommend_action with the literal text the prompt expects; \"idle\" and \"error\" MUST be answered with recommend_action — the literal reply text (next prompt/task for idle, recovery command/reply for error), and select_options is rejected. In ANY situation, if the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit recommend_action \"@noop\" to explicitly do nothing. When get_context carries a proposed_task (a pre-send task review of an idle agent), decide from the pane whether to send that queued task now: to send it unchanged submit recommend_action \"@next_task:declared\" (the daemon sends proposed_task verbatim — no need to copy it); put literal text in recommend_action only to edit the task or, if current_task is already done, to send the next unfinished item from pending_tasks; or submit \"@noop\" with a rationale to decline (e.g. every task is done). Your confident_score gates this exactly like any other decision — a confident review is applied automatically (the task is sent, or skipped on a decline) and a low-confidence one is surfaced to the operator. ALWAYS include confident_score: the daemon auto-acts only when your confidence meets the operator's threshold, otherwise it asks the operator to confirm — so a missing or low score means your decision is surfaced for human review, not acted on. The daemon re-gates every submission through this confidence gate and the never-auto patterns before acting.",
+			"description": "Submit your decision for the pending request. Which field to use depends on the situation_type in get_context: \"approval\" and \"choice\" listing options (or a multi-tab form) MUST be answered with select_options — the 1-based option number(s) shown in the context (single menu: exactly one integer, e.g. [2]; multi-tab question form: one entry per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1] — and for a MULTI-SELECT tab, whose options show `[ ]` checkboxes, pass an array of the numbers to toggle, e.g. [1, [1, 3], 2]) — while an approval/choice with NO options listed (e.g. a bare y/n prompt) takes recommend_action with the literal text the prompt expects; \"idle\" and \"error\" MUST be answered with recommend_action — the literal reply text (next prompt/task for idle, recovery command/reply for error), and select_options is rejected. In ANY situation, if the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit recommend_action \"@noop\" to explicitly do nothing. When get_context carries a proposed_task (a pre-send task review of an idle agent), decide from the pane whether to send that queued task now: to send it unchanged submit recommend_action \"@next_task:declared\" (the daemon sends proposed_task verbatim — no need to copy it); put literal text in recommend_action only to edit the task or, if current_task is already done, to send the next unfinished item from pending_tasks; or submit \"@noop\" with a rationale to decline (e.g. every task is done). Your confident_score gates this exactly like any other decision — a confident review is applied automatically (the task is sent, or skipped on a decline) and a low-confidence one is surfaced to the operator. When get_context carries a proposed_action (a pre-delivery review of a learned reply), submit recommend_action with the adapted text to replace it, \"@proposed_action:send\" to send it unchanged, or \"@noop\" with a rationale to send nothing; this review is advisory — on any failure or indecision the daemon sends the original text unchanged. ALWAYS include confident_score: the daemon auto-acts only when your confidence meets the operator's threshold, otherwise it asks the operator to confirm — so a missing or low score means your decision is surfaced for human review, not acted on. The daemon re-gates every submission through this confidence gate and the never-auto patterns before acting.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -184,6 +184,11 @@ type consultContextFields struct {
 	AnswerCount   int      `json:"answer_count"`
 	QuestionCount int      `json:"question_count"`
 	TabCount      int      `json:"tab_count"`
+	// ProposedAction marks a pre-delivery action review: the answer contract
+	// is recommend_action (adapted text / affirm sentinel / @noop), so the
+	// per-situation menu validation does not apply even when the reviewed
+	// situation carries parsed options.
+	ProposedAction string `json:"proposed_action"`
 	// TabSelectKinds is per-tab "single"/"multi" (present only when a form has
 	// a multi-select tab). Only a "multi" tab may receive several option
 	// numbers (an array); a scalar/single-select tab or the Submit tab takes
@@ -321,22 +326,36 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error)
 		if action != domain.ActionNoop {
 			var cc consultContextFields
 			_ = json.Unmarshal([]byte(req.ContextJSON), &cc)
-			hasMenu := len(cc.Options) > 0 || cc.effectiveAnswerCount() > 1
-			switch req.SituationType {
-			case domain.SituationApproval, domain.SituationChoice:
-				if hasMenu && len(selects) == 0 {
-					return nil, fmt.Errorf("%s situations with a numbered menu must be answered with select_options — the 1-based option number(s) from the context — or recommend_action \"@noop\" to do nothing", req.SituationType)
-				}
-			case domain.SituationIdle, domain.SituationError:
+			// An action review's contract is recommend_action regardless of
+			// the situation shape: the reviewed reply is free text a learned
+			// rule already resolved (it reached the review precisely because
+			// it did NOT map onto a menu), so the menu rules below would
+			// reject the very answers answer_format asks for.
+			if cc.ProposedAction != "" {
 				if len(selects) > 0 {
-					return nil, fmt.Errorf("%s situations take literal reply text via recommend_action, not select_options", req.SituationType)
+					return nil, fmt.Errorf("an action review takes recommend_action (the adapted text, %q to send the original unchanged, or \"@noop\"), not select_options", domain.ActionSendProposedAction)
 				}
 				if action == "" {
-					return nil, fmt.Errorf("%s situations require recommend_action (the literal reply text), or \"@noop\" to do nothing", req.SituationType)
+					return nil, fmt.Errorf("an action review requires recommend_action: the adapted text, %q to send the original unchanged, or \"@noop\" to send nothing", domain.ActionSendProposedAction)
 				}
-			}
-			if action == "" && len(selects) == 0 {
-				return nil, fmt.Errorf("recommend_action or select_options is required")
+			} else {
+				hasMenu := len(cc.Options) > 0 || cc.effectiveAnswerCount() > 1
+				switch req.SituationType {
+				case domain.SituationApproval, domain.SituationChoice:
+					if hasMenu && len(selects) == 0 {
+						return nil, fmt.Errorf("%s situations with a numbered menu must be answered with select_options — the 1-based option number(s) from the context — or recommend_action \"@noop\" to do nothing", req.SituationType)
+					}
+				case domain.SituationIdle, domain.SituationError:
+					if len(selects) > 0 {
+						return nil, fmt.Errorf("%s situations take literal reply text via recommend_action, not select_options", req.SituationType)
+					}
+					if action == "" {
+						return nil, fmt.Errorf("%s situations require recommend_action (the literal reply text), or \"@noop\" to do nothing", req.SituationType)
+					}
+				}
+				if action == "" && len(selects) == 0 {
+					return nil, fmt.Errorf("recommend_action or select_options is required")
+				}
 			}
 		}
 		if len(selects) > 0 {

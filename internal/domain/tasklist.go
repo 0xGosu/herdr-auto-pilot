@@ -57,7 +57,7 @@ type DeclaredTask struct {
 	AgentName string // agent short name, for {agent_name}
 	Cwd       string // agent working directory, for {cwd}
 	// LLMReview reports whether the source opted in to the pre-send LLM review
-	// gate (default: on; a source sets llm_review=false to opt out). The
+	// gate (default: on; a source sets enable_llm_review=false to opt out). The
 	// runtime "is an LLM command configured" check stays at the daemon call
 	// site — this flag carries only the source's declared preference.
 	LLMReview bool

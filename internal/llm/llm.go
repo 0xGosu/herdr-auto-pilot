@@ -22,7 +22,7 @@ import (
 
 // fastFailWindow bounds how quickly a CLI run must error out to count as a
 // "fast fail" that triggers a one-shot retry with the alternate template
-// (command ↔ command_start / rewrite_command ↔ rewrite_command_start). It is
+// (command ↔ command_start). It is
 // spawn-to-exit wall time, so it must comfortably exceed a healthy CLI's
 // startup cost yet stay short enough that an argument-rejection (e.g. claude's
 // `--resume <non-uuid>`) lands inside it. The clock covers the whole run, not
@@ -43,15 +43,6 @@ type Adapter struct {
 	Store                ports.ReadStore
 	// SelfPath overrides the {self} placeholder (defaults to os.Executable).
 	SelfPath string
-	// RewriteTemplate is the argv template for the one-shot outbound-text
-	// rewrite (llm.rewrite_command); placeholders {text}, {situation_type},
-	// {agent_type}, {agent_name}, {pane_excerpt}. Empty disables rewriting.
-	RewriteTemplate []string
-	// RewriteStartTemplate is used instead of RewriteTemplate on an agent's
-	// first rewrite (req.First); empty falls back to RewriteTemplate.
-	RewriteStartTemplate []string
-	// RewriteTimeout bounds one rewrite run (<=0 falls back to Timeout).
-	RewriteTimeout time.Duration
 	// TaskGenTemplate is the argv template for the one-shot idle task
 	// suggestion (llm.task_generate_command); placeholders {self},
 	// {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. Empty disables it.
