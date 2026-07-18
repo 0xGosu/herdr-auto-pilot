@@ -1416,7 +1416,9 @@ func (s *Store) SyncAgentTerminalID(ctx context.Context, agentID, terminalID str
 	if terminalID == "" {
 		return false, nil
 	}
-	reset := false
+	// Set inside the tx but only trusted after it commits, so a commit
+	// failure cannot report a reset that never became durable.
+	wantReset := false
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var stored string
 		err := tx.QueryRowContext(ctx,
@@ -1442,12 +1444,15 @@ func (s *Store) SyncAgentTerminalID(ctx context.Context, agentID, terminalID str
 				`UPDATE agent_names SET terminal_id = ?, created_at = ? WHERE agent_id = ?`,
 				terminalID, time.Now().UnixMilli(), agentID)
 			if err == nil {
-				reset = true
+				wantReset = true
 			}
 			return err
 		}
 	})
-	return reset, err
+	if err != nil {
+		return false, err
+	}
+	return wantReset, nil
 }
 
 func (s *Store) agentNameByID(ctx context.Context, agentID string) (string, error) {

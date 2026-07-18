@@ -811,6 +811,8 @@ func TestAgentStats(t *testing.T) {
 	if _, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_old"); err != nil {
 		t.Fatal(err)
 	}
+	// created_at is unix-milli; make the reset distinguishable from base.
+	time.Sleep(15 * time.Millisecond)
 	reset, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_new")
 	if err != nil || !reset {
 		t.Fatalf("recycled terminal id must reset: reset=%v err=%v", reset, err)
