@@ -27,7 +27,6 @@ func TestPaneExcerptStripsCodexComposer(t *testing.T) {
 	t.Cleanup(func() { raw.Close() })
 
 	fh := &fakeHerdr{}
-	fh.setPane("─ Worked for 10m 49s ─────\n\n› Summarize recent commits\n\n  gpt-5.6-sol high · /workspaces/herdr-auto-pilot\n")
 	d, err := New(Options{ConfigPath: cfgPath, Store: raw, Herdr: fh, LLM: &fakeLLM{}})
 	if err != nil {
 		t.Fatal(err)
@@ -36,18 +35,30 @@ func TestPaneExcerptStripsCodexComposer(t *testing.T) {
 	ctx := context.Background()
 	cfg, _, _ := d.snapshot()
 
-	codexSituation := domain.Situation{AgentType: "codex", PaneID: "pane-1", Content: "stale snapshot"}
-	excerpt := d.paneExcerpt(ctx, cfg, codexSituation)
-	if strings.Contains(excerpt, "›") {
-		t.Errorf("codex pane excerpt must have composer line stripped, got %q", excerpt)
+	panes := map[string]string{
+		"absolute cwd": "─ Worked for 10m 49s ─────\n\n› Summarize recent commits\n\n  gpt-5.6-sol high · /workspaces/herdr-auto-pilot\n",
+		// Issue #160: cwds under $HOME render ~-relative in the footer; the
+		// strip must fire for those sessions too.
+		"tilde cwd": "─ Worked for 10m 49s ─────\n\n› Use /skills to list available skills\n\n  gpt-5.6-sol high · ~/hap-codex-test\n",
 	}
-	if !strings.Contains(excerpt, "gpt-5.6-sol high") {
-		t.Errorf("footer must survive in codex excerpt, got %q", excerpt)
-	}
+	for name, pane := range panes {
+		t.Run(name, func(t *testing.T) {
+			fh.setPane(pane)
 
-	claudeSituation := domain.Situation{AgentType: "claude", PaneID: "pane-1", Content: "stale snapshot"}
-	claudeExcerpt := d.paneExcerpt(ctx, cfg, claudeSituation)
-	if !strings.Contains(claudeExcerpt, "› Summarize recent commits") {
-		t.Errorf("claude pane excerpt must be untouched, got %q", claudeExcerpt)
+			codexSituation := domain.Situation{AgentType: "codex", PaneID: "pane-1", Content: "stale snapshot"}
+			excerpt := d.paneExcerpt(ctx, cfg, codexSituation)
+			if strings.Contains(excerpt, "›") {
+				t.Errorf("codex pane excerpt must have composer line stripped, got %q", excerpt)
+			}
+			if !strings.Contains(excerpt, "gpt-5.6-sol high") {
+				t.Errorf("footer must survive in codex excerpt, got %q", excerpt)
+			}
+
+			claudeSituation := domain.Situation{AgentType: "claude", PaneID: "pane-1", Content: "stale snapshot"}
+			claudeExcerpt := d.paneExcerpt(ctx, cfg, claudeSituation)
+			if !strings.Contains(claudeExcerpt, "›") {
+				t.Errorf("claude pane excerpt must be untouched, got %q", claudeExcerpt)
+			}
+		})
 	}
 }

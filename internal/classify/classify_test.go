@@ -567,22 +567,30 @@ func TestApprovalFixturesStillApproval(t *testing.T) {
 // codex's Content has the "› ..." line gone and keeps the footer.
 func TestCodexComposerStrippedOnlyForCodex(t *testing.T) {
 	c := New(nil)
-	pane := "─ Worked for 10m 49s ─────\n\n› Summarize recent commits\n\n  gpt-5.6-sol high · /workspaces/herdr-auto-pilot\n"
-
-	codex := c.Classify("codex", "idle", pane)
-	if strings.Contains(codex.Content, "›") {
-		t.Errorf("codex situation content must have composer line stripped, got %q", codex.Content)
+	panes := map[string]string{
+		"absolute cwd": "─ Worked for 10m 49s ─────\n\n› Summarize recent commits\n\n  gpt-5.6-sol high · /workspaces/herdr-auto-pilot\n",
+		// Issue #160: cwds under $HOME render ~-relative in the footer; the
+		// strip must fire for those sessions too.
+		"tilde cwd": "─ Worked for 10m 49s ─────\n\n› Use /skills to list available skills\n\n  gpt-5.6-sol high · ~/hap-codex-test\n",
 	}
-	if !strings.Contains(codex.Content, "gpt-5.6-sol high") {
-		t.Errorf("codex situation content must keep the footer, got %q", codex.Content)
-	}
+	for name, pane := range panes {
+		t.Run(name, func(t *testing.T) {
+			codex := c.Classify("codex", "idle", pane)
+			if strings.Contains(codex.Content, "›") {
+				t.Errorf("codex situation content must have composer line stripped, got %q", codex.Content)
+			}
+			if !strings.Contains(codex.Content, "gpt-5.6-sol high") {
+				t.Errorf("codex situation content must keep the footer, got %q", codex.Content)
+			}
 
-	claude := c.Classify("claude", "idle", pane)
-	if claude.Content != pane {
-		t.Errorf("claude situation content must be untouched, got %q, want %q", claude.Content, pane)
-	}
+			claude := c.Classify("claude", "idle", pane)
+			if claude.Content != pane {
+				t.Errorf("claude situation content must be untouched, got %q, want %q", claude.Content, pane)
+			}
 
-	if codex.Content == claude.Content {
-		t.Error("expected codex and claude content to differ after gating")
+			if codex.Content == claude.Content {
+				t.Error("expected codex and claude content to differ after gating")
+			}
+		})
 	}
 }

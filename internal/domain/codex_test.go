@@ -160,6 +160,37 @@ func TestStripCodexComposer(t *testing.T) {
 			"some output\n\n  gpt-5.6-sol high · /tmp\n",
 		},
 		{
+			// Live-observed (issue #160): codex renders a cwd under $HOME as a
+			// ~-relative path in the footer. The strip must fire for those
+			// sessions too, not only absolute "/" paths.
+			"tilde-cwd footer: placeholder stripped, footer kept",
+			"some output\n\n› Use /skills to list available skills\n\n  gpt-5.6-sol high · ~/hap-codex-test\n",
+			"some output\n\n\n  gpt-5.6-sol high · ~/hap-codex-test\n",
+		},
+		{
+			"tilde-cwd footer with no composer line is a no-op",
+			"some output\n\n  gpt-5.6-sol high · ~/hap-codex-test\n",
+			"some output\n\n  gpt-5.6-sol high · ~/hap-codex-test\n",
+		},
+		{
+			// A "·"-separated trailer whose path starts with neither "/" nor
+			// "~" is not the footer shape — the line above it is real content.
+			"non-path trailer after · does not strip the line above",
+			"› is this a composer?\n\n  gpt-5.6-sol high · unknown\n",
+			"› is this a composer?\n\n  gpt-5.6-sol high · unknown\n",
+		},
+		{
+			// Pins the documented residual, accepted risk widened by accepting
+			// "~" (issue #160; see codexComposerBeforeFooterRE's comment): a
+			// response ending the capture with an approximation-tilde trailer
+			// (" · ~2s") is confusable with the footer, so the real submitted
+			// "›" message above it strips. Structurally bounded (needs a "›"
+			// line directly above, at the true tail) and accepted, not chased.
+			"known limitation: trailing approximation-tilde response strips the message above",
+			"› how long did the build take?\n\nbuild finished · ~2s\n",
+			"\nbuild finished · ~2s\n",
+		},
+		{
 			"leading whitespace before glyph stripped",
 			"some output\n\n  › draft text\n\n  gpt-5.6-sol high · /tmp\n",
 			"some output\n\n\n  gpt-5.6-sol high · /tmp\n",
