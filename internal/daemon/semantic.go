@@ -113,7 +113,8 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 			slog.Warn("embed failed; trying text match", "error", err)
 		default:
 			vec = v
-			hit, ok, err := d.matcher.MatchVector(ctx, vec, scope)
+			accept := func(h match.Hit) bool { return remapAllowed(s, sig, h) }
+			hit, ok, err := d.matcher.MatchVector(ctx, vec, scope, accept)
 			if err != nil {
 				slog.Warn("vector match failed; trying text match", "error", err)
 			} else if ok && hit.Score >= cfg.Embedding.SimilarityThreshold {
@@ -128,7 +129,8 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 	}
 
 	if vec == nil { // no embedding this round: BM25 text fallback
-		hit, ok, err := d.matcher.MatchText(ctx, sig.Salient, scope)
+		accept := func(h match.Hit) bool { return remapAllowed(s, sig, h) }
+		hit, ok, err := d.matcher.MatchText(ctx, sig.Salient, scope, accept)
 		if err != nil {
 			slog.Warn("text match failed; using hash key", "error", err)
 			return sig
@@ -164,6 +166,27 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 		slog.Warn("indexing signature embedding failed", "signature", sig.Raw, "error", err)
 	}
 	return sig
+}
+
+// remapAllowed is resolveSignature's accept filter for match candidates.
+// Approvals require compatible option sets between the fresh salient and the
+// candidate's stored salient (domain.ApprovalRemapCompatible) — issue #155:
+// similarity score alone can bridge two very different approval screens that
+// share a verb, e.g. a plan approval and a Bash approval both phrased "…to
+// proceed?". The matcher skips vetoed candidates (up to its top-K) and, when
+// none is acceptable, resolveSignature mints a fresh key and persists the
+// new identity, so the situation escalates rather than inheriting another
+// screen's learned rule. Other situation types pass.
+func remapAllowed(s domain.Situation, sig domain.SignatureResult, hit match.Hit) bool {
+	if s.Type != domain.SituationApproval {
+		return true
+	}
+	if !domain.ApprovalRemapCompatible(sig.Salient, hit.Salient) {
+		slog.Info("approval remap vetoed: option sets incompatible",
+			"candidate", hit.Signature, "raw", sig.Raw)
+		return false
+	}
+	return true
 }
 
 // embedderPort returns the current embedder (rebuilt on reload when the

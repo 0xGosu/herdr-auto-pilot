@@ -27,6 +27,14 @@ var (
 	remoteEnvCheckSuffixRE = regexp.MustCompile(`\s*✔\s*$`)
 )
 
+// PermissionVerbSelectRemoteEnv is the fixed permission verb assigned to the
+// remote-environment picker. Its environment labels vary per launch and are
+// the learned ACTION, not the key, so signature generation keeps this
+// approval's salient verb-only (no option folding): equivalent pickers share
+// one signature and delivery re-maps the learned label onto the live option
+// set, failing closed when it is absent.
+const PermissionVerbSelectRemoteEnv = "select remote environment"
+
 // RemoteEnvForm is the parsed live state of Claude Code's "Select remote
 // environment" picker.
 type RemoteEnvForm struct {

@@ -241,6 +241,25 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate column: %w", err)
 		}
 	}
+	// Issue #155: pre-fix approval salients carried only the permission verb,
+	// so very different approval screens shared one embedding row. Post-fix
+	// salients always carry a "| options:" segment. The old verb-only rows
+	// must go: left in place, a new salient could cosine/BM25-match one and
+	// remap onto the old over-broad signature, re-bridging the collision the
+	// format change closed. Learned rules and audit rows are kept — their old
+	// keys simply become unreachable. The remote-env picker's salient is
+	// verb-only by design and stays. Idempotent: matches zero rows once the
+	// old-format rows are gone.
+	if _, err := s.db.Exec(
+		`DELETE FROM signature_embeddings
+		  WHERE situation_type = ?
+		    AND salient LIKE 'permission:%'
+		    AND salient NOT LIKE '%| options:%'
+		    AND salient <> 'permission:' || ?`,
+		string(domain.SituationApproval), domain.PermissionVerbSelectRemoteEnv,
+	); err != nil {
+		return fmt.Errorf("migrate prune verb-only approval embeddings: %w", err)
+	}
 	return nil
 }
 
