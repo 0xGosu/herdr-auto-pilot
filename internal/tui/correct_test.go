@@ -18,6 +18,7 @@ import (
 type fakeHerdrTUI struct {
 	inputs []string
 	pane   string
+	agents []domain.AgentTransition // returned by ListAgents (live statuses)
 }
 
 func (f *fakeHerdrTUI) Send(_ context.Context, _, input string) error {
@@ -26,7 +27,7 @@ func (f *fakeHerdrTUI) Send(_ context.Context, _, input string) error {
 }
 func (f *fakeHerdrTUI) ReadPane(context.Context, string, int) (string, error) { return f.pane, nil }
 func (f *fakeHerdrTUI) ListAgents(context.Context) ([]domain.AgentTransition, error) {
-	return nil, nil
+	return f.agents, nil
 }
 
 func correctTestModel(t *testing.T) (Model, *store.Store, *fakeHerdrTUI) {
