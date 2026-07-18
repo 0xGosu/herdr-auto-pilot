@@ -23,6 +23,8 @@ func TestGoldenTranscripts(t *testing.T) {
 		"codex_idle.txt":                 "idle",
 		"approval_codex_plan.txt":        "idle",
 		"error_codex_rate_limit.txt":     "idle",
+		"error_codex_usage_limit.txt":    "idle",
+		"error_codex_banner.txt":         "idle",
 		"approval_claude_remote_env.txt": "idle",
 	}
 	agentTypeFor := map[string]string{
@@ -31,6 +33,8 @@ func TestGoldenTranscripts(t *testing.T) {
 		"choice_codex_mcq.txt":        "codex",
 		"error_codex_interrupted.txt": "codex",
 		"error_codex_rate_limit.txt":  "codex",
+		"error_codex_usage_limit.txt": "codex",
+		"error_codex_banner.txt":      "codex",
 	}
 
 	entries, err := os.ReadDir("testdata/transcripts")
@@ -376,18 +380,60 @@ func TestClaudeErrorSituations(t *testing.T) {
 
 func TestCodexErrorSituations(t *testing.T) {
 	c := New(nil)
-	for _, name := range []string{"error_codex_interrupted.txt", "error_codex_rate_limit.txt"} {
-		data, err := os.ReadFile(filepath.Join("testdata", "transcripts", name))
+	cases := []struct {
+		name string
+		// The usage-limit fixture's "You've hit your usage limit" phrasing is
+		// shared with Claude's own limit stop (claudeLimitRE), so it genuinely
+		// classifies error on both agent types; every other codex form is
+		// codex-scoped and must NOT classify error on claude.
+		claudeAlsoErrors bool
+	}{
+		{"error_codex_interrupted.txt", false},
+		{"error_codex_rate_limit.txt", false},
+		{"error_codex_usage_limit.txt", true},
+		{"error_codex_banner.txt", false},
+	}
+	for _, tc := range cases {
+		data, err := os.ReadFile(filepath.Join("testdata", "transcripts", tc.name))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if s := c.Classify("codex", "blocked", string(data)); s.Type != domain.SituationError {
-			t.Errorf("%s: type = %v, want error", name, s.Type)
+			t.Errorf("%s: type = %v, want error", tc.name, s.Type)
 		}
-		// Error detection is codex-scoped: the same content on another agent
-		// type must NOT classify as error (no rule for it yet).
-		if s := c.Classify("claude", "blocked", string(data)); s.Type == domain.SituationError {
-			t.Errorf("%s on non-codex agent must not classify error, got %v", name, s.Type)
+		if s := c.Classify("claude", "blocked", string(data)); (s.Type == domain.SituationError) != tc.claudeAlsoErrors {
+			t.Errorf("%s on claude: type = %v, want error=%v", tc.name, s.Type, tc.claudeAlsoErrors)
+		}
+	}
+}
+
+// The live failure mode from issue #161: herdr reports the hard-blocked agent
+// as IDLE, so error detection must not depend on a blocked status — otherwise
+// a learned idle rule answers "do nothing" and the operator never hears about
+// an agent that cannot progress for days.
+func TestCodexErrorBannersDetectedAtIdle(t *testing.T) {
+	c := New(nil)
+	cases := []struct {
+		name        string
+		wantSummary string
+	}{
+		{"error_codex_usage_limit.txt", domain.CodexErrorUsageLimit},
+		{"error_codex_banner.txt", "banner: stream error: connection reset by peer; retrying may help"},
+	}
+	for _, tc := range cases {
+		data, err := os.ReadFile(filepath.Join("testdata", "transcripts", tc.name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := c.Classify("codex", "idle", string(data))
+		if s.Type != domain.SituationError {
+			t.Fatalf("%s at idle: type = %v, want error", tc.name, s.Type)
+		}
+		// The exact stable kind is load-bearing: it is the error signature's
+		// salient, so instances with different volatile details must keep
+		// deduping to one learned signature.
+		if s.ErrorSummary != tc.wantSummary {
+			t.Errorf("%s: ErrorSummary = %q, want %q", tc.name, s.ErrorSummary, tc.wantSummary)
 		}
 	}
 }

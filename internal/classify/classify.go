@@ -60,9 +60,10 @@ func DefaultRules() []config.ClassifierRule {
 			Regex: nil,
 		},
 		{
-			// Codex's interrupt screen and footer-anchored rate-limit model
-			// switch modal are detected structurally via domain.CodexErrorForm
-			// at the error position in Classify, same as Claude above.
+			// Codex's interrupt screen, footer-anchored rate-limit model
+			// switch modal, hard usage-limit stop, and end-anchored "■" error
+			// banners are detected structurally via domain.CodexErrorForm at
+			// the error position in Classify, same as Claude above.
 			AgentType: "codex", Situation: "error",
 			Regex: nil,
 		},
@@ -181,8 +182,9 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		if !matched && r.situation == domain.SituationError && strings.EqualFold(agentType, "claude") {
 			_, matched = domain.ClaudeErrorForm(pane)
 		}
-		// Codex's interrupt screen and rate-limit model switch modal are
-		// detected structurally the same way, scoped to codex.
+		// Codex's interrupt screen, rate-limit model switch modal, hard
+		// usage-limit stop, and live "■" error banners are detected
+		// structurally the same way, scoped to codex.
 		if !matched && r.situation == domain.SituationError && strings.EqualFold(agentType, "codex") {
 			_, matched = domain.CodexErrorForm(pane)
 		}
@@ -287,15 +289,19 @@ func enrich(s *domain.Situation) {
 		}
 		s.Options = append(s.Options, domain.OptionLabels(optionRegion)...)
 	case domain.SituationError:
-		if m := errorLineRE.FindStringSubmatch(s.Content); m != nil {
-			s.ErrorSummary = domain.MaskVolatile(strings.TrimSpace(m[1]))
-		} else if kind, ok := domain.ClaudeErrorForm(s.Content); ok {
+		// Structural form kinds take precedence over the generic error-line
+		// scrape: a pane can carry both (build output printing "error: …"
+		// above a live usage-limit banner), and only the stable kind keeps
+		// paraphrased instances deduped to one signature.
+		if kind, ok := domain.ClaudeErrorForm(s.Content); ok && strings.EqualFold(s.AgentType, "claude") {
 			// Claude's built-in error forms carry no "error:"-prefixed line;
 			// use the stable kind so paraphrases share one signature.
 			s.ErrorSummary = kind
-		} else if kind, ok := domain.CodexErrorForm(s.Content); ok {
+		} else if kind, ok := domain.CodexErrorForm(s.Content); ok && strings.EqualFold(s.AgentType, "codex") {
 			// Same reasoning as Claude above, for Codex's built-in error forms.
 			s.ErrorSummary = kind
+		} else if m := errorLineRE.FindStringSubmatch(s.Content); m != nil {
+			s.ErrorSummary = domain.MaskVolatile(strings.TrimSpace(m[1]))
 		}
 		if strings.EqualFold(s.AgentType, "codex") && domain.CodexRateLimitForm(s.Content) {
 			s.Options = append(s.Options, domain.OptionLabels(domain.ExtractCodexRateLimitForm(s.Content))...)

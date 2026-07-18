@@ -13,7 +13,9 @@ error_build.txt status=blocked type=unclassifiable verb= options=0
 error_claude_api_retry.txt status=blocked type=error verb= options=0
 error_claude_interrupted.txt status=blocked type=error verb= options=0
 error_claude_limit.txt status=blocked type=error verb= options=0
+error_codex_banner.txt status=idle type=error verb= options=0
 error_codex_interrupted.txt status=blocked type=error verb= options=0
 error_codex_rate_limit.txt status=idle type=error verb= options=3
+error_codex_usage_limit.txt status=idle type=error verb= options=0
 idle_finished.txt status=idle type=idle verb= options=0
 unclassifiable_blocked.txt status=blocked type=unclassifiable verb= options=0
