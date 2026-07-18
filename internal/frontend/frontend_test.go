@@ -862,12 +862,12 @@ func TestConfirmRegenerationCarriesOverMarkers(t *testing.T) {
 	}
 }
 
-func TestConfirmRegenerationInsertionKeepsReservedMarker(t *testing.T) {
-	// A regeneration that INSERTS a task before a reserved one renumbers every
-	// line ("1. A" becomes "2. A"). Marker carry-over must match items by
-	// their raw task identity, not the rendered numbered text — otherwise the
-	// renumbered item resets to "[ ]" and the daemon re-sends work the agent
-	// already holds.
+func TestConfirmRegenerationAppendsKeepingReservedMarker(t *testing.T) {
+	// A later generation APPENDS new work and preserves the existing list in
+	// place (issue #183): the already-reserved "[-]" item keeps its marker AND
+	// its position, and the new task lands at the end pending — never reordered
+	// ahead of it, and never reset to "[ ]" (which would re-arm the daemon for a
+	// duplicate send).
 	app, st := testApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
@@ -885,6 +885,9 @@ func TestConfirmRegenerationInsertionKeepsReservedMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The second suggestion lists a brand-new task first, then re-lists the two
+	// existing ones — append-only keeps the existing order and appends only the
+	// genuinely-new task at the end.
 	second, _ := st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w8:p8", SituationType: domain.SituationIdle, Trigger: "t",
 		Action: "escalated", Status: "escalated",
@@ -898,21 +901,24 @@ func TestConfirmRegenerationInsertionKeepsReservedMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tasks file missing: %v", err)
 	}
-	if !strings.Contains(string(body), "- [ ] 1. Set up the load test rig") {
-		t.Errorf("tasks file = %q, want the inserted item first and pending", body)
+	if !strings.Contains(string(body), "- [-] 1. Profile the slow endpoint") {
+		t.Errorf("tasks file = %q, want the delivered item still \"[-]\" in its original position", body)
 	}
-	if !strings.Contains(string(body), "- [-] 2. Profile the slow endpoint") {
-		t.Errorf("tasks file = %q, want the delivered item still \"[-]\" under its new number", body)
+	if !strings.Contains(string(body), "- [ ] 2. Add a response cache") {
+		t.Errorf("tasks file = %q, want the existing pending item preserved", body)
 	}
-	if next := domain.NextDeclaredTask(string(body)); next != "1. Set up the load test rig" {
-		t.Errorf("next declared task = %q, want only the inserted item — the reserved one must not be re-armed", next)
+	if !strings.Contains(string(body), "- [ ] 3. Set up the load test rig") {
+		t.Errorf("tasks file = %q, want the new item appended pending at the end", body)
+	}
+	if next := domain.NextDeclaredTask(string(body)); next != "2. Add a response cache" {
+		t.Errorf("next declared task = %q, want the first still-pending item — the reserved one must not be re-armed", next)
 	}
 }
 
-func TestConfirmRegenerationInsertionKeepsCompletedMarker(t *testing.T) {
-	// Same renumbering hazard for FINISHED work: an item the agent completed
-	// ("[x]", e.g. via `hap task done`) must stay done when a regeneration
-	// re-lists it under a new number, not be re-queued.
+func TestConfirmRegenerationAppendsKeepingCompletedMarker(t *testing.T) {
+	// Same for FINISHED work: an item the agent completed ("[x]", e.g. via
+	// `hap task done`) stays done and in place when a later generation appends
+	// new work — it is never re-queued (issue #183).
 	app, st := testApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
@@ -956,11 +962,11 @@ func TestConfirmRegenerationInsertionKeepsCompletedMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tasks file missing: %v", err)
 	}
-	if !strings.Contains(string(body), "- [x] 2. Profile the slow endpoint") {
-		t.Errorf("tasks file = %q, want the completed item still \"[x]\" under its new number", body)
+	if !strings.Contains(string(body), "- [x] 1. Profile the slow endpoint") {
+		t.Errorf("tasks file = %q, want the completed item still \"[x]\" in its original position", body)
 	}
-	if next := domain.NextDeclaredTask(string(body)); next != "1. Set up the load test rig" {
-		t.Errorf("next declared task = %q, want only the inserted item — completed work must not be re-queued", next)
+	if next := domain.NextDeclaredTask(string(body)); next != "2. Set up the load test rig" {
+		t.Errorf("next declared task = %q, want the appended new item — completed work must not be re-queued", next)
 	}
 }
 
