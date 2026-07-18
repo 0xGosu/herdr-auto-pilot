@@ -48,8 +48,16 @@ func TestConfirmBusyAgentOpensAddPrompt(t *testing.T) {
 	}
 	upd, _ = m.Update(ap)
 	m = upd.(Model)
-	if m.prompt == nil || !strings.HasPrefix(strings.ToLower(m.prompt.input), "y") {
-		t.Fatalf("add prompt should open defaulting to 'y', got %+v", m.prompt)
+	// The prompt opens with NO pre-filled default: a pre-filled "y" would make a
+	// typed "n" append to "yn" (still HasPrefix "y") and the decline unreachable.
+	if m.prompt == nil {
+		t.Fatal("a busy send refusal should open the add prompt")
+	}
+	if m.prompt.input != "" {
+		t.Errorf("add prompt must open empty (no default), got %q", m.prompt.input)
+	}
+	if !strings.Contains(m.prompt.label, "add the tasks") {
+		t.Errorf("prompt label should offer to add the tasks, got %q", m.prompt.label)
 	}
 	// Nothing was delivered to the busy agent.
 	if len(fh.inputs) != 0 {
@@ -125,10 +133,11 @@ func TestAddPromptNoLeavesPending(t *testing.T) {
 	}
 }
 
-// TestAddPromptBareEnterQueues: a bare Enter (no edit to the pre-filled "y")
-// commits the default — the tasks are queued and the escalation resolved. Locks
-// in the "confirm already meant accept, so Enter queues" contract.
-func TestAddPromptBareEnterQueues(t *testing.T) {
+// TestAddPromptBareEnterDeclines: a bare Enter (empty input, no default) is the
+// SAFE outcome — it cancels the prompt and leaves the escalation pending rather
+// than silently queueing. Queueing requires an explicit "y" (see the empty-input
+// rationale on openAddPrompt).
+func TestAddPromptBareEnterDeclines(t *testing.T) {
 	m, st, fh := correctTestModel(t)
 	fh.agents = []domain.AgentTransition{{AgentID: "w1:p1", Status: "working"}}
 	ctx := context.Background()
@@ -139,19 +148,51 @@ func TestAddPromptBareEnterQueues(t *testing.T) {
 	upd, _ = m.Update(cmd().(openAddPromptMsg))
 	m = upd.(Model)
 
-	// Submit WITHOUT overwriting m.prompt.input, so the pre-filled "y" default
-	// is what commits.
+	// Submit WITHOUT typing anything: the empty input cancels.
 	_, c := m.submitPrompt()
 	if c != nil {
 		c()
 	}
 
 	audit, _ := st.GetAudit(ctx, id)
-	if audit.Status != "resolved" {
-		t.Errorf("bare Enter should queue (default y) and resolve, got %q", audit.Status)
+	if audit.Status != "escalated" {
+		t.Errorf("bare Enter must leave the escalation pending, got %q", audit.Status)
 	}
 	if len(fh.inputs) != 0 {
-		t.Errorf("queueing must deliver nothing, got %v", fh.inputs)
+		t.Errorf("nothing may be delivered, got %v", fh.inputs)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 0 {
+		t.Errorf("bare Enter must record no correction, got %+v", corr)
+	}
+}
+
+// TestAddPromptDeclineTypingN: typing "n" (which, with no pre-fill, is exactly
+// "n" — not "yn") declines cleanly and leaves the escalation pending. This is
+// the decline path the pre-filled-"y" version broke (issue #180 review).
+func TestAddPromptDeclineTypingN(t *testing.T) {
+	m, st, fh := correctTestModel(t)
+	fh.agents = []domain.AgentTransition{{AgentID: "w1:p1", Status: "working"}}
+	ctx := context.Background()
+	id := seedGenTaskEscalation(t, st, "Write missing tests")
+
+	upd, cmd := m.confirmAuditID(id)
+	m = upd.(Model)
+	upd, _ = m.Update(cmd().(openAddPromptMsg))
+	m = upd.(Model)
+
+	runPromptSubmit(t, m, "n")
+
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "escalated" {
+		t.Errorf("typing n must leave the escalation pending, got %q", audit.Status)
+	}
+	if len(fh.inputs) != 0 {
+		t.Errorf("declining must deliver nothing, got %v", fh.inputs)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 0 {
+		t.Errorf("declining must record no correction, got %+v", corr)
 	}
 }
 

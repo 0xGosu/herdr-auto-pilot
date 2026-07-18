@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -971,11 +972,13 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// Every task is written pending ("[ ]"); the first is marked in-progress
 	// ("[-]") only below, at delivery time, so a confirm that sends nothing
 	// leaves it for the daemon's normal declared-task flow (issue #156).
-	// ensureGeneratedTaskFile never resets progress markers: a stale
-	// re-confirm racing the winner must not flip a freshly reserved "[-]"
-	// (or a completed "[x]") back to "[ ]" and re-arm a second delivery.
-	content := domain.RenderGeneratedTaskList(name, tasks)
-	if err := ensureGeneratedTaskFile(path, content); err != nil {
+	// ensureGeneratedTaskFile APPENDS: a later generation preserves every
+	// existing task (its order and its "[-]"/"[x]" marker) and only appends
+	// tasks not already present — it never drops or reorders the agent's list
+	// (issue #183). `merged` is that combined list, so the send reservation
+	// below can locate the first suggested task by its real position.
+	merged, err := ensureGeneratedTaskFile(path, name, tasks)
+	if err != nil {
 		return fmt.Errorf("write tasks file: %w", err)
 	}
 	// Register the file as this agent's task source (writes config.toml and
@@ -1009,26 +1012,34 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	}
 
 	if send && a.Herdr != nil {
-		// Only the first task is sent — the operator's "start now" task. The
-		// order mirrors SendTaskToAgent and is load-bearing: RESERVE the item
-		// ([-] under the file lock) and only then deliver, so the daemon's idle
-		// flow can never hand it out mid-send, and a failed send rolls it back
-		// to [ ].
-		itemText := domain.GeneratedTaskItemText(0, tasks[0])
-		if _, err := mutateTaskFile(path, reserveTask(1, itemText)); err != nil {
-			return fmt.Errorf("task source created, but reserving task #1 (nothing was sent): %w", err)
+		// Only the first task is sent — the operator's "start now" task. With
+		// existing tasks preserved above it, that task is no longer necessarily
+		// item #1, so locate it by identity in the merged list and reserve THAT
+		// position. The order mirrors SendTaskToAgent and is load-bearing:
+		// RESERVE the item ([-] under the file lock) and only then deliver, so
+		// the daemon's idle flow can never hand it out mid-send, and a failed
+		// send rolls it back to [ ].
+		pos := generatedTaskPosition(merged, tasks[0])
+		// Reserve and send the SAME text the file was rendered from — merged
+		// carries the stripped task identity, so a task whose normalized text
+		// itself begins with a "N. " prefix renders (and must be reserved) under
+		// its identity, not the raw suggestion, or reserveTask's text check would
+		// fail spuriously after the escalation is already claimed.
+		taskText := merged[pos-1]
+		itemText := domain.GeneratedTaskItemText(pos-1, taskText)
+		if _, err := mutateTaskFile(path, reserveTask(pos, itemText)); err != nil {
+			return fmt.Errorf("task source created, but reserving task #%d (nothing was sent): %w", pos, err)
 		}
 		// Render through the same default next-task template used by a declared
 		// task source, so every idle-task handoff includes both the task and
-		// its list. The prompt sends the raw normalized task, not the numbered
-		// file line.
+		// its list. The prompt sends the task text, not the numbered file line.
 		prompt := domain.DeclaredTask{
-			Task: tasks[0], Path: path, AgentName: name,
+			Task: taskText, Path: path, AgentName: name,
 		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
-			if _, rbErr := mutateTaskFile(path, releaseTask(1, itemText)); rbErr != nil {
-				return fmt.Errorf("task source created, but sending the task failed (%w) and task #1 could not be returned to [ ] (%v) — "+
-					"it stays [-] and no agent will pick it up until you clear it", err, rbErr)
+			if _, rbErr := mutateTaskFile(path, releaseTask(pos, itemText)); rbErr != nil {
+				return fmt.Errorf("task source created, but sending the task failed (%w) and task #%d could not be returned to [ ] (%v) — "+
+					"it stays [-] and no agent will pick it up until you clear it", err, pos, rbErr)
 			}
 			return fmt.Errorf("task source created, but sending the task to the agent failed: %w", err)
 		}
@@ -1036,34 +1047,103 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	return a.nudge(ctx, control.KindReload)
 }
 
-// ensureGeneratedTaskFile writes the rendered generated-task checklist to
-// path as ONE locked read-compare-write, under the same per-path lock
-// mutateTaskFile takes — an unlocked check-then-write could land after a
-// concurrent confirm's reservation and silently reset its "[-]". A file
-// already carrying exactly these item texts is left untouched (a stale
-// re-confirm must not clobber markers or any operator edits); when the items
-// DO differ (a new generation), the rewrite carries over the existing marker
-// of every same-text item, so in-flight "[-]" and finished "[x]" work
-// survives regeneration. The write is atomic because the daemon reads this
-// file without the lock.
-func ensureGeneratedTaskFile(path, content string) error {
+// ensureGeneratedTaskFile writes the agent's generated-task checklist to path
+// as ONE locked read-merge-write, under the same per-path lock mutateTaskFile
+// takes — an unlocked check-then-write could land after a concurrent confirm's
+// reservation and silently reset its "[-]". It APPENDS: every task already in
+// the file is preserved (its order and its "[-]"/"[x]" marker), and only tasks
+// from `tasks` not already present are added at the end — a later generation
+// never drops or reorders the agent's list (issue #183). A file already
+// carrying exactly the merged items is left untouched (a stale re-confirm must
+// not clobber markers or operator edits). The write is atomic because the
+// daemon reads this file without the lock. Returns the merged task list (raw,
+// unnumbered) so the caller can locate a task's rendered position.
+func ensureGeneratedTaskFile(path, name string, tasks []string) ([]string, error) {
 	lockPath := taskLockPath(path)
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
-		return err
+		return nil, err
 	}
 	unlock, err := lockFile(lockPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer unlock()
 
-	if existing, rerr := os.ReadFile(path); rerr == nil {
-		if sameChecklistTexts(string(existing), content) {
-			return nil
-		}
-		content = carryOverChecklistMarks(string(existing), content)
+	existing := ""
+	if b, rerr := os.ReadFile(path); rerr == nil {
+		existing = string(b)
 	}
-	return writeFileAtomic(path, []byte(content), 0o600)
+	merged := mergeGeneratedTasks(existing, tasks)
+	content := domain.RenderGeneratedTaskList(name, merged)
+	if existing != "" {
+		if sameChecklistTexts(existing, content) {
+			return merged, nil
+		}
+		// merged lists every existing task, so carry-over drops nothing — it
+		// only restores each preserved item's "[-]"/"[x]" marker onto its
+		// freshly rendered "[ ]" line.
+		content = carryOverChecklistMarks(existing, content)
+	}
+	if err := writeFileAtomic(path, []byte(content), 0o600); err != nil {
+		return nil, err
+	}
+	return merged, nil
+}
+
+// mergeGeneratedTasks builds the task list for a (re)generated file: every task
+// already in existing, in file order, followed by each task from generated
+// whose identity is not already present. Existing tasks are never dropped or
+// reordered, so a later generation that lists only new work APPENDS to — rather
+// than replaces — the agent's list (issue #183). Dedup is by
+// domain.GeneratedTaskIdentity, so re-listing an existing task does not
+// duplicate it. Returns raw (unnumbered) task strings for RenderGeneratedTaskList.
+func mergeGeneratedTasks(existing string, generated []string) []string {
+	var merged []string
+	seen := map[string]bool{}
+	add := func(raw string) {
+		id := domain.GeneratedTaskIdentity(raw)
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		merged = append(merged, id)
+	}
+	for _, it := range domain.ParseChecklist(existing) {
+		add(it.Text)
+	}
+	for _, task := range generated {
+		add(task)
+	}
+	return merged
+}
+
+// checklistMarkRank ranks a checkbox mark by how far along the task is, so a
+// collapsed duplicate identity keeps its furthest-along state: done ("[x]" and
+// its parse variants X/+/*) outranks in-progress ("[-]"), which outranks
+// pending ("[ ]"). See ChecklistItem.Mark for the mark alphabet.
+func checklistMarkRank(mark string) int {
+	switch strings.TrimSpace(mark) {
+	case "":
+		return 0 // pending "[ ]"
+	case domain.MarkInProgress:
+		return 1 // in-progress "[-]"
+	default:
+		return 2 // done "[x]"/"[X]"/"[+]"/"[*]"
+	}
+}
+
+// generatedTaskPosition returns the 1-based position of task within merged
+// (matched by domain.GeneratedTaskIdentity, so a numbered or raw form both
+// find it), or 1 if absent — the reservation's own text check then fails loudly
+// rather than silently reserving the wrong item.
+func generatedTaskPosition(merged []string, task string) int {
+	id := domain.GeneratedTaskIdentity(task)
+	for i, t := range merged {
+		if domain.GeneratedTaskIdentity(t) == id {
+			return i + 1
+		}
+	}
+	return 1
 }
 
 // sameChecklistTexts reports whether two checklist documents carry the same
@@ -1100,6 +1180,17 @@ func carryOverChecklistMarks(existing, rendered string) string {
 	for _, it := range domain.ParseChecklist(existing) {
 		id := domain.GeneratedTaskIdentity(it.Text)
 		marks[id] = append(marks[id], it.Mark)
+	}
+	// Order each identity's marks most-advanced first (done "[x]" > in-progress
+	// "[-]" > pending "[ ]"). When the merge collapses a duplicate identity to
+	// one rendered item it is assigned marks[id][0], so ranking guarantees the
+	// survivor keeps the FURTHEST-along state regardless of the order the
+	// duplicates appeared in the file — a completed or in-progress task is never
+	// regressed (which would re-arm the daemon for work already underway).
+	for id := range marks {
+		sort.SliceStable(marks[id], func(a, b int) bool {
+			return checklistMarkRank(marks[id][a]) > checklistMarkRank(marks[id][b])
+		})
 	}
 	lines := strings.Split(rendered, "\n")
 	for _, it := range domain.ParseChecklist(rendered) {
