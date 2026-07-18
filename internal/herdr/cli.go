@@ -336,6 +336,7 @@ type agentListResponse struct {
 			PaneID      string `json:"pane_id"`
 			TabID       string `json:"tab_id"`
 			WorkspaceID string `json:"workspace_id"`
+			TerminalID  string `json:"terminal_id"`
 		} `json:"agents"`
 	} `json:"result"`
 }
@@ -365,6 +366,7 @@ func (c *CLI) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) 
 			AgentType:   a.Agent,
 			WorkspaceID: a.WorkspaceID,
 			Status:      a.AgentStatus,
+			TerminalID:  a.TerminalID,
 		})
 	}
 	return agents, nil
@@ -381,6 +383,7 @@ type paneGetResponse struct {
 			WorkspaceID   string `json:"workspace_id"`
 			Cwd           string `json:"cwd"`
 			ForegroundCwd string `json:"foreground_cwd"`
+			TerminalID    string `json:"terminal_id"`
 			// agent_session is a read-only object herdr attaches when it has a
 			// stored native session reference; its "value" is the agent's
 			// session id. Absent when no session is stored.
@@ -410,6 +413,7 @@ func (c *CLI) PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, err
 		Cwd:            p.Cwd,
 		ForegroundCwd:  p.ForegroundCwd,
 		AgentSessionID: p.AgentSession.Value,
+		TerminalID:     p.TerminalID,
 	}, nil
 }
 

@@ -1469,6 +1469,60 @@ func TestReconcileEscalatesAlreadyParkedAgent(t *testing.T) {
 	}
 }
 
+// TestReconcileSyncsTerminalIDs covers issue #158: herdr reuses compact pane
+// ids, so an agent row whose stored terminal id differs from the live one is a
+// brand-new terminal — reconcile resets its created_at (the TUI AGE anchor).
+// The sync runs before the parked-status filter (a "working" agent must sync
+// too), and an empty live terminal id (older herdr) leaves everything alone.
+func TestReconcileSyncsTerminalIDs(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+
+	// Rows left by the panes' previous lives.
+	for id, term := range map[string]string{"pA": "term_old", "pB": "term_keep"} {
+		if _, err := h.raw.EnsureAgentName(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.raw.SyncAgentTerminalID(ctx, id, term); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstSeen := func(id string) time.Time {
+		t.Helper()
+		stats, err := h.raw.AgentStats(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stats[id].FirstSeen
+	}
+	beforeA, beforeB := firstSeen("pA"), firstSeen("pB")
+	// created_at is unix-milli; make a reset distinguishable from the seed.
+	time.Sleep(15 * time.Millisecond)
+
+	h.herdr.setAgents([]domain.AgentTransition{
+		// Recycled pane id, new terminal — and "working", so only the
+		// terminal-id sync (not the parked-attention path) may touch it.
+		{AgentID: "pA", PaneID: "pA", AgentType: "claude", Status: "working", TerminalID: "term_new"},
+		// No terminal id reported (older herdr): today's behavior.
+		{AgentID: "pB", PaneID: "pB", AgentType: "claude", Status: "working"},
+	})
+	h.daemon.reconcileAttention(ctx)
+
+	if got := firstSeen("pA"); !got.After(beforeA) {
+		t.Errorf("recycled terminal must reset FirstSeen: %v -> %v", beforeA, got)
+	}
+	if got := firstSeen("pB"); !got.Equal(beforeB) {
+		t.Errorf("empty terminal id must not touch FirstSeen: %v -> %v", beforeB, got)
+	}
+
+	// The new id stuck: a repeat sweep with the same terminal is a no-op.
+	repeat := firstSeen("pA")
+	h.daemon.reconcileAttention(ctx)
+	if got := firstSeen("pA"); !got.Equal(repeat) {
+		t.Errorf("repeat sweep must not reset again: %v -> %v", repeat, got)
+	}
+}
+
 // TestReconcileAutoAnswersParkedAgentOnce proves the in-memory dedup guard for
 // the auto-answer path: a confident learned rule leaves NO escalation row, so
 // only episodeHandled (not the store check) stops a re-answer on the next

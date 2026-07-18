@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS agent_names (
 	agent_id TEXT PRIMARY KEY,
 	name TEXT NOT NULL UNIQUE,
 	disabled INTEGER NOT NULL DEFAULT 0,
+	terminal_id TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS signature_embeddings (
@@ -235,6 +236,10 @@ func (s *Store) migrate() error {
 		// Operator-owned per-agent automation switch. Kept on agent_names so
 		// renames preserve it and disabled agents remain visible by name.
 		`ALTER TABLE agent_names ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0`,
+		// Herdr's unique per-terminal id. Herdr reuses compact pane ids, so
+		// this is what tells "same agent" from "new terminal on a recycled
+		// pane id" (issue #158). '' = not yet observed.
+		`ALTER TABLE agent_names ADD COLUMN terminal_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
@@ -1398,6 +1403,51 @@ func (s *Store) EnsureAgentName(ctx context.Context, agentID string) (string, er
 		}
 	}
 	return "", fmt.Errorf("could not assign a unique name to agent %s", agentID)
+}
+
+// SyncAgentTerminalID reconciles the stored herdr terminal id for an agent
+// row. Herdr reuses compact pane ids after panes close, so a differing
+// terminal id means the row now describes a brand-new terminal: created_at
+// is reset so AGE reflects the current session, while the name, disabled
+// flag, and audit history survive (issue #158). Returns reset=true when the
+// timestamp was reset. Empty terminalID (older herdr) and unknown agentID
+// (row not created yet — EnsureAgentName owns creation) are no-ops.
+func (s *Store) SyncAgentTerminalID(ctx context.Context, agentID, terminalID string) (bool, error) {
+	if terminalID == "" {
+		return false, nil
+	}
+	reset := false
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		var stored string
+		err := tx.QueryRowContext(ctx,
+			`SELECT terminal_id FROM agent_names WHERE agent_id = ?`, agentID).Scan(&stored)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		switch stored {
+		case terminalID:
+			return nil
+		case "":
+			// First observation for a pre-existing row: adopt the id without
+			// touching created_at (no evidence the terminal changed).
+			_, err = tx.ExecContext(ctx,
+				`UPDATE agent_names SET terminal_id = ? WHERE agent_id = ?`,
+				terminalID, agentID)
+			return err
+		default:
+			_, err = tx.ExecContext(ctx,
+				`UPDATE agent_names SET terminal_id = ?, created_at = ? WHERE agent_id = ?`,
+				terminalID, time.Now().UnixMilli(), agentID)
+			if err == nil {
+				reset = true
+			}
+			return err
+		}
+	})
+	return reset, err
 }
 
 func (s *Store) agentNameByID(ctx context.Context, agentID string) (string, error) {

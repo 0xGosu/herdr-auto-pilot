@@ -182,6 +182,12 @@ type DaemonStore interface {
 	// EnsureAgentName returns the agent's short name, generating one on
 	// first sight (insert-if-absent only; renames stay operator-owned).
 	EnsureAgentName(ctx context.Context, agentID string) (string, error)
+	// SyncAgentTerminalID reconciles the stored herdr terminal id for an
+	// agent row. Herdr reuses compact pane ids, so a differing live id means
+	// a new terminal recycled the id: created_at resets so AGE reflects the
+	// current session (name and history survive). Empty terminalID and
+	// unknown agentID are no-ops. Returns reset=true when created_at moved.
+	SyncAgentTerminalID(ctx context.Context, agentID, terminalID string) (bool, error)
 	StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64, error)
 	UpdateLLMRequestStatus(ctx context.Context, requestID, status string) error
 	// UpdateLLMRequestContext fills the context_json of an already-staged

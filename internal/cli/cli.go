@@ -1270,9 +1270,14 @@ func formatTask(it domain.ChecklistItem) string {
 // printTaskList prints items matching the status filter, numbered by absolute
 // file position (the number never depends on the filter), then a count summary.
 func printTaskList(out io.Writer, items []domain.ChecklistItem, status string) {
-	shown, done := 0, 0
+	shown, inProgress, done := 0, 0, 0
 	for _, it := range items {
-		if it.Done {
+		// An in-progress "[-]" item has Done==true (it is no longer pending)
+		// but must not be summarized as done.
+		switch {
+		case it.Mark == domain.MarkInProgress:
+			inProgress++
+		case it.Done:
 			done++
 		}
 		if status == "pending" && it.Done {
@@ -1292,7 +1297,8 @@ func printTaskList(out io.Writer, items []domain.ChecklistItem, status string) {
 		}
 		return
 	}
-	fmt.Fprintf(out, "%d task(s): %d pending, %d done\n", len(items), len(items)-done, done)
+	fmt.Fprintf(out, "%d task(s): %d pending, %d in-progress, %d done\n",
+		len(items), len(items)-done-inProgress, inProgress, done)
 }
 
 func clearData(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
