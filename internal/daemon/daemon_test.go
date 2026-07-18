@@ -1267,8 +1267,10 @@ func TestPipelineShadowModeEscalatesWithSuggestion(t *testing.T) {
 	}
 }
 
-// otherApprovalPane is a distinct approval (different command → different
-// classified content/signature) used to prove content-level dedup.
+// otherApprovalPane is a distinct approval used to prove content-level dedup.
+// Its verb and option labels match approvalPane's, so the two share a
+// SIGNATURE (issue #155 folds options, not the command line, into approval
+// salients) — dedup must distinguish them by pane content, not signature.
 const otherApprovalPane = "Bash(npm install)\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell the agent what to do differently\n"
 
 // chromedApproval renders the approval with a leading spinner/status line that

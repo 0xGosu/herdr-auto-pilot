@@ -36,6 +36,9 @@ type Scope struct {
 type Hit struct {
 	Signature string
 	Score     float64 // cosine similarity for vectors, BM25 score for text
+	// Salient is the hit's stored salient text, so callers can vet the
+	// candidate before remapping onto it (the approval option-set gate).
+	Salient string
 }
 
 // Matcher wraps a swappable disk-backed bleve index. All methods are safe
@@ -186,11 +189,20 @@ func scopeFilter(s Scope) query.Query {
 	return bleve.NewConjunctionQuery(st, at)
 }
 
+// matchK bounds how many nearest candidates a lookup considers: the caller's
+// accept filter can veto the top hit (the approval option-set gate), so a
+// compatible candidate at rank 2-3 must stay reachable instead of being
+// permanently shadowed by an incompatible nearest neighbor.
+const matchK = 3
+
 // MatchVector returns the nearest stored signature by cosine similarity
-// within scope. ok is false when the index is empty for the scope; Score is
+// within scope that the accept filter admits (nil accepts everything).
+// Candidates are tried in descending similarity, so the returned hit is the
+// best acceptable one. ok is false when no candidate is acceptable; Score is
 // the raw cosine (bleve's cosine metric normalizes and inner-products, so
 // the hit score IS the cosine similarity) — thresholding is the caller's.
-func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope) (Hit, bool, error) {
+// accept must be a fast, pure content check (it runs inline per candidate).
+func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accept func(Hit) bool) (Hit, bool, error) {
 	m.mu.RLock()
 	idx, dims := m.idx, m.dims
 	m.mu.RUnlock()
@@ -202,25 +214,33 @@ func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope) (Hit,
 	}
 
 	req := bleve.NewSearchRequest(bleve.NewMatchNoneQuery())
-	req.Size = 1
-	req.AddKNNWithFilter("vector", vec, 1, 1.0, scopeFilter(s))
+	req.Size = matchK
+	req.Fields = []string{"salient"}
+	req.AddKNNWithFilter("vector", vec, matchK, 1.0, scopeFilter(s))
 	res, err := idx.SearchInContext(ctx, req)
 	if err != nil {
 		return Hit{}, false, err
 	}
-	if len(res.Hits) == 0 {
-		return Hit{}, false, nil
+	for _, h := range res.Hits { // descending similarity
+		stored, _ := h.Fields["salient"].(string)
+		hit := Hit{Signature: h.ID, Score: h.Score, Salient: stored}
+		if accept == nil || accept(hit) {
+			return hit, true, nil
+		}
 	}
-	h := res.Hits[0]
-	return Hit{Signature: h.ID, Score: h.Score}, true, nil
+	return Hit{}, false, nil
 }
 
-// MatchText returns the best BM25 match for the salient text within scope.
-// Score is NORMALIZED to (0,1]: the hit's BM25 score divided by the score
-// its own stored salient text achieves against the same index, so the
-// threshold stays meaningful as the corpus (and its IDF) grows. 1.0 means
-// the query matches as well as the stored text matches itself.
-func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope) (Hit, bool, error) {
+// MatchText returns the best BM25 match for the salient text within scope
+// that the accept filter admits (nil accepts everything). Score is
+// NORMALIZED to (0,1]: the hit's BM25 score divided by the score its own
+// stored salient text achieves against the same index, so the threshold
+// stays meaningful as the corpus (and its IDF) grows. 1.0 means the query
+// matches as well as the stored text matches itself. Up to matchK candidates
+// are considered and the highest NORMALIZED acceptable one wins (raw BM25
+// order can differ from normalized order). accept must be a fast, pure
+// content check (it runs inline per candidate).
+func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope, accept func(Hit) bool) (Hit, bool, error) {
 	m.mu.RLock()
 	idx := m.idx
 	m.mu.RUnlock()
@@ -228,45 +248,57 @@ func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope) (Hit, 
 		return Hit{}, false, fmt.Errorf("text matching unavailable (no index)")
 	}
 
-	score, id, stored, ok, err := m.textTop1(ctx, idx, salient, s, true)
-	if err != nil || !ok {
-		return Hit{}, false, err
-	}
-	self, selfID, _, selfOK, err := m.textTop1(ctx, idx, stored, s, false)
+	mq := bleve.NewMatchQuery(salient)
+	mq.SetField("salient")
+	req := bleve.NewSearchRequest(bleve.NewConjunctionQuery(mq, scopeFilter(s)))
+	req.Size = matchK
+	req.Fields = []string{"salient"}
+	res, err := idx.SearchInContext(ctx, req)
 	if err != nil {
 		return Hit{}, false, err
 	}
-	if !selfOK || selfID != id || self <= 0 {
-		// The stored text should always be its own best match; anything
-		// else means the score is not normalizable — fail the match.
-		return Hit{}, false, nil
+
+	var best Hit
+	var found bool
+	for _, h := range res.Hits {
+		stored, _ := h.Fields["salient"].(string)
+		cand := Hit{Signature: h.ID, Score: h.Score, Salient: stored}
+		if accept != nil && !accept(cand) {
+			continue
+		}
+		self, selfID, selfOK, err := m.textSelfScore(ctx, idx, stored, s)
+		if err != nil {
+			return Hit{}, false, err
+		}
+		if !selfOK || selfID != h.ID || self <= 0 {
+			// The stored text should always be its own best match; anything
+			// else means this candidate's score is not normalizable — skip it.
+			continue
+		}
+		norm := h.Score / self
+		if norm > 1 {
+			norm = 1
+		}
+		if !found || norm > best.Score {
+			best = Hit{Signature: h.ID, Score: norm, Salient: stored}
+			found = true
+		}
 	}
-	norm := score / self
-	if norm > 1 {
-		norm = 1
-	}
-	return Hit{Signature: id, Score: norm}, true, nil
+	return best, found, nil
 }
 
-// textTop1 runs one scoped BM25 query, optionally loading the hit's stored
-// salient text.
-func (m *Matcher) textTop1(ctx context.Context, idx bleve.Index, text string, s Scope,
-	loadSalient bool) (score float64, id, salient string, ok bool, err error) {
-
+// textSelfScore runs one scoped BM25 query for a candidate's own stored text,
+// yielding the self-match score MatchText normalizes against.
+func (m *Matcher) textSelfScore(ctx context.Context, idx bleve.Index, text string, s Scope) (score float64, id string, ok bool, err error) {
 	mq := bleve.NewMatchQuery(text)
 	mq.SetField("salient")
 	req := bleve.NewSearchRequest(bleve.NewConjunctionQuery(mq, scopeFilter(s)))
 	req.Size = 1
-	if loadSalient {
-		req.Fields = []string{"salient"}
-	}
 	res, err := idx.SearchInContext(ctx, req)
 	if err != nil || len(res.Hits) == 0 {
-		return 0, "", "", false, err
+		return 0, "", false, err
 	}
-	h := res.Hits[0]
-	stored, _ := h.Fields["salient"].(string)
-	return h.Score, h.ID, stored, true, nil
+	return res.Hits[0].Score, res.Hits[0].ID, true, nil
 }
 
 // Close releases the underlying index and removes its cache directory.

@@ -162,7 +162,7 @@ sequenceDiagram
 ### Signature Normalizer (pure domain)
 
 **Responsibilities.** Produce a stable signature (FR-003) and apply guards (FR-003a).
-**Key Components.** Volatile-token masker (paths, hashes, line numbers, timestamps, UUIDs → typed placeholders), salient-content extractor (option set / permission verb), per-agent-type scoping, hasher; variance guard and over-masking floor.
+**Key Components.** Volatile-token masker (paths, hashes, line numbers, timestamps, UUIDs → typed placeholders), salient-content extractor (option set / permission verb + option set for approvals, remote-env picker exempt), per-agent-type scoping, hasher; variance guard and over-masking floor.
 **Key Interfaces.** `Signature(situation) -> (sig, guardVerdict)`.
 **Data Models.** Consumes classified situation; produces signature string.
 **Dependencies.** None external (pure).

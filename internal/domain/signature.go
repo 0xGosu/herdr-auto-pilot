@@ -146,22 +146,104 @@ func ComputeSignatureN(s Situation, salientChars int) SignatureResult {
 	}
 }
 
+// NormalizedOptionSet folds an option-label list into an order-insensitive
+// canonical string: each label lowercased and trimmed, the set sorted and
+// joined with ";". Shared by the choice and approval salients so their
+// normalization cannot drift.
+func NormalizedOptionSet(options []string) string {
+	opts := make([]string, len(options))
+	for i, o := range options {
+		opts[i] = strings.ToLower(strings.TrimSpace(o))
+	}
+	sort.Strings(opts)
+	return strings.Join(opts, ";")
+}
+
+// approvalOptionsSegment returns the normalized option set encoded in an
+// approval salient and whether the salient carries one (pre-#155 salients
+// and the remote-env picker's are verb-only).
+func approvalOptionsSegment(salient string) (string, bool) {
+	_, opts, found := strings.Cut(salient, "| options:")
+	return strings.TrimSpace(opts), found
+}
+
+// ApprovalRemapCompatible reports whether a fresh approval salient may be
+// semantically remapped onto a stored candidate salient. Semantic matching
+// exists to bridge PARAPHRASES of one approval screen, and a paraphrase keeps
+// (nearly) the same reply options — so a remap requires both salients to
+// carry an option set and those sets to overlap by at least half (Jaccard).
+// Verb-only "permission:" salients never fuzzy-remap: equivalent ones
+// already share an exact hash. Verbless approvals (no permission verb
+// extracted) fall back to pane-tail salients with no option encoding — two
+// of those keep semantic similarity as their only comparison basis, exactly
+// as before issue #155. Fail-safe everywhere else: incompatible → the caller
+// keeps the fresh hash key, so the situation escalates instead of inheriting
+// another screen's rule (issue #155: without this, a plan approval and a
+// Bash approval sharing the verb "proceed" could still merge through the
+// cosine/BM25 fallback even though their exact hashes now differ).
+func ApprovalRemapCompatible(salient, candidate string) bool {
+	aPerm := strings.HasPrefix(salient, "permission:")
+	bPerm := strings.HasPrefix(candidate, "permission:")
+	if !aPerm && !bPerm {
+		return true // two pane-tail salients: similarity is the comparison
+	}
+	if aPerm != bPerm {
+		return false
+	}
+	a, aok := approvalOptionsSegment(salient)
+	b, bok := approvalOptionsSegment(candidate)
+	if !aok || !bok {
+		return false
+	}
+	as := splitOptionSet(a)
+	bs := splitOptionSet(b)
+	inter := 0
+	for o := range as {
+		if bs[o] {
+			inter++
+		}
+	}
+	union := len(as) + len(bs) - inter
+	// Jaccard ≥ 0.5; two empty sets (option-less approvals) are compatible.
+	return inter*2 >= union
+}
+
+// splitOptionSet splits a NormalizedOptionSet encoding back into a set,
+// dropping empty entries.
+func splitOptionSet(s string) map[string]bool {
+	out := make(map[string]bool)
+	for _, o := range strings.Split(s, ";") {
+		if o = strings.TrimSpace(o); o != "" {
+			out[o] = true
+		}
+	}
+	return out
+}
+
 // salientContent extracts the decision-relevant content per situation type:
-// the normalized option set for choices, the permission verb/action for
-// approvals, the error summary for errors, and the trailing salientChars
-// characters of the pane content otherwise.
+// the normalized option set for choices, the permission verb/action plus the
+// normalized option set for approvals (issue #155: the verb alone collapses
+// very different approval screens — a plan approval and a Bash command
+// approval both read "…to proceed?" — into one learned rule), the error
+// summary for errors, and the trailing salientChars characters of the pane
+// content otherwise.
 func salientContent(s Situation, salientChars int) string {
 	switch s.Type {
 	case SituationChoice:
-		opts := make([]string, len(s.Options))
-		for i, o := range s.Options {
-			opts[i] = strings.ToLower(strings.TrimSpace(o))
-		}
-		sort.Strings(opts)
-		return "options:" + strings.Join(opts, ";")
+		return "options:" + NormalizedOptionSet(s.Options)
 	case SituationApproval:
-		if s.PermissionVerb != "" {
+		if s.PermissionVerb == PermissionVerbSelectRemoteEnv {
+			// The picker's environment labels are the learned action, not
+			// the key (see PermissionVerbSelectRemoteEnv); folding them
+			// would fragment the signature per environment list.
 			return "permission:" + s.PermissionVerb
+		}
+		if s.PermissionVerb != "" {
+			// The "| options:" segment is always present (even when empty)
+			// so the format is self-describing: the store migration keys
+			// off it, and a new verb-only salient can never be byte-equal
+			// to a pre-#155 row.
+			return "permission:" + s.PermissionVerb + " | options:" + NormalizedOptionSet(s.Options)
 		}
 	case SituationError:
 		if s.ErrorSummary != "" {

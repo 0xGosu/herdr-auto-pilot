@@ -1208,6 +1208,60 @@ func TestSignatureEmbeddingRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMigratePrunesVerbOnlyApprovalEmbeddings(t *testing.T) {
+	// Issue #155: pre-fix approval salients carried only the permission verb.
+	// Left in place, a post-fix salient could semantically remap onto such an
+	// over-broad row, so migrate() deletes them — and only them.
+	s, path := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	for _, e := range []domain.SignatureEmbedding{
+		{Signature: "approval:old", SituationType: domain.SituationApproval,
+			AgentType: "claude", Salient: "permission:proceed", CreatedAt: now},
+		{Signature: "approval:new", SituationType: domain.SituationApproval,
+			AgentType: "claude", Salient: "permission:proceed | options:no;yes", CreatedAt: now},
+		{Signature: "approval:emptyopts", SituationType: domain.SituationApproval,
+			AgentType: "claude", Salient: "permission:continue | options:", CreatedAt: now},
+		{Signature: "approval:remoteenv", SituationType: domain.SituationApproval,
+			AgentType: "claude", Salient: "permission:" + domain.PermissionVerbSelectRemoteEnv, CreatedAt: now},
+		{Signature: "approval:fallback", SituationType: domain.SituationApproval,
+			AgentType: "claude", Salient: "trailing pane content window", CreatedAt: now},
+		{Signature: "choice:opts", SituationType: domain.SituationChoice,
+			AgentType: "claude", Salient: "options:no;yes", CreatedAt: now},
+	} {
+		if err := s.UpsertSignatureEmbedding(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	re, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer re.Close()
+	rows, err := re.ListSignatureEmbeddings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		got[r.Signature] = true
+	}
+	if got["approval:old"] {
+		t.Error("verb-only approval embedding survived migration")
+	}
+	for _, keep := range []string{
+		"approval:new", "approval:emptyopts", "approval:remoteenv",
+		"approval:fallback", "choice:opts",
+	} {
+		if !got[keep] {
+			t.Errorf("migration deleted %s, which must be kept", keep)
+		}
+	}
+}
+
 func TestCountStaleSignatureEmbeddings(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

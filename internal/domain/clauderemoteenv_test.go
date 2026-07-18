@@ -116,16 +116,24 @@ func TestClaudeRemoteEnvApprovalSignaturePassesOverMaskGuard(t *testing.T) {
 	// so the decision core never dismisses the picker as over_masked (the
 	// original failure: classified idle, raw trailing-window salient tripped
 	// the guard).
+	form, ok := ClaudeRemoteEnvForm(remoteEnvPicker)
+	if !ok {
+		t.Fatal("fixture no longer parses as a remote-env picker")
+	}
 	s := Situation{
 		AgentType:      "claude",
 		Type:           SituationApproval,
 		Content:        remoteEnvPicker,
-		PermissionVerb: "select remote environment",
+		PermissionVerb: PermissionVerbSelectRemoteEnv,
+		Options:        form.OptionLabels(),
 	}
 	sig := ComputeSignature(s)
 	if sig.Verdict != GuardOK {
 		t.Fatalf("verdict = %v, want %v (salient %q)", sig.Verdict, GuardOK, sig.Salient)
 	}
+	// The env labels are the learned action, not the key: even with Options
+	// populated the salient stays verb-only (the issue #155 option folding
+	// exempts this picker).
 	if sig.Salient != "permission:select remote environment" {
 		t.Errorf("salient = %q", sig.Salient)
 	}

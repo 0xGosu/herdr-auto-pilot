@@ -82,6 +82,36 @@ func TestGoldenTranscripts(t *testing.T) {
 	}
 }
 
+// TestApprovalSignaturesDoNotCollideAcrossScreens is the end-to-end
+// regression for issue #155: a Claude plan-approval screen and a Bash command
+// approval both extract verb "proceed", but their option sets differ, so
+// their signatures must differ — a "Yes" rule learned on one must never
+// auto-fire on the other.
+func TestApprovalSignaturesDoNotCollideAcrossScreens(t *testing.T) {
+	c := New(nil)
+	sigFor := func(name string) domain.SignatureResult {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join("testdata", "transcripts", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := c.Classify("claude", "blocked", string(data))
+		if s.Type != domain.SituationApproval {
+			t.Fatalf("%s classified %v, want approval", name, s.Type)
+		}
+		sig := domain.ComputeSignature(s)
+		if sig.Verdict != domain.GuardOK {
+			t.Fatalf("%s verdict = %v, want ok (salient %q)", name, sig.Verdict, sig.Salient)
+		}
+		return sig
+	}
+	plan := sigFor("approval_claude_plan.txt")
+	perm := sigFor("approval_permission.txt")
+	if plan.Signature == perm.Signature {
+		t.Errorf("plan approval and permission approval share a signature (salient %q)", plan.Salient)
+	}
+}
+
 func TestUnclassifiableFailsSafe(t *testing.T) {
 	c := New(nil)
 	s := c.Classify("claude", "blocked", "completely novel pane content with no known shape")

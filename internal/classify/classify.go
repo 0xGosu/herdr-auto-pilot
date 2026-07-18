@@ -263,7 +263,7 @@ func enrich(s *domain.Situation) {
 				// pickers share one signature; the env labels are the learned
 				// ACTION, not the key. Delivery re-maps the learned label onto
 				// the live option set and fails closed when it is absent.
-				s.PermissionVerb = "select remote environment"
+				s.PermissionVerb = domain.PermissionVerbSelectRemoteEnv
 				s.Options = append(s.Options, form.OptionLabels()...)
 				return
 			}

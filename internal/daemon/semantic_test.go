@@ -119,10 +119,12 @@ func approvalSituation(verb string) domain.Situation {
 }
 
 func TestResolveSignatureMintsThenRemapsSemantically(t *testing.T) {
+	// Keys are the exact salient texts the new-format approvals produce
+	// (options-less approvals still carry the "| options:" segment).
 	emb := &fakeEmbedder{vectors: map[string][]float32{
-		"permission:edit the config file":   {1, 0, 0, 0},
-		"permission:modify the config file": {0.99, 0.14, 0, 0}, // cos ≈ 0.99
-		"permission:delete the database":    {0, 1, 0, 0},
+		"permission:edit the config file | options:":   {1, 0, 0, 0},
+		"permission:modify the config file | options:": {0.99, 0.14, 0, 0}, // cos ≈ 0.99
+		"permission:delete the database | options:":    {0, 1, 0, 0},
 	}}
 	d := semanticHarness(t, emb, "")
 	ctx := context.Background()
@@ -212,7 +214,7 @@ func TestResolveSignatureExactHitSkipsEmbedding(t *testing.T) {
 
 func TestResolveSignatureBM25FallbackOnEmbedFailure(t *testing.T) {
 	emb := &fakeEmbedder{vectors: map[string][]float32{
-		"permission:write the deployment manifest file": {1, 0, 0, 0},
+		"permission:write the deployment manifest file | options:": {1, 0, 0, 0},
 	}}
 	d := semanticHarness(t, emb, "")
 	ctx := context.Background()
@@ -305,7 +307,7 @@ func TestResolveSignatureDisabledPassesThrough(t *testing.T) {
 func TestInitSemanticRebuildsFromStoreAndReembedsForeignModels(t *testing.T) {
 	ctx := context.Background()
 	emb := &fakeEmbedder{vectors: map[string][]float32{
-		"permission:push to remote": {0, 1, 0, 0},
+		"permission:push to remote | options:": {0, 1, 0, 0},
 	}}
 	dir := t.TempDir()
 	raw, err := store.Open(filepath.Join(dir, "test.db"))
@@ -315,10 +317,12 @@ func TestInitSemanticRebuildsFromStoreAndReembedsForeignModels(t *testing.T) {
 	t.Cleanup(func() { raw.Close() })
 
 	// A row persisted by an older/different model: wrong dims, other model id.
+	// (Current salient format — model drift, not the pre-#155 verb-only
+	// format, which migrate() would prune.)
 	if err := raw.UpsertSignatureEmbedding(ctx, domain.SignatureEmbedding{
 		Signature: "approval:legacy", SituationType: domain.SituationApproval,
 		AgentType: "claude", Model: "old-model", Dims: 2, Vector: []float32{1, 0},
-		Salient: "permission:push to remote", CreatedAt: time.Now(),
+		Salient: "permission:push to remote | options:", CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -356,6 +360,79 @@ func TestInitSemanticRebuildsFromStoreAndReembedsForeignModels(t *testing.T) {
 	}
 }
 
+// TestResolveSignatureApprovalRemapVetoedAcrossScreens pins the issue #155
+// residual: similarity score alone (cosine here) can bridge two DIFFERENT
+// approval screens that share a verb — a plan approval and a Bash command
+// approval both phrased "…to proceed?". The remap gate requires option-set
+// overlap, so even a perfect score must not merge them, while a paraphrase
+// of the same screen (same options, different verb wording) still remaps.
+func TestResolveSignatureApprovalRemapVetoedAcrossScreens(t *testing.T) {
+	planOpts := []string{"Yes, and use auto mode", "Yes, manually approve edits", "No, refine the plan"}
+	mkSit := func(verb string, opts []string) domain.Situation {
+		return domain.Situation{
+			Type: domain.SituationApproval, AgentType: "claude",
+			AgentID: "w1:p1", PaneID: "p1", PermissionVerb: verb, Options: opts,
+		}
+	}
+	planSit := mkSit("proceed", planOpts)
+	bashSit := mkSit("proceed", []string{
+		"Yes", "Yes, and don't ask again for go test commands",
+		"No, and tell Claude what to do differently"})
+	paraSit := mkSit("continue with this plan", planOpts)
+
+	// Vector geometry: bash and the paraphrase are both ≥ the 0.90 default
+	// similarity threshold vs plan, so only the option gate separates them.
+	emb := &fakeEmbedder{vectors: map[string][]float32{
+		domain.ComputeSignature(planSit).Salient: {1, 0, 0, 0},
+		domain.ComputeSignature(bashSit).Salient: {0.97, 0.2425, 0, 0},   // cos ≈ 0.97 vs plan
+		domain.ComputeSignature(paraSit).Salient: {0.9995, 0.0314, 0, 0}, // cos ≈ 0.9995 vs plan
+	}}
+	d := semanticHarness(t, emb, "")
+	ctx := context.Background()
+	cfg, _, _ := d.snapshot()
+
+	sigPlan := d.resolveSignature(ctx, cfg, domain.ComputeSignature(planSit), planSit)
+	if sigPlan.Signature != sigPlan.Raw {
+		t.Fatalf("first sight should mint its raw key, got %s", sigPlan.Signature)
+	}
+
+	// Different screen, same verb, cosine above threshold: gate must veto.
+	rawBash := domain.ComputeSignature(bashSit)
+	sigBash := d.resolveSignature(ctx, cfg, rawBash, bashSit)
+	if sigBash.Signature == sigPlan.Signature {
+		t.Fatal("bash approval merged with plan approval despite disjoint option sets")
+	}
+	if sigBash.Signature != rawBash.Raw || sigBash.Match.Method != domain.MatchNone {
+		t.Errorf("vetoed remap must mint a fresh key with no match method, got %s / %q",
+			sigBash.Signature, sigBash.Match.Method)
+	}
+	// The vetoed situation still persists its own identity for future events.
+	if n, _ := d.opt.Store.CountSignatureEmbeddings(ctx); n != 2 {
+		t.Errorf("embedding rows = %d, want 2 (plan + vetoed bash)", n)
+	}
+
+	// Same screen paraphrased (identical options): remap stays allowed.
+	sigPara := d.resolveSignature(ctx, cfg, domain.ComputeSignature(paraSit), paraSit)
+	if sigPara.Signature != sigPlan.Signature {
+		t.Errorf("paraphrase with identical options resolved to %s, want remap onto %s",
+			sigPara.Signature, sigPlan.Signature)
+	}
+
+	// BM25 fallback (embedder failing) must obey the same gate: a fresh
+	// bash-approval variant may text-match the learned plan salient, but must
+	// never resolve onto it.
+	emb.mu.Lock()
+	emb.fail = true
+	emb.mu.Unlock()
+	bash2 := mkSit("proceed", []string{
+		"Yes", "Yes, and don't ask again for npm install commands",
+		"No, and tell Claude what to do differently"})
+	sigBash2 := d.resolveSignature(ctx, cfg, domain.ComputeSignature(bash2), bash2)
+	if sigBash2.Signature == sigPlan.Signature {
+		t.Error("BM25 fallback merged a bash approval onto the plan approval")
+	}
+}
+
 // TestReembedNudgeSwapsEmbedderAndRetriesDegraded covers the KindReembed
 // path (reloadWith(true)): a failed re-embed pass — the shape a degraded
 // embedder latch leaves behind — is retried with a FRESH embedder even
@@ -373,7 +450,7 @@ func TestReembedNudgeSwapsEmbedderAndRetriesDegraded(t *testing.T) {
 	if err := raw.UpsertSignatureEmbedding(ctx, domain.SignatureEmbedding{
 		Signature: "approval:legacy", SituationType: domain.SituationApproval,
 		AgentType: "claude", Model: "old-model", Dims: 2, Vector: []float32{1, 0},
-		Salient: "permission:push to remote", CreatedAt: time.Now(),
+		Salient: "permission:push to remote | options:", CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}

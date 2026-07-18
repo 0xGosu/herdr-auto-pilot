@@ -132,12 +132,126 @@ func TestVarianceGuard(t *testing.T) {
 }
 
 func TestSalientContentUsesPermissionVerb(t *testing.T) {
+	opts := []string{"Yes", "No, and tell Claude what to do differently"}
 	a := ComputeSignature(Situation{Type: SituationApproval, AgentType: "claude",
-		PermissionVerb: "run shell command", Content: strings.Repeat("noise ", 100)})
+		PermissionVerb: "run shell command", Options: opts, Content: strings.Repeat("noise ", 100)})
 	b := ComputeSignature(Situation{Type: SituationApproval, AgentType: "claude",
-		PermissionVerb: "run shell command", Content: "completely different pane noise"})
+		PermissionVerb: "run shell command", Options: opts, Content: "completely different pane noise"})
 	if a.Signature != b.Signature {
-		t.Error("approval signatures should key on the permission verb, not pane noise")
+		t.Error("approval signatures should key on the permission verb and options, not pane noise")
+	}
+}
+
+func TestApprovalSalientFoldsOptions(t *testing.T) {
+	// Issue #155: the verb alone let a Claude plan-approval screen and a Bash
+	// command approval — both phrased "…to proceed?" — share one signature, so
+	// a rule learned on one auto-fired on the other. The option set is the
+	// screen's identity and must fold into the salient.
+	mk := func(verb string, opts ...string) Situation {
+		return Situation{Type: SituationApproval, AgentType: "claude",
+			PermissionVerb: verb, Options: opts,
+			Content: "Do you want to proceed with the requested action right now?"}
+	}
+	planOpts := []string{
+		"Yes, and use auto mode",
+		"Yes, manually approve edits",
+		"No, refine the plan",
+		"Tell Claude what to change",
+	}
+	bashOpts := []string{
+		"Yes",
+		"Yes, and don't ask again for: hap task commands",
+		"No, and tell Claude what to do differently",
+	}
+
+	plan := ComputeSignature(mk("proceed", planOpts...))
+	bash := ComputeSignature(mk("proceed", bashOpts...))
+	if plan.Verdict != GuardOK || bash.Verdict != GuardOK {
+		t.Fatalf("verdicts = %v / %v, want ok (salients %q / %q)",
+			plan.Verdict, bash.Verdict, plan.Salient, bash.Salient)
+	}
+	if plan.Signature == bash.Signature {
+		t.Errorf("plan approval and bash approval with the same verb must not share a signature (salient %q)", plan.Salient)
+	}
+
+	reordered := ComputeSignature(mk("proceed", "  no, refine the plan ",
+		"Tell Claude what to change", "YES, AND USE AUTO MODE", "yes, manually approve edits"))
+	if reordered.Signature != plan.Signature {
+		t.Errorf("option order/case/whitespace must not change the signature:\n%q\nvs\n%q",
+			reordered.Salient, plan.Salient)
+	}
+
+	bare := ComputeSignature(Situation{Type: SituationApproval, AgentType: "claude",
+		PermissionVerb: "proceed with the migration steps",
+		Content:        "Do you want to proceed with the migration steps?"})
+	if !strings.HasSuffix(bare.Salient, "| options:") {
+		t.Errorf("optionless approval salient must still carry the options segment, got %q", bare.Salient)
+	}
+	withOpts := ComputeSignature(Situation{Type: SituationApproval, AgentType: "claude",
+		PermissionVerb: "proceed with the migration steps", Options: []string{"Yes", "No"},
+		Content: "Do you want to proceed with the migration steps?"})
+	if bare.Signature == withOpts.Signature {
+		t.Error("empty and non-empty option sets must produce different signatures")
+	}
+
+	// The remote-env picker is exempt: its env labels are the learned action,
+	// not the key, so differing environment lists share one signature.
+	envA := ComputeSignature(Situation{Type: SituationApproval, AgentType: "claude",
+		PermissionVerb: PermissionVerbSelectRemoteEnv,
+		Options:        []string{"herdr-auto-pilot (env_A)", "Default (env_B)"},
+		Content:        "Select remote environment"})
+	envB := ComputeSignature(Situation{Type: SituationApproval, AgentType: "claude",
+		PermissionVerb: PermissionVerbSelectRemoteEnv,
+		Options:        []string{"other-project (env_C)"},
+		Content:        "Select remote environment"})
+	if envA.Signature != envB.Signature {
+		t.Errorf("remote-env pickers with different env lists must share a signature:\n%q\nvs\n%q",
+			envA.Salient, envB.Salient)
+	}
+}
+
+func TestApprovalRemapCompatible(t *testing.T) {
+	cases := []struct {
+		name, a, b string
+		want       bool
+	}{
+		{"identical option sets",
+			"permission:proceed | options:no;yes",
+			"permission:continue | options:no;yes", true},
+		{"half overlap passes",
+			"permission:proceed | options:no, and tell claude what to do differently;yes;yes, and don't ask again for go test commands",
+			"permission:proceed | options:no, and tell claude what to do differently;yes;yes, and don't ask again for npm install commands", true},
+		{"disjoint sets veto (plan vs bash)",
+			"permission:proceed | options:no, refine the plan;tell claude what to change;yes, and use auto mode;yes, manually approve edits",
+			"permission:proceed | options:no, and tell claude what to do differently;yes;yes, and don't ask again for go test commands", false},
+		{"below-half overlap vetoes",
+			"permission:proceed | options:a;b;c;d",
+			"permission:proceed | options:a;x;y;z", false},
+		{"both option-less approvals stay compatible",
+			"permission:edit the config file | options:",
+			"permission:modify the config file | options:", true},
+		{"empty vs populated vetoes",
+			"permission:proceed | options:",
+			"permission:proceed | options:no;yes", false},
+		{"verb-only candidate (pre-fix row) vetoes",
+			"permission:proceed | options:no;yes",
+			"permission:proceed", false},
+		{"verb-only query (remote-env picker) vetoes",
+			"permission:select remote environment",
+			"permission:select remote environment | options:x", false},
+		{"two pane-tail salients stay compatible (verbless approvals)",
+			"the agent wants approval to frobnicate the widget",
+			"the agent asks approval to frobnicate the widget now", true},
+		{"pane-tail vs permission salient vetoes",
+			"permission:proceed | options:no;yes",
+			"some trailing pane content asking for approval", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ApprovalRemapCompatible(c.a, c.b); got != c.want {
+				t.Errorf("ApprovalRemapCompatible(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+			}
+		})
 	}
 }
 

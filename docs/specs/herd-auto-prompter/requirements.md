@@ -44,7 +44,7 @@ The plugin SHALL classify each attention-requiring transition into exactly one o
 **FR-003 — Situation signature generation.**
 For each classified situation, the plugin SHALL derive a stable situation signature usable for matching against historical decisions.
 The signature SHALL:
-- Retain the **situation type**, the **agent type**, and the **salient decision content** — the normalized option set (for multiple-choice) or the permission verb/action (for approval/permission).
+- Retain the **situation type**, the **agent type**, and the **salient decision content** — the normalized option set (for multiple-choice) or the permission verb/action **plus** the normalized option set (for approval/permission; the remote-environment picker is exempt from option folding — its environment labels are the learned action, not the key). Folding options into approvals keeps very different screens that share a verb (a plan approval and a command approval both phrased "…to proceed?") from colliding into one learned rule.
 - **Mask volatile tokens** before hashing — absolute paths, hashes, line numbers, timestamps, UUIDs, and similar variable spans are replaced with typed placeholders so equivalent prompts collapse to one signature.
 - Be **scoped per agent type**, so one agent type's learned habits do not leak into another's signatures.
 *Acceptance:* Two prompts differing only in volatile tokens (paths, hashes, timestamps) produce the same signature; prompts differing in situation type, option set, permission verb, or agent type produce different signatures.
