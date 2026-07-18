@@ -2553,9 +2553,11 @@ func TestIdleTaskGenSkipsWhenOverMaxTasks(t *testing.T) {
 	// call returns.
 	dir := t.TempDir()
 	taskFile := filepath.Join(dir, "tasks.md")
-	// Four items (all done → pending exhausted, so generation would fire) with
-	// max_tasks = 3, i.e. 4 > 3 → over the cap.
-	os.WriteFile(taskFile, []byte("- [x] a\n- [x] b\n- [x] c\n- [x] d\n"), 0o600)
+	// Three items (all done → pending exhausted, so generation would fire)
+	// with max_tasks = 3: at-cap counts as full (3 >= 3) — appending even one
+	// generated task would exceed the cap, and the confirm-time append would
+	// refuse it, so generating would only raise unconfirmable escalations.
+	os.WriteFile(taskFile, []byte("- [x] a\n- [x] b\n- [x] c\n"), 0o600)
 
 	cfg := fmt.Sprintf(
 		"[[task_sources]]\nagent = \"agent-77\"\npath = %q\nmax_tasks = 3\n\n[llm]\ntask_generate_command = [\"fake\"]\ntask_generate_command_start = [\"fake-start\"]\n",

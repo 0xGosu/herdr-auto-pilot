@@ -733,9 +733,10 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// means the sentinel, and the literal spelling must never be learned
 	// as pane text (free text like "do nothing" stays literal).
 	action = domain.NormalizeNoopAction(action)
-	// Confirming an idle task suggestion is not a pane send: it writes a
-	// per-agent tasks.md, registers it as a task source, and (when send) hands
-	// the task to the agent. Handle it before the send-oriented flow below.
+	// Confirming an idle task suggestion is not a pane send: it appends the
+	// tasks to the agent's declared task source (or bootstraps a per-agent
+	// tasks.md when none exists) and, when send, hands the first task to the
+	// agent. Handle it before the send-oriented flow below.
 	if action == domain.SuggestGenerateTask {
 		return a.acceptGeneratedTask(ctx, audit, send)
 	}
@@ -847,16 +848,21 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	return a.nudge(ctx, control.KindReload)
 }
 
-// acceptGeneratedTask confirms an idle task suggestion: it writes a per-agent
-// tasks.md (every item pending "[ ]"), registers it as a task source in
-// config.toml, records the correction that resolves the escalation, and — when
-// send — reserves the first item "[-]" and hands it to the agent, rolling it
+// acceptGeneratedTask confirms an idle task suggestion. When the agent
+// already has a declared task source, the generated tasks refill THAT list:
+// they are appended to the source's own file (appendGeneratedTasks) — never
+// written to a second per-agent file, which would register a duplicate
+// [[task_sources]] entry and make `hap task <agent>` ambiguous (issue #157).
+// Only when no declared source matches does it bootstrap: write a per-agent
+// tasks.md (every item pending "[ ]"), register it as a task source in
+// config.toml, record the correction that resolves the escalation, and — when
+// send — reserve the first item "[-]" and hand it to the agent, rolling it
 // back to "[ ]" if the send fails. Without send the file stays all-pending so
 // the daemon's idle flow delivers the first item on the next idle; pre-marking
 // "[-]" at write time would strand it forever, since "[-]" is exactly what
-// suppresses the idle resend (issue #156). Side effects run source-first so a
-// send failure never leaves the agent without the task source that was just
-// established.
+// suppresses the idle resend (issue #156). Bootstrap side effects run
+// source-first so a send failure never leaves the agent without the task
+// source that was just established.
 func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord, send bool) error {
 	// The suggestion may carry one task or several (plain or as a Markdown
 	// list); normalize into clean bare task strings so the file is always a
@@ -879,14 +885,18 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// raised. If the agent has since started working, sending an outdated task
 	// would interrupt it — refuse rather than create a source and send. Fail
 	// open when the status is unknown (list error / agent absent): the operator
-	// explicitly asked to confirm.
+	// explicitly asked to confirm. The matched transition is kept for the
+	// declared-source resolution below (workspace-scoped selectors need the
+	// agent's live workspace).
+	var live *domain.AgentTransition
 	if a.Herdr != nil {
 		if agents, lerr := a.Herdr.ListAgents(ctx); lerr == nil {
-			for _, ag := range agents {
+			for i, ag := range agents {
 				if ag.AgentID == audit.AgentID {
 					if domain.AgentBusy(ag.Status) {
 						return fmt.Errorf("agent is no longer idle (%s); the suggested task is stale — dismiss it or wait until the agent is idle", ag.Status)
 					}
+					live = &agents[i]
 					break
 				}
 			}
@@ -898,6 +908,21 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	name, err := a.Store.EnsureAgentName(ctx, audit.AgentID)
 	if err != nil || name == "" {
 		name = audit.AgentID
+	}
+
+	// Exhausted-declared-source case (issue #157): when a declared source
+	// already matches this agent, generation was refilling that list — append
+	// to its file. Bootstrapping here instead would register a second source
+	// for the same agent and break `hap task <agent>` with a "matches 2 task
+	// sources" ambiguity. A config read error fails the confirm (the bootstrap
+	// path could not register its source either), leaving the escalation
+	// pending for a retry.
+	cfg, cerr := a.Config()
+	if cerr != nil {
+		return fmt.Errorf("read config: %w", cerr)
+	}
+	if src, ok := pickAppendTarget(a.matchingDeclaredSources(ctx, cfg, audit, name, live)); ok {
+		return a.appendGeneratedTasks(ctx, audit, src, name, tasks, send)
 	}
 
 	// Idempotent side effects FIRST (before the claim): writing the file and
@@ -930,7 +955,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// nudges the daemon to reload). Idempotent: a re-confirm for the same
 	// agent+path never stacks duplicate entries. Scope by the agent selector;
 	// workspace "" = any so the source follows the agent across workspaces.
-	if err := a.addTaskSourceIfAbsent(ctx, name, path); err != nil {
+	if err := a.addTaskSourceIfAbsent(ctx, audit.AgentID, audit.AgentType, name, path); err != nil {
 		return fmt.Errorf("register task source: %w", err)
 	}
 
@@ -1065,20 +1090,247 @@ func carryOverChecklistMarks(existing, rendered string) string {
 	return strings.Join(lines, "\n")
 }
 
+// matchingDeclaredSources returns the [[task_sources]] entries that match the
+// confirming agent, using the same selector semantics as the daemon's
+// matchTaskSource (agent id / type / short name; workspace name with "*"
+// wildcards, falling back to the raw workspace id). Workspace-scoped sources
+// are matched best-effort against the agent's live workspace; when that is
+// unresolvable (no live transition, no locator) only unscoped ("" / "*")
+// selectors match, failing soft toward the bootstrap path — where the
+// addTaskSourceIfAbsent guard still refuses to create a duplicate.
+func (a *App) matchingDeclaredSources(ctx context.Context, cfg config.Config, audit *domain.AuditRecord, agentName string, live *domain.AgentTransition) []config.TaskSource {
+	var out []config.TaskSource
+	wsTarget, wsResolved := "", false
+	for _, src := range cfg.TaskSources {
+		if !src.MatchesAgent(audit.AgentID, audit.AgentType, agentName) {
+			continue
+		}
+		if src.Workspace != "" && src.Workspace != "*" {
+			if !wsResolved {
+				wsTarget, wsResolved = a.agentWorkspaceTarget(ctx, live), true
+			}
+			if wsTarget == "" || !domain.MatchWorkspace(src.Workspace, wsTarget) {
+				continue
+			}
+		}
+		out = append(out, src)
+	}
+	return out
+}
+
+// agentWorkspaceTarget resolves the string a workspace selector matches
+// against for the given live agent: the workspace's display name (label) when
+// a LocatorPort can resolve it, else the raw workspace id — the same
+// name-falling-back-to-id rule as the daemon's workspaceName. "" means the
+// workspace is unknown.
+func (a *App) agentWorkspaceTarget(ctx context.Context, live *domain.AgentTransition) string {
+	if live == nil || live.WorkspaceID == "" || a.Herdr == nil {
+		return ""
+	}
+	if loc, ok := a.Herdr.(ports.LocatorPort); ok {
+		if wss, err := loc.ListWorkspaces(ctx); err == nil {
+			for _, w := range wss {
+				if w.ID == live.WorkspaceID && w.Label != "" {
+					return w.Label
+				}
+			}
+		}
+	}
+	return live.WorkspaceID
+}
+
+// pickAppendTarget chooses which matched declared source receives the
+// generated tasks, mirroring matchTaskSource's precedence so the confirm
+// appends to the source the daemon reasoned about: first with a pending
+// "[ ]" item, else first whose file has checklist items, else the first
+// match in config order (which also covers an empty or not-yet-created file —
+// appending there bootstraps the DECLARED path instead of a duplicate).
+func pickAppendTarget(sources []config.TaskSource) (config.TaskSource, bool) {
+	if len(sources) == 0 {
+		return config.TaskSource{}, false
+	}
+	var withItems *config.TaskSource
+	for i := range sources {
+		p := sources[i].Path
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if domain.NextDeclaredTask(string(data)) != "" {
+			return sources[i], true
+		}
+		if withItems == nil && domain.HasChecklistItems(string(data)) {
+			withItems = &sources[i]
+		}
+	}
+	if withItems != nil {
+		return *withItems, true
+	}
+	return sources[0], true
+}
+
+// appendGeneratedTasks confirms generated tasks for an agent that already has
+// a declared task source: the tasks are appended to that source's own file.
+// Ordering differs from the bootstrap path — an append is NOT idempotent, so
+// the escalation is claimed FIRST and the append runs after it, exactly like
+// the non-idempotent send (a double-submit fails at the claim). All items are
+// appended pending ("[ ]"); when send succeeds, the first is flipped to
+// in-progress ("[-]") afterwards, so a failed send never strands an
+// in-progress item the daemon would refuse to re-deliver.
+func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecord, src config.TaskSource, name string, tasks []string, send bool) error {
+	path := src.Path
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	limit := src.MaxTasksLimit()
+
+	// Pre-claim cap check: the daemon gated generation when it ran, but the
+	// list may have grown since (manual adds). Refusing BEFORE the claim
+	// leaves the escalation pending, so the operator can prune the list and
+	// confirm again. A missing file is fine (created below); any other read
+	// error must also refuse pre-claim — claiming first and then failing the
+	// in-lock read would consume the escalation with nothing appended.
+	if data, err := os.ReadFile(path); err == nil {
+		if current := len(domain.ParseChecklist(string(data))); current >= limit {
+			return fmt.Errorf("maximum number of tasks reached for %s (%d items, cap %d) — clean up the task list to make room, then confirm again", path, current, limit)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read task list %s: %w", path, err)
+	}
+	// The declared file may not exist yet (a freshly added source): create it
+	// so mutateTaskFile's stat succeeds. Idempotent, so it runs pre-claim.
+	if _, err := os.Stat(path); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return fmt.Errorf("create task list dir: %w", err)
+		}
+		if err := os.WriteFile(path, []byte("# Tasks for "+name+"\n\n"), 0o600); err != nil {
+			return fmt.Errorf("create task list file: %w", err)
+		}
+	}
+
+	// Atomically CLAIM the escalation. Only the writer that flips
+	// escalated→resolved proceeds to the append and send, so a double-submit
+	// can never append or send the tasks twice.
+	claimed, err := a.Store.ResolveEscalation(ctx, audit.ID)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return fmt.Errorf("audit record %d is no longer a pending escalation", audit.ID)
+	}
+
+	firstIndex := 0
+	if _, err := mutateTaskFile(path, func(content string) (string, error) {
+		// Recomputed inside the lock: a racing add may have consumed the room
+		// the pre-claim check saw. Appending fewer tasks than suggested beats
+		// refusing the operator's explicit "start now" — but zero room means
+		// nothing can land, so surface that.
+		room := limit - len(domain.ParseChecklist(content))
+		if room <= 0 {
+			return "", fmt.Errorf("maximum number of tasks reached (cap %d)", limit)
+		}
+		if room < len(tasks) {
+			slog.Warn("truncating generated tasks to the source's max_tasks cap",
+				"path", path, "cap", limit, "dropped", len(tasks)-room)
+			tasks = tasks[:room]
+		}
+		out := content
+		for i, task := range tasks {
+			var idx int
+			var e error
+			out, idx, e = domain.AppendChecklistItem(out, domain.EncodeTaskNewlines(task))
+			if e != nil {
+				return "", e
+			}
+			if i == 0 {
+				firstIndex = idx
+			}
+		}
+		return out, nil
+	}); err != nil {
+		return fmt.Errorf("escalation resolved, but appending the generated tasks to %s failed: %w", path, err)
+	}
+
+	// Record the correction so the idle signature learns to drive from its
+	// declared task list. Best-effort, as in the bootstrap path.
+	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
+		Author: a.Author, CreatedAt: time.Now(),
+	}); err != nil {
+		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", err)
+	}
+
+	if send && a.Herdr != nil {
+		// Only the first task is sent — the operator's "start now" task —
+		// rendered through the SOURCE's template (not the built-in default),
+		// pointing at the declared file. {cwd} is resolved only when the
+		// template references it, matching the daemon's declaredTask.
+		cwd := ""
+		if strings.Contains(domain.TemplateOrDefault(src.NextTaskTemplate), "{cwd}") {
+			if insp, ok := a.Herdr.(ports.InspectorPort); ok {
+				if pi, e := insp.PaneInfo(ctx, audit.AgentID); e == nil {
+					cwd = pi.ForegroundCwd
+					if cwd == "" {
+						cwd = pi.Cwd
+					}
+				}
+			}
+		}
+		prompt := domain.DeclaredTask{
+			Task: tasks[0], Path: path, Template: src.NextTaskTemplate,
+			AgentName: name, Cwd: cwd,
+		}.Prompt()
+		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
+			return fmt.Errorf("tasks appended to %s, but sending the task to the agent failed: %w", path, err)
+		}
+		// Delivery succeeded: flip the delivered task to in-progress so the
+		// daemon's declared flow does not re-send it on the next idle.
+		// Best-effort — a failed flip only risks a duplicate send later,
+		// which is safer than an undelivered "[-]" the daemon skips. Indices
+		// are positional and renumber on delete, so the flip is text-guarded
+		// (expectTaskText) against a concurrent edit in the send window.
+		if _, err := mutateTaskFile(path, func(content string) (string, error) {
+			if err := expectTaskText(content, firstIndex, domain.EncodeTaskNewlines(tasks[0])); err != nil {
+				return "", err
+			}
+			return domain.MarkChecklistItemInProgress(content, firstIndex)
+		}); err != nil {
+			slog.Warn("marking the delivered generated task in-progress failed", "path", path, "index", firstIndex, "error", err)
+		}
+	}
+	return a.nudge(ctx, control.KindReload)
+}
+
 // addTaskSourceIfAbsent registers a task list for an agent, skipping the append
 // when an identical agent+path entry already exists — so confirming the same
-// generated-task escalation twice never accumulates duplicate sources.
-func (a *App) addTaskSourceIfAbsent(ctx context.Context, agent, path string) error {
+// generated-task escalation twice never accumulates duplicate sources. An
+// existing source whose non-empty selector matches this agent (by id, type,
+// or short name — the same MatchesAgent semantics the daemon uses) under a
+// DIFFERENT path is refused outright: two sources matching one agent is
+// exactly the "matches 2 task sources" ambiguity issue #157 fixed, so this
+// guard keeps any residual bootstrap path (e.g. a workspace-scoped source the
+// confirm could not resolve) from re-creating it. An empty ("" = any-agent)
+// selector is deliberately not refused — a catch-all scoped to another
+// workspace must not block an unrelated agent's bootstrap.
+func (a *App) addTaskSourceIfAbsent(ctx context.Context, agentID, agentType, name, path string) error {
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		for _, ts := range cfg.TaskSources {
-			if ts.Agent == agent && ts.Path == path {
+			if ts.Agent == name && ts.Path == path {
 				return nil
 			}
 		}
-		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{Agent: agent, Path: path})
+		for _, ts := range cfg.TaskSources {
+			if ts.Agent != "" && ts.MatchesAgent(agentID, agentType, name) {
+				return fmt.Errorf("agent %q already has a task source (%s); refusing to register a second — append the generated tasks to it instead", name, ts.Path)
+			}
+		}
+		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{Agent: name, Path: path})
 		return nil
 	})
 }

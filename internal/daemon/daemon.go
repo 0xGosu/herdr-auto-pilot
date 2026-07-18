@@ -1900,8 +1900,12 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 	// a pending-consult row that the in-flight guard then trips on forever.
 	if sourceExhausted {
 		agentName, _ := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
+		// At-cap counts as full (n >= limit, matching AddTask and the
+		// confirm-time append): appending even one generated task to a list
+		// already holding max_tasks items would exceed the cap, so generating
+		// would only raise escalations every confirm must refuse.
 		if m, ok := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName); ok {
-			if n, limit := len(domain.ParseChecklist(string(m.data))), m.src.MaxTasksLimit(); n > limit {
+			if n, limit := len(domain.ParseChecklist(string(m.data))), m.src.MaxTasksLimit(); n >= limit {
 				name := agentName
 				if name == "" {
 					name = s.AgentID
@@ -3524,8 +3528,7 @@ func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID
 	var completed *taskSourceMatch
 	wsName, wsResolved := "", false
 	for _, src := range cfg.TaskSources {
-		if src.Agent != "" && src.Agent != agentID && src.Agent != agentType &&
-			(agentName == "" || src.Agent != agentName) {
+		if !src.MatchesAgent(agentID, agentType, agentName) {
 			continue
 		}
 		if src.Workspace != "" && src.Workspace != "*" {
