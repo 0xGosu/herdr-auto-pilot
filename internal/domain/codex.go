@@ -141,12 +141,16 @@ func ExtractCodexMCQForm(pane string) string {
 // codexComposerBeforeFooterRE matches Codex's live composer/input-box line —
 // prefixed with "›" (U+203A) at line start — ONLY when it directly precedes
 // (modulo blank lines) the composer's status footer, a line naming the model
-// and the working directory (e.g. "gpt-5.6-sol high · /tmp"), AND that
+// and the working directory (e.g. "gpt-5.6-sol high · /tmp"; cwds under $HOME
+// render ~-relative, "gpt-5.6-sol high · ~/project", so the path may also be
+// "~/..." or a bare "~" — issue #160. The tilde branch is deliberately that
+// narrow: a "~" followed by anything but "/" or end-of-line, e.g. an
+// approximation trailer like "took · ~2s", is NOT a footer), AND that
 // footer is the very last thing in the captured text (anchored on \z, not
 // end-of-line): every live capture shows the composer+footer pair sitting at
 // the true bottom of the screen, so requiring end-of-text is what actually
 // distinguishes the live footer from an agent response that merely contains
-// the same " · /" shape (e.g. "the config lives at foo · /etc/app.conf")
+// the same " · /" or " · ~/" shape (e.g. "the config lives at foo · /etc/app.conf")
 // mid-transcript — a per-line "$" anchor alone would wrongly accept that as
 // a footer and delete the real submitted message above it. Confirmed via
 // live capture: Codex reuses the SAME "›" glyph to render a past SUBMITTED
@@ -166,13 +170,16 @@ func ExtractCodexMCQForm(pane string) string {
 // Residual, accepted risk: this is a text-only heuristic, not a real parse —
 // if a genuinely-submitted message's real response is itself the literal
 // last thing in the captured text AND that response happens to contain the
-// same " · /" shape, the message above it is misidentified as a composer
-// line and stripped. Narrower than the mid-transcript case \z closes (the
+// same " · /" (or " · ~/", " · ~") shape, the message above it is
+// misidentified as a composer line and stripped. The tilde branch accepts
+// only "~/..." and bare "~" — approximation tildes ("took · ~2s"), common in
+// agent output, deliberately do not match (issue #160 review).
+// Narrower than the mid-transcript case \z closes (the
 // confusable text must be the true tail of the buffer, which in practice is
 // almost always the real footer), and not fully closeable without semantic
 // understanding of the pane, so it is left as a known limitation rather than
 // chased further.
-var codexComposerBeforeFooterRE = regexp.MustCompile(`(?m)^[ \t]*›[^\n]*\n((?:[ \t]*\r?\n)*[ \t]*[^\n]*\s·\s+/[^\n]*\r?\n?)\z`)
+var codexComposerBeforeFooterRE = regexp.MustCompile(`(?m)^[ \t]*›[^\n]*\n((?:[ \t]*\r?\n)*[ \t]*[^\n]*\s·\s+(?:/[^\n]*|~(?:/[^\n]*)?[ \t]*)\r?\n?)\z`)
 
 // StripCodexComposer removes Codex's live composer/input-box line from pane
 // text, keeping its footer (model name + cwd) and any real submitted

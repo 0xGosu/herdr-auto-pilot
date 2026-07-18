@@ -160,6 +160,41 @@ func TestStripCodexComposer(t *testing.T) {
 			"some output\n\n  gpt-5.6-sol high · /tmp\n",
 		},
 		{
+			// Live-observed (issue #160): codex renders a cwd under $HOME as a
+			// ~-relative path in the footer. The strip must fire for those
+			// sessions too, not only absolute "/" paths.
+			"tilde-cwd footer: placeholder stripped, footer kept",
+			"some output\n\n› Use /skills to list available skills\n\n  gpt-5.6-sol high · ~/hap-codex-test\n",
+			"some output\n\n\n  gpt-5.6-sol high · ~/hap-codex-test\n",
+		},
+		{
+			"tilde-cwd footer with no composer line is a no-op",
+			"some output\n\n  gpt-5.6-sol high · ~/hap-codex-test\n",
+			"some output\n\n  gpt-5.6-sol high · ~/hap-codex-test\n",
+		},
+		{
+			// A "·"-separated trailer whose path starts with neither "/" nor
+			// "~" is not the footer shape — the line above it is real content.
+			"non-path trailer after · does not strip the line above",
+			"› is this a composer?\n\n  gpt-5.6-sol high · unknown\n",
+			"› is this a composer?\n\n  gpt-5.6-sol high · unknown\n",
+		},
+		{
+			// The tilde branch accepts only "~/..." and bare "~" (issue #160
+			// review): an approximation-tilde trailer (" · ~2s") is common in
+			// agent output and must NOT read as the footer — the submitted
+			// "›" message above it survives.
+			"approximation-tilde trailer does not strip the message above",
+			"› how long did the build take?\n\nbuild finished · ~2s\n",
+			"› how long did the build take?\n\nbuild finished · ~2s\n",
+		},
+		{
+			// cwd exactly $HOME renders as a bare "~" footer.
+			"bare-tilde footer: placeholder stripped, footer kept",
+			"some output\n\n› Explain this codebase\n\n  gpt-5.6-sol high · ~\n",
+			"some output\n\n\n  gpt-5.6-sol high · ~\n",
+		},
+		{
 			"leading whitespace before glyph stripped",
 			"some output\n\n  › draft text\n\n  gpt-5.6-sol high · /tmp\n",
 			"some output\n\n\n  gpt-5.6-sol high · /tmp\n",
