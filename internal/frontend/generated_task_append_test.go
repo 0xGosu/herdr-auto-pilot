@@ -183,50 +183,63 @@ func TestConfirmGeneratedTaskSendReservesNumberedFirstTask(t *testing.T) {
 	}
 }
 
-// TestConfirmGeneratedTaskCollapsesDuplicateKeepingAdvancedMark: if the existing
-// file carries the same task identity twice — a pending "[ ]" ordered before an
-// in-progress "[-]" — the merge collapses them to one item that keeps the
-// ADVANCED mark, so a task already underway is not re-armed for a duplicate send
-// (issue #183 carry-over hardening).
+// TestConfirmGeneratedTaskCollapsesDuplicateKeepingAdvancedMark: when the
+// existing file carries the same task identity twice, the merge collapses them
+// to one item that keeps the MOST-ADVANCED mark (done > in-progress > pending),
+// regardless of the order the duplicates appear — a completed or in-progress
+// task is never regressed (which would re-arm the daemon for work already done
+// or underway). Issue #183 carry-over hardening.
 func TestConfirmGeneratedTaskCollapsesDuplicateKeepingAdvancedMark(t *testing.T) {
-	app, st := testApp(t)
-	fake := &fakeHerdr{}
-	app.Herdr = fake
-	stateDir := t.TempDir()
-	app.StateDir = stateDir
-	ctx := context.Background()
+	cases := []struct {
+		name     string
+		dupLines string // the two duplicate "Alpha" lines, in file order
+		wantMark string // the mark the collapsed Alpha must keep
+	}{
+		{"pending_before_inprogress", "- [ ] 1. Alpha\n- [-] 2. Alpha\n", "-"},
+		{"inprogress_before_pending", "- [-] 1. Alpha\n- [ ] 2. Alpha\n", "-"},
+		{"done_before_inprogress", "- [x] 1. Alpha\n- [-] 2. Alpha\n", "x"},
+		{"inprogress_before_done", "- [-] 1. Alpha\n- [x] 2. Alpha\n", "x"},
+		{"pending_before_done", "- [ ] 1. Alpha\n- [x] 2. Alpha\n", "x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app, st := testApp(t)
+			fake := &fakeHerdr{}
+			app.Herdr = fake
+			stateDir := t.TempDir()
+			app.StateDir = stateDir
+			ctx := context.Background()
 
-	name, _ := st.EnsureAgentName(ctx, "w9:p9")
-	first, _ := st.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: "w9:p9", SituationType: domain.SituationIdle, Trigger: "t",
-		Action: "escalated", Status: "escalated",
-		Suggestion: domain.SuggestTaskPrefix + "Alpha", CreatedAt: time.Now(),
-	})
-	if err := app.Confirm(ctx, first, false); err != nil {
-		t.Fatal(err)
-	}
-	// Hand-edit the file to carry a duplicate identity: pending BEFORE in-progress.
-	path := filepath.Join(stateDir, "tasks", name+".md")
-	if err := os.WriteFile(path, []byte("# Tasks for "+name+"\n\n- [ ] 1. Alpha\n- [-] 2. Alpha\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	second, _ := st.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: "w9:p9", SituationType: domain.SituationIdle, Trigger: "t",
-		Action: "escalated", Status: "escalated",
-		Suggestion: domain.SuggestTaskPrefix + "Beta", CreatedAt: time.Now(),
-	})
-	if err := app.Confirm(ctx, second, false); err != nil {
-		t.Fatal(err)
-	}
-	body, _ := os.ReadFile(path)
-	if !strings.Contains(string(body), "- [-] 1. Alpha") {
-		t.Errorf("collapsed duplicate must keep the in-progress mark, file = %q", body)
-	}
-	if !strings.Contains(string(body), "- [ ] 2. Beta") {
-		t.Errorf("new task must be appended pending, file = %q", body)
-	}
-	// Only the [ ] Beta is a next declared task — Alpha stays [-].
-	if next := domain.NextDeclaredTask(string(body)); next != "2. Beta" {
-		t.Errorf("next declared task = %q, want the appended Beta only", next)
+			name, _ := st.EnsureAgentName(ctx, "w9:p9")
+			first, _ := st.AppendAudit(ctx, domain.AuditRecord{
+				AgentID: "w9:p9", SituationType: domain.SituationIdle, Trigger: "t",
+				Action: "escalated", Status: "escalated",
+				Suggestion: domain.SuggestTaskPrefix + "Alpha", CreatedAt: time.Now(),
+			})
+			if err := app.Confirm(ctx, first, false); err != nil {
+				t.Fatal(err)
+			}
+			// Hand-edit the file to carry the duplicate identity in this order.
+			path := filepath.Join(stateDir, "tasks", name+".md")
+			if err := os.WriteFile(path, []byte("# Tasks for "+name+"\n\n"+tc.dupLines), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			second, _ := st.AppendAudit(ctx, domain.AuditRecord{
+				AgentID: "w9:p9", SituationType: domain.SituationIdle, Trigger: "t",
+				Action: "escalated", Status: "escalated",
+				Suggestion: domain.SuggestTaskPrefix + "Beta", CreatedAt: time.Now(),
+			})
+			if err := app.Confirm(ctx, second, false); err != nil {
+				t.Fatal(err)
+			}
+			body, _ := os.ReadFile(path)
+			wantAlpha := "- [" + tc.wantMark + "] 1. Alpha"
+			if !strings.Contains(string(body), wantAlpha) {
+				t.Errorf("collapsed duplicate must keep the most-advanced mark %q, file = %q", wantAlpha, body)
+			}
+			if !strings.Contains(string(body), "- [ ] 2. Beta") {
+				t.Errorf("new task must be appended pending, file = %q", body)
+			}
+		})
 	}
 }

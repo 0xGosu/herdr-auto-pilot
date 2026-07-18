@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1116,6 +1117,21 @@ func mergeGeneratedTasks(existing string, generated []string) []string {
 	return merged
 }
 
+// checklistMarkRank ranks a checkbox mark by how far along the task is, so a
+// collapsed duplicate identity keeps its furthest-along state: done ("[x]" and
+// its parse variants X/+/*) outranks in-progress ("[-]"), which outranks
+// pending ("[ ]"). See ChecklistItem.Mark for the mark alphabet.
+func checklistMarkRank(mark string) int {
+	switch strings.TrimSpace(mark) {
+	case "":
+		return 0 // pending "[ ]"
+	case domain.MarkInProgress:
+		return 1 // in-progress "[-]"
+	default:
+		return 2 // done "[x]"/"[X]"/"[+]"/"[*]"
+	}
+}
+
 // generatedTaskPosition returns the 1-based position of task within merged
 // (matched by domain.GeneratedTaskIdentity, so a numbered or raw form both
 // find it), or 1 if absent — the reservation's own text check then fails loudly
@@ -1163,16 +1179,18 @@ func carryOverChecklistMarks(existing, rendered string) string {
 	marks := map[string][]string{}
 	for _, it := range domain.ParseChecklist(existing) {
 		id := domain.GeneratedTaskIdentity(it.Text)
-		// Advanced marks ("[-]"/"[x]") go to the FRONT of the queue so that when
-		// the merge collapses a duplicate identity to one rendered item, that
-		// item keeps its in-progress/done state — a pending "[ ]" duplicate must
-		// never win and re-arm the daemon for a task already underway. Distinct
-		// items (post-merge identities are unique) still map one-to-one.
-		if strings.TrimSpace(it.Mark) == "" {
-			marks[id] = append(marks[id], it.Mark)
-		} else {
-			marks[id] = append([]string{it.Mark}, marks[id]...)
-		}
+		marks[id] = append(marks[id], it.Mark)
+	}
+	// Order each identity's marks most-advanced first (done "[x]" > in-progress
+	// "[-]" > pending "[ ]"). When the merge collapses a duplicate identity to
+	// one rendered item it is assigned marks[id][0], so ranking guarantees the
+	// survivor keeps the FURTHEST-along state regardless of the order the
+	// duplicates appeared in the file — a completed or in-progress task is never
+	// regressed (which would re-arm the daemon for work already underway).
+	for id := range marks {
+		sort.SliceStable(marks[id], func(a, b int) bool {
+			return checklistMarkRank(marks[id][a]) > checklistMarkRank(marks[id][b])
+		})
 	}
 	lines := strings.Split(rendered, "\n")
 	for _, it := range domain.ParseChecklist(rendered) {

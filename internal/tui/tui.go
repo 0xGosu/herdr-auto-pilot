@@ -1387,17 +1387,20 @@ func (m Model) confirmAuditID(id int64) (tea.Model, tea.Cmd) {
 
 // openAddPrompt asks whether to queue a stale generated-task suggestion onto the
 // agent's declared task list without sending — the agent is busy, so a send
-// would interrupt it, but the task itself is still valid. Adding accepts the
-// escalation: it appends the tasks, resolves the escalation, and records the
+// would interrupt it, but the task itself is still valid. Answering "y" accepts
+// the escalation: it appends the tasks, resolves the escalation, and records the
 // acceptance to Audits (the daemon delivers the first task on the next idle).
-// Defaults to "y" — the operator already chose to accept by confirming, and
-// queueing sends nothing.
+//
+// The prompt is deliberately left EMPTY (not pre-filled "y"): the input box
+// APPENDS keystrokes, so a pre-filled "y" would turn a typed "n" into "yn" —
+// still HasPrefix "y" — making the decline unreachable. With no default, a bare
+// Enter submits nothing → submitPrompt cancels (leaves the escalation pending,
+// the safe outcome), and only an explicit "y" queues. Hence the "[y/N]" hint.
 func (m Model) openAddPrompt(id int64) (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.message = ""
 	m.prompt = &prompt{
-		label: fmt.Sprintf("agent is busy — add the tasks to its task list instead? [Y/n] (#%d)", id),
-		input: "y",
+		label: fmt.Sprintf("agent is busy — add the tasks to its task list instead? [y/N] (#%d)", id),
 		onSubmit: func(input string) tea.Cmd {
 			if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(input)), "y") {
 				return func() tea.Msg {
