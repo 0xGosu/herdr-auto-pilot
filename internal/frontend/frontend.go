@@ -1033,20 +1033,32 @@ func sameChecklistTexts(a, b string) bool {
 }
 
 // carryOverChecklistMarks returns rendered with each item's checkbox replaced
-// by the marker a same-text item carries in existing (first occurrence wins),
-// so regenerating a task list never resets progress on items it re-lists.
-// Items only in rendered keep their fresh "[ ]"; items only in existing are
-// dropped with the rewrite, as before.
+// by the marker a matching item carries in existing, so regenerating a task
+// list never resets progress on items it re-lists. Items match by their
+// position-independent identity (domain.GeneratedTaskIdentity — the raw task
+// with the numbered-ID prefix stripped): a regeneration that inserts or
+// reorders tasks renumbers every line, and matching on the rendered text
+// would lose the marker of any task whose number changed, resetting a
+// reserved "[-]" (or completed "[x]") back to "[ ]" and re-arming a second
+// delivery. Each existing marker is consumed at most once, in file order, so
+// duplicate texts map one-to-one. Items only in rendered keep their fresh
+// "[ ]"; items only in existing are dropped with the rewrite, as before.
 func carryOverChecklistMarks(existing, rendered string) string {
-	marks := map[string]string{}
+	marks := map[string][]string{}
 	for _, it := range domain.ParseChecklist(existing) {
-		if _, ok := marks[it.Text]; !ok {
-			marks[it.Text] = it.Mark
-		}
+		id := domain.GeneratedTaskIdentity(it.Text)
+		marks[id] = append(marks[id], it.Mark)
 	}
 	lines := strings.Split(rendered, "\n")
 	for _, it := range domain.ParseChecklist(rendered) {
-		if mark, ok := marks[it.Text]; ok && mark != it.Mark {
+		id := domain.GeneratedTaskIdentity(it.Text)
+		queue := marks[id]
+		if len(queue) == 0 {
+			continue
+		}
+		mark := queue[0]
+		marks[id] = queue[1:]
+		if mark != it.Mark {
 			lines[it.LineNo] = it.Prefix + "[" + mark + "] " + it.Text
 		}
 	}

@@ -862,6 +862,108 @@ func TestConfirmRegenerationCarriesOverMarkers(t *testing.T) {
 	}
 }
 
+func TestConfirmRegenerationInsertionKeepsReservedMarker(t *testing.T) {
+	// A regeneration that INSERTS a task before a reserved one renumbers every
+	// line ("1. A" becomes "2. A"). Marker carry-over must match items by
+	// their raw task identity, not the rendered numbered text — otherwise the
+	// renumbered item resets to "[ ]" and the daemon re-sends work the agent
+	// already holds.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w8:p8")
+	first, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w8:p8", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Profile the slow endpoint\nAdd a response cache", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, first, true); err != nil {
+		t.Fatal(err)
+	}
+
+	second, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w8:p8", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Set up the load test rig\nProfile the slow endpoint\nAdd a response cache", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, second, false); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(stateDir, "tasks", name+".md"))
+	if err != nil {
+		t.Fatalf("tasks file missing: %v", err)
+	}
+	if !strings.Contains(string(body), "- [ ] 1. Set up the load test rig") {
+		t.Errorf("tasks file = %q, want the inserted item first and pending", body)
+	}
+	if !strings.Contains(string(body), "- [-] 2. Profile the slow endpoint") {
+		t.Errorf("tasks file = %q, want the delivered item still \"[-]\" under its new number", body)
+	}
+	if next := domain.NextDeclaredTask(string(body)); next != "1. Set up the load test rig" {
+		t.Errorf("next declared task = %q, want only the inserted item — the reserved one must not be re-armed", next)
+	}
+}
+
+func TestConfirmRegenerationInsertionKeepsCompletedMarker(t *testing.T) {
+	// Same renumbering hazard for FINISHED work: an item the agent completed
+	// ("[x]", e.g. via `hap task done`) must stay done when a regeneration
+	// re-lists it under a new number, not be re-queued.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w9:p9")
+	first, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w9:p9", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Profile the slow endpoint", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, first, true); err != nil {
+		t.Fatal(err)
+	}
+	// The agent finishes the delivered task ("[-]" → "[x]").
+	path := filepath.Join(stateDir, "tasks", name+".md")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("tasks file missing: %v", err)
+	}
+	done, err := domain.SetChecklistItemDone(string(body), 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(done), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	second, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w9:p9", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Set up the load test rig\nProfile the slow endpoint", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, second, false); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("tasks file missing: %v", err)
+	}
+	if !strings.Contains(string(body), "- [x] 2. Profile the slow endpoint") {
+		t.Errorf("tasks file = %q, want the completed item still \"[x]\" under its new number", body)
+	}
+	if next := domain.NextDeclaredTask(string(body)); next != "1. Set up the load test rig" {
+		t.Errorf("next declared task = %q, want only the inserted item — completed work must not be re-queued", next)
+	}
+}
+
 func TestConfirmGeneratedTaskRefusesWhenAgentWorking(t *testing.T) {
 	// If the agent has started working by the time the operator confirms, the
 	// suggestion is stale: no source is created, nothing is sent, and the

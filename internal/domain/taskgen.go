@@ -231,3 +231,18 @@ func RenderGeneratedTaskList(agentName string, tasks []string) string {
 func GeneratedTaskItemText(i int, task string) string {
 	return strconv.Itoa(i+1) + ". " + task
 }
+
+// generatedItemIDRE matches the numbered-ID prefix GeneratedTaskItemText
+// writes ("1. ", "23. ", …), and nothing looser: the ID is always digits, a
+// dot, and a single space, at the very start of the item text.
+var generatedItemIDRE = regexp.MustCompile(`^\d+\. `)
+
+// GeneratedTaskIdentity strips the numbered-ID prefix GeneratedTaskItemText
+// adds, recovering the raw task as a position-independent identity. A
+// regeneration that inserts or reorders tasks renumbers every line, so
+// anything reconciling an old list with a new one (marker carry-over) must
+// recognize the same logical task under a different number. Hand-authored,
+// unnumbered text passes through unchanged.
+func GeneratedTaskIdentity(text string) string {
+	return generatedItemIDRE.ReplaceAllString(text, "")
+}
