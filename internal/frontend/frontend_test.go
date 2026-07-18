@@ -1190,6 +1190,27 @@ func TestConfirmGeneratedTaskAppendRespectsMaxTasks(t *testing.T) {
 		if audit.Status != "escalated" {
 			t.Errorf("escalation must stay pending so the operator can prune and retry, got %q", audit.Status)
 		}
+		// The refusal is retryable: raise the cap and the SAME escalation
+		// confirms cleanly, appending exactly one copy.
+		if err := app.UpdateConfig(ctx, func(cfg *config.Config) error {
+			cfg.TaskSources[0].MaxTasks = 10
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := app.Confirm(ctx, id, true); err != nil {
+			t.Fatalf("re-confirm after raising the cap must succeed, got %v", err)
+		}
+		body, _ = os.ReadFile(path)
+		if got := strings.Count(string(body), "One more thing"); got != 1 {
+			t.Errorf("retried confirm appended %d copies, want exactly 1: %q", got, body)
+		}
+		if !strings.Contains(string(body), "- [-] One more thing") {
+			t.Errorf("retried confirm must leave the delivered task reserved, got %q", body)
+		}
+		if len(fake.inputs) != 1 {
+			t.Errorf("the retried confirm must send exactly once, got %d sends", len(fake.inputs))
+		}
 	})
 	t.Run("partial room truncates the appended set", func(t *testing.T) {
 		app, st, fake, _, path := declaredSourceApp(t, "w1:p1", "- [x] 1. a\n")
@@ -1214,6 +1235,105 @@ func TestConfirmGeneratedTaskAppendRespectsMaxTasks(t *testing.T) {
 			t.Errorf("the first task must still be sent, got %v", fake.inputs)
 		}
 	})
+}
+
+// sendHookHerdr wraps fakeHerdr to observe on-disk state at the exact moment
+// Send runs — the only way to assert reserve-BEFORE-send ordering, since the
+// final file state after a rollback is identical to never having reserved.
+type sendHookHerdr struct {
+	*fakeHerdr
+	onSend func()
+}
+
+func (h *sendHookHerdr) Send(ctx context.Context, paneID, input string) error {
+	if h.onSend != nil {
+		h.onSend()
+	}
+	return h.fakeHerdr.Send(ctx, paneID, input)
+}
+
+func TestConfirmGeneratedTaskAppendReservesAndRollsBackOnSendFailure(t *testing.T) {
+	// The delivery mirrors SendTaskToAgent: the first task is reserved [-]
+	// before the send (so the daemon's idle flow can never hand it out
+	// mid-send), and a failed send releases it back to [ ] so the declared
+	// flow delivers it on a later idle — never a stranded [-] nobody will
+	// send.
+	app, st, fake, _, path := declaredSourceApp(t, "w5:p5", "- [x] 1. old task\n")
+	fake.sendErr = errors.New("induced send failure")
+	reservedMidSend := false
+	app.Herdr = &sendHookHerdr{fakeHerdr: fake, onSend: func() {
+		body, _ := os.ReadFile(path)
+		reservedMidSend = strings.Contains(string(body), "- [-] Deliver me later")
+	}}
+	ctx := context.Background()
+	id := generatedEscalation(t, st, "w5:p5", "Deliver me later")
+
+	err := app.Confirm(ctx, id, true)
+	if err == nil || !strings.Contains(err.Error(), "sending the task to the agent failed") {
+		t.Fatalf("confirm with a failing send must surface the send error, got %v", err)
+	}
+	if !reservedMidSend {
+		t.Error("the task must already be reserved [-] while Send is in flight")
+	}
+	body, _ := os.ReadFile(path)
+	want := "- [x] 1. old task\n- [ ] Deliver me later\n"
+	if string(body) != want {
+		t.Errorf("declared file = %q, want the task released to pending %q", body, want)
+	}
+	// The claim gates the send, so the escalation is consumed even though the
+	// send failed — the appended task is recovered via the declared flow (or
+	// `hap task send`), not by re-confirming.
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "resolved" {
+		t.Errorf("escalation status = %q, want resolved (claim precedes the send)", audit.Status)
+	}
+}
+
+func TestConfirmGeneratedTaskSendRefusedWhenFirstTaskNotPending(t *testing.T) {
+	// A suggestion whose first task already sits [x]/[-] in the declared file
+	// cannot be delivered: the refusal must land PRE-claim (escalation stays
+	// pending, actionable) instead of surfacing from reserveTask after the
+	// claim consumed it.
+	app, st, fake, _, path := declaredSourceApp(t, "w6:p6", "- [x] Deliver me later\n")
+	ctx := context.Background()
+	id := generatedEscalation(t, st, "w6:p6", "Deliver me later")
+
+	err := app.Confirm(ctx, id, true)
+	if err == nil || !strings.Contains(err.Error(), "already [x]") {
+		t.Fatalf("confirm with an already-done first task must refuse with the mark, got %v", err)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("nothing may be sent, got %v", fake.inputs)
+	}
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "escalated" {
+		t.Errorf("escalation must stay pending after the pre-claim refusal, got %q", audit.Status)
+	}
+	body, _ := os.ReadFile(path)
+	if string(body) != "- [x] Deliver me later\n" {
+		t.Errorf("declared file must stay unchanged, got %q", body)
+	}
+}
+
+func TestConfirmGeneratedTaskAppendDeduplicatesRepeatedSuggestion(t *testing.T) {
+	// A suggestion repeating the same task text appends it once — a
+	// repetitive LLM output must not stack duplicate checklist items or burn
+	// cap room on copies.
+	app, st, fake, _, path := declaredSourceApp(t, "w7:p7", "- [x] 1. old task\n")
+	ctx := context.Background()
+	id := generatedEscalation(t, st, "w7:p7", "- [ ] Same thing\n- [ ] Other thing\n- [ ] Same thing")
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := os.ReadFile(path)
+	want := "- [x] 1. old task\n- [-] Same thing\n- [ ] Other thing\n"
+	if string(body) != want {
+		t.Errorf("declared file = %q, want the repeated task appended once: %q", body, want)
+	}
+	if len(fake.inputs) != 1 {
+		t.Errorf("only the first task may be sent, got %v", fake.inputs)
+	}
 }
 
 func TestConfirmGeneratedTaskUsesSourceTemplate(t *testing.T) {

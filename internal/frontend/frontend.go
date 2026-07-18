@@ -921,7 +921,29 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	if cerr != nil {
 		return fmt.Errorf("read config: %w", cerr)
 	}
-	if src, ok := pickAppendTarget(a.matchingDeclaredSources(ctx, cfg, audit, name, live)); ok {
+	// The agent's own bootstrapped generated file is NOT an append target: a
+	// re-confirm or regeneration of a generated list must go through the
+	// bootstrap flow below, whose locked compare-rewrite carries progress
+	// markers across regenerations and keeps the numbered-ID rendering
+	// (issue #156). Only sources declared elsewhere take the append path —
+	// which also makes a legacy dual-source config (one declared source plus
+	// a bug-era bootstrap file) prefer the declared one.
+	base := a.StateDir
+	if base == "" {
+		base = filepath.Dir(a.ConfigPath)
+	}
+	bootstrapPath := filepath.Join(base, "tasks", sanitizeTaskFileName(name)+".md")
+	var external []config.TaskSource
+	for _, src := range a.matchingDeclaredSources(ctx, cfg, audit, name, live) {
+		p := src.Path
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if p != bootstrapPath {
+			external = append(external, src)
+		}
+	}
+	if src, ok := pickAppendTarget(external); ok {
 		return a.appendGeneratedTasks(ctx, audit, src, name, tasks, send)
 	}
 
@@ -932,15 +954,10 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// de-dupes under UpdateConfig's advisory lock. Running them before the claim means a
 	// failure here leaves the escalation still pending, so the operator can
 	// retry; only the non-idempotent send is gated by the claim below.
-	base := a.StateDir
-	if base == "" {
-		base = filepath.Dir(a.ConfigPath)
-	}
-	dir := filepath.Join(base, "tasks")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(bootstrapPath), 0o700); err != nil {
 		return fmt.Errorf("create tasks dir: %w", err)
 	}
-	path := filepath.Join(dir, sanitizeTaskFileName(name)+".md")
+	path := bootstrapPath
 	// Every task is written pending ("[ ]"); the first is marked in-progress
 	// ("[-]") only below, at delivery time, so a confirm that sends nothing
 	// leaves it for the daemon's normal declared-task flow (issue #156).
@@ -1174,12 +1191,15 @@ func pickAppendTarget(sources []config.TaskSource) (config.TaskSource, bool) {
 
 // appendGeneratedTasks confirms generated tasks for an agent that already has
 // a declared task source: the tasks are appended to that source's own file.
-// Ordering differs from the bootstrap path — an append is NOT idempotent, so
-// the escalation is claimed FIRST and the append runs after it, exactly like
-// the non-idempotent send (a double-submit fails at the claim). All items are
-// appended pending ("[ ]"); when send succeeds, the first is flipped to
-// in-progress ("[-]") afterwards, so a failed send never strands an
-// in-progress item the daemon would refuse to re-deliver.
+// The append runs BEFORE the escalation claim and is idempotent — tasks whose
+// text the checklist already carries are skipped, mirroring
+// ensureGeneratedTaskFile's re-confirm skip — so ANY append-side failure (cap
+// full, unreadable file, failed write) leaves the escalation pending and
+// retryable; claiming first would consume it with nothing appended. Items are
+// appended pending ("[ ]"), and delivery mirrors SendTaskToAgent's
+// load-bearing order: the first task is RESERVED ("[-]" under the file lock)
+// before the send, so the daemon's idle flow can never hand it out mid-send,
+// and a failed send rolls it back to "[ ]".
 func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecord, src config.TaskSource, name string, tasks []string, send bool) error {
 	path := src.Path
 	if abs, err := filepath.Abs(path); err == nil {
@@ -1187,22 +1207,13 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 	}
 	limit := src.MaxTasksLimit()
 
-	// Pre-claim cap check: the daemon gated generation when it ran, but the
-	// list may have grown since (manual adds). Refusing BEFORE the claim
-	// leaves the escalation pending, so the operator can prune the list and
-	// confirm again. A missing file is fine (created below); any other read
-	// error must also refuse pre-claim — claiming first and then failing the
-	// in-lock read would consume the escalation with nothing appended.
-	if data, err := os.ReadFile(path); err == nil {
-		if current := len(domain.ParseChecklist(string(data))); current >= limit {
-			return fmt.Errorf("maximum number of tasks reached for %s (%d items, cap %d) — clean up the task list to make room, then confirm again", path, current, limit)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("read task list %s: %w", path, err)
-	}
 	// The declared file may not exist yet (a freshly added source): create it
-	// so mutateTaskFile's stat succeeds. Idempotent, so it runs pre-claim.
+	// so mutateTaskFile's stat succeeds. Idempotent, so it runs pre-claim; any
+	// other stat error refuses now, while the escalation is still pending.
 	if _, err := os.Stat(path); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat task list %s: %w", path, err)
+		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return fmt.Errorf("create task list dir: %w", err)
 		}
@@ -1211,47 +1222,86 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 		}
 	}
 
+	// ONE locked compare-append: skip already-present tasks (a retry after a
+	// failed claim, or the loser of a concurrent double-confirm, must not
+	// duplicate them), enforce the max_tasks cap on what is actually missing,
+	// and record where the first task lives for the reservation below. The cap
+	// is the same limit the daemon's generation gate and manual `task add`
+	// enforce; refusing here — pre-claim — lets the operator prune the list
+	// and confirm again.
+	firstText := domain.EncodeTaskNewlines(tasks[0])
+	firstIndex := 0
+	if _, err := mutateTaskFile(path, func(content string) (string, error) {
+		items := domain.ParseChecklist(content)
+		present := map[string]int{}
+		for _, it := range items {
+			if _, ok := present[it.Text]; !ok {
+				present[it.Text] = it.Index
+			}
+		}
+		// A send needs the first task pending: discovering an already-[x]/[-]
+		// copy at reserve time would be AFTER the claim consumed the
+		// escalation, so refuse here, pre-claim, while the operator can still
+		// act on it.
+		if send {
+			for _, it := range items {
+				if it.Text == firstText {
+					if it.Done {
+						return "", fmt.Errorf("task %q is already [%s] in %s — confirm without --send, or dismiss the suggestion", tasks[0], it.Mark, path)
+					}
+					break
+				}
+			}
+		}
+		// -1 marks a text claimed by an earlier element of tasks: a suggestion
+		// repeating a task appends it once, and firstIndex stays on the first
+		// copy (the append below overwrites -1 with the real index).
+		var missing []string
+		for _, task := range tasks {
+			if text := domain.EncodeTaskNewlines(task); present[text] == 0 {
+				missing = append(missing, text)
+				present[text] = -1
+			}
+		}
+		if len(missing) > 0 {
+			room := limit - len(items)
+			if room <= 0 {
+				return "", fmt.Errorf("maximum number of tasks reached for %s (%d items, cap %d) — clean up the task list to make room, then confirm again", path, len(items), limit)
+			}
+			if room < len(missing) {
+				slog.Warn("truncating generated tasks to the source's max_tasks cap",
+					"path", path, "cap", limit, "dropped", len(missing)-room)
+				missing = missing[:room]
+			}
+		}
+		out := content
+		for _, text := range missing {
+			var idx int
+			var e error
+			out, idx, e = domain.AppendChecklistItem(out, text)
+			if e != nil {
+				return "", e
+			}
+			present[text] = idx
+		}
+		// tasks[0] is either pre-existing or missing[0] (order-preserving, and
+		// truncation keeps at least one missing item), so it is always present
+		// by now.
+		firstIndex = present[firstText]
+		return out, nil
+	}); err != nil {
+		return fmt.Errorf("appending the generated tasks to %s failed (nothing was resolved — retry after fixing this): %w", path, err)
+	}
+
 	// Atomically CLAIM the escalation. Only the writer that flips
-	// escalated→resolved proceeds to the append and send, so a double-submit
-	// can never append or send the tasks twice.
+	// escalated→resolved proceeds to the non-idempotent send, so a
+	// double-submit can never send the task twice.
 	claimed, err := a.Store.ResolveEscalation(ctx, audit.ID)
 	if err != nil {
 		return err
 	}
 	if !claimed {
 		return fmt.Errorf("audit record %d is no longer a pending escalation", audit.ID)
-	}
-
-	firstIndex := 0
-	if _, err := mutateTaskFile(path, func(content string) (string, error) {
-		// Recomputed inside the lock: a racing add may have consumed the room
-		// the pre-claim check saw. Appending fewer tasks than suggested beats
-		// refusing the operator's explicit "start now" — but zero room means
-		// nothing can land, so surface that.
-		room := limit - len(domain.ParseChecklist(content))
-		if room <= 0 {
-			return "", fmt.Errorf("maximum number of tasks reached (cap %d)", limit)
-		}
-		if room < len(tasks) {
-			slog.Warn("truncating generated tasks to the source's max_tasks cap",
-				"path", path, "cap", limit, "dropped", len(tasks)-room)
-			tasks = tasks[:room]
-		}
-		out := content
-		for i, task := range tasks {
-			var idx int
-			var e error
-			out, idx, e = domain.AppendChecklistItem(out, domain.EncodeTaskNewlines(task))
-			if e != nil {
-				return "", e
-			}
-			if i == 0 {
-				firstIndex = idx
-			}
-		}
-		return out, nil
-	}); err != nil {
-		return fmt.Errorf("escalation resolved, but appending the generated tasks to %s failed: %w", path, err)
 	}
 
 	// Record the correction so the idle signature learns to drive from its
@@ -1267,38 +1317,25 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 		// Only the first task is sent — the operator's "start now" task —
 		// rendered through the SOURCE's template (not the built-in default),
 		// pointing at the declared file. {cwd} is resolved only when the
-		// template references it, matching the daemon's declaredTask.
+		// template references it (before reserving, like SendTaskToAgent: a
+		// herdr shell-out failure should not have to unwind a reservation).
 		cwd := ""
 		if strings.Contains(domain.TemplateOrDefault(src.NextTaskTemplate), "{cwd}") {
-			if insp, ok := a.Herdr.(ports.InspectorPort); ok {
-				if pi, e := insp.PaneInfo(ctx, audit.AgentID); e == nil {
-					cwd = pi.ForegroundCwd
-					if cwd == "" {
-						cwd = pi.Cwd
-					}
-				}
-			}
+			cwd = a.paneCwd(ctx, audit.AgentID)
+		}
+		if _, err := mutateTaskFile(path, reserveTask(firstIndex, firstText)); err != nil {
+			return fmt.Errorf("tasks appended to %s, but reserving task #%d (nothing was sent): %w", path, firstIndex, err)
 		}
 		prompt := domain.DeclaredTask{
 			Task: tasks[0], Path: path, Template: src.NextTaskTemplate,
 			AgentName: name, Cwd: cwd,
 		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
-			return fmt.Errorf("tasks appended to %s, but sending the task to the agent failed: %w", path, err)
-		}
-		// Delivery succeeded: flip the delivered task to in-progress so the
-		// daemon's declared flow does not re-send it on the next idle.
-		// Best-effort — a failed flip only risks a duplicate send later,
-		// which is safer than an undelivered "[-]" the daemon skips. Indices
-		// are positional and renumber on delete, so the flip is text-guarded
-		// (expectTaskText) against a concurrent edit in the send window.
-		if _, err := mutateTaskFile(path, func(content string) (string, error) {
-			if err := expectTaskText(content, firstIndex, domain.EncodeTaskNewlines(tasks[0])); err != nil {
-				return "", err
+			if _, rbErr := mutateTaskFile(path, releaseTask(firstIndex, firstText)); rbErr != nil {
+				return fmt.Errorf("sending the task failed (%w) and task #%d could not be returned to [ ] (%v) — "+
+					"it stays [-] and no agent will pick it up until you clear it", err, firstIndex, rbErr)
 			}
-			return domain.MarkChecklistItemInProgress(content, firstIndex)
-		}); err != nil {
-			slog.Warn("marking the delivered generated task in-progress failed", "path", path, "index", firstIndex, "error", err)
+			return fmt.Errorf("tasks appended to %s, but sending the task to the agent failed: %w", path, err)
 		}
 	}
 	return a.nudge(ctx, control.KindReload)
