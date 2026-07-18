@@ -334,9 +334,16 @@ func Decide(in DecideInput) Decision {
 func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggestion string, escReason EscalateReason) {
 	switch in.Situation.Type {
 	case SituationIdle:
-		// A learned noop beats task resolution: the operator repeatedly said
-		// "leave this one alone", which outranks re-sending tasks.
-		if conf.TopAction == ActionNoop {
+		// A learned noop beats task resolution only when the OPERATOR (or a
+		// rule graduated from operator confirmations) said "leave this one
+		// alone" — that outranks re-sending tasks. A noop plurality built
+		// purely from LLM guesses does NOT outrank a declared task source:
+		// one consult-time "@noop" on an exhausted list would otherwise
+		// permanently park the task_source_exhausted → generation refill path
+		// (#175). Without a declared source there is nothing to park, so an
+		// LLM-learned noop still silences a chatty idle agent (the original
+		// nudge-loop case) instead of escalating no_task_source forever.
+		if conf.TopAction == ActionNoop && (conf.TopActionOperatorBacked || in.DeclaredTask == nil) {
 			return ActionNoop, ActionNoopSuggestion, ReasonNone
 		}
 		// Two-tier next-task resolution (FR-011). A matched source with a real

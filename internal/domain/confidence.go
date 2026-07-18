@@ -27,6 +27,14 @@ type ConfidenceResult struct {
 	TopAction string
 	// Decisions is the number of history records considered.
 	Decisions int
+	// TopActionOperatorBacked is true when at least one considered decision
+	// for TopAction was operator- or rule-sourced. A SourceRule row
+	// existentially implies past operator confirmation (graduation requires
+	// it), so it counts even after the operator rows age out of the history
+	// window. A plurality built purely from SourceLLM guesses is NOT
+	// operator-backed — resolvers use this to keep a single LLM answer from
+	// outranking operator-declared intent (#175).
+	TopActionOperatorBacked bool
 }
 
 // DecisionsSince returns the decisions newer than a signature's reset floor
@@ -48,6 +56,21 @@ func DecisionsSince(history []DecisionRecord, floorID int64) []DecisionRecord {
 	return out
 }
 
+// HasOperatorEvidence reports whether any decision in history is operator-
+// or rule-sourced. A history without such evidence is purely LLM guesses —
+// the clean-slate floor in correction processing keys on this (a rule begins
+// when the operator first speaks), and it must key on the HISTORY rather
+// than on state-row absence now that LLM decisions create their own
+// signatures row for CLI addressability (#175).
+func HasOperatorEvidence(history []DecisionRecord) bool {
+	for _, d := range history {
+		if d.Source == SourceOperator || d.Source == SourceRule {
+			return true
+		}
+	}
+	return false
+}
+
 // LiveConfidence is the confidence the decision core gates on RIGHT NOW for a
 // signature: the recency-weighted agreement over post-floor decisions only.
 // The TopAction, however, still comes from the FULL learned history when the
@@ -64,9 +87,12 @@ func LiveConfidence(history []DecisionRecord, floorID int64, confirmWeight float
 	post := DecisionsSince(history, floorID)
 	conf := Confidence(post, confirmWeight)
 	if len(post) == 0 {
-		// Only TopAction falls back; Score and Decisions stay zero so a reset
-		// rule reads as "no post-reset evidence yet", not as agreement.
-		conf.TopAction = Confidence(history, confirmWeight).TopAction
+		// Only TopAction (and its provenance) falls back; Score and Decisions
+		// stay zero so a reset rule reads as "no post-reset evidence yet",
+		// not as agreement.
+		full := Confidence(history, confirmWeight)
+		conf.TopAction = full.TopAction
+		conf.TopActionOperatorBacked = full.TopActionOperatorBacked
 	}
 	return conf
 }
@@ -88,12 +114,16 @@ func Confidence(history []DecisionRecord, confirmWeight float64) ConfidenceResul
 		confirmWeight = 1
 	}
 	weights := map[string]float64{}
+	operatorBacked := map[string]bool{}
 	var total float64
 	w := 1.0
 	for _, d := range history {
 		weight := w
 		if d.Source == SourceOperator && !d.IsCorrection {
 			weight *= confirmWeight
+		}
+		if d.Source == SourceOperator || d.Source == SourceRule {
+			operatorBacked[d.ChosenAction] = true
 		}
 		weights[d.ChosenAction] += weight
 		total += weight
@@ -106,5 +136,6 @@ func Confidence(history []DecisionRecord, confirmWeight float64) ConfidenceResul
 			top, topW = action, aw
 		}
 	}
-	return ConfidenceResult{Score: topW / total, TopAction: top, Decisions: len(history)}
+	return ConfidenceResult{Score: topW / total, TopAction: top, Decisions: len(history),
+		TopActionOperatorBacked: operatorBacked[top]}
 }

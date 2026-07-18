@@ -166,6 +166,10 @@ type DaemonStore interface {
 	WithAgentAutomation(ctx context.Context, agentID string, fn func()) (disabled bool, err error)
 
 	UpsertSignature(ctx context.Context, s domain.SignatureState) error
+	// EnsureSignature atomically creates a fresh signature state row if none
+	// exists yet (INSERT OR IGNORE) — never touching an existing row. The
+	// daemon uses it to make LLM-learned signatures CLI-addressable (#175).
+	EnsureSignature(ctx context.Context, s domain.SignatureState) error
 	RecordDecision(ctx context.Context, d domain.DecisionRecord) (int64, error)
 	AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, error)
 	UpdateAuditStatus(ctx context.Context, auditID int64, status string) error

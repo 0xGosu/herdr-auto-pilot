@@ -521,6 +521,17 @@ func TestLLMMultiTabConsultAndSeriesPromotion(t *testing.T) {
 	if !strings.HasSuffix(keys, "1 2 1") {
 		t.Errorf("promoted series keystrokes missing: %v", keys)
 	}
+
+	// #175: the delivered series decision must also create a shadow
+	// signatures row (written after delivery, so wait rather than assert).
+	var st *domain.SignatureState
+	waitFor(t, 3*time.Second, func() bool {
+		st, _ = h.raw.GetSignature(ctx, audits[0].Signature)
+		return st != nil
+	})
+	if st.Mode != domain.ModeShadow || st.DecisionFloorID != 0 {
+		t.Errorf("LLM-created row must be a fresh shadow state: %+v", st)
+	}
 }
 
 func TestLLMMultiTabSeriesDeniedWhenDisableWinsFinalBarrier(t *testing.T) {

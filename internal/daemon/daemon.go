@@ -2990,6 +2990,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				}); err != nil {
 					slog.Error("decision record write failed", "error", err)
 				}
+				d.ensureSignatureRow(ctx, res.sig.Signature, s.Type, s.AgentType, now)
 				// The runaway counter still advances (D3): a self-flapping agent
 				// must not consult-and-noop silently forever. lastAutoSend stays
 				// untouched (nothing was sent); lastAutoNoop is stamped so a
@@ -3139,6 +3140,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				ChosenAction: d.llmLearnedAction(llmDec, taskReviewSend),
 				Source:       domain.SourceLLM, CreatedAt: now,
 			})
+			d.ensureSignatureRow(ctx, res.sig.Signature, s.Type, s.AgentType, now)
 			if rate2, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
 				updated := domain.RegisterAutoPrompt(*rate2, now)
 				updated.AgentID = s.AgentID
@@ -3155,6 +3157,27 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		})
 	if !executed {
 		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
+	}
+}
+
+// ensureSignatureRow makes an LLM-learned signature addressable: every
+// recorded decision gets a signatures state row, so `hap signatures
+// list/delete/reset` and the escalation rule line can reach it (#175).
+// EnsureSignature is a single atomic INSERT OR IGNORE, so an existing row is
+// never touched (a below-threshold consult on an already learned rule lands
+// here too — its mode/confirmations/floor must survive, including against a
+// concurrent correction writer). DecisionFloorID starts 0 so LLM decisions
+// keep counting toward the plurality until the operator first speaks;
+// applyCorrection floors them out at that point. Errors only log: the
+// decision and audit are already durable, and a failed visibility write must
+// not reject an accepted LLM decision (fail-safe daemon path).
+func (d *Daemon) ensureSignatureRow(ctx context.Context, signature string,
+	situationType domain.SituationType, agentType string, now time.Time) {
+	if err := d.opt.Store.EnsureSignature(ctx, domain.SignatureState{
+		Signature: signature, SituationType: situationType,
+		AgentType: agentType, Mode: domain.ModeShadow, UpdatedAt: now,
+	}); err != nil {
+		slog.Error("signature row write failed", "signature", signature, "error", err)
 	}
 }
 
@@ -3362,37 +3385,41 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 			Signature: audit.Signature, SituationType: audit.SituationType,
 			AgentType: agentTypeOf(history, audit), Mode: domain.ModeShadow,
 		}
-		// A rule begins when the OPERATOR first speaks, so it starts on a clean
-		// slate: floor out every decision that predates this one. Before a state
-		// row exists every decision is SourceLLM (SourceRule needs a graduated
-		// rule, i.e. a row), so this can only ever discard the LLM's own guesses
-		// — never operator evidence, of which there is none yet by definition.
-		// (Modulo one narrow window: the decision below and the state row are
-		// written without a shared transaction, so a crash between them orphans
-		// an operator decision that the next correction floors out. Harmless —
-		// that rule restarts at 1.00, which is what this wants anyway.)
-		//
-		// Those guesses are not agreement about anything: an LLM that answered
-		// the same situation six different ways would otherwise hand its brand
-		// new rule a contradictory history it never earned, scoring it below the
-		// variance-guard floor and pinning it there — visibly inconsistent, since
-		// the operator has agreed with it exactly once and never disagreed. The
-		// rows are KEPT (the floor only hides them from confidence/graduation),
-		// so history and audit stay intact.
-		//
-		// history is read BEFORE the operator's decision is recorded below, so
-		// history[0] is the newest PRE-EXISTING decision: the new one lands above
-		// the floor and counts, giving the fresh rule 1.00 over its single
-		// operator decision. (Contrast ResetGraduation, which floors the newest
-		// decision INCLUDING itself — a reset has no evidence yet and reads "-".)
-		if len(history) > 0 {
-			state.DecisionFloorID = history[0].ID
-		}
 	} else if state.AgentType == "" || state.AgentType == "unknown" {
 		// Heal rules learned before the audit carried an agent type.
 		if at := agentTypeOf(history, audit); at != "unknown" {
 			state.AgentType = at
 		}
+	}
+
+	// A rule begins when the OPERATOR first speaks, so it starts on a clean
+	// slate: floor out every decision that predates this one. The trigger is
+	// "no operator/rule evidence in the pre-existing history yet" — NOT state
+	// row absence, because LLM decisions now create their own shadow row for
+	// CLI addressability (#175), so the row can exist while every decision is
+	// still SourceLLM. Flooring only a purely-LLM history means this can only
+	// ever discard the LLM's own guesses — never operator evidence.
+	// (Modulo one narrow window: the decision below and the state row are
+	// written without a shared transaction, so a crash between them orphans
+	// an operator decision that the next correction floors out. Harmless —
+	// that rule restarts at 1.00, which is what this wants anyway.)
+	//
+	// Those guesses are not agreement about anything: an LLM that answered
+	// the same situation six different ways would otherwise hand its brand
+	// new rule a contradictory history it never earned, scoring it below the
+	// variance-guard floor and pinning it there — visibly inconsistent, since
+	// the operator has agreed with it exactly once and never disagreed. The
+	// rows are KEPT (the floor only hides them from confidence/graduation),
+	// so history and audit stay intact.
+	//
+	// history is read BEFORE the operator's decision is recorded below, so
+	// history[0] is the newest PRE-EXISTING decision: the new one lands above
+	// the floor and counts, giving the fresh rule 1.00 over its single
+	// operator decision. (Contrast ResetGraduation, which floors the newest
+	// decision INCLUDING itself — a reset has no evidence yet and reads "-".)
+	if len(history) > 0 && !domain.HasOperatorEvidence(history) &&
+		history[0].ID > state.DecisionFloorID {
+		state.DecisionFloorID = history[0].ID
 	}
 
 	// Confidence/graduation see only post-reset decisions (id > the floor); the

@@ -757,6 +757,22 @@ func TestLLMPromotionDeliversMenuDigitForLabel(t *testing.T) {
 	if got := h.herdr.sentInputs()[0]; got != "1" {
 		t.Errorf("promoted LLM label \"Yes\" delivered as %q, want digit \"1\"", got)
 	}
+
+	// #175: the delivered LLM decision must also create a shadow signatures
+	// row (written after delivery, so wait for it rather than assert).
+	ctx := context.Background()
+	var st *domain.SignatureState
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(ctx, 5)
+		if len(audits) == 0 {
+			return false
+		}
+		st, _ = h.raw.GetSignature(ctx, audits[0].Signature)
+		return st != nil
+	})
+	if st.Mode != domain.ModeShadow || st.DecisionFloorID != 0 {
+		t.Errorf("LLM-created row must be a fresh shadow state: %+v", st)
+	}
 }
 
 func TestLLMPromotionDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
@@ -925,6 +941,61 @@ func TestFirstOperatorDecisionFloorsPriorLLMGuesses(t *testing.T) {
 	}
 	if st.ConsecutiveConfirmations != 1 {
 		t.Errorf("streak = %d, want 1", st.ConsecutiveConfirmations)
+	}
+}
+
+func TestFirstOperatorCorrectionFloorsLLMHistoryDespiteExistingRow(t *testing.T) {
+	// #175 companion: LLM decisions now create their own shadow signatures
+	// row at decision time, so the clean-slate floor must key on "no operator
+	// evidence in the history yet", not on state-row absence — otherwise the
+	// first operator correction would inherit every prior LLM guess into the
+	// fresh rule's confidence, the exact pathology the floor exists to stop.
+	h := newHarness(t, "[learning]\ngraduation_n = 3\n")
+	h.herdr.setPane(approvalPane)
+	ctx := context.Background()
+	sig := seedLLMHistory(t, h, approvalPane, domain.SituationApproval,
+		"No", "@noop", "No, and tell the agent what to do differently", "Yes")
+	// The row ensureSignatureRow would have written at LLM decision time.
+	if err := h.raw.UpsertSignature(ctx, domain.SignatureState{
+		Signature: sig, SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := h.raw.DecisionsForSignature(ctx, sig, 50)
+	if err != nil || len(before) != 4 {
+		t.Fatalf("seed history: %d rows, %v", len(before), err)
+	}
+
+	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	h.push("agent-floor-row", "blocked")
+	var esc domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		pend, _ := h.raw.PendingEscalations(ctx)
+		if len(pend) != 1 {
+			return false
+		}
+		esc = pend[0]
+		return true
+	})
+	if err := app.Resolve(ctx, esc.ID, "Yes", false); err != nil {
+		t.Fatal(err)
+	}
+
+	var st *domain.SignatureState
+	waitFor(t, 3*time.Second, func() bool {
+		st, _ = h.raw.GetSignature(ctx, sig)
+		return st != nil && st.DecisionFloorID != 0
+	})
+	if st.DecisionFloorID != before[0].ID {
+		t.Errorf("floor = %d, want the newest pre-existing decision %d", st.DecisionFloorID, before[0].ID)
+	}
+	if st.CachedConfidence != 1 {
+		t.Errorf("a fresh rule scores 1.00 over its one operator decision, got %.4f", st.CachedConfidence)
+	}
+	after, _ := h.raw.DecisionsForSignature(ctx, sig, 50)
+	if n := len(domain.DecisionsSince(after, st.DecisionFloorID)); n != 1 {
+		t.Errorf("post-floor decisions = %d, want only the operator's 1", n)
 	}
 }
 
@@ -3757,6 +3828,22 @@ func TestLLMPromotionDeliversRemoteEnvSelection(t *testing.T) {
 	}
 	if len(h.herdr.sentInputs()) != 0 {
 		t.Errorf("the picker must be answered with keystrokes, not a text send: %v", h.herdr.sentInputs())
+	}
+
+	// #175: the delivered picker decision must also create a shadow
+	// signatures row (written after delivery, so wait rather than assert).
+	ctx := context.Background()
+	var st *domain.SignatureState
+	waitFor(t, 3*time.Second, func() bool {
+		audits, _ := h.raw.AuditLog(ctx, 5)
+		if len(audits) == 0 {
+			return false
+		}
+		st, _ = h.raw.GetSignature(ctx, audits[0].Signature)
+		return st != nil
+	})
+	if st.Mode != domain.ModeShadow || st.DecisionFloorID != 0 {
+		t.Errorf("LLM-created row must be a fresh shadow state: %+v", st)
 	}
 }
 

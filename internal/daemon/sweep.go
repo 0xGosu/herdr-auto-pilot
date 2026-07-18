@@ -475,6 +475,7 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 					}); err != nil {
 						slog.Error("decision record write failed", "error", err)
 					}
+					d.ensureSignatureRow(ctx, sig.Signature, s.Type, s.AgentType, now)
 					if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
 						updated := domain.RegisterAutoPrompt(*rate, now)
 						updated.AgentID = s.AgentID
@@ -613,6 +614,7 @@ func (d *Daemon) deliverRemoteEnvLLM(ctx context.Context, ks ports.KeystrokeSend
 					}); err != nil {
 						slog.Error("decision record write failed", "error", err)
 					}
+					d.ensureSignatureRow(ctx, sig.Signature, s.Type, s.AgentType, now)
 					if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
 						updated := domain.RegisterAutoPrompt(*rate, now)
 						updated.AgentID = s.AgentID

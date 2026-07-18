@@ -80,6 +80,77 @@ func opHistory(actions ...string) []DecisionRecord {
 	return recs
 }
 
+// sourcedHistory builds newest-first records that all carry the given source.
+// opHistory cannot express an operator "@noop" (its "@" prefix is the
+// SourceRule marker), so noop provenance tests build records through this.
+func sourcedHistory(src Source, actions ...string) []DecisionRecord {
+	recs := history(actions...)
+	for i := range recs {
+		recs[i].Source = src
+	}
+	return recs
+}
+
+func TestConfidenceTopActionOperatorBacked(t *testing.T) {
+	cases := map[string]struct {
+		history    []DecisionRecord
+		wantTop    string
+		wantBacked bool
+	}{
+		"llm only": {sourcedHistory(SourceLLM, ActionNoop, ActionNoop, ActionNoop),
+			ActionNoop, false},
+		"test-helper zero source": {history(ActionNoop, ActionNoop), ActionNoop, false},
+		"operator mixed with llm": {append(sourcedHistory(SourceLLM, ActionNoop, ActionNoop),
+			sourcedHistory(SourceOperator, ActionNoop)...), ActionNoop, true},
+		"rule sourced": {sourcedHistory(SourceRule, ActionNoop), ActionNoop, true},
+		"operator backs a different action only": {append(sourcedHistory(SourceLLM,
+			ActionNoop, ActionNoop, ActionNoop, ActionNoop),
+			sourcedHistory(SourceOperator, "yes")...), ActionNoop, false},
+	}
+	for name, tc := range cases {
+		c := Confidence(tc.history, 1.0) // no confirmation boost: keep TopAction on vote count
+		if c.TopAction != tc.wantTop {
+			t.Fatalf("%s: top action = %q, want %q", name, c.TopAction, tc.wantTop)
+		}
+		if c.TopActionOperatorBacked != tc.wantBacked {
+			t.Errorf("%s: TopActionOperatorBacked = %v, want %v", name, c.TopActionOperatorBacked, tc.wantBacked)
+		}
+	}
+}
+
+func TestLiveConfidenceFloorFallbackCarriesProvenance(t *testing.T) {
+	// A reset rule's TopAction falls back to the full history; the operator
+	// provenance must travel with it, or a reset operator-taught noop would
+	// stop outranking a declared task until re-confirmed.
+	recs := sourcedHistory(SourceOperator, ActionNoop, ActionNoop)
+	for i := range recs {
+		recs[i].ID = int64(i + 1)
+	}
+	c := LiveConfidence(recs, 10, DefaultConfirmationWeight) // floor excludes all
+	if c.Score != 0 || c.Decisions != 0 {
+		t.Fatalf("floored history must score zero, got %+v", c)
+	}
+	if c.TopAction != ActionNoop || !c.TopActionOperatorBacked {
+		t.Errorf("fallback must carry TopAction with provenance, got %+v", c)
+	}
+}
+
+func TestHasOperatorEvidence(t *testing.T) {
+	if HasOperatorEvidence(sourcedHistory(SourceLLM, ActionNoop, "1", ActionNoop)) {
+		t.Error("purely-LLM history must have no operator evidence")
+	}
+	if HasOperatorEvidence(nil) {
+		t.Error("empty history must have no operator evidence")
+	}
+	if !HasOperatorEvidence(append(sourcedHistory(SourceLLM, ActionNoop),
+		sourcedHistory(SourceOperator, "1")...)) {
+		t.Error("an operator decision is evidence regardless of action")
+	}
+	if !HasOperatorEvidence(sourcedHistory(SourceRule, "1")) {
+		t.Error("a rule decision implies past operator confirmation")
+	}
+}
+
 func TestConfirmationBoostRaisesContestedScore(t *testing.T) {
 	// FR-005 (revised): an operator confirmation weighs more than a passive
 	// auto-send. Newest is a confirmation of "yes" against two older auto "no"
