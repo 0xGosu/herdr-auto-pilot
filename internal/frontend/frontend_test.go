@@ -996,6 +996,597 @@ func TestConfirmGeneratedTaskRefusesWhenAgentWorking(t *testing.T) {
 	}
 }
 
+// declaredSourceApp builds a testApp with one declared task source for the
+// named agent, seeding its checklist file with content. It returns the app,
+// store, fake herdr, the agent's short name, and the absolute source path.
+func declaredSourceApp(t *testing.T, agentID, content string) (*frontend.App, *store.Store, *fakeHerdr, string, string) {
+	t.Helper()
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	app.StateDir = t.TempDir()
+	ctx := context.Background()
+	name, _ := st.EnsureAgentName(ctx, agentID)
+	path := filepath.Join(t.TempDir(), "declared.md")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, name, "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+	return app, st, fake, name, path
+}
+
+// generatedEscalation seeds a pending generated-task escalation for agentID.
+func generatedEscalation(t *testing.T, st *store.Store, agentID, suggestion string) int64 {
+	t.Helper()
+	id, err := st.AppendAudit(context.Background(), domain.AuditRecord{
+		AgentID: agentID, SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + suggestion, CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestConfirmGeneratedTaskAppendsToExhaustedSource(t *testing.T) {
+	// Issue #157: when the agent already has a declared task source (whose
+	// checklist ran dry and triggered generation), confirming appends the
+	// generated task to THAT file — it must not write a second per-agent
+	// tasks.md and register a duplicate [[task_sources]] entry, which makes
+	// `hap task <agent>` ambiguous.
+	app, st, fake, name, path := declaredSourceApp(t, "w1:p1", "- [x] 1. old task\n")
+	ctx := context.Background()
+	taskText := "Investigate the flaky auth test and add a retry guard"
+	id := generatedEscalation(t, st, "w1:p1", taskText)
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Appended to the declared file, delivered task flipped in-progress, the
+	// existing completed item untouched.
+	want := "- [x] 1. old task\n- [-] " + taskText + "\n"
+	if string(body) != want {
+		t.Errorf("declared file = %q, want %q", body, want)
+	}
+
+	// No per-agent bootstrap file, and still exactly ONE task source with the
+	// original path.
+	if _, err := os.Stat(filepath.Join(app.StateDir, "tasks")); !os.IsNotExist(err) {
+		t.Errorf("no <state>/tasks bootstrap dir may be created, stat err = %v", err)
+	}
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 1 || cfg.TaskSources[0].Path != path {
+		t.Fatalf("want exactly 1 task source at %q, got %+v", path, cfg.TaskSources)
+	}
+
+	// The prompt points at the DECLARED file, and the correction learns the
+	// declared-task action.
+	wantPrompt := domain.DeclaredTask{Task: taskText, Path: path, AgentName: name}.Prompt()
+	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
+		t.Errorf("delivered %v, want the declared-source prompt %q", fake.inputs, wantPrompt)
+	}
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].CorrectedAction != domain.ActionNextDeclaredTask {
+		t.Errorf("confirm should record a declared-task correction: %+v", corr)
+	}
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "resolved" {
+		t.Errorf("escalation status = %q, want resolved", audit.Status)
+	}
+}
+
+func TestConfirmGeneratedMultipleTasksAppendToExhaustedSource(t *testing.T) {
+	// A multi-task suggestion appends every task to the declared file: the
+	// delivered first task in-progress, the rest pending for the normal
+	// declared-task flow. Only the first is sent.
+	app, st, fake, name, path := declaredSourceApp(t, "w1:p1", "- [x] 1. old task\n")
+	ctx := context.Background()
+	suggestion := "- [ ] Investigate the flaky auth test\n- [ ] Add a retry guard\n- [ ] Backfill unit tests"
+	id := generatedEscalation(t, st, "w1:p1", suggestion)
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := os.ReadFile(path)
+	want := "- [x] 1. old task\n- [-] Investigate the flaky auth test\n- [ ] Add a retry guard\n- [ ] Backfill unit tests\n"
+	if string(body) != want {
+		t.Errorf("declared file = %q, want %q", body, want)
+	}
+	wantPrompt := domain.DeclaredTask{Task: "Investigate the flaky auth test", Path: path, AgentName: name}.Prompt()
+	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
+		t.Errorf("delivered %v, want only the first task as %q", fake.inputs, wantPrompt)
+	}
+	// The queue drives on later idles from the declared file.
+	if next := domain.NextDeclaredTask(string(body)); next != "Add a retry guard" {
+		t.Errorf("next declared task = %q, want the first appended pending item", next)
+	}
+}
+
+func TestConfirmGeneratedTaskAppendWithoutSend(t *testing.T) {
+	// send=false appends every task pending ("[ ]") and delivers nothing: the
+	// daemon's declared flow hands them out on later idles. No in-progress
+	// marker may be left behind (an undelivered "[-]" is never re-sent).
+	app, st, fake, _, path := declaredSourceApp(t, "w2:p2", "- [x] 1. old task\n")
+	ctx := context.Background()
+	id := generatedEscalation(t, st, "w2:p2", "Write missing tests")
+
+	if err := app.Confirm(ctx, id, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("send=false must deliver nothing, got %v", fake.inputs)
+	}
+	body, _ := os.ReadFile(path)
+	want := "- [x] 1. old task\n- [ ] Write missing tests\n"
+	if string(body) != want {
+		t.Errorf("declared file = %q, want %q", body, want)
+	}
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 1 {
+		t.Errorf("want exactly 1 task source, got %d", len(cfg.TaskSources))
+	}
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "resolved" {
+		t.Errorf("escalation status = %q, want resolved", audit.Status)
+	}
+}
+
+func TestConfirmGeneratedTaskAppendIsIdempotent(t *testing.T) {
+	// The atomic claim gates the (non-idempotent) append: a double-submit must
+	// not append the task twice or send twice.
+	app, st, fake, _, path := declaredSourceApp(t, "w3:p3", "- [x] 1. old task\n")
+	ctx := context.Background()
+	id := generatedEscalation(t, st, "w3:p3", "Do the thing")
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Confirm(ctx, id, true); err == nil {
+		t.Error("second confirm on a resolved escalation must fail")
+	}
+	body, _ := os.ReadFile(path)
+	if got := strings.Count(string(body), "Do the thing"); got != 1 {
+		t.Errorf("task appended %d times, want exactly once: %q", got, body)
+	}
+	if len(fake.inputs) != 1 {
+		t.Errorf("task must be sent exactly once, got %d sends", len(fake.inputs))
+	}
+}
+
+func TestConfirmGeneratedTaskAppendRespectsMaxTasks(t *testing.T) {
+	// The confirm-time append honors the source's max_tasks cap — the same
+	// limit the daemon's generation gate and manual `task add` enforce.
+	t.Run("full list refuses and stays pending", func(t *testing.T) {
+		app, st, fake, _, path := declaredSourceApp(t, "w1:p1", "- [x] 1. a\n- [x] 2. b\n")
+		ctx := context.Background()
+		if err := app.UpdateConfig(ctx, func(cfg *config.Config) error {
+			cfg.TaskSources[0].MaxTasks = 2
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		id := generatedEscalation(t, st, "w1:p1", "One more thing")
+
+		if err := app.Confirm(ctx, id, true); err == nil ||
+			!strings.Contains(err.Error(), "maximum number of tasks") {
+			t.Fatalf("confirm on a full list must refuse with the cap error, got %v", err)
+		}
+		body, _ := os.ReadFile(path)
+		if string(body) != "- [x] 1. a\n- [x] 2. b\n" {
+			t.Errorf("full list must stay unchanged, got %q", body)
+		}
+		if len(fake.inputs) != 0 {
+			t.Errorf("nothing may be sent on a refused confirm, got %v", fake.inputs)
+		}
+		audit, _ := st.GetAudit(ctx, id)
+		if audit.Status != "escalated" {
+			t.Errorf("escalation must stay pending so the operator can prune and retry, got %q", audit.Status)
+		}
+		// The refusal is retryable: raise the cap and the SAME escalation
+		// confirms cleanly, appending exactly one copy.
+		if err := app.UpdateConfig(ctx, func(cfg *config.Config) error {
+			cfg.TaskSources[0].MaxTasks = 10
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := app.Confirm(ctx, id, true); err != nil {
+			t.Fatalf("re-confirm after raising the cap must succeed, got %v", err)
+		}
+		body, _ = os.ReadFile(path)
+		if got := strings.Count(string(body), "One more thing"); got != 1 {
+			t.Errorf("retried confirm appended %d copies, want exactly 1: %q", got, body)
+		}
+		if !strings.Contains(string(body), "- [-] One more thing") {
+			t.Errorf("retried confirm must leave the delivered task reserved, got %q", body)
+		}
+		if len(fake.inputs) != 1 {
+			t.Errorf("the retried confirm must send exactly once, got %d sends", len(fake.inputs))
+		}
+	})
+	t.Run("partial room truncates the appended set", func(t *testing.T) {
+		app, st, fake, _, path := declaredSourceApp(t, "w1:p1", "- [x] 1. a\n")
+		ctx := context.Background()
+		if err := app.UpdateConfig(ctx, func(cfg *config.Config) error {
+			cfg.TaskSources[0].MaxTasks = 3
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		id := generatedEscalation(t, st, "w1:p1", "- [ ] first\n- [ ] second\n- [ ] third")
+
+		if err := app.Confirm(ctx, id, true); err != nil {
+			t.Fatal(err)
+		}
+		body, _ := os.ReadFile(path)
+		want := "- [x] 1. a\n- [-] first\n- [ ] second\n"
+		if string(body) != want {
+			t.Errorf("declared file = %q, want the set truncated to the cap %q", body, want)
+		}
+		if len(fake.inputs) != 1 {
+			t.Errorf("the first task must still be sent, got %v", fake.inputs)
+		}
+	})
+}
+
+// sendHookHerdr wraps fakeHerdr to observe on-disk state at the exact moment
+// Send runs — the only way to assert reserve-BEFORE-send ordering, since the
+// final file state after a rollback is identical to never having reserved.
+type sendHookHerdr struct {
+	*fakeHerdr
+	onSend func()
+}
+
+func (h *sendHookHerdr) Send(ctx context.Context, paneID, input string) error {
+	if h.onSend != nil {
+		h.onSend()
+	}
+	return h.fakeHerdr.Send(ctx, paneID, input)
+}
+
+func TestConfirmGeneratedTaskAppendReservesAndRollsBackOnSendFailure(t *testing.T) {
+	// The delivery mirrors SendTaskToAgent: the first task is reserved [-]
+	// before the send (so the daemon's idle flow can never hand it out
+	// mid-send), and a failed send releases it back to [ ] so the declared
+	// flow delivers it on a later idle — never a stranded [-] nobody will
+	// send.
+	app, st, fake, _, path := declaredSourceApp(t, "w5:p5", "- [x] 1. old task\n")
+	fake.sendErr = errors.New("induced send failure")
+	reservedMidSend := false
+	app.Herdr = &sendHookHerdr{fakeHerdr: fake, onSend: func() {
+		body, _ := os.ReadFile(path)
+		reservedMidSend = strings.Contains(string(body), "- [-] Deliver me later")
+	}}
+	ctx := context.Background()
+	id := generatedEscalation(t, st, "w5:p5", "Deliver me later")
+
+	err := app.Confirm(ctx, id, true)
+	if err == nil || !strings.Contains(err.Error(), "sending the task to the agent failed") {
+		t.Fatalf("confirm with a failing send must surface the send error, got %v", err)
+	}
+	if !reservedMidSend {
+		t.Error("the task must already be reserved [-] while Send is in flight")
+	}
+	body, _ := os.ReadFile(path)
+	want := "- [x] 1. old task\n- [ ] Deliver me later\n"
+	if string(body) != want {
+		t.Errorf("declared file = %q, want the task released to pending %q", body, want)
+	}
+	// The claim gates the send, so the escalation is consumed even though the
+	// send failed — the appended task is recovered via the declared flow (or
+	// `hap task send`), not by re-confirming.
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "resolved" {
+		t.Errorf("escalation status = %q, want resolved (claim precedes the send)", audit.Status)
+	}
+}
+
+func TestConfirmGeneratedTaskSendRefusedWhenFirstTaskNotPending(t *testing.T) {
+	// A suggestion whose first task already sits [x]/[-] in the declared file
+	// cannot be delivered: the refusal must land PRE-claim (escalation stays
+	// pending, actionable) instead of surfacing from reserveTask after the
+	// claim consumed it.
+	app, st, fake, _, path := declaredSourceApp(t, "w6:p6", "- [x] Deliver me later\n")
+	ctx := context.Background()
+	id := generatedEscalation(t, st, "w6:p6", "Deliver me later")
+
+	err := app.Confirm(ctx, id, true)
+	if err == nil || !strings.Contains(err.Error(), "already [x]") {
+		t.Fatalf("confirm with an already-done first task must refuse with the mark, got %v", err)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("nothing may be sent, got %v", fake.inputs)
+	}
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "escalated" {
+		t.Errorf("escalation must stay pending after the pre-claim refusal, got %q", audit.Status)
+	}
+	body, _ := os.ReadFile(path)
+	if string(body) != "- [x] Deliver me later\n" {
+		t.Errorf("declared file must stay unchanged, got %q", body)
+	}
+}
+
+func TestConfirmGeneratedTaskAppendDeduplicatesRepeatedSuggestion(t *testing.T) {
+	// A suggestion repeating the same task text appends it once — a
+	// repetitive LLM output must not stack duplicate checklist items or burn
+	// cap room on copies.
+	app, st, fake, _, path := declaredSourceApp(t, "w7:p7", "- [x] 1. old task\n")
+	ctx := context.Background()
+	id := generatedEscalation(t, st, "w7:p7", "- [ ] Same thing\n- [ ] Other thing\n- [ ] Same thing")
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := os.ReadFile(path)
+	want := "- [x] 1. old task\n- [-] Same thing\n- [ ] Other thing\n"
+	if string(body) != want {
+		t.Errorf("declared file = %q, want the repeated task appended once: %q", body, want)
+	}
+	if len(fake.inputs) != 1 {
+		t.Errorf("only the first task may be sent, got %v", fake.inputs)
+	}
+}
+
+func TestConfirmGeneratedTaskUsesSourceTemplate(t *testing.T) {
+	// The append path renders the outbound prompt through the SOURCE's own
+	// next_task_template, like any declared-task send — not the built-in
+	// default the bootstrap path uses.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	app.StateDir = t.TempDir()
+	ctx := context.Background()
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	path := filepath.Join(t.TempDir(), "declared.md")
+	if err := os.WriteFile(path, []byte("- [x] 1. old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tpl := "DO {next_task_content} FROM {task_list_path} AS {agent_name}"
+	if err := app.AddTaskSource(ctx, name, "", path, tpl); err != nil {
+		t.Fatal(err)
+	}
+	id := generatedEscalation(t, st, "w1:p1", "Ship it")
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	want := "DO Ship it FROM " + path + " AS " + name
+	if len(fake.inputs) != 1 || fake.inputs[0] != want {
+		t.Errorf("delivered %v, want the source-template prompt %q", fake.inputs, want)
+	}
+}
+
+func TestConfirmGeneratedTaskAppendCreatesMissingDeclaredFile(t *testing.T) {
+	// A declared source whose file does not exist yet still receives the
+	// tasks at ITS path — never a second bootstrap source.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	app.StateDir = t.TempDir()
+	ctx := context.Background()
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	path := filepath.Join(t.TempDir(), "sub", "declared.md")
+	if err := app.AddTaskSource(ctx, name, "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+	id := generatedEscalation(t, st, "w1:p1", "Bootstrap the declared file")
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("declared file not created: %v", err)
+	}
+	if !strings.Contains(string(body), "- [-] Bootstrap the declared file") {
+		t.Errorf("declared file = %q, want the in-progress appended task", body)
+	}
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 1 || cfg.TaskSources[0].Path != path {
+		t.Fatalf("want exactly 1 task source at %q, got %+v", path, cfg.TaskSources)
+	}
+}
+
+// locatorHerdr wraps fakeHerdr with a LocatorPort so workspace-scoped
+// selectors can resolve display names at confirm time.
+type locatorHerdr struct {
+	*fakeHerdr
+	workspaces []domain.WorkspaceInfo
+}
+
+func (l *locatorHerdr) ListWorkspaces(context.Context) ([]domain.WorkspaceInfo, error) {
+	return l.workspaces, nil
+}
+
+func (l *locatorHerdr) ListTabs(context.Context) ([]domain.TabInfo, error) { return nil, nil }
+
+func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
+	// The confirm-time source resolution must use the daemon's selector
+	// semantics — agent id, agent type, and workspace name/id scoping — not
+	// just the short name, or an id-/type-selected declared source would be
+	// bypassed and bootstrapped into a duplicate.
+	t.Run("agent id selector", func(t *testing.T) {
+		app, st := testApp(t)
+		fake := &fakeHerdr{}
+		app.Herdr = fake
+		app.StateDir = t.TempDir()
+		ctx := context.Background()
+		path := filepath.Join(t.TempDir(), "declared.md")
+		os.WriteFile(path, []byte("- [x] 1. old\n"), 0o600)
+		if err := app.AddTaskSource(ctx, "w1:p1", "", path, ""); err != nil {
+			t.Fatal(err)
+		}
+		id := generatedEscalation(t, st, "w1:p1", "By id")
+		if err := app.Confirm(ctx, id, false); err != nil {
+			t.Fatal(err)
+		}
+		body, _ := os.ReadFile(path)
+		if !strings.Contains(string(body), "- [ ] By id") {
+			t.Errorf("declared file = %q, want the appended task", body)
+		}
+	})
+	t.Run("agent type selector", func(t *testing.T) {
+		app, st := testApp(t)
+		fake := &fakeHerdr{}
+		app.Herdr = fake
+		app.StateDir = t.TempDir()
+		ctx := context.Background()
+		path := filepath.Join(t.TempDir(), "declared.md")
+		os.WriteFile(path, []byte("- [x] 1. old\n"), 0o600)
+		if err := app.AddTaskSource(ctx, "claude", "", path, ""); err != nil {
+			t.Fatal(err)
+		}
+		id, err := st.AppendAudit(ctx, domain.AuditRecord{
+			AgentID: "w1:p1", AgentType: "claude", SituationType: domain.SituationIdle,
+			Trigger: "t", Action: "escalated", Status: "escalated",
+			Suggestion: domain.SuggestTaskPrefix + "By type", CreatedAt: time.Now(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := app.Confirm(ctx, id, false); err != nil {
+			t.Fatal(err)
+		}
+		body, _ := os.ReadFile(path)
+		if !strings.Contains(string(body), "- [ ] By type") {
+			t.Errorf("declared file = %q, want the appended task", body)
+		}
+	})
+	t.Run("workspace name selector via locator", func(t *testing.T) {
+		app, st := testApp(t)
+		fake := &locatorHerdr{
+			fakeHerdr:  &fakeHerdr{agents: []domain.AgentTransition{{AgentID: "w1:p1", Status: "idle", WorkspaceID: "ws-1"}}},
+			workspaces: []domain.WorkspaceInfo{{ID: "ws-1", Label: "codex-main"}},
+		}
+		app.Herdr = fake
+		app.StateDir = t.TempDir()
+		ctx := context.Background()
+		name, _ := st.EnsureAgentName(ctx, "w1:p1")
+		path := filepath.Join(t.TempDir(), "declared.md")
+		os.WriteFile(path, []byte("- [x] 1. old\n"), 0o600)
+		if err := app.AddTaskSource(ctx, name, "codex-*", path, ""); err != nil {
+			t.Fatal(err)
+		}
+		id := generatedEscalation(t, st, "w1:p1", "By workspace name")
+		if err := app.Confirm(ctx, id, false); err != nil {
+			t.Fatal(err)
+		}
+		body, _ := os.ReadFile(path)
+		if !strings.Contains(string(body), "- [ ] By workspace name") {
+			t.Errorf("declared file = %q, want the appended task", body)
+		}
+		cfg, _ := config.Load(app.ConfigPath)
+		if len(cfg.TaskSources) != 1 {
+			t.Errorf("want exactly 1 task source, got %+v", cfg.TaskSources)
+		}
+	})
+	t.Run("workspace raw id fallback without locator", func(t *testing.T) {
+		app, st := testApp(t)
+		fake := &fakeHerdr{agents: []domain.AgentTransition{{AgentID: "w1:p1", Status: "idle", WorkspaceID: "ws-1"}}}
+		app.Herdr = fake
+		app.StateDir = t.TempDir()
+		ctx := context.Background()
+		name, _ := st.EnsureAgentName(ctx, "w1:p1")
+		path := filepath.Join(t.TempDir(), "declared.md")
+		os.WriteFile(path, []byte("- [x] 1. old\n"), 0o600)
+		if err := app.AddTaskSource(ctx, name, "ws-1", path, ""); err != nil {
+			t.Fatal(err)
+		}
+		id := generatedEscalation(t, st, "w1:p1", "By raw workspace id")
+		if err := app.Confirm(ctx, id, false); err != nil {
+			t.Fatal(err)
+		}
+		body, _ := os.ReadFile(path)
+		if !strings.Contains(string(body), "- [ ] By raw workspace id") {
+			t.Errorf("declared file = %q, want the appended task", body)
+		}
+	})
+}
+
+func TestConfirmGeneratedTaskPrefersSourceWithPendingWork(t *testing.T) {
+	// With several matching sources, the append lands on the one the daemon
+	// would reason about: a source with a pending "[ ]" item beats a fully
+	// completed one, regardless of config order.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	app.StateDir = t.TempDir()
+	ctx := context.Background()
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	dir := t.TempDir()
+	donePath := filepath.Join(dir, "done.md")
+	pendingPath := filepath.Join(dir, "pending.md")
+	os.WriteFile(donePath, []byte("- [x] 1. finished\n"), 0o600)
+	os.WriteFile(pendingPath, []byte("- [ ] 1. queued\n"), 0o600)
+	// The completed source is registered FIRST, so config order alone would
+	// pick the wrong file.
+	if err := app.AddTaskSource(ctx, name, "", donePath, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, name, "", pendingPath, ""); err != nil {
+		t.Fatal(err)
+	}
+	id := generatedEscalation(t, st, "w1:p1", "Go to the live list")
+
+	if err := app.Confirm(ctx, id, false); err != nil {
+		t.Fatal(err)
+	}
+	pendingBody, _ := os.ReadFile(pendingPath)
+	if !strings.Contains(string(pendingBody), "- [ ] Go to the live list") {
+		t.Errorf("pending-work source = %q, want the appended task there", pendingBody)
+	}
+	doneBody, _ := os.ReadFile(donePath)
+	if strings.Contains(string(doneBody), "Go to the live list") {
+		t.Errorf("completed source must stay untouched, got %q", doneBody)
+	}
+}
+
+func TestConfirmGeneratedTaskRefusesDuplicateAgentSource(t *testing.T) {
+	// Defense-in-depth: a source registered under this agent's name but scoped
+	// to a workspace the confirm cannot match falls through to the bootstrap
+	// path — which must REFUSE to register a second source for the same agent
+	// selector (that duplicate is exactly the `hap task` ambiguity of #157).
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	app.StateDir = t.TempDir()
+	ctx := context.Background()
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	path := filepath.Join(t.TempDir(), "declared.md")
+	if err := os.WriteFile(path, []byte("- [x] 1. old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, name, "other-workspace", path, ""); err != nil {
+		t.Fatal(err)
+	}
+	id := generatedEscalation(t, st, "w1:p1", "Do the thing")
+
+	if err := app.Confirm(ctx, id, true); err == nil ||
+		!strings.Contains(err.Error(), "already has a task source") {
+		t.Fatalf("confirm must refuse to register a duplicate agent source, got %v", err)
+	}
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 1 {
+		t.Errorf("config must be unchanged, got %+v", cfg.TaskSources)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("nothing may be sent, got %v", fake.inputs)
+	}
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "escalated" {
+		t.Errorf("escalation must stay pending, got %q", audit.Status)
+	}
+}
+
 func TestConfirmDeliversMenuDigitNotLabel(t *testing.T) {
 	// Regression: an LLM/learned approval carries the option LABEL ("Yes"),
 	// but Claude's numbered menu only accepts the digit. Confirm must

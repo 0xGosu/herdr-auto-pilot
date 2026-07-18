@@ -1224,3 +1224,32 @@ func TestCaptureDelayLoadedFromTOML(t *testing.T) {
 		t.Errorf("unmatched start delay = %v, want 10s", got)
 	}
 }
+
+func TestTaskSourceMatchesAgent(t *testing.T) {
+	// MatchesAgent is the single definition of the agent-selector semantics,
+	// shared by the daemon's task-source matcher and the frontend's
+	// generated-task confirm: id, type, or short name; "" matches any.
+	cases := []struct {
+		name     string
+		selector string
+		id, typ  string
+		short    string
+		want     bool
+	}{
+		{"empty selector matches any", "", "w1:p1", "claude", "alpha", true},
+		{"matches agent id", "w1:p1", "w1:p1", "claude", "alpha", true},
+		{"matches agent type", "claude", "w1:p1", "claude", "alpha", true},
+		{"matches short name", "alpha", "w1:p1", "claude", "alpha", true},
+		{"no match", "beta", "w1:p1", "claude", "alpha", false},
+		{"empty short name never matches a named selector", "alpha", "w1:p1", "claude", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := TaskSource{Agent: tc.selector}
+			if got := src.MatchesAgent(tc.id, tc.typ, tc.short); got != tc.want {
+				t.Errorf("TaskSource{Agent:%q}.MatchesAgent(%q,%q,%q) = %v, want %v",
+					tc.selector, tc.id, tc.typ, tc.short, got, tc.want)
+			}
+		})
+	}
+}

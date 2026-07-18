@@ -245,6 +245,20 @@ type TaskSource struct {
 	MaxTasks int `toml:"max_tasks,omitempty"`
 }
 
+// MatchesAgent reports whether this source's agent selector matches the given
+// agent. The selector matches the agent/pane id, the agent type, or the
+// agent's short name; an empty selector matches any agent. This is the single
+// definition of the selector semantics — the daemon's task-source matcher and
+// the frontend's confirm-time source resolution must agree, or a generated
+// task confirm can bootstrap a duplicate source next to a declared one.
+func (s TaskSource) MatchesAgent(agentID, agentType, agentName string) bool {
+	if s.Agent == "" {
+		return true
+	}
+	return s.Agent == agentID || s.Agent == agentType ||
+		(agentName != "" && s.Agent == agentName)
+}
+
 // DefaultMaxTasks is the fallback for TaskSource.MaxTasks when unset (0).
 const DefaultMaxTasks = 20
 
