@@ -935,7 +935,7 @@ func TestTaskListStatusFilterPreservesNumbers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"#1", "#2", "#3", "one", "two", "three", "3 task(s): 2 pending, 1 done"} {
+	for _, want := range []string{"#1", "#2", "#3", "one", "two", "three", "3 task(s): 2 pending, 0 in-progress, 1 done"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("list missing %q, got:\n%s", want, out)
 		}
@@ -983,6 +983,22 @@ func TestTaskInProgressMarkerFaithful(t *testing.T) {
 	}
 	if !strings.Contains(out, "queued") {
 		t.Errorf("pending filter must show the truly-unchecked item, got:\n%s", out)
+	}
+}
+
+// TestTaskListSummaryCountsInProgress pins that the summary line reports "[-]"
+// items in their own in-progress bucket instead of lumping them into "done"
+// (issue #158: "[ ] [ ] [-]" printed "2 pending, 1 done").
+func TestTaskListSummaryCountsInProgress(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] one\n- [ ] two\n- [-] three\n")
+
+	out, err := run(t, app, "task", "--path", path, "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "3 task(s): 2 pending, 1 in-progress, 0 done") {
+		t.Errorf("summary must count [-] as in-progress, not done, got:\n%s", out)
 	}
 }
 

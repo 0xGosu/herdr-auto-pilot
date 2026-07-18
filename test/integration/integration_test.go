@@ -145,6 +145,12 @@ func TestRealPaneInfo(t *testing.T) {
 	if gotCwd != wantCwd {
 		t.Errorf("cwd = %q, want /tmp (resolved %q)", info.Cwd, wantCwd)
 	}
+	// The AGE reset on pane-id recycling (issue #158) hangs off this field —
+	// surface herdr dropping/renaming it. Skip (never fail) so a herdr
+	// predating terminal_id still runs the suite clean.
+	if info.TerminalID == "" {
+		t.Skipf("herdr reported no terminal_id (pre-terminal_id herdr, or the field was renamed): %+v", info)
+	}
 }
 
 // TestRealConfirmDeliversMenuDigit is the end-to-end regression for the send

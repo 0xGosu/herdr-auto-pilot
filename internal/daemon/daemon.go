@@ -722,6 +722,9 @@ func (d *Daemon) reconcileAttention(ctx context.Context) {
 		slog.Error("reconcile: listing agents failed", "error", err)
 		return
 	}
+	// Before the parked-status filter: working agents must sync too, or a
+	// busy agent on a recycled pane id keeps the stale AGE until it parks.
+	d.syncTerminalIDs(ctx, agents)
 	for _, a := range agents {
 		switch a.Status {
 		case "blocked", "idle", "done":
@@ -745,6 +748,28 @@ func (d *Daemon) reconcileAttention(ctx context.Context) {
 		}
 		slog.Info("reconcile: re-driving parked agent", "agent", a.AgentID, "pane", a.PaneID, "status", a.Status)
 		d.scheduleCapture(ctx, a)
+	}
+}
+
+// syncTerminalIDs reconciles each live agent's herdr terminal id with its
+// agent_names row, so an agent landing on a recycled pane id gets its
+// created_at (the TUI AGE anchor) reset (issue #158). Piggybacks on the
+// ListAgents call reconcileAttention already makes — no extra shell-outs.
+// Best-effort: errors are logged and never abort the reconcile sweep.
+func (d *Daemon) syncTerminalIDs(ctx context.Context, agents []domain.AgentTransition) {
+	for _, a := range agents {
+		if a.TerminalID == "" {
+			continue // older herdr without terminal_id: keep today's behavior
+		}
+		reset, err := d.opt.Store.SyncAgentTerminalID(ctx, a.AgentID, a.TerminalID)
+		if err != nil {
+			slog.Warn("reconcile: terminal-id sync failed", "agent", a.AgentID, "error", err)
+			continue
+		}
+		if reset {
+			slog.Info("pane id recycled by a new terminal; agent age reset",
+				"agent", a.AgentID, "terminal", a.TerminalID)
+		}
 	}
 }
 

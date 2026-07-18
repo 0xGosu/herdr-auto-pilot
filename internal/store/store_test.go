@@ -804,6 +804,87 @@ func TestAgentStats(t *testing.T) {
 	if g := restart["w1:p3"]; g.AutoSends != 0 || g.Escalations != 0 || g.Confirmed != 0 || g.Corrections != 0 {
 		t.Errorf("new pane id must start empty, got %+v", g)
 	}
+
+	// Herdr can also RECYCLE a pane id for a brand-new terminal. The terminal
+	// id sync then resets FirstSeen (AGE anchor) while the audit-derived
+	// counts — keyed to the pane id — survive (issue #158).
+	if _, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_old"); err != nil {
+		t.Fatal(err)
+	}
+	// created_at is unix-milli; make the reset distinguishable from base.
+	time.Sleep(15 * time.Millisecond)
+	reset, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_new")
+	if err != nil || !reset {
+		t.Fatalf("recycled terminal id must reset: reset=%v err=%v", reset, err)
+	}
+	recycled, err := s.AgentStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := recycled["w1:p1"]; !g.FirstSeen.After(base) {
+		t.Errorf("recycled pane id must move FirstSeen past %v, got %v", base, g.FirstSeen)
+	} else if g.AutoSends != want.AutoSends || g.Escalations != want.Escalations {
+		t.Errorf("terminal-id reset must keep counts, got %+v", g)
+	}
+}
+
+func TestSyncAgentTerminalID(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	name, err := s.EnsureAgentName(ctx, "w1:p1")
+	if err != nil || name == "" {
+		t.Fatalf("ensure name: %q %v", name, err)
+	}
+	firstSeen := func() time.Time {
+		t.Helper()
+		stats, err := s.AgentStats(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stats["w1:p1"].FirstSeen
+	}
+	created := firstSeen()
+
+	// Empty terminal id (older herdr) and unknown agent id are no-ops.
+	if reset, err := s.SyncAgentTerminalID(ctx, "w1:p1", ""); err != nil || reset {
+		t.Errorf("empty terminal id must no-op, got reset=%v err=%v", reset, err)
+	}
+	if reset, err := s.SyncAgentTerminalID(ctx, "w9:p9", "term_a"); err != nil || reset {
+		t.Errorf("unknown agent must no-op, got reset=%v err=%v", reset, err)
+	}
+
+	// First observation adopts the id without touching created_at.
+	if reset, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_a"); err != nil || reset {
+		t.Errorf("first observation must record without reset, got reset=%v err=%v", reset, err)
+	}
+	if got := firstSeen(); !got.Equal(created) {
+		t.Errorf("first observation moved FirstSeen %v -> %v", created, got)
+	}
+
+	// Matching id is a no-op.
+	if reset, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_a"); err != nil || reset {
+		t.Errorf("matching id must no-op, got reset=%v err=%v", reset, err)
+	}
+
+	// A differing id means the pane id was recycled: created_at resets,
+	// name survives.
+	before := time.Now().Truncate(time.Millisecond)
+	reset, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_b")
+	if err != nil || !reset {
+		t.Fatalf("differing id must reset, got reset=%v err=%v", reset, err)
+	}
+	if got := firstSeen(); got.Before(before) {
+		t.Errorf("reset must move FirstSeen to now, got %v (< %v)", got, before)
+	}
+	if after, err := s.agentNameByID(ctx, "w1:p1"); err != nil || after != name {
+		t.Errorf("reset must keep the name %q, got %q %v", name, after, err)
+	}
+
+	// The new id is now stored: re-sync is a no-op again.
+	if reset, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_b"); err != nil || reset {
+		t.Errorf("re-sync after reset must no-op, got reset=%v err=%v", reset, err)
+	}
 }
 
 func TestAgentNames(t *testing.T) {

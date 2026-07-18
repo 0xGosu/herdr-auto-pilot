@@ -28,7 +28,12 @@ type AgentTransition struct {
 	TabID       string
 	WorkspaceID string
 	Status      string // idle | working | blocked | done | unknown | detected
-	At          time.Time
+	// TerminalID is herdr's unique per-terminal id (`terminal_id`). It changes
+	// whenever the terminal behind a (reusable) pane id is recreated. Only
+	// `agent list` transitions carry it; event-socket transitions and older
+	// herdr leave it empty.
+	TerminalID string
+	At         time.Time
 	// RetryAuditID marks a daemon-injected transition that re-evaluates a
 	// retired LLM-failure escalation. Transient: Herdr events leave it zero.
 	RetryAuditID int64
@@ -61,6 +66,7 @@ type PaneInfo struct {
 	Cwd            string // pane working directory; herdr renders a deleted dir with a " (deleted)" suffix
 	ForegroundCwd  string // cwd of the foreground process; absent in some herdr responses
 	AgentSessionID string // the agent's native session id (agent_session.value); empty when herdr has no stored session reference
+	TerminalID     string // herdr's unique per-terminal id; changes when the terminal behind a reused pane id is recreated
 }
 
 // Situation is a classified, attention-requiring state of one agent pane.

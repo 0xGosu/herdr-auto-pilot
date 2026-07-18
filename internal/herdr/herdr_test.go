@@ -278,7 +278,7 @@ func TestCLIExecutor(t *testing.T) {
 
 	// agent list parsing (real herdr prints a JSON envelope)
 	fake.SetAgentList(`{"id":"cli:agent:list","result":{"agents":[` +
-		`{"agent":"claude","agent_status":"blocked","pane_id":"w1:p1","workspace_id":"w1"},` +
+		`{"agent":"claude","agent_status":"blocked","pane_id":"w1:p1","workspace_id":"w1","terminal_id":"term_656c9509757bf1"},` +
 		`{"agent":"codex","agent_status":"idle","pane_id":"w1:p2","workspace_id":"w1"}],"type":"agent_list"}}`)
 	agents, err := cli.ListAgents(ctx)
 	if err != nil {
@@ -286,6 +286,9 @@ func TestCLIExecutor(t *testing.T) {
 	}
 	if len(agents) != 2 || agents[0].AgentType != "claude" || agents[1].Status != "idle" {
 		t.Errorf("agent list parsing: %+v", agents)
+	}
+	if agents[0].TerminalID != "term_656c9509757bf1" || agents[1].TerminalID != "" {
+		t.Errorf("terminal_id parsing: %+v", agents)
 	}
 }
 
@@ -733,7 +736,8 @@ func TestPaneInfo(t *testing.T) {
 		`"source":"herdr:claude","value":"ba9a6f5a-ca6a-49dc-bcec-d4869ba97851"},` +
 		`"agent_status":"blocked","cwd":"/home/op/project",` +
 		`"foreground_cwd":"/home/op/project/sub","focused":false,"pane_id":"w1:p1",` +
-		`"revision":0,"tab_id":"w1:t1","workspace_id":"w1"},"type":"pane_info"}}`)
+		`"revision":0,"tab_id":"w1:t1","terminal_id":"term_656d948d811c53d",` +
+		`"workspace_id":"w1"},"type":"pane_info"}}`)
 	info, err := cli.PaneInfo(ctx, "w1:p1")
 	if err != nil {
 		t.Fatal(err)
@@ -746,6 +750,9 @@ func TestPaneInfo(t *testing.T) {
 	}
 	if info.AgentSessionID != "ba9a6f5a-ca6a-49dc-bcec-d4869ba97851" {
 		t.Errorf("agent_session.value parsing: %+v", info)
+	}
+	if info.TerminalID != "term_656d948d811c53d" {
+		t.Errorf("terminal_id parsing: %+v", info)
 	}
 
 	// Deleted cwd renders with a literal suffix and no foreground_cwd;
@@ -762,6 +769,9 @@ func TestPaneInfo(t *testing.T) {
 	}
 	if info.AgentSessionID != "" {
 		t.Errorf("absent agent_session must zero AgentSessionID: %+v", info)
+	}
+	if info.TerminalID != "" {
+		t.Errorf("absent terminal_id must zero TerminalID: %+v", info)
 	}
 
 	// CLI failure surfaces an error.
