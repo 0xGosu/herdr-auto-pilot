@@ -121,6 +121,21 @@ func TestExtractCodexErrorBanner(t *testing.T) {
 			"stream error: connection reset",
 		},
 		{
+			"footer cwd containing spaces is tolerated",
+			"■ stream error: connection reset\n\n  gpt-5.6-sol high · /workspaces/my project\n",
+			"stream error: connection reset",
+		},
+		{
+			"footer with deleted cwd is tolerated",
+			"■ stream error: connection reset\n\n  gpt-5.6-sol high · /tmp/gone (deleted)\n",
+			"stream error: connection reset",
+		},
+		{
+			"footer with extra ·-separated segment is tolerated",
+			"■ stream error: connection reset\n\n  gpt-5.6-sol · 56% context left · /tmp\n",
+			"stream error: connection reset",
+		},
+		{
 			"CRLF pane",
 			"■ stream error: connection\r\nreset by peer\r\n\r\n  gpt-5.6-sol high · /tmp\r\n",
 			"stream error: connection reset by peer",

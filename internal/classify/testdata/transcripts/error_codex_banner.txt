@@ -4,4 +4,4 @@
 
 ›
 
-  gpt-5.6-sol high · /tmp
+  gpt-5.6-sol high · /workspaces/my project

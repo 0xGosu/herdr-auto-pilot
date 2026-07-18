@@ -37,13 +37,18 @@ var (
 	// Codex's live composer/input-box line ("›", possibly with typed text).
 	codexComposerLineRE = regexp.MustCompile(`^[ \t]*›`)
 	// The composer status footer: model name and cwd joined by " · /"
-	// (e.g. "gpt-5.6-sol high · /tmp", a deleted cwd renders as
-	// "/path (deleted)"). Full-line shape, same " · /" separator
-	// codexComposerBeforeFooterRE keys on; like that regex this is a text
-	// heuristic — a final narration line of exactly this shape right after a
-	// scrollback banner would be misread as the footer (accepted risk, see
-	// the codexComposerBeforeFooterRE comment).
-	codexStatusFooterLineRE = regexp.MustCompile(`^[ \t]*\S[^\n·]*\s·\s+/\S*( \(deleted\))?[ \t]*$`)
+	// (e.g. "gpt-5.6-sol high · /tmp"), the same shape (greedy: the LAST
+	// " · /" on the line) codexComposerBeforeFooterRE keys on. Both sides of
+	// the separator accept any text: the model part may grow extra
+	// "·"-separated segments, and cwds may contain spaces or render as
+	// "/path (deleted)" — rejecting a real footer here reads as "no live
+	// banner" and silently idles a hard-blocked agent (#161), so the matcher
+	// must err loose. Like the composer regex this is a text heuristic — a
+	// final narration line of exactly this shape right after a scrollback
+	// banner would be misread as the footer, failing safe toward a spurious
+	// escalation (accepted risk, see the codexComposerBeforeFooterRE
+	// comment).
+	codexStatusFooterLineRE = regexp.MustCompile(`^[ \t]*\S[^\n]*\s·\s+/[^\n]*$`)
 )
 
 // Stable ErrorSummary label for Codex's built-in error forms — used as the
