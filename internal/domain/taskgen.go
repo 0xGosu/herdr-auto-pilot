@@ -192,10 +192,13 @@ func hasAlphanumeric(s string) bool {
 }
 
 // RenderGeneratedTaskList renders the normalized tasks as a checklist file:
-// the first task is in-progress ("[-]", the one sent to the agent now) and the
-// rest are pending ("[ ]", picked up by the normal declared-task flow on later
-// idles). Callers pass the result of NormalizeGeneratedTasks; an empty list
-// yields just the header.
+// every task is pending ("[ ]"), so the declared-task flow can hand each one
+// out on idle. The in-progress marker ("[-]") is written only at delivery
+// time by whoever actually sends a task (the confirm --send reservation, or
+// `hap task send`) — pre-marking here would strand the first item when no
+// send follows, since "[-]" is exactly what suppresses the idle resend
+// (issue #156). Callers pass the result of NormalizeGeneratedTasks; an empty
+// list yields just the header.
 //
 // Each item is prefixed with its 1-based position as a numbered ID ("1. ",
 // "2. ", …) rather than a plain bullet, so a standard markdown task-list
@@ -213,17 +216,33 @@ func RenderGeneratedTaskList(agentName string, tasks []string) string {
 	b.WriteString(agentName)
 	b.WriteString("\n\n")
 	for i, t := range tasks {
-		marker := "[ ]"
-		if i == 0 {
-			marker = "[" + MarkInProgress + "]"
-		}
-		b.WriteString("- ")
-		b.WriteString(marker)
-		b.WriteString(" ")
-		b.WriteString(strconv.Itoa(i + 1))
-		b.WriteString(". ")
-		b.WriteString(t)
+		b.WriteString("- [ ] ")
+		b.WriteString(GeneratedTaskItemText(i, t))
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// GeneratedTaskItemText is the checklist item text RenderGeneratedTaskList
+// writes for the i-th (0-based) generated task: the numbered ID plus the raw
+// task. It is the single source of truth for that format — the delivery-time
+// reservation must name exactly this text to claim the item, so the two sites
+// cannot be allowed to drift apart silently.
+func GeneratedTaskItemText(i int, task string) string {
+	return strconv.Itoa(i+1) + ". " + task
+}
+
+// generatedItemIDRE matches the numbered-ID prefix GeneratedTaskItemText
+// writes ("1. ", "23. ", …), and nothing looser: the ID is always digits, a
+// dot, and a single space, at the very start of the item text.
+var generatedItemIDRE = regexp.MustCompile(`^\d+\. `)
+
+// GeneratedTaskIdentity strips the numbered-ID prefix GeneratedTaskItemText
+// adds, recovering the raw task as a position-independent identity. A
+// regeneration that inserts or reorders tasks renumbers every line, so
+// anything reconciling an old list with a new one (marker carry-over) must
+// recognize the same logical task under a different number. Hand-authored,
+// unnumbered text passes through unchanged.
+func GeneratedTaskIdentity(text string) string {
+	return generatedItemIDRE.ReplaceAllString(text, "")
 }
