@@ -1023,7 +1023,10 @@ func TestCorrectionFloorsPostResetLLMGuesses(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	newestOp, _ := h.raw.DecisionsForSignature(ctx, sig.Signature, 1)
+	newestOp, err := h.raw.DecisionsForSignature(ctx, sig.Signature, 1)
+	if err != nil || len(newestOp) != 1 {
+		t.Fatalf("seed operator history: %d rows, %v", len(newestOp), err)
+	}
 	// The reset: floor everything recorded so far, newest INCLUSIVE.
 	if err := h.raw.UpsertSignature(ctx, domain.SignatureState{
 		Signature: sig.Signature, SituationType: domain.SituationApproval,
@@ -1042,7 +1045,10 @@ func TestCorrectionFloorsPostResetLLMGuesses(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	before, _ := h.raw.DecisionsForSignature(ctx, sig.Signature, 50)
+	before, err := h.raw.DecisionsForSignature(ctx, sig.Signature, 50)
+	if err != nil || len(before) != 5 {
+		t.Fatalf("seed history: %d rows, %v", len(before), err)
+	}
 
 	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
 	h.push("agent-reset-floor", "blocked")
