@@ -648,12 +648,12 @@ func TestDeclaredTaskLLMReviewDeclineDoesNotReconsult(t *testing.T) {
 }
 
 func TestDeclaredTaskLLMReviewOptOut(t *testing.T) {
-	// A source with llm_review=false keeps the plain declared-task flow even
+	// A source with enable_llm_review=false keeps the plain declared-task flow even
 	// when an LLM command is configured: the templated prompt is sent directly
 	// and the LLM is never consulted.
 	taskFile := writeReviewTaskFile(t, "- [ ] write the docs\n")
 	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-opt\"\npath = %q\nllm_review = false\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-opt\"\npath = %q\nenable_llm_review = false\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.llm.configured = true

@@ -411,6 +411,25 @@ func TestMCPSituationInputContract(t *testing.T) {
 		{"noop clears stray select_options", domain.SituationApproval,
 			`{"options":["Yes","No"]}`,
 			map[string]any{"recommend_action": "@noop", "select_options": []int{1}}, "", domain.ActionNoop},
+		// An action review (proposed_action present) takes recommend_action
+		// even when the reviewed situation carries a parsed menu — the
+		// reviewed reply reached the review precisely because it did NOT map
+		// onto the options.
+		{"action review accepts adapted text despite menu", domain.SituationApproval,
+			`{"options":["Yes","No"],"proposed_action":"y please"}`,
+			map[string]any{"recommend_action": "y — go ahead"}, "", "y — go ahead"},
+		{"action review accepts affirm sentinel despite menu", domain.SituationApproval,
+			`{"options":["Yes","No"],"proposed_action":"y please"}`,
+			map[string]any{"recommend_action": domain.ActionSendProposedAction}, "", domain.ActionSendProposedAction},
+		{"action review rejects select_options", domain.SituationApproval,
+			`{"options":["Yes","No"],"proposed_action":"y please"}`,
+			map[string]any{"select_options": []int{1}}, "recommend_action", ""},
+		{"action review requires an action", domain.SituationApproval,
+			`{"options":["Yes","No"],"proposed_action":"y please"}`,
+			map[string]any{}, "recommend_action", ""},
+		{"action review accepts noop", domain.SituationApproval,
+			`{"options":["Yes","No"],"proposed_action":"y please"}`,
+			map[string]any{"recommend_action": "@noop"}, "", domain.ActionNoop},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

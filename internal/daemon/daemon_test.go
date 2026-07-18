@@ -353,38 +353,6 @@ func (f *fakeLLM) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 	return f.consult(ctx, req)
 }
 
-// fakeRewriter layers ports.RewriterPort on the LLM fake so the daemon's
-// type assertion finds the optional rewrite capability.
-type fakeRewriter struct {
-	*fakeLLM
-	mu       sync.Mutex
-	rewrite  func(ctx context.Context, req domain.RewriteRequest) (string, error)
-	requests []domain.RewriteRequest
-}
-
-func (f *fakeRewriter) RewriteConfigured() bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.rewrite != nil
-}
-
-func (f *fakeRewriter) Rewrite(ctx context.Context, req domain.RewriteRequest) (string, error) {
-	f.mu.Lock()
-	f.requests = append(f.requests, req)
-	fn := f.rewrite
-	f.mu.Unlock()
-	if fn == nil {
-		return "", errors.New("no rewrite configured")
-	}
-	return fn(ctx, req)
-}
-
-func (f *fakeRewriter) rewriteCalls() []domain.RewriteRequest {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]domain.RewriteRequest(nil), f.requests...)
-}
-
 // fakeTaskGen layers ports.TaskGeneratorPort on the LLM fake so the daemon's
 // type assertion finds the optional idle task-generation capability.
 type fakeTaskGen struct {
@@ -512,20 +480,15 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, cfgTOML string) *harness {
-	return newHarnessFull(t, cfgTOML, nil, nil)
+	fl := &fakeLLM{}
+	return newHarnessCore(t, cfgTOML, nil, fl, fl)
 }
 
 // newHarnessWrapped lets a test substitute the HerdrPort the daemon sees
 // (e.g. hiding optional interfaces) while keeping the fake for assertions.
 func newHarnessWrapped(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort) *harness {
-	return newHarnessFull(t, cfgTOML, wrap, nil)
-}
-
-// newHarnessRewriter installs a rewriter-capable LLM port.
-func newHarnessRewriter(t *testing.T, cfgTOML string,
-	rewrite func(ctx context.Context, req domain.RewriteRequest) (string, error)) (*harness, *fakeRewriter) {
-	fr := &fakeRewriter{fakeLLM: &fakeLLM{}, rewrite: rewrite}
-	return newHarnessFull(t, cfgTOML, nil, fr), fr
+	fl := &fakeLLM{}
+	return newHarnessCore(t, cfgTOML, wrap, fl, fl)
 }
 
 // newHarnessTaskGen installs a task-generator-capable LLM port for idle
@@ -534,16 +497,6 @@ func newHarnessTaskGen(t *testing.T, cfgTOML string,
 	generate func(ctx context.Context, req domain.TaskGenRequest) (string, error)) (*harness, *fakeTaskGen) {
 	tg := &fakeTaskGen{fakeLLM: &fakeLLM{}, generate: generate}
 	return newHarnessCore(t, cfgTOML, nil, tg, tg.fakeLLM), tg
-}
-
-func newHarnessFull(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort, rw *fakeRewriter) *harness {
-	fl := &fakeLLM{}
-	var llmPort ports.LLMPort = fl
-	if rw != nil {
-		fl = rw.fakeLLM
-		llmPort = rw
-	}
-	return newHarnessCore(t, cfgTOML, wrap, llmPort, fl)
 }
 
 // newHarnessCore wires the daemon with a caller-supplied LLM port (plus the

@@ -1207,12 +1207,10 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "llm.timeout_seconds", TUIEditable: true},
 	{Key: "llm.auto_act_confidence_threshold", TUIEditable: true},
 	{Key: "llm.pane_excerpt_chars", TUIEditable: true},
-	{Key: "llm.rewrite_command"},       // argv template
-	{Key: "llm.rewrite_command_start"}, // argv template (first rewrite; inherits rewrite_command)
-	{Key: "llm.rewrite_timeout_seconds", TUIEditable: true},
-	{Key: "llm.rewrite_fallback_template"},   // template string
-	{Key: "llm.task_generate_command"},       // argv template (idle task suggestion)
-	{Key: "llm.task_generate_command_start"}, // argv template (first generation; inherits task_generate_command)
+	{Key: "llm.enable_rewrite_action", TUIEditable: true},
+	{Key: "llm.rewrite_action_fallback_template"}, // template string
+	{Key: "llm.task_generate_command"},            // argv template (idle task suggestion)
+	{Key: "llm.task_generate_command_start"},      // argv template (first generation; inherits task_generate_command)
 	{Key: "llm.task_generate_timeout_seconds", TUIEditable: true},
 	{Key: "embedding.disabled", TUIEditable: true},
 	{Key: "embedding.model_path"}, // path
@@ -1296,23 +1294,13 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.LLM.AutoActConfidenceThreshold)
 	case "llm.pane_excerpt_chars":
 		return strconv.Itoa(cfg.LLM.PaneExcerptChars)
-	case "llm.rewrite_command":
-		if len(cfg.LLM.RewriteCommand) == 0 {
-			return "(disabled)"
-		}
-		return JoinCommand(cfg.LLM.RewriteCommand)
-	case "llm.rewrite_command_start":
-		if len(cfg.LLM.RewriteCommandStart) == 0 {
-			return "(inherits rewrite_command)"
-		}
-		return JoinCommand(cfg.LLM.RewriteCommandStart)
-	case "llm.rewrite_timeout_seconds":
-		return strconv.Itoa(cfg.LLM.RewriteTimeoutSeconds)
-	case "llm.rewrite_fallback_template":
-		if cfg.LLM.RewriteFallbackTemplate == "" {
+	case "llm.enable_rewrite_action":
+		return strconv.FormatBool(cfg.LLM.EnableRewriteAction)
+	case "llm.rewrite_action_fallback_template":
+		if cfg.LLM.RewriteActionFallbackTemplate == "" {
 			return "(built-in default)"
 		}
-		return cfg.LLM.RewriteFallbackTemplate
+		return cfg.LLM.RewriteActionFallbackTemplate
 	case "llm.task_generate_command":
 		if len(cfg.LLM.GenerateTaskCommand) == 0 {
 			return "(disabled)"
@@ -1446,26 +1434,17 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			cfg.LLM.CommandStart = argv // empty inherits llm.command
 			return nil
-		case "llm.rewrite_command":
-			argv, err := SplitCommand(value)
+		case "llm.enable_rewrite_action":
+			v, err := strconv.ParseBool(value)
 			if err != nil {
-				return fmt.Errorf("llm.rewrite_command: %w", err)
+				return fmt.Errorf("llm.enable_rewrite_action must be true or false, got %q", value)
 			}
-			cfg.LLM.RewriteCommand = argv // empty disables the rewrite
+			cfg.LLM.EnableRewriteAction = v
 			return nil
-		case "llm.rewrite_command_start":
-			argv, err := SplitCommand(value)
-			if err != nil {
-				return fmt.Errorf("llm.rewrite_command_start: %w", err)
-			}
-			cfg.LLM.RewriteCommandStart = argv // empty inherits llm.rewrite_command
-			return nil
-		case "llm.rewrite_timeout_seconds":
-			return setInt(&cfg.LLM.RewriteTimeoutSeconds)
-		case "llm.rewrite_fallback_template":
+		case "llm.rewrite_action_fallback_template":
 			// Any text is accepted; empty restores the built-in default at
 			// use time (domain.ApplyRewriteFallback).
-			cfg.LLM.RewriteFallbackTemplate = value
+			cfg.LLM.RewriteActionFallbackTemplate = value
 			return nil
 		case "llm.task_generate_command":
 			argv, err := SplitCommand(value)

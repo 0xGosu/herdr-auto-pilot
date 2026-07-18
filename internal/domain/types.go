@@ -435,6 +435,15 @@ type LLMRequest struct {
 	// changed since review (checked off / edited). Transient.
 	SourcePath   string
 	ReviewedTask string
+	// ActionReview marks this consult as a pre-delivery review of a learned
+	// free-text action (llm.enable_rewrite_action): the LLM adapts the text to
+	// the live pane, affirms it with ActionSendProposedAction, or vetoes it
+	// with @noop. Transient; drives the never-block handling in
+	// handleActionReviewOutcome.
+	ActionReview bool
+	// ProposedAction is the literal outbound text under review when
+	// ActionReview is set. Transient.
+	ProposedAction string
 	// RetryAuditID identifies the retired escalation whose operator-requested
 	// retry produced this consult. Transient and intentionally not persisted;
 	// a non-zero value forces the successful result into a fresh escalation.
