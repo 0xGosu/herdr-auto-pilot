@@ -90,6 +90,17 @@ func TestLLMNoopPromotionRecordsWithoutSend(t *testing.T) {
 		t.Errorf("LLM noop decision not learned: %+v", decs)
 	}
 
+	// #175: the recorded LLM decision must also create a shadow signatures
+	// row, so the learned rule is visible to `signatures list` and
+	// addressable by delete/reset.
+	st, err := h.raw.GetSignature(ctx, audits[0].Signature)
+	if err != nil || st == nil {
+		t.Fatalf("LLM decision must create a signatures row: %v %v", st, err)
+	}
+	if st.Mode != domain.ModeShadow || st.DecisionFloorID != 0 || st.ConsecutiveConfirmations != 0 {
+		t.Errorf("LLM-created row must be a fresh shadow state: %+v", st)
+	}
+
 	pending, _ := h.raw.PendingLLMDecisions(ctx)
 	if len(pending) != 0 {
 		t.Errorf("staged decision should be accepted, still pending: %+v", pending)

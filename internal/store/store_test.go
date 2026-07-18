@@ -1113,6 +1113,116 @@ func TestListSignaturesFiltersAndOrder(t *testing.T) {
 	}
 }
 
+func TestEnsureSignature(t *testing.T) {
+	// #175: EnsureSignature is the atomic insert-if-absent the daemon uses
+	// after recording an LLM decision. It must create a fresh shadow row when
+	// none exists and never touch an existing row (a read-then-upsert would
+	// race the correction/reset writers and clobber their state).
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.EnsureSignature(ctx, domain.SignatureState{
+		Signature: "idle:fresh", SituationType: domain.SituationIdle,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.GetSignature(ctx, "idle:fresh")
+	if err != nil || st == nil {
+		t.Fatalf("ensure must create a missing row: %v %v", st, err)
+	}
+	if st.Mode != domain.ModeShadow || st.ConsecutiveConfirmations != 0 ||
+		st.CachedConfidence != 0 || st.DecisionFloorID != 0 {
+		t.Errorf("created row must be a fresh shadow state: %+v", st)
+	}
+
+	// An existing row survives untouched — even learning-state fields the
+	// caller happens to pass are ignored on the existing-row path.
+	seedSignature(t, s, "approval:learned", domain.SituationApproval, "claude", domain.ModeAutonomous, 0.9, now)
+	if err := s.EnsureSignature(ctx, domain.SignatureState{
+		Signature: "approval:learned", SituationType: domain.SituationApproval,
+		AgentType: "codex", Mode: domain.ModeShadow, UpdatedAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = s.GetSignature(ctx, "approval:learned")
+	if st == nil || st.Mode != domain.ModeAutonomous || st.AgentType != "claude" ||
+		st.ConsecutiveConfirmations != 2 || st.CachedConfidence != 0.9 {
+		t.Errorf("ensure must never touch an existing row: %+v", st)
+	}
+}
+
+func TestMigrateBackfillsSignatureRows(t *testing.T) {
+	// #175: databases from before LLM decisions created signatures rows hold
+	// decisions-only signatures that `signatures list/delete/reset` cannot
+	// address. Reopening the store backfills a shadow row per such signature
+	// (type fields from its newest decision) and never touches existing rows.
+	s, path := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	seedSignature(t, s, "approval:kept", domain.SituationApproval, "claude", domain.ModeAutonomous, 0.9, now)
+	if _, err := s.RecordDecision(ctx, domain.DecisionRecord{
+		Signature: "approval:kept", SituationType: domain.SituationApproval,
+		AgentType: "claude", ChosenAction: "1", Source: domain.SourceRule, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Same CreatedAt on purpose: the backfill must pick type fields from the
+	// newest decision BY ID (insertion order), not by a created_at that can
+	// tie within a burst.
+	for _, agentType := range []string{"codex", "claude"} { // oldest → newest
+		if _, err := s.RecordDecision(ctx, domain.DecisionRecord{
+			Signature: "idle:orphan", SituationType: domain.SituationIdle,
+			AgentType: agentType, ChosenAction: domain.ActionNoop, Source: domain.SourceLLM,
+			CreatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st, _ := s.GetSignature(ctx, "idle:orphan"); st != nil {
+		t.Fatalf("fixture must start decisions-only, got %+v", st)
+	}
+	s.Close()
+
+	re, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer re.Close()
+
+	st, err := re.GetSignature(ctx, "idle:orphan")
+	if err != nil || st == nil {
+		t.Fatalf("backfill must create the missing row: %v %v", st, err)
+	}
+	if st.Mode != domain.ModeShadow || st.DecisionFloorID != 0 || st.ConsecutiveConfirmations != 0 {
+		t.Errorf("backfilled row must be a fresh shadow state: %+v", st)
+	}
+	if st.SituationType != domain.SituationIdle || st.AgentType != "claude" {
+		t.Errorf("backfilled type fields must come from the newest decision: %+v", st)
+	}
+	// The signature is now CLI-addressable end to end.
+	if got, err := re.ResolveSignature(ctx, "idle:"); err != nil || got != "idle:orphan" {
+		t.Errorf("backfilled signature must resolve: got %q, %v", got, err)
+	}
+	if n, err := re.DeleteSignature(ctx, "idle:orphan"); err != nil || n != 2 {
+		t.Errorf("backfilled signature must delete with its decisions: n=%d, %v", n, err)
+	}
+	// Existing rows are untouched (INSERT OR IGNORE), and re-running the
+	// migration after the delete must not resurrect the deleted signature's
+	// row (its decisions are gone too).
+	kept, _ := re.GetSignature(ctx, "approval:kept")
+	if kept == nil || kept.Mode != domain.ModeAutonomous || kept.CachedConfidence != 0.9 {
+		t.Errorf("existing row must be untouched by the backfill: %+v", kept)
+	}
+	if err := re.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := re.GetSignature(ctx, "idle:orphan"); st != nil {
+		t.Error("deleted signature must stay gone on re-migration")
+	}
+}
+
 func TestResolveSignaturePrefix(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

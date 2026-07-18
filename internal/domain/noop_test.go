@@ -58,13 +58,95 @@ func TestDecideNoopChoiceBypassesOptionSet(t *testing.T) {
 }
 
 func TestDecideIdleNoopBeatsDeclaredTask(t *testing.T) {
-	// The operator repeatedly said "leave this one alone": that outranks
-	// re-sending the declared next task.
-	in := autonomous(baseInput(SituationIdle), noopHistory()...)
+	// The OPERATOR repeatedly said "leave this one alone": that outranks
+	// re-sending the declared next task. Rule-sourced rows count the same —
+	// a graduated rule implies past operator confirmation.
+	for _, src := range []Source{SourceOperator, SourceRule} {
+		in := autonomous(baseInput(SituationIdle))
+		in.History = sourcedHistory(src, noopHistory()...)
+		in.DeclaredTask = &DeclaredTask{Task: "build the parser"}
+		d := Decide(in)
+		if d.Action != ActionKindNoop {
+			t.Fatalf("%s: idle noop must beat the declared task, got %+v", src, d)
+		}
+	}
+}
+
+func TestDecideIdleLLMNoopYieldsToDeclaredTask(t *testing.T) {
+	// A noop plurality built purely from LLM guesses must NOT outrank a
+	// declared task source (#175): operator-declared intent wins. The
+	// signature is shadow (LLM decisions never graduate a rule), so the
+	// declared task surfaces as a confirmable suggestion.
+	in := baseInput(SituationIdle)
+	in.State = &SignatureState{Mode: ModeShadow}
+	in.History = sourcedHistory(SourceLLM, noopHistory()...)
 	in.DeclaredTask = &DeclaredTask{Task: "build the parser"}
 	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonShadowMode {
+		t.Fatalf("shadow LLM-noop signature must escalate the declared task, got %+v", d)
+	}
+	if !strings.Contains(d.Suggestion, "build the parser") {
+		t.Errorf("suggestion should carry the declared task, got %q", d.Suggestion)
+	}
+}
+
+func TestDecideIdleLLMNoopDoesNotBlockExhaustedGeneration(t *testing.T) {
+	// The #175 repro: the LLM answered @noop once on an exhausted list, and
+	// that learned plurality must not park the task_source_exhausted →
+	// generation refill path forever.
+	in := baseInput(SituationIdle)
+	in.State = &SignatureState{Mode: ModeShadow}
+	in.History = sourcedHistory(SourceLLM, noopHistory()...)
+	in.DeclaredTask = &DeclaredTask{Task: NoTaskContent}
+	in.GenerateTaskConfigured = true
+	in.GenerateTaskStartConfigured = true
+	d := Decide(in)
+	if d.Action != ActionGenerateTask {
+		t.Fatalf("LLM noop must not block exhausted-source generation, got %+v", d)
+	}
+}
+
+func TestDecideIdleLLMNoopExhaustedWithoutGenerateEscalates(t *testing.T) {
+	// Same suppression, no generation opt-in: the exhausted source surfaces
+	// as its own confirmable escalation instead of a silent shadow noop.
+	// Confirming @noop there records an operator decision, which makes the
+	// plurality operator-backed and restores quiet noop precedence.
+	in := baseInput(SituationIdle)
+	in.State = &SignatureState{Mode: ModeShadow}
+	in.History = sourcedHistory(SourceLLM, noopHistory()...)
+	in.DeclaredTask = &DeclaredTask{Task: NoTaskContent}
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonTaskSourceExhausted {
+		t.Fatalf("exhausted source must escalate as such, got %+v", d)
+	}
+	if d.Suggestion != ActionNoopSuggestion {
+		t.Errorf("suggestion = %q, want %q", d.Suggestion, ActionNoopSuggestion)
+	}
+}
+
+func TestDecideIdleLLMNoopStillHonoredWithoutDeclaredSource(t *testing.T) {
+	// Without a declared source there is no refill path to park: an
+	// LLM-learned noop keeps silencing a chatty idle agent (the original
+	// nudge-loop case) instead of escalating no_task_source forever.
+	in := autonomous(baseInput(SituationIdle))
+	in.History = sourcedHistory(SourceLLM, noopHistory()...)
+	d := Decide(in)
 	if d.Action != ActionKindNoop {
-		t.Fatalf("idle noop must beat the declared task, got %+v", d)
+		t.Fatalf("idle LLM noop without a declared source must still fire, got %+v", d)
+	}
+}
+
+func TestDecideLLMNoopHonoredForNonIdleSituations(t *testing.T) {
+	// The operator-provenance gate is idle-only: approval/choice/error noop
+	// rules have no competing declared-source path and keep firing on an
+	// LLM-learned plurality.
+	for _, st := range []SituationType{SituationApproval, SituationChoice, SituationError} {
+		in := autonomous(baseInput(st))
+		in.History = sourcedHistory(SourceLLM, noopHistory()...)
+		d := Decide(in)
+		if d.Action != ActionKindNoop {
+			t.Fatalf("%s: LLM-learned noop must still fire, got %+v", st, d)
+		}
 	}
 }
 

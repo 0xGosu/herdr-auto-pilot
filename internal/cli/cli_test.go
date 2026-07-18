@@ -549,6 +549,60 @@ func TestSignaturesReset(t *testing.T) {
 	}
 }
 
+func TestLLMLearnedSignatureIsCLIAddressable(t *testing.T) {
+	// #175: an LLM-recorded decision always has a signatures state row now
+	// (written by the daemon at decision time, or backfilled by the store
+	// migration), so the learned rule is listable, resettable, deletable,
+	// and named on escalations instead of hiding behind "rule=[none yet]".
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	const sig = "idle:ffff0000aaaa1111"
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: sig, SituationType: domain.SituationIdle,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RecordDecision(ctx, domain.DecisionRecord{
+		Signature: sig, SituationType: domain.SituationIdle, AgentType: "claude",
+		ChosenAction: domain.ActionNoop, Source: domain.SourceLLM, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	st.AppendAudit(ctx, domain.AuditRecord{Signature: sig,
+		Trigger: "agent idle", SituationType: domain.SituationIdle,
+		Action: "escalated", Rationale: "[shadow_mode]", Status: "escalated", CreatedAt: now})
+
+	out, err := run(t, app, "signatures")
+	if err != nil || !strings.Contains(out, "idle:ffff0000aaa") {
+		t.Errorf("LLM-learned signature must be listed (%v):\n%s", err, out)
+	}
+	out, err = run(t, app, "escalations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `top action "@noop" over 1 decision(s)`) ||
+		strings.Contains(out, "rule=[none yet]") {
+		t.Errorf("escalation must name the LLM-learned rule, got:\n%s", out)
+	}
+	out, err = run(t, app, "signatures", "reset", "idle:", "--yes")
+	if err != nil || !strings.Contains(out, "reset signature "+sig) {
+		t.Errorf("LLM-learned signature must be resettable (%v):\n%s", err, out)
+	}
+	out, err = run(t, app, "signatures", "delete", "idle:", "--yes")
+	if err != nil || !strings.Contains(out, "deleted signature "+sig) ||
+		!strings.Contains(out, "1 decision(s)") {
+		t.Errorf("LLM-learned signature must be deletable with its decisions (%v):\n%s", err, out)
+	}
+	if state, _ := st.GetSignature(ctx, sig); state != nil {
+		t.Error("signature row should be gone")
+	}
+	if recs, _ := st.DecisionsForSignature(ctx, sig, 10); len(recs) != 0 {
+		t.Error("decision history should be gone")
+	}
+}
+
 func TestDismissCLI(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()

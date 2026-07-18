@@ -265,6 +265,26 @@ func (s *Store) migrate() error {
 	); err != nil {
 		return fmt.Errorf("migrate prune verb-only approval embeddings: %w", err)
 	}
+	// Issue #175: LLM decisions used to be recorded without a signatures state
+	// row, leaving the learned rule invisible to `signatures list` and
+	// unaddressable by delete/reset. The daemon now creates the row at
+	// decision time; this backfills the rows such databases already lack.
+	// SQLite's bare-column-with-MAX rule makes the inner select carry each
+	// signature's newest decision BY ID — the autoincrement PK is strictly
+	// insertion-ordered, unlike created_at, whose millisecond values can tie
+	// within a burst and break the tie arbitrarily. Idempotent: INSERT OR
+	// IGNORE never touches an existing row.
+	if _, err := s.db.Exec(
+		`INSERT OR IGNORE INTO signatures (signature, situation_type, agent_type,
+		    mode, consecutive_confirmations, cached_confidence, decision_floor_id,
+		    guard_state, updated_at)
+		 SELECT signature, situation_type, agent_type, ?, 0, 0, 0, '', created_at
+		   FROM (SELECT signature, situation_type, agent_type, created_at, MAX(id)
+		           FROM decisions GROUP BY signature)`,
+		string(domain.ModeShadow),
+	); err != nil {
+		return fmt.Errorf("migrate backfill signature rows: %w", err)
+	}
 	return nil
 }
 
@@ -316,6 +336,24 @@ func (s *Store) UpsertSignature(ctx context.Context, sig domain.SignatureState) 
 			sig.ConsecutiveConfirmations, sig.CachedConfidence, sig.DecisionFloorID, sig.GuardState, unix(sig.UpdatedAt))
 		return err
 	})
+}
+
+// EnsureSignature creates a fresh signatures state row when none exists, as a
+// single atomic INSERT OR IGNORE — an existing row's mode, streak, floor, and
+// confidence are never touched. The daemon calls it after recording an LLM
+// decision so the learned rule is CLI-addressable (#175); a read-then-upsert
+// here would race the correction/reset writers and could clobber their state
+// with a fresh shadow row. Learning-state fields are forced to their fresh
+// zero values: only identity fields (signature, types, mode, timestamp) come
+// from the caller.
+func (s *Store) EnsureSignature(ctx context.Context, sig domain.SignatureState) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO signatures (signature, situation_type, agent_type,
+			mode, consecutive_confirmations, cached_confidence, decision_floor_id,
+			guard_state, updated_at)
+		VALUES (?, ?, ?, ?, 0, 0, 0, '', ?)`,
+		sig.Signature, string(sig.SituationType), sig.AgentType, string(sig.Mode), unix(sig.UpdatedAt))
+	return err
 }
 
 // RecordDecision appends a decision record (daemon-owned).
