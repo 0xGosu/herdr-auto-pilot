@@ -1271,18 +1271,25 @@ type delivery struct {
 
 // deliverAutonomous is the shared tail of every autonomous rule-path send:
 // pre-action audit guard (FR-024), delivery, and the daemon-owned learning
-// and counter writes.
+// and counter writes. It reports whether the input actually reached the
+// pane — false covers the lifecycle-barrier refusal, a blocked audit write,
+// and a failed send — so callers accounting for an LLM decision's fate
+// (handleActionReviewOutcome) never record an undelivered action as applied.
 func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
-	dec domain.Decision, tr domain.AgentTransition, del delivery, now time.Time) {
-	d.withAgentAutomation(ctx, s, sig, tr, del.input, dec.Confidence, del.llmConfidence, del.llmOutput, now,
-		func() { d.deliverAutonomousClaimed(ctx, s, sig, dec, tr, del, now) })
+	dec domain.Decision, tr domain.AgentTransition, del delivery, now time.Time) bool {
+	sent := false
+	executed := d.withAgentAutomation(ctx, s, sig, tr, del.input, dec.Confidence, del.llmConfidence, del.llmOutput, now,
+		func() { sent = d.deliverAutonomousClaimed(ctx, s, sig, dec, tr, del, now) })
+	return executed && sent
 }
 
 // deliverAutonomousClaimed runs while the cross-process per-agent lifecycle
 // barrier is held, so SetAgentDisabled cannot commit between audit and send.
+// Returns true once the input was sent to the pane (post-send bookkeeping
+// failures do not retract that).
 func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situation,
 	sig domain.SignatureResult, dec domain.Decision, tr domain.AgentTransition,
-	del delivery, now time.Time) {
+	del delivery, now time.Time) bool {
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + del.input, Input: del.input,
@@ -1294,7 +1301,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
 		d.notify(ctx, "Herd Auto Prompter: persistence failure",
 			"An automated action was blocked because its audit record could not be written.")
-		return
+		return false
 	}
 
 	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType, del.sendText); err != nil {
@@ -1302,7 +1309,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed",
 			fmt.Sprintf("Agent %s: could not deliver the decided input; please review.", s.AgentID))
-		return
+		return false
 	}
 
 	d.mu.Lock()
@@ -1352,6 +1359,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
 		Signature: sig.Signature, Input: del.input, Excerpt: s.Content, SituationType: s.Type,
 	})
+	return true
 }
 
 // scheduleUnblockCheck arms the post-action self-check: after the fixed
@@ -1462,6 +1470,10 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 	if res.decision != nil && strings.TrimSpace(res.decision.Rationale) != "" {
 		rationale += "; LLM: " + strings.TrimSpace(res.decision.Rationale)
 	}
+	// applied flips once the veto's audit row is durably written — an audit
+	// failure blocks the stand-down (FR-024), so the decision must not
+	// resolve as accepted for it.
+	applied := false
 	executed := d.withAgentAutomation(ctx, s, res.sig, res.tr, "", res.dec.Confidence, llmConf,
 		domain.ActionNoop, now, func() {
 			auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
@@ -1479,6 +1491,7 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 					"A review-declined no-op was blocked because its audit record could not be written.")
 				return
 			}
+			applied = true
 			if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
 				updated := domain.RegisterAutoPrompt(*rate, now)
 				updated.AgentID = s.AgentID
@@ -1494,7 +1507,7 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 		})
 	if res.decision != nil {
 		status := "accepted"
-		if !executed {
+		if !executed || !applied {
 			status = "rejected"
 		}
 		if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, status); err != nil {
@@ -2618,19 +2631,8 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 		return
 	}
 
-	if res.decision != nil {
-		// A degraded review delivered the fallback, not the model's output —
-		// resolve its decision row as rejected so the trail stays honest.
-		status := "accepted"
-		if discarded {
-			status = "rejected"
-		}
-		if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, status); err != nil {
-			slog.Error("llm decision status update failed", "error", err)
-		}
-	}
 	original := truncateRunes(res.dec.Input, 200)
-	d.deliverAutonomous(ctx, s, res.sig, res.dec, res.tr, delivery{
+	delivered := d.deliverAutonomous(ctx, s, res.sig, res.dec, res.tr, delivery{
 		sendText:      final,
 		input:         final,
 		rationale:     fmt.Sprintf("%s; %s (original: %q)", res.dec.Rationale, note, original),
@@ -2638,6 +2640,19 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 		learned:       res.learned,
 		llmConfidence: llmConf,
 	}, now)
+	if res.decision != nil {
+		// Resolve the decision AFTER delivery so the trail stays honest: a
+		// degraded review delivered the fallback (its output was discarded),
+		// and a blocked audit write or failed send delivered nothing — both
+		// are rejected, never accepted.
+		status := "accepted"
+		if discarded || !delivered {
+			status = "rejected"
+		}
+		if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, status); err != nil {
+			slog.Error("llm decision status update failed", "error", err)
+		}
+	}
 }
 
 // handleLLMOutcome re-gates a staged LLM submission through the same safety

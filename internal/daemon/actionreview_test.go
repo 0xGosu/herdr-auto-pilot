@@ -660,11 +660,15 @@ func TestActionReviewIdleInferredContentDriftStillDelivers(t *testing.T) {
 }
 
 func TestActionReviewAuditFailureBlocksSend(t *testing.T) {
-	// FR-024 holds on the review path too: no audit record, no send.
+	// FR-024 holds on the review path too: no audit record, no send — and
+	// the decision must not be recorded as accepted for an undelivered
+	// action.
 	release := make(chan struct{})
 	var calls atomic.Int32
+	var reqID atomicString
 	h := approvalReviewHarness(t, "")
-	respondReview(h, &calls, 90, func(domain.LLMRequest) (string, error) {
+	respondReview(h, &calls, 90, func(req domain.LLMRequest) (string, error) {
+		reqID.set(req.RequestID)
 		<-release
 		return "reviewed", nil
 	})
@@ -685,6 +689,10 @@ func TestActionReviewAuditFailureBlocksSend(t *testing.T) {
 	if got := h.herdr.sentInputs(); len(got) != 0 {
 		t.Errorf("audit failure must block the send (FR-024), sent %v", got)
 	}
+	waitFor(t, 3*time.Second, func() bool {
+		d, err := h.raw.LLMDecisionByRequest(context.Background(), reqID.get())
+		return err == nil && d != nil && d.Status == "rejected"
+	})
 }
 
 func TestActionReviewNoopSendsNothing(t *testing.T) {
@@ -890,11 +898,14 @@ func TestActionReviewNoopDroppedWhenAgentResumes(t *testing.T) {
 
 func TestActionReviewNoopAuditFailureNotifies(t *testing.T) {
 	// FR-024 holds for the noop path too: no audit record, no state
-	// advance — and the operator is notified.
+	// advance — the operator is notified and the decision resolves as
+	// rejected (the stand-down never applied).
 	release := make(chan struct{})
 	var calls atomic.Int32
+	var reqID atomicString
 	h := approvalReviewHarness(t, "")
-	respondReview(h, &calls, 90, func(domain.LLMRequest) (string, error) {
+	respondReview(h, &calls, 90, func(req domain.LLMRequest) (string, error) {
+		reqID.set(req.RequestID)
 		<-release
 		return "@noop", nil
 	})
@@ -916,6 +927,10 @@ func TestActionReviewNoopAuditFailureNotifies(t *testing.T) {
 	if err != nil || rate.ConsecutiveAuto != 0 {
 		t.Errorf("blocked noop must not advance the runaway counter: %+v (%v)", rate, err)
 	}
+	waitFor(t, 3*time.Second, func() bool {
+		d, derr := h.raw.LLMDecisionByRequest(context.Background(), reqID.get())
+		return derr == nil && d != nil && d.Status == "rejected"
+	})
 }
 
 func TestActionReviewSentinelOnOrdinaryConsultEscalates(t *testing.T) {
