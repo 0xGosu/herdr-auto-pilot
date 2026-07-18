@@ -87,6 +87,18 @@ func TestSignatureOptionSets(t *testing.T) {
 	if same.Signature == different.Signature {
 		t.Errorf("different option sets must produce different signatures")
 	}
+
+	// The encoding must stay injective for labels containing the delimiter:
+	// without escaping, both of these sets flatten to "allow;once;deny".
+	ambA := ComputeSignature(mk("allow;once", "deny"))
+	ambB := ComputeSignature(mk("allow", "once;deny"))
+	if ambA.Signature == ambB.Signature {
+		t.Errorf("delimiter-bearing labels collide: %q vs %q", ambA.Salient, ambB.Salient)
+	}
+	// Still deterministic: the same delimiter-bearing set matches itself.
+	if again := ComputeSignature(mk("deny", "allow;once")); again.Signature != ambA.Signature {
+		t.Errorf("escaped encoding lost order-insensitivity: %q vs %q", again.Salient, ambA.Salient)
+	}
 }
 
 func TestOverMaskingFloor(t *testing.T) {
@@ -245,6 +257,12 @@ func TestApprovalRemapCompatible(t *testing.T) {
 		{"pane-tail vs permission salient vetoes",
 			"permission:proceed | options:no;yes",
 			"some trailing pane content asking for approval", false},
+		{"escaped delimiters parse as one label, not two",
+			`permission:proceed | options:allow\;once;deny`,
+			"permission:proceed | options:allow;deny;once", false},
+		{"identical escaped sets stay compatible",
+			`permission:proceed | options:allow\;once;deny`,
+			`permission:continue | options:allow\;once;deny`, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

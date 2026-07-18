@@ -147,13 +147,20 @@ func ComputeSignatureN(s Situation, salientChars int) SignatureResult {
 }
 
 // NormalizedOptionSet folds an option-label list into an order-insensitive
-// canonical string: each label lowercased and trimmed, the set sorted and
-// joined with ";". Shared by the choice and approval salients so their
-// normalization cannot drift.
+// canonical string: each label lowercased and trimmed, delimiters escaped
+// ("\" → "\\", ";" → "\;"), the set sorted and joined with ";". The escaping
+// keeps the encoding injective — without it ["allow;once","deny"] and
+// ["allow","once;deny"] would both encode as "allow;once;deny", letting two
+// distinct screens collide into one signature. Labels without delimiters
+// (the overwhelmingly common case) encode exactly as they would unescaped.
+// Shared by the choice and approval salients so their normalization cannot
+// drift; splitOptionSet is the inverse.
 func NormalizedOptionSet(options []string) string {
 	opts := make([]string, len(options))
 	for i, o := range options {
-		opts[i] = strings.ToLower(strings.TrimSpace(o))
+		o = strings.ToLower(strings.TrimSpace(o))
+		o = strings.ReplaceAll(o, `\`, `\\`)
+		opts[i] = strings.ReplaceAll(o, ";", `\;`)
 	}
 	sort.Strings(opts)
 	return strings.Join(opts, ";")
@@ -208,15 +215,32 @@ func ApprovalRemapCompatible(salient, candidate string) bool {
 	return inter*2 >= union
 }
 
-// splitOptionSet splits a NormalizedOptionSet encoding back into a set,
-// dropping empty entries.
+// splitOptionSet is NormalizedOptionSet's inverse: it splits the encoding on
+// unescaped ";" back into a set of unescaped labels, dropping empty entries.
 func splitOptionSet(s string) map[string]bool {
 	out := make(map[string]bool)
-	for _, o := range strings.Split(s, ";") {
-		if o = strings.TrimSpace(o); o != "" {
+	var cur strings.Builder
+	flush := func() {
+		if o := strings.TrimSpace(cur.String()); o != "" {
 			out[o] = true
 		}
+		cur.Reset()
 	}
+	escaped := false
+	for _, r := range s {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case r == ';':
+			flush()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	flush()
 	return out
 }
 
