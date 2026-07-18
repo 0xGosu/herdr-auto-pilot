@@ -180,15 +180,19 @@ func TestStripCodexComposer(t *testing.T) {
 			"› is this a composer?\n\n  gpt-5.6-sol high · unknown\n",
 		},
 		{
-			// Pins the documented residual, accepted risk widened by accepting
-			// "~" (issue #160; see codexComposerBeforeFooterRE's comment): a
-			// response ending the capture with an approximation-tilde trailer
-			// (" · ~2s") is confusable with the footer, so the real submitted
-			// "›" message above it strips. Structurally bounded (needs a "›"
-			// line directly above, at the true tail) and accepted, not chased.
-			"known limitation: trailing approximation-tilde response strips the message above",
+			// The tilde branch accepts only "~/..." and bare "~" (issue #160
+			// review): an approximation-tilde trailer (" · ~2s") is common in
+			// agent output and must NOT read as the footer — the submitted
+			// "›" message above it survives.
+			"approximation-tilde trailer does not strip the message above",
 			"› how long did the build take?\n\nbuild finished · ~2s\n",
-			"\nbuild finished · ~2s\n",
+			"› how long did the build take?\n\nbuild finished · ~2s\n",
+		},
+		{
+			// cwd exactly $HOME renders as a bare "~" footer.
+			"bare-tilde footer: placeholder stripped, footer kept",
+			"some output\n\n› Explain this codebase\n\n  gpt-5.6-sol high · ~\n",
+			"some output\n\n\n  gpt-5.6-sol high · ~\n",
 		},
 		{
 			"leading whitespace before glyph stripped",
