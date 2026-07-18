@@ -543,7 +543,8 @@ func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// tasks.md written with a single in-progress item.
+	// tasks.md written, and the delivered item reserved "[-]" (the marker is
+	// applied at delivery time, not at file-creation time — issue #156).
 	path := filepath.Join(stateDir, "tasks", name+".md")
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -591,13 +592,18 @@ func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
 }
 
 func TestConfirmGeneratedTaskWithoutSendStillWritesSource(t *testing.T) {
-	// send=false establishes the source and file but delivers nothing.
+	// send=false establishes the source and file but delivers nothing — and
+	// must leave the first item "[ ]" so the daemon's idle flow can hand it
+	// out later. Regression for issue #156: the item used to be pre-marked
+	// "[-]" at write time, which suppressed the idle resend forever.
 	app, st := testApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
-	app.StateDir = t.TempDir()
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
 	ctx := context.Background()
 
+	name, _ := st.EnsureAgentName(ctx, "w2:p2")
 	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w2:p2", SituationType: domain.SituationIdle, Trigger: "t",
 		Action: "escalated", Status: "escalated",
@@ -613,12 +619,22 @@ func TestConfirmGeneratedTaskWithoutSendStillWritesSource(t *testing.T) {
 	if len(cfg.TaskSources) != 1 {
 		t.Errorf("source must still be registered on a non-send confirm, got %d", len(cfg.TaskSources))
 	}
+	body, err := os.ReadFile(filepath.Join(stateDir, "tasks", name+".md"))
+	if err != nil {
+		t.Fatalf("tasks file not written: %v", err)
+	}
+	if !strings.Contains(string(body), "- [ ] 1. Write missing tests") {
+		t.Errorf("tasks file = %q, want the undelivered item pending \"[ ]\"", body)
+	}
+	if next := domain.NextDeclaredTask(string(body)); next != "1. Write missing tests" {
+		t.Errorf("next declared task = %q, want the undelivered first item — a stranded item would never be sent", next)
+	}
 }
 
 func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
 	// A multiline suggestion (a Markdown checklist from the LLM) is normalized:
-	// the file lists the first task in-progress "[-]" and the rest pending
-	// "[ ]", and ONLY the first task is sent to the agent.
+	// ONLY the first task is sent to the agent, so after the send it reads
+	// in-progress "[-]" (reserved at delivery) and the rest stay pending "[ ]".
 	app, st := testApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
@@ -698,6 +714,151 @@ func TestConfirmGeneratedTaskIsIdempotent(t *testing.T) {
 	cfg, _ := config.Load(app.ConfigPath)
 	if len(cfg.TaskSources) != 1 {
 		t.Errorf("want exactly 1 task source after a double confirm, got %d", len(cfg.TaskSources))
+	}
+}
+
+func TestConfirmGeneratedTaskSendFailureRollsBackToPending(t *testing.T) {
+	// A failed --send delivery must roll the reserved item back to "[ ]" so
+	// the daemon's idle flow can retry it — mirroring SendTaskToAgent. Before
+	// issue #156 the item stayed "[-]" and was stranded forever.
+	app, st := testApp(t)
+	fake := &fakeHerdr{sendErr: errors.New("pane vanished")}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w5:p5")
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w5:p5", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Fix the flaky login test", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, id, true); err == nil {
+		t.Fatal("confirm must surface the failed delivery")
+	}
+	body, err := os.ReadFile(filepath.Join(stateDir, "tasks", name+".md"))
+	if err != nil {
+		t.Fatalf("tasks file not written: %v", err)
+	}
+	if !strings.Contains(string(body), "- [ ] 1. Fix the flaky login test") {
+		t.Errorf("tasks file = %q, want the failed-send item rolled back to \"[ ]\"", body)
+	}
+	if next := domain.NextDeclaredTask(string(body)); next != "1. Fix the flaky login test" {
+		t.Errorf("next declared task = %q, want the rolled-back item so the idle flow retries it", next)
+	}
+}
+
+func TestConfirmRepeatedGenerationPreservesMarkers(t *testing.T) {
+	// A later generation escalation carrying the SAME tasks (e.g. a stale
+	// duplicate raised before the first confirm registered the source) must
+	// not rewrite the file: resetting a delivered item's "[-]" back to "[ ]"
+	// would re-arm the daemon to send it a second time.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w6:p6")
+	suggestion := domain.SuggestTaskPrefix + "Profile the slow endpoint"
+	first, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w6:p6", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: suggestion, CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, first, true); err != nil {
+		t.Fatal(err)
+	}
+
+	second, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w6:p6", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: suggestion, CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, second, false); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(stateDir, "tasks", name+".md"))
+	if err != nil {
+		t.Fatalf("tasks file missing: %v", err)
+	}
+	if !strings.Contains(string(body), "- [-] 1. Profile the slow endpoint") {
+		t.Errorf("tasks file = %q, want the delivered item still reserved \"[-]\" after a same-tasks re-confirm", body)
+	}
+	if len(fake.inputs) != 1 {
+		t.Errorf("task must be delivered exactly once, got %d sends", len(fake.inputs))
+	}
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 1 {
+		t.Errorf("want exactly 1 task source, got %d", len(cfg.TaskSources))
+	}
+
+	// The sharper duplicate: --send on yet another same-tasks escalation gets
+	// its own successful claim (a distinct audit row), reaches the reserve —
+	// and must refuse there, because the item is already "[-]". No second
+	// delivery, and the reservation stands.
+	third, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w6:p6", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: suggestion, CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, third, true); err == nil || !strings.Contains(err.Error(), "no longer pending") {
+		t.Fatalf("a --send duplicate must refuse to re-reserve the [-] item, got %v", err)
+	}
+	if len(fake.inputs) != 1 {
+		t.Errorf("the duplicate must not deliver again, got %d sends", len(fake.inputs))
+	}
+	body, _ = os.ReadFile(filepath.Join(stateDir, "tasks", name+".md"))
+	if !strings.Contains(string(body), "- [-] 1. Profile the slow endpoint") {
+		t.Errorf("tasks file = %q, want the reservation untouched by the refused duplicate", body)
+	}
+}
+
+func TestConfirmRegenerationCarriesOverMarkers(t *testing.T) {
+	// A later generation carrying a DIFFERENT task list rewrites the file, but
+	// items it re-lists keep their progress markers: resetting a delivered
+	// "[-]" to "[ ]" would re-arm the daemon for a duplicate send.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w7:p7")
+	first, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w7:p7", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Profile the slow endpoint", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, first, true); err != nil {
+		t.Fatal(err)
+	}
+
+	second, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w7:p7", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Profile the slow endpoint\nAdd a response cache", CreatedAt: time.Now(),
+	})
+	if err := app.Confirm(ctx, second, false); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(stateDir, "tasks", name+".md"))
+	if err != nil {
+		t.Fatalf("tasks file missing: %v", err)
+	}
+	if !strings.Contains(string(body), "- [-] 1. Profile the slow endpoint") {
+		t.Errorf("tasks file = %q, want the re-listed delivered item still \"[-]\"", body)
+	}
+	if !strings.Contains(string(body), "- [ ] 2. Add a response cache") {
+		t.Errorf("tasks file = %q, want the new item appended pending", body)
+	}
+	if next := domain.NextDeclaredTask(string(body)); next != "2. Add a response cache" {
+		t.Errorf("next declared task = %q, want only the new pending item", next)
 	}
 }
 

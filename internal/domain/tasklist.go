@@ -195,9 +195,9 @@ type ChecklistItem struct {
 	// Mark is the raw checkbox rune (" ", "x", "X", "+", "-", "*"). Done is the
 	// binary pending/not-pending classification used for filtering; Mark is kept
 	// so a display can render a third state faithfully — notably the "-"
-	// in-progress marker this codebase's own generated-task flow writes for the
-	// task an agent is currently working on (RenderGeneratedTaskList), which
-	// would otherwise read as "[x] done".
+	// in-progress marker this codebase writes at delivery time for the task an
+	// agent is currently working on (the confirm --send reservation and
+	// `hap task send`), which would otherwise read as "[x] done".
 	Mark string
 	Done bool
 	Text string

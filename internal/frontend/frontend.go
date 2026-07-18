@@ -848,15 +848,19 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 }
 
 // acceptGeneratedTask confirms an idle task suggestion: it writes a per-agent
-// tasks.md (a single in-progress "[-]" item), registers it as a task source in
+// tasks.md (every item pending "[ ]"), registers it as a task source in
 // config.toml, records the correction that resolves the escalation, and — when
-// send — hands the task to the agent. Side effects run source-first so a send
-// failure never leaves the agent without the task source that was just
+// send — reserves the first item "[-]" and hands it to the agent, rolling it
+// back to "[ ]" if the send fails. Without send the file stays all-pending so
+// the daemon's idle flow delivers the first item on the next idle; pre-marking
+// "[-]" at write time would strand it forever, since "[-]" is exactly what
+// suppresses the idle resend (issue #156). Side effects run source-first so a
+// send failure never leaves the agent without the task source that was just
 // established.
 func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord, send bool) error {
 	// The suggestion may carry one task or several (plain or as a Markdown
 	// list); normalize into clean bare task strings so the file is always a
-	// well-formed checklist, never raw multiline text written after "- [-] ".
+	// well-formed checklist, never raw multiline text written after "- [ ] ".
 	raw := strings.TrimPrefix(audit.Suggestion, domain.SuggestTaskPrefix)
 	tasks := domain.NormalizeGeneratedTasks(raw)
 	if len(tasks) == 0 {
@@ -897,9 +901,10 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	}
 
 	// Idempotent side effects FIRST (before the claim): writing the file and
-	// registering the source can be safely repeated — the file is rewritten
-	// with identical content and addTaskSourceIfAbsent de-dupes under
-	// UpdateConfig's advisory lock. Running them before the claim means a
+	// registering the source can be safely repeated — a re-confirm skips the
+	// rewrite when the file already carries these same items (markers ignored,
+	// so it never resets a reservation or completion) and addTaskSourceIfAbsent
+	// de-dupes under UpdateConfig's advisory lock. Running them before the claim means a
 	// failure here leaves the escalation still pending, so the operator can
 	// retry; only the non-idempotent send is gated by the claim below.
 	base := a.StateDir
@@ -911,11 +916,14 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		return fmt.Errorf("create tasks dir: %w", err)
 	}
 	path := filepath.Join(dir, sanitizeTaskFileName(name)+".md")
-	// First task is in-progress ("[-]", sent to the agent now); any remaining
-	// tasks are pending ("[ ]") and the normal declared-task flow picks them up
-	// on later idles.
+	// Every task is written pending ("[ ]"); the first is marked in-progress
+	// ("[-]") only below, at delivery time, so a confirm that sends nothing
+	// leaves it for the daemon's normal declared-task flow (issue #156).
+	// ensureGeneratedTaskFile never resets progress markers: a stale
+	// re-confirm racing the winner must not flip a freshly reserved "[-]"
+	// (or a completed "[x]") back to "[ ]" and re-arm a second delivery.
 	content := domain.RenderGeneratedTaskList(name, tasks)
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	if err := ensureGeneratedTaskFile(path, content); err != nil {
 		return fmt.Errorf("write tasks file: %w", err)
 	}
 	// Register the file as this agent's task source (writes config.toml and
@@ -949,17 +957,100 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	}
 
 	if send && a.Herdr != nil {
-		// Only the first task is sent — the operator's "start now" task. Render
-		// it through the same default next-task template used by a declared task
-		// source, so every idle-task handoff includes both the task and its list.
+		// Only the first task is sent — the operator's "start now" task. The
+		// order mirrors SendTaskToAgent and is load-bearing: RESERVE the item
+		// ([-] under the file lock) and only then deliver, so the daemon's idle
+		// flow can never hand it out mid-send, and a failed send rolls it back
+		// to [ ].
+		itemText := domain.GeneratedTaskItemText(0, tasks[0])
+		if _, err := mutateTaskFile(path, reserveTask(1, itemText)); err != nil {
+			return fmt.Errorf("task source created, but reserving task #1 (nothing was sent): %w", err)
+		}
+		// Render through the same default next-task template used by a declared
+		// task source, so every idle-task handoff includes both the task and
+		// its list. The prompt sends the raw normalized task, not the numbered
+		// file line.
 		prompt := domain.DeclaredTask{
 			Task: tasks[0], Path: path, AgentName: name,
 		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
+			if _, rbErr := mutateTaskFile(path, releaseTask(1, itemText)); rbErr != nil {
+				return fmt.Errorf("task source created, but sending the task failed (%w) and task #1 could not be returned to [ ] (%v) — "+
+					"it stays [-] and no agent will pick it up until you clear it", err, rbErr)
+			}
 			return fmt.Errorf("task source created, but sending the task to the agent failed: %w", err)
 		}
 	}
 	return a.nudge(ctx, control.KindReload)
+}
+
+// ensureGeneratedTaskFile writes the rendered generated-task checklist to
+// path as ONE locked read-compare-write, under the same per-path lock
+// mutateTaskFile takes — an unlocked check-then-write could land after a
+// concurrent confirm's reservation and silently reset its "[-]". A file
+// already carrying exactly these item texts is left untouched (a stale
+// re-confirm must not clobber markers or any operator edits); when the items
+// DO differ (a new generation), the rewrite carries over the existing marker
+// of every same-text item, so in-flight "[-]" and finished "[x]" work
+// survives regeneration. The write is atomic because the daemon reads this
+// file without the lock.
+func ensureGeneratedTaskFile(path, content string) error {
+	lockPath := taskLockPath(path)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return err
+	}
+	unlock, err := lockFile(lockPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if existing, rerr := os.ReadFile(path); rerr == nil {
+		if sameChecklistTexts(string(existing), content) {
+			return nil
+		}
+		content = carryOverChecklistMarks(string(existing), content)
+	}
+	return writeFileAtomic(path, []byte(content), 0o600)
+}
+
+// sameChecklistTexts reports whether two checklist documents carry the same
+// items — same count, same texts, in the same order — ignoring the checkbox
+// markers. It answers "is this the same generated task list?" for the
+// re-confirm skip above without treating a [ ]→[-]/[x] progression as a
+// difference.
+func sameChecklistTexts(a, b string) bool {
+	ia, ib := domain.ParseChecklist(a), domain.ParseChecklist(b)
+	if len(ia) != len(ib) {
+		return false
+	}
+	for i := range ia {
+		if ia[i].Text != ib[i].Text {
+			return false
+		}
+	}
+	return true
+}
+
+// carryOverChecklistMarks returns rendered with each item's checkbox replaced
+// by the marker a same-text item carries in existing (first occurrence wins),
+// so regenerating a task list never resets progress on items it re-lists.
+// Items only in rendered keep their fresh "[ ]"; items only in existing are
+// dropped with the rewrite, as before.
+func carryOverChecklistMarks(existing, rendered string) string {
+	marks := map[string]string{}
+	for _, it := range domain.ParseChecklist(existing) {
+		if _, ok := marks[it.Text]; !ok {
+			marks[it.Text] = it.Mark
+		}
+	}
+	lines := strings.Split(rendered, "\n")
+	for _, it := range domain.ParseChecklist(rendered) {
+		if mark, ok := marks[it.Text]; ok && mark != it.Mark {
+			lines[it.LineNo] = it.Prefix + "[" + mark + "] " + it.Text
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // addTaskSourceIfAbsent registers a task list for an agent, skipping the append
