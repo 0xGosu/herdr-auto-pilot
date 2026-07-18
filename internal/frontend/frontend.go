@@ -848,6 +848,13 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	return a.nudge(ctx, control.KindReload)
 }
 
+// ErrSuggestionStaleAgentBusy is returned by a confirm+send (send=true) of a
+// generated-task suggestion whose agent has since started working: delivering
+// the task would interrupt it. The tasks can instead be QUEUED by re-confirming
+// with send=false, which succeeds while the agent is busy (the daemon delivers
+// on the next idle). Callers detect this with errors.Is to offer that fallback.
+var ErrSuggestionStaleAgentBusy = errors.New("agent is no longer idle; the suggested task is stale")
+
 // acceptGeneratedTask confirms an idle task suggestion. When the agent
 // already has a declared task source, the generated tasks refill THAT list:
 // they are appended to the source's own file (appendGeneratedTasks) — never
@@ -882,19 +889,22 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	}
 
 	// Staleness: the operator may confirm minutes after the suggestion was
-	// raised. If the agent has since started working, sending an outdated task
-	// would interrupt it — refuse rather than create a source and send. Fail
-	// open when the status is unknown (list error / agent absent): the operator
-	// explicitly asked to confirm. The matched transition is kept for the
-	// declared-source resolution below (workspace-scoped selectors need the
-	// agent's live workspace).
+	// raised. If the agent has since started working, SENDING an outdated task
+	// would interrupt it — refuse rather than create a source and send. This
+	// only matters when send is set: an add-only confirm (send=false) queues
+	// the task in the declared list without touching the pane, so a busy agent
+	// is fine — the daemon delivers it on the agent's next idle. Fail open when
+	// the status is unknown (list error / agent absent): the operator explicitly
+	// asked to confirm. The matched transition is kept for the declared-source
+	// resolution below (workspace-scoped selectors need the agent's live
+	// workspace) in both cases.
 	var live *domain.AgentTransition
 	if a.Herdr != nil {
 		if agents, lerr := a.Herdr.ListAgents(ctx); lerr == nil {
 			for i, ag := range agents {
 				if ag.AgentID == audit.AgentID {
-					if domain.AgentBusy(ag.Status) {
-						return fmt.Errorf("agent is no longer idle (%s); the suggested task is stale — dismiss it or wait until the agent is idle", ag.Status)
+					if send && domain.AgentBusy(ag.Status) {
+						return fmt.Errorf("%w (agent status: %s) — dismiss it, or confirm without --send to queue the tasks to the agent's list", ErrSuggestionStaleAgentBusy, ag.Status)
 					}
 					live = &agents[i]
 					break

@@ -715,10 +715,26 @@ func confirm(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 	if err != nil {
 		return fmt.Errorf("invalid audit id %q", idArg)
 	}
+	// Detect a generated-task suggestion up front so the success line can say
+	// the tasks were queued to the agent's declared list. Without --send they
+	// are only appended (the daemon delivers the first on the agent's next
+	// idle), so confirming without --send is the way to accept a suggestion for
+	// a busy agent without interrupting it (issue #180).
+	genTask := false
+	if audit, gerr := app.Store.GetAudit(ctx, id); gerr == nil && audit != nil {
+		genTask = strings.HasPrefix(audit.Suggestion, domain.SuggestTaskPrefix)
+	}
 	if err := app.Confirm(ctx, id, *send); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "confirmed escalation #%d (recorded as a learning event)\n", id)
+	switch {
+	case genTask && *send:
+		fmt.Fprintf(out, "confirmed escalation #%d — added the suggested task(s) to the agent's task list and sent the first\n", id)
+	case genTask:
+		fmt.Fprintf(out, "confirmed escalation #%d — added the suggested task(s) to the agent's task list (not sent)\n", id)
+	default:
+		fmt.Fprintf(out, "confirmed escalation #%d (recorded as a learning event)\n", id)
+	}
 	return nil
 }
 

@@ -979,8 +979,14 @@ func TestConfirmGeneratedTaskRefusesWhenAgentWorking(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Do the thing", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, id, true); err == nil {
+	err := app.Confirm(ctx, id, true)
+	if err == nil {
 		t.Fatal("confirming a stale suggestion for a working agent must fail")
+	}
+	// The sentinel is the contract the TUI keys off to offer "add to list
+	// instead" — a plain error would strand that fallback.
+	if !errors.Is(err, frontend.ErrSuggestionStaleAgentBusy) {
+		t.Errorf("send refusal must wrap ErrSuggestionStaleAgentBusy, got %v", err)
 	}
 	if len(fake.inputs) != 0 {
 		t.Errorf("nothing may be sent to a working agent, got %v", fake.inputs)
@@ -993,6 +999,62 @@ func TestConfirmGeneratedTaskRefusesWhenAgentWorking(t *testing.T) {
 	audit, _ := st.GetAudit(ctx, id)
 	if audit.Status != "escalated" {
 		t.Errorf("escalation must remain pending after a refused confirm, got %q", audit.Status)
+	}
+}
+
+func TestConfirmGeneratedTaskAddOnlyWhileAgentWorking(t *testing.T) {
+	// send=false QUEUES the tasks even while the agent is working: nothing
+	// reaches the pane (so the busy agent is never interrupted), the source and
+	// pending-"[ ]" file are created, the correction is recorded, and the
+	// escalation is resolved (accepted). The daemon delivers the item on the
+	// agent's next idle. This is the "a: add to list" path — the staleness
+	// refusal only applies to a send (issue #180).
+	app, st := testApp(t)
+	fake := &fakeHerdr{agents: []domain.AgentTransition{{AgentID: "w5:p5", Status: "working"}}}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w5:p5")
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w5:p5", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "Write missing tests", CreatedAt: time.Now(),
+	})
+
+	if err := app.Confirm(ctx, id, false); err != nil {
+		t.Fatalf("add-only confirm must succeed for a working agent: %v", err)
+	}
+	// Nothing delivered to the busy agent's pane.
+	if len(fake.inputs) != 0 {
+		t.Errorf("add-only must deliver nothing to a working agent, got %v", fake.inputs)
+	}
+	// Source registered and the item left pending "[ ]" so the daemon's idle
+	// flow hands it out later.
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 1 {
+		t.Fatalf("add-only must register the task source, got %d", len(cfg.TaskSources))
+	}
+	body, err := os.ReadFile(filepath.Join(stateDir, "tasks", name+".md"))
+	if err != nil {
+		t.Fatalf("tasks file not written: %v", err)
+	}
+	if !strings.Contains(string(body), "- [ ] 1. Write missing tests") {
+		t.Errorf("tasks file = %q, want the queued item pending \"[ ]\"", body)
+	}
+	if next := domain.NextDeclaredTask(string(body)); next != "1. Write missing tests" {
+		t.Errorf("next declared task = %q, want the queued item — a stranded item would never be sent", next)
+	}
+	// Accepted: the correction learns the declared-task action and the
+	// escalation is resolved.
+	corr, _ := st.UnprocessedCorrections(ctx)
+	if len(corr) != 1 || corr[0].CorrectedAction != domain.ActionNextDeclaredTask || corr[0].AuditID != id {
+		t.Errorf("add-only should record a declared-task correction: %+v", corr)
+	}
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "resolved" {
+		t.Errorf("escalation must be resolved (accepted) after add-only, got %q", audit.Status)
 	}
 }
 

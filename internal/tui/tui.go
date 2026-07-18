@@ -9,6 +9,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -92,6 +93,15 @@ type actionResultMsg struct {
 type openSendPromptMsg struct {
 	id     int64
 	action string
+}
+
+// openAddPromptMsg re-opens a prompt after a confirm+send was refused because
+// the suggested task's agent is busy, asking whether to queue the tasks to its
+// declared list instead (no send). Chaining goes through a message for the same
+// reason as openSendPromptMsg: the confirm command runs async and cannot open a
+// prompt directly.
+type openAddPromptMsg struct {
+	id int64
 }
 
 // statusNote is a durable action outcome shown in the status area until the
@@ -773,6 +783,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.refresh()
 	case openSendPromptMsg:
 		return m.openSendPrompt(msg.id, msg.action)
+	case openAddPromptMsg:
+		return m.openAddPrompt(msg.id)
 	case tickMsg:
 		return m, tea.Batch(m.refresh(), tick())
 	case clockTickMsg:
@@ -1346,13 +1358,61 @@ func (m Model) confirmSelected() (tea.Model, tea.Cmd) {
 	return m.confirmAuditID(rec.ID)
 }
 
-// confirmAuditID confirms+sends a specific escalation by id (used by the
-// list and by the detail overlay, which confirms the record it snapshotted).
+// confirmAuditID confirms+sends a specific escalation by id (used by the list
+// and by the detail overlay, which confirms the record it snapshotted). When the
+// send is refused because the suggested task's agent has started working, the
+// task is still valid but delivering it now would interrupt the agent — so it
+// chains to an "add to the task list instead?" prompt (openAddPromptMsg) rather
+// than surfacing the error. Any other failure surfaces as-is.
 func (m Model) confirmAuditID(id int64) (tea.Model, tea.Cmd) {
+	app, ctx, wg := m.app, m.ctx, m.inflight
 	m.beginAction()
-	return m, m.do(fmt.Sprintf("confirmed #%d and sent", id), func(ctx context.Context) error {
-		return m.app.Confirm(ctx, id, true)
-	})
+	if wg != nil {
+		wg.Add(1)
+	}
+	return m, func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
+		err := app.Confirm(ctx, id, true)
+		if err == nil {
+			return actionResultMsg{message: fmt.Sprintf("confirmed #%d and sent", id)}
+		}
+		if errors.Is(err, frontend.ErrSuggestionStaleAgentBusy) {
+			return openAddPromptMsg{id: id}
+		}
+		return actionResultMsg{err: err}
+	}
+}
+
+// openAddPrompt asks whether to queue a stale generated-task suggestion onto the
+// agent's declared task list without sending — the agent is busy, so a send
+// would interrupt it, but the task itself is still valid. Adding accepts the
+// escalation: it appends the tasks, resolves the escalation, and records the
+// acceptance to Audits (the daemon delivers the first task on the next idle).
+// Defaults to "y" — the operator already chose to accept by confirming, and
+// queueing sends nothing.
+func (m Model) openAddPrompt(id int64) (tea.Model, tea.Cmd) {
+	app, ctx := m.app, m.ctx
+	m.message = ""
+	m.prompt = &prompt{
+		label: fmt.Sprintf("agent is busy — add the tasks to its task list instead? [Y/n] (#%d)", id),
+		input: "y",
+		onSubmit: func(input string) tea.Cmd {
+			if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(input)), "y") {
+				return func() tea.Msg {
+					return actionResultMsg{message: fmt.Sprintf("#%d left pending — not added", id)}
+				}
+			}
+			return func() tea.Msg {
+				if err := app.Confirm(ctx, id, false); err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: fmt.Sprintf("added #%d to task list (not sent)", id)}
+			}
+		},
+	}
+	return m, nil
 }
 
 func (m Model) correctSelected() (tea.Model, tea.Cmd) {
