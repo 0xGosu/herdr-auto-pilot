@@ -3394,11 +3394,26 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 
 	// A rule begins when the OPERATOR first speaks, so it starts on a clean
 	// slate: floor out every decision that predates this one. The trigger is
-	// "no operator/rule evidence in the pre-existing history yet" — NOT state
+	// "no operator/rule evidence since the rule's last (re)birth" — NOT state
 	// row absence, because LLM decisions now create their own shadow row for
 	// CLI addressability (#175), so the row can exist while every decision is
-	// still SourceLLM. Flooring only a purely-LLM history means this can only
-	// ever discard the LLM's own guesses — never operator evidence.
+	// still SourceLLM. The evidence is checked over the POST-FLOOR slice of
+	// the same capped window that confidence and graduation consume, on
+	// purpose, so the floor decision and the score it protects always see
+	// the same rows:
+	//   - post-floor, not full-window: a reset rule's pre-reset operator rows
+	//     are "no evidence yet" by definition (the reset floored them), so
+	//     post-reset LLM guesses still get floored when the operator first
+	//     speaks again instead of polluting the re-earning score;
+	//   - capped, not unbounded: operator rows older than the read window
+	//     contribute nothing to confidence/graduation anywhere (every reader
+	//     caps at 50, and recency decay zeroes them long before that), so
+	//     when 50+ LLM guesses have buried old operator rows, advancing the
+	//     floor discards exactly the in-window guesses — an unbounded check
+	//     would instead keep that contradictory noise in the live window and
+	//     pin the rule under the variance guard.
+	// Flooring only a purely-LLM slice means this can only ever discard the
+	// LLM's own guesses — never operator evidence that still counts.
 	// (Modulo one narrow window: the decision below and the state row are
 	// written without a shared transaction, so a crash between them orphans
 	// an operator decision that the next correction floors out. Harmless —
@@ -3417,7 +3432,8 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	// the floor and counts, giving the fresh rule 1.00 over its single
 	// operator decision. (Contrast ResetGraduation, which floors the newest
 	// decision INCLUDING itself — a reset has no evidence yet and reads "-".)
-	if len(history) > 0 && !domain.HasOperatorEvidence(history) &&
+	if len(history) > 0 &&
+		!domain.HasOperatorEvidence(domain.DecisionsSince(history, state.DecisionFloorID)) &&
 		history[0].ID > state.DecisionFloorID {
 		state.DecisionFloorID = history[0].ID
 	}

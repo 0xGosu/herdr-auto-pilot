@@ -999,6 +999,83 @@ func TestFirstOperatorCorrectionFloorsLLMHistoryDespiteExistingRow(t *testing.T)
 	}
 }
 
+func TestCorrectionFloorsPostResetLLMGuesses(t *testing.T) {
+	// The clean-slate floor keys on POST-floor evidence, scoped to the same
+	// capped window confidence reads: a reset rule's pre-reset operator rows
+	// are floored ("no evidence yet" by definition), so when the post-reset
+	// history is pure LLM guesswork, the operator's next correction advances
+	// the floor over those guesses instead of letting them pollute the
+	// re-earning score. (A full-window check would see the pre-reset operator
+	// rows and refuse to stamp.)
+	h := newHarness(t, "[learning]\ngraduation_n = 3\n")
+	h.herdr.setPane(approvalPane)
+	ctx := context.Background()
+
+	s := classifierForTest().Classify("claude", "blocked", approvalPane)
+	sig := domain.ComputeSignature(s)
+	// Pre-reset operator history, still inside the 50-row read window.
+	for i, a := range []string{"Yes", "Yes"} { // oldest → newest
+		if _, err := h.raw.RecordDecision(ctx, domain.DecisionRecord{
+			Signature: sig.Signature, SituationType: domain.SituationApproval,
+			AgentType: "claude", ChosenAction: a, Source: domain.SourceOperator,
+			CreatedAt: time.Now().Add(-time.Duration(20-i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newestOp, _ := h.raw.DecisionsForSignature(ctx, sig.Signature, 1)
+	// The reset: floor everything recorded so far, newest INCLUSIVE.
+	if err := h.raw.UpsertSignature(ctx, domain.SignatureState{
+		Signature: sig.Signature, SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow,
+		DecisionFloorID: newestOp[0].ID, CachedConfidence: 1, UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Post-reset: contradictory LLM guesses.
+	for i, a := range []string{"No", "@noop", "Yes"} { // oldest → newest
+		if _, err := h.raw.RecordDecision(ctx, domain.DecisionRecord{
+			Signature: sig.Signature, SituationType: domain.SituationApproval,
+			AgentType: "claude", ChosenAction: a, Source: domain.SourceLLM,
+			CreatedAt: time.Now().Add(-time.Duration(10-i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, _ := h.raw.DecisionsForSignature(ctx, sig.Signature, 50)
+
+	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	h.push("agent-reset-floor", "blocked")
+	var esc domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		pend, _ := h.raw.PendingEscalations(ctx)
+		if len(pend) != 1 {
+			return false
+		}
+		esc = pend[0]
+		return true
+	})
+	if err := app.Resolve(ctx, esc.ID, "Yes", false); err != nil {
+		t.Fatal(err)
+	}
+
+	var st *domain.SignatureState
+	waitFor(t, 3*time.Second, func() bool {
+		st, _ = h.raw.GetSignature(ctx, sig.Signature)
+		return st != nil && st.DecisionFloorID > newestOp[0].ID
+	})
+	if st.DecisionFloorID != before[0].ID {
+		t.Errorf("floor = %d, want the newest pre-existing decision %d", st.DecisionFloorID, before[0].ID)
+	}
+	if st.CachedConfidence != 1 {
+		t.Errorf("the re-born rule scores 1.00 over its one operator decision, got %.4f", st.CachedConfidence)
+	}
+	after, _ := h.raw.DecisionsForSignature(ctx, sig.Signature, 50)
+	if n := len(domain.DecisionsSince(after, st.DecisionFloorID)); n != 1 {
+		t.Errorf("post-floor decisions = %d, want only the operator's 1", n)
+	}
+}
+
 func TestCorrectingLLMAutoRowWithNoRuleStartsStreak(t *testing.T) {
 	// An LLM auto-act writes audit.Status "auto" for a signature that has NO
 	// rule. That must not be mistaken for "a graduated rule acted": treating it
