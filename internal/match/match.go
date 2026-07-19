@@ -203,6 +203,9 @@ const matchK = 3
 // the hit score IS the cosine similarity) — thresholding is the caller's.
 // accept must be a fast, pure content check (it runs inline per candidate).
 func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accept func(Hit) bool) (Hit, bool, error) {
+	if !vectorSearchSupported {
+		return Hit{}, false, fmt.Errorf("vector matching unavailable (built without the \"vectors\" tag)")
+	}
 	m.mu.RLock()
 	idx, dims := m.idx, m.dims
 	m.mu.RUnlock()
@@ -213,11 +216,7 @@ func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accep
 		return Hit{}, false, fmt.Errorf("query vector dims %d != index dims %d", len(vec), dims)
 	}
 
-	req := bleve.NewSearchRequest(bleve.NewMatchNoneQuery())
-	req.Size = matchK
-	req.Fields = []string{"salient"}
-	req.AddKNNWithFilter("vector", vec, matchK, 1.0, scopeFilter(s))
-	res, err := idx.SearchInContext(ctx, req)
+	res, err := knnSearch(ctx, idx, vec, matchK, []string{"salient"}, scopeFilter(s))
 	if err != nil {
 		return Hit{}, false, err
 	}

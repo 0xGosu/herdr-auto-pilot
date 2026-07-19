@@ -116,7 +116,12 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 			accept := func(h match.Hit) bool { return remapAllowed(s, sig, h) }
 			hit, ok, err := d.matcher.MatchVector(ctx, vec, scope, accept)
 			if err != nil {
+				// Fall back to BM25 below: clear vec so the vec==nil text path
+				// runs (e.g. a degraded latch, or a text-only build where KNN is
+				// unavailable). Without this the "trying text match" promise is
+				// empty and resolution drops to hash-only.
 				slog.Warn("vector match failed; trying text match", "error", err)
+				vec = nil
 			} else if ok && hit.Score >= cfg.Embedding.SimilarityThreshold {
 				slog.Info("semantic match: reusing learned signature",
 					"signature", hit.Signature, "cosine", hit.Score, "raw", sig.Raw)
