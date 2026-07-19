@@ -1323,6 +1323,53 @@ func TestLatestAuditForSignature(t *testing.T) {
 	}
 }
 
+func TestLatestAuditsForSignatures(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	// No audit rows yet → empty map, no error.
+	m, err := s.LatestAuditsForSignatures(ctx)
+	if err != nil {
+		t.Fatalf("empty store: %v", err)
+	}
+	if len(m) != 0 {
+		t.Fatalf("empty store should give an empty map, got %v", m)
+	}
+
+	now := time.Now()
+	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:x", Trigger: "old",
+		SituationType: domain.SituationApproval, Action: "1", CreatedAt: now.Add(-time.Minute)})
+	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:x", Trigger: "new",
+		SituationType: domain.SituationApproval, Action: "2", CreatedAt: now})
+	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:other", Trigger: "other",
+		SituationType: domain.SituationApproval, Action: "3", CreatedAt: now})
+	// A signature-less row (e.g. an unclassifiable escalation) must not appear.
+	s.AppendAudit(ctx, domain.AuditRecord{Signature: "", Trigger: "nosig",
+		SituationType: domain.SituationApproval, Action: "x", CreatedAt: now})
+
+	m, err = s.LatestAuditsForSignatures(ctx)
+	if err != nil {
+		t.Fatalf("batched query: %v", err)
+	}
+	if len(m) != 2 {
+		t.Fatalf("expected one row per non-empty signature (2), got %d: %v", len(m), m)
+	}
+	if m["sig:x"] == nil || m["sig:x"].Trigger != "new" {
+		t.Errorf("sig:x should map to its NEWEST audit, got %+v", m["sig:x"])
+	}
+	if m["sig:other"] == nil || m["sig:other"].Trigger != "other" {
+		t.Errorf("sig:other missing or wrong: %+v", m["sig:other"])
+	}
+	if _, ok := m[""]; ok {
+		t.Errorf("signature-less rows must be excluded from the map")
+	}
+	// The batched result must agree with the per-signature query it replaces.
+	single, _ := s.LatestAuditForSignature(ctx, "sig:x")
+	if single == nil || m["sig:x"].ID != single.ID {
+		t.Errorf("batched and per-signature latest audit disagree: %+v vs %+v", m["sig:x"], single)
+	}
+}
+
 func TestSignatureEmbeddingRoundTrip(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

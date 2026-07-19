@@ -2910,6 +2910,13 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 	if err != nil {
 		return nil, err
 	}
+	// One batched query for every rule's last-used audit, instead of a
+	// per-signature LatestAuditForSignature call inside the loop (the Rules
+	// list refreshes every ~2s). Absent signatures map to nil → LAST shows "-".
+	lastAudits, err := a.Store.LatestAuditsForSignatures(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows := make([]SignatureRow, 0, len(states))
 	for _, st := range states {
 		history, err := a.Store.DecisionsForSignature(ctx, st.Signature, 50)
@@ -2936,11 +2943,7 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 		// LastAudit is the rule's most recent audit entry (auto-act or
 		// escalation); it powers the Rules tab LAST column, showing when the rule
 		// was last used (nil until it has been used at least once).
-		audit, err := a.Store.LatestAuditForSignature(ctx, st.Signature)
-		if err != nil {
-			return nil, err
-		}
-		row.LastAudit = audit
+		row.LastAudit = lastAudits[st.Signature]
 		rows = append(rows, row)
 	}
 	return rows, nil

@@ -327,6 +327,10 @@ type ReadStore interface {
 	// LatestAuditForSignature returns the newest audit row for a signature,
 	// or nil when none exists.
 	LatestAuditForSignature(ctx context.Context, signature string) (*domain.AuditRecord, error)
+	// LatestAuditsForSignatures returns the newest audit row per signature
+	// (keyed by signature) for all signatures with audit history — one batched
+	// query replacing N LatestAuditForSignature calls in the Rules listing.
+	LatestAuditsForSignatures(ctx context.Context) (map[string]*domain.AuditRecord, error)
 	// ListSignatureEmbeddings returns every stored semantic identity row
 	// (all models), for rebuilding the in-memory match index.
 	ListSignatureEmbeddings(ctx context.Context) ([]domain.SignatureEmbedding, error)
