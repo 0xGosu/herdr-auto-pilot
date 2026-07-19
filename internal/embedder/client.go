@@ -34,13 +34,12 @@ import (
 // abandoned once the latch trips.
 type Client struct {
 	modelPath string
-	gpuLayers int
 	ctxWindow int // model context window forwarded to the worker (0 = worker default)
 
 	// execPath/execArgs/extraEnv build the worker command. Production uses the
 	// running binary's `embed-worker` subcommand; tests inject a re-exec of the
-	// test binary via NewReexecClient. The model/gpu config always travels in
-	// the environment (see spawn), so execArgs need not carry it.
+	// test binary via NewReexecClient. The model config always travels in the
+	// environment (see spawn), so execArgs need not carry it.
 	execPath string
 	execArgs []string
 	extraEnv []string
@@ -64,7 +63,6 @@ const stderrTailBytes = 8 << 10
 func New(cfg config.Embedding) *Client {
 	return &Client{
 		modelPath: ResolveModelPath(cfg),
-		gpuLayers: cfg.GPULayers,
 		ctxWindow: cfg.ModelContextWindow, // 0 → worker uses DefaultContextWindow
 		execArgs:  []string{"embed-worker"},
 	}
@@ -104,7 +102,6 @@ func (c *Client) spawn() (*worker, error) {
 	cmd := exec.Command(exe, c.execArgs...)
 	cmd.Env = append(os.Environ(),
 		EnvWorkerModel+"="+c.modelPath,
-		EnvWorkerGPULayers+"="+strconv.Itoa(c.gpuLayers),
 		EnvWorkerContextWindow+"="+strconv.Itoa(c.ctxWindow),
 	)
 	cmd.Env = append(cmd.Env, c.extraEnv...)

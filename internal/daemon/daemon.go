@@ -3824,12 +3824,11 @@ func neverAutoRules(s config.Safety) []domain.NeverAutoRule {
 
 func confidenceThresholds(cfg config.Config) domain.ConfidenceThresholds {
 	return domain.ConfidenceThresholds{
-		Minimum:         cfg.ConfidenceThresholds.Minimum,
-		Idle:            cfg.ConfidenceThresholds.Idle,
-		Approval:        cfg.ConfidenceThresholds.Approval,
-		Choice:          cfg.ConfidenceThresholds.Choice,
-		Error:           cfg.ConfidenceThresholds.Error,
-		InferredTaskBar: cfg.ConfidenceThresholds.InferredTaskBar,
+		Minimum:  cfg.ConfidenceThresholds.Minimum,
+		Idle:     cfg.ConfidenceThresholds.Idle,
+		Approval: cfg.ConfidenceThresholds.Approval,
+		Choice:   cfg.ConfidenceThresholds.Choice,
+		Error:    cfg.ConfidenceThresholds.Error,
 	}
 }
 

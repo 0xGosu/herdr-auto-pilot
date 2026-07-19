@@ -65,12 +65,11 @@ func NormalizeNoopAction(s string) string {
 // ConfidenceThresholds contain the variance-guard minimum agreement and the
 // per-situation confidence thresholds (FR-009).
 type ConfidenceThresholds struct {
-	Minimum         float64
-	Idle            float64
-	Approval        float64
-	Choice          float64
-	Error           float64
-	InferredTaskBar float64
+	Minimum  float64
+	Idle     float64
+	Approval float64
+	Choice   float64
+	Error    float64
 }
 
 // ForType returns the base threshold for a situation type.
@@ -224,6 +223,15 @@ func Decide(in DecideInput) Decision {
 	}
 
 	threshold := in.ConfidenceThresholds.ForType(in.Situation.Type)
+	if candidate == ActionNextInferredTask {
+		// A task inferred from the agent's own todo widget is trustworthy; it is
+		// held only to the variance-guard minimum, not the (higher) idle
+		// threshold. There is no longer a dedicated inferred-task bar. The
+		// resolver already escalates an autonomous inferred task at/below Minimum,
+		// so reaching here means the score cleared it — this override only keeps
+		// the higher idle threshold from escalating a still-confident inferred task.
+		threshold = in.ConfidenceThresholds.Minimum
+	}
 
 	if resolveEsc != ReasonNone {
 		// "No confident learned rule applies" is exactly the LLM fallback's
@@ -373,8 +381,16 @@ func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggest
 		}
 		inferred := InferNextTask(in.Situation.AgentType, in.Situation.Content)
 		if inferred.Structured {
-			// Pane-history inference is held to the higher bar.
-			if conf.Score <= in.ConfidenceThresholds.InferredTaskBar && in.State != nil && in.State.Mode == ModeAutonomous {
+			// A next task read from the agent's OWN structured todo widget is a
+			// trustworthy signal, so it carries no dedicated confidence bar: it is
+			// gated only by the variance-guard minimum, NOT the (higher) idle
+			// threshold (the confidence gate in Decide drops the threshold to
+			// ConfidenceThresholds.Minimum for this action). Below that floor an
+			// autonomous rule ESCALATES rather than consulting the LLM — idle
+			// never synthesizes a prompt when uncertain (FR-011), so we short-
+			// circuit here instead of falling through to the generic consult gate
+			// (which the small-history path, len(post) < 4, would otherwise reach).
+			if conf.Score <= in.ConfidenceThresholds.Minimum && in.State != nil && in.State.Mode == ModeAutonomous {
 				return "", "send inferred next task: " + inferred.Task, ReasonBelowThreshold
 			}
 			return ActionNextInferredTask, "send inferred next task: " + inferred.Task, ReasonNone

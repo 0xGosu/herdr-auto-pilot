@@ -115,6 +115,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_log(agent_id);
+-- Serves LatestAuditForSignature (WHERE signature = ? ORDER BY id DESC LIMIT 1)
+-- and the batched LatestAuditsForSignatures (MAX(id) GROUP BY signature) that
+-- feeds the Rules-tab LAST column on every ~2s refresh.
+CREATE INDEX IF NOT EXISTS idx_audit_signature ON audit_log(signature, id DESC);
 CREATE TABLE IF NOT EXISTS agent_rate (
 	agent_id TEXT PRIMARY KEY,
 	consecutive_auto INTEGER NOT NULL DEFAULT 0,
@@ -1067,6 +1071,30 @@ func (s *Store) LatestAuditForSignature(ctx context.Context, signature string) (
 		return nil, err
 	}
 	return &audits[0], nil
+}
+
+// LatestAuditsForSignatures returns the newest audit row per signature, keyed
+// by signature, for every signature that has any audit history. It collapses
+// the N per-signature LatestAuditForSignature calls the Rules list would
+// otherwise make on each ~2s refresh into one grouped query. The inner
+// MAX(id)-per-signature scan is index-served by idx_audit_signature.
+func (s *Store) LatestAuditsForSignatures(ctx context.Context) (map[string]*domain.AuditRecord, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+auditCols+` FROM audit_log
+		 WHERE id IN (SELECT MAX(id) FROM audit_log WHERE signature <> '' GROUP BY signature)`)
+	if err != nil {
+		return nil, err
+	}
+	audits, err := s.scanAudits(rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]*domain.AuditRecord, len(audits))
+	for i := range audits {
+		a := audits[i]
+		out[a.Signature] = &a
+	}
+	return out, nil
 }
 
 // LatestKillEvent returns the newest kill event row, or nil (read every tick).

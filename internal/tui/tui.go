@@ -132,6 +132,12 @@ type prompt struct {
 	// Pasted CR/LF line breaks are kept regardless. Only prompts whose
 	// consumer understands multi-line text opt in.
 	multiline bool
+	// options, when non-empty, turns the prompt into a single-choice picker:
+	// ↑/↓ move the highlight, enter submits the highlighted option, and typed
+	// text is ignored. Used for enum-valued fields (e.g. tui.theme) so the
+	// operator picks from the known set instead of typing a name blind.
+	options []string
+	optIdx  int
 }
 
 // promptNewlines normalizes any line-break flavor (\r\n, bare \r — common in
@@ -168,6 +174,10 @@ func isShiftEnter(msg tea.Msg) bool {
 func (m Model) submitPrompt() (tea.Model, tea.Cmd) {
 	p := m.prompt
 	m.prompt = nil
+	if len(p.options) > 0 {
+		// Picker mode: submit the highlighted option verbatim.
+		return m, p.onSubmit(p.options[p.optIdx])
+	}
 	input := strings.TrimSpace(p.input)
 	if input == "" {
 		m.message = "cancelled"
@@ -984,6 +994,33 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.message = "cancelled"
 		}
 		return m, nil
+	}
+
+	if m.prompt != nil && len(m.prompt.options) > 0 {
+		// Picker mode: ↑/↓ (or vim k/j) move the highlight, enter submits it,
+		// typed text is ignored (the choices are fixed).
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "enter":
+			return m.submitPrompt()
+		case "esc":
+			m.prompt = nil
+			m.message = "cancelled"
+			return m, nil
+		case "up", "k":
+			if m.prompt.optIdx > 0 {
+				m.prompt.optIdx--
+			}
+			return m, nil
+		case "down", "j":
+			if m.prompt.optIdx < len(m.prompt.options)-1 {
+				m.prompt.optIdx++
+			}
+			return m, nil
+		default:
+			return m, nil
+		}
 	}
 
 	if m.prompt != nil {
@@ -2448,8 +2485,13 @@ func (m Model) listPageSize() int {
 		chrome++ // these list tabs render a column header row
 	}
 	if m.prompt != nil {
-		// blank + label line + one line per line break in the expanded input.
-		chrome += 2 + strings.Count(promptNewlines.Replace(m.prompt.input), "\n")
+		if len(m.prompt.options) > 0 {
+			// blank + label line + one line per choice.
+			chrome += 2 + len(m.prompt.options)
+		} else {
+			// blank + label line + one line per line break in the expanded input.
+			chrome += 2 + strings.Count(promptNewlines.Replace(m.prompt.input), "\n")
+		}
 	}
 	if m.message != "" {
 		chrome += 2
@@ -2490,6 +2532,13 @@ func (m *Model) arriveAtTab(t tab) {
 // scrollCursorIntoView moves the active list tab's offset so the shared
 // cursor stays visible (AR-003, AR-004).
 func (m *Model) scrollCursorIntoView() {
+	if m.tab == tabConfig {
+		// Config interleaves non-selectable section headers with items, so its
+		// offset is a display-LINE offset (not a row index); scroll off the
+		// selected item's line position, not the raw cursor index.
+		m.scrollConfigIntoView()
+		return
+	}
 	if !m.tab.isList() {
 		return
 	}
@@ -2501,11 +2550,33 @@ func (m *Model) scrollCursorIntoView() {
 	}
 }
 
+// scrollConfigIntoView keeps the Config tab's line offset in range and the
+// selected item's display line within the visible page (the Config tab windows
+// over configLines, headers included, so the title never scrolls off the top).
+func (m *Model) scrollConfigIntoView() {
+	lines := m.configLines()
+	cursorLine := m.configCursorLine(lines)
+	page := m.listPageSize()
+	if cursorLine < m.offsets[tabConfig] {
+		m.offsets[tabConfig] = cursorLine
+	}
+	if cursorLine >= m.offsets[tabConfig]+page {
+		m.offsets[tabConfig] = cursorLine - page + 1
+	}
+	if maxOff := max(0, len(lines)-page); m.offsets[tabConfig] > maxOff {
+		m.offsets[tabConfig] = maxOff
+	}
+	if m.offsets[tabConfig] < 0 {
+		m.offsets[tabConfig] = 0
+	}
+}
+
 // clampListViewport keeps every list tab's offset within
 // [0, rowCount−pageSize] and the active tab's cursor within its visible
 // (filtered) rows (CR-007, CR-008, CR-016). The cursor clamp stays OUTSIDE the
-// list-only loop on purpose: Config and Pause/Kill render unwindowed (no
-// offset) but still track a cursor, and rowCountFor covers them.
+// list-only loop on purpose: Pause/Kill renders unwindowed but still tracks a
+// cursor, and rowCountFor covers it; Config windows over display LINES, so its
+// offset is reconciled by the trailing scrollCursorIntoView (→ scrollConfigIntoView).
 func (m *Model) clampListViewport() {
 	page := m.listPageSize()
 	for t := tab(0); t < tabCount; t++ {
@@ -3114,18 +3185,50 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	key := item.key
 	app, ctx := m.app, m.ctx
 	m.beginAction()
-	m.prompt = &prompt{
-		label: fmt.Sprintf("set %s (current %s)", key, frontend.FieldValue(m.data.cfg, key)),
-		onSubmit: func(input string) tea.Cmd {
-			return func() tea.Msg {
-				if err := app.SetField(ctx, key, input); err != nil {
-					return actionResultMsg{err: err}
-				}
-				return actionResultMsg{message: key + " updated (daemon reloaded)"}
+	submit := func(input string) tea.Cmd {
+		return func() tea.Msg {
+			if err := app.SetField(ctx, key, input); err != nil {
+				return actionResultMsg{err: err}
 			}
-		},
+			return actionResultMsg{message: key + " updated (daemon reloaded)"}
+		}
+	}
+	// Enum-valued fields present a picker so the operator chooses from the
+	// known set instead of typing a name blind (the whole point being that
+	// they may not know what values exist).
+	if opts, ok := configFieldChoices(key); ok {
+		cur := frontend.FieldValue(m.data.cfg, key)
+		idx := 0
+		for i, o := range opts {
+			if o == cur {
+				idx = i
+				break
+			}
+		}
+		m.prompt = &prompt{
+			label:    fmt.Sprintf("select %s (↑/↓ then enter, current %s)", key, cur),
+			options:  opts,
+			optIdx:   idx,
+			onSubmit: submit,
+		}
+		return m, nil
+	}
+	m.prompt = &prompt{
+		label:    fmt.Sprintf("set %s (current %s)", key, frontend.FieldValue(m.data.cfg, key)),
+		onSubmit: submit,
 	}
 	return m, nil
+}
+
+// configFieldChoices returns the fixed value set for an enum-valued config
+// field (rendered as a picker in the TUI), or ok=false for free-value fields.
+func configFieldChoices(key string) (choices []string, ok bool) {
+	switch key {
+	case "tui.theme":
+		return config.ValidThemes, true
+	default:
+		return nil, false
+	}
 }
 
 func (m Model) addPatternPrompt() (tea.Model, tea.Cmd) {
@@ -3465,7 +3568,17 @@ func (m Model) View() string {
 		m.renderKills(&b)
 	}
 
-	if m.prompt != nil {
+	if m.prompt != nil && len(m.prompt.options) > 0 {
+		// Picker mode: label then one row per choice, the highlight marked.
+		fmt.Fprintf(&b, "\n%s\n", m.prompt.label)
+		for i, opt := range m.prompt.options {
+			marker := "  "
+			if i == m.prompt.optIdx {
+				marker = "❯ "
+			}
+			fmt.Fprintf(&b, "%s%s\n", marker, opt)
+		}
+	} else if m.prompt != nil {
 		// A multiline input expands the box: one rendered line per line break,
 		// continuation lines indented under the label, cursor on the last.
 		lines := strings.Split(promptNewlines.Replace(m.prompt.input), "\n")
@@ -3613,7 +3726,7 @@ func (m Model) renderSignatures(b *strings.Builder) {
 	}
 	gradN := m.data.cfg.Learning.GraduationN
 	// The signature column sizes to the widest visible id so the full id
-	// renders untruncated (CR-032); the fixed columns after it are 49
+	// renders untruncated (CR-032); the fixed columns after it are 52
 	// cells, so the action budget shifts right with the column.
 	sigW := 18
 	for _, r := range sigs {
@@ -3621,16 +3734,25 @@ func (m Model) renderSignatures(b *strings.Builder) {
 			sigW = n
 		}
 	}
-	const rulesRowFmt = "%-*s %-9s %-10s %5s %-11s %7s  %s"
-	actWidth, _ := m.budget(sigW+49, false)
+	// LAST replaces the old SITUATION column: the situation type is already the
+	// signature id's prefix (e.g. "approval:9f2c"), so the column instead shows
+	// when the rule was last used — its most recent audit entry, an auto-act OR
+	// an escalation — humanized and ticking like the WHEN columns. It is 12 wide
+	// to fit "5h 59m ago" and the ≥ 6h timestamp fallback; "-" until first use.
+	const rulesRowFmt = "%-*s %-12s %-10s %5s %-11s %7s  %s"
+	actWidth, _ := m.budget(sigW+52, false)
 	header := fmt.Sprintf(rulesRowFmt, sigW,
-		"SIGNATURE", "SITUATION", "TYPE", "CONF", "MODE", "CONFIRM", "TOP ACTION")
+		"SIGNATURE", "LAST", "TYPE", "CONF", "MODE", "CONFIRM", "TOP ACTION")
 	fmt.Fprintln(b, st.section.Render(header))
 	start, end := m.window(len(sigs))
 	for i := start; i < end; i++ {
 		r := sigs[i]
+		var lastUsed time.Time
+		if r.LastAudit != nil {
+			lastUsed = r.LastAudit.CreatedAt
+		}
 		line := fmt.Sprintf(rulesRowFmt,
-			sigW, r.Signature, r.SituationType, orDash(r.AgentType),
+			sigW, r.Signature, humanizeWhen(lastUsed, m.renderNow()), orDash(r.AgentType),
 			frontend.ConfidenceLabel(r.Confidence), r.Mode,
 			fmt.Sprintf("%d/%d", r.ConsecutiveConfirmations, gradN),
 			oneLine(r.TopAction, actWidth))
@@ -3745,6 +3867,34 @@ func formatAge(firstSeen, now time.Time) string {
 	return fmt.Sprintf("%02d:%02d:%02d", total/3600, (total%3600)/60, total%60)
 }
 
+// humanizeWhen renders how long ago an escalation was raised in a compact,
+// human-friendly form that advances in real time against the caller's clock
+// (like the Agents tab Age, driven by the 1s clockTick). Under six hours it
+// counts up in seconds, then minutes, then hours+minutes ("30s ago", "5m ago",
+// "1h 45m ago", "4h 00m ago", "5h 59m ago"); at or beyond six hours a precise
+// point in time is more useful than an ever-growing relative count, so it shows
+// the exact wall-clock timestamp instead ("Jul 19 14:30"). Returns "-" when the
+// timestamp is zero.
+func humanizeWhen(created, now time.Time) string {
+	if created.IsZero() {
+		return "-"
+	}
+	d := now.Sub(created)
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 6*time.Hour:
+		return fmt.Sprintf("%dh %02dm ago", int(d.Hours()), int(d.Minutes())%60)
+	default:
+		return created.Format("Jan 2 15:04")
+	}
+}
+
 // ruleFor resolves the learned rule an audit/escalation row is keyed to
 // (they share the signature string), from the snapshot the Rules tab uses.
 func (m Model) ruleFor(signature string) (frontend.SignatureRow, bool) {
@@ -3803,8 +3953,10 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		// SITUATION must fit "unclassifiable", the longest domain value.
 		// Allowing it to overflow shifts TYPE and every column after it away
 		// from their headers.
-		escRowFmt = "%-1s %-6s %-8s %-14s %-8s %-14s %4s %-6s %5s  %s"
-		escPrefix = 76
+		// WHEN is 12 wide to fit the humanized age ("5h 59m ago") and the
+		// exact-timestamp fallback ("Jul 19 14:30") used at ≥ 6h.
+		escRowFmt = "%-1s %-6s %-12s %-14s %-8s %-14s %4s %-6s %5s  %s"
+		escPrefix = 80
 	)
 	header := fmt.Sprintf(escRowFmt,
 		"", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "RATIONALE / SUGGESTION")
@@ -3822,7 +3974,7 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		}
 		rWidth, sWidth := m.budget(escPrefix, e.Suggestion != "")
 		line := fmt.Sprintf(escRowFmt,
-			mark, fmt.Sprintf("#%d", e.ID), e.CreatedAt.Format("15:04:05"), e.SituationType,
+			mark, fmt.Sprintf("#%d", e.ID), humanizeWhen(e.CreatedAt, m.renderNow()), e.SituationType,
 			oneLine(orDash(m.agentTypeFor(e)), 8), oneLine(agent, 14),
 			llmConfShort(e.LLMConfidence), m.ruleMarker(e.Signature), frontend.ConfidenceLabel(e.Confidence),
 			oneLine(e.Rationale, rWidth))
@@ -3864,7 +4016,7 @@ func (m Model) renderAudit(b *strings.Builder) {
 			agent = r.AgentID
 		}
 		line := fmt.Sprintf(auditRowFmt,
-			fmt.Sprintf("#%d", r.ID), r.CreatedAt.Format("01-02 15:04:05"),
+			fmt.Sprintf("#%d", r.ID), humanizeWhen(r.CreatedAt, m.renderNow()),
 			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), 14),
 			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), frontend.ConfidenceLabel(r.Confidence), r.Status,
 			oneLine(r.Action, actWidth))
@@ -3876,60 +4028,99 @@ func (m Model) renderAudit(b *strings.Builder) {
 	m.renderMoreRows(b, len(rows)-end)
 }
 
-func (m Model) renderConfig(b *strings.Builder) {
+// configLine is one display row of the Config tab: either a section header or
+// blank spacer (itemIdx = -1, not selectable) or a selectable item row
+// (itemIdx into m.items). Flattening headers and items into one ordered line
+// list lets the tab window/scroll like the other list tabs so the title row is
+// never pushed off the top when the content outgrows the pane.
+type configLine struct {
+	text    string
+	itemIdx int
+}
+
+// configLines flattens the Config tab into its ordered display lines. Item
+// rows carry their m.items index and are rendered unstyled here (the selected
+// highlight is applied at draw time); headers and the empty-section notices
+// are pre-styled and non-selectable.
+func (m Model) configLines() []configLine {
 	st := m.styles()
-	if len(m.items) == 0 {
-		fmt.Fprintln(b, m.styles().help.Render("no configuration loaded"))
-		return
+	var lines []configLine
+	header := func(s string, blankBefore bool) {
+		if blankBefore {
+			lines = append(lines, configLine{text: "", itemIdx: -1})
+		}
+		lines = append(lines, configLine{text: st.section.Render(s), itemIdx: -1})
+	}
+	emptySections := func() {
+		if len(m.data.cfg.Safety.NeverAutoPatterns) == 0 && len(m.data.cfg.Safety.NeverAutoRules) == 0 {
+			header(fmt.Sprintf("Never-auto patterns: none from operator (%s) — press a to add", m.seedLabel()), true)
+		}
+		if len(m.data.cfg.TaskSources) == 0 {
+			header("Task sources: none — press t to add", false)
+		}
 	}
 	lastKind := ""
 	emptySectionsRendered := false
 	for i, item := range m.items {
 		if item.kind != lastKind {
-			// Empty mutable sections still belong above Quick Shortcuts, which is
-			// intentionally the final section in the Config tab.
+			// Empty mutable sections still belong above Quick Shortcuts, which
+			// is intentionally the final section in the Config tab.
 			if item.kind == "shortcut" && !emptySectionsRendered {
-				m.renderEmptyConfigSections(b)
+				emptySections()
 				emptySectionsRendered = true
 			}
-			lastKind = item.kind
 			switch item.kind {
 			case "field":
-				fmt.Fprintln(b, st.section.Render("Config"))
+				header("Config", false)
 			case "pattern":
-				fmt.Fprintf(b, "\n%s\n", st.section.Render(fmt.Sprintf(
-					"Never-auto patterns (operator; %s)", m.seedLabel())))
+				header(fmt.Sprintf("Never-auto patterns (operator; %s)", m.seedLabel()), true)
 			case "source":
-				fmt.Fprintf(b, "\n%s\n", st.section.Render("Task sources"))
+				header("Task sources", true)
 			case "scoped-pattern":
-				fmt.Fprintf(b, "\n%s\n", st.section.Render("Scoped never-auto rules (read-only — edit config.toml)"))
+				header("Scoped never-auto rules (read-only — edit config.toml)", true)
 			case "capture":
-				fmt.Fprintf(b, "\n%s\n", st.section.Render("Capture delays (read-only — edit config.toml)"))
+				header("Capture delays (read-only — edit config.toml)", true)
 			case "shortcut":
-				fmt.Fprintf(b, "\n%s\n", st.section.Render("Quick Shortcuts"))
+				header("Quick Shortcuts", true)
 			}
+			lastKind = item.kind
 		}
 		// Long values (argv templates, paths) truncate to one line (CR-037).
-		line := "  " + oneLine(item.label, m.contentWidth()-2)
-		if i == m.cursors[m.tab] {
-			line = st.selected.Render(line)
-		}
-		fmt.Fprintln(b, line)
+		lines = append(lines, configLine{text: "  " + oneLine(item.label, m.contentWidth()-2), itemIdx: i})
 	}
 	if !emptySectionsRendered {
-		m.renderEmptyConfigSections(b)
+		emptySections()
 	}
+	return lines
 }
 
-func (m Model) renderEmptyConfigSections(b *strings.Builder) {
+// configCursorLine maps the selected item index to its position in the flat
+// configLines list (0 when the cursor's item isn't found — e.g. an empty tab).
+func (m Model) configCursorLine(lines []configLine) int {
+	for i, ln := range lines {
+		if ln.itemIdx == m.cursors[tabConfig] {
+			return i
+		}
+	}
+	return 0
+}
+
+func (m Model) renderConfig(b *strings.Builder) {
 	st := m.styles()
-	if len(m.data.cfg.Safety.NeverAutoPatterns) == 0 && len(m.data.cfg.Safety.NeverAutoRules) == 0 {
-		fmt.Fprintf(b, "\n%s\n", st.section.Render(fmt.Sprintf(
-			"Never-auto patterns: none from operator (%s) — press a to add", m.seedLabel())))
+	if len(m.items) == 0 {
+		fmt.Fprintln(b, st.help.Render("no configuration loaded"))
+		return
 	}
-	if len(m.data.cfg.TaskSources) == 0 {
-		fmt.Fprintf(b, "%s\n", st.section.Render("Task sources: none — press t to add"))
+	lines := m.configLines()
+	start, end := m.window(len(lines))
+	for i := start; i < end; i++ {
+		text := lines[i].text
+		if lines[i].itemIdx >= 0 && lines[i].itemIdx == m.cursors[tabConfig] {
+			text = st.selected.Render(text)
+		}
+		fmt.Fprintln(b, text)
 	}
+	m.renderMoreRows(b, len(lines)-end)
 }
 
 // seedLabel names the shipped seed patterns' state: the count when active, or

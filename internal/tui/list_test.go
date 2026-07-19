@@ -210,7 +210,7 @@ func TestEscalationAuditAndRulesListsRenderSingleHeader(t *testing.T) {
 
 	m.tab = tabSignatures
 	rules := m.View()
-	assertLineOrder(t, rules, "SIGNATURE", "SIGNATURE", "SITUATION", "TYPE", "CONF", "MODE", "CONFIRM", "TOP ACTION")
+	assertLineOrder(t, rules, "SIGNATURE", "SIGNATURE", "LAST", "TYPE", "CONF", "MODE", "CONFIRM", "TOP ACTION")
 	if strings.Contains(rules, "conf=") {
 		t.Errorf("rules rows should not repeat the confidence label:\n%s", rules)
 	}
@@ -455,9 +455,9 @@ func TestTabSwitchClampsStaleRememberedCursor(t *testing.T) {
 	}
 }
 
-// TestTabSwitchClampsStaleCursorOnConfig guards the non-list tabs: Config
-// renders unwindowed (no offset) but still tracks a cursor, which is why the
-// cursor clamp sits outside clampListViewport's list-only loop.
+// TestTabSwitchClampsStaleCursorOnConfig guards the Config tab's cursor clamp,
+// which sits outside clampListViewport's list-only loop (Config windows over
+// display lines, so its offset is reconciled separately by scrollConfigIntoView).
 func TestTabSwitchClampsStaleCursorOnConfig(t *testing.T) {
 	m := listModel(t, 40, 12)
 	m.tab = tabConfig
@@ -917,6 +917,149 @@ func TestFormatAge(t *testing.T) {
 	}
 }
 
+func TestHumanizeWhen(t *testing.T) {
+	now := time.Date(2026, 7, 19, 14, 30, 0, 0, time.UTC)
+	exact := time.Date(2026, 7, 19, 8, 15, 0, 0, time.UTC) // 6h15m before now
+	cases := []struct {
+		name    string
+		created time.Time
+		want    string
+	}{
+		{"zero", time.Time{}, "-"},
+		{"just raised", now, "0s ago"},
+		{"seconds", now.Add(-30 * time.Second), "30s ago"},
+		{"sub-second rounds down", now.Add(-59500 * time.Millisecond), "59s ago"},
+		{"one minute", now.Add(-time.Minute), "1m ago"},
+		{"minutes only, no seconds shown", now.Add(-5*time.Minute - 30*time.Second), "5m ago"},
+		{"just under an hour", now.Add(-59 * time.Minute), "59m ago"},
+		{"one hour zero minutes", now.Add(-time.Hour), "1h 00m ago"},
+		{"hours and minutes", now.Add(-time.Hour - 45*time.Minute), "1h 45m ago"},
+		{"minutes zero-padded", now.Add(-4 * time.Hour), "4h 00m ago"},
+		{"just under six hours", now.Add(-5*time.Hour - 59*time.Minute), "5h 59m ago"},
+		{"exactly six hours shows timestamp", now.Add(-6 * time.Hour), "Jul 19 08:30"},
+		{"beyond six hours shows timestamp", exact, "Jul 19 08:15"},
+		{"future clamps to zero", now.Add(time.Hour), "0s ago"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := humanizeWhen(tc.created, now); got != tc.want {
+				t.Errorf("humanizeWhen(%v, %v) = %q, want %q", tc.created, now, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEscalationWhenTicksWithClock guards that the Escalations WHEN column is
+// humanized and advances in real time off the 1s clock tick (like Agents Age),
+// rather than showing a frozen wall-clock time.
+func TestEscalationWhenTicksWithClock(t *testing.T) {
+	now := time.Date(2026, 7, 19, 14, 30, 0, 0, time.UTC)
+	m := Model{width: 140, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.escalations = []domain.AuditRecord{
+		{ID: 1, SituationType: domain.SituationApproval, AgentID: "w1:p1",
+			Status: "escalated", Rationale: "needs approval", CreatedAt: now.Add(-30 * time.Second)},
+	}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+	m.tab = tabEscalations
+	m.now = now
+
+	if !strings.Contains(m.View(), "30s ago") {
+		t.Fatalf("WHEN should render humanized age 30s ago:\n%s", m.View())
+	}
+	// A clock tick advances the relative age without re-querying the store:
+	// created at now-30s, ticked to now+45s → 75s elapsed → "1m ago".
+	upd, _ = m.Update(clockTickMsg(now.Add(45 * time.Second)))
+	m = upd.(Model)
+	if !strings.Contains(m.View(), "1m ago") {
+		t.Fatalf("WHEN should advance to 1m ago after a clock tick:\n%s", m.View())
+	}
+	if strings.Contains(m.View(), "30s ago") {
+		t.Errorf("stale WHEN 30s ago must not remain after the tick:\n%s", m.View())
+	}
+}
+
+// TestAuditWhenTicksWithClock guards that the Audit tab WHEN column is
+// humanized and advances in real time off the 1s clock tick, matching the
+// Escalations tab.
+func TestAuditWhenTicksWithClock(t *testing.T) {
+	now := time.Date(2026, 7, 19, 14, 30, 0, 0, time.UTC)
+	m := Model{width: 160, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.audit = []domain.AuditRecord{
+		{ID: 1, SituationType: domain.SituationApproval, AgentID: "w1:p1",
+			Status: "auto", Action: "auto:1", CreatedAt: now.Add(-30 * time.Second)},
+	}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+	m.tab = tabAudit
+	m.now = now
+
+	if !strings.Contains(m.View(), "30s ago") {
+		t.Fatalf("Audit WHEN should render humanized age 30s ago:\n%s", m.View())
+	}
+	upd, _ = m.Update(clockTickMsg(now.Add(45 * time.Second)))
+	m = upd.(Model)
+	if !strings.Contains(m.View(), "1m ago") {
+		t.Fatalf("Audit WHEN should advance to 1m ago after a clock tick:\n%s", m.View())
+	}
+	if strings.Contains(m.View(), "30s ago") {
+		t.Errorf("stale Audit WHEN 30s ago must not remain after the tick:\n%s", m.View())
+	}
+}
+
+// TestRulesTabLastColumn verifies the Rules tab renders the LAST column (last
+// time the rule was used — its most recent audit entry) humanized like WHEN,
+// advancing on the clock tick, and shows "-" for a rule never used (nil
+// LastAudit).
+func TestRulesTabLastColumn(t *testing.T) {
+	now := time.Date(2026, 7, 19, 14, 30, 0, 0, time.UTC)
+	m := Model{width: 160, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.signatures = []frontend.SignatureRow{
+		{SignatureState: domain.SignatureState{
+			Signature: "approval:used1", SituationType: domain.SituationApproval,
+			AgentType: "claude", Mode: domain.ModeAutonomous},
+			LastAudit: &domain.AuditRecord{ID: 1, CreatedAt: now.Add(-30 * time.Second)}},
+		{SignatureState: domain.SignatureState{
+			Signature: "choice:neverused", SituationType: domain.SituationChoice,
+			AgentType: "claude", Mode: domain.ModeShadow}},
+	}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+	m.tab = tabSignatures
+	m.now = now
+
+	view := m.View()
+	if !strings.Contains(view, "LAST") {
+		t.Fatalf("Rules header must show the LAST column:\n%s", view)
+	}
+	// The used rule's own row carries the humanized last-used time; the
+	// never-used rule's row shows no relative time (LAST renders "-").
+	lineWith := func(needle string) string {
+		for _, ln := range strings.Split(view, "\n") {
+			if strings.Contains(ln, needle) {
+				return ln
+			}
+		}
+		return ""
+	}
+	if used := lineWith("approval:used1"); !strings.Contains(used, "30s ago") {
+		t.Fatalf("used rule's LAST should be 30s ago, got row:\n%s", used)
+	}
+	if never := lineWith("choice:neverused"); strings.Contains(never, "ago") {
+		t.Errorf("never-used rule must not render a relative LAST time, got row:\n%s", never)
+	}
+
+	// The LAST column advances on the clock tick, like WHEN.
+	upd, _ = m.Update(clockTickMsg(now.Add(45 * time.Second)))
+	m = upd.(Model)
+	if !strings.Contains(m.View(), "1m ago") {
+		t.Fatalf("LAST should advance to 1m ago after a clock tick:\n%s", m.View())
+	}
+}
+
 func TestSearchEmptyStateMessages(t *testing.T) {
 	cases := []struct {
 		tab  tab
@@ -1128,11 +1271,12 @@ func TestRulesListShowsFullSignatureAndAutoSizes(t *testing.T) {
 	m.tab = tabSignatures
 	view := m.View()
 	// The column sizes to the widest visible id (25 cells): the widest row
-	// gets a single separator space, the narrower one is padded to align.
-	if !strings.Contains(view, "approval:1234abcd5678efab approval") {
+	// gets a single separator space, the narrower one is padded to align. The
+	// next column is now LAST — "-" here since these fixtures never fired.
+	if !strings.Contains(view, "approval:1234abcd5678efab -") {
 		t.Errorf("widest full id should render with the next column adjacent:\n%s", view)
 	}
-	if !strings.Contains(view, "choice:ffff0000eeee1111   choice") {
+	if !strings.Contains(view, "choice:ffff0000eeee1111   -") {
 		t.Errorf("narrower id should pad to the widest id's column:\n%s", view)
 	}
 	if strings.Contains(view, "1234abc…") || strings.Contains(view, "ffff0000e…") {

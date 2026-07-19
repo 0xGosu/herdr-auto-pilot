@@ -9,12 +9,13 @@
 # ── Decision confidence ─────────────────────────────────────────────
 # Minimum agreement plus per-situation confidence a learned rule must reach.
 [confidence_thresholds]
-minimum = 0.50             # variance guard: lower scores are contradictory history
+minimum = 0.50             # variance guard: lower scores are contradictory history.
+                           # Also gates tasks inferred from the agent's own todo
+                           # widget — a trustworthy signal, so no dedicated bar.
 idle = 0.65
 approval = 0.70
 choice = 0.70
 error = 0.75
-inferred_task_bar = 0.60   # higher bar for tasks inferred from the agent's todo widget
 
 # ── Shadow-mode learning ────────────────────────────────────────────
 [learning]
@@ -158,9 +159,6 @@ disabled = false
 model_path = ""             # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
 similarity_threshold = 0.90 # min cosine to reuse a learned rule; outside (0,1) resets to 0.90
 bm25_min_score = 0.35       # text-fallback floor when the model is unavailable, (0,1]
-gpu_layers = 0              # inert in official builds (Metal/Vulkan compiled out; the
-                            # bundled MiniLM runs in ms on CPU) — only meaningful if you
-                            # rebuild llama-go with GPU on and use a larger model
 # Input is token-truncated below the model's position limit before embedding.
 # 0 uses the bundled MiniLM default (512); positive values below 256 are
 # clamped to 256. NEVER set this above the real limit of model_path: an
@@ -196,8 +194,9 @@ terminal_bell = true       # ring the terminal bell (\a) on new escalations and 
 
 # ── Declared task lists for idle agents (repeatable) ────────────────
 # Without a declared source, the plugin falls back to inferring the next
-# task from the agent's own todo rendering, held to inferred_task_bar, then
-# uses task_generate_command (when configured) to surface a suggestion. When
+# task from the agent's own todo rendering, gated only by confidence_thresholds
+# .minimum (a trustworthy signal), then uses task_generate_command (when
+# configured) to surface a suggestion. When
 # a declared source's checklist is fully checked off, the templated prompt is
 # never sent: it escalates a confirmable @noop ("No more pending tasks")
 # unless BOTH task_generate_command and task_generate_command_start are set,

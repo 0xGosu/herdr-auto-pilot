@@ -31,7 +31,7 @@ func TestLoadMissingFileYieldsDefaults(t *testing.T) {
 	}
 	want := ConfidenceThresholds{
 		Minimum: 0.50, Idle: 0.65, Approval: 0.70,
-		Choice: 0.70, Error: 0.75, InferredTaskBar: 0.60,
+		Choice: 0.70, Error: 0.75,
 	}
 	if cfg.ConfidenceThresholds != want {
 		t.Errorf("confidence threshold defaults = %+v, want %+v", cfg.ConfidenceThresholds, want)
@@ -87,6 +87,56 @@ func TestDeprecatedVerifyUnblockMsIgnoredAndDroppedOnSave(t *testing.T) {
 	}
 	if strings.Contains(string(data), "verify_unblock_ms") {
 		t.Fatalf("saved config must drop removed verify_unblock_ms:\n%s", data)
+	}
+}
+
+func TestDeprecatedGPULayersIgnoredAndDroppedOnSave(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte("[embedding]\ngpu_layers = 8\nsimilarity_threshold = 0.8\n"), 0o600)
+	cfg, logs, err := loadWithLogs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs, "no longer supported") || !strings.Contains(logs, "CPU") {
+		t.Errorf("legacy gpu_layers warning missing or unclear: %q", logs)
+	}
+	if cfg.Embedding.SimilarityThreshold != 0.8 {
+		t.Errorf("sibling embedding value lost: %v", cfg.Embedding.SimilarityThreshold)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "gpu_layers") {
+		t.Fatalf("saved config must drop removed gpu_layers:\n%s", data)
+	}
+}
+
+func TestDeprecatedInferredTaskBarIgnoredAndDroppedOnSave(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte("[confidence_thresholds]\ninferred_task_bar = 0.9\nidle = 0.6\n"), 0o600)
+	cfg, logs, err := loadWithLogs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs, "no longer supported") || !strings.Contains(logs, "minimum") {
+		t.Errorf("legacy inferred_task_bar warning missing or unclear: %q", logs)
+	}
+	if cfg.ConfidenceThresholds.Idle != 0.6 {
+		t.Errorf("sibling threshold value lost: %v", cfg.ConfidenceThresholds.Idle)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "inferred_task_bar") {
+		t.Fatalf("saved config must drop removed inferred_task_bar:\n%s", data)
 	}
 }
 
@@ -898,26 +948,25 @@ func TestEmbeddingDefaultsAndOverride(t *testing.T) {
 		t.Errorf("default bm25_min_score = %v, want 0.35", cfg.Embedding.BM25MinScore)
 	}
 
-	// Explicit values honored, including a custom model path.
+	// Explicit values honored, including a custom model path. A removed
+	// `gpu_layers` key is ignored (embedding is strictly CPU-only), not an error.
 	os.WriteFile(path, []byte(
 		"[embedding]\ndisabled = true\nmodel_path = \"/models/custom.gguf\"\nsimilarity_threshold = 0.75\nbm25_min_score = 0.5\ngpu_layers = 8\n"), 0o600)
 	if cfg, err = Load(path); err != nil {
 		t.Fatal(err)
 	}
 	if !cfg.Embedding.Disabled || cfg.Embedding.ModelPath != "/models/custom.gguf" ||
-		cfg.Embedding.SimilarityThreshold != 0.75 || cfg.Embedding.BM25MinScore != 0.5 ||
-		cfg.Embedding.GPULayers != 8 {
+		cfg.Embedding.SimilarityThreshold != 0.75 || cfg.Embedding.BM25MinScore != 0.5 {
 		t.Errorf("explicit embedding values lost: %+v", cfg.Embedding)
 	}
 
 	// Out-of-range numerics restore defaults.
 	os.WriteFile(path, []byte(
-		"[embedding]\nsimilarity_threshold = 1.5\nbm25_min_score = 1.5\ngpu_layers = -1\n"), 0o600)
+		"[embedding]\nsimilarity_threshold = 1.5\nbm25_min_score = 1.5\n"), 0o600)
 	if cfg, err = Load(path); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Embedding.SimilarityThreshold != 0.90 || cfg.Embedding.BM25MinScore != 0.35 ||
-		cfg.Embedding.GPULayers != 0 {
+	if cfg.Embedding.SimilarityThreshold != 0.90 || cfg.Embedding.BM25MinScore != 0.35 {
 		t.Errorf("out-of-range embedding values should restore defaults: %+v", cfg.Embedding)
 	}
 }

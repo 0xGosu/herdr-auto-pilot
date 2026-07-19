@@ -353,12 +353,13 @@ highlights:
 
 ```toml
 [confidence_thresholds]
-minimum = 0.50             # variance guard: minimum learned-action agreement
+minimum = 0.50             # variance guard: minimum learned-action agreement.
+                           # Also gates a task inferred from the agent's own
+                           # todo widget — a trustworthy signal, so no higher bar.
 idle = 0.65
 approval = 0.70
 choice = 0.70
 error = 0.75
-inferred_task_bar = 0.60   # higher bar for tasks inferred from pane history
 
 [learning]
 graduation_n = 2           # consecutive confirmations to graduate (1-10)
@@ -379,7 +380,6 @@ disabled = false
 model_path = ""            # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
 similarity_threshold = 0.90 # min cosine similarity to reuse a learned signature
 bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1]
-gpu_layers = 0              # inert in official builds (GPU backends compiled out)
 model_context_window = 0    # 0 = bundled-model default (512 tokens); input is
                             # truncated below this limit before embedding
 # pane_salient_chars = 500  # fallback signature window for idle/unclassified
@@ -408,7 +408,8 @@ error = "#ff5f5f"
 # Point agents/workspaces at a task list so idle agents get the next
 # unchecked item. Without a declared source, the plugin falls back to
 # inferring the next task from the agent's own native todo rendering — never
-# free-form prose — held to the higher inferred_task_bar. If neither source
+# free-form prose. Because that comes from the agent's own todo widget it is
+# trustworthy, gated only by confidence_thresholds.minimum. If neither source
 # exists, an optional llm.task_generate_command can propose tasks for you to
 # approve. Inference is agent-type-specific: currently only `claude` is
 # supported (Claude Code's ✔/■/□ todo widget; the in-progress item wins,
