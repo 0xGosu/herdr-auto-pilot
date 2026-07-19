@@ -89,7 +89,7 @@ command = [
 # ]
 
 timeout_seconds = 120              # codex is slower to start; 180 is a safer value there
-auto_act_confidence_threshold = 999  # auto-act only when the LLM confidence (0-100) is >= this; 999 = never (surface for confirmation)
+auto_act_confidence_threshold = 99  # auto-act only when the LLM confidence (0-100) is >= this; default 99 (near-certain only); set >100 (e.g. 999) to never auto-act and always surface for confirmation
 pane_excerpt_chars = 5000          # pane context included in the consult
 
 # ── Outbound action review (optional) ──
@@ -220,7 +220,9 @@ terminal_bell = true       # ring the terminal bell (\a) on new escalations and 
 # hold before LLM task generation stops refilling it: once the file has MORE
 # than max_tasks items and its pending items are exhausted, the daemon logs a
 # warning and skips generation instead of piling more onto an already-long list
-# — prune the checklist to make room. Default: 20 when unset.
+# — prune the checklist to make room. Confirming generated tasks whose count
+# would push the list past the cap is likewise REFUSED (no partial truncation),
+# as is a manual `hap task add`. Default: 20 when unset.
 # max_tasks = 20
 
 # ── Custom classifier rules (repeatable, extend the built-ins) ──────

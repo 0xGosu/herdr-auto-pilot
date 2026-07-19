@@ -1280,7 +1280,11 @@ func TestConfirmGeneratedTaskAppendRespectsMaxTasks(t *testing.T) {
 			t.Errorf("the retried confirm must send exactly once, got %d sends", len(fake.inputs))
 		}
 	})
-	t.Run("partial room truncates the appended set", func(t *testing.T) {
+	t.Run("partial overflow refuses without truncating", func(t *testing.T) {
+		// 1 existing + 3 new = 4 exceeds the cap of 3. Rather than silently
+		// appending only the 2 that fit and dropping "third", the confirm
+		// refuses the whole set so the operator sees every suggested task and
+		// prunes the list — hiding work would be worse than refusing.
 		app, st, fake, _, path := declaredSourceApp(t, "w1:p1", "- [x] 1. a\n")
 		ctx := context.Background()
 		if err := app.UpdateConfig(ctx, func(cfg *config.Config) error {
@@ -1291,18 +1295,108 @@ func TestConfirmGeneratedTaskAppendRespectsMaxTasks(t *testing.T) {
 		}
 		id := generatedEscalation(t, st, "w1:p1", "- [ ] first\n- [ ] second\n- [ ] third")
 
-		if err := app.Confirm(ctx, id, true); err != nil {
+		err := app.Confirm(ctx, id, true)
+		if err == nil || !strings.Contains(err.Error(), "maximum number of tasks") {
+			t.Fatalf("a would-be-over-cap append must refuse with the cap error, got %v", err)
+		}
+		body, _ := os.ReadFile(path)
+		if string(body) != "- [x] 1. a\n" {
+			t.Errorf("nothing may be appended on a refused confirm, got %q", body)
+		}
+		if len(fake.inputs) != 0 {
+			t.Errorf("nothing may be sent on a refused confirm, got %v", fake.inputs)
+		}
+		audit, _ := st.GetAudit(ctx, id)
+		if audit.Status != "escalated" {
+			t.Errorf("escalation must stay pending so the operator can prune and retry, got %q", audit.Status)
+		}
+	})
+	t.Run("append that fits the cap exactly succeeds", func(t *testing.T) {
+		// 1 existing + 2 new = 3 == cap: the boundary is inclusive, so this must
+		// go through (the refusal is for exceeding, not reaching, the cap).
+		app, st, fake, _, path := declaredSourceApp(t, "w1:p1", "- [x] 1. a\n")
+		ctx := context.Background()
+		if err := app.UpdateConfig(ctx, func(cfg *config.Config) error {
+			cfg.TaskSources[0].MaxTasks = 3
+			return nil
+		}); err != nil {
 			t.Fatal(err)
+		}
+		id := generatedEscalation(t, st, "w1:p1", "- [ ] first\n- [ ] second")
+
+		if err := app.Confirm(ctx, id, true); err != nil {
+			t.Fatalf("an append that exactly fills the cap must succeed, got %v", err)
 		}
 		body, _ := os.ReadFile(path)
 		want := "- [x] 1. a\n- [-] first\n- [ ] second\n"
 		if string(body) != want {
-			t.Errorf("declared file = %q, want the set truncated to the cap %q", body, want)
+			t.Errorf("declared file = %q, want both tasks appended %q", body, want)
 		}
 		if len(fake.inputs) != 1 {
-			t.Errorf("the first task must still be sent, got %v", fake.inputs)
+			t.Errorf("the first task must be sent, got %v", fake.inputs)
 		}
 	})
+}
+
+func TestConfirmGeneratedTaskBootstrapRespectsMaxTasks(t *testing.T) {
+	// The bootstrap path (no declared source yet) also honors the default
+	// max_tasks cap: a file already holding DefaultMaxTasks items refuses one
+	// more generated task instead of growing an unbounded list. Regression for
+	// the gap where only the append + `task add` paths enforced the cap.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	// Pre-seed the bootstrap file AT the cap without registering a source, so
+	// the confirm takes the bootstrap branch (not the declared-source append).
+	path := filepath.Join(stateDir, "tasks", name+".md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	b.WriteString("# Tasks for " + name + "\n\n")
+	for i := 1; i <= config.DefaultMaxTasks; i++ {
+		fmt.Fprintf(&b, "- [ ] %d. task %d\n", i, i)
+	}
+	seeded := b.String()
+	if err := os.WriteFile(path, []byte(seeded), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "one more task", CreatedAt: time.Now(),
+	})
+
+	err := app.Confirm(ctx, id, true)
+	if err == nil || !strings.Contains(err.Error(), "maximum number of tasks") {
+		t.Fatalf("a bootstrap confirm over the default cap must refuse, got %v", err)
+	}
+	body, _ := os.ReadFile(path)
+	if string(body) != seeded {
+		t.Errorf("a refused bootstrap confirm must not change the file, got %q", body)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("nothing may be sent on a refused confirm, got %v", fake.inputs)
+	}
+	// The refusal happens before source registration, so the operator can prune
+	// the file and retry the same escalation.
+	cfg, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 0 {
+		t.Errorf("a refused confirm must not register a source, got %+v", cfg.TaskSources)
+	}
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status != "escalated" {
+		t.Errorf("escalation must stay pending so the operator can prune and retry, got %q", audit.Status)
+	}
 }
 
 // sendHookHerdr wraps fakeHerdr to observe on-disk state at the exact moment
@@ -2061,11 +2155,17 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 }
 
 func TestAutoActConfidenceThresholdFieldDisplay(t *testing.T) {
-	// The default (999) renders with a "never" label, not a bare number.
+	// The default (99) is a reachable 0-100 threshold, so it renders as a bare
+	// number, not the "never" label.
 	def := config.Default()
 	got := frontend.FieldValue(def, "llm.auto_act_confidence_threshold")
-	if !strings.Contains(got, "never") || !strings.Contains(got, "999") {
-		t.Errorf("default threshold should show a never label, got %q", got)
+	if got != "99" {
+		t.Errorf("default threshold display = %q, want a bare 99", got)
+	}
+	// A value above 100 still renders with the "never" label.
+	def.LLM.AutoActConfidenceThreshold = 999
+	if got := frontend.FieldValue(def, "llm.auto_act_confidence_threshold"); !strings.Contains(got, "never") || !strings.Contains(got, "999") {
+		t.Errorf("over-100 threshold should show a never label, got %q", got)
 	}
 	// A reachable 0-100 threshold renders plainly.
 	def.LLM.AutoActConfidenceThreshold = 70

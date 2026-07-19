@@ -160,11 +160,11 @@ func TestLLMNoopDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
 	}
 }
 
-// Below the confidence threshold (default 999 = never), an LLM @noop surfaces
-// as a human-readable suggestion; confirming it records the @noop as a
+// Below the confidence threshold (score 0 < the default 99), an LLM @noop
+// surfaces as a human-readable suggestion; confirming it records the @noop as a
 // learning event (end-to-end: accepted noop escalation becomes learned history).
 func TestLLMNoopEscalatesBelowConfidenceThreshold(t *testing.T) {
-	cfg := "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n" // threshold defaults to 999 (never)
+	cfg := "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n" // threshold defaults to 99
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true
