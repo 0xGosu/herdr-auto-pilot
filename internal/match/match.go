@@ -210,14 +210,25 @@ const matchK = 3
 // best acceptable one. ok is false when no candidate is acceptable; Score is
 // the raw cosine (bleve's cosine metric normalizes and inner-products, so
 // the hit score IS the cosine similarity) — thresholding is the caller's.
-// accept must be a fast, pure content check (it runs inline per candidate).
+// accept must be a fast, pure content check (it runs inline per candidate,
+// under the read lock) and must not call back into the Matcher — doing so
+// deadlocks against a pending Rebuild/Close writer.
 func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accept func(Hit) bool) (Hit, bool, error) {
 	if !vectorSearchSupported {
 		return Hit{}, false, fmt.Errorf("vector matching unavailable (built without the \"vectors\" tag)")
 	}
+	// Hold the read lock for the WHOLE search. Rebuild/Close take the write lock
+	// to swap in a new index and Close the old one, so holding RLock across the
+	// search guarantees the index cannot be closed mid-read. Snapshotting idx and
+	// releasing before the search races old.Close() against an in-flight bleve KNN
+	// read and DEADLOCKS: runKnnCollector re-acquires the index's internal RLock
+	// (DocCount) while Close is already blocked on that index's write lock. The
+	// build cost stays off this lock — Rebuild constructs the new index before
+	// taking the write lock, so searches only ever gate the brief pointer swap,
+	// never index construction. Regression: TestMatcherConcurrentRebuildAndMatchVector.
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	idx, dims := m.idx, m.dims
-	m.mu.RUnlock()
 	if idx == nil || dims == 0 {
 		return Hit{}, false, fmt.Errorf("vector matching unavailable (no vector index)")
 	}
@@ -247,11 +258,16 @@ func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accep
 // matches as well as the stored text matches itself. Up to matchK candidates
 // are considered and the highest NORMALIZED acceptable one wins (raw BM25
 // order can differ from normalized order). accept must be a fast, pure
-// content check (it runs inline per candidate).
+// content check (it runs inline per candidate, under the read lock) and must
+// not call back into the Matcher — doing so deadlocks against a pending
+// Rebuild/Close writer.
 func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope, accept func(Hit) bool) (Hit, bool, error) {
+	// Hold the read lock for the whole search (including textSelfScore's follow-up
+	// queries) so the index cannot be closed mid-read — see MatchVector for why
+	// snapshot-then-release is unsafe.
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	idx := m.idx
-	m.mu.RUnlock()
 	if idx == nil {
 		return Hit{}, false, fmt.Errorf("text matching unavailable (no index)")
 	}
