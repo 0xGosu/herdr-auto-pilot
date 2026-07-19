@@ -374,3 +374,44 @@ func TestMatcherConcurrentCloseAndMatchVector(t *testing.T) {
 		t.Errorf("post-close vector match: ok=%v err=%v, want no hit and an error", ok, err)
 	}
 }
+
+// TestMatchVectorAcceptMayReenterMatcher is the KNN companion to
+// TestMatchTextAcceptMayReenterMatcher: a MatchVector accept callback that
+// re-enters the Matcher (a write-lock Rebuild + a nested MatchVector) completes
+// instead of deadlocking, since accept runs outside the read lock.
+func TestMatchVectorAcceptMayReenterMatcher(t *testing.T) {
+	m := New(t.TempDir())
+	defer m.Close()
+	scope := Scope{domain.SituationApproval, "claude"}
+	if err := m.Rebuild([]domain.SignatureEmbedding{
+		row("approval:edit", domain.SituationApproval, "claude", "permission: edit", unit(1, 0, 0, 0)),
+	}, 4); err != nil {
+		t.Fatal(err)
+	}
+	q := unit(1, 0, 0, 0)
+
+	reentered := false
+	accept := func(h Hit) bool {
+		if err := m.Rebuild([]domain.SignatureEmbedding{
+			row("approval:reentrant", domain.SituationApproval, "claude", "permission: run", unit(0, 1, 0, 0)),
+		}, 4); err != nil {
+			t.Errorf("reentrant Rebuild from accept: %v", err)
+		}
+		if _, _, err := m.MatchVector(context.Background(), unit(0, 1, 0, 0), scope, nil); err != nil {
+			t.Errorf("reentrant MatchVector from accept: %v", err)
+		}
+		reentered = true
+		return true
+	}
+
+	hit, ok, err := m.MatchVector(context.Background(), q, scope, accept)
+	if err != nil {
+		t.Fatalf("MatchVector with reentrant accept: %v", err)
+	}
+	if !ok || hit.Signature != "approval:edit" {
+		t.Errorf("match = %+v ok=%v, want approval:edit", hit, ok)
+	}
+	if !reentered {
+		t.Error("accept callback did not run")
+	}
+}

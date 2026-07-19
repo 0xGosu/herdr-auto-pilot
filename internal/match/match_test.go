@@ -446,3 +446,105 @@ func TestRebuildBuildErrorCleansUpDir(t *testing.T) {
 		t.Errorf("build-error path leaked its generation dir: stat err = %v", statErr)
 	}
 }
+
+// TestMatchTextAcceptMayReenterMatcher proves accept runs OUTSIDE the matcher
+// lock: an accept callback that re-enters the Matcher — including a WRITE-lock
+// Rebuild and a nested MatchText — completes instead of deadlocking. Under the
+// old "accept under the read lock" design this hung: Rebuild's write lock waited
+// on the read lock the callback was still holding.
+func TestMatchTextAcceptMayReenterMatcher(t *testing.T) {
+	m := New(t.TempDir())
+	defer m.Close()
+	scope := Scope{domain.SituationApproval, "claude"}
+	if err := m.Rebuild([]domain.SignatureEmbedding{
+		row("approval:edit", domain.SituationApproval, "claude", "permission: edit the config", nil),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	reentered := false
+	accept := func(h Hit) bool {
+		// Re-enter with a write-lock op — deadlocks under the old design.
+		if err := m.Rebuild([]domain.SignatureEmbedding{
+			row("approval:reentrant", domain.SituationApproval, "claude", "permission: run the tests", nil),
+		}, 0); err != nil {
+			t.Errorf("reentrant Rebuild from accept: %v", err)
+		}
+		// A nested lookup must also work.
+		if _, _, err := m.MatchText(context.Background(), "permission: run the tests", scope, nil); err != nil {
+			t.Errorf("reentrant MatchText from accept: %v", err)
+		}
+		reentered = true
+		return true
+	}
+
+	hit, ok, err := m.MatchText(context.Background(), "permission: edit the config", scope, accept)
+	if err != nil {
+		t.Fatalf("MatchText with reentrant accept: %v", err)
+	}
+	if !ok || hit.Signature != "approval:edit" {
+		t.Errorf("match = %+v ok=%v, want approval:edit", hit, ok)
+	}
+	if !reentered {
+		t.Error("accept callback did not run")
+	}
+}
+
+// TestMatchAcceptReentrantConcurrentRebuildClose stresses accept-outside-the-lock
+// under contention: readers run MatchText with a reentrant accept (a nested
+// MatchText) while a goroutine rebuilds the index, then Close races the still-
+// active searchers. No deadlock or data race. Run with `-race`.
+func TestMatchAcceptReentrantConcurrentRebuildClose(t *testing.T) {
+	m := New(t.TempDir())
+	defer m.Close() // idempotent second close; cleans up on early failure
+	scope := Scope{domain.SituationApproval, "claude"}
+	base := []domain.SignatureEmbedding{
+		row("approval:edit", domain.SituationApproval, "claude", "permission: edit the config", nil),
+		row("approval:run", domain.SituationApproval, "claude", "permission: run the tests", nil),
+	}
+	if err := m.Rebuild(base, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	reenter := func(h Hit) bool {
+		// Nested lookup from within accept — lock-free, must not deadlock.
+		_, _, _ = m.MatchText(ctx, "permission: run the tests", scope, nil)
+		return false // reject so the whole candidate loop runs
+	}
+
+	var searchers, rebuilder sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		searchers.Add(1)
+		go func() {
+			defer searchers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, _, err := m.MatchText(ctx, "permission: edit the config", scope, reenter); err != nil {
+					return // matcher closed
+				}
+			}
+		}()
+	}
+	rebuilder.Add(1)
+	go func() {
+		defer rebuilder.Done()
+		for i := 0; i < 30; i++ {
+			if err := m.Rebuild(base, 0); err != nil {
+				return
+			}
+		}
+	}()
+
+	rebuilder.Wait()
+	if err := m.Close(); err != nil { // races the still-running searchers
+		t.Errorf("Close during active reentrant search: %v", err)
+	}
+	close(stop)
+	searchers.Wait()
+}

@@ -535,12 +535,11 @@ func TestReembedNudgeSwapsEmbedderAndRetriesDegraded(t *testing.T) {
 }
 
 // TestRemapAllowedContract pins the veto behavior of remapAllowed, the ONLY
-// accept callback the matcher runs. Since the fix that makes MatchVector/
-// MatchText hold the read lock across the search, accept runs UNDER that lock,
-// so it must be a pure content check that never calls back into the Matcher (a
-// reentrant Rebuild/Close/Add/Delete would deadlock). That non-reentrancy is
-// guaranteed by the signature — remapAllowed takes no *match.Matcher, enforced
-// at COMPILE time, not asserted here — and its only dependency is the pure
+// accept callback the matcher runs. accept now runs OUTSIDE the matcher lock
+// (MatchVector/MatchText apply it over materialized candidates), so a reentrant
+// callback no longer deadlocks — but remapAllowed stays a pure content check by
+// construction: its signature takes no *match.Matcher, so it cannot re-enter,
+// enforced at COMPILE time, not asserted here; its only dependency is the pure
 // domain.ApprovalRemapCompatible. These cases lock in the issue-#155 option-set
 // gate (previously untested) so a future edit can't silently loosen it.
 func TestRemapAllowedContract(t *testing.T) {

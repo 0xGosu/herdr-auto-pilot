@@ -274,10 +274,29 @@ const matchK = 3
 // best acceptable one. ok is false when no candidate is acceptable; Score is
 // the raw cosine (bleve's cosine metric normalizes and inner-products, so
 // the hit score IS the cosine similarity) — thresholding is the caller's.
-// accept must be a fast, pure content check (it runs inline per candidate,
-// under the read lock) and must not call back into the Matcher — doing so
-// deadlocks against a pending Rebuild/Close writer.
+// accept must be a fast, pure content check; it runs per candidate OUTSIDE the
+// matcher lock (over value-copy hits materialized under the lock), so — unlike
+// the search itself — it may safely call back into the Matcher. Those candidates
+// are a point-in-time snapshot: an accept that mutates the matcher (Delete/
+// Rebuild) may observe or return a now-stale signature.
 func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accept func(Hit) bool) (Hit, bool, error) {
+	cands, err := m.vectorCandidates(ctx, vec, s)
+	if err != nil {
+		return Hit{}, false, err
+	}
+	for _, hit := range cands { // descending similarity
+		if accept == nil || accept(hit) {
+			return hit, true, nil
+		}
+	}
+	return Hit{}, false, nil
+}
+
+// vectorCandidates runs the KNN search under the read lock and returns the top-K
+// matches as value copies (independent of the index), so MatchVector can apply
+// accept after releasing the lock. The lock spans the whole search but never the
+// accept callback.
+func (m *Matcher) vectorCandidates(ctx context.Context, vec []float32, s Scope) ([]Hit, error) {
 	// Hold the read lock for the WHOLE search. Rebuild/Close take the write lock
 	// to swap in a new index and Close the old one, so holding RLock across the
 	// search guarantees the index cannot be closed mid-read. Snapshotting idx and
@@ -293,31 +312,28 @@ func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accep
 	// every build — even a !vectors build, where the availability error below
 	// would otherwise mask it.
 	if m.closed {
-		return Hit{}, false, ErrClosed
+		return nil, ErrClosed
 	}
 	if !vectorSearchSupported {
-		return Hit{}, false, fmt.Errorf("vector matching unavailable (built without the \"vectors\" tag)")
+		return nil, fmt.Errorf("vector matching unavailable (built without the \"vectors\" tag)")
 	}
 	idx, dims := m.idx, m.dims
 	if idx == nil || dims == 0 {
-		return Hit{}, false, fmt.Errorf("vector matching unavailable (no vector index)")
+		return nil, fmt.Errorf("vector matching unavailable (no vector index)")
 	}
 	if len(vec) != dims {
-		return Hit{}, false, fmt.Errorf("query vector dims %d != index dims %d", len(vec), dims)
+		return nil, fmt.Errorf("query vector dims %d != index dims %d", len(vec), dims)
 	}
-
 	res, err := knnSearch(ctx, idx, vec, matchK, []string{"salient"}, scopeFilter(s))
 	if err != nil {
-		return Hit{}, false, err
+		return nil, err
 	}
+	cands := make([]Hit, 0, len(res.Hits))
 	for _, h := range res.Hits { // descending similarity
 		stored, _ := h.Fields["salient"].(string)
-		hit := Hit{Signature: h.ID, Score: h.Score, Salient: stored}
-		if accept == nil || accept(hit) {
-			return hit, true, nil
-		}
+		cands = append(cands, Hit{Signature: h.ID, Score: h.Score, Salient: stored})
 	}
-	return Hit{}, false, nil
+	return cands, nil
 }
 
 // MatchText returns the best BM25 match for the salient text within scope
@@ -327,22 +343,46 @@ func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accep
 // stays meaningful as the corpus (and its IDF) grows. 1.0 means the query
 // matches as well as the stored text matches itself. Up to matchK candidates
 // are considered and the highest NORMALIZED acceptable one wins (raw BM25
-// order can differ from normalized order). accept must be a fast, pure
-// content check (it runs inline per candidate, under the read lock) and must
-// not call back into the Matcher — doing so deadlocks against a pending
-// Rebuild/Close writer.
+// order can differ from normalized order). accept must be a fast, pure content
+// check; it runs per candidate OUTSIDE the matcher lock (over normalized
+// value-copy hits), so it may safely call back into the Matcher. Those
+// candidates are a point-in-time snapshot: an accept that mutates the matcher
+// may observe or return a now-stale signature.
 func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope, accept func(Hit) bool) (Hit, bool, error) {
-	// Hold the read lock for the whole search (including textSelfScore's follow-up
-	// queries) so the index cannot be closed mid-read — see MatchVector for why
-	// snapshot-then-release is unsafe.
+	cands, err := m.textCandidates(ctx, salient, s)
+	if err != nil {
+		return Hit{}, false, err
+	}
+	var best Hit
+	var found bool
+	for _, cand := range cands {
+		if accept != nil && !accept(cand) {
+			continue
+		}
+		if !found || cand.Score > best.Score {
+			best = cand
+			found = true
+		}
+	}
+	return best, found, nil
+}
+
+// textCandidates runs the BM25 search under the read lock and returns up to
+// matchK candidates with their scores already NORMALIZED (each hit's BM25 score
+// divided by the score its own stored text achieves), so MatchText can apply
+// accept after releasing the lock. Non-normalizable candidates (a stored text
+// that isn't its own best match) are dropped here. The lock spans the search and
+// every textSelfScore follow-up query but never the accept callback — see
+// MatchVector for why snapshot-then-release around the search itself is unsafe.
+func (m *Matcher) textCandidates(ctx context.Context, salient string, s Scope) ([]Hit, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.closed {
-		return Hit{}, false, ErrClosed
+		return nil, ErrClosed
 	}
 	idx := m.idx
 	if idx == nil {
-		return Hit{}, false, fmt.Errorf("text matching unavailable (no index)")
+		return nil, fmt.Errorf("text matching unavailable (no index)")
 	}
 
 	mq := bleve.NewMatchQuery(salient)
@@ -352,20 +392,15 @@ func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope, accept
 	req.Fields = []string{"salient"}
 	res, err := idx.SearchInContext(ctx, req)
 	if err != nil {
-		return Hit{}, false, err
+		return nil, err
 	}
 
-	var best Hit
-	var found bool
+	cands := make([]Hit, 0, len(res.Hits))
 	for _, h := range res.Hits {
 		stored, _ := h.Fields["salient"].(string)
-		cand := Hit{Signature: h.ID, Score: h.Score, Salient: stored}
-		if accept != nil && !accept(cand) {
-			continue
-		}
 		self, selfID, selfOK, err := m.textSelfScore(ctx, idx, stored, s)
 		if err != nil {
-			return Hit{}, false, err
+			return nil, err
 		}
 		if !selfOK || selfID != h.ID || self <= 0 {
 			// The stored text should always be its own best match; anything
@@ -376,12 +411,9 @@ func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope, accept
 		if norm > 1 {
 			norm = 1
 		}
-		if !found || norm > best.Score {
-			best = Hit{Signature: h.ID, Score: norm, Salient: stored}
-			found = true
-		}
+		cands = append(cands, Hit{Signature: h.ID, Score: norm, Salient: stored})
 	}
-	return best, found, nil
+	return cands, nil
 }
 
 // textSelfScore runs one scoped BM25 query for a candidate's own stored text,
