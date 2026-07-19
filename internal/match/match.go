@@ -52,6 +52,13 @@ type Matcher struct {
 	dims   int    // vector dimensionality the mapping was built with (0 = text only)
 	gen    int    // generation counter naming index subdirectories
 	closed bool   // Rebuild refuses after Close (late background init)
+
+	// publishBarrier, when non-nil, is invoked with a Rebuild's reserved
+	// generation right before it acquires the publish lock. Test-only seam (nil
+	// in production) for deterministically interleaving overlapping Rebuilds to
+	// exercise the stale-generation guard; set it before any concurrent use so
+	// the read stays race-free. See TestRebuildStaleGenerationDoesNotClobber.
+	publishBarrier func(gen int)
 }
 
 // New returns an empty matcher caching its index under baseDir (wiped: the
@@ -100,6 +107,15 @@ func buildIndex(path string, dims int) (bleve.Index, error) {
 // Rebuild replaces the index with one built from rows. dims is the vector
 // dimensionality of the active embedding model (0 indexes text only; any
 // row's vector with a different length is indexed as text only).
+//
+// The build runs off the lock so searches never block on it; only the final
+// pointer swap is under the write lock. Each call reserves a monotonic
+// generation up front, so overlapping Rebuilds are safe: if a newer Rebuild
+// starts while this one is still building, this (now stale) one discards its
+// index instead of publishing — out-of-order completion never clobbers newer
+// data (it returns nil, since the newer generation owns the index). Every
+// abandoned index directory — a failed, superseded, or replaced build — is
+// removed, so the cache never leaks generations.
 func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 	if !vectorSearchSupported {
 		// No KNN engine is linked (built without the `vectors` tag), so the
@@ -116,7 +132,8 @@ func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 		return fmt.Errorf("matcher closed")
 	}
 	m.gen++
-	dir := filepath.Join(m.baseDir, fmt.Sprintf("idx-%d", m.gen))
+	gen := m.gen // this build's generation; a newer Rebuild bumps m.gen past it
+	dir := filepath.Join(m.baseDir, fmt.Sprintf("idx-%d", gen))
 	m.mu.Unlock()
 
 	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
@@ -124,28 +141,45 @@ func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 	}
 	idx, err := buildIndex(dir, dims)
 	if err != nil {
+		os.RemoveAll(dir) // don't leave a half-built index directory behind
 		return fmt.Errorf("build match index: %w", err)
 	}
 	batch := idx.NewBatch()
 	for _, r := range rows {
 		if err := batch.Index(r.Signature, toDoc(r, dims)); err != nil {
 			idx.Close()
+			os.RemoveAll(dir)
 			return fmt.Errorf("index signature %s: %w", r.Signature, err)
 		}
 	}
 	if batch.Size() > 0 {
 		if err := idx.Batch(batch); err != nil {
 			idx.Close()
+			os.RemoveAll(dir)
 			return fmt.Errorf("populate match index: %w", err)
 		}
 	}
 
+	if m.publishBarrier != nil {
+		m.publishBarrier(gen) // test-only ordering seam; nil in production
+	}
+
 	m.mu.Lock()
-	if m.closed { // Close raced in while we were indexing
+	// Refuse to publish a stale generation: if another Rebuild started while we
+	// were building (m.gen advanced past ours) it owns the index now, and
+	// publishing here would clobber its newer data with ours — out-of-order
+	// completion must not win. Also abort if Close raced in. Either way, discard
+	// the index we just built and remove its abandoned directory.
+	closed := m.closed
+	stale := m.gen != gen
+	if closed || stale {
 		m.mu.Unlock()
 		idx.Close()
 		os.RemoveAll(dir)
-		return fmt.Errorf("matcher closed")
+		if closed {
+			return fmt.Errorf("matcher closed")
+		}
+		return nil // superseded by a newer Rebuild, which owns the index
 	}
 	old, oldDir := m.idx, m.idxDir
 	m.idx, m.idxDir, m.dims = idx, dir, dims

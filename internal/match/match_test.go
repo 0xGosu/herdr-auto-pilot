@@ -2,9 +2,13 @@ package match
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
@@ -254,5 +258,159 @@ func TestMatcherConcurrentCloseAndMatch(t *testing.T) {
 	// Fully closed: further matches error rather than crash.
 	if _, ok, err := m.MatchText(ctx, "permission: edit the config", scope, nil); err == nil || ok {
 		t.Errorf("post-close match: ok=%v err=%v, want no hit and an error", ok, err)
+	}
+}
+
+// waitForGen spins (briefly, with a safety deadline) until the matcher has
+// reserved at least generation g — used to order overlapping Rebuild calls.
+func waitForGen(t *testing.T, m *Matcher, g int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.RLock()
+		cur := m.gen
+		m.mu.RUnlock()
+		if cur >= g {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("matcher never reached generation %d", g)
+}
+
+// countIndexDirs returns how many idx-* generation directories exist under base.
+func countIndexDirs(t *testing.T, base string) int {
+	t.Helper()
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatalf("read index base dir: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "idx-") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRebuildStaleGenerationDoesNotClobber verifies out-of-order completion is
+// safe: an earlier-started Rebuild that reaches its publish step LAST must not
+// publish over a newer one. A (gen 1) starts first and blocks at its publish
+// barrier until B (gen 2) has fully published — deterministically forcing the
+// out-of-order case. A must then discard its now-stale index instead of
+// clobbering B, so B's row stays the live match and A's abandoned generation
+// directory is cleaned up. Against the pre-fix code (no publish-time generation
+// check) A overwrites B and this fails.
+func TestRebuildStaleGenerationDoesNotClobber(t *testing.T) {
+	base := t.TempDir()
+	m := New(base)
+	defer m.Close()
+	scope := Scope{domain.SituationApproval, "claude"}
+
+	alpha := []domain.SignatureEmbedding{
+		row("approval:alpha", domain.SituationApproval, "claude", "permission: alpha stale choice", nil),
+	}
+	bravo := row("approval:bravo", domain.SituationApproval, "claude", "permission: bravo distinctive choice", nil)
+
+	// Deterministically force out-of-order completion: A (gen 1) blocks at its
+	// publish barrier until B (gen 2) has fully published, so A reaches publish
+	// LAST and must abort as stale. B never blocks, so bPublished always closes.
+	// Set before any concurrent Rebuild so the field read stays race-free.
+	bPublished := make(chan struct{})
+	m.publishBarrier = func(gen int) {
+		if gen == 1 {
+			<-bPublished
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { // A: earlier generation; blocks before publishing until B is done
+		defer wg.Done()
+		if err := m.Rebuild(alpha, 0); err != nil {
+			t.Errorf("Rebuild A: %v", err)
+		}
+	}()
+
+	// A reserves generation 1 up front; wait for that before launching B so B is
+	// unambiguously the NEWER generation (2).
+	waitForGen(t, m, 1)
+
+	wg.Add(1)
+	go func() { // B: newer generation; publishes, then releases A
+		defer wg.Done()
+		if err := m.Rebuild([]domain.SignatureEmbedding{bravo}, 0); err != nil {
+			t.Errorf("Rebuild B: %v", err)
+		}
+		close(bPublished)
+	}()
+
+	wg.Wait()
+
+	// B (newer) must own the live index despite A reaching publish last: its
+	// distinctive row matches, and A's stale row did not leak in.
+	hit, ok, err := m.MatchText(context.Background(), "permission: bravo distinctive choice", scope, nil)
+	if err != nil || !ok {
+		t.Fatalf("post-rebuild match: ok=%v err=%v", ok, err)
+	}
+	if hit.Signature != "approval:bravo" {
+		t.Errorf("stale generation A clobbered newer B: matched %s, want approval:bravo", hit.Signature)
+	}
+	// A's abandoned generation directory must be cleaned up; exactly one idx-*
+	// dir (B's live one) remains.
+	if n := countIndexDirs(t, base); n != 1 {
+		t.Errorf("abandoned index dirs not cleaned up: %d idx-* dirs remain, want 1", n)
+	}
+}
+
+// TestRebuildCleansUpSupersededDirectories: each successful Rebuild removes the
+// previous generation's directory, so a long-lived matcher never accumulates
+// stale index dirs.
+func TestRebuildCleansUpSupersededDirectories(t *testing.T) {
+	base := t.TempDir()
+	m := New(base)
+	defer m.Close()
+	for i := 0; i < 5; i++ {
+		if err := m.Rebuild([]domain.SignatureEmbedding{
+			row("approval:x", domain.SituationApproval, "claude", "permission: edit the config", nil),
+		}, 0); err != nil {
+			t.Fatalf("Rebuild %d: %v", i, err)
+		}
+	}
+	if n := countIndexDirs(t, base); n != 1 {
+		t.Errorf("after 5 rebuilds, want exactly 1 idx-* dir, got %d", n)
+	}
+}
+
+// TestRebuildBuildErrorCleansUpDir: when the index build fails, the reserved
+// generation directory must not be left behind. A pre-existing path at the
+// generation dir makes bleve.New fail; the error path must remove it.
+func TestRebuildBuildErrorCleansUpDir(t *testing.T) {
+	base := t.TempDir()
+	m := New(base) // wipes base
+	defer m.Close()
+
+	// Occupy the path the first Rebuild will build at (idx-1) so buildIndex fails.
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(base, "idx-1")
+	if err := os.WriteFile(blocker, []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := m.Rebuild([]domain.SignatureEmbedding{
+		row("approval:x", domain.SituationApproval, "claude", "permission: edit", nil),
+	}, 0)
+	if err == nil {
+		t.Fatal("Rebuild should fail when its index path is already occupied")
+	}
+	// The failed build must clean up its reserved directory, not leak it.
+	if _, statErr := os.Stat(blocker); !os.IsNotExist(statErr) {
+		t.Errorf("build-error path leaked its generation dir: stat err = %v", statErr)
 	}
 }
