@@ -481,14 +481,14 @@ type harness struct {
 
 func newHarness(t *testing.T, cfgTOML string) *harness {
 	fl := &fakeLLM{}
-	return newHarnessCore(t, cfgTOML, nil, fl, fl)
+	return newHarnessCore(t, cfgTOML, nil, fl, fl, nil)
 }
 
 // newHarnessWrapped lets a test substitute the HerdrPort the daemon sees
 // (e.g. hiding optional interfaces) while keeping the fake for assertions.
 func newHarnessWrapped(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort) *harness {
 	fl := &fakeLLM{}
-	return newHarnessCore(t, cfgTOML, wrap, fl, fl)
+	return newHarnessCore(t, cfgTOML, wrap, fl, fl, nil)
 }
 
 // newHarnessTaskGen installs a task-generator-capable LLM port for idle
@@ -496,14 +496,32 @@ func newHarnessWrapped(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports
 func newHarnessTaskGen(t *testing.T, cfgTOML string,
 	generate func(ctx context.Context, req domain.TaskGenRequest) (string, error)) (*harness, *fakeTaskGen) {
 	tg := &fakeTaskGen{fakeLLM: &fakeLLM{}, generate: generate}
-	return newHarnessCore(t, cfgTOML, nil, tg, tg.fakeLLM), tg
+	return newHarnessCore(t, cfgTOML, nil, tg, tg.fakeLLM, nil), tg
+}
+
+// newHarnessPaused builds a harness whose daemon Store is a pausingAutomationStore
+// installed BEFORE the daemon starts, so it never races the startup sweep's
+// opt.Store reads (processLLMRetries / expireStaleLLMWork). Returns the harness
+// and the gate the test drives via its reached/resume channels. Replaces the
+// old racy pattern of reassigning h.daemon.opt.Store after construction.
+func newHarnessPaused(t *testing.T, cfgTOML string) (*harness, *pausingAutomationStore) {
+	t.Helper()
+	fl := &fakeLLM{}
+	var gate *pausingAutomationStore
+	h := newHarnessCore(t, cfgTOML, nil, fl, fl, func(inner ports.StorePort) ports.StorePort {
+		gate = &pausingAutomationStore{
+			StorePort: inner, reached: make(chan struct{}), resume: make(chan struct{}),
+		}
+		return gate
+	})
+	return h, gate
 }
 
 // newHarnessCore wires the daemon with a caller-supplied LLM port (plus the
 // underlying *fakeLLM for assertions), so optional-capability variants
 // (rewriter, task generator) share one setup path.
 func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort,
-	llmPort ports.LLMPort, fl *fakeLLM) *harness {
+	llmPort ports.LLMPort, fl *fakeLLM, wrapStore func(ports.StorePort) ports.StorePort) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
@@ -522,6 +540,15 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 	t.Cleanup(func() { raw.Close() })
 
 	fs := &failingStore{StorePort: raw}
+	// The daemon's Store is fixed at New() time and read by background
+	// goroutines the instant Run starts (the startup sweep: processLLMRetries /
+	// expireStaleLLMWork). A test that needs to intercept the store MUST install
+	// its wrapper here — before Run — not by reassigning d.opt.Store afterward,
+	// which data-races those reads. See newHarnessPaused.
+	var storePort ports.StorePort = fs
+	if wrapStore != nil {
+		storePort = wrapStore(fs)
+	}
 	fh := &fakeHerdr{}
 	fe := &fakeEvents{ch: make(chan domain.AgentTransition, 64)}
 	var herdrPort ports.HerdrPort = fh
@@ -534,7 +561,7 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 	d, err := New(Options{
 		ConfigPath:        cfgPath,
 		ControlSocketPath: ctlPath,
-		Store:             fs,
+		Store:             storePort,
 		Herdr:             herdrPort,
 		Events:            fe,
 		Notify:            fh,
@@ -777,7 +804,7 @@ func TestLLMPromotionDeliversMenuDigitForLabel(t *testing.T) {
 
 func TestLLMPromotionDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
 	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
-	h := newHarness(t, cfg)
+	h, gate := newHarnessPaused(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true
 	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
@@ -790,10 +817,6 @@ func TestLLMPromotionDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
 		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "Yes",
 			Rationale: "approve", ConfidentScore: 80, Status: "pending"}, nil
 	}
-	gate := &pausingAutomationStore{
-		StorePort: h.store, reached: make(chan struct{}), resume: make(chan struct{}),
-	}
-	h.daemon.opt.Store = gate
 	h.push("agent-llm-disabled", "blocked")
 	select {
 	case <-gate.reached:
@@ -2602,17 +2625,13 @@ func TestIdleTaskGenAutoDismissesWhenAgentExits(t *testing.T) {
 }
 
 func TestDisabledAgentDeniesAutonomousAction(t *testing.T) {
-	h := newHarness(t, "[learning]\ngraduation_n = 3\n")
+	h, gate := newHarnessPaused(t, "[learning]\ngraduation_n = 3\n")
 	h.herdr.setPane(approvalPane)
 	h.seedAutonomous(approvalPane, domain.SituationApproval, "Yes")
 	ctx := context.Background()
 	if _, err := h.raw.EnsureAgentName(ctx, "agent-disabled"); err != nil {
 		t.Fatal(err)
 	}
-	gate := &pausingAutomationStore{
-		StorePort: h.store, reached: make(chan struct{}), resume: make(chan struct{}),
-	}
-	h.daemon.opt.Store = gate
 
 	h.push("agent-disabled", "blocked")
 	select {
