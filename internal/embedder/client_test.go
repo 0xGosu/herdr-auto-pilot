@@ -4,17 +4,17 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"math"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 )
 
 // TestMain lets a Client under test spawn the embed worker by re-execing this
-// test binary (see NewReexecClient / RunWorkerHelperIfChild).
+// test binary (see NewReexecClient / RunWorkerHelperIfChild). It runs in both
+// the CGO (`cpu`) and stub (`!cpu`) builds; the worker uses whichever engine
+// this build linked.
 func TestMain(m *testing.M) {
 	RunWorkerHelperIfChild() // returns immediately in a normal test run
 	os.Exit(m.Run())
@@ -70,7 +70,9 @@ func TestProtocolRoundTrip(t *testing.T) {
 // child before it responds) surfaces as a Go ERROR on the parent — never a
 // panic or a parent death — and after maxConsecutiveFailures the Client latches
 // ErrDegraded, i.e. semantic matching degrades to BM25 while the daemon stays
-// up. Needs no model: the worker exits before loading one.
+// up. Needs no model AND no CGO engine: the worker exits before loading one, so
+// this runs in the tag-free (stub) build too, covering the Client supervision
+// path there.
 func TestClientWorkerCrashDegrades(t *testing.T) {
 	c := NewReexecClient(
 		config.Embedding{ModelPath: filepath.Join(t.TempDir(), "unused.gguf")},
@@ -118,75 +120,5 @@ func TestClientContextCancelNotCounted(t *testing.T) {
 	}
 	if c.Degraded() {
 		t.Error("a cancelled call must not count as an embedder fault")
-	}
-}
-
-// TestClientRealModel exercises the full subprocess path with the real gguf:
-// the framing, spawn, model load, and embed all work end to end, and the warm
-// worker is reused across calls. Skips when the model is absent.
-func TestClientRealModel(t *testing.T) {
-	c := NewReexecClient(config.Embedding{ModelPath: testModelPath(t)})
-	defer c.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	v1, err := c.EmbedText(ctx, "permission: edit the configuration file")
-	if err != nil {
-		t.Fatalf("embed via worker: %v", err)
-	}
-	if len(v1) != 384 {
-		t.Errorf("dims = %d, want 384 (MiniLM-L6)", len(v1))
-	}
-	if c.Dims() != len(v1) {
-		t.Errorf("Dims() = %d, want %d", c.Dims(), len(v1))
-	}
-	var norm float64
-	for _, x := range v1 {
-		norm += float64(x) * float64(x)
-	}
-	if math.Abs(norm-1.0) > 1e-3 {
-		t.Errorf("norm² = %v, want 1.0 (worker must return a normalized vector)", norm)
-	}
-
-	// Second call reuses the warm worker (no reload) and is deterministic.
-	v2, err := c.EmbedText(ctx, "permission: edit the configuration file")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var dot float64
-	for i := range v1 {
-		dot += float64(v1[i]) * float64(v2[i])
-	}
-	if dot < 0.999 {
-		t.Errorf("self-similarity across warm-worker calls = %v, want ≈1.0", dot)
-	}
-}
-
-// TestClientRecoversAfterWorkerCrash proves per-call recovery: with the worker
-// set to crash on its SECOND request, the first embed succeeds, the second
-// surfaces an error (not a process death), and the third succeeds again on a
-// freshly respawned worker — a single bad embed no longer latches the whole
-// process to BM25. Needs the real model (the first embed must load it).
-func TestClientRecoversAfterWorkerCrash(t *testing.T) {
-	c := NewReexecClient(config.Embedding{ModelPath: testModelPath(t)}, EnvWorkerCrash+"=2")
-	defer c.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	if _, err := c.EmbedText(ctx, "first"); err != nil {
-		t.Fatalf("first embed should succeed: %v", err)
-	}
-	if _, err := c.EmbedText(ctx, "second"); err == nil {
-		t.Fatal("second embed should error (worker crashes on its 2nd request)")
-	}
-	if c.Degraded() {
-		t.Fatal("one crash must not latch degraded")
-	}
-	// A fresh worker was spawned; it crashes only on ITS second request, so the
-	// next call succeeds.
-	if _, err := c.EmbedText(ctx, "third"); err != nil {
-		t.Fatalf("third embed should succeed on a respawned worker: %v", err)
 	}
 }
