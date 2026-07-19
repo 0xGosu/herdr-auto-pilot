@@ -27,11 +27,11 @@ import (
 
 // ErrClosed is the sentinel a Matcher's methods return once Close has run:
 // Rebuild, Add, and Delete (mutations) and MatchText/MatchVector (lookups) report
-// it, so callers can branch with errors.Is(err, match.ErrClosed) instead of
-// matching strings. (In a build without the "vectors" tag, MatchVector reports
-// its unavailable-build-tag error ahead of ErrClosed, since KNN is never linked
-// there.) Lookups still degrade the same way — the daemon treats a match error as
-// a fall-back — but the reason is now identifiable.
+// it in every build config — including a build without the "vectors" tag, where
+// MatchVector's closed check runs before its availability error — so callers can
+// branch with errors.Is(err, match.ErrClosed) instead of matching strings.
+// Lookups still degrade the same way — the daemon treats a match error as a
+// fall-back — but the reason is now identifiable.
 var ErrClosed = errors.New("matcher closed")
 
 // Scope restricts a lookup to one (situation type, agent type) pair, the
@@ -278,9 +278,6 @@ const matchK = 3
 // under the read lock) and must not call back into the Matcher — doing so
 // deadlocks against a pending Rebuild/Close writer.
 func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accept func(Hit) bool) (Hit, bool, error) {
-	if !vectorSearchSupported {
-		return Hit{}, false, fmt.Errorf("vector matching unavailable (built without the \"vectors\" tag)")
-	}
 	// Hold the read lock for the WHOLE search. Rebuild/Close take the write lock
 	// to swap in a new index and Close the old one, so holding RLock across the
 	// search guarantees the index cannot be closed mid-read. Snapshotting idx and
@@ -292,8 +289,14 @@ func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accep
 	// never index construction. Regression: TestMatcherConcurrentRebuildAndMatchVector.
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	// Closed check first, so a closed matcher reports ErrClosed consistently in
+	// every build — even a !vectors build, where the availability error below
+	// would otherwise mask it.
 	if m.closed {
 		return Hit{}, false, ErrClosed
+	}
+	if !vectorSearchSupported {
+		return Hit{}, false, fmt.Errorf("vector matching unavailable (built without the \"vectors\" tag)")
 	}
 	idx, dims := m.idx, m.dims
 	if idx == nil || dims == 0 {
