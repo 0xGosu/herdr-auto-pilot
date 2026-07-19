@@ -100,9 +100,10 @@ type LLM struct {
 	// AutoActConfidenceThreshold gates acting on an LLM suggestion
 	// automatically (subject to every safety control and the learned-history
 	// gate): the daemon auto-acts only when the LLM's self-reported
-	// confidence score (0-100) is at or above this threshold. A value above
-	// 100 — the default 999 — never auto-acts (LLM suggestions are surfaced
-	// as escalations for the operator to confirm); 0 acts on any reported
+	// confidence score (0-100) is at or above this threshold. The default is
+	// 99, so out of the box the daemon auto-acts only on a near-certain
+	// (>= 99) score and surfaces everything less confident as an escalation.
+	// A value above 100 (e.g. 999) never auto-acts; 0 acts on any reported
 	// score. A decision with no reported score (-1) always escalates.
 	AutoActConfidenceThreshold int `toml:"auto_act_confidence_threshold"`
 	// DeprecatedAutoAct is the removed boolean `auto_act` key, kept only to
@@ -368,7 +369,7 @@ func Default() Config {
 			MaxAutoPromptsPerMinute:   5,
 			MaxErrorRetries:           2,
 		},
-		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 999},
+		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 99},
 		Embedding: Embedding{
 			SimilarityThreshold: 0.90,
 			BM25MinScore:        0.35,
@@ -625,13 +626,13 @@ func Load(path string) (Config, error) {
 			"path", path, "configured_value", *inferredBarProbe.ConfidenceThresholds.InferredTaskBar)
 	}
 	// Deprecated boolean `auto_act`: migrate to the confidence threshold only
-	// when the new key was NOT explicitly set. A magic-number check on the
-	// default (999) can't tell an explicit "never" from the default — 999 is
-	// also the value operators write to disable auto-act — so probe the raw
-	// file for the new key's presence: an explicit new key always wins. true →
-	// 0 (act on any reported score) is the closest equivalent, not identical:
-	// unreported-confidence decisions now escalate. Clearing the pointer makes
-	// the next Save drop the old key.
+	// when the new key was NOT explicitly set. Comparing the loaded value to
+	// the default can't tell an explicit setting from the default — an operator
+	// may write the default value on purpose — so probe the raw file for the
+	// new key's presence: an explicit new key always wins. auto_act=false → 999
+	// (never); true → 0 (act on any reported score) is the closest equivalent,
+	// not identical: unreported-confidence decisions now escalate. Clearing the
+	// pointer makes the next Save drop the old key.
 	if cfg.LLM.DeprecatedAutoAct != nil {
 		var probe struct {
 			LLM struct {
@@ -750,8 +751,9 @@ func (c *Config) fillZeroes() {
 		c.LLM.PaneExcerptChars = d.LLM.PaneExcerptChars
 	}
 	// A hand-edited negative threshold is invalid (SetField rejects it too):
-	// fall back to the never-default, never a value below 0 that would let an
-	// unreported (-1) score auto-act. 0 stays valid (act on any reported score).
+	// fall back to the default threshold, never a value below 0 that would let
+	// an unreported (-1) score auto-act. 0 stays valid (act on any reported
+	// score).
 	if c.LLM.AutoActConfidenceThreshold < 0 {
 		c.LLM.AutoActConfidenceThreshold = d.LLM.AutoActConfidenceThreshold
 	}

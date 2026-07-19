@@ -659,8 +659,10 @@ irreversible heuristic, rate limits):
   task, or *no reply* for a decline), and the **original** queued task and the
   LLM's reasoning appear in the escalation detail.
 
-Because the default threshold is `999` (never auto-act), every review is
-surfaced for confirmation until you lower `auto_act_confidence_threshold`.
+The default threshold is `99`, so a review auto-acts only when the LLM is
+near-certain (score ≥ 99); anything less confident is surfaced for confirmation.
+Raise `auto_act_confidence_threshold` above 100 (e.g. `999`) to never auto-act,
+or lower it to auto-act more readily.
 
 For learning, every accepted task-review send is stored symbolically as
 `@next_task:declared`, whether the LLM approved the queued task verbatim,
@@ -796,7 +798,7 @@ command = [
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
 ]
 timeout_seconds = 120
-auto_act_confidence_threshold = 999   # auto-act only when the LLM's confidence (0-100) is >= this; 999 = never (surface for your confirmation)
+auto_act_confidence_threshold = 99   # auto-act only when the LLM's confidence (0-100) is >= this; default 99 (near-certain only); >100 e.g. 999 = never (surface for your confirmation)
 pane_excerpt_chars = 5000   # pane excerpt size in the consult context (default 5000)
 ```
 
@@ -894,7 +896,7 @@ launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing
 `exec` inserted) — an unrecognized shape is left untouched. Every LLM
 suggestion is re-gated through the same never-auto patterns, kill switch, and rate
 guards; it auto-acts only when the LLM's self-reported confidence meets
-`auto_act_confidence_threshold` (0-100; default 999 = never) and the action
+`auto_act_confidence_threshold` (0-100; default 99, >100 e.g. 999 = never) and the action
 doesn't contradict your learned history — otherwise the suggestion is surfaced
 for you to confirm. On timeout, CLI failure, or no submission the situation
 escalates. For a retryable failed/timed-out consult, press `l` on its TUI

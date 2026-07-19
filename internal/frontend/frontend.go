@@ -978,8 +978,14 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// tasks not already present — it never drops or reorders the agent's list
 	// (issue #183). `merged` is that combined list, so the send reservation
 	// below can locate the first suggested task by its real position.
-	merged, err := ensureGeneratedTaskFile(path, name, tasks)
+	// A bootstrap always registers a fresh source, which carries no explicit
+	// max_tasks, so the default cap applies — the same limit a later append or
+	// `task add` would enforce once the source is declared.
+	merged, err := ensureGeneratedTaskFile(path, name, tasks, config.DefaultMaxTasks)
 	if err != nil {
+		if errors.Is(err, errTaskCapExceeded) {
+			return err
+		}
 		return fmt.Errorf("write tasks file: %w", err)
 	}
 	// Register the file as this agent's task source (writes config.toml and
@@ -1048,6 +1054,25 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	return a.nudge(ctx, control.KindReload)
 }
 
+// errTaskCapExceeded flags a refusal to add generated tasks because the
+// source's max_tasks cap would be exceeded. Both generated-task confirm paths
+// return it — the bootstrap path (ensureGeneratedTaskFile) unwrapped, the
+// append path (appendGeneratedTasks) wrapped with its own retry context — so
+// the bootstrap caller can detect it with errors.Is and surface the
+// operator-facing "clean up the task list" guidance in place of its own generic
+// "write tasks file:" prefix. (The manual `task add` path enforces the same cap
+// but builds its own CLI-worded message; it does not carry this sentinel.)
+var errTaskCapExceeded = errors.New("maximum number of tasks reached")
+
+// taskCapExceededError formats the shared cap-exceeded refusal: how many tasks
+// the list already holds, how many the confirm would add, and the cap — with
+// the actionable "clean up ... then confirm again" the operator needs. It wraps
+// errTaskCapExceeded so callers can detect it with errors.Is.
+func taskCapExceededError(path string, existing, adding, limit int) error {
+	return fmt.Errorf("%w for %s: %d existing + %d new = %d exceeds cap %d — clean up the task list to make room, then confirm again",
+		errTaskCapExceeded, path, existing, adding, existing+adding, limit)
+}
+
 // ensureGeneratedTaskFile writes the agent's generated-task checklist to path
 // as ONE locked read-merge-write, under the same per-path lock mutateTaskFile
 // takes — an unlocked check-then-write could land after a concurrent confirm's
@@ -1056,10 +1081,14 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 // from `tasks` not already present are added at the end — a later generation
 // never drops or reorders the agent's list (issue #183). A file already
 // carrying exactly the merged items is left untouched (a stale re-confirm must
-// not clobber markers or operator edits). The write is atomic because the
-// daemon reads this file without the lock. Returns the merged task list (raw,
-// unnumbered) so the caller can locate a task's rendered position.
-func ensureGeneratedTaskFile(path, name string, tasks []string) ([]string, error) {
+// not clobber markers or operator edits). When adding tasks would push the
+// merged list past `limit` (the new source's max_tasks cap; <= 0 disables the
+// check), it refuses with errTaskCapExceeded rather than growing an unbounded
+// list — a re-confirm that adds nothing is exempt so a pre-cap file can still
+// be re-confirmed idempotently. The write is atomic because the daemon reads
+// this file without the lock. Returns the merged task list (raw, unnumbered) so
+// the caller can locate a task's rendered position.
+func ensureGeneratedTaskFile(path, name string, tasks []string, limit int) ([]string, error) {
 	lockPath := taskLockPath(path)
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
 		return nil, err
@@ -1078,12 +1107,27 @@ func ensureGeneratedTaskFile(path, name string, tasks []string) ([]string, error
 	content := domain.RenderGeneratedTaskList(name, merged)
 	if existing != "" {
 		if sameChecklistTexts(existing, content) {
+			// Idempotent re-confirm: no task is added, so the cap check is
+			// skipped — an already-over-cap file (a pre-fix write, or a manual
+			// edit) stays re-confirmable instead of stranding its escalation.
 			return merged, nil
 		}
 		// merged lists every existing task, so carry-over drops nothing — it
 		// only restores each preserved item's "[-]"/"[x]" marker onto its
 		// freshly rendered "[ ]" line.
 		content = carryOverChecklistMarks(existing, content)
+	}
+	// Enforce the cap only when this confirm actually ADDS a task. uniqueExisting
+	// collapses the file's identities the same way merged does, so `adding` is
+	// the genuinely-new count that mergeGeneratedTasks appended — keying on it
+	// (not on sameChecklistTexts, which also trips on a mere reorder/renumber of
+	// the same items) means a no-growth re-confirm of an already-over-cap file
+	// is never refused, so a pre-fix or hand-edited over-cap file keeps its
+	// escalation retryable instead of being stranded.
+	uniqueExisting := len(mergeGeneratedTasks(existing, nil))
+	adding := len(merged) - uniqueExisting
+	if limit > 0 && adding > 0 && len(merged) > limit {
+		return nil, taskCapExceededError(path, uniqueExisting, adding, limit)
 	}
 	if err := writeFileAtomic(path, []byte(content), 0o600); err != nil {
 		return nil, err
@@ -1326,11 +1370,11 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 
 	// ONE locked compare-append: skip already-present tasks (a retry after a
 	// failed claim, or the loser of a concurrent double-confirm, must not
-	// duplicate them), enforce the max_tasks cap on what is actually missing,
-	// and record where the first task lives for the reservation below. The cap
-	// is the same limit the daemon's generation gate and manual `task add`
-	// enforce; refusing here — pre-claim — lets the operator prune the list
-	// and confirm again.
+	// duplicate them), enforce the max_tasks cap on existing + genuinely-new
+	// tasks (any overflow refuses — no partial truncation), and record where
+	// the first task lives for the reservation below. The cap is the same limit
+	// the daemon's generation gate and manual `task add` enforce; refusing here
+	// — pre-claim — lets the operator prune the list and confirm again.
 	firstText := domain.EncodeTaskNewlines(tasks[0])
 	firstIndex := 0
 	if _, err := mutateTaskFile(path, func(content string) (string, error) {
@@ -1365,16 +1409,12 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 				present[text] = -1
 			}
 		}
-		if len(missing) > 0 {
-			room := limit - len(items)
-			if room <= 0 {
-				return "", fmt.Errorf("maximum number of tasks reached for %s (%d items, cap %d) — clean up the task list to make room, then confirm again", path, len(items), limit)
-			}
-			if room < len(missing) {
-				slog.Warn("truncating generated tasks to the source's max_tasks cap",
-					"path", path, "cap", limit, "dropped", len(missing)-room)
-				missing = missing[:room]
-			}
+		// Enforce the cap on the whole would-be list: existing items plus the
+		// tasks actually missing. Any overflow refuses outright (no silent
+		// truncation) so the operator sees the full suggestion and prunes the
+		// list — confirming half of it and dropping the rest would hide work.
+		if len(missing) > 0 && len(items)+len(missing) > limit {
+			return "", taskCapExceededError(path, len(items), len(missing), limit)
 		}
 		out := content
 		for _, text := range missing {

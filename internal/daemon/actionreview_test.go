@@ -355,10 +355,10 @@ func TestActionReviewTaskSentinelOutsideTaskReviewDegrades(t *testing.T) {
 }
 
 func TestActionReviewLowConfidenceStillDelivers(t *testing.T) {
-	// The consult confidence gate does NOT apply to action reviews: a low
-	// (or default-unreachable-threshold) score still delivers the adapted
-	// text — the learned rule already earned the send.
-	h := approvalReviewHarness(t, "") // auto_act_confidence_threshold stays 999
+	// The consult confidence gate does NOT apply to action reviews: even a
+	// score below the threshold still delivers the adapted text — the learned
+	// rule already earned the send.
+	h := approvalReviewHarness(t, "") // default auto_act_confidence_threshold (99)
 	var calls atomic.Int32
 	respondReview(h, &calls, 5, func(domain.LLMRequest) (string, error) {
 		return "y — confirmed after review", nil

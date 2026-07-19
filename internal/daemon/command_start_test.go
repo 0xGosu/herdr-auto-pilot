@@ -18,9 +18,9 @@ import (
 )
 
 func TestConsultFirstFlagPerAgent(t *testing.T) {
-	// Default confidence threshold (999) means every consult escalates, which
-	// leaves nothing sent and no rate/learning side effects — a clean way to
-	// drive repeated consults for one agent.
+	// The consult returns an error, so every consult escalates regardless of
+	// the confidence threshold, which leaves nothing sent and no rate/learning
+	// side effects — a clean way to drive repeated consults for one agent.
 	h := newHarness(t, "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n")
 	h.llm.configured = true
 	var mu sync.Mutex
