@@ -3,8 +3,10 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -596,16 +598,64 @@ func countIdxDirs(t *testing.T, base string) int {
 	return n
 }
 
+// concurrentErrs collects errors raised inside stress goroutines so they can be
+// asserted on the test goroutine after the workers join — t.Fatal is illegal off
+// the test goroutine, and a bare t.Errorf can race the test finishing.
+type concurrentErrs struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (c *concurrentErrs) add(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errs = append(c.errs, err)
+}
+
+func (c *concurrentErrs) all() []error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]error(nil), c.errs...)
+}
+
+// wgCh signals once wg is fully drained, so a WaitGroup can be selected on.
+func wgCh(wg *sync.WaitGroup) <-chan struct{} {
+	ch := make(chan struct{})
+	go func() { wg.Wait(); close(ch) }()
+	return ch
+}
+
+// awaitOrDump waits on ch up to d; on timeout it runs onTimeout (best-effort
+// cleanup, e.g. signalling workers to stop so they don't hammer past the abort),
+// dumps every goroutine's stack, and fails fast — so a deadlock surfaces in
+// seconds with a diagnosis instead of hanging until the go-test binary times out.
+func awaitOrDump(t *testing.T, what string, ch <-chan struct{}, d time.Duration, onTimeout func()) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(d):
+		if onTimeout != nil {
+			onTimeout()
+		}
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		t.Fatalf("stress watchdog: %s did not finish within %s (deadlock?)\n%s", what, d, buf[:n])
+	}
+}
+
 // TestDaemonSemanticStressNoHangRaceOrLeak is an end-to-end stress test of the
 // daemon's semantic subsystem: many goroutines drive the real resolve path
 // (embed + match via resolveSignature) while several others overlap Rebuilds on
 // the same live matcher, then the matcher is shut down WHILE both searches AND
-// rebuilds are still in flight (close races active search + active rebuild —
-// the case where a racing Rebuild could recreate the index dir after cleanup).
-// It asserts the whole
-// storm completes (no hang/deadlock), trips no data race (run under -race), the
-// generation guard leaves no abandoned idx-* directories, and shutdown removes
-// the index directory entirely. This is the integration-level guard for the
+// rebuilds are still in flight (close races active search + active rebuild — the
+// case where a racing Rebuild could recreate the index dir after cleanup).
+//
+// It asserts the storm completes (no hang/deadlock), trips no data race (run
+// under -race), the generation guard leaves no abandoned idx-* directories, and
+// shutdown removes the index directory entirely. Every blocking step runs under
+// a bounded watchdog so a regression that deadlocks fails in seconds with a
+// goroutine dump, and worker panics / unexpected rebuild errors are collected and
+// asserted rather than crashing opaquely. Integration-level guard for the
 // close-during-search, overlapping-rebuild, and cleanup fixes.
 func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
 	emb := &fakeEmbedder{vectors: map[string][]float32{
@@ -628,15 +678,36 @@ func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
 		}}
 	}
 
+	const watchdog = 60 * time.Second
+	var errs concurrentErrs
 	var searchers, rebuilders sync.WaitGroup
 	stop := make(chan struct{})
+	var stopOnce sync.Once
+	// haltWorkers signals every worker to exit. Used on the happy path and, as a
+	// watchdog onTimeout hook, best-effort on the abort path so a deadlocked run
+	// doesn't leave searchers hammering the matcher past the failure.
+	haltWorkers := func() { stopOnce.Do(func() { close(stop) }) }
+
+	// spawn runs fn on a tracked goroutine, turning a panic into a collected
+	// error (the daemon path must never panic) so it is asserted rather than
+	// crashing the test binary opaquely.
+	spawn := func(wg *sync.WaitGroup, label string, fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errs.add(fmt.Errorf("%s panicked: %v", label, r))
+				}
+			}()
+			fn()
+		}()
+	}
 
 	// Concurrent searchers: hammer the daemon's real resolve path for the whole
 	// run (across both phases below), so search is always in flight.
 	for i := 0; i < 6; i++ {
-		searchers.Add(1)
-		go func(i int) {
-			defer searchers.Done()
+		spawn(&searchers, "searcher", func() {
 			for {
 				select {
 				case <-stop:
@@ -646,25 +717,22 @@ func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
 				s := approvalSituation(verbs[i%len(verbs)])
 				_ = d.resolveSignature(ctx, cfg, domain.ComputeSignature(s), s)
 			}
-		}(i)
+		})
 	}
 
-	// Phase 1 — bounded overlapping rebuilds: several goroutines rebuild the same
-	// live matcher concurrently under live search, so builds overlap and the
-	// generation guard runs. Bounded and joined so the dir count is quiescent.
+	// Phase 1 — bounded overlapping rebuilds under live search, so builds overlap
+	// and the generation guard runs. Bounded and joined so the dir count settles.
 	for r := 0; r < 3; r++ {
-		rebuilders.Add(1)
-		go func(r int) {
-			defer rebuilders.Done()
+		spawn(&rebuilders, "phase-1 rebuilder", func() {
 			for i := 0; i < 20; i++ {
 				if err := d.matcher.Rebuild(rowsFor(verbs[(r+i)%len(verbs)]), 4); err != nil {
-					t.Errorf("rebuild: %v", err)
+					errs.add(fmt.Errorf("phase-1 rebuild: %w", err))
 					return
 				}
 			}
-		}(r)
+		})
 	}
-	rebuilders.Wait()
+	awaitOrDump(t, "phase-1 rebuilds", wgCh(&rebuilders), watchdog, haltWorkers)
 
 	// The generation guard + per-build cleanup must leave at most one live idx-*
 	// dir — no abandoned generations accumulated during the overlap. Searchers
@@ -679,12 +747,10 @@ func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
 	active := make(chan struct{}) // closed once a phase-2 rebuild has run
 	var once sync.Once
 	for r := 0; r < 3; r++ {
-		rebuilders.Add(1)
-		go func(r int) {
-			defer rebuilders.Done()
-			// Failsafe: always release the <-active barrier when this goroutine
-			// exits, so an early (unexpected) error fails fast via t.Errorf rather
-			// than hanging the waiter until the go-test timeout.
+		spawn(&rebuilders, "phase-2 rebuilder", func() {
+			// Failsafe: always release the <-active barrier on exit so an early
+			// error fails fast (via the watchdog + collected error) rather than
+			// hanging the awaitOrDump below.
 			defer once.Do(func() { close(active) })
 			for i := 0; ; i++ {
 				select {
@@ -694,27 +760,43 @@ func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
 				}
 				if err := d.matcher.Rebuild(rowsFor(verbs[(r+i)%len(verbs)]), 4); err != nil {
 					if !strings.Contains(err.Error(), "matcher closed") {
-						t.Errorf("unexpected rebuild error: %v", err)
+						errs.add(fmt.Errorf("phase-2 rebuild: %w", err))
 					}
 					return
 				}
 				once.Do(func() { close(active) })
 			}
-		}(r)
+		})
 	}
-	<-active // the search + rebuild storm is live
+	awaitOrDump(t, "rebuild storm to go live", active, watchdog, haltWorkers)
 
-	// Shut the matcher down WHILE both searches and rebuilds are in flight — the
-	// hard case: a Rebuild that raced past its closed check does its
-	// MkdirAll/buildIndex off the lock and could recreate baseDir. Close must
-	// drain those in-flight builds before its final RemoveAll so nothing is left
-	// behind, and it must not deadlock, panic, or race.
-	if err := d.matcher.Close(); err != nil {
-		t.Errorf("shutdown Close during active search+rebuild: %v", err)
+	// Shut down WHILE both searches and rebuilds are in flight — the hard case: a
+	// racing Rebuild's off-lock MkdirAll/buildIndex could recreate baseDir, so
+	// Close must drain in-flight builds before its final RemoveAll. Run under the
+	// watchdog: a regression that deadlocks the drain fails in seconds with a dump.
+	var closeErr error
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		defer func() {
+			if r := recover(); r != nil {
+				errs.add(fmt.Errorf("Close panicked: %v", r))
+			}
+		}()
+		closeErr = d.matcher.Close()
+	}()
+	awaitOrDump(t, "Close during active search+rebuild", closeDone, watchdog, haltWorkers)
+	if closeErr != nil {
+		t.Errorf("shutdown Close during active search+rebuild: %v", closeErr)
 	}
-	close(stop)
-	rebuilders.Wait()
-	searchers.Wait()
+
+	haltWorkers()
+	awaitOrDump(t, "rebuilders to drain", wgCh(&rebuilders), watchdog, haltWorkers)
+	awaitOrDump(t, "searchers to drain", wgCh(&searchers), watchdog, haltWorkers)
+
+	for _, err := range errs.all() {
+		t.Errorf("stress goroutine error: %v", err)
+	}
 
 	// No base or idx-* directory may survive shutdown — not even one recreated by
 	// a Rebuild that raced Close.
