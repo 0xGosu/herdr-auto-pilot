@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -277,5 +278,98 @@ func TestAddAndDelete(t *testing.T) {
 	}
 	if _, ok, _ := m.MatchVector(context.Background(), unit(0, 0, 1), Scope{domain.SituationError, "claude"}, nil); ok {
 		t.Error("deleted row still matches")
+	}
+}
+
+// TestMatcherClosePostCloseBehaviorVector is the vectors-build companion to
+// TestMatcherClosePostCloseBehavior: after Close the KNN path degrades to an
+// error (never a use-after-close panic on the FAISS-backed reader), and the
+// text path is unavailable too.
+func TestMatcherClosePostCloseBehaviorVector(t *testing.T) {
+	m := New(t.TempDir())
+	scope := Scope{domain.SituationApproval, "claude"}
+	if err := m.Rebuild([]domain.SignatureEmbedding{
+		row("approval:edit", domain.SituationApproval, "claude", "permission: edit", unit(1, 0, 0, 0)),
+	}, 4); err != nil {
+		t.Fatal(err)
+	}
+	q := unit(1, 0, 0, 0)
+	if _, ok, err := m.MatchVector(context.Background(), q, scope, nil); err != nil || !ok {
+		t.Fatalf("pre-close vector match: ok=%v err=%v", ok, err)
+	}
+
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, ok, err := m.MatchVector(context.Background(), q, scope, nil); err == nil || ok {
+		t.Errorf("MatchVector after Close: ok=%v err=%v, want no hit and an error", ok, err)
+	}
+	if _, ok, err := m.MatchText(context.Background(), "permission: edit", scope, nil); err == nil || ok {
+		t.Errorf("MatchText after Close: ok=%v err=%v, want no hit and an error", ok, err)
+	}
+	if err := m.Close(); err != nil {
+		t.Errorf("second Close must be idempotent nil, got %v", err)
+	}
+}
+
+// TestMatcherConcurrentCloseAndMatchVector is the vectors-build companion to
+// TestMatcherConcurrentCloseAndMatch: it closes a VECTOR-backed index while KNN
+// searches (MatchVector → knnSearch over the FAISS reader) are in flight.
+// Closing an index mid-search WITHOUT holding the read lock across it would
+// deadlock bleve's KNN collector (see the runKnnCollector/DocCount hazard in
+// match.go); here MatchVector holds the read lock, so Close waits for in-flight
+// searches instead. This exercises the safe path — it must not panic, hang, or
+// trip -race — rather than reproducing that deadlock. Run with `-race`.
+func TestMatcherConcurrentCloseAndMatchVector(t *testing.T) {
+	m := New(t.TempDir())
+	defer m.Close() // idempotent second close; also cleans up on an early failure
+	scope := Scope{domain.SituationApproval, "claude"}
+	if err := m.Rebuild([]domain.SignatureEmbedding{
+		row("approval:edit", domain.SituationApproval, "claude", "permission: edit", unit(1, 0, 0, 0)),
+		row("approval:run", domain.SituationApproval, "claude", "permission: run", unit(0, 1, 0, 0)),
+	}, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	q := unit(1, 0.05, 0, 0) // nearest: approval:edit
+	var wg sync.WaitGroup
+	var matched atomic.Int64
+	inFlight := make(chan struct{})
+	var once sync.Once
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				_, ok, err := m.MatchVector(ctx, q, scope, nil)
+				if err != nil {
+					return
+				}
+				if ok {
+					matched.Add(1)
+					once.Do(func() { close(inFlight) })
+				}
+			}
+		}()
+	}
+	// Close only once a KNN reader holds a live hit, so it provably races an
+	// in-flight FAISS search rather than an empty index.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-inFlight
+		if err := m.Close(); err != nil {
+			t.Errorf("Close during in-flight KNN search: %v", err)
+		}
+	}()
+	wg.Wait()
+
+	if matched.Load() == 0 {
+		t.Error("KNN readers never matched before Close — the in-flight window was not exercised")
+	}
+	if _, ok, err := m.MatchVector(ctx, q, scope, nil); err == nil || ok {
+		t.Errorf("post-close vector match: ok=%v err=%v, want no hit and an error", ok, err)
 	}
 }

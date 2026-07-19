@@ -3,6 +3,7 @@ package match
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -152,5 +153,106 @@ func TestMatcherConcurrentRebuildAndMatch(t *testing.T) {
 	}
 	if hit.Signature != "approval:edit" {
 		t.Errorf("post-churn match = %s, want approval:edit", hit.Signature)
+	}
+}
+
+// TestMatcherClosePostCloseBehavior pins the fail-safe contract after Close:
+// every method degrades cleanly (an error or a no-op) and none panics, so a
+// daemon shutdown racing a late lookup can't crash. Runs in both build configs
+// via the text path.
+func TestMatcherClosePostCloseBehavior(t *testing.T) {
+	m := New(t.TempDir())
+	scope := Scope{domain.SituationApproval, "claude"}
+	if err := m.Rebuild([]domain.SignatureEmbedding{
+		row("approval:edit", domain.SituationApproval, "claude", "permission: edit the config", nil),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: it matches before Close.
+	if _, ok, err := m.MatchText(context.Background(), "permission: edit the config", scope, nil); err != nil || !ok {
+		t.Fatalf("pre-close match: ok=%v err=%v", ok, err)
+	}
+
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Post-close every method degrades cleanly, never panics.
+	if _, ok, err := m.MatchText(context.Background(), "permission: edit the config", scope, nil); err == nil || ok {
+		t.Errorf("MatchText after Close: ok=%v err=%v, want no hit and an error", ok, err)
+	}
+	if err := m.Add(row("approval:new", domain.SituationApproval, "claude", "permission: run", nil)); err == nil {
+		t.Error("Add after Close must error")
+	}
+	if err := m.Delete("approval:edit"); err != nil {
+		t.Errorf("Delete after Close should be a no-op nil, got %v", err)
+	}
+	if err := m.Rebuild(nil, 0); err == nil {
+		t.Error("Rebuild after Close must error (matcher closed)")
+	}
+	if err := m.Close(); err != nil {
+		t.Errorf("second Close must be idempotent nil, got %v", err)
+	}
+}
+
+// TestMatcherConcurrentCloseAndMatch guards Close against in-flight searches:
+// Close takes the write lock while Match* hold the read lock across the whole
+// search, so Close WAITS for in-flight lookups instead of closing the index
+// under them. Readers must never panic or data-race — each MatchText either
+// succeeds or, once Close lands, returns the clean post-close error. Close must
+// not deadlock behind the readers (writer-priority drains them). Run with
+// `-race`; also runs in the !vectors build. TestMatcherConcurrentCloseAndMatchVector
+// covers the KNN path.
+func TestMatcherConcurrentCloseAndMatch(t *testing.T) {
+	m := New(t.TempDir())
+	defer m.Close() // idempotent second close; also cleans up on an early failure
+	scope := Scope{domain.SituationApproval, "claude"}
+	if err := m.Rebuild([]domain.SignatureEmbedding{
+		row("approval:edit", domain.SituationApproval, "claude", "permission: edit the config", nil),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	var matched atomic.Int64
+	inFlight := make(chan struct{})
+	var once sync.Once
+	// Readers spin on real searches until Close lands, then exit on the
+	// post-close error; each hit signals that a live match is in flight.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				_, ok, err := m.MatchText(ctx, "permission: edit the config", scope, nil)
+				if err != nil {
+					return
+				}
+				if ok {
+					matched.Add(1)
+					once.Do(func() { close(inFlight) })
+				}
+			}
+		}()
+	}
+	// Close only once a reader holds a live match, so the close provably races
+	// real in-flight searches rather than an empty index.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-inFlight
+		if err := m.Close(); err != nil {
+			t.Errorf("Close during in-flight search: %v", err)
+		}
+	}()
+	wg.Wait()
+
+	if matched.Load() == 0 {
+		t.Error("readers never matched before Close — the in-flight window was not exercised")
+	}
+	// Fully closed: further matches error rather than crash.
+	if _, ok, err := m.MatchText(ctx, "permission: edit the config", scope, nil); err == nil || ok {
+		t.Errorf("post-close match: ok=%v err=%v, want no hit and an error", ok, err)
 	}
 }
