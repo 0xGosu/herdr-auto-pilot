@@ -536,7 +536,7 @@ func TestLLMMultiTabConsultAndSeriesPromotion(t *testing.T) {
 
 func TestLLMMultiTabSeriesDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
 	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
-	h := newHarness(t, cfg)
+	h, gate := newHarnessPaused(t, cfg)
 	h.herdr.setFrames(mcqFrames)
 	h.llm.configured = true
 	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
@@ -549,10 +549,6 @@ func TestLLMMultiTabSeriesDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
 		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "1 2 1",
 			Rationale: "defaults", ConfidentScore: 80, Status: "pending"}, nil
 	}
-	gate := &pausingAutomationStore{
-		StorePort: h.store, reached: make(chan struct{}), resume: make(chan struct{}),
-	}
-	h.daemon.opt.Store = gate
 	h.push("agent-mcqllm-disabled", "blocked")
 	select {
 	case <-gate.reached:

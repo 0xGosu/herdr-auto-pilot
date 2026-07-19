@@ -92,15 +92,22 @@ jobs:
             go test -tags "${GO_BUILD_TAGS}" ./... -count=1 -timeout 15m
           fi
       - name: Race detector
-        # The race detector is flaky under CI load; retry up to 2 times
-        # (3 attempts total) before failing the job.
+        # Runs the concurrency regressions under -race with the "vectors cpu"
+        # tags on the standard (CPU-only) runners — notably internal/match's
+        # TestMatcherConcurrentRebuildAndMatch and, under the vectors tag,
+        # TestMatcherConcurrentRebuildAndMatchVector, which guard the
+        # Rebuild-closes-the-index-mid-search deadlock (the vector variant hung
+        # ~10m before the fix). Keep ./internal/match/... in PKGS so both stay
+        # covered. The race detector is flaky under CI load; retry up to 2 times
+        # (3 attempts total) before failing the job. -timeout caps a reintroduced
+        # deadlock so it fails in minutes instead of the 10m default per attempt.
         run: |
           PKGS="./internal/store/... ./internal/domain/... ./internal/control/... ./internal/embedder/... ./internal/match/... ./internal/daemon/..."
           run_race() {
             if [ "$RUNNER_OS" = "macOS" ]; then
-              go test -ldflags "-r /usr/local/lib" -tags "${GO_BUILD_TAGS}" $PKGS -race -count=1
+              go test -ldflags "-r /usr/local/lib" -tags "${GO_BUILD_TAGS}" $PKGS -race -count=1 -timeout 8m
             else
-              go test -tags "${GO_BUILD_TAGS}" $PKGS -race -count=1
+              go test -tags "${GO_BUILD_TAGS}" $PKGS -race -count=1 -timeout 8m
             fi
           }
           attempt=1

@@ -4,6 +4,7 @@ package match
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -57,5 +58,38 @@ func TestRebuildTextOnlyWithoutVectors(t *testing.T) {
 	if _, ok, err := m.MatchText(context.Background(), "permission: delete a temporary file",
 		Scope{domain.SituationApproval, "claude"}, nil); err != nil || !ok {
 		t.Errorf("added row not text-matchable: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestMatcherClosedReturnsErrClosedWithoutVectors is the tag-free lifecycle
+// regression: in a !vectors build a CLOSED matcher's MatchVector must report the
+// ErrClosed sentinel, not the build-tag "unavailable" error, so post-Close
+// behavior is identical across builds. The closed check runs before the tag
+// check; an OPEN matcher in this build still reports unavailable (not ErrClosed).
+func TestMatcherClosedReturnsErrClosedWithoutVectors(t *testing.T) {
+	scope := Scope{domain.SituationApproval, "claude"}
+
+	closed := New(t.TempDir())
+	if err := closed.Rebuild([]domain.SignatureEmbedding{
+		row("approval:edit", domain.SituationApproval, "claude", "permission: edit", nil),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, ok, err := closed.MatchVector(context.Background(), []float32{1, 0, 0}, scope, nil); ok || !errors.Is(err, ErrClosed) {
+		t.Errorf("MatchVector after Close in !vectors build: ok=%v err=%v, want no hit and errors.Is ErrClosed", ok, err)
+	}
+
+	// An OPEN matcher in this build still reports the unavailable tag error, which
+	// must NOT be ErrClosed — confirms the closed check gates it, not vice versa.
+	open := New(t.TempDir())
+	defer open.Close()
+	if err := open.Rebuild(nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := open.MatchVector(context.Background(), []float32{1, 0, 0}, scope, nil); ok || err == nil || errors.Is(err, ErrClosed) {
+		t.Errorf("open !vectors MatchVector: ok=%v err=%v, want the unavailable tag error (not ErrClosed)", ok, err)
 	}
 }

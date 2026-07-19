@@ -10,6 +10,7 @@ package match
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,23 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
+
+// ErrClosed is the sentinel a Matcher's methods return once Close has run:
+// Rebuild, Add, and Delete (mutations) and MatchText/MatchVector (lookups) report
+// it in every build config — including a build without the "vectors" tag, where
+// MatchVector's closed check runs before its availability error — so callers can
+// branch with errors.Is(err, match.ErrClosed) instead of matching strings.
+// Lookups still degrade the same way — the daemon treats a match error as a
+// fall-back — but the reason is now identifiable.
+var ErrClosed = errors.New("matcher closed")
+
+// ErrCleanup wraps a Rebuild error that occurred AFTER a new index was
+// successfully published: the rebuild itself succeeded, only removing the
+// previous generation's directory (or closing its index) failed, leaking it.
+// Callers can errors.Is(err, match.ErrCleanup) to keep using the now-live index
+// while surfacing the leak, versus a plain Rebuild error (the rebuild failed and
+// nothing was published).
+var ErrCleanup = errors.New("match index cleanup failed")
 
 // Scope restricts a lookup to one (situation type, agent type) pair, the
 // same partitioning ComputeSignature bakes into hash keys: a rule learned
@@ -52,13 +70,31 @@ type Matcher struct {
 	dims   int    // vector dimensionality the mapping was built with (0 = text only)
 	gen    int    // generation counter naming index subdirectories
 	closed bool   // Rebuild refuses after Close (late background init)
+
+	// rebuildWG tracks Rebuilds that passed the closed check and may still be
+	// touching the filesystem off-lock (MkdirAll/buildIndex). Close waits on it
+	// before its final RemoveAll so no in-flight Rebuild recreates baseDir after
+	// cleanup. Add is done under mu, gated by !closed, so it never races Wait.
+	rebuildWG sync.WaitGroup
+
+	// removeAll deletes an index directory tree (os.RemoveAll in production). A
+	// test may swap it to inject a filesystem cleanup failure; set it before any
+	// concurrent use so the read stays race-free.
+	removeAll func(dir string) error
+
+	// publishBarrier, when non-nil, is invoked with a Rebuild's reserved
+	// generation right before it acquires the publish lock. Test-only seam (nil
+	// in production) for deterministically interleaving overlapping Rebuilds to
+	// exercise the stale-generation guard; set it before any concurrent use so
+	// the read stays race-free. See TestRebuildStaleGenerationDoesNotClobber.
+	publishBarrier func(gen int)
 }
 
 // New returns an empty matcher caching its index under baseDir (wiped: the
 // index is disposable, SQLite is the source of truth). Call Rebuild next.
 func New(baseDir string) *Matcher {
 	os.RemoveAll(baseDir)
-	return &Matcher{baseDir: baseDir}
+	return &Matcher{baseDir: baseDir, removeAll: os.RemoveAll}
 }
 
 type doc struct {
@@ -100,6 +136,15 @@ func buildIndex(path string, dims int) (bleve.Index, error) {
 // Rebuild replaces the index with one built from rows. dims is the vector
 // dimensionality of the active embedding model (0 indexes text only; any
 // row's vector with a different length is indexed as text only).
+//
+// The build runs off the lock so searches never block on it; only the final
+// pointer swap is under the write lock. Each call reserves a monotonic
+// generation up front, so overlapping Rebuilds are safe: if a newer Rebuild
+// starts while this one is still building, this (now stale) one discards its
+// index instead of publishing — out-of-order completion never clobbers newer
+// data (it returns nil, since the newer generation owns the index). Every
+// abandoned index directory — a failed, superseded, or replaced build — is
+// removed, so the cache never leaks generations.
 func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 	if !vectorSearchSupported {
 		// No KNN engine is linked (built without the `vectors` tag), so the
@@ -113,64 +158,96 @@ func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return fmt.Errorf("matcher closed")
+		return ErrClosed
 	}
 	m.gen++
-	dir := filepath.Join(m.baseDir, fmt.Sprintf("idx-%d", m.gen))
+	gen := m.gen // this build's generation; a newer Rebuild bumps m.gen past it
+	dir := filepath.Join(m.baseDir, fmt.Sprintf("idx-%d", gen))
+	// Register as in-flight while still holding mu and having observed !closed,
+	// so Close (which sets closed under mu before Wait) never races this Add. The
+	// off-lock MkdirAll/buildIndex below may recreate baseDir; Close waits for
+	// our Done before its final RemoveAll.
+	m.rebuildWG.Add(1)
 	m.mu.Unlock()
+	defer m.rebuildWG.Done()
 
 	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
 		return fmt.Errorf("create match index dir: %w", err)
 	}
 	idx, err := buildIndex(dir, dims)
 	if err != nil {
-		return fmt.Errorf("build match index: %w", err)
+		// Don't leave a half-built index directory behind; surface a cleanup
+		// failure alongside the build error.
+		return errors.Join(fmt.Errorf("build match index: %w", err), m.cleanupIndex(nil, dir))
 	}
 	batch := idx.NewBatch()
 	for _, r := range rows {
 		if err := batch.Index(r.Signature, toDoc(r, dims)); err != nil {
-			idx.Close()
-			return fmt.Errorf("index signature %s: %w", r.Signature, err)
+			return errors.Join(fmt.Errorf("index signature %s: %w", r.Signature, err), m.cleanupIndex(idx.Close, dir))
 		}
 	}
 	if batch.Size() > 0 {
 		if err := idx.Batch(batch); err != nil {
-			idx.Close()
-			return fmt.Errorf("populate match index: %w", err)
+			return errors.Join(fmt.Errorf("populate match index: %w", err), m.cleanupIndex(idx.Close, dir))
 		}
 	}
 
+	if m.publishBarrier != nil {
+		m.publishBarrier(gen) // test-only ordering seam; nil in production
+	}
+
 	m.mu.Lock()
-	if m.closed { // Close raced in while we were indexing
+	// Refuse to publish a stale generation: if another Rebuild started while we
+	// were building (m.gen advanced past ours) it owns the index now, and
+	// publishing here would clobber its newer data with ours — out-of-order
+	// completion must not win. Also abort if Close raced in. Either way, discard
+	// the index we just built and remove its abandoned directory.
+	closed := m.closed
+	stale := m.gen != gen
+	if closed || stale {
 		m.mu.Unlock()
-		idx.Close()
-		os.RemoveAll(dir)
-		return fmt.Errorf("matcher closed")
+		cleanupErr := m.cleanupIndex(idx.Close, dir)
+		if closed {
+			return errors.Join(ErrClosed, cleanupErr)
+		}
+		return cleanupErr // superseded by a newer Rebuild; nil unless cleanup failed
 	}
 	old, oldDir := m.idx, m.idxDir
 	m.idx, m.idxDir, m.dims = idx, dir, dims
 	m.mu.Unlock()
 	if old != nil {
-		old.Close()
-		os.RemoveAll(oldDir)
+		if cleanupErr := m.cleanupIndex(old.Close, oldDir); cleanupErr != nil {
+			// The new index is live and published; only reclaiming the previous
+			// generation failed. Wrap ErrCleanup so callers can keep using the
+			// live index while still seeing the leak.
+			return errors.Join(ErrCleanup, cleanupErr)
+		}
 	}
 	return nil
 }
 
-// Add indexes one signature (idempotent: re-adding replaces the doc).
+// Add indexes one signature (idempotent: re-adding replaces the doc). Returns
+// ErrClosed after Close, distinct from the not-yet-built error.
 func (m *Matcher) Add(r domain.SignatureEmbedding) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.closed {
+		return ErrClosed
+	}
 	if m.idx == nil {
 		return fmt.Errorf("match index not built yet")
 	}
 	return m.idx.Index(r.Signature, toDoc(r, m.dims))
 }
 
-// Delete removes one signature from the index.
+// Delete removes one signature from the index. Returns ErrClosed after Close; a
+// not-yet-built index (never a closed one) is a no-op.
 func (m *Matcher) Delete(signature string) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.closed {
+		return ErrClosed
+	}
 	if m.idx == nil {
 		return nil
 	}
@@ -210,33 +287,66 @@ const matchK = 3
 // best acceptable one. ok is false when no candidate is acceptable; Score is
 // the raw cosine (bleve's cosine metric normalizes and inner-products, so
 // the hit score IS the cosine similarity) — thresholding is the caller's.
-// accept must be a fast, pure content check (it runs inline per candidate).
+// accept must be a fast, pure content check; it runs per candidate OUTSIDE the
+// matcher lock (over value-copy hits materialized under the lock), so — unlike
+// the search itself — it may safely call back into the Matcher. Those candidates
+// are a point-in-time snapshot: an accept that mutates the matcher (Delete/
+// Rebuild) may observe or return a now-stale signature.
 func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accept func(Hit) bool) (Hit, bool, error) {
-	if !vectorSearchSupported {
-		return Hit{}, false, fmt.Errorf("vector matching unavailable (built without the \"vectors\" tag)")
-	}
-	m.mu.RLock()
-	idx, dims := m.idx, m.dims
-	m.mu.RUnlock()
-	if idx == nil || dims == 0 {
-		return Hit{}, false, fmt.Errorf("vector matching unavailable (no vector index)")
-	}
-	if len(vec) != dims {
-		return Hit{}, false, fmt.Errorf("query vector dims %d != index dims %d", len(vec), dims)
-	}
-
-	res, err := knnSearch(ctx, idx, vec, matchK, []string{"salient"}, scopeFilter(s))
+	cands, err := m.vectorCandidates(ctx, vec, s)
 	if err != nil {
 		return Hit{}, false, err
 	}
-	for _, h := range res.Hits { // descending similarity
-		stored, _ := h.Fields["salient"].(string)
-		hit := Hit{Signature: h.ID, Score: h.Score, Salient: stored}
+	for _, hit := range cands { // descending similarity
 		if accept == nil || accept(hit) {
 			return hit, true, nil
 		}
 	}
 	return Hit{}, false, nil
+}
+
+// vectorCandidates runs the KNN search under the read lock and returns the top-K
+// matches as value copies (independent of the index), so MatchVector can apply
+// accept after releasing the lock. The lock spans the whole search but never the
+// accept callback.
+func (m *Matcher) vectorCandidates(ctx context.Context, vec []float32, s Scope) ([]Hit, error) {
+	// Hold the read lock for the WHOLE search. Rebuild/Close take the write lock
+	// to swap in a new index and Close the old one, so holding RLock across the
+	// search guarantees the index cannot be closed mid-read. Snapshotting idx and
+	// releasing before the search races old.Close() against an in-flight bleve KNN
+	// read and DEADLOCKS: runKnnCollector re-acquires the index's internal RLock
+	// (DocCount) while Close is already blocked on that index's write lock. The
+	// build cost stays off this lock — Rebuild constructs the new index before
+	// taking the write lock, so searches only ever gate the brief pointer swap,
+	// never index construction. Regression: TestMatcherConcurrentRebuildAndMatchVector.
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	// Closed check first, so a closed matcher reports ErrClosed consistently in
+	// every build — even a !vectors build, where the availability error below
+	// would otherwise mask it.
+	if m.closed {
+		return nil, ErrClosed
+	}
+	if !vectorSearchSupported {
+		return nil, fmt.Errorf("vector matching unavailable (built without the \"vectors\" tag)")
+	}
+	idx, dims := m.idx, m.dims
+	if idx == nil || dims == 0 {
+		return nil, fmt.Errorf("vector matching unavailable (no vector index)")
+	}
+	if len(vec) != dims {
+		return nil, fmt.Errorf("query vector dims %d != index dims %d", len(vec), dims)
+	}
+	res, err := knnSearch(ctx, idx, vec, matchK, []string{"salient"}, scopeFilter(s))
+	if err != nil {
+		return nil, err
+	}
+	cands := make([]Hit, 0, len(res.Hits))
+	for _, h := range res.Hits { // descending similarity
+		stored, _ := h.Fields["salient"].(string)
+		cands = append(cands, Hit{Signature: h.ID, Score: h.Score, Salient: stored})
+	}
+	return cands, nil
 }
 
 // MatchText returns the best BM25 match for the salient text within scope
@@ -246,14 +356,46 @@ func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accep
 // stays meaningful as the corpus (and its IDF) grows. 1.0 means the query
 // matches as well as the stored text matches itself. Up to matchK candidates
 // are considered and the highest NORMALIZED acceptable one wins (raw BM25
-// order can differ from normalized order). accept must be a fast, pure
-// content check (it runs inline per candidate).
+// order can differ from normalized order). accept must be a fast, pure content
+// check; it runs per candidate OUTSIDE the matcher lock (over normalized
+// value-copy hits), so it may safely call back into the Matcher. Those
+// candidates are a point-in-time snapshot: an accept that mutates the matcher
+// may observe or return a now-stale signature.
 func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope, accept func(Hit) bool) (Hit, bool, error) {
+	cands, err := m.textCandidates(ctx, salient, s)
+	if err != nil {
+		return Hit{}, false, err
+	}
+	var best Hit
+	var found bool
+	for _, cand := range cands {
+		if accept != nil && !accept(cand) {
+			continue
+		}
+		if !found || cand.Score > best.Score {
+			best = cand
+			found = true
+		}
+	}
+	return best, found, nil
+}
+
+// textCandidates runs the BM25 search under the read lock and returns up to
+// matchK candidates with their scores already NORMALIZED (each hit's BM25 score
+// divided by the score its own stored text achieves), so MatchText can apply
+// accept after releasing the lock. Non-normalizable candidates (a stored text
+// that isn't its own best match) are dropped here. The lock spans the search and
+// every textSelfScore follow-up query but never the accept callback — see
+// MatchVector for why snapshot-then-release around the search itself is unsafe.
+func (m *Matcher) textCandidates(ctx context.Context, salient string, s Scope) ([]Hit, error) {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return nil, ErrClosed
+	}
 	idx := m.idx
-	m.mu.RUnlock()
 	if idx == nil {
-		return Hit{}, false, fmt.Errorf("text matching unavailable (no index)")
+		return nil, fmt.Errorf("text matching unavailable (no index)")
 	}
 
 	mq := bleve.NewMatchQuery(salient)
@@ -263,20 +405,15 @@ func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope, accept
 	req.Fields = []string{"salient"}
 	res, err := idx.SearchInContext(ctx, req)
 	if err != nil {
-		return Hit{}, false, err
+		return nil, err
 	}
 
-	var best Hit
-	var found bool
+	cands := make([]Hit, 0, len(res.Hits))
 	for _, h := range res.Hits {
 		stored, _ := h.Fields["salient"].(string)
-		cand := Hit{Signature: h.ID, Score: h.Score, Salient: stored}
-		if accept != nil && !accept(cand) {
-			continue
-		}
 		self, selfID, selfOK, err := m.textSelfScore(ctx, idx, stored, s)
 		if err != nil {
-			return Hit{}, false, err
+			return nil, err
 		}
 		if !selfOK || selfID != h.ID || self <= 0 {
 			// The stored text should always be its own best match; anything
@@ -287,12 +424,9 @@ func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope, accept
 		if norm > 1 {
 			norm = 1
 		}
-		if !found || norm > best.Score {
-			best = Hit{Signature: h.ID, Score: norm, Salient: stored}
-			found = true
-		}
+		cands = append(cands, Hit{Signature: h.ID, Score: norm, Salient: stored})
 	}
-	return best, found, nil
+	return cands, nil
 }
 
 // textSelfScore runs one scoped BM25 query for a candidate's own stored text,
@@ -309,17 +443,45 @@ func (m *Matcher) textSelfScore(ctx context.Context, idx bleve.Index, text strin
 	return res.Hits[0].Score, res.Hits[0].ID, true, nil
 }
 
+// cleanupIndex closes closeIdx (when non-nil) and removes dir, joining any
+// errors so a leaked generation directory or an index that won't close is
+// surfaced, not swallowed. Returns nil when both succeed (errors.Join drops
+// nils, so errors.Join(nil, nil) == nil).
+func (m *Matcher) cleanupIndex(closeIdx func() error, dir string) error {
+	var idxErr error
+	if closeIdx != nil {
+		idxErr = closeIdx()
+	}
+	return errors.Join(idxErr, m.removeAll(dir))
+}
+
 // Close releases the underlying index and removes its cache directory.
 // Further Rebuild/Add calls fail; Match calls report unavailable.
 func (m *Matcher) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closed = true
-	if m.idx == nil {
-		return nil
+	if m.closed {
+		m.mu.Unlock()
+		return nil // idempotent: an earlier Close already tore everything down
 	}
-	err := m.idx.Close()
-	m.idx = nil
-	os.RemoveAll(m.baseDir)
-	return err
+	m.closed = true
+	m.mu.Unlock()
+
+	// Drain in-flight Rebuilds first. Setting closed under mu (above) stops new
+	// Rebuilds from starting (they bail before touching the filesystem), and any
+	// Rebuild that already passed its closed check registered in rebuildWG and
+	// will abort at its publish step. Waiting for them here guarantees no
+	// Rebuild's off-lock MkdirAll/buildIndex can recreate baseDir AFTER the final
+	// RemoveAll below, so shutdown leaves nothing behind.
+	m.rebuildWG.Wait()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var idxErr error
+	if m.idx != nil {
+		idxErr = m.idx.Close()
+		m.idx = nil
+	}
+	// Surface a failed cleanup (index that won't close, or a dir that won't
+	// remove) instead of swallowing it — a caller/test can observe the leak.
+	return errors.Join(idxErr, m.removeAll(m.baseDir))
 }

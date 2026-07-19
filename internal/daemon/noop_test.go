@@ -113,7 +113,7 @@ func TestLLMNoopPromotionRecordsWithoutSend(t *testing.T) {
 
 func TestLLMNoopDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
 	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
-	h := newHarness(t, cfg)
+	h, gate := newHarnessPaused(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true
 	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
@@ -126,10 +126,6 @@ func TestLLMNoopDeniedWhenDisableWinsFinalBarrier(t *testing.T) {
 		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "@noop",
 			Rationale: "no reply needed", ConfidentScore: 80, Status: "pending"}, nil
 	}
-	gate := &pausingAutomationStore{
-		StorePort: h.store, reached: make(chan struct{}), resume: make(chan struct{}),
-	}
-	h.daemon.opt.Store = gate
 	h.push("agent-llmnoop-disabled", "blocked")
 	select {
 	case <-gate.reached:

@@ -3,14 +3,18 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/match"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
@@ -528,4 +532,274 @@ func TestReembedNudgeSwapsEmbedderAndRetriesDegraded(t *testing.T) {
 		rows, err := raw.ListSignatureEmbeddings(ctx)
 		return err == nil && len(rows) == 1 && rows[0].Model == "fake-model" && rows[0].Dims == 4
 	})
+}
+
+// TestRemapAllowedContract pins the veto behavior of remapAllowed, the ONLY
+// accept callback the matcher runs. accept now runs OUTSIDE the matcher lock
+// (MatchVector/MatchText apply it over materialized candidates), so a reentrant
+// callback no longer deadlocks — but remapAllowed stays a pure content check by
+// construction: its signature takes no *match.Matcher, so it cannot re-enter,
+// enforced at COMPILE time, not asserted here; its only dependency is the pure
+// domain.ApprovalRemapCompatible. These cases lock in the issue-#155 option-set
+// gate (previously untested) so a future edit can't silently loosen it.
+func TestRemapAllowedContract(t *testing.T) {
+	tests := []struct {
+		name    string
+		typ     domain.SituationType
+		salient string // fresh situation's salient
+		cand    string // candidate hit's stored salient
+		want    bool
+	}{
+		{"non-approval choice always passes", domain.SituationChoice, "anything", "unrelated", true},
+		{"non-approval error always passes", domain.SituationError, "permission:x | options:a", "y", true},
+		{"approval identical options", domain.SituationApproval, "permission:edit | options:yes;no", "permission:modify | options:yes;no", true},
+		{"approval escaped-semicolon single label", domain.SituationApproval, `permission:edit | options:a\;b`, `permission:modify | options:a\;b`, true},
+		{"approval superset ≥half passes", domain.SituationApproval, "permission:edit | options:a;b", "permission:modify | options:a;b;c", true},
+		{"approval jaccard exactly 0.5 passes", domain.SituationApproval, "permission:x | options:a;b", "permission:y | options:a;b;c;d", true},
+		{"approval below half vetoed", domain.SituationApproval, "permission:x | options:a;b", "permission:y | options:a;c;d", false},
+		{"approval disjoint options vetoed", domain.SituationApproval, "permission:x | options:a;b", "permission:y | options:c;d", false},
+		{"approval both empty option segments compatible", domain.SituationApproval, "permission:edit | options:", "permission:modify | options:", true},
+		{"approval verb-only no segment vetoed", domain.SituationApproval, "permission:edit", "permission:edit", false},
+		{"approval one segment one none vetoed", domain.SituationApproval, "permission:edit | options:a", "permission:edit", false},
+		{"approval perm vs pane-tail vetoed", domain.SituationApproval, "permission:edit | options:a", "some pane tail text", false},
+		{"approval pane-tail vs perm vetoed (symmetry)", domain.SituationApproval, "some pane tail text", "permission:edit | options:a", false},
+		{"approval both pane-tail pass (similarity only)", domain.SituationApproval, "some pane tail", "other pane tail", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := domain.Situation{Type: tt.typ}
+			sig := domain.SignatureResult{Salient: tt.salient}
+			hit := match.Hit{Salient: tt.cand}
+			if got := remapAllowed(s, sig, hit); got != tt.want {
+				t.Errorf("remapAllowed(%s, %q, %q) = %v, want %v", tt.typ, tt.salient, tt.cand, got, tt.want)
+			}
+		})
+	}
+}
+
+// countIdxDirs returns how many idx-* generation directories exist under base
+// (0 if base itself is gone).
+func countIdxDirs(t *testing.T, base string) int {
+	t.Helper()
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatalf("read match index dir %s: %v", base, err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "idx-") {
+			n++
+		}
+	}
+	return n
+}
+
+// concurrentErrs collects errors raised inside stress goroutines so they can be
+// asserted on the test goroutine after the workers join — t.Fatal is illegal off
+// the test goroutine, and a bare t.Errorf can race the test finishing.
+type concurrentErrs struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (c *concurrentErrs) add(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errs = append(c.errs, err)
+}
+
+func (c *concurrentErrs) all() []error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]error(nil), c.errs...)
+}
+
+// wgCh signals once wg is fully drained, so a WaitGroup can be selected on.
+func wgCh(wg *sync.WaitGroup) <-chan struct{} {
+	ch := make(chan struct{})
+	go func() { wg.Wait(); close(ch) }()
+	return ch
+}
+
+// awaitOrDump waits on ch up to d; on timeout it runs onTimeout (best-effort
+// cleanup, e.g. signalling workers to stop so they don't hammer past the abort),
+// dumps every goroutine's stack, and fails fast — so a deadlock surfaces in
+// seconds with a diagnosis instead of hanging until the go-test binary times out.
+func awaitOrDump(t *testing.T, what string, ch <-chan struct{}, d time.Duration, onTimeout func()) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(d):
+		if onTimeout != nil {
+			onTimeout()
+		}
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		t.Fatalf("stress watchdog: %s did not finish within %s (deadlock?)\n%s", what, d, buf[:n])
+	}
+}
+
+// TestDaemonSemanticStressNoHangRaceOrLeak is an end-to-end stress test of the
+// daemon's semantic subsystem: many goroutines drive the real resolve path
+// (embed + match via resolveSignature) while several others overlap Rebuilds on
+// the same live matcher, then the matcher is shut down WHILE both searches AND
+// rebuilds are still in flight (close races active search + active rebuild — the
+// case where a racing Rebuild could recreate the index dir after cleanup).
+//
+// It asserts the storm completes (no hang/deadlock), trips no data race (run
+// under -race), the generation guard leaves no abandoned idx-* directories, and
+// shutdown removes the index directory entirely. Every blocking step runs under
+// a bounded watchdog so a regression that deadlocks fails in seconds with a
+// goroutine dump, and worker panics / unexpected rebuild errors are collected and
+// asserted rather than crashing opaquely. Integration-level guard for the
+// close-during-search, overlapping-rebuild, and cleanup fixes.
+func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
+	emb := &fakeEmbedder{vectors: map[string][]float32{
+		"permission:edit the config | options:":     {1, 0, 0, 0},
+		"permission:run the tests | options:":       {0, 1, 0, 0},
+		"permission:delete the database | options:": {0, 0, 1, 0},
+	}}
+	d := semanticHarness(t, emb, "")
+	indexDir := d.opt.MatchIndexDir
+
+	ctx := context.Background()
+	cfg, _, _ := d.snapshot()
+	verbs := []string{"edit the config", "run the tests", "delete the database"}
+
+	rowsFor := func(tag string) []domain.SignatureEmbedding {
+		return []domain.SignatureEmbedding{{
+			Signature: "approval:" + tag, SituationType: domain.SituationApproval,
+			AgentType: "claude", Salient: "permission:" + tag + " | options:",
+			Vector: []float32{1, 0, 0, 0}, Dims: 4, Model: "fake-model",
+		}}
+	}
+
+	const watchdog = 60 * time.Second
+	var errs concurrentErrs
+	var searchers, rebuilders sync.WaitGroup
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	// haltWorkers signals every worker to exit. Used on the happy path and, as a
+	// watchdog onTimeout hook, best-effort on the abort path so a deadlocked run
+	// doesn't leave searchers hammering the matcher past the failure.
+	haltWorkers := func() { stopOnce.Do(func() { close(stop) }) }
+
+	// spawn runs fn on a tracked goroutine, turning a panic into a collected
+	// error (the daemon path must never panic) so it is asserted rather than
+	// crashing the test binary opaquely.
+	spawn := func(wg *sync.WaitGroup, label string, fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errs.add(fmt.Errorf("%s panicked: %v", label, r))
+				}
+			}()
+			fn()
+		}()
+	}
+
+	// Concurrent searchers: hammer the daemon's real resolve path for the whole
+	// run (across both phases below), so search is always in flight.
+	for i := 0; i < 6; i++ {
+		spawn(&searchers, "searcher", func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				s := approvalSituation(verbs[i%len(verbs)])
+				_ = d.resolveSignature(ctx, cfg, domain.ComputeSignature(s), s)
+			}
+		})
+	}
+
+	// Phase 1 — bounded overlapping rebuilds under live search, so builds overlap
+	// and the generation guard runs. Bounded and joined so the dir count settles.
+	for r := 0; r < 3; r++ {
+		spawn(&rebuilders, "phase-1 rebuilder", func() {
+			for i := 0; i < 20; i++ {
+				if err := d.matcher.Rebuild(rowsFor(verbs[(r+i)%len(verbs)]), 4); err != nil {
+					errs.add(fmt.Errorf("phase-1 rebuild: %w", err))
+					return
+				}
+			}
+		})
+	}
+	awaitOrDump(t, "phase-1 rebuilds", wgCh(&rebuilders), watchdog, haltWorkers)
+
+	// The generation guard + per-build cleanup must leave at most one live idx-*
+	// dir — no abandoned generations accumulated during the overlap. Searchers
+	// are still running but never create idx-* dirs, so this count is stable.
+	if n := countIdxDirs(t, indexDir); n > 1 {
+		t.Errorf("abandoned index dirs accumulated: %d idx-* dirs, want <= 1", n)
+	}
+
+	// Phase 2 — Close races ACTIVE search AND ACTIVE rebuilds. Continuous
+	// rebuilders keep a build in flight when Close fires; they stop when Rebuild
+	// reports the matcher closed (expected).
+	active := make(chan struct{}) // closed once a phase-2 rebuild has run
+	var once sync.Once
+	for r := 0; r < 3; r++ {
+		spawn(&rebuilders, "phase-2 rebuilder", func() {
+			// Failsafe: always release the <-active barrier on exit so an early
+			// error fails fast (via the watchdog + collected error) rather than
+			// hanging the awaitOrDump below.
+			defer once.Do(func() { close(active) })
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := d.matcher.Rebuild(rowsFor(verbs[(r+i)%len(verbs)]), 4); err != nil {
+					if !errors.Is(err, match.ErrClosed) {
+						errs.add(fmt.Errorf("phase-2 rebuild: %w", err))
+					}
+					return
+				}
+				once.Do(func() { close(active) })
+			}
+		})
+	}
+	awaitOrDump(t, "rebuild storm to go live", active, watchdog, haltWorkers)
+
+	// Shut down WHILE both searches and rebuilds are in flight — the hard case: a
+	// racing Rebuild's off-lock MkdirAll/buildIndex could recreate baseDir, so
+	// Close must drain in-flight builds before its final RemoveAll. Run under the
+	// watchdog: a regression that deadlocks the drain fails in seconds with a dump.
+	var closeErr error
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		defer func() {
+			if r := recover(); r != nil {
+				errs.add(fmt.Errorf("Close panicked: %v", r))
+			}
+		}()
+		closeErr = d.matcher.Close()
+	}()
+	awaitOrDump(t, "Close during active search+rebuild", closeDone, watchdog, haltWorkers)
+	if closeErr != nil {
+		t.Errorf("shutdown Close during active search+rebuild: %v", closeErr)
+	}
+
+	haltWorkers()
+	awaitOrDump(t, "rebuilders to drain", wgCh(&rebuilders), watchdog, haltWorkers)
+	awaitOrDump(t, "searchers to drain", wgCh(&searchers), watchdog, haltWorkers)
+
+	for _, err := range errs.all() {
+		t.Errorf("stress goroutine error: %v", err)
+	}
+
+	// No base or idx-* directory may survive shutdown — not even one recreated by
+	// a Rebuild that raced Close.
+	if _, err := os.Stat(indexDir); !os.IsNotExist(err) {
+		t.Errorf("index dir recreated/leaked after Close raced active rebuilds: stat err = %v", err)
+	}
 }
