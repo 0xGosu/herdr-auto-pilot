@@ -11,6 +11,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/match"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
@@ -528,4 +529,48 @@ func TestReembedNudgeSwapsEmbedderAndRetriesDegraded(t *testing.T) {
 		rows, err := raw.ListSignatureEmbeddings(ctx)
 		return err == nil && len(rows) == 1 && rows[0].Model == "fake-model" && rows[0].Dims == 4
 	})
+}
+
+// TestRemapAllowedContract pins the veto behavior of remapAllowed, the ONLY
+// accept callback the matcher runs. Since the fix that makes MatchVector/
+// MatchText hold the read lock across the search, accept runs UNDER that lock,
+// so it must be a pure content check that never calls back into the Matcher (a
+// reentrant Rebuild/Close/Add/Delete would deadlock). That non-reentrancy is
+// guaranteed by the signature — remapAllowed takes no *match.Matcher, enforced
+// at COMPILE time, not asserted here — and its only dependency is the pure
+// domain.ApprovalRemapCompatible. These cases lock in the issue-#155 option-set
+// gate (previously untested) so a future edit can't silently loosen it.
+func TestRemapAllowedContract(t *testing.T) {
+	tests := []struct {
+		name    string
+		typ     domain.SituationType
+		salient string // fresh situation's salient
+		cand    string // candidate hit's stored salient
+		want    bool
+	}{
+		{"non-approval choice always passes", domain.SituationChoice, "anything", "unrelated", true},
+		{"non-approval error always passes", domain.SituationError, "permission:x | options:a", "y", true},
+		{"approval identical options", domain.SituationApproval, "permission:edit | options:yes;no", "permission:modify | options:yes;no", true},
+		{"approval escaped-semicolon single label", domain.SituationApproval, `permission:edit | options:a\;b`, `permission:modify | options:a\;b`, true},
+		{"approval superset ≥half passes", domain.SituationApproval, "permission:edit | options:a;b", "permission:modify | options:a;b;c", true},
+		{"approval jaccard exactly 0.5 passes", domain.SituationApproval, "permission:x | options:a;b", "permission:y | options:a;b;c;d", true},
+		{"approval below half vetoed", domain.SituationApproval, "permission:x | options:a;b", "permission:y | options:a;c;d", false},
+		{"approval disjoint options vetoed", domain.SituationApproval, "permission:x | options:a;b", "permission:y | options:c;d", false},
+		{"approval both empty option segments compatible", domain.SituationApproval, "permission:edit | options:", "permission:modify | options:", true},
+		{"approval verb-only no segment vetoed", domain.SituationApproval, "permission:edit", "permission:edit", false},
+		{"approval one segment one none vetoed", domain.SituationApproval, "permission:edit | options:a", "permission:edit", false},
+		{"approval perm vs pane-tail vetoed", domain.SituationApproval, "permission:edit | options:a", "some pane tail text", false},
+		{"approval pane-tail vs perm vetoed (symmetry)", domain.SituationApproval, "some pane tail text", "permission:edit | options:a", false},
+		{"approval both pane-tail pass (similarity only)", domain.SituationApproval, "some pane tail", "other pane tail", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := domain.Situation{Type: tt.typ}
+			sig := domain.SignatureResult{Salient: tt.salient}
+			hit := match.Hit{Salient: tt.cand}
+			if got := remapAllowed(s, sig, hit); got != tt.want {
+				t.Errorf("remapAllowed(%s, %q, %q) = %v, want %v", tt.typ, tt.salient, tt.cand, got, tt.want)
+			}
+		})
+	}
 }
