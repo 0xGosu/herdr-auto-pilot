@@ -101,6 +101,15 @@ func buildIndex(path string, dims int) (bleve.Index, error) {
 // dimensionality of the active embedding model (0 indexes text only; any
 // row's vector with a different length is indexed as text only).
 func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
+	if !vectorSearchSupported {
+		// No KNN engine is linked (built without the `vectors` tag), so the
+		// index must be text-only. Force dims to 0: a positive dims would make
+		// buildIndex call bleve's mapping.NewVectorFieldMapping(), which is nil
+		// in a !vectors build (mapping_no_vectors.go) and would panic on the
+		// field assignment. An embedder can still be present (dims>0) via the
+		// `cpu` tag, so this path is reachable — it degrades to BM25.
+		dims = 0
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -203,6 +212,9 @@ const matchK = 3
 // the hit score IS the cosine similarity) — thresholding is the caller's.
 // accept must be a fast, pure content check (it runs inline per candidate).
 func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accept func(Hit) bool) (Hit, bool, error) {
+	if !vectorSearchSupported {
+		return Hit{}, false, fmt.Errorf("vector matching unavailable (built without the \"vectors\" tag)")
+	}
 	m.mu.RLock()
 	idx, dims := m.idx, m.dims
 	m.mu.RUnlock()
@@ -213,11 +225,7 @@ func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accep
 		return Hit{}, false, fmt.Errorf("query vector dims %d != index dims %d", len(vec), dims)
 	}
 
-	req := bleve.NewSearchRequest(bleve.NewMatchNoneQuery())
-	req.Size = matchK
-	req.Fields = []string{"salient"}
-	req.AddKNNWithFilter("vector", vec, matchK, 1.0, scopeFilter(s))
-	res, err := idx.SearchInContext(ctx, req)
+	res, err := knnSearch(ctx, idx, vec, matchK, []string{"salient"}, scopeFilter(s))
 	if err != nil {
 		return Hit{}, false, err
 	}
