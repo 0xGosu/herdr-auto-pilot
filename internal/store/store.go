@@ -115,6 +115,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_log(agent_id);
+-- Serves LatestAuditForSignature (WHERE signature = ? ORDER BY id DESC LIMIT 1),
+-- called once per rule by the Rules-tab LAST column on every ~2s refresh.
+CREATE INDEX IF NOT EXISTS idx_audit_signature ON audit_log(signature, id DESC);
 CREATE TABLE IF NOT EXISTS agent_rate (
 	agent_id TEXT PRIMARY KEY,
 	consecutive_auto INTEGER NOT NULL DEFAULT 0,

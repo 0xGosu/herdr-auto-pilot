@@ -18,8 +18,6 @@ import (
 const (
 	// EnvWorkerModel is the gguf path the worker loads (required).
 	EnvWorkerModel = "HAP_EMBED_MODEL"
-	// EnvWorkerGPULayers is the GPU offload layer count (optional, default 0).
-	EnvWorkerGPULayers = "HAP_EMBED_GPU_LAYERS"
 	// EnvWorkerContextWindow overrides the model's context window / token cap
 	// (optional; empty or "0" → DefaultContextWindow).
 	EnvWorkerContextWindow = "HAP_EMBED_CONTEXT_WINDOW"
@@ -45,13 +43,6 @@ func workerConfigFromEnv() (config.Embedding, error) {
 		return config.Embedding{}, fmt.Errorf("%s is not set", EnvWorkerModel)
 	}
 	cfg := config.Embedding{ModelPath: model}
-	if v := os.Getenv(EnvWorkerGPULayers); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return config.Embedding{}, fmt.Errorf("invalid %s=%q: %w", EnvWorkerGPULayers, v, err)
-		}
-		cfg.GPULayers = n
-	}
 	if v := os.Getenv(EnvWorkerContextWindow); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {

@@ -15,16 +15,16 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// ConfidenceThresholds are the minimum history agreement, the
-// per-situation-type confidence thresholds (FR-009), and the higher
-// inferred-task bar for pane-history inference (FR-011).
+// ConfidenceThresholds are the minimum history agreement and the
+// per-situation-type confidence thresholds (FR-009). A task inferred from the
+// agent's own todo widget (FR-011) is trustworthy and gated only by Minimum,
+// so it has no dedicated threshold.
 type ConfidenceThresholds struct {
-	Minimum         float64 `toml:"minimum"`
-	Idle            float64 `toml:"idle"`
-	Approval        float64 `toml:"approval"`
-	Choice          float64 `toml:"choice"`
-	Error           float64 `toml:"error"`
-	InferredTaskBar float64 `toml:"inferred_task_bar"`
+	Minimum  float64 `toml:"minimum"`
+	Idle     float64 `toml:"idle"`
+	Approval float64 `toml:"approval"`
+	Choice   float64 `toml:"choice"`
+	Error    float64 `toml:"error"`
 }
 
 // Learning controls shadow-mode graduation (FR-006).
@@ -185,8 +185,6 @@ type Embedding struct {
 	// near-duplicate renders score ~0.4 while different actions score below
 	// ~0.26 or miss entirely.
 	BM25MinScore float64 `toml:"bm25_min_score"`
-	// GPULayers offloads model layers to the GPU (0 = CPU only).
-	GPULayers int `toml:"gpu_layers"`
 	// ModelContextWindow overrides the embedding model's maximum sequence
 	// length (position-embedding limit). Input is truncated to this many
 	// tokens before embedding, so it MUST NOT exceed what the model supports:
@@ -356,12 +354,11 @@ type Config struct {
 func Default() Config {
 	return Config{
 		ConfidenceThresholds: ConfidenceThresholds{
-			Minimum:         0.50,
-			Idle:            0.65,
-			Approval:        0.70,
-			Choice:          0.70,
-			Error:           0.75,
-			InferredTaskBar: 0.60,
+			Minimum:  0.50,
+			Idle:     0.65,
+			Approval: 0.70,
+			Choice:   0.70,
+			Error:    0.75,
 		},
 		// ConfirmationWeight mirrors domain.DefaultConfirmationWeight (kept a
 		// literal here so config stays decoupled from the domain package).
@@ -600,6 +597,33 @@ func Load(path string) (Config, error) {
 		slog.Warn("config key `limits.verify_unblock_ms` is no longer supported and is ignored; unblock verification always waits 1000ms",
 			"path", path, "configured_value", *verifyProbe.Limits.VerifyUnblockMs)
 	}
+	// Removed key `embedding.gpu_layers`: embedding is strictly CPU-only (GPU
+	// offload would require a GPU-enabled llama.cpp build), so the setting is
+	// ignored. Probe the raw file to warn rather than silently drop it.
+	var gpuProbe struct {
+		Embedding struct {
+			GPULayers *int `toml:"gpu_layers"`
+		} `toml:"embedding"`
+	}
+	_ = toml.Unmarshal(data, &gpuProbe)
+	if gpuProbe.Embedding.GPULayers != nil {
+		slog.Warn("config key `embedding.gpu_layers` is no longer supported and is ignored; embedding runs strictly on CPU",
+			"path", path, "configured_value", *gpuProbe.Embedding.GPULayers)
+	}
+	// Removed key `confidence_thresholds.inferred_task_bar`: a task inferred from
+	// the agent's own todo widget is trustworthy and is gated only by
+	// `confidence_thresholds.minimum`, so the dedicated bar is gone. Probe the raw
+	// file to warn rather than silently drop it; Save omits it (no struct field).
+	var inferredBarProbe struct {
+		ConfidenceThresholds struct {
+			InferredTaskBar *float64 `toml:"inferred_task_bar"`
+		} `toml:"confidence_thresholds"`
+	}
+	_ = toml.Unmarshal(data, &inferredBarProbe)
+	if inferredBarProbe.ConfidenceThresholds.InferredTaskBar != nil {
+		slog.Warn("config key `confidence_thresholds.inferred_task_bar` is no longer supported and is ignored; inferred next tasks are gated by `confidence_thresholds.minimum`",
+			"path", path, "configured_value", *inferredBarProbe.ConfidenceThresholds.InferredTaskBar)
+	}
 	// Deprecated boolean `auto_act`: migrate to the confidence threshold only
 	// when the new key was NOT explicitly set. A magic-number check on the
 	// default (999) can't tell an explicit "never" from the default — 999 is
@@ -700,9 +724,6 @@ func (c *Config) fillZeroes() {
 	if c.ConfidenceThresholds.Error <= 0 {
 		c.ConfidenceThresholds.Error = d.ConfidenceThresholds.Error
 	}
-	if c.ConfidenceThresholds.InferredTaskBar <= 0 {
-		c.ConfidenceThresholds.InferredTaskBar = d.ConfidenceThresholds.InferredTaskBar
-	}
 	if c.Learning.GraduationN <= 0 {
 		c.Learning.GraduationN = d.Learning.GraduationN
 	}
@@ -739,9 +760,6 @@ func (c *Config) fillZeroes() {
 	}
 	if c.Embedding.BM25MinScore <= 0 || c.Embedding.BM25MinScore > 1 {
 		c.Embedding.BM25MinScore = d.Embedding.BM25MinScore
-	}
-	if c.Embedding.GPULayers < 0 {
-		c.Embedding.GPULayers = 0
 	}
 }
 

@@ -1288,7 +1288,7 @@ func TestSignaturesTabRendersRows(t *testing.T) {
 	m.tab = tabSignatures
 	view := m.View()
 	// CR-032: the Rules list renders the FULL signature id, not shortSig.
-	for _, want := range []string{"SIGNATURE", "SITUATION", "TYPE", "CONF", "MODE", "CONFIRM", "TOP ACTION",
+	for _, want := range []string{"SIGNATURE", "LAST", "TYPE", "CONF", "MODE", "CONFIRM", "TOP ACTION",
 		"choice:ffff0000eeee1111", "approval:1234abcd5678efab", "autonomous", "shadow", "5/5", "3/5", "0.93"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("signatures tab missing %q:\n%s", want, view)

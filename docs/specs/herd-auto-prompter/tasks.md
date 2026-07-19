@@ -39,7 +39,7 @@ Implementation plan derived from the constitution, requirements, and solution sp
   - _Complexity: Small_
 
 - [x] 4\. TOML config loader with defaults and reload
-  - Load per-situation thresholds (incl. inferred-task bar), graduation N, error-retry ceiling, allowlist patterns + seed, classifier manifests, next-task sources, LLM argv/timeout, rate ceilings; provide safe defaults and a reload entrypoint.
+  - Load per-situation thresholds (an inferred task is gated by the minimum-agreement floor, not a dedicated bar), graduation N, error-retry ceiling, allowlist patterns + seed, classifier manifests, next-task sources, LLM argv/timeout, rate ceilings; provide safe defaults and a reload entrypoint.
   - Acceptance Criteria:
     - Missing/partial config falls back to documented defaults; a reload re-reads without restart.
     - Malformed TOML is rejected with a clear error and does not crash the process.
@@ -132,9 +132,9 @@ Implementation plan derived from the constitution, requirements, and solution sp
   - _Complexity: Medium_
 
 - [x] 14\. Situation resolver — idle / next-task (two-tier)
-  - Implement two-tier next-task resolution: operator-declared task source first (next unchecked item); else pane-history inference **only** from an explicit structured signal, held to the higher inferred-task bar; else escalate — never synthesize an arbitrary "continue".
+  - Implement two-tier next-task resolution: operator-declared task source first (next unchecked item); else pane-history inference **only** from an explicit structured signal, gated by the minimum-agreement floor (a trustworthy signal, so no dedicated bar); else escalate — never synthesize an arbitrary "continue".
   - Acceptance Criteria (unit + golden):
-    - Declared list → next item; structured todo clearing the higher bar → inferred task; free-form/ambiguous/sub-threshold → escalate.
+    - Declared list → next item; structured todo clearing the minimum floor → inferred task; free-form/ambiguous/below-minimum → escalate.
   - _Dependencies: 12_
   - _Requirements: FR-011_
   - _Complexity: Large_

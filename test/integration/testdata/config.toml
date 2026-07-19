@@ -12,7 +12,6 @@
   approval = 0.70
   choice = 0.70
   error = 0.75
-  inferred_task_bar = 0.60
 
 [learning]
   graduation_n = 5

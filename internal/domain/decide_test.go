@@ -15,7 +15,7 @@ func baseInput(st SituationType) DecideInput {
 			Content:   "Do you want to run the unit test suite now? (y/n)",
 		},
 		Signature:            SignatureResult{Signature: "sig", Verdict: GuardOK},
-		ConfidenceThresholds: ConfidenceThresholds{Minimum: 0.5, Idle: 0.65, Approval: 0.7, Choice: 0.7, Error: 0.75, InferredTaskBar: 0.6},
+		ConfidenceThresholds: ConfidenceThresholds{Minimum: 0.5, Idle: 0.65, Approval: 0.7, Choice: 0.7, Error: 0.75},
 		ConfirmationWeight:   DefaultConfirmationWeight,
 		GraduationN:          5,
 		RateLimits:           RateLimits{MaxConsecutive: 5, MaxPerMinute: 10},
@@ -540,30 +540,49 @@ func TestIdleInferredTaskUnsupportedAgentTypeSkipsTier2(t *testing.T) {
 	}
 }
 
-func TestIdleInferredTaskHigherBar(t *testing.T) {
+func TestIdleInferredTaskGatedByMinimum(t *testing.T) {
+	// A next task read from the agent's OWN structured todo widget is
+	// trustworthy: it carries no dedicated confidence bar and is gated only by
+	// confidence_thresholds.minimum (0.5 here), NOT the higher idle threshold
+	// (0.65). So a middling history that would not clear the idle threshold
+	// still acts, while a contradictory history below the minimum escalates.
 	content := "  ⎿  ✔ write parser\n     ■ add validation for config fields\n     □ wire logging"
-	// History consistent enough to clear the idle threshold but the test uses
-	// a configured 0.9 inferred bar that the mixed history does not clear.
+
+	// Recency-weighted confidence ≈ 0.55 — above minimum (0.5) but below the
+	// idle threshold (0.65). Because the inferred task drops to the minimum
+	// bar, this now ACTS instead of escalating.
 	in := autonomous(baseInput(SituationIdle),
-		ActionNextInferredTask, ActionNextInferredTask, ActionNextInferredTask,
-		ActionNextInferredTask, ActionNextInferredTask, "something-else")
-	in.ConfidenceThresholds.InferredTaskBar = 0.9
+		"something-else", "something-else",
+		ActionNextInferredTask, ActionNextInferredTask,
+		ActionNextInferredTask, ActionNextInferredTask)
 	in.Situation.Content = content
 	d := Decide(in)
-	if d.Action != ActionEscalate {
-		t.Fatalf("inferred task below the higher bar must escalate, got %+v", d)
+	if d.Action != ActionSend || d.Input != "add validation for config fields" {
+		t.Fatalf("inferred task above the minimum bar should act with the next item, got %+v", d)
 	}
 
-	// A fully consistent history clears the higher bar and acts.
+	// A fragmented, contradictory history scores below the minimum bar and must
+	// escalate — the trust in inferred tasks does not bypass the variance floor.
 	in2 := autonomous(baseInput(SituationIdle),
-		ActionNextInferredTask, ActionNextInferredTask, ActionNextInferredTask,
+		"a", "b", "c",
 		ActionNextInferredTask, ActionNextInferredTask, ActionNextInferredTask,
 		ActionNextInferredTask, ActionNextInferredTask)
-	in2.ConfidenceThresholds.InferredTaskBar = 0.9
 	in2.Situation.Content = content
 	d2 := Decide(in2)
-	if d2.Action != ActionSend || d2.Input != "add validation for config fields" {
-		t.Fatalf("structured todo above the bar should act with the next item, got %+v", d2)
+	if d2.Action != ActionEscalate {
+		t.Fatalf("inferred task below the minimum bar must escalate, got %+v", d2)
+	}
+
+	// Small history (< varianceMinDecisions) below the minimum bar: the variance
+	// guard is skipped, so this exercises the resolver's own below-floor branch.
+	// Even with an LLM configured it must ESCALATE, not consult — idle never
+	// synthesizes a prompt when uncertain (FR-011).
+	in3 := autonomous(baseInput(SituationIdle), "x", "y", "z") // 3 distinct → score ≈ 0.39
+	in3.Situation.Content = content
+	in3.LLMConfigured = true
+	d3 := Decide(in3)
+	if d3.Action != ActionEscalate || d3.Reason != ReasonBelowThreshold {
+		t.Fatalf("below-floor inferred task with a small history must escalate (not consult), got %+v", d3)
 	}
 }
 

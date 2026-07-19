@@ -33,7 +33,6 @@ const truncateIters = 8
 // Llama is the production EmbedderPort implementation.
 type Llama struct {
 	modelPath string
-	gpuLayers int
 	ctxWindow int // model position-embedding limit (n_ctx); see DefaultContextWindow
 
 	initOnce sync.Once
@@ -62,7 +61,6 @@ type Llama struct {
 func NewEngine(cfg config.Embedding) *Llama {
 	return &Llama{
 		modelPath: ResolveModelPath(cfg),
-		gpuLayers: cfg.GPULayers,
 		ctxWindow: ResolveContextWindow(cfg),
 	}
 }
@@ -73,7 +71,9 @@ func (l *Llama) init() {
 		l.initErr = fmt.Errorf("embedding model unavailable: %w", err)
 		return
 	}
-	model, err := llama.LoadModel(l.modelPath, llama.WithGPULayers(l.gpuLayers))
+	// Embedding is strictly CPU-only: GPU offload is never used (it would need a
+	// GPU-enabled llama.cpp build), so pin the layer count to 0.
+	model, err := llama.LoadModel(l.modelPath, llama.WithGPULayers(0))
 	if err != nil {
 		l.initErr = fmt.Errorf("load embedding model %s: %w", l.modelPath, err)
 		return

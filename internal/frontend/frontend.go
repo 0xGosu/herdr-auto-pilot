@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1689,8 +1690,8 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "confidence_thresholds.approval", TUIEditable: true},
 	{Key: "confidence_thresholds.choice", TUIEditable: true},
 	{Key: "confidence_thresholds.error", TUIEditable: true},
-	{Key: "confidence_thresholds.inferred_task_bar", TUIEditable: true},
 	{Key: "learning.graduation_n", TUIEditable: true},
+	{Key: "learning.confirmation_weight", TUIEditable: true},
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
@@ -1709,7 +1710,6 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "embedding.model_path"}, // path
 	{Key: "embedding.similarity_threshold", TUIEditable: true},
 	{Key: "embedding.bm25_min_score", TUIEditable: true},
-	{Key: "embedding.gpu_layers", TUIEditable: true},
 	{Key: "embedding.pane_salient_chars", TUIEditable: true},
 	{Key: "embedding.model_context_window", TUIEditable: true},
 	{Key: "tui.max_content_width", TUIEditable: true},
@@ -1753,10 +1753,16 @@ func FieldValue(cfg config.Config, key string) string {
 		return fmt.Sprintf("%.2f", cfg.ConfidenceThresholds.Choice)
 	case "confidence_thresholds.error":
 		return fmt.Sprintf("%.2f", cfg.ConfidenceThresholds.Error)
-	case "confidence_thresholds.inferred_task_bar":
-		return fmt.Sprintf("%.2f", cfg.ConfidenceThresholds.InferredTaskBar)
 	case "learning.graduation_n":
 		return strconv.Itoa(cfg.Learning.GraduationN)
+	case "learning.confirmation_weight":
+		// The loader clamps any weight < 1 (or non-finite) to the default, so
+		// match that sentinel here; %g renders the stored value faithfully
+		// (SetField accepts any weight >= 1, not just one-decimal ones).
+		if cfg.Learning.ConfirmationWeight < 1 {
+			return fmt.Sprintf("%g (default)", domain.DefaultConfirmationWeight)
+		}
+		return fmt.Sprintf("%g", cfg.Learning.ConfirmationWeight)
 	case "embedding.pane_salient_chars":
 		if cfg.Embedding.PaneSalientChars <= 0 {
 			return fmt.Sprintf("%d (default)", domain.DefaultPaneSalientChars)
@@ -1820,8 +1826,6 @@ func FieldValue(cfg config.Config, key string) string {
 		return fmt.Sprintf("%.2f", cfg.Embedding.SimilarityThreshold)
 	case "embedding.bm25_min_score":
 		return fmt.Sprintf("%.2f", cfg.Embedding.BM25MinScore)
-	case "embedding.gpu_layers":
-		return strconv.Itoa(cfg.Embedding.GPULayers)
 	case "embedding.model_context_window":
 		if cfg.Embedding.ModelContextWindow <= 0 {
 			return fmt.Sprintf("%d (default)", embedder.DefaultContextWindow)
@@ -1885,14 +1889,19 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setFloat(&cfg.ConfidenceThresholds.Choice)
 		case "confidence_thresholds.error":
 			return setFloat(&cfg.ConfidenceThresholds.Error)
-		case "confidence_thresholds.inferred_task_bar":
-			return setFloat(&cfg.ConfidenceThresholds.InferredTaskBar)
 		case "learning.graduation_n":
 			v, err := strconv.Atoi(value)
 			if err != nil || v < 1 || v > 10 {
 				return fmt.Errorf("learning.graduation_n must be an integer between 1 and 10, got %q", value)
 			}
 			cfg.Learning.GraduationN = v
+			return nil
+		case "learning.confirmation_weight":
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil || v < 1 || math.IsNaN(v) || math.IsInf(v, 0) {
+				return fmt.Errorf("learning.confirmation_weight must be a number >= 1 (1 disables the boost), got %q", value)
+			}
+			cfg.Learning.ConfirmationWeight = v
 			return nil
 		case "embedding.pane_salient_chars":
 			return setInt(&cfg.Embedding.PaneSalientChars)
@@ -1980,13 +1989,6 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("embedding.bm25_min_score must be in (0,1], got %q", value)
 			}
 			cfg.Embedding.BM25MinScore = v
-			return nil
-		case "embedding.gpu_layers":
-			v, err := strconv.Atoi(value)
-			if err != nil || v < 0 {
-				return fmt.Errorf("embedding.gpu_layers must be a non-negative integer, got %q", value)
-			}
-			cfg.Embedding.GPULayers = v
 			return nil
 		case "embedding.model_context_window":
 			// 0 restores the built-in default (embedder.DefaultContextWindow);
@@ -2169,12 +2171,10 @@ func (a *App) SetThreshold(ctx context.Context, situation string, value float64)
 			cfg.ConfidenceThresholds.Choice = value
 		case "error":
 			cfg.ConfidenceThresholds.Error = value
-		case "inferred_task_bar":
-			cfg.ConfidenceThresholds.InferredTaskBar = value
 		case "minimum":
 			cfg.ConfidenceThresholds.Minimum = value
 		default:
-			return fmt.Errorf("unknown confidence threshold %q (minimum|idle|approval|choice|error|inferred_task_bar)", situation)
+			return fmt.Errorf("unknown confidence threshold %q (minimum|idle|approval|choice|error)", situation)
 		}
 		return nil
 	})
@@ -2928,11 +2928,20 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 		if err != nil {
 			return nil, err
 		}
-		rows = append(rows, SignatureRow{
+		row := SignatureRow{
 			SignatureState: st, Confidence: conf.Score,
 			TopAction: conf.TopAction, Decisions: conf.Decisions,
 			TotalDecisions: total,
-		})
+		}
+		// LastAudit is the rule's most recent audit entry (auto-act or
+		// escalation); it powers the Rules tab LAST column, showing when the rule
+		// was last used (nil until it has been used at least once).
+		audit, err := a.Store.LatestAuditForSignature(ctx, st.Signature)
+		if err != nil {
+			return nil, err
+		}
+		row.LastAudit = audit
+		rows = append(rows, row)
 	}
 	return rows, nil
 }

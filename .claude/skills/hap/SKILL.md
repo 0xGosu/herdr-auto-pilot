@@ -301,7 +301,6 @@ hap config set llm.pane_excerpt_chars 8000
 hap config set safety.disable_never_auto_seed_patterns true
 hap config set embedding.disabled true
 hap config set embedding.similarity_threshold 0.85
-hap config set embedding.gpu_layers 4
 hap config set embedding.model_context_window 512
 hap config set embedding.pane_salient_chars 1000
 hap config set tui.max_content_width 120
@@ -321,7 +320,6 @@ hap config set-threshold idle 0.70
 hap config set-threshold approval 0.85
 hap config set-threshold choice 0.90
 hap config set-threshold error 0.80
-hap config set-threshold inferred_task_bar 0.95
 ```
 
 edits made through `hap config set` / `set-threshold` apply live — the command saves and nudges the running daemon to reload. a hand-edited `config.toml` is NOT auto-detected (there is no file watcher); it takes effect only when another CLI/TUI command triggers a reload or the daemon restarts.
@@ -335,7 +333,6 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `confidence_thresholds.approval` | 0.70 | confidence threshold for approval requests |
 | `confidence_thresholds.choice` | 0.70 | confidence threshold for choices |
 | `confidence_thresholds.error` | 0.75 | confidence threshold for error situations |
-| `confidence_thresholds.inferred_task_bar` | 0.60 | higher bar for tasks inferred from pane history |
 | `learning.graduation_n` | 2 | consecutive confirmations needed to graduate (1-10) |
 | `learning.confirmation_weight` | 3.0 | vote-weight multiplier for an operator confirmation in the confidence ratio (1 disables the boost) |
 | `limits.max_consecutive_auto_prompts` | 10 | max consecutive auto-prompts per agent without human interaction |
@@ -356,11 +353,10 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `embedding.model_path` | (bundled all-minilm-l6-v2-q8_0.gguf) | path to a .gguf embedding model |
 | `embedding.similarity_threshold` | 0.90 | min cosine similarity to reuse a learned signature |
 | `embedding.bm25_min_score` | 0.35 | min normalized BM25 similarity for text fallback |
-| `embedding.gpu_layers` | 0 | model layers offloaded to GPU (inert in official builds) |
 | `embedding.model_context_window` | 0 (built-in default: 512 for MiniLM) | max tokens fed to the embedder before truncation; MUST NOT exceed what the model supports (over 512 hard-aborts a BERT/MiniLM native lib). raise only when `model_path` points at a larger-window model; values below 256 clamp up |
 | `embedding.pane_salient_chars` | 800 | fallback signature window for idle/unclassified situations (trailing N chars) |
 | `tui.max_content_width` | 0 (full width) | cap variable-width list columns; 0 = full width |
-| `tui.theme` | default | TUI color theme: default, dark, light, high-contrast |
+| `tui.theme` | default | TUI color theme: default, dark, light, high-contrast (in the TUI Config tab, `e` on this row opens a ↑/↓ picker of the available themes) |
 | `tui.terminal_bell` | true | ring the terminal bell (\a) on new escalations and on pauses caused by a different process |
 
 TUI palette colors (`tui.palette.*`) are config.toml-only — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. values are 256-color codes (`"205"`) or hex (`"#ff5faf"`).

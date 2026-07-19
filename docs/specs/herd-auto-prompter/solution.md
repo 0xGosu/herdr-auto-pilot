@@ -173,7 +173,7 @@ sequenceDiagram
 **Responsibilities.** Compute recency-weighted agreement ratio (FR-005), enforce per-situation thresholds (FR-009) and graduation N (FR-006), apply per-situation resolution (FR-011–FR-014), decide `act | escalate | consult-LLM`.
 **Key Components.**
 - Confidence calculator (with operator-confirmation boost, FR-005); permanent-graduation state machine + operator reset (FR-006/FR-007).
-- **Idle resolver (FR-011)** — two-tier next-task resolution: (1) operator-declared task source (next unchecked item); (2) fallback pane-history inference **only** from an explicit structured signal (agent-emitted todo/checklist/numbered plan), held to the **higher inferred-task bar** than declared-source tasks; free-form prose is not inferable; if neither yields a sufficiently-confident next task → escalate.
+- **Idle resolver (FR-011)** — two-tier next-task resolution: (1) operator-declared task source (next unchecked item); (2) fallback pane-history inference **only** from an explicit structured signal (agent-emitted todo/checklist/numbered plan) — a trustworthy signal, so gated only by the **minimum-agreement floor**, not the higher idle threshold; free-form prose is not inferable; if neither yields a sufficiently-confident next task → escalate.
 - **Approval / choice resolvers (FR-012/FR-013)** — learned yes/no or learned option match; unfamiliar option set → escalate.
 - **Error resolver (FR-014)** — learned retry/skip/escalate bounded by the per-error-signature retry ceiling (default 2), read from the daemon-owned `error_retries` counter; on exhaustion → force escalate.
 **Key Interfaces.** `Decide(signature, history, thresholds, retryCount) -> Decision`.
@@ -336,7 +336,7 @@ erDiagram
 - **LLM_DECISIONS** — **staged LLM submission** written by the `mcp` process via `submit_decision`. The daemon consumes it, re-gates it (confidence + never-auto patterns), and on acceptance promotes it into `DECISIONS` (`source=LLM`) and `AUDIT_LOG` (`llm_output` = captured stdout); `status` tracks `pending`/`accepted`/`rejected`/`expired`.
 - **OPERATOR** — the single operator actor; present in the model to anchor `CORRECTIONS` and `KILL_EVENTS` authorship for audit.
 
-TOML config (not in SQLite): per-situation thresholds + inferred-task bar, graduation N, error-retry ceiling, never-auto patterns + seed, classifier manifests, next-task source references, LLM argv template + timeout, rate ceilings.
+TOML config (not in SQLite): per-situation thresholds (an inferred task is gated by the minimum-agreement floor, no dedicated bar), graduation N, error-retry ceiling, never-auto patterns + seed, classifier manifests, next-task source references, LLM argv template + timeout, rate ceilings.
 
 ## Concurrency & Durability Model
 

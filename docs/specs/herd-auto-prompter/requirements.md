@@ -91,9 +91,9 @@ When no confident learned rule applies, the plugin SHALL optionally consult a co
 On an idle/finished situation, the plugin SHALL prompt the agent toward its next task using next-task context resolved in the following priority order:
 1. **Operator-declared task source** — a task list / backlog / plan file the operator points the plugin at, per agent or workspace; the plugin prompts the next unchecked item.
 2. **Agent pane-history inference (fallback)** — when no declared source is configured, the plugin MAY infer the next task from the agent's own recent transcript **only when the transcript contains an explicit, structured signal** — a todo/checklist or numbered plan the agent itself emitted with an unambiguous "next" item. Free-form prose that merely discusses possible work does NOT qualify as an inferable next task.
-Pane-history-inferred next tasks are subject to the confidence gate and SHALL be held to a **higher confidence bar than operator-declared-source tasks**, because inference is riskier than reading a declared list.
+Because a next task read from the agent's OWN explicit structured todo widget is a trustworthy signal, pane-history-inferred next tasks SHALL NOT be held to a dedicated bar; they are subject only to the variance-guard **minimum-agreement** floor, not the (higher) per-situation idle threshold.
 If neither a declared task source nor a qualifying, sufficiently-confident inferable next task is available, the plugin SHALL **escalate** and SHALL NOT synthesize an arbitrary "continue" prompt.
-*Acceptance:* With a declared task list, the agent receives the next unchecked item; with no declared source but an explicit structured todo/checklist in pane history clearing the higher inferred-task bar, the inferred next task is used; with only free-form prose, ambiguous history, or sub-threshold confidence, the situation escalates and no arbitrary prompt is sent.
+*Acceptance:* With a declared task list, the agent receives the next unchecked item; with no declared source but an explicit structured todo/checklist in pane history clearing the minimum-agreement floor, the inferred next task is used; with only free-form prose, ambiguous history, or below-minimum confidence, the situation escalates and no arbitrary prompt is sent.
 
 **FR-012 — Approval / permission behavior.**
 On an approval/permission situation, the plugin SHALL select the learned yes/no response when confident and not blocked by the never-auto allowlist.
@@ -207,7 +207,7 @@ The plugin SHALL persist decision records: situation signature, situation type, 
 The plugin SHALL persist an append-only audit trail of every automated decision and escalation with the fields listed in FR-020, supporting review and post-hoc correction (FR-021).
 
 **DR-003 — Rules & configuration.**
-The plugin SHALL persist operator-editable configuration: per-situation confidence thresholds (including the higher inferred-task bar of FR-011), graduation N, never-auto allowlist patterns, per-agent/workspace next-task source references, LLM CLI configuration and timeout, rate/consecutive ceilings, and pause/kill state — in operator-inspectable/hand-editable form.
+The plugin SHALL persist operator-editable configuration: per-situation confidence thresholds (a task inferred per FR-011 is gated by the minimum-agreement floor, not a dedicated bar), graduation N, never-auto allowlist patterns, per-agent/workspace next-task source references, LLM CLI configuration and timeout, rate/consecutive ceilings, and pause/kill state — in operator-inspectable/hand-editable form.
 
 **DR-004 — Data locality & retention.**
 All persisted data SHALL remain on the operator's machine. The plugin SHOULD allow the operator to clear/reset learned history and audit data. No pane content leaves the machine except, when explicitly configured, to the local LLM CLI.
