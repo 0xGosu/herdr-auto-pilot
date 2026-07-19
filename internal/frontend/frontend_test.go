@@ -1399,6 +1399,61 @@ func TestConfirmGeneratedTaskBootstrapRespectsMaxTasks(t *testing.T) {
 	}
 }
 
+func TestConfirmGeneratedTaskBootstrapOverCapNoGrowthNotRefused(t *testing.T) {
+	// An already-over-cap bootstrap file (a pre-fix write or a hand edit) with
+	// NON-canonical numbering re-confirmed with only already-present tasks adds
+	// nothing, so it must NOT be refused — the cap gate keys on genuinely-new
+	// tasks, not on a text/numbering match. Regression: keying the exemption on
+	// sameChecklistTexts stranded the escalation of a reordered over-cap file.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	path := filepath.Join(stateDir, "tasks", name+".md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// One MORE than the cap, numbered in REVERSE so the file's rendered text
+	// differs from RenderGeneratedTaskList's canonical 1..N — this makes
+	// sameChecklistTexts return false and exercises the cap gate directly.
+	n := config.DefaultMaxTasks + 1
+	var b strings.Builder
+	b.WriteString("# Tasks for " + name + "\n\n")
+	for i := 1; i <= n; i++ {
+		fmt.Fprintf(&b, "- [ ] %d. task %d\n", n+1-i, i)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The suggestion is an item ALREADY present (identity "task 1"), so the
+	// merge adds no new task. send=false keeps the assertion on the refusal
+	// gate, not on delivery.
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "task 1", CreatedAt: time.Now(),
+	})
+
+	if err := app.Confirm(ctx, id, false); err != nil {
+		t.Fatalf("a no-growth re-confirm of an over-cap file must not be refused, got %v", err)
+	}
+	// The list neither grew nor shrank — still n items, just renumbered.
+	body, _ := os.ReadFile(path)
+	if got := len(domain.ParseChecklist(string(body))); got != n {
+		t.Errorf("over-cap file must be preserved at %d items, got %d: %q", n, got, body)
+	}
+	// The escalation resolved (not stranded).
+	audit, _ := st.GetAudit(ctx, id)
+	if audit.Status == "escalated" {
+		t.Errorf("a no-growth confirm must resolve the escalation, got %q", audit.Status)
+	}
+}
+
 // sendHookHerdr wraps fakeHerdr to observe on-disk state at the exact moment
 // Send runs — the only way to assert reserve-BEFORE-send ordering, since the
 // final file state after a rollback is identical to never having reserved.

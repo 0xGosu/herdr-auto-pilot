@@ -1117,12 +1117,17 @@ func ensureGeneratedTaskFile(path, name string, tasks []string, limit int) ([]st
 		// freshly rendered "[ ]" line.
 		content = carryOverChecklistMarks(existing, content)
 	}
-	// Enforce the cap on the growing list: existing count + genuinely-new count.
-	// uniqueExisting collapses any duplicate identities so the reported "new"
-	// matches what mergeGeneratedTasks actually appended.
-	if limit > 0 && len(merged) > limit {
-		uniqueExisting := len(mergeGeneratedTasks(existing, nil))
-		return nil, taskCapExceededError(path, uniqueExisting, len(merged)-uniqueExisting, limit)
+	// Enforce the cap only when this confirm actually ADDS a task. uniqueExisting
+	// collapses the file's identities the same way merged does, so `adding` is
+	// the genuinely-new count that mergeGeneratedTasks appended — keying on it
+	// (not on sameChecklistTexts, which also trips on a mere reorder/renumber of
+	// the same items) means a no-growth re-confirm of an already-over-cap file
+	// is never refused, so a pre-fix or hand-edited over-cap file keeps its
+	// escalation retryable instead of being stranded.
+	uniqueExisting := len(mergeGeneratedTasks(existing, nil))
+	adding := len(merged) - uniqueExisting
+	if limit > 0 && adding > 0 && len(merged) > limit {
+		return nil, taskCapExceededError(path, uniqueExisting, adding, limit)
 	}
 	if err := writeFileAtomic(path, []byte(content), 0o600); err != nil {
 		return nil, err
