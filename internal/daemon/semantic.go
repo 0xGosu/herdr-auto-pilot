@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -51,8 +52,14 @@ func (d *Daemon) initSemantic(ctx context.Context, gen int64) {
 		return // superseded by a newer reload; let its run own the index
 	}
 	if err := d.matcher.Rebuild(res.Rows, res.Dims); err != nil {
-		slog.Warn("semantic index rebuild failed; matching stays exact-hash", "error", err)
-		return
+		if !errors.Is(err, match.ErrCleanup) {
+			slog.Warn("semantic index rebuild failed; matching stays exact-hash", "error", err)
+			return
+		}
+		// The new index published; only reclaiming the previous generation's
+		// directory failed (a leak, not a rebuild failure) — surface it but keep
+		// semantic matching enabled.
+		slog.Warn("semantic index rebuilt; previous-generation cleanup failed", "error", err)
 	}
 	if d.semanticGen.Load() != gen {
 		return // a newer reload raced past; it decides readiness

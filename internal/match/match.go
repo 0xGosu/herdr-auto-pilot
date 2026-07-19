@@ -34,6 +34,14 @@ import (
 // fall-back — but the reason is now identifiable.
 var ErrClosed = errors.New("matcher closed")
 
+// ErrCleanup wraps a Rebuild error that occurred AFTER a new index was
+// successfully published: the rebuild itself succeeded, only removing the
+// previous generation's directory (or closing its index) failed, leaking it.
+// Callers can errors.Is(err, match.ErrCleanup) to keep using the now-live index
+// while surfacing the leak, versus a plain Rebuild error (the rebuild failed and
+// nothing was published).
+var ErrCleanup = errors.New("match index cleanup failed")
+
 // Scope restricts a lookup to one (situation type, agent type) pair, the
 // same partitioning ComputeSignature bakes into hash keys: a rule learned
 // for Claude approvals must never match a Codex choice.
@@ -69,6 +77,11 @@ type Matcher struct {
 	// cleanup. Add is done under mu, gated by !closed, so it never races Wait.
 	rebuildWG sync.WaitGroup
 
+	// removeAll deletes an index directory tree (os.RemoveAll in production). A
+	// test may swap it to inject a filesystem cleanup failure; set it before any
+	// concurrent use so the read stays race-free.
+	removeAll func(dir string) error
+
 	// publishBarrier, when non-nil, is invoked with a Rebuild's reserved
 	// generation right before it acquires the publish lock. Test-only seam (nil
 	// in production) for deterministically interleaving overlapping Rebuilds to
@@ -81,7 +94,7 @@ type Matcher struct {
 // index is disposable, SQLite is the source of truth). Call Rebuild next.
 func New(baseDir string) *Matcher {
 	os.RemoveAll(baseDir)
-	return &Matcher{baseDir: baseDir}
+	return &Matcher{baseDir: baseDir, removeAll: os.RemoveAll}
 }
 
 type doc struct {
@@ -163,22 +176,19 @@ func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 	}
 	idx, err := buildIndex(dir, dims)
 	if err != nil {
-		os.RemoveAll(dir) // don't leave a half-built index directory behind
-		return fmt.Errorf("build match index: %w", err)
+		// Don't leave a half-built index directory behind; surface a cleanup
+		// failure alongside the build error.
+		return errors.Join(fmt.Errorf("build match index: %w", err), m.cleanupIndex(nil, dir))
 	}
 	batch := idx.NewBatch()
 	for _, r := range rows {
 		if err := batch.Index(r.Signature, toDoc(r, dims)); err != nil {
-			idx.Close()
-			os.RemoveAll(dir)
-			return fmt.Errorf("index signature %s: %w", r.Signature, err)
+			return errors.Join(fmt.Errorf("index signature %s: %w", r.Signature, err), m.cleanupIndex(idx.Close, dir))
 		}
 	}
 	if batch.Size() > 0 {
 		if err := idx.Batch(batch); err != nil {
-			idx.Close()
-			os.RemoveAll(dir)
-			return fmt.Errorf("populate match index: %w", err)
+			return errors.Join(fmt.Errorf("populate match index: %w", err), m.cleanupIndex(idx.Close, dir))
 		}
 	}
 
@@ -196,19 +206,22 @@ func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 	stale := m.gen != gen
 	if closed || stale {
 		m.mu.Unlock()
-		idx.Close()
-		os.RemoveAll(dir)
+		cleanupErr := m.cleanupIndex(idx.Close, dir)
 		if closed {
-			return ErrClosed
+			return errors.Join(ErrClosed, cleanupErr)
 		}
-		return nil // superseded by a newer Rebuild, which owns the index
+		return cleanupErr // superseded by a newer Rebuild; nil unless cleanup failed
 	}
 	old, oldDir := m.idx, m.idxDir
 	m.idx, m.idxDir, m.dims = idx, dir, dims
 	m.mu.Unlock()
 	if old != nil {
-		old.Close()
-		os.RemoveAll(oldDir)
+		if cleanupErr := m.cleanupIndex(old.Close, oldDir); cleanupErr != nil {
+			// The new index is live and published; only reclaiming the previous
+			// generation failed. Wrap ErrCleanup so callers can keep using the
+			// live index while still seeing the leak.
+			return errors.Join(ErrCleanup, cleanupErr)
+		}
 	}
 	return nil
 }
@@ -430,6 +443,18 @@ func (m *Matcher) textSelfScore(ctx context.Context, idx bleve.Index, text strin
 	return res.Hits[0].Score, res.Hits[0].ID, true, nil
 }
 
+// cleanupIndex closes closeIdx (when non-nil) and removes dir, joining any
+// errors so a leaked generation directory or an index that won't close is
+// surfaced, not swallowed. Returns nil when both succeed (errors.Join drops
+// nils, so errors.Join(nil, nil) == nil).
+func (m *Matcher) cleanupIndex(closeIdx func() error, dir string) error {
+	var idxErr error
+	if closeIdx != nil {
+		idxErr = closeIdx()
+	}
+	return errors.Join(idxErr, m.removeAll(dir))
+}
+
 // Close releases the underlying index and removes its cache directory.
 // Further Rebuild/Add calls fail; Match calls report unavailable.
 func (m *Matcher) Close() error {
@@ -451,11 +476,12 @@ func (m *Matcher) Close() error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var err error
+	var idxErr error
 	if m.idx != nil {
-		err = m.idx.Close()
+		idxErr = m.idx.Close()
 		m.idx = nil
 	}
-	os.RemoveAll(m.baseDir)
-	return err
+	// Surface a failed cleanup (index that won't close, or a dir that won't
+	// remove) instead of swallowing it — a caller/test can observe the leak.
+	return errors.Join(idxErr, m.removeAll(m.baseDir))
 }

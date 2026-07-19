@@ -548,3 +548,80 @@ func TestMatchAcceptReentrantConcurrentRebuildClose(t *testing.T) {
 	close(stop)
 	searchers.Wait()
 }
+
+// TestCleanupIndexCombinesErrors covers the combined index-close + filesystem
+// failure: cleanupIndex must join BOTH a failing index Close and a failing
+// removeAll, and report neither when both succeed.
+func TestCleanupIndexCombinesErrors(t *testing.T) {
+	m := New(t.TempDir())
+	defer func() { m.removeAll = os.RemoveAll; m.Close() }()
+
+	errClose := errors.New("index close boom")
+	errRemove := errors.New("remove boom")
+	m.removeAll = func(string) error { return errRemove }
+
+	// Both fail → both surfaced.
+	err := m.cleanupIndex(func() error { return errClose }, "somedir")
+	if !errors.Is(err, errClose) || !errors.Is(err, errRemove) {
+		t.Errorf("combined cleanup error = %v, want both the close and remove errors", err)
+	}
+	// nil closer + failing remove → just the remove error.
+	if err := m.cleanupIndex(nil, "somedir"); !errors.Is(err, errRemove) {
+		t.Errorf("cleanup with nil closer = %v, want the remove error", err)
+	}
+	// Both succeed → nil (errors.Join drops nils).
+	m.removeAll = func(string) error { return nil }
+	if err := m.cleanupIndex(func() error { return nil }, "somedir"); err != nil {
+		t.Errorf("clean cleanup = %v, want nil", err)
+	}
+}
+
+// TestCloseSurfacesRemoveAllError: Close propagates a filesystem cleanup failure
+// (the index closes fine, but removing the cache dir fails).
+func TestCloseSurfacesRemoveAllError(t *testing.T) {
+	m := New(t.TempDir())
+	if err := m.Rebuild([]domain.SignatureEmbedding{
+		row("approval:x", domain.SituationApproval, "claude", "permission: edit", nil),
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	errRemove := errors.New("remove boom")
+	m.removeAll = func(string) error { return errRemove }
+	if err := m.Close(); !errors.Is(err, errRemove) {
+		t.Errorf("Close = %v, want the injected remove error", err)
+	}
+}
+
+// TestRebuildSurfacesCleanupErrorAsErrCleanup: when a Rebuild publishes a new
+// index but fails to reclaim the previous generation's directory, it reports
+// errors.Is(ErrCleanup) (so a caller keeps the live index) AND the underlying
+// filesystem error — while the new index stays live.
+func TestRebuildSurfacesCleanupErrorAsErrCleanup(t *testing.T) {
+	m := New(t.TempDir())
+	defer func() { m.removeAll = os.RemoveAll; m.Close() }()
+	scope := Scope{domain.SituationApproval, "claude"}
+
+	if err := m.Rebuild([]domain.SignatureEmbedding{
+		row("approval:x", domain.SituationApproval, "claude", "permission: edit", nil),
+	}, 0); err != nil {
+		t.Fatal(err) // first Rebuild: no previous generation, no cleanup
+	}
+
+	// Fail the OLD generation's cleanup on the next publish.
+	errRemove := errors.New("remove boom")
+	m.removeAll = func(string) error { return errRemove }
+
+	err := m.Rebuild([]domain.SignatureEmbedding{
+		row("approval:y", domain.SituationApproval, "claude", "permission: run the tests", nil),
+	}, 0)
+	if !errors.Is(err, ErrCleanup) || !errors.Is(err, errRemove) {
+		t.Errorf("Rebuild with failing old-cleanup = %v, want errors.Is(ErrCleanup) and the remove error", err)
+	}
+
+	// Despite the cleanup failure, the NEW index published and is live.
+	m.removeAll = os.RemoveAll // restore so the lookup/Close below behave
+	hit, ok, err := m.MatchText(context.Background(), "permission: run the tests", scope, nil)
+	if err != nil || !ok || hit.Signature != "approval:y" {
+		t.Errorf("new index not live after cleanup-failed rebuild: hit=%+v ok=%v err=%v", hit, ok, err)
+	}
+}
