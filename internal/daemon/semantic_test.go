@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -572,5 +573,115 @@ func TestRemapAllowedContract(t *testing.T) {
 				t.Errorf("remapAllowed(%s, %q, %q) = %v, want %v", tt.typ, tt.salient, tt.cand, got, tt.want)
 			}
 		})
+	}
+}
+
+// countIdxDirs returns how many idx-* generation directories exist under base
+// (0 if base itself is gone).
+func countIdxDirs(t *testing.T, base string) int {
+	t.Helper()
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatalf("read match index dir %s: %v", base, err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "idx-") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestDaemonSemanticStressNoHangRaceOrLeak is an end-to-end stress test of the
+// daemon's semantic subsystem: many goroutines drive the real resolve path
+// (embed + match via resolveSignature) while several others overlap Rebuilds on
+// the same live matcher, then the matcher is shut down WHILE searches are still
+// in flight (close-during-search). It asserts the whole
+// storm completes (no hang/deadlock), trips no data race (run under -race), the
+// generation guard leaves no abandoned idx-* directories, and shutdown removes
+// the index directory entirely. This is the integration-level guard for the
+// close-during-search, overlapping-rebuild, and cleanup fixes.
+func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
+	emb := &fakeEmbedder{vectors: map[string][]float32{
+		"permission:edit the config | options:":     {1, 0, 0, 0},
+		"permission:run the tests | options:":       {0, 1, 0, 0},
+		"permission:delete the database | options:": {0, 0, 1, 0},
+	}}
+	d := semanticHarness(t, emb, "")
+	indexDir := d.opt.MatchIndexDir
+
+	ctx := context.Background()
+	cfg, _, _ := d.snapshot()
+	verbs := []string{"edit the config", "run the tests", "delete the database"}
+
+	rowsFor := func(tag string) []domain.SignatureEmbedding {
+		return []domain.SignatureEmbedding{{
+			Signature: "approval:" + tag, SituationType: domain.SituationApproval,
+			AgentType: "claude", Salient: "permission:" + tag + " | options:",
+			Vector: []float32{1, 0, 0, 0}, Dims: 4, Model: "fake-model",
+		}}
+	}
+
+	var searchers, rebuilders sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Concurrent searchers: hammer the daemon's real resolve path until stop.
+	for i := 0; i < 6; i++ {
+		searchers.Add(1)
+		go func(i int) {
+			defer searchers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				s := approvalSituation(verbs[i%len(verbs)])
+				_ = d.resolveSignature(ctx, cfg, domain.ComputeSignature(s), s)
+			}
+		}(i)
+	}
+
+	// Overlapping rebuilders: several goroutines rebuild the same live matcher
+	// concurrently, so builds overlap and the generation guard runs under live
+	// search. Bounded work so the storm terminates deterministically.
+	for r := 0; r < 3; r++ {
+		rebuilders.Add(1)
+		go func(r int) {
+			defer rebuilders.Done()
+			for i := 0; i < 20; i++ {
+				if err := d.matcher.Rebuild(rowsFor(verbs[(r+i)%len(verbs)]), 4); err != nil {
+					t.Errorf("rebuild: %v", err)
+					return
+				}
+			}
+		}(r)
+	}
+
+	rebuilders.Wait() // the rebuild storm finishes; searchers keep hammering
+
+	// The generation guard + per-build cleanup must leave at most one live idx-*
+	// dir — no abandoned generations accumulated during the overlap. Searchers
+	// are still running but never create idx-* dirs, so this count is stable.
+	if n := countIdxDirs(t, indexDir); n > 1 {
+		t.Errorf("abandoned index dirs accumulated: %d idx-* dirs, want <= 1", n)
+	}
+
+	// Shutdown WHILE searches are still in flight (the real close-during-search
+	// case): Close must wait for in-flight lookups rather than closing the index
+	// under them — no deadlock, panic, or race — and must remove the whole index
+	// directory. The searchers then degrade onto the post-close error path.
+	if err := d.matcher.Close(); err != nil {
+		t.Fatalf("shutdown Close during in-flight search: %v", err)
+	}
+	close(stop)
+	searchers.Wait()
+
+	if _, err := os.Stat(indexDir); !os.IsNotExist(err) {
+		t.Errorf("match index dir leaked after Close: stat err = %v", err)
 	}
 }
