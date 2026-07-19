@@ -599,8 +599,10 @@ func countIdxDirs(t *testing.T, base string) int {
 // TestDaemonSemanticStressNoHangRaceOrLeak is an end-to-end stress test of the
 // daemon's semantic subsystem: many goroutines drive the real resolve path
 // (embed + match via resolveSignature) while several others overlap Rebuilds on
-// the same live matcher, then the matcher is shut down WHILE searches are still
-// in flight (close-during-search). It asserts the whole
+// the same live matcher, then the matcher is shut down WHILE both searches AND
+// rebuilds are still in flight (close races active search + active rebuild —
+// the case where a racing Rebuild could recreate the index dir after cleanup).
+// It asserts the whole
 // storm completes (no hang/deadlock), trips no data race (run under -race), the
 // generation guard leaves no abandoned idx-* directories, and shutdown removes
 // the index directory entirely. This is the integration-level guard for the
@@ -629,7 +631,8 @@ func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
 	var searchers, rebuilders sync.WaitGroup
 	stop := make(chan struct{})
 
-	// Concurrent searchers: hammer the daemon's real resolve path until stop.
+	// Concurrent searchers: hammer the daemon's real resolve path for the whole
+	// run (across both phases below), so search is always in flight.
 	for i := 0; i < 6; i++ {
 		searchers.Add(1)
 		go func(i int) {
@@ -646,9 +649,9 @@ func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
 		}(i)
 	}
 
-	// Overlapping rebuilders: several goroutines rebuild the same live matcher
-	// concurrently, so builds overlap and the generation guard runs under live
-	// search. Bounded work so the storm terminates deterministically.
+	// Phase 1 — bounded overlapping rebuilds: several goroutines rebuild the same
+	// live matcher concurrently under live search, so builds overlap and the
+	// generation guard runs. Bounded and joined so the dir count is quiescent.
 	for r := 0; r < 3; r++ {
 		rebuilders.Add(1)
 		go func(r int) {
@@ -661,8 +664,7 @@ func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
 			}
 		}(r)
 	}
-
-	rebuilders.Wait() // the rebuild storm finishes; searchers keep hammering
+	rebuilders.Wait()
 
 	// The generation guard + per-build cleanup must leave at most one live idx-*
 	// dir — no abandoned generations accumulated during the overlap. Searchers
@@ -671,17 +673,52 @@ func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
 		t.Errorf("abandoned index dirs accumulated: %d idx-* dirs, want <= 1", n)
 	}
 
-	// Shutdown WHILE searches are still in flight (the real close-during-search
-	// case): Close must wait for in-flight lookups rather than closing the index
-	// under them — no deadlock, panic, or race — and must remove the whole index
-	// directory. The searchers then degrade onto the post-close error path.
+	// Phase 2 — Close races ACTIVE search AND ACTIVE rebuilds. Continuous
+	// rebuilders keep a build in flight when Close fires; they stop when Rebuild
+	// reports the matcher closed (expected).
+	active := make(chan struct{}) // closed once a phase-2 rebuild has run
+	var once sync.Once
+	for r := 0; r < 3; r++ {
+		rebuilders.Add(1)
+		go func(r int) {
+			defer rebuilders.Done()
+			// Failsafe: always release the <-active barrier when this goroutine
+			// exits, so an early (unexpected) error fails fast via t.Errorf rather
+			// than hanging the waiter until the go-test timeout.
+			defer once.Do(func() { close(active) })
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := d.matcher.Rebuild(rowsFor(verbs[(r+i)%len(verbs)]), 4); err != nil {
+					if !strings.Contains(err.Error(), "matcher closed") {
+						t.Errorf("unexpected rebuild error: %v", err)
+					}
+					return
+				}
+				once.Do(func() { close(active) })
+			}
+		}(r)
+	}
+	<-active // the search + rebuild storm is live
+
+	// Shut the matcher down WHILE both searches and rebuilds are in flight — the
+	// hard case: a Rebuild that raced past its closed check does its
+	// MkdirAll/buildIndex off the lock and could recreate baseDir. Close must
+	// drain those in-flight builds before its final RemoveAll so nothing is left
+	// behind, and it must not deadlock, panic, or race.
 	if err := d.matcher.Close(); err != nil {
-		t.Fatalf("shutdown Close during in-flight search: %v", err)
+		t.Errorf("shutdown Close during active search+rebuild: %v", err)
 	}
 	close(stop)
+	rebuilders.Wait()
 	searchers.Wait()
 
+	// No base or idx-* directory may survive shutdown — not even one recreated by
+	// a Rebuild that raced Close.
 	if _, err := os.Stat(indexDir); !os.IsNotExist(err) {
-		t.Errorf("match index dir leaked after Close: stat err = %v", err)
+		t.Errorf("index dir recreated/leaked after Close raced active rebuilds: stat err = %v", err)
 	}
 }

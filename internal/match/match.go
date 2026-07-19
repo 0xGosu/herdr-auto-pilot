@@ -53,6 +53,12 @@ type Matcher struct {
 	gen    int    // generation counter naming index subdirectories
 	closed bool   // Rebuild refuses after Close (late background init)
 
+	// rebuildWG tracks Rebuilds that passed the closed check and may still be
+	// touching the filesystem off-lock (MkdirAll/buildIndex). Close waits on it
+	// before its final RemoveAll so no in-flight Rebuild recreates baseDir after
+	// cleanup. Add is done under mu, gated by !closed, so it never races Wait.
+	rebuildWG sync.WaitGroup
+
 	// publishBarrier, when non-nil, is invoked with a Rebuild's reserved
 	// generation right before it acquires the publish lock. Test-only seam (nil
 	// in production) for deterministically interleaving overlapping Rebuilds to
@@ -134,7 +140,13 @@ func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 	m.gen++
 	gen := m.gen // this build's generation; a newer Rebuild bumps m.gen past it
 	dir := filepath.Join(m.baseDir, fmt.Sprintf("idx-%d", gen))
+	// Register as in-flight while still holding mu and having observed !closed,
+	// so Close (which sets closed under mu before Wait) never races this Add. The
+	// off-lock MkdirAll/buildIndex below may recreate baseDir; Close waits for
+	// our Done before its final RemoveAll.
+	m.rebuildWG.Add(1)
 	m.mu.Unlock()
+	defer m.rebuildWG.Done()
 
 	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
 		return fmt.Errorf("create match index dir: %w", err)
@@ -363,13 +375,28 @@ func (m *Matcher) textSelfScore(ctx context.Context, idx bleve.Index, text strin
 // Further Rebuild/Add calls fail; Match calls report unavailable.
 func (m *Matcher) Close() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closed = true
-	if m.idx == nil {
-		return nil
+	if m.closed {
+		m.mu.Unlock()
+		return nil // idempotent: an earlier Close already tore everything down
 	}
-	err := m.idx.Close()
-	m.idx = nil
+	m.closed = true
+	m.mu.Unlock()
+
+	// Drain in-flight Rebuilds first. Setting closed under mu (above) stops new
+	// Rebuilds from starting (they bail before touching the filesystem), and any
+	// Rebuild that already passed its closed check registered in rebuildWG and
+	// will abort at its publish step. Waiting for them here guarantees no
+	// Rebuild's off-lock MkdirAll/buildIndex can recreate baseDir AFTER the final
+	// RemoveAll below, so shutdown leaves nothing behind.
+	m.rebuildWG.Wait()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var err error
+	if m.idx != nil {
+		err = m.idx.Close()
+		m.idx = nil
+	}
 	os.RemoveAll(m.baseDir)
 	return err
 }
