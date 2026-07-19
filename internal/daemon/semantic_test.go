@@ -759,7 +759,7 @@ func TestDaemonSemanticStressNoHangRaceOrLeak(t *testing.T) {
 				default:
 				}
 				if err := d.matcher.Rebuild(rowsFor(verbs[(r+i)%len(verbs)]), 4); err != nil {
-					if !strings.Contains(err.Error(), "matcher closed") {
+					if !errors.Is(err, match.ErrClosed) {
 						errs.add(fmt.Errorf("phase-2 rebuild: %w", err))
 					}
 					return

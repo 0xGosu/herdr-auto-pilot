@@ -4,6 +4,7 @@ package match
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -281,11 +282,11 @@ func TestAddAndDelete(t *testing.T) {
 	}
 }
 
-// TestMatcherClosePostCloseBehaviorVector is the vectors-build companion to
-// TestMatcherClosePostCloseBehavior: after Close the KNN path degrades to an
-// error (never a use-after-close panic on the FAISS-backed reader), and the
-// text path is unavailable too.
-func TestMatcherClosePostCloseBehaviorVector(t *testing.T) {
+// TestMatcherClosedReturnsErrClosedVector is the vectors-build companion to
+// TestMatcherClosedReturnsErrClosed: after Close the KNN path returns the
+// ErrClosed sentinel (never a use-after-close panic on the FAISS-backed reader),
+// and the text path reports it too.
+func TestMatcherClosedReturnsErrClosedVector(t *testing.T) {
 	m := New(t.TempDir())
 	scope := Scope{domain.SituationApproval, "claude"}
 	if err := m.Rebuild([]domain.SignatureEmbedding{
@@ -302,11 +303,11 @@ func TestMatcherClosePostCloseBehaviorVector(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if _, ok, err := m.MatchVector(context.Background(), q, scope, nil); err == nil || ok {
-		t.Errorf("MatchVector after Close: ok=%v err=%v, want no hit and an error", ok, err)
+	if _, ok, err := m.MatchVector(context.Background(), q, scope, nil); ok || !errors.Is(err, ErrClosed) {
+		t.Errorf("MatchVector after Close: ok=%v err=%v, want no hit and errors.Is ErrClosed", ok, err)
 	}
-	if _, ok, err := m.MatchText(context.Background(), "permission: edit", scope, nil); err == nil || ok {
-		t.Errorf("MatchText after Close: ok=%v err=%v, want no hit and an error", ok, err)
+	if _, ok, err := m.MatchText(context.Background(), "permission: edit", scope, nil); ok || !errors.Is(err, ErrClosed) {
+		t.Errorf("MatchText after Close: ok=%v err=%v, want no hit and errors.Is ErrClosed", ok, err)
 	}
 	if err := m.Close(); err != nil {
 		t.Errorf("second Close must be idempotent nil, got %v", err)

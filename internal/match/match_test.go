@@ -2,6 +2,7 @@ package match
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -160,11 +161,13 @@ func TestMatcherConcurrentRebuildAndMatch(t *testing.T) {
 	}
 }
 
-// TestMatcherClosePostCloseBehavior pins the fail-safe contract after Close:
-// every method degrades cleanly (an error or a no-op) and none panics, so a
-// daemon shutdown racing a late lookup can't crash. Runs in both build configs
-// via the text path.
-func TestMatcherClosePostCloseBehavior(t *testing.T) {
+// TestMatcherClosedReturnsErrClosed pins the standardized post-Close contract:
+// every method — the mutations Rebuild/Add/Delete and the lookup MatchText —
+// reports the ErrClosed sentinel (matchable with errors.Is), none panics, and
+// Close stays idempotent. This is the table-driven lifecycle guard; runs in both
+// build configs via the tag-independent methods. MatchVector's sentinel is
+// covered under the vectors tag in TestMatcherClosedReturnsErrClosedVector.
+func TestMatcherClosedReturnsErrClosed(t *testing.T) {
 	m := New(t.TempDir())
 	scope := Scope{domain.SituationApproval, "claude"}
 	if err := m.Rebuild([]domain.SignatureEmbedding{
@@ -181,21 +184,50 @@ func TestMatcherClosePostCloseBehavior(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Post-close every method degrades cleanly, never panics.
-	if _, ok, err := m.MatchText(context.Background(), "permission: edit the config", scope, nil); err == nil || ok {
-		t.Errorf("MatchText after Close: ok=%v err=%v, want no hit and an error", ok, err)
+	ops := []struct {
+		name string
+		call func() error
+	}{
+		{"Rebuild", func() error { return m.Rebuild(nil, 0) }},
+		{"Add", func() error {
+			return m.Add(row("approval:new", domain.SituationApproval, "claude", "permission: run", nil))
+		}},
+		{"Delete", func() error { return m.Delete("approval:edit") }},
+		{"MatchText", func() error {
+			_, _, err := m.MatchText(context.Background(), "permission: edit the config", scope, nil)
+			return err
+		}},
 	}
-	if err := m.Add(row("approval:new", domain.SituationApproval, "claude", "permission: run", nil)); err == nil {
-		t.Error("Add after Close must error")
+	for _, op := range ops {
+		t.Run(op.name, func(t *testing.T) {
+			if err := op.call(); !errors.Is(err, ErrClosed) {
+				t.Errorf("%s after Close = %v, want errors.Is(err, ErrClosed)", op.name, err)
+			}
+		})
 	}
-	if err := m.Delete("approval:edit"); err != nil {
-		t.Errorf("Delete after Close should be a no-op nil, got %v", err)
-	}
-	if err := m.Rebuild(nil, 0); err == nil {
-		t.Error("Rebuild after Close must error (matcher closed)")
-	}
+
+	// Close stays idempotent.
 	if err := m.Close(); err != nil {
 		t.Errorf("second Close must be idempotent nil, got %v", err)
+	}
+}
+
+// TestMatcherNotBuiltBehavior pins the lifecycle state BEFORE Rebuild: a
+// never-built matcher is not "closed", so its methods report the not-yet-built
+// error (Add / lookups) or a no-op (Delete) — distinct from ErrClosed.
+func TestMatcherNotBuiltBehavior(t *testing.T) {
+	m := New(t.TempDir())
+	defer m.Close()
+	scope := Scope{domain.SituationApproval, "claude"}
+
+	if err := m.Add(row("approval:x", domain.SituationApproval, "claude", "permission: edit", nil)); err == nil || errors.Is(err, ErrClosed) {
+		t.Errorf("Add before build = %v, want a non-nil error that is NOT ErrClosed", err)
+	}
+	if err := m.Delete("approval:x"); err != nil {
+		t.Errorf("Delete before build = %v, want nil no-op", err)
+	}
+	if _, ok, err := m.MatchText(context.Background(), "permission: edit", scope, nil); ok || err == nil || errors.Is(err, ErrClosed) {
+		t.Errorf("MatchText before build: ok=%v err=%v, want no hit and a non-ErrClosed error", ok, err)
 	}
 }
 

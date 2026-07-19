@@ -10,6 +10,7 @@ package match
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,15 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
+
+// ErrClosed is the sentinel a Matcher's methods return once Close has run:
+// Rebuild, Add, and Delete (mutations) and MatchText/MatchVector (lookups) report
+// it, so callers can branch with errors.Is(err, match.ErrClosed) instead of
+// matching strings. (In a build without the "vectors" tag, MatchVector reports
+// its unavailable-build-tag error ahead of ErrClosed, since KNN is never linked
+// there.) Lookups still degrade the same way — the daemon treats a match error as
+// a fall-back — but the reason is now identifiable.
+var ErrClosed = errors.New("matcher closed")
 
 // Scope restricts a lookup to one (situation type, agent type) pair, the
 // same partitioning ComputeSignature bakes into hash keys: a rule learned
@@ -135,7 +145,7 @@ func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return fmt.Errorf("matcher closed")
+		return ErrClosed
 	}
 	m.gen++
 	gen := m.gen // this build's generation; a newer Rebuild bumps m.gen past it
@@ -189,7 +199,7 @@ func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 		idx.Close()
 		os.RemoveAll(dir)
 		if closed {
-			return fmt.Errorf("matcher closed")
+			return ErrClosed
 		}
 		return nil // superseded by a newer Rebuild, which owns the index
 	}
@@ -203,20 +213,28 @@ func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 	return nil
 }
 
-// Add indexes one signature (idempotent: re-adding replaces the doc).
+// Add indexes one signature (idempotent: re-adding replaces the doc). Returns
+// ErrClosed after Close, distinct from the not-yet-built error.
 func (m *Matcher) Add(r domain.SignatureEmbedding) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.closed {
+		return ErrClosed
+	}
 	if m.idx == nil {
 		return fmt.Errorf("match index not built yet")
 	}
 	return m.idx.Index(r.Signature, toDoc(r, m.dims))
 }
 
-// Delete removes one signature from the index.
+// Delete removes one signature from the index. Returns ErrClosed after Close; a
+// not-yet-built index (never a closed one) is a no-op.
 func (m *Matcher) Delete(signature string) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.closed {
+		return ErrClosed
+	}
 	if m.idx == nil {
 		return nil
 	}
@@ -274,6 +292,9 @@ func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accep
 	// never index construction. Regression: TestMatcherConcurrentRebuildAndMatchVector.
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.closed {
+		return Hit{}, false, ErrClosed
+	}
 	idx, dims := m.idx, m.dims
 	if idx == nil || dims == 0 {
 		return Hit{}, false, fmt.Errorf("vector matching unavailable (no vector index)")
@@ -313,6 +334,9 @@ func (m *Matcher) MatchText(ctx context.Context, salient string, s Scope, accept
 	// snapshot-then-release is unsafe.
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.closed {
+		return Hit{}, false, ErrClosed
+	}
 	idx := m.idx
 	if idx == nil {
 		return Hit{}, false, fmt.Errorf("text matching unavailable (no index)")
