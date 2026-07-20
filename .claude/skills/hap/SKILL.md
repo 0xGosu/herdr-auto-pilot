@@ -456,6 +456,32 @@ this removes the `[[task_sources]]` entry only — the checklist file is left on
 disk. it is unguarded and unconfirmed: it removes the entry even while a live
 agent is mid-task on it, which makes it the force path.
 
+### auto-send tasks to idle agents
+
+by default a task only goes out when herdr reports the agent parked, and each
+idle episode is driven once — an agent that finishes and sits there just waits.
+set `enable_auto_send_task_when_idle = true` on a `[[task_sources]]` entry
+(config.toml only) and the daemon also polls every minute, handing its next
+pending `[ ]` item to any matching agent idle for more than a minute:
+
+```toml
+[[task_sources]]
+agent = "backend-dev"
+path = "/home/me/project/docs/tasks.md"
+enable_auto_send_task_when_idle = true
+```
+
+- one task, one agent: agents matched by the same source get *different*
+  pending items, and the delivered item is marked `[-]` as it is sent (a failed
+  send returns it to `[ ]`). reserving belongs to the source, so ordinary
+  event-driven sends from it are marked `[-]` too — the agent's own
+  `hap task <name> start <n>` then just becomes a no-op.
+- delivery runs the normal pipeline — kill switch, never-auto patterns, rate
+  limits, per-agent disable and `enable_llm_review` all still apply; the audit
+  row's trigger reads `auto-idle-send`.
+- an agent that is disabled, rate-paused, blocked, or has an open escalation is
+  skipped.
+
 
 ### manage the task items (CRUD)
 

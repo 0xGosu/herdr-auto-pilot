@@ -10,8 +10,6 @@ package frontend
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,6 +28,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/mcqdeliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/reembed"
+	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
 )
 
 // menuReadLines is how much of a pane the confirm/resolve path re-reads to
@@ -2353,89 +2352,33 @@ func (a *App) taskFilePath(agent, path string) (string, error) {
 	return resolveTaskFilePath(cfg, agent)
 }
 
-// writeFileAtomic writes data to path via a temp file in the same directory
-// then renames it into place, so a concurrent reader (the daemon) sees either
-// the old or the new file, never a partial write.
+// The locked read-modify-write over a checklist file lives in
+// internal/taskfile: the daemon's auto-send mutates the same files from
+// another process, so the lock, the atomic write, and the reserve/release
+// claim rules must have exactly one implementation. These aliases keep the
+// call sites below reading as they always have.
+func lockFile(path string) (func(), error) { return taskfile.Lock(path) }
+
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".hap-task-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // best-effort cleanup; a no-op after a successful rename
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return taskfile.WriteFileAtomic(path, data, perm)
 }
 
-// taskLockPath returns a stable, hap-owned lock-file path for a task file,
-// keyed by the file's canonical path. Keeping the lock in a shared temp dir —
-// rather than a `<file>.lock` sidecar — serializes concurrent mutations
-// without dropping a stray lock file into the user's repo next to a --path
-// checklist.
-//
-// The path is canonicalized (absolute + symlinks resolved, best-effort) so
-// every caller — the CLI, the TUI's add/edit, and the TUI's bulk toggle/delete
-// (which passes an already symlink-resolved path) — hashes to the SAME key for
-// one physical file. Without this, a symlinked path component (e.g. macOS
-// /var vs /private/var) would yield two different locks and stop serializing
-// concurrent mutations of the same checklist.
-func taskLockPath(path string) string {
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
-	}
-	sum := sha256.Sum256([]byte(path))
-	return filepath.Join(os.TempDir(), "hap-task-locks", hex.EncodeToString(sum[:16])+".lock")
+func taskLockPath(path string) string { return taskfile.LockPath(path) }
+
+func mutateTaskFile(path string, fn func(string) (string, error)) ([]domain.ChecklistItem, error) {
+	return taskfile.Mutate(path, fn)
 }
 
-// mutateTaskFile reads path, applies fn to its content, writes the result
-// atomically, and returns the re-parsed item list so callers can echo the
-// freshly renumbered checklist. The whole read-modify-rename is serialized
-// under a per-path advisory lock so two concurrent `hap task` mutations (e.g.
-// add racing done) can't both derive from the same content and have the last
-// rename silently drop the other — the atomic rename alone only guards a
-// reader against a partial write, not two writers against each other.
-func mutateTaskFile(path string, fn func(content string) (string, error)) ([]domain.ChecklistItem, error) {
-	lockPath := taskLockPath(path)
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
-		return nil, err
-	}
-	unlock, err := lockFile(lockPath)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
+func reserveTask(index int, taskText string) func(string) (string, error) {
+	return taskfile.Reserve(index, taskText)
+}
 
-	// Preserve the checklist's existing permission bits: a user's 0644 --path
-	// file must not be narrowed to 0600 on every edit.
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	out, err := fn(string(data))
-	if err != nil {
-		return nil, err
-	}
-	if err := writeFileAtomic(path, []byte(out), info.Mode().Perm()); err != nil {
-		return nil, err
-	}
-	return domain.ParseChecklist(out), nil
+func releaseTask(index int, taskText string) func(string) (string, error) {
+	return taskfile.Release(index, taskText)
+}
+
+func expectTaskText(content string, index int, want string) error {
+	return taskfile.ExpectText(content, index, want)
 }
 
 // TaskSourcePathFor resolves the checklist file behind an agent's task
@@ -2498,27 +2441,6 @@ func (a *App) requireIdleAgent(ctx context.Context, paneID, agentName string) er
 	return fmt.Errorf("agent %s is no longer live — refresh and retry", agentName)
 }
 
-// reserveTask claims item index for delivery: it verifies the item still
-// carries exactly taskText AND is still pending, then marks it [-], as ONE
-// locked read-modify-write. Checking and claiming must be atomic — a
-// concurrent edit slipping between them is what would let the same task be
-// delivered twice.
-func reserveTask(index int, taskText string) func(string) (string, error) {
-	return func(content string) (string, error) {
-		if err := expectTaskText(content, index, taskText); err != nil {
-			return "", err
-		}
-		for _, it := range domain.ParseChecklist(content) {
-			if it.Index == index && it.Done {
-				// Done covers [x] and [-] alike: either way it is not a
-				// pending task waiting to be handed out.
-				return "", fmt.Errorf("task #%d is no longer pending — refresh and retry", index)
-			}
-		}
-		return domain.MarkChecklistItemInProgress(content, index)
-	}
-}
-
 // SendTaskToAgent delivers one specific pending checklist item to a live
 // agent's pane, rendered through the task source's next-task template — the
 // operator-initiated twin of the daemon's idle-time declared-task send.
@@ -2569,26 +2491,6 @@ func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName,
 		return err
 	}
 	return nil
-}
-
-// releaseTask undoes a reservation after a failed delivery, returning the item
-// to [ ]. It is claim-scoped: it only resets an item that still carries this
-// reservation's text AND is still [-]. Resetting on text alone would let a
-// rollback silently re-open work somebody else completed in the meantime —
-// and re-arm it for the daemon. Anything else is left [-], which merely parks
-// the task rather than risking a second delivery.
-func releaseTask(index int, taskText string) func(string) (string, error) {
-	return func(content string) (string, error) {
-		if err := expectTaskText(content, index, taskText); err != nil {
-			return "", err
-		}
-		for _, it := range domain.ParseChecklist(content) {
-			if it.Index == index && it.Mark != domain.MarkInProgress {
-				return "", fmt.Errorf("task #%d is now [%s], not the [-] this send reserved", index, it.Mark)
-			}
-		}
-		return domain.SetChecklistItemDone(content, index, false)
-	}
 }
 
 // paneCwd resolves the pane's working directory for {cwd}, preferring the
@@ -2788,25 +2690,6 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 		return out, e
 	})
 	return items, newIndex, err
-}
-
-// expectTaskText guards a checklist mutation against a file that changed
-// while the operator had a prompt or confirmation open: inside the same
-// locked read-modify-write, it verifies task #index still carries exactly
-// the text the caller resolved the number against. Task numbers are
-// positional and renumber on every delete, so without this a stale index
-// would silently mutate a different line.
-func expectTaskText(content string, index int, want string) error {
-	for _, it := range domain.ParseChecklist(content) {
-		if it.Index != index {
-			continue
-		}
-		if it.Text != want {
-			return fmt.Errorf("task #%d is now %q, not %q — the checklist changed; refresh and retry", index, it.Text, want)
-		}
-		return nil
-	}
-	return fmt.Errorf("task #%d no longer exists — the checklist changed; refresh and retry", index)
 }
 
 // guardedMutation wraps a checklist mutation with the optional expected-text

@@ -41,6 +41,12 @@ type AgentTransition struct {
 	// follows the normal attention pipeline but is identified in the audit
 	// trigger for operator-visible provenance.
 	ManualCapture bool
+	// AutoIdleSend marks a transition the daemon injected because the agent
+	// has been idle past the auto-send threshold and its task source opted
+	// into enable_auto_send_task_when_idle. Like ManualCapture it is transient
+	// (Herdr events never set it) and exists so the audit trail names why the
+	// task went out.
+	AutoIdleSend bool
 }
 
 // WorkspaceInfo is display metadata for one Herdr workspace.
@@ -71,13 +77,18 @@ type PaneInfo struct {
 
 // Situation is a classified, attention-requiring state of one agent pane.
 type Situation struct {
-	Type              SituationType
-	AgentID           string
-	AgentType         string
-	PaneID            string
-	TabID             string
-	WorkspaceID       string
-	Status            string   // herdr-reported agent_status (e.g. idle|working|blocked|done|detected); empty when unknown
+	Type        SituationType
+	AgentID     string
+	AgentType   string
+	PaneID      string
+	TabID       string
+	WorkspaceID string
+	Status      string // herdr-reported agent_status (e.g. idle|working|blocked|done|detected); empty when unknown
+	// TerminalID is herdr's terminal identity for PaneID at capture time.
+	// Pane ids are reused, so this is what tells a delivery that the terminal
+	// it captured has since been replaced by a different agent. Empty when the
+	// transition did not carry one (event-socket transitions, older herdr).
+	TerminalID        string
 	Content           string   // pane snapshot used for classification
 	Options           []string // normalized option set (choice situations)
 	PermissionVerb    string   // salient permission verb/action (approval situations)
@@ -451,6 +462,12 @@ type LLMRequest struct {
 	// changed since review (checked off / edited). Transient.
 	SourcePath   string
 	ReviewedTask string
+	// ReserveTask pins, at consult time, whether the source requires the
+	// delivered item to be marked "[-]" as it is sent
+	// (enable_auto_send_task_when_idle). Pinning it here rather than
+	// re-reading the config after the review means a reload mid-consult can
+	// never downgrade a reserving source to an unreserved send. Transient.
+	ReserveTask bool
 	// ActionReview marks this consult as a pre-delivery review of a learned
 	// free-text action (llm.enable_rewrite_action): the LLM adapts the text to
 	// the live pane, affirms it with ActionSendProposedAction, or vetoes it

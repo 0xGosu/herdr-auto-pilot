@@ -1236,3 +1236,33 @@ func TestTaskMissingTargetOrOp(t *testing.T) {
 		t.Error("task with a target but no op must error")
 	}
 }
+
+func TestTaskSourceListShowsAutoSendFlag(t *testing.T) {
+	// The one source setting that makes hap hand out tasks unprompted must be
+	// visible in `task-source list`; the key itself is config.toml-only, so
+	// this listing is the operator's only confirmation that it took effect.
+	app, _ := testApp(t)
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{
+		{Agent: "quiet-fox", Path: "/tmp/quiet.md"},
+		{Agent: "busy-otter", Path: "/tmp/busy.md", EnableAutoSendTaskWhenIdle: true},
+	}
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "task-source", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 listed sources, got %d:\n%s", len(lines), out)
+	}
+	if strings.Contains(lines[0], "auto_send_when_idle") {
+		t.Errorf("a source without the flag must not advertise it: %s", lines[0])
+	}
+	if !strings.Contains(lines[1], "auto_send_when_idle=true") {
+		t.Errorf("a source with the flag must show it: %s", lines[1])
+	}
+}

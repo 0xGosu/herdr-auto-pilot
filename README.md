@@ -465,7 +465,34 @@ next_task_template = "Your next task is {next_task_content}. Read the full tasks
 # the LLM before it is sent (see "Reviewing tasks before they are sent" below).
 # Default: on. Opt this source out with:
 # enable_llm_review = false
+# Also hand out tasks on a timer, not only on a herdr attention event (see
+# "Keeping idle agents working" below). Default: off.
+# enable_auto_send_task_when_idle = true
 ```
+
+#### Keeping idle agents working
+
+A declared task normally reaches an agent when herdr reports it parked, and
+each idle episode is driven exactly once — so an agent that finishes its work
+and sits there without a further event waits for you.
+
+Set `enable_auto_send_task_when_idle = true` on a source and the daemon also
+polls once a minute: any agent that source matches which has been idle for
+more than a minute is handed its next pending `[ ]` item. Delivery goes
+through the normal pipeline, so the kill switch, never-auto patterns, rate
+limits, per-agent disable and `enable_llm_review` all still apply, and every
+send is audited (trigger `auto-idle-send`).
+
+Two rules keep unattended hand-out safe:
+
+- **One task, one agent.** Agents matched by the same source in one poll are
+  paired with *different* pending items, and the delivered item is marked
+  `[-]` in the file as it is sent — so neither another agent nor the next poll
+  can pick it up. A failed send returns it to `[ ]`. Reserving is a property of
+  the *source*, so ordinary event-driven sends from it are marked `[-]` too;
+  the agent's own `hap task <name> start <n>` then simply becomes a no-op.
+- **Nothing jumps the queue.** An agent that is disabled, rate-paused,
+  blocked, or has an escalation still waiting on you is skipped.
 
 The former `[thresholds]` table is accepted for compatibility. Loading it
 preserves its values, and the next config save rewrites it as

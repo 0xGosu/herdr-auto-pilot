@@ -937,6 +937,12 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 			if src.NextTaskTemplate != "" {
 				fmt.Fprintf(out, " template=%q", src.NextTaskTemplate)
 			}
+			// Only shown when on: it is the one source setting that makes hap
+			// hand out tasks unprompted, so it must be visible here — the key
+			// itself is config.toml-only.
+			if src.EnableAutoSendTaskWhenIdle {
+				fmt.Fprint(out, " auto_send_when_idle=true")
+			}
 			fmt.Fprintln(out)
 		}
 		return nil

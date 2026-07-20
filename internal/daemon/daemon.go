@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/match"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
 	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
 
@@ -62,6 +64,11 @@ type Options struct {
 	Clock    ports.Clock
 	// ReadTaskFile reads a declared task-source file (os.ReadFile in prod).
 	ReadTaskFile func(path string) ([]byte, error)
+	// MutateTaskFile applies one locked read-modify-write to a declared
+	// task-source file (taskfile.Mutate in prod). The daemon only writes a task
+	// file on the auto-send-when-idle path, where the delivered item must be
+	// reserved "[-]" so it is never handed to a second agent.
+	MutateTaskFile func(path string, fn func(content string) (string, error)) error
 	// PaneReadLines is how much recent pane content classification sees.
 	PaneReadLines int
 }
@@ -121,8 +128,9 @@ type Daemon struct {
 	// reconnect (pane-topology change), which would re-fire the kickoff
 	// prompt mid-session for long-running agents. A genuinely new agent
 	// almost always arrives in a new pane (new key → first=true naturally);
-	// the rare pane-id reuse forgoes re-priming rather than re-prime on every
-	// reconnect. Guarded by mu.
+	// the rare pane-id REUSE is caught by resetRecycledPaneState, which acts on
+	// herdr's terminal_id — a signal that means "different agent" and, unlike
+	// "detected", never fires on a mere reconnect. Guarded by mu.
 	firstConsult map[string]bool
 	// firstTaskGen marks agents whose first idle task generation has fired, so
 	// the first one can use task_generate_command_start. Same keying/semantics
@@ -151,6 +159,22 @@ type Daemon struct {
 	// sweepInFlight dedupes the one live multi-tab form sweep per agent
 	// (guarded by mu); outcomes return through sweepResults.
 	sweepInFlight map[string]bool
+
+	// idleSince tracks how long each agent has been continuously parked at a
+	// non-busy status, for the auto-send-when-idle poll. Refreshed from the
+	// sweep's agent listing: an agent that is still parked on the SAME pane
+	// keeps its original timestamp, anything else (busy again, new pane, gone)
+	// drops the entry. Deliberately in-memory only — after a daemon restart the
+	// clock restarts, which delays an auto-send rather than firing one early.
+	// Guarded by mu.
+	idleSince map[string]idleMark
+
+	// autoTaskClaim pairs an agent with the specific pending task the idle poll
+	// picked for it, so two agents driven in the SAME sweep can never race for
+	// the same "[ ]" item — the file itself is not touched until delivery.
+	// Cleared when the agent's episode resolves, when it stops being idle, or
+	// after autoTaskClaimTTL. Guarded by mu.
+	autoTaskClaim map[string]taskClaim
 
 	// snapshotSaved caches which signatures already have a provenance
 	// snapshot this daemon lifetime (guarded by mu), so the hot path skips
@@ -187,6 +211,28 @@ type Daemon struct {
 	bg             sync.WaitGroup
 	shutdownCtx    context.Context
 	cancelShutdown context.CancelFunc
+}
+
+// idleMark is one agent's parked-since timestamp, pinned to the terminal it
+// was observed on. Herdr REUSES pane ids and reports the recreated terminal
+// behind one via a new terminal_id — the same signal SyncAgentTerminalID
+// treats as a lifecycle reset. Both are compared, so a fresh agent landing on
+// a recycled pane starts its own idle clock instead of inheriting the previous
+// occupant's age and being handed work before a full minute of idle.
+// terminalID is empty on older herdr and on event-socket transitions, where
+// the pane id alone remains the best available identity.
+type idleMark struct {
+	paneID     string
+	terminalID string
+	at         time.Time
+}
+
+// taskClaim is the pending task the idle poll assigned to one agent, plus the
+// source it came from and when the claim was made (for the TTL sweep).
+type taskClaim struct {
+	sourcePath string
+	taskText   string
+	at         time.Time
 }
 
 // paneCwdEntry is one cached pane working directory with its capture time.
@@ -270,6 +316,14 @@ func New(opt Options) (*Daemon, error) {
 	if opt.ReadTaskFile == nil {
 		opt.ReadTaskFile = os.ReadFile
 	}
+	if opt.MutateTaskFile == nil {
+		opt.MutateTaskFile = func(path string, fn func(string) (string, error)) error {
+			// Bounded: this runs on the main select loop, so waiting behind
+			// another hap process's file lock must never stall every agent.
+			_, err := taskfile.MutateWithin(path, taskLockWait, fn)
+			return err
+		}
+	}
 	if opt.PaneReadLines <= 0 {
 		opt.PaneReadLines = 50
 	}
@@ -292,6 +346,8 @@ func New(opt Options) (*Daemon, error) {
 		lastAutoNoop:         map[string]time.Time{},
 		actionReviewInFlight: map[string]actionReviewFlight{},
 		sweepInFlight:        map[string]bool{},
+		idleSince:            map[string]idleMark{},
+		autoTaskClaim:        map[string]taskClaim{},
 		snapshotSaved:        map[string]bool{},
 		paneCwds:             map[string]paneCwdEntry{},
 		paneCwdRefreshing:    map[string]bool{},
@@ -600,7 +656,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)
-				d.reconcileAttention(ctx)
+				// One agent listing feeds both passes: the reconcile
+				// re-drives parked episodes, then the idle poll hands a
+				// pending task to agents that have been idle too long.
+				agents, err := d.opt.Herdr.ListAgents(ctx)
+				if err != nil {
+					slog.Error("sweep: listing agents failed", "error", err)
+					return nil
+				}
+				d.reconcileAttentionWith(ctx, agents)
+				d.autoSendIdleTasks(ctx, agents)
 				return nil
 			})
 		case tr := <-d.transitions:
@@ -739,8 +804,14 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		d.cancelActionReviewExcept(ctx, tr.AgentID, "")
 		// Genuine progress ends the pane's parked episode: re-arm the
 		// subscribe-time reconcile so a fresh block/idle/done is surfaced (#49).
+		// The agent is working again, so it is no longer idle and no longer
+		// holds an auto-send claim (whether or not the claimed task is what set
+		// it working — a claim only reserves the daemon's INTENT, never the
+		// file, so dropping it strands nothing).
 		d.mu.Lock()
 		delete(d.episodeHandled, tr.PaneID)
+		delete(d.idleSince, tr.AgentID)
+		delete(d.autoTaskClaim, tr.AgentID)
 		d.mu.Unlock()
 		return
 	case "idle", "done", "blocked":
@@ -847,6 +918,13 @@ func (d *Daemon) reconcileAttention(ctx context.Context) {
 		slog.Error("reconcile: listing agents failed", "error", err)
 		return
 	}
+	d.reconcileAttentionWith(ctx, agents)
+}
+
+// reconcileAttentionWith is reconcileAttention over an agent listing the
+// caller already has. The periodic sweep uses it so one `agent list` serves
+// both the reconcile and the auto-send-when-idle poll.
+func (d *Daemon) reconcileAttentionWith(ctx context.Context, agents []domain.AgentTransition) {
 	// Before the parked-status filter: working agents must sync too, or a
 	// busy agent on a recycled pane id keeps the stale AGE until it parks.
 	d.syncTerminalIDs(ctx, agents)
@@ -894,8 +972,55 @@ func (d *Daemon) syncTerminalIDs(ctx context.Context, agents []domain.AgentTrans
 		if reset {
 			slog.Info("pane id recycled by a new terminal; agent age reset",
 				"agent", a.AgentID, "terminal", a.TerminalID)
+			d.resetRecycledPaneState(ctx, a)
 		}
 	}
+}
+
+// resetRecycledPaneState forgets everything the daemon remembered about the
+// pane's PREVIOUS occupant, once herdr's terminal_id proves a different agent
+// is behind it now. Pane ids are reused, and every one of these maps is keyed
+// by pane or agent id — so without this a fresh agent inherits the dead one's
+// bookkeeping:
+//
+//   - episodeHandled would still read "handled", so the new agent's first
+//     parked episode is never reconciled — it simply sits there;
+//   - captureStarted would still read "started", so its very first capture uses
+//     the SHORT event delay instead of the long start delay, snapshotting a
+//     half-painted TUI;
+//   - a pending capture (and any in-flight action review) belongs to an agent
+//     that no longer exists, and would deliver into the new one's pane;
+//   - lastAutoSend/lastAutoNoop would misattribute the new agent's first
+//     "working" transition to our own automation, suppressing the human
+//     check-in that resets the runaway counter;
+//   - a stale cwd would render the wrong {cwd} in its first task prompt.
+//
+// firstConsult/firstTaskGen are reset too: their doc notes a brand-new agent
+// normally arrives on a NEW pane (so the key is absent and priming happens
+// naturally) and that the rare pane-id reuse forgoes re-priming for want of a
+// signal. terminal_id IS that signal, so a genuinely new agent primes properly.
+// This is deliberately NOT done on a "detected" event, which also fires on
+// every subscriber reconnect.
+func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTransition) {
+	// Cancel first, outside the lock these helpers take themselves: a pending
+	// capture or review for the dead agent must not fire against the new one.
+	d.cancelCapture(a.PaneID)
+	d.cancelActionReviewExcept(ctx, a.AgentID, "")
+
+	d.mu.Lock()
+	delete(d.episodeHandled, a.PaneID)
+	delete(d.captureStarted, a.PaneID)
+	delete(d.paneCwds, a.PaneID)
+	delete(d.firstConsult, a.AgentID)
+	delete(d.firstTaskGen, a.AgentID)
+	delete(d.lastAutoSend, a.AgentID)
+	delete(d.lastAutoNoop, a.AgentID)
+	delete(d.idleSince, a.AgentID)
+	delete(d.autoTaskClaim, a.AgentID)
+	d.mu.Unlock()
+	// sweepInFlight is deliberately left alone: it is a live-goroutine claim
+	// released by its owner's defer, and clearing it here would license a
+	// second concurrent pane interaction.
 }
 
 // hasOpenEscalation reports whether the agent already has an unresolved
@@ -1019,6 +1144,9 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 	situation.TabID = tr.TabID
 	situation.WorkspaceID = tr.WorkspaceID
 	situation.RetryAuditID = tr.RetryAuditID
+	// Carry the captured terminal identity so an unattended delivery can prove,
+	// just before it sends, that the pane still hosts the agent it captured.
+	situation.TerminalID = tr.TerminalID
 	// Keep herdr's reported agent_status with the situation: downstream
 	// sites (the async LLM path) must render the REAL status in triggers,
 	// never a fabricated one.
@@ -1198,7 +1326,7 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 
 	switch decision.Action {
 	case domain.ActionSend:
-		d.act(ctx, situation, sig, decision, tr, now)
+		d.act(ctx, situation, sig, decision, tr, declared, now)
 	case domain.ActionKindNoop:
 		d.deliverNoop(ctx, situation, sig, decision, tr, now)
 	case domain.ActionConsult:
@@ -1294,8 +1422,11 @@ func (d *Daemon) readDecisionState(ctx context.Context, sig domain.SignatureResu
 // act performs a confirmed autonomous action with the pre-action audit
 // guard: the audit record must be durably committed BEFORE any input is
 // sent; a persistence failure blocks the action and notifies (FR-024).
+// declared is the task source resolved for this situation (nil when none
+// matched); it rides along so a send that IS the declared task can reserve the
+// item as it goes — see reserveDeclaredTask.
 func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
-	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
+	dec domain.Decision, tr domain.AgentTransition, declared *domain.DeclaredTask, now time.Time) {
 
 	// The never-auto patterns also screen the OUTBOUND text: a next-task
 	// line from a task file (or any learned action) naming an irreversible
@@ -1361,11 +1492,19 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		}
 	}
 
+	// Reserve the checklist item only when this send really is that declared
+	// task (comparing the rendered prompt, which is exactly what Decide put in
+	// dec.Input) — a learned free-text reply for the same agent must not
+	// consume a task.
+	del := delivery{sendText: outbound, input: dec.Input, rationale: dec.Rationale}
+	if declared != nil && declared.Reserve && declared.Task != domain.NoTaskContent &&
+		declared.Prompt() == dec.Input {
+		del.declared, del.taskText = declared, declared.Task
+	}
+
 	// learned stays empty: deliverAutonomous computes it after the send,
 	// exactly as the pre-review code did.
-	d.deliverAutonomous(ctx, s, sig, dec, tr, delivery{
-		sendText: outbound, input: dec.Input, rationale: dec.Rationale,
-	}, now)
+	d.deliverAutonomous(ctx, s, sig, dec, tr, del, now)
 }
 
 // learnedAction is the action recorded in decision history for a rule-path
@@ -1421,6 +1560,11 @@ type delivery struct {
 	// audit row; nil when no LLM was involved or none was reported. Recorded
 	// for observability only — the action-review path never gates on it.
 	llmConfidence *int
+	// declared/taskText name the checklist item this send delivers, when the
+	// send IS a declared task from a source that reserves (see
+	// reserveDeclaredTask). Both empty/nil for every other send.
+	declared *domain.DeclaredTask
+	taskText string
 }
 
 // deliverAutonomous is the shared tail of every autonomous rule-path send:
@@ -1434,6 +1578,14 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 	sent := false
 	executed := d.withAgentAutomation(ctx, s, sig, tr, del.input, dec.Confidence, del.llmConfidence, del.llmOutput, now,
 		func() { sent = d.deliverAutonomousClaimed(ctx, s, sig, dec, tr, del, now) })
+	if !executed || !sent {
+		// Nothing reached the pane — a refused reservation, a rolled-back send,
+		// a blocked audit write, or the lifecycle barrier. The pairing must not
+		// outlive the attempt: it would keep this agent out of the next sweep
+		// AND withhold from every other agent a task that is pending again,
+		// until the claim's TTL expired.
+		d.dropAutoTaskClaim(s.AgentID)
+	}
 	return executed && sent
 }
 
@@ -1444,6 +1596,19 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situation,
 	sig domain.SignatureResult, dec domain.Decision, tr domain.AgentTransition,
 	del delivery, now time.Time) bool {
+	// An unattended task hand-out must not land in a pane that has been recycled
+	// since capture: the agent it was meant for is gone and a DIFFERENT agent
+	// would receive it. Checked before the audit row, because nothing is
+	// attempted — the claim is simply released so the next sweep re-pairs.
+	if tr.AutoIdleSend || (del.declared != nil && del.declared.Reserve) {
+		if recycled, why := d.paneRecycled(ctx, s); recycled {
+			slog.Warn("pane was recycled since capture; abandoning the auto-send",
+				"agent", s.AgentID, "reason", why)
+			d.dropAutoTaskClaim(s.AgentID)
+			return false
+		}
+	}
+
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + del.input, Input: del.input,
@@ -1458,8 +1623,21 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		return false
 	}
 
+	// Claim the checklist item BEFORE the send: marking it after delivery
+	// would leave a window in which the very same "[ ]" line is handed to a
+	// second idle agent. A refusal here means somebody already took it.
+	rollback, err := d.reserveDeclaredTask(del.declared, del.taskText)
+	if err != nil {
+		slog.Warn("declared task could not be reserved; not sending", "agent", s.AgentID, "error", err)
+		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+		d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+			fmt.Sprintf("Agent %s: the next task was claimed or edited before it could be sent (%v); please review the list.", s.AgentID, err))
+		return false
+	}
+
 	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType, del.sendText); err != nil {
 		slog.Error("agent send failed; escalating", "pane", s.PaneID, "error", err)
+		rollback()
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed",
 			fmt.Sprintf("Agent %s: could not deliver the decided input; please review.", s.AgentID))
@@ -1568,6 +1746,8 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 // human interaction and reset that counter.
 func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
+	// Nothing is sent, so the pairing is spent — release it (see escalate).
+	d.dropAutoTaskClaim(s.AgentID)
 	d.withAgentAutomation(ctx, s, sig, tr, "", dec.Confidence, nil, "", now,
 		func() { d.deliverNoopClaimed(ctx, s, sig, dec, tr, now) })
 }
@@ -1676,6 +1856,11 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 // escalate records and surfaces an escalation: no input is sent (FR-018).
 func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
+	// The episode ended without an autonomous send, so an auto-send pairing for
+	// this agent is spent: the operator owns the situation now, and holding the
+	// claim would withhold a still-pending task from every other agent until
+	// its TTL. The file was never touched, so nothing is stranded.
+	d.dropAutoTaskClaim(s.AgentID)
 	autoDismissReason := d.escalationAutoDismissReason(ctx, s.AgentID)
 
 	// Dedup: if this normalized situation is already awaiting the user in the
@@ -1933,6 +2118,7 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
 		TaskReview: true, ProposedTask: proposed,
 		SourcePath: declared.Path, ReviewedTask: declared.Task,
+		ReserveTask:  declared.Reserve,
 		RetryAuditID: s.RetryAuditID,
 	}
 	// Stage the pending row synchronously (context filled off-loop below) so a
@@ -3100,6 +3286,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		// rejecting it would recreate the very escalation noise the noop
 		// resolves. Audit-before-act still applies (FR-024), and the final
 		// lifecycle barrier prevents learning or rate advancement after disable.
+		// A declined review sends nothing, so an auto-send pairing for this
+		// agent is spent: holding it would withhold a still-pending task from
+		// every other agent until the claim's TTL. The file was never touched,
+		// so nothing is stranded.
+		d.dropAutoTaskClaim(s.AgentID)
 		executed := d.withAgentAutomation(ctx, s, res.sig, tr, "",
 			computedConf, &llmConf, llmDec.CapturedOutput, now, func() {
 				if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
@@ -3187,15 +3378,41 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// pane the SOURCE can have moved on (item checked off, list edited). Re-read
 	// it and refuse to inject a task whose next item changed since review —
 	// escalate for the operator instead of sending a stale task.
+	var taskReserve *domain.DeclaredTask
+	reserveText := ""
 	if res.request.TaskReview && res.request.SourcePath != "" {
 		data, rerr := d.opt.ReadTaskFile(res.request.SourcePath)
 		if rerr != nil {
 			reject(domain.ReasonHerdrUnreachable, "task source unreadable before send: "+rerr.Error())
 			return
 		}
-		if domain.NextDeclaredTask(string(data)) != res.request.ReviewedTask {
+		pendingTasks := domain.PendingDeclaredTasks(string(data))
+		// The idle poll can pair an agent with a task that is NOT the list's
+		// first pending item (a sibling agent took that one), so a claimed task
+		// only has to be still pending; every other review keeps the strict
+		// "still the next task" check.
+		claim, claimed := d.autoTaskClaimFor(s.AgentID)
+		claimed = claimed && claim.sourcePath == canonicalTaskPath(res.request.SourcePath) &&
+			claim.taskText == res.request.ReviewedTask
+		fresh := domain.NextDeclaredTask(string(data)) == res.request.ReviewedTask
+		if claimed {
+			fresh = slices.Contains(pendingTasks, res.request.ReviewedTask)
+		}
+		if !fresh {
 			reject(domain.ReasonLLMNoSubmit, "task list changed during review")
 			return
+		}
+		// A reserving source must consume a checklist item on EVERY send, or
+		// the same line is handed out again. The flag is the one pinned on the
+		// request at consult time — re-reading the config here would let a
+		// reload mid-review silently downgrade this to an unreserved send.
+		if res.request.ReserveTask {
+			// The review may have swapped to a different pending item, so
+			// reserve the item the outbound text actually consumes, not the one
+			// that was proposed. An edit/adaptation of the reviewed task still
+			// resolves to the reviewed task.
+			reserveText = reservedByAction(llmDec.Action, res.request.ReviewedTask, pendingTasks)
+			taskReserve = &domain.DeclaredTask{Path: res.request.SourcePath, Reserve: true}
 		}
 	}
 
@@ -3261,8 +3478,38 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 					"An LLM-derived action was blocked because its audit record could not be written.")
 				return
 			}
+			// Same recycled-pane guard as the rule path — and it matters more
+			// here, because an LLM review can add seconds of drift between the
+			// capture and this send.
+			if taskReserve != nil {
+				if recycled, why := d.paneRecycled(ctx, s); recycled {
+					slog.Warn("pane was recycled during the task review; not sending",
+						"agent", s.AgentID, "reason", why)
+					d.dropAutoTaskClaim(s.AgentID)
+					d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+					d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+						fmt.Sprintf("Agent %s: %s; the task was not sent.", s.AgentID, why))
+					return
+				}
+			}
+			// Same claim-before-send rule as the rule path: an auto-send source's
+			// item is marked "[-]" before the text reaches the pane.
+			rollback, rerr := d.reserveDeclaredTask(taskReserve, reserveText)
+			if rerr != nil {
+				d.dropAutoTaskClaim(s.AgentID)
+				slog.Warn("reviewed task could not be reserved; not sending", "agent", s.AgentID, "error", rerr)
+				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+				d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+					fmt.Sprintf("Agent %s: the reviewed task was claimed or edited before it could be sent (%v); please review the list.", s.AgentID, rerr))
+				return
+			}
 			if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType,
 				domain.DeliverKeystroke(s.Type, s.AgentType, pane, llmDec.Action)); err != nil {
+				rollback()
+				// The task is pending again; release the pairing with it so no
+				// other agent is denied the item until the claim's TTL (the
+				// rule path does this centrally in deliverAutonomous).
+				d.dropAutoTaskClaim(s.AgentID)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 				d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
 				return
@@ -3289,6 +3536,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			})
 		})
 	if !executed {
+		// The lifecycle barrier refused (the agent was disabled between the
+		// decision and its execution): nothing reached the pane, so release the
+		// pairing — as deliverAutonomous does on the rule path — or the task
+		// stays promised to an agent that never got it.
+		d.dropAutoTaskClaim(s.AgentID)
 		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
 	}
 }
@@ -3700,24 +3952,35 @@ type taskSourceMatch struct {
 // completed list still resolves so a templated "all done" prompt or a
 // completed-summary can be built; sources with a real remaining task take
 // precedence over one that is done).
+// sourceSelectsAgent reports whether BOTH of a task source's selectors — the
+// agent selector (id / type / short name, "" = any) and the workspace selector
+// (herdr workspace label with "*" wildcards, falling back to the raw id when
+// no name resolves) — match this agent. It is the single definition shared by
+// matchTaskSource and the auto-send-when-idle poll, so the two can never
+// disagree about which agents a source owns.
+func (d *Daemon) sourceSelectsAgent(ctx context.Context, src config.TaskSource,
+	agentID, agentType, workspaceID, agentName string) bool {
+
+	if !src.MatchesAgent(agentID, agentType, agentName) {
+		return false
+	}
+	if src.Workspace == "" || src.Workspace == "*" {
+		return true
+	}
+	// workspaceName caches the listing for workspaceCacheTTL, so resolving it
+	// per source costs at most one herdr round-trip per sweep.
+	target := d.workspaceName(ctx, workspaceID)
+	if target == "" {
+		target = workspaceID
+	}
+	return domain.MatchWorkspace(src.Workspace, target)
+}
+
 func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID, agentType, workspaceID, agentName string) (taskSourceMatch, bool) {
 	var completed *taskSourceMatch
-	wsName, wsResolved := "", false
 	for _, src := range cfg.TaskSources {
-		if !src.MatchesAgent(agentID, agentType, agentName) {
+		if !d.sourceSelectsAgent(ctx, src, agentID, agentType, workspaceID, agentName) {
 			continue
-		}
-		if src.Workspace != "" && src.Workspace != "*" {
-			if !wsResolved {
-				wsName, wsResolved = d.workspaceName(ctx, workspaceID), true
-			}
-			target := wsName
-			if target == "" {
-				target = workspaceID
-			}
-			if !domain.MatchWorkspace(src.Workspace, target) {
-				continue
-			}
 		}
 		data, err := d.opt.ReadTaskFile(src.Path)
 		if err != nil {
@@ -3792,12 +4055,28 @@ func (d *Daemon) taskSourceSummary(ctx context.Context, cfg config.Config, s dom
 // (domain.Decide) never sends that templated "none" prompt, escalating or
 // generating more tasks instead; sources with a real remaining task take
 // precedence.
+//
+// One side effect, safe from every caller: when the agent holds an auto-send
+// claim whose task is no longer pending, that claim is dead — it can never be
+// honored again — so it is dropped here rather than lingering until its TTL and
+// keeping the agent out of the next pairing. A LIVE claim is only read.
 func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.AgentTransition, agentName string) *domain.DeclaredTask {
 	m, ok := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName)
 	if !ok {
 		return nil
 	}
 	task := domain.NextDeclaredTask(string(m.data))
+	// The idle poll may have assigned this agent a task further down the list
+	// (a sibling agent was given the first one in the same sweep). Honor that
+	// pairing when the claimed item is still pending in the matched source;
+	// otherwise the claim is stale — drop it and resolve normally.
+	if claim, ok := d.autoTaskClaimFor(tr.AgentID); ok && claim.sourcePath == canonicalTaskPath(m.src.Path) {
+		if slices.Contains(domain.PendingDeclaredTasks(string(m.data)), claim.taskText) {
+			task = claim.taskText
+		} else {
+			d.dropAutoTaskClaim(tr.AgentID)
+		}
+	}
 	if task == "" {
 		task = domain.NoTaskContent
 	}
@@ -3816,6 +4095,10 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 		// A source opts out of the pre-send LLM review with llm_review=false
 		// (nil = the default, on).
 		LLMReview: m.src.EnableLLMReview == nil || *m.src.EnableLLMReview,
+		// An auto-send source hands tasks out unattended, so the delivered
+		// item must be marked "[-]" as it goes — otherwise the next idle agent
+		// is handed the very same "[ ]" line.
+		Reserve: m.src.EnableAutoSendTaskWhenIdle,
 	}
 }
 
@@ -3968,6 +4251,9 @@ func confidenceThresholds(cfg config.Config) domain.ConfidenceThresholds {
 func trigger(tr domain.AgentTransition) string {
 	if tr.ManualCapture {
 		return fmt.Sprintf("manual-capture: %s", tr.Status)
+	}
+	if tr.AutoIdleSend {
+		return fmt.Sprintf("auto-idle-send: %s", tr.Status)
 	}
 	return fmt.Sprintf("agent-status: %s", tr.Status)
 }
