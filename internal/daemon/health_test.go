@@ -10,6 +10,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
@@ -52,6 +53,78 @@ func TestEmbedderStateMapping(t *testing.T) {
 	d.embedder = degradableEmbedder{degraded: true}
 	if got := d.embedderState(); got != daemonhealth.EmbedderDegraded {
 		t.Errorf("degraded latch: got %q, want degraded", got)
+	}
+}
+
+// diagEmbedder is an EmbedderPort exposing the richer optional Diagnostics()
+// accessor the daemon prefers over the bare Degraded().
+type diagEmbedder struct{ diag embedder.Diagnostics }
+
+func (diagEmbedder) EmbedText(context.Context, string) ([]float32, error) { return nil, nil }
+func (diagEmbedder) ModelID() string                                      { return "fake" }
+func (diagEmbedder) Dims() int                                            { return 0 }
+func (diagEmbedder) Close() error                                         { return nil }
+func (e diagEmbedder) Diagnostics() embedder.Diagnostics                  { return e.diag }
+
+// TestEmbedderHealthCarriesDiagnostics: when the embedder can explain itself,
+// the heartbeat must carry the counters, the effective budgets and the last
+// error — that payload is what turns "degraded" into a fixable timeout.
+func TestEmbedderHealthCarriesDiagnostics(t *testing.T) {
+	d := &Daemon{}
+	d.semanticReady.Store(true)
+	d.embedder = diagEmbedder{diag: embedder.Diagnostics{
+		Degraded: true, ConsecutiveFailures: 3, MaxFailures: 3,
+		Timeouts: 3, Failures: 3, LastError: "embed call exceeded 2s stall guard",
+		EmbedTimeout: 2 * time.Second, WarmTimeout: 30 * time.Second,
+	}}
+
+	state, diag := d.embedderHealth()
+	if state != daemonhealth.EmbedderDegraded {
+		t.Errorf("state = %q, want degraded", state)
+	}
+	if diag == nil {
+		t.Fatal("a Diagnostics()-capable embedder must publish diagnostics")
+	}
+	if diag.EmbedTimeoutMs != 2000 || diag.WarmTimeoutMs != 30000 {
+		t.Errorf("budgets = %dms/%dms, want 2000/30000", diag.EmbedTimeoutMs, diag.WarmTimeoutMs)
+	}
+	if !diag.TimeoutBound {
+		t.Error("all-timeout failures must be marked TimeoutBound so status advises raising the budgets")
+	}
+	if diag.LastError == "" || diag.Failures != 3 {
+		t.Errorf("diag = %+v, want the last error and failure count", *diag)
+	}
+
+	// Healthy but with timeouts accruing: the state stays ready AND the
+	// diagnostics still ship — that is the early warning before the latch.
+	d.embedder = diagEmbedder{diag: embedder.Diagnostics{Timeouts: 1, Failures: 1, MaxFailures: 3}}
+	state, diag = d.embedderHealth()
+	if state != daemonhealth.EmbedderReady {
+		t.Errorf("state = %q, want ready", state)
+	}
+	if diag == nil || diag.Failures != 1 {
+		t.Error("diagnostics must ship for a healthy-but-failing embedder too")
+	}
+
+	// Disabled short-circuits everything, diagnostics included.
+	d.cfg = config.Config{Embedding: config.Embedding{Disabled: true}}
+	if state, diag = d.embedderHealth(); state != daemonhealth.EmbedderDisabled || diag != nil {
+		t.Errorf("disabled: state=%q diag=%v, want disabled/nil", state, diag)
+	}
+}
+
+// TestEmbedderHealthFallsBackToDegradedOnly keeps alternate embedders working:
+// one offering only Degraded() still maps correctly, with no diagnostics.
+func TestEmbedderHealthFallsBackToDegradedOnly(t *testing.T) {
+	d := &Daemon{}
+	d.semanticReady.Store(true)
+	d.embedder = degradableEmbedder{degraded: true}
+	state, diag := d.embedderHealth()
+	if state != daemonhealth.EmbedderDegraded {
+		t.Errorf("state = %q, want degraded", state)
+	}
+	if diag != nil {
+		t.Errorf("diag = %+v, want nil for an embedder with no Diagnostics()", *diag)
 	}
 }
 

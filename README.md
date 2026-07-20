@@ -404,6 +404,9 @@ similarity_threshold = 0.90 # min cosine similarity to reuse a learned signature
 bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1]
 model_context_window = 0    # 0 = bundled-model default (512 tokens); input is
                             # truncated below this limit before embedding
+embed_timeout_ms = 0        # 0 = 2000ms stall guard per warm embed call
+warm_timeout_ms = 0         # 0 = 30000ms for the first call (model load)
+max_consecutive_failures = 0 # 0 = 3 back-to-back failures latch text fallback
 # pane_salient_chars = 500  # fallback signature window for idle/unclassified
                             # situations (trailing N characters of pane content).
                             # Changing it re-keys idle/unclassified rules once,
@@ -484,13 +487,19 @@ and the source entry itself — can be managed. Use the name in task-source
 selectors, and rename agents to whatever fits your workflow:
 
 ```sh
-hap agents                      # short name, pane id, type, status, automation
+hap agents                      # short name, pane id, type, status, automation, working dir
 hap rename brave-otter backend-dev
 hap disable backend-dev         # stop automation for only this agent
 hap enable backend-dev          # allow automation again
 hap task-source --agent backend-dev ./docs/backend-tasks.md
 hap task-source --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
 ```
+
+`hap agents` output is tab-separated and gained a sixth column — the agent's
+working directory, `-` when herdr cannot report one — so two agents on the same
+repo from different checkouts are distinguishable. Scripts that split on tabs
+keep working; ones that assumed exactly five fields need updating. The same
+value appears as `Working dir` in the TUI agent detail view.
 
 (Or in the TUI: select the agent and press `n` to rename it, `x` to disable
 it behind a `Y/n` confirmation, or `e` to enable it again. A disabled live
@@ -790,6 +799,28 @@ models can set their real limit explicitly. Positive values below 256 are
 clamped to 256. Never configure a value above the model's actual position
 limit, because llama.cpp can abort the worker when that limit is exceeded.
 The fallback idle/unclassified signature window defaults to 500 characters.
+
+**Larger models need larger budgets.** Each embed call is bounded by a stall
+guard — 2s once the model is warm, 30s for the first call including the model
+load — and three back-to-back failures latch semantic matching onto text
+matching for the rest of the daemon's life. A model bigger than the bundled
+MiniLM can exceed those defaults on every call, which looks exactly like a
+broken embedder. `hap status` distinguishes the two: a degrade whose failures
+were all stall-guard expiries reports the budgets in force and points at the
+keys to raise, instead of suggesting you disable embeddings.
+
+```
+embedder health:     DEGRADED at runtime — degraded (every embed hit the stall guard; raise …)
+  embedder failures: 3 (3 timeouts), latch at 3 consecutive
+  embedder budgets: embed 2000ms, warm 30000ms
+  embedder last error: embed call exceeded 2s stall guard (raise `embedding.embed_timeout_ms` …)
+```
+
+Raise them with `hap config set embedding.embed_timeout_ms 8000` (and
+`embedding.warm_timeout_ms` for slow model loads, `embedding.max_consecutive_failures`
+to ride out occasional slowness). Any `[embedding]` change rebuilds the
+embedder, which also clears the degraded latch — so the fix takes effect
+without restarting the daemon by hand.
 
 ### Local LLM fallback (optional)
 

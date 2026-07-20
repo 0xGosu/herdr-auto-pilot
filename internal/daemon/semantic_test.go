@@ -534,6 +534,79 @@ func TestReembedNudgeSwapsEmbedderAndRetriesDegraded(t *testing.T) {
 	})
 }
 
+// TestTimeoutConfigChangeRebuildsEmbedder is the recovery path the docs
+// promise: raising `embedding.embed_timeout_ms` after a slow model latched the
+// degrade must rebuild the embedder (a fresh instance = a cleared latch), not
+// merely rewrite the file. Without the new keys participating in the
+// [embedding] change check, the operator's fix would silently do nothing and
+// semantic matching would stay off until a daemon restart.
+func TestTimeoutConfigChangeRebuildsEmbedder(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("[embedding]\nembed_timeout_ms = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+
+	var mu sync.Mutex
+	factoryCalls := 0
+	factory := func(config.Config) ports.EmbedderPort {
+		mu.Lock()
+		defer mu.Unlock()
+		factoryCalls++
+		return &fakeEmbedder{}
+	}
+
+	d, err := New(Options{
+		ConfigPath:        cfgPath,
+		ControlSocketPath: filepath.Join(testutil.SocketDir(t), "c.sock"),
+		Store:             raw,
+		Herdr:             &fakeHerdr{},
+		Events:            &fakeEvents{ch: make(chan domain.AgentTransition, 4)},
+		Notify:            &fakeHerdr{},
+		EmbedderFactory:   factory,
+		MatchIndexDir:     filepath.Join(dir, "match-index"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if d.matcher != nil {
+			d.matcher.Close()
+		}
+	})
+	waitFor(t, 5*time.Second, func() bool { return d.semanticReady.Load() })
+
+	// An unrelated reload leaves the embedder alone (rebuilds are expensive).
+	if err := d.reload(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	calls := factoryCalls
+	mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("plain reload rebuilt the embedder (factory calls = %d, want 1)", calls)
+	}
+
+	// Raising the stall guard is an [embedding] change: rebuild.
+	if err := os.WriteFile(cfgPath, []byte("[embedding]\nembed_timeout_ms = 8000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.reload(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	calls = factoryCalls
+	mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("raising embed_timeout_ms must rebuild the embedder (factory calls = %d, want 2)", calls)
+	}
+}
+
 // TestRemapAllowedContract pins the veto behavior of remapAllowed, the ONLY
 // accept callback the matcher runs. accept now runs OUTSIDE the matcher lock
 // (MatchVector/MatchText apply it over materialized candidates), so a reentrant

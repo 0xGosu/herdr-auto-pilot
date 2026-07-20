@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -285,7 +286,32 @@ type App struct {
 	// NewEmbedder builds the embedder for ReembedStandalone; nil defaults
 	// to the production embedder. Tests inject fakes.
 	NewEmbedder func(cfg config.Embedding) ports.EmbedderPort
+	// Clock overrides the wall clock used for cache expiry; nil means
+	// time.Now. Tests inject it to exercise TTL boundaries deterministically.
+	Clock func() time.Time
+
+	// cwdMu/cwdCache memoize pane working directories for FillAgentCwds.
+	// Without this, the TUI's 2s refresh would spawn one `herdr pane get` per
+	// agent per tick; the daemon caches its own lookups for the same reason. A
+	// cwd changes rarely, so a short TTL is plenty.
+	cwdMu    sync.Mutex
+	cwdCache map[string]cwdEntry
 }
+
+// cwdEntry is one memoized pane cwd and when it was read.
+type cwdEntry struct {
+	cwd string
+	at  time.Time
+}
+
+// cwdTTL bounds how stale a displayed working directory can be. Short enough
+// that a `cd` in the pane shows up within a few refreshes, long enough that a
+// 2s refresh over a dozen agents does not shell out constantly.
+const cwdTTL = 20 * time.Second
+
+// cwdCacheMax is the size past which expired entries are swept. Well above any
+// realistic live pane count, so a normal session never sweeps at all.
+const cwdCacheMax = 256
 
 // nudge wakes the daemon; a failed nudge is surfaced but non-fatal (the
 // kill switch is read every tick regardless).
@@ -337,6 +363,11 @@ type Status struct {
 	// locating agents; empty when the Herdr adapter cannot report them.
 	Workspaces map[string]domain.WorkspaceInfo
 	Tabs       map[string]domain.TabInfo
+	// AgentCwds maps agent/pane ids to the agent's current working directory
+	// (the foreground process's cwd when herdr reports one, else the pane's).
+	// Best-effort and short-TTL cached: a missing key just means herdr could
+	// not tell us, never that the agent has no cwd.
+	AgentCwds map[string]string
 	// Embedding summarizes semantic-matching availability: "disabled",
 	// "model missing (<path>)", or "ready (N signatures, <model>)". The
 	// daemon's live health (a degraded embedder) shows in its log instead.
@@ -427,6 +458,65 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 
 // AgentName returns the short name for an agent id ("" when unnamed).
 func (st Status) AgentName(agentID string) string { return st.AgentNames[agentID] }
+
+// AgentCwd returns the agent's working directory ("" when herdr could not
+// report one, or when the caller never asked for cwds — see FillAgentCwds).
+func (st Status) AgentCwd(agentID string) string { return st.AgentCwds[agentID] }
+
+// cwdFillBudget bounds ONE FillAgentCwds pass end to end. Each `herdr pane get`
+// is its own subprocess with a 15s CLI budget, and the lookups run in sequence,
+// so without this a wedged herdr could stall a caller for 15s × agents. A
+// working directory is a display nicety: it gets a couple of seconds, and
+// whatever resolved in that time is what shows.
+const cwdFillBudget = 3 * time.Second
+
+// FillAgentCwds populates st.AgentCwds for the agents in st.MonitoredAgents.
+//
+// It is deliberately NOT part of GetStatus: every status caller would then pay
+// one `herdr pane get` subprocess per agent for data most of them discard, and
+// one-shot commands (`hap status`, `hap task send`) can never benefit from the
+// TTL cache. Only the two surfaces that display a cwd — the TUI refresh and
+// `hap agents` — call this.
+//
+// Best-effort throughout: a missing InspectorPort, a failed lookup, or an
+// exhausted budget just leaves agents out of the map.
+func (a *App) FillAgentCwds(ctx context.Context, st *Status) {
+	if a.Herdr == nil {
+		return
+	}
+	if _, ok := a.Herdr.(ports.InspectorPort); !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, cwdFillBudget)
+	defer cancel()
+
+	now := a.now()
+	for _, agent := range st.MonitoredAgents {
+		if ctx.Err() != nil {
+			return // budget spent: keep whatever resolved
+		}
+		// herdr identifies most agents by their pane id, but the transition
+		// carries both — fall back so an empty PaneID does not drop the row.
+		pane := agent.PaneID
+		if pane == "" {
+			pane = agent.AgentID
+		}
+		if cwd := a.paneCwdCached(ctx, pane, now); cwd != "" {
+			if st.AgentCwds == nil {
+				st.AgentCwds = map[string]string{}
+			}
+			st.AgentCwds[agent.AgentID] = cwd
+		}
+	}
+}
+
+// now is the App's clock, overridable by tests (see Clock).
+func (a *App) now() time.Time {
+	if a.Clock != nil {
+		return a.Clock()
+	}
+	return time.Now()
+}
 
 // AgentDisabled reports the persistent operator-owned automation state.
 func (st Status) AgentDisabled(agentID string) bool { return st.DisabledAgents[agentID] }
@@ -1774,6 +1864,9 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "embedding.bm25_min_score", TUIEditable: true},
 	{Key: "embedding.pane_salient_chars", TUIEditable: true},
 	{Key: "embedding.model_context_window", TUIEditable: true},
+	{Key: "embedding.embed_timeout_ms", TUIEditable: true},
+	{Key: "embedding.warm_timeout_ms", TUIEditable: true},
+	{Key: "embedding.max_consecutive_failures", TUIEditable: true},
 	{Key: "tui.max_content_width", TUIEditable: true},
 	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
@@ -1800,6 +1893,15 @@ func FieldTUIEditable(key string) bool {
 		}
 	}
 	return false
+}
+
+// defaultedInt renders an int config field whose 0 means "use the built-in
+// default", showing the default that is actually in force rather than a bare 0.
+func defaultedInt(v, def int) string {
+	if v <= 0 {
+		return fmt.Sprintf("%d (default)", def)
+	}
+	return strconv.Itoa(v)
 }
 
 // FieldValue renders the current value of a SetField key for display.
@@ -1897,6 +1999,12 @@ func FieldValue(cfg config.Config, key string) string {
 			return fmt.Sprintf("%d (default)", embedder.DefaultContextWindow)
 		}
 		return strconv.Itoa(cfg.Embedding.ModelContextWindow)
+	case "embedding.embed_timeout_ms":
+		return defaultedInt(cfg.Embedding.EmbedTimeoutMs, embedder.DefaultEmbedTimeoutMs)
+	case "embedding.warm_timeout_ms":
+		return defaultedInt(cfg.Embedding.WarmTimeoutMs, embedder.DefaultWarmTimeoutMs)
+	case "embedding.max_consecutive_failures":
+		return defaultedInt(cfg.Embedding.MaxConsecutiveFailures, embedder.DefaultMaxConsecutiveFailures)
 	case "safety.disable_never_auto_seed_patterns":
 		return strconv.FormatBool(cfg.Safety.DisableNeverAutoSeedPatterns)
 	case "tui.max_content_width":
@@ -2075,6 +2183,29 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("embedding.model_context_window must be a non-negative integer (0 = default), got %q", value)
 			}
 			cfg.Embedding.ModelContextWindow = v
+			return nil
+		case "embedding.embed_timeout_ms":
+			// 0 restores the built-in default; a positive value is floored by
+			// embedder.ResolveEmbedTimeout at use time.
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("embedding.embed_timeout_ms must be a non-negative integer (0 = default), got %q", value)
+			}
+			cfg.Embedding.EmbedTimeoutMs = v
+			return nil
+		case "embedding.warm_timeout_ms":
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("embedding.warm_timeout_ms must be a non-negative integer (0 = default), got %q", value)
+			}
+			cfg.Embedding.WarmTimeoutMs = v
+			return nil
+		case "embedding.max_consecutive_failures":
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("embedding.max_consecutive_failures must be a non-negative integer (0 = default), got %q", value)
+			}
+			cfg.Embedding.MaxConsecutiveFailures = v
 			return nil
 		case "llm.pane_excerpt_chars":
 			// 0 is the config's "restore the 5000-char default" sentinel
@@ -2596,6 +2727,43 @@ func releaseTask(index int, taskText string) func(string) (string, error) {
 // so one template renders the same whoever sends it. Best-effort: the
 // inspector is an optional herdr capability and an empty {cwd} must never
 // block a send.
+// paneCwdCached is paneCwd behind the cwdTTL memo. Display paths (status /
+// agent listings) use it so a fast refresh cannot turn one `herdr pane get`
+// per agent into a subprocess storm; send paths keep using paneCwd, where a
+// stale {cwd} would be wrong rather than merely old.
+func (a *App) paneCwdCached(ctx context.Context, paneID string, now time.Time) string {
+	a.cwdMu.Lock()
+	if e, ok := a.cwdCache[paneID]; ok && now.Sub(e.at) < cwdTTL {
+		a.cwdMu.Unlock()
+		return e.cwd
+	}
+	a.cwdMu.Unlock()
+
+	cwd := a.paneCwd(ctx, paneID)
+
+	a.cwdMu.Lock()
+	defer a.cwdMu.Unlock()
+	if a.cwdCache == nil {
+		a.cwdCache = map[string]cwdEntry{}
+	}
+	// Cache the empty answer too: a herdr that cannot answer for a pane would
+	// otherwise be re-asked on every refresh. The cost is that one transient
+	// failure blanks that agent's cwd for up to cwdTTL — acceptable for a
+	// display field, and far cheaper than a subprocess per refresh.
+	a.cwdCache[paneID] = cwdEntry{cwd: cwd, at: now}
+	// Bound the map: a long-lived TUI would otherwise accumulate an entry for
+	// every pane id ever seen. Expired entries are dead weight, so drop them
+	// once the map grows past the point where any real session would sit.
+	if len(a.cwdCache) > cwdCacheMax {
+		for id, e := range a.cwdCache {
+			if now.Sub(e.at) >= cwdTTL {
+				delete(a.cwdCache, id)
+			}
+		}
+	}
+	return cwd
+}
+
 func (a *App) paneCwd(ctx context.Context, paneID string) string {
 	insp, ok := a.Herdr.(ports.InspectorPort)
 	if !ok {

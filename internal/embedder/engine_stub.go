@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 )
@@ -27,13 +28,22 @@ var errEngineUnavailable = fmt.Errorf("embedder unavailable: built without the %
 // every embed fails. Dims stays 0 so the daemon's Dims()>0 gate never routes
 // an embed through a worker that can't serve one.
 type Llama struct {
-	modelPath string
+	modelPath    string
+	embedTimeout time.Duration
+	warmTimeout  time.Duration
+	maxFailures  int
 }
 
-// NewEngine builds the stub engine. It resolves the model path (so ModelID and
-// diagnostics stay meaningful) but loads nothing — there is no native backend.
+// NewEngine builds the stub engine. It resolves the model path and the
+// configured budgets (so ModelID and Diagnostics stay meaningful) but loads
+// nothing — there is no native backend.
 func NewEngine(cfg config.Embedding) *Llama {
-	return &Llama{modelPath: ResolveModelPath(cfg)}
+	return &Llama{
+		modelPath:    ResolveModelPath(cfg),
+		embedTimeout: ResolveEmbedTimeout(cfg),
+		warmTimeout:  ResolveWarmTimeout(cfg),
+		maxFailures:  ResolveMaxFailures(cfg),
+	}
 }
 
 // EmbedText always reports the engine unavailable in a no-CGO build.
@@ -51,6 +61,18 @@ func (l *Llama) Dims() int { return 0 }
 // Degraded reports true: the engine can never serve an embed, so it is
 // effectively degraded from the start (semantic matching stays on BM25).
 func (l *Llama) Degraded() bool { return true }
+
+// Diagnostics reports the permanent build-tag degrade, so `hap status` explains
+// a no-CGO binary instead of implying a timeout the operator could tune away.
+func (l *Llama) Diagnostics() Diagnostics {
+	return Diagnostics{
+		Degraded:     true,
+		MaxFailures:  l.maxFailures,
+		LastError:    errEngineUnavailable.Error(),
+		EmbedTimeout: l.embedTimeout,
+		WarmTimeout:  l.warmTimeout,
+	}
+}
 
 // Close is a no-op; the stub owns no native resources.
 func (l *Llama) Close() error { return nil }

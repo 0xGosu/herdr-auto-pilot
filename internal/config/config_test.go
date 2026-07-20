@@ -316,6 +316,53 @@ func TestSaveRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEmbeddingTimeoutKeysRoundTrip pins the TOML surface an operator edits to
+// rescue a large model: the three tunables must parse from a hand-written file
+// and survive Save/Load, and an omitted key must stay 0 (the "use the built-in
+// default" sentinel) rather than being filled in with a number that would then
+// be written back as if it had been chosen.
+func TestEmbeddingTimeoutKeysRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(`
+[embedding]
+embed_timeout_ms = 8000
+warm_timeout_ms = 120000
+max_consecutive_failures = 10
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Embedding.EmbedTimeoutMs != 8000 || got.Embedding.WarmTimeoutMs != 120000 ||
+		got.Embedding.MaxConsecutiveFailures != 10 {
+		t.Fatalf("embedding timeout keys not parsed: %+v", got.Embedding)
+	}
+
+	out := filepath.Join(t.TempDir(), "saved.toml")
+	if err := Save(out, got); err != nil {
+		t.Fatal(err)
+	}
+	back, err := Load(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Embedding != got.Embedding {
+		t.Errorf("round trip mismatch: %+v vs %+v", back.Embedding, got.Embedding)
+	}
+
+	// Unset keys stay at the 0 sentinel.
+	def, err := Load(filepath.Join(t.TempDir(), "missing.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.Embedding.EmbedTimeoutMs != 0 || def.Embedding.WarmTimeoutMs != 0 ||
+		def.Embedding.MaxConsecutiveFailures != 0 {
+		t.Errorf("unset timeout keys = %+v, want the 0 sentinel", def.Embedding)
+	}
+}
+
 func TestTaskSourceLLMReviewParsing(t *testing.T) {
 	// enable_llm_review is opt-out: unset stays nil (the daemon treats nil
 	// as on), an explicit false is preserved so a source can opt out, and

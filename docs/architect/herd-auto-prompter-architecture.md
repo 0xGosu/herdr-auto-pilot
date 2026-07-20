@@ -287,12 +287,20 @@ directly (and stamps a `decision_floor_id`).
   **out-of-process `hap embed-worker` child** over a framed pipe: a native
   `GGML_ASSERT → SIGABRT` is uncatchable in Go, so isolating it in a child turns
   a crash into a transport error instead of killing the daemon (fix for #60). It
-  **latches a degraded mode after 3 consecutive failures** (fast-fails
-  `ErrDegraded` thereafter), is **stall-guarded** (2 s warm / 30 s cold-load
-  timeouts, raced via `select`), truncates input to the model context window to
+  **latches a degraded mode after N consecutive failures** (default 3; fast-fails
+  `ErrDegraded` thereafter), is **stall-guarded** (defaults 2 s warm / 30 s
+  cold-load, raced via `select`), truncates input to the model context window to
   avoid a position-embedding SIGABRT, and L2-normalizes vectors. `Dims()` stays 0
   until the first successful embed, keeping the daemon select loop off the cold
-  model load.
+  model load. All three bounds are configurable
+  (`embedding.{embed_timeout_ms,warm_timeout_ms,max_consecutive_failures}`) and
+  are forwarded to the worker child in its environment so parent and child hold
+  the same budgets; a model larger than the bundled MiniLM otherwise exceeds the
+  defaults on every call and latches semantic matching off for good. The
+  embedder exposes an optional `Diagnostics()` (timeout/failure counts, the
+  budgets in force, the last error) which the daemon publishes in the heartbeat,
+  so `hap status` can tell a merely-slow model from a broken one and name the
+  key to raise. Any `[embedding]` change rebuilds the embedder, clearing the latch.
 - **Matcher** — a **bleve v2** index (disk-backed under the state dir) providing
   scoped KNN (FAISS via the `vectors` tag) and BM25 text search. **SQLite
   `signature_embeddings` is the source of truth; the index is a disposable cache**

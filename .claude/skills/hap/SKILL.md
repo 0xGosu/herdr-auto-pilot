@@ -84,18 +84,23 @@ last kill event:     resumed by operator at 2026-07-11T21:49:30+08:00
 ## list agents
 
 see all monitored agents with their short names, pane ids, types, statuses,
-and automation state:
+automation state, and working directory:
 
 ```bash
 hap agents
 ```
 
-output:
+output (tab-separated; the last column is the agent's cwd, `-` when herdr
+cannot report one — it tells apart two agents working the same repo from
+different checkouts):
 ```
-brave-otter  w6:p1   claude   idle      enabled
-cool-fox     w6:p3   claude   working   disabled
-swift-hawk   w8:p1   codex    done      enabled
+brave-otter  w6:p1   claude   idle      enabled    /workspaces/herdr-auto-pilot
+cool-fox     w6:p3   claude   working   disabled   /workspaces/worktree-agent-no1
+swift-hawk   w8:p1   codex    done      enabled    -
 ```
+
+the same value appears as `Working dir` in the TUI agent detail view (`v` on
+the Agents tab).
 
 ## rename an agent
 
@@ -302,6 +307,9 @@ hap config set safety.disable_never_auto_seed_patterns true
 hap config set embedding.disabled true
 hap config set embedding.similarity_threshold 0.85
 hap config set embedding.model_context_window 512
+hap config set embedding.embed_timeout_ms 8000
+hap config set embedding.warm_timeout_ms 120000
+hap config set embedding.max_consecutive_failures 10
 hap config set embedding.pane_salient_chars 1000
 hap config set tui.max_content_width 120
 hap config set tui.theme high-contrast
@@ -354,6 +362,9 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `embedding.similarity_threshold` | 0.90 | min cosine similarity to reuse a learned signature |
 | `embedding.bm25_min_score` | 0.35 | min normalized BM25 similarity for text fallback |
 | `embedding.model_context_window` | 0 (built-in default: 512 for MiniLM) | max tokens fed to the embedder before truncation; MUST NOT exceed what the model supports (over 512 hard-aborts a BERT/MiniLM native lib). raise only when `model_path` points at a larger-window model; values below 256 clamp up |
+| `embedding.embed_timeout_ms` | 0 (built-in default: 2000) | stall guard per warm embed call. a model larger than the bundled MiniLM can exceed it on EVERY call, which latches semantic matching onto text search permanently — raise it alongside `model_path`. `hap status` reports the budgets in force and whether the failures were timeouts. values below 100 clamp up |
+| `embedding.warm_timeout_ms` | 0 (built-in default: 30000) | stall guard for the FIRST call of each embed worker, which includes loading the model; raise for slow/large model loads. values below 1000 clamp up |
+| `embedding.max_consecutive_failures` | 0 (built-in default: 3) | back-to-back embed failures that latch the text fallback; raise to ride out an occasionally-slow model. any `[embedding]` change rebuilds the embedder and clears the latch |
 | `embedding.pane_salient_chars` | 800 | fallback signature window for idle/unclassified situations (trailing N chars) |
 | `tui.max_content_width` | 0 (full width) | cap variable-width list columns; 0 = full width |
 | `tui.theme` | default | TUI color theme: default, dark, light, high-contrast (in the TUI Config tab, `e` on this row opens a ↑/↓ picker of the available themes) |

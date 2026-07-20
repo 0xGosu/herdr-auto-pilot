@@ -117,6 +117,90 @@ func TestEmbedderNoteDegradedActionable(t *testing.T) {
 	}
 }
 
+// TestEmbedderNoteTimeoutBoundPointsAtTimeouts is the diagnostics contract that
+// keeps a merely-slow model usable: when every failure was a stall-guard
+// expiry, the remedy shown must be raising the budgets — NOT
+// `embedding.disabled`, which would throw semantic matching away for good.
+func TestEmbedderNoteTimeoutBoundPointsAtTimeouts(t *testing.T) {
+	h := Health{
+		Embedder: EmbedderDegraded,
+		EmbedderDiag: &EmbedderDiag{
+			Failures: 3, Timeouts: 3, MaxFailures: 3,
+			EmbedTimeoutMs: 2000, WarmTimeoutMs: 30000,
+			TimeoutBound: true,
+		},
+	}
+	note := h.EmbedderNote()
+	if !strings.Contains(note, "embed_timeout_ms") || !strings.Contains(note, "warm_timeout_ms") {
+		t.Errorf("note = %q, want it to name the timeout keys to raise", note)
+	}
+	if strings.Contains(note, "embedding.disabled") {
+		t.Errorf("note = %q, must not advise disabling embeddings for a pure timeout degrade", note)
+	}
+
+	// A degrade with non-timeout failures keeps the original wording.
+	h.EmbedderDiag.TimeoutBound = false
+	if got := h.EmbedderNote(); !strings.Contains(got, "embedding.disabled") {
+		t.Errorf("non-timeout degrade note = %q, want the original remediation hint", got)
+	}
+}
+
+// TestEmbedderDiagLines pins the evidence block `hap status` prints, including
+// the "no diagnostics at all" case an older daemon's heartbeat produces.
+func TestEmbedderDiagLines(t *testing.T) {
+	if lines := (Health{Embedder: EmbedderDegraded}).EmbedderDiagLines(); lines != nil {
+		t.Errorf("lines without diagnostics = %v, want none", lines)
+	}
+	// Nothing has failed: stay silent. The budgets are always populated (they
+	// are the resolved defaults), so an unconditional line would print on every
+	// healthy status forever.
+	if lines := (Health{EmbedderDiag: &EmbedderDiag{EmbedTimeoutMs: 2000, WarmTimeoutMs: 30000}}).EmbedderDiagLines(); lines != nil {
+		t.Errorf("lines = %v, want none when nothing has failed", lines)
+	}
+
+	lines := Health{EmbedderDiag: &EmbedderDiag{
+		Failures: 5, Timeouts: 4, MaxFailures: 3,
+		EmbedTimeoutMs: 2000, WarmTimeoutMs: 30000,
+		LastError: "embed call exceeded 2s stall guard",
+	}}.EmbedderDiagLines()
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{"failures: 5 (4 timeouts)", "latch at 3", "budgets: embed 2000ms", "last error: embed call exceeded 2s stall guard"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("lines = %v, want a line containing %q", lines, want)
+		}
+	}
+}
+
+// TestHealthRoundTripsDiagnostics guards the wire format: the diagnostics must
+// survive the heartbeat file, and a record written without them must read back
+// as nil (older daemons) rather than as zeroed counters that look real.
+func TestHealthRoundTripsDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	in := Health{PID: 42, Embedder: EmbedderDegraded, EmbedderDiag: &EmbedderDiag{
+		Failures: 3, Timeouts: 3, MaxFailures: 3, EmbedTimeoutMs: 2000, TimeoutBound: true,
+	}}
+	if err := Write(dir, in); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := Read(dir)
+	if !ok {
+		t.Fatal("Read after Write: not found")
+	}
+	if got.EmbedderDiag == nil {
+		t.Fatal("EmbedderDiag lost in the round trip")
+	}
+	if *got.EmbedderDiag != *in.EmbedderDiag {
+		t.Errorf("EmbedderDiag = %+v, want %+v", *got.EmbedderDiag, *in.EmbedderDiag)
+	}
+
+	if err := Write(dir, Health{PID: 42, Embedder: EmbedderReady}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := Read(dir); got.EmbedderDiag != nil {
+		t.Errorf("EmbedderDiag = %+v, want nil when never reported", *got.EmbedderDiag)
+	}
+}
+
 func TestOpenStderrLogAppendsThenRotates(t *testing.T) {
 	dir := t.TempDir()
 

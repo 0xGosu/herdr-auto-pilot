@@ -55,6 +55,31 @@ type Health struct {
 	StartedAt   time.Time     `json:"started_at"`
 	HeartbeatAt time.Time     `json:"heartbeat_at"`
 	Embedder    EmbedderState `json:"embedder"`
+	// EmbedderDiag explains a non-ready embedder. Absent (nil) on older
+	// daemons and whenever the engine offers no diagnostics — readers must
+	// treat it as optional and fall back to the bare Embedder state.
+	EmbedderDiag *EmbedderDiag `json:"embedder_diag,omitempty"`
+}
+
+// EmbedderDiag is the heartbeat's copy of embedder.Diagnostics. It lives here
+// rather than being imported from internal/embedder so the health record stays
+// a plain serializable struct (and daemonhealth keeps no CGO-tagged dependency).
+//
+// It exists because "degraded" on its own is not actionable: a model that is
+// merely slower than the stall guard latches off exactly like a broken one, and
+// only the timeout counters and the last error distinguish them.
+type EmbedderDiag struct {
+	ConsecutiveFailures int    `json:"consecutive_failures,omitempty"`
+	MaxFailures         int    `json:"max_failures,omitempty"`
+	Timeouts            int    `json:"timeouts,omitempty"`
+	Failures            int    `json:"failures,omitempty"`
+	LastError           string `json:"last_error,omitempty"`
+	EmbedTimeoutMs      int    `json:"embed_timeout_ms,omitempty"`
+	WarmTimeoutMs       int    `json:"warm_timeout_ms,omitempty"`
+	// TimeoutBound marks the case where every failure was a stall-guard
+	// expiry — i.e. raising the budgets is the remedy, not disabling
+	// embeddings.
+	TimeoutBound bool `json:"timeout_bound,omitempty"`
 }
 
 // FileName is the health file's basename inside the state dir.
@@ -133,10 +158,37 @@ func (h Health) Age(now time.Time) time.Duration {
 // EmbedderNote returns a human-facing suffix describing a non-ready embedder,
 // or "" when ready/unknown (nothing to warn about).
 func (h Health) EmbedderNote() string {
-	switch h.Embedder {
-	case EmbedderDegraded:
-		return fmt.Sprintf("%s (embedder fell back to text matching; run: hap config set embedding.disabled true to silence)", h.Embedder)
-	default:
+	if h.Embedder != EmbedderDegraded {
 		return string(h.Embedder)
 	}
+	// A purely timeout-driven degrade is a tuning problem, not a broken
+	// embedder: pointing that operator at `embedding.disabled` would throw away
+	// semantic matching for a model that only needed a longer budget.
+	if d := h.EmbedderDiag; d != nil && d.TimeoutBound {
+		return fmt.Sprintf("%s (every embed hit the stall guard; raise `embedding.embed_timeout_ms` (now %dms) / `embedding.warm_timeout_ms` (now %dms) — changing [embedding] config rebuilds the embedder and clears this)",
+			h.Embedder, d.EmbedTimeoutMs, d.WarmTimeoutMs)
+	}
+	return fmt.Sprintf("%s (embedder fell back to text matching; run: hap config set embedding.disabled true to silence)", h.Embedder)
+}
+
+// EmbedderDiagLines renders the diagnostic evidence behind a degraded embedder
+// as indented detail lines (empty when there is nothing to add), so `hap status`
+// and the TUI show the same explanation.
+func (h Health) EmbedderDiagLines() []string {
+	d := h.EmbedderDiag
+	// Nothing has gone wrong: stay silent. The budgets are always populated
+	// (they are the resolved defaults), so printing them unconditionally would
+	// add noise to every healthy `hap status` forever.
+	if d == nil || (d.Failures == 0 && d.Timeouts == 0) {
+		return nil
+	}
+	lines := []string{
+		fmt.Sprintf("failures: %d (%d timeouts), latch at %d consecutive",
+			d.Failures, d.Timeouts, d.MaxFailures),
+		fmt.Sprintf("budgets: embed %dms, warm %dms", d.EmbedTimeoutMs, d.WarmTimeoutMs),
+	}
+	if d.LastError != "" {
+		lines = append(lines, "last error: "+d.LastError)
+	}
+	return lines
 }

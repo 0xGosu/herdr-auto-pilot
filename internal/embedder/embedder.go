@@ -16,7 +16,7 @@
 package embedder
 
 import (
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"time"
@@ -27,18 +27,33 @@ import (
 // DefaultModelFile is the bundled embedding model installed by install.sh.
 const DefaultModelFile = "all-minilm-l6-v2-q8_0.gguf"
 
-// embedTimeout bounds one embed call once the model is warm. A purego/cgo
-// call cannot be cancelled, so the guard converts a hung native call into an
-// error; the leaked goroutine is bounded by the degraded latch.
-const embedTimeout = 2 * time.Second
+// DefaultEmbedTimeoutMs bounds one embed call once the model is warm. A
+// purego/cgo call cannot be cancelled, so the guard converts a hung native
+// call into an error; the leaked goroutine is bounded by the degraded latch.
+// Sized for the bundled MiniLM; override via Embedding.EmbedTimeoutMs for a
+// larger model (#/embedding timeouts) so it does not latch off permanently.
+const DefaultEmbedTimeoutMs = 2000
 
-// warmTimeout bounds the first call, which includes loading the model.
-const warmTimeout = 30 * time.Second
+// DefaultWarmTimeoutMs bounds the first call, which includes loading the model.
+const DefaultWarmTimeoutMs = 30000
 
-// maxConsecutiveFailures latches the embedder into degraded mode: after this
-// many consecutive errors/timeouts every call fails fast and the daemon
-// stays on its fallback path for the process lifetime.
-const maxConsecutiveFailures = 3
+// DefaultMaxConsecutiveFailures latches the embedder into degraded mode: after
+// this many consecutive errors/timeouts every call fails fast and the daemon
+// stays on its fallback path until the [embedding] config changes.
+const DefaultMaxConsecutiveFailures = 3
+
+// minEmbedTimeoutMs / minWarmTimeoutMs floor any positive override. A budget
+// below these cannot complete even a trivial embed, so it would guarantee the
+// degrade latch — always a misconfiguration; clamp up rather than trust it.
+const (
+	minEmbedTimeoutMs = 100
+	minWarmTimeoutMs  = 1000
+)
+
+// maxFailureCeiling caps MaxConsecutiveFailures. Far above any useful setting,
+// but low enough that the int32 failure counters can never wrap (see
+// ResolveMaxFailures).
+const maxFailureCeiling = 1000
 
 // DefaultContextWindow is the BERT/MiniLM position-embedding limit (n_ctx) of
 // the bundled all-MiniLM-L6-v2: 512 position rows. Feeding GetEmbeddings a
@@ -64,8 +79,87 @@ const minContextWindow = 256
 // and its tests can still reference the boundary.
 const specialTokenHeadroom = 8
 
-// ErrDegraded is returned once the failure latch has tripped.
-var ErrDegraded = fmt.Errorf("embedder degraded after %d consecutive failures", maxConsecutiveFailures)
+// ErrDegraded is returned once the failure latch has tripped. The threshold is
+// configurable (Embedding.MaxConsecutiveFailures), so it is not baked into the
+// message; the daemon's diagnostics report the actual count and last reason.
+var ErrDegraded = errors.New("embedder degraded after too many consecutive embed failures")
+
+// ResolveEmbedTimeout returns the effective warm-call stall guard: the built-in
+// default when unset/non-positive, otherwise the override floored to
+// minEmbedTimeoutMs. Like ResolveContextWindow, this is the single chokepoint
+// every construction path goes through, so no unusable budget reaches an engine.
+func ResolveEmbedTimeout(cfg config.Embedding) time.Duration {
+	return resolveTimeout(cfg.EmbedTimeoutMs, DefaultEmbedTimeoutMs, minEmbedTimeoutMs)
+}
+
+// ResolveWarmTimeout returns the effective first-call (model load) budget,
+// defaulted and floored the same way as ResolveEmbedTimeout.
+func ResolveWarmTimeout(cfg config.Embedding) time.Duration {
+	return resolveTimeout(cfg.WarmTimeoutMs, DefaultWarmTimeoutMs, minWarmTimeoutMs)
+}
+
+func resolveTimeout(ms, def, min int) time.Duration {
+	if ms <= 0 {
+		ms = def
+	}
+	if ms < min {
+		ms = min
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// ResolveMaxFailures returns the effective degrade-latch threshold: the
+// built-in default when unset/non-positive, otherwise the configured count
+// capped at maxFailureCeiling. The cap is load-bearing, not cosmetic: the
+// counters are int32, so an absurd value would wrap negative and latch
+// degraded on the FIRST failure — the exact inverse of what an operator
+// raising this asked for.
+func ResolveMaxFailures(cfg config.Embedding) int {
+	n := cfg.MaxConsecutiveFailures
+	if n <= 0 {
+		return DefaultMaxConsecutiveFailures
+	}
+	if n > maxFailureCeiling {
+		return maxFailureCeiling
+	}
+	return n
+}
+
+// Diagnostics is a snapshot of an embedder's runtime health. It exists so an
+// operator can see WHY semantic matching fell back to text search — "degraded"
+// alone cannot distinguish a missing model from a model that is simply slower
+// than the stall guard, and the latter is fixed by raising a timeout rather
+// than by giving up on embeddings. Produced by the optional Diagnostics()
+// accessor (type-asserted, like Degraded()) and published in the daemon's
+// health heartbeat.
+type Diagnostics struct {
+	// Degraded reports whether the failure latch has tripped.
+	Degraded bool
+	// ConsecutiveFailures is the current run of back-to-back failures (reset
+	// by any success); MaxFailures is what latches degraded mode.
+	ConsecutiveFailures int
+	MaxFailures         int
+	// Timeouts counts stall-guard expiries over the embedder's lifetime;
+	// Failures counts failures of every kind. Timeouts dominating Failures is
+	// the signature of "the model needs a bigger budget".
+	Timeouts int
+	Failures int
+	// LastError is the most recent failure message (stall guard text, worker
+	// stderr tail, or the engine's own error). Empty when nothing has failed.
+	LastError string
+	// EmbedTimeout / WarmTimeout are the budgets actually in force, after
+	// defaulting and clamping — the numbers an operator would raise.
+	EmbedTimeout time.Duration
+	WarmTimeout  time.Duration
+}
+
+// TimeoutBound reports whether the evidence points at the stall guards rather
+// than at a broken model: something timed out, and every failure so far was a
+// timeout. That is the case where raising embed_timeout_ms / warm_timeout_ms
+// is the right remedy, so the operator gets told exactly that.
+func (d Diagnostics) TimeoutBound() bool {
+	return d.Timeouts > 0 && d.Timeouts >= d.Failures
+}
 
 // ResolveContextWindow returns the effective embedding context window: the
 // bundled model's default when unset/non-positive, otherwise the override

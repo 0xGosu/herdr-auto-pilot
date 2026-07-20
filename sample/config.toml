@@ -172,6 +172,16 @@ bm25_min_score = 0.35       # text-fallback floor when the model is unavailable,
 # clamped to 256. NEVER set this above the real limit of model_path: an
 # oversized context can make llama.cpp abort its isolated embed worker.
 model_context_window = 0
+# Stall guards, in milliseconds. Each embed call is bounded so a hung native
+# call cannot wedge the daemon; max_consecutive_failures back-to-back failures
+# latch matching onto BM25 text search until the [embedding] config changes.
+# The defaults are sized for the bundled MiniLM — a LARGER model_path can blow
+# through them on every call and permanently disable semantic matching, so
+# raise these alongside it. `hap status` reports the budgets in force and
+# whether the failures were timeouts. 0 = built-in default.
+embed_timeout_ms = 0          # 0 → 2000  (one warm embed call)
+warm_timeout_ms = 0           # 0 → 30000 (first call: includes the model load)
+max_consecutive_failures = 0  # 0 → 3     (failures that latch the text fallback)
 # pane_salient_chars controls the fallback signature window: for idle/
 # unclassified situations the signature (and its embedding) is minted from
 # the trailing N characters of pane content. Omit or 0 → built-in default (500).

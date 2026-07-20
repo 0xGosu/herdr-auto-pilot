@@ -29,6 +29,7 @@ func testModel(t *testing.T) Model {
 					Status: "blocked", At: time.Date(2026, 7, 9, 10, 0, 0, 0, time.UTC)},
 			},
 			AgentNames: map[string]string{"w6:p1": "brave-otter"},
+			AgentCwds:  map[string]string{"w6:p1": "/workspaces/herdr-auto-pilot"},
 			Workspaces: map[string]domain.WorkspaceInfo{
 				"w6": {ID: "w6", Label: "v013-check", Number: 6},
 			},
@@ -116,13 +117,37 @@ func TestDetailViewAgents(t *testing.T) {
 		}
 	}
 	// The counters read in the same order as the Agents list columns
-	// (ESCA → AUTO → CONF → CORR), so the two surfaces agree.
-	esc, auto := strings.Index(view, "Escalations"), strings.Index(view, "Auto-sends")
+	// (ESCA → AUTO → CONF → CORR), so the two surfaces agree. Asserted over
+	// the full field list, not the rendered viewport: the overlay scrolls, so
+	// the trailing counters need not both fit on the first screen.
+	detail := strings.Join(m.agentDetailLines(m.data.status.MonitoredAgents[0], m.width), "\n")
+	esc, auto := strings.Index(detail, "Escalations"), strings.Index(detail, "Auto-sends")
 	if esc < 0 || auto < 0 {
-		t.Fatalf("detail view should show both counters, got Escalations=%d Auto-sends=%d:\n%s", esc, auto, view)
+		t.Fatalf("detail should show both counters, got Escalations=%d Auto-sends=%d:\n%s", esc, auto, view)
 	}
 	if esc > auto {
 		t.Errorf("detail view should list Escalations before Auto-sends, matching the list columns:\n%s", view)
+	}
+}
+
+// TestDetailViewAgentShowsWorkingDir: the agent detail view names the
+// directory the agent is running in — the fastest way to tell two agents on
+// the same repo (main checkout vs worktree) apart. It is best-effort data, so
+// the row must simply disappear when herdr could not report one, never render
+// an empty or misleading value.
+func TestDetailViewAgentShowsWorkingDir(t *testing.T) {
+	m := press(t, testModel(t), "v")
+	view := m.View()
+	if !strings.Contains(view, "Working dir") || !strings.Contains(view, "/workspaces/herdr-auto-pilot") {
+		t.Errorf("agent detail view missing the working directory:\n%s", view)
+	}
+
+	// Same model without a cwd for this agent: no row at all.
+	m2 := testModel(t)
+	m2.data.status.AgentCwds = nil
+	m2 = press(t, m2, "v")
+	if strings.Contains(m2.View(), "Working dir") {
+		t.Errorf("working-dir row should be omitted when unknown:\n%s", m2.View())
 	}
 }
 

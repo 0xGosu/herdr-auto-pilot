@@ -580,6 +580,10 @@ func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 	if msg.err != nil {
 		return msg
 	}
+	// Agent working directories are an opt-in extra (one `herdr pane get` per
+	// agent, TTL-cached and time-bounded), so the TUI asks for them explicitly
+	// rather than making every GetStatus caller pay.
+	app.FillAgentCwds(ctx, &msg.status)
 	msg.escalations, msg.err = app.Escalations(ctx)
 	if msg.err != nil {
 		return msg
@@ -2715,6 +2719,11 @@ func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 		}))
 	lines = m.detailField(lines, w, "Pane", a.PaneID)
 	lines = m.detailField(lines, w, "Type", a.AgentType)
+	// Working directory: which checkout/worktree this agent is actually in —
+	// the fastest way to tell two same-named agents apart. Best-effort, so the
+	// row is simply absent when herdr cannot report one (detailField skips
+	// empty values).
+	lines = m.detailField(lines, w, "Working dir", m.data.status.AgentCwd(a.AgentID))
 	status := a.Status
 	if m.data.status.AgentDisabled(a.AgentID) {
 		status += " [DISABLED]"
