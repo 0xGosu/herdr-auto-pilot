@@ -9,6 +9,9 @@
   "overrideCommand": false,
   "privileged": true,
   "mounts": [
+    // Mount the herdr config and state to a volume to persist across container rebuilds
+    "source=herdr-config,target=/root/.config/herdr,type=volume",
+    "source=herdr-state,target=/root/.local/state/herdr,type=volume",
     // Enable docker dind
     {
       "source": "dind-var-lib-docker-${devcontainerId}",

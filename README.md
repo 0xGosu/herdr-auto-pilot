@@ -1091,8 +1091,8 @@ go build -o bin/hap ./cmd/hap
 herdr plugin link .
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The specification this plugin
-implements lives in [`docs/specs/herd-auto-prompter/`](docs/specs/herd-auto-prompter/).
+See [CONTRIBUTING.md](CONTRIBUTING.md). The architecture this plugin
+implements is documented in [`docs/architect/herd-auto-prompter-architecture.md`](docs/architect/herd-auto-prompter-architecture.md).
 
 ## License
 

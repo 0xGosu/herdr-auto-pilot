@@ -247,4 +247,4 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
 | `internal/herdr` | herdr CLI + events-socket adapters |
 | `internal/store` | SQLite persistence (WAL; `context_json` is an opaque blob) |
 | `internal/fakeherdr`, `e2e_harness/` | test fakes and the e2e driver |
-| `docs/specs/` | product/solution specs (FR-xxx / NFR-xxx ids used in comments) |
+| `docs/architect/herd-auto-prompter-architecture.md` | consolidated architecture doc (FR-xxx / NFR-xxx ids used in comments) |
