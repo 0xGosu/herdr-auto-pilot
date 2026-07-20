@@ -1735,6 +1735,8 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
+	{Key: "limits.escalation_dedup_window_seconds", TUIEditable: true},
+	{Key: "limits.escalation_dedup_jitter_percent", TUIEditable: true},
 	{Key: "safety.disable_never_auto_seed_patterns", TUIEditable: true},
 	{Key: "llm.command"},       // argv template
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
@@ -1814,6 +1816,10 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.Limits.MaxAutoPromptsPerMinute)
 	case "limits.max_error_retries":
 		return strconv.Itoa(cfg.Limits.MaxErrorRetries)
+	case "limits.escalation_dedup_window_seconds":
+		return strconv.Itoa(cfg.Limits.EscalationDedupWindowSeconds)
+	case "limits.escalation_dedup_jitter_percent":
+		return strconv.Itoa(cfg.Limits.EscalationDedupJitterPercent)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -1951,6 +1957,17 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setInt(&cfg.Limits.MaxAutoPromptsPerMinute)
 		case "limits.max_error_retries":
 			return setInt(&cfg.Limits.MaxErrorRetries)
+		case "limits.escalation_dedup_window_seconds":
+			return setInt(&cfg.Limits.EscalationDedupWindowSeconds)
+		case "limits.escalation_dedup_jitter_percent":
+			// 0-100; 0 disables the tolerance (exact match only), so unlike
+			// setInt this accepts 0 but rejects negatives and values over 100.
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 || v > 100 {
+				return fmt.Errorf("limits.escalation_dedup_jitter_percent must be an integer between 0 and 100 (0 = exact match only), got %q", value)
+			}
+			cfg.Limits.EscalationDedupJitterPercent = v
+			return nil
 		case "llm.timeout_seconds":
 			return setInt(&cfg.LLM.TimeoutSeconds)
 		case "llm.auto_act_confidence_threshold":

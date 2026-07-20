@@ -824,14 +824,18 @@ func (d *Daemon) hasOpenEscalation(ctx context.Context, agentID string) bool {
 // re-processing one, so on doubt the event proceeds to escalate rather than
 // being ignored (the "never a silent drop" architecture rule).
 func (d *Daemon) duplicatePendingEscalation(ctx context.Context, s domain.Situation) bool {
-	pending, err := d.opt.Store.PendingEscalationExcerpts(ctx, s.AgentID, s.AgentType)
+	cfg, _, _ := d.snapshot()
+	window := time.Duration(cfg.Limits.EscalationDedupWindowSeconds) * time.Second
+	resolvedSince := d.opt.Clock.Now().Add(-window)
+	pending, err := d.opt.Store.PendingEscalationExcerpts(ctx, s.AgentID, s.AgentType, resolvedSince)
 	if err != nil {
 		slog.Warn("duplicate-escalation check failed; processing event",
 			"agent", s.AgentID, "pane", s.PaneID, "error", err)
 		return false
 	}
 	return domain.DuplicatesPendingEscalation(s.Type,
-		truncateTailRunes(s.Content, snapshotMaxRunes), snapshotMaxRunes, pending)
+		truncateTailRunes(s.Content, snapshotMaxRunes), snapshotMaxRunes,
+		cfg.Limits.EscalationDedupJitterPercent, pending)
 }
 
 // ignoreDuplicate audits a no-op for an event whose situation already has a

@@ -1236,32 +1236,60 @@ func (s *Store) PendingEscalations(ctx context.Context) ([]domain.AuditRecord, e
 // worst case is one redundant operator ask, never a silent drop.
 const PendingEscalationDedupLimit = 128
 
-// PendingEscalationExcerpts returns the pane excerpts of the most recent pending
-// escalations awaiting the operator for this agent + agent type (newest first,
-// capped at PendingEscalationDedupLimit) — the candidate set for the daemon's
-// duplicate-ask check. It is NOT scoped by situation_type: that field is DERIVED
-// from the agent status (the classifier gates the approval/choice rules on herdr
-// reporting "blocked"), so one standing screen re-fired as idle reclassifies,
-// and scoping by it would miss the very re-delivery this dedups. The excerpt
-// comparison, which is the real key, happens in
-// domain.DuplicatesPendingEscalation.
+// PendingEscalationExcerpts returns the pane excerpts of the escalations that
+// dedup a re-fire for this agent + agent type (newest first, capped at
+// PendingEscalationDedupLimit) — the candidate set for the daemon's
+// duplicate-ask check. Two groups qualify:
+//   - every still-pending ('escalated') escalation, ANY age — a menu awaiting
+//     the operator from an hour ago must still dedup its re-delivery;
+//   - every 'resolved' escalation raised at or after resolvedSince WHOSE answer
+//     was actually DELIVERED (a correction with sent=1). Once the operator
+//     answers and the keystroke lands, the agent is unblocked, so herdr's
+//     re-delivered event (the same screen replayed after the pane was read) is a
+//     stale duplicate; without this recently-resolved window it would raise a
+//     second, duplicate ask.
 //
-// The status='escalated' filter is served by idx_audit_status, and pending
-// escalations are globally few (the dedup prevents identical ones from
-// stacking), so the scan stays bounded; the LIMIT additionally caps the Go-side
-// normalization.
+// The sent=1 requirement is load-bearing, not cosmetic: a LEARN-ONLY shadow
+// confirmation (`hap confirm`, send=false) also resolves the escalation but
+// delivers NOTHING, so the agent stays blocked and MUST re-escalate to
+// accumulate confirmations toward graduation (TestConfirmDrivenShadowToAutoPromotion).
+// Keying the window on a delivered answer suppresses genuine stale duplicates
+// while leaving the shadow-learning re-escalation loop intact.
+//
+// created_at (when the escalation was RAISED) is the window reference rather
+// than a resolved-at timestamp: escalations resolve within seconds of being
+// raised, so it is an adequate proxy and avoids a schema migration. The caller
+// derives resolvedSince as now-window.
+//
+// It is NOT scoped by situation_type: that field is DERIVED from the agent
+// status (the classifier gates the approval/choice rules on herdr reporting
+// "blocked"), so one standing screen re-fired as idle reclassifies, and scoping
+// by it would miss the very re-delivery this dedups. The excerpt comparison,
+// which is the real key, happens in domain.DuplicatesPendingEscalation.
+//
+// The agent_id filter is served by idx_audit_agent and the newest-first LIMIT
+// caps the returned rows and the Go-side normalization. The resolved branch's
+// created_at window and the per-row corrections EXISTS are NOT index-served
+// (matching the pre-existing llm_retries EXISTS), so the planner examines this
+// agent's audit rows to satisfy the ORDER BY; that stays cheap in practice
+// because one agent's rows are few and corrections is a small table, but it is
+// not a hard index-bounded scan.
 //
 // Escalations with an unprocessed LLM retry are excluded: the retry explicitly
 // asks to re-evaluate this exact content, so its source row must not suppress
 // the recapture (mirrors the pre-existing dedup query).
-func (s *Store) PendingEscalationExcerpts(ctx context.Context, agentID, agentType string) ([]domain.PendingEscalation, error) {
+func (s *Store) PendingEscalationExcerpts(ctx context.Context, agentID, agentType string, resolvedSince time.Time) ([]domain.PendingEscalation, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT situation_type, pane_excerpt FROM audit_log a
-			WHERE a.status = 'escalated' AND a.agent_id = ? AND a.agent_type = ?
+			WHERE a.agent_id = ? AND a.agent_type = ?
+			  AND ( a.status = 'escalated'
+			        OR (a.status = 'resolved' AND a.created_at >= ?
+			            AND EXISTS (SELECT 1 FROM corrections c
+			                  WHERE c.audit_id = a.id AND c.sent = 1)) )
 			  AND NOT EXISTS (SELECT 1 FROM llm_retries r
 					WHERE r.audit_id = a.id AND r.processed = 0)
 			ORDER BY a.id DESC LIMIT ?`,
-		agentID, agentType, PendingEscalationDedupLimit)
+		agentID, agentType, unix(resolvedSince), PendingEscalationDedupLimit)
 	if err != nil {
 		return nil, err
 	}
