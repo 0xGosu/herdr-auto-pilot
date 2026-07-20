@@ -510,6 +510,13 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	if h.EmbedderDegraded {
 		fmt.Fprintf(out, "embedder health:     DEGRADED at runtime — %s\n", h.EmbedderNote)
 	}
+	// The evidence behind the state: which budgets are in force, how many calls
+	// hit them, and the last error. Printed even when NOT degraded, so a run of
+	// timeouts is visible before the latch trips (the diag lines are empty
+	// unless something actually failed).
+	for _, line := range h.EmbedderDiagLines {
+		fmt.Fprintf(out, "  embedder %s\n", line)
+	}
 	if st.Drift.Detected {
 		// Same shape as the STALE-daemon line: the mismatch and the remedy
 		// in one glance.
@@ -547,6 +554,9 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		fmt.Fprintln(out, "no agents detected (is herdr running?)")
 		return nil
 	}
+	// Working directories are fetched only here (and by the TUI): they cost a
+	// `herdr pane get` per agent, so GetStatus does not pay for them.
+	app.FillAgentCwds(ctx, &st)
 	for _, a := range st.MonitoredAgents {
 		name := st.AgentName(a.AgentID)
 		if name == "" {
@@ -556,8 +566,15 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		if st.AgentDisabled(a.AgentID) {
 			automation = "disabled"
 		}
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\n",
-			name, a.AgentID, a.AgentType, a.Status, automation)
+		// Working directory last: it is the widest, most variable column, and
+		// best-effort — a dash when herdr cannot report one, so the field count
+		// stays constant for anything parsing this output.
+		cwd := st.AgentCwd(a.AgentID)
+		if cwd == "" {
+			cwd = "-"
+		}
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			name, a.AgentID, a.AgentType, a.Status, automation, cwd)
 	}
 	return nil
 }

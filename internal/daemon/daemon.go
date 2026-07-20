@@ -24,6 +24,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/match"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
@@ -533,21 +534,50 @@ func (d *Daemon) snapshot() (config.Config, *domain.NeverAutoList, *classify.Cla
 // record. A hard native abort never reaches here (it kills the process first);
 // this only distinguishes disabled / starting / soft-degraded / ready.
 func (d *Daemon) embedderState() daemonhealth.EmbedderState {
+	state, _ := d.embedderHealth()
+	return state
+}
+
+// embedderHealth reports the semantic-matching state plus, when the engine
+// offers it, the diagnostics explaining a degrade (timeout counts, effective
+// budgets, last error). Diagnostics() is an optional accessor, type-asserted
+// like Degraded() so alternate embedders and fakes keep compiling.
+func (d *Daemon) embedderHealth() (daemonhealth.EmbedderState, *daemonhealth.EmbedderDiag) {
 	d.mu.RLock()
 	disabled := d.cfg.Embedding.Disabled
 	d.mu.RUnlock()
 	if disabled {
-		return daemonhealth.EmbedderDisabled
+		return daemonhealth.EmbedderDisabled, nil
 	}
+	var diag *daemonhealth.EmbedderDiag
+	degraded := false
 	if emb := d.embedderPort(); emb != nil {
-		if deg, ok := emb.(interface{ Degraded() bool }); ok && deg.Degraded() {
-			return daemonhealth.EmbedderDegraded
+		if dg, ok := emb.(interface{ Diagnostics() embedder.Diagnostics }); ok {
+			s := dg.Diagnostics()
+			degraded = s.Degraded
+			diag = &daemonhealth.EmbedderDiag{
+				ConsecutiveFailures: s.ConsecutiveFailures,
+				MaxFailures:         s.MaxFailures,
+				Timeouts:            s.Timeouts,
+				Failures:            s.Failures,
+				LastError:           s.LastError,
+				EmbedTimeoutMs:      int(s.EmbedTimeout / time.Millisecond),
+				WarmTimeoutMs:       int(s.WarmTimeout / time.Millisecond),
+				TimeoutBound:        s.TimeoutBound(),
+			}
+		} else if dg, ok := emb.(interface{ Degraded() bool }); ok {
+			degraded = dg.Degraded()
 		}
 	}
-	if d.semanticReady.Load() {
-		return daemonhealth.EmbedderReady
+	if degraded {
+		return daemonhealth.EmbedderDegraded, diag
 	}
-	return daemonhealth.EmbedderStarting
+	// Keep the diagnostics on a healthy embedder too: a run of timeouts that
+	// has not yet latched is exactly the early warning an operator wants.
+	if d.semanticReady.Load() {
+		return daemonhealth.EmbedderReady, diag
+	}
+	return daemonhealth.EmbedderStarting, diag
 }
 
 // writeHealth refreshes the heartbeat file (best-effort; a failed write is
@@ -556,12 +586,14 @@ func (d *Daemon) writeHealth(startedAt time.Time) {
 	if d.opt.StateDir == "" {
 		return
 	}
+	state, diag := d.embedderHealth()
 	h := daemonhealth.Health{
-		PID:         os.Getpid(),
-		Version:     buildinfo.Version,
-		StartedAt:   startedAt,
-		HeartbeatAt: d.opt.Clock.Now(),
-		Embedder:    d.embedderState(),
+		PID:          os.Getpid(),
+		Version:      buildinfo.Version,
+		StartedAt:    startedAt,
+		HeartbeatAt:  d.opt.Clock.Now(),
+		Embedder:     state,
+		EmbedderDiag: diag,
 	}
 	if err := daemonhealth.Write(d.opt.StateDir, h); err != nil {
 		slog.Debug("heartbeat write failed", "error", err)

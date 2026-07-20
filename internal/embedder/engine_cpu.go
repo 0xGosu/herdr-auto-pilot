@@ -35,6 +35,11 @@ type Llama struct {
 	modelPath string
 	ctxWindow int // model position-embedding limit (n_ctx); see DefaultContextWindow
 
+	// Effective stall guards and degrade threshold (already defaulted/clamped).
+	embedTimeout time.Duration
+	warmTimeout  time.Duration
+	maxFailures  int
+
 	initOnce sync.Once
 	initErr  error
 	model    *llama.Model
@@ -46,6 +51,11 @@ type Llama struct {
 	failures atomic.Int32
 	degraded atomic.Bool
 	closed   atomic.Bool
+
+	// Lifetime diagnostics counters (see Diagnostics).
+	timeouts    atomic.Int32
+	allFailures atomic.Int32
+	lastErr     atomic.Pointer[string]
 }
 
 // NewEngine builds the in-process, CGO-backed embedder from config. An empty
@@ -60,8 +70,11 @@ type Llama struct {
 // are the worker and the engine's own tests.
 func NewEngine(cfg config.Embedding) *Llama {
 	return &Llama{
-		modelPath: ResolveModelPath(cfg),
-		ctxWindow: ResolveContextWindow(cfg),
+		modelPath:    ResolveModelPath(cfg),
+		ctxWindow:    ResolveContextWindow(cfg),
+		embedTimeout: ResolveEmbedTimeout(cfg),
+		warmTimeout:  ResolveWarmTimeout(cfg),
+		maxFailures:  ResolveMaxFailures(cfg),
 	}
 }
 
@@ -101,9 +114,9 @@ func (l *Llama) EmbedText(ctx context.Context, text string) ([]float32, error) {
 		return nil, ErrDegraded
 	}
 
-	timeout := embedTimeout
+	timeout, budgetKey := l.embedTimeout, "embedding.embed_timeout_ms"
 	if !l.warmed.Load() { // model load still pending: allow the warm budget
-		timeout = warmTimeout
+		timeout, budgetKey = l.warmTimeout, "embedding.warm_timeout_ms"
 	}
 
 	type result struct {
@@ -133,14 +146,16 @@ func (l *Llama) EmbedText(ctx context.Context, text string) ([]float32, error) {
 		// not at fault, so this must not push toward the degraded latch.
 		return nil, ctx.Err()
 	case <-time.After(timeout):
-		l.recordFailure()
-		return nil, fmt.Errorf("embed call exceeded %s stall guard", timeout)
+		return nil, l.recordFailure(true, stallGuardError(timeout, budgetKey, ""))
 	case r := <-ch:
 		if r.err != nil {
-			l.recordFailure()
-			return nil, r.err
+			// In the worker child this engine's error travels to the parent as
+			// a message string, so the marker in stallGuardError is what keeps
+			// a child-side expiry classified as a timeout there too.
+			return nil, l.recordFailure(IsStallGuard(r.err.Error()), r.err)
 		}
 		l.failures.Store(0)
+		l.lastErr.Store(nil) // recovered: don't report a stale error as current
 		normalize(r.vec)
 		l.dims.Store(int32(len(r.vec)))
 		l.warmed.Store(true)
@@ -202,11 +217,41 @@ func (l *Llama) truncateToBudget(text string) string {
 	return string(runes)
 }
 
-func (l *Llama) recordFailure() {
-	if l.failures.Add(1) >= maxConsecutiveFailures && !l.degraded.Swap(true) {
-		slog.Warn("embedder degraded; semantic matching falls back to text search",
-			"model", l.modelPath, "consecutive_failures", maxConsecutiveFailures)
+// recordFailure counts one failure toward the degrade latch, remembers it for
+// the diagnostics snapshot, and returns err unchanged so callers can
+// `return nil, l.recordFailure(...)`.
+func (l *Llama) recordFailure(timedOut bool, err error) error {
+	msg := err.Error()
+	l.lastErr.Store(&msg)
+	l.allFailures.Add(1)
+	if timedOut {
+		l.timeouts.Add(1)
 	}
+	if l.failures.Add(1) >= int32(l.maxFailures) && !l.degraded.Swap(true) {
+		slog.Warn("embedder degraded; semantic matching falls back to text search",
+			"model", l.modelPath, "consecutive_failures", l.maxFailures,
+			"embed_timeout", l.embedTimeout, "warm_timeout", l.warmTimeout,
+			"timeouts", l.timeouts.Load(), "last_error", msg)
+	}
+	return err
+}
+
+// Diagnostics snapshots the engine's runtime health. Mirrors Client.Diagnostics
+// so the worker and the in-process engine report the same shape.
+func (l *Llama) Diagnostics() Diagnostics {
+	d := Diagnostics{
+		Degraded:            l.degraded.Load(),
+		ConsecutiveFailures: int(l.failures.Load()),
+		MaxFailures:         l.maxFailures,
+		Timeouts:            int(l.timeouts.Load()),
+		Failures:            int(l.allFailures.Load()),
+		EmbedTimeout:        l.embedTimeout,
+		WarmTimeout:         l.warmTimeout,
+	}
+	if p := l.lastErr.Load(); p != nil {
+		d.LastError = *p
+	}
+	return d
 }
 
 // ModelID identifies the loaded model for persistence scoping.

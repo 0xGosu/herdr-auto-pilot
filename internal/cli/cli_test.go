@@ -130,7 +130,9 @@ func TestDisableEnableAgentCLI(t *testing.T) {
 		t.Fatal("disable command did not persist state")
 	}
 	out, err = run(t, app, "agents")
-	if err != nil || !strings.Contains(out, "\tdisabled\n") {
+	// The automation column is followed by the working-dir column ("-" when
+	// herdr cannot report one), so match the field, not the line end.
+	if err != nil || !strings.Contains(out, "\tdisabled\t") {
 		t.Fatalf("agents must show disabled indicator, output=%q err=%v", out, err)
 	}
 
@@ -346,6 +348,91 @@ func TestStatusEmbedderDegradedSurfaced(t *testing.T) {
 	if !strings.Contains(out, "hap config set embedding.disabled") {
 		t.Errorf("degraded note must carry the actionable, valid remediation command, got:\n%s", out)
 	}
+}
+
+// TestStatusEmbedderTimeoutDiagnostics is the operator-facing half of making
+// the timeouts configurable: when every embed failure was a stall-guard expiry,
+// `hap status` must print the evidence (counts, budgets, last error) and point
+// at the timeout keys — otherwise a big model looks broken and stays on BM25
+// forever.
+func TestStatusEmbedderTimeoutDiagnostics(t *testing.T) {
+	app, _ := testApp(t)
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, buildinfo.Version }
+
+	if err := daemonhealth.Write(stateDir, daemonhealth.Health{
+		PID: 4242, Version: buildinfo.Version,
+		HeartbeatAt: time.Now(), Embedder: daemonhealth.EmbedderDegraded,
+		EmbedderDiag: &daemonhealth.EmbedderDiag{
+			Failures: 3, Timeouts: 3, MaxFailures: 3,
+			EmbedTimeoutMs: 2000, WarmTimeoutMs: 30000,
+			LastError:    "embed call exceeded 2s stall guard",
+			TimeoutBound: true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "status")
+	if err != nil {
+		t.Fatalf("a degraded embedder is not an unhealthy exit, got err=%v", err)
+	}
+	for _, want := range []string{
+		"embed_timeout_ms",         // the knob to raise
+		"budgets: embed 2000ms",    // what is currently in force
+		"failures: 3 (3 timeouts)", // the evidence it is a timeout problem
+		"exceeded 2s stall guard",  // the actual error
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "hap config set embedding.disabled") {
+		t.Errorf("a pure-timeout degrade must not advise disabling embeddings:\n%s", out)
+	}
+}
+
+// TestAgentsListsWorkingDir: `hap agents` carries the agent's working
+// directory, and falls back to "-" (never a blank field) when herdr cannot
+// report one, so the column count stays stable for anything parsing it.
+func TestAgentsListsWorkingDir(t *testing.T) {
+	app, _ := testApp(t)
+	app.Herdr = &cwdCaptureHerdr{
+		captureHerdr: captureHerdr{agents: []domain.AgentTransition{
+			{AgentID: "pane-a", PaneID: "pane-a", AgentType: "claude", Status: "idle"},
+			{AgentID: "pane-b", PaneID: "pane-b", AgentType: "claude", Status: "idle"},
+		}},
+		info: map[string]domain.PaneInfo{"pane-a": {Cwd: "/repo", ForegroundCwd: "/repo/sub"}},
+	}
+
+	out, err := run(t, app, "agents")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("agents output = %q, want 2 rows", out)
+	}
+	if !strings.HasSuffix(lines[0], "\t/repo/sub") {
+		t.Errorf("row = %q, want it to end with the foreground cwd", lines[0])
+	}
+	if !strings.HasSuffix(lines[1], "\t-") {
+		t.Errorf("row = %q, want a dash when no cwd is known", lines[1])
+	}
+	if got, want := strings.Count(lines[0], "\t"), strings.Count(lines[1], "\t"); got != want {
+		t.Errorf("column counts differ (%d vs %d): %q / %q", got, want, lines[0], lines[1])
+	}
+}
+
+// cwdCaptureHerdr adds the optional InspectorPort to captureHerdr.
+type cwdCaptureHerdr struct {
+	captureHerdr
+	info map[string]domain.PaneInfo
+}
+
+func (f *cwdCaptureHerdr) PaneInfo(_ context.Context, paneID string) (domain.PaneInfo, error) {
+	return f.info[paneID], nil
 }
 
 func seedSignatures(t *testing.T, st *store.Store) {

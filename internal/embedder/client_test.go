@@ -68,7 +68,7 @@ func TestProtocolRoundTrip(t *testing.T) {
 // TestClientWorkerCrashDegrades is the core correctness assertion for #60: a
 // worker that aborts natively (mimicked by HAP_EMBED_WORKER_CRASH exiting the
 // child before it responds) surfaces as a Go ERROR on the parent — never a
-// panic or a parent death — and after maxConsecutiveFailures the Client latches
+// panic or a parent death — and after the configured failure ceiling the Client latches
 // ErrDegraded, i.e. semantic matching degrades to BM25 while the daemon stays
 // up. Needs no model AND no CGO engine: the worker exits before loading one, so
 // this runs in the tag-free (stub) build too, covering the Client supervision
@@ -81,7 +81,7 @@ func TestClientWorkerCrashDegrades(t *testing.T) {
 	defer c.Close()
 
 	ctx := context.Background()
-	for i := 0; i < maxConsecutiveFailures; i++ {
+	for i := 0; i < DefaultMaxConsecutiveFailures; i++ {
 		vec, err := c.EmbedText(ctx, "anything")
 		if err == nil {
 			t.Fatalf("call %d: a crashing worker must surface an error", i)
@@ -90,13 +90,13 @@ func TestClientWorkerCrashDegrades(t *testing.T) {
 			t.Fatalf("call %d: got a vector from a crashing worker", i)
 		}
 		if errors.Is(err, ErrDegraded) {
-			t.Fatalf("call %d: latched too early (before %d failures)", i, maxConsecutiveFailures)
+			t.Fatalf("call %d: latched too early (before %d failures)", i, DefaultMaxConsecutiveFailures)
 		}
 	}
 
 	// Latch tripped: further calls fail fast with ErrDegraded, no subprocess.
 	if _, err := c.EmbedText(ctx, "anything"); !errors.Is(err, ErrDegraded) {
-		t.Errorf("after %d worker crashes err = %v, want ErrDegraded", maxConsecutiveFailures, err)
+		t.Errorf("after %d worker crashes err = %v, want ErrDegraded", DefaultMaxConsecutiveFailures, err)
 	}
 	if !c.Degraded() {
 		t.Error("Degraded() = false after the latch tripped")

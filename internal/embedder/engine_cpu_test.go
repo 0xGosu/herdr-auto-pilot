@@ -155,14 +155,14 @@ func TestEmbedMissingModelDegrades(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	for i := 0; i < maxConsecutiveFailures; i++ {
+	for i := 0; i < DefaultMaxConsecutiveFailures; i++ {
 		if _, err := l.EmbedText(ctx, "anything"); err == nil {
 			t.Fatal("missing model should error")
 		}
 	}
 	// Latch tripped: fails fast with ErrDegraded.
 	if _, err := l.EmbedText(ctx, "anything"); err != ErrDegraded {
-		t.Errorf("after %d failures err = %v, want ErrDegraded", maxConsecutiveFailures, err)
+		t.Errorf("after %d failures err = %v, want ErrDegraded", DefaultMaxConsecutiveFailures, err)
 	}
 }
 

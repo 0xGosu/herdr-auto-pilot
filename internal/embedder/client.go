@@ -36,6 +36,13 @@ type Client struct {
 	modelPath string
 	ctxWindow int // model context window forwarded to the worker (0 = worker default)
 
+	// Stall guards and the degrade threshold, already defaulted/clamped by the
+	// Resolve* helpers so every path sees the same effective numbers as the
+	// diagnostics report.
+	embedTimeout time.Duration
+	warmTimeout  time.Duration
+	maxFailures  int
+
 	// execPath/execArgs/extraEnv build the worker command. Production uses the
 	// running binary's `embed-worker` subcommand; tests inject a re-exec of the
 	// test binary via NewReexecClient. The model config always travels in the
@@ -51,6 +58,11 @@ type Client struct {
 	failures atomic.Int32
 	degraded atomic.Bool
 	closed   atomic.Bool
+
+	// Lifetime diagnostics counters (see Diagnostics).
+	timeouts    atomic.Int32
+	allFailures atomic.Int32
+	lastErr     atomic.Pointer[string]
 }
 
 // stderrTailBytes bounds the captured worker stderr kept for the degrade
@@ -62,9 +74,12 @@ const stderrTailBytes = 8 << 10
 // `hap embed-worker` subcommand; nothing spawns until the first EmbedText.
 func New(cfg config.Embedding) *Client {
 	return &Client{
-		modelPath: ResolveModelPath(cfg),
-		ctxWindow: cfg.ModelContextWindow, // 0 → worker uses DefaultContextWindow
-		execArgs:  []string{"embed-worker"},
+		modelPath:    ResolveModelPath(cfg),
+		ctxWindow:    cfg.ModelContextWindow, // 0 → worker uses DefaultContextWindow
+		embedTimeout: ResolveEmbedTimeout(cfg),
+		warmTimeout:  ResolveWarmTimeout(cfg),
+		maxFailures:  ResolveMaxFailures(cfg),
+		execArgs:     []string{"embed-worker"},
 	}
 }
 
@@ -103,6 +118,11 @@ func (c *Client) spawn() (*worker, error) {
 	cmd.Env = append(os.Environ(),
 		EnvWorkerModel+"="+c.modelPath,
 		EnvWorkerContextWindow+"="+strconv.Itoa(c.ctxWindow),
+		// Same budgets on both sides of the pipe, so the child's own guard can
+		// never pre-empt a raised parent budget (see EnvWorkerEmbedTimeout).
+		EnvWorkerEmbedTimeout+"="+strconv.Itoa(int(c.embedTimeout/time.Millisecond)),
+		EnvWorkerWarmTimeout+"="+strconv.Itoa(int(c.warmTimeout/time.Millisecond)),
+		EnvWorkerMaxFailures+"="+strconv.Itoa(c.maxFailures),
 	)
 	cmd.Env = append(cmd.Env, c.extraEnv...)
 
@@ -149,8 +169,7 @@ func (c *Client) EmbedText(ctx context.Context, text string) ([]float32, error) 
 
 	w, err := c.ensureWorker()
 	if err != nil {
-		c.recordFailure()
-		return nil, err
+		return nil, c.recordFailure(false, err)
 	}
 
 	// The warm budget is per-worker, not per-client: a freshly (re)spawned
@@ -159,9 +178,9 @@ func (c *Client) EmbedText(ctx context.Context, text string) ([]float32, error) 
 	// bill a post-crash cold reload at the short stall timeout and could turn a
 	// single transient worker death into a permanent BM25 latch. The daemon's
 	// Dims()>0 gate still keeps the select loop off the very first (cold) load.
-	timeout := embedTimeout
+	timeout, budgetKey := c.embedTimeout, "embedding.embed_timeout_ms"
 	if !w.warmed.Load() {
-		timeout = warmTimeout
+		timeout, budgetKey = c.warmTimeout, "embedding.warm_timeout_ms"
 	}
 
 	type result struct {
@@ -187,8 +206,10 @@ func (c *Client) EmbedText(ctx context.Context, text string) ([]float32, error) 
 		return nil, ctx.Err()
 	case <-time.After(timeout):
 		reason := c.stopWorker(w)
-		c.recordFailure()
-		return nil, fmt.Errorf("embed call exceeded %s stall guard%s", timeout, stderrSuffix(reason))
+		// Name the budget that expired and how to raise it: a model bigger than
+		// the bundled MiniLM legitimately needs longer, and without this the
+		// operator only ever sees "degraded" and assumes a broken model.
+		return nil, c.recordFailure(true, stallGuardError(timeout, budgetKey, stderrSuffix(reason)))
 	case r := <-ch:
 		if r.err != nil {
 			var embErr *EmbedError
@@ -196,16 +217,24 @@ func (c *Client) EmbedText(ctx context.Context, text string) ([]float32, error) 
 				// The worker is alive and the pipe is in sync — a plain embed
 				// failure (missing model, bad input, worker-side degrade). Keep
 				// the warm worker; just count the failure.
-				c.recordFailure()
-				return nil, fmt.Errorf("embed: %s", embErr.Msg)
+				//
+				// The child runs the SAME stall guard, so when its timer wins
+				// the race its expiry arrives here as an ordinary embed error.
+				// Classify it by the marker: counting it as a generic failure
+				// would leave Timeouts at 0 and make `hap status` advise
+				// disabling embeddings when the fix is a bigger budget.
+				return nil, c.recordFailure(IsStallGuard(embErr.Msg), fmt.Errorf("embed: %s", embErr.Msg))
 			}
 			// Transport error: the worker died (native abort) or the pipe
 			// desynced. Tear it down; the next call respawns a fresh one.
 			reason := c.stopWorker(w)
-			c.recordFailure()
-			return nil, fmt.Errorf("embed worker crashed: %w%s", r.err, stderrSuffix(reason))
+			return nil, c.recordFailure(false, fmt.Errorf("embed worker crashed: %w%s", r.err, stderrSuffix(reason)))
 		}
 		c.failures.Store(0)
+		// Drop the remembered error too: a recovered embedder must not keep
+		// showing a stale "last error" in `hap status` as if it were current.
+		// The lifetime counters stay — they are the history.
+		c.lastErr.Store(nil)
 		// The worker's engine already L2-normalized the vector before framing it.
 		c.dims.Store(int32(len(r.vec)))
 		w.warmed.Store(true)
@@ -234,11 +263,43 @@ func (c *Client) stopWorker(w *worker) string {
 	return w.stderr.String()
 }
 
-func (c *Client) recordFailure() {
-	if c.failures.Add(1) >= maxConsecutiveFailures && !c.degraded.Swap(true) {
-		slog.Warn("embedder degraded; semantic matching falls back to text search",
-			"model", c.modelPath, "consecutive_failures", maxConsecutiveFailures)
+// recordFailure counts one failure toward the degrade latch, remembers it for
+// the diagnostics snapshot, and returns err unchanged so callers can
+// `return nil, c.recordFailure(...)`.
+func (c *Client) recordFailure(timedOut bool, err error) error {
+	msg := err.Error()
+	c.lastErr.Store(&msg)
+	c.allFailures.Add(1)
+	if timedOut {
+		c.timeouts.Add(1)
 	}
+	if c.failures.Add(1) >= int32(c.maxFailures) && !c.degraded.Swap(true) {
+		// Log the effective budgets with the latch: this line is often the only
+		// forensic record of WHY matching went quiet, and the timeouts are the
+		// knob that fixes a merely-slow model.
+		slog.Warn("embedder degraded; semantic matching falls back to text search",
+			"model", c.modelPath, "consecutive_failures", c.maxFailures,
+			"embed_timeout", c.embedTimeout, "warm_timeout", c.warmTimeout,
+			"timeouts", c.timeouts.Load(), "last_error", msg)
+	}
+	return err
+}
+
+// Diagnostics snapshots the embedder's runtime health for the daemon heartbeat.
+func (c *Client) Diagnostics() Diagnostics {
+	d := Diagnostics{
+		Degraded:            c.degraded.Load(),
+		ConsecutiveFailures: int(c.failures.Load()),
+		MaxFailures:         c.maxFailures,
+		Timeouts:            int(c.timeouts.Load()),
+		Failures:            int(c.allFailures.Load()),
+		EmbedTimeout:        c.embedTimeout,
+		WarmTimeout:         c.warmTimeout,
+	}
+	if p := c.lastErr.Load(); p != nil {
+		d.LastError = *p
+	}
+	return d
 }
 
 // ModelID identifies the loaded model for persistence scoping.

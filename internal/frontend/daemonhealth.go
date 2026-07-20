@@ -59,6 +59,12 @@ type DaemonHealth struct {
 	// EmbedderNote is the daemonhealth remediation text for a degraded embedder
 	// (single source of the exact wording, incl. the `hap config set …` hint).
 	EmbedderNote string
+	// EmbedderDiagLines is the evidence behind the embedder's state — failure
+	// and timeout counts, the effective stall-guard budgets, the last error —
+	// rendered as indented detail lines. Present whenever the daemon reported
+	// diagnostics and something has failed, degraded or not: a run of timeouts
+	// short of the latch is the early warning that the budgets are too tight.
+	EmbedderDiagLines []string
 	// Reason explains a gave-up / auto-disabled latch.
 	Reason string
 	// StderrLog is the captured daemon stderr path (for hung/crashed post-mortem).
@@ -94,6 +100,7 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 				h.EmbedderDegraded = true
 				h.EmbedderNote = rec.EmbedderNote()
 			}
+			h.EmbedderDiagLines = rec.EmbedderDiagLines()
 		}
 	}
 	if g, ok := crashguard.Read(a.StateDir); ok {
