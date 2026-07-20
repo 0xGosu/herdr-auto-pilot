@@ -289,9 +289,11 @@ type ReadStore interface {
 	CountPendingEscalations(ctx context.Context) (int64, error)
 	// PendingEscalationExcerpts returns the pane excerpts of the escalations that
 	// dedup a re-fire for this agent + agent type: every still-pending one (any
-	// age) plus every one resolved at or after resolvedSince WHOSE answer was
-	// delivered (so a genuinely-answered escalation suppresses its own stale
-	// re-delivery, while a learn-only shadow confirmation still re-escalates). The
+	// age) plus every originally-escalated ask whose answer was DELIVERED
+	// (correction sent=1) at or after resolvedSince (measured from delivery time,
+	// not raise time). So a genuinely-answered escalation suppresses its own stale
+	// re-delivery, while a learn-only shadow confirmation still re-escalates and a
+	// post-hoc correction of an autonomous action does not masquerade as one. The
 	// excerpt comparison itself lives in domain.DuplicatesPendingEscalation.
 	PendingEscalationExcerpts(ctx context.Context, agentID, agentType string, resolvedSince time.Time) ([]domain.PendingEscalation, error)
 	UnprocessedCorrections(ctx context.Context) ([]domain.CorrectionRecord, error)

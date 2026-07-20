@@ -268,25 +268,29 @@ func DuplicatesPendingEscalation(sitType SituationType, excerpt string, snapshot
 			}
 			return true
 		}
-		// Both fuzzy paths (suffix shift, jitter tolerance) require two large tail
-		// windows whose first lines do NOT discriminate. A differing first line is
-		// a different question, not jitter: the classic approval shape puts the
-		// command ("Bash(npm install)") on the first line above an otherwise
-		// identical menu/body, and over a large body two such screens are >95%
-		// similar — so without this guard the jitter path would silently collapse
-		// two genuinely different approvals. firstLineExplained is the same guard
-		// the suffix path has always used; it holds for real jitter (matching or
-		// head-shifted first lines) and refuses for a discriminating command line.
-		bothLargeTailWindows := freshWindowed &&
-			utf8.RuneCountInString(p.PaneExcerpt)*2 >= snapshotCap &&
-			firstLineExplained(excerpt, p.PaneExcerpt)
-		if !bothLargeTailWindows {
+		// Both fuzzy paths require two large tail windows.
+		bothLarge := freshWindowed && utf8.RuneCountInString(p.PaneExcerpt)*2 >= snapshotCap
+		if !bothLarge {
 			continue
 		}
-		if suffixDuplicate(suffixKey, NormalizeForDedup(dropFirstLine(p.PaneExcerpt))) {
+		// Suffix path (head-shift tolerant): the first line may be a truncation
+		// fragment, so it uses firstLineExplained (fragment-of-the-other) and an
+		// EXACT suffix match, which is order-sensitive and safe.
+		if firstLineExplained(excerpt, p.PaneExcerpt) &&
+			suffixDuplicate(suffixKey, NormalizeForDedup(dropFirstLine(p.PaneExcerpt))) {
 			return true
 		}
-		if jitterPct > 0 && shingleSimilar(keyShingles, keyRunes, pKey, jitterPct) {
+		// Jitter path: trigram-set Jaccard is ORDER-INSENSITIVE, so it demands a
+		// STRONGER first-line guarantee than the suffix path — the first lines must
+		// be IDENTICAL, not merely substring-explained. A substring match is not
+		// enough here: two distinct approval headers ("Bash(npm install)" vs
+		// "Bash(go test ./...)") can each appear in the OTHER capture's scrollback,
+		// passing firstLineExplained, and the order-insensitive set compare would
+		// then collapse two genuinely different approvals — a silent drop. Real
+		// jitter (residual chrome the normalizer missed) is mid-screen and leaves
+		// the first line untouched, so requiring equality costs nothing legitimate.
+		if jitterPct > 0 && firstLinesEqual(excerpt, p.PaneExcerpt) &&
+			shingleSimilar(keyShingles, keyRunes, pKey, jitterPct) {
 			return true
 		}
 	}
@@ -394,6 +398,16 @@ func firstLineIn(src, other string) bool {
 	first, _, _ := strings.Cut(src, "\n")
 	first = strings.TrimSpace(first)
 	return first == "" || strings.Contains(other, first)
+}
+
+// firstLinesEqual reports whether the two captures' trimmed first lines are
+// identical — the strict gate the order-insensitive jitter path uses in place of
+// firstLineExplained, so a discriminating first line (a different command over an
+// otherwise similar body) can never be waved through by a mere substring match.
+func firstLinesEqual(a, b string) bool {
+	fa, _, _ := strings.Cut(a, "\n")
+	fb, _, _ := strings.Cut(b, "\n")
+	return strings.TrimSpace(fa) == strings.TrimSpace(fb)
 }
 
 // dropFirstLine removes the first line of a tail-windowed capture: both the

@@ -360,12 +360,23 @@ func TestDuplicatesPendingEscalationJitter(t *testing.T) {
 		{
 			// Safety: two large approvals with an identical body but a DIFFERENT
 			// first command line are >95% similar as text, yet they are different
-			// questions. firstLineExplained must refuse before the jitter path runs
-			// — otherwise the second approval is silently dropped.
+			// questions. Requiring EQUAL first lines refuses before the jitter path
+			// runs — otherwise the second approval is silently dropped.
 			"large panes differing only in the first command line are NOT collapsed by jitter",
 			"Bash(npm install)\n" + body + "❯ 1. Yes\n  2. No\nstatus bar", 5,
 			[]PendingEscalation{pend(SituationApproval,
 				"Bash(go test ./...)\n"+body+"❯ 1. Yes\n  2. No\nstatus bar")}, false,
+		},
+		{
+			// Safety (the order-insensitive trap): the discriminating first-line
+			// commands ALSO appear in each other's scrollback, so the weaker
+			// firstLineExplained (substring) guard would pass and the trigram SET
+			// compare — which ignores order — would collapse two DIFFERENT
+			// approvals. firstLinesEqual (identity, not substring) refuses.
+			"large panes whose distinct headers appear in each other's body are NOT collapsed",
+			"Bash(npm install)\nnote: earlier Bash(go test ./...) passed\n" + body + "❯ 1. Yes\n  2. No\nstatus bar", 5,
+			[]PendingEscalation{pend(SituationApproval,
+				"Bash(go test ./...)\nnote: earlier Bash(npm install) passed\n"+body+"❯ 1. Yes\n  2. No\nstatus bar")}, false,
 		},
 		{
 			// Safety: two SHORT distinct commands are below the half-cap gate, so

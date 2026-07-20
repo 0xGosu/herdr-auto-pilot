@@ -1011,11 +1011,12 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// declared task list. Best-effort: the escalation is already resolved and
 	// the source established, so a failed learning write must not fail the
 	// confirm — it only skips a learning event.
-	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+	corrID, corrErr := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
 		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
 		Author: a.Author, CreatedAt: time.Now(),
-	}); err != nil {
-		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", err)
+	})
+	if corrErr != nil {
+		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", corrErr)
 	}
 
 	if send && a.Herdr != nil {
@@ -1049,6 +1050,16 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 					"it stays [-] and no agent will pick it up until you clear it", err, pos, rbErr)
 			}
 			return fmt.Errorf("task source created, but sending the task to the agent failed: %w", err)
+		}
+		// The task was delivered, so flag the correction sent — the same
+		// "answer reached the agent" signal the pane-send path records. Idle is
+		// not a verifyunblock situation, so this arms no self-check; it only
+		// lets the recently-resolved dedup window recognize this delivered
+		// confirm. Best-effort: delivery already succeeded.
+		if corrErr == nil {
+			if err := a.Store.MarkCorrectionSent(ctx, corrID); err != nil {
+				slog.Warn("marking generated-task correction sent failed", "audit", audit.ID, "error", err)
+			}
 		}
 	}
 	return a.nudge(ctx, control.KindReload)
@@ -1448,11 +1459,12 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 
 	// Record the correction so the idle signature learns to drive from its
 	// declared task list. Best-effort, as in the bootstrap path.
-	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+	corrID, corrErr := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
 		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
 		Author: a.Author, CreatedAt: time.Now(),
-	}); err != nil {
-		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", err)
+	})
+	if corrErr != nil {
+		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", corrErr)
 	}
 
 	if send && a.Herdr != nil {
@@ -1478,6 +1490,14 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 					"it stays [-] and no agent will pick it up until you clear it", err, firstIndex, rbErr)
 			}
 			return fmt.Errorf("tasks appended to %s, but sending the task to the agent failed: %w", path, err)
+		}
+		// Delivered — flag the correction sent so the recently-resolved dedup
+		// window recognizes this confirm (see the bootstrap path for why this is
+		// safe: idle is not a verifyunblock situation). Best-effort.
+		if corrErr == nil {
+			if err := a.Store.MarkCorrectionSent(ctx, corrID); err != nil {
+				slog.Warn("marking generated-task correction sent failed", "audit", audit.ID, "error", err)
+			}
 		}
 	}
 	return a.nudge(ctx, control.KindReload)
