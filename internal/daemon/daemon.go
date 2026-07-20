@@ -128,8 +128,9 @@ type Daemon struct {
 	// reconnect (pane-topology change), which would re-fire the kickoff
 	// prompt mid-session for long-running agents. A genuinely new agent
 	// almost always arrives in a new pane (new key → first=true naturally);
-	// the rare pane-id reuse forgoes re-priming rather than re-prime on every
-	// reconnect. Guarded by mu.
+	// the rare pane-id REUSE is caught by resetRecycledPaneState, which acts on
+	// herdr's terminal_id — a signal that means "different agent" and, unlike
+	// "detected", never fires on a mere reconnect. Guarded by mu.
 	firstConsult map[string]bool
 	// firstTaskGen marks agents whose first idle task generation has fired, so
 	// the first one can use task_generate_command_start. Same keying/semantics
@@ -971,8 +972,55 @@ func (d *Daemon) syncTerminalIDs(ctx context.Context, agents []domain.AgentTrans
 		if reset {
 			slog.Info("pane id recycled by a new terminal; agent age reset",
 				"agent", a.AgentID, "terminal", a.TerminalID)
+			d.resetRecycledPaneState(ctx, a)
 		}
 	}
+}
+
+// resetRecycledPaneState forgets everything the daemon remembered about the
+// pane's PREVIOUS occupant, once herdr's terminal_id proves a different agent
+// is behind it now. Pane ids are reused, and every one of these maps is keyed
+// by pane or agent id — so without this a fresh agent inherits the dead one's
+// bookkeeping:
+//
+//   - episodeHandled would still read "handled", so the new agent's first
+//     parked episode is never reconciled — it simply sits there;
+//   - captureStarted would still read "started", so its very first capture uses
+//     the SHORT event delay instead of the long start delay, snapshotting a
+//     half-painted TUI;
+//   - a pending capture (and any in-flight action review) belongs to an agent
+//     that no longer exists, and would deliver into the new one's pane;
+//   - lastAutoSend/lastAutoNoop would misattribute the new agent's first
+//     "working" transition to our own automation, suppressing the human
+//     check-in that resets the runaway counter;
+//   - a stale cwd would render the wrong {cwd} in its first task prompt.
+//
+// firstConsult/firstTaskGen are reset too: their doc notes a brand-new agent
+// normally arrives on a NEW pane (so the key is absent and priming happens
+// naturally) and that the rare pane-id reuse forgoes re-priming for want of a
+// signal. terminal_id IS that signal, so a genuinely new agent primes properly.
+// This is deliberately NOT done on a "detected" event, which also fires on
+// every subscriber reconnect.
+func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTransition) {
+	// Cancel first, outside the lock these helpers take themselves: a pending
+	// capture or review for the dead agent must not fire against the new one.
+	d.cancelCapture(a.PaneID)
+	d.cancelActionReviewExcept(ctx, a.AgentID, "")
+
+	d.mu.Lock()
+	delete(d.episodeHandled, a.PaneID)
+	delete(d.captureStarted, a.PaneID)
+	delete(d.paneCwds, a.PaneID)
+	delete(d.firstConsult, a.AgentID)
+	delete(d.firstTaskGen, a.AgentID)
+	delete(d.lastAutoSend, a.AgentID)
+	delete(d.lastAutoNoop, a.AgentID)
+	delete(d.idleSince, a.AgentID)
+	delete(d.autoTaskClaim, a.AgentID)
+	d.mu.Unlock()
+	// sweepInFlight is deliberately left alone: it is a live-goroutine claim
+	// released by its owner's defer, and clearing it here would license a
+	// second concurrent pane interaction.
 }
 
 // hasOpenEscalation reports whether the agent already has an unresolved
