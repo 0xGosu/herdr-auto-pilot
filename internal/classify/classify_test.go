@@ -272,6 +272,29 @@ func TestClaudeMCQMultiTabV2FooterReportsTabCount(t *testing.T) {
 	}
 }
 
+func TestClaudeMCQOneQuestionTabFormReportsTabCount(t *testing.T) {
+	// Live capture (2026-07-20): a form with ONE question tab plus Submit
+	// carries the tab header but the plain selection footer — there is no
+	// sibling question to switch to. It was classified as a plain menu, so
+	// delivery sent the bare digit, which only toggled the option's checkbox
+	// and left the agent blocked on the Submit tab.
+	c := New(nil)
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "choice_claude_mcq_tabs_one_question.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.Classify("claude", "blocked", string(data))
+	if s.Type != domain.SituationChoice {
+		t.Fatalf("type = %q, want choice", s.Type)
+	}
+	if s.MCQKind != domain.MCQClaudeTabs {
+		t.Errorf("form kind = %q, want %q", s.MCQKind, domain.MCQClaudeTabs)
+	}
+	if s.TabCount != 2 {
+		t.Errorf("tab count = %d, want 2 (1 question + Submit)", s.TabCount)
+	}
+}
+
 func TestNarratedNumberedListNotChoice(t *testing.T) {
 	// A narrated markdown list whose first item wraps into a long indented
 	// continuation block (> 4 lines, no MCQ footer) must NOT classify as a

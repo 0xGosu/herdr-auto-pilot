@@ -169,8 +169,20 @@ func (f *fakeForm) Read(_ context.Context, _ string, _ int) (string, error) {
 		labels[i] = fmt.Sprintf("Option %d", i+1)
 	}
 	b.WriteString(f.renderOptions(labels))
-	b.WriteString("\nEnter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel\n")
+	b.WriteString("\n" + f.footer())
 	return b.String(), nil
+}
+
+// footer mirrors the real render: the tab-switch hint appears only when there
+// is a sibling question to switch to. A ONE-question form (one tab plus the
+// generated Submit tab) shows the same plain footer as a single-question menu,
+// which is what made it read as a plain menu and get answered with a blind
+// digit that only toggled its checkbox.
+func (f *fakeForm) footer() string {
+	if f.questions > 1 {
+		return "Enter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel\n"
+	}
+	return "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
 }
 
 func (f *fakeForm) renderOptions(labels []string) string {
