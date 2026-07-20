@@ -98,7 +98,7 @@ func (d *Daemon) startSweep(ctx context.Context, ks ports.KeystrokeSender,
 		return
 	}
 
-	go func() {
+	d.spawn(func() {
 		outcome := sweepOutcome{situation: s, tr: tr, agentName: agentName}
 		logging.Guard("mcq-sweep", func() error {
 			swept, err := d.sweepFrames(ctx, ks, s)
@@ -116,7 +116,7 @@ func (d *Daemon) startSweep(ctx context.Context, ks ports.KeystrokeSender,
 		case d.sweepResults <- outcome:
 		case <-ctx.Done():
 		}
-	}()
+	})
 }
 
 // sweepFrames drives the Right-arrow capture protocol: read the visible
@@ -369,7 +369,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 		return
 	}
 
-	go func() {
+	d.spawn(func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery", func() error {
 			d.withAgentAutomation(ctx, s, sig, tr, dec.Input, dec.Confidence, nil, "", now, func() {
@@ -424,7 +424,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 			})
 			return nil
 		})
-	}()
+	})
 }
 
 // deliverSeriesLLM is the promotion-path twin of deliverSeries. Its final
@@ -435,7 +435,7 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 	llmDec *domain.LLMDecision, groups [][]string, confidence float64,
 	llmConfidence *int, now time.Time) {
 
-	go func() {
+	d.spawn(func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery-llm", func() error {
 			executed := d.withAgentAutomation(ctx, s, sig, tr, llmDec.Action,
@@ -497,7 +497,7 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 			}
 			return nil
 		})
-	}()
+	})
 }
 
 // deliverRemoteEnv answers Claude's standing "Select remote environment"
@@ -523,7 +523,7 @@ func (d *Daemon) deliverRemoteEnv(ctx context.Context, ks ports.KeystrokeSender,
 		return
 	}
 
-	go func() {
+	d.spawn(func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("remote-env-delivery", func() error {
 			d.withAgentAutomation(ctx, s, sig, tr, dec.Input, dec.Confidence, nil, "", now, func() {
@@ -571,7 +571,7 @@ func (d *Daemon) deliverRemoteEnv(ctx context.Context, ks ports.KeystrokeSender,
 			})
 			return nil
 		})
-	}()
+	})
 }
 
 // deliverRemoteEnvLLM is the promotion-path twin of deliverRemoteEnv (same
@@ -581,7 +581,7 @@ func (d *Daemon) deliverRemoteEnvLLM(ctx context.Context, ks ports.KeystrokeSend
 	s domain.Situation, sig domain.SignatureResult, tr domain.AgentTransition,
 	llmDec *domain.LLMDecision, confidence float64, llmConfidence *int, now time.Time) {
 
-	go func() {
+	d.spawn(func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("remote-env-delivery-llm", func() error {
 			executed := d.withAgentAutomation(ctx, s, sig, tr, llmDec.Action,
@@ -636,7 +636,7 @@ func (d *Daemon) deliverRemoteEnvLLM(ctx context.Context, ks ports.KeystrokeSend
 			}
 			return nil
 		})
-	}()
+	})
 }
 
 // sendRemoteEnvSelection answers the standing remote-environment picker via
