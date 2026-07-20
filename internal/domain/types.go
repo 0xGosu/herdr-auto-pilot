@@ -41,6 +41,12 @@ type AgentTransition struct {
 	// follows the normal attention pipeline but is identified in the audit
 	// trigger for operator-visible provenance.
 	ManualCapture bool
+	// AutoIdleSend marks a transition the daemon injected because the agent
+	// has been idle past the auto-send threshold and its task source opted
+	// into enable_auto_send_task_when_idle. Like ManualCapture it is transient
+	// (Herdr events never set it) and exists so the audit trail names why the
+	// task went out.
+	AutoIdleSend bool
 }
 
 // WorkspaceInfo is display metadata for one Herdr workspace.
@@ -451,6 +457,12 @@ type LLMRequest struct {
 	// changed since review (checked off / edited). Transient.
 	SourcePath   string
 	ReviewedTask string
+	// ReserveTask pins, at consult time, whether the source requires the
+	// delivered item to be marked "[-]" as it is sent
+	// (enable_auto_send_task_when_idle). Pinning it here rather than
+	// re-reading the config after the review means a reload mid-consult can
+	// never downgrade a reserving source to an unreserved send. Transient.
+	ReserveTask bool
 	// ActionReview marks this consult as a pre-delivery review of a learned
 	// free-text action (llm.enable_rewrite_action): the LLM adapts the text to
 	// the live pane, affirms it with ActionSendProposedAction, or vetoes it

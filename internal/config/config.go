@@ -258,6 +258,15 @@ type TaskSource struct {
 	// piling more onto an already-long list — the operator prunes it to make
 	// room. 0 (unset) uses DefaultMaxTasks; see MaxTasksLimit.
 	MaxTasks int `toml:"max_tasks,omitempty"`
+	// EnableAutoSendTaskWhenIdle opts this source into the daemon's periodic
+	// idle poll: on every sweep the daemon re-drives any matching agent that
+	// has been idle longer than the idle threshold, handing it the next
+	// pending "[ ]" item through the normal decision pipeline. Each eligible
+	// agent gets a DIFFERENT pending item, and the item is reserved "[-]" as
+	// it is delivered, so one task never reaches two agents. Off by default:
+	// without it, an agent that parks with no fresh herdr event just waits
+	// for the operator.
+	EnableAutoSendTaskWhenIdle bool `toml:"enable_auto_send_task_when_idle,omitempty"`
 }
 
 // MatchesAgent reports whether this source's agent selector matches the given

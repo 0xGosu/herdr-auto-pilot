@@ -385,6 +385,55 @@ enable_llm_review = true
 	}
 }
 
+func TestTaskSourceAutoSendWhenIdleParsing(t *testing.T) {
+	// enable_auto_send_task_when_idle is opt-IN: an absent key must leave the
+	// source on today's event-driven behavior, and Save must not write the key
+	// back for sources that never set it.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte(`
+[[task_sources]]
+agent = "a1"
+path = "/tmp/one.md"
+
+[[task_sources]]
+agent = "a2"
+path = "/tmp/two.md"
+enable_auto_send_task_when_idle = true
+`), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Fatalf("want 2 task sources, got %d", len(cfg.TaskSources))
+	}
+	if cfg.TaskSources[0].EnableAutoSendTaskWhenIdle {
+		t.Error("an unset enable_auto_send_task_when_idle must default to false")
+	}
+	if !cfg.TaskSources[1].EnableAutoSendTaskWhenIdle {
+		t.Error("explicit enable_auto_send_task_when_idle=true did not parse")
+	}
+
+	out := filepath.Join(t.TempDir(), "saved.toml")
+	if err := Save(out, cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := regexp.MustCompile(`(?m)^\s*enable_auto_send_task_when_idle\s*=`).FindAllIndex(raw, -1); len(n) != 1 {
+		t.Errorf("want the key emitted once (only for the source that set it), got %d:\n%s", len(n), raw)
+	}
+	reloaded, err := Load(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.TaskSources[0].EnableAutoSendTaskWhenIdle || !reloaded.TaskSources[1].EnableAutoSendTaskWhenIdle {
+		t.Errorf("round-trip lost the flag: %+v", reloaded.TaskSources)
+	}
+}
+
 func TestTaskSourceMaxTasksParsingAndDefault(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	os.WriteFile(path, []byte(`

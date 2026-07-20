@@ -28,9 +28,11 @@ var inProgressItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[-\]\s*(.+)$`)
 // with the agent's own name pre-filled in every command (so `hap task
 // {agent_name} done <n>` resolves this exact source), covering the full task
 // lifecycle: `start <n>` marks a task [-] in-progress the moment the agent
-// begins it (the daemon's auto-send leaves the item [ ], so without this
-// nothing records that the task is being worked), and `done <n>` ticks it
-// off. It also spells out the `--path {task_list_path}` form so a source that
+// begins it (an ordinary source's send leaves the item [ ], so without this
+// nothing records that the task is being worked; a source with
+// enable_auto_send_task_when_idle pre-marks it at delivery, which makes `start`
+// a harmless no-op there), and `done <n>` ticks it off. It also spells out the
+// `--path {task_list_path}` form so a source that
 // isn't name-addressable (one scoped by agent type, pane id, workspace, or
 // "any") is still manageable — `hap task {agent_name}` errors on those, and
 // the path form always works.
@@ -61,6 +63,13 @@ type DeclaredTask struct {
 	// runtime "is an LLM command configured" check stays at the daemon call
 	// site — this flag carries only the source's declared preference.
 	LLMReview bool
+	// Reserve reports whether the sender must mark this item "[-]" in the file
+	// as it delivers (and return it to "[ ]" if the send fails). Set for
+	// sources with enable_auto_send_task_when_idle: the idle poll hands tasks
+	// out unattended, so an unreserved item would be handed to the next idle
+	// agent too. Sources without the flag keep the historical behavior — the
+	// daemon leaves the item "[ ]" and the agent marks it via `hap task start`.
+	Reserve bool
 }
 
 // TemplateOrDefault resolves a task source's next-task template, falling back
