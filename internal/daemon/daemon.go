@@ -526,6 +526,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 		defer func() { _ = daemonhealth.Remove(d.opt.StateDir) }()
 	}
 
+	// Background drain + native-resource release, registered BEFORE any fallible
+	// setup so they run on EVERY Run return — including an early error return
+	// below (e.g. control-socket setup). New() has already spawned initSemantic
+	// via reloadEmbedder, so a bare early return would otherwise leave that
+	// tracked goroutine touching the store/matcher while the caller closes them.
+	// LIFO: shutdownBackground (drain) is registered last so it runs FIRST, then
+	// the matcher/embedder Close.
+	defer func() {
+		if emb := d.embedderPort(); emb != nil {
+			emb.Close()
+		}
+		if d.matcher != nil {
+			d.matcher.Close()
+		}
+	}()
+	defer d.shutdownBackground()
+
 	// Control socket: reload/wake nudges from front-ends and mcp.
 	var ctl *control.Server
 	if d.opt.ControlSocketPath != "" {
@@ -541,21 +558,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		defer ctl.Close()
 	}
-
-	// Release native resources (embedding model, match index) on exit — but
-	// ONLY after every background goroutine/timer has drained, so nothing can
-	// touch the matcher/embedder (or the store the caller closes next) after
-	// close. This defer is registered AFTER the Close defer so LIFO runs the
-	// drain FIRST.
-	defer func() {
-		if emb := d.embedderPort(); emb != nil {
-			emb.Close()
-		}
-		if d.matcher != nil {
-			d.matcher.Close()
-		}
-	}()
-	defer d.shutdownBackground()
 
 	// Event subscription with reconnect/backoff lives in its own goroutine.
 	d.spawn(func() {

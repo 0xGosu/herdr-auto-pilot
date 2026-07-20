@@ -171,6 +171,69 @@ func TestShutdownDrainsVerifyUnblockBeforeStoreClose(t *testing.T) {
 	}
 }
 
+// TestRunDrainsBackgroundOnEarlyControlSocketFailure covers the early-return
+// path: New() spawns the semantic-init goroutine (matcher configured), then Run
+// fails fast setting up the control socket. The drain barrier must still run on
+// that return — otherwise the tracked semantic-init goroutine keeps touching the
+// store/matcher while the caller (cmd/hap) closes them. We assert Run returns
+// the error AND that shutdownBackground ran (shutdownCtx cancelled + bg drained),
+// then close the store; under -race a leaked goroutine would be flagged.
+func TestRunDrainsBackgroundOnEarlyControlSocketFailure(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(tinyCaptureDelay), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fh := &fakeHerdr{}
+	fe := &fakeEvents{ch: make(chan domain.AgentTransition, 8)}
+	d, err := New(Options{
+		ConfigPath: cfgPath,
+		// Parent directory does not exist, so control.NewServer fails and Run
+		// returns before its own event/loop setup.
+		ControlSocketPath: filepath.Join(dir, "no-such-dir", "control.sock"),
+		// A configured match index makes New() spawn initSemantic via spawn(),
+		// so there is a real tracked background goroutine to drain.
+		MatchIndexDir: filepath.Join(dir, "match"),
+		Store:         raw,
+		Herdr:         fh,
+		Events:        fe,
+		Notify:        fh,
+		LLM:           &fakeLLM{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- d.Run(context.Background()) }()
+
+	select {
+	case err := <-runErr:
+		if err == nil {
+			t.Fatal("expected a control-socket setup error from Run")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return within 5s on early control-socket failure (drain barrier not on the early path?)")
+	}
+
+	// shutdownBackground must have run on the early return: it cancels
+	// shutdownCtx and drains bg. Before the fix this defer was registered after
+	// the failing control-socket setup, so it never ran here.
+	if d.shutdownCtx.Err() == nil {
+		t.Fatal("shutdownBackground did not run on early return: shutdownCtx not cancelled — background work can outlive Run and race the store/matcher close")
+	}
+
+	// Draining happened before Run returned, so this close cannot race it.
+	if err := raw.Close(); err != nil {
+		t.Fatalf("store close: %v", err)
+	}
+}
+
 // seedAutonomousRule installs a graduated (autonomous) rule directly in the
 // store so a matching situation auto-answers. It mirrors harness.seedAutonomous
 // but targets a raw store for tests that build the daemon by hand.
