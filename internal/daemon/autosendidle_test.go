@@ -2,10 +2,12 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -72,6 +74,16 @@ func parkIdleOnTerminal(h *harness, agentID, terminalID string) []domain.AgentTr
 	h.daemon.mu.Unlock()
 	return agents
 }
+
+// atomicBool is the bool twin of atomicString: it lets a test flip what the
+// fake LLM decides between sweeps without racing the daemon's goroutines.
+type atomicBool struct {
+	mu sync.Mutex
+	v  bool
+}
+
+func (a *atomicBool) set(v bool) { a.mu.Lock(); a.v = v; a.mu.Unlock() }
+func (a *atomicBool) get() bool  { a.mu.Lock(); defer a.mu.Unlock(); return a.v }
 
 // setPaneInfo sets what the fake reports for `pane get` (ports.InspectorPort).
 func (f *fakeHerdr) setPaneInfo(info domain.PaneInfo) {
@@ -648,5 +660,92 @@ func TestAutoSendIdlePaneIdentityGuardFailsOpen(t *testing.T) {
 				return strings.Contains(readTasks(t, taskFile), "- [-] step two")
 			})
 		})
+	}
+}
+
+func TestAutoSendIdleReassignsAfterLLMReviewDeclines(t *testing.T) {
+	// End to end: the poll pairs the longer-idle agent with the only pending
+	// task, the pre-send LLM review declines it (@noop, confidently — so it is
+	// applied silently rather than escalated), and NOTHING is sent. The pairing
+	// must be released with it, or that task stays promised to an agent that
+	// never received it and no other agent may be given it until the TTL.
+	//
+	// The next sweep, with the first agent now working, must hand the very same
+	// task to the second agent and reserve it.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(taskFile, []byte("- [ ] update the changelog\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n"+
+		"[[task_sources]]\nagent = \"\"\npath = %q\nenable_auto_send_task_when_idle = true\n", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(autoSendIdlePane)
+	h.llm.configured = true
+
+	var decline atomicBool
+	decline.set(true)
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		if !req.TaskReview {
+			return nil, errors.New("expected a task-review consult")
+		}
+		action, rationale := req.ProposedTask, "sending it on"
+		if decline.get() {
+			action, rationale = "@noop", "the agent is still finishing up"
+		}
+		id, err := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: action, Rationale: rationale, ConfidentScore: 90,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: action,
+			Rationale: rationale, ConfidentScore: 90, Status: "pending"}, nil
+	}
+
+	agents := parkIdle(h, 2*time.Minute, "agent-as19a", "agent-as19b")
+	h.daemon.mu.Lock()
+	h.daemon.idleSince["agent-as19a"] = idleMark{
+		paneID: "agent-as19a", at: h.daemon.opt.Clock.Now().Add(-5 * time.Minute),
+	}
+	h.daemon.mu.Unlock()
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	// The decline is applied: an auto "noop" row for the paired agent, nothing
+	// sent, the task still pending, and the pairing released.
+	waitFor(t, 5*time.Second, func() bool { return auditFor(t, h, "agent-as19a", "auto") })
+	if got := len(h.herdr.sentInputs()); got != 0 {
+		t.Fatalf("a declined review must send nothing, got %q", h.herdr.sentInputs())
+	}
+	if _, claimed := h.daemon.autoTaskClaimFor("agent-as19a"); claimed {
+		t.Fatal("the pairing outlived a declined review")
+	}
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [ ] update the changelog") {
+		t.Fatalf("a declined review must leave the task pending:\n%s", got)
+	}
+
+	// Next sweep: the first agent is working, the review now approves, and the
+	// released task is reassigned to the second agent.
+	decline.set(false)
+	working := []domain.AgentTransition{
+		{AgentID: "agent-as19a", PaneID: "agent-as19a", AgentType: "claude", Status: "working"},
+		{AgentID: "agent-as19b", PaneID: "agent-as19b", AgentType: "claude", Status: "idle"},
+	}
+	h.herdr.setAgents(working)
+	h.daemon.autoSendIdleTasks(context.Background(), working)
+
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; !strings.Contains(got, "update the changelog") {
+		t.Errorf("reassigned send = %q, want the released task", got)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] update the changelog")
+	})
+	if !auditFor(t, h, "agent-as19b", "auto") {
+		t.Error("the released task was not delivered to the second agent")
 	}
 }

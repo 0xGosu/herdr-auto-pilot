@@ -3238,6 +3238,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		// rejecting it would recreate the very escalation noise the noop
 		// resolves. Audit-before-act still applies (FR-024), and the final
 		// lifecycle barrier prevents learning or rate advancement after disable.
+		// A declined review sends nothing, so an auto-send pairing for this
+		// agent is spent: holding it would withhold a still-pending task from
+		// every other agent until the claim's TTL. The file was never touched,
+		// so nothing is stranded.
+		d.dropAutoTaskClaim(s.AgentID)
 		executed := d.withAgentAutomation(ctx, s, res.sig, tr, "",
 			computedConf, &llmConf, llmDec.CapturedOutput, now, func() {
 				if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
@@ -3483,6 +3488,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			})
 		})
 	if !executed {
+		// The lifecycle barrier refused (the agent was disabled between the
+		// decision and its execution): nothing reached the pane, so release the
+		// pairing — as deliverAutonomous does on the rule path — or the task
+		// stays promised to an agent that never got it.
+		d.dropAutoTaskClaim(s.AgentID)
 		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
 	}
 }
