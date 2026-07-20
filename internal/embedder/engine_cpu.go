@@ -146,10 +146,13 @@ func (l *Llama) EmbedText(ctx context.Context, text string) ([]float32, error) {
 		// not at fault, so this must not push toward the degraded latch.
 		return nil, ctx.Err()
 	case <-time.After(timeout):
-		return nil, l.recordFailure(true, fmt.Errorf("embed call exceeded %s stall guard (raise `%s` if this model is simply slower)", timeout, budgetKey))
+		return nil, l.recordFailure(true, stallGuardError(timeout, budgetKey, ""))
 	case r := <-ch:
 		if r.err != nil {
-			return nil, l.recordFailure(false, r.err)
+			// In the worker child this engine's error travels to the parent as
+			// a message string, so the marker in stallGuardError is what keeps
+			// a child-side expiry classified as a timeout there too.
+			return nil, l.recordFailure(IsStallGuard(r.err.Error()), r.err)
 		}
 		l.failures.Store(0)
 		l.lastErr.Store(nil) // recovered: don't report a stale error as current

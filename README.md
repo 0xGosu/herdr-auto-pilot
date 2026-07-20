@@ -404,9 +404,9 @@ similarity_threshold = 0.90 # min cosine similarity to reuse a learned signature
 bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1]
 model_context_window = 0    # 0 = bundled-model default (512 tokens); input is
                             # truncated below this limit before embedding
-embed_timeout_ms = 0        # 0 = 2000ms stall guard per warm embed call
-warm_timeout_ms = 0         # 0 = 30000ms for the first call (model load)
-max_consecutive_failures = 0 # 0 = 3 back-to-back failures latch text fallback
+embed_timeout_ms = 0        # 0 = 2000ms stall guard per warm embed call (max 600000)
+warm_timeout_ms = 0         # 0 = 30000ms for the first call (model load; max 600000)
+max_consecutive_failures = 0 # 0 = 3 back-to-back failures latch text fallback (max 1000)
 # pane_salient_chars = 500  # fallback signature window for idle/unclassified
                             # situations (trailing N characters of pane content).
                             # Changing it re-keys idle/unclassified rules once,

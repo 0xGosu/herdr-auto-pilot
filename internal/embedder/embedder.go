@@ -17,8 +17,10 @@ package embedder
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -49,6 +51,12 @@ const (
 	minEmbedTimeoutMs = 100
 	minWarmTimeoutMs  = 1000
 )
+
+// maxTimeoutMs caps both stall guards at 10 minutes. Far beyond any real model
+// load, and — the reason it exists — low enough that the millisecond→
+// time.Duration (nanosecond) multiply can never overflow int64 into a negative
+// budget that would fire instantly. See resolveTimeout.
+const maxTimeoutMs = 10 * 60 * 1000
 
 // maxFailureCeiling caps MaxConsecutiveFailures. Far above any useful setting,
 // but low enough that the int32 failure counters can never wrap (see
@@ -105,6 +113,13 @@ func resolveTimeout(ms, def, min int) time.Duration {
 	if ms < min {
 		ms = min
 	}
+	// Cap before the multiply: time.Duration counts NANOseconds, so a large
+	// millisecond value silently overflows to a NEGATIVE duration, whereupon
+	// time.After fires immediately and latches the embedder — the exact
+	// opposite of what asking for a longer budget means.
+	if ms > maxTimeoutMs {
+		ms = maxTimeoutMs
+	}
 	return time.Duration(ms) * time.Millisecond
 }
 
@@ -124,6 +139,27 @@ func ResolveMaxFailures(cfg config.Embedding) int {
 	}
 	return n
 }
+
+// StallGuardMarker appears in every stall-guard expiry message and is how a
+// timeout is recognized ACROSS THE WORKER PROTOCOL. The framed response can
+// only carry a message string, so when the child's own guard wins the race its
+// expiry reaches the parent as an ordinary embed error; matching this marker is
+// what keeps it counted as a timeout instead of a generic failure — otherwise
+// `hap status` would tell the operator to disable embeddings when the real
+// answer is to raise the budget. Keep it in sync with stallGuardError.
+const StallGuardMarker = "stall guard"
+
+// stallGuardError formats a stall-guard expiry, naming the budget that ran out
+// and the config key that widens it. Single source of the wording so the
+// marker-based classification cannot drift from the message.
+func stallGuardError(timeout time.Duration, budgetKey, suffix string) error {
+	return fmt.Errorf("embed call exceeded %s %s (raise `%s` if this model is simply slower)%s",
+		timeout, StallGuardMarker, budgetKey, suffix)
+}
+
+// IsStallGuard reports whether an error message is a stall-guard expiry,
+// wherever it was produced (this process or the worker child).
+func IsStallGuard(msg string) bool { return strings.Contains(msg, StallGuardMarker) }
 
 // Diagnostics is a snapshot of an embedder's runtime health. It exists so an
 // operator can see WHY semantic matching fell back to text search — "degraded"

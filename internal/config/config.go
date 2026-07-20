@@ -231,21 +231,25 @@ type Embedding struct {
 	// leaving this too low is what silently and permanently drops such a model
 	// to BM25 text matching. 0 → the built-in default
 	// (embedder.DefaultEmbedTimeoutMs). Positive values below
-	// embedder.minEmbedTimeoutMs (100) are clamped up.
+	// embedder.minEmbedTimeoutMs (100) are clamped up, and values above
+	// embedder.maxTimeoutMs (10 minutes) are clamped down — past that the
+	// millisecond→nanosecond conversion overflows into a negative budget.
 	EmbedTimeoutMs int `toml:"embed_timeout_ms"`
 	// WarmTimeoutMs bounds the FIRST embed call of each worker, which also
 	// loads the model from disk. Big models load slowly (and slower still on a
 	// cold page cache), so raise this alongside embed_timeout_ms when pointing
 	// model_path at one. 0 → the built-in default
 	// (embedder.DefaultWarmTimeoutMs, 30000). Positive values below
-	// embedder.minWarmTimeoutMs (1000) are clamped up.
+	// embedder.minWarmTimeoutMs (1000) are clamped up, and values above
+	// embedder.maxTimeoutMs (10 minutes) are clamped down (see EmbedTimeoutMs).
 	WarmTimeoutMs int `toml:"warm_timeout_ms"`
 	// MaxConsecutiveFailures is how many back-to-back embed errors/timeouts
 	// latch degraded mode (semantic matching falls back to text search until
 	// the [embedding] config changes and the daemon rebuilds the embedder).
 	// Raise it to ride out an occasionally-slow model instead of latching off.
 	// 0 → the built-in default (embedder.DefaultMaxConsecutiveFailures, 3);
-	// negative values are treated as 0.
+	// negative values are treated as 0 and the count is capped at 1000 (the
+	// failure counters are int32).
 	MaxConsecutiveFailures int `toml:"max_consecutive_failures"`
 }
 

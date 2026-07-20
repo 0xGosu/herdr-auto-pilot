@@ -209,8 +209,7 @@ func (c *Client) EmbedText(ctx context.Context, text string) ([]float32, error) 
 		// Name the budget that expired and how to raise it: a model bigger than
 		// the bundled MiniLM legitimately needs longer, and without this the
 		// operator only ever sees "degraded" and assumes a broken model.
-		return nil, c.recordFailure(true, fmt.Errorf("embed call exceeded %s stall guard (raise `%s` if this model is simply slower)%s",
-			timeout, budgetKey, stderrSuffix(reason)))
+		return nil, c.recordFailure(true, stallGuardError(timeout, budgetKey, stderrSuffix(reason)))
 	case r := <-ch:
 		if r.err != nil {
 			var embErr *EmbedError
@@ -218,7 +217,13 @@ func (c *Client) EmbedText(ctx context.Context, text string) ([]float32, error) 
 				// The worker is alive and the pipe is in sync — a plain embed
 				// failure (missing model, bad input, worker-side degrade). Keep
 				// the warm worker; just count the failure.
-				return nil, c.recordFailure(false, fmt.Errorf("embed: %s", embErr.Msg))
+				//
+				// The child runs the SAME stall guard, so when its timer wins
+				// the race its expiry arrives here as an ordinary embed error.
+				// Classify it by the marker: counting it as a generic failure
+				// would leave Timeouts at 0 and make `hap status` advise
+				// disabling embeddings when the fix is a bigger budget.
+				return nil, c.recordFailure(IsStallGuard(embErr.Msg), fmt.Errorf("embed: %s", embErr.Msg))
 			}
 			// Transport error: the worker died (native abort) or the pipe
 			// desynced. Tear it down; the next call respawns a fresh one.

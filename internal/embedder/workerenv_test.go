@@ -1,6 +1,7 @@
 package embedder
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -73,13 +74,16 @@ func TestWorkerConfigFromEnvOptionalAndInvalid(t *testing.T) {
 // keeps the built-in defaults and times out a slow model before the operator's
 // raised budget ever expires — making the config key look like it did nothing.
 func TestSpawnForwardsBudgetsToWorker(t *testing.T) {
-	c := New(config.Embedding{
+	// Re-exec of the test binary, like the other Client tests: spawn() really
+	// starts the child, so the executable must exist on every platform —
+	// hardcoding /bin/true passes on Linux and fails on macOS, which has it at
+	// /usr/bin/true.
+	c := NewReexecClient(config.Embedding{
 		ModelPath:              "/models/custom.gguf",
 		EmbedTimeoutMs:         8000,
 		WarmTimeoutMs:          120000,
 		MaxConsecutiveFailures: 10,
 	})
-	c.execPath = "/bin/true" // never started; spawn only builds the command
 	w, err := c.spawn()
 	if err != nil {
 		t.Fatal(err)
@@ -129,6 +133,60 @@ func TestResolveMaxFailuresCeiling(t *testing.T) {
 	}
 	if int(int32(got)) != got || int32(got) <= 0 {
 		t.Errorf("ceiling %d does not survive the int32 counters", got)
+	}
+}
+
+// TestResolveTimeoutOverflowClamp: time.Duration counts nanoseconds, so a huge
+// millisecond value multiplies past int64 into a NEGATIVE budget — time.After
+// would then fire instantly and latch the embedder, the exact inverse of asking
+// for a longer budget. Both resolvers must clamp instead.
+func TestResolveTimeoutOverflowClamp(t *testing.T) {
+	huge := []int{maxTimeoutMs + 1, 1 << 40, math.MaxInt32, math.MaxInt64 / 1000}
+	for _, ms := range huge {
+		if got := ResolveEmbedTimeout(config.Embedding{EmbedTimeoutMs: ms}); got != maxTimeoutMs*time.Millisecond {
+			t.Errorf("ResolveEmbedTimeout(%d) = %s, want the %dms cap", ms, got, maxTimeoutMs)
+		}
+		if got := ResolveWarmTimeout(config.Embedding{WarmTimeoutMs: ms}); got != maxTimeoutMs*time.Millisecond {
+			t.Errorf("ResolveWarmTimeout(%d) = %s, want the %dms cap", ms, got, maxTimeoutMs)
+		}
+	}
+	// The cap itself must stay a sane positive duration.
+	if d := ResolveEmbedTimeout(config.Embedding{EmbedTimeoutMs: maxTimeoutMs}); d <= 0 {
+		t.Errorf("capped budget = %s, want positive", d)
+	}
+	// A large-but-valid value below the cap is honored verbatim.
+	if got := ResolveWarmTimeout(config.Embedding{WarmTimeoutMs: 300000}); got != 5*time.Minute {
+		t.Errorf("ResolveWarmTimeout(300000) = %s, want 5m", got)
+	}
+}
+
+// TestChildStallGuardCountsAsTimeout: the worker child runs the SAME stall
+// guard, so when its timer wins the race its expiry reaches the parent as an
+// ordinary embed error over the framed protocol. It must still be classified as
+// a TIMEOUT — otherwise Timeouts stays 0, TimeoutBound() is false, and
+// `hap status` tells the operator to disable embeddings when the real fix is a
+// bigger budget.
+func TestChildStallGuardCountsAsTimeout(t *testing.T) {
+	c := New(config.Embedding{})
+	childMsg := stallGuardError(2*time.Second, "embedding.embed_timeout_ms", "").Error()
+	if !IsStallGuard(childMsg) {
+		t.Fatalf("stallGuardError message %q does not carry the marker", childMsg)
+	}
+	c.recordFailure(IsStallGuard(childMsg), &EmbedError{Msg: childMsg})
+
+	d := c.Diagnostics()
+	if d.Timeouts != 1 {
+		t.Errorf("Timeouts = %d, want 1 — a child-side stall guard is still a timeout", d.Timeouts)
+	}
+	if !d.TimeoutBound() {
+		t.Error("TimeoutBound() = false; status would advise disabling embeddings instead of raising the budget")
+	}
+
+	// A genuine non-timeout embed failure must NOT be miscounted.
+	c2 := New(config.Embedding{})
+	c2.recordFailure(IsStallGuard("embedding model unavailable"), &EmbedError{Msg: "embedding model unavailable"})
+	if d := c2.Diagnostics(); d.Timeouts != 0 || d.TimeoutBound() {
+		t.Errorf("non-timeout failure classified as a timeout: %+v", d)
 	}
 }
 
