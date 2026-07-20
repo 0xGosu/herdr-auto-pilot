@@ -1096,6 +1096,9 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 	situation.TabID = tr.TabID
 	situation.WorkspaceID = tr.WorkspaceID
 	situation.RetryAuditID = tr.RetryAuditID
+	// Carry the captured terminal identity so an unattended delivery can prove,
+	// just before it sends, that the pane still hosts the agent it captured.
+	situation.TerminalID = tr.TerminalID
 	// Keep herdr's reported agent_status with the situation: downstream
 	// sites (the async LLM path) must render the REAL status in triggers,
 	// never a fabricated one.
@@ -1545,6 +1548,19 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situation,
 	sig domain.SignatureResult, dec domain.Decision, tr domain.AgentTransition,
 	del delivery, now time.Time) bool {
+	// An unattended task hand-out must not land in a pane that has been recycled
+	// since capture: the agent it was meant for is gone and a DIFFERENT agent
+	// would receive it. Checked before the audit row, because nothing is
+	// attempted — the claim is simply released so the next sweep re-pairs.
+	if tr.AutoIdleSend || (del.declared != nil && del.declared.Reserve) {
+		if recycled, why := d.paneRecycled(ctx, s); recycled {
+			slog.Warn("pane was recycled since capture; abandoning the auto-send",
+				"agent", s.AgentID, "reason", why)
+			d.dropAutoTaskClaim(s.AgentID)
+			return false
+		}
+	}
+
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
 		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + del.input, Input: del.input,
@@ -3408,6 +3424,20 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				d.notify(ctx, "Herd Auto Prompter: persistence failure",
 					"An LLM-derived action was blocked because its audit record could not be written.")
 				return
+			}
+			// Same recycled-pane guard as the rule path — and it matters more
+			// here, because an LLM review can add seconds of drift between the
+			// capture and this send.
+			if taskReserve != nil {
+				if recycled, why := d.paneRecycled(ctx, s); recycled {
+					slog.Warn("pane was recycled during the task review; not sending",
+						"agent", s.AgentID, "reason", why)
+					d.dropAutoTaskClaim(s.AgentID)
+					d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+					d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+						fmt.Sprintf("Agent %s: %s; the task was not sent.", s.AgentID, why))
+					return
+				}
 			}
 			// Same claim-before-send rule as the rule path: an auto-send source's
 			// item is marked "[-]" before the text reaches the pane.

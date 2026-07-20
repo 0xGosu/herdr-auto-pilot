@@ -11,6 +11,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
 )
 
@@ -312,6 +313,46 @@ func (d *Daemon) dropAutoTaskClaim(agentID string) {
 	d.mu.Lock()
 	delete(d.autoTaskClaim, agentID)
 	d.mu.Unlock()
+}
+
+// paneRecycled reports whether the pane has been handed to a DIFFERENT terminal
+// since the situation was captured, plus a description for the log.
+//
+// The auto-send poll claims a task, then the capture delay and the (optionally
+// LLM-reviewed) pipeline run asynchronously — seconds during which herdr can
+// tear the agent down and reuse its pane id for a new one. Pane id alone cannot
+// tell them apart, so an unattended delivery would type one agent's task into
+// another agent's prompt. herdr's terminal_id can: it changes whenever the
+// terminal behind a reused pane is recreated.
+//
+// This is a live `pane get` on the delivery path, which is already a
+// shell-out path (the send itself is one) — but it is deliberately the LAST
+// thing checked before the send, because anything earlier can go stale again.
+//
+// It fails OPEN on anything it cannot prove: no captured id (event-socket
+// transitions and older herdr leave it empty), no inspector capability, a
+// failed read, or a herdr that reports no terminal id. Only a genuine
+// mismatch — two known, different ids — aborts, so this can never block
+// delivery on a herdr that does not report terminal identity at all.
+func (d *Daemon) paneRecycled(ctx context.Context, s domain.Situation) (bool, string) {
+	if s.TerminalID == "" {
+		return false, ""
+	}
+	insp, ok := d.opt.Herdr.(ports.InspectorPort)
+	if !ok {
+		return false, ""
+	}
+	info, err := insp.PaneInfo(ctx, s.PaneID)
+	if err != nil {
+		slog.Warn("auto-send: pane identity re-check failed; proceeding on the captured identity",
+			"pane", s.PaneID, "error", err)
+		return false, ""
+	}
+	if info.TerminalID == "" || info.TerminalID == s.TerminalID {
+		return false, ""
+	}
+	return true, fmt.Sprintf("pane %s now hosts terminal %s, not the %s this task was captured for",
+		s.PaneID, info.TerminalID, s.TerminalID)
 }
 
 // reservedByAction reports which checklist item an outbound task-review send

@@ -77,13 +77,18 @@ type PaneInfo struct {
 
 // Situation is a classified, attention-requiring state of one agent pane.
 type Situation struct {
-	Type              SituationType
-	AgentID           string
-	AgentType         string
-	PaneID            string
-	TabID             string
-	WorkspaceID       string
-	Status            string   // herdr-reported agent_status (e.g. idle|working|blocked|done|detected); empty when unknown
+	Type        SituationType
+	AgentID     string
+	AgentType   string
+	PaneID      string
+	TabID       string
+	WorkspaceID string
+	Status      string // herdr-reported agent_status (e.g. idle|working|blocked|done|detected); empty when unknown
+	// TerminalID is herdr's terminal identity for PaneID at capture time.
+	// Pane ids are reused, so this is what tells a delivery that the terminal
+	// it captured has since been replaced by a different agent. Empty when the
+	// transition did not carry one (event-socket transitions, older herdr).
+	TerminalID        string
 	Content           string   // pane snapshot used for classification
 	Options           []string // normalized option set (choice situations)
 	PermissionVerb    string   // salient permission verb/action (approval situations)

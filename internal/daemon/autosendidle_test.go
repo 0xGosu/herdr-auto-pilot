@@ -52,10 +52,32 @@ func parkIdle(h *harness, idleFor time.Duration, agentIDs ...string) []domain.Ag
 	at := h.daemon.opt.Clock.Now().Add(-idleFor)
 	h.daemon.mu.Lock()
 	for _, a := range agents {
-		h.daemon.idleSince[a.AgentID] = idleMark{paneID: a.PaneID, at: at}
+		h.daemon.idleSince[a.AgentID] = idleMark{paneID: a.PaneID, terminalID: a.TerminalID, at: at}
 	}
 	h.daemon.mu.Unlock()
 	return agents
+}
+
+// parkIdleOnTerminal is parkIdle for one agent whose transition carries a
+// herdr terminal id, so the recycled-pane guard has an identity to compare.
+func parkIdleOnTerminal(h *harness, agentID, terminalID string) []domain.AgentTransition {
+	agents := []domain.AgentTransition{{
+		AgentID: agentID, PaneID: agentID, TerminalID: terminalID,
+		AgentType: "claude", Status: "idle",
+	}}
+	h.herdr.setAgents(agents)
+	at := h.daemon.opt.Clock.Now().Add(-2 * time.Minute)
+	h.daemon.mu.Lock()
+	h.daemon.idleSince[agentID] = idleMark{paneID: agentID, terminalID: terminalID, at: at}
+	h.daemon.mu.Unlock()
+	return agents
+}
+
+// setPaneInfo sets what the fake reports for `pane get` (ports.InspectorPort).
+func (f *fakeHerdr) setPaneInfo(info domain.PaneInfo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paneInfo = info
 }
 
 // setFailSend makes every pane send fail, so a test can exercise the
@@ -553,5 +575,78 @@ func TestNoteIdleAgentsRestartsClockOnRecreatedTerminal(t *testing.T) {
 	}
 	if !d.idleLongEnough(agents[0], recreated.Add(2*time.Minute)) {
 		t.Error("a recreated terminal never became eligible after its own minute")
+	}
+}
+
+func TestAutoSendIdleAbortsWhenPaneRecycledBeforeDelivery(t *testing.T) {
+	// The poll claims a task, then the capture delay and pipeline run
+	// asynchronously — long enough for herdr to tear the agent down and reuse
+	// its pane id for a NEW agent. Delivering then would type one agent's task
+	// into another agent's prompt, so the send is abandoned, the task stays
+	// pending, and the pairing is released for the next sweep.
+	h, taskFile := autoSendFixture(t, "agent-as16", "- [ ] step two\n", true)
+	agents := parkIdleOnTerminal(h, "agent-as16", "term-1")
+	// By delivery time the pane hosts a different terminal.
+	h.herdr.setPaneInfo(domain.PaneInfo{PaneID: "agent-as16", TerminalID: "term-2"})
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	waitFor(t, 3*time.Second, func() bool {
+		_, claimed := h.daemon.autoTaskClaimFor("agent-as16")
+		return !claimed
+	})
+	quietFor(t, h, 300*time.Millisecond)
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [ ] step two") {
+		t.Errorf("the task must stay pending when delivery is abandoned:\n%s", got)
+	}
+}
+
+func TestAutoSendIdleDeliversWhenTerminalIdentityHolds(t *testing.T) {
+	// The guard must not block the ordinary case: same terminal behind the
+	// pane, so the task is delivered and reserved as usual.
+	h, taskFile := autoSendFixture(t, "agent-as17", "- [ ] step two\n", true)
+	agents := parkIdleOnTerminal(h, "agent-as17", "term-1")
+	h.herdr.setPaneInfo(domain.PaneInfo{PaneID: "agent-as17", TerminalID: "term-1"})
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] step two")
+	})
+}
+
+func TestAutoSendIdlePaneIdentityGuardFailsOpen(t *testing.T) {
+	// The guard can only ever act on two KNOWN, different ids. A herdr that
+	// reports no terminal identity — older builds, event-socket transitions, a
+	// failed read — must not stop tasks going out at all.
+	for _, tc := range []struct {
+		name        string
+		captured    string
+		live        domain.PaneInfo
+		failPaneGet bool
+	}{
+		{name: "no captured identity", captured: "", live: domain.PaneInfo{TerminalID: "term-9"}},
+		{name: "herdr reports no identity", captured: "term-1", live: domain.PaneInfo{}},
+		{name: "pane read fails", captured: "term-1", live: domain.PaneInfo{TerminalID: "term-2"}, failPaneGet: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := "agent-as18-" + strings.ReplaceAll(tc.name, " ", "-")
+			h, taskFile := autoSendFixture(t, agent, "- [ ] step two\n", true)
+			agents := parkIdleOnTerminal(h, agent, tc.captured)
+			h.herdr.setPaneInfo(tc.live)
+			if tc.failPaneGet {
+				h.herdr.mu.Lock()
+				h.herdr.failPaneInfo = true
+				h.herdr.mu.Unlock()
+			}
+
+			h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+			waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+			waitFor(t, 3*time.Second, func() bool {
+				return strings.Contains(readTasks(t, taskFile), "- [-] step two")
+			})
+		})
 	}
 }
