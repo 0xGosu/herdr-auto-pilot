@@ -57,6 +57,21 @@ var mcqSubmitScreenRE = regexp.MustCompile(`(?im)^\s*ready to submit your answer
 // MultiTabForm).
 var mcqSingleFooterRE = regexp.MustCompile(`(?im)^.*enter to select.*(·|\bnavigate\b).*$`)
 
+// MCQTabHeaderLine returns the LIVE (last) AskUserQuestion tab header row, if
+// the pane carries one. It reports the header ALONE, without the live-form
+// corroboration MultiTabForm also requires, so a caller can tell "no form is
+// rendered" apart from "a form is rendered but did not qualify" — the
+// integration suite needs that split to fail, rather than skip, when detection
+// regresses. Callers deciding whether to send keystrokes must use
+// MultiTabForm; a bare header can be scrollback.
+func MCQTabHeaderLine(pane string) (string, bool) {
+	headers := mcqTabHeaderRE.FindAllString(pane, -1)
+	if len(headers) == 0 {
+		return "", false
+	}
+	return headers[len(headers)-1], true
+}
+
 // ClaudeMCQForm reports whether pane content shows any of Claude Code's
 // on-screen MCQ selection prompts: the multi-tab AskUserQuestion form (a tab
 // header plus a live-form footer, via MultiTabForm) or the single-question

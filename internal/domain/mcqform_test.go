@@ -230,6 +230,22 @@ func TestMultiTabFormRejectsStaleHeaderAboveLiveSingleMenu(t *testing.T) {
 	}
 }
 
+func TestMCQTabHeaderLine(t *testing.T) {
+	// The header alone, uncorroborated: it must find the LIVE (last) header,
+	// and report absence rather than an empty match.
+	line, ok := MCQTabHeaderLine(mcqOneQuestionTabFrame)
+	if !ok || !strings.Contains(line, "☐ Scope") {
+		t.Errorf("MCQTabHeaderLine = (%q,%v), want the live header", line, ok)
+	}
+	stale := "←  ☒ Old  ✔ Submit  →\nsubmitted\n\n←  ☐ New  ✔ Submit  →\n"
+	if line, _ := MCQTabHeaderLine(stale); !strings.Contains(line, "☐ New") {
+		t.Errorf("MCQTabHeaderLine = %q, want the LAST header", line)
+	}
+	if _, ok := MCQTabHeaderLine("no form here\n1. Yes\n"); ok {
+		t.Error("MCQTabHeaderLine reported a header on a pane without one")
+	}
+}
+
 func TestMultiTabFormRejectsSelectionFooterAboveTheHeader(t *testing.T) {
 	// The corroborating footer must sit BELOW the live header. A pane whose
 	// only selection footer belongs to an earlier render is not evidence that

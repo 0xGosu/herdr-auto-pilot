@@ -48,7 +48,7 @@ absent, so these are safe to run anywhere:
 
 ```sh
 go test -tags integration ./test/integration/ -v                    # from inside herdr, or set HERDR_BIN_PATH
-HAP_ITEST_CLAUDE=1 go test -tags integration ./test/integration/ -v # also drive a real claude (spends tokens)
+HAP_ITEST_CLAUDE=1 go test -tags integration ./test/integration/ -v -timeout 20m # also drive a real claude (spends tokens; several real-claude cases can exceed the 10m default)
 go test -tags "integration vectors cpu" ./test/integration/ -v      # include the real-model semantic case
 ```
 
@@ -65,7 +65,12 @@ go test -tags "integration vectors cpu" ./test/integration/ -v      # include th
   (cosine ≥ 0.90) and leaves an unrelated one alone — skips without the model;
   `TestRealClaudePreviewMCQDelivery` (needs `HAP_ITEST_CLAUDE=1`) drives a real
   AskUserQuestion form whose options carry PREVIEWS and asserts the answers actually land —
-  the rendering where a digit only moves the caret, which blind digit delivery no-oped on.
+  the rendering where a digit only moves the caret, which blind digit delivery no-oped on;
+  `TestRealClaudeOneQuestionMultiSelectMCQDelivery` (needs `HAP_ITEST_CLAUDE=1`) drives a real
+  ONE-question multi-select form — the shape whose footer carries no tab hint, so it read as a
+  plain menu and got a bare digit that only toggled its checkbox — and asserts the answer
+  toggles, advances to Submit, and commits. It FAILS (does not skip) when a form is on screen
+  but `MultiTabForm` misses it, so the detection regression can never pass silently.
 
 **Recommended: run the integration suite once after finishing any feature**, before the
 PR — the unit suite fakes herdr, so only this catches real CLI-shape drift (e.g.
