@@ -2070,6 +2070,12 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		{"learning.graduation_n", "11", true},
 		{"learning.graduation_n", "7", false},
 		{"limits.max_error_retries", "3", false},
+		{"limits.escalation_dedup_window_seconds", "180", false},
+		{"limits.escalation_dedup_window_seconds", "0", true}, // window must be positive
+		{"limits.escalation_dedup_jitter_percent", "10", false},
+		{"limits.escalation_dedup_jitter_percent", "0", false},  // 0 = exact match only
+		{"limits.escalation_dedup_jitter_percent", "-1", true},  // negative rejected
+		{"limits.escalation_dedup_jitter_percent", "101", true}, // over 100 rejected
 		{"llm.timeout_seconds", "90", false},
 		{"llm.auto_act_confidence_threshold", "70", false},
 		{"llm.auto_act_confidence_threshold", "-1", true},
@@ -2153,6 +2159,8 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"limits.max_consecutive_auto_prompts":     "5",
 		"limits.max_auto_prompts_per_minute":      "10",
 		"limits.max_error_retries":                "2",
+		"limits.escalation_dedup_window_seconds":  "180",
+		"limits.escalation_dedup_jitter_percent":  "10",
 		"safety.disable_never_auto_seed_patterns": "true",
 		"llm.command":                             `claude -p "decide"`,
 		"llm.command_start":                       `claude -p "first: decide"`,

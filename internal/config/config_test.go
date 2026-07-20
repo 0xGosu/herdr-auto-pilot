@@ -65,6 +65,50 @@ func TestLoadPartialConfigFillsDefaults(t *testing.T) {
 	}
 }
 
+func TestEscalationDedupLimitsDefaultsAndOverrides(t *testing.T) {
+	// Unset → defaults applied.
+	unset := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(unset, []byte("[limits]\nmax_error_retries = 4\n"), 0o600)
+	cfg, err := Load(unset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.EscalationDedupWindowSeconds != Default().Limits.EscalationDedupWindowSeconds {
+		t.Errorf("unset dedup window should default to %d, got %d",
+			Default().Limits.EscalationDedupWindowSeconds, cfg.Limits.EscalationDedupWindowSeconds)
+	}
+	if cfg.Limits.EscalationDedupJitterPercent != Default().Limits.EscalationDedupJitterPercent {
+		t.Errorf("unset dedup jitter should default to %d, got %d",
+			Default().Limits.EscalationDedupJitterPercent, cfg.Limits.EscalationDedupJitterPercent)
+	}
+
+	// Explicit values honored; a 0 jitter is a valid "exact match only" setting
+	// and must NOT be overwritten by the default.
+	set := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(set, []byte("[limits]\nescalation_dedup_window_seconds = 120\nescalation_dedup_jitter_percent = 0\n"), 0o600)
+	cfg, err = Load(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.EscalationDedupWindowSeconds != 120 {
+		t.Errorf("explicit dedup window lost: %d", cfg.Limits.EscalationDedupWindowSeconds)
+	}
+	if cfg.Limits.EscalationDedupJitterPercent != 0 {
+		t.Errorf("explicit 0 jitter (disable) must be preserved, got %d", cfg.Limits.EscalationDedupJitterPercent)
+	}
+
+	// Out-of-range jitter clamps to 100; a negative falls back to the default.
+	clamp := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(clamp, []byte("[limits]\nescalation_dedup_jitter_percent = 250\n"), 0o600)
+	cfg, err = Load(clamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.EscalationDedupJitterPercent != 100 {
+		t.Errorf("over-100 jitter should clamp to 100, got %d", cfg.Limits.EscalationDedupJitterPercent)
+	}
+}
+
 func TestDeprecatedVerifyUnblockMsIgnoredAndDroppedOnSave(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	os.WriteFile(path, []byte("[limits]\nverify_unblock_ms = 0\nmax_error_retries = 4\n"), 0o600)

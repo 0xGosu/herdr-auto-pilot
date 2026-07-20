@@ -37,6 +37,14 @@ disable_never_auto_seed_patterns = false  # keep all shipped strict + heuristic 
 max_consecutive_auto_prompts = 10  # per agent, without human interaction
 max_auto_prompts_per_minute = 5    # per agent
 max_error_retries = 2              # per error signature
+# Suppress a duplicate escalation when the same situation re-fires shortly after
+# the first was accepted. A just-resolved escalation still dedups for this long
+# (measured from when it was raised); still-pending ones dedup regardless of age.
+escalation_dedup_window_seconds = 300
+# How much two large pane captures may differ (0-100%) and still count as the
+# same screen, absorbing residual TUI jitter. Applies only to large captures;
+# small ones require an exact match. 0 = exact match only.
+escalation_dedup_jitter_percent = 5
 
 # ── Operator LLM (consulted on unknown situations) ──────────────────
 # Omit this whole section to escalate unknown situations directly to you.

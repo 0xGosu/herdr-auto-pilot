@@ -81,6 +81,22 @@ type Limits struct {
 	MaxConsecutiveAutoPrompts int `toml:"max_consecutive_auto_prompts"`
 	MaxAutoPromptsPerMinute   int `toml:"max_auto_prompts_per_minute"`
 	MaxErrorRetries           int `toml:"max_error_retries"`
+	// EscalationDedupWindowSeconds is how long a just-resolved escalation still
+	// suppresses a duplicate re-fire of the same situation. Herdr re-delivers an
+	// attention event for one agent after a delay (the agent flips done->idle
+	// when the operator reads the pane); once the operator accepts the first
+	// escalation it leaves the still-pending set, so without this window the
+	// re-fire would raise a second, duplicate escalation. Measured from when the
+	// escalation was raised. `<= 0` falls back to the default. Still-pending
+	// escalations dedup regardless of age — only resolved ones are time-gated.
+	EscalationDedupWindowSeconds int `toml:"escalation_dedup_window_seconds"`
+	// EscalationDedupJitterPercent is how much two large pane captures may differ
+	// (0-100) and still count as the same screen for the duplicate-ask check —
+	// absorbing residual TUI jitter the normalizer misses. It applies ONLY to
+	// large tail-window captures (>= half the snapshot cap); small captures still
+	// require an exact match so two short but distinct questions never collapse.
+	// `0` disables the tolerance (exact match only); values are clamped to 0-100.
+	EscalationDedupJitterPercent int `toml:"escalation_dedup_jitter_percent"`
 }
 
 // LLM configures the optional local LLM/agent CLI fallback (FR-010, IR-005).
@@ -365,9 +381,11 @@ func Default() Config {
 		// literal here so config stays decoupled from the domain package).
 		Learning: Learning{GraduationN: 2, ConfirmationWeight: 3.0},
 		Limits: Limits{
-			MaxConsecutiveAutoPrompts: 10,
-			MaxAutoPromptsPerMinute:   5,
-			MaxErrorRetries:           2,
+			MaxConsecutiveAutoPrompts:    10,
+			MaxAutoPromptsPerMinute:      5,
+			MaxErrorRetries:              2,
+			EscalationDedupWindowSeconds: 300,
+			EscalationDedupJitterPercent: 5,
 		},
 		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 99},
 		Embedding: Embedding{
@@ -743,6 +761,17 @@ func (c *Config) fillZeroes() {
 	}
 	if c.Limits.MaxErrorRetries <= 0 {
 		c.Limits.MaxErrorRetries = d.Limits.MaxErrorRetries
+	}
+	if c.Limits.EscalationDedupWindowSeconds <= 0 {
+		c.Limits.EscalationDedupWindowSeconds = d.Limits.EscalationDedupWindowSeconds
+	}
+	// 0 is a valid "exact match only" setting, so only a negative (invalid,
+	// SetField rejects it too) falls back to the default; an over-100 value
+	// clamps to a full 100% tolerance.
+	if c.Limits.EscalationDedupJitterPercent < 0 {
+		c.Limits.EscalationDedupJitterPercent = d.Limits.EscalationDedupJitterPercent
+	} else if c.Limits.EscalationDedupJitterPercent > 100 {
+		c.Limits.EscalationDedupJitterPercent = 100
 	}
 	if c.LLM.TimeoutSeconds <= 0 {
 		c.LLM.TimeoutSeconds = d.LLM.TimeoutSeconds

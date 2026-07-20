@@ -1011,11 +1011,12 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// declared task list. Best-effort: the escalation is already resolved and
 	// the source established, so a failed learning write must not fail the
 	// confirm — it only skips a learning event.
-	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+	corrID, corrErr := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
 		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
 		Author: a.Author, CreatedAt: time.Now(),
-	}); err != nil {
-		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", err)
+	})
+	if corrErr != nil {
+		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", corrErr)
 	}
 
 	if send && a.Herdr != nil {
@@ -1049,6 +1050,16 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 					"it stays [-] and no agent will pick it up until you clear it", err, pos, rbErr)
 			}
 			return fmt.Errorf("task source created, but sending the task to the agent failed: %w", err)
+		}
+		// The task was delivered, so flag the correction sent — the same
+		// "answer reached the agent" signal the pane-send path records. Idle is
+		// not a verifyunblock situation, so this arms no self-check; it only
+		// lets the recently-resolved dedup window recognize this delivered
+		// confirm. Best-effort: delivery already succeeded.
+		if corrErr == nil {
+			if err := a.Store.MarkCorrectionSent(ctx, corrID); err != nil {
+				slog.Warn("marking generated-task correction sent failed", "audit", audit.ID, "error", err)
+			}
 		}
 	}
 	return a.nudge(ctx, control.KindReload)
@@ -1448,11 +1459,12 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 
 	// Record the correction so the idle signature learns to drive from its
 	// declared task list. Best-effort, as in the bootstrap path.
-	if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+	corrID, corrErr := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
 		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
 		Author: a.Author, CreatedAt: time.Now(),
-	}); err != nil {
-		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", err)
+	})
+	if corrErr != nil {
+		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", corrErr)
 	}
 
 	if send && a.Herdr != nil {
@@ -1478,6 +1490,14 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 					"it stays [-] and no agent will pick it up until you clear it", err, firstIndex, rbErr)
 			}
 			return fmt.Errorf("tasks appended to %s, but sending the task to the agent failed: %w", path, err)
+		}
+		// Delivered — flag the correction sent so the recently-resolved dedup
+		// window recognizes this confirm (see the bootstrap path for why this is
+		// safe: idle is not a verifyunblock situation). Best-effort.
+		if corrErr == nil {
+			if err := a.Store.MarkCorrectionSent(ctx, corrID); err != nil {
+				slog.Warn("marking generated-task correction sent failed", "audit", audit.ID, "error", err)
+			}
 		}
 	}
 	return a.nudge(ctx, control.KindReload)
@@ -1735,6 +1755,8 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
+	{Key: "limits.escalation_dedup_window_seconds", TUIEditable: true},
+	{Key: "limits.escalation_dedup_jitter_percent", TUIEditable: true},
 	{Key: "safety.disable_never_auto_seed_patterns", TUIEditable: true},
 	{Key: "llm.command"},       // argv template
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
@@ -1814,6 +1836,10 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.Limits.MaxAutoPromptsPerMinute)
 	case "limits.max_error_retries":
 		return strconv.Itoa(cfg.Limits.MaxErrorRetries)
+	case "limits.escalation_dedup_window_seconds":
+		return strconv.Itoa(cfg.Limits.EscalationDedupWindowSeconds)
+	case "limits.escalation_dedup_jitter_percent":
+		return strconv.Itoa(cfg.Limits.EscalationDedupJitterPercent)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -1951,6 +1977,17 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setInt(&cfg.Limits.MaxAutoPromptsPerMinute)
 		case "limits.max_error_retries":
 			return setInt(&cfg.Limits.MaxErrorRetries)
+		case "limits.escalation_dedup_window_seconds":
+			return setInt(&cfg.Limits.EscalationDedupWindowSeconds)
+		case "limits.escalation_dedup_jitter_percent":
+			// 0-100; 0 disables the tolerance (exact match only), so unlike
+			// setInt this accepts 0 but rejects negatives and values over 100.
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 || v > 100 {
+				return fmt.Errorf("limits.escalation_dedup_jitter_percent must be an integer between 0 and 100 (0 = exact match only), got %q", value)
+			}
+			cfg.Limits.EscalationDedupJitterPercent = v
+			return nil
 		case "llm.timeout_seconds":
 			return setInt(&cfg.LLM.TimeoutSeconds)
 		case "llm.auto_act_confidence_threshold":

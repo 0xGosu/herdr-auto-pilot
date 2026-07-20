@@ -454,14 +454,14 @@ func (f *failingStore) HasPendingLLMConsult(ctx context.Context, agentID string)
 	return f.StorePort.HasPendingLLMConsult(ctx, agentID)
 }
 
-func (f *failingStore) PendingEscalationExcerpts(ctx context.Context, agentID, agentType string) ([]domain.PendingEscalation, error) {
+func (f *failingStore) PendingEscalationExcerpts(ctx context.Context, agentID, agentType string, resolvedSince time.Time) ([]domain.PendingEscalation, error) {
 	f.mu.Lock()
 	fail := f.failDedup
 	f.mu.Unlock()
 	if fail {
 		return nil, errors.New("induced dedup-check failure")
 	}
-	return f.StorePort.PendingEscalationExcerpts(ctx, agentID, agentType)
+	return f.StorePort.PendingEscalationExcerpts(ctx, agentID, agentType, resolvedSince)
 }
 
 // --- harness ---
@@ -1522,6 +1522,62 @@ func TestPipelineIgnoresDuplicateEvent(t *testing.T) {
 	})
 	if got := len(ignoredRows(t, h)); got != 1 {
 		t.Fatalf("new situation was wrongly ignored: %d ignored rows, want 1", got)
+	}
+}
+
+// TestPipelineDedupAfterResolveWithinWindow covers the reported bug: an
+// escalation is accepted (escalated -> resolved, leaving the pending set), yet
+// herdr re-delivers the same screen shortly after. Within the dedup window the
+// just-resolved escalation must still suppress the re-fire — otherwise a second,
+// duplicate escalation is raised for a question the operator already handled.
+func TestPipelineDedupAfterResolveWithinWindow(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+
+	// First blocked event with no learned rule escalates.
+	h.push("agent-resolve-dup", "blocked")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+
+	// The operator accepts it AND the answer is delivered: a correction is
+	// recorded and marked sent, then the row flips escalated -> resolved and
+	// leaves the still-pending set. The delivered (sent=1) correction is what
+	// makes the resolved row a dedup candidate — a learn-only confirm would not,
+	// so the shadow-learning re-escalation loop stays intact (covered by
+	// TestConfirmDrivenShadowToAutoPromotion).
+	esc, _ := h.raw.PendingEscalations(ctx)
+	corrID, err := h.raw.InsertCorrection(ctx, domain.CorrectionRecord{
+		AuditID: esc[0].ID, CorrectedAction: "respond: Yes", Author: "test", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raw.MarkCorrectionSent(ctx, corrID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := h.raw.ResolveEscalation(ctx, esc[0].ID)
+	if err != nil || !claimed {
+		t.Fatalf("resolve escalation: claimed=%v err=%v", claimed, err)
+	}
+	if p, _ := h.raw.PendingEscalations(ctx); len(p) != 0 {
+		t.Fatalf("escalation not resolved: %d still pending", len(p))
+	}
+
+	// Herdr re-delivers the same screen (done->idle when the operator read the
+	// pane). The default window is 5 minutes, so this immediate re-fire is well
+	// inside it: no new escalation, and one ignored audit row.
+	h.herdr.setPane(approvalPane)
+	h.push("agent-resolve-dup", "idle")
+	waitFor(t, 3*time.Second, func() bool { return len(ignoredRows(t, h)) == 1 })
+
+	if p, _ := h.raw.PendingEscalations(ctx); len(p) != 0 {
+		t.Fatalf("re-delivery after resolve raised a duplicate ask: got %d, want 0", len(p))
+	}
+	if len(h.herdr.sentInputs()) != 0 {
+		t.Fatal("duplicate escalation must not send input")
 	}
 }
 

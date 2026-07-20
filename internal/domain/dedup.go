@@ -238,25 +238,142 @@ type PendingEscalation struct {
 // which is what a genuinely head-shifted window looks like and what two
 // first-line-discriminated questions never do. See suffixDuplicate for the
 // degenerate-length guard.
-func DuplicatesPendingEscalation(sitType SituationType, excerpt string, snapshotCap int, pending []PendingEscalation) bool {
+// jitterPct (0-100) widens the content compare to absorb residual TUI jitter the
+// normalizer misses: two captures that differ by no more than jitterPct% of their
+// character trigrams count as the same screen. It is applied ONLY to large
+// tail-window captures (the same half-cap gate the suffix compare uses), so two
+// short but DISTINCT questions — whose only difference may be a handful of
+// characters — never collapse into one, which would silently strand the second
+// agent. jitterPct <= 0 disables the tolerance, preserving the exact-match
+// behavior.
+func DuplicatesPendingEscalation(sitType SituationType, excerpt string, snapshotCap, jitterPct int, pending []PendingEscalation) bool {
 	key := NormalizeForDedup(excerpt)
 	freshWindowed := snapshotCap > 0 && utf8.RuneCountInString(excerpt)*2 >= snapshotCap
 	suffixKey := NormalizeForDedup(dropFirstLine(excerpt))
+	// The incoming excerpt's shingle set is invariant across the loop, so build it
+	// once (only when the jitter path can run) instead of rebuilding it for every
+	// pending candidate.
+	var keyShingles map[string]struct{}
+	var keyRunes int
+	if jitterPct > 0 {
+		keyShingles = shingles(key)
+		keyRunes = utf8.RuneCountInString(key)
+	}
 	for _, p := range pending {
-		if NormalizeForDedup(p.PaneExcerpt) == key {
+		pKey := NormalizeForDedup(p.PaneExcerpt)
+		if pKey == key {
 			// No content to discriminate on: fall back to the situation type.
 			if key == "" && p.SituationType != sitType {
 				continue
 			}
 			return true
 		}
-		if freshWindowed && utf8.RuneCountInString(p.PaneExcerpt)*2 >= snapshotCap &&
-			firstLineExplained(excerpt, p.PaneExcerpt) &&
+		// Both fuzzy paths require two large tail windows.
+		bothLarge := freshWindowed && utf8.RuneCountInString(p.PaneExcerpt)*2 >= snapshotCap
+		if !bothLarge {
+			continue
+		}
+		// Suffix path (head-shift tolerant): the first line may be a truncation
+		// fragment, so it uses firstLineExplained (fragment-of-the-other) and an
+		// EXACT suffix match, which is order-sensitive and safe.
+		if firstLineExplained(excerpt, p.PaneExcerpt) &&
 			suffixDuplicate(suffixKey, NormalizeForDedup(dropFirstLine(p.PaneExcerpt))) {
+			return true
+		}
+		// Jitter path: trigram-set Jaccard is ORDER-INSENSITIVE, so it demands a
+		// STRONGER first-line guarantee than the suffix path — the first lines must
+		// be IDENTICAL, not merely substring-explained. A substring match is not
+		// enough here: two distinct approval headers ("Bash(npm install)" vs
+		// "Bash(go test ./...)") can each appear in the OTHER capture's scrollback,
+		// passing firstLineExplained, and the order-insensitive set compare would
+		// then collapse two genuinely different approvals — a silent drop. Real
+		// jitter (residual chrome the normalizer missed) is mid-screen and leaves
+		// the first line untouched, so requiring equality costs nothing legitimate.
+		if jitterPct > 0 && firstLinesEqual(excerpt, p.PaneExcerpt) &&
+			shingleSimilar(keyShingles, keyRunes, pKey, jitterPct) {
 			return true
 		}
 	}
 	return false
+}
+
+// SimilarWithin reports whether two already-normalized captures are within
+// jitterPct% of each other by character-trigram (shingle) Jaccard similarity:
+// sim = |A∩B| / |A∪B| >= (100-jitterPct)/100. Trigram Jaccard is O(n) — unlike
+// Levenshtein's O(n·m), which is far too slow to run per pending escalation on
+// the daemon's synchronous event loop for multi-kilobyte captures — and is a
+// standard near-duplicate metric: a few changed lines in a large screen move sim
+// only slightly, while two genuinely different screens fall well below the
+// threshold. jitterPct <= 0 requires an exact match; jitterPct >= 100 matches
+// anything.
+func SimilarWithin(a, b string, jitterPct int) bool {
+	if a == b {
+		return true
+	}
+	if jitterPct <= 0 {
+		return false
+	}
+	if jitterPct >= 100 {
+		return true
+	}
+	return shingleSimilar(shingles(a), utf8.RuneCountInString(a), b, jitterPct)
+}
+
+// shingleSimilar is the trigram-Jaccard core of SimilarWithin, taking the first
+// capture's precomputed shingle set (and its rune count) so a caller comparing
+// one incoming excerpt against many candidates builds that set only once.
+// jitterPct is assumed already normalized to (0,100) by the caller.
+func shingleSimilar(sa map[string]struct{}, ra int, b string, jitterPct int) bool {
+	rb := utf8.RuneCountInString(b)
+	shorter, longer := ra, rb
+	if shorter > longer {
+		shorter, longer = longer, shorter
+	}
+	if longer == 0 {
+		return true // both empty
+	}
+	// Cheap length pre-filter: for non-degenerate (low-repetition) content the
+	// shingle-count ratio does not exceed the rune-count ratio, so a shorter
+	// capture too small a fraction of the longer cannot clear the threshold —
+	// skip building b's set. Its only failure mode is on highly repetitive text
+	// (e.g. a pane of identical separator runes at differing lengths), where it
+	// may skip a pair the full metric would accept; that direction is safe — a
+	// redundant escalation, never a silent drop of a distinct question.
+	if shorter*100 < (100-jitterPct)*longer {
+		return false
+	}
+	sb := shingles(b)
+	inter := 0
+	for k := range sa {
+		if _, ok := sb[k]; ok {
+			inter++
+		}
+	}
+	union := len(sa) + len(sb) - inter
+	if union == 0 {
+		return true
+	}
+	// sim = inter/union >= (100-jitterPct)/100, kept in integer arithmetic.
+	return inter*100 >= (100-jitterPct)*union
+}
+
+// shingles is the set of overlapping character trigrams of s. A string shorter
+// than 3 runes has no trigram, so it is represented by itself (an empty string
+// yields the empty set) — enough for the exact/near-empty cases the caller feeds
+// it; the real work is on multi-kilobyte captures.
+func shingles(s string) map[string]struct{} {
+	r := []rune(s)
+	m := make(map[string]struct{}, len(r))
+	if len(r) < 3 {
+		if len(r) > 0 {
+			m[string(r)] = struct{}{}
+		}
+		return m
+	}
+	for i := 0; i+3 <= len(r); i++ {
+		m[string(r[i:i+3])] = struct{}{}
+	}
+	return m
 }
 
 // firstLineExplained reports whether either capture's first line — the line
@@ -281,6 +398,16 @@ func firstLineIn(src, other string) bool {
 	first, _, _ := strings.Cut(src, "\n")
 	first = strings.TrimSpace(first)
 	return first == "" || strings.Contains(other, first)
+}
+
+// firstLinesEqual reports whether the two captures' trimmed first lines are
+// identical — the strict gate the order-insensitive jitter path uses in place of
+// firstLineExplained, so a discriminating first line (a different command over an
+// otherwise similar body) can never be waved through by a mere substring match.
+func firstLinesEqual(a, b string) bool {
+	fa, _, _ := strings.Cut(a, "\n")
+	fb, _, _ := strings.Cut(b, "\n")
+	return strings.TrimSpace(fa) == strings.TrimSpace(fb)
 }
 
 // dropFirstLine removes the first line of a tail-windowed capture: both the

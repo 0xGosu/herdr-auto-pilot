@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -296,8 +297,134 @@ func TestDuplicatesPendingEscalation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := DuplicatesPendingEscalation(tc.sit, tc.excerpt, tc.cap, tc.pending); got != tc.want {
+			// jitter 0: every case here pins the exact/suffix behavior, which the
+			// tolerance path must leave untouched.
+			if got := DuplicatesPendingEscalation(tc.sit, tc.excerpt, tc.cap, 0, tc.pending); got != tc.want {
 				t.Errorf("DuplicatesPendingEscalation = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// bigVariedBody builds a large, NON-repeating body: shingle (trigram) sets
+// collapse repeated text into few unique entries, so identical filler would make
+// a tiny edit a large fraction of the set. Distinct numbered lines give a large
+// unique-trigram set, the realistic case for a full pane of build output.
+func bigVariedBody(n int) string {
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		b.WriteString("line ")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(": build output token alpha")
+		b.WriteString(strconv.Itoa(i * 7))
+		b.WriteString(" beta")
+		b.WriteString(strconv.Itoa(i * 13))
+		b.WriteString(" gamma done\n")
+	}
+	return b.String()
+}
+
+func TestDuplicatesPendingEscalationJitter(t *testing.T) {
+	const cap = 200 // half-cap gate = 100 runes; the big screens clear it, short ones don't.
+	body := bigVariedBody(40)
+	// base and nearDup are the same large standing screen; nearDup changes a few
+	// characters DEEP IN THE BODY (residual jitter the normalizer missed) — a
+	// tiny fraction of a large, varied trigram set. The change is mid-body on
+	// purpose: a head-only difference would be absorbed by the suffix compare, so
+	// a mid-body edit is what isolates the jitter path (it breaks the exact and
+	// suffix compares, leaving only the tolerance).
+	base := "● Working on it\n" + body + "❯ \nstatus bar"
+	nearDup := "● Working on it\n" + strings.Replace(body, "line 20:", "line 20: (retry)", 1) + "❯ \nstatus bar"
+	// A genuinely different large screen (different body + question).
+	veryDifferent := "● Deploy to production?\n" + strings.ReplaceAll(bigVariedBody(40), "build output", "deploy step") + "❯ 1. Yes\n  2. No\nstatus bar"
+
+	tests := []struct {
+		name    string
+		excerpt string
+		jitter  int
+		pending []PendingEscalation
+		want    bool
+	}{
+		{
+			"large near-identical captures dedup within 5% jitter",
+			nearDup, 5, []PendingEscalation{pend(SituationIdle, base)}, true,
+		},
+		{
+			"large near-identical captures do NOT dedup with jitter disabled",
+			nearDup, 0, []PendingEscalation{pend(SituationIdle, base)}, false,
+		},
+		{
+			"genuinely different large captures are NOT a duplicate under 5% jitter",
+			veryDifferent, 5, []PendingEscalation{pend(SituationIdle, base)}, false,
+		},
+		{
+			// Safety: two large approvals with an identical body but a DIFFERENT
+			// first command line are >95% similar as text, yet they are different
+			// questions. Requiring EQUAL first lines refuses before the jitter path
+			// runs — otherwise the second approval is silently dropped.
+			"large panes differing only in the first command line are NOT collapsed by jitter",
+			"Bash(npm install)\n" + body + "❯ 1. Yes\n  2. No\nstatus bar", 5,
+			[]PendingEscalation{pend(SituationApproval,
+				"Bash(go test ./...)\n"+body+"❯ 1. Yes\n  2. No\nstatus bar")}, false,
+		},
+		{
+			// Safety (the order-insensitive trap): the discriminating first-line
+			// commands ALSO appear in each other's scrollback, so the weaker
+			// firstLineExplained (substring) guard would pass and the trigram SET
+			// compare — which ignores order — would collapse two DIFFERENT
+			// approvals. firstLinesEqual (identity, not substring) refuses.
+			"large panes whose distinct headers appear in each other's body are NOT collapsed",
+			"Bash(npm install)\nnote: earlier Bash(go test ./...) passed\n" + body + "❯ 1. Yes\n  2. No\nstatus bar", 5,
+			[]PendingEscalation{pend(SituationApproval,
+				"Bash(go test ./...)\nnote: earlier Bash(npm install) passed\n"+body+"❯ 1. Yes\n  2. No\nstatus bar")}, false,
+		},
+		{
+			// Safety: two SHORT distinct commands are below the half-cap gate, so
+			// the jitter path never sees them and they stay separate escalations —
+			// never a silent drop. (Belt and suspenders: at short lengths the
+			// trigram metric already keeps them apart too; see TestSimilarWithin.)
+			"short distinct commands are NOT collapsed by jitter",
+			"Bash(rm -rf /tmp/foo)?", 5,
+			[]PendingEscalation{pend(SituationApproval, "Bash(rm -rf /tmp/bar)?")}, false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DuplicatesPendingEscalation(SituationIdle, tc.excerpt, cap, tc.jitter, tc.pending); got != tc.want {
+				t.Errorf("DuplicatesPendingEscalation = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSimilarWithin(t *testing.T) {
+	body := bigVariedBody(40) // large, varied → a small edit is a small fraction
+	tests := []struct {
+		name   string
+		a, b   string
+		jitter int
+		want   bool
+	}{
+		{"identical strings always match", body, body, 5, true},
+		{"identical strings match even at jitter 0", body, body, 0, true},
+		{"empty strings match", "", "", 5, true},
+		{"tiny change in a large body is within 5%", body + "x", body + "yz", 5, true},
+		{"jitter 0 requires exact match", body + "x", body + "yz", 0, false},
+		{"jitter 100 matches anything", "totally", "different", 100, true},
+		{"very different strings miss at 5%", body, "a completely unrelated short line", 5, false},
+		{
+			// At short lengths a single differing token is already a large
+			// fraction of the trigram set, so distinct short commands fall well
+			// below 95% similar — the metric itself keeps them apart, on top of
+			// the half-cap gate in the caller.
+			"short distinct commands are NOT similar under trigram Jaccard",
+			"Bash(rm -rf /tmp/foo)?", "Bash(rm -rf /tmp/bar)?", 5, false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SimilarWithin(tc.a, tc.b, tc.jitter); got != tc.want {
+				t.Errorf("SimilarWithin(%q, %q, %d) = %v, want %v", tc.a, tc.b, tc.jitter, got, tc.want)
 			}
 		})
 	}

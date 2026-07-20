@@ -388,21 +388,99 @@ func TestPendingEscalationExcerpts(t *testing.T) {
 		return id
 	}
 
+	// The daemon derives this as now-window; here a 5-minute window.
+	resolvedSince := now.Add(-5 * time.Minute)
+
+	// resolveSent marks an escalation resolved with a DELIVERED answer (the
+	// operator accepted it and the keystroke landed), the shape that makes a
+	// recently-resolved row a dedup candidate.
+	resolveSent := func(auditID int64, at time.Time) {
+		corrID, err := s.InsertCorrection(ctx, domain.CorrectionRecord{
+			AuditID: auditID, CorrectedAction: "respond: Yes", Author: "op", CreatedAt: at,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.MarkCorrectionSent(ctx, corrID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ResolveEscalation(ctx, auditID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// resolveUnsent reproduces a LEARN-ONLY shadow confirm faithfully: the
+	// front-end DOES record a correction, but with sent=0 (never MarkCorrectionSent
+	// because nothing was delivered). Seeding a real sent=0 correction — rather
+	// than a bare resolved row with no correction — is what makes the `sent = 1`
+	// clause the SOLE reason this row is excluded, so a regression that matched
+	// any correction would be caught.
+	resolveUnsent := func(auditID int64, at time.Time) {
+		if _, err := s.InsertCorrection(ctx, domain.CorrectionRecord{
+			AuditID: auditID, CorrectedAction: "respond: Yes", Author: "op", CreatedAt: at,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ResolveEscalation(ctx, auditID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	// A pending escalation, however old, is a candidate (unbounded in time).
 	pendingID = seed("agent-1", "claude", domain.SituationApproval, "escalated", "allow bash?", now.Add(-10*time.Minute))
 	// A different situation_type escalation for the same agent is ALSO returned
 	// (the query is deliberately not type-scoped).
 	seed("agent-1", "claude", domain.SituationError, "escalated", "some error", now.Add(-20*time.Second))
-	// Non-escalated rows are never candidates.
+	// A recently-resolved escalation WITH a delivered answer is a candidate: it
+	// dedups the agent's own stale re-delivery after being unblocked.
+	recentSent := seed("agent-1", "claude", domain.SituationApproval, "escalated", "a recent answered ask", now.Add(-1*time.Minute))
+	resolveSent(recentSent, now.Add(-1*time.Minute))
+	// The window is measured from DELIVERY, not raise: an escalation raised long
+	// ago (well before the window) but answered just now is STILL a candidate.
+	// This is the away-operator case the fix exists for.
+	lateAnswered := seed("agent-1", "claude", domain.SituationApproval, "escalated", "raised long ago, answered now", now.Add(-30*time.Minute))
+	resolveSent(lateAnswered, now.Add(-1*time.Minute))
+	// A recently-resolved escalation with a learn-only (sent=0) correction is NOT
+	// a candidate — the agent is still blocked and must re-escalate to keep
+	// graduating. This pins the load-bearing `sent = 1` predicate.
+	recentUnsent := seed("agent-1", "claude", domain.SituationApproval, "escalated", "a recent learn-only ask", now.Add(-1*time.Minute))
+	resolveUnsent(recentUnsent, now.Add(-1*time.Minute))
+	// A resolved+answered escalation whose answer was DELIVERED outside the
+	// window (delivery time, not raise time) is not a candidate.
+	oldSent := seed("agent-1", "claude", domain.SituationApproval, "escalated", "an old answered ask", now.Add(-10*time.Minute))
+	resolveSent(oldSent, now.Add(-10*time.Minute))
+	// A post-hoc correction of an AUTONOMOUS action (action="auto:…") that lands
+	// at status=resolved with a recent sent correction is NOT a candidate — it
+	// was never an escalation, so it must not suppress a later genuine one.
+	autoID, err := s.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-1", AgentType: "claude", Trigger: "x",
+		SituationType: domain.SituationApproval, Action: domain.AuditActionAutoPrefix + "respond: Yes",
+		Status: "auto", PaneExcerpt: "a corrected auto action", CreatedAt: now.Add(-1 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	autoCorr, err := s.InsertCorrection(ctx, domain.CorrectionRecord{
+		AuditID: autoID, CorrectedAction: "respond: No", Author: "op", CreatedAt: now.Add(-1 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkCorrectionSent(ctx, autoCorr); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateAuditStatus(ctx, autoID, "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	// Non-escalated, non-resolved rows are never candidates (auto sends, and
+	// dismissals are not time-windowed).
 	seed("agent-1", "claude", domain.SituationIdle, "auto", "an auto send", now)
-	seed("agent-1", "claude", domain.SituationApproval, "resolved", "a resolved ask", now)
 	seed("agent-1", "claude", domain.SituationApproval, "dismissed", "a dismissed ask", now)
 	// A different agent / agent_type is out of scope.
 	seed("agent-2", "claude", domain.SituationApproval, "escalated", "other agent", now)
 	seed("agent-1", "codex", domain.SituationApproval, "escalated", "other type", now)
 
 	excerpts := func() map[string]bool {
-		got, err := s.PendingEscalationExcerpts(ctx, "agent-1", "claude")
+		got, err := s.PendingEscalationExcerpts(ctx, "agent-1", "claude", resolvedSince)
 		if err != nil {
 			t.Fatalf("PendingEscalationExcerpts: %v", err)
 		}
@@ -414,13 +492,14 @@ func TestPendingEscalationExcerpts(t *testing.T) {
 	}
 
 	got := excerpts()
-	for _, w := range []string{"allow bash?", "some error"} {
+	for _, w := range []string{"allow bash?", "some error", "a recent answered ask", "raised long ago, answered now"} {
 		if !got[w] {
 			t.Errorf("expected pending escalation %q, got %v", w, got)
 		}
 	}
 	for _, unwanted := range []string{
-		"an auto send", "a resolved ask", "a dismissed ask", "other agent", "other type",
+		"a recent learn-only ask", "an old answered ask", "a corrected auto action",
+		"an auto send", "a dismissed ask", "other agent", "other type",
 	} {
 		if got[unwanted] {
 			t.Errorf("did not expect candidate %q", unwanted)
@@ -467,7 +546,7 @@ func TestPendingEscalationExcerptsBounded(t *testing.T) {
 		}
 	}
 
-	got, err := s.PendingEscalationExcerpts(ctx, "agent-1", "claude")
+	got, err := s.PendingEscalationExcerpts(ctx, "agent-1", "claude", now.Add(-5*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,6 +565,66 @@ func TestPendingEscalationExcerptsBounded(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("newest pending escalation %q missing from the bounded window", newest)
+	}
+}
+
+// TestPendingEscalationExcerptsPendingNotCrowdedOut pins that a burst of recent
+// resolved-and-delivered escalations can never displace a still-pending one from
+// the candidate set. The two groups are fetched by separate queries with
+// independent LIMITs, so an old low-id pending row is always returned even when
+// far more than the cap of newer resolved rows exist — a single shared
+// ORDER BY ... LIMIT over both would drop it and let its re-fire duplicate.
+func TestPendingEscalationExcerptsPendingNotCrowdedOut(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// One old still-pending escalation (lowest id).
+	if _, err := s.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-1", AgentType: "claude", Trigger: "x",
+		SituationType: domain.SituationApproval, Action: "escalated", Status: "escalated",
+		PaneExcerpt: "old pending screen", CreatedAt: now.Add(-1 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// More than the cap of newer resolved-and-delivered escalations.
+	for i := 0; i < PendingEscalationDedupLimit+10; i++ {
+		id, err := s.AppendAudit(ctx, domain.AuditRecord{
+			AgentID: "agent-1", AgentType: "claude", Trigger: "x",
+			SituationType: domain.SituationApproval, Action: domain.AuditActionEscalated, Status: "escalated",
+			PaneExcerpt: fmt.Sprintf("resolved screen %d", i),
+			CreatedAt:   now.Add(time.Duration(i) * time.Millisecond),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		corrID, err := s.InsertCorrection(ctx, domain.CorrectionRecord{
+			AuditID: id, CorrectedAction: "respond: Yes", Author: "op", CreatedAt: now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.MarkCorrectionSent(ctx, corrID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ResolveEscalation(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.PendingEscalationExcerpts(ctx, "agent-1", "claude", now.Add(-5*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range got {
+		if p.PaneExcerpt == "old pending screen" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("a still-pending escalation was crowded out of the candidate set by recent resolved rows")
 	}
 }
 
