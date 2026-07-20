@@ -65,8 +65,11 @@ func OptionCheckStates(frame string) map[string]bool {
 // re-pressing one would CLEAR it), while any other checked box belongs to
 // someone else and is never hap's to clear.
 //
-// Pass a nil/empty chosen to demand an all-unchecked frame — the capture-time
-// baseline, where no answer has been decided yet.
+// Pass a nil/empty chosen to demand an all-unchecked frame: every checked box
+// then reads as foreign. Callers with no decided answer (capture) do not ask
+// this question at all — with nothing to compare against, refusing would
+// strand hap's own half-delivered forms; they record and let the delivery-time
+// call decide.
 func CheckedOutside(frame string, chosen []string) []string {
 	want := make(map[string]bool, len(chosen))
 	for _, digit := range chosen {

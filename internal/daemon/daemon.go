@@ -161,6 +161,19 @@ type Daemon struct {
 	// (guarded by mu); outcomes return through sweepResults.
 	sweepInFlight map[string]bool
 
+	// toggleAttempt records, per agent, the signature of the multi-select form
+	// this daemon last started answering — the evidence that lets a later
+	// delivery accept a tab whose boxes are ALREADY ticked. Without it,
+	// "checked ⊆ chosen" is only an inference: an operator halfway through
+	// ticking a form, having chosen a subset of what the rule chose, would
+	// pass it and have their form completed and submitted for them. With it,
+	// hap widens the baseline only where it can point at its own abandoned
+	// attempt. Cleared once a delivery completes, so the NEXT form on that
+	// agent starts from the strict baseline again. Deliberately in-memory:
+	// after a restart hap can no longer prove the ticks are its own, and
+	// falling back to "escalate" is the safe direction. Guarded by mu.
+	toggleAttempt map[string]string
+
 	// idleSince tracks how long each agent has been continuously parked at a
 	// non-busy status, for the auto-send-when-idle poll. Refreshed from the
 	// sweep's agent listing: an agent that is still parked on the SAME pane
@@ -347,6 +360,7 @@ func New(opt Options) (*Daemon, error) {
 		lastAutoNoop:         map[string]time.Time{},
 		actionReviewInFlight: map[string]actionReviewFlight{},
 		sweepInFlight:        map[string]bool{},
+		toggleAttempt:        map[string]string{},
 		idleSince:            map[string]idleMark{},
 		autoTaskClaim:        map[string]taskClaim{},
 		snapshotSaved:        map[string]bool{},
@@ -2494,7 +2508,8 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		}
 		if kinds, anyMulti := tabSelectKinds(s.EffectiveAnswerMultiSelect()); anyMulti {
 			fields["tab_select_kinds"] = kinds
-			answer += ". Some tabs are MULTI-SELECT (tab_select_kinds marks each tab \"single\" or \"multi\"; a multi-select question shows `[ ]` checkboxes on its options): for a multi-select tab pass an ARRAY of the option numbers to toggle instead of a single integer, e.g. [1, [1, 3], 2] chooses option 1 on tab 1, toggles options 1 and 3 on tab 2, and option 2 on tab 3"
+			answer += ". Some tabs are MULTI-SELECT (tab_select_kinds marks each tab \"single\" or \"multi\"; a multi-select question shows `[ ]` checkboxes on its options): for a multi-select tab pass an ARRAY of the option numbers to toggle instead of a single integer, e.g. [1, [1, 3], 2] chooses option 1 on tab 1, toggles options 1 and 3 on tab 2, and option 2 on tab 3" +
+				". An option already rendered `[✔]` is ALREADY ticked (a previous, unfinished delivery): still list every option you want selected — the complete desired set for that tab, not the difference — because the keys are pressed only for the boxes that are not already ticked, and any box you leave out is never cleared"
 		}
 		fields["answer_format"] = answer
 	} else if len(s.Options) > 0 {

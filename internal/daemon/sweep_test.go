@@ -39,7 +39,7 @@ func TestCodexQuestionSweepAndAdaptiveDelivery(t *testing.T) {
 	if s.Type != domain.SituationChoice || s.MCQKind != domain.MCQCodexQuestions || s.EffectiveAnswerCount() != 2 {
 		t.Fatalf("fixture classification = %+v", s)
 	}
-	swept, err := h.daemon.sweepFrames(context.Background(), h.herdr, s, nil)
+	swept, err := h.daemon.sweepFrames(context.Background(), h.herdr, s, checkBaseline{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,23 +291,32 @@ func TestReverifyMultiSelectRejectsChangedForm(t *testing.T) {
 	s.PaneID = "w1:p1"
 	ctx := context.Background()
 	groups := [][]string{{"1"}, {"1", "3"}, {"1"}}
+	sig := domain.ComputeSignature(s).Signature
 
 	// Unchanged form re-verifies clean.
 	h.herdr.setFrames(mcqMultiFrames)
-	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, groups); err != nil {
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, sig, groups); err != nil {
 		t.Fatalf("an unchanged multi-select form must re-verify clean, got %v", err)
 	}
 
-	// The same form carrying THIS answer's own toggles re-verifies clean too:
-	// only the checkbox marks differ, and they are the ones it chose.
+	// A form carrying ticks that hap can NOT attribute to itself is refused,
+	// even when they are a subset of what this answer chose — it may be an
+	// operator halfway through the same form.
 	h.herdr.setFrames(mcqMultiOwnToggleFrames)
-	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, groups); err != nil {
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, sig, groups); err == nil {
+		t.Fatal("ticks with no recorded attempt of ours must be refused")
+	}
+
+	// With this daemon's own attempt on record, the same pane re-verifies
+	// clean: those ticks are the answer's own, half delivered.
+	h.daemon.markToggleAttempt(s.AgentID, sig)
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, sig, groups); err != nil {
 		t.Fatalf("a form carrying this answer's own toggles must re-verify clean, got %v", err)
 	}
 
-	// A box this answer did not choose is still a refusal.
+	// A box this answer did not choose is a refusal even then.
 	h.herdr.setFrames(mcqMultiPrecheckedFrames)
-	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, groups); err == nil {
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, sig, groups); err == nil {
 		t.Fatal("reverify must reject a selection this answer did not choose")
 	}
 
@@ -318,18 +327,19 @@ func TestReverifyMultiSelectRejectsChangedForm(t *testing.T) {
 		mcqMultiFrames[2],
 	}
 	h.herdr.setFrames(changed)
-	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, groups); err == nil {
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, sig, groups); err == nil {
 		t.Fatal("reverify must reject a form whose content changed since capture")
 	}
 }
 
-// A multi-select tab that ALREADY has a selection can not be toggled safely
-// (toggling is relative): the sweep refuses, the form escalates, and no digit
-// is ever pressed.
-func TestMultiTabSweepMultiSelectPrecheckedEscalates(t *testing.T) {
+// SAFETY INVARIANT: a checkbox this answer did not choose is someone else's
+// selection. Capture records it, the rule still resolves (the signature folds
+// the box away), and the DELIVERY gate refuses — no digit is ever pressed, and
+// the operator gets the form.
+func TestMultiTabSweepMultiSelectForeignSelectionEscalates(t *testing.T) {
 	h := newHarness(t, "")
-	h.herdr.setFrames(mcqMultiPrecheckedFrames)
-	h.seedSeriesRuleFrom(t, mcqMultiFrames, "1 1,3 1") // even a graduated rule must not fire
+	h.herdr.setFrames(mcqMultiPrecheckedFrames) // option 2 checked; the rule chooses 1 and 3
+	h.seedSeriesRuleFrom(t, mcqMultiFrames, "1 1,3 1")
 
 	h.push("agent-mcqprechecked", "blocked")
 
@@ -338,14 +348,87 @@ func TestMultiTabSweepMultiSelectPrecheckedEscalates(t *testing.T) {
 		esc, _ := h.raw.PendingEscalations(ctx)
 		return len(esc) == 1
 	})
-	esc, _ := h.raw.PendingEscalations(ctx)
-	if !strings.Contains(esc[0].Rationale, "already has") {
-		t.Errorf("escalation must name the pre-selected baseline: %+v", esc[0])
-	}
 	for _, k := range h.herdr.keysSent() {
 		if k != "right" && k != "left" {
 			t.Errorf("no digit may be pressed when the toggle baseline is unsafe, keys: %v", h.herdr.keysSent())
 		}
+	}
+	audits, _ := h.raw.AuditLog(ctx, 10)
+	if audits[0].Status != "escalated" {
+		t.Errorf("audit status = %q, want escalated: %+v", audits[0].Status, audits[0])
+	}
+	// The queue entry must explain itself and be confirmable: a bare status
+	// flip leaves the rule's own rationale and an empty suggestion behind.
+	esc, _ := h.raw.PendingEscalations(ctx)
+	if !strings.Contains(esc[0].Rationale, "already has option(s) 2") {
+		t.Errorf("escalation must name the foreign selection: %+v", esc[0])
+	}
+	if esc[0].Suggestion == "" {
+		t.Errorf("escalation must carry a confirmable suggestion: %+v", esc[0])
+	}
+}
+
+// SAFETY INVARIANT: without evidence that the ticks are hap's own, a form
+// carrying a SUBSET of what the answer chose is refused — it may be an
+// operator halfway through ticking that very form, and completing it would
+// submit a selection they never finished making.
+func TestMultiTabSweepMultiSelectUnattributedTogglesEscalate(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setFrames(mcqMultiOwnToggleFrames) // exactly the rule's own choices
+	h.seedSeriesRuleFrom(t, mcqMultiFrames, "1 1,3 1")
+	// No markToggleAttempt: this daemon never started answering this form.
+
+	h.push("agent-mcqunattributed", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 10*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	for _, k := range h.herdr.keysSent() {
+		if k != "right" && k != "left" {
+			t.Errorf("no digit may be pressed without evidence the ticks are ours, keys: %v", h.herdr.keysSent())
+		}
+	}
+}
+
+// SAFETY INVARIANT (the other direction): a form carrying ONLY the boxes this
+// answer chose is hap's own half-delivered attempt. Re-capturing it must not
+// strand the agent — the rule resolves, the delivery gate accepts, and only
+// the MISSING keystrokes go out (option 1 and 3 are already ticked, so tab 2
+// contributes just its advance).
+func TestMultiTabSweepMultiSelectOwnTogglesComplete(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setFrames(mcqMultiOwnToggleFrames)
+	sig := h.seedSeriesRuleFrom(t, mcqMultiFrames, "1 1,3 1")
+	// The evidence a real retry would carry: this daemon already started
+	// answering this form, so the ticks on it are its own.
+	h.daemon.markToggleAttempt("agent-mcqowntoggle", sig)
+
+	h.push("agent-mcqowntoggle", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 10*time.Second, func() bool {
+		decs, _ := h.raw.DecisionsForSignature(ctx, sig, 10)
+		return len(decs) == 9
+	})
+	esc, _ := h.raw.PendingEscalations(ctx)
+	if len(esc) != 0 {
+		t.Fatalf("hap's own half-delivered form must not escalate: %+v", esc)
+	}
+	// The WHOLE keystroke run, so a stray digit anywhere fails: capture sweep
+	// (2 rights + reset), the pre-delivery re-verification sweep (the same
+	// again), then delivery's own reset, tab 1's digit, tab 2's advance ALONE
+	// — its boxes are already ticked and re-pressing one would clear it — and
+	// Submit.
+	reset := strings.TrimSpace(strings.Repeat("left ", 10))
+	want := "right right " + reset + " right right " + reset + " " + reset + " 1 right 1"
+	if got := strings.Join(h.herdr.keysSent(), " "); got != want {
+		t.Errorf("keystroke protocol mismatch:\n got %s\nwant %s", got, want)
+	}
+	audits, _ := h.raw.AuditLog(ctx, 10)
+	if audits[0].Status != "auto" {
+		t.Errorf("audit status = %q, want auto: %+v", audits[0].Status, audits[0])
 	}
 }
 
@@ -363,29 +446,16 @@ var mcqMultiOwnToggleFrames = []string{
 	"──────\n" + mcqHeaderTab2Answered + "\n\nReview your answers\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n",
 }
 
-// A form CAPTURED with a checkbox already set still escalates, whatever the
-// learned answer chose. Capture runs before any answer is known, so the
-// "checked ⊆ chosen" rule the delivery-time gates use has nothing to compare
-// against — the strict baseline is the only safe one there. The relaxation
-// therefore only ever applies to a form captured clean whose boxes moved
-// before delivery (see TestReverifyMultiSelectRejectsChangedForm).
-func TestMultiTabSweepMultiSelectPrecheckedEscalatesEvenWhenChosen(t *testing.T) {
-	h := newHarness(t, "")
-	// The rule chooses exactly the options the pane already carries.
-	h.seedSeriesRuleFrom(t, mcqMultiFrames, "1 1,3 1")
-	h.herdr.setFrames(mcqMultiOwnToggleFrames)
-
-	h.push("agent-mcqcaptured", "blocked")
-
-	ctx := context.Background()
-	waitFor(t, 10*time.Second, func() bool {
-		esc, _ := h.raw.PendingEscalations(ctx)
-		return len(esc) == 1
-	})
-	for _, k := range h.herdr.keysSent() {
-		if k != "right" && k != "left" {
-			t.Errorf("no digit may be pressed when the captured baseline is unsafe, keys: %v", h.herdr.keysSent())
-		}
+// A half-delivered form must resolve to the SAME signature as the untouched
+// one: the checkbox marks are volatile state, not part of the question. Without
+// that fold the learned rule never matches a re-captured form and the agent is
+// stranded no matter how permissive the gates are.
+func TestPartiallyToggledFormKeepsItsSignature(t *testing.T) {
+	clean := sweptSituationFrom(t, mcqMultiFrames)
+	toggled := sweptSituationFrom(t, mcqMultiOwnToggleFrames)
+	if got, want := domain.ComputeSignature(toggled), domain.ComputeSignature(clean); got.Signature != want.Signature {
+		t.Errorf("signature drifted with the checkbox state:\n toggled %s (%q)\n clean   %s (%q)",
+			got.Signature, got.Salient, want.Signature, want.Salient)
 	}
 }
 

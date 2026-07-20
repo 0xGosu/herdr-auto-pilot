@@ -101,6 +101,35 @@ func TestSignatureOptionSets(t *testing.T) {
 	}
 }
 
+func TestSignatureFoldsCheckboxState(t *testing.T) {
+	mk := func(opts ...string) Situation {
+		return Situation{Type: SituationChoice, AgentType: "claude",
+			Content: "Pick the stats to show", Options: opts}
+	}
+	// A ticked box is volatile state, not a different question: a form
+	// carrying a half-delivered answer must resolve to the rule learned for
+	// the untouched one.
+	unchecked := ComputeSignature(mk("[ ] Auto-sends", "[ ] Escalations"))
+	for _, mark := range []string{"[✔]", "[x]", "[X]", "[✓]"} {
+		got := ComputeSignature(mk(mark+" Auto-sends", "[ ] Escalations"))
+		if got.Signature != unchecked.Signature {
+			t.Errorf("%s drifted the signature: %q vs %q", mark, got.Salient, unchecked.Salient)
+		}
+	}
+	// It must not over-collapse: only the BOX is folded, never the label.
+	if near := ComputeSignature(mk("[✔] Auto-send", "[ ] Escalations")); near.Signature == unchecked.Signature {
+		t.Errorf("labels differing outside the box must not collapse: %q", near.Salient)
+	}
+	// The fold rewrites a checked box to the UNCHECKED spelling rather than
+	// dropping it, so every signature learned before this existed stays
+	// byte-identical — no stored row needs a migration. This pins the salient
+	// an untouched form produces; changing it invalidates every learned rule.
+	if want := "options:[ ] auto-sends;[ ] escalations"; unchecked.Salient != want {
+		t.Errorf("untouched salient = %q, want %q (a change here invalidates stored rules)",
+			unchecked.Salient, want)
+	}
+}
+
 func TestOverMaskingFloor(t *testing.T) {
 	// FR-003a acceptance: a prompt reduced almost entirely to placeholders
 	// is unclassifiable rather than matched on a degenerate signature.

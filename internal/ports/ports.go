@@ -173,6 +173,10 @@ type DaemonStore interface {
 	RecordDecision(ctx context.Context, d domain.DecisionRecord) (int64, error)
 	AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, error)
 	UpdateAuditStatus(ctx context.Context, auditID int64, status string) error
+	// EscalateAudit demotes a row to escalated WITH the reason and a
+	// confirmable suggestion (a bare status flip leaves the operator an
+	// unexplained, unconfirmable queue entry).
+	EscalateAudit(ctx context.Context, auditID int64, rationale, suggestion string) error
 	UpdateAgentRate(ctx context.Context, r domain.AgentRate) error
 	UpsertErrorRetry(ctx context.Context, e domain.ErrorRetry) error
 	ResetErrorRetry(ctx context.Context, errorSignature string) error

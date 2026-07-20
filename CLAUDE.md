@@ -169,6 +169,23 @@ whose manifest carries exactly that version).
   touching these must keep/extend the safety-invariant tests; new destructive-command shapes
   go in `internal/domain/testdata/irreversible_corpus.txt` (CI fails if seed patterns miss a
   corpus entry).
+- **A checkbox tab is answered by TOGGLING, so its baseline is a safety control** — a digit
+  flips a `[ ]`/`[✔]` box rather than selecting it, so pressing one blind is not idempotent:
+  over a pane already carrying an attempt's toggles it CLEARS them and the advance submits an
+  empty answer. The rule is `checked ⊆ chosen`, enforced at DELIVERY (`domain.CheckedOutside`
+  in `daemon.reverifyMultiSelect`, `frontend.verifyTabBaseline`, and again per keystroke in
+  `mcqdeliver.toggleTab`, which presses only the missing boxes): hap's own boxes may already
+  be set, anything else is the operator's and is never cleared. CAPTURE only records — refusing
+  there would strand every form hap itself half-answered, since the next attention event
+  re-captures that pane. The signature folds the checkbox state away
+  (`domain.NormalizedOptionSet`) so a half-delivered form still matches the rule learned for
+  the untouched one. **The widened baseline needs evidence**: it applies only when this daemon
+  recorded its own attempt at this pane+signature (`markToggleAttempt`, in-memory, cleared on
+  a completed delivery and lost across restarts — both fail safe). Without it a tab must be
+  completely clean, because "checked ⊆ chosen" alone would also accept an operator halfway
+  through ticking that very form. Keep all three invariant tests when touching this
+  (`TestMultiTabSweepMultiSelectOwnTogglesComplete` / `…ForeignSelectionEscalates` /
+  `…UnattributedTogglesEscalate`).
 - **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
   shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels
   results back through a channel (see `consultLLM` / `llmResults`).
