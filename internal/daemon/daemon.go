@@ -169,6 +169,24 @@ type Daemon struct {
 	// background refreshes per pane.
 	paneCwds          map[string]paneCwdEntry
 	paneCwdRefreshing map[string]bool
+
+	// Background lifecycle. bg tracks every goroutine and AfterFunc callback
+	// the daemon spawns via spawn/afterFunc; Run awaits it (shutdownBackground)
+	// before its deferred matcher/embedder Close — and before the caller closes
+	// the Store — so no background work can touch a store or matcher after it is
+	// closed (the source of the "database is closed" warnings and capture
+	// flakiness). lifeMu guards closing + timers. closing latches at shutdown so
+	// no new background work is scheduled. timers holds pending (unfired)
+	// AfterFunc timers so shutdown can Stop them. shutdownCtx is cancelled at
+	// shutdown for background work that must outlive a single pipeline ctx yet
+	// still stop on daemon teardown (verify-unblock and semantic-init, which
+	// previously rooted at context.Background() and so ignored shutdown).
+	lifeMu         sync.Mutex
+	closing        bool
+	timers         map[*time.Timer]struct{}
+	bg             sync.WaitGroup
+	shutdownCtx    context.Context
+	cancelShutdown context.CancelFunc
 }
 
 // paneCwdEntry is one cached pane working directory with its capture time.
@@ -278,14 +296,108 @@ func New(opt Options) (*Daemon, error) {
 		paneCwds:             map[string]paneCwdEntry{},
 		paneCwdRefreshing:    map[string]bool{},
 		embedder:             opt.Embedder,
+		timers:               map[*time.Timer]struct{}{},
 	}
+	// The shutdown context must exist before reload(): reload spawns the
+	// semantic-init goroutine, which roots at shutdownCtx so daemon teardown
+	// stops it. It is a child of Background (not a Run ctx, which does not yet
+	// exist) and is cancelled by shutdownBackground.
+	d.shutdownCtx, d.cancelShutdown = context.WithCancel(context.Background())
 	if opt.MatchIndexDir != "" {
 		d.matcher = match.New(opt.MatchIndexDir)
 	}
 	if err := d.reload(); err != nil {
+		d.cancelShutdown()
 		return nil, err
 	}
 	return d, nil
+}
+
+// spawn runs fn on a tracked background goroutine so shutdownBackground can
+// await it. A spawn after shutdown has begun is dropped (fn never runs): the
+// daemon is tearing down and nothing new may touch the store/matcher. Callers
+// that reserve d.mu-guarded state before spawning and release it in fn's defer
+// (sweepInFlight, paneCwdRefreshing) must tolerate that release being skipped
+// on a dropped spawn — harmless here, since it only happens once closing has
+// latched and no further deliveries run.
+func (d *Daemon) spawn(fn func()) {
+	d.lifeMu.Lock()
+	if d.closing {
+		d.lifeMu.Unlock()
+		return
+	}
+	d.bg.Add(1)
+	d.lifeMu.Unlock()
+	go func() {
+		defer d.bg.Done()
+		fn()
+	}()
+}
+
+// afterFunc schedules fn after delay on a tracked timer so shutdownBackground
+// can Stop still-pending ones and await any already-firing callback. It returns
+// the timer for callers that supersede it (stopTimer), or nil if the daemon is
+// already shutting down (fn is never scheduled). The callback removes itself
+// from the registry before running so a concurrent stopTimer/shutdown does not
+// double-count its WaitGroup slot.
+func (d *Daemon) afterFunc(delay time.Duration, fn func()) *time.Timer {
+	d.lifeMu.Lock()
+	if d.closing {
+		d.lifeMu.Unlock()
+		return nil
+	}
+	d.bg.Add(1)
+	var t *time.Timer
+	t = time.AfterFunc(delay, func() {
+		d.lifeMu.Lock()
+		delete(d.timers, t)
+		d.lifeMu.Unlock()
+		defer d.bg.Done()
+		fn()
+	})
+	d.timers[t] = struct{}{}
+	d.lifeMu.Unlock()
+	return t
+}
+
+// stopTimer cancels a tracked timer scheduled by afterFunc (used to supersede a
+// pending capture, and by shutdownBackground to drain unfired timers). If Stop
+// wins the race — the callback had not started — it releases that timer's
+// WaitGroup slot, since the callback will never run to release it itself. A
+// callback already past its own registry-delete releases its own slot.
+func (d *Daemon) stopTimer(t *time.Timer) {
+	if t == nil {
+		return
+	}
+	d.lifeMu.Lock()
+	_, tracked := d.timers[t]
+	if tracked {
+		delete(d.timers, t)
+	}
+	d.lifeMu.Unlock()
+	if tracked && t.Stop() {
+		d.bg.Done()
+	}
+}
+
+// shutdownBackground latches closing, cancels shutdownCtx, drains pending
+// timers, and awaits every tracked goroutine/callback. Run calls it before its
+// deferred matcher/embedder Close (and hence before the caller's Store.Close),
+// so teardown never races live background work against a closed store or index.
+func (d *Daemon) shutdownBackground() {
+	d.lifeMu.Lock()
+	d.closing = true
+	pending := make([]*time.Timer, 0, len(d.timers))
+	for t := range d.timers {
+		pending = append(pending, t)
+	}
+	d.lifeMu.Unlock()
+
+	d.cancelShutdown() // stop shutdownCtx-rooted work (verify-unblock, semantic-init)
+	for _, t := range pending {
+		d.stopTimer(t)
+	}
+	d.bg.Wait()
 }
 
 // reload re-reads TOML config and rebuilds derived state (classifier,
@@ -414,6 +526,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 		defer func() { _ = daemonhealth.Remove(d.opt.StateDir) }()
 	}
 
+	// Background drain + native-resource release, registered BEFORE any fallible
+	// setup so they run on EVERY Run return — including an early error return
+	// below (e.g. control-socket setup). New() has already spawned initSemantic
+	// via reloadEmbedder, so a bare early return would otherwise leave that
+	// tracked goroutine touching the store/matcher while the caller closes them.
+	// LIFO: shutdownBackground (drain) is registered last so it runs FIRST, then
+	// the matcher/embedder Close.
+	defer func() {
+		if emb := d.embedderPort(); emb != nil {
+			emb.Close()
+		}
+		if d.matcher != nil {
+			d.matcher.Close()
+		}
+	}()
+	defer d.shutdownBackground()
+
 	// Control socket: reload/wake nudges from front-ends and mcp.
 	var ctl *control.Server
 	if d.opt.ControlSocketPath != "" {
@@ -430,25 +559,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		defer ctl.Close()
 	}
 
-	// Release native resources (embedding model, match index) on exit.
-	defer func() {
-		if emb := d.embedderPort(); emb != nil {
-			emb.Close()
-		}
-		if d.matcher != nil {
-			d.matcher.Close()
-		}
-	}()
-
 	// Event subscription with reconnect/backoff lives in its own goroutine.
-	go func() {
+	d.spawn(func() {
 		err := logging.Guard("event-subscriber", func() error {
 			return d.opt.Events.Subscribe(ctx, d.transitions)
 		})
 		if err != nil && ctx.Err() == nil {
 			slog.Error("event subscriber terminated", "error", err)
 		}
-	}()
+	})
 
 	// Consume corrections that accumulated while the daemon was down (a
 	// failed front-end nudge is non-fatal by design), and keep a slow
@@ -653,7 +772,7 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 func (d *Daemon) cancelCapture(paneID string) {
 	d.mu.Lock()
 	if p := d.pendingCapture[paneID]; p != nil {
-		p.timer.Stop()
+		d.stopTimer(p.timer) // release the tracked bg slot, not a bare Stop
 		delete(d.pendingCapture, paneID)
 	}
 	d.mu.Unlock()
@@ -673,7 +792,7 @@ func (d *Daemon) scheduleCapture(ctx context.Context, tr domain.AgentTransition)
 	cfg, _, _ := d.snapshot()
 	d.mu.Lock()
 	if p := d.pendingCapture[tr.PaneID]; p != nil {
-		p.timer.Stop()
+		d.stopTimer(p.timer)
 		// A regular attention event may arrive while an operator-requested
 		// retry is settling. Coalescing must not erase the retry intent, or
 		// the resulting high-confidence decision could be auto-promoted.
@@ -685,7 +804,7 @@ func (d *Daemon) scheduleCapture(ctx context.Context, tr domain.AgentTransition)
 	// fires — a burst of events during startup keeps the longer settle.
 	delay := cfg.CaptureDelay(tr.AgentType, !d.captureStarted[tr.PaneID])
 	entry := &captureEntry{retryAuditID: tr.RetryAuditID}
-	entry.timer = time.AfterFunc(delay, func() {
+	entry.timer = d.afterFunc(delay, func() {
 		d.mu.Lock()
 		current := d.pendingCapture[tr.PaneID] == entry
 		if current {
@@ -704,6 +823,12 @@ func (d *Daemon) scheduleCapture(ctx context.Context, tr domain.AgentTransition)
 		case <-ctx.Done():
 		}
 	})
+	if entry.timer == nil {
+		// Daemon shutting down: drop this capture rather than leak an entry
+		// whose timer will never fire (afterFunc refused to schedule).
+		d.mu.Unlock()
+		return
+	}
 	d.pendingCapture[tr.PaneID] = entry
 	d.mu.Unlock()
 }
@@ -1407,9 +1532,12 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 	if delay <= 0 {
 		delay = unblockCheckDelay
 	}
-	time.AfterFunc(delay, func() {
+	d.afterFunc(delay, func() {
 		_ = logging.Guard("verify-unblock", func() error {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			// Root the check at shutdownCtx (not context.Background) so daemon
+			// teardown cancels an in-flight self-check instead of letting it
+			// read a store the caller is about to close.
+			ctx, cancel := context.WithTimeout(d.shutdownCtx, 10*time.Second)
 			defer cancel()
 			blocked, _, err := verifyunblock.Check(ctx, d.opt.Herdr, d.opt.Store, p, d.opt.Clock.Now())
 			if err != nil {
@@ -1729,7 +1857,7 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now, First: first,
 		RetryAuditID: s.RetryAuditID,
 	}
-	go func() {
+	d.spawn(func() {
 		outcome := llmOutcome{situation: s, sig: sig, request: req}
 		err := logging.Guard("llm-consult", func() error {
 			// The short name rides on the request ({agent_name}) and the
@@ -1753,7 +1881,7 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 		case d.llmResults <- outcome:
 		case <-ctx.Done():
 		}
-	}()
+	})
 }
 
 // taskReviewContext carries the extra get_context fields for a pre-send
@@ -1818,7 +1946,7 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 		return
 	}
 
-	go func() {
+	d.spawn(func() {
 		outcome := llmOutcome{situation: s, sig: sig, request: req}
 		err := logging.Guard("llm-task-review", func() error {
 			agentName, nerr := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
@@ -1855,7 +1983,7 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 		case d.llmResults <- outcome:
 		case <-ctx.Done():
 		}
-	}()
+	})
 }
 
 // taskGenPort returns the LLM adapter as a TaskGeneratorPort when a
@@ -1960,7 +2088,7 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 		return
 	}
 
-	go func() {
+	d.spawn(func() {
 		outcome := taskGenOutcome{situation: s, sig: sig, tr: tr, request: req, reason: reason}
 		err := logging.Guard("generate-task", func() error {
 			agentName, nerr := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
@@ -1994,7 +2122,7 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 		case d.taskGenResults <- outcome:
 		case <-ctx.Done():
 		}
-	}()
+	})
 }
 
 // handleTaskGenOutcome surfaces a finished idle task generation as an
@@ -2365,7 +2493,7 @@ func (d *Daemon) startActionReview(ctx context.Context, s domain.Situation,
 	}
 	d.mu.Unlock()
 
-	go func() {
+	d.spawn(func() {
 		// The short name rides on the request ({agent_name}) and is reused
 		// for the fallback template if the review degrades; degrade to "".
 		agentName, err := d.opt.Store.EnsureAgentName(rctx, s.AgentID)
@@ -2392,7 +2520,7 @@ func (d *Daemon) startActionReview(ctx context.Context, s domain.Situation,
 		case d.actionReviewResults <- outcome:
 		case <-ctx.Done():
 		}
-	}()
+	})
 }
 
 // actionReviewSuggestion formats the original action as an escalation
@@ -3778,7 +3906,7 @@ func (d *Daemon) refreshPaneCwd(ctx context.Context, paneID string) {
 	}
 	d.paneCwdRefreshing[paneID] = true
 	d.mu.Unlock()
-	go func() {
+	d.spawn(func() {
 		defer func() {
 			d.mu.Lock()
 			delete(d.paneCwdRefreshing, paneID)
@@ -3796,7 +3924,7 @@ func (d *Daemon) refreshPaneCwd(ctx context.Context, paneID string) {
 		d.mu.Lock()
 		d.paneCwds[paneID] = paneCwdEntry{cwd: cwd, at: d.opt.Clock.Now()}
 		d.mu.Unlock()
-	}()
+	})
 }
 
 func (d *Daemon) audit(ctx context.Context, rec domain.AuditRecord) {

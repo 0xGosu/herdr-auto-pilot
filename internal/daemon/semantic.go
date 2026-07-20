@@ -232,8 +232,12 @@ func (d *Daemon) reloadEmbedder(prev, next config.Config, first bool) {
 
 	d.semanticReady.Store(false)
 	gen := d.semanticGen.Add(1)
-	go logging.Guard("semantic-init", func() error {
-		d.initSemantic(context.Background(), gen)
-		return nil
+	// Tracked + rooted at shutdownCtx so daemon teardown cancels the reembed /
+	// index rebuild and awaits it before the matcher (and store) close.
+	d.spawn(func() {
+		_ = logging.Guard("semantic-init", func() error {
+			d.initSemantic(d.shutdownCtx, gen)
+			return nil
+		})
 	})
 }

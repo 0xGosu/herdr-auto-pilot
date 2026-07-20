@@ -477,6 +477,21 @@ type harness struct {
 	cfgPath string
 	ctlPath string
 	cancel  context.CancelFunc
+	runDone chan struct{} // closed when d.Run returns (after background drain)
+}
+
+// stop cancels the daemon and blocks until Run has fully returned — i.e. until
+// shutdownBackground has drained every background goroutine/timer. Tests use it
+// to close the shutdown→store-close race deterministically; it is idempotent
+// and also runs automatically at t.Cleanup.
+func (h *harness) stop() {
+	h.t.Helper()
+	h.cancel()
+	select {
+	case <-h.runDone:
+	case <-time.After(5 * time.Second):
+		h.t.Error("daemon Run did not return within 5s of cancel (background goroutine/timer leak?)")
+	}
 }
 
 func newHarness(t *testing.T, cfgTOML string) *harness {
@@ -572,8 +587,24 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go d.Run(ctx)
+	runDone := make(chan struct{})
+	go func() {
+		d.Run(ctx)
+		close(runDone)
+	}()
+	// Await Run's full return (background drain) BEFORE the store closes. The
+	// store's raw.Close() cleanup was registered earlier, so LIFO runs this
+	// one first — cancel, then drain, then close. Without the drain, timers
+	// and goroutines the daemon spawned would race raw.Close ("database is
+	// closed" warnings, capture flakiness).
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+			t.Error("daemon Run did not return within 5s of cancel (background goroutine/timer leak?)")
+		}
+	})
 	// Give the control socket a moment to come up.
 	waitFor(t, time.Second, func() bool {
 		_, err := os.Stat(ctlPath)
@@ -582,7 +613,7 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 
 	return &harness{
 		t: t, daemon: d, store: fs, raw: raw, herdr: fh, events: fe, llm: fl,
-		cfgPath: cfgPath, ctlPath: ctlPath, cancel: cancel,
+		cfgPath: cfgPath, ctlPath: ctlPath, cancel: cancel, runDone: runDone,
 	}
 }
 
