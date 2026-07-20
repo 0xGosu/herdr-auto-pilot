@@ -57,6 +57,28 @@ herdr plugin install 0xGosu/herdr-auto-pilot --ref v0.4.0
 herdr plugin install 0xGosu/herdr-auto-pilot --yes
 ```
 
+### Update to the latest version
+
+Re-run the install command to upgrade an existing install to the newest
+release. `--yes` skips the interactive confirmation.
+
+```sh
+herdr plugin install 0xGosu/herdr-auto-pilot --yes   # download & install the latest release
+hap daemon --ensure                                  # recommended: hot-swap the running daemon now
+```
+
+`hap daemon --ensure` is optional but recommended — it swaps the running
+daemon for the new build immediately, so you don't have to wait for the next
+automatic restart.
+
+For a clean reinstall, uninstall first, then install:
+
+```sh
+herdr plugin uninstall herd-auto-prompter            # optional: only for a clean reinstall
+herdr plugin install 0xGosu/herdr-auto-pilot --yes
+hap daemon --ensure
+```
+
 The monitoring daemon starts automatically when an agent appears in the herd.
 Use the following recommended setup to make the **Auto Prompter** pane (TUI)
 and its CLI convenient to access from the host machine.
@@ -1043,6 +1065,19 @@ Two levels, depending on how much you want gone:
 
 Prefer `clear-data` unless you also want your config gone; it's the only
 path that keeps the daemon running through the wipe.
+
+## Roadmap
+
+Planned features for future releases:
+
+- **Full-Self Prompting mode (FSP)** — a fully autonomous mode where the plugin
+  drives agents end-to-end with zero operator involvement.
+- **OpenCode support** — extend LLM-consult and agent monitoring to the
+  OpenCode CLI alongside the current Claude Code / Codex integrations.
+- **HAP Cloud** — optional sync of local data (rules, signatures, audit) to the
+  cloud for backup and cross-machine storage.
+- **HAP Web — Remote Control** — a web UI to monitor and remotely control the
+  herd from anywhere.
 
 ## Development
 
