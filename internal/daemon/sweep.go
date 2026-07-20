@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -101,7 +102,7 @@ func (d *Daemon) startSweep(ctx context.Context, ks ports.KeystrokeSender,
 	d.spawn(func() {
 		outcome := sweepOutcome{situation: s, tr: tr, agentName: agentName}
 		logging.Guard("mcq-sweep", func() error {
-			swept, err := d.sweepFrames(ctx, ks, s)
+			swept, err := d.sweepFrames(ctx, ks, s, nil)
 			if err != nil {
 				slog.Warn("multi-tab sweep failed; degrading to single-frame capture",
 					"agent", s.AgentID, "error", err)
@@ -124,8 +125,14 @@ func (d *Daemon) startSweep(ctx context.Context, ks ports.KeystrokeSender,
 // SAME form shape, then reset with a fixed burst of Left arrows so the form
 // is back on the first question. A failed reset fails the whole sweep —
 // otherwise a later answer series would start on the wrong tab.
+//
+// chosen carries the answer's per-tab selections when one is already decided
+// (the pre-delivery re-verification), and is nil at CAPTURE time. It only
+// widens the multi-select baseline below: with no answer yet, a checked box
+// means someone else touched the form; with an answer, the boxes that answer
+// itself chose may already be set by its own earlier, unverified attempt.
 func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
-	s domain.Situation) (domain.Situation, error) {
+	s domain.Situation, chosen [][]string) (domain.Situation, error) {
 
 	answerCount := s.EffectiveAnswerCount()
 	frames := make([]string, 0, answerCount)
@@ -159,14 +166,29 @@ func (d *Daemon) sweepFrames(ctx context.Context, ks ports.KeystrokeSender,
 			break
 		}
 		// A multi-select tab is answered by toggling checkboxes, which is a
-		// RELATIVE flip. We can only reason about the keystrokes if the tab
-		// starts all-unchecked (the observed default); any pre-selected option
-		// means an operator (or a default) already touched it, so escalate the
-		// whole form rather than blind-toggle into the wrong set.
-		multi := s.MCQKind == domain.MCQClaudeTabs && domain.MultiSelectTab(frame)
+		// RELATIVE flip, so what is already checked decides what may be pressed.
+		//
+		// At CAPTURE (chosen == nil) the tab must be all-unchecked. No answer
+		// exists yet, so there is nothing to compare a checked box against and
+		// no way to tell hap's own abandoned toggle from an operator's
+		// selection: escalate the whole form. A form that is already toggled
+		// when hap first sees it therefore always reaches a human — including a
+		// re-capture after hap's own attempt died mid-toggle.
+		//
+		// At DELIVERY (chosen != nil) the answer is known, so the boxes IT chose
+		// may already be set by its own earlier, unverified attempt in the
+		// window since capture; delivery presses only the missing ones
+		// (mcqdeliver.toggleTab). Anything checked outside that set still
+		// escalates — it is not hap's to clear.
+		// Scoped to the LIVE render: a visible read carries earlier renders
+		// above the form, and an older render of an already-toggled tab would
+		// otherwise contribute checkboxes the live tab does not have.
+		liveFrame := domain.ExtractMCQForm(frame)
+		multi := s.MCQKind == domain.MCQClaudeTabs && domain.MultiSelectTab(liveFrame)
 		if multi {
-			if n := countChecked(frame); n > 0 {
-				sweepErr = fmt.Errorf("answer %d/%d already has %d option(s) selected; cannot auto-toggle safely", tab+1, answerCount, n)
+			if foreign := domain.CheckedOutside(liveFrame, tabChoice(chosen, tab)); len(foreign) > 0 {
+				sweepErr = fmt.Errorf("answer %d/%d already has option(s) %s selected, which this answer did not choose; cannot auto-toggle safely",
+					tab+1, answerCount, strings.Join(foreign, ", "))
 				break
 			}
 		}
@@ -263,17 +285,25 @@ func anyMultiSelect(flags []bool) bool {
 // decisions (toggling is relative). It re-runs the capture sweep and then fails
 // CLOSED unless the re-swept aggregate content AND per-tab select kinds match
 // the situation being delivered — sweepFrames alone only guarantees the same
-// tab count and an unchecked baseline. A no-op for forms with no multi-select
-// tab.
-func (d *Daemon) reverifyMultiSelect(ctx context.Context, ks ports.KeystrokeSender, s domain.Situation) error {
+// tab count and a baseline carrying nothing this answer did not choose. A
+// no-op for forms with no multi-select tab.
+//
+// groups is the answer about to be delivered: it widens the baseline to this
+// answer's OWN boxes (an earlier attempt may have set them before dying) and,
+// for the same reason, the content comparison ignores the checkbox marks —
+// CheckedOutside inside sweepFrames is what governs which boxes may be set, so
+// the normalized compare hides nothing that decides safety.
+func (d *Daemon) reverifyMultiSelect(ctx context.Context, ks ports.KeystrokeSender,
+	s domain.Situation, groups [][]string) error {
+
 	if !anyMultiSelect(s.EffectiveAnswerMultiSelect()) {
 		return nil
 	}
-	reswept, err := d.sweepFrames(ctx, ks, s)
+	reswept, err := d.sweepFrames(ctx, ks, s, groups)
 	if err != nil {
 		return err
 	}
-	if reswept.Content != s.Content {
+	if domain.ClearCheckboxMarks(reswept.Content) != domain.ClearCheckboxMarks(s.Content) {
 		return fmt.Errorf("form content changed since capture")
 	}
 	if !slices.Equal(reswept.EffectiveAnswerMultiSelect(), s.EffectiveAnswerMultiSelect()) {
@@ -282,17 +312,14 @@ func (d *Daemon) reverifyMultiSelect(ctx context.Context, ks ports.KeystrokeSend
 	return nil
 }
 
-// countChecked reports how many of a frame's checkbox options are already
-// checked (`[x]`). Used to enforce the all-unchecked baseline before an
-// autonomous multi-select toggle.
-func countChecked(frame string) int {
-	n := 0
-	for _, checked := range domain.OptionCheckStates(frame) {
-		if checked {
-			n++
-		}
+// tabChoice returns the selections a decided answer makes on one tab, or nil
+// when no answer is decided yet (capture time) or the series is shorter than
+// the form — nil demands an all-unchecked tab, the strict baseline.
+func tabChoice(chosen [][]string, tab int) []string {
+	if tab < 0 || tab >= len(chosen) {
+		return nil
 	}
-	return n
+	return chosen[tab]
 }
 
 // handleSweepOutcome resumes the decision pipeline with the aggregated
@@ -385,7 +412,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 						"An automated action was blocked because its audit record could not be written.")
 					return
 				}
-				if err := d.reverifyMultiSelect(ctx, ks, s); err != nil {
+				if err := d.reverifyMultiSelect(ctx, ks, s, groups); err != nil {
 					slog.Warn("multi-select baseline moved before delivery; refusing", "pane", s.PaneID, "error", err)
 					d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 					d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
@@ -453,7 +480,7 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 							"An LLM-derived action was blocked because its audit record could not be written.")
 						return
 					}
-					if err := d.reverifyMultiSelect(ctx, ks, s); err != nil {
+					if err := d.reverifyMultiSelect(ctx, ks, s, groups); err != nil {
 						slog.Warn("multi-select baseline moved before LLM delivery; refusing", "pane", s.PaneID, "error", err)
 						d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 						d.notify(ctx, "Herd Auto Prompter: action delivery skipped",

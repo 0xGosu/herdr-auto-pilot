@@ -1,6 +1,9 @@
 package domain
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const claudeApproval = "Bash(go test ./...)\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell the agent what to do differently\n"
 
@@ -28,6 +31,71 @@ func TestOptionCheckStates(t *testing.T) {
 	// A frame without checkboxes yields no states.
 	if got := OptionCheckStates(claudeApproval); len(got) != 0 {
 		t.Errorf("non-checkbox options must yield no check states, got %+v", got)
+	}
+}
+
+func TestCheckedOutside(t *testing.T) {
+	// multiSelectFrame has option 2 checked.
+	if got := CheckedOutside(multiSelectFrame, nil); len(got) != 1 || got[0] != "2" {
+		t.Errorf("CheckedOutside(nil) = %v, want [2]: with no answer decided, any checked box is foreign", got)
+	}
+	if got := CheckedOutside(multiSelectFrame, []string{"2"}); len(got) != 0 {
+		t.Errorf("CheckedOutside(chosen 2) = %v, want none: this answer's own box is not foreign", got)
+	}
+	if got := CheckedOutside(multiSelectFrame, []string{"1", "2"}); len(got) != 0 {
+		t.Errorf("CheckedOutside(chosen 1,2) = %v, want none", got)
+	}
+	if got := CheckedOutside(multiSelectFrame, []string{"1", "3"}); len(got) != 1 || got[0] != "2" {
+		t.Errorf("CheckedOutside(chosen 1,3) = %v, want [2]", got)
+	}
+	if got := CheckedOutside(claudeApproval, nil); len(got) != 0 {
+		t.Errorf("a frame without checkboxes has nothing checked, got %v", got)
+	}
+}
+
+func TestClearCheckboxMarks(t *testing.T) {
+	cleared := ClearCheckboxMarks(multiSelectFrame)
+	for digit, checked := range OptionCheckStates(cleared) {
+		if checked {
+			t.Errorf("option %s is still checked after clearing: %q", digit, cleared)
+		}
+	}
+	// Only the box changes: the option set and their labels survive.
+	if len(OptionCheckStates(cleared)) != len(OptionCheckStates(multiSelectFrame)) {
+		t.Error("clearing the marks must not drop options")
+	}
+	if before, after := ParseNumberedOptions(multiSelectFrame), ParseNumberedOptions(cleared); len(before) != len(after) {
+		t.Fatalf("option count changed: %d -> %d", len(before), len(after))
+	}
+	// Two renders of one form differing only in what a partial delivery
+	// toggled must compare equal.
+	if ClearCheckboxMarks(multiSelectFrame) != ClearCheckboxMarks(cleared) {
+		t.Error("normalized renders of the same form must compare equal")
+	}
+	// Prose is untouched — only numbered option lines carry a box.
+	const prose = "the runbook says [x] means done\n"
+	if got := ClearCheckboxMarks(prose); got != prose {
+		t.Errorf("ClearCheckboxMarks rewrote non-option text: %q", got)
+	}
+
+	// The tab header's answered marks normalize too: ticking a box flips its
+	// tab ☐ -> ☒ while the form still stands, so leaving the header alone
+	// would keep two renders of one form comparing unequal — the exact case
+	// the comparison exists to accept.
+	const untouched = "←  ☐ Shape  ✔ Submit  →\n\nWhich?\n\n❯ 1. [ ] Circle\n  2. [ ] Square\n"
+	const midAnswer = "←  ☒ Shape  ✔ Submit  →\n\nWhich?\n\n❯ 1. [✔] Circle\n  2. [ ] Square\n"
+	if ClearCheckboxMarks(untouched) != ClearCheckboxMarks(midAnswer) {
+		t.Errorf("a partially-answered render must normalize to its untouched form:\n%q\n%q",
+			ClearCheckboxMarks(untouched), ClearCheckboxMarks(midAnswer))
+	}
+	// The Submit entry is not a question mark and must survive.
+	if !strings.Contains(ClearCheckboxMarks(midAnswer), "✔ Submit") {
+		t.Error("the ✔ Submit entry must not be normalized away")
+	}
+	// A genuinely different form still compares unequal.
+	const other = "←  ☐ Shape  ✔ Submit  →\n\nWhich?\n\n❯ 1. [ ] Circle\n  2. [ ] Hexagon\n"
+	if ClearCheckboxMarks(untouched) == ClearCheckboxMarks(other) {
+		t.Error("different option text must not normalize to equal")
 	}
 }
 

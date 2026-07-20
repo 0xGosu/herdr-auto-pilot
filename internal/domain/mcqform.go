@@ -125,11 +125,21 @@ func ParseMCQForm(agentType, pane string) (MCQFormState, bool) {
 // cannot stand in. ClaudeTabForm and ExtractMCQForm scope to the same region.
 //
 // The plain footer is the weakest of the three signals, because an ordinary
-// single-question menu carries it too: a submitted form's header sitting in
-// scrollback ABOVE such a menu would otherwise borrow it and route the menu
-// into the Right-arrow sweep. So that path also requires an unanswered (☐) tab
-// in the header — a submitted form marks every question ☒, and a live form
-// standing on its Submit tab carries the Submit confirmation body instead.
+// single-question menu carries it too: a submitted form's header left in
+// scrollback ABOVE such a menu would otherwise borrow it and route that menu
+// into the Right-arrow sweep — where a digit COMMITS. So that branch needs a
+// second signal that the header describes what is on screen: either a tab that
+// still owes an answer (☐), or checkbox options in the live region, which a
+// plain menu never renders.
+//
+// Both are needed. A ☐ test alone is wrong — verified live (2026-07-20, Claude
+// Code v2.1.215) a one-question form flips its header to ☒ the moment its
+// first checkbox is ticked while still standing and still owed an answer, and
+// demanding ☐ made delivery lose the form it was mid-way through answering.
+// A checkbox test alone is wrong too: a single-select one-question form has no
+// boxes at all. The pairing still can not separate a stale MULTI-SELECT form's
+// header from a live one below it; that residue is left to the delivery-time
+// tab-count and per-tab question checks.
 func MultiTabForm(pane string) (tabs int, ok bool) {
 	headers := mcqTabHeaderRE.FindAllStringIndex(pane, -1)
 	if len(headers) == 0 {
@@ -140,7 +150,8 @@ func MultiTabForm(pane string) (tabs int, ok bool) {
 	header := pane[last[0]:last[1]]
 	switch {
 	case mcqTabFooterRE.MatchString(live), mcqSubmitScreenRE.MatchString(live):
-	case mcqSingleFooterRE.MatchString(live) && strings.Contains(header, "☐"):
+	case mcqSingleFooterRE.MatchString(live) &&
+		(strings.Contains(header, "☐") || MultiSelectTab(ExtractMCQForm(pane))):
 	default:
 		return 0, false
 	}

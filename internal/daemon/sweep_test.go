@@ -39,7 +39,7 @@ func TestCodexQuestionSweepAndAdaptiveDelivery(t *testing.T) {
 	if s.Type != domain.SituationChoice || s.MCQKind != domain.MCQCodexQuestions || s.EffectiveAnswerCount() != 2 {
 		t.Fatalf("fixture classification = %+v", s)
 	}
-	swept, err := h.daemon.sweepFrames(context.Background(), h.herdr, s)
+	swept, err := h.daemon.sweepFrames(context.Background(), h.herdr, s, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,11 +290,25 @@ func TestReverifyMultiSelectRejectsChangedForm(t *testing.T) {
 	s.TabMultiSelect = []bool{false, true, false}
 	s.PaneID = "w1:p1"
 	ctx := context.Background()
+	groups := [][]string{{"1"}, {"1", "3"}, {"1"}}
 
 	// Unchanged form re-verifies clean.
 	h.herdr.setFrames(mcqMultiFrames)
-	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s); err != nil {
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, groups); err != nil {
 		t.Fatalf("an unchanged multi-select form must re-verify clean, got %v", err)
+	}
+
+	// The same form carrying THIS answer's own toggles re-verifies clean too:
+	// only the checkbox marks differ, and they are the ones it chose.
+	h.herdr.setFrames(mcqMultiOwnToggleFrames)
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, groups); err != nil {
+		t.Fatalf("a form carrying this answer's own toggles must re-verify clean, got %v", err)
+	}
+
+	// A box this answer did not choose is still a refusal.
+	h.herdr.setFrames(mcqMultiPrecheckedFrames)
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, groups); err == nil {
+		t.Fatal("reverify must reject a selection this answer did not choose")
 	}
 
 	// The middle tab now shows a DIFFERENT (still-unchecked, same-count) form.
@@ -304,7 +318,7 @@ func TestReverifyMultiSelectRejectsChangedForm(t *testing.T) {
 		mcqMultiFrames[2],
 	}
 	h.herdr.setFrames(changed)
-	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s); err == nil {
+	if err := h.daemon.reverifyMultiSelect(ctx, h.herdr, s, groups); err == nil {
 		t.Fatal("reverify must reject a form whose content changed since capture")
 	}
 }
@@ -331,6 +345,46 @@ func TestMultiTabSweepMultiSelectPrecheckedEscalates(t *testing.T) {
 	for _, k := range h.herdr.keysSent() {
 		if k != "right" && k != "left" {
 			t.Errorf("no digit may be pressed when the toggle baseline is unsafe, keys: %v", h.herdr.keysSent())
+		}
+	}
+}
+
+// mcqMultiOwnToggleFrames is mcqMultiFrames with the multi-select tab carrying
+// exactly what the learned answer ("1 1,3 1") chooses — the pane an earlier
+// delivery attempt leaves behind when it dies after toggling but before
+// submitting. It renders what Claude actually draws in that state (verified
+// live 2026-07-20): checked boxes are `[✔]`, and the toggled tab's header mark
+// has flipped to ☒ on EVERY tab even though the form still stands.
+const mcqHeaderTab2Answered = "←  ☐ Q one  ☒ Q two  ✔ Submit  →"
+
+var mcqMultiOwnToggleFrames = []string{
+	"──────\n" + mcqHeaderTab2Answered + "\n\nWhich backend?\n\n❯ 1. sqlite\n  2. postgres\n\n" + mcqFooter + "\n",
+	"──────\n" + mcqHeaderTab2Answered + "\n\nWhich stats to show?\n\n❯ 1. [✔] Auto-sends\n  2. [ ] Escalations\n  3. [✔] Confirmed\n\n" + mcqFooter + "\n",
+	"──────\n" + mcqHeaderTab2Answered + "\n\nReview your answers\n\nReady to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n",
+}
+
+// A form CAPTURED with a checkbox already set still escalates, whatever the
+// learned answer chose. Capture runs before any answer is known, so the
+// "checked ⊆ chosen" rule the delivery-time gates use has nothing to compare
+// against — the strict baseline is the only safe one there. The relaxation
+// therefore only ever applies to a form captured clean whose boxes moved
+// before delivery (see TestReverifyMultiSelectRejectsChangedForm).
+func TestMultiTabSweepMultiSelectPrecheckedEscalatesEvenWhenChosen(t *testing.T) {
+	h := newHarness(t, "")
+	// The rule chooses exactly the options the pane already carries.
+	h.seedSeriesRuleFrom(t, mcqMultiFrames, "1 1,3 1")
+	h.herdr.setFrames(mcqMultiOwnToggleFrames)
+
+	h.push("agent-mcqcaptured", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 10*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	for _, k := range h.herdr.keysSent() {
+		if k != "right" && k != "left" {
+			t.Errorf("no digit may be pressed when the captured baseline is unsafe, keys: %v", h.herdr.keysSent())
 		}
 	}
 }

@@ -2,6 +2,7 @@ package domain
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -11,11 +12,18 @@ import (
 // menu that starts at 0 or skips a number is honored, not re-indexed).
 var numberedOptionRE = regexp.MustCompile(`(?m)^[ \t]*(?:[❯›>][ \t]*)?(?:(\d+)[.)]|\[(\d+)\])[ \t]+(\S.*?)[ \t]*$`)
 
-// checkboxLabelRE matches the leading `[ ]` / `[x]` checkbox marker that a
-// Claude multi-SELECT question renders in front of each toggleable option
-// (e.g. "1. [ ] Auto-sends" parses to label "[ ] Auto-sends"). The capture
-// group is the box contents: a space (unchecked) or x/X (checked).
-var checkboxLabelRE = regexp.MustCompile(`^\[([ xX])\]`)
+// checkboxLabelRE matches the leading checkbox marker that a Claude
+// multi-SELECT question renders in front of each toggleable option (e.g.
+// "1. [ ] Auto-sends" parses to label "[ ] Auto-sends"). The capture group is
+// the box contents: a space (unchecked) or a check mark (checked).
+//
+// Claude Code renders a CHECKED box as `[✔]` (verified live 2026-07-20,
+// v2.1.215) — matching only `[x]` made every checked option invisible to
+// OptionCheckStates, so the "this tab already carries a selection" gate saw an
+// operator's selection as an empty tab and the toggle verification could not
+// see its own keystroke land. `[x]`/`[X]`/`[✓]` stay accepted: cheap, and the
+// glyph is a rendering detail that has already changed once.
+var checkboxLabelRE = regexp.MustCompile(`^\[([ xX✔✓])\]`)
 
 // NumberedOption pairs a menu option's displayed number with its label.
 type NumberedOption struct {
@@ -44,11 +52,57 @@ func OptionCheckStates(frame string) map[string]bool {
 	states := make(map[string]bool)
 	for _, o := range ParseNumberedOptions(frame) {
 		if m := checkboxLabelRE.FindStringSubmatch(o.Label); m != nil {
-			states[o.Number] = m[1] == "x" || m[1] == "X"
+			states[o.Number] = m[1] != " " // any mark means checked
 		}
 	}
 	return states
 }
+
+// CheckedOutside lists, in option order, the digits a multi-select frame shows
+// as CHECKED that are not in chosen. It is the shared "checked ⊆ chosen" rule
+// for answering a checkbox tab: the boxes an answer means to set are safe to
+// find already set (its own earlier, unverified attempt put them there, and
+// re-pressing one would CLEAR it), while any other checked box belongs to
+// someone else and is never hap's to clear.
+//
+// Pass a nil/empty chosen to demand an all-unchecked frame — the capture-time
+// baseline, where no answer has been decided yet.
+func CheckedOutside(frame string, chosen []string) []string {
+	want := make(map[string]bool, len(chosen))
+	for _, digit := range chosen {
+		want[digit] = true
+	}
+	var foreign []string
+	for digit, checked := range OptionCheckStates(frame) {
+		if checked && !want[digit] {
+			foreign = append(foreign, digit)
+		}
+	}
+	sort.Strings(foreign)
+	return foreign
+}
+
+// ClearCheckboxMarks rewrites a form's selection state back to untouched, so
+// two renders of the same form compare equal regardless of what a partial
+// delivery toggled. That means the option boxes AND the tab header's answered
+// marks: ticking a checkbox flips its tab from ☐ to ☒ while the form still
+// stands (verified live 2026-07-20), so normalizing the boxes alone would
+// still compare unequal and the comparison would reject the very
+// partially-delivered form it exists to accept.
+//
+// Only those marks change — option text, the ✔ Submit entry, and every other
+// line are untouched — and CheckedOutside is what governs which boxes may be
+// set, so nothing that decides safety is hidden by the comparison.
+func ClearCheckboxMarks(content string) string {
+	content = checkedOptionRE.ReplaceAllString(content, "${1}[ ]")
+	return mcqTabHeaderRE.ReplaceAllStringFunc(content, func(header string) string {
+		return strings.ReplaceAll(header, "☒", "☐")
+	})
+}
+
+// checkedOptionRE matches a numbered option line's CHECKED box, capturing
+// everything up to it so the replacement keeps the caret, number and spacing.
+var checkedOptionRE = regexp.MustCompile(`(?m)^([ \t]*(?:[❯›>][ \t]*)?(?:\d+[.)]|\[\d+\])[ \t]+)\[[xX✔✓]\]`)
 
 // ParseNumberedOptions extracts the numbered options from pane content in
 // display order (e.g. "❯ 1. Yes\n  2. No" → [{"1","Yes"},{"2","No"}]).

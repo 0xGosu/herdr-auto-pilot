@@ -217,16 +217,24 @@ func TestClaudeTabFormReadsOneQuestionSingleChoiceTabForm(t *testing.T) {
 	}
 }
 
-func TestMultiTabFormRejectsStaleHeaderAboveLiveSingleMenu(t *testing.T) {
-	// A consuming "recent" read can carry a finished form's header in
-	// scrollback above the live plain menu. The header must not borrow that
-	// menu's footer: doing so would route an ordinary single-question menu
-	// into the Right-arrow sweep and type arrows into it.
-	pane := "←  ☒ Scope  ✔ Submit  →\n\nAnswers submitted.\n\n" +
-		"How do you want to submit?\n❯ 1. All 4\n  2. Hold\n\n" +
+func TestMultiTabFormDetectsAnsweredOneQuestionForm(t *testing.T) {
+	// Verified live (2026-07-20, Claude Code v2.1.215): ticking the first
+	// checkbox flips the header to ☒ while the form is STILL STANDING and
+	// still owed an answer, and a checked box renders `[✔]`. Delivery re-reads
+	// between keystrokes, so losing the form here stranded it mid-answer with
+	// one box ticked.
+	answered := "←  ☒ Shape  ✔ Submit  →\n\nWhich shapes do you like?\n\n" +
+		"❯ 1. [✔] Circle\n  2. [ ] Square\n  3. [ ] Triangle\n\n" +
 		"Enter to select · ↑/↓ to navigate · Esc to cancel\n"
-	if tabs, ok := MultiTabForm(pane); ok {
-		t.Fatalf("stale header above a live single menu must not detect as multi-tab, got %d tabs", tabs)
+	tabs, ok := MultiTabForm(answered)
+	if !ok || tabs != 2 {
+		t.Fatalf("MultiTabForm(mid-answer one-question form) = (%d,%v), want (2,true)", tabs, ok)
+	}
+	if !MultiSelectTab(ExtractMCQForm(answered)) {
+		t.Error("a `[✔]`-checked option must still read as multi-select")
+	}
+	if states := OptionCheckStates(ExtractMCQForm(answered)); !states["1"] || states["2"] {
+		t.Errorf("check states = %v, want option 1 checked", states)
 	}
 }
 
@@ -243,6 +251,19 @@ func TestMCQTabHeaderLine(t *testing.T) {
 	}
 	if _, ok := MCQTabHeaderLine("no form here\n1. Yes\n"); ok {
 		t.Error("MCQTabHeaderLine reported a header on a pane without one")
+	}
+}
+
+func TestMultiTabFormRejectsStaleHeaderAboveLivePlainMenu(t *testing.T) {
+	// A finished form's header can sit in scrollback above a live plain menu.
+	// Borrowing that menu's footer would route it into the Right-arrow sweep,
+	// where a digit COMMITS — so the header needs its own live-form evidence:
+	// no unanswered ☐, and the region below it shows no checkbox options.
+	pane := "←  ☒ Scope  ✔ Submit  →\n\nAnswers submitted.\n\n" +
+		"How do you want to submit?\n❯ 1. All 4\n  2. Hold\n\n" +
+		"Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+	if tabs, ok := MultiTabForm(pane); ok {
+		t.Fatalf("stale header above a live plain menu must not detect as multi-tab, got %d tabs", tabs)
 	}
 }
 

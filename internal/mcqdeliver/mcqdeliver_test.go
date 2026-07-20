@@ -52,6 +52,27 @@ type fakeForm struct {
 	// submitStuck models a Submit tab that will not submit, so the fail-closed
 	// guard for that state is reachable.
 	submitStuck bool
+	// toggleDeaf models a multi-select tab that swallows its digits (a build
+	// with a different checkbox binding), so the toggle verification is
+	// reachable. Without it, a delivery that changes nothing on screen would
+	// still advance and submit an empty answer.
+	toggleDeaf bool
+	// hideAfterToggle drops the trailing options from a multi-select tab once
+	// it has been toggled, modelling a re-render whose option list scrolls (or
+	// a read window that truncates it). Verification must refuse rather than
+	// skip the options it can no longer see.
+	hideAfterToggle int
+	// stuckTab keeps the advance key from leaving the multi-select tab.
+	stuckTab bool
+}
+
+// check pre-checks a multi-select tab's option, modelling a pane that already
+// carries an earlier delivery attempt's toggles.
+func (f *fakeForm) check(tab, option int) {
+	if f.checked[tab] == nil {
+		f.checked[tab] = map[int]bool{}
+	}
+	f.checked[tab][option] = true
 }
 
 func newFakeForm(binding digitBinding, questions, options int) *fakeForm {
@@ -88,6 +109,9 @@ func (f *fakeForm) SendKey(_ context.Context, _, key string) error {
 			f.caret = 1
 		}
 	case "right":
+		if f.stuckTab && !f.onSubmitTab() && f.multiTabs[f.current] {
+			break // the advance does not leave a multi-select tab
+		}
 		if f.current < f.questions {
 			f.current++
 			f.caret = 1
@@ -102,6 +126,9 @@ func (f *fakeForm) SendKey(_ context.Context, _, key string) error {
 		// A multi-select tab's digit toggles a checkbox: no caret move, no
 		// commit, no advance.
 		if !f.onSubmitTab() && f.multiTabs[f.current] {
+			if f.toggleDeaf {
+				break
+			}
 			if f.checked[f.current] == nil {
 				f.checked[f.current] = map[int]bool{}
 			}
@@ -167,6 +194,12 @@ func (f *fakeForm) Read(_ context.Context, _ string, _ int) (string, error) {
 			continue
 		}
 		labels[i] = fmt.Sprintf("Option %d", i+1)
+	}
+	// A re-render that scrolls (or a truncated read) can show fewer options
+	// than the pre-toggle read did.
+	if f.hideAfterToggle > 0 && f.multiTabs[f.current] && len(f.checked[f.current]) > 0 &&
+		f.hideAfterToggle < len(labels) {
+		labels = labels[:f.hideAfterToggle]
 	}
 	b.WriteString(f.renderOptions(labels))
 	b.WriteString("\n" + f.footer())
@@ -321,6 +354,186 @@ func TestClaudeTabsTogglesAndAdvancesMultiSelectTab(t *testing.T) {
 	}
 	if !form.submitted {
 		t.Error("the form should still have been submitted after the multi-select tab")
+	}
+}
+
+// The retry regression (audit #41-#44, 2026-07-20): a digit TOGGLES a checkbox,
+// so a second delivery attempt over a pane that already carries the first
+// attempt's toggles must not press it again — that would CLEAR the selection
+// and submit an empty answer while every keystroke looked delivered. A retry
+// has to be idempotent: press nothing, verify, advance.
+func TestClaudeTabsDoesNotRetoggleAlreadyChosenOptions(t *testing.T) {
+	form := newFakeForm(digitCommits, 1, 3)
+	form.multiTabs[0] = true
+	form.check(0, 1) // the previous attempt already checked option 1
+	form.check(0, 3)
+
+	err := ClaudeTabs(context.Background(), form.config(),
+		[][]string{{"1", "3"}, {"1"}}, []bool{true, false})
+	if err != nil {
+		t.Fatalf("ClaudeTabs returned error: %v", err)
+	}
+	tail := form.keys[MCQResetKeysForTest:]
+	want := []string{"right", "1"} // no toggles: advance, then Submit
+	if strings.Join(tail, ",") != strings.Join(want, ",") {
+		t.Errorf("keys = %v, want %v (the chosen options must not be re-pressed)", tail, want)
+	}
+	if got := form.checked[0]; !got[1] || !got[3] {
+		t.Errorf("checked = %v, want options 1 and 3 still checked", got)
+	}
+	if !form.submitted {
+		t.Error("the retry should have submitted the form")
+	}
+}
+
+// A partially-delivered tab (the first attempt died between its two toggles)
+// must be completed, not restarted: press only the missing option.
+func TestClaudeTabsPressesOnlyTheMissingOptions(t *testing.T) {
+	form := newFakeForm(digitCommits, 1, 3)
+	form.multiTabs[0] = true
+	form.check(0, 1)
+
+	err := ClaudeTabs(context.Background(), form.config(),
+		[][]string{{"1", "3"}, {"1"}}, []bool{true, false})
+	if err != nil {
+		t.Fatalf("ClaudeTabs returned error: %v", err)
+	}
+	tail := form.keys[MCQResetKeysForTest:]
+	want := []string{"3", "right", "1"}
+	if strings.Join(tail, ",") != strings.Join(want, ",") {
+		t.Errorf("keys = %v, want %v", tail, want)
+	}
+	if got := form.checked[0]; !got[1] || !got[3] {
+		t.Errorf("checked = %v, want options 1 and 3 checked", got)
+	}
+	if !form.submitted {
+		t.Error("the form should have been submitted")
+	}
+}
+
+// A checkbox this answer did not choose is someone else's selection. Clearing
+// it would be the same blind toggle, so delivery refuses before pressing
+// anything — the frontend's capture-time rule, enforced at the keystroke.
+func TestClaudeTabsRefusesForeignSelection(t *testing.T) {
+	form := newFakeForm(digitCommits, 1, 3)
+	form.multiTabs[0] = true
+	form.check(0, 2)
+
+	err := ClaudeTabs(context.Background(), form.config(),
+		[][]string{{"1"}, {"1"}}, []bool{true, false})
+	if err == nil {
+		t.Fatal("ClaudeTabs accepted a tab carrying a selection it did not choose")
+	}
+	if !strings.Contains(err.Error(), "option(s) 2") {
+		t.Errorf("error = %v, want it to name the foreign selection", err)
+	}
+	if tail := form.keys[MCQResetKeysForTest:]; len(tail) != 0 {
+		t.Errorf("keys = %v, want none: the refusal must precede every keystroke", tail)
+	}
+	if form.submitted {
+		t.Error("the form must not have been submitted")
+	}
+}
+
+// Toggles that do not land must fail closed. Without this the advance would
+// move on and Submit would commit an EMPTY answer — delivered, audited, wrong.
+func TestClaudeTabsRefusesWhenTogglesDoNotLand(t *testing.T) {
+	form := newFakeForm(digitCommits, 1, 3)
+	form.multiTabs[0] = true
+	form.toggleDeaf = true
+
+	err := ClaudeTabs(context.Background(), form.config(),
+		[][]string{{"1"}, {"1"}}, []bool{true, false})
+	if err == nil {
+		t.Fatal("ClaudeTabs reported success though no checkbox changed")
+	}
+	if !strings.Contains(err.Error(), "did not land") {
+		t.Errorf("error = %v, want it to name the unlanded toggle", err)
+	}
+	if form.submitted {
+		t.Error("an unverified toggle must never reach Submit")
+	}
+}
+
+// Verification must fail CLOSED when an option stops being readable: skipping
+// the options the post-toggle re-render no longer shows would advance having
+// pressed a toggle nothing confirmed.
+func TestClaudeTabsRefusesWhenOptionsBecomeUnreadable(t *testing.T) {
+	form := newFakeForm(digitCommits, 1, 3)
+	form.multiTabs[0] = true
+	form.hideAfterToggle = 1 // only option 1 survives the re-render
+
+	err := ClaudeTabs(context.Background(), form.config(),
+		[][]string{{"1"}, {"1"}}, []bool{true, false})
+	if err == nil {
+		t.Fatal("ClaudeTabs accepted a selection it could not fully verify")
+	}
+	if !strings.Contains(err.Error(), "can not verify") {
+		t.Errorf("error = %v, want it to say the selection could not be verified", err)
+	}
+	if !strings.Contains(err.Error(), "option(s) 1 were pressed") {
+		t.Errorf("error = %v, want it to name the keys it already sent", err)
+	}
+	if form.submitted {
+		t.Error("an unverified selection must never reach Submit")
+	}
+}
+
+// The advance is verified too: a multi-select tab that does not move on would
+// otherwise have its next tab's answer typed into it.
+func TestClaudeTabsRefusesWhenMultiSelectTabDoesNotAdvance(t *testing.T) {
+	form := newFakeForm(digitCommits, 2, 3)
+	form.multiTabs[0] = true
+	form.stuckTab = true
+
+	err := ClaudeTabs(context.Background(), form.config(),
+		[][]string{{"1"}, {"1"}, {"1"}}, []bool{true, false, false})
+	if err == nil {
+		t.Fatal("ClaudeTabs reported success though the tab never advanced")
+	}
+	if !strings.Contains(err.Error(), "did not advance") {
+		t.Errorf("error = %v, want it to name the stuck advance", err)
+	}
+	if form.submitted {
+		t.Error("the form must not have been submitted")
+	}
+}
+
+// An answer naming an option the tab does not offer is refused before any
+// keystroke — a digit outside the option set would toggle nothing, or worse.
+func TestClaudeTabsRefusesUnofferedMultiSelectOption(t *testing.T) {
+	form := newFakeForm(digitCommits, 1, 2)
+	form.multiTabs[0] = true
+
+	err := ClaudeTabs(context.Background(), form.config(),
+		[][]string{{"3"}, {"1"}}, []bool{true, false})
+	if err == nil {
+		t.Fatal("ClaudeTabs accepted an option the tab does not offer")
+	}
+	if !strings.Contains(err.Error(), "does not offer option 3") {
+		t.Errorf("error = %v, want it to name the missing option", err)
+	}
+	if tail := form.keys[MCQResetKeysForTest:]; len(tail) != 0 {
+		t.Errorf("keys = %v, want none before the refusal", tail)
+	}
+}
+
+// A tab flagged multi-select whose options carry no checkboxes is not the
+// rendering this branch answers; toggling it blind would press digits into a
+// single-select menu.
+func TestClaudeTabsRefusesMultiSelectFlagOnPlainTab(t *testing.T) {
+	form := newFakeForm(digitCommits, 1, 3) // no multiTabs entry: plain options
+
+	err := ClaudeTabs(context.Background(), form.config(),
+		[][]string{{"1"}, {"1"}}, []bool{true, false})
+	if err == nil {
+		t.Fatal("ClaudeTabs toggled a tab that shows no checkboxes")
+	}
+	if !strings.Contains(err.Error(), "not multi-select") {
+		t.Errorf("error = %v, want it to report the missing checkboxes", err)
+	}
+	if tail := form.keys[MCQResetKeysForTest:]; len(tail) != 0 {
+		t.Errorf("keys = %v, want none before the refusal", tail)
 	}
 }
 

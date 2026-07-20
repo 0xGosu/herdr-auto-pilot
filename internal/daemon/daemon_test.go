@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -177,8 +178,21 @@ func (f *fakeHerdr) pressMCQDigit(key string) {
 	if len(f.mcqAnswered) < len(f.frames) {
 		f.mcqAnswered = make([]bool, len(f.frames))
 	}
-	// A multi-select tab toggles a checkbox: no answer, no advance.
-	if domain.MultiSelectTab(f.frames[f.frameIdx]) {
+	// A multi-select tab toggles a checkbox: no answer, no advance — but the
+	// box DOES flip, and delivery verifies exactly that before advancing, so
+	// the flip has to be modelled or a correct delivery would read as one that
+	// never landed. Ticking the first box ALSO flips that tab's header mark to
+	// ☒ while the form still stands and still owes an answer (verified live
+	// 2026-07-20, Claude Code v2.1.215), and the header is drawn on every tab.
+	if domain.MultiSelectTab(domain.ExtractMCQForm(f.frames[f.frameIdx])) {
+		f.frames[f.frameIdx] = toggleFakeCheckbox(f.frames[f.frameIdx], key)
+		checked := false
+		for _, on := range domain.OptionCheckStates(domain.ExtractMCQForm(f.frames[f.frameIdx])) {
+			checked = checked || on
+		}
+		for i := range f.frames {
+			f.frames[i] = markFakeTabAnswered(f.frames[i], f.frameIdx, checked)
+		}
 		return
 	}
 	// The last frame is the Submit tab: its digit submits the form away.
@@ -189,6 +203,45 @@ func (f *fakeHerdr) pressMCQDigit(key string) {
 	f.mcqAnswered[f.frameIdx] = true
 	f.frameIdx++
 }
+
+// toggleFakeCheckbox flips the `[ ]`/`[x]` box on the option line numbered
+// digit, the way a real multi-select tab re-renders after its digit press.
+func toggleFakeCheckbox(frame, digit string) string {
+	re := regexp.MustCompile(`(?m)^([ \t]*(?:[❯›>][ \t]*)?` + regexp.QuoteMeta(digit) + `[.)][ \t]+)\[[ xX✔✓]\]`)
+	return re.ReplaceAllStringFunc(frame, func(m string) string {
+		box := "[ ]"
+		if strings.HasSuffix(m, "[ ]") {
+			box = "[✔]" // the glyph Claude actually renders when checked
+		}
+		return m[:strings.LastIndex(m, "[")] + box
+	})
+}
+
+// markFakeTabAnswered sets the tab-th question mark in the frame's tab header
+// to ☒ (answered) or ☐, mirroring how the real header tracks a tab that now
+// carries a selection. The trailing ✔ Submit entry is never a question, so
+// only the ☐/☒ marks are counted.
+func markFakeTabAnswered(frame string, tab int, answered bool) string {
+	header, ok := domain.MCQTabHeaderLine(frame)
+	if !ok {
+		return frame
+	}
+	want := "☐"
+	if answered {
+		want = "☒"
+	}
+	seen := 0
+	updated := questionMarkRE.ReplaceAllStringFunc(header, func(m string) string {
+		defer func() { seen++ }()
+		if seen == tab {
+			return want
+		}
+		return m
+	})
+	return strings.Replace(frame, header, updated, 1)
+}
+
+var questionMarkRE = regexp.MustCompile(`[☐☒]`)
 
 func (f *fakeHerdr) SendKeys(ctx context.Context, paneID string, keys ...string) error {
 	for _, key := range keys {
@@ -208,7 +261,9 @@ func (f *fakeHerdr) keysSent() []string {
 func (f *fakeHerdr) setFrames(frames []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.frames = frames
+	// Copied: a digit press mutates the frame it lands on (checkbox toggles),
+	// and the fixtures are package-level slices shared by every test.
+	f.frames = append([]string(nil), frames...)
 	f.frameIdx = 0
 }
 
