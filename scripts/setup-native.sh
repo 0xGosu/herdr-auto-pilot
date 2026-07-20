@@ -44,6 +44,13 @@ if [ "$OS" = "Linux" ]; then
     echo "==> installing libopenblas-dev (FAISS BLAS backend)"
     $SUDO apt-get update -qq && $SUDO apt-get install -y -qq libopenblas-dev
   fi
+  # Both builds below shell out to cmake; without this the script dies ~100
+  # lines later with a bare "cmake: command not found" and no hint that a
+  # prerequisite is missing.
+  if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    echo "==> installing cmake (llama.cpp + FAISS build driver)"
+    $SUDO apt-get update -qq && $SUDO apt-get install -y -qq cmake
+  fi
 elif [ "$OS" = "Darwin" ]; then
   command -v brew >/dev/null 2>&1 || { echo "Homebrew is required on macOS (for LLVM/OpenMP)" >&2; exit 1; }
   if ! brew list llvm >/dev/null 2>&1; then
@@ -58,6 +65,14 @@ elif [ "$OS" = "Darwin" ]; then
     "CPPFLAGS=-I${LLVM_PREFIX}/include"
   )
 fi
+
+# Anything the auto-install above could not cover (no apt-get, or macOS).
+command -v cmake >/dev/null 2>&1 || {
+  echo "cmake is required to build llama.cpp and FAISS — install it and re-run" >&2
+  echo "  Debian/Ubuntu: sudo apt-get install -y cmake" >&2
+  echo "  macOS:         brew install cmake" >&2
+  exit 1
+}
 
 echo "==> submodules (llama-go + shallow llama.cpp)"
 git submodule update --init submodule/github.com/seed-hypermedia/llama-go

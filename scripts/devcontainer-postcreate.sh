@@ -11,6 +11,9 @@
 #     "error while loading shared libraries: libopenblas.so.0". (Building the
 #     native libs from source via scripts/setup-native.sh installs the fuller
 #     libopenblas-dev; this covers just running a prebuilt/linked binary.)
+#   - cmake: the build driver scripts/setup-native.sh uses for llama.cpp and
+#     FAISS. That script installs it on demand, but pre-seeding it here keeps
+#     the first native build from stopping to apt-install mid-run.
 #   - golangci-lint: pin the development linter to the same Go 1.25-compatible
 #     release used by CI.
 set -euo pipefail
@@ -19,9 +22,16 @@ set -euo pipefail
 if command -v apt-get >/dev/null 2>&1; then
   SUDO=""
   [ "$(id -u)" -eq 0 ] || SUDO="sudo"
-  echo "==> installing libopenblas0 (FAISS runtime BLAS backend)"
-  $SUDO apt-get update -qq
-  $SUDO apt-get install -y -qq libopenblas0
+  PKGS=()
+  # Same probe scripts/setup-native.sh uses, so an image that already ships
+  # BLAS (or the fuller libopenblas-dev) isn't downgraded or re-installed.
+  ldconfig -p 2>/dev/null | grep -q libopenblas || PKGS+=(libopenblas0)
+  command -v cmake >/dev/null 2>&1 || PKGS+=(cmake)
+  if [ "${#PKGS[@]}" -gt 0 ]; then
+    echo "==> installing ${PKGS[*]}"
+    $SUDO apt-get update -qq
+    $SUDO apt-get install -y -qq "${PKGS[@]}"
+  fi
 fi
 
 GOLANGCI_LINT_VERSION="v2.12.2"

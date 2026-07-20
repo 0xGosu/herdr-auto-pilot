@@ -32,7 +32,8 @@
 
   // Use 'postCreateCommand' to run commands after the container is created.
   // scripts/devcontainer-postcreate.sh installs hap's native runtime deps
-  // (libopenblas0 for FAISS); keep project setup steps there, not inline.
+  // (libopenblas0 for FAISS, cmake for scripts/setup-native.sh); keep project
+  // setup steps there, not inline.
   "postCreateCommand": "bash -i -c 'post_create_command' || true; bash scripts/devcontainer-postcreate.sh || true",
 
   // A command to run each time the container is successfully started.
