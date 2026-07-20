@@ -177,12 +177,18 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 			delete(d.autoTaskClaim, a.AgentID)
 			continue
 		}
-		// A pane change means a different terminal (herdr recycles pane ids),
-		// so the idle clock restarts rather than inheriting the old age.
-		if mark, ok := d.idleSince[a.AgentID]; ok && mark.paneID == a.PaneID {
+		// Same pane AND same terminal means the same continuously parked
+		// episode, so the original park time is kept. Either changing means a
+		// different terminal is behind this agent (herdr recycles pane ids and
+		// reports the new one via terminal_id), so the idle clock restarts
+		// rather than inheriting the previous occupant's age — and the pairing
+		// made for that occupant goes with it.
+		if mark, ok := d.idleSince[a.AgentID]; ok &&
+			mark.paneID == a.PaneID && mark.terminalID == a.TerminalID {
 			continue
 		}
-		d.idleSince[a.AgentID] = idleMark{paneID: a.PaneID, at: now}
+		delete(d.autoTaskClaim, a.AgentID)
+		d.idleSince[a.AgentID] = idleMark{paneID: a.PaneID, terminalID: a.TerminalID, at: now}
 	}
 	for id := range d.idleSince {
 		if _, ok := live[id]; !ok {
@@ -256,7 +262,8 @@ func (d *Daemon) idleLongEnough(a domain.AgentTransition, now time.Time) bool {
 	d.mu.RLock()
 	mark, ok := d.idleSince[a.AgentID]
 	d.mu.RUnlock()
-	return ok && mark.paneID == a.PaneID && now.Sub(mark.at) > autoSendIdleAfter
+	return ok && mark.paneID == a.PaneID && mark.terminalID == a.TerminalID &&
+		now.Sub(mark.at) > autoSendIdleAfter
 }
 
 // idleAt is the agent's parked-since timestamp (zero when unknown).

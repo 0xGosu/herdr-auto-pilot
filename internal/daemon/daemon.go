@@ -212,12 +212,18 @@ type Daemon struct {
 	cancelShutdown context.CancelFunc
 }
 
-// idleMark is one agent's parked-since timestamp, pinned to the pane it was
-// observed on: a recycled pane id means a different terminal, so the idle
-// clock must restart rather than inherit the previous agent's age.
+// idleMark is one agent's parked-since timestamp, pinned to the terminal it
+// was observed on. Herdr REUSES pane ids and reports the recreated terminal
+// behind one via a new terminal_id — the same signal SyncAgentTerminalID
+// treats as a lifecycle reset. Both are compared, so a fresh agent landing on
+// a recycled pane starts its own idle clock instead of inheriting the previous
+// occupant's age and being handed work before a full minute of idle.
+// terminalID is empty on older herdr and on event-socket transitions, where
+// the pane id alone remains the best available identity.
 type idleMark struct {
-	paneID string
-	at     time.Time
+	paneID     string
+	terminalID string
+	at         time.Time
 }
 
 // taskClaim is the pending task the idle poll assigned to one agent, plus the
@@ -1521,6 +1527,14 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 	sent := false
 	executed := d.withAgentAutomation(ctx, s, sig, tr, del.input, dec.Confidence, del.llmConfidence, del.llmOutput, now,
 		func() { sent = d.deliverAutonomousClaimed(ctx, s, sig, dec, tr, del, now) })
+	if !executed || !sent {
+		// Nothing reached the pane — a refused reservation, a rolled-back send,
+		// a blocked audit write, or the lifecycle barrier. The pairing must not
+		// outlive the attempt: it would keep this agent out of the next sweep
+		// AND withhold from every other agent a task that is pending again,
+		// until the claim's TTL expired.
+		d.dropAutoTaskClaim(s.AgentID)
+	}
 	return executed && sent
 }
 
@@ -1550,10 +1564,6 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 	// second idle agent. A refusal here means somebody already took it.
 	rollback, err := d.reserveDeclaredTask(del.declared, del.taskText)
 	if err != nil {
-		// Release the pairing too: the task is gone, so leaving the agent
-		// claimed would idle it (and withhold the item from everyone else)
-		// until the claim's TTL expired.
-		d.dropAutoTaskClaim(s.AgentID)
 		slog.Warn("declared task could not be reserved; not sending", "agent", s.AgentID, "error", err)
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
@@ -1672,6 +1682,8 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 // human interaction and reset that counter.
 func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
+	// Nothing is sent, so the pairing is spent — release it (see escalate).
+	d.dropAutoTaskClaim(s.AgentID)
 	d.withAgentAutomation(ctx, s, sig, tr, "", dec.Confidence, nil, "", now,
 		func() { d.deliverNoopClaimed(ctx, s, sig, dec, tr, now) })
 }
@@ -1780,6 +1792,11 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 // escalate records and surfaces an escalation: no input is sent (FR-018).
 func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
+	// The episode ended without an autonomous send, so an auto-send pairing for
+	// this agent is spent: the operator owns the situation now, and holding the
+	// claim would withhold a still-pending task from every other agent until
+	// its TTL. The file was never touched, so nothing is stranded.
+	d.dropAutoTaskClaim(s.AgentID)
 	autoDismissReason := d.escalationAutoDismissReason(ctx, s.AgentID)
 
 	// Dedup: if this normalized situation is already awaiting the user in the
@@ -3406,6 +3423,10 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType,
 				domain.DeliverKeystroke(s.Type, s.AgentType, pane, llmDec.Action)); err != nil {
 				rollback()
+				// The task is pending again; release the pairing with it so no
+				// other agent is denied the item until the claim's TTL (the
+				// rule path does this centrally in deliverAutonomous).
+				d.dropAutoTaskClaim(s.AgentID)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 				d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
 				return

@@ -455,3 +455,103 @@ func TestAutoSendSourceReservesEventDrivenSendsToo(t *testing.T) {
 		})
 	}
 }
+
+// auditFor reports whether the agent has an audit row in the given status.
+func auditFor(t *testing.T, h *harness, agentID, status string) bool {
+	t.Helper()
+	audits, err := h.raw.AuditLog(context.Background(), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range audits {
+		if a.AgentID == agentID && a.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAutoSendIdleReleasesClaimWhenSendFails(t *testing.T) {
+	// A failed delivery returns the task to [ ] — and must release the pairing
+	// with it, or the item stays promised to an agent that never got it and no
+	// one else may take it until the claim's TTL expires.
+	//
+	// The agent whose send failed is deliberately NOT retried: the failure
+	// raised an escalation, and the poll never pushes work onto an agent with a
+	// question still waiting on the operator. Releasing the claim is what makes
+	// the task available to a DIFFERENT idle agent, which is what this asserts.
+	h, taskFile := autoSendFixture(t, "", "- [ ] step two\n", true)
+	h.herdr.setFailSend(true)
+	// The longer-idle agent sorts first, so the deterministic pairing gives it
+	// the only task; the other gets nothing this sweep.
+	agents := parkIdle(h, 2*time.Minute, "agent-as14a", "agent-as14b")
+	h.daemon.mu.Lock()
+	h.daemon.idleSince["agent-as14a"] = idleMark{
+		paneID: "agent-as14a", at: h.daemon.opt.Clock.Now().Add(-5 * time.Minute),
+	}
+	h.daemon.mu.Unlock()
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	// The send failed: the attempt is escalated, the item is pending again, and
+	// the pairing is gone.
+	waitFor(t, 5*time.Second, func() bool { return auditFor(t, h, "agent-as14a", "escalated") })
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [ ] step two") {
+		t.Fatalf("failed send did not return the task to [ ]:\n%s", got)
+	}
+	if _, claimed := h.daemon.autoTaskClaimFor("agent-as14a"); claimed {
+		t.Fatal("the pairing outlived the failed delivery")
+	}
+
+	// Next sweep with a working send: the released task reaches the OTHER agent
+	// rather than sitting unofferable behind a dead pairing.
+	h.herdr.setFailSend(false)
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	waitFor(t, 5*time.Second, func() bool { return auditFor(t, h, "agent-as14b", "auto") })
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] step two")
+	})
+}
+
+func TestNoteIdleAgentsRestartsClockOnRecreatedTerminal(t *testing.T) {
+	// Herdr reuses pane ids and reports the recreated terminal behind one via a
+	// new terminal_id. A fresh agent landing on a recycled pane must start its
+	// own idle clock — inheriting the previous occupant's age would hand it
+	// work before it had been idle for a full minute — and must not inherit
+	// that occupant's task pairing either.
+	h, _ := autoSendFixture(t, "", "- [ ] some task\n", true)
+	d := h.daemon
+	start := d.opt.Clock.Now()
+
+	agents := []domain.AgentTransition{{
+		AgentID: "agent-as15", PaneID: "pane-x", TerminalID: "term-1",
+		AgentType: "claude", Status: "idle",
+	}}
+	d.noteIdleAgents(agents, start)
+	d.claimAutoTask("agent-as15", taskClaim{sourcePath: "/tmp/x.md", taskText: "some task", at: start})
+
+	// Same pane, same terminal: one continuous episode, clock preserved.
+	d.noteIdleAgents(agents, start.Add(30*time.Second))
+	if got := d.idleAt("agent-as15"); !got.Equal(start) {
+		t.Errorf("idle clock moved within one episode: %v vs %v", got, start)
+	}
+
+	// Same pane id, NEW terminal: a different agent is behind it now.
+	recreated := start.Add(2 * time.Minute)
+	agents[0].TerminalID = "term-2"
+	d.noteIdleAgents(agents, recreated)
+	if got := d.idleAt("agent-as15"); !got.Equal(recreated) {
+		t.Errorf("idle clock did not restart for a recreated terminal: %v vs %v", got, recreated)
+	}
+	if _, claimed := d.autoTaskClaimFor("agent-as15"); claimed {
+		t.Error("a recreated terminal inherited the previous occupant's task pairing")
+	}
+	// And it is not yet eligible: the new episode has not been idle a minute.
+	if d.idleLongEnough(agents[0], recreated.Add(30*time.Second)) {
+		t.Error("a recreated terminal was eligible before one continuous minute of idle")
+	}
+	if !d.idleLongEnough(agents[0], recreated.Add(2*time.Minute)) {
+		t.Error("a recreated terminal never became eligible after its own minute")
+	}
+}
