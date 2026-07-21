@@ -12,10 +12,11 @@ import (
 //
 //	←  ☐ New name  ☐ Rename depth  ☐ Config compat  ☐ Conciseness  ✔ Submit  →
 //
-// and a footer that names tab navigation ("Tab/Arrow keys to navigate" on
-// older builds, "Tab to switch questions" since Claude Code v2.1.207). The
-// pane shows ONE question at a time; the header is the only signal that more
-// tabs exist.
+// and — when the form has two or more question tabs — a footer that names tab
+// navigation ("Tab/Arrow keys to navigate" on older builds, "Tab to switch
+// questions" since Claude Code v2.1.207). A ONE-question form has nothing to
+// switch to and renders the plain selection footer instead. The pane shows ONE
+// question at a time; the header is the only signal that more tabs exist.
 var (
 	// The tab header marks each question ☐ (unanswered) or ☒ (answered) plus a
 	// final ✔ Submit. ☒ must be counted too — an operator (or the daemon) may
@@ -51,12 +52,29 @@ var mcqSubmitScreenRE = regexp.MustCompile(`(?im)^\s*ready to submit your answer
 // word "navigate"). The tail keeps an agent merely narrating "press enter to
 // select" (fzf-style help text in dev output) from reading as a live prompt.
 // The single-question form carries no tab header, so this footer is the only
-// structural signal it is a live menu.
+// structural signal it is a live menu — and a ONE-question tab form renders
+// this same footer, where it corroborates the tab header instead (see
+// MultiTabForm).
 var mcqSingleFooterRE = regexp.MustCompile(`(?im)^.*enter to select.*(·|\bnavigate\b).*$`)
+
+// MCQTabHeaderLine returns the LIVE (last) AskUserQuestion tab header row, if
+// the pane carries one. It reports the header ALONE, without the live-form
+// corroboration MultiTabForm also requires, so a caller can tell "no form is
+// rendered" apart from "a form is rendered but did not qualify" — the
+// integration suite needs that split to fail, rather than skip, when detection
+// regresses. Callers deciding whether to send keystrokes must use
+// MultiTabForm; a bare header can be scrollback.
+func MCQTabHeaderLine(pane string) (string, bool) {
+	headers := mcqTabHeaderRE.FindAllString(pane, -1)
+	if len(headers) == 0 {
+		return "", false
+	}
+	return headers[len(headers)-1], true
+}
 
 // ClaudeMCQForm reports whether pane content shows any of Claude Code's
 // on-screen MCQ selection prompts: the multi-tab AskUserQuestion form (a tab
-// header plus its navigation footer, via MultiTabForm) or the single-question
+// header plus a live-form footer, via MultiTabForm) or the single-question
 // form (an "Enter to select … navigate" footer). This is the choice-
 // classification signal for claude, replacing brittle numbered-line matching
 // that any narrated list would trip.
@@ -87,21 +105,70 @@ func ParseMCQForm(agentType, pane string) (MCQFormState, bool) {
 
 // MultiTabForm reports whether pane content shows the multi-tab MCQ variant
 // and how many tabs it has (checkbox entries plus the Submit entry). The tab
-// header is always required; alongside it the pane must carry EITHER the
-// tab-navigation footer (the question tabs) OR the Submit confirmation body
-// (the final tab drops the footer — issue #95). Requiring one of the two
-// keeps a narrated checkbox list from false-positiving. The LAST header
-// occurrence is the live render: a consuming "recent" read can carry earlier
-// renders (or an older form) above the current one.
+// header is always required; alongside it the pane must carry a live-form
+// signal: the tab-navigation footer (a form with two or more question tabs),
+// the Submit confirmation body (the final tab drops the footer — issue #95),
+// or the plain selection footer.
+//
+// That last case is a ONE-question form (`←  ☐ Scope  ✔ Submit  →`): with no
+// sibling question to switch to, Claude omits the tab hint and renders the
+// same footer as the single-question form. Requiring the header plus SOME
+// live-menu footer still keeps a narrated checkbox list from false-positiving,
+// while routing these forms to the verified tab deliverer — treating one as a
+// plain menu sent a blind digit that only toggled its checkbox and never
+// reached the Submit tab, leaving the agent blocked.
+//
+// The LAST header occurrence is the live render: a consuming "recent" read can
+// carry earlier renders (or an older form) above the current one. The
+// corroborating footer is searched BELOW that header only — a live form always
+// renders its footer under its header, so a footer left in scrollback above it
+// cannot stand in. ClaudeTabForm and ExtractMCQForm scope to the same region.
+//
+// The plain footer is the weakest of the three signals, because an ordinary
+// single-question menu carries it too: a submitted form's header left in
+// scrollback ABOVE such a menu would otherwise borrow it and route that menu
+// into the Right-arrow sweep — where a digit COMMITS. So that branch needs a
+// second signal that the header describes what is on screen: either a tab that
+// still owes an answer (☐), or checkbox options in the live region, which a
+// plain menu never renders.
+//
+// Both are needed. A ☐ test alone is wrong — verified live (2026-07-20, Claude
+// Code v2.1.215) a one-question form flips its header to ☒ the moment its
+// first checkbox is ticked while still standing and still owed an answer, and
+// demanding ☐ made delivery lose the form it was mid-way through answering.
+// A checkbox test alone is wrong too: a single-select one-question form has no
+// boxes at all.
+//
+// Neither signal proves the header is live — an unanswered form's ☐ header
+// left in scrollback above an ordinary menu would satisfy the first. Measured
+// live (2026-07-21, Claude Code v2.1.215) that pairing does not arise on the
+// VISIBLE pane: submitting a form replaces the whole widget with "User
+// answered Claude's questions", ESC-cancelling it with "User declined to
+// answer questions", and in both cases the header line is gone; the plain
+// permission menu that follows carries no header at all. A consuming "recent"
+// read can still hold an older render, so the guarantee that matters is
+// downstream, not here: every path that sends a keystroke re-reads the visible
+// pane and refuses before pressing anything (daemon.sweepFrames checks its
+// first frame BEFORE its first arrow — see
+// TestSweepFailsClosedWhenVisiblePaneIsNotTheForm — and seriesStale,
+// reverifyMultiSelect, mcqdeliver and the frontend confirm path all re-read
+// too). Over-claiming here therefore costs an escalation, never a keystroke.
 func MultiTabForm(pane string) (tabs int, ok bool) {
-	headers := mcqTabHeaderRE.FindAllString(pane, -1)
+	headers := mcqTabHeaderRE.FindAllStringIndex(pane, -1)
 	if len(headers) == 0 {
 		return 0, false
 	}
-	if !mcqTabFooterRE.MatchString(pane) && !mcqSubmitScreenRE.MatchString(pane) {
+	last := headers[len(headers)-1]
+	live := pane[last[0]:]
+	header := pane[last[0]:last[1]]
+	switch {
+	case mcqTabFooterRE.MatchString(live), mcqSubmitScreenRE.MatchString(live):
+	case mcqSingleFooterRE.MatchString(live) &&
+		(strings.Contains(header, "☐") || MultiSelectTab(ExtractMCQForm(pane))):
+	default:
 		return 0, false
 	}
-	n := len(mcqTabEntryRE.FindAllString(headers[len(headers)-1], -1))
+	n := len(mcqTabEntryRE.FindAllString(header, -1))
 	if n < 2 {
 		return 0, false
 	}

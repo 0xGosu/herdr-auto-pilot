@@ -57,7 +57,7 @@ func (a *App) deliverTabSeries(ctx context.Context, ks ports.KeystrokeSender, au
 		return a.deliverCodexSeries(ctx, ks, audit, groups)
 	}
 	agentID := audit.AgentID
-	multi, err := a.verifyTabBaseline(ctx, ks, agentID, len(groups))
+	multi, err := a.verifyTabBaseline(ctx, ks, agentID, groups)
 	if err != nil {
 		return err
 	}
@@ -212,10 +212,17 @@ func (a *App) resetCodexForm(ctx context.Context, ks ports.KeystrokeSender,
 
 // verifyTabBaseline walks the form read-only (reset, then one Right per tab)
 // and returns each tab's multi-select flag, erroring if the form drifted or a
-// multi-select tab already carries a selection. It toggles nothing, so the
-// caller can refuse before any answer keystroke — an all-or-nothing baseline
-// check that mirrors the daemon's capture-time refusal.
-func (a *App) verifyTabBaseline(ctx context.Context, ks ports.KeystrokeSender, agentID string, tabCount int) ([]bool, error) {
+// multi-select tab carries a selection this answer did not choose. It toggles
+// nothing, so the caller can refuse before any answer keystroke — the same
+// "checked ⊆ chosen" rule the daemon applies before delivery, and that
+// mcqdeliver enforces again at the keystroke: a box THIS answer chose may
+// already be set by an earlier attempt that died before submitting (pressing
+// it again would clear it), while anything else on the tab is the operator's
+// and is never cleared.
+func (a *App) verifyTabBaseline(ctx context.Context, ks ports.KeystrokeSender,
+	agentID string, groups [][]string) ([]bool, error) {
+
+	tabCount := len(groups)
 	if err := a.resetForm(ctx, ks, agentID); err != nil {
 		return nil, err
 	}
@@ -234,12 +241,14 @@ func (a *App) verifyTabBaseline(ctx context.Context, ks ports.KeystrokeSender, a
 		if tabs, ok := domain.MultiTabForm(frame); !ok || tabs != tabCount {
 			return nil, fmt.Errorf("the pane no longer shows the %d-tab form at tab %d; answer in the pane", tabCount, tab+1)
 		}
-		if domain.MultiSelectTab(frame) {
+		// Scoped to the live render — scrollback above it can carry an earlier,
+		// already-toggled render of this or another form.
+		liveFrame := domain.ExtractMCQForm(frame)
+		if domain.MultiSelectTab(liveFrame) {
 			multi[tab] = true
-			for digit, checked := range domain.OptionCheckStates(frame) {
-				if checked {
-					return nil, fmt.Errorf("tab %d already has option %s selected; answer in the pane", tab+1, digit)
-				}
+			if foreign := domain.CheckedOutside(liveFrame, groups[tab]); len(foreign) > 0 {
+				return nil, fmt.Errorf("tab %d already has option(s) %s selected, which this answer did not choose; answer in the pane",
+					tab+1, strings.Join(foreign, ", "))
 			}
 		}
 	}

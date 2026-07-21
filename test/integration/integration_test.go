@@ -495,6 +495,136 @@ func TestRealClaudeConsult(t *testing.T) {
 	t.Fatalf("claude did not proceed after confirm; the menu digit did not land.\npane:\n%s", pane1)
 }
 
+// formStanding reports whether an AskUserQuestion form is on screen and still
+// owes an answer: a tab header whose live row carries an unanswered ☐. It reads
+// the header through the PRODUCTION matcher (domain.MCQTabHeaderLine) so a
+// header-syntax drift can not silently disagree with the parser; the only thing
+// it deliberately bypasses is MultiTabForm's live-form corroboration, which is
+// the regression surface the test below must be able to fail on rather than
+// skip past. Answered/submitted forms mark every question ☒, so a header left
+// rendered in the transcript does not read as standing.
+func formStanding(content string) bool {
+	line, ok := domain.MCQTabHeaderLine(content)
+	return ok && strings.Contains(line, "☐")
+}
+
+// TestRealClaudeOneQuestionMultiSelectMCQDelivery drives a REAL Claude
+// AskUserQuestion form with exactly ONE multi-select question and asserts the
+// plugin toggles the choice, advances to Submit, and commits it.
+//
+// This is the shape that shipped broken: a one-question form has no sibling
+// question to switch to, so Claude renders the plain selection footer instead
+// of the tab-navigation one. MultiTabForm required that footer, so the form
+// read as a plain menu and the daemon sent a bare digit — which on a checkbox
+// question only TOGGLES the option. Nothing was committed, the Submit tab was
+// never reached, and the agent stayed blocked while the audit row said the
+// action was delivered (audit #41-#44, 2026-07-20; the retry toggled it back
+// off, so the screen looked untouched).
+//
+// The unit suite pins the parser and the deliverer against a fake form; only
+// this proves the real render still matches. Skips (never fails) when it cannot
+// elicit the form.
+func TestRealClaudeOneQuestionMultiSelectMCQDelivery(t *testing.T) {
+	if os.Getenv("HAP_ITEST_CLAUDE") != "1" {
+		t.Skip("set HAP_ITEST_CLAUDE=1 to run the real Claude one-question MCQ test")
+	}
+	requireHerdr(t)
+	if _, err := exec.LookPath("claude"); err != nil {
+		t.Skipf("claude CLI not found: %v", err)
+	}
+
+	cli := herdr.NewCLI()
+	pane := startClaudeAgent(t, cli, t.TempDir())
+
+	// ONE question (so the footer carries no tab hint) whose options are
+	// multi-select (so they render `[ ]` checkboxes a digit toggles).
+	prompt := "Use the AskUserQuestion tool right now and nothing else. Ask exactly ONE " +
+		"question, header 'Shape', question 'Which shapes do you like?', and allow MULTIPLE " +
+		"answers to be selected (multiSelect true) with options Circle, Square and Triangle. " +
+		"Do not give the options a preview."
+
+	var form string
+	ctx := t.Context()
+	for attempt := 0; attempt < 2 && form == ""; attempt++ {
+		if attempt > 0 {
+			// Never type a prompt into a standing menu: its characters would be
+			// consumed as selection keys and could commit a random answer.
+			if content, err := cli.ReadPaneVisible(ctx, pane, 60); err == nil && formStanding(content) {
+				t.Skip("claude rendered a form that is not one-question multi-select; nothing to assert")
+			}
+		}
+		if err := cli.Send(ctx, pane, prompt); err != nil {
+			t.Fatalf("send prompt to claude: %v", err)
+		}
+		tryHerdr("pane", "send-keys", pane, "enter")
+		deadline := time.Now().Add(60 * time.Second)
+		for time.Now().Before(deadline) {
+			content, err := cli.ReadPaneVisible(ctx, pane, 60)
+			if err == nil && formStanding(content) &&
+				domain.MultiSelectTab(domain.ExtractMCQForm(content)) {
+				form = content
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	if form == "" {
+		t.Skip("claude did not render a one-question multi-select form; nothing to assert")
+	}
+
+	// The form IS on screen (header + checkbox options). From here a detection
+	// miss is a failure, not a skip: that is precisely the bug.
+	tabs, ok := domain.MultiTabForm(form)
+	if !ok {
+		t.Fatalf("a one-question form is standing but MultiTabForm did not detect it; "+
+			"it would be answered as a plain menu.\npane:\n%s", form)
+	}
+	if tabs != 2 {
+		t.Fatalf("tabs = %d, want 2 (one question + Submit).\npane:\n%s", tabs, form)
+	}
+	state, ok := domain.ClaudeTabForm(form)
+	if !ok || state.Unanswered != 1 {
+		t.Fatalf("ClaudeTabForm = %+v (ok=%v), want one unanswered tab.\npane:\n%s", state, ok, form)
+	}
+	t.Logf("one-question multi-select form is up: %d tabs, question %q", tabs, state.Question)
+
+	// Toggle option 1 on the question tab, then Submit — what the daemon
+	// delivers for the answer series "1 1" with tab 1 marked multi-select.
+	err := mcqdeliver.ClaudeTabs(ctx, mcqdeliver.Config{
+		Keys: cli, Read: cli.ReadPaneVisible, PaneID: pane,
+		ReadLines: 60, KeyDelay: 250 * time.Millisecond,
+	}, [][]string{{"1"}, {"1"}}, []bool{true, false})
+	if err != nil {
+		t.Fatalf("delivering the one-question multi-select form failed: %v", err)
+	}
+
+	// The form must be COMMITTED, not merely toggled: nothing still owes an
+	// answer, AND the chosen option shows up in claude's answer. The second
+	// half is what pins the toggle — the multi-select branch presses digits
+	// without verifying them, so a delivery that toggled nothing (or toggled
+	// on and back off, the audit #41-#44 behaviour) would still reach Submit,
+	// commit an empty answer, and clear the form.
+	var last string
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		content, err := cli.ReadPaneVisible(ctx, pane, 60)
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		last = content
+		if !formStanding(content) && strings.Contains(content, "Circle") {
+			return // committed — the toggled option is in the answer
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if formStanding(last) {
+		t.Fatalf("the one-question form is still standing; the answer did not commit.\npane:\n%s", last)
+	}
+	t.Fatalf("the form was submitted but the chosen option never appears in the answer; "+
+		"the digit did not toggle it.\npane:\n%s", last)
+}
+
 // TestRealClaudePreviewMCQDelivery drives a REAL Claude AskUserQuestion form
 // whose options carry PREVIEWS, and asserts the plugin actually answers it.
 //

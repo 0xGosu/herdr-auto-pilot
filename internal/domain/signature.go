@@ -159,6 +159,15 @@ func NormalizedOptionSet(options []string) string {
 	opts := make([]string, len(options))
 	for i, o := range options {
 		o = strings.ToLower(strings.TrimSpace(o))
+		// A multi-select option's checkbox is VOLATILE state, not part of the
+		// question's identity: "[✔] Auto-sends" is the same option as
+		// "[ ] Auto-sends", just already ticked. Folding it to the unchecked
+		// spelling is what lets a form carrying a half-delivered answer still
+		// resolve to the rule learned for the untouched form — and folding TO
+		// "[ ]" (rather than dropping the box) keeps every signature already
+		// learned from an untouched form byte-identical, so nothing needs a
+		// migration.
+		o = checkboxLabelRE.ReplaceAllString(o, "[ ]")
 		o = strings.ReplaceAll(o, `\`, `\\`)
 		opts[i] = strings.ReplaceAll(o, ";", `\;`)
 	}

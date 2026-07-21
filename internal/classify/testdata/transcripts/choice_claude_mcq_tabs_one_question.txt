@@ -1,0 +1,33 @@
+● I'll explore how the task source parser works today.
+
+● Explore(Find task_source parsing code)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+  Searched for 6 patterns, read 7 files, listed 2 directories, ran 2 shell commands
+  ⎿  Loaded ../../vscode/home/root/.claude/rules/go.md
+
+❯ its ok to for the tasks.md file to contain more than 20 tasks if the user explictly update it manualy via file editing. (the 20 limit is applied to hap TUI/CLI create task and LLM generate tasks only)
+
+● Agent "Find task_source parsing code" finished · 1m 48s
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Planning: /root/.claude/plans/make-sure-the-task-source-melodic-backus.md
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Scope  ✔ Submit  →
+
+Parsing already works — I verified this exact file shape parses cleanly (headings/prose skipped, all 50 `- [ ] N.M ...` items found, no false positives). The real gaps are addressing and context. Which should I fix?
+
+❯ 1. [ ] Hierarchical task IDs (Recommended)
+  `hap task <agent> done 3.4` currently errors (Atoi fails), and `done 3` silently marks positional item #3 — the wrong task. Add: a dotted ref like "3.4" resolves by the item's own leading ID label; plain integers stay positional (fully
+  backward compatible).
+  2. [ ] Section heading context
+  Add a `{task_section}` template placeholder carrying the item's nearest `##` heading (e.g. "5. Webapp UI — Share flow (`app/routes/...`)"), so the sent prompt keeps the section's file-path context. Default template unchanged.
+  3. [ ] Regression test only
+  Add this exact tasks.md as a testdata fixture with a test pinning parse/numbering/next-task behavior. No behavior change.
+  4. [ ] Show IDs in `hap task list`
+  Render the positional number alongside the file's own ID so an agent reading "3.4 …" can see it is task #23 before running a command.
+  5. [ ] Type something
+     Submit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

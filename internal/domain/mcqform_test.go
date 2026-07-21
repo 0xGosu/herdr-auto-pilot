@@ -115,6 +115,204 @@ func TestMultiTabFormRejectsNarratedCheckboxes(t *testing.T) {
 	}
 }
 
+// mcqOneQuestionTabFrame is a LIVE capture (2026-07-20), trimmed from
+// internal/classify/testdata/transcripts/choice_claude_mcq_tabs_one_question.txt
+// (the byte-exact transcript — keep the two in step, they are not identical):
+// a Claude AskUserQuestion form with exactly ONE question tab plus Submit,
+// whose options are MULTI-select (`[ ]` checkboxes). With no sibling question
+// to switch to, the footer carries no tab hint — it is the plain
+// single-question footer — so the tab header was ignored and the form was
+// answered as a plain menu: hap sent the digit alone, which only toggled the
+// option's checkbox, and the agent stayed blocked on the Submit tab.
+const mcqOneQuestionTabFrame = `● I'll explore how the task source parser works today.
+────────────────────────────────────────────────────
+Planning: /root/.claude/plans/make-sure-the-task-source.md
+────────────────────────────────────────────────────
+←  ☐ Scope  ✔ Submit  →
+
+Parsing already works — I verified this exact file shape parses cleanly. The real gaps are addressing and context. Which should I fix?
+
+❯ 1. [ ] Hierarchical task IDs (Recommended)
+  ` + "`hap task <agent> done 3.4`" + ` currently errors (Atoi fails), and ` + "`done 3`" + ` silently marks positional item #3 — the wrong task.
+  2. [ ] Section heading context
+  Add a ` + "`{task_section}`" + ` template placeholder carrying the item's nearest ` + "`##`" + ` heading.
+  3. [ ] Regression test only
+  Add this exact tasks.md as a testdata fixture with a test pinning parse/numbering/next-task behavior.
+  4. [ ] Show IDs in ` + "`hap task list`" + `
+  Render the positional number alongside the file's own ID.
+  5. [ ] Type something
+     Submit
+────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+`
+
+// mcqOneQuestionSingleChoiceTabFrame is the other one-question shape: the same
+// header + plain footer, but SINGLE-select options (no `[ ]` checkboxes). Both
+// shapes must detect identically — the checkbox only decides how a tab is
+// answered (toggle vs. pick), never whether the form is a tab form.
+const mcqOneQuestionSingleChoiceTabFrame = `● Ready for your call.
+────────────────────────────────────────────────────
+←  ☐ Rollout  ✔ Submit  →
+
+Which rollout order should I take?
+
+❯ 1. Ship the parser fix first (Recommended)
+     Smallest diff, unblocks the rest.
+  2. Ship the CLI change first
+     Bigger blast radius.
+  3. Type something
+     Submit
+────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+`
+
+func TestMultiTabFormDetectsOneQuestionTabForm(t *testing.T) {
+	// A one-question form renders the tab header but the plain selection
+	// footer. Both select kinds must resolve to their 2 tabs (question +
+	// Submit) so the verified tab deliverer — not blind digit delivery —
+	// answers them.
+	cases := []struct {
+		name        string
+		frame       string
+		multiSelect bool
+	}{
+		{"multi-choice (checkbox options)", mcqOneQuestionTabFrame, true},
+		{"single-choice (plain options)", mcqOneQuestionSingleChoiceTabFrame, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tabs, ok := MultiTabForm(tc.frame)
+			if !ok || tabs != 2 {
+				t.Fatalf("MultiTabForm = (%d,%v), want (2,true)", tabs, ok)
+			}
+			// The select kind drives delivery: a checkbox tab toggles with the
+			// digit and needs Enter to commit, a plain tab commits on the digit.
+			if got := MultiSelectTab(ExtractMCQForm(tc.frame)); got != tc.multiSelect {
+				t.Errorf("MultiSelectTab = %v, want %v", got, tc.multiSelect)
+			}
+		})
+	}
+}
+
+func TestClaudeTabFormReadsOneQuestionSingleChoiceTabForm(t *testing.T) {
+	state, ok := ClaudeTabForm(mcqOneQuestionSingleChoiceTabFrame)
+	if !ok {
+		t.Fatal("ClaudeTabForm(one-question single-choice form) = not a form")
+	}
+	if state.Kind != MCQClaudeTabs || state.AnswerCount != 2 {
+		t.Errorf("kind/answers = %q/%d, want %q/2", state.Kind, state.AnswerCount, MCQClaudeTabs)
+	}
+	if state.Unanswered != 1 {
+		t.Errorf("Unanswered = %d, want 1", state.Unanswered)
+	}
+	if state.SelectedOption != "1" {
+		t.Errorf("SelectedOption = %q, want \"1\"", state.SelectedOption)
+	}
+	if !strings.Contains(state.Question, "Which rollout order") {
+		t.Errorf("Question = %q, want the tab's question line", state.Question)
+	}
+}
+
+func TestMultiTabFormDetectsAnsweredOneQuestionForm(t *testing.T) {
+	// Verified live (2026-07-20, Claude Code v2.1.215): ticking the first
+	// checkbox flips the header to ☒ while the form is STILL STANDING and
+	// still owed an answer, and a checked box renders `[✔]`. Delivery re-reads
+	// between keystrokes, so losing the form here stranded it mid-answer with
+	// one box ticked.
+	answered := "←  ☒ Shape  ✔ Submit  →\n\nWhich shapes do you like?\n\n" +
+		"❯ 1. [✔] Circle\n  2. [ ] Square\n  3. [ ] Triangle\n\n" +
+		"Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+	tabs, ok := MultiTabForm(answered)
+	if !ok || tabs != 2 {
+		t.Fatalf("MultiTabForm(mid-answer one-question form) = (%d,%v), want (2,true)", tabs, ok)
+	}
+	if !MultiSelectTab(ExtractMCQForm(answered)) {
+		t.Error("a `[✔]`-checked option must still read as multi-select")
+	}
+	if states := OptionCheckStates(ExtractMCQForm(answered)); !states["1"] || states["2"] {
+		t.Errorf("check states = %v, want option 1 checked", states)
+	}
+}
+
+func TestMCQTabHeaderLine(t *testing.T) {
+	// The header alone, uncorroborated: it must find the LIVE (last) header,
+	// and report absence rather than an empty match.
+	line, ok := MCQTabHeaderLine(mcqOneQuestionTabFrame)
+	if !ok || !strings.Contains(line, "☐ Scope") {
+		t.Errorf("MCQTabHeaderLine = (%q,%v), want the live header", line, ok)
+	}
+	stale := "←  ☒ Old  ✔ Submit  →\nsubmitted\n\n←  ☐ New  ✔ Submit  →\n"
+	if line, _ := MCQTabHeaderLine(stale); !strings.Contains(line, "☐ New") {
+		t.Errorf("MCQTabHeaderLine = %q, want the LAST header", line)
+	}
+	if _, ok := MCQTabHeaderLine("no form here\n1. Yes\n"); ok {
+		t.Error("MCQTabHeaderLine reported a header on a pane without one")
+	}
+}
+
+func TestMultiTabFormRejectsStaleHeaderAboveLivePlainMenu(t *testing.T) {
+	// A finished form's header can sit in scrollback above a live plain menu.
+	// Borrowing that menu's footer would route it into the Right-arrow sweep,
+	// where a digit COMMITS — so the header needs its own live-form evidence:
+	// no unanswered ☐, and the region below it shows no checkbox options.
+	pane := "←  ☒ Scope  ✔ Submit  →\n\nAnswers submitted.\n\n" +
+		"How do you want to submit?\n❯ 1. All 4\n  2. Hold\n\n" +
+		"Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+	if tabs, ok := MultiTabForm(pane); ok {
+		t.Fatalf("stale header above a live plain menu must not detect as multi-tab, got %d tabs", tabs)
+	}
+}
+
+func TestMultiTabFormRejectsSelectionFooterAboveTheHeader(t *testing.T) {
+	// The corroborating footer must sit BELOW the live header. A pane whose
+	// only selection footer belongs to an earlier render is not evidence that
+	// the trailing header is live.
+	pane := "How do you want to submit?\n❯ 1. All 4\n  2. Hold\n\n" +
+		"Enter to select · ↑/↓ to navigate · Esc to cancel\n\n" +
+		"←  ☐ Scope  ✔ Submit  →\n"
+	if tabs, ok := MultiTabForm(pane); ok {
+		t.Fatalf("footer above the header must not corroborate it, got %d tabs", tabs)
+	}
+}
+
+func TestParseMCQFormRoutesOneQuestionTabFormToTabs(t *testing.T) {
+	state, ok := ParseMCQForm("claude", mcqOneQuestionTabFrame)
+	if !ok {
+		t.Fatal("ParseMCQForm(claude, one-question tab form) = not a form")
+	}
+	if state.Kind != MCQClaudeTabs {
+		t.Errorf("Kind = %q, want %q", state.Kind, MCQClaudeTabs)
+	}
+	if state.AnswerCount != 2 {
+		t.Errorf("AnswerCount = %d, want 2", state.AnswerCount)
+	}
+}
+
+func TestClaudeTabFormReadsOneQuestionTabForm(t *testing.T) {
+	state, ok := ClaudeTabForm(mcqOneQuestionTabFrame)
+	if !ok {
+		t.Fatal("ClaudeTabForm(one-question tab form) = not a form")
+	}
+	if state.Unanswered != 1 {
+		t.Errorf("Unanswered = %d, want 1", state.Unanswered)
+	}
+	if state.SelectedOption != "1" {
+		t.Errorf("SelectedOption = %q, want \"1\"", state.SelectedOption)
+	}
+	if !strings.Contains(state.Question, "Which should I fix?") {
+		t.Errorf("Question = %q, want the tab's question line", state.Question)
+	}
+	// The options carry `[ ]` checkboxes: the digit toggles, Enter commits.
+	// Delivery must treat this tab as multi-select.
+	if !MultiSelectTab(ExtractMCQForm(mcqOneQuestionTabFrame)) {
+		t.Error("MultiSelectTab = false, want true for a checkbox question")
+	}
+}
+
 func TestClaudeMCQForm(t *testing.T) {
 	singleQuestion := "How do you want to submit?\n❯ 1. All 4\n  2. Hold\n\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
 	cases := []struct {

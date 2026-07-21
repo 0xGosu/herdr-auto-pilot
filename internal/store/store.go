@@ -410,6 +410,20 @@ func (s *Store) UpdateAuditStatus(ctx context.Context, auditID int64, status str
 	})
 }
 
+// EscalateAudit flips an audit row to escalated and records WHY, plus the
+// suggestion the operator can confirm. A row demoted from "auto" still carries
+// the rule's own rationale and (because the autonomous path had nothing to
+// suggest) an empty suggestion, so flipping the status alone puts an entry in
+// the operator's queue that neither explains itself nor can be confirmed.
+func (s *Store) EscalateAudit(ctx context.Context, auditID int64, rationale, suggestion string) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE audit_log SET status = 'escalated', rationale = ?, suggestion = ? WHERE id = ?`,
+			rationale, suggestion, auditID)
+		return err
+	})
+}
+
 // UpdateAgentRate stores the per-agent runaway counters (daemon-owned).
 func (s *Store) UpdateAgentRate(ctx context.Context, r domain.AgentRate) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
