@@ -168,6 +168,22 @@ hap escalations
 hap pause          # global kill switch
 ```
 
+The CLI documents itself — useful for humans and for the coding agents that
+drive it:
+
+```sh
+hap help                 # every command, grouped, plus common workflows
+hap help task            # one command in full: usage, every flag, details, examples
+hap escalations --help   # the same page; --help works anywhere in the arguments
+```
+
+Most commands end with a **"Next steps"** footer naming what to run next, with
+real ids filled in. Turn it off per invocation with `--no-hints`, per shell with
+`HAP_NO_HINTS=1`, or permanently with
+`hap config set cli.ai_agent_friendly_output false` (default `true`). None of
+these affect the help pages, and `hap state-dir` / `hap config path` always print
+a bare value.
+
 Run from any shell, `hap` operates on the same instance the daemon uses:
 it honors the `HERDR_PLUGIN_CONFIG_DIR`/`HERDR_PLUGIN_STATE_DIR` env vars
 Herdr injects, and without them auto-detects Herdr's plugin directories

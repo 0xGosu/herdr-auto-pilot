@@ -210,6 +210,18 @@ terminal_bell = true       # ring the terminal bell (\a) on new escalations and 
 # warn = "214"
 # help = ""
 
+# ── CLI output ──────────────────────────────────────────────────────
+[cli]
+ai_agent_friendly_output = true   # append a "Next steps" footer to command output,
+                                  # naming the commands that follow this one (with
+                                  # real ids filled in) — the CLI's main caller is
+                                  # often an AI coding agent, which cannot discover
+                                  # the next verb the way a human reads a man page.
+                                  # `hap help` and `<command> --help` always print
+                                  # theirs; `hap state-dir` and `hap config path`
+                                  # never do (a bare value stays capturable).
+                                  # Per-run equivalents: --no-hints, HAP_NO_HINTS=1
+
 # ── Declared task lists for idle agents (repeatable) ────────────────
 # Without a declared source, the plugin falls back to inferring the next
 # task from the agent's own todo rendering, gated only by confidence_thresholds

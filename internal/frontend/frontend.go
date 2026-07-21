@@ -1880,6 +1880,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
 	{Key: "tui.terminal_bell", TUIEditable: true},
+	{Key: "cli.ai_agent_friendly_output", TUIEditable: true},
 }
 
 // ConfigFieldKeys lists every scalar config field editable via SetField, in
@@ -2033,6 +2034,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return cfg.TUI.Theme
 	case "tui.terminal_bell":
 		return strconv.FormatBool(cfg.TUI.TerminalBell)
+	case "cli.ai_agent_friendly_output":
+		return strconv.FormatBool(cfg.CLI.AIAgentFriendlyOutput)
 	}
 	return ""
 }
@@ -2269,6 +2272,13 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("tui.terminal_bell must be true or false, got %q", value)
 			}
 			cfg.TUI.TerminalBell = v
+			return nil
+		case "cli.ai_agent_friendly_output":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("cli.ai_agent_friendly_output must be true or false, got %q", value)
+			}
+			cfg.CLI.AIAgentFriendlyOutput = v
 			return nil
 		}
 		return fmt.Errorf("unknown config field %q", key)
