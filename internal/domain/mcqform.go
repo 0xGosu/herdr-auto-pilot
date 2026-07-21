@@ -137,9 +137,22 @@ func ParseMCQForm(agentType, pane string) (MCQFormState, bool) {
 // first checkbox is ticked while still standing and still owed an answer, and
 // demanding ☐ made delivery lose the form it was mid-way through answering.
 // A checkbox test alone is wrong too: a single-select one-question form has no
-// boxes at all. The pairing still can not separate a stale MULTI-SELECT form's
-// header from a live one below it; that residue is left to the delivery-time
-// tab-count and per-tab question checks.
+// boxes at all.
+//
+// Neither signal proves the header is live — an unanswered form's ☐ header
+// left in scrollback above an ordinary menu would satisfy the first. Measured
+// live (2026-07-21, Claude Code v2.1.215) that pairing does not arise on the
+// VISIBLE pane: submitting a form replaces the whole widget with "User
+// answered Claude's questions", ESC-cancelling it with "User declined to
+// answer questions", and in both cases the header line is gone; the plain
+// permission menu that follows carries no header at all. A consuming "recent"
+// read can still hold an older render, so the guarantee that matters is
+// downstream, not here: every path that sends a keystroke re-reads the visible
+// pane and refuses before pressing anything (daemon.sweepFrames checks its
+// first frame BEFORE its first arrow — see
+// TestSweepFailsClosedWhenVisiblePaneIsNotTheForm — and seriesStale,
+// reverifyMultiSelect, mcqdeliver and the frontend confirm path all re-read
+// too). Over-claiming here therefore costs an escalation, never a keystroke.
 func MultiTabForm(pane string) (tabs int, ok bool) {
 	headers := mcqTabHeaderRE.FindAllStringIndex(pane, -1)
 	if len(headers) == 0 {

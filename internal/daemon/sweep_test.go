@@ -368,6 +368,37 @@ func TestMultiTabSweepMultiSelectForeignSelectionEscalates(t *testing.T) {
 	}
 }
 
+// A classification that over-claims a multi-tab form must cost nothing but an
+// escalation. The consuming "recent" read the classifier uses can carry an
+// older render, so a stale tab header above an ordinary live menu can make
+// MultiTabForm true there — the text alone can not rule it out. Every path
+// that sends a keystroke re-reads the VISIBLE pane first, and this pins that:
+// the sweep's first frame check runs BEFORE its first arrow, so a pane that no
+// longer shows the form degrades to escalation with nothing pressed.
+//
+// (Verified live 2026-07-21, Claude Code v2.1.215: this pairing does not occur
+// on the visible pane at all — submitting or ESC-cancelling a form replaces the
+// whole widget, header included, and the plain permission menu that follows
+// carries no header. The guard is for the reads that can still see scrollback.)
+func TestSweepFailsClosedWhenVisiblePaneIsNotTheForm(t *testing.T) {
+	h := newHarness(t, "")
+	// Classified as a 2-tab form (a stale header sat above the live menu in the
+	// classification read) — but the live pane is an ordinary permission menu.
+	s := sweptSituationFrom(t, mcqMultiFrames)
+	s.AgentID, s.PaneID = "agent-stale-header", "agent-stale-header"
+	h.herdr.setFrames([]string{
+		"Bash command\n\ntouch /tmp/x\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n\n" +
+			"Esc to cancel · Tab to amend · ctrl+e to explain\n",
+	})
+
+	if _, err := h.daemon.sweepFrames(context.Background(), h.herdr, s, checkBaseline{}); err == nil {
+		t.Fatal("the sweep must refuse a pane that no longer shows the form")
+	}
+	if keys := h.herdr.keysSent(); len(keys) != 0 {
+		t.Errorf("no keystroke may reach an ordinary menu misread as a form, got %v", keys)
+	}
+}
+
 // SAFETY INVARIANT: without evidence that the ticks are hap's own, a form
 // carrying a SUBSET of what the answer chose is refused — it may be an
 // operator halfway through ticking that very form, and completing it would
