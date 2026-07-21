@@ -137,16 +137,25 @@ pane_excerpt_chars = 5000          # pane context included in the consult
 # that case, so task_generate_command is always used, never *_start. Without
 # both set, an exhausted source escalates a confirmable @noop suggestion
 # ("No more pending tasks") instead of the old "none" prompt.
+#
+# The command can DECLINE: replying with "@noop" (also "noop", "no_op",
+# "no-op") means "no new task is needed". As the WHOLE reply it escalates as a
+# confirmable "do nothing" and confirming it learns a @noop rule. The sentinel
+# line is always stripped, so it is never written into the task list (and so
+# never typed into a pane by a later confirm --send) — but anything beside it
+# still counts as work, so ask for the sentinel alone. An EMPTY reply is not a
+# decline (it looks like a crashed CLI) and stays a retryable failure. The
+# prompt must name the sentinel for the model to ever use it.
 # (Renamed from generate_task_command; the old key no longer loads — update it.)
 task_generate_command = [
   "claude", "--model", "opus", "-p",
-  "Suggest up to 3 concrete next tasks for this project's coding agent, in priority order. Reply ONLY with tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
+  "Suggest up to 3 concrete next tasks for this project's coding agent, in priority order. Reply ONLY with tasks, one per line. If no new task is needed, reply with exactly @noop and nothing else.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
 ]
 
 # ── Idle task suggestion — OpenAI Codex (commented; swap in to use codex) ──
 # task_generate_command = [
 #   "codex", "--model", "gpt-5.6-sol", "exec", "--skip-git-repo-check",
-#   "Suggest up to 3 concrete next tasks for this project's coding agent, in priority order. Reply ONLY with tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
+#   "Suggest up to 3 concrete next tasks for this project's coding agent, in priority order. Reply ONLY with tasks, one per line. If no new task is needed, reply with exactly @noop and nothing else.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
 # ]
 
 # task_generate_command_start runs INSTEAD on the agent's first task generation

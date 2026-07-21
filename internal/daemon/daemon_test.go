@@ -2630,6 +2630,159 @@ func TestIdleGeneratesTaskSuggestionEscalation(t *testing.T) {
 	}
 }
 
+func TestIdleTaskGenNoopParksInsteadOfPersisting(t *testing.T) {
+	// The model's explicit decline must NOT be written into a checklist as a
+	// literal "@noop" task, and must NOT masquerade as a broken CLI: it
+	// surfaces as the human-readable noop suggestion, which the confirm path
+	// round-trips to a learned @noop.
+	for _, raw := range []string{"@noop", "  @noop\n", "- @noop", "`@noop`", "NO-OP", "```\n@noop\n```", "- @noop\n- noop"} {
+		t.Run(strings.ReplaceAll(strings.TrimSpace(raw), "\n", "|"), func(t *testing.T) {
+			h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+				return raw, nil
+			})
+			h.herdr.setPane("Task is complete.\n")
+
+			ctx := context.Background()
+			h.push("agent-20", "idle")
+			var esc []domain.AuditRecord
+			waitFor(t, 3*time.Second, func() bool {
+				esc, _ = h.raw.PendingEscalations(ctx)
+				return len(esc) == 1
+			})
+			if esc[0].Suggestion != domain.ActionNoopSuggestion {
+				t.Errorf("suggestion = %q, want the noop suggestion %q",
+					esc[0].Suggestion, domain.ActionNoopSuggestion)
+			}
+			if strings.HasPrefix(esc[0].Suggestion, domain.SuggestTaskPrefix) {
+				t.Error("a decline must never be surfaced as a confirmable generated task")
+			}
+			// The CLI worked, so offering `l: retry LLM` would only re-ask a
+			// model that already answered.
+			if domain.IsRetryableLLMEscalation(&esc[0]) {
+				t.Errorf("a decline must not be retryable, got rationale %q", esc[0].Rationale)
+			}
+			if strings.Contains(esc[0].Rationale, string(domain.ReasonTaskGenFailed)) {
+				t.Errorf("a decline must not be tagged as a failure, got %q", esc[0].Rationale)
+			}
+			// Confirming it learns @noop, never the literal sentinel text.
+			if got := suggestionAction(&esc[0]); got != domain.ActionNoop {
+				t.Errorf("suggestionAction = %q, want %q", got, domain.ActionNoop)
+			}
+			if len(h.herdr.sentInputs()) != 0 {
+				t.Errorf("nothing may be sent to the pane, sent %v", h.herdr.sentInputs())
+			}
+			if pending, _ := h.raw.HasPendingLLMConsult(ctx, "agent-20"); pending {
+				t.Error("a resolved task generation must not leave a pending request")
+			}
+		})
+	}
+}
+
+func TestIdleTaskGenStripsNoopFromRealTasks(t *testing.T) {
+	// A model told to reply "@noop" often adds real tasks (or a justification)
+	// beside it. The real work must survive, but the sentinel must NEVER reach
+	// the suggestion — from there a confirm --send would type the literal
+	// "@noop" into the agent's pane.
+	cases := map[string]string{
+		"- @noop\n- Add the missing parser tests": "- Add the missing parser tests",
+		"- Add the missing parser tests\n- @noop": "- Add the missing parser tests",
+	}
+	for raw, wantTask := range cases {
+		t.Run(strings.ReplaceAll(raw, "\n", "|"), func(t *testing.T) {
+			h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+				return raw, nil
+			})
+			h.herdr.setPane("Task is complete.\n")
+
+			ctx := context.Background()
+			h.push("agent-20", "idle")
+			var esc []domain.AuditRecord
+			waitFor(t, 3*time.Second, func() bool {
+				esc, _ = h.raw.PendingEscalations(ctx)
+				return len(esc) == 1
+			})
+			if want := domain.SuggestTaskPrefix + wantTask; esc[0].Suggestion != want {
+				t.Errorf("suggestion = %q, want %q", esc[0].Suggestion, want)
+			}
+			// Belt and braces: whatever the confirm path would write must not
+			// contain the sentinel.
+			confirmable := strings.TrimPrefix(esc[0].Suggestion, domain.SuggestTaskPrefix)
+			for _, task := range domain.NormalizeGeneratedTasks(confirmable) {
+				if domain.IsNoopAction(domain.NormalizeNoopAction(task)) {
+					t.Errorf("sentinel survived into confirmable task %q", task)
+				}
+			}
+		})
+	}
+}
+
+func TestIdleTaskGenUnusableOutputIsRetryableEscalation(t *testing.T) {
+	// Output that is non-empty but parses to no task (a bare horizontal rule,
+	// punctuation only) used to become a confirmable escalation that could
+	// ONLY fail at confirm time. It is a broken CLI, so it is retryable —
+	// unlike the decline above, which is the CLI working as asked.
+	for _, raw := range []string{"---", "***", "- \n- ", "..."} {
+		t.Run(strings.TrimSpace(raw), func(t *testing.T) {
+			h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+				return raw, nil
+			})
+			h.herdr.setPane("Task is complete.\n")
+
+			ctx := context.Background()
+			h.push("agent-21", "idle")
+			var esc []domain.AuditRecord
+			waitFor(t, 3*time.Second, func() bool {
+				esc, _ = h.raw.PendingEscalations(ctx)
+				return len(esc) == 1
+			})
+			if strings.HasPrefix(esc[0].Suggestion, domain.SuggestTaskPrefix) {
+				t.Errorf("unusable output must not be confirmable, got suggestion %q", esc[0].Suggestion)
+			}
+			if esc[0].Suggestion == domain.ActionNoopSuggestion {
+				t.Error("unusable output is a broken CLI, not a decline")
+			}
+			if !domain.IsRetryableLLMEscalation(&esc[0]) {
+				t.Errorf("unusable output should be retryable, got rationale %q", esc[0].Rationale)
+			}
+		})
+	}
+}
+
+func TestIdleTaskGenEscalatesRawSoConfirmParsesOnce(t *testing.T) {
+	// The daemon must NOT pre-normalize: NormalizeGeneratedTasks is not
+	// idempotent, so a normalized "1. Fix the parser" would re-read as an
+	// ordered-list marker on the confirm path's own parse and silently drop
+	// the unmarked item beside it. Escalating the raw text keeps that to one
+	// pass. The sentinel line is still removed.
+	h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return "- 1. Fix the parser\n- Add tests\n- @noop", nil
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	h.push("agent-20", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	want := domain.SuggestTaskPrefix + "- 1. Fix the parser\n- Add tests"
+	if esc[0].Suggestion != want {
+		t.Fatalf("suggestion = %q, want the raw (sentinel-stripped) %q", esc[0].Suggestion, want)
+	}
+	// What the confirm path would actually write: both tasks, neither lost.
+	got := domain.NormalizeGeneratedTasks(strings.TrimPrefix(esc[0].Suggestion, domain.SuggestTaskPrefix))
+	wantTasks := []string{"1. Fix the parser", "Add tests"}
+	if len(got) != len(wantTasks) {
+		t.Fatalf("confirm would write %q, want %q", got, wantTasks)
+	}
+	for i := range wantTasks {
+		if got[i] != wantTasks[i] {
+			t.Errorf("task %d = %q, want %q", i, got[i], wantTasks[i])
+		}
+	}
+}
+
 func TestIdleTaskGenFailureIsRetryableEscalation(t *testing.T) {
 	// A failed generation surfaces the rationale and is retryable with `l`.
 	h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {

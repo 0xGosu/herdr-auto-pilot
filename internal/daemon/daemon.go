@@ -2403,6 +2403,48 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 		return
 	}
 
+	// Drop the noop sentinel before anything else looks at the text, so it can
+	// never be written into a checklist — and later typed into a pane — as if
+	// it were work. What is left is still RAW: the confirm path normalizes, and
+	// NormalizeGeneratedTasks is not idempotent, so pre-normalizing here would
+	// make the two passes disagree and silently drop items (see
+	// StripNoopGeneratedLines).
+	task, declined := domain.StripNoopGeneratedLines(res.task)
+
+	// Parse only to VALIDATE. Output that yields no task (a bare horizontal
+	// rule, a punctuation-only reply) would otherwise become a confirmable
+	// escalation that can ONLY fail when the operator acts on it — the confirm
+	// path runs this same parse and refuses. Deciding it here keeps the two
+	// verdicts ("is there a task" / "can this be confirmed") from disagreeing.
+	if len(domain.NormalizeGeneratedTasks(task)) == 0 {
+		// Nothing but sentinels: the model's explicit decline. Park the
+		// situation by suggesting the human-readable noop (never the raw
+		// sentinel), matching the exhausted-source escalation in domain.Decide
+		// — confirming it learns a plain @noop rule through the existing
+		// SuggestedAction round-trip. Deliberately NOT ReasonTaskGenFailed: the
+		// CLI worked, so offering `l: retry LLM` would only re-ask a model that
+		// already answered. Note this rides on res.reason, so a decline for an
+		// exhausted DECLARED source learns an operator-backed noop over that
+		// source — which takes precedence in Decide but still yields to real
+		// pending items (ReasonNoopVsPendingTasks), so a later refill is not
+		// parked by it.
+		if declined {
+			d.escalate(ctx, s, res.sig, domain.Decision{
+				Action: domain.ActionEscalate, Reason: res.reason,
+				Rationale:  "generate-task declined: no new task needed",
+				Suggestion: domain.ActionNoopSuggestion,
+			}, res.tr, now)
+			return
+		}
+		// No sentinel and no task IS a broken CLI — keep it retryable so
+		// `l: retry LLM` can re-ask.
+		d.escalate(ctx, s, res.sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonTaskGenFailed,
+			Rationale: "generate-task produced no usable task",
+		}, res.tr, now)
+		return
+	}
+
 	// Success: surface the suggestion for confirmation. The reason carries
 	// what triggered this generation (no_task_source, or
 	// task_source_exhausted for a declared source that ran out) so the
@@ -2410,7 +2452,7 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 	// — while the suggestion carries the generated task for the confirm path.
 	d.escalate(ctx, s, res.sig, domain.Decision{
 		Action: domain.ActionEscalate, Reason: res.reason,
-		Suggestion: domain.SuggestTaskPrefix + res.task,
+		Suggestion: domain.SuggestTaskPrefix + task,
 	}, res.tr, now)
 }
 

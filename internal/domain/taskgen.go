@@ -185,6 +185,60 @@ func NormalizeGeneratedTasks(raw string) []string {
 	return tasks
 }
 
+// StripNoopGeneratedLines removes the noop sentinel from a generate-task CLI's
+// raw stdout, returning the remaining text and whether any sentinel was found.
+// The sentinel is the model's explicit "no new task is needed" decline — the
+// ONLY way a generation can decline without looking like a broken CLI, since an
+// empty response is indistinguishable from a crashed or misconfigured command
+// (that stays a retryable ReasonTaskGenFailed). A response that is NOTHING but
+// sentinels leaves no text, which is how the caller recognizes the decline and
+// routes it to an ActionNoopSuggestion escalation instead.
+//
+// It works LINE-WISE on the raw text rather than on NormalizeGeneratedTasks'
+// output for two reasons. First, the sentinel must never survive into the task
+// list: a model told to reply "@noop" often adds a line of justification, and
+// judging the response as a whole would then classify it as real work and write
+// "@noop" into tasks.md — where a later confirm --send would type the literal
+// sentinel into the agent's pane. Dropping just the sentinel line closes that
+// regardless of what else the model said. Second, the remaining text stays RAW
+// so the confirm path normalizes exactly once; NormalizeGeneratedTasks is not
+// idempotent (a normalized "1. Fix parser" re-reads as an ordered-list marker,
+// which would flip a second pass into list mode and silently drop the unmarked
+// items beside it), so the daemon must not hand it pre-normalized text.
+//
+// A line is a sentinel when its bare task text — marker and Markdown emphasis
+// stripped, exactly as NormalizeGeneratedTasks would reduce it — is one of
+// NormalizeNoopAction's spellings ("@noop", "noop", "no_op", "no-op",
+// case-insensitive). Reusing that keeps this in step with the consult path's
+// sentinel rather than defining a second one. Fence lines are left alone; the
+// parser skips them anyway.
+func StripNoopGeneratedLines(raw string) (string, bool) {
+	lines := strings.Split(raw, "\n")
+	kept := make([]string, 0, len(lines))
+	sawNoop := false
+	for _, line := range lines {
+		if !isFenceLine(line) && isNoopLine(line) {
+			sawNoop = true
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n")), sawNoop
+}
+
+// isNoopLine reports whether one raw line reduces to the noop sentinel. It
+// mirrors NormalizeGeneratedTasks' per-line reduction (optional list/checkbox
+// marker, then inline emphasis) so "@noop", "- @noop", "`@noop`" and
+// "- [ ] NO-OP" are all recognized.
+func isNoopLine(line string) bool {
+	t := line
+	if m := listItemRE.FindStringSubmatch(line); m != nil {
+		t = m[1]
+	}
+	t = strings.TrimSpace(stripInlineEmphasis(strings.TrimSpace(t)))
+	return IsNoopAction(NormalizeNoopAction(t))
+}
+
 // hasAlphanumeric reports whether s contains any letter or digit.
 func hasAlphanumeric(s string) bool {
 	for _, r := range s {

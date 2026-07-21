@@ -721,11 +721,28 @@ flow. Dismiss it with `x`; if generation failed or timed out, press `l` to
 retry. Suggestions are dropped or refused if the agent has started working, or
 now has a task source with a real pending item, in the meantime.
 
+The command can also decline: replying with `@noop` (also accepted: `noop`,
+`no_op`, `no-op`, in any case, optionally bulleted or in a code span) means "no
+new task is needed". When that is the *whole* reply it escalates as a
+confirmable `do nothing (no reply needed)`, and confirming it learns a `@noop`
+rule that parks the situation. Tell the model about the sentinel in your
+prompt, or it will never use it.
+
+The sentinel line is always stripped, so `@noop` is never written into the task
+list — and so can never be typed into an agent's pane by a later
+`confirm --send`. Anything the model puts *beside* it is still treated as work,
+so a reply like `@noop` followed by a line of explanation queues that
+explanation as a task; ask for the sentinel alone.
+
+An *empty* reply is not a decline: it is indistinguishable from a crashed or
+misconfigured CLI, so it stays a retryable failure. Output that parses to no
+task at all (a bare `---`, punctuation only) is treated the same way.
+
 ```toml
 [llm]
 task_generate_command = [
   "claude", "-p",
-  "Suggest concrete next tasks, most important first. Reply with only the tasks, one per line.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
+  "Suggest concrete next tasks, most important first. Reply with only the tasks, one per line. If no new task is needed, reply with exactly @noop and nothing else.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
   "--model", "haiku",
 ]
 # Optional first generation for each agent this daemon lifetime:
