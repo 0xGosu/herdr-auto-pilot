@@ -523,8 +523,10 @@ each idle episode is driven exactly once — so an agent that finishes its work
 and sits there without a further event waits for you.
 
 Set `enable_auto_send_task_when_idle = true` on a source — or add the source
-with `hap task-source add --auto-send-when-idle <checklist.md>`, or type
-`--auto-send-when-idle` in the *Config* tab's `t` prompt — and the daemon also
+with `hap task-source add --auto-send-when-idle <checklist.md>`, type
+`--auto-send-when-idle` in the *Config* tab's `t` prompt, or flip it on an
+existing source with `hap task-source set <index> auto-send-when-idle true`
+(the *Config* tab's `enter` on a task-source row does the same) — and the daemon also
 polls once a minute: any agent that source matches which has been idle for
 more than a minute is handed its next pending `[ ]` item. Delivery goes
 through the normal pipeline, so the kill switch, never-auto patterns, rate
@@ -566,6 +568,7 @@ hap enable backend-dev          # allow automation again
 hap task-source --agent backend-dev ./docs/backend-tasks.md
 hap task-source --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
 hap task-source --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.md
+hap task-source --agent backend-dev --max-tasks 40 ./docs/backend-tasks.md
 ```
 
 `hap agents` output is tab-separated and gained a sixth column — the agent's
@@ -684,7 +687,11 @@ more onto an already-long list. The **same cap also gates manual creation** —
 adding tasks (the Tasks tab's `a`, or `hap task … add`) to a registered source
 is rejected once it would push the list past `max_tasks` — so a hand-added list
 can't grow past what the daemon would then refuse to refill. Prune the checklist
-(or raise `max_tasks` on the `[[task_sources]]` entry) to resume. Sending the
+(or raise `max_tasks` — `hap task-source set <index> max-tasks 40`, the *Config*
+tab's `enter` on the source row, or the `[[task_sources]]` entry) to resume. The
+cap can also be chosen when the source is created: `hap task-source add
+--max-tasks 40 <checklist.md>`, or `--max-tasks 40` in the *Config* tab's `t`
+prompt. Sending the
 remaining pending items of a source under its cap is unaffected, and a `--path`
 file that isn't a registered `[[task_sources]]` entry is never capped.
 

@@ -105,6 +105,16 @@ type openAddPromptMsg struct {
 	id int64
 }
 
+// openTaskSourceFieldMsg re-opens a prompt for the VALUE of the task-source
+// setting the operator just picked (enter on a Config task-source row opens a
+// picker of settings first). Chained through a message for the same reason as
+// the two above: a picker's onSubmit returns a tea.Cmd, not a model.
+type openTaskSourceFieldMsg struct {
+	index    int
+	expected config.TaskSource // the row as it was listed, the stale-listing guard
+	field    string            // tsFieldAutoSend | tsFieldMaxTasks
+}
+
 // statusNote is a durable action outcome shown in the status area until the
 // next mutating action starts (or a later outcome replaces it) — unlike the
 // transient m.message hint line, navigation and read-only actions never clear
@@ -665,9 +675,14 @@ func (m Model) taskRows() []taskRow {
 				if m.taskMarks[taskMarkKey(g.Index, it.Index)] {
 					markCh = "✓ "
 				}
+				// Displayed and searched with the id's markdown escapes removed
+				// ("8\.1" → "8.1"), so what is on screen is what `hap task done`
+				// takes. itemText below stays RAW — it identifies the line in the
+				// file for edit/send, and must match it byte for byte.
+				shown := domain.DisplayTaskText(it.Text)
 				rows = append(rows, taskRow{
-					text:       fmt.Sprintf("%s#%d [%s] %s", markCh, it.Index, it.Mark, oneLine(it.Text, max(20, m.contentWidth()-12))),
-					fields:     append([]string{fmt.Sprintf("#%d", it.Index), it.Text, it.Mark}, hfields...),
+					text:       fmt.Sprintf("%s#%d [%s] %s", markCh, it.Index, it.Mark, oneLine(shown, max(20, m.contentWidth()-12))),
+					fields:     append([]string{fmt.Sprintf("#%d", it.Index), shown, it.Mark}, hfields...),
 					done:       it.Done,
 					inProgress: it.Mark == domain.MarkInProgress,
 					group:      g.Index,
@@ -865,6 +880,10 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		if src.EnableAutoSendTaskWhenIdle {
 			label += "  auto_send_when_idle=true"
 		}
+		// Always shown, resolved through MaxTasksLimit so the row names the cap
+		// the daemon actually enforces — and so the operator can see what enter
+		// is about to edit.
+		label += fmt.Sprintf("  max_tasks=%d", src.MaxTasksLimit())
 		items = append(items, ruleItem{
 			kind: "source", index: i, value: src.Path,
 			label: label,
@@ -1013,6 +1032,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.openSendPrompt(msg.id, msg.action)
 	case openAddPromptMsg:
 		return m.openAddPrompt(msg.id)
+	case openTaskSourceFieldMsg:
+		return m.openTaskSourceFieldPrompt(msg)
 	case tickMsg:
 		return m, tea.Batch(m.refresh(), tick())
 	case clockTickMsg:
@@ -2134,13 +2155,13 @@ func (m Model) removeTaskSourcePrompt(group int) (tea.Model, tea.Cmd) {
 		m.message = reason
 		return m, nil
 	}
-	// g.Index is the config index and g.Source.Path the raw (untruncated)
-	// path the header only displays abbreviated — RemoveTaskSource re-checks
-	// both, so a config that shifted underneath aborts instead of removing a
-	// neighbour.
+	// g.Index is the config index and g.Source the entry as it was listed
+	// (its raw, untruncated path plus both selectors) — RemoveTaskSource
+	// re-checks all of them, so a config that shifted underneath aborts
+	// instead of removing a neighbour.
 	remove := m.do(fmt.Sprintf("task source #%d removed (checklist file kept)", g.Index),
 		func(c context.Context) error {
-			return app.RemoveTaskSource(c, g.Index, g.Source.Path)
+			return app.RemoveTaskSource(c, g.Index, g.Source)
 		})
 	// A source with no path configured has no file name to name it by.
 	name := filepath.Base(g.Source.Path)
@@ -2409,8 +2430,9 @@ func (m Model) taskDetailLines(r taskRow, width int) []string {
 	lines = m.detailField(lines, w, "Task", fmt.Sprintf("#%d", r.item))
 	lines = m.detailField(lines, w, "Status", status)
 	// Stored literal `\n` sequences render as real line breaks here — the
-	// detail shows the task as the agent will receive it.
-	lines = m.detailField(lines, w, "Text", domain.DecodeTaskNewlines(r.itemText))
+	// detail shows the task as the agent will receive it. The id is unescaped
+	// like the list row, so both show the id `hap task done` takes.
+	lines = m.detailField(lines, w, "Text", domain.DecodeTaskNewlines(domain.DisplayTaskText(r.itemText)))
 	lines = m.detailField(lines, w, "Source file", r.path)
 	if r.group < len(m.data.tasks) {
 		src := m.data.tasks[r.group].Source
@@ -3402,6 +3424,8 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	case "shortcut":
 		m.message = "press enter to run this quick shortcut"
 		return m, nil
+	case "source":
+		return m.editTaskSourcePrompt(item.index, item.value)
 	case "field":
 	default:
 		return m, nil
@@ -3451,6 +3475,130 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// Task-source setting labels, shared by the picker and the message that
+// carries the choice to the value prompt.
+const (
+	tsFieldAutoSend = "auto_send_when_idle"
+	tsFieldMaxTasks = "max_tasks"
+)
+
+// editTaskSourcePrompt opens the settings picker for task source #index
+// (enter on a Config task-source row). Only the two settings worth flipping
+// after the fact are offered: path/agent/workspace are remove-and-re-add,
+// because changing them silently re-points an agent's work. The chosen setting
+// then gets its own value prompt (openTaskSourceFieldMsg) — a picker cannot
+// open a second prompt itself.
+func (m Model) editTaskSourcePrompt(index int, path string) (tea.Model, tea.Cmd) {
+	src, ok := m.taskSourceAt(index, path)
+	if !ok {
+		m.message = "task source is no longer listed — refresh and retry"
+		return m, nil
+	}
+	// Each option carries the field key it selects, so adding a third setting
+	// can never fall through to editing max_tasks by default.
+	fields := []struct{ key, label string }{
+		{tsFieldAutoSend, fmt.Sprintf("%s (currently %v)", tsFieldAutoSend, src.EnableAutoSendTaskWhenIdle)},
+		{tsFieldMaxTasks, fmt.Sprintf("%s (currently %d)", tsFieldMaxTasks, src.MaxTasksLimit())},
+	}
+	opts := make([]string, len(fields))
+	for i, f := range fields {
+		opts[i] = f.label
+	}
+	m.message = ""
+	m.openPrompt(&prompt{
+		label:   fmt.Sprintf("edit task source #%d — pick a setting (↑/↓ then enter)", index),
+		options: opts,
+		onSubmit: func(input string) tea.Cmd {
+			for _, f := range fields {
+				if input == f.label {
+					return func() tea.Msg {
+						return openTaskSourceFieldMsg{index: index, expected: src, field: f.key}
+					}
+				}
+			}
+			return func() tea.Msg {
+				return actionResultMsg{err: fmt.Errorf("unknown task source setting %q", input)}
+			}
+		},
+	})
+	return m, nil
+}
+
+// taskSourceAt returns task source #index when it is still the row the caller
+// listed (same path), so an edit opened against a refreshed config is refused
+// before it can prompt with somebody else's values.
+func (m Model) taskSourceAt(index int, path string) (config.TaskSource, bool) {
+	if index < 0 || index >= len(m.data.cfg.TaskSources) {
+		return config.TaskSource{}, false
+	}
+	src := m.data.cfg.TaskSources[index]
+	if src.Path != path {
+		return config.TaskSource{}, false
+	}
+	return src, true
+}
+
+// openTaskSourceFieldPrompt asks for the picked setting's new value and
+// applies it. Both writes carry the expected path so a config that changed
+// since the row was listed is refused rather than silently re-targeted.
+func (m Model) openTaskSourceFieldPrompt(msg openTaskSourceFieldMsg) (tea.Model, tea.Cmd) {
+	app, ctx := m.app, m.ctx
+	index, expected := msg.index, msg.expected
+	// A refresh can land between the picker and this prompt: re-check the row
+	// rather than prompting with the zero value's misleading defaults.
+	current, ok := m.taskSourceAt(index, expected.Path)
+	if !ok {
+		m.message = "task source is no longer listed — refresh and retry"
+		return m, nil
+	}
+	m.beginAction()
+	if msg.field == tsFieldAutoSend {
+		// A picker, not free text: this is the one source setting that makes
+		// hap hand out work unprompted, so "true" is chosen from a list rather
+		// than typed (and mistyped) into a yes/no box.
+		opts := []string{"false", "true"}
+		idx := 0
+		if current.EnableAutoSendTaskWhenIdle {
+			idx = 1
+		}
+		m.openPrompt(&prompt{
+			label:   fmt.Sprintf("task source #%d %s (↑/↓ then enter, currently %v)", index, tsFieldAutoSend, current.EnableAutoSendTaskWhenIdle),
+			options: opts,
+			optIdx:  idx,
+			onSubmit: func(input string) tea.Cmd {
+				on := input == "true"
+				return func() tea.Msg {
+					if err := app.SetTaskSourceAutoSend(ctx, index, expected, on); err != nil {
+						return actionResultMsg{err: err}
+					}
+					if on {
+						return actionResultMsg{message: fmt.Sprintf("task source #%d: auto-send when idle ON", index)}
+					}
+					return actionResultMsg{message: fmt.Sprintf("task source #%d: auto-send when idle off", index)}
+				}
+			},
+		})
+		return m, nil
+	}
+	m.openPrompt(&prompt{
+		label: fmt.Sprintf("task source #%d %s (whole number, 1 or more)", index, tsFieldMaxTasks),
+		input: strconv.Itoa(current.MaxTasksLimit()),
+		onSubmit: func(input string) tea.Cmd {
+			return func() tea.Msg {
+				n, err := strconv.Atoi(strings.TrimSpace(input))
+				if err != nil {
+					return actionResultMsg{err: fmt.Errorf("invalid max_tasks %q — a whole number of tasks", input)}
+				}
+				if err := app.SetTaskSourceMaxTasks(ctx, index, expected, n); err != nil {
+					return actionResultMsg{err: err}
+				}
+				return actionResultMsg{message: fmt.Sprintf("task source #%d: max_tasks=%d", index, n)}
+			}
+		},
+	})
+	return m, nil
+}
+
 // configFieldChoices returns the fixed value set for an enum-valued config
 // field (rendered as a picker in the TUI), or ok=false for free-value fields.
 func configFieldChoices(key string) (choices []string, ok bool) {
@@ -3483,25 +3631,44 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
 	m.openPrompt(&prompt{
-		label: "add task source: <path> [agent] [workspace] [--auto-send-when-idle]",
+		label: "add task source: <path> [agent] [workspace] [--auto-send-when-idle] [--max-tasks N]",
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
-				// Spelled exactly like the CLI flag, and accepted in any
-				// position so the operator never has to remember the order.
+				// Flags are spelled exactly like the CLI's and accepted in any
+				// position, so the operator never has to remember the order.
 				// Any OTHER dashed word is refused rather than taken as a
 				// field: silently storing "--auto-send-when-idl" as the path
 				// would leave the operator believing unprompted hand-out is
 				// on when it is off.
 				var opts []frontend.TaskSourceOption
 				var parts []string
-				for _, f := range strings.Fields(input) {
+				fields := strings.Fields(input)
+				maxTasks := config.DefaultMaxTasks
+				for i := 0; i < len(fields); i++ {
+					f := fields[i]
 					if f == "--auto-send-when-idle" {
 						opts = append(opts, frontend.AutoSendWhenIdle())
 						continue
 					}
+					// --max-tasks takes a value, written either way round:
+					// "--max-tasks 40" or "--max-tasks=40".
+					if value, ok := maxTasksFlagValue(fields, &i); ok {
+						if value == "" {
+							return actionResultMsg{err: fmt.Errorf(
+								"--max-tasks needs a value (e.g. --max-tasks 40)")}
+						}
+						n, err := strconv.Atoi(value)
+						if err != nil {
+							return actionResultMsg{err: fmt.Errorf(
+								"invalid --max-tasks %q — a whole number of tasks", value)}
+						}
+						opts = append(opts, frontend.MaxTasks(n))
+						maxTasks = n
+						continue
+					}
 					if strings.HasPrefix(f, "-") {
 						return actionResultMsg{err: fmt.Errorf(
-							"unknown flag %q — this prompt takes only --auto-send-when-idle (spelled exactly, no =value); use the CLI for anything else", f)}
+							"unknown flag %q — this prompt takes --auto-send-when-idle (spelled exactly, no =value) and --max-tasks N (or --max-tasks=N); use the CLI for anything else", f)}
 					}
 					parts = append(parts, f)
 				}
@@ -3522,14 +3689,49 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 				if err := app.AddTaskSource(ctx, agent, workspace, parts[0], "", opts...); err != nil {
 					return actionResultMsg{err: err}
 				}
-				if len(opts) > 0 {
-					return actionResultMsg{message: "task source added (auto-send when idle ON)"}
+				// Both settings are echoed back: an operator who typed a flag
+				// needs to see it was parsed, not mis-read as a positional
+				// field. Matches the CLI's success line.
+				msg := fmt.Sprintf("task source added (max_tasks=%d)", maxTasks)
+				if autoSendRequested(fields) {
+					msg += " (auto-send when idle ON)"
 				}
-				return actionResultMsg{message: "task source added"}
+				return actionResultMsg{message: msg}
 			}
 		},
 	})
 	return m, nil
+}
+
+// maxTasksFlagValue recognizes the --max-tasks flag at fields[*i] in either
+// spelling ("--max-tasks 40" or "--max-tasks=40"), advancing *i past a
+// separate value word. A trailing "--max-tasks" with nothing after it returns
+// an empty value, which the caller reports as invalid rather than ignoring —
+// silently dropping it would create the source under the default cap.
+func maxTasksFlagValue(fields []string, i *int) (string, bool) {
+	f := fields[*i]
+	if value, ok := strings.CutPrefix(f, "--max-tasks="); ok {
+		return value, true
+	}
+	if f != "--max-tasks" {
+		return "", false
+	}
+	if *i+1 < len(fields) {
+		*i++
+		return fields[*i], true
+	}
+	return "", true
+}
+
+// autoSendRequested reports whether the add prompt's input asked for
+// unprompted hand-out, so the result message can say so.
+func autoSendRequested(fields []string) bool {
+	for _, f := range fields {
+		if f == "--auto-send-when-idle" {
+			return true
+		}
+	}
+	return false
 }
 
 // showSelectedAgentTasks jumps to the Tasks tab for the agent under the
@@ -3693,8 +3895,16 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 			return app.RemoveNeverAutoPattern(c, idx, expected)
 		})
 	case "source":
+		// The row carries only the path; the guard needs the whole entry, so
+		// look it up by (index, path) — a row that no longer matches is
+		// refused here rather than removing whatever moved into its slot.
+		expected, ok := m.taskSourceAt(item.index, item.value)
+		if !ok {
+			m.message = "task source is no longer listed — refresh and retry"
+			return m, nil
+		}
 		m.beginAction()
-		idx, expected := item.index, item.value
+		idx := item.index
 		return m, m.do(fmt.Sprintf("task source #%d removed", idx), func(c context.Context) error {
 			return app.RemoveTaskSource(c, idx, expected)
 		})
@@ -3942,7 +4152,7 @@ func (m Model) helpLine() string {
 	case tabSignatures:
 		return "enter/v: details  x: delete  0: reset  f: filter mode  /: search  " + common
 	case tabConfig:
-		return "enter: edit/run shortcut  e: edit field  a: add pattern  t: add task source  x: remove  X: clear data  " + common
+		return "enter: edit/run shortcut  e: edit field/source  a: add pattern  t: add task source  x: remove  X: clear data  " + common
 	}
 	return common
 }

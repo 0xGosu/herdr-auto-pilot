@@ -1292,3 +1292,34 @@ func TestTasksMarkedItemsWinOverSourceRemoval(t *testing.T) {
 		t.Errorf("source must survive an item delete, got %+v", cfg.TaskSources)
 	}
 }
+
+// TestTasksTabUnescapesDisplayedIDs: a checklist whose ids carry the markdown
+// escape some editors write ("8\.1") must show the plain id — both in the list
+// row and in the detail — so what is on screen is the id `hap task done`
+// takes. The underlying item text stays raw (it identifies the file line).
+func TestTasksTabUnescapesDisplayedIDs(t *testing.T) {
+	m := taskModel(t)
+	m.data.tasks[0].Items = []domain.ChecklistItem{
+		{Index: 1, Mark: " ", Text: `8\.1 commit to a new branch`},
+	}
+	view := m.View()
+	if !strings.Contains(view, "#1 [ ] 8.1 commit to a new branch") {
+		t.Errorf("task row should show the unescaped id:\n%s", view)
+	}
+	if strings.Contains(view, `8\.1`) {
+		t.Errorf("task row must not show the markdown escape:\n%s", view)
+	}
+
+	m = press(t, m, "down", "v")
+	if m.detail == nil {
+		t.Fatal("v on an item row should open the task detail")
+	}
+	detail := m.View()
+	if !strings.Contains(detail, "8.1 commit to a new branch") || strings.Contains(detail, `8\.1`) {
+		t.Errorf("task detail should show the unescaped id:\n%s", detail)
+	}
+	// The row keeps the raw text: it is what matches the line in the file.
+	if got := m.taskRows()[1].itemText; got != `8\.1 commit to a new branch` {
+		t.Errorf("itemText = %q, want the raw file text", got)
+	}
+}

@@ -141,7 +141,11 @@ func (t DeclaredTask) Prompt() string {
 		// so the shorter {task_list_path} would otherwise consume its prefix
 		// and leave a stray "_quoted" in the prompt.
 		"{task_list_path_quoted}", ShellQuote(t.Path),
-		"{next_task_content}", DecodeTaskNewlines(t.Task),
+		// The task reaches the agent with its id unescaped: the agent reads the
+		// id here and types it back at `hap task done`, so showing it "8\.1"
+		// invites a reference nobody typed intentionally. The FILE keeps the
+		// operator's escape — only the outbound copy is normalized.
+		"{next_task_content}", DecodeTaskNewlines(DisplayTaskText(t.Task)),
 		"{task_list_path}", t.Path,
 		"{agent_name}", t.AgentName,
 		"{cwd}", t.Cwd,
@@ -298,6 +302,11 @@ func ParseChecklist(content string) []ChecklistItem {
 // The ID must be followed by whitespace or end of line either way, so "1.1.2"
 // never matches as "1.1".
 //
+// Every dot may arrive BACKSLASH-ESCAPED ("1\. Add…", "2\.3 Add…"): several
+// markdown editors escape a leading "<digits>." automatically so the line is
+// not re-rendered as an ordered list. The escape is a rendering artifact, not
+// part of the id — TaskLabel strips it, so "2\.3" and "2.3" are the same task.
+//
 // The looser multi-level rule does misread a decimal that opens an item ("2.5
 // GB export path" reads as ID 2.5). That is deliberate — requiring a separator
 // would reject the common "1.1 Add…" spelling, which is the whole point — and
@@ -305,7 +314,76 @@ func ParseChecklist(content string) []ChecklistItem {
 // whenever the item at that position carries no ID of its own. An ID wrapped in
 // markdown emphasis ("**1.1** Add…") is out of scope; such a list stays
 // positional.
-var taskLabelRE = regexp.MustCompile(`^(?:(\d+(?:\.\d+)+)[.):]?|(\d+)[.):])(?:\s|$)`)
+var taskLabelRE = regexp.MustCompile(`^(?:(` + taskIDMultiPat + `)` + taskIDSepPat + `?|(\d+)` + taskIDSepPat + `)(?:\s|$)`)
+
+// The task-id syntax lives in these four fragments. Every place that
+// RECOGNIZES an id is built from them — the label parser above, the syntactic
+// screen the CLI runs before touching the file (TaskRefSyntaxOK), the
+// generated "1. " prefix reader and the ordered-list marker stripper in
+// taskgen.go — so widening the syntax once widens it everywhere. Splitting
+// them apart is how the escaped spelling used to parse in the domain but get
+// rejected by the CLI's own copy of the rule. The one deliberate exception is
+// the WRITER, GeneratedTaskItemText, which spells its ". " literally: hap
+// always writes the plain form, and only ever reads back the escaped one.
+const (
+	// taskIDDotPat is one dot inside an id, optionally backslash-escaped:
+	// several markdown editors escape a leading "<digits>." automatically so
+	// the line is not re-rendered as an ordered list.
+	taskIDDotPat = `\\?\.`
+	// taskIDSepPat is the trailing separator an id may carry ("3.", "3)",
+	// "3:"). Only the DOT has an escaped form: a markdown editor escapes a
+	// leading "<digits>." because that renders as an ordered list, and nothing
+	// escapes ")" or ":". Accepting "3\)" here would let the syntax screen pass
+	// a reference the resolver then fails on with a stray backslash — the same
+	// layer disagreement this file exists to prevent, in the other direction.
+	taskIDSepPat = `(?:` + taskIDDotPat + `|[):])`
+	// taskIDMultiPat is a multi-level id ("1.1", "2.3.4") — at least one dot.
+	taskIDMultiPat = `\d+(?:` + taskIDDotPat + `\d+)+`
+	// taskIDPat is any id, single- or multi-level.
+	taskIDPat = `\d+(?:` + taskIDDotPat + `\d+)*`
+)
+
+// taskRefSyntaxRE is the syntactic shape of a task reference: an id (with the
+// trailing separator an agent may copy along) or a position ("#3"). It screens
+// out typos before any I/O; whether a reference names a real task is
+// ResolveTaskRef's call. Built from the same fragments as taskLabelRE, so it
+// can never reject a spelling the label parser accepts — TestTaskRefSyntaxOK
+// and FuzzResolveTaskRef pin that.
+var taskRefSyntaxRE = regexp.MustCompile(`^(?:#\d+|` + taskIDPat + taskIDSepPat + `?)$`)
+
+// positionRE is a bare position, the "#3" form's payload: digits and nothing
+// else. It is the same `\d+` taskRefSyntaxRE screens with.
+var positionRE = regexp.MustCompile(`^\d+$`)
+
+// TaskRefSyntaxOK reports whether ref is even shaped like a task reference.
+// The CLI calls it to reject a typo before reading the checklist file: without
+// it, `done xyz` on a missing file reports the file error instead of the typo
+// that caused it. It is deliberately permissive — ResolveTaskRef owns the real
+// rules.
+func TaskRefSyntaxOK(ref string) bool {
+	return taskRefSyntaxRE.MatchString(strings.TrimSpace(ref))
+}
+
+// NormalizeTaskID removes the backslashes a markdown editor may have inserted
+// before an id's dots ("8\.1" → "8.1"), so an escaped id compares equal to the
+// plain one everywhere ids are matched. ONLY a backslash-dot pair is
+// unescaped: stripping every backslash would turn a ref like `3\4` into "34"
+// and resolve it to a different task, the exact mis-targeting these helpers
+// exist to stop. This is the single normalization every id comparison uses —
+// parsing a label, resolving a reference, and rendering one for display.
+func NormalizeTaskID(s string) string {
+	return strings.ReplaceAll(s, `\.`, ".")
+}
+
+// trimTaskIDSeparator drops the single trailing separator an id may be typed
+// with ("3.4." → "3.4"). It runs on an already-normalized id, so an escaped
+// separator is a plain one by the time it gets here.
+func trimTaskIDSeparator(s string) string {
+	if len(s) > 0 && strings.ContainsAny(s[len(s)-1:], ".):") {
+		return s[:len(s)-1]
+	}
+	return s
+}
 
 // TaskLabel returns the hierarchical task ID an item's text declares, or ""
 // when it declares none. This is the ID a document numbers its own tasks with
@@ -318,9 +396,23 @@ func TaskLabel(text string) string {
 		return ""
 	}
 	if m[1] != "" {
-		return m[1]
+		return NormalizeTaskID(m[1])
 	}
 	return m[2]
+}
+
+// DisplayTaskText renders an item's text for a human (a TUI row, a CLI
+// listing): the backslashes a markdown editor may have inserted into the
+// leading task id ("8\.1 commit…") are dropped, so the id on screen is exactly
+// the id `hap task done 8.1` takes. Only the id prefix is unescaped — the rest
+// of the text is passed through verbatim, and the FILE is never rewritten: the
+// escape is the editor's, and hap has no business normalizing it away.
+func DisplayTaskText(text string) string {
+	prefix := taskLabelRE.FindString(text)
+	if prefix == "" {
+		return text
+	}
+	return NormalizeTaskID(prefix) + text[len(prefix):]
 }
 
 // ErrTaskRefRequired is returned when no task reference was supplied. It names
@@ -355,8 +447,12 @@ func ResolveTaskRef(items []ChecklistItem, ref string) (int, error) {
 		return resolvePosition(items, positional, ref)
 	}
 	// Labels never keep their trailing separator, but an agent copying the id
-	// out of its own task text plausibly types it back with one ("done 3.4.").
-	ref = strings.TrimRight(ref, ".):")
+	// out of its own task text plausibly types it back with one ("done 3.4.") —
+	// or with the markdown escapes the file carries ("done 8\.1"). Exactly ONE
+	// separator is dropped, matching TaskRefSyntaxOK: trimming a run of them
+	// would resolve "1))" here while the CLI screen refuses it, and a reference
+	// the two layers disagree about is a reference nobody can reason about.
+	ref = trimTaskIDSeparator(NormalizeTaskID(ref))
 
 	var matches []int
 	for _, it := range items {
@@ -406,6 +502,12 @@ func noSuchIDErr(ref, occupant string) error {
 // resolvePosition validates a positional task number. raw is the reference as
 // the caller typed it, so the error quotes "#3" rather than "3".
 func resolvePosition(items []ChecklistItem, digits, raw string) (int, error) {
+	// Digits only: strconv.Atoi also accepts a sign, so "+4" would otherwise
+	// resolve here while the CLI's syntactic screen refuses it — the two layers
+	// must agree on what a position even looks like.
+	if !positionRE.MatchString(digits) {
+		return 0, fmt.Errorf("invalid task number %q", raw)
+	}
 	n, err := strconv.Atoi(digits)
 	if err != nil {
 		return 0, fmt.Errorf("invalid task number %q", raw)

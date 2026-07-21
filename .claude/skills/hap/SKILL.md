@@ -464,6 +464,13 @@ this makes hap send without a herdr attention event, so it is opt-in):
 hap task-source add --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.md
 ```
 
+add a task source with a task cap other than the default 20 (see `max_tasks`
+below):
+
+```bash
+hap task-source add --agent backend-dev --max-tasks 40 ./docs/backend-tasks.md
+```
+
 remove a task source by index:
 
 ```bash
@@ -495,11 +502,24 @@ it can be turned on when the source is added, without editing config.toml:
 hap task-source add --agent backend-dev --auto-send-when-idle ./docs/tasks.md
 ```
 
-the TUI's *Config* tab `t` prompt takes the same word:
-`<path> [agent] [workspace] [--auto-send-when-idle]`. it is opt-in everywhere
-and never inferred; existing sources are switched on in config.toml. wherever
-sources are listed (`hap task-source list`, the *Config* tab) an enabled source
-shows `auto_send_when_idle=true`.
+the TUI's *Config* tab `t` prompt takes the same words:
+`<path> [agent] [workspace] [--auto-send-when-idle] [--max-tasks N]`. it is
+opt-in everywhere and never inferred. an EXISTING source is switched on without editing
+config.toml:
+
+```bash
+hap task-source set <index> auto-send-when-idle true   # or false
+hap task-source set <index> max-tasks 40               # the refill/creation cap
+```
+
+the *Config* tab's `enter` on a task-source row is the same edit: it opens a
+picker of the two settings, then asks for the value. both are also settable at
+creation time — `hap task-source add [--auto-send-when-idle] [--max-tasks N]`,
+and the *Config* tab's `t` prompt takes the same words:
+`<path> [agent] [workspace] [--auto-send-when-idle] [--max-tasks N]` (either
+`--max-tasks 40` or `--max-tasks=40`). wherever sources are listed
+(`hap task-source list`, the *Config* tab) an enabled source shows
+`auto_send_when_idle=true`, and every source shows its `max_tasks`.
 
 - one task, one agent: agents matched by the same source get *different*
   pending items, and the delivered item is marked `[-]` as it is sent (a failed
@@ -638,7 +658,7 @@ without a declared task source, the plugin falls back to inferring the next task
 
 if inference finds nothing (no task source and nothing inferable from the pane) and `llm.task_generate_command` is configured, the plugin runs that CLI once to synthesize a next task for the idle agent (placeholders: `{self}`, `{agent_name}`, `{agent_type}`, `{pane_excerpt}`, `{cwd}`). the CLI's stdout is surfaced as an escalation the operator confirms (writing a per-agent `tasks.md`) or dismisses — the plugin never sends a synthesized task unattended. leave `task_generate_command` unset to keep the default: an idle agent with no task source escalates as `no_task_source` and nothing is synthesized. `task_generate_command_start` is the first-interaction variant (empty inherits `task_generate_command`); `task_generate_timeout_seconds` bounds one run (0 inherits `llm.timeout_seconds`).
 
-**`max_tasks` (per `[[task_sources]]`, default 20)** caps how large a source's checklist may grow. once the file holds MORE than `max_tasks` items — done, in-progress, and pending counted alike — and its pending items are exhausted, the daemon logs a warning (`maximum number of tasks reached … skipping task generation`, with the agent name) and skips LLM generation for that agent instead of appending to an already-long list. the **same cap gates manual creation**: adding tasks (the Tasks-tab `a`, or `hap task … add`) to a registered source is rejected once it would push the list past `max_tasks` (`maximum number of tasks reached …`), so a hand-added list can't grow past what the daemon would then refuse to refill. prune the checklist (or raise `max_tasks`) to resume. sending the pending items of an under-cap source is unaffected; the no-task-source bootstrap case (no `[[task_sources]]` entry) and an ad-hoc `--path` file that is not a registered source are never capped.
+**`max_tasks` (per `[[task_sources]]`, default 20)** caps how large a source's checklist may grow. once the file holds MORE than `max_tasks` items — done, in-progress, and pending counted alike — and its pending items are exhausted, the daemon logs a warning (`maximum number of tasks reached … skipping task generation`, with the agent name) and skips LLM generation for that agent instead of appending to an already-long list. the **same cap gates manual creation**: adding tasks (the Tasks-tab `a`, or `hap task … add`) to a registered source is rejected once it would push the list past `max_tasks` (`maximum number of tasks reached …`), so a hand-added list can't grow past what the daemon would then refuse to refill. prune the checklist (or raise `max_tasks` — `hap task-source set <index> max-tasks <n>`, `hap task-source add --max-tasks <n>` at creation time, or the *Config* tab's `enter` on the source row) to resume. a source added by hap writes its cap explicitly (`max_tasks = 20`), and a config loaded with the key unset is saved back with the effective default rather than a bare `0`. sending the pending items of an under-cap source is unaffected; the no-task-source bootstrap case (no `[[task_sources]]` entry) and an ad-hoc `--path` file that is not a registered source are never capped.
 
 ## reset data
 

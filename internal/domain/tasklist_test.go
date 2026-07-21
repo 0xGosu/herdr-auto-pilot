@@ -3,6 +3,7 @@ package domain
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -664,6 +665,12 @@ func TestTaskLabel(t *testing.T) {
 		{"id only, no text after", "4.", "4"},
 		{"decimal inside text", "bump to 1.2 today", ""},
 		{"empty", "", ""},
+		{"escaped single-level id", `1\. Fix MultiTabForm detection`, "1"},
+		{"escaped hierarchical id", `8\.1 commit to a new branch`, "8.1"},
+		{"escaped hierarchical id with trailing dot", `8\.1\. commit to a new branch`, "8.1"},
+		{"escaped deep hierarchy", `2\.3\.4 nested task`, "2.3.4"},
+		{"escaped id only, no text after", `4\.`, "4"},
+		{"escaped decimal inside text", `bump to 1\.2 today`, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -725,6 +732,40 @@ func TestResolveTaskRefLabeled(t *testing.T) {
 	}
 	if _, err := ResolveTaskRef(items, "2"); err == nil {
 		t.Fatal("a bare number matching no id must be an error when that position is itself labeled")
+	}
+}
+
+// TestResolveTaskRefEscapedDots covers the file shape some markdown editors
+// write: they escape the dot after a leading number ("1\.", "8\.1") so the
+// line is not re-rendered as an ordered list. The escape is a rendering
+// artifact, so those items must stay addressable by their plain ids — and by
+// the escaped spelling an agent may copy back out of its prompt.
+func TestResolveTaskRefEscapedDots(t *testing.T) {
+	items := ParseChecklist(strings.Join([]string{
+		`- [x] 1\. first`,
+		`- [x] 2\. second`,
+		`- [ ] 8\.1 commit to a new branch`,
+		`- [ ] 8\.2 submit a github PR`,
+	}, "\n"))
+
+	for _, c := range []struct {
+		ref  string
+		want int
+	}{
+		{"1", 1},
+		{`1\.`, 1},
+		{"8.1", 3},
+		{`8\.1`, 3},
+		{`8\.2`, 4},
+		{"#4", 4},
+	} {
+		got, err := ResolveTaskRef(items, c.ref)
+		if err != nil {
+			t.Fatalf("ResolveTaskRef(%q) unexpected error: %v", c.ref, err)
+		}
+		if got != c.want {
+			t.Errorf("ResolveTaskRef(%q) = %d, want %d", c.ref, got, c.want)
+		}
 	}
 }
 
@@ -915,5 +956,250 @@ func TestShellQuote(t *testing.T) {
 		if got := ShellQuote(c.in); got != c.want {
 			t.Errorf("ShellQuote(%q) = %s, want %s", c.in, got, c.want)
 		}
+	}
+}
+
+// TestDisplayTaskText: the id's markdown escapes are dropped for display, so
+// the id on screen is the id the CLI accepts; everything after the id — and a
+// text carrying no id at all — is untouched.
+func TestDisplayTaskText(t *testing.T) {
+	cases := map[string]string{
+		`1\. alpha`:            "1. alpha",
+		`8\.1 beta`:            "8.1 beta",
+		`2\.3\.4 nested`:       "2.3.4 nested",
+		"3.4 plain":            "3.4 plain",
+		"no id here":           "no id here",
+		`escape 1\.2 mid-text`: `escape 1\.2 mid-text`,
+		`4\.`:                  "4.",
+		"":                     "",
+	}
+	for text, want := range cases {
+		if got := DisplayTaskText(text); got != want {
+			t.Errorf("DisplayTaskText(%q) = %q, want %q", text, got, want)
+		}
+	}
+}
+
+// TestResolveTaskRefEscapedAmbiguity: because "1\." and "1." are the same id,
+// a list carrying both is genuinely ambiguous and must be refused rather than
+// silently ticking the first — the fail-safe every id rule here defends.
+func TestResolveTaskRefEscapedAmbiguity(t *testing.T) {
+	items := ParseChecklist("- [ ] 1. plain\n- [ ] 1\\. escaped")
+	if _, err := ResolveTaskRef(items, "1"); err == nil {
+		t.Fatal("two items labeled 1 must be ambiguous, not resolved")
+	} else if !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("error = %v, want an ambiguity error", err)
+	}
+	// Position addressing is the documented way out.
+	if got, err := ResolveTaskRef(items, "#2"); err != nil || got != 2 {
+		t.Errorf("ResolveTaskRef(#2) = %d, %v; want 2, nil", got, err)
+	}
+}
+
+// TestResolveTaskRefNonDotBackslash: only a backslash-DOT pair is an escape.
+// A stray backslash elsewhere must not be swallowed — "3\4" collapsing to "34"
+// would resolve a ref to a task nobody named.
+func TestResolveTaskRefNonDotBackslash(t *testing.T) {
+	items := ParseChecklist("- [ ] a\n- [ ] b\n- [ ] c")
+	if _, err := ResolveTaskRef(items, `3\4`); err == nil {
+		t.Error(`ResolveTaskRef("3\\4") must not resolve — the backslash escapes nothing`)
+	}
+}
+
+// TestTaskRefSyntaxOK pins the syntactic screen the CLI runs before it reads
+// any file. It is deliberately permissive (ResolveTaskRef owns the real
+// rules), but it must never reject a spelling that resolves — see
+// TestTaskRefSyntaxAcceptsEverythingResolvable.
+func TestTaskRefSyntaxOK(t *testing.T) {
+	cases := []struct {
+		ref  string
+		want bool
+	}{
+		{"3", true},
+		{"3.4", true},
+		{"3.4.5", true},
+		{"3.", true},
+		{"3)", true},
+		{"3:", true},
+		{"#3", true},
+		{" 3.4 ", true}, // surrounding whitespace is trimmed
+		{`8\.1`, true},
+		{`8\.1\.`, true},
+		{`1\.`, true},
+		{"", false},
+		{"xyz", false},
+		{"#", false},
+		{"#3.4", false}, // a position is a plain integer
+		{`3\4`, false},  // a backslash escapes nothing here
+		// Only the DOT is ever escaped by a markdown editor; accepting "12\:"
+		// here would hand the resolver a ref carrying a stray backslash.
+		{`12\:`, false},
+		{`8\.1\)`, false},
+		{`3\`, false},
+		{"3..4", false},
+		{"3.4.", true},
+		{"-3", false},
+		{"3 4", false},
+	}
+	for _, c := range cases {
+		if got := TaskRefSyntaxOK(c.ref); got != c.want {
+			t.Errorf("TaskRefSyntaxOK(%q) = %v, want %v", c.ref, got, c.want)
+		}
+	}
+}
+
+// TestTaskRefSyntaxAcceptsEverythingResolvable is the invariant that keeps the
+// CLI's pre-flight screen and the resolver from drifting apart: the screen runs
+// FIRST, so any reference it rejects can never reach ResolveTaskRef — which is
+// exactly how the escaped spelling once parsed in the domain but was refused at
+// the command line.
+func TestTaskRefSyntaxAcceptsEverythingResolvable(t *testing.T) {
+	items := ParseChecklist(strings.Join([]string{
+		`- [ ] 1\. alpha`,
+		"- [ ] 2.3 beta",
+		`- [ ] 4\.5 gamma`,
+		"- [ ] unlabeled",
+	}, "\n"))
+	refs := []string{"1", `1\.`, "1.", "2.3", "2.3.", "4.5", `4\.5`, `4\.5\.`, "#4", "#1", "4"}
+	resolved := 0
+	for _, ref := range refs {
+		if _, err := ResolveTaskRef(items, ref); err != nil {
+			continue // unresolvable refs say nothing about the screen
+		}
+		resolved++
+		if !TaskRefSyntaxOK(ref) {
+			t.Errorf("ref %q resolves but the CLI screen rejects it", ref)
+		}
+	}
+	// Without this the test passes vacuously the day every ref stops resolving.
+	if resolved < len(refs)-1 {
+		t.Fatalf("only %d of %d references resolved — the fixture, not the screen, is what is being tested", resolved, len(refs))
+	}
+}
+
+// taskIDRE is what a NORMALIZED id must look like: digits and plain dots, no
+// escapes, no separator. Every TaskLabel result is checked against it.
+var normalizedIDRE = regexp.MustCompile(`^\d+(?:\.\d+)*$`)
+
+// FuzzTaskLabel pins the label parser's invariants on arbitrary item text: the
+// id it reports is always a normalized id, display only ever removes escapes
+// from that id, and neither operation changes which task the text names.
+func FuzzTaskLabel(f *testing.F) {
+	for _, seed := range []string{
+		"1. alpha", `1\. alpha`, `8\.1 beta`, "2.3.4 nested", "3 blind mice",
+		`4\.`, "", `\`, `\.`, `1\`, `1\\.2 x`, "0.5s timeout", `1\.2\.3\. deep`,
+		"12) review", "1:1 sync", strings.Repeat(`1\.`, 20) + " deep",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, text string) {
+		label := TaskLabel(text)
+		if label != "" && !normalizedIDRE.MatchString(label) {
+			t.Fatalf("TaskLabel(%q) = %q, which is not a normalized id", text, label)
+		}
+
+		shown := DisplayTaskText(text)
+		// Display only ever drops backslashes — never adds or reorders anything.
+		if len(shown) > len(text) {
+			t.Fatalf("DisplayTaskText(%q) = %q grew the text", text, shown)
+		}
+		if strings.ReplaceAll(text, `\`, "") != strings.ReplaceAll(shown, `\`, "") {
+			t.Fatalf("DisplayTaskText(%q) = %q changed more than the escapes", text, shown)
+		}
+		// Unescaping for display must not change which task the text names,
+		// and doing it twice must change nothing further.
+		if got := TaskLabel(shown); got != label {
+			t.Fatalf("TaskLabel(DisplayTaskText(%q)) = %q, want %q", text, got, label)
+		}
+		if again := DisplayTaskText(shown); again != shown {
+			t.Fatalf("DisplayTaskText not idempotent on %q: %q then %q", text, shown, again)
+		}
+	})
+}
+
+// FuzzResolveTaskRef pins the resolver's safety invariants on arbitrary refs:
+// it never panics, never returns an out-of-range index, only resolves refs the
+// CLI screen would let through, and treats an escaped id exactly like the plain
+// one. Mis-targeting a task is the failure this whole ref layer exists to
+// prevent, so these are checked rather than assumed.
+func FuzzResolveTaskRef(f *testing.F) {
+	for _, seed := range []string{
+		"1", "#1", "2.3", `4\.5`, `4\.5\.`, "3.", "", "  ", "xyz", `3\4`,
+		"#0", "#99", "0", "99", `\.`, "1.1.1", "#-1",
+	} {
+		f.Add(seed)
+	}
+	items := ParseChecklist(strings.Join([]string{
+		`- [ ] 1\. alpha`,
+		"- [ ] 2.3 beta",
+		`- [ ] 4\.5 gamma`,
+		"- [ ] unlabeled",
+	}, "\n"))
+	f.Fuzz(func(t *testing.T, ref string) {
+		idx, err := ResolveTaskRef(items, ref)
+		if err != nil {
+			if idx != 0 {
+				t.Fatalf("ResolveTaskRef(%q) returned index %d alongside an error", ref, idx)
+			}
+			return
+		}
+		if idx < 1 || idx > len(items) {
+			t.Fatalf("ResolveTaskRef(%q) = %d, out of range 1..%d", ref, idx, len(items))
+		}
+		if !TaskRefSyntaxOK(ref) {
+			t.Fatalf("ResolveTaskRef(%q) resolved a ref the CLI screen rejects", ref)
+		}
+		// The invariant the whole ref layer exists for: a resolved id names the
+		// item carrying THAT id. Falling back to the position is allowed only
+		// when the item sitting there declares no id of its own.
+		if !strings.HasPrefix(strings.TrimSpace(ref), "#") {
+			want := trimTaskIDSeparator(NormalizeTaskID(strings.TrimSpace(ref)))
+			if label := TaskLabel(items[idx-1].Text); label != want && label != "" {
+				t.Fatalf("ResolveTaskRef(%q) = %d, whose item is labeled %q", ref, idx, label)
+			}
+		}
+		// The markdown escape is a rendering artifact: it must never change
+		// which item a reference names.
+		plainIdx, plainErr := ResolveTaskRef(items, NormalizeTaskID(ref))
+		if plainErr != nil || plainIdx != idx {
+			t.Fatalf("ResolveTaskRef(%q) = %d but the unescaped %q = %d, %v",
+				ref, idx, NormalizeTaskID(ref), plainIdx, plainErr)
+		}
+	})
+}
+
+// TestResolveTaskRefMalformedSeparators pins the two shapes FuzzResolveTaskRef
+// caught: a run of trailing separators ("1))") and a signed position ("+4").
+// Both used to resolve here while the CLI's syntactic screen refused them, so
+// the same reference meant different things at different layers.
+func TestResolveTaskRefMalformedSeparators(t *testing.T) {
+	items := ParseChecklist("- [ ] 1. alpha\n- [ ] 2. beta\n- [ ] 3. gamma\n- [ ] 4. delta")
+	for _, ref := range []string{"1))", "1..", "+4", "#+4", "-1", "#-1", `1\`, `1\\.`, `1\:`, `2\.1\)`} {
+		if idx, err := ResolveTaskRef(items, ref); err == nil {
+			t.Errorf("ResolveTaskRef(%q) = %d, want an error (the CLI screen rejects it)", ref, idx)
+		}
+	}
+	// The single trailing separator an agent may copy along still works.
+	for _, ref := range []string{"1", "1.", "1)", "1:"} {
+		if idx, err := ResolveTaskRef(items, ref); err != nil || idx != 1 {
+			t.Errorf("ResolveTaskRef(%q) = %d, %v; want 1, nil", ref, idx, err)
+		}
+	}
+}
+
+// TestDeclaredTaskPromptUnescapesID: the outbound prompt carries the id the
+// CLI accepts. The agent reads its task here and types the id back at
+// `hap task done`, so a prompt saying "8\.1" invites a reference nobody meant
+// to type — while the FILE keeps the operator's escape untouched.
+func TestDeclaredTaskPromptUnescapesID(t *testing.T) {
+	task := DeclaredTask{Task: `8\.1 commit to a new branch`, Path: "/p/t.md", AgentName: "a",
+		Template: "Next: {next_task_content}"}
+	if got, want := task.Prompt(), "Next: 8.1 commit to a new branch"; got != want {
+		t.Errorf("Prompt() = %q, want %q", got, want)
+	}
+	// The stored `\n` encoding still decodes, and only the id is unescaped.
+	multi := DeclaredTask{Task: `2\.3 first line\nsecond line`, Path: "/p", Template: "{next_task_content}"}
+	if got, want := multi.Prompt(), "2.3 first line\nsecond line"; got != want {
+		t.Errorf("Prompt() = %q, want %q", got, want)
 	}
 }

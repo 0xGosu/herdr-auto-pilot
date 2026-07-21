@@ -2465,13 +2465,17 @@ func TestRemoveByIndexIsValueVerified(t *testing.T) {
 		t.Error("out-of-range pattern index must error")
 	}
 
-	if err := app.RemoveTaskSource(ctx, 0, "/wrong/path.md"); err == nil {
+	listed := config.TaskSource{Agent: "builder", Path: "/tmp/tasks.md", MaxTasks: config.DefaultMaxTasks}
+	if err := app.RemoveTaskSource(ctx, 0, config.TaskSource{Agent: "builder", Path: "/wrong/path.md"}); err == nil {
 		t.Error("mismatched expected path must refuse removal")
 	}
-	if err := app.RemoveTaskSource(ctx, 0, "/tmp/tasks.md"); err != nil {
+	if err := app.RemoveTaskSource(ctx, 0, config.TaskSource{Agent: "someone-else", Path: "/tmp/tasks.md"}); err == nil {
+		t.Error("mismatched agent selector must refuse removal")
+	}
+	if err := app.RemoveTaskSource(ctx, 0, listed); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.RemoveTaskSource(ctx, 0, "/tmp/tasks.md"); err == nil {
+	if err := app.RemoveTaskSource(ctx, 0, listed); err == nil {
 		t.Error("removing from empty task sources must error")
 	}
 }
@@ -4306,6 +4310,11 @@ func TestAddTaskSourceAutoSendWhenIdleOption(t *testing.T) {
 	if cfg.TaskSources[2].EnableAutoSendTaskWhenIdle {
 		t.Error("a bootstrapped task source must never enable unprompted hand-out")
 	}
+	// It still names its cap: a source hap creates itself must not land on disk
+	// with "max_tasks" missing, which reads as "no limit".
+	if cfg.TaskSources[2].MaxTasks != config.DefaultMaxTasks {
+		t.Errorf("bootstrapped source should carry max_tasks=%d, got %d", config.DefaultMaxTasks, cfg.TaskSources[2].MaxTasks)
+	}
 }
 
 // TestRemoveTaskSourceKeepsChecklistFile pins the contract the TUI's Tasks-tab
@@ -4328,7 +4337,7 @@ func TestRemoveTaskSourceKeepsChecklistFile(t *testing.T) {
 	if len(cfg.TaskSources) != 1 {
 		t.Fatalf("want 1 task source, got %d", len(cfg.TaskSources))
 	}
-	if err := app.RemoveTaskSource(ctx, 0, cfg.TaskSources[0].Path); err != nil {
+	if err := app.RemoveTaskSource(ctx, 0, cfg.TaskSources[0]); err != nil {
 		t.Fatal(err)
 	}
 	if cfg, err = app.Config(); err != nil {
@@ -4531,5 +4540,151 @@ func TestConfirmRemoteEnvGonePickerFailsClosed(t *testing.T) {
 	}
 	if len(fake.inputs) != 0 || len(fake.keys) != 0 {
 		t.Errorf("nothing may be sent when the picker is gone: inputs=%v keys=%v", fake.inputs, fake.keys)
+	}
+}
+
+// TestSetTaskSourceSettings covers editing an EXISTING source's two mutable
+// settings: the values must reach config.toml (the daemon reads the file), the
+// stale-listing guard must refuse an index whose path has moved, and max_tasks
+// must refuse 0 — on disk 0 means "unset", so accepting it would silently mean
+// the default rather than the "no cap" an operator typing 0 expects.
+func TestSetTaskSourceSettings(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.md")
+	second := filepath.Join(dir, "second.md")
+	if err := app.AddTaskSource(ctx, "a1", "", first, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "a2", "", second, ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A new source names its cap explicitly rather than leaving a bare 0.
+	if cfg.TaskSources[0].MaxTasks != config.DefaultMaxTasks {
+		t.Errorf("a new source should carry max_tasks=%d, got %d", config.DefaultMaxTasks, cfg.TaskSources[0].MaxTasks)
+	}
+	// The cap can also be chosen at creation time, and is validated there —
+	// every surface that offers it inherits this one rule.
+	third := filepath.Join(dir, "third.md")
+	if err := app.AddTaskSource(ctx, "a3", "", third, "", frontend.MaxTasks(40)); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "a4", "", filepath.Join(dir, "bad.md"), "", frontend.MaxTasks(0)); err == nil {
+		t.Error("MaxTasks(0) must be refused — on disk 0 means unset")
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 3 || cfg.TaskSources[2].MaxTasks != 40 {
+		t.Fatalf("MaxTasks option did not persist (and a refused add must register nothing): %+v", cfg.TaskSources)
+	}
+
+	if err := app.SetTaskSourceAutoSend(ctx, 0, cfg.TaskSources[0], true); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SetTaskSourceMaxTasks(ctx, 0, cfg.TaskSources[0], 7); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.TaskSources[0].EnableAutoSendTaskWhenIdle || reloaded.TaskSources[0].MaxTasks != 7 {
+		t.Errorf("settings did not round-trip through config.toml: %+v", reloaded.TaskSources[0])
+	}
+	// The other source is untouched — an edit targets exactly one entry.
+	if reloaded.TaskSources[1].EnableAutoSendTaskWhenIdle || reloaded.TaskSources[1].MaxTasks != config.DefaultMaxTasks {
+		t.Errorf("source #1 must be untouched, got %+v", reloaded.TaskSources[1])
+	}
+
+	// Turning it back off must be readable as off after a reload (the key is
+	// omitempty, so "off" is an absent key — that is what false means on disk).
+	if err := app.SetTaskSourceAutoSend(ctx, 0, cfg.TaskSources[0], false); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded, err = config.Load(app.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.TaskSources[0].EnableAutoSendTaskWhenIdle {
+		t.Error("auto-send should be off again")
+	}
+
+	// Guards.
+	if err := app.SetTaskSourceMaxTasks(ctx, 0, cfg.TaskSources[0], 0); err == nil {
+		t.Error("max_tasks 0 must be refused — on disk it means unset")
+	}
+	if err := app.SetTaskSourceMaxTasks(ctx, 0, config.TaskSource{Agent: "a1", Path: "/some/other.md"}, 5); err == nil {
+		t.Error("a stale expected path must be refused")
+	}
+	if err := app.SetTaskSourceAutoSend(ctx, 9, cfg.TaskSources[0], true); err == nil {
+		t.Error("an out-of-range index must be refused")
+	}
+	// Two sources may share a checklist with different scopes, so the guard
+	// compares the selectors too — a path-only check would edit the wrong one.
+	sameFile := cfg.TaskSources[0]
+	sameFile.Agent = "someone-else"
+	if err := app.SetTaskSourceMaxTasks(ctx, 0, sameFile, 5); err == nil {
+		t.Error("a source whose selectors no longer match must be refused")
+	}
+}
+
+// TestRemoveTaskSourceDuplicatePathReordered is the regression the path-only
+// guard could not catch: two sources may point at the SAME checklist under
+// different agent selectors, so after a reorder the index the operator listed
+// holds a different entry whose path still matches. Removal must refuse rather
+// than retire the wrong agent's source — and the entry the operator DID name
+// is still removable by its new index.
+func TestRemoveTaskSourceDuplicatePathReordered(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	shared := filepath.Join(t.TempDir(), "shared.md")
+	if err := os.WriteFile(shared, []byte("- [ ] a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "alpha", "", shared, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "beta", "", shared, ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := cfg.TaskSources[0] // agent "alpha", at index 0 when listed
+	if listed.Agent != "alpha" {
+		t.Fatalf("fixture: expected alpha first, got %+v", cfg.TaskSources)
+	}
+
+	// Somebody reorders the file underneath (both entries still share a path).
+	cfg.TaskSources[0], cfg.TaskSources[1] = cfg.TaskSources[1], cfg.TaskSources[0]
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.RemoveTaskSource(ctx, 0, listed); err == nil {
+		t.Fatal("a reordered duplicate-path entry must refuse removal")
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Fatalf("a refused removal must change nothing, got %+v", cfg.TaskSources)
+	}
+
+	// Re-listed, the same source removes cleanly from its new index — the
+	// guard refuses a stale reference, it does not strand the entry.
+	if err := app.RemoveTaskSource(ctx, 1, cfg.TaskSources[1]); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 || cfg.TaskSources[0].Agent != "beta" {
+		t.Errorf("wrong source removed: %+v", cfg.TaskSources)
 	}
 }

@@ -1627,7 +1627,8 @@ func (a *App) addTaskSourceIfAbsent(ctx context.Context, agentID, agentType, nam
 				return fmt.Errorf("agent %q already has a task source (%s); refusing to register a second — append the generated tasks to it instead", name, ts.Path)
 			}
 		}
-		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{Agent: name, Path: path})
+		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{
+			Agent: name, Path: path, MaxTasks: config.DefaultMaxTasks})
 		return nil
 	})
 }
@@ -2357,18 +2358,72 @@ func (a *App) RemoveNeverAutoPattern(ctx context.Context, index int, expected st
 	})
 }
 
-// RemoveTaskSource deletes a task source by index; expectedPath guards
-// against removing a different entry after a stale listing.
-func (a *App) RemoveTaskSource(ctx context.Context, index int, expectedPath string) error {
+// RemoveTaskSource deletes a task source by index. expected is the entry the
+// caller listed; it guards against removing a DIFFERENT source after the
+// config shifted underneath — the destructive twin of updateTaskSource's
+// guard, and it compares the same three fields for the same reason (two
+// sources may share one checklist under different selectors).
+func (a *App) RemoveTaskSource(ctx context.Context, index int, expected config.TaskSource) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
-		if index < 0 || index >= len(cfg.TaskSources) {
-			return fmt.Errorf("no task source #%d", index)
-		}
-		if got := cfg.TaskSources[index].Path; got != expectedPath {
-			return fmt.Errorf("task source #%d changed since it was listed (now %s); re-list and retry", index, got)
+		if err := checkTaskSourceUnchanged(*cfg, index, expected); err != nil {
+			return err
 		}
 		cfg.TaskSources = append(cfg.TaskSources[:index], cfg.TaskSources[index+1:]...)
 		return nil
+	})
+}
+
+// checkTaskSourceUnchanged verifies that task source #index is still the entry
+// the caller listed. The index is a position in a slice the operator (or
+// another surface) may have changed since it was shown, so every write keyed
+// by index goes through this. Path alone is NOT enough: two sources may point
+// at the same checklist with different agent/workspace scopes, and a path-only
+// check would happily hit the wrong one of that pair.
+func checkTaskSourceUnchanged(cfg config.Config, index int, expected config.TaskSource) error {
+	if index < 0 || index >= len(cfg.TaskSources) {
+		return fmt.Errorf("no task source #%d", index)
+	}
+	got := cfg.TaskSources[index]
+	if got.Path != expected.Path || got.Agent != expected.Agent || got.Workspace != expected.Workspace {
+		return fmt.Errorf("task source #%d changed since it was listed (now agent=%q workspace=%q %s); re-list and retry",
+			index, got.Agent, got.Workspace, got.Path)
+	}
+	return nil
+}
+
+// updateTaskSource applies mutate to task source #index, guarding on the
+// source the caller believes sits there (checkTaskSourceUnchanged) so a stale
+// listing can never retarget the edit.
+func (a *App) updateTaskSource(ctx context.Context, index int, expected config.TaskSource, mutate func(*config.TaskSource)) error {
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		if err := checkTaskSourceUnchanged(*cfg, index, expected); err != nil {
+			return err
+		}
+		mutate(&cfg.TaskSources[index])
+		return nil
+	})
+}
+
+// SetTaskSourceAutoSend turns enable_auto_send_task_when_idle on or off for an
+// existing source. This is the one source setting that makes hap hand out work
+// unprompted, so turning it ON is always an explicit operator act — never a
+// side effect of editing something else.
+func (a *App) SetTaskSourceAutoSend(ctx context.Context, index int, expected config.TaskSource, on bool) error {
+	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.EnableAutoSendTaskWhenIdle = on
+	})
+}
+
+// SetTaskSourceMaxTasks sets a source's max_tasks cap. The value must be at
+// least 1: 0 is what "unset" looks like on disk, so accepting it here would
+// silently mean DefaultMaxTasks rather than the "no cap" an operator typing 0
+// would expect.
+func (a *App) SetTaskSourceMaxTasks(ctx context.Context, index int, expected config.TaskSource, max int) error {
+	if max < 1 {
+		return fmt.Errorf("max_tasks must be 1 or greater, got %d", max)
+	}
+	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.MaxTasks = max
 	})
 }
 
@@ -2422,6 +2477,14 @@ func AutoSendWhenIdle() TaskSourceOption {
 	return func(src *config.TaskSource) { src.EnableAutoSendTaskWhenIdle = true }
 }
 
+// MaxTasks overrides the new source's task cap (max_tasks). Omitted, a source
+// is created with config.DefaultMaxTasks. AddTaskSource rejects a value below
+// 1 — 0 is what "unset" looks like on disk, so storing it would silently mean
+// the default rather than the "no cap" somebody typing 0 expects.
+func MaxTasks(n int) TaskSourceOption {
+	return func(src *config.TaskSource) { src.MaxTasks = n }
+}
+
 // AddTaskSource points an agent/workspace at a declared task list (FR-011).
 // template optionally overrides the outbound next-task prompt format
 // ({next_task_content} / {task_list_path} / {agent_name} placeholders);
@@ -2435,9 +2498,18 @@ func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, templat
 	}
 	src := config.TaskSource{
 		Agent: agent, Workspace: workspace, Path: path, NextTaskTemplate: template,
+		// Written explicitly rather than left at 0: a saved source names the cap
+		// it actually runs under, so config.toml never reads "max_tasks = 0"
+		// (which looks like "no limit") for a source capped at 20.
+		MaxTasks: config.DefaultMaxTasks,
 	}
 	for _, opt := range opts {
 		opt(&src)
+	}
+	// Validated after the options run, so every surface that can set a cap
+	// inherits the same rule from one place.
+	if src.MaxTasks < 1 {
+		return fmt.Errorf("max_tasks must be 1 or greater, got %d", src.MaxTasks)
 	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		cfg.TaskSources = append(cfg.TaskSources, src)

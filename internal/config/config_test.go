@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -500,9 +501,11 @@ max_tasks = 5
 	if len(cfg.TaskSources) != 2 {
 		t.Fatalf("want 2 task sources, got %d", len(cfg.TaskSources))
 	}
-	// Unset max_tasks stays 0 on the struct but resolves to the default.
-	if cfg.TaskSources[0].MaxTasks != 0 {
-		t.Errorf("unset max_tasks should stay 0, got %d", cfg.TaskSources[0].MaxTasks)
+	// Unset max_tasks is FILLED with the default at load, so the next Save
+	// writes the cap the daemon actually enforces instead of a bare 0 — which
+	// reads like "no limit" to anyone opening config.toml.
+	if cfg.TaskSources[0].MaxTasks != DefaultMaxTasks {
+		t.Errorf("unset max_tasks should be filled with DefaultMaxTasks (%d), got %d", DefaultMaxTasks, cfg.TaskSources[0].MaxTasks)
 	}
 	if got := cfg.TaskSources[0].MaxTasksLimit(); got != DefaultMaxTasks {
 		t.Errorf("unset max_tasks should resolve to DefaultMaxTasks (%d), got %d", DefaultMaxTasks, got)
@@ -512,9 +515,25 @@ max_tasks = 5
 		t.Errorf("explicit max_tasks=5 should parse and resolve to 5, got %d / %d",
 			cfg.TaskSources[1].MaxTasks, cfg.TaskSources[1].MaxTasksLimit())
 	}
-	// A non-positive value falls back to the default (guards a hand-edited 0/-1).
+	// A non-positive value falls back to the default (guards a hand-edited 0/-1,
+	// and a config built in memory that never went through Load).
 	if got := (TaskSource{MaxTasks: -1}).MaxTasksLimit(); got != DefaultMaxTasks {
 		t.Errorf("non-positive max_tasks should resolve to DefaultMaxTasks (%d), got %d", DefaultMaxTasks, got)
+	}
+	// Saving the loaded config writes the filled cap, and the explicit one is
+	// left alone.
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), fmt.Sprintf("max_tasks = %d", DefaultMaxTasks)) {
+		t.Errorf("saved config should name the default cap explicitly, got:\n%s", data)
+	}
+	if !strings.Contains(string(data), "max_tasks = 5") {
+		t.Errorf("saved config should keep the explicit cap, got:\n%s", data)
 	}
 }
 
