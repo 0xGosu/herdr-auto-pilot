@@ -4689,3 +4689,69 @@ func TestRemoveTaskSourceDuplicatePathReordered(t *testing.T) {
 		t.Errorf("wrong source removed: %+v", cfg.TaskSources)
 	}
 }
+
+// TestConfirmTaskGenNoopLearnsNoopWithoutTaskSource: a generate-task decline
+// escalates as the human-readable noop suggestion, NOT as a generated task.
+// Confirming it must learn a plain @noop rule and touch nothing else — no
+// tasks.md, no registered task source, and nothing typed into the pane, even
+// with --send.
+func TestConfirmTaskGenNoopLearnsNoopWithoutTaskSource(t *testing.T) {
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w9:p9")
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w9:p9", SituationType: domain.SituationIdle, Trigger: "t",
+		Signature: "sig-noop", AgentType: "claude",
+		Action: "escalated", Status: "escalated",
+		Suggestion: domain.ActionNoopSuggestion, CreatedAt: time.Now(),
+	})
+
+	// The escalation resolves to the sentinel, never to a generated task.
+	audit, err := st.GetAudit(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := frontend.SuggestedAction(audit); got != domain.ActionNoop {
+		t.Fatalf("SuggestedAction = %q, want %q", got, domain.ActionNoop)
+	}
+
+	// --send must still send nothing: a noop is learned, never typed.
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatalf("confirming a decline: %v", err)
+	}
+	if len(fake.inputs) != 0 {
+		t.Errorf("a confirmed decline must send nothing, sent %v", fake.inputs)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "tasks", name+".md")); !os.IsNotExist(err) {
+		t.Error("a confirmed decline must not write a tasks file")
+	}
+	cfg, _ := config.Load(app.ConfigPath)
+	if len(cfg.TaskSources) != 0 {
+		t.Errorf("a confirmed decline must not register a task source, got %d", len(cfg.TaskSources))
+	}
+	// The learned action is the sentinel, so the raw text never reaches a pane.
+	corrs, err := st.UnprocessedCorrections(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mine []domain.CorrectionRecord
+	for _, c := range corrs {
+		if c.AuditID == id {
+			mine = append(mine, c)
+		}
+	}
+	if len(mine) != 1 {
+		t.Fatalf("want 1 recorded correction for the escalation, got %d", len(mine))
+	}
+	if mine[0].CorrectedAction != domain.ActionNoop {
+		t.Errorf("learned action = %q, want %q", mine[0].CorrectedAction, domain.ActionNoop)
+	}
+	if mine[0].Sent {
+		t.Error("a confirmed decline must not be recorded as delivered")
+	}
+}

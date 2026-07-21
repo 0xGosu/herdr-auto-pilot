@@ -1114,6 +1114,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.detail = nil
 		case "y":
+			// On an escalation's detail, y confirms the snapshotted record
+			// WITHOUT sending — the list's y in overlay form.
+			if id := m.detail.confirmID; id != 0 {
+				m.detail = nil
+				return m.confirmIDWithoutSend(id)
+			}
 			if r := m.detail.task; r != nil {
 				m.detail = nil
 				return m.sendTaskRow(*r)
@@ -1379,7 +1385,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "y":
 		switch m.tab {
 		case tabEscalations:
-			return m.confirmSelected()
+			// y is confirm WITHOUT send (Enter is confirm+send): the rule is
+			// learned, nothing reaches a pane. Matches `hap confirm` with no
+			// --send.
+			return m.confirmWithoutSend()
 		case tabTasks:
 			return m.sendSelectedTask()
 		}
@@ -1647,6 +1656,84 @@ func (m Model) confirmAuditID(id int64) (tea.Model, tea.Cmd) {
 	}
 }
 
+// confirmWithoutSend is what y targets: it agrees with the suggestion — the
+// correction is recorded, so the rule is learned and graduates exactly as a
+// confirm+send would — but nothing is delivered to any pane. This is the TUI
+// half of the CLI's `hap confirm <id>` (no --send); Enter remains confirm+send.
+//
+// Unlike Enter it acts on the marked BATCH (or the cursor row when nothing is
+// marked), mirroring x. The asymmetry is deliberate: recording agreement
+// touches no agent, so doing it to a run of rows is safe, whereas one keypress
+// firing keystrokes into several live panes at once is not — a batch Enter
+// would be the dangerous half of the pair. Skip-and-continue like the delete
+// batch: a failed id usually means the row was resolved concurrently, and the
+// rest still confirm.
+//
+// Two hazards this has to handle, both from the row staying "escalated" until
+// the DAEMON processes the correction (it is what flips the status), which can
+// be a sweep away:
+//
+//   - Repeat presses would each insert another correction — a second operator
+//     decision for one act of agreement, inflating the signature's confidence.
+//     Confirm has no status guard to catch it (unlike Dismiss), so the marks
+//     are cleared on dispatch: an impatient second y then targets only the
+//     cursor row instead of silently re-confirming the whole batch.
+//   - The Cmd must join m.inflight, or quitting right after a batch can exit
+//     the update loop mid-write and drop learning events that were never
+//     recorded. A lost dismiss is recoverable; a lost learning event is not.
+//
+// Note what y does NOT do: the escalation leaves the queue, but the agent is
+// never answered — it stays blocked until something else replies. And on a
+// generated-task suggestion this still writes the agent's tasks.md and
+// registers its task source (Confirm's send flag only gates pane delivery),
+// so a batch is several config mutations. Nothing reaches a pane either way.
+func (m Model) confirmWithoutSend() (tea.Model, tea.Cmd) {
+	ids := m.targetEscalationIDs()
+	if len(ids) == 0 {
+		return m, nil
+	}
+	app, ctx, wg := m.app, m.ctx, m.inflight
+	desc := describeEscalations(ids)
+	m.beginAction()
+	m.marked = nil
+	if wg != nil {
+		wg.Add(1)
+	}
+	return m, func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
+		confirmed := 0
+		var skipped []string
+		var firstErr error
+		for _, id := range ids {
+			if err := app.Confirm(ctx, id, false); err != nil {
+				skipped = append(skipped, fmt.Sprintf("#%d", id))
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			confirmed++
+		}
+		if firstErr != nil {
+			return actionResultMsg{err: fmt.Errorf("confirmed %d, skipped %s: %w",
+				confirmed, strings.Join(skipped, " "), firstErr)}
+		}
+		return actionResultMsg{message: fmt.Sprintf(
+			"confirmed %s — learned, nothing sent (the agent is not answered)", desc)}
+	}
+}
+
+// confirmIDWithoutSend confirms one escalation by id without sending — the
+// detail overlay's y, acting on the record it snapshotted rather than the live
+// cursor (and never on the list's marks, which the overlay does not show).
+func (m Model) confirmIDWithoutSend(id int64) (tea.Model, tea.Cmd) {
+	m.beginAction()
+	return m, m.do(fmt.Sprintf("confirmed #%d — learned, nothing sent (the agent is not answered)", id),
+		func(ctx context.Context) error { return m.app.Confirm(ctx, id, false) })
+}
+
 // openAddPrompt asks whether to queue a stale generated-task suggestion onto the
 // agent's declared task list without sending — the agent is busy, so a send
 // would interrupt it, but the task itself is still valid. Answering "y" accepts
@@ -1794,9 +1881,9 @@ func (m Model) toggleMarkSelected() (tea.Model, tea.Cmd) {
 		m.marked[rec.ID] = true
 	}
 	if len(m.marked) == 0 {
-		m.message = "no marks — x deletes the row under the cursor"
+		m.message = "no marks — x/y act on the row under the cursor"
 	} else {
-		m.message = fmt.Sprintf("%d marked — x deletes them", len(m.marked))
+		m.message = fmt.Sprintf("%d marked — x deletes them, y confirms them without sending", len(m.marked))
 	}
 	if m.cursors[m.tab] < m.rowCount()-1 {
 		m.cursors[m.tab]++
@@ -1808,9 +1895,18 @@ func (m Model) toggleMarkSelected() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// deleteEscalationIDs is what x targets: the marked escalations (in list
-// order), or just the cursor row when nothing is marked.
-func (m Model) deleteEscalationIDs() []int64 {
+// targetEscalationIDs is the batch both x (delete) and y (confirm without
+// sending) act on: the marked escalations (in list order), or just the cursor
+// row when nothing is marked. Enter deliberately does NOT use it — see
+// confirmWithoutSend.
+//
+// Marks are read from ALL pending escalations while the cursor fallback follows
+// the visible (filtered) list, so with an active "/" filter the batch can
+// include marked rows that are currently off screen. That is deliberate — a
+// filter narrows the view, not the selection the operator already made — but it
+// means y can record learning events for rows the operator cannot see, so clear
+// the marks (or the filter) before batching if that matters.
+func (m Model) targetEscalationIDs() []int64 {
 	var ids []int64
 	for _, e := range m.data.escalations {
 		if m.marked[e.ID] {
@@ -1825,7 +1921,7 @@ func (m Model) deleteEscalationIDs() []int64 {
 	return ids
 }
 
-// describeEscalations names the delete targets compactly: "escalation #41"
+// describeEscalations names the action targets compactly: "escalation #41"
 // or "3 escalations (#41 #40 #39)", eliding a long id list.
 func describeEscalations(ids []int64) string {
 	if len(ids) == 1 {
@@ -1846,7 +1942,7 @@ func describeEscalations(ids []int64) string {
 // confirmation: dismissing is safe (nothing is sent or learned) and the
 // audit rows are kept with status "dismissed".
 func (m Model) deleteEscalations() (tea.Model, tea.Cmd) {
-	ids := m.deleteEscalationIDs()
+	ids := m.targetEscalationIDs()
 	if len(ids) == 0 {
 		return m, nil
 	}
@@ -4105,7 +4201,7 @@ func (m Model) helpLine() string {
 			if m.detail.escRetryable {
 				retry = "  l: retry LLM"
 			}
-			return "enter: confirm+send  c: correct (+send?)  x: delete  f: focus in herdr" + rule + retry +
+			return "enter: confirm+send  y: confirm only  c: correct (+send?)  x: delete  f: focus in herdr" + rule + retry +
 				preview + "  ↑/↓: scroll  tab: switch tab  " + closeKeys
 		}
 		if m.detail.agent != nil {
@@ -4146,7 +4242,7 @@ func (m Model) helpLine() string {
 	case tabTasks:
 		return "enter/y: send to agent  v: details  a: add  e: edit  d: done/undone  x: delete (source on a header)  space: mark  f: focus in herdr  /: search  " + common
 	case tabEscalations:
-		return "enter/y: confirm+send  c: correct (+send?)  l: retry LLM  f: focus in herdr  t: see rule  space: mark  x: delete  X: prune old  v: details  /: search  " + common
+		return "enter: confirm+send  y: confirm only (marked)  c: correct (+send?)  l: retry LLM  f: focus in herdr  t: see rule  space: mark  x: delete  X: prune old  v: details  /: search  " + common
 	case tabAudit:
 		return "c: correct decision  v: details  t: see rule  /: search  " + common
 	case tabSignatures:

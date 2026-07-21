@@ -284,3 +284,88 @@ func TestGeneratedTaskIdentityEscapedID(t *testing.T) {
 		}
 	}
 }
+
+// TestStripNoopGeneratedLines: the sentinel is how a model says "no new task
+// is needed" without looking like a broken CLI. It must be recognized in the
+// shapes a model actually emits, must never survive into the remaining text
+// (where it would be written into a checklist and could be typed into a pane),
+// and must leave any real task beside it intact. An all-sentinel response
+// leaves nothing, which is how the caller tells a decline from real work.
+func TestStripNoopGeneratedLines(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantSaw bool
+	}{
+		{"bare", "@noop", "", true},
+		{"padded", "  @noop  \n", "", true},
+		{"bulleted", "- @noop", "", true},
+		{"checkbox", "- [ ] @noop", "", true},
+		{"code span", "`@noop`", "", true},
+		{"bold", "**@noop**", "", true},
+		{"numbered", "1. @noop", "", true},
+		{"no prefix", "noop", "", true},
+		{"underscore", "no_op", "", true},
+		{"hyphen", "no-op", "", true},
+		{"upper", "NO-OP", "", true},
+		{"two declines", "- @noop\n- noop", "", true},
+		// Real work beside the sentinel survives — but the sentinel itself is
+		// always removed, so it can never reach a task list or a pane.
+		{"with real task", "- @noop\n- Add parser tests", "- Add parser tests", true},
+		{"sentinel last", "- Add parser tests\n- @noop", "- Add parser tests", true},
+		// No sentinel: the text is returned unchanged (only trimmed), so the
+		// confirm path still normalizes exactly once.
+		{"free text", "do nothing", "do nothing", false},
+		{"noop inside a task", "Make @noop the default", "Make @noop the default", false},
+		{"prose decline", "No new task is needed.", "No new task is needed.", false},
+		{"ordinary task", "Fix the flaky login test", "Fix the flaky login test", false},
+		{"markdown list untouched", "Here are the tasks:\n- **Fix** the login test\n- Backfill `parser` tests",
+			"Here are the tasks:\n- **Fix** the login test\n- Backfill `parser` tests", false},
+		// Empty is NOT a decline: it is indistinguishable from a crashed CLI,
+		// so the caller keeps it a retryable failure.
+		{"empty", "", "", false},
+		{"blank lines", "\n\n", "", false},
+		{"horizontal rule", "---", "---", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, saw := StripNoopGeneratedLines(tc.raw)
+			if got != tc.want || saw != tc.wantSaw {
+				t.Errorf("StripNoopGeneratedLines(%q) = (%q, %v), want (%q, %v)",
+					tc.raw, got, saw, tc.want, tc.wantSaw)
+			}
+			// Whatever survives must never still carry the sentinel.
+			for _, task := range NormalizeGeneratedTasks(got) {
+				if IsNoopAction(NormalizeNoopAction(task)) {
+					t.Errorf("sentinel survived into task %q", task)
+				}
+			}
+		})
+	}
+}
+
+// TestStripNoopGeneratedLinesKeepsConfirmParseSingle: the daemon escalates the
+// stripped text RAW and the confirm path parses it. NormalizeGeneratedTasks is
+// not idempotent, so this pins that one pass over the stripped text yields what
+// one pass over the original (minus the sentinel) would — i.e. the daemon never
+// pre-normalizes and makes the two passes disagree.
+func TestStripNoopGeneratedLinesKeepsConfirmParseSingle(t *testing.T) {
+	// An ordered marker inside an item is exactly what a second pass would
+	// re-read as a list marker, dropping the unmarked item beside it.
+	raw := "- 1. Fix the parser\n- Add tests\n- @noop"
+	stripped, saw := StripNoopGeneratedLines(raw)
+	if !saw {
+		t.Fatal("sentinel should have been detected")
+	}
+	got := NormalizeGeneratedTasks(stripped)
+	want := []string{"1. Fix the parser", "Add tests"}
+	if len(got) != len(want) {
+		t.Fatalf("NormalizeGeneratedTasks(%q) = %q, want %q", stripped, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("task %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
