@@ -1492,3 +1492,46 @@ func TestTaskInvalidRefReportsTheTypo(t *testing.T) {
 		t.Errorf("error should name the bad reference, got: %v", err)
 	}
 }
+
+// TestTaskRefMutationIsGuardedAgainstAConcurrentEdit: resolving a reference
+// necessarily reads the checklist before the mutation takes the file lock, so
+// another process adding or removing an item in between shifts positions under
+// the resolved index. The resolved TEXT is threaded through as the guard, so
+// that race must refuse rather than rewrite the wrong line.
+func TestTaskRefMutationIsGuardedAgainstAConcurrentEdit(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] 1.1 alpha\n- [ ] 1.2 beta\n")
+
+	items, err := app.ResolveTaskRef("", path, "1.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items.Index != 2 || items.Text != "1.2 beta" {
+		t.Fatalf("resolved %+v, want #2 %q", items, "1.2 beta")
+	}
+
+	// Somebody inserts a task ahead of it: position 2 is now "1.05 inserted".
+	if err := os.WriteFile(path, []byte("- [ ] 1.1 alpha\n- [ ] 1.05 inserted\n- [ ] 1.2 beta\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := app.SetTaskDone("", path, items.Index, true, items.Text); err == nil {
+		t.Fatal("a mutation on a stale index must be refused, not applied")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "[x]") {
+		t.Errorf("nothing should have been ticked off:\n%s", string(data))
+	}
+
+	// Re-resolving after the edit finds the same task at its new position.
+	again, err := app.ResolveTaskRef("", path, "1.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Index != 3 || again.Text != "1.2 beta" {
+		t.Errorf("re-resolved %+v, want #3 %q", again, "1.2 beta")
+	}
+}

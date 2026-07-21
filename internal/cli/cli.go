@@ -1033,11 +1033,9 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 	case "list", "ls":
 		return taskList(app, out, agent, path, rest)
 	case "get", "show":
-		idx, err := taskIndexArg(app, agent, path, rest)
-		if err != nil {
-			return err
-		}
-		it, err := app.GetTask(agent, path, idx)
+		// Resolution already read the item — no second read (and no window
+		// for the two to disagree) just to display it.
+		it, err := taskItemArg(app, agent, path, rest)
 		if err != nil {
 			return err
 		}
@@ -1065,12 +1063,13 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 		if len(rest) < 2 {
 			return fmt.Errorf("usage: task %s update <n> <text>", taskTargetLabel(agent, path))
 		}
-		idx, err := taskIndexArg(app, agent, path, rest[:1])
+		it, err := taskItemArg(app, agent, path, rest[:1])
 		if err != nil {
 			return err
 		}
+		idx := it.Index
 		text := strings.TrimSpace(strings.Join(rest[1:], " "))
-		items, err := app.EditTask(agent, path, idx, text)
+		items, err := app.EditTask(agent, path, idx, text, it.Text)
 		if err != nil {
 			return err
 		}
@@ -1078,11 +1077,12 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 		printTaskList(out, items, "all")
 		return nil
 	case "remove", "rm", "delete", "del":
-		idx, err := taskIndexArg(app, agent, path, rest)
+		it, err := taskItemArg(app, agent, path, rest)
 		if err != nil {
 			return err
 		}
-		items, err := app.DeleteTask(agent, path, idx)
+		idx := it.Index
+		items, err := app.DeleteTask(agent, path, idx, it.Text)
 		if err != nil {
 			return err
 		}
@@ -1117,14 +1117,11 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 	if agent == "" {
 		return fmt.Errorf("task send needs an agent name (a --path list has no agent to send to)")
 	}
-	idx, err := taskIndexArg(app, agent, path, idxArgs)
+	it, err := taskItemArg(app, agent, path, idxArgs)
 	if err != nil {
 		return err
 	}
-	it, err := app.GetTask(agent, path, idx)
-	if err != nil {
-		return err
-	}
+	idx := it.Index
 	if it.Done {
 		return fmt.Errorf("task #%d is %q — only a pending [ ] task can be sent", idx, it.Mark)
 	}
@@ -1241,30 +1238,36 @@ func taskTargetLabel(agent, path string) string {
 // reference names a real task is domain.ResolveTaskRef's call.
 var taskRefRE = regexp.MustCompile(`^(?:#\d+|\d+(?:\.\d+)*[.):]?)$`)
 
-// taskIndexArg resolves the first argument into an item's 1-based position.
-// The argument is a task REFERENCE, not necessarily a position: a checklist
-// that numbers its own tasks ("3.4 Implement …") is addressed by those ids,
-// which is what an agent reads in its prompt; "#3" always means position 3.
-// domain.ResolveTaskRef owns the rules — this only supplies the list.
-func taskIndexArg(app *frontend.App, agent, path string, args []string) (int, error) {
+// taskItemArg resolves the first argument into the item it names. The argument
+// is a task REFERENCE, not necessarily a position: a checklist that numbers its
+// own tasks ("3.4 Implement …") is addressed by those ids, which is what an
+// agent reads in its prompt; "#3" always means position 3. domain.ResolveTaskRef
+// owns the rules — this only supplies the list.
+//
+// Every MUTATING caller must pass the returned Text back as the expectText
+// guard: resolution happens before the file lock, so a concurrent add/remove
+// would otherwise shift positions under the resolved index and rewrite the
+// wrong line.
+func taskItemArg(app *frontend.App, agent, path string, args []string) (domain.ChecklistItem, error) {
 	if len(args) == 0 {
-		return 0, domain.ErrTaskRefRequired
+		return domain.ChecklistItem{}, domain.ErrTaskRefRequired
 	}
 	// Reject a syntactically impossible reference before reading anything:
 	// resolution needs the checklist, so without this `done xyz` on a missing
 	// file reports the file error instead of the typo that caused it.
 	if !taskRefRE.MatchString(strings.TrimSpace(args[0])) {
-		return 0, fmt.Errorf("invalid task number %q — pass a task id from the list (e.g. 3.4) or a position (e.g. '#3')", args[0])
+		return domain.ChecklistItem{}, fmt.Errorf("invalid task number %q — pass a task id from the list (e.g. 3.4) or a position (e.g. '#3')", args[0])
 	}
 	return app.ResolveTaskRef(agent, path, args[0])
 }
 
 func taskToggle(app *frontend.App, out io.Writer, agent, path string, rest []string, done bool) error {
-	idx, err := taskIndexArg(app, agent, path, rest)
+	it, err := taskItemArg(app, agent, path, rest)
 	if err != nil {
 		return err
 	}
-	items, err := app.SetTaskDone(agent, path, idx, done)
+	idx := it.Index
+	items, err := app.SetTaskDone(agent, path, idx, done, it.Text)
 	if err != nil {
 		return err
 	}
@@ -1280,11 +1283,12 @@ func taskToggle(app *frontend.App, out io.Writer, agent, path string, rest []str
 // taskStart marks item n with the [-] in-progress marker — the op the default
 // next-task template tells an agent to run when it begins working a task.
 func taskStart(app *frontend.App, out io.Writer, agent, path string, rest []string) error {
-	idx, err := taskIndexArg(app, agent, path, rest)
+	it, err := taskItemArg(app, agent, path, rest)
 	if err != nil {
 		return err
 	}
-	items, err := app.MarkTaskInProgress(agent, path, idx)
+	idx := it.Index
+	items, err := app.MarkTaskInProgress(agent, path, idx, it.Text)
 	if err != nil {
 		return err
 	}
