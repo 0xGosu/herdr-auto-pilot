@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -1010,11 +1011,13 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 // task manages the checklist ITEMS inside a task source's file (as opposed to
 // task-source, which manages the source config). The target is either a
 // positional <agent> (resolved to its configured task source) or --path <file>
-// to operate on any checklist directly. Tasks are addressed by their 1-based
-// position among all items in the file; every mutating op re-prints the
-// renumbered list so the caller always sees fresh numbers.
+// to operate on any checklist directly. Tasks are addressed by the id the list
+// gives them ("3.4"), or by their 1-based position among all items in the file
+// ("#3", and a bare number in a list with no ids) — see domain.ResolveTaskRef.
+// Every mutating op re-prints the renumbered list so the caller always sees
+// fresh numbers.
 func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | send <n> [--yes]"
+	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | send <n> [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>"
 	agent, path, args, err := taskTarget(args)
 	if err != nil {
 		return err
@@ -1030,7 +1033,7 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 	case "list", "ls":
 		return taskList(app, out, agent, path, rest)
 	case "get", "show":
-		idx, err := taskIndexArg(rest)
+		idx, err := taskIndexArg(app, agent, path, rest)
 		if err != nil {
 			return err
 		}
@@ -1062,7 +1065,7 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 		if len(rest) < 2 {
 			return fmt.Errorf("usage: task %s update <n> <text>", taskTargetLabel(agent, path))
 		}
-		idx, err := taskIndexArg(rest[:1])
+		idx, err := taskIndexArg(app, agent, path, rest[:1])
 		if err != nil {
 			return err
 		}
@@ -1075,7 +1078,7 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 		printTaskList(out, items, "all")
 		return nil
 	case "remove", "rm", "delete", "del":
-		idx, err := taskIndexArg(rest)
+		idx, err := taskIndexArg(app, agent, path, rest)
 		if err != nil {
 			return err
 		}
@@ -1114,7 +1117,7 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 	if agent == "" {
 		return fmt.Errorf("task send needs an agent name (a --path list has no agent to send to)")
 	}
-	idx, err := taskIndexArg(idxArgs)
+	idx, err := taskIndexArg(app, agent, path, idxArgs)
 	if err != nil {
 		return err
 	}
@@ -1232,22 +1235,32 @@ func taskTargetLabel(agent, path string) string {
 	return agent
 }
 
-func taskIndexArg(args []string) (int, error) {
+// taskRefRE is the syntactic shape of a task reference: a task id ("3.4",
+// optionally with the trailing separator an agent may copy along) or a
+// position ("#3"). It only screens out typos before any I/O — whether the
+// reference names a real task is domain.ResolveTaskRef's call.
+var taskRefRE = regexp.MustCompile(`^(?:#\d+|\d+(?:\.\d+)*[.):]?)$`)
+
+// taskIndexArg resolves the first argument into an item's 1-based position.
+// The argument is a task REFERENCE, not necessarily a position: a checklist
+// that numbers its own tasks ("3.4 Implement …") is addressed by those ids,
+// which is what an agent reads in its prompt; "#3" always means position 3.
+// domain.ResolveTaskRef owns the rules — this only supplies the list.
+func taskIndexArg(app *frontend.App, agent, path string, args []string) (int, error) {
 	if len(args) == 0 {
-		return 0, fmt.Errorf("a task number is required (see: task ... list)")
+		return 0, domain.ErrTaskRefRequired
 	}
-	n, err := strconv.Atoi(args[0])
-	if err != nil {
-		return 0, fmt.Errorf("invalid task number %q", args[0])
+	// Reject a syntactically impossible reference before reading anything:
+	// resolution needs the checklist, so without this `done xyz` on a missing
+	// file reports the file error instead of the typo that caused it.
+	if !taskRefRE.MatchString(strings.TrimSpace(args[0])) {
+		return 0, fmt.Errorf("invalid task number %q — pass a task id from the list (e.g. 3.4) or a position (e.g. '#3')", args[0])
 	}
-	if n < 1 {
-		return 0, fmt.Errorf("task number must be 1 or greater, got %d", n)
-	}
-	return n, nil
+	return app.ResolveTaskRef(agent, path, args[0])
 }
 
 func taskToggle(app *frontend.App, out io.Writer, agent, path string, rest []string, done bool) error {
-	idx, err := taskIndexArg(rest)
+	idx, err := taskIndexArg(app, agent, path, rest)
 	if err != nil {
 		return err
 	}
@@ -1267,7 +1280,7 @@ func taskToggle(app *frontend.App, out io.Writer, agent, path string, rest []str
 // taskStart marks item n with the [-] in-progress marker — the op the default
 // next-task template tells an agent to run when it begins working a task.
 func taskStart(app *frontend.App, out io.Writer, agent, path string, rest []string) error {
-	idx, err := taskIndexArg(rest)
+	idx, err := taskIndexArg(app, agent, path, rest)
 	if err != nil {
 		return err
 	}

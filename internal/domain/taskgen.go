@@ -227,7 +227,9 @@ func RenderGeneratedTaskList(agentName string, tasks []string) string {
 // writes for the i-th (0-based) generated task: the numbered ID plus the raw
 // task. It is the single source of truth for that format — the delivery-time
 // reservation must name exactly this text to claim the item, so the two sites
-// cannot be allowed to drift apart silently.
+// cannot be allowed to drift apart silently. The ID shape must also stay
+// within what domain.TaskLabel recognizes (tasklist.go), or `hap task done 3`
+// would stop addressing generated task 3 by its id.
 func GeneratedTaskItemText(i int, task string) string {
 	return strconv.Itoa(i+1) + ". " + task
 }

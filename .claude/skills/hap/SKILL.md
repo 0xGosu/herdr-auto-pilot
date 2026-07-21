@@ -501,10 +501,28 @@ enable_auto_send_task_when_idle = true
 by the agent whose task source it is, or with `--path <file>` for any checklist
 (and for workspace-scoped sources, which aren't addressable by agent name).
 
-tasks are numbered by their **position in the file** (1..N, counting checked and
-unchecked alike). the number never changes with a status filter — `done 3`
-always means the third item in the file. numbers *do* shift after `add`/`remove`,
-so every mutating command re-prints the renumbered list. the checkbox is shown
+**addressing a task.** `list` numbers items by their **position in the file**
+(`#1..#N`, counting checked and unchecked alike, never varying with a status
+filter). a checklist may also number its own tasks in the item text — either the
+`1. `/`2. ` prefix hap's generated lists use, or hand-authored section ids like
+`3.4 create the public link`. what you pass to `get`/`start`/`done`/`undone`/
+`update`/`remove`/`send` is resolved like this:
+
+| you pass | it means |
+|---|---|
+| `3.4` | the item whose id is `3.4` |
+| `3` | the item whose id is `3` |
+| `3` — no item has that id | position 3, **unless** the item sitting there has an id of its own — then it is refused, to be spelled `#3` |
+| `#3` | position 3, always |
+
+that ordering matters because the id is what an agent reads in its prompt: told
+to do "3.4 create the public link", it reports `done 3.4`, which must not tick
+off whatever happens to sit at position 3. the fallback keeps unlabeled items
+reachable — a generated list plus one `task add` is exactly that mix. note that
+`#3` needs quoting in a shell (`'#3'`), which otherwise strips it as a comment.
+positions *do* shift after
+`add`/`remove`, so every mutating command re-prints the renumbered list. the
+checkbox is shown
 verbatim, so an in-progress `[-]` item (what the generated-task flow writes for
 the task an agent is actively working) renders as `[-]` and is *not* counted as
 pending (only truly-unchecked `[ ]` items are).
@@ -512,7 +530,8 @@ pending (only truly-unchecked `[ ]` items are).
 ```bash
 hap task backend-dev list                 # all items, with status + number
 hap task backend-dev list --status pending  # or: done | all (default all)
-hap task backend-dev get 3                 # show one item
+hap task backend-dev get 3                 # show one item (by id, or #3 by position)
+hap task backend-dev done 3.4              # tick off the item the list numbers 3.4
 hap task backend-dev add "wire up retries" # append a new unchecked item
 hap task backend-dev start 2               # mark item 2 in-progress ([-])
 hap task backend-dev done 2                # tick item 2 off ([x])
@@ -573,7 +592,7 @@ agent to manage its list through the `hap task` CLI with its own name pre-filled
 in every command (and a `--path` fallback for sources that aren't name-addressable):
 
 ```
-Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them, `hap task {agent_name} start <n>` to mark one in-progress when you begin working on it, and `hap task {agent_name} done <n>` to mark it complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`).
+Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them, `hap task {agent_name} start <n>` to mark one in-progress when you begin working on it, and `hap task {agent_name} done <n>` to mark it complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`). `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.4`); otherwise its position in the list, which `#3` always addresses.
 ```
 
 - `{next_task_content}` — the text of the next unchecked item (or `"none"` when the list is complete)

@@ -2775,6 +2775,22 @@ func (a *App) ListTasks(agent, path string) ([]domain.ChecklistItem, error) {
 	return readChecklist(p)
 }
 
+// ResolveTaskRef maps a task reference — the list's own task id ("3.4"), a
+// bare number, or an explicit position ("#3") — to the 1-based item number
+// every other task method takes. See domain.ResolveTaskRef for the rules.
+//
+// Resolution reads the file OUTSIDE the mutation lock, exactly as a
+// human-supplied number is resolved from a previous `list` today. A checklist
+// that changes in between is caught by the mutation's own guard
+// (taskfile.ExpectText) rather than here.
+func (a *App) ResolveTaskRef(agent, path, ref string) (int, error) {
+	items, err := a.ListTasks(agent, path)
+	if err != nil {
+		return 0, err
+	}
+	return domain.ResolveTaskRef(items, ref)
+}
+
 // GetTask returns the single item addressed by its 1-based number.
 func (a *App) GetTask(agent, path string, index int) (domain.ChecklistItem, error) {
 	items, err := a.ListTasks(agent, path)

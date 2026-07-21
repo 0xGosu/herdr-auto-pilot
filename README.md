@@ -449,7 +449,9 @@ error = "#ff5f5f"
 #    start <n>` to mark one in-progress when you begin working on it, and
 #    `hap task {agent_name} done <n>` to mark it complete as you go (if that
 #    name isn't recognized, use `--path {task_list_path}` in place of
-#    `{agent_name}`)."
+#    `{agent_name}`). `<n>` is the task's own id when the list numbers its
+#    tasks (e.g. `done 3.4`); otherwise its position in the list, which `#3`
+#    always addresses."
 # When every item is checked off, the templated prompt is never sent: the
 # plugin escalates a confirmable @noop suggestion ("No more pending tasks")
 # instead — unless BOTH llm.task_generate_command and

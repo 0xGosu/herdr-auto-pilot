@@ -223,6 +223,11 @@ terminal_bell = true       # ring the terminal bell (\a) on new escalations and 
 # agent = ""                 # short name, pane id, or type; "" = any
 # workspace = ""             # "" or "*" = any; wildcards like "codex-*" work
 # path = "/home/me/project/docs/tasks.md"
+# Any markdown checklist works: "- [ ] item" lines, with headings and prose
+# freely interleaved (they are skipped, and every edit leaves them untouched).
+# A list may number its own tasks ("- [ ] 3.4 create the public link") — those
+# ids are what `hap task <agent> done 3.4` addresses, while `#3` always means
+# the third item in the file.
 # next_task_template placeholders: {next_task_content}, {task_list_path}, {agent_name}, {cwd}
 # next_task_template = "Your next task is {next_task_content}.\nRead the full tasks list at {task_list_path}. Verify task dependencies before starting. Once you have completed your task, mark it as done (`[x]`) in the tasks list.\nIf you are unsure what to do, ask for clarification. When there is no task available, focus on improving the test coverage of this project."
 # When an [llm].command is configured, each determined task is first REVIEWED by
