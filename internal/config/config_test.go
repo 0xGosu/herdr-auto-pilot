@@ -1463,3 +1463,51 @@ func TestTaskSourceMatchesAgent(t *testing.T) {
 		})
 	}
 }
+
+// TestSampleConfigParsesWithDocumentedDefaults loads the shipped
+// sample/config.toml — the file operators copy — and checks it both parses and
+// still describes the real defaults. The sample is documentation that can drift
+// silently; this makes a wrong value (or a section that stops parsing) a test
+// failure instead of a support question.
+func TestSampleConfigParsesWithDocumentedDefaults(t *testing.T) {
+	path := filepath.Join("..", "..", "sample", "config.toml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read sample config: %v", err)
+	}
+	cfg, logs, err := loadWithLogs(path)
+	if err != nil {
+		t.Fatalf("sample config must parse: %v", err)
+	}
+	if strings.Contains(logs, "deprecated") {
+		t.Errorf("sample config uses a deprecated key:\n%s", logs)
+	}
+
+	def := Default()
+	// Every documented value the sample states outright must be the default it
+	// claims to be; the [cli] switch is the one this test was added for.
+	if !strings.Contains(string(raw), "ai_agent_friendly_output") {
+		t.Error("sample config does not document [cli].ai_agent_friendly_output")
+	}
+	if !cfg.CLI.AIAgentFriendlyOutput {
+		t.Error("sample config must leave the AI-agent footers on")
+	}
+	if cfg.CLI.AIAgentFriendlyOutput != def.CLI.AIAgentFriendlyOutput {
+		t.Errorf("sample [cli].ai_agent_friendly_output = %v, default is %v",
+			cfg.CLI.AIAgentFriendlyOutput, def.CLI.AIAgentFriendlyOutput)
+	}
+	if cfg.ConfidenceThresholds != def.ConfidenceThresholds {
+		t.Errorf("sample confidence_thresholds = %+v, defaults are %+v",
+			cfg.ConfidenceThresholds, def.ConfidenceThresholds)
+	}
+	if cfg.Learning != def.Learning {
+		t.Errorf("sample learning = %+v, defaults are %+v", cfg.Learning, def.Learning)
+	}
+	if cfg.Limits != def.Limits {
+		t.Errorf("sample limits = %+v, defaults are %+v", cfg.Limits, def.Limits)
+	}
+	if cfg.TUI.TerminalBell != def.TUI.TerminalBell {
+		t.Errorf("sample tui.terminal_bell = %v, default is %v",
+			cfg.TUI.TerminalBell, def.TUI.TerminalBell)
+	}
+}

@@ -22,6 +22,31 @@ HAP="$PLUGIN_ROOT/bin/hap"
 
 if `hap` is already on `PATH`, use it directly.
 
+## discovering commands from the CLI itself
+
+the CLI documents itself, so you rarely need to guess:
+
+```bash
+hap help                 # every command, grouped, plus common workflows
+hap help task            # full guide for one command: usage, every flag, details, examples
+hap escalations --help   # same page; --help (or -h) works anywhere in the arguments
+```
+
+most commands end with a **"Next steps"** footer listing what to run next, with real
+ids filled in (`hap confirm 42 --send`). when parsing output in a script, suppress it:
+
+```bash
+hap agents --no-hints                                  # per invocation
+HAP_NO_HINTS=1 hap agents                              # per environment
+hap config set cli.ai_agent_friendly_output false      # persistent (default true)
+```
+
+none of these affect `hap help` or `<command> --help` — those footers are part of
+the guide.
+
+listings are tab-separated; `hap state-dir` and `hap config path` print a bare value
+(never a footer) so `$(hap state-dir)` stays usable.
+
 ## concepts
 
 **situation types** — the plugin classifies agent states into four types:
@@ -368,6 +393,7 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `embedding.pane_salient_chars` | 800 | fallback signature window for idle/unclassified situations (trailing N chars) |
 | `tui.max_content_width` | 0 (full width) | cap variable-width list columns; 0 = full width |
 | `tui.theme` | default | TUI color theme: default, dark, light, high-contrast (in the TUI Config tab, `e` on this row opens a ↑/↓ picker of the available themes) |
+| `cli.ai_agent_friendly_output` | true | append the "Next steps" footer to command output (for AI agents driving the CLI); never affects `hap help` / `--help`, which always show theirs |
 | `tui.terminal_bell` | true | ring the terminal bell (\a) on new escalations and on pauses caused by a different process |
 
 TUI palette colors (`tui.palette.*`) are config.toml-only — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. values are 256-color codes (`"205"`) or hex (`"#ff5faf"`).

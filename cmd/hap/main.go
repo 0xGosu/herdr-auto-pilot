@@ -34,66 +34,39 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/tui"
 )
 
-const usage = `hap (Herd Auto Prompter) — keep your Herdr agents unblocked, hands-free
-
-Core:
-  daemon [--ensure]     run the monitoring daemon (--ensure: start if not
-                        running; replace a daemon left by an older binary)
-  tui                   run the TUI control pane
-  mcp                   run the stdio MCP server (used by the LLM fallback)
-
-Operate:
-  status                automation state, pending escalations, agents
-  agents                list agents (short name, id, type, status, automation)
-  capture <agent>       re-run the normal capture pipeline for a live
-                        blocked/idle/done agent (name or pane id)
-  rename <agent> <name> give an agent a short name (used by task sources)
-  disable <agent>       disable autonomous actions for one agent
-  enable <agent>        re-enable autonomous actions for one agent
-  escalations [prune [minutes]]  list pending escalations; prune dismisses
-                        those older than N minutes (default 360)
-  confirm <id> [--send]         confirm an escalation's suggested action
-  resolve <id> --action TEXT [--send]   record the correct action (post-hoc correction)
-  dismiss <id>...       drop pending escalation(s) without responding
-                        (audit rows kept; nothing sent or learned)
-  audit [--limit N]     show the audit log
-  signatures [list|show <sig>|delete <sig> [--yes]]   learned signatures (alias: sigs)
-                        list filters: --type T --mode M --agent-type A --min-conf C
-  signatures reembed [--force]   re-compute stored embeddings after an
-                        embedding model change (via the daemon when running)
-  pause | resume        global pause/kill switch
-  kill-history          pause/kill event history
-  state-dir             print the state directory (DB, logs, socket, index)
-  paths                 print resolved config + state paths (labeled)
-
-Configure:
-  config [show|fields|path|set <field> <value>|set-threshold <situation> <value>]
-  rules [list|add <regex>|remove <index>]      never-auto patterns
-  task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--max-tasks N] <checklist.md>
-                        | list | set <index> <auto-send-when-idle|max-tasks> <value> | remove <index>
-  task [<agent> | --path F] list [--status all|pending|done] | get <n> | add <text>
-                        | start <n> | done <n> | undone <n> | update <n> <text>
-                        | remove <n> | send <n> [--yes]
-                        CRUD the checklist items in an agent's task list
-  clear-data --yes      reset learned history + audit data
-
-  version               print version
-`
-
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Print(usage)
+		// Same path as `hap help`, so the overview's own footer is never
+		// subject to the switches that gate command output.
+		_ = cli.Run(context.Background(), nil, os.Stdout, "help", nil)
 		os.Exit(2)
 	}
 	verb := os.Args[1]
 	args := os.Args[2:]
 
-	if verb == "version" || verb == "--version" || verb == "-V" {
-		fmt.Println("hap (herd-auto-prompter)", buildinfo.Version)
+	// Help is served from the command registry (internal/cli), so the overview,
+	// the per-command guides, and the dispatch table can never drift apart.
+	// `hap help <command>` and `hap <command> --help` both land in cli.Run.
+	if verb == "help" || verb == "--help" || verb == "-h" {
+		if err := cli.Run(context.Background(), nil, os.Stdout, "help", args); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 		return
 	}
-	if verb == "help" || verb == "--help" || verb == "-h" {
-		fmt.Print(usage)
+	// The commands main dispatches itself still document themselves through the
+	// registry, so `hap daemon --help` works before any store is opened. This
+	// runs BEFORE the version branch so `hap version --help` is a help request,
+	// as the guides promise; it returns false for unknown verbs.
+	if cli.WantsCommandHelp(verb, args) {
+		if err := cli.Run(context.Background(), nil, os.Stdout, "help", []string{verb}); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if verb == "version" || verb == "--version" || verb == "-V" {
+		fmt.Println("hap (herd-auto-prompter)", buildinfo.Version)
 		return
 	}
 

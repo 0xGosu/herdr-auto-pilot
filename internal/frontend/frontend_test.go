@@ -2184,6 +2184,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"tui.max_content_height":                  "12",
 		"tui.theme":                               "dark",
 		"tui.terminal_bell":                       "true",
+		"cli.ai_agent_friendly_output":            "false",
 	}
 
 	registry := make(map[string]bool, len(frontend.ConfigFieldKeys))

@@ -390,6 +390,18 @@ type TUI struct {
 	TerminalBell bool `toml:"terminal_bell"`
 }
 
+// CLI configures the `hap` command-line output (as opposed to the TUI).
+type CLI struct {
+	// AIAgentFriendlyOutput appends a short "Next steps" footer to command output,
+	// naming the commands that follow this one (with real ids filled in). It
+	// exists because the CLI's main caller is often an AI coding agent, which
+	// cannot discover the next verb the way a human reads a man page.
+	// Default true. It never affects `hap help` or `<command> --help`, whose
+	// footers are part of the guide, and never the bare-value verbs
+	// (`hap state-dir`, `hap config path`), which print no footer at all.
+	AIAgentFriendlyOutput bool `toml:"ai_agent_friendly_output"`
+}
+
 // PaletteOverrides are optional per-role color overrides for the TUI
 // palette. Values are terminal color strings lipgloss accepts ("205",
 // "#ff5faf"). Edited via config.toml only — the TUI shows them read-only.
@@ -417,6 +429,7 @@ type Config struct {
 	LLM                  LLM                  `toml:"llm"`
 	Embedding            Embedding            `toml:"embedding"`
 	TUI                  TUI                  `toml:"tui"`
+	CLI                  CLI                  `toml:"cli"`
 	TaskSources          []TaskSource         `toml:"task_sources"`
 	Classifier           []ClassifierRule     `toml:"classifier"`
 	// CaptureDelays are optional per-agent-type overrides for the delayed
@@ -453,6 +466,7 @@ func Default() Config {
 			BM25MinScore:        0.35,
 		},
 		TUI: TUI{TerminalBell: true},
+		CLI: CLI{AIAgentFriendlyOutput: true},
 	}
 }
 

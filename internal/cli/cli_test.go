@@ -40,6 +40,15 @@ func testApp(t *testing.T) (*frontend.App, *store.Store) {
 	}, st
 }
 
+// listedRows returns the rows a listing printed, dropping the trailing
+// "Next steps" footer the CLI adds for its (often AI) callers.
+func listedRows(out string) []string {
+	if i := strings.Index(out, "\nNext steps:\n"); i >= 0 {
+		out = out[:i]
+	}
+	return strings.Split(strings.TrimSpace(out), "\n")
+}
+
 func run(t *testing.T, app *frontend.App, verb string, args ...string) (string, error) {
 	t.Helper()
 	var out bytes.Buffer
@@ -410,7 +419,7 @@ func TestAgentsListsWorkingDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
+	lines := listedRows(out)
 	if len(lines) != 2 {
 		t.Fatalf("agents output = %q, want 2 rows", out)
 	}
@@ -1335,8 +1344,13 @@ func TestTaskListPrintsManagementHints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out, "start <n>") {
+	// The concise "Next steps" footer is still printed (it is what an agent
+	// reads to continue); what must not repeat is the instruction BLOCK.
+	if strings.Contains(out, "Prefer using the hap CLI to manage your tasks:") {
 		t.Errorf("mutating ops must not repeat the hints, got:\n%s", out)
+	}
+	if strings.Contains(out, "always addresses") {
+		t.Errorf("mutating ops must not repeat the <n> explainer, got:\n%s", out)
 	}
 }
 
@@ -1428,7 +1442,7 @@ func TestTaskSourceListShowsAutoSendFlag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
+	lines := listedRows(out)
 	if len(lines) != 2 {
 		t.Fatalf("want 2 listed sources, got %d:\n%s", len(lines), out)
 	}

@@ -29,69 +29,111 @@ import (
 // "error:" prefix, so scripted health checks can detect it.
 var ErrUnhealthy = errors.New("daemon unhealthy")
 
-// Run dispatches one CLI verb against the shared front-end layer.
+// Run dispatches one CLI verb against the shared front-end layer, through the
+// command registry (help.go) so that every verb carries its own help text and
+// "Next steps" footer.
+//
+// Two arguments are handled here rather than by any verb: `--help`/`-h`
+// anywhere in the arguments prints the verb's guide, and `--no-hints` (like
+// HAP_NO_HINTS=1) suppresses the footers for scripts parsing the listings.
+// The footers are also gated by config `cli.ai_agent_friendly_output`.
 func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, args []string) error {
-	switch verb {
-	case "status":
-		return status(ctx, app, out)
-	case "agents":
-		return agents(ctx, app, out)
-	case "capture":
-		return capture(ctx, app, out, args)
-	case "escalations":
-		return escalations(ctx, app, out, args)
-	case "audit":
-		return audit(ctx, app, out, args)
-	case "confirm":
-		return confirm(ctx, app, out, args)
-	case "resolve", "correct":
-		return resolve(ctx, app, out, args)
-	case "dismiss":
-		return dismiss(ctx, app, out, args)
-	case "pause":
-		if err := app.Pause(ctx); err != nil {
-			return err
-		}
-		fmt.Fprintln(out, "automation paused (kill switch active)")
-		return nil
-	case "resume":
-		if err := app.Resume(ctx); err != nil {
-			return err
-		}
-		fmt.Fprintln(out, "automation resumed")
-		return nil
-	case "kill-history":
-		return killHistory(ctx, app, out)
-	case "config":
-		return configCmd(ctx, app, out, args)
-	case "state-dir":
-		fmt.Fprintln(out, app.StateDir)
-		return nil
-	case "paths":
-		return paths(out, app)
-	case "rules":
-		return rules(ctx, app, out, args)
-	case "task-source":
-		return taskSource(ctx, app, out, args)
-	case "task":
-		return task(ctx, app, out, args)
-	case "rename":
-		return rename(ctx, app, out, args)
-	case "disable":
-		return setAgentDisabled(ctx, app, out, args, true)
-	case "enable":
-		return setAgentDisabled(ctx, app, out, args, false)
-	case "signatures", "sigs":
-		return signatures(ctx, app, out, args)
-	case "clear-data":
-		return clearData(ctx, app, out, args)
+	args, wantHints := stripHintFlag(args)
+
+	// Help is documentation, not command output: its footer is part of the
+	// guide, so neither the config flag nor the suppression switches apply.
+	if verb == "help" || verb == "--help" || verb == "-h" {
+		return help(&hintWriter{Writer: out, on: true}, args)
 	}
-	return fmt.Errorf("unknown command %q", verb)
+	cmd, ok := Lookup(verb)
+	if !ok {
+		return UnknownCommandError(verb)
+	}
+	if wantsHelp(args) {
+		PrintHelp(&hintWriter{Writer: out, on: true}, cmd)
+		return nil
+	}
+
+	// app is carried, not read: the config gate is evaluated when a footer is
+	// actually printed, so a `config set` of the switch obeys its own result.
+	hinted := &hintWriter{Writer: out, on: wantHints && envHintsEnabled(), app: app}
+	if cmd.Handler == nil {
+		// A `Core` entry documented here but dispatched by main (daemon, tui,
+		// mcp, version): reaching Run means main's own switch missed it.
+		return fmt.Errorf("command %q is not available here — run: hap %s", verb, verb)
+	}
+	if err := cmd.Handler(ctx, app, hinted, args); err != nil {
+		return err
+	}
+	// SelfHints verbs print a footer built from live ids; adding the static one
+	// would double it. Bare verbs print a single value for `$(…)` capture.
+	if !cmd.SelfHints && !cmd.Bare {
+		PrintNextSteps(hinted, cmd.Next)
+	}
+	return nil
+}
+
+// help implements `hap help [command]`.
+func help(out io.Writer, args []string) error {
+	if wantsHelp(args) {
+		// `hap help --help`: the guide for help itself, not the overview.
+		if cmd, ok := Lookup("help"); ok {
+			PrintHelp(out, cmd)
+			return nil
+		}
+	}
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		Overview(out)
+		return nil
+	}
+	cmd, ok := Lookup(args[0])
+	if !ok {
+		return UnknownCommandError(args[0])
+	}
+	PrintHelp(out, cmd)
+	return nil
+}
+
+// wantsHelp reports whether the arguments ask for the verb's guide.
+func wantsHelp(args []string) bool {
+	for i, a := range args {
+		if a != "--help" && a != "-h" && a != "-help" {
+			continue
+		}
+		if i > 0 && valueFlagSet()[args[i-1]] {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// stripHintFlag removes a `--no-hints` argument wherever it appears and
+// reports whether footers are still wanted.
+func stripHintFlag(args []string) ([]string, bool) {
+	on := true
+	kept := make([]string, 0, len(args))
+	for i, a := range args {
+		// Same rule as wantsHelp: a `--no-hints` sitting in a value-taking
+		// flag's slot is that flag's VALUE, not our flag.
+		isValue := i > 0 && valueFlagSet()[args[i-1]]
+		isFlag := (a == "--no-hints" || a == "-no-hints") && !isValue
+		if isFlag {
+			on = false
+			continue
+		}
+		kept = append(kept, a)
+	}
+	if on {
+		// Untouched: hand back the caller's slice so nothing depends on a copy.
+		return args, true
+	}
+	return kept, false
 }
 
 func capture(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
-		return fmt.Errorf("usage: capture <agent-name-or-pane-id>")
+		return fmt.Errorf("usage: capture <agent-name-or-pane-id> (see: hap help capture)")
 	}
 	if app.DaemonInfo != nil {
 		running, _, ver := app.DaemonInfo()
@@ -134,7 +176,7 @@ func signatures(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	if strings.HasPrefix(sub, "-") {
 		return signaturesList(ctx, app, out, append([]string{sub}, args...))
 	}
-	return fmt.Errorf("usage: signatures [list|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]|reset <sig-or-prefix> [--yes]|reembed [--force]]")
+	return fmt.Errorf("usage: signatures [list|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]|reset <sig-or-prefix> [--yes]|reembed [--force]] (see: hap help signatures)")
 }
 
 // signaturesReembed re-computes stored signature embeddings for the
@@ -179,7 +221,10 @@ func signaturesReembed(ctx context.Context, app *frontend.App, out io.Writer, ar
 			if err := app.RequestReembed(ctx); err != nil {
 				return err
 			}
-			fmt.Fprintln(out, "daemon nudged — re-embedding runs in the background; check: hap status")
+			fmt.Fprintln(out, "daemon nudged — re-embedding runs in the background")
+			PrintNextSteps(out, []Hint{
+				{Cmd: "hap status", Why: "the drift line clears when it finishes"},
+			})
 			return nil
 		}
 	}
@@ -200,6 +245,10 @@ func signaturesReembed(ctx context.Context, app *frontend.App, out io.Writer, ar
 		fmt.Fprintf(out, "WARNING: %d re-embedded row(s) failed to persist and stay stale — re-run: hap signatures reembed\n",
 			res.PersistFailed)
 	}
+	PrintNextSteps(out, []Hint{
+		{Cmd: "hap status", Why: "confirm the drift line is gone"},
+		{Cmd: "hap signatures list", Why: "the rules that were re-embedded"},
+	})
 	return nil
 }
 
@@ -236,8 +285,14 @@ func signaturesList(ctx context.Context, app *frontend.App, out io.Writer, args 
 	if len(rows) == 0 {
 		if filtered {
 			fmt.Fprintln(out, "no signatures match the filter")
+			PrintNextSteps(out, []Hint{
+				{Cmd: "hap signatures list", Why: "every learned rule, unfiltered"},
+			})
 		} else {
 			fmt.Fprintln(out, "no learned signatures yet — confirm suggestions to teach hap")
+			PrintNextSteps(out, []Hint{
+				{Cmd: "hap escalations", Why: "confirming a suggestion here is what creates a rule"},
+			})
 		}
 		return nil
 	}
@@ -248,13 +303,22 @@ func signaturesList(ctx context.Context, app *frontend.App, out io.Writer, args 
 			r.ConsecutiveConfirmations, graduationN, frontend.ConfidenceLabel(r.Confidence),
 			r.TopAction, r.UpdatedAt.Format("01-02 15:04:05"))
 	}
-	fmt.Fprintf(out, "\n%d signature(s); inspect with: signatures show <prefix>\n", len(rows))
+	fmt.Fprintf(out, "\n%d signature(s)\n", len(rows))
+	// A real prefix from the first row, so the follow-ups are copy-pasteable.
+	prefix := shortSignature(rows[0].Signature)
+	prefix = strings.TrimSuffix(prefix, "…")
+	PrintNextSteps(out, []Hint{
+		{Cmd: "hap signatures show " + prefix, Why: "the original situation, plus recent decisions"},
+		{Cmd: "hap signatures reset " + prefix + " --yes", Why: "back to shadow: it must re-earn graduation before acting alone"},
+		{Cmd: "hap signatures delete " + prefix + " --yes", Why: "erase the rule and its decisions"},
+		{Cmd: "hap signatures list --mode autonomous", Why: "only the rules that act without asking"},
+	})
 	return nil
 }
 
 func signaturesShow(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: signatures show <sig-or-prefix>")
+		return fmt.Errorf("usage: signatures show <sig-or-prefix> (see: hap signatures list)")
 	}
 	row, history, err := app.SignatureDetail(ctx, args[0])
 	if err != nil {
@@ -284,6 +348,18 @@ func signaturesShow(ctx context.Context, app *frontend.App, out io.Writer, args 
 		fmt.Fprintf(out, "last audit #%d (%s): %s — %s\n",
 			a.ID, a.Status, a.Action, a.Rationale)
 	}
+	hints := []Hint{
+		{Cmd: "hap signatures reset " + row.Signature + " --yes", Why: "back to shadow: it must re-earn graduation before acting alone"},
+		{Cmd: "hap signatures delete " + row.Signature + " --yes", Why: "erase the rule and its decisions"},
+	}
+	if a := row.LastAudit; a != nil {
+		hints = append(hints, Hint{
+			Cmd: fmt.Sprintf("hap resolve %d --action TEXT", a.ID),
+			Why: "teach it a different answer from that decision",
+		})
+	}
+	hints = append(hints, Hint{Cmd: "hap signatures list", Why: "every learned rule"})
+	PrintNextSteps(out, hints)
 	return nil
 }
 
@@ -299,7 +375,7 @@ func signaturesDelete(ctx context.Context, app *frontend.App, out io.Writer, arg
 		prefix = fs.Arg(0)
 	}
 	if prefix == "" {
-		return fmt.Errorf("usage: signatures delete <sig-or-prefix> [--yes]")
+		return fmt.Errorf("usage: signatures delete <sig-or-prefix> [--yes] (see: hap signatures list)")
 	}
 	// target holds the exact key once shown to the operator: the confirmed
 	// row and the deleted row must be the same even if the daemon learns
@@ -332,6 +408,10 @@ func signaturesDelete(ctx context.Context, app *frontend.App, out io.Writer, arg
 		return err
 	}
 	fmt.Fprintf(out, "deleted signature %s and %d decision(s); audit rows kept\n", sig, decisions)
+	PrintNextSteps(out, []Hint{
+		{Cmd: "hap signatures list", Why: "confirm it is gone"},
+		{Cmd: "hap escalations", Why: "this situation escalates again until it is re-learned"},
+	})
 	return nil
 }
 
@@ -351,7 +431,7 @@ func signaturesReset(ctx context.Context, app *frontend.App, out io.Writer, args
 		prefix = fs.Arg(0)
 	}
 	if prefix == "" {
-		return fmt.Errorf("usage: signatures reset <sig-or-prefix> [--yes]")
+		return fmt.Errorf("usage: signatures reset <sig-or-prefix> [--yes] (see: hap signatures list)")
 	}
 	target := prefix
 	if !*yes {
@@ -379,6 +459,10 @@ func signaturesReset(ctx context.Context, app *frontend.App, out io.Writer, args
 		return err
 	}
 	fmt.Fprintf(out, "reset signature %s to a fresh rule (shadow, streak 0, confidence cleared); decision history kept\n", sig)
+	PrintNextSteps(out, []Hint{
+		{Cmd: "hap signatures show " + sig, Why: "confirm the mode and streak"},
+		{Cmd: "hap escalations", Why: "it asks again now; confirm the right answer to re-teach it"},
+	})
 	return nil
 }
 
@@ -422,7 +506,7 @@ func stdinIsTTY() bool {
 
 func rename(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) != 2 {
-		return fmt.Errorf("usage: rename <agent-or-name> <new-name>")
+		return fmt.Errorf("usage: rename <agent-or-name> <new-name> (see: hap agents)")
 	}
 	if err := app.RenameAgent(ctx, args[0], args[1]); err != nil {
 		return err
@@ -440,7 +524,7 @@ func setAgentDisabled(ctx context.Context, app *frontend.App, out io.Writer,
 		state = "disabled"
 	}
 	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
-		return fmt.Errorf("usage: %s <agent-name-or-pane-id>", verb)
+		return fmt.Errorf("usage: %s <agent-name-or-pane-id> (see: hap agents)", verb)
 	}
 	if err := app.SetAgentDisabled(ctx, args[0], disabled); err != nil {
 		return err
@@ -527,6 +611,29 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 		fmt.Fprintf(out, "last kill event:     %s by %s at %s\n",
 			st.LatestKill.State, st.LatestKill.Author, st.LatestKill.CreatedAt.Format(time.RFC3339))
 	}
+	// The footer is built from what this status actually found, so the first
+	// suggestion is always the one that matters: revive the daemon, lift the
+	// kill switch, or work the queue.
+	var hints []Hint
+	if app.DaemonInfo != nil && (!h.Running || h.Hung || h.VersionStale) {
+		hints = append(hints, Hint{Cmd: "hap daemon --ensure", Why: "start, or replace, the daemon"})
+	}
+	if st.Paused {
+		hints = append(hints, Hint{Cmd: "hap resume", Why: "lift the kill switch so hap answers again"})
+	}
+	if st.Drift.Detected {
+		hints = append(hints, Hint{Cmd: "hap signatures reembed", Why: "re-embed rules for the current model"})
+	}
+	if st.PendingEscalations > 0 {
+		hints = append(hints, Hint{Cmd: "hap escalations", Why: fmt.Sprintf("answer the %d waiting decision(s)", st.PendingEscalations)})
+	} else {
+		hints = append(hints, Hint{Cmd: "hap escalations", Why: "the queue of decisions hap wants a human for"})
+	}
+	hints = append(hints,
+		Hint{Cmd: "hap agents", Why: "which agents are watched, and their state"},
+		Hint{Cmd: "hap audit --limit 20", Why: "what hap decided recently, and why"})
+	PrintNextSteps(out, hints)
+
 	// A hung daemon or a latched crash-loop give-up is a failure state: exit
 	// non-zero so scripted checks and the operator notice, even though the
 	// status body already explained it.
@@ -552,6 +659,10 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 	}
 	if len(st.MonitoredAgents) == 0 {
 		fmt.Fprintln(out, "no agents detected (is herdr running?)")
+		PrintNextSteps(out, []Hint{
+			{Cmd: "hap status", Why: "check the daemon is running and subscribed"},
+			{Cmd: "hap daemon --ensure", Why: "start it if it is not"},
+		})
 		return nil
 	}
 	// Working directories are fetched only here (and by the TUI): they cost a
@@ -576,13 +687,21 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			name, a.AgentID, a.AgentType, a.Status, automation, cwd)
 	}
+	// The first column is the handle every other command takes, so the footer
+	// spells the follow-ups with <agent> in that position.
+	PrintNextSteps(out, []Hint{
+		{Cmd: "hap task <agent> list", Why: "the agent's task list, with its numbers"},
+		{Cmd: "hap rename <agent-or-pane-id> <name>", Why: "give it a short name task sources can select"},
+		{Cmd: "hap capture <agent>", Why: "re-classify its pane now"},
+		{Cmd: "hap disable <agent>", Why: "stop hap answering for this one agent"},
+	})
 	return nil
 }
 
 func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) > 0 {
 		if args[0] != "prune" {
-			return fmt.Errorf("usage: escalations [prune [minutes]]")
+			return fmt.Errorf("usage: escalations [prune [minutes]] (see: hap help escalations)")
 		}
 		return escalationsPrune(ctx, app, out, args[1:])
 	}
@@ -592,6 +711,11 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 	}
 	if len(esc) == 0 {
 		fmt.Fprintln(out, "no pending escalations")
+		PrintNextSteps(out, []Hint{
+			{Cmd: "hap status", Why: "is automation running at all?"},
+			{Cmd: "hap audit --limit 20", Why: "what hap answered without asking"},
+			{Cmd: "hap agents", Why: "which agents are being watched"},
+		})
 		return nil
 	}
 	names, err := app.Names(ctx)
@@ -621,7 +745,17 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 			fmt.Fprintf(out, "\tembedding failed: %s\n", e.EmbedError)
 		}
 	}
-	fmt.Fprintf(out, "\n%d pending; respond with: confirm <id> | resolve <id> --action TEXT [--send] | dismiss <id>...\n", len(esc))
+	fmt.Fprintf(out, "\n%d pending\n", len(esc))
+	// The footer carries a REAL id — the first row printed, which is the newest
+	// pending one — so a caller can copy a line verbatim instead of translating
+	// a placeholder.
+	id := esc[0].ID
+	PrintNextSteps(out, []Hint{
+		{Cmd: fmt.Sprintf("hap confirm %d --send", id), Why: "the suggestion is right — accept and deliver it"},
+		{Cmd: fmt.Sprintf("hap resolve %d --action TEXT --send", id), Why: "it is wrong — record and send the right answer (@noop = no reply needed)"},
+		{Cmd: fmt.Sprintf("hap dismiss %d", id), Why: "drop it; nothing sent or learned"},
+		{Cmd: "hap escalations prune 120", Why: "dismiss everything older than 2 hours"},
+	})
 	return nil
 }
 
@@ -630,7 +764,7 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 func escalationsPrune(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	minutes := frontend.DefaultPruneMinutes
 	if len(args) > 1 {
-		return fmt.Errorf("usage: escalations prune [minutes]")
+		return fmt.Errorf("usage: escalations prune [minutes] (see: hap help escalations)")
 	}
 	if len(args) == 1 {
 		v, err := strconv.Atoi(args[0])
@@ -644,13 +778,17 @@ func escalationsPrune(ctx context.Context, app *frontend.App, out io.Writer, arg
 		return err
 	}
 	fmt.Fprintf(out, "pruned %d escalation(s) older than %d minute(s); audit rows kept as dismissed\n", n, minutes)
+	PrintNextSteps(out, []Hint{
+		{Cmd: "hap escalations", Why: "what is still pending"},
+		{Cmd: "hap audit --limit 20", Why: "the pruned rows are kept here as dismissed"},
+	})
 	return nil
 }
 
 // dismiss removes pending escalations from the queue without responding.
 func dismiss(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: dismiss <audit-id> [<audit-id>...]")
+		return fmt.Errorf("usage: dismiss <audit-id> [<audit-id>...] (see: hap escalations)")
 	}
 	for _, arg := range args {
 		id, err := strconv.ParseInt(arg, 10, 64)
@@ -726,7 +864,7 @@ func confirm(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 		idArg = fs.Arg(0)
 	}
 	if idArg == "" {
-		return fmt.Errorf("usage: confirm <audit-id> [--send]")
+		return fmt.Errorf("usage: confirm <audit-id> [--send] (see: hap escalations)")
 	}
 	id, err := strconv.ParseInt(idArg, 10, 64)
 	if err != nil {
@@ -768,7 +906,7 @@ func resolve(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 		idArg = fs.Arg(0)
 	}
 	if idArg == "" || *action == "" {
-		return fmt.Errorf("usage: resolve <audit-id> --action TEXT [--send]")
+		return fmt.Errorf("usage: resolve <audit-id> --action TEXT [--send] (see: hap escalations)")
 	}
 	id, err := strconv.ParseInt(idArg, 10, 64)
 	if err != nil {
@@ -813,10 +951,12 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 			return err
 		}
 		printConfig(out, cfg)
+		PrintNextSteps(out, configHints())
 		return nil
 	}
 	switch args[0] {
 	case "path":
+		// Bare on purpose: `$(hap config path)` must be the path alone.
 		fmt.Fprintln(out, app.ConfigPath)
 		return nil
 	case "fields":
@@ -827,6 +967,10 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		for _, key := range frontend.ConfigFieldKeys {
 			fmt.Fprintf(out, "%-40s %s\n", key, frontend.FieldValue(cfg, key))
 		}
+		PrintNextSteps(out, []Hint{
+			{Cmd: "hap config set <field> <value>", Why: "change one of the fields above (the daemon reloads)"},
+			{Cmd: "hap config set-threshold approval 0.80", Why: "shorthand for the confidence_thresholds fields"},
+		})
 		return nil
 	case "set":
 		if len(args) < 3 {
@@ -837,10 +981,11 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 			return err
 		}
 		fmt.Fprintf(out, "%s set to %s (daemon reloaded)\n", args[1], value)
+		PrintNextSteps(out, configHints())
 		return nil
 	case "set-threshold":
 		if len(args) != 3 {
-			return fmt.Errorf("usage: config set-threshold <minimum|idle|approval|choice|error> <value>")
+			return fmt.Errorf("usage: config set-threshold <minimum|idle|approval|choice|error> <value> (see: hap help config)")
 		}
 		v, err := strconv.ParseFloat(args[2], 64)
 		if err != nil {
@@ -850,9 +995,20 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 			return err
 		}
 		fmt.Fprintf(out, "threshold %s set to %.2f (daemon reloaded)\n", args[1], v)
+		PrintNextSteps(out, configHints())
 		return nil
 	}
-	return fmt.Errorf("usage: config [show|fields|path|set <field> <value>|set-threshold <situation> <value>]")
+	return fmt.Errorf("usage: config [show|fields|path|set <field> <value>|set-threshold <situation> <value>] (see: hap help config)")
+}
+
+// configHints are the follow-ups printed after a config read or edit; `config
+// path` deliberately gets none (a script captures it with $(...)).
+func configHints() []Hint {
+	return []Hint{
+		{Cmd: "hap config fields", Why: "every settable field, with its current value"},
+		{Cmd: "hap config set <field> <value>", Why: "change one (the daemon reloads, no restart)"},
+		{Cmd: "hap status", Why: "confirm the daemon picked the change up"},
+	}
 }
 
 // paths prints the resolved config and state paths, labeled, for human use.
@@ -908,6 +1064,10 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 			}
 			fmt.Fprintf(out, "operator scoped #%d\tagent_types=%s\t%s\n", i, scope, r.Pattern)
 		}
+		PrintNextSteps(out, []Hint{
+			{Cmd: "hap rules add <regex>", Why: "force a matching situation to always ask a human"},
+			{Cmd: "hap rules remove <index>", Why: "drop one of the operator patterns listed above"},
+		})
 		return nil
 	}
 	switch {
@@ -916,6 +1076,7 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 			return err
 		}
 		fmt.Fprintf(out, "never-auto pattern added: %s\n", args[1])
+		PrintNextSteps(out, rulesEditedHints())
 		return nil
 	case args[0] == "remove" && len(args) == 2:
 		idx, err := strconv.Atoi(args[1])
@@ -934,9 +1095,19 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 			return err
 		}
 		fmt.Fprintf(out, "operator never-auto pattern #%d removed: %s\n", idx, expected)
+		PrintNextSteps(out, rulesEditedHints())
 		return nil
 	}
-	return fmt.Errorf("usage: rules [list|add <regex>|remove <index>]")
+	return fmt.Errorf("usage: rules [list|add <regex>|remove <index>] (see: hap help rules)")
+}
+
+// rulesEditedHints are the follow-ups after a never-auto pattern changed: the
+// list is what renumbers, and the daemon applies it on its next reload.
+func rulesEditedHints() []Hint {
+	return []Hint{
+		{Cmd: "hap rules list", Why: "the full set, with the indexes `remove` takes"},
+		{Cmd: "hap escalations", Why: "matching situations now always land here"},
+	}
 }
 
 func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
@@ -1016,7 +1187,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 				return fmt.Errorf("flags must come before <checklist.md>: %s was read as an argument, not a flag", extra)
 			}
 		}
-		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--max-tasks N] <checklist.md> | list | set <index> <key> <value> | remove <index>")
+		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--max-tasks N] <checklist.md> | list | set <index> <key> <value> | remove <index> (see: hap help task-source)")
 	}
 	var opts []frontend.TaskSourceOption
 	if *autoSend {
@@ -1043,7 +1214,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 // are meaningful to flip after the fact are exposed; path/agent/workspace are
 // remove-and-re-add, since changing them silently re-points an agent's work.
 func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	const usage = "usage: task-source set <index> <auto-send-when-idle|max-tasks> <value> (see: task-source list)"
+	const usage = "usage: task-source set <index> <auto-send-when-idle|max-tasks> <value> (see: task-source list, hap help task-source)"
 	if len(args) != 3 {
 		return fmt.Errorf("%s", usage)
 	}
@@ -1099,11 +1270,59 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 // Every mutating op re-prints the renumbered list so the caller always sees
 // fresh numbers.
 func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | send <n> [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>"
-	agent, path, args, err := taskTarget(args)
+	agent, path, rest, err := taskTarget(args)
 	if err != nil {
 		return err
 	}
+	if err := taskOp(ctx, app, out, agent, path, rest); err != nil {
+		return err
+	}
+	// One footer for every op, spelled with the target the caller used — the
+	// op-specific output above already said what changed. `list` gets the
+	// shorter set: it has just printed domain.TaskManagementHints, which
+	// already covers start/done and how <n> is addressed.
+	// `list` has just printed domain.TaskManagementHints, and `get`/`show` print
+	// a single line a script may capture: both get the short footer.
+	listing := len(rest) > 0 && (rest[0] == "list" || rest[0] == "ls" ||
+		rest[0] == "get" || rest[0] == "show")
+	PrintNextSteps(out, taskHints(agent, path, listing))
+	return nil
+}
+
+// taskHints are the follow-ups printed under any `hap task` op. They are built
+// from the target the caller addressed the list by (agent name, or --path
+// FILE), so each line can be re-run verbatim.
+func taskHints(agent, path string, listing bool) []Hint {
+	target := agent
+	if target == "" {
+		target = "--path " + domain.ShellQuote(path)
+	}
+	var hints []Hint
+	if listing {
+		hints = []Hint{
+			{Cmd: fmt.Sprintf("hap task %s list --status pending", target), Why: "only what is left"},
+			{Cmd: fmt.Sprintf("hap task %s add \"<text>\"", target), Why: "queue more work"},
+		}
+	} else {
+		hints = []Hint{
+			{Cmd: fmt.Sprintf("hap task %s list", target), Why: "the list with current numbers"},
+			{Cmd: fmt.Sprintf("hap task %s start <n>", target), Why: "mark a task in progress when you begin it"},
+			{Cmd: fmt.Sprintf("hap task %s done <n>", target), Why: "mark it complete"},
+			{Cmd: fmt.Sprintf("hap task %s add \"<text>\"", target), Why: "queue more work"},
+		}
+	}
+	if agent != "" {
+		hints = append(hints, Hint{
+			Cmd: fmt.Sprintf("hap task %s send <n> --yes", agent),
+			Why: "hand a task to the live agent now (it must be idle)",
+		})
+	}
+	return append(hints, Hint{Cmd: "hap help task", Why: "every op, and how <n> is addressed"})
+}
+
+// taskOp runs one checklist operation against an already-resolved target.
+func taskOp(ctx context.Context, app *frontend.App, out io.Writer, agent, path string, args []string) error {
+	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | send <n> [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>\nsee: hap help task"
 	if agent == "" && path == "" {
 		return fmt.Errorf("%s", usage)
 	}
@@ -1126,7 +1345,7 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 	case "add", "create":
 		text := strings.TrimSpace(strings.Join(rest, " "))
 		if text == "" {
-			return fmt.Errorf("usage: task %s add <text>", taskTargetLabel(agent, path))
+			return fmt.Errorf("usage: task %s add <text> (see: hap help task)", taskTargetLabel(agent, path))
 		}
 		items, idx, err := app.AddTask(agent, path, text)
 		if err != nil {
@@ -1143,7 +1362,7 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 		return taskToggle(app, out, agent, path, rest, false)
 	case "update", "edit":
 		if len(rest) < 2 {
-			return fmt.Errorf("usage: task %s update <n> <text>", taskTargetLabel(agent, path))
+			return fmt.Errorf("usage: task %s update <n> <text> (see: hap help task)", taskTargetLabel(agent, path))
 		}
 		it, err := taskItemArg(app, agent, path, rest[:1])
 		if err != nil {
