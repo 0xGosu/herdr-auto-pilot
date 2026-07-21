@@ -1002,6 +1002,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	workspace := fs.String("workspace", "", "workspace name this source applies to (\"*\" wildcards, e.g. \"codex-*\")")
 	template := fs.String("template", "", "next-task prompt template ({next_task_content}, {task_list_path}, {task_list_path_quoted}, {agent_name} placeholders)")
 	autoSend := fs.Bool("auto-send-when-idle", false, "also hand out tasks on the periodic idle poll, not only on a herdr attention event")
+	maxTasks := fs.Int("max-tasks", config.DefaultMaxTasks, "cap on how many checklist items this source may hold before task generation stops refilling it")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1015,16 +1016,20 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 				return fmt.Errorf("flags must come before <checklist.md>: %s was read as an argument, not a flag", extra)
 			}
 		}
-		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] <checklist.md> | list | set <index> <key> <value> | remove <index>")
+		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--max-tasks N] <checklist.md> | list | set <index> <key> <value> | remove <index>")
 	}
 	var opts []frontend.TaskSourceOption
 	if *autoSend {
 		opts = append(opts, frontend.AutoSendWhenIdle())
 	}
+	// Passed unconditionally: guarding on "differs from the default" would
+	// couple this to AddTaskSource's own default and silently drop an explicit
+	// --max-tasks 20 the day either moves.
+	opts = append(opts, frontend.MaxTasks(*maxTasks))
 	if err := app.AddTaskSource(ctx, *agent, *workspace, fs.Arg(0), *template, opts...); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "task source added: %s\n", fs.Arg(0))
+	fmt.Fprintf(out, "task source added: %s (max_tasks=%d)\n", fs.Arg(0), *maxTasks)
 	// Unprompted hand-out is the one setting that makes hap act without a herdr
 	// event, so say so plainly instead of leaving it to `task-source list`.
 	if *autoSend {

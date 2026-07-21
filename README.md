@@ -568,6 +568,7 @@ hap enable backend-dev          # allow automation again
 hap task-source --agent backend-dev ./docs/backend-tasks.md
 hap task-source --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
 hap task-source --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.md
+hap task-source --agent backend-dev --max-tasks 40 ./docs/backend-tasks.md
 ```
 
 `hap agents` output is tab-separated and gained a sixth column — the agent's
@@ -687,7 +688,10 @@ adding tasks (the Tasks tab's `a`, or `hap task … add`) to a registered source
 is rejected once it would push the list past `max_tasks` — so a hand-added list
 can't grow past what the daemon would then refuse to refill. Prune the checklist
 (or raise `max_tasks` — `hap task-source set <index> max-tasks 40`, the *Config*
-tab's `enter` on the source row, or the `[[task_sources]]` entry) to resume. Sending the
+tab's `enter` on the source row, or the `[[task_sources]]` entry) to resume. The
+cap can also be chosen when the source is created: `hap task-source add
+--max-tasks 40 <checklist.md>`, or `--max-tasks 40` in the *Config* tab's `t`
+prompt. Sending the
 remaining pending items of a source under its cap is unaffected, and a `--path`
 file that isn't a registered `[[task_sources]]` entry is never capped.
 

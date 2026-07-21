@@ -2477,6 +2477,14 @@ func AutoSendWhenIdle() TaskSourceOption {
 	return func(src *config.TaskSource) { src.EnableAutoSendTaskWhenIdle = true }
 }
 
+// MaxTasks overrides the new source's task cap (max_tasks). Omitted, a source
+// is created with config.DefaultMaxTasks. AddTaskSource rejects a value below
+// 1 — 0 is what "unset" looks like on disk, so storing it would silently mean
+// the default rather than the "no cap" somebody typing 0 expects.
+func MaxTasks(n int) TaskSourceOption {
+	return func(src *config.TaskSource) { src.MaxTasks = n }
+}
+
 // AddTaskSource points an agent/workspace at a declared task list (FR-011).
 // template optionally overrides the outbound next-task prompt format
 // ({next_task_content} / {task_list_path} / {agent_name} placeholders);
@@ -2497,6 +2505,11 @@ func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, templat
 	}
 	for _, opt := range opts {
 		opt(&src)
+	}
+	// Validated after the options run, so every surface that can set a cap
+	// inherits the same rule from one place.
+	if src.MaxTasks < 1 {
+		return fmt.Errorf("max_tasks must be 1 or greater, got %d", src.MaxTasks)
 	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		cfg.TaskSources = append(cfg.TaskSources, src)

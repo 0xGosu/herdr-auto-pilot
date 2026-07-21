@@ -501,3 +501,97 @@ func TestTasksTabRemoveSourceRefusesAfterReorder(t *testing.T) {
 		t.Errorf("a refused removal must change nothing, got %+v", cfg.TaskSources)
 	}
 }
+
+// TestTUIAddTaskSourceMaxTasksParity pins CLI/TUI parity for the cap: the add
+// prompt takes the same `--max-tasks` flag, in either spelling and any
+// position, alongside the auto-send word.
+func TestTUIAddTaskSourceMaxTasksParity(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string // %s is replaced by the checklist path
+		want  int
+		auto  bool
+	}{
+		{name: "no flag keeps the default", input: "%s", want: config.DefaultMaxTasks},
+		{name: "separate value", input: "%s --max-tasks 40", want: 40},
+		{name: "equals value", input: "%s --max-tasks=7", want: 7},
+		{name: "flag first", input: "--max-tasks 5 %s brave-otter", want: 5},
+		{name: "with auto-send", input: "%s --auto-send-when-idle --max-tasks 12", want: 12, auto: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, app, path := sourcePromptModel(t)
+			msg := submitSourcePrompt(t, m, strings.ReplaceAll(tc.input, "%s", path))
+			if msg.err != nil {
+				t.Fatal(msg.err)
+			}
+			cfg, err := app.Config()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(cfg.TaskSources) != 1 {
+				t.Fatalf("want 1 task source, got %d", len(cfg.TaskSources))
+			}
+			src := cfg.TaskSources[0]
+			if src.Path != path {
+				t.Errorf("path = %q, want %q (a flag value must not be taken as a field)", src.Path, path)
+			}
+			if src.MaxTasks != tc.want {
+				t.Errorf("max_tasks = %d, want %d", src.MaxTasks, tc.want)
+			}
+			if src.EnableAutoSendTaskWhenIdle != tc.auto {
+				t.Errorf("auto-send = %v, want %v", src.EnableAutoSendTaskWhenIdle, tc.auto)
+			}
+			if said := strings.Contains(msg.message, "auto-send when idle ON"); said != tc.auto {
+				t.Errorf("result message announced auto-send = %v, want %v; got %q", said, tc.auto, msg.message)
+			}
+			// The message names the cap that was stored: an operator who typed
+			// the flag must see it was parsed, not read as a positional field.
+			if want := fmt.Sprintf("max_tasks=%d", tc.want); !strings.Contains(msg.message, want) {
+				t.Errorf("result message should report %s, got %q", want, msg.message)
+			}
+		})
+	}
+}
+
+// TestTUIAddTaskSourceMaxTasksErrorWording: a flag with no value at all says
+// so, instead of complaining about an empty string the operator never typed.
+func TestTUIAddTaskSourceMaxTasksErrorWording(t *testing.T) {
+	m, _, path := sourcePromptModel(t)
+	msg := submitSourcePrompt(t, m, path+" --max-tasks")
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "needs a value") {
+		t.Errorf("a valueless --max-tasks should say it needs one, got %v", msg.err)
+	}
+	m, _, path = sourcePromptModel(t)
+	msg = submitSourcePrompt(t, m, path+" --max-task 5")
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "--max-tasks=N") {
+		t.Errorf("the unknown-flag message should spell both accepted forms, got %v", msg.err)
+	}
+}
+
+// TestTUIAddTaskSourceMaxTasksRejectsBadValues: a cap that is not a whole
+// number of tasks — or a flag with no value at all — must be REFUSED, never
+// silently dropped, or the source is created under a cap nobody chose.
+func TestTUIAddTaskSourceMaxTasksRejectsBadValues(t *testing.T) {
+	for _, input := range []string{
+		"/tmp/tasks.md --max-tasks",
+		"/tmp/tasks.md --max-tasks abc",
+		"/tmp/tasks.md --max-tasks=",
+		"/tmp/tasks.md --max-tasks 0",
+		"/tmp/tasks.md --max-tasks -3",
+		"/tmp/tasks.md --max-task 5",
+	} {
+		m, app, _ := sourcePromptModel(t)
+		msg := submitSourcePrompt(t, m, input)
+		if msg.err == nil {
+			t.Errorf("input %q must be rejected, got %q", input, msg.message)
+		}
+		cfg, err := app.Config()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cfg.TaskSources) != 0 {
+			t.Errorf("input %q added a source anyway: %+v", input, cfg.TaskSources)
+		}
+	}
+}

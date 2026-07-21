@@ -1910,3 +1910,48 @@ func TestTaskSourceRemoveDuplicatePath(t *testing.T) {
 		t.Error("an out-of-range index must be refused")
 	}
 }
+
+// TestTaskSourceAddMaxTasks: the cap can be set when the source is created,
+// persists to config.toml, and is validated — the CLI half of the parity the
+// TUI add prompt mirrors.
+func TestTaskSourceAddMaxTasks(t *testing.T) {
+	app, _ := testApp(t)
+	dir := t.TempDir()
+	capped := filepath.Join(dir, "capped.md")
+	plain := filepath.Join(dir, "plain.md")
+
+	out, err := run(t, app, "task-source", "add", "--agent", "a1", "--max-tasks", "40", capped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "max_tasks=40") {
+		t.Errorf("add should report the cap it stored, got:\n%s", out)
+	}
+	// An add that does not ask for a cap gets the default, named explicitly.
+	if _, err = run(t, app, "task-source", "add", "--agent", "a2", plain); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.TaskSources[0].MaxTasks != 40 {
+		t.Errorf("--max-tasks did not persist: %+v", saved.TaskSources[0])
+	}
+	if saved.TaskSources[1].MaxTasks != config.DefaultMaxTasks {
+		t.Errorf("an add without the flag should carry the default cap, got %+v", saved.TaskSources[1])
+	}
+
+	for _, bad := range []string{"0", "-1", "abc"} {
+		if _, err := run(t, app, "task-source", "add", "--max-tasks", bad, plain); err == nil {
+			t.Errorf("--max-tasks %s must be refused", bad)
+		}
+	}
+	// The refused adds must not have created anything.
+	if saved, err = config.Load(app.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.TaskSources) != 2 {
+		t.Errorf("a refused add must not register a source, got %+v", saved.TaskSources)
+	}
+}

@@ -3631,25 +3631,44 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
 	m.openPrompt(&prompt{
-		label: "add task source: <path> [agent] [workspace] [--auto-send-when-idle]",
+		label: "add task source: <path> [agent] [workspace] [--auto-send-when-idle] [--max-tasks N]",
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
-				// Spelled exactly like the CLI flag, and accepted in any
-				// position so the operator never has to remember the order.
+				// Flags are spelled exactly like the CLI's and accepted in any
+				// position, so the operator never has to remember the order.
 				// Any OTHER dashed word is refused rather than taken as a
 				// field: silently storing "--auto-send-when-idl" as the path
 				// would leave the operator believing unprompted hand-out is
 				// on when it is off.
 				var opts []frontend.TaskSourceOption
 				var parts []string
-				for _, f := range strings.Fields(input) {
+				fields := strings.Fields(input)
+				maxTasks := config.DefaultMaxTasks
+				for i := 0; i < len(fields); i++ {
+					f := fields[i]
 					if f == "--auto-send-when-idle" {
 						opts = append(opts, frontend.AutoSendWhenIdle())
 						continue
 					}
+					// --max-tasks takes a value, written either way round:
+					// "--max-tasks 40" or "--max-tasks=40".
+					if value, ok := maxTasksFlagValue(fields, &i); ok {
+						if value == "" {
+							return actionResultMsg{err: fmt.Errorf(
+								"--max-tasks needs a value (e.g. --max-tasks 40)")}
+						}
+						n, err := strconv.Atoi(value)
+						if err != nil {
+							return actionResultMsg{err: fmt.Errorf(
+								"invalid --max-tasks %q — a whole number of tasks", value)}
+						}
+						opts = append(opts, frontend.MaxTasks(n))
+						maxTasks = n
+						continue
+					}
 					if strings.HasPrefix(f, "-") {
 						return actionResultMsg{err: fmt.Errorf(
-							"unknown flag %q — this prompt takes only --auto-send-when-idle (spelled exactly, no =value); use the CLI for anything else", f)}
+							"unknown flag %q — this prompt takes --auto-send-when-idle (spelled exactly, no =value) and --max-tasks N (or --max-tasks=N); use the CLI for anything else", f)}
 					}
 					parts = append(parts, f)
 				}
@@ -3670,14 +3689,49 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 				if err := app.AddTaskSource(ctx, agent, workspace, parts[0], "", opts...); err != nil {
 					return actionResultMsg{err: err}
 				}
-				if len(opts) > 0 {
-					return actionResultMsg{message: "task source added (auto-send when idle ON)"}
+				// Both settings are echoed back: an operator who typed a flag
+				// needs to see it was parsed, not mis-read as a positional
+				// field. Matches the CLI's success line.
+				msg := fmt.Sprintf("task source added (max_tasks=%d)", maxTasks)
+				if autoSendRequested(fields) {
+					msg += " (auto-send when idle ON)"
 				}
-				return actionResultMsg{message: "task source added"}
+				return actionResultMsg{message: msg}
 			}
 		},
 	})
 	return m, nil
+}
+
+// maxTasksFlagValue recognizes the --max-tasks flag at fields[*i] in either
+// spelling ("--max-tasks 40" or "--max-tasks=40"), advancing *i past a
+// separate value word. A trailing "--max-tasks" with nothing after it returns
+// an empty value, which the caller reports as invalid rather than ignoring —
+// silently dropping it would create the source under the default cap.
+func maxTasksFlagValue(fields []string, i *int) (string, bool) {
+	f := fields[*i]
+	if value, ok := strings.CutPrefix(f, "--max-tasks="); ok {
+		return value, true
+	}
+	if f != "--max-tasks" {
+		return "", false
+	}
+	if *i+1 < len(fields) {
+		*i++
+		return fields[*i], true
+	}
+	return "", true
+}
+
+// autoSendRequested reports whether the add prompt's input asked for
+// unprompted hand-out, so the result message can say so.
+func autoSendRequested(fields []string) bool {
+	for _, f := range fields {
+		if f == "--auto-send-when-idle" {
+			return true
+		}
+	}
+	return false
 }
 
 // showSelectedAgentTasks jumps to the Tasks tab for the agent under the

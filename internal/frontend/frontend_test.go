@@ -4568,6 +4568,21 @@ func TestSetTaskSourceSettings(t *testing.T) {
 	if cfg.TaskSources[0].MaxTasks != config.DefaultMaxTasks {
 		t.Errorf("a new source should carry max_tasks=%d, got %d", config.DefaultMaxTasks, cfg.TaskSources[0].MaxTasks)
 	}
+	// The cap can also be chosen at creation time, and is validated there —
+	// every surface that offers it inherits this one rule.
+	third := filepath.Join(dir, "third.md")
+	if err := app.AddTaskSource(ctx, "a3", "", third, "", frontend.MaxTasks(40)); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "a4", "", filepath.Join(dir, "bad.md"), "", frontend.MaxTasks(0)); err == nil {
+		t.Error("MaxTasks(0) must be refused — on disk 0 means unset")
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 3 || cfg.TaskSources[2].MaxTasks != 40 {
+		t.Fatalf("MaxTasks option did not persist (and a refused add must register nothing): %+v", cfg.TaskSources)
+	}
 
 	if err := app.SetTaskSourceAutoSend(ctx, 0, cfg.TaskSources[0], true); err != nil {
 		t.Fatal(err)
