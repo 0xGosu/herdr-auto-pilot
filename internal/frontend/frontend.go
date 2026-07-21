@@ -2784,6 +2784,14 @@ func (a *App) ListTasks(agent, path string) ([]domain.ChecklistItem, error) {
 	return readChecklist(p)
 }
 
+// TaskFilePath resolves the checklist file a task target names, without
+// reading it: an explicit --path (made absolute) wins, otherwise the agent's
+// configured source. Exported for the CLI, which prints the resolved path in
+// the task-management hints under `hap task … list`.
+func (a *App) TaskFilePath(agent, path string) (string, error) {
+	return a.taskFilePath(agent, path)
+}
+
 // ResolveTaskRef maps a task reference — the list's own task id ("3.4"), a
 // bare number, or an explicit position ("#3") — to the item it names. See
 // domain.ResolveTaskRef for the rules.

@@ -88,14 +88,28 @@ func TestDeclaredTaskPrompt(t *testing.T) {
 		want string
 	}{
 		{
-			name: "default template crafts CLI commands with the agent name and a --path fallback",
+			name: "default template points at the list command with the agent name and a --path fallback",
 			task: DeclaredTask{Task: "add validation", Path: "/docs/tasks.md", AgentName: "brave-otter"},
-			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks: `hap task brave-otter list` to view them, `hap task brave-otter start <n>` to mark one in-progress when you begin working on it, and `hap task brave-otter done <n>` to mark it complete as you go (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`). `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.4`); otherwise its position in the list, which `#3` always addresses.",
+			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`).",
 		},
 		{
 			name: "completed list uses none",
 			task: DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md", AgentName: "brave-otter"},
-			want: "Your next task is none. Prefer the hap CLI to manage your tasks: `hap task brave-otter list` to view them, `hap task brave-otter start <n>` to mark one in-progress when you begin working on it, and `hap task brave-otter done <n>` to mark it complete as you go (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`). `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.4`); otherwise its position in the list, which `#3` always addresses.",
+			want: "Your next task is none. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`).",
+		},
+		{
+			name: "default template shell-quotes a path with a space",
+			task: DeclaredTask{Task: "add validation", Path: "/my docs/tasks.md", AgentName: "brave-otter"},
+			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use `--path '/my docs/tasks.md'` in place of `brave-otter`).",
+		},
+		{
+			name: "explicit quoted placeholder in a custom template",
+			task: DeclaredTask{
+				Task:     "x",
+				Path:     "/my docs/t.md",
+				Template: "run `hap task --path {task_list_path_quoted} list`; the file is {task_list_path}",
+			},
+			want: "run `hap task --path '/my docs/t.md' list`; the file is /my docs/t.md",
 		},
 		{
 			name: "custom template",
@@ -857,5 +871,49 @@ func TestHierarchicalTaskFileIsUsable(t *testing.T) {
 	}
 	if got := ParseChecklist(out)[idx-1]; got.Mark != "x" || !strings.HasPrefix(got.Text, "3.4 ") {
 		t.Errorf("after done, item #%d = [%s] %q", idx, got.Mark, got.Text)
+	}
+}
+
+// TestTaskManagementHints pins the instructions `hap task … list` prints: the
+// default prompt no longer carries them, so this text is the only place an
+// agent learns start/done and how <n> is addressed.
+func TestTaskManagementHints(t *testing.T) {
+	got := TaskManagementHints("happy-pelican", "/state/tasks/happy-pelican.md")
+	want := "Prefer using the hap CLI to manage your tasks:\n" +
+		"- `hap task happy-pelican start <n>` to mark one in-progress when you begin working on it.\n" +
+		"- `hap task happy-pelican done <n>` to mark it complete as you go.\n" +
+		"Note:\n" +
+		"- `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.1`); otherwise its position in the list, which `'#3'` always addresses (quote it — a bare #3 is a shell comment).\n" +
+		"- when the agent name `happy-pelican` is no longer recognized, use `--path /state/tasks/happy-pelican.md` in place of `happy-pelican`\n"
+	if got != want {
+		t.Errorf("hints:\n got %q\nwant %q", got, want)
+	}
+}
+
+// A path-addressed list has no agent name, so the commands carry the path and
+// the name-fallback note — which would say "use --path X in place of ”" — is
+// dropped entirely.
+func TestTaskManagementHintsPathOnly(t *testing.T) {
+	got := TaskManagementHints("", "/docs/tasks.md")
+	if !strings.Contains(got, "`hap task --path /docs/tasks.md done <n>`") {
+		t.Errorf("path-only hints must spell commands with the path, got:\n%s", got)
+	}
+	if strings.Contains(got, "no longer recognized") {
+		t.Errorf("path-only hints must not print the name-fallback note, got:\n%s", got)
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/docs/tasks.md", "/docs/tasks.md"},
+		{"/my docs/tasks.md", "'/my docs/tasks.md'"},
+		{"/it's/tasks.md", `'/it'\''s/tasks.md'`},
+		{"", "''"},
+		{"/a;rm -rf b/tasks.md", "'/a;rm -rf b/tasks.md'"},
+	}
+	for _, c := range cases {
+		if got := ShellQuote(c.in); got != c.want {
+			t.Errorf("ShellQuote(%q) = %s, want %s", c.in, got, c.want)
+		}
 	}
 }

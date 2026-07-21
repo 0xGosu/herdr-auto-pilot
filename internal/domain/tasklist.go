@@ -23,22 +23,65 @@ var inProgressItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[-\]\s*(.+)$`)
 // DefaultNextTaskTemplate is the prompt template used when a task source
 // declares none. Placeholders: {next_task_content} is the next unchecked
 // item (or NoTaskContent when the list is complete), {task_list_path} is
-// the task-source file path, {agent_name} is the agent's short name, {cwd}
-// is the agent's working directory (the project it is in).
+// the task-source file path, {task_list_path_quoted} is that path as a single
+// shell word (use it whenever the template hands the agent a command to RUN —
+// a path with a space would otherwise split into two arguments),
+// {agent_name} is the agent's short name, {cwd} is the agent's working
+// directory (the project it is in).
 //
 // The default steers the agent to manage its list through the `hap task` CLI
-// with the agent's own name pre-filled in every command (so `hap task
-// {agent_name} done <n>` resolves this exact source), covering the full task
-// lifecycle: `start <n>` marks a task [-] in-progress the moment the agent
-// begins it (an ordinary source's send leaves the item [ ], so without this
-// nothing records that the task is being worked; a source with
-// enable_auto_send_task_when_idle pre-marks it at delivery, which makes `start`
-// a harmless no-op there), and `done <n>` ticks it off. It also spells out the
-// `--path {task_list_path}` form so a source that
-// isn't name-addressable (one scoped by agent type, pane id, workspace, or
-// "any") is still manageable — `hap task {agent_name}` errors on those, and
-// the path form always works.
-const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them, `hap task {agent_name} start <n>` to mark one in-progress when you begin working on it, and `hap task {agent_name} done <n>` to mark it complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`). `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.4`); otherwise its position in the list, which `#3` always addresses."
+// with the agent's own name pre-filled (so `hap task {agent_name} list`
+// resolves this exact source). It deliberately carries only the pointer to
+// `list`: the full lifecycle instructions (`start <n>`, `done <n>`, how `<n>`
+// is addressed, and the `--path` fallback) are printed by that command itself
+// (TaskManagementHints), so they are stated once, next to the real task
+// numbers, instead of being re-sent with every prompt.
+const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them (if that name isn't recognized, use `--path {task_list_path_quoted}` in place of `{agent_name}`)."
+
+// TaskManagementHints renders the task-management instructions printed under a
+// `hap task … list`. They live here — beside the template that points the agent
+// at `list` — so the prompt and the listing can never drift apart.
+//
+// agent is the name the caller addressed the list by, and path the resolved
+// checklist file. When the caller used --path (agent == ""), every command is
+// spelled with that path and the "name no longer recognized" note is dropped:
+// there is no name to fall back from. That note is what keeps a source that
+// isn't name-addressable (scoped by agent type, pane id, workspace, or "any")
+// manageable — `hap task {agent}` errors on those, and the path form always
+// works.
+func TaskManagementHints(agent, path string) string {
+	quoted := ShellQuote(path)
+	target := agent
+	if target == "" {
+		target = "--path " + quoted
+	}
+	var b strings.Builder
+	b.WriteString("Prefer using the hap CLI to manage your tasks:\n")
+	fmt.Fprintf(&b, "- `hap task %s start <n>` to mark one in-progress when you begin working on it.\n", target)
+	fmt.Fprintf(&b, "- `hap task %s done <n>` to mark it complete as you go.\n", target)
+	b.WriteString("Note:\n")
+	// '#3' is quoted because these commands are run in a shell, where a bare
+	// #3 is stripped as a comment and the ref reaches hap as nothing at all.
+	b.WriteString("- `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.1`); otherwise its position in the list, which `'#3'` always addresses (quote it — a bare #3 is a shell comment).\n")
+	if agent != "" {
+		fmt.Fprintf(&b, "- when the agent name `%s` is no longer recognized, use `--path %s` in place of `%s`\n", agent, quoted, agent)
+	}
+	return b.String()
+}
+
+// shellSafeRE matches a string that needs no quoting to survive a shell word
+// split — the common case, so an ordinary path stays copy-pasteable and plain.
+var shellSafeRE = regexp.MustCompile(`^[A-Za-z0-9_@%+=:,./-]+$`)
+
+// ShellQuote renders s as a single shell word. The hints and the next-task
+// prompt hand agents commands they run in bash, so a checklist path holding a
+// space (or any metacharacter) must arrive as one argument, not two.
+func ShellQuote(s string) string {
+	if s != "" && shellSafeRE.MatchString(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
 
 // NoTaskContent is the {next_task_content} value when a declared list has
 // no unchecked item left: the templated prompt is still delivered so the
@@ -94,6 +137,10 @@ func TemplateOrDefault(template string) string {
 func (t DeclaredTask) Prompt() string {
 	tpl := TemplateOrDefault(t.Template)
 	return strings.NewReplacer(
+		// The quoted form comes first: NewReplacer matches in argument order,
+		// so the shorter {task_list_path} would otherwise consume its prefix
+		// and leave a stray "_quoted" in the prompt.
+		"{task_list_path_quoted}", ShellQuote(t.Path),
 		"{next_task_content}", DecodeTaskNewlines(t.Task),
 		"{task_list_path}", t.Path,
 		"{agent_name}", t.AgentName,

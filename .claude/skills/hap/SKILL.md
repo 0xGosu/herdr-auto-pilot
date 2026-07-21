@@ -587,16 +587,22 @@ changed before the write lands, so a stale keypress never mutates the wrong
 
 ### template placeholders
 
-the prompt sent to the agent is rendered from a template. the default steers the
-agent to manage its list through the `hap task` CLI with its own name pre-filled
-in every command (and a `--path` fallback for sources that aren't name-addressable):
+the prompt sent to the agent is rendered from a template. the default points the
+agent at its own list with its name pre-filled (and a `--path` fallback for
+sources that aren't name-addressable):
 
 ```
-Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them, `hap task {agent_name} start <n>` to mark one in-progress when you begin working on it, and `hap task {agent_name} done <n>` to mark it complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`). `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.4`); otherwise its position in the list, which `#3` always addresses.
+Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them (if that name isn't recognized, use `--path {task_list_path_quoted}` in place of `{agent_name}`).
 ```
+
+the lifecycle instructions themselves (`start <n>`, `done <n>`, how `<n>` is
+addressed, and the `--path` fallback) are printed by `hap task <agent> list` at
+the bottom of its output — stated once beside the real task numbers instead of
+being re-sent with every prompt.
 
 - `{next_task_content}` — the text of the next unchecked item (or `"none"` when the list is complete)
 - `{task_list_path}` — absolute path to the checklist file
+- `{task_list_path_quoted}` — that path as one shell word (quoted only when it needs it); use this, not `{task_list_path}`, inside a command the agent is meant to run
 - `{agent_name}` — the agent's hap-owned short name
 - `{cwd}` — the agent's working directory (the project it is in)
 

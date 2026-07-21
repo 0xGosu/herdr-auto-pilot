@@ -108,6 +108,44 @@ Notes:
   like `key = "ctrl+alt+a"` also work — ctrl+letter, function keys, and
   explicit modified chords are the most reliable.
 
+### Hotkeys for pause / resume / status (optional)
+
+The same `[[keys.command]]` mechanism can drive the CLI directly, so the
+kill switch is one chord away without opening the pane:
+
+```toml
+[[keys.command]]
+key = "prefix+p"
+type = "shell"
+command = "hap pause"
+description = "Pause Auto Prompter (kill switch)"
+
+[[keys.command]]
+key = "prefix+o"
+type = "shell"
+command = "hap resume"
+description = "Resume Auto Prompter"
+
+[[keys.command]]
+key = "prefix+h"
+type = "shell"
+command = "hap status"
+description = "Show Auto Prompter status"
+```
+
+Reload with `herdr server reload-config`, then `ctrl+b p` pauses, `ctrl+b o`
+resumes, and `ctrl+b h` prints the status.
+
+Notes:
+
+- These use the bare `hap` command, which needs the
+  `/usr/local/bin/hap` symlink from the next section. Without it, use the
+  full path to the installed binary instead (under
+  `~/.config/herdr/plugins/<source>/herd-auto-prompter-*/bin/hap`).
+- `hap pause` and `hap resume` are silent state changes; `hap status` prints
+  output, so bind it to a key only if your Herdr build surfaces shell-command
+  output (otherwise read status in the pane).
+
 ### Make the CLI available from any shell
 
 Open the **Auto Prompter** pane with the hotkey above, switch to the **Config**
@@ -441,17 +479,18 @@ error = "#ff5f5f"
 # else the first
 # pending one). Other agent types skip inference entirely and escalate.
 #
-# The prompt sent to the agent is rendered from a template. The default steers
-# the agent to manage its list through the hap CLI with its own name pre-filled
-# (and a --path fallback for sources that aren't name-addressable):
+# The prompt sent to the agent is rendered from a template. The default points
+# the agent at its own list with its name pre-filled (and a --path fallback for
+# sources that aren't name-addressable):
 #   "Your next task is {next_task_content}. Prefer the hap CLI to manage your
-#    tasks: `hap task {agent_name} list` to view them, `hap task {agent_name}
-#    start <n>` to mark one in-progress when you begin working on it, and
-#    `hap task {agent_name} done <n>` to mark it complete as you go (if that
-#    name isn't recognized, use `--path {task_list_path}` in place of
-#    `{agent_name}`). `<n>` is the task's own id when the list numbers its
-#    tasks (e.g. `done 3.4`); otherwise its position in the list, which `#3`
-#    always addresses."
+#    tasks (start/done), run bash `hap task {agent_name} list` to view them
+#    (if that name isn't recognized, use `--path {task_list_path_quoted}` in
+#    place of
+#    `{agent_name}`)."
+# The full instructions — `start <n>`, `done <n>`, how `<n>` is addressed, and
+# the --path fallback — are printed by `hap task <agent> list` itself, so they
+# are stated once beside the real task numbers rather than re-sent with every
+# prompt.
 # When every item is checked off, the templated prompt is never sent: the
 # plugin escalates a confirmable @noop suggestion ("No more pending tasks")
 # instead — unless BOTH llm.task_generate_command and
@@ -464,7 +503,9 @@ agent = "brave-otter" # agent short name, pane id, or type ("" = any)
 workspace = ""        # workspace name; "" or "*" = any, "*" wildcards work
                       # ("codex-*" = starts with, "*-vscode3" = ends with)
 path = "/home/me/project/docs/tasks.md"
-# Optional per-source prompt format ({next_task_content}, {task_list_path}, {agent_name}, {cwd}):
+# Optional per-source prompt format ({next_task_content}, {task_list_path},
+# {task_list_path_quoted} — the path as one shell word, for commands the agent
+# runs — {agent_name}, {cwd}):
 next_task_template = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}. Verify task dependencies before starting. When there is no task available, focus on improving the test coverage of this project."
 # When an [llm].command is configured, each determined task is first reviewed by
 # the LLM before it is sent (see "Reviewing tasks before they are sent" below).
