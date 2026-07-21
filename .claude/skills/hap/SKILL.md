@@ -457,6 +457,13 @@ add a task source with a custom prompt template:
 hap task-source add --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
 ```
 
+add a task source that also hands out tasks on the idle poll (see below —
+this makes hap send without a herdr attention event, so it is opt-in):
+
+```bash
+hap task-source add --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.md
+```
+
 remove a task source by index:
 
 ```bash
@@ -471,9 +478,9 @@ agent is mid-task on it, which makes it the force path.
 
 by default a task only goes out when herdr reports the agent parked, and each
 idle episode is driven once — an agent that finishes and sits there just waits.
-set `enable_auto_send_task_when_idle = true` on a `[[task_sources]]` entry
-(config.toml only) and the daemon also polls every minute, handing its next
-pending `[ ]` item to any matching agent idle for more than a minute:
+set `enable_auto_send_task_when_idle = true` on a `[[task_sources]]` entry and
+the daemon also polls every minute, handing its next pending `[ ]` item to any
+matching agent idle for more than a minute:
 
 ```toml
 [[task_sources]]
@@ -481,6 +488,18 @@ agent = "backend-dev"
 path = "/home/me/project/docs/tasks.md"
 enable_auto_send_task_when_idle = true
 ```
+
+it can be turned on when the source is added, without editing config.toml:
+
+```bash
+hap task-source add --agent backend-dev --auto-send-when-idle ./docs/tasks.md
+```
+
+the TUI's *Config* tab `t` prompt takes the same word:
+`<path> [agent] [workspace] [--auto-send-when-idle]`. it is opt-in everywhere
+and never inferred; existing sources are switched on in config.toml. wherever
+sources are listed (`hap task-source list`, the *Config* tab) an enabled source
+shows `auto_send_when_idle=true`.
 
 - one task, one agent: agents matched by the same source get *different*
   pending items, and the delivered item is marked `[-]` as it is sent (a failed
@@ -581,7 +600,12 @@ marked items win over it. the add/edit prompts take
 multi-line task text: **shift+enter inserts a line break** (ctrl+j on
 terminals that can't report it), the box expands one line per break, **enter
 submits** — stored as the literal `\n` encoding above, decoded back when the
-prompt pre-fills. an action captured against a row aborts if that task's text
+prompt pre-fills. the input is a full line editor, so a typo in the middle of
+a long task is fixed in place: **←/→ move the caret** (ctrl+←/→ by word,
+home/end or ctrl+a/ctrl+e to the ends), typing and backspace/delete act at the
+caret, and the block cursor shows where the next keystroke lands. a prompt
+that pre-fills a value (edit, the prune default) opens with the caret after
+it. the same keys work in every hap prompt, not only the task ones. an action captured against a row aborts if that task's text
 changed before the write lands, so a stale keypress never mutates the wrong
 (renumbered) line.
 

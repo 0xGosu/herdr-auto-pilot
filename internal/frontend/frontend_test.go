@@ -4245,6 +4245,69 @@ func (e *emptyAgentsHerdr) ListAgents(context.Context) ([]domain.AgentTransition
 	return nil, nil
 }
 
+// TestAddTaskSourceAutoSendWhenIdleOption pins the option that turns on
+// unprompted hand-out. Unprompted sending is a safety-relevant capability, so
+// it must be reachable ONLY by asking for it: no option, no flag — including
+// on the bootstrap path that registers a generated task list by itself, which
+// no operator ever opted in for.
+func TestAddTaskSourceAutoSendWhenIdleOption(t *testing.T) {
+	app, st := testApp(t)
+	app.Herdr = &fakeHerdr{}
+	app.StateDir = t.TempDir()
+	ctx := context.Background()
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain.md")
+	auto := filepath.Join(dir, "auto.md")
+
+	if err := app.AddTaskSource(ctx, "quiet-fox", "", plain, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "busy-otter", "", auto, "", frontend.AutoSendWhenIdle()); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Fatalf("want 2 task sources, got %d", len(cfg.TaskSources))
+	}
+	if cfg.TaskSources[0].EnableAutoSendTaskWhenIdle {
+		t.Error("an add with no option must leave auto-send off")
+	}
+	if !cfg.TaskSources[1].EnableAutoSendTaskWhenIdle {
+		t.Error("AutoSendWhenIdle() did not reach the saved source")
+	}
+	// The option must survive a save/load round trip, not just the in-memory
+	// config: the daemon reads the file.
+	reloaded, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.TaskSources[0].EnableAutoSendTaskWhenIdle || !reloaded.TaskSources[1].EnableAutoSendTaskWhenIdle {
+		t.Errorf("auto-send flags did not round-trip through config.toml: %+v", reloaded.TaskSources)
+	}
+
+	// Confirming a generated task list bootstraps a source by itself — no
+	// operator ever opted that one in, so it must come out off.
+	if _, err := st.EnsureAgentName(ctx, "w9:p9"); err != nil {
+		t.Fatal(err)
+	}
+	id := generatedEscalation(t, st, "w9:p9", "Bootstrap a list")
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 3 {
+		t.Fatalf("confirm should have bootstrapped a third source, got %d", len(cfg.TaskSources))
+	}
+	if cfg.TaskSources[2].EnableAutoSendTaskWhenIdle {
+		t.Error("a bootstrapped task source must never enable unprompted hand-out")
+	}
+}
+
 // TestRemoveTaskSourceKeepsChecklistFile pins the contract the TUI's Tasks-tab
 // `x` advertises: removing a source retires the config entry only. Source
 // files are often hand-written docs hap never created and could not restore.

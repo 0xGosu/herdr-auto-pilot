@@ -956,8 +956,9 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 				fmt.Fprintf(out, " template=%q", src.NextTaskTemplate)
 			}
 			// Only shown when on: it is the one source setting that makes hap
-			// hand out tasks unprompted, so it must be visible here — the key
-			// itself is config.toml-only.
+			// hand out tasks unprompted, so it must be visible here. Set it
+			// with `task-source add --auto-send-when-idle`, or by editing
+			// config.toml for a source that already exists.
 			if src.EnableAutoSendTaskWhenIdle {
 				fmt.Fprint(out, " auto_send_when_idle=true")
 			}
@@ -994,17 +995,35 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	agent := fs.String("agent", "", "agent short name, id, or type this source applies to")
 	workspace := fs.String("workspace", "", "workspace name this source applies to (\"*\" wildcards, e.g. \"codex-*\")")
 	template := fs.String("template", "", "next-task prompt template ({next_task_content}, {task_list_path}, {task_list_path_quoted}, {agent_name} placeholders)")
+	autoSend := fs.Bool("auto-send-when-idle", false, "also hand out tasks on the periodic idle poll, not only on a herdr attention event")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] <checklist.md> | list | remove <index>")
+		// Go's flag parsing stops at the first non-flag argument, so a flag
+		// written AFTER the path is silently not applied — say so instead of
+		// printing the generic usage line, which never mentions the ordering.
+		for _, extra := range fs.Args()[min(fs.NArg(), 1):] {
+			if strings.HasPrefix(extra, "-") {
+				return fmt.Errorf("flags must come before <checklist.md>: %s was read as an argument, not a flag", extra)
+			}
+		}
+		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] <checklist.md> | list | remove <index>")
 	}
-	if err := app.AddTaskSource(ctx, *agent, *workspace, fs.Arg(0), *template); err != nil {
+	var opts []frontend.TaskSourceOption
+	if *autoSend {
+		opts = append(opts, frontend.AutoSendWhenIdle())
+	}
+	if err := app.AddTaskSource(ctx, *agent, *workspace, fs.Arg(0), *template, opts...); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "task source added: %s\n", fs.Arg(0))
+	// Unprompted hand-out is the one setting that makes hap act without a herdr
+	// event, so say so plainly instead of leaving it to `task-source list`.
+	if *autoSend {
+		fmt.Fprintln(out, "auto-send when idle is ON: matching idle agents are handed their next pending task without an attention event")
+	}
 	return nil
 }
 

@@ -69,7 +69,7 @@ Operate:
 Configure:
   config [show|fields|path|set <field> <value>|set-threshold <situation> <value>]
   rules [list|add <regex>|remove <index>]      never-auto patterns
-  task-source [add] [--agent A] [--workspace W] [--template T] <checklist.md> | list | remove <index>
+  task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] <checklist.md> | list | remove <index>
   task [<agent> | --path F] list [--status all|pending|done] | get <n> | add <text>
                         | start <n> | done <n> | undone <n> | update <n> <text>
                         | remove <n> | send <n> [--yes]

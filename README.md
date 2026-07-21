@@ -522,7 +522,9 @@ A declared task normally reaches an agent when herdr reports it parked, and
 each idle episode is driven exactly once — so an agent that finishes its work
 and sits there without a further event waits for you.
 
-Set `enable_auto_send_task_when_idle = true` on a source and the daemon also
+Set `enable_auto_send_task_when_idle = true` on a source — or add the source
+with `hap task-source add --auto-send-when-idle <checklist.md>`, or type
+`--auto-send-when-idle` in the *Config* tab's `t` prompt — and the daemon also
 polls once a minute: any agent that source matches which has been idle for
 more than a minute is handed its next pending `[ ]` item. Delivery goes
 through the normal pipeline, so the kill switch, never-auto patterns, rate
@@ -563,6 +565,7 @@ hap disable backend-dev         # stop automation for only this agent
 hap enable backend-dev          # allow automation again
 hap task-source --agent backend-dev ./docs/backend-tasks.md
 hap task-source --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
+hap task-source --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.md
 ```
 
 `hap agents` output is tab-separated and gained a sixth column — the agent's

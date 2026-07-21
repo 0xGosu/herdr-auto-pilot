@@ -260,7 +260,8 @@ terminal_bell = true       # ring the terminal bell (\a) on new escalations and 
 # agent that is disabled, rate-paused or has an escalation still awaiting you is
 # skipped. Reserving belongs to the SOURCE, so ordinary event-driven sends from
 # it are marked "[-]" too (the agent's own `hap task ... start` is then a
-# no-op). Default: off.
+# no-op). Default: off. A new source can be added with it already on:
+# `hap task-source add --auto-send-when-idle <checklist.md>`.
 # enable_auto_send_task_when_idle = true
 
 # ── Custom classifier rules (repeatable, extend the built-ins) ──────
