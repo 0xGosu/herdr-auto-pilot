@@ -263,8 +263,10 @@ type TaskSource struct {
 	Path      string `toml:"path"` // markdown checklist file
 	// NextTaskTemplate overrides the outbound prompt format. Placeholders:
 	// {next_task_content} (next unchecked item, or "none" when the list is
-	// complete), {task_list_path}, {agent_name} (the agent's short name), and
-	// {cwd} (the agent's working directory). Empty uses the built-in default.
+	// complete), {task_list_path}, {task_list_path_quoted} (that path as one
+	// shell word — use it inside any command the template hands the agent to
+	// run), {agent_name} (the agent's short name), and {cwd} (the agent's
+	// working directory). Empty uses the built-in default.
 	NextTaskTemplate string `toml:"next_task_template,omitempty"`
 	// EnableLLMReview gates the pre-send LLM review of this source's
 	// determined tasks. When an [llm].command is configured, a determined

@@ -592,7 +592,7 @@ agent at its own list with its name pre-filled (and a `--path` fallback for
 sources that aren't name-addressable):
 
 ```
-Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`).
+Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them (if that name isn't recognized, use `--path {task_list_path_quoted}` in place of `{agent_name}`).
 ```
 
 the lifecycle instructions themselves (`start <n>`, `done <n>`, how `<n>` is
@@ -602,6 +602,7 @@ being re-sent with every prompt.
 
 - `{next_task_content}` — the text of the next unchecked item (or `"none"` when the list is complete)
 - `{task_list_path}` — absolute path to the checklist file
+- `{task_list_path_quoted}` — that path as one shell word (quoted only when it needs it); use this, not `{task_list_path}`, inside a command the agent is meant to run
 - `{agent_name}` — the agent's hap-owned short name
 - `{cwd}` — the agent's working directory (the project it is in)
 

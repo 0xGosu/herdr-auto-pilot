@@ -993,7 +993,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	fs := flag.NewFlagSet("task-source", flag.ContinueOnError)
 	agent := fs.String("agent", "", "agent short name, id, or type this source applies to")
 	workspace := fs.String("workspace", "", "workspace name this source applies to (\"*\" wildcards, e.g. \"codex-*\")")
-	template := fs.String("template", "", "next-task prompt template ({next_task_content}, {task_list_path}, {agent_name} placeholders)")
+	template := fs.String("template", "", "next-task prompt template ({next_task_content}, {task_list_path}, {task_list_path_quoted}, {agent_name} placeholders)")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err

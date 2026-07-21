@@ -98,6 +98,20 @@ func TestDeclaredTaskPrompt(t *testing.T) {
 			want: "Your next task is none. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`).",
 		},
 		{
+			name: "default template shell-quotes a path with a space",
+			task: DeclaredTask{Task: "add validation", Path: "/my docs/tasks.md", AgentName: "brave-otter"},
+			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use `--path '/my docs/tasks.md'` in place of `brave-otter`).",
+		},
+		{
+			name: "explicit quoted placeholder in a custom template",
+			task: DeclaredTask{
+				Task:     "x",
+				Path:     "/my docs/t.md",
+				Template: "run `hap task --path {task_list_path_quoted} list`; the file is {task_list_path}",
+			},
+			want: "run `hap task --path '/my docs/t.md' list`; the file is /my docs/t.md",
+		},
+		{
 			name: "custom template",
 			task: DeclaredTask{
 				Task:     "wire logging",

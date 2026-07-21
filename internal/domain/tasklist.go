@@ -23,8 +23,11 @@ var inProgressItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[-\]\s*(.+)$`)
 // DefaultNextTaskTemplate is the prompt template used when a task source
 // declares none. Placeholders: {next_task_content} is the next unchecked
 // item (or NoTaskContent when the list is complete), {task_list_path} is
-// the task-source file path, {agent_name} is the agent's short name, {cwd}
-// is the agent's working directory (the project it is in).
+// the task-source file path, {task_list_path_quoted} is that path as a single
+// shell word (use it whenever the template hands the agent a command to RUN —
+// a path with a space would otherwise split into two arguments),
+// {agent_name} is the agent's short name, {cwd} is the agent's working
+// directory (the project it is in).
 //
 // The default steers the agent to manage its list through the `hap task` CLI
 // with the agent's own name pre-filled (so `hap task {agent_name} list`
@@ -33,7 +36,7 @@ var inProgressItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[-\]\s*(.+)$`)
 // is addressed, and the `--path` fallback) are printed by that command itself
 // (TaskManagementHints), so they are stated once, next to the real task
 // numbers, instead of being re-sent with every prompt.
-const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`)."
+const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them (if that name isn't recognized, use `--path {task_list_path_quoted}` in place of `{agent_name}`)."
 
 // TaskManagementHints renders the task-management instructions printed under a
 // `hap task … list`. They live here — beside the template that points the agent
@@ -134,6 +137,10 @@ func TemplateOrDefault(template string) string {
 func (t DeclaredTask) Prompt() string {
 	tpl := TemplateOrDefault(t.Template)
 	return strings.NewReplacer(
+		// The quoted form comes first: NewReplacer matches in argument order,
+		// so the shorter {task_list_path} would otherwise consume its prefix
+		// and leave a stray "_quoted" in the prompt.
+		"{task_list_path_quoted}", ShellQuote(t.Path),
 		"{next_task_content}", DecodeTaskNewlines(t.Task),
 		"{task_list_path}", t.Path,
 		"{agent_name}", t.AgentName,

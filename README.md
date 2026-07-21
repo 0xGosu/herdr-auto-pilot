@@ -484,7 +484,8 @@ error = "#ff5f5f"
 # sources that aren't name-addressable):
 #   "Your next task is {next_task_content}. Prefer the hap CLI to manage your
 #    tasks (start/done), run bash `hap task {agent_name} list` to view them
-#    (if that name isn't recognized, use `--path {task_list_path}` in place of
+#    (if that name isn't recognized, use `--path {task_list_path_quoted}` in
+#    place of
 #    `{agent_name}`)."
 # The full instructions — `start <n>`, `done <n>`, how `<n>` is addressed, and
 # the --path fallback — are printed by `hap task <agent> list` itself, so they
@@ -502,7 +503,9 @@ agent = "brave-otter" # agent short name, pane id, or type ("" = any)
 workspace = ""        # workspace name; "" or "*" = any, "*" wildcards work
                       # ("codex-*" = starts with, "*-vscode3" = ends with)
 path = "/home/me/project/docs/tasks.md"
-# Optional per-source prompt format ({next_task_content}, {task_list_path}, {agent_name}, {cwd}):
+# Optional per-source prompt format ({next_task_content}, {task_list_path},
+# {task_list_path_quoted} — the path as one shell word, for commands the agent
+# runs — {agent_name}, {cwd}):
 next_task_template = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}. Verify task dependencies before starting. When there is no task available, focus on improving the test coverage of this project."
 # When an [llm].command is configured, each determined task is first reviewed by
 # the LLM before it is sent (see "Reviewing tasks before they are sent" below).

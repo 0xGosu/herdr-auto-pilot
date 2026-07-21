@@ -228,7 +228,9 @@ terminal_bell = true       # ring the terminal bell (\a) on new escalations and 
 # A list may number its own tasks ("- [ ] 3.4 create the public link") — those
 # ids are what `hap task <agent> done 3.4` addresses, while `#3` always means
 # the third item in the file.
-# next_task_template placeholders: {next_task_content}, {task_list_path}, {agent_name}, {cwd}
+# next_task_template placeholders: {next_task_content}, {task_list_path},
+# {task_list_path_quoted} (that path as ONE shell word — use it whenever the
+# template hands the agent a command to run), {agent_name}, {cwd}
 # next_task_template = "Your next task is {next_task_content}.\nRead the full tasks list at {task_list_path}. Verify task dependencies before starting. Once you have completed your task, mark it as done (`[x]`) in the tasks list.\nIf you are unsure what to do, ask for clarification. When there is no task available, focus on improving the test coverage of this project."
 # When an [llm].command is configured, each determined task is first REVIEWED by
 # the LLM (via the get_context/submit_decision MCP tools): it sees the live pane
