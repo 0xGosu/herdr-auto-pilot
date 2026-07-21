@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
@@ -138,7 +139,116 @@ type prompt struct {
 	// operator picks from the known set instead of typing a name blind.
 	options []string
 	optIdx  int
+	// cursor is the caret's position as a RUNE index into input (0 = before
+	// the first rune, len = past the last), so every edit lands where the
+	// operator put it instead of always at the end. Rune-indexed, not
+	// byte-indexed: a task can hold any UTF-8, and slicing a multi-byte rune
+	// in half would corrupt the text. A prompt opened with a pre-filled value
+	// starts with the caret at the end — see openPrompt, which is how every
+	// prompt must be installed so this can never be left at 0 by accident.
+	cursor int
 }
+
+// openPrompt installs p as the active prompt, parking the caret at the end of
+// any pre-filled text so a default value reads as "typed already" and can be
+// appended to or backspaced immediately.
+func (m *Model) openPrompt(p *prompt) {
+	p.cursor = len([]rune(promptNewlines.Replace(p.input)))
+	m.prompt = p
+}
+
+// runes returns the input as a rune slice with line breaks normalized, plus
+// the caret clamped into it. Every edit and the renderer go through this, so a
+// cursor left stale by a direct `input` assignment can never slice out of
+// range — it just behaves as if it sat at the end.
+func (p *prompt) runes() ([]rune, int) {
+	r := []rune(promptNewlines.Replace(p.input))
+	return r, min(max(p.cursor, 0), len(r))
+}
+
+// insert puts s at the caret and leaves the caret after it.
+func (p *prompt) insert(s string) {
+	r, cur := p.runes()
+	ins := []rune(s)
+	next := make([]rune, 0, len(r)+len(ins))
+	next = append(next, r[:cur]...)
+	next = append(next, ins...)
+	next = append(next, r[cur:]...)
+	p.input = string(next)
+	p.cursor = cur + len(ins)
+}
+
+// deleteBefore removes the rune before the caret (backspace); deleteAt removes
+// the one under it (delete). Both are no-ops at their respective edges.
+func (p *prompt) deleteBefore() {
+	r, cur := p.runes()
+	if cur == 0 {
+		return
+	}
+	p.input = string(append(append([]rune{}, r[:cur-1]...), r[cur:]...))
+	p.cursor = cur - 1
+}
+
+func (p *prompt) deleteAt() {
+	r, cur := p.runes()
+	if cur >= len(r) {
+		return
+	}
+	p.input = string(append(append([]rune{}, r[:cur]...), r[cur+1:]...))
+	p.cursor = cur
+}
+
+// moveBy shifts the caret by n runes, stopping at either edge.
+func (p *prompt) moveBy(n int) {
+	r, cur := p.runes()
+	p.cursor = min(max(cur+n, 0), len(r))
+}
+
+// moveTo parks the caret at an absolute rune index (clamped).
+func (p *prompt) moveTo(i int) {
+	r, _ := p.runes()
+	p.cursor = min(max(i, 0), len(r))
+}
+
+// moveEnd parks the caret past the last rune. It measures the NORMALIZED text
+// (runes()), not the raw input: a pasted "\r\n" is one rune there and two in
+// the raw string, so measuring the raw one would overshoot.
+func (p *prompt) moveEnd() {
+	r, _ := p.runes()
+	p.cursor = len(r)
+}
+
+// wordLeft/wordRight give ctrl+←/ctrl+→ their usual meaning: skip any run of
+// spaces, then the word beside it. Task text is prose, so word-wise motion is
+// what makes a long line editable without holding an arrow key down.
+func (p *prompt) wordLeft() {
+	r, cur := p.runes()
+	for cur > 0 && isPromptSpace(r[cur-1]) {
+		cur--
+	}
+	for cur > 0 && !isPromptSpace(r[cur-1]) {
+		cur--
+	}
+	p.cursor = cur
+}
+
+func (p *prompt) wordRight() {
+	r, cur := p.runes()
+	for cur < len(r) && isPromptSpace(r[cur]) {
+		cur++
+	}
+	for cur < len(r) && !isPromptSpace(r[cur]) {
+		cur++
+	}
+	p.cursor = cur
+}
+
+// isPromptSpace uses unicode.IsSpace rather than an ASCII set: task text is
+// known to carry U+00A0 (Claude renders todo rows with it), and treating a
+// non-breaking space as a word character would make ctrl+←/→ jump over a whole
+// phrase. It also covers \r, so word motion is correct whether or not the
+// caller normalized first.
+func isPromptSpace(r rune) bool { return unicode.IsSpace(r) }
 
 // promptNewlines normalizes any line-break flavor (\r\n, bare \r — common in
 // terminal bracketed paste) to \n so the prompt renders one input line per
@@ -178,7 +288,11 @@ func (m Model) submitPrompt() (tea.Model, tea.Cmd) {
 		// Picker mode: submit the highlighted option verbatim.
 		return m, p.onSubmit(p.options[p.optIdx])
 	}
-	input := strings.TrimSpace(p.input)
+	// Normalize the line breaks here too, not only in the edit helpers: an
+	// untouched pre-filled or pasted value would otherwise submit raw CRLF
+	// while the same value submits LF the moment any key is pressed, and that
+	// difference gets baked into the checklist file by EncodeTaskNewlines.
+	input := strings.TrimSpace(promptNewlines.Replace(p.input))
 	if input == "" {
 		m.message = "cancelled"
 		return m, nil
@@ -709,7 +823,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// multiline prompt; everywhere else it is ignored like any unknown key.
 	if isShiftEnter(msg) {
 		if m.prompt != nil && m.prompt.multiline {
-			m.prompt.input += "\n"
+			m.prompt.insert("\n")
 		}
 		return m, nil
 	}
@@ -1044,22 +1158,45 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.message = "cancelled"
 			return m, nil
 		case tea.KeyBackspace:
-			if r := []rune(m.prompt.input); len(r) > 0 {
-				m.prompt.input = string(r[:len(r)-1])
-			}
+			m.prompt.deleteBefore()
+			return m, nil
+		case tea.KeyDelete:
+			m.prompt.deleteAt()
 			return m, nil
 		case tea.KeySpace:
-			m.prompt.input += " "
+			m.prompt.insert(" ")
 			return m, nil
 		case tea.KeyCtrlJ:
 			if m.prompt.multiline {
-				m.prompt.input += "\n"
+				m.prompt.insert("\n")
 			}
+			return m, nil
+		// Caret motion: the input is a full line editor, so a typo in the
+		// middle of a long task is fixed in place instead of retyping the
+		// tail. ctrl+a/ctrl+e mirror the readline bindings a terminal
+		// operator already has in muscle memory.
+		case tea.KeyLeft:
+			m.prompt.moveBy(-1)
+			return m, nil
+		case tea.KeyRight:
+			m.prompt.moveBy(1)
+			return m, nil
+		case tea.KeyCtrlLeft:
+			m.prompt.wordLeft()
+			return m, nil
+		case tea.KeyCtrlRight:
+			m.prompt.wordRight()
+			return m, nil
+		case tea.KeyHome, tea.KeyCtrlA:
+			m.prompt.moveTo(0)
+			return m, nil
+		case tea.KeyEnd, tea.KeyCtrlE:
+			m.prompt.moveEnd()
 			return m, nil
 		case tea.KeyRunes:
 			// Only printable input; key names like "up"/"home" must not
 			// leak into the text.
-			m.prompt.input += string(msg.Runes)
+			m.prompt.insert(string(msg.Runes))
 			return m, nil
 		default:
 			return m, nil
@@ -1446,7 +1583,7 @@ func (m Model) confirmAuditID(id int64) (tea.Model, tea.Cmd) {
 func (m Model) openAddPrompt(id int64) (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.message = ""
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: fmt.Sprintf("agent is busy — add the tasks to its task list instead? [y/N] (#%d)", id),
 		onSubmit: func(input string) tea.Cmd {
 			if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(input)), "y") {
@@ -1461,7 +1598,7 @@ func (m Model) openAddPrompt(id int64) (tea.Model, tea.Cmd) {
 				return actionResultMsg{message: fmt.Sprintf("added #%d to task list (not sent)", id)}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -1483,7 +1620,7 @@ func (m Model) correctSelected() (tea.Model, tea.Cmd) {
 func (m Model) correctByID(id int64, live bool) (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: fmt.Sprintf("correct #%d — action to record", id),
 		onSubmit: func(input string) tea.Cmd {
 			if live {
@@ -1498,7 +1635,7 @@ func (m Model) correctByID(id int64, live bool) (tea.Model, tea.Cmd) {
 				return actionResultMsg{message: fmt.Sprintf("correction recorded for #%d", id)}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -1509,7 +1646,7 @@ func (m Model) correctByID(id int64, live bool) (tea.Model, tea.Cmd) {
 func (m Model) openSendPrompt(id int64, action string) (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.message = ""
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: fmt.Sprintf("send corrected action to the agent now? [y/N] (#%d)", id),
 		input: "n",
 		onSubmit: func(input string) tea.Cmd {
@@ -1524,7 +1661,7 @@ func (m Model) openSendPrompt(id int64, action string) (tea.Model, tea.Cmd) {
 				return actionResultMsg{message: fmt.Sprintf("correction recorded for #%d (not sent)", id)}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -1669,7 +1806,7 @@ func (m Model) deleteEscalations() (tea.Model, tea.Cmd) {
 func (m Model) pruneEscalationsPrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: "prune escalations older than N minutes — enter confirms, esc cancels",
 		input: strconv.Itoa(frontend.DefaultPruneMinutes),
 		onSubmit: func(input string) tea.Cmd {
@@ -1686,7 +1823,7 @@ func (m Model) pruneEscalationsPrompt() (tea.Model, tea.Cmd) {
 					"pruned %d escalation(s) older than %d minute(s); audit rows kept as dismissed", n, minutes)}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -2032,7 +2169,7 @@ func (m Model) addTaskPrompt() (tea.Model, tea.Cmd) {
 	}
 	app, path := m.app, r.path
 	m.beginAction()
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: fmt.Sprintf("new task(s) for %s — enter: add, shift+enter: new line, esc: cancel",
 			truncatePathKeepBase(path, taskPathDisplayWidth)),
 		multiline: true,
@@ -2045,7 +2182,7 @@ func (m Model) addTaskPrompt() (tea.Model, tea.Cmd) {
 				return actionResultMsg{message: fmt.Sprintf("added task #%d", n)}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -2068,7 +2205,7 @@ func (m Model) editTaskPrompt() (tea.Model, tea.Cmd) {
 func (m Model) editTaskRowPrompt(r taskRow) (tea.Model, tea.Cmd) {
 	app, path, idx, stored := m.app, r.path, r.item, r.itemText
 	m.beginAction()
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label:     fmt.Sprintf("edit task #%d — enter: save, shift+enter: new line, esc: cancel", idx),
 		input:     domain.DecodeTaskNewlines(stored),
 		multiline: true,
@@ -2080,7 +2217,7 @@ func (m Model) editTaskRowPrompt(r taskRow) (tea.Model, tea.Cmd) {
 				return actionResultMsg{message: fmt.Sprintf("task #%d updated", idx)}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -2229,7 +2366,7 @@ func (m Model) renameSelected() (tea.Model, tea.Cmd) {
 	target := agent.AgentID
 	app, ctx := m.app, m.ctx
 	m.beginAction()
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: fmt.Sprintf("rename %s (%s) to", orDash(current), agent.AgentID),
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
@@ -2239,7 +2376,7 @@ func (m Model) renameSelected() (tea.Model, tea.Cmd) {
 				return actionResultMsg{message: fmt.Sprintf("agent renamed to %q", input)}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -3032,7 +3169,7 @@ func (m Model) deleteSignaturePrompt() (tea.Model, tea.Cmd) {
 	sig, decisions := row.Signature, row.TotalDecisions
 	app, ctx := m.app, m.ctx
 	m.beginAction()
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: fmt.Sprintf("type 'yes' to delete %s and its %d decision(s)", shortSig(sig), decisions),
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
@@ -3047,7 +3184,7 @@ func (m Model) deleteSignaturePrompt() (tea.Model, tea.Cmd) {
 					"deleted %s and %d decision(s); audit rows kept", shortSig(deleted), n)}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -3063,7 +3200,7 @@ func (m Model) resetGraduationPrompt() (tea.Model, tea.Cmd) {
 	sig := row.Signature
 	app, ctx := m.app, m.ctx
 	m.beginAction()
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: fmt.Sprintf("type 'yes' to reset %s to a fresh rule (shadow, streak → 0, confidence cleared)", shortSig(sig)),
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
@@ -3078,7 +3215,7 @@ func (m Model) resetGraduationPrompt() (tea.Model, tea.Cmd) {
 					"reset %s to a fresh rule (shadow, streak 0, confidence cleared); history kept", shortSig(reset))}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -3220,18 +3357,18 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		m.prompt = &prompt{
+		m.openPrompt(&prompt{
 			label:    fmt.Sprintf("select %s (↑/↓ then enter, current %s)", key, cur),
 			options:  opts,
 			optIdx:   idx,
 			onSubmit: submit,
-		}
+		})
 		return m, nil
 	}
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label:    fmt.Sprintf("set %s (current %s)", key, frontend.FieldValue(m.data.cfg, key)),
 		onSubmit: submit,
-	}
+	})
 	return m, nil
 }
 
@@ -3249,7 +3386,7 @@ func configFieldChoices(key string) (choices []string, ok bool) {
 func (m Model) addPatternPrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: "add never-auto regex",
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
@@ -3259,14 +3396,14 @@ func (m Model) addPatternPrompt() (tea.Model, tea.Cmd) {
 				return actionResultMsg{message: "never-auto pattern added"}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
 func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: "add task source: <path> [agent] [workspace] [--auto-send-when-idle]",
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
@@ -3312,7 +3449,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 				return actionResultMsg{message: "task source added"}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -3497,7 +3634,7 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 func (m Model) clearDataPrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
-	m.prompt = &prompt{
+	m.openPrompt(&prompt{
 		label: "type 'yes' to permanently clear learned history + audit data",
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
@@ -3510,7 +3647,7 @@ func (m Model) clearDataPrompt() (tea.Model, tea.Cmd) {
 				return actionResultMsg{message: "learned history and audit data cleared"}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -3619,13 +3756,18 @@ func (m Model) View() string {
 		}
 	} else if m.prompt != nil {
 		// A multiline input expands the box: one rendered line per line break,
-		// continuation lines indented under the label, cursor on the last.
-		lines := strings.Split(promptNewlines.Replace(m.prompt.input), "\n")
+		// continuation lines indented under the label. The caret is drawn AT
+		// its rune index rather than always at the end, so the operator can
+		// see where the next keystroke lands; with the caret at the end this
+		// renders exactly as it always did.
+		r, cur := m.prompt.runes()
+		withCaret := string(r[:cur]) + "█" + string(r[cur:])
+		lines := strings.Split(withCaret, "\n")
 		fmt.Fprintf(&b, "\n%s> %s", m.prompt.label, lines[0])
 		for _, l := range lines[1:] {
 			fmt.Fprintf(&b, "\n  %s", l)
 		}
-		fmt.Fprint(&b, "█\n")
+		fmt.Fprint(&b, "\n")
 	}
 	if m.confirm != nil {
 		fmt.Fprintf(&b, "\n%s\n", m.confirm.label)
@@ -3689,6 +3831,20 @@ func (m Model) helpLine() string {
 	}
 	if m.searching {
 		return "type to filter  backspace: erase  esc/enter: apply & close"
+	}
+	// The caret bindings are advertised here rather than in the prompt label:
+	// the label is inside the prompt box, whose height listPageSize budgets as
+	// one row, so a longer label would silently wrap and cost a list row.
+	if m.prompt != nil {
+		if len(m.prompt.options) > 0 {
+			return "↑/↓: choose  enter: select  esc: cancel"
+		}
+		newline := ""
+		if m.prompt.multiline {
+			newline = "  shift+enter: new line"
+		}
+		return "←/→: move (ctrl: by word)  home/end: line ends" + newline +
+			"  enter: submit  esc: cancel"
 	}
 	if m.confirm != nil {
 		return "y/enter: confirm  n/esc: cancel"

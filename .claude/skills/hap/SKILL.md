@@ -600,7 +600,12 @@ marked items win over it. the add/edit prompts take
 multi-line task text: **shift+enter inserts a line break** (ctrl+j on
 terminals that can't report it), the box expands one line per break, **enter
 submits** — stored as the literal `\n` encoding above, decoded back when the
-prompt pre-fills. an action captured against a row aborts if that task's text
+prompt pre-fills. the input is a full line editor, so a typo in the middle of
+a long task is fixed in place: **←/→ move the caret** (ctrl+←/→ by word,
+home/end or ctrl+a/ctrl+e to the ends), typing and backspace/delete act at the
+caret, and the block cursor shows where the next keystroke lands. a prompt
+that pre-fills a value (edit, the prune default) opens with the caret after
+it. the same keys work in every hap prompt, not only the task ones. an action captured against a row aborts if that task's text
 changed before the write lands, so a stale keypress never mutates the wrong
 (renumbered) line.
 
