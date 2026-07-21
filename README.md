@@ -328,8 +328,17 @@ gates and remain visible in the same audit trail.
    question (no Submit pseudo-option); delivery verifies every live question
    transition and explicitly submits the completed form.
 2. **Confirm or correct.** In the TUI's *Escalations* tab press `enter` to
-   confirm the suggestion (and send it), or `c` to type the correct
-   response — `v` shows the full record (trigger, rationale, LLM output,
+   confirm the suggestion **and send it**, `y` to confirm **without sending**
+   (the rule is learned exactly the same way, but nothing reaches the agent —
+   the TUI half of `hap confirm <id>` with no `--send`), or `c` to type the
+   correct response. `y` also acts on a whole `space`-marked batch, which
+   `enter` deliberately does not: recording agreement touches no agent, while
+   one keypress firing keystrokes into several live panes would. Two things `y`
+   does *not* do: it does not answer the agent — the escalation leaves the
+   queue but a blocked pane stays blocked until something replies — and on a
+   **generated-task** suggestion it still queues the tasks to the agent's list
+   and registers its task source (only the pane delivery is skipped). `v` shows
+   the full record (trigger, rationale, LLM output,
    agent type, and the **matched rule** — the exact learned signature this
    situation resolved to, with its mode/streak/confidence/top action, or
    "none yet" for a first sighting) when the list line is truncated; it
