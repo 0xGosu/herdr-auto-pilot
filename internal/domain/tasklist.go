@@ -1,8 +1,10 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -36,7 +38,7 @@ var inProgressItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[-\]\s*(.+)$`)
 // isn't name-addressable (one scoped by agent type, pane id, workspace, or
 // "any") is still manageable — `hap task {agent_name}` errors on those, and
 // the path form always works.
-const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them, `hap task {agent_name} start <n>` to mark one in-progress when you begin working on it, and `hap task {agent_name} done <n>` to mark it complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`)."
+const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks: `hap task {agent_name} list` to view them, `hap task {agent_name} start <n>` to mark one in-progress when you begin working on it, and `hap task {agent_name} done <n>` to mark it complete as you go (if that name isn't recognized, use `--path {task_list_path}` in place of `{agent_name}`). `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.4`); otherwise its position in the list, which `#3` always addresses."
 
 // NoTaskContent is the {next_task_content} value when a declared list has
 // no unchecked item left: the templated prompt is still delivered so the
@@ -232,6 +234,151 @@ func ParseChecklist(content string) []ChecklistItem {
 		})
 	}
 	return items
+}
+
+// taskLabelRE extracts the hierarchical task ID a checklist may carry at the
+// start of an item's text — "1.1 Add a domain method…" or the "1. " prefix
+// GeneratedTaskItemText writes (see taskgen.go, which must keep writing an ID
+// this recognizes). Two shapes are accepted:
+//
+//   - multi-level ("1.1", "2.3.4"): the dots alone mark it as an ID, so a
+//     trailing separator is optional — hand-authored plans write "1.1 Add…"
+//     as often as "1.1. Add…" or "1.1: Add…";
+//   - single-level ("3"): a trailing ".", ")" or ":" is REQUIRED. Without it,
+//     ordinary prose like "3 blind mice" would read as task ID 3 and a plain
+//     `hap task done 3` would silently retarget from position 3 onto it.
+//
+// The ID must be followed by whitespace or end of line either way, so "1.1.2"
+// never matches as "1.1".
+//
+// The looser multi-level rule does misread a decimal that opens an item ("2.5
+// GB export path" reads as ID 2.5). That is deliberate — requiring a separator
+// would reject the common "1.1 Add…" spelling, which is the whole point — and
+// ResolveTaskRef contains the damage: a bare number still resolves positionally
+// whenever the item at that position carries no ID of its own. An ID wrapped in
+// markdown emphasis ("**1.1** Add…") is out of scope; such a list stays
+// positional.
+var taskLabelRE = regexp.MustCompile(`^(?:(\d+(?:\.\d+)+)[.):]?|(\d+)[.):])(?:\s|$)`)
+
+// TaskLabel returns the hierarchical task ID an item's text declares, or ""
+// when it declares none. This is the ID a document numbers its own tasks with
+// ("3.4"), as opposed to ChecklistItem.Index, which is the item's absolute
+// position in the file. ResolveTaskRef prefers the former precisely because an
+// agent reads the former in its prompt.
+func TaskLabel(text string) string {
+	m := taskLabelRE.FindStringSubmatch(text)
+	if m == nil {
+		return ""
+	}
+	if m[1] != "" {
+		return m[1]
+	}
+	return m[2]
+}
+
+// ErrTaskRefRequired is returned when no task reference was supplied. It names
+// the shell trap explicitly: a bare `#3` is a comment in every common shell, so
+// the argument silently vanishes and the command arrives here looking like the
+// caller just forgot it.
+var ErrTaskRefRequired = errors.New("a task number is required (see: task ... list) — quote a positional reference ('#3'), since an unquoted #3 is stripped by the shell as a comment")
+
+// ResolveTaskRef maps a user- or agent-supplied task reference to an item's
+// 1-based Index. Task text is what an agent sees, so a checklist that numbers
+// its own tasks must be addressable by those numbers — otherwise an agent told
+// to work "3.4 Implement authenticated POST …" reports `done 3` and ticks off
+// whatever happens to sit at position 3.
+//
+//   - "#3" always means position 3.
+//   - "3.4" means the item labeled 3.4 (never a position — positions are
+//     integers, so this form was an error before this existed).
+//   - "3" means the item labeled 3 when one exists.
+//   - "3" with no such label means position 3, but ONLY when the item sitting
+//     there carries no label of its own. That item is unaddressable any other
+//     way (a mixed list — a generated "1."/"2." list plus a hand-added item —
+//     is the common case), so refusing would strand it. When position 3 IS
+//     labeled, the ref is refused instead: silently ticking off "1.3" for
+//     somebody who asked for task 3 is the exact mistake this whole function
+//     exists to prevent.
+func ResolveTaskRef(items []ChecklistItem, ref string) (int, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return 0, ErrTaskRefRequired
+	}
+	if positional, ok := strings.CutPrefix(ref, "#"); ok {
+		return resolvePosition(items, positional, ref)
+	}
+	// Labels never keep their trailing separator, but an agent copying the id
+	// out of its own task text plausibly types it back with one ("done 3.4.").
+	ref = strings.TrimRight(ref, ".):")
+
+	var matches []int
+	for _, it := range items {
+		if label := TaskLabel(it.Text); label != "" && label == ref {
+			matches = append(matches, it.Index)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		return 0, fmt.Errorf("task %q is ambiguous: %d items carry that id (positions %s) — address one by position, e.g. #%d",
+			ref, len(matches), joinPositions(matches), matches[0])
+	}
+
+	// No label matched. A dotted ref is an id and nothing else — positions are
+	// plain integers — so it can only be a miss.
+	if _, err := strconv.Atoi(ref); err != nil {
+		return 0, noSuchIDErr(ref, "")
+	}
+	// Otherwise fall back to the position: the only way to address an unlabeled
+	// item, and how every checklist worked before ids were understood. Unless
+	// that position is itself labeled — then the ref is ambiguous between "id
+	// 3" and "position 3" and must be spelled "#3".
+	pos, err := resolvePosition(items, ref, ref)
+	if err != nil {
+		return 0, err
+	}
+	if label := TaskLabel(items[pos-1].Text); label != "" {
+		return 0, noSuchIDErr(ref, label)
+	}
+	return pos, nil
+}
+
+// noSuchIDErr reports a reference that names no task id. occupant, when set, is
+// the id of the item sitting at the same position — the thing the caller would
+// have hit by falling back to positional addressing, and so worth naming.
+func noSuchIDErr(ref, occupant string) error {
+	if occupant != "" {
+		return fmt.Errorf("no task %q: this checklist numbers its tasks and none is %s (position %s holds task %s) — run `list` to see the ids, or address by position with #%s",
+			ref, ref, ref, occupant, ref)
+	}
+	return fmt.Errorf("no task %q: this checklist numbers its tasks and none is %s — run `list` to see the ids",
+		ref, ref)
+}
+
+// resolvePosition validates a positional task number. raw is the reference as
+// the caller typed it, so the error quotes "#3" rather than "3".
+func resolvePosition(items []ChecklistItem, digits, raw string) (int, error) {
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, fmt.Errorf("invalid task number %q", raw)
+	}
+	if n < 1 {
+		return 0, fmt.Errorf("task number must be 1 or greater, got %d", n)
+	}
+	if n > len(items) {
+		return 0, outOfRangeErr(n, len(items))
+	}
+	return n, nil
+}
+
+// joinPositions renders candidate positions as "#4, #9" for an ambiguity error.
+func joinPositions(indices []int) string {
+	parts := make([]string, len(indices))
+	for i, n := range indices {
+		parts[i] = "#" + strconv.Itoa(n)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // validateTaskText trims surrounding whitespace and rejects empty or

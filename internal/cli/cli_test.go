@@ -1353,3 +1353,185 @@ func TestTaskSourceListShowsAutoSendFlag(t *testing.T) {
 		t.Errorf("a source with the flag must show it: %s", lines[1])
 	}
 }
+
+// TestTaskAddressedByDocumentID covers a hand-authored checklist that numbers
+// its own tasks with section-scoped ids ("3.4"). The id is what an agent reads
+// in its prompt, so `done 3.4` must tick THAT item — and a bare "3", which
+// used to mean position 3, must resolve by id too now that the list has ids.
+func TestTaskAddressedByDocumentID(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, strings.Join([]string{
+		"# Tasks: Project Public Link",
+		"",
+		"## 1. Platform",
+		"",
+		"- [ ] 1.1 sign a batch of revisions",
+		"- [ ] 1.2 clamp the expiry",
+		"",
+		"## 3. Worker",
+		"",
+		"- [ ] 3.4 create the public link",
+		"- [ ] 3.5 revoke the public link",
+		"",
+	}, "\n"))
+
+	out, err := run(t, app, "task", "--path", path, "done", "3.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "task #3 marked done") {
+		t.Errorf("done 3.4 must report the resolved position #3, got:\n%s", out)
+	}
+
+	// "#2" is always positional, whatever the ids say.
+	if _, err := run(t, app, "task", "--path", path, "start", "#2"); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "- [x] 3.4 create the public link") {
+		t.Errorf("item 3.4 should be done:\n%s", got)
+	}
+	if !strings.Contains(got, "- [-] 1.2 clamp the expiry") {
+		t.Errorf("#2 should be in-progress:\n%s", got)
+	}
+	if !strings.Contains(got, "- [ ] 1.1 sign a batch of revisions") || !strings.Contains(got, "- [ ] 3.5 revoke the public link") {
+		t.Errorf("untouched items must stay pending:\n%s", got)
+	}
+	if !strings.Contains(got, "## 3. Worker") {
+		t.Errorf("headings must survive a mutation:\n%s", got)
+	}
+
+	// A number matching no id is refused rather than silently retargeted onto
+	// that position — position 2 must still be the [-] set above.
+	if _, err := run(t, app, "task", "--path", path, "done", "2"); err == nil {
+		t.Error("a bare number matching no task id must error in an id-numbered list")
+	}
+	data, _ = os.ReadFile(path)
+	if !strings.Contains(string(data), "- [-] 1.2 clamp the expiry") {
+		t.Errorf("the refused command must not have mutated the file:\n%s", string(data))
+	}
+}
+
+// TestTaskBareNumberStaysPositional pins the backward-compatible path: a list
+// with no task ids keeps addressing items by position.
+func TestTaskBareNumberStaysPositional(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] alpha\n- [ ] beta\n- [ ] gamma\n")
+
+	if _, err := run(t, app, "task", "--path", path, "done", "2"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "- [ ] alpha\n- [x] beta\n- [ ] gamma\n"; string(data) != want {
+		t.Errorf("file after done 2:\n got %q\nwant %q", string(data), want)
+	}
+}
+
+// TestTaskGeneratedIDsAddressable: the "N. " prefix RenderGeneratedTaskList
+// writes is a task id too, so `done 2` on a generated list resolves by id —
+// which for an unreordered generated list is also its position.
+func TestTaskGeneratedIDsAddressable(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "# Tasks for backend\n\n- [x] 1. first\n- [ ] 2. second\n- [ ] 3. third\n")
+
+	if _, err := run(t, app, "task", "--path", path, "done", "3"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "- [x] 3. third") || !strings.Contains(string(data), "- [ ] 2. second") {
+		t.Errorf("done 3 must tick the item labeled 3:\n%s", string(data))
+	}
+}
+
+// TestTaskMixedListStaysAddressable is the shape a generated list takes as
+// soon as somebody runs `task add`: numbered items plus one unlabeled one.
+// The added item has no id of its own, so a bare number must still reach it
+// by position — that sequence worked before ids existed and must keep working.
+func TestTaskMixedListStaysAddressable(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "# Tasks for backend\n\n- [ ] 1. generated one\n- [ ] 2. generated two\n")
+
+	if _, err := run(t, app, "task", "--path", path, "add", "hand-added task"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, app, "task", "--path", path, "done", "3"); err != nil {
+		t.Fatalf("done 3 must reach the unlabeled added item: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "- [x] hand-added task") {
+		t.Errorf("the added item should be done:\n%s", string(data))
+	}
+	if !strings.Contains(string(data), "- [ ] 2. generated two") {
+		t.Errorf("the labeled items must be untouched:\n%s", string(data))
+	}
+}
+
+// TestTaskInvalidRefReportsTheTypo: a malformed reference must be reported as
+// a bad task number, not as whatever I/O error resolving it would hit first.
+func TestTaskInvalidRefReportsTheTypo(t *testing.T) {
+	app, _ := testApp(t)
+	_, err := run(t, app, "task", "--path", filepath.Join(t.TempDir(), "missing.md"), "done", "xyz")
+	if err == nil {
+		t.Fatal("a non-numeric task reference must error")
+	}
+	if !strings.Contains(err.Error(), `invalid task number "xyz"`) {
+		t.Errorf("error should name the bad reference, got: %v", err)
+	}
+}
+
+// TestTaskRefMutationIsGuardedAgainstAConcurrentEdit: resolving a reference
+// necessarily reads the checklist before the mutation takes the file lock, so
+// another process adding or removing an item in between shifts positions under
+// the resolved index. The resolved TEXT is threaded through as the guard, so
+// that race must refuse rather than rewrite the wrong line.
+func TestTaskRefMutationIsGuardedAgainstAConcurrentEdit(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] 1.1 alpha\n- [ ] 1.2 beta\n")
+
+	items, err := app.ResolveTaskRef("", path, "1.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items.Index != 2 || items.Text != "1.2 beta" {
+		t.Fatalf("resolved %+v, want #2 %q", items, "1.2 beta")
+	}
+
+	// Somebody inserts a task ahead of it: position 2 is now "1.05 inserted".
+	if err := os.WriteFile(path, []byte("- [ ] 1.1 alpha\n- [ ] 1.05 inserted\n- [ ] 1.2 beta\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := app.SetTaskDone("", path, items.Index, true, items.Text); err == nil {
+		t.Fatal("a mutation on a stale index must be refused, not applied")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "[x]") {
+		t.Errorf("nothing should have been ticked off:\n%s", string(data))
+	}
+
+	// Re-resolving after the edit finds the same task at its new position.
+	again, err := app.ResolveTaskRef("", path, "1.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Index != 3 || again.Text != "1.2 beta" {
+		t.Errorf("re-resolved %+v, want #3 %q", again, "1.2 beta")
+	}
+}

@@ -90,12 +90,12 @@ func TestDeclaredTaskPrompt(t *testing.T) {
 		{
 			name: "default template crafts CLI commands with the agent name and a --path fallback",
 			task: DeclaredTask{Task: "add validation", Path: "/docs/tasks.md", AgentName: "brave-otter"},
-			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks: `hap task brave-otter list` to view them, `hap task brave-otter start <n>` to mark one in-progress when you begin working on it, and `hap task brave-otter done <n>` to mark it complete as you go (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`).",
+			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks: `hap task brave-otter list` to view them, `hap task brave-otter start <n>` to mark one in-progress when you begin working on it, and `hap task brave-otter done <n>` to mark it complete as you go (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`). `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.4`); otherwise its position in the list, which `#3` always addresses.",
 		},
 		{
 			name: "completed list uses none",
 			task: DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md", AgentName: "brave-otter"},
-			want: "Your next task is none. Prefer the hap CLI to manage your tasks: `hap task brave-otter list` to view them, `hap task brave-otter start <n>` to mark one in-progress when you begin working on it, and `hap task brave-otter done <n>` to mark it complete as you go (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`).",
+			want: "Your next task is none. Prefer the hap CLI to manage your tasks: `hap task brave-otter list` to view them, `hap task brave-otter start <n>` to mark one in-progress when you begin working on it, and `hap task brave-otter done <n>` to mark it complete as you go (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`). `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.4`); otherwise its position in the list, which `#3` always addresses.",
 		},
 		{
 			name: "custom template",
@@ -635,5 +635,227 @@ func TestAppendChecklistItem(t *testing.T) {
 		if _, _, err := AppendChecklistItem("- [ ] a", bad); err == nil {
 			t.Errorf("AppendChecklistItem must reject embedded newline in %q", bad)
 		}
+	}
+}
+
+func TestTaskLabel(t *testing.T) {
+	cases := []struct{ name, text, want string }{
+		{"hierarchical", "1.1 Add a domain method to sign", "1.1"},
+		{"hierarchical with dot", "3.4. Implement the endpoint", "3.4"},
+		{"deep hierarchy", "2.3.4 nested task", "2.3.4"},
+		{"generated numbered id", "12. wire up retries", "12"},
+		{"paren separator", "7) review the diff", "7"},
+		{"bare number is not an id", "3 blind mice", ""},
+		{"unlabeled", "wire up retries", ""},
+		{"id only, no text after", "4.", "4"},
+		{"decimal inside text", "bump to 1.2 today", ""},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := TaskLabel(c.text); got != c.want {
+				t.Errorf("TaskLabel(%q) = %q, want %q", c.text, got, c.want)
+			}
+		})
+	}
+}
+
+// TestResolveTaskRefLabeled covers a checklist that numbers its own tasks: a
+// bare number must resolve by id, never by position, or an agent reporting
+// "done 3" for task 3.1 would tick off whatever sits at position 3.
+func TestResolveTaskRefLabeled(t *testing.T) {
+	items := ParseChecklist(strings.Join([]string{
+		"- [ ] 1.1 first",
+		"- [ ] 1.2 second",
+		"- [ ] 1.3 third",
+		"- [ ] 3.4 fourth",
+		"- [ ] 12. twelfth",
+	}, "\n"))
+
+	cases := []struct {
+		name, ref string
+		want      int
+		wantErr   string
+	}{
+		{name: "hierarchical id", ref: "3.4", want: 4},
+		{name: "single-level id", ref: "12", want: 5},
+		{name: "trailing separator on the ref", ref: "3.4.", want: 4},
+		{name: "explicit position", ref: "#3", want: 3},
+		{name: "position beyond end", ref: "#9", wantErr: "valid task numbers are 1..5"},
+		{name: "id that matches nothing, position is labeled", ref: "2", wantErr: "none is 2"},
+		{name: "id that matches nothing, beyond end", ref: "9", wantErr: "valid task numbers are 1..5"},
+		{name: "hierarchical id that matches nothing", ref: "4.2", wantErr: "none is 4.2"},
+		{name: "empty ref", ref: "  ", wantErr: "task number is required"},
+		{name: "not a number", ref: "#abc", wantErr: `invalid task number "#abc"`},
+		{name: "zero position", ref: "#0", wantErr: "must be 1 or greater"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := ResolveTaskRef(items, c.ref)
+			if c.wantErr != "" {
+				if err == nil {
+					t.Fatalf("ResolveTaskRef(%q) = %d, want error containing %q", c.ref, got, c.wantErr)
+				}
+				if !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("ResolveTaskRef(%q) error = %v, want it to contain %q", c.ref, err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveTaskRef(%q) unexpected error: %v", c.ref, err)
+			}
+			if got != c.want {
+				t.Errorf("ResolveTaskRef(%q) = %d, want %d", c.ref, got, c.want)
+			}
+		})
+	}
+	if _, err := ResolveTaskRef(items, "2"); err == nil {
+		t.Fatal("a bare number matching no id must be an error when that position is itself labeled")
+	}
+}
+
+// TestResolveTaskRefMixedList covers the shape a generated list takes the
+// moment somebody runs `hap task <agent> add`: numbered items plus one
+// unlabeled one. The added item has no id, so a bare number MUST still reach
+// it by position — refusing would leave it addressable only as "#3".
+func TestResolveTaskRefMixedList(t *testing.T) {
+	items := ParseChecklist("- [ ] 1. generated one\n- [ ] 2. generated two\n- [ ] hand-added task")
+
+	for _, ref := range []string{"3", "#3"} {
+		got, err := ResolveTaskRef(items, ref)
+		if err != nil {
+			t.Fatalf("ResolveTaskRef(%q) unexpected error: %v", ref, err)
+		}
+		if got != 3 {
+			t.Errorf("ResolveTaskRef(%q) = %d, want the unlabeled item at 3", ref, got)
+		}
+	}
+	// The labeled items still resolve by their id, which here equals their
+	// position — a generated list is numbered in file order.
+	if got, err := ResolveTaskRef(items, "2"); err != nil || got != 2 {
+		t.Errorf("ResolveTaskRef(2) = %d, %v; want 2, nil", got, err)
+	}
+}
+
+// TestResolveTaskRefDecimalProse: an item opening with a bare decimal ("2.5 GB
+// export path") parses as an id, since requiring a trailing separator would
+// reject the "1.1 Add…" spelling this feature exists for. The positional
+// fallback must contain that misread — every unlabeled item stays reachable by
+// number. (A decimal glued to a unit, "0.5s timeout", is not a label at all:
+// taskLabelRE requires whitespace after the id.)
+func TestResolveTaskRefDecimalProse(t *testing.T) {
+	items := ParseChecklist("- [ ] alpha\n- [ ] 2.5 GB export path\n- [ ] gamma")
+	if TaskLabel("0.5s timeout tuning") != "" {
+		t.Error("a decimal glued to a unit must not read as a task id")
+	}
+
+	for _, tc := range []struct {
+		ref  string
+		want int
+	}{{"1", 1}, {"3", 3}, {"2.5", 2}} {
+		got, err := ResolveTaskRef(items, tc.ref)
+		if err != nil {
+			t.Fatalf("ResolveTaskRef(%q) unexpected error: %v", tc.ref, err)
+		}
+		if got != tc.want {
+			t.Errorf("ResolveTaskRef(%q) = %d, want %d", tc.ref, got, tc.want)
+		}
+	}
+	// Position 2 IS labeled (0.5), so a bare "2" is ambiguous and refused.
+	if _, err := ResolveTaskRef(items, "2"); err == nil {
+		t.Error("a bare number landing on a labeled item must be refused")
+	}
+}
+
+// TestResolveTaskRefUnlabeled pins the backward-compatible path: a list that
+// numbers nothing keeps addressing tasks by position, which is how every
+// checklist worked before ids were understood.
+func TestResolveTaskRefUnlabeled(t *testing.T) {
+	items := ParseChecklist("- [ ] alpha\n- [ ] beta\n- [ ] gamma")
+	for _, ref := range []string{"2", "#2"} {
+		got, err := ResolveTaskRef(items, ref)
+		if err != nil {
+			t.Fatalf("ResolveTaskRef(%q) unexpected error: %v", ref, err)
+		}
+		if got != 2 {
+			t.Errorf("ResolveTaskRef(%q) = %d, want 2", ref, got)
+		}
+	}
+	if _, err := ResolveTaskRef(items, "4"); err == nil {
+		t.Error("ResolveTaskRef past the end should error")
+	}
+}
+
+// TestResolveTaskRefAmbiguous: two items carrying the same id cannot be
+// addressed by it — the error must name the positions that do address them.
+func TestResolveTaskRefAmbiguous(t *testing.T) {
+	items := ParseChecklist("- [ ] 1.1 first\n- [ ] 2.1 second\n- [ ] 1.1 duplicate")
+	_, err := ResolveTaskRef(items, "1.1")
+	if err == nil {
+		t.Fatal("ResolveTaskRef on a duplicated id should error")
+	}
+	for _, want := range []string{"ambiguous", "#1", "#3"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %v should mention %q", err, want)
+		}
+	}
+}
+
+// TestHierarchicalTaskFileIsUsable is the regression guard for the whole
+// hand-authored format: section headings, intro prose, and `N.M`-numbered
+// items in one file.
+func TestHierarchicalTaskFileIsUsable(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "hierarchical_tasks.md"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	content := string(data)
+
+	items := ParseChecklist(content)
+	wantItems := strings.Count(content, "\n- [ ] ")
+	if len(items) != wantItems {
+		t.Fatalf("ParseChecklist found %d items, want %d — headings or prose leaked in", len(items), wantItems)
+	}
+	for _, it := range items {
+		if TaskLabel(it.Text) == "" {
+			t.Errorf("item #%d %q carries no task id", it.Index, it.Text)
+		}
+	}
+
+	if got := NextDeclaredTask(content); !strings.HasPrefix(got, "1.1 ") {
+		t.Errorf("NextDeclaredTask = %q, want the 1.1 item", got)
+	}
+	if len(PendingDeclaredTasks(content)) != len(items) {
+		t.Errorf("every fixture item is pending; got %d of %d", len(PendingDeclaredTasks(content)), len(items))
+	}
+
+	idx, err := ResolveTaskRef(items, "3.4")
+	if err != nil {
+		t.Fatalf("ResolveTaskRef(3.4): %v", err)
+	}
+	if !strings.HasPrefix(items[idx-1].Text, "3.4 ") {
+		t.Errorf("ref 3.4 resolved to #%d %q", idx, items[idx-1].Text)
+	}
+
+	// Ticking one item off must leave every other line byte-identical.
+	out, err := SetChecklistItemDone(content, idx, true)
+	if err != nil {
+		t.Fatalf("SetChecklistItemDone: %v", err)
+	}
+	before, after := strings.Split(content, "\n"), strings.Split(out, "\n")
+	if len(before) != len(after) {
+		t.Fatalf("line count changed: %d → %d", len(before), len(after))
+	}
+	changed := 0
+	for i := range before {
+		if before[i] != after[i] {
+			changed++
+		}
+	}
+	if changed != 1 {
+		t.Errorf("%d lines changed, want exactly 1", changed)
+	}
+	if got := ParseChecklist(out)[idx-1]; got.Mark != "x" || !strings.HasPrefix(got.Text, "3.4 ") {
+		t.Errorf("after done, item #%d = [%s] %q", idx, got.Mark, got.Text)
 	}
 }
