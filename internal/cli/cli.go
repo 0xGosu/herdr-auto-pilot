@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -957,20 +956,27 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 			}
 			// Only shown when on: it is the one source setting that makes hap
 			// hand out tasks unprompted, so it must be visible here. Set it
-			// with `task-source add --auto-send-when-idle`, or by editing
-			// config.toml for a source that already exists.
+			// with `task-source add --auto-send-when-idle`, or on an existing
+			// source with `task-source set <index> auto-send-when-idle <bool>`.
 			if src.EnableAutoSendTaskWhenIdle {
 				fmt.Fprint(out, " auto_send_when_idle=true")
 			}
+			// The cap is always shown, resolved through MaxTasksLimit so the
+			// number printed is the one the daemon enforces even for a config
+			// written before the cap was filled in on save.
+			fmt.Fprintf(out, " max_tasks=%d", src.MaxTasksLimit())
 			fmt.Fprintln(out)
 		}
 		return nil
+	}
+	if len(args) > 0 && args[0] == "set" {
+		return taskSourceSet(ctx, app, out, args[1:])
 	}
 	if len(args) > 0 && args[0] == "remove" {
 		if len(args) != 2 {
 			return fmt.Errorf("usage: task-source remove <index> (see: task-source list)")
 		}
-		idx, err := strconv.Atoi(args[1])
+		idx, err := strconv.Atoi(strings.TrimPrefix(args[1], "#"))
 		if err != nil {
 			return fmt.Errorf("invalid task source index %q", args[1])
 		}
@@ -1009,7 +1015,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 				return fmt.Errorf("flags must come before <checklist.md>: %s was read as an argument, not a flag", extra)
 			}
 		}
-		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] <checklist.md> | list | remove <index>")
+		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] <checklist.md> | list | set <index> <key> <value> | remove <index>")
 	}
 	var opts []frontend.TaskSourceOption
 	if *autoSend {
@@ -1025,6 +1031,58 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		fmt.Fprintln(out, "auto-send when idle is ON: matching idle agents are handed their next pending task without an attention event")
 	}
 	return nil
+}
+
+// taskSourceSet edits one setting of an existing task source — the CLI twin of
+// the TUI Config tab's enter on a task-source row. Only the two settings that
+// are meaningful to flip after the fact are exposed; path/agent/workspace are
+// remove-and-re-add, since changing them silently re-points an agent's work.
+func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	const usage = "usage: task-source set <index> <auto-send-when-idle|max-tasks> <value> (see: task-source list)"
+	if len(args) != 3 {
+		return fmt.Errorf("%s", usage)
+	}
+	// `task-source list` prints indexes as "#0", so the copied-and-pasted form
+	// must work (the `hap task` refs accept it too).
+	idx, err := strconv.Atoi(strings.TrimPrefix(args[0], "#"))
+	if err != nil {
+		return fmt.Errorf("invalid task source index %q", args[0])
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		return err
+	}
+	if idx < 0 || idx >= len(cfg.TaskSources) {
+		return fmt.Errorf("no task source #%d (see: task-source list)", idx)
+	}
+	expected := cfg.TaskSources[idx]
+	key, value := args[1], args[2]
+	switch key {
+	case "auto-send-when-idle", "enable_auto_send_task_when_idle":
+		on, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid %s value %q (true|false)", key, value)
+		}
+		if err := app.SetTaskSourceAutoSend(ctx, idx, expected, on); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "task source #%d: auto_send_when_idle=%v\n", idx, on)
+		if on {
+			fmt.Fprintln(out, "auto-send when idle is ON: matching idle agents are handed their next pending task without an attention event")
+		}
+		return nil
+	case "max-tasks", "max_tasks":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid %s value %q (a whole number of tasks)", key, value)
+		}
+		if err := app.SetTaskSourceMaxTasks(ctx, idx, expected, n); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "task source #%d: max_tasks=%d\n", idx, n)
+		return nil
+	}
+	return fmt.Errorf("unknown task-source key %q\n%s", key, usage)
 }
 
 // task manages the checklist ITEMS inside a task source's file (as opposed to
@@ -1190,7 +1248,7 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 		if stdin == os.Stdin && !stdinIsTTY() {
 			return fmt.Errorf("confirmation needs a terminal; rerun as: task %s send %d --yes", agent, idx)
 		}
-		fmt.Fprintf(out, "send task #%d (%s) to %s? [y/N] ", idx, oneLineText(it.Text, 60), agent)
+		fmt.Fprintf(out, "send task #%d (%s) to %s? [y/N] ", idx, oneLineText(domain.DisplayTaskText(it.Text), 60), agent)
 		answer := ""
 		if _, err := fmt.Fscanln(stdin, &answer); err != nil {
 			answer = "" // EOF or a bare newline both read as the default No
@@ -1251,12 +1309,6 @@ func taskTargetLabel(agent, path string) string {
 	return agent
 }
 
-// taskRefRE is the syntactic shape of a task reference: a task id ("3.4",
-// optionally with the trailing separator an agent may copy along) or a
-// position ("#3"). It only screens out typos before any I/O — whether the
-// reference names a real task is domain.ResolveTaskRef's call.
-var taskRefRE = regexp.MustCompile(`^(?:#\d+|\d+(?:\.\d+)*[.):]?)$`)
-
 // taskItemArg resolves the first argument into the item it names. The argument
 // is a task REFERENCE, not necessarily a position: a checklist that numbers its
 // own tasks ("3.4 Implement …") is addressed by those ids, which is what an
@@ -1274,7 +1326,7 @@ func taskItemArg(app *frontend.App, agent, path string, args []string) (domain.C
 	// Reject a syntactically impossible reference before reading anything:
 	// resolution needs the checklist, so without this `done xyz` on a missing
 	// file reports the file error instead of the typo that caused it.
-	if !taskRefRE.MatchString(strings.TrimSpace(args[0])) {
+	if !domain.TaskRefSyntaxOK(args[0]) {
 		return domain.ChecklistItem{}, fmt.Errorf("invalid task number %q — pass a task id from the list (e.g. 3.4) or a position (e.g. '#3')", args[0])
 	}
 	return app.ResolveTaskRef(agent, path, args[0])
@@ -1349,9 +1401,11 @@ func taskList(app *frontend.App, out io.Writer, agent, path string, args []strin
 
 // formatTask renders one item, preserving its raw checkbox rune so an
 // in-progress "[-]" (or any non-standard marker) is shown as-is rather than
-// collapsed to "[x]".
+// collapsed to "[x]". The task id is shown unescaped (domain.DisplayTaskText):
+// a listing that printed "8\.1" would read as if the backslash were part of
+// the id somebody has to type back.
 func formatTask(it domain.ChecklistItem) string {
-	return fmt.Sprintf("#%d\t[%s]\t%s", it.Index, it.Mark, it.Text)
+	return fmt.Sprintf("#%d\t[%s]\t%s", it.Index, it.Mark, domain.DisplayTaskText(it.Text))
 }
 
 // printTaskList prints items matching the status filter, numbered by absolute

@@ -1627,7 +1627,8 @@ func (a *App) addTaskSourceIfAbsent(ctx context.Context, agentID, agentType, nam
 				return fmt.Errorf("agent %q already has a task source (%s); refusing to register a second — append the generated tasks to it instead", name, ts.Path)
 			}
 		}
-		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{Agent: name, Path: path})
+		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{
+			Agent: name, Path: path, MaxTasks: config.DefaultMaxTasks})
 		return nil
 	})
 }
@@ -2372,6 +2373,50 @@ func (a *App) RemoveTaskSource(ctx context.Context, index int, expectedPath stri
 	})
 }
 
+// updateTaskSource applies mutate to task source #index, guarding on the
+// source the caller believes sits there so a stale listing can never retarget
+// the edit — the index is a position in a slice the operator may have changed
+// since it was shown. The guard compares the selectors too, not just the path:
+// two sources may point at the SAME checklist with different agent/workspace
+// scopes, and a path-only check would happily edit the wrong one of the pair.
+func (a *App) updateTaskSource(ctx context.Context, index int, expected config.TaskSource, mutate func(*config.TaskSource)) error {
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		if index < 0 || index >= len(cfg.TaskSources) {
+			return fmt.Errorf("no task source #%d", index)
+		}
+		got := cfg.TaskSources[index]
+		if got.Path != expected.Path || got.Agent != expected.Agent || got.Workspace != expected.Workspace {
+			return fmt.Errorf("task source #%d changed since it was listed (now agent=%q workspace=%q %s); re-list and retry",
+				index, got.Agent, got.Workspace, got.Path)
+		}
+		mutate(&cfg.TaskSources[index])
+		return nil
+	})
+}
+
+// SetTaskSourceAutoSend turns enable_auto_send_task_when_idle on or off for an
+// existing source. This is the one source setting that makes hap hand out work
+// unprompted, so turning it ON is always an explicit operator act — never a
+// side effect of editing something else.
+func (a *App) SetTaskSourceAutoSend(ctx context.Context, index int, expected config.TaskSource, on bool) error {
+	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.EnableAutoSendTaskWhenIdle = on
+	})
+}
+
+// SetTaskSourceMaxTasks sets a source's max_tasks cap. The value must be at
+// least 1: 0 is what "unset" looks like on disk, so accepting it here would
+// silently mean DefaultMaxTasks rather than the "no cap" an operator typing 0
+// would expect.
+func (a *App) SetTaskSourceMaxTasks(ctx context.Context, index int, expected config.TaskSource, max int) error {
+	if max < 1 {
+		return fmt.Errorf("max_tasks must be 1 or greater, got %d", max)
+	}
+	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.MaxTasks = max
+	})
+}
+
 // SetThreshold updates one confidence threshold (FR-009) and reloads.
 func (a *App) SetThreshold(ctx context.Context, situation string, value float64) error {
 	if value <= 0 || value >= 1 {
@@ -2435,6 +2480,10 @@ func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, templat
 	}
 	src := config.TaskSource{
 		Agent: agent, Workspace: workspace, Path: path, NextTaskTemplate: template,
+		// Written explicitly rather than left at 0: a saved source names the cap
+		// it actually runs under, so config.toml never reads "max_tasks = 0"
+		// (which looks like "no limit") for a source capped at 20.
+		MaxTasks: config.DefaultMaxTasks,
 	}
 	for _, opt := range opts {
 		opt(&src)

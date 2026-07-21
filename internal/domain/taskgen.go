@@ -57,7 +57,11 @@ func AgentBusy(status string) bool {
 // matching at all. A spaced rule ("- - -") does match here but has no
 // alphanumeric body, so the mode-detection check in NormalizeGeneratedTasks
 // still refuses to treat it as a list marker.
-var listItemRE = regexp.MustCompile(`^\s*(?:(?:[-*+]|\d+[.)])\s+(?:\[\s*[xX+\-*]?\s*\]\s*)?|\[\s*[xX+\-*]?\s*\]\s*)(.*)$`)
+// The ordered marker is built from the shared taskIDSepPat (tasklist.go), so an
+// escaped "1\." is stripped like a plain "1." — an LLM echoing a checklist it
+// read from an escaped file would otherwise leave the marker inside the task
+// text, and the renumbering would render "1. 1\. foo".
+var listItemRE = regexp.MustCompile(`^\s*(?:(?:[-*+]|\d+` + taskIDSepPat + `)\s+(?:\[\s*[xX+\-*]?\s*\]\s*)?|\[\s*[xX+\-*]?\s*\]\s*)(.*)$`)
 
 // isFenceLine reports whether a line is a Markdown code-fence delimiter
 // ("```", "~~~"), which is never a task.
@@ -236,8 +240,11 @@ func GeneratedTaskItemText(i int, task string) string {
 
 // generatedItemIDRE matches the numbered-ID prefix GeneratedTaskItemText
 // writes ("1. ", "23. ", …), and nothing looser: the ID is always digits, a
-// dot, and a single space, at the very start of the item text.
-var generatedItemIDRE = regexp.MustCompile(`^\d+\. `)
+// dot, and a single space, at the very start of the item text. The dot comes
+// from the shared taskIDDotPat (tasklist.go), so it may be backslash-escaped
+// ("1\. ") exactly as everywhere else — some markdown editors write that to
+// stop the line rendering as an ordered list.
+var generatedItemIDRE = regexp.MustCompile(`^\d+` + taskIDDotPat + ` `)
 
 // GeneratedTaskIdentity strips the numbered-ID prefix GeneratedTaskItemText
 // adds, recovering the raw task as a position-independent identity. A

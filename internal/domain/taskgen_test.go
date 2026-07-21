@@ -265,3 +265,22 @@ func TestRenderGeneratedTaskList(t *testing.T) {
 		t.Errorf("pending declared tasks = %v, want all three with ID markers intact", pending)
 	}
 }
+
+// TestGeneratedTaskIdentityEscapedID: a markdown editor may escape the dot in
+// the numbered ID hap writes ("1. " → "1\. ") so the line is not re-rendered
+// as an ordered list. Identity must still strip that prefix, or a regeneration
+// would fail to recognize the same logical task and lose its marker.
+func TestGeneratedTaskIdentityEscapedID(t *testing.T) {
+	cases := map[string]string{
+		"1. wire up retries":   "wire up retries",
+		`1\. wire up retries`:  "wire up retries",
+		`23\. wire up retries`: "wire up retries",
+		"hand-added task":      "hand-added task",
+		`1\.1 sub task`:        `1\.1 sub task`, // only the flat "<n>. " prefix is an ID
+	}
+	for text, want := range cases {
+		if got := GeneratedTaskIdentity(text); got != want {
+			t.Errorf("GeneratedTaskIdentity(%q) = %q, want %q", text, got, want)
+		}
+	}
+}

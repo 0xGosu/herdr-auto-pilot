@@ -4306,6 +4306,11 @@ func TestAddTaskSourceAutoSendWhenIdleOption(t *testing.T) {
 	if cfg.TaskSources[2].EnableAutoSendTaskWhenIdle {
 		t.Error("a bootstrapped task source must never enable unprompted hand-out")
 	}
+	// It still names its cap: a source hap creates itself must not land on disk
+	// with "max_tasks" missing, which reads as "no limit".
+	if cfg.TaskSources[2].MaxTasks != config.DefaultMaxTasks {
+		t.Errorf("bootstrapped source should carry max_tasks=%d, got %d", config.DefaultMaxTasks, cfg.TaskSources[2].MaxTasks)
+	}
 }
 
 // TestRemoveTaskSourceKeepsChecklistFile pins the contract the TUI's Tasks-tab
@@ -4531,5 +4536,80 @@ func TestConfirmRemoteEnvGonePickerFailsClosed(t *testing.T) {
 	}
 	if len(fake.inputs) != 0 || len(fake.keys) != 0 {
 		t.Errorf("nothing may be sent when the picker is gone: inputs=%v keys=%v", fake.inputs, fake.keys)
+	}
+}
+
+// TestSetTaskSourceSettings covers editing an EXISTING source's two mutable
+// settings: the values must reach config.toml (the daemon reads the file), the
+// stale-listing guard must refuse an index whose path has moved, and max_tasks
+// must refuse 0 — on disk 0 means "unset", so accepting it would silently mean
+// the default rather than the "no cap" an operator typing 0 expects.
+func TestSetTaskSourceSettings(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.md")
+	second := filepath.Join(dir, "second.md")
+	if err := app.AddTaskSource(ctx, "a1", "", first, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "a2", "", second, ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A new source names its cap explicitly rather than leaving a bare 0.
+	if cfg.TaskSources[0].MaxTasks != config.DefaultMaxTasks {
+		t.Errorf("a new source should carry max_tasks=%d, got %d", config.DefaultMaxTasks, cfg.TaskSources[0].MaxTasks)
+	}
+
+	if err := app.SetTaskSourceAutoSend(ctx, 0, cfg.TaskSources[0], true); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SetTaskSourceMaxTasks(ctx, 0, cfg.TaskSources[0], 7); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.TaskSources[0].EnableAutoSendTaskWhenIdle || reloaded.TaskSources[0].MaxTasks != 7 {
+		t.Errorf("settings did not round-trip through config.toml: %+v", reloaded.TaskSources[0])
+	}
+	// The other source is untouched — an edit targets exactly one entry.
+	if reloaded.TaskSources[1].EnableAutoSendTaskWhenIdle || reloaded.TaskSources[1].MaxTasks != config.DefaultMaxTasks {
+		t.Errorf("source #1 must be untouched, got %+v", reloaded.TaskSources[1])
+	}
+
+	// Turning it back off must be readable as off after a reload (the key is
+	// omitempty, so "off" is an absent key — that is what false means on disk).
+	if err := app.SetTaskSourceAutoSend(ctx, 0, cfg.TaskSources[0], false); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded, err = config.Load(app.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.TaskSources[0].EnableAutoSendTaskWhenIdle {
+		t.Error("auto-send should be off again")
+	}
+
+	// Guards.
+	if err := app.SetTaskSourceMaxTasks(ctx, 0, cfg.TaskSources[0], 0); err == nil {
+		t.Error("max_tasks 0 must be refused — on disk it means unset")
+	}
+	if err := app.SetTaskSourceMaxTasks(ctx, 0, config.TaskSource{Agent: "a1", Path: "/some/other.md"}, 5); err == nil {
+		t.Error("a stale expected path must be refused")
+	}
+	if err := app.SetTaskSourceAutoSend(ctx, 9, cfg.TaskSources[0], true); err == nil {
+		t.Error("an out-of-range index must be refused")
+	}
+	// Two sources may share a checklist with different scopes, so the guard
+	// compares the selectors too — a path-only check would edit the wrong one.
+	sameFile := cfg.TaskSources[0]
+	sameFile.Agent = "someone-else"
+	if err := app.SetTaskSourceMaxTasks(ctx, 0, sameFile, 5); err == nil {
+		t.Error("a source whose selectors no longer match must be refused")
 	}
 }

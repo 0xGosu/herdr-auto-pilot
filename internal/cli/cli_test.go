@@ -1728,3 +1728,142 @@ func TestTaskRefMutationIsGuardedAgainstAConcurrentEdit(t *testing.T) {
 		t.Errorf("re-resolved %+v, want #3 %q", again, "1.2 beta")
 	}
 }
+
+// TestTaskEscapedIDsListAndAddress covers a checklist whose ids carry the
+// backslash escapes some markdown editors insert ("1\.", "8\.1") to stop the
+// line rendering as an ordered list. The listing must show the plain id, and
+// the plain id must be what addresses the task — the operator never types the
+// backslash.
+func TestTaskEscapedIDsListAndAddress(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] 1\\. alpha-item\n- [ ] 8\\.1 beta-item\n- [ ] 8\\.2 gamma-item\n")
+
+	out, err := run(t, app, "task", "--path", path, "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"#1\t[ ]\t1. alpha-item", "#2\t[ ]\t8.1 beta-item", "#3\t[ ]\t8.2 gamma-item"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("list must show unescaped ids, missing %q, got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `8\.1`) {
+		t.Errorf("list must not print the markdown escape, got:\n%s", out)
+	}
+
+	if _, err := run(t, app, "task", "--path", path, "done", "8.1"); err != nil {
+		t.Fatalf("done 8.1 must address the escaped id: %v", err)
+	}
+	// The escaped spelling must survive the syntactic ref screen too: the
+	// next-task prompt hands the item text over verbatim, so an agent reads
+	// "8\.2 …" and plausibly types the id back exactly that way.
+	if _, err := run(t, app, "task", "--path", path, "done", `8\.2`); err != nil {
+		t.Fatalf(`done 8\.2 must be accepted as a task ref: %v`, err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The file keeps the operator's escape — hap ticks the box, nothing else.
+	if !strings.Contains(string(content), "[x] 8\\.1 beta-item") {
+		t.Errorf("done must tick the escaped item and preserve its text, got:\n%s", content)
+	}
+	if !strings.Contains(string(content), "[ ] 1\\. alpha-item") {
+		t.Errorf("no other item may change, got:\n%s", content)
+	}
+}
+
+// TestTaskRefScreenMatchesDomain: the CLI's pre-flight reference screen is
+// domain.TaskRefSyntaxOK — one rule, one place. A reference the domain would
+// resolve must reach it, and a malformed one must be refused as a typo rather
+// than as a file error.
+func TestTaskRefScreenMatchesDomain(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] 1. alpha\n- [ ] 8\\.1 beta\n")
+
+	for _, ref := range []string{"1", "1.", `8\.1`, "8.1", "#2"} {
+		if !domain.TaskRefSyntaxOK(ref) {
+			t.Errorf("domain screen rejects %q, which the CLI must accept", ref)
+		}
+	}
+	for _, bad := range []string{"xyz", "1))", "+2", `3\4`} {
+		out, err := run(t, app, "task", "--path", path, "get", bad)
+		if err == nil {
+			t.Errorf("get %q should be refused, got:\n%s", bad, out)
+			continue
+		}
+		if !strings.Contains(err.Error(), "invalid task number") && !strings.Contains(err.Error(), "no task") {
+			t.Errorf("get %q should report a bad reference, got: %v", bad, err)
+		}
+	}
+}
+
+// TestTaskSourceSet covers editing an existing source from the CLI — the twin
+// of the TUI Config tab's enter on a task-source row. The values must land in
+// config.toml, and a bad key/value/index must be refused rather than silently
+// doing nothing.
+func TestTaskSourceSet(t *testing.T) {
+	app, _ := testApp(t)
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{
+		{Agent: "quiet-fox", Path: "/tmp/quiet.md"},
+		{Agent: "busy-otter", Path: "/tmp/busy.md"},
+	}
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "task-source", "set", "1", "auto-send-when-idle", "true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "auto_send_when_idle=true") || !strings.Contains(out, "without an attention event") {
+		t.Errorf("turning unprompted hand-out ON must say so plainly, got:\n%s", out)
+	}
+	if _, err = run(t, app, "task-source", "set", "1", "max-tasks", "7"); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved.TaskSources[1].EnableAutoSendTaskWhenIdle || saved.TaskSources[1].MaxTasks != 7 {
+		t.Errorf("settings did not reach config.toml: %+v", saved.TaskSources[1])
+	}
+	// Source #0 is untouched and still carries the filled default cap.
+	if saved.TaskSources[0].EnableAutoSendTaskWhenIdle || saved.TaskSources[0].MaxTasks != config.DefaultMaxTasks {
+		t.Errorf("source #0 must be untouched, got %+v", saved.TaskSources[0])
+	}
+
+	// The listing reports both settings back.
+	if out, err = run(t, app, "task-source", "list"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "max_tasks=7") || !strings.Contains(out, fmt.Sprintf("max_tasks=%d", config.DefaultMaxTasks)) {
+		t.Errorf("list should report each source's cap, got:\n%s", out)
+	}
+
+	// The listing prints "#1", so that copied form must address the same entry.
+	if _, err = run(t, app, "task-source", "set", "#1", "max-tasks", "8"); err != nil {
+		t.Fatalf("a pasted #index must be accepted: %v", err)
+	}
+	if saved, err = config.Load(app.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if saved.TaskSources[1].MaxTasks != 8 {
+		t.Errorf("#1 should address source #1, got %+v", saved.TaskSources)
+	}
+
+	for _, bad := range [][]string{
+		{"set", "1", "bogus-key", "1"},
+		{"set", "1", "max-tasks", "zero"},
+		{"set", "1", "max-tasks", "0"},
+		{"set", "1", "auto-send-when-idle", "maybe"},
+		{"set", "9", "max-tasks", "5"},
+		{"set", "1", "max-tasks"},
+	} {
+		if _, err := run(t, app, "task-source", bad...); err == nil {
+			t.Errorf("task-source %v must be refused", bad)
+		}
+	}
+}

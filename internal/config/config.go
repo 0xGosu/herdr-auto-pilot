@@ -286,7 +286,10 @@ type TaskSource struct {
 	// it: once the file has more than MaxTasks items and its pending items are
 	// exhausted, the daemon logs a warning and skips generation instead of
 	// piling more onto an already-long list — the operator prunes it to make
-	// room. 0 (unset) uses DefaultMaxTasks; see MaxTasksLimit.
+	// room. Load fills an unset value with DefaultMaxTasks (fillZeroes), so a
+	// saved config always names the cap it is actually running under rather
+	// than a bare 0 that reads like "no limit"; MaxTasksLimit still substitutes
+	// the default for a config built in memory.
 	MaxTasks int `toml:"max_tasks,omitempty"`
 	// EnableAutoSendTaskWhenIdle opts this source into the daemon's periodic
 	// idle poll: on every sweep the daemon re-drives any matching agent that
@@ -314,7 +317,25 @@ func (s TaskSource) MatchesAgent(agentID, agentType, agentName string) bool {
 }
 
 // DefaultMaxTasks is the fallback for TaskSource.MaxTasks when unset (0).
+//
+// Because Load and Save materialize it (normalizeTaskSources), an existing
+// config pins this number on disk after its first save and is then
+// indistinguishable from an operator who chose 20 deliberately. Raising this
+// constant therefore only affects sources created afterwards — changing the
+// cap for existing installs needs a migration, not just a new default.
 const DefaultMaxTasks = 20
+
+// normalizeTaskSources fills each source's cap with DefaultMaxTasks when it is
+// unset or nonsensical. It runs on both Load and Save: "max_tasks = 0" (or a
+// missing key) reads like "unlimited" to an operator opening config.toml, when
+// the daemon has been enforcing DefaultMaxTasks all along.
+func (c *Config) normalizeTaskSources() {
+	for i := range c.TaskSources {
+		if c.TaskSources[i].MaxTasks <= 0 {
+			c.TaskSources[i].MaxTasks = DefaultMaxTasks
+		}
+	}
+}
 
 // MaxTasksLimit returns the source's task cap, substituting DefaultMaxTasks
 // when unset. Resolved dynamically (like GenerateTaskTimeout) rather than via
@@ -792,6 +813,7 @@ func (c *Config) fillZeroes() {
 	if w := c.Learning.ConfirmationWeight; w < 1 || math.IsNaN(w) || math.IsInf(w, 0) {
 		c.Learning.ConfirmationWeight = d.Learning.ConfirmationWeight
 	}
+	c.normalizeTaskSources()
 	if c.Limits.MaxConsecutiveAutoPrompts <= 0 {
 		c.Limits.MaxConsecutiveAutoPrompts = d.Limits.MaxConsecutiveAutoPrompts
 	}
@@ -880,8 +902,13 @@ func (c Config) CaptureDelay(agentType string, start bool) time.Duration {
 	return defaultCaptureEventDelay
 }
 
-// Save writes the config to path in TOML form (used by `config set`).
+// Save writes the config to path in TOML form (used by `config set`). Task
+// sources are normalized first, so a source appended by ANY write path (an
+// operator add, or the generated-task bootstrap) lands on disk naming the cap
+// it runs under — fillZeroes at load time only covers sources that were
+// already in the file.
 func Save(path string, cfg Config) error {
+	cfg.normalizeTaskSources()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
