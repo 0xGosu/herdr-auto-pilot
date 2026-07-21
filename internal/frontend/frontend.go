@@ -2407,21 +2407,40 @@ func (a *App) AddNeverAutoPattern(ctx context.Context, pattern string) error {
 	})
 }
 
+// TaskSourceOption tweaks an optional, non-positional field of a new task
+// source. New per-source settings go here rather than growing the positional
+// argument list of AddTaskSource (which every caller and test would have to
+// re-spell).
+type TaskSourceOption func(*config.TaskSource)
+
+// AutoSendWhenIdle opts the new source into the daemon's periodic idle poll
+// (enable_auto_send_task_when_idle): matching agents idle past the threshold
+// are handed their next pending task without a herdr attention event. This is
+// the one source setting that makes hap act unprompted, so it is opt-in at
+// every surface and never inferred.
+func AutoSendWhenIdle() TaskSourceOption {
+	return func(src *config.TaskSource) { src.EnableAutoSendTaskWhenIdle = true }
+}
+
 // AddTaskSource points an agent/workspace at a declared task list (FR-011).
 // template optionally overrides the outbound next-task prompt format
 // ({next_task_content} / {task_list_path} / {agent_name} placeholders);
 // "" uses the default.
-func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, template string) error {
+func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, template string, opts ...TaskSourceOption) error {
 	// The daemon reads the file from its own cwd (the state dir), not the
 	// operator's shell; resolve relative paths here where they still mean
 	// what the operator sees.
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
+	src := config.TaskSource{
+		Agent: agent, Workspace: workspace, Path: path, NextTaskTemplate: template,
+	}
+	for _, opt := range opts {
+		opt(&src)
+	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
-		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{
-			Agent: agent, Workspace: workspace, Path: path, NextTaskTemplate: template,
-		})
+		cfg.TaskSources = append(cfg.TaskSources, src)
 		return nil
 	})
 }

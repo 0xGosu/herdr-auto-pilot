@@ -1440,6 +1440,113 @@ func TestTaskSourceListShowsAutoSendFlag(t *testing.T) {
 	}
 }
 
+// TestTaskSourceAddAutoSendWhenIdle pins the flag that turns on unprompted
+// hand-out at add time. It is a safety control: enabling it lets the daemon
+// send tasks with no herdr attention event behind them, so it must be opt-IN —
+// never set by an add that did not ask for it — and it must be reported back.
+func TestTaskSourceAddAutoSendWhenIdle(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "absent", args: []string{"add", "--agent", "quiet-fox"}},
+		{name: "flag", args: []string{"add", "--agent", "busy-otter", "--auto-send-when-idle"}, want: true},
+		{name: "explicit false", args: []string{"add", "--agent", "quiet-mole", "--auto-send-when-idle=false"}},
+		{name: "explicit true", args: []string{"add", "--agent", "busy-bee", "--auto-send-when-idle=true"}, want: true},
+		// The `add` verb is optional on this command; the flag must survive
+		// the bare form too.
+		{name: "no add verb", args: []string{"--agent", "busy-crow", "--auto-send-when-idle"}, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			app, _ := testApp(t)
+			path := writeTaskFile(t, "- [ ] a\n")
+			out, err := run(t, app, "task-source", append(tc.args, path)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := app.Config()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(cfg.TaskSources) != 1 {
+				t.Fatalf("want 1 task source, got %d", len(cfg.TaskSources))
+			}
+			if got := cfg.TaskSources[0].EnableAutoSendTaskWhenIdle; got != tc.want {
+				t.Fatalf("enable_auto_send_task_when_idle = %v, want %v", got, tc.want)
+			}
+			// Turning it on is loud; leaving it off says nothing.
+			if said := strings.Contains(out, "auto-send when idle is ON"); said != tc.want {
+				t.Errorf("add output announced auto-send = %v, want %v; got:\n%s", said, tc.want, out)
+			}
+			listed, err := run(t, app, "task-source", "list")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if shown := strings.Contains(listed, "auto_send_when_idle=true"); shown != tc.want {
+				t.Errorf("task-source list showed the flag = %v, want %v; got:\n%s", shown, tc.want, listed)
+			}
+		})
+	}
+}
+
+// TestTaskSourceAddFlagPlacement pins what happens when the flag lands after
+// the path. Go's flag parsing stops at the first non-flag argument, so that
+// ordering CANNOT enable auto-send — the important half is that it fails
+// loudly instead of adding a source with the flag quietly off.
+func TestTaskSourceAddFlagPlacement(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] a\n")
+
+	_, err := run(t, app, "task-source", "add", path, "--auto-send-when-idle")
+	if err == nil {
+		t.Fatal("a flag after the path must be an error, not a silently-ignored flag")
+	}
+	if !strings.Contains(err.Error(), "must come before") {
+		t.Errorf("error should explain the ordering, got: %v", err)
+	}
+	cfg, cfgErr := app.Config()
+	if cfgErr != nil {
+		t.Fatal(cfgErr)
+	}
+	if len(cfg.TaskSources) != 0 {
+		t.Errorf("nothing should have been added, got %+v", cfg.TaskSources)
+	}
+
+	// No path at all is still the plain usage error.
+	if _, err := run(t, app, "task-source", "add", "--auto-send-when-idle"); err == nil {
+		t.Error("--auto-send-when-idle with no checklist must error")
+	}
+}
+
+// TestTaskSourceAddAutoSendIsPerSource guards the blast radius: turning the
+// flag on for one source must not switch on sources added before it.
+func TestTaskSourceAddAutoSendIsPerSource(t *testing.T) {
+	app, _ := testApp(t)
+	quiet := writeTaskFile(t, "- [ ] a\n")
+	busy := writeTaskFile(t, "- [ ] b\n")
+	if _, err := run(t, app, "task-source", "add", "--agent", "quiet-fox", quiet); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, app, "task-source", "add", "--agent", "busy-otter", "--auto-send-when-idle", busy); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Fatalf("want 2 task sources, got %d", len(cfg.TaskSources))
+	}
+	if cfg.TaskSources[0].EnableAutoSendTaskWhenIdle {
+		t.Error("adding an auto-send source switched on the source added before it")
+	}
+	if !cfg.TaskSources[1].EnableAutoSendTaskWhenIdle {
+		t.Error("the source added with --auto-send-when-idle did not keep the flag")
+	}
+}
+
 // TestTaskAddressedByDocumentID covers a hand-authored checklist that numbers
 // its own tasks with section-scoped ids ("3.4"). The id is what an agent reads
 // in its prompt, so `done 3.4` must tick THAT item — and a bare "3", which

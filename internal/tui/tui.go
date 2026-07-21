@@ -651,6 +651,12 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		if src.NextTaskTemplate != "" {
 			label += fmt.Sprintf("  template=%q", src.NextTaskTemplate)
 		}
+		// Only shown when on — it is the one source setting that makes hap
+		// hand out tasks unprompted, so it must be visible wherever sources
+		// are listed (mirrors `hap task-source list`).
+		if src.EnableAutoSendTaskWhenIdle {
+			label += "  auto_send_when_idle=true"
+		}
 		items = append(items, ruleItem{
 			kind: "source", index: i, value: src.Path,
 			label: label,
@@ -3261,10 +3267,31 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
 	m.prompt = &prompt{
-		label: "add task source: <path> [agent] [workspace]",
+		label: "add task source: <path> [agent] [workspace] [--auto-send-when-idle]",
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
-				parts := strings.Fields(input)
+				// Spelled exactly like the CLI flag, and accepted in any
+				// position so the operator never has to remember the order.
+				// Any OTHER dashed word is refused rather than taken as a
+				// field: silently storing "--auto-send-when-idl" as the path
+				// would leave the operator believing unprompted hand-out is
+				// on when it is off.
+				var opts []frontend.TaskSourceOption
+				var parts []string
+				for _, f := range strings.Fields(input) {
+					if f == "--auto-send-when-idle" {
+						opts = append(opts, frontend.AutoSendWhenIdle())
+						continue
+					}
+					if strings.HasPrefix(f, "-") {
+						return actionResultMsg{err: fmt.Errorf(
+							"unknown flag %q — this prompt takes only --auto-send-when-idle (spelled exactly, no =value); use the CLI for anything else", f)}
+					}
+					parts = append(parts, f)
+				}
+				if len(parts) == 0 {
+					return actionResultMsg{err: fmt.Errorf("expected <path> [agent] [workspace] — no path given")}
+				}
 				if len(parts) > 3 {
 					return actionResultMsg{err: fmt.Errorf(
 						"expected <path> [agent] [workspace] — got %d fields (paths with spaces are not supported here; use the CLI)", len(parts))}
@@ -3276,8 +3303,11 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 				if len(parts) > 2 {
 					workspace = parts[2]
 				}
-				if err := app.AddTaskSource(ctx, agent, workspace, parts[0], ""); err != nil {
+				if err := app.AddTaskSource(ctx, agent, workspace, parts[0], "", opts...); err != nil {
 					return actionResultMsg{err: err}
+				}
+				if len(opts) > 0 {
+					return actionResultMsg{message: "task source added (auto-send when idle ON)"}
 				}
 				return actionResultMsg{message: "task source added"}
 			}
