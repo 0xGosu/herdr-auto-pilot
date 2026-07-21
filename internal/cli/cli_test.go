@@ -1088,7 +1088,10 @@ func TestTaskListStatusFilterPreservesNumbers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "#1") || !strings.Contains(out, "#3") {
+	// Assert on whole rows: the hints block printed under every listing
+	// mentions '#3' too, so a bare Contains("#3") would pass even on a
+	// renumbered list.
+	if !strings.Contains(out, "#1\t[ ]\tone") || !strings.Contains(out, "#3\t[ ]\tthree") {
 		t.Errorf("pending filter must keep absolute numbers #1 and #3, got:\n%s", out)
 	}
 	if strings.Contains(out, "two") || strings.Contains(out, "#2") {
@@ -1105,13 +1108,15 @@ func TestTaskListStatusFilterPreservesNumbers(t *testing.T) {
 // "[-]", not "[x]", and is treated as not-pending by the filters.
 func TestTaskInProgressMarkerFaithful(t *testing.T) {
 	app, _ := testApp(t)
-	path := writeTaskFile(t, "- [-] working on it\n- [ ] queued\n")
+	// The item texts must not appear in the task-management hints printed
+	// under every listing, or "not shown" assertions match the hints instead.
+	path := writeTaskFile(t, "- [-] active-item\n- [ ] queued\n")
 
 	out, err := run(t, app, "task", "--path", path, "list")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "[-]\tworking on it") {
+	if !strings.Contains(out, "[-]\tactive-item") {
 		t.Errorf("in-progress marker must render as [-], got:\n%s", out)
 	}
 
@@ -1119,7 +1124,7 @@ func TestTaskInProgressMarkerFaithful(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out, "working on it") {
+	if strings.Contains(out, "active-item") {
 		t.Errorf("in-progress item must not count as pending, got:\n%s", out)
 	}
 	if !strings.Contains(out, "queued") {
@@ -1274,6 +1279,87 @@ func TestTaskByAgentResolvesSource(t *testing.T) {
 	data, _ := os.ReadFile(cfg.TaskSources[0].Path)
 	if want := "- [ ] alpha\n- [x] beta\n"; string(data) != want {
 		t.Errorf("done via agent name:\n got %q\nwant %q", string(data), want)
+	}
+}
+
+// TestTaskListPrintsManagementHints pins the move of the task-management
+// instructions out of the next-task prompt and into `task … list` itself: the
+// prompt only points the agent here, so a listing that omits them leaves the
+// agent with no way to learn `start`/`done`.
+func TestTaskListPrintsManagementHints(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] alpha\n")
+	if err := app.AddTaskSource(context.Background(), "backend", "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 {
+		t.Fatalf("want 1 task source, got %d", len(cfg.TaskSources))
+	}
+	abs := cfg.TaskSources[0].Path
+
+	out, err := run(t, app, "task", "backend", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"`hap task backend start <n>`",
+		"`hap task backend done <n>`",
+		"`'#3'` always addresses",
+		"use `--path " + abs + "` in place of `backend`",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("agent-addressed list must print %q, got:\n%s", want, out)
+		}
+	}
+
+	// A --path list has no name to fall back FROM: every command is spelled
+	// with the path and the "name no longer recognized" note is dropped.
+	out, err = run(t, app, "task", "--path", abs, "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "`hap task --path "+abs+" start <n>`") {
+		t.Errorf("--path list must spell commands with the path, got:\n%s", out)
+	}
+	if strings.Contains(out, "no longer recognized") {
+		t.Errorf("--path list must not print the name-fallback note, got:\n%s", out)
+	}
+
+	// Only `list` teaches: the mutating ops reprint the list, and repeating
+	// the whole instruction block on every done/start would drown it.
+	out, err = run(t, app, "task", "backend", "done", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "start <n>") {
+		t.Errorf("mutating ops must not repeat the hints, got:\n%s", out)
+	}
+}
+
+// TestTaskListHintsQuotePathWithSpace pins that the commands the hints hand an
+// agent survive a shell: a checklist under a directory with a space must be
+// one argument, not two.
+func TestTaskListHintsQuotePathWithSpace(t *testing.T) {
+	app, _ := testApp(t)
+	dir := filepath.Join(t.TempDir(), "my docs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] alpha\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "task", "--path", path, "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "--path '"+path+"' done <n>") {
+		t.Errorf("a path with a space must be shell-quoted in the hints, got:\n%s", out)
 	}
 }
 

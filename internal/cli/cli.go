@@ -1309,11 +1309,22 @@ func taskList(app *frontend.App, out io.Writer, agent, path string, args []strin
 	default:
 		return fmt.Errorf("invalid --status %q (all|pending|done)", *status)
 	}
-	items, err := app.ListTasks(agent, path)
+	// Resolve the file once and list from it, so the path printed in the hints
+	// is exactly the file the items above came from.
+	resolved, err := app.TaskFilePath(agent, path)
+	if err != nil {
+		return err
+	}
+	items, err := app.ListTasks("", resolved)
 	if err != nil {
 		return err
 	}
 	printTaskList(out, items, *status)
+	// The task-management instructions are stated here and nowhere else: the
+	// next-task prompt only points the agent at `hap task <agent> list`, so it
+	// reads them beside the actual task numbers. Only `list` prints them —
+	// the mutating ops reprint the list without repeating the instructions.
+	fmt.Fprint(out, "\n"+domain.TaskManagementHints(agent, resolved))
 	return nil
 }
 
