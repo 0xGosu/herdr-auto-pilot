@@ -2358,36 +2358,46 @@ func (a *App) RemoveNeverAutoPattern(ctx context.Context, index int, expected st
 	})
 }
 
-// RemoveTaskSource deletes a task source by index; expectedPath guards
-// against removing a different entry after a stale listing.
-func (a *App) RemoveTaskSource(ctx context.Context, index int, expectedPath string) error {
+// RemoveTaskSource deletes a task source by index. expected is the entry the
+// caller listed; it guards against removing a DIFFERENT source after the
+// config shifted underneath — the destructive twin of updateTaskSource's
+// guard, and it compares the same three fields for the same reason (two
+// sources may share one checklist under different selectors).
+func (a *App) RemoveTaskSource(ctx context.Context, index int, expected config.TaskSource) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
-		if index < 0 || index >= len(cfg.TaskSources) {
-			return fmt.Errorf("no task source #%d", index)
-		}
-		if got := cfg.TaskSources[index].Path; got != expectedPath {
-			return fmt.Errorf("task source #%d changed since it was listed (now %s); re-list and retry", index, got)
+		if err := checkTaskSourceUnchanged(*cfg, index, expected); err != nil {
+			return err
 		}
 		cfg.TaskSources = append(cfg.TaskSources[:index], cfg.TaskSources[index+1:]...)
 		return nil
 	})
 }
 
+// checkTaskSourceUnchanged verifies that task source #index is still the entry
+// the caller listed. The index is a position in a slice the operator (or
+// another surface) may have changed since it was shown, so every write keyed
+// by index goes through this. Path alone is NOT enough: two sources may point
+// at the same checklist with different agent/workspace scopes, and a path-only
+// check would happily hit the wrong one of that pair.
+func checkTaskSourceUnchanged(cfg config.Config, index int, expected config.TaskSource) error {
+	if index < 0 || index >= len(cfg.TaskSources) {
+		return fmt.Errorf("no task source #%d", index)
+	}
+	got := cfg.TaskSources[index]
+	if got.Path != expected.Path || got.Agent != expected.Agent || got.Workspace != expected.Workspace {
+		return fmt.Errorf("task source #%d changed since it was listed (now agent=%q workspace=%q %s); re-list and retry",
+			index, got.Agent, got.Workspace, got.Path)
+	}
+	return nil
+}
+
 // updateTaskSource applies mutate to task source #index, guarding on the
-// source the caller believes sits there so a stale listing can never retarget
-// the edit — the index is a position in a slice the operator may have changed
-// since it was shown. The guard compares the selectors too, not just the path:
-// two sources may point at the SAME checklist with different agent/workspace
-// scopes, and a path-only check would happily edit the wrong one of the pair.
+// source the caller believes sits there (checkTaskSourceUnchanged) so a stale
+// listing can never retarget the edit.
 func (a *App) updateTaskSource(ctx context.Context, index int, expected config.TaskSource, mutate func(*config.TaskSource)) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
-		if index < 0 || index >= len(cfg.TaskSources) {
-			return fmt.Errorf("no task source #%d", index)
-		}
-		got := cfg.TaskSources[index]
-		if got.Path != expected.Path || got.Agent != expected.Agent || got.Workspace != expected.Workspace {
-			return fmt.Errorf("task source #%d changed since it was listed (now agent=%q workspace=%q %s); re-list and retry",
-				index, got.Agent, got.Workspace, got.Path)
+		if err := checkTaskSourceUnchanged(*cfg, index, expected); err != nil {
+			return err
 		}
 		mutate(&cfg.TaskSources[index])
 		return nil

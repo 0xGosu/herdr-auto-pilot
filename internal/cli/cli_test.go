@@ -1867,3 +1867,46 @@ func TestTaskSourceSet(t *testing.T) {
 		}
 	}
 }
+
+// TestTaskSourceRemoveDuplicatePath: two sources may point at the SAME
+// checklist under different agent selectors, so a path-only guard could not
+// tell them apart. Removing #0 must retire exactly that entry and leave the
+// other agent's source pointing at the shared file.
+func TestTaskSourceRemoveDuplicatePath(t *testing.T) {
+	app, _ := testApp(t)
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{
+		{Agent: "alpha", Path: "/tmp/shared.md"},
+		{Agent: "beta", Path: "/tmp/shared.md"},
+		{Agent: "gamma", Workspace: "ws-1", Path: "/tmp/shared.md"},
+	}
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := run(t, app, "task-source", "remove", "0"); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.TaskSources) != 2 || saved.TaskSources[0].Agent != "beta" || saved.TaskSources[1].Agent != "gamma" {
+		t.Fatalf("remove 0 must retire exactly the first entry, got %+v", saved.TaskSources)
+	}
+
+	// Indexes shift down after a removal — "#1" now names gamma, and the
+	// listing the operator would re-read says so.
+	if _, err = run(t, app, "task-source", "remove", "#1"); err != nil {
+		t.Fatal(err)
+	}
+	if saved, err = config.Load(app.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.TaskSources) != 1 || saved.TaskSources[0].Agent != "beta" {
+		t.Errorf("wrong source removed: %+v", saved.TaskSources)
+	}
+	if _, err = run(t, app, "task-source", "remove", "5"); err == nil {
+		t.Error("an out-of-range index must be refused")
+	}
+}

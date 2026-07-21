@@ -987,11 +987,11 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		if idx < 0 || idx >= len(cfg.TaskSources) {
 			return fmt.Errorf("no task source #%d (see: task-source list)", idx)
 		}
-		expected := cfg.TaskSources[idx].Path
+		expected := cfg.TaskSources[idx]
 		if err := app.RemoveTaskSource(ctx, idx, expected); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "task source #%d removed: %s\n", idx, expected)
+		fmt.Fprintf(out, "task source #%d removed: %s\n", idx, expected.Path)
 		return nil
 	}
 	if len(args) > 0 && args[0] == "add" {

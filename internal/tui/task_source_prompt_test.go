@@ -319,3 +319,185 @@ func TestConfigTabSourceRowShowsMaxTasks(t *testing.T) {
 		t.Errorf("an explicit cap must render verbatim: %s", rows[1])
 	}
 }
+
+// dupSourceModel builds a Config-tab model over two sources that share ONE
+// checklist under different agent selectors — the shape a path-only stale
+// guard cannot tell apart.
+func dupSourceModel(t *testing.T) (Model, *frontend.App, string) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
+		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	shared := filepath.Join(dir, "shared.md")
+	if err := os.WriteFile(shared, []byte("- [ ] a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := app.AddTaskSource(ctx, "alpha", "", shared, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "beta", "", shared, ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(ctx, app)
+	m.width, m.height = 100, 40
+	m.data.cfg = cfg
+	m.items = buildRuleItems(cfg)
+	m.tab = tabConfig
+	return m, app, shared
+}
+
+// sourceRow returns the Config row index of task source #index.
+func sourceRow(t *testing.T, m Model, index int) int {
+	t.Helper()
+	for i, it := range m.items {
+		if it.kind == "source" && it.index == index {
+			return i
+		}
+	}
+	t.Fatalf("no config row for task source #%d", index)
+	return -1
+}
+
+// TestConfigRemoveTaskSourceDuplicatePath: removing the Config row for source
+// #0 must retire exactly that entry, even though source #1 points at the same
+// checklist file.
+func TestConfigRemoveTaskSourceDuplicatePath(t *testing.T) {
+	m, app, _ := dupSourceModel(t)
+	m.cursors[tabConfig] = sourceRow(t, m, 0)
+
+	upd, cmd := m.removeSelectedRule()
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatalf("removal should run, got message %q", m.message)
+	}
+	if res, ok := cmd().(actionResultMsg); !ok || res.err != nil {
+		t.Fatalf("removal failed: %+v", res)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 || cfg.TaskSources[0].Agent != "beta" {
+		t.Errorf("wrong source removed: %+v", cfg.TaskSources)
+	}
+}
+
+// TestConfigRemoveTaskSourceRefusesAfterReorder is the regression the widened
+// guard exists for: the config is reordered underneath the listing, so the row
+// the operator is pointing at now holds a DIFFERENT source whose path still
+// matches. The removal must abort rather than retire the wrong agent's source.
+func TestConfigRemoveTaskSourceRefusesAfterReorder(t *testing.T) {
+	m, app, _ := dupSourceModel(t)
+	m.cursors[tabConfig] = sourceRow(t, m, 0) // "alpha", as listed
+
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.TaskSources[0], cfg.TaskSources[1] = cfg.TaskSources[1], cfg.TaskSources[0]
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	// The model still shows the pre-reorder listing (no refresh yet).
+
+	upd, cmd := m.removeSelectedRule()
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatalf("the stale row was refused before dispatch, message %q", m.message)
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok || res.err == nil {
+		t.Fatalf("a reordered duplicate-path row must refuse removal, got %+v", res)
+	}
+	if !strings.Contains(res.err.Error(), "re-list and retry") {
+		t.Errorf("the error should tell the operator to re-list, got %v", res.err)
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Errorf("a refused removal must change nothing, got %+v", cfg.TaskSources)
+	}
+}
+
+// TestConfigRemoveTaskSourceRefusesVanishedRow: a row whose index no longer
+// exists (the config shrank underneath) is refused in the model, before any
+// write is dispatched.
+func TestConfigRemoveTaskSourceRefusesVanishedRow(t *testing.T) {
+	m, app, _ := dupSourceModel(t)
+	m.cursors[tabConfig] = sourceRow(t, m, 1)
+	// The model keeps the two-source listing; its own config view loses one.
+	m.data.cfg.TaskSources = m.data.cfg.TaskSources[:1]
+
+	upd, cmd := m.removeSelectedRule()
+	m = upd.(Model)
+	if cmd != nil {
+		t.Fatal("a vanished row must not dispatch a removal")
+	}
+	if !strings.Contains(m.message, "no longer listed") {
+		t.Errorf("the operator should be told to refresh, got %q", m.message)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Errorf("nothing should have been removed, got %+v", cfg.TaskSources)
+	}
+}
+
+// TestTasksTabRemoveSourceRefusesAfterReorder covers the OTHER removal path —
+// the Tasks tab's `x` on a group header, which passes the group's whole config
+// entry. Two groups share one checklist; after a reorder underneath, accepting
+// the confirmation must abort instead of retiring the wrong agent's source.
+func TestTasksTabRemoveSourceRefusesAfterReorder(t *testing.T) {
+	m, app, _ := dupSourceModel(t)
+	m.tab = tabTasks
+	upd, _ := m.Update(refreshData(context.Background(), app))
+	m = upd.(Model)
+	if len(m.data.tasks) != 2 {
+		t.Fatalf("expected two task groups, got %d", len(m.data.tasks))
+	}
+	if m.data.tasks[0].Source.Agent != "alpha" {
+		t.Fatalf("fixture: expected alpha first, got %+v", m.data.tasks[0].Source)
+	}
+
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.TaskSources[0], cfg.TaskSources[1] = cfg.TaskSources[1], cfg.TaskSources[0]
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	m = press(t, m, "x") // cursor starts on group #0's header row
+	if m.confirm == nil {
+		t.Fatalf("an unmatched source should be removable, got message %q", m.message)
+	}
+	upd, cmd := m.Update(pressKeyMsg("y"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("accepting the confirmation should dispatch the guarded removal")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok || res.err == nil {
+		t.Fatalf("a reordered duplicate-path group must refuse removal, got %+v", res)
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Errorf("a refused removal must change nothing, got %+v", cfg.TaskSources)
+	}
+}

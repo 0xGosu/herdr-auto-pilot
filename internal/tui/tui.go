@@ -2155,13 +2155,13 @@ func (m Model) removeTaskSourcePrompt(group int) (tea.Model, tea.Cmd) {
 		m.message = reason
 		return m, nil
 	}
-	// g.Index is the config index and g.Source.Path the raw (untruncated)
-	// path the header only displays abbreviated — RemoveTaskSource re-checks
-	// both, so a config that shifted underneath aborts instead of removing a
-	// neighbour.
+	// g.Index is the config index and g.Source the entry as it was listed
+	// (its raw, untruncated path plus both selectors) — RemoveTaskSource
+	// re-checks all of them, so a config that shifted underneath aborts
+	// instead of removing a neighbour.
 	remove := m.do(fmt.Sprintf("task source #%d removed (checklist file kept)", g.Index),
 		func(c context.Context) error {
-			return app.RemoveTaskSource(c, g.Index, g.Source.Path)
+			return app.RemoveTaskSource(c, g.Index, g.Source)
 		})
 	// A source with no path configured has no file name to name it by.
 	name := filepath.Base(g.Source.Path)
@@ -3841,8 +3841,16 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 			return app.RemoveNeverAutoPattern(c, idx, expected)
 		})
 	case "source":
+		// The row carries only the path; the guard needs the whole entry, so
+		// look it up by (index, path) — a row that no longer matches is
+		// refused here rather than removing whatever moved into its slot.
+		expected, ok := m.taskSourceAt(item.index, item.value)
+		if !ok {
+			m.message = "task source is no longer listed — refresh and retry"
+			return m, nil
+		}
 		m.beginAction()
-		idx, expected := item.index, item.value
+		idx := item.index
 		return m, m.do(fmt.Sprintf("task source #%d removed", idx), func(c context.Context) error {
 			return app.RemoveTaskSource(c, idx, expected)
 		})

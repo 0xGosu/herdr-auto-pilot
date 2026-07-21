@@ -2465,13 +2465,17 @@ func TestRemoveByIndexIsValueVerified(t *testing.T) {
 		t.Error("out-of-range pattern index must error")
 	}
 
-	if err := app.RemoveTaskSource(ctx, 0, "/wrong/path.md"); err == nil {
+	listed := config.TaskSource{Agent: "builder", Path: "/tmp/tasks.md", MaxTasks: config.DefaultMaxTasks}
+	if err := app.RemoveTaskSource(ctx, 0, config.TaskSource{Agent: "builder", Path: "/wrong/path.md"}); err == nil {
 		t.Error("mismatched expected path must refuse removal")
 	}
-	if err := app.RemoveTaskSource(ctx, 0, "/tmp/tasks.md"); err != nil {
+	if err := app.RemoveTaskSource(ctx, 0, config.TaskSource{Agent: "someone-else", Path: "/tmp/tasks.md"}); err == nil {
+		t.Error("mismatched agent selector must refuse removal")
+	}
+	if err := app.RemoveTaskSource(ctx, 0, listed); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.RemoveTaskSource(ctx, 0, "/tmp/tasks.md"); err == nil {
+	if err := app.RemoveTaskSource(ctx, 0, listed); err == nil {
 		t.Error("removing from empty task sources must error")
 	}
 }
@@ -4333,7 +4337,7 @@ func TestRemoveTaskSourceKeepsChecklistFile(t *testing.T) {
 	if len(cfg.TaskSources) != 1 {
 		t.Fatalf("want 1 task source, got %d", len(cfg.TaskSources))
 	}
-	if err := app.RemoveTaskSource(ctx, 0, cfg.TaskSources[0].Path); err != nil {
+	if err := app.RemoveTaskSource(ctx, 0, cfg.TaskSources[0]); err != nil {
 		t.Fatal(err)
 	}
 	if cfg, err = app.Config(); err != nil {
@@ -4611,5 +4615,61 @@ func TestSetTaskSourceSettings(t *testing.T) {
 	sameFile.Agent = "someone-else"
 	if err := app.SetTaskSourceMaxTasks(ctx, 0, sameFile, 5); err == nil {
 		t.Error("a source whose selectors no longer match must be refused")
+	}
+}
+
+// TestRemoveTaskSourceDuplicatePathReordered is the regression the path-only
+// guard could not catch: two sources may point at the SAME checklist under
+// different agent selectors, so after a reorder the index the operator listed
+// holds a different entry whose path still matches. Removal must refuse rather
+// than retire the wrong agent's source — and the entry the operator DID name
+// is still removable by its new index.
+func TestRemoveTaskSourceDuplicatePathReordered(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	shared := filepath.Join(t.TempDir(), "shared.md")
+	if err := os.WriteFile(shared, []byte("- [ ] a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "alpha", "", shared, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "beta", "", shared, ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := cfg.TaskSources[0] // agent "alpha", at index 0 when listed
+	if listed.Agent != "alpha" {
+		t.Fatalf("fixture: expected alpha first, got %+v", cfg.TaskSources)
+	}
+
+	// Somebody reorders the file underneath (both entries still share a path).
+	cfg.TaskSources[0], cfg.TaskSources[1] = cfg.TaskSources[1], cfg.TaskSources[0]
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.RemoveTaskSource(ctx, 0, listed); err == nil {
+		t.Fatal("a reordered duplicate-path entry must refuse removal")
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 2 {
+		t.Fatalf("a refused removal must change nothing, got %+v", cfg.TaskSources)
+	}
+
+	// Re-listed, the same source removes cleanly from its new index — the
+	// guard refuses a stale reference, it does not strand the entry.
+	if err := app.RemoveTaskSource(ctx, 1, cfg.TaskSources[1]); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 || cfg.TaskSources[0].Agent != "beta" {
+		t.Errorf("wrong source removed: %+v", cfg.TaskSources)
 	}
 }
