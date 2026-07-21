@@ -472,10 +472,11 @@ func TestTasksTabAddPrompt(t *testing.T) {
 	// a works from any of the group's rows, header included.
 	upd, _ := m.Update(pressKeyMsg("a"))
 	m = upd.(Model)
-	// The label names the file (the directory may be display-truncated).
-	if m.prompt == nil || !strings.Contains(m.prompt.label, "new task(s) for ") ||
-		!strings.Contains(m.prompt.label, filepath.Base(path)) {
-		t.Fatalf("a should open the add prompt naming the file, got %+v", m.prompt)
+	// The label names the source by the selector the operator thinks in — the
+	// agent it feeds — rather than by its file path, which is often a long doc
+	// path whose basename says nothing about who receives the task.
+	if m.prompt == nil || !strings.Contains(m.prompt.label, "new task(s) for agent=brave-otter") {
+		t.Fatalf("a should open the add prompt naming the source's agent, got %+v", m.prompt)
 	}
 	m = press(t, m, "delta")
 	upd, cmd := m.Update(pressKeyMsg("enter"))

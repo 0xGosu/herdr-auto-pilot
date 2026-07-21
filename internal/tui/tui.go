@@ -157,91 +157,181 @@ func (m *Model) openPrompt(p *prompt) {
 	m.prompt = p
 }
 
-// runes returns the input as a rune slice with line breaks normalized, plus
-// the caret clamped into it. Every edit and the renderer go through this, so a
-// cursor left stale by a direct `input` assignment can never slice out of
+// textEdit is one editable line of text plus the caret's RUNE index into it
+// (0 = before the first rune, len = past the last). Every text input in the
+// TUI — the prompts and the `/` search query alike — edits through this one
+// type, so caret behavior cannot drift between them.
+//
+// Rune-indexed, not byte-indexed: the text can hold any UTF-8 and slicing a
+// multi-byte rune in half would corrupt it.
+type textEdit struct {
+	text   string
+	cursor int
+}
+
+// runes returns the text as a rune slice with line breaks normalized, plus the
+// caret clamped into it. Every edit and every renderer goes through this, so a
+// cursor left stale by a direct assignment to `text` can never slice out of
 // range — it just behaves as if it sat at the end.
-func (p *prompt) runes() ([]rune, int) {
-	r := []rune(promptNewlines.Replace(p.input))
-	return r, min(max(p.cursor, 0), len(r))
+func (e textEdit) runes() ([]rune, int) {
+	r := []rune(promptNewlines.Replace(e.text))
+	return r, min(max(e.cursor, 0), len(r))
+}
+
+// end parks the caret past the last rune. It measures the NORMALIZED text, not
+// the raw string: a pasted "\r\n" is one rune there and two in the raw text,
+// so measuring the raw one would overshoot.
+func (e textEdit) end() textEdit {
+	r, _ := e.runes()
+	return textEdit{text: e.text, cursor: len(r)}
 }
 
 // insert puts s at the caret and leaves the caret after it.
-func (p *prompt) insert(s string) {
-	r, cur := p.runes()
+func (e textEdit) insert(s string) textEdit {
+	r, cur := e.runes()
 	ins := []rune(s)
 	next := make([]rune, 0, len(r)+len(ins))
 	next = append(next, r[:cur]...)
 	next = append(next, ins...)
 	next = append(next, r[cur:]...)
-	p.input = string(next)
-	p.cursor = cur + len(ins)
+	return textEdit{text: string(next), cursor: cur + len(ins)}
 }
 
 // deleteBefore removes the rune before the caret (backspace); deleteAt removes
 // the one under it (delete). Both are no-ops at their respective edges.
-func (p *prompt) deleteBefore() {
-	r, cur := p.runes()
+func (e textEdit) deleteBefore() textEdit {
+	r, cur := e.runes()
 	if cur == 0 {
-		return
+		return e
 	}
-	p.input = string(append(append([]rune{}, r[:cur-1]...), r[cur:]...))
-	p.cursor = cur - 1
+	return textEdit{text: string(append(append([]rune{}, r[:cur-1]...), r[cur:]...)), cursor: cur - 1}
 }
 
-func (p *prompt) deleteAt() {
-	r, cur := p.runes()
+func (e textEdit) deleteAt() textEdit {
+	r, cur := e.runes()
 	if cur >= len(r) {
-		return
+		return e
 	}
-	p.input = string(append(append([]rune{}, r[:cur]...), r[cur+1:]...))
-	p.cursor = cur
+	return textEdit{text: string(append(append([]rune{}, r[:cur]...), r[cur+1:]...)), cursor: cur}
 }
 
 // moveBy shifts the caret by n runes, stopping at either edge.
-func (p *prompt) moveBy(n int) {
-	r, cur := p.runes()
-	p.cursor = min(max(cur+n, 0), len(r))
-}
-
-// moveTo parks the caret at an absolute rune index (clamped).
-func (p *prompt) moveTo(i int) {
-	r, _ := p.runes()
-	p.cursor = min(max(i, 0), len(r))
-}
-
-// moveEnd parks the caret past the last rune. It measures the NORMALIZED text
-// (runes()), not the raw input: a pasted "\r\n" is one rune there and two in
-// the raw string, so measuring the raw one would overshoot.
-func (p *prompt) moveEnd() {
-	r, _ := p.runes()
-	p.cursor = len(r)
+func (e textEdit) moveBy(n int) textEdit {
+	r, cur := e.runes()
+	return textEdit{text: e.text, cursor: min(max(cur+n, 0), len(r))}
 }
 
 // wordLeft/wordRight give ctrl+←/ctrl+→ their usual meaning: skip any run of
-// spaces, then the word beside it. Task text is prose, so word-wise motion is
+// spaces, then the word beside it. The text is prose, so word-wise motion is
 // what makes a long line editable without holding an arrow key down.
-func (p *prompt) wordLeft() {
-	r, cur := p.runes()
+func (e textEdit) wordLeft() textEdit {
+	r, cur := e.runes()
 	for cur > 0 && isPromptSpace(r[cur-1]) {
 		cur--
 	}
 	for cur > 0 && !isPromptSpace(r[cur-1]) {
 		cur--
 	}
-	p.cursor = cur
+	return textEdit{text: e.text, cursor: cur}
 }
 
-func (p *prompt) wordRight() {
-	r, cur := p.runes()
+func (e textEdit) wordRight() textEdit {
+	r, cur := e.runes()
 	for cur < len(r) && isPromptSpace(r[cur]) {
 		cur++
 	}
 	for cur < len(r) && !isPromptSpace(r[cur]) {
 		cur++
 	}
-	p.cursor = cur
+	return textEdit{text: e.text, cursor: cur}
 }
+
+// withCaret renders the text with the caret block at its position, ready to be
+// split on "\n" by a multi-line renderer. With the caret at the end this is
+// exactly "text" + the block, which is how the box always used to look.
+func (e textEdit) withCaret() string {
+	r, cur := e.runes()
+	return string(r[:cur]) + "█" + string(r[cur:])
+}
+
+// applyTextKey applies one editing or caret-motion keystroke and returns the
+// result; a key it does not handle returns e unchanged. This is the single
+// definition of "what the keys do in a text input" — arrows move the caret,
+// typing and deletion act AT the caret — so a new input surface gets the whole
+// behavior by calling this instead of re-implementing an append-only field.
+//
+// Both callers swallow every key while their input is active (each returns
+// before reaching the list bindings), which is what keeps ← from switching
+// tabs mid-entry; this function does not itself decide that.
+// allowNewline gates the line-break keys for inputs whose consumer is
+// single-line.
+func applyTextKey(e textEdit, msg tea.KeyMsg, allowNewline bool) textEdit {
+	switch msg.Type {
+	case tea.KeyBackspace:
+		return e.deleteBefore()
+	case tea.KeyDelete:
+		return e.deleteAt()
+	case tea.KeySpace:
+		return e.insert(" ")
+	case tea.KeyCtrlJ:
+		if allowNewline {
+			return e.insert("\n")
+		}
+		return e
+	// Caret motion: the input is a full line editor, so a typo in the middle
+	// of a long entry is fixed in place instead of retyping the tail.
+	// ctrl+a/ctrl+e mirror the readline bindings a terminal operator already
+	// has in muscle memory.
+	case tea.KeyLeft:
+		return e.moveBy(-1)
+	case tea.KeyRight:
+		return e.moveBy(1)
+	case tea.KeyCtrlLeft:
+		return e.wordLeft()
+	case tea.KeyCtrlRight:
+		return e.wordRight()
+	case tea.KeyHome, tea.KeyCtrlA:
+		return textEdit{text: e.text}
+	case tea.KeyEnd, tea.KeyCtrlE:
+		return e.end()
+	case tea.KeyRunes:
+		// Only printable input; key names like "up"/"home" must not leak
+		// into the text.
+		return e.insert(string(msg.Runes))
+	}
+	return e
+}
+
+// queryEdit/setQueryEdit adapt the active tab's search filter to textEdit, so
+// the query gets exactly the caret behavior the prompts have.
+func (m *Model) queryEdit() textEdit {
+	return textEdit{text: m.query[m.tab], cursor: m.queryCursor[m.tab]}
+}
+
+func (m *Model) setQueryEdit(e textEdit) {
+	m.query[m.tab], m.queryCursor[m.tab] = e.text, e.cursor
+}
+
+// setQuery replaces a tab's filter wholesale (opening search, clearing it),
+// parking the caret at the end so the operator can extend an existing query
+// immediately — the same rule openPrompt applies to a pre-filled prompt.
+func (m *Model) setQuery(t tab, text string) {
+	// Measured through textEdit.end(), not len([]rune(text)): the caret must
+	// index the NORMALIZED text everywhere, or a query populated from a paste
+	// would park past its end.
+	m.query[t] = text
+	m.queryCursor[t] = textEdit{text: text}.end().cursor
+}
+
+// edit/setEdit adapt the prompt's own fields to textEdit, so the prompt keeps
+// its plain `input string` for the ~14 call sites that build one.
+func (p *prompt) edit() textEdit { return textEdit{text: p.input, cursor: p.cursor} }
+
+func (p *prompt) setEdit(e textEdit) { p.input, p.cursor = e.text, e.cursor }
+
+// insert puts s at the prompt's caret (used by the shift+enter path, which is
+// handled before the key switch).
+func (p *prompt) insert(s string) { p.setEdit(p.edit().insert(s)) }
 
 // isPromptSpace uses unicode.IsSpace rather than an ASCII set: task text is
 // known to carry U+00A0 (Claude renders todo rows with it), and treating a
@@ -404,12 +494,16 @@ type Model struct {
 	// so returning to a tab restores the row you left it on (CR-038). Only the
 	// active tab's entry is ever read — a background tab's row set can shift
 	// under its remembered cursor, so arriveAtTab clamps on arrival.
-	cursors   [tabCount]int
-	offsets   [tabCount]int    // per-list viewport offset (AR-001)
-	query     [tabCount]string // per-tab search filter (AR-013)
-	searching bool             // search-input mode on the active tab (AR-011)
-	status    *statusNote      // durable action outcome (CR-025)
-	st        *styles          // palette-resolved styles; nil = default palette
+	cursors [tabCount]int
+	offsets [tabCount]int    // per-list viewport offset (AR-001)
+	query   [tabCount]string // per-tab search filter (AR-013)
+	// queryCursor is the search caret's rune index, per tab like the query
+	// itself: re-entering search on a tab must resume where that tab's own
+	// query left off, not where another tab's did.
+	queryCursor [tabCount]int
+	searching   bool        // search-input mode on the active tab (AR-011)
+	status      *statusNote // durable action outcome (CR-025)
+	st          *styles     // palette-resolved styles; nil = default palette
 	// now is the clock the live Age counter renders against, advanced by the
 	// 1s clockTickMsg. Zero falls back to time.Now() (see renderNow), so tests
 	// can pin it for deterministic snapshots.
@@ -1157,50 +1251,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.prompt = nil
 			m.message = "cancelled"
 			return m, nil
-		case tea.KeyBackspace:
-			m.prompt.deleteBefore()
-			return m, nil
-		case tea.KeyDelete:
-			m.prompt.deleteAt()
-			return m, nil
-		case tea.KeySpace:
-			m.prompt.insert(" ")
-			return m, nil
-		case tea.KeyCtrlJ:
-			if m.prompt.multiline {
-				m.prompt.insert("\n")
-			}
-			return m, nil
-		// Caret motion: the input is a full line editor, so a typo in the
-		// middle of a long task is fixed in place instead of retyping the
-		// tail. ctrl+a/ctrl+e mirror the readline bindings a terminal
-		// operator already has in muscle memory.
-		case tea.KeyLeft:
-			m.prompt.moveBy(-1)
-			return m, nil
-		case tea.KeyRight:
-			m.prompt.moveBy(1)
-			return m, nil
-		case tea.KeyCtrlLeft:
-			m.prompt.wordLeft()
-			return m, nil
-		case tea.KeyCtrlRight:
-			m.prompt.wordRight()
-			return m, nil
-		case tea.KeyHome, tea.KeyCtrlA:
-			m.prompt.moveTo(0)
-			return m, nil
-		case tea.KeyEnd, tea.KeyCtrlE:
-			m.prompt.moveEnd()
-			return m, nil
-		case tea.KeyRunes:
-			// Only printable input; key names like "up"/"home" must not
-			// leak into the text.
-			m.prompt.insert(string(msg.Runes))
-			return m, nil
-		default:
-			return m, nil
 		}
+		// Everything else is text editing. Unhandled keys are swallowed so a
+		// stray binding cannot fire mid-entry.
+		m.prompt.setEdit(applyTextKey(m.prompt.edit(), msg, m.prompt.multiline))
+		return m, nil
 	}
 
 	// Search-input mode (AR-011): every printable key edits the query —
@@ -1212,15 +1267,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC:
 			return m, tea.Quit
 		case tea.KeyEsc, tea.KeyEnter:
+			// Leaving search hands ←/→ back to tab navigation.
 			m.searching = false
-		case tea.KeyBackspace:
-			if r := []rune(m.query[m.tab]); len(r) > 0 {
-				m.query[m.tab] = string(r[:len(r)-1])
-			}
-		case tea.KeySpace:
-			m.query[m.tab] += " "
-		case tea.KeyRunes:
-			m.query[m.tab] += string(msg.Runes)
+		default:
+			// The query is a text input like any other: same caret, same
+			// editing keys. Every key is swallowed here (this branch always
+			// returns), so ← moves the caret instead of switching tabs out
+			// from under a half-typed query.
+			m.setQueryEdit(applyTextKey(m.queryEdit(), msg, false))
 		}
 		m.clampListViewport() // CR-016
 		return m, nil
@@ -1255,13 +1309,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "/":
 		if m.tab.isList() {
 			m.searching = true
+			// Resume editing an existing filter from its end rather than
+			// from index 0, which would insert in front of it.
+			m.setQueryEdit(m.queryEdit().end())
 			m.message = ""
 		}
 	case "backspace":
 		// The active-filter hint advertises backspace-to-clear outside
 		// search mode too; a no-op otherwise.
 		if m.tab.isList() && m.query[m.tab] != "" {
-			m.query[m.tab] = ""
+			m.setQuery(m.tab, "")
 			m.clampListViewport()
 		}
 	case "p":
@@ -2157,6 +2214,28 @@ func (m Model) confirmDeleteTaskTargets(targets []taskTarget, clearsMarks bool) 
 
 // addTaskPrompt appends a task to the checklist of the source under the
 // cursor (any of its rows — header included — names the target file).
+// taskSourceLabel names the source a task prompt is writing to by the selector
+// the operator THINKS in — who the source feeds — rather than by its file
+// path, which is often a long doc path whose basename says nothing about who
+// gets the task. A source with no agent selector is named by its workspace
+// instead, wildcarded to "*" exactly like the Tasks group header renders it,
+// so the two always read the same way. The path is used only when the row has
+// no source to consult at all.
+func (m Model) taskSourceLabel(r *taskRow) string {
+	if r.group >= len(m.data.tasks) {
+		return truncatePathKeepBase(r.path, taskPathDisplayWidth)
+	}
+	src := m.data.tasks[r.group].Source
+	if src.Agent != "" {
+		return "agent=" + src.Agent
+	}
+	ws := src.Workspace
+	if ws == "" {
+		ws = "*"
+	}
+	return "ws=" + ws
+}
+
 func (m Model) addTaskPrompt() (tea.Model, tea.Cmd) {
 	r := m.selectedTaskRow()
 	if r == nil {
@@ -2171,7 +2250,7 @@ func (m Model) addTaskPrompt() (tea.Model, tea.Cmd) {
 	m.beginAction()
 	m.openPrompt(&prompt{
 		label: fmt.Sprintf("new task(s) for %s — enter: add, shift+enter: new line, esc: cancel",
-			truncatePathKeepBase(path, taskPathDisplayWidth)),
+			m.taskSourceLabel(r)),
 		multiline: true,
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
@@ -3488,7 +3567,7 @@ func (m Model) showAgentTasks(a domain.AgentTransition) (tea.Model, tea.Cmd) {
 	if !ok && m.query[tabTasks] != "" {
 		// The Tasks search filter hides the very row being jumped to; a jump
 		// that lands nowhere is worse than a dropped filter, so clear it.
-		m.query[tabTasks] = ""
+		m.setQuery(tabTasks, "")
 		cursor, ok = m.taskGroupHeaderRow(group)
 	}
 	m.offsets[tabTasks] = 0
@@ -3567,7 +3646,7 @@ func (m Model) showRuleFor(signature string) (tea.Model, tea.Cmd) {
 		// Hidden by the Rules tab's own filters — it composes a search query
 		// AND the f mode cycle, so either can bury the target. ruleFor already
 		// proved the rule exists, so clearing both makes the retry land.
-		m.query[tabSignatures] = ""
+		m.setQuery(tabSignatures, "")
 		m.sigMode = ""
 		cursor, ok = m.ruleRowFor(signature)
 	}
@@ -3721,7 +3800,7 @@ func (m Model) View() string {
 	// Search bar / active-filter line (its height is accounted for in
 	// listPageSize so the body never overflows the pane).
 	if m.searching {
-		fmt.Fprintf(&b, "%s%s█\n", st.section.Render("search> "), m.query[m.tab])
+		fmt.Fprintf(&b, "%s%s\n", st.section.Render("search> "), m.queryEdit().withCaret())
 	} else if m.tab.isList() && m.query[m.tab] != "" {
 		fmt.Fprintf(&b, "%s\n", st.help.Render(
 			fmt.Sprintf("filter: %q — / to edit, backspace to clear", m.query[m.tab])))
@@ -3760,9 +3839,7 @@ func (m Model) View() string {
 		// its rune index rather than always at the end, so the operator can
 		// see where the next keystroke lands; with the caret at the end this
 		// renders exactly as it always did.
-		r, cur := m.prompt.runes()
-		withCaret := string(r[:cur]) + "█" + string(r[cur:])
-		lines := strings.Split(withCaret, "\n")
+		lines := strings.Split(m.prompt.edit().withCaret(), "\n")
 		fmt.Fprintf(&b, "\n%s> %s", m.prompt.label, lines[0])
 		for _, l := range lines[1:] {
 			fmt.Fprintf(&b, "\n  %s", l)
@@ -3830,7 +3907,7 @@ func (m Model) helpLine() string {
 		return "↑/↓: scroll  tab: switch tab" + rule + preview + "  " + closeKeys
 	}
 	if m.searching {
-		return "type to filter  backspace: erase  esc/enter: apply & close"
+		return "type to filter  ←/→: move (ctrl: by word)  home/end: line ends  backspace/delete: erase  esc/enter: apply & close"
 	}
 	// The caret bindings are advertised here rather than in the prompt label:
 	// the label is inside the prompt box, whose height listPageSize budgets as

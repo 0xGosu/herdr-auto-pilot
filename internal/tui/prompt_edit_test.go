@@ -1,8 +1,12 @@
 package tui
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -420,5 +424,319 @@ func TestPickerPromptIgnoresCaretKeys(t *testing.T) {
 	}
 	if m.prompt.optIdx != 0 {
 		t.Errorf("caret keys moved the highlight to %d", m.prompt.optIdx)
+	}
+}
+
+// --- the `/` search query is the same text input ------------------------
+
+// searchModel opens search mode on the Agents tab and TYPES the query through
+// the real key path, so the caret it leaves behind is the production one and
+// not a value the helper assigned itself.
+func searchModel(t *testing.T, query string) Model {
+	t.Helper()
+	m := testModel(t)
+	m.tab = tabAgents
+	m = pressEdit(t, m, "/") // enter search mode
+	if !m.searching {
+		t.Fatal("/ did not enter search mode")
+	}
+	for _, r := range query {
+		if r == ' ' {
+			m = pressEdit(t, m, "space")
+			continue
+		}
+		m = pressEdit(t, m, string(r))
+	}
+	if m.query[m.tab] != query {
+		t.Fatalf("typed query is %q, want %q", m.query[m.tab], query)
+	}
+	return m
+}
+
+// TestSearchQueryHasTheSameCaret pins that the `/` filter is a real text input
+// and not the append-only field it used to be. It is the input an operator
+// types into most often, so a narrowed query that needs one word changed in the
+// middle must not require retyping the tail.
+func TestSearchQueryHasTheSameCaret(t *testing.T) {
+	m := searchModel(t, "claude agent")
+	if got, want := m.queryCursor[m.tab], len([]rune("claude agent")); got != want {
+		t.Fatalf("typing left the caret at %d, want %d (after the last rune)", got, want)
+	}
+
+	// Walk back over "agent" and insert in place.
+	m = pressEdit(t, m, "ctrl+left", "x")
+	if want := "claude xagent"; m.query[m.tab] != want {
+		t.Fatalf("insert mid-query gave %q, want %q", m.query[m.tab], want)
+	}
+	// Deletion acts at the caret, both directions.
+	m = pressEdit(t, m, "backspace")
+	if want := "claude agent"; m.query[m.tab] != want {
+		t.Fatalf("backspace at the caret gave %q, want %q", m.query[m.tab], want)
+	}
+	m = pressEdit(t, m, "delete")
+	if want := "claude gent"; m.query[m.tab] != want {
+		t.Fatalf("delete at the caret gave %q, want %q", m.query[m.tab], want)
+	}
+	// And the ends.
+	m = pressEdit(t, m, "ctrl+a")
+	if m.queryCursor[m.tab] != 0 {
+		t.Errorf("ctrl+a → %d, want 0", m.queryCursor[m.tab])
+	}
+	m = pressEdit(t, m, "ctrl+e")
+	if got, want := m.queryCursor[m.tab], len([]rune("claude gent")); got != want {
+		t.Errorf("ctrl+e → %d, want %d", got, want)
+	}
+}
+
+// TestSearchArrowsMoveTheCaretNotTheTab is the boundary the operator actually
+// feels: while a query is being typed the arrows belong to the TEXT, and only
+// after esc/enter do they go back to switching tabs. The search branch always
+// returned before the list bindings, so "the tab did not change" alone would
+// have passed before this change too — the load-bearing half is that the
+// arrows now MOVE THE CARET.
+func TestSearchArrowsMoveTheCaretNotTheTab(t *testing.T) {
+	m := searchModel(t, "abc")
+	start := m.tab
+
+	m = pressEdit(t, m, "left", "left")
+	if got := m.queryCursor[m.tab]; got != 1 {
+		t.Fatalf("← ← left the caret at %d, want 1", got)
+	}
+	m = pressEdit(t, m, "right")
+	if got := m.queryCursor[m.tab]; got != 2 {
+		t.Fatalf("→ left the caret at %d, want 2", got)
+	}
+	m = pressEdit(t, m, "ctrl+left")
+	if got := m.queryCursor[m.tab]; got != 0 {
+		t.Fatalf("ctrl+← left the caret at %d, want 0", got)
+	}
+	m = pressEdit(t, m, "ctrl+right")
+	if got := m.queryCursor[m.tab]; got != 3 {
+		t.Fatalf("ctrl+→ left the caret at %d, want 3", got)
+	}
+	if m.tab != start {
+		t.Fatalf("arrows in search mode switched tab %v → %v", start, m.tab)
+	}
+	if !m.searching {
+		t.Error("arrows in search mode left search")
+	}
+	if m.query[m.tab] != "abc" {
+		t.Errorf("arrows changed the query: %q", m.query[m.tab])
+	}
+
+	// esc hands the arrows back to tab navigation.
+	m = pressEdit(t, m, "esc")
+	if m.searching {
+		t.Fatal("esc did not leave search mode")
+	}
+	m = pressEdit(t, m, "left")
+	if m.tab == start {
+		t.Error("after leaving search, ← must switch tabs again")
+	}
+}
+
+// TestSearchCaretResumesAtEndOfExistingQuery pins re-entry: `/` on a tab that
+// already carries a filter must park the caret after it, not at 0 — otherwise
+// the next keystroke inserts in FRONT of the query the operator is refining.
+func TestSearchCaretResumesAtEndOfExistingQuery(t *testing.T) {
+	m := searchModel(t, "claude")
+	m = pressEdit(t, m, "ctrl+a") // park it at the front
+	m = pressEdit(t, m, "esc")
+
+	m = pressEdit(t, m, "/")
+	if got, want := m.queryCursor[m.tab], len([]rune("claude")); got != want {
+		t.Fatalf("re-entering search put the caret at %d, want %d", got, want)
+	}
+	m = pressEdit(t, m, "!")
+	if want := "claude!"; m.query[m.tab] != want {
+		t.Errorf("typing after re-entry gave %q, want %q", m.query[m.tab], want)
+	}
+}
+
+// TestClearingAFilterResetsItsCaret pins the other direction: backspace outside
+// search mode clears the filter, so the caret must come back to 0 with it or
+// the next `/` session starts with a caret pointing past the end of an empty
+// query.
+func TestClearingAFilterResetsItsCaret(t *testing.T) {
+	m := searchModel(t, "some filter")
+	m = pressEdit(t, m, "esc")
+	m = pressEdit(t, m, "backspace") // clears the active filter
+	if m.query[m.tab] != "" {
+		t.Fatalf("backspace outside search should clear the filter, got %q", m.query[m.tab])
+	}
+	if m.queryCursor[m.tab] != 0 {
+		t.Errorf("caret left at %d after clearing, want 0", m.queryCursor[m.tab])
+	}
+}
+
+// TestSearchRendersCaretAtItsPosition pins the visible half for the query box.
+func TestSearchRendersCaretAtItsPosition(t *testing.T) {
+	m := searchModel(t, "abcd")
+	if view := m.View(); !strings.Contains(view, "abcd█") {
+		t.Errorf("caret at the end should render after the query:\n%s", view)
+	}
+	m = pressEdit(t, m, "left", "left")
+	if view := m.View(); !strings.Contains(view, "ab█cd") {
+		t.Errorf("caret should render at its position:\n%s", view)
+	}
+}
+
+// TestOnlyApplyTextKeyConsumesTypedRunes enforces the rule that makes "every
+// text input behaves the same" true by construction rather than by discipline:
+// applyTextKey must be the ONLY function that turns typed runes into text. A
+// new input surface that hand-rolls `x += string(msg.Runes)` would silently be
+// append-only again, which is exactly the bug this change removed.
+//
+// Resolved through the AST, not a grep: the check must be about which FUNCTION
+// reads the runes, so that deleting applyTextKey's own case and hand-rolling
+// the append elsewhere in the same file still fails — and so that a comment
+// mentioning msg.Runes never fails it spuriously.
+func TestOnlyApplyTextKeyConsumesTypedRunes(t *testing.T) {
+	names, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	readers := map[string]bool{}
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			ast.Inspect(fn, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "Runes" {
+					return true
+				}
+				if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "msg" {
+					readers[fn.Name.Name] = true
+				}
+				return true
+			})
+		}
+	}
+	if len(readers) != 1 || !readers["applyTextKey"] {
+		names := make([]string, 0, len(readers))
+		for n := range readers {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		t.Errorf("msg.Runes is read by %v, want only applyTextKey — a new text input must call applyTextKey instead of appending to a plain string", names)
+	}
+}
+
+// TestSearchCaretIsPerTab pins why queryCursor is an array and not one int:
+// filters are per-tab, so returning to a tab must restore ITS caret, not
+// wherever the caret happened to sit on the tab the operator came from.
+func TestSearchCaretIsPerTab(t *testing.T) {
+	m := searchModel(t, "alpha") // Agents tab
+	m = pressEdit(t, m, "left", "left")
+	agentsCaret := m.queryCursor[tabAgents]
+	if agentsCaret != 3 {
+		t.Fatalf("caret on Agents is %d, want 3", agentsCaret)
+	}
+	m = pressEdit(t, m, "esc")
+
+	// A different query, with a different caret, on another tab.
+	m.tab = tabEscalations
+	m = pressEdit(t, m, "/")
+	for _, r := range "beta" {
+		m = pressEdit(t, m, string(r))
+	}
+	m = pressEdit(t, m, "ctrl+a", "esc")
+	if m.queryCursor[tabEscalations] != 0 {
+		t.Fatalf("caret on Escalations is %d, want 0", m.queryCursor[tabEscalations])
+	}
+
+	// Back to the first tab: its own query and caret come back untouched.
+	m.tab = tabAgents
+	if m.query[tabAgents] != "alpha" {
+		t.Errorf("Agents query = %q, want %q", m.query[tabAgents], "alpha")
+	}
+	if got := m.queryCursor[tabAgents]; got != agentsCaret {
+		t.Errorf("Agents caret = %d, want %d — the other tab's caret leaked", got, agentsCaret)
+	}
+	if m.query[tabEscalations] != "beta" {
+		t.Errorf("Escalations query = %q, want %q", m.query[tabEscalations], "beta")
+	}
+}
+
+// TestSearchQueryIsSingleLineAndRuneSafe covers the two properties the query
+// path does not inherit from the prompt tests: it is a single-line input (a
+// line break must never enter a filter), and its caret indexes runes, since a
+// filter can be typed in any language.
+func TestSearchQueryIsSingleLineAndRuneSafe(t *testing.T) {
+	m := searchModel(t, "héllo wörld")
+	if got, want := m.queryCursor[m.tab], len([]rune("héllo wörld")); got != want {
+		t.Fatalf("caret at %d, want %d runes (byte indexing would give %d)",
+			got, want, len("héllo wörld"))
+	}
+	// Delete the multi-byte rune inside "wörld" without corrupting the rest.
+	m = pressEdit(t, m, "ctrl+left", "right", "delete")
+	if want := "héllo wrld"; m.query[m.tab] != want {
+		t.Fatalf("query = %q, want %q", m.query[m.tab], want)
+	}
+
+	// ctrl+j is gated off for this surface: a filter is one line.
+	before := m.query[m.tab]
+	m = pressEdit(t, m, "ctrl+j")
+	if m.query[m.tab] != before {
+		t.Errorf("ctrl+j changed a single-line query: %q", m.query[m.tab])
+	}
+	if strings.Contains(m.query[m.tab], "\n") {
+		t.Errorf("a line break entered the filter: %q", m.query[m.tab])
+	}
+}
+
+// TestAddTaskPromptNamesTheSourceSelector pins the add prompt's title. The
+// operator picks a source by WHO it feeds, so the prompt names the agent, and
+// a source with no agent selector is named by its workspace — wildcarded to
+// "*" exactly as the Tasks group header renders it, so the prompt and the row
+// above it never disagree about what the source is called. The file path is
+// never the title: it is often a long doc path whose basename says nothing
+// about who receives the task.
+func TestAddTaskPromptNamesTheSourceSelector(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent string
+		ws    string
+		want  string
+	}{
+		{name: "agent selector wins over workspace", agent: "brave-otter", ws: "codex-*",
+			want: "new task(s) for agent=brave-otter"},
+		{name: "workspace when no agent", ws: "codex-1",
+			want: "new task(s) for ws=codex-1"},
+		// A catch-all source still names a selector rather than falling back
+		// to the path: an unset workspace reads as the "*" wildcard.
+		{name: "wildcard workspace for a catch-all", want: "new task(s) for ws=*"},
+		{name: "explicit wildcard workspace", ws: "*", want: "new task(s) for ws=*"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, path := taskAppModel(t)
+			m.data.tasks[0].Source.Agent = tc.agent
+			m.data.tasks[0].Source.Workspace = tc.ws
+
+			upd, _ := m.Update(pressKeyMsg("a"))
+			m = upd.(Model)
+			if m.prompt == nil {
+				t.Fatal("a did not open the add prompt")
+			}
+			if !strings.Contains(m.prompt.label, tc.want) {
+				t.Errorf("label = %q, want it to contain %q", m.prompt.label, tc.want)
+			}
+			// The selector replaces the path — it does not sit beside it.
+			if strings.Contains(m.prompt.label, filepath.Base(path)) {
+				t.Errorf("label = %q, must not still carry the file name", m.prompt.label)
+			}
+		})
 	}
 }
