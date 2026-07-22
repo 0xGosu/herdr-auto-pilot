@@ -66,47 +66,69 @@ func TestLoadPartialConfigFillsDefaults(t *testing.T) {
 	}
 }
 
-func TestEscalationDedupLimitsDefaultsAndOverrides(t *testing.T) {
-	// Unset → defaults applied.
-	unset := filepath.Join(t.TempDir(), "config.toml")
-	os.WriteFile(unset, []byte("[limits]\nmax_error_retries = 4\n"), 0o600)
-	cfg, err := Load(unset)
+func TestRetiredEscalationDedupKeysIgnoredWarnedAndDroppedOnSave(t *testing.T) {
+	// The escalation duplicate-ask tuning was made a hard constant (it moved to
+	// the daemon package). An existing config that still carries the retired keys
+	// must load cleanly (silently ignored, not rejected — so an upgrade never
+	// breaks a running deployment), warn the operator that they no longer apply,
+	// and drop them on the next Save.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[limits]\nmax_error_retries = 4\nescalation_dedup_window_seconds = 120\nescalation_dedup_jitter_percent = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, logs, err := loadWithLogs(path)
+	if err != nil {
+		t.Fatalf("a config with the retired dedup keys must still load, got error: %v", err)
+	}
+	if !strings.Contains(logs, "escalation_dedup_window_seconds") ||
+		!strings.Contains(logs, "escalation_dedup_jitter_percent") ||
+		!strings.Contains(logs, "no longer supported") {
+		t.Errorf("retired dedup-key warnings missing or unclear: %q", logs)
+	}
+	// The still-live sibling in the same table is honored, proving the table
+	// parsed rather than being skipped wholesale.
+	if cfg.Limits.MaxErrorRetries != 4 {
+		t.Errorf("max_error_retries alongside the retired keys was lost: %d", cfg.Limits.MaxErrorRetries)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Limits.EscalationDedupWindowSeconds != Default().Limits.EscalationDedupWindowSeconds {
-		t.Errorf("unset dedup window should default to %d, got %d",
-			Default().Limits.EscalationDedupWindowSeconds, cfg.Limits.EscalationDedupWindowSeconds)
+	if strings.Contains(string(data), "escalation_dedup_window_seconds") ||
+		strings.Contains(string(data), "escalation_dedup_jitter_percent") {
+		t.Fatalf("saved config must drop the removed dedup keys:\n%s", data)
 	}
-	if cfg.Limits.EscalationDedupJitterPercent != Default().Limits.EscalationDedupJitterPercent {
-		t.Errorf("unset dedup jitter should default to %d, got %d",
-			Default().Limits.EscalationDedupJitterPercent, cfg.Limits.EscalationDedupJitterPercent)
-	}
+}
 
-	// Explicit values honored; a 0 jitter is a valid "exact match only" setting
-	// and must NOT be overwritten by the default.
-	set := filepath.Join(t.TempDir(), "config.toml")
-	os.WriteFile(set, []byte("[limits]\nescalation_dedup_window_seconds = 120\nescalation_dedup_jitter_percent = 0\n"), 0o600)
-	cfg, err = Load(set)
+func TestRetiredEmbeddingMaxFailuresKeyIgnoredWarnedAndDroppedOnSave(t *testing.T) {
+	// embedding.max_consecutive_failures was made a fixed internal constant. An
+	// existing config carrying it must still load, warn, and lose the key on Save.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[embedding]\nmax_consecutive_failures = 10\nsimilarity_threshold = 0.8\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, logs, err := loadWithLogs(path)
+	if err != nil {
+		t.Fatalf("a config with the retired embedding key must still load, got error: %v", err)
+	}
+	if !strings.Contains(logs, "max_consecutive_failures") || !strings.Contains(logs, "no longer supported") {
+		t.Errorf("retired embedding-key warning missing or unclear: %q", logs)
+	}
+	if cfg.Embedding.SimilarityThreshold != 0.8 {
+		t.Errorf("sibling embedding setting lost: %v", cfg.Embedding.SimilarityThreshold)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Limits.EscalationDedupWindowSeconds != 120 {
-		t.Errorf("explicit dedup window lost: %d", cfg.Limits.EscalationDedupWindowSeconds)
-	}
-	if cfg.Limits.EscalationDedupJitterPercent != 0 {
-		t.Errorf("explicit 0 jitter (disable) must be preserved, got %d", cfg.Limits.EscalationDedupJitterPercent)
-	}
-
-	// Out-of-range jitter clamps to 100; a negative falls back to the default.
-	clamp := filepath.Join(t.TempDir(), "config.toml")
-	os.WriteFile(clamp, []byte("[limits]\nescalation_dedup_jitter_percent = 250\n"), 0o600)
-	cfg, err = Load(clamp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Limits.EscalationDedupJitterPercent != 100 {
-		t.Errorf("over-100 jitter should clamp to 100, got %d", cfg.Limits.EscalationDedupJitterPercent)
+	if strings.Contains(string(data), "max_consecutive_failures") {
+		t.Fatalf("saved config must drop the removed embedding key:\n%s", data)
 	}
 }
 
@@ -328,7 +350,6 @@ func TestEmbeddingTimeoutKeysRoundTrip(t *testing.T) {
 [embedding]
 embed_timeout_ms = 8000
 warm_timeout_ms = 120000
-max_consecutive_failures = 10
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -336,8 +357,7 @@ max_consecutive_failures = 10
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Embedding.EmbedTimeoutMs != 8000 || got.Embedding.WarmTimeoutMs != 120000 ||
-		got.Embedding.MaxConsecutiveFailures != 10 {
+	if got.Embedding.EmbedTimeoutMs != 8000 || got.Embedding.WarmTimeoutMs != 120000 {
 		t.Fatalf("embedding timeout keys not parsed: %+v", got.Embedding)
 	}
 
@@ -358,8 +378,7 @@ max_consecutive_failures = 10
 	if err != nil {
 		t.Fatal(err)
 	}
-	if def.Embedding.EmbedTimeoutMs != 0 || def.Embedding.WarmTimeoutMs != 0 ||
-		def.Embedding.MaxConsecutiveFailures != 0 {
+	if def.Embedding.EmbedTimeoutMs != 0 || def.Embedding.WarmTimeoutMs != 0 {
 		t.Errorf("unset timeout keys = %+v, want the 0 sentinel", def.Embedding)
 	}
 }

@@ -524,3 +524,42 @@ func TestRateGuardFunctions(t *testing.T) {
 		t.Error("paused agent must stay blocked")
 	}
 }
+
+// TestRegisterAutoPromptIdleSkipsConsecutiveCounter pins the auto-send-when-idle
+// exemption: an unattended idle task hand-out must NOT advance the consecutive
+// counter (or the source would pause after max_consecutive_auto_prompts tasks),
+// but it MUST still advance the per-minute window so a runaway source is
+// throttled.
+func TestRegisterAutoPromptIdleSkipsConsecutiveCounter(t *testing.T) {
+	now := time.Now()
+	lim := RateLimits{MaxConsecutive: 5, MaxPerMinute: 100}
+
+	// Far more idle hand-outs than the consecutive ceiling never trips it.
+	r := AgentRate{WindowStart: now}
+	for range lim.MaxConsecutive * 3 {
+		r = RegisterAutoPromptIdle(r, now)
+	}
+	if r.ConsecutiveAuto != 0 {
+		t.Errorf("idle hand-outs must not advance ConsecutiveAuto, got %d", r.ConsecutiveAuto)
+	}
+	if r.CountInWindow != lim.MaxConsecutive*3 {
+		t.Errorf("idle hand-outs must advance the per-minute window, got %d want %d",
+			r.CountInWindow, lim.MaxConsecutive*3)
+	}
+	if ok, _ := CheckRate(r, now, lim); !ok {
+		t.Error("idle hand-outs alone must never trip the consecutive ceiling")
+	}
+
+	// The per-minute cap still throttles idle hand-outs.
+	perMin := RateLimits{MaxConsecutive: 100, MaxPerMinute: 3}
+	r = AgentRate{WindowStart: now}
+	for i := range perMin.MaxPerMinute {
+		if ok, _ := CheckRate(r, now, perMin); !ok {
+			t.Fatalf("idle hand-out %d should be allowed within the minute", i+1)
+		}
+		r = RegisterAutoPromptIdle(r, now)
+	}
+	if ok, reason := CheckRate(r, now, perMin); ok || reason != ReasonRateLimited {
+		t.Error("idle hand-out over the per-minute cap must be blocked")
+	}
+}

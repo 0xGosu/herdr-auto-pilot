@@ -1854,8 +1854,6 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
-	{Key: "limits.escalation_dedup_window_seconds", TUIEditable: true},
-	{Key: "limits.escalation_dedup_jitter_percent", TUIEditable: true},
 	{Key: "safety.disable_never_auto_seed_patterns", TUIEditable: true},
 	{Key: "llm.command"},       // argv template
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
@@ -1875,7 +1873,6 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "embedding.model_context_window", TUIEditable: true},
 	{Key: "embedding.embed_timeout_ms", TUIEditable: true},
 	{Key: "embedding.warm_timeout_ms", TUIEditable: true},
-	{Key: "embedding.max_consecutive_failures", TUIEditable: true},
 	{Key: "tui.max_content_width", TUIEditable: true},
 	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
@@ -1948,10 +1945,6 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.Limits.MaxAutoPromptsPerMinute)
 	case "limits.max_error_retries":
 		return strconv.Itoa(cfg.Limits.MaxErrorRetries)
-	case "limits.escalation_dedup_window_seconds":
-		return strconv.Itoa(cfg.Limits.EscalationDedupWindowSeconds)
-	case "limits.escalation_dedup_jitter_percent":
-		return strconv.Itoa(cfg.Limits.EscalationDedupJitterPercent)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -2013,8 +2006,6 @@ func FieldValue(cfg config.Config, key string) string {
 		return defaultedInt(cfg.Embedding.EmbedTimeoutMs, embedder.DefaultEmbedTimeoutMs)
 	case "embedding.warm_timeout_ms":
 		return defaultedInt(cfg.Embedding.WarmTimeoutMs, embedder.DefaultWarmTimeoutMs)
-	case "embedding.max_consecutive_failures":
-		return defaultedInt(cfg.Embedding.MaxConsecutiveFailures, embedder.DefaultMaxConsecutiveFailures)
 	case "safety.disable_never_auto_seed_patterns":
 		return strconv.FormatBool(cfg.Safety.DisableNeverAutoSeedPatterns)
 	case "tui.max_content_width":
@@ -2097,17 +2088,6 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setInt(&cfg.Limits.MaxAutoPromptsPerMinute)
 		case "limits.max_error_retries":
 			return setInt(&cfg.Limits.MaxErrorRetries)
-		case "limits.escalation_dedup_window_seconds":
-			return setInt(&cfg.Limits.EscalationDedupWindowSeconds)
-		case "limits.escalation_dedup_jitter_percent":
-			// 0-100; 0 disables the tolerance (exact match only), so unlike
-			// setInt this accepts 0 but rejects negatives and values over 100.
-			v, err := strconv.Atoi(value)
-			if err != nil || v < 0 || v > 100 {
-				return fmt.Errorf("limits.escalation_dedup_jitter_percent must be an integer between 0 and 100 (0 = exact match only), got %q", value)
-			}
-			cfg.Limits.EscalationDedupJitterPercent = v
-			return nil
 		case "llm.timeout_seconds":
 			return setInt(&cfg.LLM.TimeoutSeconds)
 		case "llm.auto_act_confidence_threshold":
@@ -2211,13 +2191,6 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("embedding.warm_timeout_ms must be a non-negative integer (0 = default), got %q", value)
 			}
 			cfg.Embedding.WarmTimeoutMs = v
-			return nil
-		case "embedding.max_consecutive_failures":
-			v, err := strconv.Atoi(value)
-			if err != nil || v < 0 {
-				return fmt.Errorf("embedding.max_consecutive_failures must be a non-negative integer (0 = default), got %q", value)
-			}
-			cfg.Embedding.MaxConsecutiveFailures = v
 			return nil
 		case "llm.pane_excerpt_chars":
 			// 0 is the config's "restore the 5000-char default" sentinel

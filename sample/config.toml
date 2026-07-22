@@ -34,17 +34,11 @@ disable_never_auto_seed_patterns = false  # keep all shipped strict + heuristic 
 
 # ── Rate limits ─────────────────────────────────────────────────────
 [limits]
-max_consecutive_auto_prompts = 10  # per agent, without human interaction
+max_consecutive_auto_prompts = 30  # per agent, without human interaction
 max_auto_prompts_per_minute = 5    # per agent
 max_error_retries = 2              # per error signature
-# Suppress a duplicate escalation when the same situation re-fires shortly after
-# the first was accepted. A just-resolved escalation still dedups for this long
-# (measured from when it was raised); still-pending ones dedup regardless of age.
-escalation_dedup_window_seconds = 300
-# How much two large pane captures may differ (0-100%) and still count as the
-# same screen, absorbing residual TUI jitter. Applies only to large captures;
-# small ones require an exact match. 0 = exact match only.
-escalation_dedup_jitter_percent = 5
+# Note: the escalation duplicate-ask tuning (dedup window + large-capture jitter
+# tolerance) is a fixed internal constant and is no longer configurable.
 
 # ── Operator LLM (consulted on unknown situations) ──────────────────
 # Omit this whole section to escalate unknown situations directly to you.
@@ -182,15 +176,15 @@ bm25_min_score = 0.35       # text-fallback floor when the model is unavailable,
 # oversized context can make llama.cpp abort its isolated embed worker.
 model_context_window = 0
 # Stall guards, in milliseconds. Each embed call is bounded so a hung native
-# call cannot wedge the daemon; max_consecutive_failures back-to-back failures
-# latch matching onto BM25 text search until the [embedding] config changes.
-# The defaults are sized for the bundled MiniLM — a LARGER model_path can blow
-# through them on every call and permanently disable semantic matching, so
-# raise these alongside it. `hap status` reports the budgets in force and
-# whether the failures were timeouts. 0 = built-in default.
+# call cannot wedge the daemon; after a fixed number of back-to-back failures
+# (an internal constant, not configurable) matching latches onto BM25 text
+# search until the [embedding] config changes. The defaults are sized for the
+# bundled MiniLM — a LARGER model_path can blow through them on every call and
+# permanently disable semantic matching, so raise these alongside it. `hap
+# status` reports the budgets in force and whether the failures were timeouts.
+# 0 = built-in default.
 embed_timeout_ms = 0          # 0 → 2000  (one warm embed call; 100..600000)
 warm_timeout_ms = 0           # 0 → 30000 (first call: includes the model load; 1000..600000)
-max_consecutive_failures = 0  # 0 → 3     (failures that latch the text fallback; max 1000)
 # pane_salient_chars controls the fallback signature window: for idle/
 # unclassified situations the signature (and its embedding) is minted from
 # the trailing N characters of pane content. Omit or 0 → built-in default (500).

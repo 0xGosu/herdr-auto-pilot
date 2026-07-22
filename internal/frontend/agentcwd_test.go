@@ -182,7 +182,6 @@ func TestEmbeddingTimeoutFieldsDisplayDefaults(t *testing.T) {
 	}{
 		{"embedding.embed_timeout_ms", embedder.DefaultEmbedTimeoutMs},
 		{"embedding.warm_timeout_ms", embedder.DefaultWarmTimeoutMs},
-		{"embedding.max_consecutive_failures", embedder.DefaultMaxConsecutiveFailures},
 	}
 	for _, c := range cases {
 		got := frontend.FieldValue(def, c.key)
@@ -194,11 +193,9 @@ func TestEmbeddingTimeoutFieldsDisplayDefaults(t *testing.T) {
 	cfg := config.Default()
 	cfg.Embedding.EmbedTimeoutMs = 8000
 	cfg.Embedding.WarmTimeoutMs = 120000
-	cfg.Embedding.MaxConsecutiveFailures = 10
 	for key, want := range map[string]string{
-		"embedding.embed_timeout_ms":         "8000",
-		"embedding.warm_timeout_ms":          "120000",
-		"embedding.max_consecutive_failures": "10",
+		"embedding.embed_timeout_ms": "8000",
+		"embedding.warm_timeout_ms":  "120000",
 	} {
 		if got := frontend.FieldValue(cfg, key); got != want {
 			t.Errorf("FieldValue(%s) = %q, want %q", key, got, want)
@@ -211,7 +208,7 @@ func TestEmbeddingTimeoutFieldsDisplayDefaults(t *testing.T) {
 func TestEmbeddingTimeoutFieldsRejectNegatives(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
-	for _, key := range []string{"embedding.embed_timeout_ms", "embedding.warm_timeout_ms", "embedding.max_consecutive_failures"} {
+	for _, key := range []string{"embedding.embed_timeout_ms", "embedding.warm_timeout_ms"} {
 		if err := app.SetField(ctx, key, "-1"); err == nil {
 			t.Errorf("SetField(%s, -1) was accepted; a negative budget is never valid", key)
 		}

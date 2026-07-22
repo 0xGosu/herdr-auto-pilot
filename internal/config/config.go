@@ -81,22 +81,11 @@ type Limits struct {
 	MaxConsecutiveAutoPrompts int `toml:"max_consecutive_auto_prompts"`
 	MaxAutoPromptsPerMinute   int `toml:"max_auto_prompts_per_minute"`
 	MaxErrorRetries           int `toml:"max_error_retries"`
-	// EscalationDedupWindowSeconds is how long a just-resolved escalation still
-	// suppresses a duplicate re-fire of the same situation. Herdr re-delivers an
-	// attention event for one agent after a delay (the agent flips done->idle
-	// when the operator reads the pane); once the operator accepts the first
-	// escalation it leaves the still-pending set, so without this window the
-	// re-fire would raise a second, duplicate escalation. Measured from when the
-	// escalation was raised. `<= 0` falls back to the default. Still-pending
-	// escalations dedup regardless of age — only resolved ones are time-gated.
-	EscalationDedupWindowSeconds int `toml:"escalation_dedup_window_seconds"`
-	// EscalationDedupJitterPercent is how much two large pane captures may differ
-	// (0-100) and still count as the same screen for the duplicate-ask check —
-	// absorbing residual TUI jitter the normalizer misses. It applies ONLY to
-	// large tail-window captures (>= half the snapshot cap); small captures still
-	// require an exact match so two short but distinct questions never collapse.
-	// `0` disables the tolerance (exact match only); values are clamped to 0-100.
-	EscalationDedupJitterPercent int `toml:"escalation_dedup_jitter_percent"`
+	// The escalation duplicate-ask tuning (dedup window + large-capture jitter
+	// tolerance) is intentionally NOT configurable — it is behavioral tuning the
+	// operator has no reason to touch, and a bad value silently drops or
+	// duplicates escalations. The hard constants live in the daemon package
+	// (escalationDedupWindow, escalationDedupJitterPercent).
 }
 
 // LLM configures the optional local LLM/agent CLI fallback (FR-010, IR-005).
@@ -243,14 +232,10 @@ type Embedding struct {
 	// embedder.minWarmTimeoutMs (1000) are clamped up, and values above
 	// embedder.maxTimeoutMs (10 minutes) are clamped down (see EmbedTimeoutMs).
 	WarmTimeoutMs int `toml:"warm_timeout_ms"`
-	// MaxConsecutiveFailures is how many back-to-back embed errors/timeouts
-	// latch degraded mode (semantic matching falls back to text search until
-	// the [embedding] config changes and the daemon rebuilds the embedder).
-	// Raise it to ride out an occasionally-slow model instead of latching off.
-	// 0 → the built-in default (embedder.DefaultMaxConsecutiveFailures, 3);
-	// negative values are treated as 0 and the count is capped at 1000 (the
-	// failure counters are int32).
-	MaxConsecutiveFailures int `toml:"max_consecutive_failures"`
+	// Note: the degrade-latch threshold (how many back-to-back embed failures
+	// drop semantic matching to text search) is a fixed internal constant
+	// (embedder.DefaultMaxConsecutiveFailures) and is intentionally NOT
+	// configurable.
 }
 
 // TaskSource points an agent or workspace at a declared next-task list (FR-011).
@@ -454,11 +439,9 @@ func Default() Config {
 		// literal here so config stays decoupled from the domain package).
 		Learning: Learning{GraduationN: 2, ConfirmationWeight: 3.0},
 		Limits: Limits{
-			MaxConsecutiveAutoPrompts:    10,
-			MaxAutoPromptsPerMinute:      5,
-			MaxErrorRetries:              2,
-			EscalationDedupWindowSeconds: 300,
-			EscalationDedupJitterPercent: 5,
+			MaxConsecutiveAutoPrompts: 30,
+			MaxAutoPromptsPerMinute:   5,
+			MaxErrorRetries:           2,
 		},
 		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 99},
 		Embedding: Embedding{
@@ -690,6 +673,25 @@ func Load(path string) (Config, error) {
 		slog.Warn("config key `limits.verify_unblock_ms` is no longer supported and is ignored; unblock verification always waits 1000ms",
 			"path", path, "configured_value", *verifyProbe.Limits.VerifyUnblockMs)
 	}
+	// Removed keys `limits.escalation_dedup_window_seconds` /
+	// `escalation_dedup_jitter_percent`: the escalation duplicate-ask tuning is now
+	// a fixed internal constant. Probe the raw file to warn rather than silently
+	// drop them; Save omits them (no struct fields).
+	var dedupProbe struct {
+		Limits struct {
+			WindowSeconds *int `toml:"escalation_dedup_window_seconds"`
+			JitterPercent *int `toml:"escalation_dedup_jitter_percent"`
+		} `toml:"limits"`
+	}
+	_ = toml.Unmarshal(data, &dedupProbe)
+	if dedupProbe.Limits.WindowSeconds != nil {
+		slog.Warn("config key `limits.escalation_dedup_window_seconds` is no longer supported and is ignored; the escalation dedup window is a fixed 5 minutes",
+			"path", path, "configured_value", *dedupProbe.Limits.WindowSeconds)
+	}
+	if dedupProbe.Limits.JitterPercent != nil {
+		slog.Warn("config key `limits.escalation_dedup_jitter_percent` is no longer supported and is ignored; the dedup jitter tolerance is a fixed 5%",
+			"path", path, "configured_value", *dedupProbe.Limits.JitterPercent)
+	}
 	// Removed key `embedding.gpu_layers`: embedding is strictly CPU-only (GPU
 	// offload would require a GPU-enabled llama.cpp build), so the setting is
 	// ignored. Probe the raw file to warn rather than silently drop it.
@@ -702,6 +704,20 @@ func Load(path string) (Config, error) {
 	if gpuProbe.Embedding.GPULayers != nil {
 		slog.Warn("config key `embedding.gpu_layers` is no longer supported and is ignored; embedding runs strictly on CPU",
 			"path", path, "configured_value", *gpuProbe.Embedding.GPULayers)
+	}
+	// Removed key `embedding.max_consecutive_failures`: the degrade-latch threshold
+	// is now a fixed internal constant (embedder.DefaultMaxConsecutiveFailures).
+	// Probe the raw file to warn rather than silently drop it; Save omits it (no
+	// struct field).
+	var maxFailProbe struct {
+		Embedding struct {
+			MaxConsecutiveFailures *int `toml:"max_consecutive_failures"`
+		} `toml:"embedding"`
+	}
+	_ = toml.Unmarshal(data, &maxFailProbe)
+	if maxFailProbe.Embedding.MaxConsecutiveFailures != nil {
+		slog.Warn("config key `embedding.max_consecutive_failures` is no longer supported and is ignored; the degrade-latch threshold is a fixed internal constant",
+			"path", path, "configured_value", *maxFailProbe.Embedding.MaxConsecutiveFailures)
 	}
 	// Removed key `confidence_thresholds.inferred_task_bar`: a task inferred from
 	// the agent's own todo widget is trustworthy and is gated only by
@@ -836,17 +852,6 @@ func (c *Config) fillZeroes() {
 	}
 	if c.Limits.MaxErrorRetries <= 0 {
 		c.Limits.MaxErrorRetries = d.Limits.MaxErrorRetries
-	}
-	if c.Limits.EscalationDedupWindowSeconds <= 0 {
-		c.Limits.EscalationDedupWindowSeconds = d.Limits.EscalationDedupWindowSeconds
-	}
-	// 0 is a valid "exact match only" setting, so only a negative (invalid,
-	// SetField rejects it too) falls back to the default; an over-100 value
-	// clamps to a full 100% tolerance.
-	if c.Limits.EscalationDedupJitterPercent < 0 {
-		c.Limits.EscalationDedupJitterPercent = d.Limits.EscalationDedupJitterPercent
-	} else if c.Limits.EscalationDedupJitterPercent > 100 {
-		c.Limits.EscalationDedupJitterPercent = 100
 	}
 	if c.LLM.TimeoutSeconds <= 0 {
 		c.LLM.TimeoutSeconds = d.LLM.TimeoutSeconds

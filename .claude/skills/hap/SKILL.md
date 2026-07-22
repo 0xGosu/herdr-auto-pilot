@@ -322,7 +322,7 @@ examples:
 
 ```bash
 hap config set learning.graduation_n 3
-hap config set limits.max_consecutive_auto_prompts 10
+hap config set limits.max_consecutive_auto_prompts 30
 hap config set limits.max_auto_prompts_per_minute 20
 hap config set limits.max_error_retries 3
 hap config set llm.timeout_seconds 120
@@ -334,7 +334,6 @@ hap config set embedding.similarity_threshold 0.85
 hap config set embedding.model_context_window 512
 hap config set embedding.embed_timeout_ms 8000
 hap config set embedding.warm_timeout_ms 120000
-hap config set embedding.max_consecutive_failures 10
 hap config set embedding.pane_salient_chars 1000
 hap config set tui.max_content_width 120
 hap config set tui.theme high-contrast
@@ -368,7 +367,7 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `confidence_thresholds.error` | 0.75 | confidence threshold for error situations |
 | `learning.graduation_n` | 2 | consecutive confirmations needed to graduate (1-10) |
 | `learning.confirmation_weight` | 3.0 | vote-weight multiplier for an operator confirmation in the confidence ratio (1 disables the boost) |
-| `limits.max_consecutive_auto_prompts` | 10 | max consecutive auto-prompts per agent without human interaction |
+| `limits.max_consecutive_auto_prompts` | 30 | max consecutive auto-prompts per agent without human interaction |
 | `limits.max_auto_prompts_per_minute` | 5 | rate limit per agent (rolling 1-minute window) |
 | `limits.max_error_retries` | 2 | max retries per error signature |
 | `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic never-auto rule |
@@ -389,7 +388,6 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `embedding.model_context_window` | 0 (built-in default: 512 for MiniLM) | max tokens fed to the embedder before truncation; MUST NOT exceed what the model supports (over 512 hard-aborts a BERT/MiniLM native lib). raise only when `model_path` points at a larger-window model; values below 256 clamp up |
 | `embedding.embed_timeout_ms` | 0 (built-in default: 2000) | stall guard per warm embed call. a model larger than the bundled MiniLM can exceed it on EVERY call, which latches semantic matching onto text search permanently — raise it alongside `model_path`. `hap status` reports the budgets in force and whether the failures were timeouts. values below 100 clamp up, above 600000 (10 min) clamp down |
 | `embedding.warm_timeout_ms` | 0 (built-in default: 30000) | stall guard for the FIRST call of each embed worker, which includes loading the model; raise for slow/large model loads. values below 1000 clamp up, above 600000 (10 min) clamp down |
-| `embedding.max_consecutive_failures` | 0 (built-in default: 3) | back-to-back embed failures that latch the text fallback; raise to ride out an occasionally-slow model (capped at 1000). any `[embedding]` change rebuilds the embedder and clears the latch |
 | `embedding.pane_salient_chars` | 800 | fallback signature window for idle/unclassified situations (trailing N chars) |
 | `tui.max_content_width` | 0 (full width) | cap variable-width list columns; 0 = full width |
 | `tui.theme` | default | TUI color theme: default, dark, light, high-contrast (in the TUI Config tab, `e` on this row opens a ↑/↓ picker of the available themes) |

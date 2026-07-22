@@ -78,7 +78,7 @@ func New(cfg config.Embedding) *Client {
 		ctxWindow:    cfg.ModelContextWindow, // 0 → worker uses DefaultContextWindow
 		embedTimeout: ResolveEmbedTimeout(cfg),
 		warmTimeout:  ResolveWarmTimeout(cfg),
-		maxFailures:  ResolveMaxFailures(cfg),
+		maxFailures:  DefaultMaxConsecutiveFailures,
 		execArgs:     []string{"embed-worker"},
 	}
 }
@@ -122,7 +122,6 @@ func (c *Client) spawn() (*worker, error) {
 		// never pre-empt a raised parent budget (see EnvWorkerEmbedTimeout).
 		EnvWorkerEmbedTimeout+"="+strconv.Itoa(int(c.embedTimeout/time.Millisecond)),
 		EnvWorkerWarmTimeout+"="+strconv.Itoa(int(c.warmTimeout/time.Millisecond)),
-		EnvWorkerMaxFailures+"="+strconv.Itoa(c.maxFailures),
 	)
 	cmd.Env = append(cmd.Env, c.extraEnv...)
 

@@ -2070,12 +2070,6 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		{"learning.graduation_n", "11", true},
 		{"learning.graduation_n", "7", false},
 		{"limits.max_error_retries", "3", false},
-		{"limits.escalation_dedup_window_seconds", "180", false},
-		{"limits.escalation_dedup_window_seconds", "0", true}, // window must be positive
-		{"limits.escalation_dedup_jitter_percent", "10", false},
-		{"limits.escalation_dedup_jitter_percent", "0", false},  // 0 = exact match only
-		{"limits.escalation_dedup_jitter_percent", "-1", true},  // negative rejected
-		{"limits.escalation_dedup_jitter_percent", "101", true}, // over 100 rejected
 		{"llm.timeout_seconds", "90", false},
 		{"llm.auto_act_confidence_threshold", "70", false},
 		{"llm.auto_act_confidence_threshold", "-1", true},
@@ -2159,8 +2153,6 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"limits.max_consecutive_auto_prompts":     "5",
 		"limits.max_auto_prompts_per_minute":      "10",
 		"limits.max_error_retries":                "2",
-		"limits.escalation_dedup_window_seconds":  "180",
-		"limits.escalation_dedup_jitter_percent":  "10",
 		"safety.disable_never_auto_seed_patterns": "true",
 		"llm.command":                             `claude -p "decide"`,
 		"llm.command_start":                       `claude -p "first: decide"`,
@@ -2179,7 +2171,6 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"embedding.model_context_window":          "512",
 		"embedding.embed_timeout_ms":              "8000",
 		"embedding.warm_timeout_ms":               "120000",
-		"embedding.max_consecutive_failures":      "10",
 		"tui.max_content_width":                   "140",
 		"tui.max_content_height":                  "12",
 		"tui.theme":                               "dark",

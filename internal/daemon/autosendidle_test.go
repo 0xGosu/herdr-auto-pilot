@@ -174,6 +174,45 @@ func TestAutoSendIdleSendsNextPendingTaskAndReservesIt(t *testing.T) {
 	}
 }
 
+func TestAutoSendIdleDoesNotClimbConsecutiveRunawayCounter(t *testing.T) {
+	// Regression: the runaway-loop guard (FR-019) counts every autonomous send
+	// toward ConsecutiveAuto, which only a human check-in resets. An idle agent
+	// that auto-receives task after task never checks in, so counting the
+	// hand-outs would pause the source after max_consecutive_auto_prompts tasks
+	// and silently stop the feature. An idle hand-out must advance ONLY the
+	// per-minute window, leaving ConsecutiveAuto at zero.
+	h, taskFile := autoSendFixture(t, "agent-as-rate", "- [ ] step two\n- [ ] step three\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-as-rate")
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] step two")
+	})
+
+	// The counter write happens after the send; wait for it to settle, then
+	// assert the consecutive counter stayed put while the window advanced.
+	waitFor(t, 3*time.Second, func() bool {
+		rate, err := h.raw.GetAgentRate(context.Background(), "agent-as-rate")
+		return err == nil && rate.CountInWindow == 1
+	})
+	rate, err := h.raw.GetAgentRate(context.Background(), "agent-as-rate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate.ConsecutiveAuto != 0 {
+		t.Errorf("idle hand-out advanced the consecutive runaway counter to %d; it must stay 0 "+
+			"or the source pauses after max_consecutive_auto_prompts tasks", rate.ConsecutiveAuto)
+	}
+	if rate.Paused {
+		t.Error("idle hand-out must not pause the agent")
+	}
+	if rate.CountInWindow != 1 {
+		t.Errorf("idle hand-out must still advance the per-minute window, got %d", rate.CountInWindow)
+	}
+}
+
 func TestAutoSendIdleGivesEachAgentADifferentTask(t *testing.T) {
 	// Two agents matching one source in the same sweep must never receive the
 	// same task; a third agent with nothing left gets nothing.
@@ -280,6 +319,53 @@ func TestAutoSendIdleRespectsSafetyGates(t *testing.T) {
 				t.Errorf("task was reserved despite the gate:\n%s", got)
 			}
 		})
+	}
+}
+
+func TestAutoSendIdleRateLimitDoesNotPauseTheSource(t *testing.T) {
+	// Regression companion to the consecutive-counter exemption: the per-minute
+	// cap must not permanently stall an auto-send source either. A rate-limit
+	// escalation normally PauseAgent's the agent until a human checks in, and a
+	// paused agent is skipped by every future sweep — so pausing here would just
+	// move the silent stall from the consecutive ceiling to the (lower)
+	// per-minute one. The window self-heals, so an idle hand-out that trips it
+	// must escalate WITHOUT pausing.
+	h, taskFile := autoSendFixture(t, "agent-as-permin", "- [ ] step two\n", true)
+	// Fill the per-minute window well past any configured cap, consecutive well
+	// under its ceiling, so ONLY the per-minute guard trips.
+	if err := h.raw.UpdateAgentRate(context.Background(), domain.AgentRate{
+		AgentID: "agent-as-permin", CountInWindow: 1000, WindowStart: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agents := parkIdle(h, 2*time.Minute, "agent-as-permin")
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	// It escalates rather than sending (rate-limited), so wait for the escalation
+	// to land, then assert the agent was NOT paused.
+	waitFor(t, 3*time.Second, func() bool {
+		open, err := h.raw.PendingEscalations(context.Background())
+		if err != nil {
+			return false
+		}
+		for _, e := range open {
+			if e.AgentID == "agent-as-permin" {
+				return true
+			}
+		}
+		return false
+	})
+	rate, err := h.raw.GetAgentRate(context.Background(), "agent-as-permin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate.Paused {
+		t.Error("a per-minute rate-limit on an auto-send-when-idle hand-out must NOT pause the source " +
+			"(it would then be skipped by every future sweep until a human interacts)")
+	}
+	if got := readTasks(t, taskFile); strings.Contains(got, "[-]") {
+		t.Errorf("no task should have been reserved on a rate-limited send:\n%s", got)
 	}
 }
 

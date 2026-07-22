@@ -451,7 +451,7 @@ graduation_n = 2           # consecutive confirmations to graduate (1-10)
 confirmation_weight = 3.0  # confidence weight for an operator confirmation (>=1)
 
 [limits]
-max_consecutive_auto_prompts = 10  # per agent, without human interaction
+max_consecutive_auto_prompts = 30  # per agent, without human interaction
 max_auto_prompts_per_minute = 5    # per agent
 max_error_retries = 2              # per error signature
 
@@ -469,7 +469,8 @@ model_context_window = 0    # 0 = bundled-model default (512 tokens); input is
                             # truncated below this limit before embedding
 embed_timeout_ms = 0        # 0 = 2000ms stall guard per warm embed call (max 600000)
 warm_timeout_ms = 0         # 0 = 30000ms for the first call (model load; max 600000)
-max_consecutive_failures = 0 # 0 = 3 back-to-back failures latch text fallback (max 1000)
+# (the failure count that latches the BM25 text fallback is a fixed internal
+#  constant and is no longer configurable)
 # pane_salient_chars = 500  # fallback signature window for idle/unclassified
                             # situations (trailing N characters of pane content).
                             # Changing it re-keys idle/unclassified rules once,
@@ -933,16 +934,16 @@ keys to raise, instead of suggesting you disable embeddings.
 
 ```
 embedder health:     DEGRADED at runtime — degraded (every embed hit the stall guard; raise …)
-  embedder failures: 3 (3 timeouts), latch at 3 consecutive
+  embedder failures: 5 (5 timeouts), latch at 5 consecutive
   embedder budgets: embed 2000ms, warm 30000ms
   embedder last error: embed call exceeded 2s stall guard (raise `embedding.embed_timeout_ms` …)
 ```
 
 Raise them with `hap config set embedding.embed_timeout_ms 8000` (and
-`embedding.warm_timeout_ms` for slow model loads, `embedding.max_consecutive_failures`
-to ride out occasional slowness). Any `[embedding]` change rebuilds the
-embedder, which also clears the degraded latch — so the fix takes effect
-without restarting the daemon by hand.
+`embedding.warm_timeout_ms` for slow model loads). Any `[embedding]` change
+rebuilds the embedder, which also clears the degraded latch — so the fix takes
+effect without restarting the daemon by hand. (The number of back-to-back
+failures that trips the latch is a fixed internal constant, not a setting.)
 
 ### Local LLM fallback (optional)
 

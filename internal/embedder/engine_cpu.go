@@ -74,7 +74,7 @@ func NewEngine(cfg config.Embedding) *Llama {
 		ctxWindow:    ResolveContextWindow(cfg),
 		embedTimeout: ResolveEmbedTimeout(cfg),
 		warmTimeout:  ResolveWarmTimeout(cfg),
-		maxFailures:  ResolveMaxFailures(cfg),
+		maxFailures:  DefaultMaxConsecutiveFailures,
 	}
 }
 

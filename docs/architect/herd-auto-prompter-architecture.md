@@ -266,7 +266,8 @@ The domain depends only on interfaces. **Core ports:** `HerdrPort` (send/read),
   blocked agent, re-queries status a moment later (`verify_unblock_ms`); if still
   blocked, appends a `delivery_failed` diagnostic audit row.
 - **Escalation** *(daemon)* — routes uncertain paths to escalate + audit + notify,
-  with a **dedup window** (`escalation_dedup_window_seconds` + jitter,
+  with a **dedup window** (fixed internal constants `escalationDedupWindow` +
+  `escalationDedupJitterPercent` in the daemon package — not operator-configurable,
   `domain.NormalizeForDedup`) so a re-fired identical situation doesn't spam the
   operator; a resolved-window dedup gates on a *delivered* answer.
 
@@ -287,16 +288,18 @@ directly (and stamps a `decision_floor_id`).
   **out-of-process `hap embed-worker` child** over a framed pipe: a native
   `GGML_ASSERT → SIGABRT` is uncatchable in Go, so isolating it in a child turns
   a crash into a transport error instead of killing the daemon (fix for #60). It
-  **latches a degraded mode after N consecutive failures** (default 3; fast-fails
+  **latches a degraded mode after N consecutive failures** (a fixed 5; fast-fails
   `ErrDegraded` thereafter), is **stall-guarded** (defaults 2 s warm / 30 s
   cold-load, raced via `select`), truncates input to the model context window to
   avoid a position-embedding SIGABRT, and L2-normalizes vectors. `Dims()` stays 0
   until the first successful embed, keeping the daemon select loop off the cold
-  model load. All three bounds are configurable
-  (`embedding.{embed_timeout_ms,warm_timeout_ms,max_consecutive_failures}`) and
-  are forwarded to the worker child in its environment so parent and child hold
-  the same budgets; a model larger than the bundled MiniLM otherwise exceeds the
-  defaults on every call and latches semantic matching off for good. The
+  model load. The two stall-guard budgets are configurable
+  (`embedding.{embed_timeout_ms,warm_timeout_ms}`) and are forwarded to the
+  worker child in its environment so parent and child hold the same budgets; a
+  model larger than the bundled MiniLM otherwise exceeds the defaults on every
+  call and latches semantic matching off for good. The number of back-to-back
+  failures that trips that latch is a fixed constant
+  (`embedder.DefaultMaxConsecutiveFailures`), not operator-configurable. The
   embedder exposes an optional `Diagnostics()` (timeout/failure counts, the
   budgets in force, the last error) which the daemon publishes in the heartbeat,
   so `hap status` can tell a merely-slow model from a broken one and name the
@@ -474,11 +477,14 @@ automated action.
   — the daemon reads the *latest row every pipeline tick*, so a kill takes effect
   immediately even before the reload nudge arrives, while every toggle is
   preserved for audit.
-- **Runaway-loop guard.** Per agent: no more than **10 consecutive** automated
+- **Runaway-loop guard.** Per agent: no more than **30 consecutive** automated
   prompts without intervening human interaction, and no more than **5 per
-  minute** (`limits.max_consecutive_auto_prompts` default 10,
+  minute** (`limits.max_consecutive_auto_prompts` default 30,
   `max_auto_prompts_per_minute` default 5). On either ceiling, automation for
-  that agent pauses and escalates.
+  that agent pauses and escalates. Unattended `auto_send_when_idle` task
+  hand-outs are exempt from the consecutive counter and never pause on the
+  per-minute ceiling (they defer to a later sweep), since the operator opted
+  into unattended repeated sending for that source.
 - **Escalation on uncertainty.** Every uncertain path routes to escalate + audit
   + notify — never a silent drop.
 
@@ -788,7 +794,7 @@ the sections they gate.
 | **FR-016** | Allowlist seeding, extension & coverage safety | Ship a corpus-validated seed allowlist, allow operator extension via TOML regex/keyword patterns, and bias toward escalation on destructive-looking prompts that match no pattern (suspected-irreversible heuristic). |
 | **FR-017** | Global pause / kill switch | Provide a global pause/kill switch (TUI + CLI) that instantly halts all automated prompting across the herd within a small bounded delay. |
 | **FR-018** | Escalation on uncertainty | Take no action and notify the operator whenever a situation is unclassifiable, below threshold, guard-tripped, suspected-irreversible, or otherwise ineligible for autonomous action. |
-| **FR-019** | Runaway-loop guard | Bound automated prompting per agent to ≤ `max_consecutive_auto_prompts` consecutive auto-prompts without intervening human interaction AND ≤ `max_auto_prompts_per_minute` per minute (defaults 10 and 5); on either ceiling, pause automation for that agent and escalate. |
+| **FR-019** | Runaway-loop guard | Bound automated prompting per agent to ≤ `max_consecutive_auto_prompts` consecutive auto-prompts without intervening human interaction AND ≤ `max_auto_prompts_per_minute` per minute (defaults 30 and 5); on either ceiling, pause automation for that agent and escalate. Unattended `auto_send_when_idle` hand-outs are exempt from the consecutive counter and defer (never pause) on the per-minute ceiling. |
 | **FR-020** | Full audit log | Record every automated decision and escalation with its trigger, situation type, chosen action (or escalation), confidence, rationale (rule/LLM), and timestamp. |
 | **FR-021** | Post-hoc correction | Let the operator review the audit log and correct any past automated decision, feeding the correction back into learning (per FR-007) and recording it in the audit trail. |
 | **FR-022** | Equivalent TUI and CLI | Expose a TUI (Herdr pane) and a CLI with identical functionality; mutations from either surface propagate promptly to the running daemon. |
