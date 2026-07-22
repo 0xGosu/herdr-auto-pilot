@@ -49,8 +49,10 @@ var SeedNeverAutoPatterns = []string{
 	`(?i)\bgcloud\s+[^\n]*\bdelete\b`,
 	`(?i)\baz\s+[^\n]*\bdelete\b`,
 	// Credentials / secrets / auth
-	`(?i)(rotat|revok|delet|regenerat)(e|ing|ion)[^\n]*\b(credential|secret|api[- ]?key|token|password)s?\b`,
-	`(?i)\b(credential|secret|api[- ]?key|token|password)s?\b[^\n]*\b(rotat|revok|delet|regenerat)(e|ing|ion)`,
+	`(?i)(rotat|revok|delet|regenerat)(e|ing|ion)[^\n]*\b(credential|secret|api[- ]?key|password)s?\b`,
+	`(?i)\b(credential|secret|api[- ]?key|password)s?\b[^\n]*\b(rotat|revok|delet|regenerat)(e|ing|ion)`,
+	`(?i)\b(rotat|revok|delet|regenerat|invalidat)(e[sd]?|ing|ion)\b[^\n]{0,40}?\b(api|deploy|pat|service)[- ]?tokens?\b`,
+	`(?i)\b(api|deploy|pat|service)[- ]?tokens?\b[^\n]{0,40}?\b(rotat|revok|delet|regenerat|invalidat)(e[sd]?|ing|ion)\b`,
 	`(?i)gh\s+auth\s+(logout|refresh)`,
 	// System state
 	`(?i)\b(shutdown|reboot|poweroff|halt)\b`,
