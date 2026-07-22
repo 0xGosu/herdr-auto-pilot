@@ -203,7 +203,15 @@ func Decide(in DecideInput) Decision {
 		return esc(ReasonVarianceGuard, rationale, conf.Score, suggestion)
 	}
 
-	if ok, reason := CheckRate(in.Rate, in.Now, in.RateLimits); !ok {
+	// An unattended idle task hand-out is exempt from the consecutive ceiling
+	// (see CheckRate). Keyed off the VERIFIED classified situation and the
+	// resolved action, never a sweep-time flag: only a situation classified idle
+	// HERE whose resolved action is a reserving declared-task SEND qualifies — a
+	// pane that turned into an approval since the sweep, or an idle episode that
+	// resolves to @noop, is gated normally (the latter keeps the D3 noop ceiling).
+	idleHandout := in.Situation.Type == SituationIdle && candidate == ActionNextDeclaredTask &&
+		in.DeclaredTask != nil && in.DeclaredTask.Reserve
+	if ok, reason := CheckRate(in.Rate, in.Now, in.RateLimits, idleHandout); !ok {
 		return esc(reason, "", conf.Score, suggestion)
 	}
 

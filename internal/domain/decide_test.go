@@ -183,6 +183,34 @@ func TestRunawayGuardIdleRetainsDeclaredTaskSuggestion(t *testing.T) {
 	}
 }
 
+func TestRunawayGuardExemptsReservingIdleHandout(t *testing.T) {
+	// An auto_send_when_idle (reserving) source's idle task hand-out is exempt
+	// from the CONSECUTIVE ceiling (PR #222 review, finding 1): a counter
+	// saturated by non-idle reply-loop sends must not block it — otherwise the
+	// idle source stalls and, since idle escalations don't pause, never recovers.
+	// Contrast TestRunawayGuardIdleRetainsDeclaredTaskSuggestion, where a
+	// NON-reserving source is still gated. Only the CONSECUTIVE ceiling is
+	// relaxed: the FR-008 confidence gate is NOT bypassed (the signature must
+	// still be graduated — hence the autonomous history), and Paused still blocks.
+	in := autonomous(baseInput(SituationIdle),
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
+		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
+	in.DeclaredTask = &DeclaredTask{Task: "write the changelog", Path: "/tasks.md", Reserve: true}
+	in.Rate = AgentRate{ConsecutiveAuto: 5} // saturated (MaxConsecutive=5), not paused
+
+	d := Decide(in)
+	if d.Action != ActionSend || d.Input != in.DeclaredTask.Prompt() {
+		t.Fatalf("a reserving idle hand-out past a saturated counter must deliver, got %+v", d)
+	}
+
+	// A paused agent STILL blocks a reserving idle hand-out (fail-safe — an
+	// explicit pause is a human-only stop-everything state).
+	in.Rate = AgentRate{Paused: true}
+	if d := Decide(in); d.Action != ActionEscalate || d.Reason != ReasonRateLimited {
+		t.Fatalf("a paused agent must still block a reserving idle hand-out, got %+v", d)
+	}
+}
+
 func TestRunawayGuardErrorRetainsSuggestion(t *testing.T) {
 	// The Error resolver branch must retain its suggestion under the rate
 	// guard exactly like Approval/Choice/Idle do.

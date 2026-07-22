@@ -369,6 +369,85 @@ func TestAutoSendIdleRateLimitDoesNotPauseTheSource(t *testing.T) {
 	}
 }
 
+func TestAutoSendIdleDeliversDespiteSaturatedConsecutiveCounter(t *testing.T) {
+	// PR #222 review, finding 1: a consecutive counter saturated by prior NON-idle
+	// reply-loop sends must NOT block an idle task hand-out. The idle exemption
+	// applies to rate ADMISSION (domain.CheckRate), not just post-send accounting;
+	// without it the source stalls the instant a reply loop tops out the counter
+	// and — since idle escalations no longer pause — never recovers.
+	h, taskFile := autoSendFixture(t, "agent-as-sat", "- [ ] step two\n", true)
+	// Saturate the consecutive counter well past any configured ceiling; NOT
+	// paused, per-minute window clear.
+	if err := h.raw.UpdateAgentRate(context.Background(), domain.AgentRate{
+		AgentID: "agent-as-sat", ConsecutiveAuto: 1000, WindowStart: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agents := parkIdle(h, 2*time.Minute, "agent-as-sat")
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	// Delivered despite the saturated counter.
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] step two")
+	})
+	// And still not paused.
+	rate, err := h.raw.GetAgentRate(context.Background(), "agent-as-sat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate.Paused {
+		t.Error("delivering past a saturated counter must not pause the agent")
+	}
+}
+
+func TestIsIdleTaskHandoutKeysOffReserveNotStaleFlag(t *testing.T) {
+	// PR #222 review, finding 2: the consecutive-counter exemption must key off
+	// the VERIFIED classified situation (idle) and the RESOLVED delivery (a
+	// reserving declared task), not the sweep-time AutoIdleSend flag. A stale idle
+	// poll that lands on a non-idle approval answers with no declared task (nil),
+	// so it is NOT exempted — its send counts toward the reply-loop guard.
+	idle := domain.Situation{Type: domain.SituationIdle}
+	approval := domain.Situation{Type: domain.SituationApproval}
+	reserving := &domain.DeclaredTask{Reserve: true}
+
+	if isIdleTaskHandout(idle, nil) {
+		t.Error("a non-task delivery (nil declared — e.g. a stale-poll approval answer) must not be exempted")
+	}
+	if isIdleTaskHandout(idle, &domain.DeclaredTask{Reserve: false}) {
+		t.Error("a non-reserving source's task delivery must not be exempted")
+	}
+	if isIdleTaskHandout(approval, reserving) {
+		t.Error("a non-idle situation must not be exempted even with a reserving task (stale-flag hardening)")
+	}
+	if !isIdleTaskHandout(idle, reserving) {
+		t.Error("a genuine idle reserving declared-task delivery must be exempted")
+	}
+}
+
+func TestIsUnattendedIdleSendKeysOffClassifiedSituationNotStaleFlag(t *testing.T) {
+	// PR #222 review, finding 2: the no-pause exemption in escalate must key off
+	// the VERIFIED classified situation (s.Type), not the stale AutoIdleSend flag.
+	// A pane that turned into a real approval between the sweep and capture must
+	// still pause on a rate-limit; only a genuinely-idle episode on a reserving
+	// source is exempt.
+	h, _ := autoSendFixture(t, "agent-as-stale", "- [ ] some task\n", true)
+	if _, err := h.raw.EnsureAgentName(context.Background(), "agent-as-stale"); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	approval := domain.Situation{AgentID: "agent-as-stale", AgentType: "claude", Type: domain.SituationApproval}
+	if h.daemon.isUnattendedIdleSend(ctx, approval) {
+		t.Error("a non-idle (approval) situation must not receive the idle no-pause exemption")
+	}
+	idle := domain.Situation{AgentID: "agent-as-stale", AgentType: "claude", Type: domain.SituationIdle}
+	if !h.daemon.isUnattendedIdleSend(ctx, idle) {
+		t.Error("a genuinely-idle situation on a reserving source must receive the exemption")
+	}
+}
+
 func TestAutoSendIdleSkipsBusyAndBlockedAgents(t *testing.T) {
 	// Only cleanly parked agents qualify: a working agent has no idle clock at
 	// all, and a blocked one is waiting on an answer, not on work.

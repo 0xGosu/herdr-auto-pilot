@@ -360,11 +360,20 @@ type RateLimits struct {
 
 // CheckRate reports whether one more automated prompt to the agent is
 // allowed under the runaway-loop guard. It never mutates state.
-func CheckRate(r AgentRate, now time.Time, lim RateLimits) (ok bool, reason EscalateReason) {
+//
+// idleHandout marks an unattended auto-send-when-idle task delivery. Such sends
+// are exempt from the CONSECUTIVE ceiling on BOTH sides — they neither advance
+// it (RegisterAutoPromptIdle) nor are blocked by it here — because that counter
+// tracks reply-loop runaways (a DIFFERENT concern), and the operator opted into
+// unattended repeated idle delivery. Without this, a consecutive counter
+// saturated by non-idle auto-answers would permanently stall the idle source
+// (the idle escalation never pauses, so the counter never resets). The Paused
+// state and the per-minute cap STILL gate idle hand-outs.
+func CheckRate(r AgentRate, now time.Time, lim RateLimits, idleHandout bool) (ok bool, reason EscalateReason) {
 	if r.Paused {
 		return false, ReasonRateLimited
 	}
-	if r.ConsecutiveAuto >= lim.MaxConsecutive {
+	if !idleHandout && r.ConsecutiveAuto >= lim.MaxConsecutive {
 		return false, ReasonRateLimited
 	}
 	inWindow := r.CountInWindow
