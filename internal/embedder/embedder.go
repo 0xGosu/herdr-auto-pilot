@@ -41,8 +41,11 @@ const DefaultWarmTimeoutMs = 30000
 
 // DefaultMaxConsecutiveFailures latches the embedder into degraded mode: after
 // this many consecutive errors/timeouts every call fails fast and the daemon
-// stays on its fallback path until the [embedding] config changes.
-const DefaultMaxConsecutiveFailures = 3
+// stays on its fallback path until the [embedding] config changes. It is a FIXED
+// internal constant, not operator-configurable — a wrong value silently drops
+// semantic matching (too low) or hangs on a broken model (too high), and there
+// is no deployment that legitimately needs to tune it.
+const DefaultMaxConsecutiveFailures = 5
 
 // minEmbedTimeoutMs / minWarmTimeoutMs floor any positive override. A budget
 // below these cannot complete even a trivial embed, so it would guarantee the
@@ -57,11 +60,6 @@ const (
 // time.Duration (nanosecond) multiply can never overflow int64 into a negative
 // budget that would fire instantly. See resolveTimeout.
 const maxTimeoutMs = 10 * 60 * 1000
-
-// maxFailureCeiling caps MaxConsecutiveFailures. Far above any useful setting,
-// but low enough that the int32 failure counters can never wrap (see
-// ResolveMaxFailures).
-const maxFailureCeiling = 1000
 
 // DefaultContextWindow is the BERT/MiniLM position-embedding limit (n_ctx) of
 // the bundled all-MiniLM-L6-v2: 512 position rows. Feeding GetEmbeddings a
@@ -87,8 +85,8 @@ const minContextWindow = 256
 // and its tests can still reference the boundary.
 const specialTokenHeadroom = 8
 
-// ErrDegraded is returned once the failure latch has tripped. The threshold is
-// configurable (Embedding.MaxConsecutiveFailures), so it is not baked into the
+// ErrDegraded is returned once the failure latch has tripped. The threshold is a
+// fixed constant (DefaultMaxConsecutiveFailures), so it is not baked into the
 // message; the daemon's diagnostics report the actual count and last reason.
 var ErrDegraded = errors.New("embedder degraded after too many consecutive embed failures")
 
@@ -121,23 +119,6 @@ func resolveTimeout(ms, def, min int) time.Duration {
 		ms = maxTimeoutMs
 	}
 	return time.Duration(ms) * time.Millisecond
-}
-
-// ResolveMaxFailures returns the effective degrade-latch threshold: the
-// built-in default when unset/non-positive, otherwise the configured count
-// capped at maxFailureCeiling. The cap is load-bearing, not cosmetic: the
-// counters are int32, so an absurd value would wrap negative and latch
-// degraded on the FIRST failure — the exact inverse of what an operator
-// raising this asked for.
-func ResolveMaxFailures(cfg config.Embedding) int {
-	n := cfg.MaxConsecutiveFailures
-	if n <= 0 {
-		return DefaultMaxConsecutiveFailures
-	}
-	if n > maxFailureCeiling {
-		return maxFailureCeiling
-	}
-	return n
 }
 
 // StallGuardMarker appears in every stall-guard expiry message and is how a

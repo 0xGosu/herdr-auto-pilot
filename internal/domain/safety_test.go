@@ -490,37 +490,110 @@ func TestRateGuardFunctions(t *testing.T) {
 	lim := RateLimits{MaxConsecutive: 5, MaxPerMinute: 10}
 
 	r := AgentRate{}
-	for i := 0; i < 5; i++ {
-		ok, _ := CheckRate(r, now, lim)
+	for i := range 5 {
+		ok, _ := CheckRate(r, now, lim, false)
 		if !ok {
 			t.Fatalf("prompt %d should be allowed", i+1)
 		}
 		r = RegisterAutoPrompt(r, now)
 	}
-	if ok, reason := CheckRate(r, now, lim); ok || reason != ReasonRateLimited {
+	if ok, reason := CheckRate(r, now, lim, false); ok || reason != ReasonRateLimited {
 		t.Error("6th consecutive prompt must be blocked")
 	}
 
 	// Human interaction resets the consecutive counter.
 	r = RegisterHumanInteraction(r)
-	if ok, _ := CheckRate(r, now, lim); !ok {
+	if ok, _ := CheckRate(r, now, lim, false); !ok {
 		t.Error("automation should resume after human interaction")
 	}
 
 	// Per-minute window.
 	r = AgentRate{WindowStart: now.Add(-10 * time.Second), CountInWindow: 10}
-	if ok, _ := CheckRate(r, now, lim); ok {
+	if ok, _ := CheckRate(r, now, lim, false); ok {
 		t.Error("11th prompt within the minute must be blocked")
 	}
 	// Window expiry allows again (consecutive still under ceiling).
 	r = AgentRate{WindowStart: now.Add(-2 * time.Minute), CountInWindow: 10}
-	if ok, _ := CheckRate(r, now, lim); !ok {
+	if ok, _ := CheckRate(r, now, lim, false); !ok {
 		t.Error("expired window should allow prompting again")
 	}
 
 	// Paused agents stay blocked until human interaction.
 	r = PauseAgent(AgentRate{})
-	if ok, _ := CheckRate(r, now, lim); ok {
+	if ok, _ := CheckRate(r, now, lim, false); ok {
 		t.Error("paused agent must stay blocked")
+	}
+}
+
+// TestRegisterAutoPromptIdleSkipsConsecutiveCounter pins the auto-send-when-idle
+// exemption: an unattended idle task hand-out must NOT advance the consecutive
+// counter (or the source would pause after max_consecutive_auto_prompts tasks),
+// but it MUST still advance the per-minute window so a runaway source is
+// throttled.
+func TestRegisterAutoPromptIdleSkipsConsecutiveCounter(t *testing.T) {
+	now := time.Now()
+	lim := RateLimits{MaxConsecutive: 5, MaxPerMinute: 100}
+
+	// Far more idle hand-outs than the consecutive ceiling never trips it.
+	r := AgentRate{WindowStart: now}
+	for range lim.MaxConsecutive * 3 {
+		r = RegisterAutoPromptIdle(r, now)
+	}
+	if r.ConsecutiveAuto != 0 {
+		t.Errorf("idle hand-outs must not advance ConsecutiveAuto, got %d", r.ConsecutiveAuto)
+	}
+	if r.CountInWindow != lim.MaxConsecutive*3 {
+		t.Errorf("idle hand-outs must advance the per-minute window, got %d want %d",
+			r.CountInWindow, lim.MaxConsecutive*3)
+	}
+	if ok, _ := CheckRate(r, now, lim, true); !ok {
+		t.Error("idle hand-outs alone must never trip the consecutive ceiling")
+	}
+
+	// The per-minute cap still throttles idle hand-outs.
+	perMin := RateLimits{MaxConsecutive: 100, MaxPerMinute: 3}
+	r = AgentRate{WindowStart: now}
+	for i := range perMin.MaxPerMinute {
+		if ok, _ := CheckRate(r, now, perMin, true); !ok {
+			t.Fatalf("idle hand-out %d should be allowed within the minute", i+1)
+		}
+		r = RegisterAutoPromptIdle(r, now)
+	}
+	if ok, reason := CheckRate(r, now, perMin, true); ok || reason != ReasonRateLimited {
+		t.Error("idle hand-out over the per-minute cap must be blocked")
+	}
+}
+
+// TestCheckRateExemptsIdleHandoutFromConsecutiveCeiling is the admission-side
+// twin of the accounting exemption (PR #222 review, finding 1): a consecutive
+// counter saturated by NON-idle reply-loop sends must NOT block an idle task
+// hand-out — otherwise the idle source stalls the moment a reply loop tops out
+// the counter, and (because idle escalations don't pause) never recovers. Paused
+// and the per-minute cap STILL gate idle hand-outs.
+func TestCheckRateExemptsIdleHandoutFromConsecutiveCeiling(t *testing.T) {
+	now := time.Now()
+	lim := RateLimits{MaxConsecutive: 5, MaxPerMinute: 10}
+
+	// Consecutive counter saturated (by prior non-idle activity), not paused,
+	// per-minute window clear.
+	saturated := AgentRate{ConsecutiveAuto: lim.MaxConsecutive, WindowStart: now}
+	if ok, _ := CheckRate(saturated, now, lim, false); ok {
+		t.Fatal("a saturated consecutive counter must block a NON-idle send")
+	}
+	if ok, _ := CheckRate(saturated, now, lim, true); !ok {
+		t.Error("a saturated consecutive counter must NOT block an idle hand-out")
+	}
+
+	// A per-minute-full window still blocks an idle hand-out.
+	perMinFull := AgentRate{ConsecutiveAuto: lim.MaxConsecutive, WindowStart: now, CountInWindow: lim.MaxPerMinute}
+	if ok, reason := CheckRate(perMinFull, now, lim, true); ok || reason != ReasonRateLimited {
+		t.Error("the per-minute cap must still gate an idle hand-out")
+	}
+
+	// A paused agent stays blocked even for an idle hand-out (fail-safe: an
+	// explicit pause is a human-only stop-everything state).
+	paused := PauseAgent(AgentRate{WindowStart: now})
+	if ok, _ := CheckRate(paused, now, lim, true); ok {
+		t.Error("a paused agent must stay blocked even for an idle hand-out")
 	}
 }

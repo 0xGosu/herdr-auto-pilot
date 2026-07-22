@@ -360,11 +360,20 @@ type RateLimits struct {
 
 // CheckRate reports whether one more automated prompt to the agent is
 // allowed under the runaway-loop guard. It never mutates state.
-func CheckRate(r AgentRate, now time.Time, lim RateLimits) (ok bool, reason EscalateReason) {
+//
+// idleHandout marks an unattended auto-send-when-idle task delivery. Such sends
+// are exempt from the CONSECUTIVE ceiling on BOTH sides — they neither advance
+// it (RegisterAutoPromptIdle) nor are blocked by it here — because that counter
+// tracks reply-loop runaways (a DIFFERENT concern), and the operator opted into
+// unattended repeated idle delivery. Without this, a consecutive counter
+// saturated by non-idle auto-answers would permanently stall the idle source
+// (the idle escalation never pauses, so the counter never resets). The Paused
+// state and the per-minute cap STILL gate idle hand-outs.
+func CheckRate(r AgentRate, now time.Time, lim RateLimits, idleHandout bool) (ok bool, reason EscalateReason) {
 	if r.Paused {
 		return false, ReasonRateLimited
 	}
-	if r.ConsecutiveAuto >= lim.MaxConsecutive {
+	if !idleHandout && r.ConsecutiveAuto >= lim.MaxConsecutive {
 		return false, ReasonRateLimited
 	}
 	inWindow := r.CountInWindow
@@ -377,9 +386,35 @@ func CheckRate(r AgentRate, now time.Time, lim RateLimits) (ok bool, reason Esca
 	return true, ReasonNone
 }
 
-// RegisterAutoPrompt returns the rate state after one automated prompt.
+// RegisterAutoPrompt returns the rate state after one automated prompt. It
+// advances BOTH runaway guards: the consecutive-auto counter (reset only by a
+// human check-in) and the per-minute window.
 func RegisterAutoPrompt(r AgentRate, now time.Time) AgentRate {
 	r.ConsecutiveAuto++
+	return registerAutoPromptWindow(r, now)
+}
+
+// RegisterAutoPromptIdle is RegisterAutoPrompt for an unattended
+// auto-send-when-idle task hand-out: it advances ONLY the per-minute window,
+// deliberately NOT the consecutive-auto counter.
+//
+// The consecutive counter exists to catch an agent stuck answering with no
+// human check-in and is reset only by human interaction (FR-019). But
+// auto_send_when_idle drives an idle agent unattended by design, handing out a
+// DIFFERENT task each time, so counting each hand-out toward the consecutive
+// ceiling would pause the source after max_consecutive_auto_prompts tasks and
+// silently stop the feature. The per-minute cap still COUNTS these sends, so a
+// source handing out tasks faster than max_auto_prompts_per_minute is throttled
+// — but a per-minute trip on an idle hand-out defers to a later sweep rather
+// than pausing the agent (the daemon withholds the rate-limit pause from an
+// unattended idle send; the window self-heals and the send retries).
+func RegisterAutoPromptIdle(r AgentRate, now time.Time) AgentRate {
+	return registerAutoPromptWindow(r, now)
+}
+
+// registerAutoPromptWindow advances the per-minute auto-prompt window, rolling
+// it over once a minute has elapsed since it started.
+func registerAutoPromptWindow(r AgentRate, now time.Time) AgentRate {
 	if now.Sub(r.WindowStart) >= time.Minute {
 		r.WindowStart = now
 		r.CountInWindow = 0

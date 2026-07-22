@@ -42,7 +42,7 @@ func NewEngine(cfg config.Embedding) *Llama {
 		modelPath:    ResolveModelPath(cfg),
 		embedTimeout: ResolveEmbedTimeout(cfg),
 		warmTimeout:  ResolveWarmTimeout(cfg),
-		maxFailures:  ResolveMaxFailures(cfg),
+		maxFailures:  DefaultMaxConsecutiveFailures,
 	}
 }
 

@@ -1119,10 +1119,29 @@ func (d *Daemon) hasOpenEscalation(ctx context.Context, agentID string) bool {
 // hasOpenEscalation. Dropping a real event silently is worse than
 // re-processing one, so on doubt the event proceeds to escalate rather than
 // being ignored (the "never a silent drop" architecture rule).
+// Escalation duplicate-ask tuning is a HARD CONSTANT, not operator config: a
+// bad value silently drops or duplicates escalations, and there is no legitimate
+// reason to tune it per deployment.
+const (
+	// escalationDedupWindow is how long a just-resolved escalation still
+	// suppresses a duplicate re-fire of the same situation. Herdr re-delivers an
+	// attention event for one agent after a delay (the agent flips done->idle
+	// when the operator reads the pane); once the operator accepts the first
+	// escalation it leaves the still-pending set, so without this window the
+	// re-fire would raise a second, duplicate escalation. Measured from when the
+	// escalation was raised; still-pending escalations dedup regardless of age —
+	// only resolved ones are time-gated.
+	escalationDedupWindow = 5 * time.Minute
+	// escalationDedupJitterPercent is how much two large pane captures may differ
+	// (0-100) and still count as the same screen for the duplicate-ask check —
+	// absorbing residual TUI jitter the normalizer misses. It applies ONLY to
+	// large tail-window captures (>= half the snapshot cap); small captures still
+	// require an exact match so two short but distinct questions never collapse.
+	escalationDedupJitterPercent = 5
+)
+
 func (d *Daemon) duplicatePendingEscalation(ctx context.Context, s domain.Situation) bool {
-	cfg, _, _ := d.snapshot()
-	window := time.Duration(cfg.Limits.EscalationDedupWindowSeconds) * time.Second
-	resolvedSince := d.opt.Clock.Now().Add(-window)
+	resolvedSince := d.opt.Clock.Now().Add(-escalationDedupWindow)
 	pending, err := d.opt.Store.PendingEscalationExcerpts(ctx, s.AgentID, s.AgentType, resolvedSince)
 	if err != nil {
 		slog.Warn("duplicate-escalation check failed; processing event",
@@ -1131,7 +1150,7 @@ func (d *Daemon) duplicatePendingEscalation(ctx context.Context, s domain.Situat
 	}
 	return domain.DuplicatesPendingEscalation(s.Type,
 		truncateTailRunes(s.Content, snapshotMaxRunes), snapshotMaxRunes,
-		cfg.Limits.EscalationDedupJitterPercent, pending)
+		escalationDedupJitterPercent, pending)
 }
 
 // ignoreDuplicate audits a no-op for an event whose situation already has a
@@ -1613,6 +1632,65 @@ type delivery struct {
 	taskText string
 }
 
+// isIdleTaskHandout reports whether an actual delivery is an unattended
+// auto-send-when-idle task hand-out. It keys off the VERIFIED classified
+// situation (idle) and the RESOLVED delivery — a reserving declared-task send
+// (declared.Reserve, set only for an enable_auto_send_task_when_idle source and
+// only when the resolved action was the declared task) — NOT the sweep-time
+// tr.AutoIdleSend flag, which is set before the async capture and can go stale
+// if the pane turns into an approval by delivery time. Requiring SituationIdle
+// keeps this symmetric with the domain admission predicate (decide.go), so a
+// non-idle path that somehow carried a reserving task could never escape the
+// consecutive counter. Such sends are exempted from the CONSECUTIVE runaway
+// counter (see domain.RegisterAutoPromptIdle): they are unattended by design and
+// would otherwise pause the source after max_consecutive_auto_prompts tasks. The
+// per-minute cap still throttles them.
+func isIdleTaskHandout(sit domain.Situation, declared *domain.DeclaredTask) bool {
+	return sit.Type == domain.SituationIdle && declared != nil && declared.Reserve
+}
+
+// isUnattendedIdleSend reports whether an escalating situation is an
+// auto-send-when-idle task hand-out: an idle episode whose matched task source
+// reserves its items (enable_auto_send_task_when_idle). Its one caller
+// (escalate) uses it to withhold the rate-limit PAUSE from such sends — they are
+// unattended by design, and a paused agent is skipped by every future idle sweep
+// until a human interacts, so pausing one silently stops the feature.
+//
+// It keys off the VERIFIED classified situation (s.Type), NOT the sweep-time
+// tr.AutoIdleSend flag: that flag is set before the async capture and can go
+// stale, so trusting it would let a pane that turned into a real approval since
+// the sweep suppress its own rate-limit pause. Gated on the rare rate-limit
+// path, so the task-source resolution it does costs nothing on the hot path.
+func (d *Daemon) isUnattendedIdleSend(ctx context.Context, s domain.Situation) bool {
+	if s.Type != domain.SituationIdle {
+		return false
+	}
+	dt := d.declaredTaskFor(ctx, s)
+	return dt != nil && dt.Reserve
+}
+
+// advanceAutoPromptRate records one delivered automated prompt against the
+// agent's runaway-guard counters. An unattended idle task hand-out advances
+// only the per-minute window (RegisterAutoPromptIdle); every other autonomous
+// send advances the consecutive counter too. A missing rate row is skipped; an
+// update failure only logs (the send already happened — fail-safe daemon path).
+func (d *Daemon) advanceAutoPromptRate(ctx context.Context, agentID string, idleHandout bool, now time.Time) {
+	rate, err := d.opt.Store.GetAgentRate(ctx, agentID)
+	if err != nil {
+		return
+	}
+	var updated domain.AgentRate
+	if idleHandout {
+		updated = domain.RegisterAutoPromptIdle(*rate, now)
+	} else {
+		updated = domain.RegisterAutoPrompt(*rate, now)
+	}
+	updated.AgentID = agentID
+	if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
+		slog.Error("agent rate update failed", "error", err)
+	}
+}
+
 // deliverAutonomous is the shared tail of every autonomous rule-path send:
 // pre-action audit guard (FR-024), delivery, and the daemon-owned learning
 // and counter writes. It reports whether the input actually reached the
@@ -1708,14 +1786,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		slog.Error("decision record write failed", "error", err)
 	}
 
-	rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
-	if err == nil {
-		updated := domain.RegisterAutoPrompt(*rate, now)
-		updated.AgentID = s.AgentID
-		if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
-			slog.Error("agent rate update failed", "error", err)
-		}
-	}
+	d.advanceAutoPromptRate(ctx, s.AgentID, isIdleTaskHandout(s, del.declared), now)
 
 	if s.Type == domain.SituationError {
 		er, err := d.opt.Store.GetErrorRetry(ctx, sig.Signature)
@@ -1967,8 +2038,14 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		slog.Error("audit write failed for escalation", "error", err)
 	}
 
-	// Rate-limit escalations pause the agent until human check-in.
-	if dec.Reason == domain.ReasonRateLimited {
+	// Rate-limit escalations pause the agent until human check-in — EXCEPT an
+	// auto-send-when-idle hand-out, which is unattended by design. Pausing one
+	// would strand the source until a human interacts (a paused agent is skipped
+	// by every future idle sweep, autosendidle.go), silently stopping the feature
+	// — the same failure the consecutive-counter exemption avoids, one threshold
+	// down at the per-minute cap. The per-minute window self-heals, so deferring
+	// to a later sweep is the correct throttle; the send simply retries.
+	if dec.Reason == domain.ReasonRateLimited && !d.isUnattendedIdleSend(ctx, s) {
 		if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
 			paused := domain.PauseAgent(*rate)
 			paused.AgentID = s.AgentID
@@ -2986,10 +3063,13 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 			escalateWith(domain.ReasonPersistenceFailed, "rate read failed at action review: "+err.Error())
 			return
 		}
+		// D3: a noop is NOT an idle hand-out (nothing is delivered), so it is
+		// gated normally — a consult-and-noop-forever loop must still hit the
+		// consecutive ceiling and surface to a human.
 		if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 			MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 			MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
-		}); !ok {
+		}, false); !ok {
 			escalateWith(reason, "at action review")
 			return
 		}
@@ -3010,10 +3090,16 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 		escalateWith(domain.ReasonPersistenceFailed, "rate read failed at action review: "+err.Error())
 		return
 	}
+	// Consecutive-ceiling exemption for an unattended idle task delivery (see
+	// domain.CheckRate). In practice ReserveTask is FALSE here: reserving
+	// declared-task deliveries take the LLM-promotion gate below, not this
+	// action-review path (whose requests never set ReserveTask), so this stays
+	// defense-in-depth — if a reserving delivery ever reaches here it is exempted
+	// consistently. The per-minute cap and Paused still gate it.
 	if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
-	}); !ok {
+	}, res.request.ReserveTask); !ok {
 		escalateWith(reason, "at action review")
 		return
 	}
@@ -3280,10 +3366,14 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(domain.ReasonPersistenceFailed, err.Error())
 		return
 	}
+	// An unattended idle task delivery is exempt from the consecutive ceiling
+	// (see domain.CheckRate). This gate runs before the noop split below, so
+	// require BOTH a reserving task review AND a real send (!isNoop) — a promoted
+	// @noop must still hit the D3 ceiling.
 	if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
-	}); !ok {
+	}, res.request.ReserveTask && !isNoop); !ok {
 		reject(reason, "at LLM promotion")
 		return
 	}
@@ -3610,11 +3700,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				Source:       domain.SourceLLM, CreatedAt: now,
 			})
 			d.ensureSignatureRow(ctx, res.sig.Signature, s.Type, s.AgentType, now)
-			if rate2, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
-				updated := domain.RegisterAutoPrompt(*rate2, now)
-				updated.AgentID = s.AgentID
-				d.opt.Store.UpdateAgentRate(ctx, updated)
-			}
+			d.advanceAutoPromptRate(ctx, s.AgentID, isIdleTaskHandout(s, taskReserve), now)
 			d.mu.Lock()
 			d.lastAutoSend[s.AgentID] = now
 			d.mu.Unlock()

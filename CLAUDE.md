@@ -200,8 +200,8 @@ whose manifest carries exactly that version).
   exact hash. `SignatureResult.Raw` is the never-remapped content hash (the LLM drift check
   depends on it); SQLite's `signature_embeddings` is the source of truth and the bleve index
   under `<state>/match-index` is a disposable cache (mem-only scorch does NOT serve KNN — keep
-  it disk-backed). Embed calls are stall-guarded and latch a degraded mode after 3 consecutive
-  failures.
+  it disk-backed). Embed calls are stall-guarded and latch a degraded mode after 5 consecutive
+  failures (a fixed constant, not configurable).
 
 ## Testing practices
 

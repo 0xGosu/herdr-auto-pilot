@@ -20,18 +20,16 @@ func TestWorkerConfigFromEnv(t *testing.T) {
 	t.Setenv(EnvWorkerContextWindow, "1024")
 	t.Setenv(EnvWorkerEmbedTimeout, "8000")
 	t.Setenv(EnvWorkerWarmTimeout, "120000")
-	t.Setenv(EnvWorkerMaxFailures, "10")
 
 	cfg, err := workerConfigFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := config.Embedding{
-		ModelPath:              "/models/custom.gguf",
-		ModelContextWindow:     1024,
-		EmbedTimeoutMs:         8000,
-		WarmTimeoutMs:          120000,
-		MaxConsecutiveFailures: 10,
+		ModelPath:          "/models/custom.gguf",
+		ModelContextWindow: 1024,
+		EmbedTimeoutMs:     8000,
+		WarmTimeoutMs:      120000,
 	}
 	if cfg != want {
 		t.Errorf("workerConfigFromEnv() = %+v, want %+v", cfg, want)
@@ -53,11 +51,11 @@ func TestWorkerConfigFromEnvOptionalAndInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.EmbedTimeoutMs != 0 || cfg.WarmTimeoutMs != 0 || cfg.MaxConsecutiveFailures != 0 || cfg.ModelContextWindow != 0 {
+	if cfg.EmbedTimeoutMs != 0 || cfg.WarmTimeoutMs != 0 || cfg.ModelContextWindow != 0 {
 		t.Errorf("unset tunables = %+v, want the 0 sentinels", cfg)
 	}
 
-	for _, env := range []string{EnvWorkerContextWindow, EnvWorkerEmbedTimeout, EnvWorkerWarmTimeout, EnvWorkerMaxFailures} {
+	for _, env := range []string{EnvWorkerContextWindow, EnvWorkerEmbedTimeout, EnvWorkerWarmTimeout} {
 		t.Setenv(env, "not-a-number")
 		_, err := workerConfigFromEnv()
 		if err == nil {
@@ -79,10 +77,9 @@ func TestSpawnForwardsBudgetsToWorker(t *testing.T) {
 	// hardcoding /bin/true passes on Linux and fails on macOS, which has it at
 	// /usr/bin/true.
 	c := NewReexecClient(config.Embedding{
-		ModelPath:              "/models/custom.gguf",
-		EmbedTimeoutMs:         8000,
-		WarmTimeoutMs:          120000,
-		MaxConsecutiveFailures: 10,
+		ModelPath:      "/models/custom.gguf",
+		EmbedTimeoutMs: 8000,
+		WarmTimeoutMs:  120000,
 	})
 	w, err := c.spawn()
 	if err != nil {
@@ -99,7 +96,6 @@ func TestSpawnForwardsBudgetsToWorker(t *testing.T) {
 	for name, want := range map[string]int{
 		EnvWorkerEmbedTimeout: 8000,
 		EnvWorkerWarmTimeout:  120000,
-		EnvWorkerMaxFailures:  10,
 	} {
 		if got := env[name]; got != strconv.Itoa(want) {
 			t.Errorf("%s = %q, want %d", name, got, want)
@@ -120,19 +116,6 @@ func TestSpawnForwardsBudgetsToWorker(t *testing.T) {
 	if ResolveEmbedTimeout(childCfg) != c.embedTimeout || ResolveWarmTimeout(childCfg) != c.warmTimeout {
 		t.Errorf("child budgets %s/%s != parent %s/%s",
 			ResolveEmbedTimeout(childCfg), ResolveWarmTimeout(childCfg), c.embedTimeout, c.warmTimeout)
-	}
-}
-
-// TestResolveMaxFailuresCeiling: an absurd ceiling must not wrap the int32
-// failure counters negative, which would latch degraded on the FIRST failure —
-// the exact inverse of what raising this asks for.
-func TestResolveMaxFailuresCeiling(t *testing.T) {
-	got := ResolveMaxFailures(config.Embedding{MaxConsecutiveFailures: 3_000_000_000})
-	if got != maxFailureCeiling {
-		t.Errorf("ResolveMaxFailures(3e9) = %d, want the %d ceiling", got, maxFailureCeiling)
-	}
-	if int(int32(got)) != got || int32(got) <= 0 {
-		t.Errorf("ceiling %d does not survive the int32 counters", got)
 	}
 }
 

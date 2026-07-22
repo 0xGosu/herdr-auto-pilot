@@ -53,23 +53,6 @@ func TestResolveWarmTimeout(t *testing.T) {
 	}
 }
 
-// TestResolveMaxFailures covers the degrade-latch threshold: 0/negative mean
-// "built-in default", a positive value is taken as-is (raising it is how an
-// operator rides out an occasionally-slow model instead of latching off).
-func TestResolveMaxFailures(t *testing.T) {
-	cases := []struct{ in, want int }{
-		{0, DefaultMaxConsecutiveFailures},
-		{-2, DefaultMaxConsecutiveFailures},
-		{1, 1},
-		{25, 25},
-	}
-	for _, c := range cases {
-		if got := ResolveMaxFailures(config.Embedding{MaxConsecutiveFailures: c.in}); got != c.want {
-			t.Errorf("ResolveMaxFailures(%d) = %d, want %d", c.in, got, c.want)
-		}
-	}
-}
-
 // TestDiagnosticsTimeoutBound pins the classification that decides which
 // remedy an operator is shown: "every failure was a stall-guard expiry" means
 // raise the budgets, anything else means the embedder is actually broken.
@@ -92,30 +75,27 @@ func TestDiagnosticsTimeoutBound(t *testing.T) {
 	}
 }
 
-// TestClientHonoursConfiguredFailureCeiling is the point of making the latch
-// configurable: with a raised ceiling the client must keep TRYING past the
-// built-in 3 failures rather than permanently dropping semantic matching —
-// the exact behaviour a larger, occasionally-slow model needs. Uses the
-// crash-injection worker, so it needs neither a model nor the CGO engine.
-func TestClientHonoursConfiguredFailureCeiling(t *testing.T) {
-	const ceiling = DefaultMaxConsecutiveFailures + 3
+// TestClientLatchesAtFixedFailureCeiling pins the fixed degrade latch: the
+// client must keep TRYING for exactly DefaultMaxConsecutiveFailures consecutive
+// failures and only then drop semantic matching — not sooner (which would give
+// up on a merely-slow model), not never. The threshold is a hard constant, so
+// there is nothing to configure. Uses the crash-injection worker, so it needs
+// neither a model nor the CGO engine.
+func TestClientLatchesAtFixedFailureCeiling(t *testing.T) {
 	c := NewReexecClient(
-		config.Embedding{
-			ModelPath:              filepath.Join(t.TempDir(), "unused.gguf"),
-			MaxConsecutiveFailures: ceiling,
-		},
+		config.Embedding{ModelPath: filepath.Join(t.TempDir(), "unused.gguf")},
 		EnvWorkerCrash+"=1",
 	)
 	defer c.Close()
 
 	ctx := context.Background()
-	for i := 0; i < ceiling; i++ {
+	for i := range DefaultMaxConsecutiveFailures {
 		if _, err := c.EmbedText(ctx, "anything"); errors.Is(err, ErrDegraded) {
-			t.Fatalf("call %d latched at the default ceiling; the configured %d was ignored", i, ceiling)
+			t.Fatalf("call %d latched before the fixed ceiling of %d", i, DefaultMaxConsecutiveFailures)
 		}
 	}
 	if _, err := c.EmbedText(ctx, "anything"); !errors.Is(err, ErrDegraded) {
-		t.Errorf("after %d failures err = %v, want ErrDegraded", ceiling, err)
+		t.Errorf("after %d failures err = %v, want ErrDegraded", DefaultMaxConsecutiveFailures, err)
 	}
 }
 

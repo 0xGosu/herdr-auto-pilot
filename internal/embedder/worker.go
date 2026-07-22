@@ -30,9 +30,11 @@ const (
 	// embedding.embed_timeout_ms look like it did nothing.
 	EnvWorkerEmbedTimeout = "HAP_EMBED_TIMEOUT_MS"
 	EnvWorkerWarmTimeout  = "HAP_EMBED_WARM_TIMEOUT_MS"
-	// EnvWorkerMaxFailures forwards the degrade-latch threshold (optional;
-	// empty or "0" → the built-in default).
-	EnvWorkerMaxFailures = "HAP_EMBED_MAX_FAILURES"
+	// The degrade-latch threshold is NOT forwarded: it is a fixed constant
+	// (DefaultMaxConsecutiveFailures) compiled into both the parent Client and the
+	// worker's engine, so there is nothing per-run to pass across the pipe. (The
+	// worker holds no latch of its own anyway — see RunWorker.)
+	//
 	// EnvWorkerCrash is a TEST/FAULT-INJECTION seam: set to N and the worker
 	// os.Exit(134)s (mimicking a SIGABRT) when it receives its N-th embed
 	// request, before responding. It exists so the isolation contract — a
@@ -73,7 +75,6 @@ func workerConfigFromEnv() (config.Embedding, error) {
 		{EnvWorkerContextWindow, &cfg.ModelContextWindow},
 		{EnvWorkerEmbedTimeout, &cfg.EmbedTimeoutMs},
 		{EnvWorkerWarmTimeout, &cfg.WarmTimeoutMs},
-		{EnvWorkerMaxFailures, &cfg.MaxConsecutiveFailures},
 	} {
 		v := os.Getenv(f.env)
 		if v == "" {

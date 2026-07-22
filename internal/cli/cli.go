@@ -1024,9 +1024,8 @@ func printConfig(out io.Writer, cfg config.Config) {
 		cfg.ConfidenceThresholds.Minimum, cfg.ConfidenceThresholds.Idle, cfg.ConfidenceThresholds.Approval,
 		cfg.ConfidenceThresholds.Choice, cfg.ConfidenceThresholds.Error)
 	fmt.Fprintf(out, "learning:   graduation_n=%d confirmation_weight=%g\n", cfg.Learning.GraduationN, cfg.Learning.ConfirmationWeight)
-	fmt.Fprintf(out, "limits:     consecutive=%d per_minute=%d error_retries=%d dedup_window=%ds dedup_jitter=%d%%\n",
-		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries,
-		cfg.Limits.EscalationDedupWindowSeconds, cfg.Limits.EscalationDedupJitterPercent)
+	fmt.Fprintf(out, "limits:     consecutive=%d per_minute=%d error_retries=%d\n",
+		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries)
 	fmt.Fprintf(out, "llm:        configured=%v timeout=%ds auto_act_confidence_threshold=%d\n",
 		len(cfg.LLM.Command) > 0, cfg.LLM.TimeoutSeconds, cfg.LLM.AutoActConfidenceThreshold)
 	seedCount := domain.SeedNeverAutoRuleCount()
