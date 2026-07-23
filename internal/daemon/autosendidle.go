@@ -112,7 +112,17 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 	// source switched off (or removed) while hand-outs were in flight would
 	// otherwise leave its items "[-]" forever with nothing left to retire the
 	// ledger rows. The ledger, not the config, decides what needs cleaning up.
-	d.reclaimStrandedTasks(ctx, agents, now)
+	//
+	// awaiting names the agents whose hand-out this pass could NOT settle. They
+	// are barred from the pairing below: confirmation is per AGENT (a "working"
+	// transition says nothing about WHICH task), so a second hand-out layered on
+	// an unconfirmed first would let one resumption confirm both — permanently
+	// stranding the task the agent never received. A ledger it could not read at
+	// all stands the sweep down rather than pairing blind, for the same reason.
+	awaiting, ok := d.reclaimStrandedTasks(ctx, agents, now)
+	if !ok {
+		return
+	}
 
 	cfg, _, _ := d.snapshot()
 	sources := make([]config.TaskSource, 0, len(cfg.TaskSources))
@@ -137,14 +147,6 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 	for _, e := range open {
 		escalated[e.AgentID] = true
 	}
-
-	// Agents holding a hand-out the daemon has not seen taken up yet. Piling a
-	// second task on one is not just noisy: a later "working" transition
-	// confirms EVERY open row for that agent, so the untaken first task would be
-	// marked delivered and its "[-]" would stand forever — the exact stranding
-	// this sweep exists to undo. An agent stays out only until its hand-out is
-	// confirmed or reclaimed, both bounded by reclaimGrace.
-	awaiting := d.agentsAwaitingHandout(ctx)
 
 	driven := map[string]bool{} // agents already given a task this sweep
 	for _, src := range sources {
@@ -218,16 +220,28 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 //     started is NOT reclaimed again — it is left "[-]" and escalated, because
 //     the loop is otherwise unbounded.
 //
-// It is a best-effort pass throughout: an unreadable source or a failed release
+// It is a best-effort pass PER ROW: an unreadable source or a failed release
 // resolves to "leave it alone", which is the state the daemon was already in.
-func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.AgentTransition, now time.Time) {
+//
+// It returns the agents still holding a hand-out it could not settle, which the
+// pairing below uses to enforce one unconfirmed hand-out per agent, plus ok=false
+// when the ledger itself could not be read. That is why the two are computed
+// together from ONE read: a second, independent read could fail on its own and
+// report "nobody is awaiting", which would license exactly the second hand-out
+// the invariant forbids. ok=false stands the whole sweep down — the alternative,
+// pairing while blind to the ledger, lets a later "working" transition confirm
+// two rows at once and strands the task the agent never received.
+func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.AgentTransition,
+	now time.Time) (awaiting map[string]bool, ok bool) {
+
 	reservations, err := d.opt.Store.OpenTaskReservations(ctx)
 	if err != nil {
-		slog.Warn("auto-send: hand-out ledger unreadable; not reclaiming this sweep", "error", err)
-		return
+		slog.Warn("auto-send: hand-out ledger unreadable; standing down this sweep", "error", err)
+		return nil, false
 	}
+	awaiting = map[string]bool{}
 	if len(reservations) == 0 {
-		return
+		return awaiting, true
 	}
 	live := make(map[string]domain.AgentTransition, len(agents))
 	for _, a := range agents {
@@ -270,8 +284,11 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 			d.retireReservation(ctx, r)
 			continue
 		}
-		c, ok := read(r.SourcePath)
-		if !ok {
+		// From here on, every "leave it alone" branch keeps the row open, so its
+		// agent must not be handed anything else this sweep.
+		c, readable := read(r.SourcePath)
+		if !readable {
+			awaiting[r.AgentID] = true
 			continue
 		}
 		if !inProgressTask(c, r.TaskText) {
@@ -288,9 +305,11 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 		// check a busy successor would pin the item "[-]" indefinitely, never
 		// aging toward either a reclaim or the escalation ceiling.
 		if a, present := live[r.AgentID]; present && sameTenant(a, r) && !autoSendParked(a.Status) {
+			awaiting[r.AgentID] = true
 			continue
 		}
 		if now.Sub(r.ReservedAt) <= reclaimGrace {
+			awaiting[r.AgentID] = true
 			continue
 		}
 
@@ -298,15 +317,19 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 		if err != nil {
 			slog.Warn("auto-send: hand-out counter unreadable; not reclaiming",
 				"path", r.SourcePath, "error", err)
+			awaiting[r.AgentID] = true
 			continue
 		}
 		if attempts >= maxTaskHandouts {
+			// The row is retired here, so the agent is not held awaiting — the
+			// escalation this raises is what keeps it out of the pairing.
 			d.escalateNeverStartedTask(ctx, r, live[r.AgentID], attempts, now)
 			continue
 		}
 		if err := d.opt.MutateTaskFile(r.SourcePath, taskfile.Reclaim(r.ItemIndex, r.TaskText)); err != nil {
 			slog.Warn("auto-send: stranded task could not be returned to [ ]",
 				"path", r.SourcePath, "task", r.TaskText, "error", err)
+			awaiting[r.AgentID] = true
 			continue
 		}
 		delete(content, r.SourcePath)
@@ -330,6 +353,7 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 		slog.Info("auto-send: returned a stranded task to the pending list",
 			"agent", r.AgentID, "path", r.SourcePath, "task", r.TaskText, "attempt", attempts)
 	}
+	return awaiting, true
 }
 
 // retireReservation drops a ledger row that has done its job — the hand-out was
@@ -395,32 +419,6 @@ func (d *Daemon) escalateNeverStartedTask(ctx context.Context, r domain.TaskRese
 	}
 	slog.Warn("auto-send: task handed out repeatedly and never started; escalating",
 		"agent", r.AgentID, "path", r.SourcePath, "task", r.TaskText, "attempts", attempts)
-}
-
-// agentsAwaitingHandout returns the agents that still hold a hand-out the
-// daemon has not seen taken up. They are skipped by this sweep's pairing:
-// confirmation is per AGENT (a "working" transition says nothing about WHICH
-// task it is working on), so a second hand-out layered over an unconfirmed
-// first would let one resumption confirm both — permanently stranding the task
-// the agent never actually received.
-//
-// Fails OPEN: a ledger it cannot read hands out nothing new only if it also
-// cannot reclaim, and stalling the feature on a transient read error is worse
-// than one extra hand-out. This runs right after reclaimStrandedTasks, so rows
-// past their grace window are already gone by the time it reads.
-func (d *Daemon) agentsAwaitingHandout(ctx context.Context) map[string]bool {
-	reservations, err := d.opt.Store.OpenTaskReservations(ctx)
-	if err != nil {
-		slog.Warn("auto-send: hand-out ledger unreadable; pairing without it this sweep", "error", err)
-		return nil
-	}
-	out := map[string]bool{}
-	for _, r := range reservations {
-		if r.ConfirmedAt.IsZero() {
-			out[r.AgentID] = true
-		}
-	}
-	return out
 }
 
 // sameTenant reports whether a live agent is still the one a hand-out was made

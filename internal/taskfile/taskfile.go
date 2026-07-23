@@ -199,16 +199,24 @@ func ReserveFirstPending(taskText string) (func(string) (string, error), *int) {
 // sweep can hand it out again. It is the daemon's counterpart to
 // ReserveFirstPending, undoing a hand-out the agent never took up.
 //
-// It prefers the position the reservation recorded and falls back to the first
-// text match, because neither key alone is sound here: positions renumber on
-// every insert or delete, so an index resolved minutes ago can address a
-// different line; but text is not unique either — a checklist may well repeat
-// "run tests", and clearing the FIRST such "[-]" when the reservation claimed
-// the second would take back an item somebody else owns. Preferring the index
-// while it still carries the reserved text gets both. Pass index <= 0 when
-// none was recorded (rows written before the column existed).
+// Neither of the two available keys is sound alone: positions renumber on every
+// insert or delete, so an index resolved minutes ago can address a different
+// line; but text is not unique either — a checklist may well repeat "run tests".
+// So it resolves in two steps, and the second one FAILS CLOSED:
 //
-// Deliberately narrow, because the caller is unattended:
+//  1. the recorded position, while it still carries the reserved text as "[-]" —
+//     unambiguous, and the normal case;
+//  2. otherwise the sole "[-]" carrying that text, but ONLY when the text
+//     appears once in the whole checklist. A duplicated text means the caller
+//     cannot prove which copy its reservation claimed, and clearing the wrong one
+//     would take back an item somebody else owns — precisely the invariant this
+//     is meant to uphold. Refusing leaves the item "[-]", which is where the
+//     feature stood before any of this existed.
+//
+// Pass index <= 0 when none was recorded (rows written before the position was
+// stored); step 2 then decides on its own, under the same uniqueness rule.
+//
+// Deliberately narrow otherwise, because the caller is unattended:
 //   - only a "[-]" item is touched. An item now "[x]" was completed and an item
 //     already "[ ]" needs nothing — either way, silently re-opening it would
 //     re-arm work somebody finished.
@@ -221,16 +229,27 @@ func ReserveFirstPending(taskText string) (func(string) (string, error), *int) {
 func Reclaim(index int, taskText string) func(string) (string, error) {
 	return func(content string) (string, error) {
 		items := domain.ParseChecklist(content)
+		occurrences, inProgress := 0, -1
 		for _, it := range items {
-			if it.Index == index && it.Text == taskText && it.Mark == domain.MarkInProgress {
+			if it.Text != taskText {
+				continue
+			}
+			occurrences++
+			if it.Mark != domain.MarkInProgress {
+				continue
+			}
+			if it.Index == index {
 				return domain.SetChecklistItemDone(content, it.Index, false)
 			}
+			inProgress = it.Index
 		}
-		for _, it := range items {
-			if it.Text == taskText && it.Mark == domain.MarkInProgress {
-				return domain.SetChecklistItemDone(content, it.Index, false)
-			}
+		if inProgress < 0 {
+			return "", fmt.Errorf("no in-progress task matching %q remains in the list — it was completed, released or edited", taskText)
 		}
-		return "", fmt.Errorf("no in-progress task matching %q remains in the list — it was completed, released or edited", taskText)
+		if occurrences > 1 {
+			return "", fmt.Errorf("task #%d is not the %q this send reserved and the text appears %d times — "+
+				"refusing to release a copy that may not be ours", index, taskText, occurrences)
+		}
+		return domain.SetChecklistItemDone(content, inProgress, false)
 	}
 }

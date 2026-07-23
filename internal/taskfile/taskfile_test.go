@@ -141,9 +141,9 @@ func TestLockPathIsStableAcrossEquivalentPaths(t *testing.T) {
 
 func TestReclaim(t *testing.T) {
 	// The daemon's reclaim path takes back a hand-out the agent never started.
-	// It may only touch an item that is still [-], and it prefers the recorded
-	// position over a bare text match so a list repeating one task cannot have
-	// the wrong copy released.
+	// It may only touch an item that is still [-], and on a list repeating one
+	// task it releases the recorded position or nothing at all — releasing "the
+	// first [-] with this text" could clear a copy somebody else owns.
 	const list = "- [ ] alpha\n- [-] beta\n- [x] gamma\n- [-] beta\n"
 	tests := []struct {
 		name    string
@@ -160,17 +160,17 @@ func TestReclaim(t *testing.T) {
 			want: "- [ ] alpha\n- [-] beta\n- [x] gamma\n- [ ] beta\n",
 		},
 		{
-			name: "falls back to the first text match when the list renumbered",
-			// Positions shift on every insert or delete, so an index that no
-			// longer carries the reserved text is a stale address, not a veto.
-			index: 3, task: "beta",
-			want: "- [ ] alpha\n- [ ] beta\n- [x] gamma\n- [-] beta\n",
+			name: "refuses an ambiguous duplicate when the position does not match",
+			// The recorded position no longer carries the text, so the only
+			// candidates are copies we cannot prove are ours — one of which may
+			// be the operator's own in-progress mark. Fail closed.
+			index: 3, task: "beta", wantErr: true,
 		},
 		{
-			name: "falls back when no position was recorded",
-			// Rows written before the position was stored carry 0.
-			index: 0, task: "beta",
-			want: "- [ ] alpha\n- [ ] beta\n- [x] gamma\n- [-] beta\n",
+			name: "refuses a duplicate when no position was recorded",
+			// Rows written before the position was stored carry 0, which cannot
+			// disambiguate a repeated text either.
+			index: 0, task: "beta", wantErr: true,
 		},
 		{
 			// Completed work must never be silently re-opened and re-handed out.
@@ -188,18 +188,59 @@ func TestReclaim(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := Reclaim(tc.index, tc.task)(list)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("expected an error, got %q", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tc.want {
-				t.Errorf("got:\n%s\nwant:\n%s", got, tc.want)
-			}
+			checkReclaim(t, got, err, tc.want, tc.wantErr)
 		})
+	}
+}
+
+func TestReclaimUniqueText(t *testing.T) {
+	// With the text appearing once there is nothing to confuse, so a stale
+	// position (the list renumbered under the reservation) is just an address
+	// that missed — it must not veto the release.
+	const list = "- [ ] alpha\n- [-] beta\n- [x] gamma\n"
+	tests := []struct {
+		name    string
+		index   int
+		task    string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:  "releases on the recorded position",
+			index: 2, task: "beta",
+			want: "- [ ] alpha\n- [ ] beta\n- [x] gamma\n",
+		},
+		{
+			name:  "releases despite a stale position",
+			index: 7, task: "beta",
+			want: "- [ ] alpha\n- [ ] beta\n- [x] gamma\n",
+		},
+		{
+			name:  "releases when no position was recorded",
+			index: 0, task: "beta",
+			want: "- [ ] alpha\n- [ ] beta\n- [x] gamma\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Reclaim(tc.index, tc.task)(list)
+			checkReclaim(t, got, err, tc.want, tc.wantErr)
+		})
+	}
+}
+
+func checkReclaim(t *testing.T, got string, err error, want string, wantErr bool) {
+	t.Helper()
+	if wantErr {
+		if err == nil {
+			t.Fatalf("expected an error, got %q", got)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
 )
 
@@ -1295,4 +1296,91 @@ func TestAutoSendIdleUnsettleableHandoutStopsBenchingItsAgent(t *testing.T) {
 	h.daemon.autoSendIdleTasks(ctx, agents)
 
 	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 0 })
+}
+
+// ledgerFailingStore makes the hand-out ledger read fail on demand, so a test
+// can drive the sweep's fail-closed path without racing the daemon's startup
+// reads (the wrapper is installed before Run, per newHarnessCore).
+type ledgerFailingStore struct {
+	ports.StorePort
+	mu   sync.Mutex
+	fail bool
+}
+
+func (s *ledgerFailingStore) setFail(v bool) { s.mu.Lock(); s.fail = v; s.mu.Unlock() }
+
+func (s *ledgerFailingStore) OpenTaskReservations(ctx context.Context) ([]domain.TaskReservation, error) {
+	s.mu.Lock()
+	fail := s.fail
+	s.mu.Unlock()
+	if fail {
+		return nil, errors.New("ledger unavailable")
+	}
+	return s.StorePort.OpenTaskReservations(ctx)
+}
+
+func TestAutoSendIdleStandsDownWhenTheLedgerCannotBeRead(t *testing.T) {
+	// Fail CLOSED on an unreadable ledger. The sweep cannot see which agents
+	// already hold an unconfirmed hand-out, and pairing blind would give one a
+	// second task; a later "working" transition then confirms BOTH rows, leaving
+	// the untaken first [-] forever — the stranding this whole feature undoes.
+	// A skipped sweep costs a minute; a stranded task costs a human.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(taskFile, []byte("- [ ] step two\n- [ ] step three\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\nenable_auto_send_task_when_idle = true\n",
+		"agent-rc13", taskFile)
+	var gate *ledgerFailingStore
+	fl := &fakeLLM{}
+	h := newHarnessCore(t, cfg, nil, fl, fl, func(inner ports.StorePort) ports.StorePort {
+		gate = &ledgerFailingStore{StorePort: inner}
+		return gate
+	})
+	h.herdr.setPane(autoSendIdlePane)
+	h.seedAutonomous(autoSendIdlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc13")
+	ctx := context.Background()
+
+	gate.setFail(true)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+
+	quietFor(t, h, 500*time.Millisecond)
+	if got := readTasks(t, taskFile); strings.Contains(got, "[-]") {
+		t.Errorf("a task was handed out while the ledger was unreadable:\n%s", got)
+	}
+
+	// The ledger comes back; the sweep resumes normally.
+	gate.setFail(false)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+}
+
+func TestAutoSendIdleLeavesAnAmbiguousDuplicateAlone(t *testing.T) {
+	// A checklist repeating one task text: the reserved copy was completed while
+	// ANOTHER copy sits [-] under somebody else. The reclaim cannot prove which
+	// copy was its own, so it must release neither — clearing the wrong one would
+	// re-hand out work already underway.
+	h, taskFile := autoSendFixture(t, "agent-rc14", "- [ ] repeat me\n- [ ] repeat me\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc14")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] repeat me\n- [ ] repeat me")
+	})
+
+	// The daemon reserved #1. The operator completes #1 and starts #2 themselves.
+	if err := os.WriteFile(taskFile, []byte("- [x] repeat me\n- [-] repeat me\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backdateHandouts(t, h, 2*reclaimGrace)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	time.Sleep(300 * time.Millisecond)
+
+	if got := readTasks(t, taskFile); got != "- [x] repeat me\n- [-] repeat me\n" {
+		t.Errorf("the reclaim touched an ambiguous duplicate it could not prove was its own:\n%s", got)
+	}
 }
