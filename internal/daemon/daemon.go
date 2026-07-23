@@ -678,6 +678,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.processCorrections(ctx)
 		d.processLLMRetries(ctx)
 		d.expireStaleLLMWork(ctx)
+		// Confirmation of an unattended hand-out is an in-flight "agent went
+		// working" observation, so a restart loses it for hand-outs that WERE
+		// taken up. Give every outstanding one a full grace window again rather
+		// than reclaiming — and re-sending — work an agent is doing right now.
+		if err := d.opt.Store.TouchTaskReservations(ctx, maxHandoutRestamps, d.opt.Clock.Now()); err != nil {
+			slog.Warn("auto-send: hand-out ledger could not be re-stamped at startup", "error", err)
+		}
 		d.reconcileAttention(ctx)
 		return nil
 	})
@@ -859,6 +866,16 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		delete(d.idleSince, tr.AgentID)
 		delete(d.autoTaskClaim, tr.AgentID)
 		d.mu.Unlock()
+		// The agent is doing something, which is the ONLY evidence that an
+		// unattended hand-out actually reached it (a successful `agent send`
+		// only proves herdr accepted the keystrokes). Latch it here rather than
+		// polling status in the sweep: an agent can take a task, finish it, and
+		// park again between two sweeps and still deserves to be confirmed.
+		// A failure leaves the row unconfirmed, so the sweep reclaims the task —
+		// the safe direction, and it is re-sent rather than lost.
+		if err := d.opt.Store.ConfirmTaskReservations(ctx, tr.AgentID, tr.TerminalID, now); err != nil {
+			slog.Warn("auto-send: hand-out could not be confirmed", "agent", tr.AgentID, "error", err)
+		}
 		return
 	case "idle", "done", "blocked":
 		// Attention-requiring: the pane read is DELAYED so the agent TUI
@@ -1750,7 +1767,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 	// Claim the checklist item BEFORE the send: marking it after delivery
 	// would leave a window in which the very same "[ ]" line is handed to a
 	// second idle agent. A refusal here means somebody already took it.
-	rollback, err := d.reserveDeclaredTask(del.declared, del.taskText)
+	rollback, reservedIndex, err := d.reserveDeclaredTask(del.declared, del.taskText)
 	if err != nil {
 		slog.Warn("declared task could not be reserved; not sending", "agent", s.AgentID, "error", err)
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
@@ -1771,6 +1788,27 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 	d.mu.Lock()
 	d.lastAutoSend[s.AgentID] = now
 	d.mu.Unlock()
+
+	// The keystrokes are out, but herdr accepting them is not proof the agent
+	// acted on them. Record the hand-out so the idle sweep can decide from what
+	// happens NEXT — the agent going "working" confirms it; the agent parking
+	// again without ever doing so returns the item to "[ ]" for a fresh attempt
+	// (reclaimStrandedTasks). Recorded AFTER the send, so the failed-send path
+	// above — which rolls the item back itself — never leaves a row behind.
+	if reservedIndex > 0 {
+		if _, err := d.opt.Store.RecordTaskReservation(ctx, domain.TaskReservation{
+			SourcePath: canonicalTaskPath(del.declared.Path), TaskText: del.taskText,
+			ItemIndex: reservedIndex,
+			AgentID:   s.AgentID, PaneID: s.PaneID, TerminalID: s.TerminalID,
+			AuditID: auditID, ReservedAt: now,
+		}); err != nil {
+			// Losing the row costs the self-healing for THIS hand-out (the item
+			// stays "[-]" until an operator clears it), exactly the old
+			// behavior — never a double send.
+			slog.Error("auto-send: hand-out could not be recorded; this task will not self-heal if it is never started",
+				"agent", s.AgentID, "task", del.taskText, "error", err)
+		}
+	}
 
 	// Learning + counters (daemon-owned hot-path rows). The action-review
 	// path pins the learned action at decision time; the synchronous path
@@ -3673,7 +3711,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			}
 			// Same claim-before-send rule as the rule path: an auto-send source's
 			// item is marked "[-]" before the text reaches the pane.
-			rollback, rerr := d.reserveDeclaredTask(taskReserve, reserveText)
+			rollback, reservedIndex, rerr := d.reserveDeclaredTask(taskReserve, reserveText)
 			if rerr != nil {
 				d.dropAutoTaskClaim(s.AgentID)
 				slog.Warn("reviewed task could not be reserved; not sending", "agent", s.AgentID, "error", rerr)
@@ -3692,6 +3730,20 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 				d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
 				return
+			}
+			// Same as the rule path: the send landing in herdr is not proof the
+			// agent took the task, so record the hand-out for the idle sweep to
+			// confirm or reclaim (see reclaimStrandedTasks).
+			if reservedIndex > 0 {
+				if _, rerr := d.opt.Store.RecordTaskReservation(ctx, domain.TaskReservation{
+					SourcePath: canonicalTaskPath(taskReserve.Path), TaskText: reserveText,
+					ItemIndex: reservedIndex,
+					AgentID:   s.AgentID, PaneID: s.PaneID, TerminalID: s.TerminalID,
+					AuditID: auditID, ReservedAt: now,
+				}); rerr != nil {
+					slog.Error("auto-send: reviewed hand-out could not be recorded; this task will not self-heal if it is never started",
+						"agent", s.AgentID, "task", reserveText, "error", rerr)
+				}
 			}
 			d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "accepted")
 			d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{

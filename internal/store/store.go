@@ -208,6 +208,35 @@ CREATE TABLE IF NOT EXISTS signature_snapshots (
 	pane_excerpt TEXT NOT NULL,
 	created_at INTEGER NOT NULL
 );
+-- Ledger of unattended task hand-outs: which "[-]" marks the daemon wrote
+-- itself, for which agent, and whether that agent was ever seen working
+-- afterwards. Unconfirmed rows whose agent parked again are what the idle
+-- sweep returns to "[ ]"; a "[-]" with no row here is somebody else's and is
+-- never touched.
+CREATE TABLE IF NOT EXISTS task_reservations (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	source_path TEXT NOT NULL,
+	task_text TEXT NOT NULL,
+	item_index INTEGER NOT NULL DEFAULT 0,
+	agent_id TEXT NOT NULL,
+	pane_id TEXT NOT NULL,
+	terminal_id TEXT NOT NULL DEFAULT '',
+	audit_id INTEGER NOT NULL DEFAULT 0,
+	reserved_at INTEGER NOT NULL,
+	restamps INTEGER NOT NULL DEFAULT 0,
+	confirmed_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_task_res_agent ON task_reservations(agent_id);
+-- Per-item hand-out counter, kept SEPARATELY from task_reservations so it
+-- survives the reservation row being retired on every reclaim. It is what caps
+-- an item that can never be delivered from being resent forever.
+CREATE TABLE IF NOT EXISTS task_handouts (
+	source_path TEXT NOT NULL,
+	task_text TEXT NOT NULL,
+	attempts INTEGER NOT NULL DEFAULT 0,
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (source_path, task_text)
+);
 `
 
 func (s *Store) migrate() error {
@@ -1445,6 +1474,133 @@ func (s *Store) GetAgentRate(ctx context.Context, agentID string) (*domain.Agent
 	r.WindowStart = fromUnix(windowStart)
 	r.Paused = paused != 0
 	return &r, nil
+}
+
+// --- Unattended task hand-out ledger (auto_send_when_idle) ---
+
+// RecordTaskReservation logs one unattended hand-out and bumps that item's
+// attempt counter, as a single transaction: the counter is what stops an item
+// that can never be delivered from being reclaimed and resent forever, so it
+// must not be able to drift from the reservations it counts.
+func (s *Store) RecordTaskReservation(ctx context.Context, r domain.TaskReservation) (int64, error) {
+	var id int64
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO task_reservations
+				(source_path, task_text, item_index, agent_id, pane_id, terminal_id, audit_id,
+				 reserved_at, restamps, confirmed_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`,
+			r.SourcePath, r.TaskText, r.ItemIndex, r.AgentID, r.PaneID, r.TerminalID,
+			r.AuditID, unix(r.ReservedAt))
+		if err != nil {
+			return err
+		}
+		if id, err = res.LastInsertId(); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO task_handouts (source_path, task_text, attempts, updated_at)
+			VALUES (?, ?, 1, ?)
+			ON CONFLICT(source_path, task_text)
+			DO UPDATE SET attempts = attempts + 1, updated_at = excluded.updated_at`,
+			r.SourcePath, r.TaskText, unix(r.ReservedAt))
+		return err
+	})
+	return id, err
+}
+
+// OpenTaskReservations returns every recorded hand-out, oldest first. Rows are
+// retired by the reclaim sweep, so this stays small (one row per in-flight
+// hand-out); no LIMIT is needed and none is wanted — a dropped row would strand
+// the "[-]" it describes.
+func (s *Store) OpenTaskReservations(ctx context.Context) ([]domain.TaskReservation, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, source_path, task_text, item_index, agent_id, pane_id, terminal_id, audit_id,
+		       reserved_at, restamps, confirmed_at
+		FROM task_reservations ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.TaskReservation
+	for rows.Next() {
+		var r domain.TaskReservation
+		var reserved, confirmed int64
+		if err := rows.Scan(&r.ID, &r.SourcePath, &r.TaskText, &r.ItemIndex, &r.AgentID, &r.PaneID,
+			&r.TerminalID, &r.AuditID, &reserved, &r.Restamps, &confirmed); err != nil {
+			return nil, err
+		}
+		r.ReservedAt, r.ConfirmedAt = fromUnix(reserved), fromUnix(confirmed)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ConfirmTaskReservations stamps an agent's still-unconfirmed hand-outs as
+// taken up. Its caller is the "agent is working again" transition, which is the
+// only evidence the keystrokes actually reached the agent — a successful
+// `agent send` only proves herdr accepted them.
+//
+// terminalID scopes it to the SAME tenant the hand-out was made to. herdr
+// reuses compact pane ids, and an agent id is a pane id: without this, a fresh
+// agent recycled onto that id would confirm — and so permanently strand — the
+// previous tenant's untaken task the first time it did any work. Rows and
+// transitions that carry no terminal id (older herdr, event-socket transitions)
+// match anything, so this can never block confirmation on a herdr that does not
+// report terminal identity — the same fail-open rule as paneRecycled.
+func (s *Store) ConfirmTaskReservations(ctx context.Context, agentID, terminalID string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE task_reservations SET confirmed_at = ?
+		WHERE agent_id = ? AND confirmed_at = 0
+		  AND (terminal_id = '' OR ? = '' OR terminal_id = ?)`,
+		unix(at), agentID, terminalID, terminalID)
+	return err
+}
+
+// DeleteTaskReservation retires one ledger row (confirmed, reclaimed, or gone
+// from the file).
+func (s *Store) DeleteTaskReservation(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM task_reservations WHERE id = ?`, id)
+	return err
+}
+
+// TouchTaskReservations re-stamps unconfirmed hand-outs' reserved_at, giving
+// each a full grace window again. The daemon calls it at startup: confirmation
+// is an in-flight "agent went working" observation, so a restart loses it for
+// hand-outs that WERE taken up, and reclaiming immediately would re-open work an
+// agent is doing right now.
+//
+// maxRestamps bounds it, because the grace window is the ONLY thing that ages a
+// hand-out toward being reclaimed: an unbounded re-stamp means a crash-looping
+// or frequently-restarted daemon renews the window forever and the task is
+// stranded silently, with the attempt counter never advancing to the escalation.
+// Past the bound a row keeps its original timestamp and ages normally.
+func (s *Store) TouchTaskReservations(ctx context.Context, maxRestamps int, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE task_reservations SET reserved_at = ?, restamps = restamps + 1
+		WHERE confirmed_at = 0 AND restamps < ?`, unix(at), maxRestamps)
+	return err
+}
+
+// TaskHandoutAttempts reports how many times an item has been handed out
+// (0 when never).
+func (s *Store) TaskHandoutAttempts(ctx context.Context, sourcePath, taskText string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT attempts FROM task_handouts WHERE source_path = ? AND task_text = ?`,
+		sourcePath, taskText).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return n, err
+}
+
+// ClearTaskHandouts forgets an item's attempt counter, so a task that is picked
+// up (or completed, or edited) starts from zero if it is ever handed out again.
+func (s *Store) ClearTaskHandouts(ctx context.Context, sourcePath, taskText string) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM task_handouts WHERE source_path = ? AND task_text = ?`, sourcePath, taskText)
+	return err
 }
 
 // GetErrorRetry returns the retry counter for an error signature (zero when absent).

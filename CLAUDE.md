@@ -186,6 +186,23 @@ whose manifest carries exactly that version).
   through ticking that very form. Keep all three invariant tests when touching this
   (`TestMultiTabSweepMultiSelectOwnTogglesComplete` / `…ForeignSelectionEscalates` /
   `…UnattributedTogglesEscalate`).
+- **An unattended task hand-out is only "delivered" once the agent works** — a successful
+  `agent send` proves herdr took the keystrokes, not that the agent acted on them, so the
+  `[-]` written at delivery is recorded in `task_reservations` and confirmed only by a
+  `working` transition (`daemon.handleTransition`). `daemon.reclaimStrandedTasks` returns an
+  unconfirmed item to `[ ]` once its agent is parked again past `reclaimGrace`, which is what
+  makes each sweep decide from current state rather than a past send. Four bounds are
+  load-bearing and must survive any change here: the daemon releases ONLY a `[-]` it holds a
+  ledger row for (an operator's or an agent's own mark is never cleared); **one unconfirmed
+  hand-out per agent** (`agentsAwaitingHandout`), because confirmation is per-agent and a
+  second hand-out would let one resumption confirm — and so strand — the untaken first;
+  confirm and reclaim both compare `terminal_id`, since herdr recycles pane ids and an agent
+  id IS a pane id; and an item handed out `maxTaskHandouts` times without ever being started
+  is left `[-]` and escalated instead of resent forever. Keep the invariant tests in
+  `autosendidle_test.go` (`…ReclaimsStrandedHandoutAndResends` /
+  `…ConfirmedHandoutIsNeverReclaimed` / `…ReclaimIgnoresForeignInProgressItems` /
+  `…OneUnconfirmedHandoutPerAgent` / `…RecycledPaneCannotConfirmItsPredecessorsHandout` /
+  `…HandoutCapEscalatesInsteadOfResending`).
 - **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
   shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels
   results back through a channel (see `consultLLM` / `llmResults`).

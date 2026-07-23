@@ -485,6 +485,12 @@ automated action.
   hand-outs are exempt from the consecutive counter and never pause on the
   per-minute ceiling (they defer to a later sweep), since the operator opted
   into unattended repeated sending for that source.
+- **Stranded-hand-out reclaim, with a ceiling.** A reserved `[-]` item is
+  returned to `[ ]` when its hand-out was never confirmed and the agent is
+  parked again (`task_reservations`), so the queue self-heals instead of
+  draining into permanently reserved items. Two bounds keep that from becoming
+  its own runaway: only a `[-]` the daemon reserved is ever released, and after
+  **3** unstarted hand-outs of one item it is left `[-]` and escalated.
 - **Escalation on uncertainty.** Every uncertain path routes to escalate + audit
   + notify — never a silent drop.
 
@@ -786,7 +792,7 @@ the sections they gate.
 | **FR-008** | Confidence-gated autonomous action | Auto-execute the learned action only when confidence exceeds the per-situation threshold and no safety control blocks; otherwise escalate. |
 | **FR-009** | Per-situation-type thresholds | Support a distinct, operator-configurable (TOML) confidence threshold per situation type (idle, approval, choice, error). |
 | **FR-010** | Hybrid decision with LLM fallback | Optionally consult a configured local LLM/agent CLI when no confident rule applies; any LLM-derived action is re-gated by the confidence gate + safety controls, and on LLM unavailability escalate. |
-| **FR-011** | Idle / finished behavior | Prompt the next task via (1) operator-declared task source, else (2) an explicit structured pane-history todo gated by the minimum-agreement floor; if neither is sufficiently confident, escalate — never synthesize an arbitrary "continue". A source may opt into `enable_auto_send_task_when_idle`, which re-drives agents idle past a one-minute threshold on the periodic sweep (same pipeline and gates); agents matched by one source are paired with distinct pending items and the delivered item is reserved `[-]` at send time, so a task never reaches two agents. |
+| **FR-011** | Idle / finished behavior | Prompt the next task via (1) operator-declared task source, else (2) an explicit structured pane-history todo gated by the minimum-agreement floor; if neither is sufficiently confident, escalate — never synthesize an arbitrary "continue". A source may opt into `enable_auto_send_task_when_idle`, which re-drives agents idle past a one-minute threshold on the periodic sweep (same pipeline and gates); agents matched by one source are paired with distinct pending items and the delivered item is reserved `[-]` at send time, so a task never reaches two agents. Each hand-out is recorded in a durable ledger and confirmed only when herdr reports that agent WORKING (a successful send proves only that herdr accepted the keystrokes); an unconfirmed hand-out whose agent is parked again past a two-minute grace is returned to `[ ]` and re-offered, so a sweep never depends on a past send. Only a `[-]` the daemon itself reserved may be released, and an item handed out three times without ever being started is left `[-]` and escalated rather than resent forever. |
 | **FR-012** | Approval / permission behavior | Select the learned yes/no response when confident and not blocked by the never-auto allowlist. |
 | **FR-013** | Multiple-choice behavior | Select the learned option matching the choice signature; if the option set is unfamiliar, escalate. |
 | **FR-014** | Error / retry behavior | Choose the learned retry/skip/escalate action, bounded to a max of 2 automated retries per error signature, after which force escalation. |

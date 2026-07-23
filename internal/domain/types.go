@@ -313,7 +313,56 @@ const (
 	// AuditStatusDeliveryFailed: a delivered action left the agent still
 	// blocked (verifyunblock's diagnostic).
 	AuditStatusDeliveryFailed = "delivery_failed"
+	// AuditStatusReclaimed: an unattended task hand-out was never taken up by
+	// the agent, so its checklist item was returned to "[ ]" for the next sweep.
+	AuditStatusReclaimed = "reclaimed"
 )
+
+// Audit action prefixes for the auto-send-when-idle reclaim path.
+const (
+	// AuditActionTaskReclaimedPrefix prefixes the action of a reclaim row: the
+	// checklist item went back to "[ ]" because the agent it was handed to never
+	// started working.
+	AuditActionTaskReclaimedPrefix = "task_reclaimed:"
+	// AuditActionTaskNeverStartedPrefix prefixes the escalation raised when an
+	// item has been handed out MaxTaskHandouts times without ever being started.
+	AuditActionTaskNeverStartedPrefix = "task_never_started:"
+	// ReasonTaskNeverStarted is the bracketed rationale tag of that escalation
+	// (the daemon's convention for machine-readable reasons).
+	ReasonTaskNeverStarted = "task_never_started"
+)
+
+// TaskReservation is one unattended task hand-out recorded at delivery: the
+// checklist item the daemon marked "[-]" as it sent it, and the agent it was
+// sent to. It is the evidence that a given "[-]" is HAP's own, still-unconfirmed
+// reservation rather than work an operator or an agent marked itself — which is
+// what makes it safe to return the item to "[ ]" when the hand-out never landed.
+//
+// ConfirmedAt is stamped the moment herdr reports the agent working again: that
+// is the only proof the keystrokes reached the agent, since a successful
+// `agent send` only means herdr accepted them. A confirmed row is retired; an
+// unconfirmed one whose agent is parked again past the grace window is reclaimed.
+type TaskReservation struct {
+	ID         int64
+	SourcePath string // canonical (absolute, symlinks resolved) task-source path
+	TaskText   string // raw checklist text, the key ReserveFirstPending claimed on
+	// ItemIndex is the checklist position that was marked. It disambiguates a
+	// list carrying the SAME text twice, where releasing "the first match"
+	// could clear an item somebody else owns. It is a HINT, not an address:
+	// positions renumber on every insert or delete, so a release prefers this
+	// index only while the item there still carries the reserved text.
+	ItemIndex  int
+	AgentID    string
+	PaneID     string
+	TerminalID string
+	AuditID    int64
+	ReservedAt time.Time
+	// Restamps counts how many daemon startups have renewed ReservedAt. The
+	// grace window is the only thing that ages a hand-out toward reclaim, so
+	// this bounds a restart loop from renewing it forever.
+	Restamps    int
+	ConfirmedAt time.Time // zero until the agent was observed working
+}
 
 // AgentStats are lifetime per-agent counters derived from audit_log, keyed by
 // the herdr pane id. A rename preserves them (same pane id); a restart yields

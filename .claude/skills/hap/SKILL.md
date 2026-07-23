@@ -555,6 +555,18 @@ and the *Config* tab's `t` prompt takes the same words:
   row's trigger reads `auto-idle-send`.
 - an agent that is disabled, rate-paused, blocked, or has an open escalation is
   skipped.
+- **every sweep decides from current state, not from the last send.** a
+  successful send only means herdr took the keystrokes — text typed into a CLI
+  that is restarting or unfocused is silently lost, and the item would sit `[-]`
+  forever. so each hand-out is recorded, and confirmed only when herdr reports
+  that agent *working*. an unconfirmed hand-out whose agent is parked again
+  after ~2 minutes is returned to `[ ]` (audit status `reclaimed`) and re-offered
+  in the same sweep — to that agent or any other idle one. a `[-]` hap did not
+  write itself (yours, or one an agent marked) is never touched.
+- after **3** hand-outs of the same item that were never started, hap stops
+  resending it: the item is left `[-]` and an escalation
+  (`task_never_started:…`) asks you to look. clear it with
+  `hap task <name> undone <n>` once the agent is healthy.
 
 
 ### manage the task items (CRUD)

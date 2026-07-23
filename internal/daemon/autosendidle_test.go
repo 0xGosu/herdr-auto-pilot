@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
 )
 
@@ -912,5 +913,474 @@ func TestAutoSendIdleReassignsAfterLLMReviewDeclines(t *testing.T) {
 	})
 	if !auditFor(t, h, "agent-as19b", "auto") {
 		t.Error("the released task was not delivered to the second agent")
+	}
+}
+
+// --- Reclaiming stranded hand-outs -------------------------------------------
+//
+// A successful `agent send` only proves herdr accepted the keystrokes, not that
+// the agent acted on them. These tests cover the ledger that lets each sweep
+// decide from CURRENT state instead of trusting the previous send.
+
+// backdateHandouts ages every unconfirmed hand-out by d, so the reclaim sweep's
+// grace window has elapsed without the test waiting minutes of wall time. It
+// goes through the production re-stamp method rather than poking the DB.
+func backdateHandouts(t *testing.T, h *harness, d time.Duration) {
+	t.Helper()
+	if err := h.raw.TouchTaskReservations(context.Background(), maxHandoutRestamps, time.Now().Add(-d)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func openHandouts(t *testing.T, h *harness) []domain.TaskReservation {
+	t.Helper()
+	rs, err := h.raw.OpenTaskReservations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rs
+}
+
+func TestAutoSendIdleReclaimsStrandedHandoutAndResends(t *testing.T) {
+	// The core regression: the send "succeeded" (herdr took the keystrokes) but
+	// the agent never started — it is still idle and never reported working. The
+	// item must NOT stay [-] forever; the next sweep returns it to [ ] and hands
+	// it out again, to this agent or any other.
+	h, taskFile := autoSendFixture(t, "agent-rc1", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc1")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] step two")
+	})
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+
+	// The agent never worked; age the hand-out past the grace window.
+	backdateHandouts(t, h, 2*reclaimGrace)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+
+	// Re-offered in the SAME sweep that released it.
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 2 })
+	if got := h.herdr.sentInputs()[1]; !strings.Contains(got, "step two") {
+		t.Errorf("the reclaimed task was not resent; got %q", got)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] step two")
+	})
+	if !auditFor(t, h, "agent-rc1", domain.AuditStatusReclaimed) {
+		t.Error("the reclaim was not audited")
+	}
+}
+
+func TestAutoSendIdleConfirmedHandoutIsNeverReclaimed(t *testing.T) {
+	// The agent went to working after the send, which is proof the hand-out
+	// landed. Its [-] must survive every later sweep — including the sweeps
+	// after the agent finishes and parks again, which is why confirmation is a
+	// latch and not a status poll.
+	h, taskFile := autoSendFixture(t, "agent-rc2", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc2")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+
+	h.push("agent-rc2", "working")
+	waitFor(t, 3*time.Second, func() bool {
+		rs := openHandouts(t, h)
+		return len(rs) == 1 && !rs[0].ConfirmedAt.IsZero()
+	})
+
+	// Agent parks again with the task still [-] (it never ran `hap task done`).
+	backdateHandouts(t, h, 2*reclaimGrace) // no-op: only unconfirmed rows move
+	h.daemon.autoSendIdleTasks(ctx, agents)
+
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 0 })
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [-] step two") {
+		t.Errorf("a confirmed hand-out was reclaimed; the file must still read [-]:\n%s", got)
+	}
+	if n := len(h.herdr.sentInputs()); n != 1 {
+		t.Errorf("a confirmed task was resent (%d sends)", n)
+	}
+}
+
+func TestAutoSendIdleReclaimIgnoresForeignInProgressItems(t *testing.T) {
+	// Safety invariant: only a [-] the daemon has a ledger row for may be
+	// released. An operator's (or an agent's own) in-progress mark has no row
+	// and must never be cleared — doing so would re-hand out work underway.
+	h, taskFile := autoSendFixture(t, "agent-rc3", "- [-] somebody else is on this\n- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc3")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	backdateHandouts(t, h, 2*reclaimGrace)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] step two")
+	})
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [-] somebody else is on this") {
+		t.Errorf("the reclaim cleared a [-] the daemon never reserved:\n%s", got)
+	}
+}
+
+func TestAutoSendIdleReclaimHonorsGraceWindow(t *testing.T) {
+	// A hand-out inside the grace window is left alone: the send may still be
+	// landing, and reclaiming it would race a delivery that is about to work.
+	h, taskFile := autoSendFixture(t, "agent-rc4", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc4")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+
+	h.daemon.autoSendIdleTasks(ctx, agents) // fresh reservation, not yet aged
+
+	// Give a would-be reclaim + resend time to happen before asserting it did not.
+	time.Sleep(500 * time.Millisecond)
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [-] step two") {
+		t.Errorf("a hand-out inside the grace window was reclaimed:\n%s", got)
+	}
+	if n := len(h.herdr.sentInputs()); n != 1 {
+		t.Errorf("expected no resend inside the grace window, got %d sends", n)
+	}
+}
+
+func TestAutoSendIdleReclaimSkipsWorkingAgent(t *testing.T) {
+	// A hand-out whose agent is busy right now may be exactly what it is busy
+	// with. Even unconfirmed and past the grace window, it is left alone —
+	// missing a confirmation must never re-open live work.
+	h, taskFile := autoSendFixture(t, "agent-rc5", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc5")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	backdateHandouts(t, h, 2*reclaimGrace)
+
+	busy := []domain.AgentTransition{{
+		AgentID: "agent-rc5", PaneID: "agent-rc5", AgentType: "claude", Status: "working",
+	}}
+	h.herdr.setAgents(busy)
+	h.daemon.autoSendIdleTasks(ctx, busy)
+
+	if rs := openHandouts(t, h); len(rs) != 1 {
+		t.Fatalf("a working agent's hand-out was retired: %d rows left", len(rs))
+	}
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [-] step two") {
+		t.Errorf("a working agent's task was reclaimed:\n%s", got)
+	}
+}
+
+func TestAutoSendIdleHandoutCapEscalatesInsteadOfResending(t *testing.T) {
+	// Reclaiming is unbounded on its own: a task that can never be delivered
+	// would be resent every sweep forever. After maxTaskHandouts unstarted
+	// hand-outs the item is LEFT [-] (so it drops out of the pending list) and
+	// the operator is asked instead.
+	h, taskFile := autoSendFixture(t, "agent-rc6", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc6")
+	ctx := context.Background()
+
+	for i := 1; i <= maxTaskHandouts; i++ {
+		h.daemon.autoSendIdleTasks(ctx, agents)
+		want := i
+		waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == want })
+		if n := len(h.herdr.sentInputs()); n != want {
+			t.Fatalf("hand-out %d: got %d sends, want %d", i, n, want)
+		}
+		waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+		backdateHandouts(t, h, 2*reclaimGrace)
+	}
+
+	// The ceiling sweep: no fourth send, the item stays [-], operator asked.
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 0 })
+
+	if n := len(h.herdr.sentInputs()); n != maxTaskHandouts {
+		t.Errorf("task was handed out %d times; the cap is %d", n, maxTaskHandouts)
+	}
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [-] step two") {
+		t.Errorf("a capped task must stay [-] so it is not resent:\n%s", got)
+	}
+	open, err := h.raw.PendingEscalations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range open {
+		if strings.HasPrefix(e.Action, domain.AuditActionTaskNeverStartedPrefix) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no never-started escalation was raised; pending: %+v", open)
+	}
+}
+
+func TestAutoSendIdleOneUnconfirmedHandoutPerAgent(t *testing.T) {
+	// Regression on the reclaim design itself: confirmation is per AGENT (a
+	// "working" transition says nothing about WHICH task), so an agent must not
+	// be handed a second task while the first is unconfirmed. Otherwise one
+	// resumption confirms BOTH rows, and the task the agent never received
+	// stays [-] forever — the exact stranding this feature exists to undo.
+	h, taskFile := autoSendFixture(t, "agent-rc7", "- [ ] step two\n- [ ] step three\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc7")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+
+	// Still idle, still unconfirmed, still inside the grace window.
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	time.Sleep(500 * time.Millisecond)
+
+	if n := len(h.herdr.sentInputs()); n != 1 {
+		t.Errorf("agent got %d hand-outs while the first was unconfirmed; want 1", n)
+	}
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [ ] step three") {
+		t.Errorf("a second task was reserved on top of an unconfirmed hand-out:\n%s", got)
+	}
+}
+
+func TestAutoSendIdleReclaimsWhenPaneWasRecycled(t *testing.T) {
+	// herdr reuses compact pane ids, and an agent id IS a pane id. A hand-out
+	// whose agent id now belongs to a DIFFERENT terminal was made to a tenant
+	// that no longer exists, so a busy successor must not pin it: without the
+	// identity check the item would sit [-] indefinitely, never aging toward a
+	// reclaim or the escalation ceiling.
+	h, taskFile := autoSendFixture(t, "agent-rc8", "- [ ] step two\n", true)
+	agents := parkIdleOnTerminal(h, "agent-rc8", "term-1")
+	h.herdr.setPaneInfo(domain.PaneInfo{TerminalID: "term-1"})
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	if got := openHandouts(t, h)[0].TerminalID; got != "term-1" {
+		t.Fatalf("hand-out recorded terminal %q, want term-1", got)
+	}
+	backdateHandouts(t, h, 2*reclaimGrace)
+
+	// A new agent recycled onto the same pane id, hard at work on its own thing.
+	successor := []domain.AgentTransition{{
+		AgentID: "agent-rc8", PaneID: "agent-rc8", TerminalID: "term-2",
+		AgentType: "claude", Status: "working",
+	}}
+	h.herdr.setAgents(successor)
+	h.daemon.autoSendIdleTasks(ctx, successor)
+
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 0 })
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [ ] step two") {
+		t.Errorf("a hand-out to a terminal that is gone was not reclaimed:\n%s", got)
+	}
+}
+
+func TestAutoSendIdleRecycledPaneCannotConfirmItsPredecessorsHandout(t *testing.T) {
+	// The confirm side of the same identity rule: a fresh agent on a recycled
+	// pane id doing any work must not stamp the PREVIOUS tenant's untaken
+	// hand-out as delivered, which would strand it permanently.
+	h, taskFile := autoSendFixture(t, "agent-rc9", "- [ ] step two\n", true)
+	agents := parkIdleOnTerminal(h, "agent-rc9", "term-1")
+	h.herdr.setPaneInfo(domain.PaneInfo{TerminalID: "term-1"})
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+
+	h.events.ch <- domain.AgentTransition{
+		AgentID: "agent-rc9", PaneID: "agent-rc9", TerminalID: "term-2",
+		AgentType: "claude", Status: "working",
+	}
+	// Let the transition be processed, then assert it did NOT confirm.
+	time.Sleep(500 * time.Millisecond)
+	rs := openHandouts(t, h)
+	if len(rs) != 1 {
+		t.Fatalf("expected the hand-out row to survive, got %d rows", len(rs))
+	}
+	if !rs[0].ConfirmedAt.IsZero() {
+		t.Fatal("a successor terminal confirmed its predecessor's hand-out; the task would be stranded")
+	}
+
+	// And it is therefore still reclaimable.
+	backdateHandouts(t, h, 2*reclaimGrace)
+	h.daemon.autoSendIdleTasks(ctx, parkIdleOnTerminal(h, "agent-rc9", "term-2"))
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [ ] step two") ||
+			strings.Contains(readTasks(t, taskFile), "- [-] step two")
+	})
+	if len(openHandouts(t, h)) == 1 && !openHandouts(t, h)[0].ConfirmedAt.IsZero() {
+		t.Error("the stale hand-out was confirmed rather than reclaimed")
+	}
+}
+
+func TestAutoSendIdleReclaimsWhenTheAgentIsGone(t *testing.T) {
+	// An agent that vanished from herdr's listing cannot resume, so its untaken
+	// task must go back to the pool for whoever is left.
+	h, taskFile := autoSendFixture(t, "agent-rc10", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc10")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	backdateHandouts(t, h, 2*reclaimGrace)
+
+	h.herdr.setAgents(nil)
+	h.daemon.autoSendIdleTasks(ctx, nil)
+
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 0 })
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [ ] step two") {
+		t.Errorf("a departed agent's task was not returned to the pool:\n%s", got)
+	}
+}
+
+func TestAutoSendIdleConfirmationResetsTheHandoutBudget(t *testing.T) {
+	// The attempt counter must not accumulate across healthy hand-outs, or an
+	// agent that has simply been given many tasks would eventually escalate on
+	// a task it never failed. A confirmed hand-out clears the count.
+	h, _ := autoSendFixture(t, "agent-rc11", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc11")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	row := openHandouts(t, h)[0]
+	if n, err := h.raw.TaskHandoutAttempts(ctx, row.SourcePath, row.TaskText); err != nil || n != 1 {
+		t.Fatalf("attempts after one hand-out = %d (err %v), want 1", n, err)
+	}
+
+	// The agent takes it up, then the sweep retires the confirmed row.
+	h.push("agent-rc11", "working")
+	waitFor(t, 3*time.Second, func() bool {
+		rs := openHandouts(t, h)
+		return len(rs) == 1 && !rs[0].ConfirmedAt.IsZero()
+	})
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 0 })
+
+	n, err := h.raw.TaskHandoutAttempts(ctx, row.SourcePath, row.TaskText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("attempts after a confirmed hand-out = %d, want 0 — the budget must reset "+
+			"or a healthy agent eventually escalates on a task it never failed", n)
+	}
+}
+
+func TestAutoSendIdleUnsettleableHandoutStopsBenchingItsAgent(t *testing.T) {
+	// An open hand-out bars its agent from every pairing, so a row no sweep can
+	// settle — here a task source that stopped being readable — would bench
+	// that agent forever. Past staleHandoutTTL the daemon gives up on the row
+	// and the agent goes back to work; the [-] is left for the operator, which
+	// is where this feature stood before the ledger existed.
+	h, taskFile := autoSendFixture(t, "agent-rc12", "- [ ] step two\n- [ ] step three\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc12")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+
+	// The source becomes unreadable, so the reclaim can never resolve the row.
+	if err := os.Remove(taskFile); err != nil {
+		t.Fatal(err)
+	}
+	backdateHandouts(t, h, 2*reclaimGrace)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	if len(openHandouts(t, h)) != 1 {
+		t.Fatal("an unreadable source must not have its hand-out retired early")
+	}
+
+	backdateHandouts(t, h, 2*staleHandoutTTL)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 0 })
+}
+
+// ledgerFailingStore makes the hand-out ledger read fail on demand, so a test
+// can drive the sweep's fail-closed path without racing the daemon's startup
+// reads (the wrapper is installed before Run, per newHarnessCore).
+type ledgerFailingStore struct {
+	ports.StorePort
+	mu   sync.Mutex
+	fail bool
+}
+
+func (s *ledgerFailingStore) setFail(v bool) { s.mu.Lock(); s.fail = v; s.mu.Unlock() }
+
+func (s *ledgerFailingStore) OpenTaskReservations(ctx context.Context) ([]domain.TaskReservation, error) {
+	s.mu.Lock()
+	fail := s.fail
+	s.mu.Unlock()
+	if fail {
+		return nil, errors.New("ledger unavailable")
+	}
+	return s.StorePort.OpenTaskReservations(ctx)
+}
+
+func TestAutoSendIdleStandsDownWhenTheLedgerCannotBeRead(t *testing.T) {
+	// Fail CLOSED on an unreadable ledger. The sweep cannot see which agents
+	// already hold an unconfirmed hand-out, and pairing blind would give one a
+	// second task; a later "working" transition then confirms BOTH rows, leaving
+	// the untaken first [-] forever — the stranding this whole feature undoes.
+	// A skipped sweep costs a minute; a stranded task costs a human.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(taskFile, []byte("- [ ] step two\n- [ ] step three\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\nenable_auto_send_task_when_idle = true\n",
+		"agent-rc13", taskFile)
+	var gate *ledgerFailingStore
+	fl := &fakeLLM{}
+	h := newHarnessCore(t, cfg, nil, fl, fl, func(inner ports.StorePort) ports.StorePort {
+		gate = &ledgerFailingStore{StorePort: inner}
+		return gate
+	})
+	h.herdr.setPane(autoSendIdlePane)
+	h.seedAutonomous(autoSendIdlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc13")
+	ctx := context.Background()
+
+	gate.setFail(true)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+
+	quietFor(t, h, 500*time.Millisecond)
+	if got := readTasks(t, taskFile); strings.Contains(got, "[-]") {
+		t.Errorf("a task was handed out while the ledger was unreadable:\n%s", got)
+	}
+
+	// The ledger comes back; the sweep resumes normally.
+	gate.setFail(false)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+}
+
+func TestAutoSendIdleLeavesAnAmbiguousDuplicateAlone(t *testing.T) {
+	// A checklist repeating one task text: the reserved copy was completed while
+	// ANOTHER copy sits [-] under somebody else. The reclaim cannot prove which
+	// copy was its own, so it must release neither — clearing the wrong one would
+	// re-hand out work already underway.
+	h, taskFile := autoSendFixture(t, "agent-rc14", "- [ ] repeat me\n- [ ] repeat me\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-rc14")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] repeat me\n- [ ] repeat me")
+	})
+
+	// The daemon reserved #1. The operator completes #1 and starts #2 themselves.
+	if err := os.WriteFile(taskFile, []byte("- [x] repeat me\n- [-] repeat me\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backdateHandouts(t, h, 2*reclaimGrace)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	time.Sleep(300 * time.Millisecond)
+
+	if got := readTasks(t, taskFile); got != "- [x] repeat me\n- [-] repeat me\n" {
+		t.Errorf("the reclaim touched an ambiguous duplicate it could not prove was its own:\n%s", got)
 	}
 }
