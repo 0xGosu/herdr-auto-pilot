@@ -118,8 +118,10 @@ var SeedHeuristicNeverAutoRules = []NeverAutoRule{
 	seedHeuristic(`(?i)\bforc(e|ed|ibly)\b[^\n]*\b(overwrit|delet|remov|push)`),
 	// Credential / access invalidation.
 	seedHeuristic(`(?i)\b(revok|rotat|invalidat|regenerat)(e[sd]?|ing|ion)\b[^\n]*\b(access|keys?|tokens?|cert(ificate)?s?|credentials?|secrets?|sessions?|passwords?)\b`),
-	// Shipping to shared/production surfaces.
-	seedHeuristic(`(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing)|push(es|ed|ing)?)\b[^\n]*\b(prod|production|live|public)\b`),
+	// Shipping to shared/production surfaces. The public target is a phrase
+	// ("public registry/repository"), not the bare word, so ordinary branch
+	// and identifier names (feat/public, publicapi) stay benign.
+	seedHeuristic(`(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing))\b[^\n]*(\b(prod|production|live)\b|\bpublic\s+(registr(y|ies)|repositor(y|ies))\b)`),
 	// Discarding work.
 	seedHeuristic(`(?i)\b(overwrit(e[sd]?|ing)|clobber(s|ed|ing)?|discard(s|ed|ing)?)\b[^\n]*\b(changes|data|history|work)\b`),
 	// A confirmation that itself names a destructive act (same bounded
