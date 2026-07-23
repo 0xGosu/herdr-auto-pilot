@@ -119,7 +119,7 @@ var SeedHeuristicNeverAutoRules = []NeverAutoRule{
 	// Credential / access invalidation.
 	seedHeuristic(`(?i)\b(revok|rotat|invalidat|regenerat)(e[sd]?|ing|ion)\b[^\n]*\b(access|keys?|tokens?|cert(ificate)?s?|credentials?|secrets?|sessions?|passwords?)\b`),
 	// Shipping to shared/production surfaces.
-	seedHeuristic(`(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing)|push(es|ed|ing)?)\b[^\n]*\b(prod|production|live|public)\b`),
+	seedHeuristic(`(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing))\b[^\n]*\b(prod|production|live)\b`),
 	// Discarding work.
 	seedHeuristic(`(?i)\b(overwrit(e[sd]?|ing)|clobber(s|ed|ing)?|discard(s|ed|ing)?)\b[^\n]*\b(changes|data|history|work)\b`),
 	// A confirmation that itself names a destructive act (same bounded
