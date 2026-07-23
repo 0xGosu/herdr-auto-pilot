@@ -1969,3 +1969,39 @@ func TestTaskSourceAddMaxTasks(t *testing.T) {
 		t.Errorf("a refused add must not register a source, got %+v", saved.TaskSources)
 	}
 }
+
+// TestConfigShowsEnvKeysNeverValues pins the secrecy rule for the per-command
+// LLM environment: `hap config` names the variables and the .env file so the
+// operator can debug the wiring, but the values are API keys and must never
+// reach the terminal.
+func TestConfigShowsEnvKeysNeverValues(t *testing.T) {
+	app, _ := testApp(t)
+	cfg := config.Default()
+	cfg.LLM.Command = []string{"claude", "-p", "hi"}
+	cfg.LLM.Env = map[string]string{"ANTHROPIC_BASE_URL": "https://proxy.example.test"}
+	cfg.LLM.CommandEnv = map[string]string{"ANTHROPIC_API_KEY": "sk-ant-supersecret"}
+	cfg.LLM.GenerateTaskEnvFile = "/etc/hap/taskgen.env"
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"ANTHROPIC_BASE_URL",    // shared key name
+		"ANTHROPIC_API_KEY",     // per-command key name
+		"/etc/hap/taskgen.env",  // the file path is not a secret
+		"task_generate_command", // the scope it belongs to
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("config output missing %q:\n%s", want, out)
+		}
+	}
+	for _, secret := range []string{"sk-ant-supersecret", "https://proxy.example.test"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("config output leaked an env VALUE (%q):\n%s", secret, out)
+		}
+	}
+}

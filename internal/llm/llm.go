@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,14 @@ type Adapter struct {
 	DBPath               string
 	ControlPath          string
 	Store                ports.ReadStore
+	// BaseEnv is the environment shared by every command template; the
+	// per-command specs below layer on top of it (see buildEnv).
+	BaseEnv EnvSpec
+	// CommandEnv / CommandStartEnv are the environments for their matching
+	// consult templates. The env travels WITH the template through the
+	// fast-fail retry, so a rescue run never gets the other command's keys.
+	CommandEnv      EnvSpec
+	CommandStartEnv EnvSpec
 	// SelfPath overrides the {self} placeholder (defaults to os.Executable).
 	SelfPath string
 	// TaskGenTemplate is the argv template for the one-shot idle task
@@ -52,6 +61,10 @@ type Adapter struct {
 	TaskGenStartTemplate []string
 	// TaskGenTimeout bounds one task-generation run (<=0 falls back to Timeout).
 	TaskGenTimeout time.Duration
+	// TaskGenEnv / TaskGenStartEnv are the environments for their matching
+	// task-generation templates, layered over BaseEnv.
+	TaskGenEnv      EnvSpec
+	TaskGenStartEnv EnvSpec
 }
 
 // Configured reports whether an LLM CLI is configured (IR-005).
@@ -109,10 +122,13 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 	}
 	// The first consult for an agent prefers command_start when configured;
 	// the other template is the fast-fail fallback and, absent a start
-	// template, First simply reuses the base command.
-	primary, alt := a.CommandTemplate, a.CommandStartTemplate
+	// template, First simply reuses the base command. Each template carries
+	// its own environment so a retry cannot mix one command's argv with the
+	// other's credentials.
+	primary := commandSpec{argv: a.CommandTemplate, env: a.CommandEnv}
+	alt := commandSpec{argv: a.CommandStartTemplate, env: a.CommandStartEnv}
 	if req.First && len(a.CommandStartTemplate) > 0 {
-		primary, alt = a.CommandStartTemplate, a.CommandTemplate
+		primary, alt = alt, primary
 	}
 
 	timeout := a.Timeout
@@ -131,7 +147,10 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 	// parent context is already cancelled (shutdown makes every run "fail
 	// fast") or the alternate is absent / identical.
 	var retryErr error
-	if att.fastFailed() && ctx.Err() == nil && len(alt) > 0 && !slices.Equal(alt, primary) {
+	// An alternate that is identical in BOTH argv and environment would just
+	// repeat the same failure; one that differs in either is worth a try (the
+	// two templates can share an argv and differ only in key or model).
+	if att.fastFailed() && ctx.Err() == nil && len(alt.argv) > 0 && !alt.sameAs(primary) {
 		altAtt, rerr := a.runConsult(ctx, alt, self, req, timeout)
 		switch {
 		case rerr != nil:
@@ -169,31 +188,68 @@ func (a *Adapter) resolveSelf() (string, error) {
 	return self, nil
 }
 
+// consultReplacer builds the placeholder expander shared by the argv template
+// and the configured environment values, so the two can never drift apart.
+func (a *Adapter) consultReplacer(self string, req domain.LLMRequest) *strings.Replacer {
+	return strings.NewReplacer(
+		"{self}", self,
+		"{request_id}", req.RequestID,
+		"{db}", a.DBPath,
+		"{control}", a.ControlPath,
+		"{agent_name}", req.AgentName,
+	)
+}
+
+// commandSpec pairs one argv template with the environment configured for it,
+// so the two travel together through Consult's primary/alternate swap.
+type commandSpec struct {
+	argv []string
+	env  EnvSpec
+}
+
+// sameAs reports whether two specs would run the same command with the same
+// environment — in which case retrying one after the other is pointless.
+func (s commandSpec) sameAs(other commandSpec) bool {
+	return slices.Equal(s.argv, other.argv) &&
+		strings.TrimSpace(s.env.File) == strings.TrimSpace(other.env.File) &&
+		maps.Equal(s.env.Vars, other.env.Vars)
+}
+
 // runConsult runs one CLI attempt with the given template and reports the
 // outcome. It never re-stages the request (the daemon already did); it only
 // launches the CLI and reads back whatever decision was staged.
-func (a *Adapter) runConsult(ctx context.Context, tmpl []string, self string, req domain.LLMRequest, timeout time.Duration) (*consultAttempt, error) {
-	argv := make([]string, len(tmpl))
-	for i, arg := range tmpl {
-		arg = strings.ReplaceAll(arg, "{self}", self)
-		arg = strings.ReplaceAll(arg, "{request_id}", req.RequestID)
-		arg = strings.ReplaceAll(arg, "{db}", a.DBPath)
-		arg = strings.ReplaceAll(arg, "{control}", a.ControlPath)
-		arg = strings.ReplaceAll(arg, "{agent_name}", req.AgentName)
-		argv[i] = arg
+func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string, req domain.LLMRequest, timeout time.Duration) (*consultAttempt, error) {
+	repl := a.consultReplacer(self, req)
+	argv := make([]string, len(spec.argv))
+	for i, arg := range spec.argv {
+		argv[i] = repl.Replace(arg)
 	}
 	// Auto-repair known CLI misconfigurations (e.g. claude's prompt placed
 	// after other flags) so a slightly-off operator config still works.
 	argv = NormalizeLLMCommand(argv)
 
-	if err := preflight(argv[0]); err != nil {
+	// The operator's environment is composed FIRST: an unreadable env file
+	// must fail the run rather than launch the CLI without its credentials,
+	// and the command is resolved against the child's PATH, which this env
+	// may redefine. The HAP_* variables are injected last and always win.
+	env, err := buildEnv(a.BaseEnv, spec.env, repl,
+		"HAP_REQUEST_ID="+req.RequestID,
+		"HAP_DB_PATH="+a.DBPath,
+		"HAP_CONTROL_PATH="+a.ControlPath,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	bin, err := preflight(argv[0], env)
+	if err != nil {
 		return nil, err
 	}
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
+	cmd := exec.CommandContext(runCtx, bin, argv[1:]...)
 	cmd.Dir = a.WorkDir()
 	// After the timeout kills the CLI, don't wait on lingering
 	// grandchildren holding the output pipes open — fail safe promptly.
@@ -201,11 +257,7 @@ func (a *Adapter) runConsult(ctx context.Context, tmpl []string, self string, re
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
-	cmd.Env = append(os.Environ(),
-		"HAP_REQUEST_ID="+req.RequestID,
-		"HAP_DB_PATH="+a.DBPath,
-		"HAP_CONTROL_PATH="+a.ControlPath,
-	)
+	cmd.Env = env
 	started := time.Now()
 	runErr := cmd.Run()
 	elapsed := time.Since(started)
@@ -255,19 +307,34 @@ func dirLives(dir string) bool {
 	return err == nil && fi.IsDir()
 }
 
-// preflight verifies the CLI is runnable before spawning. The daemon's PATH
-// can be narrower than the operator's shell (GUI- or hook-launched); surface
-// that as itself instead of a bare exit error. A command containing a
-// separator never consults PATH, so it gets a message that doesn't
-// misdiagnose a missing file as a PATH problem.
-func preflight(argv0 string) error {
+// preflight verifies the CLI is runnable before spawning and returns the path
+// to run. The daemon's PATH can be narrower than the operator's shell (GUI- or
+// hook-launched); surface that as itself instead of a bare exit error. A
+// command containing a separator never consults PATH, so it gets a message
+// that doesn't misdiagnose a missing file as a PATH problem.
+//
+// The lookup uses the CHILD's environment, not the daemon's: a command may
+// configure its own PATH, and `exec.Command` would otherwise resolve the name
+// against the daemon's — rejecting a CLI the child could find, or resolving
+// one the child's PATH doesn't have. Passing the resolved path back to exec is
+// what makes the configured PATH take effect.
+func preflight(argv0 string, env []string) (string, error) {
+	resolved, err := lookPathIn(env, argv0)
+	if err != nil {
+		return "", fmt.Errorf("llm command %q not found in PATH (the daemon's PATH, or this command's configured PATH, may differ from your shell): %w", argv0, err)
+	}
+	if resolved != "" {
+		return resolved, nil
+	}
+	// Either a path with a separator, or a PATH entry we chose not to resolve
+	// ourselves — check runnability and let exec do the rest.
 	if _, err := exec.LookPath(argv0); err != nil {
 		if strings.ContainsRune(argv0, os.PathSeparator) {
-			return fmt.Errorf("llm command %q not runnable: %w", argv0, err)
+			return "", fmt.Errorf("llm command %q not runnable: %w", argv0, err)
 		}
-		return fmt.Errorf("llm command %q not found in PATH (the daemon's PATH may differ from your shell): %w", argv0, err)
+		return "", fmt.Errorf("llm command %q not found in PATH (the daemon's PATH may differ from your shell): %w", argv0, err)
 	}
-	return nil
+	return argv0, nil
 }
 
 func truncate(s string, n int) string {

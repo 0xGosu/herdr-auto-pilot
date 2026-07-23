@@ -10,6 +10,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -167,6 +169,50 @@ type LLM struct {
 	// GenerateTaskTimeoutSeconds bounds one task-generation run; zero or
 	// omitted inherits timeout_seconds.
 	GenerateTaskTimeoutSeconds int `toml:"task_generate_timeout_seconds,omitempty"`
+
+	// ── Per-command environment ──────────────────────────────────────
+	// Each of the four command templates can carry its own environment, so
+	// one CLI can run against a different provider/model/key than another.
+	// Values may be listed inline (`*_env` tables) or kept out of the config
+	// in a `.env` file (`*_env_file`), which is the right home for secrets:
+	// the file is read when the CLI is SPAWNED, never at load time, so Save
+	// can never copy its contents into config.toml and an edit applies to
+	// the next run without a restart. A configured-but-unreadable file fails
+	// the run (escalation) rather than silently launching without its key.
+	//
+	// Layering, last wins: the daemon's own environment, then EnvFile, Env
+	// (the shared base, applied to all four commands), then the command's
+	// own *EnvFile and *Env. hap's HAP_* variables are always injected last.
+	// Values support the same placeholders as the command template, minus
+	// {pane_excerpt} (untrusted pane text is never put in the environment).
+	//
+	// EnvFile is the shared `.env` file applied to every command; `~/` is
+	// expanded, and a relative path resolves against the daemon's cwd.
+	EnvFile string `toml:"env_file,omitempty"`
+	// CommandEnvFile is the `.env` file for Command only.
+	CommandEnvFile string `toml:"command_env_file,omitempty"`
+	// CommandStartEnvFile is the `.env` file for CommandStart only.
+	CommandStartEnvFile string `toml:"command_start_env_file,omitempty"`
+	// GenerateTaskEnvFile is the `.env` file for GenerateTaskCommand only.
+	GenerateTaskEnvFile string `toml:"task_generate_command_env_file,omitempty"`
+	// GenerateTaskStartEnvFile is the `.env` file for
+	// GenerateTaskCommandStart only.
+	GenerateTaskStartEnvFile string `toml:"task_generate_command_start_env_file,omitempty"`
+
+	// Env is the shared inline environment applied to every command.
+	// Map fields are declared last: the TOML encoder emits sub-tables after
+	// the scalars of their parent table, and keeping the declaration order
+	// aligned with the emitted order keeps a re-saved config readable.
+	Env map[string]string `toml:"env,omitempty"`
+	// CommandEnv is the inline environment for Command only.
+	CommandEnv map[string]string `toml:"command_env,omitempty"`
+	// CommandStartEnv is the inline environment for CommandStart only.
+	CommandStartEnv map[string]string `toml:"command_start_env,omitempty"`
+	// GenerateTaskEnv is the inline environment for GenerateTaskCommand only.
+	GenerateTaskEnv map[string]string `toml:"task_generate_command_env,omitempty"`
+	// GenerateTaskStartEnv is the inline environment for
+	// GenerateTaskCommandStart only.
+	GenerateTaskStartEnv map[string]string `toml:"task_generate_command_start_env,omitempty"`
 }
 
 // Embedding configures semantic signature matching: situations are matched
@@ -872,6 +918,50 @@ func (c *Config) fillZeroes() {
 	if c.Embedding.BM25MinScore <= 0 || c.Embedding.BM25MinScore > 1 {
 		c.Embedding.BM25MinScore = d.Embedding.BM25MinScore
 	}
+}
+
+// LLMEnvSummary describes the environment configured for ONE command, with
+// the values deliberately left out: these hold API keys and tokens, so
+// anything operator-facing (`hap config`, the TUI) shows key NAMES only. The
+// file path is included — it is not itself a secret and the operator needs it
+// to debug — but its contents are never read for display.
+type LLMEnvSummary struct {
+	// Scope names the command the environment belongs to ("shared" for the
+	// base applied to all four).
+	Scope string
+	// Keys are the inline variable NAMES, sorted. Never their values.
+	Keys []string
+	// File is the configured `.env` path, or "" when none is set.
+	File string
+}
+
+// EnvSummaries reports the configured per-command environments, omitting the
+// scopes that configure nothing. See LLMEnvSummary: values are never included.
+func (l LLM) EnvSummaries() []LLMEnvSummary {
+	scopes := []struct {
+		name string
+		vars map[string]string
+		file string
+	}{
+		{"shared", l.Env, l.EnvFile},
+		{"command", l.CommandEnv, l.CommandEnvFile},
+		{"command_start", l.CommandStartEnv, l.CommandStartEnvFile},
+		{"task_generate_command", l.GenerateTaskEnv, l.GenerateTaskEnvFile},
+		{"task_generate_command_start", l.GenerateTaskStartEnv, l.GenerateTaskStartEnvFile},
+	}
+	var out []LLMEnvSummary
+	for _, s := range scopes {
+		if len(s.vars) == 0 && strings.TrimSpace(s.file) == "" {
+			continue
+		}
+		keys := make([]string, 0, len(s.vars))
+		for k := range s.vars {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		out = append(out, LLMEnvSummary{Scope: s.name, Keys: keys, File: s.file})
+	}
+	return out
 }
 
 // LLMTimeout returns the configured LLM timeout as a duration.

@@ -1530,3 +1530,113 @@ func TestSampleConfigParsesWithDocumentedDefaults(t *testing.T) {
 			cfg.TUI.TerminalBell, def.TUI.TerminalBell)
 	}
 }
+
+func TestLLMCommandEnvRoundTrip(t *testing.T) {
+	// Every command carries its own environment; a Save must preserve all of
+	// them and must not disturb the scalar keys of the [llm] table (the TOML
+	// encoder emits sub-tables after scalars — this pins that).
+	path := filepath.Join(t.TempDir(), "config.toml")
+	cfg := Default()
+	cfg.LLM.Command = []string{"claude", "-p", "hi"}
+	cfg.LLM.TimeoutSeconds = 120
+	cfg.LLM.EnvFile = "~/.config/hap/llm.env"
+	cfg.LLM.Env = map[string]string{"ANTHROPIC_BASE_URL": "https://example.test"}
+	cfg.LLM.CommandEnvFile = "/etc/hap/consult.env"
+	cfg.LLM.CommandEnv = map[string]string{"ANTHROPIC_MODEL": "opus"}
+	cfg.LLM.CommandStartEnvFile = "/etc/hap/start.env"
+	cfg.LLM.CommandStartEnv = map[string]string{"ANTHROPIC_MODEL": "sonnet"}
+	cfg.LLM.GenerateTaskEnvFile = "/etc/hap/taskgen.env"
+	cfg.LLM.GenerateTaskEnv = map[string]string{"ANTHROPIC_MODEL": "haiku"}
+	cfg.LLM.GenerateTaskStartEnvFile = "/etc/hap/taskgen_start.env"
+	cfg.LLM.GenerateTaskStartEnv = map[string]string{"ANTHROPIC_MODEL": "haiku-start"}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LLM.TimeoutSeconds != 120 || len(got.LLM.Command) != 3 {
+		t.Fatalf("scalar [llm] keys corrupted by the env sub-tables: %+v", got.LLM)
+	}
+	for _, tc := range []struct {
+		name  string
+		file  string
+		vars  map[string]string
+		wantF string
+		wantV string
+	}{
+		{"shared", got.LLM.EnvFile, got.LLM.Env, "~/.config/hap/llm.env", "https://example.test"},
+		{"command", got.LLM.CommandEnvFile, got.LLM.CommandEnv, "/etc/hap/consult.env", "opus"},
+		{"command_start", got.LLM.CommandStartEnvFile, got.LLM.CommandStartEnv, "/etc/hap/start.env", "sonnet"},
+		{"task_generate", got.LLM.GenerateTaskEnvFile, got.LLM.GenerateTaskEnv, "/etc/hap/taskgen.env", "haiku"},
+		{"task_generate_start", got.LLM.GenerateTaskStartEnvFile, got.LLM.GenerateTaskStartEnv, "/etc/hap/taskgen_start.env", "haiku-start"},
+	} {
+		if tc.file != tc.wantF {
+			t.Errorf("%s env file = %q, want %q", tc.name, tc.file, tc.wantF)
+		}
+		if len(tc.vars) != 1 {
+			t.Errorf("%s env vars = %v, want one entry", tc.name, tc.vars)
+			continue
+		}
+		for _, v := range tc.vars {
+			if v != tc.wantV {
+				t.Errorf("%s env value = %q, want %q", tc.name, v, tc.wantV)
+			}
+		}
+	}
+}
+
+func TestLLMEnvKeysAbsentByDefault(t *testing.T) {
+	// The feature is opt-in: an untouched config gains no env keys on save.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := Save(path, Default()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"env_file", "[llm.env]", "command_env", "task_generate_command_env"} {
+		if strings.Contains(string(data), key) {
+			t.Errorf("default config emitted %q:\n%s", key, data)
+		}
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summaries := got.LLM.EnvSummaries(); len(summaries) != 0 {
+		t.Errorf("summaries = %+v, want none for a default config", summaries)
+	}
+}
+
+func TestLLMEnvSummariesHideValues(t *testing.T) {
+	cfg := Default()
+	cfg.LLM.Env = map[string]string{"ANTHROPIC_BASE_URL": "https://example.test"}
+	cfg.LLM.CommandEnv = map[string]string{"ZZZ_TOKEN": "s3cret", "AAA_KEY": "s3cret"}
+	cfg.LLM.CommandEnvFile = "/etc/hap/consult.env"
+	cfg.LLM.GenerateTaskStartEnvFile = "/etc/hap/taskgen_start.env"
+
+	got := cfg.LLM.EnvSummaries()
+	if len(got) != 3 {
+		t.Fatalf("summaries = %+v, want only the three configured scopes", got)
+	}
+	if got[0].Scope != "shared" || got[1].Scope != "command" || got[2].Scope != "task_generate_command_start" {
+		t.Errorf("scopes = %+v, want them in command order", got)
+	}
+	if len(got[1].Keys) != 2 || got[1].Keys[0] != "AAA_KEY" || got[1].Keys[1] != "ZZZ_TOKEN" {
+		t.Errorf("command keys = %v, want them sorted", got[1].Keys)
+	}
+	if got[1].File != "/etc/hap/consult.env" {
+		t.Errorf("command file = %q, want the configured path", got[1].File)
+	}
+	if len(got[2].Keys) != 0 {
+		t.Errorf("file-only scope reported keys: %v", got[2].Keys)
+	}
+	// The whole point: no value may appear anywhere in a summary.
+	if strings.Contains(fmt.Sprintf("%+v", got), "s3cret") ||
+		strings.Contains(fmt.Sprintf("%+v", got), "https://example.test") {
+		t.Errorf("summary leaked a value: %+v", got)
+	}
+}

@@ -1865,6 +1865,15 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "llm.task_generate_command"},            // argv template (idle task suggestion)
 	{Key: "llm.task_generate_command_start"},      // argv template (first generation; inherits task_generate_command)
 	{Key: "llm.task_generate_timeout_seconds", TUIEditable: true},
+	// Only the `.env` PATHS are registered. The inline `[llm.*_env]` tables
+	// hold API keys, and every key in this registry is rendered by the TUI
+	// and `config fields`, so they stay config.toml-only; `hap config`
+	// summarizes them by name. A path is not a secret.
+	{Key: "llm.env_file", TUIEditable: true},
+	{Key: "llm.command_env_file", TUIEditable: true},
+	{Key: "llm.command_start_env_file", TUIEditable: true},
+	{Key: "llm.task_generate_command_env_file", TUIEditable: true},
+	{Key: "llm.task_generate_command_start_env_file", TUIEditable: true},
 	{Key: "embedding.disabled", TUIEditable: true},
 	{Key: "embedding.model_path"}, // path
 	{Key: "embedding.similarity_threshold", TUIEditable: true},
@@ -1986,6 +1995,16 @@ func FieldValue(cfg config.Config, key string) string {
 			return "(inherits timeout_seconds)"
 		}
 		return strconv.Itoa(cfg.LLM.GenerateTaskTimeoutSeconds)
+	case "llm.env_file":
+		return envFileValue(cfg.LLM.EnvFile)
+	case "llm.command_env_file":
+		return envFileValue(cfg.LLM.CommandEnvFile)
+	case "llm.command_start_env_file":
+		return envFileValue(cfg.LLM.CommandStartEnvFile)
+	case "llm.task_generate_command_env_file":
+		return envFileValue(cfg.LLM.GenerateTaskEnvFile)
+	case "llm.task_generate_command_start_env_file":
+		return envFileValue(cfg.LLM.GenerateTaskStartEnvFile)
 	case "embedding.disabled":
 		return strconv.FormatBool(cfg.Embedding.Disabled)
 	case "embedding.model_path":
@@ -2157,6 +2176,25 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return nil
 		case "embedding.model_path":
 			cfg.Embedding.ModelPath = value // empty restores the bundled default
+			return nil
+		// The env file paths accept any text (empty, or blank, clears the
+		// file). The path is NOT validated here: the file is read when the
+		// CLI is spawned, so a path that appears later still works, and an
+		// unreadable one fails that run loudly.
+		case "llm.env_file":
+			cfg.LLM.EnvFile = strings.TrimSpace(value)
+			return nil
+		case "llm.command_env_file":
+			cfg.LLM.CommandEnvFile = strings.TrimSpace(value)
+			return nil
+		case "llm.command_start_env_file":
+			cfg.LLM.CommandStartEnvFile = strings.TrimSpace(value)
+			return nil
+		case "llm.task_generate_command_env_file":
+			cfg.LLM.GenerateTaskEnvFile = strings.TrimSpace(value)
+			return nil
+		case "llm.task_generate_command_start_env_file":
+			cfg.LLM.GenerateTaskStartEnvFile = strings.TrimSpace(value)
 			return nil
 		case "embedding.similarity_threshold":
 			return setFloat(&cfg.Embedding.SimilarityThreshold)
@@ -3303,4 +3341,14 @@ func (a *App) ClearData(ctx context.Context) error {
 		return err
 	}
 	return a.nudge(ctx, control.KindReload)
+}
+
+// envFileValue renders a configured `.env` path for the config field
+// registry. Only the PATH is ever shown — the file holds credentials and is
+// never opened for display.
+func envFileValue(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return "(none)"
+	}
+	return path
 }

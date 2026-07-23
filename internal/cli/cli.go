@@ -1028,12 +1028,33 @@ func printConfig(out io.Writer, cfg config.Config) {
 		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries)
 	fmt.Fprintf(out, "llm:        configured=%v timeout=%ds auto_act_confidence_threshold=%d\n",
 		len(cfg.LLM.Command) > 0, cfg.LLM.TimeoutSeconds, cfg.LLM.AutoActConfidenceThreshold)
+	for _, env := range cfg.LLM.EnvSummaries() {
+		// Names and the file path only — these variables carry API keys, so
+		// no value ever reaches an operator-facing surface.
+		fmt.Fprintf(out, "llm env:    %s: %s\n", env.Scope, describeEnvSummary(env))
+	}
 	seedCount := domain.SeedNeverAutoRuleCount()
 	if cfg.Safety.DisableNeverAutoSeedPatterns {
 		seedCount = 0
 	}
 	fmt.Fprintf(out, "task sources: %d, operator never-auto rules: %d (+%d seed)\n",
 		len(cfg.TaskSources), len(cfg.Safety.NeverAutoPatterns)+len(cfg.Safety.NeverAutoRules), seedCount)
+}
+
+// describeEnvSummary renders one command's environment for display. It prints
+// variable NAMES and the `.env` path only: the values are credentials, so they
+// must never reach the terminal (nor a log, nor the audit trail). The file's
+// contents are deliberately not read here — the count of variables it defines
+// is not worth opening a secrets file to display.
+func describeEnvSummary(env config.LLMEnvSummary) string {
+	var parts []string
+	if len(env.Keys) > 0 {
+		parts = append(parts, fmt.Sprintf("%d var(s) [%s]", len(env.Keys), strings.Join(env.Keys, ", ")))
+	}
+	if env.File != "" {
+		parts = append(parts, "file "+env.File)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {

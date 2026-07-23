@@ -2142,40 +2142,45 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 	// One valid sample value per registry key. When you add a field to
 	// frontend.ConfigFields, add a sample here or this test fails loudly.
 	samples := map[string]string{
-		"confidence_thresholds.minimum":           "0.55",
-		"confidence_thresholds.idle":              "0.70",
-		"confidence_thresholds.approval":          "0.85",
-		"confidence_thresholds.choice":            "0.85",
-		"confidence_thresholds.error":             "0.90",
-		"learning.graduation_n":                   "5",
-		"learning.confirmation_weight":            "2.5",
-		"embedding.pane_salient_chars":            "800",
-		"limits.max_consecutive_auto_prompts":     "5",
-		"limits.max_auto_prompts_per_minute":      "10",
-		"limits.max_error_retries":                "2",
-		"safety.disable_never_auto_seed_patterns": "true",
-		"llm.command":                             `claude -p "decide"`,
-		"llm.command_start":                       `claude -p "first: decide"`,
-		"llm.timeout_seconds":                     "60",
-		"llm.auto_act_confidence_threshold":       "70",
-		"llm.pane_excerpt_chars":                  "4000",
-		"llm.enable_rewrite_action":               "true",
-		"llm.rewrite_action_fallback_template":    "Act on: {original_text}",
-		"llm.task_generate_command":               `claude -p "suggest a task"`,
-		"llm.task_generate_command_start":         `claude -p "first suggest a task"`,
-		"llm.task_generate_timeout_seconds":       "45",
-		"embedding.disabled":                      "false",
-		"embedding.model_path":                    "/models/custom.gguf",
-		"embedding.similarity_threshold":          "0.90",
-		"embedding.bm25_min_score":                "0.35",
-		"embedding.model_context_window":          "512",
-		"embedding.embed_timeout_ms":              "8000",
-		"embedding.warm_timeout_ms":               "120000",
-		"tui.max_content_width":                   "140",
-		"tui.max_content_height":                  "12",
-		"tui.theme":                               "dark",
-		"tui.terminal_bell":                       "true",
-		"cli.ai_agent_friendly_output":            "false",
+		"confidence_thresholds.minimum":            "0.55",
+		"confidence_thresholds.idle":               "0.70",
+		"confidence_thresholds.approval":           "0.85",
+		"confidence_thresholds.choice":             "0.85",
+		"confidence_thresholds.error":              "0.90",
+		"learning.graduation_n":                    "5",
+		"learning.confirmation_weight":             "2.5",
+		"embedding.pane_salient_chars":             "800",
+		"limits.max_consecutive_auto_prompts":      "5",
+		"limits.max_auto_prompts_per_minute":       "10",
+		"limits.max_error_retries":                 "2",
+		"safety.disable_never_auto_seed_patterns":  "true",
+		"llm.command":                              `claude -p "decide"`,
+		"llm.command_start":                        `claude -p "first: decide"`,
+		"llm.timeout_seconds":                      "60",
+		"llm.auto_act_confidence_threshold":        "70",
+		"llm.pane_excerpt_chars":                   "4000",
+		"llm.enable_rewrite_action":                "true",
+		"llm.rewrite_action_fallback_template":     "Act on: {original_text}",
+		"llm.task_generate_command":                `claude -p "suggest a task"`,
+		"llm.task_generate_command_start":          `claude -p "first suggest a task"`,
+		"llm.task_generate_timeout_seconds":        "45",
+		"llm.env_file":                             "/etc/hap/llm.env",
+		"llm.command_env_file":                     "/etc/hap/consult.env",
+		"llm.command_start_env_file":               "/etc/hap/start.env",
+		"llm.task_generate_command_env_file":       "/etc/hap/taskgen.env",
+		"llm.task_generate_command_start_env_file": "/etc/hap/taskgen_start.env",
+		"embedding.disabled":                       "false",
+		"embedding.model_path":                     "/models/custom.gguf",
+		"embedding.similarity_threshold":           "0.90",
+		"embedding.bm25_min_score":                 "0.35",
+		"embedding.model_context_window":           "512",
+		"embedding.embed_timeout_ms":               "8000",
+		"embedding.warm_timeout_ms":                "120000",
+		"tui.max_content_width":                    "140",
+		"tui.max_content_height":                   "12",
+		"tui.theme":                                "dark",
+		"tui.terminal_bell":                        "true",
+		"cli.ai_agent_friendly_output":             "false",
 	}
 
 	registry := make(map[string]bool, len(frontend.ConfigFieldKeys))
@@ -4744,5 +4749,33 @@ func TestConfirmTaskGenNoopLearnsNoopWithoutTaskSource(t *testing.T) {
 	}
 	if mine[0].Sent {
 		t.Error("a confirmed decline must not be recorded as delivered")
+	}
+}
+
+// TestConfigFieldsNeverRenderEnvValues guards the secrecy rule for the
+// per-command LLM environment: the field registry is rendered verbatim by the
+// TUI config screen and `hap config fields`, so no inline env VALUE may be
+// reachable through it. Only the `.env` paths are registered.
+func TestConfigFieldsNeverRenderEnvValues(t *testing.T) {
+	cfg := config.Default()
+	const secret = "sk-ant-supersecret"
+	cfg.LLM.Env = map[string]string{"ANTHROPIC_API_KEY": secret}
+	cfg.LLM.CommandEnv = map[string]string{"ANTHROPIC_API_KEY": secret}
+	cfg.LLM.CommandStartEnv = map[string]string{"ANTHROPIC_API_KEY": secret}
+	cfg.LLM.GenerateTaskEnv = map[string]string{"ANTHROPIC_API_KEY": secret}
+	cfg.LLM.GenerateTaskStartEnv = map[string]string{"ANTHROPIC_API_KEY": secret}
+	cfg.LLM.CommandEnvFile = "/etc/hap/consult.env"
+
+	for _, key := range frontend.ConfigFieldKeys {
+		if got := frontend.FieldValue(cfg, key); strings.Contains(got, secret) {
+			t.Errorf("field %q rendered an env value: %q", key, got)
+		}
+	}
+	// The path itself is not a secret and must stay visible.
+	if got := frontend.FieldValue(cfg, "llm.command_env_file"); got != "/etc/hap/consult.env" {
+		t.Errorf("llm.command_env_file = %q, want the configured path", got)
+	}
+	if got := frontend.FieldValue(cfg, "llm.env_file"); got != "(none)" {
+		t.Errorf("unset env file = %q, want a clear placeholder", got)
 	}
 }
