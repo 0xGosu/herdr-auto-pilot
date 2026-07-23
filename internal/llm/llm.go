@@ -228,16 +228,10 @@ func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string,
 	// after other flags) so a slightly-off operator config still works.
 	argv = NormalizeLLMCommand(argv)
 
-	if err := preflight(argv[0]); err != nil {
-		return nil, err
-	}
-
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// The operator's environment is composed before spawning: an unreadable
-	// env file must fail the run rather than launch the CLI without its
-	// credentials. The HAP_* variables are injected last and always win.
+	// The operator's environment is composed FIRST: an unreadable env file
+	// must fail the run rather than launch the CLI without its credentials,
+	// and the command is resolved against the child's PATH, which this env
+	// may redefine. The HAP_* variables are injected last and always win.
 	env, err := buildEnv(a.BaseEnv, spec.env, repl,
 		"HAP_REQUEST_ID="+req.RequestID,
 		"HAP_DB_PATH="+a.DBPath,
@@ -247,7 +241,15 @@ func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string,
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
+	bin, err := preflight(argv[0], env)
+	if err != nil {
+		return nil, err
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(runCtx, bin, argv[1:]...)
 	cmd.Dir = a.WorkDir()
 	// After the timeout kills the CLI, don't wait on lingering
 	// grandchildren holding the output pipes open — fail safe promptly.
@@ -305,19 +307,34 @@ func dirLives(dir string) bool {
 	return err == nil && fi.IsDir()
 }
 
-// preflight verifies the CLI is runnable before spawning. The daemon's PATH
-// can be narrower than the operator's shell (GUI- or hook-launched); surface
-// that as itself instead of a bare exit error. A command containing a
-// separator never consults PATH, so it gets a message that doesn't
-// misdiagnose a missing file as a PATH problem.
-func preflight(argv0 string) error {
+// preflight verifies the CLI is runnable before spawning and returns the path
+// to run. The daemon's PATH can be narrower than the operator's shell (GUI- or
+// hook-launched); surface that as itself instead of a bare exit error. A
+// command containing a separator never consults PATH, so it gets a message
+// that doesn't misdiagnose a missing file as a PATH problem.
+//
+// The lookup uses the CHILD's environment, not the daemon's: a command may
+// configure its own PATH, and `exec.Command` would otherwise resolve the name
+// against the daemon's — rejecting a CLI the child could find, or resolving
+// one the child's PATH doesn't have. Passing the resolved path back to exec is
+// what makes the configured PATH take effect.
+func preflight(argv0 string, env []string) (string, error) {
+	resolved, err := lookPathIn(env, argv0)
+	if err != nil {
+		return "", fmt.Errorf("llm command %q not found in PATH (the daemon's PATH, or this command's configured PATH, may differ from your shell): %w", argv0, err)
+	}
+	if resolved != "" {
+		return resolved, nil
+	}
+	// Either a path with a separator, or a PATH entry we chose not to resolve
+	// ourselves — check runnability and let exec do the rest.
 	if _, err := exec.LookPath(argv0); err != nil {
 		if strings.ContainsRune(argv0, os.PathSeparator) {
-			return fmt.Errorf("llm command %q not runnable: %w", argv0, err)
+			return "", fmt.Errorf("llm command %q not runnable: %w", argv0, err)
 		}
-		return fmt.Errorf("llm command %q not found in PATH (the daemon's PATH may differ from your shell): %w", argv0, err)
+		return "", fmt.Errorf("llm command %q not found in PATH (the daemon's PATH may differ from your shell): %w", argv0, err)
 	}
-	return nil
+	return argv0, nil
 }
 
 func truncate(s string, n int) string {

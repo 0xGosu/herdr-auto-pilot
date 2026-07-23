@@ -2,8 +2,10 @@ package llm
 
 import (
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -55,6 +57,13 @@ func (s EnvSpec) entries(repl *strings.Replacer) ([]string, error) {
 	}
 	slices.Sort(keys)
 	for _, k := range keys {
+		// TOML accepts quoted keys that are not valid variable names, and a
+		// key containing "=" would be re-split when the entry is merged —
+		// silently setting a DIFFERENT variable than the one configured.
+		// Fail closed instead. The name is safe to quote; the value is not.
+		if !validEnvKey(k) {
+			return nil, fmt.Errorf("invalid environment variable name %q in llm env config", k)
+		}
 		out = append(out, k+"="+s.Vars[k])
 	}
 	out = slices.DeleteFunc(out, func(e string) bool {
@@ -94,6 +103,58 @@ func buildEnv(base, cmd EnvSpec, repl *strings.Replacer, injected ...string) ([]
 	}
 	env.merge(injected)
 	return env.slice(), nil
+}
+
+// envValue returns the value of key in a composed environment, or "".
+func envValue(env []string, key string) string {
+	for _, e := range env {
+		if k, v, ok := strings.Cut(e, "="); ok && k == key {
+			return v
+		}
+	}
+	return ""
+}
+
+// lookPathIn resolves a bare command name against the PATH of the environment
+// the CHILD will actually run with, which is not necessarily the daemon's:
+// a command can configure its own PATH. `exec.LookPath` and `exec.Command`
+// both consult the CURRENT process's PATH, so a configured one is only
+// honoured by resolving here and handing exec an already-resolved path.
+// It returns "" when the caller should keep the name as written (a name that
+// already contains a separator, or a PATH entry too odd to resolve safely).
+func lookPathIn(env []string, name string) (string, error) {
+	if strings.ContainsRune(name, os.PathSeparator) {
+		return "", nil // not a PATH lookup; the caller checks it directly
+	}
+	path := envValue(env, "PATH")
+	for _, dir := range filepath.SplitList(path) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, name)
+		if err := executableFile(candidate); err != nil {
+			continue
+		}
+		if !filepath.IsAbs(candidate) {
+			// A relative PATH entry would resolve against the child's working
+			// directory, not ours. Leave it to exec rather than guess.
+			return "", nil
+		}
+		return candidate, nil
+	}
+	return "", exec.ErrNotFound
+}
+
+// executableFile reports whether path is a regular file the daemon may execute.
+func executableFile(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if fi.IsDir() || fi.Mode()&0o111 == 0 {
+		return fs.ErrPermission
+	}
+	return nil
 }
 
 // reservedEnvKey reports whether a variable belongs to hap/herdr rather than

@@ -219,3 +219,88 @@ func TestConsultDoesNotRetryIdenticalCommandAndEnv(t *testing.T) {
 		t.Errorf("runs = %v, want exactly one — an identical alternate is not retried", got)
 	}
 }
+
+func TestGenerateTaskResolvesCommandAgainstConfiguredPath(t *testing.T) {
+	// A command may configure its own PATH. exec.Command resolves a bare name
+	// against the DAEMON's PATH, so without resolving against the child's the
+	// configured PATH would be silently ignored.
+	binDir := t.TempDir()
+	script := filepath.Join(binDir, "fake-llm-cli")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho 'task from the configured PATH'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := &Adapter{
+		TaskGenTemplate: []string{"fake-llm-cli"}, // bare name, not on the daemon's PATH
+		TaskGenTimeout:  5 * time.Second,
+		TaskGenEnv:      EnvSpec{Vars: map[string]string{"PATH": binDir}},
+	}
+	got, err := a.GenerateTask(context.Background(), domain.TaskGenRequest{})
+	if err != nil {
+		t.Fatalf("a command on the configured PATH must be runnable: %v", err)
+	}
+	if got != "task from the configured PATH" {
+		t.Errorf("output = %q, want the script's output", got)
+	}
+}
+
+func TestGenerateTaskRejectsCommandMissingFromConfiguredPath(t *testing.T) {
+	// The mirror case: the daemon can run it, the child could not. Failing the
+	// preflight beats an opaque "command not found" from the shell.
+	binDir := t.TempDir()
+	a := &Adapter{
+		TaskGenTemplate: []string{"sh"}, // on the daemon's PATH, not on this one
+		TaskGenTimeout:  5 * time.Second,
+		TaskGenEnv:      EnvSpec{Vars: map[string]string{"PATH": binDir}},
+	}
+	_, err := a.GenerateTask(context.Background(), domain.TaskGenRequest{})
+	if err == nil || !strings.Contains(err.Error(), "not found in PATH") {
+		t.Fatalf("error = %v, want a PATH complaint", err)
+	}
+}
+
+func TestConsultResolvesCommandAgainstConfiguredPath(t *testing.T) {
+	st, db := testStore(t)
+	binDir := t.TempDir()
+	out := filepath.Join(t.TempDir(), "ran.txt")
+	script := filepath.Join(binDir, "fake-consult-cli")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho ran > "+out+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := &Adapter{
+		CommandTemplate: []string{"fake-consult-cli"},
+		Timeout:         5 * time.Second,
+		DBPath:          db, Store: st, SelfPath: "/bin/true",
+		CommandEnv: EnvSpec{Vars: map[string]string{"PATH": binDir}},
+	}
+	req := domain.LLMRequest{RequestID: "req-path", CreatedAt: time.Now()}
+	if _, err := st.StageLLMRequest(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.InsertLLMDecision(context.Background(), domain.LLMDecision{
+		RequestID: "req-path", Action: "ok", Status: "pending", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Consult(context.Background(), req); err != nil {
+		t.Fatalf("a command on the configured PATH must be runnable: %v", err)
+	}
+	if strings.TrimSpace(readOptional(t, out)) != "ran" {
+		t.Error("the CLI on the configured PATH was not run")
+	}
+}
+
+func TestInlineEnvKeyMustBeValid(t *testing.T) {
+	// TOML allows a quoted key like "A=B"; merging it verbatim would set the
+	// variable A to "B=…" — a different variable than configured. Fail closed.
+	for _, key := range []string{"A=B", "HAS SPACE", "1LEADING_DIGIT", ""} {
+		a := &Adapter{
+			TaskGenTemplate: []string{"/bin/echo", "hi"},
+			TaskGenTimeout:  5 * time.Second,
+			TaskGenEnv:      EnvSpec{Vars: map[string]string{key: "value"}},
+		}
+		_, err := a.GenerateTask(context.Background(), domain.TaskGenRequest{})
+		if err == nil {
+			t.Errorf("key %q: expected the run to fail on an invalid variable name", key)
+		}
+	}
+}

@@ -1037,6 +1037,11 @@ point a nested `hap`/`herdr` at another installation). Values accept the
 same placeholders as the command template, except `{pane_excerpt}`
 (untrusted pane text is never put in a child's environment).
 
+A `PATH` set this way is honoured for finding the CLI itself: the command is
+resolved against the environment the child will actually run with, not the
+daemon's. An inline key that is not a valid variable name (TOML lets you
+quote anything) fails the run rather than being reinterpreted.
+
 A configured env file that cannot be read, has a malformed line, or defines
 no variables at all **fails that run** — it escalates instead of launching
 the CLI without its credentials, which would otherwise surface much later as

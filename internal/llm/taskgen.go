@@ -72,7 +72,21 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 		argv[i] = argvRepl.Replace(arg)
 	}
 
-	if err := preflight(argv[0]); err != nil {
+	// Compose the environment BEFORE the preflight: an unreadable env file
+	// must fail the run rather than launch the CLI without its credentials,
+	// and the command is resolved against the child's PATH, which this env
+	// may redefine.
+	childEnv, err := buildEnv(a.BaseEnv, env, envRepl,
+		"HAP_AGENT_NAME="+req.AgentName,
+		"HAP_AGENT_TYPE="+req.AgentType,
+		"HAP_CWD="+req.Cwd,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	bin, err := preflight(argv[0], childEnv)
+	if err != nil {
 		return "", err
 	}
 
@@ -83,21 +97,11 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	// Compose the environment before spawning: an unreadable env file must
-	// fail the run rather than launch the CLI without its credentials.
-	childEnv, err := buildEnv(a.BaseEnv, env, envRepl,
-		"HAP_AGENT_NAME="+req.AgentName,
-		"HAP_AGENT_TYPE="+req.AgentType,
-		"HAP_CWD="+req.Cwd,
-	)
-	if err != nil {
-		return "", err
-	}
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
+	cmd := exec.CommandContext(runCtx, bin, argv[1:]...)
 	cmd.Dir = a.WorkDir()
 	// After the timeout kills the CLI, don't wait on lingering grandchildren
 	// holding the output pipes open — fail safe promptly.
