@@ -381,6 +381,13 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `llm.task_generate_command` | (unset) | argv template for the one-shot task suggestion given to an idle agent with NO task source, or a declared source that ran out (see task sources); empty keeps escalate-only behavior |
 | `llm.task_generate_command_start` | (unset) | argv template for the FIRST task generation per agent (no-source case only; empty inherits `llm.task_generate_command`); an exhausted declared source only generates more tasks when BOTH this and `llm.task_generate_command` are set, and always uses `llm.task_generate_command` (never this) since a list already exists |
 | `llm.task_generate_timeout_seconds` | 0 (inherits `timeout_seconds`) | timeout for one task-generation run |
+| `llm.env` / `llm.env_file` | (unset) | environment shared by all four llm commands: an inline `[llm.env]` table, and/or a path to a `.env` file (`KEY=VALUE`, `#` comments, `export`, quotes, `~/` expanded) |
+| `llm.command_env` / `llm.command_env_file` | (unset) | environment for `llm.command` only, layered over the shared one |
+| `llm.command_start_env` / `llm.command_start_env_file` | (unset) | environment for `llm.command_start` only |
+| `llm.task_generate_command_env` / `llm.task_generate_command_env_file` | (unset) | environment for `llm.task_generate_command` only — e.g. a cheaper model or a different key for task ideas |
+| `llm.task_generate_command_start_env` / `llm.task_generate_command_start_env_file` | (unset) | environment for `llm.task_generate_command_start` only |
+
+per-command env notes: layering is daemon env → `env_file` → `env` → the command's `…_env_file` → the command's `…_env`, with hap's own `HAP_*` variables injected last; names starting with `HAP_`/`HERDR_` are reserved and ignored. env files are read when the CLI is SPAWNED (edits apply with no restart, and secrets never enter `config.toml`); a configured file that cannot be read, has a malformed line, or defines nothing fails that run rather than launching the CLI without its credentials. values accept the command template's placeholders except `{pane_excerpt}`. `hap config` shows variable NAMES and file paths only — never values.
 | `embedding.disabled` | false | disable semantic matching entirely |
 | `embedding.model_path` | (bundled all-minilm-l6-v2-q8_0.gguf) | path to a .gguf embedding model |
 | `embedding.similarity_threshold` | 0.90 | min cosine similarity to reuse a learned signature |

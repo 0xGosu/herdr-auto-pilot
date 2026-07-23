@@ -46,19 +46,30 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 	// Auto-repair BEFORE substitution: the normalizer pattern-matches argv
 	// shapes, and substituted pane text is untrusted — it must not be able to
 	// perturb the repair (same fixes as Consult/Rewrite).
-	base := a.TaskGenTemplate
+	base, env := a.TaskGenTemplate, a.TaskGenEnv
 	if req.First && len(a.TaskGenStartTemplate) > 0 {
-		base = a.TaskGenStartTemplate
+		base, env = a.TaskGenStartTemplate, a.TaskGenStartEnv
 	}
 	template := NormalizeLLMCommand(base)
+	// The environment shares every placeholder EXCEPT {pane_excerpt}:
+	// untrusted, unbounded pane text has no business in a child's
+	// environment, so it is expanded into argv only.
+	envRepl := strings.NewReplacer(
+		"{self}", self,
+		"{agent_name}", req.AgentName,
+		"{agent_type}", req.AgentType,
+		"{cwd}", req.Cwd,
+	)
+	argvRepl := strings.NewReplacer(
+		"{self}", self,
+		"{agent_name}", req.AgentName,
+		"{agent_type}", req.AgentType,
+		"{pane_excerpt}", req.PaneExcerpt,
+		"{cwd}", req.Cwd,
+	)
 	argv := make([]string, len(template))
 	for i, arg := range template {
-		arg = strings.ReplaceAll(arg, "{self}", self)
-		arg = strings.ReplaceAll(arg, "{agent_name}", req.AgentName)
-		arg = strings.ReplaceAll(arg, "{agent_type}", req.AgentType)
-		arg = strings.ReplaceAll(arg, "{pane_excerpt}", req.PaneExcerpt)
-		arg = strings.ReplaceAll(arg, "{cwd}", req.Cwd)
-		argv[i] = arg
+		argv[i] = argvRepl.Replace(arg)
 	}
 
 	if err := preflight(argv[0]); err != nil {
@@ -72,6 +83,17 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
+	// Compose the environment before spawning: an unreadable env file must
+	// fail the run rather than launch the CLI without its credentials.
+	childEnv, err := buildEnv(a.BaseEnv, env, envRepl,
+		"HAP_AGENT_NAME="+req.AgentName,
+		"HAP_AGENT_TYPE="+req.AgentType,
+		"HAP_CWD="+req.Cwd,
+	)
+	if err != nil {
+		return "", err
+	}
+
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -83,11 +105,7 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	cmd.Env = append(os.Environ(),
-		"HAP_AGENT_NAME="+req.AgentName,
-		"HAP_AGENT_TYPE="+req.AgentType,
-		"HAP_CWD="+req.Cwd,
-	)
+	cmd.Env = childEnv
 	runErr := cmd.Run()
 
 	if runErr != nil {

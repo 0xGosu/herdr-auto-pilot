@@ -995,6 +995,56 @@ command       = [ "claude", "-p", "...ongoing consult prompt...", "--model", "ha
 command_start = [ "claude", "-p", "...first-touch kickoff prompt...", "--model", "opus" ]
 ```
 
+#### A separate environment per command
+
+Each of the four command templates — `command`, `command_start`,
+`task_generate_command`, `task_generate_command_start` — can be spawned with
+its own environment, so one CLI can run against a different key, provider,
+model, or proxy than another. Set the variables inline, or keep them in a
+`.env` file:
+
+```toml
+[llm]
+env_file = "~/.config/hap/llm.env"                              # shared by all four
+command_env_file = "/path/to/claude_consult.env"
+task_generate_command_env_file = "/path/to/claude_task_generate.env"
+# command_start_env_file / task_generate_command_start_env_file likewise
+
+# Inline tables must come after every plain `key = value` in [llm]:
+[llm.env]
+ANTHROPIC_BASE_URL = "https://proxy.internal"
+[llm.command_env]
+ANTHROPIC_MODEL = "opus"
+[llm.task_generate_command_env]
+ANTHROPIC_MODEL = "haiku"                                       # cheaper for task ideas
+```
+
+The `.env` format is the usual one: `KEY=VALUE` per line, `#` comments, an
+optional `export` prefix, and single/double quotes (`\n`, `\t`, `\"`, `\\`
+escapes inside double quotes). `~/` is expanded. In an *unquoted* value a
+` #` starts a comment, so quote any value that contains one; a value that
+opens a quote without closing it (a pasted multi-line key) is rejected
+rather than passed on truncated. **Secrets belong in the file, not in
+`config.toml`**: it is read when the CLI is *spawned*, so its contents never
+pass through the config, and editing it applies to the next run with no
+restart.
+
+Layering, last wins: the daemon's own environment → `env_file` → `env` →
+the command's `…_env_file` → the command's `…_env`. Names starting with
+`HAP_` or `HERDR_` are reserved and ignored with a warning (they wire the
+MCP handshake and the plugin's own directories, so redirecting them would
+point a nested `hap`/`herdr` at another installation). Values accept the
+same placeholders as the command template, except `{pane_excerpt}`
+(untrusted pane text is never put in a child's environment).
+
+A configured env file that cannot be read, has a malformed line, or defines
+no variables at all **fails that run** — it escalates instead of launching
+the CLI without its credentials, which would otherwise surface much later as
+an opaque authentication error. The failure names the file and the line
+number, never the line's content. And because these values are credentials,
+`hap config` prints variable **names** and file paths only; no value is ever
+displayed or logged.
+
 The preferred template also has a one-shot **fast-fail fallback**. If it
 exits with an error in under one second without staging a decision, hap tries
 the other template (`command` ↔ `command_start`) once. This works in both

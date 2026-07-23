@@ -94,6 +94,44 @@ timeout_seconds = 120              # codex is slower to start; 180 is a safer va
 auto_act_confidence_threshold = 99  # auto-act only when the LLM confidence (0-100) is >= this; default 99 (near-certain only); set >100 (e.g. 999) to never auto-act and always surface for confirmation
 pane_excerpt_chars = 5000          # pane context included in the consult
 
+# ── Per-command environment (optional) ──
+# Each of the four command templates (command, command_start,
+# task_generate_command, task_generate_command_start) can be spawned with its
+# own environment — a different key, provider, model, or proxy per command.
+#
+# Two ways to set it, and they combine:
+#   * inline, in a `[llm.…_env]` table (values live in this file);
+#   * in a `.env` file, via `…_env_file` (KEY=VALUE lines, `#` comments,
+#     `export` and quotes accepted, `~/` expanded — quote any value with a
+#     " #" in it, which otherwise starts a comment). SECRETS BELONG HERE — the
+#     file is read when the CLI is spawned, so its contents never enter this
+#     config, and editing it applies to the next run without a restart. A
+#     configured file that cannot be read, has a malformed line, or defines
+#     nothing FAILS the run (escalation) rather than launching the CLI without
+#     its credentials.
+#
+# Layering, last wins: the daemon's own environment, then env_file, env (the
+# shared base for all four commands), then the command's own …_env_file and
+# …_env. Names starting with HAP_ or HERDR_ are reserved for hap's own wiring
+# and are ignored. Values accept the same placeholders as the command
+# template, except {pane_excerpt}.
+#
+# `hap config` prints variable NAMES and file paths only, never values.
+#
+# env_file = "~/.config/hap/llm.env"                          # shared by all four
+# command_env_file = "/path/to/claude_consult.env"
+# command_start_env_file = "/path/to/claude_start.env"
+# task_generate_command_env_file = "/path/to/claude_task_generate.env"
+# task_generate_command_start_env_file = "/path/to/claude_task_generate_start.env"
+#
+# Inline tables must come AFTER every plain `key = value` in [llm]:
+# [llm.env]
+# ANTHROPIC_BASE_URL = "https://proxy.internal"
+# [llm.command_env]
+# ANTHROPIC_MODEL = "opus"
+# [llm.task_generate_command_env]
+# ANTHROPIC_MODEL = "haiku"                                   # cheaper for task ideas
+
 # ── Outbound action review (optional) ──
 # When a LEARNED rule resolves to free text (an idle next-task prompt, an
 # error retry command, a free-text approval reply — never menu digits, and
