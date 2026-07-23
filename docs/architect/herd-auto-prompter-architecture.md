@@ -267,9 +267,23 @@ The domain depends only on interfaces. **Core ports:** `HerdrPort` (send/read),
   blocked, appends a `delivery_failed` diagnostic audit row.
 - **Escalation** *(daemon)* — routes uncertain paths to escalate + audit + notify,
   with a **dedup window** (fixed internal constants `escalationDedupWindow` +
-  `escalationDedupJitterPercent` in the daemon package — not operator-configurable,
-  `domain.NormalizeForDedup`) so a re-fired identical situation doesn't spam the
-  operator; a resolved-window dedup gates on a *delivered* answer.
+  `escalationDedupJitterPercent` = 5% in the daemon package — not
+  operator-configurable, `domain.NormalizeForDedup`) so a re-fired identical
+  situation doesn't spam the operator; a resolved-window dedup gates on a
+  *delivered* answer.
+- **Deferred-send staleness** *(daemon)* — before injecting an answer that waited
+  on an LLM consult or action review, the pane is re-read and the situation must
+  still be the one that was decided (`domain.SignatureHeldStill`). Exact content
+  hash is the primary test; when it fails, the salients may still differ by up to
+  `staleDeferredSendJitterPercent` (15%, a separate daemon constant) by trigram
+  Jaccard, so an agent CLI's dynamic status line repainting during a minutes-long
+  consult does not read as "the pane moved on" and escalate a confident answer.
+  Situation type is asserted separately (the fuzzy compare sees salients only),
+  an over-masked signature never matches at all (its hash is empty), and a
+  tolerated drift re-screens the fresh pane through never-auto + suspected-
+  irreversible — the pre-consult screen no longer covers text that changed since.
+  Measured at the default salient window: a status-line repaint is 9-13% away, the
+  nearest false accept (same scrollback, question line swapped) 21%.
 
 ### Learning Subsystem *(domain, daemon-owned writer)*
 

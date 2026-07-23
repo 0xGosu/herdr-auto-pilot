@@ -224,6 +224,53 @@ func ApprovalRemapCompatible(salient, candidate string) bool {
 	return inter*2 >= union
 }
 
+// SignatureHeldStill reports whether a re-read of the same pane still shows the
+// situation `prev` was computed from — the staleness gate every deferred send
+// (LLM consult, action review) runs before injecting an answer.
+//
+// The primary test is exact equality of the never-remapped content hash. It is
+// widened only because a consult can take minutes, during which an agent CLI
+// repaints a dynamic status line (spinner, elapsed time, token/context
+// counters). For situations whose salient IS the pane tail (idle, task
+// hand-outs, verbless approvals — see salientContent) that repaint lands inside
+// the hashed content, so an unchanged, still-blocked screen reads as stale and
+// a confident answer is escalated instead of delivered.
+//
+// The widening stays safe because refusing is the safe direction:
+//   - It only runs when the hashes already differ, so the common path is
+//     unchanged.
+//   - An over-masked signature has no usable content, so it never fuzzy-matches.
+//   - The salients compared are already MaskVolatile'd, so timestamps, paths and
+//     large numbers are folded BEFORE the tolerance is applied — what is left for
+//     the tolerance to absorb is genuinely unrecognized chrome.
+//   - Unlike DuplicatesPendingEscalation, no minimum-size gate applies: the
+//     question here is "is THIS screen still the one that was decided", not "are
+//     these two screens the same question", and a short structured salient
+//     ("permission:run npm install | options:…") that changes at all changes a
+//     large fraction of its trigrams, so a genuinely different question falls far
+//     below any sane tolerance on its own.
+//
+// It does NOT compare situation type: the type is folded into the hash, so
+// callers taking the fuzzy path must assert type equality themselves.
+// jitterPct <= 0 makes this exactly the old hash comparison.
+func SignatureHeldStill(prev, fresh SignatureResult, jitterPct int) bool {
+	if prev.Verdict != GuardOK || fresh.Verdict != GuardOK {
+		// An over-masked signature has an EMPTY Raw, so a plain hash compare
+		// would call two unrelated over-masked screens "the same". They carry no
+		// content to compare either way, so refuse both the exact and the fuzzy
+		// answer and let the caller escalate (deferred sends never reach here
+		// today: an over-masked situation escalates at Decide).
+		return false
+	}
+	if prev.Raw == fresh.Raw {
+		return true
+	}
+	if jitterPct <= 0 {
+		return false
+	}
+	return SimilarWithin(prev.Salient, fresh.Salient, jitterPct)
+}
+
 // splitOptionSet is NormalizedOptionSet's inverse: it splits the encoding on
 // unescaped ";" back into a set of unescaped labels, dropping empty entries.
 func splitOptionSet(s string) map[string]bool {
