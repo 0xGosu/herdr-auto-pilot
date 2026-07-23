@@ -138,3 +138,68 @@ func TestLockPathIsStableAcrossEquivalentPaths(t *testing.T) {
 		t.Errorf("lock path differs for equivalent paths: %s vs %s", LockPath(path), LockPath(viaDot))
 	}
 }
+
+func TestReclaim(t *testing.T) {
+	// The daemon's reclaim path takes back a hand-out the agent never started.
+	// It may only touch an item that is still [-], and it prefers the recorded
+	// position over a bare text match so a list repeating one task cannot have
+	// the wrong copy released.
+	const list = "- [ ] alpha\n- [-] beta\n- [x] gamma\n- [-] beta\n"
+	tests := []struct {
+		name    string
+		index   int
+		task    string
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "releases the recorded position",
+			// The list repeats "beta"; the hand-out reserved #4, so #2 — which
+			// may be somebody else's in-progress mark — must stay put.
+			index: 4, task: "beta",
+			want: "- [ ] alpha\n- [-] beta\n- [x] gamma\n- [ ] beta\n",
+		},
+		{
+			name: "falls back to the first text match when the list renumbered",
+			// Positions shift on every insert or delete, so an index that no
+			// longer carries the reserved text is a stale address, not a veto.
+			index: 3, task: "beta",
+			want: "- [ ] alpha\n- [ ] beta\n- [x] gamma\n- [-] beta\n",
+		},
+		{
+			name: "falls back when no position was recorded",
+			// Rows written before the position was stored carry 0.
+			index: 0, task: "beta",
+			want: "- [ ] alpha\n- [ ] beta\n- [x] gamma\n- [-] beta\n",
+		},
+		{
+			// Completed work must never be silently re-opened and re-handed out.
+			name: "refuses a completed item", index: 3, task: "gamma", wantErr: true,
+		},
+		{
+			// Already pending: nothing to take back, and the caller must be able
+			// to tell that apart from a real reclaim for its audit row.
+			name: "refuses a pending item", index: 1, task: "alpha", wantErr: true,
+		},
+		{
+			name: "refuses a text that is gone", index: 1, task: "delta", wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Reclaim(tc.index, tc.task)(list)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("got:\n%s\nwant:\n%s", got, tc.want)
+			}
+		})
+	}
+}

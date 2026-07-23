@@ -45,7 +45,39 @@ const (
 	// either starting work (which clears it) or the episode being re-driven.
 	// A stale claim would otherwise pin an agent to a task the operator has
 	// since re-prioritized.
-	autoTaskClaimTTL = 10 * time.Minute
+	//
+	// It is deliberately the same window as reclaimGrace, and for the same
+	// reason: a claim only has to survive the capture → (optionally
+	// LLM-reviewed) delivery pipeline, which is seconds. Anything longer makes
+	// the sweep depend on a past send — a claim both skips its agent
+	// (eligibleIdleAgents) and hides its task from every OTHER agent
+	// (unclaimedPendingTasks), so a claim that outlives its episode stalls
+	// exactly the hand-out it was meant to order.
+	autoTaskClaimTTL = reclaimGrace
+	// reclaimGrace is how long an unconfirmed hand-out is given to show up as
+	// "working" before the sweep treats it as never delivered and returns its
+	// checklist item to "[ ]". It has to cover the capture delay plus a pre-send
+	// LLM review plus the agent's own start-up, and to stay well under a human's
+	// patience for a stalled queue.
+	reclaimGrace = 2 * time.Minute
+	// maxTaskHandouts caps how many times ONE checklist item may be handed out
+	// without ever being started. Past it the item is left "[-]" and the
+	// operator is asked, because something about that task or that agent is
+	// broken in a way another resend will not fix.
+	maxTaskHandouts = 3
+	// maxHandoutRestamps bounds how many daemon startups may renew an
+	// unconfirmed hand-out's grace window (see TouchTaskReservations). The
+	// window is the only thing that ages a hand-out toward being reclaimed, so
+	// an unbounded renewal would let a crash-looping daemon strand a task
+	// silently, without even reaching the escalation ceiling.
+	maxHandoutRestamps = 3
+	// staleHandoutTTL is the backstop that keeps an unresolvable hand-out from
+	// benching its agent forever: an open row bars that agent from every
+	// pairing, so a row that no sweep can settle (unreadable source, an agent
+	// that never parks) is eventually given up on. Generous — reclaim normally
+	// happens two orders of magnitude sooner — because reaching this at all
+	// means the ordinary paths did not work.
+	staleHandoutTTL = time.Hour
 	// taskLockWait bounds how long a reservation waits for another hap
 	// process's file lock. The reserve runs on the main select loop, so an
 	// unbounded wait would stall every agent behind one wedged CLI; giving up
@@ -61,6 +93,27 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 	now := d.opt.Clock.Now()
 	d.noteIdleAgents(agents, now)
 
+	// FR-017: the kill switch stands the whole daemon down. Fail closed — an
+	// unreadable kill state must not license unattended sends, and it must not
+	// license the reclaim's file writes either.
+	kill, err := d.opt.Store.LatestKillEvent(ctx)
+	if err != nil {
+		slog.Warn("auto-send: kill-switch read failed; skipping this sweep", "error", err)
+		return
+	}
+	if domain.KillStateActive(kill) {
+		return
+	}
+
+	// Return stranded hand-outs to "[ ]" BEFORE pairing, so this same sweep can
+	// re-offer them. Nothing below reads the ledger.
+	//
+	// Deliberately ahead of the "no auto-send sources configured" return: a
+	// source switched off (or removed) while hand-outs were in flight would
+	// otherwise leave its items "[-]" forever with nothing left to retire the
+	// ledger rows. The ledger, not the config, decides what needs cleaning up.
+	d.reclaimStrandedTasks(ctx, agents, now)
+
 	cfg, _, _ := d.snapshot()
 	sources := make([]config.TaskSource, 0, len(cfg.TaskSources))
 	for _, src := range cfg.TaskSources {
@@ -69,17 +122,6 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 		}
 	}
 	if len(sources) == 0 {
-		return
-	}
-
-	// FR-017: the kill switch stands the whole daemon down. Fail closed — an
-	// unreadable kill state must not license unattended sends.
-	kill, err := d.opt.Store.LatestKillEvent(ctx)
-	if err != nil {
-		slog.Warn("auto-send: kill-switch read failed; skipping this sweep", "error", err)
-		return
-	}
-	if domain.KillStateActive(kill) {
 		return
 	}
 
@@ -96,9 +138,17 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 		escalated[e.AgentID] = true
 	}
 
+	// Agents holding a hand-out the daemon has not seen taken up yet. Piling a
+	// second task on one is not just noisy: a later "working" transition
+	// confirms EVERY open row for that agent, so the untaken first task would be
+	// marked delivered and its "[-]" would stand forever — the exact stranding
+	// this sweep exists to undo. An agent stays out only until its hand-out is
+	// confirmed or reclaimed, both bounded by reclaimGrace.
+	awaiting := d.agentsAwaitingHandout(ctx)
+
 	driven := map[string]bool{} // agents already given a task this sweep
 	for _, src := range sources {
-		eligible := d.eligibleIdleAgents(ctx, src, agents, now, driven, escalated)
+		eligible := d.eligibleIdleAgents(ctx, src, agents, now, driven, escalated, awaiting)
 		if len(eligible) == 0 {
 			continue
 		}
@@ -138,6 +188,273 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 			d.scheduleCapture(ctx, tr)
 		}
 	}
+}
+
+// reclaimStrandedTasks is what makes each sweep decide from CURRENT state
+// rather than from a past send.
+//
+// A hand-out marks its checklist item "[-]" BEFORE the send, and the send is
+// rolled back only when herdr reports an error. But a successful `agent send`
+// means "herdr accepted these keystrokes", not "the agent acted on them": text
+// typed into a CLI that is restarting, repainting, or not focused is silently
+// lost. Before this sweep existed, such an item stayed "[-]" forever —
+// PendingDeclaredTasks only yields "[ ]", so no agent was ever offered it
+// again, and a few of those in a row leave every agent idle beside a checklist
+// that still has work.
+//
+// So every unattended hand-out is recorded in the ledger and confirmed only
+// when herdr reports its agent WORKING (handleTransition). Here, per row:
+//
+//	confirmed                     → retire the row; the "[-]" stands
+//	item is no longer "[-]"       → retire the row (completed, released, edited)
+//	agent is working or blocked   → leave alone; it may be underway right now
+//	still inside reclaimGrace     → leave alone; the send may yet land
+//	otherwise                     → return the item to "[ ]" and re-offer it
+//
+// Two safety properties are load-bearing:
+//   - the daemon only ever releases a "[-]" it holds a ledger row for, so an
+//     operator's or an agent's own in-progress mark is never cleared;
+//   - an item that has been handed out maxTaskHandouts times without ever being
+//     started is NOT reclaimed again — it is left "[-]" and escalated, because
+//     the loop is otherwise unbounded.
+//
+// It is a best-effort pass throughout: an unreadable source or a failed release
+// resolves to "leave it alone", which is the state the daemon was already in.
+func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.AgentTransition, now time.Time) {
+	reservations, err := d.opt.Store.OpenTaskReservations(ctx)
+	if err != nil {
+		slog.Warn("auto-send: hand-out ledger unreadable; not reclaiming this sweep", "error", err)
+		return
+	}
+	if len(reservations) == 0 {
+		return
+	}
+	live := make(map[string]domain.AgentTransition, len(agents))
+	for _, a := range agents {
+		live[a.AgentID] = a
+	}
+	// One read per source per sweep, dropped whenever this pass rewrites the
+	// file so a later row on the same source sees its own effect.
+	content := map[string]string{}
+	read := func(path string) (string, bool) {
+		if c, ok := content[path]; ok {
+			return c, true
+		}
+		data, err := d.opt.ReadTaskFile(path)
+		if err != nil {
+			slog.Warn("auto-send: task source unreadable; not reclaiming its hand-outs",
+				"path", path, "error", err)
+			return "", false
+		}
+		content[path] = string(data)
+		return content[path], true
+	}
+
+	for _, r := range reservations {
+		if !r.ConfirmedAt.IsZero() {
+			d.retireReservation(ctx, r)
+			continue
+		}
+		// A row this old is not going to settle. It survives only when every
+		// sweep since has hit "leave it alone" — a source that stopped being
+		// readable, or an agent that has been busy the whole time — and an open
+		// row keeps its agent out of every future pairing
+		// (agentsAwaitingHandout). Holding one agent hostage to a hand-out
+		// nothing can resolve is worse than giving up on it: retire the row and
+		// leave the "[-]" for the operator, which is exactly where this feature
+		// stood before the ledger existed.
+		if now.Sub(r.ReservedAt) > staleHandoutTTL {
+			slog.Warn("auto-send: hand-out never settled; giving up on it — the item stays [-] until you clear it",
+				"agent", r.AgentID, "path", r.SourcePath, "task", r.TaskText,
+				"age", now.Sub(r.ReservedAt).Round(time.Second))
+			d.retireReservation(ctx, r)
+			continue
+		}
+		c, ok := read(r.SourcePath)
+		if !ok {
+			continue
+		}
+		if !inProgressTask(c, r.TaskText) {
+			// The item moved on under us: the agent completed it, an operator
+			// edited or released it, or a rollback already took it back. Either
+			// way there is nothing left to reclaim and no hand-out to count.
+			d.retireReservation(ctx, r)
+			continue
+		}
+		// A live agent that is not parked may be working on exactly this task.
+		// An agent that is gone — or whose id now belongs to a DIFFERENT
+		// terminal, since herdr recycles pane ids — is reclaimable: the tenant
+		// this task was handed to cannot resume it, and without the identity
+		// check a busy successor would pin the item "[-]" indefinitely, never
+		// aging toward either a reclaim or the escalation ceiling.
+		if a, present := live[r.AgentID]; present && sameTenant(a, r) && !autoSendParked(a.Status) {
+			continue
+		}
+		if now.Sub(r.ReservedAt) <= reclaimGrace {
+			continue
+		}
+
+		attempts, err := d.opt.Store.TaskHandoutAttempts(ctx, r.SourcePath, r.TaskText)
+		if err != nil {
+			slog.Warn("auto-send: hand-out counter unreadable; not reclaiming",
+				"path", r.SourcePath, "error", err)
+			continue
+		}
+		if attempts >= maxTaskHandouts {
+			d.escalateNeverStartedTask(ctx, r, live[r.AgentID], attempts, now)
+			continue
+		}
+		if err := d.opt.MutateTaskFile(r.SourcePath, taskfile.Reclaim(r.ItemIndex, r.TaskText)); err != nil {
+			slog.Warn("auto-send: stranded task could not be returned to [ ]",
+				"path", r.SourcePath, "task", r.TaskText, "error", err)
+			continue
+		}
+		delete(content, r.SourcePath)
+		// The pairing dies with the reservation: holding it would keep this
+		// agent out of the very sweep that is about to re-offer the task.
+		d.dropAutoTaskClaimFor(r)
+		if err := d.opt.Store.DeleteTaskReservation(ctx, r.ID); err != nil {
+			slog.Warn("auto-send: hand-out row could not be retired", "id", r.ID, "error", err)
+		}
+		a := live[r.AgentID]
+		if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+			AgentID: r.AgentID, AgentType: a.AgentType, Trigger: "auto-send-reclaim",
+			SituationType: domain.SituationIdle,
+			Action:        domain.AuditActionTaskReclaimedPrefix + domain.DisplayTaskText(r.TaskText),
+			Rationale: fmt.Sprintf("[%s] handed to %s %s ago and never started; returned to [ ] for the next idle agent",
+				domain.ReasonTaskNeverStarted, r.AgentID, now.Sub(r.ReservedAt).Round(time.Second)),
+			Status: domain.AuditStatusReclaimed, CreatedAt: now,
+		}); err != nil {
+			slog.Warn("auto-send: reclaim audit write failed", "error", err)
+		}
+		slog.Info("auto-send: returned a stranded task to the pending list",
+			"agent", r.AgentID, "path", r.SourcePath, "task", r.TaskText, "attempt", attempts)
+	}
+}
+
+// retireReservation drops a ledger row that has done its job — the hand-out was
+// confirmed, or the item is no longer the "[-]" it reserved — and forgets the
+// item's attempt counter so a future hand-out starts from zero.
+func (d *Daemon) retireReservation(ctx context.Context, r domain.TaskReservation) {
+	if err := d.opt.Store.DeleteTaskReservation(ctx, r.ID); err != nil {
+		slog.Warn("auto-send: hand-out row could not be retired", "id", r.ID, "error", err)
+		return
+	}
+	if err := d.opt.Store.ClearTaskHandouts(ctx, r.SourcePath, r.TaskText); err != nil {
+		slog.Warn("auto-send: hand-out counter could not be cleared",
+			"path", r.SourcePath, "task", r.TaskText, "error", err)
+	}
+}
+
+// escalateNeverStartedTask stops the reclaim loop for one item: after
+// maxTaskHandouts deliveries that were never taken up, resending is not going to
+// work, so the item is LEFT "[-]" (which is exactly what keeps it out of the
+// pending list) and the operator is asked.
+//
+// Note the escalation also parks this agent's auto-sends until it is resolved —
+// eligibleIdleAgents skips an agent with a pending escalation. That is
+// deliberate: a task nobody can start usually means the agent, not the task.
+func (d *Daemon) escalateNeverStartedTask(ctx context.Context, r domain.TaskReservation,
+	a domain.AgentTransition, attempts int, now time.Time) {
+
+	if err := d.opt.Store.DeleteTaskReservation(ctx, r.ID); err != nil {
+		slog.Warn("auto-send: hand-out row could not be retired", "id", r.ID, "error", err)
+		// Fall through: the escalation matters more than the bookkeeping, and a
+		// surviving row simply re-escalates next sweep (deduped by the counter
+		// staying at the ceiling).
+	}
+	d.dropAutoTaskClaimFor(r)
+	// Forget the counter with the row. Nothing can hand this item out again
+	// while it is "[-]", so the only way it comes back is an operator releasing
+	// it — and that human intervention is exactly what the ceiling was waiting
+	// for. Keeping the count would make the very first hand-out after the fix
+	// escalate again.
+	if err := d.opt.Store.ClearTaskHandouts(ctx, r.SourcePath, r.TaskText); err != nil {
+		slog.Warn("auto-send: hand-out counter could not be cleared",
+			"path", r.SourcePath, "task", r.TaskText, "error", err)
+	}
+	// Deliberately NO Suggestion and NO Input: a confirm sends the suggestion to
+	// the pane as literal text (frontend.SuggestedAction), and there is nothing
+	// to send here — the operator has to look at the agent. An empty suggestion
+	// makes the row informational: explained by its rationale, dismissible, not
+	// confirmable.
+	if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: r.AgentID, AgentType: a.AgentType, Trigger: "auto-send-reclaim",
+		SituationType: domain.SituationIdle,
+		Action:        domain.AuditActionTaskNeverStartedPrefix + domain.DisplayTaskText(r.TaskText),
+		// Addressed by --path, not by agent: an agent can match several sources,
+		// so `hap task <agent>` need not resolve the file this item lives in —
+		// and the agent may be gone by the time anyone reads this.
+		Rationale: fmt.Sprintf("[%s] handed to %s %d times and never started; left [-] so it is not resent. "+
+			"Check the agent, then `hap task --path %s undone <n>` to re-queue the item.",
+			domain.ReasonTaskNeverStarted, r.AgentID, attempts, r.SourcePath),
+		Status: "escalated", CreatedAt: now,
+	}); err != nil {
+		slog.Error("auto-send: never-started escalation could not be recorded", "error", err)
+		return
+	}
+	slog.Warn("auto-send: task handed out repeatedly and never started; escalating",
+		"agent", r.AgentID, "path", r.SourcePath, "task", r.TaskText, "attempts", attempts)
+}
+
+// agentsAwaitingHandout returns the agents that still hold a hand-out the
+// daemon has not seen taken up. They are skipped by this sweep's pairing:
+// confirmation is per AGENT (a "working" transition says nothing about WHICH
+// task it is working on), so a second hand-out layered over an unconfirmed
+// first would let one resumption confirm both — permanently stranding the task
+// the agent never actually received.
+//
+// Fails OPEN: a ledger it cannot read hands out nothing new only if it also
+// cannot reclaim, and stalling the feature on a transient read error is worse
+// than one extra hand-out. This runs right after reclaimStrandedTasks, so rows
+// past their grace window are already gone by the time it reads.
+func (d *Daemon) agentsAwaitingHandout(ctx context.Context) map[string]bool {
+	reservations, err := d.opt.Store.OpenTaskReservations(ctx)
+	if err != nil {
+		slog.Warn("auto-send: hand-out ledger unreadable; pairing without it this sweep", "error", err)
+		return nil
+	}
+	out := map[string]bool{}
+	for _, r := range reservations {
+		if r.ConfirmedAt.IsZero() {
+			out[r.AgentID] = true
+		}
+	}
+	return out
+}
+
+// sameTenant reports whether a live agent is still the one a hand-out was made
+// to. herdr reuses compact pane ids (and an agent id IS a pane id), so matching
+// ids alone can name a different terminal — its terminal_id is what tells them
+// apart. Fails OPEN on an unknown id on either side (older herdr, event-socket
+// transitions), like every other terminal-identity check here: an unprovable
+// difference must never be treated as one.
+func sameTenant(a domain.AgentTransition, r domain.TaskReservation) bool {
+	return a.TerminalID == "" || r.TerminalID == "" || a.TerminalID == r.TerminalID
+}
+
+// dropAutoTaskClaimFor releases the agent's pairing only when it is still THIS
+// hand-out's. An unrelated claim belongs to a delivery that is in flight right
+// now (a capture or an LLM review can outlive a sweep); dropping it would
+// re-expose that task to another agent in this same sweep, whose delivery then
+// loses the reservation race — no double send, but a wasted episode.
+func (d *Daemon) dropAutoTaskClaimFor(r domain.TaskReservation) {
+	if c, ok := d.autoTaskClaimFor(r.AgentID); !ok ||
+		c.sourcePath != r.SourcePath || c.taskText != r.TaskText {
+		return
+	}
+	d.dropAutoTaskClaim(r.AgentID)
+}
+
+// inProgressTask reports whether content still carries taskText as a "[-]"
+// item — the exact mark a hand-out wrote, and the only one it may take back.
+func inProgressTask(content, taskText string) bool {
+	for _, it := range domain.ParseChecklist(content) {
+		if it.Text == taskText && it.Mark == domain.MarkInProgress {
+			return true
+		}
+	}
+	return false
 }
 
 // canonicalTaskPath resolves a task-source path to the one key that identifies
@@ -208,11 +525,15 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 // deterministic run to run). Every gate here is a reason NOT to send; the
 // decision core re-applies its own on the pipeline path.
 func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
-	agents []domain.AgentTransition, now time.Time, driven, escalated map[string]bool) []domain.AgentTransition {
+	agents []domain.AgentTransition, now time.Time, driven, escalated, awaiting map[string]bool) []domain.AgentTransition {
 
 	var out []domain.AgentTransition
 	for _, a := range agents {
 		if driven[a.AgentID] || !autoSendParked(a.Status) {
+			continue
+		}
+		// One unconfirmed hand-out at a time per agent — see agentsAwaitingHandout.
+		if awaiting[a.AgentID] {
 			continue
 		}
 		if !d.idleLongEnough(a, now) {
@@ -389,21 +710,26 @@ func reservedByAction(action, reviewed string, pending []string) string {
 // different pending task, and the operator can edit the list meanwhile. A
 // failure means somebody else already took the task, and the caller must NOT
 // send.
-func (d *Daemon) reserveDeclaredTask(declared *domain.DeclaredTask, taskText string) (rollback func(), err error) {
+//
+// index is the checklist position that was marked, and is 0 when nothing was:
+// a non-zero value means the caller must record a ledger row after the send
+// (the no-op cases — a source that does not reserve, an exhausted list — must
+// not), and it is the position a later reclaim prefers over a bare text match.
+func (d *Daemon) reserveDeclaredTask(declared *domain.DeclaredTask, taskText string) (rollback func(), index int, err error) {
 	if declared == nil || !declared.Reserve || taskText == "" || taskText == domain.NoTaskContent {
-		return func() {}, nil
+		return func() {}, 0, nil
 	}
 	path := declared.Path
 	mutate, claimed := taskfile.ReserveFirstPending(taskText)
 	if err := d.opt.MutateTaskFile(path, mutate); err != nil {
-		return nil, fmt.Errorf("reserving the task in %s: %w", path, err)
+		return nil, 0, fmt.Errorf("reserving the task in %s: %w", path, err)
 	}
 	// Defensive: a MutateTaskFile implementation that reports success without
 	// running fn leaves no index to roll back, and Release(-1, …) would only
 	// produce a confusing error. Nothing was marked, so nothing needs undoing.
-	index := *claimed
+	index = *claimed
 	if index < 0 {
-		return func() {}, nil
+		return func() {}, 0, nil
 	}
 	return func() {
 		if err := d.opt.MutateTaskFile(path, taskfile.Release(index, taskText)); err != nil {
@@ -411,5 +737,5 @@ func (d *Daemon) reserveDeclaredTask(declared *domain.DeclaredTask, taskText str
 				"it stays [-] and no agent will pick it up until you clear it",
 				"path", path, "task", index, "error", err)
 		}
-	}, nil
+	}, index, nil
 }

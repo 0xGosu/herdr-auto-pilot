@@ -194,3 +194,43 @@ func ReserveFirstPending(taskText string) (func(string) (string, error), *int) {
 		return "", fmt.Errorf("no pending task matching %q remains in the list — it was completed, claimed or edited", taskText)
 	}, claimed
 }
+
+// Reclaim returns one "[-]" item carrying taskText to "[ ]", so the next idle
+// sweep can hand it out again. It is the daemon's counterpart to
+// ReserveFirstPending, undoing a hand-out the agent never took up.
+//
+// It prefers the position the reservation recorded and falls back to the first
+// text match, because neither key alone is sound here: positions renumber on
+// every insert or delete, so an index resolved minutes ago can address a
+// different line; but text is not unique either — a checklist may well repeat
+// "run tests", and clearing the FIRST such "[-]" when the reservation claimed
+// the second would take back an item somebody else owns. Preferring the index
+// while it still carries the reserved text gets both. Pass index <= 0 when
+// none was recorded (rows written before the column existed).
+//
+// Deliberately narrow, because the caller is unattended:
+//   - only a "[-]" item is touched. An item now "[x]" was completed and an item
+//     already "[ ]" needs nothing — either way, silently re-opening it would
+//     re-arm work somebody finished.
+//   - "no such item" is an error, not a no-op, so the caller can tell "left it
+//     alone" from "reclaimed it" and audit accordingly.
+//
+// The caller must additionally prove the "[-]" is the daemon's OWN reservation
+// (a task_reservations row); this helper cannot distinguish an operator's or an
+// agent's own in-progress mark from HAP's.
+func Reclaim(index int, taskText string) func(string) (string, error) {
+	return func(content string) (string, error) {
+		items := domain.ParseChecklist(content)
+		for _, it := range items {
+			if it.Index == index && it.Text == taskText && it.Mark == domain.MarkInProgress {
+				return domain.SetChecklistItemDone(content, it.Index, false)
+			}
+		}
+		for _, it := range items {
+			if it.Text == taskText && it.Mark == domain.MarkInProgress {
+				return domain.SetChecklistItemDone(content, it.Index, false)
+			}
+		}
+		return "", fmt.Errorf("no in-progress task matching %q remains in the list — it was completed, released or edited", taskText)
+	}
+}

@@ -212,6 +212,35 @@ type DaemonStore interface {
 	// SaveSignatureSnapshot records the pane excerpt a signature was first
 	// seen with (rule provenance; first sighting wins, later calls no-op).
 	SaveSignatureSnapshot(ctx context.Context, signature, excerpt string, at time.Time) error
+
+	// --- Unattended task hand-out ledger (auto_send_when_idle) ---
+	// The ledger is what lets the idle sweep decide from CURRENT state instead
+	// of trusting a past send: it records which "[-]" marks the daemon wrote,
+	// and whether the agent handed the task was ever seen working afterwards.
+
+	// RecordTaskReservation logs one hand-out and bumps that item's attempt
+	// counter, atomically.
+	RecordTaskReservation(ctx context.Context, r domain.TaskReservation) (int64, error)
+	// OpenTaskReservations returns every recorded hand-out, oldest first.
+	OpenTaskReservations(ctx context.Context) ([]domain.TaskReservation, error)
+	// ConfirmTaskReservations stamps an agent's unconfirmed hand-outs as taken
+	// up — called when herdr reports the agent working again, the only proof
+	// the keystrokes landed. terminalID scopes it to the tenant the hand-out
+	// was made to, so an agent recycled onto the same pane id cannot confirm
+	// (and thereby strand) its predecessor's task; an empty id on either side
+	// matches, as elsewhere in the terminal-identity checks.
+	ConfirmTaskReservations(ctx context.Context, agentID, terminalID string, at time.Time) error
+	// DeleteTaskReservation retires one ledger row.
+	DeleteTaskReservation(ctx context.Context, id int64) error
+	// TouchTaskReservations re-stamps unconfirmed hand-outs so a daemon restart
+	// grants each a full grace window instead of reclaiming live work, up to
+	// maxRestamps times — past that a row ages normally, so a restart loop
+	// cannot renew the window forever.
+	TouchTaskReservations(ctx context.Context, maxRestamps int, at time.Time) error
+	// TaskHandoutAttempts reports how many times an item has been handed out.
+	TaskHandoutAttempts(ctx context.Context, sourcePath, taskText string) (int, error)
+	// ClearTaskHandouts forgets an item's attempt counter.
+	ClearTaskHandouts(ctx context.Context, sourcePath, taskText string) error
 }
 
 // FrontendStore is the front-end (TUI/CLI) write surface plus shared reads.
