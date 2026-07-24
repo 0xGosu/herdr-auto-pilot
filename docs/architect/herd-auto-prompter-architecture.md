@@ -278,12 +278,17 @@ The domain depends only on interfaces. **Core ports:** `HerdrPort` (send/read),
   `staleDeferredSendJitterPercent` (15%, a separate daemon constant) by trigram
   Jaccard, so an agent CLI's dynamic status line repainting during a minutes-long
   consult does not read as "the pane moved on" and escalate a confident answer.
-  Situation type is asserted separately (the fuzzy compare sees salients only),
-  an over-masked signature never matches at all (its hash is empty), and a
-  tolerated drift re-screens the fresh pane through never-auto + suspected-
-  irreversible — the pre-consult screen no longer covers text that changed since.
-  Measured at the default salient window: a status-line repaint is 9-13% away, the
-  nearest false accept (same scrollback, question line swapped) 21%.
+  The fuzzy path is confined to **unstructured pane-tail salients**: a structured
+  salient (approval verb + options, choice options, error summary) is short and
+  identity-bearing, so a one-word target swap ("apply … to the *test* service" →
+  "*live* service") stays ~86% similar and would fuse two different approvals —
+  those require an exact match (`domain.StructuredSalient`). Situation type is
+  asserted separately (the fuzzy compare sees salients only), an over-masked
+  signature never matches at all (its hash is empty), and a tolerated drift
+  re-screens the fresh pane through never-auto + suspected-irreversible — the
+  pre-consult screen no longer covers text that changed since. Measured at the
+  default salient window: a status-line repaint is 9-13% away, the nearest
+  pane-tail false accept (same scrollback, question line swapped) 21%.
 
 ### Learning Subsystem *(domain, daemon-owned writer)*
 

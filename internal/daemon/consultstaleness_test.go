@@ -151,3 +151,50 @@ func TestLLMConsultRejectsSwappedQuestionOnSharedScrollback(t *testing.T) {
 		t.Errorf("want an %s escalation, got rationale %q", domain.ReasonLLMNoSubmit, esc[0].Rationale)
 	}
 }
+
+// A STRUCTURED approval (permission verb + options) whose target swaps one word
+// during the consult must escalate, not deliver: its salient stays ~86% similar
+// so an order-insensitive tolerance would fuse "test service" and "live
+// service" and send a yes learned for one into the other. domain.SignatureHeldStill
+// keeps structured salients on exact matching. This is the PR #230 collision,
+// end to end.
+func TestLLMConsultRejectsStructuredTargetSwap(t *testing.T) {
+	before := "Bash(deploy)\n\nDo you want to apply the requested change to the test service?\n❯ 1. Yes\n  2. No\n"
+	during := "Bash(deploy)\n\nDo you want to apply the requested change to the live service?\n❯ 1. Yes\n  2. No\n"
+
+	// Premise: both are structured approvals (verb extracted) with distinct
+	// hashes, and their salients ARE within the tolerance — only the
+	// structured-salient guard keeps them apart.
+	sb := domain.ComputeSignature(classifierForTest().Classify("claude", "blocked", before))
+	sd := domain.ComputeSignature(classifierForTest().Classify("claude", "blocked", during))
+	if sb.Verdict != domain.GuardOK || sd.Verdict != domain.GuardOK || sb.Raw == sd.Raw {
+		t.Fatalf("premise broken: verdicts %v/%v raw-equal=%v", sb.Verdict, sd.Verdict, sb.Raw == sd.Raw)
+	}
+	if !domain.StructuredSalient(sb.Salient) {
+		t.Fatalf("premise broken: expected a structured salient, got %q", sb.Salient)
+	}
+	if !domain.SimilarWithin(sb.Salient, sd.Salient, staleDeferredSendJitterPercent) {
+		t.Fatalf("premise broken: the swap is already beyond tolerance, so the guard is untested (%q vs %q)",
+			sb.Salient, sd.Salient)
+	}
+
+	h := newHarness(t, consultCfg)
+	h.herdr.setPane(before)
+	h.seedAutonomous(before, domain.SituationApproval, "1")
+	h.llm.configured = true
+	h.llm.consult = stageConsult(h, "1", during)
+
+	ctx := context.Background()
+	var esc []domain.AuditRecord
+	h.push("agent-target", "blocked")
+	waitFor(t, 5*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if sent := h.herdr.sentInputs(); len(sent) != 0 {
+		t.Errorf("a changed approval target must never receive the staged digit, sent %v", sent)
+	}
+	if !strings.Contains(esc[0].Rationale, string(domain.ReasonLLMNoSubmit)) {
+		t.Errorf("want an %s escalation, got rationale %q", domain.ReasonLLMNoSubmit, esc[0].Rationale)
+	}
+}

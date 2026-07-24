@@ -1158,10 +1158,10 @@ const (
 	// staleDeferredSendJitterPercent is how much a situation's salient may drift while
 	// a deferred send waits (LLM consult, action review) and still count as the
 	// same standing situation — see domain.SignatureHeldStill, which applies it
-	// only after the exact hash compare has already failed. Unlike the dedup
-	// constant it carries no minimum-capture gate: a small salient that barely
-	// changed is still the screen that was decided, and a genuinely different
-	// question is nowhere near this close.
+	// only after the exact hash compare has already failed and only to
+	// UNSTRUCTURED pane-tail salients. Unlike the dedup constant it carries no
+	// minimum-capture gate: a small pane-tail salient that barely changed is still
+	// the screen that was decided.
 	//
 	// Deliberately looser than escalationDedupJitterPercent and deliberately a
 	// SEPARATE constant: a consult runs for seconds to minutes of status-line
@@ -1169,13 +1169,16 @@ const (
 	// the duplicate-ask check spans, and tuning one must never loosen the other.
 	//
 	// 15 sits in a measured band at the DEFAULT ~500-rune salient window: an
-	// ordinary status-line repaint lands 9-13% away, while the nearest false
-	// accept — the same scrollback with only the question line swapped — is 21%
-	// away and a different command 29%
+	// ordinary status-line repaint lands 9-13% away, while the nearest pane-tail
+	// false accept — the same scrollback with only the question line swapped — is
+	// 21% away and a different command 29%
 	// (TestLLMConsultRejectsSwappedQuestionOnSharedScrollback pins the lower
 	// edge). Note the band narrows if embedding.pane_salient_chars is raised far
 	// above the default: a longer window dilutes a changed question line into
-	// more unchanged scrollback.
+	// more unchanged scrollback. Structured salients (approval verb + options,
+	// choice options, error summary) don't take this path at all — a one-word
+	// target swap there stays ~86% similar, so they require an exact match
+	// (domain.StructuredSalient; the test-vs-live collision from PR #230).
 	staleDeferredSendJitterPercent = 15
 )
 
