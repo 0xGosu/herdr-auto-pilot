@@ -2005,3 +2005,91 @@ func TestConfigShowsEnvKeysNeverValues(t *testing.T) {
 		}
 	}
 }
+
+func TestSignaturesSearchKeyword(t *testing.T) {
+	app, st := testApp(t)
+	seedSignatures(t, st)
+
+	// A field substring (mode) matches the shadow rule only.
+	out, err := run(t, app, "signatures", "search", "shadow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "approval:aaaa111…") {
+		t.Errorf("keyword search missing the shadow rule:\n%s", out)
+	}
+	if strings.Contains(out, "choice:cccc3333") {
+		t.Errorf("keyword search should not include the autonomous rule:\n%s", out)
+	}
+	if !strings.Contains(out, "1 keyword match(es)") {
+		t.Errorf("missing keyword match count:\n%s", out)
+	}
+
+	// No query is a usage error, not an all-rows dump.
+	if _, err := run(t, app, "signatures", "search"); err == nil {
+		t.Error("search with no query should error")
+	}
+
+	// A query matching nothing reports cleanly with a next-step hint.
+	out, err = run(t, app, "signatures", "search", "zzzznope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "no rules match") {
+		t.Errorf("empty result should say so:\n%s", out)
+	}
+}
+
+// seedSearchableRule persists a learned state + its semantic identity row so
+// `signatures search --semantic` can both list and rank it.
+func seedSearchableRule(t *testing.T, st *store.Store, sig, model string, vec []float32) {
+	t.Helper()
+	ctx := context.Background()
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: sig, SituationType: domain.SituationApproval, AgentType: "claude",
+		Mode: domain.ModeShadow, UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSignatureEmbedding(ctx, domain.SignatureEmbedding{
+		Signature: sig, SituationType: domain.SituationApproval, AgentType: "claude",
+		Model: model, Dims: len(vec), Vector: vec, Salient: "permission:" + sig, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSignaturesSearchSemantic(t *testing.T) {
+	app, st := testApp(t)
+	modelPath := filepath.Join(t.TempDir(), "test-model.gguf")
+	if err := os.WriteFile(modelPath, []byte("gguf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(app.ConfigPath,
+		[]byte(fmt.Sprintf("[embedding]\nmodel_path = %q\n", modelPath)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app.NewEmbedder = func(config.Embedding) ports.EmbedderPort {
+		return &cliFakeEmbedder{id: "test-model.gguf"} // embeds every query as {1,0,0}
+	}
+	// Cosine vs {1,0,0}: hit=1.0 (ranked), miss=0.0 (below the 0.3 floor).
+	seedSearchableRule(t, st, "approval:hit", "test-model.gguf", []float32{1, 0, 0})
+	seedSearchableRule(t, st, "approval:miss", "test-model.gguf", []float32{0, 1, 0})
+
+	out, err := run(t, app, "signatures", "search", "approve the write", "--semantic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "approval:hit") {
+		t.Errorf("semantic search missing the aligned rule:\n%s", out)
+	}
+	if strings.Contains(out, "approval:miss") {
+		t.Errorf("semantic search should drop the orthogonal rule below the floor:\n%s", out)
+	}
+	if !strings.Contains(out, "sem=1.00") {
+		t.Errorf("semantic search should show the cosine score column:\n%s", out)
+	}
+	if !strings.Contains(out, "1 semantic match(es)") {
+		t.Errorf("missing semantic match count:\n%s", out)
+	}
+}

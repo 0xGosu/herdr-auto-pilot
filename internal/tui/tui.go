@@ -77,6 +77,15 @@ type sigDetailMsg struct {
 	err     error
 }
 
+// semanticSearchMsg carries the result of an embedding search on the Rules tab
+// (dispatched by semanticSearchCmd). query is echoed back so a result that
+// arrives after the operator edited the box is ignored by semanticActive.
+type semanticSearchMsg struct {
+	query   string
+	results []frontend.SignatureSearchResult
+	err     error
+}
+
 type actionResultMsg struct {
 	message string
 	err     error
@@ -483,9 +492,14 @@ type Model struct {
 
 	tab     tab
 	data    refreshMsg
-	items   []ruleItem     // Config tab rows, rebuilt on refresh
-	sigMode domain.Mode    // Rules tab display filter: "" = all
-	marked  map[int64]bool // Escalations tab multi-select (audit ids), space toggles
+	items   []ruleItem  // Config tab rows, rebuilt on refresh
+	sigMode domain.Mode // Rules tab display filter: "" = all
+	// sigSemantic holds the last semantic (embedding) search on the Rules tab.
+	// It is applied only while its query still equals the tab's live query
+	// (semanticActive) — so editing the query drops back to live keyword
+	// filtering with no explicit teardown. nil = never run / not applicable.
+	sigSemantic *semanticSigSearch
+	marked      map[int64]bool // Escalations tab multi-select (audit ids), space toggles
 	// taskMarks is the Tasks tab multi-select, keyed by taskMarkKey
 	// (group index + item number). Space toggles; d/x consume the set.
 	taskMarks map[string]bool
@@ -571,6 +585,62 @@ func (m Model) matchesQuery(t tab, fields ...string) bool {
 		}
 	}
 	return false
+}
+
+// semanticSigSearch is the result of one embedding search on the Rules tab: the
+// query it ran for (so an edited query invalidates it) and the ranked results.
+type semanticSigSearch struct {
+	query   string
+	results []frontend.SignatureSearchResult
+}
+
+// semanticHintVisible reports whether the "press enter for semantic search"
+// footer should show: only while typing a 2+-word query on the Rules tab, where
+// embedding the whole phrase is meaningfully different from a substring filter.
+func (m Model) semanticHintVisible() bool {
+	return m.searching && m.tab == tabSignatures && len(strings.Fields(m.query[tabSignatures])) >= 2
+}
+
+// semanticActive reports whether the Rules tab is currently showing a semantic
+// result set rather than live keyword filtering — true only while the stored
+// search's query still equals the tab's live query, so any edit silently drops
+// back to keyword filtering without tearing sigSemantic down.
+func (m Model) semanticActive() bool {
+	return m.sigSemantic != nil && m.tab == tabSignatures &&
+		m.sigSemantic.query == m.query[tabSignatures]
+}
+
+// sigSemanticScores maps signature → cosine score for the active semantic
+// search, or nil when none is active (renderSignatures uses it to add the SEM
+// column).
+func (m Model) sigSemanticScores() map[string]float64 {
+	if !m.semanticActive() {
+		return nil
+	}
+	scores := make(map[string]float64, len(m.sigSemantic.results))
+	for _, r := range m.sigSemantic.results {
+		scores[r.Signature] = r.Score
+	}
+	return scores
+}
+
+// semanticSearchCmd embeds the query and ranks the learned rules by meaning,
+// off the update loop (the model loads the embedding model — see App.
+// SearchSignatures). The inflight Add mirrors do(): Run's drain never races the
+// counter from zero.
+func (m Model) semanticSearchCmd(query string) tea.Cmd {
+	app, ctx, wg := m.app, m.ctx, m.inflight
+	if wg != nil {
+		wg.Add(1)
+	}
+	return func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
+		results, err := app.SearchSignatures(ctx, query,
+			frontend.SignatureSearchOpts{Semantic: true}, domain.SignatureFilter{})
+		return semanticSearchMsg{query: query, results: results, err: err}
+	}
 }
 
 // visibleAgents applies the Agents tab search filter.
@@ -753,6 +823,28 @@ func (m Model) filterAudit(t tab, rows []domain.AuditRecord) []domain.AuditRecor
 // visibleSignatures applies the display-side mode filter (f key) composed
 // with the Rules tab search query (CR-017).
 func (m Model) visibleSignatures() []frontend.SignatureRow {
+	// Semantic search replaces keyword filtering: show the ranked matches in
+	// score order, re-mapped onto the latest refresh so confidence/mode/LAST
+	// stay live (a signature that vanished since the search is dropped). The
+	// mode filter (f) still composes on top.
+	if m.semanticActive() {
+		byID := make(map[string]frontend.SignatureRow, len(m.data.signatures))
+		for _, r := range m.data.signatures {
+			byID[r.Signature] = r
+		}
+		var out []frontend.SignatureRow
+		for _, res := range m.sigSemantic.results {
+			r, ok := byID[res.Signature]
+			if !ok {
+				continue
+			}
+			if m.sigMode != "" && r.Mode != m.sigMode {
+				continue
+			}
+			out = append(out, r)
+		}
+		return out
+	}
 	if m.sigMode == "" && m.query[tabSignatures] == "" {
 		return m.data.signatures
 	}
@@ -1066,6 +1158,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.detail = d
 		return m, nil
+	case semanticSearchMsg:
+		if msg.err != nil {
+			m.message = ""
+			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
+			m.clampListViewport()
+			return m, nil
+		}
+		m.sigSemantic = &semanticSigSearch{query: msg.query, results: msg.results}
+		// A fresh ranking: start at the top match, not wherever the keyword
+		// cursor sat.
+		m.cursors[tabSignatures] = 0
+		m.offsets[tabSignatures] = 0
+		m.message = fmt.Sprintf("semantic: %d match(es) for %q", len(msg.results), msg.query)
+		m.clampListViewport()
+		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -1294,6 +1401,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC:
 			return m, tea.Quit
 		case tea.KeyEsc, tea.KeyEnter:
+			// On the Rules tab, Enter over a 2+-word query runs a semantic
+			// (embedding) search instead of just committing the keyword filter.
+			if msg.Type == tea.KeyEnter && m.semanticHintVisible() {
+				q := m.query[tabSignatures]
+				m.searching = false
+				m.message = "running semantic search…"
+				m.clampListViewport()
+				return m, m.semanticSearchCmd(q)
+			}
 			// Leaving search hands ←/→ back to tab navigation.
 			m.searching = false
 		default:
@@ -2822,6 +2938,9 @@ func (m Model) listPageSize() int {
 	if m.searching || (m.tab.isList() && m.query[m.tab] != "") {
 		chrome++
 	}
+	if m.semanticHintVisible() {
+		chrome++ // the extra "enter: semantic search" hint line under the box
+	}
 	if m.tab == tabSignatures && m.sigMode != "" {
 		chrome++
 	}
@@ -4107,6 +4226,13 @@ func (m Model) View() string {
 	// listPageSize so the body never overflows the pane).
 	if m.searching {
 		fmt.Fprintf(&b, "%s%s\n", st.section.Render("search> "), m.queryEdit().withCaret())
+		if m.semanticHintVisible() {
+			fmt.Fprintf(&b, "%s\n", st.help.Render(
+				"enter: semantic search — embed this query to rank rules by meaning"))
+		}
+	} else if m.semanticActive() {
+		fmt.Fprintf(&b, "%s\n", st.help.Render(
+			fmt.Sprintf("semantic: %q — / to edit, backspace to clear", m.query[tabSignatures])))
 	} else if m.tab.isList() && m.query[m.tab] != "" {
 		fmt.Fprintf(&b, "%s\n", st.help.Render(
 			fmt.Sprintf("filter: %q — / to edit, backspace to clear", m.query[m.tab])))
@@ -4319,7 +4445,14 @@ func (m Model) renderSignatures(b *strings.Builder) {
 	// to fit "5h 59m ago" and the ≥ 6h timestamp fallback; "-" until first use.
 	const rulesRowFmt = "%-*s %-12s %-10s %5s %-11s %7s  %s"
 	actWidth, _ := m.budget(sigW+52, false)
-	header := fmt.Sprintf(rulesRowFmt, sigW,
+	// A semantic search adds a leading SEM (cosine) column; keyword search and
+	// the plain list omit it entirely.
+	scores := m.sigSemanticScores()
+	semHeader := ""
+	if scores != nil {
+		semHeader = fmt.Sprintf("%-6s", "SEM")
+	}
+	header := semHeader + fmt.Sprintf(rulesRowFmt, sigW,
 		"SIGNATURE", "LAST", "TYPE", "CONF", "MODE", "CONFIRM", "TOP ACTION")
 	fmt.Fprintln(b, st.section.Render(header))
 	start, end := m.window(len(sigs))
@@ -4329,7 +4462,11 @@ func (m Model) renderSignatures(b *strings.Builder) {
 		if r.LastAudit != nil {
 			lastUsed = r.LastAudit.CreatedAt
 		}
-		line := fmt.Sprintf(rulesRowFmt,
+		semCol := ""
+		if scores != nil {
+			semCol = fmt.Sprintf("%-6s", fmt.Sprintf("%.2f", scores[r.Signature]))
+		}
+		line := semCol + fmt.Sprintf(rulesRowFmt,
 			sigW, r.Signature, humanizeWhen(lastUsed, m.renderNow()), orDash(r.AgentType),
 			frontend.ConfidenceLabel(r.Confidence), r.Mode,
 			fmt.Sprintf("%d/%d", r.ConsecutiveConfirmations, gradN),
