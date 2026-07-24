@@ -106,6 +106,57 @@ func TestReleaseIsClaimScoped(t *testing.T) {
 	})
 }
 
+// TestLockPathAndMutateAgreeForNestedEnvVars guards the read/mutate/lock
+// identity for a $VAR whose value is itself a $VAR reference. os.ExpandEnv is
+// single-pass, so before ExpandPath was made idempotent the lock key (LockPath
+// expands once more) diverged from the file MutateWithin actually read/wrote.
+func TestLockPathAndMutateAgreeForNestedEnvVars(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(real, []byte("- [ ] alpha\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TASKS_B", real)
+	t.Setenv("TASKS_A", "$TASKS_B") // A's value is itself a $VAR reference
+
+	// The lock key for the nested spelling must equal the absolute one.
+	if got, want := LockPath("$TASKS_A"), LockPath(real); got != want {
+		t.Errorf("LockPath($TASKS_A) = %q, want %q", got, want)
+	}
+	// And the mutation must land in the real file, not a literal "$TASKS_B".
+	mutate, _ := ReserveFirstPending("alpha")
+	if _, err := Mutate("$TASKS_A", mutate); err != nil {
+		t.Fatalf("Mutate($TASKS_A): %v", err)
+	}
+	if got := read(t, real); got != "- [-] alpha\n" {
+		t.Errorf("nested-var file not mutated: %q", got)
+	}
+}
+
+func TestMutateResolvesTildePath(t *testing.T) {
+	// A ~-based task_sources.path must read AND write the real home file, not a
+	// literally-named "~" directory. This is the functional half of the
+	// expansion (TestLockPathExpandsShorthand covers the lock-key half).
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	real := filepath.Join(home, "tasks.md")
+	if err := os.WriteFile(real, []byte("- [ ] alpha\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mutate, _ := ReserveFirstPending("alpha")
+	if _, err := Mutate("~/tasks.md", mutate); err != nil {
+		t.Fatalf("Mutate(~/tasks.md): %v", err)
+	}
+	got := read(t, real)
+	if got != "- [-] alpha\n" {
+		t.Errorf("home file not mutated via ~ path: %q", got)
+	}
+	// And no stray literal-tilde file was created next to the cwd.
+	if _, err := os.Stat("~"); err == nil {
+		t.Error("a literal ~ path was created; expansion did not happen")
+	}
+}
+
 func TestMutatePreservesPermissions(t *testing.T) {
 	// A user's 0644 --path checklist must not be narrowed on every edit.
 	path := writeTasks(t, "- [ ] alpha\n")
@@ -136,6 +187,23 @@ func TestLockPathIsStableAcrossEquivalentPaths(t *testing.T) {
 	viaDot := filepath.Join(dir, ".", "tasks.md")
 	if LockPath(path) != LockPath(viaDot) {
 		t.Errorf("lock path differs for equivalent paths: %s vs %s", LockPath(path), LockPath(viaDot))
+	}
+}
+
+// TestLockPathExpandsShorthand guards the lock-divergence invariant for the
+// config shorthands ExpandPath resolves: a source spelled `~/tasks.md` or
+// `$HOME/tasks.md` and its absolute form MUST hash to the same lock, or the
+// daemon and the CLI/TUI would lock different keys for one file and stop
+// serializing concurrent mutations.
+func TestLockPathExpandsShorthand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	abs := filepath.Join(home, "tasks.md")
+	want := LockPath(abs)
+	for _, spelling := range []string{"~/tasks.md", "$HOME/tasks.md", "${HOME}/tasks.md"} {
+		if got := LockPath(spelling); got != want {
+			t.Errorf("LockPath(%q) = %q, want %q (same file as %q)", spelling, got, want, abs)
+		}
 	}
 }
 

@@ -456,12 +456,14 @@ func inProgressTask(content, taskText string) bool {
 }
 
 // canonicalTaskPath resolves a task-source path to the one key that identifies
-// the physical file (absolute, symlinks resolved — the same normalization
-// taskfile.LockPath applies). Claims are compared by path, and two
-// [[task_sources]] entries can spell the same file differently; without this
-// they would look like different sources and could promise one line to two
+// the physical file (~ and $VAR expanded, then absolute, symlinks resolved —
+// the same normalization taskfile.LockPath applies). Claims are compared by
+// path, and two [[task_sources]] entries can spell the same file differently
+// (including one as `~/tasks.md` and another as its absolute form); without
+// this they would look like different sources and could promise one line to two
 // agents in a single sweep.
 func canonicalTaskPath(path string) string {
+	path = config.ExpandPath(path)
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}

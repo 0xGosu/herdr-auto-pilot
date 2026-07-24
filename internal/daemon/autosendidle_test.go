@@ -124,6 +124,59 @@ func quietFor(t *testing.T, h *harness, d time.Duration) {
 	}
 }
 
+func TestAutoSendIdleResolvesTildeSourcePathDespiteStateDirCwd(t *testing.T) {
+	// Regression: a task_sources.path written as "~/tasks.md" must resolve to
+	// the operator's HOME even though the daemon chdirs to its StateDir at
+	// startup (chdirStable, main.go:182). If "~" were treated as a plain
+	// relative path it would resolve against the cwd (the state dir) as a
+	// literal "~" directory, the source would never be read, and the agent
+	// would stay parked forever. HOME and the cwd are redirected to DISTINCT
+	// temp dirs so a relative-resolution regression cannot accidentally find
+	// the file — only genuine ~ expansion locates it.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stateDir := t.TempDir()
+	t.Chdir(stateDir) // stand in for chdirStable(StateDir): cwd != HOME
+
+	realFile := filepath.Join(home, "tasks.md")
+	if err := os.WriteFile(realFile, []byte("- [x] done\n- [ ] step two\n- [ ] step three\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The source path is the shorthand, exactly as an operator would write it.
+	cfg := "[[task_sources]]\nagent = \"agent-tilde\"\npath = \"~/tasks.md\"\nenable_auto_send_task_when_idle = true\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(autoSendIdlePane)
+	h.seedAutonomous(autoSendIdlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	name, err := h.raw.EnsureAgentName(context.Background(), "agent-tilde")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agents := parkIdle(h, 2*time.Minute, "agent-tilde")
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	// A send proves the daemon READ the ~-based source from HOME, not the cwd.
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	want := (&domain.DeclaredTask{Task: "step two", Path: "~/tasks.md", AgentName: name}).Prompt()
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sent %q, want the next declared task prompt %q", got, want)
+	}
+	// The reservation MUST land in the real HOME file — proof the mutate path
+	// (taskfile.MutateWithin) expanded ~ too, not a literal "~" file elsewhere.
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, realFile), "- [-] step two")
+	})
+	if got := readTasks(t, realFile); !strings.Contains(got, "- [ ] step three") {
+		t.Errorf("only the delivered task should be reserved:\n%s", got)
+	}
+	// And no literal "~" path leaked into the state dir (the cwd).
+	if _, err := os.Stat(filepath.Join(stateDir, "~")); err == nil {
+		t.Error("a literal ~ path was created under the state dir; expansion did not happen")
+	}
+}
+
 func TestAutoSendIdleOffByDefault(t *testing.T) {
 	// Without enable_auto_send_task_when_idle a long-idle agent is left alone:
 	// today's event-driven behavior is unchanged for every existing source.

@@ -328,7 +328,14 @@ func New(opt Options) (*Daemon, error) {
 		opt.Clock = ports.SystemClock{}
 	}
 	if opt.ReadTaskFile == nil {
-		opt.ReadTaskFile = os.ReadFile
+		// Expand ~/$VAR so a task_sources.path written with either shorthand
+		// reaches the same physical file canonicalTaskPath keys it by. Reads
+		// bypass the taskfile package (which expands its own writes/locks), so
+		// the wrapper is needed here; MutateTaskFile below goes through
+		// taskfile.MutateWithin, which expands, so it does not.
+		opt.ReadTaskFile = func(path string) ([]byte, error) {
+			return os.ReadFile(config.ExpandPath(path))
+		}
 	}
 	if opt.MutateTaskFile == nil {
 		opt.MutateTaskFile = func(path string, fn func(string) (string, error)) error {

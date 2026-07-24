@@ -195,11 +195,14 @@ func ResolveContextWindow(cfg config.Embedding) int {
 	return w
 }
 
-// ResolveModelPath expands the configured model path, defaulting to the
-// bundled model next to the binary. Shared with `hap status` reporting.
+// ResolveModelPath expands the configured model path (~ and $VAR resolved),
+// defaulting to the bundled model next to the binary. The emptiness check is on
+// the EXPANDED value, so a model_path that expands to "" (e.g. an unset
+// `$VAR`) falls back to the bundled default rather than handing the embedder an
+// empty path. Shared with `hap status` reporting.
 func ResolveModelPath(cfg config.Embedding) string {
-	if cfg.ModelPath != "" {
-		return cfg.ModelPath
+	if expanded := config.ExpandPath(cfg.ModelPath); expanded != "" {
+		return expanded
 	}
 	return filepath.Join(PluginRoot(), "models", DefaultModelFile)
 }

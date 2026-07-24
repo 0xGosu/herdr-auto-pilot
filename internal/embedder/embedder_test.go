@@ -1,10 +1,35 @@
 package embedder
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 )
+
+// TestResolveModelPathExpandsAndFallsBack covers the model-path resolution:
+// a real override is ~/$VAR-expanded, while an empty configured value OR one
+// that EXPANDS to empty (an unset $VAR) falls back to the bundled default
+// rather than handing the embedder an empty path. Engine-independent.
+func TestResolveModelPathExpandsAndFallsBack(t *testing.T) {
+	bundled := filepath.Join(PluginRoot(), "models", DefaultModelFile)
+
+	t.Setenv("HOME", "/home/tester")
+	if got := ResolveModelPath(config.Embedding{ModelPath: "~/models/m.gguf"}); got != "/home/tester/models/m.gguf" {
+		t.Errorf("~ override = %q, want /home/tester/models/m.gguf", got)
+	}
+	t.Setenv("HAP_MODEL", "/opt/models/m.gguf")
+	if got := ResolveModelPath(config.Embedding{ModelPath: "$HAP_MODEL"}); got != "/opt/models/m.gguf" {
+		t.Errorf("$VAR override = %q, want /opt/models/m.gguf", got)
+	}
+	// Empty, and expands-to-empty, both fall back to the bundled default.
+	if got := ResolveModelPath(config.Embedding{ModelPath: ""}); got != bundled {
+		t.Errorf("empty model_path = %q, want bundled default %q", got, bundled)
+	}
+	if got := ResolveModelPath(config.Embedding{ModelPath: "$HAP_UNSET_MODEL"}); got != bundled {
+		t.Errorf("unset-$VAR model_path = %q, want bundled default %q", got, bundled)
+	}
+}
 
 // TestResolveContextWindowFloor covers the override boundaries — 0/negative
 // fall to the default, and any positive value below the safe minimum (at or

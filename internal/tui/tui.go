@@ -2195,11 +2195,12 @@ func truncatePathKeepBase(p string, limit int) string {
 const taskPathDisplayWidth = 44
 
 // canonicalTaskPath normalizes a source path for identity comparisons (the
-// duplicate dedupe and the per-file delete ordering): absolute + symlinks
-// resolved, best-effort. Two config spellings of one file (relative vs
-// absolute, /var vs /private/var) must not slip past the dedupe and mutate
-// the same line twice.
+// duplicate dedupe and the per-file delete ordering): ~/$VAR expanded, then
+// absolute + symlinks resolved, best-effort. Two config spellings of one file
+// (relative vs absolute, ~/x vs its absolute form, /var vs /private/var) must
+// not slip past the dedupe and mutate the same line twice.
 func canonicalTaskPath(p string) string {
+	p = config.ExpandPath(p)
 	if abs, err := filepath.Abs(p); err == nil {
 		p = abs
 	}

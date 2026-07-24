@@ -1045,7 +1045,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	bootstrapPath := filepath.Join(base, "tasks", sanitizeTaskFileName(name)+".md")
 	var external []config.TaskSource
 	for _, src := range a.matchingDeclaredSources(ctx, cfg, audit, name, live) {
-		p := src.Path
+		p := config.ExpandPath(src.Path)
 		if abs, err := filepath.Abs(p); err == nil {
 			p = abs
 		}
@@ -1198,6 +1198,9 @@ func taskCapExceededError(path string, existing, adding, limit int) error {
 // this file without the lock. Returns the merged task list (raw, unnumbered) so
 // the caller can locate a task's rendered position.
 func ensureGeneratedTaskFile(path, name string, tasks []string, limit int) ([]string, error) {
+	// Expand ~/$VAR so the manual os.ReadFile/WriteFileAtomic below and the
+	// lock key all resolve to the same physical file the daemon uses.
+	path = config.ExpandPath(path)
 	lockPath := taskLockPath(path)
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
 		return nil, err
@@ -1423,7 +1426,7 @@ func pickAppendTarget(sources []config.TaskSource) (config.TaskSource, bool) {
 	}
 	var withItems *config.TaskSource
 	for i := range sources {
-		p := sources[i].Path
+		p := config.ExpandPath(sources[i].Path)
 		if abs, err := filepath.Abs(p); err == nil {
 			p = abs
 		}
@@ -1456,7 +1459,7 @@ func pickAppendTarget(sources []config.TaskSource) (config.TaskSource, bool) {
 // before the send, so the daemon's idle flow can never hand it out mid-send,
 // and a failed send rolls it back to "[ ]".
 func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecord, src config.TaskSource, name string, tasks []string, send bool) error {
-	path := src.Path
+	path := config.ExpandPath(src.Path)
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
@@ -2512,8 +2515,9 @@ func MaxTasks(n int) TaskSourceOption {
 // "" uses the default.
 func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, template string, opts ...TaskSourceOption) error {
 	// The daemon reads the file from its own cwd (the state dir), not the
-	// operator's shell; resolve relative paths here where they still mean
-	// what the operator sees.
+	// operator's shell; expand ~/$VAR and resolve relative paths here where
+	// they still mean what the operator sees.
+	path = config.ExpandPath(path)
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
@@ -2589,6 +2593,7 @@ func resolveTaskFilePath(cfg config.Config, agent string) (string, error) {
 // takes precedence; otherwise the agent's configured source is resolved.
 func (a *App) taskFilePath(agent, path string) (string, error) {
 	if path != "" {
+		path = config.ExpandPath(path)
 		if abs, err := filepath.Abs(path); err == nil {
 			return abs, nil
 		}
@@ -2601,7 +2606,11 @@ func (a *App) taskFilePath(agent, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return resolveTaskFilePath(cfg, agent)
+	resolved, err := resolveTaskFilePath(cfg, agent)
+	if err != nil {
+		return "", err
+	}
+	return config.ExpandPath(resolved), nil
 }
 
 // The locked read-modify-write over a checklist file lives in
@@ -2657,7 +2666,7 @@ func (a *App) TaskSourceTemplateFor(agent, sourcePath string) (string, error) {
 		return "", err
 	}
 	for _, src := range cfg.TaskSources {
-		p := src.Path
+		p := config.ExpandPath(src.Path)
 		if abs, e := filepath.Abs(p); e == nil {
 			p = abs
 		}
@@ -2804,7 +2813,7 @@ func (a *App) paneCwd(ctx context.Context, paneID string) string {
 
 // readChecklist reads and parses a checklist file.
 func readChecklist(path string) ([]domain.ChecklistItem, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(config.ExpandPath(path))
 	if err != nil {
 		return nil, err
 	}
@@ -2956,15 +2965,17 @@ func (a *App) taskSourceLimit(resolvedPath string) int {
 	if err != nil {
 		return 0
 	}
-	// Abs both sides: the agent-addressed path comes back from
-	// resolveTaskFilePath as the raw config spelling (possibly relative),
-	// while a --path add is already absolute — normalize so a relative
-	// [[task_sources]] path still matches and stays capped.
+	// Expand ~/$VAR then Abs both sides: the agent-addressed path comes back
+	// from resolveTaskFilePath as the raw config spelling (possibly relative or
+	// ~-based), while a --path add is already absolute — normalize so a
+	// relative or shorthand [[task_sources]] path still matches and stays
+	// capped.
+	resolvedPath = config.ExpandPath(resolvedPath)
 	if abs, e := filepath.Abs(resolvedPath); e == nil {
 		resolvedPath = abs
 	}
 	for _, src := range cfg.TaskSources {
-		sp := src.Path
+		sp := config.ExpandPath(src.Path)
 		if abs, e := filepath.Abs(sp); e == nil {
 			sp = abs
 		}

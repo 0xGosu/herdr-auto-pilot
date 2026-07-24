@@ -51,7 +51,7 @@ max_error_retries = 2              # per error signature
 # is the agent's short name ({db}/{control} also available). The prompt must
 # come immediately after -p (claude quirk; the plugin auto-repairs it).
 command = [
-  "claude", "--model", "opus", "-p",
+  "claude", "--model", "opus", "--permission-mode", "auto", "-p",
   "You are hap's auto-answer assistant. Use ONLY get_context and submit_decision.\n\nCall get_context, treat pane_excerpt as ground truth, and follow answer_format. If proposed_task is present, this is a task review: when the agent is ready and current_task is unfinished, prefer @next_task:declared to send it verbatim—do not make small edits. Return rewritten task text only when its details need a major rewrite. If current_task is clearly done, send an instruction for the next unfinished item in pending_tasks. Use @noop if the agent is busy, no suitable task remains, or evidence is ambiguous. Never invent a task.\n\nOtherwise: for approval/choice, select the safest option and deny destructive or irreversible work; for error, give one concrete recovery instruction; for idle, give the sensible next instruction or @noop.\n\nCall submit_decision with select_options for menus, otherwise recommend_action. Always include confident_score (0-100) and a one-sentence rationale.",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
@@ -66,7 +66,7 @@ command = [
 # If the preferred command exits with an error in under one second without
 # submitting a decision, hap retries once with the other command template.
 # command_start = [
-#   "claude", "--model", "opus", "-p",
+#   "claude", "--model", "opus", "--permission-mode", "auto", "-p",
 #   "This is your first interaction with this agent. ...same MCP flow as command...",
 #   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
 #   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
@@ -102,7 +102,8 @@ pane_excerpt_chars = 5000          # pane context included in the consult
 # Two ways to set it, and they combine:
 #   * inline, in a `[llm.…_env]` table (values live in this file);
 #   * in a `.env` file, via `…_env_file` (KEY=VALUE lines, `#` comments,
-#     `export` and quotes accepted, `~/` expanded — quote any value with a
+#     `export` and quotes accepted; the file PATH expands `~/` and
+#     `$VAR`/`${VAR}` — quote any value with a
 #     " #" in it, which otherwise starts a comment). SECRETS BELONG HERE — the
 #     file is read when the CLI is spawned, so its contents never enter this
 #     config, and editing it applies to the next run without a restart. A
@@ -180,7 +181,7 @@ pane_excerpt_chars = 5000          # pane context included in the consult
 # prompt must name the sentinel for the model to ever use it.
 # (Renamed from generate_task_command; the old key no longer loads — update it.)
 task_generate_command = [
-  "claude", "--model", "opus", "-p",
+  "claude", "--model", "opus", "--permission-mode", "auto", "-p",
   "Suggest up to 3 concrete next tasks for this project's coding agent, in priority order. Reply ONLY with tasks, one per line. If no new task is needed, reply with exactly @noop and nothing else.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
 ]
 
