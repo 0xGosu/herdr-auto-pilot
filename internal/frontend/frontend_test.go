@@ -3880,6 +3880,47 @@ func TestSendTaskToAgent(t *testing.T) {
 	}
 }
 
+func TestSendTaskToAgentFoldsNestedDetail(t *testing.T) {
+	// A manual send folds the RESERVED item's nested sub-items into the
+	// delivered prompt (from the same locked snapshot as the reservation), while
+	// the item is marked [-] by its single-line identity.
+	app, _ := testApp(t)
+	h := &sendCaptureHerdr{agents: idleAt("w1:p2")}
+	app.Herdr = h
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	content := "- [ ] 1. Build the widget\n" +
+		"  - Wire the API\n" +
+		"  - Acceptance: it renders\n" +
+		"- [ ] 2. Later task\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "brave-otter", path, "", 1, "1. Build the widget"); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.sent) != 1 {
+		t.Fatalf("expected one delivery, got %v", h.sent)
+	}
+	for _, want := range []string{"1. Build the widget", "- Wire the API", "- Acceptance: it renders"} {
+		if !strings.Contains(h.sent[0], want) {
+			t.Errorf("delivered prompt missing folded detail %q:\n%s", want, h.sent[0])
+		}
+	}
+	// The second task's detail must NOT leak into task 1's delivery.
+	if strings.Contains(h.sent[0], "Later task") {
+		t.Errorf("a sibling task leaked into the folded content:\n%s", h.sent[0])
+	}
+	// Reserved by single-line identity; nested lines and the next task untouched.
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), "- [-] 1. Build the widget") {
+		t.Errorf("task should be marked in progress, got:\n%s", data)
+	}
+	if !strings.Contains(string(data), "  - Wire the API") || !strings.Contains(string(data), "- [ ] 2. Later task") {
+		t.Errorf("nested detail and next task must be preserved, got:\n%s", data)
+	}
+}
+
 // TestSendTaskToAgentRechecksIdle pins the guard against the window between
 // the caller's status read and delivery: the operator's confirmation (or a
 // --yes script) can be seconds stale, and a task must never land in a working

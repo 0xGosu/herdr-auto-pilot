@@ -2735,25 +2735,29 @@ func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName,
 	if strings.Contains(domain.TemplateOrDefault(template), "{cwd}") {
 		cwd = a.paneCwd(ctx, paneID)
 	}
-	if _, err := mutateTaskFile(sourcePath, reserveTask(index, taskText)); err != nil {
+	// Reserve the item AND fold its nested sub-items from the SAME locked
+	// snapshot, so the delivered detail always describes the item just marked
+	// [-] — even under a concurrent edit. Fold by the RESERVED index (the exact
+	// position reserveTask verified by text), never a separate post-reserve read:
+	// an insert/delete/reorder between reserve and that read could make the index
+	// point at a different item and send the wrong detail. taskText stays the
+	// reservation identity regardless.
+	folded := ""
+	if _, err := mutateTaskFile(sourcePath, func(content string) (string, error) {
+		out, rerr := reserveTask(index, taskText)(content)
+		if rerr != nil {
+			return out, rerr
+		}
+		folded = domain.FoldTaskContentAt(content, index)
+		return out, nil
+	}); err != nil {
 		// Name the phase: reserveTask's own refusals are self-describing, but
 		// a lock/read/write failure would otherwise surface as a bare os
 		// error in a flow whose first question is "did it send?".
 		return fmt.Errorf("reserving task #%d (nothing was sent): %w", index, err)
 	}
-	// Fold the task's nested sub-items into the delivered content, matching the
-	// daemon's idle-time send. Fold by the RESERVED index (not by text): this
-	// path reserves a specific position, so a duplicate title must not fold a
-	// different item's detail. Best-effort — an unreadable file falls back to the
-	// one-line title (Content stays ""); reserving marked only the checkbox, so
-	// the nested lines are intact for this read. taskText remains the reservation
-	// identity regardless.
-	content := ""
-	if data, rerr := os.ReadFile(config.ExpandPath(sourcePath)); rerr == nil {
-		content = domain.FoldTaskContentAt(string(data), index)
-	}
 	prompt := domain.DeclaredTask{
-		Task: taskText, Content: content, Path: sourcePath, Template: template, AgentName: agentName, Cwd: cwd,
+		Task: taskText, Content: folded, Path: sourcePath, Template: template, AgentName: agentName, Cwd: cwd,
 	}.Prompt()
 	if err := ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt); err != nil {
 		if _, rbErr := mutateTaskFile(sourcePath, releaseTask(index, taskText)); rbErr != nil {
