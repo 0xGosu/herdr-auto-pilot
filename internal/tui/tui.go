@@ -1167,6 +1167,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.err != nil {
+			// A failed rerun must not keep rendering a PRIOR search's ranked
+			// rows: with the same query, semanticActive() would still be true
+			// (it only checks the query/pointer pair), so the stale matches +
+			// SEM scores would show alongside the error. Invalidate them.
+			m.sigSemantic = nil
 			m.message = ""
 			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
 			m.clampListViewport()

@@ -184,6 +184,34 @@ func TestSemanticSearchEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSemanticSearchFailedRerunClearsStaleResults(t *testing.T) {
+	m := semanticModel(t)
+	// An active semantic search for a query.
+	m.query[tabSignatures] = "approve the write"
+	m.sigSemantic = &semanticSigSearch{
+		query: "approve the write",
+		results: []frontend.SignatureSearchResult{
+			{SignatureRow: frontend.SignatureRow{SignatureState: domain.SignatureState{Signature: "approval:hit"}}, Score: 1},
+		},
+	}
+	if !m.semanticActive() {
+		t.Fatal("precondition: the prior search should be active")
+	}
+	// A rerun of the SAME query fails (e.g. the model was removed). The stale
+	// ranked rows must not survive alongside the error.
+	upd, _ := m.Update(semanticSearchMsg{query: "approve the write", err: fmt.Errorf("model unavailable")})
+	m = upd.(Model)
+	if m.sigSemantic != nil {
+		t.Error("a failed rerun must invalidate the prior semantic result set")
+	}
+	if m.semanticActive() {
+		t.Error("no semantic search should remain active after a failed rerun")
+	}
+	if m.status == nil || !m.status.err {
+		t.Error("the failure should surface as an error status")
+	}
+}
+
 func TestSemanticSearchSingleWordEnterKeepsKeyword(t *testing.T) {
 	m := semanticModel(t)
 	m = press(t, m, "/")
