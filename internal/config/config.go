@@ -186,8 +186,9 @@ type LLM struct {
 	// Values support the same placeholders as the command template, minus
 	// {pane_excerpt} (untrusted pane text is never put in the environment).
 	//
-	// EnvFile is the shared `.env` file applied to every command; `~/` is
-	// expanded, and a relative path resolves against the daemon's cwd.
+	// EnvFile is the shared `.env` file applied to every command; a leading
+	// `~`/`~/…` and `$VAR`/`${VAR}` are expanded (via ExpandPath), and a
+	// relative path resolves against the daemon's cwd.
 	EnvFile string `toml:"env_file,omitempty"`
 	// CommandEnvFile is the `.env` file for Command only.
 	CommandEnvFile string `toml:"command_env_file,omitempty"`

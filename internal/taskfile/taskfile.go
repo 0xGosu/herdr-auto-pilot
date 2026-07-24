@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
@@ -32,6 +33,10 @@ func Mutate(path string, fn func(content string) (string, error)) ([]domain.Chec
 // on the main select loop, where an unbounded wait behind another hap process
 // would stall every agent.
 func MutateWithin(path string, wait time.Duration, fn func(content string) (string, error)) ([]domain.ChecklistItem, error) {
+	// Expand ~/$VAR here (and in LockPath below) so every process mutating a
+	// task_sources.path — daemon, CLI, TUI — reads, writes, and LOCKS the same
+	// physical file regardless of which shorthand the config used.
+	path = config.ExpandPath(path)
 	lockPath := LockPath(path)
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
 		return nil, err
@@ -89,13 +94,16 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 // than a `<file>.lock` sidecar — serializes concurrent mutations without
 // dropping a stray lock file into the user's repo next to a --path checklist.
 //
-// The path is canonicalized (absolute + symlinks resolved, best-effort) so
-// every caller — the daemon, the CLI, the TUI's add/edit, and the TUI's bulk
-// toggle/delete (which passes an already symlink-resolved path) — hashes to
-// the SAME key for one physical file. Without this, a symlinked path component
-// (e.g. macOS /var vs /private/var) would yield two different locks and stop
-// serializing concurrent mutations of the same checklist.
+// The path is canonicalized (~/$VAR expanded, then absolute + symlinks
+// resolved, best-effort) so every caller — the daemon, the CLI, the TUI's
+// add/edit, and the TUI's bulk toggle/delete (which passes an already
+// symlink-resolved path) — hashes to the SAME key for one physical file.
+// Without this, a symlinked path component (e.g. macOS /var vs /private/var),
+// or one config spelling a source `~/tasks.md` and another its absolute form,
+// would yield two different locks and stop serializing concurrent mutations of
+// the same checklist.
 func LockPath(path string) string {
+	path = config.ExpandPath(path)
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}

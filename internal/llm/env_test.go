@@ -100,6 +100,26 @@ func TestLoadEnvFileExpandsHome(t *testing.T) {
 	}
 }
 
+// TestLoadEnvFileExpandsEnvVars confirms the env_file PATH now resolves
+// $VAR/${VAR} (and $HOME) via the shared config.ExpandPath helper, not just ~.
+func TestLoadEnvFileExpandsEnvVars(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "hap.env"), []byte("FOO=bar\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HAP_ENV_DIR", dir)
+	t.Setenv("HOME", dir)
+	for _, spelling := range []string{"$HAP_ENV_DIR/hap.env", "${HAP_ENV_DIR}/hap.env", "$HOME/hap.env"} {
+		got, err := LoadEnvFile(spelling)
+		if err != nil {
+			t.Fatalf("LoadEnvFile(%q): %v", spelling, err)
+		}
+		if !slices.Equal(got, []string{"FOO=bar"}) {
+			t.Errorf("LoadEnvFile(%q) = %q, want FOO=bar", spelling, got)
+		}
+	}
+}
+
 // lookupEnv finds a key in a composed environment slice.
 func lookupEnv(t *testing.T, env []string, key string) (string, bool) {
 	t.Helper()

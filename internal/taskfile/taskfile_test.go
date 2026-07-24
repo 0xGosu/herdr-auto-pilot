@@ -106,6 +106,30 @@ func TestReleaseIsClaimScoped(t *testing.T) {
 	})
 }
 
+func TestMutateResolvesTildePath(t *testing.T) {
+	// A ~-based task_sources.path must read AND write the real home file, not a
+	// literally-named "~" directory. This is the functional half of the
+	// expansion (TestLockPathExpandsShorthand covers the lock-key half).
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	real := filepath.Join(home, "tasks.md")
+	if err := os.WriteFile(real, []byte("- [ ] alpha\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mutate, _ := ReserveFirstPending("alpha")
+	if _, err := Mutate("~/tasks.md", mutate); err != nil {
+		t.Fatalf("Mutate(~/tasks.md): %v", err)
+	}
+	got := read(t, real)
+	if got != "- [-] alpha\n" {
+		t.Errorf("home file not mutated via ~ path: %q", got)
+	}
+	// And no stray literal-tilde file was created next to the cwd.
+	if _, err := os.Stat("~"); err == nil {
+		t.Error("a literal ~ path was created; expansion did not happen")
+	}
+}
+
 func TestMutatePreservesPermissions(t *testing.T) {
 	// A user's 0644 --path checklist must not be narrowed on every edit.
 	path := writeTasks(t, "- [ ] alpha\n")
@@ -136,6 +160,23 @@ func TestLockPathIsStableAcrossEquivalentPaths(t *testing.T) {
 	viaDot := filepath.Join(dir, ".", "tasks.md")
 	if LockPath(path) != LockPath(viaDot) {
 		t.Errorf("lock path differs for equivalent paths: %s vs %s", LockPath(path), LockPath(viaDot))
+	}
+}
+
+// TestLockPathExpandsShorthand guards the lock-divergence invariant for the
+// config shorthands ExpandPath resolves: a source spelled `~/tasks.md` or
+// `$HOME/tasks.md` and its absolute form MUST hash to the same lock, or the
+// daemon and the CLI/TUI would lock different keys for one file and stop
+// serializing concurrent mutations.
+func TestLockPathExpandsShorthand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	abs := filepath.Join(home, "tasks.md")
+	want := LockPath(abs)
+	for _, spelling := range []string{"~/tasks.md", "$HOME/tasks.md", "${HOME}/tasks.md"} {
+		if got := LockPath(spelling); got != want {
+			t.Errorf("LockPath(%q) = %q, want %q (same file as %q)", spelling, got, want, abs)
+		}
 	}
 }
 

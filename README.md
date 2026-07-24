@@ -751,7 +751,7 @@ task at all (a bare `---`, punctuation only) is treated the same way.
 ```toml
 [llm]
 task_generate_command = [
-  "claude", "-p",
+  "claude", "--permission-mode", "auto", "-p",
   "Suggest concrete next tasks, most important first. Reply with only the tasks, one per line. If no new task is needed, reply with exactly @noop and nothing else.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
   "--model", "haiku",
 ]
@@ -968,7 +968,7 @@ Code:
 # Claude Code: the prompt belongs immediately after -p (the plugin
 # auto-repairs a prompt misplaced after other flags — see below).
 command = [
-  "claude", "-p",
+  "claude", "--permission-mode", "auto", "-p",
   "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (select_options for multiple-choice, recommend_action '@noop' to do nothing).",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
@@ -991,8 +991,8 @@ enables the fallback (`command` is what gates it):
 
 ```toml
 [llm]
-command       = [ "claude", "-p", "...ongoing consult prompt...", "--model", "haiku" ]
-command_start = [ "claude", "-p", "...first-touch kickoff prompt...", "--model", "opus" ]
+command       = [ "claude", "--permission-mode", "auto", "-p", "...ongoing consult prompt...", "--model", "haiku" ]
+command_start = [ "claude", "--permission-mode", "auto", "-p", "...first-touch kickoff prompt...", "--model", "opus" ]
 ```
 
 #### A separate environment per command
@@ -1021,7 +1021,8 @@ ANTHROPIC_MODEL = "haiku"                                       # cheaper for ta
 
 The `.env` format is the usual one: `KEY=VALUE` per line, `#` comments, an
 optional `export` prefix, and single/double quotes (`\n`, `\t`, `\"`, `\\`
-escapes inside double quotes). `~/` is expanded. In an *unquoted* value a
+escapes inside double quotes). The configured file *path* expands a leading
+`~`/`~/…` and `$VAR`/`${VAR}`. In an *unquoted* value a
 ` #` starts a comment, so quote any value that contains one; a value that
 opens a quote without closing it (a pasted multi-line key) is rejected
 rather than passed on truncated. **Secrets belong in the file, not in

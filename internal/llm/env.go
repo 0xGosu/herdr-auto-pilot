@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 )
 
 // This file builds the environment each LLM CLI is spawned with. Every one of
@@ -31,7 +33,7 @@ const maxEnvFileBytes = 1 << 20
 type EnvSpec struct {
 	// Vars are inline KEY→VALUE pairs; they override the file.
 	Vars map[string]string
-	// File is an optional path to a `.env` file ("~/" is expanded). A
+	// File is an optional path to a `.env` file (~/$VAR/${VAR} expanded). A
 	// configured file that cannot be read fails the run.
 	File string
 }
@@ -204,10 +206,9 @@ func (s *envSet) slice() []string { return s.order }
 // one that defines nothing at all, is an error naming the line NUMBER but
 // never its content.
 func LoadEnvFile(path string) ([]string, error) {
-	resolved, err := expandEnvPath(path)
-	if err != nil {
-		return nil, err
-	}
+	// Expand ~/$VAR via the shared config helper so an env_file path resolves
+	// the same shorthands as every other path-valued config key.
+	resolved := config.ExpandPath(strings.TrimSpace(path))
 	info, err := os.Stat(resolved)
 	if err != nil {
 		return nil, fmt.Errorf("read env file %s: %w", resolved, err)
@@ -323,20 +324,4 @@ func validEnvKey(name string) bool {
 		}
 	}
 	return true
-}
-
-// expandEnvPath resolves "~" / "~/…" in a configured env file path.
-func expandEnvPath(path string) (string, error) {
-	path = strings.TrimSpace(path)
-	if path != "~" && !strings.HasPrefix(path, "~/") {
-		return path, nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("expand env file path %q: %w", path, err)
-	}
-	if path == "~" {
-		return home, nil
-	}
-	return filepath.Join(home, path[2:]), nil
 }
