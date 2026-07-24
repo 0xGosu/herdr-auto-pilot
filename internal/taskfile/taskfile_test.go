@@ -106,6 +106,33 @@ func TestReleaseIsClaimScoped(t *testing.T) {
 	})
 }
 
+// TestLockPathAndMutateAgreeForNestedEnvVars guards the read/mutate/lock
+// identity for a $VAR whose value is itself a $VAR reference. os.ExpandEnv is
+// single-pass, so before ExpandPath was made idempotent the lock key (LockPath
+// expands once more) diverged from the file MutateWithin actually read/wrote.
+func TestLockPathAndMutateAgreeForNestedEnvVars(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(real, []byte("- [ ] alpha\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TASKS_B", real)
+	t.Setenv("TASKS_A", "$TASKS_B") // A's value is itself a $VAR reference
+
+	// The lock key for the nested spelling must equal the absolute one.
+	if got, want := LockPath("$TASKS_A"), LockPath(real); got != want {
+		t.Errorf("LockPath($TASKS_A) = %q, want %q", got, want)
+	}
+	// And the mutation must land in the real file, not a literal "$TASKS_B".
+	mutate, _ := ReserveFirstPending("alpha")
+	if _, err := Mutate("$TASKS_A", mutate); err != nil {
+		t.Fatalf("Mutate($TASKS_A): %v", err)
+	}
+	if got := read(t, real); got != "- [-] alpha\n" {
+		t.Errorf("nested-var file not mutated: %q", got)
+	}
+}
+
 func TestMutateResolvesTildePath(t *testing.T) {
 	// A ~-based task_sources.path must read AND write the real home file, not a
 	// literally-named "~" directory. This is the functional half of the
