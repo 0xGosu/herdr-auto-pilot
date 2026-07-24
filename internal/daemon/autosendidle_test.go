@@ -228,6 +228,53 @@ func TestAutoSendIdleSendsNextPendingTaskAndReservesIt(t *testing.T) {
 	}
 }
 
+func TestAutoSendIdleFoldsNestedTaskDetailButReservesByIdentity(t *testing.T) {
+	// A hand-authored task carries its detail as nested sub-bullets. The
+	// delivered prompt must fold those in (title + nested lines), while the
+	// RESERVATION still keys off the single-line title identity — so the item is
+	// marked [-] correctly and the next task is untouched.
+	content := "- [ ] 1. Build the widget\n" +
+		"  - Wire the API\n" +
+		"  - Acceptance: it renders\n" +
+		"- [ ] 2. Later task\n"
+	h, taskFile := autoSendFixture(t, "agent-fold", content, true)
+	name, err := h.raw.EnsureAgentName(context.Background(), "agent-fold")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agents := parkIdle(h, 2*time.Minute, "agent-fold")
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	want := (&domain.DeclaredTask{
+		Task:      "1. Build the widget",
+		Content:   domain.FoldTaskContent(content, "1. Build the widget"),
+		Path:      taskFile,
+		AgentName: name,
+	}).Prompt()
+	got := h.herdr.sentInputs()[0]
+	if got != want {
+		t.Errorf("sent %q, want the folded declared-task prompt %q", got, want)
+	}
+	// The nested detail actually rode along.
+	if !strings.Contains(got, "- Wire the API") || !strings.Contains(got, "- Acceptance: it renders") {
+		t.Errorf("delivered prompt is missing folded nested detail:\n%s", got)
+	}
+	// Reservation marked the single-line title [-], leaving nested lines and the
+	// next task untouched.
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] 1. Build the widget")
+	})
+	after := readTasks(t, taskFile)
+	if !strings.Contains(after, "  - Wire the API") {
+		t.Errorf("nested detail must be preserved in the file, got:\n%s", after)
+	}
+	if !strings.Contains(after, "- [ ] 2. Later task") {
+		t.Errorf("only the delivered task should be reserved, got:\n%s", after)
+	}
+}
+
 func TestAutoSendIdleDoesNotClimbConsecutiveRunawayCounter(t *testing.T) {
 	// Regression: the runaway-loop guard (FR-019) counts every autonomous send
 	// toward ConsecutiveAuto, which only a human check-in resets. An idle agent

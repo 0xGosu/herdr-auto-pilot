@@ -2741,8 +2741,19 @@ func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName,
 		// error in a flow whose first question is "did it send?".
 		return fmt.Errorf("reserving task #%d (nothing was sent): %w", index, err)
 	}
+	// Fold the task's nested sub-items into the delivered content, matching the
+	// daemon's idle-time send. Fold by the RESERVED index (not by text): this
+	// path reserves a specific position, so a duplicate title must not fold a
+	// different item's detail. Best-effort — an unreadable file falls back to the
+	// one-line title (Content stays ""); reserving marked only the checkbox, so
+	// the nested lines are intact for this read. taskText remains the reservation
+	// identity regardless.
+	content := ""
+	if data, rerr := os.ReadFile(config.ExpandPath(sourcePath)); rerr == nil {
+		content = domain.FoldTaskContentAt(string(data), index)
+	}
 	prompt := domain.DeclaredTask{
-		Task: taskText, Path: sourcePath, Template: template, AgentName: agentName, Cwd: cwd,
+		Task: taskText, Content: content, Path: sourcePath, Template: template, AgentName: agentName, Cwd: cwd,
 	}.Prompt()
 	if err := ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt); err != nil {
 		if _, rbErr := mutateTaskFile(sourcePath, releaseTask(index, taskText)); rbErr != nil {

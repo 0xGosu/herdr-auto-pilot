@@ -4398,6 +4398,15 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 	return &domain.DeclaredTask{
 		Task: task, Path: m.src.Path, Template: m.src.NextTaskTemplate,
 		AgentName: agentName, Cwd: cwd,
+		// Fold the task's nested sub-items into the delivered content while
+		// Task stays the single-line reservation identity. A flat file (no
+		// nesting) folds to the title unchanged, so this is a no-op there.
+		// Deliberately fail-safe: the outbound-text safety scans (never-auto,
+		// suspected-irreversible) run over declared.Prompt(), so they now inspect
+		// the whole folded body — a destructive phrase in a task's nested notes
+		// escalates the hand-out instead of auto-sending it, which is the safe
+		// direction (more review, never less).
+		Content: domain.FoldTaskContent(string(m.data), task),
 		// A source opts out of the pre-send LLM review with llm_review=false
 		// (nil = the default, on).
 		LLMReview: m.src.EnableLLMReview == nil || *m.src.EnableLLMReview,
