@@ -260,6 +260,21 @@ hap signatures list --agent-type claude       # by agent type
 hap signatures list --min-conf 0.85          # by minimum cached confidence
 ```
 
+search learned signatures — keyword (case-insensitive substring over the rule's fields
+and its salient text) by default, or `--semantic` to embed the whole query and rank rules
+by meaning (cosine similarity; needs the embedding model). the same `--type` / `--mode` /
+`--agent-type` / `--min-conf` filters compose with either:
+
+```bash
+hap signatures search terraform                       # keyword substring
+hap signatures search "approve the file write" --semantic   # ranked by meaning
+hap signatures search "run tests" --semantic --limit 10 --min-score 0.5
+```
+
+the TUI mirrors this on the Rules tab: `/` starts a live keyword filter, and typing a
+2+-word query surfaces a hint to press **enter** for a semantic search (results show a
+`SEM` cosine column; editing the query returns to live keyword filtering).
+
 show full detail for a signature (recent decisions, last audit context):
 
 ```bash
