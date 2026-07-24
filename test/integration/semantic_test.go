@@ -73,8 +73,20 @@ func (f *semHerdr) ReadPane(_ context.Context, paneID string, _ int) (string, er
 	return f.panes[paneID], nil
 }
 
+// ListAgents reports every pane this fake knows as a live agent. The daemon
+// auto-dismisses an escalation whose agent is no longer in this list
+// (autoDismissAgentNotLive), so a fake that returns nothing turns every
+// expected escalation into a "dismissed" audit row.
 func (f *semHerdr) ListAgents(_ context.Context) ([]domain.AgentTransition, error) {
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]domain.AgentTransition, 0, len(f.panes))
+	for paneID := range f.panes {
+		out = append(out, domain.AgentTransition{
+			AgentID: paneID, PaneID: paneID, AgentType: "claude", Status: "blocked",
+		})
+	}
+	return out, nil
 }
 
 func (f *semHerdr) Notify(_ context.Context, _, _ string) error { return nil }
@@ -185,10 +197,21 @@ func TestRealEmbeddingSemanticMatch(t *testing.T) {
 	emb := embedder.NewReexecClient(config.Embedding{ModelPath: modelPath})
 	defer emb.Close()
 
+	// Everything else is defaults, but the capture delay must be tiny: events
+	// are delay-captured and a burst COALESCES (latest wins, one capture per
+	// burst), so with the default 10s/2s delays the readiness probe below —
+	// which re-pushes every 250ms — reschedules the capture timer forever and
+	// no pane is ever classified. Same wildcard rule the unit harness uses.
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath,
+		[]byte("[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 1\nevent_ms = 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	fh := &semHerdr{}
 	fe := &semEvents{ch: make(chan domain.AgentTransition, 64)}
 	d, err := daemon.New(daemon.Options{
-		ConfigPath:        filepath.Join(dir, "config.toml"), // absent: defaults
+		ConfigPath:        cfgPath,
 		ControlSocketPath: filepath.Join(testutil.SocketDir(t), "c.sock"),
 		Store:             st,
 		Herdr:             fh,

@@ -224,6 +224,58 @@ func ApprovalRemapCompatible(salient, candidate string) bool {
 	return inter*2 >= union
 }
 
+// SignatureHeldStill reports whether a re-read of the same pane still shows the
+// situation `prev` was computed from — the staleness gate every deferred send
+// (LLM consult, action review) runs before injecting an answer.
+//
+// The primary test is exact equality of the never-remapped content hash. It is
+// widened only because a consult can take minutes, during which an agent CLI
+// repaints a dynamic status line (spinner, elapsed time, token/context
+// counters). For situations whose salient IS the pane tail (idle, task
+// hand-outs, verbless approvals — see salientContent) that repaint lands inside
+// the hashed content, so an unchanged, still-blocked screen reads as stale and
+// a confident answer is escalated instead of delivered.
+//
+// The widening stays safe because refusing is the safe direction:
+//   - It only runs when the hashes already differ, so the common path is
+//     unchanged.
+//   - An over-masked signature has no usable content, so it never fuzzy-matches.
+//   - The salients compared are already MaskVolatile'd, so timestamps, paths and
+//     large numbers are folded BEFORE the tolerance is applied — what is left for
+//     the tolerance to absorb is genuinely unrecognized chrome.
+//   - The fuzzy path is confined to UNSTRUCTURED pane-tail salients
+//     (StructuredSalient == false). A structured salient — an approval's verb +
+//     options, a choice's option set, an error summary — is short and
+//     identity-bearing: "permission:apply … to the test service | options:no;yes"
+//     vs "… live service …" differs by one word yet shares ~86% of its trigrams,
+//     so an order-insensitive Jaccard compare would accept a materially different
+//     approval. Those keep exact matching; only raw screen text, where the drift
+//     is genuinely repainted chrome, is fuzzed.
+//
+// It does NOT compare situation type: the type is folded into the hash, so
+// callers taking the fuzzy path must assert type equality themselves.
+// jitterPct <= 0 makes this exactly the old hash comparison.
+func SignatureHeldStill(prev, fresh SignatureResult, jitterPct int) bool {
+	if prev.Verdict != GuardOK || fresh.Verdict != GuardOK {
+		// An over-masked signature has an EMPTY Raw, so a plain hash compare
+		// would call two unrelated over-masked screens "the same". They carry no
+		// content to compare either way, so refuse both the exact and the fuzzy
+		// answer and let the caller escalate (deferred sends never reach here
+		// today: an over-masked situation escalates at Decide).
+		return false
+	}
+	if prev.Raw == fresh.Raw {
+		return true
+	}
+	if jitterPct <= 0 {
+		return false
+	}
+	if StructuredSalient(prev.Salient) || StructuredSalient(fresh.Salient) {
+		return false
+	}
+	return SimilarWithin(prev.Salient, fresh.Salient, jitterPct)
+}
+
 // splitOptionSet is NormalizedOptionSet's inverse: it splits the encoding on
 // unescaped ";" back into a set of unescaped labels, dropping empty entries.
 func splitOptionSet(s string) map[string]bool {
@@ -293,6 +345,36 @@ func salientContent(s Situation, salientChars int) string {
 		content = string(r[len(r)-salientChars:])
 	}
 	return content
+}
+
+// structuredSalientPrefixes are the identity markers salientContent emits for
+// its NON-pane-tail branches: a choice's option set, an approval's permission
+// verb, an error's summary. Their presence means the salient is a distilled,
+// order-bearing identity rather than raw screen text. Like ApprovalRemapCompatible
+// this reads the MaskVolatile'd salient, so it relies on MaskVolatile never
+// rewriting these literal prefixes (none of its patterns touch them) — keep that
+// invariant if MaskVolatile ever grows a new masker.
+var structuredSalientPrefixes = []string{"permission:", "options:", "error:"}
+
+// StructuredSalient reports whether a salient came from one of salientContent's
+// structured branches (approval verb + options, choice options, error summary)
+// rather than the pane-tail fallback. Such salients are short and
+// identity-bearing: a one-word target swap ("apply … to the test service" →
+// "… live service") leaves most of the string — and most of its trigrams —
+// intact, so an order-insensitive similarity check cannot tell two materially
+// different approvals apart. Callers use this to keep structured salients on
+// exact matching while a repainting pane-tail salient may match fuzzily.
+//
+// A raw pane-tail salient that happens to begin with one of these markers is
+// misread as structured and held to exact matching — the safe direction (it
+// escalates a benign repaint rather than risk a mis-send).
+func StructuredSalient(salient string) bool {
+	for _, p := range structuredSalientPrefixes {
+		if strings.HasPrefix(salient, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // overMaskVerdict applies the over-masking floor.

@@ -10,6 +10,17 @@ func sit(t SituationType, agentType, content string) Situation {
 	return Situation{Type: t, AgentType: agentType, Content: content}
 }
 
+// approvalSit builds an approval whose salient is STRUCTURED, mirroring what
+// classify.enrich populates (a permission verb + option labels) so
+// salientContent emits "permission:<verb> | options:…" rather than the
+// pane-tail fallback.
+func approvalSit(verb string, options ...string) Situation {
+	return Situation{
+		Type: SituationApproval, AgentType: "claude",
+		Content: "Do you want to " + verb + "?", PermissionVerb: verb, Options: options,
+	}
+}
+
 func TestMaskVolatile(t *testing.T) {
 	cases := []struct {
 		name, in, want string
@@ -349,5 +360,114 @@ func TestComputeSignatureNWindow(t *testing.T) {
 	}
 	if DefaultPaneSalientChars != 500 {
 		t.Errorf("DefaultPaneSalientChars = %d, want 500", DefaultPaneSalientChars)
+	}
+}
+
+func TestSignatureHeldStill(t *testing.T) {
+	// A pane-tail salient plus the same screen with only its status line
+	// repainted — the shape that made a still-standing situation read as stale
+	// after an LLM consult.
+	body := "waiting for input. " + strings.Repeat("the previous step completed and the summary is above. ", 12)
+	before := sit(SituationIdle, "claude", body+"esc to interrupt tokens 812 context 41%")
+	after := sit(SituationIdle, "claude", body+"esc to interrupt tokens 947 context 43%")
+	other := sit(SituationIdle, "claude", "a completely different screen asking whether to remove the build directory before continuing with the release, plus more unrelated words")
+
+	// Short pane-tail salients (verbless approvals — no PermissionVerb, so
+	// salientContent falls back to raw content): a small capture that barely
+	// changed is still the same standing screen, so these take the fuzzy path.
+	shortA := sit(SituationApproval, "claude", "Ready to write the generated notes file?\nesc to interrupt tokens 812")
+	shortDrift := sit(SituationApproval, "claude", "Ready to write the generated notes file?\nesc to interrupt tokens 947")
+
+	// STRUCTURED salients (approval verb + options, as enrich builds them): a
+	// one-word target swap keeps ~86% of the trigrams, so an order-insensitive
+	// compare must NOT fuse them — they stay on exact matching. This is the
+	// collision charliecreates[bot] flagged on PR #230.
+	structTest := approvalSit("apply the requested change to the test service", "Yes", "No")
+	structLive := approvalSit("apply the requested change to the live service", "Yes", "No")
+
+	cases := []struct {
+		name       string
+		prev, next Situation
+		jitter     int
+		want       bool
+	}{
+		{"identical panes match on the exact hash", before, before, 15, true},
+		{"status-line repaint holds still within tolerance", before, after, 15, true},
+		{"status-line repaint is stale with jitter disabled", before, after, 0, false},
+		{"a different screen is stale even at tolerance", before, other, 15, false},
+		{"a barely-changed pane-tail approval holds still", shortA, shortDrift, 15, true},
+		{"a one-word structured target swap is stale", structTest, structLive, 15, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			prev := ComputeSignature(c.prev)
+			next := ComputeSignature(c.next)
+			if prev.Verdict != GuardOK || next.Verdict != GuardOK {
+				t.Fatalf("premise broken: verdicts %v / %v", prev.Verdict, next.Verdict)
+			}
+			if prev.Raw == next.Raw && !c.want {
+				t.Fatalf("premise broken: %q and %q hash equal, so nothing is being tested",
+					prev.Salient, next.Salient)
+			}
+			if got := SignatureHeldStill(prev, next, c.jitter); got != c.want {
+				t.Errorf("SignatureHeldStill = %v, want %v (salients %q vs %q)",
+					got, c.want, prev.Salient, next.Salient)
+			}
+		})
+	}
+
+	// The status-line case must actually exercise the fuzzy path: if the
+	// hashes matched, the table above would pass for the wrong reason.
+	if ComputeSignature(before).Raw == ComputeSignature(after).Raw {
+		t.Error("premise broken: the repainted pane must hash differently")
+	}
+
+	// An over-masked signature carries no usable content: it may only match by
+	// (empty) hash, never fuzzily.
+	over := ComputeSignature(sit(SituationIdle, "claude", "/a/b/c 12345"))
+	if over.Verdict == GuardOK {
+		t.Fatalf("premise broken: expected an over-masked signature")
+	}
+	if SignatureHeldStill(over, over, 15) {
+		t.Error("over-masked reads share an EMPTY Raw; matching on it would call two unrelated screens the same")
+	}
+	if SignatureHeldStill(ComputeSignature(before), over, 15) {
+		t.Error("an over-masked re-read must never match fuzzily")
+	}
+
+	// The structured collision must genuinely exercise the guard: absent it,
+	// the two salients ARE within 15% by trigram Jaccard, so the guard — not
+	// mere distance — is what keeps them apart.
+	st := ComputeSignature(structTest)
+	sl := ComputeSignature(structLive)
+	if st.Raw == sl.Raw {
+		t.Fatal("premise broken: the two structured approvals must hash differently")
+	}
+	// The margin here is ~1pt (the pair measures ~86% vs the 85% threshold): a
+	// "premise broken" failure means a MaskVolatile or sample-text edit nudged
+	// similarity below 85%, NOT that the guard regressed — widen the shared verb
+	// text to restore margin rather than deleting the guard.
+	if !SimilarWithin(st.Salient, sl.Salient, 15) {
+		t.Errorf("premise broken: the collision needs the StructuredSalient guard to reject it, "+
+			"but trigram distance alone already does (%q vs %q)", st.Salient, sl.Salient)
+	}
+}
+
+func TestStructuredSalient(t *testing.T) {
+	cases := []struct {
+		salient string
+		want    bool
+	}{
+		{"permission:apply the change | options:no;yes", true},
+		{"permission:select remote environment", true},
+		{"options:apple;banana", true},
+		{"error:usage limit reached", true},
+		{"The previous step finished. esc to interrupt", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := StructuredSalient(c.salient); got != c.want {
+			t.Errorf("StructuredSalient(%q) = %v, want %v", c.salient, got, c.want)
+		}
 	}
 }

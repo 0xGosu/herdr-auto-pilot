@@ -1155,6 +1155,31 @@ const (
 	// large tail-window captures (>= half the snapshot cap); small captures still
 	// require an exact match so two short but distinct questions never collapse.
 	escalationDedupJitterPercent = 5
+	// staleDeferredSendJitterPercent is how much a situation's salient may drift while
+	// a deferred send waits (LLM consult, action review) and still count as the
+	// same standing situation — see domain.SignatureHeldStill, which applies it
+	// only after the exact hash compare has already failed and only to
+	// UNSTRUCTURED pane-tail salients. Unlike the dedup constant it carries no
+	// minimum-capture gate: a small pane-tail salient that barely changed is still
+	// the screen that was decided.
+	//
+	// Deliberately looser than escalationDedupJitterPercent and deliberately a
+	// SEPARATE constant: a consult runs for seconds to minutes of status-line
+	// repaint (spinner, elapsed time, token counters), far longer than the window
+	// the duplicate-ask check spans, and tuning one must never loosen the other.
+	//
+	// 15 sits in a measured band at the DEFAULT ~500-rune salient window: an
+	// ordinary status-line repaint lands 9-13% away, while the nearest pane-tail
+	// false accept — the same scrollback with only the question line swapped — is
+	// 21% away and a different command 29%
+	// (TestLLMConsultRejectsSwappedQuestionOnSharedScrollback pins the lower
+	// edge). Note the band narrows if embedding.pane_salient_chars is raised far
+	// above the default: a longer window dilutes a changed question line into
+	// more unchanged scrollback. Structured salients (approval verb + options,
+	// choice options, error summary) don't take this path at all — a one-word
+	// target swap there stays ~86% similar, so they require an exact match
+	// (domain.StructuredSalient; the test-vs-live collision from PR #230).
+	staleDeferredSendJitterPercent = 15
 )
 
 func (d *Daemon) duplicatePendingEscalation(ctx context.Context, s domain.Situation) bool {
@@ -3168,12 +3193,21 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 		// Compare raw content hashes: the staged signature may have been
 		// semantically remapped onto another key, but Raw always reflects
 		// the pane content as read, so equal Raw means the pane held still.
-		if freshSig := domain.ComputeSignatureN(current, cfg.Embedding.PaneSalientChars); freshSig.Raw != res.sig.Raw {
+		// A large pane-tail salient may also have drifted by up to
+		// staleDeferredSendJitterPercent while the review ran — the situation type is
+		// already asserted equal above, which is what the fuzzy compare cannot
+		// see (see domain.SignatureHeldStill).
+		freshSig := domain.ComputeSignatureN(current, cfg.Embedding.PaneSalientChars)
+		if !domain.SignatureHeldStill(res.sig, freshSig, staleDeferredSendJitterPercent) {
 			slog.Info("signature changed during action review; dropping send", "agent", s.AgentID)
 			if res.decision != nil {
 				d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "expired")
 			}
 			return
+		}
+		if freshSig.Raw != res.sig.Raw {
+			slog.Info("pane drifted within the jitter tolerance during action review; proceeding",
+				"agent", s.AgentID, "jitter_percent", staleDeferredSendJitterPercent)
 		}
 	}
 	// The idle policy tolerates changed content, so the FRESH pane must be
@@ -3582,13 +3616,45 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			reject(domain.ReasonLLMNoSubmit, "stale: form changed during consult")
 			return
 		}
-	} else if freshSig := domain.ComputeSignatureN(current, cfg.Embedding.PaneSalientChars); freshSig.Raw != res.sig.Raw {
+	} else if current.Type != s.Type {
+		// The situation type is folded into the signature, so the hash compare
+		// below covered a type flip implicitly; the jitter-tolerant compare it
+		// now uses works on salients alone and cannot see one, so assert it
+		// explicitly (the action-review path does the same).
+		reject(domain.ReasonLLMNoSubmit, "stale: situation changed during consult")
+		return
+	} else {
 		// Compare raw content hashes: the staged signature may have been
 		// semantically remapped onto another key, but Raw always reflects
 		// the pane content as read, so equal Raw means the pane did not
-		// move on.
-		reject(domain.ReasonLLMNoSubmit, "stale: situation changed during consult")
-		return
+		// move on. A large pane-tail salient (idle, task hand-outs, verbless
+		// approvals) may additionally have drifted by up to
+		// staleDeferredSendJitterPercent while the consult ran — status-line repaint
+		// is not the pane moving on (see domain.SignatureHeldStill).
+		freshSig := domain.ComputeSignatureN(current, cfg.Embedding.PaneSalientChars)
+		if !domain.SignatureHeldStill(res.sig, freshSig, staleDeferredSendJitterPercent) {
+			reject(domain.ReasonLLMNoSubmit, "stale: situation changed during consult")
+			return
+		}
+		if freshSig.Raw != res.sig.Raw {
+			// The safety screens above ran on the PRE-consult content. Under
+			// exact-hash equality that also screened what is on screen now; a
+			// tolerated drift means the pane carries text nothing has screened,
+			// so re-screen it exactly as the action-review path does before
+			// letting a keystroke land on it.
+			if hit, matched := allow.Match(s.AgentType,
+				domain.IrreversibleScanContent(current, "")); matched {
+				reject(domain.ReasonNeverAutoMatch, hit.Diagnostic()+" (at post-consult re-read)")
+				return
+			}
+			if hit, sus := allow.SuspectedIrreversible(s.AgentType,
+				domain.IrreversibleScanContent(current, "")); sus {
+				reject(domain.ReasonSuspectedIrrevers, hit.Diagnostic()+" (at post-consult re-read)")
+				return
+			}
+			slog.Info("pane drifted within the jitter tolerance during consult; proceeding",
+				"agent", s.AgentID, "jitter_percent", staleDeferredSendJitterPercent)
+		}
 	}
 
 	// Task-review send: the review took up to the LLM timeout, so besides the
