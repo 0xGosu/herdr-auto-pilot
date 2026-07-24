@@ -226,4 +226,14 @@ func TestSemanticSearchEditingRevertsToKeyword(t *testing.T) {
 	if m.semanticActive() {
 		t.Error("editing the query must drop back to live keyword filtering")
 	}
+	// And it must NOT resurrect if the operator later re-types the exact phrase
+	// as an ordinary keyword filter: the stale result set was torn down, so
+	// query-string equality alone can no longer reactivate it.
+	m.setQuery(tabSignatures, "approve the write")
+	if m.semanticActive() {
+		t.Error("re-typing a past semantic query as a keyword filter must not resurrect stale results")
+	}
+	if m.sigSemantic != nil {
+		t.Error("editing should have torn down the semantic result set")
+	}
 }

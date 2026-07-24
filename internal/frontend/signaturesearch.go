@@ -148,8 +148,10 @@ func (a *App) semanticSearch(ctx context.Context, query string, opts SignatureSe
 	if limit <= 0 {
 		limit = DefaultSemanticSearchLimit
 	}
+	// Only a NEGATIVE MinScore means "unset, use the default": an explicit 0 is
+	// a deliberate "no floor, show every ranked match" and must be honored.
 	floor := opts.MinScore
-	if floor <= 0 {
+	if floor < 0 {
 		floor = DefaultSemanticSearchFloor
 	}
 

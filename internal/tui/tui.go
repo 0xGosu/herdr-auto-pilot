@@ -638,7 +638,8 @@ func (m Model) semanticSearchCmd(query string) tea.Cmd {
 			defer wg.Done()
 		}
 		results, err := app.SearchSignatures(ctx, query,
-			frontend.SignatureSearchOpts{Semantic: true}, domain.SignatureFilter{})
+			frontend.SignatureSearchOpts{Semantic: true, MinScore: frontend.DefaultSemanticSearchFloor},
+			domain.SignatureFilter{})
 		return semanticSearchMsg{query: query, results: results, err: err}
 	}
 }
@@ -1159,6 +1160,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.detail = d
 		return m, nil
 	case semanticSearchMsg:
+		// The operator edited (or cleared) the query while the embed was in
+		// flight: this result is for a query they moved on from, so drop it
+		// rather than jump the cursor and announce matches for stale input.
+		if msg.query != m.query[tabSignatures] {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.message = ""
 			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
@@ -1417,7 +1424,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// editing keys. Every key is swallowed here (this branch always
 			// returns), so ← moves the caret instead of switching tabs out
 			// from under a half-typed query.
+			before := m.query[m.tab]
 			m.setQueryEdit(applyTextKey(m.queryEdit(), msg, false))
+			// Editing the Rules query abandons any semantic result set: it must
+			// be re-run, or a later keyword query that happens to re-type the
+			// old phrase would otherwise resurrect the stale ranking. Guarded on
+			// a real text change so caret-only moves keep the results visible.
+			if m.tab == tabSignatures && m.query[m.tab] != before {
+				m.sigSemantic = nil
+			}
 		}
 		m.clampListViewport() // CR-016
 		return m, nil
@@ -1462,6 +1477,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// search mode too; a no-op otherwise.
 		if m.tab.isList() && m.query[m.tab] != "" {
 			m.setQuery(m.tab, "")
+			// Clearing the query also abandons the semantic result set (see the
+			// search-input edit branch) so re-typing can't resurrect it.
+			if m.tab == tabSignatures {
+				m.sigSemantic = nil
+			}
 			m.clampListViewport()
 		}
 	case "p":

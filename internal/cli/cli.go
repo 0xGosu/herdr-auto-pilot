@@ -268,10 +268,24 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 	agentType := fs.String("agent-type", "", "filter by agent type")
 	minConf := fs.Float64("min-conf", 0, "filter by minimum live confidence")
 	fs.SetOutput(out)
-	if err := fs.Parse(args); err != nil {
-		return err
+	// Go's flag parser stops at the first non-flag argument, so a natural
+	// `search <query words> --semantic` would leave --semantic unparsed inside
+	// the query. Permute: peel positional words off and keep parsing the rest,
+	// so flags may appear before, after, or among the query words.
+	var words []string
+	rest := args
+	for len(rest) > 0 {
+		if err := fs.Parse(rest); err != nil {
+			return err
+		}
+		rest = fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		words = append(words, rest[0])
+		rest = rest[1:]
 	}
-	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	query := strings.TrimSpace(strings.Join(words, " "))
 	if query == "" {
 		return fmt.Errorf("usage: signatures search <query> [--semantic] [--limit N] [--min-score S] [filters] (see: hap help signatures)")
 	}
@@ -306,6 +320,12 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 		if !*semantic {
 			hints = append(hints, Hint{Cmd: "hap signatures search " + query + " --semantic",
 				Why: "search by meaning instead of exact words"})
+		} else if drift, derr := app.EmbeddingDrift(ctx); derr == nil && drift.Detected {
+			// Rules exist but their vectors were embedded by a previous model,
+			// so semantic search skips them all — this reads as "no rules" until
+			// they are re-embedded for the current model.
+			hints = append(hints, Hint{Cmd: "hap signatures reembed",
+				Why: "rules embedded with an older model are skipped until re-embedded"})
 		}
 		PrintNextSteps(out, hints)
 		return nil

@@ -114,13 +114,21 @@ func TestSearchSignaturesSemanticRanksByCosine(t *testing.T) {
 	// A row embedded by a different model must never be scored against a fresh
 	// query embedding — it is skipped, not ranked at 0.
 	seedSearchRule(t, st, "approval:stale", "claude", "old-model.gguf", "permission:stale", []float32{1, 0, 0})
+	// A row whose vector dimensionality does not match the query embedding is
+	// likewise skipped (same model id, wrong dims — an inconsistent store).
+	seedSearchRule(t, st, "approval:baddim", "claude", "test-model.gguf", "permission:baddim", []float32{1, 0})
 
 	got, err := app.SearchSignatures(ctx, "anything", frontend.SignatureSearchOpts{Semantic: true}, domain.SignatureFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 2 {
-		t.Fatalf("semantic search = %d results, want 2 (far below floor, stale skipped): %+v", len(got), got)
+		t.Fatalf("semantic search = %d results, want 2 (far below floor, stale + baddim skipped): %+v", len(got), got)
+	}
+	for _, r := range got {
+		if r.Signature == "approval:baddim" || r.Signature == "approval:stale" {
+			t.Errorf("skipped row %s must not appear in results", r.Signature)
+		}
 	}
 	if got[0].Signature != "approval:exact" || got[1].Signature != "approval:near" {
 		t.Fatalf("ranking order = [%s %s], want [exact near]", got[0].Signature, got[1].Signature)
