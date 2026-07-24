@@ -2558,12 +2558,15 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 	// StripNoopGeneratedLines).
 	task, declined := domain.StripNoopGeneratedLines(res.task)
 
-	// Parse only to VALIDATE. Output that yields no task (a bare horizontal
-	// rule, a punctuation-only reply) would otherwise become a confirmable
-	// escalation that can ONLY fail when the operator acts on it — the confirm
-	// path runs this same parse and refuses. Deciding it here keeps the two
-	// verdicts ("is there a task" / "can this be confirmed") from disagreeing.
-	if len(domain.NormalizeGeneratedTasks(task)) == 0 {
+	// Parse to VALIDATE and to recover the ignored prose. Output that yields no
+	// task (a bare horizontal rule, a punctuation-only reply) would otherwise
+	// become a confirmable escalation that can ONLY fail when the operator acts
+	// on it — the confirm path runs this same parse and refuses. Deciding it
+	// here keeps the two verdicts ("is there a task" / "can this be confirmed")
+	// from disagreeing. In list mode the rationale is the non-list prose the
+	// model wrote around the list, surfaced on the success escalation below.
+	tasks, rationale := domain.NormalizeGeneratedTasksWithRationale(task)
+	if len(tasks) == 0 {
 		// Nothing but sentinels: the model's explicit decline. Park the
 		// situation by suggesting the human-readable noop (never the raw
 		// sentinel), matching the exhausted-source escalation in domain.Decide
@@ -2599,6 +2602,9 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 	// — while the suggestion carries the generated task for the confirm path.
 	d.escalate(ctx, s, res.sig, domain.Decision{
 		Action: domain.ActionEscalate, Reason: res.reason,
+		// Rationale is the model's non-list prose in list mode (empty in plain
+		// mode); escalate() renders it after the "[reason]" tag.
+		Rationale:  rationale,
 		Suggestion: domain.SuggestTaskPrefix + task,
 	}, res.tr, now)
 }

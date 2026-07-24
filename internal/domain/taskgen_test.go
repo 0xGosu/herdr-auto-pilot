@@ -225,6 +225,110 @@ func TestNormalizeGeneratedTasksRealSample(t *testing.T) {
 	}
 }
 
+// TestNormalizeGeneratedTasksWithRationale: in list mode the dropped non-list
+// prose is returned as rationale (the model's reasoning around the list); in
+// plain mode nothing is ignored, so the rationale is empty. The tasks returned
+// must match what NormalizeGeneratedTasks yields for the same input.
+func TestNormalizeGeneratedTasksWithRationale(t *testing.T) {
+	tests := []struct {
+		name          string
+		raw           string
+		wantTasks     []string
+		wantRationale string
+	}{
+		{
+			// Plain mode: every non-empty line is a task, nothing is ignored.
+			"plain mode has no rationale",
+			"Investigate the flaky auth test",
+			[]string{"Investigate the flaky auth test"},
+			"",
+		},
+		{
+			// Multi-line plain response is still all tasks, no rationale.
+			"multi-line plain mode has no rationale",
+			"First task\nSecond task",
+			[]string{"First task", "Second task"},
+			"",
+		},
+		{
+			// List mode: the lead-in sentence is dropped from tasks and becomes
+			// the rationale.
+			"intro line before bullets is rationale",
+			"Here are the tasks:\n- First real task\n- Second real task",
+			[]string{"First real task", "Second real task"},
+			"Here are the tasks:",
+		},
+		{
+			// Prose interleaved with bullets is captured in reading order and
+			// collapsed to a single line (excerpt folds whitespace).
+			"prose around bullets is single-line rationale",
+			"Because the suite is red:\n- Fix the parser\nthen, once green:\n- Add validation",
+			[]string{"Fix the parser", "Add validation"},
+			"Because the suite is red: then, once green:",
+		},
+		{
+			// Fence lines and empty/bullet-only markers are list artifacts, not
+			// reasoning, so they are excluded from the rationale.
+			"fences and empty markers excluded from rationale",
+			"Rationale here\n```\n- Real task\n```\n- \n[ ] ",
+			[]string{"Real task"},
+			"Rationale here",
+		},
+		{
+			// No prose around the list → empty rationale even in list mode.
+			"pure list has empty rationale",
+			"- Only task one\n- Only task two",
+			[]string{"Only task one", "Only task two"},
+			"",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotTasks, gotRationale := NormalizeGeneratedTasksWithRationale(tc.raw)
+			if len(gotTasks) != len(tc.wantTasks) {
+				t.Fatalf("tasks = %v, want %v", gotTasks, tc.wantTasks)
+			}
+			for i := range gotTasks {
+				if gotTasks[i] != tc.wantTasks[i] {
+					t.Errorf("task[%d] = %q, want %q", i, gotTasks[i], tc.wantTasks[i])
+				}
+			}
+			if gotRationale != tc.wantRationale {
+				t.Errorf("rationale = %q, want %q", gotRationale, tc.wantRationale)
+			}
+			// The thin wrapper must return exactly the same tasks.
+			wrap := NormalizeGeneratedTasks(tc.raw)
+			if len(wrap) != len(gotTasks) {
+				t.Fatalf("NormalizeGeneratedTasks tasks = %v, want %v", wrap, gotTasks)
+			}
+			for i := range wrap {
+				if wrap[i] != gotTasks[i] {
+					t.Errorf("wrapper task[%d] = %q, want %q", i, wrap[i], gotTasks[i])
+				}
+			}
+		})
+	}
+}
+
+// TestNormalizeGeneratedTasksRationaleCapped: a huge block of ignored prose is
+// truncated to maxGeneratedRationale runes with a trailing ellipsis, so an
+// escalation rationale line stays bounded no matter how much the model wrote.
+func TestNormalizeGeneratedTasksRationaleCapped(t *testing.T) {
+	prose := strings.Repeat("x", maxGeneratedRationale+50)
+	raw := prose + "\n- Do the one real task"
+	tasks, rationale := NormalizeGeneratedTasksWithRationale(raw)
+	if len(tasks) != 1 || tasks[0] != "Do the one real task" {
+		t.Fatalf("tasks = %v, want the single bullet item", tasks)
+	}
+	runes := []rune(rationale)
+	if len(runes) != maxGeneratedRationale+1 { // capped runes + one ellipsis rune
+		t.Fatalf("rationale rune count = %d, want %d", len(runes), maxGeneratedRationale+1)
+	}
+	if runes[len(runes)-1] != '…' {
+		t.Errorf("truncated rationale must end with an ellipsis, got %q", rationale)
+	}
+}
+
 func TestRenderGeneratedTaskList(t *testing.T) {
 	// Every task renders pending "[ ]" — "[-]" is written only at delivery
 	// time (issue #156: pre-marking the first item stranded it whenever no

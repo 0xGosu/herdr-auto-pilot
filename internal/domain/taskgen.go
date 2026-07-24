@@ -126,18 +126,39 @@ func stripInlineEmphasis(s string) string {
 	return masked
 }
 
+// maxGeneratedRationale caps the rationale text NormalizeGeneratedTasksWithRationale
+// returns for the ignored non-list prose. The raw model output can be up to
+// maxTaskGenOutput (16KB); a rationale line on an escalation has a small budget
+// (see the daemon's escalate()), so anything longer is truncated with an
+// ellipsis. Measured in runes so a multibyte tail is never split.
+const maxGeneratedRationale = 500
+
 // NormalizeGeneratedTasks parses a generate-task CLI's raw stdout into a clean
-// list of task strings. The model may return one task or several, plain or as
-// a Markdown list. The parser picks a mode from the content: if ANY line
-// carries a real list/checkbox marker, the whole block is treated as a list
+// list of task strings. See NormalizeGeneratedTasksWithRationale for the parse
+// rules; this drops the rationale for callers that only need the tasks.
+func NormalizeGeneratedTasks(raw string) []string {
+	tasks, _ := NormalizeGeneratedTasksWithRationale(raw)
+	return tasks
+}
+
+// NormalizeGeneratedTasksWithRationale parses a generate-task CLI's raw stdout
+// into a clean list of task strings and, in list mode, the ignored non-list
+// prose joined as rationale text. The model may return one task or several,
+// plain or as a Markdown list. The parser picks a mode from the content: if ANY
+// line carries a real list/checkbox marker, the whole block is treated as a list
 // and ONLY marked lines become tasks — so a lead-in sentence ("Here are the
 // tasks:") preceding a bullet list is dropped rather than written as an item.
 // If no line carries a marker, it falls back to plain mode, where each
 // non-empty line is a task (a single- or multi-line plain response). Each task
 // is reduced to its bare text with Markdown inline emphasis (bold/italic/code)
-// stripped, and lines without a letter or digit are dropped. Returns nil when
-// nothing usable remains.
-func NormalizeGeneratedTasks(raw string) []string {
+// stripped, and lines without a letter or digit are dropped. Returns nil tasks
+// when nothing usable remains.
+//
+// The rationale is collected ONLY in list mode: it is the dropped, unmarked,
+// non-fence, non-blank prose (the model's reasoning around the list), collapsed
+// to a single line and capped at maxGeneratedRationale runes. In plain mode
+// nothing is ignored, so rationale is "".
+func NormalizeGeneratedTasksWithRationale(raw string) (tasks []string, rationale string) {
 	lines := strings.Split(raw, "\n")
 
 	// List mode iff some non-fence line has a real marker AND a real task body
@@ -156,16 +177,20 @@ func NormalizeGeneratedTasks(raw string) []string {
 		}
 	}
 
-	var tasks []string
+	var ignored []string
 	for _, line := range lines {
 		if isFenceLine(line) {
 			continue
 		}
 		var t string
 		if listMode {
-			// Only marked lines are tasks; unmarked prose is skipped.
+			// Only marked lines are tasks; unmarked prose is skipped — but
+			// captured as rationale so the model's reasoning is not lost.
 			m := listItemRE.FindStringSubmatch(line)
 			if m == nil {
+				if p := strings.TrimSpace(line); p != "" {
+					ignored = append(ignored, p)
+				}
 				continue
 			}
 			t = strings.TrimSpace(m[1])
@@ -182,7 +207,10 @@ func NormalizeGeneratedTasks(raw string) []string {
 			tasks = append(tasks, t)
 		}
 	}
-	return tasks
+	// excerpt (safety.go) collapses whitespace to a single line and caps the
+	// rune count with an ellipsis — a rationale is a compact one-liner rendered
+	// in the escalation's Rationale column, so multi-line prose folds to one row.
+	return tasks, excerpt(strings.Join(ignored, "\n"), maxGeneratedRationale)
 }
 
 // StripNoopGeneratedLines removes the noop sentinel from a generate-task CLI's
