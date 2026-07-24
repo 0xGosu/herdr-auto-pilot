@@ -2630,6 +2630,60 @@ func TestIdleGeneratesTaskSuggestionEscalation(t *testing.T) {
 	}
 }
 
+func TestIdleTaskGenListModeCapturesRationale(t *testing.T) {
+	// When the model wraps a bullet list in prose, the list items become the
+	// confirmable tasks (RAW, in the suggestion) and the ignored non-list prose
+	// is surfaced as the escalation's rationale — escalate() renders it after
+	// the "[reason]" tag.
+	raw := "Because the auth suite is red, here is the plan:\n" +
+		"- Fix the flaky auth test\n" +
+		"- Add a retry guard"
+	h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return raw, nil
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	h.push("agent-20", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	// The suggestion still carries the RAW text (the confirm path normalizes).
+	if want := domain.SuggestTaskPrefix + raw; esc[0].Suggestion != want {
+		t.Errorf("suggestion = %q, want %q", esc[0].Suggestion, want)
+	}
+	// The ignored prose lands in the rationale.
+	if !strings.Contains(esc[0].Rationale, "Because the auth suite is red, here is the plan:") {
+		t.Errorf("rationale should carry the ignored prose, got %q", esc[0].Rationale)
+	}
+	// The bullet text must NOT leak into the rationale (it is a task, not prose).
+	if strings.Contains(esc[0].Rationale, "Fix the flaky auth test") {
+		t.Errorf("rationale must not include list items, got %q", esc[0].Rationale)
+	}
+}
+
+func TestIdleTaskGenPlainModeHasNoRationaleProse(t *testing.T) {
+	// A plain (no-list) generation ignores nothing, so the success escalation
+	// carries only the bare "[reason]" tag — no extra prose grafted on.
+	h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return "Investigate the flaky auth test and add a retry guard", nil
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	h.push("agent-20", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if want := "[" + string(domain.ReasonNoTaskSource) + "]"; esc[0].Rationale != want {
+		t.Errorf("plain-mode rationale = %q, want the bare tag %q", esc[0].Rationale, want)
+	}
+}
+
 func TestIdleTaskGenNoopParksInsteadOfPersisting(t *testing.T) {
 	// The model's explicit decline must NOT be written into a checklist as a
 	// literal "@noop" task, and must NOT masquerade as a broken CLI: it
