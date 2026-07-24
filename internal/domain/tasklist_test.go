@@ -1203,3 +1203,137 @@ func TestDeclaredTaskPromptUnescapesID(t *testing.T) {
 		t.Errorf("Prompt() = %q, want %q", got, want)
 	}
 }
+
+func TestFoldTaskContent(t *testing.T) {
+	cases := []struct {
+		name     string
+		content  string
+		taskText string
+		want     string
+	}{
+		{
+			// A flat file (no nested lines) folds to the title unchanged, so a
+			// generated/one-line checklist is untouched.
+			name:     "flat task returns itself",
+			content:  "- [ ] 1. Do the thing\n- [ ] 2. Do the other",
+			taskText: "1. Do the thing",
+			want:     "1. Do the thing",
+		},
+		{
+			// Nested sub-bullets fold in verbatim (indentation preserved); the
+			// next top-level task and any header are boundaries.
+			name: "nested sub-items fold in, next task is a boundary",
+			content: "## Milestone\n\n" +
+				"- [ ] 1\\. Extend the model\n" +
+				"  - In `x.ts`, add a kind\n" +
+				"  - Acceptance Criteria:\n" +
+				"    - it has the kind\n" +
+				"  - _Complexity: Medium_\n\n" +
+				"## Milestone 2\n\n" +
+				"- [ ] 2\\. Classify text",
+			taskText: "1\\. Extend the model",
+			want: "1\\. Extend the model\n" +
+				"  - In `x.ts`, add a kind\n" +
+				"  - Acceptance Criteria:\n" +
+				"    - it has the kind\n" +
+				"  - _Complexity: Medium_",
+		},
+		{
+			// A nested checkbox is its own task (ParseChecklist counts it), so it
+			// bounds the fold rather than being folded as detail.
+			name: "nested checkbox is a boundary",
+			content: "- [ ] 1. parent\n" +
+				"  - a note\n" +
+				"  - [ ] sub task\n" +
+				"  - unreachable note",
+			taskText: "1. parent",
+			want:     "1. parent\n  - a note",
+		},
+		{
+			// A blank line between nested lines is kept; the trailing blank
+			// before the boundary is trimmed.
+			name: "interior blank kept, trailing blank trimmed",
+			content: "- [ ] 1. t\n" +
+				"  - first\n\n" +
+				"  - second\n\n" +
+				"- [ ] 2. u",
+			taskText: "1. t",
+			want:     "1. t\n  - first\n\n  - second",
+		},
+		{
+			// No matching item → the text is returned unchanged.
+			name:     "no match returns input",
+			content:  "- [ ] 1. something else",
+			taskText: "1. missing",
+			want:     "1. missing",
+		},
+		{
+			// The FIRST matching item is folded (mirrors ReserveFirstPending).
+			name: "first match wins",
+			content: "- [ ] 1. dup\n  - first block\n" +
+				"- [ ] 1. dup\n  - second block",
+			taskText: "1. dup",
+			want:     "1. dup\n  - first block",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := FoldTaskContent(tc.content, tc.taskText); got != tc.want {
+				t.Errorf("FoldTaskContent =\n%q\nwant\n%q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFoldTaskContentSkipsDoneDuplicate(t *testing.T) {
+	// FoldTaskContent targets the first PENDING item with the text, aligning
+	// with NextDeclaredTask/ReserveFirstPending — so an earlier DONE item that
+	// shares the title (and carries stale detail) is not folded.
+	content := "- [x] 1. build it\n  - stale done detail\n" +
+		"- [ ] 1. build it\n  - the real detail"
+	want := "1. build it\n  - the real detail"
+	if got := FoldTaskContent(content, "1. build it"); got != want {
+		t.Errorf("FoldTaskContent =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestFoldTaskContentAt(t *testing.T) {
+	// Index-based folding disambiguates duplicate titles for the position-based
+	// (frontend manual send) path: item #2 and #4 share a title but carry
+	// different detail, and each index folds its own.
+	content := "- [ ] 1. first\n  - one\n" +
+		"- [ ] 2. dup\n  - detail A\n" +
+		"- [ ] 3. third\n  - three\n" +
+		"- [ ] 4. dup\n  - detail B\n"
+	cases := map[int]string{
+		1: "1. first\n  - one",
+		2: "2. dup\n  - detail A",
+		4: "4. dup\n  - detail B",
+		9: "", // out of range → caller falls back to the plain text
+	}
+	for idx, want := range cases {
+		if got := FoldTaskContentAt(content, idx); got != want {
+			t.Errorf("FoldTaskContentAt(_, %d) =\n%q\nwant\n%q", idx, got, want)
+		}
+	}
+}
+
+func TestDeclaredTaskPromptFoldsContent(t *testing.T) {
+	// When Content is set, Prompt delivers it (with the leading id unescaped)
+	// instead of the one-line Task identity; nested lines pass through verbatim.
+	task := DeclaredTask{
+		Task:     "1\\. Extend the model",
+		Content:  "1\\. Extend the model\n  - In `x.ts`, add a kind\n  - _Complexity: Medium_",
+		Path:     "/p/t.md",
+		Template: "{next_task_content}",
+	}
+	want := "1. Extend the model\n  - In `x.ts`, add a kind\n  - _Complexity: Medium_"
+	if got := task.Prompt(); got != want {
+		t.Errorf("Prompt() =\n%q\nwant\n%q", got, want)
+	}
+	// Empty Content falls back to the one-line Task (backward compatible).
+	fallback := DeclaredTask{Task: "1. do it", Path: "/p", Template: "{next_task_content}"}
+	if got, want := fallback.Prompt(), "1. do it"; got != want {
+		t.Errorf("empty Content must fall back to Task: got %q, want %q", got, want)
+	}
+}

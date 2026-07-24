@@ -98,7 +98,16 @@ const MarkInProgress = "-"
 // task content plus the source it came from, so the outbound prompt can be
 // rendered from the source's template.
 type DeclaredTask struct {
-	Task      string // next unchecked item, or NoTaskContent when complete
+	Task string // next unchecked item, or NoTaskContent when complete
+	// Content is the FULL delivery text substituted for {next_task_content}:
+	// the task's title line plus every nested sub-item folded in
+	// (FoldTaskContent), so a hand-authored task's acceptance criteria,
+	// dependencies and notes ride along with the one-line title. Empty falls
+	// back to Task, so a caller that does not fold keeps the historical
+	// one-line behavior. Task ALWAYS stays the single physical line that is the
+	// task's reservation identity — the checklist item's own text — so folding
+	// never perturbs reservation, hand-out ledger rows, or the freshness check.
+	Content   string
 	Path      string // task-source file path
 	Template  string // operator template; "" uses DefaultNextTaskTemplate
 	AgentName string // agent short name, for {agent_name}
@@ -136,6 +145,12 @@ func TemplateOrDefault(template string) string {
 // one-line-per-item storage encoding (see EncodeTaskNewlines).
 func (t DeclaredTask) Prompt() string {
 	tpl := TemplateOrDefault(t.Template)
+	// Deliver the folded content (title + nested sub-items) when it was
+	// resolved; fall back to the one-line identity otherwise.
+	body := t.Task
+	if t.Content != "" {
+		body = t.Content
+	}
 	return strings.NewReplacer(
 		// The quoted form comes first: NewReplacer matches in argument order,
 		// so the shorter {task_list_path} would otherwise consume its prefix
@@ -144,8 +159,10 @@ func (t DeclaredTask) Prompt() string {
 		// The task reaches the agent with its id unescaped: the agent reads the
 		// id here and types it back at `hap task done`, so showing it "8\.1"
 		// invites a reference nobody typed intentionally. The FILE keeps the
-		// operator's escape — only the outbound copy is normalized.
-		"{next_task_content}", DecodeTaskNewlines(DisplayTaskText(t.Task)),
+		// operator's escape — only the outbound copy is normalized. DisplayTaskText
+		// unescapes only the leading id on the first line; nested lines pass
+		// through verbatim.
+		"{next_task_content}", DecodeTaskNewlines(DisplayTaskText(body)),
 		"{task_list_path}", t.Path,
 		"{agent_name}", t.AgentName,
 		"{cwd}", t.Cwd,
@@ -216,6 +233,110 @@ func PendingDeclaredTasks(content string) []string {
 		}
 	}
 	return pending
+}
+
+// FoldTaskContent returns the delivery content of the first PENDING checklist
+// item whose text equals taskText: the item's own text, then every nested
+// continuation line beneath it — the more-indented, non-item lines that carry
+// the task's detail (implementation notes, acceptance criteria, dependencies)
+// — appended verbatim and separated by newlines. When no such item matches, or
+// it has no nested lines, taskText is returned unchanged.
+//
+// This folds a hand-authored task's sub-bullets into the one-line title so they
+// reach the agent together, WITHOUT touching the file or the task's identity:
+// callers set the result on DeclaredTask.Content (for the outbound prompt),
+// while DeclaredTask.Task — the single physical line — stays the reservation
+// identity everywhere. Matching the first PENDING ("[ ]") item aligns with
+// NextDeclaredTask and ReserveFirstPending, so the daemon folds exactly the item
+// it is about to reserve even when an earlier item (done, or a duplicate title)
+// shares the text. A caller that reserves a specific POSITION (the frontend's
+// manual send) must use FoldTaskContentAt instead, which is unambiguous.
+func FoldTaskContent(content, taskText string) string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		m := checklistItemRE.FindStringSubmatch(line)
+		if m == nil || m[2] != " " || strings.TrimSpace(m[3]) != taskText {
+			continue
+		}
+		return foldItemAt(lines, i, taskText)
+	}
+	return taskText
+}
+
+// FoldTaskContentAt folds the checklist item at the given 1-based index — the
+// same numbering ParseChecklist and the `hap task` CLI expose — so a caller that
+// reserved a SPECIFIC position delivers that exact item's nested detail, even
+// when another item shares its title. Returns "" when index names no item,
+// letting the caller fall back to the plain task text.
+func FoldTaskContentAt(content string, index int) string {
+	lines := strings.Split(content, "\n")
+	count := 0
+	for i, line := range lines {
+		m := checklistItemRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		count++
+		if count == index {
+			return foldItemAt(lines, i, strings.TrimSpace(m[3]))
+		}
+	}
+	return ""
+}
+
+// foldItemAt returns itemText followed by the nested continuation lines of the
+// checklist item at lines[i] (verbatim, newline-joined), or itemText alone when
+// it has none.
+func foldItemAt(lines []string, i int, itemText string) string {
+	nested := nestedContinuationLines(lines, i)
+	if len(nested) == 0 {
+		return itemText
+	}
+	return itemText + "\n" + strings.Join(nested, "\n")
+}
+
+// nestedContinuationLines collects the lines that belong to the checklist item
+// at lines[i] as its folded detail: the run of following lines indented deeper
+// than the item, kept verbatim. Interior blank lines are preserved but trailing
+// ones trimmed. Collection stops at the first non-blank line indented at or
+// below the item, or at the next checklist item at any indent — a nested "[ ]"
+// checkbox is its own task (ParseChecklist counts it), so it is a boundary, not
+// folded detail.
+func nestedContinuationLines(lines []string, i int) []string {
+	base := indentWidth(lines[i])
+	var out []string
+	for j := i + 1; j < len(lines); j++ {
+		line := lines[j]
+		if strings.TrimSpace(line) == "" {
+			out = append(out, line) // interior blank; trimmed below if trailing
+			continue
+		}
+		if indentWidth(line) <= base || checklistItemRE.MatchString(line) {
+			break
+		}
+		out = append(out, line)
+	}
+	for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+// indentWidth is the number of leading space/tab runes on a line — the depth
+// used to decide whether a line nests under a checklist item. Tabs and spaces
+// each count as one unit; hand-authored checklists indent with spaces. Mixing
+// tabs and spaces between a parent and its children is unsupported — a child
+// that measures shallower than its parent is simply not folded (title-only
+// delivery), the safe fallback.
+func indentWidth(s string) int {
+	n := 0
+	for _, r := range s {
+		if r != ' ' && r != '\t' {
+			break
+		}
+		n++
+	}
+	return n
 }
 
 // InProgressDeclaredTasks returns every checklist item marked "[-]" from an
