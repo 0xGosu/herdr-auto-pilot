@@ -333,6 +333,16 @@ directly (and stamps a `decision_floor_id`).
   configured model (re-embeds rows whose model/dims drift), shared by
   `initSemantic` and the `hap signatures reembed` maintenance path; a newer
   generation can abort a stale pass.
+- **Signature search** *(`App.SearchSignatures`, front-end read)* — operator-facing
+  search over learned rules, exposed as `hap signatures search` and the TUI Rules-tab
+  `/`. Keyword mode is a case-insensitive substring over each rule's fields + salient
+  text. Semantic mode embeds the whole query with a **standalone** embedder (like
+  Reembed — the control socket carries no reply channel, so front-ends embed directly)
+  and ranks rules by cosine over the stored vectors — a linear scan (vectors are
+  L2-normalized, so cosine is a dot product), so it needs neither the daemon nor the
+  `vectors` tag, only the embedding model. Recall-oriented: top-N above a lenient floor,
+  scores shown; drifted/dimension-mismatched vectors are skipped, and it degrades to a
+  clear error (never a partial ranking) when embedding is disabled or the model is absent.
 
 ### MCP LLM Adapter *(`LLMPort` — `internal/llm`, `internal/mcpserver`)*
 

@@ -171,12 +171,14 @@ func signatures(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		return signaturesReset(ctx, app, out, args)
 	case "reembed":
 		return signaturesReembed(ctx, app, out, args)
+	case "search":
+		return signaturesSearch(ctx, app, out, args)
 	}
 	// Bare `signatures --type X` style: treat unknown leading flag as list.
 	if strings.HasPrefix(sub, "-") {
 		return signaturesList(ctx, app, out, append([]string{sub}, args...))
 	}
-	return fmt.Errorf("usage: signatures [list|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]|reset <sig-or-prefix> [--yes]|reembed [--force]] (see: hap help signatures)")
+	return fmt.Errorf("usage: signatures [list|search <query>|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]|reset <sig-or-prefix> [--yes]|reembed [--force]] (see: hap help signatures)")
 }
 
 // signaturesReembed re-computes stored signature embeddings for the
@@ -249,6 +251,104 @@ func signaturesReembed(ctx context.Context, app *frontend.App, out io.Writer, ar
 		{Cmd: "hap status", Why: "confirm the drift line is gone"},
 		{Cmd: "hap signatures list", Why: "the rules that were re-embedded"},
 	})
+	return nil
+}
+
+// signaturesSearch finds learned rules by keyword (substring over the rule's
+// fields and its salient text) or, with --semantic, by embedding the query and
+// ranking rules by cosine similarity. Keyword is the default; --semantic needs
+// the configured embedding model.
+func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	fs := flag.NewFlagSet("signatures search", flag.ContinueOnError)
+	semantic := fs.Bool("semantic", false, "embedding search: rank rules by meaning (needs the embedding model)")
+	limit := fs.Int("limit", frontend.DefaultSemanticSearchLimit, "semantic: max matches to return")
+	minScore := fs.Float64("min-score", frontend.DefaultSemanticSearchFloor, "semantic: minimum cosine score in (0,1]; 0 uses the default")
+	situation := fs.String("type", "", "filter by situation type (idle|approval|choice|error)")
+	mode := fs.String("mode", "", "filter by mode (shadow|autonomous)")
+	agentType := fs.String("agent-type", "", "filter by agent type")
+	minConf := fs.Float64("min-conf", 0, "filter by minimum live confidence")
+	fs.SetOutput(out)
+	// Go's flag parser stops at the first non-flag argument, so a natural
+	// `search <query words> --semantic` would leave --semantic unparsed inside
+	// the query. Permute: peel positional words off and keep parsing the rest,
+	// so flags may appear before, after, or among the query words.
+	var words []string
+	rest := args
+	for len(rest) > 0 {
+		if err := fs.Parse(rest); err != nil {
+			return err
+		}
+		rest = fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		words = append(words, rest[0])
+		rest = rest[1:]
+	}
+	query := strings.TrimSpace(strings.Join(words, " "))
+	if query == "" {
+		return fmt.Errorf("usage: signatures search <query> [--semantic] [--limit N] [--min-score S] [filters] (see: hap help signatures)")
+	}
+	switch *situation {
+	case "", "idle", "approval", "choice", "error":
+	default:
+		return fmt.Errorf("invalid --type %q (idle|approval|choice|error)", *situation)
+	}
+	switch *mode {
+	case "", string(domain.ModeShadow), string(domain.ModeAutonomous):
+	default:
+		return fmt.Errorf("invalid --mode %q (shadow|autonomous)", *mode)
+	}
+	results, err := app.SearchSignatures(ctx, query,
+		frontend.SignatureSearchOpts{Semantic: *semantic, Limit: *limit, MinScore: *minScore},
+		domain.SignatureFilter{
+			SituationType: domain.SituationType(*situation),
+			AgentType:     *agentType,
+			Mode:          domain.Mode(*mode),
+			MinConfidence: *minConf,
+		})
+	if err != nil {
+		return err
+	}
+	kind := "keyword"
+	if *semantic {
+		kind = "semantic"
+	}
+	if len(results) == 0 {
+		fmt.Fprintf(out, "no rules match the %s search %q\n", kind, query)
+		hints := []Hint{{Cmd: "hap signatures list", Why: "every learned rule, unfiltered"}}
+		if !*semantic {
+			hints = append(hints, Hint{Cmd: "hap signatures search " + query + " --semantic",
+				Why: "search by meaning instead of exact words"})
+		} else if drift, derr := app.EmbeddingDrift(ctx); derr == nil && drift.Detected {
+			// Rules exist but their vectors were embedded by a previous model,
+			// so semantic search skips them all — this reads as "no rules" until
+			// they are re-embedded for the current model.
+			hints = append(hints, Hint{Cmd: "hap signatures reembed",
+				Why: "rules embedded with an older model are skipped until re-embedded"})
+		}
+		PrintNextSteps(out, hints)
+		return nil
+	}
+	graduationN := graduationN(app)
+	for _, r := range results {
+		if *semantic {
+			fmt.Fprintf(out, "sem=%.2f\t", r.Score)
+		}
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d/%d\tconf=%s\ttop=%q\t%s\n",
+			shortSignature(r.Signature), r.SituationType, orDash(r.AgentType), r.Mode,
+			r.ConsecutiveConfirmations, graduationN, frontend.ConfidenceLabel(r.Confidence),
+			r.TopAction, r.UpdatedAt.Format("01-02 15:04:05"))
+	}
+	fmt.Fprintf(out, "\n%d %s match(es) for %q\n", len(results), kind, query)
+	prefix := strings.TrimSuffix(shortSignature(results[0].Signature), "…")
+	hints := []Hint{{Cmd: "hap signatures show " + prefix, Why: "the original situation, plus recent decisions"}}
+	if !*semantic {
+		hints = append(hints, Hint{Cmd: "hap signatures search " + query + " --semantic",
+			Why: "the same query, ranked by meaning"})
+	}
+	hints = append(hints, Hint{Cmd: "hap signatures list", Why: "every learned rule, unfiltered"})
+	PrintNextSteps(out, hints)
 	return nil
 }
 

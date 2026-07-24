@@ -448,29 +448,36 @@ func buildCommands() {
 			Summary: "inspect and manage learned rules",
 			Usage: []string{
 				"hap signatures [list] [--type T] [--mode M] [--agent-type A] [--min-conf C]",
+				"hap signatures search <query> [--semantic] [--limit N] [--min-score S] [filters]",
 				"hap signatures show <sig-or-prefix>",
 				"hap signatures delete <sig-or-prefix> [--yes]",
 				"hap signatures reset <sig-or-prefix> [--yes]",
 				"hap signatures reembed [--force]",
 			},
 			Flags: []FlagDoc{
-				{Name: "--type", Arg: "T", Desc: "list filter: situation type (idle|approval|choice|error)"},
-				{Name: "--mode", Arg: "M", Desc: "list filter: shadow (learning only) or autonomous (acts on its own)"},
-				{Name: "--agent-type", Arg: "A", Desc: "list filter: agent type (claude, codex, …)"},
-				{Name: "--min-conf", Arg: "C", Default: "0", Desc: "list filter: minimum live confidence (0-1)"},
+				{Name: "--type", Arg: "T", Desc: "list/search filter: situation type (idle|approval|choice|error)"},
+				{Name: "--mode", Arg: "M", Desc: "list/search filter: shadow (learning only) or autonomous (acts on its own)"},
+				{Name: "--agent-type", Arg: "A", Desc: "list/search filter: agent type (claude, codex, …)"},
+				{Name: "--min-conf", Arg: "C", Default: "0", Desc: "list/search filter: minimum live confidence (0-1)"},
+				{Name: "--semantic", Desc: "search: rank rules by meaning (embeds the query with the model) instead of keyword substring"},
+				{Name: "--limit", Arg: "N", Default: "20", Desc: "search --semantic: max matches to return"},
+				{Name: "--min-score", Arg: "S", Default: "0.3", Desc: "search --semantic: minimum cosine score in (0,1]; 0 uses the default"},
 				{Name: "--yes", Desc: "delete/reset: skip the interactive confirmation (required when stdin is not a terminal)"},
 				{Name: "--force", Desc: "reembed: re-run even when no model drift is detected"},
 			},
 			Details: "A signature is one learned situation. `list` shows: short signature, situation,\n" +
 				"agent type, mode, confirmation streak / graduation N, confidence, top action.\n" +
-				"`show` adds the original pane excerpt and recent decisions — pass any unique\n" +
-				"prefix. `delete` erases the rule and its decisions (audit rows are kept).\n" +
-				"`reset` keeps the history but returns the rule to shadow with a cleared streak\n" +
-				"and confidence, so it must re-earn graduation — prefer it over delete when a\n" +
-				"rule started answering wrongly. `reembed` re-computes stored embeddings after\n" +
-				"an embedding model change (via the running daemon when there is one).",
+				"`search` finds rules by keyword (substring over the rule's fields and its salient\n" +
+				"text); with `--semantic` it embeds the whole query and ranks rules by cosine\n" +
+				"similarity (needs the embedding model). `show` adds the original pane excerpt and\n" +
+				"recent decisions — pass any unique prefix. `delete` erases the rule and its\n" +
+				"decisions (audit rows are kept). `reset` keeps the history but returns the rule to\n" +
+				"shadow with a cleared streak and confidence, so it must re-earn graduation — prefer\n" +
+				"it over delete when a rule started answering wrongly. `reembed` re-computes stored\n" +
+				"embeddings after an embedding model change (via the running daemon when there is one).",
 			Examples: []string{
 				"hap signatures list --mode autonomous",
+				"hap signatures search \"approve the file write\" --semantic",
 				"hap signatures show a1b2c3",
 				"hap signatures reset a1b2c3 --yes",
 			},
