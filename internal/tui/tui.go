@@ -637,9 +637,9 @@ func (m Model) semanticSearchCmd(query string) tea.Cmd {
 		if wg != nil {
 			defer wg.Done()
 		}
+		// Zero Limit/MinScore fall back to the recall-oriented defaults.
 		results, err := app.SearchSignatures(ctx, query,
-			frontend.SignatureSearchOpts{Semantic: true, MinScore: frontend.DefaultSemanticSearchFloor},
-			domain.SignatureFilter{})
+			frontend.SignatureSearchOpts{Semantic: true}, domain.SignatureFilter{})
 		return semanticSearchMsg{query: query, results: results, err: err}
 	}
 }

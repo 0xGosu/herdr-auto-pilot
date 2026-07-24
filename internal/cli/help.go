@@ -461,7 +461,7 @@ func buildCommands() {
 				{Name: "--min-conf", Arg: "C", Default: "0", Desc: "list/search filter: minimum live confidence (0-1)"},
 				{Name: "--semantic", Desc: "search: rank rules by meaning (embeds the query with the model) instead of keyword substring"},
 				{Name: "--limit", Arg: "N", Default: "20", Desc: "search --semantic: max matches to return"},
-				{Name: "--min-score", Arg: "S", Default: "0.3", Desc: "search --semantic: minimum cosine score (0-1)"},
+				{Name: "--min-score", Arg: "S", Default: "0.3", Desc: "search --semantic: minimum cosine score in (0,1]; 0 uses the default"},
 				{Name: "--yes", Desc: "delete/reset: skip the interactive confirmation (required when stdin is not a terminal)"},
 				{Name: "--force", Desc: "reembed: re-run even when no model drift is detected"},
 			},

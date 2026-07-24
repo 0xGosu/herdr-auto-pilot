@@ -32,8 +32,9 @@ type SignatureSearchOpts struct {
 	// Limit caps how many semantic matches are returned (defaults to
 	// DefaultSemanticSearchLimit when <= 0). Ignored for keyword search.
 	Limit int
-	// MinScore drops semantic matches below this cosine floor (defaults to
-	// DefaultSemanticSearchFloor when <= 0). Ignored for keyword search.
+	// MinScore drops semantic matches below this cosine floor. A non-positive
+	// value falls back to DefaultSemanticSearchFloor (the zero value is a safe
+	// default, never "no floor"). Ignored for keyword search.
 	MinScore float64
 }
 
@@ -148,10 +149,12 @@ func (a *App) semanticSearch(ctx context.Context, query string, opts SignatureSe
 	if limit <= 0 {
 		limit = DefaultSemanticSearchLimit
 	}
-	// Only a NEGATIVE MinScore means "unset, use the default": an explicit 0 is
-	// a deliberate "no floor, show every ranked match" and must be honored.
+	// A non-positive MinScore means "unset": fall back to the default floor.
+	// Keeping the zero value safe (a real floor, not "return everything") is
+	// deliberate — a caller that forgets to set it must not flood the operator
+	// with near-zero-cosine noise.
 	floor := opts.MinScore
-	if floor < 0 {
+	if floor <= 0 {
 		floor = DefaultSemanticSearchFloor
 	}
 

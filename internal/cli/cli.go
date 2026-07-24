@@ -262,7 +262,7 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 	fs := flag.NewFlagSet("signatures search", flag.ContinueOnError)
 	semantic := fs.Bool("semantic", false, "embedding search: rank rules by meaning (needs the embedding model)")
 	limit := fs.Int("limit", frontend.DefaultSemanticSearchLimit, "semantic: max matches to return")
-	minScore := fs.Float64("min-score", frontend.DefaultSemanticSearchFloor, "semantic: minimum cosine score (0-1)")
+	minScore := fs.Float64("min-score", frontend.DefaultSemanticSearchFloor, "semantic: minimum cosine score in (0,1]; 0 uses the default")
 	situation := fs.String("type", "", "filter by situation type (idle|approval|choice|error)")
 	mode := fs.String("mode", "", "filter by mode (shadow|autonomous)")
 	agentType := fs.String("agent-type", "", "filter by agent type")
