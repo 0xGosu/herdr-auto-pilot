@@ -531,20 +531,32 @@ func buildCommands() {
 				"hap rules [list]",
 				"hap rules add <regex>",
 				"hap rules remove <index>",
+				"hap rules disable-seed <id>",
+				"hap rules enable-seed <id>",
 			},
-			Details: "`list` prints the shipped seed rules first (strict and heuristic), then your\n" +
-				"operator patterns with the index `remove` takes. A situation matching any rule is\n" +
-				"always escalated to a human, whatever the learned confidence says — this is a\n" +
-				"safety control, not a preference. Patterns are Go regular expressions matched\n" +
-				"against the situation's content.",
+			Details: "`list` prints the shipped seed rules first, each with a `seed #<id>` (strict or\n" +
+				"heuristic), then your operator patterns with the index `remove` takes. A situation\n" +
+				"matching any rule is always escalated to a human, whatever the learned confidence\n" +
+				"says — this is a safety control, not a preference. Patterns are Go regular\n" +
+				"expressions matched against the situation's content.\n\n" +
+				"When a builtin seed rule is too aggressive for a repo (e.g. a heuristic firing on a\n" +
+				"legitimate word like \"unrecoverable\"), take its `seed #<id>` from `rules list` and\n" +
+				"run `disable-seed <id>` to silence just that one rule while keeping the rest of the\n" +
+				"safety net; `enable-seed <id>` restores it. Note a seed rule is a single regex: one\n" +
+				"heuristic can cover several phrasings, so disabling it silences every phrase in that\n" +
+				"rule's pattern, not only the word you saw. The rule is recorded by its pattern, so\n" +
+				"the setting survives upgrades. To drop every seed rule at once instead, set\n" +
+				"safety.disable_never_auto_seed_patterns=true.",
 			Examples: []string{
 				"hap rules list",
 				"hap rules add '(?i)force[- ]push'",
 				"hap rules remove 0",
+				"hap rules disable-seed <id from rules list>",
 			},
 			Next: []Hint{
-				{Cmd: "hap rules list", Why: "every rule, with the index `remove` takes"},
+				{Cmd: "hap rules list", Why: "every rule, with the index `remove`/`disable-seed` take"},
 				{Cmd: "hap rules add <regex>", Why: "force a situation to always ask a human"},
+				{Cmd: "hap rules disable-seed <id>", Why: "silence a builtin rule that keeps over-escalating"},
 			},
 			// list and add/remove want opposite follow-ups, so the handler picks.
 			SelfHints: true,

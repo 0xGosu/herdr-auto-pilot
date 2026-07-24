@@ -135,6 +135,38 @@ func SeedNeverAutoRuleCount() int {
 	return len(SeedNeverAutoPatterns) + len(SeedHeuristicNeverAutoRules)
 }
 
+// SeedNeverAutoRules returns every shipped seed rule — strict patterns first,
+// then heuristic rules — with Kind and Source filled in. The order is stable
+// for a given build, so a caller may address a rule by its index in this slice
+// (that index is only a display convenience; the durable key for disabling a
+// rule is its Pattern string, which survives reordering across versions).
+func SeedNeverAutoRules() []NeverAutoRule {
+	rules := make([]NeverAutoRule, 0, SeedNeverAutoRuleCount())
+	for _, p := range SeedNeverAutoPatterns {
+		rules = append(rules, NeverAutoRule{Pattern: p, Kind: NeverAutoStrict, Source: NeverAutoSeed})
+	}
+	for _, r := range SeedHeuristicNeverAutoRules {
+		r.Kind = NeverAutoHeuristic
+		r.Source = NeverAutoSeed
+		rules = append(rules, r)
+	}
+	return rules
+}
+
+// SeedRuleIndexForRationale maps an escalation rationale back to the seed rule
+// that produced it, returning that rule's index in SeedNeverAutoRules. It keys
+// off the stable Diagnostic() rendering ("pattern <P> matched …"), so it fires
+// only for a seed never-auto/heuristic hit and never for an operator pattern or
+// an unrelated escalation reason. The bool is false when no seed rule matches.
+func SeedRuleIndexForRationale(rationale string) (int, bool) {
+	for i, r := range SeedNeverAutoRules() {
+		if strings.Contains(rationale, "pattern "+r.Pattern+" matched") {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // compiledNeverAutoRule is one unified rule ready for matching.
 type compiledNeverAutoRule struct {
 	rule NeverAutoRule
@@ -150,16 +182,29 @@ type NeverAutoList struct {
 // NewNeverAutoList compiles strict and heuristic rules into one matcher while
 // preserving each rule's source, kind, and agent-type scope.
 // Invalid operator patterns are reported, not silently dropped.
-func NewNeverAutoList(seedEnabled bool, extraPatterns []string, extraRules []NeverAutoRule) (*NeverAutoList, []error) {
+//
+// disabledSeeds names individual seed patterns (strict or heuristic) the
+// operator has switched off; each is skipped while every other seed rule stays
+// active. Operator rules are never filtered by it. Passing nil (or the whole
+// set disabled via seedEnabled=false) keeps the previous behavior.
+func NewNeverAutoList(seedEnabled bool, disabledSeeds, extraPatterns []string, extraRules []NeverAutoRule) (*NeverAutoList, []error) {
 	var errs []error
 	a := &NeverAutoList{}
-	addRules := func(rules []NeverAutoRule, defaultKind NeverAutoRuleKind, defaultSource NeverAutoRuleSource) {
+	disabled := make(map[string]bool, len(disabledSeeds))
+	for _, p := range disabledSeeds {
+		disabled[p] = true
+	}
+	addRules := func(rules []NeverAutoRule, defaultKind NeverAutoRuleKind, defaultSource NeverAutoRuleSource, seed bool) {
 		for _, rule := range rules {
 			if rule.Kind == "" {
 				rule.Kind = defaultKind
 			}
 			if rule.Source == "" {
 				rule.Source = defaultSource
+			}
+			// Only seed rules honor the operator's per-rule disable list.
+			if seed && disabled[rule.Pattern] {
+				continue
 			}
 			re, err := regexp.Compile(rule.Pattern)
 			if err != nil {
@@ -174,15 +219,15 @@ func NewNeverAutoList(seedEnabled bool, extraPatterns []string, extraRules []Nev
 		for _, pattern := range SeedNeverAutoPatterns {
 			seedRules = append(seedRules, NeverAutoRule{Pattern: pattern})
 		}
-		addRules(seedRules, NeverAutoStrict, NeverAutoSeed)
-		addRules(SeedHeuristicNeverAutoRules, NeverAutoHeuristic, NeverAutoSeed)
+		addRules(seedRules, NeverAutoStrict, NeverAutoSeed, true)
+		addRules(SeedHeuristicNeverAutoRules, NeverAutoHeuristic, NeverAutoSeed, true)
 	}
 	operatorRules := make([]NeverAutoRule, 0, len(extraPatterns)+len(extraRules))
 	for _, pattern := range extraPatterns {
 		operatorRules = append(operatorRules, NeverAutoRule{Pattern: pattern})
 	}
 	operatorRules = append(operatorRules, extraRules...)
-	addRules(operatorRules, NeverAutoStrict, NeverAutoOperator)
+	addRules(operatorRules, NeverAutoStrict, NeverAutoOperator, false)
 	return a, errs
 }
 

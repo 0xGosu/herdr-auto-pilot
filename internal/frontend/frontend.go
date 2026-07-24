@@ -2365,9 +2365,9 @@ func JoinCommand(argv []string) string {
 // listed by `rules list` / the TUI). expected is the pattern text the caller
 // believes is at that index: removal is refused on mismatch, so a listing
 // gone stale (another front-end edited in between) can never silently delete
-// the wrong never-auto pattern. Seed patterns cannot be removed here;
-// disabling the seed requires the explicit
-// safety.disable_never_auto_seed_patterns TOML edit.
+// the wrong never-auto pattern. Seed patterns are not deleted here — they are
+// shipped constants; disable one individually with DisableSeedRule, or drop
+// them all with safety.disable_never_auto_seed_patterns.
 func (a *App) RemoveNeverAutoPattern(ctx context.Context, index int, expected string) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		if index < 0 || index >= len(cfg.Safety.NeverAutoPatterns) {
@@ -2380,6 +2380,80 @@ func (a *App) RemoveNeverAutoPattern(ctx context.Context, index int, expected st
 			cfg.Safety.NeverAutoPatterns[:index], cfg.Safety.NeverAutoPatterns[index+1:]...)
 		return nil
 	})
+}
+
+// SeedRuleDisabled reports whether a shipped seed pattern has been disabled
+// individually via safety.disabled_seed_patterns, for list rendering.
+func (a *App) SeedRuleDisabled(pattern string) bool {
+	cfg, err := a.Config()
+	if err != nil {
+		return false
+	}
+	for _, p := range cfg.Safety.DisabledSeedPatterns {
+		if p == pattern {
+			return true
+		}
+	}
+	return false
+}
+
+// DisableSeedRule silences one shipped seed never-auto rule (strict or
+// heuristic) permanently, keeping every other seed rule active. index is the
+// rule's position in domain.SeedNeverAutoRules (as listed by `rules list`) and
+// expected is the pattern text the caller saw there: the edit is refused on
+// mismatch so a stale listing can never disable the wrong rule. The rule is
+// recorded by its pattern string (not its index), so the setting survives a
+// seed-list reordering across versions. Disabling an already-disabled rule is a
+// no-op.
+func (a *App) DisableSeedRule(ctx context.Context, index int, expected string) error {
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		pattern, err := seedPatternAt(index, expected)
+		if err != nil {
+			return err
+		}
+		for _, p := range cfg.Safety.DisabledSeedPatterns {
+			if p == pattern {
+				return nil // already disabled
+			}
+		}
+		cfg.Safety.DisabledSeedPatterns = append(cfg.Safety.DisabledSeedPatterns, pattern)
+		return nil
+	})
+}
+
+// EnableSeedRule re-enables a seed rule previously disabled with
+// DisableSeedRule. index/expected identify the rule the same way. Re-enabling a
+// rule that is not disabled is a no-op.
+func (a *App) EnableSeedRule(ctx context.Context, index int, expected string) error {
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		pattern, err := seedPatternAt(index, expected)
+		if err != nil {
+			return err
+		}
+		kept := cfg.Safety.DisabledSeedPatterns[:0]
+		for _, p := range cfg.Safety.DisabledSeedPatterns {
+			if p != pattern {
+				kept = append(kept, p)
+			}
+		}
+		cfg.Safety.DisabledSeedPatterns = kept
+		return nil
+	})
+}
+
+// seedPatternAt resolves a seed-rule index to its pattern, refusing the edit if
+// the index is out of range or the pattern at that position no longer matches
+// what the caller listed (the same stale-listing guard RemoveNeverAutoPattern
+// uses).
+func seedPatternAt(index int, expected string) (string, error) {
+	seeds := domain.SeedNeverAutoRules()
+	if index < 0 || index >= len(seeds) {
+		return "", fmt.Errorf("no seed rule #%d", index)
+	}
+	if got := seeds[index].Pattern; got != expected {
+		return "", fmt.Errorf("seed rule #%d changed since it was listed (now %q); re-list and retry", index, got)
+	}
+	return seeds[index].Pattern, nil
 }
 
 // RemoveTaskSource deletes a task source by index. expected is the entry the
@@ -2477,7 +2551,7 @@ func (a *App) SetThreshold(ctx context.Context, situation string, value float64)
 
 // AddNeverAutoPattern appends a never-auto pattern (FR-016) and reloads.
 func (a *App) AddNeverAutoPattern(ctx context.Context, pattern string) error {
-	if _, errs := domain.NewNeverAutoList(false, []string{pattern}, nil); len(errs) > 0 {
+	if _, errs := domain.NewNeverAutoList(false, nil, []string{pattern}, nil); len(errs) > 0 {
 		return fmt.Errorf("invalid pattern: %v", errs[0])
 	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {

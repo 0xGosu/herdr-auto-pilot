@@ -2051,6 +2051,88 @@ func TestAddNeverAutoPatternValidates(t *testing.T) {
 	}
 }
 
+// seedMatcherFires rebuilds the never-auto matcher the daemon would build from
+// the app's current config and reports whether content still trips a rule.
+func seedMatcherFires(t *testing.T, app *frontend.App, content string) bool {
+	t.Helper()
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, errs := domain.NewNeverAutoList(!cfg.Safety.DisableNeverAutoSeedPatterns,
+		cfg.Safety.DisabledSeedPatterns, cfg.Safety.NeverAutoPatterns, nil)
+	if len(errs) > 0 {
+		t.Fatalf("matcher compile: %v", errs)
+	}
+	_, matched := list.Match("claude", content)
+	if !matched {
+		_, matched = list.SuspectedIrreversible("claude", content)
+	}
+	return matched
+}
+
+func TestDisableAndEnableSeedRule(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+
+	// Pick the no-undo heuristic — the one that over-fires on words like
+	// "unrecoverable" — by locating it in the shipped seed list.
+	seeds := domain.SeedNeverAutoRules()
+	idx := -1
+	for i, r := range seeds {
+		if strings.Contains(r.Pattern, "unrecoverabl") {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("no-undo heuristic seed rule not found")
+	}
+	pattern := seeds[idx].Pattern
+
+	if !seedMatcherFires(t, app, "This action cannot be undone") {
+		t.Fatal("heuristic must fire before it is disabled")
+	}
+
+	if err := app.DisableSeedRule(ctx, idx, pattern); err != nil {
+		t.Fatal(err)
+	}
+	// Disabling again is a no-op, not a duplicate.
+	if err := app.DisableSeedRule(ctx, idx, pattern); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := app.Config()
+	if len(cfg.Safety.DisabledSeedPatterns) != 1 || cfg.Safety.DisabledSeedPatterns[0] != pattern {
+		t.Fatalf("disabled set wrong: %v", cfg.Safety.DisabledSeedPatterns)
+	}
+	if seedMatcherFires(t, app, "This action cannot be undone") {
+		t.Error("disabled heuristic must not fire")
+	}
+	// Sibling rules stay active.
+	if !seedMatcherFires(t, app, "DROP TABLE users") {
+		t.Error("disabling one seed rule must not disable the others")
+	}
+
+	// A stale expectation must refuse to change the wrong rule.
+	if err := app.DisableSeedRule(ctx, idx, "not-the-pattern"); err == nil {
+		t.Error("mismatched expected pattern must refuse")
+	}
+	if err := app.EnableSeedRule(ctx, 99999, pattern); err == nil {
+		t.Error("out-of-range seed index must error")
+	}
+
+	if err := app.EnableSeedRule(ctx, idx, pattern); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ = app.Config()
+	if len(cfg.Safety.DisabledSeedPatterns) != 0 {
+		t.Errorf("re-enable must clear the disabled entry: %v", cfg.Safety.DisabledSeedPatterns)
+	}
+	if !seedMatcherFires(t, app, "This action cannot be undone") {
+		t.Error("re-enabled heuristic must fire again")
+	}
+}
+
 func TestSetFieldValidatesAndPersists(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
@@ -2679,12 +2761,12 @@ func TestCLIParityWithSharedLayer(t *testing.T) {
 	if out := run("kill-history"); !strings.Contains(out, "active") {
 		t.Errorf("kill history output: %q", out)
 	}
-	if out := run("rules", "list"); !strings.Contains(out, "seed strict") || !strings.Contains(out, "seed heuristic") {
+	if out := run("rules", "list"); !strings.Contains(out, "seed #0\tstrict") || !strings.Contains(out, "\theuristic\t") {
 		t.Errorf("rules output: %q", out)
 	}
 	run("config", "set", "safety.disable_never_auto_seed_patterns", "true")
 	if out := run("rules", "list"); !strings.Contains(out, "shipped never-auto rules disabled") ||
-		strings.Contains(out, "seed strict") || strings.Contains(out, "seed heuristic") {
+		strings.Contains(out, "seed #0\tstrict") || strings.Contains(out, "\theuristic\t") {
 		t.Errorf("disabled rules output: %q", out)
 	}
 

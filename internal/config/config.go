@@ -51,6 +51,14 @@ type Safety struct {
 	// DisableNeverAutoSeedPatterns disables the shipped seed never-auto
 	// patterns (not recommended).
 	DisableNeverAutoSeedPatterns bool `toml:"disable_never_auto_seed_patterns"`
+	// DisabledSeedPatterns lists shipped seed never-auto patterns (strict or
+	// heuristic) the operator has disabled individually, keyed by the exact
+	// pattern string so the setting survives seed-list reordering across
+	// versions. Distinct from DisableNeverAutoSeedPatterns, which drops every
+	// seed rule at once: this silences only the named rules and keeps the rest
+	// of the safety net. An entry that matches no current seed pattern (a rule
+	// dropped by a later release) is simply ignored.
+	DisabledSeedPatterns []string `toml:"disabled_seed_patterns"`
 	// DeprecatedDisableSeed is the pre-rename key for
 	// DisableNeverAutoSeedPatterns. Load migrates it only when the canonical
 	// key is absent, then clears it so Save emits only the new key.

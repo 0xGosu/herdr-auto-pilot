@@ -339,6 +339,27 @@ func TestSaveRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDisabledSeedPatternsRoundTrip pins that per-rule seed disables survive
+// Save/Load — the setting that lets an operator silence one over-aggressive
+// builtin rule must persist across daemon restarts.
+func TestDisabledSeedPatternsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	cfg := Default()
+	cfg.Safety.DisabledSeedPatterns = []string{`(?i)\bunrecoverabl[ey]\b`, `(?i)\bDROP\s+TABLE\b`}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Safety.DisabledSeedPatterns) != 2 ||
+		got.Safety.DisabledSeedPatterns[0] != `(?i)\bunrecoverabl[ey]\b` ||
+		got.Safety.DisabledSeedPatterns[1] != `(?i)\bDROP\s+TABLE\b` {
+		t.Errorf("disabled_seed_patterns round trip mismatch: %+v", got.Safety.DisabledSeedPatterns)
+	}
+}
+
 // TestEmbeddingTimeoutKeysRoundTrip pins the TOML surface an operator edits to
 // rescue a large model: the three tunables must parse from a hand-written file
 // and survive Save/Load, and an omitted key must stay 0 (the "use the built-in

@@ -860,6 +860,96 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 	}
 }
 
+func TestRulesListNumbersAndDisablesSeedRules(t *testing.T) {
+	app, _ := testApp(t)
+
+	out, err := run(t, app, "rules", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "seed #0\t") {
+		t.Errorf("rules list should number seed rules, got:\n%s", out)
+	}
+	if strings.Contains(out, "[disabled]") {
+		t.Errorf("no seed rule should be disabled initially, got:\n%s", out)
+	}
+
+	// Disable seed #0 and confirm it is marked disabled on the next list.
+	if _, err := run(t, app, "rules", "disable-seed", "0"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := app.Config()
+	if len(cfg.Safety.DisabledSeedPatterns) != 1 {
+		t.Fatalf("disable-seed must persist one entry, got %v", cfg.Safety.DisabledSeedPatterns)
+	}
+	out, _ = run(t, app, "rules", "list")
+	if !strings.Contains(out, "seed #0\tstrict [disabled]") {
+		t.Errorf("disabled seed rule must be marked, got:\n%s", out)
+	}
+
+	// Re-enable clears the mark.
+	if _, err := run(t, app, "rules", "enable-seed", "0"); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = run(t, app, "rules", "list")
+	if strings.Contains(out, "[disabled]") {
+		t.Errorf("re-enabled seed rule must not be marked, got:\n%s", out)
+	}
+
+	// Bad indexes are rejected.
+	for _, bad := range []string{"-1", "99999", "abc"} {
+		if _, err := run(t, app, "rules", "disable-seed", bad); err == nil {
+			t.Errorf("disable-seed %q must error", bad)
+		}
+	}
+}
+
+func TestEscalationsHintsDisableSeedForBuiltinRule(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+
+	// Produce a real seed-rule diagnostic (the escalation rationale a builtin
+	// heuristic hit would carry) and store an escalation with it.
+	list, errs := domain.NewNeverAutoList(true, nil, nil, nil)
+	if len(errs) > 0 {
+		t.Fatalf("matcher: %v", errs)
+	}
+	hit, ok := list.SuspectedIrreversible("claude", "This action cannot be undone")
+	if !ok {
+		t.Fatal("expected a builtin heuristic to fire")
+	}
+	wantIdx, ok := domain.SeedRuleIndexForRationale(hit.Diagnostic())
+	if !ok {
+		t.Fatal("seed rationale must resolve to an index")
+	}
+	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:seedhit0001",
+		Trigger: "purge?", SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: hit.Diagnostic(), Status: "escalated", CreatedAt: time.Now()})
+
+	out, err := run(t, app, "escalations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, fmt.Sprintf("hap rules disable-seed %d", wantIdx)) {
+		t.Errorf("a builtin-rule escalation should hint disable-seed %d, got:\n%s", wantIdx, out)
+	}
+}
+
+func TestEscalationsOmitsDisableSeedForNonSeedEscalation(t *testing.T) {
+	app, st := testApp(t)
+	st.AppendAudit(context.Background(), domain.AuditRecord{Signature: "error:plainrow01",
+		Trigger: "boom", SituationType: domain.SituationError, Action: "escalated",
+		Rationale: "contradictory history", Status: "escalated", CreatedAt: time.Now()})
+
+	out, err := run(t, app, "escalations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "disable-seed") {
+		t.Errorf("a non-seed escalation must not hint disable-seed, got:\n%s", out)
+	}
+}
+
 // cliFakeEmbedder backs the standalone reembed path in CLI tests.
 type cliFakeEmbedder struct{ id string }
 
