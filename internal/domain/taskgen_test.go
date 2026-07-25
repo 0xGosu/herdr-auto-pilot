@@ -449,6 +449,68 @@ func TestNormalizeGeneratedTasksLastListWins(t *testing.T) {
 			"ignored 1 other list: I weighed two approaches: - Rewrite the parser - Patch the regex Final tasks:",
 		},
 		{
+			// A "~~~" inside a backtick block is CONTENT, not a closer. Counting
+			// delimiters instead of matching them balances this reply out, ends
+			// the fence early, and releases the rest of the snippet back into the
+			// task list — a YAML key becoming work the agent is handed.
+			"mismatched fence delimiter does not close the block",
+			"Tasks:\n\n" +
+				"- Add multi-list handling\n\n" +
+				"```yaml\n" +
+				"- name: build\n" +
+				"~~~\n" +
+				"- name: deploy\n" +
+				"```\n\n" +
+				"- Cover it with tests",
+			[]string{"Add multi-list handling", "Cover it with tests"},
+			"Tasks:",
+		},
+		{
+			// The mirror: a "```" inside a tilde block does not close it either.
+			"backtick delimiter does not close a tilde block",
+			"Tasks:\n\n" +
+				"- Add multi-list handling\n\n" +
+				"~~~yaml\n" +
+				"- name: build\n" +
+				"```\n" +
+				"- name: deploy\n" +
+				"~~~\n\n" +
+				"- Cover it with tests",
+			[]string{"Add multi-list handling", "Cover it with tests"},
+			"Tasks:",
+		},
+		{
+			// A closer must be at least as long as its opener, so a three-tick
+			// run inside a four-tick block is content — which is exactly how a
+			// model nests a fenced example inside a fenced example.
+			"short delimiter does not close a longer fence",
+			"Tasks:\n\n" +
+				"- Add multi-list handling\n\n" +
+				"````md\n" +
+				"```\n" +
+				"- fenced example item\n" +
+				"```\n" +
+				"````\n\n" +
+				"- Cover it with tests",
+			[]string{"Add multi-list handling", "Cover it with tests"},
+			"Tasks:",
+		},
+		{
+			// A run carrying an info string is an OPENER, never a closer, so it
+			// cannot end the block it sits inside.
+			"a delimiter with an info string never closes",
+			"Tasks:\n\n" +
+				"- Add multi-list handling\n\n" +
+				"```sh\n" +
+				"echo hi\n" +
+				"```go\n" +
+				"- not a task\n" +
+				"```\n\n" +
+				"- Cover it with tests",
+			[]string{"Add multi-list handling", "Cover it with tests"},
+			"Tasks:",
+		},
+		{
 			// An UNCLOSED fence makes "inside" a guess, so fence awareness
 			// switches off entirely and plain source order decides. Failing
 			// open matters: trusting the bogus parity would mark the real
@@ -554,6 +616,67 @@ func TestNormalizeGeneratedTasksLastListWins(t *testing.T) {
 			}
 			if gotRationale != tc.wantRationale {
 				t.Errorf("rationale = %q, want %q", gotRationale, tc.wantRationale)
+			}
+		})
+	}
+}
+
+// TestParseFenceDelimiterAndCloses pins the CommonMark matching rules
+// directly. Treating every fence-looking line as an interchangeable toggle
+// lets a mismatched pair balance out, which ends a block early and releases
+// its contents back into the task list as work.
+func TestParseFenceDelimiterAndCloses(t *testing.T) {
+	parses := []struct {
+		line     string
+		ok       bool
+		char     byte
+		run      int
+		infoOnly bool
+	}{
+		{line: "```", ok: true, char: '`', run: 3},
+		{line: "~~~", ok: true, char: '~', run: 3},
+		{line: "````", ok: true, char: '`', run: 4},
+		{line: "   ```", ok: true, char: '`', run: 3}, // indented openers are legal
+		{line: "```yaml", ok: true, char: '`', run: 3, infoOnly: true},
+		{line: "~~~ go ", ok: true, char: '~', run: 3, infoOnly: true},
+		{line: "``", ok: false}, // too short
+		{line: "~~", ok: false}, // too short
+		{line: "", ok: false},   // blank
+		{line: "- [ ] a", ok: false},
+		{line: "``` a ` b", ok: false}, // a backtick info string may not hold a backtick
+	}
+	for _, tc := range parses {
+		t.Run("parse "+tc.line, func(t *testing.T) {
+			d, ok := parseFenceDelimiter(tc.line)
+			if ok != tc.ok {
+				t.Fatalf("parseFenceDelimiter(%q) ok = %v, want %v", tc.line, ok, tc.ok)
+			}
+			if !ok {
+				return
+			}
+			if d.char != tc.char || d.run != tc.run || d.info != tc.infoOnly {
+				t.Errorf("parseFenceDelimiter(%q) = %+v, want char %q run %d info %v",
+					tc.line, d, tc.char, tc.run, tc.infoOnly)
+			}
+		})
+	}
+
+	open := fenceDelimiter{char: '`', run: 3}
+	closers := []struct {
+		name string
+		d    fenceDelimiter
+		want bool
+	}{
+		{"same char, same run", fenceDelimiter{char: '`', run: 3}, true},
+		{"same char, longer run", fenceDelimiter{char: '`', run: 5}, true},
+		{"other char", fenceDelimiter{char: '~', run: 3}, false},
+		{"shorter run", fenceDelimiter{char: '`', run: 2}, false},
+		{"carries an info string", fenceDelimiter{char: '`', run: 3, info: true}, false},
+	}
+	for _, tc := range closers {
+		t.Run("closes "+tc.name, func(t *testing.T) {
+			if got := tc.d.closes(open); got != tc.want {
+				t.Errorf("%+v.closes(%+v) = %v, want %v", tc.d, open, got, tc.want)
 			}
 		})
 	}

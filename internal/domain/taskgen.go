@@ -95,19 +95,74 @@ func orderedMarkerNum(line string) int {
 	return n
 }
 
-// fencedRegions marks the lines that sit INSIDE a code fence, so both the
-// block scan and the emit loop can treat that content as DATA the model
-// illustrated with rather than as tasks or reasoning. Without it a command in a
-// ```sh block reads as a blank-separated section break, a "# comment" in one
-// reads as a heading, and a "- name: build" in a ```yaml block becomes a task.
+// fenceDelimiter is a parsed Markdown code-fence line: which character the run
+// is made of ("`" or "~"), how long that run is, and whether an info string
+// ("```yaml") follows it. All three decide whether a later delimiter CLOSES
+// this fence — see parseFenceDelimiter.
+type fenceDelimiter struct {
+	char byte
+	run  int
+	info bool
+}
+
+// parseFenceDelimiter reads a line as a code-fence delimiter, reporting false
+// when it is not one. Per CommonMark a fence is at least three of the SAME
+// character, optionally indented, optionally followed by an info string; a
+// backtick fence's info string may not itself contain a backtick.
+//
+// This is stricter than isFenceLine on purpose. isFenceLine answers the loose
+// "does this look like a fence", which is all the fail-open paths need;
+// matching an opener to its closer needs the character and the run length, or
+// a "~~~" reads as closing a "```" block and everything below it escapes the
+// fence.
+func parseFenceDelimiter(line string) (fenceDelimiter, bool) {
+	t := strings.TrimLeft(line, " \t")
+	if t == "" || (t[0] != '`' && t[0] != '~') {
+		return fenceDelimiter{}, false
+	}
+	c := t[0]
+	run := 0
+	for run < len(t) && t[run] == c {
+		run++
+	}
+	if run < 3 {
+		return fenceDelimiter{}, false
+	}
+	rest := strings.TrimSpace(t[run:])
+	if c == '`' && strings.ContainsRune(rest, '`') {
+		return fenceDelimiter{}, false
+	}
+	return fenceDelimiter{char: c, run: run, info: rest != ""}, true
+}
+
+// closes reports whether d ends a fence opened by open. CommonMark requires
+// the same character, a run at least as long as the opener's, and no info
+// string. Anything else that merely looks like a fence — the other flavour, a
+// shorter run, a run carrying an info string — is ordinary content INSIDE the
+// open block.
+func (d fenceDelimiter) closes(open fenceDelimiter) bool {
+	return d.char == open.char && d.run >= open.run && !d.info
+}
+
+// fencedRegions marks the lines a code fence covers — its delimiters and
+// everything between them — so both the block scan and the emit loop can treat
+// that content as DATA the model illustrated with rather than as tasks or
+// reasoning. Without it a command in a ```sh block reads as a blank-separated
+// section break, a "# comment" in one reads as a heading, and a "- name: build"
+// in a ```yaml block becomes a task.
+//
+// Openers are matched to closers properly (see fenceDelimiter.closes), so a
+// "~~~" inside a backtick block does not end it. Counting delimiters instead
+// would let a mismatched pair balance out and release every line below it back
+// into the task list — the exact unsafe reading this exists to prevent.
 //
 // It returns nil — meaning NO line is fenced — in the two cases where hap
 // cannot tell data from the real thing:
 //
-//   - an ODD number of fence delimiters. The reply was truncated, or it nested
-//     fences (which isFenceLine cannot tell apart), so "inside" is a guess. A
-//     wrong guess is worse than none: it would mark the real trailing list as
-//     data and hand the operator the rejected options instead.
+//   - a fence is still OPEN at the end. The reply was truncated mid-block, so
+//     "inside" is a guess, and a wrong guess is worse than none: it would mark
+//     the real trailing list as data and hand the operator the rejected options
+//     instead.
 //   - no task-bearing marker OUTSIDE a fence. That is a model fencing its whole
 //     answer, where the fenced list IS the answer.
 //
@@ -116,11 +171,19 @@ func orderedMarkerNum(line string) int {
 // both fallbacks fail toward keeping tasks.
 func fencedRegions(lines []string) []bool {
 	mask := make([]bool, len(lines))
-	inFence, delimiters, plainTask := false, 0, false
+	var open fenceDelimiter
+	inFence, plainTask := false, false
 	for i, line := range lines {
-		if isFenceLine(line) {
-			delimiters++
-			inFence = !inFence
+		if d, ok := parseFenceDelimiter(line); ok {
+			mask[i] = true
+			switch {
+			case !inFence:
+				open, inFence = d, true
+			case d.closes(open):
+				inFence = false
+			}
+			// A delimiter that neither opens nor closes is content; mask[i] is
+			// already set, and the fence stays open.
 			continue
 		}
 		mask[i] = inFence
@@ -131,7 +194,7 @@ func fencedRegions(lines []string) []bool {
 			plainTask = true
 		}
 	}
-	if delimiters%2 != 0 || !plainTask {
+	if inFence || !plainTask {
 		return nil
 	}
 	return mask
