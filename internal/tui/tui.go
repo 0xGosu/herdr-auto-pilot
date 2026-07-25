@@ -560,6 +560,21 @@ type Model struct {
 	// already true for every message processed afterward, regardless of
 	// which goroutine's result lands first.
 	pausePending bool
+
+	// cursorUndo restores the cursor when an OPTIMISTIC nudge turns out to
+	// have been wrong. moveSelectedTask moves the cursor before its move
+	// lands, so the operator sees it follow the task; if the move is then
+	// refused (a stale expected-text guard, or a domain refusal), the cursor
+	// would be left sitting on an unrelated task — and the NEXT K/J would
+	// move that one, with a text guard that legitimately passes. A subtree
+	// move can travel several rows, so the wrong row is no longer adjacent.
+	cursorUndo *cursorUndo
+}
+
+// cursorUndo is a cursor position to restore if the in-flight action fails.
+type cursorUndo struct {
+	tab tab
+	pos int
 }
 
 // renderNow returns the clock the Agents tab renders Age against: the
@@ -1146,9 +1161,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
+			// The action that moved the cursor ahead of itself did not happen,
+			// so put it back rather than leave it on a task nobody selected.
+			if u := m.cursorUndo; u != nil {
+				m.cursors[u.tab] = u.pos
+				m.scrollCursorIntoView()
+			}
 		} else if msg.message != "" {
 			m.status = &statusNote{text: msg.message, at: time.Now()}
 		}
+		m.cursorUndo = nil
 		// The status area shrinks the page by 2 — keep the cursor visible.
 		m.clampListViewport()
 		return m, m.refresh()
@@ -2639,7 +2661,9 @@ func (m Model) taskGroupAgent(group int) *domain.AgentTransition {
 }
 
 // moveSelectedTask reorders the task under the cursor by delta positions
-// (-1 = up, +1 = down) within its own source file, carrying its nested detail.
+// (-1 = up, +1 = down) within its own source file, carrying its whole subtree —
+// nested detail, nested sub-tasks, and their detail. One step therefore moves
+// the cursor past ONE sibling, which may be several rows.
 //
 // Three things have to be handled that no other Tasks action needs:
 //
@@ -2680,24 +2704,45 @@ func (m Model) moveSelectedTask(delta int) (tea.Model, tea.Cmd) {
 		m.message = "clear the search filter to reorder — positions count hidden tasks too"
 		return m, nil
 	}
-	to := r.item + delta
+	// One step is one SIBLING, not one row: the row after a parent is its own
+	// first sub-task, and asking to swap those two is re-parenting, which
+	// MoveTask refuses. Stepping by position would make K/J fail on exactly the
+	// nested lists a subtree-carrying move exists for.
+	items := m.data.tasks[r.group].Items
+	to := domain.SiblingPosition(items, r.item, delta)
 	// Refuse at the ends rather than clamping: a clamp would rewrite the file
 	// with identical content and report success, so holding the key at the top
 	// of the list would look like it was still doing something.
-	if n := len(m.data.tasks[r.group].Items); to < 1 || to > n {
-		m.message = fmt.Sprintf("task #%d is already at the %s of this list", r.item, edgeName(delta))
+	if n := len(items); to < 1 || to > n {
+		m.message = fmt.Sprintf("task #%d is already at the %s of its siblings", r.item, edgeName(delta))
 		return m, nil
 	}
 	app, path, from, text := m.app, canonicalTaskPath(r.path), r.item, r.itemText
 	m.taskMarks = nil
-	if delta > 0 && m.cursors[m.tab] < m.rowCount()-1 {
-		m.cursors[m.tab]++
-	} else if delta < 0 && m.cursors[m.tab] > 0 {
-		m.cursors[m.tab]--
+	// How far the moved task actually travels. Going DOWN it clears the whole
+	// destination sibling's subtree, so it advances by that sibling's size, not
+	// by one; going UP it lands exactly on the destination's position. A ±1
+	// nudge would leave the cursor on a sub-task, and the next keypress would
+	// move THAT one.
+	nudge := to - r.item
+	landed := to
+	if delta > 0 {
+		nudge = domain.SubtreeSize(items, to)
+		// Where it ENDS UP, which is not `to`: the source subtree vacates the
+		// positions above the destination, so the item lands that much earlier.
+		landed = to + nudge - domain.SubtreeSize(items, r.item)
+	}
+	m.cursorUndo = &cursorUndo{tab: m.tab, pos: m.cursors[m.tab]}
+	if c := m.cursors[m.tab] + nudge; c < 0 {
+		m.cursors[m.tab] = 0
+	} else if last := m.rowCount() - 1; c > last {
+		m.cursors[m.tab] = last
+	} else {
+		m.cursors[m.tab] = c
 	}
 	m.scrollCursorIntoView()
 	m.beginAction()
-	return m, m.do(fmt.Sprintf("task #%d moved to position #%d", from, to),
+	return m, m.do(fmt.Sprintf("task #%d moved to position #%d", from, landed),
 		func(c context.Context) error {
 			// The snapshotted text is the staleness guard: the row positions
 			// this move was computed from are the ones last rendered, so if the

@@ -298,6 +298,16 @@ func readTasks(t *testing.T, path string) string {
 	return string(data)
 }
 
+// writeTasks replaces the fixture checklist, for tests that need a shape
+// taskAppModel's flat three-item default cannot express (nesting). Follow it
+// with syncModel so the model reloads.
+func writeTasks(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTasksTabSpaceMarksAndAdvances(t *testing.T) {
 	m := taskModel(t)
 	// Space on the group header is a no-op with a hint, not a mark.
@@ -860,6 +870,178 @@ func TestTasksReorderKeys(t *testing.T) {
 	m = upd.(Model)
 	if cmd != nil || !strings.Contains(m.message, "move the cursor onto a task") {
 		t.Errorf("J on a header should only hint, got cmd=%v message=%q", cmd != nil, m.message)
+	}
+}
+
+// TestTasksReorderCarriesSubtree: K/J on a parent moves it together with its
+// sub-tasks, and one step is one SIBLING rather than one row. Two things would
+// break a naive ±1: J on a parent would target its own first child (which
+// MoveTask refuses as re-parenting), and the cursor nudge would land on a
+// sub-task, so the next keypress would move THAT one.
+func TestTasksReorderCarriesSubtree(t *testing.T) {
+	m, _, path := taskAppModel(t)
+	writeTasks(t, path, "- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n")
+	m = syncModel(t, m)
+	m = press(t, m, "down") // row 1 = item #1 (a), the parent
+
+	if r := m.selectedTaskRow(); r == nil || r.item != 1 {
+		t.Fatalf("precondition: cursor should be on the parent, got %+v", r)
+	}
+	upd, cmd := m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("J on a parent with sub-tasks should run a move, not refuse")
+	}
+	// "b" is a leaf, so the parent advances exactly one row past it.
+	if got := m.cursors[tabTasks]; got != 2 {
+		t.Errorf("cursor should follow the moved parent to row 2, got %d", got)
+	}
+	m, res := runAction(t, m, cmd)
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	want := "- [ ] b\n- [ ] a\n  - [ ] a1\n  - [ ] a2\n"
+	if got := readTasks(t, path); got != want {
+		t.Errorf("after J:\ngot  %q\nwant %q", got, want)
+	}
+	m = syncModel(t, m)
+	if r := m.selectedTaskRow(); r == nil || r.itemText != "a" {
+		t.Fatalf("cursor should still be on the moved parent, got %+v", r)
+	}
+
+	// K brings it back, and the cursor tracks it again.
+	upd, cmd = m.Update(pressKeyMsg("K"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("K on the parent should run a move")
+	}
+	if got := m.cursors[tabTasks]; got != 1 {
+		t.Errorf("cursor should follow the moved parent back to row 1, got %d", got)
+	}
+	if m, res = runAction(t, m, cmd); res.err != nil {
+		t.Fatal(res.err)
+	}
+	if got, want := readTasks(t, path), "- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n"; got != want {
+		t.Errorf("after K:\ngot  %q\nwant %q", got, want)
+	}
+	m = syncModel(t, m)
+
+	// A sub-task with no sibling below it refuses rather than escaping into the
+	// next parent — reordering never re-parents.
+	m = press(t, m, "down", "down") // row 3 = item #3 (a2)
+	if r := m.selectedTaskRow(); r == nil || r.itemText != "a2" {
+		t.Fatalf("precondition: cursor should be on the last sub-task, got %+v", r)
+	}
+	before := readTasks(t, path)
+	upd, cmd = m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Error("J on the last sub-task must not run a move")
+	}
+	if !strings.Contains(m.message, "already at the bottom") {
+		t.Errorf("the refusal should explain itself, got %q", m.message)
+	}
+	if got := readTasks(t, path); got != before {
+		t.Errorf("a refused move must not rewrite the file:\ngot  %q\nwant %q", got, before)
+	}
+}
+
+// TestTasksReorderCarriesSubtreePastAParentWithChildren: stepping down past a
+// sibling that ALSO has sub-tasks must clear that sibling's whole subtree, or
+// the moved parent lands wedged between it and its children — and the cursor
+// nudge must be the destination's subtree size, not one.
+func TestTasksReorderCarriesSubtreePastAParentWithChildren(t *testing.T) {
+	m, _, path := taskAppModel(t)
+	writeTasks(t, path, "- [ ] a\n  - [ ] a1\n- [ ] b\n  - [ ] b1\n  - [ ] b2\n")
+	m = syncModel(t, m)
+	m = press(t, m, "down") // row 1 = item #1 (a)
+
+	upd, cmd := m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("J should run a move")
+	}
+	// b's subtree is three items, so a lands three rows down.
+	if got := m.cursors[tabTasks]; got != 4 {
+		t.Errorf("cursor should clear the destination's subtree to row 4, got %d", got)
+	}
+	m, res := runAction(t, m, cmd)
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	want := "- [ ] b\n  - [ ] b1\n  - [ ] b2\n- [ ] a\n  - [ ] a1\n"
+	if got := readTasks(t, path); got != want {
+		t.Errorf("after J:\ngot  %q\nwant %q", got, want)
+	}
+	m = syncModel(t, m)
+	if r := m.selectedTaskRow(); r == nil || r.itemText != "a" {
+		t.Fatalf("cursor should be on the moved parent, not a sub-task, got %+v", r)
+	}
+}
+
+// TestTasksReorderUpOverASubtree: the UP nudge takes the other branch of the
+// asymmetric cursor arithmetic (the destination's position, not its subtree
+// size), so it needs its own multi-row case — stepping up past a parent with
+// two sub-tasks moves the cursor three rows, not one.
+func TestTasksReorderUpOverASubtree(t *testing.T) {
+	m, _, path := taskAppModel(t)
+	writeTasks(t, path, "- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n")
+	m = syncModel(t, m)
+	m = press(t, m, "down", "down", "down", "down") // row 4 = item #4 (b)
+	if r := m.selectedTaskRow(); r == nil || r.itemText != "b" {
+		t.Fatalf("precondition: cursor should be on b, got %+v", r)
+	}
+
+	upd, cmd := m.Update(pressKeyMsg("K"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("K should run a move")
+	}
+	if got := m.cursors[tabTasks]; got != 1 {
+		t.Errorf("cursor should clear the whole subtree up to row 1, got %d", got)
+	}
+	m, res := runAction(t, m, cmd)
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	want := "- [ ] b\n- [ ] a\n  - [ ] a1\n  - [ ] a2\n"
+	if got := readTasks(t, path); got != want {
+		t.Errorf("after K:\ngot  %q\nwant %q", got, want)
+	}
+	m = syncModel(t, m)
+	if r := m.selectedTaskRow(); r == nil || r.itemText != "b" {
+		t.Fatalf("cursor should be on the moved task, got %+v", r)
+	}
+}
+
+// TestTasksReorderRestoresCursorOnFailure: the nudge is OPTIMISTIC — it runs
+// before the move lands so the cursor visibly follows the task. When the move
+// is then refused, the cursor must go back: a subtree move can travel several
+// rows, so a stranded cursor sits on an unrelated task, and the next K/J would
+// move THAT one with a text guard that legitimately passes.
+func TestTasksReorderRestoresCursorOnFailure(t *testing.T) {
+	m, _, path := taskAppModel(t)
+	writeTasks(t, path, "- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n")
+	m = syncModel(t, m)
+	m = press(t, m, "down") // row 1 = item #1 (a)
+	before := m.cursors[tabTasks]
+
+	upd, cmd := m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("J should run a move")
+	}
+	if m.cursors[tabTasks] == before {
+		t.Fatal("precondition: the nudge should have moved the cursor")
+	}
+	// Rewrite the file underneath so the expected-text guard refuses.
+	writeTasks(t, path, "- [ ] something else entirely\n")
+	m, res := runAction(t, m, cmd)
+	if res.err == nil {
+		t.Fatal("a move against a changed file must be refused")
+	}
+	if got := m.cursors[tabTasks]; got != before {
+		t.Errorf("a refused move must put the cursor back to row %d, got %d", before, got)
 	}
 }
 

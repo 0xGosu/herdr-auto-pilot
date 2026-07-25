@@ -1793,23 +1793,27 @@ func taskMove(app *frontend.App, out io.Writer, agent, path string, args []strin
 		return err
 	}
 	idx := it.Index
-	to, relative, err := moveDestination(args[1], idx)
+	// The item list resolves a relative step: "down" is one SIBLING, not one
+	// position, since the position after a parent is its own first child.
+	tasks := listTasksOrNil(app, agent, path)
+	to, relative, err := moveDestination(args[1], idx, tasks)
 	if err != nil {
 		return err
 	}
 	// A relative step off either end is a normal thing to ask for — it is what
-	// a repeated `move X up` does when it reaches the top — so it is reported
-	// as "already there" rather than the bare "no task #0" the position
-	// validator would raise for a number the caller never typed. n == 0 means
-	// the count could not be read, and is deliberately NOT treated as "past the
-	// end": that would swallow the read error behind a success message. Falling
-	// through lets MoveTask report the real problem.
-	if n := countTasks(app, agent, path); relative && (to < 1 || (n > 0 && to > n)) {
+	// a repeated `move X up` does when it reaches the top, and equally what it
+	// does for a task that has no sibling on that side — so it is reported as
+	// "already there" rather than the bare "no task #0" the position validator
+	// would raise for a number the caller never typed. A nil list means it could
+	// not be read, and is deliberately NOT treated as "past the end": that would
+	// swallow the read error behind a success message. Falling through lets
+	// MoveTask report the real problem.
+	if n := len(tasks); relative && (to < 1 || (n > 0 && to > n)) {
 		edge := "top"
 		if to > idx {
 			edge = "bottom"
 		}
-		fmt.Fprintf(out, "task #%d is already at the %s of this list\n", idx, edge)
+		fmt.Fprintf(out, "task #%d is already at the %s of its siblings\n", idx, edge)
 		return nil
 	}
 	if to == idx {
@@ -1823,20 +1827,37 @@ func taskMove(app *frontend.App, out io.Writer, agent, path string, args []strin
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "moved task #%d to position #%d\n", idx, to)
+	// Report where the task LANDED, not the destination that was asked for.
+	// Moving down, the source subtree vacates the positions above the
+	// destination, so the item usually ends up earlier than `to` — printing `to`
+	// would contradict the list printed on the very next line.
+	fmt.Fprintf(out, "moved task #%d to position #%d\n", idx, moveLanding(tasks, idx, to))
 	printTaskList(out, items, "all")
 	return nil
 }
 
-// countTasks reports how many checklist items the target file holds, for the
-// relative-move edge check, or 0 when it cannot be read — which the caller
-// treats as "unknown", not "empty".
-func countTasks(app *frontend.App, agent, path string) int {
+// moveLanding is the position domain.MoveChecklistItem leaves the item at,
+// derived from the PRE-move item list. Moving up it is the destination itself;
+// moving down it is the destination shifted back by however much more of the
+// list the source subtree occupied than the destination's does. With no item
+// list to measure (a read that failed) the destination is the honest guess.
+func moveLanding(tasks []domain.ChecklistItem, from, to int) int {
+	if tasks == nil || to < from {
+		return to
+	}
+	return to + domain.SubtreeSize(tasks, to) - domain.SubtreeSize(tasks, from)
+}
+
+// listTasksOrNil reads the target file's checklist items for the relative-move
+// step and its edge check, or nil when it cannot be read — which the caller
+// treats as "unknown", not "empty", so a read failure surfaces from the move
+// itself instead of as a bogus "already at the top".
+func listTasksOrNil(app *frontend.App, agent, path string) []domain.ChecklistItem {
 	items, err := app.ListTasks(agent, path)
 	if err != nil {
-		return 0
+		return nil
 	}
-	return len(items)
+	return items
 }
 
 // moveDestination resolves a move target to a 1-based position, reporting
@@ -1845,12 +1866,32 @@ func countTasks(app *frontend.App, agent, path string) int {
 // walking a task to the top with repeated `up` naturally ends there. An
 // absolute position is never clamped: a destination the caller actually typed
 // is rejected by name if no such task exists.
-func moveDestination(arg string, idx int) (to int, relative bool, err error) {
+//
+// A relative step moves one SIBLING, which `tasks` is needed to find: the
+// position after a parent is its own first child, and swapping a parent with
+// its child is re-parenting, which MoveChecklistItem refuses. Stepping by
+// position would make `move X down` fail on every nested list. When the item
+// has no sibling that way the result is deliberately off the end in THAT
+// direction (0 going up, past the last item going down), so the caller's
+// edge check reports the side the operator actually asked for.
+//
+// A nil `tasks` means the list could not be read; the plain ±1 step is kept so
+// that failure surfaces from the move itself rather than as a bogus edge report.
+func moveDestination(arg string, idx int, tasks []domain.ChecklistItem) (to int, relative bool, err error) {
 	switch strings.ToLower(strings.TrimSpace(arg)) {
 	case "up":
-		return idx - 1, true, nil
+		if tasks == nil {
+			return idx - 1, true, nil
+		}
+		return domain.SiblingPosition(tasks, idx, -1), true, nil
 	case "down":
-		return idx + 1, true, nil
+		if tasks == nil {
+			return idx + 1, true, nil
+		}
+		if p := domain.SiblingPosition(tasks, idx, 1); p > 0 {
+			return p, true, nil
+		}
+		return len(tasks) + 1, true, nil
 	}
 	digits := strings.TrimPrefix(strings.TrimSpace(arg), "#")
 	// Digits only: strconv.Atoi also accepts a sign, and "+2" reading as
