@@ -55,8 +55,8 @@ func AgentBusy(status string) bool {
 // match, which is how list-mode drops prose. The whitespace after the bullet
 // char is load-bearing: it keeps a tight horizontal rule ("---", "***") from
 // matching at all. A spaced rule ("- - -") does match here but has no
-// alphanumeric body, so the mode-detection check in NormalizeGeneratedTasks
-// still refuses to treat it as a list marker.
+// alphanumeric body, so the mode-detection check in lastListBlock still refuses
+// to treat it as a list marker.
 // The ordered marker is built from the shared taskIDSepPat (tasklist.go), so an
 // escaped "1\." is stripped like a plain "1." — an LLM echoing a checklist it
 // read from an escaped file would otherwise leave the marker inside the task
@@ -68,6 +68,269 @@ var listItemRE = regexp.MustCompile(`^\s*(?:(?:[-*+]|\d+` + taskIDSepPat + `)\s+
 func isFenceLine(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	return strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~")
+}
+
+// atxHeadingRE matches a Markdown ATX heading ("# Plan", "### Tasks"). A
+// heading always starts a new section, so it ends whatever list precedes it
+// even when the model wrote no blank line before it.
+var atxHeadingRE = regexp.MustCompile(`^\s*#{1,6}\s`)
+
+// orderedMarkerRE captures the number of an ordered list marker ("1.", "2)").
+// It must agree with listItemRE's ordered branch — same separator set, same
+// required trailing whitespace — so every line it reads a number from is also
+// a list item.
+var orderedMarkerRE = regexp.MustCompile(`^\s*(\d+)` + taskIDSepPat + `\s`)
+
+// orderedMarkerNum returns the number of a line's ordered list marker, or 0
+// when the line is unordered (or the number does not fit an int).
+func orderedMarkerNum(line string) int {
+	m := orderedMarkerRE.FindStringSubmatch(line)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// fenceDelimiter is a parsed Markdown code-fence line: which character the run
+// is made of ("`" or "~"), how long that run is, and whether an info string
+// ("```yaml") follows it. All three decide whether a later delimiter CLOSES
+// this fence — see parseFenceDelimiter.
+type fenceDelimiter struct {
+	char byte
+	run  int
+	info bool
+}
+
+// parseFenceDelimiter reads a line as a code-fence delimiter, reporting false
+// when it is not one. Per CommonMark a fence is at least three of the SAME
+// character, optionally indented, optionally followed by an info string; a
+// backtick fence's info string may not itself contain a backtick.
+//
+// This is stricter than isFenceLine on purpose. isFenceLine answers the loose
+// "does this look like a fence", which is all the fail-open paths need;
+// matching an opener to its closer needs the character and the run length, or
+// a "~~~" reads as closing a "```" block and everything below it escapes the
+// fence.
+func parseFenceDelimiter(line string) (fenceDelimiter, bool) {
+	t := strings.TrimLeft(line, " \t")
+	if t == "" || (t[0] != '`' && t[0] != '~') {
+		return fenceDelimiter{}, false
+	}
+	c := t[0]
+	run := 0
+	for run < len(t) && t[run] == c {
+		run++
+	}
+	if run < 3 {
+		return fenceDelimiter{}, false
+	}
+	rest := strings.TrimSpace(t[run:])
+	if c == '`' && strings.ContainsRune(rest, '`') {
+		return fenceDelimiter{}, false
+	}
+	return fenceDelimiter{char: c, run: run, info: rest != ""}, true
+}
+
+// closes reports whether d ends a fence opened by open. CommonMark requires
+// the same character, a run at least as long as the opener's, and no info
+// string. Anything else that merely looks like a fence — the other flavour, a
+// shorter run, a run carrying an info string — is ordinary content INSIDE the
+// open block.
+func (d fenceDelimiter) closes(open fenceDelimiter) bool {
+	return d.char == open.char && d.run >= open.run && !d.info
+}
+
+// fencedRegions marks the lines a code fence covers — its delimiters and
+// everything between them — so both the block scan and the emit loop can treat
+// that content as DATA the model illustrated with rather than as tasks or
+// reasoning. Without it a command in a ```sh block reads as a blank-separated
+// section break, a "# comment" in one reads as a heading, and a "- name: build"
+// in a ```yaml block becomes a task.
+//
+// Openers are matched to closers properly (see fenceDelimiter.closes), so a
+// "~~~" inside a backtick block does not end it. Counting delimiters instead
+// would let a mismatched pair balance out and release every line below it back
+// into the task list — the exact unsafe reading this exists to prevent.
+//
+// It returns nil — meaning NO line is fenced — in the two cases where hap
+// cannot tell data from the real thing:
+//
+//   - a fence is still OPEN at the end. The reply was truncated mid-block, so
+//     "inside" is a guess, and a wrong guess is worse than none: it would mark
+//     the real trailing list as data and hand the operator the rejected options
+//     instead.
+//   - no task-bearing marker OUTSIDE a fence. That is a model fencing its whole
+//     answer, where the fenced list IS the answer.
+//
+// A nil mask degrades to reading fenced content exactly as the pre-fence-aware
+// parser did — plain source order decides, and a fenced list can still win — so
+// both fallbacks fail toward keeping tasks.
+func fencedRegions(lines []string) []bool {
+	mask := make([]bool, len(lines))
+	var open fenceDelimiter
+	inFence, plainTask := false, false
+	for i, line := range lines {
+		if d, ok := parseFenceDelimiter(line); ok {
+			mask[i] = true
+			switch {
+			case !inFence:
+				open, inFence = d, true
+			case d.closes(open):
+				inFence = false
+			}
+			// A delimiter that neither opens nor closes is content; mask[i] is
+			// already set, and the fence stays open.
+			continue
+		}
+		mask[i] = inFence
+		if inFence {
+			continue
+		}
+		if m := listItemRE.FindStringSubmatch(line); m != nil && hasAlphanumeric(m[1]) {
+			plainTask = true
+		}
+	}
+	if inFence || !plainTask {
+		return nil
+	}
+	return mask
+}
+
+// isFenced reports whether line i is fenced content per mask. A nil mask means
+// fences are transparent — see fencedRegions.
+func isFenced(mask []bool, i int) bool {
+	return mask != nil && mask[i]
+}
+
+// listBlock is one run of list lines: the marker lines that no section break
+// separates, as a half-open [start,end) line range ending at the run's last
+// marker. The ordered-marker numbers let a numbered list that a paragraph
+// interrupts be recognized as ONE list rather than two.
+type listBlock struct {
+	start, end int
+	tasks      int // marker lines with a real (alphanumeric) body
+	firstNum   int // first ordered-marker number, 0 when the run is unordered
+	lastNum    int // last ordered-marker number, 0 when the run is unordered
+}
+
+// scanListBlocks splits the output into list blocks in source order, skipping
+// the fenced content fenceMask marks.
+//
+// A block ends at an unmarked line that is BOTH
+//   - separated from the list by a blank line, or an ATX heading; and
+//   - indented no deeper than the line that opened the block, so it is a new
+//     section rather than one item's continuation (the same indentation test
+//     nestedContinuationLines uses for checklist detail).
+//
+// Those two requirements keep the split conservative. Prose written flush
+// against a list ("- Fix the parser" / "then, once green:" / "- Add
+// validation") is one interrupted list, not two; an indented continuation line
+// under an item never splits its list; and a blank line alone does not end a
+// block either — that is a loose Markdown list, still one list.
+//
+// A fence is a block-level element: it never ends a list by itself, so a code
+// sample between two items leaves them one list, but the line AFTER it starts a
+// fresh paragraph and so counts as separated.
+func scanListBlocks(lines []string, fenceMask []bool) []listBlock {
+	var blocks []listBlock
+	cur := listBlock{start: -1}
+	curIndent := 0
+	// A prose line at the very top is "blank separated" from nothing, which is
+	// harmless: there is no open block for it to close.
+	blankSeen := true
+	flush := func() {
+		if cur.start >= 0 {
+			blocks = append(blocks, cur)
+		}
+		cur, curIndent = listBlock{start: -1}, 0
+	}
+	for i, line := range lines {
+		if isFenceLine(line) || isFenced(fenceMask, i) {
+			blankSeen = true
+			continue
+		}
+		if m := listItemRE.FindStringSubmatch(line); m != nil {
+			if cur.start < 0 {
+				cur.start, curIndent = i, indentWidth(line)
+			}
+			cur.end = i + 1
+			if hasAlphanumeric(m[1]) {
+				cur.tasks++
+			}
+			if n := orderedMarkerNum(line); n > 0 {
+				if cur.firstNum == 0 {
+					cur.firstNum = n
+				}
+				cur.lastNum = n
+			}
+			blankSeen = false
+			continue
+		}
+		if strings.TrimSpace(line) == "" {
+			blankSeen = true
+			continue
+		}
+		separated := blankSeen || atxHeadingRE.MatchString(line)
+		if cur.start >= 0 && separated && indentWidth(line) <= curIndent {
+			flush()
+		}
+		blankSeen = false
+	}
+	flush()
+	return mergeNumberedRuns(blocks)
+}
+
+// mergeNumberedRuns rejoins adjacent blocks whose ordered numbering runs
+// straight on ("1." … paragraph … "2."). A model explaining each numbered step
+// in its own paragraph writes ONE list, and splitting it would drop every step
+// but the last. Continued numbering is the evidence: a genuinely new list
+// restarts at 1, so it never merges.
+func mergeNumberedRuns(blocks []listBlock) []listBlock {
+	var out []listBlock
+	for _, b := range blocks {
+		if n := len(out); n > 0 && out[n-1].lastNum > 0 && b.firstNum == out[n-1].lastNum+1 {
+			prev := &out[n-1]
+			prev.end = b.end
+			prev.tasks += b.tasks
+			prev.lastNum = b.lastNum
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+// lastListBlock picks the block that holds the tasks: the LAST task-bearing
+// one. It returns that block's [start,end) line range, how many other
+// task-bearing blocks it supersedes, and whether one was found at all. A model
+// that reasons out loud often writes several lists — options it considered,
+// then the work it settled on — and only the final one is the task list; the
+// rest is reasoning that belongs in the rationale. A trailing fenced EXAMPLE
+// list cannot win, because fenceMask has already removed it from the scan.
+//
+// ok is exactly the old whole-document "list mode" predicate: some visible line
+// carries a marker AND an alphanumeric body. A marker with no body (an empty
+// "- ", a spaced rule "- - -") joins a block but never makes one task-bearing,
+// so it can neither flip a plain block into list mode nor become the "last
+// list" and starve the real one.
+func lastListBlock(lines []string, fenceMask []bool) (start, end, superseded int, ok bool) {
+	blocks := scanListBlocks(lines, fenceMask)
+	pick, candidates := -1, 0
+	for i, b := range blocks {
+		if b.tasks == 0 {
+			continue
+		}
+		candidates++
+		pick = i
+	}
+	if candidates == 0 {
+		return 0, 0, 0, false
+	}
+	return blocks[pick].start, blocks[pick].end, candidates - 1, true
 }
 
 // emphasisBody is the text an asterisk-emphasis span may wrap: it must begin
@@ -133,6 +396,19 @@ func stripInlineEmphasis(s string) string {
 // ellipsis. Measured in runes so a multibyte tail is never split.
 const maxGeneratedRationale = 500
 
+// supersededListNote is the prefix NormalizeGeneratedTasksWithRationale puts in
+// front of the rationale when it dropped other lists, so the operator sees that
+// a list was discarded even after excerpt truncates the tail. It says "other"
+// rather than "earlier" because a dropped list may also FOLLOW the winning one
+// (a trailing fenced example).
+func supersededListNote(n int) string {
+	noun := " other list:"
+	if n > 1 {
+		noun = " other lists:"
+	}
+	return "ignored " + strconv.Itoa(n) + noun
+}
+
 // NormalizeGeneratedTasks parses a generate-task CLI's raw stdout into a clean
 // list of task strings. See NormalizeGeneratedTasksWithRationale for the parse
 // rules; this drops the rationale for callers that only need the tasks.
@@ -142,22 +418,40 @@ func NormalizeGeneratedTasks(raw string) []string {
 }
 
 // NormalizeGeneratedTasksWithRationale parses a generate-task CLI's raw stdout
-// into a clean list of task strings and, in list mode, the ignored non-list
-// prose joined as rationale text. The model may return one task or several,
-// plain or as a Markdown list. The parser picks a mode from the content: if ANY
-// line carries a real list/checkbox marker, the whole block is treated as a list
-// and ONLY marked lines become tasks — so a lead-in sentence ("Here are the
-// tasks:") preceding a bullet list is dropped rather than written as an item.
-// If no line carries a marker, it falls back to plain mode, where each
-// non-empty line is a task (a single- or multi-line plain response). Each task
-// is reduced to its bare text with Markdown inline emphasis (bold/italic/code)
-// stripped, and lines without a letter or digit are dropped. Returns nil tasks
-// when nothing usable remains.
+// into a clean list of task strings and, in list mode, everything it ignored
+// joined as rationale text. The model may return one task or several, plain or
+// as a Markdown list. The parser picks a mode from the content: if ANY line
+// carries a real list/checkbox marker, the output is treated as a list and ONLY
+// marked lines become tasks — so a lead-in sentence ("Here are the tasks:")
+// preceding a bullet list is dropped rather than written as an item. If no line
+// carries a marker, it falls back to plain mode, where each non-empty line is a
+// task (a single- or multi-line plain response). Each task is reduced to its
+// bare text with Markdown inline emphasis (bold/italic/code) stripped, and
+// lines without a letter or digit are dropped. Returns nil tasks when nothing
+// usable remains.
 //
-// The rationale is collected ONLY in list mode: it is the dropped, unmarked,
-// non-fence, non-blank prose (the model's reasoning around the list), collapsed
-// to a single line and capped at maxGeneratedRationale runes. In plain mode
-// nothing is ignored, so rationale is "".
+// When the output holds SEVERAL lists, only the LAST task-bearing one becomes
+// tasks (lastListBlock picks it; see scanListBlocks for what separates two
+// lists, and fencedRegions for why an illustrative fenced list is not one of
+// them). A model that reasons out loud
+// commonly lists the options it weighed before listing the work it settled on;
+// taking every marked line would write the discarded options into the agent's
+// checklist as real tasks. The superseded lists are not lost — they go to the
+// rationale with their markers intact, behind a short "ignored N other list(s):"
+// note. The trade-off is deliberate and one-directional: a model that groups ONE
+// task list under several headings, or appends a "Notes:" list, has all but the
+// final group demoted to rationale. That is visible to the operator on an
+// escalation nothing auto-accepts, whereas the old union quietly queued the
+// model's rejected options as work.
+//
+// The rationale is collected ONLY in list mode: the unmarked, non-fence,
+// non-blank prose around the list plus any superseded list's items, in source
+// order, collapsed to a single line and capped at maxGeneratedRationale runes
+// — with the "ignored N other list(s):" note, when there is one, prepended
+// ahead of all of it so truncation cannot eat the signal. Marker-only lines
+// ("- ", "[ ] ", the spaced rule "- - -") are list artifacts rather than
+// reasoning and stay out of it. In plain mode nothing is ignored, so rationale
+// is "".
 func NormalizeGeneratedTasksWithRationale(raw string) (tasks []string, rationale string) {
 	lines := strings.Split(raw, "\n")
 
@@ -165,21 +459,18 @@ func NormalizeGeneratedTasksWithRationale(raw string) (tasks []string, rationale
 	// (letters/digits); else plain mode. Requiring the body keeps an empty
 	// marker ("- ", "[ ] ") or a spaced horizontal rule ("- - -", "* * *")
 	// from flipping an otherwise-plain block into list mode and dropping its
-	// prose lines.
-	listMode := false
-	for _, line := range lines {
-		if isFenceLine(line) {
-			continue
-		}
-		if m := listItemRE.FindStringSubmatch(line); m != nil && hasAlphanumeric(m[1]) {
-			listMode = true
-			break
-		}
-	}
+	// prose lines. lastListBlock applies exactly that test, and also tells us
+	// WHICH of several lists is the task list.
+	// Fenced content is data, not tasks and not reasoning. The SAME mask drives
+	// the block scan and this loop, so the two can never disagree about which
+	// lines are visible; when it is nil, both fall back to reading fenced text
+	// as ordinary output (see fencedRegions).
+	fenceMask := fencedRegions(lines)
+	start, end, superseded, listMode := lastListBlock(lines, fenceMask)
 
 	var ignored []string
-	for _, line := range lines {
-		if isFenceLine(line) {
+	for i, line := range lines {
+		if isFenceLine(line) || isFenced(fenceMask, i) {
 			continue
 		}
 		var t string
@@ -190,6 +481,16 @@ func NormalizeGeneratedTasksWithRationale(raw string) (tasks []string, rationale
 			if m == nil {
 				if p := strings.TrimSpace(line); p != "" {
 					ignored = append(ignored, p)
+				}
+				continue
+			}
+			if i < start || i >= end {
+				// A marked line from a superseded list. Keep it in the
+				// rationale verbatim (marker included, so the operator can see
+				// it was a list) but never as a task. Bodyless markers are
+				// artifacts, not reasoning.
+				if hasAlphanumeric(m[1]) {
+					ignored = append(ignored, strings.TrimSpace(line))
 				}
 				continue
 			}
@@ -206,6 +507,11 @@ func NormalizeGeneratedTasksWithRationale(raw string) (tasks []string, rationale
 		if t != "" && hasAlphanumeric(t) {
 			tasks = append(tasks, t)
 		}
+	}
+	// Lead with the drop note so it survives the truncation below: the tail of a
+	// long rationale is exactly where a superseded list would otherwise vanish.
+	if superseded > 0 {
+		ignored = append([]string{supersededListNote(superseded)}, ignored...)
 	}
 	// excerpt (safety.go) collapses whitespace to a single line and caps the
 	// rune count with an ellipsis — a rationale is a compact one-liner rendered

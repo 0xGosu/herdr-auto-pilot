@@ -684,6 +684,63 @@ func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
 	}
 }
 
+func TestConfirmGeneratedMultipleListsWritesOnlyLastList(t *testing.T) {
+	// The suggestion carries the model's RAW output, which may hold several
+	// Markdown lists — options it weighed, then the work it settled on. Only the
+	// LAST list is real work, so only its items reach the checklist and only its
+	// first item is sent. The daemon validated the same raw text with the same
+	// parser, so the two sides cannot disagree about which list won.
+	app, st := testApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	ctx := context.Background()
+
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	suggestion := domain.SuggestTaskPrefix +
+		"I weighed two approaches:\n" +
+		"\n" +
+		"- Rewrite the parser from scratch\n" +
+		"- Patch the existing regex\n" +
+		"\n" +
+		"Final tasks:\n" +
+		"\n" +
+		"- [ ] Add multi-list handling\n" +
+		"- [ ] Cover it with unit tests"
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", SituationType: domain.SituationIdle, Trigger: "t",
+		Action: "escalated", Status: "escalated",
+		Suggestion: suggestion, CreatedAt: time.Now(),
+	})
+
+	if err := app.Confirm(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(stateDir, "tasks", name+".md")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("tasks file not written: %v", err)
+	}
+	want := "- [-] 1. Add multi-list handling\n- [ ] 2. Cover it with unit tests\n"
+	if !strings.Contains(string(body), want) {
+		t.Errorf("tasks file = %q, want only the last list %q", body, want)
+	}
+	// Nothing from the superseded list may be written as work.
+	for _, dropped := range []string{"Rewrite the parser from scratch", "Patch the existing regex", "I weighed two approaches"} {
+		if strings.Contains(string(body), dropped) {
+			t.Errorf("tasks file must not carry the superseded list item %q, got %q", dropped, body)
+		}
+	}
+	wantPrompt := domain.DeclaredTask{
+		Task: "Add multi-list handling", Path: path, AgentName: name,
+	}.Prompt()
+	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
+		t.Errorf("delivered %v, want only the last list's first task as %q", fake.inputs, wantPrompt)
+	}
+}
+
 func TestConfirmGeneratedTaskIsIdempotent(t *testing.T) {
 	// A double-submit (or re-confirm after resolution) must not re-send the
 	// task or accumulate duplicate task sources: the atomic claim lets only the

@@ -723,7 +723,21 @@ file that isn't a registered `[[task_sources]]` entry is never capped.
 
 The command's stdout may be plain lines or a Markdown list/checklist. Hap
 normalizes it and surfaces it as an escalation; it never auto-accepts a
-generated task. Confirming the suggestion creates
+generated task. When the output contains a list, only the list items become
+tasks and the surrounding prose is kept as the escalation's rationale. When it
+contains **several** lists — the options a model weighed, then the work it
+settled on — only the **last** list becomes tasks; the others go to the
+rationale behind an `ignored N other list(s):` note, so a discarded option is
+never queued as work. A list ends at a Markdown heading, or at prose separated
+from it by a blank line; prose flush against the bullets, a lone blank line, an
+indented continuation line, anything inside a fenced code block, and a
+paragraph between consecutively numbered steps (`1.` … `2.`) all leave one list
+intact. A fenced *example* list never outranks a real one. The trade-off runs
+one way: a reply that groups a single task list under several headings, or
+appends a `Notes:` list, keeps only its final group — the rest shows up in the
+rationale, on an escalation nothing auto-accepts, so ask the prompt for one
+final flat list if your model likes sections. Confirming the suggestion
+creates
 `<state-dir>/tasks/<agent-name>.md`, marks the first task in progress,
 registers the file as that agent's task source, and sends only the first task.
 Later idle events consume the remaining tasks through the normal declared-task
