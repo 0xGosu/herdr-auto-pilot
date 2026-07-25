@@ -2078,27 +2078,26 @@ func TestDisableAndEnableSeedRule(t *testing.T) {
 	// Pick the no-undo heuristic — the one that over-fires on words like
 	// "unrecoverable" — by locating it in the shipped seed list.
 	seeds := domain.SeedNeverAutoRules()
-	idx := -1
-	for i, r := range seeds {
+	pattern := ""
+	for _, r := range seeds {
 		if strings.Contains(r.Pattern, "unrecoverabl") {
-			idx = i
+			pattern = r.Pattern
 			break
 		}
 	}
-	if idx < 0 {
+	if pattern == "" {
 		t.Fatal("no-undo heuristic seed rule not found")
 	}
-	pattern := seeds[idx].Pattern
 
 	if !seedMatcherFires(t, app, "This action cannot be undone") {
 		t.Fatal("heuristic must fire before it is disabled")
 	}
 
-	if err := app.DisableSeedRule(ctx, idx, pattern); err != nil {
+	if err := app.DisableSeedRule(ctx, pattern); err != nil {
 		t.Fatal(err)
 	}
 	// Disabling again is a no-op, not a duplicate.
-	if err := app.DisableSeedRule(ctx, idx, pattern); err != nil {
+	if err := app.DisableSeedRule(ctx, pattern); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := app.Config()
@@ -2113,15 +2112,13 @@ func TestDisableAndEnableSeedRule(t *testing.T) {
 		t.Error("disabling one seed rule must not disable the others")
 	}
 
-	// A stale expectation must refuse to change the wrong rule.
-	if err := app.DisableSeedRule(ctx, idx, "not-the-pattern"); err == nil {
-		t.Error("mismatched expected pattern must refuse")
-	}
-	if err := app.EnableSeedRule(ctx, 99999, pattern); err == nil {
-		t.Error("out-of-range seed index must error")
+	// A pattern that is not a shipped seed rule must be refused, so a bogus id
+	// can never write an arbitrary string into the disable list.
+	if err := app.DisableSeedRule(ctx, "not-a-seed-pattern"); err == nil {
+		t.Error("a non-seed pattern must be refused")
 	}
 
-	if err := app.EnableSeedRule(ctx, idx, pattern); err != nil {
+	if err := app.EnableSeedRule(ctx, pattern); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ = app.Config()
@@ -2761,12 +2758,12 @@ func TestCLIParityWithSharedLayer(t *testing.T) {
 	if out := run("kill-history"); !strings.Contains(out, "active") {
 		t.Errorf("kill history output: %q", out)
 	}
-	if out := run("rules", "list"); !strings.Contains(out, "seed #0\tstrict") || !strings.Contains(out, "\theuristic\t") {
+	if out := run("rules", "list"); !strings.Contains(out, "\tstrict\t") || !strings.Contains(out, "\theuristic\t") {
 		t.Errorf("rules output: %q", out)
 	}
 	run("config", "set", "safety.disable_never_auto_seed_patterns", "true")
 	if out := run("rules", "list"); !strings.Contains(out, "shipped never-auto rules disabled") ||
-		strings.Contains(out, "seed #0\tstrict") || strings.Contains(out, "\theuristic\t") {
+		strings.Contains(out, "\tstrict\t") || strings.Contains(out, "\theuristic\t") {
 		t.Errorf("disabled rules output: %q", out)
 	}
 

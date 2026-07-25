@@ -690,18 +690,18 @@ func TestSeedNeverAutoRulesOrderAndCount(t *testing.T) {
 	}
 }
 
-func TestSeedRuleIndexForRationale(t *testing.T) {
+func TestSeedRuleForRationale(t *testing.T) {
 	a := newSeedNeverAuto(t)
 	hit, ok := a.SuspectedIrreversible("claude", "This action cannot be undone")
 	if !ok {
 		t.Fatal("expected the no-undo heuristic to fire")
 	}
-	idx, ok := SeedRuleIndexForRationale(hit.Diagnostic())
+	rule, ok := SeedRuleForRationale(hit.Diagnostic())
 	if !ok {
 		t.Fatalf("rationale from a seed hit must resolve: %q", hit.Diagnostic())
 	}
-	if got := SeedNeverAutoRules()[idx].Pattern; got != hit.Pattern {
-		t.Errorf("resolved seed #%d pattern=%q want %q", idx, got, hit.Pattern)
+	if rule.Pattern != hit.Pattern {
+		t.Errorf("resolved pattern=%q want %q", rule.Pattern, hit.Pattern)
 	}
 	// An operator-pattern rationale must not resolve to a seed rule.
 	op, errs := NewNeverAutoList(false, nil, []string{`(?i)operator-only-phrase`}, nil)
@@ -709,11 +709,67 @@ func TestSeedRuleIndexForRationale(t *testing.T) {
 		t.Fatalf("compile: %v", errs)
 	}
 	opHit, _ := op.Match("claude", "operator-only-phrase here")
-	if _, ok := SeedRuleIndexForRationale(opHit.Diagnostic()); ok {
+	if _, ok := SeedRuleForRationale(opHit.Diagnostic()); ok {
 		t.Error("an operator-pattern rationale must not resolve to a seed rule")
 	}
 	// An unrelated rationale must not resolve.
-	if _, ok := SeedRuleIndexForRationale("contradictory history"); ok {
+	if _, ok := SeedRuleForRationale("contradictory history"); ok {
 		t.Error("an unrelated rationale must not resolve to a seed rule")
+	}
+}
+
+// TestSeedRuleForRationaleRejectsOperatorDuplicateOfSeed is the regression for
+// review comment #2: an operator rule whose pattern text is byte-identical to a
+// shipped seed rule renders "source=operator" in its diagnostic, and the source
+// check must keep it from resolving to a builtin — otherwise the CLI would tell
+// the operator to disable a seed while their own rule is the one firing.
+func TestSeedRuleForRationaleRejectsOperatorDuplicateOfSeed(t *testing.T) {
+	seedPattern := strictSeedPattern(t, "DROP")
+	// Seeds disabled so ONLY the operator copy of the pattern is active.
+	a, errs := NewNeverAutoList(false, nil, []string{seedPattern}, nil)
+	if len(errs) > 0 {
+		t.Fatalf("compile: %v", errs)
+	}
+	hit, ok := a.Match("claude", "DROP TABLE users")
+	if !ok {
+		t.Fatal("operator copy of the seed pattern must still fire")
+	}
+	if hit.Source != NeverAutoOperator {
+		t.Fatalf("expected operator source, got %q", hit.Source)
+	}
+	if _, ok := SeedRuleForRationale(hit.Diagnostic()); ok {
+		t.Error("an operator rule duplicating a seed pattern must not resolve to the seed")
+	}
+}
+
+// TestSeedRuleIDIsDurableAcrossOrdering is the regression for review comment #1:
+// the disable/enable id is a content hash, so it round-trips to the same rule
+// regardless of position, and an unknown id resolves to nothing rather than to
+// whatever rule sits at some index.
+func TestSeedRuleIDIsDurableAcrossOrdering(t *testing.T) {
+	seeds := SeedNeverAutoRules()
+	seen := make(map[string]bool, len(seeds))
+	for _, r := range seeds {
+		id := SeedRuleID(r.Pattern)
+		if seen[id] {
+			t.Fatalf("seed rule id collision at %q", id)
+		}
+		seen[id] = true
+		got, ok := SeedRuleByID(id)
+		if !ok || got.Pattern != r.Pattern {
+			t.Errorf("id %q must resolve back to its own pattern, got ok=%v pattern=%q", id, ok, got.Pattern)
+		}
+	}
+	// An id whose pattern does not ship (e.g. copied from an older version) is
+	// rejected, never silently mapped onto a positional neighbor.
+	if _, ok := SeedRuleByID("deadbeef"); ok {
+		t.Error("an unknown seed id must not resolve")
+	}
+	// IsSeedPattern gates the disable path.
+	if !IsSeedPattern(seeds[0].Pattern) {
+		t.Error("a shipped pattern must be recognized as a seed pattern")
+	}
+	if IsSeedPattern("(?i)operator-only") {
+		t.Error("an operator pattern must not be recognized as a seed pattern")
 	}
 }

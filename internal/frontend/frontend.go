@@ -2398,19 +2398,17 @@ func (a *App) SeedRuleDisabled(pattern string) bool {
 }
 
 // DisableSeedRule silences one shipped seed never-auto rule (strict or
-// heuristic) permanently, keeping every other seed rule active. index is the
-// rule's position in domain.SeedNeverAutoRules (as listed by `rules list`) and
-// expected is the pattern text the caller saw there: the edit is refused on
-// mismatch so a stale listing can never disable the wrong rule. The rule is
-// recorded by its pattern string (not its index), so the setting survives a
-// seed-list reordering across versions. Disabling an already-disabled rule is a
-// no-op.
-func (a *App) DisableSeedRule(ctx context.Context, index int, expected string) error {
+// heuristic) permanently, keeping every other seed rule active. The rule is
+// named by its exact pattern (resolved from a durable domain.SeedRuleID by the
+// caller); a pattern that is not a shipped seed rule is refused, so a stale or
+// bogus identifier can never write an arbitrary string into the disable list.
+// The pattern is what gets recorded, so the setting survives a seed-list
+// reordering across versions. Disabling an already-disabled rule is a no-op.
+func (a *App) DisableSeedRule(ctx context.Context, pattern string) error {
+	if !domain.IsSeedPattern(pattern) {
+		return fmt.Errorf("%q is not a shipped seed rule", pattern)
+	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
-		pattern, err := seedPatternAt(index, expected)
-		if err != nil {
-			return err
-		}
 		for _, p := range cfg.Safety.DisabledSeedPatterns {
 			if p == pattern {
 				return nil // already disabled
@@ -2422,14 +2420,10 @@ func (a *App) DisableSeedRule(ctx context.Context, index int, expected string) e
 }
 
 // EnableSeedRule re-enables a seed rule previously disabled with
-// DisableSeedRule. index/expected identify the rule the same way. Re-enabling a
-// rule that is not disabled is a no-op.
-func (a *App) EnableSeedRule(ctx context.Context, index int, expected string) error {
+// DisableSeedRule, named by the same exact pattern. Re-enabling a rule that is
+// not disabled is a no-op.
+func (a *App) EnableSeedRule(ctx context.Context, pattern string) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
-		pattern, err := seedPatternAt(index, expected)
-		if err != nil {
-			return err
-		}
 		kept := cfg.Safety.DisabledSeedPatterns[:0]
 		for _, p := range cfg.Safety.DisabledSeedPatterns {
 			if p != pattern {
@@ -2439,21 +2433,6 @@ func (a *App) EnableSeedRule(ctx context.Context, index int, expected string) er
 		cfg.Safety.DisabledSeedPatterns = kept
 		return nil
 	})
-}
-
-// seedPatternAt resolves a seed-rule index to its pattern, refusing the edit if
-// the index is out of range or the pattern at that position no longer matches
-// what the caller listed (the same stale-listing guard RemoveNeverAutoPattern
-// uses).
-func seedPatternAt(index int, expected string) (string, error) {
-	seeds := domain.SeedNeverAutoRules()
-	if index < 0 || index >= len(seeds) {
-		return "", fmt.Errorf("no seed rule #%d", index)
-	}
-	if got := seeds[index].Pattern; got != expected {
-		return "", fmt.Errorf("seed rule #%d changed since it was listed (now %q); re-list and retry", index, got)
-	}
-	return seeds[index].Pattern, nil
 }
 
 // RemoveTaskSource deletes a task source by index. expected is the entry the

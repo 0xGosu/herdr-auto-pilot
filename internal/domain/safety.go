@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"regexp"
 	"strings"
@@ -136,10 +137,9 @@ func SeedNeverAutoRuleCount() int {
 }
 
 // SeedNeverAutoRules returns every shipped seed rule — strict patterns first,
-// then heuristic rules — with Kind and Source filled in. The order is stable
-// for a given build, so a caller may address a rule by its index in this slice
-// (that index is only a display convenience; the durable key for disabling a
-// rule is its Pattern string, which survives reordering across versions).
+// then heuristic rules — with Kind and Source filled in. Rules are addressed by
+// their content-derived SeedRuleID, not by position, so callers never depend on
+// this ordering surviving a version upgrade.
 func SeedNeverAutoRules() []NeverAutoRule {
 	rules := make([]NeverAutoRule, 0, SeedNeverAutoRuleCount())
 	for _, p := range SeedNeverAutoPatterns {
@@ -153,18 +153,65 @@ func SeedNeverAutoRules() []NeverAutoRule {
 	return rules
 }
 
-// SeedRuleIndexForRationale maps an escalation rationale back to the seed rule
-// that produced it, returning that rule's index in SeedNeverAutoRules. It keys
-// off the stable Diagnostic() rendering ("pattern <P> matched …"), so it fires
-// only for a seed never-auto/heuristic hit and never for an operator pattern or
-// an unrelated escalation reason. The bool is false when no seed rule matches.
-func SeedRuleIndexForRationale(rationale string) (int, bool) {
-	for i, r := range SeedNeverAutoRules() {
-		if strings.Contains(rationale, "pattern "+r.Pattern+" matched") {
-			return i, true
+// SeedRuleID is a short, stable identifier for a seed rule, derived from its
+// pattern text. Because it is a content hash — not a list position — an id an
+// operator copied from `rules list` still names the SAME rule after a seed-list
+// reorder or version upgrade (or names nothing, if that pattern was dropped);
+// it can never silently point at a different rule. This is the durable key the
+// disable/enable commands and the escalation hint use.
+func SeedRuleID(pattern string) string {
+	sum := sha256.Sum256([]byte(pattern))
+	return fmt.Sprintf("%x", sum[:4]) // 8 hex chars — collision-safe for ~90 rules
+}
+
+// SeedRuleByID resolves a SeedRuleID back to its shipped rule. The bool is
+// false for an unknown id (e.g. a stale id whose pattern no longer ships),
+// which the callers surface as a "no such seed rule" error rather than acting
+// on the wrong one.
+func SeedRuleByID(id string) (NeverAutoRule, bool) {
+	for _, r := range SeedNeverAutoRules() {
+		if SeedRuleID(r.Pattern) == id {
+			return r, true
 		}
 	}
-	return 0, false
+	return NeverAutoRule{}, false
+}
+
+// IsSeedPattern reports whether pattern is the exact text of a shipped seed
+// rule. It guards the disable/enable path so only a real seed rule can be
+// recorded in safety.disabled_seed_patterns.
+func IsSeedPattern(pattern string) bool {
+	for _, r := range SeedNeverAutoRules() {
+		if r.Pattern == pattern {
+			return true
+		}
+	}
+	return false
+}
+
+// SeedRuleForRationale maps an escalation rationale back to the seed rule that
+// produced it. It requires the stable Diagnostic() rendering
+// ("pattern <P> matched …") AND, immediately after that hit's excerpt, the
+// seed-source marker "(source=seed ": an operator rule whose pattern text
+// happens to equal a seed's — or a hit taken once that seed is disabled —
+// renders "(source=operator " and must NOT resolve to a builtin, or the hint
+// would name an unrelated (or already-inactive) rule. Anchoring the source
+// check to the position after this rule's own match keeps a crafted excerpt
+// elsewhere in the rationale from spoofing it. The bool is false when no seed
+// rule matches.
+func SeedRuleForRationale(rationale string) (NeverAutoRule, bool) {
+	seedSource := "(source=" + string(NeverAutoSeed) + " "
+	for _, r := range SeedNeverAutoRules() {
+		marker := "pattern " + r.Pattern + " matched"
+		i := strings.Index(rationale, marker)
+		if i < 0 {
+			continue
+		}
+		if strings.Contains(rationale[i+len(marker):], seedSource) {
+			return r, true
+		}
+	}
+	return NeverAutoRule{}, false
 }
 
 // compiledNeverAutoRule is one unified rule ready for matching.

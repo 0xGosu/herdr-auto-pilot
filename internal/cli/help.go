@@ -534,18 +534,20 @@ func buildCommands() {
 				"hap rules disable-seed <id>",
 				"hap rules enable-seed <id>",
 			},
-			Details: "`list` prints the shipped seed rules first, each with a `seed #<id>` (strict or\n" +
-				"heuristic), then your operator patterns with the index `remove` takes. A situation\n" +
-				"matching any rule is always escalated to a human, whatever the learned confidence\n" +
-				"says — this is a safety control, not a preference. Patterns are Go regular\n" +
-				"expressions matched against the situation's content.\n\n" +
+			Details: "`list` prints the shipped seed rules first, each with a stable `seed <id>` (a\n" +
+				"short hash of the pattern, strict or heuristic), then your operator patterns with\n" +
+				"the index `remove` takes. A situation matching any rule is always escalated to a\n" +
+				"human, whatever the learned confidence says — this is a safety control, not a\n" +
+				"preference. Patterns are Go regular expressions matched against the situation's\n" +
+				"content.\n\n" +
 				"When a builtin seed rule is too aggressive for a repo (e.g. a heuristic firing on a\n" +
-				"legitimate word like \"unrecoverable\"), take its `seed #<id>` from `rules list` and\n" +
+				"legitimate word like \"unrecoverable\"), take its `seed <id>` from `rules list` and\n" +
 				"run `disable-seed <id>` to silence just that one rule while keeping the rest of the\n" +
-				"safety net; `enable-seed <id>` restores it. Note a seed rule is a single regex: one\n" +
-				"heuristic can cover several phrasings, so disabling it silences every phrase in that\n" +
-				"rule's pattern, not only the word you saw. The rule is recorded by its pattern, so\n" +
-				"the setting survives upgrades. To drop every seed rule at once instead, set\n" +
+				"safety net; `enable-seed <id>` restores it. The id is derived from the pattern, so\n" +
+				"it names the same rule across upgrades (or is rejected if that pattern no longer\n" +
+				"ships). Note a seed rule is a single regex: one heuristic can cover several\n" +
+				"phrasings, so disabling it silences every phrase in that rule's pattern, not only\n" +
+				"the word you saw. To drop every seed rule at once instead, set\n" +
 				"safety.disable_never_auto_seed_patterns=true.",
 			Examples: []string{
 				"hap rules list",
@@ -554,7 +556,7 @@ func buildCommands() {
 				"hap rules disable-seed <id from rules list>",
 			},
 			Next: []Hint{
-				{Cmd: "hap rules list", Why: "every rule, with the index `remove`/`disable-seed` take"},
+				{Cmd: "hap rules list", Why: "every rule, with the index `remove` and the id `disable-seed` take"},
 				{Cmd: "hap rules add <regex>", Why: "force a situation to always ask a human"},
 				{Cmd: "hap rules disable-seed <id>", Why: "silence a builtin rule that keeps over-escalating"},
 			},

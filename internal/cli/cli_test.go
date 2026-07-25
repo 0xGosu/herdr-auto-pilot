@@ -860,56 +860,10 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 	}
 }
 
-func TestRulesListNumbersAndDisablesSeedRules(t *testing.T) {
-	app, _ := testApp(t)
-
-	out, err := run(t, app, "rules", "list")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, "seed #0\t") {
-		t.Errorf("rules list should number seed rules, got:\n%s", out)
-	}
-	if strings.Contains(out, "[disabled]") {
-		t.Errorf("no seed rule should be disabled initially, got:\n%s", out)
-	}
-
-	// Disable seed #0 and confirm it is marked disabled on the next list.
-	if _, err := run(t, app, "rules", "disable-seed", "0"); err != nil {
-		t.Fatal(err)
-	}
-	cfg, _ := app.Config()
-	if len(cfg.Safety.DisabledSeedPatterns) != 1 {
-		t.Fatalf("disable-seed must persist one entry, got %v", cfg.Safety.DisabledSeedPatterns)
-	}
-	out, _ = run(t, app, "rules", "list")
-	if !strings.Contains(out, "seed #0\tstrict [disabled]") {
-		t.Errorf("disabled seed rule must be marked, got:\n%s", out)
-	}
-
-	// Re-enable clears the mark.
-	if _, err := run(t, app, "rules", "enable-seed", "0"); err != nil {
-		t.Fatal(err)
-	}
-	out, _ = run(t, app, "rules", "list")
-	if strings.Contains(out, "[disabled]") {
-		t.Errorf("re-enabled seed rule must not be marked, got:\n%s", out)
-	}
-
-	// Bad indexes are rejected.
-	for _, bad := range []string{"-1", "99999", "abc"} {
-		if _, err := run(t, app, "rules", "disable-seed", bad); err == nil {
-			t.Errorf("disable-seed %q must error", bad)
-		}
-	}
-}
-
-func TestEscalationsHintsDisableSeedForBuiltinRule(t *testing.T) {
-	app, st := testApp(t)
-	ctx := context.Background()
-
-	// Produce a real seed-rule diagnostic (the escalation rationale a builtin
-	// heuristic hit would carry) and store an escalation with it.
+// seedHeuristicDiagnostic returns a real builtin-heuristic hit's rationale plus
+// the durable id and pattern of the seed rule that produced it.
+func seedHeuristicDiagnostic(t *testing.T) (rationale, id, pattern string) {
+	t.Helper()
 	list, errs := domain.NewNeverAutoList(true, nil, nil, nil)
 	if len(errs) > 0 {
 		t.Fatalf("matcher: %v", errs)
@@ -918,20 +872,74 @@ func TestEscalationsHintsDisableSeedForBuiltinRule(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a builtin heuristic to fire")
 	}
-	wantIdx, ok := domain.SeedRuleIndexForRationale(hit.Diagnostic())
+	rule, ok := domain.SeedRuleForRationale(hit.Diagnostic())
 	if !ok {
-		t.Fatal("seed rationale must resolve to an index")
+		t.Fatal("seed rationale must resolve to a rule")
 	}
-	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:seedhit0001",
+	return hit.Diagnostic(), domain.SeedRuleID(rule.Pattern), rule.Pattern
+}
+
+func TestRulesListShowsSeedIDsAndDisables(t *testing.T) {
+	app, _ := testApp(t)
+
+	id := domain.SeedRuleID(domain.SeedNeverAutoRules()[0].Pattern)
+
+	out, err := run(t, app, "rules", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "seed "+id+"\t") {
+		t.Errorf("rules list should tag seed rules with their id, got:\n%s", out)
+	}
+	if strings.Contains(out, "[disabled]") {
+		t.Errorf("no seed rule should be disabled initially, got:\n%s", out)
+	}
+
+	// Disable by id and confirm it is marked disabled on the next list.
+	if _, err := run(t, app, "rules", "disable-seed", id); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := app.Config()
+	if len(cfg.Safety.DisabledSeedPatterns) != 1 {
+		t.Fatalf("disable-seed must persist one entry, got %v", cfg.Safety.DisabledSeedPatterns)
+	}
+	out, _ = run(t, app, "rules", "list")
+	if !strings.Contains(out, "seed "+id+"\tstrict [disabled]") {
+		t.Errorf("disabled seed rule must be marked, got:\n%s", out)
+	}
+
+	// Re-enable clears the mark.
+	if _, err := run(t, app, "rules", "enable-seed", id); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = run(t, app, "rules", "list")
+	if strings.Contains(out, "[disabled]") {
+		t.Errorf("re-enabled seed rule must not be marked, got:\n%s", out)
+	}
+
+	// Unknown / malformed ids are rejected (a stale id whose pattern no longer
+	// ships must never disable a positional neighbor).
+	for _, bad := range []string{"deadbeef", "0", ""} {
+		if _, err := run(t, app, "rules", "disable-seed", bad); err == nil {
+			t.Errorf("disable-seed %q must error", bad)
+		}
+	}
+}
+
+func TestEscalationsHintsDisableSeedForBuiltinRule(t *testing.T) {
+	app, st := testApp(t)
+	rationale, wantID, _ := seedHeuristicDiagnostic(t)
+
+	st.AppendAudit(context.Background(), domain.AuditRecord{Signature: "approval:seedhit0001",
 		Trigger: "purge?", SituationType: domain.SituationApproval, Action: "escalated",
-		Rationale: hit.Diagnostic(), Status: "escalated", CreatedAt: time.Now()})
+		Rationale: rationale, Status: "escalated", CreatedAt: time.Now()})
 
 	out, err := run(t, app, "escalations")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, fmt.Sprintf("hap rules disable-seed %d", wantIdx)) {
-		t.Errorf("a builtin-rule escalation should hint disable-seed %d, got:\n%s", wantIdx, out)
+	if !strings.Contains(out, "hap rules disable-seed "+wantID) {
+		t.Errorf("a builtin-rule escalation should hint disable-seed %s, got:\n%s", wantID, out)
 	}
 }
 
@@ -947,6 +955,42 @@ func TestEscalationsOmitsDisableSeedForNonSeedEscalation(t *testing.T) {
 	}
 	if strings.Contains(out, "disable-seed") {
 		t.Errorf("a non-seed escalation must not hint disable-seed, got:\n%s", out)
+	}
+}
+
+// TestEscalationsDisableSeedHintTracksNewestRow is the regression for review
+// comment #3: the footer's confirm/dismiss ids refer to the newest row, so the
+// disable-seed hint must be gated on THAT row. A seed-caused escalation sitting
+// under a newer non-seed one must not leak a hint that would reference the wrong
+// escalation; when the newest row IS seed-caused, the hint appears.
+func TestEscalationsDisableSeedHintTracksNewestRow(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	rationale, wantID, _ := seedHeuristicDiagnostic(t)
+
+	// Older row is the seed-caused one; a newer non-seed row sits on top.
+	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:oldseed0001",
+		Trigger: "purge?", SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: rationale, Status: "escalated", CreatedAt: time.Now().Add(-10 * time.Minute)})
+	st.AppendAudit(ctx, domain.AuditRecord{Signature: "error:newplain001",
+		Trigger: "boom", SituationType: domain.SituationError, Action: "escalated",
+		Rationale: "contradictory history", Status: "escalated", CreatedAt: time.Now()})
+
+	out, err := run(t, app, "escalations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "disable-seed") {
+		t.Errorf("seed row under a newer non-seed row must not surface a disconnected hint, got:\n%s", out)
+	}
+
+	// Now make the NEWEST row the seed-caused one: the hint appears and names it.
+	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:newseed0001",
+		Trigger: "purge?", SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: rationale, Status: "escalated", CreatedAt: time.Now().Add(time.Minute)})
+	out, _ = run(t, app, "escalations")
+	if !strings.Contains(out, "hap rules disable-seed "+wantID) {
+		t.Errorf("a seed-caused newest row should surface the hint, got:\n%s", out)
 	}
 }
 
