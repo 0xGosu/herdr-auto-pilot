@@ -68,7 +68,8 @@ func TestAcquireWritesPidAndVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := fmt.Sprintf("%d\n%s\n", os.Getpid(), buildinfo.Version)
+	self, _ := os.Executable()
+	want := fmt.Sprintf("%d\n%s\n%s\n", os.Getpid(), buildinfo.Version, self)
 	if string(data) != want {
 		t.Errorf("lock file = %q, want %q", data, want)
 	}
@@ -88,7 +89,8 @@ func TestAcquireTruncatesStaleContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := fmt.Sprintf("%d\n%s\n", os.Getpid(), buildinfo.Version)
+	self, _ := os.Executable()
+	want := fmt.Sprintf("%d\n%s\n%s\n", os.Getpid(), buildinfo.Version, self)
 	if string(data) != want {
 		t.Errorf("stale bytes must not survive acquire: got %q, want %q", data, want)
 	}
@@ -130,6 +132,43 @@ func TestInfoLegacyPidOnlyFormat(t *testing.T) {
 	running, pid, version := daemonlock.Info(paths)
 	if !running || pid != 1234 || version != "" {
 		t.Errorf("Info = (%v, %d, %q), want (true, 1234, \"\")", running, pid, version)
+	}
+}
+
+// The lock gained a third line (the holder's binary path). A daemon written by
+// an older hap has only two, and must still be identified rather than read as
+// a corrupt lock nobody can replace.
+func TestInfoLegacyTwoLineFormat(t *testing.T) {
+	paths := testPaths(t)
+	holdLock(t, paths, "1234\nv0.1.0\n")
+	running, pid, version := daemonlock.Info(paths)
+	if !running || pid != 1234 || version != "v0.1.0" {
+		t.Errorf("Info = (%v, %d, %q), want (true, 1234, \"v0.1.0\")", running, pid, version)
+	}
+}
+
+func TestAcquireRecordsBinaryPath(t *testing.T) {
+	paths := testPaths(t)
+	lk, err := daemonlock.Acquire(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lk.Release()
+
+	data, err := os.ReadFile(lockFile(paths))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("lock file = %q, want three lines (pid, version, exe path)", data)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Skipf("os.Executable unavailable: %v", err)
+	}
+	if lines[2] != self {
+		t.Errorf("recorded exe path = %q, want the running binary %q", lines[2], self)
 	}
 }
 
@@ -180,12 +219,109 @@ func TestStopTerminatesProcessAndToleratesGonePid(t *testing.T) {
 	}
 }
 
+// writeExe creates a file with the execute bit, standing in for an installed
+// hap binary at a particular path.
+func writeExe(t *testing.T, path string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestEnsureFreshPathStaleness covers the upgrade shape the version check
+// alone cannot see: a holder running the SAME version from a binary that is
+// no longer the one we would start. Its children (the MCP server, the embed
+// worker) are spawned by path, so it must be replaced even though nothing
+// about the version says so.
+func TestEnsureFreshPathStaleness(t *testing.T) {
+	dir := t.TempDir()
+	oldExe := writeExe(t, filepath.Join(dir, "old", "bin", "hap"))
+	newExe := writeExe(t, filepath.Join(dir, "new", "bin", "hap"))
+	// A symlink to the current binary is how an operator's /usr/local/bin/hap
+	// reaches it; that must NOT read as a different install.
+	linked := filepath.Join(dir, "usr-local-hap")
+	if err := os.Symlink(newExe, linked); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name        string
+		lockContent string
+		exePath     string
+		wantStop    bool
+	}{
+		{
+			name:        "same version, replaced binary is stale",
+			lockContent: "4242\nv0.1.0\n" + oldExe + "\n",
+			exePath:     newExe,
+			wantStop:    true,
+		},
+		{
+			name:        "same version and same binary is current",
+			lockContent: "4242\nv0.1.0\n" + newExe + "\n",
+			exePath:     newExe,
+		},
+		{
+			name:        "path reached through a symlink is the same binary",
+			lockContent: "4242\nv0.1.0\n" + newExe + "\n",
+			exePath:     linked,
+		},
+		{
+			name: "holder recorded no path: version alone decides",
+			// A daemon from before the path was recorded. Killing it on an
+			// unknowable path would make every --ensure a restart.
+			lockContent: "4242\nv0.1.0\n",
+			exePath:     newExe,
+		},
+		{
+			name:        "our own path is unknown: version alone decides",
+			lockContent: "4242\nv0.1.0\n" + oldExe + "\n",
+			exePath:     "",
+		},
+		{
+			name: "holder path no longer exists but matches ours",
+			// Both sides name the same removed file. It cannot be resolved, so
+			// the comparison is skipped rather than treated as a mismatch.
+			lockContent: "4242\nv0.1.0\n" + filepath.Join(dir, "gone", "hap") + "\n",
+			exePath:     filepath.Join(dir, "gone", "hap"),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := testPaths(t)
+			release := holdLock(t, paths, tc.lockContent)
+			var stopped, started int
+			stop := func(int) error {
+				stopped++
+				release()
+				return nil
+			}
+			start := func() error { started++; return nil }
+
+			if err := daemonlock.EnsureFresh(paths, "v0.1.0", tc.exePath, 300*time.Millisecond, stop, start); err != nil {
+				t.Fatalf("EnsureFresh: %v", err)
+			}
+			if (stopped > 0) != tc.wantStop {
+				t.Errorf("stop called = %v, want %v", stopped > 0, tc.wantStop)
+			}
+			if (started > 0) != tc.wantStop {
+				t.Errorf("start called = %v, want %v", started > 0, tc.wantStop)
+			}
+		})
+	}
+}
+
 func TestEnsureFresh(t *testing.T) {
 	const held = "4242\nv0.1.0\n"
 	tests := []struct {
 		name        string
 		lockContent string // "" = no daemon running
 		version     string // current binary version passed to EnsureFresh
+		exePath     string // current binary path passed to EnsureFresh ("" = unknown)
 		stopFrees   bool   // stop releases the lock (daemon exits)
 		stopErr     bool   // stop itself fails
 		wantErr     bool
@@ -228,7 +364,7 @@ func TestEnsureFresh(t *testing.T) {
 				started = append(started, 1)
 				return nil
 			}
-			err := daemonlock.EnsureFresh(paths, tc.version, 300*time.Millisecond, stop, start)
+			err := daemonlock.EnsureFresh(paths, tc.version, tc.exePath, 300*time.Millisecond, stop, start)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("EnsureFresh error = %v, wantErr %v", err, tc.wantErr)
 			}

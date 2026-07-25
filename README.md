@@ -64,12 +64,20 @@ release. `--yes` skips the interactive confirmation.
 
 ```sh
 herdr plugin install 0xGosu/herdr-auto-pilot --yes   # download & install the latest release
-hap daemon --ensure                                  # recommended: hot-swap the running daemon now
 ```
 
-`hap daemon --ensure` is optional but recommended — it swaps the running
-daemon for the new build immediately, so you don't have to wait for the next
-automatic restart.
+The install hands a running daemon over to the new build itself, and a daemon
+that somehow misses the handover notices its own binary is gone within ~10
+seconds and starts the replacement. `hap daemon --ensure` still forces the swap
+on demand, and `hap status` reports a daemon that could not hand over.
+
+This matters because a plugin release installs into its own directory: the
+previous binary is removed while the daemon is still running from it. Nothing
+about the live process breaks, but every child it spawns by path does — the MCP
+server your LLM CLI launches for `get_context`/`submit_decision`, and the
+embedding worker — so consults would come back empty until the daemon is
+replaced. Nothing on disk goes stale: the binary path is resolved at spawn
+time, never stored in your config.
 
 For a clean reinstall, uninstall first, then install:
 
@@ -152,6 +160,12 @@ Open the **Auto Prompter** pane with the hotkey above, switch to the **Config**
 tab, select **Create /usr/local/bin/hap symlink to this running binary** under
 **Quick Shortcuts**, and press `enter` to confirm. This makes `hap` available
 from any shell (provided `/usr/local/bin` is on your `PATH`).
+
+Each release installs into its own directory, so an upgrade leaves this symlink
+pointing at a version that no longer exists. The row then reads **Repoint
+/usr/local/bin/hap … (currently stale)** — select it again to fix the link. A
+symlink pointing at anything that is not one of hap's own installs is never
+touched; remove it by hand first if you want hap to own the name.
 
 After creating the symlink, you can also launch the TUI directly from any Bash
 shell instead of opening the Herdr pane with the hotkey:
@@ -1238,6 +1252,16 @@ Invariants:
   automatically; `hap status` shows the running daemon's version and flags
   a stale one. On older versions run `pkill -f 'hap daemon'` once after
   upgrading.
+- **After an upgrade, every LLM consult comes back empty** — the daemon is
+  running from a binary the upgrade removed, so it can no longer launch the
+  hap MCP server for its LLM CLI. `hap status` reports
+  `BINARY REMOVED (upgraded underneath it)`; `hap daemon --ensure` fixes it.
+  The install step and the daemon's own 10-second check normally handle this
+  without you noticing.
+- **`hap: command not found`, or `hap` runs an old version, after an upgrade**
+  — `/usr/local/bin/hap` points into the previous install directory. Open the
+  TUI **Config** tab and select the **Repoint /usr/local/bin/hap** row under
+  **Quick Shortcuts**.
 
 ## Pause/kill switch & audit
 

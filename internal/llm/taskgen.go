@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -34,12 +33,9 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 	if !a.GenerateTaskConfigured() {
 		return "", fmt.Errorf("no generate-task CLI configured")
 	}
-	self := a.SelfPath
-	if self == "" {
-		var err error
-		if self, err = os.Executable(); err != nil {
-			return "", fmt.Errorf("resolve self path: %w", err)
-		}
+	self, err := a.resolveSelf()
+	if err != nil {
+		return "", err
 	}
 	// The first generation for an agent uses task_generate_command_start when
 	// configured; an empty start template falls back to the base command.

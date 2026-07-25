@@ -15,6 +15,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 )
 
 // Lock is a flock-based singleton guard so only one daemon monitors the
@@ -50,7 +51,17 @@ func Acquire(paths config.Paths) (*Lock, error) {
 	}
 	// An unwritten pid would permanently dead-end every future --ensure in
 	// its "pid unreadable" branch, so a failed write must fail the acquire.
-	if _, err := fmt.Fprintf(f, "%d\n%s\n", os.Getpid(), buildinfo.Version); err != nil {
+	// The third line is the binary this daemon runs as. Version alone cannot
+	// tell a same-version binary installed at a NEW path (an upgrade that
+	// kept the version string, or any local rebuild) from the live one, and
+	// the old path is gone by then — every child the daemon spawns from it
+	// would fail. A path we cannot resolve is recorded empty and simply
+	// disables the path comparison.
+	exe, err := selfpath.Resolve()
+	if err != nil {
+		exe = ""
+	}
+	if _, err := fmt.Fprintf(f, "%d\n%s\n%s\n", os.Getpid(), buildinfo.Version, exe); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("write lock file: %w", err)
 	}
@@ -71,27 +82,40 @@ func (l *Lock) Release() {
 // concern. version is "" for holders older than the pid+version format;
 // pid is 0 when unreadable.
 func Info(paths config.Paths) (running bool, pid int, version string) {
+	running, pid, version, _ = info(paths)
+	return running, pid, version
+}
+
+// info is Info plus the holder's binary path, which only EnsureFresh needs.
+// exePath is "" for a holder older than the pid+version+path format, and for
+// one that could not resolve its own binary.
+func info(paths config.Paths) (running bool, pid int, version, exePath string) {
 	f, err := os.OpenFile(lockPath(paths), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return false, 0, ""
+		return false, 0, "", ""
 	}
 	defer f.Close()
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		return false, 0, ""
+		return false, 0, "", ""
 	}
 	// Read through the already-open fd: re-opening the path could race a
 	// holder that just replaced the file.
 	data, err := io.ReadAll(f)
 	if err != nil {
-		return true, 0, ""
+		return true, 0, "", ""
 	}
-	lines := strings.SplitN(string(data), "\n", 3)
+	// SplitN with one more field than we read keeps a two-line lock from an
+	// older daemon parseable — it simply yields no path.
+	lines := strings.SplitN(string(data), "\n", 4)
 	pid, _ = strconv.Atoi(strings.TrimSpace(lines[0]))
 	if len(lines) > 1 {
 		version = strings.TrimSpace(lines[1])
 	}
-	return true, pid, version
+	if len(lines) > 2 {
+		exePath = strings.TrimSpace(lines[2])
+	}
+	return true, pid, version, exePath
 }
 
 // Stop asks a daemon to shut down gracefully (SIGTERM cancels its run

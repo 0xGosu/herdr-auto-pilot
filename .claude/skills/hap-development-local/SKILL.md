@@ -58,6 +58,10 @@ ln -sf /workspaces/herdr-auto-pilot/bin/hap /usr/local/bin/hap
 hap version   # → "hap (herd-auto-prompter) dev"  (confirms PATH = local build)
 ```
 
+(The TUI's **Quick Shortcuts** row also repoints it now — it reads *Repoint
+/usr/local/bin/hap … (currently stale)* whenever the link is dangling or points
+at another plugin install. `ln -sf` is still the quicker path from a shell.)
+
 Alternatively, skip the symlink entirely and always call `./bin/hap` from the
 repo root. But repointing it means `hap status` / `hap daemon --ensure` in any
 shell hit your dev build, which is what you usually want.
@@ -253,7 +257,8 @@ classification. cross-check the shape:
 
 ## gotchas recap
 
-- **link does not repoint `/usr/local/bin/hap`** — fix it manually or use `./bin/hap`.
+- **link does not repoint `/usr/local/bin/hap`** — fix it manually (`ln -sf`), via the
+  TUI Quick Shortcuts row, or use `./bin/hap`.
 - **link does not overwrite `bin/hap`** — the build/install step doesn't run on link.
 - **the daemon does not hot-reload** — always `hap daemon --ensure` after a rebuild.
 - **omitting `vectors cpu` breaks the build** — both tags always.

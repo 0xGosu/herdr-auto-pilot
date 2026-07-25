@@ -106,3 +106,24 @@ else
   echo "warning: embedding model download failed; semantic matching will fall back to text search" >&2
   echo "         retry later with: bash scripts/install.sh" >&2
 fi
+
+# Hand a RUNNING daemon over to the binary we just installed. An upgrade puts
+# the new release in a new directory and unlinks the old one, but the live
+# daemon keeps running from the removed path — and every child it spawns from
+# there (the MCP server the LLM CLI launches, the embed worker) then fails, so
+# consults silently come back empty. Without this the swap waited for herdr's
+# next pane.agent_detected / workspace.created event, which may be hours away.
+#
+# --replace-only never STARTS a daemon: a fresh install (and any CI run of this
+# script) must not bring one up as a side effect of building the plugin.
+#
+# This runs inside herdr's [[build]] step, so herdr may not have registered the
+# new plugin directory yet — which is fine: the daemon we start is spawned from
+# THIS binary's own path (it exists, so hap's self-resolution never reaches the
+# registry lookup). Best-effort — a plugin install must not fail because the
+# handover did not take; `hap daemon --ensure` still fixes it.
+if "./${DEST}" daemon --ensure --replace-only; then
+  echo "handed a running daemon over to the new binary (if one was running)"
+else
+  echo "note: could not hand over a running daemon; run 'hap daemon --ensure' if hap was already running" >&2
+fi

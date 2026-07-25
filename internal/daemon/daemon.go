@@ -28,6 +28,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/match"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
 	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
@@ -35,6 +36,12 @@ import (
 // unblockCheckDelay is fixed rather than operator-configurable: post-action
 // delivery verification should behave consistently across installations.
 const unblockCheckDelay = time.Second
+
+// handoffRetryInterval paces retries after a failed upgrade handoff
+// (checkOwnBinary). Long enough that a repeatedly-failing spawn cannot storm,
+// short enough that a successor which was still being written when we first
+// tried is picked up while the operator is still watching.
+const handoffRetryInterval = time.Minute
 
 // Options configures a Daemon.
 type Options struct {
@@ -72,6 +79,17 @@ type Options struct {
 	MutateTaskFile func(path string, fn func(content string) (string, error)) error
 	// PaneReadLines is how much recent pane content classification sees.
 	PaneReadLines int
+	// ResolveSelf returns the path of a live hap binary (selfpath.Resolve in
+	// prod). The daemon compares it against the binary it started from to
+	// notice a plugin upgrade that replaced it underneath.
+	ResolveSelf func() (string, error)
+	// HandOff starts a replacement daemon from the given binary, when this
+	// daemon's own binary has been replaced (a detached `daemon --ensure`
+	// spawn in prod). It is called at most once successfully — after that
+	// this daemon exits — but a failed attempt is retried on a later
+	// heartbeat, so it must be safe to call more than once. A nil HandOff
+	// leaves this daemon running and only flags health.
+	HandOff func(exePath string) error
 }
 
 // Daemon is the monitor/decide/act loop.
@@ -80,6 +98,17 @@ type Daemon struct {
 	// verifyUnblockDelay is initialized from unblockCheckDelay. Tests in this
 	// package shorten it to keep asynchronous verification coverage fast.
 	verifyUnblockDelay time.Duration
+
+	// exePath is the binary this daemon started from, resolved once at Run
+	// before anything can replace it, and never written again — so the
+	// heartbeat's check needs no lock. binaryReplaced latches when that file
+	// is gone and the takeover could not happen; handedOff latches once a
+	// successor IS starting; lastHandoff (unix nanos) paces retries after a
+	// failed attempt. See checkOwnBinary.
+	exePath        string
+	binaryReplaced atomic.Bool
+	handedOff      atomic.Bool
+	lastHandoff    atomic.Int64
 
 	mu         sync.RWMutex
 	cfg        config.Config
@@ -348,6 +377,9 @@ func New(opt Options) (*Daemon, error) {
 	if opt.PaneReadLines <= 0 {
 		opt.PaneReadLines = 50
 	}
+	if opt.ResolveSelf == nil {
+		opt.ResolveSelf = selfpath.Resolve
+	}
 	d := &Daemon{
 		opt:                  opt,
 		verifyUnblockDelay:   unblockCheckDelay,
@@ -609,27 +641,109 @@ func (d *Daemon) writeHealth(startedAt time.Time) {
 	}
 	state, diag := d.embedderHealth()
 	h := daemonhealth.Health{
-		PID:          os.Getpid(),
-		Version:      buildinfo.Version,
-		StartedAt:    startedAt,
-		HeartbeatAt:  d.opt.Clock.Now(),
-		Embedder:     state,
-		EmbedderDiag: diag,
+		PID:            os.Getpid(),
+		Version:        buildinfo.Version,
+		StartedAt:      startedAt,
+		HeartbeatAt:    d.opt.Clock.Now(),
+		Embedder:       state,
+		EmbedderDiag:   diag,
+		ExePath:        d.exePath,
+		BinaryReplaced: d.binaryReplaced.Load(),
 	}
 	if err := daemonhealth.Write(d.opt.StateDir, h); err != nil {
 		slog.Debug("heartbeat write failed", "error", err)
 	}
 }
 
+// checkOwnBinary detects that this daemon's own executable was replaced —
+// what a plugin upgrade does, since herdr installs each release into its own
+// directory and unlinks the previous one. The process survives that, but every
+// child it spawns by path does not: the LLM CLI can no longer launch `hap mcp`
+// (so consults come back with no decision at all) and the embed worker fails
+// until the degrade latch trips. Nothing else notices — the version in the lock
+// file still matches, because it is OUR version.
+//
+// It returns true when the caller should stop the loop: a live successor was
+// found and started, and this daemon's job is to get out of its way. With no
+// successor to hand to it keeps running and flags health instead — a daemon
+// that can no longer spawn children still beats no daemon at all, and the
+// operator's remedy (`hap daemon --ensure` from a good binary) is the same.
+func (d *Daemon) checkOwnBinary() bool {
+	if d.exePath == "" || d.handedOff.Load() {
+		return false
+	}
+	if !selfpath.Missing(d.exePath) {
+		return false
+	}
+	// Flag health BEFORE requiring a HandOff hook: noticing costs one Stat,
+	// and an operator reading `hap status` deserves the answer whether or not
+	// this build can do anything about it.
+	successor, err := d.opt.ResolveSelf()
+	if err != nil || successor == "" || selfpath.Same(successor, d.exePath) {
+		if d.binaryReplaced.CompareAndSwap(false, true) {
+			slog.Error("this daemon's binary was removed and no replacement could be found; "+
+				"child processes (LLM MCP server, embed worker) will fail until a new daemon takes over",
+				"exe_path", d.exePath, "error", err)
+		}
+		return false
+	}
+	if d.opt.HandOff == nil {
+		if d.binaryReplaced.CompareAndSwap(false, true) {
+			slog.Error("this daemon's binary was removed and it cannot start a replacement itself",
+				"exe_path", d.exePath, "successor", successor)
+		}
+		return false
+	}
+	// A failed handoff must be RETRYABLE — the successor may simply not be
+	// fully installed yet, or the fork may have hit a transient limit — but
+	// not retried every 10s heartbeat, which would spawn-storm. One attempt
+	// per interval, and the latch is only taken on success (below), where it
+	// guarantees the spawn already in flight is not raced by a second one.
+	now := d.opt.Clock.Now()
+	if last := d.lastHandoff.Load(); last != 0 && now.Sub(time.Unix(0, last)) < handoffRetryInterval {
+		return false
+	}
+	d.lastHandoff.Store(now.UnixNano())
+
+	slog.Warn("hap was upgraded underneath this daemon; handing the herd over to the new binary",
+		"old", d.exePath, "new", successor)
+	if err := d.opt.HandOff(successor); err != nil {
+		// The successor never started, so stopping would leave nothing
+		// monitoring. Stay up, degraded, and retry on a later heartbeat.
+		d.binaryReplaced.Store(true)
+		slog.Error("could not start the replacement daemon; staying up with a removed binary",
+			"new", successor, "error", err, "retry_in", handoffRetryInterval)
+		return false
+	}
+	// Latch only now: from here the successor is starting and a second spawn
+	// would race it for the daemon lock.
+	d.handedOff.Store(true)
+	return true
+}
+
 // Run drives the daemon until ctx is done. It never panics: every handler
 // runs under the fail-safe guard (NFR-004).
 func (d *Daemon) Run(ctx context.Context) error {
+	// Everything Run starts roots at a context IT controls. Run can now
+	// return without the caller's ctx being cancelled (the upgrade handoff
+	// below), and the background goroutines — the event subscriber above all,
+	// which loops on reconnect backoff — would then never unwind, so
+	// shutdownBackground would wait on them forever and the process would sit
+	// there holding the daemon lock the successor is waiting for. The defer
+	// that cancels it is registered below, AFTER shutdownBackground, so LIFO
+	// puts the cancel before the drain that depends on it.
+	ctx, cancelRun := context.WithCancel(ctx)
 	// Heartbeat first: publish a fresh health record (stamped with THIS pid)
 	// as the very first action, before the slower socket/subscriber setup, so
 	// a status check during startup sees this daemon's beat — not a dead
 	// predecessor's stale file left by a hard abort. Refreshed on a ticker
 	// below; removed on clean shutdown so a graceful stop reads as gone.
 	startedAt := d.opt.Clock.Now()
+	// Resolve once, before anything can replace it: this is the identity the
+	// heartbeat publishes and checkOwnBinary watches.
+	if self, err := d.opt.ResolveSelf(); err == nil {
+		d.exePath = self
+	}
 	d.writeHealth(startedAt)
 	if d.opt.StateDir != "" {
 		defer func() { _ = daemonhealth.Remove(d.opt.StateDir) }()
@@ -651,6 +765,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}()
 	defer d.shutdownBackground()
+	// Registered after the drain so it runs before it (LIFO): the goroutines
+	// shutdownBackground waits on are the ones this cancel releases.
+	defer cancelRun()
 
 	// Control socket: reload/wake nudges from front-ends and mcp.
 	var ctl *control.Server
@@ -710,6 +827,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-heartbeat.C:
+			// Checked on the heartbeat rather than the 1-minute sweep: until
+			// the handoff happens every consult this daemon runs comes back
+			// empty, so the window is worth keeping short. It costs one Stat.
+			if d.checkOwnBinary() {
+				return nil
+			}
 			d.writeHealth(startedAt)
 		case <-sweep.C:
 			logging.Guard("periodic-sweep", func() error {

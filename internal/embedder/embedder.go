@@ -18,12 +18,12 @@ package embedder
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 )
 
 // DefaultModelFile is the bundled embedding model installed by install.sh.
@@ -210,13 +210,9 @@ func ResolveModelPath(cfg config.Embedding) string {
 // PluginRoot locates the plugin install dir from the running binary:
 // install.sh places the binary at <root>/bin/hap, so root is two levels up.
 // Falls back to the working directory when the executable can't be resolved.
+// It defers to selfpath so a daemon whose own binary was replaced by an
+// upgrade finds the NEW plugin dir — the old one no longer holds models/ or
+// the lib/ the binary is rpath'd against.
 func PluginRoot() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return "."
-	}
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
-	}
-	return filepath.Dir(filepath.Dir(exe))
+	return selfpath.PluginRoot()
 }

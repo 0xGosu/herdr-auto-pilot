@@ -670,6 +670,12 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 				line += fmt.Sprintf(" [also STALE: binary is %s; run: hap daemon --ensure]", buildinfo.Version)
 			}
 			fmt.Fprintf(out, "daemon:              %s\n", line)
+		case h.BinaryReplaced:
+			// Alive and beating, but its own binary is gone: it can no longer
+			// spawn the MCP server or the embed worker, so every consult comes
+			// back empty. Worse than STALE; the same remedy fixes it.
+			fmt.Fprintf(out, "daemon:              %s — BINARY REMOVED (upgraded underneath it); LLM consults cannot run; run: hap daemon --ensure\n",
+				label)
 		case h.VersionStale:
 			// A holder from another binary keeps old bugs alive; make the
 			// mismatch and the remedy impossible to miss.
@@ -716,7 +722,7 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	// suggestion is always the one that matters: revive the daemon, lift the
 	// kill switch, or work the queue.
 	var hints []Hint
-	if app.DaemonInfo != nil && (!h.Running || h.Hung || h.VersionStale) {
+	if app.DaemonInfo != nil && (!h.Running || h.Hung || h.VersionStale || h.BinaryReplaced) {
 		hints = append(hints, Hint{Cmd: "hap daemon --ensure", Why: "start, or replace, the daemon"})
 	}
 	if st.Paused {
@@ -738,7 +744,7 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	// A hung daemon or a latched crash-loop give-up is a failure state: exit
 	// non-zero so scripted checks and the operator notice, even though the
 	// status body already explained it.
-	if h.Hung || h.GaveUp || h.CrashLooping {
+	if h.Hung || h.GaveUp || h.CrashLooping || h.BinaryReplaced {
 		return ErrUnhealthy
 	}
 	return nil
