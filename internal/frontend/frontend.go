@@ -2365,9 +2365,9 @@ func JoinCommand(argv []string) string {
 // listed by `rules list` / the TUI). expected is the pattern text the caller
 // believes is at that index: removal is refused on mismatch, so a listing
 // gone stale (another front-end edited in between) can never silently delete
-// the wrong never-auto pattern. Seed patterns cannot be removed here;
-// disabling the seed requires the explicit
-// safety.disable_never_auto_seed_patterns TOML edit.
+// the wrong never-auto pattern. Seed patterns are not deleted here — they are
+// shipped constants; disable one individually with DisableSeedRule, or drop
+// them all with safety.disable_never_auto_seed_patterns.
 func (a *App) RemoveNeverAutoPattern(ctx context.Context, index int, expected string) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		if index < 0 || index >= len(cfg.Safety.NeverAutoPatterns) {
@@ -2378,6 +2378,59 @@ func (a *App) RemoveNeverAutoPattern(ctx context.Context, index int, expected st
 		}
 		cfg.Safety.NeverAutoPatterns = append(
 			cfg.Safety.NeverAutoPatterns[:index], cfg.Safety.NeverAutoPatterns[index+1:]...)
+		return nil
+	})
+}
+
+// SeedRuleDisabled reports whether a shipped seed pattern has been disabled
+// individually via safety.disabled_seed_patterns, for list rendering.
+func (a *App) SeedRuleDisabled(pattern string) bool {
+	cfg, err := a.Config()
+	if err != nil {
+		return false
+	}
+	for _, p := range cfg.Safety.DisabledSeedPatterns {
+		if p == pattern {
+			return true
+		}
+	}
+	return false
+}
+
+// DisableSeedRule silences one shipped seed never-auto rule (strict or
+// heuristic) permanently, keeping every other seed rule active. The rule is
+// named by its exact pattern (resolved from a durable domain.SeedRuleID by the
+// caller); a pattern that is not a shipped seed rule is refused, so a stale or
+// bogus identifier can never write an arbitrary string into the disable list.
+// The pattern is what gets recorded, so the setting survives a seed-list
+// reordering across versions. Disabling an already-disabled rule is a no-op.
+func (a *App) DisableSeedRule(ctx context.Context, pattern string) error {
+	if !domain.IsSeedPattern(pattern) {
+		return fmt.Errorf("%q is not a shipped seed rule", pattern)
+	}
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		for _, p := range cfg.Safety.DisabledSeedPatterns {
+			if p == pattern {
+				return nil // already disabled
+			}
+		}
+		cfg.Safety.DisabledSeedPatterns = append(cfg.Safety.DisabledSeedPatterns, pattern)
+		return nil
+	})
+}
+
+// EnableSeedRule re-enables a seed rule previously disabled with
+// DisableSeedRule, named by the same exact pattern. Re-enabling a rule that is
+// not disabled is a no-op.
+func (a *App) EnableSeedRule(ctx context.Context, pattern string) error {
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		kept := cfg.Safety.DisabledSeedPatterns[:0]
+		for _, p := range cfg.Safety.DisabledSeedPatterns {
+			if p != pattern {
+				kept = append(kept, p)
+			}
+		}
+		cfg.Safety.DisabledSeedPatterns = kept
 		return nil
 	})
 }
@@ -2477,7 +2530,7 @@ func (a *App) SetThreshold(ctx context.Context, situation string, value float64)
 
 // AddNeverAutoPattern appends a never-auto pattern (FR-016) and reloads.
 func (a *App) AddNeverAutoPattern(ctx context.Context, pattern string) error {
-	if _, errs := domain.NewNeverAutoList(false, []string{pattern}, nil); len(errs) > 0 {
+	if _, errs := domain.NewNeverAutoList(false, nil, []string{pattern}, nil); len(errs) > 0 {
 		return fmt.Errorf("invalid pattern: %v", errs[0])
 	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {

@@ -850,12 +850,24 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 	// pending one — so a caller can copy a line verbatim instead of translating
 	// a placeholder.
 	id := esc[0].ID
-	PrintNextSteps(out, []Hint{
+	hints := []Hint{
 		{Cmd: fmt.Sprintf("hap confirm %d --send", id), Why: "the suggestion is right — accept and deliver it"},
 		{Cmd: fmt.Sprintf("hap resolve %d --action TEXT --send", id), Why: "it is wrong — record and send the right answer (@noop = no reply needed)"},
 		{Cmd: fmt.Sprintf("hap dismiss %d", id), Why: "drop it; nothing sent or learned"},
 		{Cmd: "hap escalations prune 120", Why: "dismiss everything older than 2 hours"},
-	})
+	}
+	// When the escalation whose id the footer carries was forced by a builtin
+	// (seed) never-auto rule tripping on this repo's benign wording, point at the
+	// exact command to silence just that one rule. Gated on esc[0] — the SAME row
+	// as the confirm/dismiss ids above — so the hint always refers to the
+	// escalation being acted on, never an unrelated older row in a mixed queue.
+	if rule, ok := domain.SeedRuleForRationale(esc[0].Rationale); ok {
+		hints = append(hints, Hint{
+			Cmd: fmt.Sprintf("hap rules disable-seed %s", domain.SeedRuleID(rule.Pattern)),
+			Why: fmt.Sprintf("a builtin safety rule blocked escalation #%d — silence it if it is too aggressive for this repo", id),
+		})
+	}
+	PrintNextSteps(out, hints)
 	return nil
 }
 
@@ -1166,12 +1178,17 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if cfg.Safety.DisableNeverAutoSeedPatterns {
 			fmt.Fprintln(out, "# shipped never-auto rules disabled by safety.disable_never_auto_seed_patterns=true")
 		} else {
-			fmt.Fprintln(out, "# shipped never-auto rules")
-			for _, p := range domain.SeedNeverAutoPatterns {
-				fmt.Fprintf(out, "seed strict\t%s\n", p)
+			fmt.Fprintln(out, "# shipped never-auto rules (silence one: hap rules disable-seed <id>)")
+			disabled := make(map[string]bool, len(cfg.Safety.DisabledSeedPatterns))
+			for _, p := range cfg.Safety.DisabledSeedPatterns {
+				disabled[p] = true
 			}
-			for _, r := range domain.SeedHeuristicNeverAutoRules {
-				fmt.Fprintf(out, "seed heuristic\t%s\n", r.Pattern)
+			for _, r := range domain.SeedNeverAutoRules() {
+				state := ""
+				if disabled[r.Pattern] {
+					state = " [disabled]"
+				}
+				fmt.Fprintf(out, "seed %s\t%s%s\t%s\n", domain.SeedRuleID(r.Pattern), r.Kind, state, r.Pattern)
 			}
 		}
 		for i, p := range cfg.Safety.NeverAutoPatterns {
@@ -1187,6 +1204,7 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		PrintNextSteps(out, []Hint{
 			{Cmd: "hap rules add <regex>", Why: "force a matching situation to always ask a human"},
 			{Cmd: "hap rules remove <index>", Why: "drop one of the operator patterns listed above"},
+			{Cmd: "hap rules disable-seed <id>", Why: "silence one builtin (seed <id>) rule that is too aggressive here"},
 		})
 		return nil
 	}
@@ -1198,6 +1216,10 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		fmt.Fprintf(out, "never-auto pattern added: %s\n", args[1])
 		PrintNextSteps(out, rulesEditedHints())
 		return nil
+	case args[0] == "disable-seed" && len(args) == 2:
+		return rulesSeedToggle(ctx, app, out, args[1], true)
+	case args[0] == "enable-seed" && len(args) == 2:
+		return rulesSeedToggle(ctx, app, out, args[1], false)
 	case args[0] == "remove" && len(args) == 2:
 		idx, err := strconv.Atoi(args[1])
 		if err != nil {
@@ -1218,7 +1240,32 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		PrintNextSteps(out, rulesEditedHints())
 		return nil
 	}
-	return fmt.Errorf("usage: rules [list|add <regex>|remove <index>] (see: hap help rules)")
+	return fmt.Errorf("usage: rules [list|add <regex>|remove <index>|disable-seed <id>|enable-seed <id>] (see: hap help rules)")
+}
+
+// rulesSeedToggle disables (or re-enables) one shipped seed never-auto rule by
+// its durable domain.SeedRuleID (as listed by `rules list`). Resolving the id
+// to its pattern rejects an unknown or stale id — one whose pattern no longer
+// ships — instead of acting on whatever rule happens to sit at a position, and
+// the rule is stored by pattern so the setting is stable across a reorder.
+func rulesSeedToggle(ctx context.Context, app *frontend.App, out io.Writer, id string, disable bool) error {
+	rule, ok := domain.SeedRuleByID(id)
+	if !ok {
+		return fmt.Errorf("no seed rule %q (see: rules list)", id)
+	}
+	if disable {
+		if err := app.DisableSeedRule(ctx, rule.Pattern); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "seed rule %s disabled: %s\n", id, rule.Pattern)
+	} else {
+		if err := app.EnableSeedRule(ctx, rule.Pattern); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "seed rule %s re-enabled: %s\n", id, rule.Pattern)
+	}
+	PrintNextSteps(out, rulesEditedHints())
+	return nil
 }
 
 // rulesEditedHints are the follow-ups after a never-auto pattern changed: the

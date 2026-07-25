@@ -67,6 +67,7 @@ agents = ['codex']
 
 	matcher, errs := domain.NewNeverAutoList(
 		!cfg.Safety.DisableNeverAutoSeedPatterns,
+		cfg.Safety.DisabledSeedPatterns,
 		cfg.Safety.NeverAutoPatterns,
 		neverAutoRules(cfg.Safety),
 	)

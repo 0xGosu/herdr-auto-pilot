@@ -10,7 +10,7 @@ import (
 
 func newSeedNeverAuto(t *testing.T) *NeverAutoList {
 	t.Helper()
-	a, errs := NewNeverAutoList(true, nil, nil)
+	a, errs := NewNeverAutoList(true, nil, nil, nil)
 	if len(errs) > 0 {
 		t.Fatalf("seed allowlist failed to compile: %v", errs)
 	}
@@ -71,7 +71,7 @@ func TestNeverAutoDoesNotMatchBenignPrompts(t *testing.T) {
 }
 
 func TestOperatorPatternsExtendSeed(t *testing.T) {
-	a, errs := NewNeverAutoList(true, []string{`(?i)restart\s+the\s+payment\s+service`}, nil)
+	a, errs := NewNeverAutoList(true, nil, []string{`(?i)restart\s+the\s+payment\s+service`}, nil)
 	if len(errs) > 0 {
 		t.Fatalf("compile: %v", errs)
 	}
@@ -90,7 +90,7 @@ func TestOperatorPatternsExtendSeed(t *testing.T) {
 }
 
 func TestDisableSeedRemovesStrictAndHeuristicRules(t *testing.T) {
-	a, errs := NewNeverAutoList(false, []string{`operator-only`}, nil)
+	a, errs := NewNeverAutoList(false, nil, []string{`operator-only`}, nil)
 	if len(errs) > 0 {
 		t.Fatalf("compile: %v", errs)
 	}
@@ -116,11 +116,11 @@ func TestNeverAutoStrictAndHeuristicRegressionMatrix(t *testing.T) {
 	operatorRules := []NeverAutoRule{{
 		Pattern: scopedPattern, AgentTypes: []string{"codex"},
 	}}
-	enabled, errs := NewNeverAutoList(true, []string{operatorPattern}, operatorRules)
+	enabled, errs := NewNeverAutoList(true, nil, []string{operatorPattern}, operatorRules)
 	if len(errs) > 0 {
 		t.Fatalf("compile enabled matcher: %v", errs)
 	}
-	disabled, errs := NewNeverAutoList(false, []string{operatorPattern}, operatorRules)
+	disabled, errs := NewNeverAutoList(false, nil, []string{operatorPattern}, operatorRules)
 	if len(errs) > 0 {
 		t.Fatalf("compile disabled matcher: %v", errs)
 	}
@@ -226,7 +226,7 @@ func TestNeverAutoStrictAndHeuristicRegressionMatrix(t *testing.T) {
 
 func TestUnifiedNeverAutoRulesPreserveMetadataAndScope(t *testing.T) {
 	scopedPattern := `(?i)compact\s+the\s+conversation`
-	a, errs := NewNeverAutoList(true, []string{`operator-global`}, []NeverAutoRule{{
+	a, errs := NewNeverAutoList(true, nil, []string{`operator-global`}, []NeverAutoRule{{
 		Pattern: scopedPattern, AgentTypes: []string{"codex", "agy"},
 	}})
 	if len(errs) > 0 {
@@ -259,7 +259,7 @@ func TestUnifiedNeverAutoRulesPreserveMetadataAndScope(t *testing.T) {
 }
 
 func TestInvalidOperatorPatternReported(t *testing.T) {
-	_, errs := NewNeverAutoList(true, []string{`([unclosed`}, nil)
+	_, errs := NewNeverAutoList(true, nil, []string{`([unclosed`}, nil)
 	if len(errs) == 0 {
 		t.Error("invalid pattern must be reported")
 	}
@@ -360,7 +360,7 @@ func TestSuspectedIrreversibleIgnoresDistantNarration(t *testing.T) {
 func TestEmptyMatchableIndicatorStillFires(t *testing.T) {
 	// A misconfigured operator pattern that can match the empty string must
 	// fire (noisy-safe), not silently disable itself.
-	a, errs := NewNeverAutoList(false, nil, []NeverAutoRule{{
+	a, errs := NewNeverAutoList(false, nil, nil, []NeverAutoRule{{
 		Pattern: `(?i)(drop prod)?`, Kind: NeverAutoHeuristic, Source: NeverAutoOperator,
 	}})
 	if len(errs) > 0 {
@@ -376,7 +376,7 @@ func TestAgentScopedIndicators(t *testing.T) {
 		{Pattern: `(?i)compact\s+the\s+conversation`, AgentTypes: []string{"codex", "agy"}, Kind: NeverAutoHeuristic},
 		{Pattern: `(?i)squash\s+the\s+timeline`, AgentTypes: []string{"*"}, Kind: NeverAutoHeuristic},
 	}
-	a, errs := NewNeverAutoList(false, nil, rules)
+	a, errs := NewNeverAutoList(false, nil, nil, rules)
 	if len(errs) > 0 {
 		t.Fatalf("compile: %v", errs)
 	}
@@ -394,7 +394,7 @@ func TestAgentScopedIndicators(t *testing.T) {
 
 	// Sloppy scope entries fail noisy, not silently dead: a padded "*" is
 	// still a wildcard and a blank entry is treated as one.
-	padded, errs := NewNeverAutoList(false, nil, []NeverAutoRule{
+	padded, errs := NewNeverAutoList(false, nil, nil, []NeverAutoRule{
 		{Pattern: `(?i)compact\s+the\s+conversation`, AgentTypes: []string{" * "}, Kind: NeverAutoHeuristic},
 		{Pattern: `(?i)squash\s+the\s+timeline`, AgentTypes: []string{""}, Kind: NeverAutoHeuristic},
 	})
@@ -599,5 +599,177 @@ func TestCheckRateExemptsIdleHandoutFromConsecutiveCeiling(t *testing.T) {
 	paused := PauseAgent(AgentRate{WindowStart: now})
 	if ok, _ := CheckRate(paused, now, lim, true); ok {
 		t.Error("a paused agent must stay blocked even for an idle hand-out")
+	}
+}
+
+// heuristicSeedPattern is the shipped "no-undo language" heuristic (the one
+// that fires on "unrecoverable"/"irreversible"). Located by content so the
+// test does not hard-code a slice index that could drift.
+func heuristicSeedPattern(t *testing.T) string {
+	t.Helper()
+	for _, r := range SeedHeuristicNeverAutoRules {
+		if strings.Contains(r.Pattern, "unrecoverabl") {
+			return r.Pattern
+		}
+	}
+	t.Fatal("no-undo heuristic seed rule not found")
+	return ""
+}
+
+// strictSeedPattern locates a shipped strict seed pattern by a substring of its
+// regex, keeping tests independent of the seed list's ordering.
+func strictSeedPattern(t *testing.T, substr string) string {
+	t.Helper()
+	for _, p := range SeedNeverAutoPatterns {
+		if strings.Contains(p, substr) {
+			return p
+		}
+	}
+	t.Fatalf("no strict seed pattern containing %q", substr)
+	return ""
+}
+
+func TestDisableSpecificSeedSkipsOnlyThatRule(t *testing.T) {
+	target := heuristicSeedPattern(t)
+	a, errs := NewNeverAutoList(true, []string{target}, nil, nil)
+	if len(errs) > 0 {
+		t.Fatalf("compile: %v", errs)
+	}
+	// The disabled heuristic no longer fires on its own wording...
+	if _, ok := a.SuspectedIrreversible("claude", "This status is unrecoverable"); ok {
+		t.Error("disabled heuristic seed rule must not fire")
+	}
+	// ...but a different heuristic still does (credential revocation)...
+	if _, ok := a.SuspectedIrreversible("claude", "Revoke the API tokens for this account"); !ok {
+		t.Error("an unrelated heuristic seed rule must still fire")
+	}
+	// ...and strict seed rules are untouched.
+	if _, ok := a.Match("claude", "DROP TABLE users"); !ok {
+		t.Error("strict seed rules must stay active when only a heuristic is disabled")
+	}
+	// The disabled rule is gone from the rule set; siblings remain.
+	for _, rule := range a.Rules() {
+		if rule.Pattern == target {
+			t.Fatalf("disabled seed rule still present: %+v", rule)
+		}
+	}
+}
+
+func TestDisableSpecificSeedStrictRule(t *testing.T) {
+	target := strictSeedPattern(t, "DROP")
+	a, errs := NewNeverAutoList(true, []string{target}, nil, nil)
+	if len(errs) > 0 {
+		t.Fatalf("compile: %v", errs)
+	}
+	if _, ok := a.Match("claude", "DROP TABLE users"); ok {
+		t.Error("disabled strict seed rule must not fire")
+	}
+	// A different strict seed rule still fires.
+	if _, ok := a.Match("claude", "TRUNCATE TABLE logs"); !ok {
+		t.Error("an unrelated strict seed rule must still fire")
+	}
+}
+
+func TestSeedNeverAutoRulesOrderAndCount(t *testing.T) {
+	rules := SeedNeverAutoRules()
+	if len(rules) != SeedNeverAutoRuleCount() {
+		t.Fatalf("SeedNeverAutoRules len=%d want %d", len(rules), SeedNeverAutoRuleCount())
+	}
+	strictN := len(SeedNeverAutoPatterns)
+	for i, r := range rules {
+		if r.Source != NeverAutoSeed {
+			t.Errorf("rule #%d source=%q want seed", i, r.Source)
+		}
+		wantKind := NeverAutoStrict
+		if i >= strictN {
+			wantKind = NeverAutoHeuristic
+		}
+		if r.Kind != wantKind {
+			t.Errorf("rule #%d kind=%q want %q", i, r.Kind, wantKind)
+		}
+	}
+}
+
+func TestSeedRuleForRationale(t *testing.T) {
+	a := newSeedNeverAuto(t)
+	hit, ok := a.SuspectedIrreversible("claude", "This action cannot be undone")
+	if !ok {
+		t.Fatal("expected the no-undo heuristic to fire")
+	}
+	rule, ok := SeedRuleForRationale(hit.Diagnostic())
+	if !ok {
+		t.Fatalf("rationale from a seed hit must resolve: %q", hit.Diagnostic())
+	}
+	if rule.Pattern != hit.Pattern {
+		t.Errorf("resolved pattern=%q want %q", rule.Pattern, hit.Pattern)
+	}
+	// An operator-pattern rationale must not resolve to a seed rule.
+	op, errs := NewNeverAutoList(false, nil, []string{`(?i)operator-only-phrase`}, nil)
+	if len(errs) > 0 {
+		t.Fatalf("compile: %v", errs)
+	}
+	opHit, _ := op.Match("claude", "operator-only-phrase here")
+	if _, ok := SeedRuleForRationale(opHit.Diagnostic()); ok {
+		t.Error("an operator-pattern rationale must not resolve to a seed rule")
+	}
+	// An unrelated rationale must not resolve.
+	if _, ok := SeedRuleForRationale("contradictory history"); ok {
+		t.Error("an unrelated rationale must not resolve to a seed rule")
+	}
+}
+
+// TestSeedRuleForRationaleRejectsOperatorDuplicateOfSeed is the regression for
+// review comment #2: an operator rule whose pattern text is byte-identical to a
+// shipped seed rule renders "source=operator" in its diagnostic, and the source
+// check must keep it from resolving to a builtin — otherwise the CLI would tell
+// the operator to disable a seed while their own rule is the one firing.
+func TestSeedRuleForRationaleRejectsOperatorDuplicateOfSeed(t *testing.T) {
+	seedPattern := strictSeedPattern(t, "DROP")
+	// Seeds disabled so ONLY the operator copy of the pattern is active.
+	a, errs := NewNeverAutoList(false, nil, []string{seedPattern}, nil)
+	if len(errs) > 0 {
+		t.Fatalf("compile: %v", errs)
+	}
+	hit, ok := a.Match("claude", "DROP TABLE users")
+	if !ok {
+		t.Fatal("operator copy of the seed pattern must still fire")
+	}
+	if hit.Source != NeverAutoOperator {
+		t.Fatalf("expected operator source, got %q", hit.Source)
+	}
+	if _, ok := SeedRuleForRationale(hit.Diagnostic()); ok {
+		t.Error("an operator rule duplicating a seed pattern must not resolve to the seed")
+	}
+}
+
+// TestSeedRuleIDIsDurableAcrossOrdering is the regression for review comment #1:
+// the disable/enable id is a content hash, so it round-trips to the same rule
+// regardless of position, and an unknown id resolves to nothing rather than to
+// whatever rule sits at some index.
+func TestSeedRuleIDIsDurableAcrossOrdering(t *testing.T) {
+	seeds := SeedNeverAutoRules()
+	seen := make(map[string]bool, len(seeds))
+	for _, r := range seeds {
+		id := SeedRuleID(r.Pattern)
+		if seen[id] {
+			t.Fatalf("seed rule id collision at %q", id)
+		}
+		seen[id] = true
+		got, ok := SeedRuleByID(id)
+		if !ok || got.Pattern != r.Pattern {
+			t.Errorf("id %q must resolve back to its own pattern, got ok=%v pattern=%q", id, ok, got.Pattern)
+		}
+	}
+	// An id whose pattern does not ship (e.g. copied from an older version) is
+	// rejected, never silently mapped onto a positional neighbor.
+	if _, ok := SeedRuleByID("deadbeef"); ok {
+		t.Error("an unknown seed id must not resolve")
+	}
+	// IsSeedPattern gates the disable path.
+	if !IsSeedPattern(seeds[0].Pattern) {
+		t.Error("a shipped pattern must be recognized as a seed pattern")
+	}
+	if IsSeedPattern("(?i)operator-only") {
+		t.Error("an operator pattern must not be recognized as a seed pattern")
 	}
 }

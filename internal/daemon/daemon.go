@@ -502,7 +502,7 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	}
 	d.mu.Unlock()
 	allow, errs := domain.NewNeverAutoList(!cfg.Safety.DisableNeverAutoSeedPatterns,
-		cfg.Safety.NeverAutoPatterns, neverAutoRules(cfg.Safety))
+		cfg.Safety.DisabledSeedPatterns, cfg.Safety.NeverAutoPatterns, neverAutoRules(cfg.Safety))
 	for _, e := range errs {
 		slog.Warn("never-auto pattern rejected", "error", e)
 	}

@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"regexp"
 	"strings"
@@ -135,6 +136,84 @@ func SeedNeverAutoRuleCount() int {
 	return len(SeedNeverAutoPatterns) + len(SeedHeuristicNeverAutoRules)
 }
 
+// SeedNeverAutoRules returns every shipped seed rule — strict patterns first,
+// then heuristic rules — with Kind and Source filled in. Rules are addressed by
+// their content-derived SeedRuleID, not by position, so callers never depend on
+// this ordering surviving a version upgrade.
+func SeedNeverAutoRules() []NeverAutoRule {
+	rules := make([]NeverAutoRule, 0, SeedNeverAutoRuleCount())
+	for _, p := range SeedNeverAutoPatterns {
+		rules = append(rules, NeverAutoRule{Pattern: p, Kind: NeverAutoStrict, Source: NeverAutoSeed})
+	}
+	for _, r := range SeedHeuristicNeverAutoRules {
+		r.Kind = NeverAutoHeuristic
+		r.Source = NeverAutoSeed
+		rules = append(rules, r)
+	}
+	return rules
+}
+
+// SeedRuleID is a short, stable identifier for a seed rule, derived from its
+// pattern text. Because it is a content hash — not a list position — an id an
+// operator copied from `rules list` still names the SAME rule after a seed-list
+// reorder or version upgrade (or names nothing, if that pattern was dropped);
+// it can never silently point at a different rule. This is the durable key the
+// disable/enable commands and the escalation hint use.
+func SeedRuleID(pattern string) string {
+	sum := sha256.Sum256([]byte(pattern))
+	return fmt.Sprintf("%x", sum[:4]) // 8 hex chars — collision-safe for ~90 rules
+}
+
+// SeedRuleByID resolves a SeedRuleID back to its shipped rule. The bool is
+// false for an unknown id (e.g. a stale id whose pattern no longer ships),
+// which the callers surface as a "no such seed rule" error rather than acting
+// on the wrong one.
+func SeedRuleByID(id string) (NeverAutoRule, bool) {
+	for _, r := range SeedNeverAutoRules() {
+		if SeedRuleID(r.Pattern) == id {
+			return r, true
+		}
+	}
+	return NeverAutoRule{}, false
+}
+
+// IsSeedPattern reports whether pattern is the exact text of a shipped seed
+// rule. It guards the disable/enable path so only a real seed rule can be
+// recorded in safety.disabled_seed_patterns.
+func IsSeedPattern(pattern string) bool {
+	for _, r := range SeedNeverAutoRules() {
+		if r.Pattern == pattern {
+			return true
+		}
+	}
+	return false
+}
+
+// SeedRuleForRationale maps an escalation rationale back to the seed rule that
+// produced it. It requires the stable Diagnostic() rendering
+// ("pattern <P> matched …") AND, immediately after that hit's excerpt, the
+// seed-source marker "(source=seed ": an operator rule whose pattern text
+// happens to equal a seed's — or a hit taken once that seed is disabled —
+// renders "(source=operator " and must NOT resolve to a builtin, or the hint
+// would name an unrelated (or already-inactive) rule. Anchoring the source
+// check to the position after this rule's own match keeps a crafted excerpt
+// elsewhere in the rationale from spoofing it. The bool is false when no seed
+// rule matches.
+func SeedRuleForRationale(rationale string) (NeverAutoRule, bool) {
+	seedSource := "(source=" + string(NeverAutoSeed) + " "
+	for _, r := range SeedNeverAutoRules() {
+		marker := "pattern " + r.Pattern + " matched"
+		i := strings.Index(rationale, marker)
+		if i < 0 {
+			continue
+		}
+		if strings.Contains(rationale[i+len(marker):], seedSource) {
+			return r, true
+		}
+	}
+	return NeverAutoRule{}, false
+}
+
 // compiledNeverAutoRule is one unified rule ready for matching.
 type compiledNeverAutoRule struct {
 	rule NeverAutoRule
@@ -150,16 +229,29 @@ type NeverAutoList struct {
 // NewNeverAutoList compiles strict and heuristic rules into one matcher while
 // preserving each rule's source, kind, and agent-type scope.
 // Invalid operator patterns are reported, not silently dropped.
-func NewNeverAutoList(seedEnabled bool, extraPatterns []string, extraRules []NeverAutoRule) (*NeverAutoList, []error) {
+//
+// disabledSeeds names individual seed patterns (strict or heuristic) the
+// operator has switched off; each is skipped while every other seed rule stays
+// active. Operator rules are never filtered by it. Passing nil (or the whole
+// set disabled via seedEnabled=false) keeps the previous behavior.
+func NewNeverAutoList(seedEnabled bool, disabledSeeds, extraPatterns []string, extraRules []NeverAutoRule) (*NeverAutoList, []error) {
 	var errs []error
 	a := &NeverAutoList{}
-	addRules := func(rules []NeverAutoRule, defaultKind NeverAutoRuleKind, defaultSource NeverAutoRuleSource) {
+	disabled := make(map[string]bool, len(disabledSeeds))
+	for _, p := range disabledSeeds {
+		disabled[p] = true
+	}
+	addRules := func(rules []NeverAutoRule, defaultKind NeverAutoRuleKind, defaultSource NeverAutoRuleSource, seed bool) {
 		for _, rule := range rules {
 			if rule.Kind == "" {
 				rule.Kind = defaultKind
 			}
 			if rule.Source == "" {
 				rule.Source = defaultSource
+			}
+			// Only seed rules honor the operator's per-rule disable list.
+			if seed && disabled[rule.Pattern] {
+				continue
 			}
 			re, err := regexp.Compile(rule.Pattern)
 			if err != nil {
@@ -174,15 +266,15 @@ func NewNeverAutoList(seedEnabled bool, extraPatterns []string, extraRules []Nev
 		for _, pattern := range SeedNeverAutoPatterns {
 			seedRules = append(seedRules, NeverAutoRule{Pattern: pattern})
 		}
-		addRules(seedRules, NeverAutoStrict, NeverAutoSeed)
-		addRules(SeedHeuristicNeverAutoRules, NeverAutoHeuristic, NeverAutoSeed)
+		addRules(seedRules, NeverAutoStrict, NeverAutoSeed, true)
+		addRules(SeedHeuristicNeverAutoRules, NeverAutoHeuristic, NeverAutoSeed, true)
 	}
 	operatorRules := make([]NeverAutoRule, 0, len(extraPatterns)+len(extraRules))
 	for _, pattern := range extraPatterns {
 		operatorRules = append(operatorRules, NeverAutoRule{Pattern: pattern})
 	}
 	operatorRules = append(operatorRules, extraRules...)
-	addRules(operatorRules, NeverAutoStrict, NeverAutoOperator)
+	addRules(operatorRules, NeverAutoStrict, NeverAutoOperator, false)
 	return a, errs
 }
 
