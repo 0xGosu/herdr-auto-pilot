@@ -719,3 +719,86 @@ func TestDispatchContextBoundsOnlyAfterCancel(t *testing.T) {
 		t.Errorf("grace = %v, want comfortably more than the store's 5s busy timeout", remaining)
 	}
 }
+
+// A frame the reader already delivered must be dispatched even though the
+// context is cancelled: when both select cases are ready Go picks one at
+// RANDOM, so returning straight from the cancel branch would silently discard
+// a submit_decision that arrived before the signal — exactly the loss the
+// grace window exists to prevent. Driving serve() with a pre-filled channel
+// and an already-cancelled context makes the race deterministic; through Run()
+// it would only reproduce by luck.
+func TestServeDispatchesAlreadyDeliveredFrameOnCancel(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	const reqID = "req-raced"
+	if _, err := st.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: reqID, Signature: "idle:aaaa", SituationType: domain.SituationIdle,
+		AgentType: "claude", ContextJSON: "{}", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	frame, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "submit_decision",
+			"arguments": map[string]any{
+				"recommend_action": "proceed", "confident_score": 90, "rationale": "test",
+			},
+		},
+	})
+	frames := make(chan []byte, 1)
+	frames <- frame
+
+	cancelled, stop := context.WithCancel(context.Background())
+	stop()
+
+	var out strings.Builder
+	srv := &Server{Store: st, DefaultRequestID: reqID}
+	if err := srv.serve(cancelled, json.NewEncoder(&out), frames, make(chan error, 1)); err != nil {
+		t.Fatalf("serve = %v, want nil", err)
+	}
+	if out.Len() == 0 {
+		t.Error("the already-delivered frame got no response")
+	}
+
+	dec, err := st.LLMDecisionByRequest(ctx, reqID)
+	if err != nil {
+		t.Fatalf("read staged decision: %v", err)
+	}
+	if dec == nil {
+		t.Fatal("a decision delivered before the signal was dropped by the cancel branch")
+	}
+}
+
+// The drain must not hold shutdown open waiting for a client that has stopped
+// sending: it dispatches what is in hand and returns.
+func TestServeDrainDoesNotWaitForMoreFrames(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Open (never closed) and empty: a drain that waited would block forever.
+	frames := make(chan []byte)
+	cancelled, stop := context.WithCancel(context.Background())
+	stop()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- (&Server{Store: st}).serve(cancelled, json.NewEncoder(io.Discard), frames, make(chan error, 1))
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve blocked draining an empty channel instead of returning")
+	}
+}

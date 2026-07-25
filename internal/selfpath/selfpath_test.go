@@ -20,6 +20,19 @@ func writeExe(t *testing.T, path string) string {
 	return path
 }
 
+// resolved canonicalizes an expected path the way the code under test does.
+// On macOS a t.TempDir() path lives under the /var → /private/var symlink, so
+// comparing a raw temp path against a value that went through EvalSymlinks
+// fails there while passing on Linux.
+func resolved(t *testing.T, path string) string {
+	t.Helper()
+	out, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", path, err)
+	}
+	return out
+}
+
 // isolate points every discovery fallback at an empty world so a test only
 // sees the candidates it sets up itself, and clears the process-wide cache.
 func isolate(t *testing.T) string {
@@ -116,7 +129,7 @@ func TestResolveReplacementFindsPATHShortcut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveReplacement: %v", err)
 	}
-	if got != want {
+	if got != resolved(t, want) {
 		t.Fatalf("resolveReplacement = %q, want %q", got, want)
 	}
 }
@@ -127,7 +140,7 @@ func TestResolveReplacementCacheRevalidates(t *testing.T) {
 	first := writeExe(t, filepath.Join(bin, "hap"))
 	t.Setenv("PATH", bin)
 
-	if got, err := resolveReplacement(); err != nil || got != first {
+	if got, err := resolveReplacement(); err != nil || got != resolved(t, first) {
 		t.Fatalf("first resolveReplacement = %q, %v; want %q", got, err, first)
 	}
 	// A second upgrade removes the cached answer too. The cache must not
@@ -142,7 +155,7 @@ func TestResolveReplacementCacheRevalidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second resolveReplacement: %v", err)
 	}
-	if got != second {
+	if got != resolved(t, second) {
 		t.Fatalf("second resolveReplacement = %q, want the new binary %q", got, second)
 	}
 }
@@ -204,7 +217,7 @@ func TestPluginRootIsTwoLevelsAboveTheBinary(t *testing.T) {
 	root := filepath.Join(dir, "plugin")
 	t.Setenv(EnvOverride, writeExe(t, filepath.Join(root, "bin", "hap")))
 
-	if got := PluginRoot(); got != root {
+	if got := PluginRoot(); got != resolved(t, root) {
 		t.Fatalf("PluginRoot = %q, want %q", got, root)
 	}
 }

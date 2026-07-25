@@ -64,47 +64,96 @@ const shutdownGrace = 30 * time.Second
 // Frames are read on their own goroutine because a blocking read on stdin
 // cannot be interrupted: the LLM CLI that launched us holds the pipe open, so
 // waiting on Scan alone made `hap mcp` ignore signals entirely and linger with
-// the SQLite handle open. Dispatch stays on this goroutine, so cancellation
-// can only land BETWEEN frames and an in-flight tool call always completes.
+// the SQLite handle open. Dispatch stays on this goroutine, so a tool call
+// already running when the signal lands always completes — and a frame that
+// merely arrived first is drained on the way out (see serve), so the signal
+// cannot swallow a decision the client had already sent.
 func (s *Server) Run(ctx context.Context, in io.Reader, out io.Writer) error {
-	enc := json.NewEncoder(out)
 	frames, scanErr := readFrames(in)
+	return s.serve(ctx, json.NewEncoder(out), frames, scanErr)
+}
 
+// serve is Run's loop over an already-running frame reader, split out so the
+// cancellation race below can be exercised deterministically.
+func (s *Server) serve(ctx context.Context, enc *json.Encoder, frames <-chan []byte, scanErr <-chan error) error {
 	for {
 		select {
 		case <-ctx.Done():
 			// A signal is an ordinary end of service, not a failure: return nil
 			// so the process exits 0 and the caller's deferred store Close runs.
-			return nil
+			//
+			// But not before draining: when a frame and the cancellation are
+			// ready at the same instant, select picks BETWEEN THEM AT RANDOM,
+			// so returning straight from here would discard a frame the reader
+			// had already handed over — a submit_decision that reached us
+			// before the signal, which is precisely what the grace window
+			// exists to protect.
+			return s.drainReady(ctx, enc, frames)
 		case line, ok := <-frames:
 			if !ok {
 				return <-scanErr
 			}
-			var req rpcRequest
-			if err := json.Unmarshal(line, &req); err != nil {
-				continue // unparseable frame: ignore, fail-safe
-			}
-			if req.ID == nil {
-				continue // notification (e.g. notifications/initialized)
-			}
-			// Normally the handler just gets ctx. Only once a signal has
-			// already landed does it get a detached, separately-bounded
-			// context: the frame was read before the cancel, so a
-			// submit_decision reaching us in that window must still complete
-			// rather than fail with "context canceled" and drop the decision.
-			callCtx, cancel := dispatchContext(ctx)
-			resp := s.handle(callCtx, req)
-			cancel()
-			if err := enc.Encode(resp); err != nil {
-				// The client went away mid-reply (a killed CLI closes the pipe).
-				// That is teardown, not an error worth a non-zero exit.
-				if isPipeClosed(err) {
-					return nil
-				}
+			if stop, err := s.dispatch(ctx, enc, line); stop || err != nil {
 				return err
 			}
 		}
 	}
+}
+
+// drainReady dispatches every frame the reader has ALREADY delivered, then
+// returns. Each one goes through dispatch, so it gets the detached grace
+// context (ctx is cancelled by the time we are here).
+//
+// The default case bounds this to what is in hand: it never waits for the
+// client to send more, so a shutdown cannot be held open. Bytes still inside
+// the scanner, not yet handed to the channel, are not recoverable — "delivered
+// to the channel" is the strongest boundary this can honour, and it is the one
+// the race above actually straddles.
+func (s *Server) drainReady(ctx context.Context, enc *json.Encoder, frames <-chan []byte) error {
+	for {
+		select {
+		case line, ok := <-frames:
+			if !ok {
+				// stdin ended too; the signal is still the reason we stop, so
+				// this is a clean exit rather than the scanner's error.
+				return nil
+			}
+			if stop, err := s.dispatch(ctx, enc, line); stop || err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+}
+
+// dispatch handles one frame and writes its response. stop reports that the
+// loop should end: the client has gone away, or err is set.
+func (s *Server) dispatch(ctx context.Context, enc *json.Encoder, line []byte) (stop bool, err error) {
+	var req rpcRequest
+	if err := json.Unmarshal(line, &req); err != nil {
+		return false, nil // unparseable frame: ignore, fail-safe
+	}
+	if req.ID == nil {
+		return false, nil // notification (e.g. notifications/initialized)
+	}
+	// Normally the handler just gets ctx. Only once a signal has already
+	// landed does it get a detached, separately-bounded context: the frame was
+	// read before the cancel, so a submit_decision reaching us in that window
+	// must still complete rather than fail with "context canceled" and drop
+	// the decision.
+	callCtx, cancel := dispatchContext(ctx)
+	resp := s.handle(callCtx, req)
+	cancel()
+	if err := enc.Encode(resp); err != nil {
+		// The client went away mid-reply (a killed CLI closes the pipe). That
+		// is teardown, not an error worth a non-zero exit.
+		if isPipeClosed(err) {
+			return true, nil
+		}
+		return true, err
+	}
+	return false, nil
 }
 
 // readFrames pumps line-delimited frames off in until EOF, then reports the
