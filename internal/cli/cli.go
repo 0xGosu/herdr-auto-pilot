@@ -1729,16 +1729,38 @@ func taskTargetLabel(agent, path string) string {
 // would otherwise shift positions under the resolved index and rewrite the
 // wrong line.
 func taskItemArg(app *frontend.App, agent, path string, args []string) (domain.ChecklistItem, error) {
-	if len(args) == 0 {
-		return domain.ChecklistItem{}, domain.ErrTaskRefRequired
-	}
-	// Reject a syntactically impossible reference before reading anything:
-	// resolution needs the checklist, so without this `done xyz` on a missing
-	// file reports the file error instead of the typo that caused it.
-	if !domain.TaskRefSyntaxOK(args[0]) {
-		return domain.ChecklistItem{}, fmt.Errorf("invalid task number %q — pass a task id from the list (e.g. 3.4) or a position (e.g. '#3')", args[0])
+	if err := checkTaskRefArg(args); err != nil {
+		return domain.ChecklistItem{}, err
 	}
 	return app.ResolveTaskRef(agent, path, args[0])
+}
+
+// taskItemArgIn is taskItemArg against an ALREADY-READ list, for a caller that
+// needs the list too. Resolving from the same snapshot the rest of the command
+// reasons about is the point: two reads can straddle a concurrent edit, and
+// then the index one half resolved names a different task in the other's list.
+func taskItemArgIn(tasks []domain.ChecklistItem, args []string) (domain.ChecklistItem, error) {
+	if err := checkTaskRefArg(args); err != nil {
+		return domain.ChecklistItem{}, err
+	}
+	index, err := domain.ResolveTaskRef(tasks, args[0])
+	if err != nil {
+		return domain.ChecklistItem{}, err
+	}
+	return tasks[index-1], nil
+}
+
+// checkTaskRefArg rejects a missing or syntactically impossible reference. Both
+// resolvers call it BEFORE anything reads the checklist, so `done xyz` on a
+// missing file reports the typo that caused it rather than the file error.
+func checkTaskRefArg(args []string) error {
+	if len(args) == 0 {
+		return domain.ErrTaskRefRequired
+	}
+	if !domain.TaskRefSyntaxOK(args[0]) {
+		return fmt.Errorf("invalid task number %q — pass a task id from the list (e.g. 3.4) or a position (e.g. '#3')", args[0])
+	}
+	return nil
 }
 
 func taskToggle(app *frontend.App, out io.Writer, agent, path string, rest []string, done bool) error {
@@ -1783,19 +1805,46 @@ func taskStart(app *frontend.App, out io.Writer, agent, path string, rest []stri
 // here: after the move the item's own id is unchanged, so naming the target by
 // id would ask "put 5 where 2 is" and leave "which 2 — before or after the
 // shift?" open. `up`/`down` are the one-step forms the TUI's keys drive.
+//
+// ONE read of the checklist decides everything (taskMoveIn). Resolving the
+// reference and then RE-READING for the destination let a concurrent edit
+// answer the two halves from different files: the index one read resolved can
+// name a different task in the other's list, so the sibling step, the
+// off-the-end check and the reported position could all describe a checklist
+// the caller never named. The write itself was never at risk — expectText
+// refuses inside the lock — but a command that reports one thing and does
+// another is not one an operator can reason about.
 func taskMove(app *frontend.App, out io.Writer, agent, path string, args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: task %s move <n> <position|up|down> (see: hap help task)",
 			taskTargetLabel(agent, path))
 	}
-	it, err := taskItemArg(app, agent, path, args[:1])
+	// Before the read, so a typo is reported as a typo even when the file
+	// cannot be read — the ordering taskItemArg guarantees for every other op.
+	if err := checkTaskRefArg(args[:1]); err != nil {
+		return err
+	}
+	tasks, err := app.ListTasks(agent, path)
+	if err != nil {
+		return err
+	}
+	return taskMoveIn(app, out, agent, path, args, tasks)
+}
+
+// taskMoveIn is taskMove decided entirely from the `tasks` snapshot: which item
+// the reference names, which sibling a relative step lands on, whether that
+// step ran off the end, and which position to report. Taking the snapshot as a
+// parameter is what makes that single-snapshot property structural — there is
+// no second list for the two halves to disagree about, and a test can hand it
+// one deliberately at odds with the file on disk.
+func taskMoveIn(app *frontend.App, out io.Writer, agent, path string, args []string, tasks []domain.ChecklistItem) error {
+	it, err := taskItemArgIn(tasks, args[:1])
 	if err != nil {
 		return err
 	}
 	idx := it.Index
-	// The item list resolves a relative step: "down" is one SIBLING, not one
-	// position, since the position after a parent is its own first child.
-	tasks := listTasksOrNil(app, agent, path)
+	// "down" is one SIBLING, not one position, since the position after a
+	// parent is its own first child.
 	to, relative, err := moveDestination(args[1], idx, tasks)
 	if err != nil {
 		return err
@@ -1804,11 +1853,8 @@ func taskMove(app *frontend.App, out io.Writer, agent, path string, args []strin
 	// a repeated `move X up` does when it reaches the top, and equally what it
 	// does for a task that has no sibling on that side — so it is reported as
 	// "already there" rather than the bare "no task #0" the position validator
-	// would raise for a number the caller never typed. A nil list means it could
-	// not be read, and is deliberately NOT treated as "past the end": that would
-	// swallow the read error behind a success message. Falling through lets
-	// MoveTask report the real problem.
-	if n := len(tasks); relative && (to < 1 || (n > 0 && to > n)) {
+	// would raise for a number the caller never typed.
+	if n := len(tasks); relative && (to < 1 || to > n) {
 		edge := "top"
 		if to > idx {
 			edge = "bottom"
@@ -1837,27 +1883,15 @@ func taskMove(app *frontend.App, out io.Writer, agent, path string, args []strin
 }
 
 // moveLanding is the position domain.MoveChecklistItem leaves the item at,
-// derived from the PRE-move item list. Moving up it is the destination itself;
-// moving down it is the destination shifted back by however much more of the
-// list the source subtree occupied than the destination's does. With no item
-// list to measure (a read that failed) the destination is the honest guess.
+// derived from the SAME pre-move snapshot the move was decided from. Moving up
+// it is the destination itself; moving down it is the destination shifted back
+// by however much more of the list the source subtree occupied than the
+// destination's does.
 func moveLanding(tasks []domain.ChecklistItem, from, to int) int {
-	if tasks == nil || to < from {
+	if to < from {
 		return to
 	}
 	return to + domain.SubtreeSize(tasks, to) - domain.SubtreeSize(tasks, from)
-}
-
-// listTasksOrNil reads the target file's checklist items for the relative-move
-// step and its edge check, or nil when it cannot be read — which the caller
-// treats as "unknown", not "empty", so a read failure surfaces from the move
-// itself instead of as a bogus "already at the top".
-func listTasksOrNil(app *frontend.App, agent, path string) []domain.ChecklistItem {
-	items, err := app.ListTasks(agent, path)
-	if err != nil {
-		return nil
-	}
-	return items
 }
 
 // moveDestination resolves a move target to a 1-based position, reporting
@@ -1875,19 +1909,13 @@ func listTasksOrNil(app *frontend.App, agent, path string) []domain.ChecklistIte
 // direction (0 going up, past the last item going down), so the caller's
 // edge check reports the side the operator actually asked for.
 //
-// A nil `tasks` means the list could not be read; the plain ±1 step is kept so
-// that failure surfaces from the move itself rather than as a bogus edge report.
+// `tasks` is the caller's single snapshot — the same one the reference was
+// resolved against, so `idx` always names the item the step is computed for.
 func moveDestination(arg string, idx int, tasks []domain.ChecklistItem) (to int, relative bool, err error) {
 	switch strings.ToLower(strings.TrimSpace(arg)) {
 	case "up":
-		if tasks == nil {
-			return idx - 1, true, nil
-		}
 		return domain.SiblingPosition(tasks, idx, -1), true, nil
 	case "down":
-		if tasks == nil {
-			return idx + 1, true, nil
-		}
 		if p := domain.SiblingPosition(tasks, idx, 1); p > 0 {
 			return p, true, nil
 		}
