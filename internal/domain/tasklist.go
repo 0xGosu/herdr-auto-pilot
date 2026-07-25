@@ -258,7 +258,7 @@ func FoldTaskContent(content, taskText string) string {
 		if m == nil || m[2] != " " || strings.TrimSpace(m[3]) != taskText {
 			continue
 		}
-		return foldItemAt(lines, i, taskText)
+		return FoldedTaskText(taskText, nestedContinuationLines(lines, i))
 	}
 	return taskText
 }
@@ -278,21 +278,23 @@ func FoldTaskContentAt(content string, index int) string {
 		}
 		count++
 		if count == index {
-			return foldItemAt(lines, i, strings.TrimSpace(m[3]))
+			return FoldedTaskText(strings.TrimSpace(m[3]), nestedContinuationLines(lines, i))
 		}
 	}
 	return ""
 }
 
-// foldItemAt returns itemText followed by the nested continuation lines of the
-// checklist item at lines[i] (verbatim, newline-joined), or itemText alone when
-// it has none.
-func foldItemAt(lines []string, i int, itemText string) string {
-	nested := nestedContinuationLines(lines, i)
-	if len(nested) == 0 {
+// FoldedTaskText joins an item's own text with its nested detail lines
+// (verbatim, newline-separated), or returns itemText alone when there is no
+// detail. It is the single renderer of the folded body, so what the delivery
+// path sends and what a listing or detail view SHOWS can never drift apart —
+// the reason the display paths take ChecklistItem.Detail rather than re-deriving
+// the fold themselves.
+func FoldedTaskText(itemText string, detail []string) string {
+	if len(detail) == 0 {
 		return itemText
 	}
-	return itemText + "\n" + strings.Join(nested, "\n")
+	return itemText + "\n" + strings.Join(detail, "\n")
 }
 
 // nestedContinuationLines collects the lines that belong to the checklist item
@@ -318,6 +320,12 @@ func nestedContinuationLines(lines []string, i int) []string {
 	}
 	for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
 		out = out[:len(out)-1]
+	}
+	// Normalize an all-blank run back to nil: this is stored on every parsed
+	// item, and "no detail" must be one value, not nil-or-empty depending on
+	// whether blank lines happened to follow the item.
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
@@ -384,14 +392,25 @@ type ChecklistItem struct {
 	Mark string
 	Done bool
 	Text string
+	// Detail is the item's nested continuation lines, verbatim and in file
+	// order — the sub-bullets, acceptance criteria, dependencies and notes an
+	// operator writes UNDER a "- [ ]" title. It is exactly what the delivery
+	// path folds into the outbound prompt (FoldTaskContent), carried on the
+	// parsed item so a listing or detail view can show the task the agent will
+	// actually receive instead of re-deriving the fold. Nil for a flat item.
+	//
+	// Text stays the single physical line — the reservation identity — so
+	// nothing that keys off an item's text is affected by this field.
+	Detail []string
 }
 
 // ParseChecklist returns every checklist item in content, in file order,
 // numbered from 1. Non-item lines (headers, prose, blanks) are skipped for
 // numbering and left untouched by the mutation helpers below.
 func ParseChecklist(content string) []ChecklistItem {
+	lines := strings.Split(content, "\n")
 	var items []ChecklistItem
-	for lineNo, line := range strings.Split(content, "\n") {
+	for lineNo, line := range lines {
 		m := checklistItemRE.FindStringSubmatch(line)
 		if m == nil {
 			continue
@@ -403,6 +422,10 @@ func ParseChecklist(content string) []ChecklistItem {
 			Mark:   m[2],
 			Done:   m[2] != " ",
 			Text:   strings.TrimSpace(m[3]),
+			// The same lines FoldTaskContent delivers, resolved here once so
+			// every reader (TUI rows and detail overlay, `hap task list`/`get`)
+			// shows the folded task without re-parsing the file.
+			Detail: nestedContinuationLines(lines, lineNo),
 		})
 	}
 	return items

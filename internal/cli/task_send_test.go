@@ -119,6 +119,41 @@ func TestTaskSendConfirmation(t *testing.T) {
 	}
 }
 
+// TestTaskSendConfirmationCountsNestedDetail pins that the y/N prompt names the
+// nested sub-items that will be delivered with the task. The send folds them
+// into the outbound prompt, so a confirmation showing only the title would take
+// a "y" for more than it displayed.
+func TestTaskSendConfirmationCountsNestedDetail(t *testing.T) {
+	app, h, path := sendTestApp(t, "idle")
+	if err := os.WriteFile(path, []byte("- [ ] alpha\n  - wire it\n  - test it\n- [ ] flat\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := stdin
+	t.Cleanup(func() { stdin = old })
+
+	stdin = strings.NewReader("n\n")
+	out, err := runSend(t, app, "w1:p1", "send", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "(alpha (+2 detail lines)) to w1:p1? [y/N]") {
+		t.Errorf("confirmation must count the detail that rides along, got %q", out)
+	}
+	// A flat task's prompt stays clean — a "(+0)" would be noise that trains
+	// operators to stop reading the marker.
+	stdin = strings.NewReader("n\n")
+	out, err = runSend(t, app, "w1:p1", "send", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "(flat) to w1:p1? [y/N]") {
+		t.Errorf("a flat task needs no marker, got %q", out)
+	}
+	if len(h.sent) != 0 {
+		t.Errorf("both sends were declined, got %v", h.sent)
+	}
+}
+
 func TestOneLineTextRuneSafe(t *testing.T) {
 	got := oneLineText(strings.Repeat("계획", 40), 10)
 	if r := []rune(got); len(r) != 10 || !strings.HasSuffix(got, "…") {
