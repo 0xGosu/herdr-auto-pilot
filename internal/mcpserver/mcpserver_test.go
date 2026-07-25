@@ -566,3 +566,156 @@ func TestMCPSubmitNoopNormalized(t *testing.T) {
 		t.Fatalf("tools/list should document @noop: %s", text)
 	}
 }
+
+// A SIGTERM (Ctrl+C, or the LLM CLI being killed) must end the server. Run
+// used to block in a stdin Scan that the signal could not interrupt, so
+// `hap mcp` ignored the signal entirely and lingered holding the SQLite
+// handle open.
+func TestMCPRunReturnsOnContextCancel(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// A pipe with no writer models the real thing: the parent CLI holds our
+	// stdin open, so nothing will ever close it for us.
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	outR, outW := io.Pipe()
+	go io.Copy(io.Discard, outR)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- (&Server{Store: st}).Run(ctx, inR, outW) }()
+
+	cancel()
+	select {
+	case err := <-done:
+		// nil, not ctx.Err(): a signal is a normal end of service, and a
+		// non-nil error would exit the process non-zero with an "error:" line.
+		if err != nil {
+			t.Fatalf("Run after cancel = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the context was cancelled")
+	}
+}
+
+// Cancellation lands between frames, so a tool call already running when the
+// signal arrives still completes — an operator decision that reached
+// submit_decision must not be lost to a SIGTERM racing the write.
+func TestMCPInFlightSubmitSurvivesCancel(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	const reqID = "req-inflight"
+	if _, err := st.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: reqID, Signature: "idle:aaaa", SituationType: domain.SituationIdle,
+		AgentType: "claude", ContextJSON: "{}", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	outR, outW := io.Pipe()
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- (&Server{Store: st, DefaultRequestID: reqID}).Run(runCtx, inR, outW) }()
+
+	req, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{
+			"name": "submit_decision",
+			"arguments": map[string]any{
+				"recommend_action": "proceed", "confident_score": 90, "rationale": "test",
+			},
+		},
+	})
+	if _, err := inW.Write(append(req, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	sc := bufio.NewScanner(outR)
+	if !sc.Scan() {
+		t.Fatal("no response to submit_decision")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+
+	dec, err := st.LLMDecisionByRequest(ctx, reqID)
+	if err != nil {
+		t.Fatalf("read staged decision: %v", err)
+	}
+	if dec == nil {
+		t.Fatal("the submitted decision was not persisted")
+	}
+}
+
+// A client that dies mid-reply closes our stdout. That is teardown, not a
+// failure worth a non-zero exit.
+func TestMCPRunTreatsClosedStdoutAsCleanEnd(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	outR, outW := io.Pipe()
+	// Close the read end so the very first write fails with ErrClosedPipe.
+	outR.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- (&Server{Store: st}).Run(context.Background(), inR, outW) }()
+	fmt.Fprintln(inW, `{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run with a closed stdout = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after stdout closed")
+	}
+}
+
+// The shutdown grace must apply ONLY once a signal has landed. Bounding every
+// tool call would newly cap submit_decision, and a write merely contending
+// with the daemon (the store's busy timeout is 5s) would then fail with
+// "context deadline exceeded" — dropping exactly the decision this change
+// exists to preserve.
+func TestDispatchContextBoundsOnlyAfterCancel(t *testing.T) {
+	live := context.Background()
+	got, cancel := dispatchContext(live)
+	cancel()
+	if _, ok := got.Deadline(); ok {
+		t.Error("an ordinary call must not gain a deadline")
+	}
+	if got != live {
+		t.Error("an ordinary call must run under the caller's own context")
+	}
+
+	cancelled, stop := context.WithCancel(context.Background())
+	stop()
+	got, cancel = dispatchContext(cancelled)
+	defer cancel()
+	if got.Err() != nil {
+		t.Error("a call dispatched after cancel must run on a LIVE context, not the cancelled one")
+	}
+	deadline, ok := got.Deadline()
+	if !ok {
+		t.Fatal("a call dispatched after cancel must be separately bounded")
+	}
+	if remaining := time.Until(deadline); remaining <= 5*time.Second {
+		t.Errorf("grace = %v, want comfortably more than the store's 5s busy timeout", remaining)
+	}
+}

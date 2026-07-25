@@ -93,13 +93,15 @@ func buildCommands() {
 			Name:    "daemon",
 			Group:   groupCore,
 			Summary: "run the monitoring daemon (the process that watches agents and answers them)",
-			Usage:   []string{"hap daemon", "hap daemon --ensure"},
+			Usage:   []string{"hap daemon", "hap daemon --ensure", "hap daemon --ensure --replace-only"},
 			Flags: []FlagDoc{
-				{Name: "--ensure", Desc: "start a daemon only if none is running; replace one left by an older binary (this is what herdr's event hook runs, and how you pick up a rebuild)"},
+				{Name: "--ensure", Desc: "start a daemon only if none is running; replace one left by an older binary or a binary at a different path (this is what herdr's event hook runs, and how you pick up a rebuild)"},
+				{Name: "--replace-only", Desc: "with --ensure: replace a running daemon, but never start one when none is running (used by the plugin install step, so installing hap does not bring a daemon up as a side effect)"},
 			},
 			Details: "Without --ensure the daemon runs in the foreground and holds the state-dir lock.\n" +
 				"Exactly one daemon may run per state dir. After upgrading or rebuilding hap, run\n" +
-				"`hap daemon --ensure` — `hap status` reports a daemon from an older binary as STALE.",
+				"`hap daemon --ensure` — `hap status` reports a daemon from an older binary as STALE,\n" +
+				"and one whose own binary an upgrade removed as BINARY REMOVED.",
 			Examples: []string{"hap daemon --ensure", "hap status"},
 			Next: []Hint{
 				{Cmd: "hap status", Why: "confirm the daemon is running and healthy"},

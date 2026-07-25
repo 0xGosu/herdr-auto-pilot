@@ -59,6 +59,17 @@ type Health struct {
 	// daemons and whenever the engine offers no diagnostics — readers must
 	// treat it as optional and fall back to the bare Embedder state.
 	EmbedderDiag *EmbedderDiag `json:"embedder_diag,omitempty"`
+	// ExePath is the binary this daemon is running as. A plugin upgrade
+	// installs the new release beside the old one and unlinks it, so this
+	// path can stop existing under a perfectly live process — at which point
+	// every child it spawns from that path (the MCP server the LLM CLI
+	// launches, the embed worker) fails. Absent on older daemons.
+	ExePath string `json:"exe_path,omitempty"`
+	// BinaryReplaced records that ExePath has gone away and no successor
+	// could be found to hand off to. The daemon keeps running (something
+	// monitoring beats nothing), but it is degraded in a way only
+	// `hap daemon --ensure` from a fresh binary can fix.
+	BinaryReplaced bool `json:"binary_replaced,omitempty"`
 }
 
 // EmbedderDiag is the heartbeat's copy of embedder.Diagnostics. It lives here

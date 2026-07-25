@@ -246,6 +246,42 @@ func TestAssessVersionStale(t *testing.T) {
 	}
 }
 
+// A daemon whose own binary was removed by an upgrade is alive and beating,
+// but cannot spawn the MCP server or the embed worker — so it outranks STALE
+// and is an error, not a warning.
+func TestAssessBinaryReplaced(t *testing.T) {
+	app := appWithDaemon(t, true, 100, buildinfo.Version)
+	daemonhealth.Write(app.StateDir, daemonhealth.Health{
+		PID: 100, Version: buildinfo.Version, HeartbeatAt: time.Now(),
+		Embedder: daemonhealth.EmbedderReady, ExePath: "/gone/bin/hap", BinaryReplaced: true,
+	})
+	h := app.AssessDaemonHealth()
+	if !h.BinaryReplaced {
+		t.Fatalf("BinaryReplaced must be read from the heartbeat: %+v", h)
+	}
+	if h.Severity() != DaemonError {
+		t.Errorf("severity = %v, want error — consults cannot run at all", h.Severity())
+	}
+	if !strings.Contains(h.Banner(), "BINARY REMOVED") ||
+		!strings.Contains(h.Banner(), "hap daemon --ensure") {
+		t.Errorf("banner = %q, want the removed-binary condition and its remedy", h.Banner())
+	}
+}
+
+// A healthy daemon must not be flagged, so the heartbeat's absence of the
+// field is not read as a problem.
+func TestAssessBinaryReplacedAbsentOnHealthyDaemon(t *testing.T) {
+	app := appWithDaemon(t, true, 100, buildinfo.Version)
+	daemonhealth.Write(app.StateDir, daemonhealth.Health{
+		PID: 100, Version: buildinfo.Version, HeartbeatAt: time.Now(),
+		Embedder: daemonhealth.EmbedderReady, ExePath: "/live/bin/hap",
+	})
+	h := app.AssessDaemonHealth()
+	if h.BinaryReplaced || h.Severity() != DaemonOK {
+		t.Errorf("healthy daemon flagged: %+v (severity %v)", h, h.Severity())
+	}
+}
+
 func TestAssessVersionStaleWithoutStateDir(t *testing.T) {
 	// Version-staleness must be detectable from DaemonInfo alone (no state dir),
 	// since it only compares the lock's recorded version to this binary.

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 )
 
 // Client is the production EmbedderPort: it runs the CGO embedder engine
@@ -108,7 +109,7 @@ func (w *worker) shutdown() {
 func (c *Client) spawn() (*worker, error) {
 	exe := c.execPath
 	if exe == "" {
-		e, err := os.Executable()
+		e, err := selfpath.Resolve()
 		if err != nil {
 			return nil, fmt.Errorf("resolve hap binary for embed worker: %w", err)
 		}

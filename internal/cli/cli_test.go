@@ -182,6 +182,31 @@ func TestStatusShowsDaemonLine(t *testing.T) {
 	}
 }
 
+// A daemon whose binary an upgrade removed still beats, so nothing else in
+// status would show it — yet its LLM consults all come back empty. It must be
+// named, given the remedy, and exit non-zero for scripted checks.
+func TestStatusRemovedBinaryIsUnhealthy(t *testing.T) {
+	app, _ := testApp(t)
+	stateDir := t.TempDir()
+	app.StateDir = stateDir
+	app.DaemonInfo = func() (bool, int, string) { return true, 4242, buildinfo.Version }
+	if err := daemonhealth.Write(stateDir, daemonhealth.Health{
+		PID: 4242, Version: buildinfo.Version, HeartbeatAt: time.Now(),
+		Embedder: daemonhealth.EmbedderReady,
+		ExePath:  "/removed/bin/hap", BinaryReplaced: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "status")
+	if !errors.Is(err, cli.ErrUnhealthy) {
+		t.Errorf("status error = %v, want ErrUnhealthy", err)
+	}
+	if !strings.Contains(out, "BINARY REMOVED") || !strings.Contains(out, "hap daemon --ensure") {
+		t.Errorf("status must name the removed binary and its remedy, got:\n%s", out)
+	}
+}
+
 func TestStatusHungDaemonUnhealthy(t *testing.T) {
 	app, _ := testApp(t)
 	stateDir := t.TempDir()

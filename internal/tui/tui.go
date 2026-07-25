@@ -1084,7 +1084,7 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 	items = append(items, ruleItem{
 		kind:  "shortcut",
 		key:   "install-hap",
-		label: "Create /usr/local/bin/hap symlink to this running binary",
+		label: shortcutLabel(hapShortcutState()),
 	})
 	return items
 }
@@ -3863,15 +3863,18 @@ func (m Model) activateSelectedConfig() (tea.Model, tea.Cmd) {
 	if install == nil {
 		install = installHAPShortcut
 	}
+	// Read the state once, here, so the prompt and the result message agree
+	// with each other and with the row the operator selected.
+	state := hapShortcutState()
 	m.message = ""
 	m.confirm = &confirmation{
-		label: "Create /usr/local/bin/hap symlink to the currently running hap binary? [Y/n]",
+		label: shortcutConfirm(state),
 		onConfirm: func() tea.Cmd {
 			return func() tea.Msg {
 				if err := install(); err != nil {
 					return actionResultMsg{err: err}
 				}
-				return actionResultMsg{message: "created /usr/local/bin/hap symlink"}
+				return actionResultMsg{message: shortcutResult(state)}
 			}
 		},
 	}

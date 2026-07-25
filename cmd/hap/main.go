@@ -30,6 +30,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/mcpserver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/tui"
 )
@@ -167,9 +168,34 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 }
 
 func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
-	ensure := len(args) > 0 && args[0] == "--ensure"
+	// Flags are parsed as a SET, not by position: `hap daemon --replace-only
+	// --ensure` used to fall through to the foreground daemon, which acquires
+	// the lock and blocks forever — inside scripts/install.sh that would hang
+	// `herdr plugin install`. An unrecognized flag is an error for the same
+	// reason: silently running a foreground daemon is the worst possible
+	// interpretation of a typo.
+	var ensure, replaceOnly bool
+	for _, arg := range args {
+		switch arg {
+		case "--ensure":
+			ensure = true
+		case "--replace-only":
+			// --replace-only swaps a running stale daemon but never starts
+			// one. It is what scripts/install.sh calls after fetching a new
+			// binary: an upgrade must hand the herd over to the new build
+			// immediately, yet the plugin BUILD step must not bring a daemon
+			// up on a fresh install (or in CI, where nothing asked for a
+			// monitor at all).
+			replaceOnly = true
+		default:
+			return fmt.Errorf("unknown flag for `hap daemon`: %s (see: hap help daemon)", arg)
+		}
+	}
+	if replaceOnly && !ensure {
+		return fmt.Errorf("--replace-only only applies to `hap daemon --ensure`")
+	}
 	if ensure {
-		return ensureDaemon(paths)
+		return ensureDaemon(paths, replaceOnly)
 	}
 
 	if _, err := logging.Setup(paths.StateDir, os.Getenv("HAP_DEBUG") == "1"); err != nil {
@@ -309,6 +335,29 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		EmbedderFactory:   embedderFactory,
 		MatchIndexDir:     filepath.Join(paths.StateDir, "match-index"),
 		StateDir:          paths.StateDir,
+		// Hand the herd to the binary that replaced ours (plugin upgrade)
+		// instead of soldiering on with children we can no longer spawn.
+		//
+		// --ensure, not a bare `daemon`: we are still holding the lock when
+		// the successor starts, and a bare daemon would fail its single
+		// Acquire and die. --ensure sees a stale holder, waits for it to
+		// release, and only then takes over — which is exactly the handover
+		// we are performing.
+		HandOff: func(exePath string) error {
+			// The successor's own first act is this same crash-loop check, and
+			// a latched breaker makes it log "respawn suppressed" and exit 0 —
+			// after our cmd.Start() has already returned nil. The daemon would
+			// then read a spawn that succeeded, step aside, and leave the herd
+			// with nothing running (and `hap daemon --ensure` suppressed too).
+			// Refusing here keeps this daemon up instead.
+			if g, ok := crashguard.Read(paths.StateDir); ok {
+				cfg, _ := config.Load(paths.File())
+				if blocked, _, reason := crashguard.SpawnBlocked(g, embeddingDigest(cfg)); blocked {
+					return fmt.Errorf("crash-loop breaker would suppress the replacement daemon: %s", reason)
+				}
+			}
+			return spawnDaemon(paths, exePath, "daemon", "--ensure")
+		},
 	})
 	if err != nil {
 		return err
@@ -327,7 +376,7 @@ func embeddingDigest(cfg config.Config) string {
 	return fmt.Sprintf("%+v", cfg.Embedding)
 }
 
-func ensureDaemon(paths config.Paths) error {
+func ensureDaemon(paths config.Paths, replaceOnly bool) error {
 	// Crash-loop hard stop: after we've given up (still looping even with the
 	// embedder off), decline to respawn until the [embedding] config changes —
 	// this is what actually ends the storm herdr's per-event --ensure would
@@ -344,29 +393,61 @@ func ensureDaemon(paths config.Paths) error {
 			_ = crashguard.Write(paths.StateDir, cleared)
 		}
 	}
-	return daemonlock.EnsureFresh(paths, buildinfo.Version, 3*time.Second, daemonlock.Stop, func() error {
-		self, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		cmd := exec.Command(self, "daemon")
-		cmd.Stdout = nil
-		// Capture the detached daemon's stderr to a file. A native abort in
-		// the embedder (llama.cpp GGML_ASSERT → SIGABRT) prints there and is
-		// invisible to Go recovery; without this it went to /dev/null and the
-		// only crash evidence vanished. Best-effort: a nil file means the
-		// child inherits no stderr (today's behaviour), never a failed launch.
-		if stderrLog := daemonhealth.OpenStderrLog(paths.StateDir); stderrLog != nil {
-			cmd.Stderr = stderrLog
-			defer stderrLog.Close() // the child dup'd the fd at Start
-		}
-		cmd.Stdin = nil
-		daemonlock.Detach(cmd)
-		if err := cmd.Start(); err != nil {
-			return err
-		}
-		return cmd.Process.Release()
+	if replaceOnlyBowsOut(replaceOnly, func() bool {
+		running, _, _ := daemonlock.Info(paths)
+		return running
+	}) {
+		return nil
+	}
+	self, err := selfpath.Resolve()
+	if err != nil {
+		return fmt.Errorf("resolve the hap binary to run as the daemon: %w", err)
+	}
+	return daemonlock.EnsureFresh(paths, buildinfo.Version, self, ensureWaitTimeout, daemonlock.Stop, func() error {
+		return spawnDaemon(paths, self, "daemon")
 	})
+}
+
+// ensureWaitTimeout bounds how long --ensure waits for a stale daemon to
+// release the lock after SIGTERM. It must cover a full teardown — the
+// background drain, the FAISS matcher and SQLite closes — because the
+// upgrade handoff spawns `--ensure` from a daemon that is doing exactly that,
+// and a successor that gives up early leaves the herd unmonitored.
+const ensureWaitTimeout = 10 * time.Second
+
+// replaceOnlyBowsOut reports whether a --replace-only run should do nothing.
+//
+// The gate is here rather than in EnsureFresh's start callback because
+// EnsureFresh also calls start to REPLACE a daemon it just stopped —
+// suppressing that would leave the herd with no monitor at all, the opposite
+// of the intent. It is deliberately a check-then-act: a daemon starting in
+// the gap just means --replace-only ensures one that was already fresh, which
+// is a no-op.
+func replaceOnlyBowsOut(replaceOnly bool, running func() bool) bool {
+	return replaceOnly && !running()
+}
+
+// spawnDaemon launches a detached hap from exePath with the given args.
+// Shared by --ensure and by a running daemon handing off to the binary that
+// replaced it, so both get the same detachment and stderr capture.
+func spawnDaemon(paths config.Paths, exePath string, args ...string) error {
+	cmd := exec.Command(exePath, args...)
+	cmd.Stdout = nil
+	// Capture the detached daemon's stderr to a file. A native abort in
+	// the embedder (llama.cpp GGML_ASSERT → SIGABRT) prints there and is
+	// invisible to Go recovery; without this it went to /dev/null and the
+	// only crash evidence vanished. Best-effort: a nil file means the
+	// child inherits no stderr (today's behaviour), never a failed launch.
+	if stderrLog := daemonhealth.OpenStderrLog(paths.StateDir); stderrLog != nil {
+		cmd.Stderr = stderrLog
+		defer stderrLog.Close() // the child dup'd the fd at Start
+	}
+	cmd.Stdin = nil
+	daemonlock.Detach(cmd)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
 }
 
 // chdirStable moves the daemon onto a directory that outlives it; failure

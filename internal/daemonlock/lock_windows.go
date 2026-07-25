@@ -27,6 +27,11 @@ func (l *Lock) Release() {}
 // start (which then fails in Acquire with the message above).
 func Info(paths config.Paths) (running bool, pid int, version string) { return false, 0, "" }
 
+// info is the path-aware variant EnsureFresh uses; same stub contract.
+func info(paths config.Paths) (running bool, pid int, version, exePath string) {
+	return false, 0, "", ""
+}
+
 // Stop is unreachable on Windows (Info never reports a holder).
 func Stop(pid int) error {
 	return errors.New("the daemon is not yet supported on Windows")

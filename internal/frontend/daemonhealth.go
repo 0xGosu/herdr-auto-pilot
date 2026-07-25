@@ -40,6 +40,12 @@ type DaemonHealth struct {
 	PID          int
 	Version      string
 	VersionStale bool // running a different binary than this one
+	// BinaryReplaced: the running daemon's own executable was removed (a
+	// plugin upgrade installs the new release elsewhere) and it found no
+	// successor to hand the herd to. It is alive and beating, but every child
+	// it spawns by path — the MCP server the LLM CLI launches, the embed
+	// worker — fails, so consults come back empty.
+	BinaryReplaced bool
 	// Hung: a held lock with a stale heartbeat — alive but not progressing.
 	Hung         bool
 	HeartbeatAge time.Duration
@@ -101,6 +107,7 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 				h.EmbedderNote = rec.EmbedderNote()
 			}
 			h.EmbedderDiagLines = rec.EmbedderDiagLines()
+			h.BinaryReplaced = rec.BinaryReplaced
 		}
 	}
 	if g, ok := crashguard.Read(a.StateDir); ok {
@@ -135,7 +142,11 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 // Severity ranks the health for a single-banner/exit-code front-end.
 func (h DaemonHealth) Severity() DaemonSeverity {
 	switch {
-	case h.Hung || h.GaveUp || h.CrashLooping:
+	// BinaryReplaced ranks with the hard failures, not with STALE: a stale
+	// daemon still works (it is merely old), whereas one whose binary is gone
+	// cannot spawn the MCP server or the embed worker at all — every consult
+	// comes back empty, which is indistinguishable from broken automation.
+	case h.Hung || h.GaveUp || h.CrashLooping || h.BinaryReplaced:
 		return DaemonError
 	case h.EmbeddingAutoDisabled || h.EmbedderDegraded || (h.Running && h.VersionStale):
 		return DaemonWarn
@@ -155,6 +166,8 @@ func (h DaemonHealth) Banner() string {
 			h.RecentRestarts, crashguard.Window, h.StderrLog)
 	case h.Hung:
 		return fmt.Sprintf("⚠ DAEMON NOT RESPONDING — no heartbeat for %s; see %s", formatAge(h.HeartbeatAge), h.StderrLog)
+	case h.BinaryReplaced:
+		return "⚠ DAEMON BINARY REMOVED (upgraded underneath it) — LLM consults cannot run; run: hap daemon --ensure"
 	case h.EmbeddingAutoDisabled:
 		return "⚠ semantic matching AUTO-DISABLED by crash-loop breaker — " + h.Reason
 	case h.EmbedderDegraded:

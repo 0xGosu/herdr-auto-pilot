@@ -24,7 +24,9 @@ func TestConfigQuickShortcutsSectionIsLast(t *testing.T) {
 	view := m.View()
 
 	header := strings.LastIndex(view, "Quick Shortcuts")
-	row := strings.LastIndex(view, "Create /usr/local/bin/hap symlink to this running binary")
+	// The row's verb depends on what /usr/local/bin/hap currently holds
+	// (create / repoint / recreate), so match the part that never changes.
+	row := strings.LastIndex(view, "/usr/local/bin/hap symlink")
 	if header < 0 || row < header {
 		t.Fatalf("Quick Shortcuts section or install row missing:\n%s", view)
 	}
@@ -79,7 +81,7 @@ func TestConfigShortcutYesAndDefaultEnterExecute(t *testing.T) {
 				t.Fatal("install command must remain asynchronous until Bubble Tea runs it")
 			}
 			msg, ok := cmd().(actionResultMsg)
-			if !ok || msg.err != nil || msg.message != "created /usr/local/bin/hap symlink" {
+			if !ok || msg.err != nil || !strings.Contains(msg.message, "/usr/local/bin/hap symlink") {
 				t.Fatalf("unexpected shortcut result: %+v", msg)
 			}
 			if runs != 1 || m.confirm != nil {
@@ -170,5 +172,184 @@ func TestEnsureExecutableSymlinkRefusesDifferentLink(t *testing.T) {
 	linked, readErr := os.Readlink(target)
 	if readErr != nil || linked != other {
 		t.Fatalf("existing symlink was changed: target=%q err=%v", linked, readErr)
+	}
+}
+
+// A plugin upgrade installs the new release in a new directory and removes the
+// old one, leaving this shortcut dangling. Refusing to touch it (the original
+// behaviour) left the operator's `hap` command permanently broken with no
+// in-app remedy, so a dead link is now repointed.
+func TestEnsureExecutableSymlinkRepointsDanglingLink(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "new-install", "bin", "hap")
+	if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "hap")
+	if err := os.Symlink(filepath.Join(dir, "removed-install", "bin", "hap"), target); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureExecutableSymlink(source, target); err != nil {
+		t.Fatalf("dangling link should be repointed, got %v", err)
+	}
+	linked, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatalf("repointed link does not resolve: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked != want {
+		t.Fatalf("symlink resolves to %q, want the running binary %q", linked, want)
+	}
+}
+
+// An upgrade can also leave the link pointing at a still-present OLD plugin
+// install. That is a hap we put there, so it is superseded — unlike an
+// unrelated binary, which the refusal test above protects.
+func TestEnsureExecutableSymlinkRepointsPreviousPluginInstall(t *testing.T) {
+	dir := t.TempDir()
+	// Ownership is anchored at THIS machine's install root, so the test has to
+	// place its fake installs inside it.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
+	source := filepath.Join(dir, "config", "herdr", "plugins", "github", "herd-auto-prompter-0.4.51", "bin", "hap")
+	old := filepath.Join(dir, "config", "herdr", "plugins", "github", "herd-auto-prompter-0.4.50", "bin", "hap")
+	for _, path := range []string{source, old} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("binary"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := filepath.Join(dir, "hap")
+	if err := os.Symlink(old, target); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureExecutableSymlink(source, target); err != nil {
+		t.Fatalf("link to a previous plugin install should be repointed, got %v", err)
+	}
+	linked, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked != want {
+		t.Fatalf("symlink resolves to %q, want %q", linked, want)
+	}
+}
+
+// The repoint must never leave the path empty: a shell resolving `hap` while
+// it happens has to see either the old link or the new one.
+func TestRepointSymlinkIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "hap-new")
+	if err := os.WriteFile(source, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "hap")
+	if err := os.Symlink(filepath.Join(dir, "gone"), target); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- repointSymlink(source, target) }()
+	// Poll Lstat throughout: rename(2) replaces the entry in one step, so the
+	// name must resolve at every observation.
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("repointSymlink: %v", err)
+			}
+			if _, err := os.Lstat(target); err != nil {
+				t.Fatalf("target missing after repoint: %v", err)
+			}
+			return
+		default:
+			if _, err := os.Lstat(target); err != nil {
+				t.Fatalf("target disappeared mid-repoint: %v", err)
+			}
+		}
+	}
+}
+
+func TestClassifyShortcut(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "hap-current")
+	other := filepath.Join(dir, "hap-other")
+	for _, path := range []string{source, other} {
+		if err := os.WriteFile(path, []byte("binary"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := func(t *testing.T, name, dest string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.Symlink(dest, path); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	plainFile := filepath.Join(dir, "not-a-link")
+	if err := os.WriteFile(plainFile, []byte("keep me"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		target  string
+		want    shortcutState
+		wantErr bool
+	}{
+		{"absent", filepath.Join(dir, "nothing-here"), shortcutAbsent, false},
+		{"already ours", link(t, "current-link", source), shortcutCurrent, false},
+		{"dangling", link(t, "dead-link", filepath.Join(dir, "removed")), shortcutStale, false},
+		{"live foreign binary", link(t, "foreign-link", other), shortcutForeign, true},
+		{"regular file", plainFile, shortcutForeign, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := classifyShortcut(source, tt.target)
+			if got != tt.want {
+				t.Errorf("classifyShortcut = %v, want %v", got, tt.want)
+			}
+			if (err != nil) != tt.wantErr {
+				t.Errorf("classifyShortcut err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestShortcutLabelsMatchState(t *testing.T) {
+	tests := []struct {
+		state      shortcutState
+		wantLabel  string
+		wantResult string
+	}{
+		{shortcutAbsent, "Create", "created"},
+		{shortcutCurrent, "Recreate", "created"},
+		{shortcutStale, "Repoint", "repointed"},
+		{shortcutForeign, "Create", "created"},
+	}
+	for _, tt := range tests {
+		if got := shortcutLabel(tt.state); !strings.HasPrefix(got, tt.wantLabel) {
+			t.Errorf("shortcutLabel(%v) = %q, want it to start with %q", tt.state, got, tt.wantLabel)
+		}
+		if got := shortcutResult(tt.state); !strings.HasPrefix(got, tt.wantResult) {
+			t.Errorf("shortcutResult(%v) = %q, want it to start with %q", tt.state, got, tt.wantResult)
+		}
+		if got := shortcutConfirm(tt.state); !strings.HasSuffix(got, "[Y/n]") {
+			t.Errorf("shortcutConfirm(%v) = %q, want a Y/n prompt", tt.state, got)
+		}
 	}
 }

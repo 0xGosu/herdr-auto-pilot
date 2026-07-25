@@ -19,6 +19,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 )
 
 // fastFailWindow bounds how quickly a CLI run must error out to count as a
@@ -50,7 +51,7 @@ type Adapter struct {
 	// fast-fail retry, so a rescue run never gets the other command's keys.
 	CommandEnv      EnvSpec
 	CommandStartEnv EnvSpec
-	// SelfPath overrides the {self} placeholder (defaults to os.Executable).
+	// SelfPath overrides the {self} placeholder (defaults to selfpath.Resolve).
 	SelfPath string
 	// TaskGenTemplate is the argv template for the one-shot idle task
 	// suggestion (llm.task_generate_command); placeholders {self},
@@ -176,12 +177,15 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 }
 
 // resolveSelf resolves the {self} placeholder: the configured override, else
-// this binary's path.
+// a LIVE hap binary. It must be live, not merely the path this process
+// started from: {self} is what the LLM CLI spawns as the MCP server, and after
+// a plugin upgrade the old path is gone — the CLI would silently come up with
+// no get_context/submit_decision at all.
 func (a *Adapter) resolveSelf() (string, error) {
 	if a.SelfPath != "" {
 		return a.SelfPath, nil
 	}
-	self, err := os.Executable()
+	self, err := selfpath.Resolve()
 	if err != nil {
 		return "", fmt.Errorf("resolve self path: %w", err)
 	}
