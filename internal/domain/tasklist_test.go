@@ -3,6 +3,7 @@ package domain
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -449,9 +450,44 @@ func TestParseChecklist(t *testing.T) {
 		t.Fatalf("ParseChecklist returned %d items, want %d: %+v", len(items), len(want), items)
 	}
 	for i := range want {
-		if items[i] != want[i] {
+		if !reflect.DeepEqual(items[i], want[i]) {
 			t.Errorf("item %d = %+v, want %+v", i, items[i], want[i])
 		}
+	}
+}
+
+// TestParseChecklistCarriesNestedDetail pins that a parsed item carries the
+// SAME nested lines the delivery path folds in — the listing and detail views
+// read Detail, so a drift here would put different text on screen than the
+// agent receives.
+func TestParseChecklistCarriesNestedDetail(t *testing.T) {
+	content := "- [ ] 1. Build the widget\n" +
+		"  - Wire the API\n" +
+		"  - Acceptance Criteria:\n" +
+		"    - it renders\n" +
+		"  - _Complexity: Medium_\n" +
+		"- [ ] 2. Flat task\n"
+	items := ParseChecklist(content)
+	if len(items) != 2 {
+		t.Fatalf("got %d items, want 2", len(items))
+	}
+	wantDetail := []string{"  - Wire the API", "  - Acceptance Criteria:",
+		"    - it renders", "  - _Complexity: Medium_"}
+	if !reflect.DeepEqual(items[0].Detail, wantDetail) {
+		t.Errorf("Detail = %q, want %q", items[0].Detail, wantDetail)
+	}
+	if items[1].Detail != nil {
+		t.Errorf("a flat item must carry no detail, got %q", items[1].Detail)
+	}
+	// The folded rendering is byte-identical to what the send path delivers —
+	// the invariant that lets a display path render from Detail instead of
+	// re-folding the file.
+	if got, want := FoldedTaskText(items[0].Text, items[0].Detail),
+		FoldTaskContent(content, items[0].Text); got != want {
+		t.Errorf("FoldedTaskText = %q, want the delivered fold %q", got, want)
+	}
+	if got := FoldedTaskText(items[1].Text, items[1].Detail); got != items[1].Text {
+		t.Errorf("flat item folds to %q, want %q", got, items[1].Text)
 	}
 }
 

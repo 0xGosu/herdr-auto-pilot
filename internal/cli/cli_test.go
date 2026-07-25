@@ -1246,6 +1246,63 @@ func TestTaskListStatusFilterPreservesNumbers(t *testing.T) {
 	}
 }
 
+// TestTaskListMarksNestedDetailAndGetPrintsIt pins the display half of task
+// folding: a task's nested sub-items ride along to the agent in the delivered
+// prompt, so a listing that showed only the title read as if the title WERE the
+// whole task. `list` now counts them and `get` prints them.
+func TestTaskListMarksNestedDetailAndGetPrintsIt(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] build the widget\n"+
+		"  - wire the API\n"+
+		"  - Acceptance Criteria:\n"+
+		"    - it renders\n"+
+		"- [ ] flat task\n")
+
+	out, err := run(t, app, "task", "--path", path, "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "#1\t[ ]\tbuild the widget (+3 detail lines)") {
+		t.Errorf("list must mark the nested detail, got:\n%s", out)
+	}
+	// A flat task gets no marker — the count would be a lie and the noise
+	// would train operators to ignore it.
+	if !strings.Contains(out, "#2\t[ ]\tflat task\n") {
+		t.Errorf("a flat task must carry no detail marker, got:\n%s", out)
+	}
+	// The list stays one row per task: the detail is counted, never inlined.
+	if strings.Contains(out, "wire the API") {
+		t.Errorf("list must not inline the detail lines, got:\n%s", out)
+	}
+
+	out, err = run(t, app, "task", "--path", path, "get", "#1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"build the widget", "  - wire the API",
+		"  - Acceptance Criteria:", "    - it renders"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("get must print the nested detail line %q, got:\n%s", want, out)
+		}
+	}
+	// get prints the lines, so it must not also announce them, and it must not
+	// bleed the sibling task in.
+	if strings.Contains(out, "detail lines)") {
+		t.Errorf("get prints the detail, so it must not also count it:\n%s", out)
+	}
+	if strings.Contains(out, "flat task") {
+		t.Errorf("get #1 leaked the sibling task:\n%s", out)
+	}
+
+	out, err = run(t, app, "task", "--path", path, "get", "#2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "wire the API") {
+		t.Errorf("get on a flat task must print no detail, got:\n%s", out)
+	}
+}
+
 // TestTaskInProgressMarkerFaithful pins that an in-progress "[-]" item (what
 // this codebase's generated-task flow writes for the active task) renders as
 // "[-]", not "[x]", and is treated as not-pending by the filters.

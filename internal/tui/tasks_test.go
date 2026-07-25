@@ -665,6 +665,114 @@ func TestTaskDetailViewOpensAndCloses(t *testing.T) {
 	}
 }
 
+// TestTaskRowCountsNestedDetailAndDetailShowsIt pins the display half of task
+// folding: a task's nested sub-items ride along to the agent in the delivered
+// prompt, so a row showing only the title read as if the title WERE the whole
+// task. The row now counts them and "v" shows them in full.
+func TestTaskRowCountsNestedDetailAndDetailShowsIt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] build the widget\n"+
+		"  - wire the API\n"+
+		"  - Acceptance Criteria:\n"+
+		"    - it renders\n"+
+		"- [ ] flat task\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{{Agent: "brave-otter", Path: path}}
+	m := Model{width: 100, height: 30}
+	upd, _ := m.Update(refreshMsg{
+		cfg:   cfg,
+		tasks: []frontend.TaskGroup{{Source: cfg.TaskSources[0], Index: 0, Items: mustParse(t, path)}},
+	})
+	m = upd.(Model)
+	m.tab = tabTasks
+
+	view := m.View()
+	if !strings.Contains(view, "build the widget (+3)") {
+		t.Errorf("row must count the nested detail:\n%s", view)
+	}
+	// A flat task gets no marker, and the list stays one row per task.
+	if strings.Contains(view, "flat task (+") {
+		t.Errorf("a flat task must carry no detail marker:\n%s", view)
+	}
+	if strings.Contains(view, "wire the API") {
+		t.Errorf("rows must not inline the detail lines:\n%s", view)
+	}
+
+	m = press(t, m, "down", "v")
+	if m.detail == nil || m.detail.task == nil {
+		t.Fatal("v on an item row should open the task detail")
+	}
+	view = m.View()
+	for _, want := range []string{"build the widget", "wire the API",
+		"Acceptance Criteria:", "it renders"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("task detail missing folded line %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "flat task") {
+		t.Errorf("the detail overlay leaked the sibling task:\n%s", view)
+	}
+}
+
+// TestTaskRowDetailMarkerSurvivesNarrowPane pins the width arithmetic behind
+// the marker: it is budgeted OUT of the title's allowance, so a narrow pane
+// truncates the title and keeps the count rather than dropping the count and
+// leaving a row that reads as the whole task. Rows must also stay one screen
+// line — the accounting listPageSize depends on.
+func TestTaskRowDetailMarkerSurvivesNarrowPane(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(path, []byte(
+		"- [ ] a deliberately long task title that will not fit a narrow pane\n"+
+			"  - wire the API\n"+
+			"  - Acceptance Criteria:\n"+
+			"    - it renders\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{{Agent: "brave-otter", Path: path}}
+	for _, w := range []int{40, 60, 80, 92, 120} {
+		m := Model{width: w, height: 30}
+		upd, _ := m.Update(refreshMsg{
+			cfg:   cfg,
+			tasks: []frontend.TaskGroup{{Source: cfg.TaskSources[0], Index: 0, Items: mustParse(t, path)}},
+		})
+		m = upd.(Model)
+		m.tab = tabTasks
+		rows := m.taskRows()
+		var item *taskRow
+		for i := range rows {
+			if rows[i].item == 1 {
+				item = &rows[i]
+			}
+		}
+		if item == nil {
+			t.Fatalf("width %d: no item row", w)
+		}
+		if !strings.Contains(item.text, "(+3)") {
+			t.Errorf("width %d: the detail count must survive truncation, got %q", w, item.text)
+		}
+		if got := runewidth.StringWidth(item.text); got > m.contentWidth() {
+			t.Errorf("width %d: row is %d cells, exceeds contentWidth %d — it would wrap: %q",
+				w, got, m.contentWidth(), item.text)
+		}
+	}
+}
+
+// mustParse reads a checklist file the way the frontend does, so a test row
+// carries the same Detail the real Tasks tab renders from.
+func mustParse(t *testing.T, path string) []domain.ChecklistItem {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return domain.ParseChecklist(string(b))
+}
+
 func TestTaskDetailEditAction(t *testing.T) {
 	m, _, _ := taskAppModel(t)
 	m = press(t, m, "down", "v")
@@ -989,6 +1097,26 @@ func TestTaskDetailShowsDecodedNewlines(t *testing.T) {
 	if !strings.Contains(view, "write the parser") || !strings.Contains(view, "start with the lexer") ||
 		strings.Contains(view, `parser\nstart`) {
 		t.Errorf("detail should decode stored \\n into real lines:\n%s", view)
+	}
+}
+
+// TestTasksSendConfirmCountsNestedDetail pins that the send confirmation names
+// the nested sub-items that will be delivered with the task — the send folds
+// them into the outbound prompt, so a label naming only the item number would
+// take a "y" for more than it showed.
+func TestTasksSendConfirmCountsNestedDetail(t *testing.T) {
+	m, _, _ := sendTaskModel(t)
+	// Give item #1 the nested detail the file's fold would produce.
+	m.data.tasks[0].Items[0].Detail = []string{"  - wire it", "  - test it"}
+	upd, _ := m.Update(pressKeyMsg("down"))
+	m = upd.(Model)
+	upd, _ = m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	if m.confirm == nil {
+		t.Fatal("enter on an item row should confirm the send")
+	}
+	if !strings.Contains(m.confirm.label, "send task #1 (+2) to") {
+		t.Errorf("confirm label must count the detail that rides along, got %q", m.confirm.label)
 	}
 }
 

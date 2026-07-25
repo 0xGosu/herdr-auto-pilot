@@ -1448,8 +1448,9 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 	// op-specific output above already said what changed. `list` gets the
 	// shorter set: it has just printed domain.TaskManagementHints, which
 	// already covers start/done and how <n> is addressed.
-	// `list` has just printed domain.TaskManagementHints, and `get`/`show` print
-	// a single line a script may capture: both get the short footer.
+	// `list` has just printed domain.TaskManagementHints, and `get`/`show` lead
+	// with a single line a script may capture (its nested detail lines follow):
+	// both get the short footer.
 	listing := len(rest) > 0 && (rest[0] == "list" || rest[0] == "ls" ||
 		rest[0] == "get" || rest[0] == "show")
 	PrintNextSteps(out, taskHints(agent, path, listing))
@@ -1508,6 +1509,15 @@ func taskOp(ctx context.Context, app *frontend.App, out io.Writer, agent, path s
 			return err
 		}
 		fmt.Fprintln(out, formatTask(it))
+		// `get` is the detail view, so it prints the task WHOLE — the nested
+		// sub-items (acceptance criteria, dependencies, notes) that ride along
+		// to the agent in the delivered prompt. `list` only marks that they
+		// exist; this is where you read them. Stored literal `\n` sequences
+		// become real breaks, as the delivery path and the TUI overlay both
+		// render them — otherwise the three would disagree about one task.
+		for _, line := range it.Detail {
+			fmt.Fprintln(out, domain.DecodeTaskNewlines(line))
+		}
 		return nil
 	case "add", "create":
 		text := strings.TrimSpace(strings.Join(rest, " "))
@@ -1639,7 +1649,12 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 		if stdin == os.Stdin && !stdinIsTTY() {
 			return fmt.Errorf("confirmation needs a terminal; rerun as: task %s send %d --yes", agent, idx)
 		}
-		fmt.Fprintf(out, "send task #%d (%s) to %s? [y/N] ", idx, oneLineText(domain.DisplayTaskText(it.Text), 60), agent)
+		// The marker rides along: what gets delivered is the FOLDED task, so a
+		// prompt showing only the title would take a "y" for something larger
+		// than it displayed. This is the one moment the operator authorizes the
+		// send, so it is the last place the count may be omitted.
+		fmt.Fprintf(out, "send task #%d (%s%s) to %s? [y/N] ", idx,
+			oneLineText(domain.DisplayTaskText(it.Text), 60), detailMarker(it), agent)
 		answer := ""
 		if _, err := fmt.Fscanln(stdin, &answer); err != nil {
 			answer = "" // EOF or a bare newline both read as the default No
@@ -1799,6 +1814,22 @@ func formatTask(it domain.ChecklistItem) string {
 	return fmt.Sprintf("#%d\t[%s]\t%s", it.Index, it.Mark, domain.DisplayTaskText(it.Text))
 }
 
+// detailMarker labels an item that carries nested sub-items, so a one-line
+// listing never reads as if the title were the whole task. The count is what
+// `get` prints in full and what the delivered prompt folds in; a flat item gets
+// nothing. Only the LISTING appends it — `get` prints the lines themselves, so
+// announcing them there would be noise.
+func detailMarker(it domain.ChecklistItem) string {
+	n := len(it.Detail)
+	if n == 0 {
+		return ""
+	}
+	if n == 1 {
+		return " (+1 detail line)"
+	}
+	return fmt.Sprintf(" (+%d detail lines)", n)
+}
+
 // printTaskList prints items matching the status filter, numbered by absolute
 // file position (the number never depends on the filter), then a count summary.
 func printTaskList(out io.Writer, items []domain.ChecklistItem, status string) {
@@ -1818,7 +1849,7 @@ func printTaskList(out io.Writer, items []domain.ChecklistItem, status string) {
 		if status == "done" && !it.Done {
 			continue
 		}
-		fmt.Fprintln(out, formatTask(it))
+		fmt.Fprintln(out, formatTask(it)+detailMarker(it))
 		shown++
 	}
 	if shown == 0 {

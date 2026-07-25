@@ -677,6 +677,29 @@ type taskRow struct {
 	item       int    // 1-based checklist item number; 0 = not an item row
 	path       string // the group's checklist file
 	itemText   string // the item's raw (untruncated) text; "" for non-item rows
+	// itemDetail is the item's nested sub-items (acceptance criteria,
+	// dependencies, notes) — the lines the delivered prompt folds in. The row
+	// only COUNTS them (a row is one screen line); the detail overlay prints
+	// them, so "v" shows the task as the agent will actually receive it.
+	itemDetail []string
+}
+
+// taskDetailMarker labels a row whose task carries nested sub-items, so a
+// one-line listing never reads as if the title were the whole task. The count
+// is what "v" (the detail overlay) shows in full and what the delivered prompt
+// folds in; a flat item gets nothing.
+func taskDetailMarker(it domain.ChecklistItem) string {
+	return detailCount(it.Detail)
+}
+
+// detailCount renders the nested-sub-item count as a compact " (+N)" suffix,
+// or "" for a flat task. Shared by the row marker and the send confirmation so
+// the number an operator authorizes is the number they were shown.
+func detailCount(detail []string) string {
+	if len(detail) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (+%d)", len(detail))
 }
 
 // taskMarkKey identifies a checklist item for multi-select. Keyed by group
@@ -751,8 +774,15 @@ func (m Model) taskRows() []taskRow {
 				// takes. itemText below stays RAW — it identifies the line in the
 				// file for edit/send, and must match it byte for byte.
 				shown := domain.DisplayTaskText(it.Text)
+				// A task's nested sub-items ride along to the agent but cannot
+				// fit a one-line row, so the row carries a count and "v" opens
+				// the full text. The marker is budgeted OUT of the title's width
+				// rather than appended after truncation, so it survives a narrow
+				// pane — a row that dropped it would read as the whole task.
+				marker := taskDetailMarker(it)
+				body := max(20, m.contentWidth()-12) - runewidth.StringWidth(marker)
 				rows = append(rows, taskRow{
-					text:       fmt.Sprintf("%s#%d [%s] %s", markCh, it.Index, it.Mark, oneLine(shown, max(20, m.contentWidth()-12))),
+					text:       fmt.Sprintf("%s#%d [%s] %s%s", markCh, it.Index, it.Mark, oneLine(shown, body), marker),
 					fields:     append([]string{fmt.Sprintf("#%d", it.Index), shown, it.Mark}, hfields...),
 					done:       it.Done,
 					inProgress: it.Mark == domain.MarkInProgress,
@@ -760,6 +790,7 @@ func (m Model) taskRows() []taskRow {
 					item:       it.Index,
 					path:       g.Source.Path,
 					itemText:   it.Text,
+					itemDetail: it.Detail,
 				})
 			}
 		}
@@ -2646,8 +2677,10 @@ func (m Model) sendTaskRow(r taskRow) (tea.Model, tea.Cmd) {
 		func(c context.Context) error {
 			return app.SendTaskToAgent(c, paneID, agentType, name, path, template, item, text)
 		})
+	// The count rides along: what gets delivered is the FOLDED task, so a label
+	// naming only the item number would take a "y" for more than it showed.
 	m.confirm = &confirmation{
-		label:     fmt.Sprintf("send task #%d to %s?", item, name),
+		label:     fmt.Sprintf("send task #%d%s to %s?", item, detailCount(r.itemDetail), name),
 		onConfirm: func() tea.Cmd { return send },
 	}
 	return m, nil
@@ -2670,7 +2703,13 @@ func (m Model) taskDetailLines(r taskRow, width int) []string {
 	// Stored literal `\n` sequences render as real line breaks here — the
 	// detail shows the task as the agent will receive it. The id is unescaped
 	// like the list row, so both show the id `hap task done` takes.
-	lines = m.detailField(lines, w, "Text", domain.DecodeTaskNewlines(domain.DisplayTaskText(r.itemText)))
+	//
+	// The item's nested sub-items are folded in exactly as the delivery path
+	// folds them (domain.FoldedTaskText over the SAME lines), so this overlay
+	// is the operator's answer to "what will actually be sent?" — the list row
+	// only counts them.
+	text := domain.FoldedTaskText(domain.DisplayTaskText(r.itemText), r.itemDetail)
+	lines = m.detailField(lines, w, "Text", domain.DecodeTaskNewlines(text))
 	lines = m.detailField(lines, w, "Source file", r.path)
 	if r.group < len(m.data.tasks) {
 		src := m.data.tasks[r.group].Source
