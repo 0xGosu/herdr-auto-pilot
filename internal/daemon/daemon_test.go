@@ -2664,6 +2664,61 @@ func TestIdleTaskGenListModeCapturesRationale(t *testing.T) {
 	}
 }
 
+func TestIdleTaskGenMultipleListsKeepsLastList(t *testing.T) {
+	// A model that reasons out loud often lists the options it weighed before
+	// listing the work it settled on. Only the LAST list is real work: the
+	// superseded one must not become a confirmable task, and must show up in
+	// the rationale instead so the operator can see what was dropped. The
+	// suggestion still carries the RAW text — the confirm path runs the same
+	// parse, so both sides pick the same list.
+	raw := "I weighed two approaches:\n" +
+		"\n" +
+		"- Rewrite the parser from scratch\n" +
+		"- Patch the existing regex\n" +
+		"\n" +
+		"Final tasks:\n" +
+		"\n" +
+		"- Add multi-list handling to the parser\n" +
+		"- Cover it with unit tests"
+	h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return raw, nil
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	h.push("agent-20", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if want := domain.SuggestTaskPrefix + raw; esc[0].Suggestion != want {
+		t.Errorf("suggestion = %q, want %q", esc[0].Suggestion, want)
+	}
+	// The superseded list's items are surfaced as rationale, not as tasks.
+	if !strings.Contains(esc[0].Rationale, "Rewrite the parser from scratch") {
+		t.Errorf("rationale should carry the dropped list, got %q", esc[0].Rationale)
+	}
+	if !strings.Contains(esc[0].Rationale, "ignored 1 other list") {
+		t.Errorf("rationale should note the dropped list, got %q", esc[0].Rationale)
+	}
+	// The accepted list's items are tasks, so they stay out of the rationale.
+	if strings.Contains(esc[0].Rationale, "Add multi-list handling to the parser") {
+		t.Errorf("rationale must not include the accepted list, got %q", esc[0].Rationale)
+	}
+	// What the confirm path would write: only the last list.
+	tasks := domain.NormalizeGeneratedTasks(strings.TrimPrefix(esc[0].Suggestion, domain.SuggestTaskPrefix))
+	want := []string{"Add multi-list handling to the parser", "Cover it with unit tests"}
+	if len(tasks) != len(want) {
+		t.Fatalf("confirm-time tasks = %v, want %v", tasks, want)
+	}
+	for i := range want {
+		if tasks[i] != want[i] {
+			t.Errorf("confirm-time task[%d] = %q, want %q", i, tasks[i], want[i])
+		}
+	}
+}
+
 func TestIdleTaskGenPlainModeHasNoRationaleProse(t *testing.T) {
 	// A plain (no-list) generation ignores nothing, so the success escalation
 	// carries only the bare "[reason]" tag — no extra prose grafted on.

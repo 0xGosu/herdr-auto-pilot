@@ -185,6 +185,12 @@ pane_excerpt_chars = 5000          # pane context included in the consult
 # every other line is kept as the suggestion's rationale (capped, shown on the
 # escalation). Without any list marker, each non-empty line is a task instead —
 # so asking for a markdown list is the reliable way to separate tasks from notes.
+# If the reply holds SEVERAL lists (options the model weighed, then the work it
+# chose), only the LAST list becomes tasks; the others join the rationale. A
+# list ends at a markdown heading, or at prose separated from it by a blank line
+# — prose flush against the bullets, fenced code, and a paragraph between
+# consecutively numbered steps do not split it. So ask for ONE final flat list:
+# a reply that groups its tasks under several headings keeps only the last group.
 # (Renamed from generate_task_command; the old key no longer loads — update it.)
 task_generate_command = [
   "claude", "--model", "opus", "--permission-mode", "auto", "-p",

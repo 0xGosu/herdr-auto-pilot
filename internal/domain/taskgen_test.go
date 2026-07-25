@@ -310,6 +310,288 @@ func TestNormalizeGeneratedTasksWithRationale(t *testing.T) {
 	}
 }
 
+// TestNormalizeGeneratedTasksLastListWins: when the model writes SEVERAL lists
+// — options it weighed, then the work it settled on — only the last one becomes
+// tasks. The superseded lists must not reach the agent's checklist, and must
+// not be lost either: they go to the rationale with their markers, behind an
+// "ignored N other list(s):" note that survives truncation.
+//
+// The split is deliberately conservative: a list is only ended by an ATX
+// heading, or by prose that a BLANK LINE separates from it. Prose flush against
+// a list, a bare blank line, and indented continuation lines all keep one list
+// intact — those cases are pinned here so a future widening cannot silently
+// start dropping real tasks.
+func TestNormalizeGeneratedTasksLastListWins(t *testing.T) {
+	tests := []struct {
+		name          string
+		raw           string
+		wantTasks     []string
+		wantRationale string
+	}{
+		{
+			// The motivating shape: a considered-options list, then the real
+			// task list, separated by a blank line and a lead-in.
+			"second list supersedes the first",
+			"I considered these approaches:\n\n" +
+				"- Rewrite the parser\n" +
+				"- Patch the regex\n\n" +
+				"Final tasks:\n\n" +
+				"- [ ] Add multi-list handling\n" +
+				"- [ ] Cover it with tests",
+			[]string{"Add multi-list handling", "Cover it with tests"},
+			"ignored 1 other list: I considered these approaches: - Rewrite the parser - Patch the regex Final tasks:",
+		},
+		{
+			// A heading always ends a list, even with no blank line before it.
+			"heading splits without a blank line",
+			"- Draft option A\n" +
+				"## Tasks\n" +
+				"- [ ] Do the real work",
+			[]string{"Do the real work"},
+			"ignored 1 other list: - Draft option A ## Tasks",
+		},
+		{
+			// Prose flush against the bullets is an interruption, not a new
+			// list — both items stay tasks (guards the pinned behavior in
+			// TestNormalizeGeneratedTasksWithRationale).
+			"prose without a blank line does not split",
+			"Because the suite is red:\n- Fix the parser\nthen, once green:\n- Add validation",
+			[]string{"Fix the parser", "Add validation"},
+			"Because the suite is red: then, once green:",
+		},
+		{
+			// A blank line alone is a loose Markdown list, still one list.
+			"blank line alone does not split",
+			"- First task\n\n- Second task",
+			[]string{"First task", "Second task"},
+			"",
+		},
+		{
+			// An indented continuation line under an item must not split its
+			// list, even with a blank line before it.
+			"indented continuation does not split",
+			"- First task\n" +
+				"\n" +
+				"    extra detail about the first task\n" +
+				"- Second task",
+			[]string{"First task", "Second task"},
+			"extra detail about the first task",
+		},
+		{
+			// A trailing bodyless block ("- - -") is never task-bearing, so the
+			// real list above it still wins — and the rule text stays out of
+			// the rationale as a list artifact.
+			"bodyless trailing block never wins",
+			"- Real task one\n- Real task two\n\nWrap up.\n\n- - -",
+			[]string{"Real task one", "Real task two"},
+			"Wrap up.",
+		},
+		{
+			// A fenced command between items is DATA, not a section break: the
+			// list must survive it whole. "go test ./..." is unmarked,
+			// blank-separated and un-indented, so without the fence rule it
+			// would split the list and drop everything above it.
+			"fenced code between items does not split",
+			"Tasks:\n\n" +
+				"- Run the test suite\n\n" +
+				"```sh\n" +
+				"# install deps first\n" +
+				"go test ./...\n" +
+				"```\n\n" +
+				"- Fix any failures",
+			[]string{"Run the test suite", "Fix any failures"},
+			"Tasks:",
+		},
+		{
+			// A trailing fenced EXAMPLE of the checklist format must not
+			// replace the real list: an unfenced task-bearing block always
+			// outranks a fenced one, wherever it sits.
+			"trailing fenced example never wins",
+			"- [ ] Add multi-list handling\n" +
+				"- [ ] Cover it with tests\n\n" +
+				"Format used:\n\n" +
+				"```md\n" +
+				"- [ ] example item\n" +
+				"```",
+			[]string{"Add multi-list handling", "Cover it with tests"},
+			"ignored 1 other list: Format used: - [ ] example item",
+		},
+		{
+			// A numbered list whose steps carry their own explanation
+			// paragraphs is ONE list: continued numbering ("1." then "2.")
+			// rejoins the runs, so no step is dropped.
+			"paragraph between numbered steps does not split",
+			"1. Fix the flaky auth test\n\n" +
+				"Rationale: the suite is red.\n\n" +
+				"2. Add a retry guard",
+			[]string{"Fix the flaky auth test", "Add a retry guard"},
+			"Rationale: the suite is red.",
+		},
+		{
+			// Restarted numbering is a genuinely new list, so last-wins still
+			// applies to two ordered lists.
+			"restarted numbering is a new list",
+			"Considered:\n\n1. Rewrite it\n\nChosen:\n\n1. Patch it",
+			[]string{"Patch it"},
+			"ignored 1 other list: Considered: 1. Rewrite it Chosen:",
+		},
+		{
+			// ACCEPTED TRADE-OFF, pinned so it cannot drift unnoticed: one task
+			// list grouped under several headings keeps only the final group,
+			// and a trailing "Notes:" list replaces the tasks. Both are visible
+			// to the operator in the rationale on an escalation nothing
+			// auto-accepts.
+			"heading-grouped sections keep only the last group",
+			"## Backend\n\n- [ ] Add the endpoint\n\n## Frontend\n\n- [ ] Wire the form",
+			[]string{"Wire the form"},
+			"ignored 1 other list: ## Backend - [ ] Add the endpoint ## Frontend",
+		},
+		{
+			"trailing notes list supersedes the tasks",
+			"Tasks:\n\n- [ ] Add the endpoint\n- [ ] Wire the form\n\nNotes:\n\n- Requires network access",
+			[]string{"Requires network access"},
+			"ignored 1 other list: Tasks: - [ ] Add the endpoint - [ ] Wire the form Notes:",
+		},
+		{
+			// CRLF output splits into lines carrying a trailing "\r"; the
+			// blank/indent tests tolerate it, so the split lands the same way.
+			"CRLF line endings split the same way",
+			"Options:\r\n\r\n- Rewrite it\r\n\r\nTasks:\r\n\r\n- Patch it\r\n",
+			[]string{"Patch it"},
+			"ignored 1 other list: Options: - Rewrite it Tasks:",
+		},
+		{
+			// Three lists: the note pluralizes and both earlier lists are kept.
+			"three lists keep only the last",
+			"## Rejected\n\n- Option A\n\n## Maybe\n\n- Option B\n\n## Tasks\n\n- [ ] Ship it",
+			[]string{"Ship it"},
+			"ignored 2 other lists: ## Rejected - Option A ## Maybe - Option B ## Tasks",
+		},
+		{
+			// Only the LAST list needs a body: an earlier list of real options
+			// followed by a bodyless marker run must not resurrect the options.
+			"superseded list is dropped even when the last list is short",
+			"Options:\n\n- Rewrite it\n- Patch it\n\nDecision:\n\n1. Patch it now",
+			[]string{"Patch it now"},
+			"ignored 1 other list: Options: - Rewrite it - Patch it Decision:",
+		},
+		{
+			// Single-list output is untouched by the block logic.
+			"single list is unchanged",
+			"Here are the tasks:\n\n- First real task\n- Second real task",
+			[]string{"First real task", "Second real task"},
+			"Here are the tasks:",
+		},
+		{
+			// Plain mode has no lists at all, so nothing is superseded and the
+			// note never appears.
+			"plain mode is unchanged",
+			"First task\n\nSecond task",
+			[]string{"First task", "Second task"},
+			"",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotTasks, gotRationale := NormalizeGeneratedTasksWithRationale(tc.raw)
+			if len(gotTasks) != len(tc.wantTasks) {
+				t.Fatalf("tasks = %v, want %v", gotTasks, tc.wantTasks)
+			}
+			for i := range gotTasks {
+				if gotTasks[i] != tc.wantTasks[i] {
+					t.Errorf("task[%d] = %q, want %q", i, gotTasks[i], tc.wantTasks[i])
+				}
+			}
+			if gotRationale != tc.wantRationale {
+				t.Errorf("rationale = %q, want %q", gotRationale, tc.wantRationale)
+			}
+		})
+	}
+}
+
+// TestLastListBlock exercises the segmentation directly: the caller only ever
+// observes the chosen range through the tasks it yields, so an off-by-one that
+// happens to land on a prose line would pass every end-to-end case.
+func TestLastListBlock(t *testing.T) {
+	tests := []struct {
+		name                             string
+		raw                              string
+		wantStart, wantEnd, wantSuperNum int
+		wantOK                           bool
+	}{
+		{"no list at all", "Just prose\nand more prose", 0, 0, 0, false},
+		{"bodyless markers are not a list", "Do it\n- - -", 0, 0, 0, false},
+		{"single block spans its markers", "Intro:\n- a\n- b\ntrailing prose", 1, 3, 0, true},
+		{"blank inside a block keeps one range", "- a\n\n- b", 0, 3, 0, true},
+		{"two blocks pick the second", "- a\n\nProse:\n\n- b", 4, 5, 1, true},
+		{"heading splits with no blank line", "- a\n## Tasks\n- b", 2, 3, 1, true},
+		{"continued numbering rejoins", "1. a\n\nWhy:\n\n2. b", 0, 5, 0, true},
+		{"unfenced block beats a later fenced one", "- a\n\nFormat:\n\n```\n- b\n```", 0, 1, 1, true},
+		{"a wholly fenced list still wins", "```\n- a\n```", 1, 2, 0, true},
+		{"bodyless trailing block is not a candidate", "- a\n\nProse.\n\n- - -", 0, 1, 0, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			start, end, superseded, ok := lastListBlock(strings.Split(tc.raw, "\n"))
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if start != tc.wantStart || end != tc.wantEnd {
+				t.Errorf("range = [%d,%d), want [%d,%d)", start, end, tc.wantStart, tc.wantEnd)
+			}
+			if superseded != tc.wantSuperNum {
+				t.Errorf("superseded = %d, want %d", superseded, tc.wantSuperNum)
+			}
+		})
+	}
+}
+
+// TestStripNoopGeneratedLinesMergesBlocksItSplits: the sentinel stripper runs
+// BEFORE this parse and only ever deletes lines. Deleting one can merge two
+// blocks but never create a split, so it can only move the parse toward keeping
+// more tasks — the safe direction. Pinned because a stripper that blanked lines
+// instead of removing them would silently start dropping the first list.
+func TestStripNoopGeneratedLinesMergesBlocksItSplits(t *testing.T) {
+	stripped, declined := StripNoopGeneratedLines("- Fix the parser\n\n@noop\n\n- Add tests")
+	if !declined {
+		t.Fatal("the sentinel line must be recognized")
+	}
+	tasks, rationale := NormalizeGeneratedTasksWithRationale(stripped)
+	want := []string{"Fix the parser", "Add tests"}
+	if len(tasks) != len(want) {
+		t.Fatalf("tasks = %v, want %v — removing the sentinel must not split the list", tasks, want)
+	}
+	for i := range want {
+		if tasks[i] != want[i] {
+			t.Errorf("task[%d] = %q, want %q", i, tasks[i], want[i])
+		}
+	}
+	if rationale != "" {
+		t.Errorf("rationale = %q, want empty — one merged list ignores nothing", rationale)
+	}
+}
+
+// TestNormalizeGeneratedTasksSupersededNoteSurvivesTruncation: the drop note
+// leads the rationale, so an operator still sees that a list was discarded even
+// when the ignored text overflows maxGeneratedRationale and the tail is cut.
+func TestNormalizeGeneratedTasksSupersededNoteSurvivesTruncation(t *testing.T) {
+	raw := "- " + strings.Repeat("x", maxGeneratedRationale+50) + "\n\n" +
+		"Real work:\n\n- Do the one real task"
+	tasks, rationale := NormalizeGeneratedTasksWithRationale(raw)
+	if len(tasks) != 1 || tasks[0] != "Do the one real task" {
+		t.Fatalf("tasks = %v, want the single last-list item", tasks)
+	}
+	if !strings.HasPrefix(rationale, supersededListNote(1)) {
+		t.Errorf("rationale must lead with the drop note, got %q", rationale)
+	}
+	if runes := []rune(rationale); len(runes) != maxGeneratedRationale+1 {
+		t.Errorf("rationale rune count = %d, want %d", len(runes), maxGeneratedRationale+1)
+	}
+}
+
 // TestNormalizeGeneratedTasksRationaleCapped: a huge block of ignored prose is
 // truncated to maxGeneratedRationale runes with a trailing ellipsis, so an
 // escalation rationale line stays bounded no matter how much the model wrote.
