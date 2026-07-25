@@ -1211,6 +1211,15 @@ func writeTaskFile(t *testing.T, content string) string {
 	return p
 }
 
+func readTaskFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
 func TestTaskListStatusFilterPreservesNumbers(t *testing.T) {
 	app, _ := testApp(t)
 	path := writeTaskFile(t, "- [ ] one\n- [x] two\n- [ ] three\n")
@@ -1300,6 +1309,128 @@ func TestTaskListMarksNestedDetailAndGetPrintsIt(t *testing.T) {
 	}
 	if strings.Contains(out, "wire the API") {
 		t.Errorf("get on a flat task must print no detail, got:\n%s", out)
+	}
+}
+
+// TestTaskMove covers `hap task move`: the reorder itself, that a task's nested
+// detail travels with it, and that the two kinds of out-of-range destination
+// are reported differently — a relative step off the end is "already there",
+// a typed position that names no task is an error.
+func TestTaskMove(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] alpha\n  - a detail\n  - Acceptance: works\n- [ ] beta\n  - b detail\n- [ ] gamma\n")
+
+	out, err := run(t, app, "task", "--path", path, "move", "#3", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "moved task #3 to position #1") {
+		t.Errorf("move should report the new position, got:\n%s", out)
+	}
+	// The detail blocks followed their own tasks, so each remains foldable.
+	data := readTaskFile(t, path)
+	if want := "- [ ] gamma\n- [ ] alpha\n  - a detail\n  - Acceptance: works\n- [ ] beta\n  - b detail\n"; data != want {
+		t.Errorf("file after move:\ngot  %q\nwant %q", data, want)
+	}
+
+	// Relative steps, including off each end.
+	if out, err = run(t, app, "task", "--path", path, "move", "#1", "up"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "already at the top") {
+		t.Errorf("up at the top should say so, got:\n%s", out)
+	}
+	if out, err = run(t, app, "task", "--path", path, "move", "#3", "down"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "already at the bottom") {
+		t.Errorf("down at the bottom should say so, got:\n%s", out)
+	}
+	// Neither no-op touched the file.
+	if got := readTaskFile(t, path); got != data {
+		t.Errorf("an edge no-op must not rewrite the file:\ngot  %q\nwant %q", got, data)
+	}
+
+	// A position the caller actually typed is validated, never clamped.
+	if _, err := run(t, app, "task", "--path", path, "move", "#1", "99"); err == nil {
+		t.Error("an out-of-range typed position must error")
+	}
+	for _, bad := range []string{"sideways", "+2", "", "2.5"} {
+		if _, err := run(t, app, "task", "--path", path, "move", "#1", bad); err == nil {
+			t.Errorf("destination %q must be rejected", bad)
+		}
+	}
+	if _, err := run(t, app, "task", "--path", path, "move", "#1"); err == nil {
+		t.Error("a missing destination must error")
+	}
+	// The alias resolves to the same op.
+	if _, err := run(t, app, "task", "--path", path, "mv", "#1", "2"); err != nil {
+		t.Errorf("mv alias should work: %v", err)
+	}
+	// The no-op position reports without rewriting the file — taskfile.Mutate
+	// writes unconditionally, so calling through would churn mtime for nothing.
+	before := readTaskFile(t, path)
+	out, err = run(t, app, "task", "--path", path, "move", "#2", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "already at position #2") {
+		t.Errorf("a same-position move should say so, got:\n%s", out)
+	}
+	if got := readTaskFile(t, path); got != before {
+		t.Error("a same-position move must not rewrite the file")
+	}
+}
+
+// TestTaskMoveByDeclaredID pins the documented headline usage: when a checklist
+// numbers its own tasks, the SOURCE is addressed by that id (not its position)
+// while the destination stays a position.
+func TestTaskMoveByDeclaredID(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] 1.1 first\n- [ ] 1.2 second\n  - detail\n- [ ] 1.3 third\n")
+
+	out, err := run(t, app, "task", "--path", path, "move", "1.3", "up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "moved task #3 to position #2") {
+		t.Errorf("an id source should resolve to its position, got:\n%s", out)
+	}
+	if want := "- [ ] 1.1 first\n- [ ] 1.3 third\n- [ ] 1.2 second\n  - detail\n"; readTaskFile(t, path) != want {
+		t.Errorf("file:\ngot  %q\nwant %q", readTaskFile(t, path), want)
+	}
+	// An id that names no task is refused before anything is written.
+	if _, err := run(t, app, "task", "--path", path, "move", "9.9", "1"); err == nil {
+		t.Error("an unknown id must error")
+	}
+}
+
+// TestTaskMoveRefusesNestingRewrite pins that the CLI surfaces the domain's
+// siblings-only refusals rather than silently restructuring the file.
+func TestTaskMoveRefusesNestingRewrite(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] a\n  - [ ] a1\n- [ ] b\n")
+	before := readTaskFile(t, path)
+
+	if _, err := run(t, app, "task", "--path", path, "move", "#1", "3"); err == nil {
+		t.Error("moving a task with nested sub-tasks must error")
+	}
+	if _, err := run(t, app, "task", "--path", path, "move", "#3", "2"); err == nil {
+		t.Error("moving into another item's nesting must error")
+	}
+	if got := readTaskFile(t, path); got != before {
+		t.Errorf("a refused move must not rewrite the file:\ngot  %q\nwant %q", got, before)
+	}
+
+	// Equal indentation is not siblinghood: two sub-tasks under different
+	// parents look alike but swapping them reparents one of them.
+	cousins := writeTaskFile(t, "- [ ] parent A\n  - [ ] a\n- [ ] parent B\n  - [ ] b\n")
+	cousinsBefore := readTaskFile(t, cousins)
+	if _, err := run(t, app, "task", "--path", cousins, "move", "#2", "4"); err == nil {
+		t.Error("moving a sub-task under a different parent must error")
+	}
+	if got := readTaskFile(t, cousins); got != cousinsBefore {
+		t.Errorf("a refused move must not rewrite the file:\ngot  %q\nwant %q", got, cousinsBefore)
 	}
 }
 

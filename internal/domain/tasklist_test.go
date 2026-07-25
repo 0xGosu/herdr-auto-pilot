@@ -740,6 +740,193 @@ func TestDeleteChecklistItemTakesItsNestedDetail(t *testing.T) {
 	}
 }
 
+func TestMoveChecklistItem(t *testing.T) {
+	// Every item carries detail, so a move that dropped or stranded a block
+	// shows up as a wrong ordering AND a wrong fold.
+	const three = "- [ ] alpha\n  - a detail\n- [ ] beta\n  - b detail\n- [ ] gamma\n  - g detail\n"
+	cases := []struct {
+		name     string
+		content  string
+		from, to int
+		want     string
+	}{
+		{"up to the top", three, 3, 1,
+			"- [ ] gamma\n  - g detail\n- [ ] alpha\n  - a detail\n- [ ] beta\n  - b detail\n"},
+		{"down to the bottom", three, 1, 3,
+			"- [ ] beta\n  - b detail\n- [ ] gamma\n  - g detail\n- [ ] alpha\n  - a detail\n"},
+		{"up one", three, 2, 1,
+			"- [ ] beta\n  - b detail\n- [ ] alpha\n  - a detail\n- [ ] gamma\n  - g detail\n"},
+		{"down one", three, 1, 2,
+			"- [ ] beta\n  - b detail\n- [ ] alpha\n  - a detail\n- [ ] gamma\n  - g detail\n"},
+		{"middle stays put", three, 2, 2, three},
+		{"flat list", "- [ ] a\n- [ ] b\n- [ ] c\n", 1, 3, "- [ ] b\n- [ ] c\n- [ ] a\n"},
+		{"prose and headers are not items and stay put",
+			"# Plan\n- [ ] a\nnotes\n- [ ] b\n", 2, 1,
+			"# Plan\n- [ ] b\n- [ ] a\nnotes\n"},
+		{"deeper nesting travels whole",
+			"- [ ] a\n  - criteria:\n    - it renders\n- [ ] b\n", 2, 1,
+			"- [ ] b\n- [ ] a\n  - criteria:\n    - it renders\n"},
+		{"marks are preserved verbatim",
+			"- [x] done\n- [-] wip\n- [ ] todo\n", 3, 1,
+			"- [ ] todo\n- [x] done\n- [-] wip\n"},
+		{"no trailing newline", "- [ ] a\n  - d\n- [ ] b", 2, 1,
+			"- [ ] b\n- [ ] a\n  - d"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := MoveChecklistItem(tc.content, tc.from, tc.to)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("MoveChecklistItem(%d→%d):\ngot  %q\nwant %q", tc.from, tc.to, got, tc.want)
+			}
+		})
+	}
+
+	// Both positions must name a real item — a caller that computed a target off
+	// the end gets an error, never a silent clamp that reorders something else.
+	for _, bad := range [][2]int{{0, 1}, {1, 0}, {4, 1}, {1, 4}, {-1, 2}} {
+		if _, err := MoveChecklistItem(three, bad[0], bad[1]); err == nil {
+			t.Errorf("MoveChecklistItem(%d→%d) must error", bad[0], bad[1])
+		}
+	}
+	if _, err := MoveChecklistItem("no items here\n", 1, 1); err == nil {
+		t.Error("a file with no checklist items must error")
+	}
+}
+
+// TestMoveChecklistItemRefusesToRewriteNesting pins the siblings-only rule. A
+// nested "[ ]" is its own item, not detail, so it neither travels with a parent
+// nor is stepped over — without these refusals a move would strand a parent's
+// sub-tasks at the old position or adopt someone else's nesting at the new one.
+func TestMoveChecklistItemRefusesToRewriteNesting(t *testing.T) {
+	// Moving a parent would leave a1 orphaned under whatever precedes it.
+	parent := "- [ ] a\n  - [ ] a1\n- [ ] b\n"
+	if _, err := MoveChecklistItem(parent, 1, 3); err == nil {
+		t.Error("moving a task with nested sub-tasks must be refused")
+	} else if !strings.Contains(err.Error(), "nested sub-tasks") {
+		t.Errorf("the refusal should name the reason, got %v", err)
+	}
+	// Its own detail is still fine to carry — only sub-TASKS block the move.
+	ok := "- [ ] a\n  - just detail\n- [ ] b\n"
+	if _, err := MoveChecklistItem(ok, 1, 2); err != nil {
+		t.Errorf("plain detail must not block a move: %v", err)
+	}
+
+	// Landing inside another item's nesting would adopt it.
+	nested := "- [ ] a\n  - [ ] a1\n    - a1 detail\n- [ ] b\n"
+	if _, err := MoveChecklistItem(nested, 3, 2); err == nil {
+		t.Error("moving to a different nesting depth must be refused")
+	} else if !strings.Contains(err.Error(), "different parents") {
+		t.Errorf("the refusal should name the reason, got %v", err)
+	}
+
+	// EQUAL DEPTH IS NOT SIBLINGHOOD. Two sub-tasks under different parents are
+	// indented identically, so a depth-only check would let one be moved under
+	// the other's parent — leaving the first parent childless. This is the case
+	// that makes the guard compare parents rather than indentation.
+	cousins := "- [ ] parent A\n  - [ ] a\n- [ ] parent B\n  - [ ] b\n"
+	if _, err := MoveChecklistItem(cousins, 2, 4); err == nil {
+		t.Error("moving a sub-task under a different parent must be refused")
+	} else if !strings.Contains(err.Error(), "different parents") {
+		t.Errorf("the refusal should name the reason, got %v", err)
+	}
+	// The same shape one level deeper, to pin that the parent lookup is not
+	// special-cased to top level.
+	deep := "- [ ] root\n  - [ ] A\n    - [ ] a\n  - [ ] B\n    - [ ] b\n"
+	if _, err := MoveChecklistItem(deep, 3, 5); err == nil {
+		t.Error("nested cousins must be refused too")
+	}
+	// But true siblings under a shared parent still reorder.
+	twins := "- [ ] root\n  - [ ] A\n    - [ ] a1\n    - [ ] a2\n"
+	if got, err := MoveChecklistItem(twins, 4, 3); err != nil {
+		t.Errorf("siblings under a shared parent must reorder: %v", err)
+	} else if want := "- [ ] root\n  - [ ] A\n    - [ ] a2\n    - [ ] a1\n"; got != want {
+		t.Errorf("sibling reorder:\ngot  %q\nwant %q", got, want)
+	}
+	// Refusals never touch the content.
+	for _, c := range []string{parent, nested} {
+		if got, _ := MoveChecklistItem(c, 1, 3); got != "" {
+			t.Errorf("a refused move must return no content, got %q", got)
+		}
+	}
+	// Siblings at the SAME depth still reorder normally.
+	sibs := "- [ ] a\n  - [ ] a1\n  - [ ] a2\n"
+	got, err := MoveChecklistItem(sibs, 3, 2)
+	if err != nil {
+		t.Fatalf("sub-tasks at the same depth must reorder: %v", err)
+	}
+	if want := "- [ ] a\n  - [ ] a2\n  - [ ] a1\n"; got != want {
+		t.Errorf("sibling reorder:\ngot  %q\nwant %q", got, want)
+	}
+}
+
+// TestMoveChecklistItemBlankLines documents what a move does to blank
+// separators: they sit BETWEEN items rather than belonging to one, so a move
+// can leave a blank behind and land the item tight against its new neighbour.
+// Cosmetic and deliberate — carrying them just trades one artifact for another
+// (the blank would then follow the item to the end of the file). Pinned so the
+// behavior is a decision rather than a surprise.
+func TestMoveChecklistItemBlankLines(t *testing.T) {
+	got, err := MoveChecklistItem("- [ ] a\n  - d1\n\n- [ ] b\n", 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "\n- [ ] b\n- [ ] a\n  - d1\n"; got != want {
+		t.Errorf("blank handling changed:\ngot  %q\nwant %q", got, want)
+	}
+	// Whatever the spacing, no line is ever lost or duplicated.
+	for _, c := range []string{"- [ ] a\n\n- [ ] b\n", "- [ ] a\n  - d\n\n\n- [ ] b\n"} {
+		out, err := MoveChecklistItem(c, 1, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a, b := len(strings.Split(c, "\n")), len(strings.Split(out, "\n")); a != b {
+			t.Errorf("move changed the line count for %q: %d → %d", c, a, b)
+		}
+	}
+}
+
+// TestMoveChecklistItemKeepsEveryTasksDetail is the delivery-level invariant:
+// reordering must not change what any task is delivered. It is the operation
+// that would otherwise scramble every task's instructions at once — the moved
+// task arriving bare while its detail is folded into whatever ends up above it.
+func TestMoveChecklistItemKeepsEveryTasksDetail(t *testing.T) {
+	content := "- [ ] alpha\n  - wire the API\n  - Acceptance:\n    - it renders\n" +
+		"- [ ] beta\n  - tag the release\n" +
+		"- [ ] gamma\n  - announce it\n"
+	want := map[string]string{
+		"alpha": "alpha\n  - wire the API\n  - Acceptance:\n    - it renders",
+		"beta":  "beta\n  - tag the release",
+		"gamma": "gamma\n  - announce it",
+	}
+	// Every ordered pair, so no direction or distance is left unchecked.
+	for from := 1; from <= 3; from++ {
+		for to := 1; to <= 3; to++ {
+			out, err := MoveChecklistItem(content, from, to)
+			if err != nil {
+				t.Fatalf("move %d→%d: %v", from, to, err)
+			}
+			items := ParseChecklist(out)
+			if len(items) != 3 {
+				t.Fatalf("move %d→%d lost an item: %+v", from, to, items)
+			}
+			for _, it := range items {
+				if got := FoldTaskContent(out, it.Text); got != want[it.Text] {
+					t.Errorf("move %d→%d: %q folds to %q, want %q",
+						from, to, it.Text, got, want[it.Text])
+				}
+			}
+			// The moved task really is at its requested position.
+			if got := items[to-1].Text; got != ParseChecklist(content)[from-1].Text {
+				t.Errorf("move %d→%d: position %d holds %q, want the moved task",
+					from, to, to, got)
+			}
+		}
+	}
+}
+
 // TestDeleteChecklistItemNeverReparentsDetail is the delivery-level invariant:
 // after removing a task, no surviving task may fold in a line that belonged to
 // the deleted one. Orphaned sub-bullets stay indented deeper than the PRECEDING
