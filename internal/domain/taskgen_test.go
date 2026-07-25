@@ -403,9 +403,9 @@ func TestNormalizeGeneratedTasksLastListWins(t *testing.T) {
 			"Tasks:",
 		},
 		{
-			// A trailing fenced EXAMPLE of the checklist format must not
-			// replace the real list: an unfenced task-bearing block always
-			// outranks a fenced one, wherever it sits.
+			// A trailing fenced EXAMPLE of the checklist format is data, so it
+			// is neither a task nor a superseded "list" — the real list wins
+			// outright and the operator is not told anything was dropped.
 			"trailing fenced example never wins",
 			"- [ ] Add multi-list handling\n" +
 				"- [ ] Cover it with tests\n\n" +
@@ -414,7 +414,57 @@ func TestNormalizeGeneratedTasksLastListWins(t *testing.T) {
 				"- [ ] example item\n" +
 				"```",
 			[]string{"Add multi-list handling", "Cover it with tests"},
-			"ignored 1 other list: Format used: - [ ] example item",
+			"Format used:",
+		},
+		{
+			// A fenced snippet whose lines merely START like list items (a diff
+			// hunk, YAML) must not become tasks, nor make hap claim it dropped
+			// a list.
+			"fenced diff hunk is data, not a list",
+			"Planned diff:\n\n" +
+				"```diff\n" +
+				"- oldCall()\n" +
+				"+ newCall()\n" +
+				"```\n\n" +
+				"Tasks:\n\n" +
+				"- Apply the diff",
+			[]string{"Apply the diff"},
+			"Planned diff: Tasks:",
+		},
+		{
+			// A fence flush against prose on BOTH sides still separates the
+			// lists: a fence is block-level, so the line after it begins a new
+			// paragraph even with no blank line.
+			"fence flush against prose still separates lists",
+			"I weighed two approaches:\n\n" +
+				"- Rewrite the parser\n" +
+				"- Patch the regex\n" +
+				"```sh\n" +
+				"go test ./...\n" +
+				"```\n" +
+				"Final tasks:\n\n" +
+				"- Add multi-list handling\n" +
+				"- Cover it with tests",
+			[]string{"Add multi-list handling", "Cover it with tests"},
+			"ignored 1 other list: I weighed two approaches: - Rewrite the parser - Patch the regex Final tasks:",
+		},
+		{
+			// An UNCLOSED fence makes "inside" a guess, so fence awareness
+			// switches off entirely and plain source order decides. Failing
+			// open matters: trusting the bogus parity would mark the real
+			// trailing list as data and hand back the rejected options.
+			"unbalanced fence falls back to source order",
+			"Options I considered:\n\n" +
+				"- Rewrite the parser\n" +
+				"- Patch the regex\n\n" +
+				"Reproduce with:\n\n" +
+				"```sh\n" +
+				"go test ./...\n\n" +
+				"Final tasks:\n\n" +
+				"- Add a fence-parity guard\n" +
+				"- Add regression tests",
+			[]string{"Add a fence-parity guard", "Add regression tests"},
+			"ignored 1 other list: Options I considered: - Rewrite the parser - Patch the regex Reproduce with: go test ./... Final tasks:",
 		},
 		{
 			// A numbered list whose steps carry their own explanation
@@ -526,13 +576,18 @@ func TestLastListBlock(t *testing.T) {
 		{"two blocks pick the second", "- a\n\nProse:\n\n- b", 4, 5, 1, true},
 		{"heading splits with no blank line", "- a\n## Tasks\n- b", 2, 3, 1, true},
 		{"continued numbering rejoins", "1. a\n\nWhy:\n\n2. b", 0, 5, 0, true},
-		{"unfenced block beats a later fenced one", "- a\n\nFormat:\n\n```\n- b\n```", 0, 1, 1, true},
+		{"fenced example is not a candidate at all", "- a\n\nFormat:\n\n```\n- b\n```", 0, 1, 0, true},
 		{"a wholly fenced list still wins", "```\n- a\n```", 1, 2, 0, true},
+		// Same shape as the case above but with an UNCLOSED fence: parity is
+		// untrustworthy, so fence awareness switches off and the fenced list
+		// becomes an ordinary candidate that wins on source order.
+		{"unbalanced fence disables fence awareness", "- a\n\nFormat:\n\n```\n- b", 5, 6, 1, true},
 		{"bodyless trailing block is not a candidate", "- a\n\nProse.\n\n- - -", 0, 1, 0, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			start, end, superseded, ok := lastListBlock(strings.Split(tc.raw, "\n"))
+			lines := strings.Split(tc.raw, "\n")
+			start, end, superseded, ok := lastListBlock(lines, fencedRegions(lines))
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}
@@ -544,6 +599,33 @@ func TestLastListBlock(t *testing.T) {
 			}
 			if superseded != tc.wantSuperNum {
 				t.Errorf("superseded = %d, want %d", superseded, tc.wantSuperNum)
+			}
+		})
+	}
+}
+
+// TestOrderedMarkerNum: mergeNumberedRuns rejoins two runs only when the second
+// starts at the first's last number plus one, so a number the parser cannot
+// represent must read as "unordered" (0) rather than wrap or panic — otherwise
+// a huge id could forge a continuation and glue two unrelated lists together.
+func TestOrderedMarkerNum(t *testing.T) {
+	tests := []struct {
+		line string
+		want int
+	}{
+		{"1. Fix the parser", 1},
+		{"23) Fix the parser", 23},
+		{"  4: Fix the parser", 4},
+		{`5\. Fix the parser`, 5},
+		{"- Fix the parser", 0},
+		{"1.Fix the parser", 0}, // no space after the separator: not a marker
+		{"Fix 1. the parser", 0},
+		{"99999999999999999999. Fix the parser", 0}, // out of int range
+	}
+	for _, tc := range tests {
+		t.Run(tc.line, func(t *testing.T) {
+			if got := orderedMarkerNum(tc.line); got != tc.want {
+				t.Errorf("orderedMarkerNum(%q) = %d, want %d", tc.line, got, tc.want)
 			}
 		})
 	}

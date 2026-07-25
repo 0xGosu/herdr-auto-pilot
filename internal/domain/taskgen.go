@@ -95,21 +95,67 @@ func orderedMarkerNum(line string) int {
 	return n
 }
 
+// fencedRegions marks the lines that sit INSIDE a code fence, so both the
+// block scan and the emit loop can treat that content as DATA the model
+// illustrated with rather than as tasks or reasoning. Without it a command in a
+// ```sh block reads as a blank-separated section break, a "# comment" in one
+// reads as a heading, and a "- name: build" in a ```yaml block becomes a task.
+//
+// It returns nil — meaning NO line is fenced — in the two cases where hap
+// cannot tell data from the real thing:
+//
+//   - an ODD number of fence delimiters. The reply was truncated, or it nested
+//     fences (which isFenceLine cannot tell apart), so "inside" is a guess. A
+//     wrong guess is worse than none: it would mark the real trailing list as
+//     data and hand the operator the rejected options instead.
+//   - no task-bearing marker OUTSIDE a fence. That is a model fencing its whole
+//     answer, where the fenced list IS the answer.
+//
+// A nil mask degrades to reading fenced content exactly as the pre-fence-aware
+// parser did — plain source order decides, and a fenced list can still win — so
+// both fallbacks fail toward keeping tasks.
+func fencedRegions(lines []string) []bool {
+	mask := make([]bool, len(lines))
+	inFence, delimiters, plainTask := false, 0, false
+	for i, line := range lines {
+		if isFenceLine(line) {
+			delimiters++
+			inFence = !inFence
+			continue
+		}
+		mask[i] = inFence
+		if inFence {
+			continue
+		}
+		if m := listItemRE.FindStringSubmatch(line); m != nil && hasAlphanumeric(m[1]) {
+			plainTask = true
+		}
+	}
+	if delimiters%2 != 0 || !plainTask {
+		return nil
+	}
+	return mask
+}
+
+// isFenced reports whether line i is fenced content per mask. A nil mask means
+// fences are transparent — see fencedRegions.
+func isFenced(mask []bool, i int) bool {
+	return mask != nil && mask[i]
+}
+
 // listBlock is one run of list lines: the marker lines that no section break
 // separates, as a half-open [start,end) line range ending at the run's last
-// marker. Task-bearing lines are counted twice over — once in total, once
-// excluding code fences — so a fenced EXAMPLE list can never outrank a real
-// one. The ordered-marker numbers let a numbered list that a paragraph
+// marker. The ordered-marker numbers let a numbered list that a paragraph
 // interrupts be recognized as ONE list rather than two.
 type listBlock struct {
 	start, end int
 	tasks      int // marker lines with a real (alphanumeric) body
-	plainTasks int // ditto, outside any code fence
 	firstNum   int // first ordered-marker number, 0 when the run is unordered
 	lastNum    int // last ordered-marker number, 0 when the run is unordered
 }
 
-// scanListBlocks splits the output into list blocks in source order.
+// scanListBlocks splits the output into list blocks in source order, skipping
+// the fenced content fenceMask marks.
 //
 // A block ends at an unmarked line that is BOTH
 //   - separated from the list by a blank line, or an ATX heading; and
@@ -123,21 +169,16 @@ type listBlock struct {
 // under an item never splits its list; and a blank line alone does not end a
 // block either — that is a loose Markdown list, still one list.
 //
-// Fenced regions are DATA, not prose: a command inside a ```sh block would
-// otherwise read as a blank-separated section break (and a "# comment" in one
-// as a heading), splitting a list around an example the model was only
-// illustrating. So nothing inside a fence ends a block. Marker lines in there
-// still join it, because a model that wraps its WHOLE reply in a fence must
-// still yield tasks — they are just counted as fenced, which is what keeps an
-// illustrative list from beating a real one.
-func scanListBlocks(lines []string) []listBlock {
+// A fence is a block-level element: it never ends a list by itself, so a code
+// sample between two items leaves them one list, but the line AFTER it starts a
+// fresh paragraph and so counts as separated.
+func scanListBlocks(lines []string, fenceMask []bool) []listBlock {
 	var blocks []listBlock
 	cur := listBlock{start: -1}
 	curIndent := 0
 	// A prose line at the very top is "blank separated" from nothing, which is
 	// harmless: there is no open block for it to close.
 	blankSeen := true
-	inFence := false
 	flush := func() {
 		if cur.start >= 0 {
 			blocks = append(blocks, cur)
@@ -145,8 +186,8 @@ func scanListBlocks(lines []string) []listBlock {
 		cur, curIndent = listBlock{start: -1}, 0
 	}
 	for i, line := range lines {
-		if isFenceLine(line) {
-			inFence = !inFence
+		if isFenceLine(line) || isFenced(fenceMask, i) {
+			blankSeen = true
 			continue
 		}
 		if m := listItemRE.FindStringSubmatch(line); m != nil {
@@ -156,9 +197,6 @@ func scanListBlocks(lines []string) []listBlock {
 			cur.end = i + 1
 			if hasAlphanumeric(m[1]) {
 				cur.tasks++
-				if !inFence {
-					cur.plainTasks++
-				}
 			}
 			if n := orderedMarkerNum(line); n > 0 {
 				if cur.firstNum == 0 {
@@ -167,9 +205,6 @@ func scanListBlocks(lines []string) []listBlock {
 				cur.lastNum = n
 			}
 			blankSeen = false
-			continue
-		}
-		if inFence {
 			continue
 		}
 		if strings.TrimSpace(line) == "" {
@@ -198,7 +233,6 @@ func mergeNumberedRuns(blocks []listBlock) []listBlock {
 			prev := &out[n-1]
 			prev.end = b.end
 			prev.tasks += b.tasks
-			prev.plainTasks += b.plainTasks
 			prev.lastNum = b.lastNum
 			continue
 		}
@@ -208,36 +242,30 @@ func mergeNumberedRuns(blocks []listBlock) []listBlock {
 }
 
 // lastListBlock picks the block that holds the tasks: the LAST task-bearing
-// one, preferring a block with at least one UNFENCED task so a trailing fenced
-// example never replaces the real list. It returns that block's [start,end)
-// line range, how many other task-bearing blocks it supersedes, and whether one
-// was found at all. A model that reasons out loud often writes several lists —
-// options it considered, then the work it settled on — and only the final one
-// is the task list; the rest is reasoning that belongs in the rationale.
+// one. It returns that block's [start,end) line range, how many other
+// task-bearing blocks it supersedes, and whether one was found at all. A model
+// that reasons out loud often writes several lists — options it considered,
+// then the work it settled on — and only the final one is the task list; the
+// rest is reasoning that belongs in the rationale. A trailing fenced EXAMPLE
+// list cannot win, because fenceMask has already removed it from the scan.
 //
-// ok is exactly the old whole-document "list mode" predicate: some non-fence
-// line carries a marker AND an alphanumeric body. A marker with no body (an
-// empty "- ", a spaced rule "- - -") joins a block but never makes one
-// task-bearing, so it can neither flip a plain block into list mode nor become
-// the "last list" and starve the real one.
-func lastListBlock(lines []string) (start, end, superseded int, ok bool) {
-	blocks := scanListBlocks(lines)
-	pick, plainPick, candidates := -1, -1, 0
+// ok is exactly the old whole-document "list mode" predicate: some visible line
+// carries a marker AND an alphanumeric body. A marker with no body (an empty
+// "- ", a spaced rule "- - -") joins a block but never makes one task-bearing,
+// so it can neither flip a plain block into list mode nor become the "last
+// list" and starve the real one.
+func lastListBlock(lines []string, fenceMask []bool) (start, end, superseded int, ok bool) {
+	blocks := scanListBlocks(lines, fenceMask)
+	pick, candidates := -1, 0
 	for i, b := range blocks {
 		if b.tasks == 0 {
 			continue
 		}
 		candidates++
 		pick = i
-		if b.plainTasks > 0 {
-			plainPick = i
-		}
 	}
 	if candidates == 0 {
 		return 0, 0, 0, false
-	}
-	if plainPick >= 0 {
-		pick = plainPick
 	}
 	return blocks[pick].start, blocks[pick].end, candidates - 1, true
 }
@@ -339,9 +367,10 @@ func NormalizeGeneratedTasks(raw string) []string {
 // lines without a letter or digit are dropped. Returns nil tasks when nothing
 // usable remains.
 //
-// When the output holds SEVERAL lists, only ONE becomes tasks — the last
-// task-bearing one, preferring an unfenced list (lastListBlock picks it; see
-// scanListBlocks for what separates two lists). A model that reasons out loud
+// When the output holds SEVERAL lists, only the LAST task-bearing one becomes
+// tasks (lastListBlock picks it; see scanListBlocks for what separates two
+// lists, and fencedRegions for why an illustrative fenced list is not one of
+// them). A model that reasons out loud
 // commonly lists the options it weighed before listing the work it settled on;
 // taking every marked line would write the discarded options into the agent's
 // checklist as real tasks. The superseded lists are not lost — they go to the
@@ -369,13 +398,16 @@ func NormalizeGeneratedTasksWithRationale(raw string) (tasks []string, rationale
 	// from flipping an otherwise-plain block into list mode and dropping its
 	// prose lines. lastListBlock applies exactly that test, and also tells us
 	// WHICH of several lists is the task list.
-	start, end, superseded, listMode := lastListBlock(lines)
+	// Fenced content is data, not tasks and not reasoning. The SAME mask drives
+	// the block scan and this loop, so the two can never disagree about which
+	// lines are visible; when it is nil, both fall back to reading fenced text
+	// as ordinary output (see fencedRegions).
+	fenceMask := fencedRegions(lines)
+	start, end, superseded, listMode := lastListBlock(lines, fenceMask)
 
 	var ignored []string
-	inFence := false
 	for i, line := range lines {
-		if isFenceLine(line) {
-			inFence = !inFence
+		if isFenceLine(line) || isFenced(fenceMask, i) {
 			continue
 		}
 		var t string
@@ -384,10 +416,7 @@ func NormalizeGeneratedTasksWithRationale(raw string) (tasks []string, rationale
 			// captured as rationale so the model's reasoning is not lost.
 			m := listItemRE.FindStringSubmatch(line)
 			if m == nil {
-				// Unmarked fenced content is code the model illustrated with,
-				// not reasoning — the same reading scanListBlocks takes — so it
-				// is dropped rather than pasted into the rationale column.
-				if p := strings.TrimSpace(line); p != "" && !inFence {
+				if p := strings.TrimSpace(line); p != "" {
 					ignored = append(ignored, p)
 				}
 				continue
