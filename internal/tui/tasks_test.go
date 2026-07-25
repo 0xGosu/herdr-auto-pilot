@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1042,6 +1043,98 @@ func TestTasksReorderRestoresCursorOnFailure(t *testing.T) {
 	}
 	if got := m.cursors[tabTasks]; got != before {
 		t.Errorf("a refused move must put the cursor back to row %d, got %d", before, got)
+	}
+}
+
+// TestTasksReorderUndoIgnoresOtherActionResults: mutations run concurrently and
+// the UI keeps accepting keys while one is in flight, so an UNRELATED action's
+// result can land between a reorder's keypress and its own result. Only the
+// move's own result may consume the cursor undo it stashed — otherwise a
+// successful earlier action clears it (stranding the cursor when the move then
+// fails) or a failed earlier action yanks the cursor back from a move that is
+// still pending.
+func TestTasksReorderUndoIgnoresOtherActionResults(t *testing.T) {
+	m, _, path := taskAppModel(t)
+	writeTasks(t, path, "- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n")
+	m = syncModel(t, m)
+	m = press(t, m, "down") // row 1 = item #1 (a)
+	before := m.cursors[tabTasks]
+
+	upd, cmd := m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("J should run a move")
+	}
+	nudged := m.cursors[tabTasks]
+	if nudged == before {
+		t.Fatal("precondition: the nudge should have moved the cursor")
+	}
+	if m.cursorUndo == nil {
+		t.Fatal("precondition: the move should have stashed a cursor undo")
+	}
+
+	// An unrelated action SUCCEEDS while the move is still pending. It carries
+	// no token, so it must not clear the undo.
+	upd, _ = m.Update(actionResultMsg{message: "some other action finished"})
+	m = upd.(Model)
+	if m.cursorUndo == nil {
+		t.Error("an untagged success must not consume the move's cursor undo")
+	}
+	if got := m.cursors[tabTasks]; got != nudged {
+		t.Errorf("an untagged success must not move the cursor, got %d want %d", got, nudged)
+	}
+
+	// An unrelated action FAILS while the move is still pending. It must not
+	// roll the cursor back either — the move has not been decided yet.
+	upd, _ = m.Update(actionResultMsg{err: errors.New("some other action failed")})
+	m = upd.(Model)
+	if m.cursorUndo == nil {
+		t.Error("an untagged failure must not consume the move's cursor undo")
+	}
+	if got := m.cursors[tabTasks]; got != nudged {
+		t.Errorf("an untagged failure must not roll the cursor back, got %d want %d", got, nudged)
+	}
+
+	// The move's OWN failure does roll it back, and clears the undo.
+	upd, _ = m.Update(actionResultMsg{err: errors.New("nope"), token: m.cursorUndo.token})
+	m = upd.(Model)
+	if got := m.cursors[tabTasks]; got != before {
+		t.Errorf("the move's own failure must restore row %d, got %d", before, got)
+	}
+	if m.cursorUndo != nil {
+		t.Error("the move's own result must clear the undo")
+	}
+}
+
+// TestTasksReorderRefusesWhileOneIsInFlight: a second reorder inside the
+// refresh window would compute from stale rows AND overwrite the pending
+// move's cursor undo, leaving that move's failure un-undoable. Refuse it.
+func TestTasksReorderRefusesWhileOneIsInFlight(t *testing.T) {
+	m, _, path := taskAppModel(t)
+	writeTasks(t, path, "- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n")
+	m = syncModel(t, m)
+	m = press(t, m, "down")
+
+	upd, cmd := m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("the first J should run a move")
+	}
+	first := m.cursorUndo
+	if first == nil {
+		t.Fatal("precondition: the first move should have stashed a cursor undo")
+	}
+
+	upd, cmd = m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Error("a second reorder while one is in flight must not run")
+	}
+	if !strings.Contains(m.message, "still in flight") {
+		t.Errorf("the refusal should explain itself, got %q", m.message)
+	}
+	if m.cursorUndo != first {
+		t.Error("a refused second reorder must not disturb the pending move's undo")
 	}
 }
 

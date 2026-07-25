@@ -94,6 +94,10 @@ type actionResultMsg struct {
 	// if the pause request itself failed (the state never transitioned, so
 	// nothing will consume the flag otherwise).
 	pauseAction bool
+	// token identifies WHICH action produced this result, for state a
+	// keypress stashed awaiting its own completion. Zero for the untagged
+	// majority; see doTagged.
+	token actionToken
 }
 
 // openSendPromptMsg re-opens a second prompt after a LIVE escalation's
@@ -568,13 +572,30 @@ type Model struct {
 	// would be left sitting on an unrelated task — and the NEXT K/J would
 	// move that one, with a text guard that legitimately passes. A subtree
 	// move can travel several rows, so the wrong row is no longer adjacent.
+	//
+	// It is consumed ONLY by the result carrying its own token. Mutations run
+	// concurrently and every other action reports an untagged result, so
+	// without that match an unrelated action finishing first would clear the
+	// undo (stranding a move that then fails) or apply it (yanking the cursor
+	// back from a move still in flight).
 	cursorUndo *cursorUndo
+
+	// nextToken hands out actionToken values. Monotonic within one Model, and
+	// only ever read on the update loop.
+	nextToken actionToken
 }
 
-// cursorUndo is a cursor position to restore if the in-flight action fails.
+// actionToken identifies one mutation so its result can be matched to state
+// the keypress stashed for it. Zero means UNTAGGED: most actions need no such
+// state, and an untagged result must never consume another action's.
+type actionToken uint64
+
+// cursorUndo is a cursor position to restore if a specific in-flight action
+// fails, identified by the token that action's result will carry.
 type cursorUndo struct {
-	tab tab
-	pos int
+	tab   tab
+	pos   int
+	token actionToken
 }
 
 // renderNow returns the clock the Agents tab renders Age against: the
@@ -1161,16 +1182,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
-			// The action that moved the cursor ahead of itself did not happen,
-			// so put it back rather than leave it on a task nobody selected.
-			if u := m.cursorUndo; u != nil {
-				m.cursors[u.tab] = u.pos
-				m.scrollCursorIntoView()
-			}
 		} else if msg.message != "" {
 			m.status = &statusNote{text: msg.message, at: time.Now()}
 		}
-		m.cursorUndo = nil
+		// Only THIS action's own result may consume the undo it stashed. Other
+		// mutations run concurrently and report untagged results; letting one
+		// of those land here would either clear the undo (stranding a move that
+		// then fails) or apply it while the move is still in flight.
+		if u := m.cursorUndo; u != nil && msg.token != 0 && msg.token == u.token {
+			if msg.err != nil {
+				// The action that moved the cursor ahead of itself did not
+				// happen, so put it back rather than leave it on a task nobody
+				// selected.
+				m.cursors[u.tab] = u.pos
+				if u.tab == m.tab {
+					m.scrollCursorIntoView()
+				}
+			}
+			m.cursorUndo = nil
+		}
 		// The status area shrinks the page by 2 — keep the cursor visible.
 		m.clampListViewport()
 		return m, m.refresh()
@@ -1711,11 +1741,23 @@ func (m *Model) beginAction() {
 	m.clampListViewport()
 }
 
-// do runs a mutation and reports its outcome. The inflight Add happens here,
-// on the update loop — before Program.Run can return — so Run's drain never
-// races the counter from zero (bubbletea always launches a returned Cmd, so
-// the paired Done is guaranteed).
+// do runs a mutation and reports its outcome, UNTAGGED: nothing in the model
+// is waiting on this particular result, so it must not be mistaken for one
+// that is. Actions that stash state for their own completion use doTagged.
 func (m Model) do(okMsg string, fn func(context.Context) error) tea.Cmd {
+	return m.doTagged(0, okMsg, fn)
+}
+
+// doTagged runs a mutation and reports its outcome, stamping the result with
+// tok so Update can tell THIS action's completion from any other's. Mutations
+// are concurrent and unordered — the UI keeps accepting keys while one is in
+// flight — so state a keypress stashes for its own result (see cursorUndo) has
+// to be matched, not merely consumed by whichever result lands next.
+//
+// The inflight Add happens here, on the update loop — before Program.Run can
+// return — so Run's drain never races the counter from zero (bubbletea always
+// launches a returned Cmd, so the paired Done is guaranteed).
+func (m Model) doTagged(tok actionToken, okMsg string, fn func(context.Context) error) tea.Cmd {
 	ctx, wg := m.ctx, m.inflight
 	if wg != nil {
 		wg.Add(1)
@@ -1725,9 +1767,9 @@ func (m Model) do(okMsg string, fn func(context.Context) error) tea.Cmd {
 			defer wg.Done()
 		}
 		if err := fn(ctx); err != nil {
-			return actionResultMsg{err: err}
+			return actionResultMsg{err: err, token: tok}
 		}
-		return actionResultMsg{message: okMsg}
+		return actionResultMsg{message: okMsg, token: tok}
 	}
 }
 
@@ -2681,10 +2723,18 @@ func (m Model) taskGroupAgent(group int) *domain.AgentTransition {
 //
 // The nudge anticipates the async refresh rather than replacing it: m.data is
 // only reloaded when the actionResultMsg round-trip completes, so a second
-// press inside that window still reads stale rows and the expected-text guard
-// refuses it. The file is never at risk; the operator just has to press again.
-// One move per refresh is the honest cadence here.
+// press inside that window would read stale rows. It is refused outright below
+// rather than left to fail at the expected-text guard. One move per refresh is
+// the honest cadence here.
 func (m Model) moveSelectedTask(delta int) (tea.Model, tea.Cmd) {
+	// One reorder at a time. Both reasons are about the pending one: its rows
+	// are the ones a second press would compute from, and its cursorUndo is the
+	// only outstanding one — a second move would overwrite it, so a failure of
+	// the first could no longer be undone.
+	if m.cursorUndo != nil {
+		m.message = "a reorder is still in flight — press again in a moment"
+		return m, nil
+	}
 	r := m.selectedTaskRow()
 	if r == nil || r.item == 0 {
 		m.message = "K/J reorders checklist items — move the cursor onto a task"
@@ -2732,7 +2782,9 @@ func (m Model) moveSelectedTask(delta int) (tea.Model, tea.Cmd) {
 		// positions above the destination, so the item lands that much earlier.
 		landed = to + nudge - domain.SubtreeSize(items, r.item)
 	}
-	m.cursorUndo = &cursorUndo{tab: m.tab, pos: m.cursors[m.tab]}
+	m.nextToken++
+	tok := m.nextToken
+	m.cursorUndo = &cursorUndo{tab: m.tab, pos: m.cursors[m.tab], token: tok}
 	if c := m.cursors[m.tab] + nudge; c < 0 {
 		m.cursors[m.tab] = 0
 	} else if last := m.rowCount() - 1; c > last {
@@ -2742,7 +2794,7 @@ func (m Model) moveSelectedTask(delta int) (tea.Model, tea.Cmd) {
 	}
 	m.scrollCursorIntoView()
 	m.beginAction()
-	return m, m.do(fmt.Sprintf("task #%d moved to position #%d", from, landed),
+	return m, m.doTagged(tok, fmt.Sprintf("task #%d moved to position #%d", from, landed),
 		func(c context.Context) error {
 			// The snapshotted text is the staleness guard: the row positions
 			// this move was computed from are the ones last rendered, so if the
