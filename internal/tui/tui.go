@@ -1638,6 +1638,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case tabTasks:
 			return m.toggleTaskMarkSelected()
 		}
+	// Reorder: the shifted forms of the j/k cursor keys, so "move the selection"
+	// and "move the task" share a mnemonic. shift+arrow is bound to the same
+	// handlers for anyone who does not read j/k as movement.
+	case "K", "shift+up":
+		if m.tab == tabTasks {
+			return m.moveSelectedTask(-1)
+		}
+	case "J", "shift+down":
+		if m.tab == tabTasks {
+			return m.moveSelectedTask(1)
+		}
 	case "x", "delete":
 		switch m.tab {
 		case tabAgents:
@@ -2625,6 +2636,84 @@ func (m Model) taskGroupAgent(group int) *domain.AgentTransition {
 		}
 	}
 	return nil
+}
+
+// moveSelectedTask reorders the task under the cursor by delta positions
+// (-1 = up, +1 = down) within its own source file, carrying its nested detail.
+//
+// Three things have to be handled that no other Tasks action needs:
+//
+//   - m.taskMarks are keyed POSITIONALLY (taskMarkKey(group, item)), so a
+//     reorder renumbers items out from under them and every surviving mark
+//     would silently retarget a different task. They are cleared, exactly as
+//     the delete path does for the same reason.
+//   - the cursor is a row index, not an item identity, and a reorder leaves the
+//     row COUNT unchanged — so clampListViewport does nothing and the cursor
+//     would end up on whichever task swapped into place. It is nudged by delta
+//     so that once the refresh lands it is on the task that moved, not on the
+//     one that took its row.
+//   - a search filter hides rows while positions count every task, so the move
+//     is refused outright (see below).
+//
+// The nudge anticipates the async refresh rather than replacing it: m.data is
+// only reloaded when the actionResultMsg round-trip completes, so a second
+// press inside that window still reads stale rows and the expected-text guard
+// refuses it. The file is never at risk; the operator just has to press again.
+// One move per refresh is the honest cadence here.
+func (m Model) moveSelectedTask(delta int) (tea.Model, tea.Cmd) {
+	r := m.selectedTaskRow()
+	if r == nil || r.item == 0 {
+		m.message = "K/J reorders checklist items — move the cursor onto a task"
+		return m, nil
+	}
+	if r.group >= len(m.data.tasks) {
+		m.message = "this task source is no longer loaded — refreshing"
+		return m, nil
+	}
+	// A search filter hides rows, and positions are FILE positions — so one step
+	// would jump the task over items the operator cannot see, and the cursor
+	// could not follow it: a moved task often keeps its filtered row while its
+	// file position changes, so the nudge below would land on a different task
+	// and the next keypress would move THAT one. Refuse rather than reorder
+	// against a view that does not show what is happening.
+	if m.query[tabTasks] != "" {
+		m.message = "clear the search filter to reorder — positions count hidden tasks too"
+		return m, nil
+	}
+	to := r.item + delta
+	// Refuse at the ends rather than clamping: a clamp would rewrite the file
+	// with identical content and report success, so holding the key at the top
+	// of the list would look like it was still doing something.
+	if n := len(m.data.tasks[r.group].Items); to < 1 || to > n {
+		m.message = fmt.Sprintf("task #%d is already at the %s of this list", r.item, edgeName(delta))
+		return m, nil
+	}
+	app, path, from, text := m.app, canonicalTaskPath(r.path), r.item, r.itemText
+	m.taskMarks = nil
+	if delta > 0 && m.cursors[m.tab] < m.rowCount()-1 {
+		m.cursors[m.tab]++
+	} else if delta < 0 && m.cursors[m.tab] > 0 {
+		m.cursors[m.tab]--
+	}
+	m.scrollCursorIntoView()
+	m.beginAction()
+	return m, m.do(fmt.Sprintf("task #%d moved to position #%d", from, to),
+		func(c context.Context) error {
+			// The snapshotted text is the staleness guard: the row positions
+			// this move was computed from are the ones last rendered, so if the
+			// file changed underneath, refuse rather than reorder whatever now
+			// sits at that index.
+			_, err := app.MoveTask("", path, from, to, text)
+			return err
+		})
+}
+
+// edgeName names the end of the list a move ran into, for the refusal message.
+func edgeName(delta int) string {
+	if delta < 0 {
+		return "top"
+	}
+	return "bottom"
 }
 
 // sendSelectedTask delivers the pending task under the cursor to the live
@@ -4431,7 +4520,7 @@ func (m Model) helpLine() string {
 	case tabAgents:
 		return "v: details  x: disable  e: enable  n: rename agent  f: focus in herdr  t: see tasks  /: search  " + common
 	case tabTasks:
-		return "enter/y: send to agent  v: details  a: add  e: edit  d: done/undone  x: delete (source on a header)  space: mark  f: focus in herdr  /: search  " + common
+		return "enter/y: send to agent  v: details  a: add  e: edit  d: done/undone  K/J: move up/down  x: delete (source on a header)  space: mark  f: focus in herdr  /: search  " + common
 	case tabEscalations:
 		return "enter: confirm+send  y: confirm only (marked)  c: correct (+send?)  l: retry LLM  f: focus in herdr  t: see rule  space: mark  x: delete  X: prune old  v: details  /: search  " + common
 	case tabAudit:

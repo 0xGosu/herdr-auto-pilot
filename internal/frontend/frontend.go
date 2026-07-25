@@ -3165,6 +3165,23 @@ func (a *App) DeleteTask(agent, path string, index int, expectText ...string) ([
 	}))
 }
 
+// MoveTask reorders an item to 1-based position `to`, carrying its nested
+// detail, and returns the renumbered list. An optional expectText aborts
+// (inside the file lock) if the item's text no longer matches — see
+// expectTaskText. That guard is what makes a reorder safe to drive from a
+// stale view: the TUI computes `to` from the row positions it last rendered,
+// so if the file changed underneath, the move is refused rather than applied
+// to whatever now sits at that index.
+func (a *App) MoveTask(agent, path string, index, to int, expectText ...string) ([]domain.ChecklistItem, error) {
+	p, err := a.taskFilePath(agent, path)
+	if err != nil {
+		return nil, err
+	}
+	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
+		return domain.MoveChecklistItem(content, index, to)
+	}))
+}
+
 // SignatureRow is a learned signature enriched for display: the persisted
 // state plus the confidence, dominant action, and decision count recomputed
 // from history.

@@ -297,6 +297,26 @@ func FoldedTaskText(itemText string, detail []string) string {
 	return itemText + "\n" + strings.Join(detail, "\n")
 }
 
+// hasNestedSubTasks reports whether the checklist item at lines[i] has checklist
+// items nested under it. Those are NOT part of its detail block — a nested "[ ]"
+// bounds the block — so a move that carried only the block would leave them
+// behind. MoveChecklistItem declines rather than orphan them.
+func hasNestedSubTasks(lines []string, i int) bool {
+	base := indentWidth(lines[i])
+	for j := i + 1; j < len(lines); j++ {
+		if strings.TrimSpace(lines[j]) == "" {
+			continue
+		}
+		if indentWidth(lines[j]) <= base {
+			return false
+		}
+		if checklistItemRE.MatchString(lines[j]) {
+			return true
+		}
+	}
+	return false
+}
+
 // detailBlockEnd is the exclusive end line of the checklist item at lines[i]
 // together with its detail: the item's own line plus every nested continuation
 // line beneath it. `lines[i:detailBlockEnd(lines, i)]` is exactly the run that
@@ -835,6 +855,83 @@ func DeleteChecklistItem(content string, index int) (string, error) {
 		}
 	}
 	return "", outOfRangeErr(index, count)
+}
+
+// MoveChecklistItem moves the item at 1-based position `from` to 1-based
+// position `to`, carrying its nested detail with it, and returns the updated
+// content. Positions are the same numbering ParseChecklist and the `hap task`
+// CLI expose: after the move the item IS item `to`, and the items it displaced
+// shift by one. Moving an item to its own position is a no-op that returns the
+// content byte-for-byte unchanged.
+//
+// The item travels as its whole block (detailBlockEnd), for the reason
+// DeleteChecklistItem does: detail lines belong to their item only by being
+// indented deeper than it, so moving the title alone would leave the detail
+// behind to be folded into — and delivered with — whatever task ends up above
+// it, while the moved task arrives bare. Reordering is exactly the operation
+// that would otherwise scramble every task's instructions at once.
+//
+// Reordering is SIBLINGS-ONLY, and the two refusals below are why. A nested
+// "[ ]" is its own item, not detail, so it is neither carried along nor stepped
+// over — without these guards, moving a parent would strand its sub-tasks at
+// the old position (orphaned under whatever precedes it) and moving any item to
+// a position inside another's nesting would silently adopt that nesting. Both
+// rewrite the tree the operator wrote, which is worse than declining:
+//
+//   - an item with nested sub-tasks cannot move (its children would not follow);
+//   - source and destination must sit at the same indent depth.
+//
+// Everything a flat list can express — the shape hap writes and the shape
+// nearly every checklist has — is unaffected.
+//
+// The block is re-inserted VERBATIM; indentation and bullet style are the
+// operator's. Both positions must name an existing item; neither is clamped, so
+// a caller that computed a target off the end gets an error instead of a silent
+// no-op. Blank separators do NOT travel with the item: they sit between items
+// rather than belonging to one, so a move can leave a blank where the item was
+// and none where it landed. That is cosmetic and deliberate — carrying them
+// trades one spacing artifact for another (see TestMoveChecklistItemBlankLines).
+func MoveChecklistItem(content string, from, to int) (string, error) {
+	items := ParseChecklist(content)
+	if from < 1 || from > len(items) {
+		return "", outOfRangeErr(from, len(items))
+	}
+	if to < 1 || to > len(items) {
+		return "", outOfRangeErr(to, len(items))
+	}
+	if from == to {
+		return content, nil
+	}
+	lines := strings.Split(content, "\n")
+	if hasNestedSubTasks(lines, items[from-1].LineNo) {
+		return "", fmt.Errorf("task #%d has nested sub-tasks, which would be left behind — move or unnest them first", from)
+	}
+	if a, b := indentWidth(items[from-1].Prefix), indentWidth(items[to-1].Prefix); a != b {
+		return "", fmt.Errorf("task #%d and position #%d are at different nesting depths — a task can only be reordered among its siblings", from, to)
+	}
+	start := items[from-1].LineNo
+	end := detailBlockEnd(lines, start)
+	block := append([]string(nil), lines[start:end]...)
+
+	// Cut first, then locate the target in what REMAINS: the destination is a
+	// position in the final list, and removing the block renumbers everything
+	// after it.
+	rest := append(append([]string(nil), lines[:start]...), lines[end:]...)
+	restItems := ParseChecklist(strings.Join(rest, "\n"))
+
+	// Moving DOWN, the items between `from` and `to` each shift up by one, so
+	// the destination lands after the item now sitting at to-1. Moving UP, the
+	// destination is simply before the item now at `to` — unshifted, since every
+	// item before `from` kept its number.
+	var at int
+	if to > from {
+		anchor := restItems[to-2].LineNo
+		at = detailBlockEnd(rest, anchor)
+	} else {
+		at = restItems[to-1].LineNo
+	}
+	out := append(append(append([]string(nil), rest[:at]...), block...), rest[at:]...)
+	return strings.Join(out, "\n"), nil
 }
 
 // AppendChecklistItem adds a new unchecked item with the given text and

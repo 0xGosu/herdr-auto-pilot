@@ -271,6 +271,24 @@ func runAction(t *testing.T, m Model, cmd tea.Cmd) (Model, actionResultMsg) {
 	return upd.(Model), res
 }
 
+// syncModel replays the refresh the Bubble Tea runtime performs after every
+// action result (Update returns m.refresh(), whose refreshMsg reloads m.data).
+// runAction deliberately drops that command, so a test that presses a SECOND
+// key against the same model would otherwise act on a stale snapshot — and the
+// expected-text guard would correctly refuse it.
+func syncModel(t *testing.T, m Model) Model {
+	t.Helper()
+	upd, _ := m.Update(refreshData(m.ctx, m.app))
+	out := upd.(Model)
+	// A refresh can legitimately move the tab (a new escalation pulls focus).
+	// Assert rather than silently restore, so a caller never keeps pressing
+	// Tasks keys against a model that has navigated away.
+	if out.tab != tabTasks {
+		t.Fatalf("refresh switched away from the Tasks tab (now %v)", out.tab)
+	}
+	return out
+}
+
 func readTasks(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -762,6 +780,137 @@ func TestTaskRowDetailMarkerSurvivesNarrowPane(t *testing.T) {
 	}
 }
 
+// TestTasksReorderKeys covers K/J on the Tasks tab: the file is reordered, the
+// cursor FOLLOWS the moved task rather than staying on the row index, and the
+// two ends refuse instead of silently rewriting the file.
+func TestTasksReorderKeys(t *testing.T) {
+	m, _, path := taskAppModel(t) // "- [ ] alpha\n- [x] beta\n- [-] gamma\n"
+	m = press(t, m, "down")       // row 1 = item #1 (alpha)
+	if r := m.selectedTaskRow(); r == nil || r.item != 1 {
+		t.Fatalf("precondition: cursor should be on item #1, got %+v", r)
+	}
+
+	// J moves the task down; the cursor tracks it onto row 2.
+	upd, cmd := m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("J on an item row should run a move")
+	}
+	if got := m.cursors[tabTasks]; got != 2 {
+		t.Errorf("cursor should follow the moved task to row 2, got %d", got)
+	}
+	m, res := runAction(t, m, cmd)
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	if got, want := readTasks(t, path), "- [x] beta\n- [ ] alpha\n- [-] gamma\n"; got != want {
+		t.Errorf("after J:\ngot  %q\nwant %q", got, want)
+	}
+	m = syncModel(t, m) // the runtime's post-action refresh
+
+	// K moves it back up, cursor following again. The cursor is still on row 2,
+	// which the refreshed data now shows as the task that was just moved.
+	if r := m.selectedTaskRow(); r == nil || r.itemText != "alpha" {
+		t.Fatalf("cursor should still be on the moved task, got %+v", r)
+	}
+	upd, cmd = m.Update(pressKeyMsg("K"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("K on an item row should run a move")
+	}
+	if got := m.cursors[tabTasks]; got != 1 {
+		t.Errorf("cursor should follow the moved task back to row 1, got %d", got)
+	}
+	if m, res = runAction(t, m, cmd); res.err != nil {
+		t.Fatal(res.err)
+	}
+	if got, want := readTasks(t, path), "- [ ] alpha\n- [x] beta\n- [-] gamma\n"; got != want {
+		t.Errorf("after K:\ngot  %q\nwant %q", got, want)
+	}
+	m = syncModel(t, m)
+
+	// At the top, K refuses — no command, no rewrite.
+	before := readTasks(t, path)
+	upd, cmd = m.Update(pressKeyMsg("K"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Error("K on the first task must not run a move")
+	}
+	if !strings.Contains(m.message, "already at the top") {
+		t.Errorf("K at the top should explain itself, got %q", m.message)
+	}
+	if got := readTasks(t, path); got != before {
+		t.Errorf("a refused move must not rewrite the file:\ngot  %q\nwant %q", got, before)
+	}
+
+	// Same at the bottom.
+	m = press(t, m, "down", "down") // row 3 = item #3
+	upd, cmd = m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Error("J on the last task must not run a move")
+	}
+	if !strings.Contains(m.message, "already at the bottom") {
+		t.Errorf("J at the bottom should explain itself, got %q", m.message)
+	}
+
+	// On a group header there is no task to move.
+	m = press(t, m, "up", "up", "up")
+	upd, cmd = m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd != nil || !strings.Contains(m.message, "move the cursor onto a task") {
+		t.Errorf("J on a header should only hint, got cmd=%v message=%q", cmd != nil, m.message)
+	}
+}
+
+// TestTasksReorderClearsMarks pins that a reorder drops the multi-select.
+// m.taskMarks are keyed POSITIONALLY, so renumbering the list would leave every
+// surviving mark pointing at a different task — the same reason the delete path
+// consumes them.
+func TestTasksReorderClearsMarks(t *testing.T) {
+	m, _, _ := taskAppModel(t)
+	m = press(t, m, "down", " ") // mark item #1; space also advances the cursor
+	if len(m.taskMarks) != 1 {
+		t.Fatalf("precondition: one mark expected, got %v", m.taskMarks)
+	}
+	upd, cmd := m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("J should run a move")
+	}
+	if len(m.taskMarks) != 0 {
+		t.Errorf("a reorder renumbers items, so marks must be cleared, got %v", m.taskMarks)
+	}
+}
+
+// TestTasksReorderShiftArrowAliases pins the non-vim spelling of the same keys.
+func TestTasksReorderShiftArrowAliases(t *testing.T) {
+	// Start file: "- [ ] alpha\n- [x] beta\n- [-] gamma\n".
+	for _, tc := range []struct {
+		key, want string
+		downs     int // cursor presses to reach the task being moved
+	}{
+		{"shift+down", "- [x] beta\n- [ ] alpha\n- [-] gamma\n", 1}, // item #1 down
+		{"shift+up", "- [ ] alpha\n- [-] gamma\n- [x] beta\n", 3},   // item #3 up
+	} {
+		m, _, path := taskAppModel(t)
+		for i := 0; i < tc.downs; i++ {
+			m = press(t, m, "down")
+		}
+		upd, cmd := m.Update(pressKeyMsg(tc.key))
+		m = upd.(Model)
+		if cmd == nil {
+			t.Fatalf("%s should run a move", tc.key)
+		}
+		if _, res := runAction(t, m, cmd); res.err != nil {
+			t.Fatal(res.err)
+		}
+		if got := readTasks(t, path); got != tc.want {
+			t.Errorf("%s:\ngot  %q\nwant %q", tc.key, got, tc.want)
+		}
+	}
+}
+
 // mustParse reads a checklist file the way the frontend does, so a test row
 // carries the same Detail the real Tasks tab renders from.
 func mustParse(t *testing.T, path string) []domain.ChecklistItem {
@@ -771,6 +920,14 @@ func mustParse(t *testing.T, path string) []domain.ChecklistItem {
 		t.Fatal(err)
 	}
 	return domain.ParseChecklist(string(b))
+}
+
+// TestTasksHelpAdvertisesReorder keeps the footer honest about the new keys.
+func TestTasksHelpAdvertisesReorder(t *testing.T) {
+	m := taskModel(t)
+	if view := m.View(); !strings.Contains(view, "K/J: move up/down") {
+		t.Errorf("Tasks footer should advertise the reorder keys:\n%s", view)
+	}
 }
 
 func TestTaskDetailEditAction(t *testing.T) {
@@ -1449,5 +1606,93 @@ func TestTasksTabUnescapesDisplayedIDs(t *testing.T) {
 	// The row keeps the raw text: it is what matches the line in the file.
 	if got := m.taskRows()[1].itemText; got != `8\.1 commit to a new branch` {
 		t.Errorf("itemText = %q, want the raw file text", got)
+	}
+}
+
+// TestTasksReorderRefusesUnderSearchFilter pins the filter guard. A filter
+// hides rows while `move` works in FILE positions, so a step would jump the
+// task over invisible items — and because a moved task often keeps its filtered
+// row while its file position changes, the cursor nudge would land on a
+// different task and the next keypress would move the wrong one.
+func TestTasksReorderRefusesUnderSearchFilter(t *testing.T) {
+	m, _, path := taskAppModel(t)
+	before := readTasks(t, path)
+	m = press(t, m, "down")
+	m.query[tabTasks] = "alpha"
+	upd, cmd := m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Error("a reorder must not run while the Tasks filter is active")
+	}
+	if !strings.Contains(m.message, "clear the search filter") {
+		t.Errorf("the refusal should say why, got %q", m.message)
+	}
+	if got := readTasks(t, path); got != before {
+		t.Errorf("a refused reorder must not rewrite the file:\ngot  %q\nwant %q", got, before)
+	}
+	// Clearing the filter re-enables it.
+	m.query[tabTasks] = ""
+	if _, cmd = m.Update(pressKeyMsg("J")); cmd == nil {
+		t.Error("clearing the filter should re-enable reordering")
+	}
+}
+
+// TestTasksReorderCursorNudgeWithTwoGroups pins the arithmetic in the case it
+// is least obviously right: with a second task source above it, the rows the
+// cursor indexes include another group's header and items. It still holds
+// because a group's items are a contiguous run of rows and the end guard stops
+// a move from crossing its own header — so ±1 item is always ±1 row.
+func TestTasksReorderCursorNudgeWithTwoGroups(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.md")
+	second := filepath.Join(dir, "second.md")
+	if err := os.WriteFile(first, []byte("- [ ] one-a\n- [ ] one-b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("- [ ] two-a\n- [ ] two-b\n- [ ] two-c\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
+		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	ctx := context.Background()
+	if err := app.AddTaskSource(ctx, "a1", "", first, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "a2", "", second, ""); err != nil {
+		t.Fatal(err)
+	}
+	m := New(ctx, app)
+	m.width, m.height = 100, 30
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabTasks
+
+	// Rows: 0 header, 1 one-a, 2 one-b, 3 header, 4 two-a, 5 two-b, 6 two-c.
+	m.cursors[tabTasks] = 4
+	if r := m.selectedTaskRow(); r == nil || r.itemText != "two-a" || r.group != 1 {
+		t.Fatalf("precondition: cursor should be on the second group's first item, got %+v", r)
+	}
+	upd, cmd := m.Update(pressKeyMsg("J"))
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("J should run a move")
+	}
+	if got := m.cursors[tabTasks]; got != 5 {
+		t.Errorf("cursor should follow the moved task to row 5, got %d", got)
+	}
+	if _, res := runAction(t, m, cmd); res.err != nil {
+		t.Fatal(res.err)
+	}
+	if got, want := readTasks(t, second), "- [ ] two-b\n- [ ] two-a\n- [ ] two-c\n"; got != want {
+		t.Errorf("second group:\ngot  %q\nwant %q", got, want)
+	}
+	// The other group's file is untouched.
+	if got, want := readTasks(t, first), "- [ ] one-a\n- [ ] one-b\n"; got != want {
+		t.Errorf("first group must be untouched:\ngot  %q\nwant %q", got, want)
 	}
 }

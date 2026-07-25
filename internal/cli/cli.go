@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/term"
 
@@ -1490,7 +1491,7 @@ func taskHints(agent, path string, listing bool) []Hint {
 
 // taskOp runs one checklist operation against an already-resolved target.
 func taskOp(ctx context.Context, app *frontend.App, out io.Writer, agent, path string, args []string) error {
-	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | send <n> [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>\nsee: hap help task"
+	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | move <n> <position|up|down> | send <n> [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>\nsee: hap help task"
 	if agent == "" && path == "" {
 		return fmt.Errorf("%s", usage)
 	}
@@ -1567,6 +1568,8 @@ func taskOp(ctx context.Context, app *frontend.App, out io.Writer, agent, path s
 		fmt.Fprintf(out, "removed task #%d\n", idx)
 		printTaskList(out, items, "all")
 		return nil
+	case "move", "mv", "reorder":
+		return taskMove(app, out, agent, path, rest)
 	case "send":
 		return taskSend(ctx, app, out, agent, path, rest)
 	}
@@ -1772,6 +1775,94 @@ func taskStart(app *frontend.App, out io.Writer, agent, path string, rest []stri
 	fmt.Fprintf(out, "task #%d marked in-progress\n", idx)
 	printTaskList(out, items, "all")
 	return nil
+}
+
+// taskMove reorders one item. The SOURCE is a task reference (an id like 3.4,
+// or '#3' for a position), matching every other `hap task` op; the DESTINATION
+// is always a POSITION, because that is the only thing that is unambiguous
+// here: after the move the item's own id is unchanged, so naming the target by
+// id would ask "put 5 where 2 is" and leave "which 2 — before or after the
+// shift?" open. `up`/`down` are the one-step forms the TUI's keys drive.
+func taskMove(app *frontend.App, out io.Writer, agent, path string, args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: task %s move <n> <position|up|down> (see: hap help task)",
+			taskTargetLabel(agent, path))
+	}
+	it, err := taskItemArg(app, agent, path, args[:1])
+	if err != nil {
+		return err
+	}
+	idx := it.Index
+	to, relative, err := moveDestination(args[1], idx)
+	if err != nil {
+		return err
+	}
+	// A relative step off either end is a normal thing to ask for — it is what
+	// a repeated `move X up` does when it reaches the top — so it is reported
+	// as "already there" rather than the bare "no task #0" the position
+	// validator would raise for a number the caller never typed. n == 0 means
+	// the count could not be read, and is deliberately NOT treated as "past the
+	// end": that would swallow the read error behind a success message. Falling
+	// through lets MoveTask report the real problem.
+	if n := countTasks(app, agent, path); relative && (to < 1 || (n > 0 && to > n)) {
+		edge := "top"
+		if to > idx {
+			edge = "bottom"
+		}
+		fmt.Fprintf(out, "task #%d is already at the %s of this list\n", idx, edge)
+		return nil
+	}
+	if to == idx {
+		// Short-circuit before the mutation: taskfile.Mutate writes
+		// unconditionally, so calling through would rewrite the file (new
+		// mtime, new inode) purely to report that nothing changed.
+		fmt.Fprintf(out, "task #%d is already at position #%d\n", idx, to)
+		return nil
+	}
+	items, err := app.MoveTask(agent, path, idx, to, it.Text)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "moved task #%d to position #%d\n", idx, to)
+	printTaskList(out, items, "all")
+	return nil
+}
+
+// countTasks reports how many checklist items the target file holds, for the
+// relative-move edge check, or 0 when it cannot be read — which the caller
+// treats as "unknown", not "empty".
+func countTasks(app *frontend.App, agent, path string) int {
+	items, err := app.ListTasks(agent, path)
+	if err != nil {
+		return 0
+	}
+	return len(items)
+}
+
+// moveDestination resolves a move target to a 1-based position, reporting
+// whether it was RELATIVE ("up"/"down", one step from idx) — the caller treats
+// a relative step off the end as "already there" rather than an error, since
+// walking a task to the top with repeated `up` naturally ends there. An
+// absolute position is never clamped: a destination the caller actually typed
+// is rejected by name if no such task exists.
+func moveDestination(arg string, idx int) (to int, relative bool, err error) {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "up":
+		return idx - 1, true, nil
+	case "down":
+		return idx + 1, true, nil
+	}
+	digits := strings.TrimPrefix(strings.TrimSpace(arg), "#")
+	// Digits only: strconv.Atoi also accepts a sign, and "+2" reading as
+	// position 2 would quietly answer a relative-looking request absolutely.
+	if digits == "" || strings.TrimFunc(digits, unicode.IsDigit) != "" {
+		return 0, false, fmt.Errorf("invalid destination %q — pass a position (e.g. 2 or '#2'), or up/down", arg)
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid destination %q — pass a position (e.g. 2 or '#2'), or up/down", arg)
+	}
+	return n, false, nil
 }
 
 func taskList(app *frontend.App, out io.Writer, agent, path string, args []string) error {

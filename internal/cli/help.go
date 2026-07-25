@@ -614,6 +614,7 @@ func buildCommands() {
 				"hap task [<agent> | --path <file>] undone <n>",
 				"hap task [<agent> | --path <file>] update <n> <text>",
 				"hap task [<agent> | --path <file>] remove <n>",
+				"hap task [<agent> | --path <file>] move <n> <position|up|down>",
 				"hap task <agent> send <n> [--yes]",
 			},
 			Flags: []FlagDoc{
@@ -624,10 +625,15 @@ func buildCommands() {
 			Details: "<n> is a task REFERENCE, not always a position: when the list numbers its own\n" +
 				"tasks, use that id (e.g. `done 3.4`); '#3' always means the 3rd item in the file\n" +
 				"(quote it — a bare #3 is a shell comment). Every mutating op reprints the list.\n" +
-				"Aliases: ls, show, create, wip, check, uncheck/reopen, edit, rm/delete.\n" +
+				"Aliases: ls, show, create, wip, check, uncheck/reopen, edit, rm/delete, mv/reorder.\n" +
 				"Marks: [ ] pending, [-] in progress, [x] done.\n" +
 				"`list` marks a task carrying nested sub-items with `(+N detail lines)`; `get`\n" +
 				"prints them — they are folded into the prompt the agent receives.\n" +
+				"`move` reorders one task: the SOURCE is a reference like any other op, but the\n" +
+				"DESTINATION is always a position (or up/down for one step), since a task keeps\n" +
+				"its own id when it moves. A task's nested DETAIL lines travel with it; nested\n" +
+				"sub-TASKS are items of their own, so a task that has them cannot be moved, and\n" +
+				"a task can only be reordered among its siblings.\n" +
 				"`send` hands a pending item to a live, cleanly idle agent NOW and marks it [-];\n" +
 				"idleness is re-checked at delivery, and a failed send returns the item to [ ].\n" +
 				"Normally you do not need `send`: the daemon hands out the next task by itself.",
@@ -637,6 +643,8 @@ func buildCommands() {
 				"hap task vivid-falcon start 3.4",
 				"hap task vivid-falcon done 3.4",
 				"hap task --path ./docs/tasks.md add \"write the migration test\"",
+				"hap task vivid-falcon move 5 1",
+				"hap task vivid-falcon move 3.4 up",
 			},
 			Next: []Hint{
 				{Cmd: "hap task <agent> list", Why: "the items, with their numbers"},
