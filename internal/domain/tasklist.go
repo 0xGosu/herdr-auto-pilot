@@ -295,6 +295,23 @@ func foldItemAt(lines []string, i int, itemText string) string {
 	return itemText + "\n" + strings.Join(nested, "\n")
 }
 
+// detailBlockEnd is the exclusive end line of the checklist item at lines[i]
+// together with its detail: the item's own line plus every nested continuation
+// line beneath it. `lines[i:detailBlockEnd(lines, i)]` is exactly the run that
+// belongs to that item.
+//
+// It exists so the two mutators that MOVE lines (DeleteChecklistItem and
+// AppendChecklistItem) share one definition of "where does this item end". Both
+// used to answer it with `LineNo + 1`, which is why both handed one item's
+// detail to another.
+//
+// The conversion from nestedContinuationLines' LENGTH to a line span is exact
+// because that helper appends every line it scans — interior blanks included —
+// and only trims from the tail; see the contiguity note on its doc.
+func detailBlockEnd(lines []string, i int) int {
+	return i + 1 + len(nestedContinuationLines(lines, i))
+}
+
 // nestedContinuationLines collects the lines that belong to the checklist item
 // at lines[i] as its folded detail: the run of following lines indented deeper
 // than the item, kept verbatim. Interior blank lines are preserved but trailing
@@ -302,6 +319,13 @@ func foldItemAt(lines []string, i int, itemText string) string {
 // below the item, or at the next checklist item at any indent — a nested "[ ]"
 // checkbox is its own task (ParseChecklist counts it), so it is a boundary, not
 // folded detail.
+//
+// CONTIGUITY (load-bearing): the result is always exactly
+// lines[i+1 : i+1+len(result)]. Every scanned line is appended — interior blanks
+// included — and only the tail is trimmed, so a caller may convert the result's
+// LENGTH into a line span. detailBlockEnd does exactly that, and the delete and
+// append mutators depend on it. Skipping a line instead of appending it (for
+// blanks, say) would silently make them move the wrong number of lines.
 func nestedContinuationLines(lines []string, i int) []string {
 	base := indentWidth(lines[i])
 	var out []string
@@ -751,8 +775,28 @@ func DecodeTaskNewlines(s string) string {
 	return strings.ReplaceAll(s, `\n`, "\n")
 }
 
-// DeleteChecklistItem removes item index's line entirely, leaving every other
-// line untouched.
+// DeleteChecklistItem removes item index — its own line AND the nested
+// continuation lines that are its detail (the same block FoldTaskContent
+// delivers with it) — leaving every other line untouched.
+//
+// Deleting the detail with the item is a CORRECTNESS requirement, not tidiness.
+// Those lines are identified purely by being indented deeper than the item
+// above them, so removing only the item's own line REPARENTS them onto the
+// PRECEDING item: the next fold hands that item the deleted task's acceptance
+// criteria, and the agent is delivered detail for work nobody asked for.
+// (Deleting the first item instead strands them at the top of the file, owned
+// by nothing.) Reparenting is never the right answer for the same reason —
+// the detail describes the task being removed.
+//
+// Trailing blank lines are NOT consumed: nestedContinuationLines trims them, so
+// the run ends at the last non-blank detail line and the blank separator
+// between items survives the delete.
+//
+// The removed run NEVER crosses another checklist item's line — a nested "[ ]"
+// bounds the block rather than joining it — so every other item keeps its
+// number and a nested sub-task survives its parent. The TUI's multi-delete
+// depends on that: it deletes bottom-up by descending index, which is only
+// sufficient because a delete cannot renumber the targets still queued above it.
 func DeleteChecklistItem(content string, index int) (string, error) {
 	lines := strings.Split(content, "\n")
 	count := 0
@@ -762,7 +806,8 @@ func DeleteChecklistItem(content string, index int) (string, error) {
 		}
 		count++
 		if count == index {
-			lines = append(lines[:i], lines[i+1:]...)
+			// The item's line plus its detail block, as one contiguous run.
+			lines = append(lines[:i], lines[detailBlockEnd(lines, i):]...)
 			return strings.Join(lines, "\n"), nil
 		}
 	}
@@ -771,11 +816,18 @@ func DeleteChecklistItem(content string, index int) (string, error) {
 
 // AppendChecklistItem adds a new unchecked item with the given text and
 // returns the updated content plus the new item's 1-based number. The item is
-// inserted just after the last existing checklist item and takes the FIRST
-// item's indent+bullet — usually the list's top-level style — so appending
-// never accidentally nests the new task under a preceding sub-item. With no
-// existing items it is appended at end of file with a default "- " bullet. The
-// text must be a non-empty single line.
+// inserted after the last existing checklist item AND ITS NESTED DETAIL, and
+// takes the FIRST item's indent+bullet — usually the list's top-level style —
+// so appending never accidentally nests the new task under a preceding
+// sub-item. With no existing items it is appended at end of file with a default
+// "- " bullet. The text must be a non-empty single line.
+//
+// Inserting after the whole block, not just the last item's own line, is a
+// CORRECTNESS requirement — the mirror of DeleteChecklistItem's. Detail lines
+// are identified only by being indented deeper than the item above them, so
+// splitting the last item from its detail hands that detail to the NEW task:
+// the appended task is delivered with instructions written for its predecessor,
+// which is left bare.
 func AppendChecklistItem(content, text string) (string, int, error) {
 	text, err := validateTaskText(text)
 	if err != nil {
@@ -792,7 +844,34 @@ func AppendChecklistItem(content, text string) (string, int, error) {
 	}
 	newLine := items[0].Prefix + "[ ] " + text
 	lines := strings.Split(content, "\n")
-	insertAt := items[len(items)-1].LineNo + 1
+	lastLine := items[len(items)-1].LineNo
+	// Two conditions must BOTH hold at the insertion point, so take whichever
+	// is further down the file:
+	//
+	//  1. past the last item's own detail block — otherwise the new task is
+	//     wedged between that item and its detail, and steals it;
+	//  2. past anything that would nest under the NEW line — otherwise the new
+	//     task adopts it. This is not implied by (1): when the last ITEM is a
+	//     nested sub-task, its block ends at its own indent, but a following
+	//     note written at the PARENT's depth is still deeper than the new
+	//     top-level line and would fold into it.
+	//
+	// Neither condition alone is enough, hence the max rather than a single
+	// rule: (2) alone would strand the last item's detail whenever items[0] is
+	// indented deeper than the last item.
+	insertAt := detailBlockEnd(lines, lastLine)
+	newIndent := indentWidth(newLine)
+	for j := insertAt; j < len(lines); j++ {
+		if strings.TrimSpace(lines[j]) != "" && indentWidth(lines[j]) <= newIndent {
+			break
+		}
+		insertAt = j + 1
+	}
+	// Give back the trailing blanks either scan consumed, so a blank separator
+	// (or the file's final newline) stays below the new item rather than above it.
+	for insertAt > lastLine+1 && strings.TrimSpace(lines[insertAt-1]) == "" {
+		insertAt--
+	}
 	lines = append(lines[:insertAt], append([]string{newLine}, lines[insertAt:]...)...)
 	return strings.Join(lines, "\n"), newIndex, nil
 }
