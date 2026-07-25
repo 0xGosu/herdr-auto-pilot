@@ -650,6 +650,139 @@ func TestDeleteChecklistItem(t *testing.T) {
 	}
 }
 
+// TestDeleteChecklistItemTakesItsNestedDetail pins that a delete removes the
+// item's detail block with it. Nested lines are identified only by being
+// indented deeper than the item above them, so leaving them behind REPARENTS
+// them onto the preceding item — see TestDeleteChecklistItemNeverReparentsDetail
+// for the delivery consequence.
+func TestDeleteChecklistItemTakesItsNestedDetail(t *testing.T) {
+	cases := []struct {
+		name, content string
+		index         int
+		want          string
+	}{
+		{
+			name: "middle item with detail",
+			content: "- [ ] a\n  - a detail\n" +
+				"- [ ] b\n  - b detail\n    - b deeper\n" +
+				"- [ ] c\n  - c detail\n",
+			index: 2,
+			want:  "- [ ] a\n  - a detail\n- [ ] c\n  - c detail\n",
+		},
+		{
+			// The last item's detail runs to EOF — nothing terminates it but
+			// the end of the file, the case an "until the next item" scan misses.
+			name:    "last item with detail",
+			content: "- [ ] a\n  - a detail\n- [ ] b\n  - b detail\n    - b deeper\n",
+			index:   2,
+			want:    "- [ ] a\n  - a detail\n",
+		},
+		{
+			// A following item at the SAME depth is a boundary, not detail:
+			// deleting #1 must not touch #2's line.
+			name:    "following item at the same depth",
+			content: "- [ ] a\n  - a detail\n- [ ] b\n",
+			index:   1,
+			want:    "- [ ] b\n",
+		},
+		{
+			// A nested checkbox is its own task (ParseChecklist counts it), so
+			// it bounds the block: deleting #1 leaves #2 and its own detail.
+			name:    "nested checkbox is a task, not detail",
+			content: "- [ ] a\n  - a detail\n  - [ ] a.1\n    - a.1 detail\n",
+			index:   1,
+			want:    "  - [ ] a.1\n    - a.1 detail\n",
+		},
+		{
+			// Interior blanks belong to the block; the trailing blank does not,
+			// so it is left in place — here at the top of the file, since the
+			// deleted item was first. A later tidy-up of that leading blank
+			// would be a change, not a regression.
+			name:    "interior blank kept, trailing blank left in place",
+			content: "- [ ] a\n  - one\n\n  - two\n\n- [ ] b\n",
+			index:   1,
+			want:    "\n- [ ] b\n",
+		},
+		{
+			name:    "flat item is unaffected",
+			content: "intro\n- [ ] a\n- [ ] b\n",
+			index:   1,
+			want:    "intro\n- [ ] b\n",
+		},
+		// The block ends at EOF with no terminating newline — the shape that
+		// pushes the computed end to exactly len(lines), where an off-by-one
+		// would panic rather than misbehave quietly.
+		{
+			name:    "last item with detail, no trailing newline",
+			content: "- [ ] a\n- [ ] b\n  - d",
+			index:   2,
+			// No terminating newline in, none out: the delete removes lines,
+			// it does not normalize how the file ends.
+			want: "- [ ] a",
+		},
+		{
+			name:    "only item with detail, no trailing newline",
+			content: "- [ ] a\n  - d",
+			index:   1,
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DeleteChecklistItem(tc.content, tc.index)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("DeleteChecklistItem:\ngot  %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeleteChecklistItemNeverReparentsDetail is the delivery-level invariant:
+// after removing a task, no surviving task may fold in a line that belonged to
+// the deleted one. Orphaned sub-bullets stay indented deeper than the PRECEDING
+// item, so the pre-fix delete handed task #1 the removed task's detail and the
+// agent was delivered instructions for work nobody asked for.
+func TestDeleteChecklistItemNeverReparentsDetail(t *testing.T) {
+	content := "- [ ] 1. build the widget\n" +
+		"  - wire the API\n" +
+		"- [ ] 2. ship it\n" +
+		"  - tag the release\n" +
+		"  - announce it\n"
+	out, err := DeleteChecklistItem(content, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{"tag the release", "announce it"} {
+		if strings.Contains(out, leaked) {
+			t.Errorf("deleted task's detail %q survived:\n%s", leaked, out)
+		}
+	}
+	// The survivor keeps its OWN detail and gains nothing.
+	if got, want := FoldTaskContent(out, "1. build the widget"),
+		"1. build the widget\n  - wire the API"; got != want {
+		t.Errorf("survivor folds to %q, want %q", got, want)
+	}
+	// Deleting the FIRST item strands nothing at the top of the file either.
+	out, err = DeleteChecklistItem(content, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "wire the API") {
+		t.Errorf("first item's detail was stranded at the top of the file:\n%s", out)
+	}
+	if got, want := FoldTaskContent(out, "2. ship it"),
+		"2. ship it\n  - tag the release\n  - announce it"; got != want {
+		t.Errorf("remaining task folds to %q, want %q", got, want)
+	}
+	// Every surviving line still parses into exactly the tasks that remain.
+	if items := ParseChecklist(out); len(items) != 1 || items[0].Text != "2. ship it" {
+		t.Errorf("expected exactly the one surviving task, got %+v", items)
+	}
+}
+
 func TestAppendChecklistItem(t *testing.T) {
 	cases := []struct {
 		name, content, text, want string
@@ -662,6 +795,32 @@ func TestAppendChecklistItem(t *testing.T) {
 		{"empty file", "", "first", "- [ ] first\n", 1},
 		{"non-checklist file", "just notes\n", "first", "just notes\n- [ ] first\n", 1},
 		{"trailing prose after list", "- [ ] a\nnotes\n", "b", "- [ ] a\n- [ ] b\nnotes\n", 2},
+		// The new item goes after the last item's DETAIL BLOCK, not after its
+		// own line — inserting between an item and its detail hands that detail
+		// to the new task (see TestAppendChecklistItemNeverStealsDetail).
+		{"after the last item's nested detail", "- [ ] a\n  - wire it\n  - test it\n", "b",
+			"- [ ] a\n  - wire it\n  - test it\n- [ ] b\n", 2},
+		{"deeper nesting is still detail", "- [ ] a\n  - criteria:\n    - it renders\n", "b",
+			"- [ ] a\n  - criteria:\n    - it renders\n- [ ] b\n", 2},
+		// A nested checkbox is its own task, so it is the last ITEM and the
+		// append follows ITS detail, not the outer item's.
+		{"nested checkbox is the last item", "- [ ] a\n  - [ ] a.1\n    - sub detail\n", "b",
+			"- [ ] a\n  - [ ] a.1\n    - sub detail\n- [ ] b\n", 3},
+		// A trailing blank separator stays at the end of the file.
+		{"trailing blank after detail", "- [ ] a\n  - wire it\n\n", "b",
+			"- [ ] a\n  - wire it\n- [ ] b\n\n", 2},
+		// The last ITEM is a nested sub-task, so its own block ends at its own
+		// indent — but the following note sits at the PARENT's depth, which is
+		// still deeper than the new top-level line and would fold into it. The
+		// insert must clear it too, which spanning only the last item's block
+		// does not do.
+		{"note below a nested last item is not adopted",
+			"- [ ] a\n  - [ ] a.1\n  - Note: coordinate with ops\n", "b",
+			"- [ ] a\n  - [ ] a.1\n  - Note: coordinate with ops\n- [ ] b\n", 3},
+		// Mirror of the delete boundary case: the block runs to EOF with no
+		// terminating newline, putting the insert index at exactly len(lines).
+		{"detail to EOF, no trailing newline", "- [ ] a\n  - d", "b",
+			"- [ ] a\n  - d\n- [ ] b", 2},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -686,6 +845,47 @@ func TestAppendChecklistItem(t *testing.T) {
 		if _, _, err := AppendChecklistItem("- [ ] a", bad); err == nil {
 			t.Errorf("AppendChecklistItem must reject embedded newline in %q", bad)
 		}
+	}
+}
+
+// TestAppendChecklistItemNeverStealsDetail is the delivery-level mirror of
+// TestDeleteChecklistItemNeverReparentsDetail: appending must not split the
+// last task from its detail. Inserting after the last item's own line put the
+// new task ABOVE that detail, so the fold handed the appended task the previous
+// task's instructions and left the previous task bare.
+func TestAppendChecklistItemNeverStealsDetail(t *testing.T) {
+	content := "- [ ] 1. build the widget\n  - wire the API\n  - test it\n"
+	out, idx, err := AppendChecklistItem(content, "2. ship it")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx != 2 {
+		t.Errorf("new item index = %d, want 2", idx)
+	}
+	// The appended task owns nothing it did not bring.
+	if got := FoldTaskContent(out, "2. ship it"); got != "2. ship it" {
+		t.Errorf("appended task folds to %q, want the bare title", got)
+	}
+	// The previous task keeps every one of its detail lines.
+	if got, want := FoldTaskContent(out, "1. build the widget"),
+		"1. build the widget\n  - wire the API\n  - test it"; got != want {
+		t.Errorf("previous task folds to %q, want %q", got, want)
+	}
+
+	// Spanning only the last ITEM's block is not enough. Here the last item is
+	// a nested sub-task whose block ends at its own indent, but the note below
+	// it sits at the parent's depth — still deeper than the new top-level line,
+	// so it would fold into the appended task.
+	nested := "- [ ] 1. build the widget\n  - [ ] 1.1 test it\n  - Note: coordinate with ops\n"
+	out, _, err = AppendChecklistItem(nested, "2. ship it")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := FoldTaskContent(out, "2. ship it"); got != "2. ship it" {
+		t.Errorf("appended task adopted a line it did not bring: %q", got)
+	}
+	if !strings.Contains(out, "  - Note: coordinate with ops\n- [ ] 2. ship it") {
+		t.Errorf("the note must stay above the appended task:\n%s", out)
 	}
 }
 
