@@ -1405,6 +1405,49 @@ func TestTaskMoveByDeclaredID(t *testing.T) {
 	}
 }
 
+// TestTaskMoveCarriesSubtree: `move` reorders a parent together with its
+// sub-tasks instead of refusing, and `down` steps one SIBLING — the position
+// below a parent is its own first child, which the mutator would refuse as
+// re-parenting.
+func TestTaskMoveCarriesSubtree(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n")
+
+	out, err := run(t, app, "task", "--path", path, "move", "#1", "down")
+	if err != nil {
+		t.Fatalf("moving a parent with sub-tasks must work: %v", err)
+	}
+	want := "- [ ] b\n- [ ] a\n  - [ ] a1\n  - [ ] a2\n"
+	if got := readTaskFile(t, path); got != want {
+		t.Errorf("after move down:\ngot  %q\nwant %q", got, want)
+	}
+	// The message must name where the task LANDED (#2), not the destination it
+	// stepped to (#4) — the list printed right below it says #2.
+	if !strings.Contains(out, "moved task #1 to position #2") {
+		t.Errorf("the move should report its landing position, got %q", out)
+	}
+	// And back up, so `up` steps a sibling too.
+	if _, err := run(t, app, "task", "--path", path, "move", "#2", "up"); err != nil {
+		t.Fatalf("moving the parent back must work: %v", err)
+	}
+	want = "- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n"
+	if got := readTaskFile(t, path); got != want {
+		t.Errorf("after move up:\ngot  %q\nwant %q", got, want)
+	}
+	// A sub-task with no sibling below it is "already at the bottom", not an
+	// error and not a step into the next parent.
+	out, err = run(t, app, "task", "--path", path, "move", "#3", "down")
+	if err != nil {
+		t.Fatalf("a step with no sibling must not error: %v", err)
+	}
+	if !strings.Contains(out, "already at the bottom") {
+		t.Errorf("a sub-task with no next sibling should say so, got %q", out)
+	}
+	if got := readTaskFile(t, path); got != want {
+		t.Errorf("an edge step must not rewrite the file:\ngot  %q\nwant %q", got, want)
+	}
+}
+
 // TestTaskMoveRefusesNestingRewrite pins that the CLI surfaces the domain's
 // siblings-only refusals rather than silently restructuring the file.
 func TestTaskMoveRefusesNestingRewrite(t *testing.T) {
@@ -1412,8 +1455,8 @@ func TestTaskMoveRefusesNestingRewrite(t *testing.T) {
 	path := writeTaskFile(t, "- [ ] a\n  - [ ] a1\n- [ ] b\n")
 	before := readTaskFile(t, path)
 
-	if _, err := run(t, app, "task", "--path", path, "move", "#1", "3"); err == nil {
-		t.Error("moving a task with nested sub-tasks must error")
+	if _, err := run(t, app, "task", "--path", path, "move", "#2", "3"); err == nil {
+		t.Error("moving a sub-task out from under its parent must error")
 	}
 	if _, err := run(t, app, "task", "--path", path, "move", "#3", "2"); err == nil {
 		t.Error("moving into another item's nesting must error")

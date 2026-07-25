@@ -796,19 +796,258 @@ func TestMoveChecklistItem(t *testing.T) {
 	}
 }
 
-// TestMoveChecklistItemRefusesToRewriteNesting pins the siblings-only rule. A
-// nested "[ ]" is its own item, not detail, so it neither travels with a parent
-// nor is stepped over — without these refusals a move would strand a parent's
-// sub-tasks at the old position or adopt someone else's nesting at the new one.
-func TestMoveChecklistItemRefusesToRewriteNesting(t *testing.T) {
-	// Moving a parent would leave a1 orphaned under whatever precedes it.
-	parent := "- [ ] a\n  - [ ] a1\n- [ ] b\n"
-	if _, err := MoveChecklistItem(parent, 1, 3); err == nil {
-		t.Error("moving a task with nested sub-tasks must be refused")
-	} else if !strings.Contains(err.Error(), "nested sub-tasks") {
+// TestSiblingPositionAndSubtreeSize: one "up"/"down" step is one SIBLING, not
+// one position. The position after a parent is its own first child, and asking
+// MoveChecklistItem to swap those two is re-parenting, which it refuses — so a
+// position-stepping `move X down` (or the TUI's J) would fail on every nested
+// list. SubtreeSize is the companion the TUI needs to predict where the moved
+// task lands so its cursor follows it rather than a sub-task.
+func TestSiblingPositionAndSubtreeSize(t *testing.T) {
+	// 1 a, 2 a1, 3 a2, 4 b, 5 b1, 6 c
+	items := ParseChecklist("- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n  - [ ] b1\n- [ ] c\n")
+	if len(items) != 6 {
+		t.Fatalf("fixture parsed %d items, want 6", len(items))
+	}
+	steps := []struct {
+		name         string
+		index, delta int
+		want         int
+	}{
+		{"parent steps over its own children to the next parent", 1, 1, 4},
+		{"parent steps back over the previous parent's children", 4, -1, 1},
+		{"first parent has nothing above it", 1, -1, 0},
+		{"last parent has nothing below it", 6, 1, 0},
+		{"sub-task steps to its own sibling", 2, 1, 3},
+		{"sub-task steps back to its own sibling", 3, -1, 2},
+		{"last sub-task does not escape into the next parent", 3, 1, 0},
+		{"first sub-task does not escape up into its parent", 2, -1, 0},
+		{"an only child has no sibling either way", 5, 1, 0},
+		{"an only child has no sibling above it", 5, -1, 0},
+		{"out of range yields no sibling", 0, 1, 0},
+		{"a zero step yields no sibling", 1, 0, 0},
+	}
+	for _, tc := range steps {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SiblingPosition(items, tc.index, tc.delta); got != tc.want {
+				t.Errorf("SiblingPosition(#%d, %+d) = %d, want %d", tc.index, tc.delta, got, tc.want)
+			}
+		})
+	}
+	for index, want := range map[int]int{1: 3, 2: 1, 3: 1, 4: 2, 5: 1, 6: 1, 0: 0, 7: 0} {
+		if got := SubtreeSize(items, index); got != want {
+			t.Errorf("SubtreeSize(#%d) = %d, want %d", index, got, want)
+		}
+	}
+	// Siblinghood is the PARENT, not the depth, so two children of the same
+	// parent indented unequally are still siblings and must step to each other.
+	// Everything here uses uniform two-space indent otherwise, which would hide
+	// a depth-based regression.
+	ragged := ParseChecklist("- [ ] root\n  - [ ] A\n    - [ ] a1\n - [ ] C\n")
+	if got := SiblingPosition(ragged, 2, 1); got != 4 {
+		t.Errorf("a shallower next sibling is still a sibling: got %d, want 4", got)
+	}
+	if got := SiblingPosition(ragged, 4, -1); got != 2 {
+		t.Errorf("a deeper previous sibling is still a sibling: got %d, want 2", got)
+	}
+	if got := SubtreeSize(ragged, 2); got != 2 {
+		t.Errorf("SubtreeSize must follow indentation, not sibling depth: got %d, want 2", got)
+	}
+
+	// Every step SiblingPosition reports must be a move MoveChecklistItem
+	// accepts — the two rules cannot be allowed to drift, or "down" would step
+	// onto a destination the mutator then refuses.
+	for _, content := range []string{
+		"- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n  - [ ] b1\n- [ ] c\n",
+		"- [ ] root\n  - [ ] A\n    - [ ] a1\n - [ ] C\n",
+	} {
+		parsed := ParseChecklist(content)
+		for i := 1; i <= len(parsed); i++ {
+			for _, d := range []int{-1, 1} {
+				to := SiblingPosition(parsed, i, d)
+				if to == 0 {
+					continue
+				}
+				if _, err := MoveChecklistItem(content, i, to); err != nil {
+					t.Errorf("SiblingPosition(#%d, %+d) = %d in %q, but the move is refused: %v", i, d, to, content, err)
+				}
+			}
+		}
+	}
+}
+
+// TestMoveChecklistItemCarriesSubtree: a reorder moves the item's WHOLE
+// subtree — its own line, its detail, its nested sub-tasks, and their detail.
+// Moving less rewrites the tree: the title alone hands its instructions to
+// whatever ends up above it, and title-plus-detail strands the children under
+// whatever now precedes them. This used to be refused outright, which made
+// every parent in a nested list unmovable — the common shape now that
+// sub-items are folded into what the agent is delivered.
+func TestMoveChecklistItemCarriesSubtree(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  string
+		from, to int
+		want     string
+	}{
+		{
+			// A parent with two sub-tasks, moved DOWN past a leaf sibling.
+			"parent with two sub-tasks down",
+			"- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n",
+			1, 4,
+			"- [ ] b\n- [ ] a\n  - [ ] a1\n  - [ ] a2\n",
+		},
+		{
+			// The same list rearranged the other way: the leaf moves UP past
+			// the whole subtree rather than landing inside it.
+			"leaf up past a parent with two sub-tasks",
+			"- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n",
+			4, 1,
+			"- [ ] b\n- [ ] a\n  - [ ] a1\n  - [ ] a2\n",
+		},
+		{
+			// A parent moved back UP over a sibling, restoring the first case's
+			// input — the move round-trips.
+			"parent with two sub-tasks up",
+			"- [ ] b\n- [ ] a\n  - [ ] a1\n  - [ ] a2\n",
+			2, 1,
+			"- [ ] a\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n",
+		},
+		{
+			// A sub-task's OWN detail lines are inside the parent's subtree and
+			// must travel too — they are deeper than the parent, so nothing but
+			// an indentation bound can be used to find them.
+			"sub-task detail travels with the parent",
+			"- [ ] a\n  - [ ] a1\n    detail for a1\n- [ ] b\n",
+			1, 3,
+			"- [ ] b\n- [ ] a\n  - [ ] a1\n    detail for a1\n",
+		},
+		{
+			// Past ANOTHER parent that has children: the destination's own
+			// subtree must be cleared, or the moved parent lands wedged between
+			// that parent and its sub-tasks — adopting them.
+			"parent past a parent that also has children",
+			"- [ ] a\n  - [ ] a1\n- [ ] b\n  - [ ] b1\n  - [ ] b2\n",
+			1, 3,
+			"- [ ] b\n  - [ ] b1\n  - [ ] b2\n- [ ] a\n  - [ ] a1\n",
+		},
+		{
+			// And back again, so the pair is a true round-trip.
+			"parent back up over a parent with children",
+			"- [ ] b\n  - [ ] b1\n  - [ ] b2\n- [ ] a\n  - [ ] a1\n",
+			4, 1,
+			"- [ ] a\n  - [ ] a1\n- [ ] b\n  - [ ] b1\n  - [ ] b2\n",
+		},
+		{
+			// Grandchildren ride along: the subtree is bounded by indentation,
+			// not by one level of nesting.
+			"whole three-level subtree travels",
+			"- [ ] a\n  - [ ] a1\n    - [ ] a1x\n- [ ] b\n",
+			1, 4,
+			"- [ ] b\n- [ ] a\n  - [ ] a1\n    - [ ] a1x\n",
+		},
+		{
+			// Reordering two parents that BOTH have children, one level down —
+			// the sibling arithmetic is not special-cased to top level.
+			"nested parents with children swap",
+			"- [ ] root\n  - [ ] A\n    - [ ] a1\n  - [ ] B\n    - [ ] b1\n",
+			2, 4,
+			"- [ ] root\n  - [ ] B\n    - [ ] b1\n  - [ ] A\n    - [ ] a1\n",
+		},
+		{
+			// A blank line between a parent and its sub-task must NOT cut the
+			// subtree in half — the blank is interior, so subtreeEnd keeps
+			// scanning. Making it a boundary would orphan a1 while leaving
+			// every other case in this file green.
+			"blank line inside a subtree does not cut it",
+			"- [ ] a\n\n  - [ ] a1\n- [ ] b\n",
+			1, 3,
+			"- [ ] b\n- [ ] a\n\n  - [ ] a1\n",
+		},
+		{
+			// An ABSOLUTE destination two siblings away (what `hap task move 1 5`
+			// asks for) steps over a whole intervening subtree. Note "a" lands at
+			// position 4, not 5: its own subtree vacated the slots above the
+			// destination, which is why callers must not print `to`.
+			"absolute destination past an intervening subtree",
+			"- [ ] a\n  - [ ] a1\n- [ ] b\n  - [ ] b1\n- [ ] c\n",
+			1, 5,
+			"- [ ] b\n  - [ ] b1\n- [ ] c\n- [ ] a\n  - [ ] a1\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := MoveChecklistItem(tc.content, tc.from, tc.to)
+			if err != nil {
+				t.Fatalf("MoveChecklistItem(%d→%d): %v", tc.from, tc.to, err)
+			}
+			if got != tc.want {
+				t.Errorf("MoveChecklistItem(%d→%d):\ngot  %q\nwant %q", tc.from, tc.to, got, tc.want)
+			}
+			// A move only reorders: the same items must survive, so a subtree
+			// that was dropped or duplicated is caught even if the text lines
+			// up by accident.
+			before, after := ParseChecklist(tc.content), ParseChecklist(got)
+			if len(before) != len(after) {
+				t.Fatalf("item count changed: %d → %d", len(before), len(after))
+			}
+			seen := map[string]int{}
+			for _, it := range before {
+				seen[it.Prefix+it.Text]++
+			}
+			for _, it := range after {
+				seen[it.Prefix+it.Text]--
+			}
+			for k, n := range seen {
+				if n != 0 {
+					t.Errorf("item %q changed count by %d — a move must not add, drop, or re-indent items", k, -n)
+				}
+			}
+		})
+	}
+}
+
+// TestMoveChecklistItemRefusesSplitSubtree: the two nesting models must agree
+// before anything is rewritten. subtreeEnd reads LINES and stops at the first
+// one indented at or below the item; checklistParent reads ITEMS and skips
+// non-item lines. A bare prose line at the parent's own indent, between it and
+// a sub-task, splits them — the parser still calls the sub-task a child, but
+// the line scan stops short of it. Carrying the smaller run would leave that
+// child behind, re-parented onto whatever now precedes it, which is exactly
+// what a subtree-carrying move exists to prevent. Which reading is right is
+// genuinely ambiguous, so it declines.
+func TestMoveChecklistItemRefusesSplitSubtree(t *testing.T) {
+	split := "- [ ] a\nnotes\n  - [ ] a1\n- [ ] b\n"
+	// The parser calls a1 a child of a, so the disagreement is real.
+	items := ParseChecklist(split)
+	if got := SubtreeSize(items, 1); got != 2 {
+		t.Fatalf("precondition: the parser should see a1 as a's child (SubtreeSize=2), got %d", got)
+	}
+	got, err := MoveChecklistItem(split, 1, 3)
+	if err == nil {
+		t.Fatalf("a subtree split by a line at the parent's own indent must be refused, got %q", got)
+	}
+	if !strings.Contains(err.Error(), "leave them behind") {
 		t.Errorf("the refusal should name the reason, got %v", err)
 	}
-	// Its own detail is still fine to carry — only sub-TASKS block the move.
+	if got != "" {
+		t.Errorf("a refused move must return no content, got %q", got)
+	}
+	// Indenting the separator resolves the ambiguity, and the move goes through
+	// carrying everything.
+	fixed := "- [ ] a\n  notes\n  - [ ] a1\n- [ ] b\n"
+	if got, err := MoveChecklistItem(fixed, 1, 3); err != nil {
+		t.Errorf("an indented separator must not block the move: %v", err)
+	} else if want := "- [ ] b\n- [ ] a\n  notes\n  - [ ] a1\n"; got != want {
+		t.Errorf("indented separator:\ngot  %q\nwant %q", got, want)
+	}
+}
+
+// TestMoveChecklistItemRefusesToRewriteNesting pins the siblings-only rule.
+// Reordering carries a whole subtree, but it never RE-PARENTS: a destination
+// under a different parent would adopt someone else's nesting, rewriting the
+// tree the operator wrote.
+func TestMoveChecklistItemRefusesToRewriteNesting(t *testing.T) {
+	// A parent's own detail travels with it, as it always has.
 	ok := "- [ ] a\n  - just detail\n- [ ] b\n"
 	if _, err := MoveChecklistItem(ok, 1, 2); err != nil {
 		t.Errorf("plain detail must not block a move: %v", err)
@@ -846,8 +1085,11 @@ func TestMoveChecklistItemRefusesToRewriteNesting(t *testing.T) {
 		t.Errorf("sibling reorder:\ngot  %q\nwant %q", got, want)
 	}
 	// Refusals never touch the content.
-	for _, c := range []string{parent, nested} {
-		if got, _ := MoveChecklistItem(c, 1, 3); got != "" {
+	for _, c := range []struct {
+		content  string
+		from, to int
+	}{{nested, 2, 3}, {cousins, 2, 4}, {deep, 3, 5}} {
+		if got, _ := MoveChecklistItem(c.content, c.from, c.to); got != "" {
 			t.Errorf("a refused move must return no content, got %q", got)
 		}
 	}

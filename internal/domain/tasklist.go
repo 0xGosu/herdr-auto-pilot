@@ -314,24 +314,94 @@ func checklistParent(items []ChecklistItem, k int) int {
 	return -1
 }
 
-// hasNestedSubTasks reports whether the checklist item at lines[i] has checklist
-// items nested under it. Those are NOT part of its detail block — a nested "[ ]"
-// bounds the block — so a move that carried only the block would leave them
-// behind. MoveChecklistItem declines rather than orphan them.
-func hasNestedSubTasks(lines []string, i int) bool {
+// SiblingPosition returns the 1-based position of the item one sibling step
+// before (delta < 0) or after (delta > 0) the item at 1-based `index`, or 0
+// when it has no sibling in that direction.
+//
+// It is what "up"/"down" must mean once a move carries a whole subtree. The
+// step is one SIBLING, not one position: the position after a parent is its
+// first CHILD, and asking MoveChecklistItem to swap those two is re-parenting,
+// which it refuses. Stepping by position would therefore make `move X down`
+// and the TUI's J fail on exactly the nested lists this reordering exists for.
+//
+// Nested descendants of the neighbouring siblings are skipped, since they sit
+// between two siblings in position order. The scan stops at the first item
+// SHALLOWER than the one being moved — that is the parent's own line going up,
+// or a different parent's going down, and neither direction has any more
+// siblings past it.
+func SiblingPosition(items []ChecklistItem, index, delta int) int {
+	if index < 1 || index > len(items) || delta == 0 {
+		return 0
+	}
+	parent := checklistParent(items, index-1)
+	depth := indentWidth(items[index-1].Prefix)
+	step := 1
+	if delta < 0 {
+		step = -1
+	}
+	for i := index - 1 + step; i >= 0 && i < len(items); i += step {
+		if checklistParent(items, i) == parent {
+			return i + 1
+		}
+		if indentWidth(items[i].Prefix) < depth {
+			return 0
+		}
+	}
+	return 0
+}
+
+// SubtreeSize is how many checklist items travel with the item at 1-based
+// `index` when it is moved: the item itself plus every item nested under it.
+// It is 1 for a leaf. Callers that must predict where a moved item LANDS need
+// it — moving down past a sibling advances the item by that sibling's subtree
+// size, not by one — which is what keeps the TUI's cursor on the task it just
+// moved rather than on whichever one took its row.
+func SubtreeSize(items []ChecklistItem, index int) int {
+	if index < 1 || index > len(items) {
+		return 0
+	}
+	depth := indentWidth(items[index-1].Prefix)
+	n := 1
+	for i := index; i < len(items); i++ {
+		if indentWidth(items[i].Prefix) <= depth {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// subtreeEnd is the exclusive end line of EVERYTHING under the checklist item
+// at lines[i]: its own line, its detail block, every nested sub-task, and each
+// of those sub-tasks' detail, however deep. `lines[i:subtreeEnd(lines, i)]` is
+// the run MoveChecklistItem relocates.
+//
+// It is the wider sibling of detailBlockEnd. That one stops at the first nested
+// checklist item, because a nested "[ ]" is its own task rather than folded
+// detail — the right boundary for DELIVERING one item, and for splicing a new
+// item in beside it. Moving needs the other answer: a sub-task left where its
+// parent used to be is re-parented onto whatever now precedes it, which is the
+// same silent tree rewrite that carrying detail is meant to prevent.
+//
+// Only indentation bounds the scan: the run ends at the first non-blank line
+// indented at or below the item. Interior blank lines are included (a blank
+// between a parent and its sub-tasks must not cut the subtree in half), but
+// trailing ones are not — `end` only advances on a non-blank deeper line — so a
+// blank separator before the NEXT sibling stays where it is instead of
+// travelling with the move.
+func subtreeEnd(lines []string, i int) int {
 	base := indentWidth(lines[i])
+	end := i + 1
 	for j := i + 1; j < len(lines); j++ {
 		if strings.TrimSpace(lines[j]) == "" {
 			continue
 		}
 		if indentWidth(lines[j]) <= base {
-			return false
+			break
 		}
-		if checklistItemRE.MatchString(lines[j]) {
-			return true
-		}
+		end = j + 1
 	}
-	return false
+	return end
 }
 
 // detailBlockEnd is the exclusive end line of the checklist item at lines[i]
@@ -875,36 +945,36 @@ func DeleteChecklistItem(content string, index int) (string, error) {
 }
 
 // MoveChecklistItem moves the item at 1-based position `from` to 1-based
-// position `to`, carrying its nested detail with it, and returns the updated
+// position `to`, carrying everything nested under it, and returns the updated
 // content. Positions are the same numbering ParseChecklist and the `hap task`
-// CLI expose: after the move the item IS item `to`, and the items it displaced
-// shift by one. Moving an item to its own position is a no-op that returns the
-// content byte-for-byte unchanged.
+// CLI expose. `to` names the SIBLING the item is reordered past: moving down
+// puts it directly after that sibling's own subtree, moving up directly before
+// the item at `to`. For a flat list that is exactly "the item is now item `to`".
+// With sub-tasks in play the landing position is `to` going UP, and going DOWN
+// it is `to + SubtreeSize(to) - SubtreeSize(from)` — usually EARLIER than `to`,
+// because the whole source subtree vacated the positions above it. Callers that
+// report or predict where the item ended up must compute it; `to` is the
+// destination asked for, not the answer. Moving an item to its own position is
+// a no-op that returns the content byte-for-byte unchanged.
 //
-// The item travels as its whole block (detailBlockEnd), for the reason
-// DeleteChecklistItem does: detail lines belong to their item only by being
-// indented deeper than it, so moving the title alone would leave the detail
-// behind to be folded into — and delivered with — whatever task ends up above
-// it, while the moved task arrives bare. Reordering is exactly the operation
-// that would otherwise scramble every task's instructions at once.
+// The item travels as its whole SUBTREE (subtreeEnd): its own line, its detail
+// block, every nested sub-task, and each of those sub-tasks' detail. Detail
+// lines belong to their item only by being indented deeper than it, and a
+// nested "[ ]" is its own item bounded the same way, so moving anything less
+// rewrites the tree — the title alone would hand its instructions to whatever
+// task ends up above it and arrive bare, and the title-plus-detail would strand
+// the children under whatever now precedes them. Reordering is exactly the
+// operation that would otherwise scramble every task's instructions at once.
 //
-// Reordering is SIBLINGS-ONLY, and the two refusals below are why. A nested
-// "[ ]" is its own item, not detail, so it is neither carried along nor stepped
-// over — without these guards, moving a parent would strand its sub-tasks at
-// the old position (orphaned under whatever precedes it) and moving any item to
-// a position inside another's nesting would silently adopt that nesting. Both
-// rewrite the tree the operator wrote, which is worse than declining:
+// Reordering is still SIBLINGS-ONLY: source and destination must have the same
+// PARENT, not merely the same indent depth. Equal depth is not siblinghood —
+// two sub-tasks under different parents are equally indented, and swapping them
+// would move one under the other's parent. That guard also keeps `to` out of
+// the moved subtree, since every item inside it has the moved item (or one of
+// its descendants) as a parent. Re-parenting is a different operation from
+// reordering; it stays refused rather than done silently.
 //
-//   - an item with nested sub-tasks cannot move (its children would not follow);
-//   - source and destination must be SIBLINGS — same parent, not merely the
-//     same indent depth. Equal depth is not siblinghood: two sub-tasks under
-//     different parents are equally indented, and swapping them would move one
-//     under the other's parent.
-//
-// Everything a flat list can express — the shape hap writes and the shape
-// nearly every checklist has — is unaffected.
-//
-// The block is re-inserted VERBATIM; indentation and bullet style are the
+// The subtree is re-inserted VERBATIM; indentation and bullet style are the
 // operator's. Both positions must name an existing item; neither is clamped, so
 // a caller that computed a target off the end gets an error instead of a silent
 // no-op. Blank separators do NOT travel with the item: they sit between items
@@ -923,34 +993,55 @@ func MoveChecklistItem(content string, from, to int) (string, error) {
 		return content, nil
 	}
 	lines := strings.Split(content, "\n")
-	if hasNestedSubTasks(lines, items[from-1].LineNo) {
-		return "", fmt.Errorf("task #%d has nested sub-tasks, which would be left behind — move or unnest them first", from)
-	}
 	// Same PARENT, not merely the same depth. Equal indentation is not
 	// siblinghood: two sub-tasks under different parents sit at the same depth,
 	// so a depth-only check would let one be moved under the other's parent —
-	// the reparenting this refusal exists to prevent.
+	// the reparenting this refusal exists to prevent. It doubles as the guard
+	// that `to` is not inside the subtree about to be cut.
 	if a, b := checklistParent(items, from-1), checklistParent(items, to-1); a != b {
 		return "", fmt.Errorf("task #%d and position #%d are under different parents — a task can only be reordered among its siblings", from, to)
 	}
 	start := items[from-1].LineNo
-	end := detailBlockEnd(lines, start)
+	end := subtreeEnd(lines, start)
 	block := append([]string(nil), lines[start:end]...)
 
+	// How many ITEMS travel with the move — the parent plus every descendant.
+	// Renumbering below shifts by this, not by one.
+	moved := 0
+	for _, it := range items {
+		if it.LineNo >= start && it.LineNo < end {
+			moved++
+		}
+	}
+	// The two nesting models must agree before anything is rewritten.
+	// subtreeEnd reads LINES and stops at the first one indented at or below the
+	// item; checklistParent reads ITEMS and skips non-item lines entirely. A bare
+	// prose line at the parent's own indent, sitting between it and a sub-task,
+	// splits them: the parser still calls that sub-task a child, but the line
+	// scan stops short of it, so the move would leave it behind — re-parented
+	// onto whatever now precedes it, the one thing carrying the subtree exists to
+	// prevent. Which of the two readings is "right" is genuinely ambiguous (the
+	// prose belongs to neither), so decline and let the operator resolve it
+	// rather than pick one and silently rewrite the tree.
+	if want := SubtreeSize(items, from); moved != want {
+		return "", fmt.Errorf("task #%d has sub-tasks separated from it by a line at its own indent — the move would leave them behind; indent or remove that line first", from)
+	}
+
 	// Cut first, then locate the target in what REMAINS: the destination is a
-	// position in the final list, and removing the block renumbers everything
+	// position in the final list, and removing the subtree renumbers everything
 	// after it.
 	rest := append(append([]string(nil), lines[:start]...), lines[end:]...)
 	restItems := ParseChecklist(strings.Join(rest, "\n"))
 
-	// Moving DOWN, the items between `from` and `to` each shift up by one, so
-	// the destination lands after the item now sitting at to-1. Moving UP, the
-	// destination is simply before the item now at `to` — unshifted, since every
-	// item before `from` kept its number.
+	// Moving DOWN, every item past the cut shifts up by `moved`, so the sibling
+	// originally at `to` now sits at index to-moved-1; the subtree lands after
+	// that sibling's OWN subtree, or it would be wedged between it and its
+	// children. Moving UP, the destination is simply before the item now at `to`
+	// — unshifted, since every item before `from` kept its number.
 	var at int
 	if to > from {
-		anchor := restItems[to-2].LineNo
-		at = detailBlockEnd(rest, anchor)
+		anchor := restItems[to-moved-1].LineNo
+		at = subtreeEnd(rest, anchor)
 	} else {
 		at = restItems[to-1].LineNo
 	}

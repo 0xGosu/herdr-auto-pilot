@@ -631,9 +631,11 @@ func buildCommands() {
 				"prints them — they are folded into the prompt the agent receives.\n" +
 				"`move` reorders one task: the SOURCE is a reference like any other op, but the\n" +
 				"DESTINATION is always a position (or up/down for one step), since a task keeps\n" +
-				"its own id when it moves. A task's nested DETAIL lines travel with it; nested\n" +
-				"sub-TASKS are items of their own, so a task that has them cannot be moved, and\n" +
-				"a task can only be reordered among its siblings.\n" +
+				"its own id when it moves. The whole subtree travels — the task's nested DETAIL\n" +
+				"lines, its nested sub-TASKS, and their detail — so the destination names the\n" +
+				"SIBLING to reorder past. A task can only be reordered among its siblings;\n" +
+				"moving one under a different parent is re-parenting, not reordering, and is\n" +
+				"refused.\n" +
 				"`send` hands a pending item to a live, cleanly idle agent NOW and marks it [-];\n" +
 				"idleness is re-checked at delivery, and a failed send returns the item to [ ].\n" +
 				"Normally you do not need `send`: the daemon hands out the next task by itself.",
