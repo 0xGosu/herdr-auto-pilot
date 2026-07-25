@@ -818,8 +818,32 @@ func TestMoveChecklistItemRefusesToRewriteNesting(t *testing.T) {
 	nested := "- [ ] a\n  - [ ] a1\n    - a1 detail\n- [ ] b\n"
 	if _, err := MoveChecklistItem(nested, 3, 2); err == nil {
 		t.Error("moving to a different nesting depth must be refused")
-	} else if !strings.Contains(err.Error(), "nesting depths") {
+	} else if !strings.Contains(err.Error(), "different parents") {
 		t.Errorf("the refusal should name the reason, got %v", err)
+	}
+
+	// EQUAL DEPTH IS NOT SIBLINGHOOD. Two sub-tasks under different parents are
+	// indented identically, so a depth-only check would let one be moved under
+	// the other's parent — leaving the first parent childless. This is the case
+	// that makes the guard compare parents rather than indentation.
+	cousins := "- [ ] parent A\n  - [ ] a\n- [ ] parent B\n  - [ ] b\n"
+	if _, err := MoveChecklistItem(cousins, 2, 4); err == nil {
+		t.Error("moving a sub-task under a different parent must be refused")
+	} else if !strings.Contains(err.Error(), "different parents") {
+		t.Errorf("the refusal should name the reason, got %v", err)
+	}
+	// The same shape one level deeper, to pin that the parent lookup is not
+	// special-cased to top level.
+	deep := "- [ ] root\n  - [ ] A\n    - [ ] a\n  - [ ] B\n    - [ ] b\n"
+	if _, err := MoveChecklistItem(deep, 3, 5); err == nil {
+		t.Error("nested cousins must be refused too")
+	}
+	// But true siblings under a shared parent still reorder.
+	twins := "- [ ] root\n  - [ ] A\n    - [ ] a1\n    - [ ] a2\n"
+	if got, err := MoveChecklistItem(twins, 4, 3); err != nil {
+		t.Errorf("siblings under a shared parent must reorder: %v", err)
+	} else if want := "- [ ] root\n  - [ ] A\n    - [ ] a2\n    - [ ] a1\n"; got != want {
+		t.Errorf("sibling reorder:\ngot  %q\nwant %q", got, want)
 	}
 	// Refusals never touch the content.
 	for _, c := range []string{parent, nested} {

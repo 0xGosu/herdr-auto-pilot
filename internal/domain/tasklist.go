@@ -297,6 +297,23 @@ func FoldedTaskText(itemText string, detail []string) string {
 	return itemText + "\n" + strings.Join(detail, "\n")
 }
 
+// checklistParent returns the LineNo of the item that items[k] is nested under
+// — the nearest preceding item indented strictly less — or -1 when it is
+// top-level. Two items are siblings exactly when this agrees for both.
+//
+// Depth alone does not answer that question: "  - [ ] a" under "parent A" and
+// "  - [ ] b" under "parent B" are equally indented but are not siblings, and
+// swapping them would move one under the other's parent.
+func checklistParent(items []ChecklistItem, k int) int {
+	depth := indentWidth(items[k].Prefix)
+	for i := k - 1; i >= 0; i-- {
+		if indentWidth(items[i].Prefix) < depth {
+			return items[i].LineNo
+		}
+	}
+	return -1
+}
+
 // hasNestedSubTasks reports whether the checklist item at lines[i] has checklist
 // items nested under it. Those are NOT part of its detail block — a nested "[ ]"
 // bounds the block — so a move that carried only the block would leave them
@@ -879,7 +896,10 @@ func DeleteChecklistItem(content string, index int) (string, error) {
 // rewrite the tree the operator wrote, which is worse than declining:
 //
 //   - an item with nested sub-tasks cannot move (its children would not follow);
-//   - source and destination must sit at the same indent depth.
+//   - source and destination must be SIBLINGS — same parent, not merely the
+//     same indent depth. Equal depth is not siblinghood: two sub-tasks under
+//     different parents are equally indented, and swapping them would move one
+//     under the other's parent.
 //
 // Everything a flat list can express — the shape hap writes and the shape
 // nearly every checklist has — is unaffected.
@@ -906,8 +926,12 @@ func MoveChecklistItem(content string, from, to int) (string, error) {
 	if hasNestedSubTasks(lines, items[from-1].LineNo) {
 		return "", fmt.Errorf("task #%d has nested sub-tasks, which would be left behind — move or unnest them first", from)
 	}
-	if a, b := indentWidth(items[from-1].Prefix), indentWidth(items[to-1].Prefix); a != b {
-		return "", fmt.Errorf("task #%d and position #%d are at different nesting depths — a task can only be reordered among its siblings", from, to)
+	// Same PARENT, not merely the same depth. Equal indentation is not
+	// siblinghood: two sub-tasks under different parents sit at the same depth,
+	// so a depth-only check would let one be moved under the other's parent —
+	// the reparenting this refusal exists to prevent.
+	if a, b := checklistParent(items, from-1), checklistParent(items, to-1); a != b {
+		return "", fmt.Errorf("task #%d and position #%d are under different parents — a task can only be reordered among its siblings", from, to)
 	}
 	start := items[from-1].LineNo
 	end := detailBlockEnd(lines, start)

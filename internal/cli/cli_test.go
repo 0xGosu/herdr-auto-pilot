@@ -1416,10 +1416,21 @@ func TestTaskMoveRefusesNestingRewrite(t *testing.T) {
 		t.Error("moving a task with nested sub-tasks must error")
 	}
 	if _, err := run(t, app, "task", "--path", path, "move", "#3", "2"); err == nil {
-		t.Error("moving across nesting depths must error")
+		t.Error("moving into another item's nesting must error")
 	}
 	if got := readTaskFile(t, path); got != before {
 		t.Errorf("a refused move must not rewrite the file:\ngot  %q\nwant %q", got, before)
+	}
+
+	// Equal indentation is not siblinghood: two sub-tasks under different
+	// parents look alike but swapping them reparents one of them.
+	cousins := writeTaskFile(t, "- [ ] parent A\n  - [ ] a\n- [ ] parent B\n  - [ ] b\n")
+	cousinsBefore := readTaskFile(t, cousins)
+	if _, err := run(t, app, "task", "--path", cousins, "move", "#2", "4"); err == nil {
+		t.Error("moving a sub-task under a different parent must error")
+	}
+	if got := readTaskFile(t, cousins); got != cousinsBefore {
+		t.Errorf("a refused move must not rewrite the file:\ngot  %q\nwant %q", got, cousinsBefore)
 	}
 }
 
