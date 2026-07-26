@@ -23,15 +23,27 @@ var (
 	// components (for example "2m 2s" or "45s"). Horizontal whitespace keeps
 	// the match confined to the rendered status line.
 	claudeAPIResponseRetryRE = regexp.MustCompile(`(?i)waiting[ \t]+for[ \t]+api[ \t]+response[ \t]*·[ \t]*will[ \t]+retry[ \t]+in[ \t]+(?:\d+[hms][ \t]*)+·[ \t]*check[ \t]+your[ \t]+network\b`)
+	// claudeAPIServerErrorRE matches Claude Code's transient mid-response
+	// server error banner ("API Error: Server error mid-response...").
+	// Horizontal whitespace keeps the match confined to the rendered banner
+	// line, same as claudeAPIResponseRetryRE above.
+	claudeAPIServerErrorRE = regexp.MustCompile(`(?i)api error:[ \t]*server error mid-response`)
+	// claudeAPIOverloadedRE matches Claude Code's overloaded-server banner
+	// ("API Error: 529 Overloaded..."). The status code is generalized (\d+)
+	// since Anthropic may surface other codes for the same overloaded
+	// condition, not just 529.
+	claudeAPIOverloadedRE = regexp.MustCompile(`(?i)api error:[ \t]*\d+[ \t]+overloaded\b`)
 )
 
 // Stable ErrorSummary labels for Claude's built-in error forms — used as the
 // error signature (`error:<kind>`) so paraphrased instances (different reset
 // times, preceding narration) dedup to one learned signature.
 const (
-	ClaudeErrorLimit       = "usage-limit"
-	ClaudeErrorInterrupted = "interrupted"
-	ClaudeErrorAPIRetry    = "api-response-retry"
+	ClaudeErrorLimit          = "usage-limit"
+	ClaudeErrorInterrupted    = "interrupted"
+	ClaudeErrorAPIRetry       = "api-response-retry"
+	ClaudeErrorAPIServerError = "api-server-error"
+	ClaudeErrorAPIOverloaded  = "api-overloaded"
 )
 
 // ClaudeErrorForm reports whether pane content shows one of Claude Code's
@@ -46,6 +58,10 @@ func ClaudeErrorForm(pane string) (kind string, ok bool) {
 		return ClaudeErrorInterrupted, true
 	case claudeAPIResponseRetryRE.MatchString(pane):
 		return ClaudeErrorAPIRetry, true
+	case claudeAPIServerErrorRE.MatchString(pane):
+		return ClaudeErrorAPIServerError, true
+	case claudeAPIOverloadedRE.MatchString(pane):
+		return ClaudeErrorAPIOverloaded, true
 	}
 	return "", false
 }

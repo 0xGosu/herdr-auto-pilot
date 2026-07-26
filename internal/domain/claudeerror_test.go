@@ -15,6 +15,9 @@ func TestClaudeErrorForm(t *testing.T) {
 		{"interrupted prompt", "⎿  Interrupted · What should Claude do instead?\n", true},
 		{"api retry minutes and seconds", "✻ Waiting for API response · will retry in 2m 2s · check your network\n", true},
 		{"api retry seconds", "✽  waiting for api response · will retry in 45s · check your network\n", true},
+		{"api server error mid-response", "● API Error: Server error mid-response. The response above may be incomplete.\n", true},
+		{"api overloaded", "● API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.\n", true},
+		{"api overloaded other code", "● API Error: 503 Overloaded. Try again shortly.\n", true},
 		// Ordinary error-shaped narration must NOT match (the whole point of
 		// the tightening).
 		{"narrated build failure", "ERROR: build failed with exit code 1\nThe build failed. Retry, skip, or abort?\n", false},
@@ -22,6 +25,7 @@ func TestClaudeErrorForm(t *testing.T) {
 		{"narrated interrupt word", "the download was interrupted midway and resumed\n", false},
 		{"narrated network retry", "Waiting for an API response; I will retry after checking your network.\n", false},
 		{"retry without network warning", "Waiting for API response · will retry in 2m 2s\n", false},
+		{"narrated api error mention", "there was an API error in the code, let me fix it\n", false},
 		{"empty", "", false},
 	}
 	for _, tc := range cases {
@@ -46,5 +50,11 @@ func TestClaudeErrorFormKind(t *testing.T) {
 	}
 	if kind, _ := ClaudeErrorForm("Waiting for API response · will retry in 2m 2s · check your network\n"); kind != ClaudeErrorAPIRetry {
 		t.Errorf("API retry kind = %q, want %q", kind, ClaudeErrorAPIRetry)
+	}
+	if kind, _ := ClaudeErrorForm("API Error: Server error mid-response. The response above may be incomplete.\n"); kind != ClaudeErrorAPIServerError {
+		t.Errorf("API server error kind = %q, want %q", kind, ClaudeErrorAPIServerError)
+	}
+	if kind, _ := ClaudeErrorForm("API Error: 529 Overloaded. This is a server-side issue, usually temporary.\n"); kind != ClaudeErrorAPIOverloaded {
+		t.Errorf("API overloaded kind = %q, want %q", kind, ClaudeErrorAPIOverloaded)
 	}
 }
