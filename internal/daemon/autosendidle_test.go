@@ -76,16 +76,6 @@ func parkIdleOnTerminal(h *harness, agentID, terminalID string) []domain.AgentTr
 	return agents
 }
 
-// atomicBool is the bool twin of atomicString: it lets a test flip what the
-// fake LLM decides between sweeps without racing the daemon's goroutines.
-type atomicBool struct {
-	mu sync.Mutex
-	v  bool
-}
-
-func (a *atomicBool) set(v bool) { a.mu.Lock(); a.v = v; a.mu.Unlock() }
-func (a *atomicBool) get() bool  { a.mu.Lock(); defer a.mu.Unlock(); return a.v }
-
 // setPaneInfo sets what the fake reports for `pane get` (ports.InspectorPort).
 func (f *fakeHerdr) setPaneInfo(info domain.PaneInfo) {
 	f.mu.Lock()
