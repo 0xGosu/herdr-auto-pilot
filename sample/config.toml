@@ -251,6 +251,9 @@ theme = ""                 # named palette: default | dark | light | high-contra
                            # empty/unknown = default (the original look)
 terminal_bell = true       # ring the terminal bell (\a) on new escalations and on
                            # pauses caused by a different process; default on
+disable_check_for_update = false  # turn off the periodic GitHub release check — the
+                           # plugin's only outbound call; the header flags a newer
+                           # release, install it with `hap update`
 
 # Optional per-role color overrides layered on the selected theme; unset
 # roles inherit the theme. Values are terminal colors ("205", "#ff5faf").

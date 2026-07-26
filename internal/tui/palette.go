@@ -96,7 +96,11 @@ func resolvePalette(t config.TUI) palette {
 // styles are the concrete lipgloss styles the views render with, all
 // derived from one palette (CR-020, CR-024, CR-026).
 type styles struct {
-	title       lipgloss.Style
+	title lipgloss.Style
+	// version renders the build version beside the header title; it borrows
+	// the section role so every theme keeps it distinct from title, and it
+	// stays non-bold to read as secondary.
+	version     lipgloss.Style
 	activeTab   lipgloss.Style
 	inactiveTab lipgloss.Style
 	paused      lipgloss.Style
@@ -116,6 +120,7 @@ func newStyles(p palette) styles {
 	}
 	return styles{
 		title:       lipgloss.NewStyle().Bold(true).Foreground(p.title),
+		version:     lipgloss.NewStyle().Foreground(p.section),
 		activeTab:   lipgloss.NewStyle().Bold(true).Underline(true),
 		inactiveTab: lipgloss.NewStyle().Faint(true),
 		paused:      lipgloss.NewStyle().Bold(true).Foreground(p.paused),

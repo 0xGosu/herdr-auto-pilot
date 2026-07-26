@@ -415,6 +415,7 @@ per-command env notes: layering is daemon env → `env_file` → `env` → the c
 | `tui.theme` | default | TUI color theme: default, dark, light, high-contrast (in the TUI Config tab, `e` on this row opens a ↑/↓ picker of the available themes) |
 | `cli.ai_agent_friendly_output` | true | append the "Next steps" footer to command output (for AI agents driving the CLI); never affects `hap help` / `--help`, which always show theirs |
 | `tui.terminal_bell` | true | ring the terminal bell (\a) on new escalations and on pauses caused by a different process |
+| `tui.disable_check_for_update` | false | turn off the GitHub release check (at most every 6h, TUI only) that puts `↑ vX.Y.Z available` in the header. it is the plugin's ONLY outbound network call; a locally built (`plugin link`) binary never checks |
 
 TUI palette colors (`tui.palette.*`) are config.toml-only — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. values are 256-color codes (`"205"`) or hex (`"#ff5faf"`).
 
@@ -973,6 +974,7 @@ hap signatures reembed
 
 - **escalations citing `not found in PATH`** — the daemon inherits herdr's environment, which can be narrower than your shell's. make sure the CLI is reachable from a non-login shell or use an absolute path in `llm.command`.
 - **upgrades not taking effect** — the daemon is a singleton that outlives binary upgrades. since v0.1.13, `hap daemon --ensure` (fired by herdr's event hooks) detects the version mismatch and replaces the old daemon automatically. `hap status` shows the running daemon's version and flags a stale one. on older versions run `pkill -f 'hap daemon'` once after upgrading.
+- **installing a newer release** — the TUI header shows `↑ vX.Y.Z available` when one exists. `hap update` installs it (it runs `herdr plugin install 0xGosu/herdr-auto-pilot --yes`), then run the `daemon --ensure` command it prints to hand the running daemon over immediately — it names the newly installed binary by absolute path when the `hap` on PATH is still the previous build (a plugin install does not repoint that symlink). this MUTATES the install — never run it unprompted. on a linked working-tree build it refuses without `--force`, because installing a release would replace that checkout.
 
 ## notes
 

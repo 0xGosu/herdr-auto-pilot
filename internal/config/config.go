@@ -476,6 +476,10 @@ type TUI struct {
 	// because of a DIFFERENT process (another TUI instance, or `hap
 	// pause`) — not when this instance's own operator pressed "p".
 	TerminalBell bool `toml:"terminal_bell"`
+	// DisableCheckForUpdate turns off the TUI's periodic release check — the
+	// plugin's only outbound network call (NFR-007). It is named negatively so
+	// the zero value keeps the check on, the way Embedding.Disabled does.
+	DisableCheckForUpdate bool `toml:"disable_check_for_update"`
 }
 
 // CLI configures the `hap` command-line output (as opposed to the TUI).

@@ -2316,6 +2316,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"tui.max_content_height":                   "12",
 		"tui.theme":                                "dark",
 		"tui.terminal_bell":                        "true",
+		"tui.disable_check_for_update":             "true",
 		"cli.ai_agent_friendly_output":             "false",
 	}
 

@@ -34,8 +34,11 @@ and correctable.
   deploys, credential changes, …), a global pause/kill switch, a runaway-loop
   guard, and an error-retry ceiling all veto automation.
 - **Local by default** — learning data, history, and the audit log live in
-  SQLite on your machine. Hap sends no telemetry and makes no cloud call of
-  its own; an optional CLI you configure may use its provider's service.
+  SQLite on your machine. Hap sends no telemetry. Its only outbound call is a
+  version check that asks GitHub for the newest release (at most every 6h,
+  nothing about you is sent) so the TUI can flag an available update; switch it
+  off with `hap config set tui.disable_check_for_update true`. An optional CLI
+  you configure may use its provider's service.
 
 ## Quickstart
 
@@ -59,8 +62,27 @@ herdr plugin install 0xGosu/herdr-auto-pilot --yes
 
 ### Update to the latest version
 
-Re-run the install command to upgrade an existing install to the newest
-release. `--yes` skips the interactive confirmation.
+The TUI header flags a newer release next to the version
+(`Herd Auto Prompter v0.5.1 ↑ v0.5.2 available`). It learns that from a GitHub
+release check that runs at most every 6 hours while the TUI is open — the
+plugin's only outbound call, and off with
+`hap config set tui.disable_check_for_update true`. A locally built (`herdr
+plugin link`) binary never shows the hint.
+
+```sh
+hap update                                           # install the newest release
+```
+
+It prints the `daemon --ensure` command to run next. That command names the
+newly installed binary by absolute path whenever the `hap` on your PATH is
+still the previous build — a plugin install does not repoint that symlink, so
+a bare `hap daemon --ensure` could otherwise restart the version you just
+replaced.
+
+`hap update` runs the command below for you; run it directly if you prefer.
+`--yes` skips the interactive confirmation. On a linked working-tree build
+(`herdr plugin link`), `hap update` refuses without `--force` — installing a
+release there would replace your checkout.
 
 ```sh
 herdr plugin install 0xGosu/herdr-auto-pilot --yes   # download & install the latest release
@@ -963,9 +985,11 @@ adds/removes task sources (`t`/`x`), and clears learned data (`X`).
 Simple fields — numbers, booleans, and the `tui.theme` enum, including
 `llm.pane_excerpt_chars`, `llm.task_generate_timeout_seconds`,
 `embedding.model_context_window`, `safety.disable_never_auto_seed_patterns`,
-`tui.max_content_width` / `tui.max_content_height`, and `tui.terminal_bell`
+`tui.max_content_width` / `tui.max_content_height`, `tui.terminal_bell`
 (on by default — rings the terminal bell on a new escalation, and when the
-kill switch is paused by a *different* process than the TUI you're in) — edit
+kill switch is paused by a *different* process than the TUI you're in), and
+`tui.disable_check_for_update` (off by default — see *Update to the latest
+version*) — edit
 inline (`enter`) or via `hap config set <key> <value>`. Free-text fields (`llm.command`,
 `llm.command_start`, `llm.rewrite_action_fallback_template`,
 `llm.task_generate_command`,

@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/updatecheck"
 )
 
 // The command registry is the single source of truth for dispatch, help, and
@@ -160,6 +161,31 @@ func buildCommands() {
 		},
 
 		// ---------------------------------------------------------------- Operate
+		{
+			Name:    "update",
+			Group:   groupOperate,
+			Summary: "install the newest hap release",
+			Usage:   []string{"hap update", "hap update --force"},
+			Flags: []FlagDoc{
+				{Name: "--force", Desc: "required when this binary is not a release (a `herdr plugin link` working tree): installing would replace that checkout"},
+			},
+			Details: "Runs `herdr plugin install " + updatecheck.Repo + " --yes` — the same\n" +
+				"upgrade the TUI header points at when it flags a newer version. The running\n" +
+				"daemon keeps working on the old binary until it is handed over; `hap daemon\n" +
+				"--ensure` does that immediately. The printed follow-up names the NEWLY\n" +
+				"installed binary by absolute path whenever `hap` on your PATH still resolves\n" +
+				"to the previous build, so the hand-over cannot restart the old version.\n" +
+				"The version check behind the header hint is the plugin's only outbound network\n" +
+				"call; turn it off with `hap config set tui.disable_check_for_update true`.\n" +
+				"That switch silences the TUI hint; `hap update` still asks GitHub which\n" +
+				"version it is installing, because you asked for the upgrade.",
+			Next: []Hint{
+				{Cmd: "hap daemon --ensure", Why: "hand the running daemon over to the new build now"},
+				{Cmd: "hap status", Why: "confirm the daemon is healthy on the new version"},
+			},
+			Examples: []string{"hap update"},
+			Handler:  update,
+		},
 		{
 			Name:    "status",
 			Group:   groupOperate,

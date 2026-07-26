@@ -297,6 +297,10 @@ type App struct {
 	// Clock overrides the wall clock used for cache expiry; nil means
 	// time.Now. Tests inject it to exercise TTL boundaries deterministically.
 	Clock func() time.Time
+	// FetchLatestVersion resolves the newest published release tag for the
+	// update check; nil means the real GitHub call (updatecheck.Latest).
+	// Tests inject it so no test ever opens a network connection.
+	FetchLatestVersion func(ctx context.Context) (string, error)
 
 	// cwdMu/cwdCache memoize pane working directories for FillAgentCwds.
 	// Without this, the TUI's 2s refresh would spawn one `herdr pane get` per
@@ -1889,6 +1893,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
 	{Key: "tui.terminal_bell", TUIEditable: true},
+	{Key: "tui.disable_check_for_update", TUIEditable: true},
 	{Key: "cli.ai_agent_friendly_output", TUIEditable: true},
 }
 
@@ -2047,6 +2052,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return cfg.TUI.Theme
 	case "tui.terminal_bell":
 		return strconv.FormatBool(cfg.TUI.TerminalBell)
+	case "tui.disable_check_for_update":
+		return strconv.FormatBool(cfg.TUI.DisableCheckForUpdate)
 	case "cli.ai_agent_friendly_output":
 		return strconv.FormatBool(cfg.CLI.AIAgentFriendlyOutput)
 	}
@@ -2286,6 +2293,13 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("tui.terminal_bell must be true or false, got %q", value)
 			}
 			cfg.TUI.TerminalBell = v
+			return nil
+		case "tui.disable_check_for_update":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("tui.disable_check_for_update must be true or false, got %q", value)
+			}
+			cfg.TUI.DisableCheckForUpdate = v
 			return nil
 		case "cli.ai_agent_friendly_output":
 			v, err := strconv.ParseBool(value)
