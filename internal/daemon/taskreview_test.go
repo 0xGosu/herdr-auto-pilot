@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
@@ -67,7 +68,7 @@ func TestDeclaredTaskLLMReviewApproveSends(t *testing.T) {
 	// delivered once it clears the confidence gate.
 	taskFile := writeReviewTaskFile(t, "- [x] scaffold the module\n- [-] warm caches\n- [ ] refactor the parser\n- [ ] add parser tests\n")
 	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-rev\"\npath = %q\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-rev\"\npath = %q\nenable_llm_review = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.llm.configured = true
@@ -135,7 +136,7 @@ func TestDeclaredTaskLLMReviewSendProposedSentinel(t *testing.T) {
 	// task and sends that (no paraphrase, no wasted tokens).
 	taskFile := writeReviewTaskFile(t, "- [ ] refactor the parser\n")
 	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-sentinel\"\npath = %q\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-sentinel\"\npath = %q\nenable_llm_review = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.llm.configured = true
@@ -241,7 +242,7 @@ func TestDeclaredTaskLLMReviewLearnsSymbolicAction(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			taskFile := writeReviewTaskFile(t, "- [ ] refactor the parser\n")
-			cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-sym\"\npath = %q\n", taskFile)
+			cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-sym\"\npath = %q\nenable_llm_review = true\n", taskFile)
 			h := newHarness(t, cfg)
 			h.herdr.setPane("All tests pass. Task is complete.\n")
 			h.llm.configured = true
@@ -274,7 +275,7 @@ func TestDeclaredTaskLLMReviewEscalationSuggestionRoundTrips(t *testing.T) {
 	// prefix so a confirm round-trips to the symbolic action, while the operator
 	// still reads the real instruction.
 	taskFile := writeReviewTaskFile(t, "- [ ] refactor the parser\n")
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 95\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-rt\"\npath = %q\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 95\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-rt\"\npath = %q\nenable_llm_review = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane("All tests pass. Task is complete.\n")
 	h.llm.configured = true
@@ -310,7 +311,7 @@ func TestDeclaredTaskReviewCorrectionLearnsSymbolic(t *testing.T) {
 	// task's text. This is the second half of the leak: the suggestion carries
 	// the real text, and the confirm flow round-trips it back to the sentinel.
 	taskFile := writeReviewTaskFile(t, "- [ ] refactor the parser\n")
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 95\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-corr\"\npath = %q\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 95\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-corr\"\npath = %q\nenable_llm_review = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane("All tests pass. Task is complete.\n")
 	h.llm.configured = true
@@ -417,7 +418,7 @@ func TestDeclaredTaskLLMReviewDeclineEscalates(t *testing.T) {
 	// rationale. Nothing is sent.
 	taskFile := writeReviewTaskFile(t, "- [ ] update the changelog\n")
 	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-dec\"\npath = %q\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-dec\"\npath = %q\nenable_llm_review = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.llm.configured = true
@@ -473,7 +474,7 @@ func TestDeclaredTaskLLMReviewConfidentDeclineSkips(t *testing.T) {
 	// sent, nothing is escalated, and a noop is recorded.
 	taskFile := writeReviewTaskFile(t, "- [ ] update the changelog\n")
 	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-skip\"\npath = %q\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-skip\"\npath = %q\nenable_llm_review = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.llm.configured = true
@@ -518,7 +519,7 @@ func TestRetryDeclaredTaskReviewConfidentNoopEscalates(t *testing.T) {
 	// with a human-readable no-reply suggestion.
 	taskFile := writeReviewTaskFile(t, "- [ ] update the changelog\n")
 	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-retry-noop\"\npath = %q\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-retry-noop\"\npath = %q\nenable_llm_review = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.llm.configured = true
@@ -599,7 +600,7 @@ func TestDeclaredTaskLLMReviewDeclineDoesNotReconsult(t *testing.T) {
 	// escalation is still pending.
 	taskFile := writeReviewTaskFile(t, "- [ ] update the changelog\n")
 	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-dec2\"\npath = %q\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-dec2\"\npath = %q\nenable_llm_review = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.llm.configured = true
@@ -647,20 +648,21 @@ func TestDeclaredTaskLLMReviewDeclineDoesNotReconsult(t *testing.T) {
 	}
 }
 
-func TestDeclaredTaskLLMReviewOptOut(t *testing.T) {
-	// A source with enable_llm_review=false keeps the plain declared-task flow even
-	// when an LLM command is configured: the templated prompt is sent directly
-	// and the LLM is never consulted.
+func TestDeclaredTaskLLMReviewOffByDefault(t *testing.T) {
+	// The review is opt-IN: a source that never names enable_llm_review keeps the
+	// plain declared-task flow even when an LLM command is configured — the
+	// templated prompt is sent directly and the LLM is never consulted. This is
+	// the guard for the default itself, so the config below must NOT set the key.
 	taskFile := writeReviewTaskFile(t, "- [ ] write the docs\n")
 	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-opt\"\npath = %q\nenable_llm_review = false\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-opt\"\npath = %q\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.llm.configured = true
 	var consulted atomicString
 	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
 		consulted.set("yes")
-		return nil, errors.New("opt-out source must not consult the LLM")
+		return nil, errors.New("a source without enable_llm_review must not consult the LLM")
 	}
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
@@ -672,10 +674,10 @@ func TestDeclaredTaskLLMReviewOptOut(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
 	want := (&domain.DeclaredTask{Task: "write the docs", Path: taskFile, AgentName: name}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
-		t.Errorf("opt-out source should send the templated prompt directly, got %q", got)
+		t.Errorf("a source without enable_llm_review should send the templated prompt directly, got %q", got)
 	}
 	if consulted.get() != "" {
-		t.Error("opt-out source must not consult the LLM")
+		t.Error("a source without enable_llm_review must not consult the LLM")
 	}
 }
 
@@ -684,7 +686,7 @@ func TestDeclaredTaskLLMReviewPendingCheckErrorEscalates(t *testing.T) {
 	// silently drop the task.
 	taskFile := writeReviewTaskFile(t, "- [ ] do the thing\n")
 	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-pce\"\npath = %q\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-pce\"\npath = %q\nenable_llm_review = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.llm.configured = true
@@ -710,7 +712,7 @@ func TestDeclaredTaskLLMReviewSourceChangedEscalates(t *testing.T) {
 	// (now stale) task must NOT be injected — escalate instead.
 	taskFile := writeReviewTaskFile(t, "- [ ] original task\n")
 	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-src\"\npath = %q\n", taskFile)
+	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-src\"\npath = %q\nenable_llm_review = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.llm.configured = true
@@ -883,5 +885,32 @@ func TestConsultContextNoInProgressOmitsFirstInProgressField(t *testing.T) {
 	}
 	if _, present := m["first_in_progress_task"]; present {
 		t.Errorf("first_in_progress_task must be absent when nothing is in progress, got %v", m["first_in_progress_task"])
+	}
+}
+
+// TestDeclaredTaskLLMReviewOffForAutoSendSourceBuiltInMemory pins the
+// defense-in-depth half of config.TaskSource.LLMReviewEnabled. Load coerces a
+// conflicting pair, so the through-Load path can never carry both — but a
+// Config built in memory (a test harness, the generated-task bootstrap's
+// append) reaches neither Load nor a write surface, and must still resolve an
+// auto-send source to "no review".
+func TestDeclaredTaskLLMReviewOffForAutoSendSourceBuiltInMemory(t *testing.T) {
+	taskFile := writeReviewTaskFile(t, "- [ ] write the docs\n")
+	on := true
+	src := config.TaskSource{
+		Agent: "agent-mem", Path: taskFile,
+		EnableLLMReview:            &on,
+		EnableAutoSendTaskWhenIdle: true,
+	}
+	if src.LLMReviewEnabled() {
+		t.Fatal("an auto-send source must never resolve to review-on, even unloaded")
+	}
+	// And the raw key is still readable, so a write surface can detect the
+	// conflict that the resolver folds away.
+	if !src.LLMReviewRequested() {
+		t.Error("LLMReviewRequested must report the raw key so validation can see it")
+	}
+	if err := config.ValidateTaskSource(src); err == nil {
+		t.Error("ValidateTaskSource must reject the pair a write path would persist")
 	}
 }

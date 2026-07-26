@@ -547,12 +547,13 @@ path = "/home/me/project/docs/tasks.md"
 # {task_list_path_quoted} — the path as one shell word, for commands the agent
 # runs — {agent_name}, {cwd}):
 next_task_template = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}. Verify task dependencies before starting. When there is no task available, focus on improving the test coverage of this project."
-# When an [llm].command is configured, each determined task is first reviewed by
-# the LLM before it is sent (see "Reviewing tasks before they are sent" below).
-# Default: on. Opt this source out with:
-# enable_llm_review = false
+# When an [llm].command is configured, each determined task can first be reviewed
+# by the LLM before it is sent (see "Reviewing tasks before they are sent"
+# below). Default: OFF. Opt this source in with:
+# enable_llm_review = true
 # Also hand out tasks on a timer, not only on a herdr attention event (see
-# "Keeping idle agents working" below). Default: off.
+# "Keeping idle agents working" below). Default: off. Mutually exclusive with
+# enable_llm_review above.
 # enable_auto_send_task_when_idle = true
 ```
 
@@ -570,8 +571,17 @@ existing source with `hap task-source set <index> auto-send-when-idle true`
 polls once a minute: any agent that source matches which has been idle for
 more than a minute is handed its next pending `[ ]` item. Delivery goes
 through the normal pipeline, so the kill switch, never-auto patterns, rate
-limits, per-agent disable and `enable_llm_review` all still apply, and every
-send is audited (trigger `auto-idle-send`).
+limits and per-agent disable all still apply, and every send is audited
+(trigger `auto-idle-send`).
+
+The pre-send LLM review does **not** apply: `enable_auto_send_task_when_idle`
+and `enable_llm_review` are mutually exclusive. Unattended hand-out exists to
+drive an agent with nobody watching, while a declined review escalates to an
+operator who by construction is not there — and a pending escalation stops the
+idle poll for that agent, silently switching the feature off. Setting the
+second flag from the CLI or TUI is refused (hap never clears the first one for
+you); a config file carrying both loads with a warning and the review forced
+off.
 
 Two rules keep unattended hand-out safe:
 
@@ -855,10 +865,18 @@ an operator confirmation of a low-confidence review learns the same symbolic
 action. The sentinel is rejected if an LLM submits it outside a task review
 that actually carries a proposed task.
 
-This is **on by default** whenever the LLM command exists; set
-`enable_llm_review = false` on a `[[task_sources]]` entry to keep the plain
-declared-task flow for that source. (The former `llm_review` key still loads
-and migrates to the new name on the next config save.)
+This is **off by default**; set `enable_llm_review = true` on a
+`[[task_sources]]` entry to opt that source in, either by hand, with
+`hap task-source set <index> enable-llm-review true`, or from the *Config*
+tab's `enter` on a task-source row. `hap task-source list` and the *Config*
+tab always print the resolved value, so a source that never named the key
+still shows `enable_llm_review=false` rather than leaving you to guess.
+(The former `llm_review` key still loads and migrates to the new name on the
+next config save; the CLI refuses that spelling.)
+
+It is **mutually exclusive with `enable_auto_send_task_when_idle`** — see
+"Keeping idle agents working" above for why, and what happens to a config
+that sets both.
 
 ### Never-auto patterns
 
@@ -1205,7 +1223,7 @@ Invariants:
   the menu untouched. Only literal free text goes through the review.
 - **Declared tasks are never reviewed here** — a task from a
   `[[task_sources]]` entry is covered by that source's `enable_llm_review`
-  gate, and a source that opted out delivers its tasks verbatim.
+  gate, and a source that did not opt in delivers its tasks verbatim.
 - **A review failure never blocks the send**: on error, timeout, or empty
   output the original text is delivered exactly as it was. Set
   `rewrite_action_fallback_template` (`{original_text}`, `{agent_name}`

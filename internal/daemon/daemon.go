@@ -1491,8 +1491,9 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		irrevHit, suspected = allow.SuspectedIrreversible(situation.AgentType, scan)
 	}
 
-	// Pre-send LLM review of a determined declared task (opt-out per source via
-	// llm_review=false): when an LLM command is configured, the LLM — not
+	// Pre-send LLM review of a determined declared task (opt-IN per source via
+	// enable_llm_review=true; off by default, and never on for an auto-send
+	// source): when an LLM command is configured, the LLM — not
 	// shadow-mode graduation — decides whether this task should be sent to the
 	// idle agent now, seeing the live pane through get_context. A decline
 	// escalates to the operator; an approval is still re-gated in
@@ -2434,6 +2435,11 @@ func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s d
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
 		TaskReview: true, ProposedTask: proposed,
 		SourcePath: declared.Path, ReviewedTask: declared.Task,
+		// Always false today: a source with enable_auto_send_task_when_idle is
+		// never LLM-reviewed (the two config keys are mutually exclusive), so no
+		// reserving delivery reaches a task review. Carried anyway so the
+		// reserve-through-review path stays correct if that policy is relaxed —
+		// and pinned at consult time on purpose (see handleLLMOutcome).
 		ReserveTask:  declared.Reserve,
 		RetryAuditID: s.RetryAuditID,
 	}
@@ -3810,6 +3816,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		// first pending item (a sibling agent took that one), so a claimed task
 		// only has to be still pending; every other review keeps the strict
 		// "still the next task" check.
+		//
+		// `claimed` cannot fire while the two config keys are mutually
+		// exclusive: a claim exists only for an auto-send source, and an
+		// auto-send source is never LLM-reviewed. Kept for the same reason as
+		// ReserveTask below.
 		claim, claimed := d.autoTaskClaimFor(s.AgentID)
 		claimed = claimed && claim.sourcePath == canonicalTaskPath(res.request.SourcePath) &&
 			claim.taskText == res.request.ReviewedTask
@@ -3825,6 +3836,10 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		// the same line is handed out again. The flag is the one pinned on the
 		// request at consult time — re-reading the config here would let a
 		// reload mid-review silently downgrade this to an unreserved send.
+		//
+		// Unreachable while enable_llm_review and enable_auto_send_task_when_idle
+		// are mutually exclusive; kept so a reserving review reserves correctly
+		// if that policy ever changes.
 		if res.request.ReserveTask {
 			// The review may have swapped to a different pending item, so
 			// reserve the item the outbound text actually consumes, not the one
@@ -4530,12 +4545,14 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 		// escalates the hand-out instead of auto-sending it, which is the safe
 		// direction (more review, never less).
 		Content: domain.FoldTaskContent(string(m.data), task),
-		// A source opts out of the pre-send LLM review with llm_review=false
-		// (nil = the default, on).
-		LLMReview: m.src.EnableLLMReview == nil || *m.src.EnableLLMReview,
+		// The source's pre-send LLM review is opt-in (enable_llm_review=true,
+		// off by default) and is never on for an auto-send source —
+		// LLMReviewEnabled owns both halves of that rule.
+		LLMReview: m.src.LLMReviewEnabled(),
 		// An auto-send source hands tasks out unattended, so the delivered
 		// item must be marked "[-]" as it goes — otherwise the next idle agent
-		// is handed the very same "[ ]" line.
+		// is handed the very same "[ ]" line. Reserve and LLMReview above are
+		// mutually exclusive by construction.
 		Reserve: m.src.EnableAutoSendTaskWhenIdle,
 	}
 }

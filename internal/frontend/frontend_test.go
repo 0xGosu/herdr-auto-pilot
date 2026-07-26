@@ -4491,6 +4491,145 @@ func TestAddTaskSourceAutoSendWhenIdleOption(t *testing.T) {
 	}
 }
 
+// TestAddTaskSourceLLMReviewOption pins the opt-in review flag: it round-trips
+// as an explicit value (the field is a *bool, so "explicitly off" must be
+// distinguishable from "never decided" on disk), and an add that names neither
+// flag lands with review off — the new default.
+func TestAddTaskSourceLLMReviewOption(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain.md")
+	on := filepath.Join(dir, "on.md")
+	off := filepath.Join(dir, "off.md")
+
+	if err := app.AddTaskSource(ctx, "quiet-fox", "", plain, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "busy-otter", "", on, "", frontend.LLMReview(true)); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "calm-vole", "", off, "", frontend.LLMReview(false)); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.TaskSources) != 3 {
+		t.Fatalf("want 3 task sources, got %d", len(reloaded.TaskSources))
+	}
+	if reloaded.TaskSources[0].LLMReviewEnabled() {
+		t.Error("an add with no option must leave the review off — that is the default")
+	}
+	if !reloaded.TaskSources[1].LLMReviewEnabled() {
+		t.Error("LLMReview(true) did not round-trip through config.toml")
+	}
+	// Asserted on the POINTER, not the resolver: !LLMReviewEnabled() would also
+	// pass for nil and would not prove an explicit false was written.
+	if got := reloaded.TaskSources[2].EnableLLMReview; got == nil || *got {
+		t.Errorf("LLMReview(false) must persist as an explicit false, got %v", got)
+	}
+}
+
+// TestTaskSourceReviewAndAutoSendAreMutuallyExclusive pins the rule at every
+// write surface and in BOTH directions. Nothing auto-clears the other flag: hap
+// refuses and names both keys, so the operator decides which one they meant.
+func TestTaskSourceReviewAndAutoSendAreMutuallyExclusive(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	// AddTaskSource is the one path where both arrive at once, in either order.
+	both := filepath.Join(dir, "both.md")
+	for _, opts := range [][]frontend.TaskSourceOption{
+		{frontend.LLMReview(true), frontend.AutoSendWhenIdle()},
+		{frontend.AutoSendWhenIdle(), frontend.LLMReview(true)},
+	} {
+		err := app.AddTaskSource(ctx, "clashing", "", both, "", opts...)
+		if !errors.Is(err, config.ErrTaskSourceReviewExclusive) {
+			t.Fatalf("AddTaskSource must refuse both flags, got %v", err)
+		}
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 0 {
+		t.Fatalf("a refused add must not append a source, got %d", len(cfg.TaskSources))
+	}
+
+	// Direction 1: review on, then turning auto-send on.
+	reviewed := filepath.Join(dir, "reviewed.md")
+	if err := app.AddTaskSource(ctx, "reviewer", "", reviewed, "", frontend.LLMReview(true)); err != nil {
+		t.Fatal(err)
+	}
+	// Direction 2: auto-send on, then turning review on.
+	handout := filepath.Join(dir, "handout.md")
+	if err := app.AddTaskSource(ctx, "handout", "", handout, "", frontend.AutoSendWhenIdle()); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.SetTaskSourceAutoSend(ctx, 0, cfg.TaskSources[0], true); !errors.Is(err, config.ErrTaskSourceReviewExclusive) {
+		t.Errorf("turning auto-send on over a reviewed source must be refused, got %v", err)
+	}
+	if err := app.SetTaskSourceLLMReview(ctx, 1, cfg.TaskSources[1], true); !errors.Is(err, config.ErrTaskSourceReviewExclusive) {
+		t.Errorf("turning review on over an auto-send source must be refused, got %v", err)
+	}
+	// A refused edit must leave the file untouched — updateTaskSource validates a
+	// copy, so nothing half-written reaches Save.
+	reloaded, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.TaskSources[0].EnableAutoSendTaskWhenIdle || !reloaded.TaskSources[0].LLMReviewEnabled() {
+		t.Errorf("refused edit changed the reviewed source: %+v", reloaded.TaskSources[0])
+	}
+	if reloaded.TaskSources[1].LLMReviewRequested() || !reloaded.TaskSources[1].EnableAutoSendTaskWhenIdle {
+		t.Errorf("refused edit changed the auto-send source: %+v", reloaded.TaskSources[1])
+	}
+
+	// The way out always works: turn the standing flag off, then the other on.
+	if err := app.SetTaskSourceLLMReview(ctx, 0, reloaded.TaskSources[0], false); err != nil {
+		t.Fatalf("turning the standing flag off must always succeed, got %v", err)
+	}
+	if cfg, err = app.Config(); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SetTaskSourceAutoSend(ctx, 0, cfg.TaskSources[0], true); err != nil {
+		t.Fatalf("auto-send must be settable once review is off, got %v", err)
+	}
+}
+
+// TestSetTaskSourceMaxTasksIgnoresReviewExclusion guards the blast radius of the
+// validation living in updateTaskSource: an edit that touches neither exclusive
+// flag must never be refused because of them.
+func TestSetTaskSourceMaxTasksIgnoresReviewExclusion(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := app.AddTaskSource(ctx, "handout", "", path, "", frontend.AutoSendWhenIdle()); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SetTaskSourceMaxTasks(ctx, 0, cfg.TaskSources[0], 7); err != nil {
+		t.Fatalf("an unrelated edit must not be gated on the exclusive pair, got %v", err)
+	}
+	reloaded, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.TaskSources[0].MaxTasks != 7 {
+		t.Errorf("max_tasks = %d, want 7", reloaded.TaskSources[0].MaxTasks)
+	}
+}
+
 // TestRemoveTaskSourceKeepsChecklistFile pins the contract the TUI's Tasks-tab
 // `x` advertises: removing a source retires the config entry only. Source
 // files are often hand-written docs hap never created and could not restore.

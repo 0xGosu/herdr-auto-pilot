@@ -157,14 +157,15 @@ func TestActionReviewSkippedForMenuMappedApproval(t *testing.T) {
 
 func TestActionReviewSkippedForDeclaredTask(t *testing.T) {
 	// A declared task from a [[task_sources]] is never action-reviewed: the
-	// source's enable_llm_review gate owns task review, and an opted-out
-	// source delivers its tasks verbatim.
+	// source's enable_llm_review gate owns task review, and a source that did
+	// not opt in delivers its tasks verbatim. The key is deliberately absent —
+	// off is the default, so the source needs no opt-out.
 	dir := t.TempDir()
 	taskFile := filepath.Join(dir, "tasks.md")
 	os.WriteFile(taskFile, []byte("- [ ] step two\n"), 0o600)
 	idlePane := "All tests pass. Task is complete.\n"
 	cfg := reviewCfg("") +
-		fmt.Sprintf("\n[[task_sources]]\nagent = \"agent-ar3\"\npath = %q\nenable_llm_review = false\n", taskFile)
+		fmt.Sprintf("\n[[task_sources]]\nagent = \"agent-ar3\"\npath = %q\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(idlePane)
 	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)

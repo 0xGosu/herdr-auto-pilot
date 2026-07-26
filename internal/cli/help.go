@@ -571,9 +571,9 @@ func buildCommands() {
 			Group:   groupConfigure,
 			Summary: "declare which checklist file feeds which agent (the config, not the items)",
 			Usage: []string{
-				"hap task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--max-tasks N] <checklist.md>",
+				"hap task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--enable-llm-review] [--max-tasks N] <checklist.md>",
 				"hap task-source list",
-				"hap task-source set <index> <auto-send-when-idle|max-tasks> <value>",
+				"hap task-source set <index> <auto-send-when-idle|enable-llm-review|max-tasks> <value>",
 				"hap task-source remove <index>",
 			},
 			Flags: []FlagDoc{
@@ -581,19 +581,27 @@ func buildCommands() {
 				{Name: "--workspace", Arg: "W", Desc: "workspace name this source applies to (\"*\" wildcards, e.g. \"codex-*\")"},
 				{Name: "--template", Arg: "T", Desc: "next-task prompt template; placeholders {next_task_content} {task_list_path} {task_list_path_quoted} {agent_name} {cwd}"},
 				{Name: "--auto-send-when-idle", Desc: "also hand out tasks on the periodic idle poll, not only on a herdr attention event"},
+				{Name: "--enable-llm-review", Desc: "review each determined task with the configured [llm].command before sending it; mutually exclusive with --auto-send-when-idle"},
 				{Name: "--max-tasks", Arg: "N", Default: "config default", Desc: "cap on how many items this list may hold before task generation stops refilling it"},
 			},
 			Details: "Flags must come BEFORE the <checklist.md> path — Go's flag parsing stops at the\n" +
 				"first positional argument, so a flag written after the path is silently ignored\n" +
 				"(hap detects that case and refuses).\n" +
-				"`set` edits an existing source; only auto-send-when-idle and max-tasks are\n" +
-				"editable — changing the path/agent/workspace is remove-and-re-add, since it\n" +
-				"silently re-points an agent's work.\n" +
+				"`set` edits an existing source; only auto-send-when-idle, enable-llm-review\n" +
+				"and max-tasks are editable — changing the path/agent/workspace is\n" +
+				"remove-and-re-add, since it silently re-points an agent's work.\n" +
+				"auto-send-when-idle and enable-llm-review are mutually exclusive: auto-send\n" +
+				"drives an agent with nobody watching, while enable_llm_review escalates a\n" +
+				"declined task to the operator who is not there — and a pending escalation\n" +
+				"stops the idle poll. Setting either while the other is on is refused; turn\n" +
+				"the other off first, hap never clears it for you.\n" +
+				"enable_llm_review defaults to OFF; `task-source list` always prints it.\n" +
 				"Use `hap task` to manage the ITEMS inside the file.",
 			Examples: []string{
 				"hap task-source add --agent vivid-falcon --max-tasks 20 ./docs/tasks.md",
 				"hap task-source list",
 				"hap task-source set 0 auto-send-when-idle true",
+				"hap task-source set 0 enable-llm-review true",
 			},
 			Next: []Hint{
 				{Cmd: "hap task-source list", Why: "confirm the source and its index"},

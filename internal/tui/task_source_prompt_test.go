@@ -43,8 +43,10 @@ func submitSourcePrompt(t *testing.T, m Model, input string) actionResultMsg {
 	if m.prompt == nil {
 		t.Fatal("addTaskSourcePrompt did not open a prompt")
 	}
-	if !strings.Contains(m.prompt.label, "--auto-send-when-idle") {
-		t.Errorf("prompt label must advertise the flag, got %q", m.prompt.label)
+	for _, flag := range []string{"--auto-send-when-idle", "--enable-llm-review"} {
+		if !strings.Contains(m.prompt.label, flag) {
+			t.Errorf("prompt label must advertise %s, got %q", flag, m.prompt.label)
+		}
 	}
 	cmd := m.prompt.onSubmit(input)
 	if cmd == nil {
@@ -181,8 +183,25 @@ func editSourceSetting(t *testing.T, m Model, index int, path, pick, value strin
 	t.Helper()
 	upd, _ := m.editTaskSourcePrompt(index, path)
 	m = upd.(Model)
-	if m.prompt == nil || len(m.prompt.options) != 2 {
-		t.Fatalf("expected a two-option settings picker, got %+v", m.prompt)
+	if m.prompt == nil {
+		t.Fatal("settings picker did not open")
+	}
+	// Asserted as a SET rather than a count, so adding a tsField* without wiring
+	// it into the picker fails by NAME instead of by arithmetic.
+	want := []string{tsFieldAutoSend, tsFieldLLMReview, tsFieldMaxTasks}
+	if len(m.prompt.options) != len(want) {
+		t.Fatalf("picker should offer %d settings, got %v", len(want), m.prompt.options)
+	}
+	for _, key := range want {
+		found := false
+		for _, o := range m.prompt.options {
+			if strings.HasPrefix(o, key) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("picker is missing the %s row: %v", key, m.prompt.options)
+		}
 	}
 	var chosen string
 	for _, o := range m.prompt.options {
@@ -593,5 +612,257 @@ func TestTUIAddTaskSourceMaxTasksRejectsBadValues(t *testing.T) {
 		if len(cfg.TaskSources) != 0 {
 			t.Errorf("input %q added a source anyway: %+v", input, cfg.TaskSources)
 		}
+	}
+}
+
+// TestConfigTabEditsTaskSourceLLMReview pins the headline of this change: the
+// review gate is editable from the Config tab, and the value reaches
+// config.toml (the daemon reads the file, not the model).
+func TestConfigTabEditsTaskSourceLLMReview(t *testing.T) {
+	m, app, path := sourcePromptModel(t)
+	if msg := submitSourcePrompt(t, m, path+" busy-otter"); msg.err != nil {
+		t.Fatal(msg.err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.data.cfg = cfg
+	m.items = buildRuleItems(cfg)
+
+	if msg := editSourceSetting(t, m, 0, path, tsFieldLLMReview, "true"); msg.err != nil {
+		t.Fatalf("turning the review on failed: %v", msg.err)
+	} else if !strings.Contains(msg.message, "LLM review before sending") {
+		t.Errorf("result message = %q, want it to name the setting", msg.message)
+	}
+	reloaded, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.TaskSources[0].LLMReviewEnabled() {
+		t.Fatalf("enable_llm_review did not reach config.toml: %+v", reloaded.TaskSources[0])
+	}
+
+	// And back off — as an EXPLICIT false, so the choice is recorded on disk
+	// rather than collapsing to an absent key that reads as "never decided".
+	m.data.cfg = reloaded
+	m.items = buildRuleItems(reloaded)
+	if msg := editSourceSetting(t, m, 0, path, tsFieldLLMReview, "false"); msg.err != nil {
+		t.Fatalf("turning the review off failed: %v", msg.err)
+	}
+	if reloaded, err = config.Load(app.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.TaskSources[0].EnableLLMReview; got == nil || *got {
+		t.Errorf("enable_llm_review must persist as an explicit false, got %v", got)
+	}
+}
+
+// TestConfigTabSourceRowShowsLLMReview: the row always prints the resolved
+// review state. Unlike auto_send_when_idle (shown only when true, because true
+// is the risky state), here FALSE is the state that changes behavior silently —
+// and it is what every config becomes on upgrade without touching a key.
+func TestConfigTabSourceRowShowsLLMReview(t *testing.T) {
+	yes, no := true, false
+	for _, tc := range []struct {
+		name   string
+		review *bool
+		want   string
+	}{
+		{"unset renders false", nil, "enable_llm_review=false"},
+		{"explicit false", &no, "enable_llm_review=false"},
+		{"explicit true", &yes, "enable_llm_review=true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{TaskSources: []config.TaskSource{
+				{Agent: "a", Path: "/tmp/tasks.md", EnableLLMReview: tc.review},
+			}}
+			items := buildRuleItems(cfg)
+			var label string
+			for _, it := range items {
+				if it.kind == "source" {
+					label = it.label
+				}
+			}
+			if !strings.Contains(label, tc.want) {
+				t.Errorf("row = %q, want it to contain %q", label, tc.want)
+			}
+			// The field is a *bool: a %v on the pointer would print an address.
+			if strings.Contains(label, "0x") {
+				t.Errorf("row leaked a pointer address: %q", label)
+			}
+		})
+	}
+}
+
+// TestConfigTabTaskSourceReviewExclusionIsRefused: the TUI surfaces the
+// frontend's refusal verbatim, in both directions, and changes nothing.
+func TestConfigTabTaskSourceReviewExclusionIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup []frontend.TaskSourceOption
+		pick  string
+	}{
+		{"review on over an auto-send source", []frontend.TaskSourceOption{frontend.AutoSendWhenIdle()}, tsFieldLLMReview},
+		{"auto-send on over a reviewed source", []frontend.TaskSourceOption{frontend.LLMReview(true)}, tsFieldAutoSend},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, app, path := sourcePromptModel(t)
+			if err := app.AddTaskSource(context.Background(), "otter", "", path, "", tc.setup...); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := app.Config()
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.data.cfg = cfg
+			m.items = buildRuleItems(cfg)
+
+			msg := editSourceSetting(t, m, 0, path, tc.pick, "true")
+			if msg.err == nil {
+				t.Fatal("setting the second exclusive flag must be refused")
+			}
+			for _, key := range []string{"enable_llm_review", "enable_auto_send_task_when_idle"} {
+				if !strings.Contains(msg.err.Error(), key) {
+					t.Errorf("error must name %q, got %v", key, msg.err)
+				}
+			}
+			reloaded, err := config.Load(app.ConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// EnableLLMReview is a pointer, so the structs never compare equal
+			// across a reload — assert the resolved values that actually matter.
+			got, want := reloaded.TaskSources[0], cfg.TaskSources[0]
+			if got.LLMReviewEnabled() != want.LLMReviewEnabled() ||
+				got.EnableAutoSendTaskWhenIdle != want.EnableAutoSendTaskWhenIdle {
+				t.Errorf("a refused edit changed the source: %+v", got)
+			}
+		})
+	}
+}
+
+// TestConfigTabTaskSourcePickerShowsBlockedSetting: nothing auto-clears the
+// other flag, so the picker says which row is currently blocked — the operator
+// learns the constraint BEFORE walking both prompt steps to earn a rejection.
+func TestConfigTabTaskSourcePickerShowsBlockedSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		setup   []frontend.TaskSourceOption
+		blocked string
+	}{
+		{"auto-send blocks review", []frontend.TaskSourceOption{frontend.AutoSendWhenIdle()}, tsFieldLLMReview},
+		{"review blocks auto-send", []frontend.TaskSourceOption{frontend.LLMReview(true)}, tsFieldAutoSend},
+		{"a clean source blocks neither", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, app, path := sourcePromptModel(t)
+			if err := app.AddTaskSource(context.Background(), "otter", "", path, "", tc.setup...); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := app.Config()
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.data.cfg = cfg
+			m.items = buildRuleItems(cfg)
+
+			upd, _ := m.editTaskSourcePrompt(0, path)
+			m = upd.(Model)
+			if m.prompt == nil {
+				t.Fatal("picker did not open")
+			}
+			for _, o := range m.prompt.options {
+				isBlocked := strings.Contains(o, "blocked while")
+				if tc.blocked == "" && isBlocked {
+					t.Errorf("a clean source must block nothing, got %q", o)
+				}
+				if tc.blocked != "" && strings.HasPrefix(o, tc.blocked) && !isBlocked {
+					t.Errorf("%q should be marked blocked, got %q", tc.blocked, o)
+				}
+			}
+		})
+	}
+}
+
+// TestTaskSourceFieldPromptRejectsUnknownField guards the removal of the
+// max_tasks fallthrough: an unrecognized field key must dead-end, not silently
+// open the CAP prompt and edit the wrong setting. Before the switch this test
+// would have passed while editing max_tasks.
+func TestTaskSourceFieldPromptRejectsUnknownField(t *testing.T) {
+	m, app, path := sourcePromptModel(t)
+	if err := app.AddTaskSource(context.Background(), "otter", "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.data.cfg = cfg
+	m.items = buildRuleItems(cfg)
+
+	upd, _ := m.Update(openTaskSourceFieldMsg{index: 0, expected: cfg.TaskSources[0], field: "bogus"})
+	m = upd.(Model)
+	if m.prompt != nil {
+		t.Fatalf("an unknown field must open no prompt, got %+v", m.prompt)
+	}
+	if !strings.Contains(m.message, "bogus") {
+		t.Errorf("message should name the unknown field, got %q", m.message)
+	}
+}
+
+// TestTUIAddTaskSourceLLMReviewParity pins CLI/TUI parity for the review flag:
+// the same `--enable-llm-review` word, in any position, and an add that does not
+// ask for it leaves the review off.
+func TestTUIAddTaskSourceLLMReviewParity(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string // %s is replaced by the checklist path
+		want  bool
+	}{
+		{name: "path only", input: "%s"},
+		{name: "flag last", input: "%s brave-otter --enable-llm-review", want: true},
+		{name: "flag first", input: "--enable-llm-review %s brave-otter", want: true},
+		{name: "flag mid", input: "%s --enable-llm-review brave-otter ws-1", want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, app, path := sourcePromptModel(t)
+			msg := submitSourcePrompt(t, m, strings.ReplaceAll(tc.input, "%s", path))
+			if msg.err != nil {
+				t.Fatal(msg.err)
+			}
+			cfg, err := config.Load(app.ConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.TaskSources[0].LLMReviewEnabled(); got != tc.want {
+				t.Errorf("enable_llm_review = %v, want %v", got, tc.want)
+			}
+			if tc.want && !strings.Contains(msg.message, "LLM review before sending ON") {
+				t.Errorf("success message must echo the parsed flag, got %q", msg.message)
+			}
+		})
+	}
+}
+
+// TestTUIAddTaskSourceRejectsReviewWithAutoSend: both flags in one add line is
+// the one place the conflict arrives at once, and it must create nothing.
+func TestTUIAddTaskSourceRejectsReviewWithAutoSend(t *testing.T) {
+	m, app, path := sourcePromptModel(t)
+	msg := submitSourcePrompt(t, m, path+" otter --auto-send-when-idle --enable-llm-review")
+	if msg.err == nil {
+		t.Fatal("an add naming both exclusive flags must be refused")
+	}
+	for _, key := range []string{"enable_llm_review", "enable_auto_send_task_when_idle"} {
+		if !strings.Contains(msg.err.Error(), key) {
+			t.Errorf("error must name %q, got %v", key, msg.err)
+		}
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 0 {
+		t.Errorf("a refused add must create nothing, got %+v", cfg.TaskSources)
 	}
 }

@@ -2471,12 +2471,30 @@ func checkTaskSourceUnchanged(cfg config.Config, index int, expected config.Task
 // updateTaskSource applies mutate to task source #index, guarding on the
 // source the caller believes sits there (checkTaskSourceUnchanged) so a stale
 // listing can never retarget the edit.
+//
+// The mutation runs on a COPY that is validated before it is committed, so a
+// refused edit leaves the in-memory config byte-identical and nothing reaches
+// Save. Validating here rather than in each setter is the update-side twin of
+// AddTaskSource's post-options check: every surface that can flip a source flag
+// inherits the same rule from one place.
+//
+// This cannot reject an edit that has nothing to do with the conflict: Load
+// coerces a conflicting pair before UpdateConfig ever calls us, so the source
+// read off disk is always already valid and only the mutation itself can make
+// it invalid. It reads the LIVE source, never the caller's `expected` copy —
+// checkTaskSourceUnchanged compares only Path/Agent/Workspace, so `expected`
+// may carry a stale value of the other flag.
 func (a *App) updateTaskSource(ctx context.Context, index int, expected config.TaskSource, mutate func(*config.TaskSource)) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		if err := checkTaskSourceUnchanged(*cfg, index, expected); err != nil {
 			return err
 		}
-		mutate(&cfg.TaskSources[index])
+		updated := cfg.TaskSources[index]
+		mutate(&updated)
+		if err := config.ValidateTaskSource(updated); err != nil {
+			return err
+		}
+		cfg.TaskSources[index] = updated
 		return nil
 	})
 }
@@ -2485,9 +2503,24 @@ func (a *App) updateTaskSource(ctx context.Context, index int, expected config.T
 // existing source. This is the one source setting that makes hap hand out work
 // unprompted, so turning it ON is always an explicit operator act — never a
 // side effect of editing something else.
+//
+// Turning it on while enable_llm_review is on is refused by updateTaskSource
+// rather than silently winning: hap never clears a flag the operator did not
+// name.
 func (a *App) SetTaskSourceAutoSend(ctx context.Context, index int, expected config.TaskSource, on bool) error {
 	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
 		src.EnableAutoSendTaskWhenIdle = on
+	})
+}
+
+// SetTaskSourceLLMReview turns enable_llm_review on or off for an existing
+// source. The value is written as a POINTER, so an operator who chose "off"
+// lands on disk as an explicit `enable_llm_review = false` rather than an absent
+// key that reads as "never decided". Mutual exclusion with
+// enable_auto_send_task_when_idle is enforced by updateTaskSource.
+func (a *App) SetTaskSourceLLMReview(ctx context.Context, index int, expected config.TaskSource, on bool) error {
+	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.EnableLLMReview = &on
 	})
 }
 
@@ -2562,6 +2595,17 @@ func MaxTasks(n int) TaskSourceOption {
 	return func(src *config.TaskSource) { src.MaxTasks = n }
 }
 
+// LLMReview sets the new source's pre-send LLM review gate
+// (enable_llm_review). Unlike AutoSendWhenIdle this takes the value rather than
+// only turning the flag on: the field is a tri-state pointer, so an explicit
+// false is a state worth being able to write — it names the choice in
+// config.toml instead of leaving an absent key that reads as "never decided".
+// AddTaskSource rejects it together with AutoSendWhenIdle: a source cannot both
+// review and hand out unprompted.
+func LLMReview(on bool) TaskSourceOption {
+	return func(src *config.TaskSource) { src.EnableLLMReview = &on }
+}
+
 // AddTaskSource points an agent/workspace at a declared task list (FR-011).
 // template optionally overrides the outbound next-task prompt format
 // ({next_task_content} / {task_list_path} / {agent_name} placeholders);
@@ -2584,10 +2628,16 @@ func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, templat
 	for _, opt := range opts {
 		opt(&src)
 	}
-	// Validated after the options run, so every surface that can set a cap
-	// inherits the same rule from one place.
+	// Validated after the options run, so every surface that can set a cap or a
+	// flag inherits the same rules from one place. This is the one path where
+	// both exclusive flags can arrive at once (--auto-send-when-idle
+	// --enable-llm-review), and a new source has no prior state to grandfather:
+	// a conflict here is always something the caller just asked for.
 	if src.MaxTasks < 1 {
 		return fmt.Errorf("max_tasks must be 1 or greater, got %d", src.MaxTasks)
+	}
+	if err := config.ValidateTaskSource(src); err != nil {
+		return err
 	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		cfg.TaskSources = append(cfg.TaskSources, src)
