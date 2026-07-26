@@ -211,18 +211,23 @@ func TestUnknownCommandPointsAtHelp(t *testing.T) {
 	}
 }
 
-// TestTaskSourceHelpDocumentsReviewExclusion pins the prose that TestCommandHelpPages
+// TestTaskSourceHelpDocumentsTheReview pins the prose that TestCommandHelpPages
 // cannot: it iterates Flags and Usage only, so the Details block — where the
-// mutual exclusion and the new default are explained — would drift silently.
-func TestTaskSourceHelpDocumentsReviewExclusion(t *testing.T) {
+// review's scope, its fail-open behaviour and its default are explained — would
+// drift silently.
+func TestTaskSourceHelpDocumentsTheReview(t *testing.T) {
 	app, _ := testApp(t)
 	out, err := run(t, app, "help", "task-source")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"--enable-llm-review",
-		"mutually exclusive",
+		"--enable-llm-review-before-auto-send",
+		// It composes with auto-send now; the old text said "mutually exclusive".
+		"composes with auto-send-when-idle",
+		// The two properties an operator most needs to know before opting in.
+		"never escalates",
+		"you send by hand",
 		"defaults to OFF",
 	} {
 		if !strings.Contains(out, want) {

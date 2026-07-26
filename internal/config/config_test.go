@@ -2,7 +2,6 @@ package config
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -405,12 +404,11 @@ warm_timeout_ms = 120000
 	}
 }
 
-func TestTaskSourceLLMReviewParsing(t *testing.T) {
-	// enable_llm_review is opt-IN: unset stays nil (which resolves to off), an
-	// explicit false is preserved so a source can record the choice, and the
-	// legacy llm_review key migrates per element (an explicit new key wins over
-	// the legacy one). Parsing is unchanged by the default flip — only what nil
-	// MEANS changed, which TestTaskSourceLLMReviewEnabledResolver covers.
+func TestTaskSourceReviewBeforeAutoSendParsing(t *testing.T) {
+	// enable_llm_review_before_auto_send is opt-IN: unset stays nil (which
+	// resolves to off), an explicit false is preserved so a source can record
+	// the choice, and the renamed `enable_llm_review` key migrates per element
+	// (an explicit new key wins over the old one).
 	path := filepath.Join(t.TempDir(), "config.toml")
 	os.WriteFile(path, []byte(`
 [[task_sources]]
@@ -420,18 +418,18 @@ path = "/tmp/one.md"
 [[task_sources]]
 agent = "a2"
 path = "/tmp/two.md"
-enable_llm_review = false
+enable_llm_review_before_auto_send = false
 
 [[task_sources]]
 agent = "a3"
 path = "/tmp/three.md"
-llm_review = false
+enable_llm_review = false
 
 [[task_sources]]
 agent = "a4"
 path = "/tmp/four.md"
-llm_review = false
-enable_llm_review = true
+enable_llm_review = false
+enable_llm_review_before_auto_send = true
 `), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
@@ -440,21 +438,21 @@ enable_llm_review = true
 	if len(cfg.TaskSources) != 4 {
 		t.Fatalf("want 4 task sources, got %d", len(cfg.TaskSources))
 	}
-	if cfg.TaskSources[0].EnableLLMReview != nil {
-		t.Errorf("unset enable_llm_review should stay nil, got %v", *cfg.TaskSources[0].EnableLLMReview)
+	if cfg.TaskSources[0].EnableLLMReviewBeforeAutoSend != nil {
+		t.Errorf("an unset key should stay nil, got %v", *cfg.TaskSources[0].EnableLLMReviewBeforeAutoSend)
 	}
-	if cfg.TaskSources[1].EnableLLMReview == nil || *cfg.TaskSources[1].EnableLLMReview {
-		t.Errorf("explicit enable_llm_review=false should parse as a non-nil false, got %v", cfg.TaskSources[1].EnableLLMReview)
+	if v := cfg.TaskSources[1].EnableLLMReviewBeforeAutoSend; v == nil || *v {
+		t.Errorf("an explicit false should parse as a non-nil false, got %v", v)
 	}
-	if cfg.TaskSources[2].EnableLLMReview == nil || *cfg.TaskSources[2].EnableLLMReview {
-		t.Errorf("legacy llm_review=false should migrate to enable_llm_review, got %v", cfg.TaskSources[2].EnableLLMReview)
+	if v := cfg.TaskSources[2].EnableLLMReviewBeforeAutoSend; v == nil || *v {
+		t.Errorf("the renamed enable_llm_review should migrate across, got %v", v)
 	}
-	if cfg.TaskSources[3].EnableLLMReview == nil || !*cfg.TaskSources[3].EnableLLMReview {
-		t.Errorf("explicit enable_llm_review must win over legacy llm_review, got %v", cfg.TaskSources[3].EnableLLMReview)
+	if v := cfg.TaskSources[3].EnableLLMReviewBeforeAutoSend; v == nil || !*v {
+		t.Errorf("an explicit new key must win over the old one, got %v", v)
 	}
 	for i, src := range cfg.TaskSources {
-		if src.DeprecatedLLMReview != nil {
-			t.Errorf("source %d: deprecated llm_review must be cleared after Load", i)
+		if src.DeprecatedEnableLLMReview != nil {
+			t.Errorf("source %d: the deprecated key must be cleared after Load", i)
 		}
 	}
 	// A Save re-emits only the new key.
@@ -465,21 +463,61 @@ enable_llm_review = true
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "enable_llm_review = ") {
+	if !strings.Contains(string(raw), "enable_llm_review_before_auto_send = ") {
 		t.Errorf("re-saved config must use the new key: %s", raw)
 	}
-	// Keys are indented under their table by the encoder, so match anywhere
-	// on a line, not just column 0.
-	if regexp.MustCompile(`(?m)^\s*llm_review\s*=`).Match(raw) {
-		t.Errorf("re-saved config must drop the legacy key: %s", raw)
+	// Keys are indented under their table by the encoder, so match anywhere on
+	// a line, not just column 0. The old name is a strict prefix of the new
+	// one, so anchor on the "=" to avoid matching the new key.
+	if regexp.MustCompile(`(?m)^\s*enable_llm_review\s*=`).Match(raw) {
+		t.Errorf("re-saved config must drop the retired key: %s", raw)
 	}
 }
 
-func TestTaskSourceLLMReviewEnabledResolver(t *testing.T) {
-	// The default itself: nil means OFF. LLMReviewEnabled also folds the mutual
-	// exclusion away, so a Config built in memory (a test harness, the
-	// generated-task bootstrap's append) that never passed Load still resolves
-	// an auto-send source to "no review".
+func TestTaskSourceReviewRenameWarns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte(`
+[[task_sources]]
+agent = "renamed"
+path = "/tmp/one.md"
+enable_llm_review = true
+max_tasks = 7
+`), 0o600)
+	cfg, logs, err := loadWithLogs(path)
+	if err != nil {
+		t.Fatalf("a config using the old key must still load, got error: %v", err)
+	}
+	for _, want := range []string{"enable_llm_review", "deprecated", "enable_llm_review_before_auto_send"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("the rename warning must mention %q, got:\n%s", want, logs)
+		}
+	}
+	src := cfg.TaskSources[0]
+	if !src.ReviewBeforeAutoSendEnabled() {
+		t.Error("the migrated value must carry across: an operator who asked for review still wants it")
+	}
+	// A live sibling key in the same table still parsed, proving the migration
+	// did not skip the rest of the entry.
+	if src.MaxTasks != 7 {
+		t.Errorf("max_tasks = %d, want the value from the same table (7)", src.MaxTasks)
+	}
+	// Saving persists the new spelling, so the warning stops recurring.
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, logs2, err := loadWithLogs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logs2, "deprecated") {
+		t.Errorf("the migration must persist so the warning stops recurring, got:\n%s", logs2)
+	}
+}
+
+func TestTaskSourceReviewBeforeAutoSendResolver(t *testing.T) {
+	// nil means OFF, and — unlike the pre-#255 resolver — auto-send no longer
+	// folds the flag away. The review is a pre-DELIVERY filter that never
+	// escalates, so there is nothing left for the old exclusion to prevent.
 	yes, no := true, false
 	for _, tc := range []struct {
 		name     string
@@ -490,154 +528,49 @@ func TestTaskSourceLLMReviewEnabledResolver(t *testing.T) {
 		{"unset is off", nil, false, false},
 		{"explicit false is off", &no, false, false},
 		{"explicit true is on", &yes, false, true},
-		{"auto-send forces it off", &yes, true, false},
+		{"auto-send does NOT force it off", &yes, true, true},
 		{"unset plus auto-send is off", nil, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			src := TaskSource{EnableLLMReview: tc.review, EnableAutoSendTaskWhenIdle: tc.autoSend}
-			if got := src.LLMReviewEnabled(); got != tc.want {
-				t.Errorf("LLMReviewEnabled() = %v, want %v", got, tc.want)
+			src := TaskSource{
+				EnableLLMReviewBeforeAutoSend: tc.review,
+				EnableAutoSendTaskWhenIdle:    tc.autoSend,
 			}
-			// The raw key is what conflict detection reads, so it must NOT fold
-			// the exclusion away — otherwise ValidateTaskSource never sees one.
-			wantRaw := tc.review != nil && *tc.review
-			if got := src.LLMReviewRequested(); got != wantRaw {
-				t.Errorf("LLMReviewRequested() = %v, want %v", got, wantRaw)
+			if got := src.ReviewBeforeAutoSendEnabled(); got != tc.want {
+				t.Errorf("ReviewBeforeAutoSendEnabled() = %v, want %v", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestValidateTaskSourceRejectsReviewPlusAutoSend(t *testing.T) {
-	// Writes must refuse the combination rather than silently resolve it, so the
-	// operator learns which key won instead of discovering it later.
-	yes, no := true, false
-	for _, tc := range []struct {
-		name     string
-		review   *bool
-		autoSend bool
-		wantErr  bool
-	}{
-		{"both on is refused", &yes, true, true},
-		{"review alone is fine", &yes, false, false},
-		{"auto-send alone is fine", nil, true, false},
-		{"explicit false plus auto-send is fine", &no, true, false},
-		{"neither is fine", nil, false, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateTaskSource(TaskSource{
-				Path: "/tmp/t.md", EnableLLMReview: tc.review, EnableAutoSendTaskWhenIdle: tc.autoSend,
-			})
-			if tc.wantErr != (err != nil) {
-				t.Fatalf("ValidateTaskSource err = %v, wantErr %v", err, tc.wantErr)
-			}
-			if err == nil {
-				return
-			}
-			if !errors.Is(err, ErrTaskSourceReviewExclusive) {
-				t.Errorf("error must wrap the shared sentinel, got %v", err)
-			}
-			// Both key names must appear, or the CLI/TUI message is undiagnosable.
-			for _, key := range []string{"enable_llm_review", "enable_auto_send_task_when_idle"} {
-				if !strings.Contains(err.Error(), key) {
-					t.Errorf("error must name %q, got %v", key, err)
-				}
-			}
-		})
-	}
-}
-
-func TestTaskSourceLLMReviewForcedOffWhenAutoSendIsOn(t *testing.T) {
-	// A config already on disk with both keys must still LOAD — coerced and
-	// warned, never rejected. Rejecting would lock the operator out of the CLI
-	// and TUI that would repair it (every write does Load -> mutate -> Save),
-	// and a Load error is a fatal daemon boot failure.
+func TestTaskSourceReviewAndAutoSendCompose(t *testing.T) {
+	// The regression this whole change exists to remove: a config setting BOTH
+	// keys used to load with a warning and the review forced off. It must now
+	// load unchanged, and writes must accept the pair.
 	path := filepath.Join(t.TempDir(), "config.toml")
 	os.WriteFile(path, []byte(`
 [[task_sources]]
-agent = "conflicted"
+agent = "both"
 path = "/tmp/one.md"
 enable_auto_send_task_when_idle = true
-enable_llm_review = true
-max_tasks = 7
-
-[[task_sources]]
-agent = "reviewer"
-path = "/tmp/two.md"
-enable_llm_review = true
-`), 0o600)
-	cfg, logs, err := loadWithLogs(path)
-	if err != nil {
-		t.Fatalf("a conflicting config must still load, got error: %v", err)
-	}
-	for _, want := range []string{"enable_llm_review", "enable_auto_send_task_when_idle", "mutually exclusive"} {
-		if !strings.Contains(logs, want) {
-			t.Errorf("load warning must mention %q, got:\n%s", want, logs)
-		}
-	}
-	if len(cfg.TaskSources) != 2 {
-		t.Fatalf("want 2 task sources, got %d", len(cfg.TaskSources))
-	}
-	// Auto-send wins, and the resolution is written into the value rather than
-	// only resolved on read — so the next Save records what the daemon runs under.
-	conflicted := cfg.TaskSources[0]
-	if conflicted.EnableLLMReview == nil || *conflicted.EnableLLMReview {
-		t.Errorf("enable_llm_review must be coerced to an explicit false, got %v", conflicted.EnableLLMReview)
-	}
-	if !conflicted.EnableAutoSendTaskWhenIdle {
-		t.Error("enable_auto_send_task_when_idle must survive the coercion — auto-send wins")
-	}
-	// A live sibling key in the same table still parsed, proving the coercion did
-	// not skip the rest of the entry.
-	if conflicted.MaxTasks != 7 {
-		t.Errorf("max_tasks = %d, want the value from the same table (7)", conflicted.MaxTasks)
-	}
-	// The coercion is per element: a clean review-only source is untouched.
-	if !cfg.TaskSources[1].LLMReviewEnabled() {
-		t.Error("a source without auto-send must keep its explicit enable_llm_review = true")
-	}
-
-	// Save persists the resolution, and re-loading is then silent.
-	if err := Save(path, cfg); err != nil {
-		t.Fatal(err)
-	}
-	_, logs2, err := loadWithLogs(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(logs2, "mutually exclusive") {
-		t.Errorf("the resolution must persist so the warning stops recurring, got:\n%s", logs2)
-	}
-}
-
-func TestTaskSourceLegacyLLMReviewMigrationThenForcedOff(t *testing.T) {
-	// Ordering: the legacy `llm_review` migration is what can seed
-	// enable_llm_review=true in the first place, so the mutual-exclusion
-	// coercion has to run AFTER it or a legacy config slips a conflict through.
-	path := filepath.Join(t.TempDir(), "config.toml")
-	os.WriteFile(path, []byte(`
-[[task_sources]]
-agent = "legacy"
-path = "/tmp/one.md"
-llm_review = true
-enable_auto_send_task_when_idle = true
+enable_llm_review_before_auto_send = true
 `), 0o600)
 	cfg, logs, err := loadWithLogs(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(logs, "deprecated") {
-		t.Errorf("the legacy-key migration warning must still fire, got:\n%s", logs)
-	}
-	if !strings.Contains(logs, "mutually exclusive") {
-		t.Errorf("the coercion must run after the migration, got:\n%s", logs)
+	if strings.Contains(logs, "mutually exclusive") {
+		t.Errorf("the two keys compose now; Load must not warn about them:\n%s", logs)
 	}
 	src := cfg.TaskSources[0]
-	if src.EnableLLMReview == nil || *src.EnableLLMReview {
-		t.Errorf("a migrated llm_review = true must still be coerced off, got %v", src.EnableLLMReview)
+	if !src.ReviewBeforeAutoSendEnabled() {
+		t.Error("the review must survive alongside auto-send")
 	}
-	if src.LLMReviewEnabled() {
-		t.Error("an auto-send source must never resolve to review-on")
+	if !src.EnableAutoSendTaskWhenIdle {
+		t.Error("auto-send must survive alongside the review")
+	}
+	if err := ValidateTaskSource(src); err != nil {
+		t.Errorf("write surfaces must accept the pair, got %v", err)
 	}
 }
 

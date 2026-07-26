@@ -547,13 +547,13 @@ path = "/home/me/project/docs/tasks.md"
 # {task_list_path_quoted} — the path as one shell word, for commands the agent
 # runs — {agent_name}, {cwd}):
 next_task_template = "Your next task is {next_task_content}. Read the full tasks list at {task_list_path}. Verify task dependencies before starting. When there is no task available, focus on improving the test coverage of this project."
-# When an [llm].command is configured, each determined task can first be reviewed
-# by the LLM before it is sent (see "Reviewing tasks before they are sent"
-# below). Default: OFF. Opt this source in with:
-# enable_llm_review = true
+# When an [llm].command is configured, the LLM can review — and revise — this
+# list immediately before the daemon auto-sends a task from it (see "Reviewing
+# the task list before a task is sent" below). Default: OFF. Opt this source in:
+# enable_llm_review_before_auto_send = true
 # Also hand out tasks on a timer, not only on a herdr attention event (see
-# "Keeping idle agents working" below). Default: off. Mutually exclusive with
-# enable_llm_review above.
+# "Keeping idle agents working" below). Default: off. Composes with the review
+# above.
 # enable_auto_send_task_when_idle = true
 ```
 
@@ -574,14 +574,13 @@ through the normal pipeline, so the kill switch, never-auto patterns, rate
 limits and per-agent disable all still apply, and every send is audited
 (trigger `auto-idle-send`).
 
-The pre-send LLM review does **not** apply: `enable_auto_send_task_when_idle`
-and `enable_llm_review` are mutually exclusive. Unattended hand-out exists to
-drive an agent with nobody watching, while a declined review escalates to an
-operator who by construction is not there — and a pending escalation stops the
-idle poll for that agent, silently switching the feature off. Setting the
-second flag from the CLI or TUI is refused (hap never clears the first one for
-you); a config file carrying both loads with a warning and the review forced
-off.
+This **composes** with the pre-delivery LLM review
+(`enable_llm_review_before_auto_send`): the hand-out decides *that* a task
+goes, the review decides *which* task and in what shape. The two were once
+mutually exclusive — the review used to escalate when it declined, and a
+pending escalation stops the idle poll for that agent, so a reviewed auto-send
+source silently switched itself off. The review never escalates now, so the
+restriction is gone.
 
 Two rules keep unattended hand-out safe:
 
@@ -821,64 +820,118 @@ is included on **every** LLM consult for that agent
 so the LLM always knows the
 agent's backlog state.
 
-### Reviewing tasks before they are sent (optional)
+### Reviewing the task list before a task is sent (optional)
 
-When an `[llm].command` is configured, each task determined from a
-`[[task_sources]]` entry for an idle agent is first **reviewed** by that LLM
-before it is sent. Using the same two MCP tools as an ordinary consult
-(`get_context` / `submit_decision`), the LLM sees the live pane plus the queued
-task (`proposed_task` / `current_task`), the checklist path (`task_list_path`),
-and every remaining item (`pending_tasks`) — so it can also **pick a different
-pending task** when the pane shows the current one is already done — and decides
-what to send:
+When an `[llm].command` is configured, a source can have its **task list
+reviewed by that LLM immediately before the daemon auto-sends a task from it**.
+The review reads the whole list but acts on the task at hand: it can fix the
+list *and* choose which task actually ships, so the agent receives work that is
+valid, correctly scoped and current — instead of a stale task sent verbatim.
 
-- **Send as-is** — `submit_decision` with `recommend_action` `@next_task:declared`;
-  the daemon sends the queued task verbatim (no copying, no paraphrase drift).
-- **Send edited / a different task** — `recommend_action` set to the literal
-  instruction text (an edit, or the next unfinished item from `pending_tasks`
-  when the current one is already done).
-- **Decline** — `submit_decision` with `recommend_action` `@noop` (the agent is
-  still busy, the task is already done, or the pane shows it should not run).
+Using the same two MCP tools as an ordinary consult (`get_context` /
+`submit_decision`), the LLM sees the live pane, the queued task
+(`proposed_task` / `current_task`), the checklist path (`task_list_path`) and
+`tasks` — every item with the reference used to address it (its declared id like
+`3.4`, else a position like `#3`), its position and its status. It answers in
+**one** `submit_decision` call:
 
-Both outcomes follow `auto_act_confidence_threshold` exactly like any consult,
-and are re-gated by the same safety controls (kill switch, never-auto patterns,
-irreversible heuristic, rate limits):
+```jsonc
+submit_decision({
+  "task_actions": [                              // ordered; applied in sequence
+    {"op": "done",   "task": "3.1"},             // already finished
+    {"op": "delete", "task": "3.2"},             // no longer valid
+    {"op": "edit",   "task": "3.3", "text": "…"},// stale or wrong
+    {"op": "move",   "task": "4",   "to": 9},    // should run later
+    {"op": "add",    "text": "…", "as": "n1"}    // scope too big — break it up
+  ],
+  "send_task": "3.3",                            // a REFERENCE, or "@noop"
+  "confident_score": 92,
+  "rationale": "…"
+})
+```
 
-- **Confident (`confident_score ≥ threshold`)** — the LLM's resolution is applied
-  automatically: a send delivers the task, a decline silently skips it.
-- **Low-confidence (`< threshold`)** — surfaced for you to confirm. The
-  escalation's suggestion is the LLM's exact recommendation (the possibly-edited
-  task, or *no reply* for a decline), and the **original** queued task and the
-  LLM's reasoning appear in the escalation detail.
+Each action resolves against the list the previous ones produced, exactly as if
+they had been typed as consecutive `hap task` commands — so a declared id is
+safer than a position, which shifts under a preceding `delete` or `move`. A
+newly added task has no id yet, so `add` carries a handle (`"as": "n1"`) that
+`send_task` and later actions can name. `move` reorders among siblings and the
+destination is always a position; a task keeps its own id when it moves.
 
-The default threshold is `99`, so a review auto-acts only when the LLM is
-near-certain (score ≥ 99); anything less confident is surfaced for confirmation.
-Raise `auto_act_confidence_threshold` above 100 (e.g. `999`) to never auto-act,
-or lower it to auto-act more readily.
+**`send_task` is an id, never text.** The daemon renders the outbound prompt
+from the list itself — the item plus its folded detail, through the source's
+template — so the LLM never copies task wording into its submission and cannot
+paraphrase it into something the checklist does not say. "Send the queued task
+unchanged" needs no sentinel: it is just `send_task` naming the task under
+review, with no actions.
 
-For learning, every accepted task-review send is stored symbolically as
-`@next_task:declared`, whether the LLM approved the queued task verbatim,
-copied it, edited it, or chose another pending item. The pane still receives
-the real task text. This teaches the reusable decision “send the next declared
-task” instead of treating each task's one-off wording as a different action;
-an operator confirmation of a low-confidence review learns the same symbolic
-action. The sentinel is rejected if an LLM submits it outside a task review
-that actually carries a proposed task.
+There is no `start` operation. Marking a task in progress is the *agent's* job
+(`hap task <agent> start <n>`), once it actually begins. That is distinct from
+the auto-send **reservation** `[-]`, which the daemon still writes at delivery.
 
-This is **off by default**; set `enable_llm_review = true` on a
-`[[task_sources]]` entry to opt that source in, either by hand, at creation
-time with `hap task-source add --enable-llm-review <checklist.md>` (or
-`--enable-llm-review` in the *Config* tab's `t` prompt), on an existing source
-with `hap task-source set <index> enable-llm-review true`, or from the *Config*
-tab's `enter` on a task-source row. `hap task-source list` and the *Config*
-tab always print the resolved value, so a source that never named the key
-still shows `enable_llm_review=false` rather than leaving you to guess.
-(The former `llm_review` key still loads and migrates to the new name on the
-next config save; the CLI refuses that spelling.)
+Everything is applied **atomically**: validating every reference, applying every
+action, resolving `send_task` and reserving it all happen inside one locked
+read-modify-write on the checklist. If anything is invalid — an unresolvable or
+ambiguous reference, an operation that cannot apply, a `send_task` naming a
+done or deleted task — the whole submission is discarded and the checklist is
+left byte-identical.
 
-It is **mutually exclusive with `enable_auto_send_task_when_idle`** — see
-"Keeping idle agents working" above for why, and what happens to a config
-that sets both.
+#### It always sends something, and it never escalates
+
+This feature is for the **unattended** case: nobody is watching, so there is no
+one to escalate to. Every non-ideal outcome resolves the same way — **the
+original task is sent, unchanged**:
+
+- **Review unusable** — spawn failure, timeout, no submission, malformed
+  output, a bad reference.
+- **Review not confident enough** — `confident_score` below
+  `auto_act_confidence_threshold` discards the review's actions *and* its
+  choice of task. Deliberately all-or-nothing: a review your threshold says
+  shouldn't be trusted does not get to half-edit your checklist.
+- **Reviewed task trips a safety gate** — an edited or newly added task is
+  re-scanned by the never-auto patterns and the suspected-irreversible
+  heuristic over the *folded* delivery text, like any other LLM-authored
+  outbound.
+
+`send_task: "@noop"` is legal in exactly one case: after the actions are
+applied, no pending task remains — a genuinely exhausted source. Anything else
+falls back to the original task.
+
+None of this creates an escalation, so a review can never bar its own agent
+from the idle poll. **Every outcome is audited** under the `llm-task-review`
+trigger with a distinct reason, so a silent fallback never looks like an
+ordinary send — and the low-confidence row carries the score plus the discarded
+proposal, so you can see what your threshold is currently rejecting. Mutations
+are recorded with before/after text, so `hap audit` answers *"why is task 4
+gone?"*.
+
+For learning, an accepted review still records the symbolic
+`@next_task:declared` — the reusable decision is "send the next declared task",
+not this task's one-off wording — so a signature graduated to autonomous keeps
+acting, with the review shaping what it delivers.
+
+#### Scope and opt-in
+
+The review applies only to sends the **daemon** initiates: an idle hand-out, or
+a learned autonomous rule resolving to the next declared task. A task you send
+by hand — `hap task <agent> send <n>`, or the TUI — is never reviewed; you
+already decided.
+
+This is **off by default**; set `enable_llm_review_before_auto_send = true` on a
+`[[task_sources]]` entry to opt that source in, either by hand, at creation time
+with `hap task-source add --enable-llm-review-before-auto-send <checklist.md>`
+(or that flag in the *Config* tab's `t` prompt), on an existing source with
+`hap task-source set <index> enable-llm-review-before-auto-send true`, or from
+the *Config* tab's `enter` on a task-source row. `hap task-source list` and the
+*Config* tab always print the resolved value, so a source that never named the
+key still shows `enable_llm_review_before_auto_send=false` rather than leaving
+you to guess.
+
+It **composes with `enable_auto_send_task_when_idle`** — see "Keeping idle
+agents working" above.
+
+> The former `enable_llm_review` key still loads and migrates to the new name on
+> the next config save (with a warning); the CLI refuses that spelling. The
+> older `llm_review` spelling is no longer recognized.
 
 ### Never-auto patterns
 
@@ -1224,8 +1277,9 @@ Invariants:
 - **Numbered-menu answers are never reviewed** — a mapped digit reaches
   the menu untouched. Only literal free text goes through the review.
 - **Declared tasks are never reviewed here** — a task from a
-  `[[task_sources]]` entry is covered by that source's `enable_llm_review`
-  gate, and a source that did not opt in delivers its tasks verbatim.
+  `[[task_sources]]` entry is covered by that source's
+  `enable_llm_review_before_auto_send` gate, and a source that did not opt in
+  delivers its tasks verbatim.
 - **A review failure never blocks the send**: on error, timeout, or empty
   output the original text is delivered exactly as it was. Set
   `rewrite_action_fallback_template` (`{original_text}`, `{agent_name}`

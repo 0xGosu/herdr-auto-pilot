@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -674,29 +673,6 @@ func (d *Daemon) paneRecycled(ctx context.Context, s domain.Situation) (bool, st
 	}
 	return true, fmt.Sprintf("pane %s now hosts terminal %s, not the %s this task was captured for",
 		s.PaneID, info.TerminalID, s.TerminalID)
-}
-
-// reservedByAction reports which checklist item an outbound task-review send
-// actually consumes. The review normally approves or lightly edits the task it
-// was given, in which case that is the item — but it may also SWAP to another
-// pending item, and marking the proposed one then would strand the wrong line
-// while leaving the delivered one free for the next agent. A different pending
-// item quoted in the outbound text therefore wins (longest match, so a task
-// whose text is a prefix of another cannot shadow it).
-func reservedByAction(action, reviewed string, pending []string) string {
-	best := ""
-	for _, task := range pending {
-		if task == reviewed || task == "" || !strings.Contains(action, task) {
-			continue
-		}
-		if len(task) > len(best) {
-			best = task
-		}
-	}
-	if best != "" {
-		return best
-	}
-	return reviewed
 }
 
 // reserveDeclaredTask marks the task about to be delivered "[-]" in its source

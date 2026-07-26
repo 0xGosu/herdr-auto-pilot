@@ -239,7 +239,7 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "submit_decision",
-			"description": "Submit your decision for the pending request. Which field to use depends on the situation_type in get_context: \"approval\" and \"choice\" listing options (or a multi-tab form) MUST be answered with select_options — the 1-based option number(s) shown in the context (single menu: exactly one integer, e.g. [2]; multi-tab question form: one entry per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1] — and for a MULTI-SELECT tab, whose options show `[ ]` checkboxes, pass an array of the numbers to toggle, e.g. [1, [1, 3], 2]) — while an approval/choice with NO options listed (e.g. a bare y/n prompt) takes recommend_action with the literal text the prompt expects; \"idle\" and \"error\" MUST be answered with recommend_action — the literal reply text (next prompt/task for idle, recovery command/reply for error), and select_options is rejected. In ANY situation, if the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit recommend_action \"@noop\" to explicitly do nothing. When get_context carries a proposed_task (a pre-send task review of an idle agent), decide from the pane whether to send that queued task now: to send it unchanged submit recommend_action \"@next_task:declared\" (the daemon sends proposed_task verbatim — no need to copy it); put literal text in recommend_action only to edit the task or, if current_task is already done, to send the next unfinished item from pending_tasks; or submit \"@noop\" with a rationale to decline (e.g. every task is done). Your confident_score gates this exactly like any other decision — a confident review is applied automatically (the task is sent, or skipped on a decline) and a low-confidence one is surfaced to the operator. When get_context carries a proposed_action (a pre-delivery review of a learned reply), submit recommend_action with the adapted text to replace it, \"@proposed_action:send\" to send it unchanged, or \"@noop\" with a rationale to send nothing; this review is advisory — on any failure or indecision the daemon sends the original text unchanged. ALWAYS include confident_score: the daemon auto-acts only when your confidence meets the operator's threshold, otherwise it asks the operator to confirm — so a missing or low score means your decision is surfaced for human review, not acted on. The daemon re-gates every submission through this confidence gate and the never-auto patterns before acting.",
+			"description": "Submit your decision for the pending request. Which field to use depends on the situation_type in get_context: \"approval\" and \"choice\" listing options (or a multi-tab form) MUST be answered with select_options — the 1-based option number(s) shown in the context (single menu: exactly one integer, e.g. [2]; multi-tab question form: one entry per tab in tab order, Submit included, e.g. [1, 2, 3, 2, 1] — and for a MULTI-SELECT tab, whose options show `[ ]` checkboxes, pass an array of the numbers to toggle, e.g. [1, [1, 3], 2]) — while an approval/choice with NO options listed (e.g. a bare y/n prompt) takes recommend_action with the literal text the prompt expects; \"idle\" and \"error\" MUST be answered with recommend_action — the literal reply text (next prompt/task for idle, recovery command/reply for error), and select_options is rejected. In ANY situation, if the agent needs NO reply at all — it finished, it is only reporting status, or any prompt would just nudge it pointlessly — submit recommend_action \"@noop\" to explicitly do nothing. When get_context carries a proposed_task and a tasks list (a pre-delivery review of the task the daemon is about to auto-send), answer with task_actions and send_task instead of recommend_action: task_actions is an ordered series of edits to the checklist (done / delete / edit / move / add), and send_task names the task to deliver once they are applied. Read the whole list, but act on the task at hand. To send it unchanged, submit send_task naming it and no actions. send_task is a REFERENCE, never task text — the daemon renders the prompt from the list itself. \"@noop\" is accepted only when no pending task remains after your actions. This review NEVER escalates to a human: if it fails, or your confident_score is below the operator's threshold, the whole submission is discarded and the original task is sent unchanged, so a partial or unsure answer costs the operator nothing but changes nothing either. When get_context carries a proposed_action (a pre-delivery review of a learned reply), submit recommend_action with the adapted text to replace it, \"@proposed_action:send\" to send it unchanged, or \"@noop\" with a rationale to send nothing; this review is advisory — on any failure or indecision the daemon sends the original text unchanged. ALWAYS include confident_score: the daemon auto-acts only when your confidence meets the operator's threshold, otherwise it asks the operator to confirm — so a missing or low score means your decision is surfaced for human review, not acted on. The daemon re-gates every submission through this confidence gate and the never-auto patterns before acting.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -252,8 +252,28 @@ func toolDefinitions() []map[string]any {
 							map[string]any{"type": "array", "items": map[string]any{"type": "integer", "minimum": 1, "maximum": 9}},
 						}},
 						"description": "REQUIRED answer for approval and choice situations that list options: the chosen option number(s), 1-based. A single menu takes exactly one integer, e.g. [2]. A multi-tab question form takes one entry per tab in tab order, Submit included: an integer for a single-select tab, or an ARRAY of integers to toggle several options on a MULTI-SELECT tab (its options show `[ ]` checkboxes), e.g. [1, [1, 3], 2] toggles options 1 and 3 on tab 2. Rejected for idle/error situations."},
+					"task_actions": map[string]any{"type": "array",
+						"description": "ONLY for a pre-delivery task-list review (get_context carries proposed_task and tasks): an ORDERED series of edits to the agent's checklist, applied in sequence before send_task is resolved. Omit it to send the task at hand unchanged. Either the whole submission applies or none of it does.",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"op": map[string]any{"type": "string", "enum": []any{"done", "delete", "edit", "move", "add"},
+									"description": "done = already finished, mark it; delete = no longer valid, drop it; edit = stale or wrong, rewrite it; move = should run later, reorder it among its siblings; add = scope too big, break it up."},
+								"task": map[string]any{"type": "string",
+									"description": "Which task to act on, for done/delete/edit/move: the `ref` from get_context.tasks — a declared id (\"3.4\") or a position (\"#3\") — or a handle assigned by an earlier add. Each action resolves against the list the previous ones produced, so prefer ids: a position shifts under a preceding delete or move. Not used by add."},
+								"text": map[string]any{"type": "string",
+									"description": "New task text, for edit and add. ONE task: use \\n inside it for a multi-line body, and separate `add` entries for separate tasks."},
+								"to": map[string]any{"type": "integer", "minimum": 1,
+									"description": "Destination POSITION for move (a task keeps its own id when it moves). Reordering is siblings-only."},
+								"as": map[string]any{"type": "string",
+									"description": "For add: a short handle (e.g. \"n1\") naming the new task, so send_task and later actions can reference it before the list numbers it. Must be unique within the submission."},
+							},
+							"required": []any{"op"},
+						}},
+					"send_task": map[string]any{"type": "string",
+						"description": "ONLY for a pre-delivery task-list review: the REFERENCE of the task to deliver, resolved against the list after task_actions are applied — a declared id (\"3.4\"), a position (\"#3\"), or an add's handle. It is an id, NEVER task text: the daemon renders the prompt from the checklist itself, so never copy the task's wording here. To send the task at hand unchanged, just name it. \"@noop\" is accepted only when no pending task remains after your actions."},
 					"confident_score": map[string]any{"type": "integer", "minimum": 0, "maximum": 100,
-						"description": "REQUIRED. How confident you are in this decision, 0 (a guess) to 100 (certain). This gates auto-action: the daemon only acts automatically when this meets the operator's auto_act_confidence_threshold; below it (or if omitted) the decision is shown to the operator to confirm."},
+						"description": "REQUIRED. How confident you are in this decision, 0 (a guess) to 100 (certain). This gates auto-action: the daemon only acts automatically when this meets the operator's auto_act_confidence_threshold; below it (or if omitted) the decision is shown to the operator to confirm — except on a pre-delivery task-list review, where a low score instead discards the WHOLE submission (both the edits and the task choice) and the original task is sent unchanged."},
 					"rationale": map[string]any{"type": "string", "description": "Why this action matches the operator's likely intent"},
 				},
 				"required": []any{"confident_score"},
@@ -283,6 +303,57 @@ func (so *selectOption) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// taskActionArg is one submitted checklist edit, straight off the wire.
+type taskActionArg struct {
+	Op   string `json:"op"`
+	Task string `json:"task"`
+	Text string `json:"text"`
+	To   int    `json:"to"`
+	As   string `json:"as"`
+}
+
+// toDomain converts the submitted actions, rejecting an unknown op and the
+// per-op field omissions a schema alone cannot express. This is a SHAPE check
+// only: whether "3.4" names anything is the daemon's question, answered inside
+// the file lock.
+func toDomainTaskActions(args []taskActionArg) ([]domain.TaskAction, error) {
+	if len(args) == 0 {
+		return nil, nil
+	}
+	out := make([]domain.TaskAction, len(args))
+	for i, a := range args {
+		op := domain.TaskOp(strings.ToLower(strings.TrimSpace(a.Op)))
+		switch op {
+		case domain.TaskOpDone, domain.TaskOpDelete:
+			if strings.TrimSpace(a.Task) == "" {
+				return nil, fmt.Errorf("task_actions[%d]: %q needs a task reference", i, op)
+			}
+		case domain.TaskOpEdit:
+			if strings.TrimSpace(a.Task) == "" {
+				return nil, fmt.Errorf("task_actions[%d]: edit needs a task reference", i)
+			}
+			if strings.TrimSpace(a.Text) == "" {
+				return nil, fmt.Errorf("task_actions[%d]: edit needs the replacement text", i)
+			}
+		case domain.TaskOpMove:
+			if strings.TrimSpace(a.Task) == "" {
+				return nil, fmt.Errorf("task_actions[%d]: move needs a task reference", i)
+			}
+			if a.To < 1 {
+				return nil, fmt.Errorf("task_actions[%d]: move needs a destination position of 1 or greater", i)
+			}
+		case domain.TaskOpAdd:
+			if strings.TrimSpace(a.Text) == "" {
+				return nil, fmt.Errorf("task_actions[%d]: add needs the new task's text", i)
+			}
+		default:
+			return nil, fmt.Errorf("task_actions[%d]: unknown op %q (want done, delete, edit, move or add)", i, a.Op)
+		}
+		out[i] = domain.TaskAction{Op: op, Task: a.Task, Text: a.Text, To: a.To, As: a.As}
+	}
+	return out, nil
+}
+
 type toolCallParams struct {
 	Name      string `json:"name"`
 	Arguments struct {
@@ -291,6 +362,13 @@ type toolCallParams struct {
 		SelectOptions   []selectOption `json:"select_options"`
 		ConfidentScore  *int           `json:"confident_score"`
 		Rationale       string         `json:"rationale"`
+		// A pre-delivery task-list review's answer. Validated only for SHAPE
+		// here (known op, required fields present) — references are resolved by
+		// the daemon inside the checklist's file lock, where the list is
+		// authoritative. Validating them here would read a file that can change
+		// before the daemon acts, and report an ambiguity that no longer exists.
+		TaskActions []taskActionArg `json:"task_actions"`
+		SendTask    string          `json:"send_task"`
 		// Legacy aliases from the pre-rename tool surface; accepted so a
 		// consult started under an older prompt still lands.
 		Action   string `json:"action"`
@@ -314,6 +392,10 @@ type consultContextFields struct {
 	// per-situation menu validation does not apply even when the reviewed
 	// situation carries parsed options.
 	ProposedAction string `json:"proposed_action"`
+	// ProposedTask marks a pre-delivery TASK-LIST review: the answer contract
+	// is task_actions + send_task. Same reason the menu rules must not apply —
+	// the situation is idle, but the answer is a task reference, not reply text.
+	ProposedTask string `json:"proposed_task"`
 	// TabSelectKinds is per-tab "single"/"multi" (present only when a form has
 	// a multi-select tab). Only a "multi" tab may receive several option
 	// numbers (an array); a scalar/single-select tab or the Submit tab takes
@@ -442,13 +524,46 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error)
 		if err != nil {
 			return nil, err
 		}
+		var ccTask consultContextFields
+		_ = json.Unmarshal([]byte(req.ContextJSON), &ccTask)
+		taskActions, err := toDomainTaskActions(p.Arguments.TaskActions)
+		if err != nil {
+			return nil, err
+		}
+		sendTask := strings.TrimSpace(p.Arguments.SendTask)
+		if ccTask.ProposedTask != "" {
+			// A pre-delivery task-list review. Its contract is task_actions +
+			// send_task, so the per-situation rules below (which would demand
+			// recommend_action for an idle agent) must not apply.
+			if len(selects) > 0 {
+				return nil, fmt.Errorf("a task-list review takes send_task (the reference of the task to deliver) and optional task_actions, not select_options")
+			}
+			// A decline written as recommend_action "@noop" is still a
+			// decline; read it as one rather than staging a submission that
+			// names no task and gets discarded downstream.
+			if sendTask == "" && action == domain.ActionNoop {
+				sendTask = domain.NoopSendTask
+			}
+			if sendTask == "" {
+				return nil, fmt.Errorf("a task-list review requires send_task: the reference of the task to deliver (a declared id like \"3.4\", a position like \"#3\", or an add's handle), or %q when no pending task remains after your task_actions", domain.NoopSendTask)
+			}
+			// recommend_action has no meaning here and would be staged as the
+			// text to type into the pane, so refuse it rather than let a
+			// mixed-protocol answer through.
+			if action != "" && !domain.IsNoopAction(action) {
+				return nil, fmt.Errorf("a task-list review takes send_task, not recommend_action: name the task to deliver by reference — the daemon renders the prompt from the checklist, so never copy task text")
+			}
+			action = ""
+		} else if len(taskActions) > 0 || sendTask != "" {
+			return nil, fmt.Errorf("task_actions and send_task are only accepted on a pre-delivery task-list review (get_context carries proposed_task and tasks); this request is not one")
+		}
 		// Per-situation input contract (an explicit @noop is exempt — it is
 		// a valid "no reply" answer to any situation): approval/choice with
 		// a parsed menu must be answered with select_options; idle/error
 		// with recommend_action. A menu-less approval/choice (e.g. a bare
 		// y/n prompt) takes literal reply text, and select_options stays
 		// available as an escape hatch for a menu the parser missed.
-		if action != domain.ActionNoop {
+		if action != domain.ActionNoop && ccTask.ProposedTask == "" {
 			var cc consultContextFields
 			_ = json.Unmarshal([]byte(req.ContextJSON), &cc)
 			// An action review's contract is recommend_action regardless of
@@ -499,6 +614,7 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error)
 			RequestID: req.RequestID, Signature: req.Signature,
 			SituationType: req.SituationType, AgentType: req.AgentType,
 			Action: action, OptionID: optionID,
+			TaskActions: taskActions, SendTask: sendTask,
 			Rationale: p.Arguments.Rationale, ConfidentScore: score,
 			Status:    "pending",
 			CreatedAt: time.Now(),

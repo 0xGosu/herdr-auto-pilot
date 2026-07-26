@@ -14,8 +14,10 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/url"
 	"os"
@@ -171,7 +173,9 @@ CREATE TABLE IF NOT EXISTS llm_decisions (
 	confident_score INTEGER NOT NULL DEFAULT -1,
 	captured_output TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL DEFAULT 'pending',
-	created_at INTEGER NOT NULL
+	created_at INTEGER NOT NULL,
+	task_actions_json TEXT NOT NULL DEFAULT '',
+	send_task TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS llm_retries (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,6 +263,12 @@ func (s *Store) migrate() error {
 		`ALTER TABLE audit_log ADD COLUMN match_score REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE audit_log ADD COLUMN embed_error TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
+		// A pre-delivery task review's submission: the ordered checklist edits
+		// (JSON) and the reference of the task to deliver once they are
+		// applied. Empty on every other kind of decision, and on every row
+		// written before the review existed.
+		`ALTER TABLE llm_decisions ADD COLUMN task_actions_json TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE llm_decisions ADD COLUMN send_task TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_requests ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''`,
 		// sent = 1 when the front-end delivered the correction to the agent;
 		// drives the daemon's post-action unblock self-check.
@@ -774,13 +784,26 @@ func decodeVector(blob []byte, dims int) ([]float32, error) {
 func (s *Store) InsertLLMDecision(ctx context.Context, d domain.LLMDecision) (int64, error) {
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		// A pre-delivery task review's whole submission rides on these two
+		// columns: the DB row IS the transport between the MCP process and the
+		// daemon, so anything the review decided must land here or be lost.
+		taskActions := ""
+		if len(d.TaskActions) > 0 {
+			blob, merr := json.Marshal(d.TaskActions)
+			if merr != nil {
+				return fmt.Errorf("encoding task_actions: %w", merr)
+			}
+			taskActions = string(blob)
+		}
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO llm_decisions (request_id, signature, situation_type, agent_type,
-				action, option_id, rationale, confident_score, captured_output, status, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				action, option_id, rationale, confident_score, captured_output, status, created_at,
+				task_actions_json, send_task)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			d.RequestID, d.Signature, string(d.SituationType), d.AgentType,
 			d.Action, d.OptionID, d.Rationale, d.ConfidentScore, d.CapturedOutput,
-			orDefault(d.Status, "pending"), unix(d.CreatedAt))
+			orDefault(d.Status, "pending"), unix(d.CreatedAt),
+			taskActions, d.SendTask)
 		if err != nil {
 			return err
 		}
@@ -2017,11 +2040,23 @@ func (s *Store) scanLLMDecisions(rows *sql.Rows) ([]domain.LLMDecision, error) {
 	var out []domain.LLMDecision
 	for rows.Next() {
 		var d domain.LLMDecision
-		var situationType string
+		var situationType, taskActions string
 		var created int64
 		if err := rows.Scan(&d.ID, &d.RequestID, &d.Signature, &situationType, &d.AgentType,
-			&d.Action, &d.OptionID, &d.Rationale, &d.ConfidentScore, &d.CapturedOutput, &d.Status, &created); err != nil {
+			&d.Action, &d.OptionID, &d.Rationale, &d.ConfidentScore, &d.CapturedOutput, &d.Status, &created,
+			&taskActions, &d.SendTask); err != nil {
 			return nil, err
+		}
+		// A malformed blob degrades to "no actions", never a scan error: the
+		// daemon then sees a review that names a task but edits nothing, which
+		// its own validation handles. Failing the whole read would instead lose
+		// a decision the operator's LLM produced.
+		if taskActions != "" {
+			if err := json.Unmarshal([]byte(taskActions), &d.TaskActions); err != nil {
+				slog.Warn("llm decision has an unreadable task_actions blob; treating it as no edits",
+					"decision", d.ID, "error", err)
+				d.TaskActions = nil
+			}
 		}
 		d.SituationType = domain.SituationType(situationType)
 		d.CreatedAt = fromUnix(created)
@@ -2031,7 +2066,8 @@ func (s *Store) scanLLMDecisions(rows *sql.Rows) ([]domain.LLMDecision, error) {
 }
 
 const llmDecisionCols = `id, request_id, signature, situation_type, agent_type,
-	action, option_id, rationale, confident_score, captured_output, status, created_at`
+	action, option_id, rationale, confident_score, captured_output, status, created_at,
+	task_actions_json, send_task`
 
 // PendingLLMDecisions returns staged decisions awaiting daemon consumption.
 func (s *Store) PendingLLMDecisions(ctx context.Context) ([]domain.LLMDecision, error) {

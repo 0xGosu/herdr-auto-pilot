@@ -112,14 +112,13 @@ type DeclaredTask struct {
 	Template  string // operator template; "" uses DefaultNextTaskTemplate
 	AgentName string // agent short name, for {agent_name}
 	Cwd       string // agent working directory, for {cwd}
-	// LLMReview reports whether the source opted IN to the pre-send LLM review
-	// gate (enable_llm_review=true; off by default). Never true together with
-	// Reserve — an auto-send source hands tasks out unattended and is not
-	// reviewed, because a declined review escalates and a pending escalation
-	// stops the idle poll. config.TaskSource.LLMReviewEnabled resolves both
-	// halves, and the config layer rejects the combination at every write. The
-	// runtime "is an LLM command configured" check stays at the daemon call
-	// site — this flag carries only the source's declared preference.
+	// LLMReview reports whether the source opted IN to the pre-delivery LLM
+	// review of the task about to be auto-sent
+	// (enable_llm_review_before_auto_send=true; off by default). It composes
+	// freely with Reserve: the hand-out decides THAT a task goes, the review
+	// decides which task and in what shape. The runtime "is an LLM command
+	// configured" check stays at the daemon call site — this flag carries only
+	// the source's declared preference.
 	LLMReview bool
 	// Reserve reports whether the sender must mark this item "[-]" in the file
 	// as it delivers (and return it to "[ ]" if the send fails). Set for
@@ -127,8 +126,12 @@ type DeclaredTask struct {
 	// out unattended, so an unreserved item would be handed to the next idle
 	// agent too. Sources without the flag keep the historical behavior — the
 	// daemon leaves the item "[ ]" and the agent marks it via `hap task start`.
-	// Mutually exclusive with LLMReview (see above).
 	Reserve bool
+	// MaxTasks is the source's max_tasks cap, carried so the pre-delivery LLM
+	// review honours the same limit a manual `hap task add` does — a review
+	// must not grow a list past the size the daemon would refuse to refill.
+	// 0 means uncapped.
+	MaxTasks int
 }
 
 // TemplateOrDefault resolves a task source's next-task template, falling back

@@ -126,12 +126,13 @@ type Daemon struct {
 	semanticReady atomic.Bool
 	semanticGen   atomic.Int64
 
-	transitions         chan domain.AgentTransition
-	nudges              chan control.Kind
-	llmResults          chan llmOutcome
-	actionReviewResults chan actionReviewOutcome
-	taskGenResults      chan taskGenOutcome
-	sweepResults        chan sweepOutcome
+	transitions           chan domain.AgentTransition
+	nudges                chan control.Kind
+	llmResults            chan llmOutcome
+	actionReviewResults   chan actionReviewOutcome
+	taskListReviewResults chan taskListReviewOutcome
+	taskGenResults        chan taskGenOutcome
+	sweepResults          chan sweepOutcome
 	// delayedTr re-enters attention transitions whose capture delay has
 	// elapsed; the pane read happens back on the main loop, like every
 	// other pipeline entry point.
@@ -180,11 +181,21 @@ type Daemon struct {
 	lastAutoSend map[string]time.Time
 	lastAutoNoop map[string]time.Time
 
-	// actionReviewInFlight tracks the one live outbound action review per
+	// preDeliveryReviewInFlight tracks the one live pre-delivery review per
 	// agent; the token lets the outcome handler drop superseded results.
-	// Guarded by mu alongside actionReviewSeq.
-	actionReviewInFlight map[string]actionReviewFlight
-	actionReviewSeq      uint64
+	// Guarded by mu alongside preDeliveryReviewSeq.
+	//
+	// ONE registry for BOTH review kinds — the outbound action review
+	// (llm.enable_rewrite_action) and the task-list review
+	// (enable_llm_review_before_auto_send). They are alternatives, never
+	// concurrent: act() routes a declared task to the task review and
+	// everything else to the action review. Sharing the map is what makes
+	// "one pre-delivery review per agent" true across both, and lets
+	// cancelPreDeliveryReviewExcept supersede either when a new situation
+	// takes the pane. The token is drawn from the shared counter, so each
+	// handler's token check also drops the other kind's outcome.
+	preDeliveryReviewInFlight map[string]preDeliveryReviewFlight
+	preDeliveryReviewSeq      uint64
 
 	// sweepInFlight dedupes the one live multi-tab form sweep per agent
 	// (guarded by mu); outcomes return through sweepResults.
@@ -292,11 +303,11 @@ type llmOutcome struct {
 	err       error
 }
 
-// actionReviewFlight is the registry entry for one in-flight outbound action
+// preDeliveryReviewFlight is the registry entry for one in-flight outbound action
 // review. requestID names the staged llm_requests row so a cancelled flight
 // can expire it (a lingering pending row would block other consults for this
 // agent until expireStaleLLMWork reclaims it).
-type actionReviewFlight struct {
+type preDeliveryReviewFlight struct {
 	signature string
 	requestID string
 	token     uint64
@@ -381,32 +392,33 @@ func New(opt Options) (*Daemon, error) {
 		opt.ResolveSelf = selfpath.Resolve
 	}
 	d := &Daemon{
-		opt:                  opt,
-		verifyUnblockDelay:   unblockCheckDelay,
-		transitions:          make(chan domain.AgentTransition, 256),
-		nudges:               make(chan control.Kind, 16),
-		llmResults:           make(chan llmOutcome, 16),
-		actionReviewResults:  make(chan actionReviewOutcome, 16),
-		taskGenResults:       make(chan taskGenOutcome, 16),
-		sweepResults:         make(chan sweepOutcome, 16),
-		delayedTr:            make(chan domain.AgentTransition, 256),
-		pendingCapture:       map[string]*captureEntry{},
-		captureStarted:       map[string]bool{},
-		episodeHandled:       map[string]bool{},
-		firstConsult:         map[string]bool{},
-		firstTaskGen:         map[string]bool{},
-		lastAutoSend:         map[string]time.Time{},
-		lastAutoNoop:         map[string]time.Time{},
-		actionReviewInFlight: map[string]actionReviewFlight{},
-		sweepInFlight:        map[string]bool{},
-		toggleAttempt:        map[string]string{},
-		idleSince:            map[string]idleMark{},
-		autoTaskClaim:        map[string]taskClaim{},
-		snapshotSaved:        map[string]bool{},
-		paneCwds:             map[string]paneCwdEntry{},
-		paneCwdRefreshing:    map[string]bool{},
-		embedder:             opt.Embedder,
-		timers:               map[*time.Timer]struct{}{},
+		opt:                       opt,
+		verifyUnblockDelay:        unblockCheckDelay,
+		transitions:               make(chan domain.AgentTransition, 256),
+		nudges:                    make(chan control.Kind, 16),
+		llmResults:                make(chan llmOutcome, 16),
+		actionReviewResults:       make(chan actionReviewOutcome, 16),
+		taskListReviewResults:     make(chan taskListReviewOutcome, 16),
+		taskGenResults:            make(chan taskGenOutcome, 16),
+		sweepResults:              make(chan sweepOutcome, 16),
+		delayedTr:                 make(chan domain.AgentTransition, 256),
+		pendingCapture:            map[string]*captureEntry{},
+		captureStarted:            map[string]bool{},
+		episodeHandled:            map[string]bool{},
+		firstConsult:              map[string]bool{},
+		firstTaskGen:              map[string]bool{},
+		lastAutoSend:              map[string]time.Time{},
+		lastAutoNoop:              map[string]time.Time{},
+		preDeliveryReviewInFlight: map[string]preDeliveryReviewFlight{},
+		sweepInFlight:             map[string]bool{},
+		toggleAttempt:             map[string]string{},
+		idleSince:                 map[string]idleMark{},
+		autoTaskClaim:             map[string]taskClaim{},
+		snapshotSaved:             map[string]bool{},
+		paneCwds:                  map[string]paneCwdEntry{},
+		paneCwdRefreshing:         map[string]bool{},
+		embedder:                  opt.Embedder,
+		timers:                    map[*time.Timer]struct{}{},
 	}
 	// The shutdown context must exist before reload(): reload spawns the
 	// semantic-init goroutine, which roots at shutdownCtx so daemon teardown
@@ -891,6 +903,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.handleActionReviewOutcome(ctx, res)
 				return nil
 			})
+		case res := <-d.taskListReviewResults:
+			logging.Guard("task-list-review-result", func() error {
+				d.handleTaskListReviewOutcome(ctx, res)
+				return nil
+			})
 		case res := <-d.taskGenResults:
 			logging.Guard("task-gen-result", func() error {
 				d.handleTaskGenOutcome(ctx, res)
@@ -984,7 +1001,7 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// leave the flight live, and a late "@noop" outcome (which skips the
 		// staleness re-read) would stamp audit/rate side effects for a
 		// pane that already moved on.
-		d.cancelActionReviewExcept(ctx, tr.AgentID, "")
+		d.cancelPreDeliveryReviewExcept(ctx, tr.AgentID, "")
 		// Genuine progress ends the pane's parked episode: re-arm the
 		// subscribe-time reconcile so a fresh block/idle/done is surfaced (#49).
 		// The agent is working again, so it is no longer idle and no longer
@@ -1198,7 +1215,7 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 	// Cancel first, outside the lock these helpers take themselves: a pending
 	// capture or review for the dead agent must not fire against the new one.
 	d.cancelCapture(a.PaneID)
-	d.cancelActionReviewExcept(ctx, a.AgentID, "")
+	d.cancelPreDeliveryReviewExcept(ctx, a.AgentID, "")
 
 	d.mu.Lock()
 	delete(d.episodeHandled, a.PaneID)
@@ -1491,30 +1508,17 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		irrevHit, suspected = allow.SuspectedIrreversible(situation.AgentType, scan)
 	}
 
-	// Pre-send LLM review of a determined declared task (opt-IN per source via
-	// enable_llm_review=true; off by default, and never on for an auto-send
-	// source): when an LLM command is configured, the LLM — not
-	// shadow-mode graduation — decides whether this task should be sent to the
-	// idle agent now, seeing the live pane through get_context. A decline
-	// escalates to the operator; an approval is still re-gated in
-	// handleLLMOutcome. The fail-safe pre-checks (killed / never-auto /
-	// suspected-irreversible) escalate normally instead of spending a consult.
-	if situation.Type == domain.SituationIdle && declared != nil &&
-		declared.Task != domain.NoTaskContent && declared.LLMReview &&
-		!disabled && !killActive && !allowMatched && !suspected &&
-		d.llmPort() != nil && d.llmPort().Configured() {
-		// A matching escalation already awaiting the operator (e.g. a prior
-		// decline of this same task) means the situation is handled: don't
-		// re-consult the LLM (a wasted, token-spending review) and don't fall
-		// through to a non-reviewed send — ignore the duplicate event.
-		if d.duplicatePendingEscalation(ctx, situation) {
-			d.ignoreDuplicate(ctx, situation, tr, now)
-			return
-		}
-		d.consultDeclaredTask(ctx, cfg, situation, sig, tr, declared, now)
-		return
-	}
-
+	// NOTE: the LLM review of a declared task deliberately does NOT fork here.
+	// It used to, and that placement is what forced it to be mutually exclusive
+	// with enable_auto_send_task_when_idle (issue #255): preempting Decide meant
+	// a signature graduated to autonomous on @next_task:declared could never
+	// act, and the review's only failure mode was an escalation — which bars an
+	// agent from the idle poll entirely, silently switching auto-send off.
+	//
+	// The review is now a pre-DELIVERY filter (tasklistreview.go): Decide runs
+	// normally and decides THAT a task goes, then deliverDeclared hands the
+	// resolved task to the LLM, which revises the list and picks which task
+	// actually ships. It never escalates.
 	in := domain.DecideInput{
 		Situation:            situation,
 		Signature:            sig,
@@ -1560,7 +1564,7 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	if decision.Action == domain.ActionSend {
 		keepSig = sig.Signature
 	}
-	d.cancelActionReviewExcept(ctx, situation.AgentID, keepSig)
+	d.cancelPreDeliveryReviewExcept(ctx, situation.AgentID, keepSig)
 
 	switch decision.Action {
 	case domain.ActionSend:
@@ -1601,18 +1605,18 @@ func truncateTailRunes(s string, n int) string {
 	return "…" + string(runes[len(runes)-n:])
 }
 
-// cancelActionReviewExcept invalidates the agent's in-flight action review
+// cancelPreDeliveryReviewExcept invalidates the agent's in-flight action review
 // unless it is for keepSig. The cancelled flight's outcome is dropped by the
 // token check; its staged llm_requests row is expired best-effort so it does
 // not block other consults for this agent until expireStaleLLMWork.
-func (d *Daemon) cancelActionReviewExcept(ctx context.Context, agentID, keepSig string) {
+func (d *Daemon) cancelPreDeliveryReviewExcept(ctx context.Context, agentID, keepSig string) {
 	d.mu.Lock()
-	fl, ok := d.actionReviewInFlight[agentID]
+	fl, ok := d.preDeliveryReviewInFlight[agentID]
 	if !ok || (keepSig != "" && fl.signature == keepSig) {
 		d.mu.Unlock()
 		return
 	}
-	delete(d.actionReviewInFlight, agentID)
+	delete(d.preDeliveryReviewInFlight, agentID)
 	d.mu.Unlock()
 	fl.cancel()
 	if err := d.opt.Store.UpdateLLMRequestStatus(ctx, fl.requestID, "expired"); err != nil {
@@ -1718,8 +1722,8 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// Literal free text can be adapted to the live pane by the consult LLM
 	// (llm.enable_rewrite_action); menu digits must reach the menu
 	// untouched, and a declared task from a [[task_sources]] is never
-	// reviewed here — the source's enable_llm_review gate owns that (an
-	// opted-out or LLM-less source delivers its tasks verbatim). The send
+	// reviewed here — the source's enable_llm_review_before_auto_send gate owns
+	// that (an opted-out or LLM-less source delivers its tasks verbatim). The send
 	// completes asynchronously via handleActionReviewOutcome, so the learned
 	// action is pinned NOW — situation state may drift before delivery.
 	if cfg.LLM.EnableRewriteAction && !menuMapped && dec.Input != "" &&
@@ -1730,19 +1734,31 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		}
 	}
 
-	// Reserve the checklist item only when this send really is that declared
-	// task (comparing the rendered prompt, which is exactly what Decide put in
+	// Mark this delivery as THE declared task only when it really is one
+	// (comparing the rendered prompt, which is exactly what Decide put in
 	// dec.Input) — a learned free-text reply for the same agent must not
-	// consume a task.
+	// consume a task or be routed into the task-list review.
+	//
+	// Deliberately NOT gated on declared.Reserve. Reserving is what an
+	// auto-send source does with the item; carrying the declared task is what
+	// tells deliverDeclared this send is reviewable, and a source can opt into
+	// the review without opting into unattended hand-out. reserveDeclaredTask
+	// still no-ops for a non-reserving source, so nothing is marked "[-]" that
+	// was not before.
 	del := delivery{sendText: outbound, input: dec.Input, rationale: dec.Rationale}
-	if declared != nil && declared.Reserve && declared.Task != domain.NoTaskContent &&
+	if declared != nil && declared.Task != domain.NoTaskContent &&
 		declared.Prompt() == dec.Input {
 		del.declared, del.taskText = declared, declared.Task
 	}
 
 	// learned stays empty: deliverAutonomous computes it after the send,
 	// exactly as the pre-review code did.
-	d.deliverAutonomous(ctx, s, sig, dec, tr, del, now)
+	//
+	// This is the ONE delivery site that can carry a declared task, so it is
+	// the one that routes through deliverDeclared — the pre-delivery task-list
+	// review's only entry point. Every other deliverAutonomous caller builds a
+	// delivery with no declared task by construction (see deliverDeclared).
+	d.deliverDeclared(ctx, s, sig, dec, tr, del, now)
 }
 
 // learnedAction is the action recorded in decision history for a rule-path
@@ -1763,26 +1779,18 @@ func (d *Daemon) learnedAction(ctx context.Context, s domain.Situation, dec doma
 // llmLearnedAction is the action recorded in decision history for an LLM
 // decision — the counterpart of learnedAction on the consult path.
 //
-// A task-review send learns SYMBOLICALLY, whatever the LLM actually sent: the
-// rule is "send the next declared task", not the text of one particular task.
-// Recording the literal text instead would bucket every task separately in
-// domain.Confidence, which groups on the raw action string — the signature
-// would never reach agreement, and a couple of @noop records could even win
-// the plurality and stand the agent down (resolveSituation checks @noop before
-// the declared task). A task review always has a declared task
-// (consultDeclaredTask), so there is no inferred variant to distinguish here.
-//
-// Every other situation (approval / choice / error, and an idle consult with no
+// An ordinary consult (approval / choice / error, and an idle consult with no
 // task source, where the LLM authors free text) learns llmDec.Action — which is
-// exactly what gets delivered below. Deliberately NOT llmDec.OptionID, even
-// though learnedAction prefers dec.OptionID: that one comes from domain.Decide
-// and agrees with the send by construction, whereas llmDec.OptionID is supplied
-// by the model and can survive unresolved on the legacy option_id alias, which
+// exactly what gets delivered. Deliberately NOT llmDec.OptionID, even though
+// learnedAction prefers dec.OptionID: that one comes from domain.Decide and
+// agrees with the send by construction, whereas llmDec.OptionID is supplied by
+// the model and can survive unresolved on the legacy option_id alias, which
 // would learn an answer the daemon never sent.
-func (d *Daemon) llmLearnedAction(llmDec *domain.LLMDecision, taskReviewSend bool) string {
-	if taskReviewSend {
-		return domain.ActionNextDeclaredTask
-	}
+//
+// A declared-task send never lands here: it goes through the pre-delivery task
+// review (tasklistreview.go), which learns SYMBOLICALLY — "send the next
+// declared task", not the text of one particular task.
+func (d *Daemon) llmLearnedAction(llmDec *domain.LLMDecision) string {
 	return llmDec.Action
 }
 
@@ -1803,6 +1811,14 @@ type delivery struct {
 	// reserveDeclaredTask). Both empty/nil for every other send.
 	declared *domain.DeclaredTask
 	taskText string
+	// rollback/reservedIndex carry a claim the caller ALREADY took, so
+	// deliverAutonomousClaimed reserves nothing and simply honours it. Set only
+	// by the pre-delivery task review, which must mutate the list, re-resolve
+	// the chosen task and reserve it in ONE critical section — see
+	// taskfile.ApplyReview. A nil rollback means "not yet reserved", which is
+	// every other path.
+	rollback      func()
+	reservedIndex int
 }
 
 // isIdleTaskHandout reports whether an actual delivery is an unattended
@@ -1875,6 +1891,18 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 	sent := false
 	executed := d.withAgentAutomation(ctx, s, sig, tr, del.input, dec.Confidence, del.llmConfidence, del.llmOutput, now,
 		func() { sent = d.deliverAutonomousClaimed(ctx, s, sig, dec, tr, del, now) })
+	if !executed && del.rollback != nil {
+		// The lifecycle barrier refused (the agent was disabled mid-flight, or
+		// the cross-process lock errored) WITHOUT running the closure, so
+		// deliverAutonomousClaimed never got to own the caller's claim. Release
+		// it here or a task the pre-delivery review already reserved is
+		// stranded "[-]" with no task_reservations row — nothing for
+		// reclaimStrandedTasks to recover from, so no agent ever picks it up
+		// again. Guarded on !executed precisely because that is the one case in
+		// which neither abandon() nor the send-failure rollback can have run,
+		// so this can never double-release.
+		del.rollback()
+	}
 	if !executed || !sent {
 		// Nothing reached the pane — a refused reservation, a rolled-back send,
 		// a blocked audit write, or the lifecycle barrier. The pairing must not
@@ -1893,6 +1921,21 @@ func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig 
 func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situation,
 	sig domain.SignatureResult, dec domain.Decision, tr domain.AgentTransition,
 	del delivery, now time.Time) bool {
+	// A claim the CALLER already took (the pre-delivery task review, which must
+	// reserve inside its own critical section) is owned from here on: this
+	// function is the single place that decides whether the send happens, so it
+	// is the single place that may undo the claim. Resolved first so every
+	// early return below can release it — otherwise a review-reserved item
+	// would be stranded "[-]" with no ledger row for the sweep to reclaim from.
+	callerRollback := del.rollback
+	abandon := func() bool {
+		if callerRollback != nil {
+			callerRollback()
+		}
+		d.dropAutoTaskClaim(s.AgentID)
+		return false
+	}
+
 	// An unattended task hand-out must not land in a pane that has been recycled
 	// since capture: the agent it was meant for is gone and a DIFFERENT agent
 	// would receive it. Checked before the audit row, because nothing is
@@ -1901,8 +1944,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		if recycled, why := d.paneRecycled(ctx, s); recycled {
 			slog.Warn("pane was recycled since capture; abandoning the auto-send",
 				"agent", s.AgentID, "reason", why)
-			d.dropAutoTaskClaim(s.AgentID)
-			return false
+			return abandon()
 		}
 	}
 
@@ -1917,19 +1959,30 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
 		d.notify(ctx, "Herd Auto Prompter: persistence failure",
 			"An automated action was blocked because its audit record could not be written.")
-		return false
+		return abandon()
 	}
 
 	// Claim the checklist item BEFORE the send: marking it after delivery
 	// would leave a window in which the very same "[ ]" line is handed to a
 	// second idle agent. A refusal here means somebody already took it.
-	rollback, reservedIndex, err := d.reserveDeclaredTask(del.declared, del.taskText)
-	if err != nil {
-		slog.Warn("declared task could not be reserved; not sending", "agent", s.AgentID, "error", err)
-		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
-		d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
-			fmt.Sprintf("Agent %s: the next task was claimed or edited before it could be sent (%v); please review the list.", s.AgentID, err))
-		return false
+	//
+	// A reviewed hand-out arrives ALREADY claimed: the pre-delivery review
+	// applies its checklist edits, re-resolves the chosen task and reserves it
+	// inside one locked read-modify-write (taskfile.ApplyReview), because a
+	// position captured before those edits would address the wrong line
+	// afterwards. Re-reserving here would fail — the item is no longer "[ ]" —
+	// so the review hands its own claim and rollback down instead.
+	rollback, reservedIndex := callerRollback, del.reservedIndex
+	if rollback == nil {
+		var err error
+		rollback, reservedIndex, err = d.reserveDeclaredTask(del.declared, del.taskText)
+		if err != nil {
+			slog.Warn("declared task could not be reserved; not sending", "agent", s.AgentID, "error", err)
+			d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
+			d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
+				fmt.Sprintf("Agent %s: the next task was claimed or edited before it could be sent (%v); please review the list.", s.AgentID, err))
+			return false
+		}
 	}
 
 	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType, del.sendText); err != nil {
@@ -2386,112 +2439,19 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 	})
 }
 
-// taskReviewContext carries the extra get_context fields for a pre-send
-// declared-task review: the rendered prompt that would be sent (proposed_task),
-// the task-list file path, the current (next unchecked) task, and every pending
-// task in file order so the LLM can pick a different one when it judges the
-// current task already done.
+// taskReviewContext carries the extra get_context fields for a pre-delivery
+// task-list review: the rendered prompt that would be sent (proposed_task), the
+// task-list file path, the task under review, and the WHOLE list — every item
+// with the reference submit_decision uses to address it. The review reads the
+// whole list but acts on the task at hand, so it needs the done items too: that
+// is how it tells "already covered" from "next".
 type taskReviewContext struct {
 	proposedPrompt string
 	listPath       string
 	currentTask    string
+	tasks          []taskRef
 	pending        []string
 	inProgress     []string
-}
-
-// consultDeclaredTask reviews a determined declared task before sending: it
-// consults the operator's LLM (the same command + get_context/submit_decision
-// MCP round-trip as consultLLM) with the proposed task in context, and funnels
-// the result through the shared handleLLMOutcome so every safety re-gate still
-// applies. An approval is delivered (subject to the confidence gate); a decline
-// (@noop) is escalated to the operator in handleLLMOutcome. Runs the context
-// assembly + spawn in a goroutine so the herdr CLI reads never stall the loop.
-func (d *Daemon) consultDeclaredTask(ctx context.Context, cfg config.Config, s domain.Situation,
-	sig domain.SignatureResult, tr domain.AgentTransition, declared *domain.DeclaredTask, now time.Time) {
-
-	llm := d.llmPort()
-	// Don't stack a review onto a consult already in flight for this agent —
-	// the same guard the generate-task path uses. A persistence error must
-	// escalate + audit, never silently drop the task (fail-safe rule).
-	if pending, err := d.opt.Store.HasPendingLLMConsult(ctx, s.AgentID); err != nil {
-		d.escalate(ctx, s, sig, domain.Decision{
-			Action: domain.ActionEscalate, Reason: domain.ReasonPersistenceFailed,
-			Rationale: "task-review pending check failed: " + err.Error(),
-		}, tr, now)
-		return
-	} else if pending {
-		slog.Info("task-review skipped: consult already in flight", "agent", s.AgentID)
-		return
-	}
-
-	proposed := declared.Prompt()
-	// A review consults the operator's command, but the priming/first-consult
-	// variant is meant for answering pane prompts, not task review — always use
-	// the base command so First stays false here. SourcePath/ReviewedTask let
-	// the delayed send revalidate the checklist (see handleLLMOutcome).
-	req := domain.LLMRequest{
-		RequestID: fmt.Sprintf("taskreview-%s-%d", s.AgentID, now.UnixNano()),
-		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
-		TaskReview: true, ProposedTask: proposed,
-		SourcePath: declared.Path, ReviewedTask: declared.Task,
-		// Always false today: a source with enable_auto_send_task_when_idle is
-		// never LLM-reviewed (the two config keys are mutually exclusive), so no
-		// reserving delivery reaches a task review. Carried anyway so the
-		// reserve-through-review path stays correct if that policy is relaxed —
-		// and pinned at consult time on purpose (see handleLLMOutcome).
-		ReserveTask:  declared.Reserve,
-		RetryAuditID: s.RetryAuditID,
-	}
-	// Stage the pending row synchronously (context filled off-loop below) so a
-	// second idle event cannot race past the guard before the goroutine
-	// registers the flight. Mirrors generateTask.
-	if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
-		d.escalate(ctx, s, sig, domain.Decision{
-			Action: domain.ActionEscalate, Reason: domain.ReasonPersistenceFailed,
-			Rationale: "staging task review failed: " + err.Error(),
-		}, tr, now)
-		return
-	}
-
-	d.spawn(func() {
-		outcome := llmOutcome{situation: s, sig: sig, request: req}
-		err := logging.Guard("llm-task-review", func() error {
-			agentName, nerr := d.opt.Store.EnsureAgentName(ctx, s.AgentID)
-			if nerr != nil {
-				agentName = ""
-			}
-			req.AgentName = agentName
-			// Give the review the full remaining list (re-read off the main
-			// loop) so it can pick a different task when the current one is
-			// already done; degrade to just the current task on a read error.
-			review := &taskReviewContext{
-				proposedPrompt: proposed, listPath: declared.Path, currentTask: declared.Task,
-			}
-			if data, rerr := d.opt.ReadTaskFile(declared.Path); rerr == nil {
-				review.pending = domain.PendingDeclaredTasks(string(data))
-				review.inProgress = domain.InProgressDeclaredTasks(string(data))
-			} else {
-				slog.Warn("task-review: re-reading task source for pending list failed",
-					"path", declared.Path, "error", rerr)
-			}
-			// Fill the context on the already-staged row before the CLI reads
-			// it via get_context.
-			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, review, ""))
-			if err := d.opt.Store.UpdateLLMRequestContext(ctx, req.RequestID, req.ContextJSON); err != nil {
-				return fmt.Errorf("staging LLM request context failed: %w", err)
-			}
-			outcome.request = req
-			decision, err := llm.Consult(ctx, req)
-			outcome.decision = decision
-			return err
-		})
-		outcome.err = err
-		select {
-		case d.llmResults <- outcome:
-		case <-ctx.Done():
-		}
-	})
 }
 
 // taskGenPort returns the LLM adapter as a TaskGeneratorPort when a
@@ -2868,15 +2828,36 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 			fields["first_in_progress_task"] = summary.firstInProgress
 		}
 	}
-	// Pre-send declared-task review: the agent is idle with a next task queued.
-	// Ask the LLM to judge, from the pane, whether sending it now is right —
-	// send it (recommend_action, edited if warranted), pick a different pending
-	// task when the current one is already done, or decline (@noop).
+	// Pre-delivery task-list review: the daemon is about to auto-send a task
+	// from this agent's checklist. The LLM gets ONE look at the whole list and
+	// may revise it and choose which task actually ships, in one round trip.
 	if review != nil {
 		fields["proposed_task"] = review.proposedPrompt
 		fields["current_task"] = review.currentTask
+		// Omitted rather than null when the re-read failed: an absent key reads
+		// as "no list to show you", a null one reads like an empty checklist.
+		if len(review.tasks) > 0 {
+			fields["tasks"] = review.tasks
+		}
 		fields["pending_tasks"] = review.pending
-		fields["answer_format"] = "this idle agent has a next task ready to send: proposed_task is the exact instruction that would be sent, current_task is that task's text, task_list_path is the checklist file, and pending_tasks lists every remaining task in order. Decide from the pane what to send. To send the queued task unchanged, submit_decision recommend_action \"@next_task:declared\" — the daemon sends proposed_task verbatim, so you never need to copy it. Only put literal text in recommend_action when you are editing the task or, if the pane shows current_task is ALREADY DONE, sending a different still-unfinished item from pending_tasks. To decline — the agent is still busy, every task is done, or nothing should run now — submit_decision recommend_action \"@noop\" with a one-sentence rationale. Always include confident_score: a confident decision is applied automatically (the chosen task is sent, or skipped on a decline), while a low-confidence one is surfaced to the operator"
+		fields["answer_format"] = "the daemon is about to send this idle agent a task from its checklist. " +
+			"current_task is the task at hand, proposed_task is the exact instruction that would be sent, " +
+			"task_list_path is the checklist file, and tasks lists EVERY item with the reference you use to address it " +
+			"(`ref`, its declared id like \"3.4\" when it has one, else a position like \"#3\"), its position and its status. " +
+			"Read the whole list, but act on the task at hand. In ONE submit_decision call: " +
+			"`task_actions` is an ordered series of edits applied in sequence — " +
+			"{\"op\":\"done\",\"task\":REF} when a task is already finished, " +
+			"{\"op\":\"delete\",\"task\":REF} when it is no longer valid, " +
+			"{\"op\":\"edit\",\"task\":REF,\"text\":\"...\"} when it is stale or wrong, " +
+			"{\"op\":\"move\",\"task\":REF,\"to\":N} when it should run later (destination is a position; a task keeps its id when it moves; siblings only), " +
+			"{\"op\":\"add\",\"text\":\"...\",\"as\":\"n1\"} to break an over-large task into pieces (`as` is a handle you can reference before the list numbers it). " +
+			"Each action resolves against the list the previous ones produced — prefer declared ids, since a position shifts under a preceding delete or move. " +
+			"`send_task` is then the REFERENCE of the task to deliver, resolved against the final list. It is an id, never text: " +
+			"the daemon renders the prompt from the list itself, so never copy task text into send_task. " +
+			"To send the task at hand unchanged, just name it in send_task and submit no actions. " +
+			"send_task \"@noop\" is accepted ONLY when, after your actions, no pending task remains — say so in the rationale. " +
+			"Always include confident_score: below the operator's threshold the whole submission is discarded — both your edits and your task choice — and the original task is sent unchanged. " +
+			"Nothing here escalates to a human: if your review cannot be applied, the daemon simply sends the original task"
 	}
 	// Pre-delivery action review: a learned rule already resolved the reply;
 	// ask the LLM to adapt it to the live pane, affirm it, or veto the send.
@@ -3004,7 +2985,7 @@ func (d *Daemon) startActionReview(ctx context.Context, s domain.Situation,
 	// cannot exist here — decideAndAct cancels (and expires) it before act()
 	// dispatches — so any other pending consult row below is a foreign one.
 	d.mu.Lock()
-	if fl, ok := d.actionReviewInFlight[s.AgentID]; ok && fl.signature == sig.Signature {
+	if fl, ok := d.preDeliveryReviewInFlight[s.AgentID]; ok && fl.signature == sig.Signature {
 		d.mu.Unlock()
 		slog.Info("action review already in flight for this situation; dropping duplicate",
 			"agent", s.AgentID)
@@ -3043,9 +3024,9 @@ func (d *Daemon) startActionReview(ctx context.Context, s domain.Situation,
 
 	rctx, cancel := context.WithCancel(ctx)
 	d.mu.Lock()
-	d.actionReviewSeq++
-	token := d.actionReviewSeq
-	d.actionReviewInFlight[s.AgentID] = actionReviewFlight{
+	d.preDeliveryReviewSeq++
+	token := d.preDeliveryReviewSeq
+	d.preDeliveryReviewInFlight[s.AgentID] = preDeliveryReviewFlight{
 		signature: sig.Signature, requestID: req.RequestID, token: token, cancel: cancel,
 	}
 	d.mu.Unlock()
@@ -3115,11 +3096,11 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 	s := res.situation
 
 	// A superseded flight must never send: a newer situation owns the pane.
-	// Its staged row was already expired by cancelActionReviewExcept, so
+	// Its staged row was already expired by cancelPreDeliveryReviewExcept, so
 	// only the live flight's row is resolved to "done" below — a late
 	// outcome must not repaint cancelled work as completed.
 	d.mu.Lock()
-	fl, ok := d.actionReviewInFlight[s.AgentID]
+	fl, ok := d.preDeliveryReviewInFlight[s.AgentID]
 	if !ok || fl.token != res.token {
 		d.mu.Unlock()
 		slog.Info("action-review outcome superseded; dropping", "agent", s.AgentID)
@@ -3130,7 +3111,7 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 		}
 		return
 	}
-	delete(d.actionReviewInFlight, s.AgentID)
+	delete(d.preDeliveryReviewInFlight, s.AgentID)
 	d.mu.Unlock()
 	fl.cancel()
 
@@ -3295,16 +3276,14 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 		escalateWith(domain.ReasonPersistenceFailed, "rate read failed at action review: "+err.Error())
 		return
 	}
-	// Consecutive-ceiling exemption for an unattended idle task delivery (see
-	// domain.CheckRate). In practice ReserveTask is FALSE here: reserving
-	// declared-task deliveries take the LLM-promotion gate below, not this
-	// action-review path (whose requests never set ReserveTask), so this stays
-	// defense-in-depth — if a reserving delivery ever reaches here it is exempted
-	// consistently. The per-minute cap and Paused still gate it.
+	// No consecutive-ceiling exemption here: the action review only ever runs
+	// on a learned free-text send, never on a declared task (act() skips it for
+	// @next_task:declared), so nothing reaching this point is an unattended
+	// idle task hand-out — the one case domain.CheckRate exempts.
 	if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
-	}, res.request.ReserveTask); !ok {
+	}, false); !ok {
 		escalateWith(reason, "at action review")
 		return
 	}
@@ -3429,27 +3408,15 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// row staged by an older binary (or written directly) must not slip a
 	// noop spelling into the pane as literal text.
 	llmDec.Action = domain.NormalizeNoopAction(llmDec.Action)
-	// A task-review send — the LLM approved the queued task, edited it, or
-	// picked another pending item. Only a decline (@noop) is not one, so
-	// classify AFTER the noop normalization above. The action is symbolic for
-	// learning (llmLearnedAction) but literal for the gates and the send below.
-	taskReviewSend := res.request.TaskReview && res.request.ProposedTask != "" &&
-		!domain.IsNoopAction(llmDec.Action)
-	// Task-review shorthand: the LLM may approve the queued task verbatim with
-	// the send-proposed sentinel instead of re-typing it. Expand it to the
-	// reviewed task BEFORE the re-gates/send so every safety scan and the
-	// escalation suggestion operate on the real instruction, never the sentinel.
-	if taskReviewSend && llmDec.Action == domain.ActionSendProposed {
-		llmDec.Action = res.request.ProposedTask
-	}
-	// The sentinels only mean something on the consult that carries their
-	// referent: "send the reviewed task" on a task review, "send the
-	// proposed action" on an action review (which never enters this
-	// function — see handleActionReviewOutcome). Anywhere else there is
-	// nothing to expand them to, so they must never reach the pane as
-	// literal text. Escalate WITHOUT a suggestion rather than via reject(),
-	// which would surface the raw sentinel as confirmable — an operator
-	// confirm --send would then type it into the pane.
+	// The sentinels only mean something on the review that carries their
+	// referent: "send the proposed action" on an action review (see
+	// handleActionReviewOutcome) and "send the reviewed task" on a
+	// pre-delivery task review (see tasklistreview.go) — neither of which
+	// enters this function. Anywhere else there is nothing to expand them to,
+	// so they must never reach the pane as literal text. Escalate WITHOUT a
+	// suggestion rather than via reject(), which would surface the raw
+	// sentinel as confirmable — an operator confirm --send would then type it
+	// into the pane.
 	if llmDec.Action == domain.ActionSendProposed || llmDec.Action == domain.ActionSendProposedAction {
 		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
 		d.escalate(ctx, s, res.sig, domain.Decision{
@@ -3468,12 +3435,6 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		if isNoop {
 			// Raw "@noop" is never surfaced to humans.
 			suggested = domain.ActionNoopSuggestion
-		} else if taskReviewSend {
-			// Carry the task-send prefix so a confirm round-trips to the
-			// symbolic action (suggestionAction / frontend.SuggestedAction)
-			// while the operator still sees the real instruction, and
-			// materializeForSend can recover it for a confirm --send.
-			suggested = "send next declared task: " + suggested
 		}
 		// Surface the agent's self-reported confidence on the escalation so
 		// the operator can weigh the suggestion (-1 = not reported).
@@ -3486,33 +3447,13 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			}
 		}
 		// A retry result is itself the thing the operator asked to inspect, so
-		// preserve the model's fresh rationale even for ordinary pane consults.
-		// Task reviews append it in the richer block below.
-		if res.request.RetryAuditID != 0 && !res.request.TaskReview {
+		// preserve the model's fresh rationale.
+		if res.request.RetryAuditID != 0 {
 			if r := strings.TrimSpace(llmDec.Rationale); r != "" {
 				if why != "" {
 					why += "; "
 				}
 				why += "LLM: " + r
-			}
-		}
-		// A task review's suggestion is the LLM's EXACT recommendation (the
-		// possibly-rewritten task, or "[no reply]" when it declined). Ride the
-		// LLM's reasoning and the ORIGINAL queued task on the rationale so the
-		// detail view still shows what was proposed even when the LLM rewrote or
-		// dismissed it.
-		if res.request.TaskReview {
-			if r := strings.TrimSpace(llmDec.Rationale); r != "" {
-				if why != "" {
-					why += "; "
-				}
-				why += "LLM: " + r
-			}
-			if res.request.ProposedTask != "" {
-				if why != "" {
-					why += "; "
-				}
-				why += "proposed task: " + res.request.ProposedTask
 			}
 		}
 		// Carry the LLM's self-reported score onto the escalation's audit row
@@ -3528,11 +3469,6 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			Suggestion:    "LLM suggested: " + suggested,
 		}, tr, now)
 	}
-
-	// A task review follows the SAME confidence gate as any consult (below): a
-	// confident decline (@noop, score ≥ threshold) promotes a silent noop —
-	// nothing is sent — while a sub-threshold outcome (approve or decline) is
-	// surfaced by reject() above. No task-review special-casing here.
 
 	// Re-gate: kill switch, never-auto patterns, heuristic, rate — the LLM can never
 	// bypass safety controls.
@@ -3580,14 +3516,13 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		reject(domain.ReasonPersistenceFailed, err.Error())
 		return
 	}
-	// An unattended idle task delivery is exempt from the consecutive ceiling
-	// (see domain.CheckRate). This gate runs before the noop split below, so
-	// require BOTH a reserving task review AND a real send (!isNoop) — a promoted
-	// @noop must still hit the D3 ceiling.
+	// No consecutive-ceiling exemption here either: the exemption exists for an
+	// unattended idle task hand-out, and those go through the pre-delivery task
+	// review (tasklistreview.go), never this ordinary-consult promotion.
 	if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
-	}, res.request.ReserveTask && !isNoop); !ok {
+	}, false); !ok {
 		reject(reason, "at LLM promotion")
 		return
 	}
@@ -3654,16 +3589,14 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		}
 	}
 	// The variance guard compares the LLM's action to the signature's dominant
-	// learned action; it does not apply to a declared-task review. A review's
-	// history is symbolic ("@next_task:declared") while llmDec.Action here is
-	// the expanded task text, so the two never compare equal — the guard would
-	// reject every review. The review has its own gate: the LLM judged the live
-	// pane, and the re-gates below still apply.
-	if !res.request.TaskReview {
-		if conf := domain.Confidence(history, cfg.Learning.ConfirmationWeight); conf.TopAction != "" && conf.TopAction != llmDec.Action {
-			reject(domain.ReasonVarianceGuard, "LLM contradicts history")
-			return
-		}
+	// learned action. Declared-task reviews used to be exempted here — their
+	// history is symbolic ("@next_task:declared") while the action was the
+	// expanded task text, so the two never compared equal — but they no longer
+	// reach this function at all (tasklistreview.go owns them), so the
+	// exemption is gone with them.
+	if conf := domain.Confidence(history, cfg.Learning.ConfirmationWeight); conf.TopAction != "" && conf.TopAction != llmDec.Action {
+		reject(domain.ReasonVarianceGuard, "LLM contradicts history")
+		return
 	}
 
 	// Both scores land on the auto-acted audit row: the computed 0-1 agreement
@@ -3799,57 +3732,6 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		}
 	}
 
-	// Task-review send: the review took up to the LLM timeout, so besides the
-	// pane the SOURCE can have moved on (item checked off, list edited). Re-read
-	// it and refuse to inject a task whose next item changed since review —
-	// escalate for the operator instead of sending a stale task.
-	var taskReserve *domain.DeclaredTask
-	reserveText := ""
-	if res.request.TaskReview && res.request.SourcePath != "" {
-		data, rerr := d.opt.ReadTaskFile(res.request.SourcePath)
-		if rerr != nil {
-			reject(domain.ReasonHerdrUnreachable, "task source unreadable before send: "+rerr.Error())
-			return
-		}
-		pendingTasks := domain.PendingDeclaredTasks(string(data))
-		// The idle poll can pair an agent with a task that is NOT the list's
-		// first pending item (a sibling agent took that one), so a claimed task
-		// only has to be still pending; every other review keeps the strict
-		// "still the next task" check.
-		//
-		// `claimed` cannot fire while the two config keys are mutually
-		// exclusive: a claim exists only for an auto-send source, and an
-		// auto-send source is never LLM-reviewed. Kept for the same reason as
-		// ReserveTask below.
-		claim, claimed := d.autoTaskClaimFor(s.AgentID)
-		claimed = claimed && claim.sourcePath == canonicalTaskPath(res.request.SourcePath) &&
-			claim.taskText == res.request.ReviewedTask
-		fresh := domain.NextDeclaredTask(string(data)) == res.request.ReviewedTask
-		if claimed {
-			fresh = slices.Contains(pendingTasks, res.request.ReviewedTask)
-		}
-		if !fresh {
-			reject(domain.ReasonLLMNoSubmit, "task list changed during review")
-			return
-		}
-		// A reserving source must consume a checklist item on EVERY send, or
-		// the same line is handed out again. The flag is the one pinned on the
-		// request at consult time — re-reading the config here would let a
-		// reload mid-review silently downgrade this to an unreserved send.
-		//
-		// Unreachable while enable_llm_review and enable_auto_send_task_when_idle
-		// are mutually exclusive; kept so a reserving review reserves correctly
-		// if that policy ever changes.
-		if res.request.ReserveTask {
-			// The review may have swapped to a different pending item, so
-			// reserve the item the outbound text actually consumes, not the one
-			// that was proposed. An edit/adaptation of the reviewed task still
-			// resolves to the reviewed task.
-			reserveText = reservedByAction(llmDec.Action, res.request.ReviewedTask, pendingTasks)
-			taskReserve = &domain.DeclaredTask{Path: res.request.SourcePath, Reserve: true}
-		}
-	}
-
 	// Same numbered-menu mapping as the learned act path: deliver the digit
 	// for approval/choice, the literal reply otherwise. Multi-tab forms take
 	// the validated digit series, one keystroke per tab — off the main loop
@@ -3912,64 +3794,28 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 					"An LLM-derived action was blocked because its audit record could not be written.")
 				return
 			}
-			// Same recycled-pane guard as the rule path — and it matters more
-			// here, because an LLM review can add seconds of drift between the
-			// capture and this send.
-			if taskReserve != nil {
-				if recycled, why := d.paneRecycled(ctx, s); recycled {
-					slog.Warn("pane was recycled during the task review; not sending",
-						"agent", s.AgentID, "reason", why)
-					d.dropAutoTaskClaim(s.AgentID)
-					d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
-					d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
-						fmt.Sprintf("Agent %s: %s; the task was not sent.", s.AgentID, why))
-					return
-				}
-			}
-			// Same claim-before-send rule as the rule path: an auto-send source's
-			// item is marked "[-]" before the text reaches the pane.
-			rollback, reservedIndex, rerr := d.reserveDeclaredTask(taskReserve, reserveText)
-			if rerr != nil {
-				d.dropAutoTaskClaim(s.AgentID)
-				slog.Warn("reviewed task could not be reserved; not sending", "agent", s.AgentID, "error", rerr)
-				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
-				d.notify(ctx, "Herd Auto Prompter: action delivery skipped",
-					fmt.Sprintf("Agent %s: the reviewed task was claimed or edited before it could be sent (%v); please review the list.", s.AgentID, rerr))
-				return
-			}
 			if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType,
 				domain.DeliverKeystroke(s.Type, s.AgentType, pane, llmDec.Action)); err != nil {
-				rollback()
-				// The task is pending again; release the pairing with it so no
-				// other agent is denied the item until the claim's TTL (the
-				// rule path does this centrally in deliverAutonomous).
+				// Release any pairing this agent holds so no other agent is
+				// denied the item until the claim's TTL (the rule path does
+				// this centrally in deliverAutonomous).
 				d.dropAutoTaskClaim(s.AgentID)
 				d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 				d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
 				return
 			}
-			// Same as the rule path: the send landing in herdr is not proof the
-			// agent took the task, so record the hand-out for the idle sweep to
-			// confirm or reclaim (see reclaimStrandedTasks).
-			if reservedIndex > 0 {
-				if _, rerr := d.opt.Store.RecordTaskReservation(ctx, domain.TaskReservation{
-					SourcePath: canonicalTaskPath(taskReserve.Path), TaskText: reserveText,
-					ItemIndex: reservedIndex,
-					AgentID:   s.AgentID, PaneID: s.PaneID, TerminalID: s.TerminalID,
-					AuditID: auditID, ReservedAt: now,
-				}); rerr != nil {
-					slog.Error("auto-send: reviewed hand-out could not be recorded; this task will not self-heal if it is never started",
-						"agent", s.AgentID, "task", reserveText, "error", rerr)
-				}
-			}
 			d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "accepted")
 			d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
 				Signature: res.sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-				ChosenAction: d.llmLearnedAction(llmDec, taskReviewSend),
+				ChosenAction: d.llmLearnedAction(llmDec),
 				Source:       domain.SourceLLM, CreatedAt: now,
 			})
 			d.ensureSignatureRow(ctx, res.sig.Signature, s.Type, s.AgentType, now)
-			d.advanceAutoPromptRate(ctx, s.AgentID, isIdleTaskHandout(s, taskReserve), now)
+			// No checklist item is ever consumed here: a declared-task send goes
+			// through the pre-delivery review (tasklistreview.go), which reserves
+			// inside its own critical section. An ordinary consult answers the
+			// pane, so it is never an unattended task hand-out.
+			d.advanceAutoPromptRate(ctx, s.AgentID, false, now)
 			d.mu.Lock()
 			d.lastAutoSend[s.AgentID] = now
 			d.mu.Unlock()
@@ -4370,7 +4216,7 @@ func (d *Daemon) expireStaleLLMWork(ctx context.Context) {
 
 func (d *Daemon) registerHumanInteraction(ctx context.Context, agentID string) {
 	// The human owns the pane now: a pending reviewed send is moot.
-	d.cancelActionReviewExcept(ctx, agentID, "")
+	d.cancelPreDeliveryReviewExcept(ctx, agentID, "")
 	rate, err := d.opt.Store.GetAgentRate(ctx, agentID)
 	if err != nil {
 		return
@@ -4545,14 +4391,17 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 		// escalates the hand-out instead of auto-sending it, which is the safe
 		// direction (more review, never less).
 		Content: domain.FoldTaskContent(string(m.data), task),
-		// The source's pre-send LLM review is opt-in (enable_llm_review=true,
-		// off by default) and is never on for an auto-send source —
-		// LLMReviewEnabled owns both halves of that rule.
-		LLMReview: m.src.LLMReviewEnabled(),
+		// The source's pre-delivery LLM review is opt-in
+		// (enable_llm_review_before_auto_send=true, off by default).
+		LLMReview: m.src.ReviewBeforeAutoSendEnabled(),
+		// Resolved through MaxTasksLimit so a config built in memory (a test
+		// harness, the generated-task bootstrap's append) gets the same cap a
+		// saved one carries — the review must not outgrow what a manual add can.
+		MaxTasks: m.src.MaxTasksLimit(),
 		// An auto-send source hands tasks out unattended, so the delivered
 		// item must be marked "[-]" as it goes — otherwise the next idle agent
-		// is handed the very same "[ ]" line. Reserve and LLMReview above are
-		// mutually exclusive by construction.
+		// is handed the very same "[ ]" line. Composes with LLMReview above:
+		// the review runs at delivery and reserves the task it actually chose.
 		Reserve: m.src.EnableAutoSendTaskWhenIdle,
 	}
 }

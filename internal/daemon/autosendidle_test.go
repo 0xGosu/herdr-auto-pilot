@@ -693,29 +693,6 @@ func TestNoteIdleAgentsResetsAndExpires(t *testing.T) {
 	}
 }
 
-func TestReservedByActionPicksTheItemActuallySent(t *testing.T) {
-	// A task review may approve the proposed task, lightly edit it, or swap to
-	// a different pending item. Whatever reaches the pane is what must be
-	// marked [-] — reserving the proposed one when the review swapped would
-	// strand the wrong line and leave the delivered one free for another agent.
-	pending := []string{"write the docs", "write the docs for the API", "fix the flaky test"}
-	cases := []struct {
-		name, action, reviewed, want string
-	}{
-		{"approved verbatim", "Your next task is write the docs.", "write the docs", "write the docs"},
-		{"edited wording", "Please go and write documentation now.", "write the docs", "write the docs"},
-		{"swapped to another pending item", "Your next task is fix the flaky test.", "write the docs", "fix the flaky test"},
-		{"prefers the longest match", "Your next task is write the docs for the API.", "fix the flaky test", "write the docs for the API"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := reservedByAction(tc.action, tc.reviewed, pending); got != tc.want {
-				t.Errorf("reservedByAction = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
 func TestAutoSendSourceReservesEventDrivenSendsToo(t *testing.T) {
 	// Reserving is a property of the SOURCE, not of the poll: an ordinary
 	// herdr-event idle send from an auto-send source marks the item [-] as
@@ -919,37 +896,44 @@ func TestAutoSendIdlePaneIdentityGuardFailsOpen(t *testing.T) {
 	}
 }
 
-func TestAutoSendIdleNeverLLMReviewsItsHandouts(t *testing.T) {
-	// enable_auto_send_task_when_idle and enable_llm_review are mutually
-	// exclusive, and auto-send wins: an unattended hand-out must never spend a
-	// pre-send review, because a declined review escalates and a pending
-	// escalation bars the agent from the idle poll entirely — silently stopping
-	// the very feature the operator opted into.
+func TestAutoSendIdleReviewsItsHandouts(t *testing.T) {
+	// The headline of issue #255, and the exact inverse of the rule #253/#254
+	// had to impose. enable_auto_send_task_when_idle and the review used to be
+	// mutually exclusive: the review ran upstream of domain.Decide and its only
+	// failure mode was an escalation, and a pending escalation bars an agent
+	// from the idle poll entirely — so a reviewed auto-send source silently
+	// switched itself off.
 	//
-	// The source below sets BOTH keys, which is exactly the config an operator
-	// upgrading from the old default-on behavior can end up with. Load coerces
-	// enable_llm_review off; the sweep must then hand the task out directly.
+	// The review is now a pre-DELIVERY filter that never escalates, so the two
+	// COMPOSE: the hand-out decides that a task goes, the review decides which
+	// task and in what shape. This proves an unattended hand-out is reviewed,
+	// its checklist edits land, and the task it chose is delivered and reserved.
 	dir := t.TempDir()
 	taskFile := filepath.Join(dir, "tasks.md")
-	if err := os.WriteFile(taskFile, []byte("- [ ] update the changelog\n"), 0o600); err != nil {
+	if err := os.WriteFile(taskFile,
+		[]byte("- [ ] 1. update the changelog\n- [ ] 2. cut the release\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n"+
-		"[[task_sources]]\nagent = \"\"\npath = %q\nenable_auto_send_task_when_idle = true\nenable_llm_review = true\n", taskFile)
+		"[[task_sources]]\nagent = \"\"\npath = %q\nenable_auto_send_task_when_idle = true\nenable_llm_review_before_auto_send = true\n", taskFile)
 	h := newHarness(t, cfg)
 	h.herdr.setPane(autoSendIdlePane)
 	h.llm.configured = true
 	// The graduated rule is what makes this a hand-out rather than a consult:
 	// FR-008 is NOT bypassed for auto-send, so an unlearned idle signature still
-	// takes the ordinary shadow-mode path. Without the review in front of it,
-	// this is the same setup every other auto-send test uses.
+	// takes the ordinary shadow-mode path.
 	h.seedAutonomous(autoSendIdlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
+	// The review judges task 1 already done from the pane and sends task 2.
+	var reviewed atomicString
 	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
-		if req.TaskReview {
-			return nil, errors.New("an auto-send source must never be task-reviewed")
+		if !req.TaskReview {
+			return nil, errors.New("an auto-send hand-out must take the task-list review")
 		}
-		return nil, errors.New("no consult expected for an auto-send hand-out")
+		reviewed.set(req.ContextJSON)
+		return stageTaskReview(ctx, h, req, []domain.TaskAction{
+			{Op: domain.TaskOpDone, Task: "1"},
+		}, "2", 90)
 	}
 
 	agents := parkIdle(h, 2*time.Minute, "agent-as19a")
@@ -961,16 +945,29 @@ func TestAutoSendIdleNeverLLMReviewsItsHandouts(t *testing.T) {
 
 	h.daemon.autoSendIdleTasks(context.Background(), agents)
 
-	// The task is handed out with no review in the way, and reserved as it goes.
 	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	if got := h.herdr.sentInputs()[0]; !strings.Contains(got, "update the changelog") {
-		t.Errorf("sent %q, want the pending task", got)
+	if got := h.herdr.sentInputs()[0]; !strings.Contains(got, "2. cut the release") {
+		t.Errorf("sent %q, want the task the review chose", got)
 	}
+	// The review's edit landed AND the chosen task is reserved — both inside the
+	// one critical section, so the [-] is on the item that was actually sent.
 	waitFor(t, 3*time.Second, func() bool {
-		return strings.Contains(readTasks(t, taskFile), "- [-] update the changelog")
+		body := readTasks(t, taskFile)
+		return strings.Contains(body, "- [x] 1. update the changelog") &&
+			strings.Contains(body, "- [-] 2. cut the release")
 	})
 	if !auditFor(t, h, "agent-as19a", "auto") {
 		t.Error("the hand-out was not recorded as an autonomous send")
+	}
+	// The review context must let the model address items by reference.
+	m := decodeContext(t, reviewed.get())
+	tasks, _ := m["tasks"].([]any)
+	if len(tasks) != 2 {
+		t.Fatalf("tasks = %v, want both checklist items", m["tasks"])
+	}
+	first, _ := tasks[0].(map[string]any)
+	if first["ref"] != "1" || first["status"] != "pending" {
+		t.Errorf("first task = %v, want ref 1 and status pending", first)
 	}
 }
 

@@ -203,6 +203,140 @@ func ReserveFirstPending(taskText string) (func(string) (string, error), *int) {
 	}, claimed
 }
 
+// ReviewOutcome reports what a pre-delivery task-list review actually did to
+// the checklist. It is filled by the mutator ApplyReview returns and is valid
+// only after that mutator ran to completion inside a successful Mutate.
+type ReviewOutcome struct {
+	// Applied records every operation in order, with before/after text, for
+	// the audit row. An operator must be able to answer "why is task 4 gone?"
+	// from this alone.
+	Applied []domain.AppliedTaskAction
+	// SentIndex / SentText address the task the review chose to deliver, in
+	// the FINAL list. Both are zero/empty for a noop.
+	SentIndex int
+	SentText  string
+	// SentFolded is that task's delivery body — its text plus the detail
+	// folded under it — captured from the very snapshot the safety gates
+	// inspected and the reservation was written against. The caller MUST
+	// render its outbound prompt from this rather than re-reading the file: a
+	// second read could fold a different block than the one that was screened,
+	// which is exactly the send-text/scan/audit divergence FR-015 forbids.
+	SentFolded string
+	// Reserved is true when the chosen task was marked "[-]" as part of this
+	// same critical section, so the caller knows to record a ledger row after
+	// the send and to skip the ordinary reserve step.
+	Reserved bool
+	// Noop is true when the review declined to send anything. It is accepted
+	// only for a genuinely exhausted source, which is checked here.
+	Noop bool
+}
+
+// ApplyReview is the single critical section a pre-delivery LLM review commits
+// through: it validates every reference, applies every action, resolves the
+// task to send, re-screens that task's delivery text through the caller's
+// safety gates, and reserves it — all inside ONE locked read-modify-write.
+//
+// Doing it in one pass is a correctness requirement, not tidiness. A
+// reservation is written by INDEX and the ledger row carries that index, so an
+// index captured before the mutations points at the wrong task afterwards. The
+// order here — mutate, then re-resolve, then reserve — is what makes the
+// recorded position address the item that was actually delivered.
+//
+// It is also strictly ALL-OR-NOTHING, and structurally so: every failure path
+// returns an error, and MutateWithin writes nothing when the mutator errors.
+// The checklist is either fully updated or byte-identical. A review the
+// operator's confidence threshold rejects, or one naming a task that no longer
+// exists, can never half-edit their file.
+//
+//   - expectIndex/expectText guard against a checklist that changed while the
+//     consult ran (an LLM CLI takes seconds): the reviewed task must still be
+//     exactly where and what it was, or the whole submission is refused rather
+//     than applied to a list it was not written against. Pass expectIndex <= 0
+//     to skip the guard.
+//   - safe re-screens the FINAL folded delivery text — never-auto patterns and
+//     the suspected-irreversible heuristic (FR-015). The reviewer is an LLM
+//     authoring both task text and the choice of task, so its output is gated
+//     exactly like any other LLM-authored outbound. It runs BEFORE the write,
+//     so a trip leaves the file untouched and the caller falls back to the
+//     original task.
+//   - reserve mirrors declared.Reserve: only an auto-sending source marks its
+//     delivered item "[-]".
+//
+// maxTasks caps the list size an add may grow to (0 = uncapped).
+func ApplyReview(expectIndex int, expectText, sendRef string, actions []domain.TaskAction,
+	maxTasks int, reserve bool, safe func(folded string) error) (func(string) (string, error), *ReviewOutcome) {
+
+	out := &ReviewOutcome{}
+	return func(content string) (string, error) {
+		// Built locally and published to *out only on the success path, so a
+		// caller reading the outcome after an error can never see a delivery
+		// that did not happen. The all-or-nothing rule covers what the caller
+		// is TOLD as much as what the file holds: a half-filled outcome would
+		// have the daemon audit — or reserve against — a task it never sent.
+		var got ReviewOutcome
+
+		// 1. The list must still be the one the review was shown.
+		if expectIndex > 0 {
+			if err := ExpectText(content, expectIndex, expectText); err != nil {
+				return "", err
+			}
+		}
+
+		// 2. Apply the whole series, or none of it.
+		res, err := domain.ApplyTaskActions(content, actions, maxTasks)
+		if err != nil {
+			return "", err
+		}
+		got.Applied = res.Applied
+
+		// 3. Resolve the chosen task against the FINAL list.
+		items := domain.ParseChecklist(res.Content)
+		chosen, err := domain.ResolveSendTask(items, sendRef, res.Handles)
+		if err != nil {
+			return "", err
+		}
+		if chosen.Noop {
+			// Declining is legal only when the source is genuinely dry. The
+			// review exists to keep an agent working, so "nothing to send"
+			// with pending work left is a malformed submission, not a policy.
+			if domain.HasPendingTask(items) {
+				return "", fmt.Errorf("send_task is %q but pending tasks remain — a review may only decline an exhausted source",
+					domain.NoopSendTask)
+			}
+			got.Noop = true
+			*out = got
+			return res.Content, nil
+		}
+		got.SentIndex, got.SentText = chosen.Index, chosen.Text
+		// Fold ONCE, from this snapshot: the same bytes are screened below,
+		// delivered by the caller, and recorded on the audit row.
+		got.SentFolded = domain.FoldTaskContentAt(res.Content, chosen.Index)
+		if got.SentFolded == "" {
+			got.SentFolded = chosen.Text
+		}
+
+		// 4. Re-gate the LLM-authored delivery text before anything is written.
+		if safe != nil {
+			if err := safe(got.SentFolded); err != nil {
+				return "", err
+			}
+		}
+
+		// 5. Claim the item, now that its position is final.
+		if !reserve {
+			*out = got
+			return res.Content, nil
+		}
+		claimed, err := domain.MarkChecklistItemInProgress(res.Content, chosen.Index)
+		if err != nil {
+			return "", err
+		}
+		got.Reserved = true
+		*out = got
+		return claimed, nil
+	}, out
+}
+
 // Reclaim returns one "[-]" item carrying taskText to "[ ]", so the next idle
 // sweep can hand it out again. It is the daemon's counterpart to
 // ReserveFirstPending, undoing a hand-out the agent never took up.
