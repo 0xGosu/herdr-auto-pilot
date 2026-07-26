@@ -729,7 +729,11 @@ Exactly two tools:
   index live in the plugin's config/state dir with normal user permissions; the
   control socket is owner-only; the operator can clear/reset learned and audit
   data (`hap clear-data`). A dedicated no-egress test (`internal/privacy`) asserts
-  NFR-007.
+  NFR-007. It allows exactly ONE outbound call, by name: the TUI's release check
+  (`internal/updatecheck/fetch.go`), which asks GitHub for the newest published
+  version at most every 6h, sends nothing about the operator or their panes, and
+  is switched off by `[tui] disable_check_for_update`. Every other file importing
+  `net/http` still fails the test.
 
 ## 14. Key Design Decisions
 
@@ -847,7 +851,7 @@ the sections they gate.
 | **NFR-005** | Auditability completeness | Represent 100% of automated decisions and escalations in the audit log (1:1 action-to-record ratio); no autonomous action without a corresponding record. |
 | **NFR-005a** | Allowlist corpus regression | Maintain and CI-regression-test the irreversible-op corpus so seed patterns match 100% of it; a corpus miss fails the build. |
 | **NFR-006** | LLM fallback timeout | Bound LLM consultation by a configurable timeout; on timeout / missing / unparseable output, fail safe and escalate. |
-| **NFR-007** | Privacy / no telemetry | Keep all data local; make no outbound calls beyond the Herdr socket and the configured local LLM CLI; emit no telemetry. |
+| **NFR-007** | Privacy / no telemetry | Keep all data local; make no outbound calls beyond the Herdr socket, the configured local LLM CLI, and the opt-out GitHub release check (`internal/updatecheck`, version numbers only); emit no telemetry. |
 | **NFR-008** | Portability | Run on Linux and macOS, avoiding design that precludes a future Windows build. |
 | **NFR-009** | Control-mutation propagation | Reflect a control mutation (esp. pause/kill) issued from TUI/CLI in daemon behavior within a small bounded delay (target ≤ 1 s). |
 

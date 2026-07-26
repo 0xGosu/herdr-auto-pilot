@@ -70,6 +70,12 @@ func TestNoCommandPrintsTwoFooters(t *testing.T) {
 		if c.Handler == nil {
 			continue
 		}
+		// `update` reinstalls the plugin over the operator's live install, so
+		// it is never swept. (runHerdrInstall also refuses under testing, so
+		// this exclusion is documentation, not the safety mechanism.)
+		if c.Name == "update" {
+			continue
+		}
 		// Bare, the "list" sub-op, and each documented example — the examples
 		// are what give the argument-taking verbs (task, task-source, rules,
 		// config, signatures) real coverage instead of an immediate usage error.

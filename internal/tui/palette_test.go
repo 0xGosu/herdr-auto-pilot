@@ -141,6 +141,7 @@ func TestPaletteNewStylesWiresPalette(t *testing.T) {
 	}{
 		{"title", sa.title, a.title},
 		{"section", sa.section, a.section},
+		{"version", sa.version, a.section}, // shares the section role
 		{"err", sa.err, a.err},
 		{"ok", sa.ok, a.ok},
 		{"paused", sa.paused, a.paused},

@@ -1,6 +1,9 @@
 // Package privacy holds the no-telemetry verification (NFR-007, SC-6): the
-// plugin makes no outbound network calls beyond the local Herdr socket and
-// the operator-configured local LLM CLI.
+// plugin sends no telemetry and makes no outbound network call beyond the
+// local Herdr socket, the operator-configured local LLM CLI, and ONE
+// exception — the opt-out release check in internal/updatecheck/fetch.go,
+// which asks GitHub for the newest published version and nothing else. That
+// file is allowlisted by name below; net/http from anywhere else still fails.
 package privacy
 
 import (
@@ -27,6 +30,14 @@ var forbiddenImports = map[string]string{
 // allowedNetURLFiles may import net/url for non-network purposes.
 var allowedNetURLFiles = map[string]bool{
 	"internal/store/store.go": true, // SQLite DSN query encoding
+}
+
+// allowedHTTPFiles may import net/http. Exactly one file qualifies: the
+// release check, which the operator can switch off with
+// [tui] disable_check_for_update. Keep this list at one entry — every
+// addition widens a promise the README makes to users.
+var allowedHTTPFiles = map[string]bool{
+	"internal/updatecheck/fetch.go": true, // opt-out GitHub release check
 }
 
 func TestNoTelemetryImports(t *testing.T) {
@@ -60,6 +71,9 @@ func TestNoTelemetryImports(t *testing.T) {
 				continue
 			}
 			if ip == "net/url" && allowedNetURLFiles[filepath.ToSlash(rel)] {
+				continue
+			}
+			if ip == "net/http" && allowedHTTPFiles[filepath.ToSlash(rel)] {
 				continue
 			}
 			if reason == "" {
@@ -107,6 +121,20 @@ func TestNetUsageIsLocalOnly(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestHTTPAllowlistStaysMinimal pins the egress exception to the single
+// release-check file. Widening it changes what the README promises users, so
+// it must be a deliberate edit here — never a quiet addition.
+func TestHTTPAllowlistStaysMinimal(t *testing.T) {
+	want := "internal/updatecheck/fetch.go"
+	if len(allowedHTTPFiles) != 1 || !allowedHTTPFiles[want] {
+		t.Fatalf("net/http allowlist must contain exactly %q, got %v", want, allowedHTTPFiles)
+	}
+	root := repoRoot(t)
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(want))); err != nil {
+		t.Errorf("allowlisted file is missing — drop the entry instead: %v", err)
 	}
 }
 

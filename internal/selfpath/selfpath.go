@@ -81,6 +81,24 @@ func PluginRoot() string {
 	return filepath.Dir(filepath.Dir(exe))
 }
 
+// Installed reports the hap binary herdr's registry currently points at,
+// IGNORING the running one. Resolve deliberately prefers the running binary,
+// which is exactly wrong right after `hap update`: that process is the OLD
+// build, and so is any stale `hap` shortcut on PATH. Callers that must name
+// the freshly installed binary (so `hap daemon --ensure` hands the daemon to
+// the new version, not the one being replaced) use this instead.
+//
+// It returns "" when nothing can be discovered — a linked working tree that
+// herdr reports without an install dir, or a herdr that cannot be reached.
+func Installed() string {
+	for _, find := range []func() string{fromHerdrRegistry, fromInstallDirs} {
+		if p := find(); executable(p) {
+			return p
+		}
+	}
+	return ""
+}
+
 // Missing reports whether path no longer names an executable file. The daemon
 // polls this against the path it started from to notice its own replacement.
 func Missing(path string) bool {

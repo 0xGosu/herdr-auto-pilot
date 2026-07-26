@@ -221,3 +221,32 @@ func TestPluginRootIsTwoLevelsAboveTheBinary(t *testing.T) {
 		t.Fatalf("PluginRoot = %q, want %q", got, root)
 	}
 }
+
+// TestInstalledIgnoresTheRunningBinary is the `hap update` contract: right
+// after an install, the running process and the operator's PATH shortcut are
+// both the OLD build, so Installed must report what herdr installed instead —
+// otherwise `hap daemon --ensure` hands the daemon back to the binary the
+// upgrade just replaced.
+func TestInstalledIgnoresTheRunningBinary(t *testing.T) {
+	dir := isolate(t)
+	plugins := filepath.Join(dir, "config", "herdr", "plugins", "github")
+	newBin := writeExe(t, filepath.Join(plugins, "herd-auto-prompter-0.5.2", "bin", "hap"))
+
+	// A PATH shortcut pointing at the previous build must not win.
+	pathBin := writeExe(t, filepath.Join(dir, "path-bin", "hap"))
+	t.Setenv("PATH", filepath.Dir(pathBin))
+
+	got := Installed()
+	if got != newBin {
+		t.Fatalf("Installed = %q, want the installed binary %q", got, newBin)
+	}
+}
+
+// TestInstalledReportsNothingWhenUndiscoverable keeps the caller's fallback
+// path honest: a linked working tree has no install dir at all.
+func TestInstalledReportsNothingWhenUndiscoverable(t *testing.T) {
+	isolate(t)
+	if got := Installed(); got != "" {
+		t.Errorf("Installed = %q, want empty when nothing is installed", got)
+	}
+}

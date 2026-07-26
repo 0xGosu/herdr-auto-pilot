@@ -25,9 +25,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/updatecheck"
 )
 
 type tab int
@@ -67,8 +69,18 @@ type refreshMsg struct {
 	// flight, so "l: retry LLM" is disabled while one is running (the daemon
 	// re-checks authoritatively). Populated only for retryable escalations.
 	pendingConsult map[string]bool
-	err            error
+	// update reports a newer release from the LAST CACHED check — a local file
+	// read, never a network call (updateCheckCmd does the fetch).
+	update frontend.UpdateStatus
+	// updateDue is true when that cached result has aged out, so the tick
+	// handler knows to fire a background check.
+	updateDue bool
+	err       error
 }
+
+// updateCheckedMsg reports that a background release check finished; the
+// result itself is read back from the cache on the next refresh.
+type updateCheckedMsg struct{}
 
 // sigDetailMsg carries an asynchronously loaded signature detail.
 type sigDetailMsg struct {
@@ -546,6 +558,16 @@ type Model struct {
 	// the model's zero-valued starting state and ring for escalations or a
 	// pause that already existed before the TUI even started.
 	initialized bool
+	// updateChecking is true while a background release check is in flight, so
+	// the 2s tick fires at most one at a time.
+	updateChecking bool
+	// lastUpdateCheck is when this TUI last LAUNCHED a check. The persisted
+	// cache is the normal backoff, but it is written by the check itself: a
+	// state dir that cannot be written (read-only, full) would leave the cache
+	// permanently "due" and turn the 2s tick into a fetch loop. This in-memory
+	// floor is independent of the file, and also covers the gap between a
+	// finished check and the refresh that reports the new cache state.
+	lastUpdateCheck time.Time
 	// lastMaxEscalationID / lastPaused are the bell-diffing baseline from
 	// the last successful refresh. Deliberately not derived from m.data,
 	// since the refreshMsg handler overwrites m.data unconditionally even
@@ -1003,7 +1025,32 @@ func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 		return msg
 	}
 	msg.tasks = frontend.TaskGroups(msg.cfg)
+	// Both of these read the cached check file only — the fetch itself runs in
+	// updateCheckCmd, off this path, because refreshData runs on every tick.
+	msg.update = app.UpdateStatus(msg.cfg)
+	msg.updateDue = app.UpdateCheckDue(msg.cfg)
 	return msg
+}
+
+// updateCheckAllowed gates the background release check on all three bounds:
+// the cached result has aged out, no check is already in flight, and this TUI
+// has not launched one within the TTL regardless of what the cache says.
+func (m Model) updateCheckAllowed(now time.Time) bool {
+	if !m.data.updateDue || m.updateChecking {
+		return false
+	}
+	return m.lastUpdateCheck.IsZero() || now.Sub(m.lastUpdateCheck) >= updatecheck.TTL
+}
+
+// updateCheckCmd runs the release check in the background. Its error is
+// deliberately dropped: a failed check is recorded in the cache (which backs
+// the retry off) and must never surface as a TUI error line.
+func (m Model) updateCheckCmd() tea.Cmd {
+	app, ctx := m.app, m.ctx
+	return func() tea.Msg {
+		_, _ = app.CheckForUpdate(ctx)
+		return updateCheckedMsg{}
+	}
 }
 
 // buildRuleItems lays out the Config tab rows from the current config.
@@ -1141,6 +1188,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastPaused = msg.status.Paused
 			m.initialized = true
 		}
+		// A failed refresh returns before the update fields are filled, so
+		// carry the last known ones forward — the hint must not blink out of
+		// the header for every frame a store read happens to fail.
+		if msg.err != nil {
+			msg.update, msg.updateDue = m.data.update, m.data.updateDue
+		}
 		m.data = msg
 		m.items = buildRuleItems(msg.cfg)
 		// A failed refresh carries a zero config; keep the current palette
@@ -1218,7 +1271,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case openTaskSourceFieldMsg:
 		return m.openTaskSourceFieldPrompt(msg)
 	case tickMsg:
-		return m, tea.Batch(m.refresh(), tick())
+		cmds := []tea.Cmd{m.refresh(), tick()}
+		if m.updateCheckAllowed(time.Now()) {
+			m.updateChecking = true
+			m.lastUpdateCheck = time.Now()
+			cmds = append(cmds, m.updateCheckCmd())
+		}
+		return m, tea.Batch(cmds...)
+	case updateCheckedMsg:
+		m.updateChecking = false
+		// Pick the result up through the normal refresh path (it reads the
+		// cache the check just wrote).
+		return m, m.refresh()
 	case clockTickMsg:
 		// Repaint only: advance the Age clock, never re-query the store.
 		m.now = time.Time(msg)
@@ -3335,6 +3399,19 @@ func (m Model) wrapWidth() int {
 // the legacy fixed caps so even a pre-resize frame shows more than before.
 const fallbackContentWidth = 120
 
+// headerName is the product name the header line leads with.
+const headerName = "Herd Auto Prompter"
+
+// headerWidth is the pane width the header line must fit in. It deliberately
+// ignores MaxContentWidth (which narrows list rows, not the header) and only
+// falls back when the pane size has not arrived yet.
+func (m Model) headerWidth() int {
+	if m.width > 0 {
+		return m.width
+	}
+	return fallbackContentWidth
+}
+
 // contentWidth is the usable width for list rows: the full terminal width by
 // default, optionally capped by [tui] max_content_width, floored so a narrow
 // terminal stays readable.
@@ -4469,11 +4546,33 @@ func (m Model) View() string {
 	st := m.styles()
 	var b strings.Builder
 
-	state := st.running.Render("● running")
+	stateText, stateStyle := "● running", st.running
 	if m.data.status.Paused {
-		state = st.paused.Render("■ PAUSED (kill switch)")
+		stateText, stateStyle = "■ PAUSED (kill switch)", st.paused
 	}
-	fmt.Fprintf(&b, "%s  %s\n", st.title.Render("Herd Auto Prompter"), state)
+	state := stateStyle.Render(stateText)
+	// Unlike list rows the header is emitted unclamped, so a header too wide
+	// for the pane would wrap and push the body one row past the bottom,
+	// breaking the fixed header accounting in listPageSize/detailPageSize.
+	// Segments are therefore dropped, never wrapped, when the pane is too
+	// narrow: the update hint is dropped first (it is the least essential),
+	// the version second.
+	head := st.title.Render(headerName)
+	plain := headerName
+	fits := func(extra string) bool {
+		return runewidth.StringWidth(plain+extra+"  "+stateText) <= m.headerWidth()
+	}
+	if v := buildinfo.Label(); v != "" && fits(" "+v) {
+		head += " " + st.version.Render(v)
+		plain += " " + v
+	}
+	// The update hint uses warn (bold) rather than the version's color: it is
+	// an action the operator should notice, not a static fact.
+	if hint := m.data.update.Hint(); hint != "" && fits(" "+hint) {
+		head += " " + st.warn.Render(hint)
+		plain += " " + hint
+	}
+	fmt.Fprintf(&b, "%s  %s\n", head, state)
 
 	var tabs []string
 	for i, name := range tabNames {
