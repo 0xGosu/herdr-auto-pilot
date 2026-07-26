@@ -112,8 +112,12 @@ type DeclaredTask struct {
 	Template  string // operator template; "" uses DefaultNextTaskTemplate
 	AgentName string // agent short name, for {agent_name}
 	Cwd       string // agent working directory, for {cwd}
-	// LLMReview reports whether the source opted in to the pre-send LLM review
-	// gate (default: on; a source sets enable_llm_review=false to opt out). The
+	// LLMReview reports whether the source opted IN to the pre-send LLM review
+	// gate (enable_llm_review=true; off by default). Never true together with
+	// Reserve — an auto-send source hands tasks out unattended and is not
+	// reviewed, because a declined review escalates and a pending escalation
+	// stops the idle poll. config.TaskSource.LLMReviewEnabled resolves both
+	// halves, and the config layer rejects the combination at every write. The
 	// runtime "is an LLM command configured" check stays at the daemon call
 	// site — this flag carries only the source's declared preference.
 	LLMReview bool
@@ -123,6 +127,7 @@ type DeclaredTask struct {
 	// out unattended, so an unreserved item would be handed to the next idle
 	// agent too. Sources without the flag keep the historical behavior — the
 	// daemon leaves the item "[ ]" and the agent marks it via `hap task start`.
+	// Mutually exclusive with LLMReview (see above).
 	Reserve bool
 }
 

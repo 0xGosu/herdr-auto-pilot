@@ -2265,10 +2265,203 @@ func TestTaskSourceSet(t *testing.T) {
 		{"set", "1", "auto-send-when-idle", "maybe"},
 		{"set", "9", "max-tasks", "5"},
 		{"set", "1", "max-tasks"},
+		{"set", "1", "enable-llm-review", "maybe"},
+		// The renamed key is refused rather than aliased: config.Load migrates
+		// `llm_review` away, so accepting it here would teach a retired spelling.
+		{"set", "1", "llm_review", "true"},
+		{"set", "1", "llm-review", "true"},
 	} {
 		if _, err := run(t, app, "task-source", bad...); err == nil {
 			t.Errorf("task-source %v must be refused", bad)
 		}
+	}
+}
+
+// TestTaskSourceSetLLMReview pins the CLI twin of the TUI's review toggle,
+// including the dual key spelling (dashed CLI form and the raw TOML key) and the
+// pasted "#index" form.
+func TestTaskSourceSetLLMReview(t *testing.T) {
+	app, _ := testApp(t)
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{
+		{Agent: "quiet-fox", Path: "/tmp/quiet.md"},
+		{Agent: "busy-otter", Path: "/tmp/busy.md"},
+	}
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "task-source", "set", "1", "enable-llm-review", "true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "enable_llm_review=true") || !strings.Contains(out, "escalated to you") {
+		t.Errorf("turning the review ON must say what it does, got:\n%s", out)
+	}
+	saved, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved.TaskSources[1].LLMReviewEnabled() {
+		t.Errorf("enable_llm_review did not reach config.toml: %+v", saved.TaskSources[1])
+	}
+	if saved.TaskSources[0].LLMReviewRequested() {
+		t.Errorf("source #0 must be untouched, got %+v", saved.TaskSources[0])
+	}
+
+	// The raw TOML key and the pasted "#index" form address the same entry, and
+	// "off" persists as an explicit false rather than an absent key.
+	if _, err = run(t, app, "task-source", "set", "#1", "enable_llm_review", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if saved, err = config.Load(app.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := saved.TaskSources[1].EnableLLMReview; got == nil || *got {
+		t.Errorf("enable_llm_review must persist as an explicit false, got %v", got)
+	}
+}
+
+// TestTaskSourceListShowsLLMReview: unlike auto_send_when_idle (printed only
+// when true), the review state is ALWAYS printed — false is the state that
+// changes behavior silently, and it is what an upgraded config becomes.
+func TestTaskSourceListShowsLLMReview(t *testing.T) {
+	app, _ := testApp(t)
+	on := true
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{
+		{Agent: "quiet-fox", Path: "/tmp/quiet.md"},
+		{Agent: "busy-otter", Path: "/tmp/busy.md", EnableLLMReview: &on},
+	}
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, app, "task-source", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "enable_llm_review=false") {
+		t.Errorf("a source that never named the key must render as false, got:\n%s", out)
+	}
+	if !strings.Contains(out, "enable_llm_review=true") {
+		t.Errorf("an opted-in source must render as true, got:\n%s", out)
+	}
+	// The field is a *bool: a %v on the pointer would print an address.
+	if strings.Contains(out, "0x") {
+		t.Errorf("listing leaked a pointer address:\n%s", out)
+	}
+}
+
+// TestTaskSourceAddLLMReview pins the add flag, in the positions Go's flag
+// package accepts — and the ordering guard for the position it does not.
+func TestTaskSourceAddLLMReview(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    []string // "PATH" is replaced by the checklist path
+		want    bool
+		wantErr bool
+	}{
+		{name: "no flag", args: []string{"PATH"}},
+		{name: "flag before path", args: []string{"--enable-llm-review", "PATH"}, want: true},
+		{name: "flag with agent", args: []string{"--agent", "otter", "--enable-llm-review", "PATH"}, want: true},
+		{name: "flag after path is refused", args: []string{"PATH", "--enable-llm-review"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, _ := testApp(t)
+			path := filepath.Join(t.TempDir(), "tasks.md")
+			if err := os.WriteFile(path, []byte("- [ ] a\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			args := append([]string{"task-source"}, tc.args...)
+			for i, a := range args {
+				if a == "PATH" {
+					args[i] = path
+				}
+			}
+			out, err := run(t, app, args[0], args[1:]...)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected a refusal, got:\n%s", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved, err := config.Load(app.ConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(saved.TaskSources) != 1 {
+				t.Fatalf("want 1 task source, got %d", len(saved.TaskSources))
+			}
+			if got := saved.TaskSources[0].LLMReviewEnabled(); got != tc.want {
+				t.Errorf("enable_llm_review = %v, want %v", got, tc.want)
+			}
+			if said := strings.Contains(out, "LLM review before sending is ON"); said != tc.want {
+				t.Errorf("success output announced the review = %v, want %v; got:\n%s", said, tc.want, out)
+			}
+		})
+	}
+}
+
+// TestTaskSourceReviewExclusionRefused pins the mutual exclusion at the CLI, in
+// both directions and on both add and set. Nothing is auto-cleared: the operator
+// is told to turn the other flag off first.
+func TestTaskSourceReviewExclusionRefused(t *testing.T) {
+	namesBothKeys := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("the exclusive pair must be refused")
+		}
+		for _, key := range []string{"enable_llm_review", "enable_auto_send_task_when_idle"} {
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error must name %q, got %v", key, err)
+			}
+		}
+	}
+
+	// add, with both flags at once.
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := run(t, app, "task-source", "--auto-send-when-idle", "--enable-llm-review", path)
+	namesBothKeys(t, err)
+	saved, err := config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.TaskSources) != 0 {
+		t.Fatalf("a refused add must create nothing, got %+v", saved.TaskSources)
+	}
+
+	// set, from each standing state.
+	on := true
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{
+		{Agent: "reviewer", Path: "/tmp/reviewed.md", EnableLLMReview: &on},
+		{Agent: "handout", Path: "/tmp/handout.md", EnableAutoSendTaskWhenIdle: true},
+	}
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, err = run(t, app, "task-source", "set", "0", "auto-send-when-idle", "true")
+	namesBothKeys(t, err)
+	_, err = run(t, app, "task-source", "set", "1", "enable-llm-review", "true")
+	namesBothKeys(t, err)
+
+	// The way out always works, and an unrelated edit is never blocked by the
+	// pair — otherwise a conflicting config would be unrepairable from here.
+	if _, err = run(t, app, "task-source", "set", "1", "max-tasks", "7"); err != nil {
+		t.Errorf("an unrelated edit must not be gated on the exclusive pair: %v", err)
+	}
+	if _, err = run(t, app, "task-source", "set", "0", "enable-llm-review", "false"); err != nil {
+		t.Fatalf("turning the standing flag off must always succeed: %v", err)
+	}
+	if _, err = run(t, app, "task-source", "set", "0", "auto-send-when-idle", "true"); err != nil {
+		t.Fatalf("auto-send must be settable once the review is off: %v", err)
 	}
 }
 

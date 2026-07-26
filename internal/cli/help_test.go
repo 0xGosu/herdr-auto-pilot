@@ -210,3 +210,23 @@ func TestUnknownCommandPointsAtHelp(t *testing.T) {
 		t.Errorf("error does not suggest the near-miss command: %v", err)
 	}
 }
+
+// TestTaskSourceHelpDocumentsReviewExclusion pins the prose that TestCommandHelpPages
+// cannot: it iterates Flags and Usage only, so the Details block — where the
+// mutual exclusion and the new default are explained — would drift silently.
+func TestTaskSourceHelpDocumentsReviewExclusion(t *testing.T) {
+	app, _ := testApp(t)
+	out, err := run(t, app, "help", "task-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"--enable-llm-review",
+		"mutually exclusive",
+		"defaults to OFF",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("`hap help task-source` must mention %q, got:\n%s", want, out)
+		}
+	}
+}
