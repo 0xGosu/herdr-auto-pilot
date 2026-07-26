@@ -866,8 +866,10 @@ action. The sentinel is rejected if an LLM submits it outside a task review
 that actually carries a proposed task.
 
 This is **off by default**; set `enable_llm_review = true` on a
-`[[task_sources]]` entry to opt that source in, either by hand, with
-`hap task-source set <index> enable-llm-review true`, or from the *Config*
+`[[task_sources]]` entry to opt that source in, either by hand, at creation
+time with `hap task-source add --enable-llm-review <checklist.md>` (or
+`--enable-llm-review` in the *Config* tab's `t` prompt), on an existing source
+with `hap task-source set <index> enable-llm-review true`, or from the *Config*
 tab's `enter` on a task-source row. `hap task-source list` and the *Config*
 tab always print the resolved value, so a source that never named the key
 still shows `enable_llm_review=false` rather than leaving you to guess.

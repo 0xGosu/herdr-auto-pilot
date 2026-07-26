@@ -2478,6 +2478,12 @@ func checkTaskSourceUnchanged(cfg config.Config, index int, expected config.Task
 // AddTaskSource's post-options check: every surface that can flip a source flag
 // inherits the same rule from one place.
 //
+// The copy is SHALLOW, so a mutate func MUST assign a new pointer
+// (src.EnableLLMReview = &on) and must never write through an existing one
+// (*src.EnableLLMReview = on). Writing through would reach the live config even
+// on a REFUSED edit, while the error still reports that nothing happened — the
+// silent write on the failure path this guard exists to prevent.
+//
 // This cannot reject an edit that has nothing to do with the conflict: Load
 // coerces a conflicting pair before UpdateConfig ever calls us, so the source
 // read off disk is always already valid and only the mutation itself can make

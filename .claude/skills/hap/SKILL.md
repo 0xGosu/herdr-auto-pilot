@@ -549,23 +549,27 @@ hap task-source add --agent backend-dev --auto-send-when-idle ./docs/tasks.md
 ```
 
 the TUI's *Config* tab `t` prompt takes the same words:
-`<path> [agent] [workspace] [--auto-send-when-idle] [--max-tasks N]`. it is
-opt-in everywhere and never inferred. an EXISTING source is switched on without editing
+`<path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review] [--max-tasks N]`.
+it is opt-in everywhere and never inferred. an EXISTING source is switched on without editing
 config.toml:
 
 ```bash
 hap task-source set <index> auto-send-when-idle true   # or false
+hap task-source set <index> enable-llm-review true     # mutually exclusive with the above
 hap task-source set <index> max-tasks 40               # the refill/creation cap
 ```
 
 the *Config* tab's `enter` on a task-source row is the same edit: it opens a
-picker of the two settings, then asks for the value. both are also settable at
-creation time — `hap task-source add [--auto-send-when-idle] [--max-tasks N]`,
+picker of the three settings, then asks for the value (the picker marks a row
+`blocked while <other>=true` when the mutually exclusive partner is on). all are
+also settable at creation time —
+`hap task-source add [--auto-send-when-idle] [--enable-llm-review] [--max-tasks N]`,
 and the *Config* tab's `t` prompt takes the same words:
-`<path> [agent] [workspace] [--auto-send-when-idle] [--max-tasks N]` (either
-`--max-tasks 40` or `--max-tasks=40`). wherever sources are listed
+`<path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review] [--max-tasks N]`
+(either `--max-tasks 40` or `--max-tasks=40`). wherever sources are listed
 (`hap task-source list`, the *Config* tab) an enabled source shows
-`auto_send_when_idle=true`, and every source shows its `max_tasks`.
+`auto_send_when_idle=true`, and every source shows its `enable_llm_review` and
+`max_tasks`.
 
 - one task, one agent: agents matched by the same source get *different*
   pending items, and the delivered item is marked `[-]` as it is sent (a failed

@@ -939,6 +939,11 @@ func TestAutoSendIdleNeverLLMReviewsItsHandouts(t *testing.T) {
 	h := newHarness(t, cfg)
 	h.herdr.setPane(autoSendIdlePane)
 	h.llm.configured = true
+	// The graduated rule is what makes this a hand-out rather than a consult:
+	// FR-008 is NOT bypassed for auto-send, so an unlearned idle signature still
+	// takes the ordinary shadow-mode path. Without the review in front of it,
+	// this is the same setup every other auto-send test uses.
+	h.seedAutonomous(autoSendIdlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
 
 	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
 		if req.TaskReview {

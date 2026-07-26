@@ -889,28 +889,48 @@ func TestConsultContextNoInProgressOmitsFirstInProgressField(t *testing.T) {
 }
 
 // TestDeclaredTaskLLMReviewOffForAutoSendSourceBuiltInMemory pins the
-// defense-in-depth half of config.TaskSource.LLMReviewEnabled. Load coerces a
-// conflicting pair, so the through-Load path can never carry both — but a
-// Config built in memory (a test harness, the generated-task bootstrap's
-// append) reaches neither Load nor a write surface, and must still resolve an
-// auto-send source to "no review".
+// defense-in-depth half of config.TaskSource.LLMReviewEnabled AT THE DAEMON CALL
+// SITE. config.Load coerces a conflicting pair, so the through-Load path can
+// never carry both — but a Config built in memory (a test harness, the
+// generated-task bootstrap's append) reaches neither Load nor a write surface.
+// Asserted through declaredTask rather than on the config type alone, so
+// reverting daemon.go's LLMReviewEnabled() call to the raw pointer read fails
+// here instead of passing.
 func TestDeclaredTaskLLMReviewOffForAutoSendSourceBuiltInMemory(t *testing.T) {
 	taskFile := writeReviewTaskFile(t, "- [ ] write the docs\n")
+	h := newHarness(t, "")
+	ctx := context.Background()
+	name, err := h.raw.EnsureAgentName(ctx, "agent-mem")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Built in memory, never through config.Load: both flags are still set.
 	on := true
-	src := config.TaskSource{
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{{
 		Agent: "agent-mem", Path: taskFile,
 		EnableLLMReview:            &on,
 		EnableAutoSendTaskWhenIdle: true,
+	}}
+
+	declared := h.daemon.declaredTask(ctx, cfg,
+		domain.AgentTransition{AgentID: "agent-mem", PaneID: "agent-mem", AgentType: "claude"}, name)
+	if declared == nil {
+		t.Fatal("the source should match this agent")
 	}
-	if src.LLMReviewEnabled() {
-		t.Fatal("an auto-send source must never resolve to review-on, even unloaded")
+	if declared.LLMReview {
+		t.Error("an auto-send source must never resolve to review-on, even unloaded")
 	}
-	// And the raw key is still readable, so a write surface can detect the
+	if !declared.Reserve {
+		t.Error("auto-send wins the conflict, so the hand-out must still reserve")
+	}
+	// And the raw key stays readable, so a write surface can still detect the
 	// conflict that the resolver folds away.
-	if !src.LLMReviewRequested() {
+	if !cfg.TaskSources[0].LLMReviewRequested() {
 		t.Error("LLMReviewRequested must report the raw key so validation can see it")
 	}
-	if err := config.ValidateTaskSource(src); err == nil {
+	if err := config.ValidateTaskSource(cfg.TaskSources[0]); err == nil {
 		t.Error("ValidateTaskSource must reject the pair a write path would persist")
 	}
 }
