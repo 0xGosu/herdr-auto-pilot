@@ -1043,12 +1043,10 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		// Always shown, unlike auto_send_when_idle above. That convention (print
 		// only when true) works because the omitted state is the SAFE one; here
 		// the omitted state is the permissive one — a source with review off
-		// sends its determined tasks with no judgement step — so hiding it would
-		// hide the risk, not the noise. It also makes the mutual exclusion with
-		// auto_send_when_idle legible on the row, before enter opens the picker.
-		// Resolved through LLMReviewEnabled: the field is a *bool, and %v on it
-		// prints a pointer address.
-		label += fmt.Sprintf("  enable_llm_review=%v", src.LLMReviewEnabled())
+		// sends its tasks with no judgement step — so hiding it would hide the
+		// risk, not the noise. Resolved through the accessor: the field is a
+		// *bool, and %v on it prints a pointer address.
+		label += fmt.Sprintf("  enable_llm_review_before_auto_send=%v", src.ReviewBeforeAutoSendEnabled())
 		// Always shown, resolved through MaxTasksLimit so the row names the cap
 		// the daemon actually enforces — and so the operator can see what enter
 		// is about to edit.
@@ -3960,7 +3958,7 @@ const (
 	// The exact TOML key, unlike tsFieldAutoSend's shortened form: the label an
 	// operator reads here should be greppable in config.toml. The shortening in
 	// the sibling constant is legacy, not a convention to propagate.
-	tsFieldLLMReview = "enable_llm_review"
+	tsFieldLLMReview = "enable_llm_review_before_auto_send"
 	tsFieldMaxTasks  = "max_tasks"
 )
 
@@ -3976,25 +3974,14 @@ func (m Model) editTaskSourcePrompt(index int, path string) (tea.Model, tea.Cmd)
 		m.message = "task source is no longer listed — refresh and retry"
 		return m, nil
 	}
-	// The two delivery-gate flags are mutually exclusive and nothing here
-	// auto-clears the other one, so the row that is currently blocked says so:
-	// the constraint is discoverable BEFORE the operator walks both prompt steps
-	// only to earn a rejection. At most one of the pair is ever blocked, because
-	// the blocked one is by definition the one that is off.
-	llmNote, autoNote := "", ""
-	if src.EnableAutoSendTaskWhenIdle {
-		llmNote = fmt.Sprintf("; blocked while %s=true", tsFieldAutoSend)
-	}
-	if src.LLMReviewEnabled() {
-		autoNote = fmt.Sprintf("; blocked while %s=true", tsFieldLLMReview)
-	}
 	// Each option carries the field key it selects, so adding a fourth setting
-	// can never fall through to editing max_tasks by default. enable_llm_review
-	// renders through LLMReviewEnabled: the field is a *bool, and %v on it
-	// prints a pointer address.
+	// can never fall through to editing max_tasks by default. The review flag
+	// renders through its accessor: the field is a *bool, and %v on it prints a
+	// pointer address. The two delivery-gate flags COMPOSE — neither blocks the
+	// other — so neither row carries a constraint note.
 	fields := []struct{ key, label string }{
-		{tsFieldAutoSend, fmt.Sprintf("%s (currently %v%s)", tsFieldAutoSend, src.EnableAutoSendTaskWhenIdle, autoNote)},
-		{tsFieldLLMReview, fmt.Sprintf("%s (currently %v%s)", tsFieldLLMReview, src.LLMReviewEnabled(), llmNote)},
+		{tsFieldAutoSend, fmt.Sprintf("%s (currently %v)", tsFieldAutoSend, src.EnableAutoSendTaskWhenIdle)},
+		{tsFieldLLMReview, fmt.Sprintf("%s (currently %v)", tsFieldLLMReview, src.ReviewBeforeAutoSendEnabled())},
 		{tsFieldMaxTasks, fmt.Sprintf("%s (currently %d)", tsFieldMaxTasks, src.MaxTasksLimit())},
 	}
 	opts := make([]string, len(fields))
@@ -4059,9 +4046,9 @@ func (m Model) openTaskSourceFieldPrompt(msg openTaskSourceFieldMsg) (tea.Model,
 			func(on bool) error { return app.SetTaskSourceAutoSend(ctx, index, expected, on) },
 			"auto-send when idle ON", "auto-send when idle off")
 	case tsFieldLLMReview:
-		return m.taskSourceBoolPrompt(index, tsFieldLLMReview, current.LLMReviewEnabled(),
-			func(on bool) error { return app.SetTaskSourceLLMReview(ctx, index, expected, on) },
-			"LLM review before sending ON", "LLM review before sending off")
+		return m.taskSourceBoolPrompt(index, tsFieldLLMReview, current.ReviewBeforeAutoSendEnabled(),
+			func(on bool) error { return app.SetTaskSourceReviewBeforeAutoSend(ctx, index, expected, on) },
+			"LLM review before auto-send ON", "LLM review before auto-send off")
 	case tsFieldMaxTasks:
 		m.openPrompt(&prompt{
 			label: fmt.Sprintf("task source #%d %s (whole number, 1 or more)", index, tsFieldMaxTasks),
@@ -4092,9 +4079,8 @@ func (m Model) openTaskSourceFieldPrompt(msg openTaskSourceFieldMsg) (tea.Model,
 // flags. A picker, not free text: these settings decide whether hap hands work
 // out unprompted and whether it reviews first, so "true" is chosen from a list
 // rather than typed (and mistyped) into a yes/no box. write returns the
-// frontend's error verbatim, which is how the enable_llm_review /
-// enable_auto_send_task_when_idle exclusion reaches the operator in the same
-// wording every surface uses.
+// frontend's error verbatim, so any rule the config layer adds later reaches
+// the operator in the same wording every surface uses.
 func (m Model) taskSourceBoolPrompt(index int, field string, cur bool,
 	write func(bool) error, onMsg, offMsg string) (tea.Model, tea.Cmd) {
 
@@ -4155,7 +4141,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
 	m.openPrompt(&prompt{
-		label: "add task source: <path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review] [--max-tasks N]",
+		label: "add task source: <path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]",
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
 				// Flags are spelled exactly like the CLI's and accepted in any
@@ -4175,7 +4161,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 						opts = append(opts, frontend.AutoSendWhenIdle())
 						continue
 					}
-					if f == "--enable-llm-review" {
+					if f == "--enable-llm-review-before-auto-send" {
 						llmReview = true
 						continue
 					}
@@ -4197,7 +4183,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 					}
 					if strings.HasPrefix(f, "-") {
 						return actionResultMsg{err: fmt.Errorf(
-							"unknown flag %q — this prompt takes --auto-send-when-idle and --enable-llm-review (spelled exactly, no =value) and --max-tasks N (or --max-tasks=N); use the CLI for anything else", f)}
+							"unknown flag %q — this prompt takes --auto-send-when-idle and --enable-llm-review-before-auto-send (spelled exactly, no =value) and --max-tasks N (or --max-tasks=N); use the CLI for anything else", f)}
 					}
 					parts = append(parts, f)
 				}
@@ -4218,7 +4204,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 				// Passed unconditionally, like the CLI's --max-tasks: a new
 				// source records the review gate it actually runs under rather
 				// than leaving the key absent and the operator guessing.
-				opts = append(opts, frontend.LLMReview(llmReview))
+				opts = append(opts, frontend.ReviewBeforeAutoSend(llmReview))
 				if err := app.AddTaskSource(ctx, agent, workspace, parts[0], "", opts...); err != nil {
 					return actionResultMsg{err: err}
 				}
@@ -4230,7 +4216,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 					msg += " (auto-send when idle ON)"
 				}
 				if llmReview {
-					msg += " (LLM review before sending ON)"
+					msg += " (LLM review before auto-send ON)"
 				}
 				return actionResultMsg{message: msg}
 			}

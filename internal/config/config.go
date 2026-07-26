@@ -133,7 +133,7 @@ type LLM struct {
 	// EnableRewriteAction opts learned free-text sends (idle next-task
 	// prompts, error retry commands, free-text replies — never menu digits,
 	// and never a declared task from a [[task_sources]], whose
-	// enable_llm_review gate owns that) into a pre-delivery review by the
+	// enable_llm_review_before_auto_send gate owns that) into a review by the
 	// consult LLM (Command): the LLM adapts the text to the live pane,
 	// affirms it unchanged, or vetoes the send. Requires Command; the review
 	// never blocks the send — on any failure the original text is delivered
@@ -308,29 +308,36 @@ type TaskSource struct {
 	// run), {agent_name} (the agent's short name), and {cwd} (the agent's
 	// working directory). Empty uses the built-in default.
 	NextTaskTemplate string `toml:"next_task_template,omitempty"`
-	// EnableLLMReview gates the pre-send LLM review of this source's
-	// determined tasks. When an [llm].command is configured, a determined
-	// task is first reviewed by the LLM (via the get_context/submit_decision
-	// MCP tools), which decides whether to send it now given the live pane; a
-	// decline is escalated to the operator. OFF by default — set
-	// enable_llm_review=true to opt a source in.
+	// EnableLLMReviewBeforeAutoSend gates the pre-delivery LLM review of the
+	// tasks this source hands out. When an [llm].command is configured, the
+	// task the daemon is about to auto-send is first reviewed: through the
+	// get_context/submit_decision MCP tools the LLM sees the live pane and the
+	// whole checklist, and submits — in ONE round trip — an ordered series of
+	// edits to the list plus the id of the task to deliver once they are
+	// applied. OFF by default; set enable_llm_review_before_auto_send=true to
+	// opt a source in.
 	//
-	// Mutually exclusive with EnableAutoSendTaskWhenIdle: an auto-send source
-	// hands tasks out with nobody watching, so a review that escalates on a
-	// decline would park the very agent it was meant to keep working (a
-	// pending escalation bars an agent from the idle poll entirely). Load
-	// forces this key off, with a warning, when both are set; every write
-	// surface rejects the combination outright (ValidateTaskSource).
+	// The name says what the scope is: only sends the DAEMON initiates are
+	// reviewed. A task the operator sends by hand (`hap task <agent> send`, or
+	// the TUI) is never reviewed — they already decided.
 	//
-	// Kept a pointer so the `llm_review` migration can still tell "unset" from
-	// an explicit false, and so an explicit choice survives a Save round-trip.
-	EnableLLMReview *bool `toml:"enable_llm_review,omitempty"`
-	// DeprecatedLLMReview is the renamed `llm_review` key, kept only to
-	// migrate existing configs: on Load it seeds EnableLLMReview when that is
-	// unset, then it is cleared so the next Save rewrites the file under the
-	// new key. A value seeded from it is subject to the mutual-exclusion
-	// coercion below, which runs after this migration for exactly that reason.
-	DeprecatedLLMReview *bool `toml:"llm_review,omitempty"`
+	// The review never escalates. Every non-ideal outcome — a failed or
+	// unusable review, or one scoring below auto_act_confidence_threshold —
+	// delivers the original task unchanged, so it composes with
+	// EnableAutoSendTaskWhenIdle instead of excluding it.
+	//
+	// Kept a pointer so the rename migration can tell "unset" from an explicit
+	// false, and so an explicit choice survives a Save round-trip.
+	EnableLLMReviewBeforeAutoSend *bool `toml:"enable_llm_review_before_auto_send,omitempty"`
+	// DeprecatedEnableLLMReview is the renamed `enable_llm_review` key, kept
+	// only to migrate existing configs: on Load it seeds
+	// EnableLLMReviewBeforeAutoSend when that is unset, then it is cleared so
+	// the next Save rewrites the file under the new name.
+	//
+	// The original `llm_review` spelling is NOT carried: this key is on its
+	// second rename, and every Save since the first one has already rewritten
+	// it, so nothing still on disk should be spelling it that way.
+	DeprecatedEnableLLMReview *bool `toml:"enable_llm_review,omitempty"`
 	// MaxTasks caps how many checklist items (done, in-progress, and pending
 	// alike) this source may hold before LLM task generation stops refilling
 	// it: once the file has more than MaxTasks items and its pending items are
@@ -348,9 +355,9 @@ type TaskSource struct {
 	// agent gets a DIFFERENT pending item, and the item is reserved "[-]" as
 	// it is delivered, so one task never reaches two agents.
 	//
-	// Mutually exclusive with EnableLLMReview: an unattended hand-out is never
-	// LLM-reviewed, because a declined review escalates and a pending
-	// escalation stops the idle poll. When a source sets both, auto-send wins.
+	// Composes with EnableLLMReviewBeforeAutoSend: the hand-out decides THAT a
+	// task goes, and the review — which never escalates — decides which task
+	// and in what shape.
 	//
 	// Off by default: without it, an agent that parks with no fresh herdr
 	// event just waits for the operator.
@@ -402,56 +409,29 @@ func (s TaskSource) MaxTasksLimit() int {
 	return s.MaxTasks
 }
 
-// LLMReviewRequested reports whether the operator explicitly asked for the
-// pre-send LLM review on this source, ignoring whether the request is
-// satisfiable. This is the RAW key, and it is what conflict detection must read
-// — LLMReviewEnabled already folds the conflict away, so validating against it
-// would never see one.
-func (s TaskSource) LLMReviewRequested() bool {
-	return s.EnableLLMReview != nil && *s.EnableLLMReview
-}
-
-// LLMReviewEnabled reports whether this source's determined tasks actually take
-// the pre-send LLM review: opt-in, and never on for an auto-send source. This
-// is the resolved value every reader should use — the daemon gate, and every
-// surface that displays the setting.
+// ReviewBeforeAutoSendEnabled reports whether this source's tasks take the
+// pre-delivery LLM review. Opt-in: unset means off.
 //
-// The auto-send term is defense-in-depth: Load coerces a conflicting pair and
-// every write surface rejects one, so a Config read off disk never carries both.
-// A Config built in memory (a test harness, the generated-task bootstrap's
-// append) reaches neither, which is the same reason MaxTasksLimit resolves
-// dynamically rather than through fillZeroes.
-func (s TaskSource) LLMReviewEnabled() bool {
-	return !s.EnableAutoSendTaskWhenIdle && s.LLMReviewRequested()
+// It composes with EnableAutoSendTaskWhenIdle rather than excluding it. The two
+// were once mutually exclusive, because the review ran as a fork upstream of
+// domain.Decide whose only failure mode was an escalation — and a pending
+// escalation bars an agent from the idle poll entirely, so a reviewed auto-send
+// source silently switched itself off. The review is now a pre-DELIVERY filter
+// that never escalates (every failure sends the original task unchanged), so
+// the exclusion no longer has anything to prevent: the auto-send rule decides
+// THAT a task goes, the review decides WHICH task and in what shape.
+func (s TaskSource) ReviewBeforeAutoSendEnabled() bool {
+	return s.EnableLLMReviewBeforeAutoSend != nil && *s.EnableLLMReviewBeforeAutoSend
 }
 
-// llmReviewConflict reports the one invalid combination: an explicit
-// enable_llm_review=true on a source that also auto-sends. One definition,
-// shared by Load's coercion and ValidateTaskSource, so the two cannot drift.
-func (s TaskSource) llmReviewConflict() bool {
-	return s.EnableAutoSendTaskWhenIdle && s.LLMReviewRequested()
-}
-
-// ErrTaskSourceReviewExclusive is the single definition of the rule that a task
-// source either holds its determined tasks for the pre-send LLM review or hands
-// them out unprompted on the idle poll — never both. Exported so every surface
-// can errors.Is it and none has to re-spell the wording.
-var ErrTaskSourceReviewExclusive = errors.New(
-	"enable_llm_review and enable_auto_send_task_when_idle are mutually exclusive: " +
-		"a source either reviews its tasks before sending or hands them out unprompted when idle, not both " +
-		"(a declined review escalates, and a pending escalation stops the idle poll) — turn the other one off first")
-
-// ValidateTaskSource rejects a source no write path may persist.
+// ValidateTaskSource rejects a source no write path may persist. Nothing is
+// currently invalid; it is kept as the single hook every write surface already
+// calls, so a future rule lands in one place rather than in each of them.
 //
-// Load deliberately does NOT call this: a config already on disk in this state
-// must still load — coerced and warned — or the operator is locked out of the
-// very CLI/TUI that would repair it (every write goes Load → mutate → Save).
-// Writes are the opposite: they must refuse rather than silently resolve, so
-// the operator learns which key won instead of discovering it later.
-func ValidateTaskSource(s TaskSource) error {
-	if s.llmReviewConflict() {
-		return ErrTaskSourceReviewExclusive
-	}
+// Load deliberately does NOT call this: a config already on disk in a rejected
+// state must still load — coerced and warned — or the operator is locked out of
+// the very CLI/TUI that would repair it (every write goes Load → mutate → Save).
+func ValidateTaskSource(TaskSource) error {
 	return nil
 }
 
@@ -915,48 +895,30 @@ func Load(path string) (Config, error) {
 		}
 		cfg.LLM.DeprecatedRewriteFallbackTemplate = ""
 	}
-	// Renamed task-source `llm_review` → `enable_llm_review`, migrated per
-	// element (the key lives on [[task_sources]] entries). A set new key wins;
-	// clearing the deprecated pointer makes the next Save drop the old key.
+	// Renamed task-source `enable_llm_review` → `enable_llm_review_before_auto_send`,
+	// migrated per element (the key lives on [[task_sources]] entries). A set
+	// new key wins; clearing the deprecated pointer makes the next Save drop
+	// the old key.
+	//
+	// The rename is not cosmetic: the key used to gate a review that ran on
+	// every determined task and escalated when it declined. It now gates a
+	// pre-delivery filter that applies ONLY to sends the daemon initiates and
+	// never escalates. Carrying the value across is still right — an operator
+	// who asked for their tasks to be reviewed still wants them reviewed.
 	for i := range cfg.TaskSources {
 		src := &cfg.TaskSources[i]
-		if src.DeprecatedLLMReview == nil {
+		if src.DeprecatedEnableLLMReview == nil {
 			continue
 		}
-		if src.EnableLLMReview == nil {
-			src.EnableLLMReview = src.DeprecatedLLMReview
-			slog.Warn("task_sources key `llm_review` is deprecated; use `enable_llm_review`",
+		if src.EnableLLMReviewBeforeAutoSend == nil {
+			src.EnableLLMReviewBeforeAutoSend = src.DeprecatedEnableLLMReview
+			slog.Warn("task_sources key `enable_llm_review` is deprecated; use `enable_llm_review_before_auto_send`",
 				"path", path, "source", src.Path)
 		} else {
-			slog.Warn("deprecated task_sources key `llm_review` ignored because `enable_llm_review` is also set",
+			slog.Warn("deprecated task_sources key `enable_llm_review` ignored because `enable_llm_review_before_auto_send` is also set",
 				"path", path, "source", src.Path)
 		}
-		src.DeprecatedLLMReview = nil
-	}
-	// enable_llm_review and enable_auto_send_task_when_idle are mutually
-	// exclusive. Resolved here rather than rejected: Load is the first thing
-	// every write path runs (frontend.UpdateConfig does Load → mutate → Save),
-	// and daemon.New treats a Load error as a fatal boot failure — a rejecting
-	// Load would lock the operator out of repairing the file it rejected.
-	//
-	// Auto-send wins: it is the more consequential opt-in, and it is the one
-	// the review would silently defeat. Deliberately AFTER the migration loop
-	// above, which is what can seed EnableLLMReview=true from a legacy
-	// `llm_review` key in the first place.
-	//
-	// The resolution is written into the value, not just resolved on read, so
-	// the next Save records what the daemon is actually running under — the
-	// same reason max_tasks is materialized. The operator's typed `true` is
-	// therefore erased on that Save; the warning below is what announces it.
-	for i := range cfg.TaskSources {
-		src := &cfg.TaskSources[i]
-		if !src.llmReviewConflict() {
-			continue
-		}
-		slog.Warn("task_sources keys `enable_llm_review` and `enable_auto_send_task_when_idle` are mutually exclusive; `enable_llm_review` is forced off for this source",
-			"path", path, "source", src.Path)
-		off := false
-		src.EnableLLMReview = &off
+		src.DeprecatedEnableLLMReview = nil
 	}
 	cfg.fillZeroes()
 	return cfg, nil

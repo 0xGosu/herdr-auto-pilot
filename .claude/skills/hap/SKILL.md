@@ -549,13 +549,13 @@ hap task-source add --agent backend-dev --auto-send-when-idle ./docs/tasks.md
 ```
 
 the TUI's *Config* tab `t` prompt takes the same words:
-`<path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review] [--max-tasks N]`.
+`<path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`.
 it is opt-in everywhere and never inferred. an EXISTING source is switched on without editing
 config.toml:
 
 ```bash
 hap task-source set <index> auto-send-when-idle true   # or false
-hap task-source set <index> enable-llm-review true     # mutually exclusive with the above
+hap task-source set <index> enable-llm-review-before-auto-send true  # composes with the above
 hap task-source set <index> max-tasks 40               # the refill/creation cap
 ```
 
@@ -563,13 +563,13 @@ the *Config* tab's `enter` on a task-source row is the same edit: it opens a
 picker of the three settings, then asks for the value (the picker marks a row
 `blocked while <other>=true` when the mutually exclusive partner is on). all are
 also settable at creation time —
-`hap task-source add [--auto-send-when-idle] [--enable-llm-review] [--max-tasks N]`,
+`hap task-source add [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`,
 and the *Config* tab's `t` prompt takes the same words:
-`<path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review] [--max-tasks N]`
+`<path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`
 (either `--max-tasks 40` or `--max-tasks=40`). wherever sources are listed
 (`hap task-source list`, the *Config* tab) an enabled source shows
-`auto_send_when_idle=true`, and every source shows its `enable_llm_review` and
-`max_tasks`.
+`auto_send_when_idle=true`, and every source shows its
+`enable_llm_review_before_auto_send` and `max_tasks`.
 
 - one task, one agent: agents matched by the same source get *different*
   pending items, and the delivered item is marked `[-]` as it is sent (a failed
@@ -579,11 +579,12 @@ and the *Config* tab's `t` prompt takes the same words:
 - delivery runs the normal pipeline — kill switch, never-auto patterns, rate
   limits and per-agent disable all still apply; the audit row's trigger reads
   `auto-idle-send`.
-- the pre-send LLM review does NOT apply: `enable_auto_send_task_when_idle` and
-  `enable_llm_review` are **mutually exclusive**. a declined review escalates,
-  and an open escalation skips the agent (below) — so a reviewed auto-send
-  source would switch itself off. setting the second flag is refused; a config
-  carrying both loads with a warning and the review forced off.
+- the pre-delivery LLM review **composes** with this:
+  `enable_llm_review_before_auto_send` decides which task and in what shape,
+  this flag decides that a task goes at all. the two used to be mutually
+  exclusive, because a declined review escalated and an open escalation skips
+  the agent (below) — so a reviewed auto-send source switched itself off. the
+  review never escalates now, so the restriction is gone.
 - an agent that is disabled, rate-paused, blocked, or has an open escalation is
   skipped. this is the first thing to check when auto-send "does nothing":
   `hap escalations` — ANY open row for that agent parks the poll, silently.
@@ -720,7 +721,7 @@ being re-sent with every prompt.
 
 when every item is checked off, the prompt is still sent with `{next_task_content} = "none"`, so the template can steer what an idle agent does when the list is done.
 
-when an `[llm].command` is configured, each determined task is first reviewed by the llm before it is sent: via the `get_context`/`submit_decision` mcp tools it sees the live pane plus the queued task (`proposed_task`/`current_task`), the checklist path (`task_list_path`), and every remaining item (`pending_tasks`), then either sends the task as-is (`recommend_action` `@next_task:declared`, which sends the queued task verbatim), sends an edited task or a different pending item (literal `recommend_action` text), or declines (`@noop`). the outcome follows `auto_act_confidence_threshold` symmetrically — a confident review is applied automatically (the task is sent, or silently skipped on a decline), a low-confidence one is surfaced for confirmation (the suggestion is the llm's exact recommendation; the original task and reasoning show in the escalation detail). since the default threshold is 999, every review is surfaced until you lower it. this review is OFF by default; set `enable_llm_review = true` to opt a source in — by hand in `config.toml`, with `hap task-source set <index> enable-llm-review true`, or from the TUI's config tab (`enter` on a task-source row). `hap task-source list` always prints the resolved value. it is mutually exclusive with `enable_auto_send_task_when_idle` (see "auto-send tasks to idle agents"). the former `llm_review` key still loads and migrates on the next save, but the CLI refuses that spelling.
+when an `[llm].command` is configured and a source sets `enable_llm_review_before_auto_send = true`, the llm reviews — and may revise — that task list immediately before the daemon auto-sends a task from it. via `get_context` it sees the live pane, the queued task (`proposed_task`/`current_task`), the checklist path (`task_list_path`), and `tasks`: every item with the `ref` used to address it (a declared id like `3.4`, else a position like `#3`), its position and its status. it answers in ONE `submit_decision` call — `task_actions`, an ordered series of edits applied in sequence (`done` / `delete` / `edit` / `move` / `add`, each addressing a task by `ref`, with `add` taking an `as` handle), plus `send_task`, the REFERENCE of the task to deliver once they are applied. `send_task` is never task text: the daemon renders the prompt from the list itself, so nothing can be paraphrased in transit. to send the task at hand unchanged, just name it and submit no actions. everything applies atomically under the file lock, or not at all. **it never escalates** — an unusable review, one scoring below `auto_act_confidence_threshold`, or a reviewed task tripping never-auto / suspected-irreversible all send the ORIGINAL task unchanged and leave the checklist byte-identical. `send_task "@noop"` is legal only when no pending task remains afterwards. every outcome is audited under the `llm-task-review` trigger with a distinct reason, and mutations carry before/after text — so `hap audit` answers "why is task 4 gone?". only sends the DAEMON initiates are reviewed; `hap task <agent> send` and the TUI's send never are. OFF by default; opt a source in by hand in `config.toml`, with `hap task-source set <index> enable-llm-review-before-auto-send true`, or from the TUI's config tab (`enter` on a task-source row). it composes with `enable_auto_send_task_when_idle` (see "auto-send tasks to idle agents"). the former `enable_llm_review` key still loads and migrates on the next save, but the CLI refuses that spelling; `llm_review` is no longer recognized.
 
 without a declared task source, the plugin falls back to inferring the next task from the agent's own native todo rendering (currently only `claude` agent type is supported for inference). other agent types skip inference and escalate.
 
@@ -839,7 +840,7 @@ every LLM suggestion is re-gated through the never-auto patterns, kill switch, a
 
 ## llm action review (optional)
 
-when a learned rule resolves to literal free text (idle next-task prompt, error retry command, free-text approval reply — never menu digits, and never a declared task from a `[[task_sources]]`, whose `enable_llm_review` gate owns that), the consult LLM (`llm.command`) can review/adapt that text to what's actually on the agent's screen before sending. the review rides the same `get_context`/`submit_decision` MCP round-trip as any consult: `get_context` carries `proposed_action` (the exact text about to be sent), and the model submits the adapted text, `@proposed_action:send` to affirm the original, or `@noop` to send nothing.
+when a learned rule resolves to literal free text (idle next-task prompt, error retry command, free-text approval reply — never menu digits, and never a declared task from a `[[task_sources]]`, whose `enable_llm_review_before_auto_send` gate owns that), the consult LLM (`llm.command`) can review/adapt that text to what's actually on the agent's screen before sending. the review rides the same `get_context`/`submit_decision` MCP round-trip as any consult: `get_context` carries `proposed_action` (the exact text about to be sent), and the model submits the adapted text, `@proposed_action:send` to affirm the original, or `@noop` to send nothing.
 
 ```toml
 [llm]
@@ -854,7 +855,7 @@ upgrading: the former one-shot rewrite CLI keys (`llm.rewrite_command`, `llm.rew
 ### action review invariants
 
 - numbered-menu answers are never reviewed — a mapped digit reaches the menu untouched. only literal free text goes through the review.
-- declared tasks from `[[task_sources]]` are never action-reviewed — the source's `enable_llm_review` gate owns task review; a source that did not opt in delivers its tasks verbatim.
+- declared tasks from `[[task_sources]]` are never action-reviewed — the source's `enable_llm_review_before_auto_send` gate owns task review; a source that did not opt in delivers its tasks verbatim.
 - a review failure never blocks the send: on error, timeout, empty or invalid output the original text is delivered as-is (or wrapped in `rewrite_action_fallback_template` when configured). `auto_act_confidence_threshold` does NOT apply — an unsure review degrades to the original instead of escalating (the `confident_score` still lands on the audit row).
 - `@proposed_action:send` sends the original verbatim (bypassing any fallback template); all safety re-gates still run on it.
 - `@noop` sends nothing at all — audited as a `noop` row, runaway counter still advances, nothing learned. bare spellings (`noop`, `no_op`, `no-op`) normalize to the sentinel, as on every consult.

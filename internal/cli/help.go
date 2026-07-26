@@ -581,27 +581,33 @@ func buildCommands() {
 				{Name: "--workspace", Arg: "W", Desc: "workspace name this source applies to (\"*\" wildcards, e.g. \"codex-*\")"},
 				{Name: "--template", Arg: "T", Desc: "next-task prompt template; placeholders {next_task_content} {task_list_path} {task_list_path_quoted} {agent_name} {cwd}"},
 				{Name: "--auto-send-when-idle", Desc: "also hand out tasks on the periodic idle poll, not only on a herdr attention event"},
-				{Name: "--enable-llm-review", Desc: "review each determined task with the configured [llm].command before sending it; mutually exclusive with --auto-send-when-idle"},
+				{Name: "--enable-llm-review-before-auto-send", Desc: "let the configured [llm].command revise the task list and pick the task, immediately before the daemon auto-sends one"},
 				{Name: "--max-tasks", Arg: "N", Default: "config default", Desc: "cap on how many items this list may hold before task generation stops refilling it"},
 			},
 			Details: "Flags must come BEFORE the <checklist.md> path — Go's flag parsing stops at the\n" +
 				"first positional argument, so a flag written after the path is silently ignored\n" +
 				"(hap detects that case and refuses).\n" +
-				"`set` edits an existing source; only auto-send-when-idle, enable-llm-review\n" +
-				"and max-tasks are editable — changing the path/agent/workspace is\n" +
-				"remove-and-re-add, since it silently re-points an agent's work.\n" +
-				"auto-send-when-idle and enable-llm-review are mutually exclusive: auto-send\n" +
-				"drives an agent with nobody watching, while enable_llm_review escalates a\n" +
-				"declined task to the operator who is not there — and a pending escalation\n" +
-				"stops the idle poll. Setting either while the other is on is refused; turn\n" +
-				"the other off first, hap never clears it for you.\n" +
-				"enable_llm_review defaults to OFF; `task-source list` always prints it.\n" +
+				"`set` edits an existing source; only auto-send-when-idle,\n" +
+				"enable-llm-review-before-auto-send and max-tasks are editable — changing the\n" +
+				"path/agent/workspace is remove-and-re-add, since it silently re-points an\n" +
+				"agent's work.\n" +
+				"enable-llm-review-before-auto-send composes with auto-send-when-idle: the\n" +
+				"hand-out decides THAT a task goes, the review decides which task and in what\n" +
+				"shape. Immediately before the daemon sends, the LLM may mark, drop, rewrite,\n" +
+				"reorder or split checklist items and then name the one to deliver.\n" +
+				"The review never escalates: one that fails, or scores below\n" +
+				"auto_act_confidence_threshold, sends the original task unchanged and leaves\n" +
+				"the list byte-identical. Only sends the daemon initiates are reviewed — a task\n" +
+				"you send by hand (`hap task <agent> send`) never is.\n" +
+				"It defaults to OFF; `task-source list` always prints it. The former\n" +
+				"`enable_llm_review` spelling still loads from config.toml (with a warning) and\n" +
+				"is rewritten on the next save, but the CLI refuses it.\n" +
 				"Use `hap task` to manage the ITEMS inside the file.",
 			Examples: []string{
 				"hap task-source add --agent vivid-falcon --max-tasks 20 ./docs/tasks.md",
 				"hap task-source list",
 				"hap task-source set 0 auto-send-when-idle true",
-				"hap task-source set 0 enable-llm-review true",
+				"hap task-source set 0 enable-llm-review-before-auto-send true",
 			},
 			Next: []Hint{
 				{Cmd: "hap task-source list", Why: "confirm the source and its index"},

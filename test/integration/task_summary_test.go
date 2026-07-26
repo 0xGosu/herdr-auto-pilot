@@ -213,7 +213,9 @@ func TestRealConsultContextTaskSourceSummary(t *testing.T) {
 	if err := os.WriteFile(taskFile, []byte("- [x] scaffold\n- [-] warm caches\n- [ ] refactor\n- [ ] ship\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfgTOML := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\n", pane, taskFile)
+	// The review is opt-in, and this test exists to exercise its context.
+	cfgTOML := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\n"+
+		"enable_llm_review_before_auto_send = true\n", pane, taskFile)
 	d, events, llm := newTestDaemon(t, cli, cfgTOML)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -244,7 +246,7 @@ func TestRealConsultContextTaskSourceSummary(t *testing.T) {
 	}
 	// This is an ordinary consult, not a task review: the review-only fields
 	// must be absent.
-	for _, key := range []string{"proposed_task", "current_task", "pending_tasks"} {
+	for _, key := range []string{"proposed_task", "current_task", "tasks", "pending_tasks"} {
 		if _, present := m[key]; present {
 			t.Errorf("%s must be absent on an ordinary (non-review) consult, got %v", key, m[key])
 		}
@@ -252,11 +254,11 @@ func TestRealConsultContextTaskSourceSummary(t *testing.T) {
 }
 
 // TestRealIdleTaskReviewContextTaskSourceSummary drives a real idle agent
-// through the pre-send declared-task review and verifies get_context's
-// review fields (proposed_task/current_task/pending_tasks) agree with the
+// through the pre-DELIVERY task-list review and verifies get_context's review
+// fields (proposed_task/current_task/tasks/pending_tasks) agree with the
 // always-on task_source summary fields — the review path
-// (internal/daemon/daemon.go consultDeclaredTask), which reuses its own
-// fresh read of the checklist instead of calling taskSourceSummary again.
+// (internal/daemon/tasklistreview.go), which reuses its own fresh read of the
+// checklist instead of calling taskSourceSummary again.
 func TestRealIdleTaskReviewContextTaskSourceSummary(t *testing.T) {
 	requireHerdr(t)
 	cli := herdr.NewCLI()
@@ -269,7 +271,9 @@ func TestRealIdleTaskReviewContextTaskSourceSummary(t *testing.T) {
 	if err := os.WriteFile(taskFile, []byte("- [x] scaffold\n- [-] warm caches\n- [ ] refactor\n- [ ] ship\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfgTOML := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\n", pane, taskFile)
+	// The review is opt-in, and this test exists to exercise its context.
+	cfgTOML := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\n"+
+		"enable_llm_review_before_auto_send = true\n", pane, taskFile)
 	d, events, llm := newTestDaemon(t, cli, cfgTOML)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -292,6 +296,23 @@ func TestRealIdleTaskReviewContextTaskSourceSummary(t *testing.T) {
 	pending, _ := m["pending_tasks"].([]any)
 	if len(pending) != 2 || pending[0] != "refactor" || pending[1] != "ship" {
 		t.Errorf("pending_tasks = %v, want [refactor ship]", pending)
+	}
+	// tasks is what submit_decision actually addresses: EVERY item, with the
+	// reference to name it and its status. Without it the model can revise the
+	// list but cannot say which item it means.
+	tasks, _ := m["tasks"].([]any)
+	if len(tasks) != 4 {
+		t.Fatalf("tasks = %v, want all four checklist items", m["tasks"])
+	}
+	wantStatus := []string{"done", "in_progress", "pending", "pending"}
+	for i, raw := range tasks {
+		item, _ := raw.(map[string]any)
+		if item["ref"] != fmt.Sprintf("#%d", i+1) {
+			t.Errorf("tasks[%d].ref = %v, want #%d (this list declares no ids)", i, item["ref"], i+1)
+		}
+		if item["status"] != wantStatus[i] {
+			t.Errorf("tasks[%d].status = %v, want %q", i, item["status"], wantStatus[i])
+		}
 	}
 	// The always-on summary fields must agree with the review's own
 	// pending_tasks/current_task, since both come from the same re-read.

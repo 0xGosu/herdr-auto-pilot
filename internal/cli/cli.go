@@ -1309,9 +1309,9 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 			// Always shown, unlike auto_send_when_idle above: the omitted state
 			// there is the safe one, but here it is the permissive one (tasks
 			// sent with no judgement step), so it must be readable on every
-			// listing. Resolved through LLMReviewEnabled — the field is a *bool,
-			// and it is forced off for an auto-send source.
-			fmt.Fprintf(out, " enable_llm_review=%v", src.LLMReviewEnabled())
+			// listing. Resolved through the accessor — the field is a *bool,
+			// and %v on it would print a pointer address.
+			fmt.Fprintf(out, " enable_llm_review_before_auto_send=%v", src.ReviewBeforeAutoSendEnabled())
 			// The cap is always shown, resolved through MaxTasksLimit so the
 			// number printed is the one the daemon enforces even for a config
 			// written before the cap was filled in on save.
@@ -1353,7 +1353,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	workspace := fs.String("workspace", "", "workspace name this source applies to (\"*\" wildcards, e.g. \"codex-*\")")
 	template := fs.String("template", "", "next-task prompt template ({next_task_content}, {task_list_path}, {task_list_path_quoted}, {agent_name} placeholders)")
 	autoSend := fs.Bool("auto-send-when-idle", false, "also hand out tasks on the periodic idle poll, not only on a herdr attention event")
-	llmReview := fs.Bool("enable-llm-review", false, "review each determined task with the configured [llm].command before sending it (mutually exclusive with --auto-send-when-idle)")
+	llmReview := fs.Bool("enable-llm-review-before-auto-send", false, "let the configured [llm].command revise the task list and pick the task, immediately before the daemon auto-sends one (never applies to a manual `task send`)")
 	maxTasks := fs.Int("max-tasks", config.DefaultMaxTasks, "cap on how many checklist items this source may hold before task generation stops refilling it")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
@@ -1368,7 +1368,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 				return fmt.Errorf("flags must come before <checklist.md>: %s was read as an argument, not a flag", extra)
 			}
 		}
-		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--enable-llm-review] [--max-tasks N] <checklist.md> | list | set <index> <key> <value> | remove <index> (see: hap help task-source)")
+		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] <checklist.md> | list | set <index> <key> <value> | remove <index> (see: hap help task-source)")
 	}
 	var opts []frontend.TaskSourceOption
 	if *autoSend {
@@ -1380,7 +1380,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	opts = append(opts, frontend.MaxTasks(*maxTasks))
 	// Unconditional for the same reason: a source records the review gate it
 	// actually runs under rather than leaving the key absent on disk.
-	opts = append(opts, frontend.LLMReview(*llmReview))
+	opts = append(opts, frontend.ReviewBeforeAutoSend(*llmReview))
 	if err := app.AddTaskSource(ctx, *agent, *workspace, fs.Arg(0), *template, opts...); err != nil {
 		return err
 	}
@@ -1435,24 +1435,24 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 			fmt.Fprintln(out, "auto-send when idle is ON: matching idle agents are handed their next pending task without an attention event")
 		}
 		return nil
-	case "enable-llm-review", "enable_llm_review":
+	case "enable-llm-review-before-auto-send", "enable_llm_review_before_auto_send":
 		on, err := strconv.ParseBool(value)
 		if err != nil {
 			return fmt.Errorf("invalid %s value %q (true|false)", key, value)
 		}
-		if err := app.SetTaskSourceLLMReview(ctx, idx, expected, on); err != nil {
+		if err := app.SetTaskSourceReviewBeforeAutoSend(ctx, idx, expected, on); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "task source #%d: enable_llm_review=%v\n", idx, on)
+		fmt.Fprintf(out, "task source #%d: enable_llm_review_before_auto_send=%v\n", idx, on)
 		if on {
-			fmt.Fprintln(out, "LLM review before sending is ON: each determined task is reviewed by the configured [llm].command, and a decline is escalated to you")
+			fmt.Fprintln(out, "LLM review before auto-send is ON: immediately before the daemon sends a task, the configured [llm].command may revise the list and pick which task goes. A review that fails or scores below auto_act_confidence_threshold sends the original task unchanged — it never escalates. A task you send by hand is never reviewed.")
 		}
 		return nil
-	case "llm-review", "llm_review":
-		// The renamed key, refused rather than aliased: config.Load migrates
-		// `llm_review` away and warns about it, so accepting it here would teach
-		// the spelling hap is retiring.
-		return fmt.Errorf("task-source key %q was renamed — use enable-llm-review\n%s", key, usage)
+	case "enable-llm-review", "enable_llm_review", "llm-review", "llm_review":
+		// Both retired spellings, refused rather than aliased: config.Load
+		// migrates `enable_llm_review` away and warns about it, so accepting it
+		// here would teach a spelling hap is retiring.
+		return fmt.Errorf("task-source key %q was renamed — use enable-llm-review-before-auto-send\n%s", key, usage)
 	case "max-tasks", "max_tasks":
 		n, err := strconv.Atoi(value)
 		if err != nil {

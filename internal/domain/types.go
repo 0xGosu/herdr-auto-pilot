@@ -298,6 +298,38 @@ const (
 	// TriggerOperatorCorrection is the audit_log trigger for the correction/
 	// confirmation lineage row an operator decision writes.
 	TriggerOperatorCorrection = "operator-correction"
+	// TriggerLLMTaskReview is the audit_log trigger for the row a pre-delivery
+	// task-list review writes. It is its own trigger, not a field folded into
+	// the send row, because a review is a new class of side effect: until now
+	// an LLM could only choose TEXT TO SEND, never edit the operator's
+	// checklist. "Why is task 4 gone?" must be answerable from `hap audit`.
+	TriggerLLMTaskReview = "llm-task-review"
+)
+
+// Actions written on a TriggerLLMTaskReview audit row. Every review outcome
+// gets one, including the ones that change nothing — a silent fallback would
+// otherwise be indistinguishable from an ordinary unreviewed send.
+const (
+	// AuditActionTaskReviewApplied: the review's edits were committed and its
+	// chosen task delivered.
+	AuditActionTaskReviewApplied = "task-review:applied"
+	// AuditActionTaskReviewNoop: the review declined, which is legal only for
+	// a genuinely exhausted source. Its edits were still committed.
+	AuditActionTaskReviewNoop = "task-review:noop"
+	// AuditActionTaskReviewFailed: the review was unusable (spawn error,
+	// timeout, no submission, malformed output, an unresolvable reference).
+	// The original task was sent unchanged and the checklist left untouched.
+	AuditActionTaskReviewFailed = "task-review:failed"
+	// AuditActionTaskReviewLowConfidence: the review scored below
+	// auto_act_confidence_threshold, so BOTH its edits and its choice of task
+	// were discarded and the original task sent. The row carries the score and
+	// the discarded proposal — an operator tuning the threshold needs to see
+	// what it is currently rejecting.
+	AuditActionTaskReviewLowConfidence = "task-review:low-confidence"
+	// AuditActionTaskReviewUnsafe: the task the review produced tripped a
+	// never-auto pattern or the suspected-irreversible heuristic. The original
+	// task was sent and the checklist left untouched.
+	AuditActionTaskReviewUnsafe = "task-review:unsafe"
 	// RationaleOperatorConfirmed / RationaleOperatorCorrected distinguish a
 	// confirmation from a correction on that lineage row (both carry the same
 	// trigger and a "corrected:" action, so the rationale is the only signal).
@@ -468,6 +500,16 @@ type LLMDecision struct {
 	Action        string
 	OptionID      string
 	Rationale     string
+	// TaskActions and SendTask carry a pre-delivery task-list review's whole
+	// submission: an ordered series of edits to the agent's checklist, and the
+	// REFERENCE of the task to deliver once they are applied (or "@noop").
+	// Empty on every other kind of decision.
+	//
+	// SendTask is an id, never task text — the daemon renders the outbound
+	// prompt from the checklist itself, which is what removes the
+	// paraphrase-and-drift failure mode a text-carrying field would have.
+	TaskActions []TaskAction
+	SendTask    string
 	// ConfidentScore is the agent's self-reported confidence in this
 	// decision, 0-100; -1 means the agent did not report one.
 	ConfidentScore int
