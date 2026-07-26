@@ -20,12 +20,17 @@ error = 0.75
 # ── Shadow-mode learning ────────────────────────────────────────────
 [learning]
 graduation_n = 2           # consecutive consistent confirmations to graduate a rule (1-10)
+confirmation_weight = 3.0  # how much more an operator confirm/send counts toward
+                           # confidence than a passive observation
 
 # ── Safety (never-auto) ─────────────────────────────────────────────
 [safety]
 never_auto_patterns = []         # extra regexes that ALWAYS escalate (e.g. "rm -rf")
 # allowlist_patterns = []        # DEPRECATED alias for never_auto_patterns (merged on load)
 disable_never_auto_seed_patterns = false  # keep all shipped strict + heuristic rules (recommended)
+disabled_seed_patterns = []      # silence individual shipped rules by id instead of all of
+                                 # them: take the `seed <id>` from `hap rules list`, then
+                                 # `hap rules disable-seed <id>` / `enable-seed <id>`
 
 # Agent-scoped never-auto rule (repeatable):
 # [[safety.never_auto_rules]]

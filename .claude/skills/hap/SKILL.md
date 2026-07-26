@@ -59,7 +59,7 @@ listings are tab-separated; `hap state-dir` and `hap config path` print a bare v
 
 **escalation** — when confidence is below the threshold, the plugin surfaces the situation to the operator instead of acting automatically.
 
-**never-auto patterns** — destructive operations (force-push, `rm -rf`, deploys, credential changes, etc.) are never automated regardless of confidence. the plugin ships with 38 strict seed patterns plus broader heuristic seed rules.
+**never-auto patterns** — destructive operations (force-push, `rm -rf`, deploys, credential changes, etc.) are never automated regardless of confidence. the plugin ships with 40 strict seed patterns plus broader heuristic seed rules.
 
 **signatures** — a situation signature is a fingerprint of a classified agent state (volatile data like paths, hashes, timestamps is masked). signatures start in shadow mode and graduate to autonomous after enough consistent confirmations. you can inspect, filter, and delete them via the `signatures` command (alias: `sigs`).
 
@@ -76,7 +76,7 @@ hap is not a wrapper around the coding agents; it observes and drives them from 
 **the monitor loop** — for every agent, the daemon runs this cycle:
 
 1. **subscribe** — one `events.subscribe` per socket connection to herdr's event stream; the daemon receives a status/attention event whenever an agent's pane changes (idle, waiting on a prompt, etc.). existing panes replay as `pane_created`.
-2. **capture** — on an attention event the daemon waits a short `capture_delay` (10s on an agent's first event, 500ms after) so the agent's TUI has finished painting and event bursts coalesce, then reads the pane content via the herdr CLI (`pane read --source recent` for classification, `--source visible` to recover a standing menu at confirm time).
+2. **capture** — on an attention event the daemon waits a short `capture_delay` (10s on an agent's first event, 2000ms after) so the agent's TUI has finished painting and event bursts coalesce, then reads the pane content via the herdr CLI (`pane read --source recent` for classification, `--source visible` to recover a standing menu at confirm time).
 3. **classify** — the pane text is classified into a situation type (`idle` / `approval` / `choice` / `error`), extracting options, permission verb, or error summary.
 4. **match** — volatile data (paths, hashes, timestamps) is masked and the situation is resolved to a learned signature via embedding vector search → BM25 text fallback → exact hash. a matched signature carries the operator's past decision and a confidence.
 5. **decide** — if a confident, graduated (autonomous) rule applies and passes every safety gate (kill switch, never-auto patterns, irreversible heuristic, rate/retry guards), the daemon **acts**. otherwise it **escalates** to the operator — or first **consults the local LLM** (if configured), whose suggestion is re-gated through the same safety controls.
@@ -387,7 +387,7 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `limits.max_error_retries` | 2 | max retries per error signature |
 | `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic never-auto rule |
 | `llm.timeout_seconds` | 60 | timeout for LLM fallback calls |
-| `llm.auto_act_confidence_threshold` | 999 (never) | min LLM self-reported confidence (0-100) to auto-act on a consult decision; below it (or no score) the situation escalates with reason `[llm_low_confidence]`. 999 is unreachable = never auto-act |
+| `llm.auto_act_confidence_threshold` | 99 | min LLM self-reported confidence (0-100) to auto-act on a consult decision; below it (or no score) the situation escalates with reason `[llm_low_confidence]`. the default only auto-acts on a near-certain score; set anything above 100 (e.g. 999) to make it unreachable = never auto-act |
 | `llm.pane_excerpt_chars` | 5000 | pane excerpt size in characters for LLM consult context |
 | `llm.enable_rewrite_action` | false | have the consult LLM review/adapt learned free-text replies before delivery (see llm action review) |
 | `llm.rewrite_action_fallback_template` | `{original_text}` (original sent as-is) | optional wrapper around the original when the action review fails (placeholders: `{original_text}`, `{agent_name}`) |
@@ -410,8 +410,9 @@ per-command env notes: layering is daemon env → `env_file` → `env` → the c
 | `embedding.model_context_window` | 0 (built-in default: 512 for MiniLM) | max tokens fed to the embedder before truncation; MUST NOT exceed what the model supports (over 512 hard-aborts a BERT/MiniLM native lib). raise only when `model_path` points at a larger-window model; values below 256 clamp up |
 | `embedding.embed_timeout_ms` | 0 (built-in default: 2000) | stall guard per warm embed call. a model larger than the bundled MiniLM can exceed it on EVERY call, which latches semantic matching onto text search permanently — raise it alongside `model_path`. `hap status` reports the budgets in force and whether the failures were timeouts. values below 100 clamp up, above 600000 (10 min) clamp down |
 | `embedding.warm_timeout_ms` | 0 (built-in default: 30000) | stall guard for the FIRST call of each embed worker, which includes loading the model; raise for slow/large model loads. values below 1000 clamp up, above 600000 (10 min) clamp down |
-| `embedding.pane_salient_chars` | 800 | fallback signature window for idle/unclassified situations (trailing N chars) |
+| `embedding.pane_salient_chars` | 500 | fallback signature window for idle/unclassified situations (trailing N chars) |
 | `tui.max_content_width` | 0 (full width) | cap variable-width list columns; 0 = full width |
+| `tui.max_content_height` | 0 (full height) | cap the rows a list body may use; 0 = full height |
 | `tui.theme` | default | TUI color theme: default, dark, light, high-contrast (in the TUI Config tab, `e` on this row opens a ↑/↓ picker of the available themes) |
 | `cli.ai_agent_friendly_output` | true | append the "Next steps" footer to command output (for AI agents driving the CLI); never affects `hap help` / `--help`, which always show theirs |
 | `tui.terminal_bell` | true | ring the terminal bell (\a) on new escalations and on pauses caused by a different process |
@@ -419,9 +420,9 @@ per-command env notes: layering is daemon env → `env_file` → `env` → the c
 
 TUI palette colors (`tui.palette.*`) are config.toml-only — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. values are 256-color codes (`"205"`) or hex (`"#ff5faf"`).
 
-some settings are table-valued and live in `config.toml` only (not settable via `hap config set`): `[[capture_delay]]`, `[[task_sources]]`, `[[classifier]]`, and `[[safety.never_auto_rules]]`.
+some settings are table-valued and live in `config.toml` only (not settable via `hap config set`): `[[capture_delay]]`, `[[task_sources]]`, `[[classifier]]`, `[[safety.never_auto_rules]]`, `safety.disabled_seed_patterns` (the list `hap rules disable-seed` writes), the inline `[llm.*_env]` tables (only the `*_env_file` PATHS are settable — the tables hold secrets), and `[tui.palette]`.
 
-**capture delay** — the classification pane read waits a per-agent delay so the agent TUI has painted and event bursts coalesce. defaults: 10000ms (10s) on an agent's first event, 500ms after. override per agent type:
+**capture delay** — the classification pane read waits a per-agent delay so the agent TUI has painted and event bursts coalesce. defaults: 10000ms (10s) on an agent's first event, 2000ms after. override per agent type:
 
 ```toml
 [[capture_delay]]
@@ -450,7 +451,21 @@ remove a custom rule by index:
 hap rules remove <index>
 ```
 
-the 38 strict seed rules cover: force-push, `git reset --hard`, `rm -rf`, `sudo rm`, `DROP TABLE`, `TRUNCATE TABLE`, `DELETE FROM`, deploys to prod, `npm publish`, `terraform apply/destroy`, credential rotation, and more; broader heuristic seed rules catch suspected irreversible language. all shipped rules are active unless `safety.disable_never_auto_seed_patterns=true`. the old `safety.disable_seed` key still loads with a deprecation warning and is rewritten under the new name on the next config save.
+silence a single shipped seed rule that is too aggressive for this repo (e.g. a
+heuristic firing on a legitimate word), keeping the rest of the safety net:
+
+```bash
+hap rules list                     # take the stable `seed <id>` from the listing
+hap rules disable-seed <id>        # writes safety.disabled_seed_patterns
+hap rules enable-seed <id>         # restore it
+```
+
+the id is a short hash of the pattern, so it names the same rule across
+upgrades (and is rejected if that pattern no longer ships). one seed rule is a
+single regex that can cover several phrasings — disabling it silences all of
+them, not just the phrase you saw.
+
+the 40 strict seed rules cover: force-push, `git reset --hard`, `rm -rf`, `sudo rm`, `DROP TABLE`, `TRUNCATE TABLE`, `DELETE FROM`, deploys to prod, `npm publish`, `terraform apply/destroy`, credential rotation, and more; broader heuristic seed rules catch suspected irreversible language. all shipped rules are active unless `safety.disable_never_auto_seed_patterns=true`. the old `safety.disable_seed` key still loads with a deprecation warning and is rewritten under the new name on the next config save.
 
 the config key for custom patterns is `never_auto_patterns` (the old name `allowlist_patterns` still loads as a deprecated alias):
 
@@ -561,9 +576,8 @@ hap task-source set <index> max-tasks 40               # the refill/creation cap
 ```
 
 the *Config* tab's `enter` on a task-source row is the same edit: it opens a
-picker of the three settings, then asks for the value (the picker marks a row
-`blocked while <other>=true` when the mutually exclusive partner is on). all are
-also settable at creation time —
+picker of the three settings, then asks for the value (the three compose, so no
+row is ever blocked by another). all are also settable at creation time —
 `hap task-source add [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`,
 and the *Config* tab's `t` prompt takes the same words:
 `<path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`
@@ -647,6 +661,10 @@ hap task backend-dev done 2                # tick item 2 off ([x])
 hap task backend-dev undone 2              # re-open item 2 ([ ])
 hap task backend-dev update 2 "new text"   # edit text, keep status
 hap task backend-dev remove 2              # delete item 2
+hap task backend-dev move 5 2              # reorder: put item 5 at position 2
+hap task backend-dev move 5 up             # or: up | down (one step)
+#   a task moves together with its indented detail lines and nested sub-tasks,
+#   and reorders only among its own siblings.
 hap task backend-dev send 3 [--yes]        # deliver pending item 3 to the live
 #   agent NOW (y/N confirmation unless --yes). only a pending [ ] item on a
 #   cleanly idle agent qualifies — idleness is re-checked at the moment of
@@ -775,7 +793,7 @@ command = [
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
 ]
 timeout_seconds = 120
-auto_act_confidence_threshold = 999   # 0-100; 999 = never auto-act (default). needs an LLM CLI that reports a confidence score
+auto_act_confidence_threshold = 99    # 0-100, default 99; >100 (e.g. 999) = never auto-act. needs an LLM CLI that reports a confidence score
 pane_excerpt_chars = 5000
 ```
 
@@ -837,7 +855,7 @@ command       = ["claude", "-p", "...", "--model", "haiku"]
 command_start = ["claude", "-p", "...", "--model", "opus"]   # first consult per agent only
 ```
 
-every LLM suggestion is re-gated through the never-auto patterns, kill switch, and rate guards. the LLM may act automatically only when its self-reported confidence score meets `auto_act_confidence_threshold` (0-100; default 999 = never) AND the action doesn't contradict learned history; below the threshold, with no reported score, or on timeout / no submission, the situation escalates. the old boolean `auto_act` still loads as a deprecated alias (`true` → threshold 0, `false` → 999) and is migrated on next save.
+every LLM suggestion is re-gated through the never-auto patterns, kill switch, and rate guards. the LLM may act automatically only when its self-reported confidence score meets `auto_act_confidence_threshold` (0-100; default 99, so a near-certain score does auto-act — set it above 100 to disable) AND the action doesn't contradict learned history; below the threshold, with no reported score, or on timeout / no submission, the situation escalates. the old boolean `auto_act` still loads as a deprecated alias (`true` → threshold 0, `false` → 999) and is migrated on next save.
 
 ## llm action review (optional)
 
@@ -876,11 +894,28 @@ hap paths           # both, labeled
 
 example: `cd "$(hap state-dir)"` jumps into the state directory.
 
-## version
+## version and upgrade
 
 ```bash
 hap version
+hap update            # reinstall the newest release: herdr plugin install 0xGosu/herdr-auto-pilot --yes
+hap update --force    # required on a `herdr plugin link` dev build, which an install would replace
 ```
+
+`hap update` prints the version it moved to, then the follow-up that hands the
+running daemon to the new build. **it names an absolute path on purpose** — an
+install does not repoint `hap` on your `PATH`, so a bare `hap daemon --ensure`
+can hand the daemon straight back to the binary that was just replaced:
+
+```bash
+/path/to/new/hap daemon --ensure
+```
+
+the TUI header shows the running version and, when the release check finds a
+newer one, `↑ vX.Y.Z available`. that check is the plugin's only outbound
+network call — turn it off with `hap config set tui.disable_check_for_update
+true`. `hap update` still queries GitHub even with the switch on, because you
+asked it to.
 
 ## recipes
 
@@ -972,6 +1007,7 @@ hap signatures reembed
 
 ## troubleshooting
 
+- **an agent looks blocked but nothing shows up in `hap escalations`** — re-run the capture pipeline for it by hand: `hap capture <agent-name-or-pane-id>`. the daemon classifies that pane right now, as if herdr had raised an attention event (it needs a running, current daemon). then check `hap escalations` after a few seconds, or `hap audit --limit 10` to see the decision even if it did not escalate.
 - **escalations citing `not found in PATH`** — the daemon inherits herdr's environment, which can be narrower than your shell's. make sure the CLI is reachable from a non-login shell or use an absolute path in `llm.command`.
 - **upgrades not taking effect** — the daemon is a singleton that outlives binary upgrades. since v0.1.13, `hap daemon --ensure` (fired by herdr's event hooks) detects the version mismatch and replaces the old daemon automatically. `hap status` shows the running daemon's version and flags a stale one. on older versions run `pkill -f 'hap daemon'` once after upgrading.
 - **installing a newer release** — the TUI header shows `↑ vX.Y.Z available` when one exists. `hap update` installs it (it runs `herdr plugin install 0xGosu/herdr-auto-pilot --yes`), then run the `daemon --ensure` command it prints to hand the running daemon over immediately — it names the newly installed binary by absolute path when the `hap` on PATH is still the previous build (a plugin install does not repoint that symlink). this MUTATES the install — never run it unprompted. on a linked working-tree build it refuses without `--force`, because installing a release would replace that checkout.
