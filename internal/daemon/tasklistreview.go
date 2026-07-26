@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -359,18 +360,7 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 		if err != nil {
 			why = "kill-switch read failed: " + err.Error()
 		}
-		slog.Info("task-list review stood down", "agent", s.AgentID, "reason", why)
-		d.auditTaskReview(ctx, s, res.sig, taskReviewAudit{
-			action: domain.AuditActionTaskReviewFailed, reason: "daemon_paused", why: why,
-			taskText: res.del.taskText, sourceRef: res.del.declared.Path,
-			llmConfidence: llmConf, proposal: proposal, llmOutput: decisionOutput(res.decision),
-		}, now)
-		if res.decision != nil {
-			if uerr := d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "rejected"); uerr != nil {
-				slog.Error("llm decision status update failed", "error", uerr)
-			}
-		}
-		d.dropAutoTaskClaim(s.AgentID)
+		d.standDown(ctx, res, "daemon_paused", why, llmConf, proposal, now)
 		return
 	}
 
@@ -407,7 +397,38 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 
 	mutate, out := taskfile.ApplyReview(res.expectIndex, res.expectText, sendRef,
 		llmDec.TaskActions, res.del.declared.MaxTasks, res.del.declared.Reserve, safe)
-	if err := d.opt.MutateTaskFile(res.del.declared.Path, mutate); err != nil {
+	// Re-read the kill state one last time INSIDE the locked read-modify-write,
+	// immediately before the write. The check above avoids doing pointless work,
+	// but it cannot bound the gap on its own: everything between it and here
+	// (rendering the proposal, building the safety closure, taking the file
+	// lock) is time in which `hap kill` can commit, and the checklist edit is a
+	// DURABLE side effect — unlike a send, an operator cannot un-see it.
+	//
+	// This does not make the check atomic with InsertKillEvent, and nothing in
+	// this daemon can: there is no transaction spanning kill_events, the task
+	// file and the pane. What it does buy is that the state is read under the
+	// same lock that guards the write, so the window is the mutator itself
+	// rather than the whole post-consult tail. A kill landing after the write
+	// still lands in the send window every async LLM path here shares.
+	killed := false
+	guarded := func(content string) (string, error) {
+		kill, err := d.opt.Store.LatestKillEvent(ctx)
+		if err != nil || domain.KillStateActive(kill) {
+			killed = true
+			if err != nil {
+				return "", fmt.Errorf("kill-switch read failed: %w", err)
+			}
+			return "", errors.New("the kill switch became active during the review")
+		}
+		return mutate(content)
+	}
+	if err := d.opt.MutateTaskFile(res.del.declared.Path, guarded); err != nil {
+		if killed {
+			// A killed daemon must not send the ORIGINAL task either, so this
+			// stands down instead of taking the fail-open path below.
+			d.standDown(ctx, res, "daemon_paused", err.Error(), llmConf, proposal, now)
+			return
+		}
 		action, reason := domain.AuditActionTaskReviewFailed, "task_review_not_applicable"
 		if unsafeWhy != "" {
 			action, reason = domain.AuditActionTaskReviewUnsafe, "task_review_unsafe"
@@ -483,6 +504,32 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 	if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, status); err != nil {
 		slog.Error("llm decision status update failed", "error", err)
 	}
+}
+
+// standDown abandons a review without sending anything — not the reviewed task
+// and not the original either. It exists for the kill switch, which is the one
+// outcome where fail-open is wrong: the operator asked the daemon to stop, so
+// "keep the agent working" is exactly what they did not want.
+//
+// It still does not escalate. An escalation would bar this agent from the idle
+// poll long after the kill is lifted, which is the latch this whole redesign
+// removes; the audit row is what tells the operator it happened.
+func (d *Daemon) standDown(ctx context.Context, res taskListReviewOutcome,
+	reason, why string, llmConf *int, proposal string, now time.Time) {
+
+	s := res.situation
+	slog.Info("task-list review stood down", "agent", s.AgentID, "reason", why)
+	d.auditTaskReview(ctx, s, res.sig, taskReviewAudit{
+		action: domain.AuditActionTaskReviewFailed, reason: reason, why: why,
+		taskText: res.del.taskText, sourceRef: res.del.declared.Path,
+		llmConfidence: llmConf, proposal: proposal, llmOutput: decisionOutput(res.decision),
+	}, now)
+	if res.decision != nil {
+		if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "rejected"); err != nil {
+			slog.Error("llm decision status update failed", "error", err)
+		}
+	}
+	d.dropAutoTaskClaim(s.AgentID)
 }
 
 // reviewRollback returns the undo for a claim ApplyReview took, or a no-op when

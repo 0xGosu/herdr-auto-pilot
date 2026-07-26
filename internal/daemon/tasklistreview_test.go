@@ -757,3 +757,57 @@ func TestTaskReviewSafetyScreensTheRenderedPromptNotTheStoredText(t *testing.T) 
 		t.Errorf("want an unsafe audit row, got %+v", rows)
 	}
 }
+
+// The kill switch must also stop a review whose kill lands in the GAP between
+// the pre-mutation check and the write — the window a reviewer flagged on #258.
+// It matters more than the send window every async LLM path here shares, because
+// the checklist edit is a DURABLE side effect: an operator can ignore a stray
+// prompt, but they cannot un-see a rewritten task list.
+//
+// Deterministic, not racy: the kill is inserted from inside the MutateTaskFile
+// hook, so it commits after the first check has already passed and before the
+// mutator runs. That is exactly the interleaving the plain check cannot catch.
+//
+// This narrows the window to the mutator under the file lock; it does not make
+// the check atomic with InsertKillEvent, which nothing in this daemon can be.
+func TestTaskReviewKilledInsideTheMutationWindowWritesNothing(t *testing.T) {
+	const list = "- [ ] 1. alpha\n- [ ] 2. beta\n"
+	h, taskFile := reviewHarness(t, "agent-killgap", list, true)
+
+	// Insert the kill between the pre-mutation check and the mutator, then run
+	// the real locked read-modify-write so the in-lock check is what decides.
+	inner := h.daemon.opt.MutateTaskFile
+	h.daemon.opt.MutateTaskFile = func(path string, fn func(string) (string, error)) error {
+		if _, err := h.raw.InsertKillEvent(context.Background(), domain.KillEvent{
+			State: "active", Scope: "global", Author: "test", CreatedAt: time.Now(),
+		}); err != nil {
+			return err
+		}
+		return inner(path, fn)
+	}
+
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		return stageTaskReview(ctx, h, req, []domain.TaskAction{
+			{Op: domain.TaskOpDelete, Task: "1"},
+		}, "2", 90)
+	}
+
+	h.push("agent-killgap", "idle")
+	waitFor(t, 5*time.Second, func() bool {
+		for _, r := range auditActions(t, h) {
+			if strings.Contains(r.Rationale, "daemon_paused") {
+				return true
+			}
+		}
+		return false
+	})
+	// Nothing written and nothing sent — and notably NOT the fail-open path:
+	// under a kill the original task must not go out either.
+	if got := readTasks(t, taskFile); got != list {
+		t.Errorf("a kill inside the mutation window still edited the checklist:\n got %q\nwant %q", got, list)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("a killed daemon must send nothing — not even the original task, sent %v", got)
+	}
+	noEscalations(t, h)
+}
