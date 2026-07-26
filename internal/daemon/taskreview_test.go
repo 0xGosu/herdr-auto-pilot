@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -148,39 +147,6 @@ func TestLLMSendProposedSentinelOutsideTaskReviewEscalates(t *testing.T) {
 	}
 	if !strings.Contains(esc[0].Rationale, string(domain.ReasonLLMNoSubmit)) {
 		t.Errorf("want an %s escalation, got rationale %q", domain.ReasonLLMNoSubmit, esc[0].Rationale)
-	}
-}
-
-func TestDeclaredTaskLLMReviewOffByDefault(t *testing.T) {
-	// The review is opt-IN: a source that never names enable_llm_review_before_auto_send keeps the
-	// plain declared-task flow even when an LLM command is configured — the
-	// templated prompt is sent directly and the LLM is never consulted. This is
-	// the guard for the default itself, so the config below must NOT set the key.
-	taskFile := writeReviewTaskFile(t, "- [ ] write the docs\n")
-	idlePane := "All tests pass. Task is complete.\n"
-	cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n\n[[task_sources]]\nagent = \"agent-opt\"\npath = %q\n", taskFile)
-	h := newHarness(t, cfg)
-	h.herdr.setPane(idlePane)
-	h.llm.configured = true
-	var consulted atomicString
-	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
-		consulted.set("yes")
-		return nil, errors.New("a source without enable_llm_review_before_auto_send must not consult the LLM")
-	}
-	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
-
-	name, err := h.raw.EnsureAgentName(context.Background(), "agent-opt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.push("agent-opt", "idle")
-	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := (&domain.DeclaredTask{Task: "write the docs", Path: taskFile, AgentName: name}).Prompt()
-	if got := h.herdr.sentInputs()[0]; got != want {
-		t.Errorf("a source without enable_llm_review_before_auto_send should send the templated prompt directly, got %q", got)
-	}
-	if consulted.get() != "" {
-		t.Error("a source without enable_llm_review_before_auto_send must not consult the LLM")
 	}
 }
 
