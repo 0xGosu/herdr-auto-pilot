@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -253,13 +252,22 @@ func TestRealConsultContextTaskSourceSummary(t *testing.T) {
 	}
 }
 
-// TestRealIdleTaskReviewContextTaskSourceSummary drives a real idle agent
-// through the pre-DELIVERY task-list review and verifies get_context's review
-// fields (proposed_task/current_task/tasks/pending_tasks) agree with the
-// always-on task_source summary fields — the review path
-// (internal/daemon/tasklistreview.go), which reuses its own fresh read of the
-// checklist instead of calling taskSourceSummary again.
-func TestRealIdleTaskReviewContextTaskSourceSummary(t *testing.T) {
+// TestRealIdleUnlearnedSignatureConsultsInsteadOfReviewing pins the behaviour
+// change at the heart of issue #255, against a real herdr pane.
+//
+// The task review used to fork UPSTREAM of domain.Decide, so an idle agent with
+// a task source was routed straight into a task review — on every idle event,
+// whatever had (or had not) been learned. It is now a pre-DELIVERY filter, so it
+// runs only once Decide has actually resolved to sending the declared task. An
+// UNLEARNED idle signature therefore takes the ordinary consult path (FR-008 is
+// not bypassed), and the review-only context fields must be absent.
+//
+// That absence is the assertion worth making live: it is what proves a graduated
+// autonomous rule can still act — the thing the old placement made impossible.
+// The review's own context shape is covered by the unit suite, which can seed a
+// graduated rule; here the pane content is a real shell and its signature is not
+// predictable enough to seed against.
+func TestRealIdleUnlearnedSignatureConsultsInsteadOfReviewing(t *testing.T) {
 	requireHerdr(t)
 	cli := herdr.NewCLI()
 	pane := startIdleAgent(t)
@@ -271,7 +279,7 @@ func TestRealIdleTaskReviewContextTaskSourceSummary(t *testing.T) {
 	if err := os.WriteFile(taskFile, []byte("- [x] scaffold\n- [-] warm caches\n- [ ] refactor\n- [ ] ship\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// The review is opt-in, and this test exists to exercise its context.
+	// The review is opted IN, so a fork upstream of Decide would fire here.
 	cfgTOML := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\n"+
 		"enable_llm_review_before_auto_send = true\n", pane, taskFile)
 	d, events, llm := newTestDaemon(t, cli, cfgTOML)
@@ -284,38 +292,18 @@ func TestRealIdleTaskReviewContextTaskSourceSummary(t *testing.T) {
 	}
 
 	m := waitForConsult(t, llm, pane)
-	if pt, _ := m["proposed_task"].(string); !strings.Contains(pt, "refactor") {
-		t.Errorf("proposed_task = %q, want it to mention the declared task", pt)
+	// Review-only fields: absent, because no rule has graduated so nothing has
+	// resolved to a declared-task SEND for the review to filter.
+	for _, key := range []string{"proposed_task", "current_task", "tasks", "pending_tasks"} {
+		if v, present := m[key]; present {
+			t.Errorf("%s must be absent until a decision resolves to sending the declared task, got %v", key, v)
+		}
 	}
-	if ct, _ := m["current_task"].(string); ct != "refactor" {
-		t.Errorf("current_task = %q, want %q", ct, "refactor")
-	}
+	// The always-on task_source summary still rides along, so the consulting LLM
+	// knows the agent's backlog state even on the ordinary path.
 	if lp, _ := m["task_list_path"].(string); lp != taskFile {
 		t.Errorf("task_list_path = %q, want %q", lp, taskFile)
 	}
-	pending, _ := m["pending_tasks"].([]any)
-	if len(pending) != 2 || pending[0] != "refactor" || pending[1] != "ship" {
-		t.Errorf("pending_tasks = %v, want [refactor ship]", pending)
-	}
-	// tasks is what submit_decision actually addresses: EVERY item, with the
-	// reference to name it and its status. Without it the model can revise the
-	// list but cannot say which item it means.
-	tasks, _ := m["tasks"].([]any)
-	if len(tasks) != 4 {
-		t.Fatalf("tasks = %v, want all four checklist items", m["tasks"])
-	}
-	wantStatus := []string{"done", "in_progress", "pending", "pending"}
-	for i, raw := range tasks {
-		item, _ := raw.(map[string]any)
-		if item["ref"] != fmt.Sprintf("#%d", i+1) {
-			t.Errorf("tasks[%d].ref = %v, want #%d (this list declares no ids)", i, item["ref"], i+1)
-		}
-		if item["status"] != wantStatus[i] {
-			t.Errorf("tasks[%d].status = %v, want %q", i, item["status"], wantStatus[i])
-		}
-	}
-	// The always-on summary fields must agree with the review's own
-	// pending_tasks/current_task, since both come from the same re-read.
 	if pc, _ := m["pending_task_count"].(float64); pc != 2 {
 		t.Errorf("pending_task_count = %v, want 2", m["pending_task_count"])
 	}
