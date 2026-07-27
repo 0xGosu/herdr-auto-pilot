@@ -230,6 +230,22 @@ type Daemon struct {
 	// after autoTaskClaimTTL. Guarded by mu.
 	autoTaskClaim map[string]taskClaim
 
+	// autoAcceptAttempts counts failed delivery attempts per aged escalation,
+	// and autoAcceptAbsent counts consecutive sweeps in which an escalation's
+	// agent was missing from the listing. Both are keyed by audit id, guarded
+	// by mu, and deliberately NOT persisted: a restart grants a fresh delivery
+	// budget (a restart may itself be the fix for a transient adapter fault)
+	// and discards half-formed absence observations (an absence must be
+	// confirmed by THIS daemon across consecutive ticks). Both fail safe when
+	// cleared. Entries are dropped when their escalation reaches a terminal
+	// status and opportunistically when an id leaves the eligible set, so they
+	// stay bounded by that set rather than by daemon uptime.
+	autoAcceptAttempts map[int64]int
+	autoAcceptAbsent   map[int64]int
+	// autoAcceptBaselineWarned latches the once-per-run notice that escalations
+	// raised before the signature baseline existed are being skipped.
+	autoAcceptBaselineWarned bool
+
 	// snapshotSaved caches which signatures already have a provenance
 	// snapshot this daemon lifetime (guarded by mu), so the hot path skips
 	// the no-op INSERT OR IGNORE write transaction on repeat sightings.
@@ -414,6 +430,8 @@ func New(opt Options) (*Daemon, error) {
 		toggleAttempt:             map[string]string{},
 		idleSince:                 map[string]idleMark{},
 		autoTaskClaim:             map[string]taskClaim{},
+		autoAcceptAttempts:        map[int64]int{},
+		autoAcceptAbsent:          map[int64]int{},
 		snapshotSaved:             map[string]bool{},
 		paneCwds:                  map[string]paneCwdEntry{},
 		paneCwdRefreshing:         map[string]bool{},
@@ -821,6 +839,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 		if err := d.opt.Store.TouchTaskReservations(ctx, maxHandoutRestamps, d.opt.Clock.Now()); err != nil {
 			slog.Warn("auto-send: hand-out ledger could not be re-stamped at startup", "error", err)
 		}
+		// A row still holding the transient 'auto_accepting' status was
+		// abandoned mid-delivery by a crashed or replaced daemon. Return it to
+		// the pending queue: left there it would be invisible to BOTH the
+		// operator's queue and the auto-accept query (each filters on
+		// 'escalated'), silently losing the escalation and stranding its agent
+		// — the exact failure auto-accept exists to prevent. Safe even when the
+		// delivery had actually landed before the crash: the row must clear the
+		// whole guard chain again, and Guard 3 sees the changed pane and
+		// dismisses it as stale rather than answering twice.
+		if n, err := d.opt.Store.ReclaimAbandonedAutoAccepts(ctx); err != nil {
+			slog.Warn("auto-accept: abandoned claims could not be reclaimed at startup", "error", err)
+		} else if n > 0 {
+			slog.Info("auto-accept: returned abandoned claims to the pending queue", "count", n)
+		}
 		d.reconcileAttention(ctx)
 		return nil
 	})
@@ -851,14 +883,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)
-				// One agent listing feeds both passes: the reconcile
-				// re-drives parked episodes, then the idle poll hands a
-				// pending task to agents that have been idle too long.
+				// One agent listing feeds all three passes: auto-accept
+				// answers escalations that have waited too long, the
+				// reconcile re-drives parked episodes, then the idle poll
+				// hands a pending task to agents that have been idle too
+				// long.
 				agents, err := d.opt.Herdr.ListAgents(ctx)
 				if err != nil {
 					slog.Error("sweep: listing agents failed", "error", err)
 					return nil
 				}
+				// Ahead of the reconcile and the idle poll: an escalation
+				// accepted this tick no longer blocks its agent's
+				// hasOpenEscalation guard, so the same sweep can move it on.
+				d.autoAcceptEscalations(ctx, agents)
 				d.reconcileAttentionWith(ctx, agents)
 				d.autoSendIdleTasks(ctx, agents)
 				return nil

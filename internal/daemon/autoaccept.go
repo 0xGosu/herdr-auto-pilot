@@ -1,0 +1,581 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/deliver"
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+)
+
+// maxAutoAcceptAttempts bounds how many times one escalation's delivery is
+// retried before it is retired.
+//
+// A delivery can fail for reasons that will never resolve on their own: a
+// keystroke-less herdr adapter, a form that no longer validates, an unreachable
+// pane. Retrying every 60 seconds forever would re-run the whole guard chain —
+// including a pane read — on every tick, for as long as the daemon lives.
+//
+// The counter is in-memory and deliberately NOT persisted: a restart is itself
+// a plausible fix for a transient adapter fault, so re-granting a fresh budget
+// is the desired behavior, and it keeps the durable state derived purely from
+// created_at like the rest of this pass.
+const maxAutoAcceptAttempts = 3
+
+// autoAcceptAbsenceConfirmations is how many CONSECUTIVE sweeps must report an
+// agent missing before its escalations are retired. Two, not one: herdr can
+// return an incomplete listing while it restarts, and a single such tick must
+// not purge escalations whose agents are alive and simply not listed yet.
+const autoAcceptAbsenceConfirmations = 2
+
+// autoAcceptEscalations delivers the suggestion of any escalation that has
+// waited past its configured threshold and whose situation is still
+// demonstrably live (FR-018's escape hatch: the operator's queue becomes a slow
+// lane rather than a hard stop).
+//
+// It runs as one more pass on the existing 1-minute sweep, reusing the agent
+// listing the sweep already fetched — no new ticker, goroutine or ListAgents
+// call. Eligibility derives from audit_log.created_at, so a daemon restart
+// never resets an escalation's waiting time.
+//
+// The pass is bounded to at most ONE auto-accept per agent per tick. Without
+// that, two escalations on one agent that age out together would both claim and
+// deliver into the same pane in immediate succession, and the staleness guard
+// would only incidentally catch the second — and only if its pane re-read
+// happened to land after the first delivery. One-per-agent makes that ordering
+// irrelevant rather than load-bearing.
+func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.AgentTransition) {
+	cfg, _, _ := d.snapshot()
+	now := d.opt.Clock.Now()
+
+	cutoffs := make(map[domain.SituationType]time.Time)
+	for _, st := range config_AutoAcceptTypes() {
+		if after, ok := cfg.AutoAcceptAfter(string(st)); ok {
+			cutoffs[st] = now.Add(-after)
+		}
+	}
+	if len(cutoffs) == 0 {
+		return // feature off, or every type disabled
+	}
+
+	// Guard 1a — FR-017: the kill switch stands the whole daemon down. Fail
+	// closed, and note this returns BEFORE any dismissal path: pausing the herd
+	// must never destroy the queue it protects, so while the kill switch is
+	// active this pass retires nothing for any reason.
+	kill, err := d.opt.Store.LatestKillEvent(ctx)
+	if err != nil {
+		slog.Warn("auto-accept: kill-switch read failed; skipping this sweep", "error", err)
+		return
+	}
+	if domain.KillStateActive(kill) {
+		return
+	}
+
+	candidates, err := d.opt.Store.AutoAcceptableEscalations(ctx, cutoffs)
+	if err != nil {
+		slog.Warn("auto-accept: candidate query failed; skipping this sweep", "error", err)
+		return
+	}
+
+	live := make(map[string]domain.AgentTransition, len(agents))
+	for _, a := range agents {
+		live[a.AgentID] = a
+	}
+
+	// Bookkeeping for entries that have left the eligible set, so the in-memory
+	// maps stay bounded by that set rather than by daemon uptime.
+	stillEligible := make(map[int64]bool, len(candidates))
+
+	handledAgent := make(map[string]bool)
+	accepted := 0
+
+	for i := range candidates {
+		rec := &candidates[i]
+		suggestion := domain.SuggestedAction(rec)
+		if why := domain.AutoAcceptIneligible(rec, suggestion); why != "" {
+			// Ineligible is NOT stale: the escalation stays pending for the
+			// operator. The missing-baseline case is logged once per run so an
+			// operator whose pre-upgrade backlog never auto-accepts can find
+			// out why from the logs rather than from the schema.
+			if why == "no signature baseline" {
+				d.logMissingBaselineOnce(rec)
+			}
+			continue
+		}
+		stillEligible[rec.ID] = true
+
+		// One per agent per tick; candidates arrive oldest-first, so the agent's
+		// longest-waiting escalation is the one taken.
+		if handledAgent[rec.AgentID] {
+			continue
+		}
+
+		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, now); outcome {
+		case autoAcceptDelivered:
+			handledAgent[rec.AgentID] = true
+			accepted++
+		case autoAcceptRetired:
+			// Dismissed. The agent is NOT marked handled: nothing was
+			// delivered to its pane, so another escalation of its may proceed.
+			delete(stillEligible, rec.ID)
+		case autoAcceptSkipped:
+			// Transient — left pending, reconsidered on a later tick.
+		}
+	}
+
+	if accepted > 0 {
+		// Per-tick count, so a deployment can judge whether a global ceiling is
+		// warranted before one is designed (there is none today by decision;
+		// one-per-agent-per-tick bounds the per-pane blast radius).
+		slog.Info("auto-accept: escalations accepted this sweep", "count", accepted)
+	}
+	d.pruneAutoAcceptState(stillEligible)
+}
+
+// autoAcceptOutcome distinguishes the three ends of one escalation's turn.
+type autoAcceptOutcome int
+
+const (
+	// autoAcceptSkipped: a transient condition, or a lost claim. Left pending.
+	autoAcceptSkipped autoAcceptOutcome = iota
+	// autoAcceptDelivered: the suggestion reached the pane.
+	autoAcceptDelivered
+	// autoAcceptRetired: a guard proved it can never be answered, or delivery
+	// attempts were exhausted. Dismissed with a recorded reason.
+	autoAcceptRetired
+)
+
+// autoAcceptOne runs the guard chain for a single escalation and, if it passes,
+// claims → delivers → finalizes.
+func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, suggestion string,
+	live map[string]domain.AgentTransition, now time.Time) autoAcceptOutcome {
+
+	agent, present := live[rec.AgentID]
+	if !present {
+		// Terminal, but only once confirmed: an incomplete listing during a
+		// herdr restart must not retire escalations whose agents are alive.
+		if !d.noteAgentAbsent(rec.ID) {
+			return autoAcceptSkipped
+		}
+		return d.autoDismiss(ctx, rec, domain.ReasonAutoDismissAgentGone,
+			"the agent no longer exists", now)
+	}
+	d.clearAgentAbsent(rec.ID)
+
+	// Guard 1b — a paused or operator-disabled agent is suppressed, never
+	// retired: a pause is a temporary operator control.
+	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID) {
+		return autoAcceptSkipped
+	}
+
+	// Guard 2 — a cheap pre-filter that avoids a pane read for agents that have
+	// obviously moved on. It admits the same parked set CaptureAgent accepts.
+	// A done -> idle flip during the wait passes, because that is precisely the
+	// transition escalationDedupWindow exists to absorb. This is NOT the
+	// authoritative staleness check; Guard 3 is.
+	switch agent.Status {
+	case "blocked", "idle", "done":
+	default:
+		return autoAcceptSkipped
+	}
+
+	// Guard 3 — the authoritative one.
+	switch d.autoAcceptSituationHeldStill(ctx, rec, agent) {
+	case heldStillUnevaluable:
+		// Absence of evidence is never evidence of staleness: an unreadable
+		// pane or unreachable herdr leaves the escalation pending, however long
+		// the outage lasts.
+		return autoAcceptSkipped
+	case heldStillNo:
+		return d.autoDismiss(ctx, rec, domain.ReasonAutoDismissStale,
+			"the situation is no longer on screen", now)
+	}
+
+	// Claim BEFORE delivering. ClaimForAutoAccept is a status-guarded atomic
+	// update, so an operator confirming this same escalation right now cannot
+	// produce a double send: exactly one writer wins, and only the winner
+	// delivers.
+	claimed, err := d.opt.Store.ClaimForAutoAccept(ctx, rec.ID)
+	if err != nil {
+		slog.Warn("auto-accept: claim failed", "audit_id", rec.ID, "error", err)
+		return autoAcceptSkipped
+	}
+	if !claimed {
+		// Another writer won — typically the operator confirming manually.
+		// Silent by design; nothing went wrong.
+		return autoAcceptSkipped
+	}
+
+	if err := d.autoAcceptDeliver(ctx, rec, suggestion); err != nil {
+		return d.autoAcceptDeliveryFailed(ctx, rec, err, now)
+	}
+
+	// Finalize. Note what is NOT here: no CorrectionRecord is written, so an
+	// automatic acceptance contributes no learning event, no confidence and no
+	// graduation progress. A machine's decision to stop waiting is not evidence
+	// the suggestion was right.
+	ok, err := d.opt.Store.MarkAutoAccepted(ctx, rec.ID)
+	if err != nil {
+		slog.Warn("auto-accept: finalize failed after a successful delivery",
+			"audit_id", rec.ID, "error", err)
+	} else if !ok {
+		// Zero rows is a no-op, not an error: another writer already moved the
+		// row. This tolerance is what makes the startup reclaim safe when two
+		// daemon processes briefly overlap during a binary handoff.
+		slog.Info("auto-accept: row was no longer claimed at finalize; delivery already happened",
+			"audit_id", rec.ID)
+	}
+	d.clearAutoAcceptAttempts(rec.ID)
+	slog.Info("auto-accept: delivered an aged escalation",
+		"audit_id", rec.ID, "agent", rec.AgentID, "situation", rec.SituationType,
+		"waited", now.Sub(rec.CreatedAt).Round(time.Second).String(),
+		"action", truncateRunes(suggestion, 120))
+	return autoAcceptDelivered
+}
+
+// autoAcceptDeliver sends the suggestion through the shared reply pipeline —
+// the same fail-closed implementation the operator's confirm uses, so the two
+// paths cannot drift on delivery or safety behavior.
+//
+// The send runs inside the cross-process per-agent lifecycle barrier, so an
+// operator disabling the agent cannot commit mid-delivery.
+func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord, suggestion string) error {
+	var deliverErr error
+	sent := false
+	disabled, err := d.opt.Store.WithAgentAutomation(ctx, rec.AgentID, func() {
+		deliverErr = deliver.Deliver(ctx, deliver.Config{
+			Herdr:     d.opt.Herdr,
+			Read:      d.readVisible,
+			ReadLines: d.opt.PaneReadLines,
+		}, deliver.Request{
+			PaneID:        rec.AgentID,
+			AgentType:     rec.AgentType,
+			SituationType: rec.SituationType,
+			PaneExcerpt:   rec.PaneExcerpt,
+			Outbound:      domain.MaterializeForSend(suggestion, rec),
+		})
+		sent = deliverErr == nil
+	})
+	switch {
+	case err != nil:
+		return err
+	case disabled:
+		// The operator turned this agent off. Not a delivery fault and not a
+		// reason to retire the escalation — it simply waits.
+		return errAgentDisabled
+	case !sent:
+		return deliverErr
+	}
+	return nil
+}
+
+// autoAcceptDeliveryFailed applies the bounded-retry policy: revert the claim
+// so the row is re-evaluated on a later tick, or retire it once the attempt
+// budget is spent.
+func (d *Daemon) autoAcceptDeliveryFailed(ctx context.Context, rec *domain.AuditRecord,
+	cause error, now time.Time) autoAcceptOutcome {
+
+	// A disabled agent is suppression, not failure: it must not burn an
+	// attempt, or an agent left off for a few minutes would exhaust the budget
+	// and lose its escalation.
+	if errors.Is(cause, errAgentDisabled) {
+		if ok, err := d.opt.Store.RevertAutoAccept(ctx, rec.ID); err != nil || !ok {
+			slog.Warn("auto-accept: could not return a claimed escalation to the queue",
+				"audit_id", rec.ID, "claimed", ok, "error", err)
+		}
+		return autoAcceptSkipped
+	}
+
+	attempts := d.noteAutoAcceptAttempt(rec.ID)
+	if attempts >= maxAutoAcceptAttempts {
+		slog.Warn("auto-accept: giving up after repeated delivery failures",
+			"audit_id", rec.ID, "agent", rec.AgentID, "attempts", attempts, "error", cause)
+		d.clearAutoAcceptAttempts(rec.ID)
+		return d.autoDismiss(ctx, rec, domain.ReasonAutoAcceptFailed,
+			fmt.Sprintf("delivery failed %d times: %v", attempts, cause), now)
+	}
+	slog.Warn("auto-accept: delivery failed; returning the escalation to the queue",
+		"audit_id", rec.ID, "agent", rec.AgentID, "attempt", attempts, "error", cause)
+	// Back to 'escalated', so the claim guard is satisfiable again next tick —
+	// the retry loop closes through the database, not through memory.
+	if ok, err := d.opt.Store.RevertAutoAccept(ctx, rec.ID); err != nil || !ok {
+		slog.Warn("auto-accept: could not return a claimed escalation to the queue",
+			"audit_id", rec.ID, "claimed", ok, "error", err)
+	}
+	return autoAcceptSkipped
+}
+
+// autoDismiss retires an escalation the pass has proven cannot be answered,
+// recording WHICH condition terminated it. It reuses the existing 'dismissed'
+// status: an automatic dismissal is behaviorally identical to an operator's
+// (nothing sent, nothing learned, the audit row retained per FR-020), so only
+// the reason is new, and the reason rides in the rationale.
+//
+// This is reachable from exactly three places — a negative Guard 3, confirmed
+// agent absence, and attempt exhaustion. Nothing else in this pass may dismiss.
+func (d *Daemon) autoDismiss(ctx context.Context, rec *domain.AuditRecord,
+	reason, detail string, now time.Time) autoAcceptOutcome {
+
+	tag := "[" + reason + "]"
+	if detail != "" {
+		tag += " " + detail
+	}
+	ok, err := d.opt.Store.DismissEscalationWithReason(ctx, rec.ID, tag)
+	if err != nil {
+		slog.Warn("auto-accept: dismissal failed", "audit_id", rec.ID, "error", err)
+		return autoAcceptSkipped
+	}
+	if !ok {
+		// Another writer got there first (an operator resolving or dismissing).
+		return autoAcceptSkipped
+	}
+	d.clearAutoAcceptAttempts(rec.ID)
+	d.clearAgentAbsent(rec.ID)
+	slog.Info("auto-accept: escalation auto-dismissed",
+		"audit_id", rec.ID, "agent", rec.AgentID, "situation", rec.SituationType,
+		"reason", reason, "detail", detail,
+		"waited", now.Sub(rec.CreatedAt).Round(time.Second).String())
+	return autoAcceptRetired
+}
+
+// autoAcceptAgentSuppressed reports whether the agent is paused or
+// operator-disabled. Fails CLOSED: an unreadable state suppresses rather than
+// licenses an unattended send.
+func (d *Daemon) autoAcceptAgentSuppressed(ctx context.Context, agentID string) bool {
+	disabled, err := d.opt.Store.AgentDisabled(ctx, agentID)
+	if err != nil {
+		slog.Warn("auto-accept: agent-disabled read failed; skipping", "agent", agentID, "error", err)
+		return true
+	}
+	if disabled {
+		return true
+	}
+	rate, err := d.opt.Store.GetAgentRate(ctx, agentID)
+	if err != nil {
+		slog.Warn("auto-accept: agent-rate read failed; skipping", "agent", agentID, "error", err)
+		return true
+	}
+	// Paused is the runaway guard's own stand-down, awaiting a human check-in.
+	// An auto-accept is not counted against the [limits] ceilings — it answers a
+	// question the AGENT asked and for which the system already held a
+	// suggestion, so it is not an unsolicited auto-prompt — but a pause that is
+	// already in force is still honoured.
+	return rate != nil && rate.Paused
+}
+
+// config_AutoAcceptTypes lists the situation types the auto-accept section
+// covers, as domain values.
+func config_AutoAcceptTypes() []domain.SituationType {
+	return []domain.SituationType{
+		domain.SituationApproval,
+		domain.SituationChoice,
+		domain.SituationError,
+		domain.SituationIdle,
+		domain.SituationUnclassifiable,
+	}
+}
+
+// ---- in-memory bookkeeping -------------------------------------------------
+//
+// Both maps are deliberately NOT persisted and are keyed by audit id. A restart
+// clears them, which is the desired behavior in both cases: a fresh delivery
+// budget (a restart may itself be the fix) and a fresh absence observation (an
+// absence must be confirmed by THIS daemon across consecutive ticks).
+
+// noteAutoAcceptAttempt records a failed delivery and returns the running count.
+func (d *Daemon) noteAutoAcceptAttempt(auditID int64) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.autoAcceptAttempts[auditID]++
+	return d.autoAcceptAttempts[auditID]
+}
+
+func (d *Daemon) clearAutoAcceptAttempts(auditID int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.autoAcceptAttempts, auditID)
+}
+
+// noteAgentAbsent records that this escalation's agent was missing from the
+// listing, returning whether absence is now CONFIRMED across enough
+// consecutive sweeps to act on.
+func (d *Daemon) noteAgentAbsent(auditID int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.autoAcceptAbsent[auditID]++
+	return d.autoAcceptAbsent[auditID] >= autoAcceptAbsenceConfirmations
+}
+
+// clearAgentAbsent discards a pending absence observation — the agent is back,
+// so the consecutive run is broken.
+func (d *Daemon) clearAgentAbsent(auditID int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.autoAcceptAbsent, auditID)
+}
+
+// pruneAutoAcceptState drops bookkeeping for audit ids that no longer appear in
+// the eligible set, so the maps stay bounded by that set rather than by daemon
+// uptime.
+func (d *Daemon) pruneAutoAcceptState(stillEligible map[int64]bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id := range d.autoAcceptAttempts {
+		if !stillEligible[id] {
+			delete(d.autoAcceptAttempts, id)
+		}
+	}
+	for id := range d.autoAcceptAbsent {
+		if !stillEligible[id] {
+			delete(d.autoAcceptAbsent, id)
+		}
+	}
+}
+
+// logMissingBaselineOnce reports, once per daemon run, that escalations are
+// being skipped for want of a baseline. Rows raised before the baseline
+// migration carry none and are never backfilled, so they are permanently
+// operator-only — expected, but invisible without this line.
+func (d *Daemon) logMissingBaselineOnce(rec *domain.AuditRecord) {
+	d.mu.Lock()
+	already := d.autoAcceptBaselineWarned
+	d.autoAcceptBaselineWarned = true
+	d.mu.Unlock()
+	if already {
+		return
+	}
+	slog.Info("auto-accept: skipping escalations raised before the signature baseline existed; "+
+		"they stay operator-only (confirm them, or clear them with `hap escalations prune`)",
+		"example_audit_id", rec.ID)
+}
+
+// heldStill is Guard 3's three-valued result. The third value matters: a guard
+// that could not be EVALUATED is not a guard that returned "no", and conflating
+// them would let an unreadable pane retire live escalations.
+type heldStill int
+
+const (
+	// heldStillUnevaluable: the pane could not be read, or classification
+	// produced nothing. Transient — leave pending, dismiss nothing.
+	heldStillUnevaluable heldStill = iota
+	// heldStillYes: the live pane still presents the escalated situation.
+	heldStillYes
+	// heldStillNo: the guard evaluated and proved the situation is gone.
+	heldStillNo
+)
+
+// autoAcceptSituationHeldStill re-reads the agent's live pane and asks whether
+// it still shows the situation this escalation was raised for.
+//
+// This is the load-bearing guard. After a 15-minute wait the pane may show a
+// completely different prompt, and delivering "1" would answer a question
+// nobody asked. An EXACT re-comparison fails the other way — agent TUIs repaint
+// continuously — so this reuses domain.SignatureHeldStill with the existing
+// staleDeferredSendJitterPercent, unchanged: one semantics, one comparator, no
+// fork of the tolerance. That function is stricter than a flat similarity
+// threshold sounds: it short-circuits on an exact hash match, refuses
+// over-masked signatures outright, and keeps STRUCTURED salients (an approval's
+// verb + option set, a choice's option set, an error summary — exactly the
+// three types enabled by default) on exact matching.
+//
+// Two properties are essential and easy to break:
+//
+//   - prev is rehydrated DIRECTLY from the persisted sig_* columns. It must
+//     never be reconstructed by re-classifying PaneExcerpt: that yields an
+//     unstructured pane-tail salient against a structured fresh one, which
+//     SignatureHeldStill refuses outright — every approval and choice would
+//     silently degrade into a stale dismissal and the feature would look
+//     enabled while never firing.
+//
+//   - fresh is computed with the ROW's salient window, not the currently
+//     configured one, so an operator editing embedding.pane_salient_chars
+//     during the wait cannot shift the comparison basis and manufacture a
+//     spurious staleness.
+func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.AuditRecord,
+	agent domain.AgentTransition) heldStill {
+
+	prev, ok := domain.AutoAcceptBaseline(rec)
+	if !ok {
+		// Eligibility already refused these; belt and braces.
+		return heldStillUnevaluable
+	}
+
+	_, _, cls := d.snapshot()
+	pane, err := d.readVisible(ctx, paneIDFor(rec, agent), d.opt.PaneReadLines)
+	if err != nil {
+		slog.Debug("auto-accept: pane re-read failed; leaving the escalation pending",
+			"audit_id", rec.ID, "agent", rec.AgentID, "error", err)
+		return heldStillUnevaluable
+	}
+	// Classify under the status the ESCALATED situation is expressible at, not
+	// the agent's live status.
+	//
+	// The classifier treats status as a mode selector: the very same approval
+	// menu classifies as `approval` at "blocked" but as `idle` at "idle"/"done".
+	// An agent that was blocked when the escalation was raised and has since
+	// flipped to idle — exactly the transition Guard 2 is required to absorb,
+	// and the one escalationDedupWindow exists for — would then fail the type
+	// assertion below on every tick and be dismissed as stale while its
+	// question sat plainly on screen. The feature would look like it was
+	// working and would in fact retire the escalations it exists to answer.
+	//
+	// This does not weaken the guard: the question being asked is "is the
+	// escalated situation still on screen?", so handing the classifier the mode
+	// that situation lives in is what makes the answer meaningful. A pane that
+	// has genuinely moved on still yields a different type (or a different
+	// signature) and is still dismissed — see the stale-situation tests.
+	current := cls.Classify(rec.AgentType, classifyStatusFor(rec.SituationType),
+		truncateTailRunes(pane, snapshotMaxRunes))
+	current.AgentID, current.PaneID, current.WorkspaceID = rec.AgentID, agent.PaneID, agent.WorkspaceID
+	current.Status = agent.Status
+
+	// SignatureHeldStill deliberately does NOT compare situation type (the type
+	// is folded into the hash, so fuzzy-path callers must assert it), and the
+	// existing deferred-send call sites do exactly this.
+	if current.Type != rec.SituationType {
+		slog.Debug("auto-accept: situation type changed",
+			"audit_id", rec.ID, "was", rec.SituationType, "now", current.Type)
+		return heldStillNo
+	}
+
+	fresh := domain.ComputeSignatureN(current, prev.SalientChars)
+	if !domain.SignatureHeldStill(prev, fresh, staleDeferredSendJitterPercent) {
+		return heldStillNo
+	}
+	if fresh.Raw != prev.Raw {
+		slog.Debug("auto-accept: pane drifted within the jitter tolerance; proceeding",
+			"audit_id", rec.ID, "jitter_percent", staleDeferredSendJitterPercent)
+	}
+	return heldStillYes
+}
+
+// paneIDFor resolves which pane to read. An agent id IS a pane id in herdr, but
+// the live listing is authoritative: it reflects the pane as it exists now.
+func paneIDFor(rec *domain.AuditRecord, agent domain.AgentTransition) string {
+	if agent.PaneID != "" {
+		return agent.PaneID
+	}
+	return rec.AgentID
+}
+
+// errAgentDisabled marks a delivery that did not happen because the operator
+// had turned the agent off. It is suppression, not failure: it must not burn a
+// delivery attempt, or an agent left disabled for a few minutes would exhaust
+// the budget and lose its escalation to a spurious auto_accept_failed.
+var errAgentDisabled = errors.New("agent automation is disabled")
+
+// classifyStatusFor returns the herdr status a situation of this type is
+// classified under. The classifier uses status as a mode selector — an idle
+// situation only surfaces at "idle", everything else at "blocked" — so
+// re-classifying a pane to check whether a PARTICULAR situation is still shown
+// must supply the matching mode. Mirrors the convention the test harness uses
+// when seeding a signature.
+func classifyStatusFor(st domain.SituationType) string {
+	if st == domain.SituationIdle {
+		return "idle"
+	}
+	return "blocked"
+}

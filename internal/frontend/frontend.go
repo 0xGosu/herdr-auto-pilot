@@ -1436,61 +1436,19 @@ func (a *App) PruneEscalations(ctx context.Context, olderThan time.Duration) (in
 }
 
 // SuggestedAction extracts the confirmable action from an escalation.
-// Keep in sync with the daemon's suggestionAction.
+//
+// It delegates to the domain so the operator-confirm path and the daemon's
+// auto-accept pass resolve a suggestion identically — the two must agree on
+// what "confirming this escalation" means, or the daemon would auto-accept
+// something different from what the operator sees offered.
 func SuggestedAction(audit *domain.AuditRecord) string {
-	sug := audit.Suggestion
-	// An idle task suggestion is confirmed into a tasks.md + task source, not
-	// sent to the pane as literal text — recognize it before the send-oriented
-	// prefixes below.
-	if strings.HasPrefix(sug, domain.SuggestTaskPrefix) {
-		return domain.SuggestGenerateTask
-	}
-	sug = stripSourcePrefix(sug)
-	for _, p := range []string{"send next declared task: ", "send inferred next task: "} {
-		if len(sug) > len(p) && sug[:len(p)] == p {
-			if p == "send next declared task: " {
-				return domain.ActionNextDeclaredTask
-			}
-			return domain.ActionNextInferredTask
-		}
-	}
-	// The human-readable "do nothing" suggestion round-trips to the sentinel
-	// so a confirmed noop is learned as @noop, never sent as literal text.
-	if sug == domain.ActionNoopSuggestion {
-		return domain.ActionNoop
-	}
-	return sug
-}
-
-// stripSourcePrefix removes the leading "who suggested this and how" label from
-// an escalation suggestion, leaving the action-bearing remainder. The
-// task-send prefixes are deliberately NOT here: they can ride behind
-// "LLM suggested: ", so both layers must be peeled in order.
-func stripSourcePrefix(sug string) string {
-	for _, p := range []string{"respond: ", "choose: ", "answer series: ", "on error: ", "LLM suggested: "} {
-		if len(sug) > len(p) && sug[:len(p)] == p {
-			return sug[len(p):]
-		}
-	}
-	return sug
+	return domain.SuggestedAction(audit)
 }
 
 // materializeForSend converts symbolic learned actions into the concrete
-// suggestion text when the operator asks to send. It peels the source prefix
-// first, exactly as SuggestedAction does: an LLM task review suggests
-// "LLM suggested: send next declared task: <text>", and matching the task-send
-// prefix against the unpeeled string would miss, returning the raw
-// "@next_task:declared" sentinel — which Resolve would then type into the pane.
+// suggestion text when the reply is actually to be sent.
 func materializeForSend(action string, audit *domain.AuditRecord) string {
-	if action == domain.ActionNextDeclaredTask || action == domain.ActionNextInferredTask {
-		sug := stripSourcePrefix(audit.Suggestion)
-		for _, p := range []string{"send next declared task: ", "send inferred next task: "} {
-			if len(sug) > len(p) && sug[:len(p)] == p {
-				return sug[len(p):]
-			}
-		}
-	}
-	return action
+	return domain.MaterializeForSend(action, audit)
 }
 
 // Config returns the current operator configuration.
