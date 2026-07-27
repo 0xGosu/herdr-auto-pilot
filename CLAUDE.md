@@ -285,5 +285,8 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
 | `internal/mcpserver` | stdio MCP server (`get_context`, `submit_decision`) |
 | `internal/herdr` | herdr CLI + events-socket adapters |
 | `internal/store` | SQLite persistence (WAL; `context_json` is an opaque blob) |
+| `internal/taskfile` | advisory file lock behind every checklist read-modify-write |
+| `internal/selfpath` | resolves a live `hap` binary (an upgrade unlinks the running one) |
+| `internal/updatecheck` | GitHub release check — the ONLY `net/http` importer (NFR-007 allowlist) |
 | `internal/fakeherdr`, `e2e_harness/` | test fakes and the e2e driver |
 | `docs/architect/herd-auto-prompter-architecture.md` | consolidated architecture doc (FR-xxx / NFR-xxx ids used in comments) |

@@ -1351,7 +1351,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	fs := flag.NewFlagSet("task-source", flag.ContinueOnError)
 	agent := fs.String("agent", "", "agent short name, id, or type this source applies to")
 	workspace := fs.String("workspace", "", "workspace name this source applies to (\"*\" wildcards, e.g. \"codex-*\")")
-	template := fs.String("template", "", "next-task prompt template ({next_task_content}, {task_list_path}, {task_list_path_quoted}, {agent_name} placeholders)")
+	template := fs.String("template", "", "next-task prompt template ({next_task_content}, {task_list_path}, {task_list_path_quoted}, {agent_name}, {cwd} placeholders)")
 	autoSend := fs.Bool("auto-send-when-idle", false, "also hand out tasks on the periodic idle poll, not only on a herdr attention event")
 	llmReview := fs.Bool("enable-llm-review-before-auto-send", false, "let the configured [llm].command revise the task list and pick the task, immediately before the daemon auto-sends one (never applies to a manual `task send`)")
 	maxTasks := fs.Int("max-tasks", config.DefaultMaxTasks, "cap on how many checklist items this source may hold before task generation stops refilling it")
@@ -1388,13 +1388,28 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	// Unprompted hand-out is the one setting that makes hap act without a herdr
 	// event, so say so plainly instead of leaving it to `task-source list`.
 	if *autoSend {
-		fmt.Fprintln(out, "auto-send when idle is ON: matching idle agents are handed their next pending task without an attention event")
+		fmt.Fprintln(out, autoSendOnMessage)
 	}
 	if *llmReview {
-		fmt.Fprintln(out, "LLM review before sending is ON: each determined task is reviewed by the configured [llm].command, and a decline is escalated to you")
+		fmt.Fprintln(out, llmReviewOnMessage)
 	}
 	return nil
 }
+
+// autoSendOnMessage and llmReviewOnMessage explain a delivery-gate flag the
+// moment it is switched on. `task-source add` and `task-source set` both print
+// them, so they are shared rather than duplicated: the add path went on
+// promising "a decline is escalated to you" for two releases after #255 made
+// the review a pre-delivery filter that never escalates, purely because the two
+// copies could drift.
+const (
+	autoSendOnMessage = "auto-send when idle is ON: matching idle agents are handed their next pending task without an attention event"
+
+	llmReviewOnMessage = "LLM review before auto-send is ON: immediately before the daemon sends a task, " +
+		"the configured [llm].command may revise the list and pick which task goes. A review that fails " +
+		"or scores below auto_act_confidence_threshold sends the original task unchanged — it never " +
+		"escalates. A task you send by hand is never reviewed."
+)
 
 // taskSourceSet edits one setting of an existing task source — the CLI twin of
 // the TUI Config tab's enter on a task-source row. Only the settings that are
@@ -1402,7 +1417,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 // and the cap; path/agent/workspace are remove-and-re-add, since changing them
 // silently re-points an agent's work.
 func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	const usage = "usage: task-source set <index> <auto-send-when-idle|enable-llm-review|max-tasks> <value> (see: task-source list, hap help task-source)"
+	const usage = "usage: task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks> <value> (see: task-source list, hap help task-source)"
 	if len(args) != 3 {
 		return fmt.Errorf("%s", usage)
 	}
@@ -1432,7 +1447,7 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 		}
 		fmt.Fprintf(out, "task source #%d: auto_send_when_idle=%v\n", idx, on)
 		if on {
-			fmt.Fprintln(out, "auto-send when idle is ON: matching idle agents are handed their next pending task without an attention event")
+			fmt.Fprintln(out, autoSendOnMessage)
 		}
 		return nil
 	case "enable-llm-review-before-auto-send", "enable_llm_review_before_auto_send":
@@ -1445,7 +1460,7 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 		}
 		fmt.Fprintf(out, "task source #%d: enable_llm_review_before_auto_send=%v\n", idx, on)
 		if on {
-			fmt.Fprintln(out, "LLM review before auto-send is ON: immediately before the daemon sends a task, the configured [llm].command may revise the list and pick which task goes. A review that fails or scores below auto_act_confidence_threshold sends the original task unchanged — it never escalates. A task you send by hand is never reviewed.")
+			fmt.Fprintln(out, llmReviewOnMessage)
 		}
 		return nil
 	case "enable-llm-review", "enable_llm_review", "llm-review", "llm_review":

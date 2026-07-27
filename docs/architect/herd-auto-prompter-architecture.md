@@ -3,7 +3,7 @@
 > **Single source of truth** for the Herd Auto Prompter Herdr plugin's design.
 > Consolidated from the original constitution, requirements, and solution specs
 > (now removed) and **reconciled against the shipped code** (module
-> `github.com/0xGosu/herdr-auto-pilot`, manifest `herd-auto-prompter` v0.4.24,
+> `github.com/0xGosu/herdr-auto-pilot`, manifest `herd-auto-prompter` v0.5.3,
 > `min_herdr_version` 0.7.0). This document is the authoritative single-page view
 > of *what the system is and why it is built this way*, current to the code, and
 > still carries the requirement ids (FR/NFR/DR/IR) that code comments reference.
@@ -50,8 +50,10 @@ These principles are load-bearing — every design decision below traces to one.
    action it cannot explain. *Every optional subsystem (semantic matching, LLM
    fallback, task generation) degrades rather than blocks.*
 6. **Local and private by default.** Learning data, history, and audit logs stay
-   on the operator's machine. No telemetry. Data leaves only through the local
-   LLM CLI the operator explicitly configures.
+   on the operator's machine. No telemetry. Operator data leaves only through the
+   local LLM CLI the operator explicitly configures. The one other outbound call
+   is the opt-out GitHub release check (NFR-007, §13), which sends no data and
+   only reads the latest release tag.
 7. **Reversible and interruptible.** A global pause/kill switch halts all
    automation instantly; irreversible operations are never automated.
 8. **Host-respecting integration.** Herdr owns the host surface; the plugin uses
@@ -77,7 +79,7 @@ Single **Operator** role; multi-user access is explicitly out of scope.
 |---|---|---|
 | Language / distribution | **Go**, single static binary; subcommands `daemon` / `tui` / `mcp` / `embed-worker` / CLI verbs | No runtime dependency; strong concurrency for the monitor loop |
 | Herdr events | **Raw socket** `events.subscribe` (JSON) | Long-lived agent-status subscription |
-| Herdr actions | **CLI via `HERDR_BIN_PATH`** (`agent send`, `pane read`, `pane send-keys`, `pane get`, `pane zoom`, `agent list`, `notification show`) | Portable across Unix socket / Windows named pipe |
+| Herdr actions | **CLI via `HERDR_BIN_PATH`** (`agent send`, `pane read`, `pane send-keys`, `pane get`, `pane zoom`, `agent list`, `notification show`, plus `tab focus`, `workspace list`, `tab list` behind the optional `FocusPort`/`LocatorPort`) | Portable across Unix socket / Windows named pipe |
 | History / audit | **Embedded SQLite (WAL)** | Transactional, corruption-safe concurrent access, queryable |
 | Operator config / rules | **TOML** in the plugin config dir | Hand-editable thresholds, never-auto patterns, classifier manifests, task sources, embedding tuning |
 | Daemon coordination | **Unix-domain control socket** (named pipe on Windows) | Sub-second reload propagation, no idle polling |
@@ -217,7 +219,19 @@ sequenceDiagram
 ## 6. System Modules
 
 Layered as `cmd → domain (pure) → adapters`, with `internal/daemon` the pipeline
-spine (`daemon.go`, `semantic.go`, `sweep.go`).
+spine (`daemon.go`, `semantic.go`, `sweep.go`, `autosendidle.go` — the idle poll,
+hand-out ledger and reclaim — and `tasklistreview.go` — the FR-011 pre-delivery
+review).
+
+Supporting packages not otherwise called out below: `internal/config` (TOML load
+/ save, defaults, clamps, and the deprecated-key migrations); `internal/logging`
+(`logging.Guard`, the panic fence NFR-004 depends on); `internal/taskfile` (the
+cross-platform advisory file lock behind the *locked read-modify-write* FR-011
+promises for checklist edits + `[-]` reservation); `internal/selfpath` (resolves a
+live `hap` binary for `{self}`, the embed worker, and daemon re-exec across plugin
+upgrades — an upgrade unlinks the running binary, so `os.Executable()` alone names
+a dead path); `internal/buildinfo` (ldflags-stamped version); `internal/updatecheck`
+(§13); and `internal/testutil`.
 
 ### Ports (adapter boundary — `internal/ports`)
 
@@ -263,8 +277,9 @@ The domain depends only on interfaces. **Core ports:** `HerdrPort` (send/read),
   didn't commit), because a digit commits on plain option lists but only moves
   the caret on preview forms. Never acts without a durably-committed audit record.
 - **Verify-unblock** *(`internal/verifyunblock`)* — after delivering a reply to a
-  blocked agent, re-queries status a moment later (`verify_unblock_ms`); if still
-  blocked, appends a `delivery_failed` diagnostic audit row.
+  blocked agent, re-queries status after a fixed 1s (`unblockCheckDelay`; the old
+  `limits.verify_unblock_ms` key is warned-and-ignored); if still blocked, appends
+  a `delivery_failed` diagnostic audit row.
 - **Escalation** *(daemon)* — routes uncertain paths to escalate + audit + notify,
   with a **dedup window** (fixed internal constants `escalationDedupWindow` +
   `escalationDedupJitterPercent` = 5% in the daemon package — not
@@ -372,7 +387,20 @@ TUI and CLI have identical functionality (FR-022): monitored agents, pending
 escalations, audit log + corrections, tasks, threshold/rule editing, pause/kill
 and its history. Operator-owned mutations are written directly to the DB/TOML in
 a transaction, then the daemon is nudged to reload. Front-ends never write
-daemon-owned hot-path rows.
+daemon-owned hot-path rows (with the two narrow exceptions listed in §11).
+
+Two conveniences are deliberately interactive-only and have no CLI twin: the
+Config tab's `/usr/local/bin/hap` symlink shortcut and the daemon-stderr viewer.
+
+**Self-update surface.** `internal/frontend/updatestatus.go` exposes the cached
+release check to both front-ends: the TUI header renders the running version and,
+when a newer release exists, `↑ vX.Y.Z available`; `hap update` performs the
+upgrade by shelling out to `herdr plugin install <repo> --yes`, then prints the
+`daemon --ensure` hand-over step naming the NEWLY installed binary by absolute
+path (an install does not repoint `hap` on `PATH`, so a bare `hap daemon --ensure`
+could hand the daemon back to the build just replaced). It refuses on a non-release
+(`plugin link`) build without `--force`, which would otherwise overwrite the
+developer's checkout. See §13 for the privacy carve-out the check needs.
 
 ## 7. Situation Signatures, Guards & Semantic Resolution
 
@@ -499,8 +527,13 @@ automated action.
   (`internal/domain/testdata/irreversible_corpus.txt`); CI fails if any entry
   goes unmatched.
 - **Suspected-irreversible heuristic.** A prompt showing destructive indicators
-  (`safety.indicator_rules`) but matching no allowlist pattern biases toward
-  escalation.
+  but matching no explicit never-auto pattern biases toward escalation. The
+  heuristic set is seed-only (`domain.SeedHeuristicNeverAutoRules`, kind
+  `NeverAutoHeuristic`) and is not operator-extensible: the old
+  `[[safety.indicator_rules]]` / `safety.irreversible_indicators` keys are
+  deprecated and, on load, merge into `never_auto_rules` / `never_auto_patterns`
+  as STRICT rules. Individual seed rules can be silenced by id via
+  `safety.disabled_seed_patterns` (`hap rules disable-seed`).
 - **Global pause/kill switch.** Instantly halts all automated prompting across the
   herd, from either the TUI or CLI. Implemented as an **append-only event table**
   — the daemon reads the *latest row every pipeline tick*, so a kill takes effect
@@ -510,7 +543,7 @@ automated action.
   prompts without intervening human interaction, and no more than **5 per
   minute** (`limits.max_consecutive_auto_prompts` default 30,
   `max_auto_prompts_per_minute` default 5). On either ceiling, automation for
-  that agent pauses and escalates. Unattended `auto_send_when_idle` task
+  that agent pauses and escalates. Unattended `enable_auto_send_task_when_idle` task
   hand-outs are exempt from the consecutive counter and never pause on the
   per-minute ceiling (they defer to a later sweep), since the operator opted
   into unattended repeated sending for that source.
@@ -557,6 +590,8 @@ erDiagram
     DECISIONS {
         int id PK
         text signature FK
+        text situation_type
+        text agent_type
         text chosen_action
         text source
         real confidence_at_decision
@@ -566,14 +601,23 @@ erDiagram
     AUDIT_LOG {
         int id PK
         int decision_id FK
+        text agent_id
+        text agent_type
+        text signature
+        text situation_type
         text trigger
+        text input
         text action_or_escalation
+        text status
+        text suggestion
         real confidence
         text rationale
         text match_method
         real match_score
         text embed_error
         text llm_output
+        int llm_confidence
+        text pane_excerpt
         int corrects_audit_id FK
         int created_at
     }
@@ -589,6 +633,10 @@ erDiagram
     }
     LLM_REQUESTS {
         text request_id PK
+        text signature
+        text situation_type
+        text agent_type
+        text agent_id
         text context_json
         text status
         int created_at
@@ -596,9 +644,15 @@ erDiagram
     LLM_DECISIONS {
         int id PK
         text request_id FK
+        text signature
+        text situation_type
+        text agent_type
         text action
         text option_id
+        text task_actions_json
+        text send_task
         int confident_score
+        text rationale
         text captured_output
         text status
         int created_at
@@ -628,18 +682,29 @@ erDiagram
 | **llm_retries** | Queue of audit rows to re-ask the LLM about |
 | **signature_embeddings** | **Semantic source of truth** — vector + salient per signature, scoped by situation/agent type |
 | **signature_snapshots** | Pane-excerpt provenance per signature (inspection/debugging) |
+| **task_reservations** | The `[-]` a daemon hand-out wrote, with the `terminal_id` that owns it — only a reservation hap itself holds may be released |
+| **task_handouts** | Durable ledger of unattended hand-outs (FR-011): confirms on a `working` transition, drives the ~2-min reclaim, and enforces the 3-hand-out ceiling |
 | **agent_names** | Friendly short-name mapping + per-agent disabled flag + terminal id |
 | **operator** | Single operator identity row anchoring correction/kill authorship |
 
 TOML config (not in SQLite): per-situation `confidence_thresholds` (+ the
 minimum-agreement floor is `confidence_thresholds.minimum`), `learning`
-(graduation N, confirmation
-weight), `limits` (error-retry ceiling, rate ceilings, escalation-dedup window +
-jitter), `safety` (never-auto + indicator rules, seed toggles), classifier
-manifests, `capture_delay`, `verify_unblock_ms`, `task_sources` (+ generate
-command), `embedding` (model_path, similarity/BM25 thresholds, gpu_layers,
-context window, disabled), `llm` (argv template + timeout, optional
-rewrite-action review), and `tui` palette.
+(graduation N, confirmation weight), `limits` (error-retry ceiling, rate
+ceilings — the escalation-dedup window and jitter are NOT configurable; they are
+fixed daemon constants), `safety` (never-auto patterns + rules, the global seed
+toggle, and `disabled_seed_patterns` for silencing one seed rule by id),
+classifier manifests, `capture_delay`, `task_sources` (+ generate command),
+`embedding` (model_path, similarity/BM25 thresholds, context window, stall
+guards, `pane_salient_chars`, disabled — embedding is CPU-only; `gpu_layers` is
+warned-and-ignored), `llm` (argv templates + timeouts, per-command env/env_file,
+optional rewrite-action review), `cli` (`ai_agent_friendly_output`), and `tui`
+(theme, palette, `max_content_width`/`height`, `terminal_bell`,
+`disable_check_for_update`).
+
+Removed keys still decoded only to warn and ignore: `limits.verify_unblock_ms`,
+`limits.escalation_dedup_window_seconds` / `escalation_dedup_jitter_percent`,
+`embedding.gpu_layers`, `embedding.max_consecutive_failures`,
+`confidence_thresholds.inferred_task_bar`, `llm.auto_act`.
 
 ## 11. Concurrency & Durability
 
@@ -653,10 +718,17 @@ Two concerns are kept separate:
 2. **Logical correctness** (no lost updates on hot rows) is solved by
    **write-ownership partitioning**:
    - **Daemon-exclusive (hot path):** `signatures` counters/mode, `agent_rate`,
-     `error_retries`, `signature_embeddings`, daemon-emitted `audit_log` /
-     `decisions`, and consumed-then-promoted `llm_requests`/`llm_decisions`. No
-     other process writes these, so the daemon's read-modify-write is race-free.
-   - **Front-end direct (operator-owned):** TOML config/rules, `corrections`,
+     `error_retries`, `signature_embeddings`, `task_reservations`/`task_handouts`,
+     daemon-emitted `audit_log` / `decisions`, and consumed-then-promoted
+     `llm_requests`/`llm_decisions`. The daemon is the only writer of the *hot
+     path* — the counters and state its read-modify-write depends on — so that
+     cycle is race-free. Two narrow, deliberate exceptions exist, and neither
+     touches a counter the daemon increments: a front-end may `UpsertSignature` /
+     `DeleteSignature` (the operator resetting or deleting a learned rule), and
+     may flip an existing `audit_log` row's escalation status via
+     `DismissEscalation` / `ResolveEscalation` / `DismissEscalationsBefore`.
+   - **Front-end direct (operator-owned):** TOML config/rules, `corrections`
+     (including the `sent` flip once an answer is delivered), `llm_retries`,
      `kill_events` — append-only inserts or independent rows.
    - **`mcp` staged:** `llm_decisions` inserts only; the daemon consumes these and
      derives any hot-path effect itself.
@@ -664,7 +736,7 @@ Two concerns are kept separate:
      daemon and front-ends (concurrent inserts converge; renames front-end-owned).
 
 **Propagation without polling.** After a direct/staged write, the writer sends a
-payload-free **nudge** over the daemon's control socket (`internal/control`); the
+**nudge** over the daemon's control socket (`internal/control`); the
 daemon reloads TOML and re-reads operator/staged rows — sub-second, no idle poll.
 The pause/kill switch is the exception that is *not* nudge-dependent: the daemon
 reads the latest `kill_events` row every tick, so a kill halts automation
@@ -677,12 +749,17 @@ immediately even if the nudge is delayed.
 - Actions (CLI via `HERDR_BIN_PATH`): `agent send` (writes text without Enter —
   follow with `pane send-keys <pane> enter`), `pane read` (`--source
   visible|recent`), `pane get` (cwd/ids), `pane zoom`, `agent list`,
-  `notification show`. *(Agent status is driven off the events socket, not a
-  `wait agent-status` CLI call.)*
+  `notification show`; plus `tab focus`, `workspace list` and `tab list` behind
+  the optional `FocusPort`/`LocatorPort`. *(Agent status is driven off the events
+  socket, not a `wait agent-status` CLI call.)*
 
 **Daemon control socket (internal).** Unix-domain socket (named pipe on Windows)
-in the plugin state dir. Messages: `{ "kind": "reload" | "wake" }` — no domain
-payload, idempotent and debounced.
+in the plugin state dir. Messages: `{ "kind": ... }` — idempotent and debounced.
+Four kinds: `reload`, `wake`, `reembed` (rebuild a fresh embedder, clearing the
+degraded-failure latch, and re-embed stored signatures), and `capture:<target>`
+(re-run the capture pipeline for one agent — the only kind carrying a payload,
+encoded in the kind so the one-field protocol stayed backward compatible).
+A daemon predating a kind logs and ignores it.
 
 **MCP tool surface (internal, exposed to the LLM agent — `internal/mcpserver`).**
 Exactly two tools:
@@ -690,7 +767,8 @@ Exactly two tools:
   `agent_type`, options / permission verb, history summary, and (for pre-send
   reviews) an optional `proposed_task` / `proposed_action`.
 - `submit_decision(request_id?, recommend_action?, select_options?,
-  confident_score, rationale)` — writes a `pending` `llm_decision` row and nudges
+  task_actions?, send_task?, confident_score, rationale)` — writes a `pending`
+  `llm_decision` row and nudges
   the daemon, which re-gates it before promoting/acting. **`confident_score`
   (0–100) is required** — the daemon auto-acts only when it meets the operator's
   threshold, else it surfaces the decision for confirmation. Per-situation
@@ -709,11 +787,14 @@ Exactly two tools:
   itself); a length mismatch between the answer series and `tab_count` is rejected
   rather than partially delivered.
 
-**Escalation error codes** — every rejected/failed path resolves to
-**escalate + audit**, never a silent drop: `unclassifiable`, `below_threshold`,
-`variance_guard`, `over_masked`, `never_auto_match`, `suspected_irreversible`,
-`rate_limited`, `retry_exhausted`, `daemon_paused`, `llm_timeout`,
-`llm_no_submit`, `herdr_unreachable`, `persistence_failed`.
+**Escalation reason codes** — every rejected/failed path resolves to
+**escalate + audit**, never a silent drop. The full set (`domain.EscalateReason`):
+`unclassifiable`, `below_threshold`, `variance_guard`, `over_masked`,
+`never_auto_match`, `suspected_irreversible`, `rate_limited`, `retry_exhausted`,
+`daemon_paused`, `llm_timeout`, `llm_no_submit`, `llm_low_confidence`,
+`herdr_unreachable`, `persistence_failed`, `shadow_mode`, `no_task_source`,
+`task_source_exhausted`, `noop_vs_pending_tasks`, `unfamiliar_options`,
+`no_history`, `graduation_pending`, `task_gen_failed`, `llm_retry`.
 
 ## 13. Security & Privacy
 
@@ -729,11 +810,14 @@ Exactly two tools:
   index live in the plugin's config/state dir with normal user permissions; the
   control socket is owner-only; the operator can clear/reset learned and audit
   data (`hap clear-data`). A dedicated no-egress test (`internal/privacy`) asserts
-  NFR-007. It allows exactly ONE outbound call, by name: the TUI's release check
+  NFR-007. It allows exactly ONE outbound call, by name: the release check
   (`internal/updatecheck/fetch.go`), which asks GitHub for the newest published
-  version at most every 6h, sends nothing about the operator or their panes, and
-  is switched off by `[tui] disable_check_for_update`. Every other file importing
-  `net/http` still fails the test.
+  version, sends nothing about the operator or their panes, and is switched off by
+  `[tui] disable_check_for_update`. The TUI drives it in the background at most
+  every 6h (a dev/`plugin link` build never checks at all); `hap update` performs
+  it on demand, since the operator asked for the upgrade. Every other file
+  importing `net/http` still fails the test, and a second test pins the allowlist
+  at that single entry.
 
 ## 14. Key Design Decisions
 
@@ -833,7 +917,7 @@ the sections they gate.
 | **FR-016** | Allowlist seeding, extension & coverage safety | Ship a corpus-validated seed allowlist, allow operator extension via TOML regex/keyword patterns, and bias toward escalation on destructive-looking prompts that match no pattern (suspected-irreversible heuristic). |
 | **FR-017** | Global pause / kill switch | Provide a global pause/kill switch (TUI + CLI) that instantly halts all automated prompting across the herd within a small bounded delay. |
 | **FR-018** | Escalation on uncertainty | Take no action and notify the operator whenever a situation is unclassifiable, below threshold, guard-tripped, suspected-irreversible, or otherwise ineligible for autonomous action. |
-| **FR-019** | Runaway-loop guard | Bound automated prompting per agent to ≤ `max_consecutive_auto_prompts` consecutive auto-prompts without intervening human interaction AND ≤ `max_auto_prompts_per_minute` per minute (defaults 30 and 5); on either ceiling, pause automation for that agent and escalate. Unattended `auto_send_when_idle` hand-outs are exempt from the consecutive counter and defer (never pause) on the per-minute ceiling. |
+| **FR-019** | Runaway-loop guard | Bound automated prompting per agent to ≤ `max_consecutive_auto_prompts` consecutive auto-prompts without intervening human interaction AND ≤ `max_auto_prompts_per_minute` per minute (defaults 30 and 5); on either ceiling, pause automation for that agent and escalate. Unattended `enable_auto_send_task_when_idle` hand-outs are exempt from the consecutive counter and defer (never pause) on the per-minute ceiling. |
 | **FR-020** | Full audit log | Record every automated decision and escalation with its trigger, situation type, chosen action (or escalation), confidence, rationale (rule/LLM), and timestamp. |
 | **FR-021** | Post-hoc correction | Let the operator review the audit log and correct any past automated decision, feeding the correction back into learning (per FR-007) and recording it in the audit trail. |
 | **FR-022** | Equivalent TUI and CLI | Expose a TUI (Herdr pane) and a CLI with identical functionality; mutations from either surface propagate promptly to the running daemon. |
@@ -870,7 +954,7 @@ the sections they gate.
 | Id | Title | Requirement (the plugin SHALL…) |
 |---|---|---|
 | **IR-001** | Herdr event subscription | Subscribe to Herdr agent-status transition events (raw socket `events.subscribe`) to drive monitoring without polling. |
-| **IR-002** | Herdr control actions | Send prompts/responses to agents and read pane content via Herdr's documented CLI commands (`agent send`, `pane read`, `pane get`, `pane send-keys`, `agent list`, `notification show`). |
+| **IR-002** | Herdr control actions | Send prompts/responses to agents and read pane content via Herdr's documented CLI commands (`agent send`, `pane read`, `pane get`, `pane send-keys`, `pane zoom`, `agent list`, `notification show`, and — behind optional ports — `tab focus`, `workspace list`, `tab list`). |
 | **IR-003** | Herdr notifications | Surface escalations and critical failures via Herdr notifications in addition to the TUI. |
 | **IR-004** | Herdr plugin manifest | Package as a Herdr plugin declaring id/version, pinned `min_herdr_version`, the TUI pane command, event hooks, and build steps in `herdr-plugin.toml`. |
 | **IR-005** | Local LLM CLI | Integrate an optional, operator-configured local LLM/agent CLI for the hybrid decision fallback, treating its absence or failure as an escalation trigger. |

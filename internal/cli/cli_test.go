@@ -2395,8 +2395,15 @@ func TestTaskSourceAddLLMReview(t *testing.T) {
 			if got := saved.TaskSources[0].ReviewBeforeAutoSendEnabled(); got != tc.want {
 				t.Errorf("enable_llm_review_before_auto_send = %v, want %v", got, tc.want)
 			}
-			if said := strings.Contains(out, "LLM review before sending is ON"); said != tc.want {
+			if said := strings.Contains(out, "LLM review before auto-send is ON"); said != tc.want {
 				t.Errorf("success output announced the review = %v, want %v; got:\n%s", said, tc.want, out)
+			}
+			// The add path told operators "a decline is escalated to you" long
+			// after #255 made the review a pre-delivery filter that never
+			// escalates — the very behaviour that used to force this flag to be
+			// exclusive with auto-send. It must now agree with `task-source set`.
+			if tc.want && !strings.Contains(out, "never escalates") {
+				t.Errorf("turning the review ON must say it never escalates, got:\n%s", out)
 			}
 		})
 	}

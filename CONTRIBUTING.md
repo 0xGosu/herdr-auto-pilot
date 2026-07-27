@@ -36,14 +36,17 @@ gofmt -l . | grep -v submodule ; go vet -tags "vectors cpu" ./...
 golangci-lint run --build-tags "vectors,cpu" # lint (CI runs this too)
 ```
 
+Both tags are always required — a build without them fails to link, so there is
+no tag-free shortcut for a quick check.
+
 Golden classifier fixtures live in `internal/classify/testdata/`; regenerate
-expectations with `UPDATE_GOLDEN=1 go test ./internal/classify/` and review
-the diff carefully.
+expectations with `UPDATE_GOLDEN=1 go test -tags "vectors cpu" ./internal/classify/`
+and review the diff carefully.
 
 To exercise your working tree inside Herdr:
 
 ```sh
-go build -o bin/hap ./cmd/hap
+go build -tags "vectors cpu" -o bin/hap ./cmd/hap
 herdr plugin link .
 ```
 
@@ -51,19 +54,46 @@ herdr plugin link .
 
 1. Fork/branch from `main`.
 2. Keep PRs focused; include tests for behavior changes.
-3. Make sure `go test ./...`, `gofmt`, `go vet`, and `golangci-lint` pass —
-   CI gates on all of them plus the never-auto patterns-corpus regression.
+3. Make sure the tagged commands above pass — `go test -tags "vectors cpu" ./...`,
+   `gofmt`, `go vet`, and `golangci-lint`. CI gates on all of them, plus:
+   - the never-auto patterns-corpus regression (`corpus-gate`);
+   - a **race-detector** job over `internal/{store,domain,control,embedder,match,daemon}`,
+     retried up to 3 times because the detector is flaky under CI load;
+   - a **macOS** matrix leg, where test binaries need `-ldflags "-r /usr/local/lib"`
+     to reach the FAISS dylibs.
 4. Describe *what* and *why* in the PR body; link related issues.
+
+Never put `[skip ci]`, `[ci skip]`, or `[no ci]` anywhere in the squash-merge
+message (title or body) of a PR that should release. GitHub suppresses *all*
+workflows for a ref whose head commit carries one — including the release tag
+push onto that commit — so the release silently never builds.
 
 ## Release flow (maintainers)
 
-1. Update `version` in `herdr-plugin.toml` to `X.Y.Z`.
-2. Tag the same commit: `git tag vX.Y.Z && git push origin main vX.Y.Z`.
-3. The Release workflow runs the full CI gate, builds Linux/macOS binaries,
-   and publishes a GitHub Release.
+Releases are **automated on merge to `main`** (`.github/workflows/auto-release.yml`).
+`version` in `herdr-plugin.toml` is the single source of truth, and it always
+names a version whose GitHub release already exists — it *trails* releases,
+never leads them.
+
+- **Patch (the default): do nothing.** Merge the feature PR. The workflow sees
+  the manifest version already tagged, computes the next patch, squash-merges a
+  bump PR (`release/bump-vX.Y.Z+1`, commit marked `[skip release]`), and tags
+  that bump commit — which fires the tag-driven `release.yml`. Do not bump the
+  manifest by hand for patch work.
+- **Minor/major (the reserved manual path):** overwrite `version` in
+  `herdr-plugin.toml` *inside* your feature PR (e.g. `0.6.0`). On merge the
+  workflow finds that version untagged, skips the bump, and tags the merge
+  commit directly.
+
+`release.yml` then runs the full CI gate and builds on three native runners
+(CGO cannot cross-compile), publishing the platform binaries, the per-platform
+native tarballs, the embedding model, and `SHA256SUMS`.
 
 The manifest version and the tag MUST match: `herdr plugin install` runs
 `scripts/install.sh`, which downloads the release asset for the version
 declared in `herdr-plugin.toml` (that's what removes the Go-toolchain
-dependency for users). Pushing a manifest version before its release exists
-briefly breaks fresh installs, so push the tag immediately after the bump.
+dependency for users). The automation preserves this by construction. Between
+the bump merge and the release publishing (~15 min), installs from `main` can
+404 — a self-resolving window; pinned `--ref vX.Y.Z` installs are never
+affected. If the release *build* fails after the tag exists, re-run that
+`release.yml` run — never re-run auto-release, which would advance versions.

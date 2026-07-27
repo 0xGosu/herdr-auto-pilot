@@ -45,7 +45,7 @@ and correctable.
 Requires: Herdr ≥ 0.7.0 and `curl`. **No Go toolchain needed** — the install
 step downloads the prebuilt binary for your platform (Linux/macOS,
 amd64/arm64) from the matching GitHub Release and verifies it against the
-published SHA256SUMS. (Building from source instead needs Go ≥ 1.24; see
+published SHA256SUMS. (Building from source instead needs Go ≥ 1.25; see
 Development.)
 
 ```sh
@@ -56,14 +56,14 @@ Pin a release (recommended for reproducible installs), or install
 non-interactively:
 
 ```sh
-herdr plugin install 0xGosu/herdr-auto-pilot --ref v0.4.0
+herdr plugin install 0xGosu/herdr-auto-pilot --ref v0.5.3
 herdr plugin install 0xGosu/herdr-auto-pilot --yes
 ```
 
 ### Update to the latest version
 
 The TUI header flags a newer release next to the version
-(`Herd Auto Prompter v0.5.1 ↑ v0.5.2 available`). It learns that from a GitHub
+(`Herd Auto Prompter v0.5.3 ↑ v0.5.4 available`). It learns that from a GitHub
 release check that runs at most every 6 hours while the TUI is open — the
 plugin's only outbound call, and off with
 `hap config set tui.disable_check_for_update true`. A locally built (`herdr
@@ -108,6 +108,12 @@ herdr plugin uninstall herd-auto-prompter            # optional: only for a clea
 herdr plugin install 0xGosu/herdr-auto-pilot --yes
 hap daemon --ensure
 ```
+
+`--ensure` starts a daemon only if none is running, and replaces one left by an
+older binary (or a binary at a different path) — it is what herdr's event hook
+runs, and how you pick up a rebuild. Adding `--replace-only` replaces a running
+daemon but never starts one when none is running; the plugin's install step uses
+it so installing hap does not bring a daemon up as a side effect.
 
 The monitoring daemon starts automatically when an agent appears in the herd.
 Use the following recommended setup to make the **Auto Prompter** pane (TUI)
@@ -196,7 +202,9 @@ shell instead of opening the Herdr pane with the hotkey:
 hap tui
 ```
 
-Everything the TUI does is also a CLI verb on the same binary:
+Nearly everything the TUI does is also a CLI verb on the same binary — the
+exceptions are two interactive-only conveniences, the `/usr/local/bin/hap`
+symlink shortcut on the Config tab and the daemon-stderr viewer (`!`):
 
 ```sh
 hap status         # from any shell after creating the symlink above
@@ -238,6 +246,18 @@ hap state-dir            # state dir (DB, logs, socket, lock, match-index)
 hap config path          # the config.toml path (printed even before it exists)
 hap paths                # both, labeled
 cd "$(hap state-dir)"    # e.g. jump into the state dir
+```
+
+To read and change settings without opening the file:
+
+```sh
+hap version                        # the running build
+hap config show                    # the effective config, defaults filled in
+hap config fields                  # the authoritative key list `config set` takes
+hap config set <key> <value>
+hap config set-threshold approval 0.80   # minimum|idle|approval|choice|error
+hap capture <agent>                # re-run the capture pipeline for one agent now
+hap kill-history                   # past kill-switch (pause/resume) activity
 ```
 
 ## Architecture
@@ -380,7 +400,8 @@ gates and remain visible in the same audit trail.
    "none yet" for a first sighting) when the list line is truncated; it
    works on the *Agents*, *Audit*, and *Rules* tabs too, and pressing
    `tab`/`shift+tab` inside the detail view switches tabs directly (no
-   `esc` needed). Escalation and audit list rows carry compact `rule=` and
+   `esc` needed). `t` jumps straight to that matched rule on the *Rules*
+   tab. Escalation and audit list rows carry compact `rule=` and
    agent-type columns; the CLI `escalations`/`audit` listings show the
    same. From the CLI: `confirm <id> --send` or
    `resolve <id> --action TEXT --send`. Escalations you don't want to
@@ -461,6 +482,17 @@ hap signatures                      # list (--type, --mode, --agent-type, --min-
 hap signatures show approval:9f2c   # full detail by unique prefix
 hap signatures reset approval:9f2c --yes # shadow + fresh streak/confidence; history kept
 hap signatures delete approval:9f2c --yes
+
+# Find a rule without knowing its id — substring by default, or by MEANING
+# with --semantic (embeds the query with the same model the matcher uses):
+hap signatures search "force push"
+hap signatures search "asking to overwrite the branch" --semantic \
+    --limit 20 --min-score 0.3
+
+# Re-compute stored embeddings, e.g. after switching embedding model.
+# `hap status` reports model drift when a re-embed is due; the TUI offers it
+# on `R`.
+hap signatures reembed [--force]
 ```
 
 ## Configuration
@@ -519,7 +551,10 @@ warm_timeout_ms = 0         # 0 = 30000ms for the first call (model load; max 60
 [tui]
 max_content_width = 0       # cap variable-width list columns; 0 = full width
 max_content_height = 0      # expanded long-field lines; 0 = unlimited (collapsed previews use short tails)
-theme = "high-contrast"
+theme = "high-contrast"     # illustrative; the DEFAULT is "" (= the default palette)
+terminal_bell = true        # ring the bell on a new escalation, and on a pause
+                            # caused by a different process
+disable_check_for_update = false  # true turns off the GitHub release check
 
 # Optional per-role color overrides, layered on top of the theme; unset
 # roles inherit the theme's value. Values are terminal color strings
@@ -596,6 +631,19 @@ through the normal pipeline, so the kill switch, never-auto patterns, rate
 limits and per-agent disable all still apply, and every send is audited
 (trigger `auto-idle-send`).
 
+Every option a source takes can be set at creation time, in any combination:
+
+```sh
+hap task-source add --agent brave-otter --workspace 'codex-*' \
+    --template 'Your next task is {next_task_content} (cwd {cwd})' \
+    --auto-send-when-idle --enable-llm-review-before-auto-send \
+    --max-tasks 40 ./docs/tasks.md
+```
+
+Flags must come **before** the path — Go stops parsing flags at the first
+positional argument, so one written after it would be silently ignored (hap
+detects that and refuses instead).
+
 This **composes** with the pre-delivery LLM review
 (`enable_llm_review_before_auto_send`): the hand-out decides *that* a task
 goes, the review decides *which* task and in what shape. The two were once
@@ -604,7 +652,7 @@ pending escalation stops the idle poll for that agent, so a reviewed auto-send
 source silently switched itself off. The review never escalates now, so the
 restriction is gone.
 
-Two rules keep unattended hand-out safe:
+Three rules keep unattended hand-out safe:
 
 - **One task, one agent.** Agents matched by the same source in one poll are
   paired with *different* pending items, and the delivered item is marked
@@ -613,7 +661,19 @@ Two rules keep unattended hand-out safe:
   the *source*, so ordinary event-driven sends from it are marked `[-]` too;
   the agent's own `hap task <name> start <n>` then simply becomes a no-op.
 - **Nothing jumps the queue.** An agent that is disabled, rate-paused,
-  blocked, or has an escalation still waiting on you is skipped.
+  blocked, or has an escalation still waiting on you is skipped. *Any* open
+  escalation parks that agent's poll, which is the first thing to check when
+  auto-send appears to do nothing: `hap escalations`.
+- **Every sweep decides from current state, not from the last send.** A
+  successful `agent send` only proves herdr accepted the keystrokes — text
+  typed into a CLI that is restarting or unfocused is silently lost, and the
+  item would sit `[-]` forever. So each hand-out is recorded in a durable
+  ledger and confirmed only when herdr reports that agent *working*. An
+  unconfirmed hand-out whose agent is parked again after ~2 minutes is
+  returned to `[ ]` (audit trigger `auto-send-reclaim`) and re-offered in the
+  same sweep, to that agent or any other idle one. After **3** hand-outs that
+  were never started, hap escalates instead of resending forever. A `[-]` hap
+  did not write itself — yours, or one an agent marked — is never touched.
 
 The former `[thresholds]` table is accepted for compatibility. Loading it
 preserves its values, and the next config save rewrites it as
@@ -691,8 +751,28 @@ Manage items without leaving the pane:
   source (see below)
 - `space` — mark a run of tasks, so `d`/`x` act on all of them at once
   (with nothing marked, they act on the row under the cursor)
+- `K` / `J` (or `shift+↑` / `shift+↓`) — move the task under the cursor up or
+  down among its siblings; its nested detail lines and sub-tasks travel with it
 - `f` — focus the live agent this source feeds, in herdr
 - `/` — incremental search over the visible columns
+
+The same CRUD is available from the CLI, addressed either by the agent whose
+source it is or by `--path <file>` for any checklist:
+
+```sh
+hap task backend-dev list [--status pending|done|all]
+hap task backend-dev get 3.4          # <n> is a task REFERENCE (id), '#3' is a position
+hap task backend-dev add "wire up retries"
+hap task backend-dev start 2          # [-] in progress
+hap task backend-dev done 2 / undone 2
+hap task backend-dev update 2 "new text"
+hap task backend-dev remove 2
+hap task backend-dev move 5 2         # or: up | down — reorders among siblings
+hap task --path ./docs/tasks.md list  # any checklist file, no source needed
+```
+
+Aliases mirror the obvious spellings: `ls`, `show`, `create`, `wip`, `check`,
+`uncheck`/`reopen`, `edit`, `rm`/`delete`, `mv`/`reorder`.
 
 The add and edit prompts accept multi-line task text: **Shift+Enter inserts
 a line break** (Ctrl+J works on terminals that can't report Shift+Enter) and
@@ -960,11 +1040,25 @@ agents working" above.
 Irreversible operations are **never** automated, regardless of confidence.
 The shipped seed covers force-pushes, destructive filesystem/database ops,
 deploys/publishes, credential changes, and broader suspected-irreversible
-language. The strict and heuristic seed rules are both controlled by
-`safety.disable_never_auto_seed_patterns` and are regression-tested in
+language. The strict and heuristic seed rules are regression-tested in
 CI against a maintained corpus of irreversible-operation prompts
-(`internal/domain/testdata/irreversible_corpus.txt`). Extend it with your own
-regex patterns:
+(`internal/domain/testdata/irreversible_corpus.txt`).
+
+Turn the whole shipped set off with `safety.disable_never_auto_seed_patterns`,
+or — when just one seed rule is too aggressive for a repo — silence that one by
+id and keep the rest of the safety net:
+
+```sh
+hap rules list                # each shipped rule carries a stable `seed <id>`
+hap rules disable-seed <id>   # writes safety.disabled_seed_patterns
+hap rules enable-seed <id>    # restore it
+```
+
+The id is a hash of the pattern, so it names the same rule across upgrades (and
+is rejected if that pattern no longer ships). One seed rule is a single regex
+that may cover several phrasings — disabling it silences all of them.
+
+Extend the set with your own regex patterns:
 
 ```toml
 [safety]
@@ -990,7 +1084,7 @@ Simple fields — numbers, booleans, and the `tui.theme` enum, including
 kill switch is paused by a *different* process than the TUI you're in), and
 `tui.disable_check_for_update` (off by default — see *Update to the latest
 version*) — edit
-inline (`enter`) or via `hap config set <key> <value>`. Free-text fields (`llm.command`,
+inline (`enter`, or `e`) or via `hap config set <key> <value>`. Free-text fields (`llm.command`,
 `llm.command_start`, `llm.rewrite_action_fallback_template`,
 `llm.task_generate_command`,
 `llm.task_generate_command_start`, `embedding.model_path`) show read-only in
@@ -1050,7 +1144,7 @@ The fallback idle/unclassified signature window defaults to 500 characters.
 
 **Larger models need larger budgets.** Each embed call is bounded by a stall
 guard — 2s once the model is warm, 30s for the first call including the model
-load — and three back-to-back failures latch semantic matching onto text
+load — and five back-to-back failures latch semantic matching onto text
 matching for the rest of the daemon's life. A model bigger than the bundled
 MiniLM can exceed those defaults on every call, which looks exactly like a
 broken embedder. `hap status` distinguishes the two: a degrade whose failures

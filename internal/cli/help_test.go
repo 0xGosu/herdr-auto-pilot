@@ -3,13 +3,17 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 )
 
 // TestRegistryEntriesAreDocumented pins the invariant that makes the registry
@@ -233,5 +237,105 @@ func TestTaskSourceHelpDocumentsTheReview(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("`hap help task-source` must mention %q, got:\n%s", want, out)
 		}
+	}
+}
+
+// setKeysFrom pulls the "<a|b|c>" alternation of settable keys out of a
+// `task-source set` usage line, in whichever text it appears.
+func setKeysFrom(t *testing.T, usage string) []string {
+	t.Helper()
+	start := strings.Index(usage, "> <")
+	if start < 0 {
+		t.Fatalf("cannot parse the set usage line: %q", usage)
+	}
+	end := strings.Index(usage[start+1:], ">")
+	if end < 0 {
+		t.Fatalf("cannot parse the set usage line: %q", usage)
+	}
+	var keys []string
+	for _, k := range strings.Split(usage[start+3:start+1+end], "|") {
+		if k = strings.TrimSpace(k); k != "" {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+// TestTaskSourceUsageKeysAreAccepted closes the gap TestCommandHelpPages leaves:
+// it verifies each documented FLAG appears in the help page, but nothing checked
+// that the settings named inside a Usage line are spellings the CLI still takes.
+// They drifted — both usage texts advertised `enable-llm-review`, a key `set`
+// refuses outright because it was renamed. The runtime one was appended to the
+// rename error itself, so hap named the correct spelling and then printed a
+// usage line advertising the wrong one.
+//
+// hap states those keys in TWO places, so both are checked here: the registry
+// Usage in help.go (what `hap help task-source` prints) and the usage const in
+// cli.go (what a malformed `set` prints). They must agree with each other AND
+// with what the command actually accepts.
+func TestTaskSourceUsageKeysAreAccepted(t *testing.T) {
+	cmd, ok := cli.Lookup("task-source")
+	if !ok {
+		t.Fatal("task-source is not in the registry")
+	}
+	var keys []string
+	for _, u := range cmd.Usage {
+		if strings.Contains(u, "task-source set ") {
+			keys = append(keys, setKeysFrom(t, u)...)
+		}
+	}
+	if len(keys) == 0 {
+		t.Fatal("no `task-source set` usage line in the registry to check")
+	}
+
+	// The runtime usage string is unreachable from the registry, so provoke it:
+	// a wrong key prints it alongside the error.
+	app, _ := testApp(t)
+	seedTaskSource(t, app)
+	_, err := run(t, app, "task-source", "set", "0", "definitely-not-a-key", "1")
+	if err == nil {
+		t.Fatal("an unknown task-source key must be refused")
+	}
+	runtimeKeys := setKeysFrom(t, err.Error())
+	if !slices.Equal(runtimeKeys, keys) {
+		t.Errorf("the two usage texts disagree:\n  help.go: %v\n   cli.go: %v", keys, runtimeKeys)
+	}
+
+	values := map[string]string{"max-tasks": "7"}
+	for _, key := range append(keys, runtimeKeys...) {
+		t.Run(key, func(t *testing.T) {
+			app, _ := testApp(t)
+			seedTaskSource(t, app)
+			value, ok := values[key]
+			if !ok {
+				value = "true"
+			}
+			if _, err := run(t, app, "task-source", "set", "0", key, value); err != nil {
+				t.Fatalf("a usage line advertises %q but `set` rejects it: %v", key, err)
+			}
+			// A key wired to a no-op branch would pass on err==nil alone.
+			saved, err := config.Load(app.ConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reflect.DeepEqual(saved.TaskSources[0], seededTaskSource) {
+				t.Errorf("setting %q=%q changed nothing on disk: %+v", key, value, saved.TaskSources[0])
+			}
+		})
+	}
+}
+
+// seededTaskSource is the row every subtest starts from; a `set` that leaves it
+// untouched did nothing.
+var seededTaskSource = config.TaskSource{
+	Agent: "quiet-fox", Path: "/tmp/quiet.md", MaxTasks: config.DefaultMaxTasks,
+}
+
+func seedTaskSource(t *testing.T, app *frontend.App) {
+	t.Helper()
+	cfg := config.Default()
+	cfg.TaskSources = []config.TaskSource{seededTaskSource}
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
 	}
 }

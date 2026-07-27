@@ -110,11 +110,14 @@ func buildCommands() {
 			},
 		},
 		{
-			Name:     "tui",
-			Group:    groupCore,
-			Summary:  "run the interactive TUI control pane",
-			Usage:    []string{"hap tui"},
-			Details:  "Tabs mirror the CLI: agents, escalations, signatures, tasks, config.\nEverything the TUI does is also available as a CLI verb, which is what scripts and AI agents should use.",
+			Name:    "tui",
+			Group:   groupCore,
+			Summary: "run the interactive TUI control pane",
+			Usage:   []string{"hap tui"},
+			Details: "Tabs: Agents, Tasks, Escalations, Audit, Rules, Config, Pause/Kill.\n" +
+				"Nearly everything the TUI does is also a CLI verb, which is what scripts and AI\n" +
+				"agents should use. The exceptions are interactive-only conveniences: the Config\n" +
+				"tab's `/usr/local/bin/hap` symlink shortcut, and the daemon-stderr viewer (`!`).",
 			Examples: []string{"hap tui"},
 			Next: []Hint{
 				{Cmd: "hap status", Why: "the same overview, non-interactive"},
@@ -597,9 +600,9 @@ func buildCommands() {
 			Group:   groupConfigure,
 			Summary: "declare which checklist file feeds which agent (the config, not the items)",
 			Usage: []string{
-				"hap task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--enable-llm-review] [--max-tasks N] <checklist.md>",
+				"hap task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] <checklist.md>",
 				"hap task-source list",
-				"hap task-source set <index> <auto-send-when-idle|enable-llm-review|max-tasks> <value>",
+				"hap task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks> <value>",
 				"hap task-source remove <index>",
 			},
 			Flags: []FlagDoc{
