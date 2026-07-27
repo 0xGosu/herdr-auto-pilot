@@ -1364,6 +1364,15 @@ const (
 	// choice options, error summary) don't take this path at all — a one-word
 	// target swap there stays ~86% similar, so they require an exact match
 	// (domain.StructuredSalient; the test-vs-live collision from PR #230).
+	//
+	// SECOND CALLER, and a much longer window: the aged-escalation auto-accept
+	// pass (autoaccept.go) reuses this same constant to ask whether a situation
+	// held still across a wait measured in MINUTES-to-hours rather than the
+	// seconds-to-minutes a consult spans. Reusing it is deliberate — one
+	// semantics, one comparator, no drift between two staleness checks that ask
+	// the identical question — but it means retuning this value silently
+	// retunes how readily hap answers an escalation with no human present.
+	// Weigh both call sites before changing it.
 	staleDeferredSendJitterPercent = 15
 )
 

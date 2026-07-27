@@ -45,6 +45,32 @@ max_error_retries = 2              # per error signature
 # Note: the escalation duplicate-ask tuning (dedup window + large-capture jitter
 # tolerance) is a fixed internal constant and is no longer configurable.
 
+# ── Auto-accept aged escalations ────────────────────────────────────
+# An escalation waits for you forever. This turns that queue into a slow
+# lane: one that has waited past its threshold, and whose situation is
+# still demonstrably on screen, is answered automatically.
+#
+# OFF by default, and upgrading does not turn it on — the THRESHOLD
+# defaults to 15m, the FEATURE defaults to off. Delete `enabled` (or the
+# whole section) to keep every escalation waiting for you.
+#
+# It delivers but never LEARNS: no correction is written, so an
+# auto-accept contributes no confidence and no graduation progress. It
+# never touches a never-auto / suspected-irreversible escalation (excluded
+# in code, not configurable), never acts while paused, and answers at most
+# one escalation per agent per sweep.
+[escalations.auto_accept]
+enabled = false            # master switch — false ignores every threshold below
+approval = "15m"           # per situation type; a time.ParseDuration string
+choice = "15m"             # "0" disables that type; values under 1m are
+error = "15m"              #   rejected at load (the sweep runs once a minute)
+idle = "0"                 # disabled: an idle hand-out re-drives an agent's
+                           #   work rather than answering a question it asked
+unclassifiable = "0"       # disabled: hap never understood the screen at all
+# Escalations raised BEFORE upgrading can never auto-accept — they carry no
+# signature baseline to compare against, and it is not backfilled. They stay
+# yours to confirm, or clear them with `hap escalations prune`.
+
 # ── Operator LLM (consulted on unknown situations) ──────────────────
 # Omit this whole section to escalate unknown situations directly to you.
 # Two recipes are shown below — Claude Code is active; the OpenAI Codex
