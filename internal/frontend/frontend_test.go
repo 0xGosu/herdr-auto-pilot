@@ -5109,3 +5109,83 @@ func TestConfigFieldsNeverRenderEnvValues(t *testing.T) {
 		t.Errorf("unset env file = %q, want a clear placeholder", got)
 	}
 }
+
+// TestAuditStatusLabel: an operator scanning a list must be able to tell a
+// machine's action from their own without opening the record.
+func TestAuditStatusLabel(t *testing.T) {
+	tests := []struct {
+		name string
+		rec  domain.AuditRecord
+		want string
+	}{
+		{
+			// The critical distinction: an auto-accept delivered a reply but
+			// recorded NO learning event, so it must not read as "resolved".
+			name: "auto-accepted is not an operator resolution",
+			rec:  domain.AuditRecord{Status: domain.AuditStatusAutoAccepted},
+			want: "auto-sent",
+		},
+		{
+			name: "transient claim renders rather than showing unknown",
+			rec:  domain.AuditRecord{Status: domain.AuditStatusAutoAccepting},
+			want: "sending",
+		},
+		{
+			name: "operator dismissal",
+			rec:  domain.AuditRecord{Status: "dismissed", Rationale: "[shadow_mode] learning"},
+			want: "dismissed",
+		},
+		{
+			name: "machine dismissal: the situation moved on",
+			rec: domain.AuditRecord{Status: "dismissed",
+				Rationale: "[shadow_mode] learning [auto_dismiss_stale] signature drifted"},
+			want: "dism:stale",
+		},
+		{
+			name: "machine dismissal: the agent is gone",
+			rec: domain.AuditRecord{Status: "dismissed",
+				Rationale: "[shadow_mode] learning [auto_dismiss_agent_gone]"},
+			want: "dism:gone",
+		},
+		{
+			name: "machine dismissal: delivery never succeeded",
+			rec: domain.AuditRecord{Status: "dismissed",
+				Rationale: "[shadow_mode] learning [auto_accept_failed] 3 attempts"},
+			want: "dism:failed",
+		},
+		{"escalated is unchanged", domain.AuditRecord{Status: "escalated"}, "escalated"},
+		{"resolved is unchanged", domain.AuditRecord{Status: "resolved"}, "resolved"},
+		{"auto is unchanged", domain.AuditRecord{Status: "auto"}, "auto"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := frontend.AuditStatusLabel(tt.rec); got != tt.want {
+				t.Errorf("AuditStatusLabel = %q, want %q", got, tt.want)
+			}
+			if n := len(frontend.AuditStatusLabel(tt.rec)); n > frontend.AuditStatusWidth {
+				t.Errorf("label is %d wide, exceeding AuditStatusWidth=%d — it would shift the columns beside it",
+					n, frontend.AuditStatusWidth)
+			}
+		})
+	}
+}
+
+// TestAuditStatusLabelDistinguishesMachineFromOperator is the requirement in
+// one assertion: no two authors, and no two machine reasons, may collide.
+func TestAuditStatusLabelDistinguishesMachineFromOperator(t *testing.T) {
+	labels := map[string]string{}
+	for _, rec := range []domain.AuditRecord{
+		{Status: "resolved"},
+		{Status: domain.AuditStatusAutoAccepted},
+		{Status: "dismissed", Rationale: "[shadow_mode] x"},
+		{Status: "dismissed", Rationale: "[shadow_mode] x [auto_dismiss_stale] y"},
+		{Status: "dismissed", Rationale: "[shadow_mode] x [auto_dismiss_agent_gone]"},
+		{Status: "dismissed", Rationale: "[shadow_mode] x [auto_accept_failed] y"},
+	} {
+		l := frontend.AuditStatusLabel(rec)
+		if prev, dup := labels[l]; dup {
+			t.Errorf("label %q is shared by %q and %q", l, prev, rec.Rationale+"/"+rec.Status)
+		}
+		labels[l] = rec.Rationale + "/" + rec.Status
+	}
+}

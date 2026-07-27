@@ -2974,6 +2974,47 @@ func ConfidenceLabel(conf float64) string {
 	return fmt.Sprintf("%.2f", conf)
 }
 
+// AuditStatusWidth is the display width AuditStatusLabel's output fits in.
+// Wide enough for the longest label it can produce ("dism:failed"), so a
+// machine dismissal never shifts the columns beside it.
+const AuditStatusWidth = 11
+
+// AuditStatusLabel renders an audit row's status for a LIST column, where the
+// operator is scanning rather than reading one record.
+//
+// Two things must be readable at a glance and are not readable from the raw
+// status alone. An auto-accept is not an operator's resolution — the machine
+// stopped waiting, and no learning event was recorded — so it must not read as
+// "resolved". And `dismissed` now has two possible authors and three distinct
+// machine reasons, all of which look identical in a bare status column; the
+// reason lives in the rationale, which the list has no room for.
+//
+// Every audit STATUS an operator sees (TUI and CLI) goes through here so the
+// wording cannot drift between them.
+func AuditStatusLabel(r domain.AuditRecord) string {
+	switch r.Status {
+	case domain.AuditStatusAutoAccepted:
+		// Deliberately not "resolved": nothing was learned from it.
+		return "auto-sent"
+	case domain.AuditStatusAutoAccepting:
+		// Transient and normally invisible — a row only shows this while a
+		// delivery is in flight, or briefly after a crash before the startup
+		// reclaim returns it to the queue. Rendered rather than left unknown.
+		return "sending"
+	case "dismissed":
+		switch domain.AutoDismissReason(r.Rationale) {
+		case domain.ReasonAutoDismissStale:
+			return "dism:stale"
+		case domain.ReasonAutoDismissAgentGone:
+			return "dism:gone"
+		case domain.ReasonAutoAcceptFailed:
+			return "dism:failed"
+		}
+		return "dismissed" // the operator's own
+	}
+	return r.Status
+}
+
 // RuleSummary renders a one-line description of the learned rule backing a
 // signature, for escalation/audit views (TUI detail and CLI share the
 // wording so operators see the same rule either way).

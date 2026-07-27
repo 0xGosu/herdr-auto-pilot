@@ -5124,7 +5124,7 @@ func (m Model) renderAudit(b *strings.Builder) {
 	// columns. Conf is the computed 0-1 agreement ("-" when the row was never
 	// scored — see frontend.ConfidenceLabel); LLM is the consulting model's
 	// self-reported 0-100 ("-" when the row has no LLM score).
-	const auditRowFmt = "%-6s %-14s %-10s %-8s %-14s %4s %-6s %5s %-9s  %s"
+	const auditRowFmt = "%-6s %-14s %-10s %-8s %-14s %4s %-6s %5s %-11s  %s"
 	actWidth, _ := m.budget(86, false)
 	header := fmt.Sprintf(auditRowFmt,
 		"ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "ACTION")
@@ -5139,7 +5139,8 @@ func (m Model) renderAudit(b *strings.Builder) {
 		line := fmt.Sprintf(auditRowFmt,
 			fmt.Sprintf("#%d", r.ID), humanizeWhen(r.CreatedAt, m.renderNow()),
 			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), 14),
-			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), frontend.ConfidenceLabel(r.Confidence), r.Status,
+			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), frontend.ConfidenceLabel(r.Confidence),
+			frontend.AuditStatusLabel(r),
 			oneLine(r.Action, actWidth))
 		if i == m.cursors[m.tab] {
 			line = m.styles().selected.Render(line)
