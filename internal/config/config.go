@@ -640,13 +640,13 @@ type Config struct {
 	// Escalations is opt-in and omitted from Save until the operator sets it
 	// (see AutoAccept), so an untouched config is never rewritten with a
 	// section granting the daemon new autonomy.
-	Escalations Escalations `toml:"escalations,omitempty"`
-	LLM                  LLM                  `toml:"llm"`
-	Embedding            Embedding            `toml:"embedding"`
-	TUI                  TUI                  `toml:"tui"`
-	CLI                  CLI                  `toml:"cli"`
-	TaskSources          []TaskSource         `toml:"task_sources"`
-	Classifier           []ClassifierRule     `toml:"classifier"`
+	Escalations Escalations      `toml:"escalations,omitempty"`
+	LLM         LLM              `toml:"llm"`
+	Embedding   Embedding        `toml:"embedding"`
+	TUI         TUI              `toml:"tui"`
+	CLI         CLI              `toml:"cli"`
+	TaskSources []TaskSource     `toml:"task_sources"`
+	Classifier  []ClassifierRule `toml:"classifier"`
 	// CaptureDelays are optional per-agent-type overrides for the delayed
 	// pane capture; absent rules fall back to built-in defaults (not part
 	// of fillZeroes — optional tables, absent is not "zeroed").
