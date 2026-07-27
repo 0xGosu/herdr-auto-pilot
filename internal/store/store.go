@@ -113,6 +113,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	match_method TEXT NOT NULL DEFAULT '',
 	match_score REAL NOT NULL DEFAULT 0,
 	embed_error TEXT NOT NULL DEFAULT '',
+	-- The row's SignatureResult, kept as the baseline for a later staleness
+	-- comparison (see domain.AuditRecord.SigRaw). '' = no baseline.
+	sig_raw TEXT NOT NULL DEFAULT '',
+	sig_salient TEXT NOT NULL DEFAULT '',
+	sig_verdict TEXT NOT NULL DEFAULT '',
+	sig_salient_chars INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
@@ -262,6 +268,17 @@ func (s *Store) migrate() error {
 		`ALTER TABLE audit_log ADD COLUMN match_method TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE audit_log ADD COLUMN match_score REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE audit_log ADD COLUMN embed_error TEXT NOT NULL DEFAULT ''`,
+		// The row's full SignatureResult: the never-remapped content hash, the
+		// masked salient, the over-mask verdict, and the salient window used.
+		// Written on every decision-pipeline row (status 'auto' as well as
+		// 'escalated'), which is what lets a row later demoted to escalated
+		// carry a comparable baseline. NOT backfilled: '' means "no baseline",
+		// so every pre-migration row is permanently ineligible for auto-accept
+		// — the fail-closed default.
+		`ALTER TABLE audit_log ADD COLUMN sig_raw TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE audit_log ADD COLUMN sig_salient TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE audit_log ADD COLUMN sig_verdict TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE audit_log ADD COLUMN sig_salient_chars INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
 		// A pre-delivery task review's submission: the ordered checklist edits
 		// (JSON) and the reference of the task to deliver once they are
@@ -425,12 +442,14 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO audit_log (decision_id, agent_id, agent_type, signature, trigger, situation_type,
 				action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
-				corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
+				sig_raw, sig_salient, sig_verdict, sig_salient_chars, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
 			a.Action, a.Input, a.Confidence, llmConfArg(a.LLMConfidence), a.Rationale, a.LLMOutput,
 			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt,
-			string(a.MatchMethod), a.MatchScore, a.EmbedError, unix(a.CreatedAt))
+			string(a.MatchMethod), a.MatchScore, a.EmbedError,
+			a.SigRaw, a.SigSalient, string(a.SigVerdict), a.SigSalientChars, unix(a.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -1211,15 +1230,18 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 		var a domain.AuditRecord
 		var situationType string
 		var matchMethod string
+		var sigVerdict string
 		var created int64
 		var llmConf sql.NullInt64
 		if err := rows.Scan(&a.ID, &a.DecisionID, &a.AgentID, &a.AgentType, &a.Signature, &a.Trigger,
 			&situationType, &a.Action, &a.Input, &a.Confidence, &llmConf, &a.Rationale,
 			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &a.PaneExcerpt,
-			&matchMethod, &a.MatchScore, &a.EmbedError, &created); err != nil {
+			&matchMethod, &a.MatchScore, &a.EmbedError,
+			&a.SigRaw, &a.SigSalient, &sigVerdict, &a.SigSalientChars, &created); err != nil {
 			return nil, err
 		}
 		a.MatchMethod = domain.MatchMethod(matchMethod)
+		a.SigVerdict = domain.GuardVerdict(sigVerdict)
 		if llmConf.Valid {
 			v := int(llmConf.Int64)
 			a.LLMConfidence = &v
@@ -1231,9 +1253,12 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 	return out, rows.Err()
 }
 
+// auditCols is the column list every audit query selects. It is POSITIONALLY
+// coupled to scanAudits and to AppendAudit's INSERT — change all three together.
 const auditCols = `id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
 	action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
-	corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error, created_at`
+	corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
+	sig_raw, sig_salient, sig_verdict, sig_salient_chars, created_at`
 
 // llmConfArg maps the optional LLM confidence to a SQL argument: nil stores
 // NULL (no LLM score), a value stores the 0-100 score.

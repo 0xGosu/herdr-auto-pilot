@@ -1949,12 +1949,12 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 	}
 
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
+		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + del.input, Input: del.input,
 		Confidence: dec.Confidence, LLMConfidence: del.llmConfidence,
 		Rationale: del.rationale, LLMOutput: del.llmOutput,
 		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
-	})
+	}.WithSignatureBaseline(sig))
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
 		d.notify(ctx, "Herd Auto Prompter: persistence failure",
@@ -2119,11 +2119,11 @@ func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain
 func (d *Daemon) deliverNoopClaimed(ctx context.Context, s domain.Situation,
 	sig domain.SignatureResult, dec domain.Decision, tr domain.AgentTransition, now time.Time) {
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
+		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "noop", Input: "",
 		Confidence: dec.Confidence, Rationale: dec.Rationale,
 		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
-	})
+	}.WithSignatureBaseline(sig))
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous noop (FR-024)", "error", err)
 		d.notify(ctx, "Herd Auto Prompter: persistence failure",
@@ -2178,14 +2178,14 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 	executed := d.withAgentAutomation(ctx, s, res.sig, res.tr, "", res.dec.Confidence, llmConf,
 		domain.ActionNoop, now, func() {
 			auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-				AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature,
+				AgentID: s.AgentID, AgentType: s.AgentType,
 				Trigger: trigger(res.tr), SituationType: s.Type, Action: "noop", Input: "",
 				Confidence: res.dec.Confidence, LLMConfidence: llmConf,
 				Rationale: rationale,
 				LLMOutput: domain.ActionNoop,
 				Status:    "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
 				CreatedAt: now,
-			})
+			}.WithSignatureBaseline(res.sig))
 			if err != nil {
 				slog.Error("audit write failed; blocking review noop (FR-024)", "error", err)
 				d.notify(ctx, "Herd Auto Prompter: persistence failure",
@@ -2250,7 +2250,7 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		rationale += " " + dec.Rationale
 	}
 	rec := domain.AuditRecord{
-		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
+		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 		SituationType: s.Type, Action: domain.AuditActionEscalated, Confidence: dec.Confidence,
 		LLMConfidence: dec.LLMConfidence,
 		Rationale:     rationale,
@@ -2265,7 +2265,10 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		MatchScore:  sig.Match.Score,
 		EmbedError:  sig.Match.EmbedError,
 		CreatedAt:   now,
-	}
+		// Signature + the persisted baseline (sig_raw / sig_salient /
+		// sig_verdict / sig_salient_chars): plumbing only, sig is already a
+		// parameter here and is NOT recomputed.
+	}.WithSignatureBaseline(sig)
 	if autoDismissReason != "" {
 		// Store the would-be escalation directly as dismissed. This is atomic
 		// from the front-end's perspective (it can never flash in the pending
@@ -3782,12 +3785,12 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	executed := d.withAgentAutomation(ctx, s, res.sig, tr, llmDec.Action,
 		computedConf, &llmConf, llmDec.CapturedOutput, now, func() {
 			auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-				AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
+				AgentID: s.AgentID, AgentType: s.AgentType, Trigger: "llm-fallback",
 				SituationType: s.Type, Action: domain.AuditActionAutoPrefix + llmDec.Action, Input: llmDec.Action,
 				Confidence: computedConf, LLMConfidence: &llmConf,
 				Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
 				Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
-			})
+			}.WithSignatureBaseline(res.sig))
 			if err != nil {
 				slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)
 				d.notify(ctx, "Herd Auto Prompter: persistence failure",

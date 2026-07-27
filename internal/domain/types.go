@@ -428,8 +428,12 @@ type AuditRecord struct {
 	Rationale       string
 	LLMOutput       string
 	CorrectsAuditID int64
-	Status          string // "auto" | "escalated" | "resolved" | "dismissed" | "retried"
-	Suggestion      string
+	// Status: "auto" | "escalated" | "resolved" | "dismissed" | "retried" |
+	// "auto_accepting" | "auto_accepted". The last two belong to the
+	// aged-escalation auto-accept lifecycle (AuditStatusAutoAccepting is
+	// transient, AuditStatusAutoAccepted terminal); see the const block above.
+	Status     string
+	Suggestion string
 	// PaneExcerpt is the pane content THIS record was classified from
 	// (per-entry, unlike the signature's first-seen provenance snapshot);
 	// "" on legacy rows and paths with no pane read (herdr unreachable).
@@ -442,7 +446,46 @@ type AuditRecord struct {
 	MatchMethod MatchMethod
 	MatchScore  float64
 	EmbedError  string
-	CreatedAt   time.Time
+	// SigRaw / SigSalient / SigVerdict / SigSalientChars persist the row's
+	// full SignatureResult — the baseline a much later staleness comparison
+	// needs. Signature above is only the (possibly remapped) LEARNING key; it
+	// carries neither the never-remapped content hash nor the masked salient
+	// the jitter path compares, and the structured salient fields ComputeSignatureN
+	// derives them from (PermissionVerb, Options, ErrorSummary) are not
+	// persisted anywhere, so a baseline cannot be rebuilt from PaneExcerpt.
+	//
+	// Written on every decision-pipeline row — status "auto" as well as
+	// "escalated" — so a row later demoted by Store.EscalateAudit already
+	// carries its baseline. An empty SigRaw means "no baseline available"
+	// (legacy rows, and every path outside the decision pipeline), which the
+	// auto-accept eligibility predicate treats as fail-closed.
+	//
+	// SigSalientChars records the Embedding.PaneSalientChars in effect when
+	// the signature was computed, so the comparison basis cannot shift under
+	// an operator editing that setting mid-wait.
+	SigRaw          string
+	SigSalient      string
+	SigVerdict      GuardVerdict
+	SigSalientChars int
+	CreatedAt       time.Time
+}
+
+// WithSignatureBaseline stamps sig's full result onto the record — the
+// learning key AND the baseline fields a later staleness comparison needs.
+//
+// Every decision-pipeline audit insert goes through this, "auto" rows
+// included: a row written as "auto" can later be demoted to "escalated" by
+// Store.EscalateAudit, and it must already carry its baseline when that
+// happens (the demotion path has no signature in hand). Rows written outside
+// the decision pipeline simply never call it and keep an empty SigRaw, which
+// reads as "no baseline available".
+func (a AuditRecord) WithSignatureBaseline(sig SignatureResult) AuditRecord {
+	a.Signature = sig.Signature
+	a.SigRaw = sig.Raw
+	a.SigSalient = sig.Salient
+	a.SigVerdict = sig.Verdict
+	a.SigSalientChars = sig.SalientChars
+	return a
 }
 
 // IsRetryableLLMEscalation reports whether an escalation is a candidate for
