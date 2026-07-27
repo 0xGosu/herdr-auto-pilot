@@ -98,6 +98,125 @@ type Limits struct {
 	// (escalationDedupWindow, escalationDedupJitterPercent).
 }
 
+// Escalations groups the escalation-lifecycle settings.
+type Escalations struct {
+	AutoAccept AutoAccept `toml:"auto_accept"`
+}
+
+// AutoAccept configures automatic acceptance of escalations the operator has
+// left pending too long (see the daemon's auto-accept pass).
+//
+// The whole section is opt-in: an absent section, or Enabled false, behaves
+// exactly as "off" regardless of the per-type thresholds, so upgrading an
+// existing install never starts auto-answering escalations it previously
+// queued. The THRESHOLD defaults to 15m; the FEATURE defaults to off.
+//
+// Durations are TOML strings parsed with time.ParseDuration ("15m", "1h30m").
+// An omitted key takes that type's built-in default; "0" disables the type
+// explicitly. Unlike most of this file, a malformed value here is REJECTED at
+// load rather than corrected to a default: silently substituting 15m for a
+// typo would start sending on an operator's behalf. Rejection disables the
+// section and leaves the rest of the config intact — failing closed.
+//
+// The staleness tolerance the pass compares with is deliberately NOT
+// configurable, for the same reason as the dedup tuning in Limits.
+type AutoAccept struct {
+	// Enabled is the master switch. False short-circuits all five thresholds.
+	Enabled bool `toml:"enabled"`
+	// Per-situation-type waiting thresholds. Empty = that type's default.
+	Approval       string `toml:"approval,omitempty"`
+	Choice         string `toml:"choice,omitempty"`
+	Error          string `toml:"error,omitempty"`
+	Idle           string `toml:"idle,omitempty"`
+	Unclassifiable string `toml:"unclassifiable,omitempty"`
+}
+
+// Auto-accept threshold defaults. approval/choice/error wait 15 minutes; idle
+// and unclassifiable are disabled, because neither carries a suggestion an
+// absent operator would obviously have confirmed — an idle hand-out re-drives
+// an agent's work and an unclassifiable screen was never understood at all.
+const (
+	DefaultAutoAcceptApproval = 15 * time.Minute
+	DefaultAutoAcceptChoice   = 15 * time.Minute
+	DefaultAutoAcceptError    = 15 * time.Minute
+)
+
+// minAutoAcceptThreshold is the sweep granularity. A non-zero threshold below
+// it cannot be honoured — the pass only runs once a minute — so it is rejected
+// rather than silently rounded up, which would look like the feature ignoring
+// the operator's setting.
+const minAutoAcceptThreshold = time.Minute
+
+// AutoAcceptAfter returns how long an escalation of this situation type must
+// have waited before it may be auto-accepted, and whether auto-accept applies
+// at all. ok is false when the feature is off, the type is disabled, or the
+// type is not one of the five (a new situation type is never auto-accepted
+// until it is added here — fail-closed by default).
+func (c Config) AutoAcceptAfter(situationType string) (time.Duration, bool) {
+	if !c.Escalations.AutoAccept.Enabled {
+		return 0, false
+	}
+	raw, def, known := c.Escalations.AutoAccept.forType(situationType)
+	if !known {
+		return 0, false
+	}
+	if strings.TrimSpace(raw) == "" {
+		return def, def > 0
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil || d < 0 {
+		// Unreachable in practice: Load rejects these. Fail closed anyway so a
+		// hand-built Config in a test or a future caller cannot fire early.
+		return 0, false
+	}
+	return d, d > 0
+}
+
+// forType maps a situation type to its configured value and built-in default.
+func (a AutoAccept) forType(situationType string) (raw string, def time.Duration, known bool) {
+	switch situationType {
+	case "approval":
+		return a.Approval, DefaultAutoAcceptApproval, true
+	case "choice":
+		return a.Choice, DefaultAutoAcceptChoice, true
+	case "error":
+		return a.Error, DefaultAutoAcceptError, true
+	case "idle":
+		return a.Idle, 0, true
+	case "unclassifiable":
+		return a.Unclassifiable, 0, true
+	}
+	return "", 0, false
+}
+
+// AutoAcceptSituationTypes lists the types the section covers, in the order
+// they are displayed and validated.
+var AutoAcceptSituationTypes = []string{"approval", "choice", "error", "idle", "unclassifiable"}
+
+// validate rejects thresholds that cannot be honoured, naming the offending
+// key so the operator can find it.
+func (a AutoAccept) validate() error {
+	for _, t := range AutoAcceptSituationTypes {
+		raw, _, _ := a.forType(t)
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("escalations.auto_accept.%s: %q is not a duration (use e.g. \"15m\", or \"0\" to disable)", t, raw)
+		}
+		if d < 0 {
+			return fmt.Errorf("escalations.auto_accept.%s: %q is negative", t, raw)
+		}
+		if d > 0 && d < minAutoAcceptThreshold {
+			return fmt.Errorf("escalations.auto_accept.%s: %q is below the %s sweep granularity; use %s or more, or \"0\" to disable",
+				t, raw, minAutoAcceptThreshold, minAutoAcceptThreshold)
+		}
+	}
+	return nil
+}
+
 // LLM configures the optional local LLM/agent CLI fallback (FR-010, IR-005).
 type LLM struct {
 	// Command is the argv template; supports {self} (this binary),
@@ -518,6 +637,10 @@ type Config struct {
 	Learning             Learning             `toml:"learning"`
 	Safety               Safety               `toml:"safety"`
 	Limits               Limits               `toml:"limits"`
+	// Escalations is opt-in and omitted from Save until the operator sets it
+	// (see AutoAccept), so an untouched config is never rewritten with a
+	// section granting the daemon new autonomy.
+	Escalations Escalations `toml:"escalations,omitempty"`
 	LLM                  LLM                  `toml:"llm"`
 	Embedding            Embedding            `toml:"embedding"`
 	TUI                  TUI                  `toml:"tui"`
@@ -923,6 +1046,16 @@ func Load(path string) (Config, error) {
 				"path", path, "source", src.Path)
 		}
 		src.DeprecatedEnableLLMReview = nil
+	}
+	// Auto-accept thresholds are the one place a bad value is REJECTED rather
+	// than corrected to a default: this section grants the daemon permission to
+	// answer on the operator's behalf, and silently substituting 15m for a typo
+	// would start sending. Fail closed — the section is dropped so the feature
+	// stays off, the rest of the config survives, and the error names the key.
+	if err := cfg.Escalations.AutoAccept.validate(); err != nil {
+		cfg.Escalations.AutoAccept = AutoAccept{}
+		cfg.fillZeroes()
+		return cfg, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	cfg.fillZeroes()
 	return cfg, nil

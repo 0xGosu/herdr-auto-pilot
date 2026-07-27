@@ -1549,6 +1549,15 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
+	// Auto-accept: the daemon answers an escalation the operator left pending
+	// too long. Off by default; each threshold is a duration ("15m") or "0" to
+	// disable that situation type.
+	{Key: "escalations.auto_accept.enabled", TUIEditable: true},
+	{Key: "escalations.auto_accept.approval", TUIEditable: true},
+	{Key: "escalations.auto_accept.choice", TUIEditable: true},
+	{Key: "escalations.auto_accept.error", TUIEditable: true},
+	{Key: "escalations.auto_accept.idle", TUIEditable: true},
+	{Key: "escalations.auto_accept.unclassifiable", TUIEditable: true},
 	{Key: "safety.disable_never_auto_seed_patterns", TUIEditable: true},
 	{Key: "llm.command"},       // argv template
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
@@ -1650,6 +1659,18 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.Limits.MaxAutoPromptsPerMinute)
 	case "limits.max_error_retries":
 		return strconv.Itoa(cfg.Limits.MaxErrorRetries)
+	case "escalations.auto_accept.enabled":
+		return strconv.FormatBool(cfg.Escalations.AutoAccept.Enabled)
+	case "escalations.auto_accept.approval":
+		return autoAcceptValue(cfg.Escalations.AutoAccept.Approval, config.DefaultAutoAcceptApproval)
+	case "escalations.auto_accept.choice":
+		return autoAcceptValue(cfg.Escalations.AutoAccept.Choice, config.DefaultAutoAcceptChoice)
+	case "escalations.auto_accept.error":
+		return autoAcceptValue(cfg.Escalations.AutoAccept.Error, config.DefaultAutoAcceptError)
+	case "escalations.auto_accept.idle":
+		return autoAcceptValue(cfg.Escalations.AutoAccept.Idle, 0)
+	case "escalations.auto_accept.unclassifiable":
+		return autoAcceptValue(cfg.Escalations.AutoAccept.Unclassifiable, 0)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -1805,6 +1826,23 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setInt(&cfg.Limits.MaxAutoPromptsPerMinute)
 		case "limits.max_error_retries":
 			return setInt(&cfg.Limits.MaxErrorRetries)
+		case "escalations.auto_accept.enabled":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("escalations.auto_accept.enabled must be true or false, got %q", value)
+			}
+			cfg.Escalations.AutoAccept.Enabled = v
+			return nil
+		case "escalations.auto_accept.approval":
+			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Approval)
+		case "escalations.auto_accept.choice":
+			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Choice)
+		case "escalations.auto_accept.error":
+			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Error)
+		case "escalations.auto_accept.idle":
+			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Idle)
+		case "escalations.auto_accept.unclassifiable":
+			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Unclassifiable)
 		case "llm.timeout_seconds":
 			return setInt(&cfg.LLM.TimeoutSeconds)
 		case "llm.auto_act_confidence_threshold":
@@ -3192,4 +3230,43 @@ func envFileValue(path string) string {
 		return "(none)"
 	}
 	return path
+}
+
+// autoAcceptValue renders an auto-accept threshold for display: the operator's
+// literal setting when present, otherwise the built-in default marked as such
+// (or "0 (disabled)" for the types that default to off).
+func autoAcceptValue(set string, def time.Duration) string {
+	if s := strings.TrimSpace(set); s != "" {
+		return s
+	}
+	if def <= 0 {
+		return "0 (disabled, default)"
+	}
+	return def.String() + " (default)"
+}
+
+// setAutoAcceptThreshold validates one auto-accept threshold before storing it.
+// Validation happens HERE as well as in config.Load because this is the write
+// path: rejecting at load only helps a hand-edited file, and `hap config set`
+// must not be able to persist a value that would be rejected on the next
+// reload — the daemon would silently run with the section disabled.
+func setAutoAcceptThreshold(key, value string, dst *string) error {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		// Clearing restores the type's built-in default.
+		*dst = ""
+		return nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a duration (use e.g. \"15m\", or \"0\" to disable)", key, value)
+	}
+	if d < 0 {
+		return fmt.Errorf("%s: %q is negative", key, value)
+	}
+	if d > 0 && d < time.Minute {
+		return fmt.Errorf("%s: %q is below the 1m sweep granularity; use 1m or more, or \"0\" to disable", key, value)
+	}
+	*dst = v
+	return nil
 }
