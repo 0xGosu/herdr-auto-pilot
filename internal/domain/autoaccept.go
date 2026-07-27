@@ -6,15 +6,30 @@ import "strings"
 // auto-accepted, no matter how long they wait or how the operator configures
 // the feature.
 //
-// These are the two hard-safety verdicts. FR-015's invariant is that a
-// never-auto match always reaches a human; a suspected-irreversible heuristic
-// hit is the same judgement reached by inference. Both mean "a human must look
-// at this", and a timeout is not a human. They are excluded in CODE and are
-// deliberately not exposed to configuration: an operator cannot opt into
-// auto-answering them by editing a file.
+// Each means "a human must look at this", and a timeout is not a human. They
+// are excluded in CODE and are deliberately not exposed to configuration: an
+// operator cannot opt into auto-answering them by editing a file.
 var autoAcceptExcludedReasons = []EscalateReason{
+	// The two hard-safety verdicts. FR-015's invariant is that a never-auto
+	// match always reaches a human; a suspected-irreversible hit is the same
+	// judgement reached by inference.
 	ReasonNeverAutoMatch,
 	ReasonSuspectedIrrevers,
+	// The two CEILING verdicts, for the same reason one level up: each means
+	// "automation has already done this as often as it is allowed to".
+	//
+	// retry_exhausted (FR-014) is raised once an error signature has hit
+	// max_error_retries. Auto-accepting it re-sends the very retry the ceiling
+	// exists to stop — and because an auto-accept writes no correction and is
+	// not counted against [limits], the counter never advances: the error
+	// recurs, a fresh escalation is raised, and the loop repeats every
+	// threshold window forever with nobody watching.
+	ReasonRetryExhausted,
+	// rate_limited (FR-019) is the runaway guard standing an agent down until a
+	// human checks in. A timeout is not a check-in. (The pass also honours the
+	// pause the guard sets, but that is a side effect of escalate(); this makes
+	// the exclusion explicit rather than incidental.)
+	ReasonRateLimited,
 }
 
 // EscalationReason extracts the machine-readable reason from an escalation's
@@ -56,7 +71,9 @@ func EscalationReason(rationale string) (EscalateReason, bool) {
 //   - A generated-task suggestion is refused. Confirming one is not a pane
 //     send at all: it appends tasks to the operator's declared source or
 //     bootstraps a new file, which is frontend-only work well outside what
-//     "answer the question on screen" means.
+//     "answer the question on screen" means. A "@noop" suggestion is refused
+//     for the mirror-image reason: it is a sentinel meaning "send nothing",
+//     and delivery would type it at the agent as literal text.
 //
 //   - A missing baseline is refused, so every escalation raised before the
 //     baseline columns existed stays operator-only. The columns are not
@@ -85,6 +102,15 @@ func AutoAcceptIneligible(a *AuditRecord, suggestion string) string {
 	}
 	if suggestion == SuggestGenerateTask {
 		return "generated-task suggestion"
+	}
+	if suggestion == ActionNoop {
+		// "do nothing" resolves to a SENTINEL, not pane text. The operator path
+		// gates on it explicitly (a confirmed noop records the learning event
+		// but never writes "@noop" into the pane); delivery itself deliberately
+		// treats it as ordinary text. Refusing it here is the fail-closed
+		// equivalent: nothing to send means nothing to auto-send, so it stays
+		// for the operator rather than being typed at an agent verbatim.
+		return "noop suggestion"
 	}
 	if a.SigRaw == "" {
 		return "no signature baseline"

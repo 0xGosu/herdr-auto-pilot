@@ -47,7 +47,7 @@ const autoAcceptAbsenceConfirmations = 2
 // would only incidentally catch the second — and only if its pane re-read
 // happened to land after the first delivery. One-per-agent makes that ordering
 // irrelevant rather than load-bearing.
-func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.AgentTransition) {
+func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.AgentTransition) map[string]bool {
 	cfg, _, _ := d.snapshot()
 	now := d.opt.Clock.Now()
 
@@ -58,7 +58,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		}
 	}
 	if len(cutoffs) == 0 {
-		return // feature off, or every type disabled
+		return nil // feature off, or every type disabled
 	}
 
 	// Guard 1a — FR-017: the kill switch stands the whole daemon down. Fail
@@ -68,16 +68,16 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil {
 		slog.Warn("auto-accept: kill-switch read failed; skipping this sweep", "error", err)
-		return
+		return nil
 	}
 	if domain.KillStateActive(kill) {
-		return
+		return nil
 	}
 
 	candidates, err := d.opt.Store.AutoAcceptableEscalations(ctx, cutoffs)
 	if err != nil {
 		slog.Warn("auto-accept: candidate query failed; skipping this sweep", "error", err)
-		return
+		return nil
 	}
 
 	live := make(map[string]domain.AgentTransition, len(agents))
@@ -90,6 +90,12 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	stillEligible := make(map[int64]bool, len(candidates))
 
 	handledAgent := make(map[string]bool)
+	// One pane read per pane per tick. Every escalation on an agent looks at the
+	// SAME screen, so re-reading it per candidate would shell out repeatedly on
+	// the daemon's select loop for no new information (CLAUDE.md: don't stall
+	// the main loop). Scoped to this tick — never cached across sweeps, or the
+	// staleness check would be comparing against history.
+	panes := &paneCache{}
 	accepted := 0
 
 	for i := range candidates {
@@ -113,7 +119,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 			continue
 		}
 
-		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, now); outcome {
+		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, panes, now); outcome {
 		case autoAcceptDelivered:
 			handledAgent[rec.AgentID] = true
 			accepted++
@@ -133,6 +139,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		slog.Info("auto-accept: escalations accepted this sweep", "count", accepted)
 	}
 	d.pruneAutoAcceptState(stillEligible)
+	return handledAgent
 }
 
 // autoAcceptOutcome distinguishes the three ends of one escalation's turn.
@@ -151,7 +158,7 @@ const (
 // autoAcceptOne runs the guard chain for a single escalation and, if it passes,
 // claims → delivers → finalizes.
 func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, suggestion string,
-	live map[string]domain.AgentTransition, now time.Time) autoAcceptOutcome {
+	live map[string]domain.AgentTransition, panes *paneCache, now time.Time) autoAcceptOutcome {
 
 	agent, present := live[rec.AgentID]
 	if !present {
@@ -182,16 +189,19 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 		return autoAcceptSkipped
 	}
 
-	// Guard 3 — the authoritative one.
-	switch d.autoAcceptSituationHeldStill(ctx, rec, agent) {
-	case heldStillUnevaluable:
-		// Absence of evidence is never evidence of staleness: an unreadable
-		// pane or unreachable herdr leaves the escalation pending, however long
-		// the outage lasts.
-		return autoAcceptSkipped
+	// Guard 3 — the authoritative one. Exhaustive on purpose: for the guard the
+	// whole feature rests on, an unhandled value must not fall through to a send.
+	switch d.autoAcceptSituationHeldStill(ctx, rec, agent, panes) {
+	case heldStillYes:
+		// Proceed.
 	case heldStillNo:
 		return d.autoDismiss(ctx, rec, domain.ReasonAutoDismissStale,
 			"the situation is no longer on screen", now)
+	default:
+		// heldStillUnevaluable, and anything added later. Absence of evidence is
+		// never evidence of staleness: an unreadable pane or an unreachable
+		// herdr leaves the escalation pending, however long the outage lasts.
+		return autoAcceptSkipped
 	}
 
 	// Claim BEFORE delivering. ClaimForAutoAccept is a status-guarded atomic
@@ -495,7 +505,7 @@ const (
 //     during the wait cannot shift the comparison basis and manufacture a
 //     spurious staleness.
 func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.AuditRecord,
-	agent domain.AgentTransition) heldStill {
+	agent domain.AgentTransition, panes *paneCache) heldStill {
 
 	prev, ok := domain.AutoAcceptBaseline(rec)
 	if !ok {
@@ -504,7 +514,7 @@ func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.A
 	}
 
 	_, _, cls := d.snapshot()
-	pane, err := d.readVisible(ctx, paneIDFor(rec, agent), d.opt.PaneReadLines)
+	pane, err := panes.read(ctx, d, paneIDFor(rec, agent))
 	if err != nil {
 		slog.Debug("auto-accept: pane re-read failed; leaving the escalation pending",
 			"audit_id", rec.ID, "agent", rec.AgentID, "error", err)
@@ -543,6 +553,29 @@ func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.A
 
 	fresh := domain.ComputeSignatureN(current, prev.SalientChars)
 	if !domain.SignatureHeldStill(prev, fresh, staleDeferredSendJitterPercent) {
+		// A STRUCTURED salient (approval verb + options, choice options, error
+		// summary) is distilled identity: both sides were derived the same way,
+		// so a mismatch really does mean a different situation. Dismiss.
+		//
+		// An UNSTRUCTURED pane-tail salient is not comparable that confidently
+		// here. The baseline was minted from a "--source recent" read (a
+		// consuming delta, daemon.go's attention capture) while this re-read is
+		// "--source visible" (the whole screen), so the two hash different
+		// content even when nothing changed — the deferred-send path hits the
+		// same problem and side-steps it by matching idle on type alone. Over
+		// this pass's much longer window, type alone is too weak to DELIVER on,
+		// but a comparison known to be unreliable is far too weak to DESTROY a
+		// queue entry with. So: neither. Leave it pending for the operator.
+		//
+		// The practical consequence is that pane-tail situations (idle,
+		// unclassifiable, a verbless approval, a summary-less error) rarely
+		// auto-accept — which is also why idle and unclassifiable ship
+		// disabled. Nothing is ever lost to it.
+		if !domain.StructuredSalient(prev.Salient) {
+			slog.Debug("auto-accept: unstructured salient did not compare cleanly; leaving pending",
+				"audit_id", rec.ID, "agent", rec.AgentID)
+			return heldStillUnevaluable
+		}
 		return heldStillNo
 	}
 	if fresh.Raw != prev.Raw {
@@ -578,4 +611,47 @@ func classifyStatusFor(st domain.SituationType) string {
 		return "idle"
 	}
 	return "blocked"
+}
+
+// paneCache memoizes one sweep's pane reads. Every escalation on an agent looks
+// at the same screen, so the guard would otherwise shell out to herdr once per
+// candidate on the daemon's select loop. Deliberately per-tick and never shared
+// across sweeps: a cached screen from a minute ago is history, and staleness is
+// exactly what this is used to judge. Not safe for concurrent use, and does not
+// need to be — the pass runs on the select loop.
+type paneCache struct {
+	frames map[string]paneFrame
+}
+
+type paneFrame struct {
+	content string
+	err     error
+}
+
+func (p *paneCache) read(ctx context.Context, d *Daemon, paneID string) (string, error) {
+	if f, ok := p.frames[paneID]; ok {
+		return f.content, f.err
+	}
+	content, err := d.readVisible(ctx, paneID, d.opt.PaneReadLines)
+	if p.frames == nil {
+		p.frames = make(map[string]paneFrame)
+	}
+	p.frames[paneID] = paneFrame{content: content, err: err}
+	return content, err
+}
+
+// withoutAgents returns agents minus those in exclude, preserving order. Used
+// to withhold an agent that has just been sent an auto-accepted reply from the
+// rest of the sweep, so one tick can never write to its pane twice.
+func withoutAgents(agents []domain.AgentTransition, exclude map[string]bool) []domain.AgentTransition {
+	if len(exclude) == 0 {
+		return agents
+	}
+	out := make([]domain.AgentTransition, 0, len(agents))
+	for _, a := range agents {
+		if !exclude[a.AgentID] {
+			out = append(out, a)
+		}
+	}
+	return out
 }

@@ -51,7 +51,6 @@ func TestAutoAcceptEligible(t *testing.T) {
 		domain.ReasonNoHistory,
 		domain.ReasonUnfamiliarOptions,
 		domain.ReasonUnclassifiable,
-		domain.ReasonRateLimited,
 	} {
 		rec := escalation("[" + string(reason) + "] why")
 		if why := domain.AutoAcceptIneligible(rec, "Yes"); why != "" {
@@ -100,6 +99,28 @@ func TestAutoAcceptIneligible(t *testing.T) {
 			name:       "generated-task suggestion",
 			rec:        escalation("[task_source_exhausted] nothing pending"),
 			suggestion: domain.SuggestGenerateTask, wantWhy: "generated-task suggestion",
+		},
+		{
+			// FR-014's ceiling: auto-accepting this re-sends the very retry the
+			// ceiling exists to stop, and since an auto-accept writes no
+			// correction and is not rate-counted, the loop never terminates.
+			name:       "retry_exhausted is excluded in code",
+			rec:        escalation("[retry_exhausted] 2 retries already spent"),
+			suggestion: "respond: retry", wantWhy: "excluded reason: retry_exhausted",
+		},
+		{
+			// FR-019's ceiling: the runaway guard stood the agent down until a
+			// human checks in, and a timeout is not a check-in.
+			name:       "rate_limited is excluded in code",
+			rec:        escalation("[rate_limited] per-minute ceiling reached"),
+			suggestion: "respond: Yes", wantWhy: "excluded reason: rate_limited",
+		},
+		{
+			// "@noop" is a SENTINEL meaning "send nothing". Delivery treats it
+			// as ordinary text, so accepting it would type "@noop" at the agent.
+			name:       "noop suggestion is refused rather than typed at the agent",
+			rec:        escalation("[shadow_mode] learning"),
+			suggestion: domain.ActionNoop, wantWhy: "noop suggestion",
 		},
 		{
 			// The entire pre-upgrade backlog looks like this.

@@ -879,3 +879,157 @@ func TestAutoAcceptStatePrunedWhenEscalationsLeaveTheEligibleSet(t *testing.T) {
 		t.Errorf("%d entries survived after leaving the eligible set; the map is unbounded", tracked)
 	}
 }
+
+// TestAutoAcceptNeverTypesTheNoopSentinel: "@noop" is a sentinel meaning "send
+// nothing". The delivery pipeline deliberately treats it as ordinary text, so
+// without an explicit gate an auto-accept would type "@noop" into the agent.
+func TestAutoAcceptNeverTypesTheNoopSentinel(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	// The spelling the LLM-reject path writes, which SuggestedAction resolves
+	// to the sentinel.
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval,
+		domain.ActionNoopSuggestion, 20*time.Minute)
+
+	for i := 0; i < 3; i++ {
+		h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	}
+	for _, got := range h.herdr.sentInputs() {
+		if strings.Contains(got, "@noop") {
+			t.Fatalf("the noop SENTINEL was typed at the agent: %q", got)
+		}
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("a noop suggestion means send nothing, got %v", got)
+	}
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Errorf("status = %q, want it left for the operator", got)
+	}
+}
+
+// TestAutoAcceptNeverReSendsAnExhaustedRetry: FR-014's ceiling. Auto-accepting
+// a retry_exhausted escalation would re-send the very retry the ceiling exists
+// to stop — and because an auto-accept writes no correction and is not counted
+// against [limits], the counter never advances, so the loop would repeat every
+// threshold window forever with nobody watching.
+func TestAutoAcceptNeverReSendsAnExhaustedRetry(t *testing.T) {
+	for _, reason := range []string{"retry_exhausted", "rate_limited"} {
+		t.Run(reason, func(t *testing.T) {
+			h := newHarness(t, autoAcceptOn)
+			ctx := context.Background()
+			h.herdr.setPane(approvalPane)
+			id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval,
+				"respond: Yes", 10*time.Hour)
+			if err := h.raw.EscalateAudit(ctx, id, "["+reason+"] ceiling reached", "respond: Yes"); err != nil {
+				t.Fatal(err)
+			}
+
+			for i := 0; i < 5; i++ {
+				h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+			}
+			if got := auditStatus(t, h, id); got != "escalated" {
+				t.Errorf("status = %q; a ceiling verdict must stay for the operator", got)
+			}
+			if got := h.herdr.sentInputs(); len(got) != 0 {
+				t.Errorf("nothing may be sent, got %v", got)
+			}
+		})
+	}
+}
+
+// TestAutoAcceptReadsEachPaneOncePerTick: the pass runs on the daemon's select
+// loop and each pane read shells out to herdr. Every escalation on an agent
+// looks at the SAME screen, so re-reading per candidate would stall the loop
+// for no new information.
+func TestAutoAcceptReadsEachPaneOncePerTick(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	ctx := context.Background()
+	// A pane that has moved on, so no candidate is consumed by a delivery and
+	// every one of them reaches Guard 3.
+	h.herdr.setPane("● Elsewhere now.\n\n❯ \n")
+	for i := 0; i < 4; i++ {
+		seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval,
+			"respond: Yes", time.Duration(20+i)*time.Minute)
+	}
+	before := len(h.herdr.readLineCalls())
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	if reads := len(h.herdr.readLineCalls()) - before; reads > 1 {
+		t.Errorf("%d pane reads for one agent in one tick, want 1", reads)
+	}
+}
+
+// TestAutoAcceptUnstructuredMismatchLeavesPending: a pane-tail salient cannot
+// be compared confidently here — the baseline was minted from a consuming
+// "recent" read while the guard re-reads the visible screen, so the two hash
+// differently even when nothing changed. A comparison known to be unreliable
+// must never DESTROY a queue entry: leave it pending rather than dismiss it.
+func TestAutoAcceptUnstructuredMismatchLeavesPending(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	ctx := context.Background()
+	h.writeConfig(t, autoAcceptOn+"\nidle = \"15m\"\n")
+	h.daemon.reload()
+
+	before := "● Ready.\n\nEvery check has completed and the working tree is clean.\n\n❯ \n"
+	s := classifierForTest().Classify("claude", "idle", before)
+	if s.Type != domain.SituationIdle {
+		t.Skipf("fixture classifies as %v, not idle", s.Type)
+	}
+	sig := domain.ComputeSignature(s)
+	if domain.StructuredSalient(sig.Salient) {
+		t.Skip("fixture is not an unstructured pane-tail salient")
+	}
+	id, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "pA", AgentType: "claude", Trigger: "status", SituationType: domain.SituationIdle,
+		Action: domain.AuditActionEscalated, Status: "escalated",
+		Rationale: "[no_task_source] nothing declared", Suggestion: "respond: carry on",
+		PaneExcerpt: before, CreatedAt: time.Now().Add(-20 * time.Minute),
+	}.WithSignatureBaseline(sig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A completely different idle screen — still idle, but nothing alike.
+	h.herdr.setPane("● Ready.\n\nWaiting for instructions after a long and unrelated build.\n\n❯ \n")
+
+	for i := 0; i < 3; i++ {
+		h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+	}
+	if got := auditStatus(t, h, id); got == "dismissed" {
+		t.Error("an unstructured salient mismatch DESTROYED the queue entry; " +
+			"the comparison is known to be unreliable for pane-tail salients, so it must leave it pending")
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("nor may it deliver on an unreliable comparison, got %v", got)
+	}
+}
+
+// TestAutoAcceptWithholdsDeliveredAgentsFromTheRestOfTheSweep: clearing the
+// escalation is exactly what stops the later passes skipping that agent, so
+// without this a parked agent could take the auto-accepted reply AND an idle
+// task hand-out in the same tick, before its TUI had repainted.
+func TestAutoAcceptWithholdsDeliveredAgentsFromTheRestOfTheSweep(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 20*time.Minute)
+
+	agents := []domain.AgentTransition{
+		{AgentID: "pA", PaneID: "pA", AgentType: "claude", Status: "blocked"},
+		{AgentID: "pB", PaneID: "pB", AgentType: "claude", Status: "idle"},
+	}
+	delivered := h.daemon.autoAcceptEscalations(ctx, agents)
+
+	if !delivered["pA"] {
+		t.Fatalf("pA should have been delivered to, got %v", delivered)
+	}
+	rest := withoutAgents(agents, delivered)
+	if len(rest) != 1 || rest[0].AgentID != "pB" {
+		t.Errorf("rest = %+v, want only pB — pA must sit out the remainder of the tick", rest)
+	}
+	// An empty exclusion set must not copy or reorder.
+	if got := withoutAgents(agents, nil); len(got) != 2 {
+		t.Errorf("withoutAgents(agents, nil) = %d agents, want 2", len(got))
+	}
+}

@@ -1135,7 +1135,17 @@ func (s *Store) AutoAcceptableEscalations(ctx context.Context, cutoffs map[domai
 		clauses = append(clauses, "(situation_type = ? AND created_at <= ?)")
 		args = append(args, t, unix(cutoffs[domain.SituationType(t)]))
 	}
-	q := `SELECT ` + auditCols + ` FROM audit_log WHERE status = 'escalated' AND (` +
+	// sig_raw / suggestion presence ARE pushed down, unlike every other
+	// eligibility rule. They are mechanical presence checks with no judgement in
+	// them (the caller re-checks both), and leaving them out starves the query:
+	// the fetch is oldest-first and capped, pre-migration rows carry no baseline
+	// and are never backfilled, so an upgrade with more aged escalations than
+	// the cap would return a window that is 100% ineligible on every tick,
+	// forever. The REASON exclusion deliberately stays in Go — LIKE-matching a
+	// free-text rationale fails open, which is the wrong direction for a safety
+	// exclusion.
+	q := `SELECT ` + auditCols + ` FROM audit_log WHERE status = 'escalated'
+		AND sig_raw != '' AND suggestion != '' AND (` +
 		strings.Join(clauses, " OR ") + `) ORDER BY created_at ASC, id ASC LIMIT ?`
 	args = append(args, autoAcceptCandidateLimit)
 	rows, err := s.db.QueryContext(ctx, q, args...)

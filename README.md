@@ -1505,15 +1505,28 @@ If any of that cannot be *evaluated* — an unreadable pane, an unreachable herd
 — nothing happens and the escalation simply waits. Only a check that ran and
 came back negative retires one.
 
+That last check is strongest for approvals, choices and errors, whose stored
+signature is a distilled identity (the permission verb and option set, the
+option set, the error summary). Situations whose signature falls back to raw
+screen text — idle and unclassifiable, and the rarer approval with no
+recognisable verb — cannot be compared as confidently, so they are neither
+delivered nor dismissed on that comparison: they stay in your queue. It is
+another reason `idle` and `unclassifiable` ship disabled.
+
 What it deliberately does **not** do:
 
 - **It never learns from itself.** An auto-accept delivers the suggestion but
   writes no correction, so it contributes no confidence and no graduation
   progress. A machine's decision to stop waiting is not evidence the suggestion
   was right — otherwise the feature would slowly promote its own guesses.
-- **It never touches a never-auto match** (`never_auto_match`,
-  `suspected_irreversible`). Those always reach a human; that exclusion is in
-  code and cannot be configured away.
+- **It never touches an escalation a ceiling or a safety rule raised.**
+  `never_auto_match` and `suspected_irreversible` always reach a human, and so
+  do `retry_exhausted` and `rate_limited` — each means automation has already
+  done this as often as it is allowed to, and a timeout is not a human checking
+  in. These exclusions are in code and cannot be configured away.
+- **It never types the "do nothing" sentinel at an agent.** An escalation whose
+  suggestion is "no reply needed" is left for you rather than answered with
+  literal text.
 - **At most one escalation per agent per sweep**, so two ageing out together
   can never fire into the same pane back to back.
 

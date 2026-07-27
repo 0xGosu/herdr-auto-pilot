@@ -56,9 +56,10 @@ max_error_retries = 2              # per error signature
 #
 # It delivers but never LEARNS: no correction is written, so an
 # auto-accept contributes no confidence and no graduation progress. It
-# never touches a never-auto / suspected-irreversible escalation (excluded
-# in code, not configurable), never acts while paused, and answers at most
-# one escalation per agent per sweep.
+# never touches an escalation raised by a safety rule or a ceiling
+# (never_auto_match, suspected_irreversible, retry_exhausted,
+# rate_limited — excluded in code, not configurable), never acts while
+# paused, and answers at most one escalation per agent per sweep.
 [escalations.auto_accept]
 enabled = false            # master switch — false ignores every threshold below
 approval = "15m"           # per situation type; a time.ParseDuration string

@@ -896,9 +896,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 				// Ahead of the reconcile and the idle poll: an escalation
 				// accepted this tick no longer blocks its agent's
 				// hasOpenEscalation guard, so the same sweep can move it on.
-				d.autoAcceptEscalations(ctx, agents)
-				d.reconcileAttentionWith(ctx, agents)
-				d.autoSendIdleTasks(ctx, agents)
+				//
+				// But an agent that just RECEIVED an auto-accepted reply is
+				// withheld from both later passes for this tick. Its pane has
+				// input in flight that herdr has not reported acted on yet, and
+				// clearing the escalation is precisely what stops those passes
+				// from skipping it — so without this, a parked agent could take
+				// the reply and an idle task hand-out microseconds apart,
+				// before its TUI had even repainted. The next sweep sees the
+				// settled state and proceeds normally.
+				delivered := d.autoAcceptEscalations(ctx, agents)
+				rest := withoutAgents(agents, delivered)
+				d.reconcileAttentionWith(ctx, rest)
+				d.autoSendIdleTasks(ctx, rest)
 				return nil
 			})
 		case tr := <-d.transitions:
