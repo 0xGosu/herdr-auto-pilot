@@ -1,4 +1,4 @@
-.PHONY: native-deps build lint test test-race test-corpus check build-hap-and-reload reinstall-hap-from-github
+.PHONY: native-deps build lint test test-race test-corpus check-submodules check build-hap-and-reload reinstall-hap-from-github
 # SHELL := /bin/bash is required for `set -o pipefail` in *-dev targets (tee log files).
 # This affects ALL Make recipes in this file — all recipes must remain bash-compatible.
 SHELL := /bin/bash
@@ -12,7 +12,13 @@ GOLANGCI_BUILD_TAGS ?= vectors,cpu
 GO_TEST_TIMEOUT ?= 15m
 RACE_PACKAGES := ./internal/store/... ./internal/domain/... ./internal/control/... ./internal/embedder/... ./internal/match/... ./internal/daemon/...
 
-native-deps:
+# Seconds long, and it must run BEFORE native-deps: a submodule gitlink
+# replaced by a symlink (the worktree native-build trick, committed) surfaces
+# otherwise as a linker error deep inside setup-native.sh. See #265.
+check-submodules:
+	bash scripts/check-submodule-gitlink.sh
+
+native-deps: check-submodules
 	bash scripts/setup-native.sh
 
 build:
@@ -53,7 +59,7 @@ test-corpus:
 		exit 1; \
 	}
 
-check: lint test test-race test-corpus
+check: check-submodules lint test test-race test-corpus
 
 bin/hap:
 	@$(MAKE) build

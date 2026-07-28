@@ -21,6 +21,7 @@ The semantic matcher links native code (llama.cpp via CGO, FAISS behind bleve's
 always — a build without both fails to link.
 
 ```sh
+bash scripts/check-submodule-gitlink.sh        # seconds: submodule must be a gitlink, not a symlink (#265)
 bash scripts/setup-native.sh                   # one-time: submodules + llama-go libs + FAISS → /usr/local/lib
 go build -tags "vectors cpu" ./...             # CGO; needs a C/C++ toolchain
 go test -tags "vectors cpu" ./... -count=1     # full unit/golden/safety/semantic suite (what CI runs)
