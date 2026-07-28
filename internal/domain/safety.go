@@ -214,6 +214,36 @@ func SeedRuleForRationale(rationale string) (NeverAutoRule, bool) {
 	return NeverAutoRule{}, false
 }
 
+// SeedRuleForcedEscalation resolves the shipped never-auto rule that FORCED an
+// escalation. It is the gate every "silence this rule" affordance must use —
+// SeedRuleForRationale alone is not enough.
+//
+// Two conditions, both required:
+//
+//   - the rationale carries a source=seed diagnostic (SeedRuleForRationale),
+//     which rules out an operator rule whose pattern text equals a shipped
+//     one; and
+//   - the escalation's REASON is one whose rationale IS that hit.
+//
+// The second is not redundant. The variance guard appends the
+// suspected-irreversible diagnostic to its OWN rationale, so a confirmable line
+// still names why the action looked destructive — which means a
+// [variance_guard] row names a seed rule that did not force it. Offering to
+// disable that rule would weaken the safety net on a false premise AND leave
+// the operator still blocked, because the guard keeps escalating the same
+// situation.
+func SeedRuleForcedEscalation(rationale string) (NeverAutoRule, bool) {
+	reason, ok := EscalationReason(rationale)
+	if !ok {
+		return NeverAutoRule{}, false
+	}
+	switch reason {
+	case ReasonNeverAutoMatch, ReasonSuspectedIrrevers:
+		return SeedRuleForRationale(rationale)
+	}
+	return NeverAutoRule{}, false
+}
+
 // compiledNeverAutoRule is one unified rule ready for matching.
 type compiledNeverAutoRule struct {
 	rule NeverAutoRule

@@ -1067,6 +1067,13 @@ The id is a hash of the pattern, so it names the same rule across upgrades (and
 is rejected if that pattern no longer ships). One seed rule is a single regex
 that may cover several phrasings — disabling it silences all of them.
 
+In the TUI you can do the same without leaving the escalation it blocked: on the
+Escalations tab (or inside an escalation's `v` detail), **`b` disables the one
+builtin rule that forced the selected escalation**, after a confirmation naming
+the rule and its id. It is offered only while that escalation was actually
+raised by a builtin rule, and it never touches any other rule — the detail view
+shows the id under `Builtin rule` either way.
+
 Extend the set with your own regex patterns:
 
 ```toml

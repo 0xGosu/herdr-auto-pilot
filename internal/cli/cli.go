@@ -868,7 +868,11 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 	// exact command to silence just that one rule. Gated on esc[0] — the SAME row
 	// as the confirm/dismiss ids above — so the hint always refers to the
 	// escalation being acted on, never an unrelated older row in a mixed queue.
-	if rule, ok := domain.SeedRuleForRationale(esc[0].Rationale); ok {
+	// Gated on the rule having FORCED this escalation, not merely being named
+	// in its rationale: the variance guard appends the same diagnostic to its
+	// own, so a [variance_guard] row would otherwise get a hint offering to
+	// disable a rule that is not why it escalated.
+	if rule, ok := domain.SeedRuleForcedEscalation(esc[0].Rationale); ok {
 		hints = append(hints, Hint{
 			Cmd: fmt.Sprintf("hap rules disable-seed %s", domain.SeedRuleID(rule.Pattern)),
 			Why: fmt.Sprintf("a builtin safety rule blocked escalation #%d — silence it if it is too aggressive for this repo", id),

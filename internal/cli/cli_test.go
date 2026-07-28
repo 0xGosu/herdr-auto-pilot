@@ -885,9 +885,16 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 	}
 }
 
-// seedHeuristicDiagnostic returns a real builtin-heuristic hit's rationale plus
-// the durable id and pattern of the seed rule that produced it.
-func seedHeuristicDiagnostic(t *testing.T) (rationale, id, pattern string) {
+// seedHeuristicRationale returns the rationale a real builtin-heuristic hit
+// produces AS THE DAEMON PERSISTS IT — the machine-readable "[reason]" tag it
+// prefixes (daemon.escalate) followed by the hit's diagnostic — plus the
+// durable id and pattern of the seed rule behind it.
+//
+// The tag is not cosmetic: it is what says the rule is the CAUSE, and the
+// disable-seed hint is gated on it (a [variance_guard] row carries the same
+// diagnostic for a rule that did not force it). A fixture without the tag
+// would test a record shape that never reaches the database.
+func seedHeuristicRationale(t *testing.T) (rationale, id, pattern string) {
 	t.Helper()
 	list, errs := domain.NewNeverAutoList(true, nil, nil, nil)
 	if len(errs) > 0 {
@@ -901,7 +908,8 @@ func seedHeuristicDiagnostic(t *testing.T) (rationale, id, pattern string) {
 	if !ok {
 		t.Fatal("seed rationale must resolve to a rule")
 	}
-	return hit.Diagnostic(), domain.SeedRuleID(rule.Pattern), rule.Pattern
+	return "[" + string(domain.ReasonSuspectedIrrevers) + "] " + hit.Diagnostic(),
+		domain.SeedRuleID(rule.Pattern), rule.Pattern
 }
 
 func TestRulesListShowsSeedIDsAndDisables(t *testing.T) {
@@ -953,7 +961,7 @@ func TestRulesListShowsSeedIDsAndDisables(t *testing.T) {
 
 func TestEscalationsHintsDisableSeedForBuiltinRule(t *testing.T) {
 	app, st := testApp(t)
-	rationale, wantID, _ := seedHeuristicDiagnostic(t)
+	rationale, wantID, _ := seedHeuristicRationale(t)
 
 	st.AppendAudit(context.Background(), domain.AuditRecord{Signature: "approval:seedhit0001",
 		Trigger: "purge?", SituationType: domain.SituationApproval, Action: "escalated",
@@ -991,7 +999,7 @@ func TestEscalationsOmitsDisableSeedForNonSeedEscalation(t *testing.T) {
 func TestEscalationsDisableSeedHintTracksNewestRow(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
-	rationale, wantID, _ := seedHeuristicDiagnostic(t)
+	rationale, wantID, _ := seedHeuristicRationale(t)
 
 	// Older row is the seed-caused one; a newer non-seed row sits on top.
 	st.AppendAudit(ctx, domain.AuditRecord{Signature: "approval:oldseed0001",
@@ -1016,6 +1024,32 @@ func TestEscalationsDisableSeedHintTracksNewestRow(t *testing.T) {
 	out, _ = run(t, app, "escalations")
 	if !strings.Contains(out, "hap rules disable-seed "+wantID) {
 		t.Errorf("a seed-caused newest row should surface the hint, got:\n%s", out)
+	}
+}
+
+// TestEscalationsOmitsDisableSeedWhenAnotherReasonNamedTheRule is the
+// regression for the variance guard naming a rule it was not blocked by: it
+// appends the suspected-irreversible diagnostic to its OWN rationale, so the
+// row names a seed rule while a different control forced the escalation.
+// Hinting disable-seed there would tell the operator to weaken the safety net
+// on a false premise — and leave them blocked, since the guard keeps escalating.
+func TestEscalationsOmitsDisableSeedWhenAnotherReasonNamedTheRule(t *testing.T) {
+	app, st := testApp(t)
+	rationale, _, _ := seedHeuristicRationale(t)
+	// Same diagnostic, different (and truthful) reason tag.
+	_, diagnostic, _ := strings.Cut(rationale, "] ")
+	varianceGuard := "[" + string(domain.ReasonVarianceGuard) + "] contradictory history; " + diagnostic
+
+	st.AppendAudit(context.Background(), domain.AuditRecord{Signature: "approval:variance001",
+		Trigger: "purge?", SituationType: domain.SituationApproval, Action: "escalated",
+		Rationale: varianceGuard, Status: "escalated", CreatedAt: time.Now()})
+
+	out, err := run(t, app, "escalations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "disable-seed") {
+		t.Errorf("a rule the variance guard merely named must not be hinted for disabling, got:\n%s", out)
 	}
 }
 
