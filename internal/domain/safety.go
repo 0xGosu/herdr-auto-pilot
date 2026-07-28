@@ -190,28 +190,126 @@ func IsSeedPattern(pattern string) bool {
 }
 
 // SeedRuleForRationale maps an escalation rationale back to the seed rule that
-// produced it. It requires the stable Diagnostic() rendering
-// ("pattern <P> matched …") AND, immediately after that hit's excerpt, the
-// seed-source marker "(source=seed ": an operator rule whose pattern text
-// happens to equal a seed's — or a hit taken once that seed is disabled —
-// renders "(source=operator " and must NOT resolve to a builtin, or the hint
-// would name an unrelated (or already-inactive) rule. Anchoring the source
-// check to the position after this rule's own match keeps a crafted excerpt
-// elsewhere in the rationale from spoofing it. The bool is false when no seed
-// rule matches.
+// produced it, by parsing the FIRST hit-shaped diagnostic in the string and
+// requiring that hit's own provenance to say seed. The bool is false when the
+// first hit is operator-sourced, names no shipped pattern, or is absent.
+//
+// Binding to the FIRST hit is what makes attribution safe, and it is why this
+// parses a diagnostic rather than searching for one. Two regions of a rationale
+// are attacker-influenced: the excerpt is PANE CONTENT, and the daemon
+// interpolates raw LLM text after the hit (the retry path appends
+// "LLM: "+rationale, and a consult error is stored verbatim) — a
+// never_auto_match row can carry both. Searching would let either region
+// supply a fabricated diagnostic, and because a search runs in seed-list order
+// a forgery naming an EARLIER seed rule would outrank the genuine hit. The
+// operator is then offered "disable this builtin rule" for a rule that never
+// fired: the safety net gets weaker and the agent stays blocked by the rule
+// that did fire.
+//
+// The first hit is the genuine one on every path that produces these
+// rationales: the daemon writes "[reason] " and at most a literal prefix
+// ("action review: ", "LLM action: ") ahead of Diagnostic(), and everything
+// untrusted is APPENDED. %q escapes the excerpt's own quotes and backslashes,
+// so the closing quote found here is always its real end.
+//
+// The Pattern field is interpolated unescaped, so this does assume
+// operator-authored rule text is trustworthy — an operator who writes a rule
+// whose pattern text is itself a diagnostic can name any rule they like, which
+// is a config-authoring concern, not an agent-reachable one.
 func SeedRuleForRationale(rationale string) (NeverAutoRule, bool) {
-	seedSource := "(source=" + string(NeverAutoSeed) + " "
+	pattern, source, ok := firstDiagnostic(rationale)
+	if !ok || source != string(NeverAutoSeed) {
+		return NeverAutoRule{}, false
+	}
 	for _, r := range SeedNeverAutoRules() {
-		marker := "pattern " + r.Pattern + " matched"
-		i := strings.Index(rationale, marker)
-		if i < 0 {
-			continue
-		}
-		if strings.Contains(rationale[i+len(marker):], seedSource) {
+		if r.Pattern == pattern {
 			return r, true
 		}
 	}
 	return NeverAutoRule{}, false
+}
+
+const (
+	hitPrefix = "pattern "
+	hitInfix  = " matched "
+	hitSource = " (source="
+)
+
+// firstDiagnostic returns the pattern and source of the first complete
+// Diagnostic() rendering in s. Occurrences that do not parse are skipped
+// rather than ending the search: a fabricated diagnostic inside a %q-escaped
+// excerpt matches the literal prefix but fails the quoting, and must not hide
+// the genuine hit that follows it.
+func firstDiagnostic(s string) (pattern, source string, ok bool) {
+	for off := 0; off < len(s); {
+		i := strings.Index(s[off:], hitPrefix)
+		if i < 0 {
+			return "", "", false
+		}
+		off += i + len(hitPrefix)
+		if p, src, found := parseDiagnostic(s[off:]); found {
+			return p, src, true
+		}
+	}
+	return "", "", false
+}
+
+// parseDiagnostic reads "<pattern> matched <%q excerpt> (source=<src> kind=…)"
+// at the start of s. A pattern may itself contain " matched ", so each
+// candidate split is tried left to right and the first one whose tail parses
+// wins — the same split fmt.Sprintf produced.
+func parseDiagnostic(s string) (pattern, source string, ok bool) {
+	for j := 0; j < len(s); {
+		k := strings.Index(s[j:], hitInfix)
+		if k < 0 {
+			return "", "", false
+		}
+		candidate, rest := s[:j+k], s[j+k+len(hitInfix):]
+		j += k + len(hitInfix)
+		end, quoted := endOfQuoted(rest)
+		if !quoted {
+			continue
+		}
+		src, found := sourceOf(rest[end:])
+		if !found {
+			continue
+		}
+		return candidate, src, true
+	}
+	return "", "", false
+}
+
+// sourceOf reads the source field of the " (source=<src> kind=<kind>)" suffix.
+// A hit rendered with neither field carries no suffix and is unattributable —
+// naming a rule for it would be a guess.
+func sourceOf(s string) (string, bool) {
+	if !strings.HasPrefix(s, hitSource) {
+		return "", false
+	}
+	rest := s[len(hitSource):]
+	i := strings.Index(rest, " ")
+	if i < 0 {
+		return "", false
+	}
+	return rest[:i], true
+}
+
+// endOfQuoted returns the offset just past the closing quote of the Go-quoted
+// string (as %q renders it) at the start of s, and false when s does not start
+// with a complete one.
+func endOfQuoted(s string) (int, bool) {
+	if len(s) == 0 || s[0] != '"' {
+		return 0, false
+	}
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++ // the next byte is escaped, never a terminator
+		case '"':
+			return i + 1, true
+		}
+	}
+	return 0, false
 }
 
 // SeedRuleForcedEscalation resolves the shipped never-auto rule that FORCED an
@@ -220,9 +318,8 @@ func SeedRuleForRationale(rationale string) (NeverAutoRule, bool) {
 //
 // Two conditions, both required:
 //
-//   - the rationale carries a source=seed diagnostic (SeedRuleForRationale),
-//     which rules out an operator rule whose pattern text equals a shipped
-//     one; and
+//   - the rationale's first hit-shaped diagnostic is seed-sourced and names a
+//     shipped pattern (SeedRuleForRationale); and
 //   - the escalation's REASON is one whose rationale IS that hit.
 //
 // The second is not redundant. The variance guard appends the
