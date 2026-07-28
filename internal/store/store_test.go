@@ -2003,3 +2003,119 @@ func TestExpireStalePendingLLMRequestsReleasesGuard(t *testing.T) {
 		t.Error("a fresh pending request must not be expired")
 	}
 }
+
+// TestAuditSignatureBaselineRoundTrips pins the four sig_* columns: a row
+// written with a baseline reads it back intact, and a row written without one
+// reads back an empty SigRaw — the "no baseline available" fail-closed default
+// the auto-accept eligibility predicate keys off.
+func TestAuditSignatureBaselineRoundTrips(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	withBaseline := domain.AuditRecord{
+		AgentID: "w1:p1", AgentType: "claude", Trigger: "status", SituationType: domain.SituationApproval,
+		Action: domain.AuditActionEscalated, Status: "escalated", CreatedAt: time.Now(),
+	}.WithSignatureBaseline(domain.SignatureResult{
+		Signature: "approval:remapped", Raw: "approval:abc123",
+		Salient: "permission:apply | options:no;yes", Verdict: domain.GuardOK, SalientChars: 500,
+	})
+	withID, err := s.AppendAudit(ctx, withBaseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetAudit(ctx, withID)
+	if err != nil || got == nil {
+		t.Fatalf("GetAudit: %+v %v", got, err)
+	}
+	// The learning key and the never-remapped content hash are DISTINCT and
+	// both must survive: Guard 3 compares Raw, while the rule lookup uses
+	// Signature. Collapsing them would silently break the drift check.
+	if got.Signature != "approval:remapped" {
+		t.Errorf("Signature = %q, want the remapped learning key", got.Signature)
+	}
+	if got.SigRaw != "approval:abc123" {
+		t.Errorf("SigRaw = %q, want the never-remapped content hash", got.SigRaw)
+	}
+	if got.SigSalient != "permission:apply | options:no;yes" {
+		t.Errorf("SigSalient = %q", got.SigSalient)
+	}
+	if got.SigVerdict != domain.GuardOK {
+		t.Errorf("SigVerdict = %q, want %q", got.SigVerdict, domain.GuardOK)
+	}
+	if got.SigSalientChars != 500 {
+		t.Errorf("SigSalientChars = %d, want 500", got.SigSalientChars)
+	}
+
+	bareID, err := s.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p2", Trigger: "status", SituationType: domain.SituationIdle,
+		Action: "noop", Status: "auto", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare, err := s.GetAudit(ctx, bareID)
+	if err != nil || bare == nil {
+		t.Fatalf("GetAudit: %+v %v", bare, err)
+	}
+	if bare.SigRaw != "" {
+		t.Errorf("a row written outside the decision pipeline must carry no baseline, got %q", bare.SigRaw)
+	}
+}
+
+// TestMigrateAddsSignatureBaselineToLegacyAuditLog: a database predating the
+// baseline columns must migrate cleanly, and its existing rows must stay
+// baseline-less — the columns are additive and deliberately NOT backfilled, so
+// the pre-upgrade escalation backlog can never auto-accept.
+func TestMigrateAddsSignatureBaselineToLegacyAuditLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+		CREATE TABLE audit_log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			decision_id INTEGER NOT NULL DEFAULT 0,
+			agent_id TEXT NOT NULL DEFAULT '',
+			agent_type TEXT NOT NULL DEFAULT '',
+			signature TEXT NOT NULL DEFAULT '',
+			trigger TEXT NOT NULL,
+			situation_type TEXT NOT NULL,
+			action_or_escalation TEXT NOT NULL,
+			input TEXT NOT NULL DEFAULT '',
+			confidence REAL NOT NULL DEFAULT 0,
+			rationale TEXT NOT NULL DEFAULT '',
+			llm_output TEXT NOT NULL DEFAULT '',
+			corrects_audit_id INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT '',
+			suggestion TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL
+		);
+		INSERT INTO audit_log (trigger, situation_type, action_or_escalation, status, created_at)
+		VALUES ('status', 'approval', 'escalated', 'escalated', 1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("opening a pre-baseline DB must migrate, got: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	ctx := context.Background()
+	pending, err := s.PendingEscalations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending = %d, want the legacy row to survive", len(pending))
+	}
+	if pending[0].SigRaw != "" || pending[0].SigSalientChars != 0 {
+		t.Errorf("a legacy row must NOT be backfilled, got raw=%q chars=%d",
+			pending[0].SigRaw, pending[0].SigSalientChars)
+	}
+}

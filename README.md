@@ -523,6 +523,15 @@ max_consecutive_auto_prompts = 30  # per agent, without human interaction
 max_auto_prompts_per_minute = 5    # per agent
 max_error_retries = 2              # per error signature
 
+# Auto-accept aged escalations — OFF by default, see the section below.
+[escalations.auto_accept]
+enabled = false            # master switch; false ignores every threshold below
+approval = "15m"           # how long an escalation waits before hap answers it
+choice = "15m"
+error = "15m"
+idle = "0"                 # "0" disables that situation type
+unclassifiable = "0"
+
 # Semantic rule matching: situations are matched to learned rules by
 # embedding their masked salient content (llama.cpp, MiniLM by default) in an
 # isolated worker and vector-searching stored signatures, so a paraphrased
@@ -1455,6 +1464,92 @@ Invariants:
   TUI **Config** tab and select the **Repoint /usr/local/bin/hap** row under
   **Quick Shortcuts**.
 
+### Answering escalations you never got to (optional)
+
+An escalation waits for you. If you are asleep, in a meeting, or simply
+elsewhere, every agent behind one stays blocked until you come back — even when
+hap already worked out the answer and is only waiting for a nod (a rule still
+one confirmation short of graduating, a score just under its threshold, a
+shadow-mode suggestion hap generated itself).
+
+`[escalations.auto_accept]` turns that queue from a hard stop into a slow lane:
+an escalation that has waited past its threshold, and whose situation is still
+demonstrably on screen, is answered automatically.
+
+```toml
+[escalations.auto_accept]
+enabled = true
+approval = "15m"
+choice = "15m"
+error = "15m"
+idle = "0"                 # disabled
+unclassifiable = "0"       # disabled
+```
+
+**It is off by default and upgrading does not turn it on.** The *threshold*
+defaults to 15 minutes; the *feature* defaults to off. Each duration is a
+`time.ParseDuration` string (`"15m"`, `"1h30m"`); `"0"` disables that situation
+type. A value below one minute — the sweep's granularity — is rejected at load
+rather than quietly rounded, and so is anything unparseable: the whole section
+is then ignored, so a typo can never start sending on your behalf.
+
+Before anything is delivered, all of this must hold:
+
+- the kill switch is off and the agent is neither paused nor disabled;
+- the agent still exists and is parked (`blocked` / `idle` / `done`);
+- the pane still shows **the same situation** the escalation was raised for —
+  re-read and re-classified, and compared against the signature stored on the
+  audit row using the same staleness check a deferred LLM send uses.
+
+If any of that cannot be *evaluated* — an unreadable pane, an unreachable herdr
+— nothing happens and the escalation simply waits. Only a check that ran and
+came back negative retires one.
+
+That last check is strongest for approvals, choices and errors, whose stored
+signature is a distilled identity (the permission verb and option set, the
+option set, the error summary). Situations whose signature falls back to raw
+screen text — idle and unclassifiable, and the rarer approval with no
+recognisable verb — cannot be compared as confidently, so they are neither
+delivered nor dismissed on that comparison: they stay in your queue. It is
+another reason `idle` and `unclassifiable` ship disabled.
+
+What it deliberately does **not** do:
+
+- **It never learns from itself.** An auto-accept delivers the suggestion but
+  writes no correction, so it contributes no confidence and no graduation
+  progress. A machine's decision to stop waiting is not evidence the suggestion
+  was right — otherwise the feature would slowly promote its own guesses.
+- **It never touches an escalation a ceiling or a safety rule raised.**
+  `never_auto_match` and `suspected_irreversible` always reach a human, and so
+  do `retry_exhausted` and `rate_limited` — each means automation has already
+  done this as often as it is allowed to, and a timeout is not a human checking
+  in. These exclusions are in code and cannot be configured away.
+- **It never types the "do nothing" sentinel at an agent.** An escalation whose
+  suggestion is "no reply needed" is left for you rather than answered with
+  literal text.
+- **At most one escalation per agent per sweep**, so two ageing out together
+  can never fire into the same pane back to back.
+
+Outcomes are visible in `audit` / the *Audit* tab: `auto-sent` for a delivered
+one, and `dism:stale` / `dism:gone` / `dism:failed` when hap retired one
+instead (the situation moved on, the agent disappeared, or delivery kept
+failing). None of these read as `resolved` — that stays yours.
+
+**Escalations raised before you upgrade can never auto-accept.** The comparison
+needs a signature baseline that older audit rows do not carry, and it is not
+backfilled, so the backlog stays yours to confirm — or to clear with
+`escalations prune`. The daemon logs this once per run so it is not mistaken
+for a broken feature.
+
+Two accepted trade-offs, recorded so they are not mistaken for oversights.
+There is **no global per-tick ceiling**: the one-per-agent rule bounds the
+blast radius per pane, and a large herd can still produce several sends in one
+sweep. And the irreversible-content scan is **not re-run at delivery time** —
+the exclusion above plus the scan performed when the escalation was raised are
+what stand between an auto-accept and a destructive command, with the
+still-on-screen check closing most of the remaining gap (content that changed
+materially fails it).
+
 ## Pause/kill switch & audit
 
 - `pause` / `resume` (CLI, TUI `p`/`r`, or Herdr plugin actions) toggle a
@@ -1470,6 +1565,13 @@ Invariants:
   Disabled agents use `[agent_disabled]`; their suppressed autonomous actions
   are written as `denied`. These lifecycle outcomes remain visible without
   notifying the operator or creating a stale pending escalation.
+- With `[escalations.auto_accept]` enabled, an escalation that waited past its
+  threshold can be answered by the daemon: the row becomes `auto_accepted`
+  (shown as `auto-sent`) and **no correction is recorded**, so nothing is
+  learned from it. Retired ones stay `dismissed` with their reason in the
+  rationale (`[auto_dismiss_stale]`, `[auto_dismiss_agent_gone]`,
+  `[auto_accept_failed]`), surfaced inline so a machine dismissal is never
+  mistaken for yours.
 - `clear-data --yes` resets all learned history and audit data (it never
   leaves your machine in the first place).
 

@@ -111,6 +111,14 @@ type SignatureResult struct {
 	Raw     string
 	Salient string
 	Verdict GuardVerdict
+	// SalientChars is the fallback content window this result was computed
+	// with. It travels WITH the signature rather than being re-read from
+	// config later, so a comparison against this result always uses the same
+	// basis it was minted under — an operator widening or narrowing
+	// embedding.pane_salient_chars afterwards cannot silently shift it and
+	// manufacture a spurious mismatch. Persisted alongside Raw/Salient on
+	// audit rows (see AuditRecord.SigSalientChars).
+	SalientChars int
 	// Match records how semantic resolution mapped this signature to its
 	// learning key (zero value until resolveSignature runs).
 	Match MatchDetail
@@ -128,21 +136,25 @@ func ComputeSignature(s Situation) SignatureResult {
 // idle and unclassified situations; salientChars <= 0 falls back to
 // DefaultPaneSalientChars.
 func ComputeSignatureN(s Situation, salientChars int) SignatureResult {
+	if salientChars <= 0 {
+		salientChars = DefaultPaneSalientChars
+	}
 	salient := salientContent(s, salientChars)
 	masked := MaskVolatile(salient)
 
 	if verdict := overMaskVerdict(masked); verdict != GuardOK {
-		return SignatureResult{Salient: masked, Verdict: verdict}
+		return SignatureResult{Salient: masked, Verdict: verdict, SalientChars: salientChars}
 	}
 
 	canon := strings.Join([]string{"v1", string(s.Type), s.AgentType, strings.ToLower(masked)}, "|")
 	sum := sha256.Sum256([]byte(canon))
 	key := string(s.Type) + ":" + hex.EncodeToString(sum[:12])
 	return SignatureResult{
-		Signature: key,
-		Raw:       key,
-		Salient:   masked,
-		Verdict:   GuardOK,
+		Signature:    key,
+		Raw:          key,
+		Salient:      masked,
+		Verdict:      GuardOK,
+		SalientChars: salientChars,
 	}
 }
 

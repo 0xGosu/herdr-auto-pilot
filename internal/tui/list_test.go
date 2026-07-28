@@ -1310,7 +1310,11 @@ func TestSignatureDetailAndDeletePromptStillShortSig(t *testing.T) {
 // configModel builds a Model on the Config tab from cfg.
 func configModel(t *testing.T, cfg config.Config) Model {
 	t.Helper()
-	m := Model{width: 100, height: 60}
+	// Tall enough to render the whole Config tab without scrolling, so tests
+	// asserting on section ORDER see every section. Keep it ahead of the row
+	// count when adding config keys — the scroll behaviour itself is covered by
+	// the dedicated paging tests, which build their own model.
+	m := Model{width: 100, height: 90}
 	upd, _ := m.Update(refreshMsg{cfg: cfg})
 	m = upd.(Model)
 	m.tab = tabConfig

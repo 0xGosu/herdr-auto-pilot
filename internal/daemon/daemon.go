@@ -230,6 +230,29 @@ type Daemon struct {
 	// after autoTaskClaimTTL. Guarded by mu.
 	autoTaskClaim map[string]taskClaim
 
+	// autoAcceptAttempts counts failed delivery attempts per aged escalation,
+	// and autoAcceptAbsent counts consecutive sweeps in which an escalation's
+	// agent was missing from the listing. Both are keyed by audit id, guarded
+	// by mu, and deliberately NOT persisted: a restart grants a fresh delivery
+	// budget (a restart may itself be the fix for a transient adapter fault)
+	// and discards half-formed absence observations (an absence must be
+	// confirmed by THIS daemon across consecutive ticks). Both fail safe when
+	// cleared. Entries are dropped when their escalation reaches a terminal
+	// status and opportunistically when an id leaves the eligible set, so they
+	// stay bounded by that set rather than by daemon uptime.
+	autoAcceptAttempts map[int64]int
+	autoAcceptAbsent   map[int64]int
+	// autoAcceptNeedsFinalize holds deliveries that LANDED but whose finalize
+	// did not commit (a transient store failure). Such a row is still
+	// 'auto_accepting', a status excluded from BOTH the operator's queue and
+	// the candidate query, so without an in-process retry it would stay
+	// invisible until the daemon happened to restart. Retried at the top of
+	// every sweep and cleared the moment it sticks; empty in a healthy daemon.
+	autoAcceptNeedsFinalize map[int64]struct{}
+	// autoAcceptBaselineWarned latches the once-per-run notice that escalations
+	// raised before the signature baseline existed are being skipped.
+	autoAcceptBaselineWarned bool
+
 	// snapshotSaved caches which signatures already have a provenance
 	// snapshot this daemon lifetime (guarded by mu), so the hot path skips
 	// the no-op INSERT OR IGNORE write transaction on repeat sightings.
@@ -414,6 +437,9 @@ func New(opt Options) (*Daemon, error) {
 		toggleAttempt:             map[string]string{},
 		idleSince:                 map[string]idleMark{},
 		autoTaskClaim:             map[string]taskClaim{},
+		autoAcceptAttempts:        map[int64]int{},
+		autoAcceptAbsent:          map[int64]int{},
+		autoAcceptNeedsFinalize:   map[int64]struct{}{},
 		snapshotSaved:             map[string]bool{},
 		paneCwds:                  map[string]paneCwdEntry{},
 		paneCwdRefreshing:         map[string]bool{},
@@ -821,6 +847,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 		if err := d.opt.Store.TouchTaskReservations(ctx, maxHandoutRestamps, d.opt.Clock.Now()); err != nil {
 			slog.Warn("auto-send: hand-out ledger could not be re-stamped at startup", "error", err)
 		}
+		// A row still holding the transient 'auto_accepting' status was
+		// abandoned mid-delivery by a crashed or replaced daemon. Return it to
+		// the pending queue: left there it would be invisible to BOTH the
+		// operator's queue and the auto-accept query (each filters on
+		// 'escalated'), silently losing the escalation and stranding its agent
+		// — the exact failure auto-accept exists to prevent. Safe even when the
+		// delivery had actually landed before the crash: the row must clear the
+		// whole guard chain again, and Guard 3 sees the changed pane and
+		// dismisses it as stale rather than answering twice.
+		if n, err := d.opt.Store.ReclaimAbandonedAutoAccepts(ctx); err != nil {
+			slog.Warn("auto-accept: abandoned claims could not be reclaimed at startup", "error", err)
+		} else if n > 0 {
+			slog.Info("auto-accept: returned abandoned claims to the pending queue", "count", n)
+		}
 		d.reconcileAttention(ctx)
 		return nil
 	})
@@ -851,16 +891,32 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)
-				// One agent listing feeds both passes: the reconcile
-				// re-drives parked episodes, then the idle poll hands a
-				// pending task to agents that have been idle too long.
+				// One agent listing feeds all three passes: auto-accept
+				// answers escalations that have waited too long, the
+				// reconcile re-drives parked episodes, then the idle poll
+				// hands a pending task to agents that have been idle too
+				// long.
 				agents, err := d.opt.Herdr.ListAgents(ctx)
 				if err != nil {
 					slog.Error("sweep: listing agents failed", "error", err)
 					return nil
 				}
-				d.reconcileAttentionWith(ctx, agents)
-				d.autoSendIdleTasks(ctx, agents)
+				// Ahead of the reconcile and the idle poll: an escalation
+				// accepted this tick no longer blocks its agent's
+				// hasOpenEscalation guard, so the same sweep can move it on.
+				//
+				// But an agent that just RECEIVED an auto-accepted reply is
+				// withheld from both later passes for this tick. Its pane has
+				// input in flight that herdr has not reported acted on yet, and
+				// clearing the escalation is precisely what stops those passes
+				// from skipping it — so without this, a parked agent could take
+				// the reply and an idle task hand-out microseconds apart,
+				// before its TUI had even repainted. The next sweep sees the
+				// settled state and proceeds normally.
+				delivered := d.autoAcceptEscalations(ctx, agents)
+				rest := withoutAgents(agents, delivered)
+				d.reconcileAttentionWith(ctx, rest)
+				d.autoSendIdleTasks(ctx, rest)
 				return nil
 			})
 		case tr := <-d.transitions:
@@ -1326,6 +1382,15 @@ const (
 	// choice options, error summary) don't take this path at all — a one-word
 	// target swap there stays ~86% similar, so they require an exact match
 	// (domain.StructuredSalient; the test-vs-live collision from PR #230).
+	//
+	// SECOND CALLER, and a much longer window: the aged-escalation auto-accept
+	// pass (autoaccept.go) reuses this same constant to ask whether a situation
+	// held still across a wait measured in MINUTES-to-hours rather than the
+	// seconds-to-minutes a consult spans. Reusing it is deliberate — one
+	// semantics, one comparator, no drift between two staleness checks that ask
+	// the identical question — but it means retuning this value silently
+	// retunes how readily hap answers an escalation with no human present.
+	// Weigh both call sites before changing it.
 	staleDeferredSendJitterPercent = 15
 )
 
@@ -1949,12 +2014,12 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 	}
 
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
+		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + del.input, Input: del.input,
 		Confidence: dec.Confidence, LLMConfidence: del.llmConfidence,
 		Rationale: del.rationale, LLMOutput: del.llmOutput,
 		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
-	})
+	}.WithSignatureBaseline(sig))
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
 		d.notify(ctx, "Herd Auto Prompter: persistence failure",
@@ -2119,11 +2184,11 @@ func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain
 func (d *Daemon) deliverNoopClaimed(ctx context.Context, s domain.Situation,
 	sig domain.SignatureResult, dec domain.Decision, tr domain.AgentTransition, now time.Time) {
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
+		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "noop", Input: "",
 		Confidence: dec.Confidence, Rationale: dec.Rationale,
 		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
-	})
+	}.WithSignatureBaseline(sig))
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous noop (FR-024)", "error", err)
 		d.notify(ctx, "Herd Auto Prompter: persistence failure",
@@ -2178,14 +2243,14 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 	executed := d.withAgentAutomation(ctx, s, res.sig, res.tr, "", res.dec.Confidence, llmConf,
 		domain.ActionNoop, now, func() {
 			auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-				AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature,
+				AgentID: s.AgentID, AgentType: s.AgentType,
 				Trigger: trigger(res.tr), SituationType: s.Type, Action: "noop", Input: "",
 				Confidence: res.dec.Confidence, LLMConfidence: llmConf,
 				Rationale: rationale,
 				LLMOutput: domain.ActionNoop,
 				Status:    "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
 				CreatedAt: now,
-			})
+			}.WithSignatureBaseline(res.sig))
 			if err != nil {
 				slog.Error("audit write failed; blocking review noop (FR-024)", "error", err)
 				d.notify(ctx, "Herd Auto Prompter: persistence failure",
@@ -2250,7 +2315,7 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		rationale += " " + dec.Rationale
 	}
 	rec := domain.AuditRecord{
-		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature, Trigger: trigger(tr),
+		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 		SituationType: s.Type, Action: domain.AuditActionEscalated, Confidence: dec.Confidence,
 		LLMConfidence: dec.LLMConfidence,
 		Rationale:     rationale,
@@ -2265,7 +2330,10 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		MatchScore:  sig.Match.Score,
 		EmbedError:  sig.Match.EmbedError,
 		CreatedAt:   now,
-	}
+		// Signature + the persisted baseline (sig_raw / sig_salient /
+		// sig_verdict / sig_salient_chars): plumbing only, sig is already a
+		// parameter here and is NOT recomputed.
+	}.WithSignatureBaseline(sig)
 	if autoDismissReason != "" {
 		// Store the would-be escalation directly as dismissed. This is atomic
 		// from the front-end's perspective (it can never flash in the pending
@@ -3782,12 +3850,12 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	executed := d.withAgentAutomation(ctx, s, res.sig, tr, llmDec.Action,
 		computedConf, &llmConf, llmDec.CapturedOutput, now, func() {
 			auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-				AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
+				AgentID: s.AgentID, AgentType: s.AgentType, Trigger: "llm-fallback",
 				SituationType: s.Type, Action: domain.AuditActionAutoPrefix + llmDec.Action, Input: llmDec.Action,
 				Confidence: computedConf, LLMConfidence: &llmConf,
 				Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
 				Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
-			})
+			}.WithSignatureBaseline(res.sig))
 			if err != nil {
 				slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)
 				d.notify(ctx, "Herd Auto Prompter: persistence failure",

@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -113,6 +114,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	match_method TEXT NOT NULL DEFAULT '',
 	match_score REAL NOT NULL DEFAULT 0,
 	embed_error TEXT NOT NULL DEFAULT '',
+	-- The row's SignatureResult, kept as the baseline for a later staleness
+	-- comparison (see domain.AuditRecord.SigRaw). '' = no baseline.
+	sig_raw TEXT NOT NULL DEFAULT '',
+	sig_salient TEXT NOT NULL DEFAULT '',
+	sig_verdict TEXT NOT NULL DEFAULT '',
+	sig_salient_chars INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
@@ -262,6 +269,17 @@ func (s *Store) migrate() error {
 		`ALTER TABLE audit_log ADD COLUMN match_method TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE audit_log ADD COLUMN match_score REAL NOT NULL DEFAULT 0`,
 		`ALTER TABLE audit_log ADD COLUMN embed_error TEXT NOT NULL DEFAULT ''`,
+		// The row's full SignatureResult: the never-remapped content hash, the
+		// masked salient, the over-mask verdict, and the salient window used.
+		// Written on every decision-pipeline row (status 'auto' as well as
+		// 'escalated'), which is what lets a row later demoted to escalated
+		// carry a comparable baseline. NOT backfilled: '' means "no baseline",
+		// so every pre-migration row is permanently ineligible for auto-accept
+		// — the fail-closed default.
+		`ALTER TABLE audit_log ADD COLUMN sig_raw TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE audit_log ADD COLUMN sig_salient TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE audit_log ADD COLUMN sig_verdict TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE audit_log ADD COLUMN sig_salient_chars INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
 		// A pre-delivery task review's submission: the ordered checklist edits
 		// (JSON) and the reference of the task to deliver once they are
@@ -425,12 +443,14 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO audit_log (decision_id, agent_id, agent_type, signature, trigger, situation_type,
 				action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
-				corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
+				sig_raw, sig_salient, sig_verdict, sig_salient_chars, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
 			a.Action, a.Input, a.Confidence, llmConfArg(a.LLMConfidence), a.Rationale, a.LLMOutput,
 			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt,
-			string(a.MatchMethod), a.MatchScore, a.EmbedError, unix(a.CreatedAt))
+			string(a.MatchMethod), a.MatchScore, a.EmbedError,
+			a.SigRaw, a.SigSalient, string(a.SigVerdict), a.SigSalientChars, unix(a.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -1076,6 +1096,175 @@ func (s *Store) ResolveEscalation(ctx context.Context, auditID int64) (bool, err
 	return claimed, err
 }
 
+// ---- Auto-accept lifecycle (daemon writes) --------------------------------
+//
+// Every transition below is an atomic, STATUS-GUARDED update returning whether
+// it claimed the row, mirroring ResolveEscalation. That guard is what makes the
+// lifecycle safe against a concurrent operator: exactly one writer wins, so an
+// operator confirming the same escalation the daemon is auto-accepting cannot
+// produce a double send. Zero rows affected is "not claimed", never an error.
+
+// AutoAcceptableEscalations returns pending escalations whose situation type is
+// in types and whose created_at is at or before that type's cutoff — the aged
+// candidates for auto-accept.
+//
+// It narrows on status, created_at and situation_type ONLY. Reason exclusion,
+// suggestion presence and baseline presence are all judgement-bearing and stay
+// in Go: the reason is a text tag on a free-text rationale, and LIKE-matching
+// free text fails OPEN, which is the wrong direction for a safety exclusion.
+//
+// Oldest first, so the caller's one-per-agent-per-tick rule takes the
+// longest-waiting escalation for each agent. Bounded by the caller's cutoffs
+// rather than loading the whole pending queue; the hard limit is a backstop.
+func (s *Store) AutoAcceptableEscalations(ctx context.Context, cutoffs map[domain.SituationType]time.Time) ([]domain.AuditRecord, error) {
+	if len(cutoffs) == 0 {
+		return nil, nil
+	}
+	// One OR-group per enabled type: each has its OWN cutoff, so a single
+	// created_at bound could not express them.
+	clauses := make([]string, 0, len(cutoffs))
+	args := make([]any, 0, len(cutoffs)*2)
+	// Deterministic parameter order (map iteration is randomized), so the
+	// prepared statement and any query log stay stable across calls.
+	types := make([]string, 0, len(cutoffs))
+	for t := range cutoffs {
+		types = append(types, string(t))
+	}
+	sort.Strings(types)
+	for _, t := range types {
+		clauses = append(clauses, "(situation_type = ? AND created_at <= ?)")
+		args = append(args, t, unix(cutoffs[domain.SituationType(t)]))
+	}
+	// sig_raw / suggestion presence ARE pushed down, unlike every other
+	// eligibility rule. They are mechanical presence checks with no judgement in
+	// them (the caller re-checks both), and leaving them out starves the query:
+	// the fetch is oldest-first and capped, pre-migration rows carry no baseline
+	// and are never backfilled, so an upgrade with more aged escalations than
+	// the cap would return a window that is 100% ineligible on every tick,
+	// forever. The REASON exclusion deliberately stays in Go — LIKE-matching a
+	// free-text rationale fails open, which is the wrong direction for a safety
+	// exclusion.
+	q := `SELECT ` + auditCols + ` FROM audit_log WHERE status = 'escalated'
+		AND sig_raw != '' AND suggestion != '' AND (` +
+		strings.Join(clauses, " OR ") + `) ORDER BY created_at ASC, id ASC LIMIT ?`
+	args = append(args, autoAcceptCandidateLimit)
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	return s.scanAudits(rows)
+}
+
+// autoAcceptCandidateLimit bounds one sweep's candidate fetch. Each row can
+// carry a multi-KB pane excerpt and the pass runs on the daemon's select loop,
+// so the fetch is capped to keep that work constant no matter how large an
+// unresolved backlog grows (NFR-001/NFR-002). Being oldest-first, a truncated
+// fetch still returns the longest-waiting escalations, and the rest are simply
+// considered on a later tick — the pass takes at most one per agent per tick
+// anyway, so this is far above what a single tick can act on.
+const autoAcceptCandidateLimit = 256
+
+// ClaimForAutoAccept atomically moves a pending escalation to 'auto_accepting',
+// returning whether it claimed the row. The claim happens BEFORE delivery, so
+// only the winner ever sends.
+func (s *Store) ClaimForAutoAccept(ctx context.Context, auditID int64) (bool, error) {
+	return s.guardedStatus(ctx, auditID, "escalated", domain.AuditStatusAutoAccepting)
+}
+
+// MarkAutoAccepted finalizes a delivered auto-accept. Guarded on
+// 'auto_accepting' so it can only ever advance the daemon's OWN claim and can
+// never clobber another writer's terminal state.
+func (s *Store) MarkAutoAccepted(ctx context.Context, auditID int64) (bool, error) {
+	return s.guardedStatus(ctx, auditID, domain.AuditStatusAutoAccepting, domain.AuditStatusAutoAccepted)
+}
+
+// RevertAutoAccept returns a claimed escalation to the pending queue after a
+// failed delivery, so the claim guard is satisfiable again on the next tick —
+// the retry loop closes through the database rather than in-memory bookkeeping.
+func (s *Store) RevertAutoAccept(ctx context.Context, auditID int64) (bool, error) {
+	return s.guardedStatus(ctx, auditID, domain.AuditStatusAutoAccepting, "escalated")
+}
+
+// ReclaimAbandonedAutoAccepts returns every row still holding the transient
+// 'auto_accepting' status to 'escalated', reporting how many. Any such row is
+// by definition abandoned: the status lives only for the duration of one
+// delivery attempt, so a daemon that finds one at startup crashed (or was
+// replaced) mid-delivery.
+//
+// Reclaiming is safe even when the delivery had actually landed before the
+// crash: the row must clear the whole guard chain again, and the staleness
+// guard is the backstop — a delivered reply changes the pane, so the freshly
+// classified signature no longer matches the persisted baseline and the
+// escalation is dismissed as stale rather than answered twice.
+func (s *Store) ReclaimAbandonedAutoAccepts(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE audit_log SET status = 'escalated' WHERE status = ?`,
+			domain.AuditStatusAutoAccepting)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	return n, err
+}
+
+// DismissEscalationWithReason is the daemon-side counterpart of
+// DismissEscalation: it retires an escalation and records WHY in the rationale.
+//
+// It differs from the front-end method in two deliberate ways. It accepts a row
+// in either non-terminal state ('escalated' or 'auto_accepting'), because
+// attempt exhaustion retires a row the daemon currently holds. And it reports
+// zero rows as "not claimed" rather than erroring, matching ResolveEscalation —
+// losing the race to an operator is an ordinary outcome here, not a fault.
+//
+// The reason is APPENDED to the existing rationale rather than replacing it, so
+// the original escalation reason survives alongside the machine's (the same
+// shape escalate() uses for its agent_not_live / agent_disabled dismissals).
+func (s *Store) DismissEscalationWithReason(ctx context.Context, auditID int64, reason string) (bool, error) {
+	var claimed bool
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE audit_log
+			SET status = 'dismissed',
+			    rationale = CASE WHEN rationale = '' THEN ? ELSE rationale || ' ' || ? END
+			WHERE id = ? AND status IN ('escalated', ?)`,
+			reason, reason, auditID, domain.AuditStatusAutoAccepting)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		claimed = n > 0
+		return nil
+	})
+	return claimed, err
+}
+
+// guardedStatus is the shared claim primitive: move a row from `from` to `to`
+// only while it still holds `from`, reporting whether it claimed it.
+func (s *Store) guardedStatus(ctx context.Context, auditID int64, from, to string) (bool, error) {
+	var claimed bool
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE audit_log SET status = ? WHERE id = ? AND status = ?`, to, auditID, from)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		claimed = n > 0
+		return nil
+	})
+	return claimed, err
+}
+
 // DismissEscalationsBefore dismisses every pending escalation created before
 // cutoff, returning how many were dismissed (the front-end prune).
 func (s *Store) DismissEscalationsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
@@ -1211,15 +1400,18 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 		var a domain.AuditRecord
 		var situationType string
 		var matchMethod string
+		var sigVerdict string
 		var created int64
 		var llmConf sql.NullInt64
 		if err := rows.Scan(&a.ID, &a.DecisionID, &a.AgentID, &a.AgentType, &a.Signature, &a.Trigger,
 			&situationType, &a.Action, &a.Input, &a.Confidence, &llmConf, &a.Rationale,
 			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &a.PaneExcerpt,
-			&matchMethod, &a.MatchScore, &a.EmbedError, &created); err != nil {
+			&matchMethod, &a.MatchScore, &a.EmbedError,
+			&a.SigRaw, &a.SigSalient, &sigVerdict, &a.SigSalientChars, &created); err != nil {
 			return nil, err
 		}
 		a.MatchMethod = domain.MatchMethod(matchMethod)
+		a.SigVerdict = domain.GuardVerdict(sigVerdict)
 		if llmConf.Valid {
 			v := int(llmConf.Int64)
 			a.LLMConfidence = &v
@@ -1231,9 +1423,12 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 	return out, rows.Err()
 }
 
+// auditCols is the column list every audit query selects. It is POSITIONALLY
+// coupled to scanAudits and to AppendAudit's INSERT — change all three together.
 const auditCols = `id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
 	action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
-	corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error, created_at`
+	corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
+	sig_raw, sig_salient, sig_verdict, sig_salient_chars, created_at`
 
 // llmConfArg maps the optional LLM confidence to a SQL argument: nil stores
 // NULL (no LLM score), a value stores the 0-100 score.

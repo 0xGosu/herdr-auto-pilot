@@ -2695,3 +2695,47 @@ func TestSignaturesSearchSemantic(t *testing.T) {
 		t.Errorf("missing semantic match count:\n%s", out)
 	}
 }
+
+// TestAuditSurfacesAutoAcceptStatusesAndReasons: `hap audit` must let an
+// operator tell a machine's action from their own, and tell the three machine
+// dismissal reasons apart, without opening each record.
+func TestAuditSurfacesAutoAcceptStatusesAndReasons(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	rows := []domain.AuditRecord{
+		{Trigger: "status", SituationType: domain.SituationApproval, Action: "auto-accepted:1",
+			Status: domain.AuditStatusAutoAccepted, Rationale: "[shadow_mode] learning", CreatedAt: now},
+		{Trigger: "status", SituationType: domain.SituationApproval, Action: "corrected:1",
+			Status: "resolved", Rationale: "operator confirmed", CreatedAt: now},
+		{Trigger: "status", SituationType: domain.SituationApproval, Action: "escalated",
+			Status: "dismissed", Rationale: "[shadow_mode] learning [auto_dismiss_stale] drift", CreatedAt: now},
+		{Trigger: "status", SituationType: domain.SituationApproval, Action: "escalated",
+			Status: "dismissed", Rationale: "[shadow_mode] learning [auto_dismiss_agent_gone]", CreatedAt: now},
+		{Trigger: "status", SituationType: domain.SituationApproval, Action: "escalated",
+			Status: "dismissed", Rationale: "[shadow_mode] learning [auto_accept_failed] 3 attempts", CreatedAt: now},
+		{Trigger: "status", SituationType: domain.SituationApproval, Action: "escalated",
+			Status: "dismissed", Rationale: "[shadow_mode] learning", CreatedAt: now},
+	}
+	for _, r := range rows {
+		if _, err := st.AppendAudit(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out, err := run(t, app, "audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"auto-sent", "resolved", "dism:stale", "dism:gone", "dism:failed", "dismissed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("audit output missing %q:\n%s", want, out)
+		}
+	}
+	// An auto-accept delivered a reply but recorded no learning event, so it
+	// must never read as the operator's own resolution.
+	if strings.Contains(out, domain.AuditStatusAutoAccepted) {
+		t.Errorf("the raw auto_accepted status leaked instead of its label:\n%s", out)
+	}
+}

@@ -24,258 +24,13 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
+	"github.com/0xGosu/herdr-auto-pilot/internal/deliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
-	"github.com/0xGosu/herdr-auto-pilot/internal/mcqdeliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/reembed"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
 )
-
-// menuReadLines is how much of a pane the confirm/resolve path re-reads to
-// recover the live numbered menu before delivering the operator's reply.
-const menuReadLines = 40
-
-// seriesResetKeys / seriesAdvanceKey alias the shared domain protocol
-// constants so the operator-confirm path navigates a form identically to the
-// daemon's sweep and delivery (single source of truth — domain.MCQ*).
-// seriesKeyDelay mirrors the daemon's sweepKeyDelay pacing.
-const seriesResetKeys = domain.MCQResetKeys
-const seriesAdvanceKey = domain.MCQAdvanceKey
-const seriesKeyDelay = 250 * time.Millisecond
-
-// deliverTabSeries answers a multi-tab question form for the operator-confirm
-// path. Unlike the daemon it never swept the form, so it verifies in two
-// passes to stay all-or-nothing (matching the daemon's refuse-before-any-
-// keystroke behavior): first a read-only walk of every tab confirming the form
-// is stable and no multi-select tab already has a selection, then — only if
-// that passes — a delivery pass that toggles. This way a refusal never leaves
-// the form half-answered. groups has one entry per tab (validated by the
-// caller against the tab count).
-func (a *App) deliverTabSeries(ctx context.Context, ks ports.KeystrokeSender, audit *domain.AuditRecord, groups [][]string) error {
-	if strings.EqualFold(audit.AgentType, "codex") {
-		return a.deliverCodexSeries(ctx, ks, audit, groups)
-	}
-	agentID := audit.AgentID
-	multi, err := a.verifyTabBaseline(ctx, ks, agentID, groups)
-	if err != nil {
-		return err
-	}
-	return mcqdeliver.ClaudeTabs(ctx, mcqdeliver.Config{
-		Keys:      ks,
-		Read:      a.readVisiblePane,
-		PaneID:    agentID,
-		ReadLines: menuReadLines,
-		KeyDelay:  seriesKeyDelay,
-	}, groups, multi)
-}
-
-// deliverCodexSeries mirrors the daemon's adaptive Codex protocol for an
-// operator correction. Digits may commit immediately or merely select the
-// numbered row; live reads determine whether Enter and/or Right is needed.
-func (a *App) deliverCodexSeries(ctx context.Context, ks ports.KeystrokeSender,
-	audit *domain.AuditRecord, groups [][]string) error {
-	for i, group := range groups {
-		if len(group) != 1 {
-			return fmt.Errorf("codex question %d is single-select, got %d selections", i+1, len(group))
-		}
-	}
-	if err := a.resetCodexForm(ctx, ks, audit.AgentID, len(groups)); err != nil {
-		return err
-	}
-	answerCount := len(groups)
-	for i, group := range groups {
-		beforePane, err := a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
-		if err != nil {
-			return fmt.Errorf("re-reading Codex question %d/%d failed: %w", i+1, answerCount, err)
-		}
-		before, ok := domain.CodexMCQForm(beforePane)
-		if !ok || before.AnswerCount != answerCount || before.Current != i+1 || before.Unanswered != answerCount-i {
-			return fmt.Errorf("the Codex form is stale at question %d/%d", i+1, answerCount)
-		}
-		if i == 0 && strings.Contains(audit.PaneExcerpt, "[question 1/") &&
-			domain.ExtractCodexMCQForm(beforePane) != domain.FirstMCQQuestion(audit.PaneExcerpt) {
-			return fmt.Errorf("a different Codex form is showing; answer series not delivered")
-		}
-
-		digit := group[0]
-		if err := ks.SendKey(ctx, audit.AgentID, digit); err != nil {
-			return fmt.Errorf("delivering Codex question %d option %s failed: %w", i+1, digit, err)
-		}
-		time.Sleep(seriesKeyDelay)
-		afterPane, err := a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
-		if err != nil {
-			return fmt.Errorf("re-reading Codex question %d after option failed: %w", i+1, err)
-		}
-		after, standing := domain.CodexMCQForm(afterPane)
-		if !standing {
-			if i == answerCount-1 {
-				return nil
-			}
-			return fmt.Errorf("codex form disappeared after question %d/%d", i+1, answerCount)
-		}
-		if after.Unanswered == before.Unanswered {
-			if after.Current != before.Current || after.SelectedOption != digit {
-				return fmt.Errorf("codex option %s was not selected on question %d", digit, i+1)
-			}
-			if err := ks.SendKey(ctx, audit.AgentID, "enter"); err != nil {
-				return fmt.Errorf("committing Codex question %d failed: %w", i+1, err)
-			}
-			time.Sleep(seriesKeyDelay)
-			afterPane, err = a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
-			if err != nil {
-				return fmt.Errorf("re-reading committed Codex question %d failed: %w", i+1, err)
-			}
-			after, standing = domain.CodexMCQForm(afterPane)
-			if !standing {
-				if i == answerCount-1 {
-					return nil
-				}
-				return fmt.Errorf("codex form disappeared after question %d/%d", i+1, answerCount)
-			}
-		}
-		if after.Unanswered != before.Unanswered-1 {
-			return fmt.Errorf("codex question %d did not commit", i+1)
-		}
-		if i == answerCount-1 {
-			if !after.SubmitAll {
-				return fmt.Errorf("codex answered all questions but submit-all state is not showing")
-			}
-			if err := ks.SendKey(ctx, audit.AgentID, "enter"); err != nil {
-				return fmt.Errorf("submitting Codex answers failed: %w", err)
-			}
-			return nil
-		}
-		if after.Current == i+1 {
-			if err := ks.SendKey(ctx, audit.AgentID, "right"); err != nil {
-				return fmt.Errorf("navigating to Codex question %d failed: %w", i+2, err)
-			}
-			time.Sleep(seriesKeyDelay)
-			pane, err := a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
-			if err != nil {
-				return fmt.Errorf("re-reading Codex question %d failed: %w", i+2, err)
-			}
-			next, ok := domain.CodexMCQForm(pane)
-			if !ok || next.Current != i+2 || next.Unanswered != after.Unanswered {
-				return fmt.Errorf("codex did not navigate to question %d", i+2)
-			}
-		} else if after.Current != i+2 {
-			return fmt.Errorf("codex advanced to unexpected question %d", after.Current)
-		}
-	}
-	return nil
-}
-
-// resetCodexForm is the operator-delivery counterpart to the daemon's
-// adaptive reset: read the live question index, send the remaining Left keys
-// together when supported, and stop only after question 1 is actually visible.
-func (a *App) resetCodexForm(ctx context.Context, ks ports.KeystrokeSender,
-	agentID string, answerCount int) error {
-	for attempt := 0; attempt <= seriesResetKeys; attempt++ {
-		pane, err := a.readVisiblePane(ctx, agentID, menuReadLines)
-		if err != nil {
-			return fmt.Errorf("resetting Codex form read failed: %w", err)
-		}
-		state, ok := domain.CodexMCQForm(pane)
-		if !ok || state.AnswerCount != answerCount {
-			return fmt.Errorf("the pane no longer shows the %d-question Codex form", answerCount)
-		}
-		if state.Current == 1 {
-			return nil
-		}
-		if attempt == seriesResetKeys {
-			break
-		}
-		steps := state.Current - 1
-		if seq, ok := ks.(ports.KeystrokeSequenceSender); ok {
-			keys := make([]string, steps)
-			for i := range keys {
-				keys[i] = "left"
-			}
-			if err := seq.SendKeys(ctx, agentID, keys...); err != nil {
-				return fmt.Errorf("resetting the Codex form failed: %w", err)
-			}
-		} else {
-			for i := 0; i < steps; i++ {
-				if err := ks.SendKey(ctx, agentID, "left"); err != nil {
-					return fmt.Errorf("resetting the Codex form failed: %w", err)
-				}
-				if i+1 < steps {
-					time.Sleep(seriesKeyDelay)
-				}
-			}
-		}
-		time.Sleep(seriesKeyDelay)
-	}
-	return fmt.Errorf("the Codex form did not return to question 1")
-}
-
-// verifyTabBaseline walks the form read-only (reset, then one Right per tab)
-// and returns each tab's multi-select flag, erroring if the form drifted or a
-// multi-select tab carries a selection this answer did not choose. It toggles
-// nothing, so the caller can refuse before any answer keystroke — the same
-// "checked ⊆ chosen" rule the daemon applies before delivery, and that
-// mcqdeliver enforces again at the keystroke: a box THIS answer chose may
-// already be set by an earlier attempt that died before submitting (pressing
-// it again would clear it), while anything else on the tab is the operator's
-// and is never cleared.
-func (a *App) verifyTabBaseline(ctx context.Context, ks ports.KeystrokeSender,
-	agentID string, groups [][]string) ([]bool, error) {
-
-	tabCount := len(groups)
-	if err := a.resetForm(ctx, ks, agentID); err != nil {
-		return nil, err
-	}
-	multi := make([]bool, tabCount)
-	for tab := 0; tab < tabCount; tab++ {
-		if tab > 0 {
-			if err := ks.SendKey(ctx, agentID, seriesAdvanceKey); err != nil {
-				return nil, fmt.Errorf("walking to tab %d failed: %w", tab+1, err)
-			}
-			time.Sleep(seriesKeyDelay)
-		}
-		frame, err := a.readVisiblePane(ctx, agentID, menuReadLines)
-		if err != nil {
-			return nil, fmt.Errorf("re-reading tab %d/%d failed: %w", tab+1, tabCount, err)
-		}
-		if tabs, ok := domain.MultiTabForm(frame); !ok || tabs != tabCount {
-			return nil, fmt.Errorf("the pane no longer shows the %d-tab form at tab %d; answer in the pane", tabCount, tab+1)
-		}
-		// Scoped to the live render — scrollback above it can carry an earlier,
-		// already-toggled render of this or another form.
-		liveFrame := domain.ExtractMCQForm(frame)
-		if domain.MultiSelectTab(liveFrame) {
-			multi[tab] = true
-			if foreign := domain.CheckedOutside(liveFrame, groups[tab]); len(foreign) > 0 {
-				return nil, fmt.Errorf("tab %d already has option(s) %s selected, which this answer did not choose; answer in the pane",
-					tab+1, strings.Join(foreign, ", "))
-			}
-		}
-	}
-	return multi, nil
-}
-
-// resetForm sends the fixed Left-arrow burst that lands focus on the first
-// question, then pauses for the form to re-render.
-func (a *App) resetForm(ctx context.Context, ks ports.KeystrokeSender, agentID string) error {
-	for i := 0; i < seriesResetKeys; i++ {
-		if err := ks.SendKey(ctx, agentID, "left"); err != nil {
-			return fmt.Errorf("resetting the form failed: %w", err)
-		}
-	}
-	time.Sleep(seriesKeyDelay)
-	return nil
-}
-
-// readVisiblePane returns the pane's current on-screen content, preferring a
-// visible-source read (which reflects a standing menu) and falling back to
-// the plain recent read when the adapter cannot do visible reads.
-func (a *App) readVisiblePane(ctx context.Context, paneID string, lines int) (string, error) {
-	if vr, ok := a.Herdr.(ports.VisiblePaneReader); ok {
-		return vr.ReadPaneVisible(ctx, paneID, lines)
-	}
-	return a.Herdr.ReadPane(ctx, paneID, lines)
-}
 
 // App bundles the shared state both front-ends operate on.
 type App struct {
@@ -865,87 +620,20 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// — but never writes the sentinel into the pane: "do nothing" means
 	// exactly that.
 	if willSend {
-		outbound := materializeForSend(action, audit)
-		// A numbered menu (Claude approvals/choices) only accepts the
-		// option's digit, not the label. Re-read the pane's CURRENT screen
-		// so a menu still up gets the right keystroke; on read failure, a
-		// free-text prompt, or a non-menu situation, deliver the literal
-		// reply unchanged.
-		pane, rerr := a.readVisiblePane(ctx, audit.AgentID, menuReadLines)
-		// A per-tab answer series ("1 2 1", or "1 1,3 2" when a tab is multi-
-		// select) answers a multi-tab question form: one keystroke group per
-		// tab, Submit included — sent as literal text it would land in the
-		// first question's input instead.
-		if groups, isSeries := domain.ParseTabSelections(outbound); isSeries &&
-			audit.SituationType == domain.SituationChoice {
-			if rerr != nil {
-				return fmt.Errorf("correction recorded, but the pane could not be read to deliver the answer series: %w", rerr)
-			}
-			form, ok := domain.ParseMCQForm(audit.AgentType, pane)
-			if !ok && audit.AgentType == "" {
-				if tabs, legacyOK := domain.MultiTabForm(pane); legacyOK {
-					form, ok = domain.MCQFormState{Kind: domain.MCQClaudeTabs, AnswerCount: tabs}, true
-				}
-			}
-			if !ok || form.AnswerCount != len(groups) {
-				return fmt.Errorf("correction recorded, but the pane no longer shows a %d-tab form; answer series not delivered", len(groups))
-			}
-			ks, ok := a.Herdr.(ports.KeystrokeSender)
-			if !ok {
-				return fmt.Errorf("correction recorded, but this herdr adapter cannot send keystrokes for the answer series")
-			}
-			if err := a.deliverTabSeries(ctx, ks, audit, groups); err != nil {
-				return fmt.Errorf("correction recorded, but %w", err)
-			}
-			markSent()
-			return a.nudge(ctx, control.KindReload)
-		}
-		// Claude's remote-environment picker commits per a per-build
-		// protocol (the digit may only move the caret), so a standing picker
-		// is answered via the adaptive keystroke deliverer. The situation is
-		// identified from the audit's own pane capture as well as the live
-		// read: a failed or stale read must REFUSE, never fall through to the
-		// literal-label send below — its trailing Enter could commit whatever
-		// option the caret rests on and launch the wrong cloud environment. A
-		// keystroke-less adapter falls through ONLY when the reply maps to a
-		// live option digit (safe under both bindings).
-		if audit.SituationType == domain.SituationApproval && strings.EqualFold(audit.AgentType, "claude") {
-			_, wasRemoteEnv := domain.ClaudeRemoteEnvForm(audit.PaneExcerpt)
-			var form domain.RemoteEnvForm
-			live := false
-			if rerr == nil {
-				form, live = domain.ClaudeRemoteEnvForm(pane)
-			}
-			if wasRemoteEnv || live {
-				if rerr != nil {
-					return fmt.Errorf("correction recorded, but the pane could not be read to answer the remote environment picker: %w", rerr)
-				}
-				if !live {
-					return fmt.Errorf("correction recorded, but the pane no longer shows the remote environment picker")
-				}
-				if ks, ok := a.Herdr.(ports.KeystrokeSender); ok {
-					if err := mcqdeliver.ClaudeRemoteEnv(ctx, mcqdeliver.Config{
-						Keys:      ks,
-						Read:      a.readVisiblePane,
-						PaneID:    audit.AgentID,
-						ReadLines: menuReadLines,
-						KeyDelay:  seriesKeyDelay,
-					}, outbound); err != nil {
-						return fmt.Errorf("correction recorded, but %w", err)
-					}
-					markSent()
-					return a.nudge(ctx, control.KindReload)
-				}
-				if _, mapped := domain.MenuKeystrokeFrom(form.Options, domain.TrimRemoteEnvCheck(outbound)); !mapped {
-					return fmt.Errorf("correction recorded, but %q matches none of the offered environments and this herdr adapter cannot send verified keystrokes", outbound)
-				}
-			}
-		}
-		if rerr == nil {
-			outbound = domain.DeliverKeystroke(audit.SituationType, audit.AgentType, pane, outbound)
-		}
-		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, outbound); err != nil {
-			return fmt.Errorf("correction recorded, but sending to the agent failed: %w", err)
+		// Delivery itself lives in internal/deliver, shared with the daemon's
+		// auto-accept pass so the fail-closed keystroke and menu-mapping logic
+		// exists once. What stays here is what makes this path the OPERATOR's:
+		// the correction bookkeeping above and below, and the nudge. Every
+		// refusal from the deliverer is a bare sentence, so the
+		// "correction recorded, but …" prefix is added in exactly one place.
+		if err := deliver.Deliver(ctx, deliver.Config{Herdr: a.Herdr}, deliver.Request{
+			PaneID:        audit.AgentID,
+			AgentType:     audit.AgentType,
+			SituationType: audit.SituationType,
+			PaneExcerpt:   audit.PaneExcerpt,
+			Outbound:      materializeForSend(action, audit),
+		}); err != nil {
+			return fmt.Errorf("correction recorded, but %w", err)
 		}
 		markSent()
 	}
@@ -1748,61 +1436,19 @@ func (a *App) PruneEscalations(ctx context.Context, olderThan time.Duration) (in
 }
 
 // SuggestedAction extracts the confirmable action from an escalation.
-// Keep in sync with the daemon's suggestionAction.
+//
+// It delegates to the domain so the operator-confirm path and the daemon's
+// auto-accept pass resolve a suggestion identically — the two must agree on
+// what "confirming this escalation" means, or the daemon would auto-accept
+// something different from what the operator sees offered.
 func SuggestedAction(audit *domain.AuditRecord) string {
-	sug := audit.Suggestion
-	// An idle task suggestion is confirmed into a tasks.md + task source, not
-	// sent to the pane as literal text — recognize it before the send-oriented
-	// prefixes below.
-	if strings.HasPrefix(sug, domain.SuggestTaskPrefix) {
-		return domain.SuggestGenerateTask
-	}
-	sug = stripSourcePrefix(sug)
-	for _, p := range []string{"send next declared task: ", "send inferred next task: "} {
-		if len(sug) > len(p) && sug[:len(p)] == p {
-			if p == "send next declared task: " {
-				return domain.ActionNextDeclaredTask
-			}
-			return domain.ActionNextInferredTask
-		}
-	}
-	// The human-readable "do nothing" suggestion round-trips to the sentinel
-	// so a confirmed noop is learned as @noop, never sent as literal text.
-	if sug == domain.ActionNoopSuggestion {
-		return domain.ActionNoop
-	}
-	return sug
-}
-
-// stripSourcePrefix removes the leading "who suggested this and how" label from
-// an escalation suggestion, leaving the action-bearing remainder. The
-// task-send prefixes are deliberately NOT here: they can ride behind
-// "LLM suggested: ", so both layers must be peeled in order.
-func stripSourcePrefix(sug string) string {
-	for _, p := range []string{"respond: ", "choose: ", "answer series: ", "on error: ", "LLM suggested: "} {
-		if len(sug) > len(p) && sug[:len(p)] == p {
-			return sug[len(p):]
-		}
-	}
-	return sug
+	return domain.SuggestedAction(audit)
 }
 
 // materializeForSend converts symbolic learned actions into the concrete
-// suggestion text when the operator asks to send. It peels the source prefix
-// first, exactly as SuggestedAction does: an LLM task review suggests
-// "LLM suggested: send next declared task: <text>", and matching the task-send
-// prefix against the unpeeled string would miss, returning the raw
-// "@next_task:declared" sentinel — which Resolve would then type into the pane.
+// suggestion text when the reply is actually to be sent.
 func materializeForSend(action string, audit *domain.AuditRecord) string {
-	if action == domain.ActionNextDeclaredTask || action == domain.ActionNextInferredTask {
-		sug := stripSourcePrefix(audit.Suggestion)
-		for _, p := range []string{"send next declared task: ", "send inferred next task: "} {
-			if len(sug) > len(p) && sug[:len(p)] == p {
-				return sug[len(p):]
-			}
-		}
-	}
-	return action
+	return domain.MaterializeForSend(action, audit)
 }
 
 // Config returns the current operator configuration.
@@ -1861,6 +1507,15 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
+	// Auto-accept: the daemon answers an escalation the operator left pending
+	// too long. Off by default; each threshold is a duration ("15m") or "0" to
+	// disable that situation type.
+	{Key: "escalations.auto_accept.enabled", TUIEditable: true},
+	{Key: "escalations.auto_accept.approval", TUIEditable: true},
+	{Key: "escalations.auto_accept.choice", TUIEditable: true},
+	{Key: "escalations.auto_accept.error", TUIEditable: true},
+	{Key: "escalations.auto_accept.idle", TUIEditable: true},
+	{Key: "escalations.auto_accept.unclassifiable", TUIEditable: true},
 	{Key: "safety.disable_never_auto_seed_patterns", TUIEditable: true},
 	{Key: "llm.command"},       // argv template
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
@@ -1962,6 +1617,18 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.Limits.MaxAutoPromptsPerMinute)
 	case "limits.max_error_retries":
 		return strconv.Itoa(cfg.Limits.MaxErrorRetries)
+	case "escalations.auto_accept.enabled":
+		return strconv.FormatBool(cfg.Escalations.AutoAccept.Enabled)
+	case "escalations.auto_accept.approval":
+		return autoAcceptValue(cfg.Escalations.AutoAccept.Approval, config.DefaultAutoAcceptApproval)
+	case "escalations.auto_accept.choice":
+		return autoAcceptValue(cfg.Escalations.AutoAccept.Choice, config.DefaultAutoAcceptChoice)
+	case "escalations.auto_accept.error":
+		return autoAcceptValue(cfg.Escalations.AutoAccept.Error, config.DefaultAutoAcceptError)
+	case "escalations.auto_accept.idle":
+		return autoAcceptValue(cfg.Escalations.AutoAccept.Idle, 0)
+	case "escalations.auto_accept.unclassifiable":
+		return autoAcceptValue(cfg.Escalations.AutoAccept.Unclassifiable, 0)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -2117,6 +1784,23 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return setInt(&cfg.Limits.MaxAutoPromptsPerMinute)
 		case "limits.max_error_retries":
 			return setInt(&cfg.Limits.MaxErrorRetries)
+		case "escalations.auto_accept.enabled":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("escalations.auto_accept.enabled must be true or false, got %q", value)
+			}
+			cfg.Escalations.AutoAccept.Enabled = v
+			return nil
+		case "escalations.auto_accept.approval":
+			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Approval)
+		case "escalations.auto_accept.choice":
+			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Choice)
+		case "escalations.auto_accept.error":
+			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Error)
+		case "escalations.auto_accept.idle":
+			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Idle)
+		case "escalations.auto_accept.unclassifiable":
+			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Unclassifiable)
 		case "llm.timeout_seconds":
 			return setInt(&cfg.LLM.TimeoutSeconds)
 		case "llm.auto_act_confidence_threshold":
@@ -3290,6 +2974,47 @@ func ConfidenceLabel(conf float64) string {
 	return fmt.Sprintf("%.2f", conf)
 }
 
+// AuditStatusWidth is the display width AuditStatusLabel's output fits in.
+// Wide enough for the longest label it can produce ("dism:failed"), so a
+// machine dismissal never shifts the columns beside it.
+const AuditStatusWidth = 11
+
+// AuditStatusLabel renders an audit row's status for a LIST column, where the
+// operator is scanning rather than reading one record.
+//
+// Two things must be readable at a glance and are not readable from the raw
+// status alone. An auto-accept is not an operator's resolution — the machine
+// stopped waiting, and no learning event was recorded — so it must not read as
+// "resolved". And `dismissed` now has two possible authors and three distinct
+// machine reasons, all of which look identical in a bare status column; the
+// reason lives in the rationale, which the list has no room for.
+//
+// Every audit STATUS an operator sees (TUI and CLI) goes through here so the
+// wording cannot drift between them.
+func AuditStatusLabel(r domain.AuditRecord) string {
+	switch r.Status {
+	case domain.AuditStatusAutoAccepted:
+		// Deliberately not "resolved": nothing was learned from it.
+		return "auto-sent"
+	case domain.AuditStatusAutoAccepting:
+		// Transient and normally invisible — a row only shows this while a
+		// delivery is in flight, or briefly after a crash before the startup
+		// reclaim returns it to the queue. Rendered rather than left unknown.
+		return "sending"
+	case "dismissed":
+		switch domain.AutoDismissReason(r.Rationale) {
+		case domain.ReasonAutoDismissStale:
+			return "dism:stale"
+		case domain.ReasonAutoDismissAgentGone:
+			return "dism:gone"
+		case domain.ReasonAutoAcceptFailed:
+			return "dism:failed"
+		}
+		return "dismissed" // the operator's own
+	}
+	return r.Status
+}
+
 // RuleSummary renders a one-line description of the learned rule backing a
 // signature, for escalation/audit views (TUI detail and CLI share the
 // wording so operators see the same rule either way).
@@ -3504,4 +3229,43 @@ func envFileValue(path string) string {
 		return "(none)"
 	}
 	return path
+}
+
+// autoAcceptValue renders an auto-accept threshold for display: the operator's
+// literal setting when present, otherwise the built-in default marked as such
+// (or "0 (disabled)" for the types that default to off).
+func autoAcceptValue(set string, def time.Duration) string {
+	if s := strings.TrimSpace(set); s != "" {
+		return s
+	}
+	if def <= 0 {
+		return "0 (disabled, default)"
+	}
+	return def.String() + " (default)"
+}
+
+// setAutoAcceptThreshold validates one auto-accept threshold before storing it.
+// Validation happens HERE as well as in config.Load because this is the write
+// path: rejecting at load only helps a hand-edited file, and `hap config set`
+// must not be able to persist a value that would be rejected on the next
+// reload — the daemon would silently run with the section disabled.
+func setAutoAcceptThreshold(key, value string, dst *string) error {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		// Clearing restores the type's built-in default.
+		*dst = ""
+		return nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a duration (use e.g. \"15m\", or \"0\" to disable)", key, value)
+	}
+	if d < 0 {
+		return fmt.Errorf("%s: %q is negative", key, value)
+	}
+	if d > 0 && d < time.Minute {
+		return fmt.Errorf("%s: %q is below the 1m sweep granularity; use 1m or more, or \"0\" to disable", key, value)
+	}
+	*dst = v
+	return nil
 }

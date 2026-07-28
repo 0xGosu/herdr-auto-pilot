@@ -965,7 +965,7 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 			rule = string(row.Mode)
 		}
 		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%s\tllm=%s\trule=%s\t%s\n",
-			r.ID, r.CreatedAt.Format("01-02 15:04:05"), r.Status, r.SituationType,
+			r.ID, r.CreatedAt.Format("01-02 15:04:05"), frontend.AuditStatusLabel(r), r.SituationType,
 			r.Action, frontend.ConfidenceLabel(r.Confidence), llmConfCLI(r.LLMConfidence), rule, r.Rationale)
 	}
 	return nil

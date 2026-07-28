@@ -177,6 +177,33 @@ type DaemonStore interface {
 	// confirmable suggestion (a bare status flip leaves the operator an
 	// unexplained, unconfirmable queue entry).
 	EscalateAudit(ctx context.Context, auditID int64, rationale, suggestion string) error
+
+	// Auto-accept lifecycle. These are ADDED to DaemonStore rather than
+	// borrowed from FrontendStore: no existing front-end write method moves,
+	// so the write partition is preserved.
+	//
+	// The four mutating calls return a `claimed` boolean instead of erroring on
+	// zero affected rows, matching ResolveEscalation's race-safe contract —
+	// losing the row to a concurrent operator is an ordinary outcome, and only
+	// the writer that actually claimed it may apply the one-time side effect.
+
+	// AutoAcceptableEscalations returns aged pending escalations, oldest first,
+	// narrowed on status/created_at/situation_type only (one cutoff per enabled
+	// type). Every judgement-bearing filter is the caller's.
+	AutoAcceptableEscalations(ctx context.Context, cutoffs map[domain.SituationType]time.Time) ([]domain.AuditRecord, error)
+	// ClaimForAutoAccept moves escalated -> auto_accepting, before delivery.
+	ClaimForAutoAccept(ctx context.Context, auditID int64) (bool, error)
+	// MarkAutoAccepted moves auto_accepting -> auto_accepted, after delivery.
+	MarkAutoAccepted(ctx context.Context, auditID int64) (bool, error)
+	// RevertAutoAccept moves auto_accepting -> escalated when delivery failed.
+	RevertAutoAccept(ctx context.Context, auditID int64) (bool, error)
+	// ReclaimAbandonedAutoAccepts returns every row left mid-delivery by a
+	// crashed or replaced daemon to the pending queue, reporting the count.
+	ReclaimAbandonedAutoAccepts(ctx context.Context) (int64, error)
+	// DismissEscalationWithReason retires an escalation from either
+	// non-terminal state, appending the machine reason to its rationale.
+	DismissEscalationWithReason(ctx context.Context, auditID int64, reason string) (bool, error)
+
 	UpdateAgentRate(ctx context.Context, r domain.AgentRate) error
 	UpsertErrorRetry(ctx context.Context, e domain.ErrorRetry) error
 	ResetErrorRetry(ctx context.Context, errorSignature string) error

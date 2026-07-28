@@ -900,8 +900,13 @@ func (m Model) filterAudit(t tab, rows []domain.AuditRecord) []domain.AuditRecor
 	}
 	var out []domain.AuditRecord
 	for _, r := range rows {
+		// Both spellings are searchable: the raw status, and the label the
+		// operator actually SEES in the column. Without the latter, typing
+		// "auto-sent" or "dism:stale" — the only forms visible on screen —
+		// would match nothing.
 		if m.matchesQuery(t,
 			fmt.Sprintf("#%d", r.ID), string(r.SituationType), r.Status,
+			frontend.AuditStatusLabel(r),
 			m.data.status.AgentName(r.AgentID), r.AgentID, m.agentTypeFor(r),
 			r.Action, r.Rationale, r.Suggestion) {
 			out = append(out, r)
@@ -5124,7 +5129,10 @@ func (m Model) renderAudit(b *strings.Builder) {
 	// columns. Conf is the computed 0-1 agreement ("-" when the row was never
 	// scored — see frontend.ConfidenceLabel); LLM is the consulting model's
 	// self-reported 0-100 ("-" when the row has no LLM score).
-	const auditRowFmt = "%-6s %-14s %-10s %-8s %-14s %4s %-6s %5s %-9s  %s"
+	// The STATUS column is sized from the label width rather than hardcoded, so
+	// adding a longer status label cannot silently shift the ACTION column.
+	auditRowFmt := fmt.Sprintf("%%-6s %%-14s %%-10s %%-8s %%-14s %%4s %%-6s %%5s %%-%ds  %%s",
+		frontend.AuditStatusWidth)
 	actWidth, _ := m.budget(86, false)
 	header := fmt.Sprintf(auditRowFmt,
 		"ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "ACTION")
@@ -5139,7 +5147,8 @@ func (m Model) renderAudit(b *strings.Builder) {
 		line := fmt.Sprintf(auditRowFmt,
 			fmt.Sprintf("#%d", r.ID), humanizeWhen(r.CreatedAt, m.renderNow()),
 			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), 14),
-			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), frontend.ConfidenceLabel(r.Confidence), r.Status,
+			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), frontend.ConfidenceLabel(r.Confidence),
+			frontend.AuditStatusLabel(r),
 			oneLine(r.Action, actWidth))
 		if i == m.cursors[m.tab] {
 			line = m.styles().selected.Render(line)

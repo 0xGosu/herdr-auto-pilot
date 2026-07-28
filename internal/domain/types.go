@@ -348,7 +348,74 @@ const (
 	// AuditStatusReclaimed: an unattended task hand-out was never taken up by
 	// the agent, so its checklist item was returned to "[ ]" for the next sweep.
 	AuditStatusReclaimed = "reclaimed"
+	// AuditStatusAutoAccepting: an aged escalation the daemon has CLAIMED and
+	// is delivering right now. Transient by design — it exists only for the
+	// duration of one delivery attempt.
+	//
+	// It is a distinct status because one terminal status cannot tell "claimed"
+	// from "delivered". A daemon that dies mid-delivery would otherwise leave
+	// the row looking delivered while nothing was sent, and it would then be
+	// invisible to BOTH sides (the operator's queue and the auto-accept query
+	// both filter on 'escalated') — the escalation silently lost and its agent
+	// blocked forever, which is the exact failure this feature exists to
+	// prevent. Any row still holding this status at daemon startup is by
+	// definition abandoned and is reclaimed to 'escalated'.
+	AuditStatusAutoAccepting = "auto_accepting"
+	// AuditStatusAutoAccepted: an aged escalation whose suggestion the daemon
+	// delivered because it had waited past its configured threshold and the
+	// situation was still live. Terminal.
+	//
+	// Deliberately NOT 'resolved': that status carries an implicit contract
+	// that a corrections row exists and was learned from, whereas an
+	// auto-accept writes none. A machine's decision to stop waiting is not
+	// evidence the suggestion was right, so it must never feed the confidence
+	// model or push a signature toward graduation. "Sent but not learned" has
+	// no other spelling.
+	AuditStatusAutoAccepted = "auto_accepted"
 )
+
+// Rationale tags for the auto-accept pass's terminal outcomes. An automatic
+// dismissal reuses the 'dismissed' status — it is behaviorally identical to an
+// operator's (nothing sent, nothing learned, the audit row retained per
+// FR-020) — so the reason it happened is carried in the rationale, following
+// the daemon's "[reason]" convention. Without these a reader could not tell a
+// machine dismissal from a human one, nor the three machine reasons apart.
+const (
+	// ReasonAutoDismissStale: the situation is no longer on screen (the
+	// freshly classified type differs, or the signature drifted beyond
+	// tolerance), so the suggestion can no longer be meaningfully delivered.
+	ReasonAutoDismissStale = "auto_dismiss_stale"
+	// ReasonAutoDismissAgentGone: the escalation's agent no longer exists, so
+	// there is no pane left to answer. Confirmed across consecutive sweeps
+	// before it is acted on.
+	ReasonAutoDismissAgentGone = "auto_dismiss_agent_gone"
+	// ReasonAutoAcceptFailed: delivery could not be completed within the
+	// attempt cap. Retired visibly rather than retried forever.
+	ReasonAutoAcceptFailed = "auto_accept_failed"
+)
+
+// AutoDismissReasons are the machine-dismissal tags an operator surface must
+// surface inline, so a dismissal's author and cause are readable without
+// opening the record.
+var AutoDismissReasons = []string{
+	ReasonAutoDismissStale,
+	ReasonAutoDismissAgentGone,
+	ReasonAutoAcceptFailed,
+}
+
+// AutoDismissReason returns the machine-dismissal tag carried by a rationale,
+// or "" when the dismissal was an operator's. The tag is appended as a
+// bracketed suffix (the daemon's convention, shared with the agent_not_live /
+// agent_disabled auto-dismissals), so this scans for it anywhere rather than
+// assuming a prefix.
+func AutoDismissReason(rationale string) string {
+	for _, r := range AutoDismissReasons {
+		if strings.Contains(rationale, "["+r+"]") {
+			return r
+		}
+	}
+	return ""
+}
 
 // Audit action prefixes for the auto-send-when-idle reclaim path.
 const (
@@ -428,8 +495,12 @@ type AuditRecord struct {
 	Rationale       string
 	LLMOutput       string
 	CorrectsAuditID int64
-	Status          string // "auto" | "escalated" | "resolved" | "dismissed" | "retried"
-	Suggestion      string
+	// Status: "auto" | "escalated" | "resolved" | "dismissed" | "retried" |
+	// "auto_accepting" | "auto_accepted". The last two belong to the
+	// aged-escalation auto-accept lifecycle (AuditStatusAutoAccepting is
+	// transient, AuditStatusAutoAccepted terminal); see the const block above.
+	Status     string
+	Suggestion string
 	// PaneExcerpt is the pane content THIS record was classified from
 	// (per-entry, unlike the signature's first-seen provenance snapshot);
 	// "" on legacy rows and paths with no pane read (herdr unreachable).
@@ -442,7 +513,46 @@ type AuditRecord struct {
 	MatchMethod MatchMethod
 	MatchScore  float64
 	EmbedError  string
-	CreatedAt   time.Time
+	// SigRaw / SigSalient / SigVerdict / SigSalientChars persist the row's
+	// full SignatureResult — the baseline a much later staleness comparison
+	// needs. Signature above is only the (possibly remapped) LEARNING key; it
+	// carries neither the never-remapped content hash nor the masked salient
+	// the jitter path compares, and the structured salient fields ComputeSignatureN
+	// derives them from (PermissionVerb, Options, ErrorSummary) are not
+	// persisted anywhere, so a baseline cannot be rebuilt from PaneExcerpt.
+	//
+	// Written on every decision-pipeline row — status "auto" as well as
+	// "escalated" — so a row later demoted by Store.EscalateAudit already
+	// carries its baseline. An empty SigRaw means "no baseline available"
+	// (legacy rows, and every path outside the decision pipeline), which the
+	// auto-accept eligibility predicate treats as fail-closed.
+	//
+	// SigSalientChars records the Embedding.PaneSalientChars in effect when
+	// the signature was computed, so the comparison basis cannot shift under
+	// an operator editing that setting mid-wait.
+	SigRaw          string
+	SigSalient      string
+	SigVerdict      GuardVerdict
+	SigSalientChars int
+	CreatedAt       time.Time
+}
+
+// WithSignatureBaseline stamps sig's full result onto the record — the
+// learning key AND the baseline fields a later staleness comparison needs.
+//
+// Every decision-pipeline audit insert goes through this, "auto" rows
+// included: a row written as "auto" can later be demoted to "escalated" by
+// Store.EscalateAudit, and it must already carry its baseline when that
+// happens (the demotion path has no signature in hand). Rows written outside
+// the decision pipeline simply never call it and keep an empty SigRaw, which
+// reads as "no baseline available".
+func (a AuditRecord) WithSignatureBaseline(sig SignatureResult) AuditRecord {
+	a.Signature = sig.Signature
+	a.SigRaw = sig.Raw
+	a.SigSalient = sig.Salient
+	a.SigVerdict = sig.Verdict
+	a.SigSalientChars = sig.SalientChars
+	return a
 }
 
 // IsRetryableLLMEscalation reports whether an escalation is a candidate for
