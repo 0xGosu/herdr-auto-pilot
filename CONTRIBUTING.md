@@ -73,6 +73,12 @@ herdr plugin link .
    - a **macOS** matrix leg, where test binaries need `-ldflags "-r /usr/local/lib"`
      to reach the FAISS dylibs.
 4. Describe *what* and *why* in the PR body; link related issues.
+5. **Add an entry under `## Unreleased` in `CHANGELOG.md`** — required for every
+   change, including patch-level fixes, in the same commit as the change itself.
+   Verb-first one-liners (`Added …`, `Fixed …`); write what it means for the
+   reader, not what the diff did. GitHub already generates a list of PR titles
+   per release; that file is for what a title cannot convey, like the bounds of
+   a new action. See the Changelog section in `CLAUDE.md`.
 
 Never put `[skip ci]`, `[ci skip]`, or `[no ci]` anywhere in the squash-merge
 message (title or body) of a PR that should release. GitHub suppresses *all*

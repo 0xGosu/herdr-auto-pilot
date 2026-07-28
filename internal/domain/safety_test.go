@@ -773,3 +773,52 @@ func TestSeedRuleIDIsDurableAcrossOrdering(t *testing.T) {
 		t.Error("an operator pattern must not be recognized as a seed pattern")
 	}
 }
+
+// TestSeedRuleForcedEscalationRequiresTheReasonToBeTheHit guards the gate every
+// "silence this rule" affordance uses. The variance guard APPENDS the
+// suspected-irreversible diagnostic to its own rationale (see Decide), so a
+// [variance_guard] escalation names a seed rule that did not force it.
+// Resolving it there would offer to weaken the safety net on a false premise —
+// and leave the operator still blocked, since the guard keeps escalating.
+func TestSeedRuleForcedEscalationRequiresTheReasonToBeTheHit(t *testing.T) {
+	a := newSeedNeverAuto(t)
+	hit, ok := a.SuspectedIrreversible("claude", "This action cannot be undone")
+	if !ok {
+		t.Fatal("expected the no-undo heuristic to fire")
+	}
+
+	// The two reasons whose rationale IS the hit resolve.
+	for _, reason := range []EscalateReason{ReasonNeverAutoMatch, ReasonSuspectedIrrevers} {
+		rationale := "[" + string(reason) + "] " + hit.Diagnostic()
+		rule, ok := SeedRuleForcedEscalation(rationale)
+		if !ok {
+			t.Fatalf("%s must resolve its own hit: %q", reason, rationale)
+		}
+		if rule.Pattern != hit.Pattern {
+			t.Errorf("%s resolved pattern=%q want %q", reason, rule.Pattern, hit.Pattern)
+		}
+	}
+
+	// The variance guard's own rationale carries the same diagnostic and must
+	// NOT resolve — this is the regression.
+	varianceGuard := "[" + string(ReasonVarianceGuard) + "] contradictory history; " + hit.Diagnostic()
+	if _, ok := SeedRuleForcedEscalation(varianceGuard); ok {
+		t.Errorf("a rule the variance guard merely named must not resolve: %q", varianceGuard)
+	}
+	// SeedRuleForRationale alone still resolves it — which is exactly why the
+	// reason gate is not redundant.
+	if _, ok := SeedRuleForRationale(varianceGuard); !ok {
+		t.Error("SeedRuleForRationale should still name the rule; the reason gate is what adds causation")
+	}
+
+	// An untagged rationale cannot prove causation, so it fails closed.
+	if _, ok := SeedRuleForcedEscalation(hit.Diagnostic()); ok {
+		t.Error("an untagged rationale must not resolve")
+	}
+	// An operator rule whose pattern text equals a shipped one stays excluded
+	// through the new gate too: the source check still runs underneath it.
+	if _, ok := SeedRuleForcedEscalation("[" + string(ReasonNeverAutoMatch) + "] pattern " +
+		hit.Pattern + ` matched "x" (source=operator kind=strict)`); ok {
+		t.Error("an operator-sourced hit must not resolve through the reason gate")
+	}
+}

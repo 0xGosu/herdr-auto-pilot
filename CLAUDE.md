@@ -101,6 +101,24 @@ ticket/issue id**. Examples:
   new worktree from `main` that includes those staged changes, and continue there without
   disturbing the other work in progress.
 
+## Changelog (MANDATORY)
+
+**Every change gets an entry in `CHANGELOG.md` at the repo root — including
+patch releases.** No exceptions for "small", "internal", or "just a fix": if it
+merges, it is in the changelog. A PR without one is incomplete.
+
+- Add the line(s) under `## Unreleased`, in the same commit as the change. The
+  heading becomes the version number when that release is tagged (the manifest
+  version TRAILS releases, so the number is not known at merge time).
+- Style: a flat list of verb-first one-liners — `Added …`, `Fixed …`,
+  `Changed …`, `Removed …`. No sub-sections.
+- Write what it MEANS for the reader, not what the diff did. GitHub already
+  generates a per-release list of PR titles; this file exists for what a title
+  cannot carry — the bounds of a new action, what a changed default now does,
+  what a fix stops happening.
+- Mark a breaking change **Breaking.** at the start of its line, matching the
+  `feat!:` commit type.
+
 ## Version bump & release
 
 Releases are **automated on merge to main** with a bump-then-tag model

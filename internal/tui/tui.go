@@ -473,6 +473,12 @@ type detailView struct {
 	// `agent` nil) must do nothing at all.
 	ruleDetail    bool
 	ruleSignature string
+	// seedRule snapshots the builtin (seed) never-auto rule that forced THIS
+	// escalation, resolved from its rationale at open time, so `b` disables the
+	// rule named on screen even if a refresh moved the list cursor (same reason
+	// as confirmID). nil when no builtin rule produced the record — which is
+	// the common case, and is why the binding is advertised conditionally.
+	seedRule *domain.NeverAutoRule
 	// agent snapshots the agent an agents-tab detail was opened for, so the
 	// clock tick can rebuild its lines against the current clock (the live Age
 	// would otherwise freeze at open time — the build closure captures m by
@@ -1475,6 +1481,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if r := m.detail.task; r != nil {
 				return m.focusTaskGroupAgent(r.group)
 			}
+		case "b":
+			// Acts on the rule snapshotted at open, not the live cursor —
+			// same rule as confirmID. The overlay closes as soon as there is
+			// something to act on (the house convention the other per-entry
+			// keys follow), and stays open when nothing is armed.
+			if rule := m.detail.seedRule; rule != nil {
+				id := m.detail.confirmID
+				m.detail = nil
+				return m.disableSeedRulePrompt(*rule, id)
+			}
 		case "t":
 			if m.detail.agent != nil {
 				return m.showAgentTasks(*m.detail.agent)
@@ -1708,6 +1724,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "c":
 		if m.tab == tabEscalations || m.tab == tabAudit {
 			return m.correctSelected()
+		}
+	case "b":
+		// Escalations only: disabling a builtin rule answers "this rule
+		// blocked me", which the read-only Audit history cannot pose.
+		if m.tab == tabEscalations {
+			return m.disableMatchedSeedRulePrompt()
 		}
 	case "n":
 		if m.tab == tabAgents {
@@ -3221,6 +3243,13 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 				d.confirmID = r.ID
 				d.escRetryable = m.canRetry(r)
 				d.focusAgentID = r.AgentID
+				// Only the Escalations detail offers `b`: disabling a builtin
+				// rule is a response to being blocked by it, and the Audit tab
+				// is a read-only history. The line naming the rule still
+				// renders on both.
+				if rule, ok := domain.SeedRuleForcedEscalation(r.Rationale); ok {
+					d.seedRule = &rule
+				}
 			}
 			m.detail = d
 		}
@@ -3696,6 +3725,22 @@ func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int, op
 	lines = m.detailField(lines, w, "Action", r.Action)
 	lines = m.detailField(lines, w, "Input", r.Input)
 	lines = m.detailField(lines, w, "Rationale", r.Rationale)
+	// The rationale names the pattern, but not which of the ~90 shipped rules
+	// it is or how to silence it. Resolve it to its stable id here so the
+	// operator can act without hand-matching regex text against `rules list`.
+	if rule, ok := domain.SeedRuleForRationale(r.Rationale); ok {
+		// Named, but say whether it is the CAUSE. The variance guard appends
+		// this diagnostic to its own rationale, so a record can name a builtin
+		// rule that did not force it — and disabling that one would weaken the
+		// safety net while the guard kept escalating the same situation.
+		role := ""
+		if _, forced := domain.SeedRuleForcedEscalation(r.Rationale); !forced {
+			role = "  (noted, not what forced this)"
+		}
+		lines = m.detailField(lines, w, "Builtin rule",
+			fmt.Sprintf("%s  %s%s%s", domain.SeedRuleID(rule.Pattern), rule.Pattern,
+				m.seedRuleStateSuffix(rule.Pattern), role))
+	}
 	if opts.collapseLLMOutput {
 		lines = m.detailPreviewField(lines, w, "LLM output", r.LLMOutput, opts.expanded, 3)
 	} else {
@@ -4421,6 +4466,94 @@ func (m Model) showSelectedRule() (tea.Model, tea.Cmd) {
 	return m.showRuleFor(rec.Signature)
 }
 
+// --- Builtin (seed) never-auto rules ---
+
+// seedRuleDisabled reports whether a shipped seed pattern is currently
+// silenced, and why. Two different switches can silence it: the per-rule
+// safety.disabled_seed_patterns list, and the wholesale
+// safety.disable_never_auto_seed_patterns. They need different messages —
+// re-enabling one rule does nothing while the master switch is on.
+func (m Model) seedRuleDisabled(pattern string) (reason string, disabled bool) {
+	if m.data.cfg.Safety.DisableNeverAutoSeedPatterns {
+		return "every builtin rule is already off (safety.disable_never_auto_seed_patterns)", true
+	}
+	for _, p := range m.data.cfg.Safety.DisabledSeedPatterns {
+		if p == pattern {
+			return "already disabled", true
+		}
+	}
+	return "", false
+}
+
+// seedRuleStateSuffix annotates a rule's detail line when it is no longer
+// active, so an OLD escalation — raised while the rule still applied — does
+// not read as a live block the operator still has to clear.
+func (m Model) seedRuleStateSuffix(pattern string) string {
+	if reason, off := m.seedRuleDisabled(pattern); off {
+		return "  (" + reason + ")"
+	}
+	return ""
+}
+
+// disableMatchedSeedRulePrompt silences the ONE builtin never-auto rule that
+// forced the selected escalation (`b`). Being blocked by a shipped rule that
+// is too aggressive for this repo is otherwise a trip to `hap rules list` and
+// an eyeball match of regex text; the rationale already names the pattern, so
+// resolve it here instead.
+//
+// Only the rule that matched THIS escalation is offered — never the whole seed
+// set. Weakening a safety control wholesale is a config decision, not an
+// answer to one blocked agent.
+func (m Model) disableMatchedSeedRulePrompt() (tea.Model, tea.Cmd) {
+	rec := m.selectedAudit()
+	if rec == nil {
+		return m, nil
+	}
+	rule, ok := domain.SeedRuleForcedEscalation(rec.Rationale)
+	if !ok {
+		m.message = "no builtin safety rule forced this escalation — nothing to disable (v: details shows why it escalated)"
+		m.scrollCursorIntoView() // the hint line shrinks the page
+		return m, nil
+	}
+	return m.disableSeedRulePrompt(rule, rec.ID)
+}
+
+// disableSeedRulePrompt asks before silencing one shipped rule. It is a
+// guarded action deliberately: the rule exists to force a human decision, and
+// after this every situation matching it is answerable by the machine.
+func (m Model) disableSeedRulePrompt(rule domain.NeverAutoRule, escID int64) (tea.Model, tea.Cmd) {
+	id, pattern := domain.SeedRuleID(rule.Pattern), rule.Pattern
+	if reason, off := m.seedRuleDisabled(pattern); off {
+		m.message = fmt.Sprintf("builtin rule %s: %s", id, reason)
+		m.scrollCursorIntoView()
+		return m, nil
+	}
+	app := m.app
+	m.confirm = &confirmation{
+		// The consequence comes BEFORE the pattern: a seed regex can run past
+		// 100 characters, and this label is rendered untruncated — on a narrow
+		// pane a trailing warning wraps past the fold. The [y/N] is not
+		// decoration either: enter accepts, and enter is this tab's most-used
+		// key (confirm+send), so the accept keys have to be stated.
+		label: fmt.Sprintf("disable builtin safety rule %s? situations matching it stop being held for a human (it forced escalation #%d) — pattern: %s [y/N]",
+			id, escID, pattern),
+		// The 2s poll can land between the question and the answer, and the
+		// same rule can be disabled from the Config tab or another hap
+		// process. Re-check rather than report a disable that did nothing.
+		revalidate: func(cur Model) (string, bool) {
+			if reason, off := cur.seedRuleDisabled(pattern); off {
+				return fmt.Sprintf("builtin rule %s: %s", id, reason), false
+			}
+			return "", true
+		},
+		onConfirm: func() tea.Cmd {
+			return m.do(fmt.Sprintf("builtin rule %s disabled: %s (re-enable: hap rules enable-seed %s)", id, pattern, id),
+				func(ctx context.Context) error { return app.DisableSeedRule(ctx, pattern) })
+		},
+	}
+	return m, nil
+}
+
 // showRuleFor jumps to the Rules tab with the rule a record is keyed to already
 // selected (AR-039) — shared by the Escalations/Audit lists and their detail
 // overlays, since a record and its rule share the signature string (see
@@ -4738,7 +4871,14 @@ func (m Model) helpLine() string {
 			if m.detail.escRetryable {
 				retry = "  l: retry LLM"
 			}
-			return "enter: confirm+send  y: confirm only  c: correct (+send?)  x: delete  f: focus in herdr" + rule + retry +
+			// Advertised only when a builtin rule actually produced this
+			// record: on most escalations the key does nothing, and the line
+			// is already at the width budget.
+			seed := ""
+			if m.detail.seedRule != nil {
+				seed = "  b: disable builtin rule"
+			}
+			return "enter: confirm+send  y: confirm only  c: correct (+send?)  x: delete  f: focus in herdr" + rule + retry + seed +
 				preview + "  ↑/↓: scroll  tab: switch tab  " + closeKeys
 		}
 		if m.detail.agent != nil {
@@ -4779,7 +4919,16 @@ func (m Model) helpLine() string {
 	case tabTasks:
 		return "enter/y: send to agent  v: details  a: add  e: edit  d: done/undone  K/J: move up/down  x: delete (source on a header)  space: mark  f: focus in herdr  /: search  " + common
 	case tabEscalations:
-		return "enter: confirm+send  y: confirm only (marked)  c: correct (+send?)  l: retry LLM  f: focus in herdr  t: see rule  space: mark  x: delete  X: prune old  v: details  /: search  " + common
+		// `b` is offered only while the selected row was actually forced by a
+		// builtin rule — on every other escalation the key has nothing to act
+		// on, and this line is already the longest one here.
+		seed := ""
+		if rec := m.selectedAudit(); rec != nil {
+			if _, ok := domain.SeedRuleForcedEscalation(rec.Rationale); ok {
+				seed = "  b: disable builtin rule"
+			}
+		}
+		return "enter: confirm+send  y: confirm only (marked)  c: correct (+send?)  l: retry LLM  f: focus in herdr  t: see rule" + seed + "  space: mark  x: delete  X: prune old  v: details  /: search  " + common
 	case tabAudit:
 		return "c: correct decision  v: details  t: see rule  /: search  " + common
 	case tabSignatures:
