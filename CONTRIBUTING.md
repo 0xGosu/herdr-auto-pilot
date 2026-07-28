@@ -39,6 +39,17 @@ golangci-lint run --build-tags "vectors,cpu" # lint (CI runs this too)
 Both tags are always required — a build without them fails to link, so there is
 no tag-free shortcut for a quick check.
 
+Never `git add` the llama-go submodule directory after pointing it at another
+checkout with a symlink (a common local trick for reusing prebuilt native
+archives): that rewrites its tree entry from a gitlink to a symlink, and a
+fresh clone then fails inside `setup-native.sh` with a linker error that names
+neither git nor submodules. `make check` and every CI job that builds native
+deps run `bash scripts/check-submodule-gitlink.sh` first to catch it. In a
+worktree, `git config submodule.<name>.ignore all` (the `<name>` from the
+`[submodule "…"]` header — it equals the path here) keeps `git add -A` off it,
+but an explicit `git add <that path>` still records the symlink, so never run
+one.
+
 Golden classifier fixtures live in `internal/classify/testdata/`; regenerate
 expectations with `UPDATE_GOLDEN=1 go test -tags "vectors cpu" ./internal/classify/`
 and review the diff carefully.

@@ -21,6 +21,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      # First after checkout: a submodule gitlink replaced by a symlink
+      # otherwise surfaces as a linker error deep inside setup-native.sh
+      # that names neither git nor submodules (#265).
+      - name: Submodule gitlinks intact
+        run: bash scripts/check-submodule-gitlink.sh
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -69,6 +74,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Submodule gitlinks intact
+        run: bash scripts/check-submodule-gitlink.sh
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
