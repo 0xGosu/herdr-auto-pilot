@@ -2334,6 +2334,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"tui.max_content_height":                   "12",
 		"tui.theme":                                "dark",
 		"tui.terminal_bell":                        "true",
+		"tui.herdr_notification":                   "false",
 		"tui.disable_check_for_update":             "true",
 		"cli.ai_agent_friendly_output":             "false",
 	}
@@ -2488,6 +2489,9 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 		{"safety.disable_never_auto_seed_patterns", "true", false},
 		{"safety.disable_never_auto_seed_patterns", "false", false},
 		{"safety.disable_never_auto_seed_patterns", "yes", true},
+		{"tui.herdr_notification", "true", false},
+		{"tui.herdr_notification", "false", false},
+		{"tui.herdr_notification", "sometimes", true},
 		{"llm.pane_excerpt_chars", "0", false}, // 0 = restore-default sentinel (fillZeroes)
 		{"llm.pane_excerpt_chars", "-5", true},
 		{"llm.pane_excerpt_chars", "abc", true},
@@ -2552,6 +2556,11 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 	if err := app.SetField(ctx, "llm.task_generate_timeout_seconds", "30"); err != nil {
 		t.Fatal(err)
 	}
+	// Ends on false — the non-default value, so a validator that forgot the
+	// assignment cannot pass by inheriting the true default.
+	if err := app.SetField(ctx, "tui.herdr_notification", "false"); err != nil {
+		t.Fatal(err)
+	}
 	if cfg, err = app.Config(); err != nil {
 		t.Fatal(err)
 	}
@@ -2569,6 +2578,9 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 	}
 	if cfg.LLM.GenerateTaskTimeoutSeconds != 30 {
 		t.Errorf("llm.task_generate_timeout_seconds = %d, want 30 (assignment not persisted)", cfg.LLM.GenerateTaskTimeoutSeconds)
+	}
+	if cfg.TUI.HerdrNotification {
+		t.Error("tui.herdr_notification = true, want false (assignment not persisted)")
 	}
 }
 

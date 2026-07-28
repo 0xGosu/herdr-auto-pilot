@@ -72,6 +72,11 @@ go test -tags "integration vectors cpu" ./test/integration/ -v      # include th
   plain menu and got a bare digit that only toggled its checkbox — and asserts the answer
   toggles, advances to Submit, and commits. It FAILS (does not skip) when a form is on screen
   but `MultiTabForm` misses it, so the detection regression can never pass silently.
+  `TestRealHerdrNotification*` / `TestRealInHerdrDetection` (`notification_test.go`) drive the
+  socket notifier the TUI alerts through: the `notification.show` result shape (`shown` must
+  agree with a `reason` the TUI knows), that two calls in a row both land (herdr closes the
+  connection after each answer, so a pooled connection would EPIPE), and that an empty
+  normalized title is refused locally AND still refused by herdr. They raise real toasts.
 
 **Recommended: run the integration suite once after finishing any feature**, before the
 PR — the unit suite fakes herdr, so only this catches real CLI-shape drift (e.g.

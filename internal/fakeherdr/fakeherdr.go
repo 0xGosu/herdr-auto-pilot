@@ -27,6 +27,15 @@ type clientConn struct {
 	subs []subscription
 }
 
+// SocketNotification is one notification.show request the fake received.
+type SocketNotification struct {
+	ID       string
+	Title    string
+	Body     string
+	Position string
+	Sound    string
+}
+
 // Server is a fake Herdr events socket.
 type Server struct {
 	SocketPath string
@@ -35,6 +44,16 @@ type Server struct {
 	mu    sync.Mutex
 	conns map[net.Conn]*clientConn
 	panes map[string]string // paneID → workspaceID (replayed on subscribe)
+
+	// notifications records every notification.show request; notifyShown /
+	// notifyReason are the canned result, defaulting to a displayed toast.
+	notifications []SocketNotification
+	notifyShown   bool
+	notifyReason  string
+	// notifyErrCode, when set, makes notification.show answer with a
+	// protocol error instead of a result.
+	notifyErrCode string
+	notifyErrMsg  string
 }
 
 // NewServer starts a fake events socket in dir.
@@ -46,8 +65,10 @@ func NewServer(dir string) (*Server, error) {
 	}
 	s := &Server{
 		SocketPath: path, ln: ln,
-		conns: map[net.Conn]*clientConn{},
-		panes: map[string]string{},
+		conns:        map[net.Conn]*clientConn{},
+		panes:        map[string]string{},
+		notifyShown:  true,
+		notifyReason: "shown",
 	}
 	go s.accept()
 	return s, nil
@@ -71,9 +92,37 @@ func (s *Server) serve(conn net.Conn) {
 			Method string `json:"method"`
 			Params struct {
 				Subscriptions []subscription `json:"subscriptions"`
+				Title         string         `json:"title"`
+				Body          string         `json:"body"`
+				Position      string         `json:"position"`
+				Sound         string         `json:"sound"`
 			} `json:"params"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			continue
+		}
+		if req.Method == "notification.show" {
+			s.mu.Lock()
+			s.notifications = append(s.notifications, SocketNotification{
+				ID: req.ID, Title: req.Params.Title, Body: req.Params.Body,
+				Position: req.Params.Position, Sound: req.Params.Sound,
+			})
+			shown, reason := s.notifyShown, s.notifyReason
+			errCode, errMsg := s.notifyErrCode, s.notifyErrMsg
+			s.mu.Unlock()
+			var resp []byte
+			if errCode != "" {
+				resp, _ = json.Marshal(map[string]any{
+					"id": req.ID, "error": map[string]any{"code": errCode, "message": errMsg},
+				})
+			} else {
+				resp, _ = json.Marshal(map[string]any{
+					"id": req.ID, "result": map[string]any{
+						"type": "notification_show", "shown": shown, "reason": reason,
+					},
+				})
+			}
+			conn.Write(append(resp, '\n'))
 			continue
 		}
 		if req.Method == "pane.list" {
@@ -149,6 +198,33 @@ func (s *Server) serve(conn net.Conn) {
 func wrap(event string, data map[string]any) []byte {
 	msg, _ := json.Marshal(map[string]any{"event": event, "data": data})
 	return append(msg, '\n')
+}
+
+// SetNotificationResult sets the canned notification.show result. Real herdr
+// answers shown=false with a reason ("disabled", "rate_limited",
+// "no_foreground_client", "busy") when it drops a toast.
+func (s *Server) SetNotificationResult(shown bool, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notifyShown, s.notifyReason = shown, reason
+	s.notifyErrCode, s.notifyErrMsg = "", ""
+}
+
+// SetNotificationError makes notification.show answer with a protocol error
+// instead of a result. An empty code restores the canned result.
+func (s *Server) SetNotificationError(code, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notifyErrCode, s.notifyErrMsg = code, message
+}
+
+// SocketNotifications returns every notification.show request received so
+// far, in order. Named apart from FakeCLI.Notifications, which records the
+// `herdr notification show` COMMAND rather than the socket method.
+func (s *Server) SocketNotifications() []SocketNotification {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]SocketNotification(nil), s.notifications...)
 }
 
 // AddPane registers a pane (replayed to future pane.created subscribers and

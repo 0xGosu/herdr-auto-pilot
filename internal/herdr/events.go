@@ -212,7 +212,8 @@ func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTr
 func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTransition) error {
 	paneIDs, err := s.listPanes(ctx)
 	if err != nil {
-		return fmt.Errorf("pane.list: %w", err)
+		// Not wrapped with the method name: call()'s errors already carry it.
+		return err
 	}
 	if len(paneIDs) == 0 {
 		// Nothing to watch yet: wait for discovery to find panes.
@@ -388,52 +389,107 @@ func (s *Subscriber) signalDirty() {
 	}
 }
 
-// listPanes queries the live pane set over a short-lived connection.
-func (s *Subscriber) listPanes(ctx context.Context) ([]string, error) {
-	conn, err := s.Dial(ctx)
+// SocketError is a protocol-level error herdr returned in place of a result.
+// It is distinct from a transport failure so callers can tell "herdr answered,
+// and said no" from "we never reached herdr".
+type SocketError struct {
+	Method  string
+	Code    string
+	Message string
+}
+
+func (e *SocketError) Error() string {
+	return fmt.Sprintf("herdr %s: %s: %s", e.Method, e.Code, e.Message)
+}
+
+// call performs one request/response round trip over a SHORT-LIVED connection
+// and decodes the single response line's `result` into out (nil discards it).
+// herdr's protocol is newline-delimited JSON with no handshake, so one write
+// plus one read is the whole exchange.
+//
+// This is the request/response counterpart to stream(), which keeps its
+// connection open as an event feed instead.
+//
+// EVERY error it returns names the method, so callers must not wrap with the
+// method again — that is what produced "pane.list: herdr pane.list: …".
+func call(ctx context.Context, dial func(context.Context) (net.Conn, error),
+	id, method string, params any, out any) error {
+
+	conn, err := dial(ctx)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("dial herdr socket for %s: %w", method, err)
 	}
 	defer conn.Close()
+	// Closing the conn is what unblocks the read below; ctx alone cannot
+	// interrupt a Scan already in flight.
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 
-	req, _ := json.Marshal(socketRequest{ID: "hap_pane_list", Method: "pane.list", Params: map[string]any{}})
+	req, err := json.Marshal(socketRequest{ID: id, Method: method, Params: params})
+	if err != nil {
+		return fmt.Errorf("encode %s request: %w", method, err)
+	}
 	if _, err := conn.Write(append(req, '\n')); err != nil {
-		return nil, err
+		return fmt.Errorf("write %s request: %w", method, err)
 	}
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {
-			return nil, err
+			return fmt.Errorf("read %s response: %w", method, err)
 		}
-		return nil, fmt.Errorf("connection closed before pane.list response")
+		return fmt.Errorf("connection closed before %s response", method)
 	}
-	var resp struct {
+	var envelope struct {
+		ID    string `json:"id"`
 		Error *struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
-		Result struct {
-			Panes []struct {
-				PaneID      string `json:"pane_id"`
-				TabID       string `json:"tab_id"`
-				WorkspaceID string `json:"workspace_id"`
-				Agent       string `json:"agent"`
-			} `json:"panes"`
-		} `json:"result"`
+		Result json.RawMessage `json:"result"`
 	}
-	if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+	if err := json.Unmarshal(scanner.Bytes(), &envelope); err != nil {
+		return fmt.Errorf("decode %s response: %w", method, err)
+	}
+	// herdr echoes the request id. A mismatch means we are reading someone
+	// else's answer — decoding it as ours would be worse than failing. Only
+	// checked when the server actually sent one, so an id-less reply still
+	// works.
+	if envelope.ID != "" && envelope.ID != id {
+		return fmt.Errorf("%s response id %q does not match request %q", method, envelope.ID, id)
+	}
+	if envelope.Error != nil {
+		return &SocketError{Method: method, Code: envelope.Error.Code, Message: envelope.Error.Message}
+	}
+	// An absent result is not an error: the pre-extraction code decoded a
+	// missing `result` into a zero struct and carried on, so this preserves
+	// that. A malformed one still errors, one Unmarshal later.
+	if out == nil || len(envelope.Result) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(envelope.Result, out); err != nil {
+		return fmt.Errorf("decode %s result: %w", method, err)
+	}
+	return nil
+}
+
+// listPanes queries the live pane set over a short-lived connection.
+func (s *Subscriber) listPanes(ctx context.Context) ([]string, error) {
+	var result struct {
+		Panes []struct {
+			PaneID      string `json:"pane_id"`
+			TabID       string `json:"tab_id"`
+			WorkspaceID string `json:"workspace_id"`
+			Agent       string `json:"agent"`
+		} `json:"panes"`
+	}
+	if err := call(ctx, s.Dial, "hap_pane_list", "pane.list", map[string]any{}, &result); err != nil {
 		return nil, err
 	}
-	if resp.Error != nil {
-		return nil, fmt.Errorf("%s: %s", resp.Error.Code, resp.Error.Message)
-	}
-	ids := make([]string, 0, len(resp.Result.Panes))
+	ids := make([]string, 0, len(result.Panes))
 	s.mu.Lock()
 	live := map[string]bool{}
-	for _, p := range resp.Result.Panes {
+	for _, p := range result.Panes {
 		ids = append(ids, p.PaneID)
 		live[p.PaneID] = true
 		info := s.panes[p.PaneID]

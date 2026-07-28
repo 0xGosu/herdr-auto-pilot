@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,6 +30,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/updatecheck"
 )
 
@@ -558,6 +560,11 @@ type Model struct {
 	// bellOut is where the terminal bell (ASCII BEL) is written; nil is a
 	// safe no-op so tests never touch real IO. Run() wires it to os.Stdout.
 	bellOut io.Writer
+	// notifier raises a herdr desktop notification for the same two events
+	// the bell covers. nil whenever hap is not running as a herdr-managed
+	// pane (a plain terminal, and every test that does not inject one), in
+	// which case alert() falls straight through to the bell.
+	notifier ports.NotifyShower
 	// initialized is false until the first successful (err == nil)
 	// refreshMsg has been processed. It gates all bell logic: without it,
 	// the very first refresh would look like a 0-to-N transition against
@@ -965,7 +972,7 @@ func (m Model) visibleSignatures() []frontend.SignatureRow {
 
 // New creates the TUI model.
 func New(ctx context.Context, app *frontend.App) Model {
-	return Model{app: app, ctx: ctx, inflight: &sync.WaitGroup{}}
+	return Model{app: app, ctx: ctx, inflight: &sync.WaitGroup{}, notifier: app.Notifier}
 }
 
 // Init starts the refresh loop.
@@ -1177,21 +1184,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case refreshMsg:
 		if msg.err == nil {
-			if m.initialized && msg.cfg.TUI.TerminalBell {
+			if m.initialized {
+				// Either channel being on is enough to evaluate the triggers;
+				// alert() itself picks the channel and honors both switches.
+				alerting := msg.cfg.TUI.HerdrNotification || msg.cfg.TUI.TerminalBell
 				// Trigger 1: any escalation newer than the last successful
-				// poll. One bell per poll cycle even if several appeared at
-				// once — beeping N times for a burst is worse UX.
-				if maxEscalationID(msg.escalations) > m.lastMaxEscalationID {
-					m.ringBell()
+				// poll. One alert per poll cycle even if several appeared at
+				// once — beeping (or toasting) N times for a burst is worse UX.
+				if alerting && maxEscalationID(msg.escalations) > m.lastMaxEscalationID {
+					title, body := escalationAlertText(msg)
+					m.alert(msg.cfg.TUI, title, body)
 				}
 				// Trigger 2: pause just became active, and NOT because this
 				// instance's own "p" press caused it (pausePending, set
 				// synchronously at keypress time — see its doc comment).
+				//
+				// pausePending is consumed on the TRANSITION, never inside the
+				// alerting branch: it is a fact about who caused THIS pause, so
+				// leaving it set while alerts happen to be off would latch it
+				// and make the next externally-caused pause read as self-caused
+				// — silently swallowing a real alert.
 				if !m.lastPaused && msg.status.Paused {
-					if m.pausePending {
-						m.pausePending = false
-					} else {
-						m.ringBell()
+					selfCaused := m.pausePending
+					m.pausePending = false
+					if alerting && !selfCaused {
+						m.alert(msg.cfg.TUI, "Auto Prompter: automation paused",
+							"The kill switch was activated by another process.")
 					}
 				}
 			}
@@ -1885,10 +1903,99 @@ func maxEscalationID(rows []domain.AuditRecord) int64 {
 	return highest
 }
 
-// ringBell emits a single ASCII BEL (0x07). A nil bellOut (the default in
+// alert raises the operator's attention through the best channel available:
+// a herdr desktop notification when hap runs as a herdr-managed pane, else
+// (or when herdr declines to display it) the terminal bell.
+//
+// The notification is dispatched on a goroutine, NOT inline: a socket round
+// trip takes up to SocketNotifier.Timeout, and Update runs on Bubble Tea's
+// single update loop where any wait freezes the whole UI. The goroutine joins
+// m.inflight — the same WaitGroup do() uses and Run drains before returning —
+// so quitting right after an escalation still lets the toast finish. The
+// Add(1) happens here, on the update loop, for the reason documented on do():
+// adding inside the goroutine can race Run's drain.
+//
+// Falling back on a not-shown toast is deliberate. herdr answers with
+// shown=false and a reason (disabled, rate_limited, no_foreground_client,
+// busy) when it drops one; treating that as delivered would silently swallow
+// the alert the operator configured.
+func (m Model) alert(cfg config.TUI, title, body string) {
+	if cfg.HerdrNotification && m.notifier != nil {
+		// Capture only what the goroutine needs — a Model copy would pin the
+		// whole refresh payload for the life of the call.
+		wg, ctx, notifier, out, bell := m.inflight, m.ctx, m.notifier, m.bellOut, cfg.TerminalBell
+		if ctx == nil { // Model literals in tests may leave it unset
+			ctx = context.Background()
+		}
+		// Guarded like every other inflight user here (see do/semanticSearchCmd):
+		// Model is built by literal in dozens of tests, so a nil WaitGroup must
+		// degrade rather than panic on the update loop.
+		if wg != nil {
+			wg.Add(1)
+		}
+		go func() {
+			if wg != nil {
+				defer wg.Done()
+			}
+			res, err := notifier.ShowNotification(ctx, title, body)
+			if err == nil && res.Shown {
+				return
+			}
+			if err != nil {
+				// Warn, not Debug: the TUI logs at Info, and a permanently
+				// broken socket (herdr restarted, wrong HERDR_SOCKET_PATH)
+				// would otherwise leave the operator with an unexplained bell
+				// and nothing to find in the log.
+				slog.Warn("herdr notification failed", "error", err)
+			} else {
+				// Expected traffic, not a fault — herdr routinely declines.
+				slog.Debug("herdr notification not shown", "reason", res.Reason)
+			}
+			// On shutdown the dial fails instantly because ctx is already
+			// cancelled; beeping the terminal on the way out is noise, not an
+			// alert.
+			if bell && ctx.Err() == nil {
+				ringBellTo(out)
+			}
+		}()
+		return
+	}
+	if cfg.TerminalBell {
+		ringBellTo(m.bellOut)
+	}
+}
+
+// escalationAlertText renders the notification for the newest escalation in a
+// refresh. It names the agent the way the lists do (short name, falling back
+// to the pane id) so the toast and the TUI row agree.
+func escalationAlertText(msg refreshMsg) (title, body string) {
+	newest := domain.AuditRecord{}
+	for _, r := range msg.escalations {
+		if r.ID > newest.ID {
+			newest = r
+		}
+	}
+	agent := msg.status.AgentName(newest.AgentID)
+	if agent == "" {
+		agent = newest.AgentID
+	}
+	if agent == "" {
+		// No escalation row to describe (an id-only diff, or a pruned list):
+		// still alert, just without the specifics.
+		return "Auto Prompter: an agent needs attention", "A new escalation is waiting."
+	}
+	title = fmt.Sprintf("Auto Prompter: %s needs attention", agent)
+	body = fmt.Sprintf("%s escalated.", orDash(string(newest.SituationType)))
+	if newest.Suggestion != "" {
+		body += " Suggestion: " + newest.Suggestion
+	}
+	return title, body
+}
+
+// ringBellTo emits a single ASCII BEL (0x07). A nil writer (the default in
 // tests and unless Run() wires it) makes this a safe no-op.
 //
-// This writes directly to bellOut (os.Stdout in Run()) rather than through
+// This writes directly to the writer (os.Stdout in Run()) rather than through
 // Bubble Tea's own output helpers: tea.Println/tea.Printf are silently
 // dropped whenever the alt screen is active (see bubbletea's
 // standardRenderer's printLineMessage handling) — verified against the
@@ -1897,12 +2004,13 @@ func maxEscalationID(rows []domain.AuditRecord) int64 {
 // flush writes to the same fd from its own goroutine, but a lone BEL is a
 // single byte — a single Write() of one byte cannot be torn by a
 // concurrent Write() of another buffer, so the worst case is a one-frame-
-// late beep, never output corruption.
-func (m Model) ringBell() {
-	if m.bellOut == nil {
+// late beep, never output corruption. That same single-byte argument is what
+// lets alert()'s goroutine call this off the update loop.
+func ringBellTo(w io.Writer) {
+	if w == nil {
 		return
 	}
-	_, _ = m.bellOut.Write([]byte{0x07})
+	_, _ = w.Write([]byte{0x07})
 }
 
 // pauseCmd activates the pause/kill switch, tagging its result as

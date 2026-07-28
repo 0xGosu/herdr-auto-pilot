@@ -164,6 +164,12 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 			return daemonlock.Info(paths)
 		},
 	}
+	// Desktop notifications only exist when herdr launched us as a managed
+	// pane — it injects HERDR_ENV=1 and the control socket there. Outside
+	// herdr the field stays nil and consumers fall back (the TUI beeps).
+	if herdr.InHerdr() {
+		app.Notifier = herdr.NewSocketNotifier(herdr.SocketPath())
+	}
 	return app, func() { st.Close() }, nil
 }
 
@@ -318,11 +324,7 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		return embedder.New(cfg.Embedding)
 	}
 
-	socketPath := os.Getenv("HERDR_SOCKET_PATH")
-	if socketPath == "" {
-		home, _ := os.UserHomeDir()
-		socketPath = home + "/.config/herdr/herdr.sock"
-	}
+	socketPath := herdr.SocketPath()
 
 	d, err := daemon.New(daemon.Options{
 		ConfigPath:        paths.File(),
