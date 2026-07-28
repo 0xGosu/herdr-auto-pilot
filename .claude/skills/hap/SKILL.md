@@ -415,7 +415,8 @@ per-command env notes: layering is daemon env → `env_file` → `env` → the c
 | `tui.max_content_height` | 0 (full height) | cap the rows a list body may use; 0 = full height |
 | `tui.theme` | default | TUI color theme: default, dark, light, high-contrast (in the TUI Config tab, `e` on this row opens a ↑/↓ picker of the available themes) |
 | `cli.ai_agent_friendly_output` | true | append the "Next steps" footer to command output (for AI agents driving the CLI); never affects `hap help` / `--help`, which always show theirs |
-| `tui.terminal_bell` | true | ring the terminal bell (\a) on new escalations and on pauses caused by a different process |
+| `tui.terminal_bell` | true | ring the terminal bell (\a) on new escalations and on pauses caused by a different process; also the fallback when a herdr notification is not displayed |
+| `tui.herdr_notification` | true | raise a herdr desktop notification on those same two events, when the TUI runs as a herdr-managed pane |
 | `tui.disable_check_for_update` | false | turn off the GitHub release check (at most every 6h, TUI only) that puts `↑ vX.Y.Z available` in the header. it is the plugin's ONLY outbound network call; a locally built (`plugin link`) binary never checks |
 
 TUI palette colors (`tui.palette.*`) are config.toml-only — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. values are 256-color codes (`"205"`) or hex (`"#ff5faf"`).

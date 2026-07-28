@@ -562,7 +562,10 @@ max_content_width = 0       # cap variable-width list columns; 0 = full width
 max_content_height = 0      # expanded long-field lines; 0 = unlimited (collapsed previews use short tails)
 theme = "high-contrast"     # illustrative; the DEFAULT is "" (= the default palette)
 terminal_bell = true        # ring the bell on a new escalation, and on a pause
-                            # caused by a different process
+                            # caused by a different process. Also the fallback
+                            # when a herdr notification is not displayed
+herdr_notification = true   # raise a herdr desktop notification on those same
+                            # two events, when the TUI runs inside herdr
 disable_check_for_update = false  # true turns off the GitHub release check
 
 # Optional per-role color overrides, layered on top of the theme; unset
@@ -1097,7 +1100,10 @@ Simple fields — numbers, booleans, and the `tui.theme` enum, including
 `embedding.model_context_window`, `safety.disable_never_auto_seed_patterns`,
 `tui.max_content_width` / `tui.max_content_height`, `tui.terminal_bell`
 (on by default — rings the terminal bell on a new escalation, and when the
-kill switch is paused by a *different* process than the TUI you're in), and
+kill switch is paused by a *different* process than the TUI you're in),
+`tui.herdr_notification` (on by default — raises a herdr desktop notification
+for those same two events when the TUI is running as a herdr pane; the bell
+still rings if herdr reports it did not display the toast), and
 `tui.disable_check_for_update` (off by default — see *Update to the latest
 version*) — edit
 inline (`enter`, or `e`) or via `hap config set <key> <value>`. Free-text fields (`llm.command`,

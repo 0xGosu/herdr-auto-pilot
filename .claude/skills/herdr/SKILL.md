@@ -181,6 +181,32 @@ herdr pane send-keys 1-1 Enter
 herdr pane run 1-1 "echo hello"
 ```
 
+## notify the user
+
+raise a desktop/in-app notification when you need the user's attention and they
+may be looking at a different tab or another app:
+
+```bash
+herdr notification show "build failed" --body "api workspace" --sound request
+```
+
+- `--sound` is `none` (default), `done`, or `request`. use `request` when you
+  are asking for something and `done` when work finished.
+- `--position` is `top-left` | `top-right` | `bottom-left` | `bottom-right`;
+  omit it to use the user's configured default.
+- the title must contain visible text. herdr collapses whitespace and trims the
+  title to 80 characters and the body to 240.
+
+the cli exits 0 whether or not the toast was actually displayed. the socket
+method answers `{"shown":…,"reason":…}` — `shown`, `disabled`, `rate_limited`,
+`no_foreground_client`, or `busy` — so use the socket directly when you must
+know whether it landed:
+
+```bash
+printf '{"id":"n1","method":"notification.show","params":{"title":"needs you","sound":"request"}}\n' \
+  | nc -U "$HERDR_SOCKET_PATH"
+```
+
 ## workspace management
 
 create a new workspace:

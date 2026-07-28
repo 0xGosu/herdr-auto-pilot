@@ -106,6 +106,23 @@ type NotifyPort interface {
 	Notify(ctx context.Context, title, body string) error
 }
 
+// NotifyResult reports what herdr did with a notification. Shown == false is
+// not a failure: herdr answered and declined to paint the toast, naming why
+// in Reason ("disabled", "rate_limited", "no_foreground_client", "busy").
+type NotifyResult struct {
+	Shown  bool
+	Reason string
+}
+
+// NotifyShower is the optional richer form of NotifyPort: it reports whether
+// the notification was actually displayed, so a caller that must reach the
+// operator can fall back to another channel (the TUI falls back to the
+// terminal bell) instead of assuming a silently-dropped toast landed.
+// Type-assert it off a NotifyPort at the call site and degrade when absent.
+type NotifyShower interface {
+	ShowNotification(ctx context.Context, title, body string) (NotifyResult, error)
+}
+
 // EmbedderPort turns masked salient text into a semantic vector for
 // signature matching. Implementations must be safe for concurrent use and
 // must return errors — never panic — when the model is unavailable, so the

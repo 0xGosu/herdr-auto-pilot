@@ -1651,6 +1651,49 @@ func TestSampleConfigParsesWithDocumentedDefaults(t *testing.T) {
 		t.Errorf("sample tui.terminal_bell = %v, default is %v",
 			cfg.TUI.TerminalBell, def.TUI.TerminalBell)
 	}
+	if !strings.Contains(string(raw), "herdr_notification") {
+		t.Error("sample config does not document [tui].herdr_notification")
+	}
+	if cfg.TUI.HerdrNotification != def.TUI.HerdrNotification {
+		t.Errorf("sample tui.herdr_notification = %v, default is %v",
+			cfg.TUI.HerdrNotification, def.TUI.HerdrNotification)
+	}
+}
+
+// TestHerdrNotificationDefaultsOnAndCanBeDisabled pins the Load-over-Default
+// idiom for a bool that defaults TRUE: an absent key must keep the default,
+// and only an explicit false may turn it off.
+func TestHerdrNotificationDefaultsOnAndCanBeDisabled(t *testing.T) {
+	if !Default().TUI.HerdrNotification {
+		t.Fatal("herdr notifications should be on by default")
+	}
+
+	dir := t.TempDir()
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"absent key keeps the default", "[tui]\nterminal_bell = true\n", true},
+		{"no [tui] table at all", "", true},
+		{"explicit false disables", "[tui]\nherdr_notification = false\n", false},
+		{"explicit true", "[tui]\nherdr_notification = true\n", true},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, fmt.Sprintf("config%d.toml", i))
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.TUI.HerdrNotification != tc.want {
+				t.Errorf("HerdrNotification = %v, want %v", cfg.TUI.HerdrNotification, tc.want)
+			}
+		})
+	}
 }
 
 func TestLLMCommandEnvRoundTrip(t *testing.T) {

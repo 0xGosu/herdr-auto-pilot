@@ -282,7 +282,12 @@ max_content_height = 0     # expanded long-field lines; 0 = unlimited; collapsed
 theme = ""                 # named palette: default | dark | light | high-contrast;
                            # empty/unknown = default (the original look)
 terminal_bell = true       # ring the terminal bell (\a) on new escalations and on
-                           # pauses caused by a different process; default on
+                           # pauses caused by a different process; default on.
+                           # Also the fallback when herdr_notification is on but
+                           # herdr does not display the toast
+herdr_notification = true  # raise a herdr desktop notification on those same two
+                           # events when the TUI runs as a herdr-managed pane;
+                           # outside herdr there is no socket and this does nothing
 disable_check_for_update = false  # turn off the periodic GitHub release check — the
                            # plugin's only outbound call; the header flags a newer
                            # release, install it with `hap update`

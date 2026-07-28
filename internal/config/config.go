@@ -594,7 +594,16 @@ type TUI struct {
 	// last poll, and (2) the global pause/kill switch becoming active
 	// because of a DIFFERENT process (another TUI instance, or `hap
 	// pause`) — not when this instance's own operator pressed "p".
+	//
+	// It is also the FALLBACK for HerdrNotification: a toast herdr declined
+	// to display still rings the bell, because the operator asked to be
+	// alerted and an undelivered toast has not alerted them.
 	TerminalBell bool `toml:"terminal_bell"`
+	// HerdrNotification raises a herdr desktop notification (the socket API's
+	// notification.show) on those same two events, when the TUI is running as
+	// a herdr-managed pane. Outside herdr there is no socket to talk to and
+	// this does nothing. Default true.
+	HerdrNotification bool `toml:"herdr_notification"`
 	// DisableCheckForUpdate turns off the TUI's periodic release check — the
 	// plugin's only outbound network call (NFR-007). It is named negatively so
 	// the zero value keeps the check on, the way Embedding.Disabled does.
@@ -678,7 +687,7 @@ func Default() Config {
 			SimilarityThreshold: 0.90,
 			BM25MinScore:        0.35,
 		},
-		TUI: TUI{TerminalBell: true},
+		TUI: TUI{TerminalBell: true, HerdrNotification: true},
 		CLI: CLI{AIAgentFriendlyOutput: true},
 	}
 }

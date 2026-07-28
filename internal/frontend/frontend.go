@@ -42,6 +42,11 @@ type App struct {
 	// DaemonInfo reports the running daemon's identity from the lock file
 	// (daemonlock.Info in prod); nil hides the daemon line in status.
 	DaemonInfo func() (running bool, pid int, version string)
+	// Notifier raises herdr desktop notifications and reports whether they
+	// were actually displayed. nil when hap is not running inside herdr (a
+	// plain terminal), which is why every consumer must degrade rather than
+	// depend on it. Read only by the TUI today.
+	Notifier ports.NotifyShower
 	// StateDir is the daemon state directory; front-ends read the daemon's
 	// heartbeat/health record (daemonhealth) and reference the captured
 	// stderr log from here. Empty skips the health-derived status lines.
@@ -1548,6 +1553,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
 	{Key: "tui.terminal_bell", TUIEditable: true},
+	{Key: "tui.herdr_notification", TUIEditable: true},
 	{Key: "tui.disable_check_for_update", TUIEditable: true},
 	{Key: "cli.ai_agent_friendly_output", TUIEditable: true},
 }
@@ -1719,6 +1725,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return cfg.TUI.Theme
 	case "tui.terminal_bell":
 		return strconv.FormatBool(cfg.TUI.TerminalBell)
+	case "tui.herdr_notification":
+		return strconv.FormatBool(cfg.TUI.HerdrNotification)
 	case "tui.disable_check_for_update":
 		return strconv.FormatBool(cfg.TUI.DisableCheckForUpdate)
 	case "cli.ai_agent_friendly_output":
@@ -1977,6 +1985,13 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("tui.terminal_bell must be true or false, got %q", value)
 			}
 			cfg.TUI.TerminalBell = v
+			return nil
+		case "tui.herdr_notification":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("tui.herdr_notification must be true or false, got %q", value)
+			}
+			cfg.TUI.HerdrNotification = v
 			return nil
 		case "tui.disable_check_for_update":
 			v, err := strconv.ParseBool(value)
