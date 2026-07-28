@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/deliver"
@@ -48,6 +49,14 @@ const autoAcceptAbsenceConfirmations = 2
 // happened to land after the first delivery. One-per-agent makes that ordering
 // irrelevant rather than load-bearing.
 func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.AgentTransition) map[string]bool {
+	// Before anything else, and before every early return below: settle rows
+	// whose reply already landed but whose finalize did not stick. That is pure
+	// bookkeeping about a send that has ALREADY happened, so it must not be
+	// gated on the feature still being enabled, or on the kill switch — an
+	// operator disabling the feature (or pausing the herd) immediately after a
+	// delivery must not strand the row in a transient status.
+	d.retryAutoAcceptFinalize(ctx)
+
 	cfg, _, _ := d.snapshot()
 	now := d.opt.Clock.Now()
 
@@ -229,8 +238,15 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	// the suggestion was right.
 	ok, err := d.opt.Store.MarkAutoAccepted(ctx, rec.ID)
 	if err != nil {
-		slog.Warn("auto-accept: finalize failed after a successful delivery",
+		// The reply LANDED but the row is still 'auto_accepting' — a status
+		// excluded from both the operator's queue and the candidate query. Left
+		// alone it would be invisible to everyone until the daemon happened to
+		// restart, which is exactly the "silently lost escalation" this status
+		// exists to make recoverable. Remember it and retry the finalize on
+		// every subsequent tick until it sticks.
+		slog.Warn("auto-accept: finalize failed after a successful delivery; will retry",
 			"audit_id", rec.ID, "error", err)
+		d.noteAutoAcceptNeedsFinalize(rec.ID)
 	} else if !ok {
 		// Zero rows is a no-op, not an error: another writer already moved the
 		// row. This tolerance is what makes the startup reclaim safe when two
@@ -401,6 +417,59 @@ func (d *Daemon) noteAutoAcceptAttempt(auditID int64) int {
 	defer d.mu.Unlock()
 	d.autoAcceptAttempts[auditID]++
 	return d.autoAcceptAttempts[auditID]
+}
+
+// noteAutoAcceptNeedsFinalize records a delivered escalation whose finalize did
+// not commit, so a later tick can settle it.
+func (d *Daemon) noteAutoAcceptNeedsFinalize(auditID int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.autoAcceptNeedsFinalize[auditID] = struct{}{}
+}
+
+// retryAutoAcceptFinalize re-attempts MarkAutoAccepted for every delivery whose
+// finalize previously failed.
+//
+// MarkAutoAccepted is guarded on 'auto_accepting', so a retry can only ever
+// settle the daemon's OWN claim: if the row has since moved on — an operator
+// acted, or a restart's reclaim returned it to the queue — it reports "not
+// claimed" and the entry is simply dropped. A retry can therefore never
+// resurrect or clobber someone else's terminal state, and it never re-delivers
+// anything: the send happened once, on the tick that recorded this id.
+//
+// Entries clear the moment the store recovers, so in a healthy daemon this map
+// is empty and the pass costs nothing.
+func (d *Daemon) retryAutoAcceptFinalize(ctx context.Context) {
+	d.mu.Lock()
+	if len(d.autoAcceptNeedsFinalize) == 0 {
+		d.mu.Unlock()
+		return
+	}
+	ids := make([]int64, 0, len(d.autoAcceptNeedsFinalize))
+	for id := range d.autoAcceptNeedsFinalize {
+		ids = append(ids, id)
+	}
+	d.mu.Unlock()
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	for _, id := range ids {
+		ok, err := d.opt.Store.MarkAutoAccepted(ctx, id)
+		if err != nil {
+			// Still broken. Keep the entry and try again next tick.
+			slog.Warn("auto-accept: finalize retry failed; still pending",
+				"audit_id", id, "error", err)
+			continue
+		}
+		d.mu.Lock()
+		delete(d.autoAcceptNeedsFinalize, id)
+		d.mu.Unlock()
+		if ok {
+			slog.Info("auto-accept: finalized a delivery whose bookkeeping had failed", "audit_id", id)
+		} else {
+			// Another writer already moved the row out of 'auto_accepting'.
+			slog.Info("auto-accept: row was no longer claimed at finalize retry", "audit_id", id)
+		}
+	}
 }
 
 func (d *Daemon) clearAutoAcceptAttempts(auditID int64) {

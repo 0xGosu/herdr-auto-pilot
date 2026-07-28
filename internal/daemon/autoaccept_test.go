@@ -2,12 +2,14 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
 // autoAcceptOn is the config that enables the feature for approval and choice
@@ -1031,5 +1033,183 @@ func TestAutoAcceptWithholdsDeliveredAgentsFromTheRestOfTheSweep(t *testing.T) {
 	// An empty exclusion set must not copy or reorder.
 	if got := withoutAgents(agents, nil); len(got) != 2 {
 		t.Errorf("withoutAgents(agents, nil) = %d agents, want 2", len(got))
+	}
+}
+
+// flakyFinalizeStore fails MarkAutoAccepted the first failN times, then behaves
+// normally — a transient store fault in the window between a successful send and
+// its bookkeeping.
+type flakyFinalizeStore struct {
+	ports.StorePort
+	mu     sync.Mutex
+	failN  int
+	failed int
+}
+
+func (f *flakyFinalizeStore) MarkAutoAccepted(ctx context.Context, auditID int64) (bool, error) {
+	f.mu.Lock()
+	fail := f.failed < f.failN
+	if fail {
+		f.failed++
+	}
+	f.mu.Unlock()
+	if fail {
+		return false, errors.New("induced finalize failure")
+	}
+	return f.StorePort.MarkAutoAccepted(ctx, auditID)
+}
+
+// TestAutoAcceptFinalizeFailureIsRetriedInProcess is the reliability case a
+// bare "log and move on" leaves stranded.
+//
+// The reply LANDS, then the finalize write fails. The row is still
+// 'auto_accepting' — a status excluded from BOTH the operator's pending queue
+// and the candidate query — so nothing would ever look at it again, and
+// ReclaimAbandonedAutoAccepts only runs at startup. A transient SQLite fault
+// would therefore hide a delivered escalation for the entire life of the
+// daemon. The pass must settle it in-process on a later tick.
+func TestAutoAcceptFinalizeFailureIsRetriedInProcess(t *testing.T) {
+	var flaky *flakyFinalizeStore
+	h := newHarnessCore(t, autoAcceptOn, nil, nil, nil, func(inner ports.StorePort) ports.StorePort {
+		flaky = &flakyFinalizeStore{StorePort: inner, failN: 1}
+		return flaky
+	})
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 20*time.Minute)
+
+	// Tick 1: delivered, but the bookkeeping fails.
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	if got := h.herdr.sentInputs(); len(got) != 1 {
+		t.Fatalf("sent = %v, want exactly one delivery", got)
+	}
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepting {
+		t.Fatalf("status = %q, want the row stuck mid-finalize for this test to mean anything", got)
+	}
+	h.daemon.mu.Lock()
+	_, tracked := h.daemon.autoAcceptNeedsFinalize[id]
+	h.daemon.mu.Unlock()
+	if !tracked {
+		t.Fatal("the failed finalize was not remembered; the row can only be recovered by a restart")
+	}
+
+	// Tick 2: the store has recovered, so the pass settles it — WITHOUT
+	// re-delivering, because the send already happened.
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+		t.Errorf("status = %q, want %q once the store recovered", got, domain.AuditStatusAutoAccepted)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 1 {
+		t.Errorf("sent = %v; the retry must finalize, never re-deliver", got)
+	}
+	h.daemon.mu.Lock()
+	remaining := len(h.daemon.autoAcceptNeedsFinalize)
+	h.daemon.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("%d entries left after a successful finalize; the map must self-clear", remaining)
+	}
+	// And it is genuinely settled — no correction was written by any of this.
+	corr, err := h.raw.UnprocessedCorrections(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(corr) != 0 {
+		t.Errorf("an auto-accept must write NO correction, got %+v", corr)
+	}
+}
+
+// TestAutoAcceptFinalizeRetryRunsWhileDisabledAndPaused: settling a row whose
+// reply ALREADY landed is bookkeeping about a completed send, not a new action.
+// It must not be gated on the feature still being enabled, or on the kill
+// switch — otherwise an operator who disables the feature or pauses the herd
+// right after a delivery strands the row in a transient status permanently.
+func TestAutoAcceptFinalizeRetryRunsWhileDisabledAndPaused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		after func(t *testing.T, h *harness)
+	}{
+		{
+			name: "feature disabled",
+			after: func(t *testing.T, h *harness) {
+				h.writeConfig(t, "[escalations.auto_accept]\nenabled = false\n")
+				h.daemon.reload()
+			},
+		},
+		{
+			name: "kill switch active",
+			after: func(t *testing.T, h *harness) {
+				if _, err := h.raw.InsertKillEvent(context.Background(), domain.KillEvent{
+					State: "active", Scope: "global", Author: "operator", CreatedAt: time.Now(),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var flaky *flakyFinalizeStore
+			h := newHarnessCore(t, autoAcceptOn, nil, nil, nil, func(inner ports.StorePort) ports.StorePort {
+				flaky = &flakyFinalizeStore{StorePort: inner, failN: 1}
+				return flaky
+			})
+			ctx := context.Background()
+			h.herdr.setPane(approvalPane)
+			id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval,
+				"respond: Yes", 20*time.Minute)
+
+			h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+			if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepting {
+				t.Fatalf("status = %q, want it stuck mid-finalize", got)
+			}
+
+			tc.after(t, h)
+
+			h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+			if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+				t.Errorf("status = %q; a delivered row must still be settled", got)
+			}
+		})
+	}
+}
+
+// TestAutoAcceptFinalizeRetryYieldsToAnotherWriter: MarkAutoAccepted is guarded
+// on 'auto_accepting', so a retry can only ever settle the daemon's OWN claim.
+// If the row moved on meanwhile — a restart's reclaim returned it to the queue
+// and an operator then resolved it — the retry must drop the entry rather than
+// clobber that terminal state.
+func TestAutoAcceptFinalizeRetryYieldsToAnotherWriter(t *testing.T) {
+	var flaky *flakyFinalizeStore
+	h := newHarnessCore(t, autoAcceptOn, nil, nil, nil, func(inner ports.StorePort) ports.StorePort {
+		flaky = &flakyFinalizeStore{StorePort: inner, failN: 1}
+		return flaky
+	})
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 20*time.Minute)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepting {
+		t.Fatalf("status = %q, want it stuck mid-finalize", got)
+	}
+
+	// A restart reclaims the abandoned-looking row, and the operator resolves it.
+	if n, err := h.raw.ReclaimAbandonedAutoAccepts(ctx); err != nil || n != 1 {
+		t.Fatalf("reclaim = (%d, %v)", n, err)
+	}
+	if ok, err := h.raw.ResolveEscalation(ctx, id); err != nil || !ok {
+		t.Fatalf("resolve: %v %v", ok, err)
+	}
+
+	h.daemon.retryAutoAcceptFinalize(ctx)
+
+	if got := auditStatus(t, h, id); got != "resolved" {
+		t.Errorf("status = %q; the operator's resolution must stand", got)
+	}
+	h.daemon.mu.Lock()
+	remaining := len(h.daemon.autoAcceptNeedsFinalize)
+	h.daemon.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("%d entries left; an entry the daemon no longer owns must be dropped", remaining)
 	}
 }

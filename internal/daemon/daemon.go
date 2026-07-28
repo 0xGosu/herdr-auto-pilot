@@ -242,6 +242,13 @@ type Daemon struct {
 	// stay bounded by that set rather than by daemon uptime.
 	autoAcceptAttempts map[int64]int
 	autoAcceptAbsent   map[int64]int
+	// autoAcceptNeedsFinalize holds deliveries that LANDED but whose finalize
+	// did not commit (a transient store failure). Such a row is still
+	// 'auto_accepting', a status excluded from BOTH the operator's queue and
+	// the candidate query, so without an in-process retry it would stay
+	// invisible until the daemon happened to restart. Retried at the top of
+	// every sweep and cleared the moment it sticks; empty in a healthy daemon.
+	autoAcceptNeedsFinalize map[int64]struct{}
 	// autoAcceptBaselineWarned latches the once-per-run notice that escalations
 	// raised before the signature baseline existed are being skipped.
 	autoAcceptBaselineWarned bool
@@ -432,6 +439,7 @@ func New(opt Options) (*Daemon, error) {
 		autoTaskClaim:             map[string]taskClaim{},
 		autoAcceptAttempts:        map[int64]int{},
 		autoAcceptAbsent:          map[int64]int{},
+		autoAcceptNeedsFinalize:   map[int64]struct{}{},
 		snapshotSaved:             map[string]bool{},
 		paneCwds:                  map[string]paneCwdEntry{},
 		paneCwdRefreshing:         map[string]bool{},
