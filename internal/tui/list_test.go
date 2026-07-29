@@ -1388,7 +1388,7 @@ func TestConfigReadOnlyRowsRefuseEditAndRemove(t *testing.T) {
 }
 
 func TestConfigTUIReadOnlyFieldsNoPrompt(t *testing.T) {
-	readOnly := []string{"llm.command", "llm.command_start", "llm.rewrite_action_fallback_template", "embedding.model_path"}
+	readOnly := []string{"llm.command", "llm.command_start", "llm.task_generate_command", "embedding.model_path"}
 	for _, key := range readOnly {
 		for _, k := range []string{"enter", "e"} {
 			t.Run(key+"/"+k, func(t *testing.T) {
@@ -1412,6 +1412,53 @@ func TestConfigTUIReadOnlyFieldsNoPrompt(t *testing.T) {
 	m = press(t, m, "enter")
 	if m.prompt == nil || !strings.Contains(m.prompt.label, "set llm.timeout_seconds") {
 		t.Errorf("editable field should open the edit prompt, got %+v", m.prompt)
+	}
+}
+
+// TestConfigTUIHidesAdvancedFields: advanced knobs are kept out of the Config
+// tab so the settings operators actually change stay findable. They must be
+// absent as rows AND as rendered text, while `hap config fields` still lists
+// them — hiding is a TUI display choice, not a removal.
+func TestConfigTUIHidesAdvancedFields(t *testing.T) {
+	hidden := []string{
+		"llm.pane_excerpt_chars",
+		"llm.enable_rewrite_action",
+		"llm.rewrite_action_fallback_template",
+		"llm.env_file",
+		"llm.command_env_file",
+		"llm.command_start_env_file",
+		"llm.task_generate_command_env_file",
+		"llm.task_generate_command_start_env_file",
+		"embedding.pane_salient_chars",
+		"embedding.warm_timeout_ms",
+	}
+	m := configModel(t, config.Default())
+	rows := make(map[string]bool)
+	for _, it := range m.items {
+		if it.kind == "field" {
+			rows[it.key] = true
+		}
+	}
+	view := m.View()
+	for _, key := range hidden {
+		if rows[key] {
+			t.Errorf("advanced field %q must not be a Config tab row", key)
+		}
+		if strings.Contains(view, key) {
+			t.Errorf("advanced field %q must not render on the Config tab", key)
+		}
+		if !slices.Contains(frontend.ConfigFieldKeys, key) {
+			t.Errorf("advanced field %q dropped from the registry — it must stay settable via `hap config set`", key)
+		}
+	}
+	// A neighbouring visible field is untouched.
+	if !rows["llm.timeout_seconds"] {
+		t.Error("llm.timeout_seconds must still render on the Config tab")
+	}
+	// The section header is the operator's only in-app clue that more
+	// fields exist, so absence alone is not enough — it must point somewhere.
+	if !strings.Contains(view, "hap config fields") {
+		t.Errorf("Config header must point at `hap config fields` for the hidden ones:\n%s", view)
 	}
 }
 
