@@ -283,12 +283,27 @@ func (e textEdit) wordRight() textEdit {
 	return textEdit{text: e.text, cursor: cur}
 }
 
-// withCaret renders the text with the caret block at its position, ready to be
-// split on "\n" by a multi-line renderer. With the caret at the end this is
-// exactly "text" + the block, which is how the box always used to look.
+// promptCaret is the block drawn at the caret's position. It travels INSIDE
+// the rendered text (see withCaret) rather than being positioned by column, so
+// wrapping the text also carries the caret to the right row.
+const promptCaret = "█"
+
+// promptCaretMark is what withCaret actually inserts; inputBox.render swaps it
+// for promptCaret on the way out. The layout has to FIND the caret's row to
+// scroll to it, and the operator's own text can contain a block glyph — pane
+// output full of progress bars is exactly what pre-fills a "correct this
+// suggestion" prompt — so searching for the drawn glyph would lock the window
+// onto their text and scroll the real caret off screen. A private-use rune
+// cannot be typed or pasted, and measures 1 cell like the block it stands in
+// for, so wrapping is identical either way.
+const promptCaretMark = "\ue000"
+
+// withCaret renders the text with the caret at its position, ready to be split
+// on "\n" by a multi-line renderer. With the caret at the end this is exactly
+// "text" + the marker, which is how the box always used to look.
 func (e textEdit) withCaret() string {
 	r, cur := e.runes()
-	return string(r[:cur]) + "█" + string(r[cur:])
+	return string(r[:cur]) + promptCaretMark + string(r[cur:])
 }
 
 // applyTextKey applies one editing or caret-motion keystroke and returns the
@@ -381,6 +396,234 @@ func isPromptSpace(r rune) bool { return unicode.IsSpace(r) }
 // terminal bracketed paste) to \n so the prompt renders one input line per
 // break and the height accounting can count them.
 var promptNewlines = strings.NewReplacer("\r\n", "\n", "\r", "\n")
+
+// promptIndent prefixes every text row of a wrapped input box so the block
+// reads as one unit under its label.
+const promptIndent = "  "
+
+// promptIndentWidth is promptIndent's width in display cells.
+var promptIndentWidth = runewidth.StringWidth(promptIndent)
+
+// wrapInputText breaks s into the rows an input box renders, wrapping at
+// `first` display cells on the first row and `rest` on every row after it, and
+// giving each line break already in s a row of its own.
+//
+// Unlike wrapText it never drops or rewrites a rune WITHIN a line: every row is
+// a contiguous slice of one logical line (after \r\n normalization and tab
+// expansion), so joining the rows of a line reproduces it exactly. That is what
+// lets the caret marker ride inside the text — the row it lands on and the
+// column it sits at both come out right without tracking an index separately.
+//
+// A break prefers the position just after the last space that fit, so a word is
+// not split mid-way; a token longer than the row is hard-broken because there is
+// nowhere else to cut. Tabs are expanded first: runewidth counts a tab as zero
+// cells but a terminal paints several, and a paste can carry one.
+func wrapInputText(s string, first, rest int) []string {
+	first, rest = max(first, 1), max(rest, 1)
+	s = strings.ReplaceAll(promptNewlines.Replace(s), "\t", "    ")
+	var out []string
+	limit := first
+	for _, ln := range strings.Split(s, "\n") {
+		r := []rune(ln)
+		// start is the first rune of the row being built and cells its width so
+		// far; brk is the index just past the last space seen on it, with
+		// brkCells the width of what follows that space — the width the next row
+		// would open with, tracked as we go so a break never has to rescan.
+		start, cells := 0, 0
+		brk, brkCells := -1, 0
+		for i := 0; i < len(r); i++ {
+			w := runewidth.RuneWidth(r[i])
+			if cells+w > limit && i > start {
+				if brk > start && brk < i {
+					out, start, cells = append(out, string(r[start:brk])), brk, brkCells
+				} else {
+					out, start, cells = append(out, string(r[start:i])), i, 0
+				}
+				limit, brk, brkCells = rest, -1, 0
+			}
+			cells, brkCells = cells+w, brkCells+w
+			if r[i] == ' ' {
+				brk, brkCells = i+1, 0
+			}
+		}
+		out = append(out, string(r[start:]))
+		limit = rest
+	}
+	return out
+}
+
+// windowRows trims rows to at most budget entries, keeping the row that holds
+// the caret visible, and reports the index the window starts at. A long entry
+// therefore scrolls inside its box instead of pushing the list off the pane.
+// The window centers on the caret, which parks it at the tail while text is
+// being appended (the common case) and follows the caret when it is moved.
+func windowRows(rows []string, budget int) ([]string, int) {
+	budget = max(budget, 1)
+	if len(rows) <= budget {
+		return rows, 0
+	}
+	caret := 0
+	for i, r := range rows {
+		if strings.Contains(r, promptCaretMark) {
+			caret = i
+			break
+		}
+	}
+	start := max(0, min(caret-budget/2, len(rows)-budget))
+	return rows[start : start+budget], start
+}
+
+// inputBox is one text input laid out for the pane. head is the label, wrapped
+// and kept separate so the caller can style it; rows are the wrapped text rows.
+// When inline is true the single text row sits on the label's line — the
+// historical one-line look; otherwise the label keeps its own line(s) and every
+// text row is indented under it, which is what gives long text the full width.
+type inputBox struct {
+	head   []string
+	inline bool
+	rows   []string
+}
+
+// plainStyle is the identity styler, for callers (and the height accounting)
+// that want inputBox.render's output without escape codes.
+func plainStyle(s string) string { return s }
+
+// render returns the exact lines the box occupies, the label styled by style
+// and the caret marker swapped for the block that gets drawn. View prints these
+// lines and listPageSize counts them, so the pane-height budget can never
+// disagree with what is drawn (AR-010).
+func (b inputBox) render(style func(string) string) []string {
+	out := make([]string, 0, len(b.head)+len(b.rows))
+	for _, h := range b.head {
+		out = append(out, style(h))
+	}
+	rows := b.rows
+	if b.inline && len(out) > 0 && len(rows) > 0 {
+		out[len(out)-1] += drawCaret(rows[0])
+		rows = rows[1:]
+	}
+	for _, r := range rows {
+		out = append(out, promptIndent+drawCaret(r))
+	}
+	return out
+}
+
+// drawCaret swaps the internal caret marker for the block the operator sees.
+func drawCaret(s string) string {
+	return strings.ReplaceAll(s, promptCaretMark, promptCaret)
+}
+
+// promptInlineFloor is the width the first row must keep for the label to share
+// it. Below that the text would trickle down a sliver beside a wall of label,
+// which reads worse than giving the label its own line.
+const promptInlineFloor = 20
+
+// promptLabelRows bounds a wrapped label. Labels carry instructions worth
+// reading, so they wrap rather than clip; but they are also chrome, and an
+// unbounded one would eat the list, so the overflow is flattened into the last
+// row instead.
+const promptLabelRows = 2
+
+// promptMaxRows caps the input box even on a tall pane: past a few hundred
+// characters on screen at once, more rows stop helping and just bury the list.
+// minListRows is what the list keeps whatever the box does — a list showing
+// nothing is not a list.
+const (
+	promptMaxRows = 8
+	minListRows   = 3
+	// searchRowCap bounds the search box. It is a FIXED cap, not the derived
+	// promptRowBudget: chromeRows counts the search box, and deriving its
+	// budget from chromeRows would recurse.
+	searchRowCap = 3
+)
+
+// promptRowBudget bounds how many text rows the prompt box may draw: whatever
+// the pane can spare once the rest of the chrome, the box's own blank and label
+// lines, and the list's floor are paid for. Deriving it (rather than taking a
+// flat fraction of the height) is what keeps a long entry on a short pane from
+// pushing the help line off the bottom.
+func (m Model) promptRowBudget() int {
+	if m.height <= 0 || m.prompt == nil {
+		return promptMaxRows
+	}
+	// The blank line plus the most the label can cost. Taking the bound rather
+	// than measuring this label keeps the figure independent of the layout it is
+	// being used to decide (an inline box spends fewer rows, and a scrolled one
+	// lengthens the label with its "(lines x-y of z)" note) — erring high only
+	// ever leaves a text row on the table, and only on a pane too short to spare
+	// it anyway.
+	overhead := 1 + promptLabelRows
+	spare := m.height - m.chromeRows() - overhead - minListRows
+	return max(1, min(promptMaxRows, spare))
+}
+
+// layoutInput lays out one text input: `label> ` followed by text (which already
+// carries its caret block), wrapped to the pane so the operator can read
+// everything they typed. Before this the row was drawn in full and bubbletea
+// clipped it at the pane edge, so anything past the right margin was invisible
+// and operators broke sentences with newlines to work around it.
+func (m Model) layoutInput(label, text string, budget int) inputBox {
+	width := m.contentWidth()
+	prefix := label + "> "
+	rest := max(1, width-promptIndentWidth)
+	// The label shares the first row, so that row is the narrower one — unless
+	// the label is so long that sharing would leave a sliver, or the box is
+	// scrolled and the first row is not the one on screen. Then the label takes
+	// its own line and every text row gets the full width.
+	first := width - runewidth.StringWidth(prefix)
+	inline := first >= min(promptInlineFloor, rest)
+	if !inline {
+		first = rest
+	}
+	rows := wrapInputText(text, first, rest)
+	shown, start := windowRows(rows, budget)
+	if len(shown) < len(rows) && inline {
+		// Scrolled: the label can no longer share the first row, so re-wrap at
+		// the full width. Without this the top visible row keeps the narrow
+		// first-row width and reads as a short, ragged line under a label that
+		// is no longer beside it.
+		inline = false
+		rows = wrapInputText(text, rest, rest)
+		shown, start = windowRows(rows, budget)
+	}
+	if inline {
+		return inputBox{head: []string{prefix}, inline: true, rows: shown}
+	}
+	head := label + ">"
+	if len(shown) < len(rows) {
+		head = fmt.Sprintf("%s>  (lines %d-%d of %d)", label, start+1, start+len(shown), len(rows))
+	}
+	return inputBox{head: wrapLabel(head, width), rows: shown}
+}
+
+// wrapLabel wraps an input's label to the pane, bounded by promptLabelRows —
+// the overflow past the last allowed row is flattened into it rather than
+// costing further list rows.
+//
+// The label is flattened to one logical line first. A label is a line of
+// instruction, so a break in one is noise; flattening also makes every wrapped
+// row a contiguous slice of the SAME string, which is what lets the overflow be
+// rejoined without gluing the words either side of a break together.
+func wrapLabel(label string, width int) []string {
+	flat := strings.ReplaceAll(promptNewlines.Replace(label), "\n", " ")
+	rows := wrapInputText(flat, width, width)
+	if len(rows) > promptLabelRows {
+		tail := oneLine(strings.Join(rows[promptLabelRows-1:], ""), width)
+		rows = append(rows[:promptLabelRows-1:promptLabelRows-1], tail)
+	}
+	return rows
+}
+
+// promptBox and searchBox are the two live text inputs. Both View and
+// listPageSize go through these, so the drawn box and the budgeted box are the
+// same box by construction.
+func (m Model) promptBox() inputBox {
+	return m.layoutInput(m.prompt.label, m.prompt.edit().withCaret(), m.promptRowBudget())
+}
+
+func (m Model) searchBox() inputBox {
+	return m.layoutInput("search", m.queryEdit().withCaret(), searchRowCap)
+}
 
 // shiftEnterSeqs are the String() forms bubbletea gives the two standard
 // shift+enter escape sequences — xterm modifyOtherKeys (ESC[27;2;13~, what
@@ -3383,15 +3626,17 @@ func (m Model) detailPageSize() int {
 	return max(1, m.height-chrome)
 }
 
-// listPageSize is how many list rows fit under the current pane chrome,
-// mirroring detailPageSize's accounting (AR-002): header title + tabs +
-// blank (3), the more-rows indicator (1), and blank + help (2) — plus the
-// error line, the daemon health banner, the search/filter lines, and the
-// prompt, hint, and status areas when present.
-func (m Model) listPageSize() int {
-	if m.height <= 0 {
-		return 20
-	}
+// chromeRows is every pane row View spends outside the list rows and the
+// prompt box, mirroring detailPageSize's accounting (AR-002): header title +
+// tabs + blank (3), the more-rows indicator (1), and blank + help (2) — plus
+// the error line, the daemon health banner, the search/filter lines, and the
+// hint and status areas when present.
+//
+// The prompt box is deliberately NOT counted here: promptRowBudget sizes that
+// box from what the rest of the chrome leaves, so counting it would recurse.
+// The search box IS counted, and is safe to count because it takes a fixed row
+// cap rather than the derived budget.
+func (m Model) chromeRows() int {
 	chrome := 6
 	if m.data.err != nil {
 		chrome++
@@ -3399,7 +3644,11 @@ func (m Model) listPageSize() int {
 	if m.data.daemonHealth.Banner() != "" {
 		chrome++
 	}
-	if m.searching || (m.tab.isList() && m.query[m.tab] != "") {
+	if m.searching {
+		// The query wraps like any other input, so budget the rows it draws
+		// rather than a flat one.
+		chrome += len(m.searchBox().render(plainStyle))
+	} else if m.tab.isList() && m.query[m.tab] != "" {
 		chrome++
 	}
 	if m.semanticHintVisible() {
@@ -3411,20 +3660,31 @@ func (m Model) listPageSize() int {
 	if m.tab == tabAgents || m.tab == tabEscalations || m.tab == tabAudit || m.tab == tabSignatures {
 		chrome++ // these list tabs render a column header row
 	}
-	if m.prompt != nil {
-		if len(m.prompt.options) > 0 {
-			// blank + label line + one line per choice.
-			chrome += 2 + len(m.prompt.options)
-		} else {
-			// blank + label line + one line per line break in the expanded input.
-			chrome += 2 + strings.Count(promptNewlines.Replace(m.prompt.input), "\n")
-		}
-	}
 	if m.message != "" {
 		chrome += 2
 	}
 	if m.status != nil {
 		chrome += 2
+	}
+	return chrome
+}
+
+// listPageSize is how many list rows fit under the current pane chrome and the
+// prompt box.
+func (m Model) listPageSize() int {
+	if m.height <= 0 {
+		return 20
+	}
+	chrome := m.chromeRows()
+	if m.prompt != nil {
+		if len(m.prompt.options) > 0 {
+			// blank + label line + one line per choice.
+			chrome += 2 + len(m.prompt.options)
+		} else {
+			// blank + every row the box actually draws (the label's line, plus
+			// one per line break AND per wrap of the expanded input).
+			chrome += 1 + len(m.promptBox().render(plainStyle))
+		}
 	}
 	return max(1, m.height-chrome)
 }
@@ -4877,7 +5137,9 @@ func (m Model) View() string {
 	// Search bar / active-filter line (its height is accounted for in
 	// listPageSize so the body never overflows the pane).
 	if m.searching {
-		fmt.Fprintf(&b, "%s%s\n", st.section.Render("search> "), m.queryEdit().withCaret())
+		for _, l := range m.searchBox().render(func(s string) string { return st.section.Render(s) }) {
+			fmt.Fprintf(&b, "%s\n", l)
+		}
 		if m.semanticHintVisible() {
 			fmt.Fprintf(&b, "%s\n", st.help.Render(
 				"enter: semantic search — embed this query to rank rules by meaning"))
@@ -4909,26 +5171,27 @@ func (m Model) View() string {
 
 	if m.prompt != nil && len(m.prompt.options) > 0 {
 		// Picker mode: label then one row per choice, the highlight marked.
-		fmt.Fprintf(&b, "\n%s\n", m.prompt.label)
+		// A choice is a value the operator picks, not text they edit, so an
+		// over-wide one is truncated rather than wrapped — wrapping it would
+		// cost list rows the height budget does not reserve.
+		fmt.Fprintf(&b, "\n%s\n", oneLine(m.prompt.label, m.contentWidth()))
 		for i, opt := range m.prompt.options {
 			marker := "  "
 			if i == m.prompt.optIdx {
 				marker = "❯ "
 			}
-			fmt.Fprintf(&b, "%s%s\n", marker, opt)
+			fmt.Fprintf(&b, "%s%s\n", marker, oneLine(opt, max(1, m.contentWidth()-promptIndentWidth)))
 		}
 	} else if m.prompt != nil {
-		// A multiline input expands the box: one rendered line per line break,
-		// continuation lines indented under the label. The caret is drawn AT
-		// its rune index rather than always at the end, so the operator can
-		// see where the next keystroke lands; with the caret at the end this
-		// renders exactly as it always did.
-		lines := strings.Split(m.prompt.edit().withCaret(), "\n")
-		fmt.Fprintf(&b, "\n%s> %s", m.prompt.label, lines[0])
-		for _, l := range lines[1:] {
-			fmt.Fprintf(&b, "\n  %s", l)
-		}
+		// The input expands the box: one rendered row per line break AND per
+		// wrap at the pane width, rows indented under the label. The caret is
+		// drawn AT its rune index rather than always at the end, so the
+		// operator can see where the next keystroke lands; a short entry still
+		// renders on the label's line exactly as it always did.
 		fmt.Fprint(&b, "\n")
+		for _, l := range m.promptBox().render(plainStyle) {
+			fmt.Fprintf(&b, "%s\n", l)
+		}
 	}
 	if m.confirm != nil {
 		fmt.Fprintf(&b, "\n%s\n", m.confirm.label)
@@ -5001,8 +5264,8 @@ func (m Model) helpLine() string {
 		return "type to filter  ←/→: move (ctrl: by word)  home/end: line ends  backspace/delete: erase  esc/enter: apply & close"
 	}
 	// The caret bindings are advertised here rather than in the prompt label:
-	// the label is inside the prompt box, whose height listPageSize budgets as
-	// one row, so a longer label would silently wrap and cost a list row.
+	// the label shares the box's first row with short input, so a longer label
+	// would push that text onto its own row for no reason.
 	if m.prompt != nil {
 		if len(m.prompt.options) > 0 {
 			return "↑/↓: choose  enter: select  esc: cancel"

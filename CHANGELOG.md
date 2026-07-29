@@ -5,6 +5,13 @@ section in `CLAUDE.md`. Entries go under the version that will carry them: mergi
 to main auto-releases the next patch, so a PR adds its lines under that number
 (or under the minor/major version it bumps the manifest to).
 
+## 0.5.13
+
+- Fixed long text being invisible past the right edge of the TUI while typing it. Every text input — add task, edit a task, correct a suggestion, the `/` filter, every config value — now wraps to the pane width, so the whole entry is readable without breaking the sentence with `shift+enter` to see it
+- Changed: wrapping breaks after a word rather than mid-word. A short entry still sits on its label's line as before; a label too long to share that line, or a box that has scrolled, gives the text the full pane width instead
+- Added a scrolling input box: the box takes only the rows the pane can spare (at most 8, and never the last few list rows), and an entry taller than that scrolls with the caret and says which rows are showing — instead of pushing the list and the help line off the bottom
+- Unchanged: what gets submitted. Wrapping is a rendering decision only — no line break enters the stored task, filter or config value
+
 ## 0.5.12
 
 - Fixed `enable_auto_send_task_when_idle` still not delivering anything unattended: the task went out only once its situation signature had graduated, which took two operator confirmations — the exact human attention the flag exists to remove. Because every idle screen mints its own signature, in practice it escalated `shadow_mode` with the task as a suggestion and waited, forever
