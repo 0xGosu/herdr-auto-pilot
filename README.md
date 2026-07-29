@@ -679,6 +679,13 @@ widening interval (1, 2, 4 … up to 15 minutes) rather than every minute, so it
 does not cost a pane read a minute indefinitely. Any delivered task resets it, so
 this only delays recovery, never prevents it.
 
+**The task goes out without waiting for hap to learn anything.** Turning the flag
+on is your instruction, so a declared task from that source skips shadow mode and
+the idle confidence threshold, and a learned "do nothing" rule cannot park it —
+otherwise the feature would need you to confirm it into autonomy first, which is
+the attention it exists to remove. Sources *without* the flag are unchanged: they
+are attended by definition, so a new signature still suggests rather than acts.
+
 Three rules keep unattended hand-out safe:
 
 - **One task, one agent.** Agents matched by the same source in one poll are

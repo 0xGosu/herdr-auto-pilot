@@ -240,6 +240,21 @@ whose manifest carries exactly that version).
   `…ConfirmedHandoutIsNeverReclaimed` / `…ReclaimIgnoresForeignInProgressItems` /
   `…OneUnconfirmedHandoutPerAgent` / `…RecycledPaneCannotConfirmItsPredecessorsHandout` /
   `…HandoutCapEscalatesInsteadOfResending`).
+- **`enable_auto_send_task_when_idle` skips the LEARNING gates, never the safety ones** —
+  a declared task from a source with that flag (`DeclaredTask.Reserve`) resolves ahead of any
+  learned noop precedence (`resolveSituation`) and bypasses BOTH the shadow-mode gate and the
+  confidence gate (`domain.Decide`, keyed on the existing `idleHandout` predicate — the
+  VERIFIED classified situation plus the RESOLVED action, never a sweep-time flag). The flag
+  is an operator instruction about a QUEUE; a learned action is an inference about a SCREEN,
+  and every idle screen mints its own signature, so holding the queue to per-signature
+  graduation means the feature never delivers unattended — which is the only thing it is for.
+  The bypass sits AFTER the variance guard, rate guard and suspected-irreversible heuristic
+  and before nothing else; the kill switch, never-auto patterns, per-agent disable and the
+  optional pre-delivery LLM review all still apply at delivery. Sources without the flag keep
+  the historical behavior exactly. Keep the paired invariant tests
+  (`TestDecideUnattendedSourceSendsWithoutGraduating` / `…OutranksALearnedNoop` /
+  `…StillObeysEverySafetyControl` / `TestDecideAttendedSourceStillWaitsToGraduate` /
+  `TestAutoSendIdleUnattendedSourceSendsWithNoLearnedRule` / `…AttendedSourceStillEscalates…`).
 - **A pending escalation never benches an agent from the idle poll** — `eligibleIdleAgents`
   has no escalation gate, deliberately. An escalation is a question about what to answer on
   the agent's SCREEN, not a verdict on whether it can take its next declared task, and gating

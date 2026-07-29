@@ -595,6 +595,12 @@ and the *Config* tab's `t` prompt takes the same words:
 - delivery runs the normal pipeline — kill switch, never-auto patterns, rate
   limits and per-agent disable all still apply; the audit row's trigger reads
   `auto-idle-send`.
+- **the task is sent without waiting for anything to be learned.** turning the
+  flag on is the operator's instruction, so a declared task from that source
+  skips shadow mode and the idle confidence threshold, and a learned "do
+  nothing" rule does not park it. every other source is unaffected: without the
+  flag a shadow signature still suggests rather than acts. this is why the
+  feature works while you are AFK — there is no confirmation to give.
 - the pre-delivery LLM review **composes** with this:
   `enable_llm_review_before_auto_send` decides which task and in what shape,
   this flag decides that a task goes at all. the two used to be mutually

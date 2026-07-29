@@ -1786,3 +1786,67 @@ func TestAutoSendIdleLeavesAnAmbiguousDuplicateAlone(t *testing.T) {
 		t.Errorf("the reclaim touched an ambiguous duplicate it could not prove was its own:\n%s", got)
 	}
 }
+
+func TestAutoSendIdleUnattendedSourceSendsWithNoLearnedRule(t *testing.T) {
+	// End-to-end shape of the unattended contract: with
+	// enable_auto_send_task_when_idle on, a parked agent gets its next declared
+	// task even though NOTHING has been learned for that screen — no seeded
+	// rule, no graduated signature, no operator confirmation.
+	//
+	// Before this, every idle screen minted its own shadow signature at 0/N and
+	// escalated `shadow_mode` with the task as a suggestion, so the feature
+	// could not deliver anything until a human confirmed it twice. That is the
+	// attention the flag exists to remove: an operator who turns it on and walks
+	// away must come back to work having been done.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(taskFile, []byte("- [ ] step two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\nenable_auto_send_task_when_idle = true\n",
+		"agent-unattended", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(autoSendIdlePane)
+	// Deliberately NO seedAutonomous: the signature is brand new.
+	agents := parkIdle(h, 2*time.Minute, "agent-unattended")
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; !strings.Contains(got, "step two") {
+		t.Errorf("sent %q, want the declared task", got)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] step two")
+	})
+	// And it went out silently — an unattended hand-out that escalates has not
+	// done its job, whatever else it did.
+	noEscalations(t, h)
+}
+
+func TestAutoSendIdleAttendedSourceStillEscalatesWithNoLearnedRule(t *testing.T) {
+	// The mirror image, pinning the scope of the bypass. WITHOUT the flag the
+	// source is attended by definition, so an unlearned idle screen still
+	// escalates for a human rather than sending unattended.
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(taskFile, []byte("- [ ] step two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\nenable_auto_send_task_when_idle = false\n",
+		"agent-attended", taskFile)
+	h := newHarness(t, cfg)
+	h.herdr.setPane(autoSendIdlePane)
+	parkIdle(h, 2*time.Minute, "agent-attended")
+
+	// The poll only drives auto-send sources, so drive the pipeline directly.
+	h.push("agent-attended", "idle")
+
+	waitFor(t, 5*time.Second, func() bool { return auditFor(t, h, "agent-attended", "escalated") })
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("an attended source must not send unattended, sent %v", got)
+	}
+	if got := readTasks(t, taskFile); strings.Contains(got, "[-]") {
+		t.Errorf("an attended source must not reserve:\n%s", got)
+	}
+}
