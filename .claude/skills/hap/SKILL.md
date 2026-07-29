@@ -724,7 +724,11 @@ marked items win over it. the add/edit prompts take
 multi-line task text: **shift+enter inserts a line break** (ctrl+j on
 terminals that can't report it), the box expands one line per break, **enter
 submits** — stored as the literal `\n` encoding above, decoded back when the
-prompt pre-fills. the input is a full line editor, so a typo in the middle of
+prompt pre-fills. **long text wraps to the pane width** on its own (breaking
+after a word, never mid-word), so a line break is only for text you actually
+want on its own line — never to make a long sentence visible. an entry taller
+than the box scrolls with the caret and the label says which rows are showing.
+the input is a full line editor, so a typo in the middle of
 a long task is fixed in place: **←/→ move the caret** (ctrl+←/→ by word,
 home/end or ctrl+a/ctrl+e to the ends), typing and backspace/delete act at the
 caret, and the block cursor shows where the next keystroke lands. a prompt
