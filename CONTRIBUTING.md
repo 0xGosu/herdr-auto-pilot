@@ -73,8 +73,13 @@ herdr plugin link .
    - a **macOS** matrix leg, where test binaries need `-ldflags "-r /usr/local/lib"`
      to reach the FAISS dylibs.
 4. Describe *what* and *why* in the PR body; link related issues.
-5. **Add an entry under `## Unreleased` in `CHANGELOG.md`** — required for every
-   change, including patch-level fixes, in the same commit as the change itself.
+5. **Add an entry to `CHANGELOG.md`** — required for every change, including
+   patch-level fixes, in the same commit as the change itself. There is no
+   `Unreleased` heading: merging auto-releases the next patch, so head your
+   section with that number. Read the file on the latest remote `main`, take the
+   topmost `## X.Y.Z`, and use `X.Y.(Z+1)` if that version is already tagged —
+   or append to it if it is not (another unmerged PR opened it). A deliberate
+   minor/major bump uses the version you set in `herdr-plugin.toml` instead.
    Verb-first one-liners (`Added …`, `Fixed …`); write what it means for the
    reader, not what the diff did. GitHub already generates a list of PR titles
    per release; that file is for what a title cannot convey, like the bounds of

@@ -112,9 +112,22 @@ ticket/issue id**. Examples:
 patch releases.** No exceptions for "small", "internal", or "just a fix": if it
 merges, it is in the changelog. A PR without one is incomplete.
 
-- Add the line(s) under `## Unreleased`, in the same commit as the change. The
-  heading becomes the version number when that release is tagged (the manifest
-  version TRAILS releases, so the number is not known at merge time).
+- **Never use an `Unreleased` heading.** Merging to main auto-releases, so the
+  version a PR ships in is knowable at write time — write that number as the
+  heading, in the same commit as the change:
+  1. Read `CHANGELOG.md` on the latest **remote** `main`
+     (`git fetch origin main && git show origin/main:CHANGELOG.md | head -20`) —
+     not your branch, which may be behind. The topmost `## X.Y.Z` is the latest
+     entry.
+  2. If that version is already released (`git tag -l vX.Y.Z` finds it, i.e. it
+     matches `version` in `herdr-plugin.toml`), your section is the **next patch**:
+     `## X.Y.(Z+1)`. If it is NOT yet released, another unmerged PR already opened
+     that section — add your lines to it instead of starting a new one.
+  3. Exception: when the user explicitly asks for a minor/major bump, the version
+     is not a guess — you overwrite `version` in `herdr-plugin.toml` inside the PR
+     (see *Version bump & release*), so use exactly that number as the heading.
+- The guess can be wrong if a race merges another PR first; that is fine and
+  self-correcting — fix the heading in a follow-up rather than reverting.
 - Style: a flat list of verb-first one-liners — `Added …`, `Fixed …`,
   `Changed …`, `Removed …`. No sub-sections.
 - Write what it MEANS for the reader, not what the diff did. GitHub already
