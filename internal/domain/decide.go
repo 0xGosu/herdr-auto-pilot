@@ -290,6 +290,41 @@ func Decide(in DecideInput) Decision {
 			conf.Score, suggestion)
 	}
 
+	// An unattended declared-task hand-out is not a learned answer, so the two
+	// LEARNING gates below do not apply to it.
+	//
+	// Shadow mode and the confidence threshold both ask "has this signature
+	// earned the right to act on its own?" — the right question for an inferred
+	// reply to a screen, the wrong one for a task the operator queued in a file
+	// and flagged for unattended delivery. There is nothing to have learned: the
+	// content comes from their checklist, not from history, and every idle screen
+	// is a different signature, so a per-signature graduation counter means the
+	// feature stays silent essentially forever. That is what
+	// enable_auto_send_task_when_idle exists to prevent.
+	//
+	// Every SAFETY control still applies, and deliberately runs BEFORE this
+	// point: the variance guard, the FR-019 rate guard, and the
+	// suspected-irreversible heuristic are all above; the kill switch, the
+	// never-auto patterns, per-agent disable and the pre-delivery LLM review are
+	// re-applied by the daemon at delivery. This bypasses graduation, not safety.
+	//
+	// idleHandout is computed from the VERIFIED classified situation and the
+	// RESOLVED action (see its definition above), never a sweep-time flag — so a
+	// pane that became an approval since the sweep, or an episode that resolves
+	// to @noop, never reaches here.
+	if idleHandout {
+		input, optionID, ok := materialize(in, candidate)
+		if !ok {
+			return esc(ReasonNoTaskSource, "action not materializable", conf.Score, suggestion)
+		}
+		return Decision{
+			Action: ActionSend, Input: input, OptionID: optionID, Source: SourceRule,
+			Confidence: conf.Score,
+			Rationale: "declared task from a source with enable_auto_send_task_when_idle; " +
+				"delivered unattended without waiting for the signature to graduate",
+		}
+	}
+
 	// Mode gate: shadow signatures suggest, never act (FR-004/FR-006).
 	if in.State == nil || in.State.Mode != ModeAutonomous {
 		if in.LLMConfigured && len(in.History) == 0 {
@@ -350,6 +385,26 @@ func Decide(in DecideInput) Decision {
 func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggestion string, escReason EscalateReason) {
 	switch in.Situation.Type {
 	case SituationIdle:
+		// An UNATTENDED source with real pending work resolves to that work
+		// ahead of anything learned, including every noop precedence below.
+		//
+		// enable_auto_send_task_when_idle is an instruction about a QUEUE — "keep
+		// this agent fed from this file while I am away". A learned action is an
+		// inference about a SCREEN. When they disagree the instruction wins,
+		// because the operator gave it explicitly and about exactly this
+		// situation, and because the alternative (escalate, or stand down on a
+		// learned noop) means the feature does nothing precisely when nobody is
+		// there — which is when it is supposed to work.
+		//
+		// Nothing here weakens safety: Decide applies the kill switch, variance
+		// guard, rate ceilings and the suspected-irreversible heuristic to the
+		// resulting action, and the daemon re-gates never-auto patterns and the
+		// optional pre-delivery LLM review at delivery.
+		if in.DeclaredTask != nil && in.DeclaredTask.Reserve &&
+			in.DeclaredTask.Task != NoTaskContent {
+			return ActionNextDeclaredTask,
+				"send next declared task: " + in.DeclaredTask.Prompt(), ReasonNone
+		}
 		// A learned noop never silently parks REAL pending work. The
 		// declared-source state is not part of the idle signature, so a noop
 		// learned on "nothing to do" screens reuses on screens where the

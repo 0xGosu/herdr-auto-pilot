@@ -5,6 +5,14 @@ section in `CLAUDE.md`. Entries go under the version that will carry them: mergi
 to main auto-releases the next patch, so a PR adds its lines under that number
 (or under the minor/major version it bumps the manifest to).
 
+## 0.5.12
+
+- Fixed `enable_auto_send_task_when_idle` still not delivering anything unattended: the task went out only once its situation signature had graduated, which took two operator confirmations — the exact human attention the flag exists to remove. Because every idle screen mints its own signature, in practice it escalated `shadow_mode` with the task as a suggestion and waited, forever
+- Changed: a declared task from a source with `enable_auto_send_task_when_idle` is now delivered without waiting for the signature to graduate, and without being held to the idle confidence threshold. Turning the flag on now means what it says — the agent keeps itself fed while you are away
+- Changed: a learned "do nothing" rule no longer parks pending work on such a source, whatever its provenance. The opt-in is an instruction about a queue and outranks an inference about a screen
+- Unchanged for every other source: without the flag a source is attended by definition, so a shadow signature still suggests rather than acts and a learned noop still escalates over pending work
+- Unchanged for safety: the kill switch, the variance guard, the per-minute and consecutive rate ceilings, the suspected-irreversible heuristic, the never-auto patterns and per-agent disable all still stop an unattended hand-out. This skips graduation, not safety
+
 ## 0.5.11
 
 - Fixed `enable_auto_send_task_when_idle` going permanently silent on an agent that had any escalation waiting: a pending task is itself what raises `noop_vs_pending_tasks`, and that escalation then blocked the very poll that would have delivered the task, so the agent sat idle beside its own list with nothing logged
