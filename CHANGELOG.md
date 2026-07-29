@@ -8,6 +8,7 @@ to main auto-releases the next patch, so a PR adds its lines under that number
 ## 0.5.10
 
 - Fixed the changelog leaving the 0.5.8 and 0.5.9 entries stranded under `Unreleased` after both releases shipped; they now sit under their own version headings, and the file no longer uses an `Unreleased` heading at all
+- Changed the TUI Config tab to hide ten advanced fields that crowded out the settings people actually change: `llm.pane_excerpt_chars`, `llm.enable_rewrite_action`, `llm.rewrite_action_fallback_template`, the five `llm.*env_file` paths, `embedding.pane_salient_chars`, and `embedding.warm_timeout_ms`. They are unchanged everywhere else — still listed by `hap config fields`, still settable with `hap config set`, still read from `config.toml`
 
 ## 0.5.9
 

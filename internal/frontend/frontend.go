@@ -1491,9 +1491,16 @@ func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) e
 // templates, template strings, paths — are TUI-read-only as a standing
 // rule (CR-036): the one-line prompt round-trip mangles them. `config set`
 // accepts every key regardless of the flag.
+//
+// TUIHidden goes one step further: the field is not listed on the TUI Config
+// tab at all. It is for advanced knobs an operator tunes once (if ever) —
+// showing them buries the settings people actually change. Hidden is a
+// display choice only: config.toml, `hap config fields`, and
+// `hap config set` all keep working on the key.
 type ConfigFieldDef struct {
 	Key         string
 	TUIEditable bool
+	TUIHidden   bool
 }
 
 // ConfigFields is the single source of truth for the scalar config field
@@ -1526,29 +1533,29 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
 	{Key: "llm.timeout_seconds", TUIEditable: true},
 	{Key: "llm.auto_act_confidence_threshold", TUIEditable: true},
-	{Key: "llm.pane_excerpt_chars", TUIEditable: true},
-	{Key: "llm.enable_rewrite_action", TUIEditable: true},
-	{Key: "llm.rewrite_action_fallback_template"}, // template string
-	{Key: "llm.task_generate_command"},            // argv template (idle task suggestion)
-	{Key: "llm.task_generate_command_start"},      // argv template (first generation; inherits task_generate_command)
+	{Key: "llm.pane_excerpt_chars", TUIEditable: true, TUIHidden: true},
+	{Key: "llm.enable_rewrite_action", TUIEditable: true, TUIHidden: true},
+	{Key: "llm.rewrite_action_fallback_template", TUIHidden: true}, // template string
+	{Key: "llm.task_generate_command"},                             // argv template (idle task suggestion)
+	{Key: "llm.task_generate_command_start"},                       // argv template (first generation; inherits task_generate_command)
 	{Key: "llm.task_generate_timeout_seconds", TUIEditable: true},
 	// Only the `.env` PATHS are registered. The inline `[llm.*_env]` tables
-	// hold API keys, and every key in this registry is rendered by the TUI
-	// and `config fields`, so they stay config.toml-only; `hap config`
+	// hold API keys, and every key in this registry is rendered by
+	// `config fields`, so they stay config.toml-only; `hap config`
 	// summarizes them by name. A path is not a secret.
-	{Key: "llm.env_file", TUIEditable: true},
-	{Key: "llm.command_env_file", TUIEditable: true},
-	{Key: "llm.command_start_env_file", TUIEditable: true},
-	{Key: "llm.task_generate_command_env_file", TUIEditable: true},
-	{Key: "llm.task_generate_command_start_env_file", TUIEditable: true},
+	{Key: "llm.env_file", TUIEditable: true, TUIHidden: true},
+	{Key: "llm.command_env_file", TUIEditable: true, TUIHidden: true},
+	{Key: "llm.command_start_env_file", TUIEditable: true, TUIHidden: true},
+	{Key: "llm.task_generate_command_env_file", TUIEditable: true, TUIHidden: true},
+	{Key: "llm.task_generate_command_start_env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "embedding.disabled", TUIEditable: true},
 	{Key: "embedding.model_path"}, // path
 	{Key: "embedding.similarity_threshold", TUIEditable: true},
 	{Key: "embedding.bm25_min_score", TUIEditable: true},
-	{Key: "embedding.pane_salient_chars", TUIEditable: true},
+	{Key: "embedding.pane_salient_chars", TUIEditable: true, TUIHidden: true},
 	{Key: "embedding.model_context_window", TUIEditable: true},
 	{Key: "embedding.embed_timeout_ms", TUIEditable: true},
-	{Key: "embedding.warm_timeout_ms", TUIEditable: true},
+	{Key: "embedding.warm_timeout_ms", TUIEditable: true, TUIHidden: true},
 	{Key: "tui.max_content_width", TUIEditable: true},
 	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
@@ -1559,7 +1566,8 @@ var ConfigFields = []ConfigFieldDef{
 }
 
 // ConfigFieldKeys lists every scalar config field editable via SetField, in
-// display order (shared by the TUI config editor and `config set`).
+// display order. This is the complete set — `config fields` and `config set`
+// use it. The TUI shows the shorter TUIConfigFieldKeys.
 var ConfigFieldKeys = func() []string {
 	keys := make([]string, len(ConfigFields))
 	for i, f := range ConfigFields {
@@ -1568,16 +1576,43 @@ var ConfigFieldKeys = func() []string {
 	return keys
 }()
 
-// FieldTUIEditable reports whether the TUI inline prompt may edit key;
-// false means the TUI shows it read-only (config.toml and `config set`
-// still work — CR-036).
-func FieldTUIEditable(key string) bool {
+// TUIConfigFieldKeys lists the config fields the TUI Config tab shows, in
+// display order: ConfigFieldKeys minus the advanced ones marked TUIHidden.
+var TUIConfigFieldKeys = func() []string {
+	keys := make([]string, 0, len(ConfigFields))
 	for _, f := range ConfigFields {
-		if f.Key == key {
-			return f.TUIEditable
+		if !f.TUIHidden {
+			keys = append(keys, f.Key)
 		}
 	}
-	return false
+	return keys
+}()
+
+// configFieldDef looks a registry entry up by key. It is the single place the
+// "unknown key" default lives, so every accessor below degrades the same way.
+func configFieldDef(key string) (ConfigFieldDef, bool) {
+	for _, f := range ConfigFields {
+		if f.Key == key {
+			return f, true
+		}
+	}
+	return ConfigFieldDef{}, false
+}
+
+// FieldTUIHidden reports whether the TUI Config tab omits key. Hidden fields
+// stay fully settable through config.toml and `hap config set`.
+func FieldTUIHidden(key string) bool {
+	f, _ := configFieldDef(key)
+	return f.TUIHidden
+}
+
+// FieldTUIEditable reports whether the TUI inline prompt may edit key. False
+// means the TUI will not edit it inline — either it renders read-only because
+// a one-line prompt would mangle the value (CR-036), or it is not rendered at
+// all (TUIHidden). config.toml and `config set` work in both cases.
+func FieldTUIEditable(key string) bool {
+	f, _ := configFieldDef(key)
+	return f.TUIEditable && !f.TUIHidden
 }
 
 // defaultedInt renders an int config field whose 0 means "use the built-in

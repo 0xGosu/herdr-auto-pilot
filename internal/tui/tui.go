@@ -1074,7 +1074,7 @@ func (m Model) updateCheckCmd() tea.Cmd {
 // buildRuleItems lays out the Config tab rows from the current config.
 func buildRuleItems(cfg config.Config) []ruleItem {
 	var items []ruleItem
-	for _, key := range frontend.ConfigFieldKeys {
+	for _, key := range frontend.TUIConfigFieldKeys {
 		items = append(items, ruleItem{
 			kind: "field", key: key,
 			label: fmt.Sprintf("%-38s %s", key, frontend.FieldValue(cfg, key)),
@@ -5458,7 +5458,14 @@ func (m Model) configLines() []configLine {
 			}
 			switch item.kind {
 			case "field":
-				header("Config", false)
+				// Name the omission: advanced fields are hidden here, not
+				// gone, so the operator knows where the rest live. Derived,
+				// so the note disappears if nothing is hidden any more.
+				title := "Config"
+				if len(frontend.TUIConfigFieldKeys) < len(frontend.ConfigFieldKeys) {
+					title += " (advanced fields hidden — see: hap config fields)"
+				}
+				header(title, false)
 			case "pattern":
 				header(fmt.Sprintf("Never-auto patterns (operator; %s)", m.seedLabel()), true)
 			case "source":

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -2447,10 +2448,20 @@ func TestFieldTUIEditableClassification(t *testing.T) {
 		"llm.task_generate_command_start":      true,
 		"embedding.model_path":                 true,
 	}
-	for _, key := range frontend.ConfigFieldKeys {
-		want := !readOnly[key]
-		if got := frontend.FieldTUIEditable(key); got != want {
-			t.Errorf("FieldTUIEditable(%s) = %v, want %v", key, got, want)
+	for _, f := range frontend.ConfigFields {
+		// Assert the DECLARED flag, not the accessor's output. A hidden
+		// field's FieldTUIEditable is forced false, so deriving the
+		// expectation from the accessor would leave TUIEditable unpinned
+		// for exactly the fields where it matters — it is the value that
+		// takes effect the day one is un-hidden.
+		if f.TUIEditable == readOnly[f.Key] {
+			t.Errorf("%s: TUIEditable=%v contradicts the CR-036 read-only classification", f.Key, f.TUIEditable)
+		}
+		// The accessor folds in TUIHidden: the TUI cannot edit a row it
+		// does not render.
+		want := f.TUIEditable && !f.TUIHidden
+		if got := frontend.FieldTUIEditable(f.Key); got != want {
+			t.Errorf("FieldTUIEditable(%s) = %v, want %v", f.Key, got, want)
 		}
 	}
 	// Every expected read-only key must actually exist in the registry.
@@ -2465,6 +2476,64 @@ func TestFieldTUIEditableClassification(t *testing.T) {
 	}
 	if frontend.FieldTUIEditable("nonexistent.field") {
 		t.Error("unknown key must not be TUI-editable")
+	}
+}
+
+// TestTUIHiddenConfigFields: the advanced knobs are dropped from the TUI's
+// display list only. They must stay in ConfigFieldKeys so config.toml,
+// `hap config fields`, and `hap config set` keep working on them.
+func TestTUIHiddenConfigFields(t *testing.T) {
+	hidden := map[string]bool{
+		"llm.pane_excerpt_chars":                   true,
+		"llm.enable_rewrite_action":                true,
+		"llm.rewrite_action_fallback_template":     true,
+		"llm.env_file":                             true,
+		"llm.command_env_file":                     true,
+		"llm.command_start_env_file":               true,
+		"llm.task_generate_command_env_file":       true,
+		"llm.task_generate_command_start_env_file": true,
+		"embedding.pane_salient_chars":             true,
+		"embedding.warm_timeout_ms":                true,
+	}
+	all := make(map[string]bool, len(frontend.ConfigFieldKeys))
+	for _, key := range frontend.ConfigFieldKeys {
+		all[key] = true
+		if got := frontend.FieldTUIHidden(key); got != hidden[key] {
+			t.Errorf("FieldTUIHidden(%s) = %v, want %v", key, got, hidden[key])
+		}
+	}
+	for key := range hidden {
+		if !all[key] {
+			t.Errorf("hidden key %q is gone from ConfigFieldKeys — it must stay settable via `hap config set`", key)
+		}
+	}
+	if frontend.FieldTUIHidden("nonexistent.field") {
+		t.Error("unknown key must not report as hidden")
+	}
+
+	// TUIConfigFieldKeys is exactly ConfigFieldKeys minus the hidden ones,
+	// in the same order.
+	var want []string
+	for _, key := range frontend.ConfigFieldKeys {
+		if !hidden[key] {
+			want = append(want, key)
+		}
+	}
+	if !slices.Equal(frontend.TUIConfigFieldKeys, want) {
+		t.Errorf("TUIConfigFieldKeys = %v, want %v", frontend.TUIConfigFieldKeys, want)
+	}
+
+	// Hidden fields still round-trip through SetField.
+	app, _ := testApp(t)
+	if err := app.SetField(context.Background(), "embedding.warm_timeout_ms", "90000"); err != nil {
+		t.Fatalf("SetField on a hidden key must still work: %v", err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Embedding.WarmTimeoutMs != 90000 {
+		t.Errorf("hidden field not persisted: %d", cfg.Embedding.WarmTimeoutMs)
 	}
 }
 
@@ -5095,9 +5164,9 @@ func TestConfirmTaskGenNoopLearnsNoopWithoutTaskSource(t *testing.T) {
 }
 
 // TestConfigFieldsNeverRenderEnvValues guards the secrecy rule for the
-// per-command LLM environment: the field registry is rendered verbatim by the
-// TUI config screen and `hap config fields`, so no inline env VALUE may be
-// reachable through it. Only the `.env` paths are registered.
+// per-command LLM environment: the field registry is rendered verbatim by
+// `hap config fields`, so no inline env VALUE may be reachable through it.
+// Only the `.env` paths are registered.
 func TestConfigFieldsNeverRenderEnvValues(t *testing.T) {
 	cfg := config.Default()
 	const secret = "sk-ant-supersecret"

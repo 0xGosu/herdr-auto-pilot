@@ -1096,7 +1096,7 @@ or `hap rules add '<regex>'` / `rules remove <index>`, or press `a`/`x` on
 the TUI's *Config* tab — which also lists the supported scalar config fields,
 adds/removes task sources (`t`/`x`), and clears learned data (`X`).
 Simple fields — numbers, booleans, and the `tui.theme` enum, including
-`llm.pane_excerpt_chars`, `llm.task_generate_timeout_seconds`,
+`llm.task_generate_timeout_seconds`,
 `embedding.model_context_window`, `safety.disable_never_auto_seed_patterns`,
 `tui.max_content_width` / `tui.max_content_height`, `tui.terminal_bell`
 (on by default — rings the terminal bell on a new escalation, and when the
@@ -1107,12 +1107,18 @@ still rings if herdr reports it did not display the toast), and
 `tui.disable_check_for_update` (off by default — see *Update to the latest
 version*) — edit
 inline (`enter`, or `e`) or via `hap config set <key> <value>`. Free-text fields (`llm.command`,
-`llm.command_start`, `llm.rewrite_action_fallback_template`,
+`llm.command_start`,
 `llm.task_generate_command`,
 `llm.task_generate_command_start`, `embedding.model_path`) show read-only in
 the TUI, because a one-line
 prompt mangles quoted argv values — edit them in `config.toml` or with
-`config set`, which accepts every listed scalar key. Scoped never-auto rules
+`config set`, which accepts every listed scalar key. Ten advanced fields are
+not listed on the tab at all, so the settings you actually change stay
+findable: `llm.pane_excerpt_chars`, `llm.enable_rewrite_action`,
+`llm.rewrite_action_fallback_template`, the five `llm.*env_file` paths,
+`embedding.pane_salient_chars`, and `embedding.warm_timeout_ms`. They are
+hidden only from the TUI — `hap config fields` still lists them, `hap config
+set` still sets them, and `config.toml` still reads them. Scoped never-auto rules
 and `[[capture_delay]]` rules also display read-only on the tab. The
 `[tui.palette]` overrides are edited directly in `config.toml`. Capture delays show the built-in defaults (10000
 ms first event / 2000 ms after) when none are configured, and long values are
