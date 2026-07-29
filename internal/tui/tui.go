@@ -5577,11 +5577,54 @@ func llmConfShort(v *int) string {
 }
 
 // Run starts the TUI program.
+//
+// Signals reach the TUI as a cancelled ctx and nothing else. tea.WithContext
+// makes cancellation tear the program down through bubbletea's own shutdown,
+// which restores the terminal (alt screen off, cursor back, cooked mode) and
+// lets Run's drain and main's deferred cleanup run. That is the only path by
+// which SIGHUP — raised when the pane or ssh session hosting us closes — gets
+// a clean exit rather than Go's default, which kills the process on the spot.
+//
+// tea.WithoutSignalHandler is what keeps that path SINGLE, and it is
+// load-bearing rather than tidiness. bubbletea's own handler answers
+// SIGINT/SIGTERM by pushing a message onto an internal channel with a
+// blocking send that has no ctx escape; its shutdown then waits on that
+// goroutine forever. With both mechanisms live, the same signal cancels the
+// context AND queues that message, so whenever the event loop unwinds on
+// ctx.Done() first, nothing is left to receive it and the process hangs
+// instead of exiting (reproduced on roughly half of SIGINTs). Ctrl+C is
+// unaffected: the terminal is in raw mode, so it arrives as a KeyMsg the
+// model already handles.
 func Run(ctx context.Context, app *frontend.App) error {
+	return run(ctx, app)
+}
+
+// run is Run with room for extra program options. The shutdown-critical
+// options are applied here so tests exercise the real configuration; `extra`
+// is appended last and therefore wins on anything it overlaps, so tests must
+// only add options (a terminal-less input, say), never contradict these.
+func run(ctx context.Context, app *frontend.App, extra ...tea.ProgramOption) error {
 	m := New(ctx, app)
 	m.bellOut = os.Stdout
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	opts := append([]tea.ProgramOption{
+		tea.WithAltScreen(), tea.WithContext(ctx), tea.WithoutSignalHandler(),
+	}, extra...)
+	p := tea.NewProgram(m, opts...)
 	_, err := p.Run()
+	// A cancelled context is how a signal reaches us, not a failure: report it
+	// as a clean exit so `hap tui` does not print "error: program was killed"
+	// and exit 1 every time the operator closes the pane.
+	//
+	// Match ONLY the pure-cancellation shape. bubbletea returns ErrProgramKilled
+	// wrapped around a real cause too — around ErrProgramPanic for a recovered
+	// panic, and around the event loop's own error — and those satisfy a bare
+	// errors.Is(err, tea.ErrProgramKilled) just as well. Swallowing them would
+	// silence a crash at the one moment the report is most wanted: while the
+	// TUI is unwinding. Only the cancel path carries context.Canceled.
+	if errors.Is(err, tea.ErrProgramKilled) &&
+		errors.Is(err, context.Canceled) && !errors.Is(err, tea.ErrProgramPanic) {
+		err = nil
+	}
 	// bubbletea does not wait for in-flight Cmd goroutines on quit; drain
 	// them (bounded, in case a Cmd was somehow never launched) so a send
 	// confirmed right before quitting still lands and registers its submit

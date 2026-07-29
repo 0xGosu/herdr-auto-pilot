@@ -81,8 +81,64 @@ func main() {
 	}
 }
 
+// shutdownSignals are the signals that cancel the run context instead of
+// killing the process where it stands.
+//
+// SIGHUP is the one that is easy to miss: it arrives when the terminal hosting
+// us goes away — the herdr pane is closed, an ssh session drops — which is a
+// routine way for `hap tui` to end, not an exceptional one. Unhandled, Go's
+// default for it is immediate termination, so nothing deferred runs: the store
+// is never closed and the TUI never restores the terminal, leaving it in raw
+// mode with the alt screen still on.
+//
+// What this does NOT rescue is the submit-retry drain. Those workers run on
+// the same context the signal just cancelled (herdr.CLI.spawnSubmitRetry), so
+// they return without pressing Enter no matter how orderly the exit is; the
+// drain only does its job on the ordinary quit path, where nothing is
+// cancelled. Making retries survive a signal would mean detaching their
+// context from shutdown, which is a delivery-path decision, not a
+// signal-handling one.
+var shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP}
+
+// shutdownContext returns the run context and its release function. It is
+// separate from run() so tests can exercise the real wiring — both halves of
+// it, including the release below, which no assertion could otherwise reach.
+//
+// Catching a signal means it no longer kills us, so a process wedged in a call
+// that does not observe ctx (a blocking flock, a stuck subprocess read) would
+// become unkillable by anything short of SIGKILL. The graceful path therefore
+// gets exactly one chance: the handler is released the moment the first signal
+// arrives, so a second one terminates immediately. Without that, adding SIGHUP
+// would turn an orphaned-and-wedged process — which the hangup used to reap —
+// into one that lingers forever.
+//
+// The release happens BEFORE the cancellation, not in a goroutine watching
+// ctx.Done(): that ordering is what makes the guarantee real rather than
+// probabilistic. Watching for cancellation leaves the release racing every
+// consumer of ctx, so a second signal arriving promptly — the operator hitting
+// it again because nothing seemed to happen — could still find the handler
+// installed and be swallowed.
+func shutdownContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, shutdownSignals...)
+	release := func() { signal.Stop(ch) }
+	go func() {
+		select {
+		case <-ch:
+			release()
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() {
+		release()
+		cancel()
+	}
+}
+
 func run(verb string, args []string) error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := shutdownContext()
 	defer stop()
 
 	// Path-printing verbs are pure diagnostics: they resolve paths WITHOUT
