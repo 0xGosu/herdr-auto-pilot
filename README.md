@@ -659,10 +659,25 @@ detects that and refuses instead).
 This **composes** with the pre-delivery LLM review
 (`enable_llm_review_before_auto_send`): the hand-out decides *that* a task
 goes, the review decides *which* task and in what shape. The two were once
-mutually exclusive — the review used to escalate when it declined, and a
-pending escalation stops the idle poll for that agent, so a reviewed auto-send
-source silently switched itself off. The review never escalates now, so the
-restriction is gone.
+mutually exclusive — the review used to escalate when it declined, and at the
+time any pending escalation stopped the idle poll for that agent, so a reviewed
+auto-send source silently switched itself off. The review never escalates now,
+and ordinary escalations no longer stop the poll either, so the restriction is
+gone twice over.
+
+An escalation waiting for you does **not** withhold queued work from an agent.
+It is a question about what to answer on the agent's screen, not a judgement
+that the agent cannot take its next task — so the hand-out goes out and you
+answer the escalation when you get to it. What stops an undeliverable task from
+being retried forever is a limit on the *task*, not on the agent: an item that
+fails to deliver three times is left `[-]` and escalated, and the agent moves on
+to the next one.
+
+An agent whose episodes keep resolving to something other than a send — typically
+one sitting behind an escalation you have not answered yet — is re-checked on a
+widening interval (1, 2, 4 … up to 15 minutes) rather than every minute, so it
+does not cost a pane read a minute indefinitely. Any delivered task resets it, so
+this only delays recovery, never prevents it.
 
 Three rules keep unattended hand-out safe:
 

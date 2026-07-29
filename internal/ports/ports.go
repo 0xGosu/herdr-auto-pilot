@@ -265,6 +265,14 @@ type DaemonStore interface {
 	// RecordTaskReservation logs one hand-out and bumps that item's attempt
 	// counter, atomically.
 	RecordTaskReservation(ctx context.Context, r domain.TaskReservation) (int64, error)
+	// RecordTaskHandoutAttempt bumps an item's attempt counter WITHOUT opening a
+	// reservation. It exists for the delivery that never reached the agent: a
+	// failed send rolls its "[-]" straight back to "[ ]", so there is no
+	// hand-out to reclaim and no row to age — but the attempt still happened,
+	// and without counting it nothing bounds re-offering the same item to the
+	// same wedged pane on every sweep. It returns the count AFTER the bump so
+	// the caller can apply the maxTaskHandouts ceiling without a racy re-read.
+	RecordTaskHandoutAttempt(ctx context.Context, sourcePath, taskText string, at time.Time) (int, error)
 	// OpenTaskReservations returns every recorded hand-out, oldest first.
 	OpenTaskReservations(ctx context.Context) ([]domain.TaskReservation, error)
 	// ConfirmTaskReservations stamps an agent's unconfirmed hand-outs as taken

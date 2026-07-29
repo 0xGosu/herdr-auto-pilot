@@ -2119,3 +2119,73 @@ func TestMigrateAddsSignatureBaselineToLegacyAuditLog(t *testing.T) {
 			pending[0].SigRaw, pending[0].SigSalientChars)
 	}
 }
+
+func TestRecordTaskHandoutAttemptCountsWithoutAReservation(t *testing.T) {
+	// The counter exists so a delivery that never reached the agent still ages
+	// toward maxTaskHandouts. A failed send records NO reservation (the ledger
+	// row is written only after herdr accepts the keystrokes), so this is the
+	// only thing that advances it — and the caller applies the ceiling to the
+	// returned value, so the post-bump count has to be exact.
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	at := time.Now()
+
+	for want := 1; want <= 4; want++ {
+		got, err := s.RecordTaskHandoutAttempt(ctx, "/tasks.md", "step two", at)
+		if err != nil {
+			t.Fatalf("attempt %d: %v", want, err)
+		}
+		if got != want {
+			t.Errorf("attempt %d returned %d, want %d", want, got, want)
+		}
+	}
+
+	// It agrees with the independent reader the reclaim sweep uses.
+	n, err := s.TaskHandoutAttempts(ctx, "/tasks.md", "step two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 4 {
+		t.Errorf("TaskHandoutAttempts = %d, want 4", n)
+	}
+
+	// No reservation was opened — nothing for the reclaim sweep to age or
+	// release, which is exactly why the send site has to count for itself.
+	open, err := s.OpenTaskReservations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 0 {
+		t.Errorf("counting an attempt opened %d reservations, want 0", len(open))
+	}
+
+	// Scoping: a different item and a different source each count separately,
+	// so one poisoned task cannot cap its neighbours.
+	if got, err := s.RecordTaskHandoutAttempt(ctx, "/tasks.md", "other", at); err != nil || got != 1 {
+		t.Errorf("a different task = %d (err %v), want 1", got, err)
+	}
+	if got, err := s.RecordTaskHandoutAttempt(ctx, "/other.md", "step two", at); err != nil || got != 1 {
+		t.Errorf("a different source = %d (err %v), want 1", got, err)
+	}
+
+	// And the shared counter is the SAME one RecordTaskReservation bumps, which
+	// is what lets landed-but-never-started hand-outs and refused deliveries add
+	// up to one ceiling rather than two half-ceilings.
+	if _, err := s.RecordTaskReservation(ctx, domain.TaskReservation{
+		SourcePath: "/tasks.md", TaskText: "step two", ItemIndex: 1,
+		AgentID: "a1", PaneID: "a1", ReservedAt: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.TaskHandoutAttempts(ctx, "/tasks.md", "step two"); err != nil || n != 5 {
+		t.Errorf("after a reservation the shared counter = %d (err %v), want 5", n, err)
+	}
+
+	// ClearTaskHandouts forgets it, so an operator releasing the item starts over.
+	if err := s.ClearTaskHandouts(ctx, "/tasks.md", "step two"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.TaskHandoutAttempts(ctx, "/tasks.md", "step two"); err != nil || n != 0 {
+		t.Errorf("after clearing, counter = %d (err %v), want 0", n, err)
+	}
+}

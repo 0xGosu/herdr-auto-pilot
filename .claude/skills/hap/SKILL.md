@@ -598,12 +598,21 @@ and the *Config* tab's `t` prompt takes the same words:
 - the pre-delivery LLM review **composes** with this:
   `enable_llm_review_before_auto_send` decides which task and in what shape,
   this flag decides that a task goes at all. the two used to be mutually
-  exclusive, because a declined review escalated and an open escalation skips
-  the agent (below) — so a reviewed auto-send source switched itself off. the
-  review never escalates now, so the restriction is gone.
-- an agent that is disabled, rate-paused, blocked, or has an open escalation is
-  skipped. this is the first thing to check when auto-send "does nothing":
-  `hap escalations` — ANY open row for that agent parks the poll, silently.
+  exclusive, because a declined review escalated and — at the time — any open
+  escalation skipped the agent, so a reviewed auto-send source switched itself
+  off. the review never escalates now, and ordinary escalations no longer skip
+  the agent either (below), so the restriction is gone twice over.
+- an agent that is disabled, rate-paused, or blocked is skipped. a pending
+  **escalation does NOT stop the hand-out** — it is a question for you about
+  what to answer on screen, not a verdict on whether the agent can take its next
+  task, so queued work keeps flowing while you catch up. what bounds an
+  undeliverable task is a per-TASK limit: an item whose delivery fails
+  `maxTaskHandouts` (3) times is left `[-]` and escalated as
+  `task_never_started`, and the agent moves on to the next item.
+- an agent whose episodes keep resolving to something other than a send (a
+  standing escalation you have not answered yet) is re-checked on a **widening
+  interval** — 1, 2, 4 … up to 15 minutes — instead of every minute. it is a
+  delay, not a bench: any delivered task resets it to full speed.
 - **every sweep decides from current state, not from the last send.** a
   successful send only means herdr took the keystrokes — text typed into a CLI
   that is restarting or unfocused is silently lost, and the item would sit `[-]`
@@ -612,10 +621,10 @@ and the *Config* tab's `t` prompt takes the same words:
   after ~2 minutes is returned to `[ ]` (audit status `reclaimed`) and re-offered
   in the same sweep — to that agent or any other idle one. a `[-]` hap did not
   write itself (yours, or one an agent marked) is never touched.
-- after **3** hand-outs of the same item that were never started, hap stops
-  resending it: the item is left `[-]` and an escalation
-  (`task_never_started:…`) asks you to look. clear it with
-  `hap task <name> undone <n>` once the agent is healthy.
+- after **3** hand-outs of the same item that were never started — or **3**
+  deliveries herdr refused outright — hap stops resending it: the item is left
+  `[-]` and an escalation (`task_never_started:…`) asks you to look. clear it
+  with `hap task <name> undone <n>` once the agent is healthy.
 
 
 ### manage the task items (CRUD)

@@ -230,6 +230,25 @@ type Daemon struct {
 	// after autoTaskClaimTTL. Guarded by mu.
 	autoTaskClaim map[string]taskClaim
 
+	// pollRedrive backs off re-driving a parked agent whose poll episodes keep
+	// resolving to something other than a send.
+	//
+	// The idle poll deliberately ignores episodeHandled, so it re-drives the same
+	// parked pane every sweep. That is what makes a rule graduating (or an
+	// operator answering) take effect without waiting for a herdr event — but an
+	// episode that escalates leaves the agent parked, its claim dropped and its
+	// idle clock untouched, so nothing else stops the poll re-reading that pane
+	// once a minute forever, one `ignored` audit row at a time, in a table
+	// nothing prunes. Until the escalation gate was removed, that gate stood in
+	// for this.
+	//
+	// Retries still happen, just at a widening interval, so recovery is only
+	// delayed and never prevented. Reset the moment the agent stops being parked
+	// (noteIdleAgents) — it acted, so whatever was stuck is not stuck any more.
+	// In-memory only: a restart grants a fresh budget, which costs one extra
+	// pane read.
+	pollRedrive map[string]pollRedriveState
+
 	// autoAcceptAttempts counts failed delivery attempts per aged escalation,
 	// and autoAcceptAbsent counts consecutive sweeps in which an escalation's
 	// agent was missing from the listing. Both are keyed by audit id, guarded
@@ -437,6 +456,7 @@ func New(opt Options) (*Daemon, error) {
 		toggleAttempt:             map[string]string{},
 		idleSince:                 map[string]idleMark{},
 		autoTaskClaim:             map[string]taskClaim{},
+		pollRedrive:               map[string]pollRedriveState{},
 		autoAcceptAttempts:        map[int64]int{},
 		autoAcceptAbsent:          map[int64]int{},
 		autoAcceptNeedsFinalize:   map[int64]struct{}{},
@@ -1577,8 +1597,9 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	// It used to, and that placement is what forced it to be mutually exclusive
 	// with enable_auto_send_task_when_idle (issue #255): preempting Decide meant
 	// a signature graduated to autonomous on @next_task:declared could never
-	// act, and the review's only failure mode was an escalation — which bars an
-	// agent from the idle poll entirely, silently switching auto-send off.
+	// act, and the review's only failure mode was an escalation — which at the
+	// time barred an agent from the idle poll entirely, silently switching
+	// auto-send off. (That gate is gone; the review still never escalates.)
 	//
 	// The review is now a pre-DELIVERY filter (tasklistreview.go): Decide runs
 	// normally and decides THAT a task goes, then deliverDeclared hands the
@@ -2052,7 +2073,36 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 
 	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType, del.sendText); err != nil {
 		slog.Error("agent send failed; escalating", "pane", s.PaneID, "error", err)
-		rollback()
+		// A failed send leaves NO reservation behind — the ledger row below is
+		// written only once herdr accepts the keystrokes — so the reclaim
+		// sweep's maxTaskHandouts ceiling can never see this item, and nothing
+		// would stop the next poll re-offering it to the same unwritable pane,
+		// once a minute, forever. Counting the attempt here is what closes that
+		// loop: below the ceiling the item returns to "[ ]" so ANOTHER agent can
+		// take it, and at the ceiling it stays "[-]" and the operator is asked,
+		// exactly as escalateNeverStartedTask leaves a hand-out that landed but
+		// was never taken up.
+		capped := false
+		if reservedIndex > 0 && del.declared != nil {
+			attempts, err := d.opt.Store.RecordTaskHandoutAttempt(ctx,
+				canonicalTaskPath(del.declared.Path), del.taskText, now)
+			switch {
+			case err != nil:
+				// Uncounted: roll back and let it be re-offered. Losing the
+				// bound is better than stranding a task on a write error.
+				slog.Error("auto-send: failed hand-out could not be counted; this item may be re-offered without bound",
+					"agent", s.AgentID, "task", del.taskText, "error", err)
+			case attempts >= maxTaskHandouts:
+				// Only skip the rollback once the operator has actually been
+				// told; an unrecorded escalation would leave the item "[-]"
+				// with nothing to explain it and no sweep able to reach it.
+				capped = d.escalateUndeliverableTask(ctx, s, del, attempts, now)
+			}
+		}
+		if !capped {
+			rollback()
+		}
+		// The claim is released by deliverAutonomous on !sent, for both branches.
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
 		d.notify(ctx, "Herd Auto Prompter: action delivery failed",
 			fmt.Sprintf("Agent %s: could not deliver the decided input; please review.", s.AgentID))
@@ -2062,6 +2112,9 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 	d.mu.Lock()
 	d.lastAutoSend[s.AgentID] = now
 	d.mu.Unlock()
+	// Something reached the pane, so this agent's episodes are resolving — give
+	// the idle poll its full re-drive budget back (see Daemon.pollRedrive).
+	d.clearRedrive(s.AgentID)
 
 	// The keystrokes are out, but herdr accepting them is not proof the agent
 	// acted on them. Record the hand-out so the idle sweep can decide from what

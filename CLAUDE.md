@@ -240,6 +240,26 @@ whose manifest carries exactly that version).
   `…ConfirmedHandoutIsNeverReclaimed` / `…ReclaimIgnoresForeignInProgressItems` /
   `…OneUnconfirmedHandoutPerAgent` / `…RecycledPaneCannotConfirmItsPredecessorsHandout` /
   `…HandoutCapEscalatesInsteadOfResending`).
+- **A pending escalation never benches an agent from the idle poll** — `eligibleIdleAgents`
+  has no escalation gate, deliberately. An escalation is a question about what to answer on
+  the agent's SCREEN, not a verdict on whether it can take its next declared task, and gating
+  on one deadlocks the feature against itself: a pending task is what raises
+  `noop_vs_pending_tasks`, which then blocks the poll that would deliver it. Do not reach for
+  the audit `Trigger` to tell "the poll's own" escalations apart either — `daemon.trigger`
+  derives it from `tr.AutoIdleSend`, so EVERY escalation raised on a poll-driven episode is
+  stamped `auto-idle-send:`, which is the common shape for exactly the parked agents this
+  feature exists for. **The bound on an undeliverable task is per ITEM, not per agent**: a
+  failed send rolls its item back to `[ ]` and records NO reservation, so
+  `reclaimStrandedTasks` can never age it — `deliverAutonomousClaimed` therefore counts the
+  attempt itself (`RecordTaskHandoutAttempt`) and at `maxTaskHandouts` skips the rollback,
+  leaving the item `[-]` and escalating (`escalateUndeliverableTask`). Because the poll
+  ignores `episodeHandled` on purpose, an agent whose episodes keep NOT sending is otherwise
+  re-read every sweep forever, so `Daemon.pollRedrive` widens the interval (1, 2, 4 … capped
+  at 15m) and any delivered send clears it — a delay, never a bench. Keep the invariant
+  tests (`…OrdinaryEscalationDoesNotBlockHandout`, whose poll-raised cases pin the trigger
+  trap / `…UndeliverableTaskIsCappedNotRetriedForever` / `…CapsAtExactlyMaxHandouts` /
+  `…CappedTaskLetsTheAgentMoveToTheNextItem` / `…EscalatedAgentStillGetsItsNextTask` /
+  `…BacksOffRedrivingAnAgentThatNeverSends` / `TestTaskReviewFailedSendCountsTheHandoutAndRollsBack`).
 - **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
   shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels
   results back through a channel (see `consultLLM` / `llmResults`).

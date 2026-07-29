@@ -5,6 +5,13 @@ section in `CLAUDE.md`. Entries go under the version that will carry them: mergi
 to main auto-releases the next patch, so a PR adds its lines under that number
 (or under the minor/major version it bumps the manifest to).
 
+## 0.5.11
+
+- Fixed `enable_auto_send_task_when_idle` going permanently silent on an agent that had any escalation waiting: a pending task is itself what raises `noop_vs_pending_tasks`, and that escalation then blocked the very poll that would have delivered the task, so the agent sat idle beside its own list with nothing logged
+- Changed: a pending escalation no longer withholds queued work from an agent at all. It is a question about what to answer on the agent's screen, not a judgement that the agent cannot take its next task — so hand-outs continue while you catch up, and answering or dismissing an escalation is no longer a prerequisite for auto-send to resume
+- Changed the limit that stops an undeliverable task from being retried forever: it now counts deliveries that herdr refused, and applies per TASK rather than benching the agent. An item whose delivery fails three times is left `[-]` and escalated as `task_never_started`, and the agent moves on to the next item instead of stalling
+- Added a widening interval (1, 2, 4 … up to 15 minutes) before the idle poll re-reads the pane of an agent whose episodes keep resolving to something other than a send, so an agent parked behind an unanswered question no longer costs a pane read and an audit row every minute indefinitely. Any delivered task resets it, so nothing is ever prevented — only delayed
+
 ## 0.5.10
 
 - Fixed the changelog leaving the 0.5.8 and 0.5.9 entries stranded under `Unreleased` after both releases shipped; they now sit under their own version headings, and the file no longer uses an `Unreleased` heading at all

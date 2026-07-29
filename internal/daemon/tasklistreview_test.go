@@ -811,3 +811,46 @@ func TestTaskReviewKilledInsideTheMutationWindowWritesNothing(t *testing.T) {
 	}
 	noEscalations(t, h)
 }
+
+func TestTaskReviewFailedSendCountsTheHandoutAndRollsBack(t *testing.T) {
+	// The reviewed path reserves inside its OWN critical section
+	// (taskfile.ApplyReview) and hands the claim plus rollback down, so
+	// deliverAutonomousClaimed sees a caller-owned reservation rather than one
+	// it took itself. Nothing exercised that branch against a failed send, so
+	// the hand-out counting added for the per-item ceiling could have been
+	// skipped here — leaving a reviewed task re-offered to a wedged pane on
+	// every sweep, the loop the ceiling exists to close.
+	h, taskFile := reviewHarness(t, "agent-review-fail",
+		"- [ ] 1. alpha\n- [ ] 2. beta\n", true)
+	h.herdr.setFailSend(true)
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		return stageTaskReview(ctx, h, req, []domain.TaskAction{
+			{Op: domain.TaskOpDone, Task: "1"},
+		}, "2", 90)
+	}
+
+	h.push("agent-review-fail", "idle")
+
+	// Below the ceiling the item comes back to "[ ]" — the review's own edits
+	// stand, because they were committed before the send was attempted.
+	waitFor(t, 5*time.Second, func() bool {
+		return readTasks(t, taskFile) == "- [x] 1. alpha\n- [ ] 2. beta\n"
+	})
+	if got := readTasks(t, taskFile); got != "- [x] 1. alpha\n- [ ] 2. beta\n" {
+		t.Fatalf("a failed reviewed send did not release its reservation: %q", got)
+	}
+	// ...and the attempt was counted, which is what ages it toward the ceiling.
+	waitFor(t, 5*time.Second, func() bool {
+		n, err := h.raw.TaskHandoutAttempts(context.Background(),
+			canonicalTaskPath(taskFile), "2. beta")
+		return err == nil && n == 1
+	})
+	n, err := h.raw.TaskHandoutAttempts(context.Background(),
+		canonicalTaskPath(taskFile), "2. beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("a failed reviewed send counted %d hand-outs, want 1: the ceiling can never fire", n)
+	}
+}

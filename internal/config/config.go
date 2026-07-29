@@ -534,8 +534,9 @@ func (s TaskSource) MaxTasksLimit() int {
 // It composes with EnableAutoSendTaskWhenIdle rather than excluding it. The two
 // were once mutually exclusive, because the review ran as a fork upstream of
 // domain.Decide whose only failure mode was an escalation — and a pending
-// escalation bars an agent from the idle poll entirely, so a reviewed auto-send
-// source silently switched itself off. The review is now a pre-DELIVERY filter
+// escalation used to bar an agent from the idle poll entirely, so a reviewed
+// auto-send source silently switched itself off. (That gate is gone: no
+// escalation benches an agent now.) The review is now a pre-DELIVERY filter
 // that never escalates (every failure sends the original task unchanged), so
 // the exclusion no longer has anything to prevent: the auto-send rule decides
 // THAT a task goes, the review decides WHICH task and in what shape.
