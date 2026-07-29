@@ -24,10 +24,13 @@ import (
 //  1. preempting Decide meant a signature graduated to autonomous on
 //     @next_task:declared could never act — the review ran on every idle event
 //     regardless of what had been learned;
-//  2. the review's only failure mode was an escalation, and one pending
-//     escalation bars an agent from the idle poll forever
+//  2. the review's only failure mode was an escalation, and at the time ANY
+//     pending escalation barred an agent from the idle poll forever
 //     (eligibleIdleAgents). A reviewed auto-send source therefore switched
 //     itself off, which is why the two features had to be mutually exclusive.
+//     That latch is gone — no escalation benches an agent now; an undeliverable
+//     task is bounded per ITEM instead — but not escalating remains the right
+//     behavior here for the reason below, not merely to dodge it.
 //
 // As a pre-DELIVERY filter neither holds. Decide runs normally and decides THAT
 // a task goes; the review decides WHICH task and in what shape. And it NEVER
@@ -352,9 +355,9 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 	// `hap kill` in between must stop this. Deliberately BEFORE the mutation,
 	// so a paused daemon writes nothing to the operator's checklist and there
 	// is no claim to unwind. Fail closed on a read error, and — unlike the
-	// sibling async paths, which escalate here — stand down silently: an
-	// escalation would bar this agent from the idle poll long after the kill is
-	// lifted. The audit row is what tells the operator it happened.
+	// sibling async paths, which escalate here — stand down silently: the
+	// operator asked the daemon to stop, so there is nothing to ask them about.
+	// The audit row is what tells them it happened.
 	if kill, err := d.opt.Store.LatestKillEvent(ctx); err != nil || domain.KillStateActive(kill) {
 		why := "the kill switch is active"
 		if err != nil {
@@ -492,13 +495,16 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 	}
 
 	// deliverAutonomousClaimed owns the claim from here: it releases it on every
-	// path that decides not to send, and rolls it back on a failed one. Nothing
-	// is released here, or the claim-scoped Release would run twice.
+	// path that decides not to send, and rolls it back on a failed one — EXCEPT
+	// at the hand-out ceiling, where a send that failed for the maxTaskHandouts'th
+	// time deliberately leaves the item "[-]" and escalates instead. Nothing is
+	// released here either way, or the claim-scoped Release would run twice.
 	delivered := d.deliverAutonomous(ctx, s, res.sig, res.dec, res.tr, del, now)
 	status := "accepted"
 	if !delivered {
 		status = "rejected"
-		slog.Warn("reviewed task was not delivered; its checklist edits stand and the item was released",
+		slog.Warn("reviewed task was not delivered; its checklist edits stand and the item was released "+
+			"(unless the hand-out ceiling kept it [-] — see the escalation)",
 			"agent", s.AgentID, "task", out.SentText)
 	}
 	if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, status); err != nil {
@@ -511,9 +517,9 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 // outcome where fail-open is wrong: the operator asked the daemon to stop, so
 // "keep the agent working" is exactly what they did not want.
 //
-// It still does not escalate. An escalation would bar this agent from the idle
-// poll long after the kill is lifted, which is the latch this whole redesign
-// removes; the audit row is what tells the operator it happened.
+// It still does not escalate. There is nobody to ask — the operator already
+// said "stop" — so an escalation would only add a row to answer later for
+// something that needs no answer; the audit row is what tells them it happened.
 func (d *Daemon) standDown(ctx context.Context, res taskListReviewOutcome,
 	reason, why string, llmConf *int, proposal string, now time.Time) {
 

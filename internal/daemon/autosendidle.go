@@ -82,7 +82,63 @@ const (
 	// unbounded wait would stall every agent behind one wedged CLI; giving up
 	// resolves to "do not send", which is the safe outcome.
 	taskLockWait = 2 * time.Second
+	// maxPollRedriveBackoff caps the widening interval between re-drives of a
+	// parked agent whose episodes keep not sending (see Daemon.pollRedrive).
+	// Long enough that a permanently stuck agent costs a handful of pane reads
+	// an hour instead of sixty, short enough that a rule graduating — or an
+	// operator answering the escalation — takes effect while they are still
+	// looking at it.
+	maxPollRedriveBackoff = 15 * time.Minute
 )
+
+// pollRedriveState is one agent's re-drive budget: how many consecutive poll
+// episodes have resolved without a send, and the earliest time the poll may
+// drive it again.
+type pollRedriveState struct {
+	misses int
+	nextAt time.Time
+}
+
+// pollRedriveDelay is the wait after n consecutive no-send episodes: 1, 2, 4, 8
+// minutes … capped at maxPollRedriveBackoff. n==1 yields the sweep interval
+// itself, so an agent that resolves normally is never actually delayed.
+func pollRedriveDelay(n int) time.Duration {
+	d := autoSendIdleAfter
+	for i := 1; i < n && d < maxPollRedriveBackoff; i++ {
+		d *= 2
+	}
+	return min(d, maxPollRedriveBackoff)
+}
+
+// noteRedrive records that the poll is driving this agent now and arms the next
+// backoff step. Called for every re-drive; clearRedrive undoes it as soon as the
+// agent stops being parked, so the interval only widens while nothing happens.
+func (d *Daemon) noteRedrive(agentID string, now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := d.pollRedrive[agentID]
+	st.misses++
+	st.nextAt = now.Add(pollRedriveDelay(st.misses))
+	d.pollRedrive[agentID] = st
+}
+
+// redriveDeferred reports whether this agent's backoff has not yet elapsed.
+func (d *Daemon) redriveDeferred(agentID string, now time.Time) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	st, ok := d.pollRedrive[agentID]
+	return ok && now.Before(st.nextAt)
+}
+
+// clearRedrive restores an agent's full re-drive budget. Called whenever
+// something reaches the pane — a delivered send means the episodes ARE
+// resolving, so the next one should not be made to wait behind a backoff earned
+// while they were not.
+func (d *Daemon) clearRedrive(agentID string) {
+	d.mu.Lock()
+	delete(d.pollRedrive, agentID)
+	d.mu.Unlock()
+}
 
 // autoSendIdleTasks is the per-sweep poll. It runs on the main loop over an
 // agent listing the sweep already fetched: everything it reads is either
@@ -134,22 +190,42 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 		return
 	}
 
-	// One escalation scan for the whole poll: an agent with a question still
-	// waiting on the operator must not be handed work on top of it. Fails
-	// closed — an unreadable escalation table skips the sweep entirely.
-	open, err := d.opt.Store.PendingEscalations(ctx)
-	if err != nil {
-		slog.Warn("auto-send: pending-escalation read failed; skipping this sweep", "error", err)
-		return
-	}
-	escalated := make(map[string]bool, len(open))
-	for _, e := range open {
-		escalated[e.AgentID] = true
-	}
-
+	// NOTE: a pending escalation deliberately does NOT stand an agent down here.
+	// An escalation is a question for the operator about what to answer on the
+	// agent's SCREEN; it is not a verdict on whether the agent can take its next
+	// declared task, and this feature exists precisely so an idle agent with
+	// pending work keeps working while the operator catches up. Benching on any
+	// open escalation deadlocked the feature against itself: a pending task is
+	// what raises noop_vs_pending_tasks, and that escalation then blocked the
+	// very poll that would have delivered it — silently, and forever.
+	//
+	// What bounds a delivery that cannot land is the per-ITEM attempt counter
+	// (maxTaskHandouts), not a per-agent bench: a failed send counts its attempt
+	// and, at the ceiling, is LEFT "[-]" by escalateUndeliverableTask — which is
+	// what takes it out of the pending pool. That bound is per TASK, so a wedged
+	// pane cannot loop while a healthy agent with an unanswered question still
+	// gets its work.
+	//
+	// What the removed gate incidentally did — keep a hand-out out of a pane with
+	// a standing question — now rests on three weaker things, and it is worth
+	// being precise because the obvious reassurance is FALSE. The classifier
+	// treats herdr's status as a MODE SELECTOR: approval/choice content rules
+	// only match while the agent reads `blocked` (classify.go), and an
+	// unmatched idle/done pane falls through to SituationIdle. So a pane whose
+	// approval menu is still standing while herdr reports idle classifies as
+	// IDLE, not approval. What actually protects it is (1) herdr normally
+	// reporting `blocked` for exactly that pane, (2) the two structural
+	// detectors that DO survive at idle/done (Codex's Plan approval, Claude's
+	// remote-environment picker), and (3) a menu-bearing pane rarely matching a
+	// graduated idle rule, so the first occurrence escalates rather than sends.
+	// Residual risk, deliberately accepted here: once such a signature does
+	// graduate, a hand-out can land in a standing menu. Do not "fix" that by
+	// gating on the pending escalation's SituationType — a stale approval row
+	// the operator answered in-pane but never dismissed would bench the agent
+	// forever, which is the silent stall this change exists to remove.
 	driven := map[string]bool{} // agents already given a task this sweep
 	for _, src := range sources {
-		eligible := d.eligibleIdleAgents(ctx, src, agents, now, driven, escalated, awaiting)
+		eligible := d.eligibleIdleAgents(ctx, src, agents, now, driven, awaiting)
 		if len(eligible) == 0 {
 			continue
 		}
@@ -184,6 +260,7 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 			tr := a
 			tr.AutoIdleSend = true
 			tr.At = now
+			d.noteRedrive(a.AgentID, now)
 			slog.Info("auto-send: re-driving idle agent with its next declared task",
 				"agent", a.AgentID, "pane", a.PaneID, "status", a.Status, "source", src.Path)
 			d.scheduleCapture(ctx, tr)
@@ -340,7 +417,7 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 		}
 		a := live[r.AgentID]
 		if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-			AgentID: r.AgentID, AgentType: a.AgentType, Trigger: "auto-send-reclaim",
+			AgentID: r.AgentID, AgentType: a.AgentType, Trigger: domain.TriggerAutoSendReclaim,
 			SituationType: domain.SituationIdle,
 			Action:        domain.AuditActionTaskReclaimedPrefix + domain.DisplayTaskText(r.TaskText),
 			Rationale: fmt.Sprintf("[%s] handed to %s %s ago and never started; returned to [ ] for the next idle agent",
@@ -374,9 +451,12 @@ func (d *Daemon) retireReservation(ctx context.Context, r domain.TaskReservation
 // work, so the item is LEFT "[-]" (which is exactly what keeps it out of the
 // pending list) and the operator is asked.
 //
-// Note the escalation also parks this agent's auto-sends until it is resolved —
-// eligibleIdleAgents skips an agent with a pending escalation. That is
-// deliberate: a task nobody can start usually means the agent, not the task.
+// Note what stops the loop is the "[-]" mark, NOT the escalation: an open
+// escalation does not stand its agent down (eligibleIdleAgents has no such
+// gate), so the agent goes on to the next pending item while this one waits for
+// a human. The bound is therefore per TASK, which is what lets a healthy agent
+// keep working through an unanswered question while a task nobody can start
+// stays put.
 func (d *Daemon) escalateNeverStartedTask(ctx context.Context, r domain.TaskReservation,
 	a domain.AgentTransition, attempts int, now time.Time) {
 
@@ -402,7 +482,7 @@ func (d *Daemon) escalateNeverStartedTask(ctx context.Context, r domain.TaskRese
 	// makes the row informational: explained by its rationale, dismissible, not
 	// confirmable.
 	if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: r.AgentID, AgentType: a.AgentType, Trigger: "auto-send-reclaim",
+		AgentID: r.AgentID, AgentType: a.AgentType, Trigger: domain.TriggerAutoSendReclaim,
 		SituationType: domain.SituationIdle,
 		Action:        domain.AuditActionTaskNeverStartedPrefix + domain.DisplayTaskText(r.TaskText),
 		// Addressed by --path, not by agent: an agent can match several sources,
@@ -418,6 +498,61 @@ func (d *Daemon) escalateNeverStartedTask(ctx context.Context, r domain.TaskRese
 	}
 	slog.Warn("auto-send: task handed out repeatedly and never started; escalating",
 		"agent", r.AgentID, "path", r.SourcePath, "task", r.TaskText, "attempts", attempts)
+}
+
+// escalateUndeliverableTask is escalateNeverStartedTask's twin for the delivery
+// that never landed: after maxTaskHandouts sends that herdr refused, the item is
+// LEFT "[-]" (the caller skips its rollback) and the operator is asked.
+//
+// Both ceilings exist because they see different evidence. The reclaim sweep
+// counts hand-outs that LANDED and were never taken up, which it learns from the
+// ledger; a send that failed leaves no ledger row at all, so only the send site
+// can count it. Same counter, same end state, same escalation shape — an
+// operator sees one kind of row either way.
+// It returns whether the operator was actually told. A false return means the
+// caller must roll the item back to "[ ]" after all: leaving it "[-]" with no
+// escalation, no reservation and a cleared counter would make the task vanish
+// silently — the one outcome worse than another retry.
+func (d *Daemon) escalateUndeliverableTask(ctx context.Context, s domain.Situation,
+	del delivery, attempts int, now time.Time) bool {
+
+	sourcePath := canonicalTaskPath(del.declared.Path)
+	// The audit row goes FIRST. Clearing the counter before it is recorded would,
+	// on a write failure, leave the item "[-]" with the ceiling forgotten and
+	// nothing on record — invisible in `hap escalations` and unreachable by any
+	// sweep.
+	//
+	// Deliberately NO Suggestion and NO Input: a confirm sends the suggestion to
+	// the pane as literal text, and there is nothing to send — the operator has
+	// to look at the agent. An empty suggestion makes the row informational.
+	if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: domain.TriggerAutoSendReclaim,
+		SituationType: domain.SituationIdle,
+		Action:        domain.AuditActionTaskNeverStartedPrefix + domain.DisplayTaskText(del.taskText),
+		// Addressed by --path, not by agent: an agent can match several sources,
+		// so `hap task <agent>` need not resolve the file this item lives in.
+		Rationale: fmt.Sprintf("[%s] could not be delivered to %s %d times; left [-] so it is not resent. "+
+			"Check the agent, then `hap task --path %s undone <n>` to re-queue the item.",
+			domain.ReasonTaskNeverStarted, s.AgentID, attempts, sourcePath),
+		Status: "escalated", CreatedAt: now,
+	}); err != nil {
+		slog.Error("auto-send: undeliverable-task escalation could not be recorded; "+
+			"returning the item to [ ] so it is not stranded silently",
+			"agent", s.AgentID, "task", del.taskText, "error", err)
+		return false
+	}
+	// Forget the counter now that the operator has been told, exactly as the
+	// reclaim ceiling does: nothing can hand the item out again while it is
+	// "[-]", so the only way back is an operator releasing it — and that
+	// intervention is what the ceiling was waiting for. Keeping the count would
+	// make the first attempt after the fix escalate again.
+	if err := d.opt.Store.ClearTaskHandouts(ctx, sourcePath, del.taskText); err != nil {
+		slog.Warn("auto-send: hand-out counter could not be cleared",
+			"path", sourcePath, "task", del.taskText, "error", err)
+	}
+	slog.Warn("auto-send: task could not be delivered repeatedly; leaving it [-] and escalating",
+		"agent", s.AgentID, "path", sourcePath, "task", del.taskText, "attempts", attempts)
+	return true
 }
 
 // sameTenant reports whether a live agent is still the one a hand-out was made
@@ -492,6 +627,10 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 		if !autoSendParked(a.Status) {
 			delete(d.idleSince, a.AgentID)
 			delete(d.autoTaskClaim, a.AgentID)
+			// The agent is working (or gone): whatever its episodes were not
+			// resolving, they are resolving now. Start the next parked spell
+			// with a full budget.
+			delete(d.pollRedrive, a.AgentID)
 			continue
 		}
 		// Same pane AND same terminal means the same continuously parked
@@ -505,11 +644,19 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 			continue
 		}
 		delete(d.autoTaskClaim, a.AgentID)
+		// A new parked episode (or a recycled pane) is a fresh start for the
+		// backoff too — the budget belongs to the spell, not to the agent id.
+		delete(d.pollRedrive, a.AgentID)
 		d.idleSince[a.AgentID] = idleMark{paneID: a.PaneID, terminalID: a.TerminalID, at: now}
 	}
 	for id := range d.idleSince {
 		if _, ok := live[id]; !ok {
 			delete(d.idleSince, id)
+		}
+	}
+	for id := range d.pollRedrive {
+		if _, ok := live[id]; !ok {
+			delete(d.pollRedrive, id)
 		}
 	}
 	for id, claim := range d.autoTaskClaim {
@@ -524,7 +671,7 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 // deterministic run to run). Every gate here is a reason NOT to send; the
 // decision core re-applies its own on the pipeline path.
 func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
-	agents []domain.AgentTransition, now time.Time, driven, escalated, awaiting map[string]bool) []domain.AgentTransition {
+	agents []domain.AgentTransition, now time.Time, driven, awaiting map[string]bool) []domain.AgentTransition {
 
 	var out []domain.AgentTransition
 	for _, a := range agents {
@@ -536,6 +683,11 @@ func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
 			continue
 		}
 		if !d.idleLongEnough(a, now) {
+			continue
+		}
+		// Backing off a pane whose last episodes did not send. Not a bench: the
+		// interval widens, it never closes.
+		if d.redriveDeferred(a.AgentID, now) {
 			continue
 		}
 		if _, claimed := d.autoTaskClaimFor(a.AgentID); claimed {
@@ -558,11 +710,6 @@ func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
 			continue
 		}
 		if rate, err := d.opt.Store.GetAgentRate(ctx, a.AgentID); err != nil || rate.Paused {
-			continue
-		}
-		// An escalation still waiting on the operator IS the pending question
-		// for this agent; pushing a task under it would bury it.
-		if escalated[a.AgentID] {
 			continue
 		}
 		out = append(out, a)

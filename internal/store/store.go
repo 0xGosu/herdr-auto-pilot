@@ -1727,6 +1727,35 @@ func (s *Store) RecordTaskReservation(ctx context.Context, r domain.TaskReservat
 	return id, err
 }
 
+// RecordTaskHandoutAttempt bumps an item's attempt counter without opening a
+// reservation, for a delivery that never reached the agent.
+//
+// The counter and the reservations are separate tables precisely so this can
+// exist: a failed send rolls its "[-]" back to "[ ]" itself, leaving no row for
+// the reclaim sweep to age toward the maxTaskHandouts ceiling. Counting the
+// attempt here is what lets that same ceiling bound a pane that cannot be
+// written to at all — otherwise the item returns to the pending pool every
+// sweep and is offered again, forever.
+// It returns the item's attempt count AFTER the bump, so the caller can apply
+// the ceiling without a second, racy read.
+func (s *Store) RecordTaskHandoutAttempt(ctx context.Context, sourcePath, taskText string, at time.Time) (int, error) {
+	var attempts int
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO task_handouts (source_path, task_text, attempts, updated_at)
+			VALUES (?, ?, 1, ?)
+			ON CONFLICT(source_path, task_text)
+			DO UPDATE SET attempts = attempts + 1, updated_at = excluded.updated_at`,
+			sourcePath, taskText, unix(at)); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, `
+			SELECT attempts FROM task_handouts WHERE source_path = ? AND task_text = ?`,
+			sourcePath, taskText).Scan(&attempts)
+	})
+	return attempts, err
+}
+
 // OpenTaskReservations returns every recorded hand-out, oldest first. Rows are
 // retired by the reclaim sweep, so this stays small (one row per in-flight
 // hand-out); no LIMIT is needed and none is wanted — a dropped row would strand

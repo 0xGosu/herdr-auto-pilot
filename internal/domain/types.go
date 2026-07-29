@@ -304,6 +304,11 @@ const (
 	// an LLM could only choose TEXT TO SEND, never edit the operator's
 	// checklist. "Why is task 4 gone?" must be answerable from `hap audit`.
 	TriggerLLMTaskReview = "llm-task-review"
+	// TriggerAutoSendReclaim is the audit trigger of the rows the auto-send
+	// hand-out ledger writes — the reclaim sweep's, and the send site's when a
+	// delivery exhausts maxTaskHandouts. It marks a row as being about a
+	// hand-out rather than about what is on the agent's screen.
+	TriggerAutoSendReclaim = "auto-send-reclaim"
 )
 
 // Actions written on a TriggerLLMTaskReview audit row. Every review outcome

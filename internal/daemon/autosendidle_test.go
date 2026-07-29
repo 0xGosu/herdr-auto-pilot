@@ -76,6 +76,43 @@ func parkIdleOnTerminal(h *harness, agentID, terminalID string) []domain.AgentTr
 	return agents
 }
 
+// expireRedriveBackoff makes the poll's re-drive backoff elapse immediately, so
+// a test can drive consecutive sweeps in wall-clock milliseconds. Production
+// waits 1, 2, 4 … minutes between re-drives of an agent whose episodes are not
+// sending (Daemon.pollRedrive); tests that deliberately fail every send would
+// otherwise stall behind it. Deliberately NOT a bypass in the daemon — see
+// TestAutoSendIdleBacksOffRedrivingAnAgentThatNeverSends for the real behavior.
+func expireRedriveBackoff(h *harness, agentIDs ...string) {
+	h.daemon.mu.Lock()
+	defer h.daemon.mu.Unlock()
+	for _, id := range agentIDs {
+		if st, ok := h.daemon.pollRedrive[id]; ok {
+			st.nextAt = time.Time{}
+			h.daemon.pollRedrive[id] = st
+		}
+	}
+}
+
+// capEscalated reports whether the never-started ceiling has fired yet.
+//
+// The "[-]" mark is NOT a usable signal for this: every attempt reserves its
+// item before sending and only rolls it back afterwards, so a transient "[-]"
+// is on disk during any delivery, capped or not. Waiting on it makes a test
+// pass on attempt 1 and then assert against half-applied state.
+func capEscalated(t *testing.T, h *harness) bool {
+	t.Helper()
+	open, err := h.raw.PendingEscalations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range open {
+		if strings.HasPrefix(e.Action, domain.AuditActionTaskNeverStartedPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // setPaneInfo sets what the fake reports for `pane get` (ports.InspectorPort).
 func (f *fakeHerdr) setPaneInfo(info domain.PaneInfo) {
 	f.mu.Lock()
@@ -384,18 +421,6 @@ func TestAutoSendIdleRespectsSafetyGates(t *testing.T) {
 				}
 			},
 		},
-		{
-			name:  "escalation still open",
-			agent: "agent-as6d",
-			setup: func(t *testing.T, h *harness, agentID string) {
-				if _, err := h.raw.AppendAudit(context.Background(), domain.AuditRecord{
-					AgentID: agentID, AgentType: "claude", SituationType: domain.SituationIdle,
-					Action: "escalated", Status: "escalated", CreatedAt: time.Now(),
-				}); err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -410,6 +435,326 @@ func TestAutoSendIdleRespectsSafetyGates(t *testing.T) {
 				t.Errorf("task was reserved despite the gate:\n%s", got)
 			}
 		})
+	}
+}
+
+func TestAutoSendIdleOrdinaryEscalationDoesNotBlockHandout(t *testing.T) {
+	// The bug this pins: ANY pending escalation used to bench an agent from the
+	// idle poll, which deadlocked the feature against itself. A declared source
+	// with a pending item is exactly what raises noop_vs_pending_tasks — a
+	// learned "@noop" rule matching an idle screen while real work is queued —
+	// and that escalation then blocked the poll that would have delivered the
+	// item, silently and forever. The agent sat idle beside its own task list.
+	//
+	// An escalation is a question for the OPERATOR about what to answer on
+	// screen. It is not evidence that the agent cannot take its next declared
+	// task, so it must not stop the hand-out.
+	// The trigger matters as much as the reason. An escalation raised on the
+	// poll's OWN re-drive is stamped "auto-idle-send: <status>" (daemon.trigger
+	// reads tr.AutoIdleSend), and for an agent that parks without a further
+	// herdr event — the exact gap this feature closes — the poll is the ONLY
+	// thing raising episodes, so that is the common shape, not the rare one.
+	// Any ownership test that looks at the trigger gets this case backwards.
+	cases := []struct {
+		name    string
+		agent   string
+		trigger string
+		reason  domain.EscalateReason
+	}{
+		{"noop vs pending tasks", "agent-as6f", "agent-status: idle", domain.ReasonNoopVsPendingTasks},
+		{"noop vs pending tasks, poll-raised", "agent-as6j", "auto-idle-send: idle", domain.ReasonNoopVsPendingTasks},
+		{"task source exhausted", "agent-as6g", "agent-status: idle", domain.ReasonTaskSourceExhausted},
+		{"task source exhausted, poll-raised", "agent-as6k", "auto-idle-send: idle", domain.ReasonTaskSourceExhausted},
+		{"never-auto match", "agent-as6h", "agent-status: idle", domain.ReasonNeverAutoMatch},
+		{"never-auto match, poll-raised", "agent-as6l", "auto-idle-send: done", domain.ReasonNeverAutoMatch},
+		{"rate limited", "agent-as6m", "auto-idle-send: idle", domain.ReasonRateLimited},
+		{"llm task review row", "agent-as6i", domain.TriggerLLMTaskReview, domain.ReasonNoopVsPendingTasks},
+		{"never-started ceiling on ANOTHER task", "agent-as6n", domain.TriggerAutoSendReclaim, domain.ReasonTaskNeverStarted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, taskFile := autoSendFixture(t, tc.agent, "- [ ] queued work\n", true)
+			if _, err := h.raw.AppendAudit(context.Background(), domain.AuditRecord{
+				AgentID: tc.agent, AgentType: "claude", SituationType: domain.SituationIdle,
+				Trigger: tc.trigger, Action: "escalated", Status: "escalated",
+				Rationale: "[" + string(tc.reason) + "] pending operator question",
+				CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			agents := parkIdle(h, 2*time.Minute, tc.agent)
+
+			h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+			waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+			waitFor(t, 5*time.Second, func() bool {
+				return strings.Contains(readTasks(t, taskFile), "- [-] queued work")
+			})
+		})
+	}
+}
+
+func TestAutoSendIdleUndeliverableTaskIsCappedNotRetriedForever(t *testing.T) {
+	// The bound that replaces the old blanket escalation gate. A failed send
+	// rolls its item straight back to "[ ]" and records NO reservation
+	// (deliverAutonomousClaimed writes the ledger row only after herdr accepts
+	// the keystrokes), so reclaimStrandedTasks never sees it and its
+	// maxTaskHandouts ceiling could never fire. Without counting the attempt at
+	// the send site, a pane that cannot be written to is re-offered the same
+	// task on every sweep, forever.
+	//
+	// Below the ceiling the item must come BACK to "[ ]" — a transient herdr
+	// failure must not strand work that another agent could take.
+	h, taskFile := autoSendFixture(t, "agent-as14c", "- [ ] unsendable\n", true)
+	h.herdr.setFailSend(true)
+	agents := parkIdle(h, 2*time.Minute, "agent-as14c")
+	ctx := context.Background()
+
+	// Below the ceiling: the failure escalates and the item comes BACK to "[ ]".
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 5*time.Second, func() bool { return auditFor(t, h, "agent-as14c", "escalated") })
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [ ] unsendable") {
+		t.Fatalf("a single failed delivery must return the task to [ ] for another agent:\n%s", got)
+	}
+
+	// Keep sweeping until the ceiling fires. Re-driving is asynchronous and a
+	// failed send produces no sentInputs() to synchronize on, so the sweep is
+	// driven from inside the wait rather than counted from outside. The wait
+	// keys off the ESCALATION, not the "[-]" mark: every attempt reserves the
+	// item before sending, so a transient "[-]" is visible mid-flight on runs
+	// that are nowhere near the cap.
+	capped := func() bool {
+		open, err := h.raw.PendingEscalations(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range open {
+			if strings.HasPrefix(e.Action, domain.AuditActionTaskNeverStartedPrefix) {
+				return true
+			}
+		}
+		return false
+	}
+	waitFor(t, 20*time.Second, func() bool {
+		expireRedriveBackoff(h, "agent-as14c")
+		h.daemon.autoSendIdleTasks(ctx, agents)
+		return capped()
+	})
+	if !capped() {
+		t.Fatalf("the ceiling never fired; the task is still being re-offered every sweep:\n%s",
+			readTasks(t, taskFile))
+	}
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [-] unsendable") {
+		t.Errorf("a capped task must be LEFT [-] so it drops out of the pending pool:\n%s", got)
+	}
+	if n := len(h.herdr.sentInputs()); n != 0 {
+		t.Errorf("no delivery ever succeeded, yet %d sends were recorded", n)
+	}
+
+	// And it is out of the pending pool for good: even with a working send, the
+	// next sweep has nothing to offer.
+	h.herdr.setFailSend(false)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+
+	quietFor(t, h, 300*time.Millisecond)
+	if n := len(h.herdr.sentInputs()); n != 0 {
+		t.Errorf("the capped task was offered again (%d sends): the loop is unbounded", n)
+	}
+}
+
+func TestAutoSendIdleEscalatedAgentStillGetsItsNextTask(t *testing.T) {
+	// The end-to-end shape of the bug, driven through the real failure path
+	// rather than a hand-written audit row: a delivery fails, which escalates
+	// for THIS agent, and the very next sweep must still hand it work. Before
+	// the fix that escalation benched the agent permanently — the send never
+	// recovered even once herdr was healthy again.
+	h, taskFile := autoSendFixture(t, "agent-as14d", "- [ ] first\n", true)
+	h.herdr.setFailSend(true)
+	agents := parkIdle(h, 2*time.Minute, "agent-as14d")
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+	waitFor(t, 5*time.Second, func() bool { return auditFor(t, h, "agent-as14d", "escalated") })
+	waitFor(t, 5*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [ ] first")
+	})
+
+	h.herdr.setFailSend(false)
+	// In production the next re-drive is a minute out, not blocked — the point
+	// here is that nothing BENCHES the agent, so it recovers on its own.
+	expireRedriveBackoff(h, "agent-as14d")
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	waitFor(t, 5*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] first")
+	})
+}
+
+func TestAutoSendIdleBacksOffRedrivingAnAgentThatNeverSends(t *testing.T) {
+	// Removing the escalation gate left the poll re-driving a parked agent on
+	// EVERY sweep, including one whose episodes never send — a pane read and an
+	// `ignored` audit row a minute, forever, in a table nothing prunes. The
+	// backoff widens that interval instead of closing it, so recovery is only
+	// delayed, never prevented.
+	h, _ := autoSendFixture(t, "agent-as6z", "- [ ] queued work\n", true)
+	h.herdr.setFailSend(true)
+	agents := parkIdle(h, 2*time.Minute, "agent-as6z")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 5*time.Second, func() bool { return auditFor(t, h, "agent-as6z", "escalated") })
+
+	// Immediately after, the same agent is deferred rather than re-driven.
+	if !h.daemon.redriveDeferred("agent-as6z", h.daemon.opt.Clock.Now()) {
+		t.Fatal("a no-send episode did not arm the re-drive backoff")
+	}
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	quietFor(t, h, 300*time.Millisecond)
+
+	// It is a delay, not a bench: once the interval elapses the poll drives it
+	// again, and a working send is picked up.
+	expireRedriveBackoff(h, "agent-as6z")
+	h.herdr.setFailSend(false)
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+
+	// And a delivery restores the full budget, so the next parked spell is not
+	// serving a sentence earned earlier.
+	if h.daemon.redriveDeferred("agent-as6z", h.daemon.opt.Clock.Now()) {
+		t.Error("a successful delivery did not clear the re-drive backoff")
+	}
+}
+
+func TestAutoSendIdleCapsAtExactlyMaxHandouts(t *testing.T) {
+	// Pins the COUNT, which the loop-until-capped test cannot: it drives sweeps
+	// from inside a wait, so "capped after 3" and "capped after 300" look the
+	// same to it. A double-bump per sweep, or an off-by-one in the ceiling,
+	// passes there and fails here.
+	h, taskFile := autoSendFixture(t, "agent-as6y", "- [ ] unsendable\n", true)
+	h.herdr.setFailSend(true)
+	agents := parkIdle(h, 2*time.Minute, "agent-as6y")
+	ctx := context.Background()
+	sourcePath := canonicalTaskPath(taskFile)
+
+	// Attempts below the ceiling: the counter advances by exactly one each time
+	// and the item is returned to "[ ]". Both are waited on together, because the
+	// counter is bumped BEFORE the rollback runs.
+	for attempt := 1; attempt < maxTaskHandouts; attempt++ {
+		expireRedriveBackoff(h, "agent-as6y")
+		h.daemon.autoSendIdleTasks(ctx, agents)
+		want := attempt
+		waitFor(t, 5*time.Second, func() bool {
+			n, err := h.raw.TaskHandoutAttempts(ctx, sourcePath, "unsendable")
+			return err == nil && n == want &&
+				strings.Contains(readTasks(t, taskFile), "- [ ] unsendable")
+		})
+		n, err := h.raw.TaskHandoutAttempts(ctx, sourcePath, "unsendable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != attempt {
+			t.Fatalf("after %d failed sends the counter is %d, want %d", attempt, n, attempt)
+		}
+		// The other half of "exactly": it must not cap EARLY.
+		if capEscalated(t, h) {
+			t.Fatalf("the ceiling fired after %d failed sends; the cap is %d", attempt, maxTaskHandouts)
+		}
+	}
+
+	// The maxTaskHandouts'th failure is the one that caps. Keyed off the
+	// escalation, never the "[-]" mark — see capEscalated.
+	expireRedriveBackoff(h, "agent-as6y")
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 5*time.Second, func() bool {
+		if !capEscalated(t, h) {
+			return false
+		}
+		// The counter is forgotten with the escalation, so an operator releasing
+		// the item starts from zero rather than re-escalating on the first retry.
+		n, err := h.raw.TaskHandoutAttempts(ctx, sourcePath, "unsendable")
+		return err == nil && n == 0
+	})
+	if !capEscalated(t, h) {
+		t.Fatalf("the ceiling did not fire on attempt %d", maxTaskHandouts)
+	}
+	if n, err := h.raw.TaskHandoutAttempts(ctx, sourcePath, "unsendable"); err != nil || n != 0 {
+		t.Errorf("counter after capping = %d (err %v), want 0", n, err)
+	}
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [-] unsendable") {
+		t.Errorf("a capped task must be LEFT [-] so it drops out of the pending pool:\n%s", got)
+	}
+}
+
+func TestAutoSendIdleCappedTaskLetsTheAgentMoveToTheNextItem(t *testing.T) {
+	// The user-facing half of the per-ITEM bound: capping one task must not
+	// bench its agent. A per-agent bound would leave the whole list stalled
+	// behind one bad item, which is the failure this change exists to remove.
+	h, taskFile := autoSendFixture(t, "agent-as6x", "- [ ] poison\n- [ ] good work\n", true)
+	h.herdr.setFailSend(true)
+	agents := parkIdle(h, 2*time.Minute, "agent-as6x")
+	ctx := context.Background()
+
+	waitFor(t, 20*time.Second, func() bool {
+		expireRedriveBackoff(h, "agent-as6x")
+		h.daemon.autoSendIdleTasks(ctx, agents)
+		return capEscalated(t, h)
+	})
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [-] poison") {
+		t.Fatalf("the capped item was not left [-]:\n%s", got)
+	}
+
+	// herdr recovers: the SECOND item is delivered to the same agent. The sweep
+	// is driven from inside the wait because the capping episode is still
+	// unwinding — an agent with a capture in flight is skipped, so a single
+	// call here would race it.
+	h.herdr.setFailSend(false)
+	waitFor(t, 10*time.Second, func() bool {
+		expireRedriveBackoff(h, "agent-as6x")
+		h.daemon.autoSendIdleTasks(ctx, agents)
+		return len(h.herdr.sentInputs()) == 1
+	})
+	if got := h.herdr.sentInputs()[0]; !strings.Contains(got, "good work") {
+		t.Errorf("after capping one item the agent got %q, want the NEXT pending task", got)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [-] good work")
+	})
+}
+
+func TestAutoSendIdleNonReservingSourceCountsNoHandouts(t *testing.T) {
+	// The ceiling is scoped to sources that RESERVE (enable_auto_send_task_when_idle).
+	// A source that does not reserve marks nothing, so there is no hand-out to
+	// count and nothing that could be left "[-]" — dropping the reservedIndex
+	// guard would silently start capping tasks hap never claimed.
+	h, taskFile := autoSendFixture(t, "agent-as6w", "- [ ] not reserved\n", false)
+	h.herdr.setFailSend(true)
+	agents := parkIdle(h, 2*time.Minute, "agent-as6w")
+	ctx := context.Background()
+
+	for range maxTaskHandouts + 1 {
+		expireRedriveBackoff(h, "agent-as6w")
+		h.daemon.autoSendIdleTasks(ctx, agents)
+		quietFor(t, h, 100*time.Millisecond)
+	}
+
+	if n, err := h.raw.TaskHandoutAttempts(ctx, canonicalTaskPath(taskFile), "not reserved"); err != nil || n != 0 {
+		t.Errorf("a non-reserving source recorded %d hand-out attempts (err %v), want 0", n, err)
+	}
+	if got := readTasks(t, taskFile); strings.Contains(got, "[-]") {
+		t.Errorf("a non-reserving source must never mark an item:\n%s", got)
+	}
+}
+
+func TestPollRedriveDelayWidensAndCaps(t *testing.T) {
+	// 1, 2, 4, 8 … minutes, capped. The first step is the sweep interval itself,
+	// so an agent whose episodes resolve normally is never actually delayed.
+	for n, want := range map[int]time.Duration{
+		1: time.Minute, 2: 2 * time.Minute, 3: 4 * time.Minute, 4: 8 * time.Minute,
+		5: maxPollRedriveBackoff, 6: maxPollRedriveBackoff, 50: maxPollRedriveBackoff,
+	} {
+		if got := pollRedriveDelay(n); got != want {
+			t.Errorf("pollRedriveDelay(%d) = %v, want %v", n, got, want)
+		}
 	}
 }
 
@@ -743,10 +1088,10 @@ func TestAutoSendIdleReleasesClaimWhenSendFails(t *testing.T) {
 	// with it, or the item stays promised to an agent that never got it and no
 	// one else may take it until the claim's TTL expires.
 	//
-	// The agent whose send failed is deliberately NOT retried: the failure
-	// raised an escalation, and the poll never pushes work onto an agent with a
-	// question still waiting on the operator. Releasing the claim is what makes
-	// the task available to a DIFFERENT idle agent, which is what this asserts.
+	// Releasing the claim is what makes the task available to a DIFFERENT idle
+	// agent, which is what this asserts. The agent whose send failed is not
+	// singled out — an escalation no longer benches anyone — it simply loses the
+	// deterministic pairing to the longer-idle agent on the next sweep.
 	h, taskFile := autoSendFixture(t, "", "- [ ] step two\n", true)
 	h.herdr.setFailSend(true)
 	// The longer-idle agent sorts first, so the deterministic pairing gives it
@@ -770,12 +1115,14 @@ func TestAutoSendIdleReleasesClaimWhenSendFails(t *testing.T) {
 		t.Fatal("the pairing outlived the failed delivery")
 	}
 
-	// Next sweep with a working send: the released task reaches the OTHER agent
-	// rather than sitting unofferable behind a dead pairing.
+	// Next sweep with a working send: the released task is delivered rather than
+	// sitting unofferable behind a dead pairing. WHICH agent gets it is not the
+	// point and is deliberately not asserted — an escalation no longer benches
+	// anyone, so the longer-idle agent-as14a is a legitimate winner again.
 	h.herdr.setFailSend(false)
 	h.daemon.autoSendIdleTasks(context.Background(), agents)
 
-	waitFor(t, 5*time.Second, func() bool { return auditFor(t, h, "agent-as14b", "auto") })
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
 	waitFor(t, 3*time.Second, func() bool {
 		return strings.Contains(readTasks(t, taskFile), "- [-] step two")
 	})
