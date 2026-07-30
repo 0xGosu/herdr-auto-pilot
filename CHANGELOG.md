@@ -5,6 +5,11 @@ section in `CLAUDE.md`. Entries go under the version that will carry them: mergi
 to main auto-releases the next patch, so a PR adds its lines under that number
 (or under the minor/major version it bumps the manifest to).
 
+## 0.5.16
+
+- Fixed `scripts/setup-native.sh` dropping `sudo` when only part of the install prefix was writable, which failed the build with `Permission denied` on `apt-get` and on `/usr/local/include/faiss`. It now keeps `sudo` unless BOTH `lib` and `include` are writable, and always uses it for the package manager, which needs real root regardless
+- Changed CI to check formatting in its own job, so a `gofmt` slip is reported in seconds rather than behind a two-minute native build
+
 ## 0.5.14
 
 - Changed the daemon to raise its herdr notifications over the socket API instead of the `herdr notification show` CLI, so it now learns whether a toast was actually displayed. The CLI exits 0 even when herdr paints nothing, which meant an escalation could be dropped — notifications turned off, rate limited, no foreground client — with the daemon assuming the operator had been told

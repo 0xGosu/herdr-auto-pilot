@@ -26,8 +26,26 @@ CACHE="${HAP_NATIVE_CACHE:-${REPO_ROOT}/.cache/native}"
 PREFIX="${HAP_NATIVE_PREFIX:-/usr/local}"
 JOBS="${HAP_NATIVE_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
 
+# Two different privilege questions, and conflating them broke CI.
+#
+# SUDO covers writing into ${PREFIX}. Dropping it needs BOTH install targets
+# writable, not just lib: this script writes ${PREFIX}/lib AND
+# ${PREFIX}/include/faiss, and GitHub's ubuntu runner image is exactly the
+# shape that tells them apart — /usr/local/lib is writable by the runner user
+# while /usr/local/include is not. Probing lib alone blanked SUDO and the run
+# then died at `mkdir ${PREFIX}/include/faiss: Permission denied`.
 SUDO="sudo"
-if [ -w "${PREFIX}/lib" ] || [ "$(id -u)" = "0" ]; then SUDO=""; fi
+if [ "$(id -u)" = "0" ]; then
+  SUDO=""
+elif [ -w "${PREFIX}/lib" ] && [ -w "${PREFIX}/include" ]; then
+  SUDO=""
+fi
+
+# APT_SUDO covers the package manager, which always needs real root no matter
+# who owns ${PREFIX}. Reusing SUDO here meant a writable prefix silently ran
+# `apt-get update` unprivileged, failing on /var/lib/apt/lists/lock.
+APT_SUDO=""
+if [ "$(id -u)" != "0" ]; then APT_SUDO="sudo"; fi
 
 OS="$(uname -s)"
 case "$OS" in
@@ -42,14 +60,14 @@ FAISS_CMAKE_ENV=()
 if [ "$OS" = "Linux" ]; then
   if ! ldconfig -p 2>/dev/null | grep -q libopenblas && command -v apt-get >/dev/null 2>&1; then
     echo "==> installing libopenblas-dev (FAISS BLAS backend)"
-    $SUDO apt-get update -qq && $SUDO apt-get install -y -qq libopenblas-dev
+    $APT_SUDO apt-get update -qq && $APT_SUDO apt-get install -y -qq libopenblas-dev
   fi
   # Both builds below shell out to cmake; without this the script dies ~100
   # lines later with a bare "cmake: command not found" and no hint that a
   # prerequisite is missing.
   if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
     echo "==> installing cmake (llama.cpp + FAISS build driver)"
-    $SUDO apt-get update -qq && $SUDO apt-get install -y -qq cmake
+    $APT_SUDO apt-get update -qq && $APT_SUDO apt-get install -y -qq cmake
   fi
 elif [ "$OS" = "Darwin" ]; then
   command -v brew >/dev/null 2>&1 || { echo "Homebrew is required on macOS (for LLVM/OpenMP)" >&2; exit 1; }
