@@ -13,8 +13,33 @@ env:
   GO_BUILD_TAGS: vectors cpu
 
 jobs:
+  # gofmt is pure text: it neither builds nor typechecks, so it needs no
+  # submodules, no CGO toolchain and no native libraries. Split out of the lint
+  # job so a formatting mistake is reported in seconds instead of waiting on
+  # (and being maskable by) a ~2min FAISS/llama build.
+  format:
+    name: Format (gofmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l . | grep -v '^submodule/' || true)
+          if [ -n "$out" ]; then
+            echo "gofmt violations:" && echo "$out" && exit 1
+          fi
+
+  # go vet and golangci-lint DO need the native build: both typecheck the cgo
+  # packages, and the FAISS headers they need (${PREFIX}/include/faiss) are put
+  # there by setup-native.sh. Dropping the build tags to avoid it would stop
+  # linting engine_cpu.go, knn_vectors.go and the rest of the tag-gated files —
+  # the CGO code most worth linting.
   lint:
-    name: Lint (gofmt, go vet, golangci-lint)
+    name: Lint (go vet, golangci-lint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,12 +68,6 @@ jobs:
           key: native-lint-${{ runner.os }}-${{ env.ImageOS }}-${{ hashFiles('scripts/setup-native.sh') }}-${{ steps.subsha.outputs.sha }}
       - name: Build native dependencies
         run: bash scripts/setup-native.sh
-      - name: gofmt
-        run: |
-          out=$(gofmt -l . | grep -v '^submodule/' || true)
-          if [ -n "$out" ]; then
-            echo "gofmt violations:" && echo "$out" && exit 1
-          fi
       - name: go vet
         run: go vet -tags "${GO_BUILD_TAGS}" ./...
       - name: golangci-lint
