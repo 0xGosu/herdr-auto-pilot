@@ -62,6 +62,14 @@ type App struct {
 	// Tests inject it so no test ever opens a network connection.
 	FetchLatestVersion func(ctx context.Context) (string, error)
 
+	// TUISessions polices how many `hap tui` processes run at once (see
+	// EnforceTUISessionLimit). nil for every front-end that is not a TUI, and
+	// for a TUI that could not register itself — both simply do not enforce.
+	TUISessions TUISessionLimiter
+
+	// tuiLimit throttles the instance-limit sweep.
+	tuiLimit tuiLimitState
+
 	// cwdMu/cwdCache memoize pane working directories for FillAgentCwds.
 	// Without this, the TUI's 2s refresh would spawn one `herdr pane get` per
 	// agent per tick; the daemon caches its own lookups for the same reason. A
@@ -1562,6 +1570,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.terminal_bell", TUIEditable: true},
 	{Key: "tui.herdr_notification", TUIEditable: true},
 	{Key: "tui.disable_check_for_update", TUIEditable: true},
+	{Key: "tui.max_instances", TUIEditable: true},
 	{Key: "cli.ai_agent_friendly_output", TUIEditable: true},
 }
 
@@ -1764,6 +1773,11 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.FormatBool(cfg.TUI.HerdrNotification)
 	case "tui.disable_check_for_update":
 		return strconv.FormatBool(cfg.TUI.DisableCheckForUpdate)
+	case "tui.max_instances":
+		if cfg.TUI.MaxInstances <= 0 {
+			return "0 (no limit)"
+		}
+		return strconv.Itoa(cfg.TUI.MaxInstances)
 	case "cli.ai_agent_friendly_output":
 		return strconv.FormatBool(cfg.CLI.AIAgentFriendlyOutput)
 	}
@@ -2034,6 +2048,15 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("tui.disable_check_for_update must be true or false, got %q", value)
 			}
 			cfg.TUI.DisableCheckForUpdate = v
+			return nil
+		case "tui.max_instances":
+			// 0 is "no limit" here, not "restore the default" — the default
+			// only applies to a config that never mentions the key.
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("tui.max_instances must be a non-negative integer (0 = no limit), got %q", value)
+			}
+			cfg.TUI.MaxInstances = v
 			return nil
 		case "cli.ai_agent_friendly_output":
 			v, err := strconv.ParseBool(value)

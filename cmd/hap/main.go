@@ -33,6 +33,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/tui"
+	"github.com/0xGosu/herdr-auto-pilot/internal/tuisession"
 )
 
 func main() {
@@ -182,6 +183,17 @@ func run(verb string, args []string) error {
 		defer drainSubmitRetries(app)
 		if _, err := logging.Setup(paths.StateDir, false); err != nil {
 			return err
+		}
+		// Join the TUI registry so this instance is counted, and so it can
+		// close the older ones (`[tui] max_instances`; the first refresh
+		// sweeps). Failing to register only costs the limit — never the TUI —
+		// so it is logged, not returned.
+		session, err := tuisession.Register(paths.StateDir)
+		if err != nil {
+			slog.Warn("TUI instance limit disabled for this run", "error", err)
+		} else {
+			defer session.Release()
+			app.TUISessions = session
 		}
 		return tui.Run(ctx, app)
 	default:

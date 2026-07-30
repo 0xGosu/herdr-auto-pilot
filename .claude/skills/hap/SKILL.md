@@ -418,6 +418,7 @@ per-command env notes: layering is daemon env → `env_file` → `env` → the c
 | `tui.terminal_bell` | true | ring the terminal bell (\a) on new escalations and on pauses caused by a different process; also the fallback when a herdr notification is not displayed |
 | `tui.herdr_notification` | true | raise a herdr desktop notification on those same two events, when the TUI runs as a herdr-managed pane |
 | `tui.disable_check_for_update` | false | turn off the GitHub release check (at most every 6h, TUI only) that puts `↑ vX.Y.Z available` in the header. it is the plugin's ONLY outbound network call; a locally built (`plugin link`) binary never checks |
+| `tui.max_instances` | 1 | how many `hap tui` processes may run at once. starting one closes the OLDEST past this cap (SIGTERM — a clean exit), because each instance re-polls the whole state every 2s and shells out to herdr per agent. `0` = no limit; a lowered cap applies within 10s without restarting anything |
 
 TUI palette colors (`tui.palette.*`) are config.toml-only — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. values are 256-color codes (`"205"`) or hex (`"#ff5faf"`).
 

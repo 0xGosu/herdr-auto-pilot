@@ -359,6 +359,7 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
 | `internal/store` | SQLite persistence (WAL; `context_json` is an opaque blob) |
 | `internal/taskfile` | advisory file lock behind every checklist read-modify-write |
 | `internal/selfpath` | resolves a live `hap` binary (an upgrade unlinks the running one) |
+| `internal/tuisession` | flock registry of live `hap tui` processes; closes the oldest past `[tui] max_instances` |
 | `internal/updatecheck` | GitHub release check — the ONLY `net/http` importer (NFR-007 allowlist) |
 | `internal/fakeherdr`, `e2e_harness/` | test fakes and the e2e driver |
 | `docs/architect/herd-auto-prompter-architecture.md` | consolidated architecture doc (FR-xxx / NFR-xxx ids used in comments) |

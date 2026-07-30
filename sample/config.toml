@@ -291,6 +291,12 @@ herdr_notification = true  # raise a herdr desktop notification on those same tw
 disable_check_for_update = false  # turn off the periodic GitHub release check — the
                            # plugin's only outbound call; the header flags a newer
                            # release, install it with `hap update`
+max_instances = 1          # how many `hap tui` processes may run at once. Each one
+                           # re-polls the whole state every 2s and shells out to
+                           # herdr per agent, so forgotten TUI panes cost real CPU
+                           # while only one is ever read. Starting a TUI closes the
+                           # OLDEST ones past this limit (SIGTERM — the same clean
+                           # exit as closing the pane). 0 = no limit
 
 # Optional per-role color overrides layered on the selected theme; unset
 # roles inherit the theme. Values are terminal colors ("205", "#ff5faf").
