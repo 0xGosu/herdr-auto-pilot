@@ -253,6 +253,19 @@ disabled = false
 model_path = ""             # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
 similarity_threshold = 0.90 # min cosine to reuse a learned rule; outside (0,1) resets to 0.90
 bm25_min_score = 0.35       # text-fallback floor when the model is unavailable, (0,1]
+# min_salient_chars is the length below which a situation is matched by BM25
+# text search INSTEAD of embedding, measured on the masked salient. Sentence
+# embeddings are not discriminative on a handful of generic tokens: any two
+# near-empty screens land above similarity_threshold, so one almost-empty
+# learned rule ends up silently answering every unrelated situation. The floor
+# applies to BOTH sides — a short situation is not embedded, a short rule is
+# stored without a vector, and an existing short rule is dropped from vector
+# search at the next daemon start — so such a rule stays reachable by text
+# matching and exact hash only. Rules keyed on a permission verb and its options
+# (approvals, choices, errors) are EXEMPT at any length: they are short by
+# construction and are distilled identities, not near-empty screens.
+# Omit or 0 → built-in default (100).
+min_salient_chars = 0
 # Input is token-truncated below the model's position limit before embedding.
 # 0 uses the bundled MiniLM default (512); positive values below 256 are
 # clamped to 256. NEVER set this above the real limit of model_path: an

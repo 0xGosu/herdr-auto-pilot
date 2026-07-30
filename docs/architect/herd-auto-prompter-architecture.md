@@ -457,6 +457,18 @@ situation against past decisions (`domain.ComputeSignatureN`). It retains:
 - **Masked volatile tokens** — absolute paths, hashes, line numbers, timestamps,
   UUIDs, and similar spans become typed placeholders, so prompts differing only
   in volatile tokens collapse to one signature.
+- **Redacted agent-TUI chrome** *(pane-tail salients only, gated on agent type)* —
+  for `claude`, `domain.StripClaudeChrome` deletes the startup banner, the
+  horizontal rules, the live spinner/token-counter line, the permission-mode
+  footer, herdr's status bar, and the trailing composer line; for `codex`,
+  `domain.StripCodexComposer` deletes the composer (applied earlier, in
+  `Classify`). Chrome is byte-identical across unrelated panes, so leaving it in
+  both inflates similarity between different screens and consumes the
+  `pane_salient_chars` window that should hold what the agent said. The strip
+  runs BEFORE the window is taken, and only ever deletes lines it can positively
+  identify — an unrecognized line is kept, so two different screens stay
+  different. A pane that is nothing but chrome now trips the over-masking floor
+  and escalates, instead of minting a degenerate rule.
 
 `SignatureResult.Raw` is the never-remapped literal content hash; `.Signature`
 is the (possibly remapped) learning key; `.Salient` is the masked salient text.
@@ -484,6 +496,23 @@ fallback chain (each step stamps a `match_method` recorded in the audit log):
    (default **0.90**) remaps onto the learned key (`cosine`). Approvals
    additionally require compatible option sets (`ApprovalRemapCompatible`,
    issue #155) so a shared verb can't merge different screens.
+   **Short PANE-TAIL salients never reach this step, on either side.** Below
+   `embedding.min_salient_chars` (default **100**, measured on the masked
+   salient — `domain.EmbeddableSalient`) an embedding is not discriminative:
+   any two near-empty screens land above the threshold, so one almost-empty
+   learned rule silently answers every unrelated situation. The floor is
+   enforced three times so it cannot be reached from either direction — the
+   incoming situation skips the embed call, a newly minted short rule is
+   persisted with no vector, and an existing short rule is stripped of its
+   vector by `reembed.Reconcile` (at every daemon start and `[embedding]`
+   reload, which is what heals an existing database with no migration) and
+   vetoed again as a search candidate. Such a rule stays reachable by BM25 and
+   by exact hash; only cosine is closed to it. **Structured salients are exempt
+   at any length** — they are short by construction
+   (`permission:proceed | options:no;yes` is 35 characters), so a length floor
+   over them would disable cosine paraphrase matching for approvals, choices and
+   errors; they are distilled identities already guarded by
+   `ApprovalRemapCompatible` and `StructuredSalient`.
 4. **BM25 text fallback** — when no embedding is available (embedder degraded,
    errored, or a `!vectors` build), normalized-BM25 text match at score ≥
    `bm25_min_score` (default **0.35**) remaps (`bm25`).
@@ -732,7 +761,7 @@ fixed daemon constants), `safety` (never-auto patterns + rules, the global seed
 toggle, and `disabled_seed_patterns` for silencing one seed rule by id),
 classifier manifests, `capture_delay`, `task_sources` (+ generate command),
 `embedding` (model_path, similarity/BM25 thresholds, context window, stall
-guards, `pane_salient_chars`, disabled — embedding is CPU-only; `gpu_layers` is
+guards, `min_salient_chars`, `pane_salient_chars`, disabled — embedding is CPU-only; `gpu_layers` is
 warned-and-ignored), `llm` (argv templates + timeouts, per-command env/env_file,
 optional rewrite-action review), `cli` (`ai_agent_friendly_output`), and `tui`
 (theme, palette, `max_content_width`/`height`, `terminal_bell`,

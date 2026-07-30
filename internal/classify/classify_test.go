@@ -20,6 +20,7 @@ func TestGoldenTranscripts(t *testing.T) {
 
 	statusFor := map[string]string{
 		"idle_finished.txt":              "idle",
+		"idle_claude_chrome.txt":         "idle",
 		"codex_idle.txt":                 "idle",
 		"approval_codex_plan.txt":        "idle",
 		"error_codex_rate_limit.txt":     "idle",
@@ -661,5 +662,37 @@ func TestCodexComposerStrippedOnlyForCodex(t *testing.T) {
 				t.Error("expected codex and claude content to differ after gating")
 			}
 		})
+	}
+}
+
+// TestIdleClaudeChromeIsRedactedFromSignature is the end-to-end regression for
+// the near-empty-rule magnet: a real captured Claude idle pane must contribute
+// only what the agent SAID to its signature. The banner, rules, status bar,
+// mode line and composer are identical on every Claude pane, so leaving them in
+// made unrelated screens embed alike (reported as cosine 0.91) and crowded the
+// agent's own output out of the salient window.
+func TestIdleClaudeChromeIsRedactedFromSignature(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "idle_claude_chrome.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(nil).Classify("claude", "idle", string(data))
+	sig := domain.ComputeSignature(s)
+	if sig.Verdict != domain.GuardOK {
+		t.Fatalf("verdict = %v, want ok (salient %q)", sig.Verdict, sig.Salient)
+	}
+
+	for _, chrome := range []string{"❯", "───", "workspace", "INSERT", "accept edits", "Claude Code v"} {
+		if strings.Contains(sig.Salient, chrome) {
+			t.Errorf("chrome %q reached the signature salient: %q", chrome, sig.Salient)
+		}
+	}
+	if !strings.Contains(sig.Salient, "Rebased the branch onto main") {
+		t.Errorf("the agent's own output must survive; salient = %q", sig.Salient)
+	}
+	// The pane is 13 lines of which 8 are chrome: without the strip the salient
+	// is dominated by furniture rather than by the sentence that identifies it.
+	if strings.Contains(sig.Salient, "focus") {
+		t.Errorf("status bar reached the salient: %q", sig.Salient)
 	}
 }

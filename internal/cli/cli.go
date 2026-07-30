@@ -244,8 +244,16 @@ func signaturesReembed(ctx context.Context, app *frontend.App, out io.Writer, ar
 	}
 	fmt.Fprintf(out, "re-embedded %d, kept %d, downgraded %d (text-only) — model %s\n",
 		res.Reembedded, res.Kept, res.Downgraded, drift.ModelID)
+	if res.TooShort > 0 {
+		// Say what was excluded rather than letting it vanish between the
+		// counts: these rules are matched by text and exact hash from now on.
+		fmt.Fprintf(out, "%d rule(s) below `embedding.min_salient_chars` excluded from similarity search (text matching only)\n",
+			res.TooShort)
+	}
 	if res.PersistFailed > 0 {
-		fmt.Fprintf(out, "WARNING: %d re-embedded row(s) failed to persist and stay stale — re-run: hap signatures reembed\n",
+		// Covers both passes: a row re-embedded under the live model and a
+		// below-floor row cleared of its vector can each fail to persist.
+		fmt.Fprintf(out, "WARNING: %d row(s) failed to persist and stay stale — re-run: hap signatures reembed\n",
 			res.PersistFailed)
 	}
 	PrintNextSteps(out, []Hint{

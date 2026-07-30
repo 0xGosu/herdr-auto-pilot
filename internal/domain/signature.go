@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // GuardVerdict is the signature-guard outcome (FR-003a).
@@ -67,6 +68,51 @@ const overMaskMaxRatio = 0.6
 // content (CJK, box-drawing, code) can approach ~1 token/char, so 500 chars
 // stays clear of 512 even before the embedder's own truncation guard.
 const DefaultPaneSalientChars = 500
+
+// DefaultMinSalientChars is the floor below which a salient is matched by BM25
+// text search instead of embedding similarity. Operators can move it via
+// embedding.min_salient_chars.
+//
+// Sentence embeddings are not discriminative at this length: a handful of
+// generic tokens smears into a vector that sits above the 0.90 default
+// similarity_threshold from almost any other short string, so ONE near-empty
+// learned rule becomes a magnet that silently answers every unrelated screen.
+// BM25 does not have that failure mode — it scores on terms the two texts
+// actually share, so a short text matches only another short text made of the
+// same words.
+const DefaultMinSalientChars = 100
+
+// EmbeddableSalient reports whether a MASKED salient may be matched by
+// embedding similarity (see DefaultMinSalientChars). It is the single
+// definition of the floor, applied on BOTH sides of every comparison: the
+// incoming situation skips the embed call, a newly learned rule is stored with
+// no vector, and a stored rule below the floor is excluded from vector search —
+// cleared of its vector by reembed.Reconcile and vetoed again as a search
+// candidate. A salient below the floor can therefore never appear on either end
+// of a cosine match. minChars <= 0 uses the default.
+//
+// The floor applies ONLY to pane-tail salients — raw screen text, where a
+// near-empty capture really is indistinguishable from any other. A STRUCTURED
+// salient (approval verb + options, choice options, error summary) is exempt at
+// any length, and that exemption is load-bearing rather than a convenience:
+// those salients are short BY CONSTRUCTION ("permission:proceed | options:no;yes"
+// is 35 characters), so a length floor would switch cosine matching off for
+// approvals, choices and errors — the paraphrase matching the whole feature
+// exists for. They are already distilled identities and are guarded on their own
+// terms: ApprovalRemapCompatible requires overlapping option sets before any
+// approval remap (issue #155), and StructuredSalient keeps them on exact
+// matching wherever similarity would be too coarse. The reported failure — one
+// almost-empty rule answering every unrelated screen — was a pane-tail rule, and
+// that is what this closes.
+func EmbeddableSalient(salient string, minChars int) bool {
+	if StructuredSalient(salient) {
+		return true
+	}
+	if minChars <= 0 {
+		minChars = DefaultMinSalientChars
+	}
+	return utf8.RuneCountInString(salient) >= minChars
+}
 
 // MatchMethod identifies how a situation's signature was resolved to its
 // learning key (FR-003), so an escalation can explain WHY it matched a rule.
@@ -351,6 +397,14 @@ func salientContent(s Situation, salientChars int) string {
 		salientChars = DefaultPaneSalientChars
 	}
 	content := s.Content
+	// Redact the agent TUI's own furniture BEFORE the window is taken, so the
+	// chrome cannot spend the budget that should hold what the agent said. Only
+	// this pane-tail branch needs it: the structured branches above return a
+	// distilled identity that never contained chrome. See StripClaudeChrome for
+	// why this must stay gated on the agent type.
+	if strings.EqualFold(s.AgentType, "claude") {
+		content = StripClaudeChrome(content)
+	}
 	// Trailing salientChars characters (rune-aware, so a multibyte glyph is
 	// never split at the window boundary — matches the "chars" naming).
 	if r := []rune(content); len(r) > salientChars {

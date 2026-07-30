@@ -763,11 +763,39 @@ func (s *Store) CountSignatureEmbeddings(ctx context.Context) (int64, error) {
 // CountStaleSignatureEmbeddings counts semantic identity rows whose vector
 // was not produced by the given model — including text-only rows (no
 // vector) — i.e. rows a re-embed pass would rewrite.
-func (s *Store) CountStaleSignatureEmbeddings(ctx context.Context, model string) (int64, error) {
+//
+// Rows below the embedding floor are NOT stale: being vectorless is their
+// intended terminal state, not a failure to retry (see domain.EmbeddableSalient
+// — they are excluded from vector search on purpose). Counting them would leave
+// `hap status` reporting embedding drift forever, with `hap signatures reembed`
+// unable to clear it. minSalientChars <= 0 uses domain.DefaultMinSalientChars.
+//
+// The predicate MIRRORS domain.EmbeddableSalient and must be kept in step with
+// it: a STRUCTURED salient is exempt from the floor at any length (they are
+// short by construction), so the prefixes below track
+// domain.StructuredSalient's markers. SQLite's length() counts characters on a
+// TEXT value, matching the rune-based floor.
+//
+// GLOB, not LIKE: SQLite's LIKE is case-INSENSITIVE for ASCII, while
+// domain.StructuredSalient uses a case-sensitive prefix test. With LIKE, a
+// pane-tail salient that happens to start with "ERROR:" (raw screen text — a
+// build log line, say) would read as structured here and as unstructured there.
+// A short one would then be stripped of its vector by reembed.Reconcile yet
+// still counted stale by this query, reinstating the exact permanent-drift bug
+// the exclusion exists to prevent. GLOB compares case-sensitively, so the two
+// agree.
+func (s *Store) CountStaleSignatureEmbeddings(ctx context.Context, model string, minSalientChars int) (int64, error) {
+	if minSalientChars <= 0 {
+		minSalientChars = domain.DefaultMinSalientChars
+	}
 	var n int64
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM signature_embeddings
-		 WHERE model <> ? OR vector IS NULL OR dims <= 0`, model).Scan(&n)
+		 WHERE (model <> ? OR vector IS NULL OR dims <= 0)
+		   AND (length(salient) >= ?
+		        OR salient GLOB 'permission:*'
+		        OR salient GLOB 'options:*'
+		        OR salient GLOB 'error:*')`, model, minSalientChars).Scan(&n)
 	return n, err
 }
 

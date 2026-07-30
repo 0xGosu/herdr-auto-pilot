@@ -2328,6 +2328,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"embedding.model_path":                     "/models/custom.gguf",
 		"embedding.similarity_threshold":           "0.90",
 		"embedding.bm25_min_score":                 "0.35",
+		"embedding.min_salient_chars":              "120",
 		"embedding.model_context_window":           "512",
 		"embedding.embed_timeout_ms":               "8000",
 		"embedding.warm_timeout_ms":                "120000",
