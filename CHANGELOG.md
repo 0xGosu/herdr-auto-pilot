@@ -5,6 +5,12 @@ section in `CLAUDE.md`. Entries go under the version that will carry them: mergi
 to main auto-releases the next patch, so a PR adds its lines under that number
 (or under the minor/major version it bumps the manifest to).
 
+## 0.5.15
+
+- Added an instance limit for the TUI: starting `hap tui` now closes the older ones, so only the newest stays open. Every instance re-reads the whole state on a 2s tick and shells out to herdr for each agent's pane, so panes left open in other tabs kept a core busy for a view nobody was reading
+- Added `[tui] max_instances` (default 1) to raise that cap — `hap config set tui.max_instances 2` keeps two; `0` restores the old unlimited behavior. It applies without a restart: lowering it closes the surplus within 10s
+- An older TUI is closed the same way closing its pane is, so it restores the terminal and shuts its database down cleanly — and it is given a full minute to finish doing so before it is ever asked again. The instance that closed it says which pids it asked to close and why. A TUI whose peers cannot be read or signalled is left running: the limit is a performance guard, never a reason for a TUI to fail
+
 ## 0.5.13
 
 - Fixed long text being invisible past the right edge of the TUI while typing it. Every text input — add task, edit a task, correct a suggestion, the `/` filter, every config value — now wraps to the pane width, so the whole entry is readable without breaking the sentence with `shift+enter` to see it

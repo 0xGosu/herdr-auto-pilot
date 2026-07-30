@@ -393,6 +393,42 @@ daemon-owned hot-path rows (with the two narrow exceptions listed in §11).
 Two conveniences are deliberately interactive-only and have no CLI twin: the
 Config tab's `/usr/local/bin/hap` symlink shortcut and the daemon-stderr viewer.
 
+**TUI instance limit** *(`internal/tuisession`)*. Each TUI re-reads the whole
+state on a 2s tick and shells out to herdr per agent, so instances left open in
+other tabs cost real CPU for a view nobody reads. Every `hap tui` registers in
+`<state>/tui-sessions/`, holding an advisory lock on its record for its whole
+run — liveness is therefore proved by the lock, never by probing a pid, so a
+recycled pid can never be mistaken for a TUI (the same guarantee `daemonlock`
+gives). The refresh path sweeps (throttled to 10s): the oldest sessions past
+`[tui] max_instances` (default 1, `0` = unlimited) get SIGTERM, which is the
+ordinary "pane closed" exit, and the sweeping instance reports the pids it
+asked to close. Only the NEWEST live session signals, and it only ever signals
+peers older than itself: the second half keeps two TUIs starting at the same
+moment from closing each other, and the first keeps the grace below meaningful
+by making signalling single-writer (with three TUIs, a middle session and the
+newest would otherwise each SIGTERM the oldest, neither aware of the other). An
+unreadable registry or an unsignallable peer leaves everything running: the
+limit is a performance guard and never a reason for a TUI to fail.
+
+Three bounds are load-bearing. **A peer already asked to exit is left alone for
+`signalGrace` (60s)**: `cmd/hap` releases its signal handler on the first signal
+so a wedged process stays killable, so a second SIGTERM from the next 10s sweep
+would kill the TUI where it stands — no terminal restore, no store close. (The
+submit-retry drain is not among the stakes; any signalled exit forfeits it, as
+`shutdownSignals` documents.) Past the grace it has plainly ignored the request
+and signalling again is the right escalation. **`claim` truncates the record the
+moment it takes the lock**, so a reused pid can never be read carrying its dead
+predecessor's start time (which would make the newest TUI look like the oldest
+and close it). **A peer whose recorded process identity differs from ours is
+neither counted nor signalled** — a state dir reached from two pid namespaces (a
+container and its host sharing a bind-mounted home) is the one case where flock
+still says "live" while the pid names someone else entirely; an unknown identity
+on either side degrades to trusting the pid.
+
+Closing a plugin pane's process does not restart it: herdr respawns a *shell*
+in the pane when a launch command exits, so the limit cannot oscillate between
+two TUI panes re-closing each other.
+
 **Self-update surface.** `internal/frontend/updatestatus.go` exposes the cached
 release check to both front-ends: the TUI header renders the running version and,
 when a newer release exists, `↑ vX.Y.Z available`; `hap update` performs the

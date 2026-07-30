@@ -2337,6 +2337,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"tui.terminal_bell":                        "true",
 		"tui.herdr_notification":                   "false",
 		"tui.disable_check_for_update":             "true",
+		"tui.max_instances":                        "2",
 		"cli.ai_agent_friendly_output":             "false",
 	}
 

@@ -609,6 +609,17 @@ type TUI struct {
 	// plugin's only outbound network call (NFR-007). It is named negatively so
 	// the zero value keeps the check on, the way Embedding.Disabled does.
 	DisableCheckForUpdate bool `toml:"disable_check_for_update"`
+	// MaxInstances caps how many `hap tui` processes may run at once against
+	// this state dir. Every instance polls the same state on a 2s tick and
+	// shells out to herdr per agent, so forgotten panes cost real CPU while
+	// only one of them is ever being read. When a TUI starts and more than this
+	// many are live, the OLDEST are closed (SIGTERM — a clean exit, same as
+	// closing the pane). Default 1; 0 or less means no limit.
+	//
+	// Unlike the other zero-means-default ints here, 0 is a real setting, so
+	// fillZeroes deliberately leaves it alone: the default only applies when
+	// the key is absent, which config.Load gets from starting at Default().
+	MaxInstances int `toml:"max_instances"`
 }
 
 // CLI configures the `hap` command-line output (as opposed to the TUI).
@@ -688,7 +699,7 @@ func Default() Config {
 			SimilarityThreshold: 0.90,
 			BM25MinScore:        0.35,
 		},
-		TUI: TUI{TerminalBell: true, HerdrNotification: true},
+		TUI: TUI{TerminalBell: true, HerdrNotification: true, MaxInstances: 1},
 		CLI: CLI{AIAgentFriendlyOutput: true},
 	}
 }
