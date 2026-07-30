@@ -147,3 +147,77 @@ jobs:
           go test ./internal/domain/ -run 'TestSeedNeverAutoCatchesCorpus$' -v -count=1 | tee /tmp/corpus-gate.out
           grep -q -- '--- PASS: TestSeedNeverAutoCatchesCorpus' /tmp/corpus-gate.out \
             || { echo '::error::corpus gate did not execute TestSeedNeverAutoCatchesCorpus (test renamed?)'; exit 1; }
+
+  changelog-fragment:
+    name: Changelog fragment present
+    # Only PRs: a push to main is a merge whose fragment already landed, and
+    # the release path deletes fragments, so requiring one there would fail
+    # every bump commit.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The merge-base comparison below needs both branches' history.
+          fetch-depth: 0
+      - name: A code change needs an entry in changelog.d/
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          CHANGED=$(git diff --name-only "${BASE}...${HEAD}")
+          # The release automation's own bump PR assembles fragments away.
+          if git log -1 --format=%s "${HEAD}" | grep -q '\[skip release\]'; then
+            echo "release bump PR; fragment not required"; exit 0
+          fi
+
+          # A PR may legitimately write a CHANGELOG.md section itself, but ONLY
+          # on the manual minor/major path — where it hand-writes the version
+          # into herdr-plugin.toml and runs assemble-changelog.sh, because no
+          # bump commit is ever created to assemble into. That path adds AND
+          # deletes its fragment within the branch, so the file is net-zero in
+          # the diff and the fragment check below would fail the one PR shape
+          # that did everything right.
+          #
+          # The manifest is what tells that apart from the OLD hand-edited
+          # style this change replaces: a legitimate assembly's section always
+          # matches the version the PR is shipping. Anything else is someone
+          # editing CHANGELOG.md by hand, which must be rejected — on merge it
+          # would make the release script abort ("section already exists") with
+          # no tag produced.
+          MANIFEST=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml)
+          SECTIONS=$(git diff "${BASE}...${HEAD}" -- CHANGELOG.md \
+            | grep -E '^\+## [0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^+## //' || true)
+          if [ -n "${SECTIONS}" ]; then
+            for v in ${SECTIONS}; do
+              if [ "${v}" != "${MANIFEST}" ]; then
+                echo "::error::CHANGELOG.md gained a '## ${v}' section, but herdr-plugin.toml says ${MANIFEST}."
+                echo "::error::Do not write changelog sections by hand — add changelog.d/<your-branch>.md instead (see changelog.d/README.md)."
+                echo "::error::Only a minor/major PR may assemble its own section, and then the manifest must carry exactly that version."
+                exit 1
+              fi
+            done
+            echo "PR assembles its own '## ${MANIFEST}' section (manual minor/major path); fragment not required"
+            exit 0
+          fi
+
+          # Doc/workflow-only changes do not release (see auto-release.yml),
+          # so they need no entry. Anything else does.
+          NEEDS=$(echo "${CHANGED}" | grep -vE '^(docs/|\.github/|changelog\.d/|.*\.md$)' || true)
+          if [ -z "${NEEDS}" ]; then
+            echo "no releasing changes; fragment not required"; exit 0
+          fi
+          # ADDED files only: a PR that DELETES someone else's fragment, or
+          # edits one, must not satisfy its own requirement. -x anchors the
+          # README exclusion so a file merely containing that name cannot pass.
+          ADDED=$(git diff --name-only --diff-filter=A "${BASE}...${HEAD}" \
+            | grep -E '^changelog\.d/.+\.md$' | grep -vx 'changelog\.d/README\.md' || true)
+          if [ -n "${ADDED}" ]; then
+            echo "changelog fragment(s) present:"; echo "${ADDED}"; exit 0
+          fi
+          echo "::error::This PR changes code that will be released, but adds no changelog fragment."
+          echo "::error::Add changelog.d/<your-branch>.md with your entry — see changelog.d/README.md."
+          echo "Changed files needing an entry:"
+          echo "${NEEDS}"
+          exit 1

@@ -108,26 +108,35 @@ ticket/issue id**. Examples:
 
 ## Changelog (MANDATORY)
 
-**Every change gets an entry in `CHANGELOG.md` at the repo root — including
-patch releases.** No exceptions for "small", "internal", or "just a fix": if it
-merges, it is in the changelog. A PR without one is incomplete.
+**Every change gets an entry — including patch releases.** No exceptions for
+"small", "internal", or "just a fix": if it merges, it is in the changelog. A PR
+without one is incomplete. Entries are written as **fragments in
+`changelog.d/`**, never into `CHANGELOG.md` directly.
 
-- **Never use an `Unreleased` heading.** Merging to main auto-releases, so the
-  version a PR ships in is knowable at write time — write that number as the
-  heading, in the same commit as the change:
-  1. Read `CHANGELOG.md` on the latest **remote** `main`
-     (`git fetch origin main && git show origin/main:CHANGELOG.md | head -20`) —
-     not your branch, which may be behind. The topmost `## X.Y.Z` is the latest
-     entry.
-  2. If that version is already released (`git tag -l vX.Y.Z` finds it, i.e. it
-     matches `version` in `herdr-plugin.toml`), your section is the **next patch**:
-     `## X.Y.(Z+1)`. If it is NOT yet released, another unmerged PR already opened
-     that section — add your lines to it instead of starting a new one.
-  3. Exception: when the user explicitly asks for a minor/major bump, the version
-     is not a guess — you overwrite `version` in `herdr-plugin.toml` inside the PR
-     (see *Version bump & release*), so use exactly that number as the heading.
-- The guess can be wrong if a race merges another PR first; that is fine and
-  self-correcting — fix the heading in a follow-up rather than reverting.
+- **Never edit `CHANGELOG.md` by hand, and never write a version number.** Add a
+  fragment instead — a new file nobody else's PR can touch:
+
+  ```sh
+  cat > changelog.d/$(git branch --show-current | tr / -).md <<'EOF'
+  - Fixed the thing that used to happen
+  EOF
+  ```
+
+  Just the bullets, no heading. `changelog.d/README.md` has the full format.
+- **Why:** every PR used to insert its section at the top of one shared file, so
+  two open PRs always conflicted on the same lines even when the changes were
+  unrelated — and each had to GUESS its version, which is only knowable when the
+  release is cut. Fragments make the conflict structurally impossible and delete
+  the guess.
+- On merge, the auto-release workflow runs `scripts/assemble-changelog.sh
+  <version>`, folding every fragment into `CHANGELOG.md` under the real version
+  and deleting them — inside the same commit that bumps `herdr-plugin.toml`.
+  A CI job fails any PR that changes releasing code without a fragment.
+- **Minor/major is the manual exception**: you hand-write the version into
+  `herdr-plugin.toml` inside your PR (see *Version bump & release*), and no bump
+  commit is ever created to assemble into — so run
+  `bash scripts/assemble-changelog.sh X.Y.0` in that same PR and commit the
+  result. The release refuses to tag while unassembled fragments remain.
 - Style: a flat list of verb-first one-liners — `Added …`, `Fixed …`,
   `Changed …`, `Removed …`. No sub-sections.
 - Write what it MEANS for the reader, not what the diff did. GitHub already

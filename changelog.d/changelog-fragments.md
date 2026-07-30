@@ -1,0 +1,4 @@
+- Changed how changelog entries are written: add a fragment in `changelog.d/` instead of editing `CHANGELOG.md`. One file per PR means two open PRs can no longer conflict on the same lines, which they did on every parallel change
+- Removed the need to guess a version number. Contributors write no version at all — the release automation folds the fragments into `CHANGELOG.md` under the version it actually assigns, which is the only moment that number is a fact
+- Added a CI check that fails a PR changing releasing code without a fragment, so the mandatory-changelog rule is enforced rather than remembered
+- Added a release guard that refuses to tag while unassembled fragments remain, which catches the manual minor/major path forgetting to run `scripts/assemble-changelog.sh`

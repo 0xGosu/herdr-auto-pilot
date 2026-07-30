@@ -105,6 +105,15 @@ jobs:
             local CUR; CUR=$(version)
             git checkout -B "${BRANCH}" origin/main
             sed -i "s/^version = \"${CUR}\"/version = \"${NEXT}\"/" herdr-plugin.toml
+            # Fold this release's changelog fragments into CHANGELOG.md in the
+            # SAME commit as the manifest bump. This is the only moment the
+            # version is a fact rather than a guess, which is exactly why
+            # contributors no longer write one: they drop a file in
+            # changelog.d/ and two PRs can never collide on it.
+            # `git commit -a` below picks up the modified CHANGELOG.md; the
+            # script git-rm's the fragments itself, so the deletions are
+            # already staged.
+            bash scripts/assemble-changelog.sh "${NEXT}"
             git commit -am "${TITLE}"
             git push --force origin "HEAD:${BRANCH}"
             local PR
@@ -166,6 +175,31 @@ jobs:
 
           grep -q "^version = \"${RELEASE}\"" herdr-plugin.toml || {
             echo "::error::manifest does not carry ${RELEASE} at tag time"; exit 1; }
+          # Changelog fragments should be folded into CHANGELOG.md by now: the
+          # patch path does it inside bump(), the manual minor/major path does
+          # it in the feature PR.
+          #
+          # This WARNS and continues; it must never fail the run. A release
+          # that stops here after bump() merged would leave main carrying a
+          # version with no tag and no release — precisely the state the
+          # manifest invariant forbids, breaking `herdr plugin install` for
+          # everyone, and it does not self-heal: every queued run would hit the
+          # same guard, and manual recovery is blocked because the script
+          # refuses a version whose section already exists. Path B is no safer:
+          # its manifest already names the untagged RELEASE before this runs,
+          # so refusing to tag strands it identically.
+          #
+          # Leftovers are also NORMAL on the patch path: a feature PR merging
+          # during bump()'s PR round-trip lands its fragment after assembly.
+          # Those simply roll into the next patch. Gate on the real failure —
+          # this release having no section at all — so the warning means
+          # something when it appears.
+          LEFTOVER=$(find changelog.d -maxdepth 1 -name '*.md' ! -name 'README.md' -type f 2>/dev/null | LC_ALL=C sort || true)
+          if [ -n "${LEFTOVER}" ] && ! grep -qE "^## ${RELEASE//./\\.}\$" CHANGELOG.md; then
+            echo "::warning::releasing ${RELEASE} with no CHANGELOG.md section; these fragments were never assembled:"
+            echo "${LEFTOVER}"
+            echo "::warning::run 'bash scripts/assemble-changelog.sh <next-version>' in a follow-up PR — they will roll into the next release"
+          fi
           # Never tag a commit whose message carries a GitHub skip-ci
           # keyword: the tag push onto it would be suppressed and the
           # release would silently not build (no failed run to re-run).
