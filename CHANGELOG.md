@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.17
+
+- Changed how changelog entries are written: add a fragment in `changelog.d/` instead of editing `CHANGELOG.md`. One file per PR means two open PRs can no longer conflict on the same lines, which they did on every parallel change
+- Removed the need to guess a version number. Contributors write no version at all — the release automation folds the fragments into `CHANGELOG.md` under the version it actually assigns, which is the only moment that number is a fact
+- Added a CI check that fails a PR changing releasing code without a fragment, so the mandatory-changelog rule is enforced rather than remembered
+- Added a release guard that refuses to tag while unassembled fragments remain, which catches the manual minor/major path forgetting to run `scripts/assemble-changelog.sh`
+
 ## 0.5.16
 
 - Fixed `scripts/setup-native.sh` dropping `sudo` when only part of the install prefix was writable, which failed the build with `Permission denied` on `apt-get` and on `/usr/local/include/faiss`. It now keeps `sudo` unless BOTH `lib` and `include` are writable, and always uses it for the package manager, which needs real root regardless
