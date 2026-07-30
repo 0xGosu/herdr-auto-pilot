@@ -2430,10 +2430,31 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	if dec.Suggestion != "" {
 		body += " Suggestion: " + dec.Suggestion
 	}
-	d.notify(ctx, title, body)
-	slog.Info("escalated", "agent", s.AgentID, "situation", s.Type,
+	res := d.notify(ctx, title, body)
+	slog.Info("escalated", escalationLogAttrs(s, dec, res)...)
+}
+
+// escalationLogAttrs builds the "escalated" log line's key/value pairs.
+//
+// Split out as a pure function so the one thing an escalation log could never
+// say before — whether the operator was actually interrupted — is directly
+// testable. The CLI notification path exits 0 even when herdr paints nothing,
+// so the delivery keys are emitted ONLY when herdr reported the outcome; an
+// unknown must never be logged as a claim either way.
+func escalationLogAttrs(s domain.Situation, dec domain.Decision, res ports.NotifyResult) []any {
+	attrs := []any{"agent", s.AgentID, "situation", s.Type,
 		"reason", dec.Reason, "suggestion", dec.Suggestion,
-		"version", buildinfo.Version)
+		"version", buildinfo.Version}
+	if !res.Known {
+		return attrs
+	}
+	attrs = append(attrs, "notified", res.Shown)
+	if !res.Shown {
+		// Only meaningful when herdr declined: naming a reason next to
+		// notified=true would read as a caveat on a delivered toast.
+		attrs = append(attrs, "notify_reason", res.Reason)
+	}
+	return attrs
 }
 
 const (
@@ -4641,13 +4662,40 @@ func (d *Daemon) audit(ctx context.Context, rec domain.AuditRecord) {
 	}
 }
 
-func (d *Daemon) notify(ctx context.Context, title, body string) {
+// notify surfaces an operator toast and REPORTS what herdr did with it.
+//
+// The daemon has no second channel to fall back to (the TUI rings the terminal
+// bell; a background process has no terminal), so the value of the result is
+// evidential, not corrective: an escalation herdr declined to paint means the
+// operator was never interrupted, and the log must be able to say so. Callers
+// that only fire-and-forget ignore the return.
+//
+// A NotifyPort that cannot report delivery yields a !Known result rather than
+// a false claim of one — see ports.NotifyResult.
+func (d *Daemon) notify(ctx context.Context, title, body string) ports.NotifyResult {
 	if d.opt.Notify == nil {
-		return
+		return ports.NotifyResult{}
 	}
-	if err := d.opt.Notify.Notify(ctx, title, body); err != nil {
+	shower, ok := d.opt.Notify.(ports.NotifyShower)
+	if !ok {
+		if err := d.opt.Notify.Notify(ctx, title, body); err != nil {
+			slog.Warn("notification failed", "error", err)
+		}
+		return ports.NotifyResult{}
+	}
+	res, err := shower.ShowNotification(ctx, title, body)
+	if err != nil {
 		slog.Warn("notification failed", "error", err)
+		return ports.NotifyResult{}
 	}
+	if res.Known && !res.Shown {
+		// Info, not Warn: herdr routinely declines toasts the operator turned
+		// off or rate limited. It is normal traffic — but traffic that means
+		// nobody was told, so it is never silent.
+		slog.Info("herdr did not display notification",
+			"reason", res.Reason, "title", title)
+	}
+	return res
 }
 
 // neverAutoRules maps agent-scoped operator configuration into the unified

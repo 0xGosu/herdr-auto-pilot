@@ -11,6 +11,13 @@ to main auto-releases the next patch, so a PR adds its lines under that number
 - Added `[tui] max_instances` (default 1) to raise that cap — `hap config set tui.max_instances 2` keeps two; `0` restores the old unlimited behavior. It applies without a restart: lowering it closes the surplus within 10s
 - An older TUI is closed the same way closing its pane is, so it restores the terminal and shuts its database down cleanly — and it is given a full minute to finish doing so before it is ever asked again. The instance that closed it says which pids it asked to close and why. A TUI whose peers cannot be read or signalled is left running: the limit is a performance guard, never a reason for a TUI to fail
 
+## 0.5.14
+
+- Changed the daemon to raise its herdr notifications over the socket API instead of the `herdr notification show` CLI, so it now learns whether a toast was actually displayed. The CLI exits 0 even when herdr paints nothing, which meant an escalation could be dropped — notifications turned off, rate limited, no foreground client — with the daemon assuming the operator had been told
+- Added the delivery outcome to the daemon's `escalated` log line: `notified=true`, or `notified=false` with the reason herdr gave. Absent when nothing reported it, so the log never turns "we don't know" into a claim
+- Kept the CLI as the fallback for when the socket itself is unreachable. A request herdr answered and refused is never re-fired through it — same herdr, same verdict — and neither is one already refused locally or cancelled by shutdown
+- Changed the notification timeout to bound the whole socket-then-CLI attempt rather than each hop, so adding the socket cannot make a wedged herdr stall the daemon longer than the CLI alone did
+
 ## 0.5.13
 
 - Fixed long text being invisible past the right edge of the TUI while typing it. Every text input — add task, edit a task, correct a suggestion, the `/` filter, every config value — now wraps to the pane width, so the whole entry is readable without breaking the sentence with `shift+enter` to see it

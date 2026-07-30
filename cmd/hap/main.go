@@ -400,11 +400,16 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		Store:             st,
 		Herdr:             cliAdapter,
 		Events:            herdr.NewSubscriber(socketPath),
-		Notify:            cliAdapter,
-		LLMFactory:        llmFactory,
-		EmbedderFactory:   embedderFactory,
-		MatchIndexDir:     filepath.Join(paths.StateDir, "match-index"),
-		StateDir:          paths.StateDir,
+		// Socket first, CLI as the transport backstop: `notification.show`
+		// answers whether the toast was actually painted, which is the
+		// difference between "the operator was told about this escalation" and
+		// "nothing reached anyone" (IR-003). The CLI exits 0 either way, so it
+		// can only ever be the fallback.
+		Notify:          herdr.NewFallbackNotifier(socketPath, cliAdapter),
+		LLMFactory:      llmFactory,
+		EmbedderFactory: embedderFactory,
+		MatchIndexDir:   filepath.Join(paths.StateDir, "match-index"),
+		StateDir:        paths.StateDir,
 		// Hand the herd to the binary that replaced ours (plugin upgrade)
 		// instead of soldiering on with children we can no longer spawn.
 		//
