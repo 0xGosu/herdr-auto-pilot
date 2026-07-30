@@ -71,6 +71,11 @@ type refreshMsg struct {
 	// flight, so "l: retry LLM" is disabled while one is running (the daemon
 	// re-checks authoritatively). Populated only for retryable escalations.
 	pendingConsult map[string]bool
+	// tuiLimit reports the instance-limit sweep this refresh ran: the pids of
+	// older `hap tui` processes it asked to exit, so the operator learns why a
+	// pane they left open went away, and the limit that closed them. Normally
+	// nothing was closed.
+	tuiLimit frontend.TUILimitSweep
 	// update reports a newer release from the LAST CACHED check — a local file
 	// read, never a network call (updateCheckCmd does the fetch).
 	update frontend.UpdateStatus
@@ -843,6 +848,11 @@ type Model struct {
 	// which goroutine's result lands first.
 	pausePending bool
 
+	// pendingTUINote holds the "asked N older TUIs to close" explanation until
+	// the status line is free of an error note. Nothing regenerates it — the
+	// sweep reports a peer once — so it waits here rather than being dropped.
+	pendingTUINote string
+
 	// cursorUndo restores the cursor when an OPTIMISTIC nudge turns out to
 	// have been wrong. moveSelectedTask moves the cursor before its move
 	// lands, so the operator sees it follow the task; if the move is then
@@ -1242,6 +1252,15 @@ func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 	// Daemon health is read from local state files (never errors), so assess it
 	// first — it stays meaningful even when GetStatus fails (e.g. daemon down).
 	msg.daemonHealth = app.AssessDaemonHealth()
+	// Keep only the newest few TUIs alive: every extra one re-runs this whole
+	// refresh on its own 2s tick. Throttled inside the App, and deliberately
+	// not allowed to fail the refresh — an unenforceable limit is a slow TUI,
+	// not a broken one.
+	if sweep, err := app.EnforceTUISessionLimit(); err != nil {
+		slog.Warn("TUI instance limit not enforced", "error", err)
+	} else {
+		msg.tuiLimit = sweep
+	}
 	msg.status, msg.err = app.GetStatus(ctx)
 	if msg.err != nil {
 		return msg
@@ -1291,6 +1310,23 @@ func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 	msg.update = app.UpdateStatus(msg.cfg)
 	msg.updateDue = app.UpdateCheckDue(msg.cfg)
 	return msg
+}
+
+// closedTUINote explains a sweep that closed older TUIs, naming the setting to
+// raise (or zero) if the operator wanted those panes. It says "asked … to
+// close" rather than "closed": what the sweep did is deliver a SIGTERM, and the
+// peer then unwinds on its own schedule.
+func closedTUINote(sweep frontend.TUILimitSweep) string {
+	pids := make([]string, 0, len(sweep.Closed))
+	for _, pid := range sweep.Closed {
+		pids = append(pids, strconv.Itoa(pid))
+	}
+	noun := "older TUI"
+	if len(pids) > 1 {
+		noun = "older TUIs"
+	}
+	return fmt.Sprintf("asked %d %s to close (pid %s) — tui.max_instances=%d",
+		len(pids), noun, strings.Join(pids, ", "), sweep.Max)
 }
 
 // updateCheckAllowed gates the background release check on all three bounds:
@@ -1459,6 +1495,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastMaxEscalationID = maxEscalationID(msg.escalations)
 			m.lastPaused = msg.status.Paused
 			m.initialized = true
+		}
+		// Say so when this instance closed older ones: from the operator's side
+		// a pane they left open simply disappeared, and the reason (a limit they
+		// can raise) is only knowable from here.
+		// Never over an error the operator is reading: a failed action they
+		// just triggered is the one they need. It is held rather than dropped,
+		// because no later sweep will re-report it — a peer already asked to
+		// close is skipped for its whole grace, and gone after that — and a
+		// pane that vanished with no explanation is the thing this note exists
+		// to prevent.
+		if len(msg.tuiLimit.Closed) > 0 {
+			m.pendingTUINote = closedTUINote(msg.tuiLimit)
+		}
+		if m.pendingTUINote != "" && (m.status == nil || !m.status.err) {
+			m.status = &statusNote{text: m.pendingTUINote, at: time.Now()}
+			m.pendingTUINote = ""
 		}
 		// A failed refresh returns before the update fields are filled, so
 		// carry the last known ones forward — the hint must not blink out of
