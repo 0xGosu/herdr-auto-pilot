@@ -76,6 +76,11 @@ var claudeBannerCornerGlyphs = map[rune]bool{
 // signature.
 const claudeBannerMarker = "Claude Code"
 
+// claudeBannerRows is the logo's known height: three rows (art + product name,
+// art + model/plan, art + cwd). The continuation scan stops there rather than
+// running as far as glyph lines happen to continue.
+const claudeBannerRows = 3
+
 // claudeFooterLines bounds how far back from the end of the capture the
 // footer-only filters (mode line, herdr status bar) may look. Those two shapes
 // are less distinctive than the banner or the rules — a sentence of agent prose
@@ -203,8 +208,8 @@ func claudeBannerBlock(lines []string) (start, end int, ok bool) {
 			continue
 		}
 		end = i
-		for j := i + 1; j < limit; j++ {
-			if !claudeBannerLine(strings.TrimSpace(lines[j])) {
+		for j := i + 1; j < limit && j-i < claudeBannerRows; j++ {
+			if !claudeBannerContinuation(strings.TrimSpace(lines[j])) {
 				break
 			}
 			end = j
@@ -223,6 +228,40 @@ func claudeBannerBlock(lines []string) (start, end int, ok bool) {
 // from solid blocks and has no corner pieces, so it is content even when the
 // banner filter is armed. It covers all three banner rows, including the one
 // whose only other content is the cwd ("▘▘ ▝▝    /path").
+// claudeBannerContinuation reports whether a line may extend the banner block
+// beneath its anchor row. Being glyph-shaped is NOT sufficient: a progress or
+// sparkline the agent printed can directly follow the logo's last row with no
+// blank line between, and accepting it would delete real content and let two
+// panes differing only in that line collapse onto one signature.
+//
+// The extra evidence is the logo's fixed-width art column: every row's text
+// begins at the same column, so at least two spaces separate the last glyph
+// from it ("▝▜█████▛▘··Opus 5…", "▘▘ ▝▝····<cwd>"). A bar puts a single space
+// before its count ("▌▌▌ 60% indexed"), so it is rejected. A row that is pure
+// art carries no text to be separated from and is accepted.
+func claudeBannerContinuation(trimmed string) bool {
+	return claudeBannerLine(trimmed) && claudeBannerArtPadded(trimmed)
+}
+
+// claudeBannerArtPadded implements the art-column test described above.
+func claudeBannerArtPadded(trimmed string) bool {
+	runes := []rune(trimmed)
+	last := -1
+	for i, r := range runes {
+		if claudeBannerGlyphs[r] {
+			last = i
+		}
+	}
+	if last < 0 {
+		return false
+	}
+	rest := runes[last+1:]
+	if strings.TrimSpace(string(rest)) == "" {
+		return true // a pure-art row has no text column to check
+	}
+	return len(rest) >= 2 && rest[0] == ' ' && rest[1] == ' '
+}
+
 func claudeBannerLine(trimmed string) bool {
 	runes := []rune(trimmed)
 	if len(runes) == 0 || !claudeBannerGlyphs[runes[0]] {

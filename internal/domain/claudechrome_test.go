@@ -251,8 +251,8 @@ func TestStripClaudeChromeMarkerAndGlyphsMustBeTheSameLine(t *testing.T) {
 }
 
 // TestStripClaudeChromeBannerBlockStopsAtRealContent: the block extends only
-// over the contiguous glyph rows under the anchor, so output that happens to
-// follow the banner is never swept up with it.
+// over the logo's own rows, so output that follows the banner is never swept up
+// with it.
 func TestStripClaudeChromeBannerBlockStopsAtRealContent(t *testing.T) {
 	pane := claudeBanner + "\n● the first thing the agent said\n▌▌▌ 60% indexed"
 	got := StripClaudeChrome(pane)
@@ -262,6 +262,64 @@ func TestStripClaudeChromeBannerBlockStopsAtRealContent(t *testing.T) {
 	for _, want := range []string{"● the first thing the agent said", "▌▌▌ 60% indexed"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("content after the banner must survive: %q missing from:\n%s", want, got)
+		}
+	}
+}
+
+// TestStripClaudeChromeBannerBlockStopsAtADJACENTOutput is the regression for
+// the third review finding, and the case the test above MASKS: with a "●" line
+// between, the glyph run is already broken, so the continuation loop stops for
+// the wrong reason. A progress line can follow the logo's last row with nothing
+// in between, and a continuation rule that accepts any glyph line deletes it.
+//
+// The bar is rejected by the art-column test (one space before its count, where
+// every logo row has at least two), and the scan is additionally capped at the
+// logo's known three rows.
+func TestStripClaudeChromeBannerBlockStopsAtAdjacentOutput(t *testing.T) {
+	bar := "▌▌▌ 60% indexed"
+	pane := claudeBanner + "\n" + bar
+	got := StripClaudeChrome(pane)
+	if strings.Contains(got, "Claude Code v") {
+		t.Errorf("the banner block must still be stripped; got:\n%s", got)
+	}
+	if !strings.Contains(got, bar) {
+		t.Errorf("a bar DIRECTLY under the banner's last row must survive; got:\n%s", got)
+	}
+
+	// The consequence: two panes differing only in that adjacent bar keep
+	// distinct signatures.
+	mk := func(b string) SignatureResult {
+		return ComputeSignature(sit(SituationIdle, "claude",
+			claudeBanner+"\n"+b+"\nindexing the corpus, please wait for the summary\n"+claudeFooter))
+	}
+	a, c := mk("▌▌▌ 60% indexed"), mk("▌ 20% indexed")
+	if a.Verdict != GuardOK || c.Verdict != GuardOK {
+		t.Fatalf("premise: both panes carry real content: %v / %v", a.Verdict, c.Verdict)
+	}
+	if a.Raw == c.Raw {
+		t.Errorf("panes differing only in the adjacent bar must not share a signature: both %q", a.Raw)
+	}
+}
+
+// TestClaudeBannerContinuationRejectsBars pins the discriminator directly: the
+// logo's fixed-width art column leaves >=2 spaces before its text, a bar leaves
+// one before its count.
+func TestClaudeBannerContinuationRejectsBars(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"▝▜█████▛▘  Opus 5 with high effort · Claude Max", true}, // real logo row 2
+		{"▘▘ ▝▝    /workspaces/herdr-auto-pilot", true},           // real logo row 3
+		{"▌▌▌", true},              // pure art: no text column
+		{"▌▌▌ 60% indexed", false}, // bar: one space
+		{"▌ 20% indexed", false},
+		{"████████ 80% done", false}, // no corner glyphs at all
+		{"● ordinary output", false},
+	}
+	for _, tc := range tests {
+		if got := claudeBannerContinuation(tc.in); got != tc.want {
+			t.Errorf("claudeBannerContinuation(%q) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }
