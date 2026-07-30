@@ -1,9 +1,12 @@
 # Changelog
 
 Every change gets a line here, including patch releases — see the Changelog
-section in `CLAUDE.md`. Entries go under the version that will carry them: merging
-to main auto-releases the next patch, so a PR adds its lines under that number
-(or under the minor/major version it bumps the manifest to).
+section in `CLAUDE.md`.
+
+**This file is assembled, not edited.** Contributors add a fragment in
+`changelog.d/` (one file per PR, so two PRs can never conflict); the release
+automation folds those into a new section here under the version it actually
+assigns. Do not add a heading or an entry by hand.
 
 ## 0.5.16
 
