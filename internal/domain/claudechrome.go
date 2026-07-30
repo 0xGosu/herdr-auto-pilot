@@ -115,14 +115,16 @@ const claudeStatusBarFields = 3
 func StripClaudeChrome(pane string) string {
 	lines := strings.Split(pane, "\n")
 	footerFrom := len(lines) - claudeFooterLines
-	// The banner filter is armed only when the head of the capture actually
-	// shows the startup logo (see claudeBannerMarker). On every other capture it
-	// stays off entirely, so the agent's own block-glyph output is never at risk.
-	bannerPresent := claudeBannerHead(lines)
+	// The banner is removed as a located BLOCK, not as "any glyph line near the
+	// top": only the rows between bannerStart and bannerEnd go, and only when a
+	// row was found that is both glyph-shaped and carries the product name. On
+	// every other capture nothing here is stripped, so the agent's own
+	// block-glyph output is never at risk (see claudeBannerBlock).
+	bannerStart, bannerEnd, bannerFound := claudeBannerBlock(lines)
 	kept := make([]string, 0, len(lines))
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if bannerPresent && i < claudeBannerLines && claudeBannerLine(trimmed) {
+		if bannerFound && i >= bannerStart && i <= bannerEnd {
 			continue
 		}
 		if claudeRuleLineRE.MatchString(trimmed) {
@@ -173,21 +175,43 @@ func dropTrailingComposer(lines []string) []string {
 	return lines
 }
 
-// claudeBannerHead reports whether the head of the capture actually shows the
-// startup logo, by looking for the product name the logo's first row always
-// carries. It is what arms the banner filter at all: block glyphs alone are not
-// evidence of a banner, because a capture may begin anywhere in the agent's
-// output.
-func claudeBannerHead(lines []string) bool {
-	for i, line := range lines {
-		if i >= claudeBannerLines {
-			return false
-		}
-		if strings.Contains(line, claudeBannerMarker) {
-			return true
-		}
+// claudeBannerBlock locates the startup logo as a STRUCTURE and returns the
+// inclusive line range it occupies, or ok=false when the capture does not show
+// one.
+//
+// The marker and the glyph shape must hold on the SAME line — the logo's first
+// row carries the product name itself ("▐▛███▜▌   Claude Code v2.1.220"). Testing
+// them independently over the head is not enough, because ordinary output can
+// satisfy each separately: a report headed "Claude Code output:" followed by
+// "▌▌▌ 30% indexed" would arm the filter and then delete the progress line,
+// which is real content. Requiring one line to be both is what makes the
+// evidence a banner rather than a coincidence.
+//
+// From that anchor the block extends over the contiguous glyph rows beneath it
+// (the logo is three rows, the last carrying the cwd), bounded by
+// claudeBannerLines. A capture that begins PART-WAY into the logo has no anchor
+// row, so nothing is stripped — chrome survives into the salient, which is the
+// safe direction: it never deletes real output.
+func claudeBannerBlock(lines []string) (start, end int, ok bool) {
+	limit := len(lines)
+	if limit > claudeBannerLines {
+		limit = claudeBannerLines
 	}
-	return false
+	for i := 0; i < limit; i++ {
+		if !claudeBannerLine(strings.TrimSpace(lines[i])) ||
+			!strings.Contains(lines[i], claudeBannerMarker) {
+			continue
+		}
+		end = i
+		for j := i + 1; j < limit; j++ {
+			if !claudeBannerLine(strings.TrimSpace(lines[j])) {
+				break
+			}
+			end = j
+		}
+		return i, end, true
+	}
+	return 0, 0, false
 }
 
 // claudeBannerLine reports whether a trimmed line is part of the startup logo.

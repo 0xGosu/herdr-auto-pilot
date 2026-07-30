@@ -206,8 +206,8 @@ func TestStripClaudeChromeBarChartsDoNotCollapseDistinctScreens(t *testing.T) {
 }
 
 // TestStripClaudeChromeBannerNeedsItsMarker pins the corroboration: block
-// glyphs at the head are stripped only when the head also carries the product
-// name the logo's first row always shows.
+// glyphs at the head are stripped only when a glyph row itself carries the
+// product name the logo's first row always shows.
 func TestStripClaudeChromeBannerNeedsItsMarker(t *testing.T) {
 	// Banner-shaped glyph rows WITHOUT the marker are the agent's own output.
 	unmarked := "▐▛███▜▌   rendering the diagram\n▝▜█████▛▘  second row\n  ▘▘ ▝▝    third row"
@@ -215,9 +215,54 @@ func TestStripClaudeChromeBannerNeedsItsMarker(t *testing.T) {
 		t.Errorf("without the %q marker nothing may be stripped;\n in  %q\n got %q",
 			claudeBannerMarker, unmarked, got)
 	}
-	// With the marker present, the same rows are the banner.
+	// With the marker on the glyph row, the same rows are the banner.
 	if got := StripClaudeChrome(claudeBanner); strings.TrimSpace(got) != "" {
 		t.Errorf("with the marker the banner must be stripped; got %q", got)
+	}
+}
+
+// TestStripClaudeChromeMarkerAndGlyphsMustBeTheSameLine is the regression for
+// the second review finding: testing the marker and the glyph shape
+// INDEPENDENTLY over the head lets ordinary output satisfy both by coincidence.
+// A report headed "Claude Code output:" followed by a corner-glyph progress
+// line armed the filter and then deleted the progress line — real content, and
+// two panes differing only in it would collapse onto one signature.
+//
+// The logo's first row carries the product name itself, so requiring ONE line
+// to be both glyph-shaped and marked is what distinguishes structure from
+// coincidence.
+func TestStripClaudeChromeMarkerAndGlyphsMustBeTheSameLine(t *testing.T) {
+	pane := "Claude Code output:\n▌▌▌ 30% indexed\nstill working through the corpus"
+	got := StripClaudeChrome(pane)
+	if strings.TrimSpace(got) != pane {
+		t.Errorf("marker prose + a separate glyph line is not a banner;\n in  %q\n got %q", pane, got)
+	}
+	// And the consequence: two such panes differing only in the bar keep
+	// distinct signatures.
+	a := ComputeSignature(sit(SituationIdle, "claude", pane+"\n"+claudeFooter))
+	b := ComputeSignature(sit(SituationIdle, "claude",
+		"Claude Code output:\n▌ 10% indexed\nstill working through the corpus\n"+claudeFooter))
+	if a.Verdict != GuardOK || b.Verdict != GuardOK {
+		t.Fatalf("premise: both panes carry real content: %v / %v", a.Verdict, b.Verdict)
+	}
+	if a.Raw == b.Raw {
+		t.Errorf("panes differing only in the progress line must not share a signature: both %q", a.Raw)
+	}
+}
+
+// TestStripClaudeChromeBannerBlockStopsAtRealContent: the block extends only
+// over the contiguous glyph rows under the anchor, so output that happens to
+// follow the banner is never swept up with it.
+func TestStripClaudeChromeBannerBlockStopsAtRealContent(t *testing.T) {
+	pane := claudeBanner + "\n● the first thing the agent said\n▌▌▌ 60% indexed"
+	got := StripClaudeChrome(pane)
+	if strings.Contains(got, "Claude Code v") {
+		t.Errorf("the banner block must be stripped; got:\n%s", got)
+	}
+	for _, want := range []string{"● the first thing the agent said", "▌▌▌ 60% indexed"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("content after the banner must survive: %q missing from:\n%s", want, got)
+		}
 	}
 }
 
