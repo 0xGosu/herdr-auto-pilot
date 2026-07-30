@@ -165,6 +165,62 @@ func TestStripClaudeChromeKeepsBlockGlyphContentBelowTheHead(t *testing.T) {
 	}
 }
 
+// TestStripClaudeChromeKeepsBarChartAtTheTopOfACapture is the case the head
+// bound alone did NOT cover, and the reason the banner filter needs positive
+// evidence rather than position: a pane capture does not guarantee the startup
+// logo is still on screen. herdr's `--source recent` read is a consuming delta
+// and a scrolled pane begins mid-output, so the agent's own bar can legitimately
+// be the FIRST captured line. Deleting it would let two screens differing only
+// in bar length acquire the same salient — the collapse this redaction exists to
+// prevent.
+func TestStripClaudeChromeKeepsBarChartAtTheTopOfACapture(t *testing.T) {
+	for _, bar := range []string{
+		"████████ 80% done",
+		"█████ 50%",
+		"████▌ 45% complete", // a half-block for sub-cell precision
+		"▌▌▌ sparkline",      // corner glyphs, but no banner marker in the head
+	} {
+		pane := bar + "\nrebuilding the search index from scratch\nstill going"
+		got := StripClaudeChrome(pane)
+		if !strings.Contains(got, bar) {
+			t.Errorf("bar %q at the top of a capture was stripped; got:\n%s", bar, got)
+		}
+	}
+}
+
+// TestStripClaudeChromeBarChartsDoNotCollapseDistinctScreens states the
+// consequence directly: two screens that differ ONLY in bar length must keep
+// distinct salients.
+func TestStripClaudeChromeBarChartsDoNotCollapseDistinctScreens(t *testing.T) {
+	a := ComputeSignature(sit(SituationIdle, "claude",
+		"████████ 80% done\nindexing the corpus, please wait for the summary\n"+claudeFooter))
+	b := ComputeSignature(sit(SituationIdle, "claude",
+		"███ 30% done\nindexing the corpus, please wait for the summary\n"+claudeFooter))
+	if a.Verdict != GuardOK || b.Verdict != GuardOK {
+		t.Fatalf("premise: both panes carry real content: %v / %v", a.Verdict, b.Verdict)
+	}
+	if a.Raw == b.Raw {
+		t.Errorf("screens differing only in bar length must not share a signature: both %q (salient %q)",
+			a.Raw, a.Salient)
+	}
+}
+
+// TestStripClaudeChromeBannerNeedsItsMarker pins the corroboration: block
+// glyphs at the head are stripped only when the head also carries the product
+// name the logo's first row always shows.
+func TestStripClaudeChromeBannerNeedsItsMarker(t *testing.T) {
+	// Banner-shaped glyph rows WITHOUT the marker are the agent's own output.
+	unmarked := "▐▛███▜▌   rendering the diagram\n▝▜█████▛▘  second row\n  ▘▘ ▝▝    third row"
+	if got := StripClaudeChrome(unmarked); strings.TrimSpace(got) != unmarked {
+		t.Errorf("without the %q marker nothing may be stripped;\n in  %q\n got %q",
+			claudeBannerMarker, unmarked, got)
+	}
+	// With the marker present, the same rows are the banner.
+	if got := StripClaudeChrome(claudeBanner); strings.TrimSpace(got) != "" {
+		t.Errorf("with the marker the banner must be stripped; got %q", got)
+	}
+}
+
 // TestStripClaudeChromeStatusBarOnlyInFooter pins the footer window: the same
 // pipe-heavy line is chrome at the bottom of the capture and content above it.
 func TestStripClaudeChromeStatusBarOnlyInFooter(t *testing.T) {

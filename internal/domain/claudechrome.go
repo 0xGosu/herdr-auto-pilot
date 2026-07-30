@@ -51,12 +51,30 @@ var (
 	claudeComposerLineRE = regexp.MustCompile(`^❯`)
 )
 
-// claudeBannerGlyphs are the half-block glyphs Claude Code's startup logo is
-// drawn from. They appear in no agent prose, which is what makes a leading one
-// a reliable banner marker.
+// claudeBannerGlyphs are the glyphs Claude Code's startup logo is drawn from.
 var claudeBannerGlyphs = map[rune]bool{
 	'▐': true, '▛': true, '▜': true, '▌': true, '▝': true, '▘': true, '█': true,
 }
+
+// claudeBannerCornerGlyphs are the logo's QUADRANT and half-block glyphs — the
+// subset that "█" is not. Requiring these is what separates the logo from a
+// progress bar or bar chart the agent printed: a bar is drawn from solid blocks
+// (and shade glyphs), essentially never from the corner pieces the logo's
+// silhouette needs.
+var claudeBannerCornerGlyphs = map[rune]bool{
+	'▐': true, '▛': true, '▜': true, '▌': true, '▝': true, '▘': true,
+}
+
+// claudeBannerMarker corroborates the whole banner block. The logo's first row
+// always carries the product name, so its ABSENCE from the head of a capture
+// means whatever block glyphs are there belong to the agent's own output, not
+// to a banner. This is the load-bearing half of the check: a pane capture does
+// not guarantee the logo is still on screen — herdr's "recent" read is a
+// consuming delta, and a scrolled pane can begin mid-output — so without the
+// marker a legitimate "████████ 80% done" as the FIRST captured line would be
+// deleted, and two screens differing only in bar length would collapse onto one
+// signature.
+const claudeBannerMarker = "Claude Code"
 
 // claudeFooterLines bounds how far back from the end of the capture the
 // footer-only filters (mode line, herdr status bar) may look. Those two shapes
@@ -66,10 +84,10 @@ var claudeBannerGlyphs = map[rune]bool{
 const claudeFooterLines = 8
 
 // claudeBannerLines bounds the banner filter to the head of the capture, the
-// only place the startup logo renders. Without the bound, any line that begins
-// with a block glyph and carries two of them — a progress bar or bar chart the
-// agent printed, "████████ 80% done" — would be deleted mid-transcript, and two
-// screens differing only in bar length would collapse onto one signature.
+// only place the startup logo renders. The bound alone is NOT sufficient — a
+// scrolled or delta capture can begin with the agent's own block-glyph output —
+// so it is one of three pieces of evidence, alongside claudeBannerMarker and
+// the per-line corner-glyph structure.
 const claudeBannerLines = 6
 
 // claudeStatusBarFields is the minimum number of "|" separators for a trailing
@@ -97,10 +115,14 @@ const claudeStatusBarFields = 3
 func StripClaudeChrome(pane string) string {
 	lines := strings.Split(pane, "\n")
 	footerFrom := len(lines) - claudeFooterLines
+	// The banner filter is armed only when the head of the capture actually
+	// shows the startup logo (see claudeBannerMarker). On every other capture it
+	// stays off entirely, so the agent's own block-glyph output is never at risk.
+	bannerPresent := claudeBannerHead(lines)
 	kept := make([]string, 0, len(lines))
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if i < claudeBannerLines && claudeBannerLine(trimmed) {
+		if bannerPresent && i < claudeBannerLines && claudeBannerLine(trimmed) {
 			continue
 		}
 		if claudeRuleLineRE.MatchString(trimmed) {
@@ -151,11 +173,32 @@ func dropTrailingComposer(lines []string) []string {
 	return lines
 }
 
+// claudeBannerHead reports whether the head of the capture actually shows the
+// startup logo, by looking for the product name the logo's first row always
+// carries. It is what arms the banner filter at all: block glyphs alone are not
+// evidence of a banner, because a capture may begin anywhere in the agent's
+// output.
+func claudeBannerHead(lines []string) bool {
+	for i, line := range lines {
+		if i >= claudeBannerLines {
+			return false
+		}
+		if strings.Contains(line, claudeBannerMarker) {
+			return true
+		}
+	}
+	return false
+}
+
 // claudeBannerLine reports whether a trimmed line is part of the startup logo.
-// It requires the line to BEGIN with a logo glyph and to carry at least two of
-// them, so a single stray block character inside a sentence is not enough.
-// This covers all three banner rows, including the one whose only other
-// content is the cwd.
+// It requires the line to BEGIN with a logo glyph and to carry at least two
+// CORNER glyphs — the quadrant/half-block pieces the logo's silhouette is built
+// from, which "█" is not.
+//
+// The corner requirement is what keeps a bar out: "████████ 80% done" is drawn
+// from solid blocks and has no corner pieces, so it is content even when the
+// banner filter is armed. It covers all three banner rows, including the one
+// whose only other content is the cwd ("▘▘ ▝▝    /path").
 func claudeBannerLine(trimmed string) bool {
 	runes := []rune(trimmed)
 	if len(runes) == 0 || !claudeBannerGlyphs[runes[0]] {
@@ -163,7 +206,7 @@ func claudeBannerLine(trimmed string) bool {
 	}
 	n := 0
 	for _, r := range runes {
-		if claudeBannerGlyphs[r] {
+		if claudeBannerCornerGlyphs[r] {
 			n++
 		}
 	}

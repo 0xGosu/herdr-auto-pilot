@@ -335,6 +335,11 @@ whose manifest carries exactly that version).
   the footer window is the entire capture on a short pane. The status bar needs three pieces of
   evidence together (>=3 pipes, no leading `|`, and the terminal-width padding run before its
   trailing token) — the pipe count alone also matches a shell pipeline the agent reported running.
+  The banner filter likewise needs positive evidence, not position: it is ARMED only when the head
+  of the capture carries the `Claude Code` marker, and each line must hold >=2 CORNER glyphs
+  (`▐▛▜▌▝▘`, which `█` is not). A capture does not guarantee the logo is on screen — `--source
+  recent` is a consuming delta and a scrolled pane starts mid-output — so `████████ 80% done` can
+  legitimately be line 1, and stripping it would collapse two screens differing only in bar length.
   Accepted trade-offs: a status bar rendered WITHOUT a trailing token is not recognized (chrome
   survives into the salient — degraded, never dangerous), and a pane left with only a word or two
   after the strip trips the over-masking floor and escalates.
