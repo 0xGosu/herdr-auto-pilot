@@ -79,8 +79,8 @@ Single **Operator** role; multi-user access is explicitly out of scope.
 |---|---|---|
 | Language / distribution | **Go**, single static binary; subcommands `daemon` / `tui` / `mcp` / `embed-worker` / CLI verbs | No runtime dependency; strong concurrency for the monitor loop |
 | Herdr events | **Raw socket** `events.subscribe` (JSON) | Long-lived agent-status subscription |
-| Herdr notifications (TUI) | **Raw socket** `notification.show` (JSON) | Reports whether the toast was displayed, so the TUI can fall back to the terminal bell |
-| Herdr actions | **CLI via `HERDR_BIN_PATH`** (`agent send`, `pane read`, `pane send-keys`, `pane get`, `pane zoom`, `agent list`, `notification show`, plus `tab focus`, `workspace list`, `tab list` behind the optional `FocusPort`/`LocatorPort`) | Portable across Unix socket / Windows named pipe |
+| Herdr notifications (TUI + daemon) | **Raw socket** `notification.show` (JSON), CLI as transport fallback | Reports whether the toast was displayed, so the TUI can fall back to the terminal bell and the daemon can record that an escalation reached nobody |
+| Herdr actions | **CLI via `HERDR_BIN_PATH`** (`agent send`, `pane read`, `pane send-keys`, `pane get`, `pane zoom`, `agent list`, plus `tab focus`, `workspace list`, `tab list` behind the optional `FocusPort`/`LocatorPort`) | Portable across Unix socket / Windows named pipe |
 | History / audit | **Embedded SQLite (WAL)** | Transactional, corruption-safe concurrent access, queryable |
 | Operator config / rules | **TOML** in the plugin config dir | Hand-editable thresholds, never-auto patterns, classifier manifests, task sources, embedding tuning |
 | Daemon coordination | **Unix-domain control socket** (named pipe on Windows) | Sub-second reload propagation, no idle polling |
@@ -963,7 +963,7 @@ the sections they gate.
 |---|---|---|
 | **IR-001** | Herdr event subscription | Subscribe to Herdr agent-status transition events (raw socket `events.subscribe`) to drive monitoring without polling. |
 | **IR-002** | Herdr control actions | Send prompts/responses to agents and read pane content via Herdr's documented CLI commands (`agent send`, `pane read`, `pane get`, `pane send-keys`, `pane zoom`, `agent list`, `notification show`, and — behind optional ports — `tab focus`, `workspace list`, `tab list`). |
-| **IR-003** | Herdr notifications | Surface escalations and critical failures via Herdr notifications in addition to the TUI. The daemon uses the CLI (`notification show`); the TUI uses the socket method (`notification.show`), which reports whether the toast was actually displayed so it can fall back to the terminal bell when Herdr drops it. |
+| **IR-003** | Herdr notifications | Surface escalations and critical failures via Herdr notifications in addition to the TUI. Both front-ends prefer the socket method (`notification.show`), which reports whether the toast was actually displayed; the CLI (`notification show`) is the transport-failure fallback only, because it exits 0 whether or not a toast was painted. The TUI acts on the report by falling back to the terminal bell; the daemon, having no second channel, records it — an escalation Herdr declined to paint means the operator was never interrupted, and the log says so. A toast Herdr *answered and declined* is never retried through the CLI (same Herdr, same verdict); an unreported delivery is recorded as unknown rather than claimed. |
 | **IR-004** | Herdr plugin manifest | Package as a Herdr plugin declaring id/version, pinned `min_herdr_version`, the TUI pane command, event hooks, and build steps in `herdr-plugin.toml`. |
 | **IR-005** | Local LLM CLI | Integrate an optional, operator-configured local LLM/agent CLI for the hybrid decision fallback, treating its absence or failure as an escalation trigger. |
 

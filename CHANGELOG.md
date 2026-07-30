@@ -5,6 +5,13 @@ section in `CLAUDE.md`. Entries go under the version that will carry them: mergi
 to main auto-releases the next patch, so a PR adds its lines under that number
 (or under the minor/major version it bumps the manifest to).
 
+## 0.5.14
+
+- Changed the daemon to raise its herdr notifications over the socket API instead of the `herdr notification show` CLI, so it now learns whether a toast was actually displayed. The CLI exits 0 even when herdr paints nothing, which meant an escalation could be dropped — notifications turned off, rate limited, no foreground client — with the daemon assuming the operator had been told
+- Added the delivery outcome to the daemon's `escalated` log line: `notified=true`, or `notified=false` with the reason herdr gave. Absent when nothing reported it, so the log never turns "we don't know" into a claim
+- Kept the CLI as the fallback for when the socket itself is unreachable. A request herdr answered and refused is never re-fired through it — same herdr, same verdict — and neither is one already refused locally or cancelled by shutdown
+- Changed the notification timeout to bound the whole socket-then-CLI attempt rather than each hop, so adding the socket cannot make a wedged herdr stall the daemon longer than the CLI alone did
+
 ## 0.5.13
 
 - Fixed long text being invisible past the right edge of the TUI while typing it. Every text input — add task, edit a task, correct a suggestion, the `/` filter, every config value — now wraps to the pane width, so the whole entry is readable without breaking the sentence with `shift+enter` to see it
