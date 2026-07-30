@@ -300,6 +300,44 @@ whose manifest carries exactly that version).
   under `<state>/match-index` is a disposable cache (mem-only scorch does NOT serve KNN — keep
   it disk-backed). Embed calls are stall-guarded and latch a degraded mode after 5 consecutive
   failures (a fixed constant, not configurable).
+- **A short PANE-TAIL salient is never embedded — on EITHER side of the comparison** — below
+  `embedding.min_salient_chars` (default 100, on the masked salient) matching uses BM25 instead.
+  **STRUCTURED salients are exempt at any length, and that exemption is load-bearing**: they are
+  short by construction (`permission:proceed | options:no;yes` is 35 chars), so a floor over them
+  would switch cosine matching off for every approval, choice and error rule — the paraphrase
+  matching the feature exists for. They are already guarded on their own terms
+  (`ApprovalRemapCompatible`, `StructuredSalient`). If every pre-existing semantic test needs a
+  lowered floor to pass, the floor's scope is wrong — that was the tell the first time.
+  Sentence embeddings are not discriminative on a few generic tokens: any two near-empty screens
+  land above `similarity_threshold`, so ONE almost-empty learned rule becomes a magnet that
+  silently answers every unrelated situation. `domain.EmbeddableSalient` is the single definition
+  and is enforced three times, because closing only the query side still lets a long screen match
+  a short stored rule: the incoming situation skips the embed call, a newly minted short rule is
+  persisted with no vector, and an existing short rule is stripped of its vector by
+  `reembed.Reconcile` AND vetoed again in `resolveSignature`'s vector accept filter (the veto
+  covers the window before a rebuild — an index built by an older build, or a row added under a
+  lower floor). Reconcile runs at every daemon start and `[embedding]` reload, which is what heals
+  an existing database with no migration. Such a rule stays reachable by BM25 and exact hash; only
+  cosine is closed to it. Keep the paired tests
+  (`TestResolveSignatureShortSalientSkipsEmbedding` / `…ShortStoredRuleIsExcludedFromVectorSearch` /
+  `…ShortStoredRuleStillMatchesByText` / `TestReconcileShortSalientRowsAreStrippedOfVectors`).
+- **Agent-TUI chrome is redacted from pane-tail salients, gated on agent type** —
+  `domain.StripClaudeChrome` (banner, `───` rules, spinner/token-counter line, `⏵⏵` mode line,
+  herdr status bar, trailing `❯` composer) for claude; `domain.StripCodexComposer` for codex.
+  Chrome is byte-identical across unrelated panes, so it BOTH inflates similarity between
+  different screens and eats the `pane_salient_chars` window. The strip runs in `salientContent`
+  BEFORE the window is taken, and only on the pane-tail branch — structured salients return
+  earlier. It only ever deletes lines it can positively identify; an unrecognized line is kept, so
+  two different screens stay different (fail-safe). The `❯` filter is anchored on "last non-empty
+  line" because `❯` is also an option-list caret — never widen it to the bare glyph. Every filter is
+  ANCHORED for the same reason (leading spinner glyph, leading mode glyph, banner glyph at line
+  start): a bare substring test deletes a whole line when the agent merely QUOTES the phrase, and
+  the footer window is the entire capture on a short pane. The status bar needs three pieces of
+  evidence together (>=3 pipes, no leading `|`, and the terminal-width padding run before its
+  trailing token) — the pipe count alone also matches a shell pipeline the agent reported running.
+  Accepted trade-offs: a status bar rendered WITHOUT a trailing token is not recognized (chrome
+  survives into the salient — degraded, never dangerous), and a pane left with only a word or two
+  after the strip trips the over-masking floor and escalates.
 
 ## Testing practices
 

@@ -1,0 +1,204 @@
+package domain
+
+import (
+	"strings"
+	"testing"
+)
+
+// claudeFooter is the chrome block that closes every Claude Code pane: the two
+// rules around the composer, herdr's status bar, and the permission-mode line.
+const claudeFooter = "" +
+	"────────────────────────────────────────────────────────────────────────\n" +
+	"❯\n" +
+	"────────────────────────────────────────────────────────────────────────\n" +
+	"  workspace | Fable 5 (7%) | default | 581cf618-d98b-4eac-b665-019083a8f31f      focus\n" +
+	"  -- INSERT -- ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents"
+
+// claudeBanner is the startup logo, including the row whose only other content
+// is the cwd.
+const claudeBanner = "" +
+	" ▐▛███▜▌   Claude Code v2.1.220\n" +
+	"▝▜█████▛▘  Opus 5 with high effort · Claude Max\n" +
+	"  ▘▘ ▝▝    /workspaces/herdr-auto-pilot"
+
+func TestStripClaudeChrome(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "banner and footer around real content",
+			in:   claudeBanner + "\n\n● All tests pass.\n\n" + claudeFooter,
+			want: "● All tests pass.",
+		},
+		{
+			name: "banner alone",
+			in:   claudeBanner,
+			want: "",
+		},
+		{
+			name: "footer alone",
+			in:   claudeFooter,
+			want: "",
+		},
+		{
+			name: "live spinner line with counters",
+			in:   "● Working on it.\n✽ Thinking… (12s · ↑ 1.2k tokens · esc to interrupt)",
+			want: "● Working on it.",
+		},
+		{
+			name: "retry countdown line",
+			in:   "● Retrying.\n✻ API error — will retry in 4s",
+			want: "● Retrying.",
+		},
+		{
+			name: "typed but unsubmitted composer text is chrome",
+			in:   "● Done.\n" + strings.Replace(claudeFooter, "❯\n", "❯ /hap check the plugin\n", 1),
+			want: "● Done.",
+		},
+		{
+			name: "plan-mode footer variant",
+			in:   "● Ready.\n⏸ plan mode on (shift+tab to cycle)",
+			want: "● Ready.",
+		},
+		{
+			name: "bypass-permissions footer variant",
+			in:   "● Ready.\n⏵⏵ bypass permissions on",
+			want: "● Ready.",
+		},
+		{
+			// Only a LEADING spinner glyph marks the status line. A sentence
+			// that merely mentions the phrase is content: deleting the line
+			// would let two different screens collapse onto one signature.
+			name: "prose mentioning the marker phrase survives",
+			in:   "● The footer says esc to interrupt while a tool is running.",
+			want: "● The footer says esc to interrupt while a tool is running.",
+		},
+		{
+			// Same rule as the spinner line: the mode-line filter is
+			// line-anchored, so prose quoting Claude's UI is content.
+			name: "prose quoting the mode-line hint survives",
+			in:   "● Press (shift+tab to cycle) to switch permission modes.",
+			want: "● Press (shift+tab to cycle) to switch permission modes.",
+		},
+		{
+			name: "no chrome at all is a no-op",
+			in:   "● The refactor is complete and committed.\n\n  Anything else?",
+			want: "● The refactor is complete and committed.\n\n  Anything else?",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := strings.TrimSpace(StripClaudeChrome(tc.in))
+			if got != tc.want {
+				t.Errorf("StripClaudeChrome():\n got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStripClaudeChromeKeepsOptionCaret pins the reason the composer filter is
+// anchored on "last non-empty line" rather than on the "❯" glyph: an option
+// list draws the very same caret in front of its highlighted choice, and
+// deleting that would silently change which question was asked.
+func TestStripClaudeChromeKeepsOptionCaret(t *testing.T) {
+	pane := "How deep should the feature test go?\n\n" +
+		"❯ 1. Read-only + config\n  2. Full end-to-end\n  3. Read-only only\n\n" +
+		"Enter to select · ↑/↓ to navigate · Esc to cancel"
+	got := StripClaudeChrome(pane)
+	if !strings.Contains(got, "❯ 1. Read-only + config") {
+		t.Errorf("option caret must survive; got:\n%s", got)
+	}
+}
+
+// TestStripClaudeChromeKeepsProseWithPipes guards the status-bar filter: it is
+// the loosest of the set, so it must not reach ordinary content. A markdown
+// table row is the shape most at risk, and prose far from the footer must be
+// out of range entirely.
+func TestStripClaudeChromeKeepsProseWithPipes(t *testing.T) {
+	pane := "| col a | col b | col c |\n" +
+		"|---|---|---|\n" +
+		"| 1 | 2 | 3 |\n" +
+		"● Ran the pipeline: cat x | grep y | sort | uniq — three matches.\n" +
+		strings.Repeat("filler line\n", claudeFooterLines)
+	got := StripClaudeChrome(pane)
+	for _, want := range []string{"| col a | col b | col c |", "cat x | grep y | sort | uniq"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("content %q was stripped; got:\n%s", want, got)
+		}
+	}
+}
+
+// TestStripClaudeChromeKeepsPipedContentInsideTheFooterWindow is the case the
+// window alone does NOT cover: on a short capture every line is inside the
+// footer window, so a shell pipeline the agent reported sits squarely in range
+// of the status-bar filter. The pipe count is therefore not sufficient evidence
+// — the terminal-width padding run before the trailing token is what actually
+// identifies the bar. Deleting this line would drop real content and could
+// collapse two different screens onto one signature.
+func TestStripClaudeChromeKeepsPipedContentInsideTheFooterWindow(t *testing.T) {
+	for _, line := range []string{
+		"● Ran: git log --oneline | grep fix | head -3 | cat",
+		"● Output was: name | size | mode | owner",
+	} {
+		got := StripClaudeChrome(line) // one line: unavoidably in the footer window
+		if strings.TrimSpace(got) != line {
+			t.Errorf("piped content inside the footer window was stripped:\n in  %q\n got %q", line, got)
+		}
+	}
+}
+
+// TestStripClaudeChromeKeepsBlockGlyphContentBelowTheHead: the banner only ever
+// renders at the top of a capture, so the filter is bounded there. A progress
+// bar or bar chart the agent printed uses the same glyphs, and deleting it
+// would fuse two screens that differ only in bar length.
+func TestStripClaudeChromeKeepsBlockGlyphContentBelowTheHead(t *testing.T) {
+	bar := "████████ 80% done"
+	pane := strings.Repeat("some earlier output line\n", claudeBannerLines) + bar
+	if got := StripClaudeChrome(pane); !strings.Contains(got, bar) {
+		t.Errorf("a progress bar below the head must survive; got:\n%s", got)
+	}
+	// ...while the real banner, at the head, still goes.
+	if got := StripClaudeChrome(claudeBanner); strings.TrimSpace(got) != "" {
+		t.Errorf("the banner at the head must still be stripped; got %q", got)
+	}
+}
+
+// TestStripClaudeChromeStatusBarOnlyInFooter pins the footer window: the same
+// pipe-heavy line is chrome at the bottom of the capture and content above it.
+func TestStripClaudeChromeStatusBarOnlyInFooter(t *testing.T) {
+	// The real bar carries terminal-width padding before its trailing token;
+	// that padding is part of what identifies it (see claudeStatusBarLine).
+	bar := "  workspace | Fable 5 (7%) | default | 581cf618          focus"
+	tail := StripClaudeChrome("● Done.\n" + bar)
+	if strings.Contains(tail, "workspace |") {
+		t.Errorf("status bar in the footer must be stripped; got:\n%s", tail)
+	}
+	body := StripClaudeChrome(bar + "\n" + strings.Repeat("real content line\n", claudeFooterLines))
+	if !strings.Contains(body, "workspace |") {
+		t.Errorf("the same shape above the footer window must survive; got:\n%s", body)
+	}
+}
+
+func TestClaudeBannerLine(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"▐▛███▜▌   Claude Code v2.1.220", true},
+		{"▝▜█████▛▘  Opus 5 with high effort · Claude Max", true},
+		{"▘▘ ▝▝    /workspaces/herdr-auto-pilot", true},
+		{"", false},
+		{"● All tests pass.", false},
+		// One stray glyph mid-sentence is not a banner: the line must BEGIN
+		// with a logo glyph and carry at least two of them.
+		{"the ▌ character renders a half block", false},
+		{"▌ a quoted line with a single leading block", false},
+	}
+	for _, tc := range tests {
+		if got := claudeBannerLine(tc.in); got != tc.want {
+			t.Errorf("claudeBannerLine(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

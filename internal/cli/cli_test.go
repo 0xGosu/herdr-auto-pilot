@@ -1141,7 +1141,7 @@ func TestSignaturesReembedNudgesRunningDaemon(t *testing.T) {
 		t.Errorf("running daemon should be nudged, got:\n%s", out)
 	}
 	// The CLI did not write the rows itself — the daemon owns them.
-	if n, _ := st.CountStaleSignatureEmbeddings(context.Background(), "test-model.gguf"); n != 1 {
+	if n, _ := st.CountStaleSignatureEmbeddings(context.Background(), "test-model.gguf", 1); n != 1 {
 		t.Errorf("stale rows = %d, want 1 (untouched by the CLI)", n)
 	}
 }
@@ -1158,7 +1158,7 @@ func TestSignaturesReembedRefusesStaleDaemon(t *testing.T) {
 		t.Errorf("stale daemon must refuse with the --ensure remedy, got %v", err)
 	}
 	// The rows are untouched — the CLI did not fall through to standalone.
-	if n, _ := st.CountStaleSignatureEmbeddings(context.Background(), "test-model.gguf"); n != 1 {
+	if n, _ := st.CountStaleSignatureEmbeddings(context.Background(), "test-model.gguf", 1); n != 1 {
 		t.Errorf("stale rows = %d, want 1 (untouched)", n)
 	}
 }

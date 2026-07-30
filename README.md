@@ -542,6 +542,14 @@ disabled = false
 model_path = ""            # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
 similarity_threshold = 0.90 # min cosine similarity to reuse a learned signature
 bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1]
+min_salient_chars = 0       # 0 = 100. Below this many characters a situation is
+                            # matched by BM25 instead of embedding — short text
+                            # embeds indiscriminately, which is how one
+                            # almost-empty rule comes to answer everything. Applies
+                            # to stored rules too: a rule below the floor is
+                            # excluded from vector search and served by text
+                            # matching and exact hash only. Approval/choice/error
+                            # rules are exempt at any length (short by design).
 model_context_window = 0    # 0 = bundled-model default (512 tokens); input is
                             # truncated below this limit before embedding
 embed_timeout_ms = 0        # 0 = 2000ms stall guard per warm embed call (max 600000)

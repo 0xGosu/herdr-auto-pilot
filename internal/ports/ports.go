@@ -435,7 +435,10 @@ type ReadStore interface {
 	CountSignatureEmbeddings(ctx context.Context) (int64, error)
 	// CountStaleSignatureEmbeddings counts rows a re-embed under the given
 	// model id would rewrite (other-model vectors and text-only rows).
-	CountStaleSignatureEmbeddings(ctx context.Context, model string) (int64, error)
+	// Rows below minSalientChars are excluded: they are vectorless on purpose
+	// (see domain.EmbeddableSalient), so counting them would report drift that
+	// no re-embed could ever clear.
+	CountStaleSignatureEmbeddings(ctx context.Context, model string, minSalientChars int) (int64, error)
 	// GetSignatureSnapshot returns the pane excerpt a signature was first
 	// seen with, or "" when none was captured (pre-snapshot rules).
 	GetSignatureSnapshot(ctx context.Context, signature string) (string, error)

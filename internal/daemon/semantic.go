@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"unicode/utf8"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -30,7 +31,7 @@ func (d *Daemon) initSemantic(ctx context.Context, gen int64) {
 	// stale dims) from their stored salient text, so a model swap keeps
 	// every signature matchable. Warm failure is not fatal: the index still
 	// serves BM25 text matching (dims 0).
-	res, err := reembed.Reconcile(ctx, d.opt.Store, d.embedderPort(),
+	res, err := reembed.Reconcile(ctx, d.opt.Store, d.embedderPort(), cfg.Embedding.MinSalientChars,
 		func(_, _ int, sig string, rowErr error) {
 			if rowErr != nil {
 				slog.Warn("re-embedding stored signature failed; row serves text matching only",
@@ -65,7 +66,12 @@ func (d *Daemon) initSemantic(ctx context.Context, gen int64) {
 		return // a newer reload raced past; it decides readiness
 	}
 	d.semanticReady.Store(true)
-	slog.Info("semantic matching ready", "signatures", len(res.Rows), "vector_dims", res.Dims)
+	// below_floor is reported on every start rather than left silent: it is the
+	// number of learned rules that vector search will not see, and a mistyped
+	// min_salient_chars is otherwise invisible (those rows are excluded from the
+	// drift count too, so `hap status` would report nothing amiss).
+	slog.Info("semantic matching ready", "signatures", len(res.Rows),
+		"vector_dims", res.Dims, "below_floor", res.TooShort)
 }
 
 // resolveSignature maps a freshly computed signature to its learning key:
@@ -106,11 +112,21 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 
 	scope := match.Scope{SituationType: s.Type, AgentType: s.AgentType}
 	var vec []float32
+	// A salient below the floor is matched by text, never by embedding: at that
+	// length cosine collapses unrelated screens onto each other (see
+	// domain.EmbeddableSalient). Skipping the embed call here also means the row
+	// minted below carries NO vector, so a short situation learned now can never
+	// become a cosine candidate for anything later.
+	embeddable := domain.EmbeddableSalient(sig.Salient, cfg.Embedding.MinSalientChars)
+	if !embeddable {
+		slog.Debug("salient below min_salient_chars; using text matching",
+			"chars", utf8.RuneCountInString(sig.Salient), "raw", sig.Raw)
+	}
 	// Dims() flips non-zero only after the first successful embed (the
 	// background warmup): before that a hung model load could stall THIS
 	// goroutine — the daemon select loop — for the full warm timeout, so
 	// the loop never embeds until the warmup has proven the model healthy.
-	if emb := d.embedderPort(); emb != nil && emb.Dims() > 0 {
+	if emb := d.embedderPort(); embeddable && emb != nil && emb.Dims() > 0 {
 		v, err := emb.EmbedText(ctx, sig.Salient)
 		switch {
 		case err != nil:
@@ -120,7 +136,24 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 			slog.Warn("embed failed; trying text match", "error", err)
 		default:
 			vec = v
-			accept := func(h match.Hit) bool { return remapAllowed(s, sig, h) }
+			// The floor is symmetric: a STORED rule whose salient is below it
+			// is excluded from vector search too, however similar it scores.
+			// reembed.Reconcile already strips such rows of their vectors at
+			// every daemon start, so this veto is what closes the window before
+			// that runs (an index built by an older build, or a row added under
+			// a lower floor earlier in this process). Vetoed candidates are
+			// skipped, the next of the top-K is tried, and if none is acceptable
+			// the situation mints a fresh key and escalates — the safe
+			// direction. The rule stays reachable by BM25 and by exact hash;
+			// only cosine is closed to it.
+			accept := func(h match.Hit) bool {
+				if !domain.EmbeddableSalient(h.Salient, cfg.Embedding.MinSalientChars) {
+					slog.Debug("vector candidate below min_salient_chars; skipped",
+						"candidate", h.Signature, "raw", sig.Raw)
+					return false
+				}
+				return remapAllowed(s, sig, h)
+			}
 			hit, ok, err := d.matcher.MatchVector(ctx, vec, scope, accept)
 			if err != nil {
 				// Fall back to BM25 below: clear vec so the vec==nil text path

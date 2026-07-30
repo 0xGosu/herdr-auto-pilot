@@ -364,7 +364,7 @@ func (a *App) embeddingDrift(ctx context.Context, cfg config.Config) (EmbeddingD
 	if d.Total, err = a.Store.CountSignatureEmbeddings(ctx); err != nil {
 		return d, err
 	}
-	if d.Stale, err = a.Store.CountStaleSignatureEmbeddings(ctx, d.ModelID); err != nil {
+	if d.Stale, err = a.Store.CountStaleSignatureEmbeddings(ctx, d.ModelID, cfg.Embedding.MinSalientChars); err != nil {
 		return d, err
 	}
 	d.Detected = d.Stale > 0
@@ -415,11 +415,18 @@ func (a *App) ReembedStandalone(ctx context.Context, progress reembed.RowFunc) (
 		emb = embedder.New(cfg.Embedding)
 	}
 	defer emb.Close()
-	res, err = reembed.Reconcile(ctx, ws, emb, progress, nil)
+	res, err = reembed.Reconcile(ctx, ws, emb, cfg.Embedding.MinSalientChars, progress, nil)
 	if err != nil {
 		return res, err
 	}
 	if res.WarmErr != nil {
+		// The below-floor exclusion runs before the embedder is warmed and does
+		// rewrite rows, so "nothing re-embedded" would be a false report when it
+		// stripped any. Name what actually happened.
+		if res.TooShort > 0 {
+			return res, fmt.Errorf("embedding model unavailable, nothing re-embedded (%d rule(s) below min_salient_chars were still excluded from similarity search): %w",
+				res.TooShort, res.WarmErr)
+		}
 		return res, fmt.Errorf("embedding model unavailable, nothing re-embedded: %w", res.WarmErr)
 	}
 	// Best-effort: if a daemon appeared mid-run, have it reload the index.
@@ -1560,6 +1567,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "embedding.model_path"}, // path
 	{Key: "embedding.similarity_threshold", TUIEditable: true},
 	{Key: "embedding.bm25_min_score", TUIEditable: true},
+	{Key: "embedding.min_salient_chars", TUIEditable: true},
 	{Key: "embedding.pane_salient_chars", TUIEditable: true, TUIHidden: true},
 	{Key: "embedding.model_context_window", TUIEditable: true},
 	{Key: "embedding.embed_timeout_ms", TUIEditable: true},
@@ -1656,6 +1664,11 @@ func FieldValue(cfg config.Config, key string) string {
 			return fmt.Sprintf("%g (default)", domain.DefaultConfirmationWeight)
 		}
 		return fmt.Sprintf("%g", cfg.Learning.ConfirmationWeight)
+	case "embedding.min_salient_chars":
+		if cfg.Embedding.MinSalientChars <= 0 {
+			return fmt.Sprintf("%d (default)", domain.DefaultMinSalientChars)
+		}
+		return strconv.Itoa(cfg.Embedding.MinSalientChars)
 	case "embedding.pane_salient_chars":
 		if cfg.Embedding.PaneSalientChars <= 0 {
 			return fmt.Sprintf("%d (default)", domain.DefaultPaneSalientChars)
@@ -1833,6 +1846,8 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			cfg.Learning.ConfirmationWeight = v
 			return nil
+		case "embedding.min_salient_chars":
+			return setInt(&cfg.Embedding.MinSalientChars)
 		case "embedding.pane_salient_chars":
 			return setInt(&cfg.Embedding.PaneSalientChars)
 		case "limits.max_consecutive_auto_prompts":

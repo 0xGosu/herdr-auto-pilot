@@ -365,6 +365,24 @@ type Embedding struct {
 	// near-duplicate renders score ~0.4 while different actions score below
 	// ~0.26 or miss entirely.
 	BM25MinScore float64 `toml:"bm25_min_score"`
+	// MinSalientChars is the floor, in characters, below which a situation is
+	// matched by BM25 text search instead of embedding similarity. It is
+	// measured on the MASKED salient — the exact string that would be embedded.
+	// 0 → the built-in default (domain.DefaultMinSalientChars, 100); negative
+	// values reset to it.
+	//
+	// Short salients are what make one near-empty learned rule answer every
+	// unrelated screen: a few generic tokens embed into a vector that sits above
+	// similarity_threshold from almost any other short string. The floor applies
+	// to BOTH sides of a comparison — the incoming situation skips embedding, a
+	// new short rule is stored with no vector, and an existing short rule is
+	// dropped from vector search — so a rule below it is reachable by text
+	// matching and exact hash only.
+	//
+	// Raising it pushes more situations onto BM25 (bm25_min_score then governs
+	// them); lowering it toward 0 restores the old embed-everything behavior and
+	// with it the near-empty-rule magnet.
+	MinSalientChars int `toml:"min_salient_chars"`
 	// ModelContextWindow overrides the embedding model's maximum sequence
 	// length (position-embedding limit). Input is truncated to this many
 	// tokens before embedding, so it MUST NOT exceed what the model supports:
@@ -698,6 +716,9 @@ func Default() Config {
 		Embedding: Embedding{
 			SimilarityThreshold: 0.90,
 			BM25MinScore:        0.35,
+			// MinSalientChars is deliberately left at 0 (like PaneSalientChars):
+			// the domain owns the number, and config stays decoupled from it.
+			// domain.EmbeddableSalient resolves 0 to DefaultMinSalientChars.
 		},
 		TUI: TUI{TerminalBell: true, HerdrNotification: true, MaxInstances: 1},
 		CLI: CLI{AIAgentFriendlyOutput: true},
@@ -1139,6 +1160,12 @@ func (c *Config) fillZeroes() {
 	}
 	if c.Embedding.BM25MinScore <= 0 || c.Embedding.BM25MinScore > 1 {
 		c.Embedding.BM25MinScore = d.Embedding.BM25MinScore
+	}
+	// A negative floor is meaningless; fold it to 0, which the domain resolves
+	// to DefaultMinSalientChars. 0 is a legitimate stored value (the "use the
+	// default" spelling), so it is left alone — matching PaneSalientChars.
+	if c.Embedding.MinSalientChars < 0 {
+		c.Embedding.MinSalientChars = 0
 	}
 }
 

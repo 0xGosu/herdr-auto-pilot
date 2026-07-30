@@ -1660,13 +1660,13 @@ func TestCountStaleSignatureEmbeddings(t *testing.T) {
 		}
 	}
 
-	if n, err := s.CountStaleSignatureEmbeddings(ctx, "minilm"); err != nil || n != 2 {
+	if n, err := s.CountStaleSignatureEmbeddings(ctx, "minilm", 1); err != nil || n != 2 {
 		t.Errorf("stale for minilm = %d (%v), want 2 (foreign + text-only)", n, err)
 	}
-	if n, err := s.CountStaleSignatureEmbeddings(ctx, "third-model"); err != nil || n != 3 {
+	if n, err := s.CountStaleSignatureEmbeddings(ctx, "third-model", 1); err != nil || n != 3 {
 		t.Errorf("stale for third-model = %d (%v), want 3", n, err)
 	}
-	if n, err := s.CountStaleSignatureEmbeddings(ctx, "old-model"); err != nil || n != 2 {
+	if n, err := s.CountStaleSignatureEmbeddings(ctx, "old-model", 1); err != nil || n != 2 {
 		t.Errorf("stale for old-model = %d (%v), want 2 (current + text-only)", n, err)
 	}
 }
@@ -2187,5 +2187,118 @@ func TestRecordTaskHandoutAttemptCountsWithoutAReservation(t *testing.T) {
 	}
 	if n, err := s.TaskHandoutAttempts(ctx, "/tasks.md", "step two"); err != nil || n != 0 {
 		t.Errorf("after clearing, counter = %d (err %v), want 0", n, err)
+	}
+}
+
+// TestCountStaleSignatureEmbeddingsExcludesShortSalients: a rule below
+// embedding.min_salient_chars is deliberately vectorless — it is excluded from
+// vector search, not waiting to be re-embedded. Counting it as stale would
+// leave `hap status` reporting embedding drift that `hap signatures reembed`
+// could never clear, because the next pass strips the vector again.
+func TestCountStaleSignatureEmbeddingsExcludesShortSalients(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	long := strings.Repeat("a", 120)
+
+	for _, e := range []domain.SignatureEmbedding{
+		// Short + vectorless: the intended terminal state, never stale.
+		{Signature: "idle:short", SituationType: domain.SituationIdle,
+			AgentType: "claude", Salient: "workspace focus", CreatedAt: now},
+		// Long + vectorless: genuinely awaiting a re-embed.
+		{Signature: "idle:long", SituationType: domain.SituationIdle,
+			AgentType: "claude", Salient: long, CreatedAt: now},
+	} {
+		if err := s.UpsertSignatureEmbedding(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n, err := s.CountStaleSignatureEmbeddings(ctx, "minilm", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("stale = %d, want 1 (only the long vectorless row)", n)
+	}
+	// minSalientChars <= 0 must resolve to the domain default, not to "no
+	// floor" — an untouched config stores 0.
+	if n, err = s.CountStaleSignatureEmbeddings(ctx, "minilm", 0); err != nil || n != 1 {
+		t.Errorf("stale with an unset floor = %d (%v), want 1", n, err)
+	}
+	// A lower floor puts the short row back in scope.
+	if n, err = s.CountStaleSignatureEmbeddings(ctx, "minilm", 1); err != nil || n != 2 {
+		t.Errorf("stale with floor 1 = %d (%v), want 2", n, err)
+	}
+}
+
+// TestCountStaleSignatureEmbeddingsCountsCharsNotBytes: SQLite's length() must
+// be measuring characters on the TEXT salient, matching the rune-based floor in
+// domain.EmbeddableSalient. If it counted bytes, multibyte content would clear
+// the floor at a third of its real length.
+func TestCountStaleSignatureEmbeddingsCountsCharsNotBytes(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	if err := s.UpsertSignatureEmbedding(ctx, domain.SignatureEmbedding{
+		Signature: "idle:cjk", SituationType: domain.SituationIdle, AgentType: "claude",
+		Salient:   strings.Repeat("同", 50), // 50 runes, 150 bytes
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.CountStaleSignatureEmbeddings(ctx, "minilm", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("stale = %d, want 0: 50 runes is below a 100-char floor even though it is 150 bytes", n)
+	}
+}
+
+// TestCountStaleSignatureEmbeddingsMirrorsEmbeddableSalient pins the SQL
+// predicate to domain.EmbeddableSalient. The query duplicates the floor (and
+// the structured-salient exemption) in SQL for efficiency, so the two must be
+// checked against each other or they will drift apart silently.
+func TestCountStaleSignatureEmbeddingsMirrorsEmbeddableSalient(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	const floor = 100
+
+	salients := []string{
+		"permission:proceed | options:no;yes",  // structured, short → exempt
+		"permission:select remote environment", // structured, short → exempt
+		"options:apple;banana",                 // structured, short → exempt
+		"error:usage_limit",                    // structured, short → exempt
+		"waiting for input",                    // pane-tail, short → excluded
+		"workspace default focus",              // pane-tail, short → excluded
+		// Case matters: SQLite LIKE is case-insensitive but
+		// domain.StructuredSalient is not, so an uppercase marker in raw screen
+		// text is the shape where an LIKE-based mirror silently disagreed.
+		"ERROR: cannot open file",     // pane-tail, short → excluded
+		"Options: pick one",           // pane-tail, short → excluded
+		strings.Repeat("a", floor),    // pane-tail, at the floor → counted
+		strings.Repeat("b", floor+40), // pane-tail, long → counted
+	}
+	want := 0
+	for i, sal := range salients {
+		// Every row is vectorless, so each is stale iff it is embeddable.
+		if err := s.UpsertSignatureEmbedding(ctx, domain.SignatureEmbedding{
+			Signature:     fmt.Sprintf("idle:%d", i),
+			SituationType: domain.SituationIdle, AgentType: "claude",
+			Salient: sal, CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if domain.EmbeddableSalient(sal, floor) {
+			want++
+		}
+	}
+
+	got, err := s.CountStaleSignatureEmbeddings(ctx, "minilm", floor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(got) != want {
+		t.Errorf("stale = %d, want %d — the SQL predicate has drifted from domain.EmbeddableSalient", got, want)
 	}
 }
