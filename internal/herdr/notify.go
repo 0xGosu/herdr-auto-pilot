@@ -2,6 +2,7 @@ package herdr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -35,6 +36,12 @@ const (
 // its update loop's goroutine pool), so this is far shorter than the CLI
 // adapter's 15s command timeout.
 const defaultNotifyTimeout = 3 * time.Second
+
+// ErrEmptyNotificationTitle is the local refusal of a title herdr would reject
+// with invalid_params. It is a caller bug, not a transport fault, so a chain
+// must recognize it and decline to spend a second channel on the same
+// invalid request (see FallbackNotifier).
+var ErrEmptyNotificationTitle = errors.New("notification title is empty")
 
 // SocketPath resolves herdr's control socket the way herdr itself documents:
 // HERDR_SOCKET_PATH when herdr injected it (every managed pane gets one),
@@ -121,7 +128,7 @@ func (n *SocketNotifier) Show(ctx context.Context, msg Notification) (ports.Noti
 		// herdr rejects an empty normalized title with invalid_params; catch
 		// it here so a caller's bug surfaces as its own error rather than a
 		// protocol one, and so we never open a connection for nothing.
-		return ports.NotifyResult{}, fmt.Errorf("notification title is empty")
+		return ports.NotifyResult{}, ErrEmptyNotificationTitle
 	}
 	params := map[string]any{"title": title}
 	if body := clampNotifyText(msg.Body, maxNotifyBody); body != "" {
@@ -145,7 +152,8 @@ func (n *SocketNotifier) Show(ctx context.Context, msg Notification) (ports.Noti
 	if err := call(ctx, n.dial, id, "notification.show", params, &result); err != nil {
 		return ports.NotifyResult{}, err
 	}
-	return ports.NotifyResult{Shown: result.Shown, Reason: result.Reason}, nil
+	// Known: herdr answered this one, so Shown is evidence rather than a guess.
+	return ports.NotifyResult{Shown: result.Shown, Reason: result.Reason, Known: true}, nil
 }
 
 // ShowNotification satisfies ports.NotifyShower — the title/body form the

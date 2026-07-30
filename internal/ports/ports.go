@@ -109,9 +109,17 @@ type NotifyPort interface {
 // NotifyResult reports what herdr did with a notification. Shown == false is
 // not a failure: herdr answered and declined to paint the toast, naming why
 // in Reason ("disabled", "rate_limited", "no_foreground_client", "busy").
+//
+// Known separates "herdr answered, and the answer was no" from "we never
+// found out". Only the socket method reports delivery; the CLI
+// (`notification show`) exits 0 whether or not a toast was painted, so a
+// caller that fell back to it holds no evidence either way. The zero value is
+// therefore the unknown one — a result nobody filled in never claims delivery
+// — and !Known must be read as "assume the operator was not reached".
 type NotifyResult struct {
 	Shown  bool
 	Reason string
+	Known  bool
 }
 
 // NotifyShower is the optional richer form of NotifyPort: it reports whether
