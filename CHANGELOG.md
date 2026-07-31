@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.20
+
+- Fixed `embedding.bm25_highbar_score` being invisible to `hap config` and the TUI config screen. It shipped settable in `config.toml` but `hap config set` rejected it as an unknown field, so the only way to change it was editing the file by hand. It is now listed and editable in both.
+- Added the eight `tui.palette.*` color roles to `hap config fields` and `hap config set`, which previously reached every other config key but not these. Values are validated — an unrecognized color renders as no color at all, and these roles are hidden from the TUI config screen, so a rejected value is the only feedback available. Setting a role to `""` clears it back to the selected theme.
+- Added a check that every key `config.toml` accepts is reachable from `hap config set`, so a new setting can no longer ship configurable in the file but unknown to the CLI.
+
 ## 0.5.19
 
 - Changed BM25 text matching to also run when embedding search finds no learned rule above `similarity_threshold`, not only when the embedder is unavailable or errored — a screen that is a textual near-duplicate of a rule hap already learned now reuses that rule instead of minting a new signature, re-escalating, and graduating from scratch.
