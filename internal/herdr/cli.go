@@ -99,13 +99,15 @@ func (c *CLI) Send(ctx context.Context, paneID, input string) error {
 
 // sendBehavior selects the per-agent-type submit hardening applied by send.
 type sendBehavior struct {
-	codexDoubleEnter bool // unconditional Enter after codexSecondEnterDelay
+	codexDoubleEnter bool // delayed extra Enter, only after an explicit one
 	retrySubmit      bool // status-gated exponential retry Enters
 }
 
-// SendToAgent hardens submission per agent type. Codex treats rapidly
-// injected text as a paste burst and interprets the first immediate Enter as
-// a newline, so it always gets a delayed second Enter. Codex and Claude
+// SendToAgent hardens submission per agent type. Codex treats rapidly injected
+// text as a paste burst and interprets the first immediate Enter as a newline,
+// so a send that pressed Enter ITSELF gets a delayed second one; a multi-line
+// send goes out through `agent prompt`, whose Enter is encoded into the same
+// request and is not swallowed, so it gets none (see send). Codex and Claude
 // additionally get status-gated retry Enters: when the agent was idle/done
 // before the send and its status has not moved afterwards, Enter is pressed
 // again with exponential backoff until the status changes (submitRetryMax
@@ -128,10 +130,19 @@ func (c *CLI) send(ctx context.Context, paneID, input string, b sendBehavior) er
 			preStatus, retry = st, true
 		}
 	}
-	if err := c.submitText(ctx, paneID, input); err != nil {
+	explicitEnter, err := c.submitText(ctx, paneID, input)
+	if err != nil {
 		return err
 	}
-	if b.codexDoubleEnter {
+	// The codex second Enter repairs ONE failure mode: codex reads rapidly
+	// injected text as a paste burst and swallows the immediately following
+	// Enter as a newline. That only happens when the Enter is a separate
+	// keystroke we sent ourselves. `agent prompt` encodes the submit inside the
+	// same bracketed-paste-aware request, so there is nothing to repair — and
+	// firing it anyway lands a bare Enter 300ms later on whatever codex has put
+	// on screen by then, which can submit a blank turn or accept a focused
+	// control. Gate it on having actually pressed Enter.
+	if b.codexDoubleEnter && explicitEnter {
 		if err := sleepCtx(ctx, codexSecondEnterDelay); err != nil {
 			return err
 		}
@@ -184,7 +195,11 @@ const (
 // 0.7.0) working. Only exit status 2 — herdr rejecting the verb itself —
 // demotes to it; a pane-level failure exits 1 with a JSON error and is returned
 // as-is, so a real delivery error is never retried as a second send.
-func (c *CLI) submitText(ctx context.Context, paneID, input string) error {
+// It reports whether the submit was a SEPARATE `pane send-keys enter` that it
+// issued itself (the typed route and the legacy fallback) rather than an Enter
+// herdr encoded into the same request. Callers that harden submission — the
+// codex second Enter — must only act when an explicit Enter was pressed.
+func (c *CLI) submitText(ctx context.Context, paneID, input string) (explicitEnter bool, err error) {
 	// Route on the BODY, not the raw string. A trailing newline is not
 	// multi-line content — it is the submit this function performs itself — and
 	// nothing upstream trims it: domain.DeliverOutbound returns the chosen
@@ -200,31 +215,34 @@ func (c *CLI) submitText(ctx context.Context, paneID, input string) error {
 }
 
 // submitTyped writes single-line input as literal terminal input, then submits
-// it. A menu digit must arrive this way or it selects nothing.
-func (c *CLI) submitTyped(ctx context.Context, paneID, input string) error {
+// it with an explicit Enter. A menu digit must arrive this way or it selects
+// nothing.
+func (c *CLI) submitTyped(ctx context.Context, paneID, input string) (bool, error) {
 	if _, err := c.run(ctx, "pane", "send-text", paneID, input); err != nil {
 		if !unsupportedSubcommand(err) {
-			return err
+			return false, err
 		}
 		if _, err := c.run(ctx, "agent", "send", paneID, input); err != nil {
-			return err
+			return false, err
 		}
 	}
-	_, err := c.run(ctx, "pane", "send-keys", paneID, "enter")
-	return err
+	if _, err := c.run(ctx, "pane", "send-keys", paneID, "enter"); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // submitPasted delivers multi-line input as one message. `agent prompt` submits
 // it itself, so no separate Enter follows — one here would be a SECOND submit.
-func (c *CLI) submitPasted(ctx context.Context, paneID, input string) error {
+func (c *CLI) submitPasted(ctx context.Context, paneID, input string) (bool, error) {
 	if c.sendShape.Load() != sendShapeLegacySend {
 		_, err := c.run(ctx, "agent", "prompt", paneID, input)
 		if err == nil {
 			c.sendShape.Store(sendShapeAgentPrompt)
-			return nil
+			return false, nil // herdr encoded the Enter; we pressed nothing
 		}
 		if !unsupportedSubcommand(err) {
-			return err
+			return false, err
 		}
 		slog.Warn("herdr does not support `agent prompt`; falling back to `agent send` + Enter",
 			"pane", paneID)
@@ -235,11 +253,13 @@ func (c *CLI) submitPasted(ctx context.Context, paneID, input string) error {
 		// turning one bad probe into a process-lifetime outage. Only a fallback
 		// that actually delivered earns the latch; anything else re-probes.
 		c.sendShape.Store(sendShapeUnresolved)
-		return err
+		return false, err
 	}
 	c.sendShape.Store(sendShapeLegacySend)
-	_, err := c.run(ctx, "pane", "send-keys", paneID, "enter")
-	return err
+	if _, err := c.run(ctx, "pane", "send-keys", paneID, "enter"); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // unsupportedSubcommand reports whether herdr rejected the VERB rather than

@@ -533,6 +533,59 @@ func countCalls(calls []string, call string) int {
 	return n
 }
 
+func TestSendToCodexMultiLineGetsNoSecondEnter(t *testing.T) {
+	// The codex second Enter repairs codex swallowing an Enter WE pressed as a
+	// paste newline. `agent prompt` encodes the submit into the same request,
+	// so there is nothing to repair — and a bare Enter 300ms later lands on
+	// whatever codex has put on screen by then, submitting a blank turn or
+	// accepting a focused control.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Blocked = retry-ineligible, so any Enter here would be the guaranteed one.
+	if err := fake.SetAgentList(agentListJSON("codex", "blocked", "w1:p1")); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "codex", "do this\nthen that"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"agent list", `agent prompt w1:p1 do this\nthen that`}
+	if calls := fake.Calls(); !slices.Equal(calls, want) {
+		t.Fatalf("multi-line codex send calls = %v, want %v", calls, want)
+	}
+}
+
+func TestSendToCodexMultiLineLegacyFallbackKeepsSecondEnter(t *testing.T) {
+	// The legacy fallback DOES press Enter itself, so the codex repair still
+	// applies there — gating on the delivery path, not on "multi-line".
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetLegacySend(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetAgentList(agentListJSON("codex", "blocked", "w1:p1")); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "codex", "do this\nthen that"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"agent list",
+		`agent prompt w1:p1 do this\nthen that`,
+		`agent send w1:p1 do this\nthen that`,
+		"pane send-keys w1:p1 enter",
+		"pane send-keys w1:p1 enter",
+	}
+	if calls := fake.Calls(); !slices.Equal(calls, want) {
+		t.Fatalf("legacy multi-line codex send calls = %v, want %v", calls, want)
+	}
+}
+
 func TestSendToCodexSubmitsAgainAfterDelay(t *testing.T) {
 	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
 	if err != nil {
