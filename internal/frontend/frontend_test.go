@@ -3,6 +3,7 @@ package frontend_test
 import (
 	"bytes"
 	"context"
+	"encoding"
 	"errors"
 	"fmt"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
+	"github.com/BurntSushi/toml"
 )
 
 func testApp(t *testing.T) (*frontend.App, *store.Store) {
@@ -5309,27 +5311,97 @@ var configKeysExemptFromRegistry = map[string]string{
 	"safety.disable_seed":           "deprecated alias for safety.disable_never_auto_seed_patterns",
 }
 
+// tomlScalarKeys reports every key BurntSushi/toml would accept as a SCALAR
+// for rt, and separately every exported field carrying no toml tag.
+//
+// It models the DECODER's field resolution, not a convenient approximation of
+// it, because anything the decoder accepts but this walk misses is a config key
+// that can be set in config.toml while `hap config set` rejects it — the exact
+// drift TestEveryConfigKeyIsRegistered exists to prevent. Verified against
+// BurntSushi/toml v1.6.0:
+//
+//   - An UNTAGGED exported field is accepted under its Go field name (and
+//     case-folded, so `untagged = "x"` reaches `Untagged`). Reported separately
+//     rather than keyed, because every field in this config carries an explicit
+//     tag and an untagged one would produce a MixedCaps key unlike any other —
+//     the fix is to add the tag, not to register the odd key.
+//   - An ANONYMOUS embedded struct has its fields PROMOTED to the parent level,
+//     so it recurses with the parent's prefix rather than adding a segment.
+//   - A type implementing encoding.TextUnmarshaler or toml.Unmarshaler is
+//     decoded as a SCALAR even though its Kind is Struct. Recursing into it
+//     would find no tagged fields and silently record nothing.
+//
+// Slices, maps and interfaces are structured data that one key=value assignment
+// cannot express, and are config.toml-only by design.
+func tomlScalarKeys(rt reflect.Type) (scalars, untagged []string) {
+	textUnmarshaler := reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+	tomlUnmarshaler := reflect.TypeOf((*toml.Unmarshaler)(nil)).Elem()
+	decodesAsScalar := func(ft reflect.Type) bool {
+		for _, iface := range []reflect.Type{textUnmarshaler, tomlUnmarshaler} {
+			if ft.Implements(iface) || reflect.PointerTo(ft).Implements(iface) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var walk func(rt reflect.Type, prefix string)
+	walk = func(rt reflect.Type, prefix string) {
+		for i := 0; i < rt.NumField(); i++ {
+			f := rt.Field(i)
+			// Unexported fields are unreachable — EXCEPT an anonymous one, whose
+			// exported inner fields the decoder still promotes even when the
+			// embedded TYPE itself is unexported (reflect sets PkgPath there).
+			if f.PkgPath != "" && !f.Anonymous {
+				continue
+			}
+			name, _, _ := strings.Cut(f.Tag.Get("toml"), ",")
+			if name == "-" {
+				continue
+			}
+
+			ft := f.Type
+			for ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+
+			// Anonymous embedding promotes the inner fields to this level.
+			if f.Anonymous && name == "" && ft.Kind() == reflect.Struct && !decodesAsScalar(ft) {
+				walk(ft, prefix)
+				continue
+			}
+			if name == "" {
+				untagged = append(untagged, prefix+"."+f.Name)
+				continue
+			}
+
+			key := name
+			if prefix != "" {
+				key = prefix + "." + name
+			}
+			switch {
+			case decodesAsScalar(ft):
+				scalars = append(scalars, key)
+			case ft.Kind() == reflect.Slice, ft.Kind() == reflect.Map, ft.Kind() == reflect.Interface:
+				// structured data — config.toml-only by design
+			case ft.Kind() == reflect.Struct:
+				walk(ft, key)
+			default:
+				scalars = append(scalars, key)
+			}
+		}
+	}
+	walk(rt, "")
+	return scalars, untagged
+}
+
 // TestEveryConfigKeyIsRegistered keeps `hap config set` in sync with
 // config.toml BY CONSTRUCTION rather than by discipline.
 //
-// It walks config.Config's toml tags and asserts every scalar key has a
-// ConfigFields entry. The parity tests above only compare the registry against
-// a hand-written sample map, so a key added to the struct and forgotten in the
-// registry was invisible to all of them — which is exactly how
-// embedding.bm25_highbar_score shipped settable in config.toml but rejected by
-// `hap config set` as an unknown field.
-//
-// The walk classifies by EXCLUSION, not by an allowlist of scalar kinds: only
-// slices, maps and interfaces are skipped (structured data a single key=value
-// assignment cannot express — [[task_sources]], [[classifier]],
-// never_auto_rules, the llm argv/env tables), structs and non-nil-able pointers
-// recurse, and everything else must be registered. An allowlist would silently
-// skip the first uint, float32 or time.Duration field anyone adds, which is the
-// same shape of blind spot this test exists to close.
-//
-// It walks TYPES rather than values, so a nil pointer sub-table is still
-// descended into — config.Default() leaves some of them nil, and a
-// value-driven walk would quietly skip whatever they contain.
+// The parity tests above only compare the registry against a hand-written
+// sample map, so a key added to config.Config and forgotten in the registry was
+// invisible to all of them — which is exactly how embedding.bm25_highbar_score
+// shipped settable in config.toml but rejected by `hap config set`.
 //
 // TUI visibility is NOT what this checks: an advanced key belongs in the
 // registry with TUIHidden so the CLI reaches it while the TUI stays readable.
@@ -5339,42 +5411,23 @@ func TestEveryConfigKeyIsRegistered(t *testing.T) {
 		registered[key] = true
 	}
 
-	var missing []string
-	present := map[string]bool{}
-	var walk func(rt reflect.Type, prefix string)
-	walk = func(rt reflect.Type, prefix string) {
-		for i := 0; i < rt.NumField(); i++ {
-			f := rt.Field(i)
-			name, _, _ := strings.Cut(f.Tag.Get("toml"), ",")
-			if name == "" || name == "-" {
-				continue
-			}
-			key := name
-			if prefix != "" {
-				key = prefix + "." + name
-			}
-			present[key] = true
+	scalars, untagged := tomlScalarKeys(reflect.TypeOf(config.Config{}))
 
-			ft := f.Type
-			for ft.Kind() == reflect.Pointer {
-				ft = ft.Elem()
-			}
-			switch ft.Kind() {
-			case reflect.Slice, reflect.Map, reflect.Interface:
-				// Structured data: not expressible as one key=value.
-				continue
-			case reflect.Struct:
-				walk(ft, key)
-			default:
-				if _, exempt := configKeysExemptFromRegistry[key]; !registered[key] && !exempt {
-					missing = append(missing, key)
-				}
-			}
-		}
+	for _, key := range untagged {
+		t.Errorf("config field %s has no toml tag, so the decoder accepts it under its "+
+			"Go field NAME — a MixedCaps key unlike every other one. Add an explicit "+
+			"toml tag.", strings.TrimPrefix(key, "."))
 	}
-	walk(reflect.TypeOf(config.Config{}), "")
 
-	for _, key := range missing {
+	present := map[string]bool{}
+	for _, key := range scalars {
+		present[key] = true
+		if registered[key] {
+			continue
+		}
+		if _, exempt := configKeysExemptFromRegistry[key]; exempt {
+			continue
+		}
 		t.Errorf("config key %q is settable in config.toml but missing from "+
 			"frontend.ConfigFields — `hap config set %s` rejects it as an unknown "+
 			"field. Register it (add TUIHidden if it is too advanced for the TUI), "+
@@ -5471,6 +5524,82 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 			if err := app.SetField(ctx, "tui.palette.title", bad); err == nil {
 				t.Errorf("SetField(tui.palette.title, %q) was accepted; it renders as no color at all", bad)
 			}
+		}
+	})
+}
+
+// tomlProbeCustom decodes from a TOML string even though its Kind is Struct.
+type tomlProbeCustom struct{ raw string }
+
+func (c *tomlProbeCustom) UnmarshalText(b []byte) error { c.raw = string(b); return nil }
+
+type tomlProbeEmbedded struct {
+	Promoted string `toml:"promoted"`
+}
+
+type tomlProbeNested struct {
+	Inner string `toml:"inner"`
+}
+
+type tomlProbeConfig struct {
+	Tagged   string `toml:"tagged"`
+	Untagged string // decoder accepts this under the Go field name
+	tomlProbeEmbedded
+	Custom   tomlProbeCustom `toml:"custom"` // scalar despite Kind() == Struct
+	Nested   tomlProbeNested `toml:"nested"`
+	Listed   []string        `toml:"listed"` // structured: config.toml-only
+	Mapped   map[string]int  `toml:"mapped"` // structured: config.toml-only
+	Skipped  string          `toml:"-"`      // decoder ignores
+	unexpvar string          `toml:"unexp"`  //nolint:unused // decoder cannot reach it
+}
+
+// TestTOMLScalarKeysModelsTheDecoder pins the field-resolution rules
+// TestEveryConfigKeyIsRegistered depends on. Each shape here is one the decoder
+// accepts but a naive `toml`-tag walk misses, so a regression in this helper
+// would silently reopen the config/CLI drift that guard exists to prevent.
+//
+// The premise is verified against the real decoder, not assumed: the subtest
+// below round-trips the same struct through toml.Unmarshal, so if
+// BurntSushi/toml ever changes these rules this test fails rather than pinning
+// a model of a decoder that no longer exists.
+func TestTOMLScalarKeysModelsTheDecoder(t *testing.T) {
+	scalars, untagged := tomlScalarKeys(reflect.TypeOf(tomlProbeConfig{}))
+
+	got := map[string]bool{}
+	for _, k := range scalars {
+		got[k] = true
+	}
+	for _, want := range []string{
+		"tagged",
+		"promoted", // anonymous embedding promotes to the PARENT level
+		"custom",   // TextUnmarshaler: scalar, not a table to recurse into
+		"nested.inner",
+	} {
+		if !got[want] {
+			t.Errorf("tomlScalarKeys missed %q — the decoder accepts it, so a real config "+
+				"field of this shape would be settable in config.toml yet unregistered", want)
+		}
+	}
+	for _, notWant := range []string{"listed", "mapped", "unexp", "-", "custom.raw", "tomlProbeEmbedded.promoted"} {
+		if got[notWant] {
+			t.Errorf("tomlScalarKeys reported %q as a settable scalar; it is not one", notWant)
+		}
+	}
+	if len(untagged) != 1 || !strings.HasSuffix(untagged[0], "Untagged") {
+		t.Errorf("untagged = %v, want exactly the one untagged exported field — an "+
+			"untagged field is reachable from config.toml under its Go name and must "+
+			"be reported, not skipped", untagged)
+	}
+
+	t.Run("the decoder really does accept these shapes", func(t *testing.T) {
+		var c tomlProbeConfig
+		if err := toml.Unmarshal([]byte(
+			"tagged=\"a\"\nUntagged=\"b\"\npromoted=\"c\"\ncustom=\"d\"\n[nested]\ninner=\"e\"\n"), &c); err != nil {
+			t.Fatal(err)
+		}
+		if c.Tagged != "a" || c.Untagged != "b" || c.Promoted != "c" ||
+			c.Custom.raw != "d" || c.Nested.Inner != "e" {
+			t.Errorf("decoder no longer resolves fields the way tomlScalarKeys models: %+v", c)
 		}
 	})
 }
