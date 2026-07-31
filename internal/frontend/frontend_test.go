@@ -3,10 +3,12 @@ package frontend_test
 import (
 	"bytes"
 	"context"
+	"encoding"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,6 +24,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
+	"github.com/BurntSushi/toml"
 )
 
 func testApp(t *testing.T) (*frontend.App, *store.Store) {
@@ -2332,6 +2335,15 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"embedding.model_context_window":           "512",
 		"embedding.embed_timeout_ms":               "8000",
 		"embedding.warm_timeout_ms":                "120000",
+		"embedding.bm25_highbar_score":             "0.80",
+		"tui.palette.title":                        "205",
+		"tui.palette.section":                      "63",
+		"tui.palette.error":                        "#ff5faf",
+		"tui.palette.ok":                           "42",
+		"tui.palette.paused":                       "214",
+		"tui.palette.running":                      "39",
+		"tui.palette.warn":                         "220",
+		"tui.palette.help":                         "244",
 		"tui.max_content_width":                    "140",
 		"tui.max_content_height":                   "12",
 		"tui.theme":                                "dark",
@@ -2496,6 +2508,16 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 		"llm.task_generate_command_start_env_file": true,
 		"embedding.pane_salient_chars":             true,
 		"embedding.warm_timeout_ms":                true,
+		// Eight color strings would bury the settings a TUI operator actually
+		// reaches for, but they stay registered so `hap config set` reaches them.
+		"tui.palette.title":   true,
+		"tui.palette.section": true,
+		"tui.palette.error":   true,
+		"tui.palette.ok":      true,
+		"tui.palette.paused":  true,
+		"tui.palette.running": true,
+		"tui.palette.warn":    true,
+		"tui.palette.help":    true,
 	}
 	all := make(map[string]bool, len(frontend.ConfigFieldKeys))
 	for _, key := range frontend.ConfigFieldKeys {
@@ -5271,4 +5293,313 @@ func TestAuditStatusLabelDistinguishesMachineFromOperator(t *testing.T) {
 		}
 		labels[l] = rec.Rationale + "/" + rec.Status
 	}
+}
+
+// configKeysExemptFromRegistry are the config.toml keys deliberately NOT
+// settable through `hap config set`. Every entry needs a reason; the default
+// answer for a new key is to REGISTER it, not to add it here.
+//
+// All three entries today are deprecated aliases kept only so an existing
+// config.toml still loads and migrates onto the canonical key. Offering them
+// for WRITING would let an operator author the very key we are migrating away
+// from. They are listed explicitly rather than left to fall through the walk,
+// because two of them are pointers and would otherwise be skipped for their
+// SHAPE rather than for this reason.
+var configKeysExemptFromRegistry = map[string]string{
+	"llm.rewrite_fallback_template": "deprecated alias for llm.rewrite_action_fallback_template",
+	"llm.auto_act":                  "deprecated alias for llm.auto_act_confidence_threshold",
+	"safety.disable_seed":           "deprecated alias for safety.disable_never_auto_seed_patterns",
+}
+
+// tomlScalarKeys reports every key BurntSushi/toml would accept as a SCALAR
+// for rt, and separately every exported field carrying no toml tag.
+//
+// It models the DECODER's field resolution, not a convenient approximation of
+// it, because anything the decoder accepts but this walk misses is a config key
+// that can be set in config.toml while `hap config set` rejects it — the exact
+// drift TestEveryConfigKeyIsRegistered exists to prevent. Verified against
+// BurntSushi/toml v1.6.0:
+//
+//   - An UNTAGGED exported field is accepted under its Go field name (and
+//     case-folded, so `untagged = "x"` reaches `Untagged`). Reported separately
+//     rather than keyed, because every field in this config carries an explicit
+//     tag and an untagged one would produce a MixedCaps key unlike any other —
+//     the fix is to add the tag, not to register the odd key.
+//   - An ANONYMOUS embedded struct has its fields PROMOTED to the parent level,
+//     so it recurses with the parent's prefix rather than adding a segment.
+//   - A type implementing encoding.TextUnmarshaler or toml.Unmarshaler is
+//     decoded as a SCALAR even though its Kind is Struct. Recursing into it
+//     would find no tagged fields and silently record nothing.
+//
+// Slices, maps and interfaces are structured data that one key=value assignment
+// cannot express, and are config.toml-only by design.
+func tomlScalarKeys(rt reflect.Type) (scalars, untagged []string) {
+	textUnmarshaler := reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+	tomlUnmarshaler := reflect.TypeOf((*toml.Unmarshaler)(nil)).Elem()
+	decodesAsScalar := func(ft reflect.Type) bool {
+		for _, iface := range []reflect.Type{textUnmarshaler, tomlUnmarshaler} {
+			if ft.Implements(iface) || reflect.PointerTo(ft).Implements(iface) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var walk func(rt reflect.Type, prefix string)
+	walk = func(rt reflect.Type, prefix string) {
+		for i := 0; i < rt.NumField(); i++ {
+			f := rt.Field(i)
+			// Unexported fields are unreachable — EXCEPT an anonymous one, whose
+			// exported inner fields the decoder still promotes even when the
+			// embedded TYPE itself is unexported (reflect sets PkgPath there).
+			if f.PkgPath != "" && !f.Anonymous {
+				continue
+			}
+			name, _, _ := strings.Cut(f.Tag.Get("toml"), ",")
+			if name == "-" {
+				continue
+			}
+
+			ft := f.Type
+			for ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+
+			// Anonymous embedding promotes the inner fields to this level.
+			if f.Anonymous && name == "" && ft.Kind() == reflect.Struct && !decodesAsScalar(ft) {
+				walk(ft, prefix)
+				continue
+			}
+			if name == "" {
+				untagged = append(untagged, prefix+"."+f.Name)
+				continue
+			}
+
+			key := name
+			if prefix != "" {
+				key = prefix + "." + name
+			}
+			switch {
+			case decodesAsScalar(ft):
+				scalars = append(scalars, key)
+			case ft.Kind() == reflect.Slice, ft.Kind() == reflect.Map, ft.Kind() == reflect.Interface:
+				// structured data — config.toml-only by design
+			case ft.Kind() == reflect.Struct:
+				walk(ft, key)
+			default:
+				scalars = append(scalars, key)
+			}
+		}
+	}
+	walk(rt, "")
+	return scalars, untagged
+}
+
+// TestEveryConfigKeyIsRegistered keeps `hap config set` in sync with
+// config.toml BY CONSTRUCTION rather than by discipline.
+//
+// The parity tests above only compare the registry against a hand-written
+// sample map, so a key added to config.Config and forgotten in the registry was
+// invisible to all of them — which is exactly how embedding.bm25_highbar_score
+// shipped settable in config.toml but rejected by `hap config set`.
+//
+// TUI visibility is NOT what this checks: an advanced key belongs in the
+// registry with TUIHidden so the CLI reaches it while the TUI stays readable.
+func TestEveryConfigKeyIsRegistered(t *testing.T) {
+	registered := make(map[string]bool, len(frontend.ConfigFieldKeys))
+	for _, key := range frontend.ConfigFieldKeys {
+		registered[key] = true
+	}
+
+	scalars, untagged := tomlScalarKeys(reflect.TypeOf(config.Config{}))
+
+	for _, key := range untagged {
+		t.Errorf("config field %s has no toml tag, so the decoder accepts it under its "+
+			"Go field NAME — a MixedCaps key unlike every other one. Add an explicit "+
+			"toml tag.", strings.TrimPrefix(key, "."))
+	}
+
+	present := map[string]bool{}
+	for _, key := range scalars {
+		present[key] = true
+		if registered[key] {
+			continue
+		}
+		if _, exempt := configKeysExemptFromRegistry[key]; exempt {
+			continue
+		}
+		t.Errorf("config key %q is settable in config.toml but missing from "+
+			"frontend.ConfigFields — `hap config set %s` rejects it as an unknown "+
+			"field. Register it (add TUIHidden if it is too advanced for the TUI), "+
+			"or add it to configKeysExemptFromRegistry with a reason.", key, key)
+	}
+
+	// The exemption list must not rot: an entry naming a key the struct no
+	// longer has is a stale exemption that would silently cover a future key
+	// reusing that name.
+	for key, why := range configKeysExemptFromRegistry {
+		if !present[key] {
+			t.Errorf("exemption for %q (%s) names a key config.Config no longer has — "+
+				"drop the exemption", key, why)
+		}
+	}
+}
+
+// TestNewConfigFieldsRoundTrip covers what the registry parity test cannot:
+// parity only asserts SetField ACCEPTS a sample, so a case that returns nil
+// without assigning anything passes it. These keys are checked by reading the
+// value back, plus the rejections that make the validation meaningful.
+func TestNewConfigFieldsRoundTrip(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+
+	t.Run("bm25_highbar_score persists and is bounded", func(t *testing.T) {
+		if err := app.SetField(ctx, "embedding.bm25_highbar_score", "0.80"); err != nil {
+			t.Fatalf("SetField rejected a valid value: %v", err)
+		}
+		cfg, err := app.Config()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.Embedding.BM25HighBarScore; got != 0.80 {
+			t.Errorf("BM25HighBarScore = %v, want 0.80 — SetField accepted the value but did not store it", got)
+		}
+		for _, bad := range []string{"0", "1.5", "-0.2", "abc", ""} {
+			if err := app.SetField(ctx, "embedding.bm25_highbar_score", bad); err == nil {
+				t.Errorf("SetField accepted %q; the bar must stay within (0,1]", bad)
+			}
+		}
+		// A value below bm25_min_score is deliberately ALLOWED: the daemon
+		// ignores it rather than letting it loosen the fallback, and rejecting
+		// it here would make the two keys order-dependent to set.
+		if err := app.SetField(ctx, "embedding.bm25_highbar_score", "0.10"); err != nil {
+			t.Errorf("a high bar below bm25_min_score must be storable, got %v", err)
+		}
+	})
+
+	t.Run("palette roles persist, validate, and clear", func(t *testing.T) {
+		roles := map[string]func(config.Config) string{
+			"tui.palette.title":   func(c config.Config) string { return c.TUI.Palette.Title },
+			"tui.palette.section": func(c config.Config) string { return c.TUI.Palette.Section },
+			"tui.palette.error":   func(c config.Config) string { return c.TUI.Palette.Error },
+			"tui.palette.ok":      func(c config.Config) string { return c.TUI.Palette.OK },
+			"tui.palette.paused":  func(c config.Config) string { return c.TUI.Palette.Paused },
+			"tui.palette.running": func(c config.Config) string { return c.TUI.Palette.Running },
+			"tui.palette.warn":    func(c config.Config) string { return c.TUI.Palette.Warn },
+			"tui.palette.help":    func(c config.Config) string { return c.TUI.Palette.Help },
+		}
+		for key, read := range roles {
+			if err := app.SetField(ctx, key, "205"); err != nil {
+				t.Fatalf("SetField(%s, 205): %v", key, err)
+			}
+			cfg, err := app.Config()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := read(cfg); got != "205" {
+				t.Errorf("%s = %q after set, want \"205\" — the case is wired to the wrong field or does not assign", key, got)
+			}
+			// "" clears the role back to the theme; that is a setting, not an error.
+			if err := app.SetField(ctx, key, ""); err != nil {
+				t.Errorf("SetField(%s, \"\") must clear the role, got %v", key, err)
+			}
+			cleared, err := app.Config()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := read(cleared); got != "" {
+				t.Errorf("%s = %q after clearing, want empty", key, got)
+			}
+		}
+
+		// Accepted forms, on one representative role.
+		for _, ok := range []string{"0", "255", "#abc", "#a1b2c3", "#ABCDEF"} {
+			if err := app.SetField(ctx, "tui.palette.title", ok); err != nil {
+				t.Errorf("SetField(tui.palette.title, %q) rejected a valid color: %v", ok, err)
+			}
+		}
+		// Rejected: lipgloss resolves each of these to NO color (or an
+		// out-of-spec SGR) silently, and a TUIHidden key has no other feedback.
+		for _, bad := range []string{"purple", "300", "-1", "#ab", "#abcd", "#gggggg", "1.5"} {
+			if err := app.SetField(ctx, "tui.palette.title", bad); err == nil {
+				t.Errorf("SetField(tui.palette.title, %q) was accepted; it renders as no color at all", bad)
+			}
+		}
+	})
+}
+
+// tomlProbeCustom decodes from a TOML string even though its Kind is Struct.
+type tomlProbeCustom struct{ raw string }
+
+func (c *tomlProbeCustom) UnmarshalText(b []byte) error { c.raw = string(b); return nil }
+
+type tomlProbeEmbedded struct {
+	Promoted string `toml:"promoted"`
+}
+
+type tomlProbeNested struct {
+	Inner string `toml:"inner"`
+}
+
+type tomlProbeConfig struct {
+	Tagged   string `toml:"tagged"`
+	Untagged string // decoder accepts this under the Go field name
+	tomlProbeEmbedded
+	Custom   tomlProbeCustom `toml:"custom"` // scalar despite Kind() == Struct
+	Nested   tomlProbeNested `toml:"nested"`
+	Listed   []string        `toml:"listed"` // structured: config.toml-only
+	Mapped   map[string]int  `toml:"mapped"` // structured: config.toml-only
+	Skipped  string          `toml:"-"`      // decoder ignores
+	unexpvar string          `toml:"unexp"`  //nolint:unused // decoder cannot reach it
+}
+
+// TestTOMLScalarKeysModelsTheDecoder pins the field-resolution rules
+// TestEveryConfigKeyIsRegistered depends on. Each shape here is one the decoder
+// accepts but a naive `toml`-tag walk misses, so a regression in this helper
+// would silently reopen the config/CLI drift that guard exists to prevent.
+//
+// The premise is verified against the real decoder, not assumed: the subtest
+// below round-trips the same struct through toml.Unmarshal, so if
+// BurntSushi/toml ever changes these rules this test fails rather than pinning
+// a model of a decoder that no longer exists.
+func TestTOMLScalarKeysModelsTheDecoder(t *testing.T) {
+	scalars, untagged := tomlScalarKeys(reflect.TypeOf(tomlProbeConfig{}))
+
+	got := map[string]bool{}
+	for _, k := range scalars {
+		got[k] = true
+	}
+	for _, want := range []string{
+		"tagged",
+		"promoted", // anonymous embedding promotes to the PARENT level
+		"custom",   // TextUnmarshaler: scalar, not a table to recurse into
+		"nested.inner",
+	} {
+		if !got[want] {
+			t.Errorf("tomlScalarKeys missed %q — the decoder accepts it, so a real config "+
+				"field of this shape would be settable in config.toml yet unregistered", want)
+		}
+	}
+	for _, notWant := range []string{"listed", "mapped", "unexp", "-", "custom.raw", "tomlProbeEmbedded.promoted"} {
+		if got[notWant] {
+			t.Errorf("tomlScalarKeys reported %q as a settable scalar; it is not one", notWant)
+		}
+	}
+	if len(untagged) != 1 || !strings.HasSuffix(untagged[0], "Untagged") {
+		t.Errorf("untagged = %v, want exactly the one untagged exported field — an "+
+			"untagged field is reachable from config.toml under its Go name and must "+
+			"be reported, not skipped", untagged)
+	}
+
+	t.Run("the decoder really does accept these shapes", func(t *testing.T) {
+		var c tomlProbeConfig
+		if err := toml.Unmarshal([]byte(
+			"tagged=\"a\"\nUntagged=\"b\"\npromoted=\"c\"\ncustom=\"d\"\n[nested]\ninner=\"e\"\n"), &c); err != nil {
+			t.Fatal(err)
+		}
+		if c.Tagged != "a" || c.Untagged != "b" || c.Promoted != "c" ||
+			c.Custom.raw != "d" || c.Nested.Inner != "e" {
+			t.Errorf("decoder no longer resolves fields the way tomlScalarKeys models: %+v", c)
+		}
+	})
 }

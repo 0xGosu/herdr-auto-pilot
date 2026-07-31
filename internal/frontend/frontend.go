@@ -16,6 +16,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1567,6 +1568,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "embedding.model_path"}, // path
 	{Key: "embedding.similarity_threshold", TUIEditable: true},
 	{Key: "embedding.bm25_min_score", TUIEditable: true},
+	{Key: "embedding.bm25_highbar_score", TUIEditable: true},
 	{Key: "embedding.min_salient_chars", TUIEditable: true},
 	{Key: "embedding.pane_salient_chars", TUIEditable: true, TUIHidden: true},
 	{Key: "embedding.model_context_window", TUIEditable: true},
@@ -1580,6 +1582,18 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.disable_check_for_update", TUIEditable: true},
 	{Key: "tui.max_instances", TUIEditable: true},
 	{Key: "cli.ai_agent_friendly_output", TUIEditable: true},
+	// Palette roles are TUIHidden, not absent: eight color strings would bury
+	// the settings a TUI operator actually reaches for, but `hap config fields`
+	// and `hap config set` must still reach every key config.toml accepts.
+	// TestEveryConfigKeyIsRegistered enforces that "every key" literally.
+	{Key: "tui.palette.title", TUIEditable: true, TUIHidden: true},
+	{Key: "tui.palette.section", TUIEditable: true, TUIHidden: true},
+	{Key: "tui.palette.error", TUIEditable: true, TUIHidden: true},
+	{Key: "tui.palette.ok", TUIEditable: true, TUIHidden: true},
+	{Key: "tui.palette.paused", TUIEditable: true, TUIHidden: true},
+	{Key: "tui.palette.running", TUIEditable: true, TUIHidden: true},
+	{Key: "tui.palette.warn", TUIEditable: true, TUIHidden: true},
+	{Key: "tui.palette.help", TUIEditable: true, TUIHidden: true},
 }
 
 // ConfigFieldKeys lists every scalar config field editable via SetField, in
@@ -1639,6 +1653,50 @@ func defaultedInt(v, def int) string {
 		return fmt.Sprintf("%d (default)", def)
 	}
 	return strconv.Itoa(v)
+}
+
+// FieldValue renders the current value of a SetField key for display.
+// paletteFieldValue renders one palette role. An unset role is not blank — it
+// inherits the selected theme — and FieldValue must never return "" for a
+// registered key (TestConfigFieldRegistryParity asserts that), so say so.
+func paletteFieldValue(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "(theme default)"
+	}
+	return v
+}
+
+// paletteHexRE matches the two hex forms lipgloss accepts.
+var paletteHexRE = regexp.MustCompile(`^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$`)
+
+// setPaletteRole validates a terminal color and assigns it, mirroring how
+// tui.theme rejects an unknown name rather than storing it.
+//
+// Validation is not optional politeness here: lipgloss resolves an
+// unrecognized string to NO color at all and an out-of-range number to an
+// out-of-spec SGR code, both silently. Palette roles are TUIHidden, so the
+// config screen cannot show the operator what happened, and `hap config
+// fields` would echo the bad value back as though it were in effect — there is
+// no feedback loop at all unless `config set` refuses it here.
+//
+// Empty clears the role back to the selected theme; that is a real setting,
+// not a rejected one.
+func setPaletteRole(dst *string, value string) error {
+	v := strings.TrimSpace(value)
+	switch {
+	case v == "":
+		*dst = "" // inherit the theme
+		return nil
+	case paletteHexRE.MatchString(v):
+		*dst = v
+		return nil
+	}
+	if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 255 {
+		*dst = v
+		return nil
+	}
+	return fmt.Errorf("palette color must be a 0-255 terminal color, a #rgb/#rrggbb hex, "+
+		`or "" to inherit the theme, got %q`, value)
 }
 
 // FieldValue renders the current value of a SetField key for display.
@@ -1754,6 +1812,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return fmt.Sprintf("%.2f", cfg.Embedding.SimilarityThreshold)
 	case "embedding.bm25_min_score":
 		return fmt.Sprintf("%.2f", cfg.Embedding.BM25MinScore)
+	case "embedding.bm25_highbar_score":
+		return fmt.Sprintf("%.2f", cfg.Embedding.BM25HighBarScore)
 	case "embedding.model_context_window":
 		if cfg.Embedding.ModelContextWindow <= 0 {
 			return fmt.Sprintf("%d (default)", embedder.DefaultContextWindow)
@@ -1780,6 +1840,22 @@ func FieldValue(cfg config.Config, key string) string {
 			return "default"
 		}
 		return cfg.TUI.Theme
+	case "tui.palette.title":
+		return paletteFieldValue(cfg.TUI.Palette.Title)
+	case "tui.palette.section":
+		return paletteFieldValue(cfg.TUI.Palette.Section)
+	case "tui.palette.error":
+		return paletteFieldValue(cfg.TUI.Palette.Error)
+	case "tui.palette.ok":
+		return paletteFieldValue(cfg.TUI.Palette.OK)
+	case "tui.palette.paused":
+		return paletteFieldValue(cfg.TUI.Palette.Paused)
+	case "tui.palette.running":
+		return paletteFieldValue(cfg.TUI.Palette.Running)
+	case "tui.palette.warn":
+		return paletteFieldValue(cfg.TUI.Palette.Warn)
+	case "tui.palette.help":
+		return paletteFieldValue(cfg.TUI.Palette.Help)
 	case "tui.terminal_bell":
 		return strconv.FormatBool(cfg.TUI.TerminalBell)
 	case "tui.herdr_notification":
@@ -1971,6 +2047,17 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			cfg.Embedding.BM25MinScore = v
 			return nil
+		case "embedding.bm25_highbar_score":
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil || v <= 0 || v > 1 {
+				return fmt.Errorf("embedding.bm25_highbar_score must be in (0,1], got %q", value)
+			}
+			// Deliberately NOT rejected when <= bm25_min_score: the bar can only
+			// tighten, so the daemon ignores such a value (daemon.bm25Bar) rather
+			// than letting it loosen the fallback. Refusing it here would also
+			// make the two keys order-dependent to set.
+			cfg.Embedding.BM25HighBarScore = v
+			return nil
 		case "embedding.model_context_window":
 			// 0 restores the built-in default (embedder.DefaultContextWindow);
 			// a positive value tunes the token cap for a larger custom model.
@@ -2026,6 +2113,22 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			cfg.TUI.MaxContentHeight = v
 			return nil
+		case "tui.palette.title":
+			return setPaletteRole(&cfg.TUI.Palette.Title, value)
+		case "tui.palette.section":
+			return setPaletteRole(&cfg.TUI.Palette.Section, value)
+		case "tui.palette.error":
+			return setPaletteRole(&cfg.TUI.Palette.Error, value)
+		case "tui.palette.ok":
+			return setPaletteRole(&cfg.TUI.Palette.OK, value)
+		case "tui.palette.paused":
+			return setPaletteRole(&cfg.TUI.Palette.Paused, value)
+		case "tui.palette.running":
+			return setPaletteRole(&cfg.TUI.Palette.Running, value)
+		case "tui.palette.warn":
+			return setPaletteRole(&cfg.TUI.Palette.Warn, value)
+		case "tui.palette.help":
+			return setPaletteRole(&cfg.TUI.Palette.Help, value)
 		case "tui.theme":
 			// `config set` rejects unknown names with the valid list (the
 			// CR-033 "pick ONE behavior" choice); a hand-edited config.toml
