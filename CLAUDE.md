@@ -397,6 +397,35 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
   only accepts the option's number; sending the literal label ("Yes") is silently ignored — it
   reads as "nothing happened" on confirm. Map the chosen option to its digit with
   `domain.MenuKeystroke` before delivering (both the daemon `act` and frontend confirm paths do).
+- **A label that maps to NO option must never be delivered — the literal fall-through commits
+  option 1.** Verified live (2026-07-31, Claude Code 2.1.220): typing an unmatched reply at a
+  standing Bash approval runs the command under plain "Yes" and reports success — the agent
+  ignores the letters and the trailing Enter commits whatever option the caret rests on, which is
+  always the first. So "no digit could be mapped" is not a safe default on a menu:
+  `domain.UnmatchedMenuReply` is the gate, and **all FOUR send paths** refuse on it — `daemon.act`,
+  the LLM promotion in `handleLLMOutcome`, the rewritten reply in `handleActionReviewOutcome`, and
+  `deliver.Deliver` for operator-confirm/auto-accept. Two things make a correct label fail to map,
+  and both are load-bearing: **typography** — the same build renders `Yes, and don’t ask again for:
+  npm *` with U+2019 while every rule, LLM answer and fixture in this repo writes the ASCII
+  `don't`, so all label comparisons go through `domain.FoldMenuText` (punctuation, case,
+  whitespace); and **drift** — a rule learned on one render of an option (`use auto mode` vs
+  `switch to auto mode`, a path that has since changed) names an option no longer offered, which is
+  exactly what must escalate. Three ordering rules are deliberate and easy to undo by accident:
+  the gate runs AFTER the multi-tab answer-series and remote-environment branches on every path
+  (each answers its own protocol); it runs AFTER `llm.enable_rewrite_action` dispatches in
+  `act`, because adapting a drifted label to the live options is exactly what the rewrite is for —
+  `handleActionReviewOutcome` re-checks the result, so nothing skips the gate by going that way;
+  and matching is unique-or-refuse on BOTH the exact and the prefix pass, since one capture can
+  hold two renders of a menu that number the same label differently. Keep the paired tests
+  (`TestMenuKeystrokeFoldsTypographicPunctuation` / `…FoldKeepsDistinctOptionsDistinct` /
+  `…DuplicateRendersRefuse` / `TestUnmatchedMenuReply` / `TestDeliverUnmatchedMenuReplyRefuses` /
+  `TestDeliverUnreadablePaneWithMenuEvidenceRefuses` / `TestAutoActMatchesLabelAcrossTypography` /
+  `TestAutoActUnmatchedMenuReplyEscalatesInsteadOfSending` /
+  `TestLLMPromotionUnmatchedMenuReplyRejects`). Two accepted trade-offs: an approval whose real
+  prompt is a bare `y/n` while unrelated numbered lines sit in the scrollback now escalates instead
+  of typing `y`; and an UNREADABLE pane refuses only when the decision's own capture proves a menu
+  was standing (`req.PaneExcerpt`) — with no such evidence the literal send still stands, so legacy
+  rows that carry no excerpt behave as before.
 - **A digit does NOT always commit — AskUserQuestion has two protocols, per tab.** Verified live
   (2026-07-16): on **plain** options (`1. Apple / 2. Banana`) the digit selects AND auto-advances,
   but on **preview** options (option list left, `┌──┐` preview box right, `Notes: press n to add

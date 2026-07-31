@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,6 +109,50 @@ func TestLLMNoopPromotionRecordsWithoutSend(t *testing.T) {
 	rate, err := h.raw.GetAgentRate(ctx, "agent-llmnoop")
 	if err != nil || rate.ConsecutiveAuto != 1 {
 		t.Errorf("LLM noop must register an auto prompt, rate=%+v err=%v", rate, err)
+	}
+}
+
+// TestLLMPromotionUnmatchedMenuReplyRejects is the LLM half of the wrong-option
+// fix. A model that paraphrases an option instead of naming it must be rejected,
+// not typed at the menu: the letters are ignored and the trailing Enter commits
+// whichever option the caret rests on — the first one. Lives here beside the
+// other promotion-path tests, since it guards the same promotion gate.
+func TestLLMPromotionUnmatchedMenuReplyRejects(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(approvalPane)
+	h.llm.configured = true
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		// approvalPane offers "Yes" and "No, and tell the agent what to do
+		// differently"; this names neither.
+		const action = "Sure, go ahead and do not ask about this again"
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: action, Rationale: "looks safe", ConfidentScore: 90,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: action,
+			Rationale: "looks safe", ConfidentScore: 90, Status: "pending"}, nil
+	}
+
+	h.push("agent-llmunmatched", "blocked")
+
+	ctx := context.Background()
+	var esc domain.AuditRecord
+	waitFor(t, 5*time.Second, func() bool {
+		pend, _ := h.raw.PendingEscalations(ctx)
+		if len(pend) != 1 {
+			return false
+		}
+		esc = pend[0]
+		return true
+	})
+	if sent := h.herdr.sentInputs(); len(sent) != 0 {
+		t.Fatalf("nothing may reach the pane, got %v", sent)
+	}
+	if !strings.Contains(esc.Rationale, string(domain.ReasonUnfamiliarOptions)) {
+		t.Errorf("rationale = %q, want the unfamiliar_options reason", esc.Rationale)
 	}
 }
 

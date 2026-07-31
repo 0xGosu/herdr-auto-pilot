@@ -118,6 +118,96 @@ func TestDeliverMapsMenuLabelToDigit(t *testing.T) {
 	}
 }
 
+// claudeTypographicApprovalPane is Claude Code 2.1.220's real Bash approval,
+// captured live 2026-07-31: option 2 renders "don’t" with U+2019.
+const claudeTypographicApprovalPane = `Bash command
+
+  npm --version
+
+This command requires approval
+Do you want to proceed?
+❯ 1. Yes
+  2. Yes, and don’t ask again for: npm *
+  3. No
+`
+
+// TestDeliverMatchesLabelAcrossTypography pins the fix for the reported bug: the
+// operator's answer names option 2 in ASCII, the pane renders it with U+2019,
+// and the digit that reaches the agent must still be 2.
+func TestDeliverMatchesLabelAcrossTypography(t *testing.T) {
+	h := &fakeHerdr{pane: claudeTypographicApprovalPane}
+	err := deliver.Deliver(context.Background(), fastCfg(h), deliver.Request{
+		PaneID: "w1:p1", AgentType: "claude",
+		SituationType: domain.SituationApproval, Outbound: "Yes, and don't ask again",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.inputs) != 1 || h.inputs[0] != "2" {
+		t.Errorf("inputs = %v, want [2] — an ASCII apostrophe must still find the U+2019 label", h.inputs)
+	}
+}
+
+// TestDeliverUnmatchedMenuReplyRefuses is the safety half of the same bug. A
+// reply matching no offered option must send NOTHING: typed literally, the
+// agent ignores the letters and the trailing Enter commits the caret's option
+// (the first one), so the old fall-through silently answered "Yes" and reported
+// success.
+func TestDeliverUnmatchedMenuReplyRefuses(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		outbound string
+	}{
+		{"label the menu does not offer", "Yes, and always allow access to root/"},
+		{"digit outside the offered range", "9"},
+		{"free text at a standing menu", "please rerun the tests instead"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeHerdr{pane: claudeTypographicApprovalPane}
+			err := deliver.Deliver(context.Background(), fastCfg(h), deliver.Request{
+				PaneID: "w1:p1", AgentType: "claude",
+				SituationType: domain.SituationApproval, Outbound: tc.outbound,
+			})
+			if err == nil {
+				t.Fatal("want a refusal, got nil")
+			}
+			if !strings.Contains(err.Error(), "matches none of the options") {
+				t.Errorf("err = %v, want the unmatched-option refusal", err)
+			}
+			if len(h.inputs) != 0 {
+				t.Errorf("nothing may reach the pane, got %v", h.inputs)
+			}
+		})
+	}
+}
+
+// TestDeliverUnreadablePaneWithMenuEvidenceRefuses closes the read-failure hole:
+// when the DECISION's own capture proves a menu was standing, an unreadable pane
+// must refuse rather than send the literal blind — that literal's Enter is the
+// same wrong-option commit, just one read later. The evidence gate is what keeps
+// TestDeliverUnreadablePaneStillSendsLiteral (no excerpt) sending.
+func TestDeliverUnreadablePaneWithMenuEvidenceRefuses(t *testing.T) {
+	h := &fakeHerdr{readErr: errRead}
+	err := deliver.Deliver(context.Background(), fastCfg(h), deliver.Request{
+		PaneID: "w1:p1", AgentType: "claude",
+		SituationType: domain.SituationApproval,
+		PaneExcerpt:   claudeTypographicApprovalPane,
+		Outbound:      "Yes",
+	})
+	if err == nil {
+		t.Fatal("want a refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "could not be read to answer a menu") {
+		t.Errorf("err = %v, want the unreadable-menu refusal", err)
+	}
+	if !errors.Is(err, errRead) {
+		t.Errorf("the adapter error must stay unwrappable, got %v", err)
+	}
+	if len(h.inputs) != 0 {
+		t.Errorf("nothing may reach the pane, got %v", h.inputs)
+	}
+}
+
 // TestDeliverUnreadablePaneStillSendsLiteral proves the hoisted read's error is
 // NOT fatal on the plain path: a free-text or unreadable situation delivers the
 // literal reply unchanged.

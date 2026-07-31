@@ -154,6 +154,118 @@ func TestMenuKeystrokeAmbiguousPrefixStaysLiteral(t *testing.T) {
 	}
 }
 
+// claudeTypographicApproval is Claude Code 2.1.220's real Bash approval,
+// captured live 2026-07-31: option 2 renders "don’t" with U+2019 while every
+// source of a chosen reply (a learned rule, an LLM answer, this repo's own
+// classifier fixtures) writes the ASCII "don't".
+const claudeTypographicApproval = "Bash command\n\n   npm --version\n\n This command requires approval\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don’t ask again for: npm *\n   3. No\n"
+
+func TestMenuKeystrokeFoldsTypographicPunctuation(t *testing.T) {
+	// The bug: an ASCII apostrophe answered a U+2019 label, matched nothing,
+	// and was delivered as literal text whose Enter committed option 1.
+	if got, mapped := MenuKeystroke(claudeTypographicApproval, "Yes, and don't ask again"); !mapped || got != "2" {
+		t.Errorf("ASCII abbreviation of a U+2019 label = (%q, %v), want (\"2\", true)", got, mapped)
+	}
+	if got, mapped := MenuKeystroke(claudeTypographicApproval, "Yes, and don't ask again for: npm *"); !mapped || got != "2" {
+		t.Errorf("full ASCII label = (%q, %v), want (\"2\", true)", got, mapped)
+	}
+	// The exact rendered label keeps working — folding widens, never replaces.
+	if got, mapped := MenuKeystroke(claudeTypographicApproval, "Yes, and don’t ask again for: npm *"); !mapped || got != "2" {
+		t.Errorf("verbatim label = (%q, %v), want (\"2\", true)", got, mapped)
+	}
+	// Plain "Yes" is still option 1: option 2 does not start with "yes," so
+	// the exact match on option 1 wins and nothing is ambiguous.
+	if got, mapped := MenuKeystroke(claudeTypographicApproval, "Yes"); !mapped || got != "1" {
+		t.Errorf("Yes = (%q, %v), want (\"1\", true)", got, mapped)
+	}
+	// A genuinely different answer must still NOT map to anything.
+	if got, mapped := MenuKeystroke(claudeTypographicApproval, "Yes, and always allow access"); mapped {
+		t.Errorf("an option the menu does not offer must not map, got %q", got)
+	}
+}
+
+// TestMenuKeystrokeFoldKeepsDistinctOptionsDistinct is the counterweight to the
+// fold: widening what compares equal is only safe while options the menu
+// genuinely distinguishes stay distinct, because the failure mode is committing
+// the wrong one.
+func TestMenuKeystrokeFoldKeepsDistinctOptionsDistinct(t *testing.T) {
+	const menu = "1. Yes, and don’t ask again for: npm *\n2. Yes, and don’t ask again for: npm test\n3. No\n"
+	// Both options fold to a common prefix, so neither an abbreviation nor a
+	// near-miss may pick one.
+	if got, mapped := MenuKeystroke(menu, "Yes, and don't ask again"); mapped {
+		t.Errorf("an abbreviation matching two options must refuse, got %q", got)
+	}
+	// The full text of each still resolves to its own digit.
+	if got, mapped := MenuKeystroke(menu, "Yes, and don't ask again for: npm *"); !mapped || got != "1" {
+		t.Errorf("first option = (%q, %v), want (\"1\", true)", got, mapped)
+	}
+	if got, mapped := MenuKeystroke(menu, "Yes, and don't ask again for: npm test"); !mapped || got != "2" {
+		t.Errorf("second option = (%q, %v), want (\"2\", true)", got, mapped)
+	}
+}
+
+// TestMenuKeystrokeDuplicateRendersRefuse covers the shape one capture can hold
+// twice — a scrolled pane, or an earlier render still in the buffer. When the
+// two renders number the same label differently there is no way to tell which
+// one is live, so returning the first hit would deliver a digit from the stale
+// render while reporting a clean mapping.
+func TestMenuKeystrokeDuplicateRendersRefuse(t *testing.T) {
+	const twoRenders = "1. Apply\n2. Skip\n\n(scrolled)\n\n1. Skip\n2. Apply\n"
+	if got, mapped := MenuKeystroke(twoRenders, "Apply"); mapped {
+		t.Errorf("a label numbered differently in two renders must refuse, got %q", got)
+	}
+	// The same option seen twice at the SAME number is one option, not two.
+	const echoed = "1. Apply\n2. Skip\n\n1. Apply\n2. Skip\n"
+	if got, mapped := MenuKeystroke(echoed, "Apply"); !mapped || got != "1" {
+		t.Errorf("an identical repeated render = (%q, %v), want (\"1\", true)", got, mapped)
+	}
+}
+
+func TestFoldMenuText(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"Yes, and don’t ask again", "yes, and don't ask again"},
+		{"Yes,   and\tdon't  ask again ", "yes, and don't ask again"},
+		{"“Quoted” — dashed", `"quoted" - dashed`},
+		{"non breaking", "non breaking"},
+		// A backtick is NOT an apostrophe rendering: folding it would make a
+		// code span compare equal to quoted prose.
+		{"run `npm`", "run `npm`"},
+	}
+	for _, tc := range tests {
+		if got := FoldMenuText(tc.in); got != tc.want {
+			t.Errorf("FoldMenuText(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestUnmatchedMenuReply(t *testing.T) {
+	tests := []struct {
+		name      string
+		sitType   SituationType
+		agentType string
+		content   string
+		chosen    string
+		want      bool
+	}{
+		{"unmatched label on a standing approval menu", SituationApproval, "claude", claudeApproval, "Yes, and don't ask again", true},
+		{"matched label is fine", SituationApproval, "claude", claudeApproval, "Yes", false},
+		{"typography-only difference is not a mismatch", SituationApproval, "claude", claudeTypographicApproval, "Yes, and don't ask again", false},
+		{"unmatched option on a choice menu", SituationChoice, "claude", claudeApproval, "Maybe", true},
+		{"a digit out of range is a mismatch", SituationApproval, "claude", claudeApproval, "9", true},
+		// The two ways out: no menu on screen, or a situation answered by text.
+		{"free-text approval prompt has no menu", SituationApproval, "claude", "Enter a message:", "looks good", false},
+		{"idle is never a menu situation", SituationIdle, "claude", claudeApproval, "carry on", false},
+		{"a non-Codex error keeps its literal retry", SituationError, "claude", claudeApproval, "go test ./...", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := UnmatchedMenuReply(tc.sitType, tc.agentType, tc.content, tc.chosen); got != tc.want {
+				t.Errorf("UnmatchedMenuReply(%q) = %v, want %v", tc.chosen, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDeliverOutbound(t *testing.T) {
 	menu := "Allow this tool?\n❯ 1. Yes\n  2. No\n"
 	tests := []struct {

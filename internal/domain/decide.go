@@ -539,11 +539,17 @@ func materialize(in DecideInput, action string) (input, optionID string, ok bool
 }
 
 // optionInSet reports whether the learned option matches one of the
-// currently offered options (case-insensitive, trimmed).
+// currently offered options, comparing folded text (case, whitespace and
+// typographic punctuation) so an option a learned rule spells in ASCII still
+// matches the same option the agent renders with typographic glyphs — the
+// mismatch that made Claude's "Yes, and don’t ask again" (U+2019) unreachable.
 func optionInSet(option string, options []string) bool {
-	norm := strings.ToLower(strings.TrimSpace(option))
+	norm := FoldMenuText(option)
+	if norm == "" {
+		return false // a blank action names no option
+	}
 	for _, o := range options {
-		if strings.ToLower(strings.TrimSpace(o)) == norm {
+		if FoldMenuText(o) == norm {
 			return true
 		}
 	}
