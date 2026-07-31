@@ -382,6 +382,10 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
   error body and is returned as-is, so a real delivery error is never retried as a second send.
   Keep the paired tests (`TestSingleLineSendTypesTheTextSoAMenuDigitSelects` /
   `…NeverPastes` / `TestMultiLineSendPastesAsOneMessage`).
+- **A herdr agent name is 1-32 chars of `[a-z0-9_-]` starting with a lowercase letter**
+  (`invalid_agent_name`), and `agent start` refuses a name already in use. Integration cases
+  therefore derive a unique short name from `t.Name()` — a shared one made whichever case ran
+  second fail to start.
 - **`agent prompt` needs the agent to be interactively READY, and says so.** Verified live
   (2026-07-31): a prompt issued in the seconds after `agent start`, or while claude still shows
   its release-notes screen, lands in the composer WITHOUT submitting. The status-gated

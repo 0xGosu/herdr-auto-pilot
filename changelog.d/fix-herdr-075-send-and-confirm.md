@@ -3,3 +3,4 @@
 - Changed the refusal you get when confirming an escalation that carries no suggestion: it now names the safety control that withheld it and the exact `hap resolve` / `hap dismiss` command to use, instead of only saying there was nothing to confirm.
 - Fixed the plugin log growing without bound (a live state directory reached 1.9 GB). It now rotates to a single `.old` sibling at 64 MiB, so at most 128 MiB is kept.
 - Changed config deprecation warnings to be logged once per process instead of on every config reload, which is what filled that log.
+- Fixed the local integration suite failing to start agents on herdr 0.7.5, which reshaped `agent start` and caps agent names at 32 characters; failures now report herdr's own stderr instead of a bare exit status.

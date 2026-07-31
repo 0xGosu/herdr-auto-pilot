@@ -53,13 +53,28 @@ func requireHerdr(t *testing.T) {
 }
 
 // runHerdr runs a herdr CLI command and returns trimmed stdout.
+//
+// The failure message carries stderr, where herdr puts the reason: a bare
+// "exit status 1" cannot tell an unknown verb (exit 2, usage banner) from a
+// refused operation (exit 1, JSON error body), which is exactly the
+// distinction that matters when herdr reshapes its CLI under the suite.
 func runHerdr(t *testing.T, args ...string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// `agent start` waits for the agent's REPL, which can exceed a short
+	// bound on a cold start; every other call here is a fast control action.
+	timeout := 10 * time.Second
+	if len(args) >= 2 && args[0] == "agent" && args[1] == "start" {
+		timeout = 150 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, herdrBin(), args...).Output()
+	cmd := exec.CommandContext(ctx, herdrBin(), args...)
+	var errb strings.Builder
+	cmd.Stderr = &errb
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("herdr %s: %v", strings.Join(args, " "), err)
+		t.Fatalf("herdr %s: %v (stderr: %s)",
+			strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -99,6 +114,38 @@ func newScratchPane(t *testing.T, cwd, label string) string {
 	}
 	t.Cleanup(func() { tryHerdr("pane", "close", pane) })
 	return pane
+}
+
+// agentNameMaxLen is herdr's limit: an agent name must start with a lowercase
+// letter and hold 1-32 characters of [a-z0-9_-].
+const agentNameMaxLen = 32
+
+// sanitizeAgentName reduces a test name to something herdr accepts as an agent
+// name. Truncation keeps the LEADING characters, which is what distinguishes
+// one case from another here — the shared "TestRealClaude" prefix plus the
+// first distinguishing word fits well inside the limit.
+func sanitizeAgentName(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case b.Len() > 0 && !strings.HasSuffix(b.String(), "-"):
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > agentNameMaxLen {
+		out = strings.Trim(out[:agentNameMaxLen], "-")
+	}
+	// Must start with a letter, and never be empty.
+	if out == "" || out[0] < 'a' || out[0] > 'z' {
+		out = "itest" + out
+		if len(out) > agentNameMaxLen {
+			out = out[:agentNameMaxLen]
+		}
+	}
+	return out
 }
 
 // startScriptAgent runs a shell script in a scratch pane and tells herdr the
@@ -347,8 +394,12 @@ func startClaudeAgent(t *testing.T, cli *herdr.CLI, cwd string) string {
 	// agent's own argv follows `--`. `--timeout` is generous because a cold
 	// claude can take a while to reach its REPL, and herdr waits for that
 	// rather than returning a pane that is not accepting input yet.
-	pane := newScratchPane(t, cwd, "hapclaude")
-	runHerdr(t, "agent", "start", "hapclaude", "--kind", "claude", "--pane", pane,
+	// Unique per test: herdr agent names must not collide, and a pane closed
+	// by a previous test's cleanup is not necessarily deregistered yet — a
+	// shared "hapclaude" made whichever case ran second fail to start.
+	name := sanitizeAgentName(t.Name())
+	pane := newScratchPane(t, cwd, name)
+	runHerdr(t, "agent", "start", name, "--kind", "claude", "--pane", pane,
 		"--timeout", "120000",
 		"--", "--model", claudeModel(), "--permission-mode", "default")
 
