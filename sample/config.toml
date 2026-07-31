@@ -245,14 +245,33 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # Situations are matched to learned rules by embedding their masked salient
 # content and vector-searching stored signatures, so a paraphrased prompt
 # reuses the rule instead of re-learning from zero. Falls back to normalized
-# BM25 text matching when the model is unavailable, then to exact hashing —
+# BM25 text matching whenever that search does not match — the model being
+# unavailable, and also a search that found nothing similar enough — then to
+# exact hashing —
 # llama.cpp runs in an isolated worker, so missing assets, stalls, and native
 # worker aborts degrade matching without taking down the monitoring daemon.
 [embedding]
 disabled = false
 model_path = ""             # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
 similarity_threshold = 0.90 # min cosine to reuse a learned rule; outside (0,1) resets to 0.90
-bm25_min_score = 0.35       # text-fallback floor when the model is unavailable, (0,1]
+bm25_min_score = 0.35       # text-fallback floor, (0,1]. The fallback runs whenever the
+                            # vector search does not match — the model being unavailable,
+                            # AND a search that ran but found nothing above
+                            # similarity_threshold. Raise it to make those second-chance
+                            # remaps rarer; lower it to merge on shared wording alone.
+bm25_highbar_score = 0.70   # the STRICTER bar, (0,1], used instead of bm25_min_score for a
+                            # PANE-TAIL salient at or above min_salient_chars that reaches
+                            # text matching after an embedding search RAN and refused it.
+                            # Cosine already judged the pair too dissimilar, so this bounds
+                            # how far a bag-of-words score may overturn that verdict.
+                            # Below the floor a salient is never embedded — no cosine verdict
+                            # to overturn — so it keeps bm25_min_score, its only matcher.
+                            # Structured salients (approval/choice/error) refused by cosine
+                            # are not reconsidered by text AT ALL, at any score: BM25 cannot
+                            # tell WHICH token changed, so a changed approval target and a
+                            # harmless rewording score alike, and the score is itself unstable
+                            # on an incrementally built index. This bar can only tighten; a
+                            # value at or below bm25_min_score is ignored.
 # min_salient_chars is the length below which a situation is matched by BM25
 # text search INSTEAD of embedding, measured on the masked salient. Sentence
 # embeddings are not discriminative on a handful of generic tokens: any two

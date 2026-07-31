@@ -345,9 +345,11 @@ type LLM struct {
 
 // Embedding configures semantic signature matching: situations are matched
 // to learned signatures by embedding their masked salient content and
-// searching stored vectors, with BM25 text scoring as the fallback when the
-// embedder is unavailable. Missing model assets never break the daemon —
-// matching degrades to BM25, then to exact hashing.
+// searching stored vectors, with BM25 text scoring as the fallback whenever
+// that search does not produce a match — because the embedder was unavailable
+// or errored, or because it ran and found nothing above similarity_threshold.
+// Missing model assets never break the daemon — matching degrades to BM25,
+// then to exact hashing.
 type Embedding struct {
 	// Disabled turns semantic matching off entirely (exact-hash only).
 	Disabled bool `toml:"disabled"`
@@ -364,7 +366,69 @@ type Embedding struct {
 	// bar stays meaningful as the corpus grows). Default 0.35: measured
 	// near-duplicate renders score ~0.4 while different actions score below
 	// ~0.26 or miss entirely.
+	//
+	// The fallback runs on EVERY path where vector search did not produce a
+	// match — including a search that ran cleanly and found nothing above
+	// similarity_threshold — so this is also the bar that decides whether a
+	// screen cosine judged too dissimilar is nonetheless a textual
+	// near-duplicate of a learned rule. Raising it toward 1 makes such
+	// second-chance remaps rarer (more fresh signatures, more escalations);
+	// lowering it merges more aggressively on shared wording alone.
+	//
+	// What 0.35 buys, measured over a 25-rule corpus: a screen differing from a
+	// learned one by a single word scores 0.51 (47-character salient) to 0.66
+	// (147-character), while a different situation that merely shares some
+	// phrasing scores 0.12-0.14, and unrelated text does not reach the rule at
+	// all. The default sits in that wide valley, which is what makes it safe;
+	// tune it by deciding where in the valley you want the line, not by nudging
+	// it toward either measured band.
+	//
+	// Length shifts the score but not the verdict. The score is normalized
+	// against what the STORED salient earns against itself, so one differing
+	// word costs a large share of a seven-term salient and a small share of a
+	// twenty-term one — hence 0.51 vs 0.66 above. Symmetrically, longer
+	// salients score LOWER at partial overlap, so they separate better at both
+	// ends. Both lengths land on the same side of this default.
+	//
+	// The two populations reach this bar by different routes: a salient below
+	// min_salient_chars is never embedded, so BM25 is its ONLY matcher and this
+	// is its entire discriminator; a salient above the floor reaches BM25 as
+	// the cosine-miss fallback, or whenever the embedder is unavailable.
+	//
+	// Absolute scores here are corpus-dependent and rise steeply with corpus
+	// size — the same one-word variant measures 0.33 against a SINGLE stored
+	// rule, because a one-document index has uniform IDF and no meaningful
+	// average document length. Do not re-derive this default from a small
+	// corpus. internal/match/bm25_test.go pins the curve and the corpus
+	// sensitivity.
 	BM25MinScore float64 `toml:"bm25_min_score"`
+	// BM25HighBarScore is the STRICTER normalized-BM25 bar, in (0,1], applied
+	// instead of bm25_min_score when a situation falls back to text matching
+	// after an embedding search RAN and found nothing similar enough.
+	// Default 0.70.
+	//
+	// It governs PANE-TAIL salients at or above min_salient_chars. Two other
+	// populations are outside it: a pane-tail salient BELOW the floor skips the
+	// embed call, so it never had a cosine opinion to contradict and keeps
+	// bm25_min_score (its only matcher); and a STRUCTURED salient cosine has
+	// refused is not reconsidered by text at all, at any score — see
+	// daemon.bm25RetryAllowed. Structured salients still use bm25_min_score on
+	// the paths where cosine never ran, e.g. a degraded embedder.
+	//
+	// Why stricter here: cosine has already judged the pair not similar enough,
+	// so admitting them on a bag-of-words score is overriding a stronger signal
+	// with a weaker one. On a repainted screen that trade is usually right — the
+	// drift is rewrapping, not a changed meaning — so the retry stays open and
+	// this bar bounds how loose it gets.
+	//
+	// 0.70 was chosen as the lowest value rejecting a one-word approval target
+	// swap at every corpus size measured (0.570 at one stored rule, 0.621 at
+	// five, 0.658 at twenty-five); it still admits a screen that merely GAINS a
+	// word (0.781). Structured salients no longer rely on it — a threshold could
+	// not be trusted for them — but it remains a reasonable scale for pane-tail
+	// drift. Values outside (0,1] restore the default, and a value below
+	// bm25_min_score is ignored at the call site: this bar can only tighten.
+	BM25HighBarScore float64 `toml:"bm25_highbar_score"`
 	// MinSalientChars is the floor, in characters, below which a situation is
 	// matched by BM25 text search instead of embedding similarity. It is
 	// measured on the MASKED salient — the exact string that would be embedded.
@@ -716,6 +780,7 @@ func Default() Config {
 		Embedding: Embedding{
 			SimilarityThreshold: 0.90,
 			BM25MinScore:        0.35,
+			BM25HighBarScore:    0.70,
 			// MinSalientChars is deliberately left at 0 (like PaneSalientChars):
 			// the domain owns the number, and config stays decoupled from it.
 			// domain.EmbeddableSalient resolves 0 to DefaultMinSalientChars.
@@ -1160,6 +1225,9 @@ func (c *Config) fillZeroes() {
 	}
 	if c.Embedding.BM25MinScore <= 0 || c.Embedding.BM25MinScore > 1 {
 		c.Embedding.BM25MinScore = d.Embedding.BM25MinScore
+	}
+	if c.Embedding.BM25HighBarScore <= 0 || c.Embedding.BM25HighBarScore > 1 {
+		c.Embedding.BM25HighBarScore = d.Embedding.BM25HighBarScore
 	}
 	// A negative floor is meaningless; fold it to 0, which the domain resolves
 	// to DefaultMinSalientChars. 0 is a legitimate stored value (the "use the

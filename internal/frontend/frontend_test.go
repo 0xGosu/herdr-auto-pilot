@@ -3757,7 +3757,7 @@ func TestMatchSummary(t *testing.T) {
 			"matched by `similarity_threshold` (cosine 0.94)"},
 		{"bm25 names bm25_min_score and notes fallback",
 			domain.AuditRecord{MatchMethod: domain.MatchBM25, MatchScore: 0.42},
-			"matched by `bm25_min_score` (bm25 0.42, embedding fallback)"},
+			"matched by `bm25_min_score` (bm25 0.42, text fallback)"},
 		{"exact", domain.AuditRecord{MatchMethod: domain.MatchExact}, "exact content hash"},
 		{"none is empty", domain.AuditRecord{MatchMethod: domain.MatchNone}, ""},
 	}

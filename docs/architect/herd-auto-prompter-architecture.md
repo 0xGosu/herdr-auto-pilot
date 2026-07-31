@@ -506,16 +506,54 @@ fallback chain (each step stamps a `match_method` recorded in the audit log):
    persisted with no vector, and an existing short rule is stripped of its
    vector by `reembed.Reconcile` (at every daemon start and `[embedding]`
    reload, which is what heals an existing database with no migration) and
-   vetoed again as a search candidate. Such a rule stays reachable by BM25 and
-   by exact hash; only cosine is closed to it. **Structured salients are exempt
+   vetoed again as a *vector*-search candidate. Such a rule stays reachable by
+   BM25 and by exact hash; only cosine is closed to it — the veto in step 3's
+   accept filter is not repeated in step 4, so a candidate cosine refused for
+   being below the floor can still be chosen by text in the same call. **Structured salients are exempt
    at any length** — they are short by construction
    (`permission:proceed | options:no;yes` is 35 characters), so a length floor
    over them would disable cosine paraphrase matching for approvals, choices and
    errors; they are distilled identities already guarded by
    `ApprovalRemapCompatible` and `StructuredSalient`.
-4. **BM25 text fallback** — when no embedding is available (embedder degraded,
-   errored, or a `!vectors` build), normalized-BM25 text match at score ≥
-   `bm25_min_score` (default **0.35**) remaps (`bm25`).
+4. **BM25 text fallback** — whenever step 3 did not remap: no embedding was
+   available (skipped by the floor, embedder degraded, errored, or a `!vectors`
+   build), **and equally when the vector search ran cleanly but found nothing
+   above `similarity_threshold`**. Normalized-BM25 text match remaps (`bm25`).
+   The two matchers miss in different ways — an embedding can land below the
+   threshold on a screen that is a near-verbatim render of a learned one — and
+   minting a new key there costs a fresh escalation plus a rule that re-graduates
+   from scratch.
+
+   **Two bars, selected by whether cosine already had its say.** A situation
+   that reached here WITHOUT an embedding verdict — a pane-tail salient below
+   `min_salient_chars`, or anything at all when the embedder is unavailable — is
+   held to `bm25_min_score` (default **0.35**); for a below-floor rule that is
+   its only matcher, so a higher bar would strand it on exact hash, which the
+   floor exists to avoid. A situation whose vector search RAN and refused it is
+   held to `bm25_highbar_score` (default **0.70**), because admitting it on a
+   bag-of-words score means overriding a stronger signal with a weaker one. That
+   population is exactly `domain.EmbeddableSalient`: structured salients at any
+   length plus pane-tail salients at or above the floor.
+
+   **A structured salient cosine refused is not retried by text at all**
+   (`daemon.bm25RetryAllowed`) — a rule, not a threshold, for two independent
+   reasons. First, BM25 knows how many terms differ, never WHICH: an approval
+   whose TARGET changed (`… to the test service` → `… live service`) and one
+   whose verb was harmlessly reworded score within parts per million of each
+   other (~0.658 over a 25-rule corpus), so no bar admits one and refuses the
+   other. Second, the score is not stable enough to threshold: normalized BM25
+   divides by a SECOND search (`textSelfScore`) that is not snapshot-consistent
+   with the first, so on an incrementally built index — which is every
+   production index, since each minted signature calls `matcher.Add` — a
+   background segment merge landing between the two inflates the ratio.
+   Measured over 40 identical trials: 0.658 in 80%, and 0.766 / 0.813 / 0.861 /
+   0.944 / **1.000** in the rest. This keeps signature resolution consistent
+   with `SignatureHeldStill`, which already refuses fuzzy matching for
+   structured salients on the deferred-send drift check.
+
+   (That normalization instability is pre-existing and affects `bm25_min_score`
+   too; it is tolerable there only because the margins are wide — near
+   duplicates score 0.45–0.87 against partial overlap at 0.10–0.15.)
 5. **Mint new** — no match keeps the raw hash as a new key and persists its
    semantic identity (`signature_embeddings` row: salient always, vector when
    available) so later paraphrases can match it. Write/index failures only cost
