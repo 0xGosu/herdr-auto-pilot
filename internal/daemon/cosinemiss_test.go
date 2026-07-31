@@ -571,6 +571,7 @@ func TestResolveSignatureSalientFloorSelectsWhichBM25BarApplies(t *testing.T) {
 
 			seedIdleRules(t, d, 24) // measure in the production regime
 			learned := d.resolveSignature(ctx, cfg, storedSig, storedSit)
+			compactMatchIndex(t, d)
 			got := d.resolveSignature(ctx, cfg, swappedSig, swappedSit)
 
 			merged := got.Signature == learned.Signature
@@ -661,5 +662,45 @@ func TestBM25BarSelection(t *testing.T) {
 					tc.cosineMissed, got, tc.want)
 			}
 		})
+	}
+}
+
+// compactMatchIndex rebuilds the match index from the store in ONE batch,
+// making BM25 scores reproducible for a test that asserts which side of a
+// threshold a pair lands on.
+//
+// Why it is needed: MatchText normalizes a hit by a SECOND search
+// (match.textCandidates -> textSelfScore) that is not snapshot-consistent with
+// the first. Seeding through resolveSignature grows the index by repeated
+// matcher.Add, which leaves many small scorch segments, and a background merge
+// landing between those two searches inflates the ratio. Measured over 40
+// identical trials on an Add-built index the same pair scored 0.658 in 80% of
+// them and 0.766 / 0.813 / 0.861 / 0.944 / 1.000 in the rest, while a
+// Rebuild-built index returned 0.657887 every time. Under CPU load the
+// inflation crosses bm25_highbar_score and flips a merge verdict, which is what
+// made TestResolveSignatureSalientFloorSelectsWhichBM25BarApplies fail roughly
+// one full-suite run in five.
+//
+// This makes the TEST deterministic; it does not make the underlying scoring
+// stable. A production index is Add-built, so the same inflation is reachable
+// there — which is exactly why a structured salient refused by cosine is closed
+// by a RULE (daemon.bm25RetryAllowed) rather than held to a threshold, and why
+// bm25_highbar_score is a bound on pane-tail drift rather than a guarantee. Do
+// not read a passing test here as evidence that the normalization is sound.
+func compactMatchIndex(t *testing.T, d *Daemon) {
+	t.Helper()
+	rows, err := d.opt.Store.ListSignatureEmbeddings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dims := 0
+	for _, r := range rows {
+		if r.Dims > 0 {
+			dims = r.Dims
+			break
+		}
+	}
+	if err := d.matcher.Rebuild(rows, dims); err != nil {
+		t.Fatal(err)
 	}
 }
