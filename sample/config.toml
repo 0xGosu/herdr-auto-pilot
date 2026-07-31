@@ -332,6 +332,9 @@ max_instances = 1          # how many `hap tui` processes may run at once. Each 
 
 # Optional per-role color overrides layered on the selected theme; unset
 # roles inherit the theme. Values are terminal colors ("205", "#ff5faf").
+# Settable with `hap config set tui.palette.<role> <color>`; hidden from the
+# TUI's config screen (eight colors would bury the settings you reach for),
+# so `hap config fields` is where you see their current values.
 # [tui.palette]
 # title = "205"
 # section = "117"

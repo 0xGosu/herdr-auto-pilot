@@ -718,7 +718,9 @@ type CLI struct {
 
 // PaletteOverrides are optional per-role color overrides for the TUI
 // palette. Values are terminal color strings lipgloss accepts ("205",
-// "#ff5faf"). Edited via config.toml only — the TUI shows them read-only.
+// "#ff5faf"), or "" to inherit the selected theme. Settable with `hap config
+// set tui.palette.<role>`, which validates the color; hidden from the TUI
+// config screen, so `hap config fields` is where their values are read.
 type PaletteOverrides struct {
 	Title   string `toml:"title,omitempty"`
 	Section string `toml:"section,omitempty"`
