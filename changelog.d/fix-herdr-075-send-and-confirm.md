@@ -1,0 +1,5 @@
+- Fixed every reply to an agent failing with `herdr agent send: exit status 2` on herdr 0.7.5, which removed that command. A single-line reply is now typed with `pane send-text` and submitted with Enter, and a multi-line one is delivered with `agent prompt`; older herdr (0.7.0–0.7.4) still gets the previous `agent send` + Enter pair.
+- Fixed the routing so an approval answer keeps working: a menu digit has to reach the agent as a keystroke, and delivering it as pasted text answers whichever option the cursor happened to be on instead of the one that was chosen.
+- Changed the refusal you get when confirming an escalation that carries no suggestion: it now names the safety control that withheld it and the exact `hap resolve` / `hap dismiss` command to use, instead of only saying there was nothing to confirm.
+- Fixed the plugin log growing without bound (a live state directory reached 1.9 GB). It now rotates to a single `.old` sibling at 64 MiB, so at most 128 MiB is kept.
+- Changed config deprecation warnings to be logged once per process instead of on every config reload, which is what filled that log.

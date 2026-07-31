@@ -314,21 +314,41 @@ type FakeCLI struct {
 	LogPath  string
 	PaneFile string
 	FailFlag string // when this file exists, every invocation fails
+	// LegacyFlag: when this file exists, `agent prompt` is rejected the way a
+	// pre-0.7.5 herdr rejects an unknown verb (exit 2 + usage banner).
+	LegacyFlag string
 }
 
 // NewFakeCLI writes the fake herdr script into dir.
 func NewFakeCLI(dir string) (*FakeCLI, error) {
 	f := &FakeCLI{
-		BinPath:  filepath.Join(dir, "fake-herdr"),
-		LogPath:  filepath.Join(dir, "herdr-calls.log"),
-		PaneFile: filepath.Join(dir, "pane-content.txt"),
-		FailFlag: filepath.Join(dir, "fail-flag"),
+		BinPath:    filepath.Join(dir, "fake-herdr"),
+		LogPath:    filepath.Join(dir, "herdr-calls.log"),
+		PaneFile:   filepath.Join(dir, "pane-content.txt"),
+		FailFlag:   filepath.Join(dir, "fail-flag"),
+		LegacyFlag: filepath.Join(dir, "legacy-send-flag"),
 	}
+	// One log LINE per invocation: a multi-line argument (a task hand-out) is
+	// escaped back to a literal \n, so Calls() stays line-addressable and a
+	// paste-route send is one recorded call rather than several.
+	//
+	// awk, not sed: the usual `:a;N;$!ba` slurp is GNU-only for single-line
+	// input, where `N` runs on the last line — GNU sed prints the pattern space,
+	// BSD sed (macOS, which CI builds on) exits printing NOTHING. That would
+	// silently empty the call log for every ordinary invocation.
 	script := fmt.Sprintf(`#!/bin/sh
-echo "$@" >> %q
+printf '%%s\n' "$*" | awk '{printf "%%s%%s", (NR>1 ? "\\n" : ""), $0} END{printf "\n"}' >> %q
 if [ -e %q ]; then
   echo "fake herdr: induced failure" >&2
   exit 1
+fi
+if [ -e %q ]; then
+  case "$1 $2" in
+    "agent prompt"|"pane send-text")
+      echo "herdr $1 commands:" >&2
+      exit 2
+      ;;
+  esac
 fi
 case "$1 $2" in
   "pane read")
@@ -355,7 +375,7 @@ case "$1 $2" in
     ;;
 esac
 exit 0
-`, f.LogPath, f.FailFlag, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
+`, f.LogPath, f.FailFlag, f.LegacyFlag, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
 	if err := os.WriteFile(f.BinPath, []byte(script), 0o700); err != nil {
 		return nil, err
 	}
@@ -436,18 +456,48 @@ func (f *FakeCLI) Calls() []string {
 	return lines
 }
 
-// SentInputs returns the inputs delivered via `agent send`, in order.
+// SentInputs returns the inputs delivered to an agent, in order. Every herdr
+// text-submission shape counts: `pane send-text` (single-line, so a menu digit
+// arrives as a keystroke), `agent prompt` (multi-line, pasted as one message),
+// and the legacy `agent send` both fall back to on pre-0.7.5 herdr.
 func (f *FakeCLI) SentInputs() []string {
+	// In legacy mode both modern verbs are rejected, so their logged
+	// invocations delivered nothing — counting them would report the
+	// fallback's single delivery twice.
+	verbs := []string{"pane send-text ", "agent prompt ", "agent send "}
+	if _, err := os.Stat(f.LegacyFlag); err == nil {
+		verbs = []string{"agent send "}
+	}
 	var sent []string
 	for _, call := range f.Calls() {
-		if rest, ok := strings.CutPrefix(call, "agent send "); ok {
+		for _, verb := range verbs {
+			rest, ok := strings.CutPrefix(call, verb)
+			if !ok {
+				continue
+			}
 			parts := strings.SplitN(rest, " ", 2)
 			if len(parts) == 2 {
 				sent = append(sent, parts[1])
 			}
+			break
 		}
 	}
 	return sent
+}
+
+// SetLegacySend makes the fake reject both modern submission verbs (`agent
+// prompt` and `pane send-text`) exactly as an older herdr does — exit status 2
+// with a usage banner — so the CLI adapter's fallback to `agent send` can be
+// exercised on the typed route as well as the pasted one.
+func (f *FakeCLI) SetLegacySend(legacy bool) error {
+	if legacy {
+		return os.WriteFile(f.LegacyFlag, nil, 0o600)
+	}
+	err := os.Remove(f.LegacyFlag)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 // Notifications returns the titles shown via `notification show`.

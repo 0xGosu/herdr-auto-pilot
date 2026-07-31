@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -49,6 +51,10 @@ type CLI struct {
 	// retryBaseDelay overrides submitRetryBaseDelay in tests (0 = default).
 	retryBaseDelay time.Duration
 
+	// sendShape caches which text-submission CLI shape this herdr supports
+	// (see submitText). Atomic: concurrent sends to different panes share it.
+	sendShape atomic.Int32
+
 	// Submit-retry workers run detached from the send call (the daemon's
 	// monitor loop must never absorb their backoff sleeps); a newer send to
 	// the same pane supersedes the previous worker.
@@ -85,9 +91,8 @@ func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
 	return out.String(), nil
 }
 
-// Send delivers input text to the target agent pane: `agent send` writes
-// the literal text, then `pane send-keys <pane> enter` submits it (verified
-// against herdr 0.7: agent send alone does not press Enter).
+// Send delivers input text to the target agent pane and submits it — see
+// submitText for the two herdr CLI shapes this spans.
 func (c *CLI) Send(ctx context.Context, paneID, input string) error {
 	return c.send(ctx, paneID, input, sendBehavior{})
 }
@@ -123,10 +128,7 @@ func (c *CLI) send(ctx context.Context, paneID, input string, b sendBehavior) er
 			preStatus, retry = st, true
 		}
 	}
-	if _, err := c.run(ctx, "agent", "send", paneID, input); err != nil {
-		return err
-	}
-	if _, err := c.run(ctx, "pane", "send-keys", paneID, "enter"); err != nil {
+	if err := c.submitText(ctx, paneID, input); err != nil {
 		return err
 	}
 	if b.codexDoubleEnter {
@@ -141,6 +143,114 @@ func (c *CLI) send(ctx context.Context, paneID, input string, b sendBehavior) er
 		c.spawnSubmitRetry(ctx, paneID, preStatus)
 	}
 	return nil
+}
+
+// `agent prompt` spans two herdr CLI generations, so the paste route resolves
+// the verb once and remembers it: a herdr that does not know it makes every
+// multi-line send pay a doomed probe otherwise. The typed route deliberately
+// does NOT cache — `pane send-text` is an old pane primitive present in every
+// supported herdr, so its fallback is a safety net that should never fire.
+const (
+	sendShapeUnresolved int32 = iota
+	sendShapeAgentPrompt
+	sendShapeLegacySend
+)
+
+// submitText delivers input to the agent pane AND submits it.
+//
+// herdr 0.7.5 removed `agent send` — the whole verb, not a flag — so every send
+// failed with exit status 2 and a usage banner, which reached operators as
+// "nothing can be handed to an agent any more". Nothing replaces it one-for-one,
+// because `agent send` quietly did TWO things and the survivors split them:
+//
+//   - `pane send-text` writes the text as literal terminal input. A digit
+//     therefore reaches a numbered menu as the KEY it is, which is how an
+//     approval gets answered — hap maps the chosen option to its digit
+//     (domain.MenuKeystroke) and sends that. But it is not paste-aware, so an
+//     embedded newline is a literal Enter: a multi-line hand-out submits its
+//     first line and types the rest into the next prompt.
+//   - `agent prompt` writes the text AND its Enter in one request, honoring the
+//     pane's live bracketed-paste mode, so multi-line arrives as ONE message.
+//     But bracketed paste is exactly what stops a digit from acting as a key:
+//     verified live (2026-07-31) against a real Claude question form, `agent
+//     prompt "2"` pastes "2" as text and its Enter commits whichever option the
+//     caret was already on — answering "Apple" when hap chose "Banana",
+//     silently and with a success exit code.
+//
+// So route on the content: multi-line needs paste, single-line needs keys.
+// Together these reproduce what `agent send` + `pane send-keys enter` did.
+//
+// The `agent send` fallback keeps herdr 0.7.0–0.7.4 (min_herdr_version is
+// 0.7.0) working. Only exit status 2 — herdr rejecting the verb itself —
+// demotes to it; a pane-level failure exits 1 with a JSON error and is returned
+// as-is, so a real delivery error is never retried as a second send.
+func (c *CLI) submitText(ctx context.Context, paneID, input string) error {
+	// Route on the BODY, not the raw string. A trailing newline is not
+	// multi-line content — it is the submit this function performs itself — and
+	// nothing upstream trims it: domain.DeliverOutbound returns the chosen
+	// action unchanged when no menu is parsed, and an action can come from an
+	// LLM or `hap resolve --action`. Routing on it would send a one-line answer
+	// (including a menu digit) down the paste route, which is exactly the
+	// silent wrong-answer this split exists to prevent.
+	body := strings.TrimRight(input, "\r\n")
+	if strings.Contains(body, "\n") {
+		return c.submitPasted(ctx, paneID, body)
+	}
+	return c.submitTyped(ctx, paneID, body)
+}
+
+// submitTyped writes single-line input as literal terminal input, then submits
+// it. A menu digit must arrive this way or it selects nothing.
+func (c *CLI) submitTyped(ctx context.Context, paneID, input string) error {
+	if _, err := c.run(ctx, "pane", "send-text", paneID, input); err != nil {
+		if !unsupportedSubcommand(err) {
+			return err
+		}
+		if _, err := c.run(ctx, "agent", "send", paneID, input); err != nil {
+			return err
+		}
+	}
+	_, err := c.run(ctx, "pane", "send-keys", paneID, "enter")
+	return err
+}
+
+// submitPasted delivers multi-line input as one message. `agent prompt` submits
+// it itself, so no separate Enter follows — one here would be a SECOND submit.
+func (c *CLI) submitPasted(ctx context.Context, paneID, input string) error {
+	if c.sendShape.Load() != sendShapeLegacySend {
+		_, err := c.run(ctx, "agent", "prompt", paneID, input)
+		if err == nil {
+			c.sendShape.Store(sendShapeAgentPrompt)
+			return nil
+		}
+		if !unsupportedSubcommand(err) {
+			return err
+		}
+		slog.Warn("herdr does not support `agent prompt`; falling back to `agent send` + Enter",
+			"pane", paneID)
+	}
+	if _, err := c.run(ctx, "agent", "send", paneID, input); err != nil {
+		// On herdr 0.7.5 BOTH verbs are unknown, so latching legacy here would
+		// route every later multi-line send to a command that cannot work —
+		// turning one bad probe into a process-lifetime outage. Only a fallback
+		// that actually delivered earns the latch; anything else re-probes.
+		c.sendShape.Store(sendShapeUnresolved)
+		return err
+	}
+	c.sendShape.Store(sendShapeLegacySend)
+	_, err := c.run(ctx, "pane", "send-keys", paneID, "enter")
+	return err
+}
+
+// unsupportedSubcommand reports whether herdr rejected the VERB rather than
+// failing the operation. herdr exits 2 and prints its usage banner for a
+// command it does not know, and exits 1 with a JSON error body for one it
+// understood but could not carry out (`pane_not_found`, and so on) — so the
+// exit status alone separates "this herdr is older/newer than expected" from
+// "this send failed".
+func unsupportedSubcommand(err error) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == 2
 }
 
 // spawnSubmitRetry runs the retry loop in its own guarded goroutine so the

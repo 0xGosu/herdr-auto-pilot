@@ -371,6 +371,38 @@ func TestVarianceGuardSurfacesConfirmableSuggestion(t *testing.T) {
 	}
 }
 
+func TestEveryEarlyVetoStaysUnconfirmable(t *testing.T) {
+	// Companion to TestNeverAutoVetoOutranksVarianceGuardAndStaysUnconfirmable:
+	// the same invariant for the other three vetoes that return before the
+	// situation is resolved. A fully confident autonomous rule is used, so any
+	// of them leaking `resolveSituation`'s output fails here.
+	tests := []struct {
+		name   string
+		mutate func(*DecideInput)
+		reason EscalateReason
+	}{
+		{"kill switch", func(in *DecideInput) { in.KillActive = true }, ReasonDaemonPaused},
+		{"unclassifiable", func(in *DecideInput) { in.Situation.Type = SituationUnclassifiable }, ReasonUnclassifiable},
+		{"over-masked signature", func(in *DecideInput) { in.Signature.Verdict = GuardOverMasked }, ReasonOverMasked},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			in := autonomous(baseInput(SituationApproval), "y", "y", "y", "y", "y", "y")
+			tc.mutate(&in)
+			d := Decide(in)
+			if d.Action != ActionEscalate || d.Reason != tc.reason {
+				t.Fatalf("expected %s escalation, got %+v", tc.reason, d)
+			}
+			if d.Suggestion != "" {
+				t.Errorf("a vetoed escalation must stay non-confirmable, got %q", d.Suggestion)
+			}
+			if d.Input != "" {
+				t.Errorf("a vetoed decision must carry no input to send, got %q", d.Input)
+			}
+		})
+	}
+}
+
 func TestVarianceGuardNamesWhyNothingIsConfirmable(t *testing.T) {
 	// Some situations resolve to nothing at all — an unfamiliar option set here.
 	// The guard still escalates with no suggestion (there IS no action to

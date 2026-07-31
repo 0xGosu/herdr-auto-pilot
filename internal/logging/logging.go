@@ -18,8 +18,7 @@ func Setup(logDir string, debug bool) (*slog.Logger, error) {
 		if err := os.MkdirAll(logDir, 0o700); err != nil {
 			return nil, err
 		}
-		f, err := os.OpenFile(filepath.Join(logDir, "herd-auto-prompter.log"),
-			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		f, err := newRotatingFile(filepath.Join(logDir, "herd-auto-prompter.log"), LogCap)
 		if err != nil {
 			return nil, err
 		}

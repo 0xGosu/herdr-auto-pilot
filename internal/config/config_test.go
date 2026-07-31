@@ -12,13 +12,46 @@ import (
 	"time"
 )
 
+// loadWithLogs loads a config and returns what it warned about. The
+// once-per-process latch is cleared first: it exists to stop a warning
+// repeating for the operator, not to hide it from the next test.
 func loadWithLogs(path string) (Config, string, error) {
+	resetWarnOnceForTest()
 	var logs bytes.Buffer
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	defer slog.SetDefault(previous)
 	cfg, err := Load(path)
 	return cfg, logs.String(), err
+}
+
+func TestDeprecationWarningIsNotRepeatedPerLoad(t *testing.T) {
+	// Load runs on every daemon reload nudge, TUI refresh and CLI invocation.
+	// Re-warning each time is what turned three deprecated keys into 1842 log
+	// lines in one tail window of a live 1.9 GB log.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[limits]\nescalation_dedup_window_seconds = 300\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, first, err := loadWithLogs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(first, "escalation_dedup_window_seconds") {
+		t.Fatalf("the operator must be told once, got %q", first)
+	}
+
+	// Same process, second load: silent.
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(previous)
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logs.String(), "escalation_dedup_window_seconds") {
+		t.Errorf("the warning repeated on reload, got %q", logs.String())
+	}
 }
 
 func TestLoadMissingFileYieldsDefaults(t *testing.T) {

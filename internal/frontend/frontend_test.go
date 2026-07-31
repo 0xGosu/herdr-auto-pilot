@@ -305,6 +305,78 @@ func TestConfirmUsesSuggestion(t *testing.T) {
 	}
 }
 
+func TestConfirmWithoutSuggestionExplainsItselfAndOffersTheWayOut(t *testing.T) {
+	// The four safety vetoes escalate without a suggestion on purpose, so
+	// confirm must refuse — but the refusal is all the operator sees. "carries
+	// no suggestion to confirm" reads as a broken plugin: it names neither the
+	// control that fired nor the command that answers the escalation, and the
+	// operator is left with a pending item they can see is answerable.
+	app, st := testApp(t)
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "",
+		Rationale: "[never_auto_match] pattern (?i)\\brm\\s+-rf\\b matched \"rm -rf build\" (source=seed)",
+		CreatedAt: time.Now(),
+	})
+	err := app.Confirm(ctx, id, false)
+	if err == nil {
+		t.Fatal("a suggestion-less escalation must not be confirmable")
+	}
+	for _, want := range []string{
+		"never_auto_match", // which control fired
+		fmt.Sprintf("hap resolve %d --action TEXT --send", id), // how to answer it
+		fmt.Sprintf("hap dismiss %d", id),                      // how to drop it
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal must mention %q, got: %v", want, err)
+		}
+	}
+}
+
+func TestConfirmRefusalOnlyBlamesAControlThatActuallyWithheld(t *testing.T) {
+	// A variance guard over an unfamiliar option set escalates with an empty
+	// suggestion because NOTHING resolved, not because a control held one back.
+	// Saying otherwise sends the operator hunting for a safety rule to relax.
+	app, st := testApp(t)
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationChoice, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "",
+		Rationale: "[variance_guard] contradictory history; unfamiliar_options",
+		CreatedAt: time.Now(),
+	})
+	err := app.Confirm(ctx, id, false)
+	if err == nil {
+		t.Fatal("a suggestion-less escalation must not be confirmable")
+	}
+	if strings.Contains(err.Error(), "on purpose") {
+		t.Errorf("only the deliberate vetoes may be blamed, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "no action could be resolved") {
+		t.Errorf("refusal must say nothing resolved, got: %v", err)
+	}
+}
+
+func TestConfirmWithoutSuggestionOrReasonTagStillOffersTheWayOut(t *testing.T) {
+	// A rationale with no "[reason]" tag (legacy rows, LLM-authored text) must
+	// still produce an actionable refusal rather than a bare tag-less sentence.
+	app, st := testApp(t)
+	ctx := context.Background()
+	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Status: "escalated", Suggestion: "",
+		Rationale: "something went sideways", CreatedAt: time.Now(),
+	})
+	err := app.Confirm(ctx, id, false)
+	if err == nil {
+		t.Fatal("a suggestion-less escalation must not be confirmable")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("hap resolve %d --action TEXT --send", id)) {
+		t.Errorf("refusal must still name the resolve command, got: %v", err)
+	}
+}
+
 // fakeHerdr captures Send calls for confirm/resolve delivery assertions.
 var errAny = errors.New("induced failure")
 
