@@ -1378,9 +1378,37 @@ func (a *App) Confirm(ctx context.Context, auditID int64, send bool) error {
 	}
 	action := SuggestedAction(audit)
 	if action == "" {
-		return fmt.Errorf("audit record %d carries no suggestion to confirm; use resolve with an explicit action", auditID)
+		return errNoSuggestion(audit)
 	}
 	return a.Resolve(ctx, auditID, action, send)
+}
+
+// errNoSuggestion explains a confirm that cannot proceed.
+//
+// Some escalations carry no suggestion on purpose: the four safety vetoes
+// (kill switch, unclassifiable, over-masked signature, never-auto match) return
+// before the situation is resolved, precisely so a vetoed action cannot be
+// answered with one key. A refusal that only says "carries no suggestion" reads
+// as a broken plugin instead — it names neither which control fired nor what to
+// type instead, so the operator is stuck with an escalation they can see is
+// answerable. Name both.
+func errNoSuggestion(audit *domain.AuditRecord) error {
+	// Only the four vetoes withhold a resolvable action DELIBERATELY. Every
+	// other empty suggestion means nothing resolved at all (a variance guard
+	// over an unfamiliar option set, a failed consult), and telling the
+	// operator a control withheld an answer that never existed sends them
+	// hunting for a safety rule to relax.
+	why := "no action could be resolved for it"
+	switch domain.EscalateReason(domain.EscalationReasonTag(audit.Rationale)) {
+	case domain.ReasonDaemonPaused, domain.ReasonUnclassifiable,
+		domain.ReasonOverMasked, domain.ReasonNeverAutoMatch:
+		why = "it was escalated by the " + domain.EscalationReasonTag(audit.Rationale) +
+			" control, which withholds a one-key answer on purpose"
+	}
+	return fmt.Errorf("audit record %d has no suggestion to confirm: %s. "+
+		"Answer it explicitly with `hap resolve %d --action TEXT --send`, "+
+		"or drop it with `hap dismiss %d`",
+		audit.ID, why, audit.ID, audit.ID)
 }
 
 // Dismiss removes a pending escalation from the queue without responding:

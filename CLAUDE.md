@@ -363,7 +363,36 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
 - CLI reads print JSON envelopes (`{"id":…,"result":{…}}`); `pane read --format text` prints
   plain text. `pane get` exposes `cwd` / `foreground_cwd` (a deleted dir renders as
   `"/path (deleted)"`).
-- `agent send` writes text WITHOUT Enter — follow with `pane send-keys <pane> enter`.
+- **herdr 0.7.5 REMOVED `agent send`**, and nothing replaces it one-for-one — the old call now
+  exits 2 with a usage banner and nothing reaches the agent. `agent send` quietly did two things
+  and the survivors split them, so `internal/herdr.CLI.submitText` **routes on the content**:
+  - **single-line → `pane send-text` + `pane send-keys enter`.** Literal terminal input, so a
+    menu digit arrives as the KEY it is. This is safety-critical: hap answers an approval by
+    mapping the option to its digit (`domain.MenuKeystroke`), and verified live (2026-07-31)
+    against a real Claude question form, `agent prompt "2"` PASTES the 2 as text and its Enter
+    commits whichever option the caret was on — it answered "Apple" while hap had chosen
+    "Banana", silently, with a success exit code. Never route a digit through paste.
+  - **multi-line → `agent prompt`.** Writes the text AND its Enter in one request honoring the
+    pane's live bracketed-paste mode, so a task hand-out lands as ONE message. `pane send-text`
+    is NOT paste-aware — each embedded newline is a literal Enter, which submits the first line
+    and types the rest into the next prompt.
+
+  Both fall back to the legacy `agent send` (+ Enter) only on exit status 2 — herdr rejecting the
+  VERB — which keeps `min_herdr_version = 0.7.0` honest. A pane-level failure exits 1 with a JSON
+  error body and is returned as-is, so a real delivery error is never retried as a second send.
+  Keep the paired tests (`TestSingleLineSendTypesTheTextSoAMenuDigitSelects` /
+  `…NeverPastes` / `TestMultiLineSendPastesAsOneMessage`).
+- **A herdr agent name is 1-32 chars of `[a-z0-9_-]` starting with a lowercase letter**
+  (`invalid_agent_name`), and `agent start` refuses a name already in use. Integration cases
+  therefore derive a unique short name from `t.Name()` — a shared one made whichever case ran
+  second fail to start.
+- **`agent prompt` needs the agent to be interactively READY, and says so.** Verified live
+  (2026-07-31): a prompt issued in the seconds after `agent start`, or while claude still shows
+  its release-notes screen, lands in the composer WITHOUT submitting. The status-gated
+  retry-Enter loop in `CLI.send` is what recovers that, so do not remove it on the grounds that
+  submission is atomic now. A pane whose agent is not the foreground process is refused outright
+  with `agent_not_ready` — which is why an externally reported agent (`pane report-agent` over a
+  bash stand-in) can never receive `agent prompt`.
 - **Numbered menus want the digit, not the label.** A Claude approval/choice (`1. Yes / 2. No`)
   only accepts the option's number; sending the literal label ("Yes") is silently ignored — it
   reads as "nothing happened" on confirm. Map the chosen option to its digit with

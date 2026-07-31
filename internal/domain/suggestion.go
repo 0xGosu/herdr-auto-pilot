@@ -36,6 +36,31 @@ func SuggestedAction(audit *AuditRecord) string {
 	return sug
 }
 
+// EscalationReasonTag returns the leading "[reason]" token the daemon stamps on
+// every escalation rationale, without the brackets ("" when absent).
+//
+// It exists so a refusal can NAME why an escalation is not confirmable. The
+// four early safety vetoes deliberately carry no suggestion, and a bare "no
+// suggestion to confirm" reads as a malfunction rather than as the safety
+// control it is — the operator is left guessing which of their own rules
+// stopped it.
+func EscalationReasonTag(rationale string) string {
+	if !strings.HasPrefix(rationale, "[") {
+		return ""
+	}
+	end := strings.Index(rationale, "]")
+	if end <= 1 {
+		return ""
+	}
+	tag := rationale[1:end]
+	// A rationale is machine-written; anything with a space or bracket inside
+	// is prose that merely starts with "[", not a reason token.
+	if strings.ContainsAny(tag, " []") {
+		return ""
+	}
+	return tag
+}
+
 // StripSourcePrefix removes the leading "who suggested this and how" label from
 // an escalation suggestion, leaving the action-bearing remainder. The
 // task-send prefixes are deliberately NOT here: they can ride behind

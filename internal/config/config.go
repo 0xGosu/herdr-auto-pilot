@@ -6,7 +6,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -917,7 +916,7 @@ func Load(path string) (Config, error) {
 	}
 	_ = toml.Unmarshal(data, &thresholdProbe)
 	if thresholdProbe.ConfidenceThresholds == nil && thresholdProbe.Legacy != nil {
-		slog.Warn("config table `[thresholds]` is deprecated; use `[confidence_thresholds]`",
+		warnOnce("config table `[thresholds]` is deprecated; use `[confidence_thresholds]`",
 			"path", path)
 		cfg.ConfidenceThresholds = *thresholdProbe.Legacy
 	}
@@ -925,7 +924,7 @@ func Load(path string) (Config, error) {
 	// (dedupe) and clear, so a later Save migrates the file to the new key
 	// (Save re-encodes the whole struct from toml tags).
 	if len(cfg.Safety.DeprecatedAllowlistPatterns) > 0 {
-		slog.Warn("config key `allowlist_patterns` is deprecated; use `never_auto_patterns` (patterns merged)",
+		warnOnce("config key `allowlist_patterns` is deprecated; use `never_auto_patterns` (patterns merged)",
 			"path", path)
 		seen := make(map[string]bool, len(cfg.Safety.NeverAutoPatterns))
 		for _, p := range cfg.Safety.NeverAutoPatterns {
@@ -947,7 +946,7 @@ func Load(path string) (Config, error) {
 	// entries without duplication, and clear decode-only fields so Save
 	// completes the migration.
 	if len(cfg.Safety.DeprecatedIrreversibleIndicators) > 0 {
-		slog.Warn("config key `safety.irreversible_indicators` is deprecated; use `safety.never_auto_patterns` (patterns merged)",
+		warnOnce("config key `safety.irreversible_indicators` is deprecated; use `safety.never_auto_patterns` (patterns merged)",
 			"path", path)
 		seen := make(map[string]bool, len(cfg.Safety.NeverAutoPatterns))
 		for _, p := range cfg.Safety.NeverAutoPatterns {
@@ -962,7 +961,7 @@ func Load(path string) (Config, error) {
 	}
 	cfg.Safety.DeprecatedIrreversibleIndicators = nil
 	if len(cfg.Safety.DeprecatedIndicatorRules) > 0 {
-		slog.Warn("config table `[[safety.indicator_rules]]` is deprecated; use `[[safety.never_auto_rules]]` (rules merged)",
+		warnOnce("config table `[[safety.indicator_rules]]` is deprecated; use `[[safety.never_auto_rules]]` (rules merged)",
 			"path", path)
 		seen := make(map[string]bool, len(cfg.Safety.NeverAutoRules))
 		for _, r := range cfg.Safety.NeverAutoRules {
@@ -991,10 +990,10 @@ func Load(path string) (Config, error) {
 		_ = toml.Unmarshal(data, &probe)
 		if probe.Safety.Canonical == nil {
 			cfg.Safety.DisableNeverAutoSeedPatterns = *cfg.Safety.DeprecatedDisableSeed
-			slog.Warn("config key `safety.disable_seed` is deprecated; use `safety.disable_never_auto_seed_patterns`",
+			warnOnce("config key `safety.disable_seed` is deprecated; use `safety.disable_never_auto_seed_patterns`",
 				"path", path)
 		} else {
-			slog.Warn("deprecated config key `safety.disable_seed` ignored because `safety.disable_never_auto_seed_patterns` is also set",
+			warnOnce("deprecated config key `safety.disable_seed` ignored because `safety.disable_never_auto_seed_patterns` is also set",
 				"path", path)
 		}
 		cfg.Safety.DeprecatedDisableSeed = nil
@@ -1009,7 +1008,7 @@ func Load(path string) (Config, error) {
 	}
 	_ = toml.Unmarshal(data, &verifyProbe)
 	if verifyProbe.Limits.VerifyUnblockMs != nil {
-		slog.Warn("config key `limits.verify_unblock_ms` is no longer supported and is ignored; unblock verification always waits 1000ms",
+		warnOnce("config key `limits.verify_unblock_ms` is no longer supported and is ignored; unblock verification always waits 1000ms",
 			"path", path, "configured_value", *verifyProbe.Limits.VerifyUnblockMs)
 	}
 	// Removed keys `limits.escalation_dedup_window_seconds` /
@@ -1024,11 +1023,11 @@ func Load(path string) (Config, error) {
 	}
 	_ = toml.Unmarshal(data, &dedupProbe)
 	if dedupProbe.Limits.WindowSeconds != nil {
-		slog.Warn("config key `limits.escalation_dedup_window_seconds` is no longer supported and is ignored; the escalation dedup window is a fixed 5 minutes",
+		warnOnce("config key `limits.escalation_dedup_window_seconds` is no longer supported and is ignored; the escalation dedup window is a fixed 5 minutes",
 			"path", path, "configured_value", *dedupProbe.Limits.WindowSeconds)
 	}
 	if dedupProbe.Limits.JitterPercent != nil {
-		slog.Warn("config key `limits.escalation_dedup_jitter_percent` is no longer supported and is ignored; the dedup jitter tolerance is a fixed 5%",
+		warnOnce("config key `limits.escalation_dedup_jitter_percent` is no longer supported and is ignored; the dedup jitter tolerance is a fixed 5%",
 			"path", path, "configured_value", *dedupProbe.Limits.JitterPercent)
 	}
 	// Removed key `embedding.gpu_layers`: embedding is strictly CPU-only (GPU
@@ -1041,7 +1040,7 @@ func Load(path string) (Config, error) {
 	}
 	_ = toml.Unmarshal(data, &gpuProbe)
 	if gpuProbe.Embedding.GPULayers != nil {
-		slog.Warn("config key `embedding.gpu_layers` is no longer supported and is ignored; embedding runs strictly on CPU",
+		warnOnce("config key `embedding.gpu_layers` is no longer supported and is ignored; embedding runs strictly on CPU",
 			"path", path, "configured_value", *gpuProbe.Embedding.GPULayers)
 	}
 	// Removed key `embedding.max_consecutive_failures`: the degrade-latch threshold
@@ -1055,7 +1054,7 @@ func Load(path string) (Config, error) {
 	}
 	_ = toml.Unmarshal(data, &maxFailProbe)
 	if maxFailProbe.Embedding.MaxConsecutiveFailures != nil {
-		slog.Warn("config key `embedding.max_consecutive_failures` is no longer supported and is ignored; the degrade-latch threshold is a fixed internal constant",
+		warnOnce("config key `embedding.max_consecutive_failures` is no longer supported and is ignored; the degrade-latch threshold is a fixed internal constant",
 			"path", path, "configured_value", *maxFailProbe.Embedding.MaxConsecutiveFailures)
 	}
 	// Removed key `confidence_thresholds.inferred_task_bar`: a task inferred from
@@ -1069,7 +1068,7 @@ func Load(path string) (Config, error) {
 	}
 	_ = toml.Unmarshal(data, &inferredBarProbe)
 	if inferredBarProbe.ConfidenceThresholds.InferredTaskBar != nil {
-		slog.Warn("config key `confidence_thresholds.inferred_task_bar` is no longer supported and is ignored; inferred next tasks are gated by `confidence_thresholds.minimum`",
+		warnOnce("config key `confidence_thresholds.inferred_task_bar` is no longer supported and is ignored; inferred next tasks are gated by `confidence_thresholds.minimum`",
 			"path", path, "configured_value", *inferredBarProbe.ConfidenceThresholds.InferredTaskBar)
 	}
 	// Deprecated boolean `auto_act`: migrate to the confidence threshold only
@@ -1092,7 +1091,7 @@ func Load(path string) (Config, error) {
 			if *cfg.LLM.DeprecatedAutoAct {
 				migrated = 0
 			}
-			slog.Warn("config key `auto_act` is deprecated; use `auto_act_confidence_threshold` (0-100; 999 = never). If your LLM CLI does not report a confidence score, auto-act stays off until you set a reachable threshold.",
+			warnOnce("config key `auto_act` is deprecated; use `auto_act_confidence_threshold` (0-100; 999 = never). If your LLM CLI does not report a confidence score, auto-act stays off until you set a reachable threshold.",
 				"path", path, "migrated_to", migrated)
 			cfg.LLM.AutoActConfidenceThreshold = migrated
 		}
@@ -1112,7 +1111,7 @@ func Load(path string) (Config, error) {
 	_ = toml.Unmarshal(data, &rewriteProbe)
 	if rewriteProbe.LLM.Command != nil || rewriteProbe.LLM.CommandStart != nil ||
 		rewriteProbe.LLM.TimeoutSeconds != nil {
-		slog.Warn("config keys `llm.rewrite_command`, `llm.rewrite_command_start`, and `llm.rewrite_timeout_seconds` are no longer supported and are ignored; set `llm.enable_rewrite_action = true` to have the consult LLM (`llm.command`) rewrite outbound text instead",
+		warnOnce("config keys `llm.rewrite_command`, `llm.rewrite_command_start`, and `llm.rewrite_timeout_seconds` are no longer supported and are ignored; set `llm.enable_rewrite_action = true` to have the consult LLM (`llm.command`) rewrite outbound text instead",
 			"path", path)
 	}
 	// Renamed `rewrite_fallback_template` → `rewrite_action_fallback_template`:
@@ -1123,10 +1122,10 @@ func Load(path string) (Config, error) {
 	if cfg.LLM.DeprecatedRewriteFallbackTemplate != "" {
 		if cfg.LLM.RewriteActionFallbackTemplate == "" {
 			cfg.LLM.RewriteActionFallbackTemplate = cfg.LLM.DeprecatedRewriteFallbackTemplate
-			slog.Warn("config key `llm.rewrite_fallback_template` is deprecated; use `llm.rewrite_action_fallback_template`",
+			warnOnce("config key `llm.rewrite_fallback_template` is deprecated; use `llm.rewrite_action_fallback_template`",
 				"path", path)
 		} else {
-			slog.Warn("deprecated config key `llm.rewrite_fallback_template` ignored because `llm.rewrite_action_fallback_template` is also set",
+			warnOnce("deprecated config key `llm.rewrite_fallback_template` ignored because `llm.rewrite_action_fallback_template` is also set",
 				"path", path)
 		}
 		cfg.LLM.DeprecatedRewriteFallbackTemplate = ""
@@ -1148,10 +1147,10 @@ func Load(path string) (Config, error) {
 		}
 		if src.EnableLLMReviewBeforeAutoSend == nil {
 			src.EnableLLMReviewBeforeAutoSend = src.DeprecatedEnableLLMReview
-			slog.Warn("task_sources key `enable_llm_review` is deprecated; use `enable_llm_review_before_auto_send`",
+			warnOnce("task_sources key `enable_llm_review` is deprecated; use `enable_llm_review_before_auto_send`",
 				"path", path, "source", src.Path)
 		} else {
-			slog.Warn("deprecated task_sources key `enable_llm_review` ignored because `enable_llm_review_before_auto_send` is also set",
+			warnOnce("deprecated task_sources key `enable_llm_review` ignored because `enable_llm_review_before_auto_send` is also set",
 				"path", path, "source", src.Path)
 		}
 		src.DeprecatedEnableLLMReview = nil

@@ -53,13 +53,28 @@ func requireHerdr(t *testing.T) {
 }
 
 // runHerdr runs a herdr CLI command and returns trimmed stdout.
+//
+// The failure message carries stderr, where herdr puts the reason: a bare
+// "exit status 1" cannot tell an unknown verb (exit 2, usage banner) from a
+// refused operation (exit 1, JSON error body), which is exactly the
+// distinction that matters when herdr reshapes its CLI under the suite.
 func runHerdr(t *testing.T, args ...string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// `agent start` waits for the agent's REPL, which can exceed a short
+	// bound on a cold start; every other call here is a fast control action.
+	timeout := 10 * time.Second
+	if len(args) >= 2 && args[0] == "agent" && args[1] == "start" {
+		timeout = 150 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, herdrBin(), args...).Output()
+	cmd := exec.CommandContext(ctx, herdrBin(), args...)
+	var errb strings.Builder
+	cmd.Stderr = &errb
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("herdr %s: %v", strings.Join(args, " "), err)
+		t.Fatalf("herdr %s: %v (stderr: %s)",
+			strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -73,37 +88,97 @@ func tryHerdr(args ...string) {
 	_ = exec.CommandContext(ctx, herdrBin(), args...).Run()
 }
 
+// newScratchPane opens a throwaway tab and returns its pane id, closing it when
+// the test ends.
+//
+// herdr 0.7.5 reshaped `agent start` to `--kind KIND --pane ID`: it now starts a
+// KNOWN agent kind in an EXISTING pane, and can no longer launch an arbitrary
+// command as a named agent (the old `agent start <name> --cwd D -- <argv>` exits
+// 2). So a pane is created first, and what runs in it is a separate step.
+func newScratchPane(t *testing.T, cwd, label string) string {
+	t.Helper()
+	out := runHerdr(t, "tab", "create", "--cwd", cwd, "--label", label, "--no-focus")
+	var resp struct {
+		Result struct {
+			RootPane struct {
+				PaneID string `json:"pane_id"`
+			} `json:"root_pane"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("parse tab create output: %v (%s)", err, out)
+	}
+	pane := resp.Result.RootPane.PaneID
+	if pane == "" {
+		t.Fatalf("no pane id in tab create output: %s", out)
+	}
+	t.Cleanup(func() { tryHerdr("pane", "close", pane) })
+	return pane
+}
+
+// agentNameMaxLen is herdr's limit: an agent name must start with a lowercase
+// letter and hold 1-32 characters of [a-z0-9_-].
+const agentNameMaxLen = 32
+
+// sanitizeAgentName reduces a test name to something herdr accepts as an agent
+// name. Truncation keeps the LEADING characters, which is what distinguishes
+// one case from another here — the shared "TestRealClaude" prefix plus the
+// first distinguishing word fits well inside the limit.
+func sanitizeAgentName(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case b.Len() > 0 && !strings.HasSuffix(b.String(), "-"):
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > agentNameMaxLen {
+		out = strings.Trim(out[:agentNameMaxLen], "-")
+	}
+	// Must start with a letter, and never be empty.
+	if out == "" || out[0] < 'a' || out[0] > 'z' {
+		out = "itest" + out
+		if len(out) > agentNameMaxLen {
+			out = out[:agentNameMaxLen]
+		}
+	}
+	return out
+}
+
+// startScriptAgent runs a shell script in a scratch pane and tells herdr the
+// pane hosts a blocked claude, so the daemon's agent discovery sees it.
+//
+// The stand-in is deliberately a script, not a real agent: these cases assert
+// hap's DELIVERY, which must not depend on an LLM. Note the one thing such a
+// pane cannot receive — `agent prompt` refuses any pane whose reported agent is
+// not its foreground process (`agent_not_ready`), so a script stand-in only ever
+// gets the typed route (`pane send-text` / `pane send-keys`). That is exactly
+// the route a menu digit takes, which is what these tests are for.
+func startScriptAgent(t *testing.T, name, body string) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), name+".sh")
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pane := newScratchPane(t, "/tmp", name)
+	runHerdr(t, "pane", "run", pane, "bash "+script)
+	runHerdr(t, "pane", "report-agent", pane,
+		"--source", "hap-itest", "--agent", "claude", "--state", "blocked")
+	return pane
+}
+
 // startMenuAgent spawns a scratch agent that presents a numbered menu
 // (bash `select`, exactly the shape Claude's approvals use) and returns its
 // pane id. The agent writes its picked option to markerPath.
 func startMenuAgent(t *testing.T, markerPath string) string {
 	t.Helper()
-	script := filepath.Join(t.TempDir(), "menu.sh")
-	body := "#!/bin/bash\n" +
-		"echo 'Do you want to proceed?'\n" +
-		"select x in Yes No; do echo \"$x\" > " + markerPath + "; break; done\n" +
-		"sleep 60\n"
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	out := runHerdr(t, "agent", "start", "hapitest", "--cwd", "/tmp", "--no-focus",
-		"--", "bash", script)
-	var resp struct {
-		Result struct {
-			Agent struct {
-				PaneID string `json:"pane_id"`
-			} `json:"agent"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal([]byte(out), &resp); err != nil {
-		t.Fatalf("parse agent start output: %v (%s)", err, out)
-	}
-	pane := resp.Result.Agent.PaneID
-	if pane == "" {
-		t.Fatalf("no pane id in agent start output: %s", out)
-	}
-	t.Cleanup(func() { tryHerdr("pane", "close", pane) })
-	return pane
+	return startScriptAgent(t, "hapitest", "#!/bin/bash\n"+
+		"echo 'Do you want to proceed?'\n"+
+		"select x in Yes No; do echo \"$x\" > "+markerPath+"; break; done\n"+
+		"sleep 60\n")
 }
 
 func waitForMenu(t *testing.T, cli *herdr.CLI, pane string) {
@@ -206,7 +281,6 @@ func TestRealConfirmDeliversMenuDigit(t *testing.T) {
 // id. The committed environment label is written to markerPath.
 func startRemoteEnvAgent(t *testing.T, markerPath string) string {
 	t.Helper()
-	script := filepath.Join(t.TempDir(), "remote_env.sh")
 	body := `#!/bin/bash
 caret=1
 render() {
@@ -232,28 +306,8 @@ while IFS= read -r -s -n1 key; do
 done
 sleep 60
 `
-	body = strings.ReplaceAll(body, "MARKER", markerPath)
-	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	out := runHerdr(t, "agent", "start", "hapitest", "--cwd", "/tmp", "--no-focus",
-		"--", "bash", script)
-	var resp struct {
-		Result struct {
-			Agent struct {
-				PaneID string `json:"pane_id"`
-			} `json:"agent"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal([]byte(out), &resp); err != nil {
-		t.Fatalf("parse agent start output: %v (%s)", err, out)
-	}
-	pane := resp.Result.Agent.PaneID
-	if pane == "" {
-		t.Fatalf("no pane id in agent start output: %s", out)
-	}
-	t.Cleanup(func() { tryHerdr("pane", "close", pane) })
-	return pane
+	return startScriptAgent(t, "hapitest-remote-env",
+		strings.ReplaceAll(body, "MARKER", markerPath))
 }
 
 // TestRealConfirmDeliversRemoteEnvSelection drives the remote-environment
@@ -336,23 +390,18 @@ func claudeModel() string {
 // folder" prompt so the REPL is ready for input.
 func startClaudeAgent(t *testing.T, cli *herdr.CLI, cwd string) string {
 	t.Helper()
-	out := runHerdr(t, "agent", "start", "hapclaude", "--cwd", cwd, "--no-focus",
-		"--", "claude", "--model", claudeModel(), "--permission-mode", "default")
-	var resp struct {
-		Result struct {
-			Agent struct {
-				PaneID string `json:"pane_id"`
-			} `json:"agent"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal([]byte(out), &resp); err != nil {
-		t.Fatalf("parse claude agent start: %v (%s)", err, out)
-	}
-	pane := resp.Result.Agent.PaneID
-	if pane == "" {
-		t.Fatalf("no pane id from claude agent start: %s", out)
-	}
-	t.Cleanup(func() { tryHerdr("pane", "close", pane) })
+	// herdr 0.7.5: `agent start` names a KIND and an EXISTING pane, and the
+	// agent's own argv follows `--`. `--timeout` is generous because a cold
+	// claude can take a while to reach its REPL, and herdr waits for that
+	// rather than returning a pane that is not accepting input yet.
+	// Unique per test: herdr agent names must not collide, and a pane closed
+	// by a previous test's cleanup is not necessarily deregistered yet — a
+	// shared "hapclaude" made whichever case ran second fail to start.
+	name := sanitizeAgentName(t.Name())
+	pane := newScratchPane(t, cwd, name)
+	runHerdr(t, "agent", "start", name, "--kind", "claude", "--pane", pane,
+		"--timeout", "120000",
+		"--", "--model", claudeModel(), "--permission-mode", "default")
 
 	// Claude asks to trust a new folder on first start; option 1 ("Yes, I
 	// trust") is pre-selected, so Enter clears it. Wait for the REPL prompt.

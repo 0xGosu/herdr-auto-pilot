@@ -3,6 +3,8 @@ package herdr
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -292,7 +294,29 @@ func TestCLIExecutor(t *testing.T) {
 	}
 }
 
-func TestSendSubmitsWithEnter(t *testing.T) {
+func TestSingleLineSendTypesTheTextSoAMenuDigitSelects(t *testing.T) {
+	// The safety-critical route. hap answers a numbered menu by mapping the
+	// chosen option to its DIGIT, so that digit must reach the TUI as a
+	// keystroke. Verified live (2026-07-31): `agent prompt "2"` pastes it as
+	// text and its Enter commits whatever the caret was on — the menu answers
+	// option 1 while hap believes it sent option 2, with a success exit code.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.Send(context.Background(), "w1:p1", "2"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pane send-text w1:p1 2", "pane send-keys w1:p1 enter"}
+	if calls := fake.Calls(); !slices.Equal(calls, want) {
+		t.Fatalf("a menu digit must be typed, not pasted: got %v, want %v", calls, want)
+	}
+}
+
+func TestSingleLineSendNeverPastes(t *testing.T) {
+	// Guard the routing itself: no single-line reply may take the paste route,
+	// because nothing at this layer can tell a menu digit from ordinary prose.
 	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -301,10 +325,174 @@ func TestSendSubmitsWithEnter(t *testing.T) {
 	if err := cli.Send(context.Background(), "w1:p1", "run the tests"); err != nil {
 		t.Fatal(err)
 	}
-	calls := fake.Calls()
-	if len(calls) != 2 || calls[0] != "agent send w1:p1 run the tests" ||
-		calls[1] != "pane send-keys w1:p1 enter" {
-		t.Errorf("send should write text then press enter, got %v", calls)
+	for _, call := range fake.Calls() {
+		if strings.HasPrefix(call, "agent prompt ") {
+			t.Errorf("single-line reply took the paste route: %v", fake.Calls())
+		}
+	}
+}
+
+func TestMultiLineSendPastesAsOneMessage(t *testing.T) {
+	// The other half: a multi-line task hand-out must arrive as ONE message.
+	// `pane send-text` is not paste-aware, so its embedded newlines would
+	// submit the first line and type the rest into the next prompt. `agent
+	// prompt` carries its own Enter, so no separate one may follow — that
+	// would be a second submit.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.Send(context.Background(), "w1:p1", "do this\nthen that"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`agent prompt w1:p1 do this\nthen that`}
+	if calls := fake.Calls(); !slices.Equal(calls, want) {
+		t.Fatalf("multi-line send calls = %v, want %v", calls, want)
+	}
+}
+
+func TestSingleLineSendTrimsATrailingNewlineInsteadOfPasting(t *testing.T) {
+	// A trailing newline is not multi-line content — it is the submit the
+	// adapter performs itself. Nothing upstream trims it, and routing on it
+	// would push a one-line answer (a menu digit included) down the paste
+	// route, which answers whichever option the caret was on.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	for _, input := range []string{"2\n", "2\r\n", "2\n\n"} {
+		fake.ClearLog()
+		if err := cli.Send(context.Background(), "w1:p1", input); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"pane send-text w1:p1 2", "pane send-keys w1:p1 enter"}
+		if calls := fake.Calls(); !slices.Equal(calls, want) {
+			t.Errorf("Send(%q) = %v, want %v", input, calls, want)
+		}
+	}
+}
+
+func TestSingleLineSendFallsBackToLegacyAgentSend(t *testing.T) {
+	// The safety-critical fallback: on a herdr without `pane send-text`, a menu
+	// digit must still be typed and submitted rather than silently lost.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetLegacySend(true); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.Send(context.Background(), "w1:p1", "2"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"pane send-text w1:p1 2",
+		"agent send w1:p1 2",
+		"pane send-keys w1:p1 enter",
+	}
+	if calls := fake.Calls(); !slices.Equal(calls, want) {
+		t.Fatalf("legacy typed fallback calls = %v, want %v", calls, want)
+	}
+	if sent := fake.SentInputs(); len(sent) != 1 || sent[0] != "2" {
+		t.Errorf("legacy fallback should deliver the digit once, got %v", sent)
+	}
+}
+
+func TestMultiLineSendDoesNotLatchLegacyWhenTheFallbackAlsoFails(t *testing.T) {
+	// On herdr 0.7.5 BOTH `agent prompt` and `agent send` are unknown verbs.
+	// Latching legacy on a failed fallback would route every later multi-line
+	// send to a command that cannot work — one bad probe becoming a
+	// process-lifetime outage. The next send must re-probe.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetLegacySend(true); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	ctx := context.Background()
+	// `agent send` is absent too: the fake's induced failure stands in for it.
+	if err := fake.SetFailing(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Send(ctx, "w1:p1", "do\nthis"); err == nil {
+		t.Fatal("expected the send to fail when neither verb works")
+	}
+	if err := fake.SetFailing(false); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetLegacySend(false); err != nil {
+		t.Fatal(err)
+	}
+	fake.ClearLog()
+	if err := cli.Send(ctx, "w1:p1", "do\nthis"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`agent prompt w1:p1 do\nthis`}
+	if calls := fake.Calls(); !slices.Equal(calls, want) {
+		t.Errorf("a failed fallback must not wedge the shape, got %v", calls)
+	}
+}
+
+func TestMultiLineSendFallsBackToLegacyAgentSend(t *testing.T) {
+	// min_herdr_version is 0.7.0, which predates `agent prompt`: a herdr that
+	// rejects the verb (exit 2) must still get the text plus an explicit Enter,
+	// and the shape must be remembered so the next send does not re-probe.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetLegacySend(true); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	ctx := context.Background()
+	if err := cli.Send(ctx, "w1:p1", "run the\ntests"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`agent prompt w1:p1 run the\ntests`,
+		`agent send w1:p1 run the\ntests`,
+		"pane send-keys w1:p1 enter",
+	}
+	if calls := fake.Calls(); !slices.Equal(calls, want) {
+		t.Fatalf("legacy fallback calls = %v, want %v", calls, want)
+	}
+	if sent := fake.SentInputs(); len(sent) != 1 || sent[0] != `run the\ntests` {
+		t.Errorf("legacy fallback should deliver the text once, got %v", sent)
+	}
+
+	fake.ClearLog()
+	if err := cli.Send(ctx, "w1:p1", "and\nagain"); err != nil {
+		t.Fatal(err)
+	}
+	want = []string{`agent send w1:p1 and\nagain`, "pane send-keys w1:p1 enter"}
+	if calls := fake.Calls(); !slices.Equal(calls, want) {
+		t.Errorf("resolved legacy shape should not re-probe, got %v", calls)
+	}
+}
+
+func TestSendReturnsPaneErrorWithoutFallingBack(t *testing.T) {
+	// A pane-level failure exits 1 (JSON error body), not 2. Treating it as an
+	// unsupported verb would send the same text a SECOND time via the legacy
+	// pair — a duplicate delivery on every transient herdr error.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetFailing(true); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.Send(context.Background(), "w1:p1", "run the\ntests"); err == nil {
+		t.Fatal("expected the pane failure to surface")
+	}
+	if calls := fake.Calls(); len(calls) != 1 {
+		t.Errorf("a failed send must not be retried as a legacy send, got %v", calls)
 	}
 }
 
@@ -345,6 +533,59 @@ func countCalls(calls []string, call string) int {
 	return n
 }
 
+func TestSendToCodexMultiLineGetsNoSecondEnter(t *testing.T) {
+	// The codex second Enter repairs codex swallowing an Enter WE pressed as a
+	// paste newline. `agent prompt` encodes the submit into the same request,
+	// so there is nothing to repair — and a bare Enter 300ms later lands on
+	// whatever codex has put on screen by then, submitting a blank turn or
+	// accepting a focused control.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Blocked = retry-ineligible, so any Enter here would be the guaranteed one.
+	if err := fake.SetAgentList(agentListJSON("codex", "blocked", "w1:p1")); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "codex", "do this\nthen that"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"agent list", `agent prompt w1:p1 do this\nthen that`}
+	if calls := fake.Calls(); !slices.Equal(calls, want) {
+		t.Fatalf("multi-line codex send calls = %v, want %v", calls, want)
+	}
+}
+
+func TestSendToCodexMultiLineLegacyFallbackKeepsSecondEnter(t *testing.T) {
+	// The legacy fallback DOES press Enter itself, so the codex repair still
+	// applies there — gating on the delivery path, not on "multi-line".
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetLegacySend(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetAgentList(agentListJSON("codex", "blocked", "w1:p1")); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.SendToAgent(context.Background(), "w1:p1", "codex", "do this\nthen that"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"agent list",
+		`agent prompt w1:p1 do this\nthen that`,
+		`agent send w1:p1 do this\nthen that`,
+		"pane send-keys w1:p1 enter",
+		"pane send-keys w1:p1 enter",
+	}
+	if calls := fake.Calls(); !slices.Equal(calls, want) {
+		t.Fatalf("legacy multi-line codex send calls = %v, want %v", calls, want)
+	}
+}
+
 func TestSendToCodexSubmitsAgainAfterDelay(t *testing.T) {
 	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
 	if err != nil {
@@ -366,7 +607,7 @@ func TestSendToCodexSubmitsAgainAfterDelay(t *testing.T) {
 	calls := fake.Calls()
 	want := []string{
 		"agent list",
-		"agent send w1:p1 run the tests",
+		"pane send-text w1:p1 run the tests",
 		"pane send-keys w1:p1 enter",
 		"pane send-keys w1:p1 enter",
 	}
@@ -392,7 +633,7 @@ func TestSendToBlockedClaudeDoesNotSubmitAgain(t *testing.T) {
 	calls := fake.Calls()
 	want := []string{
 		"agent list",
-		"agent send w1:p1 run the tests",
+		"pane send-text w1:p1 run the tests",
 		"pane send-keys w1:p1 enter",
 	}
 	if fmt.Sprint(calls) != fmt.Sprint(want) {
@@ -410,9 +651,9 @@ func TestSendToUnknownAgentTypeSkipsSubmitHardening(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := fake.Calls()
-	if len(calls) != 2 || calls[0] != "agent send w1:p1 run the tests" ||
-		calls[1] != "pane send-keys w1:p1 enter" {
-		t.Errorf("unknown-type send should press Enter once with no status check, got %v", calls)
+	want := []string{"pane send-text w1:p1 run the tests", "pane send-keys w1:p1 enter"}
+	if !slices.Equal(calls, want) {
+		t.Errorf("unknown-type send should submit once with no status check, got %v", calls)
 	}
 }
 

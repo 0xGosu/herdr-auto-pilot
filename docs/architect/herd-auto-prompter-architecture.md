@@ -80,7 +80,7 @@ Single **Operator** role; multi-user access is explicitly out of scope.
 | Language / distribution | **Go**, single static binary; subcommands `daemon` / `tui` / `mcp` / `embed-worker` / CLI verbs | No runtime dependency; strong concurrency for the monitor loop |
 | Herdr events | **Raw socket** `events.subscribe` (JSON) | Long-lived agent-status subscription |
 | Herdr notifications (TUI + daemon) | **Raw socket** `notification.show` (JSON), CLI as transport fallback | Reports whether the toast was displayed, so the TUI can fall back to the terminal bell and the daemon can record that an escalation reached nobody |
-| Herdr actions | **CLI via `HERDR_BIN_PATH`** (`agent send`, `pane read`, `pane send-keys`, `pane get`, `pane zoom`, `agent list`, plus `tab focus`, `workspace list`, `tab list` behind the optional `FocusPort`/`LocatorPort`) | Portable across Unix socket / Windows named pipe |
+| Herdr actions | **CLI via `HERDR_BIN_PATH`** (`pane send-text`, `agent prompt`, `pane read`, `pane send-keys`, `pane get`, `pane zoom`, `agent list`, plus `tab focus`, `workspace list`, `tab list` behind the optional `FocusPort`/`LocatorPort`) | Portable across Unix socket / Windows named pipe |
 | History / audit | **Embedded SQLite (WAL)** | Transactional, corruption-safe concurrent access, queryable |
 | Operator config / rules | **TOML** in the plugin config dir | Hand-editable thresholds, never-auto patterns, classifier manifests, task sources, embedding tuning |
 | Daemon coordination | **Unix-domain control socket** (named pipe on Windows) | Sub-second reload propagation, no idle polling |
@@ -194,7 +194,7 @@ sequenceDiagram
     D->>S: resolve signature (exact hash then cosine KNN then BM25) + read mode/confidence + latest kill_event
     alt confident rule + passes safety
         D->>S: write audit_log + update signature counter (daemon-owned)
-        D->>H: agent send (next task / response)
+        D->>H: send-text / agent prompt (next task / response)
         D->>H: verify-unblock re-read status, audit delivery_failed if still blocked
     else no confident rule, LLM configured
         D->>S: stage llm_request (context)
@@ -204,7 +204,7 @@ sequenceDiagram
         D->>D: consume llm_decision, re-gate confidence + never-auto patterns
         alt passes gate & safety
             D->>S: promote to decisions (source=LLM) + audit (stdout captured)
-            D->>H: agent send
+            D->>H: send-text / agent prompt
         else fails / timeout / no submit / @noop
             D->>S: audit (escalated or noop)
             D->>H: notification show (escalation)
@@ -271,7 +271,8 @@ The domain depends only on interfaces. **Core ports:** `HerdrPort` (send/read),
   suspected-irreversible heuristic, kill switch, runaway guard, per-error retry
   ceiling. Any control can veto any action (§9).
 - **Action Executor** *(`HerdrPort`, outbound — `internal/herdr`)* — delivers
-  decided input via `agent send` + `pane send-keys enter`, reads panes, emits
+  decided input — typed as keys when single-line, pasted via `agent prompt` when
+  multi-line — reads panes, emits
   notifications. For multi-tab MCQ forms it uses the **sweep** (`sweep.go`,
   Right-arrow protocol) to capture every tab and `internal/mcqdeliver` to press
   the answer series **adaptively** (digit → re-read → Enter only if the answer
@@ -856,8 +857,11 @@ immediately even if the nudge is delayed.
   `rate_limited`, `no_foreground_client`, `busy`) is distinguishable from a
   delivered one and the TUI falls back to the terminal bell. Detected at
   runtime via `HERDR_ENV=1` + `HERDR_SOCKET_PATH`; absent outside Herdr.
-- Actions (CLI via `HERDR_BIN_PATH`): `agent send` (writes text without Enter —
-  follow with `pane send-keys <pane> enter`), `pane read` (`--source
+- Actions (CLI via `HERDR_BIN_PATH`): `pane send-text` + `pane send-keys enter` for
+  a single-line reply (literal keys, so a menu digit selects) and `agent prompt` for
+  a multi-line one (pasted as a single message); herdr 0.7.5 removed the older
+  `agent send`, which did both, and hap falls back to it only when herdr rejects
+  the newer verb. Also `pane read` (`--source
   visible|recent`), `pane get` (cwd/ids), `pane zoom`, `agent list`,
   `notification show`; plus `tab focus`, `workspace list` and `tab list` behind
   the optional `FocusPort`/`LocatorPort`. *(Agent status is driven off the events
@@ -1065,7 +1069,7 @@ the sections they gate.
 | Id | Title | Requirement (the plugin SHALL…) |
 |---|---|---|
 | **IR-001** | Herdr event subscription | Subscribe to Herdr agent-status transition events (raw socket `events.subscribe`) to drive monitoring without polling. |
-| **IR-002** | Herdr control actions | Send prompts/responses to agents and read pane content via Herdr's documented CLI commands (`agent send`, `pane read`, `pane get`, `pane send-keys`, `pane zoom`, `agent list`, `notification show`, and — behind optional ports — `tab focus`, `workspace list`, `tab list`). |
+| **IR-002** | Herdr control actions | Send prompts/responses to agents and read pane content via Herdr's documented CLI commands (`pane send-text`, `agent prompt`, `pane read`, `pane get`, `pane send-keys`, `pane zoom`, `agent list`, `notification show`, and — behind optional ports — `tab focus`, `workspace list`, `tab list`). |
 | **IR-003** | Herdr notifications | Surface escalations and critical failures via Herdr notifications in addition to the TUI. Both front-ends prefer the socket method (`notification.show`), which reports whether the toast was actually displayed; the CLI (`notification show`) is the transport-failure fallback only, because it exits 0 whether or not a toast was painted. The TUI acts on the report by falling back to the terminal bell; the daemon, having no second channel, records it — an escalation Herdr declined to paint means the operator was never interrupted, and the log says so. A toast Herdr *answered and declined* is never retried through the CLI (same Herdr, same verdict); an unreported delivery is recorded as unknown rather than claimed. |
 | **IR-004** | Herdr plugin manifest | Package as a Herdr plugin declaring id/version, pinned `min_herdr_version`, the TUI pane command, event hooks, and build steps in `herdr-plugin.toml`. |
 | **IR-005** | Local LLM CLI | Integrate an optional, operator-configured local LLM/agent CLI for the hybrid decision fallback, treating its absence or failure as an escalation trigger. |

@@ -160,6 +160,11 @@ func Decide(in DecideInput) Decision {
 	// Rationales are tag-only where the reason token self-explains — the
 	// escalation line's budget belongs to the suggestion, not to prose
 	// repeating the tag or the operator's own config.
+	//
+	// These four deliberately return BEFORE the situation is resolved, so they
+	// carry no suggestion and `hap confirm` refuses them: a vetoed action is
+	// answered by naming it explicitly (`hap resolve <id> --action TEXT`), never
+	// by one key. See TestNeverAutoVetoOutranksVarianceGuardAndStaysUnconfirmable.
 	if in.KillActive {
 		return esc(ReasonDaemonPaused, "", conf.Score, "")
 	}

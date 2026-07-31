@@ -177,24 +177,8 @@ func waitForConsult(t *testing.T, llm *capturingLLM, agentID string) map[string]
 // daemon is told (via the injected transition) that herdr reports it idle.
 func startIdleAgent(t *testing.T) string {
 	t.Helper()
-	out := runHerdr(t, "agent", "start", "hapitest-idle", "--cwd", "/tmp", "--no-focus",
-		"--", "bash", "-c", "echo 'All tests pass. Task is complete.'; sleep 60")
-	var resp struct {
-		Result struct {
-			Agent struct {
-				PaneID string `json:"pane_id"`
-			} `json:"agent"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal([]byte(out), &resp); err != nil {
-		t.Fatalf("parse agent start output: %v (%s)", err, out)
-	}
-	pane := resp.Result.Agent.PaneID
-	if pane == "" {
-		t.Fatalf("no pane id in agent start output: %s", out)
-	}
-	t.Cleanup(func() { tryHerdr("pane", "close", pane) })
-	return pane
+	return startScriptAgent(t, "hapitest-idle",
+		"#!/bin/bash\necho 'All tests pass. Task is complete.'\nsleep 60\n")
 }
 
 // TestRealConsultContextTaskSourceSummary drives a real approval consult (a
