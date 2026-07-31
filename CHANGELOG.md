@@ -8,6 +8,15 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.19
+
+- Changed BM25 text matching to also run when embedding search finds no learned rule above `similarity_threshold`, not only when the embedder is unavailable or errored — a screen that is a textual near-duplicate of a rule hap already learned now reuses that rule instead of minting a new signature, re-escalating, and graduating from scratch.
+- Changed approval, choice and error rules so a screen that embedding search has already judged too dissimilar is never reconsidered by text matching. Text scoring compares words without knowing which word carries the meaning, so an approval that swaps its target (`… to the test service` → `… live service`) is indistinguishable from one whose wording merely changed — and it must not inherit the other's learned answer. This matches the rule already applied when checking whether a screen held still before a delayed reply.
+- Added `embedding.bm25_highbar_score` (default 0.70), the stricter text-matching bar for screens at or above `min_salient_chars` once embedding search has run and refused them. Shorter screens, for which text matching is the only matcher, keep `bm25_min_score` and are unaffected.
+- Added a stall guard to the text-matching search so a pathologically slow match index degrades to exact-hash matching instead of holding up the daemon's monitoring loop.
+- Fixed a transient vector-search failure persisting the new signature without the embedding that had been computed for it, leaving that rule unreachable by similarity matching until a later daemon restart re-embedded it.
+- Fixed a newly learned signature being labelled with whichever embedding model was loaded when it was saved rather than the one that produced its vector, which could permanently attach a mismatched vector to a rule if the model was reloaded at that moment.
+
 ## 0.5.18
 
 - Fixed unrelated situations being auto-answered by one almost-empty learned rule, reported as `matched by \`similarity_threshold\` (cosine 0.91)`. Sentence embeddings are not discriminative on a handful of generic tokens, so any near-empty rule sat above the threshold from nearly every screen and became a magnet that answered them all
