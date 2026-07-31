@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.21
+
+- Fixed a test that could fail spuriously on a busy machine, making CI runs fail for reasons unrelated to the change under review.
+
 ## 0.5.20
 
 - Fixed `embedding.bm25_highbar_score` being invisible to `hap config` and the TUI config screen. It shipped settable in `config.toml` but `hap config set` rejected it as an unknown field, so the only way to change it was editing the file by hand. It is now listed and editable in both.
