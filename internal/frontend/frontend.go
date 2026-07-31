@@ -3126,7 +3126,7 @@ func MatchSummary(rec domain.AuditRecord) string {
 	case domain.MatchCosine:
 		return fmt.Sprintf("matched by `similarity_threshold` (cosine %.2f)", rec.MatchScore)
 	case domain.MatchBM25:
-		return fmt.Sprintf("matched by `bm25_min_score` (bm25 %.2f, embedding fallback)", rec.MatchScore)
+		return fmt.Sprintf("matched by `bm25_min_score` (bm25 %.2f, text fallback)", rec.MatchScore)
 	case domain.MatchExact:
 		return "exact content hash"
 	default:

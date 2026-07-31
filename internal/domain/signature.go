@@ -127,7 +127,9 @@ const (
 	// MatchCosine: an embedding cosine similarity met similarity_threshold.
 	MatchCosine MatchMethod = "cosine"
 	// MatchBM25: a normalized BM25 text similarity met bm25_min_score, the
-	// fallback taken when embedding failed or produced no vector.
+	// fallback taken whenever vector search did not produce a match — embedding
+	// skipped or failed, AND equally a search that ran cleanly but found
+	// nothing above similarity_threshold.
 	MatchBM25 MatchMethod = "bm25"
 )
 

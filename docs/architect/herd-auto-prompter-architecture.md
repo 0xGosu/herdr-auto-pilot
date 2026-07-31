@@ -506,16 +506,23 @@ fallback chain (each step stamps a `match_method` recorded in the audit log):
    persisted with no vector, and an existing short rule is stripped of its
    vector by `reembed.Reconcile` (at every daemon start and `[embedding]`
    reload, which is what heals an existing database with no migration) and
-   vetoed again as a search candidate. Such a rule stays reachable by BM25 and
-   by exact hash; only cosine is closed to it. **Structured salients are exempt
+   vetoed again as a *vector*-search candidate. Such a rule stays reachable by
+   BM25 and by exact hash; only cosine is closed to it — the veto in step 3's
+   accept filter is not repeated in step 4, so a candidate cosine refused for
+   being below the floor can still be chosen by text in the same call. **Structured salients are exempt
    at any length** — they are short by construction
    (`permission:proceed | options:no;yes` is 35 characters), so a length floor
    over them would disable cosine paraphrase matching for approvals, choices and
    errors; they are distilled identities already guarded by
    `ApprovalRemapCompatible` and `StructuredSalient`.
-4. **BM25 text fallback** — when no embedding is available (embedder degraded,
-   errored, or a `!vectors` build), normalized-BM25 text match at score ≥
-   `bm25_min_score` (default **0.35**) remaps (`bm25`).
+4. **BM25 text fallback** — whenever step 3 did not remap: no embedding was
+   available (skipped by the floor, embedder degraded, errored, or a `!vectors`
+   build), **and equally when the vector search ran cleanly but found nothing
+   above `similarity_threshold`**. Normalized-BM25 text match at score ≥
+   `bm25_min_score` (default **0.35**) remaps (`bm25`). The two matchers miss in
+   different ways — an embedding can land below the threshold on a screen that
+   is a near-verbatim render of a learned one — and minting a new key there
+   costs a fresh escalation plus a rule that re-graduates from scratch.
 5. **Mint new** — no match keeps the raw hash as a new key and persists its
    semantic identity (`signature_embeddings` row: salient always, vector when
    available) so later paraphrases can match it. Write/index failures only cost

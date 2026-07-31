@@ -1,7 +1,9 @@
 // Package match maintains the semantic search index over learned
 // signatures: bleve KNN (FAISS, `vectors` build tag) for embedding matches
-// and BM25 text scoring over the same salient content as the fallback when
-// no embedder is available. SQLite (signature_embeddings) is the source of
+// and BM25 text scoring over the same salient content as the fallback for
+// whenever a KNN match is not produced — no embedder available, and equally a
+// search that ran and found nothing similar enough. SQLite
+// (signature_embeddings) is the source of
 // truth; the bleve index is a disposable disk-backed cache under the state
 // dir, rebuilt from SQLite at daemon start and on model change. (Disk-backed
 // because scorch's mem-only segments do not serve KNN — verified against

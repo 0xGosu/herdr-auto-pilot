@@ -535,13 +535,18 @@ unclassifiable = "0"
 # Semantic rule matching: situations are matched to learned rules by
 # embedding their masked salient content (llama.cpp, MiniLM by default) in an
 # isolated worker and vector-searching stored signatures, so a paraphrased
-# prompt reuses the rule instead of re-learning from zero. Worker/model
-# failures degrade to normalized BM25 text matching, then exact hashes.
+# prompt reuses the rule instead of re-learning from zero. Normalized BM25 text
+# matching takes over whenever that search does not match — worker/model
+# failures, and equally a search that found nothing similar enough — then
+# exact hashes.
 [embedding]
 disabled = false
 model_path = ""            # "" = bundled <plugin>/models/all-minilm-l6-v2-q8_0.gguf; any .gguf works
 similarity_threshold = 0.90 # min cosine similarity to reuse a learned signature
-bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1]
+bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallback, (0,1].
+                            # The fallback runs whenever the vector search did not match:
+                            # the embedder being unavailable or errored, and also a search
+                            # that ran cleanly but found nothing above similarity_threshold.
 min_salient_chars = 0       # 0 = 100. Below this many characters a situation is
                             # matched by BM25 instead of embedding — short text
                             # embeds indiscriminately, which is how one
