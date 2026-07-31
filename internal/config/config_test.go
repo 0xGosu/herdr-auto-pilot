@@ -1247,26 +1247,38 @@ func TestEmbeddingDefaultsAndOverride(t *testing.T) {
 	if cfg.Embedding.BM25MinScore != 0.35 {
 		t.Errorf("default bm25_min_score = %v, want 0.35", cfg.Embedding.BM25MinScore)
 	}
+	// The high bar must default ABOVE bm25_min_score or it does nothing: it can
+	// only tighten, and the daemon ignores a value at or below the low bar.
+	if cfg.Embedding.BM25HighBarScore != 0.70 {
+		t.Errorf("default bm25_highbar_score = %v, want 0.70", cfg.Embedding.BM25HighBarScore)
+	}
+	if cfg.Embedding.BM25HighBarScore <= cfg.Embedding.BM25MinScore {
+		t.Errorf("default bm25_highbar_score (%v) must exceed bm25_min_score (%v), "+
+			"or the strict path is silently inert",
+			cfg.Embedding.BM25HighBarScore, cfg.Embedding.BM25MinScore)
+	}
 
 	// Explicit values honored, including a custom model path. A removed
 	// `gpu_layers` key is ignored (embedding is strictly CPU-only), not an error.
 	os.WriteFile(path, []byte(
-		"[embedding]\ndisabled = true\nmodel_path = \"/models/custom.gguf\"\nsimilarity_threshold = 0.75\nbm25_min_score = 0.5\ngpu_layers = 8\n"), 0o600)
+		"[embedding]\ndisabled = true\nmodel_path = \"/models/custom.gguf\"\nsimilarity_threshold = 0.75\nbm25_min_score = 0.5\nbm25_highbar_score = 0.8\ngpu_layers = 8\n"), 0o600)
 	if cfg, err = Load(path); err != nil {
 		t.Fatal(err)
 	}
 	if !cfg.Embedding.Disabled || cfg.Embedding.ModelPath != "/models/custom.gguf" ||
-		cfg.Embedding.SimilarityThreshold != 0.75 || cfg.Embedding.BM25MinScore != 0.5 {
+		cfg.Embedding.SimilarityThreshold != 0.75 || cfg.Embedding.BM25MinScore != 0.5 ||
+		cfg.Embedding.BM25HighBarScore != 0.8 {
 		t.Errorf("explicit embedding values lost: %+v", cfg.Embedding)
 	}
 
 	// Out-of-range numerics restore defaults.
 	os.WriteFile(path, []byte(
-		"[embedding]\nsimilarity_threshold = 1.5\nbm25_min_score = 1.5\n"), 0o600)
+		"[embedding]\nsimilarity_threshold = 1.5\nbm25_min_score = 1.5\nbm25_highbar_score = 1.5\n"), 0o600)
 	if cfg, err = Load(path); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Embedding.SimilarityThreshold != 0.90 || cfg.Embedding.BM25MinScore != 0.35 {
+	if cfg.Embedding.SimilarityThreshold != 0.90 || cfg.Embedding.BM25MinScore != 0.35 ||
+		cfg.Embedding.BM25HighBarScore != 0.70 {
 		t.Errorf("out-of-range embedding values should restore defaults: %+v", cfg.Embedding)
 	}
 }

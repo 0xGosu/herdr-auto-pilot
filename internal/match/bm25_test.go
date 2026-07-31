@@ -289,3 +289,137 @@ func TestMatchTextLengthRaisesTheScoreAtHighOverlap(t *testing.T) {
 			partialShort, partialLong)
 	}
 }
+
+// approvalCorpus indexes one stored approval plus `filler` unrelated ones, all
+// carrying the identical Claude option-set boilerplate a real approval renders.
+//
+// Built with Rebuild (one batch) on purpose. An index grown by repeated Add —
+// which is how the daemon's mint path grows a real one — leaves many small
+// scorch segments that merge asynchronously, and MatchText's normalization
+// divides by a SECOND search (textSelfScore) that is not snapshot-consistent
+// with the first. A merge landing between the two inflates the ratio: measured
+// over 40 identical trials on an Add-built index, this same query scored 0.658
+// in 80% of them and 0.766 / 0.813 / 0.861 / 0.944 / 1.000 in the rest, while
+// the Rebuild-built index returned 0.657887 every single time. Batch building
+// is what makes the linguistic property below measurable at all, and the
+// instability is why daemon.bm25RetryAllowed refuses structured salients by a
+// rule rather than by thresholding this score.
+func approvalCorpus(t *testing.T, storedVerb string, filler int) (*Matcher, string) {
+	t.Helper()
+	const opts = "options:no, and tell claude what to do differently;yes;" +
+		"yes, and don't ask again for similar commands"
+	sal := func(verb string) string { return "permission:" + verb + " | " + opts }
+
+	m := New(t.TempDir())
+	t.Cleanup(func() { m.Close() })
+	fillerVerbs := []string{
+		"read the file at the given path", "write the updated manifest",
+		"restart the background worker", "fetch the upstream changes",
+		"remove the temporary directory", "install the missing dependency",
+		"format the source tree", "publish the built artifact",
+		"rotate the signing credentials", "compact the on disk index",
+		"drain the pending queue", "verify the release checksums",
+	}
+	rows := []domain.SignatureEmbedding{{
+		Signature: "stored", SituationType: domain.SituationApproval,
+		AgentType: "claude", Salient: sal(storedVerb), CreatedAt: time.Now(),
+	}}
+	for i := 0; i < filler; i++ {
+		rows = append(rows, domain.SignatureEmbedding{
+			Signature: fmt.Sprintf("filler%04d", i), SituationType: domain.SituationApproval,
+			AgentType: "claude", CreatedAt: time.Now(),
+			Salient: sal(fmt.Sprintf("%s number zeta%c%c",
+				fillerVerbs[i%len(fillerVerbs)], 'a'+i/26, 'a'+i%26)),
+		})
+	}
+	if err := m.Rebuild(rows, 0); err != nil {
+		t.Fatal(err)
+	}
+	return m, opts
+}
+
+// TestMatchTextCannotSeparateATargetSwapFromARewording is the evidence behind
+// daemon.bm25RetryAllowed refusing structured salients outright instead of
+// holding them to a stricter threshold.
+//
+// BM25 is a bag of words: it knows how many terms differ, never WHICH. Against
+// a stored "apply the pending migration to the test service", changing the
+// TARGET ("… live service" — a materially different approval) and rewording the
+// VERB ("run the pending migration …" — the same approval, restated) each
+// differ by exactly one token, and score indistinguishably. No threshold can
+// admit the second and refuse the first.
+//
+// domain.SignatureHeldStill already refuses fuzzy matching for structured
+// salients on this same ground, for the deferred-send drift check.
+func TestMatchTextCannotSeparateATargetSwapFromARewording(t *testing.T) {
+	const storedVerb = "apply the pending migration to the test service"
+	m, opts := approvalCorpus(t, storedVerb, 24)
+	sal := func(verb string) string { return "permission:" + verb + " | " + opts }
+
+	score := func(verb string) float64 {
+		t.Helper()
+		hit, ok, err := m.MatchText(context.Background(), sal(verb),
+			Scope{SituationType: domain.SituationApproval, AgentType: "claude"}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok || hit.Signature != "stored" {
+			t.Fatalf("premise: %q must reach the stored rule (ok=%v, hit=%s)", verb, ok, hit.Signature)
+		}
+		return hit.Score
+	}
+
+	targetSwap := score("apply the pending migration to the live service")
+	rewording := score("run the pending migration to the test service")
+	t.Logf("target swap = %.6f, benign rewording = %.6f (bm25_min_score=%.2f)",
+		targetSwap, rewording, defaultBM25MinScore)
+
+	// Both must be reachable at all, or the pair proves nothing.
+	if targetSwap < defaultBM25MinScore || rewording < defaultBM25MinScore {
+		t.Fatalf("premise: both must clear %.2f, got %.4f and %.4f",
+			defaultBM25MinScore, targetSwap, rewording)
+	}
+	// Tolerance rather than equality: different tokens put them parts per
+	// million apart. "Indistinguishable" is the claim — no bar fits between.
+	const indistinguishable = 0.01
+	if d := targetSwap - rewording; d > indistinguishable || d < -indistinguishable {
+		t.Errorf("a target swap (%.6f) and a benign rewording (%.6f) are now %.4f apart — "+
+			"if BM25 can separate them, a target-identity rule may be possible and "+
+			"refusing structured salients outright deserves revisiting",
+			targetSwap, rewording, d)
+	}
+}
+
+// TestMatchTextBatchBuiltIndexScoresDeterministically pins the premise the test
+// above depends on: on a Rebuild-built index the same query returns the same
+// score every time. (An Add-built index does NOT — see approvalCorpus. That
+// asymmetry is deliberately not asserted here, because a test for intermittent
+// behavior would itself be intermittent.)
+func TestMatchTextBatchBuiltIndexScoresDeterministically(t *testing.T) {
+	const storedVerb = "apply the pending migration to the test service"
+	var first float64
+	for i := 0; i < 5; i++ {
+		m, opts := approvalCorpus(t, storedVerb, 24)
+		hit, ok, err := m.MatchText(context.Background(),
+			"permission:apply the pending migration to the live service | "+opts,
+			Scope{SituationType: domain.SituationApproval, AgentType: "claude"}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatal("premise: the query must match the stored rule")
+		}
+		if i == 0 {
+			first = hit.Score
+			continue
+		}
+		// Tight, but not exact: floating-point accumulation order can move the
+		// last bits. 1e-6 is three orders of magnitude below the 0.1+ swings an
+		// Add-built index shows, so this still distinguishes "stable" decisively.
+		if d := hit.Score - first; d > 1e-6 || d < -1e-6 {
+			t.Errorf("batch-built index scored %.12f on trial %d but %.12f on the first "+
+				"(%.2e apart) — the stable-scoring premise behind the characterization "+
+				"tests is gone", hit.Score, i, first, d)
+		}
+	}
+}

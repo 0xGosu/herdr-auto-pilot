@@ -547,6 +547,12 @@ bm25_min_score = 0.35       # min normalized BM25 similarity for the text fallba
                             # The fallback runs whenever the vector search did not match:
                             # the embedder being unavailable or errored, and also a search
                             # that ran cleanly but found nothing above similarity_threshold.
+bm25_highbar_score = 0.70   # the stricter bar used instead of bm25_min_score for a
+                            # pane-tail salient at/above min_salient_chars once an
+                            # embedding search has RUN and refused the pair. Approval,
+                            # choice and error rules refused by cosine are not retried by
+                            # text at all — BM25 scores a changed approval TARGET and a
+                            # harmless rewording alike, so no bar can separate them.
 min_salient_chars = 0       # 0 = 100. Below this many characters a situation is
                             # matched by BM25 instead of embedding — short text
                             # embeds indiscriminately, which is how one

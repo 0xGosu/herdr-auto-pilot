@@ -259,6 +259,19 @@ bm25_min_score = 0.35       # text-fallback floor, (0,1]. The fallback runs when
                             # AND a search that ran but found nothing above
                             # similarity_threshold. Raise it to make those second-chance
                             # remaps rarer; lower it to merge on shared wording alone.
+bm25_highbar_score = 0.70   # the STRICTER bar, (0,1], used instead of bm25_min_score for a
+                            # PANE-TAIL salient at or above min_salient_chars that reaches
+                            # text matching after an embedding search RAN and refused it.
+                            # Cosine already judged the pair too dissimilar, so this bounds
+                            # how far a bag-of-words score may overturn that verdict.
+                            # Below the floor a salient is never embedded — no cosine verdict
+                            # to overturn — so it keeps bm25_min_score, its only matcher.
+                            # Structured salients (approval/choice/error) refused by cosine
+                            # are not reconsidered by text AT ALL, at any score: BM25 cannot
+                            # tell WHICH token changed, so a changed approval target and a
+                            # harmless rewording score alike, and the score is itself unstable
+                            # on an incrementally built index. This bar can only tighten; a
+                            # value at or below bm25_min_score is ignored.
 # min_salient_chars is the length below which a situation is matched by BM25
 # text search INSTEAD of embedding, measured on the masked salient. Sentence
 # embeddings are not discriminative on a handful of generic tokens: any two

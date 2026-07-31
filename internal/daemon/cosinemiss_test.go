@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/match"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
@@ -51,10 +53,12 @@ func TestResolveSignatureCosineMissFallsBackToBM25(t *testing.T) {
 	ctx := context.Background()
 	cfg, _, _ := d.snapshot()
 
+	seedIdleRules(t, d, 24) // the production regime; see seedRule's comment
 	learned := d.resolveSignature(ctx, cfg, learnedSig, learnedSit)
 	if learned.Match.Method != domain.MatchNone {
 		t.Fatalf("premise: the first sight mints a fresh key, got method %q", learned.Match.Method)
 	}
+	before, _ := d.opt.Store.CountSignatureEmbeddings(ctx)
 
 	got := d.resolveSignature(ctx, cfg, rewordedSig, rewordedSit)
 	if got.Signature != learned.Signature {
@@ -64,8 +68,11 @@ func TestResolveSignatureCosineMissFallsBackToBM25(t *testing.T) {
 	if got.Match.Method != domain.MatchBM25 {
 		t.Errorf("match method = %q, want bm25", got.Match.Method)
 	}
-	if got.Match.Score < cfg.Embedding.BM25MinScore {
-		t.Errorf("bm25 score = %.3f, want >= %.2f", got.Match.Score, cfg.Embedding.BM25MinScore)
+	// This screen is embeddable and cosine refused it, so the STRICT bar
+	// governs — a purely additive near-duplicate has to clear it.
+	if got.Match.Score < cfg.Embedding.BM25HighBarScore {
+		t.Errorf("bm25 score = %.4f, want >= the high bar %.2f",
+			got.Match.Score, cfg.Embedding.BM25HighBarScore)
 	}
 	// The embed SUCCEEDED — cosine just did not clear the bar. Reporting an
 	// embed error here would send the operator hunting a broken model.
@@ -76,9 +83,10 @@ func TestResolveSignatureCosineMissFallsBackToBM25(t *testing.T) {
 	if got.Raw != rewordedSig.Raw {
 		t.Errorf("Raw must never be remapped: %s vs %s", got.Raw, rewordedSig.Raw)
 	}
-	// A remap persists no new identity.
-	if n, _ := d.opt.Store.CountSignatureEmbeddings(ctx); n != 1 {
-		t.Errorf("embedding rows after remap = %d, want 1", n)
+	// A remap persists no new identity — the reused rule already has one.
+	if n, _ := d.opt.Store.CountSignatureEmbeddings(ctx); n != before {
+		t.Errorf("embedding rows went %d -> %d across a remap; a reused signature "+
+			"must not mint a second identity", before, n)
 	}
 }
 
@@ -192,6 +200,28 @@ func approvalWithOptions(verb string) domain.Situation {
 	s := approvalSituation(verb)
 	s.Options = claudeApprovalOptions
 	return s
+}
+
+// approvalHarness builds a daemon whose index holds `seeds` unrelated approvals
+// plus one learned rule, and returns the learned result.
+//
+// Each variant under test needs its OWN harness. resolveSignature mints an
+// embedding row for anything it refuses, and the exact-hash fast path reads the
+// RULES table, not signature_embeddings — so re-resolving the same situation a
+// second time does not short-circuit, it matches the row the first call just
+// minted, at cosine 1.0. Sharing a harness across variants silently measures
+// that instead of the comparison intended.
+func approvalHarness(t *testing.T, learnedSit domain.Situation, seeds int) (
+	*Daemon, config.Config, domain.SignatureResult) {
+	t.Helper()
+	learnedSig := domain.ComputeSignature(learnedSit)
+	emb := &fakeEmbedder{vectors: map[string][]float32{
+		learnedSig.Salient: {1, 0, 0, 0},
+	}}
+	d := semanticHarness(t, emb, "")
+	cfg, _, _ := d.snapshot()
+	seedApprovalRules(t, d, seeds)
+	return d, cfg, d.resolveSignature(context.Background(), cfg, learnedSig, learnedSit)
 }
 
 // seedApprovalRules learns `n` unrelated approvals so the match index carries a
@@ -323,79 +353,72 @@ func TestResolveSignatureCosineMissKeepsUnrelatedChoicesApart(t *testing.T) {
 	}
 }
 
-// TestResolveSignatureCosineMissMergesNearIdenticalApprovals pins an ACCEPTED
-// trade-off rather than a desired behavior, so it is deliberately explicit.
+// TestResolveSignatureCosineMissKeepsOneWordApprovalVariantsApart is the
+// safety invariant this whole path is bounded by, and it mirrors the rule
+// domain.SignatureHeldStill already enforces on the deferred-send drift check:
+// a structured salient is a distilled identity, so
+// "permission:apply … to the test service" and "… live service" are materially
+// DIFFERENT approvals however much text they share.
 //
-// Two approvals differing by a single word — "…to the staging cluster" vs
-// "…to the production cluster" — share enough terms to clear bm25_min_score
-// (measured 0.55), so a rule learned for one now answers the other. Before the
-// retry existed, a cosine miss minted separate keys for them.
-//
-// It is accepted because a real embedding model puts that pair far above
-// similarity_threshold anyway (this test only forces a miss by handing the
-// paraphrase an orthogonal canned vector), and because a shared learning key is
-// not a delivered answer: the rule still has to graduate, and the kill switch,
-// never-auto patterns, irreversible heuristic and rate guards all still gate
-// delivery. The operator's lever is bm25_min_score.
-//
-// If this test starts FAILING, the merge stopped happening — that is a
-// behavior change to make deliberately, not to re-baseline.
-func TestResolveSignatureCosineMissMergesNearIdenticalApprovals(t *testing.T) {
-	learnedSit := approvalWithOptions("deploy the release to the staging cluster")
-	nearSit := approvalWithOptions("deploy the release to the production cluster")
-	learnedSig := domain.ComputeSignature(learnedSit)
+// Text matching would MATCH them (the premise below checks that directly
+// against the matcher), so the refusal has to come from bm25RetryAllowed, not
+// from the pair being far apart. And it is a rule rather than a bar because no
+// bar can be trusted here: BM25 scores a changed target and a benign rewording
+// indistinguishably (internal/match.TestMatchTextCannotSeparateATargetSwapFromARewording),
+// and the score itself is unstable on an incrementally built index — see
+// bm25RetryAllowed.
+func TestResolveSignatureCosineMissKeepsOneWordApprovalVariantsApart(t *testing.T) {
+	learnedSit := approvalWithOptions("apply the pending migration to the test service")
+	nearSit := approvalWithOptions("apply the pending migration to the live service")
 	nearSig := domain.ComputeSignature(nearSit)
 
-	emb := &fakeEmbedder{vectors: map[string][]float32{
-		learnedSig.Salient: {1, 0, 0, 0},
-	}}
-	d := semanticHarness(t, emb, "")
-	ctx := context.Background()
-	cfg, _, _ := d.snapshot()
+	d, cfg, learned := approvalHarness(t, learnedSit, 24)
 
-	seedApprovalRules(t, d, 24) // measure in the production regime
-	learned := d.resolveSignature(ctx, cfg, learnedSig, learnedSit)
-	got := d.resolveSignature(ctx, cfg, nearSig, nearSit)
+	// Premise, checked against the matcher directly so it cannot be satisfied by
+	// the very rule under test: text matching DOES reach the learned rule for
+	// this pair, comfortably above bm25_min_score. Without that, the assertions
+	// below would pass for the wrong reason — the pair simply not matching.
+	hit, ok, err := d.matcher.MatchText(context.Background(), nearSig.Salient,
+		match.Scope{SituationType: nearSit.Type, AgentType: nearSit.AgentType}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || hit.Signature != learned.Signature || hit.Score < cfg.Embedding.BM25MinScore {
+		t.Fatalf("premise: text matching must reach the learned rule for this pair "+
+			"(ok=%v, hit=%s, score=%.4f, min=%.2f) — otherwise this test does not show "+
+			"that bm25RetryAllowed is what refuses it",
+			ok, hit.Signature, hit.Score, cfg.Embedding.BM25MinScore)
+	}
+	t.Logf("text matching would have merged at bm25 %.4f; the structured rule refuses it", hit.Score)
 
-	if got.Signature != learned.Signature || got.Match.Method != domain.MatchBM25 {
-		t.Errorf("a one-word approval variant is expected to merge by text after a "+
-			"cosine miss: signature %s (learned %s), method %q, score %.3f",
-			got.Signature, learned.Signature, got.Match.Method, got.Match.Score)
+	got := d.resolveSignature(context.Background(), cfg, nearSig, nearSit)
+	if got.Signature == learned.Signature {
+		t.Errorf("a one-word TARGET change must not inherit the learned rule: "+
+			"both = %s (method %q, score %.4f)",
+			got.Signature, got.Match.Method, got.Match.Score)
+	}
+	if got.Signature != nearSig.Raw {
+		t.Errorf("a refused approval keeps its raw key, got %s", got.Signature)
+	}
+	if got.Match.Method != domain.MatchNone {
+		t.Errorf("match method = %q, want none", got.Match.Method)
 	}
 
-	// Raising bm25_min_score above the observed score is the operator's lever
-	// for refusing this merge. Re-run the SAME pair under the stricter config —
-	// a different third situation would have different term statistics and so
-	// would not establish anything about the pair that just merged. Re-running
-	// is clean because a remap persists no row, so nearSig.Raw is still unknown
-	// to the store and the exact-hash fast path cannot short-circuit it.
-	strict := cfg
-	strict.Embedding.BM25MinScore = 0.9
-	again := d.resolveSignature(ctx, strict, nearSig, nearSit)
-	if again.Signature != nearSig.Raw {
-		t.Errorf("raising bm25_min_score must refuse the very merge it just made, "+
-			"got %s (method %q, score %.3f)", again.Signature, again.Match.Method, again.Match.Score)
+	// The refusal must not depend on a threshold: lowering the high bar all the
+	// way to bm25_min_score changes nothing, because a structured salient cosine
+	// refused never reaches a bar at all. A FRESH harness, since the run above
+	// minted a row for nearSig that this one would match against itself.
+	d2, cfg2, learned2 := approvalHarness(t, learnedSit, 24)
+	loose := cfg2
+	loose.Embedding.BM25HighBarScore = cfg2.Embedding.BM25MinScore
+	again := d2.resolveSignature(context.Background(), loose, nearSig, nearSit)
+	if again.Signature == learned2.Signature {
+		t.Errorf("lowering bm25_highbar_score re-opened the merge (%s, method %q, score %.4f) — "+
+			"the structured refusal must be threshold-free, since the score it would "+
+			"compare against is not stable",
+			again.Signature, again.Match.Method, again.Match.Score)
 	}
 }
-
-// swappingEmbedder returns its canned vector and, on the way out, installs a
-// DIFFERENT embedder on the daemon — reproducing a [embedding] reload landing
-// between the embed call and the mint block at the end of resolveSignature.
-type swappingEmbedder struct {
-	*fakeEmbedder
-	d           *Daemon
-	replacement ports.EmbedderPort
-}
-
-func (s swappingEmbedder) EmbedText(ctx context.Context, text string) ([]float32, error) {
-	v, err := s.fakeEmbedder.EmbedText(ctx, text)
-	s.d.mu.Lock()
-	s.d.embedder = s.replacement
-	s.d.mu.Unlock()
-	return v, err
-}
-
-func (s swappingEmbedder) ModelID() string { return "model-a" }
 
 // TestResolveSignatureMintedRowRecordsTheModelThatProducedTheVector pins the
 // reload race. The minted row used to take its model id from whatever embedder
@@ -447,6 +470,25 @@ func TestResolveSignatureMintedRowRecordsTheModelThatProducedTheVector(t *testin
 	t.Fatalf("no embedding row minted for %s", sig.Raw)
 }
 
+// swappingEmbedder returns its canned vector and, on the way out, installs a
+// DIFFERENT embedder on the daemon — reproducing an [embedding] reload landing
+// between the embed call and the mint block at the end of resolveSignature.
+type swappingEmbedder struct {
+	*fakeEmbedder
+	d           *Daemon
+	replacement ports.EmbedderPort
+}
+
+func (s swappingEmbedder) EmbedText(ctx context.Context, text string) ([]float32, error) {
+	v, err := s.fakeEmbedder.EmbedText(ctx, text)
+	s.d.mu.Lock()
+	s.d.embedder = s.replacement
+	s.d.mu.Unlock()
+	return v, err
+}
+
+func (s swappingEmbedder) ModelID() string { return "model-a" }
+
 type namedEmbedder struct {
 	*fakeEmbedder
 	id string
@@ -454,45 +496,56 @@ type namedEmbedder struct {
 
 func (n *namedEmbedder) ModelID() string { return n.id }
 
-// TestResolveSignatureOneWordVariantsMergeAtBothSalientLengths is the
-// end-to-end half of internal/match's threshold characterization, and the
-// answer to "does min_salient_chars change what bm25_min_score does?"
+// TestResolveSignatureSalientFloorSelectsWhichBM25BarApplies is the end-to-end
+// statement of how the two thresholds divide the work, and the answer to "does
+// min_salient_chars change what the BM25 bars do?" — it decides WHICH ONE
+// applies, which is the whole design:
 //
-// It does not change the VERDICT, only the score. The two populations reach
-// this bar by different routes — a salient below the floor is never embedded,
-// so BM25 is its only matcher and 0.35 is its entire discriminator, while a
-// salient above the floor reaches BM25 as the cosine-miss fallback (or whenever
-// the embedder is unavailable) — but at a realistic corpus a one-word variant
-// clears the bar comfortably on BOTH sides (measured 0.53 short, 0.67 long over
-// 25 rules). Length shifts the score, not the outcome.
+//   - BELOW the floor a salient is never embedded, so text matching is its only
+//     matcher and it is held to bm25_min_score (0.35). A one-word variant
+//     scores 0.507 and MERGES — without that, such a rule could only ever match
+//     by exact hash, which the floor exists to avoid.
+//   - AT OR ABOVE the floor cosine ran first and refused the pair, so the
+//     stricter bm25_highbar_score (0.70) applies. The same one-word variant
+//     scores 0.657 and is REFUSED — text is not allowed to overturn a stronger
+//     signal's verdict on a one-token change.
+//
+// So the identical edit merges below the floor and is refused above it, by
+// design rather than by accident of scoring.
 //
 // The corpus seeding is essential. At ONE indexed rule the short case scores
-// 0.33 and the long 0.38, straddling the default, which reads as a real
-// length-driven split; it is an artifact of a single-document index having
-// uniform IDF and no meaningful average document length. See
+// 0.33 and the long 0.38 — an artifact of a single-document index having
+// uniform IDF and no meaningful average document length, which would make the
+// short case fail here for entirely the wrong reason. See
 // internal/match.TestMatchTextCorpusSizeDoesNotFlipTheVerdict.
-func TestResolveSignatureOneWordVariantsMergeAtBothSalientLengths(t *testing.T) {
+func TestResolveSignatureSalientFloorSelectsWhichBM25BarApplies(t *testing.T) {
 	const shortBase = "waiting for the reviewer to approve the release"
 	const longBase = "waiting for the reviewer to approve the release because the migration " +
 		"touches the billing tables and the rollback window closes at midnight tonight"
 
 	for _, tc := range []struct {
-		name    string
-		stored  string
-		swapped string
-		route   string
+		name      string
+		stored    string
+		swapped   string
+		route     string
+		wantMerge bool
+		wantBar   string
 	}{
 		{
-			name:    "below the floor: BM25 is the only matcher",
-			stored:  shortBase,
-			swapped: "waiting for the reviewer to approve the rollback",
-			route:   "never embedded",
+			name:      "below the floor: BM25 is the only matcher",
+			stored:    shortBase,
+			swapped:   "waiting for the reviewer to approve the rollback",
+			route:     "never embedded",
+			wantMerge: true,
+			wantBar:   "bm25_min_score",
 		},
 		{
-			name:    "above the floor: BM25 is the cosine-miss fallback",
-			stored:  longBase,
-			swapped: longBase[:len(longBase)-len("midnight tonight")] + "midday tomorrow",
-			route:   "embedded, cosine missed",
+			name:      "above the floor: cosine already refused it",
+			stored:    longBase,
+			swapped:   longBase[:len(longBase)-len("midnight tonight")] + "midday tomorrow",
+			route:     "embedded, cosine missed",
+			wantMerge: false,
+			wantBar:   "bm25_highbar_score",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -520,16 +573,23 @@ func TestResolveSignatureOneWordVariantsMergeAtBothSalientLengths(t *testing.T) 
 			learned := d.resolveSignature(ctx, cfg, storedSig, storedSit)
 			got := d.resolveSignature(ctx, cfg, swappedSig, swappedSit)
 
-			if got.Signature != learned.Signature {
-				t.Errorf("%s (%s): a one-word variant should reuse the learned rule, "+
-					"got %s (method %q, score %.4f)",
-					tc.name, tc.route, got.Signature, got.Match.Method, got.Match.Score)
+			merged := got.Signature == learned.Signature
+			if merged != tc.wantMerge {
+				t.Errorf("%s (%s, governed by %s): merged = %v, want %v "+
+					"(method %q, score %.4f; min %.2f, high %.2f)",
+					tc.name, tc.route, tc.wantBar, merged, tc.wantMerge,
+					got.Match.Method, got.Match.Score,
+					cfg.Embedding.BM25MinScore, cfg.Embedding.BM25HighBarScore)
 			}
-			if got.Match.Method != domain.MatchBM25 {
-				t.Errorf("match method = %q, want bm25 (score %.4f)",
-					got.Match.Method, got.Match.Score)
+			wantMethod := domain.MatchNone
+			if tc.wantMerge {
+				wantMethod = domain.MatchBM25
 			}
-			t.Logf("%s: bm25 %.4f", tc.route, got.Match.Score)
+			if got.Match.Method != wantMethod {
+				t.Errorf("match method = %q, want %q (score %.4f)",
+					got.Match.Method, wantMethod, got.Match.Score)
+			}
+			t.Logf("%s (%s): score %.4f, merged=%v", tc.route, tc.wantBar, got.Match.Score, merged)
 		})
 	}
 }
@@ -568,4 +628,38 @@ func assertRowHasVector(t *testing.T, rows []domain.SignatureEmbedding, signatur
 		return
 	}
 	t.Errorf("no embedding row minted for %s", signature)
+}
+
+// TestBM25BarSelection pins which bar governs each route, and the only-tightens
+// rule: a bm25_highbar_score at or below bm25_min_score is IGNORED rather than
+// allowed to loosen the cosine-miss path. Without that guard, misconfiguring the
+// high bar downward would quietly widen the very merge it exists to refuse.
+func TestBM25BarSelection(t *testing.T) {
+	withBars := func(min, high float64) config.Config {
+		c := config.Default()
+		c.Embedding.BM25MinScore = min
+		c.Embedding.BM25HighBarScore = high
+		return c
+	}
+	for _, tc := range []struct {
+		name         string
+		cfg          config.Config
+		cosineMissed bool
+		want         float64
+	}{
+		{"no cosine verdict uses the low bar", withBars(0.35, 0.70), false, 0.35},
+		{"cosine refused it uses the high bar", withBars(0.35, 0.70), true, 0.70},
+		{"a high bar below the low bar is ignored", withBars(0.35, 0.20), true, 0.35},
+		{"a high bar equal to the low bar is a no-op", withBars(0.35, 0.35), true, 0.35},
+		{"a low high bar never touches the low-bar route", withBars(0.35, 0.20), false, 0.35},
+		{"an operator-raised low bar still wins when it exceeds the high one", withBars(0.9, 0.70), true, 0.9},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bm25Bar(tc.cfg, tc.cosineMissed); got != tc.want {
+				t.Errorf("bm25Bar(min=%v, high=%v, cosineMissed=%v) = %v, want %v",
+					tc.cfg.Embedding.BM25MinScore, tc.cfg.Embedding.BM25HighBarScore,
+					tc.cosineMissed, got, tc.want)
+			}
+		})
+	}
 }

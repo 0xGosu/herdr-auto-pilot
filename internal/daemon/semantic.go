@@ -83,6 +83,66 @@ func (d *Daemon) initSemantic(ctx context.Context, gen int64) {
 // measured over a 200-rule corpus, so it only ever fires on real pathology.
 const bm25MatchTimeout = 2 * time.Second
 
+// bm25Bar picks the normalized-BM25 bar for a text fallback.
+//
+// A situation that reached text matching AFTER a cosine search ran and found
+// nothing similar enough is held to the stricter embedding.bm25_highbar_score:
+// cosine already judged the pair too dissimilar, so admitting it on a
+// bag-of-words score means overriding a stronger signal with a weaker one.
+//
+// cosineMissed selects exactly the embeddable population
+// (domain.EmbeddableSalient — structured salients at any length, plus pane-tail
+// salients at or above min_salient_chars), because nothing else runs an embed
+// call at all. A short pane-tail salient never had a cosine opinion to
+// contradict, and text matching is its ONLY matcher, so it keeps
+// bm25_min_score; raising its bar would strand it on exact hash, which is
+// precisely what the min_salient_chars design rules out.
+//
+// A high bar below bm25_min_score is ignored: this can only tighten.
+func bm25Bar(cfg config.Config, cosineMissed bool) float64 {
+	if !cosineMissed {
+		return cfg.Embedding.BM25MinScore
+	}
+	if cfg.Embedding.BM25HighBarScore > cfg.Embedding.BM25MinScore {
+		return cfg.Embedding.BM25HighBarScore
+	}
+	return cfg.Embedding.BM25MinScore
+}
+
+// bm25RetryAllowed reports whether a situation cosine has already REFUSED may
+// be reconsidered by text matching at all.
+//
+// Structured salients — an approval's verb + options, a choice's option set, an
+// error summary — are refused outright, and this is a threshold-free rule on
+// purpose. Two independent reasons, either sufficient:
+//
+//  1. BM25 cannot express the distinction that matters. One token IS the
+//     target, and a bag of words knows how many terms differ but never WHICH:
+//     "apply … to the test service" → "… live service" and a harmless rewording
+//     of the verb against the SAME target score within parts per million of each
+//     other. No bar admits one and refuses the other
+//     (TestResolveSignatureCosineMissCannotSeparateTargetFromRewording).
+//  2. The score itself is not trustworthy enough to threshold here. Normalized
+//     BM25 divides by a SECOND search (match.textCandidates → textSelfScore)
+//     that is not snapshot-consistent with the first, so on an incrementally
+//     built index — which is every production index, since each minted signature
+//     calls matcher.Add — a background segment merge landing between the two
+//     searches inflates the ratio. Measured over 40 identical trials: 0.658 in
+//     80% of them, and 0.766 / 0.813 / 0.861 / 0.944 / 1.000 in the rest. A bar
+//     cannot refuse a pair that intermittently scores a perfect 1.0.
+//
+// domain.SignatureHeldStill already refuses fuzzy matching for structured
+// salients on reason 1 alone, for the deferred-send drift check; this keeps
+// signature resolution consistent with it.
+//
+// Pane-tail salients keep the retry: there, drift is genuinely a repainted
+// screen rather than a changed target, and an inflated score merges two similar
+// screens instead of two materially different approvals. They are still held to
+// bm25_highbar_score, which bounds how loose that can get.
+func bm25RetryAllowed(sig domain.SignatureResult, cosineMissed bool) bool {
+	return !cosineMissed || !domain.StructuredSalient(sig.Salient)
+}
+
 // resolveSignature maps a freshly computed signature to its learning key:
 //
 //  1. over-masked, semantic disabled, or index not ready → unchanged;
@@ -123,8 +183,9 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 
 	scope := match.Scope{SituationType: s.Type, AgentType: s.AgentType}
 	var (
-		vec      []float32
-		vecModel string
+		vec          []float32
+		vecModel     string
+		cosineMissed bool // a vector search RAN and found nothing acceptable
 	)
 	// A salient below the floor is matched by text, never by embedding: at that
 	// length cosine collapses unrelated screens onto each other (see
@@ -206,6 +267,7 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 				// new key, silently and without a log line; it now retries by
 				// text below. hit is the zero value when ok is false, so
 				// best_cosine reads 0 there.
+				cosineMissed = true
 				slog.Debug("no cosine match; trying text match",
 					"best_cosine", hit.Score, "accepted", ok,
 					"threshold", cfg.Embedding.SimilarityThreshold, "raw", sig.Raw)
@@ -228,6 +290,10 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 	// remapAllowed still gates every approval remap on option-set
 	// compatibility, however the candidate was found.
 	//
+	// A structured salient cosine already REFUSED does not get this second look
+	// at all — see bm25RetryAllowed. It is a rule rather than a threshold
+	// because no threshold can do the job here.
+	//
 	// Stall-guarded like the embed call above, and for the same reason: this
 	// runs INLINE on the daemon select loop, which serves every agent. MatchText
 	// issues one scored search plus up to matchK self-score queries under the
@@ -236,13 +302,19 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 	// it runs for every non-exact situation, so a pathological index must not be
 	// able to wedge the loop. On timeout the error branch below degrades to the
 	// hash key — the fail-safe direction, and no new config knob.
+	if !bm25RetryAllowed(sig, cosineMissed) {
+		slog.Debug("structured salient refused by cosine; not retried by text",
+			"raw", sig.Raw, "type", s.Type)
+		return d.mintSignature(ctx, sig, s, vec, vecModel)
+	}
 	bmCtx, cancel := context.WithTimeout(ctx, bm25MatchTimeout)
 	defer cancel()
+	bar := bm25Bar(cfg, cosineMissed)
 	accept := func(h match.Hit) bool { return remapAllowed(s, sig, h) }
 	if hit, ok, err := d.matcher.MatchText(bmCtx, sig.Salient, scope, accept); err != nil {
 		slog.Warn("text match failed; using hash key", "error", err)
 		return sig
-	} else if ok && hit.Score >= cfg.Embedding.BM25MinScore {
+	} else if ok && hit.Score >= bar {
 		slog.Info("text match: reusing learned signature",
 			"signature", hit.Signature, "bm25", hit.Score, "raw", sig.Raw)
 		sig.Signature = hit.Signature
@@ -251,9 +323,23 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 		return sig
 	}
 
-	// New situation: persist its semantic identity under the raw hash key so
-	// later paraphrases can match it. Write failures only cost future
-	// matching; the decision path continues on the hash key regardless.
+	return d.mintSignature(ctx, sig, s, vec, vecModel)
+}
+
+// mintSignature records a situation as NEW: it persists the semantic identity
+// under the raw hash key so later paraphrases can match it, and returns sig
+// unchanged (still on its raw key, still MatchNone).
+//
+// vecModel must be the id of the embedder that PRODUCED vec, not whatever is
+// installed now — a reload racing resolveSignature would otherwise label model
+// A's vector as model B's, and reembed.Reconcile keeps any row whose model and
+// dims already agree, so cosine would serve the foreign vector forever.
+//
+// Write and index failures only cost FUTURE matching; the decision path
+// continues on the hash key regardless (fail-safe rule).
+func (d *Daemon) mintSignature(ctx context.Context, sig domain.SignatureResult,
+	s domain.Situation, vec []float32, vecModel string) domain.SignatureResult {
+
 	row := domain.SignatureEmbedding{
 		Signature: sig.Raw, SituationType: s.Type, AgentType: s.AgentType,
 		Salient: sig.Salient, CreatedAt: d.opt.Clock.Now(),
