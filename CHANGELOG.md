@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.24
+
+- Fixed the TUI Tasks tab lagging behind its own actions: toggling done (`d`), deleting (`x`), adding (`a`), and editing (`e`) a task now update the list immediately — the checkbox flips at the keypress and the write's own result refreshes the rows — instead of showing the old state for seconds until the next full refresh, which used to invite a second `d` that flipped the task straight back.
+
 ## 0.5.23
 
 - Fixed an approval answer selecting the wrong option: Claude Code renders "Yes, and don’t ask again" with a typographic apostrophe (U+2019) while every learned rule and LLM answer writes the ASCII "don't", so the label matched nothing and the reply was typed as literal text — which a standing menu ignores, leaving its Enter to commit the first option ("Yes"). Option labels now compare with typographic punctuation, case and whitespace folded away.
