@@ -141,8 +141,11 @@ func OptionLabels(content string) []string {
 // ("1. Yes / 2. No") that only accept the option's number — typing the label
 // text ("Yes") is ignored, which looked to operators like "nothing happened"
 // on confirm. When content presents a numbered menu and chosen matches an
-// option — by label (case-insensitive, trimmed) or by an already-numeric
-// selection — MenuKeystroke returns that option's digit and true.
+// option — by label (compared through FoldMenuText: case, whitespace and
+// typographic punctuation folded away), by a unique folded prefix of one, or by
+// an already-numeric selection — MenuKeystroke returns that option's digit and
+// true. A match that is ambiguous across two DIFFERENT option numbers is
+// refused rather than guessed.
 //
 // It returns (chosen, false) when there is no numbered menu, or chosen
 // matches no option: free-text prompts (a typed reply, an error-retry
@@ -158,11 +161,26 @@ func MenuKeystrokeFrom(opts []NumberedOption, chosen string) (string, bool) {
 	if len(opts) == 0 {
 		return chosen, false
 	}
-	want := strings.ToLower(strings.TrimSpace(chosen))
+	// Exact match is unique-or-refuse, like the prefix match below. One capture
+	// can hold the same menu twice — a scrolled pane, or an earlier render still
+	// in the buffer — and if the two renders order their options differently,
+	// returning the FIRST hit would deliver a digit from the stale render while
+	// reporting a clean mapping. Two hits carrying the same number are the same
+	// option seen twice and stay fine.
+	want := FoldMenuText(chosen)
+	hit, hits := "", 0
 	for _, o := range opts {
-		if strings.ToLower(o.Label) == want || o.Number == want {
-			return o.Number, true
+		if FoldMenuText(o.Label) == want || o.Number == want {
+			if hit != o.Number {
+				hit, hits = o.Number, hits+1
+			}
 		}
+	}
+	if hits == 1 {
+		return hit, true
+	}
+	if hits > 1 {
+		return chosen, false
 	}
 	// A label the operator abbreviated (e.g. "Yes" for "Yes, allow once"):
 	// accept a unique prefix match so learned short answers still resolve.
@@ -170,6 +188,75 @@ func MenuKeystrokeFrom(opts []NumberedOption, chosen string) (string, bool) {
 		return key, true
 	}
 	return chosen, false
+}
+
+// typographicFolds maps the presentation glyphs an agent TUI renders onto the
+// ASCII an operator, a task file or an LLM actually types. Comparison only —
+// nothing that is DELIVERED is folded (a menu answer is always the option's own
+// digit, and free text is sent byte-for-byte).
+//
+// Verified live 2026-07-31 against Claude Code 2.1.220: its Bash approval
+// renders option 2 as "Yes, and don't ask again for: npm *" with U+2019, while
+// every source of a chosen reply — a learned rule, an LLM suggestion, this
+// repo's own classifier fixtures — writes the ASCII "don't". Comparing raw, the
+// label matched nothing, MenuKeystroke fell through to the literal text, and
+// the literal + Enter committed whatever option the caret rested on: option 1,
+// silently, with a success exit code. Folding is what makes the intended option
+// match; UnmatchedMenuReply is what catches the cases folding cannot.
+// The set is deliberately narrow — only glyphs that are a RENDERING of the
+// ASCII beside them. A backtick and an acute accent are not folded even though
+// they look apostrophe-ish: each carries its own meaning (a code span, an
+// accented letter), and every widening here brings two genuinely different
+// labels one character closer to comparing equal. An ellipsis is not folded
+// either: a label truncated with … cannot prefix-match a full one in either
+// direction, so the fold would add collision surface and buy nothing.
+// Unicode spaces need no entries — FoldMenuText's strings.Fields already
+// collapses every unicode.IsSpace rune, NBSP included.
+var typographicFolds = strings.NewReplacer(
+	"‘", "'", "’", "'", "‚", "'", "‛", "'", "′", "'",
+	"“", `"`, "”", `"`, "„", `"`, "″", `"`,
+	"‐", "-", "‑", "-", "‒", "-", "–", "-", "—", "-", "―", "-", "−", "-",
+)
+
+// FoldMenuText normalizes a menu label or a chosen reply so the two compare on
+// meaning rather than on typography: typographic punctuation folds to ASCII,
+// whitespace runs collapse, and case is dropped.
+func FoldMenuText(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(typographicFolds.Replace(s)), " "))
+}
+
+// MenuSituation reports whether sitType is answered by pressing an option on a
+// numbered menu rather than by typing free text — the same gate DeliverOutbound
+// applies before mapping.
+func MenuSituation(sitType SituationType, agentType, paneContent string) bool {
+	return sitType == SituationApproval || sitType == SituationChoice ||
+		(sitType == SituationError && strings.EqualFold(strings.TrimSpace(agentType), "codex") && CodexRateLimitForm(paneContent))
+}
+
+// UnmatchedMenuReply reports that paneContent presents a numbered menu for this
+// situation and chosen matches NONE of its options — the one state in which a
+// reply must never be delivered.
+//
+// It exists because the fallback for "no digit could be mapped" is to type the
+// reply literally, and on a standing menu that is not a harmless no-op: the
+// agent ignores the letters and the trailing Enter COMMITS the option the caret
+// rests on, which is the first one. Verified live 2026-07-31 against Claude Code
+// 2.1.220 — sending an unmatched label at a Bash approval ran the command under
+// plain "Yes" and answered nothing the reply asked for, reporting success.
+//
+// It is deliberately false whenever the pane shows no numbered options at all:
+// a free-text prompt (a typed reply, an error-retry command) is delivered
+// literally and always has been.
+func UnmatchedMenuReply(sitType SituationType, agentType, paneContent, chosen string) bool {
+	if !MenuSituation(sitType, agentType, paneContent) {
+		return false
+	}
+	opts := ParseNumberedOptions(paneContent)
+	if len(opts) == 0 {
+		return false
+	}
+	_, mapped := MenuKeystrokeFrom(opts, chosen)
+	return !mapped
 }
 
 // DeliverOutbound maps a chosen reply to the numbered-menu digit for
@@ -182,9 +269,7 @@ func MenuKeystrokeFrom(opts []NumberedOption, chosen string) (string, bool) {
 // returned text is free text (callers deciding whether to rewrite literal
 // outbound text key off this).
 func DeliverOutbound(sitType SituationType, agentType, paneContent, chosen string) (string, bool) {
-	menuSituation := sitType == SituationApproval || sitType == SituationChoice ||
-		(sitType == SituationError && strings.EqualFold(strings.TrimSpace(agentType), "codex") && CodexRateLimitForm(paneContent))
-	if !menuSituation {
+	if !MenuSituation(sitType, agentType, paneContent) {
 		return chosen, false
 	}
 	return MenuKeystroke(paneContent, chosen)
@@ -197,7 +282,8 @@ func DeliverKeystroke(sitType SituationType, agentType, paneContent, chosen stri
 }
 
 // uniquePrefixMatch returns an option's number when exactly one option label
-// starts with want; ambiguous or absent prefixes return ("", false).
+// starts with want; ambiguous or absent prefixes return ("", false). want is
+// already folded by the caller, so labels are folded here to match.
 func uniquePrefixMatch(opts []NumberedOption, want string) (string, bool) {
 	if want == "" {
 		return "", false
@@ -205,7 +291,7 @@ func uniquePrefixMatch(opts []NumberedOption, want string) (string, bool) {
 	var hit string
 	matches := 0
 	for _, o := range opts {
-		if strings.HasPrefix(strings.ToLower(o.Label), want) {
+		if strings.HasPrefix(FoldMenuText(o.Label), want) {
 			hit = o.Number
 			matches++
 		}

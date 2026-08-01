@@ -1812,12 +1812,41 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// that (an opted-out or LLM-less source delivers its tasks verbatim). The send
 	// completes asynchronously via handleActionReviewOutcome, so the learned
 	// action is pinned NOW — situation state may drift before delivery.
+	//
+	// This deliberately runs BEFORE the unmatched-menu gate below: adapting a
+	// drifted label to what the pane now offers is exactly what the rewrite is
+	// for, and gating first would take every menu situation away from it. The
+	// rewritten text is re-checked against the live pane in
+	// handleActionReviewOutcome, so nothing skips the gate by going this way.
 	if cfg.LLM.EnableRewriteAction && !menuMapped && dec.Input != "" &&
 		d.llmPort() != nil && d.llmPort().Configured() {
 		if learned := d.learnedAction(ctx, s, dec); learned != domain.ActionNextDeclaredTask {
 			d.startActionReview(ctx, s, sig, dec, tr, learned)
 			return
 		}
+	}
+
+	// A learned reply that matches NO option on the menu it is meant to answer
+	// is escalated, never sent. The send below would type the label literally,
+	// and on a standing menu the agent ignores the letters while the trailing
+	// Enter commits whatever option the caret rests on — the first one. That
+	// made a drifted or paraphrased rule answer plain "Yes" silently, with a
+	// success exit code (verified live 2026-07-31 against Claude Code 2.1.220,
+	// whose approval renders "don’t" with U+2019 where every learned rule writes
+	// the ASCII "don't"). Choice situations already refuse this in
+	// domain.Decide's option-set check; approvals had no equivalent, so this is
+	// the one gate covering both.
+	//
+	// No Suggestion is offered, matching the never-auto escalation above: this
+	// reply is un-confirmable by construction — the operator confirming it would
+	// land in deliver.Deliver and be refused there for the very same reason.
+	if domain.UnmatchedMenuReply(s.Type, s.AgentType, s.Content, dec.Input) {
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonUnfamiliarOptions,
+			Rationale:  "learned reply matches none of the offered options: " + dec.Input,
+			Confidence: dec.Confidence,
+		}, tr, now)
+		return
 	}
 
 	// Mark this delivery as THE declared task only when it really is one
@@ -3488,9 +3517,27 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 		return
 	}
 
+	// The rewrite exists to adapt a reply to what the pane now shows, so this
+	// is where an adapted MENU answer is checked — `pane` is the visible
+	// re-read verified current above, and it is the only read on this path that
+	// sees the live option set (the act path let this through precisely because
+	// its consuming "recent" snapshot showed no menu). A rewritten label that
+	// still matches nothing must escalate: sent literally, its Enter commits the
+	// caret's option. It is also mapped to the option's DIGIT, like every other
+	// send path — a menu ignores the label text.
+	if domain.UnmatchedMenuReply(current.Type, s.AgentType, pane, final) {
+		escalateWith(domain.ReasonUnfamiliarOptions,
+			"rewritten reply matches none of the offered options: "+final)
+		return
+	}
+	// sendText carries the digit, input keeps the label — the same split the
+	// act path makes, so the audit row and what is learned still read as the
+	// answer a human recognizes rather than a bare keystroke.
+	sendText := domain.DeliverKeystroke(current.Type, s.AgentType, pane, final)
+
 	original := truncateRunes(res.dec.Input, 200)
 	delivered := d.deliverAutonomous(ctx, s, res.sig, res.dec, res.tr, delivery{
-		sendText:      final,
+		sendText:      sendText,
 		input:         final,
 		rationale:     fmt.Sprintf("%s; %s (original: %q)", res.dec.Rationale, note, original),
 		llmOutput:     llmOutput,
@@ -3686,9 +3733,16 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		}
 	} else if s.Type == domain.SituationChoice && !isNoop && len(s.Options) > 0 {
 		found := false
+		// Folded comparison, like domain's own option-set check: an LLM writes
+		// an apostrophe as ASCII where the agent renders U+2019, and rejecting
+		// the right option over its typography is a false refusal.
+		action, optionID := domain.FoldMenuText(llmDec.Action), domain.FoldMenuText(llmDec.OptionID)
 		for _, o := range s.Options {
-			if strings.EqualFold(strings.TrimSpace(o), strings.TrimSpace(llmDec.Action)) ||
-				strings.EqualFold(strings.TrimSpace(o), strings.TrimSpace(llmDec.OptionID)) {
+			folded := domain.FoldMenuText(o)
+			if folded == "" {
+				continue
+			}
+			if folded == action || (optionID != "" && folded == optionID) {
 				found = true
 				break
 			}
@@ -3921,6 +3975,20 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			return
 		}
 	}
+	// An LLM answer that matches no option on the live menu fails closed for the
+	// same reason the rule path does: the generic send below would type it
+	// literally and its Enter would commit the caret's option, so a model that
+	// paraphrased a label would silently pick the first one. `pane` is the
+	// visible re-read verified current above, so this reads the options the
+	// keystroke would actually land on. There is already an option-set check for
+	// choice situations further up; this covers approvals and any drift between
+	// the consult snapshot and the live screen.
+	if domain.UnmatchedMenuReply(s.Type, s.AgentType, pane, llmDec.Action) {
+		reject(domain.ReasonUnfamiliarOptions,
+			"LLM answer matches none of the offered options: "+llmDec.Action)
+		return
+	}
+
 	executed := d.withAgentAutomation(ctx, s, res.sig, tr, llmDec.Action,
 		computedConf, &llmConf, llmDec.CapturedOutput, now, func() {
 			auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{

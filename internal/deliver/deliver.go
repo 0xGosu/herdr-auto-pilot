@@ -164,15 +164,45 @@ func Deliver(ctx context.Context, c Config, req Request) error {
 	// launch the wrong cloud environment. A keystroke-less adapter falls
 	// through ONLY when the reply maps to a live option digit (safe under both
 	// bindings), which is why this returns a handled flag rather than an error.
+	pickerDigit := ""
 	if req.SituationType == domain.SituationApproval && strings.EqualFold(req.AgentType, "claude") {
-		handled, err := c.deliverRemoteEnv(ctx, req, pane, rerr)
+		handled, digit, err := c.deliverRemoteEnv(ctx, req, pane, rerr)
 		if handled {
 			return err
 		}
+		pickerDigit = digit
 	}
 
-	if rerr == nil {
+	switch {
+	case pickerDigit != "":
+		// The picker branch already resolved the reply against its OWN option
+		// set — region-scoped and with the default entry's ✔ stripped — so its
+		// digit is used verbatim. Re-deriving options from the whole pane here
+		// would compare against a different set (the ✔ back on, plus any
+		// numbered line in the scrollback) and could refuse a mapping the picker
+		// just certified.
+		outbound = pickerDigit
+	case rerr == nil:
+		// A standing menu the reply matches no option of is REFUSED, never
+		// typed literally. The literal is not a harmless no-op there: the agent
+		// ignores the letters and the trailing Enter commits whichever option
+		// the caret rests on — the first one — so a stale or paraphrased label
+		// silently answered "Yes" while reporting success (verified live
+		// 2026-07-31 against Claude Code 2.1.220).
+		if domain.UnmatchedMenuReply(req.SituationType, req.AgentType, pane, outbound) {
+			return fmt.Errorf("%q matches none of the options the pane is offering; "+
+				"nothing was delivered (answering it literally would commit the first option)", outbound)
+		}
 		outbound = domain.DeliverKeystroke(req.SituationType, req.AgentType, pane, outbound)
+	case domain.MenuSituation(req.SituationType, req.AgentType, req.PaneExcerpt) &&
+		len(domain.ParseNumberedOptions(req.PaneExcerpt)) > 0:
+		// The live read failed, but the decision's own capture proves a menu was
+		// standing. Sending the literal reply blind is the same wrong-option
+		// commit one read later, so refuse: this is the only branch where an
+		// unreadable pane is fatal to a PLAIN reply, and it is evidence-gated —
+		// with no menu in the excerpt (or none captured at all, as on legacy
+		// rows) the literal send below is still the right answer.
+		return fmt.Errorf("the pane could not be read to answer a menu that was on screen: %w", rerr)
 	}
 	if err := ports.SendToAgent(ctx, c.Herdr, req.PaneID, req.AgentType, outbound); err != nil {
 		return fmt.Errorf("sending to the agent failed: %w", err)
@@ -210,7 +240,12 @@ func (c Config) deliverSeries(ctx context.Context, req Request, pane string, rer
 // whose reply maps to a live option digit (safe under both key bindings).
 // Every other outcome, success included, is handled so the caller cannot send
 // a second time.
-func (c Config) deliverRemoteEnv(ctx context.Context, req Request, pane string, rerr error) (bool, error) {
+//
+// digit is set only in that second case, and carries the mapping this function
+// already made against the picker's OWN option set (region-scoped, ✔ stripped).
+// The caller sends it verbatim rather than re-deriving one from the whole pane,
+// which would compare the reply against a different set of labels.
+func (c Config) deliverRemoteEnv(ctx context.Context, req Request, pane string, rerr error) (bool, string, error) {
 	_, wasRemoteEnv := domain.ClaudeRemoteEnvForm(req.PaneExcerpt)
 	var form domain.RemoteEnvForm
 	live := false
@@ -218,19 +253,20 @@ func (c Config) deliverRemoteEnv(ctx context.Context, req Request, pane string, 
 		form, live = domain.ClaudeRemoteEnvForm(pane)
 	}
 	if !wasRemoteEnv && !live {
-		return false, nil
+		return false, "", nil
 	}
 	if rerr != nil {
-		return true, fmt.Errorf("the pane could not be read to answer the remote environment picker: %w", rerr)
+		return true, "", fmt.Errorf("the pane could not be read to answer the remote environment picker: %w", rerr)
 	}
 	if !live {
-		return true, fmt.Errorf("the pane no longer shows the remote environment picker")
+		return true, "", fmt.Errorf("the pane no longer shows the remote environment picker")
 	}
 	if ks, ok := c.Herdr.(ports.KeystrokeSender); ok {
-		return true, mcqdeliver.ClaudeRemoteEnv(ctx, c.mcq(ks, req.PaneID), req.Outbound)
+		return true, "", mcqdeliver.ClaudeRemoteEnv(ctx, c.mcq(ks, req.PaneID), req.Outbound)
 	}
-	if _, mapped := domain.MenuKeystrokeFrom(form.Options, domain.TrimRemoteEnvCheck(req.Outbound)); !mapped {
-		return true, fmt.Errorf("%q matches none of the offered environments and this herdr adapter cannot send verified keystrokes", req.Outbound)
+	digit, mapped := domain.MenuKeystrokeFrom(form.Options, domain.TrimRemoteEnvCheck(req.Outbound))
+	if !mapped {
+		return true, "", fmt.Errorf("%q matches none of the offered environments and this herdr adapter cannot send verified keystrokes", req.Outbound)
 	}
-	return false, nil
+	return false, digit, nil
 }

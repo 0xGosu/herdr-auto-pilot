@@ -942,6 +942,57 @@ func TestAutoActDeliversMenuDigitForLabelAction(t *testing.T) {
 	}
 }
 
+// typographicApprovalPane is Claude Code 2.1.220's real Bash approval, captured
+// live 2026-07-31: option 2 renders "don’t" with U+2019, while a learned rule,
+// an LLM answer and this repo's own fixtures all write the ASCII "don't".
+const typographicApprovalPane = "Bash command\n\n  npm --version\n\nThis command requires approval\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don’t ask again for: npm *\n  3. No\n"
+
+// TestAutoActMatchesLabelAcrossTypography is the regression for the reported
+// bug: the rule names option 2 in ASCII, the pane renders it with U+2019, and
+// the digit that reaches the agent must be 2. Before the fold, the label matched
+// nothing, the reply was typed literally, and its Enter committed option 1 —
+// "Yes" — silently and with a success exit code.
+func TestAutoActMatchesLabelAcrossTypography(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(typographicApprovalPane)
+	h.seedAutonomous(typographicApprovalPane, domain.SituationApproval, "Yes, and don't ask again")
+
+	h.push("agent-typo", "blocked")
+
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "2" {
+		t.Errorf("sent %q, want the menu digit \"2\" — an ASCII apostrophe must find the U+2019 label", got)
+	}
+}
+
+// TestAutoActUnmatchedMenuReplyEscalatesInsteadOfSending is the safety half. A
+// learned reply that matches NO offered option must escalate and send nothing:
+// the literal fall-through is not a harmless no-op on a standing menu, it
+// commits whichever option the caret rests on.
+func TestAutoActUnmatchedMenuReplyEscalatesInsteadOfSending(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	// Deliberately inert wording: the never-auto and suspected-irreversible
+	// screens run BEFORE this gate, so an action that could trip a safety seed
+	// would let the test pass for the wrong reason.
+	h.seedAutonomous(approvalPane, domain.SituationApproval, "Maybe, ask me later")
+
+	h.push("agent-unmatched", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 3*time.Second, func() bool {
+		pend, _ := h.raw.PendingEscalations(ctx)
+		return len(pend) == 1
+	})
+	if sent := h.herdr.sentInputs(); len(sent) != 0 {
+		t.Fatalf("nothing may reach the pane, got %v", sent)
+	}
+	pend, _ := h.raw.PendingEscalations(ctx)
+	if !strings.Contains(pend[0].Rationale, string(domain.ReasonUnfamiliarOptions)) {
+		t.Errorf("rationale = %q, want the unfamiliar_options reason", pend[0].Rationale)
+	}
+}
+
 // TestConfirmDrivenShadowToAutoPromotion is the end-to-end regression for the
 // live-observed learning loop: an operator's repeated confirmations of a
 // shadow-mode approval grow the rule's agreement and promote it from shadow to
