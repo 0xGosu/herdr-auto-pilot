@@ -373,6 +373,140 @@ func TestTasksTabToggleDoneBulk(t *testing.T) {
 	}
 }
 
+// TestTasksTabToggleReflectsImmediately pins the no-lag contract: the
+// checkbox flips on screen at the keypress (before the async write even
+// runs), and the action's own result carries the authoritative checklist so
+// the tab is current without waiting for the full refresh round trip. The
+// old behavior — stale until refreshData finished its daemon reads — is what
+// made operators press "d" again and flip the task straight back.
+func TestTasksTabToggleReflectsImmediately(t *testing.T) {
+	m, _, path := taskAppModel(t)
+	m = press(t, m, "down") // item #1 (pending alpha)
+	upd, cmd := m.Update(pressKeyMsg("d"))
+	m = upd.(Model)
+	if view := m.View(); !strings.Contains(view, "#1 [x] alpha") {
+		t.Fatalf("checkbox must flip at the keypress, before the write lands:\n%s", view)
+	}
+	if cmd == nil {
+		t.Fatal("expected an action command")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok || res.err != nil {
+		t.Fatalf("toggle failed: %+v", res)
+	}
+	if len(res.taskLists) == 0 {
+		t.Fatal("toggle result should carry the fresh checklist")
+	}
+	upd2, _ := m.Update(res)
+	m = upd2.(Model)
+	if view := m.View(); !strings.Contains(view, "#1 [x] alpha") {
+		t.Fatalf("the write's own result must keep the tab current:\n%s", view)
+	}
+	// A second press acts on the now-current state — no refresh in between —
+	// so it toggles back instead of idempotently re-checking.
+	upd3, cmd := m.Update(pressKeyMsg("d"))
+	m, res = runAction(t, upd3.(Model), cmd)
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	if got := readTasks(t, path); !strings.Contains(got, "- [ ] alpha") {
+		t.Errorf("second d should toggle back to pending, got:\n%s", got)
+	}
+	if view := m.View(); !strings.Contains(view, "#1 [ ] alpha") {
+		t.Errorf("second toggle should also render without a refresh:\n%s", view)
+	}
+}
+
+// TestTasksTabToggleDuplicatePathDoubleToggleNoRefresh pins the aliasing
+// contract behind flipTaskCheckboxes' set-semantics: applyTaskLists assigns
+// ONE shared items array to duplicate-path groups, so the second keypress
+// must flip each physical item once — a naive in-place invert applied per
+// aliased group would net out to a no-op and resurrect the stale-checkbox
+// bug for exactly this shape, with every single-source test still green.
+func TestTasksTabToggleDuplicatePathDoubleToggleNoRefresh(t *testing.T) {
+	m, app, path := taskAppModel(t)
+	ctx := context.Background()
+	if err := app.AddTaskSource(ctx, "codex", "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m = press(t, m, "down") // group 0 item #1 (pending alpha)
+	upd, cmd := m.Update(pressKeyMsg("d"))
+	m, res := runAction(t, upd.(Model), cmd)
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	if view := m.View(); strings.Count(view, "#1 [x] alpha") != 2 {
+		t.Fatalf("both duplicate-path groups must show the toggle:\n%s", view)
+	}
+	// Second toggle with NO refresh in between: both groups now alias the
+	// applied list, and the item must still flip back exactly once.
+	upd, cmd = m.Update(pressKeyMsg("d"))
+	m, res = runAction(t, upd.(Model), cmd)
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	if got := readTasks(t, path); !strings.Contains(got, "- [ ] alpha") {
+		t.Errorf("second d should flip back to pending, got:\n%s", got)
+	}
+	if view := m.View(); strings.Count(view, "#1 [ ] alpha") != 2 {
+		t.Errorf("both groups must show the flip back:\n%s", view)
+	}
+}
+
+// TestTasksTabTogglePartialFailureShowsTruth pins the deliberate ordering of
+// applyTaskLists BEFORE the error branch in the actionResultMsg handler: an
+// errored bulk toggle still carries the authoritative list for the writes
+// that landed, so the succeeded item stays flipped, the failed item renders
+// the file's real state (correcting its optimistic flip), and the error note
+// names the skip. Guarding the apply with `if msg.err == nil` would regress
+// this invisibly.
+func TestTasksTabTogglePartialFailureShowsTruth(t *testing.T) {
+	m, _, path := taskAppModel(t)
+	m = press(t, m, "down", " ", " ") // mark #1 (pending alpha) and #2 (done beta)
+	// beta's text changes underneath the snapshot (an agent edited it), so
+	// its expected-text guard refuses; alpha still matches.
+	writeTasks(t, path, "- [ ] alpha\n- [x] beta CHANGED\n- [-] gamma\n")
+	upd, cmd := m.Update(pressKeyMsg("d"))
+	m, res := runAction(t, upd.(Model), cmd)
+	if res.err == nil || !strings.Contains(res.err.Error(), "skipped #2") {
+		t.Fatalf("stale beta should be skipped, got %+v", res)
+	}
+	view := m.View()
+	if !strings.Contains(view, "#1 [x] alpha") {
+		t.Errorf("succeeded alpha must stay flipped:\n%s", view)
+	}
+	if !strings.Contains(view, "#2 [x] beta CHANGED") {
+		t.Errorf("failed beta must render the file's real state, not the optimistic flip:\n%s", view)
+	}
+}
+
+// TestTasksTabDeleteReflectsImmediately pins the same contract for x: the
+// confirmed delete's result carries the renumbered checklist, so the row
+// disappears (and the survivors renumber) without waiting for the refresh.
+func TestTasksTabDeleteReflectsImmediately(t *testing.T) {
+	m, _, _ := taskAppModel(t)
+	m = press(t, m, "down") // item #1 (alpha)
+	upd, _ := m.Update(pressKeyMsg("x"))
+	m = upd.(Model)
+	if m.confirm == nil {
+		t.Fatal("x should ask before deleting")
+	}
+	upd, cmd := m.Update(pressKeyMsg("y"))
+	m, res := runAction(t, upd.(Model), cmd)
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	view := m.View()
+	if strings.Contains(view, "alpha") {
+		t.Errorf("deleted row must disappear without a refresh:\n%s", view)
+	}
+	if !strings.Contains(view, "#1 [x] beta") {
+		t.Errorf("surviving items should show their renumbered positions:\n%s", view)
+	}
+}
+
 func TestTasksTabDeleteBulkWithConfirm(t *testing.T) {
 	m, _, path := taskAppModel(t)
 	// Mark #1 and #3 (space advances off #1 onto #2, then down to #3).
@@ -519,6 +653,10 @@ func TestTasksTabAddPrompt(t *testing.T) {
 	if m.status == nil || !strings.Contains(m.status.text, "added task #4") {
 		t.Errorf("add should report the new task number, got %+v", m.status)
 	}
+	// The add's own result carries the fresh list — no refresh needed.
+	if view := m.View(); !strings.Contains(view, "#4 [ ] delta") {
+		t.Errorf("added task should render without a refresh:\n%s", view)
+	}
 }
 
 // shiftEnterMsg mimics the unrecognized-CSI message bubbletea delivers for a
@@ -636,12 +774,16 @@ func TestTasksTabEditPromptPrefilled(t *testing.T) {
 	}
 	m = press(t, m, " v2") // append to the pre-filled text
 	upd, cmd := m.Update(pressKeyMsg("enter"))
-	_, res := runAction(t, upd.(Model), cmd)
+	m, res := runAction(t, upd.(Model), cmd)
 	if res.err != nil {
 		t.Fatal(res.err)
 	}
 	if got := readTasks(t, path); !strings.Contains(got, "- [ ] alpha v2") {
 		t.Errorf("submitted edit should rewrite the task text, got:\n%s", got)
+	}
+	// The edit's own result carries the fresh list — no refresh needed.
+	if view := m.View(); !strings.Contains(view, "#1 [ ] alpha v2") {
+		t.Errorf("edited text should render without a refresh:\n%s", view)
 	}
 }
 
