@@ -117,6 +117,13 @@ type actionResultMsg struct {
 	// keypress stashed awaiting its own completion. Zero for the untagged
 	// majority; see doTagged.
 	token actionToken
+	// taskLists carries the authoritative renumbered checklist a task
+	// mutation returned, keyed by canonical source path. Applying it
+	// directly updates the Tasks tab the moment the write lands, instead
+	// of after the full refresh round trip (daemon status, per-agent pane
+	// reads, store queries) — which takes long enough that the old
+	// checkbox invites a second press.
+	taskLists map[string][]domain.ChecklistItem
 }
 
 // openSendPromptMsg re-opens a second prompt after a LIVE escalation's
@@ -1557,6 +1564,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case actionResultMsg:
+		m.applyTaskLists(msg.taskLists)
 		if msg.pauseAction && msg.err != nil {
 			// The pause request itself failed, so Paused never transitions
 			// and the refreshMsg diff above will never consume the flag —
@@ -2847,6 +2855,65 @@ func (m Model) markedTaskTargets() []taskTarget {
 	return targets
 }
 
+// applyTaskLists overwrites the loaded task groups with the fresh checklists
+// a mutation returned (keyed by canonical path — see actionResultMsg). Every
+// group naming that file updates, so duplicate-path sources stay in step. The
+// list came from a successful read-modify-write of the file, so a stale
+// per-group read error clears too.
+func (m *Model) applyTaskLists(lists map[string][]domain.ChecklistItem) {
+	if len(lists) == 0 {
+		return
+	}
+	for i := range m.data.tasks {
+		g := &m.data.tasks[i]
+		if items, ok := lists[canonicalTaskPath(g.Source.Path)]; ok {
+			g.Items = items
+			g.Err = ""
+		}
+	}
+}
+
+// flipTaskCheckboxes optimistically flips each target's checkbox in the
+// loaded snapshot so the rows repaint on the very next frame — the async
+// write and its actionResultMsg.taskLists then confirm (or, on failure, the
+// follow-up refresh corrects). Matched by canonical path, item number AND
+// text — the same identity the write's expected-text guard enforces — so a
+// shifted file is left alone. Each group's path is canonicalized once
+// (EvalSymlinks hits the filesystem), keeping a bulk flip cheap on the
+// keypress path.
+//
+// The mark is SET from the target's prior state, never inverted in place:
+// applyTaskLists assigns one shared items array to every duplicate-path
+// group, so an in-place toggle applied once per aliased group would net out
+// to a no-op — a set stays idempotent no matter how many groups alias the
+// array.
+func (m *Model) flipTaskCheckboxes(targets []taskTarget) {
+	byPath := map[string][]taskTarget{}
+	for _, tg := range targets {
+		byPath[tg.path] = append(byPath[tg.path], tg)
+	}
+	for i := range m.data.tasks {
+		g := &m.data.tasks[i]
+		tgs := byPath[canonicalTaskPath(g.Source.Path)]
+		if len(tgs) == 0 {
+			continue
+		}
+		for j := range g.Items {
+			it := &g.Items[j]
+			for _, tg := range tgs {
+				if it.Index != tg.item || it.Text != tg.text {
+					continue
+				}
+				if tg.done {
+					it.Mark, it.Done = " ", false
+				} else {
+					it.Mark, it.Done = "x", true
+				}
+			}
+		}
+	}
+}
+
 // describeTasks names the action targets compactly: "task #3" or
 // "3 tasks (#1 #2 #5)", eliding a long list.
 func describeTasks(targets []taskTarget) string {
@@ -2895,7 +2962,11 @@ func (m Model) toggleTaskMarkSelected() (tea.Model, tea.Cmd) {
 
 // toggleTasksDone flips done/pending on the marked items (or the cursor row),
 // each item individually — mirroring `hap task done`/`undone`. Toggling never
-// renumbers, so per-item failures skip and continue safely.
+// renumbers, so per-item failures skip and continue safely. The checkbox
+// flips on screen immediately (flipTaskCheckboxes), and the write's own
+// returned list confirms it (actionResultMsg.taskLists) — waiting for the
+// full refresh left the old state on screen long enough that a second "d"
+// looked necessary and then flipped the task straight back.
 func (m Model) toggleTasksDone() (tea.Model, tea.Cmd) {
 	targets := m.markedTaskTargets()
 	if len(targets) == 0 {
@@ -2905,25 +2976,29 @@ func (m Model) toggleTasksDone() (tea.Model, tea.Cmd) {
 	app, desc := m.app, describeTasks(targets)
 	m.taskMarks = nil // the action consumes the selection
 	m.beginAction()
+	m.flipTaskCheckboxes(targets)
 	return m, func() tea.Msg {
 		toggled := 0
 		var skipped []string
 		var firstErr error
+		lists := map[string][]domain.ChecklistItem{}
 		for _, tg := range targets {
-			if _, err := app.SetTaskDone("", tg.path, tg.item, !tg.done, tg.text); err != nil {
+			items, err := app.SetTaskDone("", tg.path, tg.item, !tg.done, tg.text)
+			if err != nil {
 				skipped = append(skipped, fmt.Sprintf("#%d", tg.item))
 				if firstErr == nil {
 					firstErr = err
 				}
 				continue
 			}
+			lists[tg.path] = items
 			toggled++
 		}
 		if firstErr != nil {
 			return actionResultMsg{err: fmt.Errorf("toggled %d, skipped %s: %w",
-				toggled, strings.Join(skipped, " "), firstErr)}
+				toggled, strings.Join(skipped, " "), firstErr), taskLists: lists}
 		}
-		return actionResultMsg{message: fmt.Sprintf("toggled %s", desc)}
+		return actionResultMsg{message: fmt.Sprintf("toggled %s", desc), taskLists: lists}
 	}
 }
 
@@ -3061,17 +3136,20 @@ func (m Model) confirmDeleteTaskTargets(targets []taskTarget, clearsMarks bool) 
 		onConfirm: func() tea.Cmd {
 			return func() tea.Msg {
 				deleted := 0
+				lists := map[string][]domain.ChecklistItem{}
 				for _, tg := range targets {
-					if _, err := app.DeleteTask("", tg.path, tg.item, tg.text); err != nil {
+					items, err := app.DeleteTask("", tg.path, tg.item, tg.text)
+					if err != nil {
 						// Stop, don't skip: a failure here usually means the
 						// file changed under us, and later (lower) indices
 						// may already point at different lines.
 						return actionResultMsg{err: fmt.Errorf("deleted %d of %d: %w",
-							deleted, len(targets), err)}
+							deleted, len(targets), err), taskLists: lists}
 					}
+					lists[tg.path] = items
 					deleted++
 				}
-				return actionResultMsg{message: fmt.Sprintf("deleted %s", desc)}
+				return actionResultMsg{message: fmt.Sprintf("deleted %s", desc), taskLists: lists}
 			}
 		},
 	}
@@ -3120,11 +3198,12 @@ func (m Model) addTaskPrompt() (tea.Model, tea.Cmd) {
 		multiline: true,
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
-				_, n, err := app.AddTask("", path, input)
+				items, n, err := app.AddTask("", path, input)
 				if err != nil {
 					return actionResultMsg{err: err}
 				}
-				return actionResultMsg{message: fmt.Sprintf("added task #%d", n)}
+				return actionResultMsg{message: fmt.Sprintf("added task #%d", n),
+					taskLists: map[string][]domain.ChecklistItem{canonicalTaskPath(path): items}}
 			}
 		},
 	})
@@ -3156,10 +3235,12 @@ func (m Model) editTaskRowPrompt(r taskRow) (tea.Model, tea.Cmd) {
 		multiline: true,
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
-				if _, err := app.EditTask("", path, idx, input, stored); err != nil {
+				items, err := app.EditTask("", path, idx, input, stored)
+				if err != nil {
 					return actionResultMsg{err: err}
 				}
-				return actionResultMsg{message: fmt.Sprintf("task #%d updated", idx)}
+				return actionResultMsg{message: fmt.Sprintf("task #%d updated", idx),
+					taskLists: map[string][]domain.ChecklistItem{canonicalTaskPath(path): items}}
 			}
 		},
 	})
