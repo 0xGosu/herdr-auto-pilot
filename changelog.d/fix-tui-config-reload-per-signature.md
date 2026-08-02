@@ -1,0 +1,1 @@
+- Fixed `hap tui` burning ~35% of a CPU core continuously while open. Listing learned rules re-read and re-parsed `config.toml` once per signature, so the TUI's 2-second refresh spent ~700ms of CPU on ~80 rules doing nothing but decoding the same file 80 times. `hap signatures list` and `hap audit` are now about 4x faster too.

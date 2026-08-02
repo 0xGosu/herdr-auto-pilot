@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
@@ -121,7 +120,7 @@ func keywordSearch(query string, rows []SignatureRow,
 func (a *App) semanticSearch(ctx context.Context, query string, opts SignatureSearchOpts,
 	rows []SignatureRow, byMasked map[string]domain.SignatureEmbedding) ([]SignatureSearchResult, error) {
 
-	cfg, err := config.Load(a.ConfigPath)
+	cfg, err := a.Config()
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}

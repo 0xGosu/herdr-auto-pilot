@@ -62,6 +62,11 @@ type App struct {
 	// update check; nil means the real GitHub call (updatecheck.Latest).
 	// Tests inject it so no test ever opens a network connection.
 	FetchLatestVersion func(ctx context.Context) (string, error)
+	// LoadConfig reads config.toml; nil means config.Load. A load is ~9ms of
+	// TOML decoding and is deliberately NOT cached (an operator edit must take
+	// effect on the next read), so call sites must not put one in a loop —
+	// tests inject this to count the loads and hold that line.
+	LoadConfig func(path string) (config.Config, error)
 
 	// TUISessions polices how many `hap tui` processes run at once (see
 	// EnforceTUISessionLimit). nil for every front-end that is not a TUI, and
@@ -210,7 +215,7 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 	}
 	// One config load serves both embedding summaries so they cannot
 	// disagree about a mid-edit config within a single status snapshot.
-	if cfg, err := config.Load(a.ConfigPath); err != nil {
+	if cfg, err := a.Config(); err != nil {
 		st.Embedding = "unknown (config unreadable)"
 	} else {
 		st.Embedding = a.embeddingStatus(ctx, cfg)
@@ -343,7 +348,7 @@ type EmbeddingDrift struct {
 // EmbeddingDrift checks stored embeddings against the configured model.
 // Zero-valued (Detected=false) when embedding is disabled.
 func (a *App) EmbeddingDrift(ctx context.Context) (EmbeddingDrift, error) {
-	cfg, err := config.Load(a.ConfigPath)
+	cfg, err := a.Config()
 	if err != nil {
 		return EmbeddingDrift{}, fmt.Errorf("load config: %w", err)
 	}
@@ -398,7 +403,7 @@ func (a *App) ReembedStandalone(ctx context.Context, progress reembed.RowFunc) (
 			return res, fmt.Errorf("daemon is running (pid %d) — use: hap signatures reembed (it nudges the daemon), or stop the daemon first", pid)
 		}
 	}
-	cfg, err := config.Load(a.ConfigPath)
+	cfg, err := a.Config()
 	if err != nil {
 		return res, fmt.Errorf("load config: %w", err)
 	}
@@ -1502,6 +1507,9 @@ func materializeForSend(action string, audit *domain.AuditRecord) string {
 
 // Config returns the current operator configuration.
 func (a *App) Config() (config.Config, error) {
+	if a.LoadConfig != nil {
+		return a.LoadConfig(a.ConfigPath)
+	}
 	return config.Load(a.ConfigPath)
 }
 
@@ -1517,6 +1525,11 @@ func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) e
 	}
 	defer unlock()
 
+	// Deliberately config.Load, not a.Config(): this is the WRITE path, and the
+	// value read here is edited and saved straight back over the file. It must
+	// come from the file itself, so an injected LoadConfig can never round-trip
+	// a substituted config onto disk. Every read-only path routes through
+	// a.Config().
 	cfg, err := config.Load(a.ConfigPath)
 	if err != nil {
 		return err
@@ -3288,6 +3301,12 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 	if err != nil {
 		return nil, err
 	}
+	// Nothing learned yet: skip the audit query and the config load below. On a
+	// fresh install this is every TUI refresh, and both are pure waste when
+	// there is no row to enrich.
+	if len(states) == 0 {
+		return []SignatureRow{}, nil
+	}
 	// One batched query for every rule's last-used audit, instead of a
 	// per-signature LatestAuditForSignature call inside the loop (the Rules
 	// list refreshes every ~2s). Absent signatures map to nil → LAST shows "-".
@@ -3295,13 +3314,20 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 	if err != nil {
 		return nil, err
 	}
+	// Resolved ONCE, outside the loop. confirmationWeight re-reads and re-parses
+	// config.toml on every call (App.Config has no cache), which costs ~9ms —
+	// three orders of magnitude more than the per-row queries beside it. Called
+	// per signature it made this listing O(signatures) file reads, and the TUI
+	// calls Signatures on its 2s refresh, so ~80 learned rules burned ~700ms of
+	// CPU every 2s for a value that cannot change mid-listing anyway.
+	weight := a.confirmationWeight()
 	rows := make([]SignatureRow, 0, len(states))
 	for _, st := range states {
 		history, err := a.Store.DecisionsForSignature(ctx, st.Signature, 50)
 		if err != nil {
 			return nil, err
 		}
-		conf := domain.LiveConfidence(history, st.DecisionFloorID, a.confirmationWeight())
+		conf := domain.LiveConfidence(history, st.DecisionFloorID, weight)
 		// min-conf filters the LIVE score here, not cached_confidence in SQL:
 		// the store cannot do it correctly (see domain.SignatureFilter).
 		if f.MinConfidence > 0 && conf.Score < f.MinConfidence {
