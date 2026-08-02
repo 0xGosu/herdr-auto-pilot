@@ -5675,3 +5675,187 @@ func TestTOMLScalarKeysModelsTheDecoder(t *testing.T) {
 		}
 	})
 }
+
+// TestSignaturesLoadsConfigOncePerCall pins the fix for the TUI's runaway CPU
+// use. App.Config re-reads and re-parses config.toml on every call (~9ms of
+// TOML decoding, deliberately uncached so an operator edit takes effect on the
+// next read). Signatures used to resolve the confirmation weight INSIDE its
+// per-signature loop, making the listing O(signatures) file reads: with ~80
+// learned rules that is ~700ms of pure CPU, and the TUI calls Signatures on a
+// 2s refresh, so `hap tui` sat at ~35% of a core for as long as it was open.
+// The weight cannot change mid-listing, so one load per call is the ceiling.
+func TestSignaturesLoadsConfigOncePerCall(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	const sigCount = 12
+	for i := 0; i < sigCount; i++ {
+		sig := fmt.Sprintf("approval:%02d", i)
+		if err := st.UpsertSignature(ctx, domain.SignatureState{
+			Signature: sig, SituationType: domain.SituationApproval, AgentType: "claude",
+			Mode: domain.ModeShadow, UpdatedAt: now.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.RecordDecision(ctx, domain.DecisionRecord{Signature: sig,
+			SituationType: domain.SituationApproval, AgentType: "claude",
+			ChosenAction: "1", Source: domain.SourceOperator, CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var loads int
+	app.LoadConfig = func(path string) (config.Config, error) {
+		loads++
+		return config.Load(path)
+	}
+
+	rows, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != sigCount {
+		t.Fatalf("got %d rows, want %d", len(rows), sigCount)
+	}
+	// Exactly one, not "at most one": zero would mean a refactor had dropped the
+	// config read altogether and hardcoded the default weight, which passes a
+	// `> 1` assertion while silently ignoring learning.confirmation_weight.
+	// TestSignaturesAppliesConfiguredConfirmationWeight pins the other half.
+	if loads != 1 {
+		t.Errorf("Signatures over %d rules loaded config %d times, want exactly 1 — "+
+			"the confirmation weight must be resolved once, outside the per-signature loop",
+			sigCount, loads)
+	}
+}
+
+// TestSignaturesAppliesConfiguredConfirmationWeight is the companion to the
+// load-count test above: hoisting the config read out of the loop must not
+// become "stop reading config at all". The operator's
+// learning.confirmation_weight has to reach domain.LiveConfidence, so a rule
+// whose history mixes one operator confirmation with one non-operator auto-send
+// scores differently under a heavy weight than under no boost at all.
+func TestSignaturesAppliesConfiguredConfirmationWeight(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	const sig = "approval:weighted"
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: sig, SituationType: domain.SituationApproval, AgentType: "claude",
+		Mode: domain.ModeShadow, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Two competing actions. Only the operator one is boosted by the weight
+	// (Confidence boosts Source==SourceOperator && !IsCorrection), so the
+	// agreement ratio moves with it. A single-action history would score 1.0
+	// under every weight and prove nothing.
+	if _, err := st.RecordDecision(ctx, domain.DecisionRecord{Signature: sig,
+		SituationType: domain.SituationApproval, AgentType: "claude",
+		ChosenAction: "1", Source: domain.SourceOperator, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RecordDecision(ctx, domain.DecisionRecord{Signature: sig,
+		SituationType: domain.SituationApproval, AgentType: "claude",
+		ChosenAction: "2", Source: domain.SourceRule, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	scoreAt := func(weight float64) float64 {
+		t.Helper()
+		cfg := config.Default()
+		cfg.Learning.ConfirmationWeight = weight
+		if err := config.Save(app.ConfigPath, cfg); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := app.Signatures(ctx, domain.SignatureFilter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("got %d rows, want 1", len(rows))
+		}
+		return rows[0].Confidence
+	}
+
+	unboosted := scoreAt(1) // 1 == no boost (Confidence clamps anything below 1)
+	boosted := scoreAt(9)
+	if boosted <= unboosted {
+		t.Errorf("confirmation_weight is not reaching LiveConfidence: score was %.3f at weight 1 "+
+			"and %.3f at weight 9, want the operator-confirmed action to score higher when boosted",
+			unboosted, boosted)
+	}
+}
+
+// noBatchStore hides the optional bulk decision reads. It embeds the INTERFACE,
+// not the concrete store, so the batch methods are not promoted and the type
+// assertion in App.Signatures fails — which is exactly the shape of any fake
+// that does not implement ports.BatchDecisionReader.
+type noBatchStore struct{ ports.FrontendStore }
+
+// TestSignaturesBatchAndFallbackAgree pins the optional-capability contract.
+// App.Signatures takes two bulk queries when the store offers them and two
+// queries PER RULE when it does not; the fast path is only legitimate while
+// both produce identical rows. A drift here would show the operator different
+// confidence depending on which store implementation they happened to have.
+func TestSignaturesBatchAndFallbackAgree(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// Mixed history so the confidence scores are not all trivially 1.0: two
+	// competing actions, an operator confirmation among them, and one rule with
+	// no decisions at all.
+	for i, sig := range []string{"approval:a", "choice:b", "idle:c"} {
+		if err := st.UpsertSignature(ctx, domain.SignatureState{
+			Signature: sig, SituationType: domain.SituationApproval, AgentType: "claude",
+			Mode: domain.ModeShadow, UpdatedAt: now.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if sig == "idle:c" {
+			continue
+		}
+		for j := 0; j < 5+i; j++ {
+			action, source := "1", domain.SourceOperator
+			if j%3 == 0 {
+				action, source = "2", domain.SourceRule
+			}
+			if _, err := st.RecordDecision(ctx, domain.DecisionRecord{Signature: sig,
+				SituationType: domain.SituationApproval, AgentType: "claude",
+				ChosenAction: action, Source: source, CreatedAt: now}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if _, ok := app.Store.(ports.BatchDecisionReader); !ok {
+		t.Fatal("the real store must implement ports.BatchDecisionReader, or this test proves nothing")
+	}
+	batched, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app.Store = noBatchStore{app.Store}
+	if _, ok := app.Store.(ports.BatchDecisionReader); ok {
+		t.Fatal("noBatchStore still exposes the batch reads; the fallback path is not being exercised")
+	}
+	fallback, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(batched) != len(fallback) {
+		t.Fatalf("batched returned %d rows, fallback %d", len(batched), len(fallback))
+	}
+	for i := range batched {
+		b, f := batched[i], fallback[i]
+		if b.Signature != f.Signature || b.Confidence != f.Confidence ||
+			b.TopAction != f.TopAction || b.Decisions != f.Decisions ||
+			b.TotalDecisions != f.TotalDecisions {
+			t.Errorf("row %d differs\n batched:  %+v\n fallback: %+v", i, b, f)
+		}
+	}
+}

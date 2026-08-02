@@ -343,6 +343,113 @@ func TestLegacyThresholdsTableMigratesOnSave(t *testing.T) {
 	}
 }
 
+// TestCanonicalThresholdsTableBeatsLegacyTable pins the presence check that
+// decides the [thresholds] -> [confidence_thresholds] migration. Load reads
+// presence from the RAW file, because once decoded a canonical table written at
+// its defaults is indistinguishable from an absent one — and the canonical
+// table here carries NONE of the keys the legacy one sets, so only genuine
+// table-presence detection (not "did any canonical value change") can pick the
+// winner. Getting this backwards silently reinstates thresholds an operator
+// migrated away from, which is a safety gate moving on its own.
+func TestCanonicalThresholdsTableBeatsLegacyTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	// Canonical table present but setting only `idle`; legacy sets `minimum`
+	// and `approval`. Neither legacy value may survive.
+	body := "[confidence_thresholds]\nidle = 0.42\n\n[thresholds]\nminimum = 0.55\napproval = 0.91\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := Default()
+	if cfg.ConfidenceThresholds.Idle != 0.42 {
+		t.Errorf("canonical idle = %v, want 0.42", cfg.ConfidenceThresholds.Idle)
+	}
+	if cfg.ConfidenceThresholds.Minimum != def.ConfidenceThresholds.Minimum {
+		t.Errorf("legacy minimum leaked: got %v, want the default %v",
+			cfg.ConfidenceThresholds.Minimum, def.ConfidenceThresholds.Minimum)
+	}
+	if cfg.ConfidenceThresholds.Approval != def.ConfidenceThresholds.Approval {
+		t.Errorf("legacy approval leaked: got %v, want the default %v",
+			cfg.ConfidenceThresholds.Approval, def.ConfidenceThresholds.Approval)
+	}
+}
+
+// TestIllTypedRemovedKeyCannotBreakTheThresholdsMigration pins the reason every
+// legacyKeys field is type-free. All the deprecated/removed keys are probed
+// from ONE shared decode, and BurntSushi aborts the whole decode on the first
+// type mismatch — walking the file's key map, so WHICH fields were populated
+// first varies between runs. If those probes carried real types, an ignored key
+// an operator happens to have written as the wrong type (`gpu_layers = 0.5` on
+// an int field) could abort the pass before the `[thresholds]` table was read,
+// silently resetting migrated confidence gates — intermittently, which is the
+// worst way for a safety gate to move.
+//
+// Every removed key here is deliberately the WRONG type for what it names.
+func TestIllTypedRemovedKeyCannotBreakTheThresholdsMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	body := "" +
+		"[thresholds]\nminimum = 0.55\napproval = 0.91\n\n" +
+		"[embedding]\ngpu_layers = 0.5\nmax_consecutive_failures = \"lots\"\n\n" +
+		"[limits]\nescalation_dedup_jitter_percent = 5.0\nverify_unblock_ms = true\n\n" +
+		"[llm]\nrewrite_command = \"claude -p\"\nrewrite_timeout_seconds = 1.5\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Repeated because the failure this guards against is nondeterministic: it
+	// depends on Go map iteration order inside the decoder, so a single passing
+	// run proves nothing.
+	for i := 0; i < 50; i++ {
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		if cfg.ConfidenceThresholds.Minimum != 0.55 || cfg.ConfidenceThresholds.Approval != 0.91 {
+			t.Fatalf("run %d: legacy [thresholds] lost to an ill-typed removed key: %+v",
+				i, cfg.ConfidenceThresholds)
+		}
+	}
+}
+
+// TestScalarWrittenUnderATableNameIsIgnoredNotFatal covers the STRUCTURAL
+// mismatch the scalar cases above cannot reach. `thresholds = 5` writes a
+// scalar where a table belongs; `thresholds` has no Config field, so the main
+// decode does not reject it first and it lands in the shared legacy probe. The
+// probe field is `*any` (not a map) precisely so this cannot abort the pass and
+// take the other deprecation warnings with it — and the table assertion in
+// legacyValue keeps the failure local.
+func TestScalarWrittenUnderATableNameIsIgnoredNotFatal(t *testing.T) {
+	for _, body := range []string{
+		"thresholds = 5\n\n[limits]\nverify_unblock_ms = 1234\n",
+		"thresholds = [1, 2]\n\n[limits]\nverify_unblock_ms = 1234\n",
+		"confidence_thresholds = 5\n",
+	} {
+		t.Run(strings.SplitN(body, "\n", 2)[0], func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// Either a clean parse error or defaults — never a panic, and never
+			// a config whose confidence gates silently sit at zero.
+			cfg, err := Load(path)
+			if err != nil {
+				return // rejected outright by the main decode: also fine
+			}
+			def := Default()
+			if cfg.ConfidenceThresholds.Minimum != def.ConfidenceThresholds.Minimum {
+				t.Errorf("minimum = %v, want the default %v",
+					cfg.ConfidenceThresholds.Minimum, def.ConfidenceThresholds.Minimum)
+			}
+			if cfg.ConfidenceThresholds.Approval != def.ConfidenceThresholds.Approval {
+				t.Errorf("approval = %v, want the default %v",
+					cfg.ConfidenceThresholds.Approval, def.ConfidenceThresholds.Approval)
+			}
+		})
+	}
+}
+
 func TestSaveRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	cfg := Default()

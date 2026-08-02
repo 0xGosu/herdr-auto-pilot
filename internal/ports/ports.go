@@ -364,6 +364,29 @@ type MCPStore interface {
 	InsertLLMDecision(ctx context.Context, d domain.LLMDecision) (int64, error)
 }
 
+// BatchDecisionReader is the OPTIONAL bulk form of ReadStore's two
+// per-signature decision reads. A listing enriches every rule with its history
+// and exact total, which through the single-signature calls is two round trips
+// per rule — and the TUI runs that listing every 2 seconds, so at ~200 learned
+// rules it was ~400 queries per refresh with nothing happening.
+//
+// Optional on purpose (see the architecture rule on optional capabilities):
+// callers type-assert and fall back to the per-signature loop, so a store that
+// does not implement it — any fake — keeps working, just slower. The two forms
+// must agree: the map is keyed by signature, each slice is newest-first and
+// capped exactly like DecisionsForSignature, and the counts are unwindowed
+// totals exactly like CountDecisionsForSignature. A signature with no decisions
+// is simply absent from either map.
+//
+// Both take the signatures to read RATHER than reading every row: the whole
+// point is to cut per-refresh work, and an unbounded scan would trade a cost
+// bounded by the listing's size for one that grows with total decision history.
+// An empty slice means an empty result, not "everything".
+type BatchDecisionReader interface {
+	DecisionsForSignatures(ctx context.Context, signatures []string, limitPerSignature int) (map[string][]domain.DecisionRecord, error)
+	CountDecisionsForSignatures(ctx context.Context, signatures []string) (map[string]int, error)
+}
+
 // ReadStore is the shared read surface.
 type ReadStore interface {
 	GetSignature(ctx context.Context, signature string) (*domain.SignatureState, error)

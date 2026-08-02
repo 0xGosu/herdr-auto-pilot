@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -903,14 +904,35 @@ func (s *Store) CountDecisionsForSignature(ctx context.Context, signature string
 	return n, nil
 }
 
+// decisionCols is the column list every decision read selects, in scanDecision's
+// scan order. Shared so the single and batched forms cannot drift apart.
+const decisionCols = `id, signature, situation_type, agent_type, chosen_action, source,
+	confidence_at_decision, is_correction, created_at`
+
+// scanDecision reads one decisions row selected as decisionCols.
+func scanDecision(rows *sql.Rows) (domain.DecisionRecord, error) {
+	var d domain.DecisionRecord
+	var situationType, source string
+	var isCorrection int
+	var created int64
+	if err := rows.Scan(&d.ID, &d.Signature, &situationType, &d.AgentType,
+		&d.ChosenAction, &source, &d.Confidence, &isCorrection, &created); err != nil {
+		return d, err
+	}
+	d.SituationType = domain.SituationType(situationType)
+	d.Source = domain.Source(source)
+	d.IsCorrection = isCorrection != 0
+	d.CreatedAt = fromUnix(created)
+	return d, nil
+}
+
 // DecisionsForSignature returns decision history newest first.
 func (s *Store) DecisionsForSignature(ctx context.Context, signature string, limit int) ([]domain.DecisionRecord, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, signature, situation_type, agent_type, chosen_action, source,
-			confidence_at_decision, is_correction, created_at
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+decisionCols+`
 		FROM decisions WHERE signature = ? ORDER BY id DESC LIMIT ?`, signature, limit)
 	if err != nil {
 		return nil, err
@@ -918,21 +940,140 @@ func (s *Store) DecisionsForSignature(ctx context.Context, signature string, lim
 	defer rows.Close()
 	var out []domain.DecisionRecord
 	for rows.Next() {
-		var d domain.DecisionRecord
-		var situationType, source string
-		var isCorrection int
-		var created int64
-		if err := rows.Scan(&d.ID, &d.Signature, &situationType, &d.AgentType,
-			&d.ChosenAction, &source, &d.Confidence, &isCorrection, &created); err != nil {
+		d, err := scanDecision(rows)
+		if err != nil {
 			return nil, err
 		}
-		d.SituationType = domain.SituationType(situationType)
-		d.Source = domain.Source(source)
-		d.IsCorrection = isCorrection != 0
-		d.CreatedAt = fromUnix(created)
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// sqlChunk bounds how many signatures go into one IN (...) list. SQLite's
+// parameter ceiling is far higher; a fixed chunk just keeps the statement (and
+// the prepared-plan cache) a predictable size however many rules accumulate.
+// A var, not a const, so tests can lower it and actually cross a chunk boundary
+// — the multi-chunk merge is the only behavior that differs from one query.
+var sqlChunk = 400
+
+// inPlaceholders renders "?,?,?" for n bound values.
+func inPlaceholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// uniqueSignatures drops duplicates, preserving first-seen order. Required
+// before chunking: IN (...) dedupes WITHIN a chunk, but a signature repeated
+// across two chunks would run two queries whose rows collectDecisions APPENDS,
+// returning the same history twice and double-counting every decision in the
+// confidence the caller computes from it.
+func uniqueSignatures(signatures []string) []string {
+	seen := make(map[string]bool, len(signatures))
+	out := make([]string, 0, len(signatures))
+	for _, sig := range signatures {
+		if seen[sig] {
+			continue
+		}
+		seen[sig] = true
+		out = append(out, sig)
+	}
+	return out
+}
+
+// DecisionsForSignatures returns the newest limitPerSignature decisions for EACH
+// of the given signatures, keyed by signature and newest first within each — the
+// bulk form of DecisionsForSignature.
+//
+// The Rules list enriches every rule with its history on a 2s TUI refresh, so
+// the per-signature form made that O(signatures) round trips: at ~200 learned
+// rules it was ~400 queries every 2 seconds while nothing was happening.
+//
+// signatures is REQUIRED, not a convenience. Ranking the whole table instead
+// would make the window function's cost grow with total history — and nothing
+// prunes decisions (see CountDecisionsForSignature) — whereas the per-signature
+// form it replaces was bounded at limitPerSignature rows per LISTED rule. It
+// also confines the work to the rules a filtered listing actually asked for.
+// An empty slice yields an empty map without touching the database.
+func (s *Store) DecisionsForSignatures(ctx context.Context, signatures []string, limitPerSignature int) (map[string][]domain.DecisionRecord, error) {
+	if limitPerSignature <= 0 {
+		limitPerSignature = 50
+	}
+	out := map[string][]domain.DecisionRecord{}
+	for chunk := range slices.Chunk(uniqueSignatures(signatures), sqlChunk) {
+		args := make([]any, 0, len(chunk)+1)
+		for _, sig := range chunk {
+			args = append(args, sig)
+		}
+		args = append(args, limitPerSignature)
+		// _rn, not rn: the alias sits beside d.* in the subquery's output, so a
+		// column literally named rn on decisions would shadow it and the outer
+		// predicate would silently filter on the table's column instead.
+		rows, err := s.db.QueryContext(ctx, `
+			SELECT `+decisionCols+` FROM (
+				SELECT d.*, ROW_NUMBER() OVER (PARTITION BY signature ORDER BY id DESC) AS _rn
+				FROM decisions d WHERE signature IN (`+inPlaceholders(len(chunk))+`)
+			) WHERE _rn <= ?
+			ORDER BY signature ASC, id DESC`, args...)
+		if err != nil {
+			return nil, err
+		}
+		if err := collectDecisions(rows, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// collectDecisions drains rows into out, closing them. Separate so the chunk
+// loop above cannot leak a Rows by deferring inside the loop body.
+func collectDecisions(rows *sql.Rows, out map[string][]domain.DecisionRecord) error {
+	defer rows.Close()
+	for rows.Next() {
+		d, err := scanDecision(rows)
+		if err != nil {
+			return err
+		}
+		out[d.Signature] = append(out[d.Signature], d)
+	}
+	return rows.Err()
+}
+
+// CountDecisionsForSignatures returns the EXACT decision total for each given
+// signature — the bulk form of CountDecisionsForSignature, and exact for the
+// same reason: the totals feed delete prompts, which erase every row, not just
+// the window above. Signatures with no decisions are absent from the map. An
+// empty slice yields an empty map without touching the database.
+func (s *Store) CountDecisionsForSignatures(ctx context.Context, signatures []string) (map[string]int, error) {
+	out := map[string]int{}
+	for chunk := range slices.Chunk(uniqueSignatures(signatures), sqlChunk) {
+		args := make([]any, 0, len(chunk))
+		for _, sig := range chunk {
+			args = append(args, sig)
+		}
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT signature, COUNT(*) FROM decisions WHERE signature IN (`+
+				inPlaceholders(len(chunk))+`) GROUP BY signature`, args...)
+		if err != nil {
+			return nil, err
+		}
+		if err := collectCounts(rows, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// collectCounts drains rows into out, closing them (see collectDecisions).
+func collectCounts(rows *sql.Rows, out map[string]int) error {
+	defer rows.Close()
+	for rows.Next() {
+		var sig string
+		var n int
+		if err := rows.Scan(&sig, &n); err != nil {
+			return err
+		}
+		out[sig] = n
+	}
+	return rows.Err()
 }
 
 // ListSignatures returns learning state rows, newest-updated first.

@@ -2302,3 +2302,197 @@ func TestCountStaleSignatureEmbeddingsMirrorsEmbeddableSalient(t *testing.T) {
 		t.Errorf("stale = %d, want %d — the SQL predicate has drifted from domain.EmbeddableSalient", got, want)
 	}
 }
+
+// TestBatchDecisionReadsMatchThePerSignatureForms is the contract test for the
+// ports.BatchDecisionReader fast path. The bulk queries exist purely so the
+// Rules listing stops issuing two round trips per rule on a 2s TUI refresh, so
+// they are only safe while they return EXACTLY what the per-signature calls
+// return. Anything else silently changes what confidence the operator sees.
+//
+// The fixture deliberately spans the window boundary: one signature with more
+// than the 50-row cap (so the window function has to truncate), one with fewer,
+// and one with none at all.
+func TestBatchDecisionReadsMatchThePerSignatureForms(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	counts := map[string]int{
+		"approval:over":  63, // past the 50 cap
+		"approval:under": 7,  // under the cap
+		"idle:none":      0,  // never decided
+	}
+	sigs := []string{"approval:over", "approval:under", "idle:none"}
+	for _, sig := range sigs {
+		if err := s.UpsertSignature(ctx, domain.SignatureState{
+			Signature: sig, SituationType: domain.SituationApproval,
+			AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < counts[sig]; i++ {
+			if _, err := s.RecordDecision(ctx, domain.DecisionRecord{
+				Signature: sig, SituationType: domain.SituationApproval,
+				AgentType: "claude", ChosenAction: fmt.Sprintf("act-%d", i),
+				Source: domain.SourceOperator, CreatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	batched, err := s.DecisionsForSignatures(ctx, sigs, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	totals, err := s.CountDecisionsForSignatures(ctx, sigs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, sig := range sigs {
+		want, err := s.DecisionsForSignature(ctx, sig, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := batched[sig]
+		if len(got) != len(want) {
+			t.Fatalf("%s: batched %d decisions, per-signature %d", sig, len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("%s: decision %d differs\n batched: %+v\n single:  %+v", sig, i, got[i], want[i])
+			}
+		}
+		// Newest-first has to survive the window function, not just the cap.
+		for i := 1; i < len(got); i++ {
+			if got[i-1].ID <= got[i].ID {
+				t.Errorf("%s: not newest-first at %d (%d then %d)", sig, i, got[i-1].ID, got[i].ID)
+			}
+		}
+		// The total is UNWINDOWED — it is what a delete erases, so for the
+		// over-cap signature it must exceed the 50 rows returned above.
+		wantTotal, err := s.CountDecisionsForSignature(ctx, sig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if totals[sig] != wantTotal {
+			t.Errorf("%s: batched total %d, per-signature total %d", sig, totals[sig], wantTotal)
+		}
+		if wantTotal != counts[sig] {
+			t.Errorf("%s: total %d, seeded %d", sig, wantTotal, counts[sig])
+		}
+	}
+	if len(batched["approval:over"]) != 50 {
+		t.Errorf("over-cap signature returned %d rows, want the 50-row window", len(batched["approval:over"]))
+	}
+	// A signature with no decisions is absent from both maps, and the zero
+	// values that absence yields are what the caller must be able to use.
+	if _, ok := batched["idle:none"]; ok {
+		t.Error("a signature with no decisions must be absent from the history map")
+	}
+	if _, ok := totals["idle:none"]; ok {
+		t.Error("a signature with no decisions must be absent from the totals map")
+	}
+
+	// The signature list BOUNDS the read: a rule that was filtered out of the
+	// listing must not come back in the map, and an empty list must not be read
+	// as "everything" (which would restore the whole-table scan this parameter
+	// exists to prevent).
+	only, err := s.DecisionsForSignatures(ctx, []string{"approval:under"}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(only) != 1 || len(only["approval:under"]) != counts["approval:under"] {
+		t.Errorf("scoped read returned %d signature(s), want only approval:under", len(only))
+	}
+	onlyTotals, err := s.CountDecisionsForSignatures(ctx, []string{"approval:under"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onlyTotals) != 1 || onlyTotals["approval:under"] != counts["approval:under"] {
+		t.Errorf("scoped totals = %v, want only approval:under", onlyTotals)
+	}
+	empty, err := s.DecisionsForSignatures(ctx, nil, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("an empty signature list returned %d rows; it must mean nothing, not everything", len(empty))
+	}
+	emptyTotals, err := s.CountDecisionsForSignatures(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(emptyTotals) != 0 {
+		t.Errorf("an empty signature list returned %d totals; it must mean nothing, not everything", len(emptyTotals))
+	}
+}
+
+// TestBatchDecisionReadsAcrossChunks covers the one behavior a single-chunk
+// read cannot: the merge across IN(...) batches. sqlChunk is lowered so the
+// boundary is actually crossed, and the input repeats a signature ACROSS that
+// boundary — IN dedupes within a chunk, so only a duplicate spanning two of
+// them can produce the double-append this guards against (a rule's history
+// returned twice would double-count every decision in its confidence).
+func TestBatchDecisionReadsAcrossChunks(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	orig := sqlChunk
+	sqlChunk = 2
+	t.Cleanup(func() { sqlChunk = orig })
+
+	var sigs []string
+	for i := 0; i < 7; i++ {
+		sig := fmt.Sprintf("approval:%02d", i)
+		sigs = append(sigs, sig)
+		if err := s.UpsertSignature(ctx, domain.SignatureState{
+			Signature: sig, SituationType: domain.SituationApproval,
+			AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: now,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for j := 0; j <= i; j++ {
+			if _, err := s.RecordDecision(ctx, domain.DecisionRecord{
+				Signature: sig, SituationType: domain.SituationApproval,
+				AgentType: "claude", ChosenAction: "1",
+				Source: domain.SourceOperator, CreatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// approval:00 appears in the first chunk and again in the last.
+	withDupe := append(append([]string{}, sigs...), "approval:00")
+
+	got, err := s.DecisionsForSignatures(ctx, withDupe, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(sigs) {
+		t.Fatalf("got %d signatures, want %d", len(got), len(sigs))
+	}
+	for i, sig := range sigs {
+		if len(got[sig]) != i+1 {
+			t.Errorf("%s: %d decisions, want %d (a duplicate across chunks must not append twice)",
+				sig, len(got[sig]), i+1)
+		}
+		for k := 1; k < len(got[sig]); k++ {
+			if got[sig][k-1].ID <= got[sig][k].ID {
+				t.Errorf("%s: not newest-first across the chunk merge", sig)
+				break
+			}
+		}
+	}
+	totals, err := s.CountDecisionsForSignatures(ctx, withDupe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, sig := range sigs {
+		if totals[sig] != i+1 {
+			t.Errorf("%s: total %d, want %d", sig, totals[sig], i+1)
+		}
+	}
+}
