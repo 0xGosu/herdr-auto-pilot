@@ -66,7 +66,8 @@ var claimRetryDelay = 20 * time.Millisecond
 // submit-retry drain is NOT among the stakes: cmd/hap documents that those
 // workers run on the context the signal already cancelled, so any signalled
 // exit forfeits it.) An orderly exit must therefore never be interrupted by
-// the next sweep, and the sweeps are 10s apart. Past the grace the peer has
+// the next sweep, and the sweeps are at least 10s apart — further apart once a
+// TUI backs off its idle poll, which only widens the margin. Past the grace the peer has
 // plainly ignored the request, and signalling again — now fatal — is the
 // right escalation.
 const signalGrace = 60 * time.Second
