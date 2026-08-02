@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.25
+
+- Fixed `hap tui` burning a quarter of a CPU core the whole time it was open, doing nothing. Listing learned rules re-read and re-parsed `config.toml` once per rule, so each 2-second refresh spent most of its time decoding the same file over and over. Measured on a 196-rule state directory, an idle TUI now costs about a sixth of what it did.
+- Changed the Rules listing to read every rule's decision history and totals in two queries instead of two per rule. `hap signatures list` and `hap audit` are faster by the same amount.
+- Changed `config.toml` loading to parse the file twice instead of eight times — it used to re-parse the whole file for each deprecated-key check. This applies to every `hap` command and to the daemon, not just the TUI.
+- Added a warning when a deprecated `[thresholds]` table is present but cannot be read. Its values were previously dropped in silence on the next save.
+
 ## 0.5.24
 
 - Fixed the TUI Tasks tab lagging behind its own actions: toggling done (`d`), deleting (`x`), adding (`a`), and editing (`e`) a task now update the list immediately — the checkbox flips at the keypress and the write's own result refreshes the rows — instead of showing the old state for seconds until the next full refresh, which used to invite a second `d` that flipped the task straight back.
