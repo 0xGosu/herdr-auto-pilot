@@ -3293,9 +3293,9 @@ func IndexSignatures(rows []SignatureRow) map[string]SignatureRow {
 // Signatures lists learned signatures (newest-updated first) enriched from each
 // rule's history with its live confidence, top action, and decision counts. It
 // also DROPS rows below f.MinConfidence: that filter needs the live score, so it
-// cannot live in the store's SQL (see domain.SignatureFilter). Per-row history
-// reads are N+1 at operator scale; a SQL aggregate is a future optimization if
-// lists grow.
+// cannot live in the store's SQL (see domain.SignatureFilter). History and
+// totals come from two bulk queries when the store implements
+// ports.BatchDecisionReader, and from the per-signature calls otherwise.
 func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]SignatureRow, error) {
 	states, err := a.Store.ListSignatures(ctx, f)
 	if err != nil {
@@ -3321,11 +3321,41 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 	// calls Signatures on its 2s refresh, so ~80 learned rules burned ~700ms of
 	// CPU every 2s for a value that cannot change mid-listing anyway.
 	weight := a.confirmationWeight()
+	// Two queries for the whole listing when the store offers the bulk reads,
+	// instead of two PER RULE. Both maps stay nil when it does not, and the loop
+	// falls back to the per-signature calls — a fake store keeps working, just
+	// slower. Absent from either map means "no decisions", which reads the same
+	// as the empty slice / zero the single-row calls return.
+	var (
+		histories map[string][]domain.DecisionRecord
+		totals    map[string]int
+		// Explicit, rather than testing the maps for nil: "the store has no bulk
+		// capability" and "the bulk call returned a nil map" are different
+		// things, and nothing in the port contract forbids the latter. Keying
+		// the fast path on map nilness would let such an implementation fall
+		// back to 2N queries — the exact cost this exists to remove — silently.
+		batched bool
+	)
+	if batch, ok := a.Store.(ports.BatchDecisionReader); ok {
+		listed := make([]string, len(states))
+		for i, st := range states {
+			listed[i] = st.Signature
+		}
+		if histories, err = batch.DecisionsForSignatures(ctx, listed, 50); err != nil {
+			return nil, err
+		}
+		if totals, err = batch.CountDecisionsForSignatures(ctx, listed); err != nil {
+			return nil, err
+		}
+		batched = true
+	}
 	rows := make([]SignatureRow, 0, len(states))
 	for _, st := range states {
-		history, err := a.Store.DecisionsForSignature(ctx, st.Signature, 50)
-		if err != nil {
-			return nil, err
+		history := histories[st.Signature]
+		if !batched {
+			if history, err = a.Store.DecisionsForSignature(ctx, st.Signature, 50); err != nil {
+				return nil, err
+			}
 		}
 		conf := domain.LiveConfidence(history, st.DecisionFloorID, weight)
 		// min-conf filters the LIVE score here, not cached_confidence in SQL:
@@ -3335,9 +3365,11 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 		}
 		// An exact count, not len(history): history is a capped window, and the
 		// delete prompts this feeds erase every row.
-		total, err := a.Store.CountDecisionsForSignature(ctx, st.Signature)
-		if err != nil {
-			return nil, err
+		total := totals[st.Signature]
+		if !batched {
+			if total, err = a.Store.CountDecisionsForSignature(ctx, st.Signature); err != nil {
+				return nil, err
+			}
 		}
 		row := SignatureRow{
 			SignatureState: st, Confidence: conf.Score,

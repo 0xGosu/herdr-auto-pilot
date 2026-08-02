@@ -892,6 +892,103 @@ func (p Paths) DBPath() string { return filepath.Join(p.StateDir, "herd-auto-pro
 // ControlSocketPath returns the daemon control socket path.
 func (p Paths) ControlSocketPath() string { return filepath.Join(p.StateDir, "control.sock") }
 
+// legacyKeys mirrors every deprecated or removed config key that Load must
+// detect in the RAW file. Presence is the point: once decoded into Config, a
+// key absent from the file is indistinguishable from one written at its default,
+// and removed keys have no Config field at all. Every field is therefore a
+// pointer — non-nil means "the operator wrote this".
+//
+// Every field is deliberately TYPE-FREE (`*any`, or a map for a table). These
+// keys are all removed or deprecated, so nothing here is ever used as a value —
+// only its presence, plus a %v render in the warning that names it. Declaring
+// real types would be worse than useless: BurntSushi aborts the WHOLE decode on
+// the first type mismatch, and it walks the file's key map, so which fields got
+// populated before the abort varies run to run. With nine probes sharing one
+// decode, `gpu_layers = 0.5` in an ignored key could intermittently swallow the
+// `[thresholds]` migration below and silently reset an operator's confidence
+// gates. A type-free probe cannot mismatch, so it cannot abort.
+type legacyKeys struct {
+	Safety struct {
+		// The canonical key for the deprecated `safety.disable_seed`. An
+		// explicitly set canonical key must beat a stale legacy one, which is
+		// exactly what comparing the decoded bool to its zero value cannot tell.
+		DisableNeverAutoSeedPatterns *any `toml:"disable_never_auto_seed_patterns"`
+	} `toml:"safety"`
+	Limits struct {
+		VerifyUnblockMs              *any `toml:"verify_unblock_ms"`
+		EscalationDedupWindowSeconds *any `toml:"escalation_dedup_window_seconds"`
+		EscalationDedupJitterPercent *any `toml:"escalation_dedup_jitter_percent"`
+	} `toml:"limits"`
+	Embedding struct {
+		GPULayers              *any `toml:"gpu_layers"`
+		MaxConsecutiveFailures *any `toml:"max_consecutive_failures"`
+	} `toml:"embedding"`
+	// A POINTER, so nil distinguishes "[confidence_thresholds] is absent" (which
+	// is what lets the legacy [thresholds] table win) from "present but carrying
+	// none of the removed keys". `*any` and not `*map[string]any`: a map field
+	// still has to STRUCTURALLY match, so `thresholds = 5` — a scalar under a
+	// table name — would reach unifyMap with a non-table. Today that is
+	// swallowed by a dead branch in BurntSushi v1.6.0; a fixed upstream would
+	// silently reinstate the abort-coupling this whole struct exists to remove.
+	// legacyValue does the table assertion instead, where a failure is local.
+	ConfidenceThresholds *any `toml:"confidence_thresholds"`
+	// PRESENCE only, like the rest. The deprecated `[thresholds]` table is the
+	// one probe whose VALUES are migrated rather than warned about, and reading
+	// them needs a real typed decode — which is exactly what must not run in
+	// this shared pass. loadLegacyThresholds does it separately, and only when
+	// this says the table is actually there.
+	Thresholds *any `toml:"thresholds"`
+	LLM        struct {
+		AutoActConfidenceThreshold *any `toml:"auto_act_confidence_threshold"`
+		RewriteCommand             *any `toml:"rewrite_command"`
+		RewriteCommandStart        *any `toml:"rewrite_command_start"`
+		RewriteTimeoutSeconds      *any `toml:"rewrite_timeout_seconds"`
+	} `toml:"llm"`
+}
+
+// probeLegacyKeys decodes the raw file once for every deprecated/removed key.
+// The error is dropped deliberately, as it was in each probe this replaces: the
+// caller has already decoded the same bytes into Config and reported any parse
+// error from there. Every field being type-free means a mismatch cannot arise
+// here anyway (see legacyKeys).
+func probeLegacyKeys(data []byte) legacyKeys {
+	var lk legacyKeys
+	_ = toml.Unmarshal(data, &lk)
+	return lk
+}
+
+// loadLegacyThresholds decodes the deprecated `[thresholds]` table for its
+// VALUES. It is a second typed decode, kept out of probeLegacyKeys so an
+// ill-typed value here can only cost this migration and never the removed-key
+// warnings — and vice versa. Callers gate it on the table actually being
+// present, so a config that completed the migration (all of them, eventually)
+// never pays for it.
+func loadLegacyThresholds(data []byte) *ConfidenceThresholds {
+	var probe struct {
+		Thresholds *ConfidenceThresholds `toml:"thresholds"`
+	}
+	if err := toml.Unmarshal(data, &probe); err != nil {
+		return nil
+	}
+	return probe.Thresholds
+}
+
+// legacyValue reads one key out of a type-free probed table, reporting whether
+// the operator wrote it. Absent table, a "table" the operator wrote as a scalar,
+// and an absent key are all the same answer — this is where the type assertion
+// lives precisely so a malformed one costs only this lookup.
+func legacyValue(table *any, key string) (any, bool) {
+	if table == nil {
+		return nil, false
+	}
+	m, ok := (*table).(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	v, ok := m[key]
+	return v, ok
+}
+
 // Load reads the config file, applying defaults for missing values.
 // A missing file yields pure defaults; malformed TOML returns an error and
 // never panics.
@@ -907,18 +1004,27 @@ func Load(path string) (Config, error) {
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return Default(), fmt.Errorf("parse config %s: %w", path, err)
 	}
-	// Deprecated `[thresholds]` table: load it only when the renamed
-	// `[confidence_thresholds]` table is absent. A later Save emits only the
-	// canonical table name, completing the migration without losing values.
-	var thresholdProbe struct {
-		ConfidenceThresholds *ConfidenceThresholds `toml:"confidence_thresholds"`
-		Legacy               *ConfidenceThresholds `toml:"thresholds"`
-	}
-	_ = toml.Unmarshal(data, &thresholdProbe)
-	if thresholdProbe.ConfidenceThresholds == nil && thresholdProbe.Legacy != nil {
-		warnOnce("config table `[thresholds]` is deprecated; use `[confidence_thresholds]`",
-			"path", path)
-		cfg.ConfidenceThresholds = *thresholdProbe.Legacy
+	// Every deprecated/removed key is probed from THIS ONE decode. The probes
+	// exist because a key absent from the Config struct is indistinguishable
+	// from a key set to its default once decoded, so presence has to be read
+	// from the raw file — but each probe used to run its own toml.Unmarshal.
+	// That made Load lex and parse the same file EIGHT times (~3.8ms for 4KB;
+	// BurntSushi's lexer is a goroutine/channel pipeline, so it is not cheap),
+	// on a function the daemon, every CLI invocation and every 2s TUI refresh
+	// all call. One decode answers all of them.
+	legacy := probeLegacyKeys(data)
+	if legacy.ConfidenceThresholds == nil && legacy.Thresholds != nil {
+		if legacyThresholds := loadLegacyThresholds(data); legacyThresholds != nil {
+			warnOnce("config table `[thresholds]` is deprecated; use `[confidence_thresholds]`",
+				"path", path)
+			cfg.ConfidenceThresholds = *legacyThresholds
+		} else {
+			// Present but undecodable. Say so: the defaults now apply, and the
+			// next Save drops the table (it only ever emits the canonical one),
+			// so staying quiet would lose the operator's values for good.
+			warnOnce("config table `[thresholds]` is deprecated AND could not be read (a value has the wrong type), so it is ignored and the defaults apply; copy the values you want into `[confidence_thresholds]` before the next save drops it",
+				"path", path)
+		}
 	}
 	// Deprecated `allowlist_patterns` alias: merge into never_auto_patterns
 	// (dedupe) and clear, so a later Save migrates the file to the new key
@@ -982,13 +1088,7 @@ func Load(path string) (Config, error) {
 	// so probe the raw TOML rather than comparing the decoded bool to its zero
 	// value. Clearing the pointer makes the next Save drop the old key.
 	if cfg.Safety.DeprecatedDisableSeed != nil {
-		var probe struct {
-			Safety struct {
-				Canonical *bool `toml:"disable_never_auto_seed_patterns"`
-			} `toml:"safety"`
-		}
-		_ = toml.Unmarshal(data, &probe)
-		if probe.Safety.Canonical == nil {
+		if legacy.Safety.DisableNeverAutoSeedPatterns == nil {
 			cfg.Safety.DisableNeverAutoSeedPatterns = *cfg.Safety.DeprecatedDisableSeed
 			warnOnce("config key `safety.disable_seed` is deprecated; use `safety.disable_never_auto_seed_patterns`",
 				"path", path)
@@ -1001,75 +1101,44 @@ func Load(path string) (Config, error) {
 	// `limits.verify_unblock_ms` is no longer configurable. Detect it only to
 	// make the behavior change visible; Save omits it because Limits has no
 	// corresponding field. Post-action verification always waits 1000ms.
-	var verifyProbe struct {
-		Limits struct {
-			VerifyUnblockMs *int `toml:"verify_unblock_ms"`
-		} `toml:"limits"`
-	}
-	_ = toml.Unmarshal(data, &verifyProbe)
-	if verifyProbe.Limits.VerifyUnblockMs != nil {
+	if legacy.Limits.VerifyUnblockMs != nil {
 		warnOnce("config key `limits.verify_unblock_ms` is no longer supported and is ignored; unblock verification always waits 1000ms",
-			"path", path, "configured_value", *verifyProbe.Limits.VerifyUnblockMs)
+			"path", path, "configured_value", *legacy.Limits.VerifyUnblockMs)
 	}
 	// Removed keys `limits.escalation_dedup_window_seconds` /
 	// `escalation_dedup_jitter_percent`: the escalation duplicate-ask tuning is now
 	// a fixed internal constant. Probe the raw file to warn rather than silently
 	// drop them; Save omits them (no struct fields).
-	var dedupProbe struct {
-		Limits struct {
-			WindowSeconds *int `toml:"escalation_dedup_window_seconds"`
-			JitterPercent *int `toml:"escalation_dedup_jitter_percent"`
-		} `toml:"limits"`
-	}
-	_ = toml.Unmarshal(data, &dedupProbe)
-	if dedupProbe.Limits.WindowSeconds != nil {
+	if legacy.Limits.EscalationDedupWindowSeconds != nil {
 		warnOnce("config key `limits.escalation_dedup_window_seconds` is no longer supported and is ignored; the escalation dedup window is a fixed 5 minutes",
-			"path", path, "configured_value", *dedupProbe.Limits.WindowSeconds)
+			"path", path, "configured_value", *legacy.Limits.EscalationDedupWindowSeconds)
 	}
-	if dedupProbe.Limits.JitterPercent != nil {
+	if legacy.Limits.EscalationDedupJitterPercent != nil {
 		warnOnce("config key `limits.escalation_dedup_jitter_percent` is no longer supported and is ignored; the dedup jitter tolerance is a fixed 5%",
-			"path", path, "configured_value", *dedupProbe.Limits.JitterPercent)
+			"path", path, "configured_value", *legacy.Limits.EscalationDedupJitterPercent)
 	}
 	// Removed key `embedding.gpu_layers`: embedding is strictly CPU-only (GPU
 	// offload would require a GPU-enabled llama.cpp build), so the setting is
 	// ignored. Probe the raw file to warn rather than silently drop it.
-	var gpuProbe struct {
-		Embedding struct {
-			GPULayers *int `toml:"gpu_layers"`
-		} `toml:"embedding"`
-	}
-	_ = toml.Unmarshal(data, &gpuProbe)
-	if gpuProbe.Embedding.GPULayers != nil {
+	if legacy.Embedding.GPULayers != nil {
 		warnOnce("config key `embedding.gpu_layers` is no longer supported and is ignored; embedding runs strictly on CPU",
-			"path", path, "configured_value", *gpuProbe.Embedding.GPULayers)
+			"path", path, "configured_value", *legacy.Embedding.GPULayers)
 	}
 	// Removed key `embedding.max_consecutive_failures`: the degrade-latch threshold
 	// is now a fixed internal constant (embedder.DefaultMaxConsecutiveFailures).
 	// Probe the raw file to warn rather than silently drop it; Save omits it (no
 	// struct field).
-	var maxFailProbe struct {
-		Embedding struct {
-			MaxConsecutiveFailures *int `toml:"max_consecutive_failures"`
-		} `toml:"embedding"`
-	}
-	_ = toml.Unmarshal(data, &maxFailProbe)
-	if maxFailProbe.Embedding.MaxConsecutiveFailures != nil {
+	if legacy.Embedding.MaxConsecutiveFailures != nil {
 		warnOnce("config key `embedding.max_consecutive_failures` is no longer supported and is ignored; the degrade-latch threshold is a fixed internal constant",
-			"path", path, "configured_value", *maxFailProbe.Embedding.MaxConsecutiveFailures)
+			"path", path, "configured_value", *legacy.Embedding.MaxConsecutiveFailures)
 	}
 	// Removed key `confidence_thresholds.inferred_task_bar`: a task inferred from
 	// the agent's own todo widget is trustworthy and is gated only by
 	// `confidence_thresholds.minimum`, so the dedicated bar is gone. Probe the raw
 	// file to warn rather than silently drop it; Save omits it (no struct field).
-	var inferredBarProbe struct {
-		ConfidenceThresholds struct {
-			InferredTaskBar *float64 `toml:"inferred_task_bar"`
-		} `toml:"confidence_thresholds"`
-	}
-	_ = toml.Unmarshal(data, &inferredBarProbe)
-	if inferredBarProbe.ConfidenceThresholds.InferredTaskBar != nil {
+	if inferredTaskBar, ok := legacyValue(legacy.ConfidenceThresholds, "inferred_task_bar"); ok {
 		warnOnce("config key `confidence_thresholds.inferred_task_bar` is no longer supported and is ignored; inferred next tasks are gated by `confidence_thresholds.minimum`",
-			"path", path, "configured_value", *inferredBarProbe.ConfidenceThresholds.InferredTaskBar)
+			"path", path, "configured_value", inferredTaskBar)
 	}
 	// Deprecated boolean `auto_act`: migrate to the confidence threshold only
 	// when the new key was NOT explicitly set. Comparing the loaded value to
@@ -1080,13 +1149,7 @@ func Load(path string) (Config, error) {
 	// not identical: unreported-confidence decisions now escalate. Clearing the
 	// pointer makes the next Save drop the old key.
 	if cfg.LLM.DeprecatedAutoAct != nil {
-		var probe struct {
-			LLM struct {
-				Threshold *int `toml:"auto_act_confidence_threshold"`
-			} `toml:"llm"`
-		}
-		_ = toml.Unmarshal(data, &probe)
-		if probe.LLM.Threshold == nil {
+		if legacy.LLM.AutoActConfidenceThreshold == nil {
 			migrated := 999
 			if *cfg.LLM.DeprecatedAutoAct {
 				migrated = 0
@@ -1101,16 +1164,8 @@ func Load(path string) (Config, error) {
 	// review opted into with `llm.enable_rewrite_action`. Detect the removed
 	// keys only to make the change visible; Save omits them because LLM has
 	// no corresponding fields. Deliberately NOT auto-enabled.
-	var rewriteProbe struct {
-		LLM struct {
-			Command        *[]string `toml:"rewrite_command"`
-			CommandStart   *[]string `toml:"rewrite_command_start"`
-			TimeoutSeconds *int      `toml:"rewrite_timeout_seconds"`
-		} `toml:"llm"`
-	}
-	_ = toml.Unmarshal(data, &rewriteProbe)
-	if rewriteProbe.LLM.Command != nil || rewriteProbe.LLM.CommandStart != nil ||
-		rewriteProbe.LLM.TimeoutSeconds != nil {
+	if legacy.LLM.RewriteCommand != nil || legacy.LLM.RewriteCommandStart != nil ||
+		legacy.LLM.RewriteTimeoutSeconds != nil {
 		warnOnce("config keys `llm.rewrite_command`, `llm.rewrite_command_start`, and `llm.rewrite_timeout_seconds` are no longer supported and are ignored; set `llm.enable_rewrite_action = true` to have the consult LLM (`llm.command`) rewrite outbound text instead",
 			"path", path)
 	}

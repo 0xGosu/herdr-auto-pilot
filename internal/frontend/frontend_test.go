@@ -5787,3 +5787,75 @@ func TestSignaturesAppliesConfiguredConfirmationWeight(t *testing.T) {
 			unboosted, boosted)
 	}
 }
+
+// noBatchStore hides the optional bulk decision reads. It embeds the INTERFACE,
+// not the concrete store, so the batch methods are not promoted and the type
+// assertion in App.Signatures fails — which is exactly the shape of any fake
+// that does not implement ports.BatchDecisionReader.
+type noBatchStore struct{ ports.FrontendStore }
+
+// TestSignaturesBatchAndFallbackAgree pins the optional-capability contract.
+// App.Signatures takes two bulk queries when the store offers them and two
+// queries PER RULE when it does not; the fast path is only legitimate while
+// both produce identical rows. A drift here would show the operator different
+// confidence depending on which store implementation they happened to have.
+func TestSignaturesBatchAndFallbackAgree(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// Mixed history so the confidence scores are not all trivially 1.0: two
+	// competing actions, an operator confirmation among them, and one rule with
+	// no decisions at all.
+	for i, sig := range []string{"approval:a", "choice:b", "idle:c"} {
+		if err := st.UpsertSignature(ctx, domain.SignatureState{
+			Signature: sig, SituationType: domain.SituationApproval, AgentType: "claude",
+			Mode: domain.ModeShadow, UpdatedAt: now.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if sig == "idle:c" {
+			continue
+		}
+		for j := 0; j < 5+i; j++ {
+			action, source := "1", domain.SourceOperator
+			if j%3 == 0 {
+				action, source = "2", domain.SourceRule
+			}
+			if _, err := st.RecordDecision(ctx, domain.DecisionRecord{Signature: sig,
+				SituationType: domain.SituationApproval, AgentType: "claude",
+				ChosenAction: action, Source: source, CreatedAt: now}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if _, ok := app.Store.(ports.BatchDecisionReader); !ok {
+		t.Fatal("the real store must implement ports.BatchDecisionReader, or this test proves nothing")
+	}
+	batched, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app.Store = noBatchStore{app.Store}
+	if _, ok := app.Store.(ports.BatchDecisionReader); ok {
+		t.Fatal("noBatchStore still exposes the batch reads; the fallback path is not being exercised")
+	}
+	fallback, err := app.Signatures(ctx, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(batched) != len(fallback) {
+		t.Fatalf("batched returned %d rows, fallback %d", len(batched), len(fallback))
+	}
+	for i := range batched {
+		b, f := batched[i], fallback[i]
+		if b.Signature != f.Signature || b.Confidence != f.Confidence ||
+			b.TopAction != f.TopAction || b.Decisions != f.Decisions ||
+			b.TotalDecisions != f.TotalDecisions {
+			t.Errorf("row %d differs\n batched:  %+v\n fallback: %+v", i, b, f)
+		}
+	}
+}
