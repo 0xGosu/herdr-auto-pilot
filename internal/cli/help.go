@@ -118,7 +118,8 @@ func buildCommands() {
 				"Nearly everything the TUI does is also a CLI verb, which is what scripts and AI\n" +
 				"agents should use. The exceptions are interactive-only conveniences: the Config\n" +
 				"tab's `/usr/local/bin/hap` symlink shortcut, and the daemon-stderr viewer (`!`).\n" +
-				"Only ONE TUI stays open: each instance re-polls the whole state every 2s, so\n" +
+				"Only ONE TUI stays open: each instance re-polls the whole state every 2s (30s\n" +
+				"once idle for 10 minutes), so\n" +
 				"starting one closes the older ones. Raise the cap with `hap config set\n" +
 				"tui.max_instances <n>`, or set 0 for no limit.",
 			Examples: []string{"hap tui"},

@@ -166,9 +166,10 @@ type statusNote struct {
 
 type tickMsg time.Time
 
-// clockTickMsg fires once a second to advance the live Age counter on the
-// Agents tab. It only repaints — it never re-queries the store (unlike the
-// slower tickMsg refresh).
+// clockTickMsg advances the live Age counter on the Agents tab — every second
+// while anything is happening, every slowClockInterval once the TUI has backed
+// off (see refreshInterval). It only repaints; it never re-queries the store
+// (unlike the slower tickMsg refresh).
 type clockTickMsg time.Time
 
 // prompt is an in-flight inline input.
@@ -807,9 +808,10 @@ type Model struct {
 	searching   bool        // search-input mode on the active tab (AR-011)
 	status      *statusNote // durable action outcome (CR-025)
 	st          *styles     // palette-resolved styles; nil = default palette
-	// now is the clock the live Age counter renders against, advanced by the
-	// 1s clockTickMsg. Zero falls back to time.Now() (see renderNow), so tests
-	// can pin it for deterministic snapshots.
+	// now is the clock the live Age counter renders against, advanced by
+	// clockTickMsg (1s while active, slowClockInterval once idle) and by the
+	// keypress that ends an idle stretch. Zero falls back to time.Now() (see
+	// renderNow), so tests can pin it for deterministic snapshots.
 	now time.Time
 
 	// bellOut is where the terminal bell (ASCII BEL) is written; nil is a
@@ -842,6 +844,19 @@ type Model struct {
 	// on a failed refresh.
 	lastMaxEscalationID int64
 	lastPaused          bool
+
+	// lastActivity is when this TUI last saw the operator press a key or the
+	// refreshed data actually change. Past idleBackoffAfter it drops to the
+	// slow poll (see refreshInterval); any activity restores the fast one.
+	// Zero until the first refresh, which is treated as activity.
+	lastActivity time.Time
+	// lastFingerprint is the previous refresh's activityFingerprint, the
+	// change signal lastActivity is driven from. Empty before the first one.
+	lastFingerprint string
+	// slowPoll records whether the LAST tick was scheduled at the slow
+	// interval, so a return to activity can refresh immediately instead of
+	// waiting out a long timer that is already in flight.
+	slowPoll bool
 	// pausePending is set synchronously the instant "p" is pressed (before
 	// the pause request is dispatched), and consumed by the next refreshMsg
 	// that observes the false-to-true Paused transition. Setting it
@@ -1237,16 +1252,113 @@ func New(ctx context.Context, app *frontend.App) Model {
 
 // Init starts the refresh loop.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refresh(), tick(), clockTick())
+	return tea.Batch(m.refresh(), tick(fastPollInterval), clockTick(fastClockInterval))
 }
 
-func tick() tea.Cmd {
-	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+const (
+	// fastPollInterval is the live cadence: what the operator gets whenever
+	// anything is happening, and what every activity returns to at once.
+	fastPollInterval = 2 * time.Second
+	// slowPollInterval is the idle cadence. Each poll costs a full store read
+	// plus two herdr CLI round trips, so on a pane left open overnight that is
+	// thousands of queries answering "still nothing". Kept short enough that a
+	// glance at a forgotten pane is never more than this stale.
+	slowPollInterval = 30 * time.Second
+	// idleBackoffAfter is how long BOTH the operator and the agents must have
+	// been quiet before backing off. Deliberately far longer than any burst of
+	// activity, so an operator working in the pane never sees the slow cadence.
+	idleBackoffAfter = 10 * time.Minute
+	// fastClockInterval / slowClockInterval drive the Age column repaint, which
+	// runs no query but does re-render the screen. Ages shown while idle are
+	// minutes old, so second-accuracy there is redrawing to change nothing.
+	fastClockInterval = 1 * time.Second
+	slowClockInterval = 10 * time.Second
+)
+
+// idle reports that neither the operator nor the agents have done anything for
+// idleBackoffAfter. Before the first refresh sets lastActivity it is false, so
+// a starting TUI always polls fast.
+func (m Model) idle(now time.Time) bool {
+	return !m.lastActivity.IsZero() && now.Sub(m.lastActivity) >= idleBackoffAfter
 }
 
-// clockTick drives the 1s Age repaint; it carries no data query.
-func clockTick() tea.Cmd {
-	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg { return clockTickMsg(t) })
+// refreshInterval is the data-poll cadence for the current idleness.
+func (m Model) refreshInterval(now time.Time) time.Duration {
+	if m.idle(now) {
+		return slowPollInterval
+	}
+	return fastPollInterval
+}
+
+// activityFingerprint condenses a refresh into the facts that mean "something
+// happened": agent set and statuses, pending escalations, the newest audit and
+// kill rows, the pause switch, and the number of learned rules and tasks.
+//
+// It is built ONLY from data the refresh already fetched, so change detection
+// costs no extra query — which is the whole point, since the alternative is
+// polling more to discover there is nothing to poll for.
+//
+// Missing a signal here is bounded and self-correcting: the poll stays slow a
+// while longer and the change shows up on the next one, at most
+// slowPollInterval late. That is the deliberate trade — a fingerprint that is
+// cheap and coarse, never one that decides to skip work.
+func activityFingerprint(msg refreshMsg) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "p=%v|esc=%d/%d|aud=%d|sig=%d",
+		msg.status.Paused, len(msg.escalations), maxEscalationID(msg.escalations),
+		maxEscalationID(msg.audit), len(msg.signatures))
+	// Per-ITEM, not per-group: TaskGroups returns one group per configured
+	// source, so a group count only moves when the operator adds or removes a
+	// SOURCE — effectively never. An agent grinding through a checklist writes
+	// no audit row and no status transition, so without this the Tasks tab is
+	// the one view that visibly moves while the poll has backed off.
+	for _, g := range msg.tasks {
+		done := 0
+		for _, it := range g.Items {
+			if it.Mark != " " {
+				done++
+			}
+		}
+		fmt.Fprintf(&b, "|t%d=%d/%d/%v", g.Index, done, len(g.Items), g.Err != "")
+	}
+	if len(msg.kills) > 0 {
+		fmt.Fprintf(&b, "|kill=%d", msg.kills[0].ID)
+	}
+	// Agent statuses are what "an agent event" means from out here: the TUI
+	// polls rather than subscribing, so a transition is only ever visible as a
+	// status that differs from the one before. Sorted because the agent list's
+	// order is not guaranteed stable and a reorder is not an event.
+	agents := make([]string, 0, len(msg.status.MonitoredAgents))
+	for _, a := range msg.status.MonitoredAgents {
+		agents = append(agents, a.AgentID+":"+a.Status+":"+a.TerminalID)
+	}
+	sort.Strings(agents)
+	b.WriteString("|" + strings.Join(agents, ","))
+	// A daemon that dies, hangs, gives up or starts crash-looping is exactly
+	// the event an operator must not wait out a slow poll to see — it is also
+	// the one that stops producing agent events, so nothing else here would
+	// notice it.
+	h := msg.daemonHealth
+	fmt.Fprintf(&b, "|daemon=%v%v%v%v%v/%d", h.Running, h.Hung, h.GaveUp,
+		h.CrashLooping, h.BinaryReplaced, h.RecentRestarts)
+	return b.String()
+}
+
+func tick(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+// clockTick drives the Age repaint; it carries no data query.
+func clockTick(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg { return clockTickMsg(t) })
+}
+
+// clockInterval matches the Age repaint to the poll cadence.
+func (m Model) clockInterval(now time.Time) time.Duration {
+	if m.idle(now) {
+		return slowClockInterval
+	}
+	return fastClockInterval
 }
 
 func (m Model) refresh() tea.Cmd {
@@ -1453,6 +1565,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// KeyMsg — catch it here. It only ever means "insert a newline" in a
 	// multiline prompt; everywhere else it is ignored like any unknown key.
 	if isShiftEnter(msg) {
+		// A real keypress that never reaches the tea.KeyMsg branch below
+		// (bubbletea v1 delivers it as an unrecognized CSI message), so it has
+		// to stamp presence here or typing into a multiline prompt would not
+		// count as the operator being here.
+		m.lastActivity = time.Now()
 		if m.prompt != nil && m.prompt.multiline {
 			m.prompt.insert("\n")
 		}
@@ -1460,6 +1577,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		// Resizing the pane is unambiguous operator presence, and it is not a
+		// KeyMsg, so stamp it here.
+		m.lastActivity = time.Now()
 		m.width, m.height = msg.Width, msg.Height
 		if m.detail != nil && m.detail.build != nil {
 			m.detail.lines = m.detail.build(m.wrapWidth(), m.detail.previewExpanded)
@@ -1524,6 +1644,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the header for every frame a store read happens to fail.
 		if msg.err != nil {
 			msg.update, msg.updateDue = m.data.update, m.data.updateDue
+		}
+		// A refresh that shows something new counts as activity, which is what
+		// keeps an agent working overnight on the fast poll with nobody at the
+		// keyboard. A failed refresh is not evidence of quiet either — it would
+		// otherwise let a broken store back the poll off — so it also refreshes
+		// the stamp without pretending to know the fingerprint.
+		if msg.err != nil {
+			m.lastActivity = time.Now()
+		} else if fp := activityFingerprint(msg); fp != m.lastFingerprint {
+			m.lastFingerprint = fp
+			m.lastActivity = time.Now()
 		}
 		m.data = msg
 		m.items = buildRuleItems(msg.cfg)
@@ -1603,7 +1734,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case openTaskSourceFieldMsg:
 		return m.openTaskSourceFieldPrompt(msg)
 	case tickMsg:
-		cmds := []tea.Cmd{m.refresh(), tick()}
+		now := time.Now()
+		m.slowPoll = m.idle(now)
+		cmds := []tea.Cmd{m.refresh(), tick(m.refreshInterval(now))}
 		if m.updateCheckAllowed(time.Now()) {
 			m.updateChecking = true
 			m.lastUpdateCheck = time.Now()
@@ -1627,7 +1760,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detail.build = build
 			m.detail.lines = build(m.wrapWidth(), m.detail.previewExpanded)
 		}
-		return m, clockTick()
+		return m, clockTick(m.clockInterval(time.Time(msg)))
 	case sigDetailMsg:
 		if msg.err != nil {
 			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
@@ -1672,7 +1805,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clampListViewport()
 		return m, nil
 	case tea.KeyMsg:
-		return m.handleKey(msg)
+		// The operator is here: back to the live cadence. Stamped BEFORE
+		// handleKey so the model it returns carries it (value receiver).
+		m.lastActivity = time.Now()
+		wasSlow := m.slowPoll
+		m.slowPoll = false
+		if wasSlow {
+			// Only clockTickMsg advances the render clock, and the timer in
+			// flight right now is the SLOW one, so the Age column would render
+			// against an up-to-slowClockInterval-stale clock for another
+			// slowClockInterval — visible skew, precisely when they look.
+			// Scoped to the return from idle: doing this on EVERY keypress
+			// would also overwrite a clock a caller pinned deliberately (the
+			// zero value means "use time.Now()", so a set one is a choice).
+			m.now = m.lastActivity
+		}
+		next, cmd := m.handleKey(msg)
+		if !wasSlow {
+			return next, cmd
+		}
+		// Coming back from the slow poll, pull fresh data at once rather than
+		// making them look at rows up to slowPollInterval old. Deliberately NO
+		// new tick here: the slow timer is already in flight and will reschedule
+		// itself fast when it lands, whereas starting a second one would leave
+		// two tickers refreshing forever. This is also why the immediate refresh
+		// is gated on wasSlow — un-gated, every keystroke would trigger a full
+		// store read.
+		if mdl, ok := next.(Model); ok {
+			return mdl, tea.Batch(cmd, mdl.refresh())
+		}
+		return next, tea.Batch(cmd, m.refresh())
 	}
 	return m, nil
 }
