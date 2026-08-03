@@ -953,7 +953,7 @@ task_generate_command = [
 ```
 
 Available placeholders are `{self}`, `{agent_name}`, `{agent_type}`,
-`{pane_excerpt}`, and `{cwd}`. The first-generation state is tracked
+`{pane_excerpt}`, `{cwd}`, and `{session_id}`. The first-generation state is tracked
 independently from LLM consults and rewrites, and only applies to the
 no-source-at-all case: `task_generate_command_start` bootstraps a list from
 nothing, so refilling an already-exhausted declared source is never treated
@@ -1265,6 +1265,24 @@ timeout_seconds = 120
 auto_act_confidence_threshold = 99   # auto-act only when the LLM's confidence (0-100) is >= this; default 99 (near-certain only); >100 e.g. 999 = never (surface for your confirmation)
 pane_excerpt_chars = 5000   # pane excerpt size in the consult context (default 5000)
 ```
+
+### Session ids
+
+Every LLM invocation is given a session id, and that id is recorded on the audit
+row the invocation produced (`llm_session_id`). It is what the CLI names its
+transcript file, so a decision can be traced back to the conversation behind it.
+
+- **`claude`** — hap appends `--session-id {session_id}` automatically. Write
+  `{session_id}` in your `command` yourself only if you need it somewhere else;
+  doing so turns the automatic injection off, so the id is never passed twice.
+- **`codex`** — has no such flag: it mints its own id and prints it in its
+  startup banner, which hap reads back.
+- **anything else** — nothing is added. hap does not guess a flag name, because
+  a wrong one is an argv error that would fail every consult.
+
+The id is recorded for failed consults too — a timeout or a no-submit still
+wrote a transcript, and still raises an escalation. It is bookkeeping only:
+nothing decides anything from it, and an empty value simply means unknown.
 
 An optional **`command_start`** runs *instead of* `command` on an agent's
 **first consult** — the first time the plugin needs the LLM for that agent

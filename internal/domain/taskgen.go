@@ -35,6 +35,11 @@ type TaskGenRequest struct {
 	// lifetime, selecting llm.task_generate_command_start when configured.
 	// Tracked independently of the consult "first".
 	First bool
+	// SessionID identifies the CLI conversation this generation runs as, and
+	// is what the CLI names its transcript file. See LLMRequest.SessionID —
+	// task generation is the single largest producer of those transcripts, so
+	// leaving it out would miss most of them.
+	SessionID string
 }
 
 // AgentBusy reports whether a herdr agent status means the agent is NOT

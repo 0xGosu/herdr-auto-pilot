@@ -157,6 +157,27 @@ type LLMPort interface {
 	Configured() bool
 }
 
+// SessionReportingLLM is implemented by LLM adapters that can say which CLI
+// conversation a consult actually ran as. Optional: callers type-assert and
+// degrade to the id they passed in (or to none at all).
+//
+// It exists because the session id must survive a FAILED consult — a timeout or
+// a no-submit still wrote a transcript, and still raises the escalation an
+// operator dismisses — so it cannot ride on the decision, which is nil exactly
+// then. The adapter cannot write it either: its store is a ReadStore.
+type SessionReportingLLM interface {
+	// ConsultWithSession is Consult plus the session id the run used. The id
+	// is returned on the error path too, and is "" when unknown.
+	ConsultWithSession(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, string, error)
+}
+
+// SessionReportingTaskGenerator is the GenerateTask counterpart of
+// SessionReportingLLM. Task generation is the largest single producer of CLI
+// transcripts, so it reports its session id the same way.
+type SessionReportingTaskGenerator interface {
+	GenerateTaskWithSession(ctx context.Context, req domain.TaskGenRequest) (string, string, error)
+}
+
 // TaskGeneratorPort is an optional capability of the LLM adapter: a one-shot
 // task suggestion for an idle agent with no task source
 // (llm.task_generate_command). The suggested task is the subprocess's

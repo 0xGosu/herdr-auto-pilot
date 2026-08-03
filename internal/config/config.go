@@ -219,9 +219,16 @@ func (a AutoAccept) validate() error {
 // LLM configures the optional local LLM/agent CLI fallback (FR-010, IR-005).
 type LLM struct {
 	// Command is the argv template; supports {self} (this binary),
-	// {request_id}, {db}, {control}, and {agent_name} (the agent's short
-	// name) placeholders. Empty means no LLM is configured (low-confidence
-	// situations escalate).
+	// {request_id}, {db}, {control}, {agent_name} (the agent's short name)
+	// and {session_id} placeholders. Empty means no LLM is configured
+	// (low-confidence situations escalate).
+	//
+	// {session_id} is a fresh UUID per invocation, recorded on the audit row
+	// so a decision can be traced to the transcript the CLI left behind. For
+	// `claude`, hap appends `--session-id {session_id}` automatically — write
+	// the placeholder yourself only to place it differently, which suppresses
+	// the automatic injection. `codex` mints its own and is never passed one;
+	// hap reads it back from the CLI's startup banner instead.
 	Command []string `toml:"command"`
 	// CommandStart is the argv template used on the FIRST consult per agent
 	// (a fresh agent in a pane, until superseded on the next "detected"

@@ -168,6 +168,7 @@ func (d *Daemon) startTaskListReview(ctx context.Context, s domain.Situation, si
 	// always use the base command (First stays false, same as startActionReview).
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("taskreview-%s-%d", s.AgentID, now.UnixNano()),
+		SessionID: domain.NewSessionID(),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
 		TaskReview: true, ProposedTask: del.input,
@@ -223,7 +224,10 @@ func (d *Daemon) startTaskListReview(ctx context.Context, s domain.Situation, si
 			if err := d.opt.Store.UpdateLLMRequestContext(rctx, req.RequestID, req.ContextJSON); err != nil {
 				return fmt.Errorf("staging LLM request context failed: %w", err)
 			}
-			decision, err := llm.Consult(rctx, req)
+			decision, sessionID, err := consultWithSession(rctx, llm, req)
+			// req is copied into outcome.request after this guard returns, so
+			// updating it here is what carries the id the run actually used.
+			req.SessionID = sessionID
 			outcome.decision = decision
 			return err
 		})

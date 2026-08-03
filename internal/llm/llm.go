@@ -34,7 +34,8 @@ const fastFailWindow = time.Second
 // Adapter shells out to the operator's LLM CLI.
 type Adapter struct {
 	// CommandTemplate is the argv template from config; placeholders:
-	// {self} → this binary, {request_id}, {db}, {control}, {agent_name}.
+	// {self} → this binary, {request_id}, {db}, {control}, {agent_name},
+	// {session_id}.
 	CommandTemplate []string
 	// CommandStartTemplate is used instead of CommandTemplate on an agent's
 	// first consult (req.First); empty falls back to CommandTemplate.
@@ -78,9 +79,14 @@ func (a *Adapter) Configured() bool {
 type consultAttempt struct {
 	dec      *domain.LLMDecision
 	captured string
-	runErr   error
-	deadline bool          // the run hit its own timeout
-	elapsed  time.Duration // spawn-to-exit wall time
+	// sessionID is the CLI conversation this attempt actually ran as: the id
+	// hap passed in, or the one the CLI reported if it mints its own. Empty
+	// when neither applies. Per ATTEMPT, not per request — Consult retries with
+	// the alternate template, and that is a different conversation.
+	sessionID string
+	runErr    error
+	deadline  bool          // the run hit its own timeout
+	elapsed   time.Duration // spawn-to-exit wall time
 }
 
 // staged reports whether the run left a usable (pending) decision.
@@ -114,12 +120,23 @@ func (att *consultAttempt) failure(timeout time.Duration) error {
 // preferred template fails fast (e.g. `command` resumes a session that does
 // not exist yet), Consult retries once with the alternate template.
 func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+	dec, _, err := a.ConsultWithSession(ctx, req)
+	return dec, err
+}
+
+// ConsultWithSession is Consult plus the session id the run actually used —
+// hap's own when the CLI accepts one, the CLI's own when it mints one.
+//
+// The id is returned on EVERY path including the failures, because a consult
+// that timed out or never submitted still created a transcript and still
+// raises an escalation. Implements ports.SessionReportingLLM.
+func (a *Adapter) ConsultWithSession(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, string, error) {
 	if !a.Configured() {
-		return nil, fmt.Errorf("no LLM CLI configured")
+		return nil, "", fmt.Errorf("no LLM CLI configured")
 	}
 	self, err := a.resolveSelf()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// The first consult for an agent prefers command_start when configured;
 	// the other template is the fast-fail fallback and, absent a start
@@ -142,7 +159,10 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 		// A preflight/store error on the PRIMARY aborts outright (a missing
 		// preferred binary is a config error worth surfacing directly); the
 		// same error on the retry is folded into retryErr so the primary wins.
-		return nil, err
+		//
+		// No session id: this failed BEFORE the CLI ran, so nothing was
+		// created to name.
+		return nil, "", err
 	}
 	// A fast fail retries once with the alternate template. Skip when the
 	// parent context is already cancelled (shutdown makes every run "fail
@@ -165,15 +185,18 @@ func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.L
 
 	if !att.staged() {
 		base := att.failure(timeout)
+		// att.sessionID even here: the run happened, so a transcript exists and
+		// the escalation this failure raises can still be traced back to it.
 		if retryErr != nil {
 			// Lead with the primary failure (the informative one the operator
 			// must debug); note the alternate also failed.
-			return nil, fmt.Errorf("%w; retry with alternate command also failed: %v", base, retryErr)
+			return nil, att.sessionID,
+				fmt.Errorf("%w; retry with alternate command also failed: %v", base, retryErr)
 		}
-		return nil, base
+		return nil, att.sessionID, base
 	}
 	att.dec.CapturedOutput = att.captured
-	return att.dec, nil
+	return att.dec, att.sessionID, nil
 }
 
 // resolveSelf resolves the {self} placeholder: the configured override, else
@@ -201,6 +224,7 @@ func (a *Adapter) consultReplacer(self string, req domain.LLMRequest) *strings.R
 		"{db}", a.DBPath,
 		"{control}", a.ControlPath,
 		"{agent_name}", req.AgentName,
+		SessionIDPlaceholder, req.SessionID,
 	)
 }
 
@@ -224,12 +248,26 @@ func (s commandSpec) sameAs(other commandSpec) bool {
 // launches the CLI and reads back whatever decision was staged.
 func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string, req domain.LLMRequest, timeout time.Duration) (*consultAttempt, error) {
 	repl := a.consultReplacer(self, req)
-	argv := make([]string, len(spec.argv))
-	for i, arg := range spec.argv {
+	// Injected into the TEMPLATE, before substitution: the check for "the
+	// operator placed {session_id} themselves" has to see the placeholder, and
+	// after substitution it is already an opaque uuid. What gets appended is
+	// the placeholder itself, so the substitution below fills it exactly once.
+	//
+	// Guarded on a non-empty id: injecting the placeholder with nothing to
+	// expand it to would hand the CLI a bare `--session-id ""`, which is worse
+	// than not pinning the session at all.
+	tmpl := spec.argv
+	if req.SessionID != "" {
+		tmpl = InjectSessionID(tmpl, SessionIDPlaceholder)
+	}
+	argv := make([]string, len(tmpl))
+	for i, arg := range tmpl {
 		argv[i] = repl.Replace(arg)
 	}
 	// Auto-repair known CLI misconfigurations (e.g. claude's prompt placed
-	// after other flags) so a slightly-off operator config still works.
+	// after other flags) so a slightly-off operator config still works. Runs
+	// AFTER the injection above, which appends — so the prompt adjacency
+	// claude requires is restored here even though we added a trailing flag.
 	argv = NormalizeLLMCommand(argv)
 
 	// The operator's environment is composed FIRST: an unreadable env file
@@ -274,12 +312,19 @@ func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string,
 	if err != nil {
 		return nil, fmt.Errorf("read staged decision: %w", err)
 	}
+	// A CLI that mints its own session id reports it in the output we already
+	// captured; that one is authoritative over anything hap passed in.
+	sessionID := req.SessionID
+	if reported := ExtractSessionID(argv[0], captured); reported != "" {
+		sessionID = reported
+	}
 	return &consultAttempt{
-		dec:      dec,
-		captured: captured,
-		runErr:   runErr,
-		deadline: runCtx.Err() == context.DeadlineExceeded,
-		elapsed:  elapsed,
+		dec:       dec,
+		captured:  captured,
+		sessionID: sessionID,
+		runErr:    runErr,
+		deadline:  runCtx.Err() == context.DeadlineExceeded,
+		elapsed:   elapsed,
 	}, nil
 }
 
