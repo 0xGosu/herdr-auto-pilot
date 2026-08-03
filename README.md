@@ -1191,10 +1191,57 @@ next config save.
 `hap status` and the TUI share the same health assessment. They report a
 stale or hung daemon, a runtime-degraded embedder, crash-looping, and the
 crash-loop breaker's auto-disable/give-up states. The detached daemon's stderr
-is captured at `<state-dir>/daemon.stderr.log` (rotated at 256 KiB); an
-error-severity TUI banner offers `!` to open the last 16 KiB in a scrollable
-detail view. The same path appears in `hap status` and `hap state-dir` makes it
-easy to locate.
+is captured at `<state-dir>/daemon.stderr.log` (rotated at 256 KiB — checked
+both when a daemon is spawned and on the running daemon's heartbeat, so a
+process that never restarts is bounded too); an error-severity TUI banner offers
+`!` to open the last 16 KiB in a scrollable detail view. The same path appears
+in `hap status` and `hap state-dir` makes it easy to locate.
+
+### Disk usage
+
+`hap status` prints a `disk:` line with the state directory's total, its
+largest component, and the excerpt retention in force. Three things grow there:
+
+| File | Bounded by |
+|---|---|
+| `herd-auto-prompter.log` | `[logging] max_size_mb` (default 16 MiB), plus one `.old` sibling |
+| `daemon.stderr.log` | 256 KiB, plus one `.old` sibling |
+| `herd-auto-prompter.db` | `[logging] audit_excerpt_retention_days` (default 14) |
+
+The database is the one that grows fastest. Most of it is the pane excerpt
+captured with each audit row — about 3.8 KiB of a 5.0 KiB row — so retention
+**blanks that column and keeps the row**: `hap audit` history, rationales and
+statuses all survive.
+
+`audit_excerpt_retention_days` takes three kinds of value:
+
+| Value | Meaning |
+|---|---|
+| omitted | the default, 14 days |
+| `0` | keep **no** excerpts — blank every eligible row |
+| negative (e.g. `-1`) | never prune; keep every excerpt forever |
+
+`0` means what it says — retain for zero days — so it is the most aggressive
+setting, not the off switch. Negative is the off switch.
+
+Rows the daemon may still read are never touched, whatever the retention says:
+pending escalations at any age, rows with an unprocessed LLM retry, and recently
+answered asks. That is a safety rule rather than a nicety — auto-accept reads a
+pending escalation's excerpt as the proof that a menu was standing, and without
+it an unreadable pane would fall through to a literal send.
+
+The daemon sweeps once a day. `hap gc` runs it now and reports what it
+reclaimed; `hap gc --dry-run` shows the window without changing anything, and
+`hap gc --days N` overrides it for one run (`--days 0` blanks every eligible
+excerpt, matching the config value). Because SQLite frees pages *inside* the
+file, `hap gc` also vacuums — which is what actually returns the space.
+
+To turn the log itself down, set `[logging] level` to `warn`. It applies to
+`hap tui` as well, which writes to the same file. `HAP_DEBUG=1` still forces
+debug for one run and outranks the config. Unlike most settings, `level` and
+`max_size_mb` are read once when a process starts — a running daemon keeps its
+current level through a config reload, so restart it with `hap daemon --ensure`
+to apply a change.
 
 Llama.cpp runs in a persistent `hap embed-worker` child rather than inside the
 daemon. A native abort or stalled embedding call therefore kills/restarts the

@@ -254,7 +254,10 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 				// re-embedded it (reembed.Reconcile).
 				slog.Warn("vector match failed; trying text match", "error", err)
 			case ok && hit.Score >= cfg.Embedding.SimilarityThreshold:
-				slog.Info("semantic match: reusing learned signature",
+				// Debug: a routine cache hit, emitted once per classification.
+				// At Info it was the single most common line in the log (167 of
+				// 735 in a live sample) and said only "the matcher worked".
+				slog.Debug("semantic match: reusing learned signature",
 					"signature", hit.Signature, "cosine", hit.Score, "raw", sig.Raw)
 				sig.Signature = hit.Signature
 				sig.Match.Method = domain.MatchCosine
@@ -315,7 +318,8 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 		slog.Warn("text match failed; using hash key", "error", err)
 		return sig
 	} else if ok && hit.Score >= bar {
-		slog.Info("text match: reusing learned signature",
+		// Debug for the same reason as the cosine hit above: routine success.
+		slog.Debug("text match: reusing learned signature",
 			"signature", hit.Signature, "bm25", hit.Score, "raw", sig.Raw)
 		sig.Signature = hit.Signature
 		sig.Match.Method = domain.MatchBM25

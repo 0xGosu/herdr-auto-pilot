@@ -78,15 +78,42 @@ func NewEngine(cfg config.Embedding) *Llama {
 	}
 }
 
+// quietLlamaLogging drops llama.cpp's own log output to warnings and errors.
+//
+// The worker's stderr is captured to <state>/daemon.stderr.log, which exists to
+// preserve a native abort (GGML_ASSERT → SIGABRT) that Go recovery cannot see.
+// At llama.cpp's default "info" level a model load writes ~250 banner lines
+// (~11 KiB) EVERY time the worker starts — a measured log was 100% banner and
+// 0% error, burying the one thing the file is for.
+//
+// An operator who set LLAMA_LOG deliberately keeps it: this only supplies a
+// default. llama.cpp reads the variable in a package init() that has already
+// run by now, so InitLogging must be called to re-read it.
+func quietLlamaLogging() {
+	if _, set := os.LookupEnv("LLAMA_LOG"); set {
+		return
+	}
+	if err := os.Setenv("LLAMA_LOG", "warn"); err != nil {
+		return // keep the default level rather than fail the load
+	}
+	llama.InitLogging()
+}
+
 // init loads the model and an embeddings context once.
 func (l *Llama) init() {
 	if _, err := os.Stat(l.modelPath); err != nil {
 		l.initErr = fmt.Errorf("embedding model unavailable: %w", err)
 		return
 	}
+	quietLlamaLogging()
 	// Embedding is strictly CPU-only: GPU offload is never used (it would need a
 	// GPU-enabled llama.cpp build), so pin the layer count to 0.
-	model, err := llama.LoadModel(l.modelPath, llama.WithGPULayers(0))
+	//
+	// WithSilentLoading drops the progress dots llama.cpp writes straight to
+	// stderr. LLAMA_LOG does NOT cover them (see the option's own docs), so
+	// silencing the banner takes both this and quietLlamaLogging above.
+	model, err := llama.LoadModel(l.modelPath,
+		llama.WithGPULayers(0), llama.WithSilentLoading())
 	if err != nil {
 		l.initErr = fmt.Errorf("load embedding model %s: %w", l.modelPath, err)
 		return

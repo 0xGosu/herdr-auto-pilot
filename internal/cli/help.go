@@ -372,6 +372,33 @@ func buildCommands() {
 			Handler: dismiss,
 		},
 		{
+			Name:    "gc",
+			Group:   groupData,
+			Summary: "reclaim disk from hap's own logs and audit history",
+			Usage:   []string{"hap gc [--days N] [--dry-run]"},
+			Flags: []FlagDoc{
+				{Name: "--days", Arg: "N", Default: "config", Desc: "blank pane excerpts older than N days; 0 blanks them all"},
+				{Name: "--dry-run", Desc: "report what would be reclaimed, change nothing"},
+			},
+			Details: "Blanks the captured pane excerpt on aged audit rows — the rows themselves,\n" +
+				"with their action, rationale and status, are KEPT, so `hap audit` history stays\n" +
+				"complete. The excerpt is the bulk of the database (~3.8 KiB of a 5.0 KiB row).\n\n" +
+				"Rows the daemon may still read are never touched: pending escalations at any\n" +
+				"age, rows with an unprocessed LLM retry, and recently answered asks. That is a\n" +
+				"safety rule, not a nicety — auto-accept reads a pending escalation's excerpt as\n" +
+				"the proof that a menu was standing.\n\n" +
+				"The daemon does this once a day on its own; run it by hand to reclaim now.\n" +
+				"Reclaiming rebuilds the database, which briefly takes a write lock — a running\n" +
+				"daemon may retry an audit write while that happens. Nothing is lost; it is just\n" +
+				"not instant on a large database.",
+			Examples: []string{"hap gc --dry-run", "hap gc --days 7"},
+			Next: []Hint{
+				{Cmd: "hap status", Why: "see the state directory footprint"},
+				{Cmd: "hap config set logging.audit_excerpt_retention_days N", Why: "change the retention window"},
+			},
+			Handler: gc,
+		},
+		{
 			Name:    "audit",
 			Group:   groupOperate,
 			Summary: "show the audit log (every decision, auto or escalated)",

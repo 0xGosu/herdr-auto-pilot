@@ -181,7 +181,10 @@ func run(verb string, args []string) error {
 		}
 		defer closeStore()
 		defer drainSubmitRetries(app)
-		if _, err := logging.Setup(paths.StateDir, false); err != nil {
+		// The TUI logs into the same file as the daemon, so it honours the same
+		// configured level. It used to be pinned to Info regardless, which is
+		// what made its 2s-tick warnings impossible to turn down.
+		if _, err := logging.Setup(paths.StateDir, logOptions(paths)); err != nil {
 			return err
 		}
 		// Join the TUI registry so this instance is counted, and so it can
@@ -272,7 +275,7 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		return ensureDaemon(paths, replaceOnly)
 	}
 
-	if _, err := logging.Setup(paths.StateDir, os.Getenv("HAP_DEBUG") == "1"); err != nil {
+	if _, err := logging.Setup(paths.StateDir, logOptions(paths)); err != nil {
 		return err
 	}
 
@@ -500,6 +503,29 @@ const ensureWaitTimeout = 10 * time.Second
 // is a no-op.
 func replaceOnlyBowsOut(replaceOnly bool, running func() bool) bool {
 	return replaceOnly && !running()
+}
+
+// logOptions resolves the log level and size cap for this process.
+//
+// Config is (re)loaded here rather than threaded in because Setup runs before
+// the callers that hold a Config, and a load is cheap. An unreadable config
+// yields the defaults — logging must come up whatever else is broken.
+//
+// HAP_DEBUG=1 still outranks the file, so an operator can raise verbosity for
+// one run without editing it.
+func logOptions(paths config.Paths) logging.Options {
+	cfg, err := config.Load(paths.File())
+	if err != nil {
+		cfg = config.Default()
+	}
+	opt := logging.Options{
+		Level:   cfg.Logging.SlogLevel(),
+		MaxSize: int64(cfg.Logging.MaxSizeMB) << 20,
+	}
+	if os.Getenv("HAP_DEBUG") == "1" {
+		opt.Level = slog.LevelDebug
+	}
+	return opt
 }
 
 // spawnDaemon launches a detached hap from exePath with the given args.

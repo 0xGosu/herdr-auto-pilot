@@ -6,6 +6,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -653,6 +654,96 @@ type CaptureDelayRule struct {
 	EventMs   int    `toml:"event_ms"`   // all later events
 }
 
+// Logging bounds what hap writes about itself: the plugin log file and the
+// audit history that accumulates beside it.
+//
+// The audit knob lives here rather than in a section of its own because it
+// answers the same operator question as the other two — "why is hap using this
+// much disk" — and audit_log is an append-only log table whose pane excerpts
+// (~3.8 KiB of a 5.0 KiB row) dominate the database.
+type Logging struct {
+	// Level is the minimum severity written to the plugin log:
+	// "debug", "info" (default), "warn" or "error". An unknown value falls
+	// back to the default rather than silencing the log.
+	//
+	// HAP_DEBUG=1 still forces debug and outranks this, so an operator can
+	// raise verbosity for one run without editing the file.
+	//
+	// Read once per process, at logging.Setup — unlike most of this file, a
+	// change does NOT take effect on the daemon's config reload. The slog
+	// default handler is installed at startup and swapping it under running
+	// goroutines is not worth the race for a diagnostic setting; restart the
+	// daemon (`hap daemon --ensure`) to apply it.
+	Level string `toml:"level,omitempty"`
+	// MaxSizeMB caps the plugin log before it rotates to a single ".old"
+	// sibling, so roughly twice this is kept on disk. 0 uses the default.
+	// Read once per process, like Level.
+	MaxSizeMB int `toml:"max_size_mb,omitempty"`
+	// AuditExcerptRetentionDays is how many days an audit row keeps its
+	// captured pane excerpt. Past that the excerpt is blanked while the row
+	// itself — action, rationale, status — is kept, so `hap audit` history
+	// stays complete.
+	//
+	// Three cases, and 0 is a real setting rather than "unset":
+	//   - absent   → DefaultAuditExcerptRetentionDays
+	//   - 0        → keep NO excerpts; every eligible row is blanked. Reads the
+	//                way it looks: retain for zero days.
+	//   - negative → never prune, keeping every excerpt forever (the behaviour
+	//                before this setting existed).
+	//
+	// A POINTER because absent and 0 mean different things and a plain int
+	// cannot tell them apart — fillZeroes would read the operator's 0 as
+	// "unset" and quietly substitute the default. Negative is the "off" switch
+	// for the same reason 0 could not be: it is already taken. That also
+	// matches journal_size_limit's convention right above.
+	//
+	// Rows the daemon may still READ are never touched whatever this says, and
+	// the cutoff is floored at AuditExcerptDedupMargin, so even 0 cannot reach
+	// a row being compared against this second. See store.PruneAuditExcerpts,
+	// where both are safety controls.
+	AuditExcerptRetentionDays *int `toml:"audit_excerpt_retention_days,omitempty"`
+}
+
+// AuditExcerptRetention returns the excerpt retention window and whether the
+// sweep runs at all. A zero window with ok=true means "keep no excerpts", which
+// is different from ok=false ("never prune") — the store still floors the
+// cutoff, so zero prunes everything OLDER THAN that safety margin.
+func (l Logging) AuditExcerptRetention() (time.Duration, bool) {
+	days := DefaultAuditExcerptRetentionDays
+	if l.AuditExcerptRetentionDays != nil {
+		days = *l.AuditExcerptRetentionDays
+	}
+	if days < 0 {
+		return 0, false
+	}
+	return time.Duration(days) * 24 * time.Hour, true
+}
+
+// DefaultAuditExcerptRetentionDays is how long excerpts are kept when the
+// operator has not said. Roughly how far back `hap audit` is realistically read.
+const DefaultAuditExcerptRetentionDays = 14
+
+// ValidLogLevels are the accepted Logging.Level values. "warning" is a synonym
+// for "warn" and must stay listed: SlogLevel accepts it, so leaving it out made
+// fillZeroes silently rewrite an operator's "warning" to "info" — quietly
+// RAISING verbosity from what they asked for.
+var ValidLogLevels = []string{"debug", "info", "warn", "warning", "error"}
+
+// SlogLevel maps Level onto slog, defaulting to Info for an empty or unknown
+// value — an operator typo must not silence the log.
+func (l Logging) SlogLevel() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(l.Level)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
 // TUI configures the terminal UI's presentation (DR-003).
 type TUI struct {
 	// MaxContentWidth caps the character width of variable-length columns
@@ -747,6 +838,7 @@ type Config struct {
 	Escalations Escalations      `toml:"escalations,omitempty"`
 	LLM         LLM              `toml:"llm"`
 	Embedding   Embedding        `toml:"embedding"`
+	Logging     Logging          `toml:"logging"`
 	TUI         TUI              `toml:"tui"`
 	CLI         CLI              `toml:"cli"`
 	TaskSources []TaskSource     `toml:"task_sources"`
@@ -786,8 +878,14 @@ func Default() Config {
 			// the domain owns the number, and config stays decoupled from it.
 			// domain.EmbeddableSalient resolves 0 to DefaultMinSalientChars.
 		},
-		TUI: TUI{TerminalBell: true, HerdrNotification: true, MaxInstances: 1},
-		CLI: CLI{AIAgentFriendlyOutput: true},
+		// 16 MiB, not the 64 MiB this replaces: at 64 the log alone could
+		// legitimately hold 128 MiB with its ".old" sibling, which is a large
+		// reservation for a diagnostic file. Retention is left nil so
+		// AuditExcerptRetention supplies the default — an explicit 0 there is
+		// the operator turning the sweep OFF, and must survive fillZeroes.
+		Logging: Logging{Level: "info", MaxSizeMB: 16},
+		TUI:     TUI{TerminalBell: true, HerdrNotification: true, MaxInstances: 1},
+		CLI:     CLI{AIAgentFriendlyOutput: true},
 	}
 }
 
@@ -1253,6 +1351,17 @@ func (c *Config) fillZeroes() {
 	if w := c.Learning.ConfirmationWeight; w < 1 || math.IsNaN(w) || math.IsInf(w, 0) {
 		c.Learning.ConfirmationWeight = d.Learning.ConfirmationWeight
 	}
+	// An unknown level falls back rather than silencing the log: SlogLevel
+	// already defaults unknown values to Info, so normalize the stored string
+	// too and the operator sees what is actually in effect.
+	if !slices.Contains(ValidLogLevels, strings.ToLower(strings.TrimSpace(c.Logging.Level))) {
+		c.Logging.Level = d.Logging.Level
+	}
+	if c.Logging.MaxSizeMB <= 0 {
+		c.Logging.MaxSizeMB = d.Logging.MaxSizeMB
+	}
+	// Logging.AuditExcerptRetentionDays is deliberately absent here: it is a
+	// pointer precisely so an explicit 0 ("never prune") survives this pass.
 	c.normalizeTaskSources()
 	if c.Limits.MaxConsecutiveAutoPrompts <= 0 {
 		c.Limits.MaxConsecutiveAutoPrompts = d.Limits.MaxConsecutiveAutoPrompts

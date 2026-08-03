@@ -16,6 +16,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -107,8 +108,26 @@ func (s *Subscriber) Subscribe(ctx context.Context, out chan<- domain.AgentTrans
 	return ctx.Err()
 }
 
+// errPaneSetChanged marks the two returns that are ORDINARY CONTROL FLOW, not a
+// fault: the status loop unwinds on purpose whenever the pane set changes, so it
+// can resubscribe to the new set. Every pane open, close, split and
+// agent-detection produces one.
+//
+// It is a sentinel rather than a bare error because loop() must tell the two
+// apart, and conflating them cost twice over: every routine pane split logged a
+// WARN reading "connection lost", and — worse — it advanced the reconnect
+// backoff. Since the healthy-stretch reset needs a full uninterrupted minute
+// (rare on a busy herd), ordinary churn ratcheted the delay to the 30s cap and
+// hap went BLIND to status events for that long after a normal split.
+var errPaneSetChanged = errors.New("pane set changed")
+
 // loop runs fn with exponential backoff, resetting the backoff after a
 // connection that stayed healthy for a while.
+//
+// An expected resubscribe (errPaneSetChanged) is exempt from both: it logs at
+// Debug and leaves the backoff where it was, so pane churn can neither fill the
+// log nor slow reconnection. It reconnects immediately — there is nothing to
+// back off from.
 func (s *Subscriber) loop(ctx context.Context, name string, fn func(context.Context) error) {
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
@@ -120,6 +139,19 @@ func (s *Subscriber) loop(ctx context.Context, name string, fn func(context.Cont
 		err := fn(ctx)
 		if ctx.Err() != nil {
 			return
+		}
+		if errors.Is(err, errPaneSetChanged) {
+			// Reaching here at all means the subscribe SUCCEEDED and then ran
+			// until the pane set moved — positive evidence the connection is
+			// healthy, so reset the ladder rather than merely not advancing it.
+			// Without this, a backoff ratcheted by an earlier real outage stays
+			// at up to 30s: the healthy-stretch reset below needs a full
+			// uninterrupted minute, and `started` restarts every iteration, so
+			// on a herd with sub-minute churn it can never fire.
+			backoff = time.Second
+			slog.Debug("herdr pane set changed; resubscribing",
+				"loop", name, "error", err)
+			continue
 		}
 		if time.Since(started) > time.Minute {
 			backoff = time.Second // healthy stretch: reset the backoff
@@ -221,7 +253,7 @@ func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTrans
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-s.dirty:
-			return fmt.Errorf("pane set changed")
+			return errPaneSetChanged
 		}
 	}
 
@@ -279,7 +311,7 @@ func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTrans
 		return nil
 	})
 	if ctx.Err() == nil && streamCtx.Err() != nil {
-		return fmt.Errorf("pane set changed; resubscribing")
+		return fmt.Errorf("resubscribing: %w", errPaneSetChanged)
 	}
 	return err
 }
