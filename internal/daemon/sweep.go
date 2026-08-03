@@ -452,7 +452,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 	d.spawn(func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery", func() error {
-			d.withAgentAutomation(ctx, s, sig, tr, dec.Input, dec.Confidence, nil, "", now, func() {
+			d.withAgentAutomation(ctx, s, sig, tr, dec.Input, dec.Confidence, nil, "", "", now, func() {
 				auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 					AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 					SituationType: s.Type, Action: "auto:" + dec.Input, Input: dec.Input,
@@ -528,13 +528,14 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 		defer d.releasePane(s.AgentID)
 		logging.Guard("series-delivery-llm", func() error {
 			executed := d.withAgentAutomation(ctx, s, sig, tr, llmDec.Action,
-				confidence, llmConfidence, llmDec.CapturedOutput, now, func() {
+				confidence, llmConfidence, llmDec.CapturedOutput, llmDec.SessionID, now, func() {
 					auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 						AgentID: s.AgentID, AgentType: s.AgentType, Trigger: "llm-fallback",
 						SituationType: s.Type, Action: domain.AuditActionAutoPrefix + llmDec.Action, Input: llmDec.Action,
 						Confidence: confidence, LLMConfidence: llmConfidence,
 						Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
-						Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+						LLMSessionID: llmDec.SessionID,
+						Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 					}.WithSignatureBaseline(sig))
 					if err != nil {
 						slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)
@@ -617,7 +618,7 @@ func (d *Daemon) deliverRemoteEnv(ctx context.Context, ks ports.KeystrokeSender,
 	d.spawn(func() {
 		defer d.releasePane(s.AgentID)
 		logging.Guard("remote-env-delivery", func() error {
-			d.withAgentAutomation(ctx, s, sig, tr, dec.Input, dec.Confidence, nil, "", now, func() {
+			d.withAgentAutomation(ctx, s, sig, tr, dec.Input, dec.Confidence, nil, "", "", now, func() {
 				auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 					AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 					SituationType: s.Type, Action: domain.AuditActionAutoPrefix + dec.Input, Input: dec.Input,
@@ -676,13 +677,14 @@ func (d *Daemon) deliverRemoteEnvLLM(ctx context.Context, ks ports.KeystrokeSend
 		defer d.releasePane(s.AgentID)
 		logging.Guard("remote-env-delivery-llm", func() error {
 			executed := d.withAgentAutomation(ctx, s, sig, tr, llmDec.Action,
-				confidence, llmConfidence, llmDec.CapturedOutput, now, func() {
+				confidence, llmConfidence, llmDec.CapturedOutput, llmDec.SessionID, now, func() {
 					auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 						AgentID: s.AgentID, AgentType: s.AgentType, Trigger: "llm-fallback",
 						SituationType: s.Type, Action: domain.AuditActionAutoPrefix + llmDec.Action, Input: llmDec.Action,
 						Confidence: confidence, LLMConfidence: llmConfidence,
 						Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
-						Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+						LLMSessionID: llmDec.SessionID,
+						Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 					}.WithSignatureBaseline(sig))
 					if err != nil {
 						slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)

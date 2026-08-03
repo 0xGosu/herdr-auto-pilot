@@ -651,8 +651,18 @@ type LLMDecision struct {
 	// decision, 0-100; -1 means the agent did not report one.
 	ConfidentScore int
 	CapturedOutput string
-	Status         string // pending | accepted | rejected | expired
-	CreatedAt      time.Time
+	// SessionID is the CLI conversation this decision came out of — the name
+	// of the transcript file the run left behind.
+	//
+	// TRANSIENT, like CapturedOutput is on the way out: the adapter stamps it
+	// after the run, and it is not a column on llm_decisions. Reading a
+	// decision back from the store yields an empty one. It rides here so every
+	// delivery path that already holds the decision can name the conversation
+	// without threading a parameter through four more signatures; the paths
+	// that have no decision (a consult that FAILED) use LLMRequest.SessionID.
+	SessionID string
+	Status    string // pending | accepted | rejected | expired
+	CreatedAt time.Time
 }
 
 // LLMRequest is the daemon-staged context for one LLM consultation.

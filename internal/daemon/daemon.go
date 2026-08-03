@@ -1653,7 +1653,7 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 			d.escalate(ctx, situation, sig, decision, tr, now)
 		} else {
 			d.auditAgentDisabled(ctx, situation, sig, tr, decision.Input,
-				decision.Confidence, nil, "", now)
+				decision.Confidence, nil, "", "", now)
 		}
 		return
 	}
@@ -1931,7 +1931,10 @@ type delivery struct {
 	input     string // audit Input and the "auto:" action label
 	rationale string
 	llmOutput string // LLM review diagnostics, when applicable
-	learned   string // ChosenAction recorded for learning
+	// llmSessionID names the CLI conversation behind llmOutput — the
+	// transcript that review left behind. Empty when no LLM was involved.
+	llmSessionID string
+	learned      string // ChosenAction recorded for learning
 	// llmConfidence is the review LLM's self-reported score (0-100) for the
 	// audit row; nil when no LLM was involved or none was reported. Recorded
 	// for observability only — the action-review path never gates on it.
@@ -2019,7 +2022,7 @@ func (d *Daemon) advanceAutoPromptRate(ctx context.Context, agentID string, idle
 func (d *Daemon) deliverAutonomous(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, del delivery, now time.Time) bool {
 	sent := false
-	executed := d.withAgentAutomation(ctx, s, sig, tr, del.input, dec.Confidence, del.llmConfidence, del.llmOutput, now,
+	executed := d.withAgentAutomation(ctx, s, sig, tr, del.input, dec.Confidence, del.llmConfidence, del.llmOutput, del.llmSessionID, now,
 		func() { sent = d.deliverAutonomousClaimed(ctx, s, sig, dec, tr, del, now) })
 	if !executed && del.rollback != nil {
 		// The lifecycle barrier refused (the agent was disabled mid-flight, or
@@ -2083,7 +2086,8 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		SituationType: s.Type, Action: domain.AuditActionAutoPrefix + del.input, Input: del.input,
 		Confidence: dec.Confidence, LLMConfidence: del.llmConfidence,
 		Rationale: del.rationale, LLMOutput: del.llmOutput,
-		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+		LLMSessionID: del.llmSessionID,
+		Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	}.WithSignatureBaseline(sig))
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
@@ -2274,7 +2278,7 @@ func (d *Daemon) deliverNoop(ctx context.Context, s domain.Situation, sig domain
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
 	// Nothing is sent, so the pairing is spent — release it (see escalate).
 	d.dropAutoTaskClaim(s.AgentID)
-	d.withAgentAutomation(ctx, s, sig, tr, "", dec.Confidence, nil, "", now,
+	d.withAgentAutomation(ctx, s, sig, tr, "", dec.Confidence, nil, "", "", now,
 		func() { d.deliverNoopClaimed(ctx, s, sig, dec, tr, now) })
 }
 
@@ -2338,14 +2342,15 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 	// resolve as accepted for it.
 	applied := false
 	executed := d.withAgentAutomation(ctx, s, res.sig, res.tr, "", res.dec.Confidence, llmConf,
-		domain.ActionNoop, now, func() {
+		domain.ActionNoop, res.request.SessionID, now, func() {
 			auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 				AgentID: s.AgentID, AgentType: s.AgentType,
 				Trigger: trigger(res.tr), SituationType: s.Type, Action: "noop", Input: "",
 				Confidence: res.dec.Confidence, LLMConfidence: llmConf,
-				Rationale: rationale,
-				LLMOutput: domain.ActionNoop,
-				Status:    "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
+				Rationale:    rationale,
+				LLMOutput:    domain.ActionNoop,
+				LLMSessionID: res.request.SessionID,
+				Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
 				CreatedAt: now,
 			}.WithSignatureBaseline(res.sig))
 			if err != nil {
@@ -2544,13 +2549,14 @@ func (d *Daemon) escalationAutoDismissReason(ctx context.Context, agentID string
 // rationale tag is intentionally stable for audit consumers.
 func (d *Daemon) auditAgentDisabled(ctx context.Context, s domain.Situation,
 	sig domain.SignatureResult, tr domain.AgentTransition, input string,
-	confidence float64, llmConfidence *int, llmOutput string, now time.Time) {
+	confidence float64, llmConfidence *int, llmOutput, llmSessionID string, now time.Time) {
 	d.audit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Signature: sig.Signature,
 		Trigger: trigger(tr), SituationType: s.Type,
 		Action: domain.AuditActionDenied, Input: input, Confidence: confidence,
 		LLMConfidence: llmConfidence, LLMOutput: llmOutput,
-		Rationale: "[agent_disabled]", Status: "denied",
+		LLMSessionID: llmSessionID,
+		Rationale:    "[agent_disabled]", Status: "denied",
 		PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 	})
 	slog.Info("autonomous action denied: agent disabled",
@@ -2563,7 +2569,7 @@ func (d *Daemon) auditAgentDisabled(ctx context.Context, s domain.Situation,
 // disable commits, or is denied wholly after it.
 func (d *Daemon) withAgentAutomation(ctx context.Context, s domain.Situation,
 	sig domain.SignatureResult, tr domain.AgentTransition, input string,
-	confidence float64, llmConfidence *int, llmOutput string, now time.Time,
+	confidence float64, llmConfidence *int, llmOutput, llmSessionID string, now time.Time,
 	fn func()) bool {
 	disabled, err := d.opt.Store.WithAgentAutomation(ctx, s.AgentID, fn)
 	if err != nil {
@@ -2574,7 +2580,7 @@ func (d *Daemon) withAgentAutomation(ctx context.Context, s domain.Situation,
 		return false
 	}
 	if disabled {
-		d.auditAgentDisabled(ctx, s, sig, tr, input, confidence, llmConfidence, llmOutput, now)
+		d.auditAgentDisabled(ctx, s, sig, tr, input, confidence, llmConfidence, llmOutput, llmSessionID, now)
 		return false
 	}
 	return true
@@ -3344,7 +3350,7 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 	now := d.opt.Clock.Now()
 	if disabled, err := d.opt.Store.AgentDisabled(ctx, s.AgentID); err == nil && disabled {
 		d.auditAgentDisabled(ctx, s, res.sig, res.tr, res.dec.Input,
-			res.dec.Confidence, llmConf, reviewed, now)
+			res.dec.Confidence, llmConf, reviewed, res.request.SessionID, now)
 		if res.decision != nil {
 			d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "rejected")
 		}
@@ -3573,6 +3579,7 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 		input:         final,
 		rationale:     fmt.Sprintf("%s; %s (original: %q)", res.dec.Rationale, note, original),
 		llmOutput:     llmOutput,
+		llmSessionID:  res.request.SessionID,
 		learned:       res.learned,
 		llmConfidence: llmConf,
 	}, now)
@@ -3846,13 +3853,14 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		// so nothing is stranded.
 		d.dropAutoTaskClaim(s.AgentID)
 		executed := d.withAgentAutomation(ctx, s, res.sig, tr, "",
-			computedConf, &llmConf, llmDec.CapturedOutput, now, func() {
+			computedConf, &llmConf, llmDec.CapturedOutput, llmDec.SessionID, now, func() {
 				if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 					AgentID: s.AgentID, AgentType: s.AgentType, Signature: res.sig.Signature, Trigger: "llm-fallback",
 					SituationType: s.Type, Action: "noop", Input: "",
 					Confidence: computedConf, LLMConfidence: &llmConf,
 					Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
-					Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+					LLMSessionID: res.request.SessionID,
+					Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 				}); err != nil {
 					slog.Error("audit write failed; blocking LLM noop (FR-024)", "error", err)
 					d.notify(ctx, "Herd Auto Prompter: persistence failure",
@@ -4022,13 +4030,14 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	}
 
 	executed := d.withAgentAutomation(ctx, s, res.sig, tr, llmDec.Action,
-		computedConf, &llmConf, llmDec.CapturedOutput, now, func() {
+		computedConf, &llmConf, llmDec.CapturedOutput, llmDec.SessionID, now, func() {
 			auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 				AgentID: s.AgentID, AgentType: s.AgentType, Trigger: "llm-fallback",
 				SituationType: s.Type, Action: domain.AuditActionAutoPrefix + llmDec.Action, Input: llmDec.Action,
 				Confidence: computedConf, LLMConfidence: &llmConf,
 				Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
-				Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+				LLMSessionID: res.request.SessionID,
+				Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
 			}.WithSignatureBaseline(res.sig))
 			if err != nil {
 				slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)

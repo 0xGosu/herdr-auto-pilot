@@ -196,6 +196,9 @@ func (a *Adapter) ConsultWithSession(ctx context.Context, req domain.LLMRequest)
 		return nil, att.sessionID, base
 	}
 	att.dec.CapturedOutput = att.captured
+	// Stamped alongside the captured output, and for the same reason: the
+	// delivery paths downstream hold the decision, not the request.
+	att.dec.SessionID = att.sessionID
 	return att.dec, att.sessionID, nil
 }
 

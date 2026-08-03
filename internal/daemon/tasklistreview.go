@@ -303,6 +303,7 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 			action: action, reason: reason, why: why,
 			taskText: res.del.taskText, sourceRef: res.del.declared.Path,
 			llmConfidence: llmConf, proposal: proposal,
+			sessionID: res.request.SessionID,
 			llmOutput: decisionOutput(res.decision),
 		}, now)
 		if res.decision != nil {
@@ -459,6 +460,7 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 			applied:  out.Applied,
 			taskText: res.del.taskText, sourceRef: res.del.declared.Path,
 			llmConfidence: llmConf, proposal: proposal, llmOutput: decisionOutput(res.decision),
+			sessionID: res.request.SessionID,
 		}, now)
 		if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "accepted"); err != nil {
 			slog.Error("llm decision status update failed", "error", err)
@@ -481,6 +483,7 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 		applied:  out.Applied,
 		taskText: out.SentText, sourceRef: res.del.declared.Path,
 		llmConfidence: llmConf, proposal: proposal, llmOutput: decisionOutput(res.decision),
+		sessionID: res.request.SessionID,
 	}, now)
 
 	del := res.del
@@ -533,6 +536,7 @@ func (d *Daemon) standDown(ctx context.Context, res taskListReviewOutcome,
 		action: domain.AuditActionTaskReviewFailed, reason: reason, why: why,
 		taskText: res.del.taskText, sourceRef: res.del.declared.Path,
 		llmConfidence: llmConf, proposal: proposal, llmOutput: decisionOutput(res.decision),
+		sessionID: res.request.SessionID,
 	}, now)
 	if res.decision != nil {
 		if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "rejected"); err != nil {
@@ -630,6 +634,9 @@ type taskReviewAudit struct {
 	llmConfidence *int
 	proposal      string
 	llmOutput     string
+	// sessionID names the CLI conversation this review ran as — the transcript
+	// it left behind. Empty when the review never reached an LLM.
+	sessionID string
 }
 
 // auditTaskReview records one review outcome under its own trigger.
@@ -668,7 +675,8 @@ func (d *Daemon) auditTaskReview(ctx context.Context, s domain.Situation, sig do
 		Trigger: domain.TriggerLLMTaskReview, SituationType: s.Type,
 		Action: a.action, Input: domain.FormatAppliedTaskActions(a.applied),
 		Confidence: 0, LLMConfidence: a.llmConfidence,
-		Rationale: strings.TrimSpace(rationale), LLMOutput: a.llmOutput,
+		LLMSessionID: a.sessionID,
+		Rationale:    strings.TrimSpace(rationale), LLMOutput: a.llmOutput,
 		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
 		CreatedAt: now,
 	}); err != nil {
