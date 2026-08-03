@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.26
+
+- Added an idle back-off to `hap tui`: after 10 minutes with no keypress and nothing changing, it polls every 30 seconds instead of every 2, and repaints the Age column every 10 seconds instead of every 1. A pane left open overnight stops costing a full store read and two herdr round trips every 2 seconds — measured at about a third of the idle CPU it used before.
+- Any keypress or pane resize returns it to the live cadence at once and refreshes immediately. Agent status changes, new escalations, task-list progress, and daemon health changes also restore it, but are only noticed by the poll that finds them, so while backed off they can be up to 30 seconds late — including the TUI's own escalation bell. The daemon raises its own herdr notification independently, so no alert is lost.
+
 ## 0.5.25
 
 - Fixed `hap tui` burning a quarter of a CPU core the whole time it was open, doing nothing. Listing learned rules re-read and re-parsed `config.toml` once per rule, so each 2-second refresh spent most of its time decoding the same file over and over. Measured on a 196-rule state directory, an idle TUI now costs about a sixth of what it did.
