@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.28
+
+- Added a session id to every LLM invocation, recorded on the audit row it produced. A decision can now be traced to the transcript the CLI wrote for it — previously nothing linked the two, so there was no way to tell which consult produced a given escalation.
+- Added the `{session_id}` command placeholder. For `claude`, hap appends `--session-id {session_id}` on its own; write the placeholder yourself only to place it differently, which turns the automatic injection off. `codex` has no such flag and is never passed one — hap reads the id back from its startup banner instead. Any other CLI gets nothing added, since a guessed flag name would fail every consult.
+- The id is recorded for failed consults too: a timeout or a no-submit still wrote a transcript, and still raises an escalation.
+
 ## 0.5.27
 
 - Added `hap gc` — reclaims disk from hap's own records on demand, with `--dry-run` to see the window first and `--days N` to override it. It blanks the captured pane excerpt on aged audit rows (the bulk of the database: ~3.8 KiB of a 5.0 KiB row) while keeping the rows themselves, so `hap audit` history stays complete. Rows the daemon may still read are never touched — pending escalations at any age, rows with an unprocessed LLM retry, and recently answered asks.
