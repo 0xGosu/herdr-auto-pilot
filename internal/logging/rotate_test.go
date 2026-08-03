@@ -106,7 +106,7 @@ func TestRotatingFileReattachesAfterForeignRotation(t *testing.T) {
 
 func TestSetupLogsToRotatingFile(t *testing.T) {
 	dir := t.TempDir()
-	logger, err := Setup(dir, false)
+	logger, err := Setup(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

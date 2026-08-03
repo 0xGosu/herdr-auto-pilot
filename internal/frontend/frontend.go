@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1615,6 +1616,9 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "embedding.model_context_window", TUIEditable: true},
 	{Key: "embedding.embed_timeout_ms", TUIEditable: true},
 	{Key: "embedding.warm_timeout_ms", TUIEditable: true, TUIHidden: true},
+	{Key: "logging.level", TUIEditable: true},
+	{Key: "logging.max_size_mb", TUIEditable: true},
+	{Key: "logging.audit_excerpt_retention_days", TUIEditable: true},
 	{Key: "tui.max_content_width", TUIEditable: true},
 	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
@@ -1773,6 +1777,20 @@ func FieldValue(cfg config.Config, key string) string {
 			return fmt.Sprintf("%d (default)", domain.DefaultPaneSalientChars)
 		}
 		return strconv.Itoa(cfg.Embedding.PaneSalientChars)
+	case "logging.level":
+		return cfg.Logging.Level
+	case "logging.max_size_mb":
+		return strconv.Itoa(cfg.Logging.MaxSizeMB)
+	case "logging.audit_excerpt_retention_days":
+		// nil and 0 are different answers here: absent takes the default,
+		// an explicit 0 is the operator turning the sweep off.
+		if cfg.Logging.AuditExcerptRetentionDays == nil {
+			return fmt.Sprintf("%d (default)", config.DefaultAuditExcerptRetentionDays)
+		}
+		if *cfg.Logging.AuditExcerptRetentionDays <= 0 {
+			return "0 (never prune)"
+		}
+		return strconv.Itoa(*cfg.Logging.AuditExcerptRetentionDays)
 	case "limits.max_consecutive_auto_prompts":
 		return strconv.Itoa(cfg.Limits.MaxConsecutiveAutoPrompts)
 	case "limits.max_auto_prompts_per_minute":
@@ -2207,6 +2225,26 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("tui.disable_check_for_update must be true or false, got %q", value)
 			}
 			cfg.TUI.DisableCheckForUpdate = v
+			return nil
+		case "logging.level":
+			lv := strings.ToLower(value)
+			if !slices.Contains(config.ValidLogLevels, lv) {
+				return fmt.Errorf("logging.level must be one of %s, got %q",
+					strings.Join(config.ValidLogLevels, "|"), value)
+			}
+			cfg.Logging.Level = lv
+			return nil
+		case "logging.max_size_mb":
+			return setInt(&cfg.Logging.MaxSizeMB)
+		case "logging.audit_excerpt_retention_days":
+			// 0 is "never prune" here, not "restore the default" — same rule as
+			// tui.max_instances below, and the reason the field is a pointer.
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("logging.audit_excerpt_retention_days must be a "+
+					"non-negative integer (0 = never prune), got %q", value)
+			}
+			cfg.Logging.AuditExcerptRetentionDays = &v
 			return nil
 		case "tui.max_instances":
 			// 0 is "no limit" here, not "restore the default" — the default

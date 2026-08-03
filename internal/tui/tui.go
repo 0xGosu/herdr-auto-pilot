@@ -30,6 +30,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/updatecheck"
 )
@@ -1264,7 +1265,10 @@ func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 	// not allowed to fail the refresh — an unenforceable limit is a slow TUI,
 	// not a broken one.
 	if sweep, err := app.EnforceTUISessionLimit(); err != nil {
-		slog.Warn("TUI instance limit not enforced", "error", err)
+		// Once per process: refreshData runs on a 2s tick, so a registry error
+		// that persists (an unwritable state dir, a stale lock) would otherwise
+		// write 43,200 identical lines a day into the daemon's log file.
+		logging.WarnOnce("tui-session-limit", "TUI instance limit not enforced", "error", err)
 	} else {
 		msg.tuiLimit = sweep
 	}

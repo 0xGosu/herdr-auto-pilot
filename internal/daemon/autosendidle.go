@@ -242,7 +242,13 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 			if i >= len(pending) {
 				// More idle agents than remaining work: the rest wait for the
 				// list to refill rather than share a task.
-				slog.Info("auto-send: no pending task left for idle agent",
+				//
+				// Debug, not Info: this is a steady STATE, not an event, and the
+				// break below happens before noteRedrive — so these agents never
+				// enter the pollRedrive backoff and nothing ages them out. At
+				// Info it was one line per minute per source, forever, whenever
+				// idle agents outnumbered pending work.
+				slog.Debug("auto-send: no pending task left for idle agent",
 					"agent", a.AgentID, "source", src.Path)
 				break
 			}

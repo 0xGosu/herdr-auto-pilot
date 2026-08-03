@@ -62,6 +62,23 @@ type InspectorPort interface {
 	PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, error)
 }
 
+// RetentionPort is implemented by stores that can bound their own on-disk
+// growth. Optional: callers type-assert and simply skip the sweep when absent,
+// so an in-memory or fake store needs no retention support to be usable.
+//
+// PruneAuditExcerpts blanks the captured pane excerpt on audit rows older than
+// cutoff and returns how many it cleared. It KEEPS the rows — only the column
+// is emptied — and never touches a row the daemon may still read (see the
+// implementation, where that exclusion is a safety control, not a nicety).
+//
+// FreelistPages and Vacuum are the pair that turns that into reclaimed disk:
+// blanking frees pages inside the file, and only a rebuild returns them.
+type RetentionPort interface {
+	PruneAuditExcerpts(ctx context.Context, now, cutoff time.Time) (int64, error)
+	FreelistPages(ctx context.Context) (int64, error)
+	Vacuum(ctx context.Context) error
+}
+
 // VisiblePaneReader is implemented by Herdr adapters that can read the pane's
 // current on-screen content (as opposed to ReadPane's consuming "recent"
 // delta). Used to recover a standing numbered menu when delivering an

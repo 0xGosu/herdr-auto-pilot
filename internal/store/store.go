@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,6 +36,11 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
+
+// walSizeLimit caps the write-ahead log after each checkpoint. SQLite's default
+// (-1) never shrinks the WAL, so it stays at whatever peak any one transaction
+// reached for the life of the file.
+const walSizeLimit = 64 << 20 // 64 MiB
 
 // Store is the SQLite-backed implementation of ports.StorePort.
 type Store struct {
@@ -51,6 +57,12 @@ func Open(path string) (*Store, error) {
 			"journal_mode(WAL)",
 			"synchronous(NORMAL)",
 			"foreign_keys(ON)",
+			// Truncate the WAL back to this after a checkpoint instead of
+			// leaving it at its high-water mark forever (the default, -1, is
+			// unbounded). A live state directory carried a 4 MiB WAL beside an
+			// 8 MiB database; PruneAuditExcerpts rewrites hundreds of rows in
+			// one transaction and would push that mark higher still.
+			"journal_size_limit(" + strconv.Itoa(walSizeLimit) + ")",
 		},
 	}.Encode()
 	db, err := sql.Open("sqlite", dsn)
@@ -1652,6 +1664,114 @@ func (s *Store) PendingEscalations(ctx context.Context) ([]domain.AuditRecord, e
 		return nil, err
 	}
 	return s.scanAudits(rows)
+}
+
+// AuditExcerptDedupMargin is how far back PruneAuditExcerpts spares a row whose
+// reply was delivered recently, and the floor it clamps its own cutoff to.
+//
+// It MUST stay >= the daemon's escalationDedupWindow, which is what group 2 of
+// PendingEscalationExcerpts is measured against. The relationship cannot be
+// expressed in the type system (store cannot import daemon — daemon imports
+// store), so TestEscalationDedupWindowFitsAuditExcerptMargin asserts it instead.
+// The margin is deliberately far larger than that window: the cost of sparing a
+// row is a few KB, and the cost of blanking a live one is a broken dedup.
+const AuditExcerptDedupMargin = time.Hour
+
+// PruneAuditExcerpts blanks pane_excerpt on audit rows older than cutoff,
+// returning how many rows it cleared. Rows are KEPT — only the column is
+// emptied, so `hap audit` history, rationales and statuses all survive while the
+// table sheds the bulk of its bytes (a live database measured 3.8 KB of excerpt
+// per 5.0 KB row: 76% of the table).
+//
+// Blanking is safe only for rows nothing reads again, and TWO live paths still
+// read this column. Both exclusions below are safety controls, not tidiness:
+//
+//   - status 'escalated' AND 'auto_accepting', at ANY age. The first is what
+//     AutoAcceptableEscalations selects and what group 1 of
+//     PendingEscalationExcerpts reads, both unbounded in time; the second is
+//     the SAME row mid-delivery (ClaimForAutoAccept moves it there and
+//     RevertAutoAccept moves it back), so excluding only 'escalated' would let
+//     a claimed row be blanked and then returned to the pending queue with no
+//     excerpt. autoAcceptDeliver passes rec.PaneExcerpt into deliver.Request,
+//     where an unreadable pane refuses delivery ONLY when that excerpt proves a
+//     menu was standing; with no such evidence the literal send still stands,
+//     and a literal reply typed at a live menu commits option 1. Auto-accept
+//     fires on AGED escalations by design, so age is precisely the wrong thing
+//     to blank here.
+//
+//   - rows with a correction delivered within AuditExcerptDedupMargin, and rows
+//     with an unprocessed llm_retries row. These mirror group 2 and the retry
+//     exclusion of PendingEscalationExcerpts. A correction is written when the
+//     OPERATOR answers, which can be days after the audit row was created — so
+//     an old row can enter the dedup set at any moment, and the cutoff alone
+//     cannot rule it out.
+//
+// The cutoff is clamped to at least AuditExcerptDedupMargin in the past, so a
+// misconfigured retention of "0 days" cannot reach rows the daemon is still
+// comparing against this second.
+//
+// ACCEPTED TRADE-OFF, for the one reader not excluded above: frontend.Resolve
+// (`hap resolve --send`, the TUI confirm, MCP submit_decision) also passes a
+// stored excerpt into deliver.Request, and it works on terminal rows — exactly
+// what this blanks. The exposure is narrow, because the excerpt is consulted
+// ONLY when the LIVE pane read fails (deliver.go): correcting a blanked row
+// against a readable pane is unaffected. When the read DOES fail, a blanked row
+// behaves like a pre-migration row that never captured an excerpt, which
+// deliver already treats as "send the literal" by design. Correcting a row
+// older than the retention window is rare enough to accept that; keeping every
+// terminal row's excerpt forever to cover it is what made the table unbounded.
+func (s *Store) PruneAuditExcerpts(ctx context.Context, now, cutoff time.Time) (int64, error) {
+	if latest := now.Add(-AuditExcerptDedupMargin); cutoff.After(latest) {
+		cutoff = latest
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE audit_log SET pane_excerpt = ''
+			WHERE pane_excerpt != ''
+			  AND created_at < ?
+			  AND status NOT IN ('escalated', ?)
+			  AND NOT EXISTS (SELECT 1 FROM llm_retries r
+					WHERE r.audit_id = audit_log.id AND r.processed = 0)
+			  AND NOT EXISTS (SELECT 1 FROM corrections c
+					WHERE c.audit_id = audit_log.id AND c.sent = 1
+					  AND c.created_at >= ?)`,
+		unix(cutoff), domain.AuditStatusAutoAccepting, unix(now.Add(-AuditExcerptDedupMargin)))
+	if err != nil {
+		return 0, fmt.Errorf("prune audit excerpts: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// FreelistPages reports how many pages the database has freed but not returned
+// to the filesystem. PruneAuditExcerpts empties a column in place, so the bytes
+// become free pages INSIDE the file and `du` does not move until a VACUUM runs
+// (the database is auto_vacuum=0, where deletes never shrink the file).
+func (s *Store) FreelistPages(ctx context.Context) (int64, error) {
+	var n int64
+	if err := s.db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("read freelist: %w", err)
+	}
+	return n, nil
+}
+
+// Vacuum rebuilds the database, returning the freed pages to the filesystem.
+//
+// It takes a write lock for the whole rebuild, so it must never run on the
+// daemon's select loop (CLAUDE.md: don't stall the main loop) — callers run it
+// from a goroutine, and only when FreelistPages says there is something to
+// reclaim.
+func (s *Store) Vacuum(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
+		return fmt.Errorf("vacuum: %w", err)
+	}
+	// Fold the WAL back into the database and truncate it. Without this the
+	// rebuild VACUUM just wrote through the WAL stays there, and the state
+	// directory measures BIGGER right after a reclaim — the pages are freed in
+	// the database while an equally large WAL sits beside it. journal_size_limit
+	// caps the WAL only at a checkpoint, and nothing else forces one here.
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("checkpoint after vacuum: %w", err)
+	}
+	return nil
 }
 
 // PendingEscalationDedupLimit bounds how many pending escalations the daemon

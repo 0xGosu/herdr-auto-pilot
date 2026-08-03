@@ -726,6 +726,9 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 		fmt.Fprintf(out, "last kill event:     %s by %s at %s\n",
 			st.LatestKill.State, st.LatestKill.Author, st.LatestKill.CreatedAt.Format(time.RFC3339))
 	}
+	if cfg, err := config.Load(app.ConfigPath); err == nil {
+		printDiskLine(out, app.StateDir, cfg)
+	}
 	// The footer is built from what this status actually found, so the first
 	// suggestion is always the one that matters: revive the daemon, lift the
 	// kill switch, or work the queue.
@@ -1170,6 +1173,23 @@ func printConfig(out io.Writer, cfg config.Config) {
 	}
 	fmt.Fprintf(out, "task sources: %d, operator never-auto rules: %d (+%d seed)\n",
 		len(cfg.TaskSources), len(cfg.Safety.NeverAutoPatterns)+len(cfg.Safety.NeverAutoRules), seedCount)
+}
+
+// printDiskLine reports what hap is using disk for, and under what retention.
+// It rides on `hap status` rather than `hap config`: an operator who has just
+// noticed the state directory is large is looking at the state of things, not
+// at settings, and `hap gc` points here.
+func printDiskLine(out io.Writer, stateDir string, cfg config.Config) {
+	fp := measureStateDir(stateDir)
+	if len(fp) == 0 {
+		return
+	}
+	retention := "off"
+	if window, ok := cfg.Logging.AuditExcerptRetention(); ok {
+		retention = humanDays(window)
+	}
+	fmt.Fprintf(out, "disk:       %s in %s (largest: %s %s); excerpt retention: %s\n",
+		humanBytes(totalBytes(fp)), stateDir, fp[0].name, humanBytes(fp[0].bytes), retention)
 }
 
 // describeEnvSummary renders one command's environment for display. It prints

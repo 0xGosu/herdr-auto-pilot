@@ -307,6 +307,12 @@ type Daemon struct {
 	bg             sync.WaitGroup
 	shutdownCtx    context.Context
 	cancelShutdown context.CancelFunc
+
+	// lastRetentionSweep throttles the audit-excerpt sweep to once a day off
+	// the 1-minute ticker. In memory on purpose: a restart re-running it is
+	// harmless (the sweep skips rows already blanked), and persisting it would
+	// buy nothing. Guarded by d.mu.
+	lastRetentionSweep time.Time
 }
 
 // idleMark is one agent's parked-since timestamp, pinned to the terminal it
@@ -906,8 +912,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 				return nil
 			}
 			d.writeHealth(startedAt)
+			// Bound the captured stderr log for a daemon that never restarts.
+			// OpenStderrLog only checks at spawn, so without this a long-lived
+			// process grows it without limit. Two cheap Stats, same as above.
+			if d.opt.StateDir != "" {
+				daemonhealth.RotateOwnStderrIfNeeded(d.opt.StateDir)
+			}
 		case <-sweep.C:
 			logging.Guard("periodic-sweep", func() error {
+				// Self-throttled to once a day and does its work on a
+				// background goroutine; the call itself is a clock compare.
+				d.maybePruneAuditExcerpts(d.opt.Clock.Now())
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)

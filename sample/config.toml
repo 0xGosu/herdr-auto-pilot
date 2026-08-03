@@ -307,6 +307,35 @@ warm_timeout_ms = 0           # 0 → 30000 (first call: includes the model load
 # approval/choice/error rules are unaffected.
 # pane_salient_chars = 500
 
+# ── Logging & retention ─────────────────────────────────────────────
+# What hap keeps about itself: the plugin log at
+# <state-dir>/herd-auto-prompter.log, and the audit history in its database.
+[logging]
+level = "info"             # debug | info | warn | error. An unknown value falls
+                           # back to info — a typo never silences the log.
+                           # HAP_DEBUG=1 forces debug and outranks this.
+                           # Applies to `hap tui` too: it writes to the same file.
+                           # NOTE: read once per process, so unlike most settings
+                           # here it does NOT apply on the daemon's config reload
+                           # — restart it with `hap daemon --ensure`
+max_size_mb = 16           # rotate the plugin log past this, keeping one ".old"
+                           # sibling — so roughly twice this on disk.
+                           # Read once per process, like level
+
+# How long an audit row keeps the pane excerpt captured with it. Past this the
+# excerpt is blanked and the row is KEPT, so `hap audit` history stays complete
+# while the database sheds most of its bytes (the excerpt is ~3.8 KiB of a
+# 5.0 KiB row). Set to 0 to keep every excerpt forever.
+#
+# Rows the daemon may still read are never touched whatever this says: pending
+# escalations at ANY age, rows with an unprocessed LLM retry, and recently
+# answered asks. That exclusion is a safety control — auto-accept reads a
+# pending escalation's excerpt as the proof that a menu was standing.
+#
+# The daemon sweeps once a day; `hap gc` does it now, `hap gc --dry-run` shows
+# the window first.
+# audit_excerpt_retention_days = 14
+
 # ── TUI ─────────────────────────────────────────────────────────────
 [tui]
 max_content_width = 0      # cap on variable-length list columns; 0 = full terminal width
