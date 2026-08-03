@@ -8,6 +8,17 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.27
+
+- Added `hap gc` — reclaims disk from hap's own records on demand, with `--dry-run` to see the window first and `--days N` to override it. It blanks the captured pane excerpt on aged audit rows (the bulk of the database: ~3.8 KiB of a 5.0 KiB row) while keeping the rows themselves, so `hap audit` history stays complete. Rows the daemon may still read are never touched — pending escalations at any age, rows with an unprocessed LLM retry, and recently answered asks.
+- Added a daily retention sweep so the audit history stops growing forever. Nothing pruned it before, and a lightly used state directory grew about 0.6 MB a day. Tune it with `[logging] audit_excerpt_retention_days`: omitted keeps 14 days, `0` keeps no excerpts at all, and a negative value never prunes (the old behaviour).
+- Added `[logging] level` and `[logging] max_size_mb`. There was previously no way to turn the plugin log down — only `HAP_DEBUG=1` to turn it up, and that never applied to `hap tui`, which logged into the same file. The default log cap drops from 64 MiB to 16 MiB, so an untouched install reserves 32 MiB instead of 128 MiB counting the `.old` sibling.
+- Fixed hap going blind to agent status for up to 30 seconds after an ordinary pane split. Every pane open, close, split and agent-detection unwinds the status subscriber on purpose, but that was treated as a dropped connection: it logged a warning each time and advanced the reconnect backoff to its 30 second ceiling. Expected resubscribes now reconnect immediately and log at debug.
+- Fixed `daemon.stderr.log` growing without bound for a daemon that never restarts — its 256 KiB cap was only checked when a new daemon was spawned.
+- Changed the embedding worker to stop writing llama.cpp's model-load banner to that log: roughly 250 lines every time the worker started, which is what the file was almost entirely made of. It now keeps the native crash trail it exists for. Set `LLAMA_LOG` yourself to override.
+- Changed several routine daemon lines to debug — successful signature matches, and the once-a-minute note that an idle agent has no task waiting. Both described a steady state and together dominated the log.
+- Fixed the write-ahead log staying at its high-water mark forever; it is now truncated back after each checkpoint.
+
 ## 0.5.26
 
 - Added an idle back-off to `hap tui`: after 10 minutes with no keypress and nothing changing, it polls every 30 seconds instead of every 2, and repaints the Age column every 10 seconds instead of every 1. A pane left open overnight stops costing a full store read and two herdr round trips every 2 seconds — measured at about a third of the idle CPU it used before.
