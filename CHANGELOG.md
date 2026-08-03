@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.29
+
+- Fixed the LLM session id being recorded only on escalations. A decision the LLM answered and hap delivered — the most common outcome — left its audit row blank, so exactly the rows most worth tracing could not be tied back to the transcript behind them. Every audit row carrying LLM detail now carries the id: delivered actions and no-ops, multi-tab and remote-environment answers, task-list reviews, and the row written when an agent was disabled mid-flight.
+
 ## 0.5.28
 
 - Added a session id to every LLM invocation, recorded on the audit row it produced. A decision can now be traced to the transcript the CLI wrote for it — previously nothing linked the two, so there was no way to tell which consult produced a given escalation.
