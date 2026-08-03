@@ -2415,8 +2415,11 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 		SituationType: s.Type, Action: domain.AuditActionEscalated, Confidence: dec.Confidence,
 		LLMConfidence: dec.LLMConfidence,
-		Rationale:     rationale,
-		Status:        "escalated", Suggestion: dec.Suggestion,
+		// Names the CLI conversation behind this escalation, and so the
+		// transcript it left on disk. Empty on non-LLM escalations.
+		LLMSessionID: dec.LLMSessionID,
+		Rationale:    rationale,
+		Status:       "escalated", Suggestion: dec.Suggestion,
 		// The content THIS escalation was classified from — per entry,
 		// unlike the signature's first-seen provenance snapshot.
 		PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
@@ -2594,6 +2597,7 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 	d.mu.Unlock()
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("req-%s-%d", s.AgentID, now.UnixNano()),
+		SessionID: domain.NewSessionID(),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now, First: first,
 		RetryAuditID: s.RetryAuditID,
@@ -2613,7 +2617,11 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 				return fmt.Errorf("staging LLM request failed: %w", err)
 			}
 			outcome.request = req
-			decision, err := llm.Consult(ctx, req)
+			decision, sessionID, err := consultWithSession(ctx, llm, req)
+			// The CLI may have minted its own id (codex); keep the one the run
+			// ACTUALLY used, on the failure path too — a consult that timed out
+			// still left a transcript, and still raises an escalation.
+			outcome.request.SessionID = sessionID
 			outcome.decision = decision
 			return err
 		})
@@ -2728,6 +2736,7 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("gentask-%s-%d", s.AgentID, now.UnixNano()),
+		SessionID: domain.NewSessionID(),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now, First: first,
 	}
@@ -2761,13 +2770,17 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 			if cwd == "" {
 				cwd = info.Cwd
 			}
-			task, gerr := tg.GenerateTask(ctx, domain.TaskGenRequest{
+			task, sessionID, gerr := generateTaskWithSession(ctx, tg, domain.TaskGenRequest{
 				AgentType:   s.AgentType,
 				AgentName:   agentName,
 				PaneExcerpt: d.paneExcerpt(ctx, cfg, s),
 				Cwd:         cwd,
 				First:       first,
+				// The same id staged on the llm_requests row above, so the
+				// generation and its record name one conversation.
+				SessionID: req.SessionID,
 			})
+			outcome.request.SessionID = sessionID
 			outcome.task = task
 			return gerr
 		})
@@ -2821,7 +2834,7 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonTaskGenFailed,
 			Rationale: rationale,
-		}, res.tr, now)
+		}.WithLLMSession(res.request.SessionID), res.tr, now)
 		return
 	}
 
@@ -2858,7 +2871,7 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 				Action: domain.ActionEscalate, Reason: res.reason,
 				Rationale:  "generate-task declined: no new task needed",
 				Suggestion: domain.ActionNoopSuggestion,
-			}, res.tr, now)
+			}.WithLLMSession(res.request.SessionID), res.tr, now)
 			return
 		}
 		// No sentinel and no task IS a broken CLI — keep it retryable so
@@ -2866,7 +2879,7 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonTaskGenFailed,
 			Rationale: "generate-task produced no usable task",
-		}, res.tr, now)
+		}.WithLLMSession(res.request.SessionID), res.tr, now)
 		return
 	}
 
@@ -2881,7 +2894,7 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 		// mode); escalate() renders it after the "[reason]" tag.
 		Rationale:  rationale,
 		Suggestion: domain.SuggestTaskPrefix + task,
-	}, res.tr, now)
+	}.WithLLMSession(res.request.SessionID), res.tr, now)
 }
 
 // agentNotCleanlyIdle reports whether the agent's LIVE herdr status means it is
@@ -3196,6 +3209,7 @@ func (d *Daemon) startActionReview(ctx context.Context, s domain.Situation,
 	// as consultDeclaredTask).
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("actreview-%s-%d", s.AgentID, now.UnixNano()),
+		SessionID: domain.NewSessionID(),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
 		ActionReview: true, ProposedAction: dec.Input,
@@ -3235,7 +3249,10 @@ func (d *Daemon) startActionReview(ctx context.Context, s domain.Situation,
 			if err := d.opt.Store.UpdateLLMRequestContext(rctx, req.RequestID, req.ContextJSON); err != nil {
 				return fmt.Errorf("staging LLM request context failed: %w", err)
 			}
-			decision, err := llm.Consult(rctx, req)
+			decision, sessionID, err := consultWithSession(rctx, llm, req)
+			// req is copied into outcome.request after this guard returns, so
+			// updating it here is what carries the id the run actually used.
+			req.SessionID = sessionID
 			outcome.decision = decision
 			return err
 		})
@@ -3603,7 +3620,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: reason,
 			Rationale: fmt.Sprintf("%v", res.err),
-		}, tr, now)
+		}.WithLLMSession(res.request.SessionID), tr, now)
 		return
 	}
 
@@ -3626,7 +3643,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonLLMNoSubmit,
 			Rationale: fmt.Sprintf("LLM submitted the %q sentinel outside the review that defines it", llmDec.Action),
-		}, tr, now)
+		}.WithLLMSession(res.request.SessionID), tr, now)
 		return
 	}
 	isNoop := domain.IsNoopAction(llmDec.Action)
@@ -3671,7 +3688,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			Action: domain.ActionEscalate, Reason: reason, Rationale: why,
 			LLMConfidence: llmConf,
 			Suggestion:    "LLM suggested: " + suggested,
-		}, tr, now)
+		}.WithLLMSession(res.request.SessionID), tr, now)
 	}
 
 	// Re-gate: kill switch, never-auto patterns, heuristic, rate — the LLM can never

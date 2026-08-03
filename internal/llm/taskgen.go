@@ -30,12 +30,20 @@ func (a *Adapter) GenerateTaskConfigured() bool {
 
 // GenerateTask launches the generate-task CLI and returns its trimmed stdout.
 func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+	task, _, err := a.GenerateTaskWithSession(ctx, req)
+	return task, err
+}
+
+// GenerateTaskWithSession is GenerateTask plus the session id the run used.
+// Implements ports.SessionReportingTaskGenerator; the id is returned on the
+// error paths too, since a failed generation still wrote a transcript.
+func (a *Adapter) GenerateTaskWithSession(ctx context.Context, req domain.TaskGenRequest) (string, string, error) {
 	if !a.GenerateTaskConfigured() {
-		return "", fmt.Errorf("no generate-task CLI configured")
+		return "", "", fmt.Errorf("no generate-task CLI configured")
 	}
 	self, err := a.resolveSelf()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	// The first generation for an agent uses task_generate_command_start when
 	// configured; an empty start template falls back to the base command.
@@ -46,6 +54,13 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 	if req.First && len(a.TaskGenStartTemplate) > 0 {
 		base, env = a.TaskGenStartTemplate, a.TaskGenStartEnv
 	}
+	// Session id first, then the adjacency repair: injection appends, and
+	// NormalizeLLMCommand is what puts claude's prompt back beside its -p.
+	// Guarded on a non-empty id — an unexpanded placeholder would become a
+	// bare `--session-id ""`.
+	if req.SessionID != "" {
+		base = InjectSessionID(base, SessionIDPlaceholder)
+	}
 	template := NormalizeLLMCommand(base)
 	// The environment shares every placeholder EXCEPT {pane_excerpt}:
 	// untrusted, unbounded pane text has no business in a child's
@@ -55,6 +70,7 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 		"{agent_name}", req.AgentName,
 		"{agent_type}", req.AgentType,
 		"{cwd}", req.Cwd,
+		SessionIDPlaceholder, req.SessionID,
 	)
 	argvRepl := strings.NewReplacer(
 		"{self}", self,
@@ -62,6 +78,7 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 		"{agent_type}", req.AgentType,
 		"{pane_excerpt}", req.PaneExcerpt,
 		"{cwd}", req.Cwd,
+		SessionIDPlaceholder, req.SessionID,
 	)
 	argv := make([]string, len(template))
 	for i, arg := range template {
@@ -78,12 +95,13 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 		"HAP_CWD="+req.Cwd,
 	)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	bin, err := preflight(argv[0], childEnv)
 	if err != nil {
-		return "", err
+		// Nothing ran, so there is no session to name.
+		return "", "", err
 	}
 
 	timeout := a.TaskGenTimeout
@@ -108,24 +126,33 @@ func (a *Adapter) GenerateTask(ctx context.Context, req domain.TaskGenRequest) (
 	cmd.Env = childEnv
 	runErr := cmd.Run()
 
+	// A CLI that mints its own session id prints it in its startup BANNER,
+	// which lands on stderr — so this is read from stderr, not the stdout that
+	// carries the suggested task. Resolved before the error returns below: a
+	// failed generation still created a transcript.
+	sessionID := req.SessionID
+	if reported := ExtractSessionID(argv[0], stderr.String()); reported != "" {
+		sessionID = reported
+	}
+
 	if runErr != nil {
 		// Classify as timeout only when the run actually failed: a CLI
 		// finishing right at the deadline must keep its valid output.
 		if runCtx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("generate-task timeout after %s (stderr: %s)",
+			return "", sessionID, fmt.Errorf("generate-task timeout after %s (stderr: %s)",
 				timeout, tailOf(stderr.String(), 500))
 		}
-		return "", fmt.Errorf("generate-task CLI failed: %w (stderr: %s)",
+		return "", sessionID, fmt.Errorf("generate-task CLI failed: %w (stderr: %s)",
 			runErr, tailOf(stderr.String(), 500))
 	}
 	result := strings.TrimSpace(stdout.String())
 	if result == "" {
-		return "", fmt.Errorf("generate-task CLI produced empty output (stderr: %s)",
+		return "", sessionID, fmt.Errorf("generate-task CLI produced empty output (stderr: %s)",
 			tailOf(stderr.String(), 500))
 	}
 	if len(result) > maxTaskGenOutput {
-		return "", fmt.Errorf("generate-task CLI produced oversized output (%d bytes > %d cap)",
+		return "", sessionID, fmt.Errorf("generate-task CLI produced oversized output (%d bytes > %d cap)",
 			len(result), maxTaskGenOutput)
 	}
-	return result, nil
+	return result, sessionID, nil
 }

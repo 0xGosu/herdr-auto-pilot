@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	sig_salient TEXT NOT NULL DEFAULT '',
 	sig_verdict TEXT NOT NULL DEFAULT '',
 	sig_salient_chars INTEGER NOT NULL DEFAULT 0,
+	llm_session_id TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
@@ -179,7 +180,8 @@ CREATE TABLE IF NOT EXISTS llm_requests (
 	agent_id TEXT NOT NULL DEFAULT '',
 	context_json TEXT NOT NULL,
 	status TEXT NOT NULL DEFAULT 'pending',
-	created_at INTEGER NOT NULL
+	created_at INTEGER NOT NULL,
+	session_id TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS llm_decisions (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,6 +295,13 @@ func (s *Store) migrate() error {
 		`ALTER TABLE audit_log ADD COLUMN sig_salient TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE audit_log ADD COLUMN sig_verdict TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE audit_log ADD COLUMN sig_salient_chars INTEGER NOT NULL DEFAULT 0`,
+		// The CLI conversation the LLM ran as, and the name of the transcript
+		// file it left behind. '' on learned/operator rows, on rows from before
+		// this column existed, and whenever the CLI neither accepted nor
+		// reported an id — it is bookkeeping, never load-bearing. NOT
+		// backfilled: there is nothing to backfill it FROM.
+		`ALTER TABLE audit_log ADD COLUMN llm_session_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE llm_requests ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
 		// A pre-delivery task review's submission: the ordered checklist edits
 		// (JSON) and the reference of the task to deliver once they are
@@ -457,13 +466,14 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 			INSERT INTO audit_log (decision_id, agent_id, agent_type, signature, trigger, situation_type,
 				action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
 				corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
-				sig_raw, sig_salient, sig_verdict, sig_salient_chars, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
 			a.Action, a.Input, a.Confidence, llmConfArg(a.LLMConfidence), a.Rationale, a.LLMOutput,
 			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt,
 			string(a.MatchMethod), a.MatchScore, a.EmbedError,
-			a.SigRaw, a.SigSalient, string(a.SigVerdict), a.SigSalientChars, unix(a.CreatedAt))
+			a.SigRaw, a.SigSalient, string(a.SigVerdict), a.SigSalientChars,
+			a.LLMSessionID, unix(a.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -561,10 +571,11 @@ func (s *Store) StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO llm_requests (request_id, signature, situation_type, agent_type, agent_id, context_json, status, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			INSERT INTO llm_requests (request_id, signature, situation_type, agent_type, agent_id, context_json, status, created_at, session_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			r.RequestID, r.Signature, string(r.SituationType), r.AgentType,
-			r.AgentID, r.ContextJSON, orDefault(r.Status, "pending"), unix(r.CreatedAt))
+			r.AgentID, r.ContextJSON, orDefault(r.Status, "pending"), unix(r.CreatedAt),
+			r.SessionID)
 		if err != nil {
 			return err
 		}
@@ -1588,7 +1599,8 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 			&situationType, &a.Action, &a.Input, &a.Confidence, &llmConf, &a.Rationale,
 			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &a.PaneExcerpt,
 			&matchMethod, &a.MatchScore, &a.EmbedError,
-			&a.SigRaw, &a.SigSalient, &sigVerdict, &a.SigSalientChars, &created); err != nil {
+			&a.SigRaw, &a.SigSalient, &sigVerdict, &a.SigSalientChars,
+			&a.LLMSessionID, &created); err != nil {
 			return nil, err
 		}
 		a.MatchMethod = domain.MatchMethod(matchMethod)
@@ -1609,7 +1621,7 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 const auditCols = `id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
 	action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
 	corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
-	sig_raw, sig_salient, sig_verdict, sig_salient_chars, created_at`
+	sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id, created_at`
 
 // llmConfArg maps the optional LLM confidence to a SQL argument: nil stores
 // NULL (no LLM score), a value stores the 0-100 score.

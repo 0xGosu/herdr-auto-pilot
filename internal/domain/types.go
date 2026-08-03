@@ -217,9 +217,26 @@ type Decision struct {
 	// LLMConfidence carries a consulting LLM's self-reported confidence (0-100)
 	// through to the audit row escalate() writes; nil for non-LLM decisions.
 	LLMConfidence *int
-	Rationale     string
-	Reason        EscalateReason // set when Action == ActionEscalate
-	Suggestion    string         // suggested input surfaced with shadow-mode escalations
+	// LLMSessionID carries the consulting CLI's session id through to the audit
+	// row escalate() writes — the same channel as LLMConfidence above, and for
+	// the same reason: escalate has no access to the LLM request. Empty for
+	// non-LLM decisions. It names the transcript file the consult left behind.
+	LLMSessionID string
+	Rationale    string
+	Reason       EscalateReason // set when Action == ActionEscalate
+	Suggestion   string         // suggested input surfaced with shadow-mode escalations
+}
+
+// WithLLMSession stamps the consulting CLI's session id onto the decision, so
+// the audit row escalate() writes can name the transcript that consult left
+// behind. Returns a copy — Decision is passed by value everywhere.
+//
+// A method rather than a field set at each literal because the handlers raise
+// several different escalations from one outcome (declined, failed, no usable
+// task, success), and every one of them came from the same conversation.
+func (d Decision) WithLLMSession(sessionID string) Decision {
+	d.LLMSessionID = sessionID
+	return d
 }
 
 // Mode is the per-signature learning state.
@@ -539,7 +556,12 @@ type AuditRecord struct {
 	SigSalient      string
 	SigVerdict      GuardVerdict
 	SigSalientChars int
-	CreatedAt       time.Time
+	// LLMSessionID names the CLI conversation behind this row, and so the
+	// transcript file it left on disk. Empty on learned/operator rows, on rows
+	// predating the column, and whenever the CLI neither accepted nor reported
+	// an id. Bookkeeping only — nothing decides anything from it.
+	LLMSessionID string
+	CreatedAt    time.Time
 }
 
 // WithSignatureBaseline stamps sig's full result onto the record — the
@@ -645,7 +667,17 @@ type LLMRequest struct {
 	AgentID string
 	// AgentName is the agent's short name, for the {agent_name} command
 	// placeholder and the consult context blob.
-	AgentName   string
+	AgentName string
+	// SessionID identifies the CLI conversation this consult runs as, and is
+	// what the CLI names its transcript file. Distinct from RequestID (which
+	// names hap's own staged row): `claude --session-id` requires a UUID, and
+	// RequestID is not one.
+	//
+	// For a CLI that ACCEPTS an id, hap mints this up front and passes it. For
+	// one that MINTS its own (codex), this starts empty and is filled in from
+	// the run's output. Empty means "unknown" — every consumer treats it as
+	// bookkeeping that may be missing.
+	SessionID   string
 	ContextJSON string
 	Status      string // pending | done | expired
 	CreatedAt   time.Time
