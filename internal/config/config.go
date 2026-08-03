@@ -679,30 +679,41 @@ type Logging struct {
 	// sibling, so roughly twice this is kept on disk. 0 uses the default.
 	// Read once per process, like Level.
 	MaxSizeMB int `toml:"max_size_mb,omitempty"`
-	// AuditExcerptRetentionDays is how long an audit row keeps its captured
-	// pane excerpt. Past it the excerpt is blanked while the row itself —
-	// action, rationale, status — is kept, so `hap audit` history stays
-	// complete.
+	// AuditExcerptRetentionDays is how many days an audit row keeps its
+	// captured pane excerpt. Past that the excerpt is blanked while the row
+	// itself — action, rationale, status — is kept, so `hap audit` history
+	// stays complete.
 	//
-	// A POINTER so that "absent" and "explicitly 0" stay distinguishable:
-	// absent takes the default, an explicit 0 turns the sweep off and keeps
-	// every excerpt forever (the behaviour before this setting existed).
-	// Plain ints elsewhere in this file cannot express that, and fillZeroes
-	// would read the operator's 0 as "unset" and re-enable it.
+	// Three cases, and 0 is a real setting rather than "unset":
+	//   - absent   → DefaultAuditExcerptRetentionDays
+	//   - 0        → keep NO excerpts; every eligible row is blanked. Reads the
+	//                way it looks: retain for zero days.
+	//   - negative → never prune, keeping every excerpt forever (the behaviour
+	//                before this setting existed).
 	//
-	// Rows the daemon may still READ are never touched whatever this says;
-	// see store.PruneAuditExcerpts, where that exclusion is a safety control.
+	// A POINTER because absent and 0 mean different things and a plain int
+	// cannot tell them apart — fillZeroes would read the operator's 0 as
+	// "unset" and quietly substitute the default. Negative is the "off" switch
+	// for the same reason 0 could not be: it is already taken. That also
+	// matches journal_size_limit's convention right above.
+	//
+	// Rows the daemon may still READ are never touched whatever this says, and
+	// the cutoff is floored at AuditExcerptDedupMargin, so even 0 cannot reach
+	// a row being compared against this second. See store.PruneAuditExcerpts,
+	// where both are safety controls.
 	AuditExcerptRetentionDays *int `toml:"audit_excerpt_retention_days,omitempty"`
 }
 
 // AuditExcerptRetention returns the excerpt retention window and whether the
-// sweep is enabled at all.
+// sweep runs at all. A zero window with ok=true means "keep no excerpts", which
+// is different from ok=false ("never prune") — the store still floors the
+// cutoff, so zero prunes everything OLDER THAN that safety margin.
 func (l Logging) AuditExcerptRetention() (time.Duration, bool) {
 	days := DefaultAuditExcerptRetentionDays
 	if l.AuditExcerptRetentionDays != nil {
 		days = *l.AuditExcerptRetentionDays
 	}
-	if days <= 0 {
+	if days < 0 {
 		return 0, false
 	}
 	return time.Duration(days) * 24 * time.Hour, true

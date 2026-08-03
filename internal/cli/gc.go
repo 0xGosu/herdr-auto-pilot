@@ -71,13 +71,27 @@ func dirSize(dir string) int64 {
 // time.Duration would print 14 days as "336h0m0s".
 func humanDays(d time.Duration) string {
 	days := int(d.Hours() / 24)
-	if days == 1 {
+	switch {
+	case d == 0:
+		// Retention 0: nothing is kept. Rendering this as "0 days" invites the
+		// reading "nothing happens", which is the opposite of what it does.
+		return "no excerpts kept"
+	case days == 1:
 		return "1 day"
-	}
-	if days > 0 {
+	case days > 0:
 		return fmt.Sprintf("%d days", days)
 	}
 	return d.String()
+}
+
+// blankPhrase describes what a run would do, as a verb phrase. Retention 0 gets
+// its own wording because "blank excerpts older than no excerpts kept" is not a
+// sentence — the window doubles as a description of the setting elsewhere.
+func blankPhrase(window time.Duration) string {
+	if window == 0 {
+		return "blank EVERY eligible pane excerpt (retention is 0)"
+	}
+	return "blank pane excerpts older than " + humanDays(window)
 }
 
 // humanBytes renders a size the way an operator reads `du -h`.
@@ -101,17 +115,21 @@ func humanBytes(n int64) string {
 // wants the space back now, and wants to see what it would do first.
 func gc(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
-	days := fs.Int("days", 0, "blank pane excerpts older than N days (default: the configured retention)")
+	days := fs.Int("days", daysUnset,
+		"blank pane excerpts older than N days; 0 blanks them all (default: the configured retention)")
 	dryRun := fs.Bool("dry-run", false, "report what would be reclaimed, change nothing")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *days < 0 && *days != daysUnset {
+		return fmt.Errorf("--days must be 0 or more (0 blanks every eligible excerpt)")
+	}
 
 	window, enabled := retentionWindow(app, *days)
 	if !enabled {
-		return fmt.Errorf("excerpt retention is disabled " +
-			"(`[logging] audit_excerpt_retention_days = 0`) — pass --days N to override for this run")
+		return fmt.Errorf("excerpt retention is turned off " +
+			"(`[logging] audit_excerpt_retention_days` is negative) — pass --days N to override for this run")
 	}
 
 	before := measureStateDir(app.StateDir)
@@ -127,7 +145,7 @@ func gc(ctx context.Context, app *frontend.App, out io.Writer, args []string) er
 	if *dryRun {
 		// Reported, not performed: the same cutoff the real run would use, so
 		// the operator can see the window before committing to it.
-		fmt.Fprintf(out, "\nDry run: would blank pane excerpts older than %s.\n", humanDays(window))
+		fmt.Fprintf(out, "\nDry run: would %s.\n", blankPhrase(window))
 		fmt.Fprintln(out, "Rows still in play are never touched — pending escalations at any age,")
 		fmt.Fprintln(out, "rows with an unprocessed LLM retry, and recently answered asks.")
 		return nil
@@ -137,7 +155,11 @@ func gc(ctx context.Context, app *frontend.App, out io.Writer, args []string) er
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "\nCleared pane excerpts on %d audit row(s) older than %s.\n", n, humanDays(window))
+	if window == 0 {
+		fmt.Fprintf(out, "\nCleared pane excerpts on %d audit row(s) — retention is 0, so none are kept.\n", n)
+	} else {
+		fmt.Fprintf(out, "\nCleared pane excerpts on %d audit row(s) older than %s.\n", n, humanDays(window))
+	}
 
 	// Always vacuum here, unlike the daemon's threshold: the operator asked
 	// for the space back, so the write lock is the point rather than a cost.
@@ -158,10 +180,15 @@ func gc(ctx context.Context, app *frontend.App, out io.Writer, args []string) er
 	return nil
 }
 
+// daysUnset is --days's "not given" sentinel. It cannot be 0: `--days 0` is a
+// real instruction ("keep no excerpts"), the same as the config value, so 0
+// must not double as "fall back to the config".
+const daysUnset = -1
+
 // retentionWindow resolves the cutoff: an explicit --days wins, otherwise the
-// configured retention (which may be disabled).
+// configured retention (which may be off entirely).
 func retentionWindow(app *frontend.App, days int) (time.Duration, bool) {
-	if days > 0 {
+	if days >= 0 {
 		return time.Duration(days) * 24 * time.Hour, true
 	}
 	cfg, err := config.Load(app.ConfigPath)

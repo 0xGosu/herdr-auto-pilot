@@ -376,7 +376,7 @@ func buildCommands() {
 			Summary: "reclaim disk from hap's own logs and audit history",
 			Usage:   []string{"hap gc [--days N] [--dry-run]"},
 			Flags: []FlagDoc{
-				{Name: "--days", Arg: "N", Default: "config", Desc: "blank pane excerpts older than N days"},
+				{Name: "--days", Arg: "N", Default: "config", Desc: "blank pane excerpts older than N days; 0 blanks them all"},
 				{Name: "--dry-run", Desc: "report what would be reclaimed, change nothing"},
 			},
 			Details: "Blanks the captured pane excerpt on aged audit rows — the rows themselves,\n" +

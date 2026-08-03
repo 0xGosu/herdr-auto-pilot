@@ -1782,15 +1782,20 @@ func FieldValue(cfg config.Config, key string) string {
 	case "logging.max_size_mb":
 		return strconv.Itoa(cfg.Logging.MaxSizeMB)
 	case "logging.audit_excerpt_retention_days":
-		// nil and 0 are different answers here: absent takes the default,
-		// an explicit 0 is the operator turning the sweep off.
+		// Three distinct answers: absent takes the default, 0 keeps nothing,
+		// negative turns pruning off. Spelled out because "0" alone reads as
+		// "disabled" to most people and here it means the opposite.
 		if cfg.Logging.AuditExcerptRetentionDays == nil {
 			return fmt.Sprintf("%d (default)", config.DefaultAuditExcerptRetentionDays)
 		}
-		if *cfg.Logging.AuditExcerptRetentionDays <= 0 {
-			return "0 (never prune)"
+		switch d := *cfg.Logging.AuditExcerptRetentionDays; {
+		case d < 0:
+			return fmt.Sprintf("%d (never prune)", d)
+		case d == 0:
+			return "0 (keep no excerpts)"
+		default:
+			return strconv.Itoa(d)
 		}
-		return strconv.Itoa(*cfg.Logging.AuditExcerptRetentionDays)
 	case "limits.max_consecutive_auto_prompts":
 		return strconv.Itoa(cfg.Limits.MaxConsecutiveAutoPrompts)
 	case "limits.max_auto_prompts_per_minute":
@@ -2237,12 +2242,15 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 		case "logging.max_size_mb":
 			return setInt(&cfg.Logging.MaxSizeMB)
 		case "logging.audit_excerpt_retention_days":
-			// 0 is "never prune" here, not "restore the default" — same rule as
-			// tui.max_instances below, and the reason the field is a pointer.
+			// Every integer is meaningful here, including 0 and negatives, so
+			// unlike tui.max_instances below there is no rejected range: 0
+			// keeps no excerpts, negative never prunes, and neither is
+			// "restore the default" (that is removing the key). This is why
+			// the field is a pointer.
 			v, err := strconv.Atoi(value)
-			if err != nil || v < 0 {
-				return fmt.Errorf("logging.audit_excerpt_retention_days must be a "+
-					"non-negative integer (0 = never prune), got %q", value)
+			if err != nil {
+				return fmt.Errorf("logging.audit_excerpt_retention_days must be an integer "+
+					"(0 = keep no excerpts, negative = never prune), got %q", value)
 			}
 			cfg.Logging.AuditExcerptRetentionDays = &v
 			return nil

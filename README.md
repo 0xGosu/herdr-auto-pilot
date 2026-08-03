@@ -1211,8 +1211,18 @@ largest component, and the excerpt retention in force. Three things grow there:
 The database is the one that grows fastest. Most of it is the pane excerpt
 captured with each audit row — about 3.8 KiB of a 5.0 KiB row — so retention
 **blanks that column and keeps the row**: `hap audit` history, rationales and
-statuses all survive. Set `audit_excerpt_retention_days = 0` to keep every
-excerpt forever.
+statuses all survive.
+
+`audit_excerpt_retention_days` takes three kinds of value:
+
+| Value | Meaning |
+|---|---|
+| omitted | the default, 14 days |
+| `0` | keep **no** excerpts — blank every eligible row |
+| negative (e.g. `-1`) | never prune; keep every excerpt forever |
+
+`0` means what it says — retain for zero days — so it is the most aggressive
+setting, not the off switch. Negative is the off switch.
 
 Rows the daemon may still read are never touched, whatever the retention says:
 pending escalations at any age, rows with an unprocessed LLM retry, and recently
@@ -1222,8 +1232,9 @@ it an unreadable pane would fall through to a literal send.
 
 The daemon sweeps once a day. `hap gc` runs it now and reports what it
 reclaimed; `hap gc --dry-run` shows the window without changing anything, and
-`hap gc --days N` overrides it for one run. Because SQLite frees pages *inside*
-the file, `hap gc` also vacuums — which is what actually returns the space.
+`hap gc --days N` overrides it for one run (`--days 0` blanks every eligible
+excerpt, matching the config value). Because SQLite frees pages *inside* the
+file, `hap gc` also vacuums — which is what actually returns the space.
 
 To turn the log itself down, set `[logging] level` to `warn`. It applies to
 `hap tui` as well, which writes to the same file. `HAP_DEBUG=1` still forces

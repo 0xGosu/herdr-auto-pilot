@@ -178,8 +178,51 @@ func TestPruneAuditExcerptsSparesUnprocessedRetryAndRecentCorrection(t *testing.
 	}
 }
 
-// TestPruneAuditExcerptsClampsCutoffToDedupMargin: a misconfigured retention of
-// "0 days" must not reach rows the daemon is comparing against right now.
+// TestPruneAuditExcerptsZeroRetentionStillHonoursEveryExclusion is the safety
+// case for `audit_excerpt_retention_days = 0` ("keep no excerpts").
+//
+// 0 is the most aggressive setting an operator can choose, so it is exactly
+// where the exclusions must still hold: a pending escalation at any age keeps
+// its excerpt because auto-accept reads it as the proof that a menu was
+// standing. "Keep nothing" means nothing RETAINABLE, never anything live.
+func TestPruneAuditExcerptsZeroRetentionStillHonoursEveryExclusion(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	esc := appendAgedAudit(t, s, "escalated", 365*24*time.Hour, now)
+	claimed := appendAgedAudit(t, s, "escalated", 365*24*time.Hour, now)
+	if ok, err := s.ClaimForAutoAccept(ctx, claimed); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	retried := appendAgedAudit(t, s, "dismissed", 365*24*time.Hour, now)
+	if _, err := s.InsertLLMRetry(ctx, retried, now); err != nil {
+		t.Fatal(err)
+	}
+	terminal := appendAgedAudit(t, s, "dismissed", 365*24*time.Hour, now)
+
+	// cutoff == now: retention 0, the most aggressive window there is.
+	if _, err := s.PruneAuditExcerpts(ctx, now, now); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	for name, id := range map[string]int64{
+		"pending escalation": esc,
+		"mid auto-accept":    claimed,
+		"unprocessed retry":  retried,
+	} {
+		if got := excerptOf(t, s, id); got == "" {
+			t.Errorf("%s lost its excerpt at retention 0 — the exclusions are "+
+				"safety controls and do not scale with the window", name)
+		}
+	}
+	if got := excerptOf(t, s, terminal); got != "" {
+		t.Errorf("retention 0 must blank an eligible terminal row, got %q", got)
+	}
+}
+
+// TestPruneAuditExcerptsClampsCutoffToDedupMargin: a retention of "0 days" must
+// not reach rows the daemon is comparing against right now.
 func TestPruneAuditExcerptsClampsCutoffToDedupMargin(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

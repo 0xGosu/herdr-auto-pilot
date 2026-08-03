@@ -322,10 +322,14 @@ max_size_mb = 16           # rotate the plugin log past this, keeping one ".old"
                            # sibling — so roughly twice this on disk.
                            # Read once per process, like level
 
-# How long an audit row keeps the pane excerpt captured with it. Past this the
-# excerpt is blanked and the row is KEPT, so `hap audit` history stays complete
-# while the database sheds most of its bytes (the excerpt is ~3.8 KiB of a
-# 5.0 KiB row). Set to 0 to keep every excerpt forever.
+# How many days an audit row keeps the pane excerpt captured with it. Past that
+# the excerpt is blanked and the row is KEPT, so `hap audit` history stays
+# complete while the database sheds most of its bytes (the excerpt is ~3.8 KiB
+# of a 5.0 KiB row).
+#
+#   omitted    the default below (14 days)
+#   0          keep NO excerpts — blank every eligible row
+#   negative   never prune; keep every excerpt forever
 #
 # Rows the daemon may still read are never touched whatever this says: pending
 # escalations at ANY age, rows with an unprocessed LLM retry, and recently

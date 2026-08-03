@@ -38,16 +38,38 @@ func TestLoggingLevelParsing(t *testing.T) {
 	}
 }
 
-// TestAuditExcerptRetentionExplicitZeroDisables is why the field is a pointer:
-// an omitted key takes the default, but an operator's explicit 0 means "never
-// prune" and must survive fillZeroes.
-func TestAuditExcerptRetentionExplicitZeroDisables(t *testing.T) {
+// TestAuditExcerptRetentionExplicitZeroKeepsNothing: 0 reads the way it looks —
+// retain for zero days — so it prunes everything rather than disabling the
+// sweep. This is why the field is a pointer: fillZeroes must not mistake the
+// operator's 0 for "unset" and substitute the default.
+func TestAuditExcerptRetentionExplicitZeroKeepsNothing(t *testing.T) {
 	cfg, err := Load(writeConfig(t, "[logging]\naudit_excerpt_retention_days = 0\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, enabled := cfg.Logging.AuditExcerptRetention(); enabled {
-		t.Error("an explicit 0 must disable the sweep, not fall back to the default")
+	window, enabled := cfg.Logging.AuditExcerptRetention()
+	if !enabled {
+		t.Fatal("0 must RUN the sweep (keeping nothing), not turn it off")
+	}
+	if window != 0 {
+		t.Errorf("window = %v, want 0 (keep nothing)", window)
+	}
+}
+
+// TestAuditExcerptRetentionNegativeDisables: negative is the off switch,
+// because 0 is taken. Same convention as journal_size_limit = -1.
+func TestAuditExcerptRetentionNegativeDisables(t *testing.T) {
+	for _, body := range []string{
+		"[logging]\naudit_excerpt_retention_days = -1\n",
+		"[logging]\naudit_excerpt_retention_days = -30\n",
+	} {
+		cfg, err := Load(writeConfig(t, body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, enabled := cfg.Logging.AuditExcerptRetention(); enabled {
+			t.Errorf("%q must turn the sweep off", body)
+		}
 	}
 }
 
