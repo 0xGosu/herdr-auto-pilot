@@ -72,6 +72,15 @@ var codexSessionLine = regexp.MustCompile(
 // ExtractSessionID reads the session id a CLI reported in its own output, for
 // the CLIs that mint one rather than accept one.
 //
+// WHERE THE TRANSCRIPT LANDS DIFFERS PER CLI, and anything that later goes
+// looking for one must not assume claude's layout (verified live 2026-08-03):
+//
+//	claude  <CLAUDE_CONFIG_DIR>/projects/<slugified-cwd>/<session-id>.jsonl
+//	codex   <CODEX_HOME>/sessions/<YYYY>/<MM>/<DD>/rollout-<ISO-ts>-<session-id>.jsonl
+//
+// So codex needs a suffix glob, not an exact filename. Its store is also the
+// larger of the two in practice (120 MB vs 24 MB on one live machine).
+//
 // hap merges the child's stdout and stderr into a single capture buffer, so
 // codex's banner (which goes to stderr) is already in hand — nothing extra is
 // spawned or re-read to get this.

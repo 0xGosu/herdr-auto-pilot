@@ -1331,6 +1331,16 @@ The id is recorded for failed consults too — a timeout or a no-submit still
 wrote a transcript, and still raises an escalation. It is bookkeeping only:
 nothing decides anything from it, and an empty value simply means unknown.
 
+Where the transcript lands differs per CLI, so anything looking one up cannot
+assume claude's layout:
+
+| CLI | Transcript path |
+|---|---|
+| `claude` | `<CLAUDE_CONFIG_DIR>/projects/<slugified-cwd>/<session-id>.jsonl` |
+| `codex` | `<CODEX_HOME>/sessions/<YYYY>/<MM>/<DD>/rollout-<ISO-ts>-<session-id>.jsonl` |
+
+codex therefore needs a suffix match rather than an exact filename.
+
 An optional **`command_start`** runs *instead of* `command` on an agent's
 **first consult** — the first time the plugin needs the LLM for that agent
 this daemon lifetime. Every later consult uses `command`. A genuinely new
