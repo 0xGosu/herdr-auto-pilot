@@ -1,1 +1,0 @@
-- Fixed the session id being read from the truncated copy of an LLM CLI's output rather than the whole of it. For a CLI that reports its own id (`codex`), enough output before the announcement would push it past the 16 KiB the audit row keeps, and hap would silently record the id it had minted instead — naming a conversation that never existed, with no error to explain it.
