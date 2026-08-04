@@ -1,0 +1,1 @@
+- Added tests pinning `codex` session-id extraction against a verbatim capture from a real codex-cli 0.146.0 run, including the case where codex prints an unrelated error carrying the same UUID in a file path *before* its banner — where a looser pattern would read the wrong id on a completely ordinary run.
