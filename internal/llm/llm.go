@@ -307,7 +307,8 @@ func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string,
 	runErr := cmd.Run()
 	elapsed := time.Since(started)
 
-	captured := truncate(out.String(), 16*1024)
+	raw := out.String()
+	captured := truncate(raw, 16*1024)
 
 	// Regardless of exit status, the authoritative signal is the staged
 	// submission in the DB.
@@ -317,8 +318,15 @@ func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string,
 	}
 	// A CLI that mints its own session id reports it in the output we already
 	// captured; that one is authoritative over anything hap passed in.
+	//
+	// Read from the RAW output, not the 16 KiB `captured` copy the audit row
+	// keeps. The banner is early today (codex prints it at startup, and the
+	// truncation keeps the head), but stdout and stderr share this one buffer —
+	// so a CLI that wrote enough before announcing itself would push the banner
+	// past the cap and silently lose the id. Scanning the full string costs
+	// nothing here and removes the whole class.
 	sessionID := req.SessionID
-	if reported := ExtractSessionID(argv[0], captured); reported != "" {
+	if reported := ExtractSessionID(argv[0], raw); reported != "" {
 		sessionID = reported
 	}
 	return &consultAttempt{

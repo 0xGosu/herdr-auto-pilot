@@ -187,3 +187,41 @@ func containsPair(args []string, flag, value string) bool {
 	}
 	return false
 }
+
+// TestConsultReadsCodexSessionBehindBulkyOutput guards the capture against the
+// audit-log truncation.
+//
+// runConsult merges stdout and stderr into ONE buffer and keeps only the first
+// 16 KiB on the audit row. Extraction must read the RAW output instead: a CLI
+// that writes a lot before announcing itself would otherwise push its banner
+// past the cap, and the id would be lost silently — no error, just an empty
+// column that nothing would explain later.
+func TestConsultReadsCodexSessionBehindBulkyOutput(t *testing.T) {
+	st, db := testStore(t)
+	const codexID = "019fc84d-a8b8-77f2-8e20-8ea2c12822f4"
+	// 20 KiB of chatter on stdout, THEN the banner on stderr — well past the
+	// 16 KiB the audit copy keeps.
+	script := writeNamedScript(t, "codex",
+		"awk 'BEGIN{for(i=0;i<400;i++) printf \"%051d\\n\", i}'\n"+
+			"echo \"session id: "+codexID+"\" >&2\n")
+	a := &Adapter{
+		CommandTemplate: []string{script, "exec", "hello"},
+		Timeout:         10 * time.Second,
+		DBPath:          db, Store: st, SelfPath: "/bin/true",
+	}
+	req := domain.LLMRequest{
+		RequestID: "req-bulky", SessionID: "11111111-2222-4333-8444-555555555555",
+		CreatedAt: time.Now(),
+	}
+	if _, err := st.StageLLMRequest(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+
+	_, sessionID, _ := a.ConsultWithSession(context.Background(), req)
+
+	if sessionID != codexID {
+		t.Errorf("session id = %q, want %q — the banner fell outside the "+
+			"16 KiB audit copy and extraction did not read the raw output",
+			sessionID, codexID)
+	}
+}
