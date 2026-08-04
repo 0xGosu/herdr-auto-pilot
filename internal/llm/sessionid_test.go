@@ -3,6 +3,7 @@ package llm
 import (
 	"regexp"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -147,6 +148,53 @@ func TestExtractSessionIDIgnoresQuotedIDs(t *testing.T) {
 				t.Errorf("must not extract from %q, got %q", out, got)
 			}
 		})
+	}
+}
+
+// realCodexStderr is a VERBATIM capture from codex-cli 0.146.0 (2026-08-03),
+// kept because the codexBanner fixture above came from 0.143.0 and the format
+// has to be re-proved as codex moves.
+//
+// The leading noise is the point. codex writes an unrelated ERROR line first,
+// and that line embeds THE SAME UUID inside a shell_snapshots path — so a
+// pattern that merely searched for a uuid, or matched "session" anywhere on a
+// line, would extract from the wrong place on a completely ordinary run.
+const realCodexStderr = "Reading additional input from stdin...\n" +
+	"2026-08-03T15:46:01.419621Z ERROR codex_core::shell_snapshot: Shell snapshot " +
+	"validation failed: Snapshot command exited with status exit status: 2: " +
+	"/root/.codex/shell_snapshots/019fc84d-a8b8-77f2-8e20-8ea2c12822f4.tmp-1785771960838110783: " +
+	"line 1327: syntax error near unexpected token `('\n\n" +
+	"OpenAI Codex v0.146.0\n" +
+	"--------\n" +
+	"workdir: /workspaces/herdr-auto-pilot\n" +
+	"model: gpt-5.6-sol\n" +
+	"provider: openai\n" +
+	"approval: never\n" +
+	"sandbox: workspace-write [workdir, /tmp, $TMPDIR]\n" +
+	"reasoning effort: high\n" +
+	"reasoning summaries: none\n" +
+	"session id: 019fc84d-a8b8-77f2-8e20-8ea2c12822f4\n" +
+	"--------\n" +
+	"user\n"
+
+// TestExtractSessionIDFromRealCodex0146 pins extraction against real output
+// from a real run, noise and all — verified live 2026-08-03 by driving the
+// actual codex binary through the adapter.
+func TestExtractSessionIDFromRealCodex0146(t *testing.T) {
+	const want = "019fc84d-a8b8-77f2-8e20-8ea2c12822f4"
+	if got := ExtractSessionID("codex", realCodexStderr); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestExtractSessionIDIgnoresTheSnapshotPath isolates the trap above: the same
+// uuid appears in an error path BEFORE the banner, so extraction must come
+// from the banner line and nowhere else.
+func TestExtractSessionIDIgnoresTheSnapshotPath(t *testing.T) {
+	noiseOnly := realCodexStderr[:strings.Index(realCodexStderr, "OpenAI Codex")]
+	if got := ExtractSessionID("codex", noiseOnly); got != "" {
+		t.Errorf("extracted %q from the shell_snapshots path; only the "+
+			"line-anchored banner may be read", got)
 	}
 }
 
