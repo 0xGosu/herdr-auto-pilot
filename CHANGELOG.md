@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.31
+
+- Added tests pinning `codex` session-id extraction against a verbatim capture from a real codex-cli 0.146.0 run, including the case where codex prints an unrelated error carrying the same UUID in a file path *before* its banner — where a looser pattern would read the wrong id on a completely ordinary run.
+- Documented where each LLM CLI writes its session transcript, since `claude` and `codex` do not agree and a lookup cannot assume one layout.
+
 ## 0.5.30
 
 - Fixed the session id being read from the truncated copy of an LLM CLI's output rather than the whole of it. For a CLI that reports its own id (`codex`), enough output before the announcement would push it past the 16 KiB the audit row keeps, and hap would silently record the id it had minted instead — naming a conversation that never existed, with no error to explain it.
