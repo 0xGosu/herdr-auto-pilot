@@ -225,9 +225,9 @@ func (d *Daemon) applyLearnRetry(ctx context.Context, audit *domain.AuditRecord)
 	// retry on a stale row would resolve the working directory of whatever pane
 	// now answers to that id — and this CLI edits files. Requiring the agent to
 	// be live closes the common stale case (its pane is simply gone) and mirrors
-	// what applyLLMRetry already does for a consult retry. A pane RECYCLED to a
-	// different agent within the window is still not detectable here; the
-	// adapter's live-directory check is the remaining backstop.
+	// what applyLLMRetry already does for a consult retry. The agent-type check
+	// below catches the recycles it can; a pane recycled to the SAME type still
+	// passes both, leaving the adapter's live-directory check as the last word.
 	agents, err := d.opt.Herdr.ListAgents(ctx)
 	if err != nil {
 		// Transient: leave it queued for the next sweep rather than burning it.
