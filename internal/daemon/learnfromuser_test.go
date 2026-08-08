@@ -545,6 +545,63 @@ func TestLearnFromUserRetrySkipsWhenTheAgentIsGone(t *testing.T) {
 	}
 }
 
+// TestLearnFromUserRetryStaysQueuedWhilePaused: pressing `l` while automation
+// is paused must not evaporate the request. The operator pressed a key; the
+// retry has to survive until the pause lifts, or they get silence.
+func TestLearnFromUserRetryStaysQueuedWhilePaused(t *testing.T) {
+	h, fl, esc := learnHarness(t, "agent-lfu16")
+	fl.mu.Lock()
+	fl.learn = func(context.Context, domain.LearnRequest) (string, error) {
+		return "", errors.New("learn-from-user CLI failed: exit 1")
+	}
+	fl.mu.Unlock()
+
+	resolveWith(t, h, esc.ID, "use the dry-run flag")
+	waitFor(t, 3*time.Second, func() bool { return len(learnAudits(t, h)) == 1 })
+	failed := learnAudits(t, h)[0]
+
+	ctx := context.Background()
+	if _, err := h.raw.InsertKillEvent(ctx, domain.KillEvent{
+		State: "active", Scope: "global", Author: "operator", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fl.mu.Lock()
+	fl.learn = func(context.Context, domain.LearnRequest) (string, error) { return "recorded", nil }
+	fl.mu.Unlock()
+	before := len(fl.learnCalls())
+
+	if _, err := h.raw.InsertLLMRetry(ctx, failed.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := len(fl.learnCalls()) - before; got != 0 {
+		t.Errorf("a paused daemon must not run the retry, got %d call(s)", got)
+	}
+	q, _ := h.raw.UnprocessedLLMRetries(ctx)
+	if len(q) != 1 {
+		t.Fatalf("the retry must stay queued while paused, got %+v", q)
+	}
+
+	// Resuming lets the queued retry land.
+	if _, err := h.raw.InsertKillEvent(ctx, domain.KillEvent{
+		State: "resumed", Scope: "global", Author: "operator", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+			return false
+		}
+		return len(fl.learnCalls())-before == 1
+	})
+}
+
 func TestLearnFromUserRetriedCorrectionNeverFiresTwice(t *testing.T) {
 	dir := t.TempDir()
 	taskFile := filepath.Join(dir, "tasks.md")

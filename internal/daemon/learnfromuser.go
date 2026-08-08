@@ -84,10 +84,14 @@ func (d *Daemon) learnPort() ports.LearnFromUserPort {
 // cannot race a second correction for the same agent.
 // The timeout and template come from the LLM adapter, which main rebuilds from
 // config on every reload, so no config.Config is threaded through here.
-func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) {
+//
+// It reports whether a run was actually SPAWNED. A correction ignores that (a
+// skipped run is simply no lesson), but a RETRY must not be marked processed
+// when nothing ran — the operator pressed a key and would otherwise get silence.
+func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) bool {
 	lp := d.learnPort()
 	if lp == nil {
-		return
+		return false
 	}
 
 	// The kill switch covers this too. Learning from a correction is not a
@@ -97,7 +101,7 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) {
 	kill, err := d.opt.Store.LatestKillEvent(ctx)
 	if err != nil || domain.KillStateActive(kill) {
 		slog.Info("learn-from-user skipped: automation paused", "agent", req.AgentID)
-		return
+		return false
 	}
 
 	// One run per agent at a time. Corrections are human-paced, so this only
@@ -109,7 +113,7 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) {
 	if d.learnInFlight[req.AgentID] {
 		d.mu.Unlock()
 		slog.Info("learn-from-user skipped: run already in flight", "agent", req.AgentID)
-		return
+		return false
 	}
 	// Marked before the spawn so two corrections in one batch cannot both pass
 	// this gate. A spawn dropped because shutdown has latched leaves the mark
@@ -171,6 +175,7 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) {
 			d.mu.Unlock()
 		}
 	})
+	return true
 }
 
 // applyLearnRetry re-runs a failed learn-from-correction CLI from its audit
@@ -185,6 +190,15 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) {
 // terminal — a refused spawn writes its own learn:failed row, which the operator
 // can retry again.
 func (d *Daemon) applyLearnRetry(ctx context.Context, audit *domain.AuditRecord) bool {
+	// Unconfigured is TERMINAL, unlike the transient skips below: the operator
+	// removed llm.learn_from_user_command since the failure, so no amount of
+	// re-sweeping will ever run this. Consume the item instead of queueing it
+	// against a command that no longer exists.
+	if d.learnPort() == nil {
+		slog.Info("learn-from-user retry dropped: no learn command configured", "audit", audit.ID)
+		return true
+	}
+
 	// The agent must still be there. An audit row carries no terminal_id, so a
 	// retry on a stale row would resolve the working directory of whatever pane
 	// now answers to that id — and this CLI edits files. Requiring the agent to
@@ -217,7 +231,11 @@ func (d *Daemon) applyLearnRetry(ctx context.Context, audit *domain.AuditRecord)
 	}
 
 	slog.Info("learn-from-user retry requested", "audit", audit.ID, "agent", audit.AgentID)
-	d.learnFromUser(ctx, domain.LearnRequest{
+	// Only a run that actually SPAWNED consumes the queue item. Automation
+	// paused, or a run already in flight for this agent, are both transient —
+	// leaving the item queued makes the retry land on a later sweep instead of
+	// evaporating, which is what the operator expects from pressing a key.
+	return d.learnFromUser(ctx, domain.LearnRequest{
 		AgentType:     audit.AgentType,
 		AgentID:       audit.AgentID,
 		SituationType: audit.SituationType,
@@ -225,7 +243,6 @@ func (d *Daemon) applyLearnRetry(ctx context.Context, audit *domain.AuditRecord)
 		Suggestion:    audit.Suggestion,
 		Correction:    audit.Input,
 	})
-	return true
 }
 
 // learnWithSession runs the learn CLI through SessionReportingLearner when the
