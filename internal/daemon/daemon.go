@@ -4463,7 +4463,17 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	// caller fires it only after the correction is committed — a correction
 	// retried on a transient store error must not spawn the CLI twice.
 	// Confirmations are skipped on purpose: hap was right, so there is no lesson.
-	if !isConfirmation && audit.AgentID != "" {
+	//
+	// A generated-task escalation is excluded, and the exclusion is load-bearing
+	// rather than cosmetic. Confirming one records CorrectedAction =
+	// ActionNextDeclaredTask against a Suggestion of "LLM suggested task: …", so
+	// it never compares equal and every ACCEPTED task suggestion would read as a
+	// correction here. Worse, it is not an answer to anything on the screen —
+	// the operator approved a checklist edit — so the CLI would be told "you
+	// were about to answer <a task list> and the user corrected it to
+	// @next_declared_task", which is a lesson about hap's internal sentinels.
+	if !isConfirmation && audit.AgentID != "" &&
+		!strings.HasPrefix(audit.Suggestion, domain.SuggestTaskPrefix) {
 		eff.learn = &domain.LearnRequest{
 			AgentType:     state.AgentType,
 			AgentID:       audit.AgentID,

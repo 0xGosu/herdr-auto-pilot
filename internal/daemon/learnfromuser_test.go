@@ -162,6 +162,36 @@ func TestConfirmationDoesNotInvokeLearnFromUser(t *testing.T) {
 	}
 }
 
+// TestLearnFromUserSkipsGeneratedTaskConfirmations: accepting a generated-task
+// suggestion records CorrectedAction = @next_declared_task against a Suggestion
+// of "LLM suggested task: …", so it can never compare equal and looks like a
+// correction. It is not one — the operator approved a checklist edit, not an
+// answer to anything on screen — so it must not spend a learn run, and must not
+// teach the agent about hap's internal sentinels.
+func TestLearnFromUserSkipsGeneratedTaskConfirmations(t *testing.T) {
+	h, fl, _ := learnHarness(t, "agent-lfu9")
+	ctx := context.Background()
+	id, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-lfu9", AgentType: "claude", Signature: "sig-lfu9-gentask",
+		Trigger: "test", SituationType: domain.SituationIdle,
+		Action:      domain.AuditActionEscalated,
+		Suggestion:  domain.SuggestTaskPrefix + "Investigate the flaky auth test",
+		PaneExcerpt: "idle at prompt", Status: "escalated", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolveWith(t, h, id, domain.ActionNextDeclaredTask)
+
+	waitFor(t, 3*time.Second, func() bool {
+		a, _ := h.raw.GetAudit(ctx, id)
+		return a != nil && a.Status == "resolved"
+	})
+	if calls := fl.learnCalls(); len(calls) != 0 {
+		t.Errorf("accepting a generated task must not run the learn CLI, got %d call(s): %+v", len(calls), calls)
+	}
+}
+
 // TestLearnFromUserNotConfiguredIsNoop: the feature is off by default, and an
 // unconfigured daemon must resolve corrections exactly as it always did.
 func TestLearnFromUserNotConfiguredIsNoop(t *testing.T) {

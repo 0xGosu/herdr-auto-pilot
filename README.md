@@ -1631,6 +1631,8 @@ Invariants:
 
 - **Only corrections trigger it.** Confirming hap's suggestion means hap was
   right, so there is no lesson and no CLI run — confirmations never spend one.
+  Accepting a **generated task suggestion** does not count either: that is you
+  approving a checklist edit, not answering anything on the agent's screen.
 - **It runs in the agent's cwd**, which is what makes it edit the right
   project's memory file. A cwd herdr cannot report falls back to the daemon's
   usual working directory rather than failing the run.
