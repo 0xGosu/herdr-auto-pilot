@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -184,6 +185,37 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) {
 // terminal — a refused spawn writes its own learn:failed row, which the operator
 // can retry again.
 func (d *Daemon) applyLearnRetry(ctx context.Context, audit *domain.AuditRecord) bool {
+	// The agent must still be there. An audit row carries no terminal_id, so a
+	// retry on a stale row would resolve the working directory of whatever pane
+	// now answers to that id — and this CLI edits files. Requiring the agent to
+	// be live closes the common stale case (its pane is simply gone) and mirrors
+	// what applyLLMRetry already does for a consult retry. A pane RECYCLED to a
+	// different agent within the window is still not detectable here; the
+	// adapter's live-directory check is the remaining backstop.
+	agents, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		// Transient: leave it queued for the next sweep rather than burning it.
+		slog.Error("learn-from-user retry: listing agents failed", "agent", audit.AgentID, "error", err)
+		return false
+	}
+	live := false
+	for _, a := range agents {
+		if a.AgentID == audit.AgentID {
+			live = true
+			break
+		}
+	}
+	if !live {
+		label := audit.AgentID
+		if name, nerr := d.opt.Store.EnsureAgentName(ctx, audit.AgentID); nerr == nil && name != "" {
+			label = fmt.Sprintf("%s (%s)", name, audit.AgentID)
+		}
+		slog.Info("learn-from-user retry: agent no longer present", "agent", audit.AgentID)
+		d.notify(ctx, "Herd Auto Prompter: retry skipped",
+			fmt.Sprintf("Agent %s is no longer present — cannot re-run the learn command.", label))
+		return true
+	}
+
 	slog.Info("learn-from-user retry requested", "audit", audit.ID, "agent", audit.AgentID)
 	d.learnFromUser(ctx, domain.LearnRequest{
 		AgentType:     audit.AgentType,

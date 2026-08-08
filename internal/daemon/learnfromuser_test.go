@@ -507,6 +507,44 @@ func (s *flakyProcessedStore) MarkCorrectionProcessed(ctx context.Context, id in
 // recorded and still re-scores the signature; only the CLI run is skipped. The
 // alternative, remembering across sweeps that the row *was* live, would have to
 // survive the very failure that caused the retry.
+// TestLearnFromUserRetrySkipsWhenTheAgentIsGone: an audit row carries no
+// terminal_id, so retrying a stale row would resolve the working directory of
+// whatever pane now answers to that id — and this CLI edits files. Requiring
+// the agent to still be live closes the common stale case.
+func TestLearnFromUserRetrySkipsWhenTheAgentIsGone(t *testing.T) {
+	h, fl, esc := learnHarness(t, "agent-lfu15")
+	fl.mu.Lock()
+	fl.learn = func(context.Context, domain.LearnRequest) (string, error) {
+		return "", errors.New("learn-from-user CLI failed: exit 1")
+	}
+	fl.mu.Unlock()
+
+	resolveWith(t, h, esc.ID, "use the dry-run flag")
+	waitFor(t, 3*time.Second, func() bool { return len(learnAudits(t, h)) == 1 })
+	failed := learnAudits(t, h)[0]
+	before := len(fl.learnCalls())
+
+	// The agent's pane disappears before the operator retries.
+	h.herdr.setAgents(nil)
+
+	ctx := context.Background()
+	if _, err := h.raw.InsertLLMRetry(ctx, failed.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+	// The queue item must be consumed (terminal, not retried forever) without
+	// spawning the CLI.
+	waitFor(t, 3*time.Second, func() bool {
+		q, _ := h.raw.UnprocessedLLMRetries(ctx)
+		return len(q) == 0
+	})
+	if got := len(fl.learnCalls()) - before; got != 0 {
+		t.Errorf("retry must not run the CLI when the agent is gone, got %d call(s)", got)
+	}
+}
+
 func TestLearnFromUserRetriedCorrectionNeverFiresTwice(t *testing.T) {
 	dir := t.TempDir()
 	taskFile := filepath.Join(dir, "tasks.md")
