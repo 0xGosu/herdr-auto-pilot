@@ -2127,6 +2127,65 @@ func retryAppModel(t *testing.T) (Model, *store.Store, *frontend.App, int64) {
 	return m, st, app, id
 }
 
+// TestDetailViewRetriesFailedLearnFromUserRunOnAuditTab: a failed
+// learn-from-correction run is a RESOLVED audit row, never an escalation — so
+// it is reachable only from the Audit tab, and only `l` applies to it. The
+// footer must advertise the key (an unadvertised recovery is no recovery), and
+// the confirm/correct/dismiss bindings must stay off, since there is nothing
+// pending to confirm.
+func TestDetailViewRetriesFailedLearnFromUserRunOnAuditTab(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	app := &frontend.App{Store: st, Herdr: &captureHerdr{}, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	ctx := context.Background()
+	id, err := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:pA", AgentType: "claude", SituationType: domain.SituationApproval,
+		Trigger: domain.TriggerLLMLearnFromUser, Action: domain.AuditActionLearnFailed,
+		Rationale: "learn-from-user run failed: exit 2 — press `l` on this row's detail view to retry",
+		LLMOutput: "stderr:\nunknown flag", Input: "No, deny it",
+		Status: "resolved", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New(ctx, app)
+	m.width, m.height = 100, 30
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabAudit
+
+	m = press(t, m, "v")
+	if m.detail == nil {
+		t.Fatal("v should open the audit detail")
+	}
+	if m.detail.retryID != id {
+		t.Fatalf("a failed learn run must be retryable from the Audit tab, got retryID=%d want %d", m.detail.retryID, id)
+	}
+	if m.detail.confirmID != 0 {
+		t.Errorf("an audit row is not confirmable; confirmID must stay 0, got %d", m.detail.confirmID)
+	}
+	if footer := m.helpLine(); !strings.Contains(footer, "l: retry LLM") {
+		t.Errorf("the Audit detail footer must advertise retry, got %q", footer)
+	}
+
+	_, cmd := m.Update(pressKeyMsg("l"))
+	if cmd == nil {
+		t.Fatal("l on a failed learn run should issue the retry command")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok || res.err != nil {
+		t.Fatalf("retry should succeed, got %+v", res)
+	}
+	q, _ := st.UnprocessedLLMRetries(ctx)
+	if len(q) != 1 || q[0].AuditID != id {
+		t.Errorf("retry should queue for audit %d, got %+v", id, q)
+	}
+}
+
 func TestRetryLLMListQueuesForFailedConsult(t *testing.T) {
 	m, st, _, id := retryAppModel(t)
 	ctx := context.Background()
@@ -2216,8 +2275,8 @@ func TestDetailViewEscalationActionsAndFooter(t *testing.T) {
 	if m.detail == nil || m.detail.confirmID != id {
 		t.Fatalf("v should open the escalation detail snapshotting #%d, got %+v", id, m.detail)
 	}
-	if !m.detail.escRetryable {
-		t.Fatal("a [llm_timeout] escalation detail should be retryable")
+	if m.detail.retryID != id {
+		t.Fatalf("a [llm_timeout] escalation detail should be retryable, got retryID=%d", m.detail.retryID)
 	}
 	// The detail footer mirrors the list's per-entry actions.
 	footer := m.helpLine()
@@ -2288,7 +2347,7 @@ func TestDetailViewNonRetryableHidesRetryAndStaysOnEscalation(t *testing.T) {
 	m := testModel(t)
 	m.tab = tabEscalations
 	m = press(t, m, "v")
-	if m.detail == nil || m.detail.escRetryable {
+	if m.detail == nil || m.detail.retryID != 0 {
 		t.Fatalf("non-LLM escalation detail must not be retryable, got %+v", m.detail)
 	}
 	if strings.Contains(m.helpLine(), "retry LLM") {

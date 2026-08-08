@@ -326,6 +326,13 @@ const (
 	// delivery exhausts maxTaskHandouts. It marks a row as being about a
 	// hand-out rather than about what is on the agent's screen.
 	TriggerAutoSendReclaim = "auto-send-reclaim"
+	// TriggerLLMLearnFromUser is the audit_log trigger for the row a
+	// learn-from-correction run writes (llm.learn_from_user_command). Like
+	// TriggerLLMTaskReview it is its own trigger rather than a field folded
+	// into the correction lineage row, because it is a distinct side effect:
+	// the run EDITS A FILE in the agent's project. "Why did CLAUDE.md change?"
+	// must be answerable from `hap audit`.
+	TriggerLLMLearnFromUser = "llm-learn-from-user"
 )
 
 // Actions written on a TriggerLLMTaskReview audit row. Every review outcome
@@ -358,6 +365,42 @@ const (
 	RationaleOperatorConfirmed = "operator confirmed"
 	RationaleOperatorCorrected = "operator corrected"
 )
+
+// Actions written on a TriggerLLMLearnFromUser audit row. Both outcomes get
+// one: the run edits a file in the operator's project, so "it ran" must be
+// distinguishable from "it never ran". There are only two, deliberately —
+// nothing is parsed out of the CLI's output, so hap has no opinion on WHAT the
+// run decided, only on whether it completed. The output itself rides on the
+// row's LLMOutput for the operator to read.
+const (
+	// AuditActionLearnRecorded: the CLI ran to completion. Whether it actually
+	// wrote anything is between it and the file — hap does not inspect it.
+	AuditActionLearnRecorded = "learn:recorded"
+	// AuditActionLearnFailed: the CLI could not be spawned, exited non-zero,
+	// or timed out. Nothing else happens — a failed lesson never blocks the
+	// correction, which was already committed before the run started. The
+	// operator can re-run it (see IsRetryableLearnFailure).
+	AuditActionLearnFailed = "learn:failed"
+)
+
+// IsRetryableLearnFailure reports whether an audit row is a failed
+// learn-from-correction run the operator may re-run.
+//
+// It is deliberately NOT folded into IsRetryableLLMEscalation: that predicate
+// requires Status == "escalated", and a learn row is never an escalation (the
+// feature must not put a question in front of the operator). The row is
+// "resolved" from birth, and its retryability is carried by the trigger and
+// action instead.
+//
+// Retryability is decided here, but SAFETY is decided at fire time, not by this
+// predicate: the run re-resolves the agent's working directory live, which is
+// what keeps it correct on a moved agent and what makes it dangerous on a
+// RECYCLED pane id (an audit row carries no terminal_id). daemon.applyLearnRetry
+// carries those guards — the agent must still be live and still be the same
+// agent type.
+func IsRetryableLearnFailure(a *AuditRecord) bool {
+	return a != nil && a.Trigger == TriggerLLMLearnFromUser && a.Action == AuditActionLearnFailed
+}
 
 // audit_log Status literals shared across packages.
 const (

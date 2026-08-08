@@ -349,6 +349,8 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 			TaskGenTemplate:      cfg.LLM.GenerateTaskCommand,
 			TaskGenStartTemplate: cfg.LLM.GenerateTaskCommandStart,
 			TaskGenTimeout:       cfg.GenerateTaskTimeout(),
+			LearnTemplate:        cfg.LLM.LearnFromUserCommand,
+			LearnTimeout:         cfg.LearnFromUserTimeout(),
 			// The `.env` files are never read here: the adapter reads them
 			// when it spawns a CLI, so editing a file applies to the next
 			// run, and changing the configured PATH applies on the next
@@ -358,6 +360,7 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 			CommandStartEnv: llm.EnvSpec{Vars: cfg.LLM.CommandStartEnv, File: cfg.LLM.CommandStartEnvFile},
 			TaskGenEnv:      llm.EnvSpec{Vars: cfg.LLM.GenerateTaskEnv, File: cfg.LLM.GenerateTaskEnvFile},
 			TaskGenStartEnv: llm.EnvSpec{Vars: cfg.LLM.GenerateTaskStartEnv, File: cfg.LLM.GenerateTaskStartEnvFile},
+			LearnEnv:        llm.EnvSpec{Vars: cfg.LLM.LearnFromUserEnv, File: cfg.LLM.LearnFromUserEnvFile},
 		}
 	}
 

@@ -2394,11 +2394,14 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"llm.task_generate_command":                `claude -p "suggest a task"`,
 		"llm.task_generate_command_start":          `claude -p "first suggest a task"`,
 		"llm.task_generate_timeout_seconds":        "45",
+		"llm.learn_from_user_command":              `claude -p "record the lesson"`,
+		"llm.learn_from_user_timeout_seconds":      "90",
 		"llm.env_file":                             "/etc/hap/llm.env",
 		"llm.command_env_file":                     "/etc/hap/consult.env",
 		"llm.command_start_env_file":               "/etc/hap/start.env",
 		"llm.task_generate_command_env_file":       "/etc/hap/taskgen.env",
 		"llm.task_generate_command_start_env_file": "/etc/hap/taskgen_start.env",
+		"llm.learn_from_user_command_env_file":     "/etc/hap/learn.env",
 		"embedding.disabled":                       "false",
 		"embedding.model_path":                     "/models/custom.gguf",
 		"embedding.similarity_threshold":           "0.90",
@@ -2539,6 +2542,7 @@ func TestFieldTUIEditableClassification(t *testing.T) {
 		"llm.rewrite_action_fallback_template": true,
 		"llm.task_generate_command":            true,
 		"llm.task_generate_command_start":      true,
+		"llm.learn_from_user_command":          true,
 		"embedding.model_path":                 true,
 	}
 	for _, f := range frontend.ConfigFields {
@@ -2585,6 +2589,7 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 		"llm.command_start_env_file":               true,
 		"llm.task_generate_command_env_file":       true,
 		"llm.task_generate_command_start_env_file": true,
+		"llm.learn_from_user_command_env_file":     true,
 		"embedding.pane_salient_chars":             true,
 		"embedding.warm_timeout_ms":                true,
 		// Eight color strings would bury the settings a TUI operator actually
@@ -5553,6 +5558,57 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 		// it here would make the two keys order-dependent to set.
 		if err := app.SetField(ctx, "embedding.bm25_highbar_score", "0.10"); err != nil {
 			t.Errorf("a high bar below bm25_min_score must be storable, got %v", err)
+		}
+	})
+
+	t.Run("learn_from_user keys persist, validate, and clear", func(t *testing.T) {
+		if err := app.SetField(ctx, "llm.learn_from_user_command", `claude -p "record the lesson"`); err != nil {
+			t.Fatalf("SetField rejected a valid argv: %v", err)
+		}
+		cfg, err := app.Config()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cfg.LLM.LearnFromUserCommand; len(got) != 3 || got[0] != "claude" || got[2] != "record the lesson" {
+			t.Errorf("LearnFromUserCommand = %q — SetField accepted the value but did not store it as argv", got)
+		}
+		// Empty disables the feature; that is a setting, not an error.
+		if err := app.SetField(ctx, "llm.learn_from_user_command", ""); err != nil {
+			t.Errorf("an empty command must disable the feature, got %v", err)
+		}
+		if cfg, _ = app.Config(); len(cfg.LLM.LearnFromUserCommand) != 0 {
+			t.Errorf("empty command did not clear: %q", cfg.LLM.LearnFromUserCommand)
+		}
+		// An unbalanced quote is a real parse error, not a silent single arg.
+		if err := app.SetField(ctx, "llm.learn_from_user_command", `claude -p "unterminated`); err == nil {
+			t.Error("SetField accepted an unbalanced quote")
+		}
+
+		if err := app.SetField(ctx, "llm.learn_from_user_timeout_seconds", "90"); err != nil {
+			t.Fatalf("SetField rejected a valid timeout: %v", err)
+		}
+		if cfg, _ = app.Config(); cfg.LLM.LearnFromUserTimeoutSeconds != 90 {
+			t.Errorf("LearnFromUserTimeoutSeconds = %d, want 90", cfg.LLM.LearnFromUserTimeoutSeconds)
+		}
+		// 0 is legal and means "inherit timeout_seconds"; negatives and
+		// non-numbers are not.
+		if err := app.SetField(ctx, "llm.learn_from_user_timeout_seconds", "0"); err != nil {
+			t.Errorf("0 must be accepted (inherits timeout_seconds), got %v", err)
+		}
+		for _, bad := range []string{"-1", "abc", ""} {
+			if err := app.SetField(ctx, "llm.learn_from_user_timeout_seconds", bad); err == nil {
+				t.Errorf("SetField accepted %q for a non-negative integer field", bad)
+			}
+		}
+
+		if err := app.SetField(ctx, "llm.learn_from_user_command_env_file", "/etc/hap/learn.env"); err != nil {
+			t.Fatalf("SetField rejected a valid env path: %v", err)
+		}
+		if cfg, _ = app.Config(); cfg.LLM.LearnFromUserEnvFile != "/etc/hap/learn.env" {
+			t.Errorf("LearnFromUserEnvFile = %q, want the path", cfg.LLM.LearnFromUserEnvFile)
+		}
+		if err := app.SetField(ctx, "llm.learn_from_user_command_env_file", ""); err != nil {
+			t.Errorf("an empty env path must clear it, got %v", err)
 		}
 	})
 

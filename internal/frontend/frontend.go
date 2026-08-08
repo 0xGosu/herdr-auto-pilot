@@ -1453,8 +1453,11 @@ func (a *App) RetryLLM(ctx context.Context, auditID int64) error {
 	if audit == nil {
 		return fmt.Errorf("audit record %d not found", auditID)
 	}
-	if !domain.IsRetryableLLMEscalation(audit) {
-		return fmt.Errorf("audit record %d is not a retryable LLM escalation", auditID)
+	// Two shapes queue here: a failed LLM escalation (re-drives the consult
+	// pipeline) and a failed learn-from-correction run (re-runs that CLI). The
+	// daemon tells them apart from the audit row; both are just an id here.
+	if !domain.IsRetryableLLMEscalation(audit) && !domain.IsRetryableLearnFailure(audit) {
+		return fmt.Errorf("audit record %d is not retryable: only a failed or timed-out LLM escalation, or a failed learn-from-correction run, can be re-invoked", auditID)
 	}
 	if _, err := a.Store.InsertLLMRetry(ctx, auditID, time.Now()); err != nil {
 		return err
@@ -1597,6 +1600,8 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "llm.task_generate_command"},                             // argv template (idle task suggestion)
 	{Key: "llm.task_generate_command_start"},                       // argv template (first generation; inherits task_generate_command)
 	{Key: "llm.task_generate_timeout_seconds", TUIEditable: true},
+	{Key: "llm.learn_from_user_command"}, // argv template (lesson after an operator correction)
+	{Key: "llm.learn_from_user_timeout_seconds", TUIEditable: true},
 	// Only the `.env` PATHS are registered. The inline `[llm.*_env]` tables
 	// hold API keys, and every key in this registry is rendered by
 	// `config fields`, so they stay config.toml-only; `hap config`
@@ -1606,6 +1611,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "llm.command_start_env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "llm.task_generate_command_env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "llm.task_generate_command_start_env_file", TUIEditable: true, TUIHidden: true},
+	{Key: "llm.learn_from_user_command_env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "embedding.disabled", TUIEditable: true},
 	{Key: "embedding.model_path"}, // path
 	{Key: "embedding.similarity_threshold", TUIEditable: true},
@@ -1855,6 +1861,16 @@ func FieldValue(cfg config.Config, key string) string {
 			return "(inherits timeout_seconds)"
 		}
 		return strconv.Itoa(cfg.LLM.GenerateTaskTimeoutSeconds)
+	case "llm.learn_from_user_command":
+		if len(cfg.LLM.LearnFromUserCommand) == 0 {
+			return "(disabled)"
+		}
+		return JoinCommand(cfg.LLM.LearnFromUserCommand)
+	case "llm.learn_from_user_timeout_seconds":
+		if cfg.LLM.LearnFromUserTimeoutSeconds <= 0 {
+			return "(inherits timeout_seconds)"
+		}
+		return strconv.Itoa(cfg.LLM.LearnFromUserTimeoutSeconds)
 	case "llm.env_file":
 		return envFileValue(cfg.LLM.EnvFile)
 	case "llm.command_env_file":
@@ -1865,6 +1881,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return envFileValue(cfg.LLM.GenerateTaskEnvFile)
 	case "llm.task_generate_command_start_env_file":
 		return envFileValue(cfg.LLM.GenerateTaskStartEnvFile)
+	case "llm.learn_from_user_command_env_file":
+		return envFileValue(cfg.LLM.LearnFromUserEnvFile)
 	case "embedding.disabled":
 		return strconv.FormatBool(cfg.Embedding.Disabled)
 	case "embedding.model_path":
@@ -2073,6 +2091,22 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			cfg.LLM.GenerateTaskTimeoutSeconds = v
 			return nil
+		case "llm.learn_from_user_command":
+			argv, err := SplitCommand(value)
+			if err != nil {
+				return fmt.Errorf("llm.learn_from_user_command: %w", err)
+			}
+			cfg.LLM.LearnFromUserCommand = argv // empty disables learning from corrections
+			return nil
+		case "llm.learn_from_user_timeout_seconds":
+			// 0 inherits timeout_seconds at use time (LearnFromUserTimeout());
+			// a positive value bounds one learn run. Reject negatives.
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("llm.learn_from_user_timeout_seconds must be a non-negative integer (0 = inherit timeout_seconds), got %q", value)
+			}
+			cfg.LLM.LearnFromUserTimeoutSeconds = v
+			return nil
 		case "embedding.disabled":
 			v, err := strconv.ParseBool(value)
 			if err != nil {
@@ -2101,6 +2135,9 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			return nil
 		case "llm.task_generate_command_start_env_file":
 			cfg.LLM.GenerateTaskStartEnvFile = strings.TrimSpace(value)
+			return nil
+		case "llm.learn_from_user_command_env_file":
+			cfg.LLM.LearnFromUserEnvFile = strings.TrimSpace(value)
 			return nil
 		case "embedding.similarity_threshold":
 			return setFloat(&cfg.Embedding.SimilarityThreshold)

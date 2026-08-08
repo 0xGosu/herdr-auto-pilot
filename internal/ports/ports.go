@@ -207,6 +207,36 @@ type TaskGeneratorPort interface {
 	GenerateTaskConfigured() bool
 }
 
+// LearnFromUserPort is an optional capability of the LLM adapter: a one-shot
+// run that records a lesson in the agent's own project memory after the
+// operator CORRECTS an escalation (llm.learn_from_user_command). Callers
+// type-assert and degrade gracefully when absent.
+//
+// Unlike Consult it stages nothing and returns no decision — the CLI's side
+// effect is the edit it makes to a file in the agent's working directory.
+// NOTHING is parsed out of the returned string: it is the run's TRANSCRIPT
+// (stdout and stderr, labelled), carried to the audit row purely so the
+// operator can read what the CLI said and diagnose a failure.
+type LearnFromUserPort interface {
+	// LearnFromUser runs the configured CLI in the agent's working directory
+	// and returns the run's transcript, or an error on spawn failure /
+	// non-zero exit / timeout. The transcript is returned on the ERROR path
+	// too — a failed run's stderr is the whole point. Empty output is NOT an
+	// error: the CLI's job is to edit a file, not to print anything.
+	LearnFromUser(ctx context.Context, req domain.LearnRequest) (string, error)
+	// LearnFromUserConfigured reports whether a learn-from-user CLI is
+	// configured.
+	LearnFromUserConfigured() bool
+}
+
+// SessionReportingLearner is the LearnFromUser counterpart of
+// SessionReportingLLM: it reports which CLI conversation the run actually used,
+// on the error path too, so a failed run stays traceable to the transcript it
+// left behind.
+type SessionReportingLearner interface {
+	LearnFromUserWithSession(ctx context.Context, req domain.LearnRequest) (string, string, error)
+}
+
 // StorePort is the persistence boundary. Write-ownership is partitioned:
 // daemon-exclusive writers for signatures/agent_rate/error_retries/decisions,
 // daemon-emitted audit rows, and signature_embeddings (with one maintenance

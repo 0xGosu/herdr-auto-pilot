@@ -67,6 +67,16 @@ type Adapter struct {
 	// task-generation templates, layered over BaseEnv.
 	TaskGenEnv      EnvSpec
 	TaskGenStartEnv EnvSpec
+	// LearnTemplate is the argv template for the one-shot run that records a
+	// lesson after an operator correction (llm.learn_from_user_command);
+	// placeholders {self}, {agent_name}, {agent_type}, {cwd}, {situation_type},
+	// {pane_excerpt}, {suggestion}, {correction}. Empty disables it. There is
+	// no *Start variance — see config.LLM.LearnFromUserCommand.
+	LearnTemplate []string
+	// LearnTimeout bounds one learn-from-user run (<=0 falls back to Timeout).
+	LearnTimeout time.Duration
+	// LearnEnv is the environment for LearnTemplate, layered over BaseEnv.
+	LearnEnv EnvSpec
 }
 
 // Configured reports whether an LLM CLI is configured (IR-005).

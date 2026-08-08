@@ -1,0 +1,139 @@
+package domain
+
+import (
+	"strings"
+	"unicode/utf8"
+)
+
+// Learning from an operator correction (llm.learn_from_user_command): when the
+// operator answers an escalation with something OTHER than what hap suggested,
+// a one-shot CLI is run in the agent's own working directory and asked to write
+// the lesson into that project's memory file (CLAUDE.md for claude, AGENTS.md
+// for codex).
+//
+// This is the durable half of correction handling. The statistical half —
+// RecordDecision, Confidence, MaybeGraduate — is keyed on a SIGNATURE, so it
+// only helps when the same screen comes back. A lesson in the project's memory
+// file survives a screen that mints a fresh signature, and survives the agent
+// process itself.
+//
+// The run is advisory in the strongest sense: it never touches the pane, never
+// mints a hap rule, and never escalates. It happens strictly AFTER the
+// correction has been committed, so a failure can never cost the operator
+// their correction. These are the pure pieces — the subprocess lives in
+// internal/llm and the dispatch in internal/daemon.
+
+// TailRunes keeps the last n bytes of s without ever starting mid-rune,
+// marking a cut with a leading ellipsis. It is the shared truncation used
+// wherever CLI output is carried onward for a human to read.
+//
+// Bytes-then-align rather than []rune(s)[len-n:]: converting to a rune slice
+// materializes four bytes per rune of the WHOLE input just to keep its tail, so
+// a runaway CLI emitting hundreds of megabytes would cost gigabytes of
+// transient allocation inside the daemon. n is therefore a byte budget; the
+// result is at most n bytes and always valid UTF-8.
+//
+// The TAIL, not the head: a CLI that fails says why at the end, while the head
+// is usually a banner.
+func TailRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := s[len(s)-n:]
+	for i := 0; i < len(cut) && i < utf8.UTFMax; i++ {
+		if utf8.RuneStart(cut[i]) {
+			return "…" + cut[i:]
+		}
+	}
+	// Every byte in the window was a continuation byte, so the window is a bare
+	// rune fragment with no start to align to — the budget was smaller than the
+	// last character. Returning the fragment would emit invalid UTF-8, so return
+	// only the cut marker.
+	return "…"
+}
+
+// NoSuggestionText is what {suggestion} expands to when the escalation carried
+// no suggestion — hap escalated without an opinion (an unclassifiable screen,
+// or a rule that resolved to nothing). Rendering the empty string instead would
+// leave the shipped prompt's "You were about to answer:" trailing into nothing,
+// which reads to a model as a truncated prompt rather than as a fact.
+const NoSuggestionText = "(nothing — hap had no suggestion and escalated to the operator)"
+
+// SuggestionText is the {suggestion} rendering of a learn request: the
+// suggestion itself, or NoSuggestionText when there was none. The @noop
+// sentinel is spelled out for the same reason CorrectionText does it.
+func (r LearnRequest) SuggestionText() string {
+	if strings.TrimSpace(r.Suggestion) == "" {
+		return NoSuggestionText
+	}
+	return spellOutNoop(r.Suggestion)
+}
+
+// CorrectionText is the {correction} rendering: the operator's answer, with the
+// @noop sentinel spelled out. "@noop" is hap's internal token for "no reply was
+// needed"; handed to a model as-is it reads as a literal string the operator
+// typed, and the lesson recorded would be about the token rather than about
+// leaving the situation alone.
+func (r LearnRequest) CorrectionText() string {
+	return spellOutNoop(r.Correction)
+}
+
+// spellOutNoop replaces a bare hap SENTINEL with its human phrasing, leaving
+// every other action untouched.
+//
+// Sentinels are hap's internal tokens for "answer nothing" and "hand out the
+// next task". A model handed one verbatim has no way to know it is a token: it
+// reads as a literal string the operator typed, so the lesson recorded is about
+// the spelling of "@next_task:declared" rather than about the behavior the
+// operator actually wanted. Every sentinel that can reach a learn prompt must
+// be listed here.
+func spellOutNoop(action string) string {
+	trimmed := strings.TrimSpace(action)
+	if IsNoopAction(NormalizeNoopAction(trimmed)) {
+		return ActionNoopSuggestion
+	}
+	switch trimmed {
+	case ActionNextDeclaredTask:
+		return "send the agent its next task from its declared task list"
+	case ActionNextInferredTask:
+		return "send the agent the next task inferred from its own on-screen todo list"
+	}
+	return action
+}
+
+// LearnRequest is everything the learn-from-user CLI template can reference.
+type LearnRequest struct {
+	// AgentType is the agent's type ("claude", "codex", …), for {agent_type}.
+	// It is also how an operator picks the right memory file in their prompt:
+	// CLAUDE.md for claude, AGENTS.md for codex.
+	AgentType string
+	// AgentName is the agent's short name, for {agent_name}.
+	AgentName string
+	// AgentID is the herdr pane id the correction was recorded against. It is
+	// not a placeholder — it identifies the agent on the audit row and keys the
+	// daemon's one-run-in-flight guard.
+	AgentID string
+	// Cwd is the agent's working directory, for {cwd}. It is ALSO the directory
+	// the CLI is spawned in, which is what makes it edit the right project's
+	// memory file rather than the daemon's.
+	Cwd string
+	// SituationType is the classified situation the escalation came from
+	// ("approval", "choice", "error", "idle", …), for {situation_type}.
+	SituationType SituationType
+	// PaneExcerpt is the pane content the escalation was classified from, for
+	// {pane_excerpt}. It is the historical snapshot on the audit row, not a
+	// fresh read: the lesson is about the screen the operator was looking at.
+	PaneExcerpt string
+	// Suggestion is what hap was about to answer, for {suggestion}. Without it
+	// the CLI sees only the right answer and cannot tell what the mistake was.
+	// It is EMPTY when the escalation carried no suggestion at all (hap could
+	// not classify the screen). That still runs — "hap had no idea and you said
+	// X" is a lesson, often the most useful one — and {suggestion} renders as
+	// NoSuggestionText so the prompt does not trail off mid-sentence.
+	Suggestion string
+	// Correction is what the operator answered instead, for {correction}.
+	Correction string
+	// SessionID identifies the CLI conversation this run happens in, and is
+	// what the CLI names its transcript file. See LLMRequest.SessionID.
+	SessionID string
+}

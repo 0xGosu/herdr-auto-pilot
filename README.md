@@ -1599,6 +1599,86 @@ Invariants:
   TUI **Config** tab and select the **Repoint /usr/local/bin/hap** row under
   **Quick Shortcuts**.
 
+### Learning from your corrections (optional)
+
+When you **correct** an escalation — answer it with something other than what
+hap suggested — hap can run a one-shot CLI **in the agent's own working
+directory** and ask the agent to write the lesson into that project's memory
+file (`CLAUDE.md` for claude, `AGENTS.md` for codex).
+
+```toml
+[llm]
+learn_from_user_command = [
+  "claude", "--model", "opus", "--permission-mode", "acceptEdits", "-p",
+  "You are recording a lesson for yourself. Read the operator's correction below, then update CLAUDE.md in the current directory so you do not repeat the mistake. ... If the correction carries no durable lesson, change nothing.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
+]
+# learn_from_user_timeout_seconds = 300   # omitted: inherits timeout_seconds
+```
+
+`sample/config.toml` carries the full prompt and a commented codex recipe.
+
+Why it exists: hap already learns from a correction, but that learning is keyed
+on the **signature of one screen**. A lesson written into the project's memory
+file survives a screen that hashes differently, and survives the agent process
+itself. The two are complementary — the statistical learning still happens
+exactly as before.
+
+Placeholders: `{self}`, `{agent_name}`, `{agent_type}`, `{cwd}`,
+`{situation_type}`, `{pane_excerpt}`, `{suggestion}` (what hap was about to
+answer), `{correction}` (what you answered instead), `{session_id}`.
+
+Invariants:
+
+- **Only corrections trigger it.** Confirming hap's suggestion means hap was
+  right, so there is no lesson and no CLI run — confirmations never spend one.
+  Accepting a **generated task suggestion** does not count either: that is you
+  approving a checklist edit, not answering anything on the agent's screen.
+- **Only a standing escalation teaches.** Correcting an old row from the
+  **audit** tab still feeds the normal learning, but runs no CLI: herdr recycles
+  pane ids, so on a historical row the agent's "current directory" can belong to
+  a different agent entirely, and the lesson would land in someone else's
+  project. (For the same reason, a correction whose bookkeeping fails and gets
+  retried drops its lesson rather than risk running twice — the correction
+  itself is never lost.)
+- **It runs in the agent's cwd**, which is what makes it edit the right
+  project's memory file. If that directory cannot be resolved, or no longer
+  exists, the run is **refused** rather than redirected — the CLI has write
+  permission and is told to edit "the current directory", so a fallback would
+  write your lesson into an unrelated project (or your global `~/CLAUDE.md`).
+  The refusal is recorded as `learn:failed`, and a successful run names the
+  directory it edited on its audit row.
+- **It never touches the pane**, never creates or changes a hap rule, and
+  **never escalates**. Every run leaves exactly one `hap audit` row
+  (`llm-learn-from-user`), either `learn:recorded` or `learn:failed`.
+- **Nothing is parsed out of the reply.** hap takes no decision from this CLI,
+  so the prompt needs no sentinel and no output shape — write it however suits
+  your agent. Whatever it prints (stdout *and* stderr) is captured verbatim on
+  the audit row: open the row in the TUI's **Audit** tab and press `v` to read
+  it. That is also how you diagnose a failure.
+- **A failed run is retryable.** Open its row in the **Audit** tab and press
+  `l`. The retry rebuilds the request from the row and re-resolves the agent's
+  working directory live, so it still edits the right project — or refuses
+  again if it cannot tell. Each attempt writes its own audit row. A retry is
+  refused (with a toast) when the agent's pane is gone, when that pane now runs
+  a different agent type, or when automation is paused — in the last case
+  `hap resume` first, then press `l` again, so a paused pause never turns into a
+  file edit you did not expect.
+- **It runs only after your correction is committed**, so a broken CLI here can
+  never cost you the correction — and a correction retried after a transient
+  error still runs the CLI exactly once.
+- **`hap pause` suppresses it** like every other automated action, and only one
+  run per agent is in flight at a time so a burst of corrections cannot race
+  two CLIs editing the same file.
+- **No `_start` variance.** Unlike `command` and `task_generate_command` there
+  is no `learn_from_user_command_start`: `*_start` marks an agent's *first*
+  interaction, and "the first correction" means nothing different from the
+  tenth.
+- **The CLI needs write access** to edit the memory file — note
+  `--permission-mode acceptEdits` above, which the read-only consult recipe
+  does not use.
+- **Cost note**: one CLI run per correction. Corrections are human-paced, so
+  this is far cheaper than the consult path.
+
 ### Answering escalations you never got to (optional)
 
 An escalation waits for you. If you are asleep, in a meeting, or simply

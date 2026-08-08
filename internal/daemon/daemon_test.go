@@ -440,6 +440,39 @@ func (f *fakeTaskGen) genCalls() []domain.TaskGenRequest {
 	return append([]domain.TaskGenRequest(nil), f.requests...)
 }
 
+// fakeLearner layers ports.LearnFromUserPort on the LLM fake so the daemon's
+// type assertion finds the optional learn-from-correction capability. Every
+// request is recorded so a test can assert what the CLI would have been told.
+type fakeLearner struct {
+	*fakeLLM
+	mu       sync.Mutex
+	learn    func(ctx context.Context, req domain.LearnRequest) (string, error)
+	requests []domain.LearnRequest
+}
+
+func (f *fakeLearner) LearnFromUserConfigured() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.learn != nil
+}
+
+func (f *fakeLearner) LearnFromUser(ctx context.Context, req domain.LearnRequest) (string, error) {
+	f.mu.Lock()
+	f.requests = append(f.requests, req)
+	fn := f.learn
+	f.mu.Unlock()
+	if fn == nil {
+		return "", errors.New("no learn configured")
+	}
+	return fn(ctx, req)
+}
+
+func (f *fakeLearner) learnCalls() []domain.LearnRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.LearnRequest(nil), f.requests...)
+}
+
 // failingStore injects persistence failures on audit writes (FR-024) and,
 // optionally, on the LLM in-flight check.
 type failingStore struct {
@@ -567,6 +600,15 @@ func newHarnessTaskGen(t *testing.T, cfgTOML string,
 	generate func(ctx context.Context, req domain.TaskGenRequest) (string, error)) (*harness, *fakeTaskGen) {
 	tg := &fakeTaskGen{fakeLLM: &fakeLLM{}, generate: generate}
 	return newHarnessCore(t, cfgTOML, nil, tg, tg.fakeLLM, nil), tg
+}
+
+// newHarnessLearn installs a learn-from-correction-capable LLM port. Like every
+// other port wrapper it must be handed to newHarnessCore BEFORE Run — see the
+// note there about racing the startup sweep.
+func newHarnessLearn(t *testing.T, cfgTOML string,
+	learn func(ctx context.Context, req domain.LearnRequest) (string, error)) (*harness, *fakeLearner) {
+	fl := &fakeLearner{fakeLLM: &fakeLLM{}, learn: learn}
+	return newHarnessCore(t, cfgTOML, nil, fl, fl.fakeLLM, nil), fl
 }
 
 // newHarnessPaused builds a harness whose daemon Store is a pausingAutomationStore

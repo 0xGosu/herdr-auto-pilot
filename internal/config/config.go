@@ -303,9 +303,36 @@ type LLM struct {
 	// GenerateTaskTimeoutSeconds bounds one task-generation run; zero or
 	// omitted inherits timeout_seconds.
 	GenerateTaskTimeoutSeconds int `toml:"task_generate_timeout_seconds,omitempty"`
+	// LearnFromUserCommand is the argv template for the one-shot CLI run that
+	// records a lesson after the OPERATOR CORRECTS an escalation — the agent
+	// is asked to write the lesson into its own project memory (CLAUDE.md for
+	// claude, AGENTS.md for codex), so the correction outlives the signature it
+	// was learned on. Placeholders: {self}, {agent_name}, {agent_type}, {cwd},
+	// {situation_type}, {pane_excerpt}, {suggestion}, {correction},
+	// {session_id}. Empty (the default) disables the feature entirely.
+	//
+	// It runs in the AGENT's working directory, so the CLI edits the right
+	// project's memory file, and it is deliberately NOT an MCP flow: nothing is
+	// staged and nothing is read back from stdout except the optional "@noop"
+	// decline. The run never touches the pane, never learns a hap rule and
+	// never escalates — every outcome is one audit row
+	// (domain.TriggerLLMLearnFromUser).
+	//
+	// It fires only on a real CORRECTION, never on a confirmation: a confirmed
+	// suggestion means hap was right, so there is no lesson to record.
+	//
+	// There is deliberately NO learn_from_user_command_start variance. The
+	// consult and task-generation pairs use *_start for an agent's FIRST
+	// interaction, which is a property of the agent's lifecycle; a correction
+	// is a property of a mistake, and "the first mistake" carries no different
+	// meaning from the tenth.
+	LearnFromUserCommand []string `toml:"learn_from_user_command,omitempty"`
+	// LearnFromUserTimeoutSeconds bounds one learn-from-user run; zero or
+	// omitted inherits timeout_seconds.
+	LearnFromUserTimeoutSeconds int `toml:"learn_from_user_timeout_seconds,omitempty"`
 
 	// ── Per-command environment ──────────────────────────────────────
-	// Each of the four command templates can carry its own environment, so
+	// Each of the five command templates can carry its own environment, so
 	// one CLI can run against a different provider/model/key than another.
 	// Values may be listed inline (`*_env` tables) or kept out of the config
 	// in a `.env` file (`*_env_file`), which is the right home for secrets:
@@ -315,7 +342,7 @@ type LLM struct {
 	// the run (escalation) rather than silently launching without its key.
 	//
 	// Layering, last wins: the daemon's own environment, then EnvFile, Env
-	// (the shared base, applied to all four commands), then the command's
+	// (the shared base, applied to all five commands), then the command's
 	// own *EnvFile and *Env. hap's HAP_* variables are always injected last.
 	// Values support the same placeholders as the command template, minus
 	// {pane_excerpt} (untrusted pane text is never put in the environment).
@@ -333,6 +360,8 @@ type LLM struct {
 	// GenerateTaskStartEnvFile is the `.env` file for
 	// GenerateTaskCommandStart only.
 	GenerateTaskStartEnvFile string `toml:"task_generate_command_start_env_file,omitempty"`
+	// LearnFromUserEnvFile is the `.env` file for LearnFromUserCommand only.
+	LearnFromUserEnvFile string `toml:"learn_from_user_command_env_file,omitempty"`
 
 	// Env is the shared inline environment applied to every command.
 	// Map fields are declared last: the TOML encoder emits sub-tables after
@@ -348,6 +377,8 @@ type LLM struct {
 	// GenerateTaskStartEnv is the inline environment for
 	// GenerateTaskCommandStart only.
 	GenerateTaskStartEnv map[string]string `toml:"task_generate_command_start_env,omitempty"`
+	// LearnFromUserEnv is the inline environment for LearnFromUserCommand only.
+	LearnFromUserEnv map[string]string `toml:"learn_from_user_command_env,omitempty"`
 }
 
 // Embedding configures semantic signature matching: situations are matched
@@ -1416,7 +1447,7 @@ func (c *Config) fillZeroes() {
 // to debug — but its contents are never read for display.
 type LLMEnvSummary struct {
 	// Scope names the command the environment belongs to ("shared" for the
-	// base applied to all four).
+	// base applied to all five).
 	Scope string
 	// Keys are the inline variable NAMES, sorted. Never their values.
 	Keys []string
@@ -1437,6 +1468,7 @@ func (l LLM) EnvSummaries() []LLMEnvSummary {
 		{"command_start", l.CommandStartEnv, l.CommandStartEnvFile},
 		{"task_generate_command", l.GenerateTaskEnv, l.GenerateTaskEnvFile},
 		{"task_generate_command_start", l.GenerateTaskStartEnv, l.GenerateTaskStartEnvFile},
+		{"learn_from_user_command", l.LearnFromUserEnv, l.LearnFromUserEnvFile},
 	}
 	var out []LLMEnvSummary
 	for _, s := range scopes {
@@ -1466,6 +1498,16 @@ func (c Config) GenerateTaskTimeout() time.Duration {
 		return c.LLMTimeout()
 	}
 	return time.Duration(c.LLM.GenerateTaskTimeoutSeconds) * time.Second
+}
+
+// LearnFromUserTimeout returns the learn-from-correction timeout:
+// learn_from_user_timeout_seconds, or — when zero/omitted — the consult
+// timeout_seconds.
+func (c Config) LearnFromUserTimeout() time.Duration {
+	if c.LLM.LearnFromUserTimeoutSeconds <= 0 {
+		return c.LLMTimeout()
+	}
+	return time.Duration(c.LLM.LearnFromUserTimeoutSeconds) * time.Second
 }
 
 // Built-in capture delays: the agent TUI can take several seconds to paint

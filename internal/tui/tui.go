@@ -715,10 +715,14 @@ type detailView struct {
 	// confirmID is the escalation's audit id captured at open time, so
 	// enter confirms the record ON SCREEN even if a background refresh
 	// clamped the list cursor. 0 = not a confirmable escalation detail.
-	// The per-entry actions (c/x/l) act on this id too, never the live
-	// cursor. escRetryable snapshots whether "l: retry LLM" is offered.
-	confirmID    int64
-	escRetryable bool
+	// The per-entry actions (c/x) act on this id too, never the live cursor.
+	confirmID int64
+	// retryID is the audit id `l` re-invokes the LLM on, snapshotted the same
+	// way. It is SEPARATE from confirmID because retry is offered on two kinds
+	// of row while confirm/correct/dismiss are only ever offered on a pending
+	// escalation: a failed learn-from-correction run is a resolved AUDIT row,
+	// retryable but never confirmable. 0 = retry not offered here.
+	retryID int64
 	// focusAgentID is the agent recorded on an escalation detail. Its current
 	// pane coordinates are resolved from live status when `f` is pressed, so a
 	// background refresh or list-cursor move cannot retarget the action.
@@ -1935,16 +1939,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}}, true)
 			}
 		case "l":
-			// On an escalation detail, `l` retries the LLM on the snapshotted
-			// record; elsewhere it keeps its vim-right "next tab" meaning.
-			if id := m.detail.confirmID; id != 0 {
-				if !m.detail.escRetryable {
-					m.message = "retry LLM: not available for this escalation"
-					m.detail = nil
-					return m, nil
-				}
+			// On a retryable detail — a failed LLM escalation, or a failed
+			// learn-from-correction run on the Audit tab — `l` re-invokes the
+			// LLM on the snapshotted record; elsewhere it keeps its vim-right
+			// "next tab" meaning.
+			if id := m.detail.retryID; id != 0 {
 				m.detail = nil
 				return m.retryByID(id)
+			}
+			if m.detail.confirmID != 0 {
+				m.message = "retry LLM: not available for this escalation"
+				m.detail = nil
+				return m, nil
 			}
 			m.detail = nil
 			m.searching = false
@@ -3889,9 +3895,17 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 			// Only the Escalations detail is confirmable via enter and
 			// carries the per-entry actions (c/x/l), which act on this
 			// snapshotted id — never the live cursor.
+			// A failed learn-from-correction run is retryable from the AUDIT tab
+			// — it is a resolved row, never an escalation, so it gets `l` without
+			// any of the confirm/correct/dismiss bindings below.
+			if domain.IsRetryableLearnFailure(&r) {
+				d.retryID = r.ID
+			}
 			if m.tab == tabEscalations {
 				d.confirmID = r.ID
-				d.escRetryable = m.canRetry(r)
+				if m.canRetry(r) {
+					d.retryID = r.ID
+				}
 				d.focusAgentID = r.AgentID
 				// Only the Escalations detail offers `b`: disabling a builtin
 				// rule is a response to being blocked by it, and the Audit tab
@@ -5536,11 +5550,14 @@ func (m Model) helpLine() string {
 		if m.detail.ruleDetail {
 			rule = "  t: see rule"
 		}
+		// Keyed off retryID, not the tab: a failed learn-from-correction run is
+		// retryable from the AUDIT tab, and an unadvertised key on the one row
+		// that needs it is the same trap the rule hint above documents.
+		retry := ""
+		if m.detail.retryID != 0 {
+			retry = "  l: retry LLM"
+		}
 		if m.detail.confirmID != 0 {
-			retry := ""
-			if m.detail.escRetryable {
-				retry = "  l: retry LLM"
-			}
 			// Advertised only when a builtin rule actually produced this
 			// record: on most escalations the key does nothing, and the line
 			// is already at the width budget.
@@ -5557,7 +5574,7 @@ func (m Model) helpLine() string {
 		if m.detail.task != nil {
 			return "enter/y: send to agent  e: edit  x: delete  f: focus in herdr  ↑/↓: scroll  tab: switch tab  " + closeKeys
 		}
-		return "↑/↓: scroll  tab: switch tab" + rule + preview + "  " + closeKeys
+		return "↑/↓: scroll  tab: switch tab" + rule + retry + preview + "  " + closeKeys
 	}
 	if m.searching {
 		return "type to filter  ←/→: move (ctrl: by word)  home/end: line ends  backspace/delete: erase  esc/enter: apply & close"

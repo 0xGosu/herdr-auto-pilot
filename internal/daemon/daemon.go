@@ -133,6 +133,7 @@ type Daemon struct {
 	taskListReviewResults chan taskListReviewOutcome
 	taskGenResults        chan taskGenOutcome
 	sweepResults          chan sweepOutcome
+	learnResults          chan learnOutcome
 	// delayedTr re-enters attention transitions whose capture delay has
 	// elapsed; the pane read happens back on the main loop, like every
 	// other pipeline entry point.
@@ -167,6 +168,19 @@ type Daemon struct {
 	// the first one can use task_generate_command_start. Same keying/semantics
 	// as firstConsult; guarded by mu.
 	firstTaskGen map[string]bool
+
+	// learnInFlight marks agents with a learn-from-correction run outstanding,
+	// so a burst of corrections cannot stack CLI subprocesses on one agent.
+	// Corrections are human-paced, so this only ever guards a burst (a batch
+	// resolve, or a backlog drained at daemon start). Cleared when the outcome
+	// lands. Keyed by agentID (== paneID); guarded by mu.
+	//
+	// It deliberately does NOT use the llm_requests pending guard the consult
+	// and generate-task paths share: that guard exists to stop two runs
+	// competing to act on one PANE, and a learn run never touches the pane. If
+	// it consumed that guard, a consult in flight would silently discard the
+	// operator's lesson.
+	learnInFlight map[string]bool
 
 	// configured flips after the first successful reload so reloadEmbedder
 	// can tell first load from a config change.
@@ -449,12 +463,14 @@ func New(opt Options) (*Daemon, error) {
 		taskListReviewResults:     make(chan taskListReviewOutcome, 16),
 		taskGenResults:            make(chan taskGenOutcome, 16),
 		sweepResults:              make(chan sweepOutcome, 16),
+		learnResults:              make(chan learnOutcome, 16),
 		delayedTr:                 make(chan domain.AgentTransition, 256),
 		pendingCapture:            map[string]*captureEntry{},
 		captureStarted:            map[string]bool{},
 		episodeHandled:            map[string]bool{},
 		firstConsult:              map[string]bool{},
 		firstTaskGen:              map[string]bool{},
+		learnInFlight:             map[string]bool{},
 		lastAutoSend:              map[string]time.Time{},
 		lastAutoNoop:              map[string]time.Time{},
 		preDeliveryReviewInFlight: map[string]preDeliveryReviewFlight{},
@@ -488,17 +504,20 @@ func New(opt Options) (*Daemon, error) {
 }
 
 // spawn runs fn on a tracked background goroutine so shutdownBackground can
-// await it. A spawn after shutdown has begun is dropped (fn never runs): the
-// daemon is tearing down and nothing new may touch the store/matcher. Callers
-// that reserve d.mu-guarded state before spawning and release it in fn's defer
-// (sweepInFlight, paneCwdRefreshing) must tolerate that release being skipped
-// on a dropped spawn — harmless here, since it only happens once closing has
-// latched and no further deliveries run.
-func (d *Daemon) spawn(fn func()) {
+// await it, reporting whether it actually SCHEDULED fn. A spawn after shutdown
+// has begun is dropped (fn never runs): the daemon is tearing down and nothing
+// new may touch the store/matcher. Callers that reserve d.mu-guarded state
+// before spawning and release it in fn's defer (sweepInFlight,
+// paneCwdRefreshing) must tolerate that release being skipped on a dropped
+// spawn — harmless there, since it only happens once closing has latched and no
+// further deliveries run. Callers that must not report success on a drop (a
+// learn retry, which would otherwise consume the operator's queued request)
+// check the return value.
+func (d *Daemon) spawn(fn func()) bool {
 	d.lifeMu.Lock()
 	if d.closing {
 		d.lifeMu.Unlock()
-		return
+		return false
 	}
 	d.bg.Add(1)
 	d.lifeMu.Unlock()
@@ -506,6 +525,7 @@ func (d *Daemon) spawn(fn func()) {
 		defer d.bg.Done()
 		fn()
 	}()
+	return true
 }
 
 // afterFunc schedules fn after delay on a tracked timer so shutdownBackground
@@ -1007,6 +1027,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case res := <-d.sweepResults:
 			logging.Guard("sweep-result", func() error {
 				d.handleSweepOutcome(ctx, res)
+				return nil
+			})
+		case res := <-d.learnResults:
+			logging.Guard("learn-from-user-result", func() error {
+				d.handleLearnOutcome(ctx, res)
 				return nil
 			})
 		}
@@ -4118,7 +4143,7 @@ func (d *Daemon) processCorrections(ctx context.Context) {
 		return
 	}
 	for _, c := range corrections {
-		arm, err := d.applyCorrection(ctx, cfg, c)
+		eff, err := d.applyCorrection(ctx, cfg, c)
 		if err != nil {
 			slog.Error("applying correction failed", "correction", c.ID, "error", err)
 			continue
@@ -4131,8 +4156,14 @@ func (d *Daemon) processCorrections(ctx context.Context) {
 		}
 		// Arm the post-action self-check only after the correction is committed,
 		// so a correction retried on a transient error never arms it twice.
-		if arm != nil {
-			d.scheduleUnblockCheck(*arm)
+		if eff.arm != nil {
+			d.scheduleUnblockCheck(*eff.arm)
+		}
+		// Same discipline for the learn-from-correction run: it spawns a CLI
+		// that edits a file in the agent's project, so it must fire exactly once
+		// per committed correction.
+		if eff.learn != nil {
+			d.learnFromUser(ctx, *eff.learn)
 		}
 	}
 }
@@ -4177,6 +4208,15 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) bool {
 		return true
 	}
 	agentID := audit.AgentID
+
+	// A failed learn-from-correction run re-runs that CLI instead of re-driving
+	// the consult pipeline. It shares this queue (and the `l` key) because it is
+	// the same operator gesture — "that LLM call failed, run it again" — but
+	// none of the machinery below applies: there is no escalation to retire, no
+	// pane to re-read, and no consult to avoid stacking onto.
+	if domain.IsRetryableLearnFailure(audit) {
+		return d.applyLearnRetry(ctx, audit)
+	}
 
 	// Guard: never stack a retry onto a consult that is still in flight for
 	// this agent (a pending llm_requests row). The operator re-queues once it
@@ -4263,13 +4303,14 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) bool {
 // the caller arms it only after the correction is committed (see
 // processCorrections), so a correction retried on a transient error never arms
 // the check twice.
-func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domain.CorrectionRecord) (*verifyunblock.Params, error) {
+func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domain.CorrectionRecord) (correctionEffects, error) {
+	var eff correctionEffects
 	audit, err := d.opt.Store.GetAudit(ctx, c.AuditID)
 	if err != nil {
-		return nil, err
+		return eff, err
 	}
 	if audit == nil {
-		return nil, fmt.Errorf("correction %d references missing audit %d", c.ID, c.AuditID)
+		return eff, fmt.Errorf("correction %d references missing audit %d", c.ID, c.AuditID)
 	}
 	now := d.opt.Clock.Now()
 
@@ -4283,9 +4324,8 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	// still-blocked agent surfaces a delivery_failed audit row, exactly as the
 	// daemon's own autonomous sends do. (AgentID is the pane id.) The params
 	// are returned rather than armed here so the caller arms once, after commit.
-	var arm *verifyunblock.Params
 	if c.Sent && audit.AgentID != "" {
-		arm = &verifyunblock.Params{
+		eff.arm = &verifyunblock.Params{
 			PaneID: audit.AgentID, AgentID: audit.AgentID, AgentType: audit.AgentType,
 			Signature: audit.Signature, Input: c.CorrectedAction, Excerpt: audit.PaneExcerpt,
 			SituationType: audit.SituationType,
@@ -4293,18 +4333,23 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	}
 
 	if audit.Signature == "" {
-		// Nothing learnable (e.g. herdr-unreachable escalation).
-		return arm, d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
+		// Nothing learnable (e.g. a herdr-unreachable escalation, which never
+		// classified a screen). The learn-from-user run is skipped for the same
+		// reason: with no signature there was no situation, so there is nothing
+		// to have been wrong ABOUT. Note this is not about an absent
+		// SUGGESTION — a suggestion-less escalation still teaches (see
+		// domain.NoSuggestionText).
+		return eff, d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
 	}
 
 	history, err := d.opt.Store.DecisionsForSignature(ctx, audit.Signature, 50)
 	if err != nil {
-		return nil, err
+		return eff, err
 	}
 
 	state, err := d.opt.Store.GetSignature(ctx, audit.Signature)
 	if err != nil {
-		return nil, err
+		return eff, err
 	}
 	if state == nil {
 		state = &domain.SignatureState{
@@ -4380,7 +4425,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		AgentType: state.AgentType, ChosenAction: c.CorrectedAction,
 		Source: domain.SourceOperator, IsCorrection: !isConfirmation, CreatedAt: now,
 	}); err != nil {
-		return nil, err
+		return eff, err
 	}
 
 	// Permanent graduation (revised FR-007) is enforced inside
@@ -4403,7 +4448,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 
 	refreshed, err := d.opt.Store.DecisionsForSignature(ctx, audit.Signature, 50)
 	if err != nil {
-		return nil, err
+		return eff, err
 	}
 	conf := domain.Confidence(domain.DecisionsSince(refreshed, newState.DecisionFloorID), cfg.Learning.ConfirmationWeight)
 	newState.CachedConfidence = conf.Score
@@ -4412,7 +4457,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		confidenceThresholds(cfg).ForType(audit.SituationType), cfg.Learning.GraduationN)
 
 	if err := d.opt.Store.UpsertSignature(ctx, newState); err != nil {
-		return nil, err
+		return eff, err
 	}
 
 	// Error corrections clear the retry counter (FR-014).
@@ -4428,7 +4473,59 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		Input: c.CorrectedAction, Rationale: map[bool]string{true: domain.RationaleOperatorConfirmed, false: domain.RationaleOperatorCorrected}[isConfirmation],
 		CorrectsAuditID: c.AuditID, Status: "resolved", CreatedAt: now,
 	})
-	return arm, d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
+
+	// A real CORRECTION (not a confirmation) is the one thing worth teaching the
+	// agent about itself. The request is returned rather than run here so the
+	// caller fires it only after the correction is committed — a correction
+	// retried on a transient store error must not spawn the CLI twice.
+	// Confirmations are skipped on purpose: hap was right, so there is no lesson.
+	//
+	// Two exclusions, both load-bearing rather than cosmetic:
+	//
+	// A POST-HOC correction is excluded (learnableCorrectionStatus). The TUI's
+	// `c` key on the AUDIT tab records a correction against an arbitrarily old,
+	// already-resolved row, and this run spawns a file-editing CLI in the cwd of
+	// whatever pane currently answers to audit.AgentID. herdr recycles pane ids
+	// and an AuditRecord carries no terminal_id, so on an old row that cwd can
+	// belong to an entirely different agent — and the adapter's live-directory
+	// check cannot catch it, because the wrong directory exists. The lesson
+	// would land in a stranger's project. A contemporaneous escalation has no
+	// such gap, which is also exactly what the feature was asked for.
+	//
+	// A generated-task escalation is excluded too. Confirming one records
+	// CorrectedAction = ActionNextDeclaredTask against a Suggestion of
+	// "LLM suggested task: …", so it never compares equal and every ACCEPTED
+	// task suggestion would read as a correction here. Worse, it is not an
+	// answer to anything on the screen — the operator approved a checklist edit
+	// — so the CLI would be told "you were about to answer <a task list> and the
+	// user corrected it to @next_task:declared", a lesson about hap's sentinels.
+	if !isConfirmation && audit.AgentID != "" &&
+		learnableCorrectionStatus(audit.Status) &&
+		!strings.HasPrefix(audit.Suggestion, domain.SuggestTaskPrefix) {
+		eff.learn = &domain.LearnRequest{
+			AgentType:     state.AgentType,
+			AgentID:       audit.AgentID,
+			SituationType: audit.SituationType,
+			PaneExcerpt:   audit.PaneExcerpt,
+			Suggestion:    suggested,
+			Correction:    c.CorrectedAction,
+		}
+	}
+	return eff, d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
+}
+
+// correctionEffects are the side effects one processed correction earns, to be
+// triggered by the caller AFTER the correction is committed. Both are deferred
+// for the same reason: a correction retried on a transient error would
+// otherwise arm the self-check, or spawn the learn CLI, a second time.
+type correctionEffects struct {
+	// arm schedules the post-action unblock self-check; nil unless the
+	// correction was actually delivered to the pane (c.Sent).
+	arm *verifyunblock.Params
+	// learn asks the agent to record a lesson in its own project memory; nil
+	// unless the operator genuinely CORRECTED hap's suggestion. AgentName,
+	// Cwd and SessionID are filled in by learnFromUser, off the main loop.
+	learn *domain.LearnRequest
 }
 
 // expireStaleLLMWork marks dangling pending LLM decisions AND pending consult
