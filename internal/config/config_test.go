@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -1331,6 +1332,129 @@ task_generate_timeout_seconds = 45
 	if len(rt.LLM.GenerateTaskCommand) != 3 || len(rt.LLM.GenerateTaskCommandStart) != 3 ||
 		rt.LLM.GenerateTaskTimeoutSeconds != 45 {
 		t.Errorf("round trip lost generate-task keys: %+v", rt.LLM)
+	}
+}
+
+// TestLearnFromUserConfigKeys pins llm.learn_from_user_command and its timeout:
+// omitted means the feature is off, the timeout inherits timeout_seconds
+// without being frozen into the file, and explicit values survive a round trip.
+func TestLearnFromUserConfigKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+
+	// Omitted entirely: the feature is disabled and the timeout inherits the
+	// consult timeout, resolved at use time rather than materialized.
+	os.WriteFile(path, []byte("[llm]\ncommand = [\"claude\"]\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LLM.LearnFromUserCommand) != 0 {
+		t.Errorf("learn_from_user_command should default empty, got %v", cfg.LLM.LearnFromUserCommand)
+	}
+	if cfg.LLM.LearnFromUserTimeoutSeconds != 0 {
+		t.Errorf("omitted learn timeout should stay 0 (inherit at use time), got %d", cfg.LLM.LearnFromUserTimeoutSeconds)
+	}
+	if cfg.LearnFromUserTimeout() != 60*time.Second {
+		t.Errorf("LearnFromUserTimeout() = %v, want inherited default 60s", cfg.LearnFromUserTimeout())
+	}
+
+	// An omitted timeout inherits a CUSTOM consult timeout, and Save must not
+	// freeze that inheritance into the file.
+	os.WriteFile(path, []byte("[llm]\ntimeout_seconds = 120\n"), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LearnFromUserTimeout() != 120*time.Second {
+		t.Errorf("LearnFromUserTimeout() = %v, want inherited 120s", cfg.LearnFromUserTimeout())
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LLM.LearnFromUserTimeoutSeconds != 0 || cfg.LearnFromUserTimeout() != 120*time.Second {
+		t.Errorf("Save must not freeze the inherited timeout: raw=%d effective=%v",
+			cfg.LLM.LearnFromUserTimeoutSeconds, cfg.LearnFromUserTimeout())
+	}
+
+	// Explicit values are honored verbatim and survive a round trip, including
+	// the per-command environment.
+	os.WriteFile(path, []byte(`[llm]
+timeout_seconds = 120
+learn_from_user_command = ["claude", "-p", "lesson for {agent_name}: {correction}"]
+learn_from_user_timeout_seconds = 90
+learn_from_user_command_env_file = "/etc/hap/learn.env"
+
+[llm.learn_from_user_command_env]
+ANTHROPIC_MODEL = "haiku"
+`), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LLM.LearnFromUserCommand) != 3 || cfg.LLM.LearnFromUserCommand[2] != "lesson for {agent_name}: {correction}" {
+		t.Errorf("learn_from_user_command lost: %v", cfg.LLM.LearnFromUserCommand)
+	}
+	if cfg.LLM.LearnFromUserTimeoutSeconds != 90 || cfg.LearnFromUserTimeout() != 90*time.Second {
+		t.Errorf("explicit learn timeout lost: raw=%d effective=%v",
+			cfg.LLM.LearnFromUserTimeoutSeconds, cfg.LearnFromUserTimeout())
+	}
+	if cfg.LLM.LearnFromUserEnvFile != "/etc/hap/learn.env" {
+		t.Errorf("learn_from_user_command_env_file lost: %q", cfg.LLM.LearnFromUserEnvFile)
+	}
+	if cfg.LLM.LearnFromUserEnv["ANTHROPIC_MODEL"] != "haiku" {
+		t.Errorf("learn_from_user_command_env lost: %v", cfg.LLM.LearnFromUserEnv)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.LLM.LearnFromUserCommand) != 3 || rt.LLM.LearnFromUserTimeoutSeconds != 90 ||
+		rt.LLM.LearnFromUserEnvFile != "/etc/hap/learn.env" ||
+		rt.LLM.LearnFromUserEnv["ANTHROPIC_MODEL"] != "haiku" {
+		t.Errorf("round trip lost learn-from-user keys: %+v", rt.LLM)
+	}
+
+	// The env scope is reported alongside the other four, names only.
+	summaries := rt.LLM.EnvSummaries()
+	var found *LLMEnvSummary
+	for i := range summaries {
+		if summaries[i].Scope == "learn_from_user_command" {
+			found = &summaries[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("EnvSummaries() omits the learn_from_user_command scope: %+v", summaries)
+	}
+	if len(found.Keys) != 1 || found.Keys[0] != "ANTHROPIC_MODEL" || found.File != "/etc/hap/learn.env" {
+		t.Errorf("learn env summary wrong: %+v", *found)
+	}
+}
+
+// TestLearnFromUserHasNoStartVariance pins the deliberate asymmetry with
+// command/task_generate_command: there is no learn_from_user_command_start,
+// because *_start marks an agent's FIRST interaction and "the first correction"
+// carries no different meaning from the tenth. A future refactor that adds one
+// by symmetry should have to delete this test on purpose.
+func TestLearnFromUserHasNoStartVariance(t *testing.T) {
+	for _, f := range reflect.VisibleFields(reflect.TypeFor[LLM]()) {
+		tag := f.Tag.Get("toml")
+		if name, _, _ := strings.Cut(tag, ","); name == "learn_from_user_command_start" {
+			t.Fatalf("field %s declares learn_from_user_command_start; the key is deliberately absent", f.Name)
+		}
+	}
+	// An unknown key must not silently become one either.
+	path := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(path, []byte("[llm]\nlearn_from_user_command_start = [\"claude\"]\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LLM.LearnFromUserCommand) != 0 {
+		t.Errorf("a _start key must not populate learn_from_user_command, got %v", cfg.LLM.LearnFromUserCommand)
 	}
 }
 

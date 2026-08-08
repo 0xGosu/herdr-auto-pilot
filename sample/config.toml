@@ -247,6 +247,55 @@ task_generate_command = [
 # task_generate_command_start = [ ... ]
 task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_seconds
 
+# ── Learn from your corrections (optional) ──
+# When you CORRECT an escalation — answer it with something other than what hap
+# suggested — this one-shot CLI runs in the AGENT'S OWN working directory and
+# asks the agent to write the lesson into that project's memory file (CLAUDE.md
+# for claude, AGENTS.md for codex). Confirming hap's suggestion never triggers
+# it: hap was right, so there is no lesson.
+#
+# Why this exists: hap already learns from a correction statistically, but that
+# learning is keyed on the SIGNATURE of one screen. A lesson in the project's
+# memory file survives a screen that hashes differently, and survives the agent
+# process itself.
+#
+# It is fire-and-forget: no MCP tools, nothing staged, nothing read back except
+# an optional "@noop". It never types into the pane, never creates a hap rule,
+# and never raises an escalation — every run leaves exactly one `hap audit` row
+# (llm-learn-from-user). It runs only AFTER your correction is committed, so a
+# broken CLI here can never cost you the correction. The global pause
+# (`hap pause`) suppresses it like everything else.
+#
+# The CLI needs WRITE access to edit the memory file — note --permission-mode
+# acceptEdits below, which the read-only consult recipe does not use.
+#
+# Placeholders: {self}, {agent_name}, {agent_type}, {cwd}, {situation_type},
+# {pane_excerpt}, {suggestion} (what hap was about to answer), {correction}
+# (what you answered instead), {session_id}. As everywhere else, {pane_excerpt}
+# and {suggestion} are argv-only — untrusted pane text never enters the child's
+# environment.
+#
+# There is deliberately NO learn_from_user_command_start: *_start marks an
+# agent's FIRST interaction, and "the first correction" means nothing different
+# from the tenth.
+#
+# Omit to keep the default: corrections are learned statistically only, and hap
+# never edits files in your projects.
+# learn_from_user_command = [
+#   "claude", "--model", "opus", "--permission-mode", "acceptEdits", "-p",
+#   "You are recording a lesson for yourself. Read the operator's correction below, then update CLAUDE.md in the current directory so you do not repeat the mistake. Edit CLAUDE.md and nothing else: do not run the task, do not touch the terminal, do not answer the prompt shown on screen. Add or amend ONE short, general rule, phrased as guidance for the future rather than as a note about this incident; if an existing rule already covers it, sharpen that rule instead of adding a second one. If the correction carries no durable lesson (a one-off, or purely situational), change nothing and reply with exactly @noop.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
+# ]
+
+# ── Learn from your corrections — OpenAI Codex (commented; swap in to use codex) ──
+# Same prompt, but codex reads AGENTS.md rather than CLAUDE.md.
+# learn_from_user_command = [
+#   "codex", "--model", "gpt-5.6-sol", "exec", "--skip-git-repo-check",
+#   "--dangerously-bypass-approvals-and-sandbox",
+#   "You are recording a lesson for yourself. Read the operator's correction below, then update AGENTS.md in the current directory so you do not repeat the mistake. Edit AGENTS.md and nothing else: do not run the task, do not touch the terminal, do not answer the prompt shown on screen. Add or amend ONE short, general rule, phrased as guidance for the future rather than as a note about this incident; if an existing rule already covers it, sharpen that rule instead of adding a second one. If the correction carries no durable lesson (a one-off, or purely situational), change nothing and reply with exactly @noop.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
+# ]
+
+# learn_from_user_timeout_seconds = 300   # omitted: inherits timeout_seconds
+
 
 # ── Semantic rule matching (vector embeddings) ──────────────────────
 # Situations are matched to learned rules by embedding their masked salient

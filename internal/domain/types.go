@@ -326,6 +326,13 @@ const (
 	// delivery exhausts maxTaskHandouts. It marks a row as being about a
 	// hand-out rather than about what is on the agent's screen.
 	TriggerAutoSendReclaim = "auto-send-reclaim"
+	// TriggerLLMLearnFromUser is the audit_log trigger for the row a
+	// learn-from-correction run writes (llm.learn_from_user_command). Like
+	// TriggerLLMTaskReview it is its own trigger rather than a field folded
+	// into the correction lineage row, because it is a distinct side effect:
+	// the run EDITS A FILE in the agent's project. "Why did CLAUDE.md change?"
+	// must be answerable from `hap audit`.
+	TriggerLLMLearnFromUser = "llm-learn-from-user"
 )
 
 // Actions written on a TriggerLLMTaskReview audit row. Every review outcome
@@ -357,6 +364,23 @@ const (
 	// trigger and a "corrected:" action, so the rationale is the only signal).
 	RationaleOperatorConfirmed = "operator confirmed"
 	RationaleOperatorCorrected = "operator corrected"
+)
+
+// Actions written on a TriggerLLMLearnFromUser audit row. Every outcome gets
+// one, including the declines and the failures: the run edits a file in the
+// operator's project, so "it ran and changed nothing" must be distinguishable
+// from "it never ran".
+const (
+	// AuditActionLearnRecorded: the CLI ran cleanly and reported no decline,
+	// so it recorded whatever lesson it judged appropriate.
+	AuditActionLearnRecorded = "learn:recorded"
+	// AuditActionLearnNoop: the CLI declined with the @noop sentinel — it
+	// judged the correction to carry no durable lesson.
+	AuditActionLearnNoop = "learn:noop"
+	// AuditActionLearnFailed: the CLI could not be spawned, exited non-zero,
+	// or timed out. Nothing else happens — a failed lesson never blocks the
+	// correction, which was already committed before the run started.
+	AuditActionLearnFailed = "learn:failed"
 )
 
 // audit_log Status literals shared across packages.

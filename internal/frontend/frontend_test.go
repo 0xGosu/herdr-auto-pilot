@@ -2394,11 +2394,14 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"llm.task_generate_command":                `claude -p "suggest a task"`,
 		"llm.task_generate_command_start":          `claude -p "first suggest a task"`,
 		"llm.task_generate_timeout_seconds":        "45",
+		"llm.learn_from_user_command":              `claude -p "record the lesson"`,
+		"llm.learn_from_user_timeout_seconds":      "90",
 		"llm.env_file":                             "/etc/hap/llm.env",
 		"llm.command_env_file":                     "/etc/hap/consult.env",
 		"llm.command_start_env_file":               "/etc/hap/start.env",
 		"llm.task_generate_command_env_file":       "/etc/hap/taskgen.env",
 		"llm.task_generate_command_start_env_file": "/etc/hap/taskgen_start.env",
+		"llm.learn_from_user_command_env_file":     "/etc/hap/learn.env",
 		"embedding.disabled":                       "false",
 		"embedding.model_path":                     "/models/custom.gguf",
 		"embedding.similarity_threshold":           "0.90",
@@ -2539,6 +2542,7 @@ func TestFieldTUIEditableClassification(t *testing.T) {
 		"llm.rewrite_action_fallback_template": true,
 		"llm.task_generate_command":            true,
 		"llm.task_generate_command_start":      true,
+		"llm.learn_from_user_command":          true,
 		"embedding.model_path":                 true,
 	}
 	for _, f := range frontend.ConfigFields {
@@ -2585,6 +2589,7 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 		"llm.command_start_env_file":               true,
 		"llm.task_generate_command_env_file":       true,
 		"llm.task_generate_command_start_env_file": true,
+		"llm.learn_from_user_command_env_file":     true,
 		"embedding.pane_salient_chars":             true,
 		"embedding.warm_timeout_ms":                true,
 		// Eight color strings would bury the settings a TUI operator actually
