@@ -187,9 +187,11 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) boo
 // nothing else. (One erosion: the audit-excerpt retention prune blanks
 // pane_excerpt on resolved rows, and a learn row is resolved from birth — so a
 // retry after that window rebuilds with an empty excerpt. That still runs; the
-// correction and the suggestion, which carry the lesson, are never pruned.) The working directory is deliberately NOT taken from the row —
-// learnFromUser re-resolves it live, so a retry minutes later still edits the
-// project the agent is in now, or refuses if it cannot tell.
+// correction and the suggestion, which carry the lesson, are never pruned.)
+//
+// The working directory is deliberately NOT taken from the row — learnFromUser
+// re-resolves it live, so a retry minutes later still edits the project the
+// agent is in now, or refuses if it cannot tell.
 //
 // The return value follows applyLLMRetry's contract: true means the queue item
 // reached a terminal outcome and may be marked processed. TERMINAL here means
