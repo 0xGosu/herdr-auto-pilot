@@ -1572,6 +1572,63 @@ Invariants:
 - **Cost note**: every reviewed send is one full consult (an MCP
   round-trip), so latency and token spend are those of `llm.command`.
 
+### Learning from your corrections (optional)
+
+When you **correct** an escalation — answer it with something other than what
+hap suggested — hap can run a one-shot CLI **in the agent's own working
+directory** and ask the agent to write the lesson into that project's memory
+file (`CLAUDE.md` for claude, `AGENTS.md` for codex).
+
+```toml
+[llm]
+learn_from_user_command = [
+  "claude", "--model", "opus", "--permission-mode", "acceptEdits", "-p",
+  "You are recording a lesson for yourself. Read the operator's correction below, then update CLAUDE.md in the current directory so you do not repeat the mistake. ... If the correction carries no durable lesson, change nothing and reply with exactly @noop.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
+]
+# learn_from_user_timeout_seconds = 300   # omitted: inherits timeout_seconds
+```
+
+`sample/config.toml` carries the full prompt and a commented codex recipe.
+
+Why it exists: hap already learns from a correction, but that learning is keyed
+on the **signature of one screen**. A lesson written into the project's memory
+file survives a screen that hashes differently, and survives the agent process
+itself. The two are complementary — the statistical learning still happens
+exactly as before.
+
+Placeholders: `{self}`, `{agent_name}`, `{agent_type}`, `{cwd}`,
+`{situation_type}`, `{pane_excerpt}`, `{suggestion}` (what hap was about to
+answer), `{correction}` (what you answered instead), `{session_id}`.
+
+Invariants:
+
+- **Only corrections trigger it.** Confirming hap's suggestion means hap was
+  right, so there is no lesson and no CLI run — confirmations never spend one.
+- **It runs in the agent's cwd**, which is what makes it edit the right
+  project's memory file. A cwd herdr cannot report falls back to the daemon's
+  usual working directory rather than failing the run.
+- **It never touches the pane**, never creates or changes a hap rule, and
+  **never escalates**. Every run leaves exactly one `hap audit` row
+  (`llm-learn-from-user`) with `learn:recorded`, `learn:noop`, or
+  `learn:failed`.
+- **It runs only after your correction is committed**, so a broken CLI here can
+  never cost you the correction — and a correction retried after a transient
+  error still runs the CLI exactly once.
+- **`@noop` is the decline**: the agent judged the correction to carry no
+  durable lesson. That is audited as `learn:noop`, distinct from a failure.
+- **`hap pause` suppresses it** like every other automated action, and only one
+  run per agent is in flight at a time so a burst of corrections cannot race
+  two CLIs editing the same file.
+- **No `_start` variance.** Unlike `command` and `task_generate_command` there
+  is no `learn_from_user_command_start`: `*_start` marks an agent's *first*
+  interaction, and "the first correction" means nothing different from the
+  tenth.
+- **The CLI needs write access** to edit the memory file — note
+  `--permission-mode acceptEdits` above, which the read-only consult recipe
+  does not use.
+- **Cost note**: one CLI run per correction. Corrections are human-paced, so
+  this is far cheaper than the consult path.
+
 #### Troubleshooting the fallback
 
 - **Escalations citing `not found in PATH`** — the daemon inherits herdr's
