@@ -1189,6 +1189,53 @@ rewrite_action_fallback_template = "Do this: {original_text}"
 	}
 }
 
+func TestRunInAgentCwdConfigKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+
+	// Omitted: the CLI runs in the agent's directory. Load materializes the
+	// default so a saved config names the behavior it is running under.
+	os.WriteFile(path, []byte("[llm]\ncommand = [\"claude\"]\n"), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RunLLMInAgentCwd() {
+		t.Error("run_in_agent_cwd must default to true")
+	}
+	if cfg.LLM.RunInAgentCwd == nil {
+		t.Error("Load must materialize the default so a Save names it")
+	}
+
+	// A config built in memory gets the default without Load having run — the
+	// accessor, not the pointer, is what callers read.
+	if !(Config{}).RunLLMInAgentCwd() {
+		t.Error("an unset pointer must read as the default, not as false")
+	}
+	if !Default().RunLLMInAgentCwd() {
+		t.Error("Default() must run in the agent's cwd")
+	}
+
+	// An explicit false is honored and survives a Save round trip — the whole
+	// reason the field is a pointer.
+	os.WriteFile(path, []byte("[llm]\ncommand = [\"claude\"]\nrun_in_agent_cwd = false\n"), 0o600)
+	if cfg, err = Load(path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RunLLMInAgentCwd() {
+		t.Error("run_in_agent_cwd = false lost on Load")
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt.RunLLMInAgentCwd() {
+		t.Error("run_in_agent_cwd = false lost on the Save round trip")
+	}
+}
+
 func TestRewriteFallbackTemplateLegacyKeyMigrates(t *testing.T) {
 	// The renamed rewrite_fallback_template seeds the new key on Load (with
 	// a warning), an explicit new key wins, and a Save re-emits only the new

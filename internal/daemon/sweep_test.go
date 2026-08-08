@@ -47,7 +47,8 @@ func TestCodexQuestionSweepAndAdaptiveDelivery(t *testing.T) {
 		t.Fatalf("Codex aggregate/options = %q / %v", swept.Content, swept.Options)
 	}
 	cfg, _, _ := h.daemon.snapshot()
-	consult := string(h.daemon.consultContext(context.Background(), cfg, swept, "codex-agent", nil, ""))
+	contextJSON, _ := h.daemon.consultContext(context.Background(), cfg, swept, "codex-agent", nil, "")
+	consult := string(contextJSON)
 	for _, want := range []string{`"mcq_kind":"codex_questions"`, `"answer_count":2`, `"question_count":2`, "there is no Submit pseudo-option"} {
 		if !strings.Contains(consult, want) {
 			t.Errorf("Codex consult context missing %q: %s", want, consult)

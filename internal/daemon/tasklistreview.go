@@ -220,7 +220,9 @@ func (d *Daemon) startTaskListReview(ctx context.Context, s domain.Situation, si
 				slog.Warn("task-list review: re-reading the task source failed",
 					"path", del.declared.Path, "error", rerr)
 			}
-			req.ContextJSON = string(d.consultContext(rctx, cfg, s, agentName, review, ""))
+			contextJSON, cwd := d.consultContext(rctx, cfg, s, agentName, review, "")
+			req.ContextJSON = string(contextJSON)
+			req.Cwd = cwd
 			if err := d.opt.Store.UpdateLLMRequestContext(rctx, req.RequestID, req.ContextJSON); err != nil {
 				return fmt.Errorf("staging LLM request context failed: %w", err)
 			}

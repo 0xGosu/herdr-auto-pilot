@@ -132,6 +132,19 @@ command = [
 timeout_seconds = 120              # codex is slower to start; 180 is a safer value there
 auto_act_confidence_threshold = 99  # auto-act only when the LLM confidence (0-100) is >= this; default 99 (near-certain only); set >100 (e.g. 999) to never auto-act and always surface for confirmation
 pane_excerpt_chars = 5000          # pane context included in the consult
+# Run the CLI in the monitored AGENT's own working directory instead of hap's,
+# so it reads that project's CLAUDE.md / AGENTS.md, sees its local tool config,
+# and can resolve repo-relative paths. Default true. If the directory is
+# unknown or has been deleted, the run falls back to hap's own directory — it
+# never fails. Applies to `command`/`command_start` and the task-generation
+# commands; `learn_from_user_command` always runs in the agent's directory
+# (it edits that project's memory file) and ignores this key.
+# Trust note: the directory is chosen by the AGENT, so that project's
+# instruction file is read by the CLI whose answer drives auto-answering. Set
+# false where your agents work in repos you don't trust. It cannot bypass a
+# safety control — the kill switch, never-auto patterns, the rate guard and
+# auto_act_confidence_threshold still gate every delivery.
+run_in_agent_cwd = true
 
 # ── Per-command environment (optional) ──
 # Each of the four command templates (command, command_start,

@@ -1,0 +1,2 @@
+- Changed the LLM CLI to run in the monitored agent's own working directory instead of hap's, so consults and task generation read that project's `CLAUDE.md` / `AGENTS.md`, see its local tool config, and can resolve repo-relative paths. An unknown or deleted directory falls back to the previous behavior rather than failing the run.
+- Added `llm.run_in_agent_cwd` (default `true`) to turn that off and keep running the CLI where hap runs. It does not affect `llm.learn_from_user_command`, which already required the agent's directory.

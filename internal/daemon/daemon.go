@@ -2643,7 +2643,11 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 				agentName = ""
 			}
 			req.AgentName = agentName
-			req.ContextJSON = string(d.consultContext(ctx, cfg, s, agentName, nil, ""))
+			contextJSON, cwd := d.consultContext(ctx, cfg, s, agentName, nil, "")
+			req.ContextJSON = string(contextJSON)
+			// Transient: StageLLMRequest below persists the row without it, so a
+			// request rebuilt from that row falls back to hap's own directory.
+			req.Cwd = cwd
 			if _, err := d.opt.Store.StageLLMRequest(ctx, req); err != nil {
 				return fmt.Errorf("staging LLM request failed: %w", err)
 			}
@@ -2797,10 +2801,7 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 					info = pi
 				}
 			}
-			cwd := info.ForegroundCwd
-			if cwd == "" {
-				cwd = info.Cwd
-			}
+			cwd := agentCwd(info)
 			task, sessionID, gerr := generateTaskWithSession(ctx, tg, domain.TaskGenRequest{
 				AgentType:   s.AgentType,
 				AgentName:   agentName,
@@ -2963,7 +2964,14 @@ func (d *Daemon) agentNotCleanlyIdle(ctx context.Context, agentID string) bool {
 // about to be typed into the pane) with an answer_format that frames
 // submit_decision as adapt (literal text) vs. affirm
 // (@proposed_action:send) vs. veto (@noop).
-func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation, agentName string, review *taskReviewContext, proposedAction string) []byte {
+//
+// It also returns the agent's own working directory, which the caller pins onto
+// the request so the adapter can run the CLI there (llm.run_in_agent_cwd). It is
+// returned from HERE rather than resolved by the caller because this function
+// already made the `pane get` call that reports it — a second one would cost
+// another round trip through herdr on every consult. Empty when herdr could not
+// report one, which the adapter reads as "fall back to hap's own directory".
+func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain.Situation, agentName string, review *taskReviewContext, proposedAction string) ([]byte, string) {
 	excerpt := d.paneExcerpt(ctx, cfg, s)
 
 	// Pane location and cwd come from `pane get`; degrade to empty values
@@ -3099,7 +3107,20 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		fields["answer_format"] = "this agent's automation resolved a learned reply that is about to be typed into the pane: proposed_action is the exact text. Review it against the live pane. To send it unchanged, submit_decision recommend_action \"@proposed_action:send\". To adapt it to what the pane currently shows, put the full replacement text in recommend_action — it is sent verbatim, so never submit commentary or partial edits. If nothing should be sent at all (the pane resolved itself, or a reply would do harm), submit_decision recommend_action \"@noop\" with a one-sentence rationale. If the review cannot decide, the daemon sends the original text unchanged"
 	}
 	contextJSON, _ := json.Marshal(fields)
-	return contextJSON
+	return contextJSON, agentCwd(info)
+}
+
+// agentCwd picks the directory an agent is actually working in: the foreground
+// process's cwd when herdr reports one (the agent may have cd'd since the pane
+// was created), else the pane's. Empty when neither is known.
+//
+// The same precedence as generateTask and learnFromUser — kept in one place so
+// the three cannot drift apart.
+func agentCwd(info domain.PaneInfo) string {
+	if cwd := strings.TrimSpace(info.ForegroundCwd); cwd != "" {
+		return cwd
+	}
+	return strings.TrimSpace(info.Cwd)
 }
 
 // tabSelectKinds renders per-tab select kinds ("single"/"multi") for the LLM
@@ -3276,7 +3297,9 @@ func (d *Daemon) startActionReview(ctx context.Context, s domain.Situation,
 		}
 		outcome.err = logging.Guard("llm-action-review", func() error {
 			req.AgentName = agentName
-			req.ContextJSON = string(d.consultContext(rctx, cfg, s, agentName, nil, dec.Input))
+			contextJSON, cwd := d.consultContext(rctx, cfg, s, agentName, nil, dec.Input)
+			req.ContextJSON = string(contextJSON)
+			req.Cwd = cwd
 			if err := d.opt.Store.UpdateLLMRequestContext(rctx, req.RequestID, req.ContextJSON); err != nil {
 				return fmt.Errorf("staging LLM request context failed: %w", err)
 			}

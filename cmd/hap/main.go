@@ -351,6 +351,7 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 			TaskGenTimeout:       cfg.GenerateTaskTimeout(),
 			LearnTemplate:        cfg.LLM.LearnFromUserCommand,
 			LearnTimeout:         cfg.LearnFromUserTimeout(),
+			RunInAgentCwd:        cfg.RunLLMInAgentCwd(),
 			// The `.env` files are never read here: the adapter reads them
 			// when it spawns a CLI, so editing a file applies to the next
 			// run, and changing the configured PATH applies on the next

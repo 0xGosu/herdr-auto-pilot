@@ -116,7 +116,12 @@ func (a *Adapter) GenerateTaskWithSession(ctx context.Context, req domain.TaskGe
 	defer cancel()
 
 	cmd := exec.CommandContext(runCtx, bin, argv[1:]...)
-	cmd.Dir = a.WorkDir()
+	// Deliberately allowed to diverge from the {cwd} placeholder above: {cwd}
+	// names the project the suggested task should be ABOUT — the agent's — while
+	// this names where the CLI runs, which falls back to hap's directory when
+	// that one is unusable. Substituting the fallback into the prompt would tell
+	// the CLI to suggest work about hap's state directory.
+	cmd.Dir = a.runDir(req.Cwd)
 	// After the timeout kills the CLI, don't wait on lingering grandchildren
 	// holding the output pipes open — fail safe promptly.
 	cmd.WaitDelay = 2 * time.Second

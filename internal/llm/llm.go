@@ -77,6 +77,14 @@ type Adapter struct {
 	LearnTimeout time.Duration
 	// LearnEnv is the environment for LearnTemplate, layered over BaseEnv.
 	LearnEnv EnvSpec
+	// RunInAgentCwd runs the consult and task-generation CLIs in the monitored
+	// agent's OWN working directory when the request names a live one, so the
+	// CLI picks up that project's instructions (CLAUDE.md / AGENTS.md), its
+	// local tool config, and can resolve repo-relative paths. When it is off,
+	// or the request names no usable directory, the run falls back to WorkDir()
+	// — the historical behavior. It does NOT govern LearnTemplate, which
+	// requires the agent's cwd and refuses to run without one (see runLearn).
+	RunInAgentCwd bool
 }
 
 // Configured reports whether an LLM CLI is configured (IR-005).
@@ -305,7 +313,7 @@ func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string,
 	defer cancel()
 
 	cmd := exec.CommandContext(runCtx, bin, argv[1:]...)
-	cmd.Dir = a.WorkDir()
+	cmd.Dir = a.runDir(req.Cwd)
 	// After the timeout kills the CLI, don't wait on lingering
 	// grandchildren holding the output pipes open — fail safe promptly.
 	cmd.WaitDelay = 2 * time.Second
@@ -370,6 +378,34 @@ func (a *Adapter) WorkDir() string {
 		return home
 	}
 	return os.TempDir()
+}
+
+// runDir returns the directory a consult or task-generation run must start in,
+// given the agent's own working directory as reported by `herdr pane get`.
+//
+// The agent's directory is what the operator actually wants the CLI to see, but
+// it is not trustworthy input: the pane may be gone, herdr may not have reported
+// one, and a deleted directory is rendered with a " (deleted)" suffix that only
+// LOOKS like a path. So this degrades to WorkDir() — never refuses — because a
+// consult is advisory: running it from hap's own directory still produces an
+// answer, whereas failing the spawn escalates a question nobody asked.
+//
+// LearnTemplate deliberately does not come through here: writing a lesson into
+// the wrong project's memory file is worse than writing none, so runLearn
+// refuses instead of falling back.
+func (a *Adapter) runDir(agentCwd string) string {
+	if !a.RunInAgentCwd {
+		return a.WorkDir()
+	}
+	dir := strings.TrimSpace(agentCwd)
+	// IsAbs: a relative path would resolve against the DAEMON's cwd — a
+	// different directory entirely, silently. dirLives rejects both a deleted
+	// directory and herdr's "/path (deleted)" rendering of one, since neither
+	// stats.
+	if dir == "" || !filepath.IsAbs(dir) || !dirLives(dir) {
+		return a.WorkDir()
+	}
+	return dir
 }
 
 func dirLives(dir string) bool {

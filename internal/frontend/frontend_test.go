@@ -2390,6 +2390,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"llm.auto_act_confidence_threshold":        "70",
 		"llm.pane_excerpt_chars":                   "4000",
 		"llm.enable_rewrite_action":                "true",
+		"llm.run_in_agent_cwd":                     "false",
 		"llm.rewrite_action_fallback_template":     "Act on: {original_text}",
 		"llm.task_generate_command":                `claude -p "suggest a task"`,
 		"llm.task_generate_command_start":          `claude -p "first suggest a task"`,
@@ -2583,6 +2584,7 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 	hidden := map[string]bool{
 		"llm.pane_excerpt_chars":                   true,
 		"llm.enable_rewrite_action":                true,
+		"llm.run_in_agent_cwd":                     true,
 		"llm.rewrite_action_fallback_template":     true,
 		"llm.env_file":                             true,
 		"llm.command_env_file":                     true,
