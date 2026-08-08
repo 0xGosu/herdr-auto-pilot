@@ -198,6 +198,33 @@ func TestLearnFromUserRendersMissingSuggestion(t *testing.T) {
 	}
 }
 
+// TestLearnFromUserSpellsOutTheNoopSentinel: "@noop" is hap's internal token
+// for "no reply was needed". Handed to a model verbatim it reads as a literal
+// string the operator typed, so the lesson recorded would be about the token
+// rather than about leaving the situation alone.
+func TestLearnFromUserSpellsOutTheNoopSentinel(t *testing.T) {
+	dir := t.TempDir()
+	argvFile := filepath.Join(dir, "argv")
+	script := writeScript(t, `printf '%s\n' "$@" > `+argvFile+"\n")
+	a := &Adapter{
+		LearnTemplate: []string{script, "was={suggestion}", "now={correction}"},
+		LearnTimeout:  5 * time.Second,
+	}
+	if _, err := a.LearnFromUser(context.Background(), domain.LearnRequest{
+		Cwd: dir, Suggestion: "Yes", Correction: domain.ActionNoop,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "was=Yes\nnow=" + domain.ActionNoopSuggestion + "\n"
+	if string(got) != want {
+		t.Errorf("argv = %q, want %q", got, want)
+	}
+}
+
 func TestLearnFromUserFailureModes(t *testing.T) {
 	t.Run("non-zero exit", func(t *testing.T) {
 		script := writeScript(t, "echo 'boom' >&2\nexit 3\n")

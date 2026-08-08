@@ -28,12 +28,31 @@ import "strings"
 const NoSuggestionText = "(nothing — hap had no suggestion and escalated to the operator)"
 
 // SuggestionText is the {suggestion} rendering of a learn request: the
-// suggestion itself, or NoSuggestionText when there was none.
+// suggestion itself, or NoSuggestionText when there was none. The @noop
+// sentinel is spelled out for the same reason CorrectionText does it.
 func (r LearnRequest) SuggestionText() string {
 	if strings.TrimSpace(r.Suggestion) == "" {
 		return NoSuggestionText
 	}
-	return r.Suggestion
+	return spellOutNoop(r.Suggestion)
+}
+
+// CorrectionText is the {correction} rendering: the operator's answer, with the
+// @noop sentinel spelled out. "@noop" is hap's internal token for "no reply was
+// needed"; handed to a model as-is it reads as a literal string the operator
+// typed, and the lesson recorded would be about the token rather than about
+// leaving the situation alone.
+func (r LearnRequest) CorrectionText() string {
+	return spellOutNoop(r.Correction)
+}
+
+// spellOutNoop replaces the bare @noop sentinel with its human phrasing,
+// leaving every other action untouched.
+func spellOutNoop(action string) string {
+	if IsNoopAction(NormalizeNoopAction(strings.TrimSpace(action))) {
+		return ActionNoopSuggestion
+	}
+	return action
 }
 
 // LearnRequest is everything the learn-from-user CLI template can reference.

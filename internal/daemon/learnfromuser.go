@@ -123,7 +123,15 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) {
 		outcome.err = err
 		select {
 		case d.learnResults <- outcome:
+			// handleLearnOutcome clears the in-flight mark on the main loop.
 		case <-ctx.Done():
+			// The outcome will never be handled, so clear the mark here or this
+			// agent could never learn again. Only reachable during shutdown
+			// today, but the flag is a latch and a latch that leaks is a silent
+			// permanent disable — not something to leave resting on the caller.
+			d.mu.Lock()
+			delete(d.learnInFlight, req.AgentID)
+			d.mu.Unlock()
 		}
 	})
 }

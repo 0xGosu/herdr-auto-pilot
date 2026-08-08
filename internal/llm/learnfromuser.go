@@ -76,7 +76,7 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 		"{agent_type}", req.AgentType,
 		"{cwd}", req.Cwd,
 		"{situation_type}", string(req.SituationType),
-		"{correction}", req.Correction,
+		"{correction}", req.CorrectionText(),
 		SessionIDPlaceholder, req.SessionID,
 	)
 	argvRepl := strings.NewReplacer(
@@ -87,7 +87,7 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 		"{situation_type}", string(req.SituationType),
 		"{pane_excerpt}", req.PaneExcerpt,
 		"{suggestion}", req.SuggestionText(),
-		"{correction}", req.Correction,
+		"{correction}", req.CorrectionText(),
 		SessionIDPlaceholder, req.SessionID,
 	)
 	argv := make([]string, len(template))
