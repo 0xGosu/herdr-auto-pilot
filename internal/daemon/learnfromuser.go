@@ -32,6 +32,27 @@ type learnOutcome struct {
 	err    error
 }
 
+// learnableCorrectionStatus reports whether an audit row is still LIVE enough
+// for a correction against it to teach the agent — i.e. the operator is
+// answering a standing escalation, not annotating history.
+//
+// Only "escalated" and "auto_accepting" qualify. The second is the same state
+// mid-flight: the auto-accept sweep flips a pending escalation to
+// auto_accepting while it delivers, and an operator answering in that window is
+// still answering a live question.
+//
+// Everything else — a resolved row, an auto row, a dismissed one — is a
+// post-hoc correction, which the audit tab's `c` key can record against a row
+// of any age. That path is unsafe for this feature specifically: the run spawns
+// a file-editing CLI in the cwd of whatever pane now answers to the row's
+// AgentID, herdr recycles pane ids, and an AuditRecord carries no terminal_id
+// to detect it. The learning in applyCorrection is unaffected — a post-hoc
+// correction still records its decision and re-scores the signature exactly as
+// before; only the CLI run is withheld.
+func learnableCorrectionStatus(status string) bool {
+	return status == "escalated" || status == domain.AuditStatusAutoAccepting
+}
+
 // learnPort returns the LLM adapter as a LearnFromUserPort when a
 // learn-from-user CLI is configured, else nil (the capability is optional).
 func (d *Daemon) learnPort() ports.LearnFromUserPort {

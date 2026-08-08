@@ -1633,6 +1633,13 @@ Invariants:
   right, so there is no lesson and no CLI run — confirmations never spend one.
   Accepting a **generated task suggestion** does not count either: that is you
   approving a checklist edit, not answering anything on the agent's screen.
+- **Only a standing escalation teaches.** Correcting an old row from the
+  **audit** tab still feeds the normal learning, but runs no CLI: herdr recycles
+  pane ids, so on a historical row the agent's "current directory" can belong to
+  a different agent entirely, and the lesson would land in someone else's
+  project. (For the same reason, a correction whose bookkeeping fails and gets
+  retried drops its lesson rather than risk running twice — the correction
+  itself is never lost.)
 - **It runs in the agent's cwd**, which is what makes it edit the right
   project's memory file. If that directory cannot be resolved, or no longer
   exists, the run is **refused** rather than redirected — the CLI has write

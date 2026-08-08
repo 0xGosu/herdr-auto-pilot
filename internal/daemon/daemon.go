@@ -4467,15 +4467,27 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	// retried on a transient store error must not spawn the CLI twice.
 	// Confirmations are skipped on purpose: hap was right, so there is no lesson.
 	//
-	// A generated-task escalation is excluded, and the exclusion is load-bearing
-	// rather than cosmetic. Confirming one records CorrectedAction =
-	// ActionNextDeclaredTask against a Suggestion of "LLM suggested task: …", so
-	// it never compares equal and every ACCEPTED task suggestion would read as a
-	// correction here. Worse, it is not an answer to anything on the screen —
-	// the operator approved a checklist edit — so the CLI would be told "you
-	// were about to answer <a task list> and the user corrected it to
-	// @next_declared_task", which is a lesson about hap's internal sentinels.
+	// Two exclusions, both load-bearing rather than cosmetic:
+	//
+	// A POST-HOC correction is excluded (learnableCorrectionStatus). The TUI's
+	// `c` key on the AUDIT tab records a correction against an arbitrarily old,
+	// already-resolved row, and this run spawns a file-editing CLI in the cwd of
+	// whatever pane currently answers to audit.AgentID. herdr recycles pane ids
+	// and an AuditRecord carries no terminal_id, so on an old row that cwd can
+	// belong to an entirely different agent — and the adapter's live-directory
+	// check cannot catch it, because the wrong directory exists. The lesson
+	// would land in a stranger's project. A contemporaneous escalation has no
+	// such gap, which is also exactly what the feature was asked for.
+	//
+	// A generated-task escalation is excluded too. Confirming one records
+	// CorrectedAction = ActionNextDeclaredTask against a Suggestion of
+	// "LLM suggested task: …", so it never compares equal and every ACCEPTED
+	// task suggestion would read as a correction here. Worse, it is not an
+	// answer to anything on the screen — the operator approved a checklist edit
+	// — so the CLI would be told "you were about to answer <a task list> and the
+	// user corrected it to @next_task:declared", a lesson about hap's sentinels.
 	if !isConfirmation && audit.AgentID != "" &&
+		learnableCorrectionStatus(audit.Status) &&
 		!strings.HasPrefix(audit.Suggestion, domain.SuggestTaskPrefix) {
 		eff.learn = &domain.LearnRequest{
 			AgentType:     state.AgentType,

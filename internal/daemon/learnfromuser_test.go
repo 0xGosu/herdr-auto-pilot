@@ -192,6 +192,85 @@ func TestLearnFromUserSkipsGeneratedTaskConfirmations(t *testing.T) {
 	}
 }
 
+// TestLearnFromUserFiresOnceAcrossRepeatedSweeps: processCorrections runs on
+// every nudge AND on a 1-minute sweep, so an already-processed correction is
+// re-read constantly. The CLI edits a file, so it must fire once — not once per
+// sweep.
+func TestLearnFromUserFiresOnceAcrossRepeatedSweeps(t *testing.T) {
+	h, fl, esc := learnHarness(t, "agent-lfu12")
+	resolveWith(t, h, esc.ID, "use the dry-run flag")
+	waitFor(t, 3*time.Second, func() bool { return len(fl.learnCalls()) == 1 })
+
+	ctx := context.Background()
+	for range 4 {
+		if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(300 * time.Millisecond) // let any (incorrect) extra run land
+	if calls := fl.learnCalls(); len(calls) != 1 {
+		t.Errorf("learn ran %d times across repeated sweeps, want exactly 1", len(calls))
+	}
+}
+
+// TestLearnFromUserSkipsPostHocCorrections: the TUI's `c` key on the AUDIT tab
+// records a correction against an arbitrarily old, already-resolved row. This
+// run spawns a file-editing CLI in the cwd of whatever pane now answers to that
+// row's AgentID — and herdr recycles pane ids, so on an old row that is a live
+// but WRONG directory the adapter's existence check cannot catch. Only a
+// contemporaneous escalation may teach.
+func TestLearnFromUserSkipsPostHocCorrections(t *testing.T) {
+	h, fl, _ := learnHarness(t, "agent-lfu10")
+	ctx := context.Background()
+	for _, status := range []string{"resolved", "auto", "dismissed", domain.AuditStatusAutoAccepted} {
+		t.Run(status, func(t *testing.T) {
+			id, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+				AgentID: "agent-lfu10", AgentType: "claude",
+				Signature: "sig-lfu10-" + status, Trigger: "test",
+				SituationType: domain.SituationApproval, Action: "auto:Yes",
+				Suggestion: "respond: Yes", PaneExcerpt: approvalPane,
+				Status: status, CreatedAt: time.Now(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := len(fl.learnCalls())
+			resolveWith(t, h, id, "No, that was wrong")
+			// The signature row is the completion signal, NOT the audit status:
+			// a row seeded as "resolved" already satisfies a status check at
+			// insert time, so waiting on that would race the sweep and assert
+			// "no learn call" before processCorrections had even run.
+			waitFor(t, 3*time.Second, func() bool {
+				st, _ := h.raw.GetSignature(ctx, "sig-lfu10-"+status)
+				return st != nil
+			})
+			if got := len(fl.learnCalls()) - before; got != 0 {
+				t.Errorf("a post-hoc correction on a %q row must not run the learn CLI, got %d call(s)", status, got)
+			}
+		})
+	}
+}
+
+// TestLearnFromUserLearnsFromAnAutoAcceptingRow: auto_accepting is a pending
+// escalation MID-FLIGHT, not history — an operator answering in that window is
+// still answering a live question, so it must teach.
+func TestLearnFromUserLearnsFromAnAutoAcceptingRow(t *testing.T) {
+	h, fl, _ := learnHarness(t, "agent-lfu11")
+	ctx := context.Background()
+	id, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-lfu11", AgentType: "claude", Signature: "sig-lfu11",
+		Trigger: "test", SituationType: domain.SituationApproval,
+		Action: domain.AuditActionEscalated, Suggestion: "respond: Yes",
+		PaneExcerpt: approvalPane, Status: domain.AuditStatusAutoAccepting,
+		CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolveWith(t, h, id, "No, deny it")
+	waitFor(t, 3*time.Second, func() bool { return len(fl.learnCalls()) == 1 })
+}
+
 // TestLearnFromUserNotConfiguredIsNoop: the feature is off by default, and an
 // unconfigured daemon must resolve corrections exactly as it always did.
 func TestLearnFromUserNotConfiguredIsNoop(t *testing.T) {
@@ -268,9 +347,17 @@ func TestLearnFromUserFailureOnlyAuditsAndNeverEscalates(t *testing.T) {
 	if !strings.Contains(rows[0].Rationale, "exit 3") {
 		t.Errorf("rationale = %q, want the CLI's error included", rows[0].Rationale)
 	}
+	// No escalation may originate from the learn failure. The agent keeps going
+	// idle and re-escalating on its own in this harness, so assert on the
+	// PROVENANCE of what is pending rather than on the count: nothing pending
+	// may carry the learn trigger or name the learn run.
 	pending, _ := h.raw.PendingEscalations(context.Background())
-	if len(pending) != 0 {
-		t.Errorf("a failed lesson must never escalate, got %d pending: %+v", len(pending), pending)
+	for _, p := range pending {
+		if p.Trigger == domain.TriggerLLMLearnFromUser ||
+			strings.Contains(p.Rationale, "learn-from-user") ||
+			strings.Contains(p.Action, "learn:") {
+			t.Errorf("a failed lesson must never escalate, got %+v", p)
+		}
 	}
 }
 
@@ -314,11 +401,20 @@ func (s *flakyProcessedStore) MarkCorrectionProcessed(ctx context.Context, id in
 	return s.StorePort.MarkCorrectionProcessed(ctx, id)
 }
 
-// TestLearnFromUserRetriedCorrectionFiresOnce pins the fire-AFTER-commit
-// discipline. A correction whose "processed" flag fails to commit is re-applied
-// on the next sweep; because the CLI edits a file in the operator's project, it
-// must run exactly once for that correction — not once per attempt.
-func TestLearnFromUserRetriedCorrectionFiresOnce(t *testing.T) {
+// TestLearnFromUserRetriedCorrectionNeverFiresTwice pins the fire-AFTER-commit
+// discipline at its sharp edge. A correction whose "processed" flag fails to
+// commit is re-applied on the next sweep, and because the CLI edits a file in
+// the operator's project it must never run twice for one correction.
+//
+// It runs ZERO times here, and that is the deliberate outcome rather than a
+// near miss: the first pass resolves the audit row before the commit fails, so
+// the retry re-reads a row that is no longer a standing escalation and
+// learnableCorrectionStatus withholds the run. Dropping a lesson after a store
+// failure is the safe direction — the operator's correction itself is still
+// recorded and still re-scores the signature; only the CLI run is skipped. The
+// alternative, remembering across sweeps that the row *was* live, would have to
+// survive the very failure that caused the retry.
+func TestLearnFromUserRetriedCorrectionNeverFiresTwice(t *testing.T) {
 	dir := t.TempDir()
 	taskFile := filepath.Join(dir, "tasks.md")
 	os.WriteFile(taskFile, []byte("- [ ] update the docs\n"), 0o600)
@@ -341,26 +437,31 @@ func TestLearnFromUserRetriedCorrectionFiresOnce(t *testing.T) {
 	})
 	esc, _ := h.raw.PendingEscalations(ctx)
 
-	// First pass: the commit fails, so the batch aborts BEFORE the learn run.
+	// First pass: applyCorrection resolves the row, then the commit fails, so
+	// the batch aborts before the learn run.
 	resolveWith(t, h, esc[0].ID, "use the dry-run flag")
-	// Second pass: the commit succeeds and the learn run fires — once.
+	// Second pass: the commit succeeds and the correction is finally processed.
 	waitFor(t, 5*time.Second, func() bool {
 		if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
 			return false
 		}
-		return len(fl.learnCalls()) >= 1
+		st, _ := h.raw.GetSignature(ctx, esc[0].Signature)
+		return st != nil && st.ConsecutiveConfirmations > 0
 	})
 
-	// Drive several more sweeps; the correction is now processed, so no
-	// further run may fire.
+	// Drive several more sweeps; nothing may fire on any of them.
 	for range 3 {
 		if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
 			t.Fatal(err)
 		}
 	}
 	time.Sleep(300 * time.Millisecond) // let any (incorrect) extra run land
-	if calls := fl.learnCalls(); len(calls) != 1 {
-		t.Errorf("learn ran %d times across a failed commit plus repeated sweeps, want exactly 1", len(calls))
+	if calls := fl.learnCalls(); len(calls) != 0 {
+		t.Errorf("learn ran %d time(s) across a failed commit plus repeated sweeps; a retry must never risk a duplicate file-editing run", len(calls))
+	}
+	// The operator's correction is NOT lost — only the CLI run is.
+	if st, _ := h.raw.GetSignature(ctx, esc[0].Signature); st == nil {
+		t.Error("the correction must still be learned statistically after a failed commit")
 	}
 }
 
