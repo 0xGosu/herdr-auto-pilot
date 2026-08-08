@@ -1453,7 +1453,10 @@ func (a *App) RetryLLM(ctx context.Context, auditID int64) error {
 	if audit == nil {
 		return fmt.Errorf("audit record %d not found", auditID)
 	}
-	if !domain.IsRetryableLLMEscalation(audit) {
+	// Two shapes queue here: a failed LLM escalation (re-drives the consult
+	// pipeline) and a failed learn-from-correction run (re-runs that CLI). The
+	// daemon tells them apart from the audit row; both are just an id here.
+	if !domain.IsRetryableLLMEscalation(audit) && !domain.IsRetryableLearnFailure(audit) {
 		return fmt.Errorf("audit record %d is not a retryable LLM escalation", auditID)
 	}
 	if _, err := a.Store.InsertLLMRetry(ctx, auditID, time.Now()); err != nil {

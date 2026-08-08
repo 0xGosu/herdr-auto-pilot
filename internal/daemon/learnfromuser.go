@@ -20,6 +20,16 @@ import (
 // has been committed (see processCorrections), so it can never cost the
 // operator their correction.
 
+// maxLearnAuditOutput caps the transcript stored on an audit row. The adapter
+// already caps its capture at 16KB; this is the tighter bound that keeps the
+// audit table small (audit_log is the second-largest consumer of hap's state
+// directory) while leaving room for a real stack trace or usage banner.
+const maxLearnAuditOutput = 4000
+
+// retryHint is appended to a failed run's rationale so the operator learns the
+// recovery from the row itself rather than from documentation.
+const retryHint = " — press `l` on this row's detail view to retry"
+
 // learnOutcome carries a finished learn-from-correction run back into the main
 // loop, where the audit row is written — daemon-owned table writes stay on the
 // main loop. The request rides along so the in-flight guard can be cleared for
@@ -162,6 +172,30 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) {
 	})
 }
 
+// applyLearnRetry re-runs a failed learn-from-correction CLI from its audit
+// row. The row is self-sufficient by construction: handleLearnOutcome stores the
+// pane excerpt, the suggestion and the correction precisely so a retry needs
+// nothing else. The working directory is deliberately NOT taken from the row —
+// learnFromUser re-resolves it live, so a retry minutes later still edits the
+// project the agent is in now, or refuses if it cannot tell.
+//
+// The return value follows applyLLMRetry's contract: true means the queue item
+// reached a terminal outcome and may be marked processed. Every outcome here is
+// terminal — a refused spawn writes its own learn:failed row, which the operator
+// can retry again.
+func (d *Daemon) applyLearnRetry(ctx context.Context, audit *domain.AuditRecord) bool {
+	slog.Info("learn-from-user retry requested", "audit", audit.ID, "agent", audit.AgentID)
+	d.learnFromUser(ctx, domain.LearnRequest{
+		AgentType:     audit.AgentType,
+		AgentID:       audit.AgentID,
+		SituationType: audit.SituationType,
+		PaneExcerpt:   audit.PaneExcerpt,
+		Suggestion:    audit.Suggestion,
+		Correction:    audit.Input,
+	})
+	return true
+}
+
 // learnWithSession runs the learn CLI through SessionReportingLearner when the
 // adapter offers it, degrading to the plain call (and the id we passed in)
 // otherwise — the same optional-capability shape as consultWithSession.
@@ -187,25 +221,18 @@ func (d *Daemon) handleLearnOutcome(ctx context.Context, res learnOutcome) {
 	d.mu.Unlock()
 
 	now := d.opt.Clock.Now()
-	action := domain.AuditActionLearnRecorded
 	// Name the directory: the row exists to answer "why did this project's
 	// memory file change?", which it cannot do without saying WHICH one.
+	action := domain.AuditActionLearnRecorded
 	rationale := "recorded a lesson from the operator's correction in " + res.req.Cwd
-	switch {
-	case res.err != nil:
+	if res.err != nil {
 		action = domain.AuditActionLearnFailed
-		rationale = "learn-from-user run failed: " + res.err.Error()
+		rationale = "learn-from-user run failed: " + res.err.Error() + retryHint
 		slog.Warn("learn-from-user failed", "agent", res.req.AgentID, "error", res.err)
-	default:
-		// The @noop sentinel is the CLI's explicit "no durable lesson here".
-		// Reuse the shared line-wise stripper so the sentinel is recognized in
-		// every spelling and shape the other paths accept ("@noop", "- noop",
-		// "`NO-OP`"), rather than defining a second dialect.
-		if _, declined := domain.StripNoopGeneratedLines(res.output); declined {
-			action = domain.AuditActionLearnNoop
-			rationale = "the agent judged the correction to carry no durable lesson"
-		}
 	}
+	// The CLI's output is NOT inspected — no sentinel, no decision, nothing
+	// parsed. It rides along verbatim so the operator can read what the run
+	// said (and, on a failure, why) from the row's detail view.
 
 	// Through d.audit, not a bare AppendAudit: this row is the ONLY record that
 	// a CLI ran and edited a file in the operator's project, so a dropped write
@@ -217,11 +244,31 @@ func (d *Daemon) handleLearnOutcome(ctx context.Context, res learnOutcome) {
 		SituationType: res.req.SituationType,
 		Action:        action,
 		Rationale:     rationale,
+		// LLMOutput is where the detail view renders a run's output, so the
+		// transcript goes there and is truncated to keep audit rows bounded —
+		// the tail is kept, since a failing CLI says why at the end.
+		LLMOutput: tailRunes(res.output, maxLearnAuditOutput),
 		// The corrected action is what the lesson is about; recording it keeps
 		// the row self-explanatory next to the correction lineage row.
-		Input:        res.req.Correction,
+		Input: res.req.Correction,
+		// PaneExcerpt and Suggestion are stored so a RETRY can rebuild the
+		// request from this row alone (see applyLearnRetry) — and so the detail
+		// view shows the operator the screen the lesson was about.
+		PaneExcerpt:  res.req.PaneExcerpt,
+		Suggestion:   res.req.Suggestion,
 		LLMSessionID: res.req.SessionID,
 		Status:       "resolved",
 		CreatedAt:    now,
 	})
+}
+
+// tailRunes keeps the LAST n runes of s, prefixing an ellipsis when it cut.
+// The tail rather than the head: a CLI that fails says why at the end, and the
+// head is usually a banner.
+func tailRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return "…" + string(r[len(r)-n:])
 }

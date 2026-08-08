@@ -4205,6 +4205,15 @@ func (d *Daemon) applyLLMRetry(ctx context.Context, r domain.LLMRetry) bool {
 	}
 	agentID := audit.AgentID
 
+	// A failed learn-from-correction run re-runs that CLI instead of re-driving
+	// the consult pipeline. It shares this queue (and the `l` key) because it is
+	// the same operator gesture — "that LLM call failed, run it again" — but
+	// none of the machinery below applies: there is no escalation to retire, no
+	// pane to re-read, and no consult to avoid stacking onto.
+	if domain.IsRetryableLearnFailure(audit) {
+		return d.applyLearnRetry(ctx, audit)
+	}
+
 	// Guard: never stack a retry onto a consult that is still in flight for
 	// this agent (a pending llm_requests row). The operator re-queues once it
 	// resolves; expireStaleLLMWork clears an abandoned one after 2×timeout.

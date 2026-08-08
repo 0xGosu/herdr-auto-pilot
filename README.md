@@ -1610,7 +1610,7 @@ file (`CLAUDE.md` for claude, `AGENTS.md` for codex).
 [llm]
 learn_from_user_command = [
   "claude", "--model", "opus", "--permission-mode", "acceptEdits", "-p",
-  "You are recording a lesson for yourself. Read the operator's correction below, then update CLAUDE.md in the current directory so you do not repeat the mistake. ... If the correction carries no durable lesson, change nothing and reply with exactly @noop.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
+  "You are recording a lesson for yourself. Read the operator's correction below, then update CLAUDE.md in the current directory so you do not repeat the mistake. ... If the correction carries no durable lesson, change nothing.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
 ]
 # learn_from_user_timeout_seconds = 300   # omitted: inherits timeout_seconds
 ```
@@ -1649,13 +1649,19 @@ Invariants:
   directory it edited on its audit row.
 - **It never touches the pane**, never creates or changes a hap rule, and
   **never escalates**. Every run leaves exactly one `hap audit` row
-  (`llm-learn-from-user`) with `learn:recorded`, `learn:noop`, or
-  `learn:failed`.
+  (`llm-learn-from-user`), either `learn:recorded` or `learn:failed`.
+- **Nothing is parsed out of the reply.** hap takes no decision from this CLI,
+  so the prompt needs no sentinel and no output shape — write it however suits
+  your agent. Whatever it prints (stdout *and* stderr) is captured verbatim on
+  the audit row: open the row in the TUI's **Audit** tab and press `v` to read
+  it. That is also how you diagnose a failure.
+- **A failed run is retryable.** Open its row in the **Audit** tab and press
+  `l`. The retry rebuilds the request from the row and re-resolves the agent's
+  working directory live, so it still edits the right project — or refuses
+  again if it cannot tell. Each attempt writes its own audit row.
 - **It runs only after your correction is committed**, so a broken CLI here can
   never cost you the correction — and a correction retried after a transient
   error still runs the CLI exactly once.
-- **`@noop` is the decline**: the agent judged the correction to carry no
-  durable lesson. That is audited as `learn:noop`, distinct from a failure.
 - **`hap pause` suppresses it** like every other automated action, and only one
   run per agent is in flight at a time so a burst of corrections cannot race
   two CLIs editing the same file.

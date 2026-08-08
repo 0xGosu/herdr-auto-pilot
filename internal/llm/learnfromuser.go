@@ -17,34 +17,43 @@ import (
 // flow) there is no MCP server and nothing is staged — the CLI's real output is
 // the edit it makes to a file.
 //
-// Two things set it apart from every other command in this package:
+// Three things set it apart from every other command in this package:
 //
 //   - it runs in the AGENT's working directory, not the daemon's, because the
-//     whole point is editing that project's CLAUDE.md/AGENTS.md; and
-//   - EMPTY stdout is a success. A CLI that edited a file and printed nothing
+//     whole point is editing that project's CLAUDE.md/AGENTS.md;
+//   - EMPTY output is a success. A CLI that edited a file and printed nothing
 //     did its job. Only a spawn failure, a non-zero exit, or a timeout is an
 //     error, and even those merely produce an audit row — the correction they
-//     follow was committed before this ever ran.
-
-// maxLearnOutput caps the accepted stdout (matches the consult/rewrite/taskgen
-// 16KB capture cap). Nothing downstream reads this text except the @noop check,
-// so the cap only stops a runaway CLI from being held in memory.
-const maxLearnOutput = 16 * 1024
+//     follow was committed before this ever ran; and
+//   - NOTHING IS PARSED OUT OF THE OUTPUT. No decision, no sentinel, no
+//     structure. The returned text is the run's TRANSCRIPT — stdout and stderr
+//     interleaved — and exists only so the operator can read what the CLI said
+//     on the audit row. That is why it is returned on the error path too: a
+//     failed run's stderr is exactly what the operator needs to fix it.
+const (
+	// maxLearnOutput caps the captured transcript (matches the
+	// consult/rewrite/taskgen 16KB capture cap) so a runaway CLI cannot be held
+	// in memory unbounded. The daemon truncates again, harder, before the text
+	// reaches an audit row.
+	maxLearnOutput = 16 * 1024
+)
 
 // LearnFromUserConfigured reports whether a learn-from-user CLI is configured.
 func (a *Adapter) LearnFromUserConfigured() bool {
 	return a != nil && len(a.LearnTemplate) > 0
 }
 
-// LearnFromUser launches the learn-from-user CLI and returns its trimmed stdout.
+// LearnFromUser launches the learn-from-user CLI and returns the run's
+// transcript (stdout + stderr), on the error path too.
 func (a *Adapter) LearnFromUser(ctx context.Context, req domain.LearnRequest) (string, error) {
 	out, _, err := a.LearnFromUserWithSession(ctx, req)
 	return out, err
 }
 
 // LearnFromUserWithSession is LearnFromUser plus the session id the run used.
-// Implements ports.SessionReportingLearner; the id is returned on the error
-// paths too, since a failed run still wrote a transcript.
+// Implements ports.SessionReportingLearner; both the transcript and the id are
+// returned on the error paths too, since a failed run still said something and
+// still wrote a transcript file.
 func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.LearnRequest) (string, string, error) {
 	if !a.LearnFromUserConfigured() {
 		return "", "", fmt.Errorf("no learn-from-user CLI configured")
@@ -163,22 +172,51 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 		sessionID = reported
 	}
 
+	// The transcript goes back on EVERY path, success or failure. It is the
+	// only window the operator has into what the CLI actually did, and on a
+	// failure it is the more valuable of the two — the error string carries
+	// only a 500-char stderr tail, while this carries the whole run.
+	transcript := learnTranscript(stdout.String(), stderr.String())
+
 	if runErr != nil {
 		// Classify as timeout only when the run actually failed: a CLI
 		// finishing right at the deadline must keep its valid output.
 		if runCtx.Err() == context.DeadlineExceeded {
-			return "", sessionID, fmt.Errorf("learn-from-user timeout after %s (stderr: %s)",
+			return transcript, sessionID, fmt.Errorf("learn-from-user timeout after %s (stderr: %s)",
 				timeout, tailOf(stderr.String(), 500))
 		}
-		return "", sessionID, fmt.Errorf("learn-from-user CLI failed: %w (stderr: %s)",
+		return transcript, sessionID, fmt.Errorf("learn-from-user CLI failed: %w (stderr: %s)",
 			runErr, tailOf(stderr.String(), 500))
 	}
-	result := strings.TrimSpace(stdout.String())
 	// Deliberately NO empty-output check, unlike GenerateTask: there the stdout
 	// IS the product, so an empty reply means a broken CLI. Here the product is
 	// the file edit, and a CLI that edits quietly is the normal case.
-	if len(result) > maxLearnOutput {
-		result = result[:maxLearnOutput]
+	return transcript, sessionID, nil
+}
+
+// learnTranscript renders one run's captured streams for the audit row. The two
+// are LABELLED rather than concatenated: a CLI that fails after printing
+// progress leaves useful text in both, and "which stream said this" is most of
+// the diagnosis ("hello" on stdout with an exit-1 traceback on stderr reads very
+// differently from the reverse). Empty streams are omitted so the common case —
+// a quiet, successful edit — renders as "" rather than as two empty headings.
+func learnTranscript(stdout, stderr string) string {
+	out, errOut := strings.TrimSpace(stdout), strings.TrimSpace(stderr)
+	var b strings.Builder
+	if out != "" {
+		b.WriteString("stdout:\n")
+		b.WriteString(out)
 	}
-	return result, sessionID, nil
+	if errOut != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("stderr:\n")
+		b.WriteString(errOut)
+	}
+	s := b.String()
+	if len(s) > maxLearnOutput {
+		s = s[:maxLearnOutput]
+	}
+	return s
 }

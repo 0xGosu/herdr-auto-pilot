@@ -361,22 +361,115 @@ func TestLearnFromUserFailureOnlyAuditsAndNeverEscalates(t *testing.T) {
 	}
 }
 
-// TestLearnFromUserNoopDeclineIsRecorded: the CLI's "@noop" means "no durable
-// lesson here". It is a distinct outcome from a failure — the run worked and
-// deliberately changed nothing — so it gets its own action.
-func TestLearnFromUserNoopDeclineIsRecorded(t *testing.T) {
+// TestLearnFromUserCapturesTheTranscript: hap takes no decision from this CLI,
+// so its output is not parsed — it is carried verbatim onto the audit row for
+// the operator to read. Anything that looks like a sentinel is just text.
+func TestLearnFromUserCapturesTheTranscript(t *testing.T) {
 	h, fl, esc := learnHarness(t, "agent-lfu6")
 	fl.mu.Lock()
 	fl.learn = func(context.Context, domain.LearnRequest) (string, error) {
-		return "@noop", nil
+		return "stdout:\nAppended a rule to CLAUDE.md\n\nstderr:\n@noop", nil
 	}
 	fl.mu.Unlock()
 
-	resolveWith(t, h, esc.ID, "just this once, skip it")
+	resolveWith(t, h, esc.ID, "prefer the safe option")
 	waitFor(t, 3*time.Second, func() bool { return len(learnAudits(t, h)) == 1 })
 
-	if got := learnAudits(t, h)[0].Action; got != domain.AuditActionLearnNoop {
-		t.Errorf("audit action = %q, want %q", got, domain.AuditActionLearnNoop)
+	row := learnAudits(t, h)[0]
+	// A completed run is `learn:recorded` whatever it printed: "@noop" in the
+	// output is text, not a verdict — hap no longer asks for a sentinel and
+	// must not resurrect one by reading it.
+	if row.Action != domain.AuditActionLearnRecorded {
+		t.Errorf("audit action = %q, want %q — the output must not be interpreted", row.Action, domain.AuditActionLearnRecorded)
+	}
+	if !strings.Contains(row.LLMOutput, "Appended a rule to CLAUDE.md") {
+		t.Errorf("LLMOutput = %q, want the CLI's stdout captured for the operator", row.LLMOutput)
+	}
+	if !strings.Contains(row.LLMOutput, "@noop") {
+		t.Errorf("LLMOutput = %q, want the transcript verbatim", row.LLMOutput)
+	}
+}
+
+// TestLearnFromUserFailureCapturesTheTranscript: a failed run's output is the
+// MORE valuable of the two — it is how the operator diagnoses the failure — so
+// it must land on the row even though the call returned an error.
+func TestLearnFromUserFailureCapturesTheTranscript(t *testing.T) {
+	h, fl, esc := learnHarness(t, "agent-lfu13")
+	fl.mu.Lock()
+	fl.learn = func(context.Context, domain.LearnRequest) (string, error) {
+		return "stderr:\nclaude: unknown flag --permission-mode", errors.New("learn-from-user CLI failed: exit 2")
+	}
+	fl.mu.Unlock()
+
+	resolveWith(t, h, esc.ID, "deny it")
+	waitFor(t, 3*time.Second, func() bool { return len(learnAudits(t, h)) == 1 })
+
+	row := learnAudits(t, h)[0]
+	if row.Action != domain.AuditActionLearnFailed {
+		t.Errorf("audit action = %q, want %q", row.Action, domain.AuditActionLearnFailed)
+	}
+	if !strings.Contains(row.LLMOutput, "unknown flag") {
+		t.Errorf("LLMOutput = %q, want the failing CLI's stderr", row.LLMOutput)
+	}
+	// The row must tell the operator how to recover, not just that it broke.
+	if !strings.Contains(row.Rationale, "`l`") {
+		t.Errorf("rationale = %q, want the retry hint", row.Rationale)
+	}
+	if !domain.IsRetryableLearnFailure(&row) {
+		t.Errorf("a failed run must be retryable: %+v", row)
+	}
+}
+
+// TestLearnFromUserRetryRerunsTheCLI: `l` on a failed run's audit row re-runs
+// it. The row is self-sufficient — the retry rebuilds the request from it — and
+// the working directory is re-resolved live rather than reused.
+func TestLearnFromUserRetryRerunsTheCLI(t *testing.T) {
+	h, fl, esc := learnHarness(t, "agent-lfu14")
+	fl.mu.Lock()
+	fl.learn = func(context.Context, domain.LearnRequest) (string, error) {
+		return "boom", errors.New("learn-from-user CLI failed: exit 1")
+	}
+	fl.mu.Unlock()
+
+	resolveWith(t, h, esc.ID, "use the dry-run flag")
+	waitFor(t, 3*time.Second, func() bool { return len(learnAudits(t, h)) == 1 })
+	failed := learnAudits(t, h)[0]
+
+	// The CLI is fixed; the operator retries.
+	fl.mu.Lock()
+	fl.learn = func(context.Context, domain.LearnRequest) (string, error) { return "recorded", nil }
+	fl.mu.Unlock()
+
+	ctx := context.Background()
+	if _, err := h.raw.InsertLLMRetry(ctx, failed.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return len(fl.learnCalls()) == 2 })
+
+	// The retry carried the whole request forward from the row alone.
+	retried := fl.learnCalls()[1]
+	if retried.Correction != "use the dry-run flag" {
+		t.Errorf("retry Correction = %q, want it rebuilt from the audit row", retried.Correction)
+	}
+	if retried.PaneExcerpt == "" {
+		t.Error("retry PaneExcerpt is empty; the row must carry the screen forward")
+	}
+	if retried.Cwd == "" {
+		t.Error("retry Cwd is empty; it must be re-resolved live")
+	}
+	// A second, successful row — the failed one is history, not mutated.
+	waitFor(t, 3*time.Second, func() bool { return len(learnAudits(t, h)) == 2 })
+	var recorded bool
+	for _, r := range learnAudits(t, h) {
+		if r.Action == domain.AuditActionLearnRecorded {
+			recorded = true
+		}
+	}
+	if !recorded {
+		t.Errorf("a successful retry must write a learn:recorded row, got %+v", learnAudits(t, h))
 	}
 }
 

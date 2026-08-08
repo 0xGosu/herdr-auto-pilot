@@ -175,7 +175,8 @@ func TestLearnFromUserRefusesWithoutALiveCwd(t *testing.T) {
 
 // TestLearnFromUserEmptyOutputIsNotAnError is the deliberate difference from
 // GenerateTask, where stdout IS the product. Here the product is the file the
-// CLI edited; a CLI that edits quietly is the normal case.
+// CLI edited; a CLI that edits quietly is the normal case, and it must render
+// as "" rather than as two empty stream headings.
 func TestLearnFromUserEmptyOutputIsNotAnError(t *testing.T) {
 	script := writeScript(t, "true\n")
 	a := &Adapter{LearnTemplate: []string{script}, LearnTimeout: 5 * time.Second}
@@ -186,6 +187,53 @@ func TestLearnFromUserEmptyOutputIsNotAnError(t *testing.T) {
 	if got != "" {
 		t.Errorf("output = %q, want empty", got)
 	}
+}
+
+// TestLearnFromUserReturnsTheTranscript: nothing is parsed out of this CLI's
+// reply, so both streams are captured and LABELLED for the operator to read on
+// the audit row — "which stream said this" is most of the diagnosis.
+func TestLearnFromUserReturnsTheTranscript(t *testing.T) {
+	script := writeScript(t, "echo 'wrote a rule to CLAUDE.md'\necho 'a warning' >&2\n")
+	a := &Adapter{LearnTemplate: []string{script}, LearnTimeout: 5 * time.Second}
+	got, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "stdout:\nwrote a rule to CLAUDE.md\n\nstderr:\na warning"
+	if got != want {
+		t.Errorf("transcript = %q, want %q", got, want)
+	}
+}
+
+// TestLearnFromUserReturnsTheTranscriptOnFailure is the case that matters most:
+// a run that failed is diagnosed from its output, so the transcript must come
+// back alongside the error rather than being dropped for it.
+func TestLearnFromUserReturnsTheTranscriptOnFailure(t *testing.T) {
+	t.Run("non-zero exit", func(t *testing.T) {
+		script := writeScript(t, "echo 'starting'\necho 'unknown flag --nope' >&2\nexit 2\n")
+		a := &Adapter{LearnTemplate: []string{script}, LearnTimeout: 5 * time.Second}
+		got, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: t.TempDir()})
+		if err == nil {
+			t.Fatal("want an error")
+		}
+		if !strings.Contains(got, "unknown flag --nope") {
+			t.Errorf("transcript = %q, want the failing stderr", got)
+		}
+		if !strings.Contains(got, "starting") {
+			t.Errorf("transcript = %q, want the stdout it managed to print", got)
+		}
+	})
+	t.Run("timeout", func(t *testing.T) {
+		script := writeScript(t, "echo 'partial work' >&2\nsleep 30\n")
+		a := &Adapter{LearnTemplate: []string{script}, LearnTimeout: 200 * time.Millisecond}
+		got, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: t.TempDir()})
+		if err == nil {
+			t.Fatal("want a timeout error")
+		}
+		if !strings.Contains(got, "partial work") {
+			t.Errorf("transcript = %q, want what the CLI printed before the deadline", got)
+		}
+	})
 }
 
 // TestLearnFromUserRendersMissingSuggestion: hap escalates without an opinion

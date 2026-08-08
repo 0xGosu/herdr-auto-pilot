@@ -366,22 +366,38 @@ const (
 	RationaleOperatorCorrected = "operator corrected"
 )
 
-// Actions written on a TriggerLLMLearnFromUser audit row. Every outcome gets
-// one, including the declines and the failures: the run edits a file in the
-// operator's project, so "it ran and changed nothing" must be distinguishable
-// from "it never ran".
+// Actions written on a TriggerLLMLearnFromUser audit row. Both outcomes get
+// one: the run edits a file in the operator's project, so "it ran" must be
+// distinguishable from "it never ran". There are only two, deliberately —
+// nothing is parsed out of the CLI's output, so hap has no opinion on WHAT the
+// run decided, only on whether it completed. The output itself rides on the
+// row's LLMOutput for the operator to read.
 const (
-	// AuditActionLearnRecorded: the CLI ran cleanly and reported no decline,
-	// so it recorded whatever lesson it judged appropriate.
+	// AuditActionLearnRecorded: the CLI ran to completion. Whether it actually
+	// wrote anything is between it and the file — hap does not inspect it.
 	AuditActionLearnRecorded = "learn:recorded"
-	// AuditActionLearnNoop: the CLI declined with the @noop sentinel — it
-	// judged the correction to carry no durable lesson.
-	AuditActionLearnNoop = "learn:noop"
 	// AuditActionLearnFailed: the CLI could not be spawned, exited non-zero,
 	// or timed out. Nothing else happens — a failed lesson never blocks the
-	// correction, which was already committed before the run started.
+	// correction, which was already committed before the run started. The
+	// operator can re-run it (see IsRetryableLearnFailure).
 	AuditActionLearnFailed = "learn:failed"
 )
+
+// IsRetryableLearnFailure reports whether an audit row is a failed
+// learn-from-correction run the operator may re-run.
+//
+// It is deliberately NOT folded into IsRetryableLLMEscalation: that predicate
+// requires Status == "escalated", and a learn row is never an escalation (the
+// feature must not put a question in front of the operator). The row is
+// "resolved" from birth, and its retryability is carried by the trigger and
+// action instead.
+//
+// A retry is always safe to offer: the run has no pane side effect, and it
+// re-resolves the agent's working directory at fire time rather than reusing a
+// stale one.
+func IsRetryableLearnFailure(a *AuditRecord) bool {
+	return a != nil && a.Trigger == TriggerLLMLearnFromUser && a.Action == AuditActionLearnFailed
+}
 
 // audit_log Status literals shared across packages.
 const (

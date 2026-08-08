@@ -259,12 +259,19 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # memory file survives a screen that hashes differently, and survives the agent
 # process itself.
 #
-# It is fire-and-forget: no MCP tools, nothing staged, nothing read back except
-# an optional "@noop". It never types into the pane, never creates a hap rule,
-# and never raises an escalation — every run leaves exactly one `hap audit` row
-# (llm-learn-from-user). It runs only AFTER your correction is committed, so a
-# broken CLI here can never cost you the correction. The global pause
-# (`hap pause`) suppresses it like everything else.
+# It is fire-and-forget: no MCP tools, nothing staged, and NOTHING is parsed out
+# of the reply — hap takes no decision from this CLI, so the prompt needs no
+# sentinel and no particular output shape. Whatever it prints (stdout and
+# stderr) is captured verbatim on its `hap audit` row so you can read what it
+# did; open the row in the TUI's Audit tab and press `v` for the full text.
+#
+# It never types into the pane, never creates a hap rule, and never raises an
+# escalation — every run leaves exactly one audit row (llm-learn-from-user),
+# `learn:recorded` or `learn:failed`. A FAILED run (bad command, non-zero exit,
+# timeout) is retryable: open its row in the Audit tab and press `l`. It runs
+# only AFTER your correction is committed, so a broken CLI here can never cost
+# you the correction. The global pause (`hap pause`) suppresses it like
+# everything else.
 #
 # The CLI needs WRITE access to edit the memory file — note --permission-mode
 # acceptEdits below, which the read-only consult recipe does not use.
@@ -283,7 +290,7 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # never edits files in your projects.
 # learn_from_user_command = [
 #   "claude", "--model", "opus", "--permission-mode", "acceptEdits", "-p",
-#   "You are recording a lesson for yourself. Read the operator's correction below, then update CLAUDE.md in the current directory so you do not repeat the mistake. Edit CLAUDE.md and nothing else: do not run the task, do not touch the terminal, do not answer the prompt shown on screen. Add or amend ONE short, general rule, phrased as guidance for the future rather than as a note about this incident; if an existing rule already covers it, sharpen that rule instead of adding a second one. If the correction carries no durable lesson (a one-off, or purely situational), change nothing and reply with exactly @noop.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
+#   "You are recording a lesson for yourself. Read the operator's correction below, then update CLAUDE.md in the current directory so you do not repeat the mistake. Edit CLAUDE.md and nothing else: do not run the task, do not touch the terminal, do not answer the prompt shown on screen. Add or amend ONE short, general rule, phrased as guidance for the future rather than as a note about this incident; if an existing rule already covers it, sharpen that rule instead of adding a second one. If the correction carries no durable lesson (a one-off, or purely situational), change nothing.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
 # ]
 
 # ── Learn from your corrections — OpenAI Codex (commented; swap in to use codex) ──
@@ -291,7 +298,7 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # learn_from_user_command = [
 #   "codex", "--model", "gpt-5.6-sol", "exec", "--skip-git-repo-check",
 #   "--dangerously-bypass-approvals-and-sandbox",
-#   "You are recording a lesson for yourself. Read the operator's correction below, then update AGENTS.md in the current directory so you do not repeat the mistake. Edit AGENTS.md and nothing else: do not run the task, do not touch the terminal, do not answer the prompt shown on screen. Add or amend ONE short, general rule, phrased as guidance for the future rather than as a note about this incident; if an existing rule already covers it, sharpen that rule instead of adding a second one. If the correction carries no durable lesson (a one-off, or purely situational), change nothing and reply with exactly @noop.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
+#   "You are recording a lesson for yourself. Read the operator's correction below, then update AGENTS.md in the current directory so you do not repeat the mistake. Edit AGENTS.md and nothing else: do not run the task, do not touch the terminal, do not answer the prompt shown on screen. Add or amend ONE short, general rule, phrased as guidance for the future rather than as a note about this incident; if an existing rule already covers it, sharpen that rule instead of adding a second one. If the correction carries no durable lesson (a one-off, or purely situational), change nothing.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
 # ]
 
 # learn_from_user_timeout_seconds = 300   # omitted: inherits timeout_seconds
