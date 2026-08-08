@@ -5563,6 +5563,41 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 		}
 	})
 
+	t.Run("run_in_agent_cwd persists an explicit false", func(t *testing.T) {
+		// A POINTER field is exactly the shape where "SetField accepted the
+		// value" and "SetField stored it" come apart — a nil left in place, or
+		// a write through a pointer the loaded Config shares, both look fine to
+		// the registry-parity guard.
+		if err := app.SetField(ctx, "llm.run_in_agent_cwd", "false"); err != nil {
+			t.Fatalf("SetField rejected a valid bool: %v", err)
+		}
+		cfg, err := app.Config()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.LLM.RunInAgentCwd == nil || *cfg.LLM.RunInAgentCwd {
+			t.Errorf("RunInAgentCwd = %v — SetField accepted false but did not store it", cfg.LLM.RunInAgentCwd)
+		}
+		if cfg.RunLLMInAgentCwd() {
+			t.Error("the accessor must report false once an explicit false is stored")
+		}
+		// And back on again, so the default is reachable after opting out.
+		if err := app.SetField(ctx, "llm.run_in_agent_cwd", "true"); err != nil {
+			t.Fatalf("SetField rejected true: %v", err)
+		}
+		if cfg, err = app.Config(); err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.RunLLMInAgentCwd() {
+			t.Error("RunInAgentCwd must be settable back to true")
+		}
+		for _, bad := range []string{"yes", "", "1.5", "maybe"} {
+			if err := app.SetField(ctx, "llm.run_in_agent_cwd", bad); err == nil {
+				t.Errorf("SetField accepted %q; only a bool is valid", bad)
+			}
+		}
+	})
+
 	t.Run("learn_from_user keys persist, validate, and clear", func(t *testing.T) {
 		if err := app.SetField(ctx, "llm.learn_from_user_command", `claude -p "record the lesson"`); err != nil {
 			t.Fatalf("SetField rejected a valid argv: %v", err)
