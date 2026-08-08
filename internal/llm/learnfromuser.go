@@ -86,7 +86,7 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 		"{cwd}", req.Cwd,
 		"{situation_type}", string(req.SituationType),
 		"{pane_excerpt}", req.PaneExcerpt,
-		"{suggestion}", req.Suggestion,
+		"{suggestion}", req.SuggestionText(),
 		"{correction}", req.Correction,
 		SessionIDPlaceholder, req.SessionID,
 	)

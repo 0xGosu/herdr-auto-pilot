@@ -171,6 +171,33 @@ func TestLearnFromUserEmptyOutputIsNotAnError(t *testing.T) {
 	}
 }
 
+// TestLearnFromUserRendersMissingSuggestion: hap escalates without an opinion
+// on an unclassifiable screen, so {suggestion} can legitimately be empty. The
+// run still happens ("hap had no idea and you said X" is a lesson), but the
+// placeholder must render as a readable fact rather than leaving the shipped
+// prompt's "You were about to answer:" trailing into nothing.
+func TestLearnFromUserRendersMissingSuggestion(t *testing.T) {
+	dir := t.TempDir()
+	argvFile := filepath.Join(dir, "argv")
+	script := writeScript(t, `printf '%s\n' "$@" > `+argvFile+"\n")
+	a := &Adapter{
+		LearnTemplate: []string{script, "was={suggestion}"},
+		LearnTimeout:  5 * time.Second,
+	}
+	if _, err := a.LearnFromUser(context.Background(), domain.LearnRequest{
+		Cwd: dir, Correction: "deny it",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "was="+domain.NoSuggestionText {
+		t.Errorf("argv = %q, want the NoSuggestionText placeholder", got)
+	}
+}
+
 func TestLearnFromUserFailureModes(t *testing.T) {
 	t.Run("non-zero exit", func(t *testing.T) {
 		script := writeScript(t, "echo 'boom' >&2\nexit 3\n")

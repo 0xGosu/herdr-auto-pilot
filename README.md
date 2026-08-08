@@ -1572,6 +1572,33 @@ Invariants:
 - **Cost note**: every reviewed send is one full consult (an MCP
   round-trip), so latency and token spend are those of `llm.command`.
 
+#### Troubleshooting the fallback
+
+- **Escalations citing `not found in PATH`** — the daemon inherits herdr's
+  environment, which can be narrower than your shell's; make sure the CLI
+  is reachable from a non-login shell or use an absolute path in
+  `llm.command`.
+- **Escalations citing `ENOENT: Bun could not find a file` (≤ v0.1.10)** —
+  the daemon was started from a workspace directory that has since been
+  deleted, which kills the Bun-built `claude` CLI at startup. Fixed in
+  v0.1.11; upgrading also requires replacing the running daemon (below).
+- **Upgrades not taking effect** — the daemon is a singleton that outlives
+  binary upgrades. Since v0.1.13, `hap daemon --ensure` (fired by herdr's
+  event hooks) detects the version mismatch and replaces the old daemon
+  automatically; `hap status` shows the running daemon's version and flags
+  a stale one. On older versions run `pkill -f 'hap daemon'` once after
+  upgrading.
+- **After an upgrade, every LLM consult comes back empty** — the daemon is
+  running from a binary the upgrade removed, so it can no longer launch the
+  hap MCP server for its LLM CLI. `hap status` reports
+  `BINARY REMOVED (upgraded underneath it)`; `hap daemon --ensure` fixes it.
+  The install step and the daemon's own 10-second check normally handle this
+  without you noticing.
+- **`hap: command not found`, or `hap` runs an old version, after an upgrade**
+  — `/usr/local/bin/hap` points into the previous install directory. Open the
+  TUI **Config** tab and select the **Repoint /usr/local/bin/hap** row under
+  **Quick Shortcuts**.
+
 ### Learning from your corrections (optional)
 
 When you **correct** an escalation — answer it with something other than what
@@ -1628,33 +1655,6 @@ Invariants:
   does not use.
 - **Cost note**: one CLI run per correction. Corrections are human-paced, so
   this is far cheaper than the consult path.
-
-#### Troubleshooting the fallback
-
-- **Escalations citing `not found in PATH`** — the daemon inherits herdr's
-  environment, which can be narrower than your shell's; make sure the CLI
-  is reachable from a non-login shell or use an absolute path in
-  `llm.command`.
-- **Escalations citing `ENOENT: Bun could not find a file` (≤ v0.1.10)** —
-  the daemon was started from a workspace directory that has since been
-  deleted, which kills the Bun-built `claude` CLI at startup. Fixed in
-  v0.1.11; upgrading also requires replacing the running daemon (below).
-- **Upgrades not taking effect** — the daemon is a singleton that outlives
-  binary upgrades. Since v0.1.13, `hap daemon --ensure` (fired by herdr's
-  event hooks) detects the version mismatch and replaces the old daemon
-  automatically; `hap status` shows the running daemon's version and flags
-  a stale one. On older versions run `pkill -f 'hap daemon'` once after
-  upgrading.
-- **After an upgrade, every LLM consult comes back empty** — the daemon is
-  running from a binary the upgrade removed, so it can no longer launch the
-  hap MCP server for its LLM CLI. `hap status` reports
-  `BINARY REMOVED (upgraded underneath it)`; `hap daemon --ensure` fixes it.
-  The install step and the daemon's own 10-second check normally handle this
-  without you noticing.
-- **`hap: command not found`, or `hap` runs an old version, after an upgrade**
-  — `/usr/local/bin/hap` points into the previous install directory. Open the
-  TUI **Config** tab and select the **Repoint /usr/local/bin/hap** row under
-  **Quick Shortcuts**.
 
 ### Answering escalations you never got to (optional)
 

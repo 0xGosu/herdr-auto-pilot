@@ -1,5 +1,7 @@
 package domain
 
+import "strings"
+
 // Learning from an operator correction (llm.learn_from_user_command): when the
 // operator answers an escalation with something OTHER than what hap suggested,
 // a one-shot CLI is run in the agent's own working directory and asked to write
@@ -17,6 +19,22 @@ package domain
 // correction has been committed, so a failure can never cost the operator
 // their correction. These are the pure pieces — the subprocess lives in
 // internal/llm and the dispatch in internal/daemon.
+
+// NoSuggestionText is what {suggestion} expands to when the escalation carried
+// no suggestion — hap escalated without an opinion (an unclassifiable screen,
+// or a rule that resolved to nothing). Rendering the empty string instead would
+// leave the shipped prompt's "You were about to answer:" trailing into nothing,
+// which reads to a model as a truncated prompt rather than as a fact.
+const NoSuggestionText = "(nothing — hap had no suggestion and escalated to the operator)"
+
+// SuggestionText is the {suggestion} rendering of a learn request: the
+// suggestion itself, or NoSuggestionText when there was none.
+func (r LearnRequest) SuggestionText() string {
+	if strings.TrimSpace(r.Suggestion) == "" {
+		return NoSuggestionText
+	}
+	return r.Suggestion
+}
 
 // LearnRequest is everything the learn-from-user CLI template can reference.
 type LearnRequest struct {
@@ -43,6 +61,10 @@ type LearnRequest struct {
 	PaneExcerpt string
 	// Suggestion is what hap was about to answer, for {suggestion}. Without it
 	// the CLI sees only the right answer and cannot tell what the mistake was.
+	// It is EMPTY when the escalation carried no suggestion at all (hap could
+	// not classify the screen). That still runs — "hap had no idea and you said
+	// X" is a lesson, often the most useful one — and {suggestion} renders as
+	// NoSuggestionText so the prompt does not trail off mid-sentence.
 	Suggestion string
 	// Correction is what the operator answered instead, for {correction}.
 	Correction string

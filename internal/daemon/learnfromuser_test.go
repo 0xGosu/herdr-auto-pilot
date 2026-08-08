@@ -13,6 +13,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
 // Tests for llm.learn_from_user_command: after the operator CORRECTS an
@@ -262,25 +263,74 @@ func TestLearnFromUserNoopDeclineIsRecorded(t *testing.T) {
 	}
 }
 
-// TestLearnFromUserRetriedCorrectionFiresOnce: a correction whose "processed"
-// flag fails to commit is retried on the next sweep. The CLI edits a file, so
-// it must run exactly once per committed correction — never twice.
-func TestLearnFromUserRetriedCorrectionFiresOnce(t *testing.T) {
-	h, fl, esc := learnHarness(t, "agent-lfu7")
-	resolveWith(t, h, esc.ID, "use the dry-run flag")
-	waitFor(t, 3*time.Second, func() bool { return len(fl.learnCalls()) == 1 })
+// flakyProcessedStore fails the first MarkCorrectionProcessed, so the
+// correction is re-read and re-applied on the next sweep. It must be installed
+// BEFORE Run (see newHarnessCore) — reassigning the daemon's store afterward
+// races the startup sweep.
+type flakyProcessedStore struct {
+	ports.StorePort
+	mu     sync.Mutex
+	failed bool
+}
 
-	// Drive several more sweeps. The correction is already marked processed, so
-	// no further run may fire.
+func (s *flakyProcessedStore) MarkCorrectionProcessed(ctx context.Context, id int64) error {
+	s.mu.Lock()
+	first := !s.failed
+	s.failed = true
+	s.mu.Unlock()
+	if first {
+		return errors.New("simulated transient store failure")
+	}
+	return s.StorePort.MarkCorrectionProcessed(ctx, id)
+}
+
+// TestLearnFromUserRetriedCorrectionFiresOnce pins the fire-AFTER-commit
+// discipline. A correction whose "processed" flag fails to commit is re-applied
+// on the next sweep; because the CLI edits a file in the operator's project, it
+// must run exactly once for that correction — not once per attempt.
+func TestLearnFromUserRetriedCorrectionFiresOnce(t *testing.T) {
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	os.WriteFile(taskFile, []byte("- [ ] update the docs\n"), 0o600)
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-lfu7\"\npath = %q\n", taskFile)
+
+	fl := &fakeLearner{fakeLLM: &fakeLLM{}, learn: func(context.Context, domain.LearnRequest) (string, error) {
+		return "", nil
+	}}
+	h := newHarnessCore(t, cfg, nil, fl, fl.fakeLLM, func(inner ports.StorePort) ports.StorePort {
+		return &flakyProcessedStore{StorePort: inner}
+	})
+	h.herdr.setPane("All tests pass. Task is complete.\n")
+	h.herdr.setPaneInfo(domain.PaneInfo{ForegroundCwd: dir})
+
 	ctx := context.Background()
+	h.push("agent-lfu7", "idle")
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ := h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	esc, _ := h.raw.PendingEscalations(ctx)
+
+	// First pass: the commit fails, so the batch aborts BEFORE the learn run.
+	resolveWith(t, h, esc[0].ID, "use the dry-run flag")
+	// Second pass: the commit succeeds and the learn run fires — once.
+	waitFor(t, 5*time.Second, func() bool {
+		if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+			return false
+		}
+		return len(fl.learnCalls()) >= 1
+	})
+
+	// Drive several more sweeps; the correction is now processed, so no
+	// further run may fire.
 	for range 3 {
 		if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
 			t.Fatal(err)
 		}
 	}
-	waitFor(t, time.Second, func() bool { return false }) // settle
+	time.Sleep(300 * time.Millisecond) // let any (incorrect) extra run land
 	if calls := fl.learnCalls(); len(calls) != 1 {
-		t.Errorf("learn ran %d times across repeated sweeps, want exactly 1", len(calls))
+		t.Errorf("learn ran %d times across a failed commit plus repeated sweeps, want exactly 1", len(calls))
 	}
 }
 
@@ -302,30 +352,40 @@ func TestLearnFromUserOneRunPerAgentInFlight(t *testing.T) {
 	}
 	fl.mu.Unlock()
 
+	// The blocked CLI must be released even if an assertion below aborts the
+	// test, or the daemon's background drain never finishes and the harness
+	// reports a goroutine leak instead of the real failure.
+	defer close(release)
+
 	// First correction: blocks inside the CLI.
 	resolveWith(t, h, esc.ID, "first correction")
 	started.Wait()
 
-	// Second correction for the SAME agent while the first is still running.
-	// It resolves normally but must not spawn a second CLI.
+	// A SECOND escalation for the same agent, written directly: this test is
+	// about the in-flight guard, not about classification, so the row is
+	// constructed rather than driven through the pipeline.
 	ctx := context.Background()
-	second := h.seedAutonomous("Another screen entirely.\n", domain.SituationApproval, "Yes")
-	audits, _ := h.raw.AuditLog(ctx, 50)
-	var secondID int64
-	for _, r := range audits {
-		if r.Signature == second && r.Status == "escalated" {
-			secondID = r.ID
-		}
+	secondID, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-lfu8", AgentType: "claude", Signature: "sig-lfu8-second",
+		Trigger: "test", SituationType: domain.SituationApproval,
+		Action: domain.AuditActionEscalated, Suggestion: "respond: Yes",
+		PaneExcerpt: approvalPane, Status: "escalated", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if secondID != 0 {
-		resolveWith(t, h, secondID, "no, do the other thing")
-		waitFor(t, 2*time.Second, func() bool {
-			a, _ := h.raw.GetAudit(ctx, secondID)
-			return a != nil && a.Status == "resolved"
-		})
-		if calls := fl.learnCalls(); len(calls) != 1 {
-			t.Errorf("a second correction while one run is in flight must be skipped, got %d calls", len(calls))
-		}
+	if secondID == 0 {
+		t.Fatal("could not create the second escalation")
 	}
-	close(release)
+
+	// Correcting it resolves normally but must NOT spawn a second CLI while the
+	// first is still running — two CLIs would race editing the same memory file.
+	resolveWith(t, h, secondID, "no, do the other thing")
+	waitFor(t, 3*time.Second, func() bool {
+		a, _ := h.raw.GetAudit(ctx, secondID)
+		return a != nil && a.Status == "resolved"
+	})
+	if calls := fl.learnCalls(); len(calls) != 1 {
+		t.Errorf("a second correction while one run is in flight must be skipped, got %d calls", len(calls))
+	}
 }
