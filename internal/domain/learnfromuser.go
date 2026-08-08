@@ -46,11 +46,25 @@ func (r LearnRequest) CorrectionText() string {
 	return spellOutNoop(r.Correction)
 }
 
-// spellOutNoop replaces the bare @noop sentinel with its human phrasing,
-// leaving every other action untouched.
+// spellOutNoop replaces a bare hap SENTINEL with its human phrasing, leaving
+// every other action untouched.
+//
+// Sentinels are hap's internal tokens for "answer nothing" and "hand out the
+// next task". A model handed one verbatim has no way to know it is a token: it
+// reads as a literal string the operator typed, so the lesson recorded is about
+// the spelling of "@next_task:declared" rather than about the behavior the
+// operator actually wanted. Every sentinel that can reach a learn prompt must
+// be listed here.
 func spellOutNoop(action string) string {
-	if IsNoopAction(NormalizeNoopAction(strings.TrimSpace(action))) {
+	trimmed := strings.TrimSpace(action)
+	if IsNoopAction(NormalizeNoopAction(trimmed)) {
 		return ActionNoopSuggestion
+	}
+	switch trimmed {
+	case ActionNextDeclaredTask:
+		return "send the agent its next task from its declared task list"
+	case ActionNextInferredTask:
+		return "send the agent the next task inferred from its own on-screen todo list"
 	}
 	return action
 }

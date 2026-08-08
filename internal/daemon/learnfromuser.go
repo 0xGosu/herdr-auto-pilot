@@ -79,6 +79,11 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) {
 		slog.Info("learn-from-user skipped: run already in flight", "agent", req.AgentID)
 		return
 	}
+	// Marked before the spawn so two corrections in one batch cannot both pass
+	// this gate. A spawn dropped because shutdown has latched leaves the mark
+	// set — the same tolerated skip spawn documents for sweepInFlight and
+	// paneCwdRefreshing, and harmless for the same reason: the map dies with
+	// the process, and no further deliveries run.
 	d.learnInFlight[req.AgentID] = true
 	d.mu.Unlock()
 
@@ -162,7 +167,9 @@ func (d *Daemon) handleLearnOutcome(ctx context.Context, res learnOutcome) {
 
 	now := d.opt.Clock.Now()
 	action := domain.AuditActionLearnRecorded
-	rationale := "recorded a lesson from the operator's correction"
+	// Name the directory: the row exists to answer "why did this project's
+	// memory file change?", which it cannot do without saying WHICH one.
+	rationale := "recorded a lesson from the operator's correction in " + res.req.Cwd
 	switch {
 	case res.err != nil:
 		action = domain.AuditActionLearnFailed
@@ -179,7 +186,10 @@ func (d *Daemon) handleLearnOutcome(ctx context.Context, res learnOutcome) {
 		}
 	}
 
-	d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+	// Through d.audit, not a bare AppendAudit: this row is the ONLY record that
+	// a CLI ran and edited a file in the operator's project, so a dropped write
+	// must at least be logged rather than vanish.
+	d.audit(ctx, domain.AuditRecord{
 		AgentID:       res.req.AgentID,
 		AgentType:     res.req.AgentType,
 		Trigger:       domain.TriggerLLMLearnFromUser,

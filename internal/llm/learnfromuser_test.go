@@ -140,17 +140,34 @@ func TestLearnFromUserRunsInTheAgentsCwd(t *testing.T) {
 	}
 }
 
-// TestLearnFromUserMissingCwdFallsBack: a cwd herdr could not report, or one
-// that has since been deleted, must still spawn rather than fail — the lesson
-// lands wherever the adapter defaults to, which beats not running at all.
-func TestLearnFromUserMissingCwdFallsBack(t *testing.T) {
-	gone := filepath.Join(t.TempDir(), "deleted")
-	script := writeScript(t, "true\n")
+// TestLearnFromUserRefusesWithoutALiveCwd: an unknown or dead working directory
+// must REFUSE, not fall back. This CLI is configured to edit a memory file "in
+// the current directory" and is given write permission to do it, so a fallback
+// would not degrade the run — it would write the operator's lesson into a
+// different project, or into $HOME. Refusing produces a `learn:failed` audit
+// row instead, which is the honest signal.
+func TestLearnFromUserRefusesWithoutALiveCwd(t *testing.T) {
+	ran := filepath.Join(t.TempDir(), "ran")
+	script := writeScript(t, `touch `+ran+"\n")
 	a := &Adapter{LearnTemplate: []string{script}, LearnTimeout: 5 * time.Second}
-	for name, cwd := range map[string]string{"empty": "", "deleted": gone} {
+	cases := map[string]string{
+		"empty":   "",
+		"blank":   "   ",
+		"deleted": filepath.Join(t.TempDir(), "deleted"),
+		// herdr renders a deleted directory like this; it must never stat.
+		"herdr deleted suffix": t.TempDir() + " (deleted)",
+	}
+	for name, cwd := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: cwd}); err != nil {
-				t.Errorf("a %s cwd must not fail the run: %v", name, err)
+			_, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: cwd})
+			if err == nil {
+				t.Fatalf("a %s cwd must refuse rather than run somewhere else", name)
+			}
+			if !strings.Contains(err.Error(), "unrelated directory") {
+				t.Errorf("err = %v, want it to name the refusal reason", err)
+			}
+			if _, statErr := os.Stat(ran); statErr == nil {
+				t.Error("the CLI ran despite an unusable cwd — it could have edited a stranger's memory file")
 			}
 		})
 	}
@@ -162,7 +179,7 @@ func TestLearnFromUserMissingCwdFallsBack(t *testing.T) {
 func TestLearnFromUserEmptyOutputIsNotAnError(t *testing.T) {
 	script := writeScript(t, "true\n")
 	a := &Adapter{LearnTemplate: []string{script}, LearnTimeout: 5 * time.Second}
-	got, err := a.LearnFromUser(context.Background(), domain.LearnRequest{})
+	got, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: t.TempDir()})
 	if err != nil {
 		t.Fatalf("empty output must not be an error: %v", err)
 	}
@@ -229,7 +246,7 @@ func TestLearnFromUserFailureModes(t *testing.T) {
 	t.Run("non-zero exit", func(t *testing.T) {
 		script := writeScript(t, "echo 'boom' >&2\nexit 3\n")
 		a := &Adapter{LearnTemplate: []string{script}, LearnTimeout: 5 * time.Second}
-		_, err := a.LearnFromUser(context.Background(), domain.LearnRequest{})
+		_, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: t.TempDir()})
 		if err == nil || !strings.Contains(err.Error(), "learn-from-user CLI failed") {
 			t.Errorf("err = %v, want a CLI-failed error naming the stderr", err)
 		}
@@ -240,7 +257,7 @@ func TestLearnFromUserFailureModes(t *testing.T) {
 	t.Run("timeout", func(t *testing.T) {
 		script := writeScript(t, "sleep 30\n")
 		a := &Adapter{LearnTemplate: []string{script}, LearnTimeout: 50 * time.Millisecond}
-		_, err := a.LearnFromUser(context.Background(), domain.LearnRequest{})
+		_, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: t.TempDir()})
 		if err == nil || !strings.Contains(err.Error(), "learn-from-user timeout") {
 			t.Errorf("err = %v, want a timeout error", err)
 		}
@@ -253,7 +270,7 @@ func TestLearnFromUserFailureModes(t *testing.T) {
 	})
 	t.Run("command not on PATH", func(t *testing.T) {
 		a := &Adapter{LearnTemplate: []string{"hap-no-such-cli-xyz"}, LearnTimeout: time.Second}
-		_, err := a.LearnFromUser(context.Background(), domain.LearnRequest{})
+		_, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: t.TempDir()})
 		if err == nil || !strings.Contains(err.Error(), "not found in PATH") {
 			t.Errorf("err = %v, want a PATH error", err)
 		}
@@ -265,7 +282,7 @@ func TestLearnFromUserFailureModes(t *testing.T) {
 func TestLearnFromUserTimeoutInheritsConsultTimeout(t *testing.T) {
 	script := writeScript(t, "sleep 30\n")
 	a := &Adapter{LearnTemplate: []string{script}, Timeout: 50 * time.Millisecond}
-	_, err := a.LearnFromUser(context.Background(), domain.LearnRequest{})
+	_, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "learn-from-user timeout after 50ms") {
 		t.Errorf("err = %v, want a timeout at the inherited 50ms", err)
 	}

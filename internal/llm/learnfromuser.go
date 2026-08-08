@@ -49,6 +49,24 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 	if !a.LearnFromUserConfigured() {
 		return "", "", fmt.Errorf("no learn-from-user CLI configured")
 	}
+	// A KNOWN, LIVE working directory is a precondition, not a nicety. This CLI
+	// is configured to edit a memory file "in the current directory" and is
+	// given write permission to do it (`--permission-mode acceptEdits`, or
+	// codex's sandbox bypass). Falling back to the adapter's WorkDir would not
+	// degrade the run — it would point that CLI at a DIFFERENT project, or at
+	// $HOME, and write the operator's lesson into a stranger's memory file.
+	//
+	// Every way this goes wrong is on a path the feature actually takes: a
+	// swallowed `pane get` error, a deleted directory (herdr renders one as
+	// "/path (deleted)", which never stats), or a correction drained from a
+	// startup backlog whose pane id herdr has since recycled. Refusing turns
+	// all three into one `learn:failed` audit row, which is the honest signal.
+	if strings.TrimSpace(req.Cwd) == "" {
+		return "", "", fmt.Errorf("learn-from-user: no working directory for agent %q; refusing to run a file-editing CLI in an unrelated directory", req.AgentName)
+	}
+	if !dirLives(req.Cwd) {
+		return "", "", fmt.Errorf("learn-from-user: working directory %q does not exist; refusing to run a file-editing CLI in an unrelated directory", req.Cwd)
+	}
 	self, err := a.resolveSelf()
 	if err != nil {
 		return "", "", err
@@ -127,15 +145,7 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 	defer cancel()
 
 	cmd := exec.CommandContext(runCtx, bin, argv[1:]...)
-	// Run where the AGENT lives, so the CLI edits that project's memory file.
-	// A cwd herdr could not report, or one that has since been deleted, falls
-	// back to the adapter's usual choice — the lesson is then written wherever
-	// the CLI defaults to, which is worse than useless only if the operator's
-	// prompt assumes otherwise, and is still better than failing to spawn.
-	cmd.Dir = a.WorkDir()
-	if req.Cwd != "" && dirLives(req.Cwd) {
-		cmd.Dir = req.Cwd
-	}
+	cmd.Dir = req.Cwd
 	// After the timeout kills the CLI, don't wait on lingering grandchildren
 	// holding the output pipes open — fail safe promptly.
 	cmd.WaitDelay = 2 * time.Second

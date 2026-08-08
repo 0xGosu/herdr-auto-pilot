@@ -4320,9 +4320,12 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	}
 
 	if audit.Signature == "" {
-		// Nothing learnable (e.g. herdr-unreachable escalation) — and nothing to
-		// teach either: with no suggestion there is no confirm/correct
-		// distinction to draw, so the learn-from-user run is skipped too.
+		// Nothing learnable (e.g. a herdr-unreachable escalation, which never
+		// classified a screen). The learn-from-user run is skipped for the same
+		// reason: with no signature there was no situation, so there is nothing
+		// to have been wrong ABOUT. Note this is not about an absent
+		// SUGGESTION — a suggestion-less escalation still teaches (see
+		// domain.NoSuggestionText).
 		return eff, d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
 	}
 

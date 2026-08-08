@@ -1634,8 +1634,12 @@ Invariants:
   Accepting a **generated task suggestion** does not count either: that is you
   approving a checklist edit, not answering anything on the agent's screen.
 - **It runs in the agent's cwd**, which is what makes it edit the right
-  project's memory file. A cwd herdr cannot report falls back to the daemon's
-  usual working directory rather than failing the run.
+  project's memory file. If that directory cannot be resolved, or no longer
+  exists, the run is **refused** rather than redirected — the CLI has write
+  permission and is told to edit "the current directory", so a fallback would
+  write your lesson into an unrelated project (or your global `~/CLAUDE.md`).
+  The refusal is recorded as `learn:failed`, and a successful run names the
+  directory it edited on its audit row.
 - **It never touches the pane**, never creates or changes a hap rule, and
   **never escalates**. Every run leaves exactly one `hap audit` row
   (`llm-learn-from-user`) with `learn:recorded`, `learn:noop`, or
