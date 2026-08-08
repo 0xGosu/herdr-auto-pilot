@@ -1,6 +1,9 @@
 package domain
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // Learning from an operator correction (llm.learn_from_user_command): when the
 // operator answers an escalation with something OTHER than what hap suggested,
@@ -19,6 +22,35 @@ import "strings"
 // correction has been committed, so a failure can never cost the operator
 // their correction. These are the pure pieces — the subprocess lives in
 // internal/llm and the dispatch in internal/daemon.
+
+// TailRunes keeps the last n bytes of s without ever starting mid-rune,
+// marking a cut with a leading ellipsis. It is the shared truncation used
+// wherever CLI output is carried onward for a human to read.
+//
+// Bytes-then-align rather than []rune(s)[len-n:]: converting to a rune slice
+// materializes four bytes per rune of the WHOLE input just to keep its tail, so
+// a runaway CLI emitting hundreds of megabytes would cost gigabytes of
+// transient allocation inside the daemon. n is therefore a byte budget; the
+// result is at most n bytes and always valid UTF-8.
+//
+// The TAIL, not the head: a CLI that fails says why at the end, while the head
+// is usually a banner.
+func TailRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := s[len(s)-n:]
+	for i := 0; i < len(cut) && i < utf8.UTFMax; i++ {
+		if utf8.RuneStart(cut[i]) {
+			return "…" + cut[i:]
+		}
+	}
+	// Every byte in the window was a continuation byte, so the window is a bare
+	// rune fragment with no start to align to — the budget was smaller than the
+	// last character. Returning the fragment would emit invalid UTF-8, so return
+	// only the cut marker.
+	return "…"
+}
 
 // NoSuggestionText is what {suggestion} expands to when the escalation carried
 // no suggestion — hap escalated without an opinion (an unclassifiable screen,

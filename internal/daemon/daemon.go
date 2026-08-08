@@ -504,17 +504,20 @@ func New(opt Options) (*Daemon, error) {
 }
 
 // spawn runs fn on a tracked background goroutine so shutdownBackground can
-// await it. A spawn after shutdown has begun is dropped (fn never runs): the
-// daemon is tearing down and nothing new may touch the store/matcher. Callers
-// that reserve d.mu-guarded state before spawning and release it in fn's defer
-// (sweepInFlight, paneCwdRefreshing) must tolerate that release being skipped
-// on a dropped spawn — harmless here, since it only happens once closing has
-// latched and no further deliveries run.
-func (d *Daemon) spawn(fn func()) {
+// await it, reporting whether it actually SCHEDULED fn. A spawn after shutdown
+// has begun is dropped (fn never runs): the daemon is tearing down and nothing
+// new may touch the store/matcher. Callers that reserve d.mu-guarded state
+// before spawning and release it in fn's defer (sweepInFlight,
+// paneCwdRefreshing) must tolerate that release being skipped on a dropped
+// spawn — harmless there, since it only happens once closing has latched and no
+// further deliveries run. Callers that must not report success on a drop (a
+// learn retry, which would otherwise consume the operator's queued request)
+// check the return value.
+func (d *Daemon) spawn(fn func()) bool {
 	d.lifeMu.Lock()
 	if d.closing {
 		d.lifeMu.Unlock()
-		return
+		return false
 	}
 	d.bg.Add(1)
 	d.lifeMu.Unlock()
@@ -522,6 +525,7 @@ func (d *Daemon) spawn(fn func()) {
 		defer d.bg.Done()
 		fn()
 	}()
+	return true
 }
 
 // afterFunc schedules fn after delay on a tracked timer so shutdownBackground

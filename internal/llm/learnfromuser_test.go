@@ -328,6 +328,26 @@ func tail(s string, n int) string {
 	return string(r[len(r)-n:])
 }
 
+// TestLearnFromUserTranscriptFitsTheAuditRowCap pins the relationship between
+// the two caps. The daemon tail-cuts the composed transcript again before it
+// reaches an audit row; if the streams plus their labels exceed that budget,
+// that second cut takes the `stderr:` label — and all of stdout — off the
+// front, defeating the labelling the per-stream split exists for.
+func TestLearnFromUserTranscriptFitsTheAuditRowCap(t *testing.T) {
+	// The daemon-side budget (internal/daemon.maxLearnAuditOutput). Duplicated
+	// rather than imported: internal/llm must not depend on internal/daemon, and
+	// a silent drift here is exactly what this test exists to catch.
+	const auditRowCap = 4000
+	worst := learnTranscript(strings.Repeat("o", maxLearnStreamOut*2), strings.Repeat("e", maxLearnStreamErr*2))
+	if len(worst) > auditRowCap {
+		t.Errorf("worst-case transcript is %d bytes, exceeding the %d-byte audit row cap: "+
+			"the daemon would re-cut it and drop the stderr label", len(worst), auditRowCap)
+	}
+	if !strings.Contains(worst, "stdout:") || !strings.Contains(worst, "stderr:") {
+		t.Errorf("both labels must be present in the worst case, got %q", tail(worst, 120))
+	}
+}
+
 func TestLearnFromUserFailureModes(t *testing.T) {
 	t.Run("non-zero exit", func(t *testing.T) {
 		script := writeScript(t, "echo 'boom' >&2\nexit 3\n")

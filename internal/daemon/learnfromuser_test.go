@@ -587,6 +587,39 @@ func TestLearnFromUserRetrySkipsWhenThePaneHostsADifferentAgent(t *testing.T) {
 	}
 }
 
+// TestLearnFromUserRetryRunsWhenTheStoredTypeIsUnknown: "unknown" is a stored
+// VALUE hap writes when herdr reported no agent type — it travels onto
+// decisions, signature state and audit rows. Comparing it against a live real
+// type is an absence of evidence, not a recycle, and a bare `!=` here would
+// drop the retry TERMINALLY, so pressing `l` again could never recover it.
+func TestLearnFromUserRetryRunsWhenTheStoredTypeIsUnknown(t *testing.T) {
+	h, fl, _ := learnHarness(t, "agent-lfu18")
+	ctx := context.Background()
+	id, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "agent-lfu18", AgentType: "unknown", Signature: "sig-lfu18",
+		Trigger: domain.TriggerLLMLearnFromUser, Action: domain.AuditActionLearnFailed,
+		Rationale: "learn-from-user run failed: exit 1", Input: "No, deny it",
+		PaneExcerpt: approvalPane, SituationType: domain.SituationApproval,
+		Status: "resolved", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The live agent reports a real type; nothing was recycled.
+	h.herdr.setAgents([]domain.AgentTransition{
+		{AgentID: "agent-lfu18", PaneID: "agent-lfu18", AgentType: "claude", Status: "idle"},
+	})
+	before := len(fl.learnCalls())
+
+	if _, err := h.raw.InsertLLMRetry(ctx, id, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return len(fl.learnCalls())-before == 1 })
+}
+
 // TestLearnFromUserRetryDroppedWhilePaused: pressing `l` while automation is
 // paused DROPS the retry rather than holding it. Nothing ages an llm_retries
 // row, so a held one would survive restarts and then spawn a file-editing CLI

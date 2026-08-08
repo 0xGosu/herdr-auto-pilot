@@ -134,7 +134,7 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) boo
 		slog.Debug("learn-from-user: audit row carries no pane excerpt", "agent", req.AgentID)
 	}
 
-	d.spawn(func() {
+	scheduled := d.spawn(func() {
 		outcome := learnOutcome{req: req}
 		err := logging.Guard("llm-learn-from-user", func() error {
 			agentName, nerr := d.opt.Store.EnsureAgentName(ctx, req.AgentID)
@@ -178,6 +178,17 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) boo
 			d.mu.Unlock()
 		}
 	})
+	if !scheduled {
+		// Shutdown latched between the gate and the spawn, so nothing will run
+		// and no outcome will ever clear the mark. Clear it here and report the
+		// truth, so a queued retry survives to the next daemon instead of being
+		// marked processed against a run that never happened.
+		d.mu.Lock()
+		delete(d.learnInFlight, req.AgentID)
+		d.mu.Unlock()
+		slog.Info("learn-from-user skipped: daemon is shutting down", "agent", req.AgentID)
+		return false
+	}
 	return true
 }
 
@@ -243,7 +254,14 @@ func (d *Daemon) applyLearnRetry(ctx context.Context, audit *domain.AuditRecord)
 	// project the new occupant is in. Note the label deliberately does not go
 	// through EnsureAgentName: that map is keyed by pane id, so on a recycled id
 	// it would print the OLD agent's name and read as if nothing were wrong.
-	if audit.AgentType != "" && live.AgentType != "" && live.AgentType != audit.AgentType {
+	//
+	// DifferentAgentType, not `!=`: "unknown" is a real stored VALUE, not an
+	// absence — the daemon writes the literal string whenever herdr reported no
+	// type, and it travels onto decisions, signature state and audit rows. A
+	// bare comparison would read an "unknown" row against a live claude as a
+	// recycle and drop the retry TERMINALLY, so pressing `l` again could never
+	// recover it. Absence of evidence is not evidence of a different agent.
+	if domain.DifferentAgentType(audit.AgentType, live.AgentType) {
 		slog.Warn("learn-from-user retry: pane now hosts a different agent type",
 			"agent", audit.AgentID, "was", audit.AgentType, "now", live.AgentType)
 		d.notify(ctx, "Herd Auto Prompter: retry skipped",
@@ -259,10 +277,22 @@ func (d *Daemon) applyLearnRetry(ctx context.Context, audit *domain.AuditRecord)
 	// prevent. It would also pin the row's pane excerpt against the retention
 	// prune for the whole pause. Telling the operator to retry after resuming is
 	// both honest and cheap.
-	if kill, err := d.opt.Store.LatestKillEvent(ctx); err == nil && domain.KillStateActive(kill) {
-		slog.Info("learn-from-user retry dropped: automation paused", "audit", audit.ID, "agent", audit.AgentID)
+	kill, kerr := d.opt.Store.LatestKillEvent(ctx)
+	if kerr != nil || domain.KillStateActive(kill) {
+		// A read error takes the SAME branch as an active pause, matching
+		// learnFromUser's posture: unable to confirm we are not paused reads as
+		// paused. Terminal rather than queued, because a persistently failing
+		// store read would otherwise loop the item every sweep forever while
+		// telling the operator nothing.
+		why := "Automation is paused"
+		if kerr != nil {
+			why = "hap could not read the pause state"
+			slog.Warn("learn-from-user retry dropped: pause state unreadable", "audit", audit.ID, "error", kerr)
+		} else {
+			slog.Info("learn-from-user retry dropped: automation paused", "audit", audit.ID, "agent", audit.AgentID)
+		}
 		d.notify(ctx, "Herd Auto Prompter: retry skipped",
-			"Automation is paused — resume with `hap resume`, then press `l` again to re-run the learn command.")
+			why+" — resolve it, then press `l` again to re-run the learn command.")
 		return true
 	}
 
@@ -332,7 +362,7 @@ func (d *Daemon) handleLearnOutcome(ctx context.Context, res learnOutcome) {
 		// LLMOutput is where the detail view renders a run's output, so the
 		// transcript goes there and is truncated to keep audit rows bounded —
 		// the tail is kept, since a failing CLI says why at the end.
-		LLMOutput: tailRunes(res.output, maxLearnAuditOutput),
+		LLMOutput: domain.TailRunes(res.output, maxLearnAuditOutput),
 		// The corrected action is what the lesson is about; recording it keeps
 		// the row self-explanatory next to the correction lineage row.
 		Input: res.req.Correction,
@@ -345,15 +375,4 @@ func (d *Daemon) handleLearnOutcome(ctx context.Context, res learnOutcome) {
 		Status:       "resolved",
 		CreatedAt:    now,
 	})
-}
-
-// tailRunes keeps the LAST n runes of s, prefixing an ellipsis when it cut.
-// The tail rather than the head: a CLI that fails says why at the end, and the
-// head is usually a banner.
-func tailRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return "…" + string(r[len(r)-n:])
 }
