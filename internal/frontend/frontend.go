@@ -1457,7 +1457,7 @@ func (a *App) RetryLLM(ctx context.Context, auditID int64) error {
 	// pipeline) and a failed learn-from-correction run (re-runs that CLI). The
 	// daemon tells them apart from the audit row; both are just an id here.
 	if !domain.IsRetryableLLMEscalation(audit) && !domain.IsRetryableLearnFailure(audit) {
-		return fmt.Errorf("audit record %d is not a retryable LLM escalation", auditID)
+		return fmt.Errorf("audit record %d is not retryable: only a failed or timed-out LLM escalation, or a failed learn-from-correction run, can be re-invoked", auditID)
 	}
 	if _, err := a.Store.InsertLLMRetry(ctx, auditID, time.Now()); err != nil {
 		return err

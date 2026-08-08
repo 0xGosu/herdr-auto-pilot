@@ -31,11 +31,15 @@ import (
 //     on the audit row. That is why it is returned on the error path too: a
 //     failed run's stderr is exactly what the operator needs to fix it.
 const (
-	// maxLearnOutput caps the captured transcript (matches the
-	// consult/rewrite/taskgen 16KB capture cap) so a runaway CLI cannot be held
-	// in memory unbounded. The daemon truncates again, harder, before the text
-	// reaches an audit row.
-	maxLearnOutput = 16 * 1024
+	// maxLearnStreamOut / maxLearnStreamErr cap each captured stream, in RUNES,
+	// so a runaway CLI cannot be held in memory unbounded. They are capped
+	// separately (see learnTranscript) so a chatty stdout can never crowd out
+	// stderr, and stderr gets the larger share because it is what a failing run
+	// is diagnosed from. Together they stay under the ~16KB capture budget the
+	// consult/rewrite/taskgen paths use. The daemon truncates again, harder,
+	// before the text reaches an audit row.
+	maxLearnStreamOut = 2000
+	maxLearnStreamErr = 4000
 )
 
 // LearnFromUserConfigured reports whether a learn-from-user CLI is configured.
@@ -200,8 +204,16 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 // the diagnosis ("hello" on stdout with an exit-1 traceback on stderr reads very
 // differently from the reverse). Empty streams are omitted so the common case —
 // a quiet, successful edit — renders as "" rather than as two empty headings.
+//
+// Each stream is capped SEPARATELY, and from the tail. Capping the composed
+// string instead would drop whichever stream was appended last — stderr, the
+// one the operator opened the row to read — as soon as a chatty CLI's stdout
+// filled the budget. Tail rather than head because a failing CLI says why at
+// the end, while the head is usually a banner. stderr gets the larger share for
+// the same reason.
 func learnTranscript(stdout, stderr string) string {
-	out, errOut := strings.TrimSpace(stdout), strings.TrimSpace(stderr)
+	out := tailRunesLLM(strings.TrimSpace(stdout), maxLearnStreamOut)
+	errOut := tailRunesLLM(strings.TrimSpace(stderr), maxLearnStreamErr)
 	var b strings.Builder
 	if out != "" {
 		b.WriteString("stdout:\n")
@@ -214,9 +226,16 @@ func learnTranscript(stdout, stderr string) string {
 		b.WriteString("stderr:\n")
 		b.WriteString(errOut)
 	}
-	s := b.String()
-	if len(s) > maxLearnOutput {
-		s = s[:maxLearnOutput]
+	return b.String()
+}
+
+// tailRunesLLM keeps the last n RUNES of s, marking a cut with a leading
+// ellipsis. Runes, not bytes: a byte slice can split a multibyte character and
+// render the boundary as U+FFFD.
+func tailRunesLLM(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
 	}
-	return s
+	return "…" + string(r[len(r)-n:])
 }

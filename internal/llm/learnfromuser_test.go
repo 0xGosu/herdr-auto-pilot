@@ -290,6 +290,44 @@ func TestLearnFromUserSpellsOutTheNoopSentinel(t *testing.T) {
 	}
 }
 
+// TestLearnFromUserTranscriptCapsStreamsSeparately: a chatty stdout must never
+// crowd stderr out of the transcript. Capping the composed string would drop
+// whichever stream was appended last — stderr, the one the operator opened the
+// row to read — on exactly the run they are trying to diagnose.
+func TestLearnFromUserTranscriptCapsStreamsSeparately(t *testing.T) {
+	// Far more stdout than the whole budget, plus a short, decisive stderr.
+	script := writeScript(t,
+		"i=0; while [ $i -lt 4000 ]; do echo 'chatty progress line'; i=$((i+1)); done\n"+
+			"echo 'FATAL: could not write CLAUDE.md' >&2\nexit 1\n")
+	a := &Adapter{LearnTemplate: []string{script}, LearnTimeout: 20 * time.Second}
+	got, err := a.LearnFromUser(context.Background(), domain.LearnRequest{Cwd: t.TempDir()})
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !strings.Contains(got, "FATAL: could not write CLAUDE.md") {
+		t.Errorf("stderr was crowded out by stdout; transcript tail = %q", tail(got, 200))
+	}
+	if !strings.Contains(got, "stdout:") || !strings.Contains(got, "stderr:") {
+		t.Errorf("both stream labels must survive, got %q", tail(got, 200))
+	}
+	// Bounded, and cut from the tail (the head is a banner, the tail is why).
+	if n := len([]rune(got)); n > maxLearnStreamOut+maxLearnStreamErr+64 {
+		t.Errorf("transcript is %d runes, want it bounded by the per-stream caps", n)
+	}
+	if !strings.Contains(got, "…") {
+		t.Errorf("a truncated stream must mark the cut, got %q", tail(got, 200))
+	}
+}
+
+// tail returns the last n runes of s, for readable failure output.
+func tail(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[len(r)-n:])
+}
+
 func TestLearnFromUserFailureModes(t *testing.T) {
 	t.Run("non-zero exit", func(t *testing.T) {
 		script := writeScript(t, "echo 'boom' >&2\nexit 3\n")

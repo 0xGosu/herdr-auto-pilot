@@ -545,10 +545,54 @@ func TestLearnFromUserRetrySkipsWhenTheAgentIsGone(t *testing.T) {
 	}
 }
 
-// TestLearnFromUserRetryStaysQueuedWhilePaused: pressing `l` while automation
-// is paused must not evaporate the request. The operator pressed a key; the
-// retry has to survive until the pause lifts, or they get silence.
-func TestLearnFromUserRetryStaysQueuedWhilePaused(t *testing.T) {
+// TestLearnFromUserRetrySkipsWhenThePaneHostsADifferentAgent: herdr recycles
+// pane ids and an audit row carries no terminal_id, so a stale retry could
+// resolve the cwd of a DIFFERENT agent — one whose directory exists, so the
+// adapter's live-directory check cannot catch it. A changed agent type is the
+// one recycle signal available here, and it is free.
+func TestLearnFromUserRetrySkipsWhenThePaneHostsADifferentAgent(t *testing.T) {
+	h, fl, esc := learnHarness(t, "agent-lfu17")
+	fl.mu.Lock()
+	fl.learn = func(context.Context, domain.LearnRequest) (string, error) {
+		return "", errors.New("learn-from-user CLI failed: exit 1")
+	}
+	fl.mu.Unlock()
+
+	resolveWith(t, h, esc.ID, "use the dry-run flag")
+	waitFor(t, 3*time.Second, func() bool { return len(learnAudits(t, h)) == 1 })
+	failed := learnAudits(t, h)[0]
+	if failed.AgentType != "claude" {
+		t.Fatalf("fixture should record agent type claude, got %q", failed.AgentType)
+	}
+	before := len(fl.learnCalls())
+
+	// The pane id is recycled to a codex agent before the operator retries.
+	h.herdr.setAgents([]domain.AgentTransition{
+		{AgentID: "agent-lfu17", PaneID: "agent-lfu17", AgentType: "codex", Status: "idle"},
+	})
+
+	ctx := context.Background()
+	if _, err := h.raw.InsertLLMRetry(ctx, failed.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		q, _ := h.raw.UnprocessedLLMRetries(ctx)
+		return len(q) == 0
+	})
+	if got := len(fl.learnCalls()) - before; got != 0 {
+		t.Errorf("retry must not run when the pane now hosts a different agent type, got %d call(s)", got)
+	}
+}
+
+// TestLearnFromUserRetryDroppedWhilePaused: pressing `l` while automation is
+// paused DROPS the retry rather than holding it. Nothing ages an llm_retries
+// row, so a held one would survive restarts and then spawn a file-editing CLI
+// the moment the operator resumes — days later, unprompted, which is exactly
+// the surprise `hap pause` exists to prevent.
+func TestLearnFromUserRetryDroppedWhilePaused(t *testing.T) {
 	h, fl, esc := learnHarness(t, "agent-lfu16")
 	fl.mu.Lock()
 	fl.learn = func(context.Context, domain.LearnRequest) (string, error) {
@@ -579,27 +623,30 @@ func TestLearnFromUserRetryStaysQueuedWhilePaused(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	time.Sleep(300 * time.Millisecond)
+	// The item is consumed, not held.
+	waitFor(t, 3*time.Second, func() bool {
+		q, _ := h.raw.UnprocessedLLMRetries(ctx)
+		return len(q) == 0
+	})
 	if got := len(fl.learnCalls()) - before; got != 0 {
 		t.Errorf("a paused daemon must not run the retry, got %d call(s)", got)
 	}
-	q, _ := h.raw.UnprocessedLLMRetries(ctx)
-	if len(q) != 1 {
-		t.Fatalf("the retry must stay queued while paused, got %+v", q)
-	}
 
-	// Resuming lets the queued retry land.
+	// And resuming must NOT resurrect it: the drop is the point.
 	if _, err := h.raw.InsertKillEvent(ctx, domain.KillEvent{
 		State: "resumed", Scope: "global", Author: "operator", CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, 5*time.Second, func() bool {
+	for range 3 {
 		if err := control.Nudge(ctx, h.ctlPath, control.KindReload); err != nil {
-			return false
+			t.Fatal(err)
 		}
-		return len(fl.learnCalls())-before == 1
-	})
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := len(fl.learnCalls()) - before; got != 0 {
+		t.Errorf("a retry dropped while paused must not fire on resume, got %d call(s)", got)
+	}
 }
 
 func TestLearnFromUserRetriedCorrectionNeverFiresTwice(t *testing.T) {

@@ -392,9 +392,12 @@ const (
 // "resolved" from birth, and its retryability is carried by the trigger and
 // action instead.
 //
-// A retry is always safe to offer: the run has no pane side effect, and it
-// re-resolves the agent's working directory at fire time rather than reusing a
-// stale one.
+// Retryability is decided here, but SAFETY is decided at fire time, not by this
+// predicate: the run re-resolves the agent's working directory live, which is
+// what keeps it correct on a moved agent and what makes it dangerous on a
+// RECYCLED pane id (an audit row carries no terminal_id). daemon.applyLearnRetry
+// carries those guards — the agent must still be live and still be the same
+// agent type.
 func IsRetryableLearnFailure(a *AuditRecord) bool {
 	return a != nil && a.Trigger == TriggerLLMLearnFromUser && a.Action == AuditActionLearnFailed
 }

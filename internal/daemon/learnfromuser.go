@@ -21,10 +21,12 @@ import (
 // has been committed (see processCorrections), so it can never cost the
 // operator their correction.
 
-// maxLearnAuditOutput caps the transcript stored on an audit row. The adapter
-// already caps its capture at 16KB; this is the tighter bound that keeps the
-// audit table small (audit_log is the second-largest consumer of hap's state
-// directory) while leaving room for a real stack trace or usage banner.
+// maxLearnAuditOutput caps the transcript stored on an audit row, in RUNES (so
+// a multibyte-heavy transcript can exceed this in bytes). The adapter already
+// caps each captured stream; this is the tighter per-row bound that keeps the
+// audit table small — audit_log is the second-largest consumer of hap's state
+// directory, and llm_output is not covered by the excerpt retention prune —
+// while leaving room for a real stack trace or usage banner.
 const maxLearnAuditOutput = 4000
 
 // retryHint is appended to a failed run's rationale so the operator learns the
@@ -37,8 +39,9 @@ const retryHint = " — press `l` on this row's detail view to retry"
 // the right agent.
 type learnOutcome struct {
 	req domain.LearnRequest
-	// output is the CLI's trimmed stdout, used only to recognize the @noop
-	// decline. Empty is normal: the CLI's product is the file it edited.
+	// output is the run's transcript (stdout and stderr, labelled). NOTHING
+	// reads it — it is carried to the audit row for the operator. Empty is
+	// normal: the CLI's product is the file it edited, not text.
 	output string
 	err    error
 }
@@ -143,9 +146,9 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) boo
 			// main loop's paneCwd cache: that cache refreshes in the background
 			// and returns "" for a cold pane, and this is the one caller for
 			// which an empty cwd is not cosmetic — it decides which project's
-			// memory file the CLI edits. Degrade to empty when the adapter has
-			// no inspector surface (the adapter then falls back to its own
-			// WorkDir).
+			// memory file the CLI edits. An adapter with no inspector surface
+			// leaves it empty, which the adapter REFUSES to run on rather than
+			// falling back — a wrong directory is worse than no lesson.
 			if insp, ok := d.opt.Herdr.(ports.InspectorPort); ok {
 				if pi, perr := insp.PaneInfo(ctx, req.AgentID); perr == nil {
 					outcome.req.Cwd = pi.ForegroundCwd
@@ -181,14 +184,20 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) boo
 // applyLearnRetry re-runs a failed learn-from-correction CLI from its audit
 // row. The row is self-sufficient by construction: handleLearnOutcome stores the
 // pane excerpt, the suggestion and the correction precisely so a retry needs
-// nothing else. The working directory is deliberately NOT taken from the row —
+// nothing else. (One erosion: the audit-excerpt retention prune blanks
+// pane_excerpt on resolved rows, and a learn row is resolved from birth — so a
+// retry after that window rebuilds with an empty excerpt. That still runs; the
+// correction and the suggestion, which carry the lesson, are never pruned.) The working directory is deliberately NOT taken from the row —
 // learnFromUser re-resolves it live, so a retry minutes later still edits the
 // project the agent is in now, or refuses if it cannot tell.
 //
 // The return value follows applyLLMRetry's contract: true means the queue item
-// reached a terminal outcome and may be marked processed. Every outcome here is
-// terminal — a refused spawn writes its own learn:failed row, which the operator
-// can retry again.
+// reached a terminal outcome and may be marked processed. TERMINAL here means
+// the retry can never succeed as queued — no command configured, the agent's
+// pane is gone, the pane now hosts a different agent type, or automation is
+// paused (see below for why that one is not held). TRANSIENT — returning false
+// so the item survives to the next sweep — means it could not run YET: a
+// ListAgents error, or another learn run still in flight for this agent.
 func (d *Daemon) applyLearnRetry(ctx context.Context, audit *domain.AuditRecord) bool {
 	// Unconfigured is TERMINAL, unlike the transient skips below: the operator
 	// removed llm.learn_from_user_command since the failure, so no amount of
@@ -212,28 +221,53 @@ func (d *Daemon) applyLearnRetry(ctx context.Context, audit *domain.AuditRecord)
 		slog.Error("learn-from-user retry: listing agents failed", "agent", audit.AgentID, "error", err)
 		return false
 	}
-	live := false
-	for _, a := range agents {
-		if a.AgentID == audit.AgentID {
-			live = true
+	var live *domain.AgentTransition
+	for i := range agents {
+		if agents[i].AgentID == audit.AgentID {
+			live = &agents[i]
 			break
 		}
 	}
-	if !live {
-		label := audit.AgentID
-		if name, nerr := d.opt.Store.EnsureAgentName(ctx, audit.AgentID); nerr == nil && name != "" {
-			label = fmt.Sprintf("%s (%s)", name, audit.AgentID)
-		}
+	if live == nil {
 		slog.Info("learn-from-user retry: agent no longer present", "agent", audit.AgentID)
 		d.notify(ctx, "Herd Auto Prompter: retry skipped",
-			fmt.Sprintf("Agent %s is no longer present — cannot re-run the learn command.", label))
+			fmt.Sprintf("Agent %s is no longer present — cannot re-run the learn command.", audit.AgentID))
+		return true
+	}
+	// The one recycle signal available here: an agent id now answering as a
+	// DIFFERENT type is certainly not the agent the lesson was about. It is a
+	// partial check — a claude recycled to another claude still passes — but it
+	// is free, and the alternative is pointing a file-editing CLI at whatever
+	// project the new occupant is in. Note the label deliberately does not go
+	// through EnsureAgentName: that map is keyed by pane id, so on a recycled id
+	// it would print the OLD agent's name and read as if nothing were wrong.
+	if audit.AgentType != "" && live.AgentType != "" && live.AgentType != audit.AgentType {
+		slog.Warn("learn-from-user retry: pane now hosts a different agent type",
+			"agent", audit.AgentID, "was", audit.AgentType, "now", live.AgentType)
+		d.notify(ctx, "Herd Auto Prompter: retry skipped",
+			fmt.Sprintf("Pane %s now runs %s, not %s — refusing to write a lesson into a different agent's project.",
+				audit.AgentID, live.AgentType, audit.AgentType))
+		return true
+	}
+
+	// A PAUSED daemon drops the retry rather than holding it. Nothing ages an
+	// llm_retries row, so a held one would survive restarts and then spawn a
+	// file-editing CLI the moment the operator resumes — possibly days after
+	// they pressed a key, which is precisely the surprise `hap pause` exists to
+	// prevent. It would also pin the row's pane excerpt against the retention
+	// prune for the whole pause. Telling the operator to retry after resuming is
+	// both honest and cheap.
+	if kill, err := d.opt.Store.LatestKillEvent(ctx); err == nil && domain.KillStateActive(kill) {
+		slog.Info("learn-from-user retry dropped: automation paused", "audit", audit.ID, "agent", audit.AgentID)
+		d.notify(ctx, "Herd Auto Prompter: retry skipped",
+			"Automation is paused — resume with `hap resume`, then press `l` again to re-run the learn command.")
 		return true
 	}
 
 	slog.Info("learn-from-user retry requested", "audit", audit.ID, "agent", audit.AgentID)
-	// Only a run that actually SPAWNED consumes the queue item. Automation
-	// paused, or a run already in flight for this agent, are both transient —
-	// leaving the item queued makes the retry land on a later sweep instead of
+	// Only a run that actually SPAWNED consumes the queue item. The remaining
+	// skip is a run already in flight for this agent, which clears in seconds —
+	// leaving the item queued makes the retry land on the next sweep instead of
 	// evaporating, which is what the operator expects from pressing a key.
 	return d.learnFromUser(ctx, domain.LearnRequest{
 		AgentType:     audit.AgentType,

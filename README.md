@@ -1658,7 +1658,11 @@ Invariants:
 - **A failed run is retryable.** Open its row in the **Audit** tab and press
   `l`. The retry rebuilds the request from the row and re-resolves the agent's
   working directory live, so it still edits the right project — or refuses
-  again if it cannot tell. Each attempt writes its own audit row.
+  again if it cannot tell. Each attempt writes its own audit row. A retry is
+  refused (with a toast) when the agent's pane is gone, when that pane now runs
+  a different agent type, or when automation is paused — in the last case
+  `hap resume` first, then press `l` again, so a paused pause never turns into a
+  file edit you did not expect.
 - **It runs only after your correction is committed**, so a broken CLI here can
   never cost you the correction — and a correction retried after a transient
   error still runs the CLI exactly once.
