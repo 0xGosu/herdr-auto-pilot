@@ -155,6 +155,104 @@ func capture(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 	return nil
 }
 
+// mode reads or sets a live agent's permission mode.
+//
+// `hap mode <agent>` prints the mode alone so a script can capture it
+// (`$(hap mode reviewer)`); `hap mode <agent> <mode>` rotates the agent there
+// and prints what changed. The set form is deliberately IDEMPOTENT — an agent
+// already in the target mode sends no keystrokes at all — which is what makes it
+// safe to call unconditionally at the top of a script.
+func mode(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	skipConfirm := false
+	var rest []string
+	for _, a := range args {
+		if a == "--yes" || a == "-y" {
+			skipConfirm = true
+			continue
+		}
+		rest = append(rest, a)
+	}
+	if len(rest) == 0 || len(rest) > 2 || strings.TrimSpace(rest[0]) == "" {
+		return fmt.Errorf("usage: mode <agent-name-or-pane-id> [<mode>] [--yes] (see: hap help mode)")
+	}
+	target := rest[0]
+	if len(rest) == 1 {
+		report, err := app.AgentMode(ctx, target)
+		if err != nil {
+			return modeReadError(report, target, err)
+		}
+		fmt.Fprintln(out, report.Mode)
+		return nil
+	}
+
+	want := rest[1]
+	// Read FIRST, so an agent already in the target mode is reported as a no-op
+	// without prompting at all. Confirming a change that then prints "already
+	// in plan mode" is a prompt for nothing, and it would make the documented
+	// idempotence untrue in the interactive case.
+	if report, err := app.AgentMode(ctx, target); err == nil && string(report.Mode) == want {
+		fmt.Fprintf(out, "%s is already in %s mode\n", report.Label(target), report.Mode)
+		modeNextSteps(out, target)
+		return nil
+	}
+	// Confirm before touching a live agent, on the same terms as `hap task
+	// send` and `signatures delete`: the mode governs how much the agent asks
+	// before acting, so widening it is exactly the change an operator wants to
+	// have meant. Scripted (non-TTY) runs opt in with --yes.
+	if !skipConfirm {
+		if stdin == os.Stdin && !stdinIsTTY() {
+			return fmt.Errorf("confirmation needs a terminal; rerun as: mode %s %s --yes", target, want)
+		}
+		fmt.Fprintf(out, "set %s to %s mode? [y/N] ", target, want)
+		answer := ""
+		if _, err := fmt.Fscanln(stdin, &answer); err != nil {
+			answer = "" // EOF or a bare newline both read as the default No
+		}
+		if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+			fmt.Fprintln(out, "aborted — mode unchanged")
+			return nil
+		}
+	}
+	change, err := app.SetAgentMode(ctx, target, want, frontend.ModeOptions{})
+	if err != nil {
+		return modeReadError(change.ModeReport, target, err)
+	}
+	if change.Presses == 0 {
+		fmt.Fprintf(out, "%s is already in %s mode\n", change.Label(target), change.Mode)
+	} else {
+		fmt.Fprintf(out, "%s: %s -> %s (%d shift+tab)\n",
+			change.Label(target), change.From, change.Mode, change.Presses)
+	}
+	modeNextSteps(out, target)
+	return nil
+}
+
+func modeNextSteps(out io.Writer, target string) {
+	PrintNextSteps(out, []Hint{
+		{Cmd: "hap mode " + target, Why: "confirm the mode the agent now reports"},
+		{Cmd: "hap agents", Why: "see every agent's mode alongside its status"},
+	})
+}
+
+// modeReadError turns the frontend's sentinel refusals into advice. The two
+// that need it are the ones an operator meets in normal use and would otherwise
+// read as a bug: an agent type with no toggle, and a pane whose footer is
+// covered by a modal.
+func modeReadError(r frontend.ModeReport, target string, err error) error {
+	switch {
+	case errors.Is(err, frontend.ErrModeUnsupported):
+		return fmt.Errorf("%s is a %q agent, which has no shift+tab mode toggle (claude and codex do)",
+			r.Label(target), r.AgentType)
+	case errors.Is(err, frontend.ErrModeUnreadable):
+		return fmt.Errorf("could not read %s's mode: its pane is not showing the composer footer "+
+			"(an approval or form is probably up — answer it, then retry)", r.Label(target))
+	case errors.Is(err, frontend.ErrModeUnsafe):
+		return fmt.Errorf("%s is not at its composer, so shift+tab would answer whatever is on screen "+
+			"instead of changing the mode — refusing to send it", r.Label(target))
+	}
+	return err
+}
+
 func signatures(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	sub := "list"
 	if len(args) > 0 {
@@ -786,6 +884,10 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 	// Working directories are fetched only here (and by the TUI): they cost a
 	// `herdr pane get` per agent, so GetStatus does not pay for them.
 	app.FillAgentCwds(ctx, &st)
+	// Permission modes cost a `herdr pane read` per agent for the same reason,
+	// and are read fresh every time: the mode is exactly what an operator flips
+	// by hand mid-session, so a cached one would lie.
+	app.FillAgentModes(ctx, &st)
 	for _, a := range st.MonitoredAgents {
 		name := st.AgentName(a.AgentID)
 		if name == "" {
@@ -795,6 +897,17 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		if st.AgentDisabled(a.AgentID) {
 			automation = "disabled"
 		}
+		// Appended AFTER cwd, deliberately: inserting it mid-row would shift
+		// cwd from field 6 to field 7 and silently break every existing
+		// `cut -f6` / `awk '{print $6}'` that reads a working directory.
+		//
+		// A dash covers both "this agent type has no mode toggle" and "its
+		// footer was not readable just now" — neither is a mode, and inventing
+		// one here would be the same mistake the domain parser refuses to make.
+		mode := string(st.AgentMode(a.AgentID))
+		if mode == "" {
+			mode = "-"
+		}
 		// Working directory last: it is the widest, most variable column, and
 		// best-effort — a dash when herdr cannot report one, so the field count
 		// stays constant for anything parsing this output.
@@ -802,8 +915,8 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		if cwd == "" {
 			cwd = "-"
 		}
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			name, a.AgentID, a.AgentType, a.Status, automation, cwd)
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			name, a.AgentID, a.AgentType, a.Status, automation, cwd, mode)
 	}
 	// The first column is the handle every other command takes, so the footer
 	// spells the follow-ups with <agent> in that position.

@@ -1368,10 +1368,30 @@ func (m Model) clockInterval(now time.Time) time.Duration {
 
 func (m Model) refresh() tea.Cmd {
 	app, ctx := m.app, m.ctx
-	return func() tea.Msg { return refreshData(ctx, app) }
+	// Only the agent whose detail overlay is OPEN needs its permission mode: it
+	// is the sole place the TUI renders one, and reading it costs a `herdr pane
+	// read` subprocess per agent with no cache (the mode is what an operator
+	// flips by hand, so a stale one is worse than none). Filling every agent on
+	// the 2s tick meant N subprocesses every two seconds to paint a row that is
+	// usually not on screen.
+	modeFor := m.detailAgentID()
+	return func() tea.Msg { return refreshData(ctx, app, modeFor) }
 }
 
-func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
+// detailAgentID returns the agent id an agents-tab detail overlay is currently
+// open for, or "" when no agent detail is showing.
+func (m Model) detailAgentID() string {
+	if m.detail == nil || m.detail.agent == nil {
+		return ""
+	}
+	return m.detail.agent.AgentID
+}
+
+// refreshData gathers one poll's worth of state. modeFor optionally names the
+// single agent whose permission mode should be read; it is variadic because
+// omitting it means "no agent detail is open", which is precisely the case that
+// must NOT pay for a mode read.
+func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refreshMsg {
 	var msg refreshMsg
 	// Daemon health is read from local state files (never errors), so assess it
 	// first — it stays meaningful even when GetStatus fails (e.g. daemon down).
@@ -1396,6 +1416,13 @@ func refreshData(ctx context.Context, app *frontend.App) refreshMsg {
 	// agent, TTL-cached and time-bounded), so the TUI asks for them explicitly
 	// rather than making every GetStatus caller pay.
 	app.FillAgentCwds(ctx, &msg.status)
+	// The permission mode is read only for the agent whose detail overlay is
+	// open (see refresh): it is uncached by design, so filling every agent on
+	// every tick would spawn one herdr subprocess per agent per 2 seconds to
+	// paint a row nobody is looking at.
+	if len(modeFor) > 0 && modeFor[0] != "" {
+		app.FillAgentModes(ctx, &msg.status, modeFor[0])
+	}
 	msg.escalations, msg.err = app.Escalations(ctx)
 	if msg.err != nil {
 		return msg
@@ -4228,6 +4255,11 @@ func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 		}))
 	lines = m.detailField(lines, w, "Pane", a.PaneID)
 	lines = m.detailField(lines, w, "Type", a.AgentType)
+	// Permission mode: how much this agent asks before acting. Read from the
+	// indicator it paints in its own composer footer, so the row is absent
+	// whenever that footer was covered (a standing approval) or the agent type
+	// has no such toggle — an unreadable mode is never rendered as a default.
+	lines = m.detailField(lines, w, "Mode", string(m.data.status.AgentMode(a.AgentID)))
 	// Working directory: which checkout/worktree this agent is actually in —
 	// the fastest way to tell two same-named agents apart. Best-effort, so the
 	// row is simply absent when herdr cannot report one (detailField skips

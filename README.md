@@ -755,11 +755,14 @@ hap task-source --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.m
 hap task-source --agent backend-dev --max-tasks 40 ./docs/backend-tasks.md
 ```
 
-`hap agents` output is tab-separated and gained a sixth column — the agent's
-working directory, `-` when herdr cannot report one — so two agents on the same
-repo from different checkouts are distinguishable. Scripts that split on tabs
-keep working; ones that assumed exactly five fields need updating. The same
-value appears as `Working dir` in the TUI agent detail view.
+`hap agents` output is tab-separated and now carries seven columns. The sixth is
+the agent's working directory, `-` when herdr cannot report one, so two agents on
+the same repo from different checkouts are distinguishable. The seventh is the
+agent's permission mode (see `hap mode`), `-` when it could not be read or the
+agent type has none. New columns are appended, so existing field positions never
+move; scripts that split on tabs keep working, and only ones that assumed an
+exact field count need updating. Both values appear in the TUI agent detail view,
+as `Working dir` and `Mode`.
 
 (Or in the TUI: select the agent and press `n` to rename it, `x` to disable
 it behind a `Y/n` confirmation, or `e` to enable it again. A disabled live

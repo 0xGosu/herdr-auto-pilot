@@ -25,6 +25,7 @@ var (
 	_ ports.VisiblePaneReader       = (*CLI)(nil)
 	_ ports.KeystrokeSender         = (*CLI)(nil)
 	_ ports.KeystrokeSequenceSender = (*CLI)(nil)
+	_ ports.ChordSender             = (*CLI)(nil)
 	_ ports.AgentAwareSender        = (*CLI)(nil)
 	_ ports.SubmitRetryWaiter       = (*CLI)(nil)
 )
@@ -415,6 +416,30 @@ func (c *CLI) SendKeys(ctx context.Context, paneID string, keys ...string) error
 	}
 	args := append([]string{"pane", "send-keys", paneID}, keys...)
 	_, err := c.run(ctx, args...)
+	return err
+}
+
+// SendChord writes a raw terminal escape sequence to the pane as literal input
+// (ports.ChordSender), submitting nothing. It exists because herdr's key
+// vocabulary cannot express every chord an agent TUI binds.
+//
+// Shift+Tab is the motivating case, and it fails in the WORST possible way.
+// Verified live (2026-08-09, herdr 0.7.5): `pane send-keys <pane> shift+tab` is
+// accepted — herdr validates the key name and exits 0 — but writes a bare TAB
+// (0x09), silently dropping the shift modifier. Sent to a pane running `cat -v`,
+// `shift+tab` and `tab` produce byte-identical output, and both Claude Code and
+// Codex ignore it across repeated presses while every send reports success. The
+// three bytes of CSI Z, written as literal terminal input, do reach them.
+//
+// `pane send-text` is the right transport precisely because it is NOT
+// bracketed-paste aware (see submitText's routing note): it writes the bytes
+// through untouched, where `agent prompt` would wrap them as pasted text. No
+// Enter follows — a chord is not a submission.
+func (c *CLI) SendChord(ctx context.Context, paneID, chord string) error {
+	if chord == "" {
+		return nil
+	}
+	_, err := c.run(ctx, "pane", "send-text", paneID, chord)
 	return err
 }
 
