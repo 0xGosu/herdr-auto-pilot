@@ -116,6 +116,33 @@ func newScratchPane(t *testing.T, cwd, label string) string {
 	return pane
 }
 
+// startAgentInPane runs `agent start`, retrying while herdr reports the pane is
+// not yet an available shell.
+//
+// `agent start` requires the pane to be AT its interactive shell prompt and
+// refuses with `agent_pane_busy` otherwise. A pane created moments ago has often
+// not finished spawning its shell, so the first attempt loses that race —
+// observed failing a real run. Skips (never fails) on any other error, matching
+// the rest of this suite.
+func startAgentInPane(t *testing.T, pane, name, kind string, agentArgs ...string) {
+	t.Helper()
+	args := append([]string{"agent", "start", name, "--kind", kind, "--pane", pane,
+		"--timeout", "120000"}, agentArgs...)
+	deadline := time.Now().Add(45 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 130*time.Second)
+		out, err := exec.CommandContext(ctx, herdrBin(), args...).CombinedOutput()
+		cancel()
+		if err == nil {
+			return
+		}
+		if !strings.Contains(string(out), "agent_pane_busy") || !time.Now().Before(deadline) {
+			t.Skipf("could not start %s in pane %s: %v (%s)", kind, pane, err, out)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
 // agentNameMaxLen is herdr's limit: an agent name must start with a lowercase
 // letter and hold 1-32 characters of [a-z0-9_-].
 const agentNameMaxLen = 32
@@ -399,8 +426,7 @@ func startClaudeAgent(t *testing.T, cli *herdr.CLI, cwd string) string {
 	// shared "hapclaude" made whichever case ran second fail to start.
 	name := sanitizeAgentName(t.Name())
 	pane := newScratchPane(t, cwd, name)
-	runHerdr(t, "agent", "start", name, "--kind", "claude", "--pane", pane,
-		"--timeout", "120000",
+	startAgentInPane(t, pane, name, "claude",
 		"--", "--model", claudeModel(), "--permission-mode", "default")
 
 	// Claude asks to trust a new folder on first start; option 1 ("Yes, I

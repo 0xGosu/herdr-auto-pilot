@@ -448,11 +448,13 @@ func TestAgentsListsWorkingDir(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("agents output = %q, want 2 rows", out)
 	}
-	if !strings.HasSuffix(lines[0], "\t/repo/sub") {
-		t.Errorf("row = %q, want it to end with the foreground cwd", lines[0])
+	// cwd stays in field 6 even though `mode` was added after it — moving it
+	// would silently break every existing `cut -f6`.
+	if got := strings.Split(lines[0], "\t"); len(got) < 6 || got[5] != "/repo/sub" {
+		t.Errorf("row = %q, want the foreground cwd in field 6", lines[0])
 	}
-	if !strings.HasSuffix(lines[1], "\t-") {
-		t.Errorf("row = %q, want a dash when no cwd is known", lines[1])
+	if got := strings.Split(lines[1], "\t"); len(got) < 6 || got[5] != "-" {
+		t.Errorf("row = %q, want a dash in field 6 when no cwd is known", lines[1])
 	}
 	if got, want := strings.Count(lines[0], "\t"), strings.Count(lines[1], "\t"); got != want {
 		t.Errorf("column counts differ (%d vs %d): %q / %q", got, want, lines[0], lines[1])

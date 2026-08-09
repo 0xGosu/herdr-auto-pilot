@@ -215,15 +215,18 @@ func buildCommands() {
 		{
 			Name:    "agents",
 			Group:   groupOperate,
-			Summary: "list monitored agents (name, id, type, status, automation, cwd)",
+			Summary: "list monitored agents (name, id, type, status, automation, mode, cwd)",
 			Usage:   []string{"hap agents"},
 			Details: "One tab-separated row per agent. \"automation\" is enabled/disabled (see\n" +
-				"`hap disable`); the last column is the agent's working directory, or \"-\" when\n" +
-				"herdr cannot report one. Give an agent a short name with `hap rename` — task\n" +
-				"sources and `hap task <agent>` address agents by that name.",
+				"`hap disable`); \"mode\" is the agent's own permission mode (see `hap mode`); the\n" +
+				"last column is the agent's working directory. Either of the last two is \"-\"\n" +
+				"when it could not be read, so the field count stays constant for parsers. Give\n" +
+				"an agent a short name with `hap rename` — task sources and `hap task <agent>`\n" +
+				"address agents by that name.",
 			Next: []Hint{
 				{Cmd: "hap task <agent> list", Why: "the agent's task list"},
 				{Cmd: "hap rename <agent-or-pane-id> <name>", Why: "give it a short name"},
+				{Cmd: "hap mode <agent> plan", Why: "put it in plan mode"},
 				{Cmd: "hap capture <agent>", Why: "re-classify its pane now"},
 			},
 			Examples:  []string{"hap agents"},
@@ -261,6 +264,42 @@ func buildCommands() {
 				{Cmd: "hap task-source list", Why: "check which sources select this name"},
 			},
 			Handler: rename,
+		},
+		{
+			Name:    "mode",
+			Group:   groupOperate,
+			Summary: "show or set an agent's permission mode (the shift+tab cycle)",
+			Usage: []string{
+				"hap mode <agent-name-or-pane-id>",
+				"hap mode <agent-name-or-pane-id> <mode> [--yes]",
+			},
+			Flags: []FlagDoc{
+				{Name: "--yes", Desc: "skip the confirmation prompt (required when not on a terminal)"},
+			},
+			Details: "With one argument it prints the mode alone, for scripts to capture:\n" +
+				"  claude: manual | acceptEdits | plan | auto\n" +
+				"  codex:  default | plan\n" +
+				"With two it presses shift+tab until the agent's own pane reports the mode you\n" +
+				"asked for — so it is idempotent: an agent already in that mode is left alone\n" +
+				"and no keystroke is sent.\n\n" +
+				"The mode is read from the indicator the agent paints in its composer footer;\n" +
+				"neither herdr nor the agents report it any other way. That means hap refuses\n" +
+				"rather than guesses: if an approval or form is covering the footer, both forms\n" +
+				"fail with an explanation instead of pressing keys into a modal (inside one,\n" +
+				"shift+tab means \"approve\", not \"change mode\").\n\n" +
+				"Claude's launch-time bypass-permissions mode is reported but cannot be set —\n" +
+				"the shift+tab cycle does not pass through it.",
+			Examples: []string{
+				"hap mode vivid-falcon",
+				"hap mode vivid-falcon plan --yes",
+				"test \"$(hap mode vivid-falcon)\" = plan || hap mode vivid-falcon plan --yes",
+			},
+			// SelfHints, not a static Next: the READ form must print the mode
+			// and nothing else, or `$(hap mode reviewer)` captures the footer
+			// too and every string comparison against it fails. The set form
+			// prints its own footer instead.
+			SelfHints: true,
+			Handler:   mode,
 		},
 		{
 			Name:    "disable",

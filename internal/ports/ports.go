@@ -105,6 +105,16 @@ type KeystrokeSequenceSender interface {
 	SendKeys(ctx context.Context, paneID string, keys ...string) error
 }
 
+// ChordSender is implemented by Herdr adapters that can write a raw terminal
+// escape sequence to a pane as literal input, submitting nothing. It is the
+// escape hatch for chords herdr's key vocabulary cannot express — notably
+// Shift+Tab (CSI Z), which `pane send-keys shift+tab` accepts and then delivers
+// as a bare TAB, so the agent never sees the modifier. Optional: callers
+// type-assert and refuse (never fall back to a key name that silently no-ops).
+type ChordSender interface {
+	SendChord(ctx context.Context, paneID, chord string) error
+}
+
 // FocusPort is implemented by Herdr adapters that can bring a tab/pane into
 // view. Optional: callers type-assert and report "not supported" when absent.
 type FocusPort interface {

@@ -72,6 +72,18 @@ go test -tags "integration vectors cpu" ./test/integration/ -v      # include th
   plain menu and got a bare digit that only toggled its checkbox — and asserts the answer
   toggles, advances to Submit, and commits. It FAILS (does not skip) when a form is on screen
   but `MultiTabForm` misses it, so the detection regression can never pass silently.
+  `TestRealClaudeModeCycle` / `TestRealCodexModeToggle` (`agentmode_test.go`, needs
+  `HAP_ITEST_CLAUDE=1` / `HAP_ITEST_CODEX=1`) DISCOVER the session's cycle (never assume
+  `AgentModesFor` — see the per-session rule above), drive the agent to every mode it
+  offers, and assert a mode it does NOT offer fails cleanly and leaves the agent where it
+  was. They are the only check that the Shift+Tab chord ENCODING still reaches an agent and
+  that the mode INDICATOR still renders the labels the parser matches, both of which live
+  in the agent's build, not herdr's. `TestRealClaudeModeRefusesAStandingModal` proves the
+  safety gate against a real modal — it raises `/model` (deterministic, no tool call
+  needed) and asserts the picker is still standing untouched afterwards.
+  `TestRealShiftTabKeyNameIsStillBroken` is a TRIPWIRE on the workaround: it FAILS if
+  herdr's `shift+tab` key name ever starts working, which is the signal to delete
+  `domain.ShiftTab`/`CLI.SendChord` in favor of a plain `pane send-keys`.
   `TestRealHerdrNotification*` / `TestRealInHerdrDetection` (`notification_test.go`) drive the
   socket notifier the TUI alerts through: the `notification.show` result shape (`shown` must
   agree with a `reason` the TUI knows), that two calls in a row both land (herdr closes the
@@ -382,6 +394,57 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
   error body and is returned as-is, so a real delivery error is never retried as a second send.
   Keep the paired tests (`TestSingleLineSendTypesTheTextSoAMenuDigitSelects` /
   `…NeverPastes` / `TestMultiLineSendPastesAsOneMessage`).
+- **`pane send-keys shift+tab` is ACCEPTED and delivers a bare TAB.** Verified live
+  (2026-08-09, herdr 0.7.5): herdr validates the key name, exits 0, and writes `0x09` —
+  the shift modifier is dropped. Proved by sending it to a pane running `cat -v`, where
+  `shift+tab` and `tab` produced byte-identical output, and by both Claude Code and Codex
+  ignoring it across repeated presses while every send reported success. `backtab`, `btab`
+  and `S-Tab` are all rejected outright (`invalid_key`), so there is no key NAME that
+  works. The chord must be written as its raw terminal encoding, CSI Z (`domain.ShiftTab`
+  = `"\x1b[Z"`), through `pane send-text` — which is the right transport precisely because
+  it is not bracketed-paste aware, so the bytes pass through untouched
+  (`herdr.CLI.SendChord`, `ports.ChordSender`). This is the reason
+  `frontend.SetAgentMode` is an open loop that re-reads the pane after every press: a
+  green exit code from herdr is not evidence a chord landed. Keep the paired tests
+  (`TestSendChordTypesTheRawEscapeAndNeverSubmits` /
+  `TestShiftTabIsTheRawEscapeNotAHerdrKeyName` /
+  `TestSetAgentModeGivesUpOnADeafAgent`).
+- **An agent's permission mode is READABLE ONLY FROM ITS PANE, and only positively.**
+  Neither `agent list` nor `pane get` carries a mode field, so `domain.AgentModeFromPane`
+  parses the indicator the agent paints in its composer footer. Two rules are
+  load-bearing. **Absence is UNKNOWN, never a default**: every Claude mode renders a line
+  (verified live against 2.1.226 — including `⏸ manual mode on`, which uniquely omits the
+  `(shift+tab to cycle)` hint), so a capture with no line is a capture that does not show
+  the footer. **Matching is on the LABEL, never the glyph**: `accept edits on` and
+  `auto mode on` both render `⏵⏵`, so a glyph-keyed parser cannot tell the most permissive
+  mode from the middle one. Codex is the mirror image — it appends a right-aligned
+  `Plan mode (shift+tab to cycle)` to its `model · cwd` footer in Plan mode and nothing at
+  all in Default — so "no segment" only means Default once the footer itself is
+  recognized.
+- **The mode cycle is per-SESSION, not per-agent-type, so a set must detect a closed
+  rotation.** Verified live (2026-08-09): a `--model haiku` Claude session rotates through
+  only three modes — manual, acceptEdits, plan — while a default-model session in the same
+  build offers all four. `domain.AgentModesFor` is therefore a SUPERSET, never a promise.
+  `frontend.SetAgentMode` tracks the modes it has observed and stops the moment the
+  rotation returns to one, because the naive alternative is not merely a worse error
+  message: pressing to the ceiling leaves the agent parked in an arbitrary PERMISSION mode
+  nobody asked for. A failed set therefore also ROTATES THE AGENT BACK to where it started
+  (`restoreMode`). Note the two diagnoses are distinct — a mode that did not change at all
+  means the chord did not land and must keep pressing to the ceiling; only a mode that
+  CHANGED into one already seen means the cycle closed. Keep the paired tests
+  (`TestSetAgentModeDetectsAModeThisSessionDoesNotOffer` /
+  `TestSetAgentModeGivesUpOnADeafAgent`).
+- **Shift+Tab is REBOUND inside Claude's modals, so a mode press needs positive composer
+  evidence.** A standing plan approval renders `shift+tab to approve with this feedback`
+  (see `internal/classify/testdata/transcripts/approval_claude_plan.txt`), so pressing the
+  chord there APPROVES THE PLAN. `domain.ClaudeComposerReady` therefore requires the
+  composer SANDWICH — a `───` rule, the `❯` input line, and a second rule below it — not
+  the bare `❯`, which is also the caret an option list draws in front of its highlighted
+  choice. Refusing merely because a known form was *detected* is not enough; the ordinary
+  composer must be *proven*. Readiness is re-checked before EVERY press, not once up
+  front, because a prompt can appear between two presses. Keep the paired tests
+  (`TestClaudeComposerReadyRefusesAStandingApproval` /
+  `TestSetAgentModeRefusesAModalThatAppearsMidRotation`).
 - **A herdr agent name is 1-32 chars of `[a-z0-9_-]` starting with a lowercase letter**
   (`invalid_agent_name`), and `agent start` refuses a name already in use. Integration cases
   therefore derive a unique short name from `t.Name()` — a shared one made whichever case ran
@@ -463,6 +526,7 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
 | `internal/daemon` | monitor loop: subscribe → classify → decide → act/escalate |
 | `internal/classify` | pane-content classifier + golden fixtures |
 | `internal/mcqdeliver` | answers a live multi-tab MCQ form, verifying each keystroke landed |
+| `internal/domain/agentmode.go` | parses an agent's permission mode out of its composer footer; proves the composer is safe to press into |
 | `internal/llm` | operator LLM CLI adapter (argv template, auto-repair) |
 | `internal/mcpserver` | stdio MCP server (`get_context`, `submit_decision`) |
 | `internal/herdr` | herdr CLI + events-socket adapters |

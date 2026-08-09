@@ -109,23 +109,72 @@ last kill event:     resumed by operator at 2026-07-11T21:49:30+08:00
 ## list agents
 
 see all monitored agents with their short names, pane ids, types, statuses,
-automation state, and working directory:
+automation state, working directory, and permission mode:
 
 ```bash
 hap agents
 ```
 
-output (tab-separated; the last column is the agent's cwd, `-` when herdr
-cannot report one — it tells apart two agents working the same repo from
-different checkouts):
+output (tab-separated; the last two columns are the agent's cwd and its
+permission mode, each `-` when it could not be read — the cwd tells apart two
+agents working the same repo from different checkouts. new columns are always
+appended, so existing field positions never move):
 ```
-brave-otter  w6:p1   claude   idle      enabled    /workspaces/herdr-auto-pilot
-cool-fox     w6:p3   claude   working   disabled   /workspaces/worktree-agent-no1
-swift-hawk   w8:p1   codex    done      enabled    -
+brave-otter  w6:p1   claude   idle      enabled    /workspaces/herdr-auto-pilot    plan
+cool-fox     w6:p3   claude   working   disabled   /workspaces/worktree-agent-no1  acceptEdits
+swift-hawk   w8:p1   codex    done      enabled    -                               default
 ```
 
-the same value appears as `Working dir` in the TUI agent detail view (`v` on
-the Agents tab).
+both values appear in the TUI agent detail view (`v` on the Agents tab), as
+`Mode` and `Working dir`.
+
+## read and set an agent's permission mode
+
+the permission mode is the agent's own setting for how much it asks before
+acting — what `shift+tab` cycles inside the agent's TUI. hap can read it and
+drive it programmatically:
+
+```bash
+hap mode brave-otter                  # print the mode alone, for scripts
+hap mode brave-otter plan --yes       # rotate the agent into plan mode
+```
+
+modes, per agent type:
+
+| type | modes (in `shift+tab` cycle order) |
+|---|---|
+| `claude` | `acceptEdits`, `plan`, `auto`, `manual` |
+| `codex` | `default`, `plan` |
+
+the set form works by pressing `shift+tab` and re-reading the pane until the
+agent itself reports the mode you asked for, so:
+
+- it is **idempotent** — an agent already in the target mode gets no keystroke
+  at all, and the command still succeeds. safe to call unconditionally at the
+  top of a script:
+  ```bash
+  [ "$(hap mode brave-otter)" = plan ] || hap mode brave-otter plan --yes
+  ```
+- it **fails rather than guesses**. the mode is read from the indicator the
+  agent paints in its composer footer — neither herdr nor the agents report it
+  any other way — so if an approval or form is covering that footer, both forms
+  refuse with an explanation. that refusal is a safety control, not a
+  limitation: inside claude's approval modals `shift+tab` is rebound to
+  "approve with this feedback", so pressing it there would answer the prompt.
+- `--yes` skips the y/N confirmation and is **required** when not on a terminal.
+
+two more things it will not do silently:
+
+- **a mode the session does not actually offer.** the cycle is per-session, not
+  per-agent-type — a `--model haiku` claude rotates through only `manual`,
+  `acceptEdits` and `plan`, with no `auto` at all. hap notices as soon as the
+  rotation closes, rotates the agent **back to where it started**, and tells you
+  the cycle it actually observed.
+- **an agent launched with `--dangerously-skip-permissions`.** it reports
+  `bypassPermissions`, which the `shift+tab` cycle cannot leave, so hap refuses
+  immediately instead of pressing keys that cannot work.
+
+agent types other than claude and codex have no mode toggle and report `-`.
 
 ## rename an agent
 

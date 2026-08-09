@@ -155,6 +155,12 @@ type Status struct {
 	// Best-effort and short-TTL cached: a missing key just means herdr could
 	// not tell us, never that the agent has no cwd.
 	AgentCwds map[string]string
+	// AgentModes maps agent ids to the permission mode the agent is painting
+	// in its composer footer (Claude's Shift+Tab cycle, Codex's Default/Plan
+	// toggle). Populated only by callers that display it — see FillAgentModes.
+	// A missing key means the mode could not be read, never that the agent has
+	// no mode: absence of the indicator is UNKNOWN, not a default.
+	AgentModes map[string]domain.AgentMode
 	// Embedding summarizes semantic-matching availability: "disabled",
 	// "model missing (<path>)", or "ready (N signatures, <model>)". The
 	// daemon's live health (a degraded embedder) shows in its log instead.
@@ -249,6 +255,10 @@ func (st Status) AgentName(agentID string) string { return st.AgentNames[agentID
 // AgentCwd returns the agent's working directory ("" when herdr could not
 // report one, or when the caller never asked for cwds — see FillAgentCwds).
 func (st Status) AgentCwd(agentID string) string { return st.AgentCwds[agentID] }
+
+// AgentMode returns the agent's permission mode (domain.AgentModeUnknown when
+// it could not be read, or when the caller never asked — see FillAgentModes).
+func (st Status) AgentMode(agentID string) domain.AgentMode { return st.AgentModes[agentID] }
 
 // cwdFillBudget bounds ONE FillAgentCwds pass end to end. Each `herdr pane get`
 // is its own subprocess with a 15s CLI budget, and the lookups run in sequence,
@@ -510,31 +520,9 @@ func (a *App) CaptureAgent(ctx context.Context, target string) (domain.AgentTran
 	if a.ControlPath == "" {
 		return domain.AgentTransition{}, fmt.Errorf("daemon control socket is unavailable")
 	}
-	agents, err := a.Herdr.ListAgents(ctx)
-	if err != nil {
-		return domain.AgentTransition{}, fmt.Errorf("listing live agents: %w", err)
-	}
-	names, err := a.Store.AgentNames(ctx)
+	found, err := a.FindLiveAgent(ctx, target)
 	if err != nil {
 		return domain.AgentTransition{}, err
-	}
-	var found *domain.AgentTransition
-	for i := range agents {
-		if agents[i].AgentID == target || agents[i].PaneID == target {
-			found = &agents[i]
-			break
-		}
-	}
-	if found == nil {
-		for i := range agents {
-			if names[agents[i].AgentID] == target {
-				found = &agents[i]
-				break
-			}
-		}
-	}
-	if found == nil {
-		return domain.AgentTransition{}, fmt.Errorf("live agent %q not found", target)
 	}
 	switch found.Status {
 	case "blocked", "idle", "done":
@@ -548,7 +536,7 @@ func (a *App) CaptureAgent(ctx context.Context, target string) (domain.AgentTran
 	if err := control.NudgeCapture(ctx, a.ControlPath, agentID); err != nil {
 		return domain.AgentTransition{}, fmt.Errorf("requesting capture from daemon: %w", err)
 	}
-	return *found, nil
+	return found, nil
 }
 
 // Escalations lists pending escalations.

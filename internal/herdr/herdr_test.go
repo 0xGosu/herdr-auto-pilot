@@ -496,6 +496,48 @@ func TestSendReturnsPaneErrorWithoutFallingBack(t *testing.T) {
 	}
 }
 
+// TestSendChordTypesTheRawEscapeAndNeverSubmits pins BOTH halves of the
+// workaround for herdr's broken shift+tab.
+//
+// The transport must be `pane send-text`, not `pane send-keys`: verified live
+// (2026-08-09, herdr 0.7.5), `pane send-keys <pane> shift+tab` is accepted and
+// exits 0 while writing a bare TAB, so the agent never sees the modifier and
+// every send falsely reports success. And no Enter may follow — a chord is not a
+// submission, and an Enter here would commit whatever the composer held.
+func TestSendChordTypesTheRawEscapeAndNeverSubmits(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if err := cli.SendChord(context.Background(), "w1:p1", domain.ShiftTab); err != nil {
+		t.Fatal(err)
+	}
+	calls := fake.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("a chord must be exactly one herdr call, got %v", calls)
+	}
+	if !strings.HasPrefix(calls[0], "pane send-text w1:p1 ") {
+		t.Errorf("chord went out as %q; it must use `pane send-text` — `pane send-keys shift+tab` "+
+			"exits 0 and delivers a bare TAB", calls[0])
+	}
+	if !strings.Contains(calls[0], "\x1b[Z") {
+		t.Errorf("chord call %q does not carry the CSI Z escape", calls[0])
+	}
+	for _, c := range calls {
+		if strings.Contains(c, "send-keys") && strings.Contains(c, "enter") {
+			t.Errorf("a chord must not be followed by Enter, got %q", c)
+		}
+	}
+	// An empty chord is a no-op, not an empty send-text.
+	if err := cli.SendChord(context.Background(), "w1:p1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.Calls(); len(got) != 1 {
+		t.Errorf("empty chord should send nothing, calls = %v", got)
+	}
+}
+
 func TestSendKeysUsesOneHerdrInvocation(t *testing.T) {
 	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
 	if err != nil {
