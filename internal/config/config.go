@@ -330,6 +330,36 @@ type LLM struct {
 	// LearnFromUserTimeoutSeconds bounds one learn-from-user run; zero or
 	// omitted inherits timeout_seconds.
 	LearnFromUserTimeoutSeconds int `toml:"learn_from_user_timeout_seconds,omitempty"`
+	// RunInAgentCwd runs the consult and task-generation CLIs in the monitored
+	// AGENT's own working directory (from `herdr pane get`, preferring
+	// foreground_cwd) instead of hap's, so the CLI reads that project's
+	// instructions (CLAUDE.md / AGENTS.md), sees its local tool config, and can
+	// resolve repo-relative paths. Defaults to true.
+	//
+	// When it is off — or the agent's directory is unknown, relative, or has
+	// been deleted — the run falls back to hap's own directory
+	// (llm.Adapter.WorkDir), the historical behavior. It never fails a run: a
+	// consult from the wrong directory still answers, while a refused spawn
+	// would escalate a question nobody asked.
+	//
+	// It does NOT govern learn_from_user_command, which edits a project's memory
+	// file and therefore requires the agent's directory and refuses to run
+	// without one — falling back there would write the operator's lesson into a
+	// stranger's project.
+	//
+	// The trust boundary moves with it: the directory is chosen by the MONITORED
+	// AGENT (which can cd anywhere, including a repo it just cloned), so that
+	// project's instruction file is read by the very CLI whose answer and
+	// confidence drive auto-answering. Turn it off where the agents work in
+	// repos the operator does not trust. What it cannot do is bypass a safety
+	// control: the kill switch, never-auto patterns, the rate guard and
+	// auto_act_confidence_threshold all still gate delivery, so an injected
+	// answer reaches the same gates any other LLM answer does.
+	//
+	// Kept a pointer so an explicit false is distinguishable from unset and
+	// survives a Save round-trip; Load materializes the default (fillZeroes) so
+	// a saved config names the behavior it is running under.
+	RunInAgentCwd *bool `toml:"run_in_agent_cwd,omitempty"`
 
 	// ── Per-command environment ──────────────────────────────────────
 	// Each of the five command templates can carry its own environment, so
@@ -907,7 +937,7 @@ func Default() Config {
 			MaxAutoPromptsPerMinute:   5,
 			MaxErrorRetries:           2,
 		},
-		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 99},
+		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 99, RunInAgentCwd: boolPtr(true)},
 		Embedding: Embedding{
 			SimilarityThreshold: 0.90,
 			BM25MinScore:        0.35,
@@ -1423,6 +1453,11 @@ func (c *Config) fillZeroes() {
 	if c.LLM.AutoActConfidenceThreshold < 0 {
 		c.LLM.AutoActConfidenceThreshold = d.LLM.AutoActConfidenceThreshold
 	}
+	// Materialized rather than left nil so a saved config NAMES the directory
+	// behavior it is running under; an explicit false is preserved.
+	if c.LLM.RunInAgentCwd == nil {
+		c.LLM.RunInAgentCwd = boolPtr(*d.LLM.RunInAgentCwd)
+	}
 	if c.Embedding.SimilarityThreshold <= 0 || c.Embedding.SimilarityThreshold >= 1 {
 		c.Embedding.SimilarityThreshold = d.Embedding.SimilarityThreshold
 	}
@@ -1489,6 +1524,18 @@ func (l LLM) EnvSummaries() []LLMEnvSummary {
 func (c Config) LLMTimeout() time.Duration {
 	return time.Duration(c.LLM.TimeoutSeconds) * time.Second
 }
+
+// RunLLMInAgentCwd reports whether the consult and task-generation CLIs run in
+// the monitored agent's own working directory. Unset means true — a config
+// built in memory (tests, an older file predating the key) gets the default
+// without depending on Load having filled it in.
+func (c Config) RunLLMInAgentCwd() bool {
+	return c.LLM.RunInAgentCwd == nil || *c.LLM.RunInAgentCwd
+}
+
+// boolPtr returns a pointer to v, for the config fields that distinguish an
+// explicit false from an unset one.
+func boolPtr(v bool) *bool { return &v }
 
 // GenerateTaskTimeout returns the task-generation timeout:
 // task_generate_timeout_seconds, or — when zero/omitted — the consult

@@ -2390,6 +2390,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"llm.auto_act_confidence_threshold":        "70",
 		"llm.pane_excerpt_chars":                   "4000",
 		"llm.enable_rewrite_action":                "true",
+		"llm.run_in_agent_cwd":                     "false",
 		"llm.rewrite_action_fallback_template":     "Act on: {original_text}",
 		"llm.task_generate_command":                `claude -p "suggest a task"`,
 		"llm.task_generate_command_start":          `claude -p "first suggest a task"`,
@@ -2583,6 +2584,7 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 	hidden := map[string]bool{
 		"llm.pane_excerpt_chars":                   true,
 		"llm.enable_rewrite_action":                true,
+		"llm.run_in_agent_cwd":                     true,
 		"llm.rewrite_action_fallback_template":     true,
 		"llm.env_file":                             true,
 		"llm.command_env_file":                     true,
@@ -5558,6 +5560,41 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 		// it here would make the two keys order-dependent to set.
 		if err := app.SetField(ctx, "embedding.bm25_highbar_score", "0.10"); err != nil {
 			t.Errorf("a high bar below bm25_min_score must be storable, got %v", err)
+		}
+	})
+
+	t.Run("run_in_agent_cwd persists an explicit false", func(t *testing.T) {
+		// A POINTER field is exactly the shape where "SetField accepted the
+		// value" and "SetField stored it" come apart — a nil left in place, or
+		// a write through a pointer the loaded Config shares, both look fine to
+		// the registry-parity guard.
+		if err := app.SetField(ctx, "llm.run_in_agent_cwd", "false"); err != nil {
+			t.Fatalf("SetField rejected a valid bool: %v", err)
+		}
+		cfg, err := app.Config()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.LLM.RunInAgentCwd == nil || *cfg.LLM.RunInAgentCwd {
+			t.Errorf("RunInAgentCwd = %v — SetField accepted false but did not store it", cfg.LLM.RunInAgentCwd)
+		}
+		if cfg.RunLLMInAgentCwd() {
+			t.Error("the accessor must report false once an explicit false is stored")
+		}
+		// And back on again, so the default is reachable after opting out.
+		if err := app.SetField(ctx, "llm.run_in_agent_cwd", "true"); err != nil {
+			t.Fatalf("SetField rejected true: %v", err)
+		}
+		if cfg, err = app.Config(); err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.RunLLMInAgentCwd() {
+			t.Error("RunInAgentCwd must be settable back to true")
+		}
+		for _, bad := range []string{"yes", "", "1.5", "maybe"} {
+			if err := app.SetField(ctx, "llm.run_in_agent_cwd", bad); err == nil {
+				t.Errorf("SetField accepted %q; only a bool is valid", bad)
+			}
 		}
 	})
 

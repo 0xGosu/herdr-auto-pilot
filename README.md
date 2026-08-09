@@ -1156,7 +1156,7 @@ prompt mangles quoted argv values — edit them in `config.toml` or with
 `config set`, which accepts every listed scalar key. The advanced fields are
 not listed on the tab at all, so the settings you actually change stay
 findable: `llm.pane_excerpt_chars`, `llm.enable_rewrite_action`,
-`llm.rewrite_action_fallback_template`, the five `llm.*env_file` paths,
+`llm.rewrite_action_fallback_template`, `llm.run_in_agent_cwd`, the five `llm.*env_file` paths,
 `embedding.pane_salient_chars`, `embedding.warm_timeout_ms`, and the eight
 `tui.palette.*` color roles. They are
 hidden only from the TUI — `hap config fields` still lists them, `hap config
@@ -1307,11 +1307,69 @@ command = [
   "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (select_options for multiple-choice, recommend_action '@noop' to do nothing).",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
+  # hap's MCP server is the COMPLETE set: the consult runs in the agent's own
+  # project (llm.run_in_agent_cwd), so without this claude would also start the
+  # servers that project's .mcp.json names. hap appends this automatically to a
+  # claude command carrying --mcp-config; it is spelled out here to be visible.
+  "--strict-mcp-config",
 ]
 timeout_seconds = 120
 auto_act_confidence_threshold = 99   # auto-act only when the LLM's confidence (0-100) is >= this; default 99 (near-certain only); >100 e.g. 999 = never (surface for your confirmation)
 pane_excerpt_chars = 5000   # pane excerpt size in the consult context (default 5000)
+run_in_agent_cwd = true     # run the CLI in the agent's own project directory (default true)
 ```
+
+### Where the CLI runs
+
+By default hap launches the LLM CLI **in the monitored agent's own working
+directory** (`herdr pane get`, preferring `foreground_cwd`), so it reads that
+project's `CLAUDE.md` / `AGENTS.md`, sees its local tool config, and can resolve
+repo-relative paths. Set `run_in_agent_cwd = false` to keep the historical
+behavior — the CLI runs where hap runs.
+
+When the agent's directory is unknown or has been deleted, the run falls back to
+hap's own directory rather than failing: a consult answered from the wrong
+directory is better than a refused spawn.
+
+Two consequences worth knowing. First, the directory is chosen by the **agent** —
+which can `cd` anywhere, including a repo it just cloned — so that project's
+instruction file is read by the very CLI whose answer and confidence drive
+auto-answering. Turn the key off where your agents work in repos you don't trust.
+It cannot bypass a safety control: the kill switch, never-auto patterns, the rate
+guard and `auto_act_confidence_threshold` all still gate delivery, so an injected
+answer meets the same gates as any other. Second, CLIs store conversations per
+directory, so a session minted before this setting changed resumes from a
+different directory than it started in.
+
+**MCP servers are pinned to the ones hap names.** A project directory also
+carries a `.mcp.json`, and claude would start those servers for the consult. So
+hap appends **`--strict-mcp-config`** to any `claude` command that passes
+`--mcp-config` — making hap's server list the complete set rather than a
+starting point. Note what that also removes: MCP servers from your user-level
+`~/.claude.json`, from `--settings`, and from enabled plugins stop reaching the
+consult too. To keep one, move it into the `--mcp-config` JSON, where it
+survives.
+
+hap only appends the flag to a template that already passes `--mcp-config` —
+asserting no MCP set is not the same as asking for an empty one, so a command
+without it is left alone rather than silently stripped of your user-level
+servers. The shipped recipes therefore spell `--strict-mcp-config` out
+literally, including `task_generate_command` and `learn_from_user_command`,
+which pass no `--mcp-config` and need no MCP server at all (the flag alone means
+the empty set). That matters most for `learn_from_user_command`: it always runs
+in the agent's directory, and it runs with `--permission-mode acceptEdits`.
+
+**`codex` needs no equivalent** (verified against codex-cli 0.146.0). It has no
+`--strict-mcp-config` — the similarly named `--strict-config` just rejects
+unrecognized `config.toml` fields — and it has nothing to make strict: every MCP
+source it reads is `$CODEX_HOME`-rooted, so a project directory cannot add
+servers to a codex run. Run from a directory holding both a `.mcp.json` and a
+`.codex/config.toml` declaring servers, `codex mcp list` reports none, while a
+server in `$CODEX_HOME` is listed. `agy` is likewise left alone.
+
+`learn_from_user_command` is not governed by this key — it edits a project's own
+memory file, so it always runs in the agent's directory and refuses to run when
+there is none.
 
 ### Session ids
 

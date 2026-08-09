@@ -69,7 +69,11 @@ var claudeBoolFlags = map[string]bool{
 	"--dangerously-skip-permissions": true,
 	"--include-partial-messages":     true,
 	"--replay-user-messages":         true,
-	"--strict-mcp-config":            true,
+	// The exported constant, not a second copy of the literal: injection runs
+	// BEFORE the normalizer, and fixPromptAdjacency bails out entirely on a flag
+	// it cannot classify — so this entry is what keeps prompt repair working on
+	// every claude template hap has appended the flag to.
+	StrictMCPConfigFlag: true,
 }
 
 // --- agy (Antigravity CLI; Go-style flags, single or double dash) ---

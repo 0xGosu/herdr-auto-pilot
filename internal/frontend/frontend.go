@@ -1596,6 +1596,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "llm.auto_act_confidence_threshold", TUIEditable: true},
 	{Key: "llm.pane_excerpt_chars", TUIEditable: true, TUIHidden: true},
 	{Key: "llm.enable_rewrite_action", TUIEditable: true, TUIHidden: true},
+	{Key: "llm.run_in_agent_cwd", TUIEditable: true, TUIHidden: true},
 	{Key: "llm.rewrite_action_fallback_template", TUIHidden: true}, // template string
 	{Key: "llm.task_generate_command"},                             // argv template (idle task suggestion)
 	{Key: "llm.task_generate_command_start"},                       // argv template (first generation; inherits task_generate_command)
@@ -1841,6 +1842,10 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.LLM.PaneExcerptChars)
 	case "llm.enable_rewrite_action":
 		return strconv.FormatBool(cfg.LLM.EnableRewriteAction)
+	case "llm.run_in_agent_cwd":
+		// Through the accessor: an unset pointer reads as the default (true),
+		// not as a bare "false".
+		return strconv.FormatBool(cfg.RunLLMInAgentCwd())
 	case "llm.rewrite_action_fallback_template":
 		if cfg.LLM.RewriteActionFallbackTemplate == "" {
 			return "(built-in default)"
@@ -2062,6 +2067,15 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 				return fmt.Errorf("llm.enable_rewrite_action must be true or false, got %q", value)
 			}
 			cfg.LLM.EnableRewriteAction = v
+			return nil
+		case "llm.run_in_agent_cwd":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("llm.run_in_agent_cwd must be true or false, got %q", value)
+			}
+			// A fresh pointer, never a write through the existing one: the
+			// Config was loaded from disk and other holders may share it.
+			cfg.LLM.RunInAgentCwd = &v
 			return nil
 		case "llm.rewrite_action_fallback_template":
 			// Any text is accepted; empty restores the built-in default at

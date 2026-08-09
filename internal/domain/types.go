@@ -772,6 +772,16 @@ type LLMRequest struct {
 	// retry produced this consult. Transient and intentionally not persisted;
 	// a non-zero value forces the successful result into a fresh escalation.
 	RetryAuditID int64
+	// Cwd is the agent's own working directory (`herdr pane get`, foreground_cwd
+	// preferred over cwd), which the adapter runs the CLI in when
+	// llm.run_in_agent_cwd is on, so the CLI sees that project's instructions
+	// and tool config.
+	//
+	// Transient and resolved per run, never persisted: a pane's directory can
+	// change between staging and running, and a request rebuilt from a stored
+	// row (a retry drain, a restart) carries none — which the adapter treats as
+	// "fall back to hap's own directory", the historical behavior.
+	Cwd string
 }
 
 // LLMRetry is a front-end-written request to re-invoke the LLM on an

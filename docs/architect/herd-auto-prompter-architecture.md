@@ -370,6 +370,13 @@ attached stdio MCP server (the `mcp` subcommand) exposing `get_context` and
 **re-gated by the same confidence + never-auto controls** before it can act.
 Stdout/stderr are captured for audit only. No submit / timeout → escalate.
 
+The CLI is launched in the monitored **agent's own working directory** (from
+`pane get`, preferring `foreground_cwd`) so it reads that project's instructions
+and tool config; `llm.run_in_agent_cwd = false` keeps hap's directory instead, and
+an unknown or deleted directory falls back to it rather than failing the run.
+`learn_from_user_command` is exempt — it edits a project's memory file, so it
+requires the agent's directory and refuses without one.
+
 ### Resilience *(`internal/daemonlock`, `internal/daemonhealth`, `internal/crashguard`)*
 
 - **daemonlock** — a file lock guaranteeing a single monitoring daemon per state

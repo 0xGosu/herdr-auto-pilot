@@ -151,10 +151,7 @@ func (d *Daemon) learnFromUser(ctx context.Context, req domain.LearnRequest) boo
 			// falling back — a wrong directory is worse than no lesson.
 			if insp, ok := d.opt.Herdr.(ports.InspectorPort); ok {
 				if pi, perr := insp.PaneInfo(ctx, req.AgentID); perr == nil {
-					outcome.req.Cwd = pi.ForegroundCwd
-					if outcome.req.Cwd == "" {
-						outcome.req.Cwd = pi.Cwd
-					}
+					outcome.req.Cwd = agentCwd(pi)
 				}
 			}
 			out, sessionID, lerr := learnWithSession(ctx, lp, outcome.req)

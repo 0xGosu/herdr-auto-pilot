@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -83,10 +84,19 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 	// "/path (deleted)", which never stats), or a correction drained from a
 	// startup backlog whose pane id herdr has since recycled. Refusing turns
 	// all three into one `learn:failed` audit row, which is the honest signal.
-	if strings.TrimSpace(req.Cwd) == "" {
+	cwd := strings.TrimSpace(req.Cwd)
+	if cwd == "" {
 		return "", "", fmt.Errorf("learn-from-user: no working directory for agent %q; refusing to run a file-editing CLI in an unrelated directory", req.AgentName)
 	}
-	if !dirLives(req.Cwd) {
+	// Absolute for the same reason runDir insists on it, and more so here: a
+	// relative path resolves against the DAEMON's cwd, so "project" would send a
+	// CLI holding write permission into <daemon-cwd>/project — a real directory
+	// that is not the agent's. It stats, so dirLives alone would wave it through.
+	// herdr reports absolute paths today; this port is callable with anything.
+	if !filepath.IsAbs(cwd) {
+		return "", "", fmt.Errorf("learn-from-user: working directory %q is not absolute; refusing to run a file-editing CLI in an unrelated directory", req.Cwd)
+	}
+	if !dirLives(cwd) {
 		return "", "", fmt.Errorf("learn-from-user: working directory %q does not exist; refusing to run a file-editing CLI in an unrelated directory", req.Cwd)
 	}
 	self, err := a.resolveSelf()
@@ -101,6 +111,9 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 	if req.SessionID != "" {
 		base = InjectSessionID(base, SessionIDPlaceholder)
 	}
+	// A no-op unless the operator gave this template its own --mcp-config; the
+	// shipped recipes only do so for the consult.
+	base = InjectStrictMCPConfig(base)
 	// Auto-repair BEFORE substitution: the normalizer pattern-matches argv
 	// shapes, and the substituted pane excerpt and suggestion are untrusted —
 	// they must not be able to perturb the repair (same rule as GenerateTask).
@@ -114,7 +127,7 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 		"{self}", self,
 		"{agent_name}", req.AgentName,
 		"{agent_type}", req.AgentType,
-		"{cwd}", req.Cwd,
+		"{cwd}", cwd,
 		"{situation_type}", string(req.SituationType),
 		"{correction}", req.CorrectionText(),
 		SessionIDPlaceholder, req.SessionID,
@@ -123,7 +136,7 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 		"{self}", self,
 		"{agent_name}", req.AgentName,
 		"{agent_type}", req.AgentType,
-		"{cwd}", req.Cwd,
+		"{cwd}", cwd,
 		"{situation_type}", string(req.SituationType),
 		"{pane_excerpt}", req.PaneExcerpt,
 		"{suggestion}", req.SuggestionText(),
@@ -142,7 +155,7 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 	childEnv, err := buildEnv(a.BaseEnv, a.LearnEnv, envRepl,
 		"HAP_AGENT_NAME="+req.AgentName,
 		"HAP_AGENT_TYPE="+req.AgentType,
-		"HAP_CWD="+req.Cwd,
+		"HAP_CWD="+cwd,
 		"HAP_SITUATION_TYPE="+string(req.SituationType),
 	)
 	if err != nil {
@@ -167,7 +180,8 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 	defer cancel()
 
 	cmd := exec.CommandContext(runCtx, bin, argv[1:]...)
-	cmd.Dir = req.Cwd
+	// The validated value, not the raw one: the guards above ran on this.
+	cmd.Dir = cwd
 	// After the timeout kills the CLI, don't wait on lingering grandchildren
 	// holding the output pipes open — fail safe promptly.
 	cmd.WaitDelay = 2 * time.Second

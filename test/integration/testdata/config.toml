@@ -30,6 +30,11 @@ command = [
   "--model", "haiku",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
+  # hap's MCP server is the COMPLETE set: the consult runs in the agent's own
+  # project (llm.run_in_agent_cwd), so without this claude would also start the
+  # servers that project's .mcp.json names. hap appends this automatically to a
+  # claude command carrying --mcp-config; it is spelled out here to be visible.
+  "--strict-mcp-config",
 ]
 timeout_seconds = 120
 auto_act_confidence_threshold = 999
