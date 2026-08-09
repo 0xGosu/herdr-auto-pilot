@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.5.33
+
+- Changed the LLM CLI to run in the monitored agent's own working directory instead of hap's, so consults and task generation read that project's `CLAUDE.md` / `AGENTS.md`, see its local tool config, and can resolve repo-relative paths. An unknown or deleted directory falls back to the previous behavior rather than failing the run.
+- Added `llm.run_in_agent_cwd` (default `true`) to turn that off and keep running the CLI where hap runs. It does not affect `llm.learn_from_user_command`, which already required the agent's directory.
+- **Breaking.** Added `--strict-mcp-config` to any `claude` command that passes `--mcp-config`, so the MCP servers hap names are the complete set for that run. The agent project's own `.mcp.json` can no longer add servers to a decision — and neither can your user-level `~/.claude.json`, `--settings`, or enabled plugins, which reached the consult before and now do not. Move any server you want to keep into the `--mcp-config` JSON. A command that passes no `--mcp-config` is left alone. `codex` is unaffected: it has no such flag and reads MCP servers only from `$CODEX_HOME`, so a project directory cannot add any.
+
 ## 0.5.32
 
 - Added `llm.learn_from_user_command`: when you correct an escalation, hap runs a one-shot CLI in the agent's own working directory and asks it to record the lesson in that project's memory file (`CLAUDE.md`, or `AGENTS.md` for codex), so a correction outlives the one screen it was learned on. Off unless configured. Confirming hap's suggestion never triggers it, the run never touches the pane and never escalates, `hap pause` suppresses it, and every run leaves one `hap audit` row (`llm-learn-from-user`) carrying the CLI's stdout and stderr verbatim, so you can read what it did — press `v` on the row in the TUI's Audit tab. Nothing is parsed out of the reply, so the prompt needs no sentinel. A failed run is retryable with `l` on that same detail view; the retry is refused when the agent's pane is gone or now runs a different agent, and while automation is paused. The run is refused (and audited as `learn:failed`) when the agent's working directory cannot be resolved, so a file-editing CLI is never pointed at an unrelated project. `llm.learn_from_user_timeout_seconds` bounds a run and inherits `timeout_seconds` when omitted.
