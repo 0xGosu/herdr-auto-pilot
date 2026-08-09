@@ -281,6 +281,10 @@ func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string,
 	if req.SessionID != "" {
 		tmpl = InjectSessionID(tmpl, SessionIDPlaceholder)
 	}
+	// Also on the TEMPLATE, and for the same reason the normalizer runs last:
+	// appending here lets NormalizeLLMCommand restore claude's prompt adjacency
+	// over both additions in one pass.
+	tmpl = InjectStrictMCPConfig(tmpl)
 	argv := make([]string, len(tmpl))
 	for i, arg := range tmpl {
 		argv[i] = repl.Replace(arg)

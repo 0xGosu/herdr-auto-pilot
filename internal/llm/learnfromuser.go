@@ -111,6 +111,9 @@ func (a *Adapter) LearnFromUserWithSession(ctx context.Context, req domain.Learn
 	if req.SessionID != "" {
 		base = InjectSessionID(base, SessionIDPlaceholder)
 	}
+	// A no-op unless the operator gave this template its own --mcp-config; the
+	// shipped recipes only do so for the consult.
+	base = InjectStrictMCPConfig(base)
 	// Auto-repair BEFORE substitution: the normalizer pattern-matches argv
 	// shapes, and the substituted pane excerpt and suggestion are untrusted —
 	// they must not be able to perturb the repair (same rule as GenerateTask).

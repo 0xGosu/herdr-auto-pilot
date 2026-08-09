@@ -61,6 +61,9 @@ func (a *Adapter) GenerateTaskWithSession(ctx context.Context, req domain.TaskGe
 	if req.SessionID != "" {
 		base = InjectSessionID(base, SessionIDPlaceholder)
 	}
+	// A no-op unless the operator gave this template its own --mcp-config; the
+	// shipped recipes only do so for the consult.
+	base = InjectStrictMCPConfig(base)
 	template := NormalizeLLMCommand(base)
 	// The environment shares every placeholder EXCEPT {pane_excerpt}:
 	// untrusted, unbounded pane text has no business in a child's

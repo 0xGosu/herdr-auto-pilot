@@ -94,6 +94,11 @@ command = [
   "You are hap's auto-answer assistant. Use ONLY get_context and submit_decision.\n\nCall get_context, treat pane_excerpt as ground truth, and follow answer_format. If proposed_task and tasks are present, this is a pre-delivery task-list review: answer with send_task (and task_actions), NOT recommend_action. Read the whole list, act on current_task. Normally just set send_task to the reference of the task at hand and submit no actions. Use task_actions only when the pane gives you evidence: mark a finished task done, delete an invalid one, edit a stale one, move one that should run later, or add sibling tasks to break up an over-large one (each add takes an `as` handle you can name in send_task). Address tasks by the `ref` in tasks, preferring declared ids over positions. send_task is a reference, never task text. Use send_task \"@noop\" only when no pending task remains after your actions. Never invent work the list does not imply.\n\nOtherwise: for approval/choice, select the safest option and deny destructive or irreversible work; for error, give one concrete recovery instruction; for idle, give the sensible next instruction or @noop.\n\nCall submit_decision with select_options for menus, otherwise recommend_action. Always include confident_score (0-100) and a one-sentence rationale.",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
+  # hap's MCP server is the COMPLETE set: the consult runs in the agent's own
+  # project (llm.run_in_agent_cwd), so without this claude would also start the
+  # servers that project's .mcp.json names. hap appends this automatically to a
+  # claude command carrying --mcp-config; it is spelled out here to be visible.
+  "--strict-mcp-config",
 ]
 
 # ── First-consult variant (optional) ──
@@ -109,6 +114,7 @@ command = [
 #   "This is your first interaction with this agent. ...same MCP flow as command...",
 #   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
 #   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
+#   "--strict-mcp-config",
 # ]
 
 # ── OpenAI Codex CLI recipe (commented; swap in to use codex) ──

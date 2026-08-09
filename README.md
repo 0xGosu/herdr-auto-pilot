@@ -1307,6 +1307,11 @@ command = [
   "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (select_options for multiple-choice, recommend_action '@noop' to do nothing).",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
+  # hap's MCP server is the COMPLETE set: the consult runs in the agent's own
+  # project (llm.run_in_agent_cwd), so without this claude would also start the
+  # servers that project's .mcp.json names. hap appends this automatically to a
+  # claude command carrying --mcp-config; it is spelled out here to be visible.
+  "--strict-mcp-config",
 ]
 timeout_seconds = 120
 auto_act_confidence_threshold = 99   # auto-act only when the LLM's confidence (0-100) is >= this; default 99 (near-certain only); >100 e.g. 999 = never (surface for your confirmation)
@@ -1335,6 +1340,17 @@ guard and `auto_act_confidence_threshold` all still gate delivery, so an injecte
 answer meets the same gates as any other. Second, CLIs store conversations per
 directory, so a session minted before this setting changed resumes from a
 different directory than it started in.
+
+**MCP servers are pinned to the ones hap names.** A project directory also
+carries a `.mcp.json`, and claude would start those servers for the consult. So
+hap appends **`--strict-mcp-config`** to any `claude` command that passes
+`--mcp-config` — making hap's server list the complete set rather than a
+starting point. The shipped recipes spell the flag out too, so it is visible
+rather than magic. It is claude-only (`codex` and `agy` have no equivalent) and
+skipped for a template that passes no `--mcp-config` of its own — asserting no
+MCP set is not the same as asking for an empty one, and the task-generation and
+learn-from-user recipes are in that shape. To give the consult another server,
+add it to the `--mcp-config` JSON, where it survives.
 
 `learn_from_user_command` is not governed by this key — it edits a project's own
 memory file, so it always runs in the agent's directory and refuses to run when
