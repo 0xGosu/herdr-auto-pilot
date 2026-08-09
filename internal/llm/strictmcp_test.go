@@ -43,6 +43,11 @@ func TestInjectStrictMCPConfig(t *testing.T) {
 			want: []string{"claude", "-p", "suggest a task"},
 		},
 		{
+			name: "repeated --mcp-config still yields one flag",
+			argv: []string{"claude", "--mcp-config", "a.json", "--mcp-config", "b.json"},
+			want: []string{"claude", "--mcp-config", "a.json", "--mcp-config", "b.json", "--strict-mcp-config"},
+		},
+		{
 			name: "never doubled",
 			argv: []string{"claude", "--mcp-config", "{}", "--strict-mcp-config"},
 			want: []string{"claude", "--mcp-config", "{}", "--strict-mcp-config"},
@@ -71,41 +76,62 @@ func TestInjectStrictMCPConfig(t *testing.T) {
 	}
 }
 
-// TestStrictMCPConfigKeepsThePromptBesideItsFlag pins the ORDER: the flag is
-// appended to the template, then NormalizeLLMCommand runs — so claude's prompt
-// is moved back beside its -p over both this addition and the session id.
-// Appending after the normalizer would strand the prompt and fail every run
-// with "Input must be provided either through stdin or as a prompt argument".
-func TestStrictMCPConfigKeepsThePromptBesideItsFlag(t *testing.T) {
-	argv := InjectStrictMCPConfig([]string{"claude", "-p", "decide", "--mcp-config", "{}"})
+// TestStrictMCPConfigSurvivesPromptRepair pins that the appended flag does not
+// break claude's prompt-adjacency repair. The template here is deliberately
+// MISORDERED (the prompt sits after --model), so NormalizeLLMCommand actually
+// walks the flags instead of taking its already-adjacent early return — which
+// is what makes the case able to fail: an unclassifiable trailing flag makes
+// fixPromptAdjacency bail out and leaves the prompt stranded, and claude then
+// dies with "Input must be provided either through stdin or as a prompt
+// argument". The classification lives in claudeBoolFlags.
+func TestStrictMCPConfigSurvivesPromptRepair(t *testing.T) {
+	argv := InjectStrictMCPConfig([]string{"claude", "-p", "--model", "opus", "decide", "--mcp-config", "{}"})
 	argv = NormalizeLLMCommand(argv)
 	i := slices.Index(argv, "-p")
 	if i < 0 || i+1 >= len(argv) || argv[i+1] != "decide" {
-		t.Errorf("prompt must stay immediately after -p, got %q", argv)
+		t.Errorf("prompt must be repaired to sit immediately after -p, got %q", argv)
 	}
 	if !slices.Contains(argv, StrictMCPConfigFlag) {
 		t.Errorf("the flag must survive normalization, got %q", argv)
 	}
 }
 
-// TestConsultPassesStrictMCPConfig is the end-to-end check that a real consult
-// spawn carries the flag: the guard is what stops the agent's own project
-// .mcp.json from adding servers to hap's decision run.
-func TestConsultPassesStrictMCPConfig(t *testing.T) {
+// TestInjectionRunsOnTheTemplateNotTheSubstitutedArgv pins the real reason the
+// injection sits before placeholder substitution: detection then only ever sees
+// OPERATOR-authored argv. A prompt carrying untrusted pane text that happens to
+// expand to exactly "--mcp-config" must not be able to make hap declare an MCP
+// set the operator never wrote.
+func TestInjectionRunsOnTheTemplateNotTheSubstitutedArgv(t *testing.T) {
+	tmpl := []string{"claude", "-p", "{pane_excerpt}"}
+	if got := InjectStrictMCPConfig(tmpl); slices.Contains(got, StrictMCPConfigFlag) {
+		t.Errorf("a template with no --mcp-config must be left alone, got %q", got)
+	}
+	// The same argv AFTER a hostile substitution — proof the ordering is what
+	// keeps this out of reach, not the detection itself.
+	substituted := []string{"claude", "-p", "--mcp-config"}
+	if got := InjectStrictMCPConfig(substituted); !slices.Contains(got, StrictMCPConfigFlag) {
+		t.Logf("note: post-substitution argv would match (%q) — which is exactly why injection runs on the template", got)
+	}
+}
+
+// consultArgv runs one real consult through a fake CLI named "claude" (so the
+// claude-only gate applies) and returns the argv it actually received, one
+// element per entry — compared exactly, since a substring match would also
+// accept the flag glued into another element.
+func consultArgv(t *testing.T, reqID string, tmpl ...string) []string {
+	t.Helper()
 	st, db := testStore(t)
 	out := filepath.Join(t.TempDir(), "argv.txt")
-	// Named "claude" so the claude-only gate applies to this fake.
-	dir := t.TempDir()
-	script := filepath.Join(dir, "claude")
+	script := filepath.Join(t.TempDir(), "claude")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > '"+out+"'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	a := &Adapter{
-		CommandTemplate: []string{script, "-p", "decide", "--mcp-config", "{}"},
+		CommandTemplate: append([]string{script}, tmpl...),
 		Timeout:         5 * time.Second,
 		DBPath:          db, Store: st, SelfPath: "/bin/true",
 	}
-	req := domain.LLMRequest{RequestID: "req-strict", CreatedAt: time.Now()}
+	req := domain.LLMRequest{RequestID: reqID, CreatedAt: time.Now()}
 	ctx := context.Background()
 	if _, err := st.StageLLMRequest(ctx, req); err != nil {
 		t.Fatal(err)
@@ -122,7 +148,26 @@ func TestConsultPassesStrictMCPConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), StrictMCPConfigFlag) {
-		t.Errorf("the consult argv must carry %s, got:\n%s", StrictMCPConfigFlag, data)
+	return strings.Split(strings.TrimSpace(string(data)), "\n")
+}
+
+// TestConsultPassesStrictMCPConfig is the end-to-end check that a real consult
+// spawn carries the flag: it is what stops the agent's own project .mcp.json
+// from adding servers to hap's decision run.
+func TestConsultPassesStrictMCPConfig(t *testing.T) {
+	argv := consultArgv(t, "req-strict", "-p", "decide", "--mcp-config", "{}")
+	if !slices.Contains(argv, StrictMCPConfigFlag) {
+		t.Errorf("the consult argv must carry %s, got %q", StrictMCPConfigFlag, argv)
+	}
+}
+
+// TestConsultWithoutMCPConfigIsNotMadeStrict is the bound the whole change
+// rests on: a template that names no MCP set of its own is asserting nothing,
+// so silently switching off the operator's user-level servers there would be a
+// capability removal they never asked for.
+func TestConsultWithoutMCPConfigIsNotMadeStrict(t *testing.T) {
+	argv := consultArgv(t, "req-nostrict", "-p", "decide")
+	if slices.Contains(argv, StrictMCPConfigFlag) {
+		t.Errorf("a template with no --mcp-config must not be made strict, got %q", argv)
 	}
 }

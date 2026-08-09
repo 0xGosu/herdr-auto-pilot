@@ -253,6 +253,11 @@ run_in_agent_cwd = true
 task_generate_command = [
   "claude", "--model", "opus", "--permission-mode", "auto", "-p",
   "Suggest up to 3 concrete next tasks for this project's coding agent, in priority order. Return the tasks as a markdown list — one \"- \" bullet or \"1.\" numbered item per task; any surrounding text is ignored as tasks and kept as rationale. If no new task is needed, reply with exactly @noop and nothing else.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
+  # This run needs NO MCP server, and it runs in the agent's own project — so
+  # the flag with no --mcp-config is the empty set, which is exactly right.
+  # Unlike the consult, hap cannot append it for you here: it only does so for a
+  # command that already names an MCP set (see llm.InjectStrictMCPConfig).
+  "--strict-mcp-config",
 ]
 
 # ── Idle task suggestion — OpenAI Codex (commented; swap in to use codex) ──
@@ -310,6 +315,10 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # learn_from_user_command = [
 #   "claude", "--model", "opus", "--permission-mode", "acceptEdits", "-p",
 #   "You are recording a lesson for yourself. Read the operator's correction below, then update CLAUDE.md in the current directory so you do not repeat the mistake. Edit CLAUDE.md and nothing else: do not run the task, do not touch the terminal, do not answer the prompt shown on screen. Add or amend ONE short, general rule, phrased as guidance for the future rather than as a note about this incident; if an existing rule already covers it, sharpen that rule instead of adding a second one. If the correction carries no durable lesson (a one-off, or purely situational), change nothing.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
+#   # Edits files with acceptEdits, in the agent's own project — so it must not
+#   # also load the MCP servers that project's .mcp.json names. No --mcp-config
+#   # means the empty set.
+#   "--strict-mcp-config",
 # ]
 
 # ── Learn from your corrections — OpenAI Codex (commented; swap in to use codex) ──

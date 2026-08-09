@@ -36,8 +36,22 @@ const mcpConfigFlag = "--mcp-config"
 // Writing --strict-mcp-config in the template by hand is also respected (it is
 // never doubled).
 //
-// claude-only, like InjectSessionID — codex and agy have no such flag, and
-// appending an unknown one is an argv error that would fail every run.
+// claude-only, like InjectSessionID, and codex needs no equivalent — verified
+// live against codex-cli 0.146.0 (2026-08-09):
+//
+//   - There is no --strict-mcp-config. The similarly named --strict-config is
+//     unrelated: it errors out when config.toml holds fields this codex version
+//     does not recognize.
+//   - It has nothing to make strict. Every MCP source codex reads is
+//     $CODEX_HOME-rooted (~/.codex/config.toml, $CODEX_HOME/<name>.config.toml,
+//     -c mcp_servers.* overrides). Run from a directory holding BOTH a
+//     .mcp.json and a .codex/config.toml declaring servers, `codex mcp list`
+//     reports none — while a server in $CODEX_HOME is listed, so the check was
+//     not merely failing silently. A project directory therefore cannot add
+//     servers to a codex run the way it can to a claude one.
+//
+// agy is likewise left alone. Appending an unknown flag is an argv error that
+// would fail every run, so the gate stays positive: claude, and nothing else.
 func InjectStrictMCPConfig(argv []string) []string {
 	if len(argv) == 0 || filepath.Base(argv[0]) != "claude" {
 		return argv

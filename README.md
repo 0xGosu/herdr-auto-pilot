@@ -1345,12 +1345,27 @@ different directory than it started in.
 carries a `.mcp.json`, and claude would start those servers for the consult. So
 hap appends **`--strict-mcp-config`** to any `claude` command that passes
 `--mcp-config` — making hap's server list the complete set rather than a
-starting point. The shipped recipes spell the flag out too, so it is visible
-rather than magic. It is claude-only (`codex` and `agy` have no equivalent) and
-skipped for a template that passes no `--mcp-config` of its own — asserting no
-MCP set is not the same as asking for an empty one, and the task-generation and
-learn-from-user recipes are in that shape. To give the consult another server,
-add it to the `--mcp-config` JSON, where it survives.
+starting point. Note what that also removes: MCP servers from your user-level
+`~/.claude.json`, from `--settings`, and from enabled plugins stop reaching the
+consult too. To keep one, move it into the `--mcp-config` JSON, where it
+survives.
+
+hap only appends the flag to a template that already passes `--mcp-config` —
+asserting no MCP set is not the same as asking for an empty one, so a command
+without it is left alone rather than silently stripped of your user-level
+servers. The shipped recipes therefore spell `--strict-mcp-config` out
+literally, including `task_generate_command` and `learn_from_user_command`,
+which pass no `--mcp-config` and need no MCP server at all (the flag alone means
+the empty set). That matters most for `learn_from_user_command`: it always runs
+in the agent's directory, and it runs with `--permission-mode acceptEdits`.
+
+**`codex` needs no equivalent** (verified against codex-cli 0.146.0). It has no
+`--strict-mcp-config` — the similarly named `--strict-config` just rejects
+unrecognized `config.toml` fields — and it has nothing to make strict: every MCP
+source it reads is `$CODEX_HOME`-rooted, so a project directory cannot add
+servers to a codex run. Run from a directory holding both a `.mcp.json` and a
+`.codex/config.toml` declaring servers, `codex mcp list` reports none, while a
+server in `$CODEX_HOME` is listed. `agy` is likewise left alone.
 
 `learn_from_user_command` is not governed by this key — it edits a project's own
 memory file, so it always runs in the agent's directory and refuses to run when

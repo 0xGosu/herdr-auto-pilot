@@ -39,27 +39,25 @@ func TestAgentCwdPrefersForegroundCwd(t *testing.T) {
 // working directory reaches the LLM port, which is what lets the adapter run
 // the CLI inside that project (llm.run_in_agent_cwd).
 func TestConsultCarriesTheAgentsCwd(t *testing.T) {
-	h := newHarness(t, "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n")
-	h.llm.configured = true
-	h.herdr.mu.Lock()
-	h.herdr.paneInfo = domain.PaneInfo{ForegroundCwd: "/home/op/widgets", Cwd: "/home/op"}
-	h.herdr.mu.Unlock()
-
 	var mu sync.Mutex
 	var cwds []string
-	// The consult errors, so every episode escalates: nothing is sent and no
-	// rule is learned, which keeps the assertion about the request alone.
-	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
-		mu.Lock()
-		cwds = append(cwds, req.Cwd)
-		mu.Unlock()
-		return nil, errors.New("escalate")
-	}
 	got := func() []string {
 		mu.Lock()
 		defer mu.Unlock()
 		return append([]string(nil), cwds...)
 	}
+	// The consult errors, so every episode escalates: nothing is sent and no
+	// rule is learned, which keeps the assertion about the request alone.
+	h := newHarnessConsult(t, "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n",
+		func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+			mu.Lock()
+			cwds = append(cwds, req.Cwd)
+			mu.Unlock()
+			return nil, errors.New("escalate")
+		})
+	h.herdr.mu.Lock()
+	h.herdr.paneInfo = domain.PaneInfo{ForegroundCwd: "/home/op/widgets", Cwd: "/home/op"}
+	h.herdr.mu.Unlock()
 
 	h.herdr.setPane(approvalPane)
 	h.push("agent-cwd-consult", "blocked")
@@ -125,25 +123,23 @@ func TestTaskListReviewCarriesTheAgentsCwd(t *testing.T) {
 // empty, which the adapter reads as "run where hap runs" — the historical
 // behavior, never a failed consult.
 func TestConsultCwdIsEmptyWhenHerdrReportsNone(t *testing.T) {
-	h := newHarness(t, "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n")
-	h.llm.configured = true
-	h.herdr.mu.Lock()
-	h.herdr.paneInfo = domain.PaneInfo{}
-	h.herdr.mu.Unlock()
-
 	var mu sync.Mutex
 	var calls []domain.LLMRequest
-	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
-		mu.Lock()
-		calls = append(calls, req)
-		mu.Unlock()
-		return nil, errors.New("escalate")
-	}
 	count := func() int {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(calls)
 	}
+	h := newHarnessConsult(t, "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n",
+		func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+			mu.Lock()
+			calls = append(calls, req)
+			mu.Unlock()
+			return nil, errors.New("escalate")
+		})
+	h.herdr.mu.Lock()
+	h.herdr.paneInfo = domain.PaneInfo{}
+	h.herdr.mu.Unlock()
 
 	h.herdr.setPane(approvalPane)
 	h.push("agent-cwd-none", "blocked")

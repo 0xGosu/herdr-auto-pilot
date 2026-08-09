@@ -587,6 +587,19 @@ func newHarness(t *testing.T, cfgTOML string) *harness {
 	return newHarnessCore(t, cfgTOML, nil, fl, fl, nil)
 }
 
+// newHarnessConsult builds a harness whose consult fake is installed BEFORE the
+// daemon starts, for the same reason as newHarnessLearn and newHarnessPaused:
+// assigning h.llm.consult afterwards races the startup sweep. A reconcile that
+// re-drives a parked agent first runs the consult with NO fake, which escalates
+// on "no consult configured" — and the test's own event is then folded into
+// that pending escalation as a duplicate, so the fake never sees a call at all.
+func newHarnessConsult(t *testing.T, cfgTOML string,
+	consult func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error)) *harness {
+	t.Helper()
+	fl := &fakeLLM{configured: true, consult: consult}
+	return newHarnessCore(t, cfgTOML, nil, fl, fl, nil)
+}
+
 // newHarnessWrapped lets a test substitute the HerdrPort the daemon sees
 // (e.g. hiding optional interfaces) while keeping the fake for assertions.
 func newHarnessWrapped(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort) *harness {
