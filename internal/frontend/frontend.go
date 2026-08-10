@@ -3021,14 +3021,28 @@ func expectTaskText(content string, index int, want string) error {
 // source (the CLI's exactly-one-wins rules), absolutized — the exported
 // form of taskFilePath for callers that need the path itself (task send).
 func (a *App) TaskSourcePathFor(agent string) (string, error) {
-	p, err := a.taskFilePath(agent, "")
+	// Returned verbatim: taskFilePath already yields the addressing form —
+	// absolute for a local list, scheme'd for a remote one. Running
+	// filepath.Abs over the latter does not fail, it silently produces
+	// "<cwd>/gist:/<id>/<file>", and the caller would then reserve and send
+	// against a LOCAL file that happens to have that name.
+	return a.taskFilePath(agent, "")
+}
+
+// sourceLocatorMatches reports whether a configured source resolves to locator
+// for this agent.
+//
+// Comparing src.Path to a locator by hand is what broke twice: under a remote
+// provider src.Path is a bare file name, so ExpandPath+Abs turns it into a path
+// under the caller's working directory that can never equal "gist://…". Resolve
+// the source the same way the locator was produced, and compare canonically so
+// two spellings of one local file still match.
+func (a *App) sourceLocatorMatches(cfg config.Config, src config.TaskSource, agent, locator string) bool {
+	res, err := tasklocator.Resolve(cfg, src, agent)
 	if err != nil {
-		return "", err
+		return false
 	}
-	if abs, e := filepath.Abs(p); e == nil {
-		p = abs
-	}
-	return p, nil
+	return tasklocator.Canonical(res.Locator) == tasklocator.Canonical(locator)
 }
 
 // TaskSourceTemplateFor returns the next-task template of the task source
@@ -3041,11 +3055,7 @@ func (a *App) TaskSourceTemplateFor(agent, sourcePath string) (string, error) {
 		return "", err
 	}
 	for _, src := range cfg.TaskSources {
-		p := config.ExpandPath(src.Path)
-		if abs, e := filepath.Abs(p); e == nil {
-			p = abs
-		}
-		if src.Agent == agent && p == sourcePath {
+		if src.Agent == agent && a.sourceLocatorMatches(cfg, src, agent, sourcePath) {
 			return src.NextTaskTemplate, nil
 		}
 	}
@@ -3373,26 +3383,20 @@ func (a *App) GetTask(agent, path string, index int) (domain.ChecklistItem, erro
 // that is not a managed task source is left uncapped. Matched by absolute path
 // so it applies to both agent- and path-addressed adds of a registered source.
 // A config read error also yields 0 (fail-open: never block an add on it).
-func (a *App) taskSourceLimit(resolvedPath string) int {
+func (a *App) taskSourceLimit(agent, locator string) int {
 	cfg, err := a.Config()
 	if err != nil {
 		return 0
 	}
-	// Expand ~/$VAR then Abs both sides: the agent-addressed path comes back
-	// from resolveTaskFilePath as the raw config spelling (possibly relative or
-	// ~-based), while a --path add is already absolute — normalize so a
-	// relative or shorthand [[task_sources]] path still matches and stays
-	// capped.
-	resolvedPath = config.ExpandPath(resolvedPath)
-	if abs, e := filepath.Abs(resolvedPath); e == nil {
-		resolvedPath = abs
-	}
+	// Compared as LOCATORS, not as paths. Both previous spellings of this
+	// comparison were path-shaped and each broke silently: symlink-resolving
+	// one side stopped a macOS temp path matching its own config entry, and
+	// filepath.Abs over a "gist://…" locator produced a cwd-relative string
+	// that could never match — either way the source read as unregistered and
+	// therefore UNCAPPED, which is worse than having no cap because the
+	// operator believes one is set.
 	for _, src := range cfg.TaskSources {
-		sp := config.ExpandPath(src.Path)
-		if abs, e := filepath.Abs(sp); e == nil {
-			sp = abs
-		}
-		if sp == resolvedPath {
+		if a.sourceLocatorMatches(cfg, src, agent, locator) {
 			return src.MaxTasksLimit()
 		}
 	}
@@ -3412,7 +3416,7 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 	if err != nil {
 		return nil, 0, err
 	}
-	limit := a.taskSourceLimit(p)
+	limit := a.taskSourceLimit(agent, p)
 	newIndex := 0
 	items, err := a.mutateTask(p, func(content string) (string, error) {
 		// Checked inside the lock (like expectTaskText) so a racing add cannot
