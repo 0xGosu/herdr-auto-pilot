@@ -141,9 +141,16 @@ func (d *Daemon) clearRedrive(agentID string) {
 }
 
 // autoSendIdleTasks is the per-sweep poll. It runs on the main loop over an
-// agent listing the sweep already fetched: everything it reads is either
-// in-memory or a small file read (opt.ReadTaskFile), and the actual pane work
-// happens later, off the loop, through scheduleCapture.
+// agent listing the sweep already fetched, and the actual pane work happens
+// later, off the loop, through scheduleCapture.
+//
+// Its reads are in-memory or cheap: a LOCAL source is a small file read, and a
+// REMOTE one is served from the snapshot cache rather than the network (see
+// taskcache.go). Its WRITES are not — reclaimStrandedTasks does one
+// read-modify-write per stranded row, inline, so against a remote store a
+// backlog of stranded rows costs a round trip each on this loop. Bounded by the
+// per-call deadline, but it is the reason this function is no longer "only
+// cheap reads".
 func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTransition) {
 	now := d.opt.Clock.Now()
 	d.noteIdleAgents(agents, now)
@@ -229,49 +236,100 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 		if len(eligible) == 0 {
 			continue
 		}
-		data, err := d.opt.ReadTaskFile(src.Path)
-		if err != nil {
-			slog.Warn("auto-send: task source unreadable", "path", src.Path, "error", err)
-			continue
-		}
-		pending := d.unclaimedPendingTasks(canonicalTaskPath(src.Path), string(data))
-		if len(pending) == 0 {
-			continue
-		}
-		for i, a := range eligible {
-			if i >= len(pending) {
-				// More idle agents than remaining work: the rest wait for the
-				// list to refill rather than share a task.
-				//
-				// Debug, not Info: this is a steady STATE, not an event, and the
-				// break below happens before noteRedrive — so these agents never
-				// enter the pollRedrive backoff and nothing ages them out. At
-				// Info it was one line per minute per source, forever, whenever
-				// idle agents outnumbered pending work.
-				slog.Debug("auto-send: no pending task left for idle agent",
-					"agent", a.AgentID, "source", src.Path)
-				break
+		// Resolve PER AGENT, not once per source: a source that declares no
+		// file derives one list per matched agent, so two eligible agents can
+		// legitimately resolve to two different lists. Agents that resolve to
+		// the SAME list are grouped, and the pairing below runs within a group
+		// — which is what still stops one task reaching two agents when they
+		// genuinely share a list.
+		for _, group := range d.groupEligibleByList(src, eligible) {
+			data, err := d.opt.ReadTaskFile(group.locator)
+			if err != nil {
+				slog.Warn("auto-send: task source unreadable",
+					"locator", group.locator, "error", err)
+				continue
 			}
-			d.claimAutoTask(a.AgentID, taskClaim{
-				sourcePath: canonicalTaskPath(src.Path), taskText: pending[i], at: now,
-			})
-			driven[a.AgentID] = true
-			// Claim the parked episode (as captureLiveAgent does) so the next
-			// reconcile does not queue a second, provenance-less capture behind
-			// this one. The pipeline itself never consults episodeHandled, so
-			// this only suppresses the duplicate.
-			d.mu.Lock()
-			d.episodeHandled[a.PaneID] = true
-			d.mu.Unlock()
-			tr := a
-			tr.AutoIdleSend = true
-			tr.At = now
-			d.noteRedrive(a.AgentID, now)
-			slog.Info("auto-send: re-driving idle agent with its next declared task",
-				"agent", a.AgentID, "pane", a.PaneID, "status", a.Status, "source", src.Path)
-			d.scheduleCapture(ctx, tr)
+			pending := d.unclaimedPendingTasks(canonicalTaskPath(group.locator), string(data))
+			if len(pending) == 0 {
+				continue
+			}
+			for i, a := range group.agents {
+				if i >= len(pending) {
+					// More idle agents than remaining work: the rest wait for
+					// the list to refill rather than share a task.
+					//
+					// Debug, not Info: this is a steady STATE, not an event, and
+					// the break below happens before noteRedrive — so these
+					// agents never enter the pollRedrive backoff and nothing ages
+					// them out. At Info it was one line per minute per source,
+					// forever, whenever idle agents outnumbered pending work.
+					slog.Debug("auto-send: no pending task left for idle agent",
+						"agent", a.AgentID, "source", group.locator)
+					break
+				}
+				d.claimAutoTask(a.AgentID, taskClaim{
+					sourcePath: canonicalTaskPath(group.locator), taskText: pending[i], at: now,
+				})
+				driven[a.AgentID] = true
+				// Claim the parked episode (as captureLiveAgent does) so the
+				// next reconcile does not queue a second, provenance-less
+				// capture behind this one. The pipeline itself never consults
+				// episodeHandled, so this only suppresses the duplicate.
+				d.mu.Lock()
+				d.episodeHandled[a.PaneID] = true
+				d.mu.Unlock()
+				tr := a
+				tr.AutoIdleSend = true
+				tr.At = now
+				d.noteRedrive(a.AgentID, now)
+				slog.Info("auto-send: re-driving idle agent with its next declared task",
+					"agent", a.AgentID, "pane", a.PaneID, "status", a.Status,
+					"source", group.locator)
+				d.scheduleCapture(ctx, tr)
+			}
 		}
 	}
+}
+
+// listGroup is the eligible agents that share one resolved task list.
+type listGroup struct {
+	locator string
+	agents  []domain.AgentTransition
+}
+
+// groupEligibleByList resolves each eligible agent's list and groups the agents
+// that share one, preserving the caller's agent order within each group (the
+// pairing below is positional, so a stable order keeps a sweep deterministic).
+//
+// An agent whose list cannot be resolved is dropped with a warning rather than
+// silently skipped as "no work": a misconfigured provider must read as an
+// unusable SOURCE, never as an absent one.
+func (d *Daemon) groupEligibleByList(src config.TaskSource,
+	eligible []domain.AgentTransition) []listGroup {
+
+	var order []string
+	byLocator := map[string][]domain.AgentTransition{}
+	for _, a := range eligible {
+		name, err := d.opt.Store.EnsureAgentName(context.Background(), a.AgentID)
+		if err != nil {
+			name = ""
+		}
+		res, err := d.resolveTaskSource(src, name)
+		if err != nil {
+			slog.Warn("auto-send: task source unresolvable for agent",
+				"agent", a.AgentID, "error", err)
+			continue
+		}
+		if _, seen := byLocator[res.Locator]; !seen {
+			order = append(order, res.Locator)
+		}
+		byLocator[res.Locator] = append(byLocator[res.Locator], a)
+	}
+	groups := make([]listGroup, 0, len(order))
+	for _, loc := range order {
+		groups = append(groups, listGroup{locator: loc, agents: byLocator[loc]})
+	}
+	return groups
 }
 
 // reclaimStrandedTasks is what makes each sweep decide from CURRENT state

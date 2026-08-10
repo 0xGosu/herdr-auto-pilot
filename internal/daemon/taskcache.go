@@ -4,6 +4,8 @@ import (
 	"errors"
 	"log/slog"
 	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 )
 
 // Task-list snapshots for a REMOTE store.
@@ -43,6 +45,12 @@ var errTaskListNotCachedYet = errors.New("task list has not been read yet; it wi
 type taskSnapshot struct {
 	data []byte
 	at   time.Time
+	// gen increments on every WRITE to this locator. A background refresh
+	// records the generation it started under and is DISCARDED if a write
+	// landed meanwhile — otherwise a read that began before the write would
+	// overwrite the post-write content with pre-write bytes, and a reserved
+	// "[-]" item would read as pending again for a whole TTL.
+	gen uint64
 	// err is the failure of the most recent refresh. It is served to callers
 	// so a persistently unreachable store reports WHY on every event rather
 	// than silently reading as "no pending tasks" — which would stop every
@@ -59,9 +67,25 @@ func (d *Daemon) cachedTaskList(locator string) ([]byte, error) {
 	ttl := d.taskSnapshotTTL()
 	now := d.opt.Clock.Now()
 
+	if ttl <= 0 {
+		// The documented escape hatch (a negative refresh_seconds) means read
+		// THROUGH, so it must actually do that. Kicking a background refresh
+		// and returning the previous snapshot would serve stale data forever
+		// while merely raising the refresh rate — the opposite of what an
+		// operator debugging a sync problem asked for. This deliberately does
+		// block the caller: they turned the cache off.
+		store, err := d.taskStore(locator)
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := d.taskCallCtx()
+		defer cancel()
+		return store.Read(ctx, locator)
+	}
+
 	d.mu.Lock()
 	snap, ok := d.taskSnapshots[locator]
-	stale := !ok || ttl <= 0 || now.Sub(snap.at) >= ttl
+	stale := !ok || now.Sub(snap.at) >= ttl
 	kick := stale && !snap.refreshing
 	if kick {
 		snap.refreshing = true
@@ -70,7 +94,7 @@ func (d *Daemon) cachedTaskList(locator string) ([]byte, error) {
 	d.mu.Unlock()
 
 	if kick {
-		d.refreshTaskSnapshot(locator)
+		d.refreshTaskSnapshot(locator, snap.gen)
 	}
 	switch {
 	case !ok:
@@ -82,22 +106,42 @@ func (d *Daemon) cachedTaskList(locator string) ([]byte, error) {
 	}
 }
 
-// refreshTaskSnapshot reads a locator off the main loop and stores the result.
-func (d *Daemon) refreshTaskSnapshot(locator string) {
+// refreshTaskSnapshot reads a locator off the main loop and stores the result,
+// unless a write landed while it was in flight (see taskSnapshot.gen).
+func (d *Daemon) refreshTaskSnapshot(locator string, startGen uint64) {
 	if !d.spawn(func() {
-		store, err := d.taskStore(locator)
+		// Guarded: this is the one new adapter call the daemon makes on a
+		// background goroutine, and the daemon path must never panic.
 		var data []byte
-		if err == nil {
+		err := logging.Guard("task-list-refresh", func() error {
+			store, serr := d.taskStore(locator)
+			if serr != nil {
+				return serr
+			}
 			ctx, cancel := d.taskCallCtx()
-			data, err = store.Read(ctx, locator)
-			cancel()
-		}
+			defer cancel()
+			var rerr error
+			data, rerr = store.Read(ctx, locator)
+			return rerr
+		})
 		if err != nil {
 			slog.Warn("task list refresh failed", "locator", locator, "error", err)
 		}
 		d.mu.Lock()
-		d.taskSnapshots[locator] = taskSnapshot{data: data, at: d.opt.Clock.Now(), err: err}
-		d.mu.Unlock()
+		defer d.mu.Unlock()
+		cur := d.taskSnapshots[locator]
+		if cur.gen != startGen {
+			// A write landed while this read was in flight. Its content is
+			// authoritative — it came back from inside the lock — so drop this
+			// result entirely rather than reviving pre-write bytes. Only the
+			// latch is cleared.
+			cur.refreshing = false
+			d.taskSnapshots[locator] = cur
+			return
+		}
+		d.taskSnapshots[locator] = taskSnapshot{
+			data: data, at: d.opt.Clock.Now(), err: err, gen: startGen,
+		}
 	}) {
 		// The daemon is shutting down and the goroutine was dropped, so clear
 		// the latch — otherwise a snapshot would stay marked "refreshing"
@@ -122,11 +166,18 @@ func (d *Daemon) noteTaskListWritten(locator string, content []byte, err error) 
 	if d.taskSnapshots == nil {
 		return
 	}
+	// Bumped on BOTH paths, so an in-flight refresh started before this write
+	// is discarded either way — after a failed mutation the store's state is
+	// unknown, and a pre-write read is no better evidence of it.
+	gen := d.taskSnapshots[locator].gen + 1
 	if err != nil {
-		delete(d.taskSnapshots, locator)
+		// Keep the generation, drop the content: never serve a snapshot that
+		// may have been half-reasoned about. refreshing stays false so the next
+		// read re-reads.
+		d.taskSnapshots[locator] = taskSnapshot{gen: gen, err: errTaskListNotCachedYet}
 		return
 	}
-	d.taskSnapshots[locator] = taskSnapshot{data: content, at: d.opt.Clock.Now()}
+	d.taskSnapshots[locator] = taskSnapshot{data: content, at: d.opt.Clock.Now(), gen: gen}
 }
 
 // dropTaskSnapshots clears the whole cache. Called when the registry is
@@ -139,8 +190,10 @@ func (d *Daemon) dropTaskSnapshots() {
 	d.taskSnapshots = map[string]taskSnapshot{}
 }
 
-// taskSnapshotTTL is how long a remote snapshot may be reused. 0 means read
-// through on every call (the operator's debugging escape hatch).
+// taskSnapshotTTL is how long a remote snapshot may be reused. A
+// non-positive value means read through on every call — cachedTaskList then
+// does a blocking read rather than serving anything, which is the point of the
+// escape hatch.
 func (d *Daemon) taskSnapshotTTL() time.Duration {
 	d.mu.Lock()
 	defer d.mu.Unlock()

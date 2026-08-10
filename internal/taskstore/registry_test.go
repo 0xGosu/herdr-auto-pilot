@@ -113,7 +113,11 @@ func TestRegistryDispatchesOnLocatorSchemeNotConfiguredProvider(t *testing.T) {
 
 	t.Run("a gist ledger row under a now-local config stays remote", func(t *testing.T) {
 		// Default provider is local_fs, but a row written earlier names a gist.
-		r := taskstore.NewRegistry(config.Default())
+		// The credentials stay configured — they are what still authorizes
+		// finishing an in-flight hand-out.
+		cfg := config.Default()
+		cfg.TaskSourceProvider.EnvFile = "/etc/hap/task.env"
+		r := taskstore.NewRegistry(cfg)
 		store, err := r.ForLocator("gist://3f2a/brave-otter.md")
 		if err != nil {
 			t.Fatal(err)
@@ -202,5 +206,37 @@ func TestRegistryAnyRemoteTracksTheConfig(t *testing.T) {
 	mixed.TaskSources = []config.TaskSource{{Agent: "a", Provider: config.ProviderGitHubGist, GistID: "x"}}
 	if !taskstore.NewRegistry(mixed).AnyRemote() {
 		t.Error("a single overriding source must report AnyRemote")
+	}
+}
+
+// TestRegistryRefusesAnUnservableRemoteBackend pins that the registry reports
+// the SAME operator-facing remediation the config validator produces, rather
+// than a second copy of the rules that could drift from it.
+func TestRegistryRefusesAnUnservableRemoteBackend(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*config.Config)
+		wantErr string
+	}{
+		{
+			name:    "no credentials",
+			mutate:  func(c *config.Config) { c.TaskSourceProvider.EnvFile = "" },
+			wantErr: "env_file",
+		},
+		{
+			name:    "no gist id",
+			mutate:  func(c *config.Config) { c.TaskSourceProvider.GitHubGist.GistID = "" },
+			wantErr: "hap config set task_source_provider.github_gist.gist_id",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := gistCfg("3f2a")
+			tc.mutate(&cfg)
+			_, _, err := taskstore.NewRegistry(cfg).For(config.TaskSource{Path: "a.md"}, "brave-otter")
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want an error mentioning %q, got %v", tc.wantErr, err)
+			}
+		})
 	}
 }

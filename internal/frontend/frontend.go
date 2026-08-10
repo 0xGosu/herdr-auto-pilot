@@ -1173,25 +1173,29 @@ func pickAppendTarget(sources []config.TaskSource) (config.TaskSource, bool) {
 // before the send, so the daemon's idle flow can never hand it out mid-send,
 // and a failed send rolls it back to "[ ]".
 func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecord, src config.TaskSource, name string, tasks []string, send bool) error {
-	path := config.ExpandPath(src.Path)
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
+	// Resolved through the registry, NOT by absolutizing src.Path. Under a
+	// remote provider src.Path is a bare file name inside the store, so
+	// filepath.Abs would turn it into a path under the CLI's working directory,
+	// create a local file there, append to it, and report success while the
+	// operator's real list never changed — the exact corruption the provider
+	// design refuses everywhere else.
+	cfg, err := a.Config()
+	if err != nil {
+		return err
 	}
+	l, err := a.resolveSourceList(cfg, src, name)
+	if err != nil {
+		return fmt.Errorf("resolve task list for %s: %w", name, err)
+	}
+	path := l.Locator
 	limit := src.MaxTasksLimit()
 
-	// The declared file may not exist yet (a freshly added source): create it
-	// so mutateTaskFile's stat succeeds. Idempotent, so it runs pre-claim; any
-	// other stat error refuses now, while the escalation is still pending.
-	if _, err := os.Stat(path); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat task list %s: %w", path, err)
-		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return fmt.Errorf("create task list dir: %w", err)
-		}
-		if err := os.WriteFile(path, []byte("# Tasks for "+name+"\n\n"), 0o600); err != nil {
-			return fmt.Errorf("create task list file: %w", err)
-		}
+	// The list may not exist yet (a freshly added source, or a gist file no
+	// agent has been handed work from). Create it so the mutation below has
+	// something to read. Idempotent and never clobbering, so it runs pre-claim
+	// while the escalation is still pending.
+	if _, err := a.ensureList(context.Background(), cfg, path, "# Tasks for "+name+"\n\n"); err != nil {
+		return fmt.Errorf("create task list %s: %w", l.Display, err)
 	}
 
 	// ONE locked compare-append: skip already-present tasks (a retry after a
@@ -1203,7 +1207,7 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 	// — pre-claim — lets the operator prune the list and confirm again.
 	firstText := domain.EncodeTaskNewlines(tasks[0])
 	firstIndex := 0
-	if _, err := mutateTaskFile(path, func(content string) (string, error) {
+	if _, err := a.mutateTask(path, func(content string) (string, error) {
 		items := domain.ParseChecklist(content)
 		present := map[string]int{}
 		for _, it := range items {
@@ -1292,7 +1296,7 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 		if strings.Contains(domain.TemplateOrDefault(src.NextTaskTemplate), "{cwd}") {
 			cwd = a.paneCwd(ctx, audit.AgentID)
 		}
-		if _, err := mutateTaskFile(path, reserveTask(firstIndex, firstText)); err != nil {
+		if _, err := a.mutateTask(path, reserveTask(firstIndex, firstText)); err != nil {
 			return fmt.Errorf("tasks appended to %s, but reserving task #%d (nothing was sent): %w", path, firstIndex, err)
 		}
 		prompt := domain.DeclaredTask{
@@ -1300,7 +1304,7 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 			AgentName: name, Cwd: cwd,
 		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
-			if _, rbErr := mutateTaskFile(path, releaseTask(firstIndex, firstText)); rbErr != nil {
+			if _, rbErr := a.mutateTask(path, releaseTask(firstIndex, firstText)); rbErr != nil {
 				return fmt.Errorf("sending the task failed (%w) and task #%d could not be returned to [ ] (%v) — "+
 					"it stays [-] and no agent will pick it up until you clear it", err, firstIndex, rbErr)
 			}
@@ -1330,24 +1334,58 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 // selector is deliberately not refused — a catch-all scoped to another
 // workspace must not block an unrelated agent's bootstrap.
 func (a *App) addTaskSourceIfAbsent(ctx context.Context, agentID, agentType, name, path string) error {
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		src := config.TaskSource{Agent: name, MaxTasks: config.DefaultMaxTasks}
+		// Under the DEFAULT provider the bootstrap file is a real path; under a
+		// remote one it is a file name inside the store, so absolutizing would
+		// turn it into a local path the store can never serve. Provider and
+		// GistID are deliberately left EMPTY: an absent key is the inheritance,
+		// and recording the resolved value would freeze this source against a
+		// later change of the default.
+		if cfg.ResolveProvider(src).Remote() {
+			src.Path = config.SanitizeTaskFileName(name) + ".md"
+		} else {
+			src.Path = path
+			if abs, err := filepath.Abs(src.Path); err == nil {
+				src.Path = abs
+			}
+		}
 		for _, ts := range cfg.TaskSources {
-			if ts.Agent == name && ts.Path == path {
+			// The provider is part of identity: two sources could carry the
+			// same bare file name under different backends.
+			if ts.Agent == name && ts.Path == src.Path &&
+				cfg.ResolveProvider(ts).Name == cfg.ResolveProvider(src).Name {
 				return nil
 			}
 		}
 		for _, ts := range cfg.TaskSources {
 			if ts.Agent != "" && ts.MatchesAgent(agentID, agentType, name) {
-				return fmt.Errorf("agent %q already has a task source (%s); refusing to register a second — append the generated tasks to it instead", name, ts.Path)
+				return fmt.Errorf("agent %q already has a task source (%s); refusing to register a second — append the generated tasks to it instead",
+					name, taskSourceLabel(*cfg, ts))
 			}
 		}
-		cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{
-			Agent: name, Path: path, MaxTasks: config.DefaultMaxTasks})
+		// Validated like every other write surface: without this the bootstrap
+		// was the one path that could persist a source no later resolve accepts
+		// — the confirm would "succeed" and mint a permanently broken source.
+		if err := config.ValidateTaskSource(*cfg, src); err != nil {
+			return err
+		}
+		cfg.TaskSources = append(cfg.TaskSources, src)
 		return nil
 	})
+}
+
+// taskSourceLabel renders where a source's list lives, for operator-facing
+// text. Under a remote provider a bare Path means nothing on its own.
+func taskSourceLabel(cfg config.Config, src config.TaskSource) string {
+	p := cfg.ResolveProvider(src)
+	if !p.Remote() {
+		return src.Path
+	}
+	if src.Path == "" {
+		return fmt.Sprintf("one list per matched agent in %s", p.Name)
+	}
+	return fmt.Sprintf("%q in %s", src.Path, p.Name)
 }
 
 // sanitizeTaskFileName makes an agent name safe as a file name. It moved to

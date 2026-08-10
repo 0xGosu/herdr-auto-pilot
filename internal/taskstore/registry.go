@@ -8,7 +8,6 @@ package taskstore
 
 import (
 	"fmt"
-	"runtime"
 	"sync"
 	"time"
 
@@ -28,10 +27,12 @@ var gistTokenKeys = []string{"GITHUB_TOKEN", "GH_TOKEN"}
 // Registry resolves a task source to its backend, reusing one backend instance
 // per distinct identity.
 //
-// Reuse is not an optimization detail: each gist backend owns an *http.Client
-// whose Transport holds the connection pool, so building one per call would
-// drop keep-alives and re-handshake TLS on every task-list read — and the
-// daemon reads a source on every agent event.
+// Reuse keeps per-backend state (the resolved gist id, the credential source,
+// the timeout) in one place rather than rebuilt per call. Note it is NOT what
+// preserves keep-alives: the store leaves its client's Transport nil, so every
+// backend shares http.DefaultTransport's pool and connections survive a
+// registry swap either way. Do not "optimize" this by giving each store its own
+// Transport without also closing idle connections when a registry is dropped.
 type Registry struct {
 	cfg config.Config
 
@@ -70,6 +71,14 @@ func (r *Registry) Config() config.Config { return r.cfg }
 // agents; a source that derives its file name per agent then returns
 // tasklocator.ErrAgentNameRequired, which those surfaces render as a template.
 func (r *Registry) For(src config.TaskSource, agentName string) (ports.TaskStore, string, error) {
+	// Validated BEFORE the locator is built. tasklocator.Resolve also needs a
+	// gist id (it cannot form "gist://<id>/<file>" without one) and reports a
+	// terse structural error for a missing one; going through the validator
+	// first means the operator gets the message that names both remedies
+	// instead. Two checks, one message.
+	if err := config.ValidateResolvedProvider(r.cfg, r.indexOf(src), src); err != nil {
+		return nil, "", err
+	}
 	res, err := tasklocator.Resolve(r.cfg, src, agentName)
 	if err != nil {
 		return nil, "", err
@@ -79,6 +88,19 @@ func (r *Registry) For(src config.TaskSource, agentName string) (ports.TaskStore
 		return nil, "", err
 	}
 	return store, res.Locator, nil
+}
+
+// indexOf reports a source's position in the configured list, so an error can
+// name the `hap task-source set <index> …` that fixes it. -1 when the source is
+// not one of the configured entries (a synthesized one, or a stale ledger row).
+func (r *Registry) indexOf(src config.TaskSource) int {
+	for i, s := range r.cfg.TaskSources {
+		if s.Agent == src.Agent && s.Workspace == src.Workspace && s.Path == src.Path &&
+			s.Provider == src.Provider && s.GistID == src.GistID {
+			return i
+		}
+	}
+	return -1
 }
 
 // ForLocator returns the backend serving an already-resolved locator,
@@ -113,21 +135,15 @@ func (r *Registry) backend(p config.ResolvedProvider) (ports.TaskStore, error) {
 	if !p.Remote() {
 		return r.local, nil
 	}
-	if p.Name != config.ProviderGitHubGist {
-		return nil, fmt.Errorf("unknown task source provider %q — expected one of %v",
-			p.Name, config.ValidTaskSourceProviders)
-	}
-	// The last gate before a remote backend exists at all, so it catches a
-	// hand-edited config that never crossed a write surface. lock_windows.go's
-	// Lock is a no-op, and a two-round-trip read-modify-write against a store
-	// with no compare-and-swap needs that lock to not lose concurrent edits.
-	if runtime.GOOS == "windows" {
-		return nil, fmt.Errorf("provider=%s is not supported on Windows: hap has no "+
-			"cross-process file lock there, and a remote checklist needs one to avoid "+
-			"losing concurrent edits", p.Name)
-	}
-	if p.GistID == "" {
-		return nil, fmt.Errorf("task source provider %s has no gist_id", p.Name)
+	// ONE validator for every use-time rule — unknown provider, unsupported
+	// platform, missing gist_id, missing env_file — rather than a copy here that
+	// drifts from it. It is what produces the operator-facing remediation
+	// ("hap config set …", "hap task-source set N gist-id …"), so re-checking
+	// inline would silently drop those hints. index is unknown at this depth.
+	if err := config.ValidateResolvedProvider(r.cfg, -1, config.TaskSource{
+		Provider: p.Name, GistID: p.GistID,
+	}); err != nil {
+		return nil, err
 	}
 
 	key := gistKey{GistID: p.GistID, EnvFile: p.EnvFile, Timeout: r.cfg.TaskSourceProvider.TaskStoreTimeout()}

@@ -292,10 +292,16 @@ type EnsureCreator interface {
 //
 // Optional, and the daemon's whole risk control: absent, every task-list read
 // and mutation runs inline on the main select loop exactly as it always has;
-// present, the daemon reads through an in-memory snapshot refreshed off the
-// loop and moves mutating episodes into a goroutine. Gating on the interface
-// rather than on config is what keeps the default provider's behaviour — and
-// its entire test suite — untouched.
+// present, the daemon serves reads from an in-memory snapshot refreshed off the
+// loop. Gating on the interface rather than on config is what keeps the default
+// provider's behaviour — and its entire test suite — untouched.
+//
+// Known gap: mutations still run inline. They are bounded (the lock wait plus
+// two round trips, all inside one deadline) but a slow backend does delay the
+// loop. The intended fix is to move the whole delivery EPISODE into a goroutine
+// funnelled back through one outcome channel, as consultLLM does — not to split
+// each mutation into a request/response pair, which would spread the
+// audit → reserve → send → ledger ordering across loop turns.
 type RemoteTaskStore interface {
 	Remote() bool
 }

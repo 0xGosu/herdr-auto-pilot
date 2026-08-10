@@ -550,11 +550,25 @@ func (d *Daemon) taskStoreTimeout() time.Duration {
 	return d.cfg.TaskSourceProvider.TaskStoreTimeout()
 }
 
-// taskCallCtx bounds one backend call. A local call has no deadline worth
+// taskCallCtx bounds one backend READ. A local call has no deadline worth
 // wiring; a remote one is additionally bounded by the HTTP client's own
 // timeout, so this is a backstop rather than the only guard.
 func (d *Daemon) taskCallCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(d.shutdownCtx, d.taskStoreTimeout())
+}
+
+// taskMutateCtx bounds one whole read-modify-write, which is a different budget
+// from a read and must not be confused with one.
+//
+// It has to cover THREE things, not one: the wait for another process's
+// advisory lock (which taskfile's flock loop takes without any context
+// awareness), then the store's read, then its write. Budgeting a single
+// timeout for all of it is self-defeating — under exactly the contention the
+// widened lock wait exists for, the lock would be acquired near the deadline
+// and the read would then fail instantly with "context deadline exceeded",
+// making the mutation guaranteed to fail precisely when it mattered.
+func (d *Daemon) taskMutateCtx(lockWait time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(d.shutdownCtx, lockWait+2*d.taskStoreTimeout())
 }
 
 // readTaskList is the production ReadTaskFile.
@@ -594,7 +608,7 @@ func (d *Daemon) mutateTaskList(locator string, fn func(string) (string, error))
 			wait = remote
 		}
 	}
-	ctx, cancel := d.taskCallCtx()
+	ctx, cancel := d.taskMutateCtx(wait)
 	defer cancel()
 	// Capture what the mutator produced so the snapshot can be replaced with
 	// it: Mutate read that content inside the lock, so there is no staleness
@@ -1822,6 +1836,23 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		// REAL pending task: declared != nil here means a task source matched
 		// but its checklist is exhausted (Task == NoTaskContent), not that
 		// none was ever declared.
+		//
+		// But "no declared task" has two very different causes, and only one of
+		// them licenses inventing work. A source may own this agent and simply
+		// be unreadable right now — a briefly unreachable provider, a bad
+		// credential, a snapshot not yet warm after a reload. Generating then
+		// would write invented tasks for an agent whose real list is full of
+		// pending work, which is the opposite of what the operator asked for.
+		// Escalate instead: the operator can see the source is broken.
+		if declared == nil {
+			if _, _, unusable := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType,
+				tr.WorkspaceID, agentName); unusable {
+				slog.Warn("task source is configured but unusable; escalating instead of generating tasks",
+					"agent", situation.AgentID)
+				d.escalate(ctx, situation, sig, decision, tr, now)
+				return
+			}
+		}
 		d.generateTask(ctx, cfg, situation, sig, tr, now, declared != nil)
 	default:
 		d.escalate(ctx, situation, sig, decision, tr, now)
@@ -2851,7 +2882,7 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 		// confirm-time append): appending even one generated task to a list
 		// already holding max_tasks items would exceed the cap, so generating
 		// would only raise escalations every confirm must refuse.
-		if m, ok := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName); ok {
+		if m, ok, _ := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName); ok {
 			if n, limit := len(domain.ParseChecklist(string(m.data))), m.src.MaxTasksLimit(); n >= limit {
 				name := agentName
 				if name == "" {
@@ -4765,28 +4796,36 @@ func (d *Daemon) sourceSelectsAgent(ctx context.Context, src config.TaskSource,
 	return domain.MatchWorkspace(src.Workspace, target)
 }
 
-func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID, agentType, workspaceID, agentName string) (taskSourceMatch, bool) {
+// matchTaskSource returns the source serving this agent. The third result
+// reports that a source SELECTED this agent but could not be resolved or read,
+// which callers must not confuse with "this agent has no task source" — the
+// latter is what licenses inventing one.
+func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID, agentType, workspaceID, agentName string) (taskSourceMatch, bool, bool) {
 	var completed *taskSourceMatch
+	unusable := false
 	for _, src := range cfg.TaskSources {
 		if !d.sourceSelectsAgent(ctx, src, agentID, agentType, workspaceID, agentName) {
 			continue
 		}
 		res, err := d.resolveTaskSource(src, agentName)
 		if err != nil {
-			// Skipped as an UNREADABLE source, never as "no source matched".
+			// Recorded as an UNUSABLE source, never as "no source matched".
 			// The difference is load-bearing: "no source" falls through to LLM
-			// task generation, so a misconfigured provider would have hap
-			// inventing tasks instead of reading the operator's list.
+			// task generation, so a misconfigured or briefly unreachable
+			// provider would have hap INVENTING tasks for an agent whose real
+			// list is full of pending work.
 			slog.Warn("task source unresolvable", "agent", agentID, "error", err)
+			unusable = true
 			continue
 		}
 		data, err := d.opt.ReadTaskFile(res.Locator)
 		if err != nil {
 			slog.Warn("task source unreadable", "locator", res.Locator, "error", err)
+			unusable = true
 			continue
 		}
 		if domain.NextDeclaredTask(string(data)) != "" {
-			return taskSourceMatch{src: src, locator: res.Locator, display: res.Display, remote: res.Remote, data: data}, true
+			return taskSourceMatch{src: src, locator: res.Locator, display: res.Display, remote: res.Remote, data: data}, true, false
 		}
 		// Only a real checklist with every item checked counts as completed;
 		// an empty or non-checklist file must not suppress tier-2 inference.
@@ -4795,9 +4834,9 @@ func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID
 		}
 	}
 	if completed != nil {
-		return *completed, true
+		return *completed, true, false
 	}
-	return taskSourceMatch{}, false
+	return taskSourceMatch{}, false, unusable
 }
 
 // taskSummaryMaxRunes bounds the get_context preview of the next pending or
@@ -4828,7 +4867,7 @@ func taskPreview(items []string) string {
 // taskSourceSummary reports the get_context task_source surface for the
 // given agent/workspace.
 func (d *Daemon) taskSourceSummary(ctx context.Context, cfg config.Config, s domain.Situation, workspaceID, agentName string) (taskSourceSummaryFields, bool) {
-	m, ok := d.matchTaskSource(ctx, cfg, s.AgentID, s.AgentType, workspaceID, agentName)
+	m, ok, _ := d.matchTaskSource(ctx, cfg, s.AgentID, s.AgentType, workspaceID, agentName)
 	if !ok {
 		return taskSourceSummaryFields{}, false
 	}
@@ -4859,7 +4898,7 @@ func (d *Daemon) taskSourceSummary(ctx context.Context, cfg config.Config, s dom
 // honored again — so it is dropped here rather than lingering until its TTL and
 // keeping the agent out of the next pairing. A LIVE claim is only read.
 func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.AgentTransition, agentName string) *domain.DeclaredTask {
-	m, ok := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName)
+	m, ok, _ := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName)
 	if !ok {
 		return nil
 	}

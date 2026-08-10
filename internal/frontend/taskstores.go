@@ -16,10 +16,11 @@ import (
 // built from.
 //
 // Config itself is deliberately never cached (an operator edit must take effect
-// on the next read), but the REGISTRY must be, because a gist backend owns an
-// *http.Client whose Transport holds the connection pool — and the TUI reloads
-// config every two seconds. Rebuilding per read would open a fresh TLS
-// connection on every refresh.
+// on the next read). The REGISTRY is, because the TUI reloads config every two
+// seconds and rebuilding a backend per read churns allocations and per-backend
+// state for no reason. It is NOT what preserves connections: the gist store
+// leaves its client's Transport nil, so http.DefaultTransport's pool is shared
+// and survives a rebuild regardless.
 type taskStoreState struct {
 	mu       sync.Mutex
 	registry *taskstore.Registry
