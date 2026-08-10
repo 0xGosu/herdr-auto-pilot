@@ -1615,6 +1615,13 @@ func shortGistID(id string) string {
 const (
 	autoSendOnMessage = "auto-send when idle is ON: matching idle agents are handed their next pending task without an attention event"
 
+	// providerChangeMessage is printed whenever a source's storage moves. Kept
+	// beside its two siblings so the three cannot drift apart.
+	providerChangeMessage = "the existing list is NOT migrated: hap reads this source from the new " +
+		"store from now on, and the old copy is left exactly where it is. Copy the items across " +
+		"yourself before the next hand-out, or the agent will be handed whatever the new store " +
+		"already holds — possibly nothing."
+
 	llmReviewOnMessage = "LLM review before auto-send is ON: immediately before the daemon sends a task, " +
 		"the configured [llm].command may revise the list and pick which task goes. A review that fails " +
 		"or scores below auto_act_confidence_threshold sends the original task unchanged — it never " +
@@ -1627,7 +1634,7 @@ const (
 // and the cap; path/agent/workspace are remove-and-re-add, since changing them
 // silently re-points an agent's work.
 func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	const usage = "usage: task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks> <value> (see: task-source list, hap help task-source)"
+	const usage = "usage: task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: task-source list, hap help task-source)"
 	if len(args) != 3 {
 		return fmt.Errorf("%s", usage)
 	}
@@ -1687,6 +1694,48 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 			return err
 		}
 		fmt.Fprintf(out, "task source #%d: max_tasks=%d\n", idx, n)
+		return nil
+	case "provider":
+		// "inherit"/"" clears the override. Without a clearing spelling an
+		// override would be a one-way door: nothing else can put a source back
+		// to following [task_source_provider].
+		name := strings.ToLower(strings.TrimSpace(value))
+		if name == "inherit" {
+			name = ""
+		}
+		if name != "" && !slices.Contains(config.ValidTaskSourceProviders, name) {
+			return fmt.Errorf("provider must be one of %s, or \"inherit\" to follow the default, got %q",
+				strings.Join(config.ValidTaskSourceProviders, ", "), value)
+		}
+		converted, err := app.SetTaskSourceProvider(ctx, idx, expected, name)
+		if err != nil {
+			return err
+		}
+		switch {
+		case name == "":
+			eff := cfg.ResolveProvider(config.TaskSource{})
+			fmt.Fprintf(out, "task source #%d: provider now inherits the default (%s)\n", idx, eff.Name)
+		default:
+			fmt.Fprintf(out, "task source #%d: provider=%s\n", idx, name)
+		}
+		if converted != "" {
+			fmt.Fprintf(out, "path converted to store file %q (was %s)\n", converted, expected.Path)
+		}
+		fmt.Fprintln(out, providerChangeMessage)
+		return nil
+	case "gist-id", "gist_id":
+		id := strings.TrimSpace(value)
+		if strings.EqualFold(id, "inherit") {
+			id = ""
+		}
+		if err := app.SetTaskSourceGistID(ctx, idx, expected, id); err != nil {
+			return err
+		}
+		if id == "" {
+			fmt.Fprintf(out, "task source #%d: gist_id now inherits the default\n", idx)
+		} else {
+			fmt.Fprintf(out, "task source #%d: gist_id=%s\n", idx, shortGistID(id))
+		}
 		return nil
 	}
 	return fmt.Errorf("unknown task-source key %q\n%s", key, usage)

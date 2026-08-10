@@ -2690,6 +2690,53 @@ func (a *App) SetTaskSourceMaxTasks(ctx context.Context, index int, expected con
 	})
 }
 
+// SetTaskSourceProvider overrides (or, with an empty name, clears the override
+// on) where this source's list is stored, returning the file name a local path
+// was converted to — "" when nothing was converted.
+//
+// Moving a local source to a remote store converts its path with filepath.Base,
+// because a remote store takes a file NAME and ValidateTaskSource refuses a
+// path-shaped one. Doing it here rather than refusing is deliberate: the
+// alternative is remove-and-re-add, which loses max_tasks and both
+// delivery-gate flags. The conversion is printed by the caller, operator-
+// initiated, and reversible by setting the provider back — which does NOT
+// convert in reverse, because a bare "tasks.md" is a valid relative path and
+// guessing a directory would be worse than the resulting use-time error.
+func (a *App) SetTaskSourceProvider(ctx context.Context, index int, expected config.TaskSource,
+	name string) (converted string, err error) {
+
+	cfg, err := a.Config()
+	if err != nil {
+		return "", err
+	}
+	probe := expected
+	probe.Provider = name
+	if cfg.ResolveProvider(probe).Remote() && expected.Path != "" &&
+		config.ValidateStoreFileName(expected.Path) != nil {
+		converted = filepath.Base(expected.Path)
+	}
+	err = a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.Provider = name
+		if converted != "" {
+			src.Path = converted
+		}
+	})
+	if err != nil {
+		return "", err
+	}
+	return converted, nil
+}
+
+// SetTaskSourceGistID overrides (or, with an empty id, clears the override on)
+// which gist this source's list lives in.
+func (a *App) SetTaskSourceGistID(ctx context.Context, index int, expected config.TaskSource,
+	id string) error {
+
+	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.GistID = id
+	})
+}
+
 // SetThreshold updates one confidence threshold (FR-009) and reloads.
 func (a *App) SetThreshold(ctx context.Context, situation string, value float64) error {
 	if value <= 0 || value >= 1 {

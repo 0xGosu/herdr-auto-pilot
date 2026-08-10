@@ -4308,7 +4308,15 @@ func (m Model) agentTaskSourceMatches(a domain.AgentTransition) []int {
 			(agentName == "" || src.Agent != agentName) {
 			continue
 		}
-		if !domain.MatchWorkspace(src.Workspace, workspaceName) || src.Path == "" {
+		if !domain.MatchWorkspace(src.Workspace, workspaceName) {
+			continue
+		}
+		// An empty path means "unconfigured" only under local storage. Under a
+		// remote provider it is the ordinary one-list-per-matched-agent form,
+		// so skipping it here would hide every derived source from the Agents
+		// tab, the `t` jump, and the Tasks-tab annotations — the source would
+		// silently look like it did not exist.
+		if src.Path == "" && !m.data.cfg.ResolveProvider(src).Remote() {
 			continue
 		}
 		indices = append(indices, i)

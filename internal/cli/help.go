@@ -672,7 +672,7 @@ func buildCommands() {
 			Usage: []string{
 				"hap task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>]",
 				"hap task-source list",
-				"hap task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks> <value>",
+				"hap task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value>",
 				"hap task-source remove <index>",
 			},
 			Flags: []FlagDoc{
@@ -700,10 +700,12 @@ func buildCommands() {
 				"               agent gets its own \"<agent-name>.md\", created on first hand-out.\n" +
 				"`hap task <agent> …` works the same either way. `--path` on `hap task` always\n" +
 				"reads a LOCAL file, so address a remote list by the agent's name.\n" +
-				"`set` edits an existing source; only auto-send-when-idle,\n" +
-				"enable-llm-review-before-auto-send and max-tasks are editable — changing the\n" +
-				"path/agent/workspace is remove-and-re-add, since it silently re-points an\n" +
-				"agent's work.\n" +
+				"`set` edits an existing source: the two delivery gates, max-tasks, and where\n" +
+				"the list is stored (provider, gist-id — either takes \"inherit\" to go back to\n" +
+				"following the default). Changing the path/agent/workspace is remove-and-re-add,\n" +
+				"since it silently re-points an agent's work. Changing the PROVIDER does not\n" +
+				"migrate the list: hap reads the new store from then on and leaves the old copy\n" +
+				"where it is.\n" +
 				"enable-llm-review-before-auto-send composes with auto-send-when-idle: the\n" +
 				"hand-out decides THAT a task goes, the review decides which task and in what\n" +
 				"shape. Immediately before the daemon sends, the LLM may mark, drop, rewrite,\n" +
