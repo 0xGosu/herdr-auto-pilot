@@ -1469,6 +1469,12 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	if len(args) > 0 && args[0] == "set" {
 		return taskSourceSet(ctx, app, out, args[1:])
 	}
+	if len(args) > 0 && args[0] == "provider" {
+		if len(args) != 1 {
+			return fmt.Errorf("usage: task-source provider (read-only; set with `hap config set task_source_provider.…`)")
+		}
+		return taskSourceProvider(app, out)
+	}
 	if len(args) > 0 && args[0] == "remove" {
 		if len(args) != 2 {
 			return fmt.Errorf("usage: task-source remove <index> (see: task-source list)")
@@ -1627,6 +1633,71 @@ const (
 		"or scores below auto_act_confidence_threshold sends the original task unchanged — it never " +
 		"escalates. A task you send by hand is never reviewed."
 )
+
+// taskSourceProvider reports where task lists are stored. Read-only on purpose:
+// the values are written through the config registry (`hap config set
+// task_source_provider.…` and `hap task-source set <i> provider …`), and a
+// second write path would be a second validation to drift from.
+//
+// It exists because "is my token wired up?" has no other answer short of
+// reading config.toml and stat-ing the file by hand. It never prints the token,
+// and elides the gist id — a secret gist's URL is effectively a capability.
+func taskSourceProvider(app *frontend.App, out io.Writer) error {
+	cfg, err := app.Config()
+	if err != nil {
+		return err
+	}
+	def := cfg.ResolveProvider(config.TaskSource{})
+	fmt.Fprintf(out, "default provider: %s\n", def.Name)
+	if def.Remote() {
+		fmt.Fprintf(out, "default gist_id:  %s\n", shortGistID(def.GistID))
+		fmt.Fprintf(out, "env_file:         %s\n", describeEnvFile(def.EnvFile))
+	}
+
+	local, remote, overridden := 0, 0, 0
+	for _, src := range cfg.TaskSources {
+		if cfg.ResolveProvider(src).Remote() {
+			remote++
+		} else {
+			local++
+		}
+		if src.Provider != "" || src.GistID != "" {
+			overridden++
+		}
+	}
+	fmt.Fprintf(out, "sources:          %d (%d local, %d remote; %d with their own override)\n",
+		len(cfg.TaskSources), local, remote, overridden)
+
+	// Surface the reason it will not work, in the same words the daemon and
+	// every other surface use.
+	if def.Remote() {
+		if err := config.ValidateResolvedProvider(cfg, -1, config.TaskSource{}); err != nil {
+			fmt.Fprintf(out, "MISCONFIGURED:    %v\n", err)
+		}
+	}
+	fmt.Fprintf(out, "set default with: hap config set task_source_provider.provider <%s>\n",
+		strings.Join(config.ValidTaskSourceProviders, "|"))
+	fmt.Fprintln(out, "set per source:   hap task-source set <index> provider <name>")
+	return nil
+}
+
+// describeEnvFile reports whether the credential file resolves, WITHOUT reading
+// it: the path is not a secret, its contents are.
+func describeEnvFile(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return "(not set)"
+	}
+	expanded := config.ExpandPath(path)
+	info, err := os.Stat(expanded)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("%s (UNREADABLE: %v)", path, err)
+	case info.IsDir():
+		return fmt.Sprintf("%s (UNREADABLE: is a directory)", path)
+	default:
+		return path + " (configured, readable)"
+	}
+}
 
 // taskSourceSet edits one setting of an existing task source — the CLI twin of
 // the TUI Config tab's enter on a task-source row. Only the settings that are

@@ -307,6 +307,21 @@ type listGroup struct {
 func (d *Daemon) groupEligibleByList(src config.TaskSource,
 	eligible []domain.AgentTransition) []listGroup {
 
+	// Fast path: a source that names its own file resolves the SAME list for
+	// every agent, so resolve once and skip the per-agent name lookup entirely.
+	// That lookup is a store write (EnsureAgentName mints a row), and this runs
+	// on every sweep for every eligible agent — paying it when nothing depends
+	// on the answer would be a per-sweep cost for the default provider, which
+	// resolves identically for everyone.
+	if src.Path != "" {
+		res, err := d.resolveTaskSource(src, "")
+		if err != nil {
+			slog.Warn("auto-send: task source unresolvable", "error", err)
+			return nil
+		}
+		return []listGroup{{locator: res.Locator, agents: eligible}}
+	}
+
 	var order []string
 	byLocator := map[string][]domain.AgentTransition{}
 	for _, a := range eligible {

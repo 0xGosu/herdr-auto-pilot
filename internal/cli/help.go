@@ -672,6 +672,7 @@ func buildCommands() {
 			Usage: []string{
 				"hap task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>]",
 				"hap task-source list",
+				"hap task-source provider",
 				"hap task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value>",
 				"hap task-source remove <index>",
 			},
