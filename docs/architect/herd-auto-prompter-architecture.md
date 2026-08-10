@@ -50,10 +50,12 @@ These principles are load-bearing — every design decision below traces to one.
    action it cannot explain. *Every optional subsystem (semantic matching, LLM
    fallback, task generation) degrades rather than blocks.*
 6. **Local and private by default.** Learning data, history, and audit logs stay
-   on the operator's machine. No telemetry. Operator data leaves only through the
-   local LLM CLI the operator explicitly configures. The one other outbound call
-   is the opt-out GitHub release check (NFR-007, §13), which sends no data and
-   only reads the latest release tag.
+   on the operator's machine. No telemetry. Operator data leaves only through
+   two surfaces the operator explicitly configures: the local LLM CLI, and a
+   remote task-list storage provider, which carries the task text of the sources
+   using it and nothing else (the default provider keeps every checklist local).
+   The one other outbound call is the opt-out GitHub release check (NFR-007,
+   §13), which sends no data and only reads the latest release tag.
 7. **Reversible and interruptible.** A global pause/kill switch halts all
    automation instantly; irreversible operations are never automated.
 8. **Host-respecting integration.** Herdr owns the host surface; the plugin uses
@@ -806,6 +808,9 @@ ceilings — the escalation-dedup window and jitter are NOT configurable; they a
 fixed daemon constants), `safety` (never-auto patterns + rules, the global seed
 toggle, and `disabled_seed_patterns` for silencing one seed rule by id),
 classifier manifests, `capture_delay`, `task_sources` (+ generate command),
+`task_source_provider` (the DEFAULT task-list storage backend — provider enum,
+one shared credential `env_file`, per-provider subtables — which each
+`[[task_sources]]` entry may override with its own `provider`/`gist_id`),
 `embedding` (model_path, similarity/BM25 thresholds, context window, stall
 guards, `min_salient_chars`, `pane_salient_chars`, disabled — embedding is CPU-only; `gpu_layers` is
 warned-and-ignored), `llm` (argv templates + timeouts, per-command env/env_file,
@@ -931,10 +936,18 @@ Exactly two tools:
   index live in the plugin's config/state dir with normal user permissions; the
   control socket is owner-only; the operator can clear/reset learned and audit
   data (`hap clear-data`). A dedicated no-egress test (`internal/privacy`) asserts
-  NFR-007. It allows exactly ONE outbound call, by name: the release check
-  (`internal/updatecheck/fetch.go`), which asks GitHub for the newest published
-  version, sends nothing about the operator or their panes, and is switched off by
-  `[tui] disable_check_for_update`. The TUI drives it in the background at most
+  NFR-007. It allows exactly TWO outbound calls, both by name and both operator
+  opt-in: the release check (`internal/updatecheck/fetch.go`), which asks GitHub
+  for the newest published version, sends nothing about the operator or their
+  panes, and is switched off by `[tui] disable_check_for_update`; and the
+  `github_gist` task-list backend (`internal/taskstore/gist/gist.go`), which reads
+  and writes the checklists of the task sources configured for it — task text
+  only — in a gist the operator owns, with a token the operator supplies in
+  `[task_source_provider] env_file`. The default provider is `local_fs`, so an
+  install that never sets one makes neither call beyond the release check. The
+  no-egress test bans the GitHub SDK by its own import path as well as
+  `net/http`, because it checks DIRECT imports and an adapter naming only the SDK
+  would otherwise egress while passing. The TUI drives it in the background at most
   every 6h (a dev/`plugin link` build never checks at all); `hap update` performs
   it on demand, since the operator asked for the upgrade. Every other file
   importing `net/http` still fails the test, and a second test pins the allowlist
@@ -1057,7 +1070,7 @@ the sections they gate.
 | **NFR-005** | Auditability completeness | Represent 100% of automated decisions and escalations in the audit log (1:1 action-to-record ratio); no autonomous action without a corresponding record. |
 | **NFR-005a** | Allowlist corpus regression | Maintain and CI-regression-test the irreversible-op corpus so seed patterns match 100% of it; a corpus miss fails the build. |
 | **NFR-006** | LLM fallback timeout | Bound LLM consultation by a configurable timeout; on timeout / missing / unparseable output, fail safe and escalate. |
-| **NFR-007** | Privacy / no telemetry | Keep all data local; make no outbound calls beyond the Herdr socket, the configured local LLM CLI, and the opt-out GitHub release check (`internal/updatecheck`, version numbers only); emit no telemetry. |
+| **NFR-007** | Privacy / no telemetry | Keep all data local; make no outbound calls beyond the Herdr socket, the configured local LLM CLI, the opt-out GitHub release check (`internal/updatecheck`, version numbers only), and — only when the operator explicitly selects a remote task-list storage provider — that provider's API, carrying the task text of the sources configured for it and nothing else (no pane content, no learned rules, no audit history). The default posture is fully local: the default provider is `local_fs`. Emit no telemetry. |
 | **NFR-008** | Portability | Run on Linux and macOS, avoiding design that precludes a future Windows build. |
 | **NFR-009** | Control-mutation propagation | Reflect a control mutation (esp. pause/kill) issued from TUI/CLI in daemon behavior within a small bounded delay (target ≤ 1 s). |
 

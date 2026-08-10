@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"sort"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
+	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 )
 
 // Auto-send-when-idle (opt-in per [[task_sources]] via
@@ -141,9 +141,16 @@ func (d *Daemon) clearRedrive(agentID string) {
 }
 
 // autoSendIdleTasks is the per-sweep poll. It runs on the main loop over an
-// agent listing the sweep already fetched: everything it reads is either
-// in-memory or a small file read (opt.ReadTaskFile), and the actual pane work
-// happens later, off the loop, through scheduleCapture.
+// agent listing the sweep already fetched, and the actual pane work happens
+// later, off the loop, through scheduleCapture.
+//
+// Its reads are in-memory or cheap: a LOCAL source is a small file read, and a
+// REMOTE one is served from the snapshot cache rather than the network (see
+// taskcache.go). Its WRITES are not — reclaimStrandedTasks does one
+// read-modify-write per stranded row, inline, so against a remote store a
+// backlog of stranded rows costs a round trip each on this loop. Bounded by the
+// per-call deadline, but it is the reason this function is no longer "only
+// cheap reads".
 func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTransition) {
 	now := d.opt.Clock.Now()
 	d.noteIdleAgents(agents, now)
@@ -229,49 +236,115 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 		if len(eligible) == 0 {
 			continue
 		}
-		data, err := d.opt.ReadTaskFile(src.Path)
-		if err != nil {
-			slog.Warn("auto-send: task source unreadable", "path", src.Path, "error", err)
-			continue
-		}
-		pending := d.unclaimedPendingTasks(canonicalTaskPath(src.Path), string(data))
-		if len(pending) == 0 {
-			continue
-		}
-		for i, a := range eligible {
-			if i >= len(pending) {
-				// More idle agents than remaining work: the rest wait for the
-				// list to refill rather than share a task.
-				//
-				// Debug, not Info: this is a steady STATE, not an event, and the
-				// break below happens before noteRedrive — so these agents never
-				// enter the pollRedrive backoff and nothing ages them out. At
-				// Info it was one line per minute per source, forever, whenever
-				// idle agents outnumbered pending work.
-				slog.Debug("auto-send: no pending task left for idle agent",
-					"agent", a.AgentID, "source", src.Path)
-				break
+		// Resolve PER AGENT, not once per source: a source that declares no
+		// file derives one list per matched agent, so two eligible agents can
+		// legitimately resolve to two different lists. Agents that resolve to
+		// the SAME list are grouped, and the pairing below runs within a group
+		// — which is what still stops one task reaching two agents when they
+		// genuinely share a list.
+		for _, group := range d.groupEligibleByList(src, eligible) {
+			data, err := d.opt.ReadTaskFile(group.locator)
+			if err != nil {
+				slog.Warn("auto-send: task source unreadable",
+					"locator", group.locator, "error", err)
+				continue
 			}
-			d.claimAutoTask(a.AgentID, taskClaim{
-				sourcePath: canonicalTaskPath(src.Path), taskText: pending[i], at: now,
-			})
-			driven[a.AgentID] = true
-			// Claim the parked episode (as captureLiveAgent does) so the next
-			// reconcile does not queue a second, provenance-less capture behind
-			// this one. The pipeline itself never consults episodeHandled, so
-			// this only suppresses the duplicate.
-			d.mu.Lock()
-			d.episodeHandled[a.PaneID] = true
-			d.mu.Unlock()
-			tr := a
-			tr.AutoIdleSend = true
-			tr.At = now
-			d.noteRedrive(a.AgentID, now)
-			slog.Info("auto-send: re-driving idle agent with its next declared task",
-				"agent", a.AgentID, "pane", a.PaneID, "status", a.Status, "source", src.Path)
-			d.scheduleCapture(ctx, tr)
+			pending := d.unclaimedPendingTasks(canonicalTaskPath(group.locator), string(data))
+			if len(pending) == 0 {
+				continue
+			}
+			for i, a := range group.agents {
+				if i >= len(pending) {
+					// More idle agents than remaining work: the rest wait for
+					// the list to refill rather than share a task.
+					//
+					// Debug, not Info: this is a steady STATE, not an event, and
+					// the break below happens before noteRedrive — so these
+					// agents never enter the pollRedrive backoff and nothing ages
+					// them out. At Info it was one line per minute per source,
+					// forever, whenever idle agents outnumbered pending work.
+					slog.Debug("auto-send: no pending task left for idle agent",
+						"agent", a.AgentID, "source", group.locator)
+					break
+				}
+				d.claimAutoTask(a.AgentID, taskClaim{
+					sourcePath: canonicalTaskPath(group.locator), taskText: pending[i], at: now,
+				})
+				driven[a.AgentID] = true
+				// Claim the parked episode (as captureLiveAgent does) so the
+				// next reconcile does not queue a second, provenance-less
+				// capture behind this one. The pipeline itself never consults
+				// episodeHandled, so this only suppresses the duplicate.
+				d.mu.Lock()
+				d.episodeHandled[a.PaneID] = true
+				d.mu.Unlock()
+				tr := a
+				tr.AutoIdleSend = true
+				tr.At = now
+				d.noteRedrive(a.AgentID, now)
+				slog.Info("auto-send: re-driving idle agent with its next declared task",
+					"agent", a.AgentID, "pane", a.PaneID, "status", a.Status,
+					"source", group.locator)
+				d.scheduleCapture(ctx, tr)
+			}
 		}
 	}
+}
+
+// listGroup is the eligible agents that share one resolved task list.
+type listGroup struct {
+	locator string
+	agents  []domain.AgentTransition
+}
+
+// groupEligibleByList resolves each eligible agent's list and groups the agents
+// that share one, preserving the caller's agent order within each group (the
+// pairing below is positional, so a stable order keeps a sweep deterministic).
+//
+// An agent whose list cannot be resolved is dropped with a warning rather than
+// silently skipped as "no work": a misconfigured provider must read as an
+// unusable SOURCE, never as an absent one.
+func (d *Daemon) groupEligibleByList(src config.TaskSource,
+	eligible []domain.AgentTransition) []listGroup {
+
+	// Fast path: a source that names its own file resolves the SAME list for
+	// every agent, so resolve once and skip the per-agent name lookup entirely.
+	// That lookup is a store write (EnsureAgentName mints a row), and this runs
+	// on every sweep for every eligible agent — paying it when nothing depends
+	// on the answer would be a per-sweep cost for the default provider, which
+	// resolves identically for everyone.
+	if src.Path != "" {
+		res, err := d.resolveTaskSource(src, "")
+		if err != nil {
+			slog.Warn("auto-send: task source unresolvable", "error", err)
+			return nil
+		}
+		return []listGroup{{locator: res.Locator, agents: eligible}}
+	}
+
+	var order []string
+	byLocator := map[string][]domain.AgentTransition{}
+	for _, a := range eligible {
+		name, err := d.opt.Store.EnsureAgentName(context.Background(), a.AgentID)
+		if err != nil {
+			name = ""
+		}
+		res, err := d.resolveTaskSource(src, name)
+		if err != nil {
+			slog.Warn("auto-send: task source unresolvable for agent",
+				"agent", a.AgentID, "error", err)
+			continue
+		}
+		if _, seen := byLocator[res.Locator]; !seen {
+			order = append(order, res.Locator)
+		}
+		byLocator[res.Locator] = append(byLocator[res.Locator], a)
+	}
+	groups := make([]listGroup, 0, len(order))
+	for _, loc := range order {
+		groups = append(groups, listGroup{locator: loc, agents: byLocator[loc]})
+	}
+	return groups
 }
 
 // reclaimStrandedTasks is what makes each sweep decide from CURRENT state
@@ -408,6 +481,22 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 			d.escalateNeverStartedTask(ctx, r, live[r.AgentID], attempts, now)
 			continue
 		}
+		// Over a REMOTE store this release is a read AND a write, and the loop
+		// would pay both per row, serially. Hand it to a goroutine and settle
+		// the row when its outcome comes back (handleTaskReclaimOutcome). The
+		// agent is held awaiting for THIS sweep because its row is still open —
+		// the same state every other "leave it alone" branch leaves it in — so
+		// the release simply completes a sweep later, never differently.
+		if d.asyncTaskWriteback(r.SourcePath) {
+			if d.releaseStrandedAsync(ctx, r, live[r.AgentID]) {
+				awaiting[r.AgentID] = true
+				continue
+			}
+			// Shutting down: nothing was scheduled, so leave the row for a
+			// future daemon rather than releasing it inline on the way out.
+			awaiting[r.AgentID] = true
+			continue
+		}
 		if err := d.opt.MutateTaskFile(r.SourcePath, taskfile.Reclaim(r.ItemIndex, r.TaskText)); err != nil {
 			slog.Warn("auto-send: stranded task could not be returned to [ ]",
 				"path", r.SourcePath, "task", r.TaskText, "error", err)
@@ -522,7 +611,7 @@ func (d *Daemon) escalateNeverStartedTask(ctx context.Context, r domain.TaskRese
 func (d *Daemon) escalateUndeliverableTask(ctx context.Context, s domain.Situation,
 	del delivery, attempts int, now time.Time) bool {
 
-	sourcePath := canonicalTaskPath(del.declared.Path)
+	sourcePath := canonicalTaskPath(del.declared.Locator)
 	// The audit row goes FIRST. Clearing the counter before it is recorded would,
 	// on a write failure, leave the item "[-]" with the ceiling forgotten and
 	// nothing on record — invisible in `hap escalations` and unreachable by any
@@ -595,22 +684,21 @@ func inProgressTask(content, taskText string) bool {
 	return false
 }
 
-// canonicalTaskPath resolves a task-source path to the one key that identifies
-// the physical file (~ and $VAR expanded, then absolute, symlinks resolved —
-// the same normalization taskfile.LockPath applies). Claims are compared by
-// path, and two [[task_sources]] entries can spell the same file differently
-// (including one as `~/tasks.md` and another as its absolute form); without
-// this they would look like different sources and could promise one line to two
-// agents in a single sweep.
-func canonicalTaskPath(path string) string {
-	path = config.ExpandPath(path)
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
-	}
-	return path
+// canonicalTaskPath resolves a task-list locator to the one key that identifies
+// it. Claims are compared by this key, and two [[task_sources]] entries can
+// spell the same list differently (including one as `~/tasks.md` and another as
+// its absolute form); without this they would look like different sources and
+// could promise one line to two agents in a single sweep.
+//
+// It delegates to tasklocator.Canonical, which is the SAME function
+// taskfile.LockPath and the TUI's grouping use. That sharing is load-bearing
+// rather than tidy: a locator carrying a scheme (gist://…) must be returned
+// verbatim, and filepath.Abs does not fail on one — it silently returns
+// "<cwd>/gist:/id/f.md", differently in every process. Two copies of this
+// normalization with only one of them branching would have the daemon's claims
+// and the TUI's grouping disagree, with nothing erroring.
+func canonicalTaskPath(locator string) string {
+	return tasklocator.Canonical(locator)
 }
 
 // autoSendParked is the positive allowlist of statuses that may be handed
@@ -848,7 +936,7 @@ func (d *Daemon) reserveDeclaredTask(declared *domain.DeclaredTask, taskText str
 	if declared == nil || !declared.Reserve || taskText == "" || taskText == domain.NoTaskContent {
 		return func() {}, 0, nil
 	}
-	path := declared.Path
+	path := declared.Locator
 	mutate, claimed := taskfile.ReserveFirstPending(taskText)
 	if err := d.opt.MutateTaskFile(path, mutate); err != nil {
 		return nil, 0, fmt.Errorf("reserving the task in %s: %w", path, err)

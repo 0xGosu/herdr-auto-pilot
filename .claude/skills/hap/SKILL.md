@@ -476,7 +476,7 @@ per-command env notes: layering is daemon env → `env_file` → `env` → the c
 
 TUI palette colors — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. set with `hap config set tui.palette.<role> <color>`; values are 256-color codes (`"205"`, 0-255) or hex (`"#ff5faf"`, `#rgb` or `#rrggbb`), and `""` clears a role back to the theme. anything else is rejected — lipgloss resolves an unrecognized color to NO color at all. hidden from the TUI config tab (eight colors would bury the settings you reach for), so `hap config fields` is where you read their current values.
 
-some settings are table-valued and live in `config.toml` only (not settable via `hap config set`): `[[capture_delay]]`, `[[task_sources]]`, `[[classifier]]`, `[[safety.never_auto_rules]]`, `safety.disabled_seed_patterns` (the list `hap rules disable-seed` writes), and the inline `[llm.*_env]` tables (only the `*_env_file` PATHS are settable — the tables hold secrets). `[tui.palette]` is NOT in this list: its roles are individually settable, see above.
+some settings are table-valued and live in `config.toml` only (not settable via `hap config set`): `[[capture_delay]]`, `[[task_sources]]`, `[[classifier]]`, `[[safety.never_auto_rules]]`, `safety.disabled_seed_patterns` (the list `hap rules disable-seed` writes), and the inline `[llm.*_env]` tables (only the `*_env_file` PATHS are settable — the tables hold secrets). `[tui.palette]` is NOT in this list: its roles are individually settable, see above. neither is `[task_source_provider]`: its keys ARE settable — `task_source_provider.provider`, `.env_file`, `.timeout_seconds`, `.refresh_seconds`, `.github_gist.gist_id` (see task sources). the PER-SOURCE overrides of those, on a `[[task_sources]]` entry, go through `hap task-source set <index> …` like the entry's other settings.
 
 **capture delay** — the classification pane read waits a per-agent delay so the agent TUI has painted and event bursts coalesce. defaults: 10000ms (10s) on an agent's first event, 2000ms after. override per agent type:
 
@@ -598,6 +598,44 @@ hap task-source remove <index>
 this removes the `[[task_sources]]` entry only — the checklist file is left on
 disk. it is unguarded and unconfirmed: it removes the entry even while a live
 agent is mid-task on it, which makes it the force path.
+
+### where task lists are stored
+
+by default a checklist is a file on this machine. `[task_source_provider]` sets
+the DEFAULT storage for every source, and each `[[task_sources]]` entry may
+override it — so some agents can be local and others in a gist at once:
+
+```bash
+hap config set task_source_provider.provider github_gist
+hap config set task_source_provider.github_gist.gist_id 3f2a1b9c4d5e6f708192a3b4c5d6e7f8
+hap config set task_source_provider.env_file ~/.config/hap/task_source.env
+
+hap task-source set 0 provider local_fs     # this ONE source stays on disk
+hap task-source set 0 provider inherit      # …and back to following the default
+hap task-source set 1 gist-id aa11bb22      # this ONE source uses another gist
+```
+
+show what is in force (never prints the token):
+
+```bash
+hap task-source provider
+```
+
+a source that sets no `provider` keeps INHERITING the default, so changing the
+default moves it. hap never writes the inherited value into the entry.
+
+under `github_gist`, a source's `path` is a file name INSIDE the gist, not a
+filesystem path. set it and every agent the source matches shares one list;
+leave it out and each matched agent gets its own `<agent-name>.md`, created on
+first hand-out. `hap task-source add --provider github_gist --agent brave-otter`
+(no path) creates that form.
+
+hap never creates the gist — make a secret gist on github.com and paste its hex
+id. the token lives in the file `env_file` names (`GITHUB_TOKEN=…`, `gist`
+scope, mode 0600), is read at use time, and is never written to `config.toml`.
+
+`hap task <agent> …` works the same either way. `--path` always reads a LOCAL
+file, so use the agent name for a remote list.
 
 ### auto-send tasks to idle agents
 

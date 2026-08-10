@@ -29,7 +29,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/match"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
-	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
+	"github.com/0xGosu/herdr-auto-pilot/internal/taskstore"
 	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
 
@@ -70,13 +70,22 @@ type Options struct {
 	// (daemonhealth). Empty disables health writing (tests that don't care).
 	StateDir string
 	Clock    ports.Clock
-	// ReadTaskFile reads a declared task-source file (os.ReadFile in prod).
-	ReadTaskFile func(path string) ([]byte, error)
-	// MutateTaskFile applies one locked read-modify-write to a declared
-	// task-source file (taskfile.Mutate in prod). The daemon only writes a task
-	// file on the auto-send-when-idle path, where the delivered item must be
-	// reserved "[-]" so it is never handed to a second agent.
-	MutateTaskFile func(path string, fn func(content string) (string, error)) error
+	// ReadTaskFile reads a declared task source's checklist, addressed by its
+	// LOCATOR — a canonical filesystem path, or a scheme'd string like
+	// "gist://<id>/<file>". In prod it dispatches through TaskStoreFactory's
+	// registry on the locator's scheme.
+	ReadTaskFile func(locator string) ([]byte, error)
+	// MutateTaskFile applies one locked read-modify-write to a declared task
+	// source's checklist. The daemon only writes on the auto-send-when-idle
+	// path, where the delivered item must be reserved "[-]" so it is never
+	// handed to a second agent.
+	MutateTaskFile func(locator string, fn func(content string) (string, error)) error
+	// TaskStoreFactory rebuilds the task-store registry from freshly loaded
+	// config whenever [task_source_provider] or a source's own provider
+	// changes, mirroring LLMFactory/EmbedderFactory. Registry construction does
+	// no I/O, so a reload can swap it atomically without ever holding a
+	// half-built one.
+	TaskStoreFactory func(cfg config.Config) *taskstore.Registry
 	// PaneReadLines is how much recent pane content classification sees.
 	PaneReadLines int
 	// ResolveSelf returns the path of a live hap binary (selfpath.Resolve in
@@ -125,6 +134,25 @@ type Daemon struct {
 	matcher       *match.Matcher
 	semanticReady atomic.Bool
 	semanticGen   atomic.Int64
+
+	// taskSnapshots caches REMOTE task lists so the main select loop never
+	// waits on a network read (see taskcache.go). A local store is never
+	// cached — it reads through exactly as it always has.
+	taskSnapshots map[string]taskSnapshot
+
+	// taskReclaimResults carries an off-loop stranded-task release back to the
+	// loop, where its ledger row, claim and audit row are settled.
+	taskReclaimResults chan taskReclaimOutcome
+
+	// testTaskStore overrides backend resolution. Only tests set it, so the
+	// cache can be exercised against a fake without standing up a registry and
+	// a config; production always goes through d.stores.
+	testTaskStore func(locator string) (ports.TaskStore, error)
+
+	// stores resolves a task source to the backend serving its checklist.
+	// Swapped wholesale on reload (guarded by mu, like cfg/llm/classifier)
+	// so a provider change takes effect without restarting the daemon.
+	stores *taskstore.Registry
 
 	transitions           chan domain.AgentTransition
 	nudges                chan control.Kind
@@ -429,24 +457,12 @@ func New(opt Options) (*Daemon, error) {
 	if opt.Clock == nil {
 		opt.Clock = ports.SystemClock{}
 	}
-	if opt.ReadTaskFile == nil {
-		// Expand ~/$VAR so a task_sources.path written with either shorthand
-		// reaches the same physical file canonicalTaskPath keys it by. Reads
-		// bypass the taskfile package (which expands its own writes/locks), so
-		// the wrapper is needed here; MutateTaskFile below goes through
-		// taskfile.MutateWithin, which expands, so it does not.
-		opt.ReadTaskFile = func(path string) ([]byte, error) {
-			return os.ReadFile(config.ExpandPath(path))
-		}
+	if opt.TaskStoreFactory == nil {
+		opt.TaskStoreFactory = taskstore.NewRegistry
 	}
-	if opt.MutateTaskFile == nil {
-		opt.MutateTaskFile = func(path string, fn func(string) (string, error)) error {
-			// Bounded: this runs on the main select loop, so waiting behind
-			// another hap process's file lock must never stall every agent.
-			_, err := taskfile.MutateWithin(path, taskLockWait, fn)
-			return err
-		}
-	}
+	// The two seams below are kept as func fields because tests inject them.
+	// Their production implementations close over `d`, so they are assigned
+	// after the Daemon exists (see the wiring just below its construction).
 	if opt.PaneReadLines <= 0 {
 		opt.PaneReadLines = 50
 	}
@@ -455,6 +471,8 @@ func New(opt Options) (*Daemon, error) {
 	}
 	d := &Daemon{
 		opt:                       opt,
+		taskSnapshots:             map[string]taskSnapshot{},
+		taskReclaimResults:        make(chan taskReclaimOutcome, 32),
 		verifyUnblockDelay:        unblockCheckDelay,
 		transitions:               make(chan domain.AgentTransition, 256),
 		nudges:                    make(chan control.Kind, 16),
@@ -496,11 +514,122 @@ func New(opt Options) (*Daemon, error) {
 	if opt.MatchIndexDir != "" {
 		d.matcher = match.New(opt.MatchIndexDir)
 	}
+	// Assigned here rather than above because the production implementations
+	// need the Daemon: they dispatch on the locator through the registry that
+	// reload() installs, so a provider change takes effect without a restart.
+	// Both remain injectable — a test that set them keeps its own.
+	if d.opt.ReadTaskFile == nil {
+		d.opt.ReadTaskFile = d.readTaskList
+	}
+	if d.opt.MutateTaskFile == nil {
+		d.opt.MutateTaskFile = d.mutateTaskList
+	}
 	if err := d.reload(); err != nil {
 		d.cancelShutdown()
 		return nil, err
 	}
 	return d, nil
+}
+
+// taskStore resolves the backend serving a locator, dispatching on the
+// locator's SCHEME rather than on any source's configured provider — see
+// Registry.ForLocator for why a ledger row written under an older provider must
+// still reach the backend that owns it.
+func (d *Daemon) taskStore(locator string) (ports.TaskStore, error) {
+	d.mu.Lock()
+	stores, override := d.stores, d.testTaskStore
+	d.mu.Unlock()
+	if override != nil {
+		return override(locator)
+	}
+	if stores == nil {
+		return nil, fmt.Errorf("task store registry is not configured")
+	}
+	return stores.ForLocator(locator)
+}
+
+// taskStoreTimeout is the per-call backend deadline from current config.
+func (d *Daemon) taskStoreTimeout() time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cfg.TaskSourceProvider.TaskStoreTimeout()
+}
+
+// taskCallCtx bounds one backend READ. A local call has no deadline worth
+// wiring; a remote one is additionally bounded by the HTTP client's own
+// timeout, so this is a backstop rather than the only guard.
+func (d *Daemon) taskCallCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(d.shutdownCtx, d.taskStoreTimeout())
+}
+
+// taskMutateCtx bounds one whole read-modify-write, which is a different budget
+// from a read and must not be confused with one.
+//
+// It has to cover THREE things, not one: the wait for another process's
+// advisory lock (which taskfile's flock loop takes without any context
+// awareness), then the store's read, then its write. Budgeting a single
+// timeout for all of it is self-defeating — under exactly the contention the
+// widened lock wait exists for, the lock would be acquired near the deadline
+// and the read would then fail instantly with "context deadline exceeded",
+// making the mutation guaranteed to fail precisely when it mattered.
+func (d *Daemon) taskMutateCtx(lockWait time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(d.shutdownCtx, lockWait+2*d.taskStoreTimeout())
+}
+
+// readTaskList is the production ReadTaskFile.
+//
+// A REMOTE list is served from the snapshot cache and refreshed off the loop; a
+// local one reads through, byte for byte as before. Gating on the store's own
+// declaration rather than on config is what keeps the default provider — and
+// its entire test suite — untouched.
+func (d *Daemon) readTaskList(locator string) ([]byte, error) {
+	store, err := d.taskStore(locator)
+	if err != nil {
+		return nil, err
+	}
+	if ports.TaskStoreRemote(store) {
+		return d.cachedTaskList(locator)
+	}
+	ctx, cancel := d.taskCallCtx()
+	defer cancel()
+	return store.Read(ctx, locator)
+}
+
+// mutateTaskList is the production MutateTaskFile.
+//
+// The lock wait widens for a REMOTE store. taskLockWait is 2s because this ran
+// on the main select loop over a local file; a sibling hap process holding the
+// lock across a gist read-modify-write holds it for two round trips, so keeping
+// 2s there would routinely lose the lock and skip a legitimate hand-out — a
+// silent throughput loss that looks like nothing happening.
+func (d *Daemon) mutateTaskList(locator string, fn func(string) (string, error)) error {
+	store, err := d.taskStore(locator)
+	if err != nil {
+		return err
+	}
+	wait := taskLockWait
+	if ports.TaskStoreRemote(store) {
+		if remote := 2 * d.taskStoreTimeout(); remote > wait {
+			wait = remote
+		}
+	}
+	ctx, cancel := d.taskMutateCtx(wait)
+	defer cancel()
+	// Capture what the mutator produced so the snapshot can be replaced with
+	// it: Mutate read that content inside the lock, so there is no staleness
+	// after a write and no second round trip.
+	var written []byte
+	_, err = store.Mutate(ctx, locator, wait, func(content string) (string, error) {
+		out, mErr := fn(content)
+		if mErr == nil {
+			written = []byte(out)
+		}
+		return out, mErr
+	})
+	if ports.TaskStoreRemote(store) {
+		d.noteTaskListWritten(locator, written, err)
+	}
+	return err
 }
 
 // spawn runs fn on a tracked background goroutine so shutdownBackground can
@@ -628,6 +757,10 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	if d.opt.LLMFactory != nil {
 		llmPort = d.opt.LLMFactory(cfg)
 	}
+	// Built BEFORE the lock and swapped inside it: registry construction does
+	// no I/O and cannot fail, so there is never a half-built one to reason
+	// about, and a reload that gets this far always has a usable store.
+	stores := d.opt.TaskStoreFactory(cfg)
 
 	d.mu.Lock()
 	prev, first := d.cfg, !d.configured
@@ -636,6 +769,10 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	d.neverAuto = allow
 	d.classifier = cls
 	d.llm = llmPort
+	d.stores = stores
+	// A provider or credential change can point the same locator at different
+	// content, so nothing cached under the old registry may outlive it.
+	d.taskSnapshots = map[string]taskSnapshot{}
 	d.mu.Unlock()
 
 	d.reloadEmbedder(prev, cfg, first || forceEmbedder)
@@ -1004,6 +1141,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.reconcileAttention(ctx)
 				return nil
 			})
+		case res := <-d.taskReclaimResults:
+			d.handleTaskReclaimOutcome(ctx, res)
 		case res := <-d.llmResults:
 			logging.Guard("llm-result", func() error {
 				d.handleLLMOutcome(ctx, res)
@@ -1704,6 +1843,23 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		// REAL pending task: declared != nil here means a task source matched
 		// but its checklist is exhausted (Task == NoTaskContent), not that
 		// none was ever declared.
+		//
+		// But "no declared task" has two very different causes, and only one of
+		// them licenses inventing work. A source may own this agent and simply
+		// be unreadable right now — a briefly unreachable provider, a bad
+		// credential, a snapshot not yet warm after a reload. Generating then
+		// would write invented tasks for an agent whose real list is full of
+		// pending work, which is the opposite of what the operator asked for.
+		// Escalate instead: the operator can see the source is broken.
+		if declared == nil {
+			if _, _, unusable := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType,
+				tr.WorkspaceID, agentName); unusable {
+				slog.Warn("task source is configured but unusable; escalating instead of generating tasks",
+					"agent", situation.AgentID)
+				d.escalate(ctx, situation, sig, decision, tr, now)
+				return
+			}
+		}
 		d.generateTask(ctx, cfg, situation, sig, tr, now, declared != nil)
 	default:
 		d.escalate(ctx, situation, sig, decision, tr, now)
@@ -2158,7 +2314,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		capped := false
 		if reservedIndex > 0 && del.declared != nil {
 			attempts, err := d.opt.Store.RecordTaskHandoutAttempt(ctx,
-				canonicalTaskPath(del.declared.Path), del.taskText, now)
+				canonicalTaskPath(del.declared.Locator), del.taskText, now)
 			switch {
 			case err != nil:
 				// Uncounted: roll back and let it be re-offered. Losing the
@@ -2197,7 +2353,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 	// above — which rolls the item back itself — never leaves a row behind.
 	if reservedIndex > 0 {
 		if _, err := d.opt.Store.RecordTaskReservation(ctx, domain.TaskReservation{
-			SourcePath: canonicalTaskPath(del.declared.Path), TaskText: del.taskText,
+			SourcePath: canonicalTaskPath(del.declared.Locator), TaskText: del.taskText,
 			ItemIndex: reservedIndex,
 			AgentID:   s.AgentID, PaneID: s.PaneID, TerminalID: s.TerminalID,
 			AuditID: auditID, ReservedAt: now,
@@ -2733,14 +2889,14 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 		// confirm-time append): appending even one generated task to a list
 		// already holding max_tasks items would exceed the cap, so generating
 		// would only raise escalations every confirm must refuse.
-		if m, ok := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName); ok {
+		if m, ok, _ := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName); ok {
 			if n, limit := len(domain.ParseChecklist(string(m.data))), m.src.MaxTasksLimit(); n >= limit {
 				name := agentName
 				if name == "" {
 					name = s.AgentID
 				}
 				slog.Warn("maximum number of tasks reached — clean up the task list to make room for new tasks; skipping task generation",
-					"agent", name, "tasks", n, "max_tasks", limit, "path", m.src.Path)
+					"agent", name, "tasks", n, "max_tasks", limit, "locator", m.locator)
 				return
 			}
 		}
@@ -4603,8 +4759,18 @@ func (d *Daemon) registerHumanInteraction(ctx context.Context, agentID string) {
 // (which builds the outbound prompt) and taskSourceSummary (which only needs
 // the winning path + pending items for get_context).
 type taskSourceMatch struct {
-	src  config.TaskSource
-	data []byte
+	src config.TaskSource
+	// locator identifies THIS agent's list for the source. A source that
+	// declares no file derives one per matched agent, so the same entry can
+	// resolve differently for two agents.
+	locator string
+	// display is what {task_list_path} renders — a path locally, a URL
+	// remotely. Never used for I/O.
+	display string
+	// remote reports that the list is not on this machine, which selects the
+	// next-task template that omits the --path fallback.
+	remote bool
+	data   []byte
 }
 
 // matchTaskSource walks cfg.TaskSources for a source matching the given
@@ -4637,30 +4803,47 @@ func (d *Daemon) sourceSelectsAgent(ctx context.Context, src config.TaskSource,
 	return domain.MatchWorkspace(src.Workspace, target)
 }
 
-func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID, agentType, workspaceID, agentName string) (taskSourceMatch, bool) {
+// matchTaskSource returns the source serving this agent. The third result
+// reports that a source SELECTED this agent but could not be resolved or read,
+// which callers must not confuse with "this agent has no task source" — the
+// latter is what licenses inventing one.
+func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID, agentType, workspaceID, agentName string) (taskSourceMatch, bool, bool) {
 	var completed *taskSourceMatch
+	unusable := false
 	for _, src := range cfg.TaskSources {
 		if !d.sourceSelectsAgent(ctx, src, agentID, agentType, workspaceID, agentName) {
 			continue
 		}
-		data, err := d.opt.ReadTaskFile(src.Path)
+		res, err := d.resolveTaskSource(src, agentName)
 		if err != nil {
-			slog.Warn("task source unreadable", "path", src.Path, "error", err)
+			// Recorded as an UNUSABLE source, never as "no source matched".
+			// The difference is load-bearing: "no source" falls through to LLM
+			// task generation, so a misconfigured or briefly unreachable
+			// provider would have hap INVENTING tasks for an agent whose real
+			// list is full of pending work.
+			slog.Warn("task source unresolvable", "agent", agentID, "error", err)
+			unusable = true
+			continue
+		}
+		data, err := d.opt.ReadTaskFile(res.Locator)
+		if err != nil {
+			slog.Warn("task source unreadable", "locator", res.Locator, "error", err)
+			unusable = true
 			continue
 		}
 		if domain.NextDeclaredTask(string(data)) != "" {
-			return taskSourceMatch{src: src, data: data}, true
+			return taskSourceMatch{src: src, locator: res.Locator, display: res.Display, remote: res.Remote, data: data}, true, false
 		}
 		// Only a real checklist with every item checked counts as completed;
 		// an empty or non-checklist file must not suppress tier-2 inference.
 		if completed == nil && domain.HasChecklistItems(string(data)) {
-			completed = &taskSourceMatch{src: src, data: data}
+			completed = &taskSourceMatch{src: src, locator: res.Locator, display: res.Display, remote: res.Remote, data: data}
 		}
 	}
 	if completed != nil {
-		return *completed, true
+		return *completed, true, false
 	}
-	return taskSourceMatch{}, false
+	return taskSourceMatch{}, false, unusable
 }
 
 // taskSummaryMaxRunes bounds the get_context preview of the next pending or
@@ -4691,14 +4874,14 @@ func taskPreview(items []string) string {
 // taskSourceSummary reports the get_context task_source surface for the
 // given agent/workspace.
 func (d *Daemon) taskSourceSummary(ctx context.Context, cfg config.Config, s domain.Situation, workspaceID, agentName string) (taskSourceSummaryFields, bool) {
-	m, ok := d.matchTaskSource(ctx, cfg, s.AgentID, s.AgentType, workspaceID, agentName)
+	m, ok, _ := d.matchTaskSource(ctx, cfg, s.AgentID, s.AgentType, workspaceID, agentName)
 	if !ok {
 		return taskSourceSummaryFields{}, false
 	}
 	pending := domain.PendingDeclaredTasks(string(m.data))
 	inProgress := domain.InProgressDeclaredTasks(string(m.data))
 	return taskSourceSummaryFields{
-		path:            m.src.Path,
+		path:            m.display,
 		pendingCount:    len(pending),
 		nextPending:     taskPreview(pending),
 		inProgressCount: len(inProgress),
@@ -4722,7 +4905,7 @@ func (d *Daemon) taskSourceSummary(ctx context.Context, cfg config.Config, s dom
 // honored again — so it is dropped here rather than lingering until its TTL and
 // keeping the agent out of the next pairing. A LIVE claim is only read.
 func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.AgentTransition, agentName string) *domain.DeclaredTask {
-	m, ok := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName)
+	m, ok, _ := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType, tr.WorkspaceID, agentName)
 	if !ok {
 		return nil
 	}
@@ -4731,7 +4914,7 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 	// (a sibling agent was given the first one in the same sweep). Honor that
 	// pairing when the claimed item is still pending in the matched source;
 	// otherwise the claim is stale — drop it and resolve normally.
-	if claim, ok := d.autoTaskClaimFor(tr.AgentID); ok && claim.sourcePath == canonicalTaskPath(m.src.Path) {
+	if claim, ok := d.autoTaskClaimFor(tr.AgentID); ok && claim.sourcePath == canonicalTaskPath(m.locator) {
 		if slices.Contains(domain.PendingDeclaredTasks(string(m.data)), claim.taskText) {
 			task = claim.taskText
 		} else {
@@ -4751,7 +4934,11 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 		cwd = d.paneCwd(ctx, tr.PaneID)
 	}
 	return &domain.DeclaredTask{
-		Task: task, Path: m.src.Path, Template: m.src.NextTaskTemplate,
+		// Path is the DISPLAY address ({task_list_path}); Locator is what every
+		// read, mutation, lock and ledger row keys on. Under a remote provider
+		// they differ — the display is a URL, the locator a gist:// string.
+		Task: task, Path: m.display, Locator: m.locator, Remote: m.remote,
+		Template:  m.src.NextTaskTemplate,
 		AgentName: agentName, Cwd: cwd,
 		// Fold the task's nested sub-items into the delivered content while
 		// Task stays the single-line reservation identity. A flat file (no

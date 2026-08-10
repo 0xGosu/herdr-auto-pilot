@@ -296,6 +296,32 @@ whose manifest carries exactly that version).
   trap / `…UndeliverableTaskIsCappedNotRetriedForever` / `…CapsAtExactlyMaxHandouts` /
   `…CappedTaskLetsTheAgentMoveToTheNextItem` / `…EscalatedAgentStillGetsItsNextTask` /
   `…BacksOffRedrivingAnAgentThatNeverSends` / `TestTaskReviewFailedSendCountsTheHandoutAndRollsBack`).
+- **An inherited task-source provider is a live link, never a snapshot** — `[task_source_provider]`
+  is the DEFAULT storage backend and each `[[task_sources]]` entry may override it with its own
+  `provider`/`gist_id`. An empty per-source key IS the inheritance and must NEVER be materialized:
+  `normalizeTaskSources` runs on **Load AND Save**, so filling it in "like we do for `max_tasks`"
+  would stamp the current default onto every existing source the first time any surface writes
+  config — and the operator's later `hap config set task_source_provider.provider …` would then
+  move nothing, silently, for every install that already had a config. It fails no obvious test;
+  `TestInheritedProviderIsNeverMaterialized` is the one that catches it. Provider misconfiguration
+  is detected at USE time (`ValidateResolvedProvider`), never at `Load`, and never coerced —
+  coercing an unrecognized provider to `local_fs` would resolve gist-shaped names against the
+  daemon's cwd and CREATE local checklist files while the operator believed their lists were
+  remote. A missing `gist_id` is deliberately not a write-time rule either: it would make the keys
+  order-dependent to set (`TestValidateTaskSourceAcceptsAMissingGistID` pins the omission).
+- **A task-list locator is canonicalized in exactly one place** — `tasklocator.Canonical`, which
+  `taskfile.LockPath` and both `canonicalTaskPath` copies delegate to. A scheme'd locator
+  (`gist://…`) is returned verbatim, and the hazard of a second copy forgetting that is SILENT:
+  `filepath.Abs` does not fail on one, it returns `<cwd>/gist:/id/file`, and each hap process has a
+  different cwd — so the daemon's claims and the TUI's grouping would stop agreeing with nothing
+  erroring. Each of the three packages has a test pinning the delegation.
+- **Egress has exactly two exceptions, both opt-in and off by default** — the release check
+  (`internal/updatecheck/fetch.go`) and the `github_gist` task-list backend
+  (`internal/taskstore/gist/gist.go`), which carries task text only. `internal/privacy` bans the
+  GitHub SDK by its own import path as well as `net/http`, because the walker checks DIRECT
+  imports: an adapter using only the SDK would egress while passing. The gist adapter must keep
+  using `github.WithURLs` (not a `*url.URL`) and `github.WithTimeout` (not a hand-built
+  transport), or `net/url` and the no-remote-dial scan need widening too.
 - **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
   shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels
   results back through a channel (see `consultLLM` / `llmResults`).
@@ -532,8 +558,10 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
 | `internal/herdr` | herdr CLI + events-socket adapters |
 | `internal/store` | SQLite persistence (WAL; `context_json` is an opaque blob) |
 | `internal/taskfile` | advisory file lock behind every checklist read-modify-write |
+| `internal/tasklocator` | the ONE canonicalizer for a task-list locator + provider resolution (pure) |
+| `internal/taskstore` | task-list backends: `local` (default) and `gist` (opt-in, the only GitHub SDK importer) |
 | `internal/selfpath` | resolves a live `hap` binary (an upgrade unlinks the running one) |
 | `internal/tuisession` | flock registry of live `hap tui` processes; closes the oldest past `[tui] max_instances` |
-| `internal/updatecheck` | GitHub release check — the ONLY `net/http` importer (NFR-007 allowlist) |
+| `internal/updatecheck` | GitHub release check — one of exactly TWO `net/http` importers (NFR-007 allowlist) |
 | `internal/fakeherdr`, `e2e_harness/` | test fakes and the e2e driver |
 | `docs/architect/herd-auto-prompter-architecture.md` | consolidated architecture doc (FR-xxx / NFR-xxx ids used in comments) |

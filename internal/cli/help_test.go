@@ -301,7 +301,14 @@ func TestTaskSourceUsageKeysAreAccepted(t *testing.T) {
 		t.Errorf("the two usage texts disagree:\n  help.go: %v\n   cli.go: %v", keys, runtimeKeys)
 	}
 
-	values := map[string]string{"max-tasks": "7"}
+	// A key whose value is not a bool needs its own sample, or the loop below
+	// exercises it with "true". gist-id must come with a provider that makes it
+	// meaningful, which is why the seed varies per key (see seedTaskSource).
+	values := map[string]string{
+		"max-tasks": "7",
+		"provider":  "github_gist",
+		"gist-id":   "3f2a1b9c4d5e6f708192a3b4c5d6e7f8",
+	}
 	for _, key := range append(keys, runtimeKeys...) {
 		t.Run(key, func(t *testing.T) {
 			app, _ := testApp(t)
