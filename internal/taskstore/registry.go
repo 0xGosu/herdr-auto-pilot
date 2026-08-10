@@ -8,6 +8,7 @@ package taskstore
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -115,6 +116,15 @@ func (r *Registry) backend(p config.ResolvedProvider) (ports.TaskStore, error) {
 	if p.Name != config.ProviderGitHubGist {
 		return nil, fmt.Errorf("unknown task source provider %q — expected one of %v",
 			p.Name, config.ValidTaskSourceProviders)
+	}
+	// The last gate before a remote backend exists at all, so it catches a
+	// hand-edited config that never crossed a write surface. lock_windows.go's
+	// Lock is a no-op, and a two-round-trip read-modify-write against a store
+	// with no compare-and-swap needs that lock to not lose concurrent edits.
+	if runtime.GOOS == "windows" {
+		return nil, fmt.Errorf("provider=%s is not supported on Windows: hap has no "+
+			"cross-process file lock there, and a remote checklist needs one to avoid "+
+			"losing concurrent edits", p.Name)
 	}
 	if p.GistID == "" {
 		return nil, fmt.Errorf("task source provider %s has no gist_id", p.Name)

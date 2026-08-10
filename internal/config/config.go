@@ -1037,6 +1037,14 @@ func ValidateResolvedProvider(cfg Config, index int, src TaskSource) error {
 	if !p.Remote() {
 		return nil
 	}
+	// Duplicated from ValidateTaskSource on purpose. That one runs on WRITE
+	// surfaces, which a hand-edited config.toml never crosses — so without this
+	// an operator on Windows could reach the backend with no cross-process lock
+	// at all, which is precisely the corruption the rule exists to prevent.
+	if runtime.GOOS == "windows" {
+		return fmt.Errorf("provider=%s is not supported on Windows: hap has no cross-process "+
+			"file lock there, and a remote checklist needs one to avoid losing concurrent edits", p.Name)
+	}
 	if p.Name == ProviderGitHubGist && strings.TrimSpace(p.GistID) == "" {
 		// Name BOTH remedies: from the error alone the operator cannot tell
 		// whether they are missing the shared default or this source's own
