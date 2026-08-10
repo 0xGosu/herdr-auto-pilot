@@ -186,7 +186,14 @@ func TestAutoSendIdleResolvesTildeSourcePathDespiteStateDirCwd(t *testing.T) {
 
 	// A send proves the daemon READ the ~-based source from HOME, not the cwd.
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := (&domain.DeclaredTask{Task: "step two", Path: "~/tasks.md", AgentName: name}).Prompt()
+	// {task_list_path} renders the RESOLVED address, not the operator's
+	// shorthand, so the prompt itself carries the HOME-expanded path — which
+	// makes it a second, independent proof that ~ expansion happened. It is
+	// also what the agent needs: "~" would otherwise resolve against the
+	// AGENT's home, which need not be the daemon's.
+	want := (&domain.DeclaredTask{
+		Task: "step two", Path: canonicalTaskPath(realFile), AgentName: name,
+	}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want the next declared task prompt %q", got, want)
 	}

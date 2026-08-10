@@ -163,6 +163,41 @@ func Resolve(cfg config.Config, src config.TaskSource, agentName string) (Resolv
 // that list sources rather than agents, which render a template instead.
 var ErrAgentNameRequired = fmt.Errorf("this task source derives one list per matched agent, so it needs an agent name to resolve")
 
+// Display renders a locator as the address {task_list_path} shows an operator
+// or an agent.
+//
+// A filesystem locator is already that address. A gist locator becomes its web
+// URL, and the alternatives are all worse: a bare file name ("brave-otter.md")
+// is something the agent resolves against its OWN working directory, where it
+// either fails confusingly or finds an unrelated file; an empty string turns
+// "read the list at {task_list_path}" into nonsense. A URL fails loudly and is
+// something the operator can actually open.
+func Display(locator string) string {
+	ref, ok := ParseGist(locator)
+	if !ok {
+		return locator
+	}
+	return "https://gist.github.com/" + ref.GistID + "#file-" + anchorSlug(ref.File)
+}
+
+// anchorSlug renders a gist file name as GitHub's per-file anchor: lowercased,
+// with every run of non-alphanumerics collapsed to a single hyphen.
+func anchorSlug(file string) string {
+	var b strings.Builder
+	lastHyphen := false
+	for _, r := range strings.ToLower(file) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			lastHyphen = false
+		case !lastHyphen:
+			b.WriteByte('-')
+			lastHyphen = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
 // DerivedFileName is the checklist file name for an agent whose source names
 // none. It reuses the same sanitization the generated-task bootstrap has always
 // applied to build <state>/tasks/<name>.md, so a bootstrapped source and a

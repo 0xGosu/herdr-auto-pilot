@@ -522,7 +522,7 @@ func (d *Daemon) escalateNeverStartedTask(ctx context.Context, r domain.TaskRese
 func (d *Daemon) escalateUndeliverableTask(ctx context.Context, s domain.Situation,
 	del delivery, attempts int, now time.Time) bool {
 
-	sourcePath := canonicalTaskPath(del.declared.Path)
+	sourcePath := canonicalTaskPath(del.declared.Locator)
 	// The audit row goes FIRST. Clearing the counter before it is recorded would,
 	// on a write failure, leave the item "[-]" with the ceiling forgotten and
 	// nothing on record — invisible in `hap escalations` and unreachable by any
@@ -847,7 +847,7 @@ func (d *Daemon) reserveDeclaredTask(declared *domain.DeclaredTask, taskText str
 	if declared == nil || !declared.Reserve || taskText == "" || taskText == domain.NoTaskContent {
 		return func() {}, 0, nil
 	}
-	path := declared.Path
+	path := declared.Locator
 	mutate, claimed := taskfile.ReserveFirstPending(taskText)
 	if err := d.opt.MutateTaskFile(path, mutate); err != nil {
 		return nil, 0, fmt.Errorf("reserving the task in %s: %w", path, err)

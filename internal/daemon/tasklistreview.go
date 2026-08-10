@@ -154,7 +154,7 @@ func (d *Daemon) startTaskListReview(ctx context.Context, s domain.Situation, si
 	// the guard, and ApplyReview still resolves every reference against the
 	// live file inside the lock.
 	expectIndex, expectText := 0, del.taskText
-	if data, err := d.opt.ReadTaskFile(del.declared.Path); err == nil {
+	if data, err := d.opt.ReadTaskFile(del.declared.Locator); err == nil {
 		for _, it := range domain.ParseChecklist(string(data)) {
 			if !it.Done && it.Text == del.taskText {
 				expectIndex = it.Index
@@ -172,7 +172,7 @@ func (d *Daemon) startTaskListReview(ctx context.Context, s domain.Situation, si
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
 		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
 		TaskReview: true, ProposedTask: del.input,
-		SourcePath: del.declared.Path, ReviewedTask: del.taskText,
+		SourcePath: del.declared.Locator, ReviewedTask: del.taskText,
 		ReserveTask: del.declared.Reserve,
 	}
 	// Stage the pending row synchronously (context filled off-loop below) so a
@@ -212,13 +212,13 @@ func (d *Daemon) startTaskListReview(ctx context.Context, s domain.Situation, si
 				listPath:       del.declared.Path,
 				currentTask:    del.taskText,
 			}
-			if data, rerr := d.opt.ReadTaskFile(del.declared.Path); rerr == nil {
+			if data, rerr := d.opt.ReadTaskFile(del.declared.Locator); rerr == nil {
 				review.tasks = describeTasks(domain.ParseChecklist(string(data)))
 				review.pending = domain.PendingDeclaredTasks(string(data))
 				review.inProgress = domain.InProgressDeclaredTasks(string(data))
 			} else {
 				slog.Warn("task-list review: re-reading the task source failed",
-					"path", del.declared.Path, "error", rerr)
+					"locator", del.declared.Locator, "error", rerr)
 			}
 			contextJSON, cwd := d.consultContext(rctx, cfg, s, agentName, review, "")
 			req.ContextJSON = string(contextJSON)
@@ -279,7 +279,7 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 		// and its send is lost.
 		if c, ok := d.autoTaskClaimFor(s.AgentID); ok &&
 			c.taskText == res.del.taskText &&
-			c.sourcePath == canonicalTaskPath(res.del.declared.Path) {
+			c.sourcePath == canonicalTaskPath(res.del.declared.Locator) {
 			d.dropAutoTaskClaim(s.AgentID)
 		}
 		return
@@ -432,7 +432,7 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 		}
 		return mutate(content)
 	}
-	if err := d.opt.MutateTaskFile(res.del.declared.Path, guarded); err != nil {
+	if err := d.opt.MutateTaskFile(res.del.declared.Locator, guarded); err != nil {
 		if killed {
 			// A killed daemon must not send the ORIGINAL task either, so this
 			// stands down instead of taking the fail-open path below.
@@ -451,7 +451,7 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 	// the chosen item is already "[-]". Everything below must therefore either
 	// deliver or roll that claim back — it can no longer fall back to the
 	// original task, whose line the review may have just edited away.
-	rollback := d.reviewRollback(res.del.declared.Path, out)
+	rollback := d.reviewRollback(res.del.declared.Locator, out)
 
 	if out.Noop {
 		// A legal decline: the source is genuinely exhausted. The edits stand

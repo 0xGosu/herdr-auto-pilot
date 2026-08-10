@@ -50,10 +50,29 @@ const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer t
 // manageable — `hap task {agent}` errors on those, and the path form always
 // works.
 func TaskManagementHints(agent, path string) string {
+	return taskManagementHints(agent, path, false)
+}
+
+// RemoteTaskManagementHints is TaskManagementHints for a list that is not a
+// file on this machine. It drops the `--path` fallback — --path always reads a
+// LOCAL file, so under a remote provider that line names something that does
+// not exist — and says so, since an agent told only "use hap task" will
+// otherwise go looking for the file anyway.
+func RemoteTaskManagementHints(agent, display string) string {
+	return taskManagementHints(agent, display, true)
+}
+
+func taskManagementHints(agent, path string, remote bool) string {
 	quoted := ShellQuote(path)
 	target := agent
 	if target == "" {
-		target = "--path " + quoted
+		if remote {
+			// There is no local path to fall back to, and a remote list is
+			// always reachable by the agent's own name.
+			target = "<agent>"
+		} else {
+			target = "--path " + quoted
+		}
 	}
 	var b strings.Builder
 	b.WriteString("Prefer using the hap CLI to manage your tasks:\n")
@@ -63,7 +82,10 @@ func TaskManagementHints(agent, path string) string {
 	// '#3' is quoted because these commands are run in a shell, where a bare
 	// #3 is stripped as a comment and the ref reaches hap as nothing at all.
 	b.WriteString("- `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.1`); otherwise its position in the list, which `'#3'` always addresses (quote it — a bare #3 is a shell comment).\n")
-	if agent != "" {
+	switch {
+	case remote:
+		b.WriteString("- your task list is stored remotely, not as a file here — `hap task` is the only way to read or change it, and `--path` will not reach it.\n")
+	case agent != "":
 		fmt.Fprintf(&b, "- when the agent name `%s` is no longer recognized, use `--path %s` in place of `%s`\n", agent, quoted, agent)
 	}
 	return b.String()
@@ -107,8 +129,23 @@ type DeclaredTask struct {
 	// one-line behavior. Task ALWAYS stays the single physical line that is the
 	// task's reservation identity — the checklist item's own text — so folding
 	// never perturbs reservation, hand-out ledger rows, or the freshness check.
-	Content   string
-	Path      string // task-source file path
+	Content string
+	// Path is what {task_list_path} renders — the operator-facing address of
+	// the list, which under a remote provider is a URL rather than a file path.
+	// It is for DISPLAY and templating only; never open or lock it.
+	Path string
+	// Locator identifies the list for I/O: a canonical filesystem path, or a
+	// scheme'd string like "gist://<id>/<file>". Every read, mutation, lock and
+	// persisted reservation keys on THIS, not on Path.
+	Locator string
+	// Remote reports that the list is not a file on the agent's machine, which
+	// selects DefaultRemoteNextTaskTemplate — the default prompt WITHOUT the
+	// `--path {task_list_path_quoted}` fallback, since --path always reads a
+	// local file and would point the agent at something that does not exist.
+	//
+	// A plain bool, with Path pre-rendered by the caller, precisely so this
+	// package stays pure: it must not learn what a storage provider is.
+	Remote    bool
 	Template  string // operator template; "" uses DefaultNextTaskTemplate
 	AgentName string // agent short name, for {agent_name}
 	Cwd       string // agent working directory, for {cwd}
@@ -134,16 +171,45 @@ type DeclaredTask struct {
 	MaxTasks int
 }
 
+// DefaultRemoteNextTaskTemplate is DefaultNextTaskTemplate for a task list that
+// is NOT a file on the agent's machine.
+//
+// It drops the `--path` clause for a hard reason: --path always reads a LOCAL
+// file, so under a remote provider that clause points the agent at something
+// that does not exist. It does not need the fallback either — the fallback
+// existed for sources not addressable by an agent's name, and a remote list
+// derived per agent is named after that very agent, so `hap task {agent_name}`
+// always resolves.
+const DefaultRemoteNextTaskTemplate = "Your next task is {next_task_content}. " +
+	"Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them. " +
+	"Your task list is not a file on this machine — always go through `hap task`, never try to open or edit it directly."
+
 // TemplateOrDefault resolves a task source's next-task template, falling back
-// to DefaultNextTaskTemplate for an unset one. Prompt renders through it, and
-// it is exported so a caller can inspect the template it is ABOUT to render —
-// notably to skip resolving {cwd} (a herdr round-trip) when nothing
-// references it. Reading t.Template directly would miss the default.
+// to the built-in default for an unset one. Prompt renders through it, and it
+// is exported so a caller can inspect the template it is ABOUT to render —
+// notably to skip resolving {cwd} (a herdr round-trip) when nothing references
+// it. Reading t.Template directly would miss the default.
+//
+// remote selects the default that omits the --path fallback. An operator's own
+// template is never rewritten: they are warned at the point they set one that
+// references --path, not silently edited.
 func TemplateOrDefault(template string) string {
-	if template == "" {
-		return DefaultNextTaskTemplate
+	return templateOrDefault(template, false)
+}
+
+// RemoteTemplateOrDefault is TemplateOrDefault for a remote list.
+func RemoteTemplateOrDefault(template string) string {
+	return templateOrDefault(template, true)
+}
+
+func templateOrDefault(template string, remote bool) string {
+	if template != "" {
+		return template
 	}
-	return template
+	if remote {
+		return DefaultRemoteNextTaskTemplate
+	}
+	return DefaultNextTaskTemplate
 }
 
 // Prompt renders the outbound prompt from the source's template. A single
@@ -152,7 +218,7 @@ func TemplateOrDefault(template string) string {
 // task content become real newlines here — the sending side of the
 // one-line-per-item storage encoding (see EncodeTaskNewlines).
 func (t DeclaredTask) Prompt() string {
-	tpl := TemplateOrDefault(t.Template)
+	tpl := templateOrDefault(t.Template, t.Remote)
 	// Deliver the folded content (title + nested sub-items) when it was
 	// resolved; fall back to the one-line identity otherwise.
 	body := t.Task
