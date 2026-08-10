@@ -1343,23 +1343,12 @@ func (a *App) addTaskSourceIfAbsent(ctx context.Context, agentID, agentType, nam
 	})
 }
 
-// sanitizeTaskFileName makes an agent name safe as a file name: path
-// separators and whitespace collapse to hyphens, so a colorful short name (or
-// a raw agent id) never escapes the tasks dir.
-func sanitizeTaskFileName(name string) string {
-	repl := func(r rune) rune {
-		if strings.ContainsRune("/\\ \t\n", r) || r == os.PathSeparator {
-			return '-'
-		}
-		return r
-	}
-	out := strings.Map(repl, name)
-	out = strings.Trim(out, "-.")
-	if out == "" {
-		return "agent"
-	}
-	return out
-}
+// sanitizeTaskFileName makes an agent name safe as a file name. It moved to
+// internal/config so internal/tasklocator can derive the SAME name for a
+// gist-backed source that this bootstrap writes under <state>/tasks/ — one
+// definition, or an agent's derived list and its bootstrapped list would
+// diverge on any name needing sanitization.
+func sanitizeTaskFileName(name string) string { return config.SanitizeTaskFileName(name) }
 
 // Confirm records agreement with an escalation's suggested action.
 func (a *App) Confirm(ctx context.Context, auditID int64, send bool) error {
@@ -1622,6 +1611,23 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.disable_check_for_update", TUIEditable: true},
 	{Key: "tui.max_instances", TUIEditable: true},
 	{Key: "cli.ai_agent_friendly_output", TUIEditable: true},
+	// Where task lists are stored, by DEFAULT — each [[task_sources]] entry may
+	// override it (`hap task-source set <index> provider …`), and one that does
+	// not keeps FOLLOWING this value, so changing it here really moves every
+	// inheriting source. The per-source keys are deliberately NOT registered:
+	// they are per-index settings like max_tasks, and tomlScalarKeys skips the
+	// TaskSources slice as structured data.
+	//
+	// `provider` is an enum, so the TUI renders it as a picker
+	// (configFieldChoices) instead of a text box the operator would have to
+	// guess at. Only the `.env` PATH is registered, exactly as the [llm]
+	// *_env_file keys are: the file holds a token and every registered key is
+	// printed verbatim by `hap config fields`.
+	{Key: "task_source_provider.provider", TUIEditable: true},
+	{Key: "task_source_provider.env_file", TUIEditable: true, TUIHidden: true},
+	{Key: "task_source_provider.timeout_seconds", TUIEditable: true, TUIHidden: true},
+	{Key: "task_source_provider.refresh_seconds", TUIEditable: true, TUIHidden: true},
+	{Key: "task_source_provider.github_gist.gist_id", TUIEditable: true},
 	// Palette roles are TUIHidden, not absent: eight color strings would bury
 	// the settings a TUI operator actually reaches for, but `hap config fields`
 	// and `hap config set` must still reach every key config.toml accepts.
@@ -1944,8 +1950,34 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.TUI.MaxInstances)
 	case "cli.ai_agent_friendly_output":
 		return strconv.FormatBool(cfg.CLI.AIAgentFriendlyOutput)
+	case "task_source_provider.provider":
+		// Resolved rather than read raw, so a Config built in memory (or one
+		// predating the section) renders the provider actually in force instead
+		// of an empty string. Every registered key must render something.
+		return cfg.ResolveProvider(config.TaskSource{}).Name
+	case "task_source_provider.env_file":
+		return pathFieldValue(cfg.TaskSourceProvider.EnvFile)
+	case "task_source_provider.timeout_seconds":
+		return strconv.Itoa(int(cfg.TaskSourceProvider.TaskStoreTimeout() / time.Second))
+	case "task_source_provider.refresh_seconds":
+		if cfg.TaskSourceProvider.RefreshSeconds < 0 {
+			return "0 (read through every call)"
+		}
+		return strconv.Itoa(int(cfg.TaskSourceProvider.SnapshotTTL() / time.Second))
+	case "task_source_provider.github_gist.gist_id":
+		return pathFieldValue(cfg.TaskSourceProvider.GitHubGist.GistID)
 	}
 	return ""
+}
+
+// pathFieldValue renders an optional string setting, never returning "" — a
+// registered key that renders empty fails TestConfigFieldRegistryParity, and
+// "(none)" is the placeholder the [llm] *_env_file keys already use.
+func pathFieldValue(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "(none)"
+	}
+	return v
 }
 
 // SetField updates one scalar config field by key, with validation. It
@@ -2302,6 +2334,68 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			}
 			cfg.TUI.MaxInstances = v
 			return nil
+		case "task_source_provider.provider":
+			// Rejects an unknown name with the valid list, exactly like
+			// tui.theme: this is the surface an operator types at, so it is
+			// where a typo gets caught. A hand-edited config.toml still LOADS
+			// an unrecognized value and fails at use time, because coercing it
+			// would silently create local checklist files for sources the
+			// operator believes are remote.
+			p := strings.ToLower(strings.TrimSpace(value))
+			if p == "" {
+				cfg.TaskSourceProvider.Provider = ""
+				return nil
+			}
+			if !slices.Contains(config.ValidTaskSourceProviders, p) {
+				return fmt.Errorf("task_source_provider.provider must be one of %s, got %q",
+					strings.Join(config.ValidTaskSourceProviders, ", "), value)
+			}
+			cfg.TaskSourceProvider.Provider = p
+			return nil
+		case "task_source_provider.env_file":
+			// Stored verbatim, NOT expanded: expanding at set time would bake
+			// today's $HOME into config.toml. llm.env_file does the same.
+			cfg.TaskSourceProvider.EnvFile = strings.TrimSpace(value)
+			return nil
+		case "task_source_provider.timeout_seconds":
+			v, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || v < 0 {
+				return fmt.Errorf("task_source_provider.timeout_seconds must be a non-negative "+
+					"integer (0 = the built-in default), got %q", value)
+			}
+			cfg.TaskSourceProvider.TimeoutSeconds = v
+			return nil
+		case "task_source_provider.refresh_seconds":
+			v, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil {
+				return fmt.Errorf("task_source_provider.refresh_seconds must be an integer "+
+					"(0 = the built-in default, negative = read through every call), got %q", value)
+			}
+			cfg.TaskSourceProvider.RefreshSeconds = v
+			return nil
+		case "task_source_provider.github_gist.gist_id":
+			// Deliberately NOT rejected for the provider being local_fs, nor for
+			// env_file being unset: making the three keys interdependent would
+			// make them ORDER-DEPENDENT to set, which is the trap already
+			// documented for embedding.bm25_highbar_score. What is still
+			// missing is reported at use time and printed by
+			// `hap task-source provider`.
+			id := strings.TrimSpace(value)
+			if id == "" {
+				cfg.TaskSourceProvider.GitHubGist.GistID = ""
+				return nil
+			}
+			// Operators copy the URL out of the browser; storing it whole would
+			// fail later with a confusing "gist not found".
+			if u := strings.TrimSuffix(id, "/"); strings.Contains(u, "/") {
+				id = u[strings.LastIndex(u, "/")+1:]
+			}
+			if id == "" || strings.ContainsAny(id, " \t") {
+				return fmt.Errorf("task_source_provider.github_gist.gist_id must be a gist id "+
+					"(the hex tail of its URL), got %q", value)
+			}
+			cfg.TaskSourceProvider.GitHubGist.GistID = id
+			return nil
 		case "cli.ai_agent_friendly_output":
 			v, err := strconv.ParseBool(value)
 			if err != nil {
@@ -2507,7 +2601,9 @@ func (a *App) updateTaskSource(ctx context.Context, index int, expected config.T
 		}
 		updated := cfg.TaskSources[index]
 		mutate(&updated)
-		if err := config.ValidateTaskSource(updated); err != nil {
+		// Validated against the config being written, so a rule that depends on
+		// the effective provider sees the same inheritance the daemon will.
+		if err := config.ValidateTaskSource(*cfg, updated); err != nil {
 			return err
 		}
 		cfg.TaskSources[index] = updated
@@ -2622,13 +2718,6 @@ func ReviewBeforeAutoSend(on bool) TaskSourceOption {
 // ({next_task_content} / {task_list_path} / {agent_name} placeholders);
 // "" uses the default.
 func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, template string, opts ...TaskSourceOption) error {
-	// The daemon reads the file from its own cwd (the state dir), not the
-	// operator's shell; expand ~/$VAR and resolve relative paths here where
-	// they still mean what the operator sees.
-	path = config.ExpandPath(path)
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
 	src := config.TaskSource{
 		Agent: agent, Workspace: workspace, Path: path, NextTaskTemplate: template,
 		// Written explicitly rather than left at 0: a saved source names the cap
@@ -2644,10 +2733,26 @@ func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, templat
 	if src.MaxTasks < 1 {
 		return fmt.Errorf("max_tasks must be 1 or greater, got %d", src.MaxTasks)
 	}
-	if err := config.ValidateTaskSource(src); err != nil {
-		return err
-	}
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		// Path resolution and validation both need the EFFECTIVE provider, which
+		// may be inherited from [task_source_provider] — so both run here, inside
+		// the closure that holds the config being written. This still executes in
+		// the operator's process, so filepath.Abs below resolves against their
+		// shell's cwd, which is the whole reason it happens here and not in the
+		// daemon (which runs from the state dir).
+		// Validate BEFORE absolutizing: filepath.Abs("") returns the cwd, which
+		// would quietly turn a missing path into a real-looking one and defeat
+		// the empty-path rule. It also keeps the gist-file-name rule reading the
+		// value the operator actually typed.
+		if err := config.ValidateTaskSource(*cfg, src); err != nil {
+			return err
+		}
+		if !cfg.ResolveProvider(src).Remote() {
+			src.Path = config.ExpandPath(src.Path)
+			if abs, err := filepath.Abs(src.Path); err == nil {
+				src.Path = abs
+			}
+		}
 		cfg.TaskSources = append(cfg.TaskSources, src)
 		return nil
 	})

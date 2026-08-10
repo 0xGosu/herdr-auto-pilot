@@ -247,6 +247,67 @@ type SessionReportingLearner interface {
 	LearnFromUserWithSession(ctx context.Context, req domain.LearnRequest) (string, string, error)
 }
 
+// TaskStore is the persistence boundary for a declared task source's markdown
+// checklist. Implementations: internal/taskstore/local (the filesystem, and the
+// default) and internal/taskstore/gist (a file inside a GitHub gist).
+//
+// A locator identifies one list — a canonical filesystem path, or a scheme'd
+// string like "gist://<id>/<file>" (see internal/tasklocator).
+type TaskStore interface {
+	// Read returns the list's raw bytes. A locator naming a list that does not
+	// exist yet MUST wrap fs.ErrNotExist, because callers already branch on
+	// that to decide whether to create one.
+	Read(ctx context.Context, locator string) ([]byte, error)
+
+	// Mutate applies fn to the list's content as ONE atomic read-modify-write
+	// and returns the resulting checklist. wait bounds acquisition of the
+	// cross-process lock (<= 0 blocks). A mutator error writes ZERO bytes.
+	//
+	// fn runs INSIDE the critical section, and that is a correctness
+	// requirement rather than a convenience. Every mutator hap has checks and
+	// claims in the same pass — Reserve runs ExpectText then marks "[-]";
+	// ApplyReview mutates, re-resolves the send target against the post-mutation
+	// list, re-screens it through the safety gates, then reserves; the
+	// pre-delivery review re-reads the kill switch immediately before the write.
+	// A Get/Put split would move those checks outside the lock and reintroduce
+	// the double-delivery race the design exists to prevent.
+	Mutate(ctx context.Context, locator string, wait time.Duration,
+		fn func(content string) (string, error)) ([]domain.ChecklistItem, error)
+}
+
+// EnsureCreator creates a task list that does not exist yet.
+//
+// Optional: Mutate deliberately requires the list to exist, so a typo in a
+// configured path fails loudly instead of silently minting an empty checklist.
+// Only the generated-task bootstrap — which is supposed to create one — needs
+// this. Callers type-assert and report "not supported" when absent.
+type EnsureCreator interface {
+	// Ensure creates the list with initial content if it is missing, reporting
+	// whether it created it. Idempotent, and it NEVER overwrites existing
+	// content.
+	Ensure(ctx context.Context, locator, initial string) (created bool, err error)
+}
+
+// RemoteTaskStore marks a store whose reads and writes leave the machine.
+//
+// Optional, and the daemon's whole risk control: absent, every task-list read
+// and mutation runs inline on the main select loop exactly as it always has;
+// present, the daemon reads through an in-memory snapshot refreshed off the
+// loop and moves mutating episodes into a goroutine. Gating on the interface
+// rather than on config is what keeps the default provider's behaviour — and
+// its entire test suite — untouched.
+type RemoteTaskStore interface {
+	Remote() bool
+}
+
+// TaskStoreRemote reports whether a store's calls leave the machine, defaulting
+// to false for a store that does not declare itself. It is the free-function
+// form of the type assertion, so call sites do not each repeat it.
+func TaskStoreRemote(s TaskStore) bool {
+	r, ok := s.(RemoteTaskStore)
+	return ok && r.Remote()
+}
+
 // StorePort is the persistence boundary. Write-ownership is partitioned:
 // daemon-exclusive writers for signatures/agent_rate/error_retries/decisions,
 // daemon-emitted audit rows, and signature_embeddings (with one maintenance

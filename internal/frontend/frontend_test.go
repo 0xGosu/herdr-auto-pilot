@@ -2414,6 +2414,14 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"embedding.bm25_highbar_score":             "0.80",
 		"logging.level":                            "warn",
 		"logging.max_size_mb":                      "32",
+		// github_gist and not local_fs on purpose: the sample doubles as the
+		// SetField exercise, and setting the NON-default is what proves the
+		// enum branch is reachable at all.
+		"task_source_provider.provider":            "github_gist",
+		"task_source_provider.env_file":            "/etc/hap/task_source.env",
+		"task_source_provider.timeout_seconds":     "20",
+		"task_source_provider.refresh_seconds":     "30",
+		"task_source_provider.github_gist.gist_id": "3f2a1b9c4d5e6f708192a3b4c5d6e7f8",
 		// Non-zero on purpose: 0 is a valid setting here ("never prune") but
 		// this sample also feeds the FieldValue round trip, and a real day
 		// count is the case worth exercising. The explicit-0 path has its own

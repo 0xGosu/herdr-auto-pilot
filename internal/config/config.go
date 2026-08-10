@@ -10,6 +10,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -562,6 +564,183 @@ type Embedding struct {
 	// configurable.
 }
 
+// Task-list storage providers — the operator-visible values of
+// [task_source_provider] provider and of a [[task_sources]] entry's own
+// `provider` override.
+const (
+	ProviderLocalFS    = "local_fs"
+	ProviderGitHubGist = "github_gist"
+)
+
+// ValidTaskSourceProviders are the values a provider key accepts, in display
+// order. Mirrors ValidThemes: `hap config set` and the TUI picker validate
+// against it, while a hand-edited config.toml still LOADS an unrecognized
+// value and fails at use time (see ValidateTaskSource).
+var ValidTaskSourceProviders = []string{ProviderLocalFS, ProviderGitHubGist}
+
+// DefaultTaskStoreTimeoutSeconds bounds one backend call (a gist GET or PATCH).
+const DefaultTaskStoreTimeoutSeconds = 20
+
+// DefaultTaskStoreRefreshSeconds is the daemon's task-list snapshot TTL for a
+// REMOTE store. 0 means read-through (an escape hatch for debugging); it has no
+// effect on local_fs, which is always read-through.
+const DefaultTaskStoreRefreshSeconds = 30
+
+// TaskSourceProvider is the DEFAULT storage for task lists: the backend a
+// [[task_sources]] entry uses when it names none of its own, and the one hap
+// uses when it mints a source implicitly (the operator accepting an
+// LLM-suggested task for an agent that has no entry yet).
+//
+// It does NOT decide WHICH agents have task lists — a [[task_sources]] entry is
+// still required to opt an agent in, and an agent no entry matches keeps its
+// existing no-task-source behaviour exactly.
+//
+// A third backend adds a SUBTABLE here (e.g. [task_source_provider.linear]),
+// never a new top-level key, so nothing already on disk moves.
+type TaskSourceProvider struct {
+	// Provider is one of ValidTaskSourceProviders. Empty means local_fs.
+	// An UNRECOGNIZED value is neither rejected at Load nor coerced — coercing
+	// it to local_fs would resolve every gist-shaped path against the daemon's
+	// cwd and silently CREATE local checklist files while the operator believed
+	// their lists were remote. It is left exactly as written so they can see it.
+	Provider string `toml:"provider,omitempty"`
+	// EnvFile is the ONE .env file holding every provider's credentials (for
+	// github_gist, a GitHub token with the `gist` scope under GITHUB_TOKEN, or
+	// GH_TOKEN as a fallback).
+	//
+	// Exactly the [llm] *_env_file contract: the PATH lives in config and the
+	// CONTENTS are read at USE time, never at Load — so Save can never copy a
+	// token into config.toml, and editing the file applies to the next call
+	// with no restart. A configured-but-unreadable file FAILS the operation
+	// (escalation on the daemon path); it never falls back to an
+	// unauthenticated call. A leading ~ and $VAR/${VAR} are expanded.
+	//
+	// Global-only, with no per-source override, and that line is deliberate:
+	// credentials are global, addressing is per-source. Two sources may name
+	// two gists on one account with one token; two GitHub ACCOUNTS are out of
+	// scope, and adding a per-source EnvFile later reshapes nothing.
+	EnvFile string `toml:"env_file,omitempty"`
+	// TimeoutSeconds bounds one backend call. 0 means the built-in default
+	// (DefaultTaskStoreTimeoutSeconds) — NOT "no timeout".
+	//
+	// It renders as `timeout_seconds = 0` in a saved config because
+	// BurntSushi's `omitempty` covers strings, bools, slices, maps, structs and
+	// pointers but NOT integers, so a zero int is always emitted. That matches
+	// how the sibling [embedding] millisecond knobs already read, and both are
+	// resolved dynamically (TaskStoreTimeout) rather than materialized, so a 0
+	// on disk keeps following the default rather than pinning today's number.
+	TimeoutSeconds int `toml:"timeout_seconds,omitempty"`
+	// RefreshSeconds is the daemon's snapshot TTL for a REMOTE store. 0 means
+	// the built-in default (DefaultTaskStoreRefreshSeconds); a NEGATIVE value
+	// is the explicit "read through on every call" escape hatch. Same
+	// zero-is-emitted note as TimeoutSeconds above.
+	RefreshSeconds int `toml:"refresh_seconds,omitempty"`
+	// GitHubGist configures the github_gist provider. Kept (not cleared) under
+	// another provider so switching back and forth does not lose the id.
+	//
+	// Declared LAST: BurntSushi emits sub-tables after the parent's scalars, so
+	// a field declared after this one would encode INSIDE this table.
+	GitHubGist GitHubGist `toml:"github_gist,omitempty"`
+}
+
+// GitHubGist is the gist a github_gist task list lives inside, as a file.
+//
+// hap NEVER creates the gist: the operator creates a secret gist on github.com
+// and pastes its id here. hap creates and updates the FILES inside it on
+// demand.
+type GitHubGist struct {
+	// GistID is the gist's id (the hex tail of its URL). Required under
+	// provider = "github_gist"; an empty or unusable id fails at USE time, not
+	// at Load.
+	GistID string `toml:"gist_id,omitempty"`
+}
+
+// TaskStoreTimeout returns the per-call backend timeout, substituting the
+// default when unset. Resolved dynamically (like GenerateTaskTimeout) rather
+// than via fillZeroes, so a Config built in memory behaves the same.
+func (p TaskSourceProvider) TaskStoreTimeout() time.Duration {
+	if p.TimeoutSeconds <= 0 {
+		return DefaultTaskStoreTimeoutSeconds * time.Second
+	}
+	return time.Duration(p.TimeoutSeconds) * time.Second
+}
+
+// SnapshotTTL returns the daemon's task-list snapshot TTL for a remote store.
+// A negative RefreshSeconds means read through on every call.
+func (p TaskSourceProvider) SnapshotTTL() time.Duration {
+	switch {
+	case p.RefreshSeconds < 0:
+		return 0
+	case p.RefreshSeconds == 0:
+		return DefaultTaskStoreRefreshSeconds * time.Second
+	default:
+		return time.Duration(p.RefreshSeconds) * time.Second
+	}
+}
+
+// ResolvedProvider is the effective storage configuration for ONE task source,
+// carrying the PROVENANCE every operator surface needs: an inherited value and
+// an identical explicit override must not read the same, or an operator cannot
+// tell why a source moved when they changed the default.
+type ResolvedProvider struct {
+	// Name is never empty — ProviderLocalFS when nothing is configured.
+	Name    string
+	GistID  string
+	EnvFile string
+	// NameInherited / GistIDInherited report that the value came from
+	// [task_source_provider] rather than the source's own key.
+	NameInherited   bool
+	GistIDInherited bool
+}
+
+// Remote reports whether this provider's reads and writes leave the machine.
+// It is the single definition, so a third backend is remote by adding one case
+// rather than by every call site guessing.
+func (r ResolvedProvider) Remote() bool { return r.Name != ProviderLocalFS }
+
+// ResolveProvider returns the effective storage configuration for src,
+// applying the [task_source_provider] defaults to every field the entry leaves
+// empty.
+//
+// Inheritance is a LIVE RELATIONSHIP, not a snapshot: an empty source key is
+// never materialized onto disk (see normalizeTaskSources), so changing the
+// default really does move every inheriting source.
+func (c Config) ResolveProvider(src TaskSource) ResolvedProvider {
+	out := ResolvedProvider{
+		Name:    src.Provider,
+		GistID:  src.GistID,
+		EnvFile: c.TaskSourceProvider.EnvFile,
+	}
+	if out.Name == "" {
+		out.Name, out.NameInherited = c.TaskSourceProvider.Provider, true
+	}
+	if out.Name == "" {
+		out.Name = ProviderLocalFS
+	}
+	if out.GistID == "" {
+		out.GistID, out.GistIDInherited = c.TaskSourceProvider.GitHubGist.GistID, true
+	}
+	return out
+}
+
+// AnyNonDefaultProvider reports whether anything in this config selects a
+// storage backend other than the built-in local_fs default.
+//
+// It is the single predicate gating every "print the provider" branch in the
+// CLI and TUI, which is what keeps an install that has never touched the
+// setting byte-identical in its output.
+func (c Config) AnyNonDefaultProvider() bool {
+	if c.TaskSourceProvider.Provider != "" && c.TaskSourceProvider.Provider != ProviderLocalFS {
+		return true
+	}
+	for _, src := range c.TaskSources {
+		if src.Provider != "" && src.Provider != ProviderLocalFS {
+			return true
+		}
+	}
+	return false
+}
+
 // TaskSource points an agent or workspace at a declared next-task list (FR-011).
 type TaskSource struct {
 	Agent string `toml:"agent"` // agent id or name ("" = any)
@@ -569,7 +748,40 @@ type TaskSource struct {
 	// matches any; "*" inside the value is a wildcard ("codex-*",
 	// "*-vscode3"). Raw workspace ids still match when no name resolves.
 	Workspace string `toml:"workspace"`
-	Path      string `toml:"path"` // markdown checklist file
+	// Provider overrides [task_source_provider] provider for THIS source, so
+	// one herd can keep some agents' lists on disk and others' in a gist at the
+	// same time. EMPTY means INHERIT the default — and inheritance is a live
+	// relationship, not a snapshot: it is never materialized by
+	// normalizeTaskSources or Save, so changing the default really does move
+	// every inheriting source.
+	//
+	// This is the OPPOSITE of MaxTasks, which IS materialized, and the
+	// difference is the point: a cap is a value already in force, while an
+	// inherited provider is a link the operator expects to keep following.
+	// Materializing it would stamp the current default onto every existing
+	// source the first time any surface writes config, and the operator's later
+	// change of the default would then silently move nothing.
+	Provider string `toml:"provider,omitempty"`
+	// GistID overrides [task_source_provider.github_gist] gist_id for this
+	// source, so one agent's list can live in a different gist on the same
+	// account. Empty inherits. Meaningful only when the effective provider is
+	// github_gist; kept (not cleared) under another provider so switching back
+	// and forth does not lose it.
+	GistID string `toml:"gist_id,omitempty"`
+	// Path is the markdown checklist, and what it names depends on the
+	// effective provider:
+	//
+	//   local_fs    — a filesystem path. REQUIRED.
+	//   github_gist — a file name INSIDE the gist (no directories). Set it and
+	//                 every agent this source matches shares ONE list, which is
+	//                 the historical behaviour. Leave it EMPTY and the file
+	//                 name is derived per matched agent from that agent's short
+	//                 name ("<agent-name>.md"), created on demand, so one entry
+	//                 backs a private list per agent.
+	//
+	// omitempty so a derived source round-trips as an ABSENT key rather than
+	// `path = ""`, which reads like an error.
+	Path string `toml:"path,omitempty"`
 	// NextTaskTemplate overrides the outbound prompt format. Placeholders:
 	// {next_task_content} (next unchecked item, or "none" when the list is
 	// complete), {task_list_path}, {task_list_path_quoted} (that path as one
@@ -660,6 +872,16 @@ const DefaultMaxTasks = 20
 // unset or nonsensical. It runs on both Load and Save: "max_tasks = 0" (or a
 // missing key) reads like "unlimited" to an operator opening config.toml, when
 // the daemon has been enforcing DefaultMaxTasks all along.
+//
+// It deliberately does NOT do the same for TaskSource.Provider or
+// TaskSource.GistID, and that omission is load-bearing rather than an oversight.
+// Because this runs on Load AND Save, materializing an inherited provider would
+// stamp the current default onto every existing source the first time ANY
+// surface writes config — and the operator's later
+// `hap config set task_source_provider.provider github_gist` would then move
+// nothing at all, silently, for every install that already had a config. An
+// empty provider key IS the inheritance; keep it empty.
+// (TestInheritedProviderIsNeverMaterialized pins this.)
 func (c *Config) normalizeTaskSources() {
 	for i := range c.TaskSources {
 		if c.TaskSources[i].MaxTasks <= 0 {
@@ -694,15 +916,149 @@ func (s TaskSource) ReviewBeforeAutoSendEnabled() bool {
 	return s.EnableLLMReviewBeforeAutoSend != nil && *s.EnableLLMReviewBeforeAutoSend
 }
 
-// ValidateTaskSource rejects a source no write path may persist. Nothing is
-// currently invalid; it is kept as the single hook every write surface already
-// calls, so a future rule lands in one place rather than in each of them.
+// ValidateTaskSource rejects a source no write path may persist, given the
+// provider in force. It is the single hook every write surface already calls.
+//
+// It takes the whole Config because every rule below is provider-conditional,
+// and the effective provider may be inherited from [task_source_provider].
 //
 // Load deliberately does NOT call this: a config already on disk in a rejected
-// state must still load — coerced and warned — or the operator is locked out of
-// the very CLI/TUI that would repair it (every write goes Load → mutate → Save).
-func ValidateTaskSource(TaskSource) error {
+// state must still load — or the operator is locked out of the very CLI/TUI
+// that would repair it, since every write goes Load → mutate → Save. That rule
+// gets sharper with providers. Suppose the operator sets the default to
+// github_gist and later switches it back: every inheriting source now holds a
+// bare "brave-otter.md" under local_fs. Rejecting that at Load locks them out;
+// COERCING it is worse still, because hap would resolve the name against the
+// daemon's cwd and create local checklist files with plausible names while the
+// operator believed their lists were in the gist. Failing at USE time turns the
+// same mistake into one escalation naming the source, and touches nothing.
+//
+// Note what is deliberately NOT checked here: that a github_gist source has a
+// resolvable gist_id. Rejecting that at write time would make the keys
+// ORDER-DEPENDENT to set — no adding a gist source before setting the default
+// id, no setting a source's provider before its own id — which is the same trap
+// documented for embedding.bm25_highbar_score. Because every write goes
+// Load → mutate → Save, it would also break `hap task-source add` for an
+// operator midway through configuring. That check is
+// ValidateResolvedProvider's, at use time.
+// (TestValidateTaskSourceAcceptsAMissingGistID pins the omission.)
+func ValidateTaskSource(cfg Config, src TaskSource) error {
+	if src.Provider != "" && !slices.Contains(ValidTaskSourceProviders, src.Provider) {
+		return fmt.Errorf("unknown task source provider %q — expected one of %s",
+			src.Provider, strings.Join(ValidTaskSourceProviders, ", "))
+	}
+	p := cfg.ResolveProvider(src)
+	if !p.Remote() {
+		if strings.TrimSpace(src.Path) == "" {
+			return fmt.Errorf("a checklist path is required under provider=%s; "+
+				"an empty path only means \"one list per agent\" under a remote provider", p.Name)
+		}
+		return nil
+	}
+	if runtime.GOOS == "windows" {
+		// lock_windows.go's Lock is a no-op, so nothing serializes two hap
+		// processes there. That is survivable over a local file (the atomic
+		// rename still prevents a torn write) but not over a two-round-trip
+		// read-modify-write against a store with no compare-and-swap, where the
+		// loser is silently overwritten. Refuse rather than corrupt.
+		return fmt.Errorf("provider=%s is not supported on Windows: hap has no cross-process "+
+			"file lock there, and a remote checklist needs one to avoid losing concurrent edits", p.Name)
+	}
+	// Under a remote provider `path` names a file INSIDE the store, and a gist
+	// has no directories: GitHub mangles a separator in a gist file name, so a
+	// path-shaped value corrupts silently rather than failing.
+	if name := strings.TrimSpace(src.Path); name != "" {
+		if err := ValidateStoreFileName(name); err != nil {
+			return fmt.Errorf("under provider=%s, path names a file INSIDE the store, not a "+
+				"filesystem path: %w", p.Name, err)
+		}
+	}
 	return nil
+}
+
+// storeFileNamePattern is the shape a remote store's file name may take: a
+// single path-free segment. Deliberately stricter than what GitHub accepts, so
+// the rule is explainable in one sentence and the same for every future backend.
+var storeFileNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`)
+
+// SanitizeTaskFileName makes an agent name safe as a file name: path
+// separators and whitespace collapse to hyphens, so a colorful short name (or a
+// raw agent id) never escapes the tasks dir — and, under a remote provider,
+// never turns into a nested path the store would mangle.
+//
+// It lives here rather than beside the generated-task bootstrap that first
+// needed it because internal/tasklocator derives the same name for a source
+// that declares no file of its own. Two definitions would let an agent's
+// bootstrapped list and its derived list disagree for any name needing
+// sanitization.
+func SanitizeTaskFileName(name string) string {
+	repl := func(r rune) rune {
+		if strings.ContainsRune("/\\ \t\n", r) || r == os.PathSeparator {
+			return '-'
+		}
+		return r
+	}
+	out := strings.Map(repl, name)
+	out = strings.Trim(out, "-.")
+	if out == "" {
+		return "agent"
+	}
+	return out
+}
+
+// ValidateStoreFileName reports whether name is usable as a file name inside a
+// remote store. Exported because internal/tasklocator applies the same rule to
+// a DERIVED name, and the two must not drift.
+func ValidateStoreFileName(name string) error {
+	if !storeFileNamePattern.MatchString(name) {
+		return fmt.Errorf("got %q — expected a single file name of letters, digits, dot, "+
+			"dash or underscore (no %q, no %q, no leading dot)", name, "/", "..")
+	}
+	if strings.Contains(name, "..") {
+		return fmt.Errorf("got %q — %q is not allowed in a store file name", name, "..")
+	}
+	return nil
+}
+
+// ValidateResolvedProvider reports why a task source cannot be served by its
+// effective storage backend. It runs at USE time — when a backend is about to
+// be constructed — never at Load, so a misconfiguration is one clear message
+// instead of a config the operator cannot open a CLI to repair.
+//
+// index is the source's position in cfg.TaskSources, so the message can name
+// the `hap task-source set <index> …` that fixes it; pass -1 when unknown.
+func ValidateResolvedProvider(cfg Config, index int, src TaskSource) error {
+	p := cfg.ResolveProvider(src)
+	if !slices.Contains(ValidTaskSourceProviders, p.Name) {
+		return fmt.Errorf("unknown task source provider %q — expected one of %s "+
+			"(hap config set task_source_provider.provider <name>)",
+			p.Name, strings.Join(ValidTaskSourceProviders, ", "))
+	}
+	if !p.Remote() {
+		return nil
+	}
+	if p.Name == ProviderGitHubGist && strings.TrimSpace(p.GistID) == "" {
+		// Name BOTH remedies: from the error alone the operator cannot tell
+		// whether they are missing the shared default or this source's own
+		// override.
+		return fmt.Errorf("no gist_id for this task source — create a secret gist on github.com, "+
+			"then set the default with 'hap config set task_source_provider.github_gist.gist_id <id>'%s",
+			taskSourceSetHint(index, "gist-id <id>"))
+	}
+	if strings.TrimSpace(p.EnvFile) == "" {
+		return fmt.Errorf("[task_source_provider] env_file is not set — it must name a .env file " +
+			"holding a GitHub token with the `gist` scope (GITHUB_TOKEN, or GH_TOKEN)")
+	}
+	return nil
+}
+
+// taskSourceSetHint renders the ", or this source's own with 'hap task-source
+// set N …'" tail, omitting it when the caller could not identify the source.
+func taskSourceSetHint(index int, keyAndValue string) string {
+	if index < 0 {
+		return ""
+	}
+	return fmt.Sprintf(", or this source's own with 'hap task-source set %d %s'", index, keyAndValue)
 }
 
 // ClassifierRule is one manifest rule classifying pane content (FR-002).
@@ -903,14 +1259,20 @@ type Config struct {
 	// Escalations is opt-in and omitted from Save until the operator sets it
 	// (see AutoAccept), so an untouched config is never rewritten with a
 	// section granting the daemon new autonomy.
-	Escalations Escalations      `toml:"escalations,omitempty"`
-	LLM         LLM              `toml:"llm"`
-	Embedding   Embedding        `toml:"embedding"`
-	Logging     Logging          `toml:"logging"`
-	TUI         TUI              `toml:"tui"`
-	CLI         CLI              `toml:"cli"`
-	TaskSources []TaskSource     `toml:"task_sources"`
-	Classifier  []ClassifierRule `toml:"classifier"`
+	Escalations Escalations `toml:"escalations,omitempty"`
+	LLM         LLM         `toml:"llm"`
+	Embedding   Embedding   `toml:"embedding"`
+	Logging     Logging     `toml:"logging"`
+	TUI         TUI         `toml:"tui"`
+	CLI         CLI         `toml:"cli"`
+	// TaskSourceProvider is the DEFAULT storage backend for task lists, which
+	// each [[task_sources]] entry may override. Declared BEFORE TaskSources on
+	// purpose: BurntSushi emits a struct's sub-tables after its scalars, and
+	// TaskSources is an array-of-tables, so a section declared after it would
+	// encode inside the last [[task_sources]] entry.
+	TaskSourceProvider TaskSourceProvider `toml:"task_source_provider"`
+	TaskSources        []TaskSource       `toml:"task_sources"`
+	Classifier         []ClassifierRule   `toml:"classifier"`
 	// CaptureDelays are optional per-agent-type overrides for the delayed
 	// pane capture; absent rules fall back to built-in defaults (not part
 	// of fillZeroes — optional tables, absent is not "zeroed").
@@ -954,6 +1316,11 @@ func Default() Config {
 		Logging: Logging{Level: "info", MaxSizeMB: 16},
 		TUI:     TUI{TerminalBell: true, HerdrNotification: true, MaxInstances: 1},
 		CLI:     CLI{AIAgentFriendlyOutput: true},
+		// Task lists stay on this machine unless the operator says otherwise.
+		// Named explicitly rather than left to the zero value so FieldValue
+		// renders something for the registry parity test, and so an operator
+		// reading a saved config sees the posture they are running under.
+		TaskSourceProvider: TaskSourceProvider{Provider: ProviderLocalFS},
 	}
 }
 
@@ -1431,6 +1798,14 @@ func (c *Config) fillZeroes() {
 	// Logging.AuditExcerptRetentionDays is deliberately absent here: it is a
 	// pointer precisely so an explicit 0 ("never prune") survives this pass.
 	c.normalizeTaskSources()
+	// Only an EMPTY provider is filled. An unrecognized one is left exactly as
+	// written: coercing it to local_fs would resolve every gist-shaped path
+	// against the daemon's cwd and silently create local checklist files while
+	// the operator believed their lists were remote. Fail at use instead, where
+	// the message can name the key and the valid values.
+	if c.TaskSourceProvider.Provider == "" {
+		c.TaskSourceProvider.Provider = d.TaskSourceProvider.Provider
+	}
 	if c.Limits.MaxConsecutiveAutoPrompts <= 0 {
 		c.Limits.MaxConsecutiveAutoPrompts = d.Limits.MaxConsecutiveAutoPrompts
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"sort"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
+	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 )
 
 // Auto-send-when-idle (opt-in per [[task_sources]] via
@@ -595,22 +595,21 @@ func inProgressTask(content, taskText string) bool {
 	return false
 }
 
-// canonicalTaskPath resolves a task-source path to the one key that identifies
-// the physical file (~ and $VAR expanded, then absolute, symlinks resolved —
-// the same normalization taskfile.LockPath applies). Claims are compared by
-// path, and two [[task_sources]] entries can spell the same file differently
-// (including one as `~/tasks.md` and another as its absolute form); without
-// this they would look like different sources and could promise one line to two
-// agents in a single sweep.
-func canonicalTaskPath(path string) string {
-	path = config.ExpandPath(path)
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
-	}
-	return path
+// canonicalTaskPath resolves a task-list locator to the one key that identifies
+// it. Claims are compared by this key, and two [[task_sources]] entries can
+// spell the same list differently (including one as `~/tasks.md` and another as
+// its absolute form); without this they would look like different sources and
+// could promise one line to two agents in a single sweep.
+//
+// It delegates to tasklocator.Canonical, which is the SAME function
+// taskfile.LockPath and the TUI's grouping use. That sharing is load-bearing
+// rather than tidy: a locator carrying a scheme (gist://…) must be returned
+// verbatim, and filepath.Abs does not fail on one — it silently returns
+// "<cwd>/gist:/id/f.md", differently in every process. Two copies of this
+// normalization with only one of them branching would have the daemon's claims
+// and the TUI's grouping disagree, with nothing erroring.
+func canonicalTaskPath(locator string) string {
+	return tasklocator.Canonical(locator)
 }
 
 // autoSendParked is the positive allowlist of statuses that may be handed

@@ -32,6 +32,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 	"github.com/0xGosu/herdr-auto-pilot/internal/updatecheck"
 )
 
@@ -3008,20 +3009,19 @@ func truncatePathKeepBase(p string, limit int) string {
 // pending count and live-agent names survive on ordinary pane widths.
 const taskPathDisplayWidth = 44
 
-// canonicalTaskPath normalizes a source path for identity comparisons (the
-// duplicate dedupe and the per-file delete ordering): ~/$VAR expanded, then
-// absolute + symlinks resolved, best-effort. Two config spellings of one file
-// (relative vs absolute, ~/x vs its absolute form, /var vs /private/var) must
-// not slip past the dedupe and mutate the same line twice.
-func canonicalTaskPath(p string) string {
-	p = config.ExpandPath(p)
-	if abs, err := filepath.Abs(p); err == nil {
-		p = abs
-	}
-	if resolved, err := filepath.EvalSymlinks(p); err == nil {
-		p = resolved
-	}
-	return p
+// canonicalTaskPath normalizes a task-list locator for identity comparisons
+// (the duplicate dedupe and the per-file delete ordering). Two config spellings
+// of one list (relative vs absolute, ~/x vs its absolute form, /var vs
+// /private/var) must not slip past the dedupe and mutate the same line twice.
+//
+// It delegates to tasklocator.Canonical — the SAME function taskfile.LockPath
+// and the daemon's claim map use. A locator carrying a scheme (gist://…) is
+// returned verbatim, which matters because filepath.Abs does not fail on one:
+// it silently returns "<cwd>/gist:/id/f.md", and the TUI's cwd is not the
+// daemon's, so a local copy of this normalization would make the two disagree
+// about which lists are the same list.
+func canonicalTaskPath(locator string) string {
+	return tasklocator.Canonical(locator)
 }
 
 // markedTaskTargets returns the marked items (in list order) or, with no
@@ -4955,6 +4955,8 @@ func configFieldChoices(key string) (choices []string, ok bool) {
 	switch key {
 	case "tui.theme":
 		return config.ValidThemes, true
+	case "task_source_provider.provider":
+		return config.ValidTaskSourceProviders, true
 	default:
 		return nil, false
 	}

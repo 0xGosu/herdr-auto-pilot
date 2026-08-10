@@ -16,6 +16,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 )
 
 // Mutate applies fn to the file's content as one locked read-modify-write and
@@ -89,28 +90,25 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return os.Rename(tmpName, path)
 }
 
-// LockPath returns a stable, hap-owned lock-file path for a task file, keyed
-// by the file's canonical path. Keeping the lock in a shared temp dir — rather
-// than a `<file>.lock` sidecar — serializes concurrent mutations without
-// dropping a stray lock file into the user's repo next to a --path checklist.
+// LockPath returns a stable, hap-owned lock-file path for a task list, keyed by
+// its canonical locator. Keeping the lock in a shared temp dir — rather than a
+// `<file>.lock` sidecar — serializes concurrent mutations without dropping a
+// stray lock file into the user's repo next to a --path checklist.
 //
-// The path is canonicalized (~/$VAR expanded, then absolute + symlinks
-// resolved, best-effort) so every caller — the daemon, the CLI, the TUI's
-// add/edit, and the TUI's bulk toggle/delete (which passes an already
-// symlink-resolved path) — hashes to the SAME key for one physical file.
-// Without this, a symlinked path component (e.g. macOS /var vs /private/var),
-// or one config spelling a source `~/tasks.md` and another its absolute form,
-// would yield two different locks and stop serializing concurrent mutations of
-// the same checklist.
-func LockPath(path string) string {
-	path = config.ExpandPath(path)
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
-	}
-	sum := sha256.Sum256([]byte(path))
+// The locator is canonicalized by tasklocator.Canonical (~/$VAR expanded, then
+// absolute + symlinks resolved for a filesystem path; returned verbatim for a
+// scheme'd one) so every caller — the daemon, the CLI, the TUI's add/edit, and
+// the TUI's bulk toggle/delete, which passes an already symlink-resolved path —
+// hashes to the SAME key for one list. Without this, a symlinked path component
+// (e.g. macOS /var vs /private/var), or one config spelling a source
+// `~/tasks.md` and another its absolute form, would yield two different locks
+// and stop serializing concurrent mutations of the same checklist.
+//
+// The lock is what serializes hap's processes over a REMOTE list too: a gist
+// has no compare-and-swap, so its read-modify-write is guarded by exactly this
+// lock rather than by a conditional write.
+func LockPath(locator string) string {
+	sum := sha256.Sum256([]byte(tasklocator.Canonical(locator)))
 	return filepath.Join(os.TempDir(), "hap-task-locks", hex.EncodeToString(sum[:16])+".lock")
 }
 
