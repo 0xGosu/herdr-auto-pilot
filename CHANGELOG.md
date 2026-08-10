@@ -10,6 +10,9 @@ assigns. Do not add a heading or an entry by hand.
 
 ## 0.6.0
 
+- Added a provider column to `hap task-source list` and a task-store line to `hap status`, both shown only once something selects a non-default storage backend — an install that never touched the setting sees exactly the output it always did. Each row says whether its provider is inherited from the default or overridden on the source, because an inherited value and an identical override behave differently the next time you change the default.
+- Added `provider` and `gist_id` to the TUI Config tab's task-source editor (`enter` on a source row), including an `inherit` choice that puts a source back to following the default.
+- `hap status` now names a misconfigured task store and why it cannot be reached, in the same words every other surface uses.
 - Added a task-list storage provider: set `[task_source_provider] provider = "github_gist"` and a task source's checklist lives as a file inside a GitHub gist you own instead of on this machine, so a herd spread across hosts shares one list. Off by default, and the setting is a DEFAULT — each `[[task_sources]]` entry can override it, so some agents can keep their lists local while others are in a gist at the same time.
 - Changed what a task source's `path` means under a remote provider: name a file to share one list across every agent the source matches, or leave it out and each matched agent gets its own list named after it, created the first time it is handed a task.
 - Added `hap task-source provider`, which shows where lists are stored, which gist, and whether the credential file resolved — never the token itself.
@@ -17,6 +20,7 @@ assigns. Do not add a heading or an entry by hand.
 - Fixed a generated task list being overwritten when hap could not read it. An unreadable-but-present list was treated as empty and then replaced, discarding every task in it; the read now happens inside the locked update and a failure leaves the list untouched.
 - Fixed two simultaneous generated-task confirmations racing to create the same list, where the second one's write discarded the first one's tasks.
 - Changed the privacy promise: hap still makes no outbound call in its default configuration. Enabling the gist provider sends the task lists of the sources using it — and only those task lists, never pane content, learned rules or the audit log — to a gist you own, using a token you supply.
+- Changed how a stranded task hand-out is returned to the pending list when the task source is stored remotely: the release now happens in the background and its result is settled on the daemon's next turn, instead of the daemon waiting on the network once per stranded row. A backlog of stranded hand-outs no longer delays every other agent's classification and delivery. Local task lists are unaffected — they are released exactly as before.
 
 ## 0.5.34
 

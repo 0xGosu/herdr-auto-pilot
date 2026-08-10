@@ -1,3 +1,0 @@
-- Added a provider column to `hap task-source list` and a task-store line to `hap status`, both shown only once something selects a non-default storage backend — an install that never touched the setting sees exactly the output it always did. Each row says whether its provider is inherited from the default or overridden on the source, because an inherited value and an identical override behave differently the next time you change the default.
-- Added `provider` and `gist_id` to the TUI Config tab's task-source editor (`enter` on a source row), including an `inherit` choice that puts a source back to following the default.
-- `hap status` now names a misconfigured task store and why it cannot be reached, in the same words every other surface uses.
