@@ -778,10 +778,23 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// de-dupes under UpdateConfig's advisory lock. Running them before the claim means a
 	// failure here leaves the escalation still pending, so the operator can
 	// retry; only the non-idempotent send is gated by the claim below.
-	if err := os.MkdirAll(filepath.Dir(bootstrapPath), 0o700); err != nil {
+	// Resolve the list ONCE, by the same rule addTaskSourceIfAbsent registers
+	// by, so the tasks are written where the source will actually point. Under
+	// a remote default those differ: the bootstrap path is a local file while
+	// the registered source names a file in the store, and writing to one while
+	// registering the other leaves the agent with an empty list.
+	bootstrapSrc := config.TaskSource{Agent: name}
+	path := bootstrapPath
+	if cfg.ResolveProvider(bootstrapSrc).Remote() {
+		bootstrapSrc.Path = config.SanitizeTaskFileName(name) + ".md"
+		l, lerr := a.resolveSourceList(cfg, bootstrapSrc, name)
+		if lerr != nil {
+			return fmt.Errorf("resolve task list for %s: %w", name, lerr)
+		}
+		path = l.Locator
+	} else if err := os.MkdirAll(filepath.Dir(bootstrapPath), 0o700); err != nil {
 		return fmt.Errorf("create tasks dir: %w", err)
 	}
-	path := bootstrapPath
 	// Every task is written pending ("[ ]"); the first is marked in-progress
 	// ("[-]") only below, at delivery time, so a confirm that sends nothing
 	// leaves it for the daemon's normal declared-task flow (issue #156).
@@ -793,7 +806,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// A bootstrap always registers a fresh source, which carries no explicit
 	// max_tasks, so the default cap applies — the same limit a later append or
 	// `task add` would enforce once the source is declared.
-	merged, err := ensureGeneratedTaskFile(path, name, tasks, config.DefaultMaxTasks)
+	merged, err := a.ensureGeneratedTaskFile(ctx, cfg, path, name, tasks, config.DefaultMaxTasks)
 	if err != nil {
 		if errors.Is(err, errTaskCapExceeded) {
 			return err
@@ -913,24 +926,38 @@ func taskCapExceededError(path string, existing, adding, limit int) error {
 // be re-confirmed idempotently. The write is atomic because the daemon reads
 // this file without the lock. Returns the merged task list (raw, unnumbered) so
 // the caller can locate a task's rendered position.
-func ensureGeneratedTaskFile(path, name string, tasks []string, limit int) ([]string, error) {
-	// Expand ~/$VAR so the manual os.ReadFile/WriteFileAtomic below and the
-	// lock key all resolve to the same physical file the daemon uses.
-	path = config.ExpandPath(path)
-	lockPath := taskLockPath(path)
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+func (a *App) ensureGeneratedTaskFile(ctx context.Context, cfg config.Config,
+	locator, name string, tasks []string, limit int) ([]string, error) {
+
+	// Create-if-missing, then ONE locked read-modify-write through the store.
+	// This replaces a hand-rolled lock + os.ReadFile + WriteFileAtomic, which
+	// was local-only — so under a remote provider it wrote the agent's tasks to
+	// a file on this machine while the source it registered pointed at the
+	// store, and the agent's real list stayed empty.
+	if _, err := a.ensureList(ctx, cfg, locator, ""); err != nil {
 		return nil, err
 	}
-	unlock, err := lockFile(lockPath)
+	var merged []string
+	_, err := a.mutateList(ctx, cfg, locator, func(existing string) (string, error) {
+		out, mErr := generatedTaskContent(existing, name, tasks, limit, locator)
+		if mErr != nil {
+			return "", mErr
+		}
+		merged = mergeGeneratedTasks(existing, tasks)
+		return out, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
+	return merged, nil
+}
 
-	existing := ""
-	if b, rerr := os.ReadFile(path); rerr == nil {
-		existing = string(b)
-	}
+// generatedTaskContent is the pure transform ensureGeneratedTaskFile applies:
+// merge, render, carry markers over, and enforce the cap. Split out so it runs
+// INSIDE the store's critical section, on content the store just read — the
+// previous shape read the file itself and swallowed a read error as "empty",
+// which then OVERWROTE an unreadable-but-present list and discarded it.
+func generatedTaskContent(existing, name string, tasks []string, limit int, locator string) (string, error) {
 	merged := mergeGeneratedTasks(existing, tasks)
 	content := domain.RenderGeneratedTaskList(name, merged)
 	if existing != "" {
@@ -938,7 +965,8 @@ func ensureGeneratedTaskFile(path, name string, tasks []string, limit int) ([]st
 			// Idempotent re-confirm: no task is added, so the cap check is
 			// skipped — an already-over-cap file (a pre-fix write, or a manual
 			// edit) stays re-confirmable instead of stranding its escalation.
-			return merged, nil
+			// Returning the content unchanged makes the mutation a no-op.
+			return existing, nil
 		}
 		// merged lists every existing task, so carry-over drops nothing — it
 		// only restores each preserved item's "[-]"/"[x]" marker onto its
@@ -955,12 +983,9 @@ func ensureGeneratedTaskFile(path, name string, tasks []string, limit int) ([]st
 	uniqueExisting := len(mergeGeneratedTasks(existing, nil))
 	adding := len(merged) - uniqueExisting
 	if limit > 0 && adding > 0 && len(merged) > limit {
-		return nil, taskCapExceededError(path, uniqueExisting, adding, limit)
+		return "", taskCapExceededError(tasklocator.Display(locator), uniqueExisting, adding, limit)
 	}
-	if err := writeFileAtomic(path, []byte(content), 0o600); err != nil {
-		return nil, err
-	}
-	return merged, nil
+	return content, nil
 }
 
 // mergeGeneratedTasks builds the task list for a (re)generated file: every task

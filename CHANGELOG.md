@@ -14,7 +14,7 @@ assigns. Do not add a heading or an entry by hand.
 - Changed what a task source's `path` means under a remote provider: name a file to share one list across every agent the source matches, or leave it out and each matched agent gets its own list named after it, created the first time it is handed a task.
 - Added `hap task-source provider`, which shows where lists are stored, which gist, and whether the credential file resolved — never the token itself.
 - Changed the next-task prompt under a remote provider: it no longer offers `--path`, which always reads a local file and would have pointed the agent at something that does not exist.
-- Fixed a generated task list being overwritten when hap could not read it. An unreadable-but-present list was treated as empty and then replaced, discarding the tasks in it; it now fails and leaves the file alone.
+- Fixed a generated task list being overwritten when hap could not read it. An unreadable-but-present list was treated as empty and then replaced, discarding every task in it; the read now happens inside the locked update and a failure leaves the list untouched.
 - Fixed two simultaneous generated-task confirmations racing to create the same list, where the second one's write discarded the first one's tasks.
 - Changed the privacy promise: hap still makes no outbound call in its default configuration. Enabling the gist provider sends the task lists of the sources using it — and only those task lists, never pane content, learned rules or the audit log — to a gist you own, using a token you supply.
 
