@@ -140,6 +140,10 @@ type Daemon struct {
 	// cached — it reads through exactly as it always has.
 	taskSnapshots map[string]taskSnapshot
 
+	// taskReclaimResults carries an off-loop stranded-task release back to the
+	// loop, where its ledger row, claim and audit row are settled.
+	taskReclaimResults chan taskReclaimOutcome
+
 	// testTaskStore overrides backend resolution. Only tests set it, so the
 	// cache can be exercised against a fake without standing up a registry and
 	// a config; production always goes through d.stores.
@@ -468,6 +472,7 @@ func New(opt Options) (*Daemon, error) {
 	d := &Daemon{
 		opt:                       opt,
 		taskSnapshots:             map[string]taskSnapshot{},
+		taskReclaimResults:        make(chan taskReclaimOutcome, 32),
 		verifyUnblockDelay:        unblockCheckDelay,
 		transitions:               make(chan domain.AgentTransition, 256),
 		nudges:                    make(chan control.Kind, 16),
@@ -1136,6 +1141,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.reconcileAttention(ctx)
 				return nil
 			})
+		case res := <-d.taskReclaimResults:
+			d.handleTaskReclaimOutcome(ctx, res)
 		case res := <-d.llmResults:
 			logging.Guard("llm-result", func() error {
 				d.handleLLMOutcome(ctx, res)

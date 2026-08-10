@@ -481,6 +481,22 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 			d.escalateNeverStartedTask(ctx, r, live[r.AgentID], attempts, now)
 			continue
 		}
+		// Over a REMOTE store this release is a read AND a write, and the loop
+		// would pay both per row, serially. Hand it to a goroutine and settle
+		// the row when its outcome comes back (handleTaskReclaimOutcome). The
+		// agent is held awaiting for THIS sweep because its row is still open —
+		// the same state every other "leave it alone" branch leaves it in — so
+		// the release simply completes a sweep later, never differently.
+		if d.asyncTaskWriteback(r.SourcePath) {
+			if d.releaseStrandedAsync(ctx, r, live[r.AgentID]) {
+				awaiting[r.AgentID] = true
+				continue
+			}
+			// Shutting down: nothing was scheduled, so leave the row for a
+			// future daemon rather than releasing it inline on the way out.
+			awaiting[r.AgentID] = true
+			continue
+		}
 		if err := d.opt.MutateTaskFile(r.SourcePath, taskfile.Reclaim(r.ItemIndex, r.TaskText)); err != nil {
 			slog.Warn("auto-send: stranded task could not be returned to [ ]",
 				"path", r.SourcePath, "task", r.TaskText, "error", err)
