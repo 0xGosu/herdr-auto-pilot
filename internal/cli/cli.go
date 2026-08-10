@@ -23,6 +23,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 )
 
 // ErrUnhealthy signals that `hap status` found the daemon in an unhealthy
@@ -2344,7 +2345,15 @@ func taskList(app *frontend.App, out io.Writer, agent, path string, args []strin
 	// next-task prompt only points the agent at `hap task <agent> list`, so it
 	// reads them beside the actual task numbers. Only `list` prints them —
 	// the mutating ops reprint the list without repeating the instructions.
-	fmt.Fprint(out, "\n"+domain.TaskManagementHints(agent, resolved))
+	// The hints must match where the list actually lives. `resolved` is a
+	// LOCATOR: printing it raw would show the agent a gist:// string, and the
+	// local form's closing line offers a `--path` fallback that reads a local
+	// file — which under a remote provider names something that does not exist.
+	if tasklocator.Remote(resolved) {
+		fmt.Fprint(out, "\n"+domain.RemoteTaskManagementHints(agent, tasklocator.Display(resolved)))
+	} else {
+		fmt.Fprint(out, "\n"+domain.TaskManagementHints(agent, resolved))
+	}
 	return nil
 }
 

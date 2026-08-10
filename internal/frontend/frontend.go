@@ -854,7 +854,9 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		// task source, so every idle-task handoff includes both the task and
 		// its list. The prompt sends the task text, not the numbered file line.
 		prompt := domain.DeclaredTask{
-			Task: taskText, Path: path, AgentName: name,
+			Task: taskText, AgentName: name,
+			Path:   tasklocator.Display(path),
+			Remote: tasklocator.Remote(path),
 		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
 			if _, rbErr := mutateTaskFile(path, releaseTask(pos, itemText)); rbErr != nil {
@@ -1300,7 +1302,9 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 			return fmt.Errorf("tasks appended to %s, but reserving task #%d (nothing was sent): %w", path, firstIndex, err)
 		}
 		prompt := domain.DeclaredTask{
-			Task: tasks[0], Path: path, Template: src.NextTaskTemplate,
+			Task: tasks[0], Template: src.NextTaskTemplate,
+			Path:      tasklocator.Display(path),
+			Remote:    tasklocator.Remote(path),
 			AgentName: name, Cwd: cwd,
 		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
@@ -3139,8 +3143,15 @@ func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName,
 		// error in a flow whose first question is "did it send?".
 		return fmt.Errorf("reserving task #%d (nothing was sent): %w", index, err)
 	}
+	// Path is the DISPLAY address ({task_list_path}), never the locator: under a
+	// remote provider the locator is a gist:// string, which is not something an
+	// operator or an agent can act on. Remote selects the default template that
+	// omits the --path clause, since --path reads a local file.
 	prompt := domain.DeclaredTask{
-		Task: taskText, Content: folded, Path: sourcePath, Template: template, AgentName: agentName, Cwd: cwd,
+		Task: taskText, Content: folded,
+		Path:     tasklocator.Display(sourcePath),
+		Remote:   tasklocator.Remote(sourcePath),
+		Template: template, AgentName: agentName, Cwd: cwd,
 	}.Prompt()
 	if err := ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt); err != nil {
 		if _, rbErr := a.mutateTask(sourcePath, releaseTask(index, taskText)); rbErr != nil {

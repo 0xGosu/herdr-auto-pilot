@@ -84,7 +84,11 @@ func taskManagementHints(agent, path string, remote bool) string {
 	b.WriteString("- `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.1`); otherwise its position in the list, which `'#3'` always addresses (quote it — a bare #3 is a shell comment).\n")
 	switch {
 	case remote:
-		b.WriteString("- your task list is stored remotely, not as a file here — `hap task` is the only way to read or change it, and `--path` will not reach it.\n")
+		// Deliberately does not name the --path flag even to warn against it:
+		// an agent that reads a flag name tends to try it. State the fact
+		// instead — there is no local file — which answers the same question
+		// without handing over a spelling to experiment with.
+		b.WriteString("- your task list is stored remotely; there is no file here to open or edit, so `hap task` is the only way to read or change it.\n")
 	case agent != "":
 		fmt.Fprintf(&b, "- when the agent name `%s` is no longer recognized, use `--path %s` in place of `%s`\n", agent, quoted, agent)
 	}
@@ -195,11 +199,6 @@ const DefaultRemoteNextTaskTemplate = "Your next task is {next_task_content}. " 
 // references --path, not silently edited.
 func TemplateOrDefault(template string) string {
 	return templateOrDefault(template, false)
-}
-
-// RemoteTemplateOrDefault is TemplateOrDefault for a remote list.
-func RemoteTemplateOrDefault(template string) string {
-	return templateOrDefault(template, true)
 }
 
 func templateOrDefault(template string, remote bool) string {
