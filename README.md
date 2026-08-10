@@ -34,11 +34,15 @@ and correctable.
   deploys, credential changes, …), a global pause/kill switch, a runaway-loop
   guard, and an error-retry ceiling all veto automation.
 - **Local by default** — learning data, history, and the audit log live in
-  SQLite on your machine. Hap sends no telemetry. Its only outbound call is a
-  version check that asks GitHub for the newest release (at most every 6h,
-  nothing about you is sent) so the TUI can flag an available update; switch it
-  off with `hap config set tui.disable_check_for_update true`. An optional CLI
-  you configure may use its provider's service.
+  SQLite on your machine. Hap sends no telemetry. In its default configuration
+  its only outbound call is a version check that asks GitHub for the newest
+  release (at most every 6h, nothing about you is sent) so the TUI can flag an
+  available update; switch it off with
+  `hap config set tui.disable_check_for_update true`. Two things you can turn on
+  do talk to a service: an optional CLI you configure may use its provider's
+  service, and setting a task source's storage provider to `github_gist` puts
+  that source's checklist in a gist you own (see *Where task lists are stored*)
+  — its task text and nothing else. Both are off unless you configure them.
 
 ## Quickstart
 
@@ -64,8 +68,8 @@ herdr plugin install 0xGosu/herdr-auto-pilot --yes
 
 The TUI header flags a newer release next to the version
 (`Herd Auto Prompter v0.5.3 ↑ v0.5.4 available`). It learns that from a GitHub
-release check that runs at most every 6 hours while the TUI is open — the
-plugin's only outbound call, and off with
+release check that runs at most every 6 hours while the TUI is open — the only
+outbound call the plugin makes unless you configure one, and off with
 `hap config set tui.disable_check_for_update true`. A locally built (`herdr
 plugin link`) binary never shows the hint.
 
@@ -644,6 +648,68 @@ next_task_template = "Your next task is {next_task_content}. Read the full tasks
 # above.
 # enable_auto_send_task_when_idle = true
 ```
+
+#### Where task lists are stored
+
+By default a checklist is a file on the machine hap runs on, and nothing about
+it leaves that machine. `[task_source_provider]` changes where lists are kept:
+
+```toml
+[task_source_provider]
+provider = "github_gist"                     # "local_fs" (default) | "github_gist"
+env_file = "~/.config/hap/task_source.env"   # holds GITHUB_TOKEN; read at use time
+
+[task_source_provider.github_gist]
+gist_id = "3f2a1b9c4d5e6f708192a3b4c5d6e7f8"
+```
+
+This section is a **default**, not a global switch. Every `[[task_sources]]`
+entry may override it, so one agent can keep a local checklist while another's
+lives in a gist:
+
+```toml
+[[task_sources]]          # inherits github_gist; no path, so this agent gets
+agent = "brave-otter"     #   its own "brave-otter.md" inside the gist
+
+[[task_sources]]          # overrides back to a file on this machine
+agent = "legacy-fox"
+provider = "local_fs"
+path = "/home/me/project/docs/tasks.md"
+
+[[task_sources]]          # inherits the provider, but uses a different gist
+agent = "secret-badger"
+gist_id = "aa11bb22cc33dd44ee55ff6677889900"
+```
+
+A source that sets no `provider` **keeps inheriting** it: change the default and
+every inheriting source moves with it. hap never writes the inherited value back
+into a source.
+
+Three things stay exactly as they were. A `[[task_sources]]` entry is still what
+opts an agent in — the provider only changes *where* that entry's list lives,
+never *which* agents have one. Every safety control still applies at delivery.
+And `local_fs` is still the default, so an install that never touches this
+section behaves identically.
+
+Under `github_gist`, `path` names a file **inside** the gist rather than a
+filesystem path. Set it and every agent the source matches shares one list;
+leave it out and each matched agent gets its own `<agent-name>.md`, created the
+first time it is handed a task.
+
+hap never creates the gist. Create a **secret** gist on github.com, copy the hex
+id out of its URL, and paste it into `gist_id`; hap creates and updates the files
+inside it. The token lives in the file `env_file` names, never in `config.toml` —
+its contents are read when hap reaches the store, so rotating it needs no
+restart, and a save can never copy it into your config. Give the token the
+`gist` scope and keep the file mode `0600`.
+
+`hap task-source provider` shows what is in force — the provider, the gist, and
+whether the credential file resolved — without ever printing the token.
+
+**Privacy.** Enabling this sends the task lists of the sources using it to
+GitHub. That is the only thing it sends: no pane content, no learned rules, no
+audit history. The default configuration still makes no outbound call beyond the
+opt-out release check.
 
 #### Keeping idle agents working
 

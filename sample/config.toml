@@ -481,6 +481,74 @@ ai_agent_friendly_output = true   # append a "Next steps" footer to command outp
                                   # never do (a bare value stays capturable).
                                   # Per-run equivalents: --no-hints, HAP_NO_HINTS=1
 
+# ── Where task lists are stored: the DEFAULT (per-source overridable) ──
+# This section supplies the DEFAULT storage for the checklists below. Each
+# [[task_sources]] entry may override it, so some agents can keep their lists
+# on this machine while others share one in a gist — at the same time.
+#
+# It does NOT decide WHICH agents have task lists: a [[task_sources]] entry is
+# still required to opt an agent in, and an agent no entry matches behaves
+# exactly as it always did.
+#
+# A source that sets no `provider` INHERITS this one, and keeps inheriting:
+# change the value here and every inheriting source moves with it. hap never
+# writes the inherited value back into a source (that would freeze it).
+#
+# Values: "local_fs" (default) | "github_gist"
+# [task_source_provider]
+# provider = "local_fs"
+
+# ── github_gist ─────────────────────────────────────────────────────
+# PRIVACY: this sends the task lists of the sources using it to GitHub. The
+# default ("local_fs") keeps every checklist on this machine and makes no
+# outbound call. Nothing else is ever sent: no pane content, no learned rules,
+# no audit log.
+#
+# Every list is a FILE inside ONE gist you already own. hap NEVER creates the
+# gist: make a SECRET gist on github.com, copy the hex id out of its URL, and
+# paste it below. hap creates and updates the files inside it on demand.
+# provider = "github_gist"
+#
+# Credentials live OUTSIDE this file, and there is exactly ONE env file for
+# every provider and every source — credentials are global, addressing is
+# per-source. Its CONTENTS are read when hap reaches the store, never at config
+# load, so a token can never be copied into config.toml by a save, and editing
+# the file applies to the next read with no restart. A configured-but-unreadable
+# file FAILS the operation (escalation on the daemon path); it never falls back
+# to an unauthenticated call. Keep it mode 0600.
+#   env_file contents (one KEY=VALUE per line):
+#     GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx   # a token with the `gist` scope
+# env_file = "~/.config/hap/task_source.env"
+#
+# timeout_seconds bounds one call to the store (0 = the built-in 20s).
+# refresh_seconds is how long the daemon may reuse a cached copy of a remote
+# list before re-reading it (0 = the built-in 30s; negative = never cache).
+# Neither has any effect under local_fs, which is always read through.
+# timeout_seconds = 20
+# refresh_seconds = 30
+#
+# [task_source_provider.github_gist]
+# gist_id = "3f2a1b9c4d5e6f708192a3b4c5d6e7f8"
+#
+# Then, per source below: under a remote provider `path` is a file name INSIDE
+# the gist, not a filesystem path. Set it to share ONE list across every agent
+# the source matches, or leave it out entirely and each matched agent gets its
+# own list named after it ("<agent-name>.md"), created the first time it is
+# handed a task.
+#
+# A worked mixed configuration:
+#   [[task_sources]]                 # inherits github_gist; own list per agent
+#   agent = "brave-otter"
+#
+#   [[task_sources]]                 # overrides back to a local file
+#   agent = "legacy-fox"
+#   provider = "local_fs"
+#   path = "/home/me/project/docs/tasks.md"
+#
+#   [[task_sources]]                 # inherits the provider, not the gist
+#   agent = "secret-badger"
+#   gist_id = "aa11bb22cc33dd44ee55ff6677889900"
+
 # ── Declared task lists for idle agents (repeatable) ────────────────
 # Without a declared source, the plugin falls back to inferring the next
 # task from the agent's own todo rendering, gated only by confidence_thresholds
