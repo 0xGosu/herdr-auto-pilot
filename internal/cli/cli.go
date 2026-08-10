@@ -795,6 +795,12 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "pending escalations: %d\n", st.PendingEscalations)
 	fmt.Fprintf(out, "monitored agents:    %d\n", len(st.MonitoredAgents))
+	// Where task lists live, and why they cannot be reached when they cannot.
+	// `hap status` is the surface an operator runs first, so a broken store
+	// becomes visible without having to think to run `task-source provider`.
+	if cfg, cfgErr := app.Config(); cfgErr == nil {
+		printTaskStoreLine(out, cfg)
+	}
 	// The crash-loop breaker's auto-disable is the authoritative state and
 	// replaces the config-derived line (which can't know matching was forced
 	// off); it latches until the [embedding] config changes.
@@ -1288,6 +1294,57 @@ func printConfig(out io.Writer, cfg config.Config) {
 	}
 	fmt.Fprintf(out, "task sources: %d, operator never-auto rules: %d (+%d seed)\n",
 		len(cfg.TaskSources), len(cfg.Safety.NeverAutoPatterns)+len(cfg.Safety.NeverAutoRules), seedCount)
+	printTaskStoreLine(out, cfg)
+}
+
+// printTaskStoreLine reports where task lists live, and why they cannot be
+// reached when they cannot.
+//
+// Printed only when something selects a non-default backend: `hap status` is
+// the surface an operator runs first, so a line saying "local, as always" would
+// be noise on every install that never touched the setting. When a remote
+// backend IS configured, this is where a broken one becomes visible without
+// having to think to run `hap task-source provider`.
+func printTaskStoreLine(out io.Writer, cfg config.Config) {
+	if !cfg.AnyNonDefaultProvider() {
+		return
+	}
+	def := cfg.ResolveProvider(config.TaskSource{})
+	fmt.Fprintf(out, "task store: default %s", def.Name)
+	if def.Remote() {
+		fmt.Fprintf(out, " gist=%s env_file=%s", shortGistID(def.GistID), describeEnvFile(def.EnvFile))
+	}
+	overrides := 0
+	for _, src := range cfg.TaskSources {
+		if src.Provider != "" || src.GistID != "" {
+			overrides++
+		}
+	}
+	if overrides > 0 {
+		fmt.Fprintf(out, "; %d source(s) override it", overrides)
+	}
+	fmt.Fprintln(out)
+	// The same message every other surface reports, so an operator does not
+	// have to reconcile two wordings for one problem.
+	if err := config.ValidateResolvedProvider(cfg, -1, config.TaskSource{}); err != nil {
+		fmt.Fprintf(out, "task store: MISCONFIGURED — %v\n", err)
+	}
+}
+
+// taskSourceLocation renders where one source's list lives, as a labelled token
+// for `task-source list`. Under a remote provider the label changes from path=
+// to gist_file=, because a value that is neither a path nor even a fixed string
+// must not be presented as one.
+func taskSourceLocation(p config.ResolvedProvider, path string) string {
+	if !p.Remote() {
+		return "path=" + path
+	}
+	if path == "" {
+		// The literal angle brackets are the point: this row has no single
+		// file, it has one per matched agent.
+		return "gist_file=<agent-name>.md (per matched agent)"
+	}
+	return fmt.Sprintf("gist_file=%q", path)
 }
 
 // printDiskLine reports what hap is using disk for, and under what retention.
@@ -1441,8 +1498,38 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 			fmt.Fprintln(out, "no task sources configured")
 			return nil
 		}
+		// The header and the provider token appear ONLY when something selects
+		// a non-default backend. An install that has never touched the setting
+		// keeps byte-identical output, which is what every existing script and
+		// the copy-pasteable "#0" convention depend on.
+		showProvider := cfg.AnyNonDefaultProvider()
+		if showProvider {
+			def := cfg.ResolveProvider(config.TaskSource{})
+			fmt.Fprintf(out, "provider default: %s", def.Name)
+			if def.Remote() {
+				fmt.Fprintf(out, " gist_id=%s env_file=%s", shortGistID(def.GistID), describeEnvFile(def.EnvFile))
+			}
+			fmt.Fprintln(out)
+		}
 		for i, src := range cfg.TaskSources {
-			fmt.Fprintf(out, "#%d\tagent=%q workspace=%q path=%s", i, src.Agent, src.Workspace, src.Path)
+			fmt.Fprintf(out, "#%d\tagent=%q workspace=%q", i, src.Agent, src.Workspace)
+			p := cfg.ResolveProvider(src)
+			if showProvider {
+				// Inherited and overridden are always distinguished, even when
+				// the value is identical: otherwise an operator cannot predict
+				// what changing the default will do to this row.
+				origin := "override"
+				if p.NameInherited {
+					origin = "inherited"
+				}
+				fmt.Fprintf(out, " provider=%s(%s)", p.Name, origin)
+				// The default's gist is already in the header; repeating it on
+				// every row is noise, so only an override is shown.
+				if p.Remote() && !p.GistIDInherited {
+					fmt.Fprintf(out, " gist_id=%s(override)", shortGistID(p.GistID))
+				}
+			}
+			fmt.Fprintf(out, " %s", taskSourceLocation(p, src.Path))
 			if src.NextTaskTemplate != "" {
 				fmt.Fprintf(out, " template=%q", src.NextTaskTemplate)
 			}
