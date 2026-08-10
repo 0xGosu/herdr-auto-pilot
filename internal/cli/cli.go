@@ -1870,11 +1870,10 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 		if err != nil {
 			return err
 		}
-		switch {
-		case name == "":
+		if name == "" {
 			eff := cfg.ResolveProvider(config.TaskSource{})
 			fmt.Fprintf(out, "task source #%d: provider now inherits the default (%s)\n", idx, eff.Name)
-		default:
+		} else {
 			fmt.Fprintf(out, "task source #%d: provider=%s\n", idx, name)
 		}
 		if converted != "" {

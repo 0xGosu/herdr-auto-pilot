@@ -102,8 +102,18 @@ func GistLocator(gistID, file string) string {
 // what credentials, and which list within that backend.
 type Resolved struct {
 	config.ResolvedProvider
-	// Locator identifies the list, canonicalized.
+	// Locator identifies the list, canonicalized. It is the key for I/O,
+	// locking, the claim map and the persisted ledger.
 	Locator string
+	// Display is the operator- and agent-facing address ({task_list_path}).
+	//
+	// It is deliberately NOT the locator. For a local list it is expanded and
+	// absolute but NOT symlink-resolved: resolution belongs to IDENTITY, where
+	// two spellings of one file must collide, and it actively harms display —
+	// on macOS every temp path reads back as /private/var/… instead of the
+	// /var/… the operator wrote, and an operator cannot match what hap printed
+	// against their own config.
+	Display string
 }
 
 // Resolve maps a task source to its backend identity and locator.
@@ -133,6 +143,7 @@ func Resolve(cfg config.Config, src config.TaskSource, agentName string) (Resolv
 			return Resolved{}, fmt.Errorf("task source has no path and provider=%s does not derive one", p.Name)
 		}
 		out.Locator = Canonical(src.Path)
+		out.Display = DisplayPath(src.Path)
 		return out, nil
 	}
 
@@ -155,7 +166,19 @@ func Resolve(cfg config.Config, src config.TaskSource, agentName string) (Resolv
 		return Resolved{}, fmt.Errorf("task source file name: %w", err)
 	}
 	out.Locator = Canonical(GistLocator(p.GistID, file))
+	out.Display = Display(out.Locator)
 	return out, nil
+}
+
+// DisplayPath renders a filesystem task-list path as an operator reads it:
+// ~/$VAR expanded and made absolute, so it means the same thing from any
+// working directory, but NOT symlink-resolved. See Resolved.Display.
+func DisplayPath(path string) string {
+	p := config.ExpandPath(path)
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
 }
 
 // ErrAgentNameRequired reports that a source derives its file name per agent

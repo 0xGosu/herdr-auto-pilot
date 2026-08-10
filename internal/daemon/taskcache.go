@@ -180,16 +180,6 @@ func (d *Daemon) noteTaskListWritten(locator string, content []byte, err error) 
 	d.taskSnapshots[locator] = taskSnapshot{data: content, at: d.opt.Clock.Now(), gen: gen}
 }
 
-// dropTaskSnapshots clears the whole cache. Called when the registry is
-// swapped: a provider or credential change can point the same locator at
-// different content, and a stale entry would outlive the config that produced
-// it.
-func (d *Daemon) dropTaskSnapshots() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.taskSnapshots = map[string]taskSnapshot{}
-}
-
 // taskSnapshotTTL is how long a remote snapshot may be reused. A
 // non-positive value means read through on every call — cachedTaskList then
 // does a blocking read rather than serving anything, which is the point of the

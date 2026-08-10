@@ -34,9 +34,6 @@ func TestLockPathSerializesARemoteLocator(t *testing.T) {
 	const a = "gist://3f2a1b9c/brave-otter.md"
 	const b = "gist://3f2a1b9c/calm-badger.md"
 
-	if LockPath(a) != LockPath(a) {
-		t.Error("the lock key for one remote list must be stable")
-	}
 	if LockPath(a) == LockPath(b) {
 		t.Error("two files in one gist are two lists and must not share a lock")
 	}

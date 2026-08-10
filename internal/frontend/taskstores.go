@@ -92,14 +92,18 @@ func (a *App) resolveList(cfg config.Config, locator string) (resolvedList, erro
 // resolveSourceList resolves one configured source, for the agent it was
 // matched against.
 func (a *App) resolveSourceList(cfg config.Config, src config.TaskSource, agentName string) (resolvedList, error) {
-	store, locator, err := a.taskStores(cfg).For(src, agentName)
+	res, err := tasklocator.Resolve(cfg, src, agentName)
+	if err != nil {
+		return resolvedList{}, err
+	}
+	store, err := a.taskStores(cfg).ForLocator(res.Locator)
 	if err != nil {
 		return resolvedList{}, err
 	}
 	return resolvedList{
 		Store:   store,
-		Locator: locator,
-		Display: tasklocator.Display(locator),
+		Locator: res.Locator,
+		Display: res.Display,
 		Remote:  ports.TaskStoreRemote(store),
 	}, nil
 }

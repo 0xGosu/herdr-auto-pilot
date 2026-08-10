@@ -44,7 +44,7 @@ func (d *Daemon) resolveTaskSource(src config.TaskSource, agentName string) (res
 	}
 	return resolvedSource{
 		Locator: res.Locator,
-		Display: tasklocator.Display(res.Locator),
+		Display: res.Display,
 		Remote:  res.Remote(),
 	}, nil
 }

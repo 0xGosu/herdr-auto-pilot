@@ -2943,37 +2943,6 @@ func resolveTaskSourceFor(cfg config.Config, agent string) (config.TaskSource, e
 	}
 }
 
-func resolveTaskFilePath(cfg config.Config, agent string) (string, error) {
-	var matches []config.TaskSource
-	workspaceOnly := false
-	for _, src := range cfg.TaskSources {
-		if src.Agent == "" {
-			if src.Workspace != "" && src.Workspace != "*" {
-				workspaceOnly = true
-			}
-			continue
-		}
-		if src.Agent == agent {
-			matches = append(matches, src)
-		}
-	}
-	switch len(matches) {
-	case 1:
-		return matches[0].Path, nil
-	case 0:
-		if workspaceOnly {
-			return "", fmt.Errorf("no task source is scoped to agent %q; workspace-scoped sources exist but aren't addressable by name — use --path <file>", agent)
-		}
-		return "", fmt.Errorf("no task source for agent %q; add one first: hap task-source add --agent %s <checklist.md>", agent, agent)
-	default:
-		paths := make([]string, len(matches))
-		for i, m := range matches {
-			paths[i] = m.Path
-		}
-		return "", fmt.Errorf("agent %q matches %d task sources (%s); use --path <file> to pick one", agent, len(matches), strings.Join(paths, ", "))
-	}
-}
-
 // taskFilePath resolves the checklist file to operate on: an explicit --path
 // (relative paths are made absolute so they mean what the caller's shell sees)
 // takes precedence; otherwise the agent's configured source is resolved.
@@ -3031,12 +3000,6 @@ func (a *App) mutateTask(locator string, fn func(string) (string, error)) ([]dom
 // claim rules must have exactly one implementation. These aliases keep the
 // call sites below reading as they always have.
 func lockFile(path string) (func(), error) { return taskfile.Lock(path) }
-
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	return taskfile.WriteFileAtomic(path, data, perm)
-}
-
-func taskLockPath(path string) string { return taskfile.LockPath(path) }
 
 func mutateTaskFile(path string, fn func(string) (string, error)) ([]domain.ChecklistItem, error) {
 	return taskfile.Mutate(path, fn)
@@ -3246,13 +3209,6 @@ func (a *App) paneCwd(ctx context.Context, paneID string) string {
 }
 
 // readChecklist reads and parses a checklist file.
-func readChecklistFile(path string) ([]domain.ChecklistItem, error) {
-	data, err := os.ReadFile(config.ExpandPath(path))
-	if err != nil {
-		return nil, err
-	}
-	return domain.ParseChecklist(string(data)), nil
-}
 
 // TaskGroup is one configured task source plus its parsed checklist, for the
 // aggregated all-agents view (TUI Tasks tab). Err carries a per-source read
