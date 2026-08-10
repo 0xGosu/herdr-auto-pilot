@@ -2720,6 +2720,20 @@ func ReviewBeforeAutoSend(on bool) TaskSourceOption {
 	return func(src *config.TaskSource) { src.EnableLLMReviewBeforeAutoSend = &on }
 }
 
+// Provider overrides where THIS source's list is stored. Applied only when the
+// caller passed one: an unset provider must stay unset on disk, because an
+// empty key IS the inheritance from [task_source_provider], and writing the
+// resolved value would freeze the source against a later change of the default.
+func Provider(name string) TaskSourceOption {
+	return func(src *config.TaskSource) { src.Provider = name }
+}
+
+// GistID overrides which gist this source's list lives in. Same
+// only-when-passed rule as Provider, for the same reason.
+func GistID(id string) TaskSourceOption {
+	return func(src *config.TaskSource) { src.GistID = id }
+}
+
 // AddTaskSource points an agent/workspace at a declared task list (FR-011).
 // template optionally overrides the outbound next-task prompt format
 // ({next_task_content} / {task_list_path} / {agent_name} placeholders);

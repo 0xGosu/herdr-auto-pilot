@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1500,22 +1501,50 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	autoSend := fs.Bool("auto-send-when-idle", false, "also hand out tasks on the periodic idle poll, not only on a herdr attention event")
 	llmReview := fs.Bool("enable-llm-review-before-auto-send", false, "let the configured [llm].command revise the task list and pick the task, immediately before the daemon auto-sends one (never applies to a manual `task send`)")
 	maxTasks := fs.Int("max-tasks", config.DefaultMaxTasks, "cap on how many checklist items this source may hold before task generation stops refilling it")
+	provider := fs.String("provider", "", "where THIS source's list is stored: "+strings.Join(config.ValidTaskSourceProviders, " | ")+"; omit to inherit the [task_source_provider] default and keep inheriting it")
+	gistID := fs.String("gist-id", "", "store this source's list in a specific gist instead of the default one (github_gist only)")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	if fs.NArg() > 1 {
 		// Go's flag parsing stops at the first non-flag argument, so a flag
 		// written AFTER the path is silently not applied — say so instead of
 		// printing the generic usage line, which never mentions the ordering.
-		for _, extra := range fs.Args()[min(fs.NArg(), 1):] {
+		for _, extra := range fs.Args()[1:] {
 			if strings.HasPrefix(extra, "-") {
 				return fmt.Errorf("flags must come before <checklist.md>: %s was read as an argument, not a flag", extra)
 			}
 		}
-		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] <checklist.md> | list | set <index> <key> <value> | remove <index> (see: hap help task-source)")
+		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>] | list | set <index> <key> <value> | remove <index> (see: hap help task-source)")
+	}
+	if *provider != "" && !slices.Contains(config.ValidTaskSourceProviders, *provider) {
+		return fmt.Errorf("--provider must be one of %s, got %q",
+			strings.Join(config.ValidTaskSourceProviders, ", "), *provider)
+	}
+	// Whether the positional is required depends on the provider this source
+	// will actually run under, which may be inherited.
+	cfg, err := app.Config()
+	if err != nil {
+		return err
+	}
+	effective := cfg.ResolveProvider(config.TaskSource{Provider: *provider, GistID: *gistID})
+	if fs.NArg() == 0 && !effective.Remote() {
+		return fmt.Errorf("a checklist path is required under provider=%s: "+
+			"hap task-source add [flags] <checklist.md>", effective.Name)
+	}
+	if *gistID != "" && effective.Name != config.ProviderGitHubGist {
+		// Refused rather than ignored: a silently dropped flag would leave the
+		// operator believing this source targets a gist it does not.
+		return fmt.Errorf("--gist-id has no meaning under provider=%s", effective.Name)
 	}
 	var opts []frontend.TaskSourceOption
+	if *provider != "" {
+		opts = append(opts, frontend.Provider(*provider))
+	}
+	if *gistID != "" {
+		opts = append(opts, frontend.GistID(*gistID))
+	}
 	if *autoSend {
 		opts = append(opts, frontend.AutoSendWhenIdle())
 	}
@@ -1529,7 +1558,8 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	if err := app.AddTaskSource(ctx, *agent, *workspace, fs.Arg(0), *template, opts...); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "task source added: %s (max_tasks=%d)\n", fs.Arg(0), *maxTasks)
+	fmt.Fprintf(out, "task source added: %s (max_tasks=%d)\n",
+		describeAddedSource(effective, fs.Arg(0), *provider == ""), *maxTasks)
 	// Unprompted hand-out is the one setting that makes hap act without a herdr
 	// event, so say so plainly instead of leaving it to `task-source list`.
 	if *autoSend {
@@ -1539,6 +1569,41 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		fmt.Fprintln(out, llmReviewOnMessage)
 	}
 	return nil
+}
+
+// describeAddedSource renders where a newly added source's list will live, in
+// terms an operator can check against their config.
+func describeAddedSource(p config.ResolvedProvider, path string, inherited bool) string {
+	var where string
+	switch {
+	case !p.Remote():
+		where = path
+	case path != "":
+		where = fmt.Sprintf("%q in gist %s (shared by every agent this source matches)",
+			path, shortGistID(p.GistID))
+	default:
+		where = fmt.Sprintf("one list per matched agent (%q in gist %s, created on first hand-out)",
+			"<agent-name>.md", shortGistID(p.GistID))
+	}
+	if inherited && p.Remote() {
+		// Say what they got: they named no provider, so the default decided.
+		where += fmt.Sprintf(" [provider inherited: %s]", p.Name)
+	}
+	return where
+}
+
+// shortGistID renders a gist id as a recognizable prefix. A secret gist's URL
+// is effectively a capability, so hap does not echo one in full outside the
+// config file the operator wrote it into.
+func shortGistID(id string) string {
+	const keep = 8
+	if id == "" {
+		return "(not set)"
+	}
+	if len(id) <= keep {
+		return id
+	}
+	return id[:keep] + "…"
 }
 
 // autoSendOnMessage and llmReviewOnMessage explain a delivery-gate flag the

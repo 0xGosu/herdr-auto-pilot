@@ -670,7 +670,7 @@ func buildCommands() {
 			Group:   groupConfigure,
 			Summary: "declare which checklist file feeds which agent (the config, not the items)",
 			Usage: []string{
-				"hap task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] <checklist.md>",
+				"hap task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>]",
 				"hap task-source list",
 				"hap task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks> <value>",
 				"hap task-source remove <index>",
@@ -682,10 +682,24 @@ func buildCommands() {
 				{Name: "--auto-send-when-idle", Desc: "also hand out tasks on the periodic idle poll, not only on a herdr attention event"},
 				{Name: "--enable-llm-review-before-auto-send", Desc: "let the configured [llm].command revise the task list and pick the task, immediately before the daemon auto-sends one"},
 				{Name: "--max-tasks", Arg: "N", Default: "config default", Desc: "cap on how many items this list may hold before task generation stops refilling it"},
+				{Name: "--provider", Arg: "P", Default: "the [task_source_provider] default", Desc: "where THIS source's list is stored: local_fs | github_gist; omit to inherit the default and keep inheriting it"},
+				{Name: "--gist-id", Arg: "ID", Default: "the [task_source_provider.github_gist] default", Desc: "store this source's list in a specific gist instead of the default one (github_gist only)"},
 			},
 			Details: "Flags must come BEFORE the <checklist.md> path — Go's flag parsing stops at the\n" +
 				"first positional argument, so a flag written after the path is silently ignored\n" +
 				"(hap detects that case and refuses).\n" +
+				"Where the list is STORED is set globally by [task_source_provider] (see\n" +
+				"`hap config set task_source_provider.provider`); --provider overrides it for\n" +
+				"this one source, so some agents can be local while others are in a gist. A\n" +
+				"source that names no provider keeps INHERITING the default, so changing the\n" +
+				"default moves it — hap never writes the inherited value into the source.\n" +
+				"The <checklist.md> argument means different things per provider:\n" +
+				"  local_fs     a filesystem path. REQUIRED.\n" +
+				"  github_gist  a file name INSIDE the gist. Give one and every agent this\n" +
+				"               source matches shares that list; leave it out and each matched\n" +
+				"               agent gets its own \"<agent-name>.md\", created on first hand-out.\n" +
+				"`hap task <agent> …` works the same either way. `--path` on `hap task` always\n" +
+				"reads a LOCAL file, so address a remote list by the agent's name.\n" +
 				"`set` edits an existing source; only auto-send-when-idle,\n" +
 				"enable-llm-review-before-auto-send and max-tasks are editable — changing the\n" +
 				"path/agent/workspace is remove-and-re-add, since it silently re-points an\n" +
