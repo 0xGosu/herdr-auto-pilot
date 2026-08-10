@@ -102,17 +102,14 @@ func GistLocator(gistID, file string) string {
 // what credentials, and which list within that backend.
 type Resolved struct {
 	config.ResolvedProvider
-	// Locator identifies the list, canonicalized. It is the key for I/O,
-	// locking, the claim map and the persisted ledger.
+	// Locator addresses the list for I/O. It is expanded and absolute (or a
+	// scheme'd string for a remote store), but it is NOT the identity key:
+	// callers that compare or persist one apply Canonical to it, which is what
+	// collapses two spellings of a file to a single lock and claim key.
 	Locator string
 	// Display is the operator- and agent-facing address ({task_list_path}).
-	//
-	// It is deliberately NOT the locator. For a local list it is expanded and
-	// absolute but NOT symlink-resolved: resolution belongs to IDENTITY, where
-	// two spellings of one file must collide, and it actively harms display —
-	// on macOS every temp path reads back as /private/var/… instead of the
-	// /var/… the operator wrote, and an operator cannot match what hap printed
-	// against their own config.
+	// For a local list it equals Locator; for a remote one it is a URL the
+	// operator can actually open, rather than the gist:// addressing string.
 	Display string
 }
 
@@ -142,8 +139,16 @@ func Resolve(cfg config.Config, src config.TaskSource, agentName string) (Resolv
 		if strings.TrimSpace(src.Path) == "" {
 			return Resolved{}, fmt.Errorf("task source has no path and provider=%s does not derive one", p.Name)
 		}
-		out.Locator = Canonical(src.Path)
-		out.Display = DisplayPath(src.Path)
+		// Expanded and absolute, but NOT symlink-resolved. Resolution is what
+		// IDENTITY needs, and every identity site applies it itself —
+		// taskfile.LockPath, the daemon's claim key and the TUI's grouping all
+		// call Canonical on whatever they are given. Pre-resolving here instead
+		// leaked into everything that COMPARES a locator against a configured
+		// path (the max_tasks lookup) or PRINTS one ({task_list_path}), where on
+		// macOS every /var/… path came back as /private/var/… — a spelling the
+		// operator never wrote and their config does not match.
+		out.Locator = DisplayPath(src.Path)
+		out.Display = out.Locator
 		return out, nil
 	}
 
@@ -169,6 +174,12 @@ func Resolve(cfg config.Config, src config.TaskSource, agentName string) (Resolv
 	out.Display = Display(out.Locator)
 	return out, nil
 }
+
+// DisplayFor renders any locator as its operator-facing address: a gist
+// locator becomes its web URL, and a filesystem locator is already the address
+// (it is expanded and absolute but not symlink-resolved, so it still reads as
+// the operator wrote it).
+func DisplayFor(locator string) string { return Display(locator) }
 
 // DisplayPath renders a filesystem task-list path as an operator reads it:
 // ~/$VAR expanded and made absolute, so it means the same thing from any

@@ -868,7 +868,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		// its list. The prompt sends the task text, not the numbered file line.
 		prompt := domain.DeclaredTask{
 			Task: taskText, AgentName: name,
-			Path:   tasklocator.Display(path),
+			Path:   tasklocator.DisplayFor(path),
 			Remote: tasklocator.Remote(path),
 		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
@@ -1328,7 +1328,7 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 		}
 		prompt := domain.DeclaredTask{
 			Task: tasks[0], Template: src.NextTaskTemplate,
-			Path:      tasklocator.Display(path),
+			Path:      tasklocator.DisplayFor(path),
 			Remote:    tasklocator.Remote(path),
 			AgentName: name, Cwd: cwd,
 		}.Prompt()
