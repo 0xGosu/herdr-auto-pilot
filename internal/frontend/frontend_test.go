@@ -2602,6 +2602,13 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 		"llm.learn_from_user_command_env_file":     true,
 		"embedding.pane_salient_chars":             true,
 		"embedding.warm_timeout_ms":                true,
+		// The env file holds a token, so it follows the llm.*_env_file rule:
+		// registered (a path is not a secret and `hap config set` must reach
+		// it) but off the TUI's Config tab. The two timing knobs are tuned once
+		// if ever, and only matter for a remote provider.
+		"task_source_provider.env_file":        true,
+		"task_source_provider.timeout_seconds": true,
+		"task_source_provider.refresh_seconds": true,
 		// Eight color strings would bury the settings a TUI operator actually
 		// reaches for, but they stay registered so `hap config set` reaches them.
 		"tui.palette.title":   true,
