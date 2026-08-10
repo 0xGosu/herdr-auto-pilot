@@ -135,6 +135,16 @@ type Daemon struct {
 	semanticReady atomic.Bool
 	semanticGen   atomic.Int64
 
+	// taskSnapshots caches REMOTE task lists so the main select loop never
+	// waits on a network read (see taskcache.go). A local store is never
+	// cached — it reads through exactly as it always has.
+	taskSnapshots map[string]taskSnapshot
+
+	// testTaskStore overrides backend resolution. Only tests set it, so the
+	// cache can be exercised against a fake without standing up a registry and
+	// a config; production always goes through d.stores.
+	testTaskStore func(locator string) (ports.TaskStore, error)
+
 	// stores resolves a task source to the backend serving its checklist.
 	// Swapped wholesale on reload (guarded by mu, like cfg/llm/classifier)
 	// so a provider change takes effect without restarting the daemon.
@@ -457,6 +467,7 @@ func New(opt Options) (*Daemon, error) {
 	}
 	d := &Daemon{
 		opt:                       opt,
+		taskSnapshots:             map[string]taskSnapshot{},
 		verifyUnblockDelay:        unblockCheckDelay,
 		transitions:               make(chan domain.AgentTransition, 256),
 		nudges:                    make(chan control.Kind, 16),
@@ -521,8 +532,11 @@ func New(opt Options) (*Daemon, error) {
 // still reach the backend that owns it.
 func (d *Daemon) taskStore(locator string) (ports.TaskStore, error) {
 	d.mu.Lock()
-	stores := d.stores
+	stores, override := d.stores, d.testTaskStore
 	d.mu.Unlock()
+	if override != nil {
+		return override(locator)
+	}
 	if stores == nil {
 		return nil, fmt.Errorf("task store registry is not configured")
 	}
@@ -544,10 +558,18 @@ func (d *Daemon) taskCallCtx() (context.Context, context.CancelFunc) {
 }
 
 // readTaskList is the production ReadTaskFile.
+//
+// A REMOTE list is served from the snapshot cache and refreshed off the loop; a
+// local one reads through, byte for byte as before. Gating on the store's own
+// declaration rather than on config is what keeps the default provider — and
+// its entire test suite — untouched.
 func (d *Daemon) readTaskList(locator string) ([]byte, error) {
 	store, err := d.taskStore(locator)
 	if err != nil {
 		return nil, err
+	}
+	if ports.TaskStoreRemote(store) {
+		return d.cachedTaskList(locator)
 	}
 	ctx, cancel := d.taskCallCtx()
 	defer cancel()
@@ -574,7 +596,20 @@ func (d *Daemon) mutateTaskList(locator string, fn func(string) (string, error))
 	}
 	ctx, cancel := d.taskCallCtx()
 	defer cancel()
-	_, err = store.Mutate(ctx, locator, wait, fn)
+	// Capture what the mutator produced so the snapshot can be replaced with
+	// it: Mutate read that content inside the lock, so there is no staleness
+	// after a write and no second round trip.
+	var written []byte
+	_, err = store.Mutate(ctx, locator, wait, func(content string) (string, error) {
+		out, mErr := fn(content)
+		if mErr == nil {
+			written = []byte(out)
+		}
+		return out, mErr
+	})
+	if ports.TaskStoreRemote(store) {
+		d.noteTaskListWritten(locator, written, err)
+	}
 	return err
 }
 
@@ -716,6 +751,9 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	d.classifier = cls
 	d.llm = llmPort
 	d.stores = stores
+	// A provider or credential change can point the same locator at different
+	// content, so nothing cached under the old registry may outlive it.
+	d.taskSnapshots = map[string]taskSnapshot{}
 	d.mu.Unlock()
 
 	d.reloadEmbedder(prev, cfg, first || forceEmbedder)
