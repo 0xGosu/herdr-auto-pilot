@@ -32,6 +32,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/reembed"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
+	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 )
 
 // App bundles the shared state both front-ends operate on.
@@ -76,6 +77,12 @@ type App struct {
 
 	// tuiLimit throttles the instance-limit sweep.
 	tuiLimit tuiLimitState
+
+	// taskStore caches the task-list backend registry (see taskStores). The
+	// config it is built from is never cached, but the registry must be: a
+	// remote backend owns a connection pool, and the TUI reloads config every
+	// two seconds.
+	taskStore taskStoreState
 
 	// cwdMu/cwdCache memoize pane working directories for FillAgentCwds.
 	// Without this, the TUI's 2s refresh would spawn one `herdr pane get` per
@@ -2773,6 +2780,41 @@ func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, templat
 // back to --path in those cases. This deliberately does NOT reuse the daemon's
 // declaredTask precedence (live workspace, first-real-task-wins): here we are
 // choosing a file to edit, not a task to send.
+// resolveTaskSourceFor returns the single task source addressable by this
+// agent's name. It replaces the older path-returning form: the SOURCE is what
+// the caller needs now, because turning it into a list also needs the agent
+// (a source that declares no file derives one per matched agent).
+func resolveTaskSourceFor(cfg config.Config, agent string) (config.TaskSource, error) {
+	var matches []config.TaskSource
+	workspaceOnly := false
+	for _, src := range cfg.TaskSources {
+		if src.Agent == "" {
+			if src.Workspace != "" && src.Workspace != "*" {
+				workspaceOnly = true
+			}
+			continue
+		}
+		if src.Agent == agent {
+			matches = append(matches, src)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		if workspaceOnly {
+			return config.TaskSource{}, fmt.Errorf("no task source is scoped to agent %q; workspace-scoped sources exist but aren't addressable by name — use --path <file>", agent)
+		}
+		return config.TaskSource{}, fmt.Errorf("no task source for agent %q; add one first: hap task-source add --agent %s <checklist.md>", agent, agent)
+	default:
+		paths := make([]string, len(matches))
+		for i, m := range matches {
+			paths[i] = m.Path
+		}
+		return config.TaskSource{}, fmt.Errorf("agent %q matches %d task sources (%s); use --path <file> to pick one", agent, len(matches), strings.Join(paths, ", "))
+	}
+}
+
 func resolveTaskFilePath(cfg config.Config, agent string) (string, error) {
 	var matches []config.TaskSource
 	workspaceOnly := false
@@ -2809,6 +2851,16 @@ func resolveTaskFilePath(cfg config.Config, agent string) (string, error) {
 // takes precedence; otherwise the agent's configured source is resolved.
 func (a *App) taskFilePath(agent, path string) (string, error) {
 	if path != "" {
+		// --path is the escape hatch and always names a LOCAL file, on every
+		// provider: it is resolved against the caller's shell, and it is the
+		// only way to reach a checklist that is not a configured source. It is
+		// also not needed for the case it exists for under a remote provider —
+		// a derived remote list is named after the agent, so `hap task <agent>`
+		// always resolves. A locator pasted verbatim still works, since a
+		// scheme'd string is returned unchanged by Canonical.
+		if tasklocator.Remote(path) {
+			return path, nil
+		}
 		path = config.ExpandPath(path)
 		if abs, err := filepath.Abs(path); err == nil {
 			return abs, nil
@@ -2822,11 +2874,27 @@ func (a *App) taskFilePath(agent, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	resolved, err := resolveTaskFilePath(cfg, agent)
+	src, err := resolveTaskSourceFor(cfg, agent)
 	if err != nil {
 		return "", err
 	}
-	return config.ExpandPath(resolved), nil
+	l, err := a.resolveSourceList(cfg, src, agent)
+	if err != nil {
+		return "", err
+	}
+	return l.Locator, nil
+}
+
+// mutateTask applies one locked read-modify-write to a task list through the
+// backend serving it. It replaces the direct taskfile.Mutate call every item
+// mutator used, so a source stored remotely is edited in place rather than
+// having its file name written to disk.
+func (a *App) mutateTask(locator string, fn func(string) (string, error)) ([]domain.ChecklistItem, error) {
+	cfg, err := a.Config()
+	if err != nil {
+		return nil, err
+	}
+	return a.mutateList(context.Background(), cfg, locator, fn)
 }
 
 // The locked read-modify-write over a checklist file lives in
@@ -2959,7 +3027,7 @@ func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName,
 	// point at a different item and send the wrong detail. taskText stays the
 	// reservation identity regardless.
 	folded := ""
-	if _, err := mutateTaskFile(sourcePath, func(content string) (string, error) {
+	if _, err := a.mutateTask(sourcePath, func(content string) (string, error) {
 		out, rerr := reserveTask(index, taskText)(content)
 		if rerr != nil {
 			return out, rerr
@@ -2976,7 +3044,7 @@ func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName,
 		Task: taskText, Content: folded, Path: sourcePath, Template: template, AgentName: agentName, Cwd: cwd,
 	}.Prompt()
 	if err := ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt); err != nil {
-		if _, rbErr := mutateTaskFile(sourcePath, releaseTask(index, taskText)); rbErr != nil {
+		if _, rbErr := a.mutateTask(sourcePath, releaseTask(index, taskText)); rbErr != nil {
 			return fmt.Errorf("send failed (%w) and task #%d could not be returned to [ ] (%v) — "+
 				"it stays [-] and no agent will pick it up until you clear it", err, index, rbErr)
 		}
@@ -3043,7 +3111,7 @@ func (a *App) paneCwd(ctx context.Context, paneID string) string {
 }
 
 // readChecklist reads and parses a checklist file.
-func readChecklist(path string) ([]domain.ChecklistItem, error) {
+func readChecklistFile(path string) ([]domain.ChecklistItem, error) {
 	data, err := os.ReadFile(config.ExpandPath(path))
 	if err != nil {
 		return nil, err
@@ -3057,8 +3125,15 @@ func readChecklist(path string) ([]domain.ChecklistItem, error) {
 type TaskGroup struct {
 	Source config.TaskSource
 	Index  int // position in cfg.TaskSources (stable group identity)
-	Items  []domain.ChecklistItem
-	Err    string // "" = read OK
+	// Locator identifies this group's list. It is the group's identity for
+	// dedupe and for joining against the daemon's reservations — NOT
+	// Source.Path, which under a remote provider is only a file name and can
+	// repeat across gists.
+	Locator string
+	// Display is the operator-facing address: the path locally, a URL remotely.
+	Display string
+	Items   []domain.ChecklistItem
+	Err     string // "" = read OK
 }
 
 // TaskGroups parses every configured task source's checklist, in config
@@ -3068,16 +3143,28 @@ type TaskGroup struct {
 // them. This deliberately does NOT reuse resolveTaskFilePath: its
 // exactly-one-source-per-agent semantics pick a file to edit, while the
 // aggregate shows every source as configured.
-func TaskGroups(cfg config.Config) []TaskGroup {
+func (a *App) TaskGroups(cfg config.Config) []TaskGroup {
+	ctx := context.Background()
 	groups := make([]TaskGroup, 0, len(cfg.TaskSources))
 	for i, src := range cfg.TaskSources {
 		g := TaskGroup{Source: src, Index: i}
-		if src.Path == "" {
-			g.Err = "no path configured"
-		} else if items, err := readChecklist(src.Path); err != nil {
+		// "" for the agent name: this view enumerates SOURCES, not agents. A
+		// source that derives one list per matched agent therefore cannot be
+		// resolved to a single list here, and says so rather than guessing —
+		// its per-agent lists are reachable from the Agents tab.
+		l, err := a.resolveSourceList(cfg, src, "")
+		switch {
+		case errors.Is(err, tasklocator.ErrAgentNameRequired):
+			g.Err = "one list per matched agent — open an agent's list from the Agents tab"
+		case err != nil:
 			g.Err = err.Error()
-		} else {
-			g.Items = items
+		default:
+			g.Locator, g.Display = l.Locator, l.Display
+			if items, rerr := a.readList(ctx, cfg, l.Locator); rerr != nil {
+				g.Err = rerr.Error()
+			} else {
+				g.Items = items
+			}
 		}
 		groups = append(groups, g)
 	}
@@ -3129,11 +3216,15 @@ func PendingTasks(groups []TaskGroup) int {
 // by absolute file position (checked and unchecked alike). Filtering by status
 // is the CLI's job — the numbers here never depend on a filter.
 func (a *App) ListTasks(agent, path string) ([]domain.ChecklistItem, error) {
-	p, err := a.taskFilePath(agent, path)
+	cfg, err := a.Config()
 	if err != nil {
 		return nil, err
 	}
-	return readChecklist(p)
+	locator, err := a.taskFilePath(agent, path)
+	if err != nil {
+		return nil, err
+	}
+	return a.readList(context.Background(), cfg, locator)
 }
 
 // TaskFilePath resolves the checklist file a task target names, without
@@ -3232,7 +3323,7 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 	}
 	limit := a.taskSourceLimit(p)
 	newIndex := 0
-	items, err := mutateTaskFile(p, func(content string) (string, error) {
+	items, err := a.mutateTask(p, func(content string) (string, error) {
 		// Checked inside the lock (like expectTaskText) so a racing add cannot
 		// slip the count over the cap. limit == 0 means no cap (the file is
 		// not a registered task source).
@@ -3276,7 +3367,7 @@ func (a *App) SetTaskDone(agent, path string, index int, done bool, expectText .
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
+	return a.mutateTask(p, guardedMutation(index, expectText, func(content string) (string, error) {
 		return domain.SetChecklistItemDone(content, index, done)
 	}))
 }
@@ -3292,7 +3383,7 @@ func (a *App) MarkTaskInProgress(agent, path string, index int, expectText ...st
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
+	return a.mutateTask(p, guardedMutation(index, expectText, func(content string) (string, error) {
 		return domain.MarkChecklistItemInProgress(content, index)
 	}))
 }
@@ -3307,7 +3398,7 @@ func (a *App) EditTask(agent, path string, index int, text string, expectText ..
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
+	return a.mutateTask(p, guardedMutation(index, expectText, func(content string) (string, error) {
 		if strings.TrimSpace(text) == "" {
 			return "", fmt.Errorf("task text must not be empty")
 		}
@@ -3323,7 +3414,7 @@ func (a *App) DeleteTask(agent, path string, index int, expectText ...string) ([
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
+	return a.mutateTask(p, guardedMutation(index, expectText, func(content string) (string, error) {
 		return domain.DeleteChecklistItem(content, index)
 	}))
 }
@@ -3340,7 +3431,7 @@ func (a *App) MoveTask(agent, path string, index, to int, expectText ...string) 
 	if err != nil {
 		return nil, err
 	}
-	return mutateTaskFile(p, guardedMutation(index, expectText, func(content string) (string, error) {
+	return a.mutateTask(p, guardedMutation(index, expectText, func(content string) (string, error) {
 		return domain.MoveChecklistItem(content, index, to)
 	}))
 }

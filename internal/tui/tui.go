@@ -1459,7 +1459,7 @@ func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refr
 	if msg.err != nil {
 		return msg
 	}
-	msg.tasks = frontend.TaskGroups(msg.cfg)
+	msg.tasks = app.TaskGroups(msg.cfg)
 	// Both of these read the cached check file only — the fetch itself runs in
 	// updateCheckCmd, off this path, because refreshData runs on every tick.
 	msg.update = app.UpdateStatus(msg.cfg)

@@ -4008,6 +4008,7 @@ func TestTaskGroups(t *testing.T) {
 	}
 	missing := filepath.Join(dir, "gone.md")
 
+	app, _ := testApp(t)
 	cfg := config.Config{TaskSources: []config.TaskSource{
 		{Agent: "brave-otter", Workspace: "w1", Path: good},
 		{Agent: "codex", Path: missing},
@@ -4015,7 +4016,7 @@ func TestTaskGroups(t *testing.T) {
 		{Workspace: "*", Path: good}, // duplicate path, its own group
 		{Agent: "quiet", Path: empty},
 	}}
-	groups := frontend.TaskGroups(cfg)
+	groups := app.TaskGroups(cfg)
 	if len(groups) != len(cfg.TaskSources) {
 		t.Fatalf("got %d groups, want %d", len(groups), len(cfg.TaskSources))
 	}
@@ -4043,8 +4044,11 @@ func TestTaskGroups(t *testing.T) {
 	if g := groups[1]; g.Err == "" || len(g.Items) != 0 {
 		t.Errorf("missing file: Err=%q items=%d, want an error and no items", g.Err, len(g.Items))
 	}
-	if g := groups[2]; g.Err != "no path configured" {
-		t.Errorf("empty path: Err=%q, want \"no path configured\"", g.Err)
+	// The message is now provider-aware: an empty path is a misconfiguration
+	// under local_fs but the ordinary "one list per agent" form under a remote
+	// provider, so the error says which case it is.
+	if g := groups[2]; !strings.Contains(g.Err, "no path") || !strings.Contains(g.Err, "local_fs") {
+		t.Errorf("empty path: Err=%q, want it to name the missing path and the provider", g.Err)
 	}
 	if g := groups[3]; g.Err != "" || len(g.Items) != 3 {
 		t.Errorf("duplicate path: Err=%q items=%d, want an independent readable group", g.Err, len(g.Items))
@@ -4055,7 +4059,8 @@ func TestTaskGroups(t *testing.T) {
 }
 
 func TestTaskGroupsEmptyConfig(t *testing.T) {
-	if groups := frontend.TaskGroups(config.Config{}); len(groups) != 0 {
+	app, _ := testApp(t)
+	if groups := app.TaskGroups(config.Config{}); len(groups) != 0 {
 		t.Errorf("no task sources should yield no groups, got %d", len(groups))
 	}
 }
