@@ -263,7 +263,12 @@ func configEnvSet(ctx context.Context, app *frontend.App, out io.Writer, args []
 		return err
 	}
 	if fs.NArg() > 0 {
-		return fmt.Errorf("unexpected argument %q — pass the value with --value, or on stdin", fs.Arg(0))
+		// The extra argument is NOT echoed. The likeliest way to reach this is
+		// `hap config env set command ANTHROPIC_API_KEY sk-…` — the positional
+		// shape every other CLI uses — so quoting it would print the very
+		// secret this command exists to keep off argv, into scrollback, CI
+		// output and pasted bug reports.
+		return fmt.Errorf("unexpected extra argument — pass the value with --value, or on stdin")
 	}
 	v := *value
 	if !isFlagPassed(fs, "value") {

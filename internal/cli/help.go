@@ -688,7 +688,11 @@ func buildCommands() {
 				"limited to the named agent types, so a phrase that is only dangerous in one\n" +
 				"agent's TUI does not force every other agent to ask. Scoped rules are listed\n" +
 				"under \"operator scoped\" and have their own index space, which is why they are\n" +
-				"dropped with `remove-scoped` rather than `remove`.",
+				"dropped with `remove-scoped` rather than `remove`. A scoped rule that names an\n" +
+				"agent type nothing reports is added with a note: it narrows a safety control, so\n" +
+				"a typo there fails toward hap answering rather than asking.\n" +
+				"The pattern may start with a dash (`--force`, `-rf /`) and is taken literally —\n" +
+				"only `--agent-type` is read as a flag, in either position.",
 			Examples: []string{
 				"hap rules list",
 				"hap rules add '(?i)force[- ]push'",

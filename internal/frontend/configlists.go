@@ -191,6 +191,11 @@ func (a *App) SetCaptureDelay(ctx context.Context, agentType string, startMs, ev
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		for i := range cfg.CaptureDelays {
 			if matchesCaptureAgentType(cfg.CaptureDelays[i].AgentType, agentType) {
+				// The stored spelling is rewritten too, not just the numbers: an
+				// upsert that matched case-insensitively would otherwise leave a
+				// row spelled differently from what the operator just typed, and
+				// no later `set` could ever repair it.
+				cfg.CaptureDelays[i].AgentType = agentType
 				cfg.CaptureDelays[i].StartMs = startMs
 				cfg.CaptureDelays[i].EventMs = eventMs
 				return nil

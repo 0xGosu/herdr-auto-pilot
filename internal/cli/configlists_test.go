@@ -201,6 +201,35 @@ func TestCaptureDelaySpecificRuleOutranksAnExistingWildcard(t *testing.T) {
 	}
 }
 
+// TestCaptureDelayAgentTypeIsCaseInsensitive pins the match the daemon makes.
+// Every other agent-type comparison in the codebase is EqualFold, and a
+// capitalization that silently produced a rule the daemon never read — while
+// the listing showed it in force — is the worst shape a config editor can have.
+func TestCaptureDelayAgentTypeIsCaseInsensitive(t *testing.T) {
+	app, _ := testApp(t)
+	if _, err := run(t, app, "capture-delay", "set", "Claude", "12000", "2500"); err != nil {
+		t.Fatalf("capture-delay set Claude: %v", err)
+	}
+	cfg := loadCfg(t, app.ConfigPath)
+	// herdr reports the type lowercase, which is what the daemon looks up with.
+	if got := cfg.CaptureDelay("claude", true); got.Milliseconds() != 12000 {
+		t.Errorf("CaptureDelay(claude) = %s, want 12s — a capitalized agent_type must "+
+			"not write a rule the daemon never reads", got)
+	}
+	// The upsert rewrites the stored spelling too, or no later `set` could
+	// repair a row it matched only case-insensitively.
+	if _, err := run(t, app, "capture-delay", "set", "claude", "9000", "1000"); err != nil {
+		t.Fatalf("capture-delay set claude: %v", err)
+	}
+	cfg = loadCfg(t, app.ConfigPath)
+	if len(cfg.CaptureDelays) != 1 || cfg.CaptureDelays[0].AgentType != "claude" {
+		t.Errorf("CaptureDelays = %+v, want one rule stored under the spelling last set", cfg.CaptureDelays)
+	}
+	if got := cfg.CaptureDelay("Claude", true); got.Milliseconds() != 9000 {
+		t.Errorf("CaptureDelay(Claude) = %s, want 9s — the lookup folds case in both directions", got)
+	}
+}
+
 func TestScopedNeverAutoRulesAreEditableFromTheCLI(t *testing.T) {
 	app, _ := testApp(t)
 
@@ -251,6 +280,46 @@ func TestRulesAddStillWritesTheFlatListWithoutAScope(t *testing.T) {
 	if len(cfg.Safety.NeverAutoPatterns) != 1 || len(cfg.Safety.NeverAutoRules) != 0 {
 		t.Errorf("patterns=%v rules=%+v, want the unscoped add to keep writing the flat list",
 			cfg.Safety.NeverAutoPatterns, cfg.Safety.NeverAutoRules)
+	}
+}
+
+// TestRulesAddAcceptsADashLeadingPattern pins why `rules add` parses
+// --agent-type by hand instead of through flag.Parse. A never-auto pattern is a
+// REGEX and the dangerous ones are frequently flags (`--force`, `--no-verify`,
+// `-rf /`); flag.Parse rejects those as unknown flags, and a safety rule that
+// cannot be ADDED is protection silently absent.
+func TestRulesAddAcceptsADashLeadingPattern(t *testing.T) {
+	for _, pattern := range []string{"--no-verify", "-rf /", "--force"} {
+		t.Run(pattern, func(t *testing.T) {
+			app, _ := testApp(t)
+			if _, err := run(t, app, "rules", "add", pattern); err != nil {
+				t.Fatalf("rules add %q: %v", pattern, err)
+			}
+			got := loadCfg(t, app.ConfigPath).Safety.NeverAutoPatterns
+			if len(got) != 1 || got[0] != pattern {
+				t.Errorf("NeverAutoPatterns = %v, want exactly %q", got, pattern)
+			}
+		})
+	}
+
+	// The scoped form takes one too, in either order, and `--` still terminates
+	// for the pathological pattern that IS the flag name.
+	app, _ := testApp(t)
+	if _, err := run(t, app, "rules", "add", "--agent-type", "codex", "--no-verify"); err != nil {
+		t.Fatalf("scoped rules add with a dash-leading pattern: %v", err)
+	}
+	if _, err := run(t, app, "rules", "add", "--force", "--agent-type", "claude"); err != nil {
+		t.Fatalf("flag after the pattern: %v", err)
+	}
+	if _, err := run(t, app, "rules", "add", "--", "--agent-type"); err != nil {
+		t.Fatalf("`--` terminator: %v", err)
+	}
+	cfg := loadCfg(t, app.ConfigPath)
+	if len(cfg.Safety.NeverAutoRules) != 2 || cfg.Safety.NeverAutoRules[0].Pattern != "--no-verify" {
+		t.Errorf("NeverAutoRules = %+v, want both scoped rules with their dash-leading patterns", cfg.Safety.NeverAutoRules)
+	}
+	if got := cfg.Safety.NeverAutoPatterns; len(got) != 1 || got[0] != "--agent-type" {
+		t.Errorf("NeverAutoPatterns = %v, want the `--`-terminated pattern taken literally", got)
 	}
 }
 
@@ -362,6 +431,22 @@ func TestLLMEnvIsEditableFromTheCLIWithoutEverPrintingAValue(t *testing.T) {
 	}
 	if _, err := run(t, app, "config", "env", "set", "nowhere", "X", "--value", "y"); err == nil {
 		t.Error("an unknown scope must be refused")
+	}
+}
+
+// TestConfigEnvSetNeverEchoesAPositionalValue covers the likeliest misuse:
+// `hap config env set <scope> <NAME> <value>`, the positional shape every other
+// CLI uses. It must be refused — and the refusal must not quote the argument,
+// which would print the very secret this command exists to keep off argv into
+// scrollback, CI output and pasted bug reports.
+func TestConfigEnvSetNeverEchoesAPositionalValue(t *testing.T) {
+	app, _ := testApp(t)
+	out, err := run(t, app, "config", "env", "set", "command", "TOKEN", "sk-leaked-secret")
+	if err == nil {
+		t.Fatal("a positional value must be refused — it is exactly what --value/stdin exist to avoid")
+	}
+	if strings.Contains(err.Error()+out, "sk-leaked-secret") {
+		t.Errorf("the refusal printed the value: %v / %q", err, out)
 	}
 }
 

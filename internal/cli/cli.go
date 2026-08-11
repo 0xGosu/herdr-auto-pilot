@@ -1453,17 +1453,15 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 // The two lists are listed and removed separately (`remove` vs
 // `remove-scoped`) because each has its own index space.
 func rulesAdd(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	fs := flag.NewFlagSet("rules add", flag.ContinueOnError)
-	agentTypes := fs.String("agent-type", "", "limit the rule to these agent types (comma-separated, e.g. claude,codex); omit for every agent")
-	fs.SetOutput(out)
-	if err := fs.Parse(args); err != nil {
+	agentTypes, rest, err := splitAgentTypeFlag(args)
+	if err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	if len(rest) != 1 {
 		return fmt.Errorf("usage: rules add [--agent-type T[,T]] <regex> (see: hap help rules)")
 	}
-	pattern := fs.Arg(0)
-	if strings.TrimSpace(*agentTypes) == "" {
+	pattern := rest[0]
+	if strings.TrimSpace(agentTypes) == "" {
 		if err := app.AddNeverAutoPattern(ctx, pattern); err != nil {
 			return err
 		}
@@ -1471,14 +1469,77 @@ func rulesAdd(ctx context.Context, app *frontend.App, out io.Writer, args []stri
 		PrintNextSteps(out, rulesEditedHints())
 		return nil
 	}
-	types := strings.Split(*agentTypes, ",")
+	types := strings.Split(agentTypes, ",")
 	if err := app.AddNeverAutoRule(ctx, pattern, types); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "scoped never-auto rule added: agent_types=%s\t%s\n",
 		strings.Join(types, ","), pattern)
+	warnUnseenAgentTypes(ctx, app, out, types)
 	PrintNextSteps(out, rulesEditedHints())
 	return nil
+}
+
+// splitAgentTypeFlag pulls --agent-type out of `rules add`'s arguments by hand
+// and returns everything else as positional.
+//
+// flag.Parse cannot be used here: a never-auto pattern is a REGEX and may
+// legitimately begin with a dash (`--force`, `--no-verify`, `-rf /`), which the
+// parser would reject as an unknown flag. Before --agent-type existed the
+// pattern was read positionally and those patterns worked; a safety rule that
+// can no longer be ADDED is protection silently absent, so the flag is carved
+// out instead of the pattern being handed to a parser. A literal `--`
+// terminator still works for the pathological pattern that IS "--agent-type".
+func splitAgentTypeFlag(args []string) (agentTypes string, rest []string, err error) {
+	const flagName = "agent-type"
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			rest = append(rest, args[i+1:]...)
+			return agentTypes, rest, nil
+		}
+		name, value, hasValue := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if strings.HasPrefix(a, "-") && name == flagName {
+			if hasValue {
+				agentTypes = value
+				continue
+			}
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("--%s needs a value (comma-separated agent types)", flagName)
+			}
+			i++
+			agentTypes = args[i]
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return agentTypes, rest, nil
+}
+
+// warnUnseenAgentTypes prints a non-blocking notice when a scoped rule names an
+// agent type no watched agent reports.
+//
+// A typo here fails OPEN, unlike everywhere else in the safety configuration: a
+// scoped rule NARROWS a never-auto control, so `--agent-type claude-code` is
+// accepted, listed, and never applies — the failure direction is hap answering
+// something it should have escalated. There is no canonical agent-type list to
+// validate against (herdr can report any type), so this observes rather than
+// refuses, and stays silent whenever the agent list could not be read — an
+// absent herdr must never read as "that type does not exist".
+func warnUnseenAgentTypes(ctx context.Context, app *frontend.App, out io.Writer, types []string) {
+	st, err := app.GetStatus(ctx)
+	if err != nil || !st.AgentsKnown {
+		return
+	}
+	seen := make(map[string]bool, len(st.MonitoredAgents))
+	for _, a := range st.MonitoredAgents {
+		seen[strings.ToLower(strings.TrimSpace(a.AgentType))] = true
+	}
+	for _, t := range types {
+		if !seen[strings.ToLower(strings.TrimSpace(t))] {
+			fmt.Fprintf(out, "note: no watched agent reports type %q — this rule does not apply to anything yet\n", t)
+		}
+	}
 }
 
 // rulesRemoveScoped deletes one agent-scoped never-auto rule by the index

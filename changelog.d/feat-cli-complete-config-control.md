@@ -4,4 +4,5 @@
 - Added `hap config env` — set, unset and list the environment handed to the LLM CLI, per command scope. Values are never printed by any listing and `set` reads the value from stdin unless `--value` is passed, so an API key never lands in shell history or another user's `ps` output.
 - Added `hap escalations retry <id>` — re-invoke the LLM on a consult that failed or timed out (and re-run a failed learn-from-correction). This was previously possible only from the TUI.
 - Added `hap status --stderr` — print the captured daemon stderr, not just the one-line summary the health line quotes.
+- Fixed `[[capture_delay]]` matching an agent type case-sensitively — the one place in hap where an operator's capitalization silently mattered. `agent_type = "Claude"` wrote a rule the daemon never read while every listing showed it in force; the match now folds case like every other agent-type comparison.
 - Changed: every configuration key config.toml accepts now has a CLI command, and two tests fail the build if a new one ever ships without one.

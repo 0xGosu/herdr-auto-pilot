@@ -1566,12 +1566,19 @@ const (
 
 // CaptureDelay returns how long to wait before reading the pane after a
 // herdr event — start is the agent's first event since it appeared. The
-// first [[capture_delay]] rule matching the agent type (exact, "*", or
-// empty) wins; a matched field <= 0 and the no-rule case fall back to the
-// built-in defaults.
+// first [[capture_delay]] rule matching the agent type (case-insensitively,
+// or "*"/empty for any) wins; a matched field <= 0 and the no-rule case fall
+// back to the built-in defaults.
+//
+// The match is EqualFold, like every other agent-type comparison in the
+// codebase (classify.New, domain.ruleAppliesTo, AgentModesFor). It used to be
+// exact, which made this the one surface where an operator's capitalization
+// silently mattered: `agent_type = "Claude"` wrote a rule the daemon never
+// read while every listing showed it in force.
 func (c Config) CaptureDelay(agentType string, start bool) time.Duration {
 	for _, r := range c.CaptureDelays {
-		if r.AgentType != agentType && r.AgentType != "*" && r.AgentType != "" {
+		stored := strings.TrimSpace(r.AgentType)
+		if stored != "*" && stored != "" && !strings.EqualFold(stored, strings.TrimSpace(agentType)) {
 			continue
 		}
 		ms := r.EventMs
