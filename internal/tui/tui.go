@@ -1094,7 +1094,7 @@ func (m Model) taskRows() []taskRow {
 		addr := g.ListAddress()
 		shownPath := g.Source.Path
 		if shownPath == "" {
-			shownPath = g.Display
+			shownPath = displayTaskAddress(addr)
 		}
 		hdr := fmt.Sprintf("#%d agent=%s ws=%s  %s", g.Index, sel, ws,
 			truncatePathKeepBase(shownPath, taskPathDisplayWidth))
@@ -3377,7 +3377,7 @@ func (m Model) confirmDeleteTaskTargets(targets []taskTarget, clearsMarks bool) 
 // no source to consult at all.
 func (m Model) taskSourceLabel(r *taskRow) string {
 	if r.group >= len(m.data.tasks) {
-		return truncatePathKeepBase(r.path, taskPathDisplayWidth)
+		return truncatePathKeepBase(displayTaskAddress(r.path), taskPathDisplayWidth)
 	}
 	src := m.data.tasks[r.group].Source
 	if src.Agent != "" {
@@ -3695,7 +3695,7 @@ func (m Model) taskDetailLines(r taskRow, width int) []string {
 	// only counts them.
 	text := domain.FoldedTaskText(domain.DisplayTaskText(r.itemText), r.itemDetail)
 	lines = m.detailField(lines, w, "Text", domain.DecodeTaskNewlines(text))
-	lines = m.detailField(lines, w, "Source file", r.path)
+	lines = m.detailField(lines, w, "Source file", displayTaskAddress(r.path))
 	if r.group < len(m.data.tasks) {
 		src := m.data.tasks[r.group].Source
 		lines = m.detailField(lines, w, "Agent selector", orDash(src.Agent))
@@ -4886,6 +4886,18 @@ func (m Model) editTaskSourcePrompt(index int, path string) (tea.Model, tea.Cmd)
 		},
 	})
 	return m, nil
+}
+
+// displayTaskAddress renders a task-list address for on-screen text: a local
+// path unchanged, a gist locator with its id shortened. Same rule as
+// shortGistIDForDisplay — a secret gist's id is effectively a capability, so
+// no screen echoes one in full — which is why displays must not use the raw
+// row path or TaskGroup.Display (the full, openable URL) directly.
+func displayTaskAddress(addr string) string {
+	if ref, ok := tasklocator.ParseGist(addr); ok {
+		return "gist:" + shortGistIDForDisplay(ref.GistID) + "/" + ref.File
+	}
+	return addr
 }
 
 // shortGistIDForDisplay renders a gist id as a recognizable prefix. A secret

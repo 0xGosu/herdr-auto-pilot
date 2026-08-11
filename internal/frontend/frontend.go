@@ -3305,9 +3305,7 @@ func (g TaskGroup) ListAddress() string {
 // status-snapshot surfaces (the TUI's Agents/Tasks tabs, TaskGroups' derived
 // resolution); the daemon's delivery path has its own richer matcher.
 func SourceMatchesAgent(cfg config.Config, src config.TaskSource, st Status, a domain.AgentTransition) bool {
-	name := st.AgentName(a.AgentID)
-	if src.Agent != "" && src.Agent != a.AgentID && src.Agent != a.AgentType &&
-		(name == "" || src.Agent != name) {
+	if !src.MatchesAgent(a.AgentID, a.AgentType, st.AgentName(a.AgentID)) {
 		return false
 	}
 	workspaceName := ""
