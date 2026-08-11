@@ -977,10 +977,12 @@ hap config task-source set <index> gist-id aa11bb22       # or "inherit"
 
 The first three re-point the source, so each reports what it changed *from* and
 warns: the next hand-out then comes from a different list, or goes to a
-different agent. Nothing is copied or removed either way. A relative `path` is
-resolved against your shell's working directory — the daemon runs from the
-state dir, so a path stored verbatim would name a different file — and an empty
-one is refused, since that is `remove`, not an edit.
+different agent. Nothing is copied or removed either way. An empty `agent` or
+`workspace` matches **any** of them — the widest re-point there is, so it is
+called out when you do it. A relative `path` is resolved against your shell's
+working directory (the daemon runs from the state dir, so a path stored
+verbatim would name a different file); an empty `path` is refused under a local
+provider and means "one list per agent" under a remote one.
 
 ### Suggesting tasks when no source exists, or a source runs out (optional)
 

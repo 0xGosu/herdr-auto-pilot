@@ -860,9 +860,11 @@ func buildCommands() {
 				"(provider and gist-id each take \"inherit\" to go back to following the default.)\n" +
 				"The three that re-point the source print what they changed FROM and warn: the\n" +
 				"next hand-out then comes from a different list, or goes to a different agent.\n" +
-				"Nothing is copied or removed either way. A relative path is resolved against\n" +
-				"YOUR shell's directory (the daemon runs from the state dir), and an empty one\n" +
-				"is refused — that is `remove`, not an edit. Changing the PROVIDER likewise does\n" +
+				"Nothing is copied or removed either way. An empty agent or workspace matches\n" +
+				"ANY of them — the widest re-point there is, so it is called out when you do it.\n" +
+				"A relative path is resolved against YOUR shell's directory (the daemon runs\n" +
+				"from the state dir); an empty path is refused under a local provider and means\n" +
+				"\"one list per agent\" under a remote one. Changing the PROVIDER likewise does\n" +
 				"not migrate the list: hap reads the new store from then on and leaves the old\n" +
 				"copy where it is.\n" +
 				"enable-llm-review-before-auto-send composes with auto-send-when-idle: the\n" +

@@ -76,9 +76,31 @@ func TestEveryTaskSourceFieldIsEditable(t *testing.T) {
 			"set at creation and never changed. Add a key and name it in taskSourceSetKeys, "+
 			"or add it to taskSourceFieldsExemptFromSet with a reason.", name)
 	}
+	// The map's VALUES are checked against the real dispatcher, not just its
+	// keys against the struct: an entry naming a key `set` has no case arm for
+	// — a typo, or an arm deleted later — would otherwise pass green while the
+	// field it claims to cover stayed creation-only.
+	app, _ := testApp(t)
+	ctx := context.Background()
+	if err := app.AddTaskSource(ctx, "a", "", filepath.Join(t.TempDir(), "t.md"), ""); err != nil {
+		t.Fatal(err)
+	}
+	// Values chosen only to get past parsing; what is asserted is that the key
+	// REACHES an arm, never what that arm does with it.
+	probe := map[string]string{
+		"agent": "b", "workspace": "ws", "path": "/tmp/probe.md",
+		"next_task_template": "T", "provider": "inherit", "gist_id": "inherit",
+		"max_tasks": "5", "enable_auto_send_task_when_idle": "false",
+		"enable_llm_review_before_auto_send": "false",
+	}
 	for field, key := range taskSourceSetKeys {
 		if !present[field] {
 			t.Errorf("taskSourceSetKeys names %q (key %q), which config.TaskSource no longer has — drop it", field, key)
+			continue
+		}
+		if _, err := run(t, app, "config", "task-source", "set", "0", key, probe[field]); err != nil &&
+			strings.Contains(err.Error(), "unknown task-source key") {
+			t.Errorf("field %q maps to key %q, which `set` does not accept: %v", field, key, err)
 		}
 	}
 	for field, why := range taskSourceFieldsExemptFromSet {
@@ -134,16 +156,57 @@ func TestTaskSourceSelectorsAreEditableInPlace(t *testing.T) {
 		t.Errorf("got %d task sources, want the single entry edited in place", n)
 	}
 
-	// An empty template restores the default; an empty PATH is refused, since
-	// that is `remove`, not an edit.
-	if _, err := run(t, app, "config", "task-source", "set", "0", "template", ""); err != nil {
-		t.Fatalf("clearing the template: %v", err)
+	// An empty template restores the default — and so does a WHITESPACE-only
+	// one, which is the case that matters: only the empty string falls back to
+	// the built-in default, so "  " stored verbatim would be rendered as the
+	// whole outbound prompt — a hand-out carrying no task text and no
+	// instructions, sent unattended on an auto-send source.
+	for _, blank := range []string{"", "   "} {
+		if _, err := run(t, app, "config", "task-source", "set", "0", "template", "Do: X"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := run(t, app, "config", "task-source", "set", "0", "template", blank); err != nil {
+			t.Fatalf("clearing the template with %q: %v", blank, err)
+		}
+		if got := loadCfg(t, app.ConfigPath).TaskSources[0].NextTaskTemplate; got != "" {
+			t.Errorf("NextTaskTemplate = %q after setting %q, want it cleared to the default", got, blank)
+		}
 	}
-	if got := loadCfg(t, app.ConfigPath).TaskSources[0].NextTaskTemplate; got != "" {
-		t.Errorf("NextTaskTemplate = %q, want it cleared", got)
+
+	// An empty path is left to config.ValidateTaskSource: under the LOCAL
+	// provider this source runs, it is refused, and the refusal names the
+	// provider rather than asserting a rule that does not hold everywhere (an
+	// empty path is legal under a remote provider — "one list per agent").
+	_, err = run(t, app, "config", "task-source", "set", "0", "path", "  ")
+	if err == nil {
+		t.Fatal("an empty path must be refused under a local provider")
 	}
-	if _, err := run(t, app, "config", "task-source", "set", "0", "path", "  "); err == nil {
-		t.Error("an empty path must be refused — that is `remove`, not an edit")
+	if !strings.Contains(err.Error(), "provider=") {
+		t.Errorf("the refusal must name the provider it applies to, got: %v", err)
+	}
+}
+
+// TestTaskSourceSetEmptySelectorWidensAndSaysSo covers the widest re-point
+// available: clearing a selector makes the source match ANY agent (or
+// workspace). It is legal — `add` accepts it — but silent widening of which
+// agents a list feeds is exactly the kind of thing an operator should be told
+// about rather than discover from a later listing.
+func TestTaskSourceSetEmptySelectorWidensAndSaysSo(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	if err := app.AddTaskSource(ctx, "brave-otter", "ws", filepath.Join(t.TempDir(), "t.md"), ""); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, app, "config", "task-source", "set", "0", "agent", "")
+	if err != nil {
+		t.Fatalf("clearing the agent selector: %v", err)
+	}
+	if !strings.Contains(out, "ANY agent") {
+		t.Errorf("clearing the agent selector must say it now matches any agent, got %q", out)
+	}
+	src := loadCfg(t, app.ConfigPath).TaskSources[0]
+	if src.Agent != "" || !src.MatchesAgent("pane-9", "claude", "some-other-agent") {
+		t.Errorf("task source = %+v, want an empty selector matching any agent", src)
 	}
 }
 

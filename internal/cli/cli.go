@@ -2005,10 +2005,12 @@ func describeEnvFile(path string) string {
 }
 
 // taskSourceSet edits one setting of an existing task source — the CLI twin of
-// the TUI Config tab's enter on a task-source row. Only the settings that are
-// meaningful to flip after the fact are exposed — the two delivery-gate flags
-// and the cap; path/agent/workspace are remove-and-re-add, since changing them
-// silently re-points an agent's work.
+// the TUI Config tab's enter on a task-source row.
+//
+// EVERY field is exposed, including the three that re-point the source. A field
+// settable only at creation means remove-and-re-add: retyping the rest of the
+// entry and renumbering every later source to change one. The TUI still offers
+// the shorter list; this is the surface that has to be complete.
 func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	const usage = "usage: hap config task-source set <index> <path|agent|workspace|template|auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: hap config task-source list, hap help config task-source)"
 	if len(args) != 3 {
@@ -2122,24 +2124,38 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 	// `template` changes the outbound prompt's FORMAT, not its target, so it
 	// carries no such warning.
 	case "path":
-		if err := app.SetTaskSourcePath(ctx, idx, expected, value); err != nil {
+		// The STORED path is echoed, not the typed one: a local path is
+		// absolutized on the way in, so printing the argument beside the
+		// previous stored value would compare a relative path against an
+		// absolute one and read like a downgrade.
+		stored, err := app.SetTaskSourcePath(ctx, idx, expected, value)
+		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "task source #%d: path=%s (was %s)\n", idx, value, expected.Path)
+		fmt.Fprintf(out, "task source #%d: path=%s (was %s)\n", idx, orDash(stored), orDash(expected.Path))
 		fmt.Fprintln(out, retargetMessage)
 		return nil
 	case "agent":
-		if err := app.SetTaskSourceAgent(ctx, idx, expected, value); err != nil {
+		// Trimmed to match what is stored, for the same reason.
+		agent := strings.TrimSpace(value)
+		if err := app.SetTaskSourceAgent(ctx, idx, expected, agent); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "task source #%d: agent=%q (was %q)\n", idx, value, expected.Agent)
+		fmt.Fprintf(out, "task source #%d: agent=%q (was %q)\n", idx, agent, expected.Agent)
+		if agent == "" {
+			fmt.Fprintln(out, "an empty agent matches ANY agent — this source now feeds all of them")
+		}
 		fmt.Fprintln(out, retargetMessage)
 		return nil
 	case "workspace":
-		if err := app.SetTaskSourceWorkspace(ctx, idx, expected, value); err != nil {
+		workspace := strings.TrimSpace(value)
+		if err := app.SetTaskSourceWorkspace(ctx, idx, expected, workspace); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "task source #%d: workspace=%q (was %q)\n", idx, value, expected.Workspace)
+		fmt.Fprintf(out, "task source #%d: workspace=%q (was %q)\n", idx, workspace, expected.Workspace)
+		if workspace == "" || workspace == "*" {
+			fmt.Fprintln(out, "an empty (or \"*\") workspace matches ANY workspace")
+		}
 		fmt.Fprintln(out, retargetMessage)
 		return nil
 	case "template", "next-task-template", "next_task_template":

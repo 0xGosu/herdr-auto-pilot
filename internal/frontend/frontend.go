@@ -2779,26 +2779,39 @@ func (a *App) SetTaskSourceProvider(ctx context.Context, index int, expected con
 // withholding the smaller edit while allowing the larger one only forced the
 // operator through remove-and-re-add — retyping every other field, and
 // renumbering every later source, to change one.
+// It returns the path as STORED, which is not what the caller passed: a local
+// one is absolutized, so a confirmation echoing the typed value beside the
+// previous stored one would compare a relative path against an absolute one and
+// read like a downgrade.
+//
+// Emptiness is left to config.ValidateTaskSource rather than pre-empted here.
+// An empty path is illegal under a local provider (it already says so, naming
+// the provider) but LEGAL under a remote one, where it means "one list per
+// agent" — so refusing it outright would make that documented state
+// unreachable for a source that had once been given an explicit file name,
+// while `provider` and `gist-id` each offer an `inherit` spelling to undo
+// themselves.
 func (a *App) SetTaskSourcePath(ctx context.Context, index int, expected config.TaskSource,
-	path string) error {
+	path string) (stored string, err error) {
 
-	if strings.TrimSpace(path) == "" {
-		return fmt.Errorf("path is required (use `hap config task-source remove %d` to drop the source)", index)
-	}
-	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+	err = a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
 		src.Path = path
 	}, func(cfg config.Config, src *config.TaskSource) {
 		if !cfg.ResolveProvider(*src).Remote() {
 			src.Path = config.ExpandPath(src.Path)
-			if abs, err := filepath.Abs(src.Path); err == nil {
+			if abs, absErr := filepath.Abs(src.Path); absErr == nil {
 				src.Path = abs
 			}
 		}
+		stored = src.Path
 	})
+	return stored, err
 }
 
 // SetTaskSourceAgent re-scopes a source to a different agent selector (an
 // agent id, short name, or agent type; "" matches any agent).
+// An empty selector is legal and means "any agent" — the widest re-point there
+// is, which is why the caller says so rather than silently applying it.
 func (a *App) SetTaskSourceAgent(ctx context.Context, index int, expected config.TaskSource,
 	agent string) error {
 
@@ -2827,6 +2840,16 @@ func (a *App) SetTaskSourceWorkspace(ctx context.Context, index int, expected co
 func (a *App) SetTaskSourceTemplate(ctx context.Context, index int, expected config.TaskSource,
 	template string) error {
 
+	// A whitespace-ONLY template is normalized to empty, because only the empty
+	// string falls back to the built-in default (domain.templateOrDefault).
+	// Stored verbatim, "  " would be rendered and delivered as the whole
+	// prompt: a hand-out carrying no task text and no instructions, sent
+	// unattended on an auto-send source and marking the item [-] for it.
+	// Non-empty templates are NOT trimmed — trailing whitespace there may be
+	// deliberate.
+	if strings.TrimSpace(template) == "" {
+		template = ""
+	}
 	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
 		src.NextTaskTemplate = template
 	})

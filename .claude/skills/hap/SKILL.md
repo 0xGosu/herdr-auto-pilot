@@ -742,9 +742,12 @@ hap config task-source set <index> gist-id aa11bb22
 the first three re-point the source, so each prints what it changed FROM and
 says so — the next hand-out then comes from a different list, or goes to a
 different agent. nothing is copied or removed either way; check
-`hap config task-source list` and `hap task <agent> list` afterwards. a relative
-`path` is resolved against YOUR shell's cwd (the daemon runs from the state
-dir), and an empty one is refused — that is `remove`, not an edit.
+`hap config task-source list` and `hap task <agent> list` afterwards. an empty
+`agent` or `workspace` matches ANY of them, which is called out when you do it.
+a relative `path` is resolved against YOUR shell's cwd (the daemon runs from the
+state dir); an empty `path` is refused under a local provider and means "one
+list per agent" under a remote one. a whitespace-only `template` clears back to
+the default rather than being delivered as the prompt.
 
 the *Config* tab's `enter` on a task-source row is the same edit: it opens a
 picker of the three settings, then asks for the value (the three compose, so no
