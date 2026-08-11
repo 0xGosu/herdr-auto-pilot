@@ -323,6 +323,53 @@ func TestRulesAddAcceptsADashLeadingPattern(t *testing.T) {
 	}
 }
 
+// TestScopedRuleNotesAnUnseenAgentType covers the one place in the safety
+// configuration where a typo fails OPEN: a scoped rule NARROWS a never-auto
+// control, so `--agent-type claude-code` is accepted, listed, and never
+// applies — the failure direction is hap answering what it should have asked
+// about. There is no canonical agent-type list to validate against, so the
+// notice observes rather than refuses; it must stay silent when the agent list
+// could not be read, because an absent herdr is not evidence a type is wrong.
+func TestScopedRuleNotesAnUnseenAgentType(t *testing.T) {
+	app, _ := testApp(t)
+	app.Herdr = &captureHerdr{agents: []domain.AgentTransition{{
+		AgentID: "pane-1", PaneID: "pane-1", AgentType: "claude", Status: "idle",
+	}}}
+
+	out, err := run(t, app, "rules", "add", "--agent-type", "claude-code", "x")
+	if err != nil {
+		t.Fatalf("rules add: %v", err)
+	}
+	if !strings.Contains(out, "claude-code") || !strings.Contains(out, "note:") {
+		t.Errorf("adding a rule for an unreported agent type must say so, got %q", out)
+	}
+	// The rule is still written — the notice is advice, not a refusal.
+	if got := loadCfg(t, app.ConfigPath).Safety.NeverAutoRules; len(got) != 1 {
+		t.Errorf("NeverAutoRules = %+v, want the rule stored despite the notice", got)
+	}
+
+	out, err = run(t, app, "rules", "add", "--agent-type", "Claude", "y")
+	if err != nil {
+		t.Fatalf("rules add: %v", err)
+	}
+	// Agent types are matched case-insensitively everywhere else, so a
+	// capitalized-but-real type must not be flagged as unknown.
+	if strings.Contains(out, "note:") {
+		t.Errorf("a reported agent type (differing only in case) must not be flagged, got %q", out)
+	}
+
+	// No herdr adapter: the list is unreadable, which is NOT the same as "no
+	// agent has that type".
+	quiet, _ := testApp(t)
+	out, err = run(t, quiet, "rules", "add", "--agent-type", "claude-code", "z")
+	if err != nil {
+		t.Fatalf("rules add without a herdr adapter: %v", err)
+	}
+	if strings.Contains(out, "note:") {
+		t.Errorf("an unreadable agent list must not produce a notice, got %q", out)
+	}
+}
+
 func TestRulesAddRejectsAWildcardScope(t *testing.T) {
 	app, _ := testApp(t)
 	// "*" would be a second spelling of the flat list. Refusing it keeps one
