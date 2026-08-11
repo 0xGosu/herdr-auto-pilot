@@ -252,17 +252,44 @@ hap paths                # both, labeled
 cd "$(hap state-dir)"    # e.g. jump into the state dir
 ```
 
-To read and change settings without opening the file:
+**Everything that writes `config.toml` is a `hap config` subcommand.** That is the
+whole configuration surface — the file never has to be opened by hand:
+
+```sh
+hap config show                          # the effective config, defaults filled in
+hap config fields                        # the authoritative key list `config set` takes
+hap config set <key> <value>
+hap config set-threshold approval 0.80   # minimum|idle|approval|choice|error
+hap config rules ...                     # never-auto patterns, incl. --agent-type scoped ones
+hap config task-source ...               # which checklist file feeds which agent
+hap config classifier ...                # which situation a pane is showing
+hap config capture-delay ...             # how long to wait before reading a pane
+hap config env ...                       # the environment handed to the LLM CLI
+```
+
+The last five are topics rather than `set` keys because a list element is
+addressed by position and a map entry by name, neither of which one dotted key
+can name. Each has its own guide (`hap help config rules`, and likewise for the
+rest). They were top-level verbs (`hap config rules …`) until this release; the old
+spellings still work and print a note naming the new one on stderr, so a script
+parsing their tab-separated output is unaffected.
+
+`hap task` is deliberately *not* under `hap config`: it edits the checklist
+items inside an agent's markdown file, which is not configuration.
+
+Related, but not config writes:
 
 ```sh
 hap version                        # the running build
-hap config show                    # the effective config, defaults filled in
-hap config fields                  # the authoritative key list `config set` takes
-hap config set <key> <value>
-hap config set-threshold approval 0.80   # minimum|idle|approval|choice|error
 hap capture <agent>                # re-run the capture pipeline for one agent now
 hap kill-history                   # past kill-switch (pause/resume) activity
 ```
+
+`hap config env` never prints a value — the tables hold API keys — and reads
+one from stdin unless `--value` is passed, so a token stays out of shell
+history and `ps`. Two tests (`TestEveryConfigKeyIsRegistered`,
+`TestEveryConfigListHasACLICommand`) fail the build if a new config key or
+section ever ships without a command.
 
 ## Architecture
 
@@ -703,7 +730,7 @@ its contents are read when hap reaches the store, so rotating it needs no
 restart, and a save can never copy it into your config. Give the token the
 `gist` scope and keep the file mode `0600`.
 
-`hap task-source provider` shows what is in force — the provider, the gist, and
+`hap config task-source provider` shows what is in force — the provider, the gist, and
 whether the credential file resolved — without ever printing the token.
 
 **Privacy.** Enabling this sends the task lists of the sources using it to
@@ -718,9 +745,9 @@ each idle episode is driven exactly once — so an agent that finishes its work
 and sits there without a further event waits for you.
 
 Set `enable_auto_send_task_when_idle = true` on a source — or add the source
-with `hap task-source add --auto-send-when-idle <checklist.md>`, type
+with `hap config task-source add --auto-send-when-idle <checklist.md>`, type
 `--auto-send-when-idle` in the *Config* tab's `t` prompt, or flip it on an
-existing source with `hap task-source set <index> auto-send-when-idle true`
+existing source with `hap config task-source set <index> auto-send-when-idle true`
 (the *Config* tab's `enter` on a task-source row does the same) — and the daemon also
 polls once a minute: any agent that source matches which has been idle for
 more than a minute is handed its next pending `[ ]` item. Delivery goes
@@ -731,7 +758,7 @@ limits and per-agent disable all still apply, and every send is audited
 Every option a source takes can be set at creation time, in any combination:
 
 ```sh
-hap task-source add --agent brave-otter --workspace 'codex-*' \
+hap config task-source add --agent brave-otter --workspace 'codex-*' \
     --template 'Your next task is {next_task_content} (cwd {cwd})' \
     --auto-send-when-idle --enable-llm-review-before-auto-send \
     --max-tasks 40 ./docs/tasks.md
@@ -815,10 +842,10 @@ hap agents                      # short name, pane id, type, status, automation,
 hap rename brave-otter backend-dev
 hap disable backend-dev         # stop automation for only this agent
 hap enable backend-dev          # allow automation again
-hap task-source --agent backend-dev ./docs/backend-tasks.md
-hap task-source --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
-hap task-source --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.md
-hap task-source --agent backend-dev --max-tasks 40 ./docs/backend-tasks.md
+hap config task-source --agent backend-dev ./docs/backend-tasks.md
+hap config task-source --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
+hap config task-source --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.md
+hap config task-source --agent backend-dev --max-tasks 40 ./docs/backend-tasks.md
 ```
 
 `hap agents` output is tab-separated and now carries seven columns. The sixth is
@@ -930,8 +957,8 @@ only — **the checklist file stays on disk**, since sources are often
 hand-written docs hap never created; re-adding the source brings the list back
 untouched. (With items marked via `space`, `x` still deletes those items — the
 selection wins.) To retire a source the guard refuses, use the *Config* tab's
-`x` or `hap task-source remove <index>`, which are unguarded by design. To
-point an agent at a source in the first place, use `hap task-source add` or
+`x` or `hap config task-source remove <index>`, which are unguarded by design. To
+point an agent at a source in the first place, use `hap config task-source add` or
 the *Config* tab's `t`.
 
 ### Suggesting tasks when no source exists, or a source runs out (optional)
@@ -960,9 +987,9 @@ more onto an already-long list. The **same cap also gates manual creation** —
 adding tasks (the Tasks tab's `a`, or `hap task … add`) to a registered source
 is rejected once it would push the list past `max_tasks` — so a hand-added list
 can't grow past what the daemon would then refuse to refill. Prune the checklist
-(or raise `max_tasks` — `hap task-source set <index> max-tasks 40`, the *Config*
+(or raise `max_tasks` — `hap config task-source set <index> max-tasks 40`, the *Config*
 tab's `enter` on the source row, or the `[[task_sources]]` entry) to resume. The
-cap can also be chosen when the source is created: `hap task-source add
+cap can also be chosen when the source is created: `hap config task-source add
 --max-tasks 40 <checklist.md>`, or `--max-tasks 40` in the *Config* tab's `t`
 prompt. Sending the
 remaining pending items of a source under its cap is unaffected, and a `--path`
@@ -1142,10 +1169,10 @@ already decided.
 
 This is **off by default**; set `enable_llm_review_before_auto_send = true` on a
 `[[task_sources]]` entry to opt that source in, either by hand, at creation time
-with `hap task-source add --enable-llm-review-before-auto-send <checklist.md>`
+with `hap config task-source add --enable-llm-review-before-auto-send <checklist.md>`
 (or that flag in the *Config* tab's `t` prompt), on an existing source with
-`hap task-source set <index> enable-llm-review-before-auto-send true`, or from
-the *Config* tab's `enter` on a task-source row. `hap task-source list` and the
+`hap config task-source set <index> enable-llm-review-before-auto-send true`, or from
+the *Config* tab's `enter` on a task-source row. `hap config task-source list` and the
 *Config* tab always print the resolved value, so a source that never named the
 key still shows `enable_llm_review_before_auto_send=false` rather than leaving
 you to guess.
@@ -1171,9 +1198,9 @@ or — when just one seed rule is too aggressive for a repo — silence that one
 id and keep the rest of the safety net:
 
 ```sh
-hap rules list                # each shipped rule carries a stable `seed <id>`
-hap rules disable-seed <id>   # writes safety.disabled_seed_patterns
-hap rules enable-seed <id>    # restore it
+hap config rules list                # each shipped rule carries a stable `seed <id>`
+hap config rules disable-seed <id>   # writes safety.disabled_seed_patterns
+hap config rules enable-seed <id>    # restore it
 ```
 
 The id is a hash of the pattern, so it names the same rule across upgrades (and
@@ -1202,7 +1229,7 @@ The pre-rename boolean `safety.disable_seed` also still loads with a warning;
 the next config save rewrites it as
 `safety.disable_never_auto_seed_patterns`.
 
-or `hap rules add '<regex>'` / `rules remove <index>`, or press `a`/`x` on
+or `hap config rules add '<regex>'` / `rules remove <index>`, or press `a`/`x` on
 the TUI's *Config* tab — which also lists the supported scalar config fields,
 adds/removes task sources (`t`/`x`), and clears learned data (`X`).
 Simple fields — numbers, booleans, and the `tui.theme` enum, including
@@ -1232,7 +1259,9 @@ hidden only from the TUI — `hap config fields` still lists them, `hap config
 set` still sets them, and `config.toml` still reads them. Scoped never-auto rules
 and `[[capture_delay]]` rules also display read-only on the tab. Capture delays show the built-in defaults (10000
 ms first event / 2000 ms after) when none are configured, and long values are
-truncated to one line — the full value lives in `config.toml`. Prompts that
+truncated to one line — the full value lives in `config.toml`, and both lists
+are editable from the CLI (`hap config rules add --agent-type` / `remove-scoped`, and
+`hap config capture-delay set` / `remove`). Prompts that
 *look* destructive
 but match no pattern are escalated by a suspected-irreversible heuristic
 rather than automated. The heuristic needs corroboration to fire — a
@@ -1251,6 +1280,13 @@ pattern = '(?i)compact\s+the\s+conversation'
 agent_types = ["codex", "agy"]   # "*" or omit for all agent types
 ```
 
+or, equivalently, from the CLI:
+
+```sh
+hap config rules add --agent-type codex,agy '(?i)compact\s+the\s+conversation'
+hap config rules remove-scoped <index>   # scoped rules have their own index space
+```
+
 The legacy `irreversible_indicators` and `[[safety.indicator_rules]]` settings
 still load with warnings and migrate to these unified never-auto forms on the
 next config save.
@@ -1263,8 +1299,9 @@ crash-loop breaker's auto-disable/give-up states. The detached daemon's stderr
 is captured at `<state-dir>/daemon.stderr.log` (rotated at 256 KiB — checked
 both when a daemon is spawned and on the running daemon's heartbeat, so a
 process that never restarts is bounded too); an error-severity TUI banner offers
-`!` to open the last 16 KiB in a scrollable detail view. The same path appears
-in `hap status` and `hap state-dir` makes it easy to locate.
+`!` to open the last 16 KiB in a scrollable detail view, and `hap status
+--stderr` prints the same captured tail. The path appears in `hap status`
+either way, and `hap state-dir` makes it easy to locate.
 
 ### Disk usage
 
@@ -1509,6 +1546,22 @@ ANTHROPIC_MODEL = "opus"
 ANTHROPIC_MODEL = "haiku"                                       # cheaper for task ideas
 ```
 
+Both halves are editable from the CLI: the file paths with
+`hap config set llm.env_file <path>` (and the four `…_env_file` keys), and the
+inline tables with `hap config env`:
+
+```sh
+hap config env list                                          # names only, never values
+echo -n "$ANTHROPIC_API_KEY" | hap config env set command ANTHROPIC_API_KEY
+hap config env unset command ANTHROPIC_API_KEY
+```
+
+The scopes are `shared`, `command`, `command_start`, `task_generate_command`,
+`task_generate_command_start` and `learn_from_user_command`. No read path in
+hap ever prints a value, and `set` reads it from stdin unless `--value` is
+passed — a token on the command line lands in shell history and in every other
+user's `ps` output.
+
 The `.env` format is the usual one: `KEY=VALUE` per line, `#` comments, an
 optional `export` prefix, and single/double quotes (`\n`, `\t`, `\"`, `\\`
 escapes inside double quotes). The configured file *path* expands a leading
@@ -1622,8 +1675,9 @@ guards; it auto-acts only when the LLM's self-reported confidence meets
 doesn't contradict your learned history — otherwise the suggestion is surfaced
 for you to confirm. On timeout, CLI failure, or no submission the situation
 escalates. For a retryable failed/timed-out consult, press `l` on its TUI
-escalation; hap refreshes the agent's live pane and status before re-running
-the consult, and disables retry while another consult is already in flight.
+escalation or run `hap escalations retry <id>`; hap refreshes the agent's live
+pane and status before re-running the consult, and the TUI disables retry while
+another consult is already in flight.
 
 The model can also submit `recommend_action: "@noop"` (also accepted: `noop`,
 `no_op`, `no-op`) to say **no reply is needed** — the agent finished or is
@@ -1783,7 +1837,8 @@ Invariants:
   the audit row: open the row in the TUI's **Audit** tab and press `v` to read
   it. That is also how you diagnose a failure.
 - **A failed run is retryable.** Open its row in the **Audit** tab and press
-  `l`. The retry rebuilds the request from the row and re-resolves the agent's
+  `l`, or run `hap escalations retry <id>`. The retry rebuilds the request from
+  the row and re-resolves the agent's
   working directory live, so it still edits the right project — or refuses
   again if it cannot tell. Each attempt writes its own audit row. A retry is
   refused (with a toast) when the agent's pane is gone, when that pane now runs

@@ -91,7 +91,7 @@ func (r *Registry) For(src config.TaskSource, agentName string) (ports.TaskStore
 }
 
 // indexOf reports a source's position in the configured list, so an error can
-// name the `hap task-source set <index> …` that fixes it. -1 when the source is
+// name the `hap config task-source set <index> …` that fixes it. -1 when the source is
 // not one of the configured entries (a synthesized one, or a stale ledger row).
 func (r *Registry) indexOf(src config.TaskSource) int {
 	for i, s := range r.cfg.TaskSources {
@@ -138,7 +138,7 @@ func (r *Registry) backend(p config.ResolvedProvider) (ports.TaskStore, error) {
 	// ONE validator for every use-time rule — unknown provider, unsupported
 	// platform, missing gist_id, missing env_file — rather than a copy here that
 	// drifts from it. It is what produces the operator-facing remediation
-	// ("hap config set …", "hap task-source set N gist-id …"), so re-checking
+	// ("hap config set …", "hap config task-source set N gist-id …"), so re-checking
 	// inline would silently drop those hints. index is unknown at this depth.
 	if err := config.ValidateResolvedProvider(r.cfg, -1, config.TaskSource{
 		Provider: p.Name, GistID: p.GistID,

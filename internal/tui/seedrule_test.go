@@ -398,7 +398,7 @@ func TestDisableMatchedSeedRuleCancelChangesNothing(t *testing.T) {
 }
 
 // Guard the id the operator acts on: it is a content hash, so the rule named
-// in the prompt is the rule `hap rules list` shows and `enable-seed` restores.
+// in the prompt is the rule `hap config rules list` shows and `enable-seed` restores.
 func TestDisableMatchedSeedRulePromptIdMatchesTheCLIId(t *testing.T) {
 	rule := aSeedRule(t)
 	m := escModelWith(t, config.Default(), []domain.AuditRecord{seedRuleEscalation(1, rule, domain.NeverAutoSeed)})

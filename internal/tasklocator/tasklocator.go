@@ -124,7 +124,7 @@ type Resolved struct {
 // agent listing, and the front-end resolves by agent.
 //
 // Pass "" only from a surface that enumerates SOURCES rather than agents (the
-// TUI's aggregate task view, `hap task-source list`). Those get
+// TUI's aggregate task view, `hap config task-source list`). Those get
 // ErrAgentNameRequired for a derived source and render a template instead;
 // nothing on the delivery path can reach it.
 //

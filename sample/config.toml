@@ -29,8 +29,8 @@ never_auto_patterns = []         # extra regexes that ALWAYS escalate (e.g. "rm 
 # allowlist_patterns = []        # DEPRECATED alias for never_auto_patterns (merged on load)
 disable_never_auto_seed_patterns = false  # keep all shipped strict + heuristic rules (recommended)
 disabled_seed_patterns = []      # silence individual shipped rules by id instead of all of
-                                 # them: take the `seed <id>` from `hap rules list`, then
-                                 # `hap rules disable-seed <id>` / `enable-seed <id>`
+                                 # them: take the `seed <id>` from `hap config rules list`, then
+                                 # `hap config rules disable-seed <id>` / `enable-seed <id>`
 
 # Agent-scoped never-auto rule (repeatable):
 # [[safety.never_auto_rules]]
@@ -596,8 +596,8 @@ ai_agent_friendly_output = true   # append a "Next steps" footer to command outp
 # enable_llm_review_before_auto_send = true
 # Composes with enable_auto_send_task_when_idle below: the hand-out decides THAT
 # a task goes, the review decides which task and in what shape. Editable with
-# `hap task-source set <index> enable-llm-review-before-auto-send <bool>`, or in
-# the TUI's Config tab; `hap task-source list` always prints the resolved value.
+# `hap config task-source set <index> enable-llm-review-before-auto-send <bool>`, or in
+# the TUI's Config tab; `hap config task-source list` always prints the resolved value.
 # The former `enable_llm_review` spelling still loads (with a warning) and is
 # rewritten on the next save; the CLI refuses it.
 # Cap how many checklist items (done, in-progress, and pending) this source may
@@ -622,7 +622,7 @@ ai_agent_friendly_output = true   # append a "Next steps" footer to command outp
 # skipped. Reserving belongs to the SOURCE, so ordinary event-driven sends from
 # it are marked "[-]" too (the agent's own `hap task ... start` is then a
 # no-op). Default: off. A new source can be added with it already on:
-# `hap task-source add --auto-send-when-idle <checklist.md>`.
+# `hap config task-source add --auto-send-when-idle <checklist.md>`.
 # enable_auto_send_task_when_idle = true
 
 # ── Custom classifier rules (repeatable, extend the built-ins) ──────

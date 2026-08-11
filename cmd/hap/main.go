@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -61,7 +62,26 @@ func main() {
 	// runs BEFORE the version branch so `hap version --help` is a help request,
 	// as the guides promise; it returns false for unknown verbs.
 	if cli.WantsCommandHelp(verb, args) {
-		if err := cli.Run(context.Background(), nil, os.Stdout, "help", []string{verb}); err != nil {
+		// A `hap config` topic is a TWO-word command ("config rules"), so the
+		// subcommand token is forwarded when — and only when — it names one.
+		// Passing the verb alone would answer `hap config rules --help` with
+		// the parent's page; passing the whole argument list would forward the
+		// `--help` flag itself, which reads as a request for help's own guide.
+		// The FIRST POSITIONAL argument is what may name a topic, not args[0]:
+		// cli.Run strips --no-hints before its own two-word lookup, so probing
+		// the raw args here would disagree with it and answer
+		// `hap config --no-hints rules --help` with the parent's page.
+		helpTarget := []string{verb}
+		for _, a := range args {
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			if _, ok := cli.Lookup(verb + " " + a); ok {
+				helpTarget = append(helpTarget, a)
+			}
+			break
+		}
+		if err := cli.Run(context.Background(), nil, os.Stdout, "help", helpTarget); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}

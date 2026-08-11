@@ -220,6 +220,35 @@ whose manifest carries exactly that version).
 - **Optional capabilities are optional interfaces** — extend the herdr surface with a new
   port interface (see `LocatorPort`, `InspectorPort`) and type-assert at the call site,
   degrading gracefully; don't grow `HerdrPort` and break every fake.
+- **Everything that writes config.toml is a `hap config` subcommand** — one place to learn,
+  and the reason `hap config` is the ONLY visible command in the help's Configure group
+  (`TestConfigureGroupHasOneVisibleCommand` fails on a second one). Topics are TWO-word
+  registry entries (`config rules`, `config task-source`, `config classifier`,
+  `config capture-delay`), resolved longest-spelling-first in `cli.Run`, so each is
+  dispatched and documented on its own rather than routed by the parent's handler — that
+  is what makes `hap config rules --help` reach the topic's page. `hap task` is
+  deliberately NOT here: it edits checklist ITEMS in an agent's markdown file, which is not
+  configuration. The four were top-level verbs once; their old spellings still resolve
+  (`Command.MovedFrom`) and print a migration note on **stderr**, never stdout, because
+  these verbs print tab-separated listings that scripts parse.
+- **Every config key is reachable from the CLI** — the TUI is a convenience, not a
+  capability, and config.toml is never something an operator must open by hand. SCALAR keys
+  go in the `frontend.ConfigFields` registry (`hap config set`); `TestEveryConfigKeyIsRegistered`
+  walks `config.Config` the way BurntSushi's decoder does and fails on any unregistered one.
+  ARRAY and MAP sections cannot be a `config set` key — a list element is addressed by
+  POSITION and a map entry by NAME — so each gets a verb (`hap config rules`, `hap config task-source`,
+  `hap config classifier`, `hap config capture-delay`, `hap config env`) and is named in
+  `configListCommands`, which `TestEveryConfigListHasACLICommand` holds to the same
+  by-construction standard. Both tests also fail on a STALE entry, so neither map can claim
+  coverage for a key that no longer exists. Two rules bind the list editors: **removal
+  compares the WHOLE entry the caller listed**, never one field (several classifier rules
+  share a situation, and one never-auto pattern is legitimately scoped twice — a one-field
+  guard passes on the wrong element exactly when a listing has gone stale); and **an insert
+  must respect the daemon's own lookup order** — `config.CaptureDelay` takes the first rule
+  matching the agent type and `"*"` matches everything, so a specific rule appended after a
+  wildcard one is configured, listed, and never read. Secrets are a DISPLAY rule, not an
+  exemption: `hap config env` never prints a value and reads it from stdin unless `--value`
+  is passed, so a token stays out of shell history and `ps`.
 - **Fail safe on the daemon path** — no panics; every error resolves to escalate + audit +
   log. Wrap new handler/adapter calls in `logging.Guard`.
 - **Safety controls are never bypassed** — LLM submissions and learned rules alike are

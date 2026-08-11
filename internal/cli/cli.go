@@ -32,6 +32,11 @@ import (
 // "error:" prefix, so scripted health checks can detect it.
 var ErrUnhealthy = errors.New("daemon unhealthy")
 
+// deprecationOut is where the "this verb moved" note goes. It is stderr rather
+// than the command's own writer so the tab-separated listings these verbs print
+// stay machine-parseable; a var so tests can capture it.
+var deprecationOut io.Writer = os.Stderr
+
 // Run dispatches one CLI verb against the shared front-end layer, through the
 // command registry (help.go) so that every verb carries its own help text and
 // "Next steps" footer.
@@ -48,13 +53,30 @@ func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, arg
 	if verb == "help" || verb == "--help" || verb == "-h" {
 		return help(&hintWriter{Writer: out, on: true}, args)
 	}
+	// A `hap config` topic is a TWO-word command ("config rules"), so the longer
+	// spelling is resolved first and its own handler runs directly — the parent
+	// verb never has to route to it, and `hap config rules --help` reaches the
+	// topic's page rather than the parent's.
 	cmd, ok := Lookup(verb)
+	if len(args) > 0 {
+		if sub, subOK := Lookup(verb + " " + args[0]); subOK {
+			cmd, ok, args = sub, true, args[1:]
+		}
+	}
 	if !ok {
 		return UnknownCommandError(verb)
 	}
 	if wantsHelp(args) {
 		PrintHelp(&hintWriter{Writer: out, on: true}, cmd)
 		return nil
+	}
+	// Everything that writes config.toml moved under `hap config`. The old
+	// top-level spellings still work; say so once, on STDERR, because these
+	// verbs print tab-separated listings that scripts parse and a note on
+	// stdout would corrupt them.
+	if MovedFromSpelling(cmd, verb) {
+		fmt.Fprintf(deprecationOut, "note: `hap %s` is now `hap %s` — the old spelling still works\n",
+			verb, cmd.Name)
 	}
 
 	// app is carried, not read: the config gate is evaluated when a footer is
@@ -88,6 +110,14 @@ func help(out io.Writer, args []string) error {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		Overview(out)
 		return nil
+	}
+	// `hap help config rules` — same two-words-first resolution Run uses, so a
+	// topic is asked about the way it is typed.
+	if len(args) > 1 {
+		if cmd, ok := Lookup(args[0] + " " + args[1]); ok {
+			PrintHelp(out, cmd)
+			return nil
+		}
 	}
 	cmd, ok := Lookup(args[0])
 	if !ok {
@@ -742,7 +772,16 @@ func setAgentDisabled(ctx context.Context, app *frontend.App, out io.Writer,
 	return nil
 }
 
-func status(ctx context.Context, app *frontend.App, out io.Writer) error {
+func status(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	stderrTail := fs.Bool("stderr", false, "also print the captured daemon stderr (the crash output the status line only names)")
+	fs.SetOutput(out)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected argument %q (usage: hap status [--stderr])", fs.Arg(0))
+	}
 	st, err := app.GetStatus(ctx)
 	if err != nil {
 		return err
@@ -834,6 +873,21 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	}
 	if cfg, err := config.Load(app.ConfigPath); err == nil {
 		printDiskLine(out, app.StateDir, cfg)
+	}
+	// The full crash output, on request. The health lines above name the log
+	// file but only ever quote a one-line summary of it, which was enough to
+	// know something crashed and never enough to know why — reading the whole
+	// tail was TUI-only until now.
+	if *stderrTail {
+		path, tail := app.DaemonStderrTail()
+		fmt.Fprintf(out, "\ndaemon stderr (%s):\n", orDash(path))
+		if tail == "" {
+			fmt.Fprintln(out, "  (empty — the daemon has written nothing to stderr)")
+		} else {
+			for _, line := range strings.Split(tail, "\n") {
+				fmt.Fprintf(out, "  %s\n", line)
+			}
+		}
 	}
 	// The footer is built from what this status actually found, so the first
 	// suggestion is always the one that matters: revive the daemon, lift the
@@ -939,10 +993,13 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 
 func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) > 0 {
-		if args[0] != "prune" {
-			return fmt.Errorf("usage: escalations [prune [minutes]] (see: hap help escalations)")
+		switch args[0] {
+		case "prune":
+			return escalationsPrune(ctx, app, out, args[1:])
+		case "retry":
+			return escalationsRetry(ctx, app, out, args[1:])
 		}
-		return escalationsPrune(ctx, app, out, args[1:])
+		return fmt.Errorf("usage: escalations [prune [minutes] | retry <audit-id>] (see: hap help escalations)")
 	}
 	esc, err := app.Escalations(ctx)
 	if err != nil {
@@ -1006,7 +1063,7 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 	// disable a rule that is not why it escalated.
 	if rule, ok := domain.SeedRuleForcedEscalation(esc[0].Rationale); ok {
 		hints = append(hints, Hint{
-			Cmd: fmt.Sprintf("hap rules disable-seed %s", domain.SeedRuleID(rule.Pattern)),
+			Cmd: fmt.Sprintf("hap config rules disable-seed %s", domain.SeedRuleID(rule.Pattern)),
 			Why: fmt.Sprintf("a builtin safety rule blocked escalation #%d — silence it if it is too aggressive for this repo", id),
 		})
 	}
@@ -1036,6 +1093,30 @@ func escalationsPrune(ctx context.Context, app *frontend.App, out io.Writer, arg
 	PrintNextSteps(out, []Hint{
 		{Cmd: "hap escalations", Why: "what is still pending"},
 		{Cmd: "hap audit --limit 20", Why: "the pruned rows are kept here as dismissed"},
+	})
+	return nil
+}
+
+// escalationsRetry re-invokes the operator LLM on an escalation whose consult
+// failed or timed out (or re-runs a failed learn-from-correction), which was
+// previously reachable only from the TUI. The request is queued; the daemon
+// re-drives the consult against the agent's LIVE pane on its next reload, so
+// the answer reflects the screen as it is now, not the one that failed.
+func escalationsRetry(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: escalations retry <audit-id> (see: hap escalations)")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid audit id %q", args[0])
+	}
+	if err := app.RetryLLM(ctx, id); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "LLM re-consult queued for escalation #%d\n", id)
+	PrintNextSteps(out, []Hint{
+		{Cmd: "hap escalations", Why: "the queue — the row updates once the daemon re-consults"},
+		{Cmd: "hap status", Why: "the daemon must be running to pick the retry up"},
 	})
 	return nil
 }
@@ -1214,6 +1295,8 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		// Bare on purpose: `$(hap config path)` must be the path alone.
 		fmt.Fprintln(out, app.ConfigPath)
 		return nil
+	case "env":
+		return configEnv(ctx, app, out, args[1:])
 	case "fields":
 		cfg, err := app.Config()
 		if err != nil {
@@ -1253,7 +1336,12 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		PrintNextSteps(out, configHints())
 		return nil
 	}
-	return fmt.Errorf("usage: config [show|fields|path|set <field> <value>|set-threshold <situation> <value>] (see: hap help config)")
+	// The topics are named here too: reaching this line means `hap config <x>`
+	// resolved to no two-word command, and "rule" for "rules" is the likeliest
+	// way to get here.
+	return fmt.Errorf("usage: config [show|fields|path|set <field> <value>|set-threshold <situation> <value>|env …]\n" +
+		"  topics: config rules | config task-source | config classifier | config capture-delay\n" +
+		"  (see: hap help config)")
 }
 
 // configHints are the follow-ups printed after a config read or edit; `config
@@ -1304,7 +1392,7 @@ func printConfig(out io.Writer, cfg config.Config) {
 // the surface an operator runs first, so a line saying "local, as always" would
 // be noise on every install that never touched the setting. When a remote
 // backend IS configured, this is where a broken one becomes visible without
-// having to think to run `hap task-source provider`.
+// having to think to run `hap config task-source provider`.
 func printTaskStoreLine(out io.Writer, cfg config.Config) {
 	if !cfg.AnyNonDefaultProvider() {
 		return
@@ -1389,7 +1477,7 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if cfg.Safety.DisableNeverAutoSeedPatterns {
 			fmt.Fprintln(out, "# shipped never-auto rules disabled by safety.disable_never_auto_seed_patterns=true")
 		} else {
-			fmt.Fprintln(out, "# shipped never-auto rules (silence one: hap rules disable-seed <id>)")
+			fmt.Fprintln(out, "# shipped never-auto rules (silence one: hap config rules disable-seed <id>)")
 			disabled := make(map[string]bool, len(cfg.Safety.DisabledSeedPatterns))
 			for _, p := range cfg.Safety.DisabledSeedPatterns {
 				disabled[p] = true
@@ -1413,20 +1501,18 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 			fmt.Fprintf(out, "operator scoped #%d\tagent_types=%s\t%s\n", i, scope, r.Pattern)
 		}
 		PrintNextSteps(out, []Hint{
-			{Cmd: "hap rules add <regex>", Why: "force a matching situation to always ask a human"},
-			{Cmd: "hap rules remove <index>", Why: "drop one of the operator patterns listed above"},
-			{Cmd: "hap rules disable-seed <id>", Why: "silence one builtin (seed <id>) rule that is too aggressive here"},
+			{Cmd: "hap config rules add <regex>", Why: "force a matching situation to always ask a human"},
+			{Cmd: "hap config rules remove <index>", Why: "drop one of the operator patterns listed above"},
+			{Cmd: "hap config rules remove-scoped <index>", Why: "drop one of the agent-scoped rules listed above"},
+			{Cmd: "hap config rules disable-seed <id>", Why: "silence one builtin (seed <id>) rule that is too aggressive here"},
 		})
 		return nil
 	}
 	switch {
-	case args[0] == "add" && len(args) == 2:
-		if err := app.AddNeverAutoPattern(ctx, args[1]); err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "never-auto pattern added: %s\n", args[1])
-		PrintNextSteps(out, rulesEditedHints())
-		return nil
+	case args[0] == "add":
+		return rulesAdd(ctx, app, out, args[1:])
+	case args[0] == "remove-scoped" && len(args) == 2:
+		return rulesRemoveScoped(ctx, app, out, args[1])
 	case args[0] == "disable-seed" && len(args) == 2:
 		return rulesSeedToggle(ctx, app, out, args[1], true)
 	case args[0] == "enable-seed" && len(args) == 2:
@@ -1434,14 +1520,14 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 	case args[0] == "remove" && len(args) == 2:
 		idx, err := strconv.Atoi(args[1])
 		if err != nil {
-			return fmt.Errorf("invalid pattern index %q (see: rules list)", args[1])
+			return fmt.Errorf("invalid pattern index %q (see: hap config rules list)", args[1])
 		}
 		cfg, err := app.Config()
 		if err != nil {
 			return err
 		}
 		if idx < 0 || idx >= len(cfg.Safety.NeverAutoPatterns) {
-			return fmt.Errorf("no operator never-auto pattern #%d (see: rules list)", idx)
+			return fmt.Errorf("no operator never-auto pattern #%d (see: hap config rules list)", idx)
 		}
 		expected := cfg.Safety.NeverAutoPatterns[idx]
 		if err := app.RemoveNeverAutoPattern(ctx, idx, expected); err != nil {
@@ -1451,7 +1537,130 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		PrintNextSteps(out, rulesEditedHints())
 		return nil
 	}
-	return fmt.Errorf("usage: rules [list|add <regex>|remove <index>|disable-seed <id>|enable-seed <id>] (see: hap help rules)")
+	return fmt.Errorf("usage: hap config rules [list|add [--agent-type T] <regex>|remove <index>|remove-scoped <index>|disable-seed <id>|enable-seed <id>] (see: hap help config rules)")
+}
+
+// rulesAdd appends an operator never-auto pattern. With --agent-type it lands
+// in the SCOPED list ([[safety.never_auto_rules]]) instead of the flat one:
+// same safety meaning, but limited to the named agent types, so a phrase that
+// is only dangerous in one agent's TUI does not make every other agent ask.
+// The two lists are listed and removed separately (`remove` vs
+// `remove-scoped`) because each has its own index space.
+func rulesAdd(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	agentTypes, rest, err := splitAgentTypeFlag(args)
+	if err != nil {
+		return err
+	}
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: hap config rules add [--agent-type T[,T]] <regex> (see: hap help config rules)")
+	}
+	pattern := rest[0]
+	if strings.TrimSpace(agentTypes) == "" {
+		if err := app.AddNeverAutoPattern(ctx, pattern); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "never-auto pattern added: %s\n", pattern)
+		PrintNextSteps(out, rulesEditedHints())
+		return nil
+	}
+	types := strings.Split(agentTypes, ",")
+	if err := app.AddNeverAutoRule(ctx, pattern, types); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "scoped never-auto rule added: agent_types=%s\t%s\n",
+		strings.Join(types, ","), pattern)
+	warnUnseenAgentTypes(ctx, app, out, types)
+	PrintNextSteps(out, rulesEditedHints())
+	return nil
+}
+
+// splitAgentTypeFlag pulls --agent-type out of `rules add`'s arguments by hand
+// and returns everything else as positional.
+//
+// flag.Parse cannot be used here: a never-auto pattern is a REGEX and may
+// legitimately begin with a dash (`--force`, `--no-verify`, `-rf /`), which the
+// parser would reject as an unknown flag. Before --agent-type existed the
+// pattern was read positionally and those patterns worked; a safety rule that
+// can no longer be ADDED is protection silently absent, so the flag is carved
+// out instead of the pattern being handed to a parser. A literal `--`
+// terminator still works for the pathological pattern that IS "--agent-type".
+func splitAgentTypeFlag(args []string) (agentTypes string, rest []string, err error) {
+	const flagName = "agent-type"
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			rest = append(rest, args[i+1:]...)
+			return agentTypes, rest, nil
+		}
+		name, value, hasValue := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if strings.HasPrefix(a, "-") && name == flagName {
+			if hasValue {
+				agentTypes = value
+				continue
+			}
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("--%s needs a value (comma-separated agent types)", flagName)
+			}
+			i++
+			agentTypes = args[i]
+			continue
+		}
+		rest = append(rest, a)
+	}
+	return agentTypes, rest, nil
+}
+
+// warnUnseenAgentTypes prints a non-blocking notice when a scoped rule names an
+// agent type no watched agent reports.
+//
+// A typo here fails OPEN, unlike everywhere else in the safety configuration: a
+// scoped rule NARROWS a never-auto control, so `--agent-type claude-code` is
+// accepted, listed, and never applies — the failure direction is hap answering
+// something it should have escalated. There is no canonical agent-type list to
+// validate against (herdr can report any type), so this observes rather than
+// refuses, and stays silent whenever the agent list could not be read — an
+// absent herdr must never read as "that type does not exist".
+func warnUnseenAgentTypes(ctx context.Context, app *frontend.App, out io.Writer, types []string) {
+	st, err := app.GetStatus(ctx)
+	if err != nil || !st.AgentsKnown {
+		return
+	}
+	seen := make(map[string]bool, len(st.MonitoredAgents))
+	for _, a := range st.MonitoredAgents {
+		seen[strings.ToLower(strings.TrimSpace(a.AgentType))] = true
+	}
+	for _, t := range types {
+		if !seen[strings.ToLower(strings.TrimSpace(t))] {
+			fmt.Fprintf(out, "note: no watched agent reports type %q — this rule does not apply to anything yet\n", t)
+		}
+	}
+}
+
+// rulesRemoveScoped deletes one agent-scoped never-auto rule by the index
+// `rules list` printed for it ("operator scoped #N"). It is a separate verb
+// from `remove` because the scoped rules have their own index space — sharing
+// one verb would make `rules remove 0` ambiguous between two different safety
+// rules.
+func rulesRemoveScoped(ctx context.Context, app *frontend.App, out io.Writer, arg string) error {
+	idx, err := strconv.Atoi(strings.TrimPrefix(arg, "#"))
+	if err != nil {
+		return fmt.Errorf("invalid scoped rule index %q (see: hap config rules list)", arg)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		return err
+	}
+	if idx < 0 || idx >= len(cfg.Safety.NeverAutoRules) {
+		return fmt.Errorf("no scoped never-auto rule #%d (see: hap config rules list)", idx)
+	}
+	expected := cfg.Safety.NeverAutoRules[idx]
+	if err := app.RemoveNeverAutoRule(ctx, idx, expected); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "scoped never-auto rule #%d removed: agent_types=%s\t%s\n",
+		idx, strings.Join(expected.AgentTypes, ","), expected.Pattern)
+	PrintNextSteps(out, rulesEditedHints())
+	return nil
 }
 
 // rulesSeedToggle disables (or re-enables) one shipped seed never-auto rule by
@@ -1462,7 +1671,7 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 func rulesSeedToggle(ctx context.Context, app *frontend.App, out io.Writer, id string, disable bool) error {
 	rule, ok := domain.SeedRuleByID(id)
 	if !ok {
-		return fmt.Errorf("no seed rule %q (see: rules list)", id)
+		return fmt.Errorf("no seed rule %q (see: hap config rules list)", id)
 	}
 	if disable {
 		if err := app.DisableSeedRule(ctx, rule.Pattern); err != nil {
@@ -1483,7 +1692,7 @@ func rulesSeedToggle(ctx context.Context, app *frontend.App, out io.Writer, id s
 // list is what renumbers, and the daemon applies it on its next reload.
 func rulesEditedHints() []Hint {
 	return []Hint{
-		{Cmd: "hap rules list", Why: "the full set, with the indexes `remove` takes"},
+		{Cmd: "hap config rules list", Why: "the full set, with the indexes `remove` takes"},
 		{Cmd: "hap escalations", Why: "matching situations now always land here"},
 	}
 }
@@ -1565,7 +1774,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	}
 	if len(args) > 0 && args[0] == "remove" {
 		if len(args) != 2 {
-			return fmt.Errorf("usage: task-source remove <index> (see: task-source list)")
+			return fmt.Errorf("usage: hap config task-source remove <index> (see: hap config task-source list)")
 		}
 		idx, err := strconv.Atoi(strings.TrimPrefix(args[1], "#"))
 		if err != nil {
@@ -1576,7 +1785,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 			return err
 		}
 		if idx < 0 || idx >= len(cfg.TaskSources) {
-			return fmt.Errorf("no task source #%d (see: task-source list)", idx)
+			return fmt.Errorf("no task source #%d (see: hap config task-source list)", idx)
 		}
 		expected := cfg.TaskSources[idx]
 		if err := app.RemoveTaskSource(ctx, idx, expected); err != nil {
@@ -1610,7 +1819,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 				return fmt.Errorf("flags must come before <checklist.md>: %s was read as an argument, not a flag", extra)
 			}
 		}
-		return fmt.Errorf("usage: task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>] | list | set <index> <key> <value> | remove <index> (see: hap help task-source)")
+		return fmt.Errorf("usage: hap config task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>] | list | set <index> <key> <value> | remove <index> (see: hap help config task-source)")
 	}
 	if *provider != "" && !slices.Contains(config.ValidTaskSourceProviders, *provider) {
 		return fmt.Errorf("--provider must be one of %s, got %q",
@@ -1625,7 +1834,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	effective := cfg.ResolveProvider(config.TaskSource{Provider: *provider, GistID: *gistID})
 	if fs.NArg() == 0 && !effective.Remote() {
 		return fmt.Errorf("a checklist path is required under provider=%s: "+
-			"hap task-source add [flags] <checklist.md>", effective.Name)
+			"hap config task-source add [flags] <checklist.md>", effective.Name)
 	}
 	if *gistID != "" && effective.Name != config.ProviderGitHubGist {
 		// Refused rather than ignored: a silently dropped flag would leave the
@@ -1724,7 +1933,7 @@ const (
 
 // taskSourceProvider reports where task lists are stored. Read-only on purpose:
 // the values are written through the config registry (`hap config set
-// task_source_provider.…` and `hap task-source set <i> provider …`), and a
+// task_source_provider.…` and `hap config task-source set <i> provider …`), and a
 // second write path would be a second validation to drift from.
 //
 // It exists because "is my token wired up?" has no other answer short of
@@ -1765,7 +1974,7 @@ func taskSourceProvider(app *frontend.App, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "set default with: hap config set task_source_provider.provider <%s>\n",
 		strings.Join(config.ValidTaskSourceProviders, "|"))
-	fmt.Fprintln(out, "set per source:   hap task-source set <index> provider <name>")
+	fmt.Fprintln(out, "set per source:   hap config task-source set <index> provider <name>")
 	return nil
 }
 
@@ -1793,7 +2002,7 @@ func describeEnvFile(path string) string {
 // and the cap; path/agent/workspace are remove-and-re-add, since changing them
 // silently re-points an agent's work.
 func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	const usage = "usage: task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: task-source list, hap help task-source)"
+	const usage = "usage: hap config task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: hap config task-source list, hap help config task-source)"
 	if len(args) != 3 {
 		return fmt.Errorf("%s", usage)
 	}
@@ -1808,7 +2017,7 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 		return err
 	}
 	if idx < 0 || idx >= len(cfg.TaskSources) {
-		return fmt.Errorf("no task source #%d (see: task-source list)", idx)
+		return fmt.Errorf("no task source #%d (see: hap config task-source list)", idx)
 	}
 	expected := cfg.TaskSources[idx]
 	key, value := args[1], args[2]

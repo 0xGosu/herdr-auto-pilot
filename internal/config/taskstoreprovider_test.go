@@ -400,7 +400,7 @@ func TestValidateTaskSourceProviderRules(t *testing.T) {
 
 // TestValidateTaskSourceAcceptsAMissingGistID pins a deliberate OMISSION.
 // Rejecting a missing gist_id at write time would make the keys
-// order-dependent to set and would break `hap task-source add` for an operator
+// order-dependent to set and would break `hap config task-source add` for an operator
 // midway through configuring, because every write goes Load → mutate → Save.
 // The check belongs at use time. Do not "tighten" this without deleting this
 // test and explaining why.
@@ -420,7 +420,7 @@ func TestValidateTaskSourceAcceptsAMissingGistID(t *testing.T) {
 		// are missing the shared default or this source's own override.
 		for _, want := range []string{
 			"hap config set task_source_provider.github_gist.gist_id",
-			"hap task-source set 0 gist-id",
+			"hap config task-source set 0 gist-id",
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("the message must name %q, got: %v", want, err)

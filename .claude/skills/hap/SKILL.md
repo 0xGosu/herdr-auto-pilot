@@ -248,6 +248,12 @@ hap escalations prune
 hap escalations prune 120
 ```
 
+re-invoke the LLM on an escalation whose consult failed or timed out (and re-run a failed learn-from-correction). the request is queued: the running daemon re-consults against the agent's LIVE pane, so the answer reflects the screen now, not the one that failed:
+
+```bash
+hap escalations retry <id>
+```
+
 ## pause and resume (kill switch)
 
 pause all automation globally:
@@ -476,9 +482,35 @@ per-command env notes: layering is daemon env → `env_file` → `env` → the c
 
 TUI palette colors — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. set with `hap config set tui.palette.<role> <color>`; values are 256-color codes (`"205"`, 0-255) or hex (`"#ff5faf"`, `#rgb` or `#rrggbb`), and `""` clears a role back to the theme. anything else is rejected — lipgloss resolves an unrecognized color to NO color at all. hidden from the TUI config tab (eight colors would bury the settings you reach for), so `hap config fields` is where you read their current values.
 
-some settings are table-valued and live in `config.toml` only (not settable via `hap config set`): `[[capture_delay]]`, `[[task_sources]]`, `[[classifier]]`, `[[safety.never_auto_rules]]`, `safety.disabled_seed_patterns` (the list `hap rules disable-seed` writes), and the inline `[llm.*_env]` tables (only the `*_env_file` PATHS are settable — the tables hold secrets). `[tui.palette]` is NOT in this list: its roles are individually settable, see above. neither is `[task_source_provider]`: its keys ARE settable — `task_source_provider.provider`, `.env_file`, `.timeout_seconds`, `.refresh_seconds`, `.github_gist.gist_id` (see task sources). the PER-SOURCE overrides of those, on a `[[task_sources]]` entry, go through `hap task-source set <index> …` like the entry's other settings.
+**everything that writes `config.toml` is a `hap config` subcommand** — that is the whole configuration surface, and the file never has to be opened by hand. (`hap task` is deliberately not one: it edits the checklist items inside an agent's markdown file, which is not configuration.)
+
+some settings are table-valued, so one `hap config set <key> <value>` cannot address them (a list element is addressed by position, a map entry by name). each gets a topic of its own instead:
+
+| section | command |
+|---|---|
+| `[[task_sources]]` | `hap config task-source add / set / remove` |
+| `[[classifier]]` | `hap config classifier add / remove` |
+| `[[capture_delay]]` | `hap config capture-delay set / remove` |
+| `safety.never_auto_patterns` | `hap config rules add / remove` |
+| `[[safety.never_auto_rules]]` | `hap config rules add --agent-type / hap config rules remove-scoped` |
+| `safety.disabled_seed_patterns` | `hap config rules disable-seed / enable-seed` |
+| `[llm.*_env]` | `hap config env set / unset` (values read from stdin) |
+
+`[tui.palette]` is not table-valued for this purpose: its roles are individually settable with `hap config set`, see above. `TestEveryConfigKeyIsRegistered` and `TestEveryConfigListHasACLICommand` fail the build if a new key or section ever ships without a command, and `TestConfigureGroupHasOneVisibleCommand` fails if one ships outside `hap config`.
+
+`rules`, `task-source`, `classifier` and `capture-delay` were top-level verbs (`hap config rules …`) before this. the old spellings still work and print a note naming the new one on **stderr** — stdout stays clean, so a script parsing these tab-separated listings is unaffected. each topic has its own guide: `hap help config rules`, and likewise for the other three.
+
+`[task_source_provider]` is not table-valued either: its keys are ordinary `hap config set` fields — `task_source_provider.provider`, `.env_file`, `.timeout_seconds`, `.refresh_seconds`, `.github_gist.gist_id` (see task sources). the PER-SOURCE overrides of those live on a `[[task_sources]]` entry and go through `hap config task-source set <index> …` like its other settings.
 
 **capture delay** — the classification pane read waits a per-agent delay so the agent TUI has painted and event bursts coalesce. defaults: 10000ms (10s) on an agent's first event, 2000ms after. override per agent type:
+
+```bash
+hap config capture-delay list                     # the delays in force, defaults resolved
+hap config capture-delay set codex 8000 500       # <agent-type> <start-ms> <event-ms>; "*" = all types
+hap config capture-delay remove codex             # back to the built-in defaults
+```
+
+setting a type that already has a rule OVERWRITES it — the daemon reads the first matching rule, so a second one for the same type would never be reached. a `0` means "keep the built-in default for that one". the equivalent config.toml:
 
 ```toml
 [[capture_delay]]
@@ -487,33 +519,60 @@ start_ms = 8000        # first-event delay
 event_ms = 500         # subsequent-event delay
 ```
 
+**classifier rules** — which situation a pane is showing. hap ships rules for the agent TUIs it knows; add your own when a screen is read as the wrong situation, or as none at all (`unclassifiable` escalations). operator rules are consulted BEFORE the shipped ones, in the order added, so position is precedence:
+
+```bash
+hap config classifier list
+hap config classifier add --situation approval --agent-type claude --regex 'Do you want to proceed\?'
+hap config classifier remove 0
+```
+
+`--situation` is approval, choice, error or idle; `--agent-type` defaults to `*`. repeat `--regex`/`--keyword` for several (a regex may contain a comma, so they are not comma-split). a rule needs at least one regex or keyword.
+
+**LLM environment** — the variables handed to the LLM CLI, per scope (`shared`, `command`, `command_start`, `task_generate_command`, `task_generate_command_start`, `learn_from_user_command`):
+
+```bash
+hap config env list                                          # names only, never values
+echo -n "$ANTHROPIC_API_KEY" | hap config env set command ANTHROPIC_API_KEY
+hap config env unset command ANTHROPIC_API_KEY
+```
+
+these hold API keys, so no read path ever prints a VALUE and `env set` reads it from stdin unless you pass `--value` — a token on argv lands in shell history and in every other user's `ps`. to keep values out of config.toml entirely, point a scope at a `.env` file instead (`hap config set llm.env_file <path>`).
+
 ## safety rules (never-auto patterns)
 
 list all rules (seed + custom):
 
 ```bash
-hap rules list
+hap config rules list
 ```
 
 add a custom regex pattern (operations matching this are never automated):
 
 ```bash
-hap rules add '(?i)restart\s+the\s+payment\s+service'
+hap config rules add '(?i)restart\s+the\s+payment\s+service'
 ```
 
 remove a custom rule by index:
 
 ```bash
-hap rules remove <index>
+hap config rules remove <index>
+```
+
+scope a rule to specific agent types (a phrase only dangerous in one agent's TUI should not make every other agent ask):
+
+```bash
+hap config rules add --agent-type codex,agy '(?i)compact\s+the\s+conversation'
+hap config rules remove-scoped <index>    # scoped rules have their own index space
 ```
 
 silence a single shipped seed rule that is too aggressive for this repo (e.g. a
 heuristic firing on a legitimate word), keeping the rest of the safety net:
 
 ```bash
-hap rules list                     # take the stable `seed <id>` from the listing
-hap rules disable-seed <id>        # writes safety.disabled_seed_patterns
-hap rules enable-seed <id>         # restore it
+hap config rules list                     # take the stable `seed <id>` from the listing
+hap config rules disable-seed <id>        # writes safety.disabled_seed_patterns
+hap config rules enable-seed <id>         # restore it
 ```
 
 the id is a short hash of the pattern, so it names the same rule across
@@ -548,51 +607,51 @@ task sources point agents at a checklist file so idle agents get the next unchec
 list configured task sources:
 
 ```bash
-hap task-source list
+hap config task-source list
 ```
 
 add a task source for a specific agent:
 
 ```bash
-hap task-source add --agent backend-dev ./docs/backend-tasks.md
+hap config task-source add --agent backend-dev ./docs/backend-tasks.md
 ```
 
 add a task source for a specific workspace (supports wildcards):
 
 ```bash
-hap task-source add --workspace "codex-*" ./docs/tasks.md
+hap config task-source add --workspace "codex-*" ./docs/tasks.md
 ```
 
 add a task source for any agent in any workspace:
 
 ```bash
-hap task-source add ./docs/tasks.md
+hap config task-source add ./docs/tasks.md
 ```
 
 add a task source with a custom prompt template:
 
 ```bash
-hap task-source add --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
+hap config task-source add --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
 ```
 
 add a task source that also hands out tasks on the idle poll (see below —
 this makes hap send without a herdr attention event, so it is opt-in):
 
 ```bash
-hap task-source add --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.md
+hap config task-source add --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.md
 ```
 
 add a task source with a task cap other than the default 20 (see `max_tasks`
 below):
 
 ```bash
-hap task-source add --agent backend-dev --max-tasks 40 ./docs/backend-tasks.md
+hap config task-source add --agent backend-dev --max-tasks 40 ./docs/backend-tasks.md
 ```
 
 remove a task source by index:
 
 ```bash
-hap task-source remove <index>
+hap config task-source remove <index>
 ```
 
 this removes the `[[task_sources]]` entry only — the checklist file is left on
@@ -610,15 +669,15 @@ hap config set task_source_provider.provider github_gist
 hap config set task_source_provider.github_gist.gist_id 3f2a1b9c4d5e6f708192a3b4c5d6e7f8
 hap config set task_source_provider.env_file ~/.config/hap/task_source.env
 
-hap task-source set 0 provider local_fs     # this ONE source stays on disk
-hap task-source set 0 provider inherit      # …and back to following the default
-hap task-source set 1 gist-id aa11bb22      # this ONE source uses another gist
+hap config task-source set 0 provider local_fs     # this ONE source stays on disk
+hap config task-source set 0 provider inherit      # …and back to following the default
+hap config task-source set 1 gist-id aa11bb22      # this ONE source uses another gist
 ```
 
 show what is in force (never prints the token):
 
 ```bash
-hap task-source provider
+hap config task-source provider
 ```
 
 a source that sets no `provider` keeps INHERITING the default, so changing the
@@ -627,7 +686,7 @@ default moves it. hap never writes the inherited value into the entry.
 under `github_gist`, a source's `path` is a file name INSIDE the gist, not a
 filesystem path. set it and every agent the source matches shares one list;
 leave it out and each matched agent gets its own `<agent-name>.md`, created on
-first hand-out. `hap task-source add --provider github_gist --agent brave-otter`
+first hand-out. `hap config task-source add --provider github_gist --agent brave-otter`
 (no path) creates that form.
 
 hap never creates the gist — make a secret gist on github.com and paste its hex
@@ -655,7 +714,7 @@ enable_auto_send_task_when_idle = true
 it can be turned on when the source is added, without editing config.toml:
 
 ```bash
-hap task-source add --agent backend-dev --auto-send-when-idle ./docs/tasks.md
+hap config task-source add --agent backend-dev --auto-send-when-idle ./docs/tasks.md
 ```
 
 the TUI's *Config* tab `t` prompt takes the same words:
@@ -664,19 +723,19 @@ it is opt-in everywhere and never inferred. an EXISTING source is switched on wi
 config.toml:
 
 ```bash
-hap task-source set <index> auto-send-when-idle true   # or false
-hap task-source set <index> enable-llm-review-before-auto-send true  # composes with the above
-hap task-source set <index> max-tasks 40               # the refill/creation cap
+hap config task-source set <index> auto-send-when-idle true   # or false
+hap config task-source set <index> enable-llm-review-before-auto-send true  # composes with the above
+hap config task-source set <index> max-tasks 40               # the refill/creation cap
 ```
 
 the *Config* tab's `enter` on a task-source row is the same edit: it opens a
 picker of the three settings, then asks for the value (the three compose, so no
 row is ever blocked by another). all are also settable at creation time —
-`hap task-source add [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`,
+`hap config task-source add [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`,
 and the *Config* tab's `t` prompt takes the same words:
 `<path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`
 (either `--max-tasks 40` or `--max-tasks=40`). wherever sources are listed
-(`hap task-source list`, the *Config* tab) an enabled source shows
+(`hap config task-source list`, the *Config* tab) an enabled source shows
 `auto_send_when_idle=true`, and every source shows its
 `enable_llm_review_before_auto_send` and `max_tasks`.
 
@@ -729,7 +788,7 @@ and the *Config* tab's `t` prompt takes the same words:
 ### manage the task items (CRUD)
 
 `hap task` edits the checklist items *inside* a source's file (whereas
-`hap task-source` manages which file an agent points at). Address a list either
+`hap config task-source` manages which file an agent points at). Address a list either
 by the agent whose task source it is, or with `--path <file>` for any checklist
 (and for workspace-scoped sources, which aren't addressable by agent name).
 
@@ -853,13 +912,13 @@ being re-sent with every prompt.
 
 when every item is checked off, the prompt is still sent with `{next_task_content} = "none"`, so the template can steer what an idle agent does when the list is done.
 
-when an `[llm].command` is configured and a source sets `enable_llm_review_before_auto_send = true`, the llm reviews — and may revise — that task list immediately before the daemon auto-sends a task from it. via `get_context` it sees the live pane, the queued task (`proposed_task`/`current_task`), the checklist path (`task_list_path`), and `tasks`: every item with the `ref` used to address it (a declared id like `3.4`, else a position like `#3`), its position and its status. it answers in ONE `submit_decision` call — `task_actions`, an ordered series of edits applied in sequence (`done` / `delete` / `edit` / `move` / `add`, each addressing a task by `ref`, with `add` taking an `as` handle), plus `send_task`, the REFERENCE of the task to deliver once they are applied. `send_task` is never task text: the daemon renders the prompt from the list itself, so nothing can be paraphrased in transit. to send the task at hand unchanged, just name it and submit no actions. everything applies atomically under the file lock, or not at all. **it never escalates** — an unusable review, one scoring below `auto_act_confidence_threshold`, or a reviewed task tripping never-auto / suspected-irreversible all send the ORIGINAL task unchanged and leave the checklist byte-identical. `send_task "@noop"` is legal only when no pending task remains afterwards. every outcome is audited under the `llm-task-review` trigger with a distinct reason, and mutations carry before/after text — so `hap audit` answers "why is task 4 gone?". only sends the DAEMON initiates are reviewed; `hap task <agent> send` and the TUI's send never are. OFF by default; opt a source in by hand in `config.toml`, with `hap task-source set <index> enable-llm-review-before-auto-send true`, or from the TUI's config tab (`enter` on a task-source row). it composes with `enable_auto_send_task_when_idle` (see "auto-send tasks to idle agents"). the former `enable_llm_review` key still loads and migrates on the next save, but the CLI refuses that spelling; `llm_review` is no longer recognized.
+when an `[llm].command` is configured and a source sets `enable_llm_review_before_auto_send = true`, the llm reviews — and may revise — that task list immediately before the daemon auto-sends a task from it. via `get_context` it sees the live pane, the queued task (`proposed_task`/`current_task`), the checklist path (`task_list_path`), and `tasks`: every item with the `ref` used to address it (a declared id like `3.4`, else a position like `#3`), its position and its status. it answers in ONE `submit_decision` call — `task_actions`, an ordered series of edits applied in sequence (`done` / `delete` / `edit` / `move` / `add`, each addressing a task by `ref`, with `add` taking an `as` handle), plus `send_task`, the REFERENCE of the task to deliver once they are applied. `send_task` is never task text: the daemon renders the prompt from the list itself, so nothing can be paraphrased in transit. to send the task at hand unchanged, just name it and submit no actions. everything applies atomically under the file lock, or not at all. **it never escalates** — an unusable review, one scoring below `auto_act_confidence_threshold`, or a reviewed task tripping never-auto / suspected-irreversible all send the ORIGINAL task unchanged and leave the checklist byte-identical. `send_task "@noop"` is legal only when no pending task remains afterwards. every outcome is audited under the `llm-task-review` trigger with a distinct reason, and mutations carry before/after text — so `hap audit` answers "why is task 4 gone?". only sends the DAEMON initiates are reviewed; `hap task <agent> send` and the TUI's send never are. OFF by default; opt a source in by hand in `config.toml`, with `hap config task-source set <index> enable-llm-review-before-auto-send true`, or from the TUI's config tab (`enter` on a task-source row). it composes with `enable_auto_send_task_when_idle` (see "auto-send tasks to idle agents"). the former `enable_llm_review` key still loads and migrates on the next save, but the CLI refuses that spelling; `llm_review` is no longer recognized.
 
 without a declared task source, the plugin falls back to inferring the next task from the agent's own native todo rendering (currently only `claude` agent type is supported for inference). other agent types skip inference and escalate.
 
 if inference finds nothing (no task source and nothing inferable from the pane) and `llm.task_generate_command` is configured, the plugin runs that CLI once to synthesize a next task for the idle agent (placeholders: `{self}`, `{agent_name}`, `{agent_type}`, `{pane_excerpt}`, `{cwd}`). the CLI's stdout is surfaced as an escalation the operator confirms (writing a per-agent `tasks.md`) or dismisses — the plugin never sends a synthesized task unattended. leave `task_generate_command` unset to keep the default: an idle agent with no task source escalates as `no_task_source` and nothing is synthesized. `task_generate_command_start` is the first-interaction variant (empty inherits `task_generate_command`); `task_generate_timeout_seconds` bounds one run (0 inherits `llm.timeout_seconds`).
 
-**`max_tasks` (per `[[task_sources]]`, default 20)** caps how large a source's checklist may grow. once the file holds MORE than `max_tasks` items — done, in-progress, and pending counted alike — and its pending items are exhausted, the daemon logs a warning (`maximum number of tasks reached … skipping task generation`, with the agent name) and skips LLM generation for that agent instead of appending to an already-long list. the **same cap gates manual creation**: adding tasks (the Tasks-tab `a`, or `hap task … add`) to a registered source is rejected once it would push the list past `max_tasks` (`maximum number of tasks reached …`), so a hand-added list can't grow past what the daemon would then refuse to refill. prune the checklist (or raise `max_tasks` — `hap task-source set <index> max-tasks <n>`, `hap task-source add --max-tasks <n>` at creation time, or the *Config* tab's `enter` on the source row) to resume. a source added by hap writes its cap explicitly (`max_tasks = 20`), and a config loaded with the key unset is saved back with the effective default rather than a bare `0`. sending the pending items of an under-cap source is unaffected; the no-task-source bootstrap case (no `[[task_sources]]` entry) and an ad-hoc `--path` file that is not a registered source are never capped.
+**`max_tasks` (per `[[task_sources]]`, default 20)** caps how large a source's checklist may grow. once the file holds MORE than `max_tasks` items — done, in-progress, and pending counted alike — and its pending items are exhausted, the daemon logs a warning (`maximum number of tasks reached … skipping task generation`, with the agent name) and skips LLM generation for that agent instead of appending to an already-long list. the **same cap gates manual creation**: adding tasks (the Tasks-tab `a`, or `hap task … add`) to a registered source is rejected once it would push the list past `max_tasks` (`maximum number of tasks reached …`), so a hand-added list can't grow past what the daemon would then refuse to refill. prune the checklist (or raise `max_tasks` — `hap config task-source set <index> max-tasks <n>`, `hap config task-source add --max-tasks <n>` at creation time, or the *Config* tab's `enter` on the source row) to resume. a source added by hap writes its cap explicitly (`max_tasks = 20`), and a config loaded with the key unset is saved back with the effective default rather than a bare `0`. sending the pending items of an under-cap source is unaffected; the no-task-source bootstrap case (no `[[task_sources]]` entry) and an ad-hoc `--path` file that is not a registered source are never capped.
 
 ## reset data
 
@@ -1044,8 +1103,8 @@ hap rename brave-otter frontend-dev
 hap rename cool-fox backend-dev
 
 # point agents at task lists with custom templates
-hap task-source add --agent frontend-dev ./docs/frontend-tasks.md
-hap task-source add --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
+hap config task-source add --agent frontend-dev ./docs/frontend-tasks.md
+hap config task-source add --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
 
 # lower the graduation bar during initial training
 hap config set learning.graduation_n 1
@@ -1127,7 +1186,7 @@ hap signatures reembed
 
 ## notes
 
-- `hap status`, `hap agents`, `hap escalations`, `hap audit`, `hap signatures list`, `hap signatures show`, `hap config show`, `hap config fields`, `hap config path`, `hap rules list`, `hap task-source list`, `hap task <agent> list`, `hap task <agent> get`, `hap kill-history`, `hap state-dir`, `hap paths`, and `hap version` are read-only and safe to run anytime.
+- `hap status`, `hap agents`, `hap escalations`, `hap audit`, `hap signatures list`, `hap signatures show`, `hap config show`, `hap config fields`, `hap config path`, `hap config env list` (names only, never values), `hap config rules list`, `hap config task-source list`, `hap config classifier list`, `hap config capture-delay list`, `hap task <agent> list`, `hap task <agent> get`, `hap kill-history`, `hap state-dir`, `hap paths`, and `hap version` are read-only and safe to run anytime.
 - `hap confirm` and `hap resolve` with `--send` will deliver text to an agent pane — be mindful of what you send.
 - `hap dismiss` drops escalations without responding — safe, nothing is sent or learned, audit rows kept as `dismissed`.
 - `hap escalations prune [minutes]` bulk-dismisses old escalations (default 360 minutes).
@@ -1142,4 +1201,4 @@ hap signatures reembed
 - the MCP server (`hap mcp`) supports `HAP_DB_PATH` and `HAP_CONTROL_PATH` env vars for agent CLIs that sanitize the environment.
 - `--workspace` in task-source supports name wildcards (e.g. `"codex-*"`, `"*-vscode3"`).
 - `resolve --action @noop` (also: `noop`, `no_op`, `no-op`) means no reply was needed — nothing is ever sent to the pane.
-- `hap tui` launches the interactive terminal UI (status, escalations, signatures, config) as an alternative to the read-only CLI commands. the escalation detail view offers per-item actions — confirm, resolve, dismiss, and **retry LLM** (re-invoke the local LLM on a consult that timed out or failed). retry is TUI-only; there is no CLI verb for it.
+- `hap tui` launches the interactive terminal UI (status, escalations, signatures, config) as an alternative to the read-only CLI commands. the escalation detail view offers per-item actions — confirm, resolve, dismiss, and **retry LLM** (re-invoke the local LLM on a consult that timed out or failed, also available as `hap escalations retry <id>`). the TUI is a convenience, not a capability: every configuration key and every action it offers is reachable from the CLI alone.

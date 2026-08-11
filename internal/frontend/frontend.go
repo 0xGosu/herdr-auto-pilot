@@ -1686,7 +1686,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.max_instances", TUIEditable: true},
 	{Key: "cli.ai_agent_friendly_output", TUIEditable: true},
 	// Where task lists are stored, by DEFAULT — each [[task_sources]] entry may
-	// override it (`hap task-source set <index> provider …`), and one that does
+	// override it (`hap config task-source set <index> provider …`), and one that does
 	// not keeps FOLLOWING this value, so changing it here really moves every
 	// inheriting source. The per-source keys are deliberately NOT registered:
 	// they are per-index settings like max_tasks, and tomlScalarKeys skips the
@@ -2453,7 +2453,7 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 			// make them ORDER-DEPENDENT to set, which is the trap already
 			// documented for embedding.bm25_highbar_score. What is still
 			// missing is reported at use time and printed by
-			// `hap task-source provider`.
+			// `hap config task-source provider`.
 			id := strings.TrimSpace(value)
 			if id == "" {
 				cfg.TaskSourceProvider.GitHubGist.GistID = ""
@@ -2933,7 +2933,7 @@ func resolveTaskSourceFor(cfg config.Config, agent string) (config.TaskSource, e
 		if workspaceOnly {
 			return config.TaskSource{}, fmt.Errorf("no task source is scoped to agent %q; workspace-scoped sources exist but aren't addressable by name — use --path <file>", agent)
 		}
-		return config.TaskSource{}, fmt.Errorf("no task source for agent %q; add one first: hap task-source add --agent %s <checklist.md>", agent, agent)
+		return config.TaskSource{}, fmt.Errorf("no task source for agent %q; add one first: hap config task-source add --agent %s <checklist.md>", agent, agent)
 	default:
 		paths := make([]string, len(matches))
 		for i, m := range matches {

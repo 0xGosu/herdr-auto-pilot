@@ -973,7 +973,7 @@ func TestEscalationsHintsDisableSeedForBuiltinRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "hap rules disable-seed "+wantID) {
+	if !strings.Contains(out, "hap config rules disable-seed "+wantID) {
 		t.Errorf("a builtin-rule escalation should hint disable-seed %s, got:\n%s", wantID, out)
 	}
 }
@@ -1024,7 +1024,7 @@ func TestEscalationsDisableSeedHintTracksNewestRow(t *testing.T) {
 		Trigger: "purge?", SituationType: domain.SituationApproval, Action: "escalated",
 		Rationale: rationale, Status: "escalated", CreatedAt: time.Now().Add(time.Minute)})
 	out, _ = run(t, app, "escalations")
-	if !strings.Contains(out, "hap rules disable-seed "+wantID) {
+	if !strings.Contains(out, "hap config rules disable-seed "+wantID) {
 		t.Errorf("a seed-caused newest row should surface the hint, got:\n%s", out)
 	}
 }

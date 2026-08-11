@@ -938,7 +938,7 @@ func (s TaskSource) ReviewBeforeAutoSendEnabled() bool {
 // ORDER-DEPENDENT to set — no adding a gist source before setting the default
 // id, no setting a source's provider before its own id — which is the same trap
 // documented for embedding.bm25_highbar_score. Because every write goes
-// Load → mutate → Save, it would also break `hap task-source add` for an
+// Load → mutate → Save, it would also break `hap config task-source add` for an
 // operator midway through configuring. That check is
 // ValidateResolvedProvider's, at use time.
 // (TestValidateTaskSourceAcceptsAMissingGistID pins the omission.)
@@ -1026,7 +1026,7 @@ func ValidateStoreFileName(name string) error {
 // instead of a config the operator cannot open a CLI to repair.
 //
 // index is the source's position in cfg.TaskSources, so the message can name
-// the `hap task-source set <index> …` that fixes it; pass -1 when unknown.
+// the `hap config task-source set <index> …` that fixes it; pass -1 when unknown.
 func ValidateResolvedProvider(cfg Config, index int, src TaskSource) error {
 	p := cfg.ResolveProvider(src)
 	if !slices.Contains(ValidTaskSourceProviders, p.Name) {
@@ -1060,13 +1060,13 @@ func ValidateResolvedProvider(cfg Config, index int, src TaskSource) error {
 	return nil
 }
 
-// taskSourceSetHint renders the ", or this source's own with 'hap task-source
+// taskSourceSetHint renders the ", or this source's own with 'hap config task-source
 // set N …'" tail, omitting it when the caller could not identify the source.
 func taskSourceSetHint(index int, keyAndValue string) string {
 	if index < 0 {
 		return ""
 	}
-	return fmt.Sprintf(", or this source's own with 'hap task-source set %d %s'", index, keyAndValue)
+	return fmt.Sprintf(", or this source's own with 'hap config task-source set %d %s'", index, keyAndValue)
 }
 
 // ClassifierRule is one manifest rule classifying pane content (FR-002).
@@ -1949,12 +1949,19 @@ const (
 
 // CaptureDelay returns how long to wait before reading the pane after a
 // herdr event — start is the agent's first event since it appeared. The
-// first [[capture_delay]] rule matching the agent type (exact, "*", or
-// empty) wins; a matched field <= 0 and the no-rule case fall back to the
-// built-in defaults.
+// first [[capture_delay]] rule matching the agent type (case-insensitively,
+// or "*"/empty for any) wins; a matched field <= 0 and the no-rule case fall
+// back to the built-in defaults.
+//
+// The match is EqualFold, like every other agent-type comparison in the
+// codebase (classify.New, domain.ruleAppliesTo, AgentModesFor). It used to be
+// exact, which made this the one surface where an operator's capitalization
+// silently mattered: `agent_type = "Claude"` wrote a rule the daemon never
+// read while every listing showed it in force.
 func (c Config) CaptureDelay(agentType string, start bool) time.Duration {
 	for _, r := range c.CaptureDelays {
-		if r.AgentType != agentType && r.AgentType != "*" && r.AgentType != "" {
+		stored := strings.TrimSpace(r.AgentType)
+		if stored != "*" && stored != "" && !strings.EqualFold(stored, strings.TrimSpace(agentType)) {
 			continue
 		}
 		ms := r.EventMs
