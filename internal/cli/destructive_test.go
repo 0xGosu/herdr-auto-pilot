@@ -202,9 +202,10 @@ func TestTaskSourceRemoveTargetsTheListedEntry(t *testing.T) {
 	}
 }
 
-// TestTaskSourceRemoveRejectsBadIndex pins that every unusable index is
-// refused without touching config: indices come from a listing the operator
-// may be reading from a stale terminal.
+// TestTaskSourceRemoveRejectsBadIndex pins that every unusable reference is
+// refused without touching config: an index comes from a listing the operator
+// may be reading from a stale terminal, and a non-numeric token is read as an
+// AGENT NAME, which must name exactly one source.
 func TestTaskSourceRemoveRejectsBadIndex(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
@@ -216,8 +217,10 @@ func TestTaskSourceRemoveRejectsBadIndex(t *testing.T) {
 	for _, tc := range []struct{ name, index, wantErr string }{
 		{name: "past the end", index: "1", wantErr: "no task source #1"},
 		{name: "negative", index: "-2", wantErr: "no task source #-2"},
-		{name: "not a number", index: "beta", wantErr: "invalid task source index"},
-		{name: "empty", index: "", wantErr: "invalid task source index"},
+		// An agent name that matches nothing names the two ways forward: the
+		// index (which addresses any source) and adding one for that agent.
+		{name: "unknown agent", index: "beta", wantErr: `no task source is scoped to agent "beta"`},
+		{name: "empty", index: "", wantErr: "index or agent name is required"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := run(t, app, "task-source", "remove", tc.index)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,6 +26,277 @@ func loadCfg(t *testing.T, path string) config.Config {
 		t.Fatalf("load config: %v", err)
 	}
 	return cfg
+}
+
+// taskSourceSetKeys maps every field of a [[task_sources]] entry to the
+// `hap config task-source set` key that edits it after creation.
+//
+// `add` has always taken every field; `set` did not, so the four that re-point
+// a source (path and the two selectors, plus the template) could only be
+// changed by removing the entry and re-adding it — retyping every other field
+// and renumbering every later source to change one. This map is what keeps a
+// new field from quietly landing in the same state.
+var taskSourceSetKeys = map[string]string{
+	"agent":                              "agent",
+	"workspace":                          "workspace",
+	"path":                               "path",
+	"next_task_template":                 "template",
+	"provider":                           "provider",
+	"gist_id":                            "gist-id",
+	"max_tasks":                          "max-tasks",
+	"enable_auto_send_task_when_idle":    "auto-send-when-idle",
+	"enable_llm_review_before_auto_send": "enable-llm-review-before-auto-send",
+}
+
+// taskSourceFieldsExemptFromSet are fields with no `set` key, each for a
+// reason. The default answer for a new field is a key, not an entry here.
+var taskSourceFieldsExemptFromSet = map[string]string{
+	"enable_llm_review": "deprecated alias for enable_llm_review_before_auto_send — Load migrates it, and the CLI refuses the spelling on purpose",
+}
+
+// TestEveryTaskSourceFieldIsEditable is the per-source twin of
+// TestEveryConfigKeyIsRegistered: a field an operator can SET when creating a
+// task source, but never change afterwards, is a hole in the CLI-only promise.
+func TestEveryTaskSourceFieldIsEditable(t *testing.T) {
+	rt := reflect.TypeOf(config.TaskSource{})
+	present := map[string]bool{}
+	for i := 0; i < rt.NumField(); i++ {
+		name, _, _ := strings.Cut(rt.Field(i).Tag.Get("toml"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		present[name] = true
+		if taskSourceSetKeys[name] != "" {
+			continue
+		}
+		if _, exempt := taskSourceFieldsExemptFromSet[name]; exempt {
+			continue
+		}
+		t.Errorf("task source field %q has no `hap config task-source set` key — it could be "+
+			"set at creation and never changed. Add a key and name it in taskSourceSetKeys, "+
+			"or add it to taskSourceFieldsExemptFromSet with a reason.", name)
+	}
+	// The map's VALUES are checked against the real dispatcher, not just its
+	// keys against the struct: an entry naming a key `set` has no case arm for
+	// — a typo, or an arm deleted later — would otherwise pass green while the
+	// field it claims to cover stayed creation-only.
+	app, _ := testApp(t)
+	ctx := context.Background()
+	if err := app.AddTaskSource(ctx, "a", "", filepath.Join(t.TempDir(), "t.md"), ""); err != nil {
+		t.Fatal(err)
+	}
+	// Values chosen only to get past parsing; what is asserted is that the key
+	// REACHES an arm, never what that arm does with it.
+	probe := map[string]string{
+		"agent": "b", "workspace": "ws", "path": "/tmp/probe.md",
+		"next_task_template": "T", "provider": "inherit", "gist_id": "inherit",
+		"max_tasks": "5", "enable_auto_send_task_when_idle": "false",
+		"enable_llm_review_before_auto_send": "false",
+	}
+	for field, key := range taskSourceSetKeys {
+		if !present[field] {
+			t.Errorf("taskSourceSetKeys names %q (key %q), which config.TaskSource no longer has — drop it", field, key)
+			continue
+		}
+		if _, err := run(t, app, "config", "task-source", "set", "0", key, probe[field]); err != nil &&
+			strings.Contains(err.Error(), "unknown task-source key") {
+			t.Errorf("field %q maps to key %q, which `set` does not accept: %v", field, key, err)
+		}
+	}
+	for field, why := range taskSourceFieldsExemptFromSet {
+		if !present[field] {
+			t.Errorf("exemption for %q (%s) names a field config.TaskSource no longer has — drop it", field, why)
+		}
+	}
+}
+
+// TestTaskSourceSelectorsAreEditableInPlace covers the four keys added for
+// that rule, including the normalization `add` applies (a relative path is
+// absolutized in the OPERATOR's process — the daemon runs from the state dir,
+// so a path stored verbatim would resolve somewhere else entirely).
+func TestTaskSourceSelectorsAreEditableInPlace(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.md")
+	if err := os.WriteFile(first, []byte("- [ ] a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "brave-otter", "", first, "Next: {next_task_content}"); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "config", "task-source", "set", "0", "agent", "swift-heron")
+	if err != nil {
+		t.Fatalf("set agent: %v", err)
+	}
+	// The old value is echoed: re-pointing a source is the kind of edit an
+	// operator wants confirmed against what they believed it was.
+	if !strings.Contains(out, "brave-otter") || !strings.Contains(out, "swift-heron") {
+		t.Errorf("set agent must report both the old and new selector, got %q", out)
+	}
+	if _, err := run(t, app, "config", "task-source", "set", "0", "workspace", "codex-*"); err != nil {
+		t.Fatalf("set workspace: %v", err)
+	}
+	if _, err := run(t, app, "config", "task-source", "set", "0", "template", "Do: {next_task_content}"); err != nil {
+		t.Fatalf("set template: %v", err)
+	}
+	if _, err := run(t, app, "config", "task-source", "set", "0", "path", filepath.Join(dir, "second.md")); err != nil {
+		t.Fatalf("set path: %v", err)
+	}
+
+	src := loadCfg(t, app.ConfigPath).TaskSources[0]
+	if src.Agent != "swift-heron" || src.Workspace != "codex-*" ||
+		src.NextTaskTemplate != "Do: {next_task_content}" ||
+		src.Path != filepath.Join(dir, "second.md") {
+		t.Errorf("task source = %+v, want every field updated in place", src)
+	}
+	// One entry still, not a second one appended.
+	if n := len(loadCfg(t, app.ConfigPath).TaskSources); n != 1 {
+		t.Errorf("got %d task sources, want the single entry edited in place", n)
+	}
+
+	// An empty template restores the default — and so does a WHITESPACE-only
+	// one, which is the case that matters: only the empty string falls back to
+	// the built-in default, so "  " stored verbatim would be rendered as the
+	// whole outbound prompt — a hand-out carrying no task text and no
+	// instructions, sent unattended on an auto-send source.
+	for _, blank := range []string{"", "   "} {
+		if _, err := run(t, app, "config", "task-source", "set", "0", "template", "Do: X"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := run(t, app, "config", "task-source", "set", "0", "template", blank); err != nil {
+			t.Fatalf("clearing the template with %q: %v", blank, err)
+		}
+		if got := loadCfg(t, app.ConfigPath).TaskSources[0].NextTaskTemplate; got != "" {
+			t.Errorf("NextTaskTemplate = %q after setting %q, want it cleared to the default", got, blank)
+		}
+	}
+
+	// An empty path is left to config.ValidateTaskSource: under the LOCAL
+	// provider this source runs, it is refused, and the refusal names the
+	// provider rather than asserting a rule that does not hold everywhere (an
+	// empty path is legal under a remote provider — "one list per agent").
+	_, err = run(t, app, "config", "task-source", "set", "0", "path", "  ")
+	if err == nil {
+		t.Fatal("an empty path must be refused under a local provider")
+	}
+	if !strings.Contains(err.Error(), "provider=") {
+		t.Errorf("the refusal must name the provider it applies to, got: %v", err)
+	}
+}
+
+// TestTaskSourceAddressableByAgentName covers the answer to "which index do I
+// use?": for the common case, none — a source is addressable by the agent it
+// feeds. The index is POSITIONAL, so removing a source renumbers every one
+// after it and a remembered number silently means a different entry; a name
+// does not move.
+func TestTaskSourceAddressableByAgentName(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	for _, agent := range []string{"brave-otter", "swift-heron"} {
+		if err := app.AddTaskSource(ctx, agent, "", filepath.Join(dir, agent+".md"), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Addressed by name, the SECOND source is edited — not the first, which is
+	// what a positional reading of the same token would have hit.
+	if _, err := run(t, app, "config", "task-source", "set", "swift-heron", "max-tasks", "42"); err != nil {
+		t.Fatalf("set by agent name: %v", err)
+	}
+	srcs := loadCfg(t, app.ConfigPath).TaskSources
+	if srcs[1].MaxTasks != 42 || srcs[0].MaxTasks == 42 {
+		t.Errorf("sources = %+v, want only the swift-heron source changed", srcs)
+	}
+	// The index form still works, and `#0` — the spelling the listing prints —
+	// is accepted verbatim so a row can be copied without editing it.
+	if _, err := run(t, app, "config", "task-source", "set", "#0", "max-tasks", "7"); err != nil {
+		t.Fatalf("set by #index: %v", err)
+	}
+	if got := loadCfg(t, app.ConfigPath).TaskSources[0].MaxTasks; got != 7 {
+		t.Errorf("MaxTasks = %d, want 7", got)
+	}
+	// Removal takes a name too, and removes the right one.
+	if _, err := run(t, app, "config", "task-source", "remove", "brave-otter"); err != nil {
+		t.Fatalf("remove by agent name: %v", err)
+	}
+	srcs = loadCfg(t, app.ConfigPath).TaskSources
+	if len(srcs) != 1 || srcs[0].Agent != "swift-heron" {
+		t.Errorf("sources = %+v, want only the swift-heron source left", srcs)
+	}
+}
+
+// TestTaskSourceAgentRefRefusesAmbiguity pins the bound on name addressing:
+// two sources feeding one agent is legal, and a name that could mean either
+// must be refused rather than resolved to whichever comes first.
+func TestTaskSourceAgentRefRefusesAmbiguity(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	for _, f := range []string{"a.md", "b.md"} {
+		if err := app.AddTaskSource(ctx, "brave-otter", "", filepath.Join(dir, f), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := run(t, app, "config", "task-source", "set", "brave-otter", "max-tasks", "9")
+	if err == nil {
+		t.Fatal("an agent matching two sources must be refused, not resolved to the first")
+	}
+	// The refusal names the indexes that disambiguate it — the one thing the
+	// operator needs and cannot guess.
+	if !strings.Contains(err.Error(), "#0") || !strings.Contains(err.Error(), "#1") {
+		t.Errorf("the refusal must name the matching indexes, got: %v", err)
+	}
+	for _, src := range loadCfg(t, app.ConfigPath).TaskSources {
+		if src.MaxTasks == 9 {
+			t.Errorf("a refused edit changed a source anyway: %+v", src)
+		}
+	}
+}
+
+// TestTaskSourceSetEmptySelectorWidensAndSaysSo covers the widest re-point
+// available: clearing a selector makes the source match ANY agent (or
+// workspace). It is legal — `add` accepts it — but silent widening of which
+// agents a list feeds is exactly the kind of thing an operator should be told
+// about rather than discover from a later listing.
+func TestTaskSourceSetEmptySelectorWidensAndSaysSo(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	if err := app.AddTaskSource(ctx, "brave-otter", "ws", filepath.Join(t.TempDir(), "t.md"), ""); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, app, "config", "task-source", "set", "0", "agent", "")
+	if err != nil {
+		t.Fatalf("clearing the agent selector: %v", err)
+	}
+	if !strings.Contains(out, "ANY agent") {
+		t.Errorf("clearing the agent selector must say it now matches any agent, got %q", out)
+	}
+	src := loadCfg(t, app.ConfigPath).TaskSources[0]
+	if src.Agent != "" || !src.MatchesAgent("pane-9", "claude", "some-other-agent") {
+		t.Errorf("task source = %+v, want an empty selector matching any agent", src)
+	}
+}
+
+// TestTaskSourceSetPathIsAbsolutized pins the normalization that makes the
+// edit equivalent to a re-add: the daemon reads task files from the state dir,
+// so a relative path must be resolved against the OPERATOR's cwd here or it
+// silently names a different file.
+func TestTaskSourceSetPathIsAbsolutized(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	if err := app.AddTaskSource(ctx, "a", "", filepath.Join(t.TempDir(), "x.md"), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, app, "config", "task-source", "set", "0", "path", "relative.md"); err != nil {
+		t.Fatalf("set path: %v", err)
+	}
+	got := loadCfg(t, app.ConfigPath).TaskSources[0].Path
+	if !filepath.IsAbs(got) || filepath.Base(got) != "relative.md" {
+		t.Errorf("Path = %q, want an absolute path ending in relative.md", got)
+	}
 }
 
 func TestClassifierRulesAreEditableFromTheCLI(t *testing.T) {

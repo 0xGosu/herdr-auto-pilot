@@ -824,8 +824,8 @@ func buildCommands() {
 				"hap config task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>]",
 				"hap config task-source list",
 				"hap config task-source provider",
-				"hap config task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value>",
-				"hap config task-source remove <index>",
+				"hap config task-source set <index|agent> <path|agent|workspace|template|auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value>",
+				"hap config task-source remove <index|agent>",
 			},
 			Flags: []FlagDoc{
 				{Name: "--agent", Arg: "A", Desc: "agent short name, id, or type this source applies to"},
@@ -852,12 +852,26 @@ func buildCommands() {
 				"               agent gets its own \"<agent-name>.md\", created on first hand-out.\n" +
 				"`hap task <agent> …` works the same either way. `--path` on `hap task` always\n" +
 				"reads a LOCAL file, so address a remote list by the agent's name.\n" +
-				"`set` edits an existing source: the two delivery gates, max-tasks, and where\n" +
-				"the list is stored (provider, gist-id — either takes \"inherit\" to go back to\n" +
-				"following the default). Changing the path/agent/workspace is remove-and-re-add,\n" +
-				"since it silently re-points an agent's work. Changing the PROVIDER does not\n" +
-				"migrate the list: hap reads the new store from then on and leaves the old copy\n" +
-				"where it is.\n" +
+				"`set` and `remove` take either the INDEX `list` prints (`0`, or the copy-pasteable\n" +
+				"`#0`) or the AGENT NAME the source feeds — a name does not move when an earlier\n" +
+				"source is removed and every later index shifts. A name matching no source, or\n" +
+				"more than one, is refused with the indexes that disambiguate it; a\n" +
+				"workspace-scoped source has no agent to be addressed by, so it takes an index.\n" +
+				"`set` edits an existing source in place, and every field is editable:\n" +
+				"  path | agent | workspace                     re-point it\n" +
+				"  template                                     the outbound prompt (\"\" = default)\n" +
+				"  auto-send-when-idle | enable-llm-review-before-auto-send | max-tasks\n" +
+				"  provider | gist-id                           where the list is stored\n" +
+				"(provider and gist-id each take \"inherit\" to go back to following the default.)\n" +
+				"The three that re-point the source print what they changed FROM and warn: the\n" +
+				"next hand-out then comes from a different list, or goes to a different agent.\n" +
+				"Nothing is copied or removed either way. An empty agent or workspace matches\n" +
+				"ANY of them — the widest re-point there is, so it is called out when you do it.\n" +
+				"A relative path is resolved against YOUR shell's directory (the daemon runs\n" +
+				"from the state dir); an empty path is refused under a local provider and means\n" +
+				"\"one list per agent\" under a remote one. Changing the PROVIDER likewise does\n" +
+				"not migrate the list: hap reads the new store from then on and leaves the old\n" +
+				"copy where it is.\n" +
 				"enable-llm-review-before-auto-send composes with auto-send-when-idle: the\n" +
 				"hand-out decides THAT a task goes, the review decides which task and in what\n" +
 				"shape. Immediately before the daemon sends, the LLM may mark, drop, rewrite,\n" +
@@ -875,12 +889,23 @@ func buildCommands() {
 				"hap config task-source list",
 				"hap config task-source set 0 auto-send-when-idle true",
 				"hap config task-source set 0 enable-llm-review-before-auto-send true",
+				"hap config task-source set brave-otter agent swift-heron",
+				"hap config task-source set brave-otter path ./docs/other-tasks.md",
+				"hap config task-source set 0 template 'Do this next: {next_task_content}'",
 			},
+			// Next is still carried even though SelfHints suppresses the RUNTIME
+			// footer: PrintHelp renders it for the `--help` page, which would
+			// otherwise fall back to the generic "hap help" pointer.
 			Next: []Hint{
-				{Cmd: "hap config task-source list", Why: "confirm the source and its index"},
-				{Cmd: "hap task <agent> list", Why: "see the items the agent will get"},
+				{Cmd: "hap config task-source list", Why: "every source, with the index or agent name `set` and `remove` take"},
+				{Cmd: "hap task <agent> list", Why: "the items that source will hand out"},
 			},
-			Handler: taskSource,
+			// Every branch builds its own runtime footer: the listing publishes
+			// a REAL reference (the only place one appears), and the empty
+			// state points at `add` rather than at the listing it just came
+			// from.
+			SelfHints: true,
+			Handler:   taskSource,
 		},
 
 		// ------------------------------------------------------------------ Tasks

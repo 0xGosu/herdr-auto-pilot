@@ -1705,6 +1705,13 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		}
 		if len(cfg.TaskSources) == 0 {
 			fmt.Fprintln(out, "no task sources configured")
+			// The empty state is where an operator is most stuck, so it points
+			// at the command that ends it rather than at the listing they just
+			// ran and found empty.
+			PrintNextSteps(out, []Hint{
+				{Cmd: "hap agents", Why: "the agent names `--agent` takes"},
+				{Cmd: "hap config task-source add --agent <name> ./docs/tasks.md", Why: "point an agent at a checklist"},
+			})
 			return nil
 		}
 		// The header and the provider token appear ONLY when something selects
@@ -1761,6 +1768,32 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 			fmt.Fprintf(out, " max_tasks=%d", src.MaxTasksLimit())
 			fmt.Fprintln(out)
 		}
+		// The footer carries a REAL index — 0, which every listing has — and a
+		// real agent name where there is one, so the follow-up can be copied
+		// verbatim instead of translating a placeholder. This listing is the
+		// ONLY place the index `set` and `remove` take is published, so telling
+		// the operator to run `list` again (the previous static footer) left
+		// them exactly where they started.
+		// The follow-ups name a REAL source, addressed the way the operator
+		// most likely wants to: by the agent it feeds, falling back to the
+		// index for a source with no agent selector (workspace-scoped, or
+		// "any agent"), which has no name to be addressed by.
+		// The name is used only when it resolves UNIQUELY. Two sources feeding
+		// one agent is legal, and a footer naming that agent would print a
+		// command resolveTaskSourceRef refuses — failing on the very screen
+		// meant to resolve the ambiguity.
+		ref, agent := "0", cfg.TaskSources[0].Agent
+		if _, err := resolveTaskSourceRef(cfg, agent); err == nil {
+			ref = agent
+		}
+		if strings.TrimSpace(agent) == "" {
+			agent = "<agent>"
+		}
+		PrintNextSteps(out, []Hint{
+			{Cmd: "hap config task-source set " + ref + " <key> <value>", Why: "edit that source — `hap help config task-source` lists the keys"},
+			{Cmd: "hap config task-source remove " + ref, Why: "drop it (the checklist file itself is kept)"},
+			{Cmd: "hap task " + agent + " list", Why: "the items that source will hand out"},
+		})
 		return nil
 	}
 	if len(args) > 0 && args[0] == "set" {
@@ -1774,24 +1807,24 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	}
 	if len(args) > 0 && args[0] == "remove" {
 		if len(args) != 2 {
-			return fmt.Errorf("usage: hap config task-source remove <index> (see: hap config task-source list)")
-		}
-		idx, err := strconv.Atoi(strings.TrimPrefix(args[1], "#"))
-		if err != nil {
-			return fmt.Errorf("invalid task source index %q", args[1])
+			return fmt.Errorf("usage: hap config task-source remove <index|agent> (see: hap config task-source list)")
 		}
 		cfg, err := app.Config()
 		if err != nil {
 			return err
 		}
-		if idx < 0 || idx >= len(cfg.TaskSources) {
-			return fmt.Errorf("no task source #%d (see: hap config task-source list)", idx)
+		idx, err := resolveTaskSourceRef(cfg, args[1])
+		if err != nil {
+			return err
 		}
 		expected := cfg.TaskSources[idx]
 		if err := app.RemoveTaskSource(ctx, idx, expected); err != nil {
 			return err
 		}
 		fmt.Fprintf(out, "task source #%d removed: %s\n", idx, expected.Path)
+		// Removing RENUMBERS every later source, so the listing is the only
+		// safe next step before another index-keyed edit.
+		PrintNextSteps(out, taskSourceEditedHints())
 		return nil
 	}
 	if len(args) > 0 && args[0] == "add" {
@@ -1819,7 +1852,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 				return fmt.Errorf("flags must come before <checklist.md>: %s was read as an argument, not a flag", extra)
 			}
 		}
-		return fmt.Errorf("usage: hap config task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>] | list | set <index> <key> <value> | remove <index> (see: hap help config task-source)")
+		return fmt.Errorf("usage: hap config task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>] | list | set <index|agent> <key> <value> | remove <index|agent> (see: hap help config task-source)")
 	}
 	if *provider != "" && !slices.Contains(config.ValidTaskSourceProviders, *provider) {
 		return fmt.Errorf("--provider must be one of %s, got %q",
@@ -1871,7 +1904,75 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	if *llmReview {
 		fmt.Fprintln(out, llmReviewOnMessage)
 	}
+	PrintNextSteps(out, taskSourceEditedHints())
 	return nil
+}
+
+// resolveTaskSourceRef turns the token an operator typed into a task-source
+// INDEX. It accepts the index itself ("0" or the copy-pasteable "#0") or an
+// AGENT NAME, which is how an operator actually thinks about a source: "the
+// task list for brave-otter", not "source #2".
+//
+// The index alone was a poor address. It is POSITIONAL, so removing a source
+// renumbers every one after it and a remembered number silently means a
+// different entry; and it says nothing about what it points at, so every edit
+// began with a listing and a careful eye. Both remain true of the index — this
+// gives the common case a name that does not move.
+//
+// The two forms cannot collide: a herdr agent name must start with a lowercase
+// LETTER (`invalid_agent_name`), so a purely numeric token is never one. An
+// agent must match exactly one source; zero or several is refused with the
+// index form named, since that is what disambiguates two sources feeding one
+// agent — and a workspace-scoped source has no agent to be addressed by at all.
+func resolveTaskSourceRef(cfg config.Config, ref string) (int, error) {
+	token := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ref), "#"))
+	if token == "" {
+		return 0, fmt.Errorf("a task source index or agent name is required (see: hap config task-source list)")
+	}
+	if idx, err := strconv.Atoi(token); err == nil {
+		if idx < 0 || idx >= len(cfg.TaskSources) {
+			return 0, fmt.Errorf("no task source #%d (see: hap config task-source list)", idx)
+		}
+		return idx, nil
+	}
+	var matches []int
+	for i, src := range cfg.TaskSources {
+		if src.Agent != "" && src.Agent == token {
+			matches = append(matches, i)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		// A source may be scoped by the agent's ID or TYPE rather than its short
+		// name, in which case it exists but is not addressable this way — so
+		// the listing leads, and "add one" comes second. Leading with `add`
+		// steers toward creating a SECOND source for an agent that already has
+		// one, which is the state this resolver then refuses to address.
+		return 0, fmt.Errorf("no task source is scoped to agent %q — it may be scoped by the "+
+			"agent's id or type instead, so check `hap config task-source list` and address it "+
+			"by index; or add one: hap config task-source add --agent %s <checklist.md>",
+			token, token)
+	default:
+		idxs := make([]string, len(matches))
+		for i, m := range matches {
+			idxs[i] = fmt.Sprintf("#%d", m)
+		}
+		return 0, fmt.Errorf("agent %q matches %d task sources (%s) — address the one you mean by index",
+			token, len(matches), strings.Join(idxs, ", "))
+	}
+}
+
+// taskSourceEditedHints are the follow-ups after a source is added, edited or
+// removed. The listing leads because it publishes the INDEX every other
+// index-keyed command takes — and because a remove renumbers every source
+// after it, so a remembered index is stale the moment one is dropped.
+func taskSourceEditedHints() []Hint {
+	return []Hint{
+		{Cmd: "hap config task-source list", Why: "every source, with the index or agent name `set` and `remove` take"},
+		{Cmd: "hap task <agent> list", Why: "the items that source will hand out"},
+	}
 }
 
 // describeAddedSource renders where a newly added source's list will live, in
@@ -1925,6 +2026,14 @@ const (
 		"yourself before the next hand-out, or the agent will be handed whatever the new store " +
 		"already holds — possibly nothing."
 
+	// retargetMessage is printed when a source's path or one of its selectors
+	// changes. Nothing moves and nothing is lost, but the NEXT hand-out comes
+	// from somewhere else — or goes to somebody else — which is worth saying
+	// out loud rather than leaving to a re-listing.
+	retargetMessage = "this re-points the source: the next hand-out is read from the new list, " +
+		"or given to whoever the new selector matches. Nothing is copied or removed — check " +
+		"`hap config task-source list` and `hap task <agent> list`."
+
 	llmReviewOnMessage = "LLM review before auto-send is ON: immediately before the daemon sends a task, " +
 		"the configured [llm].command may revise the list and pick which task goes. A review that fails " +
 		"or scores below auto_act_confidence_threshold sends the original task unchanged — it never " +
@@ -1974,7 +2083,10 @@ func taskSourceProvider(app *frontend.App, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "set default with: hap config set task_source_provider.provider <%s>\n",
 		strings.Join(config.ValidTaskSourceProviders, "|"))
-	fmt.Fprintln(out, "set per source:   hap config task-source set <index> provider <name>")
+	fmt.Fprintln(out, "set per source:   hap config task-source set <index|agent> provider <name>")
+	// The two "set …" lines above name an <index> this view never prints, so
+	// the footer points at the listing that does.
+	PrintNextSteps(out, taskSourceEditedHints())
 	return nil
 }
 
@@ -1997,27 +2109,26 @@ func describeEnvFile(path string) string {
 }
 
 // taskSourceSet edits one setting of an existing task source — the CLI twin of
-// the TUI Config tab's enter on a task-source row. Only the settings that are
-// meaningful to flip after the fact are exposed — the two delivery-gate flags
-// and the cap; path/agent/workspace are remove-and-re-add, since changing them
-// silently re-points an agent's work.
+// the TUI Config tab's enter on a task-source row.
+//
+// EVERY field is exposed, including the three that re-point the source. A field
+// settable only at creation means remove-and-re-add: retyping the rest of the
+// entry and renumbering every later source to change one. The TUI still offers
+// the shorter list; this is the surface that has to be complete.
 func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	const usage = "usage: hap config task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: hap config task-source list, hap help config task-source)"
+	const usage = "usage: hap config task-source set <index|agent> <path|agent|workspace|template|auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: hap config task-source list, hap help config task-source)"
 	if len(args) != 3 {
 		return fmt.Errorf("%s", usage)
 	}
 	// `task-source list` prints indexes as "#0", so the copied-and-pasted form
 	// must work (the `hap task` refs accept it too).
-	idx, err := strconv.Atoi(strings.TrimPrefix(args[0], "#"))
-	if err != nil {
-		return fmt.Errorf("invalid task source index %q", args[0])
-	}
 	cfg, err := app.Config()
 	if err != nil {
 		return err
 	}
-	if idx < 0 || idx >= len(cfg.TaskSources) {
-		return fmt.Errorf("no task source #%d (see: hap config task-source list)", idx)
+	idx, err := resolveTaskSourceRef(cfg, args[0])
+	if err != nil {
+		return err
 	}
 	expected := cfg.TaskSources[idx]
 	key, value := args[1], args[2]
@@ -2034,6 +2145,7 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 		if on {
 			fmt.Fprintln(out, autoSendOnMessage)
 		}
+		PrintNextSteps(out, taskSourceEditedHints())
 		return nil
 	case "enable-llm-review-before-auto-send", "enable_llm_review_before_auto_send":
 		on, err := strconv.ParseBool(value)
@@ -2047,6 +2159,7 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 		if on {
 			fmt.Fprintln(out, llmReviewOnMessage)
 		}
+		PrintNextSteps(out, taskSourceEditedHints())
 		return nil
 	case "enable-llm-review", "enable_llm_review", "llm-review", "llm_review":
 		// Both retired spellings, refused rather than aliased: config.Load
@@ -2062,6 +2175,7 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 			return err
 		}
 		fmt.Fprintf(out, "task source #%d: max_tasks=%d\n", idx, n)
+		PrintNextSteps(out, taskSourceEditedHints())
 		return nil
 	case "provider":
 		// "inherit"/"" clears the override. Without a clearing spelling an
@@ -2089,6 +2203,7 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 			fmt.Fprintf(out, "path converted to store file %q (was %s)\n", converted, expected.Path)
 		}
 		fmt.Fprintln(out, providerChangeMessage)
+		PrintNextSteps(out, taskSourceEditedHints())
 		return nil
 	case "gist-id", "gist_id":
 		id := strings.TrimSpace(value)
@@ -2103,6 +2218,65 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 		} else {
 			fmt.Fprintf(out, "task source #%d: gist_id=%s\n", idx, shortGistID(id))
 		}
+		PrintNextSteps(out, taskSourceEditedHints())
+		return nil
+	// The path, the two selectors, and the template.
+	//
+	// The first three RE-POINT the source — which list is read, or which agent
+	// is fed — so each echoes what it changed FROM and says what follows. They
+	// are not withheld for it: `remove` is unguarded by design, so refusing the
+	// smaller edit only forced the operator through remove-and-re-add, retyping
+	// every other field and renumbering every later source to change one.
+	// `template` changes the outbound prompt's FORMAT, not its target, so it
+	// carries no such warning.
+	case "path":
+		// The STORED path is echoed, not the typed one: a local path is
+		// absolutized on the way in, so printing the argument beside the
+		// previous stored value would compare a relative path against an
+		// absolute one and read like a downgrade.
+		stored, err := app.SetTaskSourcePath(ctx, idx, expected, value)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "task source #%d: path=%s (was %s)\n", idx, orDash(stored), orDash(expected.Path))
+		fmt.Fprintln(out, retargetMessage)
+		PrintNextSteps(out, taskSourceEditedHints())
+		return nil
+	case "agent":
+		// Trimmed to match what is stored, for the same reason.
+		agent := strings.TrimSpace(value)
+		if err := app.SetTaskSourceAgent(ctx, idx, expected, agent); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "task source #%d: agent=%q (was %q)\n", idx, agent, expected.Agent)
+		if agent == "" {
+			fmt.Fprintln(out, "an empty agent matches ANY agent — this source now feeds all of them")
+		}
+		fmt.Fprintln(out, retargetMessage)
+		PrintNextSteps(out, taskSourceEditedHints())
+		return nil
+	case "workspace":
+		workspace := strings.TrimSpace(value)
+		if err := app.SetTaskSourceWorkspace(ctx, idx, expected, workspace); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "task source #%d: workspace=%q (was %q)\n", idx, workspace, expected.Workspace)
+		if workspace == "" || workspace == "*" {
+			fmt.Fprintln(out, "an empty (or \"*\") workspace matches ANY workspace")
+		}
+		fmt.Fprintln(out, retargetMessage)
+		PrintNextSteps(out, taskSourceEditedHints())
+		return nil
+	case "template", "next-task-template", "next_task_template":
+		if err := app.SetTaskSourceTemplate(ctx, idx, expected, value); err != nil {
+			return err
+		}
+		if strings.TrimSpace(value) == "" {
+			fmt.Fprintf(out, "task source #%d: template cleared — the built-in default applies\n", idx)
+		} else {
+			fmt.Fprintf(out, "task source #%d: template=%q\n", idx, value)
+		}
+		PrintNextSteps(out, taskSourceEditedHints())
 		return nil
 	}
 	return fmt.Errorf("unknown task-source key %q\n%s", key, usage)
