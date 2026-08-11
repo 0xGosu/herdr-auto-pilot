@@ -893,9 +893,17 @@ func buildCommands() {
 				"hap config task-source set brave-otter path ./docs/other-tasks.md",
 				"hap config task-source set 0 template 'Do this next: {next_task_content}'",
 			},
-			// Every branch builds its own footer: the listing publishes REAL
-			// indexes (the only place they appear), and the empty state points
-			// at `add` rather than at the listing it just came from.
+			// Next is still carried even though SelfHints suppresses the RUNTIME
+			// footer: PrintHelp renders it for the `--help` page, which would
+			// otherwise fall back to the generic "hap help" pointer.
+			Next: []Hint{
+				{Cmd: "hap config task-source list", Why: "every source, with the index or agent name `set` and `remove` take"},
+				{Cmd: "hap task <agent> list", Why: "the items that source will hand out"},
+			},
+			// Every branch builds its own runtime footer: the listing publishes
+			// a REAL reference (the only place one appears), and the empty
+			// state points at `add` rather than at the listing it just came
+			// from.
 			SelfHints: true,
 			Handler:   taskSource,
 		},

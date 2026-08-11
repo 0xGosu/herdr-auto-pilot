@@ -2810,11 +2810,38 @@ func (a *App) SetTaskSourcePath(ctx context.Context, index int, expected config.
 
 // SetTaskSourceAgent re-scopes a source to a different agent selector (an
 // agent id, short name, or agent type; "" matches any agent).
+// validateAgentSelector refuses a purely NUMERIC agent selector.
+//
+// It keeps a CLI invariant true by construction rather than by assertion:
+// `hap config task-source set|remove` resolves a numeric token as an INDEX and
+// anything else as an agent name, which is unambiguous only because a herdr
+// agent name must start with a lowercase letter (`invalid_agent_name`). Nothing
+// else in hap held a STORED selector to that rule, so `--agent 3` was accepted
+// and that source was then permanently unaddressable by name while `set 3 …`
+// silently meant index 3.
+//
+// Real pane and agent ids ("1-1", "w1:p1") are unaffected — they do not parse
+// as integers — and an empty selector stays legal ("any agent").
+func validateAgentSelector(agent string) error {
+	agent = strings.TrimSpace(agent)
+	if agent == "" {
+		return nil
+	}
+	if _, err := strconv.Atoi(agent); err == nil {
+		return fmt.Errorf("agent selector %q is a bare number, which the CLI reads as a task-source "+
+			"INDEX — a herdr agent name starts with a lowercase letter", agent)
+	}
+	return nil
+}
+
 // An empty selector is legal and means "any agent" — the widest re-point there
 // is, which is why the caller says so rather than silently applying it.
 func (a *App) SetTaskSourceAgent(ctx context.Context, index int, expected config.TaskSource,
 	agent string) error {
 
+	if err := validateAgentSelector(agent); err != nil {
+		return err
+	}
 	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
 		src.Agent = strings.TrimSpace(agent)
 	})
@@ -2952,6 +2979,9 @@ func GistID(id string) TaskSourceOption {
 // ({next_task_content} / {task_list_path} / {agent_name} placeholders);
 // "" uses the default.
 func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, template string, opts ...TaskSourceOption) error {
+	if err := validateAgentSelector(agent); err != nil {
+		return err
+	}
 	src := config.TaskSource{
 		Agent: agent, Workspace: workspace, Path: path, NextTaskTemplate: template,
 		// Written explicitly rather than left at 0: a saved source names the cap

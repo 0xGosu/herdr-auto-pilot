@@ -1778,10 +1778,15 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		// most likely wants to: by the agent it feeds, falling back to the
 		// index for a source with no agent selector (workspace-scoped, or
 		// "any agent"), which has no name to be addressed by.
+		// The name is used only when it resolves UNIQUELY. Two sources feeding
+		// one agent is legal, and a footer naming that agent would print a
+		// command resolveTaskSourceRef refuses — failing on the very screen
+		// meant to resolve the ambiguity.
 		ref, agent := "0", cfg.TaskSources[0].Agent
-		if strings.TrimSpace(agent) != "" {
+		if _, err := resolveTaskSourceRef(cfg, agent); err == nil {
 			ref = agent
-		} else {
+		}
+		if strings.TrimSpace(agent) == "" {
 			agent = "<agent>"
 		}
 		PrintNextSteps(out, []Hint{
@@ -1802,7 +1807,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	}
 	if len(args) > 0 && args[0] == "remove" {
 		if len(args) != 2 {
-			return fmt.Errorf("usage: hap config task-source remove <index> (see: hap config task-source list)")
+			return fmt.Errorf("usage: hap config task-source remove <index|agent> (see: hap config task-source list)")
 		}
 		cfg, err := app.Config()
 		if err != nil {
@@ -1847,7 +1852,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 				return fmt.Errorf("flags must come before <checklist.md>: %s was read as an argument, not a flag", extra)
 			}
 		}
-		return fmt.Errorf("usage: hap config task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>] | list | set <index> <key> <value> | remove <index> (see: hap help config task-source)")
+		return fmt.Errorf("usage: hap config task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>] | list | set <index|agent> <key> <value> | remove <index|agent> (see: hap help config task-source)")
 	}
 	if *provider != "" && !slices.Contains(config.ValidTaskSourceProviders, *provider) {
 		return fmt.Errorf("--provider must be one of %s, got %q",
@@ -1940,8 +1945,14 @@ func resolveTaskSourceRef(cfg config.Config, ref string) (int, error) {
 	case 1:
 		return matches[0], nil
 	case 0:
-		return 0, fmt.Errorf("no task source is scoped to agent %q — address it by index instead "+
-			"(see: hap config task-source list), or add one: hap config task-source add --agent %s <checklist.md>",
+		// A source may be scoped by the agent's ID or TYPE rather than its short
+		// name, in which case it exists but is not addressable this way — so
+		// the listing leads, and "add one" comes second. Leading with `add`
+		// steers toward creating a SECOND source for an agent that already has
+		// one, which is the state this resolver then refuses to address.
+		return 0, fmt.Errorf("no task source is scoped to agent %q — it may be scoped by the "+
+			"agent's id or type instead, so check `hap config task-source list` and address it "+
+			"by index; or add one: hap config task-source add --agent %s <checklist.md>",
 			token, token)
 	default:
 		idxs := make([]string, len(matches))
@@ -1959,7 +1970,7 @@ func resolveTaskSourceRef(cfg config.Config, ref string) (int, error) {
 // after it, so a remembered index is stale the moment one is dropped.
 func taskSourceEditedHints() []Hint {
 	return []Hint{
-		{Cmd: "hap config task-source list", Why: "every source, with the index `set` and `remove` take"},
+		{Cmd: "hap config task-source list", Why: "every source, with the index or agent name `set` and `remove` take"},
 		{Cmd: "hap task <agent> list", Why: "the items that source will hand out"},
 	}
 }
@@ -2105,7 +2116,7 @@ func describeEnvFile(path string) string {
 // entry and renumbering every later source to change one. The TUI still offers
 // the shorter list; this is the surface that has to be complete.
 func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	const usage = "usage: hap config task-source set <index> <path|agent|workspace|template|auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: hap config task-source list, hap help config task-source)"
+	const usage = "usage: hap config task-source set <index|agent> <path|agent|workspace|template|auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: hap config task-source list, hap help config task-source)"
 	if len(args) != 3 {
 		return fmt.Errorf("%s", usage)
 	}
