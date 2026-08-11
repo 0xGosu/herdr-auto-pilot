@@ -791,3 +791,46 @@ func TestInstallFallbackFindsCandidatesViaLsRemote(t *testing.T) {
 		t.Errorf("installed v%s, want v0.6.1 discovered via ls-remote:\n%s", got, out)
 	}
 }
+
+// Failure on the SECOND restore move of reclaim_swap: the complete pair has
+// cleared both live halves, lib/ is back, and moving the binary fails. That
+// state is incoherent by construction — the two are a pair, and the move that
+// failed is the one needed to complete it — so what has to hold is narrower:
+// nothing is discarded, and the next run finishes the job.
+func TestInstallReclaimFailureIsRecoverableOnTheNextRun(t *testing.T) {
+	env := newInstallEnv(t, "0.6.1",
+		[]string{"v0.6.1"}, []release{{version: "0.6.1"}})
+	env.seedPriorInstall(t)
+
+	// Debris of a run killed after BOTH saves: a complete pair in the holding
+	// directory. The binary is marked v0.0.9 so its recovery is provable.
+	swap := filepath.Join(env.root, ".hap-swap")
+	if err := os.MkdirAll(filepath.Join(swap, "lib"), 0o755); err != nil {
+		t.Fatalf("stage swap: %v", err)
+	}
+	writeFile(t, filepath.Join(swap, "lib", "libpair.so"), []byte("paired lib\n"), 0o644)
+	writeFile(t, filepath.Join(swap, "hap"), []byte("#!/bin/sh\necho hap v0.0.9\nexit 0\n"), 0o755)
+
+	// Run 1: restoring lib/ succeeds, restoring the binary fails.
+	code, out := env.run(t, "HAP_TEST_MV_FAIL=*/.hap-swap/hap")
+	if code != 1 {
+		t.Fatalf("a failed reclaim must fail the install (exit %d):\n%s", code, out)
+	}
+	if !env.exists(".hap-swap/hap") {
+		t.Fatalf("the stranded binary was discarded:\n%s", out)
+	}
+	mustContain(t, out, ".hap-swap")
+
+	// Run 2: reclaim finishes. Fail the install itself right afterwards, so
+	// what ends up live is the RECOVERED binary and not a fresh download.
+	code, out = env.run(t, "HAP_TEST_MV_FAIL=bin/hap")
+	if code != 1 {
+		t.Fatalf("run 2 should have failed after reclaiming (exit %d):\n%s", code, out)
+	}
+	if got := env.installedVersion(t); got != "0.0.9" {
+		t.Errorf("the stranded binary was not recovered on the next run (got v%s):\n%s", got, out)
+	}
+	if env.exists(".hap-swap") {
+		t.Errorf("the holding directory outlived a completed reclaim:\n%s", out)
+	}
+}

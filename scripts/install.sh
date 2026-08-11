@@ -170,6 +170,15 @@ install_release() {
 # may have landed after the new lib/ was placed but before its binary was, and
 # restoring only what is missing would then pair an old binary with the new
 # lib/ — a mismatch preserved rather than repaired.
+#
+# If a restore move itself fails, the state left behind is INCOHERENT and
+# cannot be made otherwise: the binary and lib/ are a pair, POSIX offers no
+# atomic rename of two objects, and the move that failed is the one needed to
+# complete it. So the guarantee here is narrower, and it is what the fatal exit
+# rests on: nothing is DISCARDED (SWAP is removed only after every restore has
+# succeeded), and the function is IDEMPOTENT — re-running it finishes whatever
+# is left, because each move is guarded on the destination being absent.
+# `TestInstallReclaimFailureIsRecoverableOnTheNextRun` pins both.
 reclaim_swap() {
   local reclaimed=0
   [ -d "$SWAP" ] || return 0
@@ -383,7 +392,9 @@ release_available() {
 # rest of this script sees a coherent install to replace. Fatal if it cannot:
 # proceeding would build a new SWAP on top of files that are the only copy of
 # the live binary's libraries.
-reclaim_swap || fail "could not recover the previous install from an interrupted swap; its files are at ${SWAP}"
+reclaim_swap || fail "could not recover the previous install from an interrupted swap
+(nothing was discarded — its files are still at ${SWAP}, and re-running this
+script finishes the recovery once the disk problem is resolved)"
 
 INSTALLED=""
 if install_release "$VERSION"; then
