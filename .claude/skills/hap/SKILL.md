@@ -728,6 +728,24 @@ hap config task-source set <index> enable-llm-review-before-auto-send true  # co
 hap config task-source set <index> max-tasks 40               # the refill/creation cap
 ```
 
+**every field of a source is editable in place**, not just those three:
+
+```bash
+hap config task-source set <index> path /new/tasks.md    # which list it reads
+hap config task-source set <index> agent swift-heron     # which agent it feeds
+hap config task-source set <index> workspace 'codex-*'   # which workspace
+hap config task-source set <index> template 'Do: {next_task_content}'   # "" restores the default
+hap config task-source set <index> provider github_gist  # where the list is stored
+hap config task-source set <index> gist-id aa11bb22
+```
+
+the first three re-point the source, so each prints what it changed FROM and
+says so — the next hand-out then comes from a different list, or goes to a
+different agent. nothing is copied or removed either way; check
+`hap config task-source list` and `hap task <agent> list` afterwards. a relative
+`path` is resolved against YOUR shell's cwd (the daemon runs from the state
+dir), and an empty one is refused — that is `remove`, not an edit.
+
 the *Config* tab's `enter` on a task-source row is the same edit: it opens a
 picker of the three settings, then asks for the value (the three compose, so no
 row is ever blocked by another). all are also settable at creation time —

@@ -1925,6 +1925,14 @@ const (
 		"yourself before the next hand-out, or the agent will be handed whatever the new store " +
 		"already holds — possibly nothing."
 
+	// retargetMessage is printed when a source's path or one of its selectors
+	// changes. Nothing moves and nothing is lost, but the NEXT hand-out comes
+	// from somewhere else — or goes to somebody else — which is worth saying
+	// out loud rather than leaving to a re-listing.
+	retargetMessage = "this re-points the source: the next hand-out is read from the new list, " +
+		"or given to whoever the new selector matches. Nothing is copied or removed — check " +
+		"`hap config task-source list` and `hap task <agent> list`."
+
 	llmReviewOnMessage = "LLM review before auto-send is ON: immediately before the daemon sends a task, " +
 		"the configured [llm].command may revise the list and pick which task goes. A review that fails " +
 		"or scores below auto_act_confidence_threshold sends the original task unchanged — it never " +
@@ -2002,7 +2010,7 @@ func describeEnvFile(path string) string {
 // and the cap; path/agent/workspace are remove-and-re-add, since changing them
 // silently re-points an agent's work.
 func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	const usage = "usage: hap config task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: hap config task-source list, hap help config task-source)"
+	const usage = "usage: hap config task-source set <index> <path|agent|workspace|template|auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: hap config task-source list, hap help config task-source)"
 	if len(args) != 3 {
 		return fmt.Errorf("%s", usage)
 	}
@@ -2102,6 +2110,43 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 			fmt.Fprintf(out, "task source #%d: gist_id now inherits the default\n", idx)
 		} else {
 			fmt.Fprintf(out, "task source #%d: gist_id=%s\n", idx, shortGistID(id))
+		}
+		return nil
+	// The three SELECTORS and the template. Changing one re-points which work
+	// an agent is handed, which is why each prints what it changed FROM as well
+	// as to — but it is not withheld: `remove` is unguarded by design, so
+	// refusing the smaller edit only forced the operator through
+	// remove-and-re-add, retyping every other field and renumbering every later
+	// source to change one.
+	case "path":
+		if err := app.SetTaskSourcePath(ctx, idx, expected, value); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "task source #%d: path=%s (was %s)\n", idx, value, expected.Path)
+		fmt.Fprintln(out, retargetMessage)
+		return nil
+	case "agent":
+		if err := app.SetTaskSourceAgent(ctx, idx, expected, value); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "task source #%d: agent=%q (was %q)\n", idx, value, expected.Agent)
+		fmt.Fprintln(out, retargetMessage)
+		return nil
+	case "workspace":
+		if err := app.SetTaskSourceWorkspace(ctx, idx, expected, value); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "task source #%d: workspace=%q (was %q)\n", idx, value, expected.Workspace)
+		fmt.Fprintln(out, retargetMessage)
+		return nil
+	case "template", "next-task-template", "next_task_template":
+		if err := app.SetTaskSourceTemplate(ctx, idx, expected, value); err != nil {
+			return err
+		}
+		if strings.TrimSpace(value) == "" {
+			fmt.Fprintf(out, "task source #%d: template cleared — the built-in default applies\n", idx)
+		} else {
+			fmt.Fprintf(out, "task source #%d: template=%q\n", idx, value)
 		}
 		return nil
 	}

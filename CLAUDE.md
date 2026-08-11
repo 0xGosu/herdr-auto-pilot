@@ -240,7 +240,11 @@ whose manifest carries exactly that version).
   `hap config classifier`, `hap config capture-delay`, `hap config env`) and is named in
   `configListCommands`, which `TestEveryConfigListHasACLICommand` holds to the same
   by-construction standard. Both tests also fail on a STALE entry, so neither map can claim
-  coverage for a key that no longer exists. Two rules bind the list editors: **removal
+  coverage for a key that no longer exists. A list ELEMENT's own fields are held to the
+  same standard where the element is long-lived: every `[[task_sources]]` field has a
+  `hap config task-source set` key (`TestEveryTaskSourceFieldIsEditable`), because a field
+  settable only at creation means remove-and-re-add — retyping every other field and
+  renumbering every later source to change one. Three rules bind the list editors: **removal
   compares the WHOLE entry the caller listed**, never one field (several classifier rules
   share a situation, and one never-auto pattern is legitimately scoped twice — a one-field
   guard passes on the wrong element exactly when a listing has gone stale); and **an insert

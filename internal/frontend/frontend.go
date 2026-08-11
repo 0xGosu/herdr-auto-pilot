@@ -2668,7 +2668,14 @@ func checkTaskSourceUnchanged(cfg config.Config, index int, expected config.Task
 // that nothing happened — the silent write on the failure path this guard
 // exists to prevent. The contract holds whether or not any rule currently
 // rejects anything: it is what keeps adding one later safe.
-func (a *App) updateTaskSource(ctx context.Context, index int, expected config.TaskSource, mutate func(*config.TaskSource)) error {
+// after, when given, runs on the validated entry with the config in hand — for
+// the one edit (path) that must be normalized against the EFFECTIVE provider,
+// which may be inherited. It runs after validation for the same reason
+// AddTaskSource absolutizes after validating: filepath.Abs("") returns the cwd,
+// which would turn a missing path into a real-looking one and defeat the rule.
+func (a *App) updateTaskSource(ctx context.Context, index int, expected config.TaskSource,
+	mutate func(*config.TaskSource), after ...func(config.Config, *config.TaskSource)) error {
+
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		if err := checkTaskSourceUnchanged(*cfg, index, expected); err != nil {
 			return err
@@ -2679,6 +2686,9 @@ func (a *App) updateTaskSource(ctx context.Context, index int, expected config.T
 		// the effective provider sees the same inheritance the daemon will.
 		if err := config.ValidateTaskSource(*cfg, updated); err != nil {
 			return err
+		}
+		for _, fn := range after {
+			fn(*cfg, &updated)
 		}
 		cfg.TaskSources[index] = updated
 		return nil
@@ -2754,6 +2764,72 @@ func (a *App) SetTaskSourceProvider(ctx context.Context, index int, expected con
 		return "", err
 	}
 	return converted, nil
+}
+
+// SetTaskSourcePath re-points a source at a different checklist.
+//
+// The path is expanded and absolutized here, in the operator's process, for the
+// same reason AddTaskSource does it: the daemon runs from the state dir, so a
+// relative path stored verbatim would resolve somewhere the operator never
+// meant. A REMOTE provider is left alone — its value is a locator, not a path,
+// and filepath.Abs does not fail on one, it silently mangles it.
+//
+// This changes which work an agent is handed, so the caller warns; it is not
+// refused. `hap config task-source remove` is deliberately unguarded, so
+// withholding the smaller edit while allowing the larger one only forced the
+// operator through remove-and-re-add — retyping every other field, and
+// renumbering every later source, to change one.
+func (a *App) SetTaskSourcePath(ctx context.Context, index int, expected config.TaskSource,
+	path string) error {
+
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("path is required (use `hap config task-source remove %d` to drop the source)", index)
+	}
+	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.Path = path
+	}, func(cfg config.Config, src *config.TaskSource) {
+		if !cfg.ResolveProvider(*src).Remote() {
+			src.Path = config.ExpandPath(src.Path)
+			if abs, err := filepath.Abs(src.Path); err == nil {
+				src.Path = abs
+			}
+		}
+	})
+}
+
+// SetTaskSourceAgent re-scopes a source to a different agent selector (an
+// agent id, short name, or agent type; "" matches any agent).
+func (a *App) SetTaskSourceAgent(ctx context.Context, index int, expected config.TaskSource,
+	agent string) error {
+
+	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.Agent = strings.TrimSpace(agent)
+	})
+}
+
+// SetTaskSourceWorkspace re-scopes a source to a different workspace selector
+// ("" or "*" matches any; "*" inside the value is a wildcard, e.g. "codex-*").
+func (a *App) SetTaskSourceWorkspace(ctx context.Context, index int, expected config.TaskSource,
+	workspace string) error {
+
+	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.Workspace = strings.TrimSpace(workspace)
+	})
+}
+
+// SetTaskSourceTemplate replaces the source's outbound next-task prompt
+// template; an empty value restores the built-in default.
+//
+// Unlike the selectors above this is free text, which is why the TUI leaves it
+// alone (CR-036: a one-line prompt round-trip mangles it). The CLI has no such
+// problem — the shell already quotes it — so refusing it here would leave a
+// field settable at creation and never afterwards.
+func (a *App) SetTaskSourceTemplate(ctx context.Context, index int, expected config.TaskSource,
+	template string) error {
+
+	return a.updateTaskSource(ctx, index, expected, func(src *config.TaskSource) {
+		src.NextTaskTemplate = template
+	})
 }
 
 // SetTaskSourceGistID overrides (or, with an empty id, clears the override on)

@@ -961,6 +961,27 @@ selection wins.) To retire a source the guard refuses, use the *Config* tab's
 point an agent at a source in the first place, use `hap config task-source add` or
 the *Config* tab's `t`.
 
+Every field of an existing source is editable in place — no remove-and-re-add:
+
+```sh
+hap config task-source set <index> path /new/tasks.md   # which list it reads
+hap config task-source set <index> agent swift-heron    # which agent it feeds
+hap config task-source set <index> workspace 'codex-*'
+hap config task-source set <index> template 'Do: {next_task_content}'   # "" restores the default
+hap config task-source set <index> auto-send-when-idle true
+hap config task-source set <index> enable-llm-review-before-auto-send true
+hap config task-source set <index> max-tasks 40
+hap config task-source set <index> provider github_gist   # or "inherit"
+hap config task-source set <index> gist-id aa11bb22       # or "inherit"
+```
+
+The first three re-point the source, so each reports what it changed *from* and
+warns: the next hand-out then comes from a different list, or goes to a
+different agent. Nothing is copied or removed either way. A relative `path` is
+resolved against your shell's working directory — the daemon runs from the
+state dir, so a path stored verbatim would name a different file — and an empty
+one is refused, since that is `remove`, not an edit.
+
 ### Suggesting tasks when no source exists, or a source runs out (optional)
 
 If an idle agent has neither a matching `[[task_sources]]` entry nor an

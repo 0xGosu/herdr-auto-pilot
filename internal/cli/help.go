@@ -824,7 +824,7 @@ func buildCommands() {
 				"hap config task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>]",
 				"hap config task-source list",
 				"hap config task-source provider",
-				"hap config task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value>",
+				"hap config task-source set <index> <path|agent|workspace|template|auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value>",
 				"hap config task-source remove <index>",
 			},
 			Flags: []FlagDoc{
@@ -852,12 +852,16 @@ func buildCommands() {
 				"               agent gets its own \"<agent-name>.md\", created on first hand-out.\n" +
 				"`hap task <agent> …` works the same either way. `--path` on `hap task` always\n" +
 				"reads a LOCAL file, so address a remote list by the agent's name.\n" +
-				"`set` edits an existing source: the two delivery gates, max-tasks, and where\n" +
-				"the list is stored (provider, gist-id — either takes \"inherit\" to go back to\n" +
-				"following the default). Changing the path/agent/workspace is remove-and-re-add,\n" +
-				"since it silently re-points an agent's work. Changing the PROVIDER does not\n" +
-				"migrate the list: hap reads the new store from then on and leaves the old copy\n" +
-				"where it is.\n" +
+				"`set` edits an existing source in place, and every field is editable:\n" +
+				"  path | agent | workspace | template          re-point it\n" +
+				"  auto-send-when-idle | enable-llm-review-before-auto-send | max-tasks\n" +
+				"  provider | gist-id                           where the list is stored\n" +
+				"(provider and gist-id each take \"inherit\" to go back to following the default.)\n" +
+				"The four that re-point the source print what they changed FROM and warn: the\n" +
+				"next hand-out then comes from a different list, or goes to a different agent.\n" +
+				"Nothing is copied or removed either way. Changing the PROVIDER likewise does\n" +
+				"not migrate the list: hap reads the new store from then on and leaves the old\n" +
+				"copy where it is.\n" +
 				"enable-llm-review-before-auto-send composes with auto-send-when-idle: the\n" +
 				"hand-out decides THAT a task goes, the review decides which task and in what\n" +
 				"shape. Immediately before the daemon sends, the LLM may mark, drop, rewrite,\n" +
@@ -875,6 +879,9 @@ func buildCommands() {
 				"hap config task-source list",
 				"hap config task-source set 0 auto-send-when-idle true",
 				"hap config task-source set 0 enable-llm-review-before-auto-send true",
+				"hap config task-source set 0 agent swift-heron",
+				"hap config task-source set 0 path ./docs/other-tasks.md",
+				"hap config task-source set 0 template 'Do this next: {next_task_content}'",
 			},
 			Next: []Hint{
 				{Cmd: "hap config task-source list", Why: "confirm the source and its index"},
