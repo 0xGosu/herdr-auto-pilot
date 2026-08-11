@@ -2113,3 +2113,55 @@ func TestTasksReorderCursorNudgeWithTwoGroups(t *testing.T) {
 		t.Errorf("first group must be untouched:\ngot  %q\nwant %q", got, want)
 	}
 }
+
+// TestTaskRowsRemoteDerivedGroupCarriesResolvedLocator pins the Tasks tab's
+// addressing for a remote source: rows must carry the group's resolved
+// LOCATOR, never Source.Path — which for a derived (one-list-per-matched-
+// agent) source is empty, and for an explicit gist source is a bare file name
+// that canonicalizes against the TUI's cwd instead of the gist. Every item
+// action (done, edit, delete, move, send) mutates by the row's path, so a row
+// carrying Source.Path here silently addressed a list the store never serves.
+func TestTaskRowsRemoteDerivedGroupCarriesResolvedLocator(t *testing.T) {
+	cfg := config.Default()
+	cfg.TaskSourceProvider = config.TaskSourceProvider{
+		Provider:   config.ProviderGitHubGist,
+		EnvFile:    "/etc/hap/task.env",
+		GitHubGist: config.GitHubGist{GistID: "3f2a1b9c"},
+	}
+	cfg.TaskSources = []config.TaskSource{{Agent: "brave-otter"}}
+	const locator = "gist://3f2a1b9c/brave-otter.md"
+	const display = "https://gist.github.com/3f2a1b9c#file-brave-otter-md"
+	m := Model{width: 120, height: 30}
+	upd, _ := m.Update(refreshMsg{
+		cfg: cfg,
+		tasks: []frontend.TaskGroup{{Source: cfg.TaskSources[0], Index: 0,
+			Locator: locator, Display: display,
+			Items: []domain.ChecklistItem{{Index: 1, Mark: " ", Text: "write the parser"}}}},
+	})
+	m = upd.(Model)
+	m.tab = tabTasks
+
+	rows := m.taskRows()
+	if len(rows) != 2 || !rows[0].header || rows[1].item != 1 {
+		t.Fatalf("rows = %+v, want a header and one item row", rows)
+	}
+	for i, r := range rows {
+		if r.path != locator {
+			t.Errorf("row %d path=%q, want the resolved locator %q", i, r.path, locator)
+		}
+	}
+	// The header has no configured path to show, so it falls back to the
+	// operator-facing Display — the row must say WHICH list it resolved to.
+	if !strings.Contains(strings.Join(rows[0].fields, " "), display) {
+		t.Errorf("header fields %q do not carry the display address %q", rows[0].fields, display)
+	}
+
+	// Bulk-action targets inherit the same identity: a marked item must
+	// address the locator (Canonical returns a scheme'd locator verbatim, so
+	// this is also what joins against the mutation result's keys).
+	m.taskMarks = map[string]bool{taskMarkKey(0, 1): true}
+	targets := m.markedTaskTargets()
+	if len(targets) != 1 || targets[0].path != locator {
+		t.Fatalf("targets = %+v, want one target addressing %q", targets, locator)
+	}
+}
