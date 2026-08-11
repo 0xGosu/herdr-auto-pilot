@@ -740,7 +740,16 @@ func setAgentDisabled(ctx context.Context, app *frontend.App, out io.Writer,
 	return nil
 }
 
-func status(ctx context.Context, app *frontend.App, out io.Writer) error {
+func status(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	stderrTail := fs.Bool("stderr", false, "also print the captured daemon stderr (the crash output the status line only names)")
+	fs.SetOutput(out)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected argument %q (usage: hap status [--stderr])", fs.Arg(0))
+	}
 	st, err := app.GetStatus(ctx)
 	if err != nil {
 		return err
@@ -826,6 +835,21 @@ func status(ctx context.Context, app *frontend.App, out io.Writer) error {
 	}
 	if cfg, err := config.Load(app.ConfigPath); err == nil {
 		printDiskLine(out, app.StateDir, cfg)
+	}
+	// The full crash output, on request. The health lines above name the log
+	// file but only ever quote a one-line summary of it, which was enough to
+	// know something crashed and never enough to know why — reading the whole
+	// tail was TUI-only until now.
+	if *stderrTail {
+		path, tail := app.DaemonStderrTail()
+		fmt.Fprintf(out, "\ndaemon stderr (%s):\n", orDash(path))
+		if tail == "" {
+			fmt.Fprintln(out, "  (empty — the daemon has written nothing to stderr)")
+		} else {
+			for _, line := range strings.Split(tail, "\n") {
+				fmt.Fprintf(out, "  %s\n", line)
+			}
+		}
 	}
 	// The footer is built from what this status actually found, so the first
 	// suggestion is always the one that matters: revive the daemon, lift the
@@ -931,10 +955,13 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 
 func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) > 0 {
-		if args[0] != "prune" {
-			return fmt.Errorf("usage: escalations [prune [minutes]] (see: hap help escalations)")
+		switch args[0] {
+		case "prune":
+			return escalationsPrune(ctx, app, out, args[1:])
+		case "retry":
+			return escalationsRetry(ctx, app, out, args[1:])
 		}
-		return escalationsPrune(ctx, app, out, args[1:])
+		return fmt.Errorf("usage: escalations [prune [minutes] | retry <audit-id>] (see: hap help escalations)")
 	}
 	esc, err := app.Escalations(ctx)
 	if err != nil {
@@ -1028,6 +1055,30 @@ func escalationsPrune(ctx context.Context, app *frontend.App, out io.Writer, arg
 	PrintNextSteps(out, []Hint{
 		{Cmd: "hap escalations", Why: "what is still pending"},
 		{Cmd: "hap audit --limit 20", Why: "the pruned rows are kept here as dismissed"},
+	})
+	return nil
+}
+
+// escalationsRetry re-invokes the operator LLM on an escalation whose consult
+// failed or timed out (or re-runs a failed learn-from-correction), which was
+// previously reachable only from the TUI. The request is queued; the daemon
+// re-drives the consult against the agent's LIVE pane on its next reload, so
+// the answer reflects the screen as it is now, not the one that failed.
+func escalationsRetry(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: escalations retry <audit-id> (see: hap escalations)")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid audit id %q", args[0])
+	}
+	if err := app.RetryLLM(ctx, id); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "LLM re-consult queued for escalation #%d\n", id)
+	PrintNextSteps(out, []Hint{
+		{Cmd: "hap escalations", Why: "the queue — the row updates once the daemon re-consults"},
+		{Cmd: "hap status", Why: "the daemon must be running to pick the retry up"},
 	})
 	return nil
 }
@@ -1206,6 +1257,8 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		// Bare on purpose: `$(hap config path)` must be the path alone.
 		fmt.Fprintln(out, app.ConfigPath)
 		return nil
+	case "env":
+		return configEnv(ctx, app, out, args[1:])
 	case "fields":
 		cfg, err := app.Config()
 		if err != nil {
@@ -1245,7 +1298,7 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		PrintNextSteps(out, configHints())
 		return nil
 	}
-	return fmt.Errorf("usage: config [show|fields|path|set <field> <value>|set-threshold <situation> <value>] (see: hap help config)")
+	return fmt.Errorf("usage: config [show|fields|path|set <field> <value>|set-threshold <situation> <value>|env …] (see: hap help config)")
 }
 
 // configHints are the follow-ups printed after a config read or edit; `config
@@ -1356,18 +1409,16 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		PrintNextSteps(out, []Hint{
 			{Cmd: "hap rules add <regex>", Why: "force a matching situation to always ask a human"},
 			{Cmd: "hap rules remove <index>", Why: "drop one of the operator patterns listed above"},
+			{Cmd: "hap rules remove-scoped <index>", Why: "drop one of the agent-scoped rules listed above"},
 			{Cmd: "hap rules disable-seed <id>", Why: "silence one builtin (seed <id>) rule that is too aggressive here"},
 		})
 		return nil
 	}
 	switch {
-	case args[0] == "add" && len(args) == 2:
-		if err := app.AddNeverAutoPattern(ctx, args[1]); err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "never-auto pattern added: %s\n", args[1])
-		PrintNextSteps(out, rulesEditedHints())
-		return nil
+	case args[0] == "add":
+		return rulesAdd(ctx, app, out, args[1:])
+	case args[0] == "remove-scoped" && len(args) == 2:
+		return rulesRemoveScoped(ctx, app, out, args[1])
 	case args[0] == "disable-seed" && len(args) == 2:
 		return rulesSeedToggle(ctx, app, out, args[1], true)
 	case args[0] == "enable-seed" && len(args) == 2:
@@ -1392,7 +1443,69 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		PrintNextSteps(out, rulesEditedHints())
 		return nil
 	}
-	return fmt.Errorf("usage: rules [list|add <regex>|remove <index>|disable-seed <id>|enable-seed <id>] (see: hap help rules)")
+	return fmt.Errorf("usage: rules [list|add [--agent-type T] <regex>|remove <index>|remove-scoped <index>|disable-seed <id>|enable-seed <id>] (see: hap help rules)")
+}
+
+// rulesAdd appends an operator never-auto pattern. With --agent-type it lands
+// in the SCOPED list ([[safety.never_auto_rules]]) instead of the flat one:
+// same safety meaning, but limited to the named agent types, so a phrase that
+// is only dangerous in one agent's TUI does not make every other agent ask.
+// The two lists are listed and removed separately (`remove` vs
+// `remove-scoped`) because each has its own index space.
+func rulesAdd(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	fs := flag.NewFlagSet("rules add", flag.ContinueOnError)
+	agentTypes := fs.String("agent-type", "", "limit the rule to these agent types (comma-separated, e.g. claude,codex); omit for every agent")
+	fs.SetOutput(out)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: rules add [--agent-type T[,T]] <regex> (see: hap help rules)")
+	}
+	pattern := fs.Arg(0)
+	if strings.TrimSpace(*agentTypes) == "" {
+		if err := app.AddNeverAutoPattern(ctx, pattern); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "never-auto pattern added: %s\n", pattern)
+		PrintNextSteps(out, rulesEditedHints())
+		return nil
+	}
+	types := strings.Split(*agentTypes, ",")
+	if err := app.AddNeverAutoRule(ctx, pattern, types); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "scoped never-auto rule added: agent_types=%s\t%s\n",
+		strings.Join(types, ","), pattern)
+	PrintNextSteps(out, rulesEditedHints())
+	return nil
+}
+
+// rulesRemoveScoped deletes one agent-scoped never-auto rule by the index
+// `rules list` printed for it ("operator scoped #N"). It is a separate verb
+// from `remove` because the scoped rules have their own index space — sharing
+// one verb would make `rules remove 0` ambiguous between two different safety
+// rules.
+func rulesRemoveScoped(ctx context.Context, app *frontend.App, out io.Writer, arg string) error {
+	idx, err := strconv.Atoi(strings.TrimPrefix(arg, "#"))
+	if err != nil {
+		return fmt.Errorf("invalid scoped rule index %q (see: rules list)", arg)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		return err
+	}
+	if idx < 0 || idx >= len(cfg.Safety.NeverAutoRules) {
+		return fmt.Errorf("no scoped never-auto rule #%d (see: rules list)", idx)
+	}
+	expected := cfg.Safety.NeverAutoRules[idx]
+	if err := app.RemoveNeverAutoRule(ctx, idx, expected.Pattern); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "scoped never-auto rule #%d removed: agent_types=%s\t%s\n",
+		idx, strings.Join(expected.AgentTypes, ","), expected.Pattern)
+	PrintNextSteps(out, rulesEditedHints())
+	return nil
 }
 
 // rulesSeedToggle disables (or re-enables) one shipped seed never-auto rule by

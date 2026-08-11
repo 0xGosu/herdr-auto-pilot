@@ -5418,8 +5418,11 @@ var configKeysExemptFromRegistry = map[string]string{
 //     would find no tagged fields and silently record nothing.
 //
 // Slices, maps and interfaces are structured data that one key=value assignment
-// cannot express, and are config.toml-only by design.
-func tomlScalarKeys(rt reflect.Type) (scalars, untagged []string) {
+// cannot express, so they are reported SEPARATELY (as lists) rather than as
+// scalars: they are not `config set` keys, but they are still config an
+// operator must be able to edit, and TestEveryConfigListHasACLICommand holds
+// each of them to a verb of its own.
+func tomlScalarKeys(rt reflect.Type) (scalars, lists, untagged []string) {
 	textUnmarshaler := reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
 	tomlUnmarshaler := reflect.TypeOf((*toml.Unmarshaler)(nil)).Elem()
 	decodesAsScalar := func(ft reflect.Type) bool {
@@ -5469,7 +5472,7 @@ func tomlScalarKeys(rt reflect.Type) (scalars, untagged []string) {
 			case decodesAsScalar(ft):
 				scalars = append(scalars, key)
 			case ft.Kind() == reflect.Slice, ft.Kind() == reflect.Map, ft.Kind() == reflect.Interface:
-				// structured data — config.toml-only by design
+				lists = append(lists, key)
 			case ft.Kind() == reflect.Struct:
 				walk(ft, key)
 			default:
@@ -5478,7 +5481,7 @@ func tomlScalarKeys(rt reflect.Type) (scalars, untagged []string) {
 		}
 	}
 	walk(rt, "")
-	return scalars, untagged
+	return scalars, lists, untagged
 }
 
 // TestEveryConfigKeyIsRegistered keeps `hap config set` in sync with
@@ -5497,7 +5500,7 @@ func TestEveryConfigKeyIsRegistered(t *testing.T) {
 		registered[key] = true
 	}
 
-	scalars, untagged := tomlScalarKeys(reflect.TypeOf(config.Config{}))
+	scalars, _, untagged := tomlScalarKeys(reflect.TypeOf(config.Config{}))
 
 	for _, key := range untagged {
 		t.Errorf("config field %s has no toml tag, so the decoder accepts it under its "+
@@ -5735,11 +5738,24 @@ type tomlProbeConfig struct {
 // BurntSushi/toml ever changes these rules this test fails rather than pinning
 // a model of a decoder that no longer exists.
 func TestTOMLScalarKeysModelsTheDecoder(t *testing.T) {
-	scalars, untagged := tomlScalarKeys(reflect.TypeOf(tomlProbeConfig{}))
+	scalars, lists, untagged := tomlScalarKeys(reflect.TypeOf(tomlProbeConfig{}))
 
 	got := map[string]bool{}
 	for _, k := range scalars {
 		got[k] = true
+	}
+	// A slice or map is not a `config set` key, but it IS a config key: it must
+	// come back as a LIST, not vanish, or TestEveryConfigListHasACLICommand
+	// would silently stop noticing a new section with no CLI command.
+	gotList := map[string]bool{}
+	for _, k := range lists {
+		gotList[k] = true
+	}
+	for _, want := range []string{"listed", "mapped"} {
+		if !gotList[want] {
+			t.Errorf("tomlScalarKeys dropped %q instead of reporting it as a list — a config "+
+				"array/map with no CLI command would then go unnoticed", want)
+		}
 	}
 	for _, want := range []string{
 		"tagged",

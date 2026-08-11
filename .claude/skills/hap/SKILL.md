@@ -248,6 +248,12 @@ hap escalations prune
 hap escalations prune 120
 ```
 
+re-invoke the LLM on an escalation whose consult failed or timed out (and re-run a failed learn-from-correction). the request is queued: the running daemon re-consults against the agent's LIVE pane, so the answer reflects the screen now, not the one that failed:
+
+```bash
+hap escalations retry <id>
+```
+
 ## pause and resume (kill switch)
 
 pause all automation globally:
@@ -476,9 +482,29 @@ per-command env notes: layering is daemon env → `env_file` → `env` → the c
 
 TUI palette colors — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. set with `hap config set tui.palette.<role> <color>`; values are 256-color codes (`"205"`, 0-255) or hex (`"#ff5faf"`, `#rgb` or `#rrggbb`), and `""` clears a role back to the theme. anything else is rejected — lipgloss resolves an unrecognized color to NO color at all. hidden from the TUI config tab (eight colors would bury the settings you reach for), so `hap config fields` is where you read their current values.
 
-some settings are table-valued and live in `config.toml` only (not settable via `hap config set`): `[[capture_delay]]`, `[[task_sources]]`, `[[classifier]]`, `[[safety.never_auto_rules]]`, `safety.disabled_seed_patterns` (the list `hap rules disable-seed` writes), and the inline `[llm.*_env]` tables (only the `*_env_file` PATHS are settable — the tables hold secrets). `[tui.palette]` is NOT in this list: its roles are individually settable, see above.
+some settings are table-valued, so one `hap config set <key> <value>` cannot address them (a list element is addressed by position, a map entry by name). each has a verb of its own instead — nothing needs config.toml opened by hand:
+
+| section | command |
+|---|---|
+| `[[task_sources]]` | `hap task-source add / set / remove` |
+| `[[classifier]]` | `hap classifier add / remove` |
+| `[[capture_delay]]` | `hap capture-delay set / remove` |
+| `safety.never_auto_patterns` | `hap rules add / remove` |
+| `[[safety.never_auto_rules]]` | `hap rules add --agent-type / hap rules remove-scoped` |
+| `safety.disabled_seed_patterns` | `hap rules disable-seed / enable-seed` |
+| `[llm.*_env]` | `hap config env set / unset` (values read from stdin) |
+
+`[tui.palette]` is not table-valued for this purpose: its roles are individually settable with `hap config set`, see above. `TestEveryConfigKeyIsRegistered` and `TestEveryConfigListHasACLICommand` fail the build if a new key or section ever ships without a command.
 
 **capture delay** — the classification pane read waits a per-agent delay so the agent TUI has painted and event bursts coalesce. defaults: 10000ms (10s) on an agent's first event, 2000ms after. override per agent type:
+
+```bash
+hap capture-delay list                     # the delays in force, defaults resolved
+hap capture-delay set codex 8000 500       # <agent-type> <start-ms> <event-ms>; "*" = all types
+hap capture-delay remove codex             # back to the built-in defaults
+```
+
+setting a type that already has a rule OVERWRITES it — the daemon reads the first matching rule, so a second one for the same type would never be reached. a `0` means "keep the built-in default for that one". the equivalent config.toml:
 
 ```toml
 [[capture_delay]]
@@ -486,6 +512,26 @@ agent_type = "codex"   # or "*" for all
 start_ms = 8000        # first-event delay
 event_ms = 500         # subsequent-event delay
 ```
+
+**classifier rules** — which situation a pane is showing. hap ships rules for the agent TUIs it knows; add your own when a screen is read as the wrong situation, or as none at all (`unclassifiable` escalations). operator rules are consulted BEFORE the shipped ones, in the order added, so position is precedence:
+
+```bash
+hap classifier list
+hap classifier add --situation approval --agent-type claude --regex 'Do you want to proceed\?'
+hap classifier remove 0
+```
+
+`--situation` is approval, choice, error or idle; `--agent-type` defaults to `*`. repeat `--regex`/`--keyword` for several (a regex may contain a comma, so they are not comma-split). a rule needs at least one regex or keyword.
+
+**LLM environment** — the variables handed to the LLM CLI, per scope (`shared`, `command`, `command_start`, `task_generate_command`, `task_generate_command_start`, `learn_from_user_command`):
+
+```bash
+hap config env list                                          # names only, never values
+echo -n "$ANTHROPIC_API_KEY" | hap config env set command ANTHROPIC_API_KEY
+hap config env unset command ANTHROPIC_API_KEY
+```
+
+these hold API keys, so no read path ever prints a VALUE and `env set` reads it from stdin unless you pass `--value` — a token on argv lands in shell history and in every other user's `ps`. to keep values out of config.toml entirely, point a scope at a `.env` file instead (`hap config set llm.env_file <path>`).
 
 ## safety rules (never-auto patterns)
 
@@ -505,6 +551,13 @@ remove a custom rule by index:
 
 ```bash
 hap rules remove <index>
+```
+
+scope a rule to specific agent types (a phrase only dangerous in one agent's TUI should not make every other agent ask):
+
+```bash
+hap rules add --agent-type codex,agy '(?i)compact\s+the\s+conversation'
+hap rules remove-scoped <index>    # scoped rules have their own index space
 ```
 
 silence a single shipped seed rule that is too aggressive for this repo (e.g. a
@@ -1089,7 +1142,7 @@ hap signatures reembed
 
 ## notes
 
-- `hap status`, `hap agents`, `hap escalations`, `hap audit`, `hap signatures list`, `hap signatures show`, `hap config show`, `hap config fields`, `hap config path`, `hap rules list`, `hap task-source list`, `hap task <agent> list`, `hap task <agent> get`, `hap kill-history`, `hap state-dir`, `hap paths`, and `hap version` are read-only and safe to run anytime.
+- `hap status`, `hap agents`, `hap escalations`, `hap audit`, `hap signatures list`, `hap signatures show`, `hap config show`, `hap config fields`, `hap config path`, `hap config env list` (names only, never values), `hap rules list`, `hap task-source list`, `hap classifier list`, `hap capture-delay list`, `hap task <agent> list`, `hap task <agent> get`, `hap kill-history`, `hap state-dir`, `hap paths`, and `hap version` are read-only and safe to run anytime.
 - `hap confirm` and `hap resolve` with `--send` will deliver text to an agent pane — be mindful of what you send.
 - `hap dismiss` drops escalations without responding — safe, nothing is sent or learned, audit rows kept as `dismissed`.
 - `hap escalations prune [minutes]` bulk-dismisses old escalations (default 360 minutes).
@@ -1104,4 +1157,4 @@ hap signatures reembed
 - the MCP server (`hap mcp`) supports `HAP_DB_PATH` and `HAP_CONTROL_PATH` env vars for agent CLIs that sanitize the environment.
 - `--workspace` in task-source supports name wildcards (e.g. `"codex-*"`, `"*-vscode3"`).
 - `resolve --action @noop` (also: `noop`, `no_op`, `no-op`) means no reply was needed — nothing is ever sent to the pane.
-- `hap tui` launches the interactive terminal UI (status, escalations, signatures, config) as an alternative to the read-only CLI commands. the escalation detail view offers per-item actions — confirm, resolve, dismiss, and **retry LLM** (re-invoke the local LLM on a consult that timed out or failed). retry is TUI-only; there is no CLI verb for it.
+- `hap tui` launches the interactive terminal UI (status, escalations, signatures, config) as an alternative to the read-only CLI commands. the escalation detail view offers per-item actions — confirm, resolve, dismiss, and **retry LLM** (re-invoke the local LLM on a consult that timed out or failed, also available as `hap escalations retry <id>`). the TUI is a convenience, not a capability: every configuration key and every action it offers is reachable from the CLI alone.

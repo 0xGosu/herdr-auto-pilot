@@ -197,20 +197,23 @@ func buildCommands() {
 			Name:    "status",
 			Group:   groupOperate,
 			Summary: "automation state, daemon health, pending escalations, agent count",
-			Usage:   []string{"hap status"},
+			Usage:   []string{"hap status [--stderr]"},
+			Flags: []FlagDoc{
+				{Name: "--stderr", Desc: "also print the captured daemon stderr — the crash output the health line only names"},
+			},
 			Details: "Exits non-zero when the daemon is unhealthy (hung, crash-looping, or the\n" +
 				"crash-loop breaker gave up) — the body explains which, without an \"error:\" line.\n" +
-				"Also reports semantic-matching state and embedding drift when present.",
+				"Also reports semantic-matching state and embedding drift when present.\n" +
+				"`--stderr` appends the whole captured tail, for when the one-line summary in\n" +
+				"the health line is not enough to say why the daemon died.",
 			Next: []Hint{
 				{Cmd: "hap escalations", Why: "the queue of decisions hap wants a human for"},
 				{Cmd: "hap agents", Why: "which agents are watched, and their state"},
 				{Cmd: "hap daemon --ensure", Why: "start or replace the daemon"},
 			},
-			Examples:  []string{"hap status"},
+			Examples:  []string{"hap status", "hap status --stderr"},
 			SelfHints: true,
-			Handler: func(ctx context.Context, app *frontend.App, out io.Writer, _ []string) error {
-				return status(ctx, app, out)
-			},
+			Handler:   status,
 		},
 		{
 			Name:    "agents",
@@ -336,18 +339,29 @@ func buildCommands() {
 			Name:    "escalations",
 			Group:   groupOperate,
 			Summary: "list what is waiting for an answer; prune old ones",
-			Usage:   []string{"hap escalations", "hap escalations prune [minutes]"},
+			Usage: []string{
+				"hap escalations",
+				"hap escalations prune [minutes]",
+				"hap escalations retry <audit-id>",
+			},
 			Details: "Each row is: #id, time, situation type, reason, agent, LLM confidence,\n" +
 				"the suggested answer, and the learned rule it matched (if any).\n" +
 				"Answer a row with `confirm` (accept the suggestion), `resolve` (supply the right\n" +
 				"answer), or `dismiss` (drop it). `prune` dismisses everything older than N minutes\n" +
-				"(default 360); audit rows are kept and nothing is sent or learned.",
+				"(default 360); audit rows are kept and nothing is sent or learned.\n" +
+				"`retry` re-invokes the operator LLM on an escalation whose consult failed or\n" +
+				"timed out (and re-runs a failed learn-from-correction). It queues the request:\n" +
+				"the running daemon re-consults against the agent's LIVE pane, so the answer\n" +
+				"reflects the screen now rather than the one that failed.",
 			Next: []Hint{
 				{Cmd: "hap confirm <id> --send", Why: "accept the suggestion and deliver it"},
 				{Cmd: "hap resolve <id> --action TEXT --send", Why: "send the right answer instead"},
 				{Cmd: "hap dismiss <id>", Why: "drop it; nothing sent or learned"},
 			},
-			Examples:  []string{"hap escalations", "hap confirm 42 --send", "hap escalations prune 120"},
+			Examples: []string{
+				"hap escalations", "hap confirm 42 --send",
+				"hap escalations prune 120", "hap escalations retry 42",
+			},
 			SelfHints: true,
 			Handler:   escalations,
 		},
@@ -602,17 +616,33 @@ func buildCommands() {
 				"hap config path",
 				"hap config set <field> <value>",
 				"hap config set-threshold <minimum|idle|approval|choice|error> <value>",
+				"hap config env [list [<scope>]]",
+				"hap config env set <scope> <NAME> [--value V]",
+				"hap config env unset <scope> <NAME>",
+			},
+			Flags: []FlagDoc{
+				{Name: "--value", Arg: "V", Desc: "config env set: the value; omit it and the value is read from stdin, which keeps a secret out of shell history and `ps`"},
 			},
 			Details: "`fields` lists every settable field with its current value — that is the\n" +
 				"authoritative list of names for `set` (dotted, e.g. llm.timeout_seconds).\n" +
 				"`set` writes config.toml and reloads the running daemon; no restart needed.\n" +
 				"`set-threshold` is the shorthand for confidence_thresholds.*: how confident a\n" +
 				"rule must be before hap answers that situation type on its own.\n" +
-				"`path` prints the config file location, bare, for scripting.",
+				"`path` prints the config file location, bare, for scripting.\n\n" +
+				"`env` edits the inline environment handed to the LLM CLI, per scope: shared,\n" +
+				"command, command_start, task_generate_command, task_generate_command_start,\n" +
+				"learn_from_user_command. These hold API keys, so no read path ever prints a\n" +
+				"VALUE — `env list` shows names only — and `env set` reads the value from stdin\n" +
+				"unless you pass --value. For values you would rather keep out of config.toml\n" +
+				"entirely, set an env file instead (`hap config set llm.env_file <path>`).\n\n" +
+				"The array sections of config.toml have their own verbs, since one key=value\n" +
+				"cannot address a list element: `hap rules` (never-auto patterns), `hap\n" +
+				"task-source`, `hap classifier`, `hap capture-delay`.",
 			Examples: []string{
 				"hap config fields",
 				"hap config set learning.graduation_n 3",
 				"hap config set-threshold approval 0.80",
+				"echo -n \"$ANTHROPIC_API_KEY\" | hap config env set command ANTHROPIC_API_KEY",
 			},
 			Next: []Hint{
 				{Cmd: "hap config fields", Why: "list every field and its current value"},
@@ -630,10 +660,14 @@ func buildCommands() {
 			Summary: "never-auto safety patterns (situations hap must never answer alone)",
 			Usage: []string{
 				"hap rules [list]",
-				"hap rules add <regex>",
+				"hap rules add [--agent-type T[,T]] <regex>",
 				"hap rules remove <index>",
+				"hap rules remove-scoped <index>",
 				"hap rules disable-seed <id>",
 				"hap rules enable-seed <id>",
+			},
+			Flags: []FlagDoc{
+				{Name: "--agent-type", Arg: "T", Desc: "add: limit the rule to these agent types (comma-separated, e.g. claude,codex) instead of every agent"},
 			},
 			Details: "`list` prints the shipped seed rules first, each with a stable `seed <id>` (a\n" +
 				"short hash of the pattern, strict or heuristic), then your operator patterns with\n" +
@@ -649,11 +683,18 @@ func buildCommands() {
 				"ships). Note a seed rule is a single regex: one heuristic can cover several\n" +
 				"phrasings, so disabling it silences every phrase in that rule's pattern, not only\n" +
 				"the word you saw. To drop every seed rule at once instead, set\n" +
-				"safety.disable_never_auto_seed_patterns=true.",
+				"safety.disable_never_auto_seed_patterns=true.\n\n" +
+				"`add --agent-type` writes a SCOPED rule instead: the same safety meaning, but\n" +
+				"limited to the named agent types, so a phrase that is only dangerous in one\n" +
+				"agent's TUI does not force every other agent to ask. Scoped rules are listed\n" +
+				"under \"operator scoped\" and have their own index space, which is why they are\n" +
+				"dropped with `remove-scoped` rather than `remove`.",
 			Examples: []string{
 				"hap rules list",
 				"hap rules add '(?i)force[- ]push'",
+				"hap rules add --agent-type codex '(?i)apply patch'",
 				"hap rules remove 0",
+				"hap rules remove-scoped 0",
 				"hap rules disable-seed <id from rules list>",
 			},
 			Next: []Hint{
@@ -664,6 +705,72 @@ func buildCommands() {
 			// list and add/remove want opposite follow-ups, so the handler picks.
 			SelfHints: true,
 			Handler:   rules,
+		},
+		{
+			Name:    "classifier",
+			Group:   groupConfigure,
+			Summary: "operator rules deciding which situation a pane is showing",
+			Usage: []string{
+				"hap classifier [list]",
+				"hap classifier add --situation S [--agent-type T] [--regex RE]... [--keyword KW]...",
+				"hap classifier remove <index>",
+			},
+			Flags: []FlagDoc{
+				{Name: "--situation", Arg: "S", Desc: "what a match means: approval, choice, error or idle"},
+				{Name: "--agent-type", Arg: "T", Default: "*", Desc: "agent type the rule applies to (\"*\" for any)"},
+				{Name: "--regex", Arg: "RE", Desc: "Go regular expression matched against the pane; repeat the flag for several"},
+				{Name: "--keyword", Arg: "KW", Desc: "literal phrase matched against the pane; repeat the flag for several"},
+			},
+			Details: "hap ships classifier rules for the agent TUIs it knows. Add your own when a\n" +
+				"screen is being read as the wrong situation — or as none at all, which shows up\n" +
+				"as `unclassifiable` escalations in `hap escalations`.\n" +
+				"Operator rules are consulted BEFORE the shipped ones, in the order they were\n" +
+				"added, so position is precedence and `remove` takes the index from `list`.\n" +
+				"A rule needs at least one regex or keyword; approval and choice rules only fire\n" +
+				"while herdr reports the agent blocked.\n" +
+				"Repeat --regex/--keyword rather than comma-separating: a regex may contain a\n" +
+				"comma.",
+			Examples: []string{
+				"hap classifier list",
+				"hap classifier add --situation approval --agent-type claude --regex 'Do you want to proceed\\?'",
+				"hap classifier remove 0",
+			},
+			Next: []Hint{
+				{Cmd: "hap classifier list", Why: "every operator rule, with the index `remove` takes"},
+				{Cmd: "hap capture <agent>", Why: "re-classify a live pane to see the rule work"},
+			},
+			SelfHints: true,
+			Handler:   classifier,
+		},
+		{
+			Name:    "capture-delay",
+			Group:   groupConfigure,
+			Summary: "how long to wait after a herdr event before reading the pane",
+			Usage: []string{
+				"hap capture-delay [list]",
+				"hap capture-delay set <agent-type> <start-ms> <event-ms>",
+				"hap capture-delay remove <agent-type>",
+			},
+			Details: "An agent's TUI is still painting when herdr reports the event, so hap waits\n" +
+				"before reading the pane — longer for an agent's FIRST event (start-ms, default\n" +
+				"10000) than for later ones (event-ms, default 2000). Raise it when captures show\n" +
+				"shell scrollback or a half-drawn screen; lower it to answer faster.\n" +
+				"Rules are keyed by agent type, and \"*\" covers every type. Setting a type that\n" +
+				"already has a rule overwrites it, because the daemon reads the FIRST matching\n" +
+				"rule and a second one would never be reached. A 0 means \"use the built-in\n" +
+				"default for that one\"; `list` prints the delays actually in force, defaults\n" +
+				"resolved.",
+			Examples: []string{
+				"hap capture-delay list",
+				"hap capture-delay set claude 12000 2500",
+				"hap capture-delay remove claude",
+			},
+			Next: []Hint{
+				{Cmd: "hap capture-delay list", Why: "the delays in force, defaults resolved"},
+				{Cmd: "hap capture <agent>", Why: "capture a pane now and see what hap reads"},
+			},
+			SelfHints: true,
+			Handler:   captureDelay,
 		},
 		{
 			Name:    "task-source",
