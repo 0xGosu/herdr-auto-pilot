@@ -571,6 +571,52 @@ func TestInstallRetryAfterFailedRollbackKeepsTheRecoveryCopy(t *testing.T) {
 	}
 }
 
+// Two failures in sequence: a failed rollback has retained .hap-prev, and THEN
+// a later run is killed mid-swap with lib/ already moved into the holding
+// directory. That leftover is the only lib/ matching the still-live binary —
+// .hap-prev holds an older, different pair — so the next run must recover it,
+// not discard it because .hap-prev happens to be occupied.
+func TestInstallInterruptedSwapIsRecoveredNotDiscarded(t *testing.T) {
+	env := newInstallEnv(t, "0.6.1",
+		[]string{"v0.6.1"}, []release{{version: "0.6.1"}})
+	env.seedPriorInstall(t)
+
+	// Failure 1: the swap fails and restoring lib/ fails too, so the copy is
+	// retained under .hap-prev and lib/ is left absent.
+	if code, out := env.run(t, "HAP_TEST_MV_FAIL=*/.hap-*/lib"); code != 1 {
+		t.Fatalf("run 1 should have failed (exit %d):\n%s", code, out)
+	}
+	if !env.exists(".hap-prev/lib") {
+		t.Fatalf("run 1 did not retain a recovery copy")
+	}
+
+	// Failure 2: a run killed after moving lib/ aside but before the binary.
+	// Reconstructed directly — a real SIGKILL is not reproducible in a test.
+	// This lib/ is the mate of the binary that is still live.
+	if err := os.MkdirAll(filepath.Join(env.root, ".hap-swap", "lib"), 0o755); err != nil {
+		t.Fatalf("stage interrupted swap: %v", err)
+	}
+	writeFile(t, filepath.Join(env.root, ".hap-swap", "lib", "libinterrupted.so"),
+		[]byte("mate of the live binary\n"), 0o644)
+
+	// The next run fails early, so nothing it downloads replaces the debris.
+	code, out := env.run(t, "HAP_TEST_MV_FAIL=bin/hap")
+	if code != 1 {
+		t.Fatalf("run 3 should have failed (exit %d):\n%s", code, out)
+	}
+	body, err := os.ReadFile(filepath.Join(env.root, "lib", "libinterrupted.so"))
+	if err != nil {
+		t.Fatalf("the interrupted swap's lib/ was discarded instead of recovered: %v\n%s", err, out)
+	}
+	if string(body) != "mate of the live binary\n" {
+		t.Errorf("the recovered lib/ was corrupted:\n%s", out)
+	}
+	// The older pair is untouched — recovering one must not consume the other.
+	if !env.exists(".hap-prev/lib/libsentinel.so") {
+		t.Errorf("recovering the interrupted swap destroyed the older recovery copy:\n%s", out)
+	}
+}
+
 // The last-resort path: the swap fails AND putting the old files back fails
 // too. The saved copy is then the only surviving working install, so it must
 // NOT be deleted on the way out — the operator is told where it is.

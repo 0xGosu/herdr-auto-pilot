@@ -157,6 +157,41 @@ install_release() {
   return 0
 }
 
+# reclaim_swap — finish the rollback that a KILLED process never got to run.
+#
+# A leftover SWAP is the debris of an interrupted swap: it holds the OUTGOING
+# binary and lib/, which are the mates of whatever is still live. Deleting it
+# would throw away the only lib/ compatible with the live binary, and no other
+# copy of that pair exists — PREV, when it exists at all, holds an OLDER pair
+# from a different install, so "keep the older one" is the wrong criterion.
+# What matters is which copy goes with what is live.
+#
+# A COMPLETE pair in SWAP wins outright over the live files. The interruption
+# may have landed after the new lib/ was placed but before its binary was, and
+# restoring only what is missing would then pair an old binary with the new
+# lib/ — a mismatch preserved rather than repaired.
+reclaim_swap() {
+  local reclaimed=0
+  [ -d "$SWAP" ] || return 0
+  if [ -e "${SWAP}/lib" ] && [ -e "${SWAP}/hap" ]; then
+    rm -rf lib
+    rm -f "$DEST"
+  fi
+  if [ -e "${SWAP}/lib" ] && [ ! -e lib ]; then
+    mv "${SWAP}/lib" lib || return 1
+    reclaimed=1
+  fi
+  if [ -e "${SWAP}/hap" ] && [ ! -e "$DEST" ]; then
+    mkdir -p "$(dirname "$DEST")" || return 1
+    mv "${SWAP}/hap" "$DEST" || return 1
+    reclaimed=1
+  fi
+  [ "$reclaimed" = 1 ] && echo "note: recovered the previous install from an interrupted swap" >&2
+  # Anything left duplicates what is already live.
+  rm -rf "$SWAP"
+  return 0
+}
+
 # swap_in — replace bin/hap and lib/ with the staged payload, restoring the
 # previous ones if either move fails.
 #
@@ -172,13 +207,6 @@ install_release() {
 swap_in() {
   local saved_lib=0 saved_bin=0 placed_lib=0 placed_bin=0 restored=0
 
-  # A leftover SWAP means an earlier run was KILLED mid-swap, so it holds files
-  # that are no longer live. Move it aside as recovery data rather than
-  # deleting it; if PREV is already taken, that copy is the older and therefore
-  # better one, so it wins.
-  if [ -e "$SWAP" ] && [ ! -e "$PREV" ]; then
-    mv "$SWAP" "$PREV" 2>/dev/null || true
-  fi
   rm -rf "$SWAP"
   mkdir -p "$SWAP" || return 1
   mkdir -p "$(dirname "$DEST")" || return 1
@@ -351,6 +379,12 @@ release_available() {
 # seconds from existing — and substituting an older release there would be
 # worse than the wait. Only the CANDIDATES are probed, where a miss means the
 # release is genuinely absent.
+# Repair the debris of a previously killed run BEFORE anything else, so the
+# rest of this script sees a coherent install to replace. Fatal if it cannot:
+# proceeding would build a new SWAP on top of files that are the only copy of
+# the live binary's libraries.
+reclaim_swap || fail "could not recover the previous install from an interrupted swap; its files are at ${SWAP}"
+
 INSTALLED=""
 if install_release "$VERSION"; then
   INSTALLED="$VERSION"
