@@ -8,6 +8,18 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.1
+
+- Added `hap config classifier` — list, add and remove the operator rules that decide which situation a pane is showing. These were settable in config.toml only, so a screen hap read as the wrong situation could not be corrected from a shell.
+- Added `hap config capture-delay` — read and set how long the daemon waits after a herdr event before reading a pane, per agent type. The listing resolves the built-in defaults, so it shows the delays actually in force rather than only the overrides; setting a type that already has a rule overwrites it, since the daemon reads the first matching rule and a second would never be reached.
+- Added `hap config rules add --agent-type` and `hap config rules remove-scoped` — agent-scoped never-auto rules could be listed but not created or deleted from the CLI. A wildcard scope is refused: that is what the unscoped list already means.
+- Added `hap config env` — set, unset and list the environment handed to the LLM CLI, per command scope. Values are never printed by any listing and `set` reads the value from stdin unless `--value` is passed, so an API key never lands in shell history or another user's `ps` output.
+- Added `hap escalations retry <id>` — re-invoke the LLM on a consult that failed or timed out (and re-run a failed learn-from-correction). This was previously possible only from the TUI.
+- Added `hap status --stderr` — print the captured daemon stderr, not just the one-line summary the health line quotes.
+- Fixed `[[capture_delay]]` matching an agent type case-sensitively — the one place in hap where an operator's capitalization silently mattered. `agent_type = "Claude"` wrote a rule the daemon never read while every listing showed it in force; the match now folds case like every other agent-type comparison.
+- Changed: everything that writes config.toml is now a `hap config` subcommand — `hap rules`, `hap task-source`, `hap classifier` and `hap capture-delay` became `hap config rules`, `hap config task-source`, `hap config classifier` and `hap config capture-delay`. The old spellings still work and print a note naming the new one on stderr, so scripts parsing these listings keep working unchanged. `hap task` deliberately stays top-level: it edits checklist items in an agent's markdown file, not configuration.
+- Changed: every configuration key config.toml accepts now has a CLI command, and three tests fail the build if a new one ever ships without one, or outside `hap config`.
+
 ## 0.6.0
 
 - Added a provider column to `hap task-source list` and a task-store line to `hap status`, both shown only once something selects a non-default storage backend — an install that never touched the setting sees exactly the output it always did. Each row says whether its provider is inherited from the default or overridden on the source, because an inherited value and an identical override behave differently the next time you change the default.
