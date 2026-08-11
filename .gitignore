@@ -242,4 +242,5 @@ lib/
 
 # transient staging/rollback dirs used by scripts/install.sh
 .hap-install/
+.hap-swap/
 .hap-prev/

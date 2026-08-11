@@ -508,6 +508,69 @@ func TestInstallSwapFailureRestoresThePreviousInstall(t *testing.T) {
 	}
 }
 
+// The failure BETWEEN the two saves: lib/ has already been moved aside when
+// saving the binary fails. Returning early there would leave the old binary
+// live with its libraries stranded in the holding directory — a working
+// install turned unusable by a failed upgrade. Every failure after the first
+// live move has to reach the rollback.
+func TestInstallSwapFailureWhileSavingTheBinaryStillRestoresLib(t *testing.T) {
+	env := newInstallEnv(t, "0.6.1",
+		[]string{"v0.6.1"}, []release{{version: "0.6.1"}})
+	env.seedPriorInstall(t)
+
+	// Only the `mv bin/hap .hap-swap/hap` step has this exact source.
+	code, out := env.run(t, "HAP_TEST_MV_FAIL=bin/hap")
+	if code != 1 {
+		t.Fatalf("a failed swap must fail the install (exit %d):\n%s", code, out)
+	}
+	env.assertPriorInstallIntact(t, out)
+	if env.exists(".hap-swap/lib") || env.exists(".hap-prev/lib") {
+		t.Errorf("the previous lib/ was left stranded in a holding directory:\n%s", out)
+	}
+}
+
+// A retry after a failed rollback must not destroy the recovery copy before it
+// has succeeded. Clearing it up front means a second failure loses the last
+// complete install on the disk.
+func TestInstallRetryAfterFailedRollbackKeepsTheRecoveryCopy(t *testing.T) {
+	env := newInstallEnv(t, "0.6.1",
+		[]string{"v0.6.1"}, []release{{version: "0.6.1"}})
+	env.seedPriorInstall(t)
+
+	// Run 1: swap fails and the restore of lib/ fails too, so the copy is kept.
+	if code, out := env.run(t, "HAP_TEST_MV_FAIL=*/.hap-*/lib"); code != 1 {
+		t.Fatalf("run 1 should have failed (exit %d):\n%s", code, out)
+	}
+	if !env.exists(".hap-prev/lib/libsentinel.so") {
+		t.Fatalf("run 1 did not retain a recovery copy")
+	}
+
+	// Run 2: fails early, before anything is placed. The recovery copy from
+	// run 1 must still be there afterwards.
+	code, out := env.run(t, "HAP_TEST_MV_FAIL=bin/hap")
+	if code != 1 {
+		t.Fatalf("run 2 should have failed (exit %d):\n%s", code, out)
+	}
+	body, err := os.ReadFile(filepath.Join(env.root, ".hap-prev", "lib", "libsentinel.so"))
+	if err != nil {
+		t.Fatalf("a failed retry destroyed the recovery copy: %v\n%s", err, out)
+	}
+	if string(body) != "previous install\n" {
+		t.Errorf("the recovery copy was corrupted by the retry:\n%s", out)
+	}
+
+	// Run 3 succeeds, which is what legitimately clears the recovery copy.
+	if code, out := env.run(t); code != 0 {
+		t.Fatalf("run 3 should have succeeded (exit %d):\n%s", code, out)
+	}
+	if env.exists(".hap-prev") || env.exists(".hap-swap") {
+		t.Errorf("a successful install left holding directories behind")
+	}
+	if got := env.installedVersion(t); got != "0.6.1" {
+		t.Errorf("installed v%s, want v0.6.1", got)
+	}
+}
+
 // The last-resort path: the swap fails AND putting the old files back fails
 // too. The saved copy is then the only surviving working install, so it must
 // NOT be deleted on the way out — the operator is told where it is.

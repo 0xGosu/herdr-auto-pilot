@@ -71,11 +71,14 @@ TMP="$(mktemp -d)"
 # not under $TMP, so swapping it in is a rename rather than a cross-filesystem
 # copy — see swap_in. PREV holds the outgoing one until the swap succeeds.
 STAGE="${ROOT}/.hap-install"
+# SWAP holds the OUTGOING binary and lib/ while the new ones are moved in.
+SWAP="${ROOT}/.hap-swap"
+# PREV holds a copy retained because a rollback itself failed — the last
+# complete install on the disk. Only a SUCCESSFUL install clears it.
 PREV="${ROOT}/.hap-prev"
-# PREV is deliberately NOT cleaned here: if this process is killed mid-swap it
-# is the only copy of the working install left, and deleting it on the way out
-# would destroy exactly what it exists to protect. A later successful install
-# clears it.
+# Neither SWAP nor PREV is cleaned on exit: if this process is killed mid-swap
+# they hold the only copy of the working install, and deleting them on the way
+# out would destroy exactly what they exist to protect.
 trap 'rm -rf "$TMP" "$STAGE"' EXIT
 ATTEMPT=0
 
@@ -167,41 +170,77 @@ install_release() {
 # The binary and lib/ are swapped as a unit because neither works without the
 # other, so a failure at any point puts BOTH back.
 swap_in() {
-  local restored=0
-  rm -rf "$PREV"
-  mkdir -p "$PREV" || return 1
+  local saved_lib=0 saved_bin=0 placed_lib=0 placed_bin=0 restored=0
+
+  # A leftover SWAP means an earlier run was KILLED mid-swap, so it holds files
+  # that are no longer live. Move it aside as recovery data rather than
+  # deleting it; if PREV is already taken, that copy is the older and therefore
+  # better one, so it wins.
+  if [ -e "$SWAP" ] && [ ! -e "$PREV" ]; then
+    mv "$SWAP" "$PREV" 2>/dev/null || true
+  fi
+  rm -rf "$SWAP"
+  mkdir -p "$SWAP" || return 1
   mkdir -p "$(dirname "$DEST")" || return 1
 
-  if [ -e lib ]; then
-    mv lib "${PREV}/lib" || return 1
-  fi
-  if [ -e "$DEST" ]; then
-    mv "$DEST" "${PREV}/hap" || return 1
-  fi
+  # PREV is NOT cleared here. It only ever holds a copy retained because a
+  # previous rollback FAILED, which makes it the last complete install on the
+  # disk — clearing it before this run has succeeded would destroy the recovery
+  # data at the exact moment the retry might also fail.
 
-  if mv "${STAGE}/lib" lib && mv "${STAGE}/hap" "$DEST"; then
+  # Every move is recorded, because the rollback has to undo exactly the ones
+  # that happened and no others. A bare `return` anywhere in here would strand
+  # a half-moved install — the failure this whole function exists to prevent —
+  # so the block has ONE exit and each failure breaks out of it.
+  while :; do
+    if [ -e lib ]; then
+      mv lib "${SWAP}/lib" || break
+      saved_lib=1
+    fi
+    if [ -e "$DEST" ]; then
+      mv "$DEST" "${SWAP}/hap" || break
+      saved_bin=1
+    fi
+    mv "${STAGE}/lib" lib || break
+    placed_lib=1
+    mv "${STAGE}/hap" "$DEST" || break
+    placed_bin=1
+    break
+  done
+
+  if [ "$placed_bin" = 1 ]; then
     if [ "$OS" = "darwin" ] && command -v xattr >/dev/null 2>&1; then
       xattr -dr com.apple.quarantine lib 2>/dev/null || true
     fi
-    rm -rf "$PREV"
+    # The new install is complete and working, so the outgoing copy — and any
+    # recovery copy an earlier failure left behind — are both obsolete.
+    rm -rf "$SWAP" "$PREV"
     return 0
   fi
 
   echo "warning: could not put the new files in place; restoring the previous install" >&2
-  rm -rf lib
-  if [ -e "${PREV}/lib" ]; then
-    mv "${PREV}/lib" lib || restored=1
+  # Undo only what happened. Removing lib/ unconditionally would delete the
+  # LIVE one when the very first move is what failed.
+  [ "$placed_lib" = 1 ] && rm -rf lib
+  [ "$placed_bin" = 1 ] && rm -f "$DEST"
+  if [ "$saved_lib" = 1 ]; then
+    mv "${SWAP}/lib" lib || restored=1
   fi
-  if [ -e "${PREV}/hap" ]; then
-    mv "${PREV}/hap" "$DEST" || restored=1
+  if [ "$saved_bin" = 1 ]; then
+    mv "${SWAP}/hap" "$DEST" || restored=1
   fi
-  # Only discard the saved copy once it is definitely back in place. If even
-  # the restore failed, PREV is the last copy of a working install — say where
-  # it is instead of deleting it.
+
   if [ "$restored" = 0 ]; then
-    rm -rf "$PREV"
-  else
+    rm -rf "$SWAP"
+    return 1
+  fi
+  # The restore failed, so SWAP holds the only copy of files that are no longer
+  # live. Keep it, under PREV when that name is free so there is one place to
+  # look.
+  if [ ! -e "$PREV" ] && mv "$SWAP" "$PREV" 2>/dev/null; then
     echo "warning: the previous install could not be fully restored; it is kept at ${PREV}" >&2
+  else
+    echo "warning: the previous install could not be fully restored; it is kept at ${SWAP}" >&2
   fi
   return 1
 }
