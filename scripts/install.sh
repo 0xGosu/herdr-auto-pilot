@@ -100,11 +100,16 @@ verify() {
 }
 
 # install_release <version> — download the required trio for that release,
-# verify it, and only then touch the plugin directory. Returns non-zero when an
-# asset could not be DOWNLOADED (the release is not published, or not published
-# yet), which is the caller's cue to try an earlier release. A checksum
-# mismatch is different in kind — corruption or tampering, never a publishing
-# gap — so it fails hard here and is never answered with a downgrade.
+# verify it, and only then touch the plugin directory.
+#
+# THE CHECKSUM IS THE BOUNDARY. Before it, a failure means the RELEASE is not
+# there yet, and returning non-zero is the caller's cue to try an earlier one.
+# From the checksum onward the release has been proven present and intact, so
+# every remaining failure is about this machine (or an archive the release
+# shipped broken) — and each of those calls fail() instead. Substituting an
+# older release for a local problem would report the wrong cause and, on a full
+# disk, do it five times over. A checksum mismatch is fatal for its own
+# reason: corruption or tampering is never answered with a downgrade.
 #
 # `set -e` does not apply inside a function called from an `if`, so every step
 # whose failure must abort the attempt carries its own `|| return 1`. The two
@@ -137,20 +142,28 @@ install_release() {
   # REQUIRED — the binary is dynamically linked against them via an rpath of
   # <plugin>/lib, so a binary without them will not start, and the two must
   # never be installed independently.
+  # PAST THIS POINT NOTHING RETURNS — every failure is fatal. The assets are
+  # downloaded and their checksums check out, so the release is not the
+  # problem: what remains is this machine (a full or read-only disk) or an
+  # archive the release itself shipped broken. Returning here would tell the
+  # caller "try an older release", and a disk that cannot unpack one tarball
+  # cannot unpack five — it would grind through every candidate and then blame
+  # the download. An operator who does want an older release names it with
+  # HAP_VERSION.
+  #
   # CHECKED: a stale STAGE from a previous candidate still holds ITS lib/, and
   # tar would unpack this candidate's on top — shipping a mixture of two
   # releases' libraries.
-  rm -rf "$STAGE" || return 1
-  mkdir -p "$STAGE" || return 1
-  tar -xzf "${dir}/${NATIVE_ASSET}" -C "$STAGE" || return 1
-  [ -d "${STAGE}/lib" ] || return 1
+  rm -rf "$STAGE" || fail "could not clear the staging directory ${STAGE}"
+  mkdir -p "$STAGE" || fail "could not create the staging directory ${STAGE}"
+  tar -xzf "${dir}/${NATIVE_ASSET}" -C "$STAGE" ||
+    fail "could not unpack ${NATIVE_ASSET} for v${ver}
+(its checksum matched, so this is a local problem — or that release shipped a broken archive)"
+  [ -d "${STAGE}/lib" ] || fail "${NATIVE_ASSET} for v${ver} contains no lib/ directory"
   # Set the mode HERE so the swap can be a plain rename. `install` copies, and
   # a copy is the thing that can fail halfway.
-  install -m 755 "${dir}/${ASSET}" "${STAGE}/hap" || return 1
+  install -m 755 "${dir}/${ASSET}" "${STAGE}/hap" || fail "could not stage the binary in ${STAGE}"
 
-  # A failed swap is a LOCAL problem (a full or read-only disk), not a
-  # publishing gap, so it is fatal rather than a cue to try an earlier release
-  # — every candidate would fail the same way, just more slowly.
   swap_in || fail "could not put v${ver} in place; the previous install has been restored"
   rm -rf "$STAGE"
   echo "installed ${ASSET} v${ver} at ${DEST}"

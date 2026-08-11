@@ -36,6 +36,12 @@ type release struct {
 	// corrupt makes SHA256SUMS disagree with the binary it ships, which is
 	// the shape of a truncated download or a tampered asset.
 	corrupt bool
+	// badArchive ships a native tarball that is not valid gzip but whose
+	// checksum is computed over those very bytes — so it downloads and
+	// verifies cleanly and only fails at unpack time. That is the shape of a
+	// release built broken, and the only way to reach the post-checksum
+	// assembly failures without a shim.
+	badArchive bool
 }
 
 // installEnv is a throwaway plugin directory plus the fake release store the
@@ -141,6 +147,9 @@ func (e *installEnv) publish(t *testing.T, rel release) {
 	// releases apart.
 	bin := []byte("#!/bin/sh\necho hap v" + rel.version + "\nexit 0\n")
 	tarball := mustTarGz(t)
+	if rel.badArchive {
+		tarball = []byte("this is not a gzip stream\n")
+	}
 	model := []byte("fake embedding model\n")
 
 	writeFile(t, filepath.Join(dir, binary), bin, 0o644)
@@ -919,4 +928,29 @@ func TestInstallRollbackKeepsTheSavedCopyWhenClearingFails(t *testing.T) {
 		t.Errorf("the saved copy was discarded after a failed clear:\n%s", out)
 	}
 	mustContain(t, out, "could not be fully restored")
+}
+
+// The checksum is the boundary between "try an earlier release" and "stop".
+// Once the assets have downloaded and verified, the release is proven present
+// and intact, so anything that fails after that is about this machine — a full
+// or read-only disk — or an archive the release shipped broken. Substituting
+// an older release there reports the wrong cause, and on a full disk it would
+// do so once per candidate before blaming the download.
+func TestInstallPostChecksumFailureIsFatalAndNeverFallsBack(t *testing.T) {
+	env := newInstallEnv(t, "0.6.2",
+		[]string{"v0.6.1", "v0.6.2"},
+		// v0.6.2 downloads and verifies, then fails to unpack. v0.6.1 is
+		// perfectly installable — and must NOT be installed.
+		[]release{{version: "0.6.1"}, {version: "0.6.2", badArchive: true}})
+	env.seedPriorInstall(t)
+
+	code, out := env.run(t)
+	if code != 1 {
+		t.Fatalf("an unpack failure must be fatal (exit %d):\n%s", code, out)
+	}
+	mustContain(t, out, "could not unpack")
+	mustNotContain(t, out, "looking for an earlier release", "installed hap-")
+	// The previous install is untouched: nothing live is touched until the
+	// whole payload has been assembled.
+	env.assertPriorInstallIntact(t, out)
 }
