@@ -239,3 +239,8 @@ mind.mv2.lock
 models/*.gguf
 lib/
 .cache/
+
+# transient staging/rollback dirs used by scripts/install.sh
+.hap-install/
+.hap-swap/
+.hap-prev/

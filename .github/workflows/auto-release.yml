@@ -12,10 +12,13 @@ name: Auto Release
 # 2. It tags that bump commit vNEXT and pushes the tag with the PAT — the
 #    tag push fires the standard tag-driven release.yml, unchanged. Once
 #    the release publishes, main's manifest and the newest release agree
-#    again. During the build (~15 min) installs from main can still 404
+#    again. During the build (~15 min) main names a version with no assets
 #    (install.sh's ~60s curl retry only bridges the post-publish upload
-#    gap) — the one, self-resolving window; pinned --ref installs are
-#    never affected.
+#    gap, not the build) — the one, self-resolving window. install.sh
+#    covers it by falling back to the newest earlier release that HAS
+#    assets, warning which version it installed. A --ref pin avoids that
+#    path only by naming an already-published release: install.sh reads
+#    the manifest and cannot see the git ref.
 #
 # Manual minor/major (the reserved path): overwrite `version` in your
 # feature PR (e.g. 0.4.0). On merge the manifest version has no tag, so

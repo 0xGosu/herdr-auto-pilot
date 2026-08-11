@@ -184,10 +184,18 @@ manifest pointing at an unreleased version 404s every install.
   never builds. The workflow refuses to tag such a commit. `[skip release]` (our custom
   marker) is safe on tagged commits but suppresses auto-release itself, so keep the literal
   string out of ordinary merge messages too.
-- Between the bump merge and the release publishing (~15 min), installs from main can fail
-  with 404 — install.sh's ~60 s curl retry only bridges the post-publish upload gap, not
-  the build. Retry once the release publishes; pinned `--ref vX.Y.Z` installs are never
-  affected.
+- Between the bump merge and the release publishing (~15 min), main's manifest names a
+  version with no assets — install.sh's ~60 s curl retry only bridges the post-publish
+  upload gap, not the build. Installs no longer 404 there: install.sh **falls back to the
+  newest earlier release that has assets** (git tags, newest-first, HEAD-probed), warns
+  loudly which version it actually installed, and leaves the operator to `hap update` once
+  the intended one publishes. The fallback is refused for an explicit `HAP_VERSION` pin,
+  under `HAP_NO_FALLBACK` (any NON-EMPTY value — set-but-empty means unset, matching
+  `HAP_VERSION=`), and on a checksum mismatch — corruption is never
+  answered with a downgrade. `--ref vX.Y.Z` is NOT one of those refusals: it pins the git
+  clone, which install.sh cannot see, so it only avoids the fallback by naming a release
+  that already has assets. Detached HEAD is not a usable substitute signal either, because
+  auto-release tags the bump commit on main.
 - If the release BUILD fails after the tag exists, re-run the failed release.yml run; do
   not re-run auto-release (it would advance versions).
 
