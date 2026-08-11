@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.3
+
+- Added `path`, `agent`, `workspace` and `template` to `hap config task-source set`, so every field of a task source is now editable in place. Changing one of them used to mean removing the source and re-adding it — retyping every other field, and renumbering every later source, to change one. The three that re-point a source report what they changed from and say so plainly: the next hand-out comes from a different list, or goes to a different agent. Nothing is copied or removed either way; an empty agent or workspace matches any of them and says so; a relative path is resolved against your shell's working directory (the daemon runs from the state dir); and a whitespace-only template clears back to the built-in default rather than being delivered as the prompt.
+- Changed `hap config task-source set` and `remove` to accept the AGENT NAME a source feeds, not only its positional index — the index is what `list` prints, but it moves whenever an earlier source is removed, so a number you remembered can silently mean a different entry. `#0` is still accepted verbatim so a listing row can be copied without editing it; a name matching no source, or more than one, is refused naming the indexes that disambiguate it.
+- Changed `hap config task-source list` to end with follow-ups that name a REAL source rather than telling you to run the listing you just ran, and the empty listing now points at `add` instead.
+- Fixed `hap config task-source add --agent 3` and `set <ref> agent 3` being accepted: a bare number is how the CLI addresses a source by INDEX, so a numerically-named source was permanently unaddressable by name while the same token silently meant a position. Refused where it would be written; a real pane or agent id (`1-1`) is unaffected.
+
 ## 0.6.2
 
 - Changed the installer to fall back to the newest earlier release when the version the plugin declares has no downloadable assets yet, so `herdr plugin install` and `hap update` keep working during the ~15 minutes a release spends building (and indefinitely if that build fails) instead of failing with a 404. The install says loudly which version it actually installed; run `hap update` once the intended one publishes.
