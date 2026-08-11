@@ -2689,7 +2689,7 @@ func resolveTaskFilePath(cfg config.Config, agent string) (string, error) {
 		if workspaceOnly {
 			return "", fmt.Errorf("no task source is scoped to agent %q; workspace-scoped sources exist but aren't addressable by name — use --path <file>", agent)
 		}
-		return "", fmt.Errorf("no task source for agent %q; add one first: hap task-source add --agent %s <checklist.md>", agent, agent)
+		return "", fmt.Errorf("no task source for agent %q; add one first: hap config task-source add --agent %s <checklist.md>", agent, agent)
 	default:
 		paths := make([]string, len(matches))
 		for i, m := range matches {

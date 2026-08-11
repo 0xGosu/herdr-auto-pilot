@@ -38,11 +38,12 @@ func TestNextStepsFooterPrinted(t *testing.T) {
 		args []string
 		want string // a command the footer must suggest
 	}{
-		{verb: "audit", want: "hap signatures show"},                   // static, from the registry
-		{verb: "escalations", want: "hap confirm"},                     // dynamic, carries a live id
-		{verb: "kill-history", want: "hap status"},                     // static
-		{verb: "signatures", want: "hap escalations"},                  // dynamic, empty-state branch
-		{verb: "rules", args: []string{"list"}, want: "hap rules add"}, // dynamic, list branch
+		{verb: "audit", want: "hap signatures show"},  // static, from the registry
+		{verb: "escalations", want: "hap confirm"},    // dynamic, carries a live id
+		{verb: "kill-history", want: "hap status"},    // static
+		{verb: "signatures", want: "hap escalations"}, // dynamic, empty-state branch
+		// dynamic, list branch — addressed the way it is now spelled, `hap config rules`.
+		{verb: "config", args: []string{"rules", "list"}, want: "hap config rules add"},
 	}
 	for _, tc := range cases {
 		out, err := run(t, app, tc.verb, tc.args...)

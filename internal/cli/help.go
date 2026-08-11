@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -31,8 +32,24 @@ type FlagDoc struct {
 
 // Command is one CLI verb with everything needed to run and explain it.
 type Command struct {
+	// Name is the canonical spelling, and may be TWO words for a `hap config`
+	// topic ("config rules"). Run resolves the longer spelling first, so a
+	// two-word entry is dispatched without its parent verb's handler having to
+	// route to it.
 	Name    string
 	Aliases []string
+	// MovedFrom lists former TOP-LEVEL spellings that still dispatch here but
+	// print a one-line migration note. Everything that writes config.toml now
+	// lives under `hap config`; the old spellings keep working so existing
+	// scripts — and hap's own older audit rows and hints — do not break.
+	//
+	// Distinct from Aliases, which are equal spellings nobody is being moved
+	// off (`sigs` for `signatures`): only a MovedFrom hit prints the note.
+	MovedFrom []string
+	// Hidden keeps the entry out of `hap help`'s command list. The `hap config`
+	// topics are hidden because their parent already lists them; they are still
+	// fully documented (`hap help config rules`) and Lookup still resolves them.
+	Hidden  bool
 	Group   string
 	Summary string
 	// Usage lists every accepted syntax form, including subcommands.
@@ -264,7 +281,7 @@ func buildCommands() {
 			Examples: []string{"hap rename %12 vivid-falcon", "hap task vivid-falcon list"},
 			Next: []Hint{
 				{Cmd: "hap agents", Why: "confirm the new name"},
-				{Cmd: "hap task-source list", Why: "check which sources select this name"},
+				{Cmd: "hap config task-source list", Why: "check which sources select this name"},
 			},
 			Handler: rename,
 		},
@@ -609,7 +626,7 @@ func buildCommands() {
 		{
 			Name:    "config",
 			Group:   groupConfigure,
-			Summary: "show and edit configuration (thresholds, learning, limits, LLM, embedding)",
+			Summary: "everything that writes config.toml — settings, safety rules, task sources",
 			Usage: []string{
 				"hap config [show]",
 				"hap config fields",
@@ -619,11 +636,21 @@ func buildCommands() {
 				"hap config env [list [<scope>]]",
 				"hap config env set <scope> <NAME> [--value V]",
 				"hap config env unset <scope> <NAME>",
+				"hap config rules …          (hap help config rules)",
+				"hap config task-source …    (hap help config task-source)",
+				"hap config classifier …     (hap help config classifier)",
+				"hap config capture-delay …  (hap help config capture-delay)",
 			},
 			Flags: []FlagDoc{
 				{Name: "--value", Arg: "V", Desc: "config env set: the value; omit it and the value is read from stdin, which keeps a secret out of shell history and `ps`"},
 			},
-			Details: "`fields` lists every settable field with its current value — that is the\n" +
+			Details: "Every command that writes config.toml lives here — nothing else in hap does,\n" +
+				"so `hap config …` is the whole surface and the file never has to be opened by\n" +
+				"hand. Each topic has its own guide: `hap help config rules`, and likewise for\n" +
+				"task-source, classifier and capture-delay.\n" +
+				"(`hap task` is deliberately NOT here: it edits the checklist items inside an\n" +
+				"agent's markdown file, which is not configuration.)\n\n" +
+				"`fields` lists every settable field with its current value — that is the\n" +
 				"authoritative list of names for `set` (dotted, e.g. llm.timeout_seconds).\n" +
 				"`set` writes config.toml and reloads the running daemon; no restart needed.\n" +
 				"`set-threshold` is the shorthand for confidence_thresholds.*: how confident a\n" +
@@ -635,14 +662,19 @@ func buildCommands() {
 				"VALUE — `env list` shows names only — and `env set` reads the value from stdin\n" +
 				"unless you pass --value. For values you would rather keep out of config.toml\n" +
 				"entirely, set an env file instead (`hap config set llm.env_file <path>`).\n\n" +
-				"The array sections of config.toml have their own verbs, since one key=value\n" +
-				"cannot address a list element: `hap rules` (never-auto patterns), `hap\n" +
-				"task-source`, `hap classifier`, `hap capture-delay`.",
+				"The array sections of config.toml have their own topics, since one key=value\n" +
+				"cannot address a list element: `rules` (never-auto patterns), `task-source`,\n" +
+				"`classifier`, `capture-delay`.\n" +
+				"Those four were top-level verbs (`hap rules …`) before everything that writes\n" +
+				"config.toml was gathered here. The old spellings still work and print a note\n" +
+				"naming the new one.",
 			Examples: []string{
 				"hap config fields",
 				"hap config set learning.graduation_n 3",
 				"hap config set-threshold approval 0.80",
 				"echo -n \"$ANTHROPIC_API_KEY\" | hap config env set command ANTHROPIC_API_KEY",
+				"hap config rules list",
+				"hap config task-source add --agent vivid-falcon ./docs/tasks.md",
 			},
 			Next: []Hint{
 				{Cmd: "hap config fields", Why: "list every field and its current value"},
@@ -655,16 +687,18 @@ func buildCommands() {
 			Handler:   configCmd,
 		},
 		{
-			Name:    "rules",
-			Group:   groupConfigure,
-			Summary: "never-auto safety patterns (situations hap must never answer alone)",
+			Name:      "config rules",
+			MovedFrom: []string{"rules"},
+			Hidden:    true,
+			Group:     groupConfigure,
+			Summary:   "never-auto safety patterns (situations hap must never answer alone)",
 			Usage: []string{
-				"hap rules [list]",
-				"hap rules add [--agent-type T[,T]] <regex>",
-				"hap rules remove <index>",
-				"hap rules remove-scoped <index>",
-				"hap rules disable-seed <id>",
-				"hap rules enable-seed <id>",
+				"hap config rules [list]",
+				"hap config rules add [--agent-type T[,T]] <regex>",
+				"hap config rules remove <index>",
+				"hap config rules remove-scoped <index>",
+				"hap config rules disable-seed <id>",
+				"hap config rules enable-seed <id>",
 			},
 			Flags: []FlagDoc{
 				{Name: "--agent-type", Arg: "T", Desc: "add: limit the rule to these agent types (comma-separated, e.g. claude,codex) instead of every agent"},
@@ -694,30 +728,32 @@ func buildCommands() {
 				"The pattern may start with a dash (`--force`, `-rf /`) and is taken literally —\n" +
 				"only `--agent-type` is read as a flag, in either position.",
 			Examples: []string{
-				"hap rules list",
-				"hap rules add '(?i)force[- ]push'",
-				"hap rules add --agent-type codex '(?i)apply patch'",
-				"hap rules remove 0",
-				"hap rules remove-scoped 0",
-				"hap rules disable-seed <id from rules list>",
+				"hap config rules list",
+				"hap config rules add '(?i)force[- ]push'",
+				"hap config rules add --agent-type codex '(?i)apply patch'",
+				"hap config rules remove 0",
+				"hap config rules remove-scoped 0",
+				"hap config rules disable-seed <id from rules list>",
 			},
 			Next: []Hint{
-				{Cmd: "hap rules list", Why: "every rule, with the index `remove` and the id `disable-seed` take"},
-				{Cmd: "hap rules add <regex>", Why: "force a situation to always ask a human"},
-				{Cmd: "hap rules disable-seed <id>", Why: "silence a builtin rule that keeps over-escalating"},
+				{Cmd: "hap config rules list", Why: "every rule, with the index `remove` and the id `disable-seed` take"},
+				{Cmd: "hap config rules add <regex>", Why: "force a situation to always ask a human"},
+				{Cmd: "hap config rules disable-seed <id>", Why: "silence a builtin rule that keeps over-escalating"},
 			},
 			// list and add/remove want opposite follow-ups, so the handler picks.
 			SelfHints: true,
 			Handler:   rules,
 		},
 		{
-			Name:    "classifier",
-			Group:   groupConfigure,
-			Summary: "operator rules deciding which situation a pane is showing",
+			Name:      "config classifier",
+			MovedFrom: []string{"classifier"},
+			Hidden:    true,
+			Group:     groupConfigure,
+			Summary:   "operator rules deciding which situation a pane is showing",
 			Usage: []string{
-				"hap classifier [list]",
-				"hap classifier add --situation S [--agent-type T] [--regex RE]... [--keyword KW]...",
-				"hap classifier remove <index>",
+				"hap config classifier [list]",
+				"hap config classifier add --situation S [--agent-type T] [--regex RE]... [--keyword KW]...",
+				"hap config classifier remove <index>",
 			},
 			Flags: []FlagDoc{
 				{Name: "--situation", Arg: "S", Desc: "what a match means: approval, choice, error or idle"},
@@ -735,25 +771,27 @@ func buildCommands() {
 				"Repeat --regex/--keyword rather than comma-separating: a regex may contain a\n" +
 				"comma.",
 			Examples: []string{
-				"hap classifier list",
-				"hap classifier add --situation approval --agent-type claude --regex 'Do you want to proceed\\?'",
-				"hap classifier remove 0",
+				"hap config classifier list",
+				"hap config classifier add --situation approval --agent-type claude --regex 'Do you want to proceed\\?'",
+				"hap config classifier remove 0",
 			},
 			Next: []Hint{
-				{Cmd: "hap classifier list", Why: "every operator rule, with the index `remove` takes"},
+				{Cmd: "hap config classifier list", Why: "every operator rule, with the index `remove` takes"},
 				{Cmd: "hap capture <agent>", Why: "re-classify a live pane to see the rule work"},
 			},
 			SelfHints: true,
 			Handler:   classifier,
 		},
 		{
-			Name:    "capture-delay",
-			Group:   groupConfigure,
-			Summary: "how long to wait after a herdr event before reading the pane",
+			Name:      "config capture-delay",
+			MovedFrom: []string{"capture-delay"},
+			Hidden:    true,
+			Group:     groupConfigure,
+			Summary:   "how long to wait after a herdr event before reading the pane",
 			Usage: []string{
-				"hap capture-delay [list]",
-				"hap capture-delay set <agent-type> <start-ms> <event-ms>",
-				"hap capture-delay remove <agent-type>",
+				"hap config capture-delay [list]",
+				"hap config capture-delay set <agent-type> <start-ms> <event-ms>",
+				"hap config capture-delay remove <agent-type>",
 			},
 			Details: "An agent's TUI is still painting when herdr reports the event, so hap waits\n" +
 				"before reading the pane — longer for an agent's FIRST event (start-ms, default\n" +
@@ -765,26 +803,28 @@ func buildCommands() {
 				"default for that one\"; `list` prints the delays actually in force, defaults\n" +
 				"resolved.",
 			Examples: []string{
-				"hap capture-delay list",
-				"hap capture-delay set claude 12000 2500",
-				"hap capture-delay remove claude",
+				"hap config capture-delay list",
+				"hap config capture-delay set claude 12000 2500",
+				"hap config capture-delay remove claude",
 			},
 			Next: []Hint{
-				{Cmd: "hap capture-delay list", Why: "the delays in force, defaults resolved"},
+				{Cmd: "hap config capture-delay list", Why: "the delays in force, defaults resolved"},
 				{Cmd: "hap capture <agent>", Why: "capture a pane now and see what hap reads"},
 			},
 			SelfHints: true,
 			Handler:   captureDelay,
 		},
 		{
-			Name:    "task-source",
-			Group:   groupConfigure,
-			Summary: "declare which checklist file feeds which agent (the config, not the items)",
+			Name:      "config task-source",
+			MovedFrom: []string{"task-source"},
+			Hidden:    true,
+			Group:     groupConfigure,
+			Summary:   "declare which checklist file feeds which agent (the config, not the items)",
 			Usage: []string{
-				"hap task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] <checklist.md>",
-				"hap task-source list",
-				"hap task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks> <value>",
-				"hap task-source remove <index>",
+				"hap config task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] <checklist.md>",
+				"hap config task-source list",
+				"hap config task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks> <value>",
+				"hap config task-source remove <index>",
 			},
 			Flags: []FlagDoc{
 				{Name: "--agent", Arg: "A", Desc: "agent short name, id, or type this source applies to"},
@@ -814,13 +854,13 @@ func buildCommands() {
 				"is rewritten on the next save, but the CLI refuses it.\n" +
 				"Use `hap task` to manage the ITEMS inside the file.",
 			Examples: []string{
-				"hap task-source add --agent vivid-falcon --max-tasks 20 ./docs/tasks.md",
-				"hap task-source list",
-				"hap task-source set 0 auto-send-when-idle true",
-				"hap task-source set 0 enable-llm-review-before-auto-send true",
+				"hap config task-source add --agent vivid-falcon --max-tasks 20 ./docs/tasks.md",
+				"hap config task-source list",
+				"hap config task-source set 0 auto-send-when-idle true",
+				"hap config task-source set 0 enable-llm-review-before-auto-send true",
 			},
 			Next: []Hint{
-				{Cmd: "hap task-source list", Why: "confirm the source and its index"},
+				{Cmd: "hap config task-source list", Why: "confirm the source and its index"},
 				{Cmd: "hap task <agent> list", Why: "see the items the agent will get"},
 			},
 			Handler: taskSource,
@@ -876,7 +916,7 @@ func buildCommands() {
 			},
 			Next: []Hint{
 				{Cmd: "hap task <agent> list", Why: "the items, with their numbers"},
-				{Cmd: "hap task-source list", Why: "which file an agent's list comes from"},
+				{Cmd: "hap config task-source list", Why: "which file an agent's list comes from"},
 				{Cmd: "hap agents", Why: "the agent names these commands take"},
 			},
 			SelfHints: true,
@@ -911,7 +951,21 @@ func buildCommands() {
 		for _, a := range c.Aliases {
 			commandIndex[a] = c
 		}
+		// A moved spelling resolves like any other key; Run tells it apart from
+		// the canonical one to print the migration note.
+		for _, a := range c.MovedFrom {
+			commandIndex[a] = c
+		}
 	}
+}
+
+// MovedFromSpelling reports whether verb reached c through a former top-level
+// spelling rather than its canonical name.
+func MovedFromSpelling(c *Command, verb string) bool {
+	if c == nil {
+		return false
+	}
+	return slices.Contains(c.MovedFrom, verb)
 }
 
 // workflows are the multi-step recipes `hap help` prints after the command
@@ -944,8 +998,8 @@ var workflows = []struct {
 		Title: "Set up a task list for an agent",
 		Steps: []string{
 			"hap rename <pane-id> <name>           # give the agent a stable short name",
-			"hap task-source add --agent <name> ./docs/tasks.md",
-			"hap task-source list                  # confirm it, note the index",
+			"hap config task-source add --agent <name> ./docs/tasks.md",
+			"hap config task-source list                  # confirm it, note the index",
 			"hap task <name> list                  # the agent sees these items",
 		},
 	},
@@ -987,6 +1041,11 @@ func Overview(out io.Writer) {
 	cmds := Commands()
 	width := 0
 	for _, c := range cmds {
+		// Hidden entries are not printed, so their (longer, two-word) names
+		// must not pad the column either.
+		if c.Hidden {
+			continue
+		}
 		if n := len(c.Name); n > width {
 			width = n
 		}
@@ -995,7 +1054,7 @@ func Overview(out io.Writer) {
 		printed := false
 		for i := range cmds {
 			c := &cmds[i]
-			if c.Group != g {
+			if c.Group != g || c.Hidden {
 				continue
 			}
 			if !printed {
@@ -1007,6 +1066,17 @@ func Overview(out io.Writer) {
 				name += " (" + strings.Join(c.Aliases, ", ") + ")"
 			}
 			fmt.Fprintf(out, "  %-*s  %s\n", width+10, name, c.Summary)
+			// A parent's hidden topics are listed under it: they are the only
+			// way to reach them, and leaving them out of `hap help` entirely
+			// would make everything that writes config.toml undiscoverable.
+			for j := range cmds {
+				sub := &cmds[j]
+				if !sub.Hidden || !strings.HasPrefix(sub.Name, c.Name+" ") {
+					continue
+				}
+				fmt.Fprintf(out, "  %-*s  %s\n", width+10,
+					"  "+strings.TrimPrefix(sub.Name, c.Name+" "), sub.Summary)
+			}
 		}
 	}
 

@@ -3,7 +3,7 @@ package cli
 // CLI surface for the STRUCTURED config sections — the config.toml arrays and
 // maps that `config set <key> <value>` cannot express: [[classifier]],
 // [[capture_delay]] and the per-command [llm.*_env] tables. (The scoped
-// [[safety.never_auto_rules]] list is edited through `hap rules`, beside the
+// [[safety.never_auto_rules]] list is edited through `hap config rules`, beside the
 // flat patterns it belongs with.)
 //
 // They are verbs rather than `config set` keys because a list element is
@@ -35,7 +35,7 @@ func (r *repeatedFlag) Set(v string) error {
 	return nil
 }
 
-// classifier implements `hap classifier` — the operator rules that decide which
+// classifier implements `hap config classifier` — the operator rules that decide which
 // situation a pane is showing, consulted before the shipped defaults.
 func classifier(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) == 0 || args[0] == "list" {
@@ -47,7 +47,7 @@ func classifier(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	case "remove", "rm", "delete":
 		return classifierRemove(ctx, app, out, args[1:])
 	}
-	return fmt.Errorf("usage: classifier [list|add --situation S [--agent-type T] [--regex RE]... [--keyword KW]...|remove <index>] (see: hap help classifier)")
+	return fmt.Errorf("usage: hap config classifier [list|add --situation S [--agent-type T] [--regex RE]... [--keyword KW]...|remove <index>] (see: hap help config classifier)")
 }
 
 func classifierList(app *frontend.App, out io.Writer) error {
@@ -64,9 +64,9 @@ func classifierList(app *frontend.App, out io.Writer) error {
 			orDash(strings.Join(r.Regex, " | ")), orDash(strings.Join(r.Keywords, ", ")))
 	}
 	PrintNextSteps(out, []Hint{
-		{Cmd: "hap classifier add --situation approval --regex 'RE'", Why: "teach hap to recognize a screen its defaults miss"},
-		{Cmd: "hap classifier remove <index>", Why: "drop one of the rules listed above"},
-		{Cmd: "hap capture-delay list", Why: "when the pane is read, if a rule matches the wrong frame"},
+		{Cmd: "hap config classifier add --situation approval --regex 'RE'", Why: "teach hap to recognize a screen its defaults miss"},
+		{Cmd: "hap config classifier remove <index>", Why: "drop one of the rules listed above"},
+		{Cmd: "hap config capture-delay list", Why: "when the pane is read, if a rule matches the wrong frame"},
 	})
 	return nil
 }
@@ -83,14 +83,14 @@ func classifierAdd(ctx context.Context, app *frontend.App, out io.Writer, args [
 		return err
 	}
 	if fs.NArg() > 0 {
-		return fmt.Errorf("unexpected argument %q — every part of a classifier rule is a flag (see: hap help classifier)", fs.Arg(0))
+		return fmt.Errorf("unexpected argument %q — every part of a classifier rule is a flag (see: hap help config classifier)", fs.Arg(0))
 	}
 	if err := app.AddClassifierRule(ctx, *agentType, *situation, regexes, keywords); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "classifier rule added: agent_type=%s situation=%s\n", *agentType, strings.ToLower(*situation))
 	PrintNextSteps(out, []Hint{
-		{Cmd: "hap classifier list", Why: "the full set, with the indexes `remove` takes"},
+		{Cmd: "hap config classifier list", Why: "the full set, with the indexes `remove` takes"},
 		{Cmd: "hap capture <agent>", Why: "re-classify a live pane and see what the rule does to it"},
 	})
 	return nil
@@ -98,18 +98,18 @@ func classifierAdd(ctx context.Context, app *frontend.App, out io.Writer, args [
 
 func classifierRemove(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: classifier remove <index> (see: classifier list)")
+		return fmt.Errorf("usage: hap config classifier remove <index> (see: hap config classifier list)")
 	}
 	idx, err := strconv.Atoi(strings.TrimPrefix(args[0], "#"))
 	if err != nil {
-		return fmt.Errorf("invalid classifier rule index %q (see: classifier list)", args[0])
+		return fmt.Errorf("invalid classifier rule index %q (see: hap config classifier list)", args[0])
 	}
 	cfg, err := app.Config()
 	if err != nil {
 		return err
 	}
 	if idx < 0 || idx >= len(cfg.Classifier) {
-		return fmt.Errorf("no classifier rule #%d (see: classifier list)", idx)
+		return fmt.Errorf("no classifier rule #%d (see: hap config classifier list)", idx)
 	}
 	expected := cfg.Classifier[idx]
 	if err := app.RemoveClassifierRule(ctx, idx, expected); err != nil {
@@ -117,11 +117,11 @@ func classifierRemove(ctx context.Context, app *frontend.App, out io.Writer, arg
 	}
 	fmt.Fprintf(out, "classifier rule #%d removed: agent_type=%s situation=%s\n",
 		idx, orDash(expected.AgentType), expected.Situation)
-	PrintNextSteps(out, []Hint{{Cmd: "hap classifier list", Why: "the remaining rules, renumbered"}})
+	PrintNextSteps(out, []Hint{{Cmd: "hap config classifier list", Why: "the remaining rules, renumbered"}})
 	return nil
 }
 
-// captureDelay implements `hap capture-delay` — how long the daemon waits after
+// captureDelay implements `hap config capture-delay` — how long the daemon waits after
 // a herdr event before reading the pane, per agent type.
 func captureDelay(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) == 0 || args[0] == "list" {
@@ -132,16 +132,16 @@ func captureDelay(ctx context.Context, app *frontend.App, out io.Writer, args []
 		return captureDelaySet(ctx, app, out, args[1:])
 	case "remove", "rm", "delete", "reset":
 		if len(args) != 2 {
-			return fmt.Errorf("usage: capture-delay remove <agent-type> (see: capture-delay list)")
+			return fmt.Errorf("usage: hap config capture-delay remove <agent-type> (see: hap config capture-delay list)")
 		}
 		if err := app.RemoveCaptureDelay(ctx, args[1]); err != nil {
 			return err
 		}
 		fmt.Fprintf(out, "capture delay for %s removed — the built-in defaults apply again\n", args[1])
-		PrintNextSteps(out, []Hint{{Cmd: "hap capture-delay list", Why: "what is still overridden"}})
+		PrintNextSteps(out, []Hint{{Cmd: "hap config capture-delay list", Why: "what is still overridden"}})
 		return nil
 	}
-	return fmt.Errorf("usage: capture-delay [list|set <agent-type> <start-ms> <event-ms>|remove <agent-type>] (see: hap help capture-delay)")
+	return fmt.Errorf("usage: hap config capture-delay [list|set <agent-type> <start-ms> <event-ms>|remove <agent-type>] (see: hap help config capture-delay)")
 }
 
 func captureDelayList(app *frontend.App, out io.Writer) error {
@@ -163,15 +163,15 @@ func captureDelayList(app *frontend.App, out io.Writer) error {
 			agentType, cfg.CaptureDelay(agentType, true), cfg.CaptureDelay(agentType, false))
 	}
 	PrintNextSteps(out, []Hint{
-		{Cmd: "hap capture-delay set claude 10000 2000", Why: "wait longer before reading a pane that is still painting"},
-		{Cmd: "hap capture-delay remove claude", Why: "back to the built-in defaults for that agent type"},
+		{Cmd: "hap config capture-delay set claude 10000 2000", Why: "wait longer before reading a pane that is still painting"},
+		{Cmd: "hap config capture-delay remove claude", Why: "back to the built-in defaults for that agent type"},
 	})
 	return nil
 }
 
 func captureDelaySet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	if len(args) != 3 {
-		return fmt.Errorf("usage: capture-delay set <agent-type> <start-ms> <event-ms> (0 keeps the built-in default for that one)")
+		return fmt.Errorf("usage: hap config capture-delay set <agent-type> <start-ms> <event-ms> (0 keeps the built-in default for that one)")
 	}
 	startMs, err := strconv.Atoi(args[1])
 	if err != nil {
@@ -185,7 +185,7 @@ func captureDelaySet(ctx context.Context, app *frontend.App, out io.Writer, args
 		return err
 	}
 	fmt.Fprintf(out, "capture delay for %s: start_ms=%d event_ms=%d\n", args[0], startMs, eventMs)
-	PrintNextSteps(out, []Hint{{Cmd: "hap capture-delay list", Why: "the delays now in force, defaults resolved"}})
+	PrintNextSteps(out, []Hint{{Cmd: "hap config capture-delay list", Why: "the delays now in force, defaults resolved"}})
 	return nil
 }
 

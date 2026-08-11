@@ -24,7 +24,11 @@ func TestRegistryEntriesAreDocumented(t *testing.T) {
 		if c.Name == "" {
 			t.Fatal("a command has no name")
 		}
-		for _, n := range append([]string{c.Name}, c.Aliases...) {
+		// MovedFrom spellings resolve like aliases — a former top-level verb
+		// that stopped resolving is a broken script, not a tidy-up.
+		names := append([]string{c.Name}, c.Aliases...)
+		names = append(names, c.MovedFrom...)
+		for _, n := range names {
 			if seen[n] {
 				t.Errorf("duplicate command or alias %q", n)
 			}
@@ -186,7 +190,18 @@ func TestOverviewCoversEveryCommand(t *testing.T) {
 	cli.Overview(&buf)
 	out := buf.String()
 	for _, c := range cli.Commands() {
-		if !strings.Contains(out, c.Name) {
+		// A hidden `hap config` topic is listed INDENTED under its parent, by
+		// its short name — the overview would be unreadable if every two-word
+		// spelling were repeated in the left column. Both must still appear:
+		// these are the only commands that write config.toml, and an operator
+		// who cannot find them cannot configure hap at all.
+		want := c.Name
+		if c.Hidden {
+			if i := strings.LastIndex(c.Name, " "); i >= 0 {
+				want = c.Name[i+1:]
+			}
+		}
+		if !strings.Contains(out, want) {
 			t.Errorf("hap help does not list %q", c.Name)
 		}
 		if !strings.Contains(out, c.Summary) {

@@ -1534,7 +1534,7 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		}
 		// Only shown when on — it is the one source setting that makes hap
 		// hand out tasks unprompted, so it must be visible wherever sources
-		// are listed (mirrors `hap task-source list`).
+		// are listed (mirrors `hap config task-source list`).
 		if src.EnableAutoSendTaskWhenIdle {
 			label += "  auto_send_when_idle=true"
 		}
@@ -3227,7 +3227,7 @@ func (m Model) deleteTasksPrompt() (tea.Model, tea.Cmd) {
 // Both "unknown" inputs fail closed, because neither is evidence of safety:
 // an agent list herdr would not answer is not an empty herd, and a checklist
 // that would not read is not an empty checklist. Either can still hide live
-// work. The unguarded Config-tab `x` and `hap task-source remove` remain the
+// work. The unguarded Config-tab `x` and `hap config task-source remove` remain the
 // force path for an entry this refuses.
 func (m Model) taskSourceRemovable(g frontend.TaskGroup) (string, bool) {
 	// UnfinishedTasks, not PendingTasks: an agent mid-task has "[-]" items,
@@ -5210,7 +5210,7 @@ func (m Model) seedRuleStateSuffix(pattern string) string {
 
 // disableMatchedSeedRulePrompt silences the ONE builtin never-auto rule that
 // forced the selected escalation (`b`). Being blocked by a shipped rule that
-// is too aggressive for this repo is otherwise a trip to `hap rules list` and
+// is too aggressive for this repo is otherwise a trip to `hap config rules list` and
 // an eyeball match of regex text; the rationale already names the pattern, so
 // resolve it here instead.
 //
@@ -5260,7 +5260,7 @@ func (m Model) disableSeedRulePrompt(rule domain.NeverAutoRule, escID int64) (te
 			return "", true
 		},
 		onConfirm: func() tea.Cmd {
-			return m.do(fmt.Sprintf("builtin rule %s disabled: %s (re-enable: hap rules enable-seed %s)", id, pattern, id),
+			return m.do(fmt.Sprintf("builtin rule %s disabled: %s (re-enable: hap config rules enable-seed %s)", id, pattern, id),
 				func(ctx context.Context) error { return app.DisableSeedRule(ctx, pattern) })
 		},
 	}
@@ -5668,7 +5668,7 @@ func (m Model) renderTasks(b *strings.Builder) {
 			fmt.Fprintln(b, st.help.Render("no tasks match the filter — / edits, backspace clears"))
 			return
 		}
-		fmt.Fprintln(b, st.help.Render("no task sources configured — press t on the Config tab, or: hap task-source add"))
+		fmt.Fprintln(b, st.help.Render("no task sources configured — press t on the Config tab, or: hap config task-source add"))
 		return
 	}
 	start, end := m.window(len(rows))

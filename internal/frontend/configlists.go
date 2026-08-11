@@ -42,7 +42,7 @@ func (a *App) AddNeverAutoRule(ctx context.Context, pattern string, agentTypes [
 		return err
 	}
 	if len(types) == 0 {
-		return fmt.Errorf("a scoped never-auto rule needs at least one agent type; use `hap rules add %q` for a rule that applies to every agent", pattern)
+		return fmt.Errorf("a scoped never-auto rule needs at least one agent type; use `hap config rules add %q` for a rule that applies to every agent", pattern)
 	}
 	// Validated through the real matcher, so the CLI rejects exactly what the
 	// daemon would have skipped with a log line nobody reads.
