@@ -710,7 +710,7 @@ enable_llm_review_before_auto_send = true
 	if !src.EnableAutoSendTaskWhenIdle {
 		t.Error("auto-send must survive alongside the review")
 	}
-	if err := ValidateTaskSource(src); err != nil {
+	if err := ValidateTaskSource(cfg, src); err != nil {
 		t.Errorf("write surfaces must accept the pair, got %v", err)
 	}
 }

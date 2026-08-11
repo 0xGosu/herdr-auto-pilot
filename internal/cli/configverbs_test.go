@@ -90,7 +90,7 @@ func TestMovedVerbNotesTheNewSpellingOnStderr(t *testing.T) {
 
 	out, err := run(t, app, "classifier", "list")
 	if err != nil {
-		t.Fatalf("legacy `hap classifier list`: %v", err)
+		t.Fatalf("legacy `hap config classifier list`: %v", err)
 	}
 	if !strings.Contains(out, "no operator classifier rules") {
 		t.Errorf("the legacy spelling must still do the work, got:\n%s", out)

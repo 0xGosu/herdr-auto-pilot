@@ -507,8 +507,13 @@ const (
 // `agent send` only means herdr accepted them. A confirmed row is retired; an
 // unconfirmed one whose agent is parked again past the grace window is reclaimed.
 type TaskReservation struct {
-	ID         int64
-	SourcePath string // canonical (absolute, symlinks resolved) task-source path
+	ID int64
+	// SourcePath is the canonical task-list LOCATOR the hand-out reserved in:
+	// an absolute, symlink-resolved filesystem path, or a scheme'd string like
+	// "gist://<id>/<file>" when the source is stored remotely. The column is
+	// opaque text, so a remote locator needs no migration — but note the name
+	// predates providers and no longer implies a filesystem path.
+	SourcePath string
 	TaskText   string // raw checklist text, the key ReserveFirstPending claimed on
 	// ItemIndex is the checklist position that was marked. It disambiguates a
 	// list carrying the SAME text twice, where releasing "the first match"

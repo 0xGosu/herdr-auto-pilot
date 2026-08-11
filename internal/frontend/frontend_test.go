@@ -2414,6 +2414,14 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"embedding.bm25_highbar_score":             "0.80",
 		"logging.level":                            "warn",
 		"logging.max_size_mb":                      "32",
+		// github_gist and not local_fs on purpose: the sample doubles as the
+		// SetField exercise, and setting the NON-default is what proves the
+		// enum branch is reachable at all.
+		"task_source_provider.provider":            "github_gist",
+		"task_source_provider.env_file":            "/etc/hap/task_source.env",
+		"task_source_provider.timeout_seconds":     "20",
+		"task_source_provider.refresh_seconds":     "30",
+		"task_source_provider.github_gist.gist_id": "3f2a1b9c4d5e6f708192a3b4c5d6e7f8",
 		// Non-zero on purpose: 0 is a valid setting here ("never prune") but
 		// this sample also feeds the FieldValue round trip, and a real day
 		// count is the case worth exercising. The explicit-0 path has its own
@@ -2594,6 +2602,13 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 		"llm.learn_from_user_command_env_file":     true,
 		"embedding.pane_salient_chars":             true,
 		"embedding.warm_timeout_ms":                true,
+		// The env file holds a token, so it follows the llm.*_env_file rule:
+		// registered (a path is not a secret and `hap config set` must reach
+		// it) but off the TUI's Config tab. The two timing knobs are tuned once
+		// if ever, and only matter for a remote provider.
+		"task_source_provider.env_file":        true,
+		"task_source_provider.timeout_seconds": true,
+		"task_source_provider.refresh_seconds": true,
 		// Eight color strings would bury the settings a TUI operator actually
 		// reaches for, but they stay registered so `hap config set` reaches them.
 		"tui.palette.title":   true,
@@ -3993,6 +4008,7 @@ func TestTaskGroups(t *testing.T) {
 	}
 	missing := filepath.Join(dir, "gone.md")
 
+	app, _ := testApp(t)
 	cfg := config.Config{TaskSources: []config.TaskSource{
 		{Agent: "brave-otter", Workspace: "w1", Path: good},
 		{Agent: "codex", Path: missing},
@@ -4000,7 +4016,7 @@ func TestTaskGroups(t *testing.T) {
 		{Workspace: "*", Path: good}, // duplicate path, its own group
 		{Agent: "quiet", Path: empty},
 	}}
-	groups := frontend.TaskGroups(cfg)
+	groups := app.TaskGroups(cfg)
 	if len(groups) != len(cfg.TaskSources) {
 		t.Fatalf("got %d groups, want %d", len(groups), len(cfg.TaskSources))
 	}
@@ -4028,8 +4044,11 @@ func TestTaskGroups(t *testing.T) {
 	if g := groups[1]; g.Err == "" || len(g.Items) != 0 {
 		t.Errorf("missing file: Err=%q items=%d, want an error and no items", g.Err, len(g.Items))
 	}
-	if g := groups[2]; g.Err != "no path configured" {
-		t.Errorf("empty path: Err=%q, want \"no path configured\"", g.Err)
+	// The message is now provider-aware: an empty path is a misconfiguration
+	// under local_fs but the ordinary "one list per agent" form under a remote
+	// provider, so the error says which case it is.
+	if g := groups[2]; !strings.Contains(g.Err, "no path") || !strings.Contains(g.Err, "local_fs") {
+		t.Errorf("empty path: Err=%q, want it to name the missing path and the provider", g.Err)
 	}
 	if g := groups[3]; g.Err != "" || len(g.Items) != 3 {
 		t.Errorf("duplicate path: Err=%q items=%d, want an independent readable group", g.Err, len(g.Items))
@@ -4040,7 +4059,8 @@ func TestTaskGroups(t *testing.T) {
 }
 
 func TestTaskGroupsEmptyConfig(t *testing.T) {
-	if groups := frontend.TaskGroups(config.Config{}); len(groups) != 0 {
+	app, _ := testApp(t)
+	if groups := app.TaskGroups(config.Config{}); len(groups) != 0 {
 		t.Errorf("no task sources should yield no groups, got %d", len(groups))
 	}
 }

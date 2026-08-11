@@ -7,12 +7,12 @@ require (
 	github.com/blevesearch/bleve/v2 v2.6.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/google/go-github/v90 v90.0.0
 	github.com/mattn/go-runewidth v0.0.16
+	github.com/tcpipuk/llama-go v0.0.0-20260702185908-8fdbada9fdd0
 	golang.org/x/term v0.45.0
 	modernc.org/sqlite v1.53.0
 )
-
-require github.com/google/pprof v0.0.0-20250923004556-9e5a51aed1e8 // indirect
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.14.5 // indirect
@@ -43,6 +43,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/golang/snappy v1.0.0 // indirect
+	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/json-iterator/go v0.0.0-20171115153421-f7279a603ede // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
@@ -55,7 +56,6 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
-	github.com/tcpipuk/llama-go v0.0.0-20260702185908-8fdbada9fdd0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	go.etcd.io/bbolt v1.4.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect

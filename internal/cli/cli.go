@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 )
 
 // ErrUnhealthy signals that `hap status` found the daemon in an unhealthy
@@ -832,6 +834,12 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	}
 	fmt.Fprintf(out, "pending escalations: %d\n", st.PendingEscalations)
 	fmt.Fprintf(out, "monitored agents:    %d\n", len(st.MonitoredAgents))
+	// Where task lists live, and why they cannot be reached when they cannot.
+	// `hap status` is the surface an operator runs first, so a broken store
+	// becomes visible without having to think to run `task-source provider`.
+	if cfg, cfgErr := app.Config(); cfgErr == nil {
+		printTaskStoreLine(out, cfg)
+	}
 	// The crash-loop breaker's auto-disable is the authoritative state and
 	// replaces the config-derived line (which can't know matching was forced
 	// off); it latches until the [embedding] config changes.
@@ -1374,6 +1382,57 @@ func printConfig(out io.Writer, cfg config.Config) {
 	}
 	fmt.Fprintf(out, "task sources: %d, operator never-auto rules: %d (+%d seed)\n",
 		len(cfg.TaskSources), len(cfg.Safety.NeverAutoPatterns)+len(cfg.Safety.NeverAutoRules), seedCount)
+	printTaskStoreLine(out, cfg)
+}
+
+// printTaskStoreLine reports where task lists live, and why they cannot be
+// reached when they cannot.
+//
+// Printed only when something selects a non-default backend: `hap status` is
+// the surface an operator runs first, so a line saying "local, as always" would
+// be noise on every install that never touched the setting. When a remote
+// backend IS configured, this is where a broken one becomes visible without
+// having to think to run `hap config task-source provider`.
+func printTaskStoreLine(out io.Writer, cfg config.Config) {
+	if !cfg.AnyNonDefaultProvider() {
+		return
+	}
+	def := cfg.ResolveProvider(config.TaskSource{})
+	fmt.Fprintf(out, "task store: default %s", def.Name)
+	if def.Remote() {
+		fmt.Fprintf(out, " gist=%s env_file=%s", shortGistID(def.GistID), describeEnvFile(def.EnvFile))
+	}
+	overrides := 0
+	for _, src := range cfg.TaskSources {
+		if src.Provider != "" || src.GistID != "" {
+			overrides++
+		}
+	}
+	if overrides > 0 {
+		fmt.Fprintf(out, "; %d source(s) override it", overrides)
+	}
+	fmt.Fprintln(out)
+	// The same message every other surface reports, so an operator does not
+	// have to reconcile two wordings for one problem.
+	if err := config.ValidateResolvedProvider(cfg, -1, config.TaskSource{}); err != nil {
+		fmt.Fprintf(out, "task store: MISCONFIGURED — %v\n", err)
+	}
+}
+
+// taskSourceLocation renders where one source's list lives, as a labelled token
+// for `task-source list`. Under a remote provider the label changes from path=
+// to gist_file=, because a value that is neither a path nor even a fixed string
+// must not be presented as one.
+func taskSourceLocation(p config.ResolvedProvider, path string) string {
+	if !p.Remote() {
+		return "path=" + path
+	}
+	if path == "" {
+		// The literal angle brackets are the point: this row has no single
+		// file, it has one per matched agent.
+		return "gist_file=<agent-name>.md (per matched agent)"
+	}
+	return fmt.Sprintf("gist_file=%q", path)
 }
 
 // printDiskLine reports what hap is using disk for, and under what retention.
@@ -1648,8 +1707,38 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 			fmt.Fprintln(out, "no task sources configured")
 			return nil
 		}
+		// The header and the provider token appear ONLY when something selects
+		// a non-default backend. An install that has never touched the setting
+		// keeps byte-identical output, which is what every existing script and
+		// the copy-pasteable "#0" convention depend on.
+		showProvider := cfg.AnyNonDefaultProvider()
+		if showProvider {
+			def := cfg.ResolveProvider(config.TaskSource{})
+			fmt.Fprintf(out, "provider default: %s", def.Name)
+			if def.Remote() {
+				fmt.Fprintf(out, " gist_id=%s env_file=%s", shortGistID(def.GistID), describeEnvFile(def.EnvFile))
+			}
+			fmt.Fprintln(out)
+		}
 		for i, src := range cfg.TaskSources {
-			fmt.Fprintf(out, "#%d\tagent=%q workspace=%q path=%s", i, src.Agent, src.Workspace, src.Path)
+			fmt.Fprintf(out, "#%d\tagent=%q workspace=%q", i, src.Agent, src.Workspace)
+			p := cfg.ResolveProvider(src)
+			if showProvider {
+				// Inherited and overridden are always distinguished, even when
+				// the value is identical: otherwise an operator cannot predict
+				// what changing the default will do to this row.
+				origin := "override"
+				if p.NameInherited {
+					origin = "inherited"
+				}
+				fmt.Fprintf(out, " provider=%s(%s)", p.Name, origin)
+				// The default's gist is already in the header; repeating it on
+				// every row is noise, so only an override is shown.
+				if p.Remote() && !p.GistIDInherited {
+					fmt.Fprintf(out, " gist_id=%s(override)", shortGistID(p.GistID))
+				}
+			}
+			fmt.Fprintf(out, " %s", taskSourceLocation(p, src.Path))
 			if src.NextTaskTemplate != "" {
 				fmt.Fprintf(out, " template=%q", src.NextTaskTemplate)
 			}
@@ -1676,6 +1765,12 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	}
 	if len(args) > 0 && args[0] == "set" {
 		return taskSourceSet(ctx, app, out, args[1:])
+	}
+	if len(args) > 0 && args[0] == "provider" {
+		if len(args) != 1 {
+			return fmt.Errorf("usage: task-source provider (read-only; set with `hap config set task_source_provider.…`)")
+		}
+		return taskSourceProvider(app, out)
 	}
 	if len(args) > 0 && args[0] == "remove" {
 		if len(args) != 2 {
@@ -1709,22 +1804,50 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	autoSend := fs.Bool("auto-send-when-idle", false, "also hand out tasks on the periodic idle poll, not only on a herdr attention event")
 	llmReview := fs.Bool("enable-llm-review-before-auto-send", false, "let the configured [llm].command revise the task list and pick the task, immediately before the daemon auto-sends one (never applies to a manual `task send`)")
 	maxTasks := fs.Int("max-tasks", config.DefaultMaxTasks, "cap on how many checklist items this source may hold before task generation stops refilling it")
+	provider := fs.String("provider", "", "where THIS source's list is stored: "+strings.Join(config.ValidTaskSourceProviders, " | ")+"; omit to inherit the [task_source_provider] default and keep inheriting it")
+	gistID := fs.String("gist-id", "", "store this source's list in a specific gist instead of the default one (github_gist only)")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	if fs.NArg() > 1 {
 		// Go's flag parsing stops at the first non-flag argument, so a flag
 		// written AFTER the path is silently not applied — say so instead of
 		// printing the generic usage line, which never mentions the ordering.
-		for _, extra := range fs.Args()[min(fs.NArg(), 1):] {
+		for _, extra := range fs.Args()[1:] {
 			if strings.HasPrefix(extra, "-") {
 				return fmt.Errorf("flags must come before <checklist.md>: %s was read as an argument, not a flag", extra)
 			}
 		}
-		return fmt.Errorf("usage: hap config task-source [add] [--agent A] [--workspace W] [--template T] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] <checklist.md> | list | set <index> <key> <value> | remove <index> (see: hap help config task-source)")
+		return fmt.Errorf("usage: hap config task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>] | list | set <index> <key> <value> | remove <index> (see: hap help config task-source)")
+	}
+	if *provider != "" && !slices.Contains(config.ValidTaskSourceProviders, *provider) {
+		return fmt.Errorf("--provider must be one of %s, got %q",
+			strings.Join(config.ValidTaskSourceProviders, ", "), *provider)
+	}
+	// Whether the positional is required depends on the provider this source
+	// will actually run under, which may be inherited.
+	cfg, err := app.Config()
+	if err != nil {
+		return err
+	}
+	effective := cfg.ResolveProvider(config.TaskSource{Provider: *provider, GistID: *gistID})
+	if fs.NArg() == 0 && !effective.Remote() {
+		return fmt.Errorf("a checklist path is required under provider=%s: "+
+			"hap config task-source add [flags] <checklist.md>", effective.Name)
+	}
+	if *gistID != "" && effective.Name != config.ProviderGitHubGist {
+		// Refused rather than ignored: a silently dropped flag would leave the
+		// operator believing this source targets a gist it does not.
+		return fmt.Errorf("--gist-id has no meaning under provider=%s", effective.Name)
 	}
 	var opts []frontend.TaskSourceOption
+	if *provider != "" {
+		opts = append(opts, frontend.Provider(*provider))
+	}
+	if *gistID != "" {
+		opts = append(opts, frontend.GistID(*gistID))
+	}
 	if *autoSend {
 		opts = append(opts, frontend.AutoSendWhenIdle())
 	}
@@ -1738,7 +1861,8 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	if err := app.AddTaskSource(ctx, *agent, *workspace, fs.Arg(0), *template, opts...); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "task source added: %s (max_tasks=%d)\n", fs.Arg(0), *maxTasks)
+	fmt.Fprintf(out, "task source added: %s (max_tasks=%d)\n",
+		describeAddedSource(effective, fs.Arg(0), *provider == ""), *maxTasks)
 	// Unprompted hand-out is the one setting that makes hap act without a herdr
 	// event, so say so plainly instead of leaving it to `task-source list`.
 	if *autoSend {
@@ -1750,6 +1874,41 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	return nil
 }
 
+// describeAddedSource renders where a newly added source's list will live, in
+// terms an operator can check against their config.
+func describeAddedSource(p config.ResolvedProvider, path string, inherited bool) string {
+	var where string
+	switch {
+	case !p.Remote():
+		where = path
+	case path != "":
+		where = fmt.Sprintf("%q in gist %s (shared by every agent this source matches)",
+			path, shortGistID(p.GistID))
+	default:
+		where = fmt.Sprintf("one list per matched agent (%q in gist %s, created on first hand-out)",
+			"<agent-name>.md", shortGistID(p.GistID))
+	}
+	if inherited && p.Remote() {
+		// Say what they got: they named no provider, so the default decided.
+		where += fmt.Sprintf(" [provider inherited: %s]", p.Name)
+	}
+	return where
+}
+
+// shortGistID renders a gist id as a recognizable prefix. A secret gist's URL
+// is effectively a capability, so hap does not echo one in full outside the
+// config file the operator wrote it into.
+func shortGistID(id string) string {
+	const keep = 8
+	if id == "" {
+		return "(not set)"
+	}
+	if len(id) <= keep {
+		return id
+	}
+	return id[:keep] + "…"
+}
+
 // autoSendOnMessage and llmReviewOnMessage explain a delivery-gate flag the
 // moment it is switched on. `task-source add` and `task-source set` both print
 // them, so they are shared rather than duplicated: the add path went on
@@ -1759,11 +1918,83 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 const (
 	autoSendOnMessage = "auto-send when idle is ON: matching idle agents are handed their next pending task without an attention event"
 
+	// providerChangeMessage is printed whenever a source's storage moves. Kept
+	// beside its two siblings so the three cannot drift apart.
+	providerChangeMessage = "the existing list is NOT migrated: hap reads this source from the new " +
+		"store from now on, and the old copy is left exactly where it is. Copy the items across " +
+		"yourself before the next hand-out, or the agent will be handed whatever the new store " +
+		"already holds — possibly nothing."
+
 	llmReviewOnMessage = "LLM review before auto-send is ON: immediately before the daemon sends a task, " +
 		"the configured [llm].command may revise the list and pick which task goes. A review that fails " +
 		"or scores below auto_act_confidence_threshold sends the original task unchanged — it never " +
 		"escalates. A task you send by hand is never reviewed."
 )
+
+// taskSourceProvider reports where task lists are stored. Read-only on purpose:
+// the values are written through the config registry (`hap config set
+// task_source_provider.…` and `hap config task-source set <i> provider …`), and a
+// second write path would be a second validation to drift from.
+//
+// It exists because "is my token wired up?" has no other answer short of
+// reading config.toml and stat-ing the file by hand. It never prints the token,
+// and elides the gist id — a secret gist's URL is effectively a capability.
+func taskSourceProvider(app *frontend.App, out io.Writer) error {
+	cfg, err := app.Config()
+	if err != nil {
+		return err
+	}
+	def := cfg.ResolveProvider(config.TaskSource{})
+	fmt.Fprintf(out, "default provider: %s\n", def.Name)
+	if def.Remote() {
+		fmt.Fprintf(out, "default gist_id:  %s\n", shortGistID(def.GistID))
+		fmt.Fprintf(out, "env_file:         %s\n", describeEnvFile(def.EnvFile))
+	}
+
+	local, remote, overridden := 0, 0, 0
+	for _, src := range cfg.TaskSources {
+		if cfg.ResolveProvider(src).Remote() {
+			remote++
+		} else {
+			local++
+		}
+		if src.Provider != "" || src.GistID != "" {
+			overridden++
+		}
+	}
+	fmt.Fprintf(out, "sources:          %d (%d local, %d remote; %d with their own override)\n",
+		len(cfg.TaskSources), local, remote, overridden)
+
+	// Surface the reason it will not work, in the same words the daemon and
+	// every other surface use.
+	if def.Remote() {
+		if err := config.ValidateResolvedProvider(cfg, -1, config.TaskSource{}); err != nil {
+			fmt.Fprintf(out, "MISCONFIGURED:    %v\n", err)
+		}
+	}
+	fmt.Fprintf(out, "set default with: hap config set task_source_provider.provider <%s>\n",
+		strings.Join(config.ValidTaskSourceProviders, "|"))
+	fmt.Fprintln(out, "set per source:   hap config task-source set <index> provider <name>")
+	return nil
+}
+
+// describeEnvFile reports whether the credential file resolves, WITHOUT reading
+// it: the path is not a secret, its contents are.
+func describeEnvFile(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return "(not set)"
+	}
+	expanded := config.ExpandPath(path)
+	info, err := os.Stat(expanded)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("%s (UNREADABLE: %v)", path, err)
+	case info.IsDir():
+		return fmt.Sprintf("%s (UNREADABLE: is a directory)", path)
+	default:
+		return path + " (configured, readable)"
+	}
+}
 
 // taskSourceSet edits one setting of an existing task source — the CLI twin of
 // the TUI Config tab's enter on a task-source row. Only the settings that are
@@ -1771,7 +2002,7 @@ const (
 // and the cap; path/agent/workspace are remove-and-re-add, since changing them
 // silently re-points an agent's work.
 func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	const usage = "usage: hap config task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks> <value> (see: hap config task-source list, hap help task-source)"
+	const usage = "usage: hap config task-source set <index> <auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value> (see: hap config task-source list, hap help config task-source)"
 	if len(args) != 3 {
 		return fmt.Errorf("%s", usage)
 	}
@@ -1831,6 +2062,47 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 			return err
 		}
 		fmt.Fprintf(out, "task source #%d: max_tasks=%d\n", idx, n)
+		return nil
+	case "provider":
+		// "inherit"/"" clears the override. Without a clearing spelling an
+		// override would be a one-way door: nothing else can put a source back
+		// to following [task_source_provider].
+		name := strings.ToLower(strings.TrimSpace(value))
+		if name == "inherit" {
+			name = ""
+		}
+		if name != "" && !slices.Contains(config.ValidTaskSourceProviders, name) {
+			return fmt.Errorf("provider must be one of %s, or \"inherit\" to follow the default, got %q",
+				strings.Join(config.ValidTaskSourceProviders, ", "), value)
+		}
+		converted, err := app.SetTaskSourceProvider(ctx, idx, expected, name)
+		if err != nil {
+			return err
+		}
+		if name == "" {
+			eff := cfg.ResolveProvider(config.TaskSource{})
+			fmt.Fprintf(out, "task source #%d: provider now inherits the default (%s)\n", idx, eff.Name)
+		} else {
+			fmt.Fprintf(out, "task source #%d: provider=%s\n", idx, name)
+		}
+		if converted != "" {
+			fmt.Fprintf(out, "path converted to store file %q (was %s)\n", converted, expected.Path)
+		}
+		fmt.Fprintln(out, providerChangeMessage)
+		return nil
+	case "gist-id", "gist_id":
+		id := strings.TrimSpace(value)
+		if strings.EqualFold(id, "inherit") {
+			id = ""
+		}
+		if err := app.SetTaskSourceGistID(ctx, idx, expected, id); err != nil {
+			return err
+		}
+		if id == "" {
+			fmt.Fprintf(out, "task source #%d: gist_id now inherits the default\n", idx)
+		} else {
+			fmt.Fprintf(out, "task source #%d: gist_id=%s\n", idx, shortGistID(id))
+		}
 		return nil
 	}
 	return fmt.Errorf("unknown task-source key %q\n%s", key, usage)
@@ -2368,7 +2640,15 @@ func taskList(app *frontend.App, out io.Writer, agent, path string, args []strin
 	// next-task prompt only points the agent at `hap task <agent> list`, so it
 	// reads them beside the actual task numbers. Only `list` prints them —
 	// the mutating ops reprint the list without repeating the instructions.
-	fmt.Fprint(out, "\n"+domain.TaskManagementHints(agent, resolved))
+	// The hints must match where the list actually lives. `resolved` is a
+	// LOCATOR: printing it raw would show the agent a gist:// string, and the
+	// local form's closing line offers a `--path` fallback that reads a local
+	// file — which under a remote provider names something that does not exist.
+	if tasklocator.Remote(resolved) {
+		fmt.Fprint(out, "\n"+domain.RemoteTaskManagementHints(agent, tasklocator.Display(resolved)))
+	} else {
+		fmt.Fprint(out, "\n"+domain.TaskManagementHints(agent, resolved))
+	}
 	return nil
 }
 

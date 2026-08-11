@@ -498,7 +498,9 @@ some settings are table-valued, so one `hap config set <key> <value>` cannot add
 
 `[tui.palette]` is not table-valued for this purpose: its roles are individually settable with `hap config set`, see above. `TestEveryConfigKeyIsRegistered` and `TestEveryConfigListHasACLICommand` fail the build if a new key or section ever ships without a command, and `TestConfigureGroupHasOneVisibleCommand` fails if one ships outside `hap config`.
 
-`rules`, `task-source`, `classifier` and `capture-delay` were top-level verbs (`hap rules …`) before this. the old spellings still work and print a note naming the new one on **stderr** — stdout stays clean, so a script parsing these tab-separated listings is unaffected. each topic has its own guide: `hap help config rules`, and likewise for the other three.
+`rules`, `task-source`, `classifier` and `capture-delay` were top-level verbs (`hap config rules …`) before this. the old spellings still work and print a note naming the new one on **stderr** — stdout stays clean, so a script parsing these tab-separated listings is unaffected. each topic has its own guide: `hap help config rules`, and likewise for the other three.
+
+`[task_source_provider]` is not table-valued either: its keys are ordinary `hap config set` fields — `task_source_provider.provider`, `.env_file`, `.timeout_seconds`, `.refresh_seconds`, `.github_gist.gist_id` (see task sources). the PER-SOURCE overrides of those live on a `[[task_sources]]` entry and go through `hap config task-source set <index> …` like its other settings.
 
 **capture delay** — the classification pane read waits a per-agent delay so the agent TUI has painted and event bursts coalesce. defaults: 10000ms (10s) on an agent's first event, 2000ms after. override per agent type:
 
@@ -655,6 +657,44 @@ hap config task-source remove <index>
 this removes the `[[task_sources]]` entry only — the checklist file is left on
 disk. it is unguarded and unconfirmed: it removes the entry even while a live
 agent is mid-task on it, which makes it the force path.
+
+### where task lists are stored
+
+by default a checklist is a file on this machine. `[task_source_provider]` sets
+the DEFAULT storage for every source, and each `[[task_sources]]` entry may
+override it — so some agents can be local and others in a gist at once:
+
+```bash
+hap config set task_source_provider.provider github_gist
+hap config set task_source_provider.github_gist.gist_id 3f2a1b9c4d5e6f708192a3b4c5d6e7f8
+hap config set task_source_provider.env_file ~/.config/hap/task_source.env
+
+hap config task-source set 0 provider local_fs     # this ONE source stays on disk
+hap config task-source set 0 provider inherit      # …and back to following the default
+hap config task-source set 1 gist-id aa11bb22      # this ONE source uses another gist
+```
+
+show what is in force (never prints the token):
+
+```bash
+hap config task-source provider
+```
+
+a source that sets no `provider` keeps INHERITING the default, so changing the
+default moves it. hap never writes the inherited value into the entry.
+
+under `github_gist`, a source's `path` is a file name INSIDE the gist, not a
+filesystem path. set it and every agent the source matches shares one list;
+leave it out and each matched agent gets its own `<agent-name>.md`, created on
+first hand-out. `hap config task-source add --provider github_gist --agent brave-otter`
+(no path) creates that form.
+
+hap never creates the gist — make a secret gist on github.com and paste its hex
+id. the token lives in the file `env_file` names (`GITHUB_TOKEN=…`, `gist`
+scope, mode 0600), is read at use time, and is never written to `config.toml`.
+
+`hap task <agent> …` works the same either way. `--path` always reads a LOCAL
+file, so use the agent name for a remote list.
 
 ### auto-send tasks to idle agents
 

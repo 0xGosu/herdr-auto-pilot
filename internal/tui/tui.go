@@ -32,6 +32,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 	"github.com/0xGosu/herdr-auto-pilot/internal/updatecheck"
 )
 
@@ -1458,7 +1459,7 @@ func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refr
 	if msg.err != nil {
 		return msg
 	}
-	msg.tasks = frontend.TaskGroups(msg.cfg)
+	msg.tasks = app.TaskGroups(msg.cfg)
 	// Both of these read the cached check file only — the fetch itself runs in
 	// updateCheckCmd, off this path, because refreshData runs on every tick.
 	msg.update = app.UpdateStatus(msg.cfg)
@@ -3008,20 +3009,19 @@ func truncatePathKeepBase(p string, limit int) string {
 // pending count and live-agent names survive on ordinary pane widths.
 const taskPathDisplayWidth = 44
 
-// canonicalTaskPath normalizes a source path for identity comparisons (the
-// duplicate dedupe and the per-file delete ordering): ~/$VAR expanded, then
-// absolute + symlinks resolved, best-effort. Two config spellings of one file
-// (relative vs absolute, ~/x vs its absolute form, /var vs /private/var) must
-// not slip past the dedupe and mutate the same line twice.
-func canonicalTaskPath(p string) string {
-	p = config.ExpandPath(p)
-	if abs, err := filepath.Abs(p); err == nil {
-		p = abs
-	}
-	if resolved, err := filepath.EvalSymlinks(p); err == nil {
-		p = resolved
-	}
-	return p
+// canonicalTaskPath normalizes a task-list locator for identity comparisons
+// (the duplicate dedupe and the per-file delete ordering). Two config spellings
+// of one list (relative vs absolute, ~/x vs its absolute form, /var vs
+// /private/var) must not slip past the dedupe and mutate the same line twice.
+//
+// It delegates to tasklocator.Canonical — the SAME function taskfile.LockPath
+// and the daemon's claim map use. A locator carrying a scheme (gist://…) is
+// returned verbatim, which matters because filepath.Abs does not fail on one:
+// it silently returns "<cwd>/gist:/id/f.md", and the TUI's cwd is not the
+// daemon's, so a local copy of this normalization would make the two disagree
+// about which lists are the same list.
+func canonicalTaskPath(locator string) string {
+	return tasklocator.Canonical(locator)
 }
 
 // markedTaskTargets returns the marked items (in list order) or, with no
@@ -4308,7 +4308,15 @@ func (m Model) agentTaskSourceMatches(a domain.AgentTransition) []int {
 			(agentName == "" || src.Agent != agentName) {
 			continue
 		}
-		if !domain.MatchWorkspace(src.Workspace, workspaceName) || src.Path == "" {
+		if !domain.MatchWorkspace(src.Workspace, workspaceName) {
+			continue
+		}
+		// An empty path means "unconfigured" only under local storage. Under a
+		// remote provider it is the ordinary one-list-per-matched-agent form,
+		// so skipping it here would hide every derived source from the Agents
+		// tab, the `t` jump, and the Tasks-tab annotations — the source would
+		// silently look like it did not exist.
+		if src.Path == "" && !m.data.cfg.ResolveProvider(src).Remote() {
 			continue
 		}
 		indices = append(indices, i)
@@ -4800,7 +4808,17 @@ const (
 	// the sibling constant is legacy, not a convention to propagate.
 	tsFieldLLMReview = "enable_llm_review_before_auto_send"
 	tsFieldMaxTasks  = "max_tasks"
+	// Where this source's list is stored. Unlike path/agent/workspace these ARE
+	// editable: those change WHICH list is the agent's, while these change only
+	// where that list is kept.
+	tsFieldProvider = "provider"
+	tsFieldGistID   = "gist_id"
 )
+
+// tsInheritValue is the picker/prompt spelling that clears a per-source
+// override. Without one an override would be a one-way door — nothing else can
+// put a source back to following [task_source_provider].
+const tsInheritValue = "inherit"
 
 // editTaskSourcePrompt opens the settings picker for task source #index
 // (enter on a Config task-source row). Only the settings worth flipping after
@@ -4824,6 +4842,28 @@ func (m Model) editTaskSourcePrompt(index int, path string) (tea.Model, tea.Cmd)
 		{tsFieldLLMReview, fmt.Sprintf("%s (currently %v)", tsFieldLLMReview, src.ReviewBeforeAutoSendEnabled())},
 		{tsFieldMaxTasks, fmt.Sprintf("%s (currently %d)", tsFieldMaxTasks, src.MaxTasksLimit())},
 	}
+	// Storage settings are offered only once something selects a non-default
+	// backend, so an install that has never touched the provider keeps the
+	// picker it has always had.
+	if m.data.cfg.AnyNonDefaultProvider() {
+		p := m.data.cfg.ResolveProvider(src)
+		origin := "override"
+		if p.NameInherited {
+			origin = "inherited"
+		}
+		fields = append(fields,
+			struct{ key, label string }{tsFieldProvider,
+				fmt.Sprintf("%s (currently %s, %s)", tsFieldProvider, p.Name, origin)})
+		if p.Remote() {
+			gist := shortGistIDForDisplay(p.GistID)
+			if p.GistIDInherited {
+				gist += " (inherited)"
+			}
+			fields = append(fields,
+				struct{ key, label string }{tsFieldGistID,
+					fmt.Sprintf("%s (currently %s)", tsFieldGistID, gist)})
+		}
+	}
 	opts := make([]string, len(fields))
 	for i, f := range fields {
 		opts[i] = f.label
@@ -4846,6 +4886,21 @@ func (m Model) editTaskSourcePrompt(index int, path string) (tea.Model, tea.Cmd)
 		},
 	})
 	return m, nil
+}
+
+// shortGistIDForDisplay renders a gist id as a recognizable prefix. A secret
+// gist's URL is effectively a capability, so hap does not echo one in full
+// outside the config file the operator wrote it into.
+func shortGistIDForDisplay(id string) string {
+	const keep = 8
+	switch {
+	case id == "":
+		return "(not set)"
+	case len(id) <= keep:
+		return id
+	default:
+		return id[:keep] + "…"
+	}
 }
 
 // taskSourceAt returns task source #index when it is still the row the caller
@@ -4907,6 +4962,72 @@ func (m Model) openTaskSourceFieldPrompt(msg openTaskSourceFieldMsg) (tea.Model,
 			},
 		})
 		return m, nil
+	case tsFieldProvider:
+		// A picker, not free text: the operator may not know what values exist,
+		// and "inherit" is not guessable.
+		opts := append(append([]string{}, config.ValidTaskSourceProviders...), tsInheritValue)
+		cur := current.Provider
+		if cur == "" {
+			cur = tsInheritValue
+		}
+		idx := 0
+		for i, o := range opts {
+			if o == cur {
+				idx = i
+				break
+			}
+		}
+		m.openPrompt(&prompt{
+			label: fmt.Sprintf("task source #%d %s (↑/↓ then enter; %q follows the default)",
+				index, tsFieldProvider, tsInheritValue),
+			options: opts,
+			optIdx:  idx,
+			onSubmit: func(input string) tea.Cmd {
+				return func() tea.Msg {
+					name := input
+					if name == tsInheritValue {
+						name = ""
+					}
+					converted, err := app.SetTaskSourceProvider(ctx, index, expected, name)
+					if err != nil {
+						return actionResultMsg{err: err}
+					}
+					msg := fmt.Sprintf("task source #%d: provider=%s", index, input)
+					if converted != "" {
+						msg += fmt.Sprintf("; path converted to %q", converted)
+					}
+					// The list is NOT migrated, and an operator who does not
+					// know that finds an agent handed an empty list.
+					msg += " — the existing list is not moved; copy the items across yourself"
+					return actionResultMsg{message: msg}
+				}
+			},
+		})
+		return m, nil
+	case tsFieldGistID:
+		m.openPrompt(&prompt{
+			label: fmt.Sprintf("task source #%d %s (%q follows the default)",
+				index, tsFieldGistID, tsInheritValue),
+			input: current.GistID,
+			onSubmit: func(input string) tea.Cmd {
+				return func() tea.Msg {
+					id := strings.TrimSpace(input)
+					if strings.EqualFold(id, tsInheritValue) {
+						id = ""
+					}
+					if err := app.SetTaskSourceGistID(ctx, index, expected, id); err != nil {
+						return actionResultMsg{err: err}
+					}
+					if id == "" {
+						return actionResultMsg{message: fmt.Sprintf(
+							"task source #%d: gist_id now follows the default", index)}
+					}
+					return actionResultMsg{message: fmt.Sprintf(
+						"task source #%d: gist_id=%s", index, shortGistIDForDisplay(id))}
+				}
+			},
+		})
+		return m, nil
 	default:
 		// beginAction cleared status/message and nothing else has been started,
 		// so setting the hint line is the whole unwind.
@@ -4955,6 +5076,8 @@ func configFieldChoices(key string) (choices []string, ok bool) {
 	switch key {
 	case "tui.theme":
 		return config.ValidThemes, true
+	case "task_source_provider.provider":
+		return config.ValidTaskSourceProviders, true
 	default:
 		return nil, false
 	}
