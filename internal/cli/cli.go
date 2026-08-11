@@ -1328,7 +1328,12 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		PrintNextSteps(out, configHints())
 		return nil
 	}
-	return fmt.Errorf("usage: config [show|fields|path|set <field> <value>|set-threshold <situation> <value>|env …] (see: hap help config)")
+	// The topics are named here too: reaching this line means `hap config <x>`
+	// resolved to no two-word command, and "rule" for "rules" is the likeliest
+	// way to get here.
+	return fmt.Errorf("usage: config [show|fields|path|set <field> <value>|set-threshold <situation> <value>|env …]\n" +
+		"  topics: config rules | config task-source | config classifier | config capture-delay\n" +
+		"  (see: hap help config)")
 }
 
 // configHints are the follow-ups printed after a config read or edit; `config
