@@ -186,6 +186,76 @@ func TestTaskSourceSelectorsAreEditableInPlace(t *testing.T) {
 	}
 }
 
+// TestTaskSourceAddressableByAgentName covers the answer to "which index do I
+// use?": for the common case, none — a source is addressable by the agent it
+// feeds. The index is POSITIONAL, so removing a source renumbers every one
+// after it and a remembered number silently means a different entry; a name
+// does not move.
+func TestTaskSourceAddressableByAgentName(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	for _, agent := range []string{"brave-otter", "swift-heron"} {
+		if err := app.AddTaskSource(ctx, agent, "", filepath.Join(dir, agent+".md"), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Addressed by name, the SECOND source is edited — not the first, which is
+	// what a positional reading of the same token would have hit.
+	if _, err := run(t, app, "config", "task-source", "set", "swift-heron", "max-tasks", "42"); err != nil {
+		t.Fatalf("set by agent name: %v", err)
+	}
+	srcs := loadCfg(t, app.ConfigPath).TaskSources
+	if srcs[1].MaxTasks != 42 || srcs[0].MaxTasks == 42 {
+		t.Errorf("sources = %+v, want only the swift-heron source changed", srcs)
+	}
+	// The index form still works, and `#0` — the spelling the listing prints —
+	// is accepted verbatim so a row can be copied without editing it.
+	if _, err := run(t, app, "config", "task-source", "set", "#0", "max-tasks", "7"); err != nil {
+		t.Fatalf("set by #index: %v", err)
+	}
+	if got := loadCfg(t, app.ConfigPath).TaskSources[0].MaxTasks; got != 7 {
+		t.Errorf("MaxTasks = %d, want 7", got)
+	}
+	// Removal takes a name too, and removes the right one.
+	if _, err := run(t, app, "config", "task-source", "remove", "brave-otter"); err != nil {
+		t.Fatalf("remove by agent name: %v", err)
+	}
+	srcs = loadCfg(t, app.ConfigPath).TaskSources
+	if len(srcs) != 1 || srcs[0].Agent != "swift-heron" {
+		t.Errorf("sources = %+v, want only the swift-heron source left", srcs)
+	}
+}
+
+// TestTaskSourceAgentRefRefusesAmbiguity pins the bound on name addressing:
+// two sources feeding one agent is legal, and a name that could mean either
+// must be refused rather than resolved to whichever comes first.
+func TestTaskSourceAgentRefRefusesAmbiguity(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	for _, f := range []string{"a.md", "b.md"} {
+		if err := app.AddTaskSource(ctx, "brave-otter", "", filepath.Join(dir, f), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := run(t, app, "config", "task-source", "set", "brave-otter", "max-tasks", "9")
+	if err == nil {
+		t.Fatal("an agent matching two sources must be refused, not resolved to the first")
+	}
+	// The refusal names the indexes that disambiguate it — the one thing the
+	// operator needs and cannot guess.
+	if !strings.Contains(err.Error(), "#0") || !strings.Contains(err.Error(), "#1") {
+		t.Errorf("the refusal must name the matching indexes, got: %v", err)
+	}
+	for _, src := range loadCfg(t, app.ConfigPath).TaskSources {
+		if src.MaxTasks == 9 {
+			t.Errorf("a refused edit changed a source anyway: %+v", src)
+		}
+	}
+}
+
 // TestTaskSourceSetEmptySelectorWidensAndSaysSo covers the widest re-point
 // available: clearing a selector makes the source match ANY agent (or
 // workspace). It is legal — `add` accepts it — but silent widening of which

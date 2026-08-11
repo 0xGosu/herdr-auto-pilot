@@ -824,8 +824,8 @@ func buildCommands() {
 				"hap config task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>]",
 				"hap config task-source list",
 				"hap config task-source provider",
-				"hap config task-source set <index> <path|agent|workspace|template|auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value>",
-				"hap config task-source remove <index>",
+				"hap config task-source set <index|agent> <path|agent|workspace|template|auto-send-when-idle|enable-llm-review-before-auto-send|max-tasks|provider|gist-id> <value>",
+				"hap config task-source remove <index|agent>",
 			},
 			Flags: []FlagDoc{
 				{Name: "--agent", Arg: "A", Desc: "agent short name, id, or type this source applies to"},
@@ -852,6 +852,11 @@ func buildCommands() {
 				"               agent gets its own \"<agent-name>.md\", created on first hand-out.\n" +
 				"`hap task <agent> …` works the same either way. `--path` on `hap task` always\n" +
 				"reads a LOCAL file, so address a remote list by the agent's name.\n" +
+				"`set` and `remove` take either the INDEX `list` prints (`0`, or the copy-pasteable\n" +
+				"`#0`) or the AGENT NAME the source feeds — a name does not move when an earlier\n" +
+				"source is removed and every later index shifts. A name matching no source, or\n" +
+				"more than one, is refused with the indexes that disambiguate it; a\n" +
+				"workspace-scoped source has no agent to be addressed by, so it takes an index.\n" +
 				"`set` edits an existing source in place, and every field is editable:\n" +
 				"  path | agent | workspace                     re-point it\n" +
 				"  template                                     the outbound prompt (\"\" = default)\n" +
@@ -884,15 +889,15 @@ func buildCommands() {
 				"hap config task-source list",
 				"hap config task-source set 0 auto-send-when-idle true",
 				"hap config task-source set 0 enable-llm-review-before-auto-send true",
-				"hap config task-source set 0 agent swift-heron",
-				"hap config task-source set 0 path ./docs/other-tasks.md",
+				"hap config task-source set brave-otter agent swift-heron",
+				"hap config task-source set brave-otter path ./docs/other-tasks.md",
 				"hap config task-source set 0 template 'Do this next: {next_task_content}'",
 			},
-			Next: []Hint{
-				{Cmd: "hap config task-source list", Why: "confirm the source and its index"},
-				{Cmd: "hap task <agent> list", Why: "see the items the agent will get"},
-			},
-			Handler: taskSource,
+			// Every branch builds its own footer: the listing publishes REAL
+			// indexes (the only place they appear), and the empty state points
+			// at `add` rather than at the listing it just came from.
+			SelfHints: true,
+			Handler:   taskSource,
 		},
 
 		// ------------------------------------------------------------------ Tasks

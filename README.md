@@ -964,16 +964,24 @@ the *Config* tab's `t`.
 Every field of an existing source is editable in place — no remove-and-re-add:
 
 ```sh
-hap config task-source set <index> path /new/tasks.md   # which list it reads
-hap config task-source set <index> agent swift-heron    # which agent it feeds
-hap config task-source set <index> workspace 'codex-*'
-hap config task-source set <index> template 'Do: {next_task_content}'   # "" restores the default
-hap config task-source set <index> auto-send-when-idle true
-hap config task-source set <index> enable-llm-review-before-auto-send true
-hap config task-source set <index> max-tasks 40
-hap config task-source set <index> provider github_gist   # or "inherit"
-hap config task-source set <index> gist-id aa11bb22       # or "inherit"
+hap config task-source list                              # every source, with its index
+hap config task-source set brave-otter path /new/tasks.md   # which list it reads
+hap config task-source set brave-otter agent swift-heron    # which agent it feeds
+hap config task-source set brave-otter workspace 'codex-*'
+hap config task-source set brave-otter template 'Do: {next_task_content}'  # "" = default
+hap config task-source set brave-otter auto-send-when-idle true
+hap config task-source set brave-otter enable-llm-review-before-auto-send true
+hap config task-source set brave-otter max-tasks 40
+hap config task-source set brave-otter provider github_gist   # or "inherit"
+hap config task-source set brave-otter gist-id aa11bb22       # or "inherit"
 ```
+
+`set` and `remove` take either the **agent name** the source feeds, as above, or
+the **index** `list` prints (`0`, or the copy-pasteable `#0`). Prefer the name:
+the index is positional, so removing a source renumbers every one after it and a
+number you remembered silently means a different entry. A name matching no
+source — or more than one — is refused, naming the indexes that disambiguate it;
+a workspace-scoped source has no agent to be addressed by, so it takes an index.
 
 The first three re-point the source, so each reports what it changed *from* and
 warns: the next hand-out then comes from a different list, or goes to a

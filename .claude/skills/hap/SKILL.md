@@ -731,13 +731,20 @@ hap config task-source set <index> max-tasks 40               # the refill/creat
 **every field of a source is editable in place**, not just those three:
 
 ```bash
-hap config task-source set <index> path /new/tasks.md    # which list it reads
-hap config task-source set <index> agent swift-heron     # which agent it feeds
-hap config task-source set <index> workspace 'codex-*'   # which workspace
-hap config task-source set <index> template 'Do: {next_task_content}'   # "" restores the default
-hap config task-source set <index> provider github_gist  # where the list is stored
-hap config task-source set <index> gist-id aa11bb22
+hap config task-source list                              # every source, with its index
+hap config task-source set brave-otter path /new/tasks.md   # which list it reads
+hap config task-source set brave-otter agent swift-heron    # which agent it feeds
+hap config task-source set brave-otter workspace 'codex-*'  # which workspace
+hap config task-source set brave-otter template 'Do: {next_task_content}'  # "" = default
+hap config task-source set brave-otter provider github_gist # where the list is stored
+hap config task-source set brave-otter gist-id aa11bb22
 ```
+
+**`set` and `remove` take an AGENT NAME or an index.** prefer the name: the index
+is positional, so removing a source renumbers every one after it. `#0` (the
+spelling `list` prints) is accepted verbatim. a name matching no source, or more
+than one, is refused naming the indexes that disambiguate it; a workspace-scoped
+source has no agent, so it takes an index.
 
 the first three re-point the source, so each prints what it changed FROM and
 says so — the next hand-out then comes from a different list, or goes to a
