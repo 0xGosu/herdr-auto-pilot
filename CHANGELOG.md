@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.4
+
+- Fixed the TUI Tasks tab for gist-backed task sources: a derived (one-list-per-matched-agent) source now shows its actual checklist when exactly one live agent matches it, instead of the "one list per matched agent" note; and task actions (done, edit, delete, move, send, add) now address remote lists by their resolved locator, so they no longer no-op or resolve a gist file name against the local filesystem.
+- Added a provider-independent `hap task` selector: a task source is now addressable by its config index (`hap task 0 list`, also `'#0'`) — the way to reach a source an agent name cannot (workspace- or type-scoped, an agent matching several, or any list under a remote provider, where `--path` reads a local file that does not exist). `--path` still works for ad-hoc local files.
+- Changed the default next-task prompts and the `hap task … list` hints to offer the task-source index as the fallback selector instead of `--path`; a new `{task_source_index}` placeholder is available to custom templates (it falls back to the agent name when the sender cannot know the position).
+
 ## 0.6.3
 
 - Added `path`, `agent`, `workspace` and `template` to `hap config task-source set`, so every field of a task source is now editable in place. Changing one of them used to mean removing the source and re-adding it — retyping every other field, and renumbering every later source, to change one. The three that re-point a source report what they changed from and say so plainly: the next hand-out comes from a different list, or goes to a different agent. Nothing is copied or removed either way; an empty agent or workspace matches any of them and says so; a relative path is resolved against your shell's working directory (the daemon runs from the state dir); and a whitespace-only template clears back to the built-in default rather than being delivered as the prompt.
