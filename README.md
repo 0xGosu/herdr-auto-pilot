@@ -69,7 +69,8 @@ window and you get the newest earlier release instead of an error — the output
 says plainly which version landed, and `hap update` picks up the intended one
 once it publishes. A `--ref` pin normally names a release that already has its
 assets, so it never reaches that path; if you need the substitution refused
-outright, set `HAP_NO_FALLBACK=1` (any value) and the install fails instead.
+outright, set `HAP_NO_FALLBACK` to any non-empty value and the install fails
+instead.
 
 ### Update to the latest version
 

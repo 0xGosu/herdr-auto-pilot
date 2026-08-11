@@ -190,7 +190,8 @@ manifest pointing at an unreleased version 404s every install.
   newest earlier release that has assets** (git tags, newest-first, HEAD-probed), warns
   loudly which version it actually installed, and leaves the operator to `hap update` once
   the intended one publishes. The fallback is refused for an explicit `HAP_VERSION` pin,
-  under `HAP_NO_FALLBACK` (any value), and on a checksum mismatch — corruption is never
+  under `HAP_NO_FALLBACK` (any NON-EMPTY value — set-but-empty means unset, matching
+  `HAP_VERSION=`), and on a checksum mismatch — corruption is never
   answered with a downgrade. `--ref vX.Y.Z` is NOT one of those refusals: it pins the git
   clone, which install.sh cannot see, so it only avoids the fallback by naming a release
   that already has assets. Detached HEAD is not a usable substitute signal either, because

@@ -65,9 +65,18 @@ NATIVE_ASSET="hap-native-${OS}-${ARCH}.tar.gz"
 MODEL_FILE="all-minilm-l6-v2-q8_0.gguf"
 RELEASES="https://github.com/${SLUG}/releases/download"
 
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
 ROOT="$(pwd)"
+TMP="$(mktemp -d)"
+# STAGE holds the fully-unpacked new payload and lives INSIDE the plugin root,
+# not under $TMP, so swapping it in is a rename rather than a cross-filesystem
+# copy — see swap_in. PREV holds the outgoing one until the swap succeeds.
+STAGE="${ROOT}/.hap-install"
+PREV="${ROOT}/.hap-prev"
+# PREV is deliberately NOT cleaned here: if this process is killed mid-swap it
+# is the only copy of the working install left, and deleting it on the way out
+# would destroy exactly what it exists to protect. A later successful install
+# clears it.
+trap 'rm -rf "$TMP" "$STAGE"' EXIT
 ATTEMPT=0
 
 # Right after a version bump lands, the release workflow may still be
@@ -120,30 +129,81 @@ install_release() {
   verify "$dir" "${ASSET}" || fail "checksum verification failed for ${ASSET}"
   verify "$dir" "${NATIVE_ASSET}" || fail "checksum verification failed for ${NATIVE_ASSET}"
 
-  # Native runtime libraries (FAISS + llama.cpp). The binary is dynamically
-  # linked against these via an rpath of <plugin>/lib, so this is REQUIRED:
-  # without it hap will not start.
-  #
-  # Unpack to the staging directory first. Extracting straight over lib/ means
-  # `rm -rf lib` runs before tar can fail, so an out-of-space unpack would
-  # leave an existing install with no libraries at all — and the error the
-  # operator sees would blame the download.
-  tar -xzf "${dir}/${NATIVE_ASSET}" -C "$dir" || return 1
-  [ -d "${dir}/lib" ] || return 1
+  # Assemble the ENTIRE new payload in the staging directory before anything
+  # live is touched. The native runtime libraries (FAISS + llama.cpp) are
+  # REQUIRED — the binary is dynamically linked against them via an rpath of
+  # <plugin>/lib, so a binary without them will not start, and the two must
+  # never be installed independently.
+  rm -rf "$STAGE"
+  mkdir -p "$STAGE" || return 1
+  tar -xzf "${dir}/${NATIVE_ASSET}" -C "$STAGE" || return 1
+  [ -d "${STAGE}/lib" ] || return 1
+  # Set the mode HERE so the swap can be a plain rename. `install` copies, and
+  # a copy is the thing that can fail halfway.
+  install -m 755 "${dir}/${ASSET}" "${STAGE}/hap" || return 1
 
-  mkdir -p "$(dirname "$DEST")" || return 1
-  install -m 755 "${dir}/${ASSET}" "$DEST" || return 1
+  # A failed swap is a LOCAL problem (a full or read-only disk), not a
+  # publishing gap, so it is fatal rather than a cue to try an earlier release
+  # — every candidate would fail the same way, just more slowly.
+  swap_in || fail "could not put v${ver} in place; the previous install has been restored"
+  rm -rf "$STAGE"
   echo "installed ${ASSET} v${ver} at ${DEST}"
-
-  rm -rf lib
-  mv "${dir}/lib" lib || return 1
-  if [ "$OS" = "darwin" ] && command -v xattr >/dev/null 2>&1; then
-    xattr -dr com.apple.quarantine lib 2>/dev/null || true
-  fi
   echo "installed native libraries in lib/"
 
   install_model "$dir" "$base"
   return 0
+}
+
+# swap_in — replace bin/hap and lib/ with the staged payload, restoring the
+# previous ones if either move fails.
+#
+# Every move here is a rename WITHIN the plugin root, which is the whole reason
+# STAGE is not under $TMP: $TMP is typically a different filesystem (tmpfs vs
+# the plugin's disk), and `mv` across filesystems degrades to copy-then-delete.
+# Copying ~200MB of FAISS libraries can fail halfway on a full disk — and it
+# would do so with the old install already replaced, leaving a new binary
+# paired with partial libraries. A rename cannot fail halfway.
+#
+# The binary and lib/ are swapped as a unit because neither works without the
+# other, so a failure at any point puts BOTH back.
+swap_in() {
+  local restored=0
+  rm -rf "$PREV"
+  mkdir -p "$PREV" || return 1
+  mkdir -p "$(dirname "$DEST")" || return 1
+
+  if [ -e lib ]; then
+    mv lib "${PREV}/lib" || return 1
+  fi
+  if [ -e "$DEST" ]; then
+    mv "$DEST" "${PREV}/hap" || return 1
+  fi
+
+  if mv "${STAGE}/lib" lib && mv "${STAGE}/hap" "$DEST"; then
+    if [ "$OS" = "darwin" ] && command -v xattr >/dev/null 2>&1; then
+      xattr -dr com.apple.quarantine lib 2>/dev/null || true
+    fi
+    rm -rf "$PREV"
+    return 0
+  fi
+
+  echo "warning: could not put the new files in place; restoring the previous install" >&2
+  rm -rf lib
+  if [ -e "${PREV}/lib" ]; then
+    mv "${PREV}/lib" lib || restored=1
+  fi
+  if [ -e "${PREV}/hap" ]; then
+    mv "${PREV}/hap" "$DEST" || restored=1
+  fi
+  # Only discard the saved copy once it is definitely back in place. If even
+  # the restore failed, PREV is the last copy of a working install — say where
+  # it is instead of deleting it.
+  if [ "$restored" = 0 ]; then
+    rm -rf "$PREV"
+  else
+    echo "warning: the previous install could not be fully restored; it is kept at ${PREV}" >&2
+  fi
+  return 1
 }
 
 # install_model <attempt-dir> <base-url> — the embedding model for semantic
@@ -261,6 +321,9 @@ elif [ -n "$VERSION_PINNED" ]; then
 elif [ -n "${HAP_NO_FALLBACK:-}" ]; then
   # ANY non-empty value, not just "1": an escape hatch that quietly ignores
   # HAP_NO_FALLBACK=true would fail open, which is the wrong way for an opt-out
+  # to break. An EMPTY value means unset, matching HAP_VERSION= and the way this
+  # repo reads every other flag env var — so `HAP_NO_FALLBACK= cmd` still falls
+  # back, which is what a wrapper clearing an inherited flag intends.
   # to break.
   fail "download failed for v${VERSION}
 (HAP_NO_FALLBACK is set, so no earlier release was substituted)"

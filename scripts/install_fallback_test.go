@@ -236,6 +236,28 @@ fi
 exit 0
 `
 	writeFile(t, filepath.Join(dir, "curl"), []byte(shim), 0o755)
+
+	// A fake `mv` so a test can make ONE move of the swap fail. A full or
+	// read-only disk is the real cause and cannot be simulated as root, which
+	// bypasses permission checks; injecting the failure at the call is the only
+	// way to reach the rollback path at all.
+	realMv, err := exec.LookPath("mv")
+	if err != nil {
+		t.Skip("mv not available")
+	}
+	mvShim := `#!/bin/sh
+# Fails when the SOURCE matches the $HAP_TEST_MV_FAIL glob, else defers to the
+# real mv. Matching the source rather than the destination is deliberate: it
+# lets a test break one move of the swap while leaving the rollback's own moves
+# — whose sources live under .hap-prev — working.
+if [ -n "${HAP_TEST_MV_FAIL:-}" ]; then
+  case "$1" in
+    $HAP_TEST_MV_FAIL) echo "mv: simulated failure: $1" >&2; exit 1 ;;
+  esac
+fi
+exec '` + realMv + `' "$@"
+`
+	writeFile(t, filepath.Join(dir, "mv"), []byte(mvShim), 0o755)
 	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
 }
 
@@ -454,6 +476,66 @@ func TestInstallEmptyHapVersionIsNotAPin(t *testing.T) {
 	mustNotContain(t, out, "pinned version")
 }
 
+// The binary and lib/ have to land together — the binary is rpath-linked
+// against those libraries, so a new binary beside old or partial libraries does
+// not start. Whichever half of the swap fails, BOTH halves must go back.
+//
+// This is the failure the staging directory exists for. Before it, the swap was
+// a cross-filesystem `mv` from /tmp, which degrades to copy-then-delete and can
+// fail halfway with the old install already gone.
+func TestInstallSwapFailureRestoresThePreviousInstall(t *testing.T) {
+	for _, tc := range []struct{ name, failSource string }{
+		{"library move fails", "*/.hap-install/lib"},
+		{"binary move fails", "*/.hap-install/hap"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newInstallEnv(t, "0.6.1",
+				[]string{"v0.6.1"}, []release{{version: "0.6.1"}})
+			env.seedPriorInstall(t)
+
+			code, out := env.run(t, "HAP_TEST_MV_FAIL="+tc.failSource)
+			if code != 1 {
+				t.Fatalf("a failed swap must fail the install (exit %d):\n%s", code, out)
+			}
+			env.assertPriorInstallIntact(t, out)
+			// The new payload must be gone too — a leftover half is what makes
+			// the pairing invalid.
+			if env.exists("lib/libfake.so") {
+				t.Errorf("the new libraries survived a rolled-back swap:\n%s", out)
+			}
+			mustContain(t, out, "restoring the previous install")
+		})
+	}
+}
+
+// The last-resort path: the swap fails AND putting the old files back fails
+// too. The saved copy is then the only surviving working install, so it must
+// NOT be deleted on the way out — the operator is told where it is.
+func TestInstallFailedRollbackKeepsTheSavedCopy(t *testing.T) {
+	env := newInstallEnv(t, "0.6.1",
+		[]string{"v0.6.1"}, []release{{version: "0.6.1"}})
+	env.seedPriorInstall(t)
+
+	// Matches the staged lib (triggering the rollback) AND the rollback's own
+	// restore of the saved lib — but not `mv lib .hap-prev/lib`, whose source
+	// is the bare "lib".
+	code, out := env.run(t, "HAP_TEST_MV_FAIL=*/.hap-*/lib")
+	if code != 1 {
+		t.Fatalf("a failed swap must fail the install (exit %d):\n%s", code, out)
+	}
+	mustContain(t, out, "could not be fully restored", ".hap-prev")
+
+	// assertPriorInstallIntact does not apply here: lib/ is legitimately gone,
+	// which is precisely why the saved copy must still exist.
+	body, err := os.ReadFile(filepath.Join(env.root, ".hap-prev", "lib", "libsentinel.so"))
+	if err != nil {
+		t.Fatalf("the saved copy of the previous install was deleted: %v\n%s", err, out)
+	}
+	if string(body) != "previous install\n" {
+		t.Errorf("the saved copy was corrupted:\n%s", out)
+	}
+}
+
 // The escape hatch for reproducible installs: fail loudly instead of quietly
 // getting something older.
 func TestInstallNoFallbackEnvRefusesToSubstitute(t *testing.T) {
@@ -469,6 +551,24 @@ func TestInstallNoFallbackEnvRefusesToSubstitute(t *testing.T) {
 		t.Errorf("HAP_NO_FALLBACK=1 installed a binary anyway:\n%s", out)
 	}
 	mustContain(t, out, "HAP_NO_FALLBACK is set")
+}
+
+// Set-but-empty means UNSET, for the same reason `HAP_VERSION=` is not a pin
+// and the way every other flag env var in this repo is read. `HAP_NO_FALLBACK=
+// bash scripts/install.sh` is how a wrapper CLEARS an inherited flag, so
+// honoring it as "set" would enable the opt-out for someone switching it off.
+func TestInstallEmptyNoFallbackDoesNotBlockTheFallback(t *testing.T) {
+	env := newInstallEnv(t, "0.6.2",
+		[]string{"v0.6.1", "v0.6.2"},
+		[]release{{version: "0.6.1"}})
+
+	code, out := env.run(t, "HAP_NO_FALLBACK=")
+	if code != 0 {
+		t.Fatalf("an empty HAP_NO_FALLBACK should not block the fallback (exit %d):\n%s", code, out)
+	}
+	if got := env.installedVersion(t); got != "0.6.1" {
+		t.Errorf("installed v%s, want v0.6.1:\n%s", got, out)
+	}
 }
 
 // A checksum mismatch is corruption or tampering, never a publishing gap.
