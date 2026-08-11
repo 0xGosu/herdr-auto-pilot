@@ -22,12 +22,12 @@ import (
 // that matters is the SET of keys: a new list section added to config.Config
 // fails this test until it is either given a command or exempted with a reason.
 var configListCommands = map[string]string{
-	"safety.never_auto_patterns":    "hap rules add / hap rules remove",
-	"safety.never_auto_rules":       "hap rules add --agent-type / hap rules remove-scoped",
-	"safety.disabled_seed_patterns": "hap rules disable-seed / hap rules enable-seed",
-	"task_sources":                  "hap task-source add / set / remove",
-	"classifier":                    "hap classifier add / remove",
-	"capture_delay":                 "hap capture-delay set / remove",
+	"safety.never_auto_patterns":    "hap config rules add / hap config rules remove",
+	"safety.never_auto_rules":       "hap config rules add --agent-type / hap config rules remove-scoped",
+	"safety.disabled_seed_patterns": "hap config rules disable-seed / hap config rules enable-seed",
+	"task_sources":                  "hap config task-source add / set / remove",
+	"classifier":                    "hap config classifier add / remove",
+	"capture_delay":                 "hap config capture-delay set / remove",
 
 	// The inline LLM environments. Their VALUES are never rendered by any read
 	// path (they hold API keys), which is a display rule, not a reason to make

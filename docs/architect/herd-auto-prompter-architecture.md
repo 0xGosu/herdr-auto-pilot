@@ -645,7 +645,7 @@ automated action.
   `[[safety.indicator_rules]]` / `safety.irreversible_indicators` keys are
   deprecated and, on load, merge into `never_auto_rules` / `never_auto_patterns`
   as STRICT rules. Individual seed rules can be silenced by id via
-  `safety.disabled_seed_patterns` (`hap rules disable-seed`).
+  `safety.disabled_seed_patterns` (`hap config rules disable-seed`).
 - **Global pause/kill switch.** Instantly halts all automated prompting across the
   herd, from either the TUI or CLI. Implemented as an **append-only event table**
   — the daemon reads the *latest row every pipeline tick*, so a kill takes effect

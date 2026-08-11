@@ -133,7 +133,7 @@ func TestTUIAddTaskSourcePromptRejectsBadInput(t *testing.T) {
 	}
 }
 
-// TestConfigTabShowsAutoSendFlag mirrors `hap task-source list`: a source that
+// TestConfigTabShowsAutoSendFlag mirrors `hap config task-source list`: a source that
 // hands out tasks unprompted must say so wherever sources are listed.
 func TestConfigTabShowsAutoSendFlag(t *testing.T) {
 	m, app, path := sourcePromptModel(t)
