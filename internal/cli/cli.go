@@ -32,6 +32,11 @@ import (
 // "error:" prefix, so scripted health checks can detect it.
 var ErrUnhealthy = errors.New("daemon unhealthy")
 
+// deprecationOut is where the "this verb moved" note goes. It is stderr rather
+// than the command's own writer so the tab-separated listings these verbs print
+// stay machine-parseable; a var so tests can capture it.
+var deprecationOut io.Writer = os.Stderr
+
 // Run dispatches one CLI verb against the shared front-end layer, through the
 // command registry (help.go) so that every verb carries its own help text and
 // "Next steps" footer.
@@ -40,11 +45,6 @@ var ErrUnhealthy = errors.New("daemon unhealthy")
 // anywhere in the arguments prints the verb's guide, and `--no-hints` (like
 // HAP_NO_HINTS=1) suppresses the footers for scripts parsing the listings.
 // The footers are also gated by config `cli.ai_agent_friendly_output`.
-// deprecationOut is where the "this verb moved" note goes. It is stderr rather
-// than the command's own writer so the tab-separated listings these verbs print
-// stay machine-parseable; a var so tests can capture it.
-var deprecationOut io.Writer = os.Stderr
-
 func Run(ctx context.Context, app *frontend.App, out io.Writer, verb string, args []string) error {
 	args, wantHints := stripHintFlag(args)
 

@@ -80,13 +80,24 @@ func TestNoCommandPrintsTwoFooters(t *testing.T) {
 		// Bare, the "list" sub-op, and each documented example — the examples
 		// are what give the argument-taking verbs (task, task-source, rules,
 		// config, signatures) real coverage instead of an immediate usage error.
+		// A `hap config` topic is a TWO-word name, so the verb handed to Run is
+		// "config" and the topic becomes the first argument. Matching on the
+		// whole prefix rather than on fields[1] is what keeps these commands
+		// swept at all: a single token can never equal "config rules", so an
+		// equality check silently skipped every example of all four topics —
+		// exactly the argument-taking verbs this sweep exists for.
+		verb, lead, _ := strings.Cut(c.Name, " ")
+		var prefixArgs []string
+		if lead != "" {
+			prefixArgs = []string{lead}
+		}
 		runs := [][]string{nil, {"list"}}
 		for _, ex := range c.Examples {
-			fields := strings.Fields(ex)
-			if len(fields) < 2 || fields[0] != "hap" || fields[1] != c.Name {
+			if !strings.HasPrefix(ex, "hap "+c.Name+" ") {
 				continue
 			}
-			args := append([]string{}, fields[2:]...)
+			fields := strings.Fields(strings.TrimPrefix(ex, "hap "+c.Name+" "))
+			args := append([]string{}, fields...)
 			for i, a := range args {
 				// Point every example at a checklist this test owns, so the
 				// task ops actually execute instead of failing to resolve.
@@ -97,7 +108,8 @@ func TestNoCommandPrintsTwoFooters(t *testing.T) {
 			runs = append(runs, args)
 		}
 		for _, args := range runs {
-			out, err := run(t, app, c.Name, args...)
+			full := append(append([]string{}, prefixArgs...), args...)
+			out, err := run(t, app, verb, full...)
 			if err != nil {
 				continue // needs a live agent, a real id, or a TTY — not our concern here
 			}

@@ -1016,7 +1016,7 @@ var workflows = []struct {
 		Steps: []string{
 			"hap rename <pane-id> <name>           # give the agent a stable short name",
 			"hap config task-source add --agent <name> ./docs/tasks.md",
-			"hap config task-source list                  # confirm it, note the index",
+			"hap config task-source list           # confirm it, note the index",
 			"hap task <name> list                  # the agent sees these items",
 		},
 	},
@@ -1244,7 +1244,14 @@ func suggest(verb string) string {
 	}
 	var hits []string
 	for _, c := range Commands() {
-		for _, n := range append([]string{c.Name}, c.Aliases...) {
+		// MovedFrom is matched too: a typo'd former spelling ("task-sources")
+		// no longer resembles the canonical two-word name, so without it the
+		// operator gets a bare unknown-command error for a verb that existed
+		// last release. The SUGGESTION is always c.Name, so they are pointed at
+		// the spelling to use now, not the one they half-remembered.
+		names := append([]string{c.Name}, c.Aliases...)
+		names = append(names, c.MovedFrom...)
+		for _, n := range names {
 			if strings.HasPrefix(n, verb) || strings.HasPrefix(verb, n) || strings.Contains(n, verb) {
 				hits = append(hits, c.Name)
 			}

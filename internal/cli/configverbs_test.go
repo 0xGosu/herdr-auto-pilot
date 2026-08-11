@@ -120,6 +120,22 @@ func TestMovedVerbNotesTheNewSpellingOnStderr(t *testing.T) {
 	}
 }
 
+// TestMovedVerbTypoStillSuggestsTheCommand covers what a rename costs an
+// operator who half-remembers the old name. "task-sources" no longer resembles
+// the canonical two-word "config task-source", so without MovedFrom in the
+// candidate set they get a bare unknown-command error for a verb that existed
+// last release. The SUGGESTION is the canonical name, not the one they typed.
+func TestMovedVerbTypoStillSuggestsTheCommand(t *testing.T) {
+	app, _ := testApp(t)
+	_, err := run(t, app, "task-sources")
+	if err == nil {
+		t.Fatal("expected an error for a mistyped verb")
+	}
+	if !strings.Contains(err.Error(), "config task-source") {
+		t.Errorf("error does not suggest the command under its current name: %v", err)
+	}
+}
+
 // TestConfigTopicHelpResolvesToTheTopic pins the routing that made two-word
 // commands worth having: asking for help the way the command is typed.
 func TestConfigTopicHelpResolvesToTheTopic(t *testing.T) {
