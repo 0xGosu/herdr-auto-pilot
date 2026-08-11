@@ -178,7 +178,7 @@ func TestActionReviewSkippedForDeclaredTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	original := (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name}).Prompt()
+	original := (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name, SourceIndex: "0"}).Prompt()
 
 	h.push("agent-ar3", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })

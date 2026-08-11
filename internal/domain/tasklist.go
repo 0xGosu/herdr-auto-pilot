@@ -26,44 +26,51 @@ var inProgressItemRE = regexp.MustCompile(`^\s*(?:[-*+]\s+)?\[-\]\s*(.+)$`)
 // the task-source file path, {task_list_path_quoted} is that path as a single
 // shell word (use it whenever the template hands the agent a command to RUN —
 // a path with a space would otherwise split into two arguments),
-// {agent_name} is the agent's short name, {cwd} is the agent's working
-// directory (the project it is in).
+// {task_source_index} is the source's position in `hap config task-source
+// list` (a provider-independent `hap task` selector), {agent_name} is the
+// agent's short name, {cwd} is the agent's working directory (the project it
+// is in).
 //
 // The default steers the agent to manage its list through the `hap task` CLI
 // with the agent's own name pre-filled (so `hap task {agent_name} list`
 // resolves this exact source). It deliberately carries only the pointer to
 // `list`: the full lifecycle instructions (`start <n>`, `done <n>`, how `<n>`
-// is addressed, and the `--path` fallback) are printed by that command itself
+// is addressed, and the index fallback) are printed by that command itself
 // (TaskManagementHints), so they are stated once, next to the real task
 // numbers, instead of being re-sent with every prompt.
-const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them (if that name isn't recognized, use `--path {task_list_path_quoted}` in place of `{agent_name}`)."
+//
+// The fallback selector is the task-source INDEX, not the file path: an index
+// addresses the source through hap's own config, so the same command works
+// under every storage provider — a `--path` fallback reads a LOCAL file and is
+// dead advice for a remote list.
+const DefaultNextTaskTemplate = "Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them (if that name isn't recognized, use the task-source index `{task_source_index}` in place of `{agent_name}`)."
 
 // TaskManagementHints renders the task-management instructions printed under a
 // `hap task … list`. They live here — beside the template that points the agent
 // at `list` — so the prompt and the listing can never drift apart.
 //
-// agent is the name the caller addressed the list by, and path the resolved
-// checklist file. When the caller used --path (agent == ""), every command is
-// spelled with that path and the "name no longer recognized" note is dropped:
-// there is no name to fall back from. That note is what keeps a source that
-// isn't name-addressable (scoped by agent type, pane id, workspace, or "any")
-// manageable — `hap task {agent}` errors on those, and the path form always
-// works.
-func TaskManagementHints(agent, path string) string {
-	return taskManagementHints(agent, path, false)
+// agent is the selector the caller addressed the list by (an agent name or a
+// task-source index), path the resolved checklist file, and sourceIndex the
+// source's pre-rendered config position ("" when the caller used --path). The
+// fallback the note offers is the task-source INDEX — a selector that
+// addresses the source through hap's own config, so it works identically
+// under every storage provider, unlike the old `--path` advice, which reads a
+// LOCAL file and is dead under a remote one. A caller that addressed the list
+// by index already holds the fallback, so no note is printed for it.
+func TaskManagementHints(agent, path, sourceIndex string) string {
+	return taskManagementHints(agent, path, sourceIndex, false)
 }
 
 // RemoteTaskManagementHints is TaskManagementHints for a list that is not a
-// file on this machine. It drops the `--path` fallback — --path always reads a
-// LOCAL file, so under a remote provider that line names something that does
-// not exist — and says so, since an agent told only "use hap task" will
-// otherwise go looking for the file anyway.
-func RemoteTaskManagementHints(agent, display string) string {
-	return taskManagementHints(agent, display, true)
+// file on this machine. It never mentions --path — under a remote provider
+// that flag names something that does not exist — and says the list is
+// remote, since an agent told only "use hap task" will otherwise go looking
+// for the file anyway.
+func RemoteTaskManagementHints(agent, display, sourceIndex string) string {
+	return taskManagementHints(agent, display, sourceIndex, true)
 }
 
-func taskManagementHints(agent, path string, remote bool) string {
-	quoted := ShellQuote(path)
+func taskManagementHints(agent, path, sourceIndex string, remote bool) string {
 	target := agent
 	if target == "" {
 		if remote {
@@ -71,7 +78,7 @@ func taskManagementHints(agent, path string, remote bool) string {
 			// always reachable by the agent's own name.
 			target = "<agent>"
 		} else {
-			target = "--path " + quoted
+			target = "--path " + ShellQuote(path)
 		}
 	}
 	var b strings.Builder
@@ -82,17 +89,44 @@ func taskManagementHints(agent, path string, remote bool) string {
 	// '#3' is quoted because these commands are run in a shell, where a bare
 	// #3 is stripped as a comment and the ref reaches hap as nothing at all.
 	b.WriteString("- `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.1`); otherwise its position in the list, which `'#3'` always addresses (quote it — a bare #3 is a shell comment).\n")
-	switch {
-	case remote:
+	if remote {
 		// Deliberately does not name the --path flag even to warn against it:
 		// an agent that reads a flag name tends to try it. State the fact
 		// instead — there is no local file — which answers the same question
 		// without handing over a spelling to experiment with.
 		b.WriteString("- your task list is stored remotely; there is no file here to open or edit, so `hap task` is the only way to read or change it.\n")
-	case agent != "":
-		fmt.Fprintf(&b, "- when the agent name `%s` is no longer recognized, use `--path %s` in place of `%s`\n", agent, quoted, agent)
+	}
+	// The index note is rendered with the BARE digits, matching what the
+	// selector accepts unquoted — never "#N", which a shell strips as a
+	// comment when pasted without quotes.
+	if _, isIndex := ParseTaskSourceIndexRef(agent); agent != "" && !isIndex && sourceIndex != "" {
+		fmt.Fprintf(&b, "- when the agent name `%s` is no longer recognized, use the task-source index `%s` in place of `%s` (`hap config task-source list` shows each source's index)\n",
+			agent, sourceIndex, agent)
 	}
 	return b.String()
+}
+
+// ParseTaskSourceIndexRef reads a `hap task` list selector as a task-source
+// index: bare digits ("0"), or "#" plus digits (which needs shell quoting, so
+// every rendered command and hint spells the bare form). The bare form can
+// never collide with an agent: a herdr agent name must start with a lowercase
+// letter. This parses the REFERENCE only — bounds against the configured
+// sources are the resolver's job, where the real list is in hand.
+func ParseTaskSourceIndexRef(s string) (int, bool) {
+	digits := strings.TrimPrefix(s, "#")
+	if digits == "" {
+		return 0, false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // shellSafeRE matches a string that needs no quoting to survive a shell word
@@ -153,6 +187,15 @@ type DeclaredTask struct {
 	Template  string // operator template; "" uses DefaultNextTaskTemplate
 	AgentName string // agent short name, for {agent_name}
 	Cwd       string // agent working directory, for {cwd}
+	// SourceIndex is what {task_source_index} renders — the source's position
+	// in the config, pre-rendered as the bare-digit selector `hap task` takes
+	// (never "#N": the templates hand agents commands they paste into a shell,
+	// where an unquoted #N is a comment). It is a string threaded from
+	// wherever the caller iterated the config — NEVER recovered by comparing
+	// entries, since duplicate sources are legal and equality finds the wrong
+	// one. Empty renders {agent_name} instead: the always-working selector, so
+	// a caller that cannot know the index never emits a broken command.
+	SourceIndex string
 	// LLMReview reports whether the source opted IN to the pre-delivery LLM
 	// review of the task about to be auto-sent
 	// (enable_llm_review_before_auto_send=true; off by default). It composes
@@ -178,14 +221,16 @@ type DeclaredTask struct {
 // DefaultRemoteNextTaskTemplate is DefaultNextTaskTemplate for a task list that
 // is NOT a file on the agent's machine.
 //
-// It drops the `--path` clause for a hard reason: --path always reads a LOCAL
-// file, so under a remote provider that clause points the agent at something
-// that does not exist. It does not need the fallback either — the fallback
-// existed for sources not addressable by an agent's name, and a remote list
-// derived per agent is named after that very agent, so `hap task {agent_name}`
-// always resolves.
+// It never mentions `--path`, for a hard reason: --path always reads a LOCAL
+// file, so under a remote provider it points the agent at something that does
+// not exist. The fallback selector is the task-source index instead — the
+// selector that works regardless of where the list is stored. A remote list
+// DERIVED per agent always resolves by the agent's own name, but a shared
+// remote list scoped by workspace or agent type is exactly the source a name
+// cannot address, and without the index it was unreachable from the CLI.
 const DefaultRemoteNextTaskTemplate = "Your next task is {next_task_content}. " +
-	"Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them. " +
+	"Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them " +
+	"(if that name isn't recognized, use the task-source index `{task_source_index}` in place of `{agent_name}`). " +
 	"Your task list is not a file on this machine — always go through `hap task`, never try to open or edit it directly."
 
 // TemplateOrDefault resolves a task source's next-task template, falling back
@@ -224,11 +269,16 @@ func (t DeclaredTask) Prompt() string {
 	if t.Content != "" {
 		body = t.Content
 	}
+	sourceIndex := t.SourceIndex
+	if sourceIndex == "" {
+		sourceIndex = t.AgentName
+	}
 	return strings.NewReplacer(
 		// The quoted form comes first: NewReplacer matches in argument order,
 		// so the shorter {task_list_path} would otherwise consume its prefix
 		// and leave a stray "_quoted" in the prompt.
 		"{task_list_path_quoted}", ShellQuote(t.Path),
+		"{task_source_index}", sourceIndex,
 		// The task reaches the agent with its id unescaped: the agent reads the
 		// id here and types it back at `hap task done`, so showing it "8\.1"
 		// invites a reference nobody typed intentionally. The FILE keeps the

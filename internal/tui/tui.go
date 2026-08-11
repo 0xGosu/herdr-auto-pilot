@@ -3657,10 +3657,13 @@ func (m Model) sendTaskRow(r taskRow) (tea.Model, tea.Cmd) {
 	}
 	template := m.data.tasks[r.group].Source.NextTaskTemplate
 	app := m.app
+	// The group index IS the config position (one group per source, in config
+	// order) — threaded through, never recovered by comparing entries.
+	sourceIndex := strconv.Itoa(r.group)
 	paneID, agentType, path, text, item := agent.PaneID, agent.AgentType, canonicalTaskPath(r.path), r.itemText, r.item
 	send := m.do(fmt.Sprintf("task #%d sent to %s and marked [-] in progress", item, name),
 		func(c context.Context) error {
-			return app.SendTaskToAgent(c, paneID, agentType, name, path, template, item, text)
+			return app.SendTaskToAgent(c, paneID, agentType, name, path, template, sourceIndex, item, text)
 		})
 	// The count rides along: what gets delivered is the FOLDED task, so a label
 	// naming only the item number would take a "y" for more than it showed.

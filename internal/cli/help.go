@@ -830,7 +830,7 @@ func buildCommands() {
 			Flags: []FlagDoc{
 				{Name: "--agent", Arg: "A", Desc: "agent short name, id, or type this source applies to"},
 				{Name: "--workspace", Arg: "W", Desc: "workspace name this source applies to (\"*\" wildcards, e.g. \"codex-*\")"},
-				{Name: "--template", Arg: "T", Desc: "next-task prompt template; placeholders {next_task_content} {task_list_path} {task_list_path_quoted} {agent_name} {cwd}"},
+				{Name: "--template", Arg: "T", Desc: "next-task prompt template; placeholders {next_task_content} {task_list_path} {task_list_path_quoted} {task_source_index} {agent_name} {cwd}"},
 				{Name: "--auto-send-when-idle", Desc: "also hand out tasks on the periodic idle poll, not only on a herdr attention event"},
 				{Name: "--enable-llm-review-before-auto-send", Desc: "let the configured [llm].command revise the task list and pick the task, immediately before the daemon auto-sends one"},
 				{Name: "--max-tasks", Arg: "N", Default: "config default", Desc: "cap on how many items this list may hold before task generation stops refilling it"},
@@ -889,15 +889,15 @@ func buildCommands() {
 			Group:   groupTasks,
 			Summary: "manage the checklist items in an agent's task list (CRUD + send)",
 			Usage: []string{
-				"hap task [<agent> | --path <file>] list [--status all|pending|done]",
-				"hap task [<agent> | --path <file>] get <n>",
-				"hap task [<agent> | --path <file>] add <text>",
-				"hap task [<agent> | --path <file>] start <n>",
-				"hap task [<agent> | --path <file>] done <n>",
-				"hap task [<agent> | --path <file>] undone <n>",
-				"hap task [<agent> | --path <file>] update <n> <text>",
-				"hap task [<agent> | --path <file>] remove <n>",
-				"hap task [<agent> | --path <file>] move <n> <position|up|down>",
+				"hap task [<agent> | <source-index> | --path <file>] list [--status all|pending|done]",
+				"hap task [<agent> | <source-index> | --path <file>] get <n>",
+				"hap task [<agent> | <source-index> | --path <file>] add <text>",
+				"hap task [<agent> | <source-index> | --path <file>] start <n>",
+				"hap task [<agent> | <source-index> | --path <file>] done <n>",
+				"hap task [<agent> | <source-index> | --path <file>] undone <n>",
+				"hap task [<agent> | <source-index> | --path <file>] update <n> <text>",
+				"hap task [<agent> | <source-index> | --path <file>] remove <n>",
+				"hap task [<agent> | <source-index> | --path <file>] move <n> <position|up|down>",
 				"hap task <agent> send <n> [--yes]",
 			},
 			Flags: []FlagDoc{
@@ -908,6 +908,13 @@ func buildCommands() {
 			Details: "<n> is a task REFERENCE, not always a position: when the list numbers its own\n" +
 				"tasks, use that id (e.g. `done 3.4`); '#3' always means the 3rd item in the file\n" +
 				"(quote it — a bare #3 is a shell comment). Every mutating op reprints the list.\n" +
+				"<source-index> is a task source's position from `hap config task-source list`\n" +
+				"(e.g. `hap task 0 list`) — the selector that works under EVERY storage provider,\n" +
+				"for a source an agent name cannot address (scoped by workspace or agent type,\n" +
+				"or one agent matching several sources). An index is positional: removing a\n" +
+				"source renumbers the ones after it, so prefer the agent name when it resolves.\n" +
+				"A derived per-agent source (remote, no file name) is not index-addressable —\n" +
+				"the index names the source, and each matched agent has its own list.\n" +
 				"Aliases: ls, show, create, wip, check, uncheck/reopen, edit, rm/delete, mv/reorder.\n" +
 				"Marks: [ ] pending, [-] in progress, [x] done.\n" +
 				"`list` marks a task carrying nested sub-items with `(+N detail lines)`; `get`\n" +
@@ -927,13 +934,14 @@ func buildCommands() {
 				"hap task vivid-falcon list --status pending",
 				"hap task vivid-falcon start 3.4",
 				"hap task vivid-falcon done 3.4",
+				"hap task 0 list",
 				"hap task --path ./docs/tasks.md add \"write the migration test\"",
 				"hap task vivid-falcon move 5 1",
 				"hap task vivid-falcon move 3.4 up",
 			},
 			Next: []Hint{
 				{Cmd: "hap task <agent> list", Why: "the items, with their numbers"},
-				{Cmd: "hap config task-source list", Why: "which file an agent's list comes from"},
+				{Cmd: "hap config task-source list", Why: "which list an agent's tasks come from, and each source's index"},
 				{Cmd: "hap agents", Why: "the agent names these commands take"},
 			},
 			SelfHints: true,

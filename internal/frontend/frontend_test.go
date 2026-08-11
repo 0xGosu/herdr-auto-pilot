@@ -657,8 +657,9 @@ func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
 	}
 
 	// The generated task uses the same default prompt as every declared task,
-	// including the newly created task-list path.
-	wantPrompt := domain.DeclaredTask{Task: taskText, Path: path, AgentName: name}.Prompt()
+	// carrying the just-registered source's index (position 0) so the fallback
+	// selector in the prompt is real, not the agent-name stand-in.
+	wantPrompt := domain.DeclaredTask{Task: taskText, Path: path, AgentName: name, SourceIndex: "0"}.Prompt()
 	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
 		t.Errorf("delivered %v, want the rendered prompt %q", fake.inputs, wantPrompt)
 	}
@@ -746,7 +747,7 @@ func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
 	// first task is sent from the raw normalized suggestion (never re-read
 	// from the numbered file), so it stays clean, unnumbered text.
 	wantPrompt := domain.DeclaredTask{
-		Task: "Investigate the flaky auth test", Path: path, AgentName: name,
+		Task: "Investigate the flaky auth test", Path: path, AgentName: name, SourceIndex: "0",
 	}.Prompt()
 	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
 		t.Errorf("delivered %v, want only the first task as %q", fake.inputs, wantPrompt)
@@ -810,7 +811,7 @@ func TestConfirmGeneratedMultipleListsWritesOnlyLastList(t *testing.T) {
 		}
 	}
 	wantPrompt := domain.DeclaredTask{
-		Task: "Add multi-list handling", Path: path, AgentName: name,
+		Task: "Add multi-list handling", Path: path, AgentName: name, SourceIndex: "0",
 	}.Prompt()
 	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
 		t.Errorf("delivered %v, want only the last list's first task as %q", fake.inputs, wantPrompt)
@@ -1270,7 +1271,7 @@ func TestConfirmGeneratedTaskAppendsToExhaustedSource(t *testing.T) {
 
 	// The prompt points at the DECLARED file, and the correction learns the
 	// declared-task action.
-	wantPrompt := domain.DeclaredTask{Task: taskText, Path: path, AgentName: name}.Prompt()
+	wantPrompt := domain.DeclaredTask{Task: taskText, Path: path, AgentName: name, SourceIndex: "0"}.Prompt()
 	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
 		t.Errorf("delivered %v, want the declared-source prompt %q", fake.inputs, wantPrompt)
 	}
@@ -1301,7 +1302,7 @@ func TestConfirmGeneratedMultipleTasksAppendToExhaustedSource(t *testing.T) {
 	if string(body) != want {
 		t.Errorf("declared file = %q, want %q", body, want)
 	}
-	wantPrompt := domain.DeclaredTask{Task: "Investigate the flaky auth test", Path: path, AgentName: name}.Prompt()
+	wantPrompt := domain.DeclaredTask{Task: "Investigate the flaky auth test", Path: path, AgentName: name, SourceIndex: "0"}.Prompt()
 	if len(fake.inputs) != 1 || fake.inputs[0] != wantPrompt {
 		t.Errorf("delivered %v, want only the first task as %q", fake.inputs, wantPrompt)
 	}
@@ -4083,6 +4084,43 @@ func derivedGistCfg(t *testing.T, agentSelector string) config.Config {
 	}
 }
 
+// TestTaskListForIndexSelector pins the index selector against a REMOTE
+// provider — the provider-independence the selector exists for: an explicit
+// gist file resolves to its locator with no agent name (and no token read, so
+// no network), a DERIVED source refuses toward the agent name (the index
+// names a source, and its lists are per agent), and '#N' equals bare N.
+func TestTaskListForIndexSelector(t *testing.T) {
+	app, _ := testApp(t)
+	cfg := derivedGistCfg(t, "claude") // source 0: derived (no file name)
+	cfg.TaskSources = append(cfg.TaskSources, config.TaskSource{Agent: "x", Path: "shared.md"})
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	locator, sourceIndex, err := app.TaskListFor("1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "gist://3f2a1b9c/shared.md"; locator != want || sourceIndex != "1" {
+		t.Fatalf("TaskListFor(\"1\") = (%q, %q), want (%q, \"1\")", locator, sourceIndex, want)
+	}
+	if hashed, _, err := app.TaskListFor("#1", ""); err != nil || hashed != locator {
+		t.Fatalf("TaskListFor(\"#1\") = (%q, %v), want the same list as \"1\"", hashed, err)
+	}
+
+	if _, _, err := app.TaskListFor("0", ""); err == nil {
+		t.Fatal("a derived source addressed by index must refuse")
+	} else if !strings.Contains(err.Error(), "one list per matched agent") {
+		t.Fatalf("derived-by-index error should say why and point at the agent name, got: %v", err)
+	}
+
+	if _, _, err := app.TaskListFor("5", ""); err == nil {
+		t.Fatal("an out-of-range index must refuse")
+	} else if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("out-of-range error should say the source does not exist, got: %v", err)
+	}
+}
+
 // TestTaskGroupsDerivedSourceSoleLiveMatchResolves: a derived source with
 // exactly one live matching agent resolves to that agent's list — the case
 // the Tasks tab used to render as a template note even though there was
@@ -4311,13 +4349,16 @@ func TestSendTaskToAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "brave-otter",
-		path, "", 1, `step one\nstep two`); err != nil {
+		path, "", "3", 1, `step one\nstep two`); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.sent) != 1 {
 		t.Fatalf("expected one delivery, got %v", h.sent)
 	}
-	for _, want := range []string{"step one\nstep two", "brave-otter", path} {
+	// The default prompt names the task, the agent, and the task-source index
+	// fallback — never the file path, which the CLI's hints render instead
+	// (and which under a remote provider would be a URL the agent cannot use).
+	for _, want := range []string{"step one\nstep two", "brave-otter", "use the task-source index `3`"} {
 		if !strings.Contains(h.sent[0], want) {
 			t.Errorf("sent prompt missing %q:\n%s", want, h.sent[0])
 		}
@@ -4332,11 +4373,11 @@ func TestSendTaskToAgent(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`- [x] step one\nstep two`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", 1, `step one\nstep two`); err == nil ||
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", "", 1, `step one\nstep two`); err == nil ||
 		!strings.Contains(err.Error(), "no longer pending") {
 		t.Errorf("completed task must refuse to send, got %v", err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", 1, "different text"); err == nil ||
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", "", 1, "different text"); err == nil ||
 		!strings.Contains(err.Error(), "the checklist changed") {
 		t.Errorf("rewritten task must refuse to send, got %v", err)
 	}
@@ -4346,11 +4387,11 @@ func TestSendTaskToAgent(t *testing.T) {
 
 	// Guards: no herdr / no pane.
 	app.Herdr = nil
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", 1, "t"); err == nil {
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", "", 1, "t"); err == nil {
 		t.Error("nil herdr must refuse")
 	}
 	app.Herdr = h
-	if err := app.SendTaskToAgent(ctx, "", "claude", "n", path, "", 1, "t"); err == nil {
+	if err := app.SendTaskToAgent(ctx, "", "claude", "n", path, "", "", 1, "t"); err == nil {
 		t.Error("empty pane must refuse")
 	}
 }
@@ -4371,7 +4412,7 @@ func TestSendTaskToAgentFoldsNestedDetail(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "brave-otter", path, "", 1, "1. Build the widget"); err != nil {
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "brave-otter", path, "", "", 1, "1. Build the widget"); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.sent) != 1 {
@@ -4416,7 +4457,7 @@ func TestSendTaskToAgentRechecksIdle(t *testing.T) {
 	busy := &sendCaptureHerdr{agents: []domain.AgentTransition{
 		{AgentID: "w1:p2", PaneID: "w1:p2", AgentType: "claude", Status: "working"}}}
 	app, path := newApp(t, busy)
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err == nil ||
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err == nil ||
 		!strings.Contains(err.Error(), "cleanly idle") {
 		t.Errorf("a now-busy agent must refuse, got %v", err)
 	}
@@ -4429,14 +4470,14 @@ func TestSendTaskToAgentRechecksIdle(t *testing.T) {
 	// The agent vanished entirely.
 	gone := &sendCaptureHerdr{}
 	app, path = newApp(t, gone)
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err == nil ||
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err == nil ||
 		!strings.Contains(err.Error(), "no longer live") {
 		t.Errorf("a vanished agent must refuse, got %v", err)
 	}
 	// An unreadable agent list is not an idle agent: fail closed.
 	app, path = newApp(t, nil)
 	app.Herdr = &failingAgentsHerdr{}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err == nil ||
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err == nil ||
 		!strings.Contains(err.Error(), "nothing was sent") {
 		t.Errorf("an unreadable agent list must refuse, got %v", err)
 	}
@@ -4460,7 +4501,7 @@ func TestSendTaskToAgentReservesBeforeDelivering(t *testing.T) {
 	var atSend string
 	h := &sendCaptureHerdr{agents: idleAt("w1:p2")}
 	app.Herdr = &reserveProbeHerdr{sendCaptureHerdr: h, path: path, seen: &atSend}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work"); err != nil {
+	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(atSend, "- [-] work") {
@@ -4473,7 +4514,7 @@ func TestSendTaskToAgentReservesBeforeDelivering(t *testing.T) {
 		t.Fatal(err)
 	}
 	app2.Herdr = &sendCaptureHerdr{agents: idleAt("w1:p2"), sendErr: errors.New("pane gone")}
-	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2, "", 1, "work"); err == nil ||
+	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2, "", "", 1, "work"); err == nil ||
 		!strings.Contains(err.Error(), "pane gone") {
 		t.Errorf("a failed delivery must surface its error, got %v", err)
 	}
@@ -4524,7 +4565,7 @@ func TestSendTaskToAgentRollbackIsClaimScoped(t *testing.T) {
 		path:             path,
 		write:            "- [x] work\n", // completed by someone else mid-send
 	}
-	err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", 1, "work")
+	err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work")
 	if err == nil || !strings.Contains(err.Error(), "pane gone") {
 		t.Errorf("the delivery failure must still surface, got %v", err)
 	}
@@ -4549,7 +4590,7 @@ func TestSendTaskToAgentRendersCwd(t *testing.T) {
 	}
 	app.Herdr = h
 	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path,
-		"do {next_task_content} in {cwd}", 1, "work"); err != nil {
+		"do {next_task_content} in {cwd}", "", 1, "work"); err != nil {
 		t.Fatal(err)
 	}
 	// The foreground cwd wins, exactly as the daemon's resolver prefers it.
@@ -4565,7 +4606,7 @@ func TestSendTaskToAgentRendersCwd(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2,
-		"do {next_task_content} in {cwd}", 1, "work"); err != nil {
+		"do {next_task_content} in {cwd}", "", 1, "work"); err != nil {
 		t.Errorf("a missing inspector must never block a send, got %v", err)
 	}
 	// Exactly, not Contains: "do work in " is a prefix of a resolved cwd too,

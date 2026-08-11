@@ -2388,7 +2388,7 @@ func TestIdleDeclaredTaskSourceDrivesNextPrompt(t *testing.T) {
 	}
 	h.push("agent-9", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name}).Prompt()
+	want := (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name, SourceIndex: "0"}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want templated prompt for next unchecked item %q", got, want)
 	}
@@ -2466,7 +2466,7 @@ func TestIdleDeclaredTaskRealTaskBeatsCompletedSource(t *testing.T) {
 	}
 	h.push("agent-21", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := (&domain.DeclaredTask{Task: "real task", Path: nextFile, AgentName: name}).Prompt()
+	want := (&domain.DeclaredTask{Task: "real task", Path: nextFile, AgentName: name, SourceIndex: "1"}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want the real remaining task to win over the completed source: %q", got, want)
 	}
@@ -2557,7 +2557,7 @@ func TestIdleAutonomousNoopRuleEscalatesPendingDeclaredTasks(t *testing.T) {
 	if !strings.Contains(esc[0].Rationale, string(domain.ReasonNoopVsPendingTasks)) {
 		t.Errorf("rationale should carry the noop-vs-pending tag, got %q", esc[0].Rationale)
 	}
-	want := "send next declared task: " + (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name}).Prompt()
+	want := "send next declared task: " + (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name, SourceIndex: "0"}).Prompt()
 	if esc[0].Suggestion != want {
 		t.Errorf("suggestion = %q, want %q", esc[0].Suggestion, want)
 	}
@@ -2586,7 +2586,7 @@ func TestIdleTaskSourceMatchesWorkspaceNameWildcard(t *testing.T) {
 	}
 	h.pushIn("agent-23", "w7", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := (&domain.DeclaredTask{Task: "workspace task", Path: taskFile, AgentName: name}).Prompt()
+	want := (&domain.DeclaredTask{Task: "workspace task", Path: taskFile, AgentName: name, SourceIndex: "0"}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want workspace-name-matched prompt %q", got, want)
 	}
@@ -2635,7 +2635,7 @@ func TestIdleTaskSourceWorkspaceIdFallback(t *testing.T) {
 	}
 	h.pushIn("agent-25", "w9", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := (&domain.DeclaredTask{Task: "fallback task", Path: taskFile, AgentName: name}).Prompt()
+	want := (&domain.DeclaredTask{Task: "fallback task", Path: taskFile, AgentName: name, SourceIndex: "0"}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want id-fallback-matched prompt %q", got, want)
 	}
@@ -2674,7 +2674,7 @@ func TestIdleTaskSourceMatchesAgentShortName(t *testing.T) {
 
 	h.push("agent-15", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := (&domain.DeclaredTask{Task: "short-name task", Path: taskFile, AgentName: "docs-writer"}).Prompt()
+	want := (&domain.DeclaredTask{Task: "short-name task", Path: taskFile, AgentName: "docs-writer", SourceIndex: "0"}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want the short-name-matched task prompt %q", got, want)
 	}

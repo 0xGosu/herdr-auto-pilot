@@ -8,24 +8,31 @@ import (
 )
 
 // TestRemotePromptDropsThePathFallback is deliberately a literal string
-// assertion: dropping `--path` IS the whole point of the remote template, and
-// --path always reads a LOCAL file, so under a remote provider that clause
-// names something that does not exist.
+// assertion: neither default may mention `--path` — it always reads a LOCAL
+// file, so as a fallback it is dead advice under a remote provider. The
+// fallback both defaults offer is the task-source INDEX, which addresses the
+// source through hap's own config on every provider.
 func TestRemotePromptDropsThePathFallback(t *testing.T) {
 	const url = "https://gist.github.com/3f2a1b9c#file-brave-otter-md"
 
 	local := domain.DeclaredTask{
-		Task: "step two", Path: "/home/me/tasks.md", AgentName: "brave-otter",
+		Task: "step two", Path: "/home/me/tasks.md", AgentName: "brave-otter", SourceIndex: "1",
 	}.Prompt()
-	if !strings.Contains(local, "--path") {
-		t.Error("the LOCAL default must keep its --path fallback")
+	if strings.Contains(local, "--path") {
+		t.Errorf("the LOCAL default must not offer --path — its fallback is the source index:\n%s", local)
+	}
+	if !strings.Contains(local, "use the task-source index `1`") {
+		t.Errorf("the local default must offer the source-index fallback:\n%s", local)
 	}
 
 	remote := domain.DeclaredTask{
-		Task: "step two", Path: url, AgentName: "brave-otter", Remote: true,
+		Task: "step two", Path: url, AgentName: "brave-otter", Remote: true, SourceIndex: "1",
 	}.Prompt()
 	if strings.Contains(remote, "--path") {
 		t.Errorf("the remote default must not offer --path:\n%s", remote)
+	}
+	if !strings.Contains(remote, "use the task-source index `1`") {
+		t.Errorf("the remote default must offer the source-index fallback — a shared remote list is exactly the source a name cannot address:\n%s", remote)
 	}
 	if !strings.Contains(remote, "hap task brave-otter list") {
 		t.Errorf("the remote default must still point at the agent's own list:\n%s", remote)
@@ -60,14 +67,20 @@ func TestRemotePromptRendersTheDisplayAddress(t *testing.T) {
 func TestRemoteTaskManagementHintsDropThePathLine(t *testing.T) {
 	const url = "https://gist.github.com/3f2a1b9c#file-brave-otter-md"
 
-	local := domain.TaskManagementHints("brave-otter", "/home/me/tasks.md")
-	if !strings.Contains(local, "--path") {
-		t.Error("the local hints must keep the --path fallback")
+	local := domain.TaskManagementHints("brave-otter", "/home/me/tasks.md", "1")
+	if strings.Contains(local, "--path") {
+		t.Errorf("the local hints must not offer --path — the fallback is the source index:\n%s", local)
+	}
+	if !strings.Contains(local, "task-source index `1`") {
+		t.Errorf("the local hints must offer the source-index fallback:\n%s", local)
 	}
 
-	remote := domain.RemoteTaskManagementHints("brave-otter", url)
+	remote := domain.RemoteTaskManagementHints("brave-otter", url, "1")
 	if strings.Contains(remote, "--path") {
 		t.Errorf("the remote hints must not offer --path:\n%s", remote)
+	}
+	if !strings.Contains(remote, "task-source index `1`") {
+		t.Errorf("the remote hints must offer the source-index fallback — a shared remote list is exactly the source a name cannot address:\n%s", remote)
 	}
 	for _, want := range []string{"hap task brave-otter start", "hap task brave-otter done", "stored remotely"} {
 		if !strings.Contains(remote, want) {
