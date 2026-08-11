@@ -178,6 +178,29 @@ func TestCaptureDelayWildcardSpellingsAreOneRule(t *testing.T) {
 	}
 }
 
+// TestCaptureDelaySpecificRuleOutranksAnExistingWildcard pins the ordering the
+// daemon's lookup forces. config.CaptureDelay takes the FIRST rule matching the
+// agent type and "*" matches everything, so a specific rule appended after a
+// wildcard one is never reached: it would sit in config.toml, appear in the
+// listing, and change nothing the daemon does.
+func TestCaptureDelaySpecificRuleOutranksAnExistingWildcard(t *testing.T) {
+	app, _ := testApp(t)
+	if _, err := run(t, app, "capture-delay", "set", "*", "5000", "500"); err != nil {
+		t.Fatalf("capture-delay set *: %v", err)
+	}
+	if _, err := run(t, app, "capture-delay", "set", "codex", "8000", "800"); err != nil {
+		t.Fatalf("capture-delay set codex: %v", err)
+	}
+	cfg := loadCfg(t, app.ConfigPath)
+	if got := cfg.CaptureDelay("codex", true); got.Milliseconds() != 8000 {
+		t.Errorf("CaptureDelay(codex) = %s, want 8s — the specific rule must be reached, "+
+			"not shadowed by the wildcard one", got)
+	}
+	if got := cfg.CaptureDelay("claude", true); got.Milliseconds() != 5000 {
+		t.Errorf("CaptureDelay(claude) = %s, want the wildcard's 5s", got)
+	}
+}
+
 func TestScopedNeverAutoRulesAreEditableFromTheCLI(t *testing.T) {
 	app, _ := testApp(t)
 

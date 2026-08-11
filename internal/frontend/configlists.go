@@ -180,9 +180,22 @@ func (a *App) SetCaptureDelay(ctx context.Context, agentType string, startMs, ev
 				return nil
 			}
 		}
-		cfg.CaptureDelays = append(cfg.CaptureDelays, config.CaptureDelayRule{
-			AgentType: agentType, StartMs: startMs, EventMs: eventMs,
-		})
+		rule := config.CaptureDelayRule{AgentType: agentType, StartMs: startMs, EventMs: eventMs}
+		// A new rule for a SPECIFIC type goes in front of any wildcard rule.
+		// config.CaptureDelay takes the first rule matching the agent type and
+		// "*" matches everything, so a specific rule appended after a wildcard
+		// one is never reached — it would sit in config.toml, show up in the
+		// listing, and change nothing.
+		if !matchesCaptureAgentType(agentType, "*") {
+			for i, r := range cfg.CaptureDelays {
+				if matchesCaptureAgentType(r.AgentType, "*") {
+					cfg.CaptureDelays = append(cfg.CaptureDelays[:i],
+						append([]config.CaptureDelayRule{rule}, cfg.CaptureDelays[i:]...)...)
+					return nil
+				}
+			}
+		}
+		cfg.CaptureDelays = append(cfg.CaptureDelays, rule)
 		return nil
 	})
 }
