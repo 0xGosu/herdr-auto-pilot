@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -57,15 +58,22 @@ func (a *App) AddNeverAutoRule(ctx context.Context, pattern string, agentTypes [
 }
 
 // RemoveNeverAutoRule deletes scoped never-auto rule #index. expected is the
-// pattern the caller listed at that position; removal is refused on mismatch,
-// so a listing gone stale can never silently drop a different safety rule.
-func (a *App) RemoveNeverAutoRule(ctx context.Context, index int, expected string) error {
+// entry the caller listed at that position; removal is refused unless the rule
+// still there is identical, so a listing gone stale can never silently drop a
+// different safety rule.
+//
+// The SCOPE is part of the comparison, not just the pattern: the same pattern
+// is legitimately scoped to two different agent-type sets, and a pattern-only
+// check would happily delete the wrong one of that pair.
+func (a *App) RemoveNeverAutoRule(ctx context.Context, index int, expected config.NeverAutoRule) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		if index < 0 || index >= len(cfg.Safety.NeverAutoRules) {
 			return fmt.Errorf("no scoped never-auto rule #%d", index)
 		}
-		if got := cfg.Safety.NeverAutoRules[index].Pattern; got != expected {
-			return fmt.Errorf("scoped rule #%d changed since it was listed (now %q); re-list and retry", index, got)
+		got := cfg.Safety.NeverAutoRules[index]
+		if got.Pattern != expected.Pattern || !slices.Equal(got.AgentTypes, expected.AgentTypes) {
+			return fmt.Errorf("scoped rule #%d changed since it was listed (now agent_types=%s %q); re-list and retry",
+				index, strings.Join(got.AgentTypes, ","), got.Pattern)
 		}
 		cfg.Safety.NeverAutoRules = append(
 			cfg.Safety.NeverAutoRules[:index], cfg.Safety.NeverAutoRules[index+1:]...)
@@ -133,16 +141,24 @@ func validateClassifierRule(agentType, situation string, regexes, keywords []str
 	}, nil
 }
 
-// RemoveClassifierRule deletes classifier rule #index, guarded on the
-// situation the caller listed there (the same stale-listing guard the other
+// RemoveClassifierRule deletes classifier rule #index, guarded on the whole
+// rule the caller listed there (the same stale-listing guard the other
 // index-keyed editors use).
-func (a *App) RemoveClassifierRule(ctx context.Context, index int, expectedSituation string) error {
+//
+// The comparison is every field, not just the situation: several rules sharing
+// one situation is the NORMAL shape here (a handful of approval rules), so a
+// situation-only check would pass on the wrong rule almost every time a listing
+// went stale — which is the case the guard exists for.
+func (a *App) RemoveClassifierRule(ctx context.Context, index int, expected config.ClassifierRule) error {
 	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
 		if index < 0 || index >= len(cfg.Classifier) {
 			return fmt.Errorf("no classifier rule #%d", index)
 		}
-		if got := cfg.Classifier[index].Situation; got != expectedSituation {
-			return fmt.Errorf("classifier rule #%d changed since it was listed (now %q); re-list and retry", index, got)
+		got := cfg.Classifier[index]
+		if got.Situation != expected.Situation || got.AgentType != expected.AgentType ||
+			!slices.Equal(got.Regex, expected.Regex) || !slices.Equal(got.Keywords, expected.Keywords) {
+			return fmt.Errorf("classifier rule #%d changed since it was listed (now agent_type=%s situation=%s); re-list and retry",
+				index, got.AgentType, got.Situation)
 		}
 		cfg.Classifier = append(cfg.Classifier[:index], cfg.Classifier[index+1:]...)
 		return nil

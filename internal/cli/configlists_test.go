@@ -266,6 +266,60 @@ func TestRulesAddRejectsAWildcardScope(t *testing.T) {
 	}
 }
 
+// TestRemovalRefusesAStaleIndex covers the guard every index-keyed editor
+// carries. An index the operator copied from a listing may name a different
+// element by the time the write lands (another front-end edited in between),
+// and these are safety and classification rules — deleting the wrong one is
+// silent and permanent. The comparison is the WHOLE entry, not a single field:
+// several classifier rules legitimately share one situation, and one pattern is
+// legitimately scoped to two different agent-type sets.
+func TestRemovalRefusesAStaleIndex(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("classifier", func(t *testing.T) {
+		app, _ := testApp(t)
+		if err := app.AddClassifierRule(ctx, "claude", "approval", []string{"first"}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := app.AddClassifierRule(ctx, "claude", "approval", []string{"second"}, nil); err != nil {
+			t.Fatal(err)
+		}
+		stale := loadCfg(t, app.ConfigPath).Classifier[0]
+		if err := app.RemoveClassifierRule(ctx, 0, stale); err != nil {
+			t.Fatal(err)
+		}
+		// #0 is now the rule that used to be #1 — same situation, same agent
+		// type, different rule. The stale expectation must be refused.
+		if err := app.RemoveClassifierRule(ctx, 0, stale); err == nil {
+			t.Fatal("removal accepted a stale index whose rule merely shares a situation")
+		}
+		if got := loadCfg(t, app.ConfigPath).Classifier; len(got) != 1 || got[0].Regex[0] != "second" {
+			t.Errorf("Classifier = %+v, want the surviving rule untouched", got)
+		}
+	})
+
+	t.Run("scoped never-auto", func(t *testing.T) {
+		app, _ := testApp(t)
+		if err := app.AddNeverAutoRule(ctx, "(?i)deploy", []string{"codex"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := app.AddNeverAutoRule(ctx, "(?i)deploy", []string{"claude"}); err != nil {
+			t.Fatal(err)
+		}
+		stale := loadCfg(t, app.ConfigPath).Safety.NeverAutoRules[0]
+		if err := app.RemoveNeverAutoRule(ctx, 0, stale); err != nil {
+			t.Fatal(err)
+		}
+		if err := app.RemoveNeverAutoRule(ctx, 0, stale); err == nil {
+			t.Fatal("removal accepted a stale index whose rule merely shares a pattern")
+		}
+		got := loadCfg(t, app.ConfigPath).Safety.NeverAutoRules
+		if len(got) != 1 || got[0].AgentTypes[0] != "claude" {
+			t.Errorf("NeverAutoRules = %+v, want the claude-scoped rule untouched", got)
+		}
+	})
+}
+
 func TestLLMEnvIsEditableFromTheCLIWithoutEverPrintingAValue(t *testing.T) {
 	app, _ := testApp(t)
 

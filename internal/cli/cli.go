@@ -1499,7 +1499,7 @@ func rulesRemoveScoped(ctx context.Context, app *frontend.App, out io.Writer, ar
 		return fmt.Errorf("no scoped never-auto rule #%d (see: rules list)", idx)
 	}
 	expected := cfg.Safety.NeverAutoRules[idx]
-	if err := app.RemoveNeverAutoRule(ctx, idx, expected.Pattern); err != nil {
+	if err := app.RemoveNeverAutoRule(ctx, idx, expected); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "scoped never-auto rule #%d removed: agent_types=%s\t%s\n",

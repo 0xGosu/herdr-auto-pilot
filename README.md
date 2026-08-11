@@ -260,6 +260,24 @@ hap capture <agent>                # re-run the capture pipeline for one agent n
 hap kill-history                   # past kill-switch (pause/resume) activity
 ```
 
+The table-valued sections of `config.toml` cannot be addressed by one
+`key value` pair (a list element is addressed by position, a map entry by
+name), so each has a verb of its own — nothing needs the file opened by hand:
+
+```sh
+hap rules ...                      # never-auto patterns, incl. --agent-type scoped ones
+hap task-source ...                # which checklist file feeds which agent
+hap classifier ...                 # which situation a pane is showing
+hap capture-delay ...              # how long to wait before reading a pane
+hap config env ...                 # the environment handed to the LLM CLI
+```
+
+`hap config env` never prints a value — the tables hold API keys — and reads
+one from stdin unless `--value` is passed, so a token stays out of shell
+history and `ps`. Two tests (`TestEveryConfigKeyIsRegistered`,
+`TestEveryConfigListHasACLICommand`) fail the build if a new config key or
+section ever ships without a command.
+
 ## Architecture
 
 Herd Auto Prompter is one Go binary (`hap`) used in several roles: a
@@ -1166,7 +1184,9 @@ hidden only from the TUI — `hap config fields` still lists them, `hap config
 set` still sets them, and `config.toml` still reads them. Scoped never-auto rules
 and `[[capture_delay]]` rules also display read-only on the tab. Capture delays show the built-in defaults (10000
 ms first event / 2000 ms after) when none are configured, and long values are
-truncated to one line — the full value lives in `config.toml`. Prompts that
+truncated to one line — the full value lives in `config.toml`, and both lists
+are editable from the CLI (`hap rules add --agent-type` / `remove-scoped`, and
+`hap capture-delay set` / `remove`). Prompts that
 *look* destructive
 but match no pattern are escalated by a suspected-irreversible heuristic
 rather than automated. The heuristic needs corroboration to fire — a
@@ -1185,6 +1205,13 @@ pattern = '(?i)compact\s+the\s+conversation'
 agent_types = ["codex", "agy"]   # "*" or omit for all agent types
 ```
 
+or, equivalently, from the CLI:
+
+```sh
+hap rules add --agent-type codex,agy '(?i)compact\s+the\s+conversation'
+hap rules remove-scoped <index>   # scoped rules have their own index space
+```
+
 The legacy `irreversible_indicators` and `[[safety.indicator_rules]]` settings
 still load with warnings and migrate to these unified never-auto forms on the
 next config save.
@@ -1197,8 +1224,9 @@ crash-loop breaker's auto-disable/give-up states. The detached daemon's stderr
 is captured at `<state-dir>/daemon.stderr.log` (rotated at 256 KiB — checked
 both when a daemon is spawned and on the running daemon's heartbeat, so a
 process that never restarts is bounded too); an error-severity TUI banner offers
-`!` to open the last 16 KiB in a scrollable detail view. The same path appears
-in `hap status` and `hap state-dir` makes it easy to locate.
+`!` to open the last 16 KiB in a scrollable detail view, and `hap status
+--stderr` prints the same captured tail. The path appears in `hap status`
+either way, and `hap state-dir` makes it easy to locate.
 
 ### Disk usage
 
@@ -1443,6 +1471,22 @@ ANTHROPIC_MODEL = "opus"
 ANTHROPIC_MODEL = "haiku"                                       # cheaper for task ideas
 ```
 
+Both halves are editable from the CLI: the file paths with
+`hap config set llm.env_file <path>` (and the four `…_env_file` keys), and the
+inline tables with `hap config env`:
+
+```sh
+hap config env list                                          # names only, never values
+echo -n "$ANTHROPIC_API_KEY" | hap config env set command ANTHROPIC_API_KEY
+hap config env unset command ANTHROPIC_API_KEY
+```
+
+The scopes are `shared`, `command`, `command_start`, `task_generate_command`,
+`task_generate_command_start` and `learn_from_user_command`. No read path in
+hap ever prints a value, and `set` reads it from stdin unless `--value` is
+passed — a token on the command line lands in shell history and in every other
+user's `ps` output.
+
 The `.env` format is the usual one: `KEY=VALUE` per line, `#` comments, an
 optional `export` prefix, and single/double quotes (`\n`, `\t`, `\"`, `\\`
 escapes inside double quotes). The configured file *path* expands a leading
@@ -1556,8 +1600,9 @@ guards; it auto-acts only when the LLM's self-reported confidence meets
 doesn't contradict your learned history — otherwise the suggestion is surfaced
 for you to confirm. On timeout, CLI failure, or no submission the situation
 escalates. For a retryable failed/timed-out consult, press `l` on its TUI
-escalation; hap refreshes the agent's live pane and status before re-running
-the consult, and disables retry while another consult is already in flight.
+escalation or run `hap escalations retry <id>`; hap refreshes the agent's live
+pane and status before re-running the consult, and the TUI disables retry while
+another consult is already in flight.
 
 The model can also submit `recommend_action: "@noop"` (also accepted: `noop`,
 `no_op`, `no-op`) to say **no reply is needed** — the agent finished or is
@@ -1717,7 +1762,8 @@ Invariants:
   the audit row: open the row in the TUI's **Audit** tab and press `v` to read
   it. That is also how you diagnose a failure.
 - **A failed run is retryable.** Open its row in the **Audit** tab and press
-  `l`. The retry rebuilds the request from the row and re-resolves the agent's
+  `l`, or run `hap escalations retry <id>`. The retry rebuilds the request from
+  the row and re-resolves the agent's
   working directory live, so it still edits the right project — or refuses
   again if it cannot tell. Each attempt writes its own audit row. A retry is
   refused (with a toast) when the agent's pane is gone, when that pane now runs

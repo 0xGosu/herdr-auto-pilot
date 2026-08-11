@@ -112,7 +112,7 @@ func classifierRemove(ctx context.Context, app *frontend.App, out io.Writer, arg
 		return fmt.Errorf("no classifier rule #%d (see: classifier list)", idx)
 	}
 	expected := cfg.Classifier[idx]
-	if err := app.RemoveClassifierRule(ctx, idx, expected.Situation); err != nil {
+	if err := app.RemoveClassifierRule(ctx, idx, expected); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "classifier rule #%d removed: agent_type=%s situation=%s\n",
