@@ -90,19 +90,34 @@ func TestDeclaredTaskPrompt(t *testing.T) {
 		want string
 	}{
 		{
-			name: "default template points at the list command with the agent name and a --path fallback",
-			task: DeclaredTask{Task: "add validation", Path: "/docs/tasks.md", AgentName: "brave-otter"},
-			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`).",
+			name: "default template points at the list command with the agent name and a source-index fallback",
+			task: DeclaredTask{Task: "add validation", Path: "/docs/tasks.md", AgentName: "brave-otter", SourceIndex: "2"},
+			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use the task-source index `2` in place of `brave-otter`).",
 		},
 		{
 			name: "completed list uses none",
-			task: DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md", AgentName: "brave-otter"},
-			want: "Your next task is none. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use `--path /docs/tasks.md` in place of `brave-otter`).",
+			task: DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md", AgentName: "brave-otter", SourceIndex: "2"},
+			want: "Your next task is none. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use the task-source index `2` in place of `brave-otter`).",
 		},
 		{
-			name: "default template shell-quotes a path with a space",
+			// A sender that cannot know the position leaves SourceIndex empty,
+			// and {task_source_index} falls back to the agent name — the
+			// always-working selector, so the prompt never carries a broken
+			// command.
+			name: "unset source index falls back to the agent name",
 			task: DeclaredTask{Task: "add validation", Path: "/my docs/tasks.md", AgentName: "brave-otter"},
-			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use `--path '/my docs/tasks.md'` in place of `brave-otter`).",
+			want: "Your next task is add validation. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task brave-otter list` to view them (if that name isn't recognized, use the task-source index `brave-otter` in place of `brave-otter`).",
+		},
+		{
+			name: "custom template renders the source index",
+			task: DeclaredTask{
+				Task:        "x",
+				Path:        "/p/t.md",
+				Template:    "manage with `hap task {task_source_index} list`",
+				AgentName:   "brave-otter",
+				SourceIndex: "4",
+			},
+			want: "manage with `hap task 4 list`",
 		},
 		{
 			name: "explicit quoted placeholder in a custom template",
@@ -614,7 +629,8 @@ func TestTaskNewlineEncoding(t *testing.T) {
 	}
 	// Prompt() is the sending side: stored `\n` renders as real newlines in
 	// {next_task_content}, and only there (the path is untouched).
-	p := DeclaredTask{Task: `step one\nstep two`, Path: `/tmp/a\nb.md`, AgentName: "otter"}.Prompt()
+	p := DeclaredTask{Task: `step one\nstep two`, Path: `/tmp/a\nb.md`, AgentName: "otter",
+		Template: "{next_task_content} at {task_list_path}"}.Prompt()
 	if !strings.Contains(p, "step one\nstep two") {
 		t.Errorf("Prompt should decode task newlines, got %q", p)
 	}
@@ -1584,15 +1600,66 @@ func TestHierarchicalTaskFileIsUsable(t *testing.T) {
 // default prompt no longer carries them, so this text is the only place an
 // agent learns start/done and how <n> is addressed.
 func TestTaskManagementHints(t *testing.T) {
-	got := TaskManagementHints("happy-pelican", "/state/tasks/happy-pelican.md")
+	got := TaskManagementHints("happy-pelican", "/state/tasks/happy-pelican.md", "2")
 	want := "Prefer using the hap CLI to manage your tasks:\n" +
 		"- `hap task happy-pelican start <n>` to mark one in-progress when you begin working on it.\n" +
 		"- `hap task happy-pelican done <n>` to mark it complete as you go.\n" +
 		"Note:\n" +
 		"- `<n>` is the task's own id when the list numbers its tasks (e.g. `done 3.1`); otherwise its position in the list, which `'#3'` always addresses (quote it — a bare #3 is a shell comment).\n" +
-		"- when the agent name `happy-pelican` is no longer recognized, use `--path /state/tasks/happy-pelican.md` in place of `happy-pelican`\n"
+		"- when the agent name `happy-pelican` is no longer recognized, use the task-source index `2` in place of `happy-pelican` (`hap config task-source list` shows each source's index)\n"
 	if got != want {
 		t.Errorf("hints:\n got %q\nwant %q", got, want)
+	}
+}
+
+// An index-addressed list already holds the fallback selector, so no fallback
+// note is printed — a note saying "use `0` in place of `0`" teaches nothing.
+// And a '#0'-addressed one renders its commands with the BARE digits: the
+// hint lines are pasted into a shell, where an unquoted '#0' is a comment and
+// everything after it vanishes.
+func TestTaskManagementHintsIndexTargetDropsFallbackNote(t *testing.T) {
+	for _, target := range []string{"0", "#0"} {
+		got := TaskManagementHints(target, "/state/tasks/shared.md", "0")
+		if !strings.Contains(got, "`hap task 0 done <n>`") {
+			t.Errorf("hints for target %q must spell commands with the bare index, got:\n%s", target, got)
+		}
+		if strings.Contains(got, "#0") {
+			t.Errorf("hints for target %q must never render the '#' form, got:\n%s", target, got)
+		}
+		if strings.Contains(got, "no longer recognized") {
+			t.Errorf("index-addressed hints must not print the fallback note, got:\n%s", got)
+		}
+	}
+}
+
+func TestParseTaskSourceIndexRef(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+		ok   bool
+	}{
+		{"0", 0, true},
+		{"12", 12, true},
+		{"#3", 3, true},
+		// An agent name, flag-ish text, or anything non-numeric is NOT an
+		// index — it must fall through to name resolution untouched.
+		{"brave-otter", 0, false},
+		{"a1", 0, false},
+		{"1a", 0, false},
+		{"-1", 0, false},
+		{"#", 0, false},
+		{"", 0, false},
+		{"1.2", 0, false},
+		// All-digits but bigger than an int is STILL an index (saturated):
+		// name resolution would advise registering a source for a name herdr
+		// can never accept, while the bounds check reports "does not exist".
+		{"99999999999999999999", int(^uint(0) >> 1), true},
+	}
+	for _, tc := range cases {
+		got, ok := ParseTaskSourceIndexRef(tc.in)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Errorf("ParseTaskSourceIndexRef(%q) = (%d, %v), want (%d, %v)", tc.in, got, ok, tc.want, tc.ok)
+		}
 	}
 }
 
@@ -1600,7 +1667,7 @@ func TestTaskManagementHints(t *testing.T) {
 // the name-fallback note — which would say "use --path X in place of ”" — is
 // dropped entirely.
 func TestTaskManagementHintsPathOnly(t *testing.T) {
-	got := TaskManagementHints("", "/docs/tasks.md")
+	got := TaskManagementHints("", "/docs/tasks.md", "")
 	if !strings.Contains(got, "`hap task --path /docs/tasks.md done <n>`") {
 		t.Errorf("path-only hints must spell commands with the path, got:\n%s", got)
 	}

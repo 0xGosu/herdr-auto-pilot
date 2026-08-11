@@ -757,18 +757,18 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		base = filepath.Dir(a.ConfigPath)
 	}
 	bootstrapPath := filepath.Join(base, "tasks", sanitizeTaskFileName(name)+".md")
-	var external []config.TaskSource
-	for _, src := range a.matchingDeclaredSources(ctx, cfg, audit, name, live) {
-		p := config.ExpandPath(src.Path)
+	var external []indexedTaskSource
+	for _, s := range a.matchingDeclaredSources(ctx, cfg, audit, name, live) {
+		p := config.ExpandPath(s.src.Path)
 		if abs, err := filepath.Abs(p); err == nil {
 			p = abs
 		}
 		if p != bootstrapPath {
-			external = append(external, src)
+			external = append(external, s)
 		}
 	}
-	if src, ok := pickAppendTarget(external); ok {
-		return a.appendGeneratedTasks(ctx, audit, src, name, tasks, send)
+	if s, ok := pickAppendTarget(external); ok {
+		return a.appendGeneratedTasks(ctx, audit, s, name, tasks, send)
 	}
 
 	// Idempotent side effects FIRST (before the claim): writing the file and
@@ -866,10 +866,21 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		// Render through the same default next-task template used by a declared
 		// task source, so every idle-task handoff includes both the task and
 		// its list. The prompt sends the task text, not the numbered file line.
+		// The source was registered above (addTaskSourceIfAbsent), so its
+		// position is read back by the agent-name rule — the same exactly-one
+		// resolution `hap task <name>` applies; ambiguity leaves the index
+		// empty and {task_source_index} falls back to the name.
+		sourceIndex := ""
+		if freshCfg, cerr := a.Config(); cerr == nil {
+			if _, idx, rerr := resolveTaskSourceFor(freshCfg, name); rerr == nil {
+				sourceIndex = strconv.Itoa(idx)
+			}
+		}
 		prompt := domain.DeclaredTask{
 			Task: taskText, AgentName: name,
-			Path:   tasklocator.DisplayFor(path),
-			Remote: tasklocator.Remote(path),
+			Path:        tasklocator.DisplayFor(path),
+			Remote:      tasklocator.Remote(path),
+			SourceIndex: sourceIndex,
 		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
 			if _, rbErr := mutateTaskFile(path, releaseTask(pos, itemText)); rbErr != nil {
@@ -1114,10 +1125,10 @@ func carryOverChecklistMarks(existing, rendered string) string {
 // unresolvable (no live transition, no locator) only unscoped ("" / "*")
 // selectors match, failing soft toward the bootstrap path — where the
 // addTaskSourceIfAbsent guard still refuses to create a duplicate.
-func (a *App) matchingDeclaredSources(ctx context.Context, cfg config.Config, audit *domain.AuditRecord, agentName string, live *domain.AgentTransition) []config.TaskSource {
-	var out []config.TaskSource
+func (a *App) matchingDeclaredSources(ctx context.Context, cfg config.Config, audit *domain.AuditRecord, agentName string, live *domain.AgentTransition) []indexedTaskSource {
+	var out []indexedTaskSource
 	wsTarget, wsResolved := "", false
-	for _, src := range cfg.TaskSources {
+	for i, src := range cfg.TaskSources {
 		if !src.MatchesAgent(audit.AgentID, audit.AgentType, agentName) {
 			continue
 		}
@@ -1129,9 +1140,17 @@ func (a *App) matchingDeclaredSources(ctx context.Context, cfg config.Config, au
 				continue
 			}
 		}
-		out = append(out, src)
+		out = append(out, indexedTaskSource{src: src, index: i})
 	}
 	return out
+}
+
+// indexedTaskSource pairs a task source with its config position, threaded
+// from the walk that matched it — never recovered later by comparing entries,
+// since duplicate sources are legal and equality finds the wrong one.
+type indexedTaskSource struct {
+	src   config.TaskSource
+	index int
 }
 
 // agentWorkspaceTarget resolves the string a workspace selector matches
@@ -1161,13 +1180,13 @@ func (a *App) agentWorkspaceTarget(ctx context.Context, live *domain.AgentTransi
 // "[ ]" item, else first whose file has checklist items, else the first
 // match in config order (which also covers an empty or not-yet-created file —
 // appending there bootstraps the DECLARED path instead of a duplicate).
-func pickAppendTarget(sources []config.TaskSource) (config.TaskSource, bool) {
+func pickAppendTarget(sources []indexedTaskSource) (indexedTaskSource, bool) {
 	if len(sources) == 0 {
-		return config.TaskSource{}, false
+		return indexedTaskSource{}, false
 	}
-	var withItems *config.TaskSource
+	var withItems *indexedTaskSource
 	for i := range sources {
-		p := config.ExpandPath(sources[i].Path)
+		p := config.ExpandPath(sources[i].src.Path)
 		if abs, err := filepath.Abs(p); err == nil {
 			p = abs
 		}
@@ -1199,7 +1218,8 @@ func pickAppendTarget(sources []config.TaskSource) (config.TaskSource, bool) {
 // load-bearing order: the first task is RESERVED ("[-]" under the file lock)
 // before the send, so the daemon's idle flow can never hand it out mid-send,
 // and a failed send rolls it back to "[ ]".
-func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecord, src config.TaskSource, name string, tasks []string, send bool) error {
+func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecord, target indexedTaskSource, name string, tasks []string, send bool) error {
+	src := target.src
 	// Resolved through the registry, NOT by absolutizing src.Path. Under a
 	// remote provider src.Path is a bare file name inside the store, so
 	// filepath.Abs would turn it into a path under the CLI's working directory,
@@ -1331,6 +1351,7 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 			Path:      tasklocator.DisplayFor(path),
 			Remote:    tasklocator.Remote(path),
 			AgentName: name, Cwd: cwd,
+			SourceIndex: strconv.Itoa(target.index),
 		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
 			if _, rbErr := a.mutateTask(path, releaseTask(firstIndex, firstText)); rbErr != nil {
@@ -3038,77 +3059,127 @@ func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, templat
 // declaredTask precedence (live workspace, first-real-task-wins): here we are
 // choosing a file to edit, not a task to send.
 // resolveTaskSourceFor returns the single task source addressable by this
-// agent's name. It replaces the older path-returning form: the SOURCE is what
-// the caller needs now, because turning it into a list also needs the agent
-// (a source that declares no file derives one per matched agent).
-func resolveTaskSourceFor(cfg config.Config, agent string) (config.TaskSource, error) {
+// agent's name, and its config position. It replaces the older path-returning
+// form: the SOURCE is what the caller needs now, because turning it into a
+// list also needs the agent (a source that declares no file derives one per
+// matched agent). The index rides along from THIS iteration — never recovered
+// later by comparing entries, since duplicate sources are legal and equality
+// finds the wrong one.
+//
+// The errors steer toward the task-source INDEX, not --path: the index
+// addresses the source through hap's own config, so the advice holds under
+// every storage provider — a remote list has no local file for --path to read.
+func resolveTaskSourceFor(cfg config.Config, agent string) (config.TaskSource, int, error) {
 	var matches []config.TaskSource
-	workspaceOnly := false
-	for _, src := range cfg.TaskSources {
+	var matchIdx, workspaceIdx []int
+	for i, src := range cfg.TaskSources {
 		if src.Agent == "" {
 			if src.Workspace != "" && src.Workspace != "*" {
-				workspaceOnly = true
+				workspaceIdx = append(workspaceIdx, i)
 			}
 			continue
 		}
 		if src.Agent == agent {
 			matches = append(matches, src)
+			matchIdx = append(matchIdx, i)
 		}
 	}
 	switch len(matches) {
 	case 1:
-		return matches[0], nil
+		return matches[0], matchIdx[0], nil
 	case 0:
-		if workspaceOnly {
-			return config.TaskSource{}, fmt.Errorf("no task source is scoped to agent %q; workspace-scoped sources exist but aren't addressable by name — use --path <file>", agent)
+		if len(workspaceIdx) > 0 {
+			// The example names a REAL workspace-scoped source's index — a
+			// hardcoded `hap task 0` could open some other agent's list when
+			// source 0 happens to be agent-scoped.
+			return config.TaskSource{}, 0, fmt.Errorf("no task source is scoped to agent %q; workspace-scoped sources exist but aren't addressable by name — address one by its index, e.g. `hap task %d list` (`hap config task-source list` shows each source's index)", agent, workspaceIdx[0])
 		}
-		return config.TaskSource{}, fmt.Errorf("no task source for agent %q; add one first: hap config task-source add --agent %s <checklist.md>", agent, agent)
+		return config.TaskSource{}, 0, fmt.Errorf("no task source for agent %q; add one first: hap config task-source add --agent %s <checklist.md>", agent, agent)
 	default:
-		paths := make([]string, len(matches))
-		for i, m := range matches {
-			paths[i] = m.Path
-		}
-		return config.TaskSource{}, fmt.Errorf("agent %q matches %d task sources (%s); use --path <file> to pick one", agent, len(matches), strings.Join(paths, ", "))
+		return config.TaskSource{}, 0, fmt.Errorf("agent %q matches %d task sources (indexes %s); address one by its index, e.g. `hap task %d list`", agent, len(matches), joinInts(matchIdx), matchIdx[0])
 	}
 }
 
-// taskFilePath resolves the checklist file to operate on: an explicit --path
-// (relative paths are made absolute so they mean what the caller's shell sees)
-// takes precedence; otherwise the agent's configured source is resolved.
+// joinInts renders config positions for an error message ("0, 2").
+func joinInts(ns []int) string {
+	parts := make([]string, len(ns))
+	for i, n := range ns {
+		parts[i] = strconv.Itoa(n)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// taskFilePath resolves the checklist file to operate on — the locator-only
+// form of taskListFor, for the item mutators that don't render hints.
 func (a *App) taskFilePath(agent, path string) (string, error) {
+	locator, _, err := a.taskListFor(agent, path)
+	return locator, err
+}
+
+// taskListFor resolves a task target to its list. The selector accepts, in
+// order: an explicit --path, a task-source INDEX (bare digits or "#N" — a
+// herdr agent name can never start with a digit, so the forms cannot
+// collide), or an agent name. sourceIndex is the resolved source's config
+// position pre-rendered for {task_source_index}-style display, "" when the
+// caller used --path (an ad-hoc file has no config entry to point back at).
+//
+// The index selector is what makes `hap task` provider-independent: it
+// addresses the source through hap's own config, so the same command works
+// whether the list is a local file or lives in a gist — the role --path used
+// to play for name-unresolvable sources, but could only play locally.
+func (a *App) taskListFor(agent, path string) (locator, sourceIndex string, err error) {
 	if path != "" {
 		// --path is the escape hatch and always names a LOCAL file, on every
 		// provider: it is resolved against the caller's shell, and it is the
-		// only way to reach a checklist that is not a configured source. It is
-		// also not needed for the case it exists for under a remote provider —
-		// a derived remote list is named after the agent, so `hap task <agent>`
-		// always resolves. A locator pasted verbatim still works, since a
-		// scheme'd string is returned unchanged by Canonical.
+		// only way to reach a checklist that is not a configured source. A
+		// locator pasted verbatim still works, since a scheme'd string is
+		// returned unchanged by Canonical.
 		if tasklocator.Remote(path) {
-			return path, nil
+			return path, "", nil
 		}
 		path = config.ExpandPath(path)
 		if abs, err := filepath.Abs(path); err == nil {
-			return abs, nil
+			return abs, "", nil
 		}
-		return path, nil
+		return path, "", nil
 	}
 	if agent == "" {
-		return "", fmt.Errorf("specify an agent name, or --path <file>")
+		return "", "", fmt.Errorf("specify an agent name, a task-source index, or --path <file>")
 	}
 	cfg, err := a.Config()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	src, err := resolveTaskSourceFor(cfg, agent)
+	if idx, ok := domain.ParseTaskSourceIndexRef(agent); ok {
+		if idx >= len(cfg.TaskSources) {
+			// The message echoes the TOKEN, not idx: an overflowing all-digit
+			// selector parses as a saturated index, and the operator should
+			// see what they typed, not MaxInt.
+			return "", "", fmt.Errorf("task source %s does not exist — %d source(s) configured (`hap config task-source list` shows them)", agent, len(cfg.TaskSources))
+		}
+		src := cfg.TaskSources[idx]
+		// "" for the agent: an index names a SOURCE. A derived source is one
+		// list per matched agent, so the index alone under-specifies it —
+		// and the caller asking (typically the agent reading its own prompt)
+		// is exactly who resolves by name.
+		l, err := a.resolveSourceList(cfg, src, "")
+		if errors.Is(err, tasklocator.ErrAgentNameRequired) {
+			return "", "", fmt.Errorf("task source %d derives one list per matched agent — address it by the agent's name: hap task <agent> …", idx)
+		}
+		if err != nil {
+			return "", "", err
+		}
+		return l.Locator, strconv.Itoa(idx), nil
+	}
+	src, idx, err := resolveTaskSourceFor(cfg, agent)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	l, err := a.resolveSourceList(cfg, src, agent)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return l.Locator, nil
+	return l.Locator, strconv.Itoa(idx), nil
 }
 
 // mutateTask applies one locked read-modify-write to a task list through the
@@ -3232,7 +3303,7 @@ func (a *App) requireIdleAgent(ctx context.Context, paneID, agentName string) er
 //
 // As an operator action it is exempt from the pause switch, matching
 // Resolve/Confirm.
-func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName, sourcePath, template string, index int, taskText string) error {
+func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName, sourcePath, template, sourceIndex string, index int, taskText string) error {
 	if a.Herdr == nil {
 		return fmt.Errorf("herdr unavailable — cannot send")
 	}
@@ -3279,6 +3350,7 @@ func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName,
 		Path:     tasklocator.Display(sourcePath),
 		Remote:   tasklocator.Remote(sourcePath),
 		Template: template, AgentName: agentName, Cwd: cwd,
+		SourceIndex: sourceIndex,
 	}.Prompt()
 	if err := ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt); err != nil {
 		if _, rbErr := a.mutateTask(sourcePath, releaseTask(index, taskText)); rbErr != nil {
@@ -3373,16 +3445,26 @@ type TaskGroup struct {
 // them. This deliberately does NOT reuse resolveTaskFilePath: its
 // exactly-one-source-per-agent semantics pick a file to edit, while the
 // aggregate shows every source as configured.
-func (a *App) TaskGroups(cfg config.Config) []TaskGroup {
+//
+// st is the same status snapshot the refresh already fetched. It is what lets
+// a DERIVED source (one list per matched agent) still resolve here: the view
+// enumerates sources, so it has no agent name of its own, but when exactly one
+// live agent matches the source's selectors there is nothing to guess — that
+// agent's list IS the source's list right now. With zero or several matches
+// the group keeps the per-agent template note instead; the returned group
+// count and order never depend on the live agents (one group per config
+// entry — the TUI addresses groups by config index).
+func (a *App) TaskGroups(cfg config.Config, st Status) []TaskGroup {
 	ctx := context.Background()
 	groups := make([]TaskGroup, 0, len(cfg.TaskSources))
 	for i, src := range cfg.TaskSources {
 		g := TaskGroup{Source: src, Index: i}
-		// "" for the agent name: this view enumerates SOURCES, not agents. A
-		// source that derives one list per matched agent therefore cannot be
-		// resolved to a single list here, and says so rather than guessing —
-		// its per-agent lists are reachable from the Agents tab.
 		l, err := a.resolveSourceList(cfg, src, "")
+		if errors.Is(err, tasklocator.ErrAgentNameRequired) {
+			if name, ok := soleLiveMatch(cfg, src, st); ok {
+				l, err = a.resolveSourceList(cfg, src, name)
+			}
+		}
 		switch {
 		case errors.Is(err, tasklocator.ErrAgentNameRequired):
 			g.Err = "one list per matched agent — open an agent's list from the Agents tab"
@@ -3399,6 +3481,77 @@ func (a *App) TaskGroups(cfg config.Config) []TaskGroup {
 		groups = append(groups, g)
 	}
 	return groups
+}
+
+// ListAddress returns the address actions read and mutate this group's list
+// by: the resolved locator when the group resolved, else the configured path.
+// Never Source.Path alone — under a remote provider that is only a file name
+// (or empty, for a derived source), which the store cannot serve and which
+// collides across gists.
+func (g TaskGroup) ListAddress() string {
+	if g.Locator != "" {
+		return g.Locator
+	}
+	return g.Source.Path
+}
+
+// SourceMatchesAgent reports whether a live agent is one a task source's
+// selectors feed: the agent selector accepts the agent's id, type, or short
+// name; the workspace selector matches the workspace label (falling back to
+// its id). An empty path fails the match only under local storage — there it
+// means "unconfigured", while under a remote provider it is the ordinary
+// derived one-list-per-agent form.
+//
+// This is the ONE definition of "does this source feed this agent" for
+// status-snapshot surfaces (the TUI's Agents/Tasks tabs, TaskGroups' derived
+// resolution); the daemon's delivery path has its own richer matcher.
+func SourceMatchesAgent(cfg config.Config, src config.TaskSource, st Status, a domain.AgentTransition) bool {
+	if !src.MatchesAgent(a.AgentID, a.AgentType, st.AgentName(a.AgentID)) {
+		return false
+	}
+	workspaceName := ""
+	if ws, ok := st.Workspaces[a.WorkspaceID]; ok {
+		workspaceName = ws.Label
+	}
+	if workspaceName == "" {
+		workspaceName = a.WorkspaceID
+	}
+	if !domain.MatchWorkspace(src.Workspace, workspaceName) {
+		return false
+	}
+	if src.Path == "" && !cfg.ResolveProvider(src).Remote() {
+		return false
+	}
+	return true
+}
+
+// soleLiveMatch returns the short name of the one live agent a source's
+// selectors match, for resolving a derived source on a surface that has no
+// agent of its own. ok is false when the agent listing is unknown (absence of
+// agents must not be inferred from a failed query), when zero or several
+// agents match (ambiguous — per-agent lists stay per-agent), or when the
+// single match has no short name (the derived file name is built from it).
+func soleLiveMatch(cfg config.Config, src config.TaskSource, st Status) (string, bool) {
+	if !st.AgentsKnown {
+		return "", false
+	}
+	name, matches := "", 0
+	seen := map[string]bool{}
+	for _, a := range st.MonitoredAgents {
+		if seen[a.AgentID] {
+			continue
+		}
+		seen[a.AgentID] = true
+		if !SourceMatchesAgent(cfg, src, st, a) {
+			continue
+		}
+		matches++
+		name = st.AgentName(a.AgentID)
+	}
+	if matches != 1 || name == "" {
+		return "", false
+	}
+	return name, true
 }
 
 // UnfinishedTasks counts items that are neither completed nor abandoned —
@@ -3463,6 +3616,13 @@ func (a *App) ListTasks(agent, path string) ([]domain.ChecklistItem, error) {
 // the task-management hints under `hap task … list`.
 func (a *App) TaskFilePath(agent, path string) (string, error) {
 	return a.taskFilePath(agent, path)
+}
+
+// TaskListFor is TaskFilePath plus the resolved source's config position —
+// what the CLI's hints render as the provider-independent fallback selector.
+// sourceIndex is "" for a --path target (no config entry to point back at).
+func (a *App) TaskListFor(agent, path string) (locator, sourceIndex string, err error) {
+	return a.taskListFor(agent, path)
 }
 
 // ResolveTaskRef maps a task reference — the list's own task id ("3.4"), a

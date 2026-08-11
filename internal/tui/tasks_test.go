@@ -2113,3 +2113,148 @@ func TestTasksReorderCursorNudgeWithTwoGroups(t *testing.T) {
 		t.Errorf("first group must be untouched:\ngot  %q\nwant %q", got, want)
 	}
 }
+
+// TestTaskRowsRemoteDerivedGroupCarriesResolvedLocator pins the Tasks tab's
+// addressing for a remote source: rows must carry the group's resolved
+// LOCATOR, never Source.Path — which for a derived (one-list-per-matched-
+// agent) source is empty, and for an explicit gist source is a bare file name
+// that canonicalizes against the TUI's cwd instead of the gist. Every item
+// action (done, edit, delete, move, send) mutates by the row's path, so a row
+// carrying Source.Path here silently addressed a list the store never serves.
+func TestTaskRowsRemoteDerivedGroupCarriesResolvedLocator(t *testing.T) {
+	cfg := config.Default()
+	cfg.TaskSourceProvider = config.TaskSourceProvider{
+		Provider:   config.ProviderGitHubGist,
+		EnvFile:    "/etc/hap/task.env",
+		GitHubGist: config.GitHubGist{GistID: "3f2a1b9c"},
+	}
+	cfg.TaskSources = []config.TaskSource{{Agent: "brave-otter"}}
+	const gistID = "3f2a1b9c4d5e6f708192a3b4c5d6e7f8"
+	const locator = "gist://" + gistID + "/brave-otter.md"
+	const display = "https://gist.github.com/" + gistID + "#file-brave-otter-md"
+	m := Model{width: 120, height: 30}
+	upd, _ := m.Update(refreshMsg{
+		cfg: cfg,
+		tasks: []frontend.TaskGroup{{Source: cfg.TaskSources[0], Index: 0,
+			Locator: locator, Display: display,
+			Items: []domain.ChecklistItem{{Index: 1, Mark: " ", Text: "write the parser"}}}},
+	})
+	m = upd.(Model)
+	m.tab = tabTasks
+
+	rows := m.taskRows()
+	if len(rows) != 2 || !rows[0].header || rows[1].item != 1 {
+		t.Fatalf("rows = %+v, want a header and one item row", rows)
+	}
+	for i, r := range rows {
+		if r.path != locator {
+			t.Errorf("row %d path=%q, want the resolved locator %q", i, r.path, locator)
+		}
+	}
+	// The header has no configured path to show, so it says WHICH list the
+	// source resolved to — but with the gist id SHORTENED: a secret gist's id
+	// is a capability, and no screen echoes one in full (the same rule the
+	// Config tab applies via shortGistIDForDisplay).
+	hdr := strings.Join(rows[0].fields, " ")
+	if want := "gist:" + gistID[:8] + "…/brave-otter.md"; !strings.Contains(hdr, want) {
+		t.Errorf("header fields %q do not carry the shortened address %q", rows[0].fields, want)
+	}
+	if strings.Contains(hdr, gistID) {
+		t.Errorf("header fields %q echo the full gist id", rows[0].fields)
+	}
+
+	// Bulk-action targets inherit the same identity: a marked item must
+	// address the locator (Canonical returns a scheme'd locator verbatim, so
+	// this is also what joins against the mutation result's keys).
+	m.taskMarks = map[string]bool{taskMarkKey(0, 1): true}
+	targets := m.markedTaskTargets()
+	if len(targets) != 1 || targets[0].path != locator {
+		t.Fatalf("targets = %+v, want one target addressing %q", targets, locator)
+	}
+}
+
+// TestAddPromptOnUnresolvedSourceMessages: pressing `a` on a source the
+// aggregate could not resolve must say the right remedy per provider — a
+// derived remote source is answered per agent (`hap task <agent> add`), while
+// a local source with no path really is misconfigured. The old single message
+// sent gist operators to config.toml for a source that was configured fine.
+func TestAddPromptOnUnresolvedSourceMessages(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider string
+		want     string
+	}{
+		{"derived remote source", config.ProviderGitHubGist, "hap task"},
+		{"local source with no path", config.ProviderLocalFS, "no path configured"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.TaskSourceProvider = config.TaskSourceProvider{
+				Provider:   tc.provider,
+				EnvFile:    "/etc/hap/task.env",
+				GitHubGist: config.GitHubGist{GistID: "3f2a1b9c"},
+			}
+			cfg.TaskSources = []config.TaskSource{{Agent: "claude"}}
+			m := Model{width: 120, height: 30}
+			upd, _ := m.Update(refreshMsg{cfg: cfg, tasks: []frontend.TaskGroup{
+				{Source: cfg.TaskSources[0], Index: 0, Err: "unresolved"},
+			}})
+			m = upd.(Model)
+			m.tab = tabTasks
+			m.cursors[m.tab] = 0
+			upd, _ = m.addTaskPrompt()
+			m = upd.(Model)
+			if m.prompt != nil {
+				t.Fatal("an unresolvable source must not open the add prompt")
+			}
+			if !strings.Contains(m.message, tc.want) {
+				t.Fatalf("message %q, want it to contain %q", m.message, tc.want)
+			}
+		})
+	}
+}
+
+// TestSendTaskRowRefusesARegroupedDerivedSource: a detail-overlay row is a
+// SNAPSHOT, and a derived source can re-resolve to a different agent's list
+// between snapshot and keypress (the sole live match changed). The staleness
+// gate must compare the row's address against the group's CURRENT resolved
+// address and refuse — pairing the snapshotted text with another list's
+// template (or item numbering) is exactly what it exists to prevent.
+func TestSendTaskRowRefusesARegroupedDerivedSource(t *testing.T) {
+	cfg := config.Default()
+	cfg.TaskSourceProvider = config.TaskSourceProvider{
+		Provider:   config.ProviderGitHubGist,
+		EnvFile:    "/etc/hap/task.env",
+		GitHubGist: config.GitHubGist{GistID: "3f2a1b9c"},
+	}
+	cfg.TaskSources = []config.TaskSource{{Agent: "claude"}}
+	m := Model{width: 120, height: 30}
+	upd, _ := m.Update(refreshMsg{
+		status: frontend.Status{
+			AgentsKnown: true,
+			MonitoredAgents: []domain.AgentTransition{
+				{AgentID: "w1:p1", AgentType: "claude", PaneID: "w1:p1", Status: "idle"},
+			},
+			AgentNames: map[string]string{"w1:p1": "calm-badger"},
+		},
+		cfg: cfg,
+		tasks: []frontend.TaskGroup{{Source: cfg.TaskSources[0], Index: 0,
+			Locator: "gist://3f2a1b9c/calm-badger.md",
+			Items:   []domain.ChecklistItem{{Index: 1, Mark: " ", Text: "write the parser"}}}},
+	})
+	m = upd.(Model)
+	m.tab = tabTasks
+
+	// The row was snapshotted while the source resolved to brave-otter's list;
+	// the refresh above has since re-resolved it to calm-badger's.
+	stale := taskRow{group: 0, item: 1, path: "gist://3f2a1b9c/brave-otter.md", itemText: "write the parser"}
+	upd, _ = m.sendTaskRow(stale)
+	m = upd.(Model)
+	if m.confirm != nil {
+		t.Fatal("a stale row must not reach the send confirmation")
+	}
+	if !strings.Contains(m.message, "task sources changed") {
+		t.Fatalf("message %q, want the staleness refusal", m.message)
+	}
+}

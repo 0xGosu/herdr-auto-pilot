@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -4768,9 +4769,13 @@ type taskSourceMatch struct {
 	// remotely. Never used for I/O.
 	display string
 	// remote reports that the list is not on this machine, which selects the
-	// next-task template that omits the --path fallback.
+	// next-task template that never mentions --path.
 	remote bool
-	data   []byte
+	// index is the source's position in cfg.TaskSources, threaded from the
+	// match walk for {task_source_index} — never recovered by comparing
+	// entries, since duplicate sources are legal.
+	index int
+	data  []byte
 }
 
 // matchTaskSource walks cfg.TaskSources for a source matching the given
@@ -4810,7 +4815,7 @@ func (d *Daemon) sourceSelectsAgent(ctx context.Context, src config.TaskSource,
 func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID, agentType, workspaceID, agentName string) (taskSourceMatch, bool, bool) {
 	var completed *taskSourceMatch
 	unusable := false
-	for _, src := range cfg.TaskSources {
+	for i, src := range cfg.TaskSources {
 		if !d.sourceSelectsAgent(ctx, src, agentID, agentType, workspaceID, agentName) {
 			continue
 		}
@@ -4832,12 +4837,12 @@ func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID
 			continue
 		}
 		if domain.NextDeclaredTask(string(data)) != "" {
-			return taskSourceMatch{src: src, locator: res.Locator, display: res.Display, remote: res.Remote, data: data}, true, false
+			return taskSourceMatch{src: src, locator: res.Locator, display: res.Display, remote: res.Remote, index: i, data: data}, true, false
 		}
 		// Only a real checklist with every item checked counts as completed;
 		// an empty or non-checklist file must not suppress tier-2 inference.
 		if completed == nil && domain.HasChecklistItems(string(data)) {
-			completed = &taskSourceMatch{src: src, locator: res.Locator, display: res.Display, remote: res.Remote, data: data}
+			completed = &taskSourceMatch{src: src, locator: res.Locator, display: res.Display, remote: res.Remote, index: i, data: data}
 		}
 	}
 	if completed != nil {
@@ -4940,6 +4945,7 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 		Task: task, Path: m.display, Locator: m.locator, Remote: m.remote,
 		Template:  m.src.NextTaskTemplate,
 		AgentName: agentName, Cwd: cwd,
+		SourceIndex: strconv.Itoa(m.index),
 		// Fold the task's nested sub-items into the delivered content while
 		// Task stays the single-line reservation identity. A flat file (no
 		// nesting) folds to the title unchanged, so this is a no-op there.

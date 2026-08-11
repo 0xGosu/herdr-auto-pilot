@@ -1085,8 +1085,19 @@ func (m Model) taskRows() []taskRow {
 		if ws == "" {
 			ws = "*"
 		}
+		// The address rows carry is the group's resolved locator (see
+		// TaskGroup.ListAddress) — under a remote provider Source.Path is only
+		// a file name (or empty, for a derived source), which the actions'
+		// read-modify-write could never address. The header prefers the
+		// configured spelling and falls back to the operator-facing Display,
+		// so a derived source that resolved shows WHICH list it resolved to.
+		addr := g.ListAddress()
+		shownPath := g.Source.Path
+		if shownPath == "" {
+			shownPath = displayTaskAddress(addr)
+		}
 		hdr := fmt.Sprintf("#%d agent=%s ws=%s  %s", g.Index, sel, ws,
-			truncatePathKeepBase(g.Source.Path, taskPathDisplayWidth))
+			truncatePathKeepBase(shownPath, taskPathDisplayWidth))
 		if names := live[g.Index]; len(names) > 0 {
 			hdr += "  → " + strings.Join(names, ", ")
 		}
@@ -1103,18 +1114,18 @@ func (m Model) taskRows() []taskRow {
 		// they see, matching filterAudit. Every row is width-bounded: a wrapped
 		// line would break the one-row-one-line accounting window/listPageSize
 		// depend on.
-		hfields := []string{fmt.Sprintf("#%d", g.Index), sel, ws, g.Source.Path,
+		hfields := []string{fmt.Sprintf("#%d", g.Index), sel, ws, shownPath,
 			strings.Join(live[g.Index], " ")}
 		rows = append(rows, taskRow{text: oneLine(hdr, max(20, m.contentWidth())),
-			fields: hfields, header: true, group: g.Index, path: g.Source.Path})
+			fields: hfields, header: true, group: g.Index, path: addr})
 		switch {
 		case g.Err != "":
 			rows = append(rows, taskRow{text: oneLine("  ✗ "+g.Err, max(20, m.contentWidth())),
 				fields: append([]string{g.Err}, hfields...), errRow: true,
-				group: g.Index, path: g.Source.Path})
+				group: g.Index, path: addr})
 		case len(g.Items) == 0:
 			rows = append(rows, taskRow{text: "  (no tasks in this list)", fields: hfields,
-				group: g.Index, path: g.Source.Path})
+				group: g.Index, path: addr})
 		default:
 			for _, it := range g.Items {
 				markCh := "  "
@@ -1140,7 +1151,7 @@ func (m Model) taskRows() []taskRow {
 					inProgress: it.Mark == domain.MarkInProgress,
 					group:      g.Index,
 					item:       it.Index,
-					path:       g.Source.Path,
+					path:       addr,
 					itemText:   it.Text,
 					itemDetail: it.Detail,
 				})
@@ -1459,7 +1470,7 @@ func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refr
 	if msg.err != nil {
 		return msg
 	}
-	msg.tasks = app.TaskGroups(msg.cfg)
+	msg.tasks = app.TaskGroups(msg.cfg, msg.status)
 	// Both of these read the cached check file only — the fetch itself runs in
 	// updateCheckCmd, off this path, because refreshData runs on every tick.
 	msg.update = app.UpdateStatus(msg.cfg)
@@ -3036,7 +3047,7 @@ func (m Model) markedTaskTargets() []taskTarget {
 			if !m.taskMarks[taskMarkKey(g.Index, it.Index)] {
 				continue
 			}
-			p := canonicalTaskPath(g.Source.Path)
+			p := canonicalTaskPath(g.ListAddress())
 			key := p + "\x00" + strconv.Itoa(it.Index)
 			if seen[key] {
 				continue
@@ -3065,7 +3076,7 @@ func (m *Model) applyTaskLists(lists map[string][]domain.ChecklistItem) {
 	}
 	for i := range m.data.tasks {
 		g := &m.data.tasks[i]
-		if items, ok := lists[canonicalTaskPath(g.Source.Path)]; ok {
+		if items, ok := lists[canonicalTaskPath(g.ListAddress())]; ok {
 			g.Items = items
 			g.Err = ""
 		}
@@ -3093,7 +3104,7 @@ func (m *Model) flipTaskCheckboxes(targets []taskTarget) {
 	}
 	for i := range m.data.tasks {
 		g := &m.data.tasks[i]
-		tgs := byPath[canonicalTaskPath(g.Source.Path)]
+		tgs := byPath[canonicalTaskPath(g.ListAddress())]
 		if len(tgs) == 0 {
 			continue
 		}
@@ -3366,7 +3377,7 @@ func (m Model) confirmDeleteTaskTargets(targets []taskTarget, clearsMarks bool) 
 // no source to consult at all.
 func (m Model) taskSourceLabel(r *taskRow) string {
 	if r.group >= len(m.data.tasks) {
-		return truncatePathKeepBase(r.path, taskPathDisplayWidth)
+		return truncatePathKeepBase(displayTaskAddress(r.path), taskPathDisplayWidth)
 	}
 	src := m.data.tasks[r.group].Source
 	if src.Agent != "" {
@@ -3386,7 +3397,14 @@ func (m Model) addTaskPrompt() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if r.path == "" {
-		m.message = "this source has no path configured — edit config.toml"
+		// Unresolved: a local source with no path (misconfigured), or a derived
+		// per-agent source whose list is ambiguous here (zero or several live
+		// agents match — with exactly one, taskRows carries its resolved list).
+		if r.group < len(m.data.tasks) && m.data.cfg.ResolveProvider(m.data.tasks[r.group].Source).Remote() {
+			m.message = "one list per matched agent — add via `hap task <agent> add` instead"
+		} else {
+			m.message = "this source has no path configured — edit config.toml"
+		}
 		return m, nil
 	}
 	app, path := m.app, r.path
@@ -3633,16 +3651,19 @@ func (m Model) sendTaskRow(r taskRow) (tea.Model, tea.Cmd) {
 	// The template comes from the live config, so make sure it still belongs
 	// to the snapshotted file: a task-source change while a detail overlay
 	// was open must not pair one source's text with another's template.
-	if r.group >= len(m.data.tasks) || m.data.tasks[r.group].Source.Path != r.path {
+	if r.group >= len(m.data.tasks) || m.data.tasks[r.group].ListAddress() != r.path {
 		m.message = "task sources changed — refresh and retry"
 		return m, nil
 	}
 	template := m.data.tasks[r.group].Source.NextTaskTemplate
 	app := m.app
+	// The group's Index IS the config position (one group per source, in
+	// config order) — threaded through, never recovered by comparing entries.
+	sourceIndex := strconv.Itoa(m.data.tasks[r.group].Index)
 	paneID, agentType, path, text, item := agent.PaneID, agent.AgentType, canonicalTaskPath(r.path), r.itemText, r.item
 	send := m.do(fmt.Sprintf("task #%d sent to %s and marked [-] in progress", item, name),
 		func(c context.Context) error {
-			return app.SendTaskToAgent(c, paneID, agentType, name, path, template, item, text)
+			return app.SendTaskToAgent(c, paneID, agentType, name, path, template, sourceIndex, item, text)
 		})
 	// The count rides along: what gets delivered is the FOLDED task, so a label
 	// naming only the item number would take a "y" for more than it showed.
@@ -3677,7 +3698,7 @@ func (m Model) taskDetailLines(r taskRow, width int) []string {
 	// only counts them.
 	text := domain.FoldedTaskText(domain.DisplayTaskText(r.itemText), r.itemDetail)
 	lines = m.detailField(lines, w, "Text", domain.DecodeTaskNewlines(text))
-	lines = m.detailField(lines, w, "Source file", r.path)
+	lines = m.detailField(lines, w, "Source file", displayTaskAddress(r.path))
 	if r.group < len(m.data.tasks) {
 		src := m.data.tasks[r.group].Source
 		lines = m.detailField(lines, w, "Agent selector", orDash(src.Agent))
@@ -4293,30 +4314,12 @@ func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 // because a source's selectors are broad enough to also apply to other
 // agents (an empty/type-level Agent selector, or a wildcard Workspace).
 func (m Model) agentTaskSourceMatches(a domain.AgentTransition) []int {
-	agentName := m.data.status.AgentName(a.AgentID)
-	workspaceName := ""
-	if ws, ok := m.data.status.Workspaces[a.WorkspaceID]; ok {
-		workspaceName = ws.Label
-	}
-	if workspaceName == "" {
-		workspaceName = a.WorkspaceID
-	}
-
 	var indices []int
 	for i, src := range m.data.cfg.TaskSources {
-		if src.Agent != "" && src.Agent != a.AgentID && src.Agent != a.AgentType &&
-			(agentName == "" || src.Agent != agentName) {
-			continue
-		}
-		if !domain.MatchWorkspace(src.Workspace, workspaceName) {
-			continue
-		}
-		// An empty path means "unconfigured" only under local storage. Under a
-		// remote provider it is the ordinary one-list-per-matched-agent form,
-		// so skipping it here would hide every derived source from the Agents
-		// tab, the `t` jump, and the Tasks-tab annotations — the source would
-		// silently look like it did not exist.
-		if src.Path == "" && !m.data.cfg.ResolveProvider(src).Remote() {
+		// One matcher for "does this source feed this agent" — the same one
+		// TaskGroups uses to resolve a derived source, so the header's
+		// "→ name" annotation and the list it shows can never disagree.
+		if !frontend.SourceMatchesAgent(m.data.cfg, src, m.data.status, a) {
 			continue
 		}
 		indices = append(indices, i)
@@ -4886,6 +4889,18 @@ func (m Model) editTaskSourcePrompt(index int, path string) (tea.Model, tea.Cmd)
 		},
 	})
 	return m, nil
+}
+
+// displayTaskAddress renders a task-list address for on-screen text: a local
+// path unchanged, a gist locator with its id shortened. Same rule as
+// shortGistIDForDisplay — a secret gist's id is effectively a capability, so
+// no screen echoes one in full — which is why displays must not use the raw
+// row path or TaskGroup.Display (the full, openable URL) directly.
+func displayTaskAddress(addr string) string {
+	if ref, ok := tasklocator.ParseGist(addr); ok {
+		return "gist:" + shortGistIDForDisplay(ref.GistID) + "/" + ref.File
+	}
+	return addr
 }
 
 // shortGistIDForDisplay renders a gist id as a recognizable prefix. A secret

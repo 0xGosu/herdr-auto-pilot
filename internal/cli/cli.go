@@ -1833,7 +1833,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	fs := flag.NewFlagSet("task-source", flag.ContinueOnError)
 	agent := fs.String("agent", "", "agent short name, id, or type this source applies to")
 	workspace := fs.String("workspace", "", "workspace name this source applies to (\"*\" wildcards, e.g. \"codex-*\")")
-	template := fs.String("template", "", "next-task prompt template ({next_task_content}, {task_list_path}, {task_list_path_quoted}, {agent_name}, {cwd} placeholders)")
+	template := fs.String("template", "", "next-task prompt template ({next_task_content}, {task_list_path}, {task_list_path_quoted}, {task_source_index}, {agent_name}, {cwd} placeholders)")
 	autoSend := fs.Bool("auto-send-when-idle", false, "also hand out tasks on the periodic idle poll, not only on a herdr attention event")
 	llmReview := fs.Bool("enable-llm-review-before-auto-send", false, "let the configured [llm].command revise the task list and pick the task, immediately before the daemon auto-sends one (never applies to a manual `task send`)")
 	maxTasks := fs.Int("max-tasks", config.DefaultMaxTasks, "cap on how many checklist items this source may hold before task generation stops refilling it")
@@ -2312,10 +2312,16 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 }
 
 // taskHints are the follow-ups printed under any `hap task` op. They are built
-// from the target the caller addressed the list by (agent name, or --path
-// FILE), so each line can be re-run verbatim.
+// from the target the caller addressed the list by (agent name, source index,
+// or --path FILE), so each line can be re-run verbatim — which is why an
+// index-shaped target is normalized to its bare-digit spelling ('#0' pasted
+// unquoted is a shell comment, and the whole command after it vanishes).
 func taskHints(agent, path string, listing bool) []Hint {
 	target := agent
+	idx, isIndex := domain.ParseTaskSourceIndexRef(agent)
+	if isIndex {
+		target = strconv.Itoa(idx)
+	}
 	if target == "" {
 		target = "--path " + domain.ShellQuote(path)
 	}
@@ -2333,9 +2339,18 @@ func taskHints(agent, path string, listing bool) []Hint {
 			{Cmd: fmt.Sprintf("hap task %s add \"<text>\"", target), Why: "queue more work"},
 		}
 	}
-	if agent != "" {
+	// The send hint names an AGENT: send delivers to a live agent, which an
+	// index cannot address (taskSend refuses it), so an index target gets the
+	// placeholder form rather than a hint that is a guaranteed refusal.
+	switch {
+	case agent != "" && !isIndex:
 		hints = append(hints, Hint{
 			Cmd: fmt.Sprintf("hap task %s send <n> --yes", agent),
+			Why: "hand a task to the live agent now (it must be idle)",
+		})
+	case isIndex:
+		hints = append(hints, Hint{
+			Cmd: "hap task <agent> send <n> --yes",
 			Why: "hand a task to the live agent now (it must be idle)",
 		})
 	}
@@ -2344,7 +2359,7 @@ func taskHints(agent, path string, listing bool) []Hint {
 
 // taskOp runs one checklist operation against an already-resolved target.
 func taskOp(ctx context.Context, app *frontend.App, out io.Writer, agent, path string, args []string) error {
-	usage := "usage: task [<agent> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | move <n> <position|up|down> | send <n> [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>\nsee: hap help task"
+	usage := "usage: task [<agent> | <source-index> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | move <n> <position|up|down> | send <n> [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>; <source-index> is a position from `hap config task-source list` (e.g. 0)\nsee: hap help task"
 	if agent == "" && path == "" {
 		return fmt.Errorf("%s", usage)
 	}
@@ -2451,6 +2466,12 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 	if agent == "" {
 		return fmt.Errorf("task send needs an agent name (a --path list has no agent to send to)")
 	}
+	// Guarded here, before item resolution: an index names a SOURCE, and send
+	// needs a live AGENT — falling through would end in a misleading "no live
+	// agent named \"0\"" after the list was already read.
+	if _, isIndex := domain.ParseTaskSourceIndexRef(agent); isIndex {
+		return fmt.Errorf("task send needs an agent name — a task-source index names a list, not the agent to send to (see: hap agents)")
+	}
 	it, err := taskItemArg(app, agent, path, idxArgs)
 	if err != nil {
 		return err
@@ -2491,7 +2512,7 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 	if domain.AgentBusy(live.Status) {
 		return fmt.Errorf("agent %s is %s — a task can only be sent to a cleanly idle agent", agent, live.Status)
 	}
-	sourcePath, err := app.TaskSourcePathFor(agent)
+	sourcePath, sourceIndex, err := app.TaskListFor(agent, "")
 	if err != nil {
 		return err
 	}
@@ -2525,7 +2546,7 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 	// pre-delivery refusal (the agent stopped being idle, the checklist
 	// moved) or a delivery failure whose reservation was rolled back —
 	// either way the task is not in the agent, and retrying is safe.
-	if err := app.SendTaskToAgent(ctx, live.PaneID, live.AgentType, agent, sourcePath, template, idx, it.Text); err != nil {
+	if err := app.SendTaskToAgent(ctx, live.PaneID, live.AgentType, agent, sourcePath, template, sourceIndex, idx, it.Text); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "task #%d sent to %s and marked [-] in progress\n", idx, agent)
@@ -2558,7 +2579,7 @@ func taskTarget(args []string) (agent, path string, rest []string, err error) {
 	case strings.HasPrefix(args[0], "--path="):
 		return "", strings.TrimPrefix(args[0], "--path="), args[1:], nil
 	case strings.HasPrefix(args[0], "-"):
-		return "", "", nil, fmt.Errorf("expected an agent name or --path <file> before the task op, got %q", args[0])
+		return "", "", nil, fmt.Errorf("expected an agent name, a task-source index, or --path <file> before the task op, got %q", args[0])
 	default:
 		return args[0], "", args[1:], nil
 	}
@@ -2801,7 +2822,7 @@ func taskList(app *frontend.App, out io.Writer, agent, path string, args []strin
 	}
 	// Resolve the file once and list from it, so the path printed in the hints
 	// is exactly the file the items above came from.
-	resolved, err := app.TaskFilePath(agent, path)
+	resolved, sourceIndex, err := app.TaskListFor(agent, path)
 	if err != nil {
 		return err
 	}
@@ -2815,13 +2836,14 @@ func taskList(app *frontend.App, out io.Writer, agent, path string, args []strin
 	// reads them beside the actual task numbers. Only `list` prints them —
 	// the mutating ops reprint the list without repeating the instructions.
 	// The hints must match where the list actually lives. `resolved` is a
-	// LOCATOR: printing it raw would show the agent a gist:// string, and the
-	// local form's closing line offers a `--path` fallback that reads a local
-	// file — which under a remote provider names something that does not exist.
+	// LOCATOR: printing it raw would show the agent a gist:// string. The
+	// fallback selector the hints offer is the task-source INDEX, which works
+	// under every provider — --path reads a local file and under a remote one
+	// names something that does not exist.
 	if tasklocator.Remote(resolved) {
-		fmt.Fprint(out, "\n"+domain.RemoteTaskManagementHints(agent, tasklocator.Display(resolved)))
+		fmt.Fprint(out, "\n"+domain.RemoteTaskManagementHints(agent, tasklocator.Display(resolved), sourceIndex))
 	} else {
-		fmt.Fprint(out, "\n"+domain.TaskManagementHints(agent, resolved))
+		fmt.Fprint(out, "\n"+domain.TaskManagementHints(agent, resolved, sourceIndex))
 	}
 	return nil
 }

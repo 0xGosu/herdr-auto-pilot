@@ -1744,7 +1744,9 @@ func TestTaskListPrintsManagementHints(t *testing.T) {
 		"`hap task backend start <n>`",
 		"`hap task backend done <n>`",
 		"`'#3'` always addresses",
-		"use `--path " + abs + "` in place of `backend`",
+		// The fallback the hints offer is the source INDEX — the selector
+		// that works under every storage provider, unlike --path.
+		"use the task-source index `0` in place of `backend`",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("agent-addressed list must print %q, got:\n%s", want, out)
@@ -1821,11 +1823,14 @@ func TestTaskResolutionErrors(t *testing.T) {
 	}
 	if _, err := run(t, app, "task", "anyone", "list"); err == nil {
 		t.Error("workspace-only source must not be addressable by agent name")
-	} else if !strings.Contains(err.Error(), "--path") {
-		t.Errorf("workspace-only error should point at --path, got: %v", err)
+	} else if !strings.Contains(err.Error(), "index") {
+		// The remedy is the task-source INDEX, never --path: the index works
+		// under every storage provider, while --path reads a local file and is
+		// dead advice for a remote list.
+		t.Errorf("workspace-only error should point at the source index, got: %v", err)
 	}
 
-	// Two sources for the same agent → ambiguous.
+	// Two sources for the same agent → ambiguous, resolved by index.
 	if err := app.AddTaskSource(context.Background(), "dup", "", pathA, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -1834,8 +1839,76 @@ func TestTaskResolutionErrors(t *testing.T) {
 	}
 	if _, err := run(t, app, "task", "dup", "list"); err == nil {
 		t.Error("ambiguous agent must error")
-	} else if !strings.Contains(err.Error(), "matches 2 task sources") {
-		t.Errorf("ambiguous error should name the count, got: %v", err)
+	} else if !strings.Contains(err.Error(), "matches 2 task sources") || !strings.Contains(err.Error(), "index") {
+		t.Errorf("ambiguous error should name the count and point at the source index, got: %v", err)
+	}
+}
+
+// TestTaskSourceIndexSelector: a task source is addressable by its config
+// position — the selector that works under EVERY storage provider, for
+// sources an agent name cannot reach (workspace- or type-scoped, or an agent
+// matching several). Bare digits can never be an agent name (herdr names
+// start with a lowercase letter), and '#N' works quoted.
+func TestTaskSourceIndexSelector(t *testing.T) {
+	app, _ := testApp(t)
+	path := writeTaskFile(t, "- [ ] first job\n- [x] old job\n")
+	// A workspace-scoped source: exactly the shape a name cannot address.
+	if err := app.AddTaskSource(context.Background(), "", "codex-*", path, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "task", "0", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "first job") {
+		t.Errorf("`task 0 list` should list the source's items, got:\n%s", out)
+	}
+	// The hints must be re-runnable verbatim with the index target, and must
+	// not offer a fallback — the index IS the fallback.
+	if !strings.Contains(out, "`hap task 0 done <n>`") {
+		t.Errorf("hints should spell commands with the index target, got:\n%s", out)
+	}
+	if strings.Contains(out, "no longer recognized") {
+		t.Errorf("index-addressed hints must not print the fallback note, got:\n%s", out)
+	}
+
+	// '#0' addresses the same source (quoted in a real shell) — and every
+	// re-runnable line in the output still spells the BARE index, since '#0'
+	// pasted unquoted is a shell comment.
+	if out, err = run(t, app, "task", "#0", "list"); err != nil || !strings.Contains(out, "first job") {
+		t.Errorf("'#0' should address source 0, got err=%v out:\n%s", err, out)
+	}
+	if !strings.Contains(out, "hap task 0 list --status pending") || strings.Contains(out, "task #0 ") {
+		t.Errorf("'#0'-addressed output must render commands with the bare index, got:\n%s", out)
+	}
+	// The footer must not advertise `task 0 send` — the guard below makes
+	// that a guaranteed refusal; the placeholder form is offered instead.
+	if strings.Contains(out, "task 0 send") || !strings.Contains(out, "task <agent> send") {
+		t.Errorf("index-addressed footer should offer send only via an agent placeholder, got:\n%s", out)
+	}
+
+	// Mutations address the same list.
+	if _, err := run(t, app, "task", "0", "done", "#1"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [x] first job") {
+		t.Errorf("`task 0 done` must mutate the indexed source's file, got:\n%s", data)
+	}
+
+	// Out of range fails with the discovery hint, not a resolve guess.
+	if _, err := run(t, app, "task", "9", "list"); err == nil {
+		t.Error("an out-of-range index must error")
+	} else if !strings.Contains(err.Error(), "does not exist") || !strings.Contains(err.Error(), "task-source list") {
+		t.Errorf("out-of-range error should say so and name the discovery command, got: %v", err)
+	}
+
+	// send needs a live AGENT; an index names a list, and falling through
+	// would end in a misleading "no live agent named \"0\"".
+	if _, err := run(t, app, "task", "0", "send", "1", "--yes"); err == nil {
+		t.Error("`task <index> send` must refuse")
+	} else if !strings.Contains(err.Error(), "needs an agent name") {
+		t.Errorf("index-send refusal should ask for an agent name, got: %v", err)
 	}
 }
 

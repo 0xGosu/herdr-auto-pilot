@@ -786,8 +786,11 @@ type TaskSource struct {
 	// {next_task_content} (next unchecked item, or "none" when the list is
 	// complete), {task_list_path}, {task_list_path_quoted} (that path as one
 	// shell word — use it inside any command the template hands the agent to
-	// run), {agent_name} (the agent's short name), and {cwd} (the agent's
-	// working directory). Empty uses the built-in default.
+	// run), {task_source_index} (this source's position in `hap config
+	// task-source list` — the provider-independent `hap task` selector; falls
+	// back to the agent name when the sender cannot know the position),
+	// {agent_name} (the agent's short name), and {cwd} (the agent's working
+	// directory). Empty uses the built-in default.
 	NextTaskTemplate string `toml:"next_task_template,omitempty"`
 	// EnableLLMReviewBeforeAutoSend gates the pre-delivery LLM review of the
 	// tasks this source hands out. When an [llm].command is configured, the

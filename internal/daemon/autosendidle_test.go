@@ -194,7 +194,7 @@ func TestAutoSendIdleResolvesTildeSourcePathDespiteStateDirCwd(t *testing.T) {
 	// not be the daemon's). Expanded and absolute, but deliberately NOT
 	// symlink-resolved: that belongs to identity, not to what anyone reads.
 	want := (&domain.DeclaredTask{
-		Task: "step two", Path: tasklocator.DisplayPath(realFile), AgentName: name,
+		Task: "step two", Path: tasklocator.DisplayPath(realFile), AgentName: name, SourceIndex: "0",
 	}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want the next declared task prompt %q", got, want)
@@ -252,7 +252,7 @@ func TestAutoSendIdleSendsNextPendingTaskAndReservesIt(t *testing.T) {
 	h.daemon.autoSendIdleTasks(context.Background(), agents)
 
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	want := (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name}).Prompt()
+	want := (&domain.DeclaredTask{Task: "step two", Path: taskFile, AgentName: name, SourceIndex: "0"}).Prompt()
 	if got := h.herdr.sentInputs()[0]; got != want {
 		t.Errorf("sent %q, want the next declared task prompt %q", got, want)
 	}
@@ -284,10 +284,11 @@ func TestAutoSendIdleFoldsNestedTaskDetailButReservesByIdentity(t *testing.T) {
 
 	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
 	want := (&domain.DeclaredTask{
-		Task:      "1. Build the widget",
-		Content:   domain.FoldTaskContent(content, "1. Build the widget"),
-		Path:      taskFile,
-		AgentName: name,
+		Task:        "1. Build the widget",
+		Content:     domain.FoldTaskContent(content, "1. Build the widget"),
+		Path:        taskFile,
+		AgentName:   name,
+		SourceIndex: "0",
 	}).Prompt()
 	got := h.herdr.sentInputs()[0]
 	if got != want {
