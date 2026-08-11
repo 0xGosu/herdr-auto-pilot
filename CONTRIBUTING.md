@@ -115,7 +115,11 @@ The manifest version and the tag MUST match: `herdr plugin install` runs
 `scripts/install.sh`, which downloads the release asset for the version
 declared in `herdr-plugin.toml` (that's what removes the Go-toolchain
 dependency for users). The automation preserves this by construction. Between
-the bump merge and the release publishing (~15 min), installs from `main` can
-404 — a self-resolving window; pinned `--ref vX.Y.Z` installs are never
-affected. If the release *build* fails after the tag exists, re-run that
-`release.yml` run — never re-run auto-release, which would advance versions.
+the bump merge and the release publishing (~15 min), `main`'s manifest names a
+version with no assets; rather than 404, `install.sh` falls back to the newest
+earlier release that has them and says so loudly, and `hap update` picks up the
+intended version once it publishes. A `--ref vX.Y.Z` pin avoids that path only
+by naming a release that already has assets — install.sh sees the manifest, not
+the git ref; `HAP_NO_FALLBACK` is the guaranteed refusal. If the release *build*
+fails after the tag exists, re-run that `release.yml` run — never re-run
+auto-release, which would advance versions.
