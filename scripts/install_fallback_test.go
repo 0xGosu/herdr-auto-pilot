@@ -258,6 +258,28 @@ fi
 exec '` + realMv + `' "$@"
 `
 	writeFile(t, filepath.Join(dir, "mv"), []byte(mvShim), 0o755)
+
+	// A fake `rm`, for the same reason: an undeletable live file (immutable
+	// bit, a busy or permission-denied subdirectory, a stale network mount)
+	// cannot be produced as root either.
+	realRm, err := exec.LookPath("rm")
+	if err != nil {
+		t.Skip("rm not available")
+	}
+	rmShim := `#!/bin/sh
+# Fails when ANY argument matches the $HAP_TEST_RM_FAIL glob, else defers to
+# the real rm. Matching any argument (not just the last) keeps the pattern
+# specific to the target being removed rather than to flag order.
+if [ -n "${HAP_TEST_RM_FAIL:-}" ]; then
+  for a in "$@"; do
+    case "$a" in
+      $HAP_TEST_RM_FAIL) echo "rm: simulated failure: $a" >&2; exit 1 ;;
+    esac
+  done
+fi
+exec '` + realRm + `' "$@"
+`
+	writeFile(t, filepath.Join(dir, "rm"), []byte(rmShim), 0o755)
 	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
 }
 
@@ -833,4 +855,68 @@ func TestInstallReclaimFailureIsRecoverableOnTheNextRun(t *testing.T) {
 	if env.exists(".hap-swap") {
 		t.Errorf("the holding directory outlived a completed reclaim:\n%s", out)
 	}
+}
+
+// Clearing a live half of a complete recovery pair can fail too — an immutable
+// bit, a busy subdirectory, a stale mount. `set -e` is suspended inside these
+// functions, so an unchecked failure does not stop them: the guards downstream
+// read a merely-undeletable file as "already restored", pair the interrupted
+// half with the restored one, and delete the coherent mate — reporting
+// SUCCESS. Failing loudly and keeping the pair is the only safe outcome.
+func TestInstallReclaimKeepsThePairWhenClearingALiveHalfFails(t *testing.T) {
+	env := newInstallEnv(t, "0.6.1",
+		[]string{"v0.6.1"}, []release{{version: "0.6.1"}})
+	env.seedPriorInstall(t)
+
+	// A complete pair in the holding directory, and a live lib/ that stands
+	// in for the interrupted run's newly-placed one.
+	swap := filepath.Join(env.root, ".hap-swap")
+	if err := os.MkdirAll(filepath.Join(swap, "lib"), 0o755); err != nil {
+		t.Fatalf("stage swap: %v", err)
+	}
+	writeFile(t, filepath.Join(swap, "lib", "libcoherent.so"), []byte("coherent mate\n"), 0o644)
+	writeFile(t, filepath.Join(swap, "hap"), []byte("#!/bin/sh\necho hap v0.0.9\nexit 0\n"), 0o755)
+
+	code, out := env.run(t, "HAP_TEST_RM_FAIL=lib")
+	if code != 1 {
+		t.Fatalf("an unclearable live half must fail the install, not succeed with a mismatched pair (exit %d):\n%s", code, out)
+	}
+	// BOTH halves must survive — discarding either leaves no coherent pair.
+	body, err := os.ReadFile(filepath.Join(swap, "lib", "libcoherent.so"))
+	if err != nil {
+		t.Fatalf("the coherent lib/ was discarded: %v\n%s", err, out)
+	}
+	if string(body) != "coherent mate\n" {
+		t.Errorf("the coherent lib/ was corrupted:\n%s", out)
+	}
+	if !env.exists(".hap-swap/hap") {
+		t.Errorf("the coherent binary was discarded:\n%s", out)
+	}
+}
+
+// The same class inside swap_in's rollback. A lib/ that cannot be removed is
+// still a DIRECTORY, so restoring into it would move the saved copy INSIDE
+// (lib/lib) — an mv that SUCCEEDS, mixing the two and reporting a clean
+// rollback before deleting the saved copy.
+func TestInstallRollbackKeepsTheSavedCopyWhenClearingFails(t *testing.T) {
+	env := newInstallEnv(t, "0.6.1",
+		[]string{"v0.6.1"}, []release{{version: "0.6.1"}})
+	env.seedPriorInstall(t)
+
+	// Fail the binary move so the rollback runs after lib/ was placed, and
+	// fail the clear of that placed lib/ once the rollback tries to undo it.
+	code, out := env.run(t,
+		"HAP_TEST_MV_FAIL=*/.hap-install/hap",
+		"HAP_TEST_RM_FAIL=lib")
+	if code != 1 {
+		t.Fatalf("install should have failed (exit %d):\n%s", code, out)
+	}
+	if env.exists("lib/lib") {
+		t.Errorf("the saved lib/ was nested inside the live one instead of replacing it:\n%s", out)
+	}
+	// Nothing safe was left to do, so the saved copy must still exist.
+	if !env.exists(".hap-swap/lib/libsentinel.so") && !env.exists(".hap-prev/lib/libsentinel.so") {
+		t.Errorf("the saved copy was discarded after a failed clear:\n%s", out)
+	}
+	mustContain(t, out, "could not be fully restored")
 }

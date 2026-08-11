@@ -137,7 +137,10 @@ install_release() {
   # REQUIRED — the binary is dynamically linked against them via an rpath of
   # <plugin>/lib, so a binary without them will not start, and the two must
   # never be installed independently.
-  rm -rf "$STAGE"
+  # CHECKED: a stale STAGE from a previous candidate still holds ITS lib/, and
+  # tar would unpack this candidate's on top — shipping a mixture of two
+  # releases' libraries.
+  rm -rf "$STAGE" || return 1
   mkdir -p "$STAGE" || return 1
   tar -xzf "${dir}/${NATIVE_ASSET}" -C "$STAGE" || return 1
   [ -d "${STAGE}/lib" ] || return 1
@@ -183,8 +186,13 @@ reclaim_swap() {
   local reclaimed=0
   [ -d "$SWAP" ] || return 0
   if [ -e "${SWAP}/lib" ] && [ -e "${SWAP}/hap" ]; then
-    rm -rf lib
-    rm -f "$DEST"
+    # CHECKED, and the check is load-bearing. `set -e` is suspended here (this
+    # runs under `||`), so an unchecked failure would fall through to the
+    # guards below, which read "already restored" from a live file that is
+    # merely undeletable — leaving the interrupted half live, pairing it with
+    # the restored other half, and then deleting the coherent mate.
+    rm -rf lib || return 1
+    rm -f "$DEST" || return 1
   fi
   if [ -e "${SWAP}/lib" ] && [ ! -e lib ]; then
     mv "${SWAP}/lib" lib || return 1
@@ -201,6 +209,14 @@ reclaim_swap() {
   return 0
 }
 
+# THE RULE for everything below: any rm/mv that a LATER step depends on is
+# checked, because `set -e` is suspended inside these functions (they run under
+# `if`/`||`) and an unchecked failure falls through to guards that then misread
+# the state — an undeletable lib/ reads as "already restored", and a restore
+# into it nests rather than replaces. The only unchecked removals left are
+# cleanups of a directory whose contents have already been moved out, where a
+# failure leaves an empty directory that the next run's checked clear handles.
+#
 # swap_in — replace bin/hap and lib/ with the staged payload, restoring the
 # previous ones if either move fails.
 #
@@ -216,7 +232,9 @@ reclaim_swap() {
 swap_in() {
   local saved_lib=0 saved_bin=0 placed_lib=0 placed_bin=0 restored=0
 
-  rm -rf "$SWAP"
+  # CHECKED for the same reason: a stale SWAP/lib would make the save below
+  # move the live lib/ INSIDE it rather than to it.
+  rm -rf "$SWAP" || return 1
   mkdir -p "$SWAP" || return 1
   mkdir -p "$(dirname "$DEST")" || return 1
 
@@ -258,13 +276,29 @@ swap_in() {
   echo "warning: could not put the new files in place; restoring the previous install" >&2
   # Undo only what happened. Removing lib/ unconditionally would delete the
   # LIVE one when the very first move is what failed.
-  [ "$placed_lib" = 1 ] && rm -rf lib
-  [ "$placed_bin" = 1 ] && rm -f "$DEST"
-  if [ "$saved_lib" = 1 ]; then
-    mv "${SWAP}/lib" lib || restored=1
+  #
+  # Both clears are CHECKED for the same reason as in reclaim_swap: `set -e` is
+  # suspended here, and a `lib/` that could not be removed is still a
+  # DIRECTORY, so the restore below would move the saved copy INSIDE it
+  # (lib/lib) — which succeeds, leaving the two mixed together and reporting a
+  # clean rollback. If a clear fails there is nothing safe left to do but stop
+  # and keep the saved copy.
+  local cleared=1
+  if [ "$placed_lib" = 1 ]; then
+    rm -rf lib || cleared=0
   fi
-  if [ "$saved_bin" = 1 ]; then
-    mv "${SWAP}/hap" "$DEST" || restored=1
+  if [ "$placed_bin" = 1 ]; then
+    rm -f "$DEST" || cleared=0
+  fi
+  if [ "$cleared" = 0 ]; then
+    restored=1
+  else
+    if [ "$saved_lib" = 1 ]; then
+      mv "${SWAP}/lib" lib || restored=1
+    fi
+    if [ "$saved_bin" = 1 ]; then
+      mv "${SWAP}/hap" "$DEST" || restored=1
+    fi
   fi
 
   if [ "$restored" = 0 ]; then
@@ -294,8 +328,11 @@ install_model() {
     echo "embedding model already present (checksum ok); skipping download"
   elif curl -fsSL --retry 3 --retry-delay 5 -o "${dir}/${MODEL_FILE}" "${base}/${MODEL_FILE}" &&
     verify "$dir" "${MODEL_FILE}"; then
-    install -m 644 "${dir}/${MODEL_FILE}" "models/${MODEL_FILE}"
-    echo "installed embedding model at models/${MODEL_FILE}"
+    if install -m 644 "${dir}/${MODEL_FILE}" "models/${MODEL_FILE}"; then
+      echo "installed embedding model at models/${MODEL_FILE}"
+    else
+      echo "warning: embedding model could not be written; semantic matching will fall back to text search" >&2
+    fi
   else
     echo "warning: embedding model download failed; semantic matching will fall back to text search" >&2
     echo "         retry later with: bash scripts/install.sh" >&2
