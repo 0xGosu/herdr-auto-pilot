@@ -3244,16 +3244,26 @@ type TaskGroup struct {
 // them. This deliberately does NOT reuse resolveTaskFilePath: its
 // exactly-one-source-per-agent semantics pick a file to edit, while the
 // aggregate shows every source as configured.
-func (a *App) TaskGroups(cfg config.Config) []TaskGroup {
+//
+// st is the same status snapshot the refresh already fetched. It is what lets
+// a DERIVED source (one list per matched agent) still resolve here: the view
+// enumerates sources, so it has no agent name of its own, but when exactly one
+// live agent matches the source's selectors there is nothing to guess — that
+// agent's list IS the source's list right now. With zero or several matches
+// the group keeps the per-agent template note instead; the returned group
+// count and order never depend on the live agents (one group per config
+// entry — the TUI addresses groups by config index).
+func (a *App) TaskGroups(cfg config.Config, st Status) []TaskGroup {
 	ctx := context.Background()
 	groups := make([]TaskGroup, 0, len(cfg.TaskSources))
 	for i, src := range cfg.TaskSources {
 		g := TaskGroup{Source: src, Index: i}
-		// "" for the agent name: this view enumerates SOURCES, not agents. A
-		// source that derives one list per matched agent therefore cannot be
-		// resolved to a single list here, and says so rather than guessing —
-		// its per-agent lists are reachable from the Agents tab.
 		l, err := a.resolveSourceList(cfg, src, "")
+		if errors.Is(err, tasklocator.ErrAgentNameRequired) {
+			if name, ok := soleLiveMatch(cfg, src, st); ok {
+				l, err = a.resolveSourceList(cfg, src, name)
+			}
+		}
 		switch {
 		case errors.Is(err, tasklocator.ErrAgentNameRequired):
 			g.Err = "one list per matched agent — open an agent's list from the Agents tab"
@@ -3270,6 +3280,79 @@ func (a *App) TaskGroups(cfg config.Config) []TaskGroup {
 		groups = append(groups, g)
 	}
 	return groups
+}
+
+// ListAddress returns the address actions read and mutate this group's list
+// by: the resolved locator when the group resolved, else the configured path.
+// Never Source.Path alone — under a remote provider that is only a file name
+// (or empty, for a derived source), which the store cannot serve and which
+// collides across gists.
+func (g TaskGroup) ListAddress() string {
+	if g.Locator != "" {
+		return g.Locator
+	}
+	return g.Source.Path
+}
+
+// SourceMatchesAgent reports whether a live agent is one a task source's
+// selectors feed: the agent selector accepts the agent's id, type, or short
+// name; the workspace selector matches the workspace label (falling back to
+// its id). An empty path fails the match only under local storage — there it
+// means "unconfigured", while under a remote provider it is the ordinary
+// derived one-list-per-agent form.
+//
+// This is the ONE definition of "does this source feed this agent" for
+// status-snapshot surfaces (the TUI's Agents/Tasks tabs, TaskGroups' derived
+// resolution); the daemon's delivery path has its own richer matcher.
+func SourceMatchesAgent(cfg config.Config, src config.TaskSource, st Status, a domain.AgentTransition) bool {
+	name := st.AgentName(a.AgentID)
+	if src.Agent != "" && src.Agent != a.AgentID && src.Agent != a.AgentType &&
+		(name == "" || src.Agent != name) {
+		return false
+	}
+	workspaceName := ""
+	if ws, ok := st.Workspaces[a.WorkspaceID]; ok {
+		workspaceName = ws.Label
+	}
+	if workspaceName == "" {
+		workspaceName = a.WorkspaceID
+	}
+	if !domain.MatchWorkspace(src.Workspace, workspaceName) {
+		return false
+	}
+	if src.Path == "" && !cfg.ResolveProvider(src).Remote() {
+		return false
+	}
+	return true
+}
+
+// soleLiveMatch returns the short name of the one live agent a source's
+// selectors match, for resolving a derived source on a surface that has no
+// agent of its own. ok is false when the agent listing is unknown (absence of
+// agents must not be inferred from a failed query), when zero or several
+// agents match (ambiguous — per-agent lists stay per-agent), or when the
+// single match has no short name (the derived file name is built from it).
+func soleLiveMatch(cfg config.Config, src config.TaskSource, st Status) (string, bool) {
+	if !st.AgentsKnown {
+		return "", false
+	}
+	name, matches := "", 0
+	seen := map[string]bool{}
+	for _, a := range st.MonitoredAgents {
+		if seen[a.AgentID] {
+			continue
+		}
+		seen[a.AgentID] = true
+		if !SourceMatchesAgent(cfg, src, st, a) {
+			continue
+		}
+		matches++
+		name = st.AgentName(a.AgentID)
+	}
+	if matches != 1 || name == "" {
+		return "", false
+	}
+	return name, true
 }
 
 // UnfinishedTasks counts items that are neither completed nor abandoned —

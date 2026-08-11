@@ -4016,7 +4016,7 @@ func TestTaskGroups(t *testing.T) {
 		{Workspace: "*", Path: good}, // duplicate path, its own group
 		{Agent: "quiet", Path: empty},
 	}}
-	groups := app.TaskGroups(cfg)
+	groups := app.TaskGroups(cfg, frontend.Status{})
 	if len(groups) != len(cfg.TaskSources) {
 		t.Fatalf("got %d groups, want %d", len(groups), len(cfg.TaskSources))
 	}
@@ -4060,8 +4060,117 @@ func TestTaskGroups(t *testing.T) {
 
 func TestTaskGroupsEmptyConfig(t *testing.T) {
 	app, _ := testApp(t)
-	if groups := app.TaskGroups(config.Config{}); len(groups) != 0 {
+	if groups := app.TaskGroups(config.Config{}, frontend.Status{}); len(groups) != 0 {
 		t.Errorf("no task sources should yield no groups, got %d", len(groups))
+	}
+}
+
+// derivedTemplateNote is the note a derived (one-list-per-matched-agent)
+// source shows when the aggregate view cannot resolve it to a single list.
+const derivedTemplateNote = "one list per matched agent"
+
+func derivedGistCfg(t *testing.T, agentSelector string) config.Config {
+	t.Helper()
+	return config.Config{
+		TaskSourceProvider: config.TaskSourceProvider{
+			Provider: config.ProviderGitHubGist,
+			// Absent on purpose: the token is read at USE time, so resolution
+			// succeeds and the read fails fast — no network is ever dialed.
+			EnvFile:    filepath.Join(t.TempDir(), "absent.env"),
+			GitHubGist: config.GitHubGist{GistID: "3f2a1b9c"},
+		},
+		TaskSources: []config.TaskSource{{Agent: agentSelector}},
+	}
+}
+
+// TestTaskGroupsDerivedSourceSoleLiveMatchResolves: a derived source with
+// exactly one live matching agent resolves to that agent's list — the case
+// the Tasks tab used to render as a template note even though there was
+// nothing to guess.
+func TestTaskGroupsDerivedSourceSoleLiveMatchResolves(t *testing.T) {
+	app, _ := testApp(t)
+	cfg := derivedGistCfg(t, "brave-otter")
+	st := frontend.Status{
+		AgentsKnown: true,
+		MonitoredAgents: []domain.AgentTransition{
+			{AgentID: "t1", AgentType: "claude", WorkspaceID: "w1", Status: "idle"},
+		},
+		AgentNames: map[string]string{"t1": "brave-otter"},
+	}
+	groups := app.TaskGroups(cfg, st)
+	if len(groups) != 1 {
+		t.Fatalf("got %d groups, want 1", len(groups))
+	}
+	g := groups[0]
+	if want := "gist://3f2a1b9c/brave-otter.md"; g.Locator != want {
+		t.Fatalf("Locator=%q Err=%q, want the sole match's derived list %q", g.Locator, g.Err, want)
+	}
+	if g.ListAddress() != g.Locator {
+		t.Fatalf("ListAddress()=%q, want the resolved locator %q — actions must never fall back to the empty Source.Path", g.ListAddress(), g.Locator)
+	}
+	// The list itself is unreadable here (no credentials), and that must
+	// surface as the READ failure, not as the template note: the source DID
+	// resolve.
+	if strings.Contains(g.Err, derivedTemplateNote) {
+		t.Fatalf("Err=%q still shows the per-agent template note after a sole live match", g.Err)
+	}
+	if g.Err == "" {
+		t.Fatal("reading a gist list with no credentials should have failed")
+	}
+}
+
+// TestTaskGroupsDerivedSourceStaysTemplateWhenAmbiguous pins every case where
+// a derived source must KEEP the per-agent note: guessing a list here would
+// show (and let the operator mutate) some other agent's list.
+func TestTaskGroupsDerivedSourceStaysTemplateWhenAmbiguous(t *testing.T) {
+	otter := domain.AgentTransition{AgentID: "t1", AgentType: "claude", WorkspaceID: "w1"}
+	badger := domain.AgentTransition{AgentID: "t2", AgentType: "claude", WorkspaceID: "w1"}
+	names := map[string]string{"t1": "brave-otter", "t2": "calm-badger"}
+	cases := []struct {
+		name     string
+		selector string
+		st       frontend.Status
+	}{
+		{"two live agents match a type selector", "claude", frontend.Status{
+			AgentsKnown:     true,
+			MonitoredAgents: []domain.AgentTransition{otter, badger},
+			AgentNames:      names,
+		}},
+		{"no live agent matches", "brave-otter", frontend.Status{
+			AgentsKnown:     true,
+			MonitoredAgents: []domain.AgentTransition{badger},
+			AgentNames:      names,
+		}},
+		{"agent listing unknown", "brave-otter", frontend.Status{
+			// A failed agent query is NOT "no agents": resolution must not
+			// act on absence it cannot see.
+			AgentsKnown:     false,
+			MonitoredAgents: []domain.AgentTransition{otter},
+			AgentNames:      names,
+		}},
+		{"sole match has no short name", "t1", frontend.Status{
+			// Matched by pane id, but the derived file name is built from the
+			// SHORT name — without one there is nothing to resolve to.
+			AgentsKnown:     true,
+			MonitoredAgents: []domain.AgentTransition{otter},
+			AgentNames:      map[string]string{},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app, _ := testApp(t)
+			groups := app.TaskGroups(derivedGistCfg(t, tc.selector), tc.st)
+			if len(groups) != 1 {
+				t.Fatalf("got %d groups, want 1", len(groups))
+			}
+			g := groups[0]
+			if !strings.Contains(g.Err, derivedTemplateNote) {
+				t.Fatalf("Err=%q, want the per-agent template note", g.Err)
+			}
+			if g.Locator != "" {
+				t.Fatalf("Locator=%q, want none — an ambiguous derived source must not pick a list", g.Locator)
+			}
+		})
 	}
 }
 
