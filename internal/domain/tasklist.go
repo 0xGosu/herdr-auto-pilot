@@ -72,6 +72,13 @@ func RemoteTaskManagementHints(agent, display, sourceIndex string) string {
 
 func taskManagementHints(agent, path, sourceIndex string, remote bool) string {
 	target := agent
+	// An index-shaped target renders as its BARE digits: these command lines
+	// are pasted into a shell, where an unquoted '#0' is a comment and the
+	// whole command after it vanishes.
+	agentIsIndex := false
+	if idx, ok := ParseTaskSourceIndexRef(agent); ok {
+		target, agentIsIndex = strconv.Itoa(idx), true
+	}
 	if target == "" {
 		if remote {
 			// There is no local path to fall back to, and a remote list is
@@ -99,7 +106,7 @@ func taskManagementHints(agent, path, sourceIndex string, remote bool) string {
 	// The index note is rendered with the BARE digits, matching what the
 	// selector accepts unquoted — never "#N", which a shell strips as a
 	// comment when pasted without quotes.
-	if _, isIndex := ParseTaskSourceIndexRef(agent); agent != "" && !isIndex && sourceIndex != "" {
+	if agent != "" && !agentIsIndex && sourceIndex != "" {
 		fmt.Fprintf(&b, "- when the agent name `%s` is no longer recognized, use the task-source index `%s` in place of `%s` (`hap config task-source list` shows each source's index)\n",
 			agent, sourceIndex, agent)
 	}
@@ -124,7 +131,12 @@ func ParseTaskSourceIndexRef(s string) (int, bool) {
 	}
 	n, err := strconv.Atoi(digits)
 	if err != nil {
-		return 0, false
+		// All-digits but too large for an int. Still unambiguously an INDEX —
+		// falling through to name resolution would advise registering a source
+		// for an agent name herdr can never accept (names start with a
+		// lowercase letter). Saturate so the resolver's bounds check reports
+		// "does not exist" instead.
+		return int(^uint(0) >> 1), true
 	}
 	return n, true
 }

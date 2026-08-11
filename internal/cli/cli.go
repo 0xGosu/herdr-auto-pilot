@@ -2138,10 +2138,16 @@ func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) 
 }
 
 // taskHints are the follow-ups printed under any `hap task` op. They are built
-// from the target the caller addressed the list by (agent name, or --path
-// FILE), so each line can be re-run verbatim.
+// from the target the caller addressed the list by (agent name, source index,
+// or --path FILE), so each line can be re-run verbatim — which is why an
+// index-shaped target is normalized to its bare-digit spelling ('#0' pasted
+// unquoted is a shell comment, and the whole command after it vanishes).
 func taskHints(agent, path string, listing bool) []Hint {
 	target := agent
+	idx, isIndex := domain.ParseTaskSourceIndexRef(agent)
+	if isIndex {
+		target = strconv.Itoa(idx)
+	}
 	if target == "" {
 		target = "--path " + domain.ShellQuote(path)
 	}
@@ -2159,9 +2165,18 @@ func taskHints(agent, path string, listing bool) []Hint {
 			{Cmd: fmt.Sprintf("hap task %s add \"<text>\"", target), Why: "queue more work"},
 		}
 	}
-	if agent != "" {
+	// The send hint names an AGENT: send delivers to a live agent, which an
+	// index cannot address (taskSend refuses it), so an index target gets the
+	// placeholder form rather than a hint that is a guaranteed refusal.
+	switch {
+	case agent != "" && !isIndex:
 		hints = append(hints, Hint{
 			Cmd: fmt.Sprintf("hap task %s send <n> --yes", agent),
+			Why: "hand a task to the live agent now (it must be idle)",
+		})
+	case isIndex:
+		hints = append(hints, Hint{
+			Cmd: "hap task <agent> send <n> --yes",
 			Why: "hand a task to the live agent now (it must be idle)",
 		})
 	}

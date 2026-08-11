@@ -3657,9 +3657,9 @@ func (m Model) sendTaskRow(r taskRow) (tea.Model, tea.Cmd) {
 	}
 	template := m.data.tasks[r.group].Source.NextTaskTemplate
 	app := m.app
-	// The group index IS the config position (one group per source, in config
-	// order) — threaded through, never recovered by comparing entries.
-	sourceIndex := strconv.Itoa(r.group)
+	// The group's Index IS the config position (one group per source, in
+	// config order) — threaded through, never recovered by comparing entries.
+	sourceIndex := strconv.Itoa(m.data.tasks[r.group].Index)
 	paneID, agentType, path, text, item := agent.PaneID, agent.AgentType, canonicalTaskPath(r.path), r.itemText, r.item
 	send := m.do(fmt.Sprintf("task #%d sent to %s and marked [-] in progress", item, name),
 		func(c context.Context) error {

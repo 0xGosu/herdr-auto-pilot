@@ -2942,12 +2942,11 @@ func (a *App) AddTaskSource(ctx context.Context, agent, workspace, path, templat
 // every storage provider — a remote list has no local file for --path to read.
 func resolveTaskSourceFor(cfg config.Config, agent string) (config.TaskSource, int, error) {
 	var matches []config.TaskSource
-	var matchIdx []int
-	workspaceOnly := false
+	var matchIdx, workspaceIdx []int
 	for i, src := range cfg.TaskSources {
 		if src.Agent == "" {
 			if src.Workspace != "" && src.Workspace != "*" {
-				workspaceOnly = true
+				workspaceIdx = append(workspaceIdx, i)
 			}
 			continue
 		}
@@ -2960,8 +2959,11 @@ func resolveTaskSourceFor(cfg config.Config, agent string) (config.TaskSource, i
 	case 1:
 		return matches[0], matchIdx[0], nil
 	case 0:
-		if workspaceOnly {
-			return config.TaskSource{}, 0, fmt.Errorf("no task source is scoped to agent %q; workspace-scoped sources exist but aren't addressable by name — address one by its index, e.g. `hap task 0 list` (`hap config task-source list` shows each source's index)", agent)
+		if len(workspaceIdx) > 0 {
+			// The example names a REAL workspace-scoped source's index — a
+			// hardcoded `hap task 0` could open some other agent's list when
+			// source 0 happens to be agent-scoped.
+			return config.TaskSource{}, 0, fmt.Errorf("no task source is scoped to agent %q; workspace-scoped sources exist but aren't addressable by name — address one by its index, e.g. `hap task %d list` (`hap config task-source list` shows each source's index)", agent, workspaceIdx[0])
 		}
 		return config.TaskSource{}, 0, fmt.Errorf("no task source for agent %q; add one first: hap config task-source add --agent %s <checklist.md>", agent, agent)
 	default:
@@ -3021,7 +3023,10 @@ func (a *App) taskListFor(agent, path string) (locator, sourceIndex string, err 
 	}
 	if idx, ok := domain.ParseTaskSourceIndexRef(agent); ok {
 		if idx >= len(cfg.TaskSources) {
-			return "", "", fmt.Errorf("task source %d does not exist — %d source(s) configured (`hap config task-source list` shows them)", idx, len(cfg.TaskSources))
+			// The message echoes the TOKEN, not idx: an overflowing all-digit
+			// selector parses as a saturated index, and the operator should
+			// see what they typed, not MaxInt.
+			return "", "", fmt.Errorf("task source %s does not exist — %d source(s) configured (`hap config task-source list` shows them)", agent, len(cfg.TaskSources))
 		}
 		src := cfg.TaskSources[idx]
 		// "" for the agent: an index names a SOURCE. A derived source is one

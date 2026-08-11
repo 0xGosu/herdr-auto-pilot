@@ -1614,13 +1614,21 @@ func TestTaskManagementHints(t *testing.T) {
 
 // An index-addressed list already holds the fallback selector, so no fallback
 // note is printed — a note saying "use `0` in place of `0`" teaches nothing.
+// And a '#0'-addressed one renders its commands with the BARE digits: the
+// hint lines are pasted into a shell, where an unquoted '#0' is a comment and
+// everything after it vanishes.
 func TestTaskManagementHintsIndexTargetDropsFallbackNote(t *testing.T) {
-	got := TaskManagementHints("0", "/state/tasks/shared.md", "0")
-	if !strings.Contains(got, "`hap task 0 done <n>`") {
-		t.Errorf("index-addressed hints must spell commands with the index, got:\n%s", got)
-	}
-	if strings.Contains(got, "no longer recognized") {
-		t.Errorf("index-addressed hints must not print the fallback note, got:\n%s", got)
+	for _, target := range []string{"0", "#0"} {
+		got := TaskManagementHints(target, "/state/tasks/shared.md", "0")
+		if !strings.Contains(got, "`hap task 0 done <n>`") {
+			t.Errorf("hints for target %q must spell commands with the bare index, got:\n%s", target, got)
+		}
+		if strings.Contains(got, "#0") {
+			t.Errorf("hints for target %q must never render the '#' form, got:\n%s", target, got)
+		}
+		if strings.Contains(got, "no longer recognized") {
+			t.Errorf("index-addressed hints must not print the fallback note, got:\n%s", got)
+		}
 	}
 }
 
@@ -1642,6 +1650,10 @@ func TestParseTaskSourceIndexRef(t *testing.T) {
 		{"#", 0, false},
 		{"", 0, false},
 		{"1.2", 0, false},
+		// All-digits but bigger than an int is STILL an index (saturated):
+		// name resolution would advise registering a source for a name herdr
+		// can never accept, while the bounds check reports "does not exist".
+		{"99999999999999999999", int(^uint(0) >> 1), true},
 	}
 	for _, tc := range cases {
 		got, ok := ParseTaskSourceIndexRef(tc.in)

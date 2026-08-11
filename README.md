@@ -639,15 +639,15 @@ error = "#ff5f5f"
 # pending one). Other agent types skip inference entirely and escalate.
 #
 # The prompt sent to the agent is rendered from a template. The default points
-# the agent at its own list with its name pre-filled (and a --path fallback for
-# sources that aren't name-addressable):
+# the agent at its own list with its name pre-filled (and a task-source-index
+# fallback for sources that aren't name-addressable — the index works under
+# every storage provider, unlike --path, which reads a local file):
 #   "Your next task is {next_task_content}. Prefer the hap CLI to manage your
 #    tasks (start/done), run bash `hap task {agent_name} list` to view them
-#    (if that name isn't recognized, use `--path {task_list_path_quoted}` in
-#    place of
-#    `{agent_name}`)."
+#    (if that name isn't recognized, use the task-source index
+#    `{task_source_index}` in place of `{agent_name}`)."
 # The full instructions — `start <n>`, `done <n>`, how `<n>` is addressed, and
-# the --path fallback — are printed by `hap task <agent> list` itself, so they
+# the index fallback — are printed by `hap task <agent> list` itself, so they
 # are stated once beside the real task numbers rather than re-sent with every
 # prompt.
 # When every item is checked off, the templated prompt is never sent: the

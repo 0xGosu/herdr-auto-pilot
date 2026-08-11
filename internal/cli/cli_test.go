@@ -1873,9 +1873,19 @@ func TestTaskSourceIndexSelector(t *testing.T) {
 		t.Errorf("index-addressed hints must not print the fallback note, got:\n%s", out)
 	}
 
-	// '#0' addresses the same source (quoted in a real shell).
+	// '#0' addresses the same source (quoted in a real shell) — and every
+	// re-runnable line in the output still spells the BARE index, since '#0'
+	// pasted unquoted is a shell comment.
 	if out, err = run(t, app, "task", "#0", "list"); err != nil || !strings.Contains(out, "first job") {
 		t.Errorf("'#0' should address source 0, got err=%v out:\n%s", err, out)
+	}
+	if !strings.Contains(out, "hap task 0 list --status pending") || strings.Contains(out, "task #0 ") {
+		t.Errorf("'#0'-addressed output must render commands with the bare index, got:\n%s", out)
+	}
+	// The footer must not advertise `task 0 send` — the guard below makes
+	// that a guaranteed refusal; the placeholder form is offered instead.
+	if strings.Contains(out, "task 0 send") || !strings.Contains(out, "task <agent> send") {
+		t.Errorf("index-addressed footer should offer send only via an agent placeholder, got:\n%s", out)
 	}
 
 	// Mutations address the same list.
