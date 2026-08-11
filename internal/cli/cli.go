@@ -2112,12 +2112,15 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 			fmt.Fprintf(out, "task source #%d: gist_id=%s\n", idx, shortGistID(id))
 		}
 		return nil
-	// The three SELECTORS and the template. Changing one re-points which work
-	// an agent is handed, which is why each prints what it changed FROM as well
-	// as to — but it is not withheld: `remove` is unguarded by design, so
-	// refusing the smaller edit only forced the operator through
-	// remove-and-re-add, retyping every other field and renumbering every later
-	// source to change one.
+	// The path, the two selectors, and the template.
+	//
+	// The first three RE-POINT the source — which list is read, or which agent
+	// is fed — so each echoes what it changed FROM and says what follows. They
+	// are not withheld for it: `remove` is unguarded by design, so refusing the
+	// smaller edit only forced the operator through remove-and-re-add, retyping
+	// every other field and renumbering every later source to change one.
+	// `template` changes the outbound prompt's FORMAT, not its target, so it
+	// carries no such warning.
 	case "path":
 		if err := app.SetTaskSourcePath(ctx, idx, expected, value); err != nil {
 			return err

@@ -853,13 +853,16 @@ func buildCommands() {
 				"`hap task <agent> …` works the same either way. `--path` on `hap task` always\n" +
 				"reads a LOCAL file, so address a remote list by the agent's name.\n" +
 				"`set` edits an existing source in place, and every field is editable:\n" +
-				"  path | agent | workspace | template          re-point it\n" +
+				"  path | agent | workspace                     re-point it\n" +
+				"  template                                     the outbound prompt (\"\" = default)\n" +
 				"  auto-send-when-idle | enable-llm-review-before-auto-send | max-tasks\n" +
 				"  provider | gist-id                           where the list is stored\n" +
 				"(provider and gist-id each take \"inherit\" to go back to following the default.)\n" +
-				"The four that re-point the source print what they changed FROM and warn: the\n" +
+				"The three that re-point the source print what they changed FROM and warn: the\n" +
 				"next hand-out then comes from a different list, or goes to a different agent.\n" +
-				"Nothing is copied or removed either way. Changing the PROVIDER likewise does\n" +
+				"Nothing is copied or removed either way. A relative path is resolved against\n" +
+				"YOUR shell's directory (the daemon runs from the state dir), and an empty one\n" +
+				"is refused — that is `remove`, not an edit. Changing the PROVIDER likewise does\n" +
 				"not migrate the list: hap reads the new store from then on and leaves the old\n" +
 				"copy where it is.\n" +
 				"enable-llm-review-before-auto-send composes with auto-send-when-idle: the\n" +
