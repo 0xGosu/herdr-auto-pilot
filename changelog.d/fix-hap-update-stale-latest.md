@@ -1,2 +1,0 @@
-- Fixed `hap update` naming a stale version: the "installing …" line now does a live release check first and uses the cached record only when the fetch fails, so a cache written before a release published can no longer misname the target.
-- Changed `hap update`'s closing line to report the version read back from the installed binary itself — including the case where install.sh fell back to an earlier release's assets — with a note to retry when the newest release's assets were not published yet; when nothing can be read back it says "install finished" instead of guessing.
