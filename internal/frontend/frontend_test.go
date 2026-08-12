@@ -6249,8 +6249,9 @@ func TestTaskGroupsDerivedSourceResolvesByItsNamedSelector(t *testing.T) {
 	// it before, so the registry still names it. That registry entry is the
 	// evidence the selector is an agent NAME rather than an agent type.
 	groups := app.TaskGroups(cfg, frontend.Status{
-		AgentsKnown: true,
-		AgentNames:  map[string]string{"t9": "brave-otter"},
+		AgentsKnown:     true,
+		AgentNames:      map[string]string{"t9": "brave-otter"},
+		AgentNamesKnown: true,
 	})
 	if len(groups) != 1 {
 		t.Fatalf("got %d groups, want 1", len(groups))
@@ -6274,8 +6275,11 @@ func TestTaskGroupsDerivedSourceTypeSelectorStaysUnresolvedWithNothingLive(t *te
 	app, _ := testApp(t)
 	groups := app.TaskGroups(derivedGistCfg(t, "claude"), frontend.Status{
 		AgentsKnown: true,
-		// Registered agents exist, but none is named "claude".
-		AgentNames: map[string]string{"t1": "brave-otter"},
+		// Registered agents exist, but none is named "claude" — and the
+		// registry was actually READ, which is what makes that absence
+		// evidence rather than ignorance.
+		AgentNames:      map[string]string{"t1": "brave-otter"},
+		AgentNamesKnown: true,
 	})
 	if len(groups) != 1 {
 		t.Fatalf("got %d groups, want 1", len(groups))
@@ -6404,20 +6408,92 @@ func TestAddTaskCreatesFromTheTUIsLocatorShapedCall(t *testing.T) {
 	}
 }
 
-// TestAddTaskRefusesToCreateADerivedListForAnUnknownSelector: a derived source
-// resolves per AGENT, so creating "<selector>.md" for a selector that names no
-// agent hap has seen would queue work into a list no hand-out ever reads —
-// silently, which is worse than the error it replaces.
+// TestAddTaskRefusesToCreateADerivedListForAnUnknownSelector: a DERIVED source
+// (remote provider, no file name) resolves per AGENT, so creating
+// "<selector>.md" for a selector that names no agent hap has ever seen would
+// queue work into a list no hand-out reads — silently, which is worse than the
+// error it replaces. A selector is matched against an agent's id, type OR
+// name, so "claude" is as likely a TYPE as a name.
 func TestAddTaskRefusesToCreateADerivedListForAnUnknownSelector(t *testing.T) {
 	app, _ := testApp(t)
-	// A derived LOCAL source: no path of its own, so its list is per agent.
-	dir := t.TempDir()
-	if err := app.AddTaskSource(context.Background(), "claude", "", filepath.Join(dir, "claude.md"), ""); err != nil {
+	cfg := derivedGistCfg(t, "claude") // derived: remote provider, no path
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
 		t.Fatal(err)
 	}
-	// Explicit-file sources are exempt — they name one list for everyone they
-	// match — so this one MUST create.
-	if _, _, err := app.AddTask("claude", "", "explicit file is fine"); err != nil {
-		t.Fatalf("an explicit-file source needs no name evidence: %v", err)
+	_, _, err := app.AddTask("claude", "", "should not create claude.md")
+	if err == nil {
+		t.Fatal("a derived source whose selector names no known agent must refuse")
+	}
+	// The refusal has to SAY it is a policy, or it reads as a broken list.
+	if !strings.Contains(err.Error(), "will not create") {
+		t.Errorf("error = %v, want it to explain the refusal", err)
+	}
+}
+
+// TestAddTaskCreatesForADerivedSourceOfAKnownAgent: the same derived shape,
+// once the agent is in the name registry, is exactly the case create-on-demand
+// exists for — an agent whose list has never been written.
+func TestAddTaskCreatesForADerivedSourceOfAKnownAgent(t *testing.T) {
+	app, st := testApp(t)
+	if _, err := st.EnsureAgentName(context.Background(), "w1:p1"); err != nil {
+		t.Fatal(err)
+	}
+	names, err := st.AgentNames(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := names["w1:p1"]
+
+	cfg := derivedGistCfg(t, name)
+	if err := config.Save(app.ConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	// The gist itself is unreachable here (no credentials), so the add cannot
+	// succeed — but it must fail on the STORE, never on hap's own refusal.
+	_, _, aerr := app.AddTask(name, "", "seed")
+	if aerr != nil && strings.Contains(aerr.Error(), "will not create") {
+		t.Errorf("a known agent's derived source must not be refused by policy, got %v", aerr)
+	}
+}
+
+// TestTaskGroupsResolvesWhenTheNameRegistryCouldNotBeRead: absence is evidence
+// only when the registry was actually read. A failed query leaves AgentNames
+// nil, and treating that as "no agent has this name" would un-resolve every
+// named source at once — the exact symptom this resolution exists to fix. The
+// same rule AgentsKnown carries, for the same reason.
+func TestTaskGroupsResolvesWhenTheNameRegistryCouldNotBeRead(t *testing.T) {
+	app, _ := testApp(t)
+	groups := app.TaskGroups(derivedGistCfg(t, "brave-otter"), frontend.Status{
+		AgentsKnown: true,
+		// AgentNamesKnown false: the registry query failed.
+		AgentNames: nil,
+	})
+	if len(groups) != 1 {
+		t.Fatalf("got %d groups, want 1", len(groups))
+	}
+	if groups[0].Locator == "" {
+		t.Fatalf("Err=%q, want the source resolved — an unread registry is not proof the agent is unknown", groups[0].Err)
+	}
+}
+
+// TestTaskCapAppliesToALocatorShapedAdd: the cap lookup and the create gate
+// must find the SAME source. They diverged once — the gate grew a fallback for
+// the TUI's locator-shaped call and the cap lookup did not — so a TUI add read
+// max_tasks as UNCAPPED, silently ignoring a limit the operator had set.
+func TestTaskCapAppliesToALocatorShapedAdd(t *testing.T) {
+	app, _ := testApp(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] one\n- [ ] two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(context.Background(), "brave-otter", "", path, "",
+		frontend.MaxTasks(2)); err != nil {
+		t.Fatal(err)
+	}
+	// Addressed exactly as the Tasks tab does: no agent, the locator as path.
+	if _, _, err := app.AddTask("", path, "third"); err == nil {
+		t.Fatal("the cap must apply however the list is addressed")
+	} else if !strings.Contains(err.Error(), "cap 2") {
+		t.Errorf("error = %v, want the cap refusal", err)
 	}
 }

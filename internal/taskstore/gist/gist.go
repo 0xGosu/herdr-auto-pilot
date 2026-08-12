@@ -79,6 +79,10 @@ type Store struct {
 	// first hand-out, both write a list and immediately read it back.
 	wroteMu sync.Mutex
 	wrote   map[string]time.Time
+
+	// settle overrides the re-read schedule; only tests set it, so the unit
+	// suite does not spend the production backoff on an unsettled read.
+	settle []time.Duration
 }
 
 // writeSettleWindow is how long after our own write a "file is absent" answer
@@ -104,6 +108,12 @@ type Option func(*Store)
 // stand up an httptest server; production never sets it.
 func WithBaseURL(u string) Option {
 	return func(s *Store) { s.baseURL = u }
+}
+
+// WithSettleBackoffs replaces the post-write re-read schedule. Tests use it to
+// keep an unsettled read fast; production uses the package default.
+func WithSettleBackoffs(d []time.Duration) Option {
+	return func(s *Store) { s.settle = d }
 }
 
 // WithHTTPClient replaces the shared HTTP client (tests supply the httptest
@@ -182,11 +192,17 @@ func (s *Store) fetch(ctx context.Context, file string) (content string, found b
 	if err != nil || found || !s.recentlyWrote(file) {
 		return content, found, err
 	}
-	for _, backoff := range writeSettleRetries {
+	for _, backoff := range s.settleBackoffs() {
 		select {
 		case <-ctx.Done():
 			return "", false, ctx.Err()
 		case <-time.After(backoff):
+		}
+		// Re-checked each round: once the write is older than the window it
+		// is no longer plausibly the API lagging, and the remaining sleeps
+		// would only hold Mutate's advisory lock for nothing.
+		if !s.recentlyWrote(file) {
+			return "", false, nil
 		}
 		content, found, err = s.fetchOnce(ctx, file)
 		if err != nil || found {
@@ -194,6 +210,15 @@ func (s *Store) fetch(ctx context.Context, file string) (content string, found b
 		}
 	}
 	return "", false, nil
+}
+
+// settleBackoffs is the re-read schedule, overridable per store so a unit test
+// can spend microseconds instead of seconds.
+func (s *Store) settleBackoffs() []time.Duration {
+	if len(s.settle) > 0 {
+		return s.settle
+	}
+	return writeSettleRetries
 }
 
 // recentlyWrote reports whether this process wrote the file inside the settle
@@ -211,7 +236,16 @@ func (s *Store) markWrote(file string) {
 	if s.wrote == nil {
 		s.wrote = map[string]time.Time{}
 	}
-	s.wrote[file] = time.Now()
+	now := time.Now()
+	// Every entry is dead once its window passes, so the map stays the size of
+	// the lists written in the last few seconds rather than growing for the
+	// life of a long-running daemon.
+	for f, at := range s.wrote {
+		if now.Sub(at) >= writeSettleWindow {
+			delete(s.wrote, f)
+		}
+	}
+	s.wrote[file] = now
 }
 
 func (s *Store) fetchOnce(ctx context.Context, file string) (content string, found bool, err error) {
@@ -344,6 +378,15 @@ func (s *Store) Ensure(ctx context.Context, locator, initial string) (bool, erro
 	}
 	if found {
 		return false, nil
+	}
+	// "Absent" after the settle re-reads, for a file THIS process wrote, means
+	// the API has still not caught up — not that the list is gone. Creating
+	// here would PATCH the initial content (often empty) over a populated
+	// list, which is exactly the overwrite EnsureCreator promises never to do.
+	// Fail instead: the caller retries or reports, and no content is lost.
+	if s.recentlyWrote(file) {
+		return false, fmt.Errorf("task list %q in gist %s was written by this process but still reads as absent — "+
+			"the gist API has not caught up; retry shortly", file, shortID(s.gistID))
 	}
 	if err := s.put(ctx, file, initial); err != nil {
 		return false, err

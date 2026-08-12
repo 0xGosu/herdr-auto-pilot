@@ -181,7 +181,10 @@ func newStore(t *testing.T, f *fakeGist) *gist.Store {
 	// without it ("baseURL must have a trailing slash").
 	base := srv.URL + "/"
 	return gist.New(testGistID, func() (string, error) { return "test-token", nil },
-		5*time.Second, gist.WithBaseURL(base), gist.WithHTTPClient(srv.Client()))
+		5*time.Second, gist.WithBaseURL(base), gist.WithHTTPClient(srv.Client()),
+		// Microseconds, not the production schedule: the unit suite must not
+		// spend seconds proving the re-read happens.
+		gist.WithSettleBackoffs([]time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}))
 }
 
 func TestGistReadReturnsTheFilesContent(t *testing.T) {
@@ -704,5 +707,77 @@ func TestGistReadDoesNotWaitForAFileWeNeverWrote(t *testing.T) {
 	}
 	if f.gets != 1 {
 		t.Errorf("GETs = %d, want exactly 1 — a never-written file must not be re-read", f.gets)
+	}
+}
+
+// TestGistEnsureRefusesToOverwriteAFileItJustWrote: Ensure creates only what
+// is MISSING (ports.EnsureCreator). When a file this process wrote still reads
+// as absent after the settle re-reads, the API is lagging — not the list gone
+// — and PATCHing the initial content over it would erase a populated list with
+// an empty one (the generated-task bootstrap ensures with "").
+func TestGistEnsureRefusesToOverwriteAFileItJustWrote(t *testing.T) {
+	f := newFakeGist(nil)
+	s := newStore(t, f)
+
+	if _, err := s.Ensure(context.Background(), locator(testFile), "# Tasks\n- [ ] real work\n"); err != nil {
+		t.Fatal(err)
+	}
+	// Every later GET hides it: the settle exhausts and the file still reads
+	// as absent, though this process wrote it moments ago.
+	f.mu.Lock()
+	f.hideAfterPatch = 99
+	f.hidden = map[string]bool{testFile: true}
+	patchesBefore := f.patches
+	f.mu.Unlock()
+
+	_, err := s.Ensure(context.Background(), locator(testFile), "")
+	if err == nil {
+		t.Fatal("Ensure must refuse rather than overwrite a list it cannot see yet")
+	}
+	if !strings.Contains(err.Error(), "has not caught up") {
+		t.Errorf("error = %v, want it to name the lag", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.patches != patchesBefore {
+		t.Errorf("patches = %d, want no write at all (was %d)", f.patches, patchesBefore)
+	}
+}
+
+// gistStoreWithSlowSettle is newStore with a settle schedule long enough that
+// a cancelled context is observed mid-wait rather than after it.
+func gistStoreWithSlowSettle(t *testing.T, f *fakeGist) *gist.Store {
+	t.Helper()
+	srv := httptest.NewServer(f.handler())
+	t.Cleanup(srv.Close)
+	return gist.New(testGistID, func() (string, error) { return "test-token", nil },
+		5*time.Second, gist.WithBaseURL(srv.URL+"/"), gist.WithHTTPClient(srv.Client()),
+		gist.WithSettleBackoffs([]time.Duration{10 * time.Second}))
+}
+
+// TestGistSettleStopsWhenTheContextIsCancelled: the re-reads SLEEP, and Mutate
+// holds hap's advisory lock across them, so a context that expires mid-wait
+// must unwind at once rather than finish the schedule.
+func TestGistSettleStopsWhenTheContextIsCancelled(t *testing.T) {
+	f := newFakeGist(nil)
+	s := gistStoreWithSlowSettle(t, f) // one 10s backoff
+	if _, err := s.Ensure(context.Background(), locator(testFile), "x"); err != nil {
+		t.Fatal(err)
+	}
+	// Hide it from here on, so the read enters the settle wait.
+	f.mu.Lock()
+	f.hideAfterPatch = 99
+	f.hidden = map[string]bool{testFile: true}
+	f.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := s.Read(ctx, locator(testFile))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the deadline to surface", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %s — the settle wait ignored the context", elapsed)
 	}
 }
