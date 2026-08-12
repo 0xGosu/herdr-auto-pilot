@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.7
+
+- Fixed `hap update` naming a stale version: the "installing …" line now does a live release check first and uses the cached record only when the fetch fails, so a cache written before a release published can no longer misname the target.
+- Changed `hap update`'s closing line to report the version read back from the installed binary itself — including the case where install.sh fell back to an earlier release's assets — with a note to retry when the newest release's assets were not published yet; when nothing can be read back it says "install finished" instead of guessing.
+
 ## 0.6.6
 
 - Fixed accepting an LLM-generated task escalation against a `github_gist` task source, which always failed with `422 Validation Failed` and created no task list. hap created the agent's list blank and filled it a moment later; GitHub cannot store a blank gist file at all, and its refusal named neither the list nor the cause. The list is now created with its header, the way every other create-on-demand path already did.
