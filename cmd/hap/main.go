@@ -88,7 +88,7 @@ func main() {
 		return
 	}
 	if verb == "version" || verb == "--version" || verb == "-V" {
-		fmt.Println("hap (herd-auto-prompter)", buildinfo.Version)
+		fmt.Println(buildinfo.VersionLine())
 		return
 	}
 
