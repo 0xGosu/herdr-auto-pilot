@@ -85,6 +85,18 @@ type App struct {
 	// two seconds.
 	taskStore taskStoreState
 
+	// TaskStoreFor, when set, replaces the registry's locator→backend lookup.
+	// Only tests set it, to stand a REMOTE backend up in-process: the registry
+	// builds a real gist client out of config, so without this every test in
+	// this package runs on a local file — where a locator happens to be a path,
+	// which is exactly the condition under which "treated the locator as a
+	// file" bugs pass CI and fail for the operator.
+	//
+	// It bypasses the registry, and therefore ValidateResolvedProvider, so a
+	// test fixture must still be a config production would ACCEPT (env_file
+	// set, gist_id set) or it proves less than it appears to.
+	TaskStoreFor func(cfg config.Config, locator string) (ports.TaskStore, error)
+
 	// cwdMu/cwdCache memoize pane working directories for FillAgentCwds.
 	// Without this, the TUI's 2s refresh would spawn one `herdr pane get` per
 	// agent per tick; the daemon caches its own lookups for the same reason. A
@@ -783,18 +795,50 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		base = filepath.Dir(a.ConfigPath)
 	}
 	bootstrapPath := filepath.Join(base, "tasks", sanitizeTaskFileName(name)+".md")
-	var external []indexedTaskSource
-	for _, s := range a.matchingDeclaredSources(ctx, cfg, audit, name, live) {
-		p := config.ExpandPath(s.src.Path)
-		if abs, err := filepath.Abs(p); err == nil {
-			p = abs
-		}
-		if p != bootstrapPath {
-			external = append(external, s)
+
+	// Resolve the agent's OWN bootstrap list before the exclusion below, which
+	// compares against it. It has to be the resolved LOCATOR, not the local
+	// path: under a remote provider the bootstrap list lives in the store while
+	// its registered source carries a bare file name, so a path comparison
+	// never matched and the agent's own list was classified as `external`. On a
+	// SECOND confirm that sends the tasks down appendGeneratedTasks, whose
+	// dedupe keys on the raw task text while the bootstrap flow stores numbered
+	// items — so every task already listed is appended again, un-numbered.
+	bootstrapSrc := config.TaskSource{Agent: name}
+	bootstrapLocator := bootstrapPath
+	remoteBootstrap := cfg.ResolveProvider(bootstrapSrc).Remote()
+	// Deferred, NOT returned here: only the bootstrap flow below needs this
+	// resolution, and the append path used to run without it. Failing early
+	// would break a confirm that a healthy declared source can still serve —
+	// a misconfigured remote DEFAULT (no gist_id, no env_file) beside a source
+	// carrying `provider = "local_fs"`, or an agent whose name fell back to its
+	// raw pane id, whose colon no store file name accepts.
+	var bootstrapErr error
+	if remoteBootstrap {
+		bootstrapSrc.Path = config.SanitizeTaskFileName(name) + ".md"
+		l, lerr := a.resolveSourceList(cfg, bootstrapSrc, name)
+		if lerr != nil {
+			bootstrapErr = fmt.Errorf("resolve task list for %s: %w", name, lerr)
+		} else {
+			bootstrapLocator = l.Locator
 		}
 	}
-	if s, ok := pickAppendTarget(external); ok {
+
+	var external []indexedTaskSource
+	for _, s := range a.matchingDeclaredSources(ctx, cfg, audit, name, live) {
+		// With no bootstrap locator to compare against, nothing can be
+		// identified as the bootstrap list — which degrades to exactly the
+		// pre-existing behavior rather than excluding on a guess.
+		if bootstrapErr == nil && a.isBootstrapList(cfg, s.src, name, bootstrapLocator) {
+			continue
+		}
+		external = append(external, s)
+	}
+	if s, ok := a.pickAppendTarget(ctx, cfg, name, external); ok {
 		return a.appendGeneratedTasks(ctx, audit, s, name, tasks, send)
+	}
+	if bootstrapErr != nil {
+		return bootstrapErr
 	}
 
 	// Idempotent side effects FIRST (before the claim): writing the file and
@@ -804,22 +848,16 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// de-dupes under UpdateConfig's advisory lock. Running them before the claim means a
 	// failure here leaves the escalation still pending, so the operator can
 	// retry; only the non-idempotent send is gated by the claim below.
-	// Resolve the list ONCE, by the same rule addTaskSourceIfAbsent registers
-	// by, so the tasks are written where the source will actually point. Under
-	// a remote default those differ: the bootstrap path is a local file while
-	// the registered source names a file in the store, and writing to one while
-	// registering the other leaves the agent with an empty list.
-	bootstrapSrc := config.TaskSource{Agent: name}
-	path := bootstrapPath
-	if cfg.ResolveProvider(bootstrapSrc).Remote() {
-		bootstrapSrc.Path = config.SanitizeTaskFileName(name) + ".md"
-		l, lerr := a.resolveSourceList(cfg, bootstrapSrc, name)
-		if lerr != nil {
-			return fmt.Errorf("resolve task list for %s: %w", name, lerr)
+	// The list was resolved ONCE above, by the same rule addTaskSourceIfAbsent
+	// registers by, so the tasks are written where the source will actually
+	// point. Under a remote default those differ: the bootstrap path is a local
+	// file while the registered source names a file in the store, and writing
+	// to one while registering the other leaves the agent with an empty list.
+	path := bootstrapLocator
+	if !remoteBootstrap {
+		if err := os.MkdirAll(filepath.Dir(bootstrapPath), 0o700); err != nil {
+			return fmt.Errorf("create tasks dir: %w", err)
 		}
-		path = l.Locator
-	} else if err := os.MkdirAll(filepath.Dir(bootstrapPath), 0o700); err != nil {
-		return fmt.Errorf("create tasks dir: %w", err)
 	}
 	// Every task is written pending ("[ ]"); the first is marked in-progress
 	// ("[-]") only below, at delivery time, so a confirm that sends nothing
@@ -886,7 +924,15 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		// fail spuriously after the escalation is already claimed.
 		taskText := merged[pos-1]
 		itemText := domain.GeneratedTaskItemText(pos-1, taskText)
-		if _, err := mutateTaskFile(path, reserveTask(pos, itemText)); err != nil {
+		// Through the STORE (mutateList), not taskfile's local read-modify-write:
+		// `path` is a locator, and under a remote provider it is a `gist://…`
+		// URI that os.Stat can only fail on. The read/write above was already
+		// moved to the store; leaving the reservation behind made this the one
+		// step that could not follow the list wherever it lived, so a confirm
+		// that had already created the list, registered the source and CLAIMED
+		// the escalation then died on `stat gist://…: no such file or directory`
+		// with nothing sent.
+		if _, err := a.mutateList(ctx, cfg, path, reserveTask(pos, itemText)); err != nil {
 			return fmt.Errorf("task source created, but reserving task #%d (nothing was sent): %w", pos, err)
 		}
 		// Render through the same default next-task template used by a declared
@@ -909,7 +955,13 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 			SourceIndex: sourceIndex,
 		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
-			if _, rbErr := mutateTaskFile(path, releaseTask(pos, itemText)); rbErr != nil {
+			// WithoutCancel: this is the compensating write for a send that just
+			// failed, and the likeliest reason it failed — the operator quitting
+			// the TUI, or Ctrl-C in the CLI — is the same cancellation that
+			// would abort the release. A remote store actually uses this ctx for
+			// its HTTP calls, so inheriting the dead one guarantees the item is
+			// left stranded at "[-]" exactly when it matters most.
+			if _, rbErr := a.mutateList(context.WithoutCancel(ctx), cfg, path, releaseTask(pos, itemText)); rbErr != nil {
 				return fmt.Errorf("task source created, but sending the task failed (%w) and task #%d could not be returned to [ ] (%v) — "+
 					"it stays [-] and no agent will pick it up until you clear it", err, pos, rbErr)
 			}
@@ -950,8 +1002,8 @@ func taskCapExceededError(path string, existing, adding, limit int) error {
 }
 
 // ensureGeneratedTaskFile writes the agent's generated-task checklist to path
-// as ONE locked read-merge-write, under the same per-path lock mutateTaskFile
-// takes — an unlocked check-then-write could land after a concurrent confirm's
+// as ONE locked read-merge-write, under the same per-locator lock every other
+// mutation takes — an unlocked check-then-write could land after a concurrent confirm's
 // reservation and silently reset its "[-]". It APPENDS: every task already in
 // the file is preserved (its order and its "[-]"/"[x]" marker), and only tasks
 // from `tasks` not already present are added at the end — a later generation
@@ -1208,36 +1260,103 @@ func (a *App) agentWorkspaceTarget(ctx context.Context, live *domain.AgentTransi
 	return live.WorkspaceID
 }
 
+// isBootstrapList reports whether a matched source addresses the agent's own
+// generated-task list.
+//
+// Compared as canonical LOCATORS, never as paths: a gist source's `path` is a
+// bare file name inside the gist, so absolutizing it yields `<cwd>/<name>.md`
+// and can never equal anything real — the agent's own list then reads as
+// someone else's and takes the append path it must not take. A source that
+// cannot be resolved is treated as external, which is the pre-existing
+// behavior for a path that did not match.
+//
+// Locator equality alone is NOT the test, because a DERIVED source (`path`
+// unset — the documented one-list-per-agent form) resolves to
+// `DerivedFileName(agent)`, which is byte-identical to what the bootstrap
+// registers. Excluding that would send the most idiomatic gist setup down the
+// bootstrap flow, where addTaskSourceIfAbsent then refuses to register a second
+// source for the agent and fails the confirm outright — after the tasks have
+// already been written. So a candidate must ALSO have declared a path of its
+// own: only an explicit spelling can be the one the bootstrap wrote.
+//
+// Equality still does the rest of the work. A source naming the same file in a
+// DIFFERENT gist (`gist_id` override) resolves to a different locator and stays
+// external, which is why the declared spelling is never compared on its own.
+func (a *App) isBootstrapList(cfg config.Config, src config.TaskSource, name, bootstrapLocator string) bool {
+	if strings.TrimSpace(src.Path) == "" {
+		return false
+	}
+	l, err := a.resolveSourceList(cfg, src, name)
+	if err != nil {
+		return false
+	}
+	return tasklocator.Canonical(l.Locator) == tasklocator.Canonical(bootstrapLocator)
+}
+
 // pickAppendTarget chooses which matched declared source receives the
 // generated tasks, mirroring matchTaskSource's precedence so the confirm
 // appends to the source the daemon reasoned about: first with a pending
 // "[ ]" item, else first whose file has checklist items, else the first
 // match in config order (which also covers an empty or not-yet-created file —
 // appending there bootstraps the DECLARED path instead of a duplicate).
-func pickAppendTarget(sources []indexedTaskSource) (indexedTaskSource, bool) {
+//
+// Each candidate is read through its own STORE. Reading the raw path with
+// os.ReadFile only ever worked for a local source: a gist source's `path` is a
+// file name inside the gist, so absolutizing it produced `<cwd>/proud-robin.md`
+// and every read failed — which the loop treats as "no content", so under a
+// remote provider the precedence collapsed to "always the first match" without
+// erroring. That is invisible until an agent has two sources and the tasks
+// land in the wrong list.
+func (a *App) pickAppendTarget(ctx context.Context, cfg config.Config, name string,
+	sources []indexedTaskSource) (indexedTaskSource, bool) {
+
 	if len(sources) == 0 {
 		return indexedTaskSource{}, false
 	}
-	var withItems *indexedTaskSource
+	var withItems, firstResolvable *indexedTaskSource
 	for i := range sources {
-		p := config.ExpandPath(sources[i].src.Path)
-		if abs, err := filepath.Abs(p); err == nil {
-			p = abs
-		}
-		data, err := os.ReadFile(p)
+		l, err := a.resolveSourceList(cfg, sources[i].src, name)
 		if err != nil {
+			// A candidate that cannot be resolved is passed over — so say so.
+			// This is always a misconfiguration (a bad per-source gist id, a
+			// token without access), never a normal state, and unreported it
+			// looks exactly like the precedence preferring another source.
+			slog.Warn("append target: skipping a task source that will not resolve",
+				"source", sources[i].index, "path", sources[i].src.Path, "error", err)
 			continue
 		}
-		if domain.NextDeclaredTask(string(data)) != "" {
+		if firstResolvable == nil {
+			firstResolvable = &sources[i]
+		}
+		raw, err := l.Store.Read(ctx, l.Locator)
+		if err != nil {
+			// Not created yet is ordinary here (the fallback below bootstraps
+			// the declared path), so this is debug, not a warning.
+			slog.Debug("append target: candidate list unreadable",
+				"source", sources[i].index, "list", l.Display, "error", err)
+			continue
+		}
+		data := string(raw)
+		if domain.NextDeclaredTask(data) != "" {
 			return sources[i], true
 		}
-		if withItems == nil && domain.HasChecklistItems(string(data)) {
+		if withItems == nil && domain.HasChecklistItems(data) {
 			withItems = &sources[i]
 		}
 	}
 	if withItems != nil {
 		return *withItems, true
 	}
+	// Nothing has content to choose by, so fall back on config order — but to
+	// the first source that RESOLVES. Returning an unresolvable index 0 while a
+	// later candidate is healthy just fails the confirm in appendGeneratedTasks,
+	// which contradicts having passed that candidate over in the first place.
+	if firstResolvable != nil {
+		return *firstResolvable, true
+	}
+	// None resolve: keep the historical answer so the operator gets the
+	// resolution error from appendGeneratedTasks rather than a silent bootstrap
+	// beside the source they configured.
 	return sources[0], true
 }
 
@@ -3252,11 +3371,16 @@ func (a *App) mutateTask(locator string, fn func(string) (string, error)) ([]dom
 // another process, so the lock, the atomic write, and the reserve/release
 // claim rules must have exactly one implementation. These aliases keep the
 // call sites below reading as they always have.
+//
+// There is deliberately NO local `mutateTaskFile` alias here. Every checklist
+// mutation goes through the STORE (`mutateList` / `mutateTask`), because a task
+// list is addressed by a LOCATOR that may name a gist rather than a file, and
+// `taskfile.Mutate` can only os.Stat it. An alias that looks like the local
+// twin of `mutateTask` is how the generated-task send reservation was left
+// behind when everything around it moved to the store — a path that worked in
+// every test and could never work for a remote provider. The mutators below
+// are pure content transforms and stay shared by both.
 func lockFile(path string) (func(), error) { return taskfile.Lock(path) }
-
-func mutateTaskFile(path string, fn func(string) (string, error)) ([]domain.ChecklistItem, error) {
-	return taskfile.Mutate(path, fn)
-}
 
 func reserveTask(index int, taskText string) func(string) (string, error) {
 	return taskfile.Reserve(index, taskText)

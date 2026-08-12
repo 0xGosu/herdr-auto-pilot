@@ -75,10 +75,24 @@ type resolvedList struct {
 	Remote  bool
 }
 
+// storeFor resolves a locator to its backend, honoring the test seam.
+//
+// The seam exists because a REMOTE provider was otherwise unreachable from this
+// package's tests — the registry builds a real gist client from config and
+// there is no way in. Every unit test therefore ran on a local file, where a
+// locator happens to be a path, and that is precisely what let two separate
+// "handled the locator as a file" bugs ship green. Production never sets it.
+func (a *App) storeFor(cfg config.Config, locator string) (ports.TaskStore, error) {
+	if a.TaskStoreFor != nil {
+		return a.TaskStoreFor(cfg, locator)
+	}
+	return a.taskStores(cfg).ForLocator(locator)
+}
+
 // resolveList resolves an explicit locator (the `--path` escape hatch, or a
 // locator already recorded somewhere) to the backend serving it.
 func (a *App) resolveList(cfg config.Config, locator string) (resolvedList, error) {
-	store, err := a.taskStores(cfg).ForLocator(locator)
+	store, err := a.storeFor(cfg, locator)
 	if err != nil {
 		return resolvedList{}, err
 	}
@@ -97,7 +111,7 @@ func (a *App) resolveSourceList(cfg config.Config, src config.TaskSource, agentN
 	if err != nil {
 		return resolvedList{}, err
 	}
-	store, err := a.taskStores(cfg).ForLocator(res.Locator)
+	store, err := a.storeFor(cfg, res.Locator)
 	if err != nil {
 		return resolvedList{}, err
 	}
