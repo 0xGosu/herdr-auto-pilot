@@ -2,3 +2,4 @@
 - Fixed every `hap config …` write reporting failure (exit 1, success output suppressed) when the daemon is not running, even though the change had been saved — the ordinary first-run order, configure then start, made every command look broken and invited re-running it.
 - Fixed the TUI Tasks tab hiding a task list whose agent is not currently running: a source scoped to an agent NAME now shows its list whether or not that agent is live, matching what `hap task <name> list` has always printed.
 - Fixed the TUI Config tab showing no storage location for gist-backed task sources — a derived source rendered a blank column that read as unconfigured. Each source now names where its list lives, as `hap config task-source list` does.
+- Changed `hap config set` and `config set-threshold` to say whether the change reached a running daemon: they claimed "(daemon reloaded)" unconditionally, including when no daemon was running. The TUI's field editor says the same.

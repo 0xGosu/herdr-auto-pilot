@@ -123,13 +123,18 @@ const cwdCacheMax = 256
 // The failure is logged rather than printed: this is shared with the TUI,
 // where writing to stderr mid-render corrupts the screen. Daemon health is
 // `hap status`'s job, and it reports it precisely.
-func (a *App) nudge(ctx context.Context, kind control.Kind) {
+// It reports whether a daemon actually took the nudge, which is only for
+// WORDING — a surface that tells the operator "daemon reloaded" must not say
+// so when nothing was listening. Nobody may turn this into a failure.
+func (a *App) nudge(ctx context.Context, kind control.Kind) (delivered bool) {
 	if a.ControlPath == "" {
-		return
+		return false
 	}
 	if err := control.Nudge(ctx, a.ControlPath, kind); err != nil {
 		slog.Debug("daemon nudge failed (no daemon listening?)", "kind", kind, "error", err)
+		return false
 	}
+	return true
 }
 
 // confirmationWeight resolves the operator-confirmation boost for display-side
@@ -1622,9 +1627,18 @@ func (a *App) Config() (config.Config, error) {
 // front-ends (a long-running TUI plus CLI invocations is a supported
 // combination), so no edit is silently lost to a last-writer-wins race.
 func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) error {
+	_, err := a.updateConfigReloaded(ctx, fn)
+	return err
+}
+
+// updateConfigReloaded is UpdateConfig plus whether a running daemon took the
+// reload, for the surfaces that SAY so. The flag never gates the write: the
+// config is saved either way, and a daemon that was not listening reads it at
+// its next start.
+func (a *App) updateConfigReloaded(ctx context.Context, fn func(*config.Config) error) (bool, error) {
 	unlock, err := lockFile(a.ConfigPath + ".lock")
 	if err != nil {
-		return fmt.Errorf("lock config for editing: %w", err)
+		return false, fmt.Errorf("lock config for editing: %w", err)
 	}
 	defer unlock()
 
@@ -1635,16 +1649,15 @@ func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) e
 	// a.Config().
 	cfg, err := config.Load(a.ConfigPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := fn(&cfg); err != nil {
-		return err
+		return false, err
 	}
 	if err := config.Save(a.ConfigPath, cfg); err != nil {
-		return err
+		return false, err
 	}
-	a.nudge(ctx, control.KindReload)
-	return nil
+	return a.nudge(ctx, control.KindReload), nil
 }
 
 // ConfigFieldDef describes one scalar config field: its SetField key and
@@ -2105,7 +2118,7 @@ func pathFieldValue(v string) string {
 
 // SetField updates one scalar config field by key, with validation. It
 // backs both the TUI config editor and `config set <key> <value>`.
-func (a *App) SetField(ctx context.Context, key, value string) error {
+func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, err error) {
 	value = strings.TrimSpace(value)
 	setFloat := func(dst *float64) error {
 		v, err := strconv.ParseFloat(value, 64)
@@ -2126,7 +2139,7 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 		*dst = v
 		return nil
 	}
-	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+	return a.updateConfigReloaded(ctx, func(cfg *config.Config) error {
 		switch key {
 		case "confidence_thresholds.minimum":
 			return setFloat(&cfg.ConfidenceThresholds.Minimum)
@@ -2942,11 +2955,11 @@ func (a *App) SetTaskSourceGistID(ctx context.Context, index int, expected confi
 }
 
 // SetThreshold updates one confidence threshold (FR-009) and reloads.
-func (a *App) SetThreshold(ctx context.Context, situation string, value float64) error {
+func (a *App) SetThreshold(ctx context.Context, situation string, value float64) (reloaded bool, err error) {
 	if value <= 0 || value >= 1 {
-		return fmt.Errorf("threshold must be in (0,1), got %v", value)
+		return false, fmt.Errorf("threshold must be in (0,1), got %v", value)
 	}
-	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+	return a.updateConfigReloaded(ctx, func(cfg *config.Config) error {
 		switch situation {
 		case "idle":
 			cfg.ConfidenceThresholds.Idle = value

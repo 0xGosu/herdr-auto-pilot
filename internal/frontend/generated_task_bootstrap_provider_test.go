@@ -68,7 +68,7 @@ func TestBootstrapWritesWhereItRegisters(t *testing.T) {
 			{"task_source_provider.provider", "github_gist"},
 			{"task_source_provider.github_gist.gist_id", "3f2a1b9c"},
 		} {
-			if err := app.SetField(ctx, kv[0], kv[1]); err != nil {
+			if _, err := app.SetField(ctx, kv[0], kv[1]); err != nil {
 				t.Fatal(err)
 			}
 		}

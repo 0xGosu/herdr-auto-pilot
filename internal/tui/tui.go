@@ -4773,10 +4773,15 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	m.beginAction()
 	submit := func(input string) tea.Cmd {
 		return func() tea.Msg {
-			if err := app.SetField(ctx, key, input); err != nil {
+			reloaded, err := app.SetField(ctx, key, input)
+			if err != nil {
 				return actionResultMsg{err: err}
 			}
-			return actionResultMsg{message: key + " updated (daemon reloaded)"}
+			msg := key + " updated"
+			if !reloaded {
+				msg += " (saved — no daemon running)"
+			}
+			return actionResultMsg{message: msg}
 		}
 	}
 	// Enum-valued fields present a picker so the operator chooses from the

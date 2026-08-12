@@ -17,7 +17,7 @@ func TestTaskStoreProviderFieldsRoundTrip(t *testing.T) {
 
 	t.Run("provider persists and rejects an unknown name", func(t *testing.T) {
 		app, _ := testApp(t)
-		if err := app.SetField(ctx, "task_source_provider.provider", "github_gist"); err != nil {
+		if _, err := app.SetField(ctx, "task_source_provider.provider", "github_gist"); err != nil {
 			t.Fatalf("SetField rejected a valid provider: %v", err)
 		}
 		cfg, err := app.Config()
@@ -29,7 +29,7 @@ func TestTaskStoreProviderFieldsRoundTrip(t *testing.T) {
 				got, config.ProviderGitHubGist)
 		}
 		for _, bad := range []string{"gist", "GITHUB-GIST", "linear", "local fs"} {
-			if err := app.SetField(ctx, "task_source_provider.provider", bad); err == nil {
+			if _, err := app.SetField(ctx, "task_source_provider.provider", bad); err == nil {
 				t.Errorf("SetField accepted %q; the enum must be closed", bad)
 			} else if !strings.Contains(err.Error(), config.ProviderLocalFS) {
 				t.Errorf("the rejection must name the valid values, got %v", err)
@@ -37,7 +37,7 @@ func TestTaskStoreProviderFieldsRoundTrip(t *testing.T) {
 		}
 		// Case and surrounding space are normalized rather than refused: the
 		// operator typed a name, not a token.
-		if err := app.SetField(ctx, "task_source_provider.provider", "  LOCAL_FS "); err != nil {
+		if _, err := app.SetField(ctx, "task_source_provider.provider", "  LOCAL_FS "); err != nil {
 			t.Errorf("SetField must normalize case and space, got %v", err)
 		}
 	})
@@ -57,7 +57,7 @@ func TestTaskStoreProviderFieldsRoundTrip(t *testing.T) {
 		for _, order := range orders {
 			app, _ := testApp(t)
 			for _, key := range order {
-				if err := app.SetField(ctx, key, values[key]); err != nil {
+				if _, err := app.SetField(ctx, key, values[key]); err != nil {
 					t.Fatalf("setting %s (order %v) was refused: %v", key, order, err)
 				}
 			}
@@ -71,7 +71,7 @@ func TestTaskStoreProviderFieldsRoundTrip(t *testing.T) {
 			"https://gist.github.com/me/3f2a1b9c4d5e6f708192a3b4c5d6e7f8",
 			"https://gist.github.com/me/3f2a1b9c4d5e6f708192a3b4c5d6e7f8/",
 		} {
-			if err := app.SetField(ctx, "task_source_provider.github_gist.gist_id", in); err != nil {
+			if _, err := app.SetField(ctx, "task_source_provider.github_gist.gist_id", in); err != nil {
 				t.Fatalf("SetField(%q): %v", in, err)
 			}
 			cfg, err := app.Config()
@@ -88,7 +88,7 @@ func TestTaskStoreProviderFieldsRoundTrip(t *testing.T) {
 	t.Run("env_file is stored verbatim, never expanded", func(t *testing.T) {
 		app, _ := testApp(t)
 		const raw = "$HOME/.config/hap/task.env"
-		if err := app.SetField(ctx, "task_source_provider.env_file", raw); err != nil {
+		if _, err := app.SetField(ctx, "task_source_provider.env_file", raw); err != nil {
 			t.Fatal(err)
 		}
 		cfg, err := app.Config()
@@ -103,16 +103,16 @@ func TestTaskStoreProviderFieldsRoundTrip(t *testing.T) {
 
 	t.Run("timeouts reject nonsense and accept zero", func(t *testing.T) {
 		app, _ := testApp(t)
-		if err := app.SetField(ctx, "task_source_provider.timeout_seconds", "0"); err != nil {
+		if _, err := app.SetField(ctx, "task_source_provider.timeout_seconds", "0"); err != nil {
 			t.Errorf("0 means the built-in default and must be accepted: %v", err)
 		}
 		for _, bad := range []string{"-1", "abc", ""} {
-			if err := app.SetField(ctx, "task_source_provider.timeout_seconds", bad); err == nil {
+			if _, err := app.SetField(ctx, "task_source_provider.timeout_seconds", bad); err == nil {
 				t.Errorf("timeout_seconds accepted %q", bad)
 			}
 		}
 		// refresh_seconds DOES take a negative: it is the read-through escape hatch.
-		if err := app.SetField(ctx, "task_source_provider.refresh_seconds", "-1"); err != nil {
+		if _, err := app.SetField(ctx, "task_source_provider.refresh_seconds", "-1"); err != nil {
 			t.Errorf("a negative refresh is the documented read-through setting: %v", err)
 		}
 	})

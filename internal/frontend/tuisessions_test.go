@@ -25,7 +25,7 @@ func TestEnforceTUISessionLimitUsesTheConfiguredMax(t *testing.T) {
 	app, _ := testApp(t)
 	lim := &fakeLimiter{closed: []int{4242}}
 	app.TUISessions = lim
-	if err := app.SetField(t.Context(), "tui.max_instances", "3"); err != nil {
+	if _, err := app.SetField(t.Context(), "tui.max_instances", "3"); err != nil {
 		t.Fatalf("set tui.max_instances: %v", err)
 	}
 	sweep, err := app.EnforceTUISessionLimit()
@@ -86,7 +86,7 @@ func TestEnforceTUISessionLimitIsThrottled(t *testing.T) {
 // negative or non-numeric one is refused rather than silently reinterpreted.
 func TestSetFieldMaxInstances(t *testing.T) {
 	app, _ := testApp(t)
-	if err := app.SetField(t.Context(), "tui.max_instances", "0"); err != nil {
+	if _, err := app.SetField(t.Context(), "tui.max_instances", "0"); err != nil {
 		t.Fatalf("0 must be accepted as the no-limit setting: %v", err)
 	}
 	cfg, err := app.Config()
@@ -100,11 +100,11 @@ func TestSetFieldMaxInstances(t *testing.T) {
 		t.Errorf("FieldValue = %q, want %q", got, "0 (no limit)")
 	}
 	for _, bad := range []string{"-1", "abc", "1.5", ""} {
-		if err := app.SetField(t.Context(), "tui.max_instances", bad); err == nil {
+		if _, err := app.SetField(t.Context(), "tui.max_instances", bad); err == nil {
 			t.Errorf("SetField accepted %q", bad)
 		}
 	}
-	if err := app.SetField(t.Context(), "tui.max_instances", "3"); err != nil {
+	if _, err := app.SetField(t.Context(), "tui.max_instances", "3"); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ = app.Config()

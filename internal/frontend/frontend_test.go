@@ -2148,20 +2148,20 @@ func TestResolveUnknownAuditFails(t *testing.T) {
 func TestSetThresholdPersists(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
-	if err := app.SetThreshold(ctx, "approval", 0.93); err != nil {
+	if _, err := app.SetThreshold(ctx, "approval", 0.93); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := app.Config()
 	if err != nil || cfg.ConfidenceThresholds.Approval != 0.93 {
 		t.Fatalf("threshold not persisted: %+v %v", cfg.ConfidenceThresholds, err)
 	}
-	if err := app.SetThreshold(ctx, "approval", 1.5); err == nil {
+	if _, err := app.SetThreshold(ctx, "approval", 1.5); err == nil {
 		t.Error("out-of-range threshold must be rejected")
 	}
-	if err := app.SetThreshold(ctx, "bogus", 0.5); err == nil {
+	if _, err := app.SetThreshold(ctx, "bogus", 0.5); err == nil {
 		t.Error("unknown situation must be rejected")
 	}
-	if err := app.SetThreshold(ctx, "minimum", 0.55); err != nil {
+	if _, err := app.SetThreshold(ctx, "minimum", 0.55); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err = app.Config()
@@ -2309,7 +2309,7 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		{"nonexistent.field", "1", true},
 	}
 	for _, c := range cases {
-		err := app.SetField(ctx, c.key, c.value)
+		_, err := app.SetField(ctx, c.key, c.value)
 		if (err != nil) != c.wantErr {
 			t.Errorf("SetField(%s, %s) error = %v, wantErr %v", c.key, c.value, err, c.wantErr)
 		}
@@ -2474,7 +2474,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
 	for _, key := range frontend.ConfigFieldKeys {
-		if err := app.SetField(ctx, key, samples[key]); err != nil {
+		if _, err := app.SetField(ctx, key, samples[key]); err != nil {
 			t.Errorf("SetField(%s, %q) rejected a valid value: %v", key, samples[key], err)
 		}
 	}
@@ -2502,14 +2502,14 @@ func TestAutoActConfidenceThresholdFieldDisplay(t *testing.T) {
 	// SetField round-trips and rejects negatives; 0 is a valid value.
 	app, _ := testApp(t)
 	ctx := context.Background()
-	if err := app.SetField(ctx, "llm.auto_act_confidence_threshold", "0"); err != nil {
+	if _, err := app.SetField(ctx, "llm.auto_act_confidence_threshold", "0"); err != nil {
 		t.Fatalf("threshold 0 (act on any score) must be accepted: %v", err)
 	}
 	cfg, _ := app.Config()
 	if cfg.LLM.AutoActConfidenceThreshold != 0 {
 		t.Errorf("SetField did not persist 0, got %d", cfg.LLM.AutoActConfidenceThreshold)
 	}
-	if err := app.SetField(ctx, "llm.auto_act_confidence_threshold", "-5"); err == nil {
+	if _, err := app.SetField(ctx, "llm.auto_act_confidence_threshold", "-5"); err == nil {
 		t.Error("negative threshold must be rejected")
 	}
 }
@@ -2530,14 +2530,14 @@ func TestPaneSalientCharsFieldDisplay(t *testing.T) {
 	// SetField round-trips through the store and rejects non-positive values.
 	app, _ := testApp(t)
 	ctx := context.Background()
-	if err := app.SetField(ctx, "embedding.pane_salient_chars", "1000"); err != nil {
+	if _, err := app.SetField(ctx, "embedding.pane_salient_chars", "1000"); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := app.Config()
 	if cfg.Embedding.PaneSalientChars != 1000 {
 		t.Errorf("SetField did not persist pane_salient_chars, got %d", cfg.Embedding.PaneSalientChars)
 	}
-	if err := app.SetField(ctx, "embedding.pane_salient_chars", "0"); err == nil {
+	if _, err := app.SetField(ctx, "embedding.pane_salient_chars", "0"); err == nil {
 		t.Error("pane_salient_chars must reject 0 (use omission for the default)")
 	}
 }
@@ -2651,7 +2651,7 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 
 	// Hidden fields still round-trip through SetField.
 	app, _ := testApp(t)
-	if err := app.SetField(context.Background(), "embedding.warm_timeout_ms", "90000"); err != nil {
+	if _, err := app.SetField(context.Background(), "embedding.warm_timeout_ms", "90000"); err != nil {
 		t.Fatalf("SetField on a hidden key must still work: %v", err)
 	}
 	cfg, err := app.Config()
@@ -2701,14 +2701,14 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 		{"llm.task_generate_command_start", "", false}, // empty inherits task_generate_command
 	}
 	for _, c := range cases {
-		err := app.SetField(ctx, c.key, c.value)
+		_, err := app.SetField(ctx, c.key, c.value)
 		if (err != nil) != c.wantErr {
 			t.Errorf("SetField(%s, %q) error = %v, wantErr %v", c.key, c.value, err, c.wantErr)
 		}
 	}
 
 	// The unknown-theme error names the valid themes.
-	err := app.SetField(ctx, "tui.theme", "solarized")
+	_, err := app.SetField(ctx, "tui.theme", "solarized")
 	if err == nil {
 		t.Fatal("unknown theme must be rejected")
 	}
@@ -2719,7 +2719,7 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 	}
 
 	// Case-insensitive theme names normalize to lowercase on persist.
-	if err := app.SetField(ctx, "tui.theme", "DARK"); err != nil {
+	if _, err := app.SetField(ctx, "tui.theme", "DARK"); err != nil {
 		t.Fatalf("SetField(tui.theme, DARK) should normalize, got %v", err)
 	}
 	cfg, err := app.Config()
@@ -2730,7 +2730,7 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 		t.Errorf("persisted theme = %q, want normalized \"dark\"", cfg.TUI.Theme)
 	}
 	// Empty resets to the default theme.
-	if err := app.SetField(ctx, "tui.theme", ""); err != nil {
+	if _, err := app.SetField(ctx, "tui.theme", ""); err != nil {
 		t.Fatalf("empty theme should reset: %v", err)
 	}
 	if cfg, _ = app.Config(); cfg.TUI.Theme != "" {
@@ -2739,21 +2739,21 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 
 	// End each key on a NON-zero accepted value so persistence is positively
 	// asserted (a validator that forgot the assignment would otherwise pass).
-	if err := app.SetField(ctx, "tui.max_content_width", "140"); err != nil {
+	if _, err := app.SetField(ctx, "tui.max_content_width", "140"); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SetField(ctx, "tui.max_content_height", "12"); err != nil {
+	if _, err := app.SetField(ctx, "tui.max_content_height", "12"); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SetField(ctx, "safety.disable_never_auto_seed_patterns", "true"); err != nil {
+	if _, err := app.SetField(ctx, "safety.disable_never_auto_seed_patterns", "true"); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SetField(ctx, "llm.task_generate_timeout_seconds", "30"); err != nil {
+	if _, err := app.SetField(ctx, "llm.task_generate_timeout_seconds", "30"); err != nil {
 		t.Fatal(err)
 	}
 	// Ends on false — the non-default value, so a validator that forgot the
 	// assignment cannot pass by inheriting the true default.
-	if err := app.SetField(ctx, "tui.herdr_notification", "false"); err != nil {
+	if _, err := app.SetField(ctx, "tui.herdr_notification", "false"); err != nil {
 		t.Fatal(err)
 	}
 	if cfg, err = app.Config(); err != nil {
@@ -5718,7 +5718,7 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("bm25_highbar_score persists and is bounded", func(t *testing.T) {
-		if err := app.SetField(ctx, "embedding.bm25_highbar_score", "0.80"); err != nil {
+		if _, err := app.SetField(ctx, "embedding.bm25_highbar_score", "0.80"); err != nil {
 			t.Fatalf("SetField rejected a valid value: %v", err)
 		}
 		cfg, err := app.Config()
@@ -5729,14 +5729,14 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 			t.Errorf("BM25HighBarScore = %v, want 0.80 — SetField accepted the value but did not store it", got)
 		}
 		for _, bad := range []string{"0", "1.5", "-0.2", "abc", ""} {
-			if err := app.SetField(ctx, "embedding.bm25_highbar_score", bad); err == nil {
+			if _, err := app.SetField(ctx, "embedding.bm25_highbar_score", bad); err == nil {
 				t.Errorf("SetField accepted %q; the bar must stay within (0,1]", bad)
 			}
 		}
 		// A value below bm25_min_score is deliberately ALLOWED: the daemon
 		// ignores it rather than letting it loosen the fallback, and rejecting
 		// it here would make the two keys order-dependent to set.
-		if err := app.SetField(ctx, "embedding.bm25_highbar_score", "0.10"); err != nil {
+		if _, err := app.SetField(ctx, "embedding.bm25_highbar_score", "0.10"); err != nil {
 			t.Errorf("a high bar below bm25_min_score must be storable, got %v", err)
 		}
 	})
@@ -5746,7 +5746,7 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 		// value" and "SetField stored it" come apart — a nil left in place, or
 		// a write through a pointer the loaded Config shares, both look fine to
 		// the registry-parity guard.
-		if err := app.SetField(ctx, "llm.run_in_agent_cwd", "false"); err != nil {
+		if _, err := app.SetField(ctx, "llm.run_in_agent_cwd", "false"); err != nil {
 			t.Fatalf("SetField rejected a valid bool: %v", err)
 		}
 		cfg, err := app.Config()
@@ -5760,7 +5760,7 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 			t.Error("the accessor must report false once an explicit false is stored")
 		}
 		// And back on again, so the default is reachable after opting out.
-		if err := app.SetField(ctx, "llm.run_in_agent_cwd", "true"); err != nil {
+		if _, err := app.SetField(ctx, "llm.run_in_agent_cwd", "true"); err != nil {
 			t.Fatalf("SetField rejected true: %v", err)
 		}
 		if cfg, err = app.Config(); err != nil {
@@ -5770,14 +5770,14 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 			t.Error("RunInAgentCwd must be settable back to true")
 		}
 		for _, bad := range []string{"yes", "", "1.5", "maybe"} {
-			if err := app.SetField(ctx, "llm.run_in_agent_cwd", bad); err == nil {
+			if _, err := app.SetField(ctx, "llm.run_in_agent_cwd", bad); err == nil {
 				t.Errorf("SetField accepted %q; only a bool is valid", bad)
 			}
 		}
 	})
 
 	t.Run("learn_from_user keys persist, validate, and clear", func(t *testing.T) {
-		if err := app.SetField(ctx, "llm.learn_from_user_command", `claude -p "record the lesson"`); err != nil {
+		if _, err := app.SetField(ctx, "llm.learn_from_user_command", `claude -p "record the lesson"`); err != nil {
 			t.Fatalf("SetField rejected a valid argv: %v", err)
 		}
 		cfg, err := app.Config()
@@ -5788,18 +5788,18 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 			t.Errorf("LearnFromUserCommand = %q — SetField accepted the value but did not store it as argv", got)
 		}
 		// Empty disables the feature; that is a setting, not an error.
-		if err := app.SetField(ctx, "llm.learn_from_user_command", ""); err != nil {
+		if _, err := app.SetField(ctx, "llm.learn_from_user_command", ""); err != nil {
 			t.Errorf("an empty command must disable the feature, got %v", err)
 		}
 		if cfg, _ = app.Config(); len(cfg.LLM.LearnFromUserCommand) != 0 {
 			t.Errorf("empty command did not clear: %q", cfg.LLM.LearnFromUserCommand)
 		}
 		// An unbalanced quote is a real parse error, not a silent single arg.
-		if err := app.SetField(ctx, "llm.learn_from_user_command", `claude -p "unterminated`); err == nil {
+		if _, err := app.SetField(ctx, "llm.learn_from_user_command", `claude -p "unterminated`); err == nil {
 			t.Error("SetField accepted an unbalanced quote")
 		}
 
-		if err := app.SetField(ctx, "llm.learn_from_user_timeout_seconds", "90"); err != nil {
+		if _, err := app.SetField(ctx, "llm.learn_from_user_timeout_seconds", "90"); err != nil {
 			t.Fatalf("SetField rejected a valid timeout: %v", err)
 		}
 		if cfg, _ = app.Config(); cfg.LLM.LearnFromUserTimeoutSeconds != 90 {
@@ -5807,22 +5807,22 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 		}
 		// 0 is legal and means "inherit timeout_seconds"; negatives and
 		// non-numbers are not.
-		if err := app.SetField(ctx, "llm.learn_from_user_timeout_seconds", "0"); err != nil {
+		if _, err := app.SetField(ctx, "llm.learn_from_user_timeout_seconds", "0"); err != nil {
 			t.Errorf("0 must be accepted (inherits timeout_seconds), got %v", err)
 		}
 		for _, bad := range []string{"-1", "abc", ""} {
-			if err := app.SetField(ctx, "llm.learn_from_user_timeout_seconds", bad); err == nil {
+			if _, err := app.SetField(ctx, "llm.learn_from_user_timeout_seconds", bad); err == nil {
 				t.Errorf("SetField accepted %q for a non-negative integer field", bad)
 			}
 		}
 
-		if err := app.SetField(ctx, "llm.learn_from_user_command_env_file", "/etc/hap/learn.env"); err != nil {
+		if _, err := app.SetField(ctx, "llm.learn_from_user_command_env_file", "/etc/hap/learn.env"); err != nil {
 			t.Fatalf("SetField rejected a valid env path: %v", err)
 		}
 		if cfg, _ = app.Config(); cfg.LLM.LearnFromUserEnvFile != "/etc/hap/learn.env" {
 			t.Errorf("LearnFromUserEnvFile = %q, want the path", cfg.LLM.LearnFromUserEnvFile)
 		}
-		if err := app.SetField(ctx, "llm.learn_from_user_command_env_file", ""); err != nil {
+		if _, err := app.SetField(ctx, "llm.learn_from_user_command_env_file", ""); err != nil {
 			t.Errorf("an empty env path must clear it, got %v", err)
 		}
 	})
@@ -5839,7 +5839,7 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 			"tui.palette.help":    func(c config.Config) string { return c.TUI.Palette.Help },
 		}
 		for key, read := range roles {
-			if err := app.SetField(ctx, key, "205"); err != nil {
+			if _, err := app.SetField(ctx, key, "205"); err != nil {
 				t.Fatalf("SetField(%s, 205): %v", key, err)
 			}
 			cfg, err := app.Config()
@@ -5850,7 +5850,7 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 				t.Errorf("%s = %q after set, want \"205\" — the case is wired to the wrong field or does not assign", key, got)
 			}
 			// "" clears the role back to the theme; that is a setting, not an error.
-			if err := app.SetField(ctx, key, ""); err != nil {
+			if _, err := app.SetField(ctx, key, ""); err != nil {
 				t.Errorf("SetField(%s, \"\") must clear the role, got %v", key, err)
 			}
 			cleared, err := app.Config()
@@ -5864,14 +5864,14 @@ func TestNewConfigFieldsRoundTrip(t *testing.T) {
 
 		// Accepted forms, on one representative role.
 		for _, ok := range []string{"0", "255", "#abc", "#a1b2c3", "#ABCDEF"} {
-			if err := app.SetField(ctx, "tui.palette.title", ok); err != nil {
+			if _, err := app.SetField(ctx, "tui.palette.title", ok); err != nil {
 				t.Errorf("SetField(tui.palette.title, %q) rejected a valid color: %v", ok, err)
 			}
 		}
 		// Rejected: lipgloss resolves each of these to NO color (or an
 		// out-of-spec SGR) silently, and a TUIHidden key has no other feedback.
 		for _, bad := range []string{"purple", "300", "-1", "#ab", "#abcd", "#gggggg", "1.5"} {
-			if err := app.SetField(ctx, "tui.palette.title", bad); err == nil {
+			if _, err := app.SetField(ctx, "tui.palette.title", bad); err == nil {
 				t.Errorf("SetField(tui.palette.title, %q) was accepted; it renders as no color at all", bad)
 			}
 		}
@@ -6308,5 +6308,29 @@ func TestTaskSourceLocationNamesTheProvider(t *testing.T) {
 	local := config.Config{TaskSources: []config.TaskSource{{Agent: "x", Path: "/docs/tasks.md"}}}
 	if got := frontend.TaskSourceLocation(local, local.TaskSources[0]); got != "/docs/tasks.md" {
 		t.Errorf("local source rendered %q, want the bare path", got)
+	}
+}
+
+// TestSetFieldReportsWhetherADaemonTookTheReload: the surfaces that print
+// "daemon reloaded" must not say so when nothing was listening. The write
+// still succeeds — a stopped daemon reads config at its next start — so the
+// flag is for WORDING only and must never be turned into a failure.
+func TestSetFieldReportsWhetherADaemonTookTheReload(t *testing.T) {
+	app, _ := testApp(t)
+	app.ControlPath = filepath.Join(t.TempDir(), "control.sock") // nothing listening
+
+	reloaded, err := app.SetField(context.Background(), "learning.graduation_n", "4")
+	if err != nil {
+		t.Fatalf("a set with no daemon must still succeed: %v", err)
+	}
+	if reloaded {
+		t.Error("reloaded = true with nothing listening — the message would claim a reload that never happened")
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Learning.GraduationN != 4 {
+		t.Errorf("graduation_n = %d, want the value saved despite no daemon", cfg.Learning.GraduationN)
 	}
 }
