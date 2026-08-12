@@ -109,6 +109,15 @@ func (f *fakeGist) handler() http.Handler {
 			f.patches++
 			f.patchBodies = append(f.patchBodies, req.Files)
 			status, body := f.patchStatus, f.patchBody
+			// GitHub reads a blank body as "this entry carries no file" and
+			// drops it, then refuses the request for having an empty `files`
+			// map — so a lone blank file is a 422 that names `files`, not the
+			// file. Modeled here because the fake accepting blank content is
+			// exactly what let the generated-task bootstrap ship seeding "".
+			if status == 0 && blankPatch(req.Files) {
+				status, body = http.StatusUnprocessableEntity,
+					`{"message":"Validation Failed","errors":[{"resource":"Gist","code":"missing_field","field":"files"}]}`
+			}
 			if status == 0 {
 				for name, v := range req.Files {
 					m, ok := v.(map[string]any)
@@ -139,6 +148,26 @@ func (f *fakeGist) handler() http.Handler {
 		}
 	})
 	return mux
+}
+
+// blankPatch reports whether every entry in a PATCH's files map would be
+// dropped as blank, which is what makes GitHub answer 422. A nil entry is a
+// DELETE and is not blank content.
+func blankPatch(files map[string]any) bool {
+	if len(files) == 0 {
+		return true
+	}
+	for _, v := range files {
+		m, ok := v.(map[string]any)
+		if !ok || m == nil {
+			return false // a delete
+		}
+		c, ok := m["content"].(string)
+		if !ok || strings.TrimSpace(c) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func (f *fakeGist) writeGist(w http.ResponseWriter) {
@@ -429,6 +458,84 @@ func TestGistEnsureCreatesTheFileOnDemandAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestGistRefusesToWriteBlankContent: GitHub cannot store a blank gist file —
+// "", "\n" and " " all fail identically with `422 Validation Failed
+// {Resource:Gist Field:files Code:missing_field}` (verified live 2026-08-12).
+// The error names `files`, never the file, and reads as a malformed request, so
+// hap must recognize the case itself: the operator's whole confirm failed with
+// a message that pointed at nothing actionable.
+//
+// The refusal lives on the WRITE, not on Ensure, so a mutation that empties a
+// list gets the same answer as a create that seeds one blank. It must spend no
+// PATCH — a request GitHub will certainly reject is not worth a round trip, and
+// a caller must never be left wondering whether a rejected write landed.
+func TestGistRefusesToWriteBlankContent(t *testing.T) {
+	for _, initial := range []string{"", "\n", "  \n\t\n"} {
+		t.Run(fmt.Sprintf("ensure %q", initial), func(t *testing.T) {
+			f := newFakeGist(map[string]string{})
+			s := newStore(t, f)
+
+			created, err := s.Ensure(context.Background(), locator(testFile), initial)
+			if !errors.Is(err, gist.ErrBlankContent) {
+				t.Fatalf("Ensure must refuse blank content with ErrBlankContent; got created=%v err=%v", created, err)
+			}
+			if created {
+				t.Error("a refused create must not report that it created the list")
+			}
+			// The refusal must name the file the operator can act on — the raw
+			// GitHub error names only `files`, which is the whole problem.
+			if !strings.Contains(err.Error(), testFile) {
+				t.Errorf("the refusal must name the task list; got %q", err)
+			}
+			if _, patches := f.counts(); patches != 0 {
+				t.Errorf("a certainly-invalid write must spend no PATCH; got %d", patches)
+			}
+		})
+	}
+
+	t.Run("mutate that empties a list", func(t *testing.T) {
+		f := newFakeGist(map[string]string{testFile: "- [ ] alpha\n"})
+		s := newStore(t, f)
+
+		_, err := s.Mutate(context.Background(), locator(testFile), 0,
+			func(string) (string, error) { return "", nil })
+		if !errors.Is(err, gist.ErrBlankContent) {
+			t.Fatalf("emptying a list must refuse with ErrBlankContent; got %v", err)
+		}
+		if got, _ := f.content(testFile); got != "- [ ] alpha\n" {
+			t.Errorf("a refused mutation must leave the list untouched; got %q", got)
+		}
+	})
+}
+
+// TestGistFakeRejectsBlankContentLikeGitHub pins the FAKE against the real API,
+// because a fake that accepts a blank write is why the bootstrap shipped seeding
+// "": every unit test passed while the live call 422'd. It drives the fake
+// directly (no store guard in the way) so the two cannot drift apart silently.
+func TestGistFakeRejectsBlankContentLikeGitHub(t *testing.T) {
+	f := newFakeGist(map[string]string{})
+	srv := httptest.NewServer(f.handler())
+	t.Cleanup(srv.Close)
+
+	// http.Client has no Patch helper; build the request by hand.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPatch,
+		srv.URL+"/gists/"+testGistID, strings.NewReader(`{"files":{"`+testFile+`":{"content":"  "}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = got.Body.Close() }()
+	if got.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("the fake must answer a blank write the way GitHub does (422); got %d", got.StatusCode)
+	}
+	if _, ok := f.content(testFile); ok {
+		t.Error("a rejected blank write must create nothing")
+	}
+}
+
 func TestGistClientSendsTheBearerTokenFromTheTokenSource(t *testing.T) {
 	f := newFakeGist(map[string]string{testFile: "- [ ] alpha\n"})
 	srv := httptest.NewServer(f.handler())
@@ -714,7 +821,7 @@ func TestGistReadDoesNotWaitForAFileWeNeverWrote(t *testing.T) {
 // is MISSING (ports.EnsureCreator). When a file this process wrote still reads
 // as absent after the settle re-reads, the API is lagging — not the list gone
 // — and PATCHing the initial content over it would erase a populated list with
-// an empty one (the generated-task bootstrap ensures with "").
+// a fresh header.
 func TestGistEnsureRefusesToOverwriteAFileItJustWrote(t *testing.T) {
 	f := newFakeGist(nil)
 	s := newStore(t, f)
@@ -730,7 +837,10 @@ func TestGistEnsureRefusesToOverwriteAFileItJustWrote(t *testing.T) {
 	patchesBefore := f.patches
 	f.mu.Unlock()
 
-	_, err := s.Ensure(context.Background(), locator(testFile), "")
+	// A realistic seed — a header, the only shape a caller can now produce —
+	// so the refusal being asserted is the LAG guard and not the blank-content
+	// one, which would fire first and make this test prove nothing.
+	_, err := s.Ensure(context.Background(), locator(testFile), "# Tasks\n\n")
 	if err == nil {
 		t.Fatal("Ensure must refuse rather than overwrite a list it cannot see yet")
 	}

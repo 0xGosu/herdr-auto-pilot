@@ -972,7 +972,14 @@ func (a *App) ensureGeneratedTaskFile(ctx context.Context, cfg config.Config,
 	// was local-only — so under a remote provider it wrote the agent's tasks to
 	// a file on this machine while the source it registered pointed at the
 	// store, and the agent's real list stayed empty.
-	if _, err := a.ensureList(ctx, cfg, locator, ""); err != nil {
+	//
+	// The list is created with its HEADER, not blank. A blank initial reads as
+	// harmless — the mutation below writes the real content a moment later — but
+	// a gist cannot hold a blank file at all (gist.ErrBlankContent), so creating
+	// one failed the whole confirm with GitHub's unactionable "422 Validation
+	// Failed ... Field:files" and no task list was ever created. Every other
+	// ensureList caller already seeds the header; this is the same one.
+	if _, err := a.ensureList(ctx, cfg, locator, newListHeader(name)); err != nil {
 		return nil, err
 	}
 	var merged []string
@@ -1268,7 +1275,7 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 	// agent has been handed work from). Create it so the mutation below has
 	// something to read. Idempotent and never clobbering, so it runs pre-claim
 	// while the escalation is still pending.
-	if _, err := a.ensureList(context.Background(), cfg, path, "# Tasks for "+name+"\n\n"); err != nil {
+	if _, err := a.ensureList(context.Background(), cfg, path, newListHeader(name)); err != nil {
 		return fmt.Errorf("create task list %s: %w", l.Display, err)
 	}
 
@@ -3998,6 +4005,11 @@ func (a *App) knownAgent(name string) bool {
 // newListHeader is the initial content for a task list hap creates on demand,
 // matching the generated-task bootstrap's shape. An index selector names a
 // SOURCE rather than an agent, so it gets the untitled header.
+//
+// It is the ONE seed every create-on-demand path uses, and it must never return
+// blank: a gist file cannot be blank at all (gist.ErrBlankContent), so a caller
+// that seeds "" does not create an empty list — it fails the whole operation
+// with a 422 that names neither the file nor the cause.
 func newListHeader(agent string) string {
 	if _, isIndex := domain.ParseTaskSourceIndexRef(agent); isIndex || agent == "" {
 		return "# Tasks\n\n"

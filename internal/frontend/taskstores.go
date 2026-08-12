@@ -3,6 +3,7 @@ package frontend
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -147,6 +148,19 @@ func (a *App) ensureList(ctx context.Context, cfg config.Config, locator, initia
 	l, err := a.resolveList(cfg, locator)
 	if err != nil {
 		return false, err
+	}
+	// A list is created with its header, never blank — checked HERE, for every
+	// backend, rather than where it actually breaks. A gist cannot hold a blank
+	// file at all (gist.ErrBlankContent), while a local file takes one happily,
+	// so a caller seeding "" passes the whole unit suite and then fails for the
+	// first operator on a github_gist provider. That is not a hypothetical: it
+	// is exactly how the generated-task bootstrap shipped, and catching the
+	// class only on the backend that breaks would let the next one ship the
+	// same way. Scoped to CREATE: a mutation may still empty a local list,
+	// which is what removing the last item from a headerless one does.
+	if strings.TrimSpace(initial) == "" {
+		return false, fmt.Errorf("refusing to create %s blank: a task list is created with its "+
+			"header (a gist cannot hold a blank file at all)", l.Display)
 	}
 	creator, ok := l.Store.(ports.EnsureCreator)
 	if !ok {
