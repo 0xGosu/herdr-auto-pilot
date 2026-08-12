@@ -12,6 +12,14 @@ var Version = "dev"
 // Label renders Version for display (the TUI header).
 func Label() string { return LabelOf(Version) }
 
+// VersionLine is the one-line `hap --version` output. It is a contract, not a
+// convenience: `hap update` executes the NEWLY INSTALLED binary's --version
+// and parses the version out of this exact shape (cli.versionFromOutput, with
+// a round-trip test), so a release that changed the line would silently cost
+// every operator updating to it the "installed vX" report. Keep the version
+// the last whitespace-separated field.
+func VersionLine() string { return "hap (herd-auto-prompter) " + Version }
+
 // LabelOf gives a version string its customary "v" prefix ("0.5.2" → "v0.5.2").
 // A value that is already prefixed, or that is not a release version at all
 // (the "dev" default), is shown verbatim so a local build never reads "vdev".

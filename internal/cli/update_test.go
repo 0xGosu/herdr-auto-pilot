@@ -376,6 +376,7 @@ func TestVersionFromOutput(t *testing.T) {
 		{"unstamped dev refused", "hap (herd-auto-prompter) dev\n", ""},
 		{"empty output", "", ""},
 		{"garbage refused", "usage: hap <command>", ""},
+		{"trailing bare number refused", "warmed 3", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -383,6 +384,65 @@ func TestVersionFromOutput(t *testing.T) {
 				t.Errorf("versionFromOutput(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestVersionFromOutputRoundTripsVersionLine pins the parse to the line the
+// binary actually prints: `hap update` executes a FUTURE build's --version, so
+// a drifted format would silently cost every operator the "installed vX"
+// report — this is the test that makes such a change fail loudly instead.
+func TestVersionFromOutputRoundTripsVersionLine(t *testing.T) {
+	stampRelease(t, "v0.6.5")
+	if got := versionFromOutput(buildinfo.VersionLine()); got != "v0.6.5" {
+		t.Errorf("versionFromOutput(VersionLine()) = %q, want %q", got, "v0.6.5")
+	}
+}
+
+// TestUpdateNoNoteWhenLatestUnknown guards the note's gate: with no latest
+// version known at all (fetch fails, no cache), a successful read-back must
+// print "installed vX" and no note — the tempting `installed != latest`
+// comparison would emit a malformed note naming an empty version here.
+func TestUpdateNoNoteWhenLatestUnknown(t *testing.T) {
+	stampRelease(t, "v0.6.3")
+	stubRunner(t, nil)
+	stubInstalledVersion(t, "v0.6.4")
+
+	var out bytes.Buffer
+	if err := update(context.Background(), updateTestApp(t, ""), &out, nil); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "installed v0.6.4") {
+		t.Errorf("closing line does not report the read-back version:\n%s", got)
+	}
+	if strings.Contains(got, "note:") {
+		t.Errorf("unknown latest still produced an asset-fallback note:\n%s", got)
+	}
+}
+
+// TestUpdateWithoutStateDirStaysVague pins the stateless edge: CheckForUpdate
+// is a no-op without a state dir to cache into, so even a working fetcher is
+// never consulted and the message degrades to the vague form — same behavior
+// as before the live-first change, now deliberate rather than accidental.
+func TestUpdateWithoutStateDirStaysVague(t *testing.T) {
+	stampRelease(t, "v0.6.4")
+	stubRunner(t, nil)
+	app := &frontend.App{
+		FetchLatestVersion: func(context.Context) (string, error) {
+			return "v0.6.5", nil
+		},
+	}
+
+	var out bytes.Buffer
+	if err := update(context.Background(), app, &out, nil); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "installing the latest release (current: v0.6.4)") {
+		t.Errorf("stateless app did not degrade to the vague message:\n%s", got)
+	}
+	if strings.Contains(got, "newest known:") {
+		t.Errorf("stateless app named a version nothing could have cached:\n%s", got)
 	}
 }
 

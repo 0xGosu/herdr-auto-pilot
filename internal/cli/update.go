@@ -141,15 +141,17 @@ func readInstalledVersion(ctx context.Context) string {
 }
 
 // versionFromOutput extracts the release from `hap --version` output
-// ("hap (herd-auto-prompter) v0.6.5"). Only a release version is reported:
-// a dev build's stamp would make "installed dev-…" read as a malfunction.
+// (buildinfo.VersionLine — the round-trip test pins the two together). Only a
+// dotted release version is reported: a dev build's stamp would make
+// "installed dev-…" read as a malfunction, and IsRelease alone also accepts a
+// bare integer, which any exit-0 diagnostic could legitimately end with.
 func versionFromOutput(s string) string {
 	fields := strings.Fields(s)
 	if len(fields) == 0 {
 		return ""
 	}
 	v := fields[len(fields)-1]
-	if !updatecheck.IsRelease(v) {
+	if !strings.Contains(v, ".") || !updatecheck.IsRelease(v) {
 		return ""
 	}
 	return buildinfo.LabelOf(v)
@@ -192,7 +194,9 @@ func hasFlag(args []string, flag string) bool {
 // The operator asked to update NOW and the install is about to spend minutes
 // downloading, so the 5s fetch is free — while a cached answer can be hours
 // stale and name the release BEFORE the one being installed. It is advisory —
-// an unknown version only costs a vaguer message, never the upgrade.
+// an unknown version only costs a vaguer message, never the upgrade. (Without
+// a state dir CheckForUpdate is a no-op rather than a fetch — there is nowhere
+// to cache into — so a stateless app degrades to the vague message.)
 func latestKnownVersion(ctx context.Context, app *frontend.App) string {
 	if app == nil {
 		return ""
