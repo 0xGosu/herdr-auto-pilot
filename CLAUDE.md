@@ -365,6 +365,47 @@ whose manifest carries exactly that version).
   daemon's cwd and CREATE local checklist files while the operator believed their lists were
   remote. A missing `gist_id` is deliberately not a write-time rule either: it would make the keys
   order-dependent to set (`TestValidateTaskSourceAcceptsAMissingGistID` pins the omission).
+- **A task-list locator is never handled as a FILE outside the local backend** — `taskfile.Mutate`,
+  `MutateWithin` and `WriteFileAtomic` take a path; a locator is not one. Under a remote provider it
+  is a `gist://<id>/<file>` URI that `os.Stat` can only fail on, and the failure reads like a missing
+  file (`stat gist://…: no such file or directory`) rather than like code looking in the wrong place.
+  Every checklist mutation therefore goes through the STORE — `frontend.mutateList`/`mutateTask`,
+  `daemon.mutateTaskList` — and there is deliberately NO local `mutateTaskFile` alias in
+  `internal/frontend` to reach for. `internal/taskstore/local` is the one exemption, because there a
+  locator IS a path. The hazard is that the local twin of a store method passes every test: the
+  generated-task confirm moved its read and write to the store and left the send-time RESERVATION on
+  `taskfile.Mutate`, so under `github_gist` it created the list, registered the source, CLAIMED the
+  escalation and only then died with nothing sent. Reading is the same trap by a different call:
+  `pickAppendTarget` chose among an agent's matched sources with `os.ReadFile`, which cannot resolve a
+  gist source's bare file name, so it silently degraded from "the source with pending work" to "the
+  first source" — wrong list, no error. The bootstrap EXCLUSION had it a third time: it compared that
+  same absolutized path against the local bootstrap path, so under a gist provider an agent's own
+  list read as external and a second confirm took the append path, whose dedupe keys on raw text
+  while the bootstrap flow stores NUMBERED items — appending every listed task again, un-numbered.
+  Comparison is therefore on canonical LOCATORS (`isBootstrapList`) — **plus a declared path**, and
+  that second half is not optional: a DERIVED source (`path` unset, the documented one-list-per-agent
+  form) resolves to `DerivedFileName(agent)`, byte-identical to what the bootstrap registers, so
+  locator equality alone excludes the most idiomatic gist setup, runs the bootstrap flow, and
+  `addTaskSourceIfAbsent` then refuses to register a second source for the agent — failing every
+  retry, after the tasks were already written. Never compare the declared spelling ALONE either: the
+  same file name in a different gist (`gist_id` override) is a different list. The bootstrap
+  locator's own resolution error is likewise DEFERRED past the append early-return, because the
+  append path never needed it — a misconfigured remote default beside a healthy `local_fs` source
+  must still work. Two guards, and they cover
+  different halves: `TestOnlyTheLocalBackendTouchesATaskListAsAFile` bans the path-taking MUTATORS
+  by construction (matched on the selector, so a function value is caught too, and a dot-import of
+  `taskfile` is refused outright since it would make the ban unenforceable; exemptions carry a
+  reason and are checked live), while the READ half needs behavior — hence `App.TaskStoreFor`, the
+  test-only seam that stands a remote backend up in-process. **Every frontend test before it ran on
+  a local file, where a locator IS a path, which is the single reason all of this shipped green** —
+  so a change here belongs in `remote_confirm_test.go`, against a store that refuses a non-gist
+  locator. Keep `TestRemoteConfirmReservesThroughTheStore` /
+  `…RollsBackThroughTheStore` / `TestRemoteAppendTargetReadsCandidatesThroughTheStore` /
+  `TestRemoteSecondConfirmDoesNotDuplicateItsOwnList` /
+  `TestAppendTargetPrecedenceSurvivesTheStoreRewrite`. A compensating write (the reservation
+  rollback) additionally takes `context.WithoutCancel`: a remote store uses the caller's ctx, and
+  the likeliest cause of the failed send it undoes — the operator quitting — is the same
+  cancellation that would abort the release and strand the item at `[-]`.
 - **A task-list locator is canonicalized in exactly one place** — `tasklocator.Canonical`, which
   `taskfile.LockPath` and both `canonicalTaskPath` copies delegate to. A scheme'd locator
   (`gist://…`) is returned verbatim, and the hazard of a second copy forgetting that is SILENT:
