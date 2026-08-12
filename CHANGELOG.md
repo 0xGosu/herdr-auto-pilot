@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.6
+
+- Fixed accepting an LLM-generated task escalation against a `github_gist` task source, which always failed with `422 Validation Failed` and created no task list. hap created the agent's list blank and filled it a moment later; GitHub cannot store a blank gist file at all, and its refusal named neither the list nor the cause. The list is now created with its header, the way every other create-on-demand path already did.
+- Added a clear refusal when a task list would be written blank to a gist, in place of GitHub's `422 ... Field:files`, so emptying a list reports what is wrong instead of a malformed-request error.
+
 ## 0.6.5
 
 - Fixed `hap task <agent> add` refusing to create a task list that does not exist yet: a configured source's list is now created on demand, so a gist-backed source can be seeded from the CLI or the TUI. Before this a fresh remote source was a dead end — there is no file to create by hand, and the list was only ever created by the daemon's first hand-out, which cannot happen until the list holds a task. `--path` still refuses a missing file, so a typo fails loudly.
