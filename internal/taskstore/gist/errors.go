@@ -29,6 +29,28 @@ var ErrTruncated = errors.New("the task list is too large: GitHub returned only 
 var ErrFileListTruncated = errors.New("this gist holds too many files for GitHub to list them all, " +
 	"so hap cannot tell whether the task list is missing or merely hidden")
 
+// ErrBlankContent reports a write GitHub will not accept: a gist file whose
+// content is empty or whitespace only.
+//
+// This is a hard property of the API, not a quota or a permission — verified
+// live (2026-08-12) against a real gist, where PATCHing a file with "", "\n" or
+// " " all fail identically with `422 Validation Failed {Resource:Gist
+// Field:files Code:missing_field}`. GitHub reads a blank body as "this entry
+// carries no file", drops it, and then rejects the request for having an empty
+// `files` map — so the error names `files`, never the file, and reads as a
+// malformed request rather than as the one thing that is actually wrong.
+//
+// A gist therefore cannot represent an EMPTY task list at all; only a list with
+// at least one non-blank line, which is why every caller creates one with a
+// header. Refusing is the whole answer: substituting a placeholder would write
+// content the caller never asked for, and a newline would not even work.
+var ErrBlankContent = errors.New("GitHub will not store a gist file with no content, so this task list " +
+	"cannot be written blank — give it at least a header line")
+
+// blank reports whether content is empty or whitespace only, i.e. whether
+// GitHub will refuse it.
+func blank(content string) bool { return strings.TrimSpace(content) == "" }
+
 // gistFileCeiling is where GitHub starts truncating a gist's file list.
 const gistFileCeiling = 300
 

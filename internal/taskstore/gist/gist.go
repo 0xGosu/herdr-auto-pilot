@@ -278,6 +278,12 @@ func (s *Store) fetchOnce(ctx context.Context, file string) (content string, fou
 // whose content was truncated or omitted — could clobber or delete another
 // agent's list.
 func (s *Store) put(ctx context.Context, file, content string) error {
+	// GitHub cannot store a blank gist file, and says so in a shape nobody can
+	// act on. Refusing here — on every write path, not just Ensure — turns it
+	// into an answer the caller can use.
+	if blank(content) {
+		return fmt.Errorf("write %q to gist %s: %w", file, shortID(s.gistID), ErrBlankContent)
+	}
 	c, err := s.client()
 	if err != nil {
 		return err
@@ -381,7 +387,7 @@ func (s *Store) Ensure(ctx context.Context, locator, initial string) (bool, erro
 	}
 	// "Absent" after the settle re-reads, for a file THIS process wrote, means
 	// the API has still not caught up — not that the list is gone. Creating
-	// here would PATCH the initial content (often empty) over a populated
+	// here would PATCH the initial content — a bare header — over a populated
 	// list, which is exactly the overwrite EnsureCreator promises never to do.
 	// Fail instead: the caller retries or reports, and no content is lost.
 	if s.recentlyWrote(file) {

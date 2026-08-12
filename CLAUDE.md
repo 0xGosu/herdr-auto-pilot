@@ -371,6 +371,25 @@ whose manifest carries exactly that version).
   `filepath.Abs` does not fail on one, it returns `<cwd>/gist:/id/file`, and each hap process has a
   different cwd — so the daemon's claims and the TUI's grouping would stop agreeing with nothing
   erroring. Each of the three packages has a test pinning the delegation.
+- **A task list is never created BLANK** — GitHub cannot store a blank gist file at all: `""`,
+  `"\n"` and `" "` are all refused with `422 Validation Failed {Resource:Gist Field:files
+  Code:missing_field}` (verified live 2026-08-12), because a blank body reads as "this entry
+  carries no file", the entry is dropped, and the request is then rejected for an empty `files`
+  map. So the error names `files` — never the list, never the content — and nothing is created.
+  `newListHeader` is the ONE seed every create-on-demand path passes to `ensureList`, and the
+  rule is enforced in THREE places on purpose: `frontend.ensureList` refuses a blank `initial`
+  for EVERY backend (a local file takes one happily, so guarding only where it breaks means the
+  next caller is green through the whole unit suite and fails for the first `github_gist`
+  operator — exactly how the generated-task confirm shipped seeding `""`, making accepting an
+  LLM-suggested task impossible); `ports.EnsureCreator` states it as the interface's contract;
+  and `gist.Store.put` refuses with `ErrBlankContent` on EVERY write path, not just a create, so
+  a mutation that empties a list reports what is wrong instead of the 422. Only the CREATE is
+  closed — a mutation may still empty a LOCAL list, which is what removing the last item from a
+  headerless one does. The unit suite could not catch any of this, so `fakeGist` now answers a
+  blank write with GitHub's real 422; a fake that accepts one is what let this through. Keep the
+  paired tests (`TestGistRefusesToWriteBlankContent` / `TestGistFakeRejectsBlankContentLikeGitHub` /
+  `TestBootstrapSeedsTheListWithItsHeaderNotBlank` / `TestNewListHeaderIsNeverBlank` /
+  `TestEnsureListRefusesABlankSeedOnEveryBackend`).
 - **Egress has exactly two exceptions, both opt-in and off by default** — the release check
   (`internal/updatecheck/fetch.go`) and the `github_gist` task-list backend
   (`internal/taskstore/gist/gist.go`), which carries task text only. `internal/privacy` bans the

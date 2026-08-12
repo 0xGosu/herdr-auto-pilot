@@ -285,6 +285,11 @@ type EnsureCreator interface {
 	// Ensure creates the list with initial content if it is missing, reporting
 	// whether it created it. Idempotent, and it NEVER overwrites existing
 	// content.
+	//
+	// initial must NOT be blank. A remote backend can be unable to store a
+	// blank list at all — GitHub refuses a blank gist file outright — so
+	// "create it empty and fill it in a moment" is not a portable pattern, even
+	// though it works on a local file. Callers pass the list's header.
 	Ensure(ctx context.Context, locator, initial string) (created bool, err error)
 }
 
