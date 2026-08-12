@@ -4174,9 +4174,14 @@ func TestTaskGroupsDerivedSourceStaysTemplateWhenAmbiguous(t *testing.T) {
 			MonitoredAgents: []domain.AgentTransition{otter, badger},
 			AgentNames:      names,
 		}},
-		{"no live agent matches", "brave-otter", frontend.Status{
+		// "no live agent matches" is deliberately NOT here: a source scoped to
+		// an agent NAME resolves without that agent running (see
+		// TestTaskGroupsDerivedSourceResolvesByItsNamedSelector). What stays
+		// ambiguous with nothing live is a source that names no agent at all —
+		// a workspace scope, which any number of agents can enter.
+		{"workspace-scoped source, nothing live", "", frontend.Status{
 			AgentsKnown:     true,
-			MonitoredAgents: []domain.AgentTransition{badger},
+			MonitoredAgents: nil,
 			AgentNames:      names,
 		}},
 		{"agent listing unknown", "brave-otter", frontend.Status{
@@ -6143,5 +6148,165 @@ func TestSignaturesBatchAndFallbackAgree(t *testing.T) {
 			b.TotalDecisions != f.TotalDecisions {
 			t.Errorf("row %d differs\n batched:  %+v\n fallback: %+v", i, b, f)
 		}
+	}
+}
+
+// TestAddTaskCreatesAMissingConfiguredList: `add` is the one op that creates
+// content, and for a REMOTE list it is the only way to create one — there is
+// no file for the operator to touch, and hap's own hints (the TUI's add
+// refusal, the remote task-management hints) send them to this command. A
+// fresh gist-backed source was a deadlock before this: the list appeared only
+// on the daemon's first hand-out, which cannot happen until the list holds a
+// task.
+func TestAddTaskCreatesAMissingConfiguredList(t *testing.T) {
+	app, _ := testApp(t)
+	// A configured source in a directory that does not exist either, so the
+	// create has to build the whole path the way the bootstrap does.
+	path := filepath.Join(t.TempDir(), "nested", "tasks.md")
+	if err := app.AddTaskSource(context.Background(), "brave-otter", "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	items, idx, err := app.AddTask("brave-otter", "", "write the migration test")
+	if err != nil {
+		t.Fatalf("add to a not-yet-created configured list: %v", err)
+	}
+	if idx != 1 || len(items) != 1 || items[0].Text != "write the migration test" {
+		t.Fatalf("add returned idx=%d items=%+v, want the one new task", idx, items)
+	}
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("the list should exist now: %v", rerr)
+	}
+	// Created with the same header shape the generated-task bootstrap writes,
+	// so a list hap made is recognizable however it was made.
+	if !strings.HasPrefix(string(data), "# Tasks for brave-otter\n") {
+		t.Errorf("created list = %q, want the titled header", data)
+	}
+	if !strings.Contains(string(data), "- [ ] write the migration test") {
+		t.Errorf("created list = %q, want the added task", data)
+	}
+
+	// A second add must APPEND, never re-create over the first.
+	if _, idx2, err := app.AddTask("brave-otter", "", "second"); err != nil || idx2 != 2 {
+		t.Fatalf("second add: idx=%d err=%v, want it appended as #2", idx2, err)
+	}
+}
+
+// TestAddTaskPathTargetStillRefusesAMissingFile: the create is scoped to a
+// CONFIGURED source. --path is a path the caller typed, so a typo must fail
+// loudly rather than silently minting an empty checklist somewhere else
+// (ports.EnsureCreator's standing rule).
+func TestAddTaskPathTargetStillRefusesAMissingFile(t *testing.T) {
+	app, _ := testApp(t)
+	typo := filepath.Join(t.TempDir(), "tsaks.md")
+	if _, _, err := app.AddTask("", typo, "x"); err == nil {
+		t.Fatal("--path to a missing file must refuse")
+	}
+	if _, err := os.Stat(typo); !os.IsNotExist(err) {
+		t.Errorf("a refused --path add must create nothing, stat err = %v", err)
+	}
+}
+
+// TestConfigWriteSucceedsWithNoDaemonListening: a nudge only asks a RUNNING
+// daemon to re-read what was already persisted, so its failure must never be
+// the write's failure. It was: `hap config …` before the daemon's first start
+// — the ordinary first-run order — exited 1 printing only "daemon nudge
+// failed" while the source had in fact been added, so an operator could
+// re-run it and double-add.
+func TestConfigWriteSucceedsWithNoDaemonListening(t *testing.T) {
+	app, _ := testApp(t)
+	// A control path that nothing is listening on, which is exactly what a
+	// stopped daemon leaves behind.
+	app.ControlPath = filepath.Join(t.TempDir(), "control.sock")
+
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(context.Background(), "brave-otter", "", path, ""); err != nil {
+		t.Fatalf("a failed nudge must not fail the config write: %v", err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 {
+		t.Fatalf("the source should have been saved, got %d", len(cfg.TaskSources))
+	}
+}
+
+// TestTaskGroupsDerivedSourceResolvesByItsNamedSelector: a derived source
+// scoped to an agent NAME addresses exactly one list whether or not that agent
+// is running — the name is all the derived file name is built from. Before
+// this, an agent's list vanished from the Tasks tab the moment its pane
+// closed, while `hap task <name> list` kept printing it.
+func TestTaskGroupsDerivedSourceResolvesByItsNamedSelector(t *testing.T) {
+	app, _ := testApp(t)
+	cfg := derivedGistCfg(t, "brave-otter")
+
+	// No live agents at all — and the listing is KNOWN to be empty, which is
+	// what separates this from a failed agent query.
+	groups := app.TaskGroups(cfg, frontend.Status{AgentsKnown: true})
+	if len(groups) != 1 {
+		t.Fatalf("got %d groups, want 1", len(groups))
+	}
+	if want := "gist://3f2a1b9c/brave-otter.md"; groups[0].Locator != want {
+		t.Fatalf("Locator=%q Err=%q, want the selector's own list %q",
+			groups[0].Locator, groups[0].Err, want)
+	}
+	if strings.Contains(groups[0].Err, derivedTemplateNote) {
+		t.Errorf("Err=%q still shows the per-agent note for a named selector", groups[0].Err)
+	}
+}
+
+// TestTaskGroupsDerivedSourceWithSeveralLiveMatchesStaysUnresolved: the
+// name-selector fallback must never fire for a selector several agents share
+// (a TYPE, or a workspace scope). Those agents genuinely have one list each,
+// and picking one would show — and let the operator mutate — another agent's
+// work.
+func TestTaskGroupsDerivedSourceWithSeveralLiveMatchesStaysUnresolved(t *testing.T) {
+	app, _ := testApp(t)
+	cfg := derivedGistCfg(t, "claude") // an agent TYPE, matching both agents
+	st := frontend.Status{
+		AgentsKnown: true,
+		MonitoredAgents: []domain.AgentTransition{
+			{AgentID: "t1", AgentType: "claude", WorkspaceID: "w1"},
+			{AgentID: "t2", AgentType: "claude", WorkspaceID: "w1"},
+		},
+		AgentNames: map[string]string{"t1": "brave-otter", "t2": "calm-badger"},
+	}
+	groups := app.TaskGroups(cfg, st)
+	if len(groups) != 1 {
+		t.Fatalf("got %d groups, want 1", len(groups))
+	}
+	if !strings.Contains(groups[0].Err, derivedTemplateNote) {
+		t.Fatalf("Err=%q, want the per-agent note", groups[0].Err)
+	}
+	if groups[0].Locator != "" {
+		t.Fatalf("Locator=%q, want none — a shared selector must not pick a list", groups[0].Locator)
+	}
+}
+
+// TestTaskSourceLocationNamesTheProvider: every surface listing sources must
+// render WHERE the list lives through this, never Source.Path — which under a
+// remote provider is a bare file name, and for a derived source is empty, so
+// a raw Path renders as a blank column that reads as "unconfigured" for the
+// most ordinary gist setup there is.
+func TestTaskSourceLocationNamesTheProvider(t *testing.T) {
+	gist := derivedGistCfg(t, "brave-otter")
+	if got := frontend.TaskSourceLocation(gist, gist.TaskSources[0]); !strings.Contains(got, "github_gist") {
+		t.Errorf("derived gist source rendered %q, want the provider named", got)
+	}
+	explicit := config.TaskSource{Agent: "brave-otter", Path: "shared.md"}
+	gist.TaskSources = []config.TaskSource{explicit}
+	got := frontend.TaskSourceLocation(gist, explicit)
+	if !strings.Contains(got, "shared.md") || !strings.Contains(got, "github_gist") {
+		t.Errorf("explicit gist source rendered %q, want the file and the provider", got)
+	}
+	// A local source still reads as the plain path the operator wrote.
+	local := config.Config{TaskSources: []config.TaskSource{{Agent: "x", Path: "/docs/tasks.md"}}}
+	if got := frontend.TaskSourceLocation(local, local.TaskSources[0]); got != "/docs/tasks.md" {
+		t.Errorf("local source rendered %q, want the bare path", got)
 	}
 }

@@ -1540,7 +1540,11 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		if ws == "" {
 			ws = "*"
 		}
-		label := fmt.Sprintf("task-source #%d  agent=%s ws=%s  %s", i, sel, ws, src.Path)
+		// Never src.Path: under a remote provider that is a bare file name, or
+		// empty for a derived source — an empty column where the operator
+		// looks to confirm their gist provider took effect.
+		label := fmt.Sprintf("task-source #%d  agent=%s ws=%s  %s", i, sel, ws,
+			frontend.TaskSourceLocation(cfg, src))
 		if src.NextTaskTemplate != "" {
 			label += fmt.Sprintf("  template=%q", src.NextTaskTemplate)
 		}

@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
@@ -107,16 +108,28 @@ const cwdTTL = 20 * time.Second
 // realistic live pane count, so a normal session never sweeps at all.
 const cwdCacheMax = 256
 
-// nudge wakes the daemon; a failed nudge is surfaced but non-fatal (the
-// kill switch is read every tick regardless).
-func (a *App) nudge(ctx context.Context, kind control.Kind) error {
+// nudge wakes the daemon so it re-reads what the caller just persisted. It
+// NEVER fails the caller's operation, and so returns nothing.
+//
+// Every nudge in this package follows a completed write — config saved, rule
+// deleted, index rebuilt — and only asks a running daemon to notice it sooner.
+// When no daemon is listening there is nothing to notice: the next start reads
+// config and reconciles the index anyway. Returning an error here made
+// `hap config …` on a stopped daemon exit 1 and print ONLY "daemon nudge
+// failed" while the write had in fact succeeded — an operator setting up
+// config before starting the daemon (the ordinary first-run order) saw every
+// command fail and could re-run it, double-adding sources.
+//
+// The failure is logged rather than printed: this is shared with the TUI,
+// where writing to stderr mid-render corrupts the screen. Daemon health is
+// `hap status`'s job, and it reports it precisely.
+func (a *App) nudge(ctx context.Context, kind control.Kind) {
 	if a.ControlPath == "" {
-		return nil
+		return
 	}
 	if err := control.Nudge(ctx, a.ControlPath, kind); err != nil {
-		return fmt.Errorf("daemon nudge failed (daemon not running?): %w", err)
+		slog.Debug("daemon nudge failed (no daemon listening?)", "kind", kind, "error", err)
 	}
-	return nil
 }
 
 // confirmationWeight resolves the operator-confirmation boost for display-side
@@ -404,7 +417,8 @@ func (a *App) RequestReembed(ctx context.Context) error {
 			return fmt.Errorf("daemon not running — run: hap signatures reembed")
 		}
 	}
-	return a.nudge(ctx, control.KindReembed)
+	a.nudge(ctx, control.KindReembed)
+	return nil
 }
 
 // ReembedStandalone re-embeds stored signatures in this process. Only safe
@@ -453,10 +467,9 @@ func (a *App) ReembedStandalone(ctx context.Context, progress reembed.RowFunc) (
 		}
 		return res, fmt.Errorf("embedding model unavailable, nothing re-embedded: %w", res.WarmErr)
 	}
-	// Best-effort: if a daemon appeared mid-run, have it reload the index.
-	if nudgeErr := a.nudge(ctx, control.KindReembed); nudgeErr != nil {
-		_ = nudgeErr // no daemon to pick it up; the next start reconciles
-	}
+	// If a daemon appeared mid-run, have it reload the index; when none is
+	// listening the next start reconciles.
+	a.nudge(ctx, control.KindReembed)
 	return res, nil
 }
 
@@ -487,7 +500,8 @@ func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
 	if err != nil {
 		return err
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // SetAgentDisabled changes whether HAP may perform autonomous work for an
@@ -514,7 +528,8 @@ func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool
 	if err != nil {
 		return err
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // CaptureAgent asks the daemon to re-run the normal attention pipeline for a
@@ -659,7 +674,8 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		}
 		markSent()
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // ErrSuggestionStaleAgentBusy is returned by a confirm+send (send=true) of a
@@ -900,7 +916,8 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 			}
 		}
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // errTaskCapExceeded flags a refusal to add generated tasks because the
@@ -1369,7 +1386,8 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 			}
 		}
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // addTaskSourceIfAbsent registers a task list for an agent, skipping the append
@@ -1427,6 +1445,15 @@ func (a *App) addTaskSourceIfAbsent(ctx context.Context, agentID, agentType, nam
 
 // taskSourceLabel renders where a source's list lives, for operator-facing
 // text. Under a remote provider a bare Path means nothing on its own.
+// TaskSourceLocation renders where a source's list lives, for any surface
+// listing sources. Under a remote provider a bare Path means nothing on its
+// own — and a DERIVED source has none at all, so a raw Path renders as an
+// empty column that reads as "unconfigured" for the most ordinary gist setup
+// there is. Every listing must therefore go through this, never Source.Path.
+func TaskSourceLocation(cfg config.Config, src config.TaskSource) string {
+	return taskSourceLabel(cfg, src)
+}
+
 func taskSourceLabel(cfg config.Config, src config.TaskSource) string {
 	p := cfg.ResolveProvider(src)
 	if !p.Remote() {
@@ -1616,7 +1643,8 @@ func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) e
 	if err := config.Save(a.ConfigPath, cfg); err != nil {
 		return err
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // ConfigFieldDef describes one scalar config field: its SetField key and
@@ -3461,7 +3489,7 @@ func (a *App) TaskGroups(cfg config.Config, st Status) []TaskGroup {
 		g := TaskGroup{Source: src, Index: i}
 		l, err := a.resolveSourceList(cfg, src, "")
 		if errors.Is(err, tasklocator.ErrAgentNameRequired) {
-			if name, ok := soleLiveMatch(cfg, src, st); ok {
+			if name, ok := derivedListAgent(cfg, src, st); ok {
 				l, err = a.resolveSourceList(cfg, src, name)
 			}
 		}
@@ -3523,6 +3551,59 @@ func SourceMatchesAgent(cfg config.Config, src config.TaskSource, st Status, a d
 		return false
 	}
 	return true
+}
+
+// derivedListAgent resolves the agent name a DERIVED source's single list is
+// built from, for a surface that enumerates sources rather than agents.
+//
+// Two ways it can be known, and the second is not a weaker guess than the
+// first — it is what `hap task <name>` already does:
+//
+//   - exactly one LIVE agent matches the source's selectors, so that agent's
+//     list is the source's list right now (this also disambiguates a TYPE or
+//     workspace selector, which several agents could share);
+//   - no live agent matches at all, but the source names an agent SELECTOR.
+//     Then the selector is the only agent this source can ever feed, and the
+//     derived name is a pure function of it — no liveness needed. Without
+//     this, an agent's own task list vanished from the TUI the moment its
+//     pane closed, while `hap task <name> list` kept printing it: the same
+//     config, the same list, two different answers.
+//
+// SEVERAL live matches stays unresolved on purpose: those agents genuinely
+// have one list each, and picking any of them would show (and let the
+// operator mutate) another agent's work.
+func derivedListAgent(cfg config.Config, src config.TaskSource, st Status) (string, bool) {
+	if name, ok := soleLiveMatch(cfg, src, st); ok {
+		return name, true
+	}
+	if src.Agent == "" || liveMatchCount(cfg, src, st) > 0 {
+		return "", false
+	}
+	// Sanitized by the locator, exactly as it is for a live agent's name.
+	return src.Agent, true
+}
+
+// liveMatchCount counts the live agents a source's selectors match. A count of
+// 0 with AgentsKnown false means "unknown", which callers must not read as
+// "none" — hence the pairing with soleLiveMatch, which refuses on that.
+func liveMatchCount(cfg config.Config, src config.TaskSource, st Status) int {
+	if !st.AgentsKnown {
+		// Unknown, so treat as "some may match": the caller must not conclude
+		// this source feeds only its named selector.
+		return 1
+	}
+	n := 0
+	seen := map[string]bool{}
+	for _, a := range st.MonitoredAgents {
+		if seen[a.AgentID] {
+			continue
+		}
+		seen[a.AgentID] = true
+		if SourceMatchesAgent(cfg, src, st, a) {
+			n++
+		}
+	}
+	return n
 }
 
 // soleLiveMatch returns the short name of the one live agent a source's
@@ -3707,7 +3788,7 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 	}
 	limit := a.taskSourceLimit(agent, p)
 	newIndex := 0
-	items, err := a.mutateTask(p, func(content string) (string, error) {
+	add := func(content string) (string, error) {
 		// Checked inside the lock (like expectTaskText) so a racing add cannot
 		// slip the count over the cap. limit == 0 means no cap (the file is
 		// not a registered task source).
@@ -3726,8 +3807,47 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 		out, idx, e := domain.AppendChecklistItem(content, domain.EncodeTaskNewlines(strings.TrimSpace(text)))
 		newIndex = idx
 		return out, e
-	})
+	}
+	items, err := a.mutateTask(p, add)
+	// A CONFIGURED source whose list does not exist yet is created here, then
+	// the add is retried. `add` is the one op that creates content, and for a
+	// remote list it is the ONLY way to create one: there is no file for the
+	// operator to touch, and hap's own hints (the TUI's add refusal, the
+	// remote task-management hints) send them to this exact command. Without
+	// this, a fresh gist-backed source is a deadlock — the list is created
+	// only by the daemon's first hand-out, which cannot happen until the list
+	// has a task in it.
+	//
+	// Scoped to a configured source on purpose: --path keeps failing loudly,
+	// because there the name is a path the caller typed and a typo must not
+	// silently mint an empty checklist somewhere else (ports.EnsureCreator's
+	// standing rule). A configured source's locator was validated when the
+	// source was added, so it is not a typo.
+	if err != nil && path == "" && agent != "" && errors.Is(err, fs.ErrNotExist) {
+		cfg, cerr := a.Config()
+		if cerr != nil {
+			return nil, 0, err
+		}
+		if _, eerr := a.ensureList(context.Background(), cfg, p, newListHeader(agent)); eerr != nil {
+			// Report the ORIGINAL missing-list error: the create is the
+			// remedy, not the operation, and its failure (no such gist, no
+			// credentials) is already described by the read that failed.
+			return nil, 0, err
+		}
+		newIndex = 0
+		items, err = a.mutateTask(p, add)
+	}
 	return items, newIndex, err
+}
+
+// newListHeader is the initial content for a task list hap creates on demand,
+// matching the generated-task bootstrap's shape. An index selector names a
+// SOURCE rather than an agent, so it gets the untitled header.
+func newListHeader(agent string) string {
+	if _, isIndex := domain.ParseTaskSourceIndexRef(agent); isIndex || agent == "" {
+		return "# Tasks\n\n"
+	}
+	return "# Tasks for " + agent + "\n\n"
 }
 
 // guardedMutation wraps a checklist mutation with the optional expected-text
@@ -4118,7 +4238,8 @@ func (a *App) DeleteSignature(ctx context.Context, prefix string) (string, int64
 	if err != nil {
 		return "", 0, err
 	}
-	return sig, decisions, a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return sig, decisions, nil
 }
 
 // ResetSignatureGraduation resolves the prefix and returns a graduated
@@ -4152,7 +4273,8 @@ func (a *App) ResetSignatureGraduation(ctx context.Context, prefix string) (stri
 	if err := a.Store.UpsertSignature(ctx, reset); err != nil {
 		return "", err
 	}
-	return sig, a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return sig, nil
 }
 
 // ClearData resets learned history and audit data (DR-004).
@@ -4160,7 +4282,8 @@ func (a *App) ClearData(ctx context.Context) error {
 	if err := a.Store.ClearLearnedData(ctx); err != nil {
 		return err
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // envFileValue renders a configured `.env` path for the config field
