@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -83,9 +84,12 @@ func update(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	}
 	// Name the target up front: the install output is herdr's, not ours, so
 	// without this the operator cannot tell what version they are getting.
+	// "newest known" is a hedge, not sloppiness — the install reads main's
+	// manifest while this line reads GitHub's releases, and for the ~15 minutes
+	// between a bump merge and its release publishing the two disagree.
 	latest := latestKnownVersion(ctx, app)
 	if latest != "" {
-		fmt.Fprintf(out, "installing %s (current: %s)\n", latest, buildinfo.Label())
+		fmt.Fprintf(out, "installing the latest release (newest known: %s, current: %s)\n", latest, buildinfo.Label())
 	} else {
 		fmt.Fprintf(out, "installing the latest release (current: %s)\n", buildinfo.Label())
 	}
@@ -94,13 +98,61 @@ func update(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	if err := updateRunner(ctx, out); err != nil {
 		return err
 	}
-	if latest != "" {
-		fmt.Fprintf(out, "\ninstalled %s\n", latest)
+	// Report what actually landed, not what was expected: install.sh falls
+	// back to the newest release WITH assets when the manifest's version has
+	// not published yet, so the installed binary is the only honest source.
+	installed := installedVersion(ctx)
+	if installed != "" {
+		fmt.Fprintf(out, "\ninstalled %s\n", installed)
+		if updatecheck.IsNewer(installed, latest) {
+			fmt.Fprintf(out, "note: %s exists but its assets were not available yet — run `hap update` again in a few minutes to get it\n", latest)
+		}
 	} else {
 		fmt.Fprintln(out, "\ninstall finished")
 	}
 	printEnsureStep(out)
 	return nil
+}
+
+// installedVersion reads the version back from the binary the install left
+// behind. A var so tests substitute a fake instead of executing anything.
+var installedVersion = readInstalledVersion
+
+// readInstalledVersion runs the newly installed binary's `--version` and
+// parses the release out of it. Every failure returns "" — the caller then
+// says "install finished" rather than naming a version it cannot prove.
+func readInstalledVersion(ctx context.Context) string {
+	// The same structural guarantee as runHerdrInstall: no unit test — in any
+	// package — ever executes whatever binary the host's herdr registry names.
+	if testing.Testing() {
+		return ""
+	}
+	bin := installedBinary()
+	if bin == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	raw, err := exec.CommandContext(ctx, bin, "--version").Output()
+	if err != nil {
+		return ""
+	}
+	return versionFromOutput(string(raw))
+}
+
+// versionFromOutput extracts the release from `hap --version` output
+// ("hap (herd-auto-prompter) v0.6.5"). Only a release version is reported:
+// a dev build's stamp would make "installed dev-…" read as a malfunction.
+func versionFromOutput(s string) string {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return ""
+	}
+	v := fields[len(fields)-1]
+	if !updatecheck.IsRelease(v) {
+		return ""
+	}
+	return buildinfo.LabelOf(v)
 }
 
 // printEnsureStep names the binary that must run `daemon --ensure`.
@@ -132,29 +184,26 @@ func sameAsPathHap(bin string) bool {
 
 // hasFlag reports whether args carry the given flag.
 func hasFlag(args []string, flag string) bool {
-	for _, a := range args {
-		if a == flag {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(args, flag)
 }
 
-// latestKnownVersion resolves the release being installed: the cached check
-// first, then one live check. It is advisory — an unknown version only costs a
-// vaguer message, never the upgrade.
+// latestKnownVersion resolves the newest release GitHub knows of: one live
+// check first, falling back to the cached record only when the fetch fails.
+// The operator asked to update NOW and the install is about to spend minutes
+// downloading, so the 5s fetch is free — while a cached answer can be hours
+// stale and name the release BEFORE the one being installed. It is advisory —
+// an unknown version only costs a vaguer message, never the upgrade.
 func latestKnownVersion(ctx context.Context, app *frontend.App) string {
 	if app == nil {
 		return ""
+	}
+	if status, err := app.CheckForUpdate(ctx); err == nil && updatecheck.IsRelease(status.Latest) {
+		return status.Latest
 	}
 	if app.StateDir != "" {
 		if st, ok := updatecheck.Read(app.StateDir); ok && updatecheck.IsRelease(st.LatestVersion) {
 			return st.LatestVersion
 		}
 	}
-	status, err := app.CheckForUpdate(ctx)
-	if err != nil {
-		return ""
-	}
-	return status.Latest
+	return ""
 }

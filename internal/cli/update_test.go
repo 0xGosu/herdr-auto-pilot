@@ -50,6 +50,26 @@ func updateTestApp(t *testing.T, cached string) *frontend.App {
 	}
 }
 
+// updateTestAppLive is updateTestApp with a WORKING release fetch, for the
+// cases that prove the live check outranks whatever the cache says.
+func updateTestAppLive(t *testing.T, cached, live string) *frontend.App {
+	t.Helper()
+	app := updateTestApp(t, cached)
+	app.FetchLatestVersion = func(context.Context) (string, error) {
+		return live, nil
+	}
+	return app
+}
+
+// stubInstalledVersion swaps the post-install version read-back for a fake, so
+// no test executes whatever binary the host's herdr registry names.
+func stubInstalledVersion(t *testing.T, v string) {
+	t.Helper()
+	orig := installedVersion
+	t.Cleanup(func() { installedVersion = orig })
+	installedVersion = func(context.Context) string { return v }
+}
+
 // stampRelease makes this binary look like a published release, which is what
 // `hap update` requires before it will install anything.
 func stampRelease(t *testing.T, v string) {
@@ -239,6 +259,138 @@ func TestUpdateEnsureStepFallsBackToPlainCommand(t *testing.T) {
 				t.Errorf("expected the plain follow-up command:\n%s", out.String())
 			}
 		})
+	}
+}
+
+// TestUpdateLiveCheckOutranksStaleCache is the fix for the v0.6.4/v0.6.5
+// mismatch: the cached record can predate a release that published minutes
+// ago, so a successful live fetch must name the version — the cache is only
+// the fallback for a fetch that fails.
+func TestUpdateLiveCheckOutranksStaleCache(t *testing.T) {
+	stampRelease(t, "v0.6.4")
+	stubRunner(t, nil)
+	app := updateTestAppLive(t, "v0.6.4", "v0.6.5")
+
+	var out bytes.Buffer
+	if err := update(context.Background(), app, &out, nil); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !strings.Contains(out.String(), "newest known: v0.6.5") {
+		t.Errorf("live check did not outrank the stale cache:\n%s", out.String())
+	}
+	// The successful check also refreshes the record, so the next reader
+	// (the TUI header) stops naming the stale version too.
+	if st, ok := updatecheck.Read(app.StateDir); !ok || st.LatestVersion != "v0.6.5" {
+		t.Errorf("cache not refreshed by the live check: %+v (ok=%v)", st, ok)
+	}
+}
+
+// TestUpdateFallsBackToCacheWhenFetchFails keeps the message useful offline:
+// a dead network costs freshness, never the version hint entirely.
+func TestUpdateFallsBackToCacheWhenFetchFails(t *testing.T) {
+	stampRelease(t, "v0.5.1")
+	stubRunner(t, nil)
+	var out bytes.Buffer
+	// updateTestApp's fetch always errors, so the cache is all there is.
+	if err := update(context.Background(), updateTestApp(t, "v0.5.2"), &out, nil); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !strings.Contains(out.String(), "newest known: v0.5.2") {
+		t.Errorf("failed fetch did not fall back to the cached version:\n%s", out.String())
+	}
+}
+
+// TestUpdateReportsTheVersionThatActuallyInstalled pins the closing line to
+// the installed binary's own report, not to the expectation printed up front.
+func TestUpdateReportsTheVersionThatActuallyInstalled(t *testing.T) {
+	stampRelease(t, "v0.6.4")
+	stubRunner(t, nil)
+	stubInstalledVersion(t, "v0.6.5")
+
+	var out bytes.Buffer
+	if err := update(context.Background(), updateTestAppLive(t, "", "v0.6.5"), &out, nil); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "installed v0.6.5") {
+		t.Errorf("closing line does not report the read-back version:\n%s", got)
+	}
+	if strings.Contains(got, "note:") {
+		t.Errorf("expected no asset-fallback note when installed == latest:\n%s", got)
+	}
+}
+
+// TestUpdateAssetFallbackNamesWhatLanded covers the publish gap: the checkout's
+// manifest names a release whose assets have not published, install.sh falls
+// back to the previous release's binaries, and the closing line must report
+// THAT version — plus a note that the newer one is worth a retry.
+func TestUpdateAssetFallbackNamesWhatLanded(t *testing.T) {
+	stampRelease(t, "v0.6.3")
+	stubRunner(t, nil)
+	stubInstalledVersion(t, "v0.6.4")
+
+	var out bytes.Buffer
+	if err := update(context.Background(), updateTestAppLive(t, "", "v0.6.5"), &out, nil); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "installed v0.6.4") {
+		t.Errorf("closing line does not report what actually landed:\n%s", got)
+	}
+	if !strings.Contains(got, "note: v0.6.5") {
+		t.Errorf("missing the retry note naming the release that was expected:\n%s", got)
+	}
+}
+
+// TestUpdateUnreadableInstalledVersionStaysVague keeps the old honest default:
+// a version that cannot be read back is never guessed at.
+func TestUpdateUnreadableInstalledVersionStaysVague(t *testing.T) {
+	stampRelease(t, "v0.6.4")
+	stubRunner(t, nil)
+	stubInstalledVersion(t, "")
+
+	var out bytes.Buffer
+	if err := update(context.Background(), updateTestAppLive(t, "", "v0.6.5"), &out, nil); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "install finished") {
+		t.Errorf("unreadable version did not fall back to the vague line:\n%s", got)
+	}
+	if strings.Contains(got, "installed v") {
+		t.Errorf("closing line names a version nothing proved:\n%s", got)
+	}
+}
+
+// TestVersionFromOutput pins the parse against the one-line `hap --version`
+// format, and refuses anything that is not a release version.
+func TestVersionFromOutput(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"release build", "hap (herd-auto-prompter) v0.6.5\n", "v0.6.5"},
+		{"bare semver gets the v prefix", "hap (herd-auto-prompter) 0.6.5\n", "v0.6.5"},
+		{"dev build refused", "hap (herd-auto-prompter) dev-20260812042612\n", ""},
+		{"unstamped dev refused", "hap (herd-auto-prompter) dev\n", ""},
+		{"empty output", "", ""},
+		{"garbage refused", "usage: hap <command>", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := versionFromOutput(tc.in); got != tc.want {
+				t.Errorf("versionFromOutput(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReadInstalledVersionRefusesUnderTest is the structural guarantee that no
+// unit test ever executes whatever binary the host's herdr registry names.
+func TestReadInstalledVersionRefusesUnderTest(t *testing.T) {
+	if got := readInstalledVersion(context.Background()); got != "" {
+		t.Errorf("readInstalledVersion under `go test` = %q, want refusal", got)
 	}
 }
 
