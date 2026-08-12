@@ -6245,9 +6245,13 @@ func TestTaskGroupsDerivedSourceResolvesByItsNamedSelector(t *testing.T) {
 	app, _ := testApp(t)
 	cfg := derivedGistCfg(t, "brave-otter")
 
-	// No live agents at all — and the listing is KNOWN to be empty, which is
-	// what separates this from a failed agent query.
-	groups := app.TaskGroups(cfg, frontend.Status{AgentsKnown: true})
+	// No live agents at all — the agent's pane has closed — but hap has seen
+	// it before, so the registry still names it. That registry entry is the
+	// evidence the selector is an agent NAME rather than an agent type.
+	groups := app.TaskGroups(cfg, frontend.Status{
+		AgentsKnown: true,
+		AgentNames:  map[string]string{"t9": "brave-otter"},
+	})
 	if len(groups) != 1 {
 		t.Fatalf("got %d groups, want 1", len(groups))
 	}
@@ -6257,6 +6261,30 @@ func TestTaskGroupsDerivedSourceResolvesByItsNamedSelector(t *testing.T) {
 	}
 	if strings.Contains(groups[0].Err, derivedTemplateNote) {
 		t.Errorf("Err=%q still shows the per-agent note for a named selector", groups[0].Err)
+	}
+}
+
+// TestTaskGroupsDerivedSourceTypeSelectorStaysUnresolvedWithNothingLive: a
+// selector is matched against an agent's id, TYPE or name, and herdr agent
+// types are free-form strings, so with nothing live hap cannot tell a type
+// from a name by inspection. Resolving a type to "<type>.md" would show — and
+// let an operator fill — a list no hand-out ever reads, so the name registry
+// has to say the selector is an agent before it resolves.
+func TestTaskGroupsDerivedSourceTypeSelectorStaysUnresolvedWithNothingLive(t *testing.T) {
+	app, _ := testApp(t)
+	groups := app.TaskGroups(derivedGistCfg(t, "claude"), frontend.Status{
+		AgentsKnown: true,
+		// Registered agents exist, but none is named "claude".
+		AgentNames: map[string]string{"t1": "brave-otter"},
+	})
+	if len(groups) != 1 {
+		t.Fatalf("got %d groups, want 1", len(groups))
+	}
+	if groups[0].Locator != "" {
+		t.Fatalf("Locator=%q, want none — a bare agent TYPE names no single list", groups[0].Locator)
+	}
+	if !strings.Contains(groups[0].Err, derivedTemplateNote) {
+		t.Fatalf("Err=%q, want the per-agent note", groups[0].Err)
 	}
 }
 
@@ -6332,5 +6360,64 @@ func TestSetFieldReportsWhetherADaemonTookTheReload(t *testing.T) {
 	}
 	if cfg.Learning.GraduationN != 4 {
 		t.Errorf("graduation_n = %d, want the value saved despite no daemon", cfg.Learning.GraduationN)
+	}
+}
+
+// TestAddTaskCreatesFromTheTUIsLocatorShapedCall: the TUI adds by LOCATOR
+// (AddTask("", <locator>, text)) because its rows carry one, so a create gated
+// on the argument shape (agent != "") would have worked from the CLI only —
+// while the TUI's own refusal message is one of the things that sends an
+// operator to this feature. The gate is therefore "this locator belongs to a
+// configured source", which both surfaces satisfy.
+func TestAddTaskCreatesFromTheTUIsLocatorShapedCall(t *testing.T) {
+	app, st := testApp(t)
+	// The registry names the agent: for a DERIVED source that is the evidence
+	// the selector is an agent rather than an agent type.
+	if _, err := st.EnsureAgentName(context.Background(), "w1:p1"); err != nil {
+		t.Fatal(err)
+	}
+	names, err := st.AgentNames(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := names["w1:p1"]
+	if name == "" {
+		t.Fatal("expected a minted agent name")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tasks.md")
+	if err := app.AddTaskSource(context.Background(), name, "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+	// No agent argument, the resolved locator as `path` — exactly how the
+	// Tasks tab calls it.
+	if _, _, err := app.AddTask("", path, "from the TUI"); err != nil {
+		t.Fatalf("a locator-shaped add on a configured source must create the list: %v", err)
+	}
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("the list should exist now: %v", rerr)
+	}
+	if !strings.Contains(string(data), "- [ ] from the TUI") {
+		t.Errorf("created list = %q, want the added task", data)
+	}
+}
+
+// TestAddTaskRefusesToCreateADerivedListForAnUnknownSelector: a derived source
+// resolves per AGENT, so creating "<selector>.md" for a selector that names no
+// agent hap has seen would queue work into a list no hand-out ever reads —
+// silently, which is worse than the error it replaces.
+func TestAddTaskRefusesToCreateADerivedListForAnUnknownSelector(t *testing.T) {
+	app, _ := testApp(t)
+	// A derived LOCAL source: no path of its own, so its list is per agent.
+	dir := t.TempDir()
+	if err := app.AddTaskSource(context.Background(), "claude", "", filepath.Join(dir, "claude.md"), ""); err != nil {
+		t.Fatal(err)
+	}
+	// Explicit-file sources are exempt — they name one list for everyone they
+	// match — so this one MUST create.
+	if _, _, err := app.AddTask("claude", "", "explicit file is fine"); err != nil {
+		t.Fatalf("an explicit-file source needs no name evidence: %v", err)
 	}
 }

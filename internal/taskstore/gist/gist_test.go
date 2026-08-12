@@ -45,6 +45,12 @@ type fakeGist struct {
 	// patchBodies records each PATCH's decoded files map.
 	patchBodies []map[string]any
 
+	// hideAfterPatch counts GETs that still omit a just-PATCHed file, which is
+	// how the real API behaves: gist reads are not read-after-write
+	// consistent, so a GET right after a create can miss it.
+	hideAfterPatch int
+	hidden         map[string]bool
+
 	// getStatus / patchStatus, when non-zero, make that verb fail.
 	getStatus, patchStatus int
 	getBody, patchBody     string
@@ -112,6 +118,12 @@ func (f *fakeGist) handler() http.Handler {
 					}
 					if c, ok := m["content"].(string); ok {
 						f.files[name] = c
+						if f.hideAfterPatch > 0 {
+							if f.hidden == nil {
+								f.hidden = map[string]bool{}
+							}
+							f.hidden[name] = true
+						}
 						delete(f.sizes, name)
 					}
 				}
@@ -134,6 +146,14 @@ func (f *fakeGist) writeGist(w http.ResponseWriter) {
 	defer f.mu.Unlock()
 	files := map[string]any{}
 	for name, content := range f.files {
+		// Simulate the API's read-after-write lag for a file we just wrote.
+		if f.hideAfterPatch > 0 && f.hidden[name] {
+			f.hideAfterPatch--
+			if f.hideAfterPatch == 0 {
+				f.hidden = nil
+			}
+			continue
+		}
 		size := len(content)
 		if s, ok := f.sizes[name]; ok {
 			size = s
@@ -643,5 +663,46 @@ func TestEnvFileTokenSource(t *testing.T) {
 				t.Errorf("token = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGistReadSettlesAfterOurOwnWrite: gist reads are NOT read-after-write
+// consistent — a GET issued right after the PATCH that created a file can
+// still report it absent (measured live against api.github.com: one miss in
+// three create-then-GET rounds). "Absent" is load-bearing here: Read turns it
+// into fs.ErrNotExist and Ensure turns it into a create, so a stale miss broke
+// create-then-use — the CLI's create-on-demand add and the daemon's first
+// hand-out both write a list and immediately read it back.
+func TestGistReadSettlesAfterOurOwnWrite(t *testing.T) {
+	f := newFakeGist(nil)
+	f.hideAfterPatch = 2 // the next two GETs pretend the new file is not there
+	s := newStore(t, f)
+
+	created, err := s.Ensure(context.Background(), locator(testFile), "# Tasks\n")
+	if err != nil || !created {
+		t.Fatalf("Ensure: created=%v err=%v", created, err)
+	}
+	// Immediately after our own write: the first reads miss, and the store
+	// must re-read rather than report the list absent.
+	got, err := s.Read(context.Background(), locator(testFile))
+	if err != nil {
+		t.Fatalf("a read right after our own create must settle, got %v", err)
+	}
+	if string(got) != "# Tasks\n" {
+		t.Errorf("content = %q, want the created list", got)
+	}
+}
+
+// TestGistReadDoesNotWaitForAFileWeNeverWrote: the settle re-read is scoped to
+// files THIS process wrote. A name that never existed — a typo — must fail on
+// the first answer, as it always did, rather than costing a backoff.
+func TestGistReadDoesNotWaitForAFileWeNeverWrote(t *testing.T) {
+	f := newFakeGist(map[string]string{testFile: "- [ ] a\n"})
+	s := newStore(t, f)
+	if _, err := s.Read(context.Background(), locator("typo.md")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("err = %v, want fs.ErrNotExist", err)
+	}
+	if f.gets != 1 {
+		t.Errorf("GETs = %d, want exactly 1 — a never-written file must not be re-read", f.gets)
 	}
 }

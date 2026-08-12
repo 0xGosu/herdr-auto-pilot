@@ -1448,8 +1448,6 @@ func (a *App) addTaskSourceIfAbsent(ctx context.Context, agentID, agentType, nam
 	})
 }
 
-// taskSourceLabel renders where a source's list lives, for operator-facing
-// text. Under a remote provider a bare Path means nothing on its own.
 // TaskSourceLocation renders where a source's list lives, for any surface
 // listing sources. Under a remote provider a bare Path means nothing on its
 // own — and a DERIVED source has none at all, so a raw Path renders as an
@@ -1459,6 +1457,8 @@ func TaskSourceLocation(cfg config.Config, src config.TaskSource) string {
 	return taskSourceLabel(cfg, src)
 }
 
+// taskSourceLabel renders where a source's list lives, for operator-facing
+// text. Under a remote provider a bare Path means nothing on its own.
 func taskSourceLabel(cfg config.Config, src config.TaskSource) string {
 	p := cfg.ResolveProvider(src)
 	if !p.Remote() {
@@ -3592,8 +3592,32 @@ func derivedListAgent(cfg config.Config, src config.TaskSource, st Status) (stri
 	if src.Agent == "" || liveMatchCount(cfg, src, st) > 0 {
 		return "", false
 	}
+	// EVIDENCE that the selector is a NAME, not an agent type. A selector is
+	// matched against an agent's id, type OR name, and with nothing live
+	// hap cannot tell those apart from config alone — herdr agent types are
+	// free-form strings, so there is no list to check against. A type-scoped
+	// source genuinely has one list PER agent, and resolving it to
+	// "<type>.md" would show, and let an operator fill, a list no hand-out
+	// ever reads. The name registry is the evidence: every agent hap has seen
+	// is in it, so a source scoped to an agent that has ever run resolves,
+	// while a bare type does not.
+	if !knownAgentName(st, src.Agent) {
+		return "", false
+	}
 	// Sanitized by the locator, exactly as it is for a live agent's name.
 	return src.Agent, true
+}
+
+// knownAgentName reports whether the name registry has ever recorded this
+// short name — including for agents that are not running now, which is the
+// whole point: a closed pane must not hide its agent's task list.
+func knownAgentName(st Status, name string) bool {
+	for _, known := range st.AgentNames {
+		if known == name {
+			return true
+		}
+	}
+	return false
 }
 
 // liveMatchCount counts the live agents a source's selectors match. A count of
@@ -3831,26 +3855,83 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 	// only by the daemon's first hand-out, which cannot happen until the list
 	// has a task in it.
 	//
-	// Scoped to a configured source on purpose: --path keeps failing loudly,
-	// because there the name is a path the caller typed and a typo must not
-	// silently mint an empty checklist somewhere else (ports.EnsureCreator's
-	// standing rule). A configured source's locator was validated when the
-	// source was added, so it is not a typo.
-	if err != nil && path == "" && agent != "" && errors.Is(err, fs.ErrNotExist) {
-		cfg, cerr := a.Config()
-		if cerr != nil {
-			return nil, 0, err
+	// The gate is "this list belongs to a CONFIGURED source", tested on the
+	// resolved locator — never on the argument shape. The TUI adds by locator
+	// (`AddTask("", <locator>, text)`) because its rows carry one, so a gate
+	// keyed on `agent != ""` would have created lists from the CLI only, while
+	// the TUI — whose own refusal message sends the operator here — kept
+	// failing. A typo'd --path matches no source and so still fails loudly,
+	// which is the rule this scoping exists to keep (ports.EnsureCreator).
+	if err != nil && errors.Is(err, fs.ErrNotExist) {
+		if cfg, cerr := a.Config(); cerr == nil && a.configuredSource(cfg, agent, p) {
+			if _, eerr := a.ensureList(context.Background(), cfg, p, newListHeader(agent)); eerr != nil {
+				// Both errors: the missing list is what the caller asked
+				// about, but a token that can READ a gist and not write it
+				// fails exactly here — reporting only "does not exist" would
+				// hide that hap tried to create it and was refused.
+				return nil, 0, fmt.Errorf("%w (creating it failed: %v)", err, eerr)
+			}
+			newIndex = 0
+			items, err = a.mutateTask(p, add)
 		}
-		if _, eerr := a.ensureList(context.Background(), cfg, p, newListHeader(agent)); eerr != nil {
-			// Report the ORIGINAL missing-list error: the create is the
-			// remedy, not the operation, and its failure (no such gist, no
-			// credentials) is already described by the read that failed.
-			return nil, 0, err
-		}
-		newIndex = 0
-		items, err = a.mutateTask(p, add)
 	}
 	return items, newIndex, err
+}
+
+// configuredSource reports whether a locator is the list of some configured
+// task source — the same locator comparison taskSourceLimit uses to find a
+// source's cap, so "which source is this?" is answered one way everywhere.
+//
+// agent is the selector the caller used, needed because a DERIVED source
+// resolves per agent; an empty one still matches every source that declares
+// its file explicitly, which is what lets the TUI's locator-shaped add reach
+// this at all.
+func (a *App) configuredSource(cfg config.Config, agent, locator string) bool {
+	for _, src := range cfg.TaskSources {
+		if a.sourceLocatorMatches(cfg, src, agent, locator) {
+			// A DERIVED source resolves per agent, so the token has to be an
+			// agent NAME for the created list to be the one a hand-out reads.
+			// A selector can also be an agent TYPE, and "<type>.md" is a list
+			// nothing delivers from — creating it would queue work that never
+			// arrives. Explicit-file sources name one list for everyone they
+			// match, so they need no such evidence.
+			if src.Path == "" && !a.knownAgent(agent) {
+				continue
+			}
+			return true
+		}
+		// A derived source resolves through the agent it was matched for. The
+		// TUI passes no agent, so try the source's own selector too — the same
+		// name TaskGroups resolved the row's locator from, and which it only
+		// resolves for a known agent name.
+		if agent == "" && src.Agent != "" && a.knownAgent(src.Agent) &&
+			a.sourceLocatorMatches(cfg, src, src.Agent, locator) {
+			return true
+		}
+	}
+	return false
+}
+
+// knownAgent reports whether the name registry has ever recorded this short
+// name. It is the evidence that a task-source selector names an AGENT rather
+// than an agent type; see derivedListAgent, which asks the same question of
+// the status snapshot it already holds.
+func (a *App) knownAgent(name string) bool {
+	if name == "" || a.Store == nil {
+		return false
+	}
+	names, err := a.Store.AgentNames(context.Background())
+	if err != nil {
+		// No evidence either way. Refuse: the cost of a wrong yes is a list
+		// nothing delivers from, the cost of a wrong no is one clear error.
+		return false
+	}
+	for _, known := range names {
+		if known == name {
+			return true
+		}
+	}
+	return false
 }
 
 // newListHeader is the initial content for a task list hap creates on demand,

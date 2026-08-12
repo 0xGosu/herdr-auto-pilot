@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/go-github/v90/github"
@@ -67,7 +68,28 @@ type Store struct {
 	// (httptest), because go-github's own baseURL field is unexported and
 	// github.WithURLs is the sole seam.
 	baseURL string
+
+	// wroteMu/wrote record when this process last WROTE each file, because the
+	// gist API is not read-after-write consistent: a GET issued immediately
+	// after the PATCH that created a file can still report the file absent
+	// (measured live 2026-08-12: 1 miss in 3 create-then-GET rounds). Absent
+	// is a load-bearing answer here — it is what Read turns into fs.ErrNotExist
+	// and what Ensure turns into a create — so a stale miss makes
+	// create-then-use fail: the CLI's create-on-demand add, and the daemon's
+	// first hand-out, both write a list and immediately read it back.
+	wroteMu sync.Mutex
+	wrote   map[string]time.Time
 }
+
+// writeSettleWindow is how long after our own write a "file is absent" answer
+// is treated as possibly stale and re-read. Comfortably longer than the lag
+// observed in practice, and it costs nothing on the ordinary path: it is
+// consulted only when a file we wrote reads back as missing.
+const writeSettleWindow = 15 * time.Second
+
+// writeSettleRetries are the re-reads spent inside that window, with a short
+// backoff between them.
+var writeSettleRetries = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, 1 * time.Second}
 
 var (
 	_ ports.TaskStore       = (*Store)(nil)
@@ -153,6 +175,46 @@ func (s *Store) fileOf(locator string) (string, error) {
 // fs.ErrNotExist or into a create. It is returned ONLY when the file list was
 // complete — a truncated list cannot distinguish absent from hidden.
 func (s *Store) fetch(ctx context.Context, file string) (content string, found bool, err error) {
+	content, found, err = s.fetchOnce(ctx, file)
+	// Only a file WE wrote, and only while the write is recent, is re-read: a
+	// file that never existed still reports absent on the first answer, so a
+	// typo'd name fails as fast as it always did.
+	if err != nil || found || !s.recentlyWrote(file) {
+		return content, found, err
+	}
+	for _, backoff := range writeSettleRetries {
+		select {
+		case <-ctx.Done():
+			return "", false, ctx.Err()
+		case <-time.After(backoff):
+		}
+		content, found, err = s.fetchOnce(ctx, file)
+		if err != nil || found {
+			return content, found, err
+		}
+	}
+	return "", false, nil
+}
+
+// recentlyWrote reports whether this process wrote the file inside the settle
+// window, i.e. whether "absent" could be the API lagging our own write.
+func (s *Store) recentlyWrote(file string) bool {
+	s.wroteMu.Lock()
+	defer s.wroteMu.Unlock()
+	at, ok := s.wrote[file]
+	return ok && time.Since(at) < writeSettleWindow
+}
+
+func (s *Store) markWrote(file string) {
+	s.wroteMu.Lock()
+	defer s.wroteMu.Unlock()
+	if s.wrote == nil {
+		s.wrote = map[string]time.Time{}
+	}
+	s.wrote[file] = time.Now()
+}
+
+func (s *Store) fetchOnce(ctx context.Context, file string) (content string, found bool, err error) {
 	c, err := s.client()
 	if err != nil {
 		return "", false, err
@@ -194,6 +256,7 @@ func (s *Store) put(ctx context.Context, file, content string) error {
 	if err != nil {
 		return wrapf(s.gistID, err, "write %q to gist %s", file, shortID(s.gistID))
 	}
+	s.markWrote(file)
 	return nil
 }
 
