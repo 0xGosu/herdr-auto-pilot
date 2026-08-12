@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.8
+
+- Fixed accepting an LLM-generated task escalation with a send under a `github_gist` task source, which failed with `stat gist://…: no such file or directory` after the list had already been created, the source registered and the escalation consumed — leaving the task in the list but never delivered. The send-time reservation was still reading the task list as a local file.
+- Fixed the choice of which of an agent's task sources receives generated tasks when several match: gist-backed candidates were unreadable to that check, so it silently fell back to the first source instead of the one with pending work. A candidate that cannot be resolved is now reported instead of being skipped in silence.
+- Fixed a second confirm for the same agent duplicating its own tasks under a gist source — the agent's own list was mistaken for another source's, and the tasks were appended again without their numbering.
+- Fixed a task left stuck in progress when delivery failed because the operator quit: returning it to pending no longer depends on the cancelled request that killed the delivery.
+
 ## 0.6.7
 
 - Fixed `hap update` naming a stale version: the "installing …" line now does a live release check first and uses the cached record only when the fetch fails, so a cache written before a release published can no longer misname the target.
