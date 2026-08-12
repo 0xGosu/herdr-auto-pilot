@@ -6497,3 +6497,104 @@ func TestTaskCapAppliesToALocatorShapedAdd(t *testing.T) {
 		t.Errorf("error = %v, want the cap refusal", err)
 	}
 }
+
+// TestAddingATaskSourceNeverRenumbersTheExistingOnes: a source's INDEX is a
+// public selector — `hap task 2 …`, the `{task_source_index}` a delivered
+// prompt tells an agent to use, and the number every `hap config task-source`
+// listing and edit takes. So adding one must APPEND: an insert anywhere else
+// silently re-points every selector after it, including commands already sent
+// to an agent. Both write paths are covered, because both are reachable from
+// the operator's surfaces: `AddTaskSource` (CLI `config task-source add` and
+// the TUI Config tab) and the generated-task bootstrap (accepting an LLM task
+// suggestion, which registers a source as a side effect).
+func TestAddingATaskSourceNeverRenumbersTheExistingOnes(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	before := []string{"first", "second", "third"}
+	for _, name := range before {
+		if err := app.AddTaskSource(ctx, name, "", filepath.Join(dir, name+".md"), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertOrder := func(what string, want []string) {
+		t.Helper()
+		cfg, err := app.Config()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cfg.TaskSources) != len(want) {
+			t.Fatalf("%s: %d sources, want %d", what, len(cfg.TaskSources), len(want))
+		}
+		for i, name := range want {
+			if cfg.TaskSources[i].Agent != name {
+				t.Fatalf("%s: index %d is %q, want %q — adding a source renumbered the existing ones",
+					what, i, cfg.TaskSources[i].Agent, name)
+			}
+		}
+	}
+	assertOrder("baseline", before)
+
+	// 1. The config surface (CLI `config task-source add`, TUI Config tab).
+	if err := app.AddTaskSource(ctx, "fourth", "", filepath.Join(dir, "fourth.md"), ""); err != nil {
+		t.Fatal(err)
+	}
+	assertOrder("after config add", append(append([]string{}, before...), "fourth"))
+
+	// 2. An unrelated config write rewrites the whole file; order must survive
+	// the round-trip (Load → edit → Save), not just the append.
+	if _, err := app.SetField(ctx, "learning.graduation_n", "3"); err != nil {
+		t.Fatal(err)
+	}
+	assertOrder("after an unrelated config write", append(append([]string{}, before...), "fourth"))
+}
+
+// TestAcceptingAGeneratedTaskAppendsItsSource: the escalation-accept path
+// registers a task source as a side effect, and it is the one an operator
+// triggers without naming a source at all — so it is the likeliest place for
+// an insert to creep in. It must append like every other surface.
+func TestAcceptingAGeneratedTaskAppendsItsSource(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	// Two sources for OTHER agents, whose indexes must not move.
+	for _, name := range []string{"first", "second"} {
+		if err := app.AddTaskSource(ctx, name, "", filepath.Join(dir, name+".md"), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// An idle escalation carrying an LLM task suggestion, for an agent with no
+	// source of its own — accepting it bootstraps one.
+	app.StateDir = t.TempDir()
+	if _, err := st.EnsureAgentName(ctx, "w9:p1"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w9:p1", AgentType: "claude", Signature: "sig-gen", Trigger: "t",
+		SituationType: domain.SituationIdle, Action: "escalated", Status: "escalated",
+		Suggestion: domain.SuggestTaskPrefix + "write the migration test", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// send=false: the source registration is the part under test, and there is
+	// no live agent to deliver to.
+	if err := app.Confirm(ctx, id, false); err != nil {
+		t.Fatalf("confirm generated task: %v", err)
+	}
+
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 3 {
+		t.Fatalf("got %d sources, want the two originals plus the bootstrapped one", len(cfg.TaskSources))
+	}
+	if cfg.TaskSources[0].Agent != "first" || cfg.TaskSources[1].Agent != "second" {
+		t.Fatalf("existing sources moved: %q, %q — accepting a suggestion renumbered them",
+			cfg.TaskSources[0].Agent, cfg.TaskSources[1].Agent)
+	}
+}
