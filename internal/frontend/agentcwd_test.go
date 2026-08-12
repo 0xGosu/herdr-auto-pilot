@@ -209,10 +209,10 @@ func TestEmbeddingTimeoutFieldsRejectNegatives(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
 	for _, key := range []string{"embedding.embed_timeout_ms", "embedding.warm_timeout_ms"} {
-		if err := app.SetField(ctx, key, "-1"); err == nil {
+		if _, err := app.SetField(ctx, key, "-1"); err == nil {
 			t.Errorf("SetField(%s, -1) was accepted; a negative budget is never valid", key)
 		}
-		if err := app.SetField(ctx, key, "0"); err != nil {
+		if _, err := app.SetField(ctx, key, "0"); err != nil {
 			t.Errorf("SetField(%s, 0) rejected; 0 must restore the default: %v", key, err)
 		}
 	}

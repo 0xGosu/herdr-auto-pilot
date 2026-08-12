@@ -2258,3 +2258,36 @@ func TestSendTaskRowRefusesARegroupedDerivedSource(t *testing.T) {
 		t.Fatalf("message %q, want the staleness refusal", m.message)
 	}
 }
+
+// TestConfigTabTaskSourceRowNamesTheProvider: the Config tab is where an
+// operator confirms their storage provider took effect, and it rendered the
+// raw Source.Path — a bare file name under a gist, and EMPTY for the derived
+// one-list-per-agent shape, which reads as an unconfigured source. It must
+// name where the list actually lives, as `hap config task-source list` does.
+func TestConfigTabTaskSourceRowNamesTheProvider(t *testing.T) {
+	cfg := config.Default()
+	cfg.TaskSourceProvider = config.TaskSourceProvider{
+		Provider:   config.ProviderGitHubGist,
+		EnvFile:    "/etc/hap/task.env",
+		GitHubGist: config.GitHubGist{GistID: "3f2a1b9c"},
+	}
+	cfg.TaskSources = []config.TaskSource{
+		{Agent: "brave-otter"},                    // derived: no path at all
+		{Agent: "calm-badger", Path: "shared.md"}, // explicit gist file
+	}
+	var rows []string
+	for _, it := range buildRuleItems(cfg) {
+		if strings.HasPrefix(it.label, "task-source ") {
+			rows = append(rows, it.label)
+		}
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d task-source rows, want 2: %q", len(rows), rows)
+	}
+	if !strings.Contains(rows[0], "github_gist") {
+		t.Errorf("derived source row %q must name the provider — a blank column reads as unconfigured", rows[0])
+	}
+	if !strings.Contains(rows[1], "shared.md") || !strings.Contains(rows[1], "github_gist") {
+		t.Errorf("explicit source row %q must name the file AND the provider", rows[1])
+	}
+}

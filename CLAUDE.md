@@ -263,6 +263,19 @@ whose manifest carries exactly that version).
   wildcard one is configured, listed, and never read. Secrets are a DISPLAY rule, not an
   exemption: `hap config env` never prints a value and reads it from stdin unless `--value`
   is passed, so a token stays out of shell history and `ps`.
+  **`[[task_sources]]` is the exception to that insert rule, and it inverts it: a new source
+  is always APPENDED.** Its index is a public selector — `hap task 2 …`, the
+  `{task_source_index}` a delivered prompt tells an agent to use, and the number every
+  `hap config task-source` listing, `set` and `remove` takes — so inserting anywhere else
+  silently re-points every selector after it, including commands already sitting in an
+  agent's scrollback. That binds BOTH creating surfaces: `AddTaskSource` (CLI and the TUI
+  Config tab) and `addTaskSourceIfAbsent` (accepting an LLM task suggestion, which registers
+  a source as a side effect). Task sources need no lookup-order insert because they are
+  matched by SELECTOR, not first-match-wins by position. Removal necessarily renumbers what
+  follows, which is why the agent NAME stays the primary selector and the index is the
+  fallback for sources a name cannot address. Keep the paired tests
+  (`TestAddingATaskSourceNeverRenumbersTheExistingOnes` /
+  `TestAcceptingAGeneratedTaskAppendsItsSource`).
 - **Fail safe on the daemon path** — no panics; every error resolves to escalate + audit +
   log. Wrap new handler/adapter calls in `logging.Guard`.
 - **Safety controls are never bypassed** — LLM submissions and learned rules alike are

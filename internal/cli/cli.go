@@ -1315,10 +1315,11 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 			return fmt.Errorf("usage: config set <field> <value> (see: config fields)")
 		}
 		value := strings.Join(args[2:], " ")
-		if err := app.SetField(ctx, args[1], value); err != nil {
+		reloaded, err := app.SetField(ctx, args[1], value)
+		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "%s set to %s (daemon reloaded)\n", args[1], value)
+		fmt.Fprintf(out, "%s set to %s%s\n", args[1], value, reloadNote(reloaded))
 		PrintNextSteps(out, configHints())
 		return nil
 	case "set-threshold":
@@ -1329,10 +1330,11 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		if err != nil {
 			return fmt.Errorf("invalid threshold %q", args[2])
 		}
-		if err := app.SetThreshold(ctx, args[1], v); err != nil {
-			return err
+		reloaded, terr := app.SetThreshold(ctx, args[1], v)
+		if terr != nil {
+			return terr
 		}
-		fmt.Fprintf(out, "threshold %s set to %.2f (daemon reloaded)\n", args[1], v)
+		fmt.Fprintf(out, "threshold %s set to %.2f%s\n", args[1], v, reloadNote(reloaded))
 		PrintNextSteps(out, configHints())
 		return nil
 	}
@@ -2916,4 +2918,16 @@ func clearData(ctx context.Context, app *frontend.App, out io.Writer, args []str
 	}
 	fmt.Fprintln(out, "learned history and audit data cleared")
 	return nil
+}
+
+// reloadNote says whether a running daemon picked the change up. It must never
+// claim a reload that did not happen: a config write succeeds with no daemon
+// listening (the daemon reads config at start), and telling an operator
+// "daemon reloaded" while nothing is running hides exactly the state they are
+// about to be confused by.
+func reloadNote(reloaded bool) string {
+	if reloaded {
+		return " (daemon reloaded)"
+	}
+	return " (saved — no daemon running; it takes effect when the daemon starts)"
 }

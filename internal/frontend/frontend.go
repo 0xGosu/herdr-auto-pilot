@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
@@ -107,16 +108,33 @@ const cwdTTL = 20 * time.Second
 // realistic live pane count, so a normal session never sweeps at all.
 const cwdCacheMax = 256
 
-// nudge wakes the daemon; a failed nudge is surfaced but non-fatal (the
-// kill switch is read every tick regardless).
-func (a *App) nudge(ctx context.Context, kind control.Kind) error {
+// nudge wakes the daemon so it re-reads what the caller just persisted. It
+// NEVER fails the caller's operation, and so returns nothing.
+//
+// Every nudge in this package follows a completed write — config saved, rule
+// deleted, index rebuilt — and only asks a running daemon to notice it sooner.
+// When no daemon is listening there is nothing to notice: the next start reads
+// config and reconciles the index anyway. Returning an error here made
+// `hap config …` on a stopped daemon exit 1 and print ONLY "daemon nudge
+// failed" while the write had in fact succeeded — an operator setting up
+// config before starting the daemon (the ordinary first-run order) saw every
+// command fail and could re-run it, double-adding sources.
+//
+// The failure is logged rather than printed: this is shared with the TUI,
+// where writing to stderr mid-render corrupts the screen. Daemon health is
+// `hap status`'s job, and it reports it precisely.
+// It reports whether a daemon actually took the nudge, which is only for
+// WORDING — a surface that tells the operator "daemon reloaded" must not say
+// so when nothing was listening. Nobody may turn this into a failure.
+func (a *App) nudge(ctx context.Context, kind control.Kind) (delivered bool) {
 	if a.ControlPath == "" {
-		return nil
+		return false
 	}
 	if err := control.Nudge(ctx, a.ControlPath, kind); err != nil {
-		return fmt.Errorf("daemon nudge failed (daemon not running?): %w", err)
+		slog.Debug("daemon nudge failed (no daemon listening?)", "kind", kind, "error", err)
+		return false
 	}
-	return nil
+	return true
 }
 
 // confirmationWeight resolves the operator-confirmation boost for display-side
@@ -145,6 +163,11 @@ type Status struct {
 	AgentsKnown bool
 	// AgentNames maps agent/pane ids to their short names.
 	AgentNames map[string]string
+	// AgentNamesKnown reports that AgentNames actually reflects the registry:
+	// false means the query failed, which is NOT the same as "no agent has
+	// ever been named". A caller deciding something from a name's ABSENCE
+	// must check this first — the same rule AgentsKnown exists for.
+	AgentNamesKnown bool
 	// DisabledAgents contains agent/pane ids whose HAP automation has been
 	// disabled by the operator. They remain visible in MonitoredAgents.
 	DisabledAgents map[string]bool
@@ -218,7 +241,7 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 		}
 	}
 	if names, err := a.Store.AgentNames(ctx); err == nil {
-		st.AgentNames = names
+		st.AgentNames, st.AgentNamesKnown = names, true
 	}
 	if disabled, err := a.Store.DisabledAgents(ctx); err == nil {
 		st.DisabledAgents = disabled
@@ -404,7 +427,8 @@ func (a *App) RequestReembed(ctx context.Context) error {
 			return fmt.Errorf("daemon not running — run: hap signatures reembed")
 		}
 	}
-	return a.nudge(ctx, control.KindReembed)
+	a.nudge(ctx, control.KindReembed)
+	return nil
 }
 
 // ReembedStandalone re-embeds stored signatures in this process. Only safe
@@ -453,10 +477,9 @@ func (a *App) ReembedStandalone(ctx context.Context, progress reembed.RowFunc) (
 		}
 		return res, fmt.Errorf("embedding model unavailable, nothing re-embedded: %w", res.WarmErr)
 	}
-	// Best-effort: if a daemon appeared mid-run, have it reload the index.
-	if nudgeErr := a.nudge(ctx, control.KindReembed); nudgeErr != nil {
-		_ = nudgeErr // no daemon to pick it up; the next start reconciles
-	}
+	// If a daemon appeared mid-run, have it reload the index; when none is
+	// listening the next start reconciles.
+	a.nudge(ctx, control.KindReembed)
 	return res, nil
 }
 
@@ -487,7 +510,8 @@ func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
 	if err != nil {
 		return err
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // SetAgentDisabled changes whether HAP may perform autonomous work for an
@@ -514,7 +538,8 @@ func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool
 	if err != nil {
 		return err
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // CaptureAgent asks the daemon to re-run the normal attention pipeline for a
@@ -659,7 +684,8 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		}
 		markSent()
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // ErrSuggestionStaleAgentBusy is returned by a confirm+send (send=true) of a
@@ -900,7 +926,8 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 			}
 		}
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // errTaskCapExceeded flags a refusal to add generated tasks because the
@@ -1369,7 +1396,8 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 			}
 		}
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // addTaskSourceIfAbsent registers a task list for an agent, skipping the append
@@ -1423,6 +1451,15 @@ func (a *App) addTaskSourceIfAbsent(ctx context.Context, agentID, agentType, nam
 		cfg.TaskSources = append(cfg.TaskSources, src)
 		return nil
 	})
+}
+
+// TaskSourceLocation renders where a source's list lives, for any surface
+// listing sources. Under a remote provider a bare Path means nothing on its
+// own — and a DERIVED source has none at all, so a raw Path renders as an
+// empty column that reads as "unconfigured" for the most ordinary gist setup
+// there is. Every listing must therefore go through this, never Source.Path.
+func TaskSourceLocation(cfg config.Config, src config.TaskSource) string {
+	return taskSourceLabel(cfg, src)
 }
 
 // taskSourceLabel renders where a source's list lives, for operator-facing
@@ -1595,9 +1632,18 @@ func (a *App) Config() (config.Config, error) {
 // front-ends (a long-running TUI plus CLI invocations is a supported
 // combination), so no edit is silently lost to a last-writer-wins race.
 func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) error {
+	_, err := a.updateConfigReloaded(ctx, fn)
+	return err
+}
+
+// updateConfigReloaded is UpdateConfig plus whether a running daemon took the
+// reload, for the surfaces that SAY so. The flag never gates the write: the
+// config is saved either way, and a daemon that was not listening reads it at
+// its next start.
+func (a *App) updateConfigReloaded(ctx context.Context, fn func(*config.Config) error) (bool, error) {
 	unlock, err := lockFile(a.ConfigPath + ".lock")
 	if err != nil {
-		return fmt.Errorf("lock config for editing: %w", err)
+		return false, fmt.Errorf("lock config for editing: %w", err)
 	}
 	defer unlock()
 
@@ -1608,15 +1654,15 @@ func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) e
 	// a.Config().
 	cfg, err := config.Load(a.ConfigPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := fn(&cfg); err != nil {
-		return err
+		return false, err
 	}
 	if err := config.Save(a.ConfigPath, cfg); err != nil {
-		return err
+		return false, err
 	}
-	return a.nudge(ctx, control.KindReload)
+	return a.nudge(ctx, control.KindReload), nil
 }
 
 // ConfigFieldDef describes one scalar config field: its SetField key and
@@ -2077,7 +2123,7 @@ func pathFieldValue(v string) string {
 
 // SetField updates one scalar config field by key, with validation. It
 // backs both the TUI config editor and `config set <key> <value>`.
-func (a *App) SetField(ctx context.Context, key, value string) error {
+func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, err error) {
 	value = strings.TrimSpace(value)
 	setFloat := func(dst *float64) error {
 		v, err := strconv.ParseFloat(value, 64)
@@ -2098,7 +2144,7 @@ func (a *App) SetField(ctx context.Context, key, value string) error {
 		*dst = v
 		return nil
 	}
-	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+	return a.updateConfigReloaded(ctx, func(cfg *config.Config) error {
 		switch key {
 		case "confidence_thresholds.minimum":
 			return setFloat(&cfg.ConfidenceThresholds.Minimum)
@@ -2914,11 +2960,11 @@ func (a *App) SetTaskSourceGistID(ctx context.Context, index int, expected confi
 }
 
 // SetThreshold updates one confidence threshold (FR-009) and reloads.
-func (a *App) SetThreshold(ctx context.Context, situation string, value float64) error {
+func (a *App) SetThreshold(ctx context.Context, situation string, value float64) (reloaded bool, err error) {
 	if value <= 0 || value >= 1 {
-		return fmt.Errorf("threshold must be in (0,1), got %v", value)
+		return false, fmt.Errorf("threshold must be in (0,1), got %v", value)
 	}
-	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+	return a.updateConfigReloaded(ctx, func(cfg *config.Config) error {
 		switch situation {
 		case "idle":
 			cfg.ConfidenceThresholds.Idle = value
@@ -3461,7 +3507,7 @@ func (a *App) TaskGroups(cfg config.Config, st Status) []TaskGroup {
 		g := TaskGroup{Source: src, Index: i}
 		l, err := a.resolveSourceList(cfg, src, "")
 		if errors.Is(err, tasklocator.ErrAgentNameRequired) {
-			if name, ok := soleLiveMatch(cfg, src, st); ok {
+			if name, ok := derivedListAgent(cfg, src, st); ok {
 				l, err = a.resolveSourceList(cfg, src, name)
 			}
 		}
@@ -3523,6 +3569,92 @@ func SourceMatchesAgent(cfg config.Config, src config.TaskSource, st Status, a d
 		return false
 	}
 	return true
+}
+
+// derivedListAgent resolves the agent name a DERIVED source's single list is
+// built from, for a surface that enumerates sources rather than agents.
+//
+// Two ways it can be known, and the second is not a weaker guess than the
+// first — it is what `hap task <name>` already does:
+//
+//   - exactly one LIVE agent matches the source's selectors, so that agent's
+//     list is the source's list right now (this also disambiguates a TYPE or
+//     workspace selector, which several agents could share);
+//   - no live agent matches at all, but the source names an agent SELECTOR.
+//     Then the selector is the only agent this source can ever feed, and the
+//     derived name is a pure function of it — no liveness needed. Without
+//     this, an agent's own task list vanished from the TUI the moment its
+//     pane closed, while `hap task <name> list` kept printing it: the same
+//     config, the same list, two different answers.
+//
+// SEVERAL live matches stays unresolved on purpose: those agents genuinely
+// have one list each, and picking any of them would show (and let the
+// operator mutate) another agent's work.
+func derivedListAgent(cfg config.Config, src config.TaskSource, st Status) (string, bool) {
+	if name, ok := soleLiveMatch(cfg, src, st); ok {
+		return name, true
+	}
+	if src.Agent == "" || liveMatchCount(cfg, src, st) > 0 {
+		return "", false
+	}
+	// EVIDENCE that the selector is a NAME, not an agent type. A selector is
+	// matched against an agent's id, type OR name, and with nothing live
+	// hap cannot tell those apart from config alone — herdr agent types are
+	// free-form strings, so there is no list to check against. A type-scoped
+	// source genuinely has one list PER agent, and resolving it to
+	// "<type>.md" would show, and let an operator fill, a list no hand-out
+	// ever reads. The name registry is the evidence: every agent hap has seen
+	// is in it, so a source scoped to an agent that has ever run resolves,
+	// while a bare type does not.
+	if !knownAgentName(st, src.Agent) {
+		return "", false
+	}
+	// Sanitized by the locator, exactly as it is for a live agent's name.
+	return src.Agent, true
+}
+
+// knownAgentName reports whether the name registry has ever recorded this
+// short name — including for agents that are not running now, which is the
+// whole point: a closed pane must not hide its agent's task list.
+//
+// An UNREAD registry answers true: absence is only evidence when the registry
+// was actually read, and treating a failed query as "no such agent" would
+// silently un-resolve every named source — the very symptom this resolution
+// exists to fix. Displaying a list hap cannot fully justify is the cheap
+// direction here; nothing is created or delivered off this answer.
+func knownAgentName(st Status, name string) bool {
+	if !st.AgentNamesKnown {
+		return true
+	}
+	for _, known := range st.AgentNames {
+		if known == name {
+			return true
+		}
+	}
+	return false
+}
+
+// liveMatchCount counts the live agents a source's selectors match. A count of
+// 0 with AgentsKnown false means "unknown", which callers must not read as
+// "none" — hence the pairing with soleLiveMatch, which refuses on that.
+func liveMatchCount(cfg config.Config, src config.TaskSource, st Status) int {
+	if !st.AgentsKnown {
+		// Unknown, so treat as "some may match": the caller must not conclude
+		// this source feeds only its named selector.
+		return 1
+	}
+	n := 0
+	seen := map[string]bool{}
+	for _, a := range st.MonitoredAgents {
+		if seen[a.AgentID] {
+			continue
+		}
+		seen[a.AgentID] = true
+		if SourceMatchesAgent(cfg, src, st, a) {
+			n++
+		}
+	}
+	return n
 }
 
 // soleLiveMatch returns the short name of the one live agent a source's
@@ -3684,10 +3816,8 @@ func (a *App) taskSourceLimit(agent, locator string) int {
 	// that could never match — either way the source read as unregistered and
 	// therefore UNCAPPED, which is worse than having no cap because the
 	// operator believes one is set.
-	for _, src := range cfg.TaskSources {
-		if a.sourceLocatorMatches(cfg, src, agent, locator) {
-			return src.MaxTasksLimit()
-		}
+	if src, _, ok := a.sourceForLocator(cfg, agent, locator); ok {
+		return src.MaxTasksLimit()
 	}
 	return 0
 }
@@ -3707,7 +3837,7 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 	}
 	limit := a.taskSourceLimit(agent, p)
 	newIndex := 0
-	items, err := a.mutateTask(p, func(content string) (string, error) {
+	add := func(content string) (string, error) {
 		// Checked inside the lock (like expectTaskText) so a racing add cannot
 		// slip the count over the cap. limit == 0 means no cap (the file is
 		// not a registered task source).
@@ -3726,8 +3856,153 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 		out, idx, e := domain.AppendChecklistItem(content, domain.EncodeTaskNewlines(strings.TrimSpace(text)))
 		newIndex = idx
 		return out, e
-	})
+	}
+	items, err := a.mutateTask(p, add)
+	// A CONFIGURED source whose list does not exist yet is created here, then
+	// the add is retried. `add` is the one op that creates content, and for a
+	// remote list it is the ONLY way to create one: there is no file for the
+	// operator to touch, and hap's own hints (the TUI's add refusal, the
+	// remote task-management hints) send them to this exact command. Without
+	// this, a fresh gist-backed source is a deadlock — the list is created
+	// only by the daemon's first hand-out, which cannot happen until the list
+	// has a task in it.
+	//
+	// The gate is "this list belongs to a CONFIGURED source", tested on the
+	// resolved locator — never on the argument shape. The TUI adds by locator
+	// (`AddTask("", <locator>, text)`) because its rows carry one, so a gate
+	// keyed on `agent != ""` would have created lists from the CLI only, while
+	// the TUI — whose own refusal message sends the operator here — kept
+	// failing. A typo'd --path matches no source and so still fails loudly,
+	// which is the rule this scoping exists to keep (ports.EnsureCreator).
+	if err != nil && errors.Is(err, fs.ErrNotExist) {
+		if cfg, cerr := a.Config(); cerr == nil {
+			mayCreate, refused := a.creatableSource(cfg, agent, p)
+			if refused != "" {
+				// Say WHY hap declined, or the operator reads a deliberate
+				// policy as a broken list.
+				return nil, 0, fmt.Errorf("%w — %s", err, refused)
+			}
+			if !mayCreate {
+				return items, newIndex, err
+			}
+			if _, eerr := a.ensureList(context.Background(), cfg, p, newListHeader(agent)); eerr != nil {
+				// Both errors: the missing list is what the caller asked
+				// about, but a token that can READ a gist and not write it
+				// fails exactly here — reporting only "does not exist" would
+				// hide that hap tried to create it and was refused.
+				return nil, 0, fmt.Errorf("%w (creating it failed: %v)", err, eerr)
+			}
+			newIndex = 0
+			items, err = a.mutateTask(p, add)
+		}
+	}
 	return items, newIndex, err
+}
+
+// sourceForLocator finds the configured task source a locator belongs to, and
+// the agent name its list was derived for ("" when the source names its file
+// explicitly).
+//
+// This is the ONE answer to "which source is this list?", shared by the cap
+// lookup and the create-on-demand gate. They diverged once: the gate grew a
+// fallback for the TUI's locator-shaped call and the cap lookup did not, so a
+// TUI add to a derived source created the list while reading max_tasks as
+// UNCAPPED — a cap the operator had set and could not see being ignored.
+//
+// agent is the selector the caller used. A DERIVED source resolves per agent,
+// so when the caller supplies none (the TUI adds by locator), every agent hap
+// has a NAME for is tried: that covers both the agent whose pane is open and
+// the one whose pane has closed, which is exactly the set TaskGroups resolves
+// a row's locator from.
+func (a *App) sourceForLocator(cfg config.Config, agent, locator string) (config.TaskSource, string, bool) {
+	for _, src := range cfg.TaskSources {
+		if a.sourceLocatorMatches(cfg, src, agent, locator) {
+			return src, agent, true
+		}
+	}
+	if agent != "" {
+		return config.TaskSource{}, "", false
+	}
+	for _, name := range a.agentNames() {
+		for _, src := range cfg.TaskSources {
+			if a.sourceLocatorMatches(cfg, src, name, locator) {
+				return src, name, true
+			}
+		}
+	}
+	return config.TaskSource{}, "", false
+}
+
+// creatableSource reports whether hap may CREATE the list this locator names.
+//
+// It must belong to a configured source — a typo'd --path matches none, so it
+// still fails loudly (ports.EnsureCreator's rule). A DERIVED source needs one
+// thing more: evidence that the name its file was derived from is an AGENT.
+// A task-source selector is matched against an agent's id, type or name, and
+// "<type>.md" is a list no hand-out ever reads, so creating one would queue
+// work that never arrives.
+func (a *App) creatableSource(cfg config.Config, agent, locator string) (ok bool, refused string) {
+	src, name, found := a.sourceForLocator(cfg, agent, locator)
+	if !found {
+		return false, ""
+	}
+	if src.Path != "" {
+		// An explicit file names one list for everyone the source matches.
+		return true, ""
+	}
+	if a.knownAgent(name) {
+		return true, ""
+	}
+	return false, fmt.Sprintf("no agent named %q has been seen, so hap will not create its list "+
+		"(this source derives one list per agent): start the agent once, or give the source an explicit file name", name)
+}
+
+// agentNames returns every short name hap has ever recorded, live or not. A
+// read failure yields none: callers treat that as "no evidence", never as
+// "no such agent" — see knownAgent.
+func (a *App) agentNames() []string {
+	if a.Store == nil {
+		return nil
+	}
+	names, err := a.Store.AgentNames(context.Background())
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, n)
+	}
+	return out
+}
+
+// knownAgent reports whether the name registry has ever recorded this short
+// name. It is the evidence that a task-source selector names an AGENT rather
+// than an agent type; see derivedListAgent, which asks the same question of
+// the status snapshot it already holds.
+//
+// A registry that cannot be read yields false, which REFUSES the create. That
+// is the safe direction here: a wrong yes writes a list no hand-out reads,
+// while a wrong no is one clear error the operator can act on.
+func (a *App) knownAgent(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, known := range a.agentNames() {
+		if known == name {
+			return true
+		}
+	}
+	return false
+}
+
+// newListHeader is the initial content for a task list hap creates on demand,
+// matching the generated-task bootstrap's shape. An index selector names a
+// SOURCE rather than an agent, so it gets the untitled header.
+func newListHeader(agent string) string {
+	if _, isIndex := domain.ParseTaskSourceIndexRef(agent); isIndex || agent == "" {
+		return "# Tasks\n\n"
+	}
+	return "# Tasks for " + agent + "\n\n"
 }
 
 // guardedMutation wraps a checklist mutation with the optional expected-text
@@ -4118,7 +4393,8 @@ func (a *App) DeleteSignature(ctx context.Context, prefix string) (string, int64
 	if err != nil {
 		return "", 0, err
 	}
-	return sig, decisions, a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return sig, decisions, nil
 }
 
 // ResetSignatureGraduation resolves the prefix and returns a graduated
@@ -4152,7 +4428,8 @@ func (a *App) ResetSignatureGraduation(ctx context.Context, prefix string) (stri
 	if err := a.Store.UpsertSignature(ctx, reset); err != nil {
 		return "", err
 	}
-	return sig, a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return sig, nil
 }
 
 // ClearData resets learned history and audit data (DR-004).
@@ -4160,7 +4437,8 @@ func (a *App) ClearData(ctx context.Context) error {
 	if err := a.Store.ClearLearnedData(ctx); err != nil {
 		return err
 	}
-	return a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindReload)
+	return nil
 }
 
 // envFileValue renders a configured `.env` path for the config field

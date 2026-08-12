@@ -1540,7 +1540,11 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		if ws == "" {
 			ws = "*"
 		}
-		label := fmt.Sprintf("task-source #%d  agent=%s ws=%s  %s", i, sel, ws, src.Path)
+		// Never src.Path: under a remote provider that is a bare file name, or
+		// empty for a derived source — an empty column where the operator
+		// looks to confirm their gist provider took effect.
+		label := fmt.Sprintf("task-source #%d  agent=%s ws=%s  %s", i, sel, ws,
+			frontend.TaskSourceLocation(cfg, src))
 		if src.NextTaskTemplate != "" {
 			label += fmt.Sprintf("  template=%q", src.NextTaskTemplate)
 		}
@@ -4769,10 +4773,15 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	m.beginAction()
 	submit := func(input string) tea.Cmd {
 		return func() tea.Msg {
-			if err := app.SetField(ctx, key, input); err != nil {
+			reloaded, err := app.SetField(ctx, key, input)
+			if err != nil {
 				return actionResultMsg{err: err}
 			}
-			return actionResultMsg{message: key + " updated (daemon reloaded)"}
+			msg := key + " updated"
+			if !reloaded {
+				msg += " (saved — no daemon running)"
+			}
+			return actionResultMsg{message: msg}
 		}
 	}
 	// Enum-valued fields present a picker so the operator chooses from the
