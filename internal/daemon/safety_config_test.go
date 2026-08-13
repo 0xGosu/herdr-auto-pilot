@@ -105,7 +105,7 @@ agents = ['codex']
 	if _, ok := matcher.Match("codex", "legacy scoped"); ok {
 		t.Error("migrated indicator rule must reject an unlisted agent type")
 	}
-	if _, ok := matcher.Match("claude", "git reset --hard"); ok {
+	if _, ok := matcher.Match("claude", "git filter-repo"); ok {
 		t.Error("legacy disable_seed must remove shipped strict rules")
 	}
 	if _, ok := matcher.SuspectedIrreversible("claude", "This action cannot be undone."); ok {

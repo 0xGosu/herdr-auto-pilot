@@ -72,7 +72,7 @@ unclassifiable = "5m"
 	}
 }
 
-// TestAutoAcceptPerTypeDefaults: approval/choice/error default to 15m, idle and
+// TestAutoAcceptPerTypeDefaults: approval/choice/error default to 5m, idle and
 // unclassifiable to disabled — and an omitted key takes its type's default
 // rather than inheriting another's.
 func TestAutoAcceptPerTypeDefaults(t *testing.T) {
@@ -81,9 +81,9 @@ func TestAutoAcceptPerTypeDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]time.Duration{
-		"approval": 15 * time.Minute,
-		"choice":   15 * time.Minute,
-		"error":    15 * time.Minute,
+		"approval": 5 * time.Minute,
+		"choice":   5 * time.Minute,
+		"error":    5 * time.Minute,
 	}
 	for st, w := range want {
 		d, ok := cfg.AutoAcceptAfter(st)
@@ -122,8 +122,8 @@ idle = "1h"
 		t.Errorf("idle = (%s, %v), want 1h", d, ok)
 	}
 	// error was omitted, so it keeps its own default.
-	if d, ok := cfg.AutoAcceptAfter("error"); !ok || d != 15*time.Minute {
-		t.Errorf("error = (%s, %v), want the 15m default", d, ok)
+	if d, ok := cfg.AutoAcceptAfter("error"); !ok || d != 5*time.Minute {
+		t.Errorf("error = (%s, %v), want the 5m default", d, ok)
 	}
 }
 
@@ -226,8 +226,8 @@ unclassifiable = "0"
 		t.Errorf("unclassifiable = %s, want the explicit \"0\" to survive as disabled", d)
 	}
 	// Omitted keys still resolve to their defaults after a round trip.
-	if d, ok := again.AutoAcceptAfter("choice"); !ok || d != 15*time.Minute {
-		t.Errorf("choice = (%s, %v), want the 15m default", d, ok)
+	if d, ok := again.AutoAcceptAfter("choice"); !ok || d != 5*time.Minute {
+		t.Errorf("choice = (%s, %v), want the 5m default", d, ok)
 	}
 }
 
