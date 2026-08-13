@@ -116,8 +116,8 @@ type Escalations struct {
 // Durations are TOML strings parsed with time.ParseDuration ("15m", "1h30m").
 // An omitted key takes that type's built-in default; "0" disables the type
 // explicitly. Unlike most of this file, a malformed value here is REJECTED at
-// load rather than corrected to a default: silently substituting 15m for a
-// typo would start sending on an operator's behalf. Rejection disables the
+// load rather than corrected to a default: silently substituting the default
+// for a typo would start sending on an operator's behalf. Rejection disables the
 // section and leaves the rest of the config intact — failing closed.
 //
 // The staleness tolerance the pass compares with is deliberately NOT
@@ -1756,8 +1756,8 @@ func Load(path string) (Config, error) {
 	}
 	// Auto-accept thresholds are the one place a bad value is REJECTED rather
 	// than corrected to a default: this section grants the daemon permission to
-	// answer on the operator's behalf, and silently substituting 15m for a typo
-	// would start sending. Fail closed — the section is dropped so the feature
+	// answer on the operator's behalf, and silently substituting the default
+	// for a typo would start sending. Fail closed — the section is dropped so the feature
 	// stays off, the rest of the config survives, and the error names the key.
 	if err := cfg.Escalations.AutoAccept.validate(); err != nil {
 		cfg.Escalations.AutoAccept = AutoAccept{}

@@ -65,10 +65,13 @@ func TestNeverAutoDoesNotMatchBenignPrompts(t *testing.T) {
 		"Commit the staged changes with message 'fix: handle nil input'?",
 		"Truncate the log line to 80 characters?",
 		// Deliberately trimmed from the seed list (2026-08): locally
-		// recoverable / routine agent work must no longer escalate.
+		// recoverable / routine agent work no longer matches a STRICT rule.
+		// (Heuristics are a separate check; keep these free of heuristic
+		// trigger phrasing like "force delete" so each entry pins its own
+		// removal.)
 		"Allow `git reset --hard HEAD~5` to discard local commits?",
 		"Run git clean -fdx to remove untracked files?",
-		"Allow git branch -D experiment to force delete the local branch?",
+		"Allow git branch -D experiment to drop the local branch?",
 		"Rebase feature onto origin/main with git rebase origin/main?",
 		"Allow the command: rm -rf ./build && rm -rf /tmp/cache?",
 		"Run chmod -R 777 /var/www to fix permissions?",

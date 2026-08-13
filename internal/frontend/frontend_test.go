@@ -2481,12 +2481,12 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 }
 
 func TestAutoActConfidenceThresholdFieldDisplay(t *testing.T) {
-	// The default (99) is a reachable 0-100 threshold, so it renders as a bare
+	// The default (85) is a reachable 0-100 threshold, so it renders as a bare
 	// number, not the "never" label.
 	def := config.Default()
 	got := frontend.FieldValue(def, "llm.auto_act_confidence_threshold")
-	if got != "99" {
-		t.Errorf("default threshold display = %q, want a bare 99", got)
+	if got != "85" {
+		t.Errorf("default threshold display = %q, want a bare 85", got)
 	}
 	// A value above 100 still renders with the "never" label.
 	def.LLM.AutoActConfidenceThreshold = 999

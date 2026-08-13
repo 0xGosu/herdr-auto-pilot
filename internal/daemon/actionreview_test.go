@@ -359,7 +359,7 @@ func TestActionReviewLowConfidenceStillDelivers(t *testing.T) {
 	// The consult confidence gate does NOT apply to action reviews: even a
 	// score below the threshold still delivers the adapted text — the learned
 	// rule already earned the send.
-	h := approvalReviewHarness(t, "") // default auto_act_confidence_threshold (99)
+	h := approvalReviewHarness(t, "") // default auto_act_confidence_threshold (85)
 	var calls atomic.Int32
 	respondReview(h, &calls, 5, func(domain.LLMRequest) (string, error) {
 		return "y — confirmed after review", nil

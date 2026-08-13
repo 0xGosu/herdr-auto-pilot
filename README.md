@@ -476,10 +476,10 @@ gates and remain visible in the same audit trail.
    preview. Press `v` again to expand or collapse all previews. Expanded
    content still retains its newest trailing lines when
    `tui.max_content_height` caps it (`0` keeps the full content).
-3. **Graduate.** After **2 consecutive consistent confirmations** by default
+3. **Graduate.** After **1 consistent confirmation** by default
    (configurable from 1–10) *and* confidence above the per-situation threshold,
    that signature becomes autonomous: next time, the plugin acts on its own
-   and logs it. Confirmations carry extra confidence weight (3× by default),
+   and logs it. Confirmations carry extra confidence weight (2× by default),
    because an explicit operator answer is stronger evidence than an automated
    observation.
 4. **Stay in control.** Correct any automated decision post-hoc (TUI *Audit*

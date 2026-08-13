@@ -4007,8 +4007,8 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	}
 	// Confidence gate: auto-act only when the LLM's self-reported confidence
 	// meets the operator's threshold. A missing score (-1) is below any
-	// threshold >= 0, so it always escalates; the default threshold (99) auto-
-	// acts only on a near-certain score, and a threshold above 100 (e.g. 999)
+	// threshold >= 0, so it always escalates; the default threshold (85) auto-
+	// acts only on a high-confidence score, and a threshold above 100 (e.g. 999)
 	// never auto-acts. The reject closure surfaces the score ("llm confidence
 	// N/100") on the escalation.
 	if llmDec.ConfidentScore < cfg.LLM.AutoActConfidenceThreshold {
