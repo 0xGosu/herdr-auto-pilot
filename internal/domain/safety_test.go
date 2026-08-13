@@ -77,6 +77,7 @@ func TestNeverAutoDoesNotMatchBenignPrompts(t *testing.T) {
 		"Run rm -rf ~/projects/scratch to clean the workspace?",
 		"Delete the cache with rm -rf $HOME/.cache/hap-test?",
 		"Run rm -rf -- ./dist to clean the build output?",
+		"Clean up with rm -rf --verbose ./node_modules?",
 		"Run chmod -R 777 /var/www to fix permissions?",
 		"Run terraform apply on the prod workspace?",
 		"Run pulumi up against production?",
