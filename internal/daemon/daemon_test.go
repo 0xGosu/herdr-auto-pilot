@@ -3517,7 +3517,7 @@ func TestLLMFallbackStagingRegateAndPromotion(t *testing.T) {
 func TestLLMConfidentScoreShownOnEscalation(t *testing.T) {
 	// The agent's self-reported confident_score (0-100) must reach the
 	// escalation entry the operator sees; without one (-1) nothing is added.
-	cfg := "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n" // threshold defaults to 99: 62 < 99 → escalate
+	cfg := "[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\n" // threshold defaults to 85: 62 < 85 → escalate
 	h := newHarness(t, cfg)
 	h.herdr.setPane(approvalPane)
 	h.llm.configured = true

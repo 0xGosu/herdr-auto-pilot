@@ -476,10 +476,10 @@ gates and remain visible in the same audit trail.
    preview. Press `v` again to expand or collapse all previews. Expanded
    content still retains its newest trailing lines when
    `tui.max_content_height` caps it (`0` keeps the full content).
-3. **Graduate.** After **2 consecutive consistent confirmations** by default
+3. **Graduate.** After **1 consistent confirmation** by default
    (configurable from 1–10) *and* confidence above the per-situation threshold,
    that signature becomes autonomous: next time, the plugin acts on its own
-   and logs it. Confirmations carry extra confidence weight (3× by default),
+   and logs it. Confirmations carry extra confidence weight (2× by default),
    because an explicit operator answer is stronger evidence than an automated
    observation.
 4. **Stay in control.** Correct any automated decision post-hoc (TUI *Audit*
@@ -554,8 +554,8 @@ choice = 0.70
 error = 0.75
 
 [learning]
-graduation_n = 2           # consecutive confirmations to graduate (1-10)
-confirmation_weight = 3.0  # confidence weight for an operator confirmation (>=1)
+graduation_n = 1           # consecutive confirmations to graduate (1-10)
+confirmation_weight = 2.0  # confidence weight for an operator confirmation (>=1)
 
 [limits]
 max_consecutive_auto_prompts = 30  # per agent, without human interaction
@@ -565,9 +565,9 @@ max_error_retries = 2              # per error signature
 # Auto-accept aged escalations — OFF by default, see the section below.
 [escalations.auto_accept]
 enabled = false            # master switch; false ignores every threshold below
-approval = "15m"           # how long an escalation waits before hap answers it
-choice = "15m"
-error = "15m"
+approval = "5m"            # how long an escalation waits before hap answers it
+choice = "5m"
+error = "5m"
 idle = "0"                 # "0" disables that situation type
 unclassifiable = "0"
 
@@ -1227,9 +1227,15 @@ agents working" above.
 
 Irreversible operations are **never** automated, regardless of confidence.
 The shipped seed covers force-pushes, destructive filesystem/database ops,
-deploys/publishes, credential changes, and broader suspected-irreversible
-language. The strict and heuristic seed rules are regression-tested in
-CI against a maintained corpus of irreversible-operation prompts
+prod deploys/publishes, cloud-resource deletion, credential changes, and
+broader suspected-irreversible language. It is deliberately scoped to
+MAJOR-risk, hard-to-recover operations: routine, locally recoverable work
+(removing a build dir, a local git history reset, `terraform apply`, merging
+a PR…) is not in the shipped set — though recursive deletion of `/` or the
+whole home directory still is — add your own `safety.never_auto_patterns`
+for anything you want escalated anyway. The strict and heuristic seed rules
+are regression-tested in CI against a maintained corpus of
+irreversible-operation prompts
 (`internal/domain/testdata/irreversible_corpus.txt`).
 
 Turn the whole shipped set off with `safety.disable_never_auto_seed_patterns`,
@@ -1459,7 +1465,7 @@ command = [
   "--strict-mcp-config",
 ]
 timeout_seconds = 120
-auto_act_confidence_threshold = 99   # auto-act only when the LLM's confidence (0-100) is >= this; default 99 (near-certain only); >100 e.g. 999 = never (surface for your confirmation)
+auto_act_confidence_threshold = 85   # auto-act only when the LLM's confidence (0-100) is >= this; default 85 (high confidence); >100 e.g. 999 = never (surface for your confirmation)
 pane_excerpt_chars = 5000   # pane excerpt size in the consult context (default 5000)
 run_in_agent_cwd = true     # run the CLI in the agent's own project directory (default true)
 ```
@@ -1710,7 +1716,7 @@ launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing
 `exec` inserted) — an unrecognized shape is left untouched. Every LLM
 suggestion is re-gated through the same never-auto patterns, kill switch, and rate
 guards; it auto-acts only when the LLM's self-reported confidence meets
-`auto_act_confidence_threshold` (0-100; default 99, >100 e.g. 999 = never) and the action
+`auto_act_confidence_threshold` (0-100; default 85, >100 e.g. 999 = never) and the action
 doesn't contradict your learned history — otherwise the suggestion is surfaced
 for you to confirm. On timeout, CLI failure, or no submission the situation
 escalates. For a retryable failed/timed-out consult, press `l` on its TUI
@@ -1915,15 +1921,15 @@ demonstrably on screen, is answered automatically.
 ```toml
 [escalations.auto_accept]
 enabled = true
-approval = "15m"
-choice = "15m"
-error = "15m"
+approval = "5m"
+choice = "5m"
+error = "5m"
 idle = "0"                 # disabled
 unclassifiable = "0"       # disabled
 ```
 
 **It is off by default and upgrading does not turn it on.** The *threshold*
-defaults to 15 minutes; the *feature* defaults to off. Each duration is a
+defaults to 5 minutes; the *feature* defaults to off. Each duration is a
 `time.ParseDuration` string (`"15m"`, `"1h30m"`); `"0"` disables that situation
 type. A value below one minute — the sweep's granularity — is rejected at load
 rather than quietly rounded, and so is anything unparseable: the whole section

@@ -12,26 +12,34 @@ import (
 // regex patterns matched against prompt/pane content. Any match escalates,
 // always, regardless of confidence or mode. The patterns are validated in CI
 // against the irreversible-op corpus in testdata/corpus (NFR-005a).
+//
+// The list is deliberately scoped to MAJOR-risk, hard-to-recover operations:
+// remote/shared state (force-push, prod deploys, cloud deletes, DB data
+// loss, credential rotation, mass sends) and device-level destruction.
+// Routine, locally recoverable operations (rm -rf of a build dir, git reset
+// --hard, terraform apply, merging a PR, restarting a service…) are left to
+// the operator's own never_auto_patterns — pattern-matching those escalated
+// far more everyday agent work than it caught incidents.
 var SeedNeverAutoPatterns = []string{
 	// Git history / remote destruction
 	`(?i)git\s+push\s+[^\n]*(--force\b|-f\b|--force-with-lease)`,
-	`(?i)git\s+reset\s+--hard`,
-	`(?i)git\s+clean\s+-[a-z]*f`,
-	`(?i)git\s+branch\s+(-D|--delete\s+--force)`,
 	`(?i)git\s+push\s+[^\n]*--delete`,
 	`(?i)force[- ]push`,
-	`(?i)git\s+rebase\b[^\n]*(main|master|origin)`,
 	`(?i)git\s+filter-(branch|repo)`,
-	// Destructive filesystem operations
-	`(?i)\brm\s+(-[a-z]*[rf][a-z]*\s+)+`,
+	// Destructive filesystem operations. Recursive deletion is generally
+	// left to operator rules (build-dir cleanup is routine agent work),
+	// EXCEPT aimed at the filesystem root or the whole home directory —
+	// catastrophic even without sudo, so a narrow rule keeps that covered.
+	// One recursive/force flag is required in short (`-rf`) or long
+	// (`--recursive`/`--force`) form; any other option tokens (incl. bare
+	// `--` and `--no-preserve-root`) may sit anywhere before the target.
+	`(?i)\brm\s+((--[a-z=-]*|-[a-z]+)\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force)\s+((--[a-z=-]*|-[a-z]+)\s+)*["']?(/\*?|~/?|\$\{?HOME\}?/?\*?)["']?(\s|$)`,
 	`(?i)\bsudo\s+rm\b`,
 	`(?i)\bshred\b|\bwipefs\b|\bmkfs(\.[a-z0-9]+)?\b`,
 	`(?i)\bdd\s+[^\n]*of=/dev/`,
-	`(?i)delet(e|ing)\s+(all|every|the entire|recursively)`,
-	`(?i)(remov|delet|eras)(e|ing)\s+[^\n]*\b(director(y|ies)|folder|volume|partition|bucket)\b`,
-	`(?i)chmod\s+-R\s+777`,
+	`(?i)(remov|delet|eras)(e|ing)\s+[^\n]*\b(volume|partition|bucket)\b`,
 	// Databases
-	`(?i)\bDROP\s+(TABLE|DATABASE|SCHEMA|INDEX)\b`,
+	`(?i)\bDROP\s+(TABLE|DATABASE|SCHEMA)\b`,
 	// TABLE required: an optional group would make this match everyday
 	// "truncate the log line" prompts.
 	`(?i)\bTRUNCATE\s+TABLE\b`,
@@ -40,12 +48,11 @@ var SeedNeverAutoPatterns = []string{
 	// Deploy / publish / release
 	`(?i)\b(deploy|deploying)\b[^\n]*\b(prod|production|live)\b`,
 	`(?i)\bnpm\s+publish\b|\bcargo\s+publish\b|\bgem\s+push\b|\btwine\s+upload\b|\bgoreleaser\s+release\b`,
-	`(?i)\bterraform\s+(apply|destroy)\b`,
-	`(?i)\bpulumi\s+(up|destroy)\b`,
+	`(?i)\bterraform\s+destroy\b`,
+	`(?i)\bpulumi\s+destroy\b`,
 	`(?i)\bkubectl\s+(delete|drain|apply\s+[^\n]*prod)`,
 	`(?i)\bhelm\s+(uninstall|delete|upgrade\s+[^\n]*prod)`,
-	`(?i)\bgh\s+release\s+(create|delete)\b`,
-	`(?i)\bdocker\s+(system|volume|image)\s+prune\b`,
+	`(?i)\bgh\s+release\s+delete\b`,
 	`(?i)\baws\s+s3\s+(rb|rm)\b`,
 	`(?i)\bgcloud\s+[^\n]*\bdelete\b`,
 	`(?i)\baz\s+[^\n]*\bdelete\b`,
@@ -54,14 +61,8 @@ var SeedNeverAutoPatterns = []string{
 	`(?i)\b(credential|secret|api[- ]?key|password)s?\b[^\n]*\b(rotat|revok|delet|regenerat)(e|ing|ion)`,
 	`(?i)\b(rotat|revok|delet|regenerat|invalidat)(e[sd]?|ing|ion)\b[^\n]{0,40}?\b(api|deploy|pat|service)[- ]?tokens?\b`,
 	`(?i)\b(api|deploy|pat|service)[- ]?tokens?\b[^\n]{0,40}?\b(rotat|revok|delet|regenerat|invalidat)(e[sd]?|ing|ion)\b`,
-	`(?i)gh\s+auth\s+(logout|refresh)`,
-	// System state
-	`(?i)\b(shutdown|reboot|poweroff|halt)\b`,
-	`(?i)\bsystemctl\s+(stop|disable|mask)\b`,
-	`(?i)\bkill(all)?\s+-9\b`,
 	// Mass communication / irreversible sends
 	`(?i)\bsend\s+[^\n]*\b(email|invoice|newsletter)\b[^\n]*\b(all|every|customers|users)\b`,
-	`(?i)\b(merge|merging)\b[^\n]*\bpull request\b[^\n]*\b(main|master|prod)`,
 }
 
 // NeverAutoRuleKind preserves the behavioral class of a unified matcher rule.
@@ -105,15 +106,20 @@ func seedHeuristic(pattern string) NeverAutoRule {
 // its own — only paired with a data/infrastructure target, no-undo
 // language, or a force/credential/production context.
 var SeedHeuristicNeverAutoRules = []NeverAutoRule{
-	// Explicit no-undo language — strong enough to stand alone.
+	// Explicit no-undo language — strong enough to stand alone. (A bare "are
+	// you absolutely sure" is not: agent TUIs ask it for routine confirms, so
+	// only the corroborated are-you-sure rule below remains.)
 	seedHeuristic(`(?i)\birreversibl[ey]\b|\bunrecoverabl[ey]\b|\bcannot\s+be\s+(undone|recovered|restored|reversed|reverted)\b|\bcan't\s+be\s+undone\b|\bno\s+undo\b|\blost\s+forever\b|\b(is|are)\s+permanent\b`),
-	seedHeuristic(`(?i)\bare\s+you\s+absolutely\s+sure\b`),
 	// Destructive verb aimed at a data/infrastructure target. The bridge
 	// allows at most one line break or one blank line: confirmations often
 	// put the verb and its target on adjacent lines ("Delete the
 	// following?\n\n - production backups"), but a verb and target separated
 	// by other lines of text is narration, not a pending operation.
-	seedHeuristic(`(?i)\b(delet(e[sd]?|ing)|destroy(s|ed|ing)?|remov(e[sd]?|ing)|eras(e[sd]?|ing)|wip(e[sd]?|ing)|purg(e[sd]?|ing)|drop(s|ped|ping)?|truncat(e[sd]?|ing))\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(databases?|tables?|schemas?|backups?|snapshots?|buckets?|volumes?|partitions?|disks?|prod(uction)?|(user|customer|all)\s+data|records?|history|repositor(y|ies)|accounts?)\b`),
+	// "remove" is deliberately absent from the verbs: even with a target it
+	// reads as everyday refactoring ("remove the record from the list",
+	// "remove the repository from the config") far more often than as a
+	// pending destructive operation.
+	seedHeuristic(`(?i)\b(delet(e[sd]?|ing)|destroy(s|ed|ing)?|eras(e[sd]?|ing)|wip(e[sd]?|ing)|purg(e[sd]?|ing)|drop(s|ped|ping)?|truncat(e[sd]?|ing))\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(databases?|tables?|schemas?|backups?|snapshots?|buckets?|volumes?|partitions?|disks?|prod(uction)?|(user|customer|all)\s+data|records?|history|repositor(y|ies)|accounts?)\b`),
 	seedHeuristic(`(?i)\bpermanently\s+(delet|destroy|remov|eras|wip|purg|discard)`),
 	// Forced overwrites/removals (force-push itself is a seed pattern).
 	seedHeuristic(`(?i)\bforc(e|ed|ibly)\b[^\n]*\b(overwrit|delet|remov|push)`),
@@ -123,8 +129,6 @@ var SeedHeuristicNeverAutoRules = []NeverAutoRule{
 	// ("public registry/repository"), not the bare word, so ordinary branch
 	// and identifier names (feat/public, publicapi) stay benign.
 	seedHeuristic(`(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing))\b[^\n]*(\b(prod|production|live)\b|\bpublic\s+(registr(y|ies)|repositor(y|ies))\b)`),
-	// Discarding work.
-	seedHeuristic(`(?i)\b(overwrit(e[sd]?|ing)|clobber(s|ed|ing)?|discard(s|ed|ing)?)\b[^\n]*\b(changes|data|history|work)\b`),
 	// A confirmation that itself names a destructive act (same bounded
 	// bridge as the verb/target rule above).
 	seedHeuristic(`(?i)\bare\s+you\s+sure\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(delet|remov|eras|wip|purg|discard|overwrit|destroy|drop|reset)`),

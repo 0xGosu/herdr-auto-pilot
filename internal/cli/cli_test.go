@@ -514,7 +514,7 @@ func TestSignaturesList(t *testing.T) {
 	// reads 1.00, while choice has no decisions at all — never scored, so "-"
 	// rather than a 0.00 that would look like measured no-confidence (its
 	// cached 0.92 must not surface either).
-	for _, want := range []string{"approval:aaaa111…", "choice:cccc3333", "shadow", "autonomous", "3/2", "top=\"1\"",
+	for _, want := range []string{"approval:aaaa111…", "choice:cccc3333", "shadow", "autonomous", "3/1", "top=\"1\"",
 		"conf=1.00", "conf=-", "2 signature(s)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("list output missing %q:\n%s", want, out)
@@ -568,7 +568,7 @@ func TestSignaturesShow(t *testing.T) {
 	}
 	// "confidence: 1.00" is the live score over the seeded history; the fixture's
 	// cached snapshot is 0.75 and must never surface.
-	for _, want := range []string{"approval:aaaa1111bbbb2222", "streak: 3/2", "confidence: 1.00",
+	for _, want := range []string{"approval:aaaa1111bbbb2222", "streak: 3/1", "confidence: 1.00",
 		"top action:  \"1\" over 2 decision(s)",
 		"original situation:", "terraform apply", "recent decisions", "last audit", "shadow mode"} {
 		if !strings.Contains(out, want) {
@@ -825,7 +825,7 @@ func TestEscalationsAndAuditShowMatchedRule(t *testing.T) {
 	// confidence is the LIVE score over the seeded history (2 unanimous
 	// decisions = 1.00), not the 0.75 CachedConfidence snapshot the row carries:
 	// that field goes stale between confirms and must never reach an operator.
-	if !strings.Contains(out, `rule=[shadow — 3/2 confirmations, confidence 1.00, top action "1" over 2 decision(s)]`) {
+	if !strings.Contains(out, `rule=[shadow — 3/1 confirmations, confidence 1.00, top action "1" over 2 decision(s)]`) {
 		t.Errorf("escalations should name the matched rule, got:\n%s", out)
 	}
 

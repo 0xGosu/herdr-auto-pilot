@@ -16,7 +16,7 @@ const recencyDecay = 0.85
 // threshold faster. Corrections and dismissals are unaffected — the graduation
 // rule (consecutive confirmations + threshold) is unchanged; only how
 // confidence is computed changes. Configurable via learning.confirmation_weight.
-const DefaultConfirmationWeight = 3.0
+const DefaultConfirmationWeight = 2.0
 
 // ConfidenceResult carries the recency-weighted agreement ratio and the
 // action it agrees on.

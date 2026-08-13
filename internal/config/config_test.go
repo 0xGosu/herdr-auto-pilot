@@ -1724,10 +1724,10 @@ func TestDisableNeverAutoSeedPatternsMigration(t *testing.T) {
 }
 
 func TestAutoActConfidenceThresholdDefault(t *testing.T) {
-	// Omitted key keeps the near-certain default (99): auto-act only on a
-	// >= 99 LLM score, surface everything less confident for confirmation.
-	if got := Default().LLM.AutoActConfidenceThreshold; got != 99 {
-		t.Fatalf("default threshold = %d, want 99", got)
+	// Omitted key keeps the high-confidence default (85): auto-act only on a
+	// >= 85 LLM score, surface everything less confident for confirmation.
+	if got := Default().LLM.AutoActConfidenceThreshold; got != 85 {
+		t.Fatalf("default threshold = %d, want 85", got)
 	}
 	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(path, []byte("[llm]\ntimeout_seconds = 30\n"), 0o600); err != nil {
@@ -1737,8 +1737,8 @@ func TestAutoActConfidenceThresholdDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.LLM.AutoActConfidenceThreshold != 99 {
-		t.Errorf("omitted key should default to 99, got %d", cfg.LLM.AutoActConfidenceThreshold)
+	if cfg.LLM.AutoActConfidenceThreshold != 85 {
+		t.Errorf("omitted key should default to 85, got %d", cfg.LLM.AutoActConfidenceThreshold)
 	}
 }
 
@@ -1830,8 +1830,8 @@ func TestDeprecatedAutoActYieldsToExplicitNewKey(t *testing.T) {
 
 func TestAutoActConfidenceThresholdNegativeClamped(t *testing.T) {
 	// A hand-edited negative threshold is invalid and must not let an
-	// unreported (-1) score auto-act: it falls back to the default (99), which
-	// still escalates an unreported score since -1 < 99.
+	// unreported (-1) score auto-act: it falls back to the default (85), which
+	// still escalates an unreported score since -1 < 85.
 	path := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(path, []byte("[llm]\nauto_act_confidence_threshold = -5\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -1840,8 +1840,8 @@ func TestAutoActConfidenceThresholdNegativeClamped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.LLM.AutoActConfidenceThreshold != 99 {
-		t.Errorf("negative threshold must clamp to the default 99, got %d", cfg.LLM.AutoActConfidenceThreshold)
+	if cfg.LLM.AutoActConfidenceThreshold != 85 {
+		t.Errorf("negative threshold must clamp to the default 85, got %d", cfg.LLM.AutoActConfidenceThreshold)
 	}
 }
 

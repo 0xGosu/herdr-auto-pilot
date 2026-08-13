@@ -19,8 +19,8 @@ error = 0.75
 
 # ── Shadow-mode learning ────────────────────────────────────────────
 [learning]
-graduation_n = 2           # consecutive consistent confirmations to graduate a rule (1-10)
-confirmation_weight = 3.0  # how much more an operator confirm/send counts toward
+graduation_n = 1           # consecutive consistent confirmations to graduate a rule (1-10)
+confirmation_weight = 2.0  # how much more an operator confirm/send counts toward
                            # confidence than a passive observation
 
 # ── Safety (never-auto) ─────────────────────────────────────────────
@@ -51,7 +51,7 @@ max_error_retries = 2              # per error signature
 # still demonstrably on screen, is answered automatically.
 #
 # OFF by default, and upgrading does not turn it on — the THRESHOLD
-# defaults to 15m, the FEATURE defaults to off. Delete `enabled` (or the
+# defaults to 5m, the FEATURE defaults to off. Delete `enabled` (or the
 # whole section) to keep every escalation waiting for you.
 #
 # It delivers but never LEARNS: no correction is written, so an
@@ -62,9 +62,9 @@ max_error_retries = 2              # per error signature
 # paused, and answers at most one escalation per agent per sweep.
 [escalations.auto_accept]
 enabled = false            # master switch — false ignores every threshold below
-approval = "15m"           # per situation type; a time.ParseDuration string
-choice = "15m"             # "0" disables that type; values under 1m are
-error = "15m"              #   rejected at load (the sweep runs once a minute)
+approval = "5m"            # per situation type; a time.ParseDuration string
+choice = "5m"              # "0" disables that type; values under 1m are
+error = "5m"               #   rejected at load (the sweep runs once a minute)
 idle = "0"                 # disabled: an idle hand-out re-drives an agent's
                            #   work rather than answering a question it asked
 unclassifiable = "0"       # disabled: hap never understood the screen at all
@@ -136,7 +136,7 @@ command = [
 # ]
 
 timeout_seconds = 120              # codex is slower to start; 180 is a safer value there
-auto_act_confidence_threshold = 99  # auto-act only when the LLM confidence (0-100) is >= this; default 99 (near-certain only); set >100 (e.g. 999) to never auto-act and always surface for confirmation
+auto_act_confidence_threshold = 85  # auto-act only when the LLM confidence (0-100) is >= this; default 85 (high confidence); set >100 (e.g. 999) to never auto-act and always surface for confirmation
 pane_excerpt_chars = 5000          # pane context included in the consult
 # Run the CLI in the monitored AGENT's own working directory instead of hap's,
 # so it reads that project's CLAUDE.md / AGENTS.md, sees its local tool config,

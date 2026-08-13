@@ -111,13 +111,13 @@ type Escalations struct {
 // The whole section is opt-in: an absent section, or Enabled false, behaves
 // exactly as "off" regardless of the per-type thresholds, so upgrading an
 // existing install never starts auto-answering escalations it previously
-// queued. The THRESHOLD defaults to 15m; the FEATURE defaults to off.
+// queued. The THRESHOLD defaults to 5m; the FEATURE defaults to off.
 //
 // Durations are TOML strings parsed with time.ParseDuration ("15m", "1h30m").
 // An omitted key takes that type's built-in default; "0" disables the type
 // explicitly. Unlike most of this file, a malformed value here is REJECTED at
-// load rather than corrected to a default: silently substituting 15m for a
-// typo would start sending on an operator's behalf. Rejection disables the
+// load rather than corrected to a default: silently substituting the default
+// for a typo would start sending on an operator's behalf. Rejection disables the
 // section and leaves the rest of the config intact — failing closed.
 //
 // The staleness tolerance the pass compares with is deliberately NOT
@@ -133,14 +133,14 @@ type AutoAccept struct {
 	Unclassifiable string `toml:"unclassifiable,omitempty"`
 }
 
-// Auto-accept threshold defaults. approval/choice/error wait 15 minutes; idle
+// Auto-accept threshold defaults. approval/choice/error wait 5 minutes; idle
 // and unclassifiable are disabled, because neither carries a suggestion an
 // absent operator would obviously have confirmed — an idle hand-out re-drives
 // an agent's work and an unclassifiable screen was never understood at all.
 const (
-	DefaultAutoAcceptApproval = 15 * time.Minute
-	DefaultAutoAcceptChoice   = 15 * time.Minute
-	DefaultAutoAcceptError    = 15 * time.Minute
+	DefaultAutoAcceptApproval = 5 * time.Minute
+	DefaultAutoAcceptChoice   = 5 * time.Minute
+	DefaultAutoAcceptError    = 5 * time.Minute
 )
 
 // minAutoAcceptThreshold is the sweep granularity. A non-zero threshold below
@@ -244,8 +244,8 @@ type LLM struct {
 	// automatically (subject to every safety control and the learned-history
 	// gate): the daemon auto-acts only when the LLM's self-reported
 	// confidence score (0-100) is at or above this threshold. The default is
-	// 99, so out of the box the daemon auto-acts only on a near-certain
-	// (>= 99) score and surfaces everything less confident as an escalation.
+	// 85, so out of the box the daemon auto-acts only on a high-confidence
+	// (>= 85) score and surfaces everything less confident as an escalation.
 	// A value above 100 (e.g. 999) never auto-acts; 0 acts on any reported
 	// score. A decision with no reported score (-1) always escalates.
 	AutoActConfidenceThreshold int `toml:"auto_act_confidence_threshold"`
@@ -1304,13 +1304,13 @@ func Default() Config {
 		},
 		// ConfirmationWeight mirrors domain.DefaultConfirmationWeight (kept a
 		// literal here so config stays decoupled from the domain package).
-		Learning: Learning{GraduationN: 2, ConfirmationWeight: 3.0},
+		Learning: Learning{GraduationN: 1, ConfirmationWeight: 2.0},
 		Limits: Limits{
 			MaxConsecutiveAutoPrompts: 30,
 			MaxAutoPromptsPerMinute:   5,
 			MaxErrorRetries:           2,
 		},
-		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 99, RunInAgentCwd: boolPtr(true)},
+		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 85, RunInAgentCwd: boolPtr(true)},
 		Embedding: Embedding{
 			SimilarityThreshold: 0.90,
 			BM25MinScore:        0.35,
@@ -1756,8 +1756,8 @@ func Load(path string) (Config, error) {
 	}
 	// Auto-accept thresholds are the one place a bad value is REJECTED rather
 	// than corrected to a default: this section grants the daemon permission to
-	// answer on the operator's behalf, and silently substituting 15m for a typo
-	// would start sending. Fail closed — the section is dropped so the feature
+	// answer on the operator's behalf, and silently substituting the default
+	// for a typo would start sending. Fail closed — the section is dropped so the feature
 	// stays off, the rest of the config survives, and the error names the key.
 	if err := cfg.Escalations.AutoAccept.validate(); err != nil {
 		cfg.Escalations.AutoAccept = AutoAccept{}

@@ -82,7 +82,7 @@ hap is not a wrapper around the coding agents; it observes and drives them from 
 5. **decide** — if a confident, graduated (autonomous) rule applies and passes every safety gate (kill switch, never-auto patterns, irreversible heuristic, rate/retry guards), the daemon **acts**. otherwise it **escalates** to the operator — or first **consults the local LLM** (if configured), whose suggestion is re-gated through the same safety controls.
 6. **act** — the chosen reply is delivered back into the pane through herdr: a single-line reply goes through `pane send-text <pane> <text>` then `pane send-keys <pane> enter`, so a menu digit arrives as a keystroke; a multi-line reply goes through `agent prompt <pane> <text>`, which pastes it as one message and submits it. (herdr 0.7.5 removed the older `agent send`, which did both; hap falls back to it on older herdr.) a numbered menu (`1. Yes / 2. No`) is mapped to its **digit** via `MenuKeystroke` before sending — herdr menus accept the number, not the label. a `@noop` decision records/learns but sends nothing.
 
-**shadow → autonomous.** a new signature starts in shadow mode: the daemon escalates with a suggestion, the operator confirms or corrects, and after enough consistent confirmations (`learning.graduation_n`) the signature graduates and the daemon acts on it unattended. an operator confirm/send weighs extra toward confidence (`learning.confirmation_weight`, default 3×), so confirmed rules build confidence faster. **graduation is permanent**: once autonomous the confirmation count is frozen and a later correction no longer demotes the rule (the correction is still recorded, so confidence — and the confidence gate — reflect it). the only way back to shadow is an explicit `hap signatures reset` (or the Rules-tab reset key).
+**shadow → autonomous.** a new signature starts in shadow mode: the daemon escalates with a suggestion, the operator confirms or corrects, and after enough consistent confirmations (`learning.graduation_n`) the signature graduates and the daemon acts on it unattended. an operator confirm/send weighs extra toward confidence (`learning.confirmation_weight`, default 2×), so confirmed rules build confidence faster. **graduation is permanent**: once autonomous the confirmation count is frozen and a later correction no longer demotes the rule (the correction is still recorded, so confidence — and the confidence gate — reflect it). the only way back to shadow is an explicit `hap signatures reset` (or the Rules-tab reset key).
 
 **everything is out-of-process and fail-safe.** the daemon never blocks the agent and never modifies the agent's process — it only reads panes and sends keystrokes, exactly as a human operator would. shelling out to the LLM CLI or doing deep pane reads happens in goroutines so the single select loop keeps serving all agents; any error resolves to escalate + audit, never a crash.
 
@@ -435,8 +435,8 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `confidence_thresholds.approval` | 0.70 | confidence threshold for approval requests |
 | `confidence_thresholds.choice` | 0.70 | confidence threshold for choices |
 | `confidence_thresholds.error` | 0.75 | confidence threshold for error situations |
-| `learning.graduation_n` | 2 | consecutive confirmations needed to graduate (1-10) |
-| `learning.confirmation_weight` | 3.0 | vote-weight multiplier for an operator confirmation in the confidence ratio (1 disables the boost) |
+| `learning.graduation_n` | 1 | consecutive confirmations needed to graduate (1-10) |
+| `learning.confirmation_weight` | 2.0 | vote-weight multiplier for an operator confirmation in the confidence ratio (1 disables the boost) |
 | `limits.max_consecutive_auto_prompts` | 30 | max consecutive auto-prompts per agent without human interaction |
 | `limits.max_auto_prompts_per_minute` | 5 | rate limit per agent (rolling 1-minute window) |
 | `limits.max_error_retries` | 2 | max retries per error signature |
@@ -580,7 +580,7 @@ upgrades (and is rejected if that pattern no longer ships). one seed rule is a
 single regex that can cover several phrasings — disabling it silences all of
 them, not just the phrase you saw.
 
-the 40 strict seed rules cover: force-push, `git reset --hard`, `rm -rf`, `sudo rm`, `DROP TABLE`, `TRUNCATE TABLE`, `DELETE FROM`, deploys to prod, `npm publish`, `terraform apply/destroy`, credential rotation, and more; broader heuristic seed rules catch suspected irreversible language. all shipped rules are active unless `safety.disable_never_auto_seed_patterns=true`. the old `safety.disable_seed` key still loads with a deprecation warning and is rewritten under the new name on the next config save.
+the strict seed rules are scoped to MAJOR-risk, hard-to-recover operations: force-push, `sudo rm`, `dd`/`mkfs`, `DROP TABLE`, `TRUNCATE TABLE`, `DELETE FROM`, deploys to prod, `npm publish`, `terraform destroy`, cloud-resource deletion, credential rotation, mass sends, and more; broader heuristic seed rules catch suspected irreversible language. routine locally recoverable work (recursive `rm` of a project dir — though `/` and the whole home directory still escalate — local git history resets, `terraform apply`, merging a PR…) is deliberately NOT in the shipped set — add `never_auto_patterns` for anything you want escalated anyway. all shipped rules are active unless `safety.disable_never_auto_seed_patterns=true`. the old `safety.disable_seed` key still loads with a deprecation warning and is rewritten under the new name on the next config save.
 
 the config key for custom patterns is `never_auto_patterns` (the old name `allowlist_patterns` still loads as a deprecated alias):
 
@@ -993,7 +993,7 @@ command = [
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
 ]
 timeout_seconds = 120
-auto_act_confidence_threshold = 99    # 0-100, default 99; >100 (e.g. 999) = never auto-act. needs an LLM CLI that reports a confidence score
+auto_act_confidence_threshold = 85    # 0-100, default 85; >100 (e.g. 999) = never auto-act. needs an LLM CLI that reports a confidence score
 pane_excerpt_chars = 5000
 ```
 
@@ -1055,7 +1055,7 @@ command       = ["claude", "-p", "...", "--model", "haiku"]
 command_start = ["claude", "-p", "...", "--model", "opus"]   # first consult per agent only
 ```
 
-every LLM suggestion is re-gated through the never-auto patterns, kill switch, and rate guards. the LLM may act automatically only when its self-reported confidence score meets `auto_act_confidence_threshold` (0-100; default 99, so a near-certain score does auto-act — set it above 100 to disable) AND the action doesn't contradict learned history; below the threshold, with no reported score, or on timeout / no submission, the situation escalates. the old boolean `auto_act` still loads as a deprecated alias (`true` → threshold 0, `false` → 999) and is migrated on next save.
+every LLM suggestion is re-gated through the never-auto patterns, kill switch, and rate guards. the LLM may act automatically only when its self-reported confidence score meets `auto_act_confidence_threshold` (0-100; default 85, so a high-confidence score does auto-act — set it above 100 to disable) AND the action doesn't contradict learned history; below the threshold, with no reported score, or on timeout / no submission, the situation escalates. the old boolean `auto_act` still loads as a deprecated alias (`true` → threshold 0, `false` → 999) and is migrated on next save.
 
 ## llm action review (optional)
 
