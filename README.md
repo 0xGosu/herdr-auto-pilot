@@ -1231,7 +1231,8 @@ prod deploys/publishes, cloud-resource deletion, credential changes, and
 broader suspected-irreversible language. It is deliberately scoped to
 MAJOR-risk, hard-to-recover operations: routine, locally recoverable work
 (removing a build dir, a local git history reset, `terraform apply`, merging
-a PR…) is not in the shipped set — add your own `safety.never_auto_patterns`
+a PR…) is not in the shipped set — though recursive deletion of `/` or the
+whole home directory still is — add your own `safety.never_auto_patterns`
 for anything you want escalated anyway. The strict and heuristic seed rules
 are regression-tested in CI against a maintained corpus of
 irreversible-operation prompts

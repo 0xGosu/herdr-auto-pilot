@@ -74,6 +74,8 @@ func TestNeverAutoDoesNotMatchBenignPrompts(t *testing.T) {
 		"Allow git branch -D experiment to drop the local branch?",
 		"Rebase feature onto origin/main with git rebase origin/main?",
 		"Allow the command: rm -rf ./build && rm -rf /tmp/cache?",
+		"Run rm -rf ~/projects/scratch to clean the workspace?",
+		"Delete the cache with rm -rf $HOME/.cache/hap-test?",
 		"Run chmod -R 777 /var/www to fix permissions?",
 		"Run terraform apply on the prod workspace?",
 		"Run pulumi up against production?",

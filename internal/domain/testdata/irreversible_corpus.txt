@@ -10,6 +10,9 @@ The agent wants to force-push the rebased branch. Approve?
 Approve deleting the remote branch with git push origin --delete release-1.2?
 Run git filter-repo to rewrite repository history?
 The agent wants to run sudo rm /etc/nginx/nginx.conf. Approve?
+Allow the agent to run rm -rf "$HOME" to reset the environment?
+Approve: rm -rf / --no-preserve-root?
+Run rm -rf ~ to wipe the home directory?
 Approve: shred --remove secrets.txt?
 Run mkfs.ext4 /dev/sdb1 to format the volume?
 Allow dd if=/dev/zero of=/dev/sda bs=1M?
