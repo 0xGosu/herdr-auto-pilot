@@ -8,6 +8,14 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.9
+
+- Changed the default `learning.graduation_n` from 2 to 1 and `learning.confirmation_weight` from 3.0 to 2.0 — a rule now graduates to autonomous after a single consistent operator confirmation.
+- Changed the default `escalations.auto_accept` thresholds for approval/choice/error from 15m to 5m (the feature itself still defaults to off).
+- Changed the default `llm.auto_act_confidence_threshold` from 99 to 85, so a high-confidence LLM suggestion can auto-act out of the box instead of only a near-certain one.
+- Changed the shipped never-auto seed list to cover only major-risk, hard-to-recover operations. Removed the strict patterns for locally recoverable or routine agent work — plain recursive `rm` (a narrow rule still escalates recursive deletion of `/` or the whole home directory), local git history operations (hard reset, clean, force branch delete, rebase), `chmod -R 777`, `terraform apply`/`pulumi up` (destroy still escalates), `docker … prune`, `gh release create` (delete still escalates), `gh auth logout`, `kill -9`, `systemctl stop`, shutdown/reboot, natural-language "delete all", "remove directory/folder" (volume/partition/bucket still escalate), `DROP INDEX` (TABLE/DATABASE/SCHEMA still escalate), and merging a pull request. Force-push, `sudo rm`, `dd`/`mkfs`/`shred`, database data loss, prod deploys, package publishes, cloud-resource deletion, credential rotation, and mass sends all remain.
+- Removed two suspected-irreversible heuristics (a bare "are you absolutely sure" and overwrite/discard of changes/work) and dropped "remove" from the destructive-verb heuristic — routine agent prompts no longer trip false-alarm escalations; explicit no-undo language, "permanently delete", forced overwrites, credential invalidation, and prod/public publishing still do. Operators wanting any removed pattern back can re-add it via `safety.never_auto_patterns`.
+
 ## 0.6.8
 
 - Fixed accepting an LLM-generated task escalation with a send under a `github_gist` task source, which failed with `stat gist://…: no such file or directory` after the list had already been created, the source registered and the escalation consumed — leaving the task in the list but never delivered. The send-time reservation was still reading the task list as a local file.
