@@ -17,6 +17,8 @@ Run rm -rf -- / on the container?
 Allow rm -rf -- "$HOME" to clear the user profile?
 Run rm -rf --no-preserve-root / to rebuild the image?
 Approve rm -rf --no-preserve-root "$HOME" before reimaging?
+Run rm --recursive --force --no-preserve-root / to reset the node?
+Approve rm --recursive --force "$HOME" for the cleanup job?
 Approve: shred --remove secrets.txt?
 Run mkfs.ext4 /dev/sdb1 to format the volume?
 Allow dd if=/dev/zero of=/dev/sda bs=1M?

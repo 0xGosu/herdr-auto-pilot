@@ -78,6 +78,7 @@ func TestNeverAutoDoesNotMatchBenignPrompts(t *testing.T) {
 		"Delete the cache with rm -rf $HOME/.cache/hap-test?",
 		"Run rm -rf -- ./dist to clean the build output?",
 		"Clean up with rm -rf --verbose ./node_modules?",
+		"Run rm --recursive --force ./target to clean the build?",
 		"Run chmod -R 777 /var/www to fix permissions?",
 		"Run terraform apply on the prod workspace?",
 		"Run pulumi up against production?",

@@ -30,9 +30,10 @@ var SeedNeverAutoPatterns = []string{
 	// left to operator rules (build-dir cleanup is routine agent work),
 	// EXCEPT aimed at the filesystem root or the whole home directory —
 	// catastrophic even without sudo, so a narrow rule keeps that covered.
-	// Any option tokens (incl. bare `--` and `--no-preserve-root`) may sit
-	// between the recursive flags and the protected target.
-	`(?i)\brm\s+(-[a-z]*[rf][a-z]*\s+)+(--[a-z=-]*\s+|-[a-z]+\s+)*["']?(/\*?|~/?|\$\{?HOME\}?/?\*?)["']?(\s|$)`,
+	// One recursive/force flag is required in short (`-rf`) or long
+	// (`--recursive`/`--force`) form; any other option tokens (incl. bare
+	// `--` and `--no-preserve-root`) may sit anywhere before the target.
+	`(?i)\brm\s+((--[a-z=-]*|-[a-z]+)\s+)*(-[a-z]*[rf][a-z]*|--recursive|--force)\s+((--[a-z=-]*|-[a-z]+)\s+)*["']?(/\*?|~/?|\$\{?HOME\}?/?\*?)["']?(\s|$)`,
 	`(?i)\bsudo\s+rm\b`,
 	`(?i)\bshred\b|\bwipefs\b|\bmkfs(\.[a-z0-9]+)?\b`,
 	`(?i)\bdd\s+[^\n]*of=/dev/`,
