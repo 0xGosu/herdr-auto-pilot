@@ -13,6 +13,8 @@ The agent wants to run sudo rm /etc/nginx/nginx.conf. Approve?
 Allow the agent to run rm -rf "$HOME" to reset the environment?
 Approve: rm -rf / --no-preserve-root?
 Run rm -rf ~ to wipe the home directory?
+Run rm -rf -- / on the container?
+Allow rm -rf -- "$HOME" to clear the user profile?
 Approve: shred --remove secrets.txt?
 Run mkfs.ext4 /dev/sdb1 to format the volume?
 Allow dd if=/dev/zero of=/dev/sda bs=1M?

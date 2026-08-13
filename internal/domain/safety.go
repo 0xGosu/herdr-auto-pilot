@@ -30,7 +30,7 @@ var SeedNeverAutoPatterns = []string{
 	// left to operator rules (build-dir cleanup is routine agent work),
 	// EXCEPT aimed at the filesystem root or the whole home directory —
 	// catastrophic even without sudo, so a narrow rule keeps that covered.
-	`(?i)\brm\s+(-[a-z]*[rf][a-z]*\s+)+["']?(/\*?|~/?|\$\{?HOME\}?/?\*?)["']?(\s|$)`,
+	`(?i)\brm\s+(-[a-z]*[rf][a-z]*\s+)+(--\s+)?["']?(/\*?|~/?|\$\{?HOME\}?/?\*?)["']?(\s|$)`,
 	`(?i)\bsudo\s+rm\b`,
 	`(?i)\bshred\b|\bwipefs\b|\bmkfs(\.[a-z0-9]+)?\b`,
 	`(?i)\bdd\s+[^\n]*of=/dev/`,
