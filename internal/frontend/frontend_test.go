@@ -248,16 +248,18 @@ func TestPauseResumeAppendsKillEvents(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
 
-	if err := app.Pause(ctx); err != nil {
-		t.Fatal(err)
+	changed, err := app.Pause(ctx)
+	if err != nil || !changed {
+		t.Fatalf("pause: changed=%v err=%v", changed, err)
 	}
 	stat, err := app.GetStatus(ctx)
 	if err != nil || !stat.Paused {
 		t.Fatalf("pause not reflected: %+v %v", stat, err)
 	}
 
-	if err := app.Resume(ctx); err != nil {
-		t.Fatal(err)
+	changed, err = app.Resume(ctx)
+	if err != nil || !changed {
+		t.Fatalf("resume: changed=%v err=%v", changed, err)
 	}
 	stat, _ = app.GetStatus(ctx)
 	if stat.Paused {
@@ -268,6 +270,44 @@ func TestPauseResumeAppendsKillEvents(t *testing.T) {
 	events, _ := st.KillEvents(ctx, 10)
 	if len(events) != 2 {
 		t.Errorf("kill history rows = %d, want 2", len(events))
+	}
+}
+
+// A pause while already paused (or a resume while already running) is a
+// no-op: reported as changed=false and recording NO kill event, so pressing
+// "p"/"r" repeatedly cannot flood the history.
+func TestPauseResumeNoOpsRecordNoKillEvent(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+
+	// Resume before any pause: nothing to lift.
+	if changed, err := app.Resume(ctx); err != nil || changed {
+		t.Fatalf("resume on a never-paused daemon: changed=%v err=%v, want a no-op", changed, err)
+	}
+	if events, _ := st.KillEvents(ctx, 10); len(events) != 0 {
+		t.Fatalf("no-op resume recorded %d kill events, want 0", len(events))
+	}
+
+	if changed, err := app.Pause(ctx); err != nil || !changed {
+		t.Fatalf("first pause: changed=%v err=%v", changed, err)
+	}
+	if changed, err := app.Pause(ctx); err != nil || changed {
+		t.Fatalf("second pause: changed=%v err=%v, want a no-op", changed, err)
+	}
+	if stat, err := app.GetStatus(ctx); err != nil || !stat.Paused {
+		t.Fatalf("no-op pause must leave the daemon paused: %+v %v", stat, err)
+	}
+
+	if changed, err := app.Resume(ctx); err != nil || !changed {
+		t.Fatalf("first resume: changed=%v err=%v", changed, err)
+	}
+	if changed, err := app.Resume(ctx); err != nil || changed {
+		t.Fatalf("second resume: changed=%v err=%v, want a no-op", changed, err)
+	}
+
+	events, _ := st.KillEvents(ctx, 10)
+	if len(events) != 2 {
+		t.Errorf("kill history rows = %d, want only the two real transitions", len(events))
 	}
 }
 

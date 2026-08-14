@@ -598,28 +598,46 @@ func (a *App) KillHistory(ctx context.Context, limit int) ([]domain.KillEvent, e
 	return a.Store.KillEvents(ctx, limit)
 }
 
-// Pause activates the global pause/kill switch (FR-017).
-func (a *App) Pause(ctx context.Context) error {
+// Pause activates the global pause/kill switch (FR-017). Pausing while
+// already paused is reported as changed=false and records NO kill event, so
+// a repeated "p"/`hap pause` cannot flood the history with no-op rows.
+func (a *App) Pause(ctx context.Context) (changed bool, err error) {
+	latest, err := a.Store.LatestKillEvent(ctx)
+	if err != nil {
+		return false, err
+	}
+	if domain.KillStateActive(latest) {
+		return false, nil
+	}
 	if _, err := a.Store.InsertKillEvent(ctx, domain.KillEvent{
 		State: "active", Scope: "global", Author: a.Author, CreatedAt: time.Now(),
 	}); err != nil {
-		return err
+		return false, err
 	}
 	// The nudge is best-effort: the daemon reads the latest kill row every
 	// pipeline tick, so the pause takes effect regardless.
 	a.nudge(ctx, control.KindReload)
-	return nil
+	return true, nil
 }
 
-// Resume deactivates the pause/kill switch.
-func (a *App) Resume(ctx context.Context) error {
+// Resume deactivates the pause/kill switch. Resuming while automation is
+// already running (including never having been paused) is a no-op reported
+// as changed=false, mirroring Pause.
+func (a *App) Resume(ctx context.Context) (changed bool, err error) {
+	latest, err := a.Store.LatestKillEvent(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !domain.KillStateActive(latest) {
+		return false, nil
+	}
 	if _, err := a.Store.InsertKillEvent(ctx, domain.KillEvent{
 		State: "resumed", Scope: "global", Author: a.Author, CreatedAt: time.Now(),
 	}); err != nil {
-		return err
+		return false, err
 	}
 	a.nudge(ctx, control.KindReload)
-	return nil
+	return true, nil
 }
 
 // FocusAgent brings the herdr UI to the agent's exact pane (tab focus + pane

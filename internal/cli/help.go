@@ -171,10 +171,11 @@ func buildCommands() {
 			Aliases: []string{"--skill"},
 			Group:   groupCore,
 			Summary: "print the bundled hap agent skill document, or install it for coding agents",
-			Usage:   []string{"hap skill", "hap --skill", "hap skill install <claude|codex|agents>..."},
+			Usage:   []string{"hap skill", "hap skill show", "hap --skill", "hap skill install <claude|codex|agents>..."},
 			Details: "The SKILL.md that teaches a coding agent to drive hap ships inside the binary,\n" +
-				"so no repo checkout is needed. Without arguments the document is printed to\n" +
-				"stdout. `install` writes it into the named agents' skill directories:\n" +
+				"so no repo checkout is needed. Without arguments (or with the explicit `show`)\n" +
+				"the document is printed to stdout. `install` writes it into the named agents'\n" +
+				"skill directories:\n" +
 				"  claude → ~/.claude/skills/hap/SKILL.md\n" +
 				"  codex  → ~/.codex/skills/hap/SKILL.md\n" +
 				"  agents → ~/.agents/skills/hap/SKILL.md   (other tools sharing ~/.agents)\n" +
@@ -516,8 +517,13 @@ func buildCommands() {
 				{Cmd: "hap kill-history", Why: "see who paused and when"},
 			},
 			Handler: func(ctx context.Context, app *frontend.App, out io.Writer, _ []string) error {
-				if err := app.Pause(ctx); err != nil {
+				changed, err := app.Pause(ctx)
+				if err != nil {
 					return err
+				}
+				if !changed {
+					fmt.Fprintln(out, "automation already paused (kill switch active)")
+					return nil
 				}
 				fmt.Fprintln(out, "automation paused (kill switch active)")
 				return nil
@@ -535,8 +541,13 @@ func buildCommands() {
 				{Cmd: "hap escalations", Why: "handle what queued up while paused"},
 			},
 			Handler: func(ctx context.Context, app *frontend.App, out io.Writer, _ []string) error {
-				if err := app.Resume(ctx); err != nil {
+				changed, err := app.Resume(ctx)
+				if err != nil {
 					return err
+				}
+				if !changed {
+					fmt.Fprintln(out, "automation already resumed")
+					return nil
 				}
 				fmt.Fprintln(out, "automation resumed")
 				return nil

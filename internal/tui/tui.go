@@ -116,6 +116,10 @@ type actionResultMsg struct {
 	// if the pause request itself failed (the state never transitioned, so
 	// nothing will consume the flag otherwise).
 	pauseAction bool
+	// pauseNoChange marks a pause that was a no-op (already paused): like a
+	// failure, the state never transitions, so the flag must be cleared here
+	// rather than left to wrongly suppress a later external pause's bell.
+	pauseNoChange bool
 	// token identifies WHICH action produced this result, for state a
 	// keypress stashed awaiting its own completion. Zero for the untagged
 	// majority; see doTagged.
@@ -1782,11 +1786,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case actionResultMsg:
 		m.applyTaskLists(msg.taskLists)
-		if msg.pauseAction && msg.err != nil {
-			// The pause request itself failed, so Paused never transitions
-			// and the refreshMsg diff above will never consume the flag —
+		if msg.pauseAction && (msg.err != nil || (msg.pauseNoChange && m.lastPaused)) {
+			// The pause request failed, or was a no-op on a pause this TUI
+			// had already OBSERVED (lastPaused): Paused never transitions,
+			// so the refreshMsg diff above will never consume the flag —
 			// clear it here so it doesn't wrongly suppress some later,
-			// unrelated external pause.
+			// unrelated external pause. A no-op while lastPaused is still
+			// false is different: it is the second of a rapid double-press
+			// whose FIRST press's transition is still en route to the next
+			// refresh, and clearing would make that self-caused pause read
+			// as external and ring the bell.
 			m.pausePending = false
 		}
 		if msg.err != nil {
@@ -2251,7 +2260,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.pauseCmd()
 	case "r":
 		m.beginAction()
-		return m, m.do("automation resumed", func(ctx context.Context) error { return m.app.Resume(ctx) })
+		return m, m.doResult(func(ctx context.Context) (string, error) {
+			changed, err := m.app.Resume(ctx)
+			if err != nil {
+				return "", err
+			}
+			if !changed {
+				return "automation already resumed", nil
+			}
+			return "automation resumed", nil
+		})
 	case "R":
 		switch d := m.data.status.Drift; {
 		case !d.Detected:
@@ -2425,6 +2443,26 @@ func (m Model) do(okMsg string, fn func(context.Context) error) tea.Cmd {
 	return m.doTagged(0, okMsg, fn)
 }
 
+// doResult is do for a mutation whose success message depends on its outcome
+// (e.g. resume reporting "already resumed" on a no-op), with the same
+// inflight accounting.
+func (m Model) doResult(fn func(context.Context) (string, error)) tea.Cmd {
+	ctx, wg := m.ctx, m.inflight
+	if wg != nil {
+		wg.Add(1)
+	}
+	return func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
+		okMsg, err := fn(ctx)
+		if err != nil {
+			return actionResultMsg{err: err}
+		}
+		return actionResultMsg{message: okMsg}
+	}
+}
+
 // doTagged runs a mutation and reports its outcome, stamping the result with
 // tok so Update can tell THIS action's completion from any other's. Mutations
 // are concurrent and unordered — the UI keeps accepting keys while one is in
@@ -2576,12 +2614,24 @@ func ringBellTo(w io.Writer) {
 
 // pauseCmd activates the pause/kill switch, tagging its result as
 // pauseAction so Update can clear Model.pausePending if the request itself
-// failed — the generic do() helper has no channel for that extra signal.
+// failed or was a no-op — the generic do()/doResult() helpers have no channel
+// for those extra signals. It carries the same inflight accounting as do(),
+// so a "p" pressed just before quit still lands before Run's drain returns.
 func (m Model) pauseCmd() tea.Cmd {
-	app, ctx := m.app, m.ctx
+	app, ctx, wg := m.app, m.ctx, m.inflight
+	if wg != nil {
+		wg.Add(1)
+	}
 	return func() tea.Msg {
-		if err := app.Pause(ctx); err != nil {
+		if wg != nil {
+			defer wg.Done()
+		}
+		changed, err := app.Pause(ctx)
+		if err != nil {
 			return actionResultMsg{err: err, pauseAction: true}
+		}
+		if !changed {
+			return actionResultMsg{message: "automation already paused", pauseAction: true, pauseNoChange: true}
 		}
 		return actionResultMsg{message: "automation paused", pauseAction: true}
 	}

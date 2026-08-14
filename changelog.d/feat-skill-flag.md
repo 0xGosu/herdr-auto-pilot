@@ -1,2 +1,3 @@
-- Added `hap --skill` (also `hap skill`): prints the bundled hap agent skill document — SKILL.md now ships inside the binary, so no repo checkout is needed to read it.
+- Added `hap --skill` (also `hap skill` / `hap skill show`): prints the bundled hap agent skill document — SKILL.md now ships inside the binary, so no repo checkout is needed to read it.
 - Added skill installation for coding agents: `hap skill install <claude|codex|agents>...` and a Config-tab quick shortcut in the TUI (multi-select Claude / Codex / Others) write the bundled SKILL.md to `~/.claude/skills/hap/`, `~/.codex/skills/hap/`, or `~/.agents/skills/hap/`.
+- Changed `hap pause` / `hap resume` (and the TUI `p`/`r` keys) to be idempotent: pausing while already paused or resuming while already running now reports "already paused/resumed" and records no kill-history event, so repeated presses no longer flood the history with no-op rows.
