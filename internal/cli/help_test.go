@@ -156,6 +156,11 @@ func TestWantsCommandHelp(t *testing.T) {
 		{verb: "task", args: []string{"agent", "list", "--help"}, want: true},
 		{verb: "version", want: false},
 		{verb: "--version", args: []string{"--help"}, want: false},
+		{verb: "skill", args: []string{"--help"}, want: true},
+		// Unlike --version, --skill is a registered alias, so `hap --skill
+		// --help` answers with the guide instead of the 77KB document.
+		{verb: "--skill", args: []string{"--help"}, want: true},
+		{verb: "skill", want: false},
 		{verb: "not-a-command", args: []string{"--help"}, want: false},
 		{verb: "resolve", args: []string{"1", "--action", "--help"}, want: false},
 	}

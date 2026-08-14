@@ -107,7 +107,18 @@ func help(out io.Writer, args []string) error {
 			return nil
 		}
 	}
-	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+	if len(args) == 0 {
+		Overview(out)
+		return nil
+	}
+	if strings.HasPrefix(args[0], "-") {
+		// A dashed arg is normally a flag aimed at help itself — but a
+		// registered dashed ALIAS (--skill) names a command being asked
+		// about, so `hap --skill --help` answers with that guide.
+		if cmd, ok := Lookup(args[0]); ok {
+			PrintHelp(out, cmd)
+			return nil
+		}
 		Overview(out)
 		return nil
 	}

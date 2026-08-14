@@ -26,6 +26,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
 
+	skilldoc "github.com/0xGosu/herdr-auto-pilot"
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -115,6 +116,10 @@ type actionResultMsg struct {
 	// if the pause request itself failed (the state never transitioned, so
 	// nothing will consume the flag otherwise).
 	pauseAction bool
+	// pauseNoChange marks a pause that was a no-op (already paused): like a
+	// failure, the state never transitions, so the flag must be cleared here
+	// rather than left to wrongly suppress a later external pause's bell.
+	pauseNoChange bool
 	// token identifies WHICH action produced this result, for state a
 	// keypress stashed awaiting its own completion. Zero for the untagged
 	// majority; see doTagged.
@@ -191,6 +196,14 @@ type prompt struct {
 	// operator picks from the known set instead of typing a name blind.
 	options []string
 	optIdx  int
+	// multi turns the picker into a multi-select: space toggles the
+	// highlighted option's checkbox, enter submits every checked option —
+	// falling back to the highlighted one when none is checked, the same
+	// fallback convention as the list-tab multi-selects — and the choices go
+	// to onSubmitMulti instead of onSubmit.
+	multi         bool
+	checked       []bool
+	onSubmitMulti func([]string) tea.Cmd
 	// cursor is the caret's position as a RUNE index into input (0 = before
 	// the first rune, len = past the last), so every edit lands where the
 	// operator put it instead of always at the end. Rune-indexed, not
@@ -670,6 +683,23 @@ func (m Model) submitPrompt() (tea.Model, tea.Cmd) {
 	p := m.prompt
 	m.prompt = nil
 	if len(p.options) > 0 {
+		if p.multi {
+			// Multi-select picker: submit the checked options, or the
+			// highlighted one when nothing is checked.
+			if p.onSubmitMulti == nil {
+				return m, nil
+			}
+			var chosen []string
+			for i, opt := range p.options {
+				if i < len(p.checked) && p.checked[i] {
+					chosen = append(chosen, opt)
+				}
+			}
+			if len(chosen) == 0 {
+				chosen = []string{p.options[p.optIdx]}
+			}
+			return m, p.onSubmitMulti(chosen)
+		}
 		// Picker mode: submit the highlighted option verbatim.
 		return m, p.onSubmit(p.options[p.optIdx])
 	}
@@ -799,6 +829,10 @@ type Model struct {
 	// installShortcut is injectable so the key flow can be tested without
 	// writing /usr/local/bin. A nil value uses installHAPShortcut.
 	installShortcut func() error
+
+	// installSkill is injectable so the skill-install flow can be tested
+	// without writing the real $HOME. A nil value uses skilldoc.Install.
+	installSkill func(names []string) ([]string, error)
 
 	// cursors is the selected row of each tab, remembered across tab switches
 	// so returning to a tab restores the row you left it on (CR-038). Only the
@@ -1607,6 +1641,11 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		key:   "install-hap",
 		label: shortcutLabel(hapShortcutState()),
 	})
+	items = append(items, ruleItem{
+		kind:  "shortcut",
+		key:   "install-skill",
+		label: "Install hap agent skill for coding agents (Claude / Codex / others)",
+	})
 	return items
 }
 
@@ -1747,11 +1786,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case actionResultMsg:
 		m.applyTaskLists(msg.taskLists)
-		if msg.pauseAction && msg.err != nil {
-			// The pause request itself failed, so Paused never transitions
-			// and the refreshMsg diff above will never consume the flag —
+		if msg.pauseAction && (msg.err != nil || (msg.pauseNoChange && m.lastPaused)) {
+			// The pause request failed, or was a no-op on a pause this TUI
+			// had already OBSERVED (lastPaused): Paused never transitions,
+			// so the refreshMsg diff above will never consume the flag —
 			// clear it here so it doesn't wrongly suppress some later,
-			// unrelated external pause.
+			// unrelated external pause. A no-op while lastPaused is still
+			// false is different: it is the second of a rapid double-press
+			// whose FIRST press's transition is still en route to the next
+			// refresh, and clearing would make that self-caused pause read
+			// as external and ring the bell.
 			m.pausePending = false
 		}
 		if msg.err != nil {
@@ -2093,6 +2137,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.prompt.optIdx++
 			}
 			return m, nil
+		case " ":
+			if m.prompt.multi {
+				if len(m.prompt.checked) != len(m.prompt.options) {
+					m.prompt.checked = make([]bool, len(m.prompt.options))
+				}
+				m.prompt.checked[m.prompt.optIdx] = !m.prompt.checked[m.prompt.optIdx]
+			}
+			return m, nil
 		default:
 			return m, nil
 		}
@@ -2208,7 +2260,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.pauseCmd()
 	case "r":
 		m.beginAction()
-		return m, m.do("automation resumed", func(ctx context.Context) error { return m.app.Resume(ctx) })
+		return m, m.doResult(func(ctx context.Context) (string, error) {
+			changed, err := m.app.Resume(ctx)
+			if err != nil {
+				return "", err
+			}
+			if !changed {
+				return "automation already resumed", nil
+			}
+			return "automation resumed", nil
+		})
 	case "R":
 		switch d := m.data.status.Drift; {
 		case !d.Detected:
@@ -2382,6 +2443,26 @@ func (m Model) do(okMsg string, fn func(context.Context) error) tea.Cmd {
 	return m.doTagged(0, okMsg, fn)
 }
 
+// doResult is do for a mutation whose success message depends on its outcome
+// (e.g. resume reporting "already resumed" on a no-op), with the same
+// inflight accounting.
+func (m Model) doResult(fn func(context.Context) (string, error)) tea.Cmd {
+	ctx, wg := m.ctx, m.inflight
+	if wg != nil {
+		wg.Add(1)
+	}
+	return func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
+		okMsg, err := fn(ctx)
+		if err != nil {
+			return actionResultMsg{err: err}
+		}
+		return actionResultMsg{message: okMsg}
+	}
+}
+
 // doTagged runs a mutation and reports its outcome, stamping the result with
 // tok so Update can tell THIS action's completion from any other's. Mutations
 // are concurrent and unordered — the UI keeps accepting keys while one is in
@@ -2533,12 +2614,24 @@ func ringBellTo(w io.Writer) {
 
 // pauseCmd activates the pause/kill switch, tagging its result as
 // pauseAction so Update can clear Model.pausePending if the request itself
-// failed — the generic do() helper has no channel for that extra signal.
+// failed or was a no-op — the generic do()/doResult() helpers have no channel
+// for those extra signals. It carries the same inflight accounting as do(),
+// so a "p" pressed just before quit still lands before Run's drain returns.
 func (m Model) pauseCmd() tea.Cmd {
-	app, ctx := m.app, m.ctx
+	app, ctx, wg := m.app, m.ctx, m.inflight
+	if wg != nil {
+		wg.Add(1)
+	}
 	return func() tea.Msg {
-		if err := app.Pause(ctx); err != nil {
+		if wg != nil {
+			defer wg.Done()
+		}
+		changed, err := app.Pause(ctx)
+		if err != nil {
 			return actionResultMsg{err: err, pauseAction: true}
+		}
+		if !changed {
+			return actionResultMsg{message: "automation already paused", pauseAction: true, pauseNoChange: true}
 		}
 		return actionResultMsg{message: "automation paused", pauseAction: true}
 	}
@@ -4717,29 +4810,79 @@ func (m Model) activateSelectedConfig() (tea.Model, tea.Cmd) {
 	if item.kind != "shortcut" {
 		return m.editSelectedRule()
 	}
-	if item.key != "install-hap" {
+	// The two shortcuts confirm differently on purpose: the symlink touches
+	// /usr/local/bin and keeps its Y/n modal; the skill install's multi-select
+	// IS the confirmation (it only creates or refreshes hap's own file under
+	// the operator's home).
+	switch item.key {
+	case "install-hap":
+		install := m.installShortcut
+		if install == nil {
+			install = installHAPShortcut
+		}
+		// Read the state once, here, so the prompt and the result message agree
+		// with each other and with the row the operator selected.
+		state := hapShortcutState()
+		m.message = ""
+		m.confirm = &confirmation{
+			label: shortcutConfirm(state),
+			onConfirm: func() tea.Cmd {
+				return func() tea.Msg {
+					if err := install(); err != nil {
+						return actionResultMsg{err: err}
+					}
+					return actionResultMsg{message: shortcutResult(state)}
+				}
+			},
+		}
 		return m, nil
+	case "install-skill":
+		return m.openSkillInstallPrompt()
 	}
+	return m, nil
+}
 
-	install := m.installShortcut
+// openSkillInstallPrompt opens the multi-select of agent skill directories
+// the bundled SKILL.md can be installed into.
+func (m Model) openSkillInstallPrompt() (tea.Model, tea.Cmd) {
+	install := m.installSkill
 	if install == nil {
-		install = installHAPShortcut
+		install = skilldoc.Install
 	}
-	// Read the state once, here, so the prompt and the result message agree
-	// with each other and with the row the operator selected.
-	state := hapShortcutState()
+	targets := skilldoc.Targets()
+	opts := make([]string, len(targets))
+	nameByOpt := make(map[string]string, len(targets))
+	for i, t := range targets {
+		opts[i] = fmt.Sprintf("%s (%s)", t.Label, t.DestDir())
+		nameByOpt[opts[i]] = t.Name
+	}
 	m.message = ""
-	m.confirm = &confirmation{
-		label: shortcutConfirm(state),
-		onConfirm: func() tea.Cmd {
+	m.openPrompt(&prompt{
+		label:   "Install hap agent skill into:",
+		options: opts,
+		multi:   true,
+		checked: make([]bool, len(opts)),
+		onSubmitMulti: func(chosen []string) tea.Cmd {
+			names := make([]string, 0, len(chosen))
+			for _, opt := range chosen {
+				if name, ok := nameByOpt[opt]; ok {
+					names = append(names, name)
+				}
+			}
 			return func() tea.Msg {
-				if err := install(); err != nil {
+				written, err := install(names)
+				if err != nil {
+					// A mid-list failure already refreshed the earlier
+					// targets — say so instead of discarding them.
+					if len(written) > 0 {
+						err = fmt.Errorf("%w (already installed: %s)", err, strings.Join(written, ", "))
+					}
 					return actionResultMsg{err: err}
 				}
-				return actionResultMsg{message: shortcutResult(state)}
+				return actionResultMsg{message: "installed skill: " + strings.Join(written, ", ")}
 			}
 		},
-	}
+	})
 	return m, nil
 }
 
@@ -5672,7 +5815,15 @@ func (m Model) View() string {
 			if i == m.prompt.optIdx {
 				marker = "❯ "
 			}
-			fmt.Fprintf(&b, "%s%s\n", marker, oneLine(opt, max(1, m.contentWidth()-promptIndentWidth)))
+			box := ""
+			if m.prompt.multi {
+				box = "[ ] "
+				if i < len(m.prompt.checked) && m.prompt.checked[i] {
+					box = "[x] "
+				}
+			}
+			fmt.Fprintf(&b, "%s%s%s\n", marker, box,
+				oneLine(opt, max(1, m.contentWidth()-promptIndentWidth-len(box))))
 		}
 	} else if m.prompt != nil {
 		// The input expands the box: one rendered row per line break AND per
@@ -5763,6 +5914,9 @@ func (m Model) helpLine() string {
 	// would push that text onto its own row for no reason.
 	if m.prompt != nil {
 		if len(m.prompt.options) > 0 {
+			if m.prompt.multi {
+				return "↑/↓: choose  space: toggle  enter: submit  esc: cancel"
+			}
 			return "↑/↓: choose  enter: select  esc: cancel"
 		}
 		newline := ""

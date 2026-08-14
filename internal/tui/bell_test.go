@@ -164,6 +164,66 @@ func TestBellPausePendingClearedOnFailedPauseAction(t *testing.T) {
 	}
 }
 
+// A "p" press while already paused is a no-op: like a failed pause, Paused
+// never transitions, so the no-op result itself must consume the flag.
+func TestBellPausePendingClearedOnNoOpPauseAction(t *testing.T) {
+	m, buf := bellModel()
+	cfg := config.Config{TUI: config.TUI{TerminalBell: true}}
+
+	// Already paused when "p" is pressed (an earlier refresh said so).
+	upd, _ := m.Update(refreshMsg{cfg: cfg, status: frontend.Status{Paused: true}})
+	m = upd.(Model)
+	m.pausePending = true
+
+	upd, _ = m.Update(actionResultMsg{message: "automation already paused", pauseAction: true, pauseNoChange: true})
+	m = upd.(Model)
+	if m.pausePending {
+		t.Fatal("a no-op pause action must clear pausePending, not leave it dangling")
+	}
+
+	// A later external resume→pause cycle must now correctly ring.
+	upd, _ = m.Update(refreshMsg{cfg: cfg, status: frontend.Status{Paused: false}})
+	m = upd.(Model)
+	upd, _ = m.Update(refreshMsg{cfg: cfg, status: frontend.Status{Paused: true}})
+	m = upd.(Model)
+	if got := buf.Bytes(); len(got) != 1 || got[0] != 0x07 {
+		t.Fatalf("external pause after a cleared pausePending should ring, got %v", got)
+	}
+}
+
+// A rapid DOUBLE-press of "p" from an unpaused state: the second press's
+// no-op result lands before the refresh that reports the first press's
+// false→true transition. The no-op must NOT clear pausePending there —
+// the pause is self-caused, and clearing would ring the bell for it.
+func TestBellNoOpPauseBeforeObservedTransitionKeepsSuppression(t *testing.T) {
+	m, buf := bellModel()
+	cfg := config.Config{TUI: config.TUI{TerminalBell: true}}
+
+	upd, _ := m.Update(refreshMsg{cfg: cfg, status: frontend.Status{Paused: false}})
+	m = upd.(Model)
+	m.pausePending = true // both presses set it synchronously
+
+	// First press's result, then the second press's no-op result — both
+	// arrive before the next refresh.
+	upd, _ = m.Update(actionResultMsg{message: "automation paused", pauseAction: true})
+	m = upd.(Model)
+	upd, _ = m.Update(actionResultMsg{message: "automation already paused", pauseAction: true, pauseNoChange: true})
+	m = upd.(Model)
+	if !m.pausePending {
+		t.Fatal("a no-op result before the transition is observed must keep pausePending")
+	}
+
+	// The refresh finally reports the operator's own pause: no bell.
+	upd, _ = m.Update(refreshMsg{cfg: cfg, status: frontend.Status{Paused: true}})
+	m = upd.(Model)
+	if got := buf.Bytes(); len(got) != 0 {
+		t.Fatalf("self-caused pause should not ring after a no-op second press, got %v", got)
+	}
+	if m.pausePending {
+		t.Fatal("the observed transition should consume pausePending")
+	}
+}
+
 func TestBellNilOutputNeverPanics(t *testing.T) {
 	m := Model{width: 100, height: 30} // bellOut left nil
 	cfg := config.Config{TUI: config.TUI{TerminalBell: true}}
