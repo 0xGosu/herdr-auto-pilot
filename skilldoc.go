@@ -50,26 +50,41 @@ func TargetNames() []string {
 	return names
 }
 
-// HomeDir is the destination directory as shown to the operator, e.g.
-// "~/.claude/skills".
-func (t Target) HomeDir() string {
-	return "~/" + t.Dir
+// DestDir is the directory the skill is installed into, as shown to the
+// operator, e.g. "~/.claude/skills/hap".
+func (t Target) DestDir() string {
+	return "~/" + t.Dir + "/hap"
 }
 
 // Install writes the bundled skill into the named targets' skill directories
-// under the current user's home, returning the paths written.
+// under the current user's home, returning the paths written. A write failure
+// mid-list still returns the paths already written alongside the error.
 func Install(names []string) ([]string, error) {
+	picked, err := pickTargets(names)
+	if err != nil {
+		return nil, err
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolve home dir: %w", err)
 	}
-	return InstallTo(home, names)
+	return installTargets(home, picked)
 }
 
 // InstallTo is Install against an explicit home directory. Each selected
 // target gets <home>/<target dir>/hap/SKILL.md, created or overwritten
 // atomically. An unknown name fails before anything else is written.
 func InstallTo(home string, names []string) ([]string, error) {
+	picked, err := pickTargets(names)
+	if err != nil {
+		return nil, err
+	}
+	return installTargets(home, picked)
+}
+
+// pickTargets validates the selection before anything touches the filesystem,
+// so an argument mistake is reported as one even when $HOME is unresolvable.
+func pickTargets(names []string) ([]Target, error) {
 	valid := strings.Join(TargetNames(), ", ")
 	if len(names) == 0 {
 		return nil, fmt.Errorf("no install target named; valid targets: %s", valid)
@@ -87,6 +102,10 @@ func InstallTo(home string, names []string) ([]string, error) {
 		}
 		picked = append(picked, t)
 	}
+	return picked, nil
+}
+
+func installTargets(home string, picked []Target) ([]string, error) {
 	written := make([]string, 0, len(picked))
 	for _, t := range picked {
 		dir := filepath.Join(home, filepath.FromSlash(t.Dir), "hap")

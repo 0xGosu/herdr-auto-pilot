@@ -125,14 +125,13 @@ func runSkill(w io.Writer, args []string) error {
 	if args[0] != "install" {
 		return fmt.Errorf("unknown skill subcommand %q (did you mean install?)", args[0])
 	}
+	// A mid-list write failure still reports the targets that DID install,
+	// so the operator knows ~/.claude was refreshed even when ~/.codex broke.
 	written, err := skilldoc.Install(args[1:])
-	if err != nil {
-		return err
-	}
 	for _, path := range written {
 		fmt.Fprintln(w, "installed", path)
 	}
-	return nil
+	return err
 }
 
 // shutdownSignals are the signals that cancel the run context instead of

@@ -91,3 +91,33 @@ func TestInstallToRequiresATarget(t *testing.T) {
 		t.Fatalf("expected a no-target error, got %v", err)
 	}
 }
+
+// A write failure mid-list must still report what DID install, so the caller
+// can tell the operator ~/.claude was refreshed even though ~/.codex broke.
+func TestInstallToReportsPartialWritesOnFailure(t *testing.T) {
+	home := t.TempDir()
+	// A plain file where the .codex directory should go makes that target's
+	// MkdirAll fail after the claude write succeeded.
+	if err := os.WriteFile(filepath.Join(home, ".codex"), []byte("in the way"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	written, err := InstallTo(home, []string{"claude", "codex"})
+	if err == nil {
+		t.Fatal("expected the codex write to fail")
+	}
+	want := filepath.Join(home, ".claude", "skills", "hap", "SKILL.md")
+	if len(written) != 1 || written[0] != want {
+		t.Fatalf("written = %v, want the already-installed %q", written, want)
+	}
+}
+
+// Argument mistakes are reported as such even when $HOME is unresolvable —
+// validation must run before home resolution.
+func TestInstallValidatesTargetsBeforeResolvingHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	_, err := Install([]string{"cursor"})
+	if err == nil || !strings.Contains(err.Error(), `unknown install target "cursor"`) {
+		t.Fatalf("expected the unknown-target error, got %v", err)
+	}
+}

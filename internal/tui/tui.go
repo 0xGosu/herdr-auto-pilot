@@ -4803,7 +4803,7 @@ func (m Model) openSkillInstallPrompt() (tea.Model, tea.Cmd) {
 	opts := make([]string, len(targets))
 	nameByOpt := make(map[string]string, len(targets))
 	for i, t := range targets {
-		opts[i] = fmt.Sprintf("%s (%s)", t.Label, t.HomeDir())
+		opts[i] = fmt.Sprintf("%s (%s)", t.Label, t.DestDir())
 		nameByOpt[opts[i]] = t.Name
 	}
 	m.message = ""
@@ -4822,6 +4822,11 @@ func (m Model) openSkillInstallPrompt() (tea.Model, tea.Cmd) {
 			return func() tea.Msg {
 				written, err := install(names)
 				if err != nil {
+					// A mid-list failure already refreshed the earlier
+					// targets — say so instead of discarding them.
+					if len(written) > 0 {
+						err = fmt.Errorf("%w (already installed: %s)", err, strings.Join(written, ", "))
+					}
 					return actionResultMsg{err: err}
 				}
 				return actionResultMsg{message: "installed skill: " + strings.Join(written, ", ")}
