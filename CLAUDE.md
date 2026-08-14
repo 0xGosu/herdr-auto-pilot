@@ -14,6 +14,11 @@ Prefer these for how-to detail — this file keeps only what must stay in view.
 - **`hap-development-local`** — the local dev loop: link the working tree, rebuild,
   hot-swap the daemon (`hap daemon --ensure`), and live-test against a real agent.
 
+The hap skill also ships inside the binary: `hap --skill` prints it, and
+`hap skill install <claude|codex|agents>...` (or the TUI Config-tab shortcut)
+installs it into `~/.claude/skills/hap/`, `~/.codex/skills/hap/`, or
+`~/.agents/skills/hap/`.
+
 ## Build, test, lint
 
 The semantic matcher links native code (llama.cpp via CGO, FAISS behind bleve's

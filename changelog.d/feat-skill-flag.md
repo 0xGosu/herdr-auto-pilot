@@ -1,0 +1,2 @@
+- Added `hap --skill` (also `hap skill`): prints the bundled hap agent skill document — SKILL.md now ships inside the binary, so no repo checkout is needed to read it.
+- Added skill installation for coding agents: `hap skill install <claude|codex|agents>...` and a Config-tab quick shortcut in the TUI (multi-select Claude / Codex / Others) write the bundled SKILL.md to `~/.claude/skills/hap/`, `~/.codex/skills/hap/`, or `~/.agents/skills/hap/`.

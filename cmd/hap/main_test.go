@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	skilldoc "github.com/0xGosu/herdr-auto-pilot"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 )
 
@@ -108,5 +110,45 @@ func TestDaemonFlagParsingRejectsUnknownAndOrderIndependent(t *testing.T) {
 	// running, and --replace-only is in effect).
 	if err := runDaemon(context.Background(), paths, []string{"--replace-only", "--ensure"}); err != nil {
 		t.Fatalf("reversed flag order = %v, want it accepted", err)
+	}
+}
+
+// TestRunSkill covers the `hap skill` dispatch main routes before run(): the
+// bare form dumps the embedded document, install writes it under $HOME, and a
+// typo of "install" is refused rather than answered with the 77KB dump.
+func TestRunSkill(t *testing.T) {
+	var out strings.Builder
+	if err := runSkill(&out, nil); err != nil {
+		t.Fatalf("runSkill: %v", err)
+	}
+	if out.String() != skilldoc.HapSkill {
+		t.Fatal("bare `hap skill` should print exactly the embedded document")
+	}
+
+	if err := runSkill(io.Discard, []string{"instal"}); err == nil ||
+		!strings.Contains(err.Error(), "unknown skill subcommand") {
+		t.Fatalf("a typo of install must be refused, got %v", err)
+	}
+	if err := runSkill(io.Discard, []string{"install"}); err == nil ||
+		!strings.Contains(err.Error(), "no install target named") {
+		t.Fatalf("install without a target must name the valid ones, got %v", err)
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	out.Reset()
+	if err := runSkill(&out, []string{"install", "claude"}); err != nil {
+		t.Fatalf("install claude: %v", err)
+	}
+	dest := filepath.Join(home, ".claude", "skills", "hap", "SKILL.md")
+	if !strings.Contains(out.String(), dest) {
+		t.Fatalf("install should print the written path %s, got %q", dest, out.String())
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != skilldoc.HapSkill {
+		t.Fatal("installed file differs from the embedded document")
 	}
 }

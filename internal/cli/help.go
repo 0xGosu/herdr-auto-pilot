@@ -167,6 +167,22 @@ func buildCommands() {
 			},
 		},
 		{
+			Name:    "skill",
+			Aliases: []string{"--skill"},
+			Group:   groupCore,
+			Summary: "print the bundled hap agent skill document, or install it for coding agents",
+			Usage:   []string{"hap skill", "hap --skill", "hap skill install <claude|codex|agents>..."},
+			Details: "The SKILL.md that teaches a coding agent to drive hap ships inside the binary,\n" +
+				"so no repo checkout is needed. Without arguments the document is printed to\n" +
+				"stdout. `install` writes it into the named agents' skill directories:\n" +
+				"  claude → ~/.claude/skills/hap/SKILL.md\n" +
+				"  codex  → ~/.codex/skills/hap/SKILL.md\n" +
+				"  agents → ~/.agents/skills/hap/SKILL.md   (other tools sharing ~/.agents)\n" +
+				"The TUI's Config tab offers the same install as a quick shortcut.",
+			Examples: []string{"hap skill | less", "hap skill install claude codex"},
+			Bare:     true,
+		},
+		{
 			Name:    "help",
 			Group:   groupCore,
 			Summary: "print this overview, or a full guide for one command",

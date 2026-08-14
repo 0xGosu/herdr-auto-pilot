@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	skilldoc "github.com/0xGosu/herdr-auto-pilot"
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -91,6 +93,15 @@ func main() {
 		fmt.Println(buildinfo.VersionLine())
 		return
 	}
+	// Like version, dispatched before run() so printing or installing the
+	// bundled skill never resolves config paths or opens the store.
+	if verb == "skill" || verb == "--skill" {
+		if err := runSkill(os.Stdout, args); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := run(verb, args); err != nil {
 		// `hap status` on an unhealthy daemon already printed the human detail;
@@ -100,6 +111,28 @@ func main() {
 		}
 		os.Exit(1)
 	}
+}
+
+// runSkill serves `hap skill` / `hap --skill`: with no arguments it dumps the
+// bundled SKILL.md; `install <target>...` writes it into the named agents'
+// skill directories. Any other subcommand is refused — a typo of "install"
+// must not answer with the 77KB document.
+func runSkill(w io.Writer, args []string) error {
+	if len(args) == 0 {
+		_, err := io.WriteString(w, skilldoc.HapSkill)
+		return err
+	}
+	if args[0] != "install" {
+		return fmt.Errorf("unknown skill subcommand %q (did you mean install?)", args[0])
+	}
+	written, err := skilldoc.Install(args[1:])
+	if err != nil {
+		return err
+	}
+	for _, path := range written {
+		fmt.Fprintln(w, "installed", path)
+	}
+	return nil
 }
 
 // shutdownSignals are the signals that cancel the run context instead of
