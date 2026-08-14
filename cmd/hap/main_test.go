@@ -124,6 +124,10 @@ func TestRunSkill(t *testing.T) {
 	if out.String() != skilldoc.HapSkill {
 		t.Fatal("bare `hap skill` should print exactly the embedded document")
 	}
+	out.Reset()
+	if err := runSkill(&out, []string{"show"}); err != nil || out.String() != skilldoc.HapSkill {
+		t.Fatalf("`hap skill show` should print exactly the embedded document (err=%v)", err)
+	}
 
 	if err := runSkill(io.Discard, []string{"instal"}); err == nil ||
 		!strings.Contains(err.Error(), "unknown skill subcommand") {

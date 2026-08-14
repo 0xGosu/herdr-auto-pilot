@@ -113,17 +113,17 @@ func main() {
 	}
 }
 
-// runSkill serves `hap skill` / `hap --skill`: with no arguments it dumps the
-// bundled SKILL.md; `install <target>...` writes it into the named agents'
-// skill directories. Any other subcommand is refused — a typo of "install"
-// must not answer with the 77KB document.
+// runSkill serves `hap skill` / `hap --skill`: with no arguments (or the
+// explicit `show`) it dumps the bundled SKILL.md; `install <target>...`
+// writes it into the named agents' skill directories. Any other subcommand
+// is refused — a typo must not answer with the 77KB document.
 func runSkill(w io.Writer, args []string) error {
-	if len(args) == 0 {
+	if len(args) == 0 || args[0] == "show" {
 		_, err := io.WriteString(w, skilldoc.HapSkill)
 		return err
 	}
 	if args[0] != "install" {
-		return fmt.Errorf("unknown skill subcommand %q (did you mean install?)", args[0])
+		return fmt.Errorf("unknown skill subcommand %q (did you mean show or install?)", args[0])
 	}
 	// A mid-list write failure still reports the targets that DID install,
 	// so the operator knows ~/.claude was refreshed even when ~/.codex broke.
