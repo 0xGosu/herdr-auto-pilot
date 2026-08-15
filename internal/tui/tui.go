@@ -108,6 +108,20 @@ type semanticSearchMsg struct {
 	err     error
 }
 
+// doublePressWindow is how long after a first "r" a second one still reads as
+// a double-press (the full self-prompting toggle). The first press's own
+// action (resume) is deferred by this window, so it must stay short enough to
+// be imperceptible and long enough for a deliberate double-tap.
+const doublePressWindow = 600 * time.Millisecond
+
+// doubleRTimerMsg fires when a first "r"'s double-press window expires with
+// no second "r": the deferred resume runs then. seq guards against stale
+// timers — every arm/disarm bumps Model.doubleRSeq, and only a matching value
+// may act.
+type doubleRTimerMsg struct {
+	seq int
+}
+
 type actionResultMsg struct {
 	message string
 	err     error
@@ -909,6 +923,16 @@ type Model struct {
 	// already true for every message processed afterward, regardless of
 	// which goroutine's result lands first.
 	pausePending bool
+
+	// doubleRArmed means a first "r" was seen and its single-press action
+	// (resume) is deferred by the double-press window; a second "r" inside
+	// the window toggles full self-prompting mode instead. Any other key
+	// disarms, so r,j,r is two singles, not a double.
+	doubleRArmed bool
+	// doubleRSeq invalidates stale deferral timers: every arm/disarm bumps
+	// it, and a doubleRTimerMsg only runs the deferred resume when its seq
+	// still matches.
+	doubleRSeq int
 
 	// pendingTUINote holds the "asked N older TUIs to close" explanation until
 	// the status line is free of an error note. Nothing regenerates it — the
@@ -1784,6 +1808,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case doubleRTimerMsg:
+		if msg.seq != m.doubleRSeq || !m.doubleRArmed {
+			return m, nil // superseded: a second "r" toggled, or another key disarmed
+		}
+		m.doubleRArmed = false
+		// The deferred single-press action: resume.
+		m.beginAction()
+		return m, m.doResult(func(ctx context.Context) (string, error) {
+			changed, err := m.app.Resume(ctx)
+			if err != nil {
+				return "", err
+			}
+			if !changed {
+				return "automation already resumed", nil
+			}
+			return "automation resumed", nil
+		})
 	case actionResultMsg:
 		m.applyTaskLists(msg.taskLists)
 		if msg.pauseAction && (msg.err != nil || (msg.pauseNoChange && m.lastPaused)) {
@@ -1935,6 +1976,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Any key that is not the second "r" of a double-press disarms the pending
+	// one. At the VERY top, before the modal early-returns: a key that opens
+	// or feeds a modal must disarm too, or the deferred timer would later
+	// resume automation the operator never asked to resume. While a modal is
+	// up an "r" belongs to the modal (overlay scrolling, prompt text), so it
+	// disarms as well — the deferred resume is simply dropped there.
+	if m.doubleRArmed && (msg.String() != "r" ||
+		m.detail != nil || m.confirm != nil || m.prompt != nil || m.searching) {
+		m.doubleRArmed = false
+		m.doubleRSeq++
+	}
 	if m.detail != nil {
 		switch msg.String() {
 		case "ctrl+c":
@@ -2259,18 +2311,58 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.pausePending = true
 		return m, m.pauseCmd()
 	case "r":
+		if !m.doubleRArmed {
+			// First press: DEFER resume by the double-press window rather than
+			// running it, so a double-press never resumes on its way to the
+			// full self-prompting toggle. 600ms is imperceptible on an action
+			// whose result arrives asynchronously anyway.
+			//
+			// The status area is cleared NOW, not when the deferred action
+			// runs: every other mutation key clears it the instant it is
+			// pressed, and the operator should not keep staring at a stale
+			// result for the length of the window.
+			m.beginAction()
+			m.doubleRArmed = true
+			m.doubleRSeq++
+			seq := m.doubleRSeq
+			return m, tea.Tick(doublePressWindow, func(time.Time) tea.Msg {
+				return doubleRTimerMsg{seq: seq}
+			})
+		}
+		// Second press inside the window: toggle full self-prompting mode.
+		m.doubleRArmed = false
+		m.doubleRSeq++
+		if !m.data.status.FullSelfPrompting && m.data.status.Paused {
+			// Enabling is refused while paused, and the operator pressing "r"
+			// twice most likely wants the thing "r" does. Run the deferred
+			// resume rather than swallowing both presses into a refusal that
+			// leaves automation still paused.
+			m.beginAction()
+			return m, m.doResult(func(ctx context.Context) (string, error) {
+				changed, err := m.app.Resume(ctx)
+				if err != nil {
+					return "", err
+				}
+				if !changed {
+					return "automation already resumed — full self-prompting can be enabled now", nil
+				}
+				return "automation resumed — press rr again to enable full self-prompting", nil
+			})
+		}
+		enable := !m.data.status.FullSelfPrompting
 		m.beginAction()
 		return m, m.doResult(func(ctx context.Context) (string, error) {
-			changed, err := m.app.Resume(ctx)
-			if err != nil {
+			if err := m.app.SetFullSelfPrompting(ctx, enable); err != nil {
 				return "", err
 			}
-			if !changed {
-				return "automation already resumed", nil
+			if enable {
+				return "full self-prompting ON — escalations with a proposed answer are answered automatically", nil
 			}
-			return "automation resumed", nil
+			return "full self-prompting OFF", nil
 		})
 	case "R":
+		// Unchanged and immediate: only "r" carries the double-press gesture,
+		// so re-embed never waits on a window.
 		switch d := m.data.status.Drift; {
 		case !d.Detected:
 			m.message = "no embedding drift detected — rules already match the configured model"
@@ -5688,6 +5780,11 @@ func (m Model) View() string {
 	var b strings.Builder
 
 	stateText, stateStyle := "● running", st.running
+	if m.data.status.FullSelfPrompting {
+		stateText, stateStyle = "⚡ FULL SELF-PROMPTING", st.warn
+	}
+	// Paused wins over full self-prompting: the kill switch stands everything down,
+	// including a configured-on full self-prompting mode.
 	if m.data.status.Paused {
 		stateText, stateStyle = "■ PAUSED (kill switch)", st.paused
 	}
@@ -5762,6 +5859,14 @@ func (m Model) View() string {
 		fmt.Fprintf(&b, "%s\n", st.warn.Render(fmt.Sprintf(
 			"⚠ embedding model changed — %d of %d rules need re-compute; press R or run: hap signatures reembed",
 			d.Stale, d.Total)))
+	}
+	// Full self-prompting configured on but not actually running (graduated rules
+	// dropped below the minimum, llm.command cleared): the header still says
+	// FULL SELF-PROMPTING — that is the operator's configured intent — so this line
+	// carries the "but nothing is being accepted" truth.
+	if m.data.status.FullSelfPrompting && m.data.status.FullSelfPromptingBlocked != "" {
+		fmt.Fprintf(&b, "%s\n", st.warn.Render(
+			"⚠ full self-prompting is ON but inactive: "+m.data.status.FullSelfPromptingBlocked))
 	}
 
 	if m.detail != nil {
@@ -5929,7 +6034,7 @@ func (m Model) helpLine() string {
 	if m.confirm != nil {
 		return "y/enter: confirm  n/esc: cancel"
 	}
-	common := "tab: switch  ↑/↓: select  p: pause  r: resume  q: quit"
+	common := "tab: switch  ↑/↓: select  p: pause  r: resume  rr: full self-prompting  q: quit"
 	if d := m.data.status.Drift; d.Detected && !d.ModelMissing {
 		common = "R: re-embed  " + common
 	}

@@ -606,6 +606,10 @@ type ReadStore interface {
 	ListSignatureEmbeddings(ctx context.Context) ([]domain.SignatureEmbedding, error)
 	// CountSignatureEmbeddings reports how many semantic identity rows exist.
 	CountSignatureEmbeddings(ctx context.Context) (int64, error)
+	// CountSignaturesByMode reports how many learned rules are in the given
+	// mode (domain.ModeAutonomous counts graduated rules — the full self-prompting
+	// enable precondition).
+	CountSignaturesByMode(ctx context.Context, mode string) (int64, error)
 	// CountStaleSignatureEmbeddings counts rows a re-embed under the given
 	// model id would rewrite (other-model vectors and text-only rows).
 	// Rows below minSalientChars are excluded: they are vectorless on purpose

@@ -2496,3 +2496,30 @@ func TestBatchDecisionReadsAcrossChunks(t *testing.T) {
 		}
 	}
 }
+
+// TestCountSignaturesByMode: counts only rows in the asked-for mode — the
+// full self-prompting enable gate depends on this never counting shadow rules.
+func TestCountSignaturesByMode(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	if n, err := s.CountSignaturesByMode(ctx, string(domain.ModeAutonomous)); err != nil || n != 0 {
+		t.Fatalf("empty store: n=%d err=%v, want 0,nil", n, err)
+	}
+	for i, mode := range []domain.Mode{
+		domain.ModeAutonomous, domain.ModeAutonomous, domain.ModeShadow,
+	} {
+		if err := s.UpsertSignature(ctx, domain.SignatureState{
+			Signature: fmt.Sprintf("approval:%d", i), SituationType: domain.SituationApproval,
+			AgentType: "claude", Mode: mode, UpdatedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := s.CountSignaturesByMode(ctx, string(domain.ModeAutonomous)); err != nil || n != 2 {
+		t.Fatalf("autonomous count n=%d err=%v, want 2,nil", n, err)
+	}
+	if n, err := s.CountSignaturesByMode(ctx, string(domain.ModeShadow)); err != nil || n != 1 {
+		t.Fatalf("shadow count n=%d err=%v, want 1,nil", n, err)
+	}
+}

@@ -2089,9 +2089,11 @@ func TestReembedKey(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("drifted R must produce a command")
 	}
-	res, ok := cmd().(actionResultMsg)
+	// A tea.Cmd is one-shot: invoke it exactly once and assert on the value.
+	msg := cmd()
+	res, ok := msg.(actionResultMsg)
 	if !ok {
-		t.Fatalf("command result = %T, want actionResultMsg", cmd())
+		t.Fatalf("command result = %T, want actionResultMsg", msg)
 	}
 	if res.err == nil || !strings.Contains(res.err.Error(), "hap signatures reembed") {
 		t.Errorf("daemon-down R should surface the CLI remedy, got %v", res.err)

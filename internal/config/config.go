@@ -102,8 +102,34 @@ type Limits struct {
 
 // Escalations groups the escalation-lifecycle settings.
 type Escalations struct {
-	AutoAccept AutoAccept `toml:"auto_accept"`
+	AutoAccept        AutoAccept        `toml:"auto_accept"`
+	FullSelfPrompting FullSelfPrompting `toml:"full_self_prompting"`
 }
+
+// FullSelfPrompting configures full self-prompting mode: when enabled, every pending
+// escalation that carries a deliverable proposed answer is accepted and
+// delivered immediately — the escalate-time hook answers new escalations and
+// the auto-accept sweep catches up with zero waiting thresholds. The
+// auto-accept safety exclusions are unchanged: never-auto matches, suspected
+// irreversible commands, retry-exhausted and rate-limited escalations (and
+// anything without a suggestion) still wait for the operator.
+//
+// The flag can be persisted here freely, but it only grants autonomy while
+// the runtime preconditions hold: at least MinFSPGraduatedRules
+// graduated (autonomous) rules in the database and a configured llm.command.
+// Enabling through any hap surface is refused until they are met; a
+// hand-edited config that jumps the gun loads fine and the daemon simply
+// reports the mode as inactive until the preconditions are satisfied.
+type FullSelfPrompting struct {
+	// Enabled is the master switch. Defaults to off.
+	Enabled bool `toml:"enabled"`
+}
+
+// MinFSPGraduatedRules is how many graduated (autonomous) rules the
+// database must hold before full self-prompting mode may be enabled. A constant, not a
+// config key, on purpose: it is a safety precondition for granting the daemon
+// blanket autonomy, and a knob could be set to 0 and defeat it.
+const MinFSPGraduatedRules = 10
 
 // AutoAccept configures automatic acceptance of escalations the operator has
 // left pending too long (see the daemon's auto-accept pass).

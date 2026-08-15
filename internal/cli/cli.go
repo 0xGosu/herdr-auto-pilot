@@ -802,6 +802,14 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 		state = "PAUSED (kill switch active)"
 	}
 	fmt.Fprintf(out, "automation:          %s\n", state)
+	switch {
+	case !st.FullSelfPrompting:
+		fmt.Fprintf(out, "full self-prompting: off\n")
+	case st.FullSelfPromptingBlocked != "":
+		fmt.Fprintf(out, "full self-prompting: ON but INACTIVE — %s\n", st.FullSelfPromptingBlocked)
+	default:
+		fmt.Fprintf(out, "full self-prompting: ON — escalations with a proposed answer are answered automatically\n")
+	}
 	// Daemon health combines the lock, heartbeat, and crash-loop breaker into
 	// one assessment shared with the TUI banner (frontend.AssessDaemonHealth),
 	// so CLI and TUI can never disagree about whether the daemon is healthy.
@@ -912,6 +920,10 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	}
 	if st.Drift.Detected {
 		hints = append(hints, Hint{Cmd: "hap signatures reembed", Why: "re-embed rules for the current model"})
+	}
+	if st.FullSelfPrompting && st.FullSelfPromptingBlocked != "" {
+		hints = append(hints, Hint{Cmd: "hap config set escalations.full_self_prompting.enabled false",
+			Why: "full self-prompting is inactive (" + st.FullSelfPromptingBlocked + "); fix the precondition or turn it off"})
 	}
 	if st.PendingEscalations > 0 {
 		hints = append(hints, Hint{Cmd: "hap escalations", Why: fmt.Sprintf("answer the %d waiting decision(s)", st.PendingEscalations)})

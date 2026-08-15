@@ -278,6 +278,53 @@ view pause/resume history:
 hap kill-history
 ```
 
+## full self-prompting mode
+
+when enabled, every escalation that carries a proposed answer is accepted and delivered
+to the agent immediately — no waiting threshold, no operator action. the safety
+exclusions still wait for a human (never-auto matches, suspected-irreversible commands,
+retry-exhausted and rate-limited escalations), it never acts while paused, it never
+answers an agent that has gone back to work since the escalation was raised, it never
+learns from its own accepts, and each delivery counts against the `[limits]` runaway
+ceilings so an answer loop pauses the agent instead of running forever.
+
+```bash
+hap config set escalations.full_self_prompting.enabled true
+hap config set escalations.full_self_prompting.enabled false
+```
+
+in the TUI, **press `r` twice quickly** (within ~600ms) to toggle it. a SINGLE `r` keeps
+its old meaning — resume automation — and is simply delayed by that window, so a
+double-press never resumes on its way to the toggle; any other key in between cancels the
+pending double-press. (capital `R` is unchanged and immediate: re-compute embeddings.) if
+automation is PAUSED, `rr` resumes instead of toggling — enabling is refused while paused,
+and resuming is what the operator pressing `r` almost certainly wants. the footer
+advertises `rr: full self-prompting`, and the header reads `⚡ FULL SELF-PROMPTING` while
+the mode is on (`■ PAUSED` still wins over it).
+
+enabling is refused until the daemon has earned it: at least 10 graduated (autonomous)
+rules AND a configured `[llm].command`, and never while paused — the error names every
+requirement that is missing, so one attempt tells you the whole list:
+
+```
+error: cannot enable full self-prompting: only 3 of 10 required graduated (autonomous) rules —
+keep confirming escalations until more rules graduate (see: hap signatures list --mode
+autonomous); llm.command is not configured — run: hap config set llm.command "<argv>"
+```
+
+turning it OFF is never refused. `hap status` shows one of three lines:
+
+```
+full self-prompting:           off
+full self-prompting:           ON — escalations with a proposed answer are answered automatically
+full self-prompting:           ON but INACTIVE — only 4 of 10 required graduated (autonomous) rules remain
+```
+
+the third means the mode is still enabled in config but a precondition lapsed (rules
+deleted, `llm.command` cleared, or the count could not be read) — the daemon fails closed
+and answers nothing, and your config is never rewritten. fix the precondition or turn the
+mode off; `hap status` also prints the remedy in its next-steps footer.
+
 ## view audit log
 
 see the history of automated actions and escalations:
