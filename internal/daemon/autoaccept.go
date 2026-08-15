@@ -516,23 +516,28 @@ func (d *Daemon) noteFullAutoSend(ctx context.Context, agentID string, now time.
 //
 // Every non-send outcome simply returns: the 1-minute sweep is the designed
 // catch-up, and a dropped spawn (shutdown latched) is one such outcome.
+// agentID is the ESCALATION's own agent (the situation's), which is what the
+// audit row carries and what the delivery targets. It is passed explicitly
+// rather than read off tr: the claim must be taken on the same identity the
+// send uses, or a divergence between the two would lock one pane and type
+// into another.
 func (d *Daemon) maybeFullAutoAcceptNow(ctx context.Context, auditID int64,
-	tr domain.AgentTransition, now time.Time) {
+	agentID string, tr domain.AgentTransition, now time.Time) {
 	// Free, in-memory, and false for every install that never opted in: keep
 	// it out of the goroutine so the common path costs nothing.
 	cfg, _, _ := d.snapshot()
 	if !cfg.Escalations.FullAuto.Enabled {
 		return
 	}
-	if !d.acquirePane(tr.AgentID) {
+	if !d.acquirePane(agentID) {
 		return // this agent's pane is already being driven; the sweep catches up
 	}
 	if !d.spawn(func() {
-		defer d.releasePane(tr.AgentID)
-		d.fullAutoAcceptNow(ctx, auditID, tr, now)
+		defer d.releasePane(agentID)
+		d.fullAutoAcceptNow(ctx, auditID, agentID, tr, now)
 	}) {
 		// Shutdown latched before fn was scheduled, so its defer never runs.
-		d.releasePane(tr.AgentID)
+		d.releasePane(agentID)
 	}
 }
 
@@ -547,7 +552,7 @@ func (d *Daemon) maybeFullAutoAcceptNow(ctx context.Context, auditID int64,
 // here is known present (it just escalated), so no absence bookkeeping
 // applies.
 func (d *Daemon) fullAutoAcceptNow(ctx context.Context, auditID int64,
-	tr domain.AgentTransition, now time.Time) {
+	agentID string, tr domain.AgentTransition, now time.Time) {
 	cfg, _, _ := d.snapshot()
 	if !d.fullAutoActive(ctx, cfg) {
 		return

@@ -149,7 +149,7 @@ func TestFullAutoKillSwitchWinsOnBothPaths(t *testing.T) {
 		t.Fatalf("sweep under kill switch: status = %q, want escalated", got)
 	}
 
-	h.daemon.fullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+	h.daemon.fullAutoAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("immediate hook under kill switch: status = %q, want escalated", got)
 	}
@@ -185,7 +185,7 @@ func TestFullAutoExclusionsStillWait(t *testing.T) {
 		if got := auditStatus(t, h, id); got != "escalated" {
 			t.Errorf("sweep: %s row status = %q, want escalated", name, got)
 		}
-		h.daemon.fullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+		h.daemon.fullAutoAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
 		if got := auditStatus(t, h, id); got != "escalated" {
 			t.Errorf("immediate hook: %s row status = %q, want escalated", name, got)
 		}
@@ -284,7 +284,7 @@ func TestFullAutoImmediateStaleScreenDismisses(t *testing.T) {
 	h.herdr.setPane("Bash(npm install)\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, never mind\n")
 	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", time.Second)
 
-	h.daemon.fullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+	h.daemon.fullAutoAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
 
 	if got := auditStatus(t, h, id); got != "dismissed" {
 		t.Fatalf("status = %q, want dismissed (stale screen)", got)
@@ -365,7 +365,7 @@ func TestFullAutoDisabledAgentSuppressed(t *testing.T) {
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("sweep on a disabled agent: status = %q, want escalated", got)
 	}
-	h.daemon.fullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+	h.daemon.fullAutoAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("immediate hook on a disabled agent: status = %q, want escalated", got)
 	}
@@ -457,7 +457,7 @@ func TestFullAutoRatePausedAgentIsSuppressed(t *testing.T) {
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("sweep on a rate-paused agent: status = %q, want escalated", got)
 	}
-	h.daemon.fullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+	h.daemon.fullAutoAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("immediate hook on a rate-paused agent: status = %q, want escalated", got)
 	}
@@ -537,7 +537,7 @@ func TestFullAutoImmediateAcceptRunsOffTheSelectLoop(t *testing.T) {
 
 	returned := make(chan struct{})
 	go func() {
-		h.daemon.maybeFullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+		h.daemon.maybeFullAutoAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
 		close(returned)
 	}()
 
@@ -572,7 +572,7 @@ func TestFullAutoImmediateAcceptSkipsAClaimedPane(t *testing.T) {
 	if !h.daemon.acquirePane("pA") {
 		t.Fatal("could not claim the pane for the test")
 	}
-	h.daemon.maybeFullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+	h.daemon.maybeFullAutoAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
 
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("status = %q, want escalated (the pane was claimed)", got)

@@ -2682,7 +2682,7 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	// exists — there is nothing to claim otherwise (the sweep is the catch-up
 	// for every path this returns early from).
 	if auditErr == nil {
-		d.maybeFullAutoAcceptNow(ctx, auditID, tr, now)
+		d.maybeFullAutoAcceptNow(ctx, auditID, s.AgentID, tr, now)
 	}
 }
 
