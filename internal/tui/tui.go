@@ -109,7 +109,7 @@ type semanticSearchMsg struct {
 }
 
 // doublePressWindow is how long after a first capital R a second one still
-// reads as a double-press (the full-auto toggle). The first press's own
+// reads as a double-press (the full self-prompting toggle). The first press's own
 // action (re-embed) is deferred by this window, so it must stay short enough
 // to be imperceptible on an async request and long enough for a deliberate
 // double-tap.
@@ -927,7 +927,7 @@ type Model struct {
 
 	// reembedArmed means a first capital R was seen and its single-press
 	// action (re-embed) is deferred by the double-press window; a second R
-	// inside the window toggles full-auto mode instead. Any other key
+	// inside the window toggles full self-prompting mode instead. Any other key
 	// disarms, so R,j,R is two singles, not a double.
 	reembedArmed bool
 	// reembedSeq invalidates stale deferral timers: every arm/disarm bumps
@@ -2329,7 +2329,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.reembedArmed {
 			// First press: DEFER the single-press action (re-embed) by the
 			// double-press window rather than firing it — a double-press must
-			// never start a re-embed on its way to the full-auto toggle. The
+			// never start a re-embed on its way to the full self-prompting toggle. The
 			// deferral is imperceptible on an action that is itself an async
 			// background request (or a refusal toast).
 			m.reembedArmed = true
@@ -2339,25 +2339,25 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return reembedTimerMsg{seq: seq}
 			})
 		}
-		// Second press inside the window: toggle full-auto mode.
+		// Second press inside the window: toggle full self-prompting mode.
 		m.reembedArmed = false
 		m.reembedSeq++
-		if !m.data.status.FullAuto && m.data.status.Paused {
-			// Local fast refusal; SetFullAuto re-checks under the config lock
+		if !m.data.status.FullSelfPrompting && m.data.status.Paused {
+			// Local fast refusal; SetFullSelfPrompting re-checks under the config lock
 			// anyway (belt and braces, and one wording with the CLI).
-			m.message = "cannot enable full-auto while automation is paused — press r to resume first"
+			m.message = "cannot enable full self-prompting while automation is paused — press r to resume first"
 			return m, nil
 		}
-		enable := !m.data.status.FullAuto
+		enable := !m.data.status.FullSelfPrompting
 		m.beginAction()
 		return m, m.doResult(func(ctx context.Context) (string, error) {
-			if err := m.app.SetFullAuto(ctx, enable); err != nil {
+			if err := m.app.SetFullSelfPrompting(ctx, enable); err != nil {
 				return "", err
 			}
 			if enable {
-				return "full-auto ON — escalations with a proposed answer are answered automatically", nil
+				return "full self-prompting ON — escalations with a proposed answer are answered automatically", nil
 			}
-			return "full-auto OFF", nil
+			return "full self-prompting OFF", nil
 		})
 	case "enter":
 		switch m.tab {
@@ -5763,11 +5763,11 @@ func (m Model) View() string {
 	var b strings.Builder
 
 	stateText, stateStyle := "● running", st.running
-	if m.data.status.FullAuto {
-		stateText, stateStyle = "⚡ FULL-AUTO", st.warn
+	if m.data.status.FullSelfPrompting {
+		stateText, stateStyle = "⚡ FULL SELF-PROMPTING", st.warn
 	}
-	// Paused wins over full-auto: the kill switch stands everything down,
-	// including a configured-on full-auto mode.
+	// Paused wins over full self-prompting: the kill switch stands everything down,
+	// including a configured-on full self-prompting mode.
 	if m.data.status.Paused {
 		stateText, stateStyle = "■ PAUSED (kill switch)", st.paused
 	}
@@ -5843,13 +5843,13 @@ func (m Model) View() string {
 			"⚠ embedding model changed — %d of %d rules need re-compute; press R or run: hap signatures reembed",
 			d.Stale, d.Total)))
 	}
-	// Full-auto configured on but not actually running (graduated rules
+	// Full self-prompting configured on but not actually running (graduated rules
 	// dropped below the minimum, llm.command cleared): the header still says
-	// FULL-AUTO — that is the operator's configured intent — so this line
+	// FULL SELF-PROMPTING — that is the operator's configured intent — so this line
 	// carries the "but nothing is being accepted" truth.
-	if m.data.status.FullAuto && m.data.status.FullAutoBlocked != "" {
+	if m.data.status.FullSelfPrompting && m.data.status.FullSelfPromptingBlocked != "" {
 		fmt.Fprintf(&b, "%s\n", st.warn.Render(
-			"⚠ full-auto is ON but inactive: "+m.data.status.FullAutoBlocked))
+			"⚠ full self-prompting is ON but inactive: "+m.data.status.FullSelfPromptingBlocked))
 	}
 
 	if m.detail != nil {
@@ -6017,7 +6017,7 @@ func (m Model) helpLine() string {
 	if m.confirm != nil {
 		return "y/enter: confirm  n/esc: cancel"
 	}
-	common := "tab: switch  ↑/↓: select  p: pause  r: resume  RR: full-auto  q: quit"
+	common := "tab: switch  ↑/↓: select  p: pause  r: resume  RR: full self-prompting  q: quit"
 	if d := m.data.status.Drift; d.Detected && !d.ModelMissing {
 		common = "R: re-embed  " + common
 	}

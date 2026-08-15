@@ -2498,7 +2498,7 @@ func TestBatchDecisionReadsAcrossChunks(t *testing.T) {
 }
 
 // TestCountSignaturesByMode: counts only rows in the asked-for mode — the
-// full-auto enable gate depends on this never counting shadow rules.
+// full self-prompting enable gate depends on this never counting shadow rules.
 func TestCountSignaturesByMode(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

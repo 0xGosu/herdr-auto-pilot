@@ -16,9 +16,9 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
-// fullAutoTestApp wires a real frontend.App whose enable preconditions hold,
-// so the toggle's cmd can run end to end against the real SetFullAuto.
-func fullAutoTestApp(t *testing.T) *frontend.App {
+// fspTestApp wires a real frontend.App whose enable preconditions hold,
+// so the toggle's cmd can run end to end against the real SetFullSelfPrompting.
+func fspTestApp(t *testing.T) *frontend.App {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "t.db"))
@@ -35,7 +35,7 @@ func fullAutoTestApp(t *testing.T) *frontend.App {
 	if _, err := app.SetField(ctx, "llm.command", `claude -p "decide"`); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < config.MinFullAutoGraduatedRules; i++ {
+	for i := 0; i < config.MinFSPGraduatedRules; i++ {
 		if err := st.UpsertSignature(ctx, domain.SignatureState{
 			Signature: fmt.Sprintf("approval:tui-grad-%d", i), SituationType: domain.SituationApproval,
 			AgentType: "claude", Mode: domain.ModeAutonomous, UpdatedAt: time.Now(),
@@ -52,12 +52,12 @@ func pressOne(t *testing.T, m Model, key string) (Model, tea.Cmd) {
 	return upd.(Model), cmd
 }
 
-// TestDoubleRTogglesFullAuto: two R inside the window call the real
-// SetFullAuto, enable the mode, and report it; the deferred re-embed action
+// TestDoubleRTogglesFullSelfPrompting: two R inside the window call the real
+// SetFullSelfPrompting, enable the mode, and report it; the deferred re-embed action
 // never fires.
-func TestDoubleRTogglesFullAuto(t *testing.T) {
+func TestDoubleRTogglesFullSelfPrompting(t *testing.T) {
 	m := testModel(t)
-	m.app = fullAutoTestApp(t)
+	m.app = fspTestApp(t)
 	m.ctx = context.Background()
 
 	m, cmd := pressOne(t, m, "R")
@@ -82,15 +82,15 @@ func TestDoubleRTogglesFullAuto(t *testing.T) {
 	if res.err != nil {
 		t.Fatalf("toggle failed: %v", res.err)
 	}
-	if !strings.Contains(res.message, "full-auto ON") {
-		t.Errorf("toggle message = %q, want full-auto ON", res.message)
+	if !strings.Contains(res.message, "full self-prompting ON") {
+		t.Errorf("toggle message = %q, want full self-prompting ON", res.message)
 	}
 	cfg, err := m.app.Config()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Escalations.FullAuto.Enabled {
-		t.Fatal("double-R did not enable full-auto in config")
+	if !cfg.Escalations.FullSelfPrompting.Enabled {
+		t.Fatal("double-R did not enable full self-prompting in config")
 	}
 
 	// The first press's deferred timer is stale now: it must NOT re-embed.
@@ -121,7 +121,7 @@ func TestSingleRStillReembedsAfterTheWindow(t *testing.T) {
 // arms a fresh cycle instead of toggling.
 func TestInterveningKeyDisarmsDoubleR(t *testing.T) {
 	m := testModel(t)
-	m.app = fullAutoTestApp(t)
+	m.app = fspTestApp(t)
 	m.ctx = context.Background()
 
 	m, _ = pressOne(t, m, "R")
@@ -137,8 +137,8 @@ func TestInterveningKeyDisarmsDoubleR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Escalations.FullAuto.Enabled {
-		t.Fatal("R,j,R toggled full-auto")
+	if cfg.Escalations.FullSelfPrompting.Enabled {
+		t.Fatal("R,j,R toggled full self-prompting")
 	}
 }
 
@@ -157,31 +157,31 @@ func TestDoubleRRefusedWhilePaused(t *testing.T) {
 	}
 }
 
-// TestHeaderShowsFullAutoAndPausedWins: the header segment reflects the mode,
+// TestHeaderShowsFullSelfPromptingAndPausedWins: the header segment reflects the mode,
 // and the kill switch outranks it.
-func TestHeaderShowsFullAutoAndPausedWins(t *testing.T) {
+func TestHeaderShowsFullSelfPromptingAndPausedWins(t *testing.T) {
 	m := testModel(t)
-	m.data.status.FullAuto = true
-	if v := m.View(); !strings.Contains(v, "⚡ FULL-AUTO") {
-		t.Error("header does not show the full-auto segment")
+	m.data.status.FullSelfPrompting = true
+	if v := m.View(); !strings.Contains(v, "⚡ FULL SELF-PROMPTING") {
+		t.Error("header does not show the full self-prompting segment")
 	}
 	m.data.status.Paused = true
 	v := m.View()
-	if strings.Contains(v, "⚡ FULL-AUTO") || !strings.Contains(v, "PAUSED") {
-		t.Error("paused must win over the full-auto segment")
+	if strings.Contains(v, "⚡ FULL SELF-PROMPTING") || !strings.Contains(v, "PAUSED") {
+		t.Error("paused must win over the full self-prompting segment")
 	}
 }
 
-// TestFullAutoBlockedBanner: configured-on-but-inactive renders the warning
+// TestFullSelfPromptingBlockedBanner: configured-on-but-inactive renders the warning
 // line with its reason.
-func TestFullAutoBlockedBanner(t *testing.T) {
+func TestFullSelfPromptingBlockedBanner(t *testing.T) {
 	m := testModel(t)
-	m.data.status.FullAuto = true
-	m.data.status.FullAutoBlocked = "only 4 of 10 required graduated (autonomous) rules remain"
-	if v := m.View(); !strings.Contains(v, "full-auto is ON but inactive: only 4 of 10") {
+	m.data.status.FullSelfPrompting = true
+	m.data.status.FullSelfPromptingBlocked = "only 4 of 10 required graduated (autonomous) rules remain"
+	if v := m.View(); !strings.Contains(v, "full self-prompting is ON but inactive: only 4 of 10") {
 		t.Error("blocked banner missing")
 	}
-	m.data.status.FullAutoBlocked = ""
+	m.data.status.FullSelfPromptingBlocked = ""
 	if v := m.View(); strings.Contains(v, "ON but inactive") {
 		t.Error("banner rendered with no blockage")
 	}
@@ -190,7 +190,7 @@ func TestFullAutoBlockedBanner(t *testing.T) {
 // TestHelpLineAdvertisesDoubleR: the shortcut is discoverable.
 func TestHelpLineAdvertisesDoubleR(t *testing.T) {
 	m := testModel(t)
-	if h := m.helpLine(); !strings.Contains(h, "RR: full-auto") {
+	if h := m.helpLine(); !strings.Contains(h, "RR: full self-prompting") {
 		t.Errorf("help line %q does not advertise RR", h)
 	}
 }

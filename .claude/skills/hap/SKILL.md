@@ -278,32 +278,33 @@ view pause/resume history:
 hap kill-history
 ```
 
-## full-auto prompting mode
+## full self-prompting mode
 
 when enabled, every escalation that carries a proposed answer is accepted and delivered
 to the agent immediately — no waiting threshold, no operator action. the safety
 exclusions still wait for a human (never-auto matches, suspected-irreversible commands,
 retry-exhausted and rate-limited escalations), it never acts while paused, it never
+answers an agent that has gone back to work since the escalation was raised, it never
 learns from its own accepts, and each delivery counts against the `[limits]` runaway
 ceilings so an answer loop pauses the agent instead of running forever.
 
 ```bash
-hap config set escalations.full_auto.enabled true
-hap config set escalations.full_auto.enabled false
+hap config set escalations.full_self_prompting.enabled true
+hap config set escalations.full_self_prompting.enabled false
 ```
 
 in the TUI, **press `R` twice quickly** (within ~600ms) to toggle it. a SINGLE `R` keeps
 its old meaning — re-compute embeddings — and is simply delayed by that window, so a
 double-press never starts a re-embed on its way to the toggle; any other key in between
-cancels the pending double-press. the footer advertises `RR: full-auto`, and the header
-reads `⚡ FULL-AUTO` while the mode is on (`■ PAUSED` still wins over it).
+cancels the pending double-press. the footer advertises `RR: full self-prompting`, and the header
+reads `⚡ FULL SELF-PROMPTING` while the mode is on (`■ PAUSED` still wins over it).
 
 enabling is refused until the daemon has earned it: at least 10 graduated (autonomous)
 rules AND a configured `[llm].command`, and never while paused — the error names every
 requirement that is missing, so one attempt tells you the whole list:
 
 ```
-error: cannot enable full-auto: only 3 of 10 required graduated (autonomous) rules —
+error: cannot enable full self-prompting: only 3 of 10 required graduated (autonomous) rules —
 keep confirming escalations until more rules graduate (see: hap signatures list --mode
 autonomous); llm.command is not configured — run: hap config set llm.command "<argv>"
 ```
@@ -311,9 +312,9 @@ autonomous); llm.command is not configured — run: hap config set llm.command "
 turning it OFF is never refused. `hap status` shows one of three lines:
 
 ```
-full-auto:           off
-full-auto:           ON — escalations with a proposed answer are answered automatically
-full-auto:           ON but INACTIVE — only 4 of 10 required graduated (autonomous) rules remain
+full self-prompting:           off
+full self-prompting:           ON — escalations with a proposed answer are answered automatically
+full self-prompting:           ON but INACTIVE — only 4 of 10 required graduated (autonomous) rules remain
 ```
 
 the third means the mode is still enabled in config but a precondition lapsed (rules

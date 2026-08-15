@@ -210,13 +210,13 @@ type Status struct {
 	// Drift reports stored embeddings minted by a different model than the
 	// currently configured one (best-effort; zero-valued on check failure).
 	Drift EmbeddingDrift
-	// FullAuto reports that full-auto prompting mode is enabled in config.
-	FullAuto bool
-	// FullAutoBlocked names the runtime precondition a configured-on
-	// full-auto mode no longer meets (graduated rules below the minimum,
+	// FullSelfPrompting reports that full self-prompting mode is enabled in config.
+	FullSelfPrompting bool
+	// FullSelfPromptingBlocked names the runtime precondition a configured-on
+	// full self-prompting mode no longer meets (graduated rules below the minimum,
 	// llm.command cleared), "" when the mode is off or actually running.
 	// Best-effort, like Drift.
-	FullAutoBlocked string
+	FullSelfPromptingBlocked string
 }
 
 // GetStatus returns the operator-facing status summary.
@@ -277,8 +277,8 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 		st.Embedding = a.embeddingStatus(ctx, cfg)
 		// Best-effort: a drift-check failure must not break status.
 		st.Drift, _ = a.embeddingDrift(ctx, cfg)
-		st.FullAuto = cfg.Escalations.FullAuto.Enabled
-		st.FullAutoBlocked = a.fullAutoBlockedReason(ctx, cfg)
+		st.FullSelfPrompting = cfg.Escalations.FullSelfPrompting.Enabled
+		st.FullSelfPromptingBlocked = a.fspBlockedReason(ctx, cfg)
 	}
 	// Name any live agent the daemon has not named yet (a brand-new agent,
 	// or one that predates the daemon): the operator should never have to
@@ -1860,7 +1860,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "escalations.auto_accept.error", TUIEditable: true},
 	{Key: "escalations.auto_accept.idle", TUIEditable: true},
 	{Key: "escalations.auto_accept.unclassifiable", TUIEditable: true},
-	{Key: "escalations.full_auto.enabled", TUIEditable: true},
+	{Key: "escalations.full_self_prompting.enabled", TUIEditable: true},
 	{Key: "safety.disable_never_auto_seed_patterns", TUIEditable: true},
 	{Key: "llm.command"},       // argv template
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
@@ -2110,8 +2110,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return autoAcceptValue(cfg.Escalations.AutoAccept.Idle, 0)
 	case "escalations.auto_accept.unclassifiable":
 		return autoAcceptValue(cfg.Escalations.AutoAccept.Unclassifiable, 0)
-	case "escalations.full_auto.enabled":
-		return strconv.FormatBool(cfg.Escalations.FullAuto.Enabled)
+	case "escalations.full_self_prompting.enabled":
+		return strconv.FormatBool(cfg.Escalations.FullSelfPrompting.Enabled)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -2343,21 +2343,21 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			}
 			cfg.Escalations.AutoAccept.Enabled = v
 			return nil
-		case "escalations.full_auto.enabled":
+		case "escalations.full_self_prompting.enabled":
 			v, err := strconv.ParseBool(value)
 			if err != nil {
-				return fmt.Errorf("escalations.full_auto.enabled must be true or false, got %q", value)
+				return fmt.Errorf("escalations.full_self_prompting.enabled must be true or false, got %q", value)
 			}
 			// Enabling is gated; disabling must never be refusable. The check
 			// runs here, under the config file lock against the freshly loaded
 			// cfg, so every surface (CLI config set, TUI double-R via
-			// SetFullAuto, TUI config tab) shares one refusal wording.
-			if v && !cfg.Escalations.FullAuto.Enabled {
-				if err := a.fullAutoEnablePreconditions(ctx, cfg); err != nil {
+			// SetFullSelfPrompting, TUI config tab) shares one refusal wording.
+			if v && !cfg.Escalations.FullSelfPrompting.Enabled {
+				if err := a.fspEnablePreconditions(ctx, cfg); err != nil {
 					return err
 				}
 			}
-			cfg.Escalations.FullAuto.Enabled = v
+			cfg.Escalations.FullSelfPrompting.Enabled = v
 			return nil
 		case "escalations.auto_accept.approval":
 			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Approval)

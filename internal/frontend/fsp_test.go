@@ -37,20 +37,20 @@ func setLLMCommand(t *testing.T, app *frontend.App) {
 	}
 }
 
-// TestSetFullAutoRefusesWithoutPreconditions: enabling names EVERY unmet
+// TestSetFullSelfPromptingRefusesWithoutPreconditions: enabling names EVERY unmet
 // requirement and its remedy in one error, so the operator fixes everything
 // in one round trip.
-func TestSetFullAutoRefusesWithoutPreconditions(t *testing.T) {
+func TestSetFullSelfPromptingRefusesWithoutPreconditions(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
 
-	err := app.SetFullAuto(ctx, true)
+	err := app.SetFullSelfPrompting(ctx, true)
 	if err == nil {
 		t.Fatal("enable succeeded with 0 graduated rules and no llm.command")
 	}
 	for _, want := range []string{
-		"cannot enable full-auto",
-		fmt.Sprintf("only 0 of %d required graduated", config.MinFullAutoGraduatedRules),
+		"cannot enable full self-prompting",
+		fmt.Sprintf("only 0 of %d required graduated", config.MinFSPGraduatedRules),
 		"llm.command is not configured",
 	} {
 		if !strings.Contains(err.Error(), want) {
@@ -61,25 +61,25 @@ func TestSetFullAutoRefusesWithoutPreconditions(t *testing.T) {
 	if err2 != nil {
 		t.Fatal(err2)
 	}
-	if cfg.Escalations.FullAuto.Enabled {
+	if cfg.Escalations.FullSelfPrompting.Enabled {
 		t.Fatal("refused enable still persisted enabled=true")
 	}
 }
 
-// TestSetFullAutoRefusesBelowRuleMinimum: llm.command alone is not enough,
+// TestSetFullSelfPromptingRefusesBelowRuleMinimum: llm.command alone is not enough,
 // and the count in the message is the real one.
-func TestSetFullAutoRefusesBelowRuleMinimum(t *testing.T) {
+func TestSetFullSelfPromptingRefusesBelowRuleMinimum(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
 	setLLMCommand(t, app)
-	seedGraduatedRules(t, st, config.MinFullAutoGraduatedRules-1)
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules-1)
 
-	err := app.SetFullAuto(ctx, true)
+	err := app.SetFullSelfPrompting(ctx, true)
 	if err == nil {
 		t.Fatal("enable succeeded below the graduated-rule minimum")
 	}
 	want := fmt.Sprintf("only %d of %d required graduated",
-		config.MinFullAutoGraduatedRules-1, config.MinFullAutoGraduatedRules)
+		config.MinFSPGraduatedRules-1, config.MinFSPGraduatedRules)
 	if !strings.Contains(err.Error(), want) {
 		t.Errorf("refusal %q does not carry the real count %q", err, want)
 	}
@@ -88,18 +88,18 @@ func TestSetFullAutoRefusesBelowRuleMinimum(t *testing.T) {
 	}
 }
 
-// TestSetFullAutoRefusesWhilePaused: the kill switch blocks enabling on every
+// TestSetFullSelfPromptingRefusesWhilePaused: the kill switch blocks enabling on every
 // surface, not just the TUI's local check.
-func TestSetFullAutoRefusesWhilePaused(t *testing.T) {
+func TestSetFullSelfPromptingRefusesWhilePaused(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
 	setLLMCommand(t, app)
-	seedGraduatedRules(t, st, config.MinFullAutoGraduatedRules)
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules)
 	if _, err := app.Pause(ctx); err != nil {
 		t.Fatal(err)
 	}
 
-	err := app.SetFullAuto(ctx, true)
+	err := app.SetFullSelfPrompting(ctx, true)
 	if err == nil {
 		t.Fatal("enable succeeded while paused")
 	}
@@ -108,43 +108,43 @@ func TestSetFullAutoRefusesWhilePaused(t *testing.T) {
 	}
 }
 
-// TestSetFullAutoEnablesWhenPreconditionsHold, and shows up in status.
-func TestSetFullAutoEnablesWhenPreconditionsHold(t *testing.T) {
+// TestSetFullSelfPromptingEnablesWhenPreconditionsHold, and shows up in status.
+func TestSetFullSelfPromptingEnablesWhenPreconditionsHold(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
 	setLLMCommand(t, app)
-	seedGraduatedRules(t, st, config.MinFullAutoGraduatedRules)
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules)
 
-	if err := app.SetFullAuto(ctx, true); err != nil {
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
 		t.Fatalf("enable refused with preconditions met: %v", err)
 	}
 	cfg, err := app.Config()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Escalations.FullAuto.Enabled {
+	if !cfg.Escalations.FullSelfPrompting.Enabled {
 		t.Fatal("enable did not persist")
 	}
 	status, err := app.GetStatus(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !status.FullAuto {
-		t.Error("Status.FullAuto = false after enabling")
+	if !status.FullSelfPrompting {
+		t.Error("Status.FullSelfPrompting = false after enabling")
 	}
-	if status.FullAutoBlocked != "" {
-		t.Errorf("Status.FullAutoBlocked = %q with preconditions met", status.FullAutoBlocked)
+	if status.FullSelfPromptingBlocked != "" {
+		t.Errorf("Status.FullSelfPromptingBlocked = %q with preconditions met", status.FullSelfPromptingBlocked)
 	}
 }
 
-// TestSetFullAutoDisableAlwaysSucceeds: turning autonomy OFF must never be
+// TestSetFullSelfPromptingDisableAlwaysSucceeds: turning autonomy OFF must never be
 // refusable — not by the pause, not by a store that lost its rules.
-func TestSetFullAutoDisableAlwaysSucceeds(t *testing.T) {
+func TestSetFullSelfPromptingDisableAlwaysSucceeds(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
 	setLLMCommand(t, app)
-	seedGraduatedRules(t, st, config.MinFullAutoGraduatedRules)
-	if err := app.SetFullAuto(ctx, true); err != nil {
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules)
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
 		t.Fatal(err)
 	}
 	// Worst plausible moment: paused, and the graduated rules are gone.
@@ -154,26 +154,26 @@ func TestSetFullAutoDisableAlwaysSucceeds(t *testing.T) {
 	if err := st.ClearLearnedData(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SetFullAuto(ctx, false); err != nil {
+	if err := app.SetFullSelfPrompting(ctx, false); err != nil {
 		t.Fatalf("disable refused: %v", err)
 	}
 	cfg, err := app.Config()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Escalations.FullAuto.Enabled {
+	if cfg.Escalations.FullSelfPrompting.Enabled {
 		t.Fatal("disable did not persist")
 	}
 }
 
-// TestFullAutoStatusReportsBlockedReason: configured on, then the world
+// TestFSPStatusReportsBlockedReason: configured on, then the world
 // regresses — status carries the reason while the config stays untouched.
-func TestFullAutoStatusReportsBlockedReason(t *testing.T) {
+func TestFSPStatusReportsBlockedReason(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
 	setLLMCommand(t, app)
-	seedGraduatedRules(t, st, config.MinFullAutoGraduatedRules)
-	if err := app.SetFullAuto(ctx, true); err != nil {
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules)
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.ClearLearnedData(ctx); err != nil {
@@ -183,11 +183,11 @@ func TestFullAutoStatusReportsBlockedReason(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !status.FullAuto {
-		t.Error("Status.FullAuto flipped off; the operator's config did not change")
+	if !status.FullSelfPrompting {
+		t.Error("Status.FullSelfPrompting flipped off; the operator's config did not change")
 	}
-	if !strings.Contains(status.FullAutoBlocked, fmt.Sprintf("0 of %d", config.MinFullAutoGraduatedRules)) {
-		t.Errorf("Status.FullAutoBlocked = %q, want the graduated-rule shortfall", status.FullAutoBlocked)
+	if !strings.Contains(status.FullSelfPromptingBlocked, fmt.Sprintf("0 of %d", config.MinFSPGraduatedRules)) {
+		t.Errorf("Status.FullSelfPromptingBlocked = %q, want the graduated-rule shortfall", status.FullSelfPromptingBlocked)
 	}
 }
 
@@ -201,17 +201,17 @@ func (s countErrorStore) CountSignaturesByMode(context.Context, string) (int64, 
 	return 0, errors.New("induced count failure")
 }
 
-// TestFullAutoStatusFailsClosedOnUnreadableCount: the daemon treats an
-// unreadable graduated-rule count as "mode inactive" (fullAutoActive fails
+// TestFSPStatusFailsClosedOnUnreadableCount: the daemon treats an
+// unreadable graduated-rule count as "mode inactive" (fspActive fails
 // closed), so status must not report the mode as active — that would tell the
 // operator escalations are being answered while nothing is answering them.
 // Status describes runtime behavior, not configured intent.
-func TestFullAutoStatusFailsClosedOnUnreadableCount(t *testing.T) {
+func TestFSPStatusFailsClosedOnUnreadableCount(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
 	setLLMCommand(t, app)
-	seedGraduatedRules(t, st, config.MinFullAutoGraduatedRules)
-	if err := app.SetFullAuto(ctx, true); err != nil {
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules)
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -220,13 +220,13 @@ func TestFullAutoStatusFailsClosedOnUnreadableCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !status.FullAuto {
-		t.Error("Status.FullAuto = false; the operator's config is unchanged")
+	if !status.FullSelfPrompting {
+		t.Error("Status.FullSelfPrompting = false; the operator's config is unchanged")
 	}
-	if status.FullAutoBlocked == "" {
-		t.Fatal("an unreadable count reported full-auto as ACTIVE; the daemon fails closed on that same query")
+	if status.FullSelfPromptingBlocked == "" {
+		t.Fatal("an unreadable count reported full self-prompting as ACTIVE; the daemon fails closed on that same query")
 	}
-	if !strings.Contains(status.FullAutoBlocked, "unreadable") {
-		t.Errorf("FullAutoBlocked = %q, want it to name the unreadable count", status.FullAutoBlocked)
+	if !strings.Contains(status.FullSelfPromptingBlocked, "unreadable") {
+		t.Errorf("FullSelfPromptingBlocked = %q, want it to name the unreadable count", status.FullSelfPromptingBlocked)
 	}
 }

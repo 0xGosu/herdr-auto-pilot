@@ -785,7 +785,7 @@ func (s *Store) CountSignatureEmbeddings(ctx context.Context) (int64, error) {
 }
 
 // CountSignaturesByMode reports how many learned rules are in the given mode
-// (e.g. domain.ModeAutonomous for graduated rules — the full-auto enable
+// (e.g. domain.ModeAutonomous for graduated rules — the full self-prompting enable
 // precondition).
 func (s *Store) CountSignaturesByMode(ctx context.Context, mode string) (int64, error) {
 	var n int64

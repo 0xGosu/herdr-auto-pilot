@@ -2053,7 +2053,7 @@ func TestDriftBannerRenders(t *testing.T) {
 // pressSingleR presses R once and expires its double-press window, returning
 // the model plus whatever command the deferred single-press action produced.
 // A single R no longer acts immediately — the action is deferred by
-// doublePressWindow so a second R can toggle full-auto mode instead.
+// doublePressWindow so a second R can toggle full self-prompting mode instead.
 func pressSingleR(t *testing.T, m Model) (Model, tea.Cmd) {
 	t.Helper()
 	upd, cmd := m.Update(pressKeyMsg("R"))

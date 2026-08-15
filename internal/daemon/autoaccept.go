@@ -62,14 +62,14 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	now := d.opt.Clock.Now()
 
 	cutoffs := make(map[domain.SituationType]time.Time)
-	fullAuto := d.fullAutoActive(ctx, cfg)
-	if fullAuto {
-		// Full-auto: zero wait for ALL five types — including idle and
-		// unclassifiable, whose timed auto-accept defaults are disabled.
+	fsp := d.fspActive(ctx, cfg)
+	if fsp {
+		// Full self-prompting: zero wait for ALL five types — including idle
+		// and unclassifiable, whose timed auto-accept defaults are disabled.
 		// cutoff=now satisfies created_at <= cutoff for every pending row.
 		// A parallel builder rather than a change to AutoAcceptAfter: that
 		// accessor stays the source of truth for TIMED auto-accept, and
-		// full-auto works with escalations.auto_accept.enabled false. When
+		// full self-prompting works with escalations.auto_accept.enabled false. When
 		// both are on, these cutoffs strictly dominate.
 		for _, st := range config_AutoAcceptTypes() {
 			cutoffs[st] = now
@@ -142,7 +142,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		if handledAgent[rec.AgentID] {
 			continue
 		}
-		// Another pane interaction owns this agent — a full-auto immediate
+		// Another pane interaction owns this agent — an FSP immediate
 		// delivery, a multi-tab form sweep, or a series delivery. Their
 		// keystrokes must never interleave, so leave the row pending and take
 		// it on a later tick.
@@ -154,16 +154,16 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		case autoAcceptDelivered:
 			handledAgent[rec.AgentID] = true
 			accepted++
-			// A FULL-AUTO delivery counts against the FR-019 runaway guard
-			// (both counters — it is a machine's answer, not an operator's
+			// An FSP delivery counts against the FR-019 runaway guard (both
+			// counters — it is a machine's answer, not an operator's
 			// declared queue work). Timed auto-accept deliberately does not
 			// count: its ≥1m threshold plus the sweep throttle already bound
-			// it, and that is its documented contract. Full-auto removed the
+			// it, and that is its documented contract. FSP removed the
 			// threshold, so without this an agent re-raising escalations
 			// forever would be answered forever with no ceiling ever
 			// tripping and no human check-in ever forced.
-			if fullAuto {
-				d.noteFullAutoSend(ctx, rec.AgentID, now)
+			if fsp {
+				d.noteFSPSend(ctx, rec.AgentID, now)
 			}
 		case autoAcceptRetired:
 			// Dismissed. The agent is NOT marked handled: nothing was
@@ -225,9 +225,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	// A done -> idle flip during the wait passes, because that is precisely the
 	// transition escalationDedupWindow exists to absorb. This is NOT the
 	// authoritative staleness check; Guard 3 is.
-	switch agent.Status {
-	case "blocked", "idle", "done":
-	default:
+	if !autoAcceptParked(agent.Status) {
 		return autoAcceptSkipped
 	}
 
@@ -425,16 +423,16 @@ func (d *Daemon) autoAcceptAgentSuppressed(ctx context.Context, agentID string) 
 	return rate != nil && rate.Paused
 }
 
-// fullAutoActive reports whether the full-auto pass may run right now:
+// fspActive reports whether the full self-prompting pass may run right now:
 // configured on AND the runtime preconditions still hold (a configured
-// llm.command, at least config.MinFullAutoGraduatedRules graduated rules).
+// llm.command, at least config.MinFSPGraduatedRules graduated rules).
 // All checks fail closed. The preconditions were verified when the mode was
 // enabled, but the world moves — rules get deleted, llm.command gets cleared
 // — so a configured-on mode that no longer qualifies reverts to the normal
 // escalation flow, logged once per degradation episode. The config is never
 // rewritten: the operator's intent stands, and status surfaces the blockage.
-func (d *Daemon) fullAutoActive(ctx context.Context, cfg config.Config) bool {
-	if !cfg.Escalations.FullAuto.Enabled {
+func (d *Daemon) fspActive(ctx context.Context, cfg config.Config) bool {
+	if !cfg.Escalations.FullSelfPrompting.Enabled {
 		return false
 	}
 	reason := ""
@@ -445,29 +443,29 @@ func (d *Daemon) fullAutoActive(ctx context.Context, cfg config.Config) bool {
 		// outage during an escalation storm must not turn this into a
 		// warn-per-event firehose.
 		reason = "graduated-rule count unreadable: " + err.Error()
-	} else if n < config.MinFullAutoGraduatedRules {
+	} else if n < config.MinFSPGraduatedRules {
 		reason = fmt.Sprintf("only %d of %d required graduated (autonomous) rules remain",
-			n, config.MinFullAutoGraduatedRules)
+			n, config.MinFSPGraduatedRules)
 	}
 
 	d.mu.Lock()
-	already := d.fullAutoDegradedLogged
-	d.fullAutoDegradedLogged = reason != ""
+	already := d.fspDegradedLogged
+	d.fspDegradedLogged = reason != ""
 	d.mu.Unlock()
 	if reason == "" {
 		return true
 	}
 	if !already {
-		slog.Warn("full-auto: enabled in config but preconditions no longer hold; "+
+		slog.Warn("full self-prompting: enabled in config but preconditions no longer hold; "+
 			"reverting to normal escalation flow until fixed", "reason", reason)
 	}
 	return false
 }
 
-// noteFullAutoSend records a full-auto delivery against the FR-019 runaway
-// guard. Full-auto is the ONLY auto-accept flavour that does this: timed
+// noteFSPSend records a full self-prompting delivery against the FR-019 runaway
+// guard. FSP is the ONLY auto-accept flavour that does this: timed
 // auto-accept is already bounded by its ≥1m threshold plus the sweep, while
-// full-auto has neither, so the guard is its only frequency bound. Without it
+// full self-prompting has neither, so the guard is its only frequency bound. Without it
 // an agent that re-raises an escalation on every attention event is answered
 // at event cadence forever and no human check-in is ever forced.
 //
@@ -483,16 +481,16 @@ func (d *Daemon) fullAutoActive(ctx context.Context, cfg config.Config) bool {
 //     a delivered answer is exactly what makes the agent resume, omitting
 //     this marker means the counter is zeroed moments after every accept and
 //     the consecutive ceiling can never trip — verified live 2026-08-15,
-//     where a real full-auto delivery left consecutive_auto at 0.
-func (d *Daemon) noteFullAutoSend(ctx context.Context, agentID string, now time.Time) {
+//     where a real full self-prompting delivery left consecutive_auto at 0.
+func (d *Daemon) noteFSPSend(ctx context.Context, agentID string, now time.Time) {
 	d.advanceAutoPromptRate(ctx, agentID, false, now)
 	d.mu.Lock()
 	d.lastAutoSend[agentID] = now
 	d.mu.Unlock()
 }
 
-// maybeFullAutoAcceptNow answers a just-raised escalation immediately when
-// full-auto mode is active, instead of leaving it for the sweep.
+// maybeFSPAcceptNow answers a just-raised escalation immediately when
+// full self-prompting mode is active, instead of leaving it for the sweep.
 //
 // escalate() runs ON THE DAEMON SELECT LOOP, and a delivery is not cheap: a
 // visible-pane read, a claim, a second pane read and a herdr send, each a CLI
@@ -506,7 +504,7 @@ func (d *Daemon) noteFullAutoSend(ctx context.Context, agentID string, now time.
 //   - acquirePane is taken SYNCHRONOUSLY, before spawning, so the decision of
 //     who owns this agent's pane is still made in loop order. It is the same
 //     per-agent claim the multi-tab sweep and series delivery use ("their
-//     keystrokes must never interleave"), so a full-auto delivery can no
+//     keystrokes must never interleave"), so a full self-prompting delivery can no
 //     longer overlap those either — a bound the inline version never had.
 //   - the auto-accept sweep skips an agent whose pane is claimed (paneBusy),
 //     so sweep and immediate delivery cannot both type into one pane.
@@ -521,12 +519,12 @@ func (d *Daemon) noteFullAutoSend(ctx context.Context, agentID string, now time.
 // rather than read off tr: the claim must be taken on the same identity the
 // send uses, or a divergence between the two would lock one pane and type
 // into another.
-func (d *Daemon) maybeFullAutoAcceptNow(ctx context.Context, auditID int64,
+func (d *Daemon) maybeFSPAcceptNow(ctx context.Context, auditID int64,
 	agentID string, tr domain.AgentTransition, now time.Time) {
 	// Free, in-memory, and false for every install that never opted in: keep
 	// it out of the goroutine so the common path costs nothing.
 	cfg, _, _ := d.snapshot()
-	if !cfg.Escalations.FullAuto.Enabled {
+	if !cfg.Escalations.FullSelfPrompting.Enabled {
 		return
 	}
 	if !d.acquirePane(agentID) {
@@ -534,14 +532,14 @@ func (d *Daemon) maybeFullAutoAcceptNow(ctx context.Context, auditID int64,
 	}
 	if !d.spawn(func() {
 		defer d.releasePane(agentID)
-		d.fullAutoAcceptNow(ctx, auditID, agentID, tr, now)
+		d.fspAcceptNow(ctx, auditID, agentID, tr, now)
 	}) {
 		// Shutdown latched before fn was scheduled, so its defer never runs.
 		d.releasePane(agentID)
 	}
 }
 
-// fullAutoAcceptNow is maybeFullAutoAcceptNow's body, running off the select
+// fspAcceptNow is maybeFSPAcceptNow's body, running off the select
 // loop with this agent's pane already claimed.
 //
 // It reuses autoAcceptOne verbatim with a single-agent live map. Deliberately
@@ -551,10 +549,10 @@ func (d *Daemon) maybeFullAutoAcceptNow(ctx context.Context, auditID int64,
 // autoAcceptAbsenceConfirmations — dismissing live escalations. The agent
 // here is known present (it just escalated), so no absence bookkeeping
 // applies.
-func (d *Daemon) fullAutoAcceptNow(ctx context.Context, auditID int64,
+func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
 	agentID string, tr domain.AgentTransition, now time.Time) {
 	cfg, _, _ := d.snapshot()
-	if !d.fullAutoActive(ctx, cfg) {
+	if !d.fspActive(ctx, cfg) {
 		return
 	}
 	// The kill switch MUST be re-checked here: autoAcceptOne does not check
@@ -578,12 +576,65 @@ func (d *Daemon) fullAutoAcceptNow(ctx context.Context, auditID int64,
 	if domain.AutoAcceptIneligible(rec, suggestion) != "" {
 		return // stays for the operator (never-auto & friends), or unanswerable
 	}
-	live := map[string]domain.AgentTransition{rec.AgentID: tr}
+	// The agent must still be PARKED, checked against herdr right now rather
+	// than against tr — which is a snapshot of the moment the escalation was
+	// raised, and by the time this runs the agent may have moved on by itself
+	// (it answered its own question, the form timed out, the operator replied,
+	// or a retry resumed it). Typing an answer at an agent that is working
+	// again injects text into whatever it is doing now.
+	//
+	// The pane comparison in Guard 3 does not subsume this: it asks whether
+	// the SITUATION is still on screen, and a resumed agent can still be
+	// painting the old menu in its scrollback while it works below it. Status
+	// is the direct evidence, so it is checked directly.
+	//
+	// Absence is a SKIP here, never a dismissal: the sweep owns retirement
+	// (its absence bookkeeping needs the complete agent listing this path
+	// deliberately does not have).
+	agent, ok := d.liveAgentFor(ctx, rec.AgentID)
+	if !ok {
+		return
+	}
+	if !autoAcceptParked(agent.Status) {
+		slog.Info("full self-prompting: agent moved on before the answer could land; leaving it for the operator",
+			"agent", rec.AgentID, "audit_id", rec.ID, "status", agent.Status)
+		return
+	}
+	live := map[string]domain.AgentTransition{rec.AgentID: agent}
 	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now) == autoAcceptDelivered {
-		d.noteFullAutoSend(ctx, rec.AgentID, now)
-		slog.Info("full-auto: escalation answered immediately",
+		d.noteFSPSend(ctx, rec.AgentID, now)
+		slog.Info("full self-prompting: escalation answered immediately",
 			"agent", rec.AgentID, "audit_id", rec.ID)
 	}
+}
+
+// autoAcceptParked reports whether an agent's status still admits an answer.
+// The same set Guard 2 accepts, named once so the immediate path and the
+// guard cannot drift apart.
+func autoAcceptParked(status string) bool {
+	switch status {
+	case "blocked", "idle", "done":
+		return true
+	}
+	return false
+}
+
+// liveAgentFor re-reads one agent's CURRENT transition from herdr. ok is false
+// when the listing fails or the agent is no longer in it — both of which mean
+// "do not deliver", never "retire the escalation".
+func (d *Daemon) liveAgentFor(ctx context.Context, agentID string) (domain.AgentTransition, bool) {
+	agents, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		slog.Debug("full self-prompting: agent listing failed; leaving the escalation pending",
+			"agent", agentID, "error", err)
+		return domain.AgentTransition{}, false
+	}
+	for _, a := range agents {
+		if a.AgentID == agentID {
+			return a, true
+		}
+	}
+	return domain.AgentTransition{}, false
 }
 
 // config_AutoAcceptTypes lists the situation types the auto-accept section

@@ -2427,7 +2427,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		// false on purpose: enabling is gated on runtime preconditions (10
 		// graduated rules, llm.command) this shared fixture does not meet.
 		// The enable path is exercised in fullauto_test.go.
-		"escalations.full_auto.enabled":           "false",
+		"escalations.full_self_prompting.enabled": "false",
 		"safety.disable_never_auto_seed_patterns": "true",
 		"llm.command":                              `claude -p "decide"`,
 		"llm.command_start":                        `claude -p "first: decide"`,
