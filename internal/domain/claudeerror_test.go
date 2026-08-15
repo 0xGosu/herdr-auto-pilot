@@ -84,9 +84,9 @@ func TestClaudeModelLimitForm(t *testing.T) {
 		{"model remedy only", "You've reached your Sonnet limit. Switch models with /model.\n", ClaudeErrorModelLimit},
 		{"multi-word model", "You've reached your Claude Opus 4.5 limit. Run /usage-credits to continue.\n", ClaudeErrorModelLimit},
 		{"after narration", "⏺ Refactoring the store…\n\n  ⎿  You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\n", ClaudeErrorModelLimit},
-		// Without the slash-command remedy it is still a limit, but the
-		// account-wide kind: the per-model rule must not absorb it.
-		{"no remedy falls back to usage-limit", "You've reached your usage limit\n", ClaudeErrorLimit},
+		// The account-wide banner keeps its own kind and its own wording;
+		// the per-model rule must not absorb it.
+		{"account-wide usage limit", "You've hit your usage limit\n", ClaudeErrorLimit},
 		// The original account-wide banner is untouched.
 		{"account-wide unchanged", "You've hit your limit · resets 6pm (UTC)\n", ClaudeErrorLimit},
 	} {
@@ -104,6 +104,16 @@ func TestClaudeModelLimitForm(t *testing.T) {
 // newline-free qualifier is what keeps these out.
 func TestClaudeModelLimitDoesNotMatchNarration(t *testing.T) {
 	for _, pane := range []string{
+		// Same-line narration is the case that matters: an earlier attempt
+		// allowed a few free-form words between "your" and "limit", which
+		// matched every one of these. Claude error detection is NOT
+		// status-gated, so a sentence the agent merely TYPED would have
+		// classified a working agent as a live error.
+		"the CI log says you've reached your API rate limit, so back off\n",
+		"curl failed: you've reached your monthly request limit\n",
+		"I added a test for when you've reached your rate limit. Run /usage-credits to continue.\n",
+		"You've reached your token budget limit for this run.\n",
+		// And across a line break, for the same reason.
 		"I added a test for when you've reached your rate\nlimit. Run /usage-credits to continue.\n",
 		"The docs explain what happens when your limit is reached and how /model works.\n",
 		"You've reached your goal for the week — the limit on retries is now configurable.\n",

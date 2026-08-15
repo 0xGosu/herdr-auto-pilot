@@ -149,7 +149,7 @@ func TestFSPKillSwitchWinsOnBothPaths(t *testing.T) {
 		t.Fatalf("sweep under kill switch: status = %q, want escalated", got)
 	}
 
-	h.daemon.fspAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
+	h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("immediate hook under kill switch: status = %q, want escalated", got)
 	}
@@ -185,7 +185,7 @@ func TestFSPExclusionsStillWait(t *testing.T) {
 		if got := auditStatus(t, h, id); got != "escalated" {
 			t.Errorf("sweep: %s row status = %q, want escalated", name, got)
 		}
-		h.daemon.fspAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
+		h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
 		if got := auditStatus(t, h, id); got != "escalated" {
 			t.Errorf("immediate hook: %s row status = %q, want escalated", name, got)
 		}
@@ -284,7 +284,7 @@ func TestFSPImmediateStaleScreenDismisses(t *testing.T) {
 	h.herdr.setPane("Bash(npm install)\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, never mind\n")
 	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", time.Second)
 
-	h.daemon.fspAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
+	h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
 
 	if got := auditStatus(t, h, id); got != "dismissed" {
 		t.Fatalf("status = %q, want dismissed (stale screen)", got)
@@ -366,7 +366,7 @@ func TestFSPDisabledAgentSuppressed(t *testing.T) {
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("sweep on a disabled agent: status = %q, want escalated", got)
 	}
-	h.daemon.fspAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
+	h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("immediate hook on a disabled agent: status = %q, want escalated", got)
 	}
@@ -459,7 +459,7 @@ func TestFSPRatePausedAgentIsSuppressed(t *testing.T) {
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("sweep on a rate-paused agent: status = %q, want escalated", got)
 	}
-	h.daemon.fspAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
+	h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("immediate hook on a rate-paused agent: status = %q, want escalated", got)
 	}
@@ -629,14 +629,13 @@ func TestFSPRefusesAnAgentThatMovedOn(t *testing.T) {
 	h.herdr.setPane(approvalPane)
 	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", time.Second)
 
-	// Raised while blocked...
-	raised := parked("pA", "blocked")[0]
-	// ...but herdr now reports the agent working again.
+	// Raised while the agent was blocked, but herdr now reports it working
+	// again — the status is re-read at delivery, not taken from the raise.
 	h.herdr.setAgents([]domain.AgentTransition{
 		{AgentID: "pA", PaneID: "pA", AgentType: "claude", Status: "working"},
 	})
 
-	h.daemon.fspAcceptNow(ctx, id, "pA", raised, time.Now())
+	h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
 
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("status = %q, want escalated (the agent moved on)", got)
@@ -658,7 +657,7 @@ func TestFSPStillAnswersAnAgentStillParked(t *testing.T) {
 			h.herdr.setAgents(parked("pA", status))
 			id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", time.Second)
 
-			h.daemon.fspAcceptNow(ctx, id, "pA", parked("pA", status)[0], time.Now())
+			h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
 
 			if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
 				t.Fatalf("status = %q, want %q", got, domain.AuditStatusAutoAccepted)
@@ -689,8 +688,8 @@ func TestFSPUnlistedAgentIsSkippedNotDismissed(t *testing.T) {
 
 			// Twice: enough to trip the sweep's absence ceiling, proving this
 			// path keeps no absence state of its own.
-			h.daemon.fspAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
-			h.daemon.fspAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
+			h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
+			h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
 
 			if got := auditStatus(t, h, id); got != "escalated" {
 				t.Fatalf("status = %q, want escalated (skipped, never retired)", got)
@@ -699,5 +698,49 @@ func TestFSPUnlistedAgentIsSkippedNotDismissed(t *testing.T) {
 				t.Errorf("nothing may be delivered, sent %v", got)
 			}
 		})
+	}
+}
+
+// TestFSPImmediateAcceptReleasesThePane: the claim is taken on the select loop
+// and released in the goroutine's defer. A leak would be invisible — the agent
+// would simply stop being answered, by this path AND by the sweep (which skips
+// a claimed pane), with no error anywhere.
+func TestFSPImmediateAcceptReleasesThePane(t *testing.T) {
+	h := newFSPHarness(t, fspOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents(parked("pA", "blocked"))
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", time.Second)
+
+	h.daemon.maybeFSPAcceptNow(ctx, id, "pA", parked("pA", "blocked")[0], time.Now())
+	waitFor(t, 5*time.Second, func() bool {
+		return auditStatus(t, h, id) == domain.AuditStatusAutoAccepted
+	})
+	waitFor(t, 5*time.Second, func() bool { return !h.daemon.paneBusy("pA") })
+
+	if !h.daemon.acquirePane("pA") {
+		t.Fatal("the pane claim was not released after a completed delivery")
+	}
+	h.daemon.releasePane("pA")
+}
+
+// TestFSPRefusesWhenTheAuditRowNamesAnotherAgent is the tripwire on the
+// claim/delivery identity: the pane was claimed for one agent, so delivering
+// to the agent named on the row would type into an unclaimed pane.
+func TestFSPRefusesWhenTheAuditRowNamesAnotherAgent(t *testing.T) {
+	h := newFSPHarness(t, fspOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents(parked("pB", "blocked"))
+	id := seedAgedEscalation(t, h, "pB", approvalPane, domain.SituationApproval, "respond: Yes", time.Second)
+
+	// Claimed for pA, but the row names pB.
+	h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("status = %q, want escalated (identity mismatch must refuse)", got)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("nothing may be delivered on an identity mismatch, sent %v", got)
 	}
 }

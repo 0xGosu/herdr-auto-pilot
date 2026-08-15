@@ -52,9 +52,9 @@ func pressOne(t *testing.T, m Model, key string) (Model, tea.Cmd) {
 	return upd.(Model), cmd
 }
 
-// TestDoubleRTogglesFullSelfPrompting: two R inside the window call the real
-// SetFullSelfPrompting, enable the mode, and report it; the deferred re-embed action
-// never fires.
+// TestDoubleRTogglesFullSelfPrompting: two r inside the window call the real
+// SetFullSelfPrompting, enable the mode, and report it; the deferred resume
+// never runs.
 func TestDoubleRTogglesFullSelfPrompting(t *testing.T) {
 	m := testModel(t)
 	m.app = fspTestApp(t)
@@ -90,14 +90,113 @@ func TestDoubleRTogglesFullSelfPrompting(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !cfg.Escalations.FullSelfPrompting.Enabled {
-		t.Fatal("double-R did not enable full self-prompting in config")
+		t.Fatal("double-r did not enable full self-prompting in config")
 	}
 
-	// The first press's deferred timer is stale now: it must NOT re-embed.
-	upd, _ := m.Update(doubleRTimerMsg{seq: staleSeq})
-	m = upd.(Model)
-	if m.message != "" {
-		t.Errorf("stale timer produced output: %q", m.message)
+	// The first press's timer is stale now and must dispatch NOTHING.
+	// Assert on the COMMAND: neither branch writes m.message (the live branch
+	// calls beginAction, which clears it), so a message assertion here would
+	// pass even with the guard deleted.
+	_, cmd = m.Update(doubleRTimerMsg{seq: staleSeq})
+	if cmd != nil {
+		t.Error("the superseded timer dispatched an action; it must be inert")
+	}
+}
+
+// TestStaleDoubleRTimerIsInertWhileArmed exercises the SEQ guard specifically.
+// The disarm check alone cannot catch this: here the model IS armed again (a
+// fresh r), so only the sequence number distinguishes the old timer from the
+// live one. Without it, a timer from an abandoned gesture resumes automation
+// the operator never asked to resume.
+func TestStaleDoubleRTimerIsInertWhileArmed(t *testing.T) {
+	m := testModel(t)
+	m.app = fspTestApp(t)
+	m.ctx = context.Background()
+
+	m, _ = pressOne(t, m, "r") // arm; seq = S
+	staleSeq := m.doubleRSeq
+	m, _ = pressOne(t, m, "j") // disarm
+	m, _ = pressOne(t, m, "r") // arm again; seq > S
+	if !m.doubleRArmed {
+		t.Fatal("expected the model to be armed again")
+	}
+
+	_, cmd := m.Update(doubleRTimerMsg{seq: staleSeq})
+	if cmd != nil {
+		t.Error("a timer from the abandoned gesture fired while armed; the seq guard is not holding")
+	}
+	// The CURRENT timer still works.
+	_, cmd = m.Update(doubleRTimerMsg{seq: m.doubleRSeq})
+	if cmd == nil {
+		t.Error("the live timer must still run the deferred resume")
+	}
+}
+
+// TestModalDisarmsPendingDoubleR: a key that opens or feeds a modal must
+// disarm, or the deferred resume fires later against automation the operator
+// never asked to resume — while their attention is on the modal.
+func TestModalDisarmsPendingDoubleR(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		open func(m *Model)
+	}{
+		{"detail overlay", func(m *Model) { m.detail = &detailView{} }},
+		{"confirm modal", func(m *Model) { m.confirm = &confirmation{label: "sure?"} }},
+		{"text prompt", func(m *Model) { m.prompt = &prompt{} }},
+		{"search mode", func(m *Model) { m.searching = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testModel(t)
+			m.app = fspTestApp(t)
+			m.ctx = context.Background()
+
+			m, _ = pressOne(t, m, "r")
+			if !m.doubleRArmed {
+				t.Fatal("first r must arm")
+			}
+			tc.open(&m)
+			// An "r" now belongs to the modal, not to the gesture.
+			upd, _ := m.Update(pressKeyMsg("r"))
+			m = upd.(Model)
+			if m.doubleRArmed {
+				t.Fatal("a modal key must disarm the pending double-press")
+			}
+			if _, cmd := m.Update(doubleRTimerMsg{seq: m.doubleRSeq}); cmd != nil {
+				t.Error("the dropped gesture still dispatched an action")
+			}
+		})
+	}
+}
+
+// TestDoubleRTogglesFullSelfPromptingOff: the OFF transition is not symmetric
+// with ON — it has no preconditions at all — so it gets its own case.
+func TestDoubleRTogglesFullSelfPromptingOff(t *testing.T) {
+	m := testModel(t)
+	m.app = fspTestApp(t)
+	m.ctx = context.Background()
+	if err := m.app.SetFullSelfPrompting(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	m.data.status.FullSelfPrompting = true
+
+	m, _ = pressOne(t, m, "r")
+	_, cmd := pressOne(t, m, "r")
+	if cmd == nil {
+		t.Fatal("rr must dispatch the toggle")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok || res.err != nil {
+		t.Fatalf("toggle off failed: %+v", res)
+	}
+	if !strings.Contains(res.message, "OFF") {
+		t.Errorf("message = %q, want it to report OFF", res.message)
+	}
+	cfg, err := m.app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Escalations.FullSelfPrompting.Enabled {
+		t.Error("rr did not disable the mode")
 	}
 }
 

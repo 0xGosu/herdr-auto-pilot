@@ -804,11 +804,11 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	fmt.Fprintf(out, "automation:          %s\n", state)
 	switch {
 	case !st.FullSelfPrompting:
-		fmt.Fprintf(out, "full self-prompting:           off\n")
+		fmt.Fprintf(out, "full self-prompting: off\n")
 	case st.FullSelfPromptingBlocked != "":
-		fmt.Fprintf(out, "full self-prompting:           ON but INACTIVE — %s\n", st.FullSelfPromptingBlocked)
+		fmt.Fprintf(out, "full self-prompting: ON but INACTIVE — %s\n", st.FullSelfPromptingBlocked)
 	default:
-		fmt.Fprintf(out, "full self-prompting:           ON — escalations with a proposed answer are answered automatically\n")
+		fmt.Fprintf(out, "full self-prompting: ON — escalations with a proposed answer are answered automatically\n")
 	}
 	// Daemon health combines the lock, heartbeat, and crash-loop breaker into
 	// one assessment shared with the TUI banner (frontend.AssessDaemonHealth),

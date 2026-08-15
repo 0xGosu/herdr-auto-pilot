@@ -11,6 +11,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/deliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 )
 
 // maxAutoAcceptAttempts bounds how many times one escalation's delivery is
@@ -532,7 +533,14 @@ func (d *Daemon) maybeFSPAcceptNow(ctx context.Context, auditID int64,
 	}
 	if !d.spawn(func() {
 		defer d.releasePane(agentID)
-		d.fspAcceptNow(ctx, auditID, agentID, tr, now)
+		// Guarded like every other delivery spawn (mcq-sweep,
+		// series-delivery): this runs classification and delivery over
+		// arbitrary pane bytes on a goroutine, where an unrecovered panic
+		// takes the whole daemon down instead of failing this one escalation.
+		logging.Guard("fsp-accept", func() error {
+			d.fspAcceptNow(ctx, auditID, agentID, now)
+			return nil
+		})
 	}) {
 		// Shutdown latched before fn was scheduled, so its defer never runs.
 		d.releasePane(agentID)
@@ -550,7 +558,7 @@ func (d *Daemon) maybeFSPAcceptNow(ctx context.Context, auditID int64,
 // here is known present (it just escalated), so no absence bookkeeping
 // applies.
 func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
-	agentID string, tr domain.AgentTransition, now time.Time) {
+	agentID string, now time.Time) {
 	cfg, _, _ := d.snapshot()
 	if !d.fspActive(ctx, cfg) {
 		return
@@ -570,6 +578,16 @@ func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
 	// the sweep) would have seen on this row.
 	rec, err := d.opt.Store.GetAudit(ctx, auditID)
 	if err != nil || rec == nil {
+		return
+	}
+	if rec.AgentID != agentID {
+		// The pane claim was taken on agentID; delivering to a different one
+		// would type into an unclaimed pane. True by construction today
+		// (escalate builds the row from the same situation), so this is a
+		// tripwire for a future change that resolves the row's agent
+		// differently — a recycled-pane rewrite, say.
+		slog.Warn("full self-prompting: audit row names a different agent than the claimed pane; skipping",
+			"claimed", agentID, "row", rec.AgentID, "audit_id", rec.ID)
 		return
 	}
 	suggestion := domain.SuggestedAction(rec)

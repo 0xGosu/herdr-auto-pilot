@@ -108,11 +108,10 @@ type semanticSearchMsg struct {
 	err     error
 }
 
-// doublePressWindow is how long after a first capital R a second one still
-// reads as a double-press (the full self-prompting toggle). The first press's own
-// action (re-embed) is deferred by this window, so it must stay short enough
-// to be imperceptible on an async request and long enough for a deliberate
-// double-tap.
+// doublePressWindow is how long after a first "r" a second one still reads as
+// a double-press (the full self-prompting toggle). The first press's own
+// action (resume) is deferred by this window, so it must stay short enough to
+// be imperceptible and long enough for a deliberate double-tap.
 const doublePressWindow = 600 * time.Millisecond
 
 // doubleRTimerMsg fires when a first "r"'s double-press window expires with

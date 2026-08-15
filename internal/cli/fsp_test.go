@@ -39,7 +39,7 @@ func TestStatusReportsFullSelfPromptingStates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "full self-prompting:           off") {
+	if !strings.Contains(out, "full self-prompting: off") {
 		t.Errorf("default status must report full self-prompting off, got:\n%s", out)
 	}
 
@@ -48,7 +48,7 @@ func TestStatusReportsFullSelfPromptingStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, _ = run(t, app, "status")
-	if !strings.Contains(out, "full self-prompting:           ON — escalations with a proposed answer are answered automatically") {
+	if !strings.Contains(out, "full self-prompting: ON — escalations with a proposed answer are answered automatically") {
 		t.Errorf("enabled status must report full self-prompting ON, got:\n%s", out)
 	}
 
@@ -56,7 +56,7 @@ func TestStatusReportsFullSelfPromptingStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, _ = run(t, app, "status")
-	if !strings.Contains(out, "full self-prompting:           ON but INACTIVE — only 0 of") {
+	if !strings.Contains(out, "full self-prompting: ON but INACTIVE — only 0 of") {
 		t.Errorf("blocked status must report ON but INACTIVE with the reason, got:\n%s", out)
 	}
 	if !strings.Contains(out, "hap config set escalations.full_self_prompting.enabled false") {
