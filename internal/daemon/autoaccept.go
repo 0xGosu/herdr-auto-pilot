@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/deliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
@@ -61,13 +62,27 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	now := d.opt.Clock.Now()
 
 	cutoffs := make(map[domain.SituationType]time.Time)
-	for _, st := range config_AutoAcceptTypes() {
-		if after, ok := cfg.AutoAcceptAfter(string(st)); ok {
-			cutoffs[st] = now.Add(-after)
+	fullAuto := d.fullAutoActive(ctx, cfg)
+	if fullAuto {
+		// Full-auto: zero wait for ALL five types — including idle and
+		// unclassifiable, whose timed auto-accept defaults are disabled.
+		// cutoff=now satisfies created_at <= cutoff for every pending row.
+		// A parallel builder rather than a change to AutoAcceptAfter: that
+		// accessor stays the source of truth for TIMED auto-accept, and
+		// full-auto works with escalations.auto_accept.enabled false. When
+		// both are on, these cutoffs strictly dominate.
+		for _, st := range config_AutoAcceptTypes() {
+			cutoffs[st] = now
+		}
+	} else {
+		for _, st := range config_AutoAcceptTypes() {
+			if after, ok := cfg.AutoAcceptAfter(string(st)); ok {
+				cutoffs[st] = now.Add(-after)
+			}
 		}
 	}
 	if len(cutoffs) == 0 {
-		return nil // feature off, or every type disabled
+		return nil // both features off, or every type disabled
 	}
 
 	// Guard 1a — FR-017: the kill switch stands the whole daemon down. Fail
@@ -132,6 +147,17 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		case autoAcceptDelivered:
 			handledAgent[rec.AgentID] = true
 			accepted++
+			// A FULL-AUTO delivery counts against the FR-019 runaway guard
+			// (both counters — it is a machine's answer, not an operator's
+			// declared queue work). Timed auto-accept deliberately does not
+			// count: its ≥1m threshold plus the sweep throttle already bound
+			// it, and that is its documented contract. Full-auto removed the
+			// threshold, so without this an agent re-raising escalations
+			// forever would be answered forever with no ceiling ever
+			// tripping and no human check-in ever forced.
+			if fullAuto {
+				d.advanceAutoPromptRate(ctx, rec.AgentID, false, now)
+			}
 		case autoAcceptRetired:
 			// Dismissed. The agent is NOT marked handled: nothing was
 			// delivered to its pane, so another escalation of its may proceed.
@@ -390,6 +416,101 @@ func (d *Daemon) autoAcceptAgentSuppressed(ctx context.Context, agentID string) 
 	// suggestion, so it is not an unsolicited auto-prompt — but a pause that is
 	// already in force is still honoured.
 	return rate != nil && rate.Paused
+}
+
+// fullAutoActive reports whether the full-auto pass may run right now:
+// configured on AND the runtime preconditions still hold (a configured
+// llm.command, at least config.MinFullAutoGraduatedRules graduated rules).
+// All checks fail closed. The preconditions were verified when the mode was
+// enabled, but the world moves — rules get deleted, llm.command gets cleared
+// — so a configured-on mode that no longer qualifies reverts to the normal
+// escalation flow, logged once per degradation episode. The config is never
+// rewritten: the operator's intent stands, and status surfaces the blockage.
+func (d *Daemon) fullAutoActive(ctx context.Context, cfg config.Config) bool {
+	if !cfg.Escalations.FullAuto.Enabled {
+		return false
+	}
+	reason := ""
+	if p := d.llmPort(); p == nil || !p.Configured() {
+		reason = "llm.command is no longer configured"
+	} else if n, err := d.opt.Store.CountSignaturesByMode(ctx, string(domain.ModeAutonomous)); err != nil {
+		// Fails closed like the others, and through the same latch: a store
+		// outage during an escalation storm must not turn this into a
+		// warn-per-event firehose.
+		reason = "graduated-rule count unreadable: " + err.Error()
+	} else if n < config.MinFullAutoGraduatedRules {
+		reason = fmt.Sprintf("only %d of %d required graduated (autonomous) rules remain",
+			n, config.MinFullAutoGraduatedRules)
+	}
+
+	d.mu.Lock()
+	already := d.fullAutoDegradedLogged
+	d.fullAutoDegradedLogged = reason != ""
+	d.mu.Unlock()
+	if reason == "" {
+		return true
+	}
+	if !already {
+		slog.Warn("full-auto: enabled in config but preconditions no longer hold; "+
+			"reverting to normal escalation flow until fixed", "reason", reason)
+	}
+	return false
+}
+
+// maybeFullAutoAcceptNow answers a just-raised escalation immediately when
+// full-auto mode is active, instead of leaving it for the sweep. Called from
+// escalate() on the daemon select loop — synchronous on purpose, so it is
+// ordered against the sweep's own deliveries by construction. Every non-send
+// outcome simply returns: the 1-minute sweep is the designed catch-up.
+//
+// It reuses autoAcceptOne verbatim with a single-agent live map. Deliberately
+// NOT autoAcceptEscalations with a one-agent listing: that pass reads its
+// listing as the complete live-agent set, so every other agent's candidate
+// would take an absence mark, and two immediate accepts inside a minute reach
+// autoAcceptAbsenceConfirmations — dismissing live escalations. The agent
+// here is known present (it just escalated), so no absence bookkeeping
+// applies.
+func (d *Daemon) maybeFullAutoAcceptNow(ctx context.Context, auditID int64,
+	tr domain.AgentTransition, now time.Time) {
+	cfg, _, _ := d.snapshot()
+	if !d.fullAutoActive(ctx, cfg) {
+		return
+	}
+	// The kill switch MUST be re-checked here: autoAcceptOne does not check
+	// it (the sweep's guard sits before its loop), and escalations ARE raised
+	// while paused — ReasonDaemonPaused is not an excluded reason, and a
+	// pause can begin any time after the mode was enabled. Fail closed,
+	// exactly as the sweep does.
+	kill, err := d.opt.Store.LatestKillEvent(ctx)
+	if err != nil || domain.KillStateActive(kill) {
+		return
+	}
+	// Re-read the persisted row rather than trusting locals: autoAcceptOne
+	// claims by id and rehydrates the signature baseline from the stored
+	// sig_* columns, so the delivered answer is exactly what an operator (or
+	// the sweep) would have seen on this row.
+	rec, err := d.opt.Store.GetAudit(ctx, auditID)
+	if err != nil || rec == nil {
+		return
+	}
+	suggestion := domain.SuggestedAction(rec)
+	if domain.AutoAcceptIneligible(rec, suggestion) != "" {
+		return // stays for the operator (never-auto & friends), or unanswerable
+	}
+	live := map[string]domain.AgentTransition{rec.AgentID: tr}
+	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now) == autoAcceptDelivered {
+		// Count the delivery against the FR-019 runaway guard (both
+		// counters). This hook has no threshold and no sweep throttle, so
+		// the guard is the ONLY frequency bound on it: an agent that
+		// re-raises an escalation on every attention event would otherwise
+		// be answered at event cadence forever with no human check-in ever
+		// forced. Once the ceilings trip, decide() raises rate_limited —
+		// an excluded reason — and escalate() pauses the agent, which
+		// autoAcceptAgentSuppressed honours; a human interaction resets it.
+		d.advanceAutoPromptRate(ctx, rec.AgentID, false, now)
+		slog.Info("full-auto: escalation answered immediately",
+			"agent", rec.AgentID, "audit_id", rec.ID)
+	}
 }
 
 // config_AutoAcceptTypes lists the situation types the auto-accept section

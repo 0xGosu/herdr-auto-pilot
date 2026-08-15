@@ -1992,6 +1992,42 @@ what stand between an auto-accept and a destructive command, with the
 still-on-screen check closing most of the remaining gap (content that changed
 materially fails it).
 
+### Full-auto prompting mode (optional)
+
+Timed auto-accept is the slow lane; full-auto is the fast one. When it is on,
+every escalation that carries a proposed answer is accepted **immediately** —
+answered the moment it is raised, with the sweep as catch-up — instead of
+waiting out a threshold. Everything else about auto-accept holds unchanged:
+the same safety exclusions reach a human (`never_auto_match`,
+`suspected_irreversible`, `retry_exhausted`, `rate_limited`, and anything
+without a suggestion), the same still-on-screen check runs before delivery,
+nothing acts while paused, and nothing is ever learned from a machine's own
+accept.
+
+Unlike timed auto-accept, a full-auto delivery **counts against the `[limits]`
+runaway ceilings** — with no waiting threshold there is no other frequency
+bound, so an agent that keeps re-raising escalations is answered only until
+`max_auto_prompts_per_minute` / `max_consecutive_auto_prompts` trip, and then
+waits for a human check-in like any other runaway.
+
+```toml
+[escalations.full_auto]
+enabled = true
+```
+
+Toggle it with a double-press of `R` in the TUI, or
+`config set escalations.full_auto.enabled true`. Enabling is refused — with an
+error naming exactly what is missing — until the daemon has earned it: at
+least **10 graduated (autonomous) rules** in the database and a configured
+`[llm].command`, and never while the kill switch is active. Disabling always
+succeeds.
+
+The preconditions stay live: delete rules below the minimum or clear
+`[llm].command` and the mode goes inactive (escalations queue for you again)
+without your config being rewritten — `status` and the TUI banner then read
+`ON but INACTIVE` with the reason until you fix the precondition or turn the
+mode off.
+
 ## Pause/kill switch & audit
 
 - `pause` / `resume` (CLI, TUI `p`/`r`, or Herdr plugin actions) toggle a

@@ -1,0 +1,451 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+)
+
+// fullAutoOn enables ONLY full-auto — auto_accept stays off, proving the two
+// switches are independent.
+const fullAutoOn = `
+[escalations.full_auto]
+enabled = true
+`
+
+// newFullAutoHarness builds a harness whose runtime preconditions hold: a
+// configured LLM port and MinFullAutoGraduatedRules graduated rules.
+func newFullAutoHarness(t *testing.T, cfgTOML string) *harness {
+	t.Helper()
+	h := newHarnessConsult(t, cfgTOML,
+		func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+			return &domain.LLMDecision{Action: domain.ActionNoop}, nil
+		})
+	seedGraduatedSignatures(t, h, config.MinFullAutoGraduatedRules)
+	return h
+}
+
+func seedGraduatedSignatures(t *testing.T, h *harness, n int) {
+	t.Helper()
+	ctx := context.Background()
+	for i := 0; i < n; i++ {
+		if err := h.raw.UpsertSignature(ctx, domain.SignatureState{
+			Signature: fmt.Sprintf("approval:full-auto-grad-%d", i), SituationType: domain.SituationApproval,
+			AgentType: "claude", Mode: domain.ModeAutonomous, UpdatedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// seedEscalationWithRationale is seedAgedEscalation with a caller-chosen
+// rationale, for rows whose escalation reason IS the thing under test. The
+// baseline still matches the pane so nothing but the reason gate can refuse.
+func seedEscalationWithRationale(t *testing.T, h *harness, agentID, pane, rationale string,
+	st domain.SituationType, suggestion string, age time.Duration) int64 {
+	t.Helper()
+	status := "blocked"
+	if st == domain.SituationIdle {
+		status = "idle"
+	}
+	s := classifierForTest().Classify("claude", status, pane)
+	if s.Type != st {
+		t.Fatalf("fixture classifies as %v, want %v", s.Type, st)
+	}
+	sig := domain.ComputeSignature(s)
+	id, err := h.raw.AppendAudit(context.Background(), domain.AuditRecord{
+		AgentID: agentID, AgentType: "claude", Trigger: "status", SituationType: st,
+		Action: domain.AuditActionEscalated, Status: "escalated",
+		Rationale: rationale, Suggestion: suggestion,
+		PaneExcerpt: pane, CreatedAt: time.Now().Add(-age),
+	}.WithSignatureBaseline(sig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// TestFullAutoSweepAcceptsFreshEscalationWithoutWaiting: with full-auto on
+// (and timed auto-accept OFF), a seconds-old escalation is delivered on the
+// next sweep — no threshold, and still no learning.
+func TestFullAutoSweepAcceptsFreshEscalationWithoutWaiting(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+		t.Fatalf("status = %q, want %q", got, domain.AuditStatusAutoAccepted)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 1 || got[0] != "1" {
+		t.Errorf("sent = %v, want [1]", got)
+	}
+	corr, err := h.raw.UnprocessedCorrections(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(corr) != 0 {
+		t.Errorf("a full-auto accept must write NO correction, got %+v", corr)
+	}
+}
+
+// TestFullAutoOffFreshEscalationStillWaits is the control: with only TIMED
+// auto-accept on, the same seconds-old escalation stays pending.
+func TestFullAutoOffFreshEscalationStillWaits(t *testing.T) {
+	h := newFullAutoHarness(t, autoAcceptOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("status = %q, want escalated (only timed auto-accept is on)", got)
+	}
+}
+
+// TestFullAutoAcceptsIdleDespiteAutoAcceptDefaults: idle's timed auto-accept
+// default is disabled, but full-auto covers every type that carries a
+// deliverable suggestion.
+func TestFullAutoAcceptsIdleDespiteAutoAcceptDefaults(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := seedAgedEscalation(t, h, "pA", idlePane, domain.SituationIdle, "respond: keep going", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+		t.Fatalf("idle status = %q, want %q", got, domain.AuditStatusAutoAccepted)
+	}
+}
+
+// TestFullAutoKillSwitchWinsOnBothPaths: a pause stands full-auto down on the
+// sweep AND on the immediate escalate-time hook.
+func TestFullAutoKillSwitchWinsOnBothPaths(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	if _, err := h.raw.InsertKillEvent(ctx, domain.KillEvent{
+		State: "active", Scope: "global", Author: "operator", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("sweep under kill switch: status = %q, want escalated", got)
+	}
+
+	h.daemon.maybeFullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("immediate hook under kill switch: status = %q, want escalated", got)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("nothing may be delivered while paused, sent %v", got)
+	}
+}
+
+// TestFullAutoExclusionsStillWait: the safety exclusions are unchanged —
+// never-auto matches (which carry no suggestion), suspected-irreversible,
+// retry-exhausted, rate-limited, noop and generate-task suggestions all stay
+// for the operator, on the sweep and on the immediate hook alike.
+func TestFullAutoExclusionsStillWait(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+
+	rows := map[string]int64{
+		"never_auto_match": seedEscalationWithRationale(t, h, "pA", approvalPane,
+			"[never_auto_match] matched pattern rm -rf", domain.SituationApproval, "", time.Minute),
+		"suspected_irreversible": seedEscalationWithRationale(t, h, "pA", approvalPane,
+			"[suspected_irreversible] the command looks destructive", domain.SituationApproval, "respond: Yes", time.Minute),
+		"retry_exhausted": seedEscalationWithRationale(t, h, "pA", approvalPane,
+			"[retry_exhausted] same error three times", domain.SituationApproval, "respond: Yes", time.Minute),
+		"rate_limited": seedEscalationWithRationale(t, h, "pA", approvalPane,
+			"[rate_limited] per-minute ceiling", domain.SituationApproval, "respond: Yes", time.Minute),
+		"noop suggestion": seedEscalationWithRationale(t, h, "pA", approvalPane,
+			"[shadow_mode] learning", domain.SituationApproval, domain.ActionNoopSuggestion, time.Minute),
+	}
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	for name, id := range rows {
+		if got := auditStatus(t, h, id); got != "escalated" {
+			t.Errorf("sweep: %s row status = %q, want escalated", name, got)
+		}
+		h.daemon.maybeFullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+		if got := auditStatus(t, h, id); got != "escalated" {
+			t.Errorf("immediate hook: %s row status = %q, want escalated", name, got)
+		}
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("no excluded escalation may be delivered, sent %v", got)
+	}
+}
+
+// classifiedSituation builds the Situation exactly as the live pipeline does
+// — through the classifier — so the persisted baseline carries the structured
+// salient Guard 3 compares against. A hand-built Situation (bare Content, no
+// parsed options/verb) mints an unstructured pane-tail baseline that the
+// staleness guard refuses to evaluate, and the accept silently never fires.
+func classifiedSituation(t *testing.T, agentID, pane string) domain.Situation {
+	t.Helper()
+	s := classifierForTest().Classify("claude", "blocked", pane)
+	if s.Type != domain.SituationApproval {
+		t.Fatalf("fixture classifies as %v, want approval", s.Type)
+	}
+	s.AgentID, s.PaneID = agentID, agentID
+	return s
+}
+
+// TestFullAutoImmediateAcceptOnEscalate: an escalation raised through
+// escalate() while full-auto is active is answered right there — no sweep
+// tick involved.
+func TestFullAutoImmediateAcceptOnEscalate(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	h.herdr.setAgents(parked("pA", "blocked"))
+	h.herdr.setPane(approvalPane)
+
+	s := classifiedSituation(t, "pA", approvalPane)
+	h.daemon.escalate(ctx, s, domain.ComputeSignature(s), domain.Decision{
+		Action: domain.ActionEscalate, Reason: domain.ReasonShadowMode, Suggestion: "respond: Yes",
+	}, parked("pA", "blocked")[0], time.Now())
+
+	pending, err := h.raw.PendingEscalations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("escalation still pending after immediate accept: %+v", pending)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 1 || got[0] != "1" {
+		t.Errorf("sent = %v, want [1]", got)
+	}
+	audits, err := h.raw.AuditLog(ctx, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) == 0 || audits[0].Status != domain.AuditStatusAutoAccepted {
+		t.Fatalf("newest audit row = %+v, want status %q", audits, domain.AuditStatusAutoAccepted)
+	}
+}
+
+// TestFullAutoImmediateAcceptLeavesOtherAgentsPending: the immediate hook is
+// single-candidate by design — agent B's pending escalation takes no absence
+// mark and is neither dismissed nor delivered when agent A's fires.
+func TestFullAutoImmediateAcceptLeavesOtherAgentsPending(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	h.herdr.setAgents(parked("pA", "blocked"))
+	h.herdr.setPane(approvalPane)
+	idB := seedAgedEscalation(t, h, "pB", approvalPane, domain.SituationApproval, "respond: Yes", time.Minute)
+
+	s := classifiedSituation(t, "pA", approvalPane)
+	h.daemon.escalate(ctx, s, domain.ComputeSignature(s), domain.Decision{
+		Action: domain.ActionEscalate, Reason: domain.ReasonShadowMode, Suggestion: "respond: Yes",
+	}, parked("pA", "blocked")[0], time.Now())
+
+	if got := auditStatus(t, h, idB); got != "escalated" {
+		t.Fatalf("agent B's escalation = %q after A's immediate accept, want escalated", got)
+	}
+}
+
+// TestFullAutoImmediateStaleScreenDismisses pins the accepted trade-off: a
+// pane that structurally changed between capture and the delivery re-read is
+// dismissed as stale — the same verdict the sweep would reach a minute later.
+func TestFullAutoImmediateStaleScreenDismisses(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	h.herdr.setAgents(parked("pA", "blocked"))
+	// A DIFFERENT approval is now on screen: the option set changed, so the
+	// structured salient no longer matches the escalation's baseline.
+	h.herdr.setPane("Bash(npm install)\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, never mind\n")
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", time.Second)
+
+	h.daemon.maybeFullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+
+	if got := auditStatus(t, h, id); got != "dismissed" {
+		t.Fatalf("status = %q, want dismissed (stale screen)", got)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("nothing may be delivered onto a changed screen, sent %v", got)
+	}
+}
+
+// TestFullAutoPreconditionDriftSkipsAndConfigUntouched: rules dropping below
+// the minimum turns the pass off (fail closed) without rewriting the
+// operator's config; restoring the rules revives it with no other action.
+func TestFullAutoPreconditionDriftSkipsAndConfigUntouched(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	if _, err := h.raw.DeleteSignature(ctx, "approval:full-auto-grad-0"); err != nil {
+		t.Fatal(err)
+	}
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("below the rule minimum: status = %q, want escalated", got)
+	}
+	data, err := os.ReadFile(h.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "enabled = true") {
+		t.Fatalf("the daemon rewrote the operator's config:\n%s", data)
+	}
+
+	seedGraduatedSignatures(t, h, 1) // restore the tenth rule
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+		t.Fatalf("restored preconditions: status = %q, want %q", got, domain.AuditStatusAutoAccepted)
+	}
+}
+
+// TestFullAutoOnePerAgentPerTickStillHolds: zero wait does not lift the
+// per-pane blast-radius bound — two eligible rows on one agent drain one per
+// sweep.
+func TestFullAutoOnePerAgentPerTickStillHolds(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	id1 := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 2*time.Minute)
+	id2 := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", time.Minute)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	first, second := auditStatus(t, h, id1), auditStatus(t, h, id2)
+	if first != domain.AuditStatusAutoAccepted || second != "escalated" {
+		t.Fatalf("after one sweep: oldest = %q (want auto_accepted), newer = %q (want escalated)", first, second)
+	}
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	if got := auditStatus(t, h, id2); got != domain.AuditStatusAutoAccepted {
+		t.Fatalf("after two sweeps: newer = %q, want %q", got, domain.AuditStatusAutoAccepted)
+	}
+}
+
+// TestFullAutoDisabledAgentSuppressed: a per-agent disable still wins — the
+// row is skipped (never dismissed), on both paths.
+func TestFullAutoDisabledAgentSuppressed(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	if _, err := h.raw.EnsureAgentName(ctx, "pA"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raw.SetAgentDisabled(ctx, "pA", true); err != nil {
+		t.Fatal(err)
+	}
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("sweep on a disabled agent: status = %q, want escalated", got)
+	}
+	h.daemon.maybeFullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("immediate hook on a disabled agent: status = %q, want escalated", got)
+	}
+}
+
+// TestFullAutoDeliveryAdvancesTheRunawayGuard: a full-auto delivery counts
+// against BOTH FR-019 counters, on the immediate hook and on the sweep — the
+// guard is the only frequency bound on the hook path. Timed auto-accept keeps
+// its documented contract of not counting (its threshold + sweep throttle
+// bound it already).
+func TestFullAutoDeliveryAdvancesTheRunawayGuard(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("immediate hook counts", func(t *testing.T) {
+		h := newFullAutoHarness(t, fullAutoOn)
+		h.herdr.setAgents(parked("pA", "blocked"))
+		h.herdr.setPane(approvalPane)
+		s := classifiedSituation(t, "pA", approvalPane)
+		h.daemon.escalate(ctx, s, domain.ComputeSignature(s), domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonShadowMode, Suggestion: "respond: Yes",
+		}, parked("pA", "blocked")[0], time.Now())
+
+		rate, err := h.raw.GetAgentRate(ctx, "pA")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rate.ConsecutiveAuto != 1 || rate.CountInWindow != 1 {
+			t.Fatalf("rate after immediate accept = %+v, want both counters at 1", rate)
+		}
+	})
+
+	t.Run("full-auto sweep counts", func(t *testing.T) {
+		h := newFullAutoHarness(t, fullAutoOn)
+		h.herdr.setPane(approvalPane)
+		seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+		h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+		rate, err := h.raw.GetAgentRate(ctx, "pA")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rate.ConsecutiveAuto != 1 || rate.CountInWindow != 1 {
+			t.Fatalf("rate after full-auto sweep accept = %+v, want both counters at 1", rate)
+		}
+	})
+
+	t.Run("timed auto-accept still does not count", func(t *testing.T) {
+		h := newFullAutoHarness(t, autoAcceptOn)
+		h.herdr.setPane(approvalPane)
+		id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 20*time.Minute)
+		h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+		if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+			t.Fatalf("timed accept did not deliver: %q", got)
+		}
+		rate, err := h.raw.GetAgentRate(ctx, "pA")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rate.ConsecutiveAuto != 0 || rate.CountInWindow != 0 {
+			t.Fatalf("rate after TIMED accept = %+v, want untouched (its documented contract)", rate)
+		}
+	})
+}
+
+// TestFullAutoRatePausedAgentIsSuppressed: once the runaway guard pauses an
+// agent, full-auto answers nothing for it — the pause is the human-check-in
+// gate that breaks an answer loop, so it must hold on both paths.
+func TestFullAutoRatePausedAgentIsSuppressed(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	rate, err := h.raw.GetAgentRate(ctx, "pA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused := domain.PauseAgent(*rate)
+	paused.AgentID = "pA"
+	if err := h.raw.UpdateAgentRate(ctx, paused); err != nil {
+		t.Fatal(err)
+	}
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("sweep on a rate-paused agent: status = %q, want escalated", got)
+	}
+	h.daemon.maybeFullAutoAcceptNow(ctx, id, parked("pA", "blocked")[0], time.Now())
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("immediate hook on a rate-paused agent: status = %q, want escalated", got)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("nothing may be delivered to a rate-paused agent, sent %v", got)
+	}
+}

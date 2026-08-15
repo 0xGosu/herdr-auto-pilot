@@ -108,6 +108,21 @@ type semanticSearchMsg struct {
 	err     error
 }
 
+// doublePressWindow is how long after a first capital R a second one still
+// reads as a double-press (the full-auto toggle). The first press's own
+// action (re-embed) is deferred by this window, so it must stay short enough
+// to be imperceptible on an async request and long enough for a deliberate
+// double-tap.
+const doublePressWindow = 600 * time.Millisecond
+
+// reembedTimerMsg fires when a first R's double-press window expires with no
+// second R: the deferred single-press action (re-embed) runs then. seq guards
+// against stale timers — every arm/disarm bumps Model.reembedSeq, and only a
+// matching value may act.
+type reembedTimerMsg struct {
+	seq int
+}
+
 type actionResultMsg struct {
 	message string
 	err     error
@@ -909,6 +924,16 @@ type Model struct {
 	// already true for every message processed afterward, regardless of
 	// which goroutine's result lands first.
 	pausePending bool
+
+	// reembedArmed means a first capital R was seen and its single-press
+	// action (re-embed) is deferred by the double-press window; a second R
+	// inside the window toggles full-auto mode instead. Any other key
+	// disarms, so R,j,R is two singles, not a double.
+	reembedArmed bool
+	// reembedSeq invalidates stale deferral timers: every arm/disarm bumps
+	// it, and a reembedTimerMsg only fires the deferred single-press action
+	// when its seq still matches.
+	reembedSeq int
 
 	// pendingTUINote holds the "asked N older TUIs to close" explanation until
 	// the status line is free of an error note. Nothing regenerates it — the
@@ -1784,6 +1809,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	case reembedTimerMsg:
+		if msg.seq != m.reembedSeq || !m.reembedArmed {
+			return m, nil // superseded: a second R toggled, or another key disarmed
+		}
+		m.reembedArmed = false
+		// The deferred single-press R action, verbatim.
+		switch d := m.data.status.Drift; {
+		case !d.Detected:
+			m.message = "no embedding drift detected — rules already match the configured model"
+		case d.ModelMissing:
+			// Match the CLI's refusal: a re-embed cannot run without the
+			// model file, so a "requested" toast would be a lie.
+			m.message = "embedding model not found — fix embedding.model_path first"
+		default:
+			m.beginAction()
+			return m, m.do("re-compute requested — daemon is re-embedding in the background",
+				func(ctx context.Context) error { return m.app.RequestReembed(ctx) })
+		}
+		return m, nil
 	case actionResultMsg:
 		m.applyTaskLists(msg.taskLists)
 		if msg.pauseAction && (msg.err != nil || (msg.pauseNoChange && m.lastPaused)) {
@@ -1935,6 +1979,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Any key that is not the second R of a double-press disarms the pending
+	// one. At the VERY top, before the modal early-returns: a key that opens
+	// or feeds a modal must disarm too, or the deferred timer would later
+	// fire a re-embed the operator never asked for. While a modal is up an R
+	// belongs to the modal (overlay scrolling, prompt text), so it disarms
+	// as well — the deferred single-press is simply dropped there.
+	if m.reembedArmed && (msg.String() != "R" ||
+		m.detail != nil || m.confirm != nil || m.prompt != nil || m.searching) {
+		m.reembedArmed = false
+		m.reembedSeq++
+	}
 	if m.detail != nil {
 		switch msg.String() {
 		case "ctrl+c":
@@ -2271,19 +2326,39 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return "automation resumed", nil
 		})
 	case "R":
-		switch d := m.data.status.Drift; {
-		case !d.Detected:
-			m.message = "no embedding drift detected — rules already match the configured model"
-		case d.ModelMissing:
-			// Match the CLI's refusal: a re-embed cannot run without the
-			// model file, so a "requested" toast would be a lie.
-			m.message = "embedding model not found — fix embedding.model_path first"
-		default:
-			m.beginAction()
-			return m, m.do("re-compute requested — daemon is re-embedding in the background",
-				func(ctx context.Context) error { return m.app.RequestReembed(ctx) })
+		if !m.reembedArmed {
+			// First press: DEFER the single-press action (re-embed) by the
+			// double-press window rather than firing it — a double-press must
+			// never start a re-embed on its way to the full-auto toggle. The
+			// deferral is imperceptible on an action that is itself an async
+			// background request (or a refusal toast).
+			m.reembedArmed = true
+			m.reembedSeq++
+			seq := m.reembedSeq
+			return m, tea.Tick(doublePressWindow, func(time.Time) tea.Msg {
+				return reembedTimerMsg{seq: seq}
+			})
 		}
-		return m, nil
+		// Second press inside the window: toggle full-auto mode.
+		m.reembedArmed = false
+		m.reembedSeq++
+		if !m.data.status.FullAuto && m.data.status.Paused {
+			// Local fast refusal; SetFullAuto re-checks under the config lock
+			// anyway (belt and braces, and one wording with the CLI).
+			m.message = "cannot enable full-auto while automation is paused — press r to resume first"
+			return m, nil
+		}
+		enable := !m.data.status.FullAuto
+		m.beginAction()
+		return m, m.doResult(func(ctx context.Context) (string, error) {
+			if err := m.app.SetFullAuto(ctx, enable); err != nil {
+				return "", err
+			}
+			if enable {
+				return "full-auto ON — escalations with a proposed answer are answered automatically", nil
+			}
+			return "full-auto OFF", nil
+		})
 	case "enter":
 		switch m.tab {
 		case tabTasks:
@@ -5688,6 +5763,11 @@ func (m Model) View() string {
 	var b strings.Builder
 
 	stateText, stateStyle := "● running", st.running
+	if m.data.status.FullAuto {
+		stateText, stateStyle = "⚡ FULL-AUTO", st.warn
+	}
+	// Paused wins over full-auto: the kill switch stands everything down,
+	// including a configured-on full-auto mode.
 	if m.data.status.Paused {
 		stateText, stateStyle = "■ PAUSED (kill switch)", st.paused
 	}
@@ -5762,6 +5842,14 @@ func (m Model) View() string {
 		fmt.Fprintf(&b, "%s\n", st.warn.Render(fmt.Sprintf(
 			"⚠ embedding model changed — %d of %d rules need re-compute; press R or run: hap signatures reembed",
 			d.Stale, d.Total)))
+	}
+	// Full-auto configured on but not actually running (graduated rules
+	// dropped below the minimum, llm.command cleared): the header still says
+	// FULL-AUTO — that is the operator's configured intent — so this line
+	// carries the "but nothing is being accepted" truth.
+	if m.data.status.FullAuto && m.data.status.FullAutoBlocked != "" {
+		fmt.Fprintf(&b, "%s\n", st.warn.Render(
+			"⚠ full-auto is ON but inactive: "+m.data.status.FullAutoBlocked))
 	}
 
 	if m.detail != nil {
@@ -5929,7 +6017,7 @@ func (m Model) helpLine() string {
 	if m.confirm != nil {
 		return "y/enter: confirm  n/esc: cancel"
 	}
-	common := "tab: switch  ↑/↓: select  p: pause  r: resume  q: quit"
+	common := "tab: switch  ↑/↓: select  p: pause  r: resume  RR: full-auto  q: quit"
 	if d := m.data.status.Drift; d.Detected && !d.ModelMissing {
 		common = "R: re-embed  " + common
 	}

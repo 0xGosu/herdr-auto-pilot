@@ -784,6 +784,16 @@ func (s *Store) CountSignatureEmbeddings(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+// CountSignaturesByMode reports how many learned rules are in the given mode
+// (e.g. domain.ModeAutonomous for graduated rules — the full-auto enable
+// precondition).
+func (s *Store) CountSignaturesByMode(ctx context.Context, mode string) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM signatures WHERE mode = ?`, mode).Scan(&n)
+	return n, err
+}
+
 // CountStaleSignatureEmbeddings counts semantic identity rows whose vector
 // was not produced by the given model — including text-only rows (no
 // vector) — i.e. rows a re-embed pass would rewrite.

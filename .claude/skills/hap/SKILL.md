@@ -278,6 +278,25 @@ view pause/resume history:
 hap kill-history
 ```
 
+## full-auto prompting mode
+
+when enabled, every escalation that carries a proposed answer is accepted and delivered
+to the agent immediately — no waiting threshold, no operator action. the safety
+exclusions still wait for a human (never-auto matches, suspected-irreversible commands,
+retry-exhausted and rate-limited escalations), it never acts while paused, it never
+learns from its own accepts, and each delivery counts against the `[limits]` runaway
+ceilings so an answer loop pauses the agent instead of running forever.
+
+```bash
+hap config set escalations.full_auto.enabled true    # or double-press R in the TUI
+hap config set escalations.full_auto.enabled false
+```
+
+enabling is refused until the daemon has earned it: at least 10 graduated (autonomous)
+rules AND a configured `[llm].command` — the error names whatever is missing. `hap status`
+shows `full-auto: off`, `ON`, or `ON but INACTIVE — <reason>` when a precondition later
+lapses (the config is never rewritten; fix the precondition or turn the mode off).
+
 ## view audit log
 
 see the history of automated actions and escalations:

@@ -2050,11 +2050,25 @@ func TestDriftBannerRenders(t *testing.T) {
 	}
 }
 
-func TestReembedKey(t *testing.T) {
-	// Without drift, R is a no-op with a hint.
-	m := driftModel(t, frontend.EmbeddingDrift{})
+// pressSingleR presses R once and expires its double-press window, returning
+// the model plus whatever command the deferred single-press action produced.
+// A single R no longer acts immediately — the action is deferred by
+// doublePressWindow so a second R can toggle full-auto mode instead.
+func pressSingleR(t *testing.T, m Model) (Model, tea.Cmd) {
+	t.Helper()
 	upd, cmd := m.Update(pressKeyMsg("R"))
 	m = upd.(Model)
+	if cmd == nil || !m.reembedArmed {
+		t.Fatalf("first R must arm and schedule the window timer (armed=%v cmd=%v)", m.reembedArmed, cmd)
+	}
+	upd, cmd = m.Update(reembedTimerMsg{seq: m.reembedSeq})
+	return upd.(Model), cmd
+}
+
+func TestReembedKey(t *testing.T) {
+	// Without drift, a single R is a no-op with a hint (after the window).
+	m := driftModel(t, frontend.EmbeddingDrift{})
+	m, cmd := pressSingleR(t, m)
 	if cmd != nil || !strings.Contains(m.message, "no embedding drift") {
 		t.Errorf("driftless R should only hint, message=%q cmd=%v", m.message, cmd)
 	}
@@ -2062,8 +2076,7 @@ func TestReembedKey(t *testing.T) {
 	// Drift with a missing model file: R refuses with the CLI remedy
 	// instead of a misleading "requested" toast.
 	m = driftModel(t, frontend.EmbeddingDrift{Detected: true, ModelMissing: true, Stale: 1, Total: 1})
-	upd, cmd = m.Update(pressKeyMsg("R"))
-	m = upd.(Model)
+	m, cmd = pressSingleR(t, m)
 	if cmd != nil || !strings.Contains(m.message, "embedding.model_path") {
 		t.Errorf("missing-model R should refuse with the config remedy, message=%q cmd=%v", m.message, cmd)
 	}
@@ -2084,14 +2097,15 @@ func TestReembedKey(t *testing.T) {
 	m = driftModel(t, frontend.EmbeddingDrift{Detected: true, Stale: 1, Total: 1})
 	m.app = app
 	m.ctx = context.Background()
-	upd, cmd = m.Update(pressKeyMsg("R"))
-	m = upd.(Model)
+	m, cmd = pressSingleR(t, m)
 	if cmd == nil {
 		t.Fatal("drifted R must produce a command")
 	}
-	res, ok := cmd().(actionResultMsg)
+	// A tea.Cmd is one-shot: invoke it exactly once and assert on the value.
+	msg := cmd()
+	res, ok := msg.(actionResultMsg)
 	if !ok {
-		t.Fatalf("command result = %T, want actionResultMsg", cmd())
+		t.Fatalf("command result = %T, want actionResultMsg", msg)
 	}
 	if res.err == nil || !strings.Contains(res.err.Error(), "hap signatures reembed") {
 		t.Errorf("daemon-down R should surface the CLI remedy, got %v", res.err)

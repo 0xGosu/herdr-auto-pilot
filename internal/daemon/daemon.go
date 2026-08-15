@@ -314,6 +314,11 @@ type Daemon struct {
 	// autoAcceptBaselineWarned latches the once-per-run notice that escalations
 	// raised before the signature baseline existed are being skipped.
 	autoAcceptBaselineWarned bool
+	// fullAutoDegradedLogged latches the once-per-episode notice that
+	// full-auto mode is configured on but a runtime precondition no longer
+	// holds. Reset on config reload and whenever the preconditions pass
+	// again, so each degradation episode logs exactly once.
+	fullAutoDegradedLogged bool
 
 	// snapshotSaved caches which signatures already have a provenance
 	// snapshot this daemon lifetime (guarded by mu), so the hot path skips
@@ -774,6 +779,9 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	// A provider or credential change can point the same locator at different
 	// content, so nothing cached under the old registry may outlive it.
 	d.taskSnapshots = map[string]taskSnapshot{}
+	// A reload starts a fresh full-auto degradation episode: the config (or
+	// the world it described) changed, so the next blocked sweep re-explains.
+	d.fullAutoDegradedLogged = false
 	d.mu.Unlock()
 
 	d.reloadEmbedder(prev, cfg, first || forceEmbedder)
@@ -2636,8 +2644,9 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 			"agent", s.AgentID, "situation", s.Type, "reason", autoDismissReason)
 		return
 	}
-	if _, err := d.opt.Store.AppendAudit(ctx, rec); err != nil {
-		slog.Error("audit write failed for escalation", "error", err)
+	auditID, auditErr := d.opt.Store.AppendAudit(ctx, rec)
+	if auditErr != nil {
+		slog.Error("audit write failed for escalation", "error", auditErr)
 	}
 
 	// Rate-limit escalations pause the agent until human check-in — EXCEPT an
@@ -2666,6 +2675,15 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	}
 	res := d.notify(ctx, title, body)
 	slog.Info("escalated", escalationLogAttrs(s, dec, res)...)
+
+	// Full-auto mode answers the escalation right here rather than leaving it
+	// for the sweep. AFTER the notify on purpose: a delivery failure must
+	// never have suppressed the operator's alert. Only when the audit row
+	// exists — there is nothing to claim otherwise (the sweep is the catch-up
+	// for every path this returns early from).
+	if auditErr == nil {
+		d.maybeFullAutoAcceptNow(ctx, auditID, tr, now)
+	}
 }
 
 // escalationLogAttrs builds the "escalated" log line's key/value pairs.

@@ -72,6 +72,24 @@ unclassifiable = "0"       # disabled: hap never understood the screen at all
 # signature baseline to compare against, and it is not backfilled. They stay
 # yours to confirm, or clear them with `hap escalations prune`.
 
+# ── Full-auto prompting mode ────────────────────────────────────────
+# The fast lane: every escalation that carries a deliverable proposed
+# answer is accepted and delivered IMMEDIATELY — no waiting threshold,
+# no operator action. The same safety exclusions as auto-accept still
+# wait for you (never_auto_match, suspected_irreversible,
+# retry_exhausted, rate_limited, and anything without a suggestion),
+# it never acts while paused, and it never learns. Unlike timed
+# auto-accept, each delivery counts against the [limits] runaway
+# ceilings, so an answer loop pauses the agent for a human check-in.
+#
+# Enabling is refused until the daemon has earned it: at least 10
+# graduated (autonomous) rules in the database and a configured
+# [llm].command. Toggle with
+#   hap config set escalations.full_auto.enabled true
+# or double-press R in the TUI.
+#[escalations.full_auto]
+#enabled = false
+
 # ── Operator LLM (consulted on unknown situations) ──────────────────
 # Omit this whole section to escalate unknown situations directly to you.
 # Two recipes are shown below — Claude Code is active; the OpenAI Codex
