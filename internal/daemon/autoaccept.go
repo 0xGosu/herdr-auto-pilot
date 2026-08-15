@@ -142,6 +142,13 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		if handledAgent[rec.AgentID] {
 			continue
 		}
+		// Another pane interaction owns this agent — a full-auto immediate
+		// delivery, a multi-tab form sweep, or a series delivery. Their
+		// keystrokes must never interleave, so leave the row pending and take
+		// it on a later tick.
+		if d.paneBusy(rec.AgentID) {
+			continue
+		}
 
 		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, panes, now); outcome {
 		case autoAcceptDelivered:
@@ -485,10 +492,52 @@ func (d *Daemon) noteFullAutoSend(ctx context.Context, agentID string, now time.
 }
 
 // maybeFullAutoAcceptNow answers a just-raised escalation immediately when
-// full-auto mode is active, instead of leaving it for the sweep. Called from
-// escalate() on the daemon select loop — synchronous on purpose, so it is
-// ordered against the sweep's own deliveries by construction. Every non-send
-// outcome simply returns: the 1-minute sweep is the designed catch-up.
+// full-auto mode is active, instead of leaving it for the sweep.
+//
+// escalate() runs ON THE DAEMON SELECT LOOP, and a delivery is not cheap: a
+// visible-pane read, a claim, a second pane read and a herdr send, each a CLI
+// subprocess with a budget up to 15s. Doing that inline would block events for
+// EVERY agent — including reload and kill-switch handling — behind one slow
+// pane. So only the free checks run here; the work goes to a tracked
+// background goroutine (CLAUDE.md: don't stall the main loop).
+//
+// Ordering and duplicate protection survive the move:
+//
+//   - acquirePane is taken SYNCHRONOUSLY, before spawning, so the decision of
+//     who owns this agent's pane is still made in loop order. It is the same
+//     per-agent claim the multi-tab sweep and series delivery use ("their
+//     keystrokes must never interleave"), so a full-auto delivery can no
+//     longer overlap those either — a bound the inline version never had.
+//   - the auto-accept sweep skips an agent whose pane is claimed (paneBusy),
+//     so sweep and immediate delivery cannot both type into one pane.
+//   - ClaimForAutoAccept remains the row-level guard: it is a status-guarded
+//     atomic update, so even two concurrent attempts on one row yield exactly
+//     one delivery.
+//
+// Every non-send outcome simply returns: the 1-minute sweep is the designed
+// catch-up, and a dropped spawn (shutdown latched) is one such outcome.
+func (d *Daemon) maybeFullAutoAcceptNow(ctx context.Context, auditID int64,
+	tr domain.AgentTransition, now time.Time) {
+	// Free, in-memory, and false for every install that never opted in: keep
+	// it out of the goroutine so the common path costs nothing.
+	cfg, _, _ := d.snapshot()
+	if !cfg.Escalations.FullAuto.Enabled {
+		return
+	}
+	if !d.acquirePane(tr.AgentID) {
+		return // this agent's pane is already being driven; the sweep catches up
+	}
+	if !d.spawn(func() {
+		defer d.releasePane(tr.AgentID)
+		d.fullAutoAcceptNow(ctx, auditID, tr, now)
+	}) {
+		// Shutdown latched before fn was scheduled, so its defer never runs.
+		d.releasePane(tr.AgentID)
+	}
+}
+
+// fullAutoAcceptNow is maybeFullAutoAcceptNow's body, running off the select
+// loop with this agent's pane already claimed.
 //
 // It reuses autoAcceptOne verbatim with a single-agent live map. Deliberately
 // NOT autoAcceptEscalations with a one-agent listing: that pass reads its
@@ -497,7 +546,7 @@ func (d *Daemon) noteFullAutoSend(ctx context.Context, agentID string, now time.
 // autoAcceptAbsenceConfirmations — dismissing live escalations. The agent
 // here is known present (it just escalated), so no absence bookkeeping
 // applies.
-func (d *Daemon) maybeFullAutoAcceptNow(ctx context.Context, auditID int64,
+func (d *Daemon) fullAutoAcceptNow(ctx context.Context, auditID int64,
 	tr domain.AgentTransition, now time.Time) {
 	cfg, _, _ := d.snapshot()
 	if !d.fullAutoActive(ctx, cfg) {

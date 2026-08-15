@@ -86,6 +86,14 @@ func (d *Daemon) releasePane(agentID string) {
 	d.mu.Unlock()
 }
 
+// paneBusy reports whether a pane interaction already owns this agent, for
+// callers that must skip rather than claim (the auto-accept sweep).
+func (d *Daemon) paneBusy(agentID string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.sweepInFlight[agentID]
+}
+
 // startSweep launches (or dedupes) the one pane interaction per agent. The
 // sweep must never stall the main loop; the outcome re-enters decideAndAct
 // via sweepResults. Fail-safe: any read/keystroke error degrades to the

@@ -2,6 +2,7 @@ package frontend_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
@@ -186,5 +188,45 @@ func TestFullAutoStatusReportsBlockedReason(t *testing.T) {
 	}
 	if !strings.Contains(status.FullAutoBlocked, fmt.Sprintf("0 of %d", config.MinFullAutoGraduatedRules)) {
 		t.Errorf("Status.FullAutoBlocked = %q, want the graduated-rule shortfall", status.FullAutoBlocked)
+	}
+}
+
+// countErrorStore fails only the graduated-rule count, leaving every other
+// query intact — the shape of a transient SQLite error under load.
+type countErrorStore struct {
+	ports.FrontendStore
+}
+
+func (s countErrorStore) CountSignaturesByMode(context.Context, string) (int64, error) {
+	return 0, errors.New("induced count failure")
+}
+
+// TestFullAutoStatusFailsClosedOnUnreadableCount: the daemon treats an
+// unreadable graduated-rule count as "mode inactive" (fullAutoActive fails
+// closed), so status must not report the mode as active — that would tell the
+// operator escalations are being answered while nothing is answering them.
+// Status describes runtime behavior, not configured intent.
+func TestFullAutoStatusFailsClosedOnUnreadableCount(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	setLLMCommand(t, app)
+	seedGraduatedRules(t, st, config.MinFullAutoGraduatedRules)
+	if err := app.SetFullAuto(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+
+	app.Store = countErrorStore{FrontendStore: st}
+	status, err := app.GetStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.FullAuto {
+		t.Error("Status.FullAuto = false; the operator's config is unchanged")
+	}
+	if status.FullAutoBlocked == "" {
+		t.Fatal("an unreadable count reported full-auto as ACTIVE; the daemon fails closed on that same query")
+	}
+	if !strings.Contains(status.FullAutoBlocked, "unreadable") {
+		t.Errorf("FullAutoBlocked = %q, want it to name the unreadable count", status.FullAutoBlocked)
 	}
 }

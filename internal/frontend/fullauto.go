@@ -60,8 +60,12 @@ func (a *App) fullAutoEnablePreconditions(ctx context.Context, cfg *config.Confi
 // actually running (graduated rules dropped below the minimum, or llm.command
 // was cleared), or "" when it is active. Pause is deliberately not a reason
 // here: Status.Paused already says so, and pausing is a separate, visible
-// state. Best-effort — a count-query error returns "" rather than inventing
-// a blockage a status caller would alarm on.
+// state.
+//
+// An unreadable count is a BLOCKED reason, not an empty one: the daemon fails
+// closed on that same query (fullAutoActive), so reporting the mode as active
+// would tell the operator that escalations are being answered while nothing
+// is answering them. Status must describe runtime behavior, not intent.
 func (a *App) fullAutoBlockedReason(ctx context.Context, cfg config.Config) string {
 	if !cfg.Escalations.FullAuto.Enabled {
 		return ""
@@ -71,7 +75,7 @@ func (a *App) fullAutoBlockedReason(ctx context.Context, cfg config.Config) stri
 	}
 	n, err := a.Store.CountSignaturesByMode(ctx, string(domain.ModeAutonomous))
 	if err != nil {
-		return ""
+		return "graduated-rule count unreadable: " + err.Error()
 	}
 	if n < config.MinFullAutoGraduatedRules {
 		return fmt.Sprintf("only %d of %d required graduated (autonomous) rules remain", n, config.MinFullAutoGraduatedRules)
