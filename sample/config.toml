@@ -87,7 +87,7 @@ unclassifiable = "0"       # disabled: hap never understood the screen at all
 # graduated (autonomous) rules in the database and a configured
 # [llm].command. Toggle with
 #   hap config set escalations.full_self_prompting.enabled true
-# or double-press R in the TUI.
+# or double-press r in the TUI.
 #[escalations.full_self_prompting]
 #enabled = false
 

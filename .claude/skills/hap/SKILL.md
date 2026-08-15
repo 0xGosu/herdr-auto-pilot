@@ -293,11 +293,14 @@ hap config set escalations.full_self_prompting.enabled true
 hap config set escalations.full_self_prompting.enabled false
 ```
 
-in the TUI, **press `R` twice quickly** (within ~600ms) to toggle it. a SINGLE `R` keeps
-its old meaning — re-compute embeddings — and is simply delayed by that window, so a
-double-press never starts a re-embed on its way to the toggle; any other key in between
-cancels the pending double-press. the footer advertises `RR: full self-prompting`, and the header
-reads `⚡ FULL SELF-PROMPTING` while the mode is on (`■ PAUSED` still wins over it).
+in the TUI, **press `r` twice quickly** (within ~600ms) to toggle it. a SINGLE `r` keeps
+its old meaning — resume automation — and is simply delayed by that window, so a
+double-press never resumes on its way to the toggle; any other key in between cancels the
+pending double-press. (capital `R` is unchanged and immediate: re-compute embeddings.) if
+automation is PAUSED, `rr` resumes instead of toggling — enabling is refused while paused,
+and resuming is what the operator pressing `r` almost certainly wants. the footer
+advertises `rr: full self-prompting`, and the header reads `⚡ FULL SELF-PROMPTING` while
+the mode is on (`■ PAUSED` still wins over it).
 
 enabling is refused until the daemon has earned it: at least 10 graduated (autonomous)
 rules AND a configured `[llm].command`, and never while paused — the error names every

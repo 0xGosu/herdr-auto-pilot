@@ -148,7 +148,13 @@ func TestShutdownDrainsVerifyUnblockBeforeStoreClose(t *testing.T) {
 	})
 
 	fe.ch <- domain.AgentTransition{AgentID: "a1", PaneID: "a1", AgentType: "claude", Status: "blocked"}
-	waitFor(t, 3*time.Second, func() bool { return len(fh.sentInputs()) == 1 })
+	// >= 1, not == 1: the agent is pinned blocked before Run, so the STARTUP
+	// reconcile re-drives it too and a second send can land. An equality check
+	// against a monotonically growing counter is then a race — if both sends
+	// arrive between two polls the count skips 1 entirely and the wait times
+	// out. All this needs is that an answer went out, scheduling the
+	// verify-unblock check whose drain is the actual subject.
+	waitFor(t, 3*time.Second, func() bool { return len(fh.sentInputs()) >= 1 })
 
 	// Shut down and await the full background drain.
 	cancel()

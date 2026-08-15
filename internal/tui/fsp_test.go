@@ -60,18 +60,18 @@ func TestDoubleRTogglesFullSelfPrompting(t *testing.T) {
 	m.app = fspTestApp(t)
 	m.ctx = context.Background()
 
-	m, cmd := pressOne(t, m, "R")
-	if !m.reembedArmed || cmd == nil {
-		t.Fatalf("first R must arm and schedule the window timer (armed=%v cmd=%v)", m.reembedArmed, cmd)
+	m, cmd := pressOne(t, m, "r")
+	if !m.doubleRArmed || cmd == nil {
+		t.Fatalf("first r must arm and schedule the window timer (armed=%v cmd=%v)", m.doubleRArmed, cmd)
 	}
-	staleSeq := m.reembedSeq
+	staleSeq := m.doubleRSeq
 
-	m, cmd = pressOne(t, m, "R")
-	if m.reembedArmed {
-		t.Fatal("second R must disarm")
+	m, cmd = pressOne(t, m, "r")
+	if m.doubleRArmed {
+		t.Fatal("second r must disarm")
 	}
 	if cmd == nil {
-		t.Fatal("second R must dispatch the toggle")
+		t.Fatal("second r must dispatch the toggle")
 	}
 	// A tea.Cmd is one-shot: invoke exactly once, assert on the value.
 	msg := cmd()
@@ -94,66 +94,96 @@ func TestDoubleRTogglesFullSelfPrompting(t *testing.T) {
 	}
 
 	// The first press's deferred timer is stale now: it must NOT re-embed.
-	upd, _ := m.Update(reembedTimerMsg{seq: staleSeq})
+	upd, _ := m.Update(doubleRTimerMsg{seq: staleSeq})
 	m = upd.(Model)
 	if m.message != "" {
 		t.Errorf("stale timer produced output: %q", m.message)
 	}
 }
 
-// TestSingleRStillReembedsAfterTheWindow: one R defers, and the timer fires
-// the original single-press behavior (here: the no-drift refusal message).
-func TestSingleRStillReembedsAfterTheWindow(t *testing.T) {
+// TestSingleRStillResumesAfterTheWindow: one r defers, and when the window
+// expires the original single-press action — resume — runs. The deferral is
+// what lets rr mean something else without stealing r's meaning.
+func TestSingleRStillResumesAfterTheWindow(t *testing.T) {
 	m := testModel(t)
+	m.app = fspTestApp(t)
+	m.ctx = context.Background()
 
-	m, _ = pressOne(t, m, "R")
-	upd, _ := m.Update(reembedTimerMsg{seq: m.reembedSeq})
+	m, _ = pressOne(t, m, "r")
+	upd, cmd := m.Update(doubleRTimerMsg{seq: m.doubleRSeq})
 	m = upd.(Model)
-	if m.reembedArmed {
+	if m.doubleRArmed {
 		t.Fatal("timer must disarm")
 	}
-	if !strings.Contains(m.message, "no embedding drift detected") {
-		t.Errorf("single R message = %q, want the no-drift notice", m.message)
+	if cmd == nil {
+		t.Fatal("the expired window must run the deferred resume")
+	}
+	res, ok := cmd().(actionResultMsg)
+	if !ok {
+		t.Fatalf("deferred action returned %T, want actionResultMsg", cmd())
+	}
+	if res.err != nil || !strings.Contains(res.message, "resumed") {
+		t.Errorf("deferred action = %+v, want a resume result", res)
 	}
 }
 
-// TestInterveningKeyDisarmsDoubleR: R, j, R is two singles — the second R
+// TestInterveningKeyDisarmsDoubleR: r, j, r is two singles — the second R
 // arms a fresh cycle instead of toggling.
 func TestInterveningKeyDisarmsDoubleR(t *testing.T) {
 	m := testModel(t)
 	m.app = fspTestApp(t)
 	m.ctx = context.Background()
 
-	m, _ = pressOne(t, m, "R")
+	m, _ = pressOne(t, m, "r")
 	m, _ = pressOne(t, m, "j")
-	if m.reembedArmed {
+	if m.doubleRArmed {
 		t.Fatal("j must disarm the pending double-press")
 	}
-	m, _ = pressOne(t, m, "R")
-	if !m.reembedArmed {
-		t.Fatal("R after a disarm must arm again, not toggle")
+	m, _ = pressOne(t, m, "r")
+	if !m.doubleRArmed {
+		t.Fatal("r after a disarm must arm again, not toggle")
 	}
 	cfg, err := m.app.Config()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Escalations.FullSelfPrompting.Enabled {
-		t.Fatal("R,j,R toggled full self-prompting")
+		t.Fatal("r,j,r toggled full self-prompting")
 	}
 }
 
-// TestDoubleRRefusedWhilePaused: the TUI refuses locally, without dispatching.
-func TestDoubleRRefusedWhilePaused(t *testing.T) {
+// TestDoubleRWhilePausedResumesInsteadOfToggling: enabling is refused while
+// paused, so rr must not swallow both presses into a refusal that leaves
+// automation still paused — an operator hitting r twice wants what r does.
+// It resumes, and says the mode can be enabled next.
+func TestDoubleRWhilePausedResumesInsteadOfToggling(t *testing.T) {
 	m := testModel(t)
+	m.app = fspTestApp(t)
+	m.ctx = context.Background()
 	m.data.status.Paused = true
 
-	m, _ = pressOne(t, m, "R")
-	m, cmd := pressOne(t, m, "R")
-	if cmd != nil {
-		t.Fatal("paused enable must not dispatch anything")
+	m, _ = pressOne(t, m, "r")
+	m, cmd := pressOne(t, m, "r")
+	if cmd == nil {
+		t.Fatal("rr while paused must still resume")
 	}
-	if !strings.Contains(m.message, "paused") {
-		t.Errorf("refusal = %q, want it to name the pause", m.message)
+	res, ok := cmd().(actionResultMsg)
+	if !ok {
+		t.Fatalf("returned %T, want actionResultMsg", cmd())
+	}
+	if res.err != nil {
+		t.Fatalf("resume failed: %v", res.err)
+	}
+	if !strings.Contains(res.message, "resumed") {
+		t.Errorf("message = %q, want it to report the resume", res.message)
+	}
+	// And the mode was NOT enabled behind the operator's back.
+	cfg, err := m.app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Escalations.FullSelfPrompting.Enabled {
+		t.Error("rr while paused enabled the mode; enabling is refused while paused")
 	}
 }
 
@@ -190,7 +220,7 @@ func TestFullSelfPromptingBlockedBanner(t *testing.T) {
 // TestHelpLineAdvertisesDoubleR: the shortcut is discoverable.
 func TestHelpLineAdvertisesDoubleR(t *testing.T) {
 	m := testModel(t)
-	if h := m.helpLine(); !strings.Contains(h, "RR: full self-prompting") {
+	if h := m.helpLine(); !strings.Contains(h, "rr: full self-prompting") {
 		t.Errorf("help line %q does not advertise RR", h)
 	}
 }

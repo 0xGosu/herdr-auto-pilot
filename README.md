@@ -2024,8 +2024,12 @@ waits for a human check-in like any other runaway.
 enabled = true
 ```
 
-Toggle it with a double-press of `R` in the TUI, or
-`config set escalations.full_self_prompting.enabled true`. Enabling is refused — with an
+Toggle it with a double-press of `r` in the TUI, or
+`config set escalations.full_self_prompting.enabled true`. A single `r` keeps
+its own meaning — resume — and is simply delayed by the double-press window,
+so a double never resumes on its way to the toggle; while automation is
+paused, `rr` resumes instead of toggling, since enabling is refused then
+anyway. (Capital `R` is unchanged: re-compute embeddings, immediately.) Enabling is refused — with an
 error naming exactly what is missing — until the daemon has earned it: at
 least **10 graduated (autonomous) rules** in the database and a configured
 `[llm].command`, and never while the kill switch is active. Disabling always

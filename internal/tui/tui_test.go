@@ -2050,25 +2050,11 @@ func TestDriftBannerRenders(t *testing.T) {
 	}
 }
 
-// pressSingleR presses R once and expires its double-press window, returning
-// the model plus whatever command the deferred single-press action produced.
-// A single R no longer acts immediately — the action is deferred by
-// doublePressWindow so a second R can toggle full self-prompting mode instead.
-func pressSingleR(t *testing.T, m Model) (Model, tea.Cmd) {
-	t.Helper()
+func TestReembedKey(t *testing.T) {
+	// Without drift, R is a no-op with a hint.
+	m := driftModel(t, frontend.EmbeddingDrift{})
 	upd, cmd := m.Update(pressKeyMsg("R"))
 	m = upd.(Model)
-	if cmd == nil || !m.reembedArmed {
-		t.Fatalf("first R must arm and schedule the window timer (armed=%v cmd=%v)", m.reembedArmed, cmd)
-	}
-	upd, cmd = m.Update(reembedTimerMsg{seq: m.reembedSeq})
-	return upd.(Model), cmd
-}
-
-func TestReembedKey(t *testing.T) {
-	// Without drift, a single R is a no-op with a hint (after the window).
-	m := driftModel(t, frontend.EmbeddingDrift{})
-	m, cmd := pressSingleR(t, m)
 	if cmd != nil || !strings.Contains(m.message, "no embedding drift") {
 		t.Errorf("driftless R should only hint, message=%q cmd=%v", m.message, cmd)
 	}
@@ -2076,7 +2062,8 @@ func TestReembedKey(t *testing.T) {
 	// Drift with a missing model file: R refuses with the CLI remedy
 	// instead of a misleading "requested" toast.
 	m = driftModel(t, frontend.EmbeddingDrift{Detected: true, ModelMissing: true, Stale: 1, Total: 1})
-	m, cmd = pressSingleR(t, m)
+	upd, cmd = m.Update(pressKeyMsg("R"))
+	m = upd.(Model)
 	if cmd != nil || !strings.Contains(m.message, "embedding.model_path") {
 		t.Errorf("missing-model R should refuse with the config remedy, message=%q cmd=%v", m.message, cmd)
 	}
@@ -2097,7 +2084,8 @@ func TestReembedKey(t *testing.T) {
 	m = driftModel(t, frontend.EmbeddingDrift{Detected: true, Stale: 1, Total: 1})
 	m.app = app
 	m.ctx = context.Background()
-	m, cmd = pressSingleR(t, m)
+	upd, cmd = m.Update(pressKeyMsg("R"))
+	m = upd.(Model)
 	if cmd == nil {
 		t.Fatal("drifted R must produce a command")
 	}

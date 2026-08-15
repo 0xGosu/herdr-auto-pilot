@@ -875,6 +875,14 @@ func TestManualCaptureNudgeUsesNormalPipeline(t *testing.T) {
 
 func TestManualCaptureRecognizesIdleCodexPlanApproval(t *testing.T) {
 	h := newHarness(t, "")
+	// Let the STARTUP reconcile list agents while the set is still empty.
+	// It re-drives every parked agent it finds, so if it observes this pane
+	// first it raises its own escalation and the manual capture below is then
+	// folded into it as a duplicate — an audit row with no pane excerpt, which
+	// fails the assertion. Which one wins is pure goroutine scheduling, so
+	// sequencing here is what makes this test deterministic rather than
+	// flaky-by-timing.
+	waitFor(t, 3*time.Second, func() bool { return h.herdr.listAgentsCallCount() > 0 })
 	h.herdr.setPane(codexPlanApprovalPane)
 	h.herdr.setAgents([]domain.AgentTransition{{
 		AgentID: "agent-codex-plan", PaneID: "agent-codex-plan", AgentType: "codex", Status: "idle",
