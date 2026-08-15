@@ -288,14 +288,38 @@ learns from its own accepts, and each delivery counts against the `[limits]` run
 ceilings so an answer loop pauses the agent instead of running forever.
 
 ```bash
-hap config set escalations.full_auto.enabled true    # or double-press R in the TUI
+hap config set escalations.full_auto.enabled true
 hap config set escalations.full_auto.enabled false
 ```
 
+in the TUI, **press `R` twice quickly** (within ~600ms) to toggle it. a SINGLE `R` keeps
+its old meaning — re-compute embeddings — and is simply delayed by that window, so a
+double-press never starts a re-embed on its way to the toggle; any other key in between
+cancels the pending double-press. the footer advertises `RR: full-auto`, and the header
+reads `⚡ FULL-AUTO` while the mode is on (`■ PAUSED` still wins over it).
+
 enabling is refused until the daemon has earned it: at least 10 graduated (autonomous)
-rules AND a configured `[llm].command` — the error names whatever is missing. `hap status`
-shows `full-auto: off`, `ON`, or `ON but INACTIVE — <reason>` when a precondition later
-lapses (the config is never rewritten; fix the precondition or turn the mode off).
+rules AND a configured `[llm].command`, and never while paused — the error names every
+requirement that is missing, so one attempt tells you the whole list:
+
+```
+error: cannot enable full-auto: only 3 of 10 required graduated (autonomous) rules —
+keep confirming escalations until more rules graduate (see: hap signatures list --mode
+autonomous); llm.command is not configured — run: hap config set llm.command "<argv>"
+```
+
+turning it OFF is never refused. `hap status` shows one of three lines:
+
+```
+full-auto:           off
+full-auto:           ON — escalations with a proposed answer are answered automatically
+full-auto:           ON but INACTIVE — only 4 of 10 required graduated (autonomous) rules remain
+```
+
+the third means the mode is still enabled in config but a precondition lapsed (rules
+deleted, `llm.command` cleared, or the count could not be read) — the daemon fails closed
+and answers nothing, and your config is never rewritten. fix the precondition or turn the
+mode off; `hap status` also prints the remedy in its next-steps footer.
 
 ## view audit log
 
