@@ -3,15 +3,30 @@ package domain
 import "regexp"
 
 // Claude Code surfaces a few blocking conditions that need operator attention
-// rather than an auto-answer: a usage-limit stop ("You've hit your limit ·
-// resets 1am") and an interrupt prompt ("Interrupted · What should Claude do
+// rather than an auto-answer: an account-wide usage-limit stop ("You've hit
+// your limit · resets 1am"), the per-model exhaustion banner ("You've reached
+// your Fable 5 limit. Run /usage-credits to continue or switch models with
+// /model."), and an interrupt prompt ("Interrupted · What should Claude do
 // instead?"). These are the error/retry situations for claude — deliberately
 // narrow so ordinary error-shaped narration (a printed stack trace, a build
 // log, an "exit code 1" line) is NOT classified as a live error.
 var (
-	// claudeLimitRE tolerates a straight or curly apostrophe and an optional
-	// "usage" qualifier ("You've hit your limit" / "you've hit your usage limit").
-	claudeLimitRE = regexp.MustCompile(`(?i)you['’]?ve hit your (?:usage )?limit`)
+	// claudeLimitRE tolerates a straight or curly apostrophe, either verb
+	// ("hit" / "reached"), and a qualifier naming what ran out — "usage", or a
+	// model name in the per-model form ("You've reached your Fable 5 limit").
+	// The qualifier's character class is deliberately narrow (word chars,
+	// dots, hyphens, spaces) so the match cannot span a newline or run through
+	// unrelated punctuation-heavy text on the way to a later "limit".
+	claudeLimitRE = regexp.MustCompile(`(?i)you['’]?ve (?:hit|reached) your (?:[\w.\-]+[ \t]+){0,4}limit\b`)
+	// claudeModelLimitRE is the PER-MODEL exhaustion banner, which is a
+	// different operator situation from the account-wide stop: the remedy is
+	// to switch model or buy credits, not to wait for a reset. It therefore
+	// gets its own kind (and so its own learned signature), and is tested
+	// BEFORE claudeLimitRE, which also matches this text.
+	//
+	// The slash-command remedy on the same line is the positive evidence that
+	// this is Claude's rendered banner rather than prose quoting it.
+	claudeModelLimitRE = regexp.MustCompile(`(?i)you['’]?ve reached your[ \t]+[^\n]{0,48}?limit\b[^\n]{0,80}?/(?:usage-credits|model)\b`)
 	// claudeInterruptedRE keys on the distinctive interrupt-prompt tail; the
 	// bounded gap tolerates the "·" separator (and minor spacing drift) while
 	// staying on one line so it can't span unrelated narration.
@@ -40,6 +55,7 @@ var (
 // times, preceding narration) dedup to one learned signature.
 const (
 	ClaudeErrorLimit          = "usage-limit"
+	ClaudeErrorModelLimit     = "model-limit"
 	ClaudeErrorInterrupted    = "interrupted"
 	ClaudeErrorAPIRetry       = "api-response-retry"
 	ClaudeErrorAPIServerError = "api-server-error"
@@ -52,6 +68,10 @@ const (
 // future. kind is "" exactly when ok is false.
 func ClaudeErrorForm(pane string) (kind string, ok bool) {
 	switch {
+	// Before claudeLimitRE: the per-model banner matches both, and the more
+	// specific kind is the one worth learning a rule for.
+	case claudeModelLimitRE.MatchString(pane):
+		return ClaudeErrorModelLimit, true
 	case claudeLimitRE.MatchString(pane):
 		return ClaudeErrorLimit, true
 	case claudeInterruptedRE.MatchString(pane):

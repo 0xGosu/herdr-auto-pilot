@@ -58,3 +58,58 @@ func TestClaudeErrorFormKind(t *testing.T) {
 		t.Errorf("API overloaded kind = %q, want %q", kind, ClaudeErrorAPIOverloaded)
 	}
 }
+
+// TestClaudeModelLimitForm pins the PER-MODEL exhaustion banner — the shape a
+// live session hit (2026-08-15) that no pattern matched, so hap classified a
+// hard-stopped agent as unclassifiable and never raised it as an error.
+func TestClaudeModelLimitForm(t *testing.T) {
+	// The EXACT rendering captured live (audit row 1036, 2026-08-15): Claude
+	// prefixes the banner with "⎿ " and a U+00A0 — the non-breaking space that
+	// has broken ASCII-only parsing here before. hap classified this very pane
+	// as `idle`, which is the bug.
+	live := "  \u23bf \u00a0You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\n"
+	kind, ok := ClaudeErrorForm(live)
+	if !ok || kind != ClaudeErrorModelLimit {
+		t.Fatalf("live banner: kind=%q ok=%v, want %q true", kind, ok, ClaudeErrorModelLimit)
+	}
+
+	for _, tc := range []struct {
+		name string
+		pane string
+		want string
+	}{
+		// The banner keeps its kind across model names, the curly apostrophe
+		// Claude actually renders, and a credits-only or model-only remedy.
+		{"curly apostrophe", "You’ve reached your Opus 4.5 limit. Run /usage-credits to continue.\n", ClaudeErrorModelLimit},
+		{"model remedy only", "You've reached your Sonnet limit. Switch models with /model.\n", ClaudeErrorModelLimit},
+		{"multi-word model", "You've reached your Claude Opus 4.5 limit. Run /usage-credits to continue.\n", ClaudeErrorModelLimit},
+		{"after narration", "⏺ Refactoring the store…\n\n  ⎿  You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\n", ClaudeErrorModelLimit},
+		// Without the slash-command remedy it is still a limit, but the
+		// account-wide kind: the per-model rule must not absorb it.
+		{"no remedy falls back to usage-limit", "You've reached your usage limit\n", ClaudeErrorLimit},
+		// The original account-wide banner is untouched.
+		{"account-wide unchanged", "You've hit your limit · resets 6pm (UTC)\n", ClaudeErrorLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, ok := ClaudeErrorForm(tc.pane)
+			if !ok || kind != tc.want {
+				t.Errorf("kind=%q ok=%v, want %q true", kind, ok, tc.want)
+			}
+		})
+	}
+}
+
+// TestClaudeModelLimitDoesNotMatchNarration: an agent REPORTING the banner (or
+// prose about limits) is ordinary output, not a live stop. The bounded,
+// newline-free qualifier is what keeps these out.
+func TestClaudeModelLimitDoesNotMatchNarration(t *testing.T) {
+	for _, pane := range []string{
+		"I added a test for when you've reached your rate\nlimit. Run /usage-credits to continue.\n",
+		"The docs explain what happens when your limit is reached and how /model works.\n",
+		"You've reached your goal for the week — the limit on retries is now configurable.\n",
+	} {
+		if kind, ok := ClaudeErrorForm(pane); ok {
+			t.Errorf("narration classified as %q error: %q", kind, pane)
+		}
+	}
+}

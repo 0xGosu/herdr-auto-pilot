@@ -156,7 +156,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 			// forever would be answered forever with no ceiling ever
 			// tripping and no human check-in ever forced.
 			if fullAuto {
-				d.advanceAutoPromptRate(ctx, rec.AgentID, false, now)
+				d.noteFullAutoSend(ctx, rec.AgentID, now)
 			}
 		case autoAcceptRetired:
 			// Dismissed. The agent is NOT marked handled: nothing was
@@ -457,6 +457,33 @@ func (d *Daemon) fullAutoActive(ctx context.Context, cfg config.Config) bool {
 	return false
 }
 
+// noteFullAutoSend records a full-auto delivery against the FR-019 runaway
+// guard. Full-auto is the ONLY auto-accept flavour that does this: timed
+// auto-accept is already bounded by its ≥1m threshold plus the sweep, while
+// full-auto has neither, so the guard is its only frequency bound. Without it
+// an agent that re-raises an escalation on every attention event is answered
+// at event cadence forever and no human check-in is ever forced.
+//
+// BOTH halves are required, and the second is the non-obvious one:
+//
+//   - advanceAutoPromptRate advances the consecutive-auto counter and the
+//     per-minute window. Once either ceiling trips, Decide raises
+//     rate_limited — an excluded reason — and escalate() pauses the agent,
+//     which autoAcceptAgentSuppressed then honours.
+//   - lastAutoSend marks the send as OURS. handleTransition treats an agent
+//     resuming work as a human check-in unless it can attribute the resume to
+//     automation, and a human check-in RESETS the consecutive counter. Since
+//     a delivered answer is exactly what makes the agent resume, omitting
+//     this marker means the counter is zeroed moments after every accept and
+//     the consecutive ceiling can never trip — verified live 2026-08-15,
+//     where a real full-auto delivery left consecutive_auto at 0.
+func (d *Daemon) noteFullAutoSend(ctx context.Context, agentID string, now time.Time) {
+	d.advanceAutoPromptRate(ctx, agentID, false, now)
+	d.mu.Lock()
+	d.lastAutoSend[agentID] = now
+	d.mu.Unlock()
+}
+
 // maybeFullAutoAcceptNow answers a just-raised escalation immediately when
 // full-auto mode is active, instead of leaving it for the sweep. Called from
 // escalate() on the daemon select loop — synchronous on purpose, so it is
@@ -499,15 +526,7 @@ func (d *Daemon) maybeFullAutoAcceptNow(ctx context.Context, auditID int64,
 	}
 	live := map[string]domain.AgentTransition{rec.AgentID: tr}
 	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now) == autoAcceptDelivered {
-		// Count the delivery against the FR-019 runaway guard (both
-		// counters). This hook has no threshold and no sweep throttle, so
-		// the guard is the ONLY frequency bound on it: an agent that
-		// re-raises an escalation on every attention event would otherwise
-		// be answered at event cadence forever with no human check-in ever
-		// forced. Once the ceilings trip, decide() raises rate_limited —
-		// an excluded reason — and escalate() pauses the agent, which
-		// autoAcceptAgentSuppressed honours; a human interaction resets it.
-		d.advanceAutoPromptRate(ctx, rec.AgentID, false, now)
+		d.noteFullAutoSend(ctx, rec.AgentID, now)
 		slog.Info("full-auto: escalation answered immediately",
 			"agent", rec.AgentID, "audit_id", rec.ID)
 	}

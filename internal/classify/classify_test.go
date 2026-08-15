@@ -696,3 +696,23 @@ func TestIdleClaudeChromeIsRedactedFromSignature(t *testing.T) {
 		t.Errorf("status bar reached the salient: %q", sig.Salient)
 	}
 }
+
+// TestClaudeModelLimitClassifiesAtEveryStatus: a per-model exhaustion banner
+// is a live stop whatever herdr reports. This matters because the agent is not
+// asking anything — it just stops — so herdr commonly reports idle or done,
+// and an idle-reported stop previously fell through to the plain idle
+// situation (or unclassifiable) instead of raising an error.
+func TestClaudeModelLimitClassifiesAtEveryStatus(t *testing.T) {
+	pane := "⏺ Continuing the refactor…\n\n  ⎿  You've reached your Fable 5 limit. " +
+		"Run /usage-credits to continue or switch models with /model.\n"
+	c := New(nil)
+	for _, status := range []string{"blocked", "idle", "done", "working"} {
+		s := c.Classify("claude", status, pane)
+		if s.Type != domain.SituationError {
+			t.Errorf("status %s: type = %v, want error", status, s.Type)
+		}
+		if s.ErrorSummary != domain.ClaudeErrorModelLimit {
+			t.Errorf("status %s: ErrorSummary = %q, want %q", status, s.ErrorSummary, domain.ClaudeErrorModelLimit)
+		}
+	}
+}

@@ -449,3 +449,34 @@ func TestFullAutoRatePausedAgentIsSuppressed(t *testing.T) {
 		t.Errorf("nothing may be delivered to a rate-paused agent, sent %v", got)
 	}
 }
+
+// TestFullAutoSendIsAttributedToAutomation: the delivery must be recorded in
+// lastAutoSend, not just in agent_rate. handleTransition reads an agent
+// resuming work as a HUMAN check-in unless it can attribute the resume to
+// automation, and a human check-in resets the consecutive-auto counter — so
+// without the marker the counter is zeroed moments after every accept and the
+// consecutive ceiling can never trip. Found live (2026-08-15): a real
+// full-auto delivery left consecutive_auto at 0 after the agent resumed.
+func TestFullAutoSendIsAttributedToAutomation(t *testing.T) {
+	h := newFullAutoHarness(t, fullAutoOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	h.daemon.mu.Lock()
+	_, ours := h.daemon.lastAutoSend["pA"]
+	h.daemon.mu.Unlock()
+	if !ours {
+		t.Fatal("full-auto delivery was not recorded in lastAutoSend; the agent's own resume will reset the runaway counter")
+	}
+
+	rate, err := h.raw.GetAgentRate(ctx, "pA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate.ConsecutiveAuto != 1 {
+		t.Fatalf("ConsecutiveAuto = %d, want 1", rate.ConsecutiveAuto)
+	}
+}
