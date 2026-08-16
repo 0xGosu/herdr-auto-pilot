@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.12
+
+- Moved the full self-prompting switch to its own top-level config group: `full_self_prompting.enabled` (was `escalations.full_self_prompting.enabled`). Nothing breaks — an existing config.toml still loads and the next save rewrites it under the new key, and `hap config set` still accepts the old spelling with a note naming the new one. It is now the first thing both `hap config fields` and the TUI Config tab show, in its own section.
+- Added full self-prompting toggles to the automation history: turning the mode on or off now records an "FSP On"/"FSP Off" row alongside pause and resume, visible on the TUI Pause/Kill tab and in `hap kill-history`. Only toggles made through a hap surface are recorded; a hand-edited config.toml is not.
+- Fixed the Pause/Kill tab running off the bottom of the pane: it now scrolls a fixed-height window like the other list tabs, shows how many rows are clipped, and supports `/` to filter by state, author or time. It also keeps 200 events in view instead of 50.
+
 ## 0.6.11
 
 - Added full self-prompting mode: when enabled, every escalation that carries a proposed answer is accepted and delivered to the agent immediately — no waiting threshold, no operator action. The auto-accept safety exclusions are unchanged (never-auto matches, suspected-irreversible commands, retry-exhausted and rate-limited escalations still wait for you), it never acts while paused, it never learns from its own accepts, and each delivery counts against the `[limits]` runaway ceilings so an answer loop pauses the agent instead of running forever. Toggle with a double-press of `r` in the TUI or `hap config set escalations.full_self_prompting.enabled true`; enabling requires at least 10 graduated (autonomous) rules and a configured `llm.command`, and the refusal names whatever is missing. `hap status` and the TUI header show the mode, including an "ON but INACTIVE" state when a precondition later lapses.
