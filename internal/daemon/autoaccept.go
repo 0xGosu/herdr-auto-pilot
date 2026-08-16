@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -232,7 +233,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 
 	// Guard 3 — the authoritative one. Exhaustive on purpose: for the guard the
 	// whole feature rests on, an unhandled value must not fall through to a send.
-	switch d.autoAcceptSituationHeldStill(ctx, rec, agent, panes) {
+	switch d.autoAcceptSituationHeldStill(ctx, rec, suggestion, agent, panes) {
 	case heldStillYes:
 		// Proceed.
 	case heldStillNo:
@@ -837,7 +838,7 @@ const (
 //     during the wait cannot shift the comparison basis and manufacture a
 //     spurious staleness.
 func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.AuditRecord,
-	agent domain.AgentTransition, panes *paneCache) heldStill {
+	suggestion string, agent domain.AgentTransition, panes *paneCache) heldStill {
 
 	prev, ok := domain.AutoAcceptBaseline(rec)
 	if !ok {
@@ -851,6 +852,9 @@ func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.A
 		slog.Debug("auto-accept: pane re-read failed; leaving the escalation pending",
 			"audit_id", rec.ID, "agent", rec.AgentID, "error", err)
 		return heldStillUnevaluable
+	}
+	if verdict, handled := d.mcqFormHeldStill(rec, suggestion, pane); handled {
+		return verdict
 	}
 	// Classify under the status the ESCALATED situation is expressible at, not
 	// the agent's live status.
@@ -915,6 +919,129 @@ func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.A
 			"audit_id", rec.ID, "jitter_percent", staleDeferredSendJitterPercent)
 	}
 	return heldStillYes
+}
+
+// mcqFormHeldStill answers the staleness question for a MULTI-TAB MCQ form,
+// which the signature comparison below cannot answer at all.
+//
+// A multi-tab form shows one question at a time, so the daemon captures it by
+// SWEEPING every tab with Right-arrow keystrokes and aggregating the frames
+// (internal/daemon/sweep.go); that aggregate is what mints the signature. This
+// guard re-reads ONE visible frame. Comparing the two therefore compares a
+// 4-question capture against a 1-question screen — they can never be equal, and
+// because a choice's salient is STRUCTURED the mismatch counted as proof the
+// situation had moved on. Verified live 2026-08-16: a standing 4-tab
+// AskUserQuestion form was escalated and auto-dismissed as "no longer on
+// screen" 22ms later, while it sat on screen for another 17 minutes. Every
+// multi-tab form was affected; nothing about it was intermittent.
+//
+// So this compares the way the delivery path's seriesStale already does — same
+// tab count, and the live frame equal to one of the swept frames — which is
+// STRICTER than the fuzzy signature match it replaces, not looser. Two
+// deliberate widenings over seriesStale, both because this guard runs after a
+// wait rather than immediately before the keystrokes:
+//
+//   - Every frame is a candidate, not just the first. The operator may have
+//     tabbed through the form while it waited, and delivery resets to tab 1
+//     with a Left-arrow burst before answering anyway (deliver.resetForm).
+//   - Both sides go through domain.NormalizeMCQFrame, so a moved caret or a
+//     checkbox the operator ticked does not read as a different form.
+//
+// handled is false for anything that is not a live multi-tab form, which falls
+// through to the ordinary signature comparison.
+func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane string) (heldStill, bool) {
+	state, isForm := domain.ParseMCQForm(rec.AgentType, pane)
+	if !isForm || state.AnswerCount < 2 {
+		return 0, false
+	}
+	frames, isAggregate := domain.AggregatedMCQFrames(rec.PaneExcerpt)
+	if !isAggregate {
+		// A row with no usable capture, either because it predates captures or
+		// because truncateTailRunes cut the aggregate's head off (the incident
+		// capture was 3606 runes against a 4000 cap, so this is close, not
+		// hypothetical). Its signature was still minted from a sweep, so the
+		// comparison below would report a staleness that is an artifact of this
+		// guard rather than a fact about the pane. Absence of evidence is not
+		// evidence — the row waits for the operator.
+		//
+		// Excerpt retention cannot produce the empty case: PruneAuditExcerpts
+		// excludes 'escalated' and 'auto_accepting' at any age because this pass
+		// reads the column.
+		if strings.TrimSpace(rec.PaneExcerpt) == "" ||
+			domain.LooksLikeAggregatedMCQ(rec.PaneExcerpt) ||
+			strings.HasPrefix(rec.PaneExcerpt, excerptTruncationMarker) {
+			slog.Debug("auto-accept: multi-tab form on screen but the row carries no usable capture; leaving pending",
+				"audit_id", rec.ID, "agent", rec.AgentID, "excerpt_runes", len([]rune(rec.PaneExcerpt)))
+			return heldStillUnevaluable, true
+		}
+		// The row captured something else entirely and a form is standing now,
+		// so the situation genuinely changed. Let the signature comparison say
+		// so rather than duplicating its verdict here.
+		return 0, false
+	}
+	if state.AnswerCount != len(frames) {
+		slog.Debug("auto-accept: tab count changed",
+			"audit_id", rec.ID, "was", len(frames), "now", state.AnswerCount)
+		return heldStillNo, true
+	}
+	// The suggestion must be an answer for THIS form — one token per tab.
+	// Otherwise delivery does not take the answer-series branch at all: it
+	// falls through to the plain-menu path, maps the reply against whichever
+	// tab happens to be visible, and commits an option nobody chose. Escalations
+	// carrying such a suggestion exist and are not otherwise excluded (a
+	// multi-tab LLM answer of the wrong shape is rejected with
+	// `unfamiliar_options` and left pending with its answer attached), and
+	// before this guard learned to say yes they were simply never reachable.
+	// Unevaluable, not stale: a malformed answer needs a human, not a dismissal.
+	groups, isSeries := domain.ParseTabSelections(suggestion)
+	if !isSeries || len(groups) != state.AnswerCount {
+		slog.Debug("auto-accept: the suggestion is not an answer series for this form; leaving pending",
+			"audit_id", rec.ID, "agent", rec.AgentID, "tabs", state.AnswerCount,
+			"suggestion", truncateRunes(suggestion, 60))
+		return heldStillUnevaluable, true
+	}
+	// The token COUNT is not enough: a token may itself be a comma group
+	// ("1,3"), which only a multi-select tab can take. Delivery does refuse one
+	// on a single-select tab, but it refuses at that tab — so a comma group on
+	// any tab after the first is caught only once the earlier tabs have already
+	// been answered and committed, leaving the form half-answered. That breaks
+	// the all-or-nothing contract verifyTabBaseline exists to keep, and the
+	// half-answered form then trips the unanswered gate above on every later
+	// tick. Cheaper and safer to never start: the captured frames carry each
+	// tab's select mode, so check the shape here and leave it for the operator.
+	for i, group := range groups {
+		if len(group) > 1 && !domain.MultiSelectTab(frames[i]) {
+			slog.Debug("auto-accept: the suggestion selects several options on a single-select tab; leaving pending",
+				"audit_id", rec.ID, "agent", rec.AgentID, "tab", i+1,
+				"suggestion", truncateRunes(suggestion, 60))
+			return heldStillUnevaluable, true
+		}
+	}
+	// Someone has already begun answering. Delivery resets to tab 1 and retypes
+	// EVERY tab, and an answered single-select tab is not re-checked the way a
+	// multi-select tab's boxes are by CheckedOutside — so proceeding here would
+	// silently overwrite the operator's picks. The marks are the only evidence
+	// a form carries, and NormalizeMCQFrame folds them, so this has to be asked
+	// before the comparison rather than left to it.
+	if !domain.MCQFormFullyUnanswered(pane) {
+		slog.Debug("auto-accept: the form is already part-answered; leaving it to the operator",
+			"audit_id", rec.ID, "agent", rec.AgentID)
+		return heldStillUnevaluable, true
+	}
+	live := domain.NormalizeMCQFrame(domain.ExtractAgentMCQForm(state.Kind, pane))
+	for i, frame := range frames {
+		if domain.NormalizeMCQFrame(frame) != live {
+			continue
+		}
+		if i > 0 {
+			slog.Debug("auto-accept: the form is parked on a later tab; still the same form",
+				"audit_id", rec.ID, "tab", i+1, "tabs", len(frames))
+		}
+		return heldStillYes, true
+	}
+	slog.Debug("auto-accept: a different form with the same tab count is on screen",
+		"audit_id", rec.ID, "agent", rec.AgentID, "tabs", len(frames))
+	return heldStillNo, true
 }
 
 // paneIDFor resolves which pane to read. An agent id IS a pane id in herdr, but

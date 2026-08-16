@@ -1704,6 +1704,13 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 // bottom; older scrollback is discarded first.
 const snapshotMaxRunes = 4000
 
+// excerptTruncationMarker prefixes a capture that truncateTailRunes had to cut.
+// It is a shared constant because readers depend on it: a truncated multi-tab
+// aggregate can lose its "[question 1/N]" head entirely, and the only remaining
+// evidence that the row is a MANGLED capture rather than a different kind of
+// capture is this prefix (see mcqFormHeldStill).
+const excerptTruncationMarker = "…"
+
 // maxReviewOutput caps the accepted action-review replacement text (matches
 // the LLM adapter's 16KB capture cap): the result is typed into a pane, so
 // runaway output degrades to the fallback instead of being trimmed.
@@ -1893,7 +1900,7 @@ func truncateTailRunes(s string, n int) string {
 	if len(runes) <= n {
 		return s
 	}
-	return "…" + string(runes[len(runes)-n:])
+	return excerptTruncationMarker + string(runes[len(runes)-n:])
 }
 
 // cancelPreDeliveryReviewExcept invalidates the agent's in-flight action review

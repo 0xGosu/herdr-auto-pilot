@@ -1,0 +1,44 @@
+
+● 3 background agents launched (↓ to manage)
+   ├ Explore TUI Pause/Kill tab
+   ├ Explore FSP config + config tab
+   └ Explore per-agent pause state + CLI
+
+  Searched for 1 pattern, read 1 file, listed 1 directory, ran 2 shell commands
+  ⎿  Loaded ../../vscode/home/root/.claude/rules/go.md
+
+● Waiting on the explore agents. Meanwhile I've confirmed FSP lives at escalations.full_self_prompting.enabled today (internal/config/config.go:106,123) and the TUI is internal/tui/tui.go (6656 lines).
+
+  Searched for 12 patterns, read 3 files, ran 2 shell commands
+
+● Advising using Fable 5
+  ⎿  ✔ Advisor has reviewed the conversation and will apply the feedback
+
+  Ran 1 shell command
+
+● Agent "Explore TUI Pause/Kill tab" finished · 2m 31s
+
+● Agent "Explore FSP config + config tab" finished · 3m 58s
+
+● Agent "Explore per-agent pause state + CLI" finished · 4m 38s
+
+● All three explorations are in and align with what I found. Three decisions worth confirming before I write the plan.
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Key name  ☐ Config tab  ☐ Tab behavior  ✔ Submit  →
+
+What should the new top-level FSP config key be spelled?
+
+❯ 1. full_self_prompting.enabl    ┌──────────────────────────────────────────────────────────┐
+    ed                            │ [full_self_prompting]                                    │
+  2.                              │ enabled = true                                           │
+    full_self_prompting.enable    │                                                          │
+                                  │ hap config set full_self_prompting.enabled true          │
+                                  └──────────────────────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel

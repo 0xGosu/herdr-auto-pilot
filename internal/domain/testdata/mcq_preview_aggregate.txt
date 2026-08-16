@@ -1,0 +1,65 @@
+[question 1/4]
+←  ☐ Key name  ☐ Config tab  ☐ Tab behavior  ✔ Submit  →
+
+What should the new top-level FSP config key be spelled?
+
+❯ 1. full_self_prompting.enabl    ┌──────────────────────────────────────────────────────────┐
+    ed                            │ [full_self_prompting]                                    │
+  2.                              │ enabled = true                                           │
+    full_self_prompting.enable    │                                                          │
+                                  │ hap config set full_self_prompting.enabled true          │
+                                  └──────────────────────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+[question 2/4]
+←  ☐ Key name  ☐ Config tab  ☐ Tab behavior  ✔ Submit  →
+
+How should Full Self-Prompting appear at the top of the Config tab?
+
+❯ 1. Own section at the very      ┌──────────────────────────────────────────────────────────┐
+    top                           │ Full self-prompting                                      │
+  2. First row under "Config"     │   full_self_prompting.enabled            true            │
+                                  │                                                          │
+                                  │ Config (advanced fields hidden — see: hap config fields) │
+                                  │   confidence_thresholds.minimum          0.70            │
+                                  │   confidence_thresholds.idle             0.75            │
+                                  │   ...                                                    │
+                                  └──────────────────────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+[question 3/4]
+←  ☐ Key name  ☐ Config tab  ☐ Tab behavior  ✔ Submit  →
+
+Should the Pause/Kill tab become a full list tab (scroll + "/" search), or scroll only?
+
+❯ 1. Full list tab (scroll +      ┌──────────────────────────────────────────────────────────┐
+    search)                       │ Pause/Kill      filter: fsp                              │
+  2. Scroll only, no search       │ #42   2026-08-16T09:12:03Z  FSP On    by operator        │
+                                  │ #39   2026-08-15T22:40:11Z  FSP Off   by operator        │
+                                  │ … 27 more row(s) — ↓ to scroll                           │
+                                  └──────────────────────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+[question 4/4]
+←  ☐ Key name  ☐ Config tab  ☐ Tab behavior  ✔ Submit  →
+
+Review your answers
+
+⚠ You have not answered all questions
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel
