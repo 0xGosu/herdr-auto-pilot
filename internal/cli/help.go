@@ -554,11 +554,15 @@ func buildCommands() {
 			},
 		},
 		{
-			Name:     "kill-history",
-			Group:    groupOperate,
-			Summary:  "pause/resume event history (who, when, scope)",
-			Usage:    []string{"hap kill-history"},
-			Details:  "Useful when automation is off and nobody remembers why — the author column\n names the process or operator that flipped the switch.",
+			Name:    "kill-history",
+			Group:   groupOperate,
+			Summary: "automation history: pause/resume and full self-prompting toggles (who, when, scope)",
+			Usage:   []string{"hap kill-history"},
+			Details: "Useful when automation is off and nobody remembers why — the author column\n" +
+				" names the process or operator that flipped the switch. Full self-prompting\n" +
+				" toggles appear here too, as fsp_on/fsp_off rows scoped full_self_prompting.\n" +
+				" Only toggles made through a hap surface are recorded; a hand-edited\n" +
+				" config.toml is not.",
 			Examples: []string{"hap kill-history"},
 			Next: []Hint{
 				{Cmd: "hap status", Why: "see the current state"},

@@ -922,7 +922,7 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 		hints = append(hints, Hint{Cmd: "hap signatures reembed", Why: "re-embed rules for the current model"})
 	}
 	if st.FullSelfPrompting && st.FullSelfPromptingBlocked != "" {
-		hints = append(hints, Hint{Cmd: "hap config set escalations.full_self_prompting.enabled false",
+		hints = append(hints, Hint{Cmd: "hap config set " + frontend.FSPFieldKey + " false",
 			Why: "full self-prompting is inactive (" + st.FullSelfPromptingBlocked + "); fix the precondition or turn it off"})
 	}
 	if st.PendingEscalations > 0 {
@@ -1338,11 +1338,20 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 			return fmt.Errorf("usage: config set <field> <value> (see: config fields)")
 		}
 		value := strings.Join(args[2:], " ")
+		// A moved key still resolves; say so once, on STDERR, for the same
+		// reason a moved VERB does — `config set` output is parsed and a note
+		// on stdout would corrupt it. Printed before the write so the note
+		// still appears when the write is refused (the enable gate).
+		key, moved := frontend.CanonicalConfigKey(args[1])
+		if moved {
+			fmt.Fprintf(deprecationOut, "note: config key `%s` is now `%s` — the old spelling still works\n",
+				args[1], key)
+		}
 		reloaded, err := app.SetField(ctx, args[1], value)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "%s set to %s%s\n", args[1], value, reloadNote(reloaded))
+		fmt.Fprintf(out, "%s set to %s%s\n", key, value, reloadNote(reloaded))
 		PrintNextSteps(out, configHints())
 		return nil
 	case "set-threshold":

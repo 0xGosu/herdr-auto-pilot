@@ -102,8 +102,12 @@ type Limits struct {
 
 // Escalations groups the escalation-lifecycle settings.
 type Escalations struct {
-	AutoAccept        AutoAccept        `toml:"auto_accept"`
-	FullSelfPrompting FullSelfPrompting `toml:"full_self_prompting"`
+	AutoAccept AutoAccept `toml:"auto_accept"`
+	// DeprecatedFullSelfPrompting is the pre-move key for the top-level
+	// [full_self_prompting] group. Load migrates it only when the canonical
+	// section is absent, then clears it so Save emits only the new key.
+	// Decode-only.
+	DeprecatedFullSelfPrompting *FullSelfPrompting `toml:"full_self_prompting,omitempty"`
 }
 
 // FullSelfPrompting configures full self-prompting mode: when enabled, every pending
@@ -1289,6 +1293,12 @@ var ValidThemes = []string{"default", "dark", "light", "high-contrast"}
 
 // Config is the full operator configuration.
 type Config struct {
+	// FullSelfPrompting is its own top-level group rather than a corner of
+	// [escalations]: it is the single switch that grants the daemon blanket
+	// autonomy, and it reads first everywhere it is listed. Opt-in and
+	// omitempty for the same reason [escalations] is — an untouched config is
+	// never rewritten with a section granting new autonomy.
+	FullSelfPrompting    FullSelfPrompting    `toml:"full_self_prompting,omitempty"`
 	ConfidenceThresholds ConfidenceThresholds `toml:"confidence_thresholds"`
 	Learning             Learning             `toml:"learning"`
 	Safety               Safety               `toml:"safety"`
@@ -1508,7 +1518,12 @@ type legacyKeys struct {
 	// this shared pass. loadLegacyThresholds does it separately, and only when
 	// this says the table is actually there.
 	Thresholds *any `toml:"thresholds"`
-	LLM        struct {
+	// Presence of the canonical top-level [full_self_prompting] table. An
+	// explicit canonical `enabled = false` must beat a stale legacy
+	// `[escalations.full_self_prompting] enabled = true`, and comparing the
+	// decoded bool to its zero value cannot tell those apart.
+	FullSelfPrompting *any `toml:"full_self_prompting"`
+	LLM               struct {
 		AutoActConfidenceThreshold *any `toml:"auto_act_confidence_threshold"`
 		RewriteCommand             *any `toml:"rewrite_command"`
 		RewriteCommandStart        *any `toml:"rewrite_command_start"`
@@ -1667,6 +1682,21 @@ func Load(path string) (Config, error) {
 				"path", path)
 		}
 		cfg.Safety.DeprecatedDisableSeed = nil
+	}
+	// Deprecated `[escalations.full_self_prompting]`: migrate it only when the
+	// canonical top-level table is absent, probing the raw file for presence
+	// (an explicit canonical `enabled = false` must win over a stale legacy
+	// true). Clearing the pointer makes the next Save drop the old section.
+	if cfg.Escalations.DeprecatedFullSelfPrompting != nil {
+		if legacy.FullSelfPrompting == nil {
+			cfg.FullSelfPrompting = *cfg.Escalations.DeprecatedFullSelfPrompting
+			warnOnce("config table `[escalations.full_self_prompting]` is deprecated; use the top-level `[full_self_prompting]`",
+				"path", path)
+		} else {
+			warnOnce("deprecated config table `[escalations.full_self_prompting]` ignored because the top-level `[full_self_prompting]` is also set",
+				"path", path)
+		}
+		cfg.Escalations.DeprecatedFullSelfPrompting = nil
 	}
 	// `limits.verify_unblock_ms` is no longer configurable. Detect it only to
 	// make the behavior change visible; Save omits it because Limits has no

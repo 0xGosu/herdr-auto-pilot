@@ -2020,12 +2020,12 @@ bound, so an agent that keeps re-raising escalations is answered only until
 waits for a human check-in like any other runaway.
 
 ```toml
-[escalations.full_self_prompting]
+[full_self_prompting]
 enabled = true
 ```
 
 Toggle it with a double-press of `r` in the TUI, or
-`config set escalations.full_self_prompting.enabled true`. A single `r` keeps
+`config set full_self_prompting.enabled true`. A single `r` keeps
 its own meaning — resume — and is simply delayed by the double-press window,
 so a double never resumes on its way to the toggle; while automation is
 paused, `rr` resumes instead of toggling, since enabling is refused then

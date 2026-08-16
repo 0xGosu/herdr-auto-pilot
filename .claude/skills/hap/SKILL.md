@@ -289,8 +289,8 @@ learns from its own accepts, and each delivery counts against the `[limits]` run
 ceilings so an answer loop pauses the agent instead of running forever.
 
 ```bash
-hap config set escalations.full_self_prompting.enabled true
-hap config set escalations.full_self_prompting.enabled false
+hap config set full_self_prompting.enabled true
+hap config set full_self_prompting.enabled false
 ```
 
 in the TUI, **press `r` twice quickly** (within ~600ms) to toggle it. a SINGLE `r` keeps

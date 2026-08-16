@@ -17,7 +17,7 @@ import (
 // fspOn enables ONLY full self-prompting — auto_accept stays off, proving the two
 // switches are independent.
 const fspOn = `
-[escalations.full_self_prompting]
+[full_self_prompting]
 enabled = true
 `
 

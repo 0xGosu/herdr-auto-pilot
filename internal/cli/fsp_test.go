@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
@@ -59,7 +60,7 @@ func TestStatusReportsFullSelfPromptingStates(t *testing.T) {
 	if !strings.Contains(out, "full self-prompting: ON but INACTIVE — only 0 of") {
 		t.Errorf("blocked status must report ON but INACTIVE with the reason, got:\n%s", out)
 	}
-	if !strings.Contains(out, "hap config set escalations.full_self_prompting.enabled false") {
+	if !strings.Contains(out, "hap config set full_self_prompting.enabled false") {
 		t.Errorf("blocked status must hint the remedy, got:\n%s", out)
 	}
 }
@@ -68,7 +69,7 @@ func TestStatusReportsFullSelfPromptingStates(t *testing.T) {
 // spelling reports the same refusal the TUI shows.
 func TestConfigSetFullSelfPromptingSurfacesPreconditionError(t *testing.T) {
 	app, _ := testApp(t)
-	_, err := run(t, app, "config", "set", "escalations.full_self_prompting.enabled", "true")
+	_, err := run(t, app, "config", "set", "full_self_prompting.enabled", "true")
 	if err == nil {
 		t.Fatal("enable must be refused with no graduated rules and no llm.command")
 	}
@@ -76,5 +77,93 @@ func TestConfigSetFullSelfPromptingSurfacesPreconditionError(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}
+	}
+}
+
+// TestKillHistoryPrintsFSPTogglesInTheParsedShape: `hap kill-history` is
+// tab-separated output scripts parse, so the FSP stream deliberately prints its
+// RAW state and scope rather than the TUI's friendly label. Pin the whole row
+// shape — id, time, state, author, scope — because that contract is the reason
+// the CLI and the TUI disagree on purpose.
+func TestKillHistoryPrintsFSPTogglesInTheParsedShape(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	seedFullSelfPromptingPreconditions(t, app, st)
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Pause(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "kill-history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fspRow, pauseRow []string
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "#") {
+			continue
+		}
+		cols := strings.Split(line, "\t")
+		switch {
+		case len(cols) == 5 && cols[2] == domain.KillStateFSPOn:
+			fspRow = cols
+		case len(cols) == 5 && cols[2] == domain.KillStateActiveValue:
+			pauseRow = cols
+		}
+	}
+	if fspRow == nil {
+		t.Fatalf("kill-history printed no fsp_on row in the expected 5-column shape:\n%s", out)
+	}
+	if fspRow[4] != domain.KillScopeFSP {
+		t.Errorf("fsp_on row scope column = %q, want %q", fspRow[4], domain.KillScopeFSP)
+	}
+	if !strings.HasPrefix(fspRow[3], "by ") {
+		t.Errorf("fsp_on row author column = %q, want a \"by <author>\" cell", fspRow[3])
+	}
+	// The friendly label belongs to the TUI only.
+	if strings.Contains(out, "FSP On") {
+		t.Errorf("kill-history leaked the TUI label instead of the raw state:\n%s", out)
+	}
+	// The kill-switch stream is unchanged beside it.
+	if pauseRow == nil || pauseRow[4] != domain.KillScopeGlobal {
+		t.Errorf("the pause row lost its shape or scope: %v", pauseRow)
+	}
+}
+
+// TestConfigSetAcceptsTheMovedFSPKey: the pre-move spelling still resolves, and
+// says so on STDERR. It is what CHANGELOG history and every already-installed
+// copy of the bundled skill doc tell an agent to run — that doc only refreshes
+// on a manual `hap skill install`, so a hard error would strand them.
+func TestConfigSetAcceptsTheMovedFSPKey(t *testing.T) {
+	app, st := testApp(t)
+	seedFullSelfPromptingPreconditions(t, app, st)
+
+	var notes strings.Builder
+	restore := cli.SetDeprecationOutput(&notes)
+	defer restore()
+
+	out, err := run(t, app, "config", "set", frontend.DeprecatedFSPFieldKey, "true")
+	if err != nil {
+		t.Fatalf("the moved spelling was refused: %v", err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.FullSelfPrompting.Enabled {
+		t.Fatal("the moved spelling did not reach the canonical field")
+	}
+	if !strings.Contains(notes.String(), frontend.FSPFieldKey) {
+		t.Errorf("no migration note named the new key, got %q", notes.String())
+	}
+	// The note must never reach stdout — this output is parsed.
+	if strings.Contains(out, "note:") {
+		t.Errorf("the migration note corrupted stdout:\n%s", out)
+	}
+	// The confirmation names the canonical key, not the spelling typed.
+	if !strings.Contains(out, frontend.FSPFieldKey+" set to true") {
+		t.Errorf("confirmation should name the canonical key, got:\n%s", out)
 	}
 }

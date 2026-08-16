@@ -47,6 +47,16 @@ func listModel(t *testing.T, n, height int) Model {
 				SituationType: domain.SituationApproval, AgentType: "claude",
 				Mode: domain.ModeShadow},
 			TopAction: "1"})
+		// Both streams the Pause/Kill tab merges, alternating so a filter test
+		// has something to narrow to.
+		state, scope := domain.KillStateActiveValue, domain.KillScopeGlobal
+		if i%2 == 1 {
+			state, scope = domain.KillStateFSPOn, domain.KillScopeFSP
+		}
+		msg.kills = append(msg.kills, domain.KillEvent{
+			ID: int64(200 + i), State: state, Scope: scope,
+			Author:    fmt.Sprintf("author-%02d", i),
+			CreatedAt: time.Date(2026, 7, 9, 13, 0, i, 0, time.UTC)})
 	}
 	upd, _ := m.Update(msg)
 	return upd.(Model)
@@ -237,6 +247,10 @@ func TestListTabsFitPaneWithManyRows(t *testing.T) {
 		{name: "escalations", tab: tabEscalations},
 		{name: "audit", tab: tabAudit},
 		{name: "rules", tab: tabSignatures},
+		{name: "pause/kill", tab: tabKill},
+		{name: "pause/kill with active filter", tab: tabKill, setup: func(m *Model) {
+			m.query[tabKill] = "author" // matches every row
+		}},
 		{name: "escalations searching", tab: tabEscalations, setup: func(m *Model) {
 			m.searching = true
 			m.query[tabEscalations] = "rationale" // matches every row
@@ -1485,10 +1499,14 @@ func TestConfigLongValueTruncatesToOneLine(t *testing.T) {
 	}
 }
 
-// --- Non-list tabs unchanged (AR-032) ---
+// --- Config, the one tab that is not a windowed row list ---
 
+// TestNonListTabsIgnoreSearch: Config windows over display LINES (headers
+// interleave with items) rather than rows, so it carries no row filter and `/`
+// must stay a no-op there. Pause/Kill used to be listed here too; it is a full
+// list tab now — see TestKillTabSearchFilters.
 func TestNonListTabsIgnoreSearch(t *testing.T) {
-	for _, tb := range []tab{tabConfig, tabKill} {
+	for _, tb := range []tab{tabConfig} {
 		t.Run(tabNames[tb], func(t *testing.T) {
 			m := listModel(t, 5, 30)
 			m.tab = tb

@@ -277,7 +277,7 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 		st.Embedding = a.embeddingStatus(ctx, cfg)
 		// Best-effort: a drift-check failure must not break status.
 		st.Drift, _ = a.embeddingDrift(ctx, cfg)
-		st.FullSelfPrompting = cfg.Escalations.FullSelfPrompting.Enabled
+		st.FullSelfPrompting = cfg.FullSelfPrompting.Enabled
 		st.FullSelfPromptingBlocked = a.fspBlockedReason(ctx, cfg)
 	}
 	// Name any live agent the daemon has not named yet (a brand-new agent,
@@ -602,7 +602,8 @@ func (a *App) Audit(ctx context.Context, limit int) ([]domain.AuditRecord, error
 	return a.Store.AuditLog(ctx, limit)
 }
 
-// KillHistory lists the pause/kill event history.
+// KillHistory lists the automation history: pause/resume plus full
+// self-prompting toggles, newest first.
 func (a *App) KillHistory(ctx context.Context, limit int) ([]domain.KillEvent, error) {
 	return a.Store.KillEvents(ctx, limit)
 }
@@ -619,7 +620,8 @@ func (a *App) Pause(ctx context.Context) (changed bool, err error) {
 		return false, nil
 	}
 	if _, err := a.Store.InsertKillEvent(ctx, domain.KillEvent{
-		State: "active", Scope: "global", Author: a.Author, CreatedAt: time.Now(),
+		State: domain.KillStateActiveValue, Scope: domain.KillScopeGlobal,
+		Author: a.Author, CreatedAt: time.Now(),
 	}); err != nil {
 		return false, err
 	}
@@ -641,7 +643,8 @@ func (a *App) Resume(ctx context.Context) (changed bool, err error) {
 		return false, nil
 	}
 	if _, err := a.Store.InsertKillEvent(ctx, domain.KillEvent{
-		State: "resumed", Scope: "global", Author: a.Author, CreatedAt: time.Now(),
+		State: domain.KillStateResumed, Scope: domain.KillScopeGlobal,
+		Author: a.Author, CreatedAt: time.Now(),
 	}); err != nil {
 		return false, err
 	}
@@ -1794,6 +1797,30 @@ func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) e
 // config is saved either way, and a daemon that was not listening reads it at
 // its next start.
 func (a *App) updateConfigReloaded(ctx context.Context, fn func(*config.Config) error) (bool, error) {
+	return a.updateConfigReloadedThen(ctx, fn, nil)
+}
+
+// updateConfigReloadedThen is updateConfigReloaded with a hook that runs after
+// the file write succeeds and BEFORE the lock is released.
+//
+// The hook exists for side effects that must be totally ordered with the
+// transition they describe. Recording a full self-prompting toggle in the
+// history is the case: run after the unlock instead, and two concurrent writers
+// can persist ON → OFF while inserting the history rows OFF → ON — the first
+// writer saves and releases, the second saves and inserts, then the first
+// inserts. KillEvents orders by insertion id, so `hap kill-history` and the
+// Pause/Kill tab would then show the newest FSP row as ON while the config says
+// OFF. The lock is the cross-PROCESS one, so the TUI and a concurrent
+// `hap config set` are covered, not just two goroutines.
+//
+// It runs after Save, never inside fn: a hook that fired before the write would
+// record a transition a failed Save never persisted, which is the same bug in
+// the other direction. It returns nothing — a hook is for best-effort work that
+// must not fail a write that already landed.
+//
+// Nothing the hook touches may take this lock, or it deadlocks. Today it writes
+// SQLite, which knows nothing about config.
+func (a *App) updateConfigReloadedThen(ctx context.Context, fn func(*config.Config) error, afterSave func()) (bool, error) {
 	unlock, err := lockFile(a.ConfigPath + ".lock")
 	if err != nil {
 		return false, fmt.Errorf("lock config for editing: %w", err)
@@ -1814,6 +1841,9 @@ func (a *App) updateConfigReloaded(ctx context.Context, fn func(*config.Config) 
 	}
 	if err := config.Save(a.ConfigPath, cfg); err != nil {
 		return false, err
+	}
+	if afterSave != nil {
+		afterSave()
 	}
 	return a.nudge(ctx, control.KindReload), nil
 }
@@ -1841,6 +1871,11 @@ type ConfigFieldDef struct {
 // registry entry is unguarded (the field silently disappears from the TUI
 // and `config fields`), so always add new fields here first.
 var ConfigFields = []ConfigFieldDef{
+	// First on purpose: full self-prompting is the one switch that grants the
+	// daemon blanket autonomy, so it leads both `hap config fields` and the TUI
+	// Config tab (where it gets its own section) rather than sitting in the
+	// middle of forty tuning knobs.
+	{Key: FSPFieldKey, TUIEditable: true},
 	{Key: "confidence_thresholds.minimum", TUIEditable: true},
 	{Key: "confidence_thresholds.idle", TUIEditable: true},
 	{Key: "confidence_thresholds.approval", TUIEditable: true},
@@ -1860,7 +1895,6 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "escalations.auto_accept.error", TUIEditable: true},
 	{Key: "escalations.auto_accept.idle", TUIEditable: true},
 	{Key: "escalations.auto_accept.unclassifiable", TUIEditable: true},
-	{Key: "escalations.full_self_prompting.enabled", TUIEditable: true},
 	{Key: "safety.disable_never_auto_seed_patterns", TUIEditable: true},
 	{Key: "llm.command"},       // argv template
 	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
@@ -2042,6 +2076,7 @@ func setPaletteRole(dst *string, value string) error {
 
 // FieldValue renders the current value of a SetField key for display.
 func FieldValue(cfg config.Config, key string) string {
+	key, _ = CanonicalConfigKey(key)
 	switch key {
 	case "confidence_thresholds.minimum":
 		return fmt.Sprintf("%.2f", cfg.ConfidenceThresholds.Minimum)
@@ -2110,8 +2145,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return autoAcceptValue(cfg.Escalations.AutoAccept.Idle, 0)
 	case "escalations.auto_accept.unclassifiable":
 		return autoAcceptValue(cfg.Escalations.AutoAccept.Unclassifiable, 0)
-	case "escalations.full_self_prompting.enabled":
-		return strconv.FormatBool(cfg.Escalations.FullSelfPrompting.Enabled)
+	case FSPFieldKey:
+		return strconv.FormatBool(cfg.FullSelfPrompting.Enabled)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -2280,6 +2315,7 @@ func pathFieldValue(v string) string {
 // SetField updates one scalar config field by key, with validation. It
 // backs both the TUI config editor and `config set <key> <value>`.
 func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, err error) {
+	key, _ = CanonicalConfigKey(key)
 	value = strings.TrimSpace(value)
 	setFloat := func(dst *float64) error {
 		v, err := strconv.ParseFloat(value, 64)
@@ -2300,7 +2336,18 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 		*dst = v
 		return nil
 	}
-	return a.updateConfigReloaded(ctx, func(cfg *config.Config) error {
+	// Set by the FSP case below when the write actually flips the mode; read by
+	// the afterSave hook, which runs while the config lock is still held so the
+	// history rows can never be ordered against the transitions they describe.
+	// Recording lives HERE and not in SetFullSelfPrompting because `hap config
+	// set` and the TUI Config tab both reach the key without that wrapper.
+	var fspToggledTo *bool
+	recordToggle := func() {
+		if fspToggledTo != nil {
+			a.recordFSPToggle(ctx, *fspToggledTo)
+		}
+	}
+	return a.updateConfigReloadedThen(ctx, func(cfg *config.Config) error {
 		switch key {
 		case "confidence_thresholds.minimum":
 			return setFloat(&cfg.ConfidenceThresholds.Minimum)
@@ -2343,21 +2390,29 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			}
 			cfg.Escalations.AutoAccept.Enabled = v
 			return nil
-		case "escalations.full_self_prompting.enabled":
+		case FSPFieldKey:
 			v, err := strconv.ParseBool(value)
 			if err != nil {
-				return fmt.Errorf("escalations.full_self_prompting.enabled must be true or false, got %q", value)
+				return fmt.Errorf("%s must be true or false, got %q", FSPFieldKey, value)
 			}
 			// Enabling is gated; disabling must never be refusable. The check
 			// runs here, under the config file lock against the freshly loaded
 			// cfg, so every surface (CLI config set, TUI double-R via
 			// SetFullSelfPrompting, TUI config tab) shares one refusal wording.
-			if v && !cfg.Escalations.FullSelfPrompting.Enabled {
+			if v && !cfg.FullSelfPrompting.Enabled {
 				if err := a.fspEnablePreconditions(ctx, cfg); err != nil {
 					return err
 				}
 			}
-			cfg.Escalations.FullSelfPrompting.Enabled = v
+			// Report the toggle to the caller so it can record one history row
+			// per ACTUAL change. Assigned on every invocation of this mutator,
+			// including the no-change case, so a retried mutator can never leave
+			// a stale verdict behind.
+			fspToggledTo = nil
+			if v != cfg.FullSelfPrompting.Enabled {
+				fspToggledTo = &v
+			}
+			cfg.FullSelfPrompting.Enabled = v
 			return nil
 		case "escalations.auto_accept.approval":
 			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Approval)
@@ -2718,7 +2773,7 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			return nil
 		}
 		return fmt.Errorf("unknown config field %q", key)
-	})
+	}, recordToggle)
 }
 
 // SplitCommand splits a command line into argv, honoring single and double

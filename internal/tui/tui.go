@@ -52,10 +52,12 @@ const (
 
 var tabNames = []string{"Agents", "Tasks", "Escalations", "Audit", "Rules", "Config", "Pause/Kill"}
 
-// isList reports whether t renders a scrollable, searchable row list.
-// Config and Pause/Kill keep their existing unwindowed navigation (AR-032).
+// isList reports whether t renders a scrollable, searchable row list. Config
+// is the one exception: it windows over display LINES rather than rows (headers
+// interleave with items), so it carries its own scroll helpers.
 func (t tab) isList() bool {
-	return t == tabAgents || t == tabTasks || t == tabEscalations || t == tabAudit || t == tabSignatures
+	return t == tabAgents || t == tabTasks || t == tabEscalations || t == tabAudit ||
+		t == tabSignatures || t == tabKill
 }
 
 type refreshMsg struct {
@@ -803,7 +805,11 @@ type detailView struct {
 // visibility and refuse edit/remove with a config.toml pointer. "shortcut"
 // rows run guarded one-off setup actions.
 type ruleItem struct {
-	kind  string // "field" | "pattern" | "source" | "scoped-pattern" | "capture" | "shortcut"
+	// "fsp" is a config field like "field" and is edited by the same code path;
+	// it is a separate kind only so configLines can give it its own section at
+	// the top of the tab. Anything that treats "field" as "an editable config
+	// row" must accept "fsp" too.
+	kind  string // "fsp" | "field" | "pattern" | "source" | "scoped-pattern" | "capture" | "shortcut"
 	key   string // config field key (fields)
 	index int    // slice index (patterns / sources)
 	value string // pattern text / source path — verified on removal
@@ -1257,6 +1263,26 @@ func (m Model) visibleAudit() []domain.AuditRecord {
 	return m.filterAudit(tabAudit, m.data.audit)
 }
 
+// visibleKills applies the Pause/Kill tab's search filter to the automation
+// history. Matching is on the LABEL the operator sees ("FSP On", "paused"), not
+// only the stored state — typing "fsp" must find the rows the screen shows as
+// FSP toggles, whose raw states are the unlisted "fsp_on"/"fsp_off". The raw
+// state stays searchable too, for anyone reading `hap kill-history` alongside.
+func (m Model) visibleKills() []domain.KillEvent {
+	if m.query[tabKill] == "" {
+		return m.data.kills
+	}
+	var out []domain.KillEvent
+	for _, e := range m.data.kills {
+		if m.matchesQuery(tabKill, fmt.Sprintf("#%d", e.ID),
+			domain.KillEventLabel(e), e.State, e.Scope, e.Author,
+			e.CreatedAt.Format(time.RFC3339)) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 func (m Model) filterAudit(t tab, rows []domain.AuditRecord) []domain.AuditRecord {
 	if m.query[t] == "" {
 		return rows
@@ -1516,7 +1542,9 @@ func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refr
 	if msg.err != nil {
 		return msg
 	}
-	msg.kills, msg.err = app.KillHistory(ctx, 50)
+	// 200, not the 50 the other lists use: the tab now windows and filters, so
+	// the fetch is what bounds how far back `/` can look, not what fits a pane.
+	msg.kills, msg.err = app.KillHistory(ctx, 200)
 	if msg.err != nil {
 		return msg
 	}
@@ -1574,13 +1602,28 @@ func (m Model) updateCheckCmd() tea.Cmd {
 	}
 }
 
+// configFieldLabel renders one config field's row: the key, then its value.
+func configFieldLabel(cfg config.Config, key string) string {
+	return fmt.Sprintf("%-38s %s", key, frontend.FieldValue(cfg, key))
+}
+
 // buildRuleItems lays out the Config tab rows from the current config.
+//
+// Full self-prompting leads, in its own section: it is the switch that grants
+// the daemon blanket autonomy, and burying it among the tuning knobs is how an
+// operator loses track of whether it is on.
 func buildRuleItems(cfg config.Config) []ruleItem {
-	var items []ruleItem
+	items := []ruleItem{{
+		kind: "fsp", key: frontend.FSPFieldKey,
+		label: configFieldLabel(cfg, frontend.FSPFieldKey),
+	}}
 	for _, key := range frontend.TUIConfigFieldKeys {
+		if key == frontend.FSPFieldKey {
+			continue // already rendered above, in its own section
+		}
 		items = append(items, ruleItem{
 			kind: "field", key: key,
-			label: fmt.Sprintf("%-38s %s", key, frontend.FieldValue(cfg, key)),
+			label: configFieldLabel(cfg, key),
 		})
 	}
 	for i, p := range cfg.Safety.NeverAutoPatterns {
@@ -2729,9 +2772,9 @@ func (m Model) pauseCmd() tea.Cmd {
 	}
 }
 
-// rowCountFor counts tab t's currently visible rows: search-filter-aware
-// for the four list tabs (CR-008); Config and Pause/Kill keep their raw
-// counts so their navigation is untouched (AR-032).
+// rowCountFor counts tab t's currently visible rows: search-filter-aware for
+// every list tab (CR-008). Config keeps its raw item count — it windows over
+// display LINES, not rows.
 func (m Model) rowCountFor(t tab) int {
 	switch t {
 	case tabAgents:
@@ -2747,7 +2790,7 @@ func (m Model) rowCountFor(t tab) int {
 	case tabConfig:
 		return len(m.items)
 	case tabKill:
-		return len(m.data.kills)
+		return len(m.visibleKills())
 	}
 	return 0
 }
@@ -4311,9 +4354,9 @@ func (m *Model) scrollConfigIntoView() {
 // clampListViewport keeps every list tab's offset within
 // [0, rowCount−pageSize] and the active tab's cursor within its visible
 // (filtered) rows (CR-007, CR-008, CR-016). The cursor clamp stays OUTSIDE the
-// list-only loop on purpose: Pause/Kill renders unwindowed but still tracks a
-// cursor, and rowCountFor covers it; Config windows over display LINES, so its
-// offset is reconciled by the trailing scrollCursorIntoView (→ scrollConfigIntoView).
+// list-only loop on purpose: Config tracks a cursor but is not a list tab, and
+// rowCountFor covers it; it windows over display LINES, so its offset is
+// reconciled by the trailing scrollCursorIntoView (→ scrollConfigIntoView).
 func (m *Model) clampListViewport() {
 	page := m.listPageSize()
 	for t := tab(0); t < tabCount; t++ {
@@ -4992,7 +5035,7 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 		return m, nil
 	case "source":
 		return m.editTaskSourcePrompt(item.index, item.value)
-	case "field":
+	case "field", "fsp":
 	default:
 		return m, nil
 	}
@@ -6060,6 +6103,10 @@ func (m Model) helpLine() string {
 		return "enter/v: details  x: delete  0: reset  f: filter mode  /: search  " + common
 	case tabConfig:
 		return "enter: edit/run shortcut  e: edit field/source  a: add pattern  t: add task source  x: remove  X: clear data  " + common
+	case tabKill:
+		// The tab is read-only history; `/` is the only key it adds over the
+		// global ones, and it was previously unadvertised here.
+		return "/: search  " + common
 	}
 	return common
 }
@@ -6474,6 +6521,8 @@ func (m Model) configLines() []configLine {
 				emptySectionsRendered = true
 			}
 			switch item.kind {
+			case "fsp":
+				header("Full self-prompting", false)
 			case "field":
 				// Name the omission: advanced fields are hidden here, not
 				// gone, so the operator knows where the rest live. Derived,
@@ -6482,7 +6531,9 @@ func (m Model) configLines() []configLine {
 				if len(frontend.TUIConfigFieldKeys) < len(frontend.ConfigFieldKeys) {
 					title += " (advanced fields hidden — see: hap config fields)"
 				}
-				header(title, false)
+				// Spaced from whatever precedes it (the full self-prompting
+				// section), but never leading the tab with a blank line.
+				header(title, len(lines) > 0)
 			case "pattern":
 				header(fmt.Sprintf("Never-auto patterns (operator; %s)", m.seedLabel()), true)
 			case "source":
@@ -6544,19 +6595,34 @@ func (m Model) seedLabel() string {
 	return fmt.Sprintf("+%d seed active", domain.SeedNeverAutoRuleCount())
 }
 
+// renderKills draws the automation history: pause/resume and full
+// self-prompting toggles interleaved, newest first.
 func (m Model) renderKills(b *strings.Builder) {
-	if len(m.data.kills) == 0 {
+	rows := m.visibleKills()
+	if len(rows) == 0 {
+		if m.query[tabKill] != "" {
+			fmt.Fprintln(b, m.styles().help.Render("no matching pause/kill events"))
+			return
+		}
 		fmt.Fprintln(b, m.styles().help.Render("no pause/kill events recorded"))
 		return
 	}
-	for i, e := range m.data.kills {
+	start, end := m.window(len(rows))
+	for i := start; i < end; i++ {
+		e := rows[i]
+		// The LABEL, not the raw state: "FSP On" beats "fsp_on" on screen, and
+		// `hap kill-history` still prints the raw value for scripts.
 		line := fmt.Sprintf("#%-4d %-20s %-8s by %s",
-			e.ID, e.CreatedAt.Format(time.RFC3339), e.State, e.Author)
+			e.ID, e.CreatedAt.Format(time.RFC3339), domain.KillEventLabel(e), e.Author)
+		// One terminal line per row, or window()/listPageSize()'s row budget
+		// stops matching what is drawn.
+		line = oneLine(line, m.contentWidth())
 		if i == m.cursors[m.tab] {
 			line = m.styles().selected.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
+	m.renderMoreRows(b, len(rows)-end)
 }
 
 // oneLine flattens newlines and truncates to limit display CELLS (not

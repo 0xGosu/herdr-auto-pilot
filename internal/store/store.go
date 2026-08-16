@@ -691,14 +691,15 @@ func (s *Store) InsertLLMRetry(ctx context.Context, auditID int64, now time.Time
 	return id, err
 }
 
-// InsertKillEvent appends a pause/kill/resume toggle (append-only, FR-017).
+// InsertKillEvent appends a pause/kill/resume toggle, or a full self-prompting
+// toggle under domain.KillScopeFSP (append-only, FR-017).
 func (s *Store) InsertKillEvent(ctx context.Context, e domain.KillEvent) (int64, error) {
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO kill_events (state, scope, author, created_at)
 			VALUES (?, ?, ?, ?)`,
-			e.State, orDefault(e.Scope, "global"), orDefault(e.Author, "operator"), unix(e.CreatedAt))
+			e.State, orDefault(e.Scope, domain.KillScopeGlobal), orDefault(e.Author, "operator"), unix(e.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -1554,10 +1555,20 @@ func (s *Store) LatestAuditsForSignatures(ctx context.Context) (map[string]*doma
 	return out, nil
 }
 
-// LatestKillEvent returns the newest kill event row, or nil (read every tick).
+// LatestKillEvent returns the newest GLOBAL kill event row, or nil (read every
+// tick).
+//
+// The scope filter is a safety control, not tidiness: kill_events also carries
+// full self-prompting toggles, and every caller here derives "is automation
+// halted" from the row it gets back. Without the filter, pausing and then
+// switching full self-prompting off makes the fsp_off row the newest one,
+// domain.KillStateActive reads false, and automation silently resumes while the
+// operator believes the kill switch is still down. Legacy rows predate the FSP
+// stream and all carry the 'global' default, so no backfill is needed.
 func (s *Store) LatestKillEvent(ctx context.Context) (*domain.KillEvent, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, state, scope, author, created_at FROM kill_events ORDER BY id DESC LIMIT 1`)
+		`SELECT id, state, scope, author, created_at FROM kill_events
+		 WHERE scope = ? ORDER BY id DESC LIMIT 1`, domain.KillScopeGlobal)
 	var e domain.KillEvent
 	var created int64
 	err := row.Scan(&e.ID, &e.State, &e.Scope, &e.Author, &created)
@@ -1571,7 +1582,9 @@ func (s *Store) LatestKillEvent(ctx context.Context) (*domain.KillEvent, error) 
 	return &e, nil
 }
 
-// KillEvents returns the pause/kill history, newest first.
+// KillEvents returns the automation history, newest first — pause/resume AND
+// full self-prompting toggles, deliberately unfiltered: the merged stream is
+// what the Pause/Kill tab and `hap kill-history` show.
 func (s *Store) KillEvents(ctx context.Context, limit int) ([]domain.KillEvent, error) {
 	if limit <= 0 {
 		limit = 100
