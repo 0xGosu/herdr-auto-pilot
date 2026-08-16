@@ -13,6 +13,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
+	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
 )
 
 // seedGraduatedRules writes n autonomous signatures, the enable gate's
@@ -376,5 +377,82 @@ func TestPausedKillSwitchSurvivesAnFSPToggle(t *testing.T) {
 	}
 	if !status.Paused {
 		t.Fatal("switching full self-prompting off resumed a paused daemon")
+	}
+}
+
+// lockObservingStore records whether the config lock was held at the moment the
+// history row was inserted. It probes with a bounded wait on a SECOND file
+// descriptor for the same lock file: flock is per open-file-description, so an
+// in-process probe conflicts with the writer's lock exactly as another process
+// would.
+type lockObservingStore struct {
+	ports.FrontendStore
+	lockPath    string
+	lockWasHeld bool
+	sawAnInsert bool
+	inserts     int
+}
+
+func (s *lockObservingStore) InsertKillEvent(ctx context.Context, e domain.KillEvent) (int64, error) {
+	if e.Scope == domain.KillScopeFSP {
+		s.sawAnInsert = true
+		s.inserts++
+		if unlock, err := taskfile.LockWithin(s.lockPath, 50*time.Millisecond); err != nil {
+			s.lockWasHeld = true
+		} else {
+			unlock()
+		}
+	}
+	return s.FrontendStore.InsertKillEvent(ctx, e)
+}
+
+// TestFSPToggleIsRecordedUnderTheConfigLock pins the ordering fix. Recording
+// after the lock is released lets two concurrent writers persist ON → OFF while
+// inserting the history rows OFF → ON: the first writer saves and releases, the
+// second saves and inserts, then the first inserts. KillEvents orders by
+// insertion id, so the newest FSP row would claim the mode is ON while the
+// config says OFF — precisely backwards, in the audit trail for autonomy.
+//
+// Asserting the lock is HELD at insert time is the deterministic form of that
+// invariant: it needs no goroutine interleaving to reproduce, so it cannot go
+// flaky and cannot pass by luck.
+func TestFSPToggleIsRecordedUnderTheConfigLock(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	setLLMCommand(t, app)
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules)
+
+	obs := &lockObservingStore{FrontendStore: st, lockPath: app.ConfigPath + ".lock"}
+	app.Store = obs
+
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if !obs.sawAnInsert {
+		t.Fatal("the toggle recorded no history row at all")
+	}
+	if !obs.lockWasHeld {
+		t.Fatal("the full self-prompting history row was inserted with the config lock released — " +
+			"concurrent toggles can order the history against the transitions it describes")
+	}
+}
+
+// TestFSPRecordingIsSkippedWhenTheWriteIsRefused: the hook runs after Save, so
+// a refusal must leave no row. Guards the other half of the ordering fix — a
+// hook that fired before the write would record a transition that never
+// persisted.
+func TestFSPRecordingIsSkippedWhenTheWriteIsRefused(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+
+	obs := &lockObservingStore{FrontendStore: st, lockPath: app.ConfigPath + ".lock"}
+	app.Store = obs
+
+	// No graduated rules and no llm.command: the enable gate refuses.
+	if err := app.SetFullSelfPrompting(ctx, true); err == nil {
+		t.Fatal("enable succeeded with no preconditions met")
+	}
+	if obs.inserts != 0 {
+		t.Fatalf("a refused enable recorded %d history row(s)", obs.inserts)
 	}
 }

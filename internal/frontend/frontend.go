@@ -1797,6 +1797,30 @@ func (a *App) UpdateConfig(ctx context.Context, fn func(*config.Config) error) e
 // config is saved either way, and a daemon that was not listening reads it at
 // its next start.
 func (a *App) updateConfigReloaded(ctx context.Context, fn func(*config.Config) error) (bool, error) {
+	return a.updateConfigReloadedThen(ctx, fn, nil)
+}
+
+// updateConfigReloadedThen is updateConfigReloaded with a hook that runs after
+// the file write succeeds and BEFORE the lock is released.
+//
+// The hook exists for side effects that must be totally ordered with the
+// transition they describe. Recording a full self-prompting toggle in the
+// history is the case: run after the unlock instead, and two concurrent writers
+// can persist ON → OFF while inserting the history rows OFF → ON — the first
+// writer saves and releases, the second saves and inserts, then the first
+// inserts. KillEvents orders by insertion id, so `hap kill-history` and the
+// Pause/Kill tab would then show the newest FSP row as ON while the config says
+// OFF. The lock is the cross-PROCESS one, so the TUI and a concurrent
+// `hap config set` are covered, not just two goroutines.
+//
+// It runs after Save, never inside fn: a hook that fired before the write would
+// record a transition a failed Save never persisted, which is the same bug in
+// the other direction. It returns nothing — a hook is for best-effort work that
+// must not fail a write that already landed.
+//
+// Nothing the hook touches may take this lock, or it deadlocks. Today it writes
+// SQLite, which knows nothing about config.
+func (a *App) updateConfigReloadedThen(ctx context.Context, fn func(*config.Config) error, afterSave func()) (bool, error) {
 	unlock, err := lockFile(a.ConfigPath + ".lock")
 	if err != nil {
 		return false, fmt.Errorf("lock config for editing: %w", err)
@@ -1817,6 +1841,9 @@ func (a *App) updateConfigReloaded(ctx context.Context, fn func(*config.Config) 
 	}
 	if err := config.Save(a.ConfigPath, cfg); err != nil {
 		return false, err
+	}
+	if afterSave != nil {
+		afterSave()
 	}
 	return a.nudge(ctx, control.KindReload), nil
 }
@@ -2309,12 +2336,18 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 		*dst = v
 		return nil
 	}
-	// Set by the FSP case below when the write actually flips the mode; read
-	// after the config write succeeds. Recording lives HERE and not in
-	// SetFullSelfPrompting because `hap config set` and the TUI Config tab both
-	// reach the key without going through that wrapper.
+	// Set by the FSP case below when the write actually flips the mode; read by
+	// the afterSave hook, which runs while the config lock is still held so the
+	// history rows can never be ordered against the transitions they describe.
+	// Recording lives HERE and not in SetFullSelfPrompting because `hap config
+	// set` and the TUI Config tab both reach the key without that wrapper.
 	var fspToggledTo *bool
-	reloaded, err = a.updateConfigReloaded(ctx, func(cfg *config.Config) error {
+	recordToggle := func() {
+		if fspToggledTo != nil {
+			a.recordFSPToggle(ctx, *fspToggledTo)
+		}
+	}
+	return a.updateConfigReloadedThen(ctx, func(cfg *config.Config) error {
 		switch key {
 		case "confidence_thresholds.minimum":
 			return setFloat(&cfg.ConfidenceThresholds.Minimum)
@@ -2740,11 +2773,7 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			return nil
 		}
 		return fmt.Errorf("unknown config field %q", key)
-	})
-	if err == nil && fspToggledTo != nil {
-		a.recordFSPToggle(ctx, *fspToggledTo)
-	}
-	return reloaded, err
+	}, recordToggle)
 }
 
 // SplitCommand splits a command line into argv, honoring single and double
