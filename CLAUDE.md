@@ -317,6 +317,12 @@ whose manifest carries exactly that version).
     wrong-shaped multi-tab LLM answer and leaves it pending WITH the answer attached, and that
     reason is not in `autoAcceptExcludedReasons`) and were simply unreachable while the guard
     always said no. Without the gate a bare label is delivered and the row reads `auto_accepted`.
+    The token COUNT alone is not enough, because a token may be a comma group (`1,3`) that only
+    a multi-select tab can take: `mcqdeliver.answerTab` does refuse one, but at THAT tab, so a
+    comma group on any tab after the first is caught only after the earlier tabs are already
+    answered and committed — a half-answered form, which is exactly what `verifyTabBaseline`'s
+    all-or-nothing contract exists to prevent. The captured frames carry each tab's mode, so
+    the shape is checked against `domain.MultiSelectTab(frames[i])` before anything is pressed.
   - `domain.MCQFormFullyUnanswered` — no `☒` in the live header. Answering a tab flips it while
     the form still stands, delivery resets to tab 1 and retypes EVERY tab, and an answered
     single-select tab has no `CheckedOutside` equivalent to catch it later. Since
@@ -326,7 +332,10 @@ whose manifest carries exactly that version).
     keeps the TAIL and prefixes `…`, and the incident aggregate was 3606 runes against the 4000
     cap. One more tab and the `[question 1/N]` head is gone; treating "not a complete aggregate"
     as "some other capture" drops straight back into the whole-vs-frame comparison — the
-    original bug, silently restored.
+    original bug, silently restored. A long enough FINAL frame leaves no marker at all, so the
+    `excerptTruncationMarker` prefix is checked as well — it is then the only surviving evidence
+    that the row is a mangled capture rather than a different kind of capture, which is why the
+    marker is one shared constant with a test pinning writer and reader together.
 
   All four refuse as `heldStillUnevaluable` (PENDING), never `heldStillNo`: a malformed answer,
   a half-answered form and a mangled capture each need a human, not a dismissal. A row carrying
@@ -350,9 +359,21 @@ whose manifest carries exactly that version).
   column (`trimPreviewColumn`). The cut only ever removes a SUFFIX, which is what keeps it away
   from the checkbox rule below: a `[ ]`/`[✔]` marker is a PREFIX and always survives it, and a
   label that is nothing but preview text carried no checkbox to lose. A bare `─` is excluded
-  from the glyph set on purpose — agents draw full-width separator rules with it. What is not
-  recovered is the wrapped continuation on the next line, so a wrapped option is identified by
-  its first line rather than misidentified by the box beside it.
+  from the glyph set on purpose — agents draw full-width separator rules with it.
+  **A label that trims to nothing is recovered from the next row, never dropped**
+  (`wrappedOptionLabel`): a long enough label starts BELOW its number, leaving that number's row
+  carrying only the box, and dropping it loses a choice the agent is really offering — the
+  option set reads one short and a reply of "2" maps to nothing. Recovery takes the FIRST
+  continuation row only, gated on that row carrying a preview column, because an ordinary menu's
+  indented line under an option is a DESCRIPTION and not part of the label (the repo's own 3-tab
+  fixture renders that way, so getting it wrong would rewrite every existing choice signature).
+  Wrapped rows are deliberately NOT stitched into one label: a terminal wrap is lossy —
+  `…enabl`+`ed` is a mid-word cut needing no separator while `…the very`+`top` lost a space to
+  the break, and measured on the real capture the two differ only by how near the gutter the
+  text ends (4 columns versus 6), which is a property of one terminal width, not a rule. One row
+  per label is stable, deterministic and never invented. Keep
+  `TestWrappedPreviewOptionIsNotDropped` / `TestWrappedLabelsAreNotStitchedTogether` /
+  `TestOrdinaryMenuDescriptionIsNotAnOptionLabel`.
 - **A checkbox tab is answered by TOGGLING, so its baseline is a safety control** — a digit
   flips a `[ ]`/`[✔]` box rather than selecting it, so pressing one blind is not idempotent:
   over a pane already carrying an attempt's toggles it CLEARS them and the advance submits an

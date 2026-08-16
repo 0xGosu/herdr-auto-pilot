@@ -233,6 +233,109 @@ func TestAutoAcceptRefusesASuggestionThatIsNotAnAnswerSeries(t *testing.T) {
 	}
 }
 
+// TestAutoAcceptRefusesACommaGroupOnASingleSelectTab: a token may itself be a
+// comma group ("1,3"), which only a multi-select tab can take, so counting
+// tokens is not enough. Delivery does refuse one — but at THAT tab, so a comma
+// group on any tab after the first is caught only once the earlier tabs have
+// been answered and committed, leaving the form half-answered.
+func TestAutoAcceptRefusesACommaGroupOnASingleSelectTab(t *testing.T) {
+	for _, tc := range []struct{ name, suggestion string }{
+		{"first tab", "answer series: 1,2 1 1"},
+		{"middle tab — the one that would half-answer the form", "answer series: 1 1,2 1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, autoAcceptOn)
+			ctx := context.Background()
+			h.herdr.setFrames(mcqFrames) // every tab single-select
+			id := seedAgedSweptEscalation(t, h, "pA", mcqFrames, tc.suggestion, 20*time.Minute)
+
+			h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+			rec := auditRow(t, h, id)
+			if rec.Status != "escalated" {
+				t.Fatalf("status = %q, want it left pending (rationale %q)", rec.Status, rec.Rationale)
+			}
+			if got := h.herdr.keysSent(); len(got) != 0 {
+				t.Errorf("no keystroke may land for %q, got %v", tc.suggestion, got)
+			}
+		})
+	}
+}
+
+// TestAutoAcceptAllowsACommaGroupOnAMultiSelectTab is the other half: the check
+// is about the tab's MODE, not about commas. A multi-select tab legitimately
+// takes several digits, and refusing those would disable the feature for every
+// checkbox form.
+func TestAutoAcceptAllowsACommaGroupOnAMultiSelectTab(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	ctx := context.Background()
+	h.herdr.setFrames(mcqMultiFrames) // tab 2 carries checkboxes
+	id := seedAgedSweptEscalation(t, h, "pA", mcqMultiFrames, "answer series: 1 1,3 1", 20*time.Minute)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	rec := auditRow(t, h, id)
+	if strings.Contains(rec.Rationale, domain.ReasonAutoDismissStale) {
+		t.Fatalf("a valid multi-select series was dismissed: %q", rec.Rationale)
+	}
+	if rec.Status == "escalated" {
+		t.Fatalf("a valid multi-select series was refused; rationale %q", rec.Rationale)
+	}
+}
+
+// TestAutoAcceptLeavesAFullyTruncatedAggregatePending: truncateTailRunes keeps
+// the TAIL, so a long enough final frame leaves NO "[question N/M]" marker at
+// all. The "…" prefix is then the only surviving evidence that the row is a
+// mangled capture rather than a different kind of capture — without it this
+// falls through to the aggregate-vs-frame comparison and stale-dismisses a live
+// form, which is the original bug.
+func TestAutoAcceptLeavesAFullyTruncatedAggregatePending(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	ctx := context.Background()
+	h.herdr.setFrames(mcqFrames)
+	// A tail with every marker gone — what a >4000-rune final frame produces.
+	full := domain.AggregateMCQFrames(mcqFrames)
+	tail := full[strings.LastIndex(full, "Ready to submit"):]
+	truncated := excerptTruncationMarker + tail
+	if domain.LooksLikeAggregatedMCQ(truncated) {
+		t.Fatalf("fixture still carries a marker; it does not model the gap: %q", truncated)
+	}
+	sig := domain.ComputeSignature(sweptSituationFrom(t, mcqFrames))
+	id, err := h.raw.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "pA", AgentType: "claude", Trigger: "status",
+		SituationType: domain.SituationChoice, Action: domain.AuditActionEscalated,
+		Status: "escalated", Rationale: "[shadow_mode] learning this signature",
+		Suggestion: "answer series: 1 1 1", PaneExcerpt: truncated,
+		CreatedAt: time.Now().Add(-20 * time.Minute),
+	}.WithSignatureBaseline(sig))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	rec := auditRow(t, h, id)
+	if rec.Status != "escalated" {
+		t.Fatalf("status = %q, want it left pending (rationale %q)", rec.Status, rec.Rationale)
+	}
+	if strings.Contains(rec.Rationale, domain.ReasonAutoDismissStale) {
+		t.Errorf("a truncated capture was dismissed as stale: %q", rec.Rationale)
+	}
+}
+
+// TestExcerptTruncationMarkerIsWhatTruncationWrites keeps the reader above and
+// the writer in daemon.go from drifting apart — the guard's only evidence is
+// this exact prefix.
+func TestExcerptTruncationMarkerIsWhatTruncationWrites(t *testing.T) {
+	got := truncateTailRunes(strings.Repeat("x", snapshotMaxRunes+10), snapshotMaxRunes)
+	if !strings.HasPrefix(got, excerptTruncationMarker) {
+		t.Fatalf("truncateTailRunes no longer prefixes %q: %.20q", excerptTruncationMarker, got)
+	}
+	if strings.HasPrefix(truncateTailRunes("short", snapshotMaxRunes), excerptTruncationMarker) {
+		t.Error("an untruncated excerpt must not carry the marker")
+	}
+}
+
 // TestAutoAcceptLeavesAPartAnsweredFormAlone: answering a tab flips its ☐ to ☒
 // while the form still stands, and delivery resets to tab 1 and retypes EVERY
 // tab — so a form somebody is halfway through must never be treated as

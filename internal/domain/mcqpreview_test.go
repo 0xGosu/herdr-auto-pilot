@@ -129,6 +129,83 @@ func TestPreviewColumnIsNeverAnOptionLabel(t *testing.T) {
 	}
 }
 
+// TestWrappedPreviewOptionIsNotDropped: in the two-column rendering a long
+// label can start on the row BELOW its number, leaving the number's row
+// carrying only the preview box. Trimming the box empties that label, and
+// dropping the option would lose a choice the agent is really offering — the
+// set reads one short and a reply of "2" maps to nothing.
+func TestWrappedPreviewOptionIsNotDropped(t *testing.T) {
+	aggregate := readFixture(t, "mcq_preview_aggregate.txt")
+	opts := ParseNumberedOptions(aggregate)
+
+	// The real capture's question 1 offers TWO spellings; option 2's own row
+	// carries nothing but the preview box.
+	var q1 []NumberedOption
+	for _, o := range opts {
+		if strings.HasPrefix(o.Label, "full_self_prompting.enabl") {
+			q1 = append(q1, o)
+		}
+	}
+	if len(q1) != 2 {
+		t.Fatalf("question 1 parsed to %d options, want 2: %+v", len(q1), q1)
+	}
+	if q1[0].Number != "1" || q1[1].Number != "2" {
+		t.Errorf("numbers = %q/%q, want 1/2", q1[0].Number, q1[1].Number)
+	}
+	// Recovered from the continuation row, with no preview text in it.
+	if q1[1].Label != "full_self_prompting.enable" {
+		t.Errorf("option 2 label = %q, want the continuation row's text", q1[1].Label)
+	}
+	// A digit reply must now map — the practical loss when the option is gone.
+	if got, ok := MenuKeystrokeFrom(q1, "2"); !ok || got != "2" {
+		t.Errorf("MenuKeystrokeFrom(2) = %q,%v; a recovered option must be selectable", got, ok)
+	}
+}
+
+// TestWrappedLabelsAreNotStitchedTogether pins the deliberate limitation. A
+// terminal wrap is lossy — `…enabl`+`ed` is a mid-word cut needing no
+// separator while `…the very`+`top` lost a space to the break, and the two are
+// indistinguishable afterwards (measured on the real capture they differ only
+// by how near the gutter the text ends, 4 columns versus 6, which is a
+// property of one terminal width). So a wrapped label stays identified by ONE
+// row rather than reassembled from a guess.
+func TestWrappedLabelsAreNotStitchedTogether(t *testing.T) {
+	opts := ParseNumberedOptions(readFixture(t, "mcq_preview_aggregate.txt"))
+	for _, o := range opts {
+		if strings.Contains(o.Label, "verytop") || strings.Contains(o.Label, "very top") {
+			t.Errorf("option label was stitched across rows: %q", o.Label)
+		}
+	}
+	// Each label is exactly one row's text.
+	for _, want := range []string{"full_self_prompting.enabl", "Own section at the very"} {
+		found := false
+		for _, o := range opts {
+			if o.Label == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected single-row label %q among %+v", want, opts)
+		}
+	}
+}
+
+// TestOrdinaryMenuDescriptionIsNotAnOptionLabel: the continuation recovery must
+// not reach into a PLAIN menu, whose indented line under an option is a
+// description, not part of the label. The repo's own 3-tab fixture renders this
+// way, so getting it wrong would rewrite every existing choice signature.
+func TestOrdinaryMenuDescriptionIsNotAnOptionLabel(t *testing.T) {
+	const plain = "❯ 1. sqlite (Recommended)\n     single file, zero ops\n  2. postgres\n     needs a server\n"
+	var got []string
+	for _, o := range ParseNumberedOptions(plain) {
+		got = append(got, o.Label)
+	}
+	want := []string{"sqlite (Recommended)", "postgres"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("labels = %q, want %q", got, want)
+	}
+}
+
 // TestPreviewColumnTrimLeavesOrdinaryMenusAlone: the cut must be invisible to
 // every menu that has no preview column, which is all of them outside
 // AskUserQuestion.

@@ -110,18 +110,58 @@ var checkedOptionRE = regexp.MustCompile(`(?m)^([ \t]*(?:[❯›>][ \t]*)?(?:\d+
 // ParseNumberedOptions extracts the numbered options from pane content in
 // display order (e.g. "❯ 1. Yes\n  2. No" → [{"1","Yes"},{"2","No"}]).
 func ParseNumberedOptions(content string) []NumberedOption {
+	lines := strings.Split(content, "\n")
 	var opts []NumberedOption
-	for _, m := range numberedOptionRE.FindAllStringSubmatch(content, -1) {
+	for i, line := range lines {
+		m := numberedOptionRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
 		num := m[1]
 		if num == "" {
 			num = m[2]
 		}
 		label := strings.TrimSpace(trimPreviewColumn(m[3]))
+		if label == "" && i+1 < len(lines) {
+			label = wrappedOptionLabel(lines[i+1])
+		}
 		if num != "" && label != "" {
 			opts = append(opts, NumberedOption{Number: num, Label: label})
 		}
 	}
 	return opts
+}
+
+// wrappedOptionLabel recovers the label of a preview-layout option whose text
+// wrapped ENTIRELY off its own line.
+//
+// In the two-column rendering the option number and the option text are not
+// guaranteed to share a line: a long enough label starts on the row below its
+// number, leaving the number's row carrying nothing but the preview box beside
+// it (`  2.` + gutter + `│ enabled = true │`). Trimming the box then leaves an
+// empty label, and dropping the option loses a choice the agent is really
+// offering — the option set reads one short, and a reply of "2" maps to
+// nothing.
+//
+// It recovers the FIRST continuation row only, and deliberately does not stitch
+// wrapped rows back into one label. A terminal wrap is lossy: `…enabl` + `ed`
+// is a mid-word cut that must be rejoined with no separator, while
+// `…the very` + `top` lost a space to the break — and the two are not
+// distinguishable after the fact. Measured on the real capture the two shapes
+// differ only in how close the text ends to the gutter (4 columns versus 6),
+// which is a property of one terminal width, not a rule. So a wrapped label
+// stays identified by one row: stable, deterministic, and never invented.
+func wrappedOptionLabel(next string) string {
+	if numberedOptionRE.MatchString(next) {
+		return "" // the following option, not a continuation of this one
+	}
+	if previewColumnRE.FindStringIndex(next) == nil {
+		// No preview column, so this is not the two-column block — and an
+		// ordinary menu's indented description line ("single file, zero ops"
+		// under "sqlite") is NOT part of its option's label.
+		return ""
+	}
+	return strings.TrimSpace(trimPreviewColumn(next))
 }
 
 // previewColumnRE matches where a preview box column begins on a rendered

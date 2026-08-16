@@ -967,7 +967,9 @@ func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane stri
 		// Excerpt retention cannot produce the empty case: PruneAuditExcerpts
 		// excludes 'escalated' and 'auto_accepting' at any age because this pass
 		// reads the column.
-		if strings.TrimSpace(rec.PaneExcerpt) == "" || domain.LooksLikeAggregatedMCQ(rec.PaneExcerpt) {
+		if strings.TrimSpace(rec.PaneExcerpt) == "" ||
+			domain.LooksLikeAggregatedMCQ(rec.PaneExcerpt) ||
+			strings.HasPrefix(rec.PaneExcerpt, excerptTruncationMarker) {
 			slog.Debug("auto-accept: multi-tab form on screen but the row carries no usable capture; leaving pending",
 				"audit_id", rec.ID, "agent", rec.AgentID, "excerpt_runes", len([]rune(rec.PaneExcerpt)))
 			return heldStillUnevaluable, true
@@ -991,11 +993,29 @@ func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane stri
 	// `unfamiliar_options` and left pending with its answer attached), and
 	// before this guard learned to say yes they were simply never reachable.
 	// Unevaluable, not stale: a malformed answer needs a human, not a dismissal.
-	if seq, ok := domain.ParseDigitSeries(suggestion); !ok || len(seq) != state.AnswerCount {
+	groups, isSeries := domain.ParseTabSelections(suggestion)
+	if !isSeries || len(groups) != state.AnswerCount {
 		slog.Debug("auto-accept: the suggestion is not an answer series for this form; leaving pending",
 			"audit_id", rec.ID, "agent", rec.AgentID, "tabs", state.AnswerCount,
 			"suggestion", truncateRunes(suggestion, 60))
 		return heldStillUnevaluable, true
+	}
+	// The token COUNT is not enough: a token may itself be a comma group
+	// ("1,3"), which only a multi-select tab can take. Delivery does refuse one
+	// on a single-select tab, but it refuses at that tab — so a comma group on
+	// any tab after the first is caught only once the earlier tabs have already
+	// been answered and committed, leaving the form half-answered. That breaks
+	// the all-or-nothing contract verifyTabBaseline exists to keep, and the
+	// half-answered form then trips the unanswered gate above on every later
+	// tick. Cheaper and safer to never start: the captured frames carry each
+	// tab's select mode, so check the shape here and leave it for the operator.
+	for i, group := range groups {
+		if len(group) > 1 && !domain.MultiSelectTab(frames[i]) {
+			slog.Debug("auto-accept: the suggestion selects several options on a single-select tab; leaving pending",
+				"audit_id", rec.ID, "agent", rec.AgentID, "tab", i+1,
+				"suggestion", truncateRunes(suggestion, 60))
+			return heldStillUnevaluable, true
+		}
 	}
 	// Someone has already begun answering. Delivery resets to tab 1 and retypes
 	// EVERY tab, and an answered single-select tab is not re-checked the way a
