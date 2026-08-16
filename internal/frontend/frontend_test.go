@@ -2427,7 +2427,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		// false on purpose: enabling is gated on runtime preconditions (10
 		// graduated rules, llm.command) this shared fixture does not meet.
 		// The enable path is exercised in fsp_test.go.
-		"escalations.full_self_prompting.enabled": "false",
+		"full_self_prompting.enabled":             "false",
 		"safety.disable_never_auto_seed_patterns": "true",
 		"llm.command":                              `claude -p "decide"`,
 		"llm.command_start":                        `claude -p "first: decide"`,
@@ -5604,16 +5604,21 @@ func TestAuditStatusLabelDistinguishesMachineFromOperator(t *testing.T) {
 // settable through `hap config set`. Every entry needs a reason; the default
 // answer for a new key is to REGISTER it, not to add it here.
 //
-// All three entries today are deprecated aliases kept only so an existing
-// config.toml still loads and migrates onto the canonical key. Offering them
-// for WRITING would let an operator author the very key we are migrating away
-// from. They are listed explicitly rather than left to fall through the walk,
-// because two of them are pointers and would otherwise be skipped for their
-// SHAPE rather than for this reason.
+// Every entry today is a deprecated alias kept only so an existing config.toml
+// still loads and migrates onto the canonical key. Listing one here keeps it
+// out of the REGISTRY, which is what `hap config fields` prints and the TUI
+// Config tab renders — an operator must never be shown the spelling we are
+// migrating away from. A key may still RESOLVE when typed (see
+// frontend.CanonicalConfigKey); resolving writes the canonical field, so the
+// old spelling is never authored back into config.toml either way. They are
+// listed explicitly rather than left to fall through the walk, because most are
+// pointers and would otherwise be skipped for their SHAPE rather than for this
+// reason.
 var configKeysExemptFromRegistry = map[string]string{
-	"llm.rewrite_fallback_template": "deprecated alias for llm.rewrite_action_fallback_template",
-	"llm.auto_act":                  "deprecated alias for llm.auto_act_confidence_threshold",
-	"safety.disable_seed":           "deprecated alias for safety.disable_never_auto_seed_patterns",
+	"llm.rewrite_fallback_template":           "deprecated alias for llm.rewrite_action_fallback_template",
+	"llm.auto_act":                            "deprecated alias for llm.auto_act_confidence_threshold",
+	"safety.disable_seed":                     "deprecated alias for safety.disable_never_auto_seed_patterns",
+	"escalations.full_self_prompting.enabled": "deprecated alias for full_self_prompting.enabled",
 }
 
 // tomlScalarKeys reports every key BurntSushi/toml would accept as a SCALAR

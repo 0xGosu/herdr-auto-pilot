@@ -433,7 +433,7 @@ func (d *Daemon) autoAcceptAgentSuppressed(ctx context.Context, agentID string) 
 // escalation flow, logged once per degradation episode. The config is never
 // rewritten: the operator's intent stands, and status surfaces the blockage.
 func (d *Daemon) fspActive(ctx context.Context, cfg config.Config) bool {
-	if !cfg.Escalations.FullSelfPrompting.Enabled {
+	if !cfg.FullSelfPrompting.Enabled {
 		return false
 	}
 	reason := ""
@@ -525,7 +525,7 @@ func (d *Daemon) maybeFSPAcceptNow(ctx context.Context, auditID int64,
 	// Free, in-memory, and false for every install that never opted in: keep
 	// it out of the goroutine so the common path costs nothing.
 	cfg, _, _ := d.snapshot()
-	if !cfg.Escalations.FullSelfPrompting.Enabled {
+	if !cfg.FullSelfPrompting.Enabled {
 		return
 	}
 	if !d.acquirePane(agentID) {

@@ -545,7 +545,15 @@ type ReadStore interface {
 	// window — what a delete actually erases. Never derive that count from
 	// DecisionsForSignature's capped slice.
 	CountDecisionsForSignature(ctx context.Context, signature string) (int, error)
+	// LatestKillEvent returns the newest row of the GLOBAL kill-switch stream
+	// only (domain.KillScopeGlobal). kill_events also carries full
+	// self-prompting toggles, and an implementation that returned the newest
+	// row of ANY scope would answer "is automation halted" with an FSP toggle —
+	// resuming a paused daemon the moment the mode is switched off. Test fakes
+	// must filter too, or they pass a case that should fail.
 	LatestKillEvent(ctx context.Context) (*domain.KillEvent, error)
+	// KillEvents returns the merged automation history (both scopes), newest
+	// first — what the Pause/Kill tab and `hap kill-history` render.
 	KillEvents(ctx context.Context, limit int) ([]domain.KillEvent, error)
 	AuditLog(ctx context.Context, limit int) ([]domain.AuditRecord, error)
 	GetAudit(ctx context.Context, id int64) (*domain.AuditRecord, error)

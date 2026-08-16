@@ -61,7 +61,7 @@ func TestSetFullSelfPromptingRefusesWithoutPreconditions(t *testing.T) {
 	if err2 != nil {
 		t.Fatal(err2)
 	}
-	if cfg.Escalations.FullSelfPrompting.Enabled {
+	if cfg.FullSelfPrompting.Enabled {
 		t.Fatal("refused enable still persisted enabled=true")
 	}
 }
@@ -122,7 +122,7 @@ func TestSetFullSelfPromptingEnablesWhenPreconditionsHold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Escalations.FullSelfPrompting.Enabled {
+	if !cfg.FullSelfPrompting.Enabled {
 		t.Fatal("enable did not persist")
 	}
 	status, err := app.GetStatus(ctx)
@@ -161,7 +161,7 @@ func TestSetFullSelfPromptingDisableAlwaysSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Escalations.FullSelfPrompting.Enabled {
+	if cfg.FullSelfPrompting.Enabled {
 		t.Fatal("disable did not persist")
 	}
 }
@@ -228,5 +228,153 @@ func TestFSPStatusFailsClosedOnUnreadableCount(t *testing.T) {
 	}
 	if !strings.Contains(status.FullSelfPromptingBlocked, "unreadable") {
 		t.Errorf("FullSelfPromptingBlocked = %q, want it to name the unreadable count", status.FullSelfPromptingBlocked)
+	}
+}
+
+// fspHistory returns the full self-prompting rows of the automation history,
+// newest first.
+func fspHistory(t *testing.T, app *frontend.App) []domain.KillEvent {
+	t.Helper()
+	events, err := app.KillHistory(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []domain.KillEvent
+	for _, e := range events {
+		if e.Scope == domain.KillScopeFSP {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestFSPToggleRecordsAKillEvent: granting the daemon blanket autonomy is the
+// change an operator most needs a trail of, so each flip lands in the same
+// history the Pause/Kill tab renders — scoped so it can never be read as a
+// kill-switch row.
+func TestFSPToggleRecordsAKillEvent(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	setLLMCommand(t, app)
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules)
+
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SetFullSelfPrompting(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := fspHistory(t, app)
+	if len(rows) != 2 {
+		t.Fatalf("full self-prompting history = %d rows, want 2 (on, off)", len(rows))
+	}
+	if rows[0].State != domain.KillStateFSPOff || rows[1].State != domain.KillStateFSPOn {
+		t.Fatalf("history states = %q, %q; want fsp_off newest then fsp_on", rows[0].State, rows[1].State)
+	}
+	for _, r := range rows {
+		if r.Author == "" {
+			t.Errorf("row %d recorded no author", r.ID)
+		}
+	}
+	// The kill switch was never touched, so it must still read as running.
+	latest, err := st.LatestKillEvent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest != nil {
+		t.Fatalf("a full self-prompting toggle wrote into the kill-switch stream: %+v", latest)
+	}
+}
+
+// TestFSPSetToSameValueRecordsNothing mirrors Pause/Resume's no-flood rule: a
+// write that changes nothing is not history. Without it, every TUI config-tab
+// save of the unchanged field would add a row.
+func TestFSPSetToSameValueRecordsNothing(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	setLLMCommand(t, app)
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules)
+
+	// Off → off, twice: neither is a change.
+	if err := app.SetFullSelfPrompting(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SetFullSelfPrompting(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if rows := fspHistory(t, app); len(rows) != 0 {
+		t.Fatalf("a no-op write recorded %d history row(s)", len(rows))
+	}
+
+	// On, then on again: only the first is a change.
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if rows := fspHistory(t, app); len(rows) != 1 {
+		t.Fatalf("full self-prompting history = %d rows, want 1 (the re-enable is a no-op)", len(rows))
+	}
+}
+
+// TestFSPToggleThroughConfigSetIsRecorded is the reason recording lives in
+// SetField rather than in SetFullSelfPrompting: `hap config set` and the TUI
+// Config tab both reach the key WITHOUT the wrapper, and a trail that misses
+// them is worse than none — it reads as "nobody turned this on".
+func TestFSPToggleThroughConfigSetIsRecorded(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	setLLMCommand(t, app)
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules)
+
+	if _, err := app.SetField(ctx, frontend.FSPFieldKey, "true"); err != nil {
+		t.Fatal(err)
+	}
+	rows := fspHistory(t, app)
+	if len(rows) != 1 || rows[0].State != domain.KillStateFSPOn {
+		t.Fatalf("config-set toggle history = %+v, want one fsp_on row", rows)
+	}
+}
+
+// TestFSPRefusedEnableRecordsNothing: a refused enable changed nothing, so it
+// must not leave a row claiming the mode was turned on.
+func TestFSPRefusedEnableRecordsNothing(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+
+	if err := app.SetFullSelfPrompting(ctx, true); err == nil {
+		t.Fatal("enable succeeded with no preconditions met")
+	}
+	if rows := fspHistory(t, app); len(rows) != 0 {
+		t.Fatalf("a refused enable recorded %d history row(s)", len(rows))
+	}
+}
+
+// TestPausedKillSwitchSurvivesAnFSPToggle is the end-to-end shape of the store's
+// scope filter, at the layer the operator actually drives: pause, then switch
+// full self-prompting off, and automation must still report itself paused.
+func TestPausedKillSwitchSurvivesAnFSPToggle(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	setLLMCommand(t, app)
+	seedGraduatedRules(t, st, config.MinFSPGraduatedRules)
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Pause(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SetFullSelfPrompting(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := app.GetStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Paused {
+		t.Fatal("switching full self-prompting off resumed a paused daemon")
 	}
 }

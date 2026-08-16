@@ -776,6 +776,114 @@ func TestKillEventLatestWins(t *testing.T) {
 	}
 }
 
+// TestLatestKillEventIgnoresNonGlobalScope is the safety invariant behind
+// sharing kill_events with the full self-prompting stream: LatestKillEvent
+// answers "is automation halted", and the only rows that answer it are the
+// global kill-switch ones.
+//
+// Without the scope filter, this exact sequence — pause, then switch full
+// self-prompting off — makes the fsp_off row the newest, KillStateActive reads
+// false, and every daemon caller resumes acting while the operator believes the
+// kill switch is still down. Nothing else in the suite would notice.
+func TestLatestKillEventIgnoresNonGlobalScope(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.InsertKillEvent(ctx, domain.KillEvent{
+		State: domain.KillStateActiveValue, Scope: domain.KillScopeGlobal, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertKillEvent(ctx, domain.KillEvent{
+		State: domain.KillStateFSPOff, Scope: domain.KillScopeFSP, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	latest, err := s.LatestKillEvent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !domain.KillStateActive(latest) {
+		t.Fatalf("a full self-prompting toggle answered the kill-switch read (%+v) — "+
+			"automation resumed itself while paused", latest)
+	}
+	if latest.Scope != domain.KillScopeGlobal {
+		t.Errorf("latest kill event scope = %q, want %q", latest.Scope, domain.KillScopeGlobal)
+	}
+}
+
+// TestLatestKillEventIgnoresAnFSPOnlyHistory: a database that has only ever
+// recorded full self-prompting toggles has no kill-switch state at all, and
+// must report nil rather than the newest FSP row.
+func TestLatestKillEventIgnoresAnFSPOnlyHistory(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.InsertKillEvent(ctx, domain.KillEvent{
+		State: domain.KillStateFSPOn, Scope: domain.KillScopeFSP, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := s.LatestKillEvent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest != nil {
+		t.Fatalf("LatestKillEvent returned a non-global row: %+v", latest)
+	}
+}
+
+// TestKillEventsHistoryIncludesBothScopes: the history reader is deliberately
+// unfiltered — the merged stream is what the Pause/Kill tab shows.
+func TestKillEventsHistoryIncludesBothScopes(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	for _, e := range []domain.KillEvent{
+		{State: domain.KillStateActiveValue, Scope: domain.KillScopeGlobal},
+		{State: domain.KillStateResumed, Scope: domain.KillScopeGlobal},
+		{State: domain.KillStateFSPOn, Scope: domain.KillScopeFSP},
+	} {
+		e.CreatedAt = time.Now()
+		if _, err := s.InsertKillEvent(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := s.KillEvents(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("history = %d rows, want all 3 (both scopes)", len(events))
+	}
+	// Newest first.
+	if events[0].State != domain.KillStateFSPOn || events[0].Scope != domain.KillScopeFSP {
+		t.Errorf("newest row = %+v, want the fsp_on toggle", events[0])
+	}
+}
+
+// TestInsertKillEventDefaultsToGlobalScope pins the legacy shape: rows written
+// before the FSP stream existed carry no explicit scope, and must keep counting
+// as kill-switch rows rather than becoming invisible to LatestKillEvent.
+func TestInsertKillEventDefaultsToGlobalScope(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.InsertKillEvent(ctx, domain.KillEvent{
+		State: domain.KillStateActiveValue, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := s.LatestKillEvent(ctx)
+	if err != nil || latest == nil {
+		t.Fatalf("latest: %+v %v", latest, err)
+	}
+	if !domain.KillStateActive(latest) {
+		t.Fatal("a scope-less pause row stopped halting automation")
+	}
+}
+
 func TestErrorRetryAndAgentRate(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

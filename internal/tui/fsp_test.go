@@ -89,7 +89,7 @@ func TestDoubleRTogglesFullSelfPrompting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Escalations.FullSelfPrompting.Enabled {
+	if !cfg.FullSelfPrompting.Enabled {
 		t.Fatal("double-r did not enable full self-prompting in config")
 	}
 
@@ -195,7 +195,7 @@ func TestDoubleRTogglesFullSelfPromptingOff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Escalations.FullSelfPrompting.Enabled {
+	if cfg.FullSelfPrompting.Enabled {
 		t.Error("rr did not disable the mode")
 	}
 }
@@ -246,7 +246,7 @@ func TestInterveningKeyDisarmsDoubleR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Escalations.FullSelfPrompting.Enabled {
+	if cfg.FullSelfPrompting.Enabled {
 		t.Fatal("r,j,r toggled full self-prompting")
 	}
 }
@@ -281,7 +281,7 @@ func TestDoubleRWhilePausedResumesInsteadOfToggling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Escalations.FullSelfPrompting.Enabled {
+	if cfg.FullSelfPrompting.Enabled {
 		t.Error("rr while paused enabled the mode; enabling is refused while paused")
 	}
 }

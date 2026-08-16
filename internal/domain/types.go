@@ -661,18 +661,77 @@ type CorrectionRecord struct {
 	CreatedAt time.Time
 }
 
-// KillEvent is one row of the append-only pause/kill/resume event log.
+// KillEvent is one row of the append-only automation-history log. It carries
+// two independent streams, told apart by Scope: the global kill switch
+// (pause/resume) and full self-prompting toggles. They share a table because
+// they answer one operator question — "what changed hap's autonomy, and when" —
+// and the Pause/Kill tab renders them interleaved.
 type KillEvent struct {
-	ID        int64
-	State     string // "active" (killed/paused) | "resumed"
-	Scope     string // "global"
+	ID int64
+	// State is scope-specific: KillStateActive/KillStateResumed for
+	// KillScopeGlobal, KillStateFSPOn/KillStateFSPOff for KillScopeFSP.
+	State     string
+	Scope     string // KillScopeGlobal | KillScopeFSP
 	Author    string
 	CreatedAt time.Time
 }
 
-// KillStateActive reports whether the latest kill event halts automation.
+// Kill event scopes and states.
+//
+// The scopes are what keeps the two streams from being read as one another:
+// only KillScopeGlobal rows answer "is automation halted", which is why the
+// store's latest-row read filters on it. An FSP row landing in that answer
+// would resume a paused daemon the moment the operator toggled the mode off.
+const (
+	KillScopeGlobal = "global"
+	KillScopeFSP    = "full_self_prompting"
+
+	// KillStateActiveValue halts automation; anything else in the global scope
+	// does not.
+	KillStateActiveValue = "active"
+	KillStateResumed     = "resumed"
+	KillStateFSPOn       = "fsp_on"
+	KillStateFSPOff      = "fsp_off"
+)
+
+// KillStateActive reports whether the latest kill event halts automation. The
+// caller must pass a KillScopeGlobal row — see ports.KillStore.LatestKillEvent,
+// which is scoped for exactly this reason.
 func KillStateActive(latest *KillEvent) bool {
-	return latest != nil && latest.State == "active"
+	return latest != nil && latest.State == KillStateActiveValue
+}
+
+// KillEventLabel renders one history row's state for an operator-facing list.
+//
+// It reads the SCOPE first because State is scope-specific: no writer can
+// produce one today, but a row carrying state "active" under the full
+// self-prompting scope would otherwise render as "paused" — a full
+// self-prompting toggle wearing the kill switch's label in the merged history,
+// which is the one confusion this stream must never cause. An unrecognized
+// scope or state passes through verbatim rather than being hidden or
+// relabelled: a row written by a newer build must still be readable here.
+//
+// The empty scope reads as global. Legacy rows come back from SQLite carrying
+// the column's 'global' default, but a hand-built KillEvent in a test or a fake
+// does not.
+func KillEventLabel(e KillEvent) string {
+	switch e.Scope {
+	case KillScopeGlobal, "":
+		switch e.State {
+		case KillStateActiveValue:
+			return "paused"
+		case KillStateResumed:
+			return "resumed"
+		}
+	case KillScopeFSP:
+		switch e.State {
+		case KillStateFSPOn:
+			return "FSP On"
+		case KillStateFSPOff:
+			return "FSP Off"
+		}
+	}
+	return e.State
 }
 
 // LLMDecision is a staged submission written by the mcp process.

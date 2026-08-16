@@ -1462,8 +1462,14 @@ func TestConfigTabKeepsEditing(t *testing.T) {
 	if len(m.items) == 0 {
 		t.Fatal("config items should be built from cfg")
 	}
+	// Select the row by KEY rather than assuming it is row 0: which field leads
+	// the Config tab is a display decision that moves (full self-prompting is
+	// pinned there now), and this test is about the edit prompt, not the order.
+	// TestConfigTabShowsFullSelfPromptingFirst owns the ordering.
+	const key = "confidence_thresholds.minimum"
+	m.cursors[tabConfig] = itemIndex(t, m, func(it ruleItem) bool { return it.key == key })
 	m = press(t, m, "enter")
-	if m.prompt == nil || !strings.Contains(m.prompt.label, "set confidence_thresholds.minimum") {
+	if m.prompt == nil || !strings.Contains(m.prompt.label, "set "+key) {
 		t.Fatalf("enter on Config tab should edit the selected field, got %+v", m.prompt)
 	}
 	if !strings.Contains(testModel(t).View(), "Config") {
