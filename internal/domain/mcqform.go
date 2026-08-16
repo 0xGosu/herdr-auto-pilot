@@ -3,6 +3,7 @@ package domain
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -323,6 +324,117 @@ func FirstMCQQuestion(aggregate string) string {
 	}
 	return block
 }
+
+// aggregateMarkerRE matches one AggregateAgentMCQFrames block header
+// ("[question 2/4]" on its own line), capturing the index and the total.
+var aggregateMarkerRE = regexp.MustCompile(`(?m)^\[question (\d+)/(\d+)\]$`)
+
+// AggregatedMCQFrames splits a swept aggregate back into the per-tab form
+// blocks AggregateAgentMCQFrames built it from, reporting false for content
+// that is not one.
+//
+// It exists because the aggregate — not any single frame — is what mints a
+// multi-tab form's signature, so a caller re-reading the pane later holds ONE
+// frame and must not compare it against the whole. Recognition is structural,
+// not a substring test: the markers must run 1..N with N of them, so an agent
+// merely printing "[question 1/4]" in its output cannot pass.
+func AggregatedMCQFrames(aggregate string) ([]string, bool) {
+	locs := aggregateMarkerRE.FindAllStringSubmatchIndex(aggregate, -1)
+	if len(locs) == 0 {
+		return nil, false
+	}
+	total, err := strconv.Atoi(aggregate[locs[0][4]:locs[0][5]])
+	if err != nil || total != len(locs) {
+		return nil, false
+	}
+	frames := make([]string, 0, len(locs))
+	for i, loc := range locs {
+		if n, err := strconv.Atoi(aggregate[loc[2]:loc[3]]); err != nil || n != i+1 {
+			return nil, false
+		}
+		end := len(aggregate)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		frames = append(frames, strings.Trim(aggregate[loc[1]:end], mcqFrameCutset))
+	}
+	return frames, true
+}
+
+// mcqFrameCutset is trimmed from BOTH sides of every frame comparison. Split
+// and normalize must agree on it: the tab header matches with leading
+// whitespace allowed, so trimming spaces on one side only would make a stored
+// frame and a live frame differ by an indent forever, and the form would be
+// dismissed as stale every time with nothing in the fixtures to show why.
+const mcqFrameCutset = "\n \t"
+
+// LooksLikeAggregatedMCQ reports whether content carries an aggregate's block
+// markers at all, whether or not it parses as a complete one.
+//
+// It is the guard against a TRUNCATED capture. Excerpts are stored through
+// truncateTailRunes, which keeps the TAIL and prefixes "…" — and the aggregate
+// from the incident this was written for measures 3606 runes against a 4000
+// cap. One more tab, a wider terminal or a longer preview and the "[question
+// 1/N]" head is gone; AggregatedMCQFrames then sees markers 2..N, correctly
+// refuses to call that a complete aggregate, and a caller treating "not an
+// aggregate" as "some other kind of capture" would fall straight back into the
+// whole-vs-frame comparison this exists to prevent. Callers must therefore ask
+// this before concluding the row is anything else.
+func LooksLikeAggregatedMCQ(content string) bool {
+	return aggregateMarkerRE.MatchString(content)
+}
+
+// MCQFormFullyUnanswered reports whether a live multi-tab render still owes an
+// answer on EVERY question tab — no ☒ in its header.
+//
+// Answering a single-select tab flips its ☐ to ☒ and advances, and ticking a
+// checkbox does the same while the form still stands (verified live
+// 2026-07-20), so a ☒ is positive evidence that someone has already started
+// answering. It is the only such evidence a form carries: an answered
+// single-select tab is NOT re-checked at delivery the way a multi-select tab's
+// boxes are by CheckedOutside, and delivery resets to tab 1 and retypes every
+// tab — so a caller that treats a part-answered form as untouched overwrites
+// the operator's picks. This mirrors the checkbox doctrine: a widened baseline
+// needs evidence, and absent evidence the form must be clean.
+func MCQFormFullyUnanswered(pane string) bool {
+	header, ok := MCQTabHeaderLine(pane)
+	return ok && !strings.Contains(header, "☒")
+}
+
+// NormalizeMCQFrame folds the state a STANDING form legitimately changes while
+// it waits, so two renders of the same form compare equal. Three things move
+// without anything being answered:
+//
+//   - the selection caret, which ↑/↓ move — and which, on a preview tab, a
+//     DIGIT moves too, so hap's own failed delivery attempt moves it;
+//   - the preview box, whose content is a function of the focused option (see
+//     ClaudeTabForm), so folding the caret without folding the box would leave
+//     the entire right-hand column different and defeat the point;
+//   - the checkbox/answered marks, via ClearCheckboxMarks.
+//
+// What survives is the form's identity: the tab header, the question, and each
+// option's own first line. Two forms differing in any of those still compare
+// unequal, which is the property that matters — the caller answers "held
+// still" by typing a learned digit series into the pane.
+//
+// The preview fold is why the caller must ALSO check MCQFormFullyUnanswered:
+// with the marks folded, this function alone cannot tell an untouched form
+// from one the operator is halfway through.
+func NormalizeMCQFrame(frame string) string {
+	frame = ClearCheckboxMarks(frame)
+	lines := strings.Split(frame, "\n")
+	for i, line := range lines {
+		line = mcqOptionCaretRE.ReplaceAllString(line, "${1} ${2}")
+		lines[i] = strings.TrimRight(trimPreviewColumn(line), " \t")
+	}
+	return strings.Trim(strings.Join(lines, "\n"), mcqFrameCutset)
+}
+
+// mcqOptionCaretRE matches the selection caret in front of a numbered option,
+// keeping the surrounding spacing so replacing the glyph with a space leaves
+// the line aligned with its unselected siblings. Anchoring on the option
+// number is what keeps it off an ordinary quoted line beginning with ">".
+var mcqOptionCaretRE = regexp.MustCompile(`(?m)^([ \t]*)[❯›>]([ \t]*(?:\d+[.)]|\[\d+\]))`)
 
 // AggregateMCQFrames merges the per-tab frames captured by the daemon's
 // Right-arrow sweep into one content block — question i/N plus its options,

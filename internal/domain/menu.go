@@ -116,12 +116,53 @@ func ParseNumberedOptions(content string) []NumberedOption {
 		if num == "" {
 			num = m[2]
 		}
-		label := strings.TrimSpace(m[3])
+		label := strings.TrimSpace(trimPreviewColumn(m[3]))
 		if num != "" && label != "" {
 			opts = append(opts, NumberedOption{Number: num, Label: label})
 		}
 	}
 	return opts
+}
+
+// previewColumnRE matches where a preview box column begins on a rendered
+// line: the box's own left edge, either opening the line or standing off from
+// the option text by a gutter of two or more spaces.
+//
+// Only the glyphs that draw a box EDGE are listed. A bare horizontal rule
+// ("─") is excluded on purpose — agents draw full-width separator rules with
+// it, and those are not a column boundary.
+var previewColumnRE = regexp.MustCompile(`(?:\A|[ \t]{2,})[│┌┐└┘├┤┬┴┼╭╮╰╯]`)
+
+// trimPreviewColumn cuts a rendered option label at the preview box column.
+//
+// Claude's AskUserQuestion renders options WITH previews in two columns — the
+// option list left, a preview box for the highlighted option right — and the
+// pane is one flat text grid, so the box lands inside the option's own line
+// (verified live 2026-08-16 against Claude Code on a 4-tab form):
+//
+//	❯ 1. full_self_prompting.enabl    ┌────────────────────────┐
+//	    ed                            │ [full_self_prompting]  │
+//	  2.                              │ enabled = true         │
+//	    full_self_prompting.enable    │                        │
+//
+// Left unhandled, option 1's label carries the box's top edge, and option 2 —
+// whose own text wrapped to the following line — has a label made ENTIRELY of
+// preview content. Both then vary with whatever the box happens to be showing,
+// which is the highlighted option's preview, so merely moving the caret
+// rewrote the option set and with it the situation's signature.
+//
+// The cut only ever removes a SUFFIX, so a leading checkbox marker (which is
+// what OptionCheckStates and the "checked ⊆ chosen" safety rule read) always
+// survives it; a label that is nothing but preview text collapses to empty and
+// its option is dropped by the caller, and such a label never carried a
+// checkbox to lose. What is NOT recovered is the wrapped continuation on the
+// next line — a line-anchored parse cannot reach it — so a wrapped option is
+// identified by its first line rather than misidentified by the box beside it.
+func trimPreviewColumn(label string) string {
+	if loc := previewColumnRE.FindStringIndex(label); loc != nil {
+		label = label[:loc[0]]
+	}
+	return strings.TrimRight(label, " \t")
 }
 
 // OptionLabels returns just the labels of ParseNumberedOptions, for the

@@ -288,6 +288,71 @@ whose manifest carries exactly that version).
   touching these must keep/extend the safety-invariant tests; new destructive-command shapes
   go in `internal/domain/testdata/irreversible_corpus.txt` (CI fails if seed patterns miss a
   corpus entry).
+- **A multi-tab form's baseline is the swept AGGREGATE, so nothing may compare it to one
+  frame** — the pane shows one question at a time, so `sweepFrames` walks every tab and
+  `AggregateMCQFrames` joins them into the `Situation.Content` that mints the signature and is
+  stored as the audit row's `pane_excerpt`. Anything re-reading the pane later holds a SINGLE
+  frame, and the two can never hash alike. That is not a near miss to be absorbed by a
+  tolerance: a `choice` salient is STRUCTURED, so `SignatureHeldStill` compares it exactly and
+  the mismatch reads as proof the situation moved on. Auto-accept's Guard 3 did exactly this
+  and auto-dismissed EVERY multi-tab escalation as `auto_dismiss_stale` — verified live
+  2026-08-16, 22ms after the escalation was raised, against a form that stood for another 17
+  minutes. Deterministic, never intermittent, and invisible because it looked like the feature
+  working. So a frame is compared FRAME-WISE, the way `daemon.seriesStale` and
+  `deliver/codex.go` already do: same tab count, and the live `ExtractAgentMCQForm` equal to
+  one of `AggregatedMCQFrames(excerpt)`. Guard 3 widens that in two ways `seriesStale` does not
+  need, because it runs after a WAIT rather than immediately before the keystrokes — every
+  frame is a candidate (the operator may have tabbed around, and delivery resets to tab 1 with
+  a Left-arrow burst anyway), and both sides go through `domain.NormalizeMCQFrame`.
+  **Each widening buys a gate, and all four are load-bearing** — every one was proved by
+  mutation, and three of them close hazards the widening itself created:
+  - `NormalizeMCQFrame` folds the caret AND the preview box, because on a preview tab the box
+    is a FUNCTION of the focused option and a digit only moves the caret — so hap's own failed
+    attempt repaints the whole right column. Folding the caret alone fixes nothing there. What
+    survives is header + question + each option's first line, which is what keeps two different
+    forms unequal; the caller answers "held still" by typing a digit series into the pane.
+  - The suggestion must be a series of exactly `AnswerCount` digits. Otherwise `deliver.Deliver`
+    never takes the answer-series branch: it falls to the plain-menu path and maps the reply
+    against **whichever tab is visible**. Such rows exist (`unfamiliar_options` rejects a
+    wrong-shaped multi-tab LLM answer and leaves it pending WITH the answer attached, and that
+    reason is not in `autoAcceptExcludedReasons`) and were simply unreachable while the guard
+    always said no. Without the gate a bare label is delivered and the row reads `auto_accepted`.
+  - `domain.MCQFormFullyUnanswered` — no `☒` in the live header. Answering a tab flips it while
+    the form still stands, delivery resets to tab 1 and retypes EVERY tab, and an answered
+    single-select tab has no `CheckedOutside` equivalent to catch it later. Since
+    `NormalizeMCQFrame` folds the marks, this must be asked BEFORE the comparison, not left to
+    it. Same doctrine as the checkbox baseline: a widened baseline needs evidence.
+  - `domain.LooksLikeAggregatedMCQ` — excerpts are stored through `truncateTailRunes`, which
+    keeps the TAIL and prefixes `…`, and the incident aggregate was 3606 runes against the 4000
+    cap. One more tab and the `[question 1/N]` head is gone; treating "not a complete aggregate"
+    as "some other capture" drops straight back into the whole-vs-frame comparison — the
+    original bug, silently restored.
+
+  All four refuse as `heldStillUnevaluable` (PENDING), never `heldStillNo`: a malformed answer,
+  a half-answered form and a mangled capture each need a human, not a dismissal. A row carrying
+  no aggregate at all is the same (legacy only — retention never blanks these, since
+  `PruneAuditExcerpts` excludes `escalated`/`auto_accepting` at any age). Keep the paired tests
+  (`TestSweptAggregateStillMatchesItsLiveFrame` / `TestNormalizeMCQFrameFoldsAMovedCaretOnAPreviewTab` /
+  `TestMCQFormFullyUnanswered` / `TestLooksLikeAggregatedMCQCatchesATruncatedCapture` /
+  `TestAutoAcceptDeliversAStandingMultiTabForm` / `…DismissesADifferentFormOfTheSameSize` /
+  `…HoldsAFormParkedOnALaterTab` / `…LeavesAMultiTabFormWithNoCapturePending` /
+  `…RefusesASuggestionThatIsNotAnAnswerSeries` / `…LeavesAPartAnsweredFormAlone` /
+  `…LeavesATruncatedAggregatePending` / `TestGuard3HoldsTheRealPreviewForm`), and note that
+  every OTHER multi-tab fixture in this repo renders options without previews — the real
+  captured pair in `internal/domain/testdata/mcq_preview_*.txt` is the only one that reproduces
+  the layout, which is why this shipped green.
+- **An option label stops at the preview column** — Claude renders options WITH previews in two
+  columns (option list left, preview box right) and a pane is one flat text grid, so the box
+  lands inside the option's own line. Line-anchored parsing therefore made option 1's label
+  carry the box's top edge and gave an option whose text WRAPPED a label made entirely of
+  preview content — labels that then changed whenever the highlighted preview did, so the same
+  question minted a new signature on every caret move. `ParseNumberedOptions` cuts at the box
+  column (`trimPreviewColumn`). The cut only ever removes a SUFFIX, which is what keeps it away
+  from the checkbox rule below: a `[ ]`/`[✔]` marker is a PREFIX and always survives it, and a
+  label that is nothing but preview text carried no checkbox to lose. A bare `─` is excluded
+  from the glyph set on purpose — agents draw full-width separator rules with it. What is not
+  recovered is the wrapped continuation on the next line, so a wrapped option is identified by
+  its first line rather than misidentified by the box beside it.
 - **A checkbox tab is answered by TOGGLING, so its baseline is a safety control** — a digit
   flips a `[ ]`/`[✔]` box rather than selecting it, so pressing one blind is not idempotent:
   over a pane already carrying an attempt's toggles it CLEARS them and the advance submits an
