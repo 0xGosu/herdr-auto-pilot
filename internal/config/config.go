@@ -127,6 +127,29 @@ type Escalations struct {
 type FullSelfPrompting struct {
 	// Enabled is the master switch. Defaults to off.
 	Enabled bool `toml:"enabled"`
+	// HonourLimits makes a full self-prompting delivery obey the [limits]
+	// runaway ceilings BEFORE it acts, and stands the whole mode down the
+	// moment one is reached (the daemon writes Enabled=false back to
+	// config.toml and records the toggle).
+	//
+	// Off by default, which is the historical behavior: a delivery advances
+	// the counters (daemon.noteFSPSend) but is never refused by them, so the
+	// mode is bounded only indirectly — one decision later, when the next
+	// Decide raises rate_limited and pauses that ONE agent.
+	//
+	// The ceilings are per-agent while the mode is global, so one runaway
+	// agent turns the mode off for the whole herd. That is deliberate: the
+	// safe direction for a switch that grants blanket autonomy.
+	HonourLimits bool `toml:"honour_limits"`
+	// AcceptGeneratedTask lets full self-prompting act on an idle escalation
+	// whose suggestion is an LLM-GENERATED task ("LLM suggested task: …"),
+	// rather than leaving it for the operator.
+	//
+	// Off by default. Accepting one is not a pane send: it writes the agent's
+	// task list, registers the task source, and hands the first task over — so
+	// it is a materially larger grant than answering a question already on
+	// screen, and it stays opt-in separately from Enabled.
+	AcceptGeneratedTask bool `toml:"accept_generated_task"`
 }
 
 // MinFSPGraduatedRules is how many graduated (autonomous) rules the

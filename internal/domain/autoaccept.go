@@ -81,7 +81,15 @@ func EscalationReason(rationale string) (EscalateReason, bool) {
 //
 // suggestion is the resolved reply (frontend.SuggestedAction's output), passed
 // in rather than derived here because that resolution is a frontend concern.
-func AutoAcceptIneligible(a *AuditRecord, suggestion string) string {
+//
+// allowGeneratedTask lifts ONLY the generated-task refusal, and only for a
+// caller that both opted in and can actually carry it out (full self-prompting
+// with the capability wired). It is a parameter rather than a config read
+// because this package stays pure — and a parameter is also what forces every
+// caller to state its answer, so the default cannot drift open by omission.
+// Nothing else it refuses is affected: the excluded reasons, the noop sentinel
+// and the missing baseline are safety controls, not preferences.
+func AutoAcceptIneligible(a *AuditRecord, suggestion string, allowGeneratedTask bool) string {
 	if a == nil {
 		return "no record"
 	}
@@ -100,7 +108,7 @@ func AutoAcceptIneligible(a *AuditRecord, suggestion string) string {
 	if strings.TrimSpace(suggestion) == "" {
 		return "no suggestion"
 	}
-	if suggestion == SuggestGenerateTask {
+	if suggestion == SuggestGenerateTask && !allowGeneratedTask {
 		return "generated-task suggestion"
 	}
 	if suggestion == ActionNoop {

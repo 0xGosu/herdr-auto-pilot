@@ -2019,10 +2019,37 @@ bound, so an agent that keeps re-raising escalations is answered only until
 `max_auto_prompts_per_minute` / `max_consecutive_auto_prompts` trip, and then
 waits for a human check-in like any other runaway.
 
+By default that bound arrives one decision **late**: a delivery advances the
+counters but is never refused by them, so the ceiling is noticed on the agent's
+next decision and stops that one agent. `honour_limits` makes it strict —
+the ceiling is checked *before* each delivery, nothing is sent once it is
+reached, and the whole mode is switched **off**:
+
 ```toml
 [full_self_prompting]
 enabled = true
+honour_limits = true          # default false
+accept_generated_task = false # default false
 ```
+
+Switching off is real and persistent: hap rewrites `enabled = false` in your
+config, records the change in `hap kill-history` (author `daemon`), and raises a
+notification saying which agent tripped it. Escalations queue for you again
+until you re-enable it. Note the asymmetry worth knowing before you turn this
+on — the ceilings are **per agent** while the mode is **global**, so one runaway
+agent stands the mode down for the whole herd. That is the safe direction for a
+switch that grants blanket autonomy, but it does mean a single misbehaving agent
+can end an unattended run.
+
+`accept_generated_task` widens what the mode may act on. Normally an idle
+escalation whose suggestion is an **LLM-generated task** waits for you, because
+accepting one is not answering a question on screen: it writes the agent's task
+list, registers the task source, and hands the first task over. With the key set,
+full self-prompting does that itself — still recording no learning event, and
+still subject to every safety exclusion. In practice it fires less often than you
+might expect: idle situations are compared by raw screen text, which rarely
+matches cleanly enough to prove the situation is unchanged, and hap leaves
+anything it cannot prove for you rather than guessing.
 
 Toggle it with a double-press of `r` in the TUI, or
 `config set full_self_prompting.enabled true`. A single `r` keeps

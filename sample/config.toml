@@ -90,6 +90,21 @@ unclassifiable = "0"       # disabled: hap never understood the screen at all
 # or double-press r in the TUI.
 #[full_self_prompting]
 #enabled = false
+#
+# Refuse a delivery that would cross a [limits] ceiling, instead of
+# noticing one decision later, and switch this whole mode OFF when one
+# is reached (this file is rewritten to enabled = false and the change
+# is recorded in `hap kill-history`). The ceilings are per-agent while
+# the mode is global, so ONE runaway agent stands the mode down for
+# every agent — the safe direction for a blanket-autonomy switch.
+#honour_limits = false
+#
+# Also act on an idle escalation whose suggestion is an LLM-GENERATED
+# task, rather than leaving it for you. Accepting one is not a pane
+# answer: it writes the agent's task list, registers the task source
+# and hands the first task over. Separate from `enabled` because it is
+# a materially larger grant than answering what is already on screen.
+#accept_generated_task = false
 
 # ── Operator LLM (consulted on unknown situations) ──────────────────
 # Omit this whole section to escalate unknown situations directly to you.

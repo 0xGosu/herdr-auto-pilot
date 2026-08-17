@@ -453,6 +453,25 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 
 	socketPath := herdr.SocketPath()
 
+	// The front-end App, built here purely to lend the daemon two capabilities
+	// that live on the operator surface: accepting an LLM-generated task
+	// (checklist writes, task-source registration) and switching full
+	// self-prompting off in config.toml. Both are optional seams — the daemon
+	// degrades gracefully when they are nil — so this is the ONLY place the two
+	// layers meet, and the daemon package still does not import the front end.
+	//
+	// Author "daemon" so the automation history says who switched the mode off;
+	// an operator reading `hap kill-history` must not see their own name
+	// against a machine's decision.
+	fspApp := &frontend.App{
+		Store:       st,
+		Herdr:       cliAdapter,
+		ConfigPath:  paths.File(),
+		ControlPath: paths.ControlSocketPath(),
+		Author:      "daemon",
+		StateDir:    paths.StateDir,
+	}
+
 	d, err := daemon.New(daemon.Options{
 		ConfigPath:        paths.File(),
 		ControlSocketPath: paths.ControlSocketPath(),
@@ -467,8 +486,13 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		Notify:          herdr.NewFallbackNotifier(socketPath, cliAdapter),
 		LLMFactory:      llmFactory,
 		EmbedderFactory: embedderFactory,
-		MatchIndexDir:   filepath.Join(paths.StateDir, "match-index"),
-		StateDir:        paths.StateDir,
+		// Full self-prompting's two opt-in behaviors. Both are gated on their
+		// own config key inside the daemon; wiring them here only makes them
+		// POSSIBLE.
+		AcceptGeneratedTask: fspApp.AcceptGeneratedTaskAutomatically,
+		DisableFSP:          fspApp.DisableFullSelfPromptingWithReason,
+		MatchIndexDir:       filepath.Join(paths.StateDir, "match-index"),
+		StateDir:            paths.StateDir,
 		// Hand the herd to the binary that replaced ours (plugin upgrade)
 		// instead of soldiering on with children we can no longer spawn.
 		//

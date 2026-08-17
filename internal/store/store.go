@@ -134,6 +134,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	sig_verdict TEXT NOT NULL DEFAULT '',
 	sig_salient_chars INTEGER NOT NULL DEFAULT 0,
 	llm_session_id TEXT NOT NULL DEFAULT '',
+	-- 1 when this row was auto-accepted while full self-prompting was active,
+	-- so an operator can tell FSP's answers from timed auto-accept's (the
+	-- status is 'auto_accepted' for both). 0 on every other row.
+	while_fsp_mode_on INTEGER NOT NULL DEFAULT 0,
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
@@ -301,6 +305,12 @@ func (s *Store) migrate() error {
 		// reported an id — it is bookkeeping, never load-bearing. NOT
 		// backfilled: there is nothing to backfill it FROM.
 		`ALTER TABLE audit_log ADD COLUMN llm_session_id TEXT NOT NULL DEFAULT ''`,
+		// 1 when full self-prompting caused this auto-accept. The status alone
+		// cannot say so — 'auto_accepted' is what timed auto-accept writes too —
+		// and the two have very different meanings to an operator reviewing the
+		// log. NOT backfilled: 0 on every pre-migration row, which reads as
+		// "not attributable to FSP" rather than as a false claim either way.
+		`ALTER TABLE audit_log ADD COLUMN while_fsp_mode_on INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE llm_requests ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
 		// A pre-delivery task review's submission: the ordered checklist edits
@@ -466,14 +476,15 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 			INSERT INTO audit_log (decision_id, agent_id, agent_type, signature, trigger, situation_type,
 				action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
 				corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
-				sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id,
+				while_fsp_mode_on, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
 			a.Action, a.Input, a.Confidence, llmConfArg(a.LLMConfidence), a.Rationale, a.LLMOutput,
 			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt,
 			string(a.MatchMethod), a.MatchScore, a.EmbedError,
 			a.SigRaw, a.SigSalient, string(a.SigVerdict), a.SigSalientChars,
-			a.LLMSessionID, unix(a.CreatedAt))
+			a.LLMSessionID, a.WhileFSPModeOn, unix(a.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -1377,8 +1388,34 @@ func (s *Store) ClaimForAutoAccept(ctx context.Context, auditID int64) (bool, er
 // MarkAutoAccepted finalizes a delivered auto-accept. Guarded on
 // 'auto_accepting' so it can only ever advance the daemon's OWN claim and can
 // never clobber another writer's terminal state.
-func (s *Store) MarkAutoAccepted(ctx context.Context, auditID int64) (bool, error) {
-	return s.guardedStatus(ctx, auditID, domain.AuditStatusAutoAccepting, domain.AuditStatusAutoAccepted)
+//
+// whileFSP records whether full self-prompting caused this delivery, written in
+// the SAME guarded UPDATE as the status so the two can never disagree. It is a
+// required argument rather than a second method precisely so every caller has
+// to answer the question — an FSP delivery that silently recorded false would
+// be indistinguishable from the timed auto-accept it is not.
+//
+// It only ever sets the flag: a false never clears a true. The finalize retry
+// (daemon.retryAutoAcceptFinalize) replays this call on a later tick, and a
+// replay that had lost the flag must not erase what the first attempt recorded.
+func (s *Store) MarkAutoAccepted(ctx context.Context, auditID int64, whileFSP bool) (bool, error) {
+	var claimed bool
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE audit_log SET status = ?, while_fsp_mode_on = (while_fsp_mode_on OR ?)
+			 WHERE id = ? AND status = ?`,
+			domain.AuditStatusAutoAccepted, whileFSP, auditID, domain.AuditStatusAutoAccepting)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		claimed = n > 0
+		return nil
+	})
+	return claimed, err
 }
 
 // RevertAutoAccept returns a claimed escalation to the pending queue after a
@@ -1623,7 +1660,7 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &a.PaneExcerpt,
 			&matchMethod, &a.MatchScore, &a.EmbedError,
 			&a.SigRaw, &a.SigSalient, &sigVerdict, &a.SigSalientChars,
-			&a.LLMSessionID, &created); err != nil {
+			&a.LLMSessionID, &a.WhileFSPModeOn, &created); err != nil {
 			return nil, err
 		}
 		a.MatchMethod = domain.MatchMethod(matchMethod)
@@ -1644,7 +1681,8 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 const auditCols = `id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
 	action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
 	corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
-	sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id, created_at`
+	sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id,
+	while_fsp_mode_on, created_at`
 
 // llmConfArg maps the optional LLM confidence to a SQL argument: nil stores
 // NULL (no LLM score), a value stores the 0-100 score.

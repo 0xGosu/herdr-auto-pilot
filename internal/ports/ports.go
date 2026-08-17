@@ -369,7 +369,9 @@ type DaemonStore interface {
 	// ClaimForAutoAccept moves escalated -> auto_accepting, before delivery.
 	ClaimForAutoAccept(ctx context.Context, auditID int64) (bool, error)
 	// MarkAutoAccepted moves auto_accepting -> auto_accepted, after delivery.
-	MarkAutoAccepted(ctx context.Context, auditID int64) (bool, error)
+	// whileFSP records whether full self-prompting caused it, written in the
+	// same guarded update as the status.
+	MarkAutoAccepted(ctx context.Context, auditID int64, whileFSP bool) (bool, error)
 	// RevertAutoAccept moves auto_accepting -> escalated when delivery failed.
 	RevertAutoAccept(ctx context.Context, auditID int64) (bool, error)
 	// ReclaimAbandonedAutoAccepts returns every row left mid-delivery by a

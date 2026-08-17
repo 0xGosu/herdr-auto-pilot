@@ -408,6 +408,49 @@ whose manifest carries exactly that version).
   `…ConfirmedHandoutIsNeverReclaimed` / `…ReclaimIgnoresForeignInProgressItems` /
   `…OneUnconfirmedHandoutPerAgent` / `…RecycledPaneCannotConfirmItsPredecessorsHandout` /
   `…HandoutCapEscalatesInsteadOfResending`).
+- **Full self-prompting's two opt-in keys are OFF by default, and each buys one narrow
+  thing** — `full_self_prompting.honour_limits` and `…accept_generated_task`
+  (`config.FullSelfPrompting`). Four bounds are load-bearing:
+  - **The ceiling check must not read a PAUSE as a ceiling.** `domain.CheckRate`'s first
+    branch answers `rate_limited` for a paused agent, but `fspCeilingReached` runs BEFORE
+    Guard 1b (`autoAcceptAgentSuppressed`), which already suppresses paused agents
+    correctly. Passing the rate through unmodified would let one operator-paused agent —
+    or a leftover rate-pause from the ordinary decision path — switch the mode off for the
+    whole herd over a state nothing new happened in. The rate is copied with `Paused`
+    cleared, and only the two counters decide.
+  - **The stand-down latches in memory FIRST, writes config second, and the write runs off
+    the select loop.** `App.UpdateConfig` nudges the daemon's own control socket for the
+    reload, so an inline write would block that loop on a round trip to itself. The latch is
+    what makes the sweep that noticed stop immediately, is checked inside `fspActive` so both
+    the sweep and the escalate-time hook honour it through one gate, de-duplicates the write
+    and the operator notification to one per ceiling, and is cleared on reload so a re-enable
+    takes effect (the rate row is untouched, so a ceiling that still stands re-trips at once).
+  - **The attribution is written at FINALIZE, and the finalize RETRY must carry it.**
+    `retryAutoAcceptFinalize` re-calls `MarkAutoAccepted` on a later tick with only the id,
+    so `autoAcceptNeedsFinalize` is `map[int64]bool` (id → was-FSP), not a set — a set drops
+    the flag on exactly the rows whose bookkeeping already failed once. Claim time is NOT an
+    option: `ReclaimAbandonedAutoAccepts` returns abandoned `auto_accepting` rows to
+    `escalated` at startup and would strand a true flag on a row nothing ever delivered. The
+    store ORs the column rather than assigning it, so a replay can only ever set it.
+  - **A generated-task acceptance is the DAEMON's row to finalize.** `autoAcceptOne` has
+    already claimed it (`escalated → auto_accepting`), so the `automated` flag makes
+    `frontend.acceptGeneratedTask` skip BOTH `ResolveEscalation` (whose escalated-guard
+    could now only fail, after the files were written) and `InsertCorrection` — an automatic
+    acceptance must never feed the confidence model, which is the entire reason
+    `AuditStatusAutoAccepted` exists apart from `resolved`. The seams
+    (`Options.AcceptGeneratedTask` / `DisableFSP`) are optional function fields wired in
+    `cmd/hap`, so `internal/daemon` still does not import `internal/frontend`; a nil seam
+    returns the claim rather than stranding the row in the transient status.
+
+  Accepted limitation, not a bug: a generated-task escalation is `idle`-typed, so its
+  baseline salient is unstructured pane-tail and Guard 3 usually answers
+  `heldStillUnevaluable` — the row waits for the operator. Keep the paired tests
+  (`TestFSPHonourLimitsRefusesAtTheCeiling` / `…OffKeepsTodaysBehaviour` /
+  `…IgnoresAPauseThatIsNotACeiling` / `…SwitchesOffOnlyOnce` /
+  `TestFSPCeilingLatchStandsTheModeDownImmediately` / `TestFSPRefusesAGeneratedTaskByDefault` /
+  `TestFSPAcceptsAGeneratedTaskWhenEnabled` / `TestFSPGeneratedTaskWritesNoCorrection` /
+  `TestFSPGeneratedTaskWithNoSeamLeavesItPending` / `TestFSPFinalizeRetryKeepsTheAttribution` /
+  `TestMarkAutoAcceptedNeverClearsTheFlag`).
 - **`enable_auto_send_task_when_idle` skips the LEARNING gates, never the safety ones** —
   a declared task from a source with that flag (`DeclaredTask.Reserve`) resolves ahead of any
   learned noop precedence (`resolveSituation`) and bypasses BOTH the shadow-mode gate and the

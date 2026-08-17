@@ -645,8 +645,13 @@ func newHarnessPaused(t *testing.T, cfgTOML string) (*harness, *pausingAutomatio
 // newHarnessCore wires the daemon with a caller-supplied LLM port (plus the
 // underlying *fakeLLM for assertions), so optional-capability variants
 // (rewriter, task generator) share one setup path.
+// tweak mutates the Options BEFORE New(), which is the only safe moment: the
+// daemon's background goroutines read them the instant Run starts, so a test
+// that assigns d.opt.X afterwards races those reads. Variadic so every existing
+// caller is unaffected.
 func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.HerdrPort,
-	llmPort ports.LLMPort, fl *fakeLLM, wrapStore func(ports.StorePort) ports.StorePort) *harness {
+	llmPort ports.LLMPort, fl *fakeLLM, wrapStore func(ports.StorePort) ports.StorePort,
+	tweak ...func(*Options)) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
@@ -683,7 +688,7 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 
 	// Socket paths must stay short for macOS (104-byte cap).
 	ctlPath := filepath.Join(testutil.SocketDir(t), "control.sock")
-	d, err := New(Options{
+	opts := Options{
 		ConfigPath:        cfgPath,
 		ControlSocketPath: ctlPath,
 		Store:             storePort,
@@ -691,7 +696,11 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 		Events:            fe,
 		Notify:            fh,
 		LLM:               llmPort,
-	})
+	}
+	for _, fn := range tweak {
+		fn(&opts)
+	}
+	d, err := New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}

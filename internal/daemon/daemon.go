@@ -87,6 +87,24 @@ type Options struct {
 	// no I/O, so a reload can swap it atomically without ever holding a
 	// half-built one.
 	TaskStoreFactory func(cfg config.Config) *taskstore.Registry
+	// AcceptGeneratedTask accepts an idle escalation whose suggestion is an
+	// LLM-GENERATED task: it writes the agent's checklist, registers the task
+	// source, and (when send) hands the first task over. It must NOT touch the
+	// audit row's status or write a correction — the caller owns that
+	// lifecycle, having already claimed the row.
+	//
+	// Optional. nil means the capability was never wired, and full
+	// self-prompting leaves such escalations for the operator exactly as it
+	// does today. Supplied by cmd/hap from the front-end App, which is where
+	// the checklist/task-source code lives.
+	AcceptGeneratedTask func(ctx context.Context, auditID int64, send bool) error
+	// DisableFSP switches full self-prompting off in config.toml and records
+	// the toggle in the automation history. Called when a [limits] ceiling is
+	// reached and full_self_prompting.honour_limits is set.
+	//
+	// Optional. nil means the mode can only be stood down in memory, for this
+	// daemon's lifetime.
+	DisableFSP func(ctx context.Context, reason string) error
 	// PaneReadLines is how much recent pane content classification sees.
 	PaneReadLines int
 	// ResolveSelf returns the path of a live hap binary (selfpath.Resolve in
@@ -310,7 +328,12 @@ type Daemon struct {
 	// the candidate query, so without an in-process retry it would stay
 	// invisible until the daemon happened to restart. Retried at the top of
 	// every sweep and cleared the moment it sticks; empty in a healthy daemon.
-	autoAcceptNeedsFinalize map[int64]struct{}
+	//
+	// The VALUE is "was this delivery caused by full self-prompting", carried
+	// because the retry has no other way to know: it runs on a later tick with
+	// only the id, and MarkAutoAccepted records the attribution alongside the
+	// status.
+	autoAcceptNeedsFinalize map[int64]bool
 	// autoAcceptBaselineWarned latches the once-per-run notice that escalations
 	// raised before the signature baseline existed are being skipped.
 	autoAcceptBaselineWarned bool
@@ -319,6 +342,18 @@ type Daemon struct {
 	// holds. Reset on config reload and whenever the preconditions pass
 	// again, so each degradation episode logs exactly once.
 	fspDegradedLogged bool
+	// fspCeilingLatched stops full self-prompting the instant a [limits] ceiling
+	// is reached, without waiting for the config write to land and the reload to
+	// come back — the sweep that noticed must not deliver anything else.
+	//
+	// It also de-duplicates: one ceiling produces one config write and one
+	// operator notification, not one per candidate row.
+	//
+	// Cleared on config reload, which is what lets the operator switch the mode
+	// back on after checking in. That is safe because the ceiling itself is
+	// still there — the rate row is unchanged, so the very next candidate
+	// re-trips it unless the counters were reset by real human interaction.
+	fspCeilingLatched bool
 
 	// snapshotSaved caches which signatures already have a provenance
 	// snapshot this daemon lifetime (guarded by mu), so the hot path skips
@@ -505,7 +540,7 @@ func New(opt Options) (*Daemon, error) {
 		pollRedrive:               map[string]pollRedriveState{},
 		autoAcceptAttempts:        map[int64]int{},
 		autoAcceptAbsent:          map[int64]int{},
-		autoAcceptNeedsFinalize:   map[int64]struct{}{},
+		autoAcceptNeedsFinalize:   map[int64]bool{},
 		snapshotSaved:             map[string]bool{},
 		paneCwds:                  map[string]paneCwdEntry{},
 		paneCwdRefreshing:         map[string]bool{},
@@ -782,6 +817,11 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	// A reload starts a fresh full self-prompting degradation episode: the config (or
 	// the world it described) changed, so the next blocked sweep re-explains.
 	d.fspDegradedLogged = false
+	// Likewise the ceiling stand-down: a reload is how the operator's re-enable
+	// reaches this daemon, and a latch that outlived it would silently ignore
+	// them. The rate row is untouched, so a ceiling that still stands re-trips
+	// on the very next candidate.
+	d.fspCeilingLatched = false
 	d.mu.Unlock()
 
 	d.reloadEmbedder(prev, cfg, first || forceEmbedder)

@@ -127,7 +127,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	for i := range candidates {
 		rec := &candidates[i]
 		suggestion := domain.SuggestedAction(rec)
-		if why := domain.AutoAcceptIneligible(rec, suggestion); why != "" {
+		if why := domain.AutoAcceptIneligible(rec, suggestion, d.acceptGeneratedTaskAllowed(cfg, fsp)); why != "" {
 			// Ineligible is NOT stale: the escalation stays pending for the
 			// operator. The missing-baseline case is logged once per run so an
 			// operator whose pre-upgrade backlog never auto-accepts can find
@@ -151,8 +151,22 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		if d.paneBusy(rec.AgentID) {
 			continue
 		}
+		// The [limits] ceilings, when the operator asked full self-prompting to
+		// obey them. Checked BEFORE the delivery — the historical behavior only
+		// advanced the counters and let the NEXT decision notice, which always
+		// overshoots by one — and a trip stands the whole mode down rather than
+		// merely skipping this row.
+		//
+		// Ends the sweep, not just this row: with the mode standing down, the
+		// zero-wait cutoffs this pass is running under no longer apply to
+		// anything. The remaining candidates keep their pending status and are
+		// reconsidered on a later tick under whatever is configured then.
+		if fsp && d.fspCeilingReached(ctx, cfg, rec.AgentID, now) {
+			d.disableFSPAtCeiling(ctx, rec.AgentID)
+			break
+		}
 
-		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, panes, now); outcome {
+		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp); outcome {
 		case autoAcceptDelivered:
 			handledAgent[rec.AgentID] = true
 			accepted++
@@ -201,8 +215,13 @@ const (
 
 // autoAcceptOne runs the guard chain for a single escalation and, if it passes,
 // claims → delivers → finalizes.
+//
+// fsp says whether full self-prompting is what brought this row here. It steers
+// two things and nothing else: the generated-task branch (which only FSP may
+// take) and the attribution written at finalize. The guard chain is identical
+// either way — the safety exclusions never depend on who is asking.
 func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, suggestion string,
-	live map[string]domain.AgentTransition, panes *paneCache, now time.Time) autoAcceptOutcome {
+	live map[string]domain.AgentTransition, panes *paneCache, now time.Time, fsp bool) autoAcceptOutcome {
 
 	agent, present := live[rec.AgentID]
 	if !present {
@@ -261,7 +280,26 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 		return autoAcceptSkipped
 	}
 
-	if err := d.autoAcceptDeliver(ctx, rec, suggestion); err != nil {
+	// A generated-task suggestion is not a pane send at all: it writes the
+	// agent's checklist, registers the task source and hands the first task
+	// over. Only full self-prompting can reach this branch — eligibility refuses
+	// the suggestion outright for every other flavour — and only through the
+	// seam, whose absence means the capability was never wired (the row simply
+	// waits for the operator).
+	deliver := func() error { return d.autoAcceptDeliver(ctx, rec, suggestion) }
+	if suggestion == domain.SuggestGenerateTask {
+		if !fsp || d.opt.AcceptGeneratedTask == nil {
+			// Nothing was delivered, so return the claim rather than leaving the
+			// row stuck in the transient 'auto_accepting' status.
+			if ok, rerr := d.opt.Store.RevertAutoAccept(ctx, rec.ID); rerr != nil || !ok {
+				slog.Warn("auto-accept: could not return an unhandled generated-task escalation to the queue",
+					"audit_id", rec.ID, "claimed", ok, "error", rerr)
+			}
+			return autoAcceptSkipped
+		}
+		deliver = func() error { return d.opt.AcceptGeneratedTask(ctx, rec.ID, true) }
+	}
+	if err := deliver(); err != nil {
 		return d.autoAcceptDeliveryFailed(ctx, rec, err, now)
 	}
 
@@ -269,7 +307,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	// automatic acceptance contributes no learning event, no confidence and no
 	// graduation progress. A machine's decision to stop waiting is not evidence
 	// the suggestion was right.
-	ok, err := d.opt.Store.MarkAutoAccepted(ctx, rec.ID)
+	ok, err := d.opt.Store.MarkAutoAccepted(ctx, rec.ID, fsp)
 	if err != nil {
 		// The reply LANDED but the row is still 'auto_accepting' — a status
 		// excluded from both the operator's queue and the candidate query. Left
@@ -279,7 +317,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 		// every subsequent tick until it sticks.
 		slog.Warn("auto-accept: finalize failed after a successful delivery; will retry",
 			"audit_id", rec.ID, "error", err)
-		d.noteAutoAcceptNeedsFinalize(rec.ID)
+		d.noteAutoAcceptNeedsFinalize(rec.ID, fsp)
 	} else if !ok {
 		// Zero rows is a no-op, not an error: another writer already moved the
 		// row. This tolerance is what makes the startup reclaim safe when two
@@ -437,6 +475,15 @@ func (d *Daemon) fspActive(ctx context.Context, cfg config.Config) bool {
 	if !cfg.FullSelfPrompting.Enabled {
 		return false
 	}
+	// A ceiling stand-down takes effect immediately, before the config write it
+	// triggered has landed and come back as a reload. Checked here so BOTH the
+	// sweep and the escalate-time hook honour it through one gate.
+	d.mu.Lock()
+	latched := d.fspCeilingLatched
+	d.mu.Unlock()
+	if latched {
+		return false
+	}
 	reason := ""
 	if p := d.llmPort(); p == nil || !p.Configured() {
 		reason = "llm.command is no longer configured"
@@ -462,6 +509,110 @@ func (d *Daemon) fspActive(ctx context.Context, cfg config.Config) bool {
 			"reverting to normal escalation flow until fixed", "reason", reason)
 	}
 	return false
+}
+
+// acceptGeneratedTaskAllowed reports whether an LLM-GENERATED task suggestion
+// may be acted on right now.
+//
+// Three conditions, all required. Full self-prompting must be the flavour
+// running (timed auto-accept never gets this: its contract is answering the
+// question already on screen), the operator must have opted in separately from
+// enabling the mode, and the capability must actually be wired — without the
+// seam there is nothing to accept WITH, and claiming eligibility would only
+// produce a claim this pass then has to hand back.
+func (d *Daemon) acceptGeneratedTaskAllowed(cfg config.Config, fsp bool) bool {
+	return fsp && cfg.FullSelfPrompting.AcceptGeneratedTask && d.opt.AcceptGeneratedTask != nil
+}
+
+// fspCeilingReached reports whether this agent has reached a [limits] runaway
+// ceiling, when full self-prompting is configured to obey them.
+//
+// It deliberately does NOT use domain.CheckRate as-is. CheckRate's first branch
+// answers "false, rate_limited" for a PAUSED agent, and a pause is not a
+// ceiling: the operator may have paused that one agent, or the ordinary
+// decision path may have paused it earlier. Treating that as a ceiling here
+// would stand the whole mode down for the herd over a state Guard 1b
+// (autoAcceptAgentSuppressed) already handles correctly, one row later. So the
+// pause is cleared from the copy handed to CheckRate, and only the two counters
+// decide.
+//
+// Fails CLOSED in the safe direction for this feature: an unreadable rate row
+// reports "not reached", because the alternative is switching the operator's
+// mode off over a transient store error. The delivery it allows is still gated
+// by every other guard in the chain, including the pause read that follows.
+func (d *Daemon) fspCeilingReached(ctx context.Context, cfg config.Config, agentID string, now time.Time) bool {
+	if !cfg.FullSelfPrompting.HonourLimits {
+		return false
+	}
+	rate, err := d.opt.Store.GetAgentRate(ctx, agentID)
+	if err != nil || rate == nil {
+		slog.Warn("full self-prompting: agent-rate read failed; not treating it as a ceiling",
+			"agent", agentID, "error", err)
+		return false
+	}
+	unpaused := *rate
+	unpaused.Paused = false
+	ok, _ := domain.CheckRate(unpaused, now, domain.RateLimits{
+		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
+		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
+	}, false)
+	return !ok
+}
+
+// disableFSPAtCeiling stands full self-prompting down after a [limits] ceiling.
+//
+// The in-memory latch is set FIRST and synchronously, so the sweep this was
+// called from — and every other one until the reload lands — stops immediately.
+// The config write then happens on a tracked goroutine, because the write path
+// nudges this daemon's own control socket to reload: doing it inline on the
+// select loop would block that loop on a round trip to itself.
+//
+// The operator is told twice, deliberately. Turning autonomy off silently is
+// the one outcome that must not happen — an operator who never learns the mode
+// went off simply concludes it stopped working.
+func (d *Daemon) disableFSPAtCeiling(ctx context.Context, agentID string) {
+	d.mu.Lock()
+	already := d.fspCeilingLatched
+	d.fspCeilingLatched = true
+	d.mu.Unlock()
+	if already {
+		return // the write is already in flight; never queue a second one
+	}
+
+	reason := fmt.Sprintf("agent %s reached a [limits] runaway ceiling", agentID)
+	slog.Warn("full self-prompting: a runaway ceiling was reached; switching the mode off",
+		"agent", agentID, "consecutive_limit_key", "limits.max_consecutive_auto_prompts",
+		"per_minute_limit_key", "limits.max_auto_prompts_per_minute")
+
+	if d.opt.DisableFSP == nil {
+		// Nothing to write to. The latch still holds for this process, so the
+		// mode really is off until a restart — but config.toml keeps saying ON,
+		// so say so rather than letting the two disagree quietly.
+		slog.Warn("full self-prompting: no config writer is wired, so the mode is off " +
+			"only until this daemon restarts; turn it off yourself to make it stick")
+		return
+	}
+	// WithoutCancel for the reason every other compensating write in this repo
+	// takes it: this write RECORDS a decision already made and already acting
+	// (the latch), and the likeliest way the caller's ctx dies is the daemon
+	// shutting down — which would drop the write while the in-memory latch goes
+	// with it, bringing the mode back up on the next start.
+	writeCtx := context.WithoutCancel(ctx)
+	d.spawn(func() {
+		logging.Guard("fsp-disable", func() error {
+			if err := d.opt.DisableFSP(writeCtx, reason); err != nil {
+				// The latch stands regardless: this daemon has already decided
+				// to stop, and a failed write must not be read as permission to
+				// carry on.
+				slog.Error("full self-prompting: could not switch the mode off in config",
+					"error", err)
+				return nil
+			}
+			d.notify(writeCtx, "Full self-prompting switched off",
+				reason+" — escalations are queued for you again. Re-enable it once you have checked in.")
+			return nil
+		})
+	})
 }
 
 // noteFSPSend records a full self-prompting delivery against the FR-019 runaway
@@ -592,8 +743,15 @@ func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
 		return
 	}
 	suggestion := domain.SuggestedAction(rec)
-	if domain.AutoAcceptIneligible(rec, suggestion) != "" {
+	if domain.AutoAcceptIneligible(rec, suggestion, d.acceptGeneratedTaskAllowed(cfg, true)) != "" {
 		return // stays for the operator (never-auto & friends), or unanswerable
+	}
+	// The [limits] ceilings, checked before acting for the same reason the sweep
+	// checks them: this path has no waiting threshold at all, so without a
+	// pre-check the mode answers first and notices the ceiling afterwards.
+	if d.fspCeilingReached(ctx, cfg, rec.AgentID, now) {
+		d.disableFSPAtCeiling(ctx, rec.AgentID)
+		return
 	}
 	// The agent must still be PARKED, checked against herdr right now rather
 	// than against tr — which is a snapshot of the moment the escalation was
@@ -620,7 +778,7 @@ func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
 		return
 	}
 	live := map[string]domain.AgentTransition{rec.AgentID: agent}
-	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now) == autoAcceptDelivered {
+	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now, true) == autoAcceptDelivered {
 		d.noteFSPSend(ctx, rec.AgentID, now)
 		slog.Info("full self-prompting: escalation answered immediately",
 			"agent", rec.AgentID, "audit_id", rec.ID)
@@ -685,10 +843,15 @@ func (d *Daemon) noteAutoAcceptAttempt(auditID int64) int {
 
 // noteAutoAcceptNeedsFinalize records a delivered escalation whose finalize did
 // not commit, so a later tick can settle it.
-func (d *Daemon) noteAutoAcceptNeedsFinalize(auditID int64) {
+//
+// whileFSP rides along because the retry below is the ONLY other caller of
+// MarkAutoAccepted, and it has no per-row context of its own. A map of bare ids
+// would drop the attribution on exactly the rows whose bookkeeping already
+// went wrong once.
+func (d *Daemon) noteAutoAcceptNeedsFinalize(auditID int64, whileFSP bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.autoAcceptNeedsFinalize[auditID] = struct{}{}
+	d.autoAcceptNeedsFinalize[auditID] = whileFSP
 }
 
 // retryAutoAcceptFinalize re-attempts MarkAutoAccepted for every delivery whose
@@ -710,14 +873,16 @@ func (d *Daemon) retryAutoAcceptFinalize(ctx context.Context) {
 		return
 	}
 	ids := make([]int64, 0, len(d.autoAcceptNeedsFinalize))
-	for id := range d.autoAcceptNeedsFinalize {
+	fsp := make(map[int64]bool, len(d.autoAcceptNeedsFinalize))
+	for id, whileFSP := range d.autoAcceptNeedsFinalize {
 		ids = append(ids, id)
+		fsp[id] = whileFSP
 	}
 	d.mu.Unlock()
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
 	for _, id := range ids {
-		ok, err := d.opt.Store.MarkAutoAccepted(ctx, id)
+		ok, err := d.opt.Store.MarkAutoAccepted(ctx, id, fsp[id])
 		if err != nil {
 			// Still broken. Keep the entry and try again next tick.
 			slog.Warn("auto-accept: finalize retry failed; still pending",

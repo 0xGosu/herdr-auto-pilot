@@ -145,7 +145,7 @@ func TestAutoAcceptLifecycleRoundTrips(t *testing.T) {
 	if ok, err := s.ClaimForAutoAccept(ctx, id); err != nil || ok {
 		t.Errorf("second claim = (%v, %v), want (false, nil)", ok, err)
 	}
-	if ok, err := s.MarkAutoAccepted(ctx, id); err != nil || !ok {
+	if ok, err := s.MarkAutoAccepted(ctx, id, false); err != nil || !ok {
 		t.Fatalf("mark: %v %v", ok, err)
 	}
 	if got := statusOf(t, s, id); got != domain.AuditStatusAutoAccepted {
@@ -153,7 +153,7 @@ func TestAutoAcceptLifecycleRoundTrips(t *testing.T) {
 	}
 	// Marking again is a no-op, not an error — this is what makes the startup
 	// reclaim safe when two daemon processes briefly overlap.
-	if ok, err := s.MarkAutoAccepted(ctx, id); err != nil || ok {
+	if ok, err := s.MarkAutoAccepted(ctx, id, false); err != nil || ok {
 		t.Errorf("re-mark = (%v, %v), want (false, nil)", ok, err)
 	}
 
@@ -174,7 +174,7 @@ func TestAutoAcceptLifecycleRoundTrips(t *testing.T) {
 
 	// Guards reject the wrong starting state.
 	id3 := seedEscalation(t, s, "p3", domain.SituationApproval, time.Hour)
-	if ok, err := s.MarkAutoAccepted(ctx, id3); err != nil || ok {
+	if ok, err := s.MarkAutoAccepted(ctx, id3, false); err != nil || ok {
 		t.Errorf("mark on an unclaimed row = (%v, %v), want (false, nil)", ok, err)
 	}
 	if ok, err := s.RevertAutoAccept(ctx, id3); err != nil || ok {
@@ -258,7 +258,7 @@ func TestReclaimAbandonedAutoAccepts(t *testing.T) {
 	if ok, _ := s.ClaimForAutoAccept(ctx, finished); !ok {
 		t.Fatal("claim failed")
 	}
-	if ok, _ := s.MarkAutoAccepted(ctx, finished); !ok {
+	if ok, _ := s.MarkAutoAccepted(ctx, finished, false); !ok {
 		t.Fatal("mark failed")
 	}
 

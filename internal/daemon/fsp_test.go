@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -31,6 +32,106 @@ func newFSPHarness(t *testing.T, cfgTOML string) *harness {
 		})
 	seedGraduatedSignatures(t, h, config.MinFSPGraduatedRules)
 	return h
+}
+
+// fspSeams records what the daemon asked its optional seams to do, so a test
+// can assert the CALL rather than its side effects (the real implementations
+// live in internal/frontend and write config.toml and task lists).
+type fspSeams struct {
+	mu           sync.Mutex
+	disabled     []string
+	acceptedIDs  []int64
+	acceptErr    error
+	disableErr   error
+	acceptCalled chan struct{}
+}
+
+func newFSPSeams() *fspSeams {
+	return &fspSeams{acceptCalled: make(chan struct{}, 8)}
+}
+
+func (s *fspSeams) disable(_ context.Context, reason string) error {
+	s.mu.Lock()
+	s.disabled = append(s.disabled, reason)
+	err := s.disableErr
+	s.mu.Unlock()
+	return err
+}
+
+func (s *fspSeams) accept(_ context.Context, auditID int64, _ bool) error {
+	s.mu.Lock()
+	s.acceptedIDs = append(s.acceptedIDs, auditID)
+	err := s.acceptErr
+	s.mu.Unlock()
+	select {
+	case s.acceptCalled <- struct{}{}:
+	default:
+	}
+	return err
+}
+
+func (s *fspSeams) disableCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.disabled)
+}
+
+// waitDisableCount waits for the config write to land. The daemon does it on a
+// tracked goroutine on purpose — the write path nudges the daemon's own control
+// socket, so doing it inline would block the select loop on itself — which
+// means every assertion about it has to wait rather than read straight after
+// the sweep returns.
+func (s *fspSeams) waitDisableCount(t *testing.T, want int) {
+	t.Helper()
+	waitFor(t, 2*time.Second, func() bool { return s.disableCount() >= want })
+	if got := s.disableCount(); got != want {
+		t.Errorf("DisableFSP called %d times, want exactly %d", got, want)
+	}
+}
+
+// assertNeverDisabled gives the goroutine a chance to run before concluding it
+// never will, so a passing "not called" assertion is evidence rather than a
+// race won by the test.
+func (s *fspSeams) assertNeverDisabled(t *testing.T) {
+	t.Helper()
+	time.Sleep(100 * time.Millisecond)
+	if got := s.disableCount(); got != 0 {
+		t.Errorf("DisableFSP called %d times, want 0: %v", got, s.disabled)
+	}
+}
+
+func (s *fspSeams) accepted() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.acceptedIDs...)
+}
+
+// newFSPHarnessWithSeams is newFSPHarness with both optional capabilities
+// wired, installed BEFORE New() so no daemon goroutine ever reads them mid-write.
+func newFSPHarnessWithSeams(t *testing.T, cfgTOML string) (*harness, *fspSeams) {
+	t.Helper()
+	seams := newFSPSeams()
+	fl := &fakeLLM{configured: true, consult: func(context.Context, domain.LLMRequest) (*domain.LLMDecision, error) {
+		return &domain.LLMDecision{Action: domain.ActionNoop}, nil
+	}}
+	h := newHarnessCore(t, cfgTOML, nil, fl, fl, nil, func(o *Options) {
+		o.DisableFSP = seams.disable
+		o.AcceptGeneratedTask = seams.accept
+	})
+	seedGraduatedSignatures(t, h, config.MinFSPGraduatedRules)
+	return h, seams
+}
+
+// saturateConsecutive puts the agent exactly at the consecutive ceiling without
+// pausing it — the state an FSP delivery reaches after enough answers, and the
+// one honour_limits must refuse at.
+func saturateConsecutive(t *testing.T, h *harness, agentID string, n int) {
+	t.Helper()
+	if err := h.raw.UpdateAgentRate(context.Background(), domain.AgentRate{
+		AgentID: agentID, ConsecutiveAuto: n, WindowStart: time.Now(), CountInWindow: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func seedGraduatedSignatures(t *testing.T, h *harness, n int) {
@@ -742,5 +843,315 @@ func TestFSPRefusesWhenTheAuditRowNamesAnotherAgent(t *testing.T) {
 	}
 	if got := h.herdr.sentInputs(); len(got) != 0 {
 		t.Errorf("nothing may be delivered on an identity mismatch, sent %v", got)
+	}
+}
+
+// ---- honour_limits ---------------------------------------------------------
+
+const fspHonourLimits = `
+[full_self_prompting]
+enabled = true
+honour_limits = true
+
+[limits]
+max_consecutive_auto_prompts = 3
+max_auto_prompts_per_minute = 100
+`
+
+// TestFSPHonourLimitsRefusesAtTheCeiling: with the key on, a delivery that
+// would cross the consecutive ceiling is refused BEFORE it happens. The
+// historical behavior only advanced the counters and let the next decision
+// notice, which always overshoots by one.
+func TestFSPHonourLimitsRefusesAtTheCeiling(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspHonourLimits)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	saturateConsecutive(t, h, "pA", 3)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Errorf("status = %q, want escalated — the ceiling was already reached", got)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("nothing may be delivered at the ceiling, sent %v", got)
+	}
+	seams.waitDisableCount(t, 1)
+}
+
+// TestFSPHonourLimitsOffKeepsTodaysBehaviour is the regression guard on the
+// default: an install that never sets the key must behave exactly as before,
+// ceiling or no ceiling.
+func TestFSPHonourLimitsOffKeepsTodaysBehaviour(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, `
+[full_self_prompting]
+enabled = true
+
+[limits]
+max_consecutive_auto_prompts = 3
+max_auto_prompts_per_minute = 100
+`)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	saturateConsecutive(t, h, "pA", 3)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+		t.Errorf("status = %q, want %q — honour_limits defaults OFF, so the ceiling must not refuse",
+			got, domain.AuditStatusAutoAccepted)
+	}
+	seams.assertNeverDisabled(t)
+}
+
+// TestFSPHonourLimitsIgnoresAPauseThatIsNotACeiling: domain.CheckRate answers
+// "rate_limited" for a PAUSED agent too, and a pause is not a ceiling — the
+// operator may have paused that one agent. Reading it as one would stand the
+// whole mode down for the herd over a per-agent state Guard 1b already handles.
+func TestFSPHonourLimitsIgnoresAPauseThatIsNotACeiling(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspHonourLimits)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	if err := h.raw.UpdateAgentRate(ctx, domain.AgentRate{
+		AgentID: "pA", Paused: true, WindowStart: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Errorf("status = %q, want escalated — a paused agent is suppressed", got)
+	}
+	seams.assertNeverDisabled(t)
+}
+
+// TestFSPHonourLimitsSwitchesOffOnlyOnce: one ceiling produces one config write
+// and one notification, however many candidates are queued behind it.
+func TestFSPHonourLimitsSwitchesOffOnlyOnce(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspHonourLimits)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	saturateConsecutive(t, h, "pA", 3)
+	for i := 0; i < 3; i++ {
+		seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+	}
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	seams.waitDisableCount(t, 1)
+}
+
+// TestFSPCeilingLatchStandsTheModeDownImmediately: the latch must not wait for
+// the config write to land and come back as a reload — the sweep that noticed
+// stops right there, and the escalate-time hook is closed too.
+func TestFSPCeilingLatchStandsTheModeDownImmediately(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspHonourLimits)
+	ctx := context.Background()
+	// The config write itself fails, so nothing external can be what stops it.
+	seams.disableErr = errors.New("config is read-only")
+	h.herdr.setPane(approvalPane)
+	saturateConsecutive(t, h, "pA", 3)
+	seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	cfg, _, _ := h.daemon.snapshot()
+	if h.daemon.fspActive(ctx, cfg) {
+		t.Error("the mode must read inactive the moment a ceiling is reached, even if the config write failed")
+	}
+	// And a fresh escalation is not answered either.
+	id := seedAgedEscalation(t, h, "pB", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+	h.daemon.fspAcceptNow(ctx, id, "pB", time.Now())
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Errorf("immediate hook status = %q, want escalated — the mode is latched off", got)
+	}
+}
+
+// ---- accept_generated_task -------------------------------------------------
+
+const fspAcceptGenerated = `
+[full_self_prompting]
+enabled = true
+accept_generated_task = true
+`
+
+// generatedTaskEscalation seeds the shape the task generator produces: an idle
+// escalation whose suggestion carries LLM-authored tasks.
+func generatedTaskEscalation(t *testing.T, h *harness, agentID, pane string) int64 {
+	t.Helper()
+	return seedEscalationWithRationale(t, h, agentID, pane,
+		"[task_source_exhausted] nothing pending", domain.SituationIdle,
+		domain.SuggestTaskPrefix+"write the integration test", 5*time.Second)
+}
+
+// TestFSPRefusesAGeneratedTaskByDefault: without the opt-in, the historical
+// refusal stands — accepting one writes task lists, which is a much larger
+// grant than answering what is on screen.
+func TestFSPRefusesAGeneratedTaskByDefault(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspOn)
+	ctx := context.Background()
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := generatedTaskEscalation(t, h, "pA", idlePane)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+	h.daemon.fspAcceptNow(ctx, id, "pA", time.Now())
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Errorf("status = %q, want escalated — accept_generated_task defaults off", got)
+	}
+	if got := seams.accepted(); len(got) != 0 {
+		t.Errorf("the seam must not be called while the key is off, called for %v", got)
+	}
+}
+
+// TestFSPAcceptsAGeneratedTaskWhenEnabled: with the key on, the escalation is
+// handed to the seam and finalized on the auto-accept lifecycle.
+func TestFSPAcceptsAGeneratedTaskWhenEnabled(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspAcceptGenerated)
+	ctx := context.Background()
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := generatedTaskEscalation(t, h, "pA", idlePane)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+		t.Fatalf("status = %q, want %q", got, domain.AuditStatusAutoAccepted)
+	}
+	if got := seams.accepted(); len(got) != 1 || got[0] != id {
+		t.Errorf("seam called for %v, want exactly [%d]", got, id)
+	}
+}
+
+// TestFSPGeneratedTaskWritesNoCorrection is the doctrine guard: an automatic
+// acceptance must never become a learning event, or a machine's decision starts
+// pushing signatures toward graduation.
+func TestFSPGeneratedTaskWritesNoCorrection(t *testing.T) {
+	h, _ := newFSPHarnessWithSeams(t, fspAcceptGenerated)
+	ctx := context.Background()
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := generatedTaskEscalation(t, h, "pA", idlePane)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+
+	corrs, err := h.raw.UnprocessedCorrections(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range corrs {
+		if c.AuditID == id {
+			t.Fatalf("an automatic acceptance recorded a correction (%+v); it must record none", c)
+		}
+	}
+}
+
+// TestFSPGeneratedTaskWithNoSeamLeavesItPending: the capability is optional, so
+// a build that never wired it must leave the row for the operator — and must
+// not strand it in the transient 'auto_accepting' status.
+func TestFSPGeneratedTaskWithNoSeamLeavesItPending(t *testing.T) {
+	h := newFSPHarness(t, fspAcceptGenerated) // no seams wired
+	ctx := context.Background()
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := generatedTaskEscalation(t, h, "pA", idlePane)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Errorf("status = %q, want escalated — with no seam there is nothing to accept with", got)
+	}
+}
+
+// ---- while_fsp_mode_on -----------------------------------------------------
+
+// TestFSPDeliveryMarksWhileFSPModeOn: the status alone cannot tell an operator
+// which automatic acceptances the mode they switched on caused.
+func TestFSPDeliveryMarksWhileFSPModeOn(t *testing.T) {
+	h := newFSPHarness(t, fspOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	rec := auditRow(t, h, id)
+	if rec.Status != domain.AuditStatusAutoAccepted {
+		t.Fatalf("status = %q, want %q", rec.Status, domain.AuditStatusAutoAccepted)
+	}
+	if !rec.WhileFSPModeOn {
+		t.Error("a full self-prompting delivery must be flagged while_fsp_mode_on")
+	}
+}
+
+// TestTimedAutoAcceptIsNotMarkedWhileFSPModeOn is the other half: the flag
+// would be worthless if every auto-accept carried it.
+func TestTimedAutoAcceptIsNotMarkedWhileFSPModeOn(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 20*time.Minute)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	rec := auditRow(t, h, id)
+	if rec.Status != domain.AuditStatusAutoAccepted {
+		t.Fatalf("status = %q, want %q", rec.Status, domain.AuditStatusAutoAccepted)
+	}
+	if rec.WhileFSPModeOn {
+		t.Error("a timed auto-accept must NOT be flagged while_fsp_mode_on")
+	}
+}
+
+// TestFSPFinalizeRetryKeepsTheAttribution: the finalize retry runs on a later
+// tick with only the audit id, so a map of bare ids would silently drop
+// while_fsp_mode_on on exactly the rows whose bookkeeping already went wrong
+// once — and the flag would then be false on a delivery the mode really caused.
+func TestFSPFinalizeRetryKeepsTheAttribution(t *testing.T) {
+	var flaky *flakyFinalizeStore
+	seams := newFSPSeams()
+	fl := &fakeLLM{configured: true, consult: func(context.Context, domain.LLMRequest) (*domain.LLMDecision, error) {
+		return &domain.LLMDecision{Action: domain.ActionNoop}, nil
+	}}
+	h := newHarnessCore(t, fspOn, nil, fl, fl,
+		func(inner ports.StorePort) ports.StorePort {
+			flaky = &flakyFinalizeStore{StorePort: inner, failN: 1}
+			return flaky
+		},
+		func(o *Options) { o.DisableFSP = seams.disable })
+	seedGraduatedSignatures(t, h, config.MinFSPGraduatedRules)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	// Tick 1: delivered, finalize fails, the row is stuck mid-finalize.
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepting {
+		t.Fatalf("status = %q, want the row stuck mid-finalize for this test to mean anything", got)
+	}
+
+	// Tick 2: the retry settles it.
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	rec := auditRow(t, h, id)
+	if rec.Status != domain.AuditStatusAutoAccepted {
+		t.Fatalf("status = %q, want %q once the store recovered", rec.Status, domain.AuditStatusAutoAccepted)
+	}
+	if !rec.WhileFSPModeOn {
+		t.Error("the finalize retry lost the attribution; the row reads as a timed auto-accept")
+	}
+	// Both attempts must have carried it — the retry replaying `false` would
+	// only be harmless because the store ORs the column, and this feature must
+	// not depend on that safety net alone.
+	for i, arg := range flaky.markAutoAcceptedArgs() {
+		if !arg {
+			t.Errorf("MarkAutoAccepted call #%d passed whileFSP=false", i+1)
+		}
 	}
 }

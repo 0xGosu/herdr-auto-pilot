@@ -166,3 +166,78 @@ func TestMinFSPGraduatedRulesIsMeaningful(t *testing.T) {
 		t.Fatalf("MinFSPGraduatedRules = %d; the enable gate is gone", config.MinFSPGraduatedRules)
 	}
 }
+
+// TestFSPBehaviorKeysDefaultOff: both opt-in behaviors must be off for an
+// install that never named them, so an upgrade never widens what the mode does.
+func TestFSPBehaviorKeysDefaultOff(t *testing.T) {
+	d := config.Default()
+	if d.FullSelfPrompting.HonourLimits {
+		t.Error("Default() has honour_limits on")
+	}
+	if d.FullSelfPrompting.AcceptGeneratedTask {
+		t.Error("Default() has accept_generated_task on")
+	}
+	// Including the case where the mode ITSELF was opted into: turning the mode
+	// on must not silently turn its behaviors on too.
+	cfg, err := config.Load(writeCfg(t, "[full_self_prompting]\nenabled = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FullSelfPrompting.HonourLimits || cfg.FullSelfPrompting.AcceptGeneratedTask {
+		t.Errorf("enabling the mode turned a behavior on: honour_limits=%v accept_generated_task=%v",
+			cfg.FullSelfPrompting.HonourLimits, cfg.FullSelfPrompting.AcceptGeneratedTask)
+	}
+}
+
+// TestFSPBehaviorKeysRoundTrip: both survive Load → Save → Load. A key that
+// silently reverted on the next config write would switch a safety bound back
+// off without anyone touching it.
+func TestFSPBehaviorKeysRoundTrip(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		body := "[full_self_prompting]\nenabled = true\n" +
+			"honour_limits = " + boolText(on) + "\n" +
+			"accept_generated_task = " + boolText(on) + "\n"
+		path := writeCfg(t, body)
+		cfg, err := config.Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.FullSelfPrompting.HonourLimits != on || cfg.FullSelfPrompting.AcceptGeneratedTask != on {
+			t.Fatalf("loaded honour_limits=%v accept_generated_task=%v, want both %v",
+				cfg.FullSelfPrompting.HonourLimits, cfg.FullSelfPrompting.AcceptGeneratedTask, on)
+		}
+		if err := config.Save(path, cfg); err != nil {
+			t.Fatal(err)
+		}
+		again, err := config.Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again.FullSelfPrompting.HonourLimits != on || again.FullSelfPrompting.AcceptGeneratedTask != on {
+			t.Fatalf("re-loaded honour_limits=%v accept_generated_task=%v, want both %v",
+				again.FullSelfPrompting.HonourLimits, again.FullSelfPrompting.AcceptGeneratedTask, on)
+		}
+	}
+}
+
+// TestLegacyFSPBehaviorKeysMigrate: the deprecated table decodes into the same
+// struct, and Load copies it wholesale — so a hand-edited legacy section keeps
+// carrying the behavior keys onto the canonical one rather than dropping them.
+func TestLegacyFSPBehaviorKeysMigrate(t *testing.T) {
+	cfg, err := config.Load(writeCfg(t,
+		"[escalations.full_self_prompting]\nenabled = true\nhonour_limits = true\naccept_generated_task = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.FullSelfPrompting.HonourLimits || !cfg.FullSelfPrompting.AcceptGeneratedTask {
+		t.Errorf("legacy behavior keys did not migrate: honour_limits=%v accept_generated_task=%v",
+			cfg.FullSelfPrompting.HonourLimits, cfg.FullSelfPrompting.AcceptGeneratedTask)
+	}
+}
+
+func boolText(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
