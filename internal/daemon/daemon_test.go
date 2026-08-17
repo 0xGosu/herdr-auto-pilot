@@ -1776,8 +1776,10 @@ func TestPipelineDedupAfterResolveWithinWindow(t *testing.T) {
 	}
 
 	// Herdr re-delivers the same screen (done->idle when the operator read the
-	// pane). The default window is 5 minutes, so this immediate re-fire is well
-	// inside it: no new escalation, and one ignored audit row.
+	// pane). This immediate re-fire is well inside the window whatever it is
+	// tuned to, so it stays a duplicate: no new escalation, and one ignored audit
+	// row. The window's actual span is pinned separately, by
+	// TestResolvedEscalationSevenMinutesOldStillDedups.
 	h.herdr.setPane(approvalPane)
 	h.push("agent-resolve-dup", "idle")
 	waitFor(t, 3*time.Second, func() bool { return len(ignoredRows(t, h)) == 1 })

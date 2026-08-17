@@ -265,7 +265,10 @@ func TestPruneAuditExcerptsPreservesPendingEscalationDedupSet(t *testing.T) {
 		t.Fatalf("mark sent: %v", err)
 	}
 
-	resolvedSince := now.Add(-5 * time.Minute) // the daemon's escalationDedupWindow
+	// An arbitrary window this test picks for itself. store cannot import daemon,
+	// so this deliberately does NOT track escalationDedupWindow — don't "fix" it
+	// to match that constant, and don't read it as documenting its value.
+	resolvedSince := now.Add(-5 * time.Minute)
 	before, err := s.PendingEscalationExcerpts(ctx, "pane-1", "claude", resolvedSince)
 	if err != nil {
 		t.Fatalf("dedup set before: %v", err)

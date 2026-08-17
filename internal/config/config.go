@@ -1732,8 +1732,19 @@ func Load(path string) (Config, error) {
 	// `escalation_dedup_jitter_percent`: the escalation duplicate-ask tuning is now
 	// a fixed internal constant. Probe the raw file to warn rather than silently
 	// drop them; Save omits them (no struct fields).
+	//
+	// The values below are spelled out by HAND and cannot be derived: they live in
+	// daemon.escalationDedupWindow / escalationDedupJitterPercent, and daemon
+	// imports config, so config cannot import them back. This package's own tests
+	// assert only on the KEY name, so nothing here catches the values drifting —
+	// which is how the window text went on claiming 5 minutes after it became 10,
+	// telling every operator with a legacy config something false. The guard is
+	// daemon.TestDedupConstantsMatchTheRetiredKeyWarnings, which sits on the side
+	// that can see both: it drives Load and fails if either sentence stops
+	// matching its constant. Keep the phrasing it greps for ("fixed N minutes" /
+	// "fixed N%") intact when rewording.
 	if legacy.Limits.EscalationDedupWindowSeconds != nil {
-		warnOnce("config key `limits.escalation_dedup_window_seconds` is no longer supported and is ignored; the escalation dedup window is a fixed 5 minutes",
+		warnOnce("config key `limits.escalation_dedup_window_seconds` is no longer supported and is ignored; the escalation dedup window is a fixed 10 minutes",
 			"path", path, "configured_value", *legacy.Limits.EscalationDedupWindowSeconds)
 	}
 	if legacy.Limits.EscalationDedupJitterPercent != nil {

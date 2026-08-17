@@ -1606,7 +1606,14 @@ const (
 	// re-fire would raise a second, duplicate escalation. Measured from when the
 	// escalation was raised; still-pending escalations dedup regardless of age —
 	// only resolved ones are time-gated.
-	escalationDedupWindow = 5 * time.Minute
+	//
+	// 10 minutes rather than the original 5: measured live (2026-08-17) against a
+	// real herd, the re-fire of a just-resolved situation regularly lands well
+	// past the 5-minute mark, because the delay is set by when the OPERATOR next
+	// looks at the pane, not by anything the daemon controls. A window shorter
+	// than that gap lets the re-fire raise a second, duplicate escalation for a
+	// question the operator has already answered.
+	escalationDedupWindow = 10 * time.Minute
 	// escalationDedupJitterPercent is how much two large pane captures may differ
 	// (0-100) and still count as the same screen for the duplicate-ask check —
 	// absorbing residual TUI jitter the normalizer misses. It applies ONLY to
@@ -1660,6 +1667,61 @@ func (d *Daemon) duplicatePendingEscalation(ctx context.Context, s domain.Situat
 	return domain.DuplicatesPendingEscalation(s.Type,
 		truncateTailRunes(s.Content, snapshotMaxRunes), snapshotMaxRunes,
 		escalationDedupJitterPercent, pending)
+}
+
+// duplicateAskBeforeLLM reports whether a would-be escalation for this situation
+// is already awaiting the operator — the SAME verdict escalate() reaches, asked
+// early enough to skip an LLM subprocess whose only possible product is that
+// duplicate escalation.
+//
+// It exists because the duplicate check inside escalate() runs too late for the
+// task-generation path: generateTask shells out to the operator's LLM CLI (tens
+// of seconds to minutes, with tool calls, in the agent's cwd) and its outcome
+// funnels back through escalate(), which then discards it. Measured live
+// (2026-08-17) on a single agent in one morning: 14 task-generation subprocesses
+// produced 8 escalations — six full runs executed purely to be thrown away.
+// HasPendingLLMConsult does not cover this: it blocks only CONCURRENT
+// generations, never sequential ones.
+//
+// It mirrors escalate()'s guard exactly, INCLUDING the auto-dismiss precedence:
+// a proven-gone or disabled agent must still reach escalate(), so its lifecycle
+// decision is recorded as a dismissal in history rather than hidden behind an
+// opaque "duplicate".
+//
+// WHY THIS IS SAFE — and the reason is VERDICT EQUIVALENCE, not "the gated path
+// only escalates". That weaker-sounding rule is the tempting one and it is
+// FALSE: escalate() does not end at the audit row, it ends at
+// maybeFSPAcceptNow, which under [full_self_prompting] enabled +
+// accept_generated_task claims the row and DELIVERS the generated task to the
+// pane. So with that mode on, a generated-task escalation is precisely a
+// potential send. What makes the early gate sound is that escalate() applies
+// this same verdict BEFORE the audit write and before the FSP hook — so a
+// situation this helper suppresses could never have reached the delivery
+// either. The set of suppressed situations is identical; only the LLM
+// subprocess in between is skipped.
+//
+// Do NOT restate this as "safe to gate any path that can only escalate" — with
+// full self-prompting on, EVERY escalation is a potential pane delivery, so that
+// rule gives the wrong answer for any other call site.
+//
+// consultLLM is deliberately NOT gated, and there the difference is real rather
+// than cosmetic: handleLLMOutcome can promote a consult to a SEND on a path that
+// does NOT run escalate()'s dedup first, so a situation whose escalation would
+// be a duplicate may still be legitimately auto-answered. Gating it would
+// convert that answer into silence and leave the agent blocked — the same
+// reasoning escalate() gives for not gating before decideAndAct. It also costs
+// nothing to leave it out: every wasted call measured above was a task
+// generation, not a consult.
+// The two checks are ordered cheapest-first, which escalate() cannot do because
+// it needs the auto-dismiss reason either way: duplicatePendingEscalation is a
+// local SQLite read, while escalationAutoDismissReason costs a herdr ListAgents
+// round-trip on the main loop. Since both must hold, testing the cheap one first
+// leaves the common (non-duplicate) case paying only the query.
+func (d *Daemon) duplicateAskBeforeLLM(ctx context.Context, s domain.Situation) bool {
+	if !d.duplicatePendingEscalation(ctx, s) {
+		return false
+	}
+	return d.escalationAutoDismissReason(ctx, s.AgentID) == ""
 }
 
 // ignoreDuplicate audits a no-op for an event whose situation already has a
@@ -1922,6 +1984,38 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 				d.escalate(ctx, situation, sig, decision, tr, now)
 				return
 			}
+		}
+		// Dedup BEFORE the LLM runs, not after. handleTaskGenOutcome funnels every
+		// outcome back through escalate(), which applies this same verdict before
+		// its audit write — so when the answer is "duplicate", the whole generation
+		// is dead work, and it is the expensive kind: a full LLM CLI subprocess in
+		// the agent's cwd. See duplicateAskBeforeLLM for why equivalence with
+		// escalate()'s guard is what makes this safe (and why the obvious weaker
+		// justification is wrong). escalate() still re-checks, which covers the
+		// async outcome landing after the queue moved on.
+		//
+		// The read and the ignore are separate operations, so an operator
+		// dismissing the matching pending row in between makes this suppress a
+		// generation escalate() would by then have allowed. That window is
+		// inherent to the check rather than introduced here — escalate() reads
+		// the same set and writes the same row non-atomically — and this call
+		// site NARROWS it, from "an LLM subprocess plus a write" to just the
+		// write. Its cost is also bounded to one skipped cycle: nothing is
+		// staged before this point (StageLLMRequest lives inside generateTask),
+		// so no request row, reservation or file write is stranded, and the next
+		// attention event or idle re-drive raises the situation again. Making it
+		// atomic would need a store method fusing the query with the audit write,
+		// applied to escalate() too or the two verdicts diverge — a large change
+		// against a race whose worst outcome self-heals, and whose trigger
+		// (the operator retiring exactly this ask) is the case where skipping is
+		// arguably right anyway.
+		if d.duplicateAskBeforeLLM(ctx, situation) {
+			// Mirror escalate()'s own first act: this episode is resolving without
+			// an autonomous send, so an auto-send pairing held for this agent is
+			// spent and must not be withheld from the rest of the herd.
+			d.dropAutoTaskClaim(situation.AgentID)
+			d.ignoreDuplicate(ctx, situation, tr, now)
+			return
 		}
 		d.generateTask(ctx, cfg, situation, sig, tr, now, declared != nil)
 	default:
