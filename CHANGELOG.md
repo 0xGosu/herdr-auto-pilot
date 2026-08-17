@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.14
+
+- Added `full_self_prompting.honour_limits` (default off): full self-prompting now checks the `[limits]` runaway ceilings BEFORE each delivery instead of noticing one decision later, and switches the whole mode off when one is reached — rewriting `enabled = false`, recording the change in `hap kill-history`, and notifying you which agent tripped it. The ceilings are per-agent while the mode is global, so one runaway agent stands the mode down for every agent.
+- Added `full_self_prompting.accept_generated_task` (default off): full self-prompting may now act on an idle escalation whose suggestion is an LLM-generated task — writing the agent's task list, registering the task source and handing the first task over — instead of leaving it for you. It records no learning event, and the generated task text is screened against your never-auto patterns and the irreversible-command heuristic before anything is written; a match leaves the escalation for you. (Generated task text is authored after the decision that raised the escalation, so nothing had screened it before — your confirmation was the gate.)
+- Fixed a task list being created under a remote provider even after the caller was cancelled — the create now aborts with its caller, and is retried on the next attempt.
+- Added a `while_fsp_mode_on` flag to audit rows, so an automatic acceptance caused by full self-prompting is distinguishable from one caused by a timed auto-accept threshold expiring — they were previously identical in the log. Such rows now read `fsp-sent` instead of `auto-sent` in both `hap audit` and the TUI, render in amber on the TUI Audit tab, and name the cause in the detail view. Existing rows are not backfilled and keep reading `auto-sent`.
+
 ## 0.6.13
 
 - Fixed automatic answering never firing on a Claude multi-tab question form. Because such a form is captured by sweeping every tab, while the staleness check re-read only the one tab on screen, every one of them was retired as "no longer on screen" — often within milliseconds of being raised, and while the form was still standing. The check now compares the visible tab against the tabs actually captured, and tolerates the form being left on a later tab or the highlighted option being moved while it waits.
