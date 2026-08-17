@@ -388,7 +388,10 @@ func TestPendingEscalationExcerpts(t *testing.T) {
 		return id
 	}
 
-	// The daemon derives this as now-window; here a 5-minute window.
+	// The daemon derives this as now-window. The 5 minutes here is a span this
+	// test picks for itself and deliberately does NOT track
+	// daemon.escalationDedupWindow — store cannot import daemon — so don't "fix"
+	// it to match that constant, and don't read it as documenting its value.
 	resolvedSince := now.Add(-5 * time.Minute)
 
 	// resolveSent marks an escalation resolved with a DELIVERED answer (the

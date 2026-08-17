@@ -1993,6 +1993,22 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		// escalate()'s guard is what makes this safe (and why the obvious weaker
 		// justification is wrong). escalate() still re-checks, which covers the
 		// async outcome landing after the queue moved on.
+		//
+		// The read and the ignore are separate operations, so an operator
+		// dismissing the matching pending row in between makes this suppress a
+		// generation escalate() would by then have allowed. That window is
+		// inherent to the check rather than introduced here — escalate() reads
+		// the same set and writes the same row non-atomically — and this call
+		// site NARROWS it, from "an LLM subprocess plus a write" to just the
+		// write. Its cost is also bounded to one skipped cycle: nothing is
+		// staged before this point (StageLLMRequest lives inside generateTask),
+		// so no request row, reservation or file write is stranded, and the next
+		// attention event or idle re-drive raises the situation again. Making it
+		// atomic would need a store method fusing the query with the audit write,
+		// applied to escalate() too or the two verdicts diverge — a large change
+		// against a race whose worst outcome self-heals, and whose trigger
+		// (the operator retiring exactly this ask) is the case where skipping is
+		// arguably right anyway.
 		if d.duplicateAskBeforeLLM(ctx, situation) {
 			// Mirror escalate()'s own first act: this episode is resolving without
 			// an autonomous send, so an auto-send pairing held for this agent is
