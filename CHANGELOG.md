@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.15
+
+- Fixed an idle agent's duplicate escalation costing a full task-generation LLM run before being discarded — the duplicate-ask check now runs before the generator is invoked, not after its result comes back. Measured on one agent in one morning, six of fourteen generation subprocesses were executed purely to be thrown away.
+- Changed the escalation duplicate-ask window from 5 to 10 minutes, so a re-fire of a situation the operator just resolved no longer slips through as a second escalation when they come back to the pane a few minutes later.
+- Fixed the startup warning for the retired `limits.escalation_dedup_window_seconds` key still telling operators the window is fixed at 5 minutes.
+
 ## 0.6.14
 
 - Added `full_self_prompting.honour_limits` (default off): full self-prompting now checks the `[limits]` runaway ceilings BEFORE each delivery instead of noticing one decision later, and switches the whole mode off when one is reached — rewriting `enabled = false`, recording the change in `hap kill-history`, and notifying you which agent tripped it. The ceilings are per-agent while the mode is global, so one runaway agent stands the mode down for every agent.
