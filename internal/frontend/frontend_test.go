@@ -2427,8 +2427,12 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		// false on purpose: enabling is gated on runtime preconditions (10
 		// graduated rules, llm.command) this shared fixture does not meet.
 		// The enable path is exercised in fsp_test.go.
-		"full_self_prompting.enabled":             "false",
-		"safety.disable_never_auto_seed_patterns": "true",
+		"full_self_prompting.enabled": "false",
+		// "true" on purpose, unlike the switch above: neither of these is
+		// precondition-gated, so the accept path is exercised for real.
+		"full_self_prompting.honour_limits":         "true",
+		"full_self_prompting.accept_generated_task": "true",
+		"safety.disable_never_auto_seed_patterns":   "true",
 		"llm.command":                              `claude -p "decide"`,
 		"llm.command_start":                        `claude -p "first: decide"`,
 		"llm.timeout_seconds":                      "60",
@@ -5536,6 +5540,15 @@ func TestAuditStatusLabel(t *testing.T) {
 			want: "auto-sent",
 		},
 		{
+			// Same status, different cause. Both are automatic acceptances, but
+			// one is a threshold expiring and the other is a mode the operator
+			// switched on — an operator scanning the log needs to tell them
+			// apart without opening each row.
+			name: "full self-prompting is distinguishable from a timed auto-accept",
+			rec:  domain.AuditRecord{Status: domain.AuditStatusAutoAccepted, WhileFSPModeOn: true},
+			want: "fsp-sent",
+		},
+		{
 			name: "transient claim renders rather than showing unknown",
 			rec:  domain.AuditRecord{Status: domain.AuditStatusAutoAccepting},
 			want: "sending",
@@ -5587,6 +5600,7 @@ func TestAuditStatusLabelDistinguishesMachineFromOperator(t *testing.T) {
 	for _, rec := range []domain.AuditRecord{
 		{Status: "resolved"},
 		{Status: domain.AuditStatusAutoAccepted},
+		{Status: domain.AuditStatusAutoAccepted, WhileFSPModeOn: true},
 		{Status: "dismissed", Rationale: "[shadow_mode] x"},
 		{Status: "dismissed", Rationale: "[shadow_mode] x [auto_dismiss_stale] y"},
 		{Status: "dismissed", Rationale: "[shadow_mode] x [auto_dismiss_agent_gone]"},
@@ -5619,6 +5633,12 @@ var configKeysExemptFromRegistry = map[string]string{
 	"llm.auto_act":                            "deprecated alias for llm.auto_act_confidence_threshold",
 	"safety.disable_seed":                     "deprecated alias for safety.disable_never_auto_seed_patterns",
 	"escalations.full_self_prompting.enabled": "deprecated alias for full_self_prompting.enabled",
+	// The deprecated table decodes into the SAME struct, so every field added to
+	// FullSelfPrompting surfaces under both spellings. These two are reachable
+	// only by hand-editing the legacy table, which Load then migrates wholesale
+	// onto the canonical section — there is nothing to offer an operator here.
+	"escalations.full_self_prompting.honour_limits":         "deprecated alias for full_self_prompting.honour_limits",
+	"escalations.full_self_prompting.accept_generated_task": "deprecated alias for full_self_prompting.accept_generated_task",
 }
 
 // tomlScalarKeys reports every key BurntSushi/toml would accept as a SCALAR

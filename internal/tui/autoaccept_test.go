@@ -154,3 +154,59 @@ func TestEscalationsListSurvivesATransientRefresh(t *testing.T) {
 		}
 	}
 }
+
+// TestAuditRowStyleMarksFullSelfPromptingRows: "auto-sent" is the status for
+// BOTH flavours of automatic acceptance, so the operator's only at-a-glance
+// signal for "the mode I switched on did this" is the row colour.
+//
+// Asserted on the style CHOICE rather than the rendered escape sequence:
+// lipgloss drops colour when tests run without a TTY, so a Contains check on
+// the ANSI would pass whatever the renderer decided.
+func TestAuditRowStyleMarksFullSelfPromptingRows(t *testing.T) {
+	st := defaultStyles
+	fspRow := domain.AuditRecord{
+		ID: 1, Status: domain.AuditStatusAutoAccepted, WhileFSPModeOn: true,
+	}
+	timedRow := domain.AuditRecord{
+		ID: 2, Status: domain.AuditStatusAutoAccepted,
+	}
+
+	got, ok := auditRowStyle(st, fspRow, false)
+	if !ok {
+		t.Fatal("a full self-prompting row must be styled, not left plain")
+	}
+	if got.GetForeground() != st.warn.GetForeground() {
+		t.Errorf("foreground = %v, want the warn role %v", got.GetForeground(), st.warn.GetForeground())
+	}
+
+	if _, ok := auditRowStyle(st, timedRow, false); ok {
+		t.Error("a timed auto-accept must stay plain, or the colour means nothing")
+	}
+
+	// Selected wins, or the cursor vanishes on exactly the rows worth opening.
+	sel, ok := auditRowStyle(st, fspRow, true)
+	if !ok || sel.GetForeground() != st.selected.GetForeground() {
+		t.Errorf("selected row = %v, want the selected role %v", sel.GetForeground(), st.selected.GetForeground())
+	}
+}
+
+// TestAuditDetailNamesFullSelfPromptingAsTheCause: the colour needs a caption
+// somewhere, or an operator has to guess what amber means.
+func TestAuditDetailNamesFullSelfPromptingAsTheCause(t *testing.T) {
+	now := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	m := auditModelWith(t, nil)
+	rec := domain.AuditRecord{
+		ID: 1, SituationType: domain.SituationApproval, Status: domain.AuditStatusAutoAccepted,
+		Action: "Yes", WhileFSPModeOn: true, CreatedAt: now,
+	}
+	detail := strings.Join(m.auditDetailLines(rec, "", 120, auditDetailOptions{}), "\n")
+	if !strings.Contains(detail, "full self-prompting") {
+		t.Errorf("audit detail does not name full self-prompting as the cause:\n%s", detail)
+	}
+
+	rec.WhileFSPModeOn = false
+	plain := strings.Join(m.auditDetailLines(rec, "", 120, auditDetailOptions{}), "\n")
+	if strings.Contains(plain, "Caused by") {
+		t.Errorf("an ordinary row must not carry a cause line:\n%s", plain)
+	}
+}

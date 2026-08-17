@@ -686,7 +686,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// tasks.md when none exists) and, when send, hands the first task to the
 	// agent. Handle it before the send-oriented flow below.
 	if action == domain.SuggestGenerateTask {
-		return a.acceptGeneratedTask(ctx, audit, send)
+		return a.acceptGeneratedTask(ctx, audit, send, false, nil)
 	}
 	// willSend is the delivery gate. The correction is recorded FIRST (the
 	// learning event, preserved even when delivery fails) but with Sent=false;
@@ -752,7 +752,52 @@ var ErrSuggestionStaleAgentBusy = errors.New("agent is no longer idle; the sugge
 // suppresses the idle resend (issue #156). Bootstrap side effects run
 // source-first so a send failure never leaves the agent without the task
 // source that was just established.
-func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord, send bool) error {
+// claimGeneratedTaskEscalation takes ownership of the escalation a
+// generated-task confirm is about to act on, and records the learning event
+// that teaches the idle signature to drive from its declared list. It returns
+// the correction id to flip "sent" on after a successful delivery, or 0 when
+// none was written.
+//
+// automated is the full self-prompting path, where BOTH halves are skipped and
+// the DAEMON owns the row's lifecycle instead:
+//
+//   - It has already claimed the row (escalated → auto_accepting) before
+//     calling in, so ResolveEscalation's escalated-guard could only ever fail
+//     here — and would fail an acceptance whose files were already written.
+//   - An automatic acceptance must never write a correction. That is the whole
+//     reason AuditStatusAutoAccepted exists as a status distinct from
+//     'resolved': a machine's decision to act is not evidence the suggestion
+//     was right, so it must not feed the confidence model or push a signature
+//     toward graduation.
+func (a *App) claimGeneratedTaskEscalation(ctx context.Context, audit *domain.AuditRecord, automated bool) (int64, error) {
+	if automated {
+		return 0, nil
+	}
+	// Atomically CLAIM the escalation. Only the writer that flips
+	// escalated→resolved proceeds to the non-idempotent send, so a
+	// double-submit can never send the task twice.
+	claimed, err := a.Store.ResolveEscalation(ctx, audit.ID)
+	if err != nil {
+		return 0, err
+	}
+	if !claimed {
+		return 0, fmt.Errorf("audit record %d is no longer a pending escalation", audit.ID)
+	}
+	// Best-effort: the escalation is already resolved and the source
+	// established, so a failed learning write must not fail the confirm — it
+	// only skips a learning event.
+	corrID, corrErr := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
+		Author: a.Author, CreatedAt: time.Now(),
+	})
+	if corrErr != nil {
+		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", corrErr)
+		return 0, nil
+	}
+	return corrID, nil
+}
+
+func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord, send, automated bool, screen func(string) error) error {
 	// The suggestion may carry one task or several (plain or as a Markdown
 	// list); normalize into clean bare task strings so the file is always a
 	// well-formed checklist, never raw multiline text written after "- [ ] ".
@@ -766,7 +811,19 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	}
 	// Cheap early-out for a stale re-confirm (already resolved/dismissed): the
 	// atomic claim below is the authoritative guard against the concurrent race.
-	if audit.Status != "escalated" {
+	//
+	// The AUTOMATED caller arrives with the row already claimed
+	// (escalated → auto_accepting), so it expects the claimed status here and
+	// there is no claim below for it to fall through to. Getting this wrong is
+	// not a degraded path but a destructive one: the error propagates to
+	// autoAcceptDeliveryFailed, which burns an attempt each sweep and DISMISSES
+	// the escalation once the budget is spent — so the feature would delete the
+	// very suggestions it exists to act on, a few minutes after each is raised.
+	want := "escalated"
+	if automated {
+		want = domain.AuditStatusAutoAccepting
+	}
+	if audit.Status != want {
 		return fmt.Errorf("audit record %d is no longer a pending escalation", audit.ID)
 	}
 
@@ -865,7 +922,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		external = append(external, s)
 	}
 	if s, ok := a.pickAppendTarget(ctx, cfg, name, external); ok {
-		return a.appendGeneratedTasks(ctx, audit, s, name, tasks, send)
+		return a.appendGeneratedTasks(ctx, audit, s, name, tasks, send, automated, screen)
 	}
 	if bootstrapErr != nil {
 		return bootstrapErr
@@ -915,27 +972,9 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		return fmt.Errorf("register task source: %w", err)
 	}
 
-	// Atomically CLAIM the escalation. Only the writer that flips
-	// escalated→resolved proceeds to the non-idempotent send, so a
-	// double-submit can never send the task twice.
-	claimed, err := a.Store.ResolveEscalation(ctx, audit.ID)
+	corrID, err := a.claimGeneratedTaskEscalation(ctx, audit, automated)
 	if err != nil {
 		return err
-	}
-	if !claimed {
-		return fmt.Errorf("audit record %d is no longer a pending escalation", audit.ID)
-	}
-
-	// Record the correction so the idle signature learns to drive from its
-	// declared task list. Best-effort: the escalation is already resolved and
-	// the source established, so a failed learning write must not fail the
-	// confirm — it only skips a learning event.
-	corrID, corrErr := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
-		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
-		Author: a.Author, CreatedAt: time.Now(),
-	})
-	if corrErr != nil {
-		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", corrErr)
 	}
 
 	if send && a.Herdr != nil {
@@ -954,6 +993,31 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		// fail spuriously after the escalation is already claimed.
 		taskText := merged[pos-1]
 		itemText := domain.GeneratedTaskItemText(pos-1, taskText)
+		// Rendered BEFORE the reservation so the screen below can refuse
+		// without leaving an item stranded at "[-]".
+		sourceIndexPre := ""
+		if freshCfg, cerr := a.Config(); cerr == nil {
+			if _, idx, rerr := resolveTaskSourceFor(freshCfg, name); rerr == nil {
+				sourceIndexPre = strconv.Itoa(idx)
+			}
+		}
+		prompt := domain.DeclaredTask{
+			Task: taskText, AgentName: name,
+			Path:        tasklocator.DisplayFor(path),
+			Remote:      tasklocator.Remote(path),
+			SourceIndex: sourceIndexPre,
+		}.Prompt()
+		// The LAST gate before the pane. The caller's rules are applied to the
+		// EXACT bytes that will be sent — template, resolved path and index all
+		// substituted — because a template can frame a benign task into
+		// something those rules refuse, and the raw task text cannot show that.
+		// Refused BEFORE the reservation, so nothing has to be rolled back.
+		if screen != nil {
+			if err := screen(prompt); err != nil {
+				return fmt.Errorf("the generated task was not sent: %w", err)
+			}
+		}
+
 		// Through the STORE (mutateList), not taskfile's local read-modify-write:
 		// `path` is a locator, and under a remote provider it is a `gist://…`
 		// URI that os.Stat can only fail on. The read/write above was already
@@ -965,6 +1029,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		if _, err := a.mutateList(ctx, cfg, path, reserveTask(pos, itemText)); err != nil {
 			return fmt.Errorf("task source created, but reserving task #%d (nothing was sent): %w", pos, err)
 		}
+		resID := a.recordAutomatedReservation(ctx, automated, audit, path, itemText, pos)
 		// Render through the same default next-task template used by a declared
 		// task source, so every idle-task handoff includes both the task and
 		// its list. The prompt sends the task text, not the numbered file line.
@@ -972,18 +1037,6 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		// position is read back by the agent-name rule — the same exactly-one
 		// resolution `hap task <name>` applies; ambiguity leaves the index
 		// empty and {task_source_index} falls back to the name.
-		sourceIndex := ""
-		if freshCfg, cerr := a.Config(); cerr == nil {
-			if _, idx, rerr := resolveTaskSourceFor(freshCfg, name); rerr == nil {
-				sourceIndex = strconv.Itoa(idx)
-			}
-		}
-		prompt := domain.DeclaredTask{
-			Task: taskText, AgentName: name,
-			Path:        tasklocator.DisplayFor(path),
-			Remote:      tasklocator.Remote(path),
-			SourceIndex: sourceIndex,
-		}.Prompt()
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
 			// WithoutCancel: this is the compensating write for a send that just
 			// failed, and the likeliest reason it failed — the operator quitting
@@ -991,6 +1044,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 			// would abort the release. A remote store actually uses this ctx for
 			// its HTTP calls, so inheriting the dead one guarantees the item is
 			// left stranded at "[-]" exactly when it matters most.
+			a.releaseAutomatedReservation(ctx, resID)
 			if _, rbErr := a.mutateList(context.WithoutCancel(ctx), cfg, path, releaseTask(pos, itemText)); rbErr != nil {
 				return fmt.Errorf("task source created, but sending the task failed (%w) and task #%d could not be returned to [ ] (%v) — "+
 					"it stays [-] and no agent will pick it up until you clear it", err, pos, rbErr)
@@ -1002,7 +1056,9 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		// not a verifyunblock situation, so this arms no self-check; it only
 		// lets the recently-resolved dedup window recognize this delivered
 		// confirm. Best-effort: delivery already succeeded.
-		if corrErr == nil {
+		// 0 when no correction was written — the automated path, or a failed
+		// best-effort insert.
+		if corrID != 0 {
 			if err := a.Store.MarkCorrectionSent(ctx, corrID); err != nil {
 				slog.Warn("marking generated-task correction sent failed", "audit", audit.ID, "error", err)
 			}
@@ -1390,6 +1446,66 @@ func (a *App) pickAppendTarget(ctx context.Context, cfg config.Config, name stri
 	return sources[0], true
 }
 
+// recordAutomatedReservation gives an UNATTENDED generated-task hand-out the
+// same durable ownership the daemon's own hand-outs have, returning the ledger
+// row id (0 when none was written).
+//
+// Without it, a crash between marking the item "[-]" and completing the send
+// strands the task: the audit row is reclaimed to 'escalated' at startup, but
+// the checklist marker is not, so the retry reads the item as already taken,
+// errors, burns its attempt budget and the escalation is dismissed. With the
+// row, daemon.reclaimStrandedTasks returns the item to "[ ]" once its agent is
+// parked past the grace window — the machinery that already exists for exactly
+// this failure.
+//
+// Only the AUTOMATED path records one. An operator's confirm is attended: the
+// error names the stranded item and a human can clear it, and adding ledger
+// rows there would also start barring manually-confirmed agents from the idle
+// poll until their hand-out settles.
+//
+// Best-effort: losing the row costs this hand-out its self-healing (the item
+// stays "[-]" until someone clears it), which is exactly the behavior before
+// the ledger existed — never a double send.
+func (a *App) recordAutomatedReservation(ctx context.Context, automated bool, audit *domain.AuditRecord,
+	locator, taskText string, index int) int64 {
+	if !automated {
+		return 0
+	}
+	id, err := a.Store.RecordTaskReservation(ctx, domain.TaskReservation{
+		SourcePath: tasklocator.Canonical(locator), TaskText: taskText, ItemIndex: index,
+		// TerminalID is unknown here — the front end holds no transition. Both
+		// readers treat an empty one as "matches any terminal" (the confirm
+		// query, and reclaim's sameTenant), so the row confirms and ages
+		// normally. The one thing it gives up is telling a RECYCLED pane apart:
+		// if this pane id is later reused by a different terminal, a busy
+		// successor pins the item "[-]" until staleHandoutTTL retires the row
+		// with a warning. Degraded, never a wrong send.
+		AgentID: audit.AgentID, PaneID: audit.AgentID,
+		AuditID: audit.ID, ReservedAt: time.Now(),
+	})
+	if err != nil {
+		slog.Error("generated task handed out but not recorded; it will not self-heal if the agent never starts it",
+			"agent", audit.AgentID, "task", taskText, "error", err)
+		return 0
+	}
+	return id
+}
+
+// releaseAutomatedReservation retires a ledger row whose hand-out was rolled
+// back, so a task returned to "[ ]" is not also left claimed in the ledger.
+func (a *App) releaseAutomatedReservation(ctx context.Context, id int64) {
+	if id == 0 {
+		return
+	}
+	// WithoutCancel like the rollback it accompanies: this undoes a write that
+	// already landed, and the likeliest cause of the failure is the very
+	// cancellation that would abort it.
+	if err := a.Store.DeleteTaskReservation(context.WithoutCancel(ctx), id); err != nil {
+		slog.Warn("could not retire the hand-out ledger row for a rolled-back task",
+			"reservation", id, "error", err)
+	}
+}
+
 // appendGeneratedTasks confirms generated tasks for an agent that already has
 // a declared task source: the tasks are appended to that source's own file.
 // The append runs BEFORE the escalation claim and is idempotent — tasks whose
@@ -1401,7 +1517,7 @@ func (a *App) pickAppendTarget(ctx context.Context, cfg config.Config, name stri
 // load-bearing order: the first task is RESERVED ("[-]" under the file lock)
 // before the send, so the daemon's idle flow can never hand it out mid-send,
 // and a failed send rolls it back to "[ ]".
-func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecord, target indexedTaskSource, name string, tasks []string, send bool) error {
+func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecord, target indexedTaskSource, name string, tasks []string, send, automated bool, screen func(string) error) error {
 	src := target.src
 	// Resolved through the registry, NOT by absolutizing src.Path. Under a
 	// remote provider src.Path is a bare file name inside the store, so
@@ -1424,7 +1540,12 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 	// agent has been handed work from). Create it so the mutation below has
 	// something to read. Idempotent and never clobbering, so it runs pre-claim
 	// while the escalation is still pending.
-	if _, err := a.ensureList(context.Background(), cfg, path, newListHeader(name)); err != nil {
+	// The CALLER's ctx: this is a forward mutation, not a compensating one, and
+	// under a remote provider it is a real network write. A cancelled caller —
+	// an operator quitting, or the daemon shutting down under an automated
+	// acceptance — must not still create a remote list. Nothing is lost by
+	// aborting: the create is idempotent and the escalation is still pending.
+	if _, err := a.ensureList(ctx, cfg, path, newListHeader(name)); err != nil {
 		return fmt.Errorf("create task list %s: %w", l.Display, err)
 	}
 
@@ -1495,25 +1616,9 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 		return fmt.Errorf("appending the generated tasks to %s failed (nothing was resolved — retry after fixing this): %w", path, err)
 	}
 
-	// Atomically CLAIM the escalation. Only the writer that flips
-	// escalated→resolved proceeds to the non-idempotent send, so a
-	// double-submit can never send the task twice.
-	claimed, err := a.Store.ResolveEscalation(ctx, audit.ID)
+	corrID, err := a.claimGeneratedTaskEscalation(ctx, audit, automated)
 	if err != nil {
 		return err
-	}
-	if !claimed {
-		return fmt.Errorf("audit record %d is no longer a pending escalation", audit.ID)
-	}
-
-	// Record the correction so the idle signature learns to drive from its
-	// declared task list. Best-effort, as in the bootstrap path.
-	corrID, corrErr := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
-		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
-		Author: a.Author, CreatedAt: time.Now(),
-	})
-	if corrErr != nil {
-		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", corrErr)
 	}
 
 	if send && a.Herdr != nil {
@@ -1526,9 +1631,11 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 		if strings.Contains(domain.TemplateOrDefault(src.NextTaskTemplate), "{cwd}") {
 			cwd = a.paneCwd(ctx, audit.AgentID)
 		}
-		if _, err := a.mutateTask(path, reserveTask(firstIndex, firstText)); err != nil {
-			return fmt.Errorf("tasks appended to %s, but reserving task #%d (nothing was sent): %w", path, firstIndex, err)
-		}
+		// Rendered — and screened — BEFORE the reservation. This is the path
+		// where the exact bytes matter most: the prompt goes through the
+		// SOURCE's own template, so a template the daemon never saw can frame a
+		// benign task into something the operator's rules refuse. Refusing here
+		// leaves no item stranded at "[-]".
 		prompt := domain.DeclaredTask{
 			Task: tasks[0], Template: src.NextTaskTemplate,
 			Path:      tasklocator.DisplayFor(path),
@@ -1536,7 +1643,17 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 			AgentName: name, Cwd: cwd,
 			SourceIndex: strconv.Itoa(target.index),
 		}.Prompt()
+		if screen != nil {
+			if err := screen(prompt); err != nil {
+				return fmt.Errorf("the generated task was not sent: %w", err)
+			}
+		}
+		if _, err := a.mutateTask(path, reserveTask(firstIndex, firstText)); err != nil {
+			return fmt.Errorf("tasks appended to %s, but reserving task #%d (nothing was sent): %w", path, firstIndex, err)
+		}
+		resID := a.recordAutomatedReservation(ctx, automated, audit, path, firstText, firstIndex)
 		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
+			a.releaseAutomatedReservation(ctx, resID)
 			if _, rbErr := a.mutateTask(path, releaseTask(firstIndex, firstText)); rbErr != nil {
 				return fmt.Errorf("sending the task failed (%w) and task #%d could not be returned to [ ] (%v) — "+
 					"it stays [-] and no agent will pick it up until you clear it", err, firstIndex, rbErr)
@@ -1546,7 +1663,9 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 		// Delivered — flag the correction sent so the recently-resolved dedup
 		// window recognizes this confirm (see the bootstrap path for why this is
 		// safe: idle is not a verifyunblock situation). Best-effort.
-		if corrErr == nil {
+		// 0 when no correction was written — the automated path, or a failed
+		// best-effort insert.
+		if corrID != 0 {
 			if err := a.Store.MarkCorrectionSent(ctx, corrID); err != nil {
 				slog.Warn("marking generated-task correction sent failed", "audit", audit.ID, "error", err)
 			}
@@ -1876,6 +1995,10 @@ var ConfigFields = []ConfigFieldDef{
 	// Config tab (where it gets its own section) rather than sitting in the
 	// middle of forty tuning knobs.
 	{Key: FSPFieldKey, TUIEditable: true},
+	// The mode's two behavior keys, beside the switch they modify so the TUI
+	// renders all three under one "Full self-prompting" section.
+	{Key: FSPHonourLimitsFieldKey, TUIEditable: true},
+	{Key: FSPAcceptGeneratedTaskFieldKey, TUIEditable: true},
 	{Key: "confidence_thresholds.minimum", TUIEditable: true},
 	{Key: "confidence_thresholds.idle", TUIEditable: true},
 	{Key: "confidence_thresholds.approval", TUIEditable: true},
@@ -2147,6 +2270,10 @@ func FieldValue(cfg config.Config, key string) string {
 		return autoAcceptValue(cfg.Escalations.AutoAccept.Unclassifiable, 0)
 	case FSPFieldKey:
 		return strconv.FormatBool(cfg.FullSelfPrompting.Enabled)
+	case FSPHonourLimitsFieldKey:
+		return strconv.FormatBool(cfg.FullSelfPrompting.HonourLimits)
+	case FSPAcceptGeneratedTaskFieldKey:
+		return strconv.FormatBool(cfg.FullSelfPrompting.AcceptGeneratedTask)
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -2413,6 +2540,23 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 				fspToggledTo = &v
 			}
 			cfg.FullSelfPrompting.Enabled = v
+			return nil
+		case FSPHonourLimitsFieldKey:
+			// Deliberately NOT gated like FSPFieldKey above: this describes what
+			// the mode does, it does not grant autonomy, and tightening a safety
+			// bound must never be refusable.
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("%s must be true or false, got %q", FSPHonourLimitsFieldKey, value)
+			}
+			cfg.FullSelfPrompting.HonourLimits = v
+			return nil
+		case FSPAcceptGeneratedTaskFieldKey:
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("%s must be true or false, got %q", FSPAcceptGeneratedTaskFieldKey, value)
+			}
+			cfg.FullSelfPrompting.AcceptGeneratedTask = v
 			return nil
 		case "escalations.auto_accept.approval":
 			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Approval)
@@ -4404,6 +4548,15 @@ func AuditStatusLabel(r domain.AuditRecord) string {
 	switch r.Status {
 	case domain.AuditStatusAutoAccepted:
 		// Deliberately not "resolved": nothing was learned from it.
+		//
+		// Split by CAUSE, because the status cannot carry it: a timed threshold
+		// expiring and a mode the operator switched on are very different
+		// things to find in the log, and both write auto_accepted. Done here
+		// rather than as a new CLI column — `hap audit` prints tab-separated
+		// rows that scripts parse.
+		if r.WhileFSPModeOn {
+			return "fsp-sent"
+		}
 		return "auto-sent"
 	case domain.AuditStatusAutoAccepting:
 		// Transient and normally invisible — a row only shows this while a

@@ -123,11 +123,27 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	// staleness check would be comparing against history.
 	panes := &paneCache{}
 	accepted := 0
+	// Decided once for the whole sweep, and threaded into autoAcceptOne, so the
+	// eligibility filter and the delivery fork can never disagree about it.
+	allowGenerated := d.acceptGeneratedTaskAllowed(cfg, fsp)
+	// Re-asked per row, immediately before each claim. Only full self-prompting
+	// carries it: timed auto-accept's contract is its threshold, and it has no
+	// global switch that could be flipped mid-chain. Re-reads the config
+	// snapshot, so an `enabled = false` that landed since this sweep began is
+	// seen — as is the in-memory ceiling latch.
+	var permitted func() bool
+	if fsp {
+		permitted = d.fspStillOn
+	}
+	// Set once a [limits] ceiling stands the mode down mid-sweep: nothing more
+	// is delivered, but the loop keeps running so the remaining candidates stay
+	// accounted for.
+	stoodDown := false
 
 	for i := range candidates {
 		rec := &candidates[i]
 		suggestion := domain.SuggestedAction(rec)
-		if why := domain.AutoAcceptIneligible(rec, suggestion); why != "" {
+		if why := domain.AutoAcceptIneligible(rec, suggestion, allowGenerated); why != "" {
 			// Ineligible is NOT stale: the escalation stays pending for the
 			// operator. The missing-baseline case is logged once per run so an
 			// operator whose pre-upgrade backlog never auto-accepts can find
@@ -151,8 +167,48 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		if d.paneBusy(rec.AgentID) {
 			continue
 		}
+		// The [limits] ceilings, when the operator asked full self-prompting to
+		// obey them. Checked BEFORE the delivery — the historical behavior only
+		// advanced the counters and let the NEXT decision notice, which always
+		// overshoots by one — and a trip stands the whole mode down rather than
+		// merely skipping this row.
+		//
+		// Gated on the row being DELIVERABLE first, which is not a nicety. The
+		// consecutive counter is only ever reset by human interaction, so an
+		// agent that saturated it and was then killed carries it forever; its
+		// leftover escalation row is still a candidate here. Checking the
+		// ceiling before knowing whether the row could deliver would stand the
+		// mode down for the whole herd over that dead agent — and re-trip on
+		// the same row after every operator re-enable, since the latch clears
+		// on reload. Worse, an early exit here means autoAcceptOne never runs,
+		// so the absence bookkeeping that would eventually RETIRE that row
+		// never advances either, and the livelock has no end.
+		agent, present := live[rec.AgentID]
+		if !present || !autoAcceptParked(agent.Status) {
+			// autoAcceptOne owns what happens to such a row (absence
+			// confirmation, retirement); this only declines to read it as a
+			// ceiling.
+			if d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp, allowGenerated, permitted) == autoAcceptRetired {
+				delete(stillEligible, rec.ID)
+			}
+			continue
+		}
+		if fsp && !stoodDown {
+			if why := d.fspCeilingReached(ctx, cfg, rec.AgentID, now); why != "" {
+				d.disableFSPAtCeiling(ctx, rec.AgentID, why)
+				stoodDown = true
+			}
+		}
+		// Stop DELIVERING once the mode has stood down, but keep walking the
+		// candidates: `continue` rather than `break` so every remaining row
+		// still registers in stillEligible — a break would hand them to
+		// pruneAutoAcceptState, silently resetting their delivery budgets and
+		// absence counts.
+		if stoodDown {
+			continue
+		}
 
-		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, panes, now); outcome {
+		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp, allowGenerated, permitted); outcome {
 		case autoAcceptDelivered:
 			handledAgent[rec.AgentID] = true
 			accepted++
@@ -201,8 +257,25 @@ const (
 
 // autoAcceptOne runs the guard chain for a single escalation and, if it passes,
 // claims → delivers → finalizes.
+//
+// fsp says whether full self-prompting is what brought this row here. It steers
+// two things and nothing else: the generated-task branch (which only FSP may
+// take) and the attribution written at finalize. The guard chain is identical
+// either way — the safety exclusions never depend on who is asking.
+//
+// allowGeneratedTask is the SAME predicate eligibility was decided on, passed
+// down rather than recomputed: a weaker local test here would pass a row the
+// eligibility filter had refused, and the coupling between the two would be
+// invisible.
+//
+// stillPermitted (nil = always) is re-asked immediately before the claim. The
+// guard chain above it does pane READS — a herdr shell-out with a budget in
+// seconds — so an operator switching full self-prompting off mid-chain would
+// otherwise still get the send that follows. WithAgentAutomation covers the
+// per-AGENT disable at delivery; this covers the global mode.
 func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, suggestion string,
-	live map[string]domain.AgentTransition, panes *paneCache, now time.Time) autoAcceptOutcome {
+	live map[string]domain.AgentTransition, panes *paneCache, now time.Time,
+	fsp, allowGeneratedTask bool, stillPermitted func() bool) autoAcceptOutcome {
 
 	agent, present := live[rec.AgentID]
 	if !present {
@@ -250,6 +323,13 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	// update, so an operator confirming this same escalation right now cannot
 	// produce a double send: exactly one writer wins, and only the winner
 	// delivers.
+	// Last look before the claim, on the freshest state: everything above this
+	// point may have taken seconds.
+	if stillPermitted != nil && !stillPermitted() {
+		slog.Info("auto-accept: the mode was switched off while this escalation was being checked; leaving it pending",
+			"audit_id", rec.ID, "agent", rec.AgentID)
+		return autoAcceptSkipped
+	}
 	claimed, err := d.opt.Store.ClaimForAutoAccept(ctx, rec.ID)
 	if err != nil {
 		slog.Warn("auto-accept: claim failed", "audit_id", rec.ID, "error", err)
@@ -261,7 +341,74 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 		return autoAcceptSkipped
 	}
 
-	if err := d.autoAcceptDeliver(ctx, rec, suggestion); err != nil {
+	// A generated-task suggestion is not a pane send at all: it writes the
+	// agent's checklist, registers the task source and hands the first task
+	// over. Only full self-prompting can reach this branch — eligibility refuses
+	// the suggestion outright for every other flavour — and only through the
+	// seam, whose absence means the capability was never wired (the row simply
+	// waits for the operator).
+	deliver := func() error { return d.autoAcceptDeliver(ctx, rec, suggestion) }
+	if suggestion == domain.SuggestGenerateTask {
+		unhandled := ""
+		switch {
+		case !allowGeneratedTask:
+			unhandled = "the capability is not available"
+		default:
+			// SC-5: the task text is LLM-authored and did NOT exist when Decide
+			// ran — the generator wrote it afterwards — so nothing has screened
+			// it yet. Every other outbound the daemon sends was screened either
+			// at Decide time or by its own re-gate; this one had a human in the
+			// loop instead, and full self-prompting removes that human. Screen
+			// it here, in the one place both the sweep and the immediate hook
+			// pass through.
+			if why := d.generatedTaskUnsafe(rec); why != "" {
+				unhandled = why
+			}
+		}
+		if unhandled != "" {
+			// Nothing was delivered, so return the claim rather than leaving the
+			// row stuck in the transient 'auto_accepting' status. Pending is the
+			// correct destination for a safety refusal too: a never-auto match
+			// must always reach a human (FR-015), and this row is now waiting
+			// for one.
+			slog.Info("auto-accept: leaving a generated-task escalation for the operator",
+				"audit_id", rec.ID, "agent", rec.AgentID, "reason", unhandled)
+			if ok, rerr := d.opt.Store.RevertAutoAccept(ctx, rec.ID); rerr != nil || !ok {
+				slog.Warn("auto-accept: could not return an unhandled generated-task escalation to the queue",
+					"audit_id", rec.ID, "claimed", ok, "error", rerr)
+			}
+			return autoAcceptSkipped
+		}
+		// Inside the SAME cross-process lifecycle barrier autoAcceptDeliver
+		// uses, so an operator disabling the agent cannot have this commit
+		// mid-flight. Without it a disable landing between Guard 1b and the
+		// seam's own send still reaches the pane — the barrier exists precisely
+		// because those two moments are not the same moment.
+		//
+		// Safe against the config lock the seam takes on its way through
+		// addTaskSourceIfAbsent: the barrier is a per-AGENT flock under the
+		// state dir, the config lock is a separate file, and no path takes them
+		// in the opposite order (DisableFSP takes only the config lock;
+		// disabling an agent takes only the barrier), so there is no cycle.
+		deliver = func() error {
+			var inner error
+			disabled, err := d.opt.Store.WithAgentAutomation(ctx, rec.AgentID, func() {
+				inner = d.opt.AcceptGeneratedTask(ctx, rec.ID, true, func(prompt string) error {
+					return d.screenOutbound(rec.AgentType, prompt)
+				})
+			})
+			switch {
+			case err != nil:
+				return err
+			case disabled:
+				// Suppression, not failure — it must not burn a delivery
+				// attempt, exactly as autoAcceptDeliver treats it.
+				return errAgentDisabled
+			}
+			return inner
+		}
+	}
+	if err := deliver(); err != nil {
 		return d.autoAcceptDeliveryFailed(ctx, rec, err, now)
 	}
 
@@ -269,7 +416,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	// automatic acceptance contributes no learning event, no confidence and no
 	// graduation progress. A machine's decision to stop waiting is not evidence
 	// the suggestion was right.
-	ok, err := d.opt.Store.MarkAutoAccepted(ctx, rec.ID)
+	ok, err := d.opt.Store.MarkAutoAccepted(ctx, rec.ID, fsp)
 	if err != nil {
 		// The reply LANDED but the row is still 'auto_accepting' — a status
 		// excluded from both the operator's queue and the candidate query. Left
@@ -279,7 +426,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 		// every subsequent tick until it sticks.
 		slog.Warn("auto-accept: finalize failed after a successful delivery; will retry",
 			"audit_id", rec.ID, "error", err)
-		d.noteAutoAcceptNeedsFinalize(rec.ID)
+		d.noteAutoAcceptNeedsFinalize(rec.ID, fsp)
 	} else if !ok {
 		// Zero rows is a no-op, not an error: another writer already moved the
 		// row. This tolerance is what makes the startup reclaim safe when two
@@ -437,6 +584,15 @@ func (d *Daemon) fspActive(ctx context.Context, cfg config.Config) bool {
 	if !cfg.FullSelfPrompting.Enabled {
 		return false
 	}
+	// A ceiling stand-down takes effect immediately, before the config write it
+	// triggered has landed and come back as a reload. Checked here so BOTH the
+	// sweep and the escalate-time hook honour it through one gate.
+	d.mu.Lock()
+	latched := d.fspCeilingLatched
+	d.mu.Unlock()
+	if latched {
+		return false
+	}
 	reason := ""
 	if p := d.llmPort(); p == nil || !p.Configured() {
 		reason = "llm.command is no longer configured"
@@ -462,6 +618,199 @@ func (d *Daemon) fspActive(ctx context.Context, cfg config.Config) bool {
 			"reverting to normal escalation flow until fixed", "reason", reason)
 	}
 	return false
+}
+
+// acceptGeneratedTaskAllowed reports whether an LLM-GENERATED task suggestion
+// may be acted on right now.
+//
+// Three conditions, all required. Full self-prompting must be the flavour
+// running (timed auto-accept never gets this: its contract is answering the
+// question already on screen), the operator must have opted in separately from
+// enabling the mode, and the capability must actually be wired — without the
+// seam there is nothing to accept WITH, and claiming eligibility would only
+// produce a claim this pass then has to hand back.
+func (d *Daemon) acceptGeneratedTaskAllowed(cfg config.Config, fsp bool) bool {
+	return fsp && cfg.FullSelfPrompting.AcceptGeneratedTask && d.opt.AcceptGeneratedTask != nil
+}
+
+// generatedTaskUnsafe screens an LLM-GENERATED task before full self-prompting
+// acts on it, returning a diagnostic when it must not be sent, or "".
+//
+// This is not redundant with the screens at Decide time. The task text is
+// authored by the generator LLM AFTER the decision that raised the escalation,
+// so no safety control has ever seen it: `handleTaskGenOutcome` validates the
+// shape (sentinels, empty output) and stops there, because the operator's
+// confirm was the gate. Full self-prompting removes that gate, so the screen
+// has to exist here or an LLM's own words reach a pane un-vetted — exactly what
+// "safety controls are never bypassed" forbids.
+//
+// It screens the RENDERED prompt, not the raw suggestion, for the reason
+// tasklistreview does: stored task text keeps line breaks as the literal
+// two-character `\n`, and a line-anchored pattern (every seed rule, and any
+// operator `(?m)^…` rule) cannot match across an encoded newline while it does
+// match the real one that reaches the pane. Screening the stored form fails
+// OPEN. The probe carries only the task — the path and index substitutions are
+// hap's own text, not the model's.
+// It is a PRE-check, not the whole story: the bytes screened here are rendered
+// with the DEFAULT template, because the target source — and therefore its own
+// next_task_template, resolved path and index — is only chosen further down,
+// inside the seam. A custom template can frame a benign task into something the
+// rules refuse, so the seam is also handed screenOutbound and calls it with the
+// exact prompt immediately before the send. This check earns its place by
+// refusing obvious cases BEFORE any task list is written or source registered.
+func (d *Daemon) generatedTaskUnsafe(rec *domain.AuditRecord) string {
+	raw := strings.TrimPrefix(rec.Suggestion, domain.SuggestTaskPrefix)
+	for _, task := range domain.NormalizeGeneratedTasks(raw) {
+		if err := d.screenOutbound(rec.AgentType, domain.DeclaredTask{Task: task, Content: task}.Prompt()); err != nil {
+			return "generated task " + err.Error()
+		}
+	}
+	return ""
+}
+
+// screenOutbound applies the two content safety controls to text that is about
+// to reach a pane: the operator's never-auto rules and the suspected-irreversible
+// heuristic. It is the single definition both generated-task checks share, so
+// the pre-check and the at-send check can never diverge on WHAT they screen.
+//
+// A nil rule list means none are configured, which is the operator having no
+// patterns — not a reason to refuse.
+func (d *Daemon) screenOutbound(agentType, text string) error {
+	_, allow, _ := d.snapshot()
+	if allow == nil {
+		return nil
+	}
+	if hit, matched := allow.Match(agentType, text); matched {
+		return fmt.Errorf("matched never-auto %s", hit.Diagnostic())
+	}
+	if hit, sus := allow.SuspectedIrreversible(agentType, text); sus {
+		return fmt.Errorf("tripped irreversible %s", hit.Diagnostic())
+	}
+	return nil
+}
+
+// fspCeilingReached reports whether this agent has reached a [limits] runaway
+// ceiling, when full self-prompting is configured to obey them.
+//
+// It deliberately does NOT go through domain.CheckRate, for two reasons.
+//
+// CheckRate's first branch answers "rate_limited" for a PAUSED agent, and a
+// pause is NOT a ceiling: the operator may have paused that one agent, or the
+// ordinary decision path may have paused it earlier. Standing the whole mode
+// down over that would punish the herd for a per-agent state Guard 1b
+// (autoAcceptAgentSuppressed) already handles correctly, one row later. So the
+// pause is never consulted here at all — only the two counters are.
+//
+// And CheckRate collapses both ceilings into one verdict, while the stand-down
+// has to NAME the one that tripped. "a ceiling was reached" is not actionable:
+// one means "this agent has been answered N times with no human check-in" and
+// the other means "sends are outpacing the per-minute cap" — different causes,
+// different responses. The per-minute test honours the window ROLLOVER for the
+// same reason CheckRate does: a count from a window that elapsed minutes ago
+// would otherwise switch the mode off over traffic that has already stopped.
+//
+// Fails CLOSED in the safe direction for this feature: an unreadable rate row
+// reports "not reached", because the alternative is switching the operator's
+// mode off over a transient store error. The delivery it allows is still gated
+// by every other guard in the chain, including the pause read that follows.
+func (d *Daemon) fspCeilingReached(ctx context.Context, cfg config.Config, agentID string, now time.Time) string {
+	if !cfg.FullSelfPrompting.HonourLimits {
+		return ""
+	}
+	rate, err := d.opt.Store.GetAgentRate(ctx, agentID)
+	if err != nil || rate == nil {
+		slog.Warn("full self-prompting: agent-rate read failed; not treating it as a ceiling",
+			"agent", agentID, "error", err)
+		return ""
+	}
+	if rate.ConsecutiveAuto >= cfg.Limits.MaxConsecutiveAutoPrompts {
+		return fmt.Sprintf("%d consecutive auto-prompts with no human check-in (limits.max_consecutive_auto_prompts = %d)",
+			rate.ConsecutiveAuto, cfg.Limits.MaxConsecutiveAutoPrompts)
+	}
+	inWindow := rate.CountInWindow
+	if now.Sub(rate.WindowStart) >= time.Minute {
+		inWindow = 0 // the window rolled over; nothing has been sent in the new one
+	}
+	if inWindow >= cfg.Limits.MaxAutoPromptsPerMinute {
+		return fmt.Sprintf("%d auto-prompts in the last minute (limits.max_auto_prompts_per_minute = %d)",
+			inWindow, cfg.Limits.MaxAutoPromptsPerMinute)
+	}
+	return ""
+}
+
+// disableFSPAtCeiling stands full self-prompting down after a [limits] ceiling.
+//
+// The in-memory latch is set FIRST and synchronously, so the sweep this was
+// called from — and every other one until the reload lands — stops immediately.
+// The config write then happens on a tracked goroutine, because the write path
+// nudges this daemon's own control socket to reload: doing it inline on the
+// select loop would block that loop on a round trip to itself.
+//
+// The operator is told twice, deliberately. Turning autonomy off silently is
+// the one outcome that must not happen — an operator who never learns the mode
+// went off simply concludes it stopped working.
+func (d *Daemon) disableFSPAtCeiling(ctx context.Context, agentID, ceiling string) {
+	d.mu.Lock()
+	already := d.fspCeilingLatched
+	d.fspCeilingLatched = true
+	d.mu.Unlock()
+	if already {
+		return // the write is already in flight; never queue a second one
+	}
+
+	reason := fmt.Sprintf("agent %s reached a [limits] runaway ceiling: %s", agentID, ceiling)
+	slog.Warn("full self-prompting: a runaway ceiling was reached; switching the mode off",
+		"agent", agentID, "ceiling", ceiling)
+
+	if d.opt.DisableFSP == nil {
+		// Nothing to write to. The latch still holds for this process, so the
+		// mode really is off until a restart — but config.toml keeps saying ON,
+		// so say so rather than letting the two disagree quietly.
+		slog.Warn("full self-prompting: no config writer is wired, so the mode is off " +
+			"only until this daemon restarts; turn it off yourself to make it stick")
+		return
+	}
+	// WithoutCancel for the reason every other compensating write in this repo
+	// takes it: this write RECORDS a decision already made and already acting
+	// (the latch), and the likeliest way the caller's ctx dies is the daemon
+	// shutting down — which would drop the write while the in-memory latch goes
+	// with it, bringing the mode back up on the next start.
+	writeCtx := context.WithoutCancel(ctx)
+	d.spawn(func() {
+		logging.Guard("fsp-disable", func() error {
+			if err := d.opt.DisableFSP(writeCtx, reason); err != nil {
+				// The latch stands regardless: this daemon has already decided
+				// to stop, and a failed write must not be read as permission to
+				// carry on.
+				slog.Error("full self-prompting: could not switch the mode off in config",
+					"error", err)
+				return nil
+			}
+			d.notify(writeCtx, "Full self-prompting switched off",
+				reason+" — escalations are queued for you again. Re-enable it once you have checked in.")
+			return nil
+		})
+	})
+}
+
+// fspStillOn is the CHEAP re-check run immediately before each claim: is the
+// mode still switched on right now?
+//
+// Deliberately not fspActive. That one also queries the store for the graduated
+// rule count, and this runs once per candidate row — up to the sweep's whole
+// candidate cap, on the select loop. The runtime PRECONDITIONS it checks were
+// evaluated once when the sweep began and do not need re-polling per row;
+// what can change under us mid-sweep is an operator action, and both of its
+// forms are in memory here: the config snapshot (their `config set … false`,
+// once the reload lands) and the ceiling latch.
+func (d *Daemon) fspStillOn() bool {
+	cfg, _, _ := d.snapshot()
+	if !cfg.FullSelfPrompting.Enabled {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return !d.fspCeilingLatched
 }
 
 // noteFSPSend records a full self-prompting delivery against the FR-019 runaway
@@ -592,7 +941,9 @@ func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
 		return
 	}
 	suggestion := domain.SuggestedAction(rec)
-	if domain.AutoAcceptIneligible(rec, suggestion) != "" {
+	allowGenerated := d.acceptGeneratedTaskAllowed(cfg, true)
+	permitted := d.fspStillOn
+	if domain.AutoAcceptIneligible(rec, suggestion, allowGenerated) != "" {
 		return // stays for the operator (never-auto & friends), or unanswerable
 	}
 	// The agent must still be PARKED, checked against herdr right now rather
@@ -619,8 +970,17 @@ func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
 			"agent", rec.AgentID, "audit_id", rec.ID, "status", agent.Status)
 		return
 	}
+	// The [limits] ceilings, checked before acting for the same reason the sweep
+	// checks them: this path has no waiting threshold at all, so without a
+	// pre-check the mode answers first and notices the ceiling afterwards. AFTER
+	// the parked check, also for the sweep's reason — a row that could not have
+	// been delivered anyway is no evidence the mode is running away.
+	if why := d.fspCeilingReached(ctx, cfg, rec.AgentID, now); why != "" {
+		d.disableFSPAtCeiling(ctx, rec.AgentID, why)
+		return
+	}
 	live := map[string]domain.AgentTransition{rec.AgentID: agent}
-	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now) == autoAcceptDelivered {
+	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now, true, allowGenerated, permitted) == autoAcceptDelivered {
 		d.noteFSPSend(ctx, rec.AgentID, now)
 		slog.Info("full self-prompting: escalation answered immediately",
 			"agent", rec.AgentID, "audit_id", rec.ID)
@@ -685,10 +1045,15 @@ func (d *Daemon) noteAutoAcceptAttempt(auditID int64) int {
 
 // noteAutoAcceptNeedsFinalize records a delivered escalation whose finalize did
 // not commit, so a later tick can settle it.
-func (d *Daemon) noteAutoAcceptNeedsFinalize(auditID int64) {
+//
+// whileFSP rides along because the retry below is the ONLY other caller of
+// MarkAutoAccepted, and it has no per-row context of its own. A map of bare ids
+// would drop the attribution on exactly the rows whose bookkeeping already
+// went wrong once.
+func (d *Daemon) noteAutoAcceptNeedsFinalize(auditID int64, whileFSP bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.autoAcceptNeedsFinalize[auditID] = struct{}{}
+	d.autoAcceptNeedsFinalize[auditID] = whileFSP
 }
 
 // retryAutoAcceptFinalize re-attempts MarkAutoAccepted for every delivery whose
@@ -710,14 +1075,16 @@ func (d *Daemon) retryAutoAcceptFinalize(ctx context.Context) {
 		return
 	}
 	ids := make([]int64, 0, len(d.autoAcceptNeedsFinalize))
-	for id := range d.autoAcceptNeedsFinalize {
+	fsp := make(map[int64]bool, len(d.autoAcceptNeedsFinalize))
+	for id, whileFSP := range d.autoAcceptNeedsFinalize {
 		ids = append(ids, id)
+		fsp[id] = whileFSP
 	}
 	d.mu.Unlock()
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
 	for _, id := range ids {
-		ok, err := d.opt.Store.MarkAutoAccepted(ctx, id)
+		ok, err := d.opt.Store.MarkAutoAccepted(ctx, id, fsp[id])
 		if err != nil {
 			// Still broken. Keep the entry and try again next tick.
 			slog.Warn("auto-accept: finalize retry failed; still pending",

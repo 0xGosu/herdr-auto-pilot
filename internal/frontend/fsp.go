@@ -17,6 +17,18 @@ import (
 // section all name the same spelling.
 const FSPFieldKey = "full_self_prompting.enabled"
 
+// FSPHonourLimitsFieldKey and FSPAcceptGeneratedTaskFieldKey are the mode's two
+// behavior keys, named here for the same reason FSPFieldKey is: the registry,
+// both switches and the TUI section must all spell them identically.
+//
+// Neither is precondition-gated. They describe what the mode does once it is
+// on, so setting them while it is off is meaningful (and is how an operator
+// configures it before enabling); only FSPFieldKey itself grants autonomy.
+const (
+	FSPHonourLimitsFieldKey        = "full_self_prompting.honour_limits"
+	FSPAcceptGeneratedTaskFieldKey = "full_self_prompting.accept_generated_task"
+)
+
 // DeprecatedFSPFieldKey is the pre-move spelling. It is NOT registered — it may
 // never be offered for writing — but it still RESOLVES, because the config file
 // carrying the old table keeps loading and the two surfaces must not disagree.
@@ -44,6 +56,53 @@ func CanonicalConfigKey(key string) (canonical string, moved bool) {
 func (a *App) SetFullSelfPrompting(ctx context.Context, on bool) error {
 	_, err := a.SetField(ctx, FSPFieldKey, strconv.FormatBool(on))
 	return err
+}
+
+// DisableFullSelfPromptingWithReason switches the mode off on the daemon's
+// behalf, after a [limits] runaway ceiling. It is the daemon's seam
+// (daemon.Options.DisableFSP), wired in cmd/hap.
+//
+// It goes through the ordinary set path deliberately: that is what takes the
+// cross-process config lock, records the fsp_off row in the automation history
+// under the same ordering guarantee an operator's toggle gets, and nudges the
+// daemon to reload. Disabling is never precondition-gated, so this cannot be
+// refused. reason is logged, not persisted — the history row says WHO, the
+// daemon's own warning says why.
+func (a *App) DisableFullSelfPromptingWithReason(ctx context.Context, reason string) error {
+	slog.Info("switching full self-prompting off on the daemon's request", "reason", reason)
+	return a.SetFullSelfPrompting(ctx, false)
+}
+
+// AcceptGeneratedTaskAutomatically is the daemon's seam
+// (daemon.Options.AcceptGeneratedTask) for acting on an idle escalation whose
+// suggestion is an LLM-generated task, under full self-prompting.
+//
+// It reuses the operator's confirm path verbatim — the bootstrap-vs-append
+// choice, remote locator resolution, the append merge that never drops an
+// existing item, source registration, and the reserve→send→roll-back order —
+// because every one of those carries an invariant that must not be re-derived.
+// The single difference is the `automated` flag: the caller has already claimed
+// the audit row and will finalize it, so this writes neither the status nor a
+// learning correction.
+//
+// The side effects it performs before any send (writing the list, registering
+// the source) are idempotent, so a failure returned here is safe for the
+// caller's ordinary delivery retry.
+func (a *App) AcceptGeneratedTaskAutomatically(ctx context.Context, auditID int64, send bool, screen func(string) error) error {
+	audit, err := a.Store.GetAudit(ctx, auditID)
+	if err != nil {
+		return err
+	}
+	if audit == nil {
+		return fmt.Errorf("audit record %d not found", auditID)
+	}
+	if domain.SuggestedAction(audit) != domain.SuggestGenerateTask {
+		// The caller resolved the suggestion before choosing this branch, so a
+		// mismatch means the row changed underneath it. Refuse rather than
+		// guess: everything below writes task lists.
+		return fmt.Errorf("audit record %d no longer carries a generated-task suggestion", auditID)
+	}
+	return a.acceptGeneratedTask(ctx, audit, send, true, screen)
 }
 
 // recordFSPToggle appends one full self-prompting change to the automation

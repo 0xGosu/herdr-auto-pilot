@@ -53,7 +53,7 @@ func TestAutoAcceptEligible(t *testing.T) {
 		domain.ReasonUnclassifiable,
 	} {
 		rec := escalation("[" + string(reason) + "] why")
-		if why := domain.AutoAcceptIneligible(rec, "Yes"); why != "" {
+		if why := domain.AutoAcceptIneligible(rec, "Yes", false); why != "" {
 			t.Errorf("reason %q should be eligible, got %q", reason, why)
 		}
 	}
@@ -66,9 +66,12 @@ func TestAutoAcceptIneligible(t *testing.T) {
 		name       string
 		rec        *domain.AuditRecord
 		suggestion string
-		wantWhy    string
+		// allowGeneratedTask is full self-prompting's opt-in. Zero value false
+		// keeps every pre-existing case asserting the historical behavior.
+		allowGeneratedTask bool
+		wantWhy            string
 	}{
-		{"nil", nil, "Yes", "no record"},
+		{name: "nil", rec: nil, suggestion: "Yes", wantWhy: "no record"},
 		{
 			// FR-015: a never-auto match ALWAYS reaches a human. A timeout is
 			// not a human.
@@ -99,6 +102,29 @@ func TestAutoAcceptIneligible(t *testing.T) {
 			name:       "generated-task suggestion",
 			rec:        escalation("[task_source_exhausted] nothing pending"),
 			suggestion: domain.SuggestGenerateTask, wantWhy: "generated-task suggestion",
+		},
+		{
+			// full_self_prompting.accept_generated_task lifts THIS refusal and
+			// only this one — the caller can write task lists.
+			name:               "generated-task suggestion is allowed when the caller opted in",
+			rec:                escalation("[task_source_exhausted] nothing pending"),
+			suggestion:         domain.SuggestGenerateTask,
+			allowGeneratedTask: true, wantWhy: "",
+		},
+		{
+			// The opt-in is scoped: it must not become a general "accept more"
+			// switch. A never-auto match still reaches a human.
+			name:               "the generated-task opt-in never lifts a safety exclusion",
+			rec:                escalation("[never_auto_match] matches seed rule rm -rf"),
+			suggestion:         domain.SuggestGenerateTask,
+			allowGeneratedTask: true, wantWhy: "excluded reason: never_auto_match",
+		},
+		{
+			// Nor the noop sentinel, which would be typed at the agent.
+			name:               "the generated-task opt-in never lifts the noop refusal",
+			rec:                escalation("[shadow_mode] learning"),
+			suggestion:         domain.ActionNoop,
+			allowGeneratedTask: true, wantWhy: "noop suggestion",
 		},
 		{
 			// FR-014's ceiling: auto-accepting this re-sends the very retry the
@@ -149,7 +175,7 @@ func TestAutoAcceptIneligible(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if why := domain.AutoAcceptIneligible(tt.rec, tt.suggestion); why != tt.wantWhy {
+			if why := domain.AutoAcceptIneligible(tt.rec, tt.suggestion, tt.allowGeneratedTask); why != tt.wantWhy {
 				t.Errorf("AutoAcceptIneligible = %q, want %q", why, tt.wantWhy)
 			}
 		})

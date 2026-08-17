@@ -369,7 +369,9 @@ type DaemonStore interface {
 	// ClaimForAutoAccept moves escalated -> auto_accepting, before delivery.
 	ClaimForAutoAccept(ctx context.Context, auditID int64) (bool, error)
 	// MarkAutoAccepted moves auto_accepting -> auto_accepted, after delivery.
-	MarkAutoAccepted(ctx context.Context, auditID int64) (bool, error)
+	// whileFSP records whether full self-prompting caused it, written in the
+	// same guarded update as the status.
+	MarkAutoAccepted(ctx context.Context, auditID int64, whileFSP bool) (bool, error)
 	// RevertAutoAccept moves auto_accepting -> escalated when delivery failed.
 	RevertAutoAccept(ctx context.Context, auditID int64) (bool, error)
 	// ReclaimAbandonedAutoAccepts returns every row left mid-delivery by a
@@ -456,6 +458,16 @@ type DaemonStore interface {
 // FrontendStore is the front-end (TUI/CLI) write surface plus shared reads.
 type FrontendStore interface {
 	ReadStore
+
+	// RecordTaskReservation / DeleteTaskReservation give an UNATTENDED
+	// generated-task hand-out the same durable ownership the daemon's own
+	// hand-outs have. Without a ledger row, a crash between marking the item
+	// "[-]" and sending it leaves the task claimed with nothing to recover it:
+	// the retry reads the item as already taken, gives up after the attempt
+	// budget, and strands it. The operator's own confirm records nothing here
+	// on purpose — a human is present to see the error and clear the marker.
+	RecordTaskReservation(ctx context.Context, r domain.TaskReservation) (int64, error)
+	DeleteTaskReservation(ctx context.Context, id int64) error
 
 	InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error)
 	// MarkCorrectionSent flags a recorded correction as delivered to the agent

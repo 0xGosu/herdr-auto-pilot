@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 
 	skilldoc "github.com/0xGosu/herdr-auto-pilot"
@@ -1613,12 +1615,23 @@ func configFieldLabel(cfg config.Config, key string) string {
 // the daemon blanket autonomy, and burying it among the tuning knobs is how an
 // operator loses track of whether it is on.
 func buildRuleItems(cfg config.Config) []ruleItem {
-	items := []ruleItem{{
-		kind: "fsp", key: frontend.FSPFieldKey,
-		label: configFieldLabel(cfg, frontend.FSPFieldKey),
-	}}
+	// The switch first, then the two keys that describe what it does — an
+	// operator looking for "does the mode obey my ceilings?" looks under the
+	// mode, not forty rows down in the generic Config section.
+	fspKeys := []string{
+		frontend.FSPFieldKey,
+		frontend.FSPHonourLimitsFieldKey,
+		frontend.FSPAcceptGeneratedTaskFieldKey,
+	}
+	var items []ruleItem
+	for _, key := range fspKeys {
+		items = append(items, ruleItem{
+			kind: "fsp", key: key,
+			label: configFieldLabel(cfg, key),
+		})
+	}
 	for _, key := range frontend.TUIConfigFieldKeys {
-		if key == frontend.FSPFieldKey {
+		if slices.Contains(fspKeys, key) {
 			continue // already rendered above, in its own section
 		}
 		items = append(items, ruleItem{
@@ -4668,6 +4681,12 @@ func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int, op
 	}
 	lines = m.detailField(lines, w, "When", r.CreatedAt.Format(time.RFC3339))
 	lines = m.detailField(lines, w, "Status", r.Status)
+	// Only worth a line when true: it explains the amber row, and its absence
+	// on an ordinary row is not information the operator needs repeated.
+	if r.WhileFSPModeOn {
+		lines = m.detailField(lines, w, "Caused by",
+			"full self-prompting (answered automatically; nothing was learned from it)")
+	}
 	lines = m.detailField(lines, w, "Situation", string(r.SituationType))
 	lines = m.detailField(lines, w, "Agent", agent)
 	lines = m.detailField(lines, w, "Agent type", m.agentTypeFor(r))
@@ -6436,6 +6455,26 @@ func (m Model) renderEscalations(b *strings.Builder) {
 	m.renderMoreRows(b, len(esc)-end)
 }
 
+// auditRowStyle picks the style for one Audit row, or reports false to leave it
+// plain. Separated from the renderer so the CHOICE can be asserted directly:
+// lipgloss drops colour entirely when tests run without a TTY, which would make
+// an assertion on the rendered escape sequence pass vacuously.
+//
+// Amber marks the rows full self-prompting caused. The status column cannot:
+// "auto-sent" is what timed auto-accept renders too, so a mode the operator
+// switched on and a threshold quietly expiring look identical while scanning.
+// Selected still wins, or the cursor disappears exactly on the rows worth
+// inspecting.
+func auditRowStyle(st styles, r domain.AuditRecord, selected bool) (lipgloss.Style, bool) {
+	switch {
+	case selected:
+		return st.selected, true
+	case r.WhileFSPModeOn:
+		return st.warn, true
+	}
+	return lipgloss.Style{}, false
+}
+
 func (m Model) renderAudit(b *strings.Builder) {
 	rows := m.visibleAudit()
 	if len(rows) == 0 {
@@ -6471,8 +6510,8 @@ func (m Model) renderAudit(b *strings.Builder) {
 			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), frontend.ConfidenceLabel(r.Confidence),
 			frontend.AuditStatusLabel(r),
 			oneLine(r.Action, actWidth))
-		if i == m.cursors[m.tab] {
-			line = m.styles().selected.Render(line)
+		if st, ok := auditRowStyle(m.styles(), r, i == m.cursors[m.tab]); ok {
+			line = st.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}

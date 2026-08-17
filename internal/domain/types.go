@@ -609,7 +609,19 @@ type AuditRecord struct {
 	// predating the column, and whenever the CLI neither accepted nor reported
 	// an id. Bookkeeping only — nothing decides anything from it.
 	LLMSessionID string
-	CreatedAt    time.Time
+	// WhileFSPModeOn records that this row was auto-accepted while full
+	// self-prompting was active. It exists because the STATUS cannot say so:
+	// AuditStatusAutoAccepted is what timed auto-accept writes too, Action stays
+	// "escalated" on both, and no second row is appended — so an operator
+	// reviewing the log had no way to tell a mode they switched on from a
+	// threshold quietly expiring.
+	//
+	// Set only on a DELIVERY, at finalize, in the same guarded UPDATE as the
+	// status. False on legacy rows, on timed auto-accept, and on automatic
+	// DISMISSALS (nothing was delivered there, so there is no action to
+	// attribute).
+	WhileFSPModeOn bool
+	CreatedAt      time.Time
 }
 
 // WithSignatureBaseline stamps sig's full result onto the record — the

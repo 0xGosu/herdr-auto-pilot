@@ -293,6 +293,25 @@ hap config set full_self_prompting.enabled true
 hap config set full_self_prompting.enabled false
 ```
 
+two opt-in behaviors, both default false:
+
+```bash
+# refuse a delivery that would cross a [limits] ceiling, and switch the mode OFF
+# when one is reached (rewrites enabled = false, recorded in `hap kill-history`).
+# the ceilings are per-agent while the mode is global, so ONE runaway agent
+# stands the mode down for every agent.
+hap config set full_self_prompting.honour_limits true
+
+# also act on an idle escalation whose suggestion is an LLM-GENERATED task:
+# writes the agent's task list, registers the task source, hands the first task
+# over. still records no learning event; every safety exclusion still applies.
+hap config set full_self_prompting.accept_generated_task true
+```
+
+an escalation the mode answered is flagged in the audit log (`while_fsp_mode_on`), so it
+can be told apart from a timed auto-accept — both show the status `auto-sent`. the TUI
+Audit tab renders those rows in amber.
+
 in the TUI, **press `r` twice quickly** (within ~600ms) to toggle it. a SINGLE `r` keeps
 its old meaning — resume automation — and is simply delayed by that window, so a
 double-press never resumes on its way to the toggle; any other key in between cancels the
@@ -487,6 +506,9 @@ edits made through `hap config set` / `set-threshold` apply live — the command
 | `limits.max_consecutive_auto_prompts` | 30 | max consecutive auto-prompts per agent without human interaction |
 | `limits.max_auto_prompts_per_minute` | 5 | rate limit per agent (rolling 1-minute window) |
 | `limits.max_error_retries` | 2 | max retries per error signature |
+| `full_self_prompting.enabled` | false | answer every escalation carrying a proposed answer, immediately (see full self-prompting mode) |
+| `full_self_prompting.honour_limits` | false | check the `[limits]` ceilings BEFORE each delivery and switch the mode off when one is reached |
+| `full_self_prompting.accept_generated_task` | false | also act on an idle escalation whose suggestion is an LLM-generated task |
 | `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic never-auto rule |
 | `llm.timeout_seconds` | 60 | timeout for LLM fallback calls |
 | `llm.auto_act_confidence_threshold` | 99 | min LLM self-reported confidence (0-100) to auto-act on a consult decision; below it (or no score) the situation escalates with reason `[llm_low_confidence]`. the default only auto-acts on a near-certain score; set anything above 100 (e.g. 999) to make it unreachable = never auto-act |

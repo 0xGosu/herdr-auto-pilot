@@ -1044,19 +1044,30 @@ type flakyFinalizeStore struct {
 	mu     sync.Mutex
 	failN  int
 	failed int
+	// fspArgs records the whileFSP argument of every call, so a test can prove
+	// the finalize RETRY still carries the attribution the first attempt had.
+	fspArgs []bool
 }
 
-func (f *flakyFinalizeStore) MarkAutoAccepted(ctx context.Context, auditID int64) (bool, error) {
+func (f *flakyFinalizeStore) MarkAutoAccepted(ctx context.Context, auditID int64, whileFSP bool) (bool, error) {
 	f.mu.Lock()
 	fail := f.failed < f.failN
 	if fail {
 		f.failed++
 	}
+	f.fspArgs = append(f.fspArgs, whileFSP)
 	f.mu.Unlock()
 	if fail {
 		return false, errors.New("induced finalize failure")
 	}
-	return f.StorePort.MarkAutoAccepted(ctx, auditID)
+	return f.StorePort.MarkAutoAccepted(ctx, auditID, whileFSP)
+}
+
+// markAutoAcceptedArgs returns the recorded whileFSP arguments, oldest first.
+func (f *flakyFinalizeStore) markAutoAcceptedArgs() []bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]bool(nil), f.fspArgs...)
 }
 
 // TestAutoAcceptFinalizeFailureIsRetriedInProcess is the reliability case a
