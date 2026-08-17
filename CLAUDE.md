@@ -432,7 +432,7 @@ whose manifest carries exactly that version).
     option: `ReclaimAbandonedAutoAccepts` returns abandoned `auto_accepting` rows to
     `escalated` at startup and would strand a true flag on a row nothing ever delivered. The
     store ORs the column rather than assigning it, so a replay can only ever set it.
-  - **A generated task is screened HERE or nowhere** (`generatedTaskUnsafe`). The task text
+  - **A generated task is screened TWICE, and the second one is the real gate.** The task text
     is authored by the generator LLM AFTER the decision that raised the escalation, so no
     safety control has ever seen it — `handleTaskGenOutcome` validates only the shape, because
     the operator's confirm was the gate. This feature removes that gate, so the never-auto and
@@ -441,8 +441,16 @@ whose manifest carries exactly that version).
     literal two-character `\n`, which a line-anchored rule cannot match while the real newline
     reaching the pane can — screening the stored form fails OPEN, the same trap
     `tasklistreview` documents). A hit reverts the claim and leaves the row escalated, because
-    FR-015 says a never-auto match always reaches a human. Both guards were proved by
-    mutation.
+    FR-015 says a never-auto match always reaches a human.
+    The daemon-side check (`generatedTaskUnsafe`) can only render with the DEFAULT template —
+    the target source, and so its own `next_task_template`, resolved path and index, is chosen
+    inside the seam — so a custom template could frame a benign task into something the rules
+    refuse and still pass it. The seam is therefore handed a `screen func(string) error`
+    (the same shape as `tasklistreview`'s `safe` closure) and calls it with the EXACT prompt
+    immediately before the send, BEFORE the reservation so a refusal strands nothing. The
+    pre-check earns its place by refusing obvious cases before any list is written. Note the
+    daemon's own tests drive a FAKE seam, so only a `frontend` test can prove the real path
+    calls the callback: `TestAutomatedGeneratedTaskScreensTheSourceTemplatePrompt`.
   - **A generated-task acceptance is the DAEMON's row to finalize.** `autoAcceptOne` has
     already claimed it (`escalated → auto_accepting`), so the `automated` flag makes
     `frontend.acceptGeneratedTask` skip BOTH `ResolveEscalation` (whose escalated-guard
@@ -467,6 +475,19 @@ whose manifest carries exactly that version).
     opposite order. `TestFSPGeneratedTaskTakesTheLifecycleBarrier` asserts the barrier is
     TAKEN rather than that a disabled agent is skipped, since Guard 1b makes the latter pass
     either way.
+  - **An unattended hand-out gets a ledger row; an operator's does not.** The reservation
+    marks the item `[-]` before the send, and a crash in that window used to strand it: the
+    audit row is reclaimed to `escalated` at startup but the checklist marker is not, so the
+    retry reads the item as already taken, burns its attempt budget and the escalation is
+    DISMISSED. `recordAutomatedReservation` writes the same `task_reservations` row the
+    daemon's own hand-outs use, so `reclaimStrandedTasks` returns the item to `[ ]` once its
+    agent is parked past the grace window; a rolled-back send retires it again. The operator
+    path deliberately records nothing — a human is present to read the error, and ledger rows
+    there would start barring manually-confirmed agents from the idle poll.
+  - **The mode is re-asked immediately before the claim** (`stillPermitted`). The guard chain
+    above it does pane READS with a budget in seconds, so an operator switching the mode off
+    mid-chain would otherwise still get the send that follows; `WithAgentAutomation` covers
+    the per-AGENT disable at delivery, not the global mode.
   - **The ceiling is only read on a row that could actually be DELIVERED.** `ConsecutiveAuto`
     is reset only by human interaction, so an agent that saturated it and was then killed
     carries it forever — and its leftover escalation is still a candidate. Reading that as a
@@ -483,7 +504,12 @@ whose manifest carries exactly that version).
     minutes ago would switch the mode off over traffic that has stopped. Keep
     `TestFSPCeilingIgnoresAnUndeliverableRow` / `…IgnoresAnAgentThatWentBackToWork` /
     `…StandDownKeepsLaterCandidatesAccounted` / `TestFSPCeilingNamesWhichLimitTripped` /
-    `TestFSPPerMinuteWindowRolloverIsNotACeiling`.
+    `TestFSPPerMinuteWindowRolloverIsNotACeiling`, and for the three above
+    `TestFSPGeneratedTaskScreensTheExactOutboundPrompt` /
+    `TestAutomatedGeneratedTaskScreensTheSourceTemplatePrompt` /
+    `TestAutomatedGeneratedTaskRecordsAReservation` / `TestOperatorConfirmRecordsNoReservation` /
+    `TestAutomatedGeneratedTaskReleasesTheReservationOnAFailedSend` /
+    `TestFSPRechecksTheModeBeforeClaiming`.
 
   Accepted limitation, not a bug: a generated-task escalation is `idle`-typed, so its
   baseline salient is unstructured pane-tail and Guard 3 usually answers

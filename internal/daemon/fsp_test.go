@@ -43,6 +43,10 @@ type fspSeams struct {
 	acceptedIDs []int64
 	acceptErr   error
 	disableErr  error
+	// renderedPrompt is what the seam claims it is about to send, so a test can
+	// exercise the at-send screen the way the real front end does — with the
+	// SOURCE's template applied, which the daemon's pre-check cannot see.
+	renderedPrompt string
 }
 
 func newFSPSeams() *fspSeams { return &fspSeams{} }
@@ -55,7 +59,18 @@ func (s *fspSeams) disable(_ context.Context, reason string) error {
 	return err
 }
 
-func (s *fspSeams) accept(_ context.Context, auditID int64, _ bool) error {
+// accept mimics the real seam closely enough to matter: it calls the screen
+// callback with a prompt, so a test can prove the daemon refuses the exact
+// outbound text and not merely the raw suggestion.
+func (s *fspSeams) accept(_ context.Context, auditID int64, _ bool, screen func(string) error) error {
+	s.mu.Lock()
+	prompt := s.renderedPrompt
+	s.mu.Unlock()
+	if screen != nil && prompt != "" {
+		if err := screen(prompt); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	s.acceptedIDs = append(s.acceptedIDs, auditID)
 	err := s.acceptErr
@@ -1426,5 +1441,94 @@ func TestFSPGeneratedTaskTakesTheLifecycleBarrier(t *testing.T) {
 	if got := observed.barrierAgents(); len(got) != 1 || got[0] != "pA" {
 		t.Errorf("lifecycle barrier taken for %v, want exactly [pA] — a generated-task "+
 			"acceptance sends to the pane and must not bypass the disable barrier", got)
+	}
+}
+
+// TestFSPGeneratedTaskScreensTheExactOutboundPrompt: the daemon's pre-check
+// renders with the DEFAULT template, because the target source — and so its own
+// next_task_template, resolved path and index — is only chosen inside the seam.
+// A custom template can frame a benign task into something the rules refuse, so
+// the seam is handed the screen and calls it with the exact bytes.
+//
+// The task text alone passes here; only the rendered form trips the rule.
+func TestFSPGeneratedTaskScreensTheExactOutboundPrompt(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspAcceptGenerated+`
+[safety]
+never_auto_patterns = ['(?i)--no-preserve-root']
+`)
+	ctx := context.Background()
+	// What a source's own template would render — the daemon never sees this
+	// string until the seam hands it back.
+	seams.renderedPrompt = "Next task: tidy the workspace\nRun it with: rm -rf / --no-preserve-root"
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := seedEscalationWithRationale(t, h, "pA", idlePane,
+		"[task_source_exhausted] nothing pending", domain.SituationIdle,
+		domain.SuggestTaskPrefix+"tidy the workspace", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Errorf("status = %q, want escalated — the rendered prompt matched a never-auto rule", got)
+	}
+	if got := seams.accepted(); len(got) != 0 {
+		t.Errorf("the seam reported an acceptance for %v after its own screen refused", got)
+	}
+}
+
+// TestFSPGeneratedTaskAcceptsASafeRenderedPrompt is the control: the at-send
+// screen must not refuse everything it is shown, or the feature is dead and the
+// test above proves nothing.
+func TestFSPGeneratedTaskAcceptsASafeRenderedPrompt(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspAcceptGenerated+`
+[safety]
+never_auto_patterns = ['(?i)--no-preserve-root']
+`)
+	ctx := context.Background()
+	seams.renderedPrompt = "Next task: tidy the workspace\nList: tasks.md"
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := seedEscalationWithRationale(t, h, "pA", idlePane,
+		"[task_source_exhausted] nothing pending", domain.SituationIdle,
+		domain.SuggestTaskPrefix+"tidy the workspace", 5*time.Second)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+		t.Fatalf("status = %q, want %q", got, domain.AuditStatusAutoAccepted)
+	}
+	if got := seams.accepted(); len(got) != 1 {
+		t.Errorf("seam accepted %v, want exactly one", got)
+	}
+}
+
+// TestFSPRechecksTheModeBeforeClaiming: the guard chain does pane READS, a
+// herdr shell-out with a budget in seconds. An operator switching the mode off
+// during that window must not still get the send that follows — the per-agent
+// automation barrier covers a disabled AGENT, not the global mode.
+func TestFSPRechecksTheModeBeforeClaiming(t *testing.T) {
+	h, _ := newFSPHarnessWithSeams(t, fspOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+
+	// Stand the mode down the way a ceiling does — in memory, exactly what an
+	// operator's `config set ... false` reaches the daemon as after its reload.
+	h.daemon.mu.Lock()
+	h.daemon.fspCeilingLatched = true
+	h.daemon.mu.Unlock()
+
+	// The sweep decided `fsp` before the latch was set, so it still walks this
+	// row; the re-check before the claim is the only thing that can stop it.
+	h.daemon.autoAcceptOne(ctx, auditRow(t, h, id), "Yes",
+		map[string]domain.AgentTransition{"pA": {AgentID: "pA", Status: "blocked"}},
+		&paneCache{}, time.Now(), true, false,
+		h.daemon.fspStillOn)
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Errorf("status = %q, want escalated — the mode was switched off mid-chain", got)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("nothing may be delivered after the mode was switched off, sent %v", got)
 	}
 }

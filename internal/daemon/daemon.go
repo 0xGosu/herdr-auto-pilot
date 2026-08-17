@@ -93,11 +93,18 @@ type Options struct {
 	// audit row's status or write a correction — the caller owns that
 	// lifecycle, having already claimed the row.
 	//
+	// screen is called with the EXACT outbound prompt immediately before the
+	// send, and a non-nil return refuses it. The safety rules live with the
+	// daemon while the rendered bytes are only knowable here — the target
+	// source's own next_task_template, its resolved path and index all go into
+	// the prompt — so the check is handed down rather than approximated up
+	// front. Same shape as the pre-delivery task review's `safe` closure.
+	//
 	// Optional. nil means the capability was never wired, and full
 	// self-prompting leaves such escalations for the operator exactly as it
 	// does today. Supplied by cmd/hap from the front-end App, which is where
 	// the checklist/task-source code lives.
-	AcceptGeneratedTask func(ctx context.Context, auditID int64, send bool) error
+	AcceptGeneratedTask func(ctx context.Context, auditID int64, send bool, screen func(string) error) error
 	// DisableFSP switches full self-prompting off in config.toml and records
 	// the toggle in the automation history. Called when a [limits] ceiling is
 	// reached and full_self_prompting.honour_limits is set.

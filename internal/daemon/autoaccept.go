@@ -126,6 +126,15 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	// Decided once for the whole sweep, and threaded into autoAcceptOne, so the
 	// eligibility filter and the delivery fork can never disagree about it.
 	allowGenerated := d.acceptGeneratedTaskAllowed(cfg, fsp)
+	// Re-asked per row, immediately before each claim. Only full self-prompting
+	// carries it: timed auto-accept's contract is its threshold, and it has no
+	// global switch that could be flipped mid-chain. Re-reads the config
+	// snapshot, so an `enabled = false` that landed since this sweep began is
+	// seen — as is the in-memory ceiling latch.
+	var permitted func() bool
+	if fsp {
+		permitted = d.fspStillOn
+	}
 	// Set once a [limits] ceiling stands the mode down mid-sweep: nothing more
 	// is delivered, but the loop keeps running so the remaining candidates stay
 	// accounted for.
@@ -179,7 +188,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 			// autoAcceptOne owns what happens to such a row (absence
 			// confirmation, retirement); this only declines to read it as a
 			// ceiling.
-			if d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp, allowGenerated) == autoAcceptRetired {
+			if d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp, allowGenerated, permitted) == autoAcceptRetired {
 				delete(stillEligible, rec.ID)
 			}
 			continue
@@ -199,7 +208,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 			continue
 		}
 
-		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp, allowGenerated); outcome {
+		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp, allowGenerated, permitted); outcome {
 		case autoAcceptDelivered:
 			handledAgent[rec.AgentID] = true
 			accepted++
@@ -258,9 +267,15 @@ const (
 // down rather than recomputed: a weaker local test here would pass a row the
 // eligibility filter had refused, and the coupling between the two would be
 // invisible.
+//
+// stillPermitted (nil = always) is re-asked immediately before the claim. The
+// guard chain above it does pane READS — a herdr shell-out with a budget in
+// seconds — so an operator switching full self-prompting off mid-chain would
+// otherwise still get the send that follows. WithAgentAutomation covers the
+// per-AGENT disable at delivery; this covers the global mode.
 func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, suggestion string,
 	live map[string]domain.AgentTransition, panes *paneCache, now time.Time,
-	fsp, allowGeneratedTask bool) autoAcceptOutcome {
+	fsp, allowGeneratedTask bool, stillPermitted func() bool) autoAcceptOutcome {
 
 	agent, present := live[rec.AgentID]
 	if !present {
@@ -308,6 +323,13 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	// update, so an operator confirming this same escalation right now cannot
 	// produce a double send: exactly one writer wins, and only the winner
 	// delivers.
+	// Last look before the claim, on the freshest state: everything above this
+	// point may have taken seconds.
+	if stillPermitted != nil && !stillPermitted() {
+		slog.Info("auto-accept: the mode was switched off while this escalation was being checked; leaving it pending",
+			"audit_id", rec.ID, "agent", rec.AgentID)
+		return autoAcceptSkipped
+	}
 	claimed, err := d.opt.Store.ClaimForAutoAccept(ctx, rec.ID)
 	if err != nil {
 		slog.Warn("auto-accept: claim failed", "audit_id", rec.ID, "error", err)
@@ -371,7 +393,9 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 		deliver = func() error {
 			var inner error
 			disabled, err := d.opt.Store.WithAgentAutomation(ctx, rec.AgentID, func() {
-				inner = d.opt.AcceptGeneratedTask(ctx, rec.ID, true)
+				inner = d.opt.AcceptGeneratedTask(ctx, rec.ID, true, func(prompt string) error {
+					return d.screenOutbound(rec.AgentType, prompt)
+				})
 			})
 			switch {
 			case err != nil:
@@ -627,22 +651,42 @@ func (d *Daemon) acceptGeneratedTaskAllowed(cfg config.Config, fsp bool) bool {
 // match the real one that reaches the pane. Screening the stored form fails
 // OPEN. The probe carries only the task — the path and index substitutions are
 // hap's own text, not the model's.
+// It is a PRE-check, not the whole story: the bytes screened here are rendered
+// with the DEFAULT template, because the target source — and therefore its own
+// next_task_template, resolved path and index — is only chosen further down,
+// inside the seam. A custom template can frame a benign task into something the
+// rules refuse, so the seam is also handed screenOutbound and calls it with the
+// exact prompt immediately before the send. This check earns its place by
+// refusing obvious cases BEFORE any task list is written or source registered.
 func (d *Daemon) generatedTaskUnsafe(rec *domain.AuditRecord) string {
-	_, allow, _ := d.snapshot()
-	if allow == nil {
-		return "" // no rules configured; nothing to screen against
-	}
 	raw := strings.TrimPrefix(rec.Suggestion, domain.SuggestTaskPrefix)
 	for _, task := range domain.NormalizeGeneratedTasks(raw) {
-		prompt := domain.DeclaredTask{Task: task, Content: task}.Prompt()
-		if hit, matched := allow.Match(rec.AgentType, prompt); matched {
-			return "generated task matched never-auto " + hit.Diagnostic()
-		}
-		if hit, sus := allow.SuspectedIrreversible(rec.AgentType, prompt); sus {
-			return "generated task tripped irreversible " + hit.Diagnostic()
+		if err := d.screenOutbound(rec.AgentType, domain.DeclaredTask{Task: task, Content: task}.Prompt()); err != nil {
+			return "generated task " + err.Error()
 		}
 	}
 	return ""
+}
+
+// screenOutbound applies the two content safety controls to text that is about
+// to reach a pane: the operator's never-auto rules and the suspected-irreversible
+// heuristic. It is the single definition both generated-task checks share, so
+// the pre-check and the at-send check can never diverge on WHAT they screen.
+//
+// A nil rule list means none are configured, which is the operator having no
+// patterns — not a reason to refuse.
+func (d *Daemon) screenOutbound(agentType, text string) error {
+	_, allow, _ := d.snapshot()
+	if allow == nil {
+		return nil
+	}
+	if hit, matched := allow.Match(agentType, text); matched {
+		return fmt.Errorf("matched never-auto %s", hit.Diagnostic())
+	}
+	if hit, sus := allow.SuspectedIrreversible(agentType, text); sus {
+		return fmt.Errorf("tripped irreversible %s", hit.Diagnostic())
+	}
+	return nil
 }
 
 // fspCeilingReached reports whether this agent has reached a [limits] runaway
@@ -747,6 +791,26 @@ func (d *Daemon) disableFSPAtCeiling(ctx context.Context, agentID, ceiling strin
 			return nil
 		})
 	})
+}
+
+// fspStillOn is the CHEAP re-check run immediately before each claim: is the
+// mode still switched on right now?
+//
+// Deliberately not fspActive. That one also queries the store for the graduated
+// rule count, and this runs once per candidate row — up to the sweep's whole
+// candidate cap, on the select loop. The runtime PRECONDITIONS it checks were
+// evaluated once when the sweep began and do not need re-polling per row;
+// what can change under us mid-sweep is an operator action, and both of its
+// forms are in memory here: the config snapshot (their `config set … false`,
+// once the reload lands) and the ceiling latch.
+func (d *Daemon) fspStillOn() bool {
+	cfg, _, _ := d.snapshot()
+	if !cfg.FullSelfPrompting.Enabled {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return !d.fspCeilingLatched
 }
 
 // noteFSPSend records a full self-prompting delivery against the FR-019 runaway
@@ -878,6 +942,7 @@ func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
 	}
 	suggestion := domain.SuggestedAction(rec)
 	allowGenerated := d.acceptGeneratedTaskAllowed(cfg, true)
+	permitted := d.fspStillOn
 	if domain.AutoAcceptIneligible(rec, suggestion, allowGenerated) != "" {
 		return // stays for the operator (never-auto & friends), or unanswerable
 	}
@@ -915,7 +980,7 @@ func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
 		return
 	}
 	live := map[string]domain.AgentTransition{rec.AgentID: agent}
-	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now, true, allowGenerated) == autoAcceptDelivered {
+	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now, true, allowGenerated, permitted) == autoAcceptDelivered {
 		d.noteFSPSend(ctx, rec.AgentID, now)
 		slog.Info("full self-prompting: escalation answered immediately",
 			"agent", rec.AgentID, "audit_id", rec.ID)

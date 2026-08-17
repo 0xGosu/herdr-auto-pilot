@@ -88,7 +88,7 @@ func (a *App) DisableFullSelfPromptingWithReason(ctx context.Context, reason str
 // The side effects it performs before any send (writing the list, registering
 // the source) are idempotent, so a failure returned here is safe for the
 // caller's ordinary delivery retry.
-func (a *App) AcceptGeneratedTaskAutomatically(ctx context.Context, auditID int64, send bool) error {
+func (a *App) AcceptGeneratedTaskAutomatically(ctx context.Context, auditID int64, send bool, screen func(string) error) error {
 	audit, err := a.Store.GetAudit(ctx, auditID)
 	if err != nil {
 		return err
@@ -102,7 +102,7 @@ func (a *App) AcceptGeneratedTaskAutomatically(ctx context.Context, auditID int6
 		// guess: everything below writes task lists.
 		return fmt.Errorf("audit record %d no longer carries a generated-task suggestion", auditID)
 	}
-	return a.acceptGeneratedTask(ctx, audit, send, true)
+	return a.acceptGeneratedTask(ctx, audit, send, true, screen)
 }
 
 // recordFSPToggle appends one full self-prompting change to the automation
