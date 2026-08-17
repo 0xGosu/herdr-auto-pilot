@@ -2032,9 +2032,17 @@ honour_limits = true          # default false
 accept_generated_task = false # default false
 ```
 
+Either ceiling counts, and the message names which one tripped —
+`max_consecutive_auto_prompts` means one agent has been answered that many times
+with no human check-in, while `max_auto_prompts_per_minute` means sends are
+outpacing the cap. Note the second is a rolling window shared with every other
+autonomous send on that agent, so on a busy herd it is the one likely to fire
+first; raise it, or leave `honour_limits` off, if you want only the
+consecutive-answer bound.
+
 Switching off is real and persistent: hap rewrites `enabled = false` in your
 config, records the change in `hap kill-history` (author `daemon`), and raises a
-notification saying which agent tripped it. Escalations queue for you again
+notification saying which agent and which ceiling. Escalations queue for you again
 until you re-enable it. Note the asymmetry worth knowing before you turn this
 on — the ceilings are **per agent** while the mode is **global**, so one runaway
 agent stands the mode down for the whole herd. That is the safe direction for a
@@ -2046,7 +2054,12 @@ escalation whose suggestion is an **LLM-generated task** waits for you, because
 accepting one is not answering a question on screen: it writes the agent's task
 list, registers the task source, and hands the first task over. With the key set,
 full self-prompting does that itself — still recording no learning event, and
-still subject to every safety exclusion. In practice it fires less often than you
+still subject to every safety exclusion. The generated task text is screened
+against your never-auto patterns and the irreversible-command heuristic first,
+which matters here more than elsewhere: that text is written by the model
+*after* the escalation was raised, so until now your confirmation was the only
+thing that had ever looked at it. A match leaves the escalation for you.
+In practice it fires less often than you
 might expect: idle situations are compared by raw screen text, which rarely
 matches cleanly enough to prove the situation is unchanged, and hap leaves
 anything it cannot prove for you rather than guessing.

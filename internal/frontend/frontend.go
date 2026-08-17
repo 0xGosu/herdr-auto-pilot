@@ -811,7 +811,19 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	}
 	// Cheap early-out for a stale re-confirm (already resolved/dismissed): the
 	// atomic claim below is the authoritative guard against the concurrent race.
-	if audit.Status != "escalated" {
+	//
+	// The AUTOMATED caller arrives with the row already claimed
+	// (escalated → auto_accepting), so it expects the claimed status here and
+	// there is no claim below for it to fall through to. Getting this wrong is
+	// not a degraded path but a destructive one: the error propagates to
+	// autoAcceptDeliveryFailed, which burns an attempt each sweep and DISMISSES
+	// the escalation once the budget is spent — so the feature would delete the
+	// very suggestions it exists to act on, a few minutes after each is raised.
+	want := "escalated"
+	if automated {
+		want = domain.AuditStatusAutoAccepting
+	}
+	if audit.Status != want {
 		return fmt.Errorf("audit record %d is no longer a pending escalation", audit.ID)
 	}
 

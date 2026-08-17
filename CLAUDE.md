@@ -432,6 +432,17 @@ whose manifest carries exactly that version).
     option: `ReclaimAbandonedAutoAccepts` returns abandoned `auto_accepting` rows to
     `escalated` at startup and would strand a true flag on a row nothing ever delivered. The
     store ORs the column rather than assigning it, so a replay can only ever set it.
+  - **A generated task is screened HERE or nowhere** (`generatedTaskUnsafe`). The task text
+    is authored by the generator LLM AFTER the decision that raised the escalation, so no
+    safety control has ever seen it — `handleTaskGenOutcome` validates only the shape, because
+    the operator's confirm was the gate. This feature removes that gate, so the never-auto and
+    suspected-irreversible screens run in the fork, before the seam, on the RENDERED
+    `DeclaredTask.Prompt()` rather than the stored text (stored items keep line breaks as the
+    literal two-character `\n`, which a line-anchored rule cannot match while the real newline
+    reaching the pane can — screening the stored form fails OPEN, the same trap
+    `tasklistreview` documents). A hit reverts the claim and leaves the row escalated, because
+    FR-015 says a never-auto match always reaches a human. Both guards were proved by
+    mutation.
   - **A generated-task acceptance is the DAEMON's row to finalize.** `autoAcceptOne` has
     already claimed it (`escalated → auto_accepting`), so the `automated` flag makes
     `frontend.acceptGeneratedTask` skip BOTH `ResolveEscalation` (whose escalated-guard
@@ -441,6 +452,38 @@ whose manifest carries exactly that version).
     (`Options.AcceptGeneratedTask` / `DisableFSP`) are optional function fields wired in
     `cmd/hap`, so `internal/daemon` still does not import `internal/frontend`; a nil seam
     returns the claim rather than stranding the row in the transient status.
+    **EVERY status check on that path has to know it**, including the cheap early-out above
+    the claim (`audit.Status != "escalated"`), and missing THAT one is destructive rather
+    than merely broken: the error propagates to `autoAcceptDeliveryFailed`, which burns one
+    attempt per sweep and DISMISSES the escalation once the budget is spent — so the feature
+    would delete the very suggestions it exists to act on, minutes after each is raised. It
+    shipped green because the daemon tests wire a FAKE seam; only a `frontend` test driving
+    `AcceptGeneratedTaskAutomatically` against an already-claimed row can catch this class
+    (`TestAutomatedGeneratedTaskAcceptsAClaimedRow`, proved by mutation). The seam call
+    also runs INSIDE `WithAgentAutomation`, like every other delivery: it sends the first
+    task to the pane, so a disable landing after Guard 1b must still stop it. Safe against
+    the config lock the seam takes on its way through `addTaskSourceIfAbsent` — the barrier
+    is a per-agent flock and the config lock a separate file, and no path takes them in the
+    opposite order. `TestFSPGeneratedTaskTakesTheLifecycleBarrier` asserts the barrier is
+    TAKEN rather than that a disabled agent is skipped, since Guard 1b makes the latter pass
+    either way.
+  - **The ceiling is only read on a row that could actually be DELIVERED.** `ConsecutiveAuto`
+    is reset only by human interaction, so an agent that saturated it and was then killed
+    carries it forever — and its leftover escalation is still a candidate. Reading that as a
+    ceiling stands the mode down for the whole herd over a row nothing could have sent, and
+    because the latch clears on reload it re-trips after every operator re-enable, so the
+    mode can never stay on again; an early exit also skips `autoAcceptOne`, so the absence
+    bookkeeping that would eventually retire that row never advances and the livelock has no
+    end. Hence the `live`/`autoAcceptParked` gate before the check, and `continue` rather
+    than `break` after a stand-down so the remaining candidates still register in
+    `stillEligible` (a `break` hands them to `pruneAutoAcceptState`, silently resetting
+    delivery budgets and absence counts). The two ceilings are tested SEPARATELY rather than
+    through one `CheckRate` call so the stand-down can name which tripped — and the
+    per-minute one honours the window rollover, or a count from a window that elapsed
+    minutes ago would switch the mode off over traffic that has stopped. Keep
+    `TestFSPCeilingIgnoresAnUndeliverableRow` / `…IgnoresAnAgentThatWentBackToWork` /
+    `…StandDownKeepsLaterCandidatesAccounted` / `TestFSPCeilingNamesWhichLimitTripped` /
+    `TestFSPPerMinuteWindowRolloverIsNotACeiling`.
 
   Accepted limitation, not a bug: a generated-task escalation is `idle`-typed, so its
   baseline salient is unstructured pane-tail and Guard 3 usually answers
@@ -449,7 +492,9 @@ whose manifest carries exactly that version).
   `…IgnoresAPauseThatIsNotACeiling` / `…SwitchesOffOnlyOnce` /
   `TestFSPCeilingLatchStandsTheModeDownImmediately` / `TestFSPRefusesAGeneratedTaskByDefault` /
   `TestFSPAcceptsAGeneratedTaskWhenEnabled` / `TestFSPGeneratedTaskWritesNoCorrection` /
-  `TestFSPGeneratedTaskWithNoSeamLeavesItPending` / `TestFSPFinalizeRetryKeepsTheAttribution` /
+  `TestFSPGeneratedTaskWithNoSeamLeavesItPending` /
+  `TestFSPGeneratedTaskNeverAutoTextStaysPending` /
+  `TestFSPGeneratedTaskScreensTheRenderedForm` / `TestFSPFinalizeRetryKeepsTheAttribution` /
   `TestMarkAutoAcceptedNeverClearsTheFlag`).
 - **`enable_auto_send_task_when_idle` skips the LEARNING gates, never the safety ones** —
   a declared task from a source with that flag (`DeclaredTask.Reserve`) resolves ahead of any
