@@ -237,11 +237,16 @@ func NormalizedOptionSet(options []string) string {
 // every signature already learned from an untouched form byte-identical, so
 // nothing needs a migration.
 //
-// It is factored out so a comparison against a STORED option set normalizes both
-// sides through exactly ONE implementation. The escaping NormalizedOptionSet
-// adds on top is a delimiter concern of the joined encoding, and splitOptionSet
-// has already undone it by the time a stored label is compared — so a caller
-// holding split labels must normalize with this, never with the full encoder.
+// It is the per-label half only, and that is a trap worth naming: a stored
+// salient is not just NormalizedOptionSet's output, it is that output run through
+// MaskVolatile (see salientContent below), so a label carrying a path, a large
+// number, a timestamp or a hex run is stored as "<path>"/"<num>"/"<hash>". A
+// caller comparing live labels against a stored set with THIS function alone
+// therefore matches nothing for any such form — silently, and in one direction
+// only, which is the hardest shape of bug to notice. Derive both sides through
+// MaskVolatile("options:" + NormalizedOptionSet(...)) and split them with
+// SalientOptionSet instead; LiveMCQMatchesSalient is the reference
+// implementation.
 func normalizeOptionLabel(o string) string {
 	o = strings.ToLower(strings.TrimSpace(o))
 	return checkboxLabelRE.ReplaceAllString(o, "[ ]")

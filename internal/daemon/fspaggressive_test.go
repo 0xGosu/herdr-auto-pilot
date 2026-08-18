@@ -144,7 +144,25 @@ func mangledPreviewRow(t *testing.T) (rec *domain.AuditRecord, livePane string) 
 		SigSalient: domain.MaskVolatile("options:" +
 			domain.NormalizedOptionSet(domain.OptionLabels(aggregate))),
 	}
-	return rec, survivors[len(survivors)-1]
+	return rec, visibleReadOf(survivors[0])
+}
+
+// visibleReadOf reconstructs what `pane read --source visible` returns for a tab
+// whose block the aggregate stored: scrollback above, the form, and the
+// navigation footer the aggregation stripped.
+//
+// Feeding a stored block straight back as the "live pane" would prove only that
+// ExtractAgentMCQForm is idempotent — the comparison could not fail. This makes
+// the extraction do the work a real capture demands: drop everything above the
+// tab header, and cut at the footer. The footer is the real one, copied from
+// internal/domain/testdata/mcq_preview_visible_tab1.txt (it carries the preview
+// form's extra "n to add notes" segment).
+func visibleReadOf(block string) string {
+	const footer = "Enter to select · ↑/↓ to navigate · n to add notes · " +
+		"Tab to switch questions · Esc to cancel"
+	return "⏺ I have a few questions before I start." + NL + NL +
+		strings.Repeat("○ some earlier narration that has scrolled up"+NL, 4) +
+		strings.Repeat("─", 60) + NL + block + NL + NL + footer + NL
 }
 
 // LS-1, the #1092 regression. The stored capture no longer parses as an
@@ -518,15 +536,36 @@ func TestFSPUnstructuredFallbackRefusesAnOverMaskedPair(t *testing.T) {
 }
 
 // The other half of the same guard: a baseline that was a pane tail while the
-// live render now parses a permission verb is not a comparable pair, however
-// similar the two strings look.
+// live render now parses a permission verb is not a comparable pair.
+//
+// The fixture is built so the pair would score a perfect 1.0 without the guard —
+// the structured salient is longer than MinTailCompareRunes and is a literal
+// suffix of the baseline, so tail alignment makes the two windows identical. A
+// short structured salient would prove nothing here: it is refused by the length
+// floor whether the structured check exists or not.
 func TestFSPUnstructuredFallbackRefusesANowStructuredLiveSalient(t *testing.T) {
 	h := newHarness(t, autoAcceptOn)
 	rec := &domain.AuditRecord{ID: 8, AgentID: "pA", SituationType: domain.SituationApproval}
-	body := strings.Repeat("the agent is asking whether to go ahead with the change ", 8)
 
-	prev := domain.SignatureResult{Salient: body, Verdict: domain.GuardOK}
-	fresh := domain.SignatureResult{Salient: "permission:proceed | options:no;yes", Verdict: domain.GuardOK}
+	fresh := domain.SignatureResult{
+		Salient: "permission:proceed | options:" + strings.Repeat("keep going;stop here;", 12),
+		Verdict: domain.GuardOK,
+	}
+	prev := domain.SignatureResult{
+		Salient: "earlier pane output that has since scrolled away\n" + fresh.Salient,
+		Verdict: domain.GuardOK,
+	}
+	if n := utf8.RuneCountInString(fresh.Salient); n < domain.MinTailCompareRunes {
+		t.Fatalf("fixture is %d runes, under the %d floor — it would be refused without the guard",
+			n, domain.MinTailCompareRunes)
+	}
+	if !domain.StructuredSalient(fresh.Salient) {
+		t.Fatal("fixture must actually be a structured salient")
+	}
+	if !domain.TailSimilarWithin(prev.Salient, fresh.Salient, fspTailHeldStillJitterPercent) {
+		t.Fatal("fixture must be similar enough that only the structured check can refuse it")
+	}
+
 	if h.daemon.unstructuredHeldStill(rec, prev, fresh) {
 		t.Fatal("a structured live salient must not be compared on the pane-tail path")
 	}

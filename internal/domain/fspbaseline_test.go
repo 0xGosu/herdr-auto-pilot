@@ -202,6 +202,20 @@ func TestSurvivingMCQFramesRefusesAnythingElse(t *testing.T) {
 	}
 }
 
+// The one shape the structural rules deliberately cannot refuse: a lone
+// "[question 4/4]" on its own line is indistinguishable from a capture in which
+// only the last block survived — which is the COMMON case, so refusing it would
+// defeat the purpose. Pinned as accepted behaviour so nobody "fixes" it, and so
+// the reason callers must pair this with the tab count and frame equality stays
+// on the record.
+func TestSurvivingMCQFramesCannotRefuseALoneFinalMarker(t *testing.T) {
+	frames, total, ok := SurvivingMCQFrames("[question 4/4]\nReady to submit?\n1. Submit answers\n")
+	if !ok || total != 4 || len(frames) != 1 {
+		t.Fatalf("frames = %v total = %d ok = %v; a lone final marker is accepted by design",
+			frames, total, ok)
+	}
+}
+
 // The "…" truncateTailRunes prefixes is not cosmetic: a marker it lands on stops
 // being line-anchored, and is correctly no longer counted as surviving. Pinning
 // it means a future change to the marker regex cannot quietly start trusting a

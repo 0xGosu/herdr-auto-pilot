@@ -380,9 +380,16 @@ const mcqFrameCutset = "\n \t"
 //
 // Recognition stays structural, for the same reason AggregatedMCQFrames is
 // structural. All markers must declare the SAME total, their indices must run
-// consecutively, and the run must END at that total — which is what a tail
-// window onto an aggregate always looks like, and what an agent printing
+// consecutively, and the run must END at that total — which is what a tail window
+// onto an aggregate always looks like, and what an agent printing
 // "[question 2/4]" in its own output does not.
+//
+// One shape it cannot tell apart, deliberately: a lone line-anchored
+// "[question 4/4]" satisfies every rule, because a genuine capture in which only
+// the LAST block survived looks exactly like that — and that is the common case,
+// so refusing it would defeat the purpose. Callers must therefore never treat a
+// true return as identity on its own; daemon.mcqSalientHeldStill pairs it with
+// the tab count and with frame equality against the recovered block.
 //
 // ok is false when nothing usable survived (no markers, disagreeing totals, a
 // gap, or a run that does not reach the end). Callers must treat that as "no
