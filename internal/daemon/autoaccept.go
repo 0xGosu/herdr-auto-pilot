@@ -351,8 +351,8 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	// delivers.
 	// Last look before the claim, on the freshest state: everything above this
 	// point may have taken seconds.
-	if stillPermitted != nil && !stillPermitted() {
-		slog.Info("auto-accept: the mode was switched off while this escalation was being checked; leaving it pending",
+	if why := d.claimBlockedBy(ctx, rec, suggestion, fsp, stillPermitted); why != "" {
+		slog.Info("auto-accept: "+why+"; leaving the escalation pending",
 			"audit_id", rec.ID, "agent", rec.AgentID)
 		return autoAcceptSkipped
 	}
@@ -420,7 +420,14 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 			var inner error
 			disabled, err := d.opt.Store.WithAgentAutomation(ctx, rec.AgentID, func() {
 				inner = d.opt.AcceptGeneratedTask(ctx, rec.ID, true, func(prompt string) error {
-					return d.screenOutbound(rec.AgentType, prompt)
+					if err := d.screenOutbound(rec.AgentType, prompt); err != nil {
+						// Tagged so autoAcceptDeliveryFailed can tell a SAFETY
+						// refusal from a delivery fault. Both the real seam and
+						// the test fake propagate this with %w, so errors.Is
+						// still sees it at the other end.
+						return fmt.Errorf("%w: %v", errOutboundRefused, err)
+					}
+					return nil
 				})
 			})
 			switch {
@@ -469,6 +476,52 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	return autoAcceptDelivered
 }
 
+// claimBlockedBy is the complete last look before ClaimForAutoAccept: it names
+// the control that says stop, or "" to proceed.
+//
+// Everything above the claim — Guard 3's pane re-read especially — is a herdr
+// shell-out with a budget in SECONDS, and a sweep walks every candidate, so the
+// gap between "we checked" and "we send" is wide enough for an operator to act
+// in. Each control below was previously read only at the START of that window,
+// which meant an operator could stand automation down and still get the send
+// that followed.
+//
+// Order is deliberate: broadest control first.
+//
+//   - The KILL SWITCH (FR-017) stands the whole daemon down and is not specific
+//     to full self-prompting, so it is re-read for TIMED auto-accept too. Fails
+//     closed on a read error, exactly as the sweep's own Guard 1a does.
+//   - The MODE and its ceiling latch, via the caller's stillPermitted (nil for
+//     timed auto-accept, whose contract is a threshold and which has no global
+//     switch that could flip mid-chain).
+//   - accept_generated_task, for a generated-task row only. It is a SEPARATE
+//     opt-in from the mode, resolved once per sweep into allowGenerated — so an
+//     operator turning off just that key mid-sweep would otherwise still have a
+//     generated task written and handed to an agent. Re-read here rather than
+//     re-threaded, so the eligibility filter's snapshot stays the thing the
+//     whole sweep agrees on and this is purely a stop.
+func (d *Daemon) claimBlockedBy(ctx context.Context, rec *domain.AuditRecord,
+	suggestion string, fsp bool, stillPermitted func() bool) string {
+
+	kill, err := d.opt.Store.LatestKillEvent(ctx)
+	if err != nil {
+		return "the kill-switch state could not be read"
+	}
+	if domain.KillStateActive(kill) {
+		return "the kill switch was activated while this escalation was being checked"
+	}
+	if stillPermitted != nil && !stillPermitted() {
+		return "the mode was switched off while this escalation was being checked"
+	}
+	if fsp && suggestion == domain.SuggestGenerateTask {
+		cfg, _, _ := d.snapshot()
+		if !d.acceptGeneratedTaskAllowed(cfg, true) {
+			return "accepting generated tasks was switched off while this escalation was being checked"
+		}
+	}
+	return ""
+}
+
 // autoAcceptDeliver sends the suggestion through the shared reply pipeline —
 // the same fail-closed implementation the operator's confirm uses, so the two
 // paths cannot drift on delivery or safety behavior.
@@ -510,6 +563,20 @@ func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord,
 // budget is spent.
 func (d *Daemon) autoAcceptDeliveryFailed(ctx context.Context, rec *domain.AuditRecord,
 	cause error, now time.Time) autoAcceptOutcome {
+
+	// A content-safety refusal is a VERDICT, not a fault. Burning attempts on it
+	// would dismiss the row at the ceiling, and FR-015 says a never-auto match
+	// always reaches a human. Returned to the queue and left there.
+	if errors.Is(cause, errOutboundRefused) {
+		slog.Info("auto-accept: a safety control refused the outbound text; leaving the escalation for the operator",
+			"audit_id", rec.ID, "agent", rec.AgentID, "error", cause)
+		if ok, err := d.opt.Store.RevertAutoAccept(ctx, rec.ID); err != nil || !ok {
+			slog.Warn("auto-accept: could not return a refused escalation to the queue",
+				"audit_id", rec.ID, "claimed", ok, "error", err)
+		}
+		d.notePending(rec, "a safety control refused the text this would send")
+		return autoAcceptSkipped
+	}
 
 	// A disabled agent is suppression, not failure: it must not burn an
 	// attempt, or an agent left off for a few minutes would exhaust the budget
@@ -607,8 +674,12 @@ func (d *Daemon) retireNoopEscalation(ctx context.Context, rec *domain.AuditReco
 	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID) {
 		return
 	}
-	if stillPermitted != nil && !stillPermitted() {
-		slog.Info("auto-accept: the mode was switched off before this noop escalation was retired; leaving it pending",
+	// The same complete last look a claim takes. The kill switch matters most
+	// here: Guard 1a returns before ANY dismissal precisely so pausing the herd
+	// never destroys the queue it protects, and a pause landing mid-sweep must
+	// get the same answer as one landing a second earlier.
+	if why := d.claimBlockedBy(ctx, rec, domain.ActionNoop, true, stillPermitted); why != "" {
+		slog.Info("auto-accept: "+why+"; leaving the noop escalation pending",
 			"audit_id", rec.ID, "agent", rec.AgentID)
 		return
 	}
@@ -1714,6 +1785,24 @@ func paneIDFor(rec *domain.AuditRecord, agent domain.AgentTransition) string {
 // delivery attempt, or an agent left disabled for a few minutes would exhaust
 // the budget and lose its escalation to a spurious auto_accept_failed.
 var errAgentDisabled = errors.New("agent automation is disabled")
+
+// errOutboundRefused marks a delivery that a CONTENT safety control stopped —
+// the never-auto patterns or the suspected-irreversible heuristic, applied to
+// the exact text about to reach the pane.
+//
+// It must never be treated as a delivery FAULT. Faults are retried and, at
+// maxAutoAcceptAttempts, the escalation is dismissed as auto_accept_failed — so
+// without this tag a never-auto match inside the seam's at-send screen would be
+// answered "no" three times and then DELETED from the operator's queue, which is
+// the exact inverse of FR-015 ("a never-auto match always reaches a human").
+// Reachable only through a custom next_task_template: the daemon's pre-check
+// renders with the DEFAULT template, so a template that frames a benign task
+// into something the rules refuse is caught for the first time inside the seam.
+//
+// The refusal is also permanent by nature — the same text screens the same way
+// on every sweep — so consuming a budget for it could only ever end in that
+// dismissal.
+var errOutboundRefused = errors.New("a safety control refused the outbound text")
 
 // classifyStatusFor returns the herdr status a situation of this type is
 // classified under. The classifier uses status as a mode selector — an idle

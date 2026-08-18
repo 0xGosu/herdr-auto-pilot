@@ -450,6 +450,29 @@ whose manifest carries exactly that version).
   `TestLiveMCQMatchesSalient*` (including `…MasksBothSides`) /
   `TestNormalizedOptionSetRoundTripsThroughSplitOptionSet` / `TestSurvivingMCQFrames*` /
   `TestTailSimilarWithin*`.
+- **The last look before a claim is COMPLETE, and a content-safety refusal is not a delivery
+  fault** — everything above `ClaimForAutoAccept` (Guard 3's pane re-read especially) is a herdr
+  shell-out with a budget in SECONDS, and the sweep walks every candidate, so the gap between
+  "we checked" and "we send" is wide enough for an operator to act in. `claimBlockedBy` re-asks
+  all three controls there, broadest first: the **kill switch** (FR-017 — not FSP-specific, so
+  timed auto-accept re-reads it too, and it fails closed on a read error), the **mode** and its
+  ceiling latch via `stillPermitted`, and **`accept_generated_task`** for a generated-task row,
+  because that is a SEPARATE opt-in resolved once per sweep into `allowGenerated` — an operator
+  turning off just that key mid-sweep would otherwise still have a task written and handed to an
+  agent. `retireNoopEscalation` takes the same look, and the kill switch matters most there:
+  Guard 1a returns before ANY dismissal precisely so pausing the herd never destroys the queue it
+  protects, and a pause landing mid-sweep must get the same answer as one landing a second
+  earlier. Separately, a refusal from the seam's at-send screen is tagged `errOutboundRefused`
+  and handled like `errAgentDisabled` rather than as a delivery failure: it used to enter the
+  retry budget, so the same never-auto match was refused `maxAutoAcceptAttempts` times and the
+  row was then dismissed as `auto_accept_failed` — deleting from the queue exactly the escalation
+  FR-015 says must always reach a human. The refusal is permanent by nature (the same text
+  screens the same way every sweep), so a budget could only ever end in that dismissal. Reachable
+  only through a custom `next_task_template`, since the daemon's pre-check renders with the
+  DEFAULT one. Keep `TestFSPGeneratedTaskSafetyRefusalIsNeverDismissed` (which sweeps past the
+  attempt budget — the single-sweep test could not see it) /
+  `TestFSPRechecksAcceptGeneratedTaskBeforeClaiming` /
+  `TestAutoAcceptRechecksTheKillSwitchBeforeClaiming` (both flavours).
 - **Every auto-accept refusal names itself once** — `notePending` logs at INFO per (row, reason),
   cleared on delivery and pruned with the other per-row state. Before it, every "leave it
   pending" path was Debug-or-silent (Guard 1b and the pane-busy skip produced no output at ANY

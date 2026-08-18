@@ -1537,3 +1537,111 @@ func TestFSPRechecksTheModeBeforeClaiming(t *testing.T) {
 		t.Errorf("nothing may be delivered after the mode was switched off, sent %v", got)
 	}
 }
+
+// TestFSPGeneratedTaskSafetyRefusalIsNeverDismissed: the at-send screen refusing
+// a rendered prompt is a VERDICT, not a delivery fault.
+//
+// It used to enter the generic retry budget, so the same never-auto match was
+// refused three times and the escalation was then dismissed as
+// auto_accept_failed — deleting from the operator's queue exactly the row FR-015
+// says must always reach a human. TestFSPGeneratedTaskScreensTheExactOutboundPrompt
+// only ever ran one sweep, so it could not see this.
+func TestFSPGeneratedTaskSafetyRefusalIsNeverDismissed(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspAcceptGenerated+`
+[safety]
+never_auto_patterns = ['(?i)--no-preserve-root']
+`)
+	ctx := context.Background()
+	seams.renderedPrompt = "Next task: tidy the workspace\nRun it with: rm -rf / --no-preserve-root"
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := seedEscalationWithRationale(t, h, "pA", idlePane,
+		"[task_source_exhausted] nothing pending", domain.SituationIdle,
+		domain.SuggestTaskPrefix+"tidy the workspace", 5*time.Second)
+
+	// One more sweep than the attempt budget: the row must still be waiting.
+	for i := 0; i < maxAutoAcceptAttempts+1; i++ {
+		h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+	}
+
+	rec := auditRow(t, h, id)
+	if rec.Status != "escalated" {
+		t.Fatalf("status = %q after %d sweeps, want escalated (rationale %q)",
+			rec.Status, maxAutoAcceptAttempts+1, rec.Rationale)
+	}
+	if strings.Contains(rec.Rationale, domain.ReasonAutoAcceptFailed) {
+		t.Errorf("a safety refusal was retired as a delivery failure: %q", rec.Rationale)
+	}
+	if got := seams.accepted(); len(got) != 0 {
+		t.Errorf("the seam reported an acceptance for %v after its own screen refused", got)
+	}
+}
+
+// TestFSPRechecksAcceptGeneratedTaskBeforeClaiming: accept_generated_task is a
+// SEPARATE opt-in from the mode, and it was resolved once per sweep — so an
+// operator turning off just that key while the guards ran would still have a
+// task written and handed to an agent.
+func TestFSPRechecksAcceptGeneratedTaskBeforeClaiming(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspAcceptGenerated)
+	ctx := context.Background()
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := generatedTaskEscalation(t, h, "pA", idlePane)
+
+	// The operator's `config set full_self_prompting.accept_generated_task false`
+	// as the daemon sees it after its reload — the MODE itself stays on.
+	h.daemon.mu.Lock()
+	h.daemon.cfg.FullSelfPrompting.AcceptGeneratedTask = false
+	h.daemon.mu.Unlock()
+
+	// The sweep resolved allowGenerated before that landed, so it still walks the
+	// row with the stale `true`; only the re-check before the claim can stop it.
+	h.daemon.autoAcceptOne(ctx, auditRow(t, h, id), domain.SuggestGenerateTask,
+		map[string]domain.AgentTransition{"pA": {AgentID: "pA", Status: "idle"}},
+		&paneCache{}, time.Now(), true, true, h.daemon.fspStillOn)
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Errorf("status = %q, want escalated — the opt-in was switched off mid-chain", got)
+	}
+	if got := seams.accepted(); len(got) != 0 {
+		t.Errorf("a task was accepted for %v after the opt-in was switched off", got)
+	}
+}
+
+// TestAutoAcceptRechecksTheKillSwitchBeforeClaiming: the kill switch was read
+// only BEFORE the guard phase, and Guard 3's pane re-read is a herdr shell-out
+// with a budget in seconds — so a pause landing in that window still got the
+// send it exists to stop. Not FSP-specific: FR-017 stands the whole daemon down.
+func TestAutoAcceptRechecksTheKillSwitchBeforeClaiming(t *testing.T) {
+	for name, fsp := range map[string]bool{"full self-prompting": true, "timed auto-accept": false} {
+		t.Run(name, func(t *testing.T) {
+			h, _ := newFSPHarnessWithSeams(t, fspOn+autoAcceptOn)
+			ctx := context.Background()
+			h.herdr.setPane(approvalPane)
+			id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval,
+				"respond: Yes", 20*time.Minute)
+
+			// The operator pauses while the guards are running.
+			if _, err := h.raw.InsertKillEvent(ctx, domain.KillEvent{
+				State: "active", Scope: "global", Author: "operator", CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			var permitted func() bool
+			if fsp {
+				permitted = h.daemon.fspStillOn
+			}
+			h.daemon.autoAcceptOne(ctx, auditRow(t, h, id), "Yes",
+				map[string]domain.AgentTransition{"pA": {AgentID: "pA", Status: "blocked"}},
+				&paneCache{}, time.Now(), fsp, false, permitted)
+
+			if got := auditStatus(t, h, id); got != "escalated" {
+				t.Errorf("status = %q, want escalated — the kill switch was activated mid-chain", got)
+			}
+			if got := h.herdr.sentInputs(); len(got) != 0 {
+				t.Errorf("nothing may be delivered once the kill switch is active, sent %v", got)
+			}
+		})
+	}
+}
