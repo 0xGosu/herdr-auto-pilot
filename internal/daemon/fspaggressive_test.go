@@ -11,6 +11,9 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
+// NL keeps multi-line pane fixtures in this file readable without escaping.
+const NL = "\n"
+
 // oversizeMCQFrames builds a 4-tab form whose AGGREGATE is larger than the
 // ordinary 4000-rune excerpt budget — the shape the repo had no fixture for, and
 // the shape that produced audit #1092.
@@ -114,42 +117,88 @@ func TestAnAggregatePastItsOwnBudgetIsStillRefused(t *testing.T) {
 	}
 }
 
-// mangledPreviewRow builds the exact shape of audit #1092: the REAL 4-tab
-// preview-form aggregate, stored through the old tail-first budget so its
-// "[question 1/4]" head is gone, with the signature baseline intact — the
-// signature lives in its own columns and truncation never touched it.
-func mangledPreviewRow(t *testing.T) *domain.AuditRecord {
+// mangledPreviewRow builds the exact shape of audit #1092 — the REAL 4-tab
+// preview-form aggregate stored through the old tail-first budget, so its
+// "[question 1/4]" head is gone — and returns it with a pane read of a tab whose
+// block SURVIVED the truncation.
+//
+// The surviving tab used is the Submit tab, which is both the last block and the
+// most likely live state: the daemon's own sweep walks every tab with Right
+// arrows, so it leaves the form parked at the end.
+func mangledPreviewRow(t *testing.T) (rec *domain.AuditRecord, livePane string) {
 	t.Helper()
 	aggregate := readDomainFixture(t, "mcq_preview_aggregate.txt")
-	mangled := truncateTailRunes(aggregate, 3000)
+	r := []rune(aggregate)
+	mangled := excerptTruncationMarker + string(r[len(r)-3000:])
 	if _, ok := domain.AggregatedMCQFrames(mangled); ok {
 		t.Fatal("fixture must be truncated past its head to model the incident row")
 	}
-	if !domain.LooksLikeAggregatedMCQ(mangled) {
-		t.Fatal("fixture must still carry later markers, as the incident row did")
+	survivors, total, ok := domain.SurvivingMCQFrames(mangled)
+	if !ok || total != 4 || len(survivors) != 3 {
+		t.Fatalf("fixture must leave 3 of 4 blocks intact, got ok=%v total=%d blocks=%d",
+			ok, total, len(survivors))
 	}
-	return &domain.AuditRecord{
+	rec = &domain.AuditRecord{
 		ID: 1092, AgentID: "pA", AgentType: "claude",
 		SituationType: domain.SituationChoice, PaneExcerpt: mangled,
-		SigSalient: "options:" + domain.NormalizedOptionSet(domain.OptionLabels(aggregate)),
+		SigSalient: domain.MaskVolatile("options:" +
+			domain.NormalizedOptionSet(domain.OptionLabels(aggregate))),
 	}
+	return rec, survivors[len(survivors)-1]
 }
 
-// LS-1, the #1092 regression. The stored capture is unusable, so the frame-wise
-// comparison has nothing to compare — but the row's own option set and the live
-// form together still prove it is the same form, and under full self-prompting
-// that is enough to answer it.
-func TestFSPAnswersATruncatedAggregateWhoseLiveOptionsMatch(t *testing.T) {
+// LS-1, the #1092 regression. The stored capture no longer parses as an
+// aggregate, so the ordinary frame-wise comparison has nothing to compare — but
+// the blocks truncation did NOT reach are still intact, and the live frame being
+// one of them is the same identity relation, just over a partial capture.
+func TestFSPAnswersATruncatedAggregateWhoseLiveFrameSurvived(t *testing.T) {
 	h := newHarness(t, autoAcceptOn)
-	rec := mangledPreviewRow(t)
-	visible := readDomainFixture(t, "mcq_preview_visible_tab1.txt")
+	rec, pane := mangledPreviewRow(t)
 
-	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", visible, true)
+	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", pane, true)
 	if !handled {
 		t.Fatal("a live 4-tab form was not routed to the multi-tab comparison")
 	}
 	if got != heldStillYes {
-		t.Fatalf("verdict = %v, want heldStillYes: the form is standing and is provably the same one", got)
+		t.Fatalf("verdict = %v, want heldStillYes: the live frame is a surviving block of this row's own capture", got)
+	}
+}
+
+// THE hazard the option-subset test cannot see on its own. Every AskUserQuestion
+// form ends in a generated "Submit answers"/"Cancel" tab, so those labels are in
+// EVERY stored option union — a pane parked on any other form's Submit tab is a
+// subset of this row's set, has the same tab count, and is fully unanswered. Only
+// the frame comparison tells the two forms apart, and getting this wrong would
+// type one form's answer series into a different form.
+func TestFSPTruncatedAggregateRefusesADifferentFormOfTheSameSize(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	rec, _ := mangledPreviewRow(t)
+	other := "←  ☐ Deploy target  ☐ Rollback plan  ☐ On-call  ✔ Submit  →" + NL + NL +
+		"Review your answers" + NL + NL + "Ready to submit your answers?" + NL + NL +
+		"❯ 1. Submit answers" + NL + "  2. Cancel" + NL
+
+	// The option-subset half genuinely passes — which is exactly why it cannot be
+	// the only gate.
+	if !domain.LiveMCQMatchesSalient(domain.OptionLabels(other), rec.SigSalient) {
+		t.Fatal("fixture no longer reproduces the collision it exists to test")
+	}
+	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", other, true)
+	if !handled || got != heldStillUnevaluable {
+		t.Fatalf("verdict = %v handled = %v, want pending: this is a different form", got, handled)
+	}
+}
+
+// A capture that lost EVERY block carries no identity evidence at all, so there
+// is nothing to tell that form apart from another of the same size. A deliberate
+// limit of the fallback, not an oversight.
+func TestFSPRefusesACaptureWithNoSurvivingBlock(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	rec, pane := mangledPreviewRow(t)
+	rec.PaneExcerpt = excerptTruncationMarker + "  2. Cancel" + NL
+
+	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", pane, true)
+	if !handled || got != heldStillUnevaluable {
+		t.Fatalf("verdict = %v handled = %v, want pending with no surviving block", got, handled)
 	}
 }
 
@@ -157,36 +206,35 @@ func TestFSPAnswersATruncatedAggregateWhoseLiveOptionsMatch(t *testing.T) {
 // threshold with an operator present, so it keeps waiting for one.
 func TestTimedAutoAcceptStillLeavesATruncatedAggregatePending(t *testing.T) {
 	h := newHarness(t, autoAcceptOn)
-	got, handled := h.daemon.mcqFormHeldStill(mangledPreviewRow(t), "1 1 1 1",
-		readDomainFixture(t, "mcq_preview_visible_tab1.txt"), false)
+	rec, pane := mangledPreviewRow(t)
+	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", pane, false)
 	if !handled || got != heldStillUnevaluable {
 		t.Fatalf("verdict = %v handled = %v, want the row left pending without FSP", got, handled)
 	}
 }
 
-// The evidence is the option set, so a form offering something the escalation
-// never recorded is refused however similar it looks.
-func TestFSPTruncatedAggregateRefusesAnOptionTheBaselineNeverOffered(t *testing.T) {
+// The supporting conjunct still earns its place: a form whose recorded options
+// have drifted is refused even when a block still matches.
+func TestFSPTruncatedAggregateRefusesDriftedOptions(t *testing.T) {
 	h := newHarness(t, autoAcceptOn)
-	rec := mangledPreviewRow(t)
+	rec, pane := mangledPreviewRow(t)
 	rec.SigSalient = "options:" + domain.NormalizedOptionSet(
-		[]string{"something else entirely", "and another thing", "submit answers"})
+		[]string{"something else entirely", "and another thing"})
 
-	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1 1 1",
-		readDomainFixture(t, "mcq_preview_visible_tab1.txt"), true)
+	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", pane, true)
 	if !handled || got != heldStillUnevaluable {
 		t.Fatalf("verdict = %v handled = %v, want pending: the live options are not in the stored set", got, handled)
 	}
 }
 
-// A comma group only makes sense on a multi-select tab, and the per-tab select
-// modes lived in the frames the truncation destroyed. An unanswerable safety
-// question is answered NO — pressing one blind could half-answer the form.
+// A comma group only makes sense on a multi-select tab, and the tabs whose blocks
+// truncation destroyed carry no select mode at all — so the shape cannot be
+// verified for the whole form. An unanswerable safety question is answered NO.
 func TestFSPTruncatedAggregateRefusesEveryCommaGroup(t *testing.T) {
 	h := newHarness(t, autoAcceptOn)
-	visible := readDomainFixture(t, "mcq_preview_visible_tab1.txt")
+	rec, pane := mangledPreviewRow(t)
 	for _, series := range []string{"1,3 1 1 1", "1 1 1,2 1"} {
-		got, handled := h.daemon.mcqFormHeldStill(mangledPreviewRow(t), series, visible, true)
+		got, handled := h.daemon.mcqFormHeldStill(rec, series, pane, true)
 		if !handled || got != heldStillUnevaluable {
 			t.Errorf("series %q: verdict = %v handled = %v, want pending", series, got, handled)
 		}
@@ -198,11 +246,12 @@ func TestFSPTruncatedAggregateRefusesEveryCommaGroup(t *testing.T) {
 // alone rather than overwritten.
 func TestFSPTruncatedAggregateRefusesAPartAnsweredForm(t *testing.T) {
 	h := newHarness(t, autoAcceptOn)
-	visible := strings.Replace(readDomainFixture(t, "mcq_preview_visible_tab1.txt"), "☐", "☒", 1)
-	if !strings.Contains(visible, "☒") {
+	rec, pane := mangledPreviewRow(t)
+	answered := strings.Replace(pane, "☐", "☒", 1)
+	if !strings.Contains(answered, "☒") {
 		t.Fatal("fixture has no tab header checkbox to mark as answered")
 	}
-	got, handled := h.daemon.mcqFormHeldStill(mangledPreviewRow(t), "1 1 1 1", visible, true)
+	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", answered, true)
 	if !handled || got != heldStillUnevaluable {
 		t.Fatalf("verdict = %v handled = %v, want pending on a part-answered form", got, handled)
 	}
@@ -213,8 +262,8 @@ func TestFSPTruncatedAggregateRefusesAPartAnsweredForm(t *testing.T) {
 // to prove the refusal never turns into heldStillNo.
 func TestFSPTruncatedAggregateOverrideNeverDismisses(t *testing.T) {
 	h := newHarness(t, autoAcceptOn)
-	got, handled := h.daemon.mcqFormHeldStill(mangledPreviewRow(t), "1 1",
-		readDomainFixture(t, "mcq_preview_visible_tab1.txt"), true)
+	rec, pane := mangledPreviewRow(t)
+	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1", pane, true)
 	if !handled || got != heldStillUnevaluable {
 		t.Fatalf("verdict = %v handled = %v, want heldStillUnevaluable — this path must never dismiss", got, handled)
 	}
@@ -439,5 +488,46 @@ func TestAChangedPendingReasonIsReported(t *testing.T) {
 
 	if lines := cap.matching("leaving this escalation for the operator"); len(lines) != 2 {
 		t.Fatalf("got %d explanations for two distinct reasons, want 2: %v", len(lines), lines)
+	}
+}
+
+// LS-3 runs AFTER SignatureHeldStill has refused, so it must re-ask the two
+// refusals its caller did not. An over-masked salient is mostly repeated
+// placeholders, and two of those share almost every trigram — they would clear
+// any tolerance over any window, which is the magnet failure arriving by a door
+// the length floor does not cover.
+func TestFSPUnstructuredFallbackRefusesAnOverMaskedPair(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	rec := &domain.AuditRecord{ID: 7, AgentID: "pA", SituationType: domain.SituationIdle}
+	masked := strings.Repeat("<path> <num> <hash> ", 40)
+
+	for name, pair := range map[string][2]domain.SignatureResult{
+		"stored over-masked": {
+			{Salient: masked, Verdict: domain.GuardOverMasked},
+			{Salient: masked, Verdict: domain.GuardOK},
+		},
+		"live over-masked": {
+			{Salient: masked, Verdict: domain.GuardOK},
+			{Salient: masked, Verdict: domain.GuardOverMasked},
+		},
+	} {
+		if h.daemon.unstructuredHeldStill(rec, pair[0], pair[1]) {
+			t.Errorf("%s: an over-masked salient must never prove a screen held still", name)
+		}
+	}
+}
+
+// The other half of the same guard: a baseline that was a pane tail while the
+// live render now parses a permission verb is not a comparable pair, however
+// similar the two strings look.
+func TestFSPUnstructuredFallbackRefusesANowStructuredLiveSalient(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	rec := &domain.AuditRecord{ID: 8, AgentID: "pA", SituationType: domain.SituationApproval}
+	body := strings.Repeat("the agent is asking whether to go ahead with the change ", 8)
+
+	prev := domain.SignatureResult{Salient: body, Verdict: domain.GuardOK}
+	fresh := domain.SignatureResult{Salient: "permission:proceed | options:no;yes", Verdict: domain.GuardOK}
+	if h.daemon.unstructuredHeldStill(rec, prev, fresh) {
+		t.Fatal("a structured live salient must not be compared on the pane-tail path")
 	}
 }

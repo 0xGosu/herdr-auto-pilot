@@ -161,43 +161,43 @@ func AutoAcceptBaseline(a *AuditRecord) (SignatureResult, bool) {
 	}, true
 }
 
-// LiveMCQMatchesSalient reports whether the multi-tab form standing on screen is
-// recognisably the one an escalation was raised for, using the row's STORED
-// SALIENT as the identity evidence instead of its stored capture.
+// LiveMCQMatchesSalient reports whether every option a LIVE MCQ frame offers was
+// recorded in a stored salient's option set.
 //
-// It exists for one narrow case: the capture is unusable. A swept aggregate that
-// was truncated past its "[question 1/N]" head cannot be parsed back into frames
-// at all, so the frame-wise comparison auto-accept normally makes has nothing to
-// compare against and the row waits forever (observed live 2026-08-18, audit
-// #1092). The salient is a SEPARATE column that truncation never touched, and
-// for a choice it is the form's whole option set across every tab
-// ("options:" + NormalizedOptionSet) — which is real, unforgeable identity
-// evidence the excerpt's loss does not affect.
+// It is a SUPPORTING check, never identity on its own, and the reason is the
+// Submit tab: every Claude AskUserQuestion form ends in a generated tab offering
+// "Submit answers" / "Cancel", so those two labels are in EVERY stored union and
+// a pane parked on any form's Submit tab is a subset of any other form's set. A
+// generic Yes/No tab collides the same way. Used alone this would let one form's
+// answer series be typed into a different form with the same tab count — exactly
+// what AggregatedMCQFrames' doc forbids. Callers must pair it with frame
+// evidence; see daemon.mcqSalientHeldStill.
 //
-// The test is SUBSET, not equality, and the direction is load-bearing: the live
-// read is ONE tab of an N-tab form, so its options are necessarily a subset of
-// the aggregate's. Equality could never hold, and the reverse containment would
-// be satisfied by any single-option screen.
+// What it does catch, cheaply, is option DRIFT: a form whose choices have changed
+// at all fails, because labels compare exactly.
 //
-// It is deliberately not a similarity score. Both sides normalize through
-// normalizeOptionLabel, so the comparison is exact per label; a form whose
-// options have drifted at all fails, which is the fail-safe direction — the
-// caller leaves such a row pending rather than answering it.
+// Both sides are derived through the SAME pipeline the signature was minted with
+// — NormalizedOptionSet then MaskVolatile — rather than through a per-label
+// lookalike. That is not a nicety: the stored salient went through MaskVolatile
+// (ComputeSignatureN), so any label carrying a path, a large number, a timestamp
+// or a hex run is stored as "<path>"/"<num>"/"<hash>", and a live side normalized
+// only for case and whitespace could never match it. The failure would be silent
+// and one-directional — such forms simply never match — which is the shape of bug
+// this repo keeps finding after it ships.
 //
-// What this does NOT establish, and the caller must check separately: that the
-// form is still fully unanswered, that the tab count matches the answer series,
-// and that no tab needs a multi-select group (the per-tab select modes lived in
-// the frames the truncation destroyed, so a comma group can never be verified
-// here and must be refused by the caller).
+// Fails CLOSED: no stored option set, or nothing parsed off the live frame, is no
+// evidence and returns false.
 func LiveMCQMatchesSalient(liveOptions []string, salient string) bool {
 	stored, ok := SalientOptionSet(salient)
 	if !ok || len(liveOptions) == 0 {
-		// No option set stored (a pane-tail salient, or a verb-only approval),
-		// or nothing parsed off the live frame: no evidence, so no match.
 		return false
 	}
-	for _, o := range liveOptions {
-		if !stored[normalizeOptionLabel(o)] {
+	live, ok := SalientOptionSet(MaskVolatile("options:" + NormalizedOptionSet(liveOptions)))
+	if !ok {
+		return false
+	}
+	for o := range live {
+		if !stored[o] {
 			return false
 		}
 	}

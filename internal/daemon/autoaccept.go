@@ -1542,10 +1542,13 @@ func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane stri
 //     screen a magnet for every other — the same failure mode
 //     embedding.min_salient_chars exists to prevent on the cosine path. Below the
 //     floor there is no evidence and the row waits.
-//   - It NEVER dismisses. A containment miss returns false, and the caller's
-//     next move is heldStillUnevaluable, not heldStillNo. The comparison is good
-//     enough to justify acting when it succeeds and never good enough to destroy
-//     a queue entry when it fails.
+//   - It NEVER dismisses. A miss returns false, and the caller's next move is
+//     heldStillUnevaluable, not heldStillNo. The comparison is good enough to
+//     justify acting when it succeeds and never good enough to destroy a queue
+//     entry when it fails.
+//   - It re-asks the two refusals SignatureHeldStill makes that the caller does
+//     not: either side over-masked, or a fresh salient that has become
+//     structured. See the guard at the top of the body.
 //   - The situation TYPE was already asserted equal by the caller, and Guard 2
 //     already proved the agent is still parked. This adds content evidence on
 //     top of those, it does not replace them.
@@ -1554,6 +1557,23 @@ func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane stri
 // is a symmetric similarity bound with two other call sites, and reusing it here
 // would silently couple three different questions to one number.
 func (d *Daemon) unstructuredHeldStill(rec *domain.AuditRecord, prev, fresh domain.SignatureResult) bool {
+	// SignatureHeldStill refuses the fuzzy path on THREE conditions, and this
+	// fallback runs after it — so it has to re-ask the two the caller did not.
+	// Skipping them would not merely be untidy: an over-masked salient is mostly
+	// repeated "<path>"/"<num>"/"<hash>" placeholders, and two such salients
+	// share almost all their trigrams. They would clear any tolerance over any
+	// window, which is the "near-empty screens are a magnet" failure arriving by
+	// a different door than the one MinTailCompareRunes closes. The structured
+	// check is the cheaper half — a verbless approval whose live render now
+	// parses a permission verb makes `fresh` structured while `prev` is not —
+	// and it is free to close.
+	if prev.Verdict != domain.GuardOK || fresh.Verdict != domain.GuardOK ||
+		domain.StructuredSalient(fresh.Salient) {
+		slog.Debug("auto-accept: the pair is not comparable on the fuzzy path; leaving pending",
+			"audit_id", rec.ID, "agent", rec.AgentID,
+			"prev_verdict", prev.Verdict, "fresh_verdict", fresh.Verdict)
+		return false
+	}
 	if !domain.TailSimilarWithin(prev.Salient, fresh.Salient, fspTailHeldStillJitterPercent) {
 		slog.Debug("auto-accept: the pane tail no longer matches the escalated screen on their common window; leaving pending",
 			"audit_id", rec.ID, "agent", rec.AgentID,
@@ -1567,44 +1587,53 @@ func (d *Daemon) unstructuredHeldStill(rec *domain.AuditRecord, prev, fresh doma
 }
 
 // mcqSalientHeldStill is full self-prompting's fallback identity check for a
-// multi-tab form whose STORED CAPTURE is unusable — truncated past its
-// "[question 1/N]" head, or absent on a legacy row.
+// multi-tab form whose STORED CAPTURE was truncated past its head.
 //
 // Without it such a row is unanswerable forever. The capture is what the
-// frame-wise comparison compares against, so losing it means the guard can never
-// say yes, and it must not say no either (a mangled capture is not evidence the
-// screen changed) — so the row sits `escalated` through every sweep, delivered by
-// nobody and dismissed by nobody. That is not hypothetical: audit #1092 sat that
-// way for eleven minutes across both the FSP sweep and the timed threshold, and
-// was cleared by hand.
+// frame-wise comparison compares against, so a mangled one leaves the guard
+// unable to say yes — and it must not say no either (a mangled capture is not
+// evidence the screen changed) — so the row sits `escalated` through every sweep,
+// delivered by nobody and dismissed by nobody. Audit #1092 sat that way for
+// eleven minutes across both the FSP sweep and the timed threshold, and was
+// cleared by hand.
 //
-// The substitute evidence is the row's SALIENT, a separate column truncation
-// never touched. For a choice it encodes the whole form's option set across every
-// tab, so a live frame whose options are a subset of it is the same form. That is
-// STRICTER than it sounds: labels compare exactly (both sides through one
-// normalizer), so any drift in the offered options fails and the row stays
-// pending.
+// The evidence is the part of the capture truncation did NOT destroy.
+// truncateTailRunes cuts from the top, so every block after the first surviving
+// "[question k/N]" marker is byte-intact — and comparing the live frame against
+// those blocks is the SAME frame-wise relation the intact path uses, just over a
+// partial capture. That relation is what makes this safe.
 //
-// Three further conditions, none of them optional:
+// It is emphatically not enough to ask whether the live options are a subset of
+// the row's stored option set. That set is the union over every tab, and every
+// AskUserQuestion form ends in a generated "Submit answers"/"Cancel" tab, so a
+// pane parked on ANY form's Submit tab is a subset of ANY other form's set — one
+// form's answer series would be typed into a different form with the same tab
+// count, which is precisely what AggregatedMCQFrames exists to prevent. The
+// subset test is kept only as a cheap extra conjunct that catches option drift.
+//
+// Three further conditions, none optional:
 //
 //   - The tab count must match the answer series, or delivery would not take the
 //     answer-series branch at all — it would fall through to the plain-menu path
 //     and map the reply against whichever tab happens to be visible.
 //   - No token may be a COMMA GROUP. A group only makes sense on a multi-select
-//     tab, and the per-tab select modes lived in the frames the truncation
-//     destroyed — so unlike the intact-aggregate path there is nothing here to
-//     verify a group against. mcqdeliver would refuse it at its own tab, but that
-//     is AFTER earlier tabs were answered and committed, leaving the
-//     half-answered form the all-or-nothing contract exists to prevent. Refuse
-//     before anything is pressed.
-//   - The form must be fully unanswered, for the reason the intact path checks it:
-//     delivery resets to tab 1 and retypes EVERY tab, so proceeding over someone
-//     else's picks would silently overwrite them.
+//     tab, and while the surviving blocks carry their own select modes, the tabs
+//     whose blocks are GONE carry nothing — so the shape cannot be verified for
+//     the whole form. mcqdeliver would refuse at its own tab, but only after
+//     earlier tabs were answered and committed, leaving the half-answered form
+//     the all-or-nothing contract exists to prevent. Refuse before anything is
+//     pressed.
+//   - The form must be fully unanswered: delivery resets to tab 1 and retypes
+//     EVERY tab, so proceeding over someone else's picks would overwrite them.
 //
-// This widens the evidence for IDENTITY only. Liveness is still proved twice
-// after this returns — deliver.deliverSeries refuses unless the live pane parses
-// as a form with exactly this many tabs, and mcqdeliver verifies every keystroke
-// landed.
+// A row whose capture left NO usable block — a fully truncated excerpt, or a
+// legacy row that carries none — has no identity evidence at all and stays
+// pending. That is a deliberate limit, not an oversight: there is nothing left to
+// tell that form apart from another of the same size.
+//
+// Liveness is still proved twice after this returns — deliver.deliverSeries
+// refuses unless the live pane parses as a form with exactly this many tabs, and
+// mcqdeliver verifies every keystroke landed.
 func (d *Daemon) mcqSalientHeldStill(rec *domain.AuditRecord, suggestion, pane string,
 	state domain.MCQFormState) bool {
 
@@ -1619,21 +1648,41 @@ func (d *Daemon) mcqSalientHeldStill(rec *domain.AuditRecord, suggestion, pane s
 	}
 	for i, group := range groups {
 		if len(group) > 1 {
-			return decline(fmt.Sprintf("tab %d needs a multi-select group no capture can verify", i+1))
+			return decline(fmt.Sprintf("tab %d needs a multi-select group no surviving capture can verify", i+1))
 		}
 	}
 	if !domain.MCQFormFullyUnanswered(pane) {
 		return decline("the form is already part-answered")
 	}
+	survivors, total, ok := domain.SurvivingMCQFrames(rec.PaneExcerpt)
+	if !ok {
+		return decline("no block of the row's own capture survived the truncation")
+	}
+	if total != state.AnswerCount {
+		return decline(fmt.Sprintf("the capture declares %d tabs, the live form shows %d",
+			total, state.AnswerCount))
+	}
+	live := domain.ExtractAgentMCQForm(state.Kind, pane)
+	normalized := domain.NormalizeMCQFrame(live)
+	matched := false
+	for _, frame := range survivors {
+		if domain.NormalizeMCQFrame(frame) == normalized {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return decline("the live frame matches none of the blocks that survived the truncation")
+	}
 	// OptionLabels is what the sweep itself ran over the aggregate to build the
 	// Options the salient was minted from, so both sides of the comparison are
 	// derived by the same function.
-	live := domain.OptionLabels(domain.ExtractAgentMCQForm(state.Kind, pane))
-	if !domain.LiveMCQMatchesSalient(live, rec.SigSalient) {
-		return decline("the live options are not a subset of the escalated form's option set")
+	if !domain.LiveMCQMatchesSalient(domain.OptionLabels(live), rec.SigSalient) {
+		return decline("the live options are not all in the escalated form's option set")
 	}
-	slog.Info("full self-prompting: the row's capture is unusable but the live form matches its stored option set; proceeding",
-		"audit_id", rec.ID, "agent", rec.AgentID, "tabs", state.AnswerCount)
+	slog.Info("full self-prompting: the row's capture was truncated but the live frame matches a surviving block of it; proceeding",
+		"audit_id", rec.ID, "agent", rec.AgentID, "tabs", state.AnswerCount,
+		"surviving_blocks", len(survivors))
 	return true
 }
 

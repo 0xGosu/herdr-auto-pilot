@@ -384,18 +384,29 @@ whose manifest carries exactly that version).
   resolve to `heldStillUnevaluable` (PENDING) when they decline. A fallback that could answer
   `heldStillNo` would turn a widening into a queue-destroying dismissal, which is the one
   outcome none of this may produce.
-  - `mcqSalientHeldStill` answers the row whose CAPTURE is unusable using the row's SALIENT,
-    a separate column truncation never touched: for a choice it encodes the form's whole option
-    set across every tab, so a live frame whose options are a SUBSET of it is the same form
-    (`domain.LiveMCQMatchesSalient`; subset, not equality — the live read is ONE tab of N). Both
-    sides normalize through the single `normalizeOptionLabel` factored out of
-    `NormalizedOptionSet`, so labels compare exactly and any drift refuses. Three further gates
-    are not optional: tab count must equal the answer-series length (or delivery falls to the
-    plain-menu path and maps the reply against whichever tab is visible), the form must be fully
-    unanswered (delivery resets to tab 1 and retypes EVERY tab), and **no token may be a comma
-    group** — a group only makes sense on a multi-select tab, and the per-tab select modes lived
-    in the frames the truncation destroyed, so the question is unanswerable and an unanswerable
-    safety question is answered NO. Liveness is still proved twice afterwards by
+  - `mcqSalientHeldStill` answers the row whose CAPTURE was truncated past its head, using
+    the blocks truncation did NOT reach. `truncateTailRunes` cuts from the top, so every block
+    after the first surviving `[question k/N]` marker is byte-intact
+    (`domain.SurvivingMCQFrames`, which stays structural: one declared total, consecutive
+    indices, and the run must END at that total). Requiring the live frame to equal one of
+    those blocks is the SAME frame-wise relation the intact path uses, just over a partial
+    capture — and that relation is what makes this safe. **The option set alone is NOT
+    sufficient identity and must never become the only gate**: it is the union over every tab,
+    and every AskUserQuestion form ends in a generated `Submit answers`/`Cancel` tab, so a pane
+    parked on ANY form's Submit tab is a subset of ANY other form's set — one form's answer
+    series would be typed into a different form of the same tab count, exactly what
+    `AggregatedMCQFrames` exists to prevent. `domain.LiveMCQMatchesSalient` is kept only as a
+    cheap extra conjunct catching option drift, and it derives BOTH sides through
+    `NormalizedOptionSet` then `MaskVolatile` — the stored salient was masked, so a live side
+    normalized only for case and whitespace could never match a label carrying a path or a
+    number, and would silently no-op for every such form. Three further gates are not optional:
+    tab count must equal the answer-series length (or delivery falls to the plain-menu path and
+    maps the reply against whichever tab is visible), the form must be fully unanswered
+    (delivery resets to tab 1 and retypes EVERY tab), and **no token may be a comma group** —
+    the tabs whose blocks are gone carry no select mode at all, so the shape cannot be verified
+    for the whole form, and an unanswerable safety question is answered NO. A capture with NO
+    surviving block (fully truncated, or a legacy row) has no identity evidence and stays
+    pending: a deliberate limit, not an oversight. Liveness is still proved twice afterwards by
     `deliver.deliverSeries` and `mcqdeliver`.
   - `unstructuredHeldStill` answers a PANE-TAIL row using `domain.TailSimilarWithin`, which cuts
     both salients to the shorter one's length FROM THE TAIL before the trigram compare. The
@@ -410,7 +421,12 @@ whose manifest carries exactly that version).
     `embedding.min_salient_chars` is — two short tails compare equal whatever they say, making
     one near-empty screen a magnet. `fspTailHeldStillJitterPercent` is a SEPARATE constant from
     `staleDeferredSendJitterPercent` (shared by two other call sites) at the same value: the
-    loosening is the alignment, not the tolerance.
+    loosening is the alignment, not the tolerance. Because it runs AFTER `SignatureHeldStill`
+    has refused, it must re-ask the two refusals its caller did not — either side over-masked,
+    or a fresh salient that has become structured. An over-masked salient is mostly repeated
+    `<path>`/`<num>`/`<hash>` placeholders, and two of those share almost every trigram, so they
+    clear any tolerance over any window: the magnet failure arriving by a door the length floor
+    does not cover.
 
   A third loosening sits outside Guard 3: under FSP a `@noop` suggestion is RETIRED
   (`ReasonAutoDismissNoop`) rather than left pending, because the sentinel means SEND NOTHING and
@@ -419,16 +435,20 @@ whose manifest carries exactly that version).
   evidence, and it can afford to be: nothing is typed, nothing is learned. It still honours the
   kill switch, the per-agent disable and the runaway-guard pause, and it makes `autoDismiss`
   reachable from FOUR places rather than three. Keep
-  `TestFSPAnswersATruncatedAggregateWhoseLiveOptionsMatch` (the #1092 regression) /
+  `TestFSPAnswersATruncatedAggregateWhoseLiveFrameSurvived` (the #1092 regression) /
+  `TestFSPTruncatedAggregateRefusesADifferentFormOfTheSameSize` (the Submit-tab collision that
+  is why the option set can never be the only gate) / `TestFSPRefusesACaptureWithNoSurvivingBlock` /
   `TestTimedAutoAcceptStillLeavesATruncatedAggregatePending` /
-  `TestFSPTruncatedAggregateRefusesAnOptionTheBaselineNeverOffered` /
+  `TestFSPTruncatedAggregateRefusesDriftedOptions` /
   `…RefusesEveryCommaGroup` / `…RefusesAPartAnsweredForm` / `…OverrideNeverDismisses` /
+  `TestFSPUnstructuredFallbackRefusesAnOverMaskedPair` / `…RefusesANowStructuredLiveSalient` /
   `TestFSPAnswersAnIdleRowWhoseTailStillMatches` /
   `TestTimedAutoAcceptCannotEvaluateAMismatchedWindow` (the control proving the pair is not
   vacuous) / `TestFSPLeavesAMovedOnIdleScreenPending` / `TestFSPRetiresANoopEscalation` /
   `TestTimedAutoAcceptStillLeavesANoopEscalationPending` /
   `TestFSPNoopRetirementHonoursADisabledAgent`, and in `internal/domain`
-  `TestLiveMCQMatchesSalient*` / `TestNormalizedOptionSetRoundTripsThroughSplitOptionSet` /
+  `TestLiveMCQMatchesSalient*` (including `…MasksBothSides`) /
+  `TestNormalizedOptionSetRoundTripsThroughSplitOptionSet` / `TestSurvivingMCQFrames*` /
   `TestTailSimilarWithin*`.
 - **Every auto-accept refusal names itself once** — `notePending` logs at INFO per (row, reason),
   cleared on delivery and pruned with the other per-row state. Before it, every "leave it

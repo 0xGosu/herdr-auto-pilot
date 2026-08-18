@@ -12,7 +12,7 @@ import (
 // hold, and the reverse containment would be satisfied by any single-option
 // screen.
 func TestLiveMCQMatchesSalientAcceptsOneTabOfTheStoredUnion(t *testing.T) {
-	salient := "options:" + NormalizedOptionSet([]string{
+	salient := storedSalient([]string{
 		"Additive — both coexist", "Cancel", "Snapshot at session start", "Submit answers",
 	})
 	if !LiveMCQMatchesSalient([]string{"Cancel", "Additive — both coexist"}, salient) {
@@ -23,7 +23,7 @@ func TestLiveMCQMatchesSalientAcceptsOneTabOfTheStoredUnion(t *testing.T) {
 // Case and surrounding whitespace are folded on both sides by one function, so a
 // re-render that only changes those is still the same form.
 func TestLiveMCQMatchesSalientFoldsCaseAndSpacing(t *testing.T) {
-	salient := "options:" + NormalizedOptionSet([]string{"Yes, proceed", "No"})
+	salient := storedSalient([]string{"Yes, proceed", "No"})
 	if !LiveMCQMatchesSalient([]string{"  YES, PROCEED  "}, salient) {
 		t.Fatal("label normalization must be identical on both sides")
 	}
@@ -32,7 +32,7 @@ func TestLiveMCQMatchesSalientFoldsCaseAndSpacing(t *testing.T) {
 // The whole point of the check: a form offering something the escalation never
 // recorded is a DIFFERENT form, however similar it looks.
 func TestLiveMCQMatchesSalientRefusesAnOptionTheBaselineNeverOffered(t *testing.T) {
-	salient := "options:" + NormalizedOptionSet([]string{"Yes", "No"})
+	salient := storedSalient([]string{"Yes", "No"})
 	if LiveMCQMatchesSalient([]string{"Yes", "Delete everything"}, salient) {
 		t.Fatal("an option absent from the escalation's own set must refuse")
 	}
@@ -59,8 +59,8 @@ func TestLiveMCQMatchesSalientRefusesWithoutEvidence(t *testing.T) {
 // SalientOptionSet must read both spellings — otherwise the fallback silently
 // only ever works for `choice` rows.
 func TestSalientOptionSetReadsBothSpellings(t *testing.T) {
-	choice := "options:" + NormalizedOptionSet([]string{"Yes", "No"})
-	approval := "permission:proceed | options:" + NormalizedOptionSet([]string{"Yes", "No"})
+	choice := storedSalient([]string{"Yes", "No"})
+	approval := MaskVolatile("permission:proceed | options:" + NormalizedOptionSet([]string{"Yes", "No"}))
 	for name, salient := range map[string]string{"choice": choice, "approval": approval} {
 		set, ok := SalientOptionSet(salient)
 		if !ok || len(set) != 2 || !set["yes"] || !set["no"] {
@@ -138,5 +138,79 @@ func TestTailSimilarWithinRefusesTooShortACommonTail(t *testing.T) {
 	if n := utf8.RuneCountInString(short); n >= MinTailCompareRunes {
 		t.Fatalf("fixture is %d runes, no longer under the %d floor it exists to test",
 			n, MinTailCompareRunes)
+	}
+}
+
+// storedSalient builds a choice salient exactly as ComputeSignatureN persists one:
+// the option set is encoded and THEN masked. Constructing it without MaskVolatile
+// is what let a live side normalized only for case and whitespace look correct in
+// tests while never matching a real row whose labels carry a path or a number.
+func storedSalient(options []string) string {
+	return MaskVolatile("options:" + NormalizedOptionSet(options))
+}
+
+// A stored salient went through MaskVolatile, so a label carrying a path is
+// stored as "<path>". The live side must be derived through the same pipeline or
+// the whole check silently no-ops for every form that mentions a file.
+func TestLiveMCQMatchesSalientMasksBothSides(t *testing.T) {
+	labels := []string{"Edit internal/daemon/autoaccept.go", "Cancel"}
+	salient := storedSalient(labels)
+	if !strings.Contains(salient, "<path>") {
+		t.Fatalf("fixture must exercise masking, got %q", salient)
+	}
+	if !LiveMCQMatchesSalient(labels, salient) {
+		t.Fatal("a live frame offering the very labels the row recorded must match")
+	}
+}
+
+// A head-truncated aggregate still carries every block after its first surviving
+// marker, byte-intact — that is the identity evidence such a row has left.
+func TestSurvivingMCQFramesRecoversTheTailBlocks(t *testing.T) {
+	frames := []string{"tab one body\n1. a\n", "tab two body\n1. b\n", "tab three body\n1. c\n"}
+	full := AggregateMCQFrames(frames)
+	cut := strings.Index(full, "[question 2/3]")
+	if cut < 1 || full[cut-1] != '\n' {
+		t.Fatal("aggregate does not carry the marker this test truncates at, on its own line")
+	}
+	// Cut just BEFORE the marker's line, the way truncateTailRunes would: the "…"
+	// it prefixes must not land on the marker itself, or that marker stops being
+	// line-anchored and is correctly no longer recognized.
+	got, total, ok := SurvivingMCQFrames("…" + full[cut-1:])
+	if !ok || total != 3 || len(got) != 2 {
+		t.Fatalf("SurvivingMCQFrames = %v, total %d, ok %v; want the last 2 of 3", got, total, ok)
+	}
+	if got[0] != strings.TrimSpace(frames[1]) || got[1] != strings.TrimSpace(frames[2]) {
+		t.Errorf("recovered blocks = %q, want the intact tails of frames 2 and 3", got)
+	}
+}
+
+// Recognition is structural, exactly as AggregatedMCQFrames is: a run that does
+// not reach the declared total, disagreeing totals, or a gap all mean the content
+// is not a tail window onto one aggregate — so it is no evidence, not weak
+// evidence.
+func TestSurvivingMCQFramesRefusesAnythingElse(t *testing.T) {
+	for name, content := range map[string]string{
+		"no markers":        "just some pane output with no markers at all\n",
+		"does not reach N":  "[question 1/4]\nbody\n[question 2/4]\nbody\n",
+		"gap in the run":    "[question 2/4]\nbody\n[question 4/4]\nbody\n",
+		"totals disagree":   "[question 2/4]\nbody\n[question 3/5]\nbody\n[question 4/5]\nbody\n",
+		"agent printed one": "I will now answer [question 1/4] for you.\n",
+	} {
+		if _, _, ok := SurvivingMCQFrames(content); ok {
+			t.Errorf("%s: must not be read as a surviving aggregate", name)
+		}
+	}
+}
+
+// The "…" truncateTailRunes prefixes is not cosmetic: a marker it lands on stops
+// being line-anchored, and is correctly no longer counted as surviving. Pinning
+// it means a future change to the marker regex cannot quietly start trusting a
+// half-eaten header.
+func TestSurvivingMCQFramesIgnoresAMarkerTheCutLandedOn(t *testing.T) {
+	full := AggregateMCQFrames([]string{"one\n1. a\n", "two\n1. b\n", "three\n1. c\n"})
+	cut := strings.Index(full, "[question 2/3]")
+	got, _, ok := SurvivingMCQFrames("…" + full[cut:])
+	if !ok || len(got) != 1 {
+		t.Fatalf("blocks = %v ok = %v, want only the one whose marker survived intact", got, ok)
 	}
 }
