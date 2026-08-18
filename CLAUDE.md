@@ -350,6 +350,95 @@ whose manifest carries exactly that version).
   every OTHER multi-tab fixture in this repo renders options without previews — the real
   captured pair in `internal/domain/testdata/mcq_preview_*.txt` is the only one that reproduces
   the layout, which is why this shipped green.
+- **A swept AGGREGATE is the one capture whose HEAD is load-bearing, so it gets its own
+  storage budget** — every other `pane_excerpt` is a pane TAIL (the prompt or error is at the
+  bottom, old scrollback goes first), which is why `truncateTailRunes` keeps the tail and
+  prefixes `…`. An aggregate is the opposite shape: `AggregatedMCQFrames` reads the tab total
+  out of the FIRST `[question 1/N]` marker and demands N markers running 1..N, so shearing the
+  head does not degrade the capture, it DESTROYS it — and `mcqFormHeldStill` then answers
+  `heldStillUnevaluable` on every sweep, forever, at Debug level only. The row is neither
+  delivered nor dismissed and nothing says why. Verified live 2026-08-18 (audit #1092): a 4-tab
+  AskUserQuestion form with preview boxes stored 4001 runes with 3 of its 4 markers left, and
+  sat pending across BOTH the FSP sweep and the 5-minute timed threshold until the operator
+  cleared it by hand. The real 3-tab preview fixture is already 3606 runes, so 4000 never fit
+  four tabs — this is every large form, not an edge case. Hence `aggregateMaxRunes`
+  (`truncateExcerpt`/`excerptBudget`), and three bounds on it: the gate is a **strict parse**,
+  never `LooksLikeAggregatedMCQ` (at write time content is untruncated so a real aggregate always
+  parses, while the marker test would hand the big budget to any pane that merely PRINTED
+  `[question 1/4]` — `LooksLikeAggregatedMCQ` stays the READER's evidence that a stored row is
+  mangled); `SaveSignatureSnapshot` deliberately keeps 4000, because `signature_snapshots` has NO
+  retention path at all and `hap signatures show` prints it unpaged; and
+  `duplicatePendingEscalation` truncates with the new helper but still passes `snapshotMaxRunes`
+  as the `snapshotCap` ARGUMENT, since there it is the "is this a large tail window" threshold
+  that gates the two fuzzy dedup paths, not a storage budget — passing the bigger one would
+  disarm them for exactly the captures most likely to need them. The refusal branches stay: this
+  stops new rows being mangled, it does not make a mangled capture trustworthy. Note the test
+  seeder `seedAgedSweptEscalation` was the only writer of that column anywhere that skipped
+  truncation, which is why every existing test was blind to this; it now goes through
+  `truncateExcerpt` like production. Keep `TestAnOversizeAggregateSurvivesTheCapturePath` /
+  `TestAnOrdinaryCaptureKeepsTheSmallerBudget` / `TestOnlyARealAggregateEarnsTheBiggerBudget` /
+  `TestAnAggregatePastItsOwnBudgetIsStillRefused`.
+- **Full self-prompting may widen the YES side of Guard 3, never the NO side** — the mode gets
+  two extra evidence paths, both reached ONLY after the ordinary comparison has already refused,
+  both gated on the `fsp bool` already threaded through `autoAcceptOne`, and both required to
+  resolve to `heldStillUnevaluable` (PENDING) when they decline. A fallback that could answer
+  `heldStillNo` would turn a widening into a queue-destroying dismissal, which is the one
+  outcome none of this may produce.
+  - `mcqSalientHeldStill` answers the row whose CAPTURE is unusable using the row's SALIENT,
+    a separate column truncation never touched: for a choice it encodes the form's whole option
+    set across every tab, so a live frame whose options are a SUBSET of it is the same form
+    (`domain.LiveMCQMatchesSalient`; subset, not equality — the live read is ONE tab of N). Both
+    sides normalize through the single `normalizeOptionLabel` factored out of
+    `NormalizedOptionSet`, so labels compare exactly and any drift refuses. Three further gates
+    are not optional: tab count must equal the answer-series length (or delivery falls to the
+    plain-menu path and maps the reply against whichever tab is visible), the form must be fully
+    unanswered (delivery resets to tab 1 and retypes EVERY tab), and **no token may be a comma
+    group** — a group only makes sense on a multi-select tab, and the per-tab select modes lived
+    in the frames the truncation destroyed, so the question is unanswerable and an unanswerable
+    safety question is answered NO. Liveness is still proved twice afterwards by
+    `deliver.deliverSeries` and `mcqdeliver`.
+  - `unstructuredHeldStill` answers a PANE-TAIL row using `domain.TailSimilarWithin`, which cuts
+    both salients to the shorter one's length FROM THE TAIL before the trigram compare. The
+    mismatch it exists for is structural, not statistical: the baseline is minted from a
+    `--source recent` CONSUMING DELTA while every re-read is `--source visible`, so symmetric
+    Jaccard is dominated by content only the longer side ever had and refuses however little
+    moved — which is the documented reason idle and generated-task rows never auto-accept.
+    Aligning on the TAIL rather than testing containment is what keeps it safe: a screen that
+    moved on paints its new content at the BOTTOM, inside the compared window, while containment
+    would answer "still there" with a new question sitting below the old one.
+    `domain.MinTailCompareRunes` is the floor, and it is load-bearing for the same reason
+    `embedding.min_salient_chars` is — two short tails compare equal whatever they say, making
+    one near-empty screen a magnet. `fspTailHeldStillJitterPercent` is a SEPARATE constant from
+    `staleDeferredSendJitterPercent` (shared by two other call sites) at the same value: the
+    loosening is the alignment, not the tolerance.
+
+  A third loosening sits outside Guard 3: under FSP a `@noop` suggestion is RETIRED
+  (`ReasonAutoDismissNoop`) rather than left pending, because the sentinel means SEND NOTHING and
+  can never become deliverable on a later sweep — so under a mode whose premise is that nobody is
+  reading the queue it would sit forever. It is the only auto-accept path that acts with no pane
+  evidence, and it can afford to be: nothing is typed, nothing is learned. It still honours the
+  kill switch, the per-agent disable and the runaway-guard pause, and it makes `autoDismiss`
+  reachable from FOUR places rather than three. Keep
+  `TestFSPAnswersATruncatedAggregateWhoseLiveOptionsMatch` (the #1092 regression) /
+  `TestTimedAutoAcceptStillLeavesATruncatedAggregatePending` /
+  `TestFSPTruncatedAggregateRefusesAnOptionTheBaselineNeverOffered` /
+  `…RefusesEveryCommaGroup` / `…RefusesAPartAnsweredForm` / `…OverrideNeverDismisses` /
+  `TestFSPAnswersAnIdleRowWhoseTailStillMatches` /
+  `TestTimedAutoAcceptCannotEvaluateAMismatchedWindow` (the control proving the pair is not
+  vacuous) / `TestFSPLeavesAMovedOnIdleScreenPending` / `TestFSPRetiresANoopEscalation` /
+  `TestTimedAutoAcceptStillLeavesANoopEscalationPending` /
+  `TestFSPNoopRetirementHonoursADisabledAgent`, and in `internal/domain`
+  `TestLiveMCQMatchesSalient*` / `TestNormalizedOptionSetRoundTripsThroughSplitOptionSet` /
+  `TestTailSimilarWithin*`.
+- **Every auto-accept refusal names itself once** — `notePending` logs at INFO per (row, reason),
+  cleared on delivery and pruned with the other per-row state. Before it, every "leave it
+  pending" path was Debug-or-silent (Guard 1b and the pane-busy skip produced no output at ANY
+  level), which is why #1092 took a five-round investigation and a live database query to
+  explain. Once per (row, reason), not per sweep, because the pass re-examines every pending row
+  every minute — but a row whose reason CHANGES is new information and says so. The call sites
+  all sit AFTER `stillEligible` is set: an INELIGIBLE row `continue`s before that, so logging one
+  there would be pruned every tick and re-logged every minute forever. Keep
+  `TestAPendingEscalationSaysWhyExactlyOnce` / `TestAChangedPendingReasonIsReported`.
 - **An option label stops at the preview column** — Claude renders options WITH previews in two
   columns (option list left, preview box right) and a pane is one flat text grid, so the box
   lands inside the option's own line. Line-anchored parsing therefore made option 1's label
