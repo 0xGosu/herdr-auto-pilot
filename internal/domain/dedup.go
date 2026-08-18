@@ -357,6 +357,46 @@ func shingleSimilar(sa map[string]struct{}, ra int, b string, jitterPct int) boo
 	return inter*100 >= (100-jitterPct)*union
 }
 
+// MinTailCompareRunes is the floor under TailSimilarWithin. Below it the common
+// tail is a line or two of text plus whatever agent chrome the strip did not
+// recognize, and any two such tails compare equal — the same "near-empty screens
+// are a magnet" hazard EmbeddableSalient closes on the embedding path.
+const MinTailCompareRunes = 200
+
+// TailSimilarWithin reports whether two pane-tail captures agree on the tail they
+// SHARE: both are cut to the shorter one's rune length before the trigram
+// compare.
+//
+// It exists for one measured cause. An auto-accept baseline is minted from the
+// daemon's classification read, which is `pane read --source recent` — a
+// CONSUMING delta that can return a fraction of the screen — while every later
+// staleness re-check reads `--source visible`, the whole screen. The two are then
+// different-length WINDOWS onto the same unchanged pane, and symmetric Jaccard
+// punishes that misalignment directly: the union is dominated by content only the
+// longer side ever had, so similarity stays low however little moved. Aligning the
+// windows first is a STRUCTURAL fix for a structural mismatch, which is why the
+// tolerance itself does not have to be loosened to compensate.
+//
+// Aligning on the TAIL (not the head) is what makes it safe: a screen that has
+// moved on shows its new content at the BOTTOM, which lands inside the compared
+// window and fails. A containment test would not — the old content is still
+// present further up, so "the escalated screen is still there" would keep
+// answering yes while a new question sat below it.
+//
+// The floor is not optional, and the caller must treat a false as "cannot tell",
+// never as "the screen changed".
+func TailSimilarWithin(a, b string, jitterPct int) bool {
+	ra, rb := []rune(a), []rune(b)
+	n := len(ra)
+	if len(rb) < n {
+		n = len(rb)
+	}
+	if n < MinTailCompareRunes {
+		return false
+	}
+	return SimilarWithin(string(ra[len(ra)-n:]), string(rb[len(rb)-n:]), jitterPct)
+}
+
 // shingles is the set of overlapping character trigrams of s. A string shorter
 // than 3 runes has no trigram, so it is represented by itself (an empty string
 // yields the empty set) — enough for the exact/near-empty cases the caller feeds

@@ -4571,6 +4571,8 @@ func AuditStatusLabel(r domain.AuditRecord) string {
 			return "dism:gone"
 		case domain.ReasonAutoAcceptFailed:
 			return "dism:failed"
+		case domain.ReasonAutoDismissNoop:
+			return "dism:noop"
 		}
 		return "dismissed" // the operator's own
 	}

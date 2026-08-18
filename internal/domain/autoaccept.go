@@ -118,13 +118,22 @@ func AutoAcceptIneligible(a *AuditRecord, suggestion string, allowGeneratedTask 
 		// treats it as ordinary text. Refusing it here is the fail-closed
 		// equivalent: nothing to send means nothing to auto-send, so it stays
 		// for the operator rather than being typed at an agent verbatim.
-		return "noop suggestion"
+		return IneligibleNoopSuggestion
 	}
 	if a.SigRaw == "" {
 		return "no signature baseline"
 	}
 	return ""
 }
+
+// IneligibleNoopSuggestion is the refusal AutoAcceptIneligible returns for a
+// "@noop" suggestion. It is a named constant because full self-prompting acts on
+// it specifically — retiring the row rather than leaving it pending, since a
+// sentinel meaning "send nothing" has nothing to deliver and will still have
+// nothing to deliver on the next sweep, and the one after that. Every other
+// refusal stays a plain string: they mean "a human must look at this", which is
+// not a value any caller should be branching on.
+const IneligibleNoopSuggestion = "noop suggestion"
 
 // AutoAcceptBaseline rehydrates the SignatureResult persisted on an audit row,
 // for use as `prev` in a staleness comparison.
@@ -150,4 +159,47 @@ func AutoAcceptBaseline(a *AuditRecord) (SignatureResult, bool) {
 		Verdict:      a.SigVerdict,
 		SalientChars: a.SigSalientChars,
 	}, true
+}
+
+// LiveMCQMatchesSalient reports whether every option a LIVE MCQ frame offers was
+// recorded in a stored salient's option set.
+//
+// It is a SUPPORTING check, never identity on its own, and the reason is the
+// Submit tab: every Claude AskUserQuestion form ends in a generated tab offering
+// "Submit answers" / "Cancel", so those two labels are in EVERY stored union and
+// a pane parked on any form's Submit tab is a subset of any other form's set. A
+// generic Yes/No tab collides the same way. Used alone this would let one form's
+// answer series be typed into a different form with the same tab count — exactly
+// what AggregatedMCQFrames' doc forbids. Callers must pair it with frame
+// evidence; see daemon.mcqSalientHeldStill.
+//
+// What it does catch, cheaply, is option DRIFT: a form whose choices have changed
+// at all fails, because labels compare exactly.
+//
+// Both sides are derived through the SAME pipeline the signature was minted with
+// — NormalizedOptionSet then MaskVolatile — rather than through a per-label
+// lookalike. That is not a nicety: the stored salient went through MaskVolatile
+// (ComputeSignatureN), so any label carrying a path, a large number, a timestamp
+// or a hex run is stored as "<path>"/"<num>"/"<hash>", and a live side normalized
+// only for case and whitespace could never match it. The failure would be silent
+// and one-directional — such forms simply never match — which is the shape of bug
+// this repo keeps finding after it ships.
+//
+// Fails CLOSED: no stored option set, or nothing parsed off the live frame, is no
+// evidence and returns false.
+func LiveMCQMatchesSalient(liveOptions []string, salient string) bool {
+	stored, ok := SalientOptionSet(salient)
+	if !ok || len(liveOptions) == 0 {
+		return false
+	}
+	live, ok := SalientOptionSet(MaskVolatile("options:" + NormalizedOptionSet(liveOptions)))
+	if !ok {
+		return false
+	}
+	for o := range live {
+		if !stored[o] {
+			return false
+		}
+	}
+	return true
 }

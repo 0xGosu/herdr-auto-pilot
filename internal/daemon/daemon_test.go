@@ -481,6 +481,26 @@ type failingStore struct {
 	failAudit   bool
 	failPending bool
 	failDedup   bool
+	// failRevert makes the compensating release of a claimed escalation fail,
+	// which is how a row gets stranded in the transient 'auto_accepting' status
+	// — invisible to both the operator's queue and the candidate query.
+	failRevert bool
+}
+
+func (s *failingStore) RevertAutoAccept(ctx context.Context, auditID int64) (bool, error) {
+	s.mu.Lock()
+	fail := s.failRevert
+	s.mu.Unlock()
+	if fail {
+		return false, errors.New("revert failed")
+	}
+	return s.StorePort.RevertAutoAccept(ctx, auditID)
+}
+
+func (s *failingStore) setFailRevert(v bool) {
+	s.mu.Lock()
+	s.failRevert = v
+	s.mu.Unlock()
 }
 
 // pausingAutomationStore lets a test stop immediately before the real

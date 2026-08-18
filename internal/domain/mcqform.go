@@ -368,6 +368,66 @@ func AggregatedMCQFrames(aggregate string) ([]string, bool) {
 // dismissed as stale every time with nothing in the fixtures to show why.
 const mcqFrameCutset = "\n \t"
 
+// SurvivingMCQFrames recovers the per-tab blocks that are still INTACT in a
+// head-truncated aggregate, together with the tab total the markers declare.
+//
+// A stored aggregate that lost its head no longer parses as one
+// (AggregatedMCQFrames requires markers running 1..N with N of them), and the
+// blocks that DID survive are the only identity evidence such a row still
+// carries. They are fully usable: truncation cuts everything before the first
+// surviving marker, and a marker only matches on its own line, so every block
+// after it is byte-intact.
+//
+// Recognition stays structural, for the same reason AggregatedMCQFrames is
+// structural. All markers must declare the SAME total, their indices must run
+// consecutively, and the run must END at that total — which is what a tail window
+// onto an aggregate always looks like, and what an agent printing
+// "[question 2/4]" in its own output does not.
+//
+// One shape it cannot tell apart, deliberately: a lone line-anchored
+// "[question 4/4]" satisfies every rule, because a genuine capture in which only
+// the LAST block survived looks exactly like that — and that is the common case,
+// so refusing it would defeat the purpose. Callers must therefore never treat a
+// true return as identity on its own; daemon.mcqSalientHeldStill pairs it with
+// the tab count and with frame equality against the recovered block.
+//
+// ok is false when nothing usable survived (no markers, disagreeing totals, a
+// gap, or a run that does not reach the end). Callers must treat that as "no
+// evidence", never as "the screen changed".
+func SurvivingMCQFrames(aggregate string) (frames []string, total int, ok bool) {
+	locs := aggregateMarkerRE.FindAllStringSubmatchIndex(aggregate, -1)
+	if len(locs) == 0 {
+		return nil, 0, false
+	}
+	total, err := strconv.Atoi(aggregate[locs[0][4]:locs[0][5]])
+	if err != nil || total < 1 {
+		return nil, 0, false
+	}
+	first, err := strconv.Atoi(aggregate[locs[0][2]:locs[0][3]])
+	if err != nil || first < 1 {
+		return nil, 0, false
+	}
+	// The surviving run must be the TAIL of the form: first..total, consecutive.
+	if first+len(locs)-1 != total {
+		return nil, 0, false
+	}
+	for i, loc := range locs {
+		n, err := strconv.Atoi(aggregate[loc[2]:loc[3]])
+		if err != nil || n != first+i {
+			return nil, 0, false
+		}
+		if t, err := strconv.Atoi(aggregate[loc[4]:loc[5]]); err != nil || t != total {
+			return nil, 0, false
+		}
+		end := len(aggregate)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		frames = append(frames, strings.Trim(aggregate[loc[1]:end], mcqFrameCutset))
+	}
+	return frames, total, true
+}
+
 // LooksLikeAggregatedMCQ reports whether content carries an aggregate's block
 // markers at all, whether or not it parses as a complete one.
 //

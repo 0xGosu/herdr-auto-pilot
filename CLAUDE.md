@@ -350,6 +350,149 @@ whose manifest carries exactly that version).
   every OTHER multi-tab fixture in this repo renders options without previews — the real
   captured pair in `internal/domain/testdata/mcq_preview_*.txt` is the only one that reproduces
   the layout, which is why this shipped green.
+- **A swept AGGREGATE is the one capture whose HEAD is load-bearing, so it gets its own
+  storage budget** — every other `pane_excerpt` is a pane TAIL (the prompt or error is at the
+  bottom, old scrollback goes first), which is why `truncateTailRunes` keeps the tail and
+  prefixes `…`. An aggregate is the opposite shape: `AggregatedMCQFrames` reads the tab total
+  out of the FIRST `[question 1/N]` marker and demands N markers running 1..N, so shearing the
+  head does not degrade the capture, it DESTROYS it — and `mcqFormHeldStill` then answers
+  `heldStillUnevaluable` on every sweep, forever, at Debug level only. The row is neither
+  delivered nor dismissed and nothing says why. Verified live 2026-08-18 (audit #1092): a 4-tab
+  AskUserQuestion form with preview boxes stored 4001 runes with 3 of its 4 markers left, and
+  sat pending across BOTH the FSP sweep and the 5-minute timed threshold until the operator
+  cleared it by hand. The real 3-tab preview fixture is already 3606 runes, so 4000 never fit
+  four tabs — this is every large form, not an edge case. Hence `aggregateMaxRunes`
+  (`truncateExcerpt`/`excerptBudget`), and three bounds on it: the gate is a **strict parse**,
+  never `LooksLikeAggregatedMCQ` (at write time content is untruncated so a real aggregate always
+  parses, while the marker test would hand the big budget to any pane that merely PRINTED
+  `[question 1/4]` — `LooksLikeAggregatedMCQ` stays the READER's evidence that a stored row is
+  mangled); `SaveSignatureSnapshot` deliberately keeps 4000, because `signature_snapshots` has NO
+  retention path at all and `hap signatures show` prints it unpaged; and
+  `duplicatePendingEscalation` truncates with the new helper but still passes `snapshotMaxRunes`
+  as the `snapshotCap` ARGUMENT, since there it is the "is this a large tail window" threshold
+  that gates the two fuzzy dedup paths, not a storage budget — passing the bigger one would
+  disarm them for exactly the captures most likely to need them. The refusal branches stay: this
+  stops new rows being mangled, it does not make a mangled capture trustworthy. Note the test
+  seeder `seedAgedSweptEscalation` was the only writer of that column anywhere that skipped
+  truncation, which is why every existing test was blind to this; it now goes through
+  `truncateExcerpt` like production. Keep `TestAnOversizeAggregateSurvivesTheCapturePath` /
+  `TestAnOrdinaryCaptureKeepsTheSmallerBudget` / `TestOnlyARealAggregateEarnsTheBiggerBudget` /
+  `TestAnAggregatePastItsOwnBudgetIsStillRefused`.
+- **Full self-prompting may widen the YES side of Guard 3, never the NO side** — the mode gets
+  two extra evidence paths, both reached ONLY after the ordinary comparison has already refused,
+  both gated on the `fsp bool` already threaded through `autoAcceptOne`, and both required to
+  resolve to `heldStillUnevaluable` (PENDING) when they decline. A fallback that could answer
+  `heldStillNo` would turn a widening into a queue-destroying dismissal, which is the one
+  outcome none of this may produce.
+  - `mcqSalientHeldStill` answers the row whose CAPTURE was truncated past its head, using
+    the blocks truncation did NOT reach. `truncateTailRunes` cuts from the top, so every block
+    after the first surviving `[question k/N]` marker is byte-intact
+    (`domain.SurvivingMCQFrames`, which stays structural: one declared total, consecutive
+    indices, and the run must END at that total). Requiring the live frame to equal one of
+    those blocks is the SAME frame-wise relation the intact path uses, just over a partial
+    capture — and that relation is what makes this safe. **The option set alone is NOT
+    sufficient identity and must never become the only gate**: it is the union over every tab,
+    and every AskUserQuestion form ends in a generated `Submit answers`/`Cancel` tab, so a pane
+    parked on ANY form's Submit tab is a subset of ANY other form's set — one form's answer
+    series would be typed into a different form of the same tab count, exactly what
+    `AggregatedMCQFrames` exists to prevent. `domain.LiveMCQMatchesSalient` is kept only as a
+    cheap extra conjunct catching option drift, and it derives BOTH sides through
+    `NormalizedOptionSet` then `MaskVolatile` — the stored salient was masked, so a live side
+    normalized only for case and whitespace could never match a label carrying a path or a
+    number, and would silently no-op for every such form. Three further gates are not optional:
+    tab count must equal the answer-series length (or delivery falls to the plain-menu path and
+    maps the reply against whichever tab is visible), the form must be fully unanswered
+    (delivery resets to tab 1 and retypes EVERY tab), and **no token may be a comma group** —
+    the tabs whose blocks are gone carry no select mode at all, so the shape cannot be verified
+    for the whole form, and an unanswerable safety question is answered NO. A capture with NO
+    surviving block (fully truncated, or a legacy row) has no identity evidence and stays
+    pending: a deliberate limit, not an oversight. Liveness is still proved twice afterwards by
+    `deliver.deliverSeries` and `mcqdeliver`.
+  - `unstructuredHeldStill` answers a PANE-TAIL row using `domain.TailSimilarWithin`, which cuts
+    both salients to the shorter one's length FROM THE TAIL before the trigram compare. The
+    mismatch it exists for is structural, not statistical: the baseline is minted from a
+    `--source recent` CONSUMING DELTA while every re-read is `--source visible`, so symmetric
+    Jaccard is dominated by content only the longer side ever had and refuses however little
+    moved — which is the documented reason idle and generated-task rows never auto-accept.
+    Aligning on the TAIL rather than testing containment is what keeps it safe: a screen that
+    moved on paints its new content at the BOTTOM, inside the compared window, while containment
+    would answer "still there" with a new question sitting below the old one.
+    `domain.MinTailCompareRunes` is the floor, and it is load-bearing for the same reason
+    `embedding.min_salient_chars` is — two short tails compare equal whatever they say, making
+    one near-empty screen a magnet. `fspTailHeldStillJitterPercent` is a SEPARATE constant from
+    `staleDeferredSendJitterPercent` (shared by two other call sites) at the same value: the
+    loosening is the alignment, not the tolerance. Because it runs AFTER `SignatureHeldStill`
+    has refused, it must re-ask the two refusals its caller did not — either side over-masked,
+    or a fresh salient that has become structured. An over-masked salient is mostly repeated
+    `<path>`/`<num>`/`<hash>` placeholders, and two of those share almost every trigram, so they
+    clear any tolerance over any window: the magnet failure arriving by a door the length floor
+    does not cover.
+
+  A third loosening sits outside Guard 3: under FSP a `@noop` suggestion is RETIRED
+  (`ReasonAutoDismissNoop`) rather than left pending, because the sentinel means SEND NOTHING and
+  can never become deliverable on a later sweep — so under a mode whose premise is that nobody is
+  reading the queue it would sit forever. It is the only auto-accept path that acts with no pane
+  evidence, and it can afford to be: nothing is typed, nothing is learned. It still honours the
+  kill switch, the per-agent disable and the runaway-guard pause, and it makes `autoDismiss`
+  reachable from FOUR places rather than three. Keep
+  `TestFSPAnswersATruncatedAggregateWhoseLiveFrameSurvived` (the #1092 regression) /
+  `TestFSPTruncatedAggregateRefusesADifferentFormOfTheSameSize` (the Submit-tab collision that
+  is why the option set can never be the only gate) / `TestFSPRefusesACaptureWithNoSurvivingBlock` /
+  `TestTimedAutoAcceptStillLeavesATruncatedAggregatePending` /
+  `TestFSPTruncatedAggregateRefusesDriftedOptions` /
+  `…RefusesEveryCommaGroup` / `…RefusesAPartAnsweredForm` / `…OverrideNeverDismisses` /
+  `TestFSPUnstructuredFallbackRefusesAnOverMaskedPair` / `…RefusesANowStructuredLiveSalient` /
+  `TestFSPAnswersAnIdleRowWhoseTailStillMatches` /
+  `TestTimedAutoAcceptCannotEvaluateAMismatchedWindow` (the control proving the pair is not
+  vacuous) / `TestFSPLeavesAMovedOnIdleScreenPending` / `TestFSPRetiresANoopEscalation` /
+  `TestTimedAutoAcceptStillLeavesANoopEscalationPending` /
+  `TestFSPNoopRetirementHonoursADisabledAgent`, and in `internal/domain`
+  `TestLiveMCQMatchesSalient*` (including `…MasksBothSides`) /
+  `TestNormalizedOptionSetRoundTripsThroughSplitOptionSet` / `TestSurvivingMCQFrames*` /
+  `TestTailSimilarWithin*`.
+- **The last look before a claim is COMPLETE, and a content-safety refusal is not a delivery
+  fault** — everything above `ClaimForAutoAccept` (Guard 3's pane re-read especially) is a herdr
+  shell-out with a budget in SECONDS, and the sweep walks every candidate, so the gap between
+  "we checked" and "we send" is wide enough for an operator to act in. `claimBlockedBy` re-asks
+  all three controls there, broadest first: the **kill switch** (FR-017 — not FSP-specific, so
+  timed auto-accept re-reads it too, and it fails closed on a read error), the **mode** and its
+  ceiling latch via `stillPermitted`, and **`accept_generated_task`** for a generated-task row,
+  because that is a SEPARATE opt-in resolved once per sweep into `allowGenerated` — an operator
+  turning off just that key mid-sweep would otherwise still have a task written and handed to an
+  agent. `retireNoopEscalation` takes the same look, and the kill switch matters most there:
+  Guard 1a returns before ANY dismissal precisely so pausing the herd never destroys the queue it
+  protects, and a pause landing mid-sweep must get the same answer as one landing a second
+  earlier. Separately, a refusal from the seam's at-send screen is tagged `errOutboundRefused`
+  and handled like `errAgentDisabled` rather than as a delivery failure: it used to enter the
+  retry budget, so the same never-auto match was refused `maxAutoAcceptAttempts` times and the
+  row was then dismissed as `auto_accept_failed` — deleting from the queue exactly the escalation
+  FR-015 says must always reach a human. The refusal is permanent by nature (the same text
+  screens the same way every sweep), so a budget could only ever end in that dismissal. Reachable
+  only through a custom `next_task_template`, since the daemon's pre-check renders with the
+  DEFAULT one. **And the compensating revert itself needs an obligation**: every claimed row that
+  is not delivered comes back through `revertClaim`, and `auto_accepting` is a TRANSIENT status
+  that both the operator's queue and the candidate query filter out (each selects `escalated`)
+  while the only automatic reclaim runs at daemon START — so a revert that fails leaves the
+  escalation invisible to everyone until a restart, which is the "silently lost escalation" the
+  status exists to make recoverable, arriving through the error path instead of a crash. Failed
+  reverts are therefore remembered and retried every tick (`retryAutoAcceptRevert`), beside the
+  finalize retry and for the same reason it is not gated on the kill switch: it is bookkeeping
+  about a claim that has ALREADY been abandoned, and an operator pausing the herd must not be why
+  a row stays hidden. Only a non-nil error is a failure — `false, nil` means another writer moved
+  the row, which is legitimate. Keep `TestFSPGeneratedTaskSafetyRefusalIsNeverDismissed` (which
+  sweeps past the attempt budget — the single-sweep test could not see it) /
+  `TestFSPRechecksAcceptGeneratedTaskBeforeClaiming` /
+  `TestAutoAcceptRechecksTheKillSwitchBeforeClaiming` (both flavours) /
+  `TestAStrandedClaimIsRetriedUntilItIsReleased` / `…IsReleasedEvenWhilePaused`.
+- **Every auto-accept refusal names itself once** — `notePending` logs at INFO per (row, reason),
+  cleared on delivery and pruned with the other per-row state. Before it, every "leave it
+  pending" path was Debug-or-silent (Guard 1b and the pane-busy skip produced no output at ANY
+  level), which is why #1092 took a five-round investigation and a live database query to
+  explain. Once per (row, reason), not per sweep, because the pass re-examines every pending row
+  every minute — but a row whose reason CHANGES is new information and says so. The call sites
+  all sit AFTER `stillEligible` is set: an INELIGIBLE row `continue`s before that, so logging one
+  there would be pruned every tick and re-logged every minute forever. Keep
+  `TestAPendingEscalationSaysWhyExactlyOnce` / `TestAChangedPendingReasonIsReported`.
 - **An option label stops at the preview column** — Claude renders options WITH previews in two
   columns (option list left, preview box right) and a pane is one flat text grid, so the box
   lands inside the option's own line. Line-anchored parsing therefore made option 1's label

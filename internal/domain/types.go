@@ -457,6 +457,13 @@ const (
 	// ReasonAutoAcceptFailed: delivery could not be completed within the
 	// attempt cap. Retired visibly rather than retried forever.
 	ReasonAutoAcceptFailed = "auto_accept_failed"
+	// ReasonAutoDismissNoop: the suggested answer is the "@noop" sentinel, so
+	// there is nothing to deliver to the pane at all. Full self-prompting only:
+	// the ordinary pass leaves such a row for the operator, because a human
+	// reading "do nothing" may still want to do something. Nothing is ever typed
+	// at the agent on this path — it retires a queue entry, it does not answer
+	// one.
+	ReasonAutoDismissNoop = "auto_dismiss_noop"
 )
 
 // AutoDismissReasons are the machine-dismissal tags an operator surface must
@@ -466,6 +473,7 @@ var AutoDismissReasons = []string{
 	ReasonAutoDismissStale,
 	ReasonAutoDismissAgentGone,
 	ReasonAutoAcceptFailed,
+	ReasonAutoDismissNoop,
 }
 
 // AutoDismissReason returns the machine-dismissal tag carried by a rationale,
