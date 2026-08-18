@@ -77,6 +77,9 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	// operator disabling the feature (or pausing the herd) immediately after a
 	// delivery must not strand the row in a transient status.
 	d.retryAutoAcceptFinalize(ctx)
+	// Same contract, opposite direction: a claim whose compensating revert
+	// failed is a row nobody can see until it is released.
+	d.retryAutoAcceptRevert(ctx)
 
 	cfg, _, _ := d.snapshot()
 	now := d.opt.Clock.Now()
@@ -399,10 +402,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 			// for one.
 			slog.Info("auto-accept: leaving a generated-task escalation for the operator",
 				"audit_id", rec.ID, "agent", rec.AgentID, "reason", unhandled)
-			if ok, rerr := d.opt.Store.RevertAutoAccept(ctx, rec.ID); rerr != nil || !ok {
-				slog.Warn("auto-accept: could not return an unhandled generated-task escalation to the queue",
-					"audit_id", rec.ID, "claimed", ok, "error", rerr)
-			}
+			d.revertClaim(ctx, rec.ID)
 			return autoAcceptSkipped
 		}
 		// Inside the SAME cross-process lifecycle barrier autoAcceptDeliver
@@ -570,10 +570,7 @@ func (d *Daemon) autoAcceptDeliveryFailed(ctx context.Context, rec *domain.Audit
 	if errors.Is(cause, errOutboundRefused) {
 		slog.Info("auto-accept: a safety control refused the outbound text; leaving the escalation for the operator",
 			"audit_id", rec.ID, "agent", rec.AgentID, "error", cause)
-		if ok, err := d.opt.Store.RevertAutoAccept(ctx, rec.ID); err != nil || !ok {
-			slog.Warn("auto-accept: could not return a refused escalation to the queue",
-				"audit_id", rec.ID, "claimed", ok, "error", err)
-		}
+		d.revertClaim(ctx, rec.ID)
 		d.notePending(rec, "a safety control refused the text this would send")
 		return autoAcceptSkipped
 	}
@@ -582,10 +579,7 @@ func (d *Daemon) autoAcceptDeliveryFailed(ctx context.Context, rec *domain.Audit
 	// attempt, or an agent left off for a few minutes would exhaust the budget
 	// and lose its escalation.
 	if errors.Is(cause, errAgentDisabled) {
-		if ok, err := d.opt.Store.RevertAutoAccept(ctx, rec.ID); err != nil || !ok {
-			slog.Warn("auto-accept: could not return a claimed escalation to the queue",
-				"audit_id", rec.ID, "claimed", ok, "error", err)
-		}
+		d.revertClaim(ctx, rec.ID)
 		return autoAcceptSkipped
 	}
 
@@ -601,11 +595,73 @@ func (d *Daemon) autoAcceptDeliveryFailed(ctx context.Context, rec *domain.Audit
 		"audit_id", rec.ID, "agent", rec.AgentID, "attempt", attempts, "error", cause)
 	// Back to 'escalated', so the claim guard is satisfiable again next tick —
 	// the retry loop closes through the database, not through memory.
-	if ok, err := d.opt.Store.RevertAutoAccept(ctx, rec.ID); err != nil || !ok {
-		slog.Warn("auto-accept: could not return a claimed escalation to the queue",
-			"audit_id", rec.ID, "claimed", ok, "error", err)
-	}
+	d.revertClaim(ctx, rec.ID)
 	return autoAcceptSkipped
+}
+
+// revertClaim returns a claimed row to the pending queue, and — this is the part
+// that is not optional — keeps a retry obligation when the store write fails.
+//
+// 'auto_accepting' is a TRANSIENT status that both the operator's queue and the
+// candidate query filter out (each selects 'escalated'), and the only automatic
+// reclaim runs at daemon START. So a compensating revert that fails leaves the
+// escalation invisible to everyone until the next restart — the "silently lost
+// escalation" this whole status exists to make recoverable, arriving through the
+// error path instead of a crash. Every claimed row that is NOT delivered comes
+// back through here, so one obligation covers all of them.
+//
+// Only a non-nil error is a failure. `false, nil` means another writer already
+// moved the row out of 'auto_accepting' (an operator confirming it, the startup
+// reclaim), which is a legitimate outcome and nothing to retry.
+func (d *Daemon) revertClaim(ctx context.Context, auditID int64) {
+	ok, err := d.opt.Store.RevertAutoAccept(ctx, auditID)
+	if err != nil {
+		slog.Warn("auto-accept: could not return a claimed escalation to the queue; will retry",
+			"audit_id", auditID, "error", err)
+		d.mu.Lock()
+		d.autoAcceptNeedsRevert[auditID] = true
+		d.mu.Unlock()
+		return
+	}
+	d.mu.Lock()
+	delete(d.autoAcceptNeedsRevert, auditID)
+	d.mu.Unlock()
+	if !ok {
+		slog.Debug("auto-accept: the row was no longer claimed when it was released",
+			"audit_id", auditID)
+	}
+}
+
+// retryAutoAcceptRevert re-attempts the reverts that failed, on every tick until
+// they stick — the same shape retryAutoAcceptFinalize uses, and for the same
+// reason: it is bookkeeping about a claim that has ALREADY been abandoned, so it
+// must not be gated on the feature still being enabled or on the kill switch. An
+// operator pausing the herd immediately after a failed revert must not be the
+// reason an escalation stays hidden.
+func (d *Daemon) retryAutoAcceptRevert(ctx context.Context) {
+	d.mu.Lock()
+	ids := make([]int64, 0, len(d.autoAcceptNeedsRevert))
+	for id := range d.autoAcceptNeedsRevert {
+		ids = append(ids, id)
+	}
+	d.mu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		ok, err := d.opt.Store.RevertAutoAccept(ctx, id)
+		if err != nil {
+			slog.Warn("auto-accept: revert retry failed; the escalation is still held",
+				"audit_id", id, "error", err)
+			continue
+		}
+		d.mu.Lock()
+		delete(d.autoAcceptNeedsRevert, id)
+		d.mu.Unlock()
+		slog.Info("auto-accept: returned a stranded claim to the pending queue",
+			"audit_id", id, "was_claimed", ok)
+	}
 }
 
 // autoDismiss retires an escalation the pass has proven cannot be answered,

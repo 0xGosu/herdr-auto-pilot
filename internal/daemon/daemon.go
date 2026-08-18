@@ -333,6 +333,11 @@ type Daemon struct {
 	// left pending for, so notePending can report a NEW reason at INFO without
 	// repeating the same one on every sweep. Pruned with the other two.
 	autoAcceptPendingLogged map[int64]string
+	// autoAcceptNeedsRevert holds the ids whose compensating RevertAutoAccept
+	// failed, so a row cannot be stranded in the transient 'auto_accepting'
+	// status — invisible to both the operator's queue and the candidate query —
+	// until the next daemon restart. Retried on every tick until it sticks.
+	autoAcceptNeedsRevert map[int64]bool
 	// autoAcceptNeedsFinalize holds deliveries that LANDED but whose finalize
 	// did not commit (a transient store failure). Such a row is still
 	// 'auto_accepting', a status excluded from BOTH the operator's queue and
@@ -552,6 +557,7 @@ func New(opt Options) (*Daemon, error) {
 		autoAcceptAttempts:        map[int64]int{},
 		autoAcceptAbsent:          map[int64]int{},
 		autoAcceptPendingLogged:   map[int64]string{},
+		autoAcceptNeedsRevert:     map[int64]bool{},
 		autoAcceptNeedsFinalize:   map[int64]bool{},
 		snapshotSaved:             map[string]bool{},
 		paneCwds:                  map[string]paneCwdEntry{},

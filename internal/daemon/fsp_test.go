@@ -1645,3 +1645,82 @@ func TestAutoAcceptRechecksTheKillSwitchBeforeClaiming(t *testing.T) {
 		})
 	}
 }
+
+// TestAStrandedClaimIsRetriedUntilItIsReleased: 'auto_accepting' is a transient
+// status that BOTH the operator's queue and the candidate query filter out, and
+// the only automatic reclaim runs at daemon start — so a compensating revert
+// that fails leaves the escalation invisible to everyone until a restart.
+//
+// That is the "silently lost escalation" the status exists to make recoverable,
+// arriving through the error path rather than through a crash. Every claimed row
+// that is not delivered comes back through revertClaim, so the obligation it
+// keeps covers all of them; here the safety-refusal path is the one driven.
+func TestAStrandedClaimIsRetriedUntilItIsReleased(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspAcceptGenerated+`
+[safety]
+never_auto_patterns = ['(?i)--no-preserve-root']
+`)
+	ctx := context.Background()
+	seams.renderedPrompt = "Next task: tidy up\nRun it with: rm -rf / --no-preserve-root"
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := seedEscalationWithRationale(t, h, "pA", idlePane,
+		"[task_source_exhausted] nothing pending", domain.SituationIdle,
+		domain.SuggestTaskPrefix+"tidy up", 5*time.Second)
+
+	// The store fails exactly the compensating write, after the claim landed.
+	h.store.(*failingStore).setFailRevert(true)
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepting {
+		t.Fatalf("status = %q, want the row stranded in %q — the fixture is not reproducing the failure",
+			got, domain.AuditStatusAutoAccepting)
+	}
+
+	// The store recovers. The very next sweep must release the row without any
+	// operator action and without waiting for a restart.
+	h.store.(*failingStore).setFailRevert(false)
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("status = %q, want escalated — a stranded claim must be released on a later tick", got)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("nothing may be delivered on this path, sent %v", got)
+	}
+}
+
+// The retry is bookkeeping about a claim that has ALREADY been abandoned, so it
+// must not be gated on the kill switch: an operator pausing the herd right after
+// a failed revert must not be the reason an escalation stays hidden.
+func TestAStrandedClaimIsReleasedEvenWhilePaused(t *testing.T) {
+	h, seams := newFSPHarnessWithSeams(t, fspAcceptGenerated+`
+[safety]
+never_auto_patterns = ['(?i)--no-preserve-root']
+`)
+	ctx := context.Background()
+	seams.renderedPrompt = "Next task: tidy up\nRun it with: rm -rf / --no-preserve-root"
+	idlePane := "All tests pass. Task is complete.\n"
+	h.herdr.setPane(idlePane)
+	id := seedEscalationWithRationale(t, h, "pA", idlePane,
+		"[task_source_exhausted] nothing pending", domain.SituationIdle,
+		domain.SuggestTaskPrefix+"tidy up", 5*time.Second)
+
+	h.store.(*failingStore).setFailRevert(true)
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepting {
+		t.Fatalf("status = %q, want the row stranded first", got)
+	}
+
+	h.store.(*failingStore).setFailRevert(false)
+	if _, err := h.raw.InsertKillEvent(ctx, domain.KillEvent{
+		State: "active", Scope: "global", Author: "operator", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "idle"))
+
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("status = %q, want escalated — the release must not be gated on the kill switch", got)
+	}
+}

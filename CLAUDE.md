@@ -469,10 +469,21 @@ whose manifest carries exactly that version).
   FR-015 says must always reach a human. The refusal is permanent by nature (the same text
   screens the same way every sweep), so a budget could only ever end in that dismissal. Reachable
   only through a custom `next_task_template`, since the daemon's pre-check renders with the
-  DEFAULT one. Keep `TestFSPGeneratedTaskSafetyRefusalIsNeverDismissed` (which sweeps past the
-  attempt budget — the single-sweep test could not see it) /
+  DEFAULT one. **And the compensating revert itself needs an obligation**: every claimed row that
+  is not delivered comes back through `revertClaim`, and `auto_accepting` is a TRANSIENT status
+  that both the operator's queue and the candidate query filter out (each selects `escalated`)
+  while the only automatic reclaim runs at daemon START — so a revert that fails leaves the
+  escalation invisible to everyone until a restart, which is the "silently lost escalation" the
+  status exists to make recoverable, arriving through the error path instead of a crash. Failed
+  reverts are therefore remembered and retried every tick (`retryAutoAcceptRevert`), beside the
+  finalize retry and for the same reason it is not gated on the kill switch: it is bookkeeping
+  about a claim that has ALREADY been abandoned, and an operator pausing the herd must not be why
+  a row stays hidden. Only a non-nil error is a failure — `false, nil` means another writer moved
+  the row, which is legitimate. Keep `TestFSPGeneratedTaskSafetyRefusalIsNeverDismissed` (which
+  sweeps past the attempt budget — the single-sweep test could not see it) /
   `TestFSPRechecksAcceptGeneratedTaskBeforeClaiming` /
-  `TestAutoAcceptRechecksTheKillSwitchBeforeClaiming` (both flavours).
+  `TestAutoAcceptRechecksTheKillSwitchBeforeClaiming` (both flavours) /
+  `TestAStrandedClaimIsRetriedUntilItIsReleased` / `…IsReleasedEvenWhilePaused`.
 - **Every auto-accept refusal names itself once** — `notePending` logs at INFO per (row, reason),
   cleared on delivery and pruned with the other per-row state. Before it, every "leave it
   pending" path was Debug-or-silent (Guard 1b and the pane-busy skip produced no output at ANY
