@@ -172,7 +172,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 			// The ONE refusal full self-prompting retires rather than leaves
 			// pending. Nothing reaches the pane on this path.
 			if fsp && why == domain.IneligibleNoopSuggestion {
-				d.retireNoopEscalation(ctx, rec, now)
+				d.retireNoopEscalation(ctx, rec, now, permitted)
 			}
 			continue
 		}
@@ -594,8 +594,22 @@ func (d *Daemon) autoDismiss(ctx context.Context, rec *domain.AuditRecord,
 // retained with a reason naming what happened (FR-020). It still honours the
 // per-agent controls — an operator who disabled an agent, or a runaway-guard
 // pause, means hap stops making decisions for that agent, including this one.
-func (d *Daemon) retireNoopEscalation(ctx context.Context, rec *domain.AuditRecord, now time.Time) {
+//
+// stillPermitted is the same last look every claim takes, and it is not optional
+// just because nothing is typed. This pass walks a whole candidate list, so an
+// operator switching the mode off part-way through would otherwise still have
+// the REST of their queue retired by a mode they had just turned off — and a
+// dismissal is not something they can undo, which makes the re-check matter more
+// on this path, not less.
+func (d *Daemon) retireNoopEscalation(ctx context.Context, rec *domain.AuditRecord,
+	now time.Time, stillPermitted func() bool) {
+
 	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID) {
+		return
+	}
+	if stillPermitted != nil && !stillPermitted() {
+		slog.Info("auto-accept: the mode was switched off before this noop escalation was retired; leaving it pending",
+			"audit_id", rec.ID, "agent", rec.AgentID)
 		return
 	}
 	d.autoDismiss(ctx, rec, domain.ReasonAutoDismissNoop,

@@ -570,3 +570,33 @@ func TestFSPUnstructuredFallbackRefusesANowStructuredLiveSalient(t *testing.T) {
 		t.Fatal("a structured live salient must not be compared on the pane-tail path")
 	}
 }
+
+// The mode is re-asked immediately before the retirement, exactly as it is
+// before a claim. The sweep walks a whole candidate list, so an operator turning
+// the mode off part-way through must not have the rest of their queue retired by
+// it — and unlike a send, a dismissal is not something they can undo.
+//
+// Driven directly rather than through the sweep on purpose: the sweep resolves
+// `fsp` once at the top, so a latch set before calling it would simply switch the
+// whole branch off and the test would pass with or without the re-check. What
+// needs pinning is that the callback is consulted at the moment of retirement.
+func TestFSPNoopRetirementStopsWhenTheModeIsSwitchedOffMidSweep(t *testing.T) {
+	h := newFSPHarness(t, fspOn)
+	ctx := context.Background()
+	id := seedEscalationWithRationale(t, h, "pA", approvalPane,
+		"[task_source_exhausted] nothing pending", domain.SituationApproval,
+		domain.ActionNoopSuggestion, time.Minute)
+	rec := auditRow(t, h, id)
+
+	h.daemon.retireNoopEscalation(ctx, rec, time.Now(), func() bool { return false })
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("status = %q, want it left pending once the mode was switched off", got)
+	}
+
+	// And the control: with the mode still on, the very same call retires it — so
+	// the assertion above is about the re-check and not about something else.
+	h.daemon.retireNoopEscalation(ctx, rec, time.Now(), func() bool { return true })
+	if got := auditStatus(t, h, id); got != "dismissed" {
+		t.Fatalf("status = %q, want dismissed while the mode is still on", got)
+	}
+}
