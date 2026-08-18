@@ -329,6 +329,10 @@ type Daemon struct {
 	// stay bounded by that set rather than by daemon uptime.
 	autoAcceptAttempts map[int64]int
 	autoAcceptAbsent   map[int64]int
+	// autoAcceptPendingLogged remembers the reason each escalation was last
+	// left pending for, so notePending can report a NEW reason at INFO without
+	// repeating the same one on every sweep. Pruned with the other two.
+	autoAcceptPendingLogged map[int64]string
 	// autoAcceptNeedsFinalize holds deliveries that LANDED but whose finalize
 	// did not commit (a transient store failure). Such a row is still
 	// 'auto_accepting', a status excluded from BOTH the operator's queue and
@@ -547,6 +551,7 @@ func New(opt Options) (*Daemon, error) {
 		pollRedrive:               map[string]pollRedriveState{},
 		autoAcceptAttempts:        map[int64]int{},
 		autoAcceptAbsent:          map[int64]int{},
+		autoAcceptPendingLogged:   map[int64]string{},
 		autoAcceptNeedsFinalize:   map[int64]bool{},
 		snapshotSaved:             map[string]bool{},
 		paneCwds:                  map[string]paneCwdEntry{},
@@ -1664,8 +1669,14 @@ func (d *Daemon) duplicatePendingEscalation(ctx context.Context, s domain.Situat
 			"agent", s.AgentID, "pane", s.PaneID, "error", err)
 		return false
 	}
+	// The excerpt is cut exactly as the stored rows were (truncateExcerpt), or the
+	// exact-match compare below could never fire for an aggregate. The snapshotCap
+	// ARGUMENT stays snapshotMaxRunes on purpose: there it is the "this is a large
+	// tail window" threshold that gates the two fuzzy paths, not a storage budget —
+	// passing the larger aggregate budget would silently switch those paths off for
+	// exactly the captures most likely to need them.
 	return domain.DuplicatesPendingEscalation(s.Type,
-		truncateTailRunes(s.Content, snapshotMaxRunes), snapshotMaxRunes,
+		truncateExcerpt(s.Content), snapshotMaxRunes,
 		escalationDedupJitterPercent, pending)
 }
 
@@ -1733,7 +1744,7 @@ func (d *Daemon) ignoreDuplicate(ctx context.Context, s domain.Situation,
 		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "ignored", Status: domain.AuditStatusIgnored,
 		Rationale:   "duplicated event",
-		PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
+		PaneExcerpt: truncateExcerpt(s.Content),
 		CreatedAt:   now,
 	})
 	slog.Info("ignored duplicate event: matching pending escalation exists",
@@ -1820,6 +1831,57 @@ const snapshotMaxRunes = 4000
 // capture is this prefix (see mcqFormHeldStill).
 const excerptTruncationMarker = "…"
 
+// aggregateMaxRunes is the excerpt budget for a SWEPT MULTI-TAB capture, which
+// snapshotMaxRunes is the wrong cap for in a way that silently disables
+// auto-accept.
+//
+// truncateTailRunes keeps the TAIL, which is right for shell output and prompts
+// — the actionable part is at the bottom. An aggregate is the one capture whose
+// HEAD is load-bearing: AggregatedMCQFrames reads the tab total from the FIRST
+// "[question 1/N]" marker and requires N markers to follow it, so shearing the
+// head off makes the whole capture unparseable. mcqFormHeldStill then refuses it
+// as heldStillUnevaluable on EVERY sweep, which is a permanent stall: the row is
+// never delivered and never dismissed, and the refusal only logs at Debug.
+//
+// Observed live 2026-08-18 (audit #1092): a 4-tab AskUserQuestion form with
+// preview boxes stored 4001 runes with a leading marker and only 3 of its 4
+// "[question N/4]" heads surviving. The real 3-tab preview fixture in
+// internal/domain/testdata measures 3606 runes, so 4000 does not fit even four
+// tabs — every large form hits this, not an edge case.
+//
+// 12000 fits six to eight preview tabs. It is deliberately a bound rather than
+// "no limit": PruneAuditExcerpts excludes 'escalated'/'auto_accepting' at any
+// age precisely because this pass reads the column, so a pending form row is
+// never reclaimed and the budget sets how much an abandoned queue can cost.
+const aggregateMaxRunes = 12000
+
+// excerptBudget picks the storage budget for a capture: an aggregate gets
+// aggregateMaxRunes, everything else snapshotMaxRunes.
+//
+// The gate is a STRICT parse rather than LooksLikeAggregatedMCQ's marker test,
+// and the difference matters in exactly one direction. At write time the content
+// has not been truncated yet, so a genuine aggregate always parses completely —
+// while the marker test would also hand the large budget to any pane on which an
+// agent merely PRINTED a "[question 1/4]" line. LooksLikeAggregatedMCQ stays what
+// it is: the READER's evidence that an already-stored row is a mangled aggregate.
+//
+// It tests the CONTENT rather than the Situation because several writers only
+// hold the string by the time they store it.
+func excerptBudget(content string) int {
+	if _, ok := domain.AggregatedMCQFrames(content); ok {
+		return aggregateMaxRunes
+	}
+	return snapshotMaxRunes
+}
+
+// truncateExcerpt is truncateTailRunes under the aggregate-aware budget. Every
+// writer of an audit row's pane_excerpt goes through it, so a stored row and a
+// freshly captured one are always cut the same way — which duplicatePendingEscalation
+// depends on for its exact-match compare.
+func truncateExcerpt(s string) string {
+	return truncateTailRunes(s, excerptBudget(s))
+}
+
 // maxReviewOutput caps the accepted action-review replacement text (matches
 // the LLM adapter's 16KB capture cap): the result is typed into a pane, so
 // runaway output degrades to the fallback instead of being trimmed.
@@ -1848,6 +1910,11 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	d.mu.Unlock()
 	if sig.Signature != "" && !saved {
 		if err := d.opt.Store.SaveSignatureSnapshot(ctx, sig.Signature,
+			// Deliberately NOT truncateExcerpt: a signature snapshot is
+			// provenance for `hap signatures show` (which prints it unpaged),
+			// not the Guard 3 comparison input, and signature_snapshots has no
+			// retention path at all — one row per learned signature, forever.
+			// The aggregate budget is for the column auto-accept reads.
 			truncateTailRunes(situation.Content, snapshotMaxRunes), now); err != nil {
 			slog.Warn("signature snapshot write failed", "error", err)
 		} else {
@@ -2425,7 +2492,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		Confidence: dec.Confidence, LLMConfidence: del.llmConfidence,
 		Rationale: del.rationale, LLMOutput: del.llmOutput,
 		LLMSessionID: del.llmSessionID,
-		Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+		Status:       "auto", PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
 	}.WithSignatureBaseline(sig))
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
@@ -2573,7 +2640,7 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 		return
 	}
 	// Keep the diagnostic row's excerpt the same size as the normal audit rows.
-	p.Excerpt = truncateTailRunes(p.Excerpt, snapshotMaxRunes)
+	p.Excerpt = truncateExcerpt(p.Excerpt)
 	delay := d.verifyUnblockDelay
 	if delay <= 0 {
 		delay = unblockCheckDelay
@@ -2626,7 +2693,7 @@ func (d *Daemon) deliverNoopClaimed(ctx context.Context, s domain.Situation,
 		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 		SituationType: s.Type, Action: "noop", Input: "",
 		Confidence: dec.Confidence, Rationale: dec.Rationale,
-		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+		Status: "auto", PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
 	}.WithSignatureBaseline(sig))
 	if err != nil {
 		slog.Error("audit write failed; blocking autonomous noop (FR-024)", "error", err)
@@ -2688,7 +2755,7 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 				Rationale:    rationale,
 				LLMOutput:    domain.ActionNoop,
 				LLMSessionID: res.request.SessionID,
-				Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
+				Status:       "auto", PaneExcerpt: truncateExcerpt(s.Content),
 				CreatedAt: now,
 			}.WithSignatureBaseline(res.sig))
 			if err != nil {
@@ -2765,7 +2832,7 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		Status:       "escalated", Suggestion: dec.Suggestion,
 		// The content THIS escalation was classified from — per entry,
 		// unlike the signature's first-seen provenance snapshot.
-		PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
+		PaneExcerpt: truncateExcerpt(s.Content),
 		// How this situation resolved to its rule (cosine / BM25 / exact) and
 		// any embedding failure for this event, so the operator can see WHY
 		// the matched rule was chosen. Auto-send rows leave these empty.
@@ -2905,7 +2972,7 @@ func (d *Daemon) auditAgentDisabled(ctx context.Context, s domain.Situation,
 		LLMConfidence: llmConfidence, LLMOutput: llmOutput,
 		LLMSessionID: llmSessionID,
 		Rationale:    "[agent_disabled]", Status: "denied",
-		PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+		PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
 	})
 	slog.Info("autonomous action denied: agent disabled",
 		"agent", s.AgentID, "situation", s.Type, "input", input)
@@ -4231,7 +4298,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 					Confidence: computedConf, LLMConfidence: &llmConf,
 					Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
 					LLMSessionID: res.request.SessionID,
-					Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+					Status:       "auto", PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
 				}); err != nil {
 					slog.Error("audit write failed; blocking LLM noop (FR-024)", "error", err)
 					d.notify(ctx, "Herd Auto Prompter: persistence failure",
@@ -4408,7 +4475,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				Confidence: computedConf, LLMConfidence: &llmConf,
 				Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
 				LLMSessionID: res.request.SessionID,
-				Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+				Status:       "auto", PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
 			}.WithSignatureBaseline(res.sig))
 			if err != nil {
 				slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)

@@ -21,6 +21,13 @@ import (
 // seedAgedSweptEscalation is seedAgedEscalation for a form the daemon swept:
 // the baseline is minted from the AGGREGATE (as sweepFrames builds it) and the
 // row stores that aggregate, which is what the real capture path does.
+//
+// The excerpt goes through truncateExcerpt, exactly as every production writer
+// does. It used to store s.Content raw, which made this seeder the only writer of
+// that column anywhere that skipped truncation — so it modelled a row production
+// could never produce, and the one failure truncation causes (a swept aggregate
+// shorn of its "[question 1/N]" head, permanently unanswerable) was invisible to
+// every test built on it.
 func seedAgedSweptEscalation(t *testing.T, h *harness, agentID string,
 	frames []string, suggestion string, age time.Duration) int64 {
 	t.Helper()
@@ -33,7 +40,7 @@ func seedAgedSweptEscalation(t *testing.T, h *harness, agentID string,
 		AgentID: agentID, AgentType: "claude", Trigger: "status",
 		SituationType: domain.SituationChoice, Action: domain.AuditActionEscalated,
 		Status: "escalated", Rationale: "[shadow_mode] learning this signature",
-		Suggestion: suggestion, PaneExcerpt: s.Content, CreatedAt: time.Now().Add(-age),
+		Suggestion: suggestion, PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: time.Now().Add(-age),
 	}.WithSignatureBaseline(sig))
 	if err != nil {
 		t.Fatal(err)
@@ -182,7 +189,7 @@ func TestGuard3HoldsTheRealPreviewForm(t *testing.T) {
 		ID: 1, AgentID: "pA", AgentType: "claude",
 		SituationType: domain.SituationChoice, PaneExcerpt: aggregate,
 	}
-	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", visible)
+	got, handled := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", visible, false)
 	if !handled {
 		t.Fatal("a live 4-tab form was not routed to the multi-tab comparison")
 	}
@@ -191,7 +198,7 @@ func TestGuard3HoldsTheRealPreviewForm(t *testing.T) {
 	}
 
 	// And it still retires a pane that really did move on.
-	gone, handledGone := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", "⏺ Answers received. Working on it now.\n\n❯ \n")
+	gone, handledGone := h.daemon.mcqFormHeldStill(rec, "1 1 1 1", "⏺ Answers received. Working on it now.\n\n❯ \n", false)
 	if handledGone {
 		t.Errorf("a pane with no form must fall through to the signature comparison, got %v", gone)
 	}

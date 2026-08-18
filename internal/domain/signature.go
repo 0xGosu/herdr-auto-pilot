@@ -218,21 +218,56 @@ func ComputeSignatureN(s Situation, salientChars int) SignatureResult {
 func NormalizedOptionSet(options []string) string {
 	opts := make([]string, len(options))
 	for i, o := range options {
-		o = strings.ToLower(strings.TrimSpace(o))
-		// A multi-select option's checkbox is VOLATILE state, not part of the
-		// question's identity: "[✔] Auto-sends" is the same option as
-		// "[ ] Auto-sends", just already ticked. Folding it to the unchecked
-		// spelling is what lets a form carrying a half-delivered answer still
-		// resolve to the rule learned for the untouched form — and folding TO
-		// "[ ]" (rather than dropping the box) keeps every signature already
-		// learned from an untouched form byte-identical, so nothing needs a
-		// migration.
-		o = checkboxLabelRE.ReplaceAllString(o, "[ ]")
+		o = normalizeOptionLabel(o)
 		o = strings.ReplaceAll(o, `\`, `\\`)
 		opts[i] = strings.ReplaceAll(o, ";", `\;`)
 	}
 	sort.Strings(opts)
 	return strings.Join(opts, ";")
+}
+
+// normalizeOptionLabel is the per-label half of NormalizedOptionSet: lowercase,
+// trim, and fold a multi-select checkbox to its unchecked spelling.
+//
+// A multi-select option's checkbox is VOLATILE state, not part of the question's
+// identity: "[✔] Auto-sends" is the same option as "[ ] Auto-sends", just
+// already ticked. Folding it to the unchecked spelling is what lets a form
+// carrying a half-delivered answer still resolve to the rule learned for the
+// untouched form — and folding TO "[ ]" (rather than dropping the box) keeps
+// every signature already learned from an untouched form byte-identical, so
+// nothing needs a migration.
+//
+// It is factored out so a comparison against a STORED option set normalizes both
+// sides through exactly ONE implementation. The escaping NormalizedOptionSet
+// adds on top is a delimiter concern of the joined encoding, and splitOptionSet
+// has already undone it by the time a stored label is compared — so a caller
+// holding split labels must normalize with this, never with the full encoder.
+func normalizeOptionLabel(o string) string {
+	o = strings.ToLower(strings.TrimSpace(o))
+	return checkboxLabelRE.ReplaceAllString(o, "[ ]")
+}
+
+// SalientOptionSet returns the option labels a STRUCTURED salient encodes, and
+// whether it carries an option set at all. It accepts both spellings that mint
+// one: a choice's "options:…" and an approval's "permission:… | options:…".
+//
+// The labels come back in normalizeOptionLabel form (the encoding's escaping
+// removed by splitOptionSet), so a caller comparing live labels against them
+// must run those through normalizeOptionLabel too.
+func SalientOptionSet(salient string) (map[string]bool, bool) {
+	encoded, found := approvalOptionsSegment(salient)
+	if !found {
+		rest, ok := strings.CutPrefix(salient, "options:")
+		if !ok {
+			return nil, false
+		}
+		encoded = strings.TrimSpace(rest)
+	}
+	set := splitOptionSet(encoded)
+	if len(set) == 0 {
+		return nil, false
+	}
+	return set, true
 }
 
 // approvalOptionsSegment returns the normalized option set encoded in an

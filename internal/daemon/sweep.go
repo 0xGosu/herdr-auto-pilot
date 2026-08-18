@@ -465,7 +465,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 					AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 					SituationType: s.Type, Action: "auto:" + dec.Input, Input: dec.Input,
 					Confidence: dec.Confidence, Rationale: dec.Rationale,
-					Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+					Status: "auto", PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
 				}.WithSignatureBaseline(sig))
 				if err != nil {
 					slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
@@ -543,7 +543,7 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 						Confidence: confidence, LLMConfidence: llmConfidence,
 						Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
 						LLMSessionID: llmDec.SessionID,
-						Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+						Status:       "auto", PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
 					}.WithSignatureBaseline(sig))
 					if err != nil {
 						slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)
@@ -631,7 +631,7 @@ func (d *Daemon) deliverRemoteEnv(ctx context.Context, ks ports.KeystrokeSender,
 					AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
 					SituationType: s.Type, Action: domain.AuditActionAutoPrefix + dec.Input, Input: dec.Input,
 					Confidence: dec.Confidence, Rationale: dec.Rationale,
-					Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+					Status: "auto", PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
 				}.WithSignatureBaseline(sig))
 				if err != nil {
 					slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
@@ -692,7 +692,7 @@ func (d *Daemon) deliverRemoteEnvLLM(ctx context.Context, ks ports.KeystrokeSend
 						Confidence: confidence, LLMConfidence: llmConfidence,
 						Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
 						LLMSessionID: llmDec.SessionID,
-						Status:       "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes), CreatedAt: now,
+						Status:       "auto", PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
 					}.WithSignatureBaseline(sig))
 					if err != nil {
 						slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)

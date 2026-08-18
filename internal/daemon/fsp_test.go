@@ -276,8 +276,15 @@ func TestFSPKillSwitchWinsOnBothPaths(t *testing.T) {
 
 // TestFSPExclusionsStillWait: the safety exclusions are unchanged —
 // never-auto matches (which carry no suggestion), suspected-irreversible,
-// retry-exhausted, rate-limited, noop and generate-task suggestions all stay
-// for the operator, on the sweep and on the immediate hook alike.
+// retry-exhausted, rate-limited and generate-task suggestions all stay for the
+// operator, on the sweep and on the immediate hook alike.
+//
+// The "@noop" row deliberately left this table: it is not a safety exclusion but
+// an unanswerable one — nothing is ever typed for it and nothing ever could be —
+// so full self-prompting now RETIRES it instead of queueing it for an operator
+// who by definition is not watching. See TestFSPRetiresANoopEscalation, and
+// TestTimedAutoAcceptStillLeavesANoopEscalationPending for the unchanged
+// behaviour without the mode.
 func TestFSPExclusionsStillWait(t *testing.T) {
 	h := newFSPHarness(t, fspOn)
 	ctx := context.Background()
@@ -292,8 +299,6 @@ func TestFSPExclusionsStillWait(t *testing.T) {
 			"[retry_exhausted] same error three times", domain.SituationApproval, "respond: Yes", time.Minute),
 		"rate_limited": seedEscalationWithRationale(t, h, "pA", approvalPane,
 			"[rate_limited] per-minute ceiling", domain.SituationApproval, "respond: Yes", time.Minute),
-		"noop suggestion": seedEscalationWithRationale(t, h, "pA", approvalPane,
-			"[shadow_mode] learning", domain.SituationApproval, domain.ActionNoopSuggestion, time.Minute),
 		// The comment above always claimed this row; the map never had it, so
 		// the generate-task refusal was only ever covered at the domain level.
 		// With accept_generated_task off (as here) it must still stand.

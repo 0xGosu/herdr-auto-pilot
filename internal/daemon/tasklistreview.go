@@ -679,7 +679,7 @@ func (d *Daemon) auditTaskReview(ctx context.Context, s domain.Situation, sig do
 		Confidence: 0, LLMConfidence: a.llmConfidence,
 		LLMSessionID: a.sessionID,
 		Rationale:    strings.TrimSpace(rationale), LLMOutput: a.llmOutput,
-		Status: "auto", PaneExcerpt: truncateTailRunes(s.Content, snapshotMaxRunes),
+		Status: "auto", PaneExcerpt: truncateExcerpt(s.Content),
 		CreatedAt: now,
 	}); err != nil {
 		// The review row is a record, not a gate: losing it must not cost the

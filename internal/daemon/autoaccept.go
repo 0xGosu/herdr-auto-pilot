@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/deliver"
@@ -28,6 +29,23 @@ import (
 // is the desired behavior, and it keeps the durable state derived purely from
 // created_at like the rest of this pass.
 const maxAutoAcceptAttempts = 3
+
+// fspTailHeldStillJitterPercent is the tolerance full self-prompting applies to
+// an UNSTRUCTURED pane-tail salient after SignatureHeldStill has already refused
+// it.
+//
+// It is a SEPARATE constant from staleDeferredSendJitterPercent, which the
+// consult path and the ordinary auto-accept comparison share — one number serving
+// three different questions is how tolerances drift, and retuning one of them
+// through another is exactly what the comment on that constant warns against. It
+// starts at the same value on purpose: the loosening this path needs is
+// STRUCTURAL (domain.TailSimilarWithin aligns the recent-vs-visible window
+// mismatch before comparing), so what is left for the tolerance to absorb is
+// ordinary repaint, which is the band that value was already measured for.
+// Aligned tails are also SHORTER than a full window, which makes a changed
+// question line a LARGER fraction of the compared string — so discrimination
+// improves rather than degrades, and errors fall on the refusing side.
+const fspTailHeldStillJitterPercent = 15
 
 // autoAcceptAbsenceConfirmations is how many CONSECUTIVE sweeps must report an
 // agent missing before its escalations are retired. Two, not one: herdr can
@@ -151,6 +169,11 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 			if why == "no signature baseline" {
 				d.logMissingBaselineOnce(rec)
 			}
+			// The ONE refusal full self-prompting retires rather than leaves
+			// pending. Nothing reaches the pane on this path.
+			if fsp && why == domain.IneligibleNoopSuggestion {
+				d.retireNoopEscalation(ctx, rec, now)
+			}
 			continue
 		}
 		stillEligible[rec.ID] = true
@@ -165,6 +188,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		// keystrokes must never interleave, so leave the row pending and take
 		// it on a later tick.
 		if d.paneBusy(rec.AgentID) {
+			d.notePending(rec, "another pane interaction owns this agent")
 			continue
 		}
 		// The [limits] ceilings, when the operator asked full self-prompting to
@@ -292,6 +316,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	// Guard 1b — a paused or operator-disabled agent is suppressed, never
 	// retired: a pause is a temporary operator control.
 	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID) {
+		d.notePending(rec, "the agent is disabled, or paused by the runaway guard")
 		return autoAcceptSkipped
 	}
 
@@ -301,12 +326,13 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	// transition escalationDedupWindow exists to absorb. This is NOT the
 	// authoritative staleness check; Guard 3 is.
 	if !autoAcceptParked(agent.Status) {
+		d.notePending(rec, "the agent is no longer parked", "status", agent.Status)
 		return autoAcceptSkipped
 	}
 
 	// Guard 3 — the authoritative one. Exhaustive on purpose: for the guard the
 	// whole feature rests on, an unhandled value must not fall through to a send.
-	switch d.autoAcceptSituationHeldStill(ctx, rec, suggestion, agent, panes) {
+	switch d.autoAcceptSituationHeldStill(ctx, rec, suggestion, agent, panes, fsp) {
 	case heldStillYes:
 		// Proceed.
 	case heldStillNo:
@@ -435,6 +461,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 			"audit_id", rec.ID)
 	}
 	d.clearAutoAcceptAttempts(rec.ID)
+	d.clearPendingNote(rec.ID)
 	slog.Info("auto-accept: delivered an aged escalation",
 		"audit_id", rec.ID, "agent", rec.AgentID, "situation", rec.SituationType,
 		"waited", now.Sub(rec.CreatedAt).Round(time.Second).String(),
@@ -520,8 +547,11 @@ func (d *Daemon) autoAcceptDeliveryFailed(ctx context.Context, rec *domain.Audit
 // (nothing sent, nothing learned, the audit row retained per FR-020), so only
 // the reason is new, and the reason rides in the rationale.
 //
-// This is reachable from exactly three places — a negative Guard 3, confirmed
-// agent absence, and attempt exhaustion. Nothing else in this pass may dismiss.
+// This is reachable from exactly four places — a negative Guard 3, confirmed
+// agent absence, attempt exhaustion, and full self-prompting retiring a "@noop"
+// row (retireNoopEscalation), which is the only one that dismisses without any
+// pane evidence because it never had anything to deliver. Nothing else in this
+// pass may dismiss.
 func (d *Daemon) autoDismiss(ctx context.Context, rec *domain.AuditRecord,
 	reason, detail string, now time.Time) autoAcceptOutcome {
 
@@ -545,6 +575,31 @@ func (d *Daemon) autoDismiss(ctx context.Context, rec *domain.AuditRecord,
 		"reason", reason, "detail", detail,
 		"waited", now.Sub(rec.CreatedAt).Round(time.Second).String())
 	return autoAcceptRetired
+}
+
+// retireNoopEscalation is LS-2: under full self-prompting, an escalation whose
+// suggested answer is the "@noop" sentinel is dismissed instead of waiting
+// forever.
+//
+// "@noop" means SEND NOTHING. Delivery would type the sentinel at the agent as
+// literal text, which is why AutoAcceptIneligible refuses it outright — and that
+// refusal is permanent by construction: the suggestion cannot become deliverable
+// on a later sweep, so the row is guaranteed to sit in the queue until a human
+// clears it by hand. The main population is task_source_exhausted ("no more
+// pending tasks"), which is exactly the kind of notice an unattended mode should
+// be able to retire on its own.
+//
+// This is the only auto-accept path that acts without any pane evidence, and it
+// can afford to be: nothing is sent, nothing is learned, and the audit row is
+// retained with a reason naming what happened (FR-020). It still honours the
+// per-agent controls — an operator who disabled an agent, or a runaway-guard
+// pause, means hap stops making decisions for that agent, including this one.
+func (d *Daemon) retireNoopEscalation(ctx context.Context, rec *domain.AuditRecord, now time.Time) {
+	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID) {
+		return
+	}
+	d.autoDismiss(ctx, rec, domain.ReasonAutoDismissNoop,
+		`the suggested answer is "do nothing", so there is nothing to deliver`, now)
 }
 
 // autoAcceptAgentSuppressed reports whether the agent is paused or
@@ -1143,6 +1198,46 @@ func (d *Daemon) pruneAutoAcceptState(stillEligible map[int64]bool) {
 			delete(d.autoAcceptAbsent, id)
 		}
 	}
+	for id := range d.autoAcceptPendingLogged {
+		if !stillEligible[id] {
+			delete(d.autoAcceptPendingLogged, id)
+		}
+	}
+}
+
+// notePending records WHY an escalation is being left pending, at INFO, once per
+// (row, reason).
+//
+// Every refusal on this path used to be Debug-or-silent, and the cost of that is
+// measurable: audit #1092 sat pending across two independent passes for eleven
+// minutes with no operator-visible explanation, and diagnosing it needed the
+// database and a five-step investigation. An operator running full self-prompting
+// at the default log level could see that nothing was being answered but never
+// why.
+//
+// Once per (row, reason) rather than once per sweep, because the pass re-examines
+// every pending row every minute and a per-sweep line would be a firehose — but a
+// row whose reason CHANGES (the agent went back to work, then the form was
+// part-answered) is genuinely new information and says so.
+func (d *Daemon) notePending(rec *domain.AuditRecord, reason string, attrs ...any) {
+	d.mu.Lock()
+	previous, seen := d.autoAcceptPendingLogged[rec.ID]
+	d.autoAcceptPendingLogged[rec.ID] = reason
+	d.mu.Unlock()
+	if seen && previous == reason {
+		return
+	}
+	args := append([]any{"audit_id", rec.ID, "agent", rec.AgentID,
+		"situation", rec.SituationType, "reason", reason}, attrs...)
+	slog.Info("auto-accept: leaving this escalation for the operator", args...)
+}
+
+// clearPendingNote forgets a row's last pending reason, so a row that starts
+// stalling again after a delivery or a successful guard reports it afresh.
+func (d *Daemon) clearPendingNote(auditID int64) {
+	d.mu.Lock()
+	delete(d.autoAcceptPendingLogged, auditID)
+	d.mu.Unlock()
 }
 
 // logMissingBaselineOnce reports, once per daemon run, that escalations are
@@ -1205,7 +1300,7 @@ const (
 //     during the wait cannot shift the comparison basis and manufacture a
 //     spurious staleness.
 func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.AuditRecord,
-	suggestion string, agent domain.AgentTransition, panes *paneCache) heldStill {
+	suggestion string, agent domain.AgentTransition, panes *paneCache, fsp bool) heldStill {
 
 	prev, ok := domain.AutoAcceptBaseline(rec)
 	if !ok {
@@ -1216,11 +1311,10 @@ func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.A
 	_, _, cls := d.snapshot()
 	pane, err := panes.read(ctx, d, paneIDFor(rec, agent))
 	if err != nil {
-		slog.Debug("auto-accept: pane re-read failed; leaving the escalation pending",
-			"audit_id", rec.ID, "agent", rec.AgentID, "error", err)
+		d.notePending(rec, "the agent's pane could not be read", "error", err)
 		return heldStillUnevaluable
 	}
-	if verdict, handled := d.mcqFormHeldStill(rec, suggestion, pane); handled {
+	if verdict, handled := d.mcqFormHeldStill(rec, suggestion, pane, fsp); handled {
 		return verdict
 	}
 	// Classify under the status the ESCALATED situation is expressible at, not
@@ -1275,8 +1369,13 @@ func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.A
 		// auto-accept — which is also why idle and unclassifiable ship
 		// disabled. Nothing is ever lost to it.
 		if !domain.StructuredSalient(prev.Salient) {
-			slog.Debug("auto-accept: unstructured salient did not compare cleanly; leaving pending",
-				"audit_id", rec.ID, "agent", rec.AgentID)
+			// Full self-prompting asks the containment question instead before
+			// giving up. See unstructuredHeldStill: it is the whole reason idle
+			// and generated-task rows can be delivered unattended at all.
+			if fsp && d.unstructuredHeldStill(rec, prev, fresh) {
+				return heldStillYes
+			}
+			d.notePending(rec, "the pane no longer compares cleanly with the escalated screen")
 			return heldStillUnevaluable
 		}
 		return heldStillNo
@@ -1316,7 +1415,7 @@ func (d *Daemon) autoAcceptSituationHeldStill(ctx context.Context, rec *domain.A
 //
 // handled is false for anything that is not a live multi-tab form, which falls
 // through to the ordinary signature comparison.
-func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane string) (heldStill, bool) {
+func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane string, fsp bool) (heldStill, bool) {
 	state, isForm := domain.ParseMCQForm(rec.AgentType, pane)
 	if !isForm || state.AnswerCount < 2 {
 		return 0, false
@@ -1337,8 +1436,14 @@ func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane stri
 		if strings.TrimSpace(rec.PaneExcerpt) == "" ||
 			domain.LooksLikeAggregatedMCQ(rec.PaneExcerpt) ||
 			strings.HasPrefix(rec.PaneExcerpt, excerptTruncationMarker) {
-			slog.Debug("auto-accept: multi-tab form on screen but the row carries no usable capture; leaving pending",
-				"audit_id", rec.ID, "agent", rec.AgentID, "excerpt_runes", len([]rune(rec.PaneExcerpt)))
+			// Full self-prompting gets a second source of identity evidence
+			// before giving up: the row's SALIENT, a separate column the
+			// truncation never touched. See mcqSalientHeldStill.
+			if fsp && d.mcqSalientHeldStill(rec, suggestion, pane, state) {
+				return heldStillYes, true
+			}
+			d.notePending(rec, "a multi-tab form is on screen but the row's own capture is unusable",
+				"excerpt_runes", len([]rune(rec.PaneExcerpt)))
 			return heldStillUnevaluable, true
 		}
 		// The row captured something else entirely and a form is standing now,
@@ -1362,9 +1467,8 @@ func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane stri
 	// Unevaluable, not stale: a malformed answer needs a human, not a dismissal.
 	groups, isSeries := domain.ParseTabSelections(suggestion)
 	if !isSeries || len(groups) != state.AnswerCount {
-		slog.Debug("auto-accept: the suggestion is not an answer series for this form; leaving pending",
-			"audit_id", rec.ID, "agent", rec.AgentID, "tabs", state.AnswerCount,
-			"suggestion", truncateRunes(suggestion, 60))
+		d.notePending(rec, "the suggested answer is not an answer series for this form",
+			"tabs", state.AnswerCount, "suggestion", truncateRunes(suggestion, 60))
 		return heldStillUnevaluable, true
 	}
 	// The token COUNT is not enough: a token may itself be a comma group
@@ -1378,9 +1482,8 @@ func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane stri
 	// tab's select mode, so check the shape here and leave it for the operator.
 	for i, group := range groups {
 		if len(group) > 1 && !domain.MultiSelectTab(frames[i]) {
-			slog.Debug("auto-accept: the suggestion selects several options on a single-select tab; leaving pending",
-				"audit_id", rec.ID, "agent", rec.AgentID, "tab", i+1,
-				"suggestion", truncateRunes(suggestion, 60))
+			d.notePending(rec, "the suggested answer selects several options on a single-select tab",
+				"tab", i+1, "suggestion", truncateRunes(suggestion, 60))
 			return heldStillUnevaluable, true
 		}
 	}
@@ -1391,8 +1494,7 @@ func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane stri
 	// a form carries, and NormalizeMCQFrame folds them, so this has to be asked
 	// before the comparison rather than left to it.
 	if !domain.MCQFormFullyUnanswered(pane) {
-		slog.Debug("auto-accept: the form is already part-answered; leaving it to the operator",
-			"audit_id", rec.ID, "agent", rec.AgentID)
+		d.notePending(rec, "the form is already part-answered")
 		return heldStillUnevaluable, true
 	}
 	live := domain.NormalizeMCQFrame(domain.ExtractAgentMCQForm(state.Kind, pane))
@@ -1409,6 +1511,130 @@ func (d *Daemon) mcqFormHeldStill(rec *domain.AuditRecord, suggestion, pane stri
 	slog.Debug("auto-accept: a different form with the same tab count is on screen",
 		"audit_id", rec.ID, "agent", rec.AgentID, "tabs", len(frames))
 	return heldStillNo, true
+}
+
+// unstructuredHeldStill is full self-prompting's fallback for a PANE-TAIL
+// salient that failed the ordinary staleness comparison.
+//
+// The ordinary comparison is symmetric trigram Jaccard, and for these rows it is
+// asking a question the two captures cannot answer. The baseline was minted from
+// a `pane read --source recent` capture — a CONSUMING DELTA — while this re-read
+// is `--source visible`, the entire screen. The same unchanged screen therefore
+// yields two very differently sized salients whose union is dominated by content
+// only the visible read ever had, so similarity is low however little moved. The
+// existing code knows this and answers heldStillUnevaluable, which is correct and
+// also permanent: idle, unclassifiable, verbless-approval and summary-less-error
+// rows then never auto-accept at all. That is the documented reason
+// full_self_prompting.accept_generated_task ships and almost never delivers.
+//
+// So this compares the two on the window they SHARE: domain.TailSimilarWithin
+// cuts both to the shorter one's length, from the TAIL, before measuring. That
+// removes the length mismatch instead of tolerating it — and aligning on the tail
+// rather than testing containment is what keeps it honest, because a screen that
+// has moved on paints its new content at the BOTTOM, inside the compared window.
+// Containment would answer "still there" while a new question sat below the old
+// one.
+//
+// Three bounds keep it honest:
+//
+//   - A FLOOR on the shared window (domain.MinTailCompareRunes). Two very short
+//     tails compare equal whatever they say, which would make one near-empty
+//     screen a magnet for every other — the same failure mode
+//     embedding.min_salient_chars exists to prevent on the cosine path. Below the
+//     floor there is no evidence and the row waits.
+//   - It NEVER dismisses. A containment miss returns false, and the caller's
+//     next move is heldStillUnevaluable, not heldStillNo. The comparison is good
+//     enough to justify acting when it succeeds and never good enough to destroy
+//     a queue entry when it fails.
+//   - The situation TYPE was already asserted equal by the caller, and Guard 2
+//     already proved the agent is still parked. This adds content evidence on
+//     top of those, it does not replace them.
+//
+// The tolerance is deliberately NOT staleDeferredSendJitterPercent: that constant
+// is a symmetric similarity bound with two other call sites, and reusing it here
+// would silently couple three different questions to one number.
+func (d *Daemon) unstructuredHeldStill(rec *domain.AuditRecord, prev, fresh domain.SignatureResult) bool {
+	if !domain.TailSimilarWithin(prev.Salient, fresh.Salient, fspTailHeldStillJitterPercent) {
+		slog.Debug("auto-accept: the pane tail no longer matches the escalated screen on their common window; leaving pending",
+			"audit_id", rec.ID, "agent", rec.AgentID,
+			"baseline_runes", utf8.RuneCountInString(prev.Salient),
+			"live_runes", utf8.RuneCountInString(fresh.Salient))
+		return false
+	}
+	slog.Info("full self-prompting: the escalated pane-tail content is still on screen; proceeding",
+		"audit_id", rec.ID, "agent", rec.AgentID, "situation", rec.SituationType)
+	return true
+}
+
+// mcqSalientHeldStill is full self-prompting's fallback identity check for a
+// multi-tab form whose STORED CAPTURE is unusable — truncated past its
+// "[question 1/N]" head, or absent on a legacy row.
+//
+// Without it such a row is unanswerable forever. The capture is what the
+// frame-wise comparison compares against, so losing it means the guard can never
+// say yes, and it must not say no either (a mangled capture is not evidence the
+// screen changed) — so the row sits `escalated` through every sweep, delivered by
+// nobody and dismissed by nobody. That is not hypothetical: audit #1092 sat that
+// way for eleven minutes across both the FSP sweep and the timed threshold, and
+// was cleared by hand.
+//
+// The substitute evidence is the row's SALIENT, a separate column truncation
+// never touched. For a choice it encodes the whole form's option set across every
+// tab, so a live frame whose options are a subset of it is the same form. That is
+// STRICTER than it sounds: labels compare exactly (both sides through one
+// normalizer), so any drift in the offered options fails and the row stays
+// pending.
+//
+// Three further conditions, none of them optional:
+//
+//   - The tab count must match the answer series, or delivery would not take the
+//     answer-series branch at all — it would fall through to the plain-menu path
+//     and map the reply against whichever tab happens to be visible.
+//   - No token may be a COMMA GROUP. A group only makes sense on a multi-select
+//     tab, and the per-tab select modes lived in the frames the truncation
+//     destroyed — so unlike the intact-aggregate path there is nothing here to
+//     verify a group against. mcqdeliver would refuse it at its own tab, but that
+//     is AFTER earlier tabs were answered and committed, leaving the
+//     half-answered form the all-or-nothing contract exists to prevent. Refuse
+//     before anything is pressed.
+//   - The form must be fully unanswered, for the reason the intact path checks it:
+//     delivery resets to tab 1 and retypes EVERY tab, so proceeding over someone
+//     else's picks would silently overwrite them.
+//
+// This widens the evidence for IDENTITY only. Liveness is still proved twice
+// after this returns — deliver.deliverSeries refuses unless the live pane parses
+// as a form with exactly this many tabs, and mcqdeliver verifies every keystroke
+// landed.
+func (d *Daemon) mcqSalientHeldStill(rec *domain.AuditRecord, suggestion, pane string,
+	state domain.MCQFormState) bool {
+
+	decline := func(why string) bool {
+		slog.Debug("auto-accept: no usable capture and the live form is not provably the same one; leaving pending",
+			"audit_id", rec.ID, "agent", rec.AgentID, "reason", why)
+		return false
+	}
+	groups, isSeries := domain.ParseTabSelections(suggestion)
+	if !isSeries || len(groups) != state.AnswerCount {
+		return decline("the suggestion is not an answer series for this form")
+	}
+	for i, group := range groups {
+		if len(group) > 1 {
+			return decline(fmt.Sprintf("tab %d needs a multi-select group no capture can verify", i+1))
+		}
+	}
+	if !domain.MCQFormFullyUnanswered(pane) {
+		return decline("the form is already part-answered")
+	}
+	// OptionLabels is what the sweep itself ran over the aggregate to build the
+	// Options the salient was minted from, so both sides of the comparison are
+	// derived by the same function.
+	live := domain.OptionLabels(domain.ExtractAgentMCQForm(state.Kind, pane))
+	if !domain.LiveMCQMatchesSalient(live, rec.SigSalient) {
+		return decline("the live options are not a subset of the escalated form's option set")
+	}
+	slog.Info("full self-prompting: the row's capture is unusable but the live form matches its stored option set; proceeding",
+		"audit_id", rec.ID, "agent", rec.AgentID, "tabs", state.AnswerCount)
+	return true
 }
 
 // paneIDFor resolves which pane to read. An agent id IS a pane id in herdr, but

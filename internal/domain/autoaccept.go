@@ -118,13 +118,22 @@ func AutoAcceptIneligible(a *AuditRecord, suggestion string, allowGeneratedTask 
 		// treats it as ordinary text. Refusing it here is the fail-closed
 		// equivalent: nothing to send means nothing to auto-send, so it stays
 		// for the operator rather than being typed at an agent verbatim.
-		return "noop suggestion"
+		return IneligibleNoopSuggestion
 	}
 	if a.SigRaw == "" {
 		return "no signature baseline"
 	}
 	return ""
 }
+
+// IneligibleNoopSuggestion is the refusal AutoAcceptIneligible returns for a
+// "@noop" suggestion. It is a named constant because full self-prompting acts on
+// it specifically — retiring the row rather than leaving it pending, since a
+// sentinel meaning "send nothing" has nothing to deliver and will still have
+// nothing to deliver on the next sweep, and the one after that. Every other
+// refusal stays a plain string: they mean "a human must look at this", which is
+// not a value any caller should be branching on.
+const IneligibleNoopSuggestion = "noop suggestion"
 
 // AutoAcceptBaseline rehydrates the SignatureResult persisted on an audit row,
 // for use as `prev` in a staleness comparison.
@@ -150,4 +159,47 @@ func AutoAcceptBaseline(a *AuditRecord) (SignatureResult, bool) {
 		Verdict:      a.SigVerdict,
 		SalientChars: a.SigSalientChars,
 	}, true
+}
+
+// LiveMCQMatchesSalient reports whether the multi-tab form standing on screen is
+// recognisably the one an escalation was raised for, using the row's STORED
+// SALIENT as the identity evidence instead of its stored capture.
+//
+// It exists for one narrow case: the capture is unusable. A swept aggregate that
+// was truncated past its "[question 1/N]" head cannot be parsed back into frames
+// at all, so the frame-wise comparison auto-accept normally makes has nothing to
+// compare against and the row waits forever (observed live 2026-08-18, audit
+// #1092). The salient is a SEPARATE column that truncation never touched, and
+// for a choice it is the form's whole option set across every tab
+// ("options:" + NormalizedOptionSet) — which is real, unforgeable identity
+// evidence the excerpt's loss does not affect.
+//
+// The test is SUBSET, not equality, and the direction is load-bearing: the live
+// read is ONE tab of an N-tab form, so its options are necessarily a subset of
+// the aggregate's. Equality could never hold, and the reverse containment would
+// be satisfied by any single-option screen.
+//
+// It is deliberately not a similarity score. Both sides normalize through
+// normalizeOptionLabel, so the comparison is exact per label; a form whose
+// options have drifted at all fails, which is the fail-safe direction — the
+// caller leaves such a row pending rather than answering it.
+//
+// What this does NOT establish, and the caller must check separately: that the
+// form is still fully unanswered, that the tab count matches the answer series,
+// and that no tab needs a multi-select group (the per-tab select modes lived in
+// the frames the truncation destroyed, so a comma group can never be verified
+// here and must be refused by the caller).
+func LiveMCQMatchesSalient(liveOptions []string, salient string) bool {
+	stored, ok := SalientOptionSet(salient)
+	if !ok || len(liveOptions) == 0 {
+		// No option set stored (a pane-tail salient, or a verb-only approval),
+		// or nothing parsed off the live frame: no evidence, so no match.
+		return false
+	}
+	for _, o := range liveOptions {
+		if !stored[normalizeOptionLabel(o)] {
+			return false
+		}
+	}
+	return true
 }
