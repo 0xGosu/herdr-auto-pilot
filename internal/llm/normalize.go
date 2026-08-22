@@ -69,6 +69,11 @@ var claudeBoolFlags = map[string]bool{
 	"--dangerously-skip-permissions": true,
 	"--include-partial-messages":     true,
 	"--replay-user-messages":         true,
+	// Keeps a consult out of the operator's own session history. Every claude
+	// recipe hap documents now carries it, so an unregistered entry here would
+	// make fixPromptAdjacency bail out on the RECOMMENDED template — the same
+	// trap StrictMCPConfigFlag documents below.
+	"--no-session-persistence": true,
 	// The exported constant, not a second copy of the literal: injection runs
 	// BEFORE the normalizer, and fixPromptAdjacency bails out entirely on a flag
 	// it cannot classify — so this entry is what keeps prompt repair working on
