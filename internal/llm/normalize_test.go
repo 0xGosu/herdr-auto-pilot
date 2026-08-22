@@ -39,6 +39,17 @@ func TestNormalizeLLMCommand(t *testing.T) {
 			want: []string{"claude", "-p", "prompt here", "--verbose", "--mcp-config", mcpJSON},
 		},
 		{
+			// Every claude recipe hap documents carries this flag now, so an
+			// unregistered entry would make the repair bail out on the
+			// RECOMMENDED template — the misplaced prompt would then reach the
+			// CLI and fail every consult.
+			name: "claude --no-session-persistence is classified",
+			in: []string{"claude", "--no-session-persistence", "-p",
+				"--mcp-config", mcpJSON, "prompt here"},
+			want: []string{"claude", "-p", "prompt here",
+				"--no-session-persistence", "--mcp-config", mcpJSON},
+		},
+		{
 			name: "claude no positional stays put",
 			in:   []string{"claude", "-p", "--verbose"},
 			want: []string{"claude", "-p", "--verbose"},
