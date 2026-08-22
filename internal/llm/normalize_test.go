@@ -40,11 +40,20 @@ func TestNormalizeLLMCommand(t *testing.T) {
 		},
 		{
 			// Every claude recipe hap documents carries this flag now, so an
-			// unregistered entry would make the repair bail out on the
-			// RECOMMENDED template — the misplaced prompt would then reach the
-			// CLI and fail every consult.
-			name: "claude --no-session-persistence is classified",
-			in: []string{"claude", "--no-session-persistence", "-p",
+			// unregistered entry would make the repair bail out on a recipe
+			// whose prompt an operator moved — and the misplaced prompt would
+			// then reach the CLI and fail every consult.
+			//
+			// The flag sits BETWEEN -p and the prompt on purpose: that is the
+			// only position that also catches a WRONG-ARITY entry. Registered
+			// as a value flag instead, it eats --mcp-config, mcpJSON and the
+			// prompt both read as positionals, and the repair bails on the
+			// ambiguity — silently, with the suite green, while a real
+			// misconfigured template goes unrepaired. Placed before -p, the
+			// value-flag mutant's i++ skips over -p and produces the identical
+			// output, so that arrangement proves only registration.
+			name: "claude --no-session-persistence is classified as a bool flag",
+			in: []string{"claude", "-p", "--no-session-persistence",
 				"--mcp-config", mcpJSON, "prompt here"},
 			want: []string{"claude", "-p", "prompt here",
 				"--no-session-persistence", "--mcp-config", mcpJSON},
