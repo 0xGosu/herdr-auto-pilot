@@ -1528,8 +1528,20 @@ there is none.
 ### Session ids
 
 Every LLM invocation is given a session id, and that id is recorded on the audit
-row the invocation produced (`llm_session_id`). It is what the CLI names its
-transcript file, so a decision can be traced back to the conversation behind it.
+row the invocation produced (`llm_session_id`). **When the CLI persists sessions**,
+it is also what names the transcript file, so a decision can be traced back to the
+conversation behind it.
+
+The recipes above disable that persistence (`--no-session-persistence` for
+claude, `--ephemeral` for codex) so hap's background consults stay out of your
+own session history. Under those flags the id names **no file on disk** — it
+remains a correlation key on the audit row, not something to open. Drop the flag
+from a `command` if you want its transcripts back.
+
+This does not cost you the record of what the LLM said: hap captures the CLI's
+own stdout and stderr onto the audit row either way, readable with `hap audit`
+or `v` in the TUI's Audit tab. The transcript is the CLI's optional extra copy,
+not hap's evidence.
 
 - **`claude`** — hap appends `--session-id {session_id}` automatically. Write
   `{session_id}` in your `command` yourself only if you need it somewhere else;
@@ -1539,12 +1551,12 @@ transcript file, so a decision can be traced back to the conversation behind it.
 - **anything else** — nothing is added. hap does not guess a flag name, because
   a wrong one is an argv error that would fail every consult.
 
-The id is recorded for failed consults too — a timeout or a no-submit still
-wrote a transcript, and still raises an escalation. It is bookkeeping only:
-nothing decides anything from it, and an empty value simply means unknown.
+The id is recorded for failed consults too — a timeout or a no-submit still ran
+the CLI, and still raises an escalation. It is bookkeeping only: nothing decides
+anything from it, and an empty value simply means unknown.
 
-Where the transcript lands differs per CLI, so anything looking one up cannot
-assume claude's layout:
+Where the transcript lands **when persistence is enabled** differs per CLI, so
+anything looking one up cannot assume claude's layout:
 
 | CLI | Transcript path |
 |---|---|
