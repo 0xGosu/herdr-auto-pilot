@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.17
+
+- Changed every documented Claude Code recipe to pass `--no-session-persistence`, and every OpenAI Codex one to pass `--ephemeral`, so hap's background consults no longer land in your own session history or transcript store. The recorded `{session_id}` becomes a correlation key rather than a file you can open; drop the flag if you want the transcripts. Existing configs are unaffected — edit yours to pick this up.
+- Fixed the claude prompt-adjacency repair bailing out on any template carrying `--no-session-persistence`, which would have left the prompt misplaced and failed the consult.
+
 ## 0.6.16
 
 - Fixed a multi-tab question form whose captured question list was too long to store being escalated and then neither delivered nor dismissed, silently, forever — the capture was cut from the top, which is the half that says how many questions there are. Such a capture now gets a much larger storage budget, so it stays readable.
