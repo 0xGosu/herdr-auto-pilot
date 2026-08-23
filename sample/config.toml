@@ -117,14 +117,25 @@ unclassifiable = "0"       # disabled: hap never understood the screen at all
 # is the agent's short name ({db}/{control} also available). The prompt must
 # come immediately after -p (claude quirk; the plugin auto-repairs it).
 #
-# {session_id} = a fresh UUID per invocation, recorded on the audit row so a
-# decision can be traced to the transcript the CLI wrote. Not written below on
-# purpose: for `claude`, hap appends `--session-id {session_id}` by itself.
-# Write the placeholder yourself only to place it somewhere else — doing so
-# turns the automatic injection off. `codex` has no such flag and is never
-# passed one; hap reads the id back from its startup banner instead.
+# {session_id} = a fresh UUID per invocation, recorded on the audit row. When
+# the CLI persists sessions it also names the transcript file, so a decision
+# can be traced to the conversation behind it. Not written below on purpose:
+# for `claude`, hap appends `--session-id {session_id}` by itself. Write the
+# placeholder yourself only to place it somewhere else — doing so turns the
+# automatic injection off. `codex` has no such flag and is never passed one;
+# hap reads the id back from its startup banner instead.
+#
+# NOTE the recipe below disables that persistence. `--no-session-persistence`
+# keeps these consults OUT of your own session history, so hap's background
+# LLM calls never show up in `claude --resume` or clutter the transcript
+# store — and under it the recorded {session_id} names NO file on disk. It
+# stays a correlation key for the audit row, not something to open. Drop the
+# flag if you want the transcripts. (codex's equivalent is `--ephemeral`,
+# shown in the recipe below; hap never resumes a session, so neither flag
+# breaks anything.) What the LLM actually said is not lost either way: hap
+# captures the CLI's stdout+stderr onto the audit row regardless.
 command = [
-  "claude", "--model", "opus", "--permission-mode", "auto", "-p",
+  "claude", "--no-session-persistence", "--model", "opus", "--permission-mode", "auto", "-p",
   "You are hap's auto-answer assistant. Use ONLY get_context and submit_decision.\n\nCall get_context, treat pane_excerpt as ground truth, and follow answer_format. If proposed_task and tasks are present, this is a pre-delivery task-list review: answer with send_task (and task_actions), NOT recommend_action. Read the whole list, act on current_task. Normally just set send_task to the reference of the task at hand and submit no actions. Use task_actions only when the pane gives you evidence: mark a finished task done, delete an invalid one, edit a stale one, move one that should run later, or add sibling tasks to break up an over-large one (each add takes an `as` handle you can name in send_task). Address tasks by the `ref` in tasks, preferring declared ids over positions. send_task is a reference, never task text. Use send_task \"@noop\" only when no pending task remains after your actions. Never invent work the list does not imply.\n\nOtherwise: for approval/choice, select the safest option and deny destructive or irreversible work; for error, give one concrete recovery instruction; for idle, give the sensible next instruction or @noop.\n\nCall submit_decision with select_options for menus, otherwise recommend_action. Always include confident_score (0-100) and a one-sentence rationale.",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
@@ -144,7 +155,7 @@ command = [
 # If the preferred command exits with an error in under one second without
 # submitting a decision, hap retries once with the other command template.
 # command_start = [
-#   "claude", "--model", "opus", "--permission-mode", "auto", "-p",
+#   "claude", "--no-session-persistence", "--model", "opus", "--permission-mode", "auto", "-p",
 #   "This is your first interaction with this agent. ...same MCP flow as command...",
 #   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
 #   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
@@ -159,7 +170,7 @@ command = [
 # environment, so the db/control paths must be passed explicitly via
 # {db}/{control}.
 # command = [
-#   "codex", "--model", "gpt-5.6-terra", "exec", "--skip-git-repo-check",
+#   "codex", "--model", "gpt-5.6-terra", "exec", "--ephemeral", "--skip-git-repo-check",
 #   "--dangerously-bypass-approvals-and-sandbox",
 #   "-c", 'mcp_servers.hap.command="{self}"',
 #   "-c", 'mcp_servers.hap.args=["mcp"]',
@@ -285,7 +296,7 @@ run_in_agent_cwd = true
 # a reply that groups its tasks under several headings keeps only the last group.
 # (Renamed from generate_task_command; the old key no longer loads — update it.)
 task_generate_command = [
-  "claude", "--model", "opus", "--permission-mode", "auto", "-p",
+  "claude", "--no-session-persistence", "--model", "opus", "--permission-mode", "auto", "-p",
   "Suggest up to 3 concrete next tasks for this project's coding agent, in priority order. Return the tasks as a markdown list — one \"- \" bullet or \"1.\" numbered item per task; any surrounding text is ignored as tasks and kept as rationale. If no new task is needed, reply with exactly @noop and nothing else.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
   # This run needs NO MCP server, and it runs in the agent's own project — so
   # the flag with no --mcp-config is the empty set, which is exactly right.
@@ -296,7 +307,7 @@ task_generate_command = [
 
 # ── Idle task suggestion — OpenAI Codex (commented; swap in to use codex) ──
 # task_generate_command = [
-#   "codex", "--model", "gpt-5.6-sol", "exec", "--skip-git-repo-check",
+#   "codex", "--model", "gpt-5.6-sol", "exec", "--ephemeral", "--skip-git-repo-check",
 #   "Suggest up to 3 concrete next tasks for this project's coding agent, in priority order. Return the tasks as a markdown list — one \"- \" bullet or \"1.\" numbered item per task; any surrounding text is ignored as tasks and kept as rationale. If no new task is needed, reply with exactly @noop and nothing else.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
 # ]
 
@@ -347,7 +358,7 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # Omit to keep the default: corrections are learned statistically only, and hap
 # never edits files in your projects.
 # learn_from_user_command = [
-#   "claude", "--model", "opus", "--permission-mode", "acceptEdits", "-p",
+#   "claude", "--no-session-persistence", "--model", "opus", "--permission-mode", "acceptEdits", "-p",
 #   "You are recording a lesson for yourself. Read the operator's correction below, then update CLAUDE.md in the current directory so you do not repeat the mistake. Edit CLAUDE.md and nothing else: do not run the task, do not touch the terminal, do not answer the prompt shown on screen. Add or amend ONE short, general rule, phrased as guidance for the future rather than as a note about this incident; if an existing rule already covers it, sharpen that rule instead of adding a second one. If the correction carries no durable lesson (a one-off, or purely situational), change nothing.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
 #   # Edits files with acceptEdits, in the agent's own project — so it must not
 #   # also load the MCP servers that project's .mcp.json names. No --mcp-config
@@ -358,7 +369,7 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # ── Learn from your corrections — OpenAI Codex (commented; swap in to use codex) ──
 # Same prompt, but codex reads AGENTS.md rather than CLAUDE.md.
 # learn_from_user_command = [
-#   "codex", "--model", "gpt-5.6-sol", "exec", "--skip-git-repo-check",
+#   "codex", "--model", "gpt-5.6-sol", "exec", "--ephemeral", "--skip-git-repo-check",
 #   "--dangerously-bypass-approvals-and-sandbox",
 #   "You are recording a lesson for yourself. Read the operator's correction below, then update AGENTS.md in the current directory so you do not repeat the mistake. Edit AGENTS.md and nothing else: do not run the task, do not touch the terminal, do not answer the prompt shown on screen. Add or amend ONE short, general rule, phrased as guidance for the future rather than as a note about this incident; if an existing rule already covers it, sharpen that rule instead of adding a second one. If the correction carries no durable lesson (a one-off, or purely situational), change nothing.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
 # ]

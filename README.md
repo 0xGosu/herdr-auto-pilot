@@ -1078,7 +1078,7 @@ task at all (a bare `---`, punctuation only) is treated the same way.
 ```toml
 [llm]
 task_generate_command = [
-  "claude", "--permission-mode", "auto", "-p",
+  "claude", "--no-session-persistence", "--permission-mode", "auto", "-p",
   "Suggest concrete next tasks, most important first. Reply with only the tasks, one per line. If no new task is needed, reply with exactly @noop and nothing else.\n\nAgent: {agent_name}\nCwd: {cwd}\n\nScreen:\n{pane_excerpt}",
   "--model", "haiku",
 ]
@@ -1453,8 +1453,11 @@ Code:
 [llm]
 # Claude Code: the prompt belongs immediately after -p (the plugin
 # auto-repairs a prompt misplaced after other flags — see below).
+# --no-session-persistence keeps hap's background consults out of your own
+# session history (codex's equivalent is --ephemeral). hap never resumes a
+# session, so this costs nothing but the on-disk transcript.
 command = [
-  "claude", "--permission-mode", "auto", "-p",
+  "claude", "--no-session-persistence", "--permission-mode", "auto", "-p",
   "Use the hap MCP tools: call get_context, decide what the operator would answer — or whether no reply is needed — then call submit_decision (select_options for multiple-choice, recommend_action '@noop' to do nothing).",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
@@ -1525,8 +1528,20 @@ there is none.
 ### Session ids
 
 Every LLM invocation is given a session id, and that id is recorded on the audit
-row the invocation produced (`llm_session_id`). It is what the CLI names its
-transcript file, so a decision can be traced back to the conversation behind it.
+row the invocation produced (`llm_session_id`). **When the CLI persists sessions**,
+it is also what names the transcript file, so a decision can be traced back to the
+conversation behind it.
+
+The recipes above disable that persistence (`--no-session-persistence` for
+claude, `--ephemeral` for codex) so hap's background consults stay out of your
+own session history. Under those flags the id names **no file on disk** — it
+remains a correlation key on the audit row, not something to open. Drop the flag
+from a `command` if you want its transcripts back.
+
+This does not cost you the record of what the LLM said: hap captures the CLI's
+own stdout and stderr onto the audit row either way, readable with `hap audit`
+or `v` in the TUI's Audit tab. The transcript is the CLI's optional extra copy,
+not hap's evidence.
 
 - **`claude`** — hap appends `--session-id {session_id}` automatically. Write
   `{session_id}` in your `command` yourself only if you need it somewhere else;
@@ -1536,12 +1551,12 @@ transcript file, so a decision can be traced back to the conversation behind it.
 - **anything else** — nothing is added. hap does not guess a flag name, because
   a wrong one is an argv error that would fail every consult.
 
-The id is recorded for failed consults too — a timeout or a no-submit still
-wrote a transcript, and still raises an escalation. It is bookkeeping only:
-nothing decides anything from it, and an empty value simply means unknown.
+The id is recorded for failed consults too — a timeout or a no-submit still ran
+the CLI, and still raises an escalation. It is bookkeeping only: nothing decides
+anything from it, and an empty value simply means unknown.
 
-Where the transcript lands differs per CLI, so anything looking one up cannot
-assume claude's layout:
+Where the transcript lands **when persistence is enabled** differs per CLI, so
+anything looking one up cannot assume claude's layout:
 
 | CLI | Transcript path |
 |---|---|
@@ -1563,8 +1578,8 @@ enables the fallback (`command` is what gates it):
 
 ```toml
 [llm]
-command       = [ "claude", "--permission-mode", "auto", "-p", "...ongoing consult prompt...", "--model", "haiku" ]
-command_start = [ "claude", "--permission-mode", "auto", "-p", "...first-touch kickoff prompt...", "--model", "opus" ]
+command       = [ "claude", "--no-session-persistence", "--permission-mode", "auto", "-p", "...ongoing consult prompt...", "--model", "haiku" ]
+command_start = [ "claude", "--no-session-persistence", "--permission-mode", "auto", "-p", "...first-touch kickoff prompt...", "--model", "opus" ]
 ```
 
 #### A separate environment per command
@@ -1671,7 +1686,7 @@ before anything reaches an agent:
 ```toml
 [llm]
 command = [
-  "codex", "exec", "--skip-git-repo-check",
+  "codex", "exec", "--ephemeral", "--skip-git-repo-check",
   "--dangerously-bypass-approvals-and-sandbox",
   "-c", 'mcp_servers.hap.command="{self}"',
   "-c", 'mcp_servers.hap.args=["mcp"]',
@@ -1835,7 +1850,7 @@ file (`CLAUDE.md` for claude, `AGENTS.md` for codex).
 ```toml
 [llm]
 learn_from_user_command = [
-  "claude", "--model", "opus", "--permission-mode", "acceptEdits", "-p",
+  "claude", "--no-session-persistence", "--model", "opus", "--permission-mode", "acceptEdits", "-p",
   "You are recording a lesson for yourself. Read the operator's correction below, then update CLAUDE.md in the current directory so you do not repeat the mistake. ... If the correction carries no durable lesson, change nothing.\n\nAgent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}",
 ]
 # learn_from_user_timeout_seconds = 300   # omitted: inherits timeout_seconds

@@ -1056,7 +1056,7 @@ when no confident learned rule applies, the plugin can consult a local LLM. the 
 ```toml
 [llm]
 command = [
-  "claude", "-p",
+  "claude", "--no-session-persistence", "-p",
   "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
   "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
   "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
@@ -1073,7 +1073,7 @@ codex requires `exec` for headless runs and explicit `HAP_DB_PATH`/`HAP_CONTROL_
 ```toml
 [llm]
 command = [
-  "codex", "exec", "--skip-git-repo-check",
+  "codex", "exec", "--ephemeral", "--skip-git-repo-check",
   "--dangerously-bypass-approvals-and-sandbox",
   "-c", 'mcp_servers.hap.command="{self}"',
   "-c", 'mcp_servers.hap.args=["mcp"]',
@@ -1120,8 +1120,8 @@ set `command_start` to use a different argv on the FIRST consult for a freshly d
 
 ```toml
 [llm]
-command       = ["claude", "-p", "...", "--model", "haiku"]
-command_start = ["claude", "-p", "...", "--model", "opus"]   # first consult per agent only
+command       = ["claude", "--no-session-persistence", "-p", "...", "--model", "haiku"]
+command_start = ["claude", "--no-session-persistence", "-p", "...", "--model", "opus"]   # first consult per agent only
 ```
 
 every LLM suggestion is re-gated through the never-auto patterns, kill switch, and rate guards. the LLM may act automatically only when its self-reported confidence score meets `auto_act_confidence_threshold` (0-100; default 85, so a high-confidence score does auto-act — set it above 100 to disable) AND the action doesn't contradict learned history; below the threshold, with no reported score, or on timeout / no submission, the situation escalates. the old boolean `auto_act` still loads as a deprecated alias (`true` → threshold 0, `false` → 999) and is migrated on next save.
