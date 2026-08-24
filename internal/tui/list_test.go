@@ -1165,6 +1165,8 @@ func TestFilteredSelectionConfirms(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	h := &captureHerdr{}
 	app := &frontend.App{Store: st, Herdr: h, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	makeDaemonLive(t, app, dir)
+	startStandInDrain(t, st, h.record)
 	ctx := context.Background()
 	idA, _ := st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w1:pA", SituationType: domain.SituationApproval, Trigger: "a",
@@ -1202,7 +1204,7 @@ func TestFilteredSelectionConfirms(t *testing.T) {
 	if !strings.Contains(res.message, fmt.Sprintf("#%d", idA)) {
 		t.Errorf("should confirm the filtered row #%d, message %q", idA, res.message)
 	}
-	if len(h.sent) != 1 || h.sent[0] != "Apple" {
+	if got := h.delivered(); len(got) != 1 || got[0] != "Apple" {
 		t.Errorf("should deliver A's suggestion, got %v", h.sent)
 	}
 }

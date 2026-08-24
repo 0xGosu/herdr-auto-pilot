@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -374,4 +376,47 @@ func seedAuditForCorrection(t *testing.T, s *Store) int64 {
 		t.Fatalf("seed audit: %v", err)
 	}
 	return id
+}
+
+// A state-dir path containing '?' or '#' must open the database it names.
+//
+// The DSN is "file:<path>?<pragmas>", so an unescaped path is TRUNCATED at
+// either character — silently, with no error, and with every caller under that
+// path sharing one file somewhere else entirely. Go's own t.TempDir() produces
+// such a path for any repeated subtest name ("#01"), which is how a freshly
+// created store was found reporting "no such column" for a column the schema
+// plainly declares.
+func TestAStorePathWithURIMetacharactersOpensItsOwnDatabase(t *testing.T) {
+	base := t.TempDir()
+	ctx := context.Background()
+	for _, name := range []string{"plain", "has#hash", "has?query", "has%percent"} {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(base, name)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Open(filepath.Join(dir, "t.db"))
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			defer s.Close()
+			if _, err := s.EnqueueAgentAction(ctx, domain.AgentAction{
+				Kind: domain.AgentActionCapture, Target: name, CreatedAt: time.Now(),
+			}); err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+			got, err := s.PendingAgentActions(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// One row, its own. Sharing a truncated path would accumulate
+			// every sibling's rows here.
+			if len(got) != 1 || got[0].Target != name {
+				t.Fatalf("actions = %+v; want only this database's own row", got)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "t.db")); err != nil {
+				t.Errorf("no database at the path that was asked for: %v", err)
+			}
+		})
+	}
 }

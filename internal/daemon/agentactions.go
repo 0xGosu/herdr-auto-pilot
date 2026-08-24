@@ -38,6 +38,16 @@ const actionStaleAfter = 2 * time.Minute
 // errActionUnsupported reports a kind this build has no executor for.
 var errActionUnsupported = errors.New("this hap daemon does not support that action")
 
+// errActionTransient marks a failure that is about the MACHINERY rather than
+// about the request — a locked database, a store write that lost a race.
+//
+// It is opt-in, and the default is the other way round: an operator is
+// BLOCKING on this row, so a failure they could act on has to reach them at
+// once. Retrying an answer the pane rejected just makes them wait
+// maxAgentActionAttempts sweeps — minutes — to be told something the first
+// attempt already knew.
+var errActionTransient = errors.New("transient")
+
 // agentActionStaleBound returns how long kind may wait before its request is
 // treated as stale, or 0 for kinds that never go stale.
 //
@@ -129,12 +139,14 @@ func (d *Daemon) runAgentAction(ctx context.Context, a domain.AgentAction) {
 		d.finishAgentAction(ctx, a, domain.AgentActionDone, "", result)
 		return
 	}
-	// A missing executor is PERMANENT: the next attempt runs the same build
-	// against the same switch. Spending the retry budget on it would leave the
-	// row pending for two more passes — a minute apiece — with the operator's
-	// surface polling, before finally reporting the answer it could have given
-	// at once.
-	if errors.Is(runErr, errActionUnsupported) || attempts >= maxAgentActionAttempts {
+	// Terminal unless the executor explicitly said otherwise. Almost every way
+	// an action fails is permanent by nature — a kind this build lacks, a
+	// safety rule that fires, an audit row that is gone, a menu whose options
+	// no longer include the answer — and retrying those only postpones a
+	// verdict the operator is waiting on. A content refusal in particular must
+	// never enter a budget: FR-015 says a never-auto match reaches a human, and
+	// a budget could only ever end in a message about attempts.
+	if !errors.Is(runErr, errActionTransient) || attempts >= maxAgentActionAttempts {
 		msg := runErr.Error()
 		if attempts > 1 {
 			msg = fmt.Sprintf("%s (gave up after %d attempts)", runErr, attempts)
@@ -162,8 +174,11 @@ func (d *Daemon) runAgentAction(ctx context.Context, a domain.AgentAction) {
 // was delivered when nothing was sent.
 func (d *Daemon) executeAgentAction(ctx context.Context, a domain.AgentAction) (string, error) {
 	switch a.Kind {
+	case domain.AgentActionDeliverReply:
+		return d.deliverReply(ctx, a)
 	default:
-		return "", fmt.Errorf("%w: %q", errActionUnsupported, a.Kind)
+		return "", fmt.Errorf("%w: %q, so it cannot be run by this build. Upgrade with `hap daemon --ensure`",
+			errActionUnsupported, a.Kind)
 	}
 }
 

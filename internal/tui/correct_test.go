@@ -2,12 +2,17 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
@@ -16,14 +21,36 @@ import (
 // fakeHerdrTUI captures Send calls so the "also send?" yes-path can be
 // asserted; ReadPane returns a standing menu for digit mapping.
 type fakeHerdrTUI struct {
+	mu     sync.Mutex
 	inputs []string
 	pane   string
 	agents []domain.AgentTransition // returned by ListAgents (live statuses)
 }
 
+// recordDelivered notes a reply the DAEMON would have typed.
+//
+// The TUI no longer delivers anything itself, so a test can no longer watch a
+// pane to learn whether an operator's answer reached the agent. What it CAN
+// watch is the queue: the stand-in drain below claims each queued delivery and
+// records its action here, which keeps every "must / must not deliver"
+// assertion meaning what it always did. What is typed for a given action —
+// menu digit, answer series, remote-env keystrokes — is covered where it now
+// happens, in internal/daemon's deliverreply tests.
+func (f *fakeHerdrTUI) recordDelivered(action string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inputs = append(f.inputs, action)
+}
+
 func (f *fakeHerdrTUI) Send(_ context.Context, _, input string) error {
-	f.inputs = append(f.inputs, input)
+	f.recordDelivered(input)
 	return nil
+}
+
+func (f *fakeHerdrTUI) delivered() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.inputs...)
 }
 func (f *fakeHerdrTUI) ReadPane(context.Context, string, int) (string, error) { return f.pane, nil }
 func (f *fakeHerdrTUI) ListAgents(context.Context) ([]domain.AgentTransition, error) {
@@ -39,13 +66,76 @@ func correctTestModel(t *testing.T) (Model, *store.Store, *fakeHerdrTUI) {
 	}
 	t.Cleanup(func() { st.Close() })
 	fh := &fakeHerdrTUI{pane: "Do you want to proceed?\n❯ 1. Yes\n  2. No\n"}
+	// A health record that reads as a live daemon: the front end refuses to
+	// queue an action nothing could execute, and these tests are all about
+	// what an operator's keypress does when a daemon IS running.
+	if err := daemonhealth.Write(dir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	app := &frontend.App{
 		Store:      st,
 		Herdr:      fh,
 		ConfigPath: filepath.Join(dir, "config.toml"),
 		Author:     "operator",
+		StateDir:   dir,
+		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version },
 	}
+	startStandInDrain(t, st, fh.recordDelivered)
 	return Model{width: 100, height: 30, app: app, ctx: context.Background()}, st, fh
+}
+
+// makeDaemonLive gives an App a health record that reads as a running daemon.
+//
+// The front end refuses to queue an operator action when nothing could execute
+// it, so any test about what a keypress DOES has to stand a daemon up first.
+func makeDaemonLive(t *testing.T, app *frontend.App, stateDir string) {
+	t.Helper()
+	if err := daemonhealth.Write(stateDir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app.StateDir = stateDir
+	app.DaemonInfo = func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version }
+}
+
+// startStandInDrain plays the daemon's agent-action drain: it claims each
+// queued action, reports the reply it would have typed to record, and finishes
+// the row so the operator's blocking wait returns.
+func startStandInDrain(t *testing.T, st *store.Store, record func(string)) {
+	t.Helper()
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			acts, err := st.PendingAgentActions(context.Background())
+			if err == nil {
+				for _, a := range acts {
+					ok, _ := st.ClaimAgentAction(context.Background(), a.ID, time.Now())
+					if !ok {
+						continue
+					}
+					var p domain.DeliverReplyPayload
+					if json.Unmarshal([]byte(a.Payload), &p) == nil && p.Action != "" {
+						record(p.Action)
+					}
+					if a.CorrectionID != 0 {
+						st.MarkCorrectionSent(context.Background(), a.CorrectionID)
+					}
+					st.FinishAgentAction(context.Background(), a.ID,
+						domain.AgentActionDone, "", "", time.Now())
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
 }
 
 func seedEscalation(t *testing.T, st *store.Store, status string) int64 {

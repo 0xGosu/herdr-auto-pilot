@@ -50,8 +50,26 @@ type Store struct {
 
 // Open opens (creating if needed) the database at path with WAL mode and a
 // busy timeout, and applies migrations.
+// escapeSQLiteURIPath percent-encodes the three characters that mean something
+// to SQLite's URI filename parser.
+//
+// The DSN is built as "file:<path>?<pragmas>", so a path containing '?' or '#'
+// is silently TRUNCATED there and a different database is opened — with no
+// error, and with every caller under that path sharing one file. A '%' has to
+// be escaped first, or escaping the other two would corrupt a literal one.
+//
+// Not hypothetical: Go's t.TempDir() derives its directory from the test name,
+// and a subtest whose name repeats gets a "#01" suffix — so every such test
+// opened one shared database in /tmp, persisting across runs, which is how a
+// newly added column read as "no such column" in a supposedly fresh store.
+func escapeSQLiteURIPath(path string) string {
+	path = strings.ReplaceAll(path, "%", "%25")
+	path = strings.ReplaceAll(path, "?", "%3f")
+	return strings.ReplaceAll(path, "#", "%23")
+}
+
 func Open(path string) (*Store, error) {
-	dsn := "file:" + path + "?" + url.Values{
+	dsn := "file:" + escapeSQLiteURIPath(path) + "?" + url.Values{
 		"_pragma": []string{
 			"busy_timeout(5000)",
 			"journal_mode(WAL)",

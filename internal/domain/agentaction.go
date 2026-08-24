@@ -103,3 +103,21 @@ func ValidAgentActionKind(kind AgentActionKind) bool {
 	}
 	return false
 }
+
+// DeliverReplyPayload is the deliver_reply action's arguments.
+//
+// It lives in domain so the front end that WRITES it and the daemon that READS
+// it share one definition: two structs with matching json tags in two packages
+// is a silent-drift hazard, and the failure mode is an operator's answer that
+// unmarshals to an empty action.
+//
+// The audit id is the only identifier carried. Everything the delivery needs —
+// pane, agent type, situation type, the excerpt the decision was classified
+// from — is read back off the audit row by the daemon, so a front end's stale
+// view of a row can never decide what gets typed.
+type DeliverReplyPayload struct {
+	AuditID int64 `json:"audit_id"`
+	// Action is the operator's answer in its STORED, unmaterialized form.
+	// Sentinels are expanded daemon-side, against the daemon's own audit row.
+	Action string `json:"action"`
+}

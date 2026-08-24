@@ -10,6 +10,7 @@ package frontend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -27,7 +28,6 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
-	"github.com/0xGosu/herdr-auto-pilot/internal/deliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
@@ -694,39 +694,62 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// daemon arms the post-action unblock self-check off the Sent flag, so a
 	// failed pane read / form-validation / keystroke series / Send must never
 	// leave a Sent=true correction (which would fire a bogus delivery_failed).
-	willSend := send && action != domain.ActionNoop && a.Herdr != nil && audit.AgentID != ""
-	corrID, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
-		AuditID: auditID, CorrectedAction: action, Author: a.Author, Sent: false, CreatedAt: time.Now(),
-	})
+	// A confirmed/resolved noop records the correction — the learning event —
+	// but never writes the sentinel into the pane: "do nothing" means exactly
+	// that. An escalation naming no agent has nowhere to deliver to.
+	willSend := send && action != domain.ActionNoop && audit.AgentID != ""
+	if !willSend {
+		if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+			AuditID: auditID, CorrectedAction: action, Author: a.Author, Sent: false, CreatedAt: time.Now(),
+		}); err != nil {
+			return err
+		}
+		a.nudge(ctx, control.KindReload)
+		return nil
+	}
+
+	// Delivery is the DAEMON's. This process no longer touches herdr, so the
+	// answer is queued and the daemon types it — which is what stops two
+	// processes driving one pane, and what finally puts an operator's answer
+	// behind the never-auto screen and the per-agent lifecycle barrier the
+	// daemon's own sends have always had.
+	//
+	// Refused BEFORE anything is written when no daemon could run it: a queued
+	// reply with nothing draining the queue would sit in a healthy-looking
+	// table indefinitely, which is worse than the immediate, visible failure
+	// it replaces.
+	if err := a.requireLiveDaemon(); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(domain.DeliverReplyPayload{AuditID: auditID, Action: action})
 	if err != nil {
 		return err
 	}
-	// markSent flags the correction delivered so the daemon arms the self-check.
-	// Best-effort: the send already succeeded, so a flag-write failure only
-	// skips the (safety-net) check rather than failing the operator's action.
-	markSent := func() { _ = a.Store.MarkCorrectionSent(ctx, corrID) }
-	// A confirmed/resolved noop records the correction — the learning event
-	// — but never writes the sentinel into the pane: "do nothing" means
-	// exactly that.
-	if willSend {
-		// Delivery itself lives in internal/deliver, shared with the daemon's
-		// auto-accept pass so the fail-closed keystroke and menu-mapping logic
-		// exists once. What stays here is what makes this path the OPERATOR's:
-		// the correction bookkeeping above and below, and the nudge. Every
-		// refusal from the deliverer is a bare sentence, so the
-		// "correction recorded, but …" prefix is added in exactly one place.
-		if err := deliver.Deliver(ctx, deliver.Config{Herdr: a.Herdr}, deliver.Request{
-			PaneID:        audit.AgentID,
-			AgentType:     audit.AgentType,
-			SituationType: audit.SituationType,
-			PaneExcerpt:   audit.PaneExcerpt,
-			Outbound:      materializeForSend(action, audit),
-		}); err != nil {
-			return fmt.Errorf("correction recorded, but %w", err)
-		}
-		markSent()
+	// One transaction. The daemon marks a correction processed permanently,
+	// reading its Sent flag on the way past to arm the post-action unblock
+	// self-check; a sweep landing between two separate inserts would process
+	// the correction before its delivery existed, and the check could never
+	// arm for that row.
+	_, actionID, err := a.Store.InsertCorrectionWithDelivery(ctx,
+		domain.CorrectionRecord{
+			AuditID: auditID, CorrectedAction: action, Author: a.Author, CreatedAt: time.Now(),
+		},
+		domain.AgentAction{
+			Kind: domain.AgentActionDeliverReply, Target: audit.AgentID,
+			Payload: string(payload), Author: a.Author, CreatedAt: time.Now(),
+		})
+	if err != nil {
+		return err
 	}
-	a.nudge(ctx, control.KindReload)
+	a.nudge(ctx, control.KindWake)
+
+	// Wait for the daemon's verdict so the operator still learns on the spot
+	// whether their answer landed. Every refusal from the deliverer is a bare
+	// sentence, so the "correction recorded, but …" prefix is still added in
+	// exactly one place.
+	if _, err := a.AwaitAgentAction(ctx, actionID, DefaultActionTimeout); err != nil {
+		return fmt.Errorf("correction recorded, but %w", err)
+	}
 	return nil
 }
 

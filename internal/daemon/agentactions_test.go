@@ -8,8 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
@@ -247,4 +250,25 @@ func (s *recordingActionStore) PendingAgentActions(ctx context.Context) ([]domai
 	*s.order = append(*s.order, "drain")
 	s.mu.Unlock()
 	return s.StorePort.PendingAgentActions(ctx)
+}
+
+// frontendApp builds the operator-side App wired to THIS harness's live daemon:
+// the store it drains, its control socket, and a health record that reads as
+// running.
+//
+// The health record is what makes an operator action possible at all — the
+// front end refuses to queue one when nothing could execute it — and a test
+// driving a real daemon is exactly the case that must pass.
+func (h *harness) frontendApp() *frontend.App {
+	h.t.Helper()
+	stateDir := h.t.TempDir()
+	if err := daemonhealth.Write(stateDir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now(),
+	}); err != nil {
+		h.t.Fatal(err)
+	}
+	return &frontend.App{
+		Store: h.raw, ControlPath: h.ctlPath, Author: "test", StateDir: stateDir,
+		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version },
+	}
 }

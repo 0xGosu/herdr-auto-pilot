@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1540,13 +1541,29 @@ func TestMaxContentWidthCapsRows(t *testing.T) {
 // is what most Tasks-tab tests want; the send path needs a live one, so those
 // harnesses populate it.
 type captureHerdr struct {
+	mu     sync.Mutex
 	sent   []string
 	agents []domain.AgentTransition
 }
 
 func (c *captureHerdr) Send(_ context.Context, _, input string) error {
-	c.sent = append(c.sent, input)
+	c.record(input)
 	return nil
+}
+
+// record notes a reply that reached the agent. The TUI no longer delivers
+// anything itself, so the stand-in drain reports the DAEMON's send here — see
+// startStandInDrain.
+func (c *captureHerdr) record(input string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sent = append(c.sent, input)
+}
+
+func (c *captureHerdr) delivered() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.sent...)
 }
 func (c *captureHerdr) ReadPane(context.Context, string, int) (string, error) { return "", nil }
 func (c *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
@@ -1564,6 +1581,8 @@ func TestEscalationDetailEnterConfirmsAndCloses(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	h := &captureHerdr{}
 	app := &frontend.App{Store: st, Herdr: h, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	makeDaemonLive(t, app, dir)
+	startStandInDrain(t, st, h.record)
 	ctx := context.Background()
 	st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w1:p1", SituationType: domain.SituationApproval, Trigger: "apply?",
@@ -1593,7 +1612,7 @@ func TestEscalationDetailEnterConfirmsAndCloses(t *testing.T) {
 	if !ok || res.err != nil {
 		t.Fatalf("confirm+send should succeed, got %+v (ok=%v)", res, ok)
 	}
-	if len(h.sent) != 1 || h.sent[0] != "Yes" {
+	if got := h.delivered(); len(got) != 1 || got[0] != "Yes" {
 		t.Errorf("expected the suggestion delivered to the agent, got %v", h.sent)
 	}
 }
@@ -1630,6 +1649,8 @@ func TestEscalationDetailEnterConfirmsSnapshotNotClampedCursor(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	h := &captureHerdr{}
 	app := &frontend.App{Store: st, Herdr: h, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	makeDaemonLive(t, app, dir)
+	startStandInDrain(t, st, h.record)
 	ctx := context.Background()
 	idA, _ := st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w1:pA", SituationType: domain.SituationApproval, Trigger: "a",
@@ -1679,7 +1700,7 @@ func TestEscalationDetailEnterConfirmsSnapshotNotClampedCursor(t *testing.T) {
 	if !strings.Contains(res.message, fmt.Sprintf("#%d", idB)) {
 		t.Errorf("should confirm the displayed escalation #%d, message was %q", idB, res.message)
 	}
-	if len(h.sent) != 1 || h.sent[0] != "Banana" {
+	if got := h.delivered(); len(got) != 1 || got[0] != "Banana" {
 		t.Errorf("should deliver B's suggestion, got %v", h.sent)
 	}
 	_ = idA
