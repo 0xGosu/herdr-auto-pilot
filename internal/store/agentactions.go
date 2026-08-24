@@ -235,3 +235,35 @@ func (s *Store) InsertCorrectionWithDelivery(ctx context.Context, c domain.Corre
 	})
 	return correctionID, actionID, err
 }
+
+// DeleteCorrection removes an unprocessed correction, returning whether it
+// existed. It is the compensating write for a delivery the SAFETY controls
+// refused.
+//
+// Without it a vetoed reply still clears the operator's queue: applyCorrection
+// ends by flipping the audit row to "resolved" whatever the delivery did, so a
+// never-auto match would leave the escalation gone, nothing typed, and the
+// agent still blocked — the one outcome FR-015 exists to prevent.
+//
+// Deleting rather than keeping is deliberate. A correction is the record of an
+// action hap TOOK; a refused answer is one it declined to take, and learning
+// from it would graduate a rule toward a reply the safety controls will refuse
+// every time. Guarded on processed = 0 so it can only ever remove a row the
+// daemon has not acted on.
+func (s *Store) DeleteCorrection(ctx context.Context, id int64) (bool, error) {
+	var deleted bool
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM corrections WHERE id = ? AND processed = 0`, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		deleted = n > 0
+		return nil
+	})
+	return deleted, err
+}

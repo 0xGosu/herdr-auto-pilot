@@ -364,8 +364,9 @@ func (s *Store) migrate() error {
 		`ALTER TABLE llm_decisions ADD COLUMN task_actions_json TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_decisions ADD COLUMN send_task TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_requests ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''`,
-		// sent = 1 when the front-end delivered the correction to the agent;
-		// drives the daemon's post-action unblock self-check.
+		// sent = 1 when the correction actually reached the agent pane;
+		// drives the daemon's post-action unblock self-check. Written by the
+		// daemon after its own delivery (front ends record it unsent).
 		`ALTER TABLE corrections ADD COLUMN sent INTEGER NOT NULL DEFAULT 0`,
 		// Per-signature decision-id floor: decisions with id <= this are kept
 		// but excluded from confidence/graduation (stamped by an operator reset).

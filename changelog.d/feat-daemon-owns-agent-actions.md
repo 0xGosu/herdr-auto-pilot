@@ -8,6 +8,10 @@
   daemon, and to say so with the `hap daemon --ensure` remedy rather than
   recording a correction for a reply nothing will deliver. Confirming without
   `--send`, dismissing, and every config command still work with no daemon.
+- Fixed a confirmed reply that a never-auto or suspected-irreversible rule
+  refuses clearing its escalation anyway. Nothing was typed, the agent stayed
+  blocked, and the row left the queue — so there was nothing left to look at.
+  The refusal now leaves the escalation where a human will see it.
 - Fixed hap opening the wrong SQLite database when its state directory path
   contained `?` or `#`. The path was pasted into a URI DSN unescaped, so it was
   truncated at that character — silently, with no error, and with every caller

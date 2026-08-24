@@ -507,3 +507,67 @@ func TestQueuedReplyToAClosedRemoteEnvPickerFailsClosed(t *testing.T) {
 			h.herdr.keysSent(), h.herdr.sentInputs())
 	}
 }
+
+// FR-015: a never-auto match always reaches a human. A refused reply must
+// therefore leave its escalation IN the operator's queue.
+//
+// applyCorrection ends by flipping its audit row to "resolved" whatever the
+// delivery did, so a correction left behind for a vetoed answer would clear the
+// escalation with nothing typed and the agent still blocked — and the operator
+// would have no row left to look at. This branch is new with the move: an
+// operator's reply had never been screened before.
+func TestARefusedReplyLeavesItsEscalationPending(t *testing.T) {
+	h := newHarness(t, "[[rules]]\nsituation = \"*\"\nnever_auto = [\"rm -rf\"]\n")
+	ctx := context.Background()
+	h.herdr.setPane("Enter a command:\n> ")
+	auditID := h.seedEscalation(domain.AuditRecord{
+		AgentID: "a1", Signature: "sig", SituationType: domain.SituationApproval,
+		Suggestion: "respond: y",
+	})
+
+	payload, _ := json.Marshal(domain.DeliverReplyPayload{AuditID: auditID, Action: "rm -rf /"})
+	corrID, actID, err := h.raw.InsertCorrectionWithDelivery(ctx,
+		domain.CorrectionRecord{AuditID: auditID, CorrectedAction: "rm -rf /", CreatedAt: time.Now()},
+		domain.AgentAction{Kind: domain.AgentActionDeliverReply, Target: "a1", Payload: string(payload), CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Nudge(ctx, h.ctlPath, control.KindWake); err != nil {
+		t.Fatal(err)
+	}
+	got := h.awaitAction(actID)
+	if got.Status != domain.AgentActionFailed {
+		t.Fatalf("status = %q, want failed", got.Status)
+	}
+
+	// The correction is withdrawn, so nothing will ever resolve the row for an
+	// answer that was never delivered.
+	if c, _ := h.raw.AgentActionByID(ctx, actID); c == nil {
+		t.Fatal("the action row itself must survive — the operator polls it")
+	}
+	corrections, err := h.raw.UnprocessedCorrections(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range corrections {
+		if c.ID == corrID {
+			t.Fatalf("the refused reply's correction is still queued (%+v); it will resolve the escalation", c)
+		}
+	}
+
+	// Give the sweep every chance to resolve it, then check the queue.
+	if err := control.Nudge(ctx, h.ctlPath, control.KindWake); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	rec, err := h.raw.GetAudit(ctx, auditID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != "escalated" {
+		t.Fatalf("audit status = %q; a vetoed reply must leave the escalation for a human", rec.Status)
+	}
+	if n := len(h.herdr.sentInputs()); n != 0 {
+		t.Errorf("sent %d inputs; nothing may reach the pane", n)
+	}
+}

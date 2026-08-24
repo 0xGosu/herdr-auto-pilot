@@ -470,6 +470,10 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		ControlPath: paths.ControlSocketPath(),
 		Author:      "daemon",
 		StateDir:    paths.StateDir,
+		// This App runs INSIDE the daemon, on its select loop. Without the
+		// flag it would refuse its own actions (no lock file to read) and
+		// deadlock on any it queued.
+		InDaemon: true,
 	}
 
 	d, err := daemon.New(daemon.Options{

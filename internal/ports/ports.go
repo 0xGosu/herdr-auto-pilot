@@ -349,6 +349,10 @@ type DaemonStore interface {
 	// so a row left there would be invisible to the drain forever while the
 	// surface that queued it polls to its timeout.
 	PendingAgentActions(ctx context.Context) ([]domain.AgentAction, error)
+	// DeleteCorrection removes an unprocessed correction — the compensating
+	// write for a delivery the safety controls refused, so a vetoed reply
+	// cannot resolve the escalation it was never delivered for.
+	DeleteCorrection(ctx context.Context, id int64) (bool, error)
 	ClaimAgentAction(ctx context.Context, id int64, now time.Time) (bool, error)
 	FinishAgentAction(ctx context.Context, id int64, status domain.AgentActionStatus, errText, result string, now time.Time) (bool, error)
 	ReleaseAgentAction(ctx context.Context, id int64, now time.Time) (bool, error)
@@ -494,10 +498,11 @@ type FrontendStore interface {
 	// it done with sent=0 so the post-action unblock check could never arm.
 	InsertCorrectionWithDelivery(ctx context.Context, c domain.CorrectionRecord, a domain.AgentAction) (correctionID, actionID int64, err error)
 	InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error)
-	// MarkCorrectionSent flags a recorded correction as delivered to the agent
-	// (front-ends record the correction first, then flip this once delivery
-	// succeeds), so the daemon arms the post-action unblock self-check only for
-	// corrections that actually reached the pane.
+	// MarkCorrectionSent flags a recorded correction as delivered to the
+	// agent. The DAEMON calls it once its own delivery succeeds — a front end
+	// records the correction unsent and queues the delivery — so the
+	// post-action unblock self-check is armed only for corrections that
+	// actually reached the pane.
 	MarkCorrectionSent(ctx context.Context, id int64) error
 	// InsertLLMRetry queues a request to re-invoke the LLM on an escalation
 	// whose consult failed/timed out; the daemon drains it on reload.

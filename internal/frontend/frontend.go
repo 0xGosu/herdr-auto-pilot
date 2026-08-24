@@ -43,6 +43,20 @@ type App struct {
 	ConfigPath  string
 	ControlPath string
 	Author      string
+	// InDaemon marks the App the DAEMON builds for itself (cmd/hap's fspApp,
+	// which full self-prompting calls back through). It is not an optimization
+	// and must be set on that App only.
+	//
+	// Two things go wrong without it. The liveness precondition would refuse:
+	// this App has no DaemonInfo, because the daemon does not read its own lock
+	// file, so AssessDaemonHealth reports "not running" and the daemon would
+	// decline to act on the grounds that no daemon is running. And anything
+	// that queued an action and awaited it would DEADLOCK — the seams run on
+	// the daemon's own select loop, which is the goroutine that drains the
+	// queue, so it would wait for work only it could do.
+	//
+	// So an in-daemon App never queues: it calls the executor's work directly.
+	InDaemon bool
 	// DaemonInfo reports the running daemon's identity from the lock file
 	// (daemonlock.Info in prod); nil hides the daemon line in status.
 	DaemonInfo func() (running bool, pid int, version string)

@@ -52,6 +52,7 @@ func (d *Daemon) deliverReply(ctx context.Context, a domain.AgentAction) (string
 	// carries none of the words a rule matches on, while the prompt that
 	// actually reaches the pane does.
 	if err := d.screenOutbound(audit.AgentType, outbound); err != nil {
+		d.dropRefusedCorrection(ctx, a)
 		return "", fmt.Errorf("%w: %v", errOutboundRefused, err)
 	}
 
@@ -99,5 +100,29 @@ func (d *Daemon) deliverToPane(ctx context.Context, audit *domain.AuditRecord, a
 		return fmt.Errorf("agent %s is disabled for automation; re-enable it and answer again", audit.AgentID)
 	default:
 		return err
+	}
+}
+
+// dropRefusedCorrection removes the correction paired with a reply the safety
+// controls refused, so the escalation stays in the operator's queue.
+//
+// applyCorrection ends by flipping its audit row to "resolved" whatever the
+// delivery did. Leaving the correction in place would therefore clear the
+// escalation for an answer that never reached the agent — with the agent still
+// blocked and nothing to show the operator why. FR-015 says a never-auto match
+// always reaches a human, so the refusal has to leave the row where a human
+// will see it.
+//
+// This branch is NEW with the move: an operator's reply had never been screened
+// before, because the daemon's own sends are screened at Decide time and an
+// operator authors theirs afterwards.
+func (d *Daemon) dropRefusedCorrection(ctx context.Context, a domain.AgentAction) {
+	if a.CorrectionID == 0 {
+		return
+	}
+	if _, err := d.opt.Store.DeleteCorrection(ctx, a.CorrectionID); err != nil {
+		slog.Error("agent actions: a refused reply's correction could not be withdrawn; "+
+			"the escalation may be resolved without ever being answered",
+			"correction", a.CorrectionID, "error", err)
 	}
 }

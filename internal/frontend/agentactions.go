@@ -46,6 +46,11 @@ const DefaultActionTimeout = 30 * time.Second
 // A HUNG daemon is refused too. It holds the lock, so it looks alive, but it is
 // by definition not draining anything.
 func (a *App) requireLiveDaemon() error {
+	if a.InDaemon {
+		// This IS the daemon. It has no lock file of its own to read, and it
+		// must never wait on a queue only it can drain — see App.InDaemon.
+		return nil
+	}
 	h := a.AssessDaemonHealth()
 	switch {
 	case !h.Running:
