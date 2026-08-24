@@ -340,6 +340,20 @@ type DaemonStore interface {
 	// disabled=true without calling fn when the operator disabled the agent.
 	WithAgentAutomation(ctx context.Context, agentID string, fn func()) (disabled bool, err error)
 
+	// The agent-action queue's daemon half: claim a pending row, write its
+	// terminal outcome, hand a claim back when it could not be carried
+	// through, and recover claims a crash left behind.
+	//
+	// ReclaimRunningAgentActions runs at daemon START and is not optional:
+	// 'running' means "a daemon holds this claim", and at startup none does,
+	// so a row left there would be invisible to the drain forever while the
+	// surface that queued it polls to its timeout.
+	PendingAgentActions(ctx context.Context) ([]domain.AgentAction, error)
+	ClaimAgentAction(ctx context.Context, id int64, now time.Time) (bool, error)
+	FinishAgentAction(ctx context.Context, id int64, status domain.AgentActionStatus, errText, result string, now time.Time) (bool, error)
+	ReleaseAgentAction(ctx context.Context, id int64, now time.Time) (bool, error)
+	ReclaimRunningAgentActions(ctx context.Context, now time.Time) (int64, error)
+
 	UpsertSignature(ctx context.Context, s domain.SignatureState) error
 	// EnsureSignature atomically creates a fresh signature state row if none
 	// exists yet (INSERT OR IGNORE) — never touching an existing row. The
@@ -469,6 +483,16 @@ type FrontendStore interface {
 	RecordTaskReservation(ctx context.Context, r domain.TaskReservation) (int64, error)
 	DeleteTaskReservation(ctx context.Context, id int64) error
 
+	// EnqueueAgentAction queues an action for the DAEMON to perform against a
+	// live agent. Front ends do not touch herdr, so anything reaching a pane
+	// goes through here; the caller nudges afterwards and polls the row for
+	// the outcome, which is the only readback a reply-less socket allows.
+	EnqueueAgentAction(ctx context.Context, a domain.AgentAction) (int64, error)
+	// InsertCorrectionWithDelivery records a correction AND queues its
+	// delivery in ONE transaction. Separate inserts would let a sweep landing
+	// between them process the correction before the delivery exists, marking
+	// it done with sent=0 so the post-action unblock check could never arm.
+	InsertCorrectionWithDelivery(ctx context.Context, c domain.CorrectionRecord, a domain.AgentAction) (correctionID, actionID int64, err error)
 	InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error)
 	// MarkCorrectionSent flags a recorded correction as delivered to the agent
 	// (front-ends record the correction first, then flip this once delivery
@@ -551,6 +575,9 @@ type BatchDecisionReader interface {
 
 // ReadStore is the shared read surface.
 type ReadStore interface {
+	// AgentActionByID reads one queued action, nil when absent. Shared: the
+	// daemon executes actions, the front ends poll this for the outcome.
+	AgentActionByID(ctx context.Context, id int64) (*domain.AgentAction, error)
 	GetSignature(ctx context.Context, signature string) (*domain.SignatureState, error)
 	DecisionsForSignature(ctx context.Context, signature string, limit int) ([]domain.DecisionRecord, error)
 	// CountDecisionsForSignature counts ALL of a signature's decisions, with no

@@ -1087,6 +1087,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// failed front-end nudge is non-fatal by design), and keep a slow
 	// periodic sweep as a safety net.
 	logging.Guard("startup-corrections", func() error {
+		// Before anything reads a correction's Sent flag: a 'running' agent
+		// action is a claim no live daemon holds (this one has not claimed
+		// anything yet), so a row a crash left there would be invisible to the
+		// drain forever while the surface that queued it polls to its timeout.
+		if n, err := d.opt.Store.ReclaimRunningAgentActions(ctx, d.opt.Clock.Now()); err != nil {
+			slog.Warn("agent actions: abandoned claims could not be reclaimed at startup", "error", err)
+		} else if n > 0 {
+			slog.Info("agent actions: returned abandoned claims to the queue", "count", n)
+		}
+		d.processAgentActions(ctx)
 		d.processCorrections(ctx)
 		d.processLLMRetries(ctx)
 		d.expireStaleLLMWork(ctx)
@@ -1147,6 +1157,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				// Self-throttled to once a day and does its work on a
 				// background goroutine; the call itself is a clock compare.
 				d.maybePruneAuditExcerpts(d.opt.Clock.Now())
+				// Ahead of processCorrections: a delivered reply flips its
+				// correction's Sent flag, and processCorrections both READS
+				// that flag (to arm the unblock check) and marks the row
+				// processed for good.
+				d.processAgentActions(ctx)
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)
@@ -1202,6 +1217,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 						d.reloadWith(true)
 					}
 				}
+				d.processAgentActions(ctx)
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)
