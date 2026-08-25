@@ -1335,7 +1335,17 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		return nil
 	case "set":
 		if len(args) < 3 {
-			return fmt.Errorf("usage: config set <field> <value> (see: config fields)")
+			return fmt.Errorf("usage: config set <field> <value>, or config set <llm command field> --preset <claude|codex> (see: config fields)")
+		}
+		// --preset is intercepted BEFORE the join below, which would otherwise
+		// flatten it into the value and store the literal string "--preset
+		// claude" as a one-word argv template. It bootstraps one of the three
+		// [llm] command fields that ship disabled with the built-in recipe for
+		// a supported CLI, because the alternative — retyping a ~1 KB prompt
+		// onto this line — is not a real one. Only an UNSET field takes one;
+		// changing a configured command stays a config.toml job.
+		if args[2] == "--preset" {
+			return configSetPreset(ctx, app, out, args[1], args[3:])
 		}
 		value := strings.Join(args[2:], " ")
 		// A moved key still resolves; say so once, on STDERR, for the same

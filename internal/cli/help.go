@@ -663,6 +663,7 @@ func buildCommands() {
 				"hap config fields",
 				"hap config path",
 				"hap config set <field> <value>",
+				"hap config set <llm command field> --preset <claude|codex>",
 				"hap config set-threshold <minimum|idle|approval|choice|error> <value>",
 				"hap config env [list [<scope>]]",
 				"hap config env set <scope> <NAME> [--value V]",
@@ -674,6 +675,7 @@ func buildCommands() {
 			},
 			Flags: []FlagDoc{
 				{Name: "--value", Arg: "V", Desc: "config env set: the value; omit it and the value is read from stdin, which keeps a secret out of shell history and `ps`"},
+				{Name: "--preset", Arg: "NAME", Desc: "config set: install a built-in claude or codex recipe into an UNSET llm.command / llm.task_generate_command / llm.learn_from_user_command; refused once the field is configured"},
 			},
 			Details: "Every command that writes config.toml lives here — nothing else in hap does,\n" +
 				"so `hap config …` is the whole surface and the file never has to be opened by\n" +
@@ -684,6 +686,11 @@ func buildCommands() {
 				"`fields` lists every settable field with its current value — that is the\n" +
 				"authoritative list of names for `set` (dotted, e.g. llm.timeout_seconds).\n" +
 				"`set` writes config.toml and reloads the running daemon; no restart needed.\n" +
+				"The three [llm] command fields ship as \"(disabled)\" and their argv is far too\n" +
+				"long to retype, so `set <field> --preset claude` (or codex) installs the\n" +
+				"built-in recipe for that CLI. It only ever bootstraps a field nobody has\n" +
+				"configured: once one is set, tuning it is a config.toml edit, and the same\n" +
+				"picker is on the TUI's Config tab (press e on a \"(disabled)\" row).\n" +
 				"`set-threshold` is the shorthand for confidence_thresholds.*: how confident a\n" +
 				"rule must be before hap answers that situation type on its own.\n" +
 				"`path` prints the config file location, bare, for scripting.\n\n" +

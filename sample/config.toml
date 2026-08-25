@@ -111,6 +111,17 @@ unclassifiable = "0"       # disabled: hap never understood the screen at all
 # Two recipes are shown below — Claude Code is active; the OpenAI Codex
 # equivalent is commented out. Enable ONE `command` (comment the Claude
 # keys and uncomment the Codex ones to switch).
+#
+# You do not have to copy any of this by hand. The three commands that ship
+# DISABLED — `command`, `task_generate_command` and `learn_from_user_command`
+# — carry the recipes below as built-in PRESETS: run
+#   hap config set llm.command --preset claude      (or: --preset codex)
+# or press `e` on a "(disabled)" row in the TUI's Config tab and pick a CLI.
+# A preset only ever bootstraps a command nobody has configured; once one is
+# set, changing it is an edit here, and a preset will refuse to overwrite it.
+# The Claude recipes for `command` and `task_generate_command` below are held
+# byte-identical to the presets by a test — the four commented-out ones are
+# the same text the presets install.
 [llm]
 # ── Claude Code recipe (active) ──
 # {self} = the hap binary, {request_id} is filled per consult, {agent_name}

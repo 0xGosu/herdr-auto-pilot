@@ -5058,6 +5058,18 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	default:
 		return m, nil
 	}
+	// An LLM command that is not configured at all is the one free-text field
+	// the TUI can safely write, and it is a BOOTSTRAP, not an edit: the
+	// operator picks a CLI and hap installs that CLI's built-in recipe
+	// verbatim. Nothing is typed, so CR-036's hazard — a one-line prompt
+	// round-trip mangling an argv template — never arises. This runs BEFORE
+	// the read-only gate below and deliberately falls through to it once the
+	// key IS set: changing a configured command stays a config.toml job.
+	if frontend.HasLLMPresets(item.key) {
+		if unset, _ := frontend.LLMCommandUnset(m.data.cfg, item.key); unset {
+			return m.llmPresetPrompt(item.key)
+		}
+	}
 	// Free-text fields (argv templates, template strings, paths) are
 	// read-only in the TUI (CR-036): the one-line prompt round-trip mangles
 	// them. `hap config set` still accepts every key.
@@ -5385,6 +5397,43 @@ func (m Model) taskSourceBoolPrompt(index int, field string, cur bool,
 					return actionResultMsg{message: fmt.Sprintf("task source #%d: %s", index, onMsg)}
 				}
 				return actionResultMsg{message: fmt.Sprintf("task source #%d: %s", index, offMsg)}
+			}
+		},
+	})
+	return m, nil
+}
+
+// llmPresetPrompt opens the CLI picker for an UNSET LLM command field
+// (llm.command, llm.task_generate_command, llm.learn_from_user_command — the
+// three that render "(disabled)"). Choosing installs that CLI's built-in
+// recipe; the field is then read-only again, like every other argv template.
+//
+// The chosen option string is the preset NAME, and ApplyLLMPreset writes the
+// argv slice straight into config.toml. It deliberately does NOT go through
+// SetField: these recipes carry apostrophes, embedded double quotes and real
+// newlines that SplitCommand cannot round-trip (see ApplyLLMPreset).
+func (m Model) llmPresetPrompt(key string) (tea.Model, tea.Cmd) {
+	app, ctx := m.app, m.ctx
+	m.beginAction()
+	m.openPrompt(&prompt{
+		label:   fmt.Sprintf("%s is not configured — install a default recipe (↑/↓ then enter, esc to cancel)", key),
+		options: frontend.LLMPresetNames,
+		onSubmit: func(preset string) tea.Cmd {
+			return func() tea.Msg {
+				reloaded, err := app.ApplyLLMPreset(ctx, key, preset)
+				if err != nil {
+					return actionResultMsg{err: err}
+				}
+				msg := fmt.Sprintf("%s set to the %s default recipe — edit config.toml to tune it", key, preset)
+				if !reloaded {
+					msg += " (saved — no daemon running)"
+				}
+				// What the preset installs only half of, worded once in the
+				// frontend so this and the CLI cannot drift apart.
+				if note := frontend.LLMPresetFollowUp(key); note != "" {
+					msg += " — note: " + note
+				}
+				return actionResultMsg{message: msg}
 			}
 		},
 	})
