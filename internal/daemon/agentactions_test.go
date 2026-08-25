@@ -212,18 +212,6 @@ func TestTheActionDrainRunsBeforeCorrectionsInRecurringPasses(t *testing.T) {
 	}
 }
 
-func allIndexes(s, sub string) []int {
-	var out []int
-	for i := 0; ; {
-		j := strings.Index(s[i:], sub)
-		if j < 0 {
-			return out
-		}
-		out = append(out, i+j)
-		i += j + len(sub)
-	}
-}
-
 // A 'running' row is a claim some daemon holds. At startup none does, so a row
 // a crash left there is invisible to the drain — which only ever reads pending
 // rows — while the surface that queued it polls to its timeout. Startup must
