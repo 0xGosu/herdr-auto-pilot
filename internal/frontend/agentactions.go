@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
@@ -63,32 +62,6 @@ func (a *App) requireLiveDaemon() error {
 			ErrDaemonUnavailable)
 	}
 	return nil
-}
-
-// queueAgentAction refuses early if no daemon can run the action, writes the
-// row, and nudges.
-//
-// The nudge is KindWake rather than KindReload on purpose: waking has no case
-// in the daemon's switch and falls straight to the drain tail, so an operator
-// action no longer forces a full config reload with its classifier, LLM adapter
-// and embedder rebuild. A lost nudge costs only latency — the periodic sweep
-// drains the same queue.
-func (a *App) queueAgentAction(ctx context.Context, act domain.AgentAction) (int64, error) {
-	if err := a.requireLiveDaemon(); err != nil {
-		return 0, err
-	}
-	if act.Author == "" {
-		act.Author = a.Author
-	}
-	if act.CreatedAt.IsZero() {
-		act.CreatedAt = time.Now()
-	}
-	id, err := a.Store.EnqueueAgentAction(ctx, act)
-	if err != nil {
-		return 0, err
-	}
-	a.nudge(ctx, control.KindWake)
-	return id, nil
 }
 
 // AwaitAgentAction blocks until a queued action reaches a terminal status and

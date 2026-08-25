@@ -197,8 +197,8 @@ func TestCorrectLiveRecordOnlyPath(t *testing.T) {
 	if len(corr) != 1 || corr[0].Sent {
 		t.Errorf("record-only correction should be Sent=false: %+v", corr)
 	}
-	if len(fh.inputs) != 0 {
-		t.Errorf("answering 'n' must not deliver anything, got %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("answering 'n' must not deliver anything, got %v", fh.delivered())
 	}
 }
 
@@ -219,8 +219,8 @@ func TestCorrectLiveSendPath(t *testing.T) {
 	if len(corr) != 1 || !corr[0].Sent {
 		t.Errorf("sent correction should be Sent=true: %+v", corr)
 	}
-	if len(fh.inputs) != 1 {
-		t.Errorf("answering 'y' should deliver exactly one keystroke, got %v", fh.inputs)
+	if len(fh.delivered()) != 1 {
+		t.Errorf("answering 'y' should deliver exactly one keystroke, got %v", fh.delivered())
 	}
 }
 
@@ -240,7 +240,7 @@ func TestCorrectNonLiveRecordsWithoutSendPrompt(t *testing.T) {
 	if len(corr) != 1 || corr[0].Sent {
 		t.Errorf("non-live correction should be Sent=false: %+v", corr)
 	}
-	if len(fh.inputs) != 0 {
-		t.Errorf("non-live correction must not deliver, got %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("non-live correction must not deliver, got %v", fh.delivered())
 	}
 }

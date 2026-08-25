@@ -1924,12 +1924,6 @@ func SuggestedAction(audit *domain.AuditRecord) string {
 	return domain.SuggestedAction(audit)
 }
 
-// materializeForSend converts symbolic learned actions into the concrete
-// suggestion text when the reply is actually to be sent.
-func materializeForSend(action string, audit *domain.AuditRecord) string {
-	return domain.MaterializeForSend(action, audit)
-}
-
 // Config returns the current operator configuration.
 func (a *App) Config() (config.Config, error) {
 	if a.LoadConfig != nil {
