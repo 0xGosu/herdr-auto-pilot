@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.6.19
+
+- Added built-in `claude` and `codex` recipes for the three LLM commands that ship disabled (`llm.command`, `llm.task_generate_command`, `llm.learn_from_user_command`) — press `e` on a `(disabled)` row in the TUI's Config tab and pick a CLI, or run `hap config set <field> --preset claude|codex`. They install the same argv `sample/config.toml` documents, so turning the operator LLM on no longer means retyping a kilobyte-long prompt.
+- A preset only bootstraps a command that is not configured: a field that already carries argv is refused and stays read-only in the TUI, so tuning one remains a `config.toml` edit and nothing can overwrite a template you wrote.
+- Installing the `llm.task_generate_command` preset now says what it does not cover: refilling an exhausted declared task source additionally needs `llm.task_generate_command_start`, a separate opt-in that reads `(inherits …)` until you set it.
+- `hap config set <field> --preset …` is dispatched on the FIELD, so `--preset` stays an ordinary literal value for every key that has no presets, exactly as before.
+
 ## 0.6.18
 
 - Changed confirming an escalation with `--send`: the reply is now typed by the
