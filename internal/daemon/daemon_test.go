@@ -18,7 +18,6 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/classify"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
-	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
@@ -485,6 +484,29 @@ type failingStore struct {
 	// which is how a row gets stranded in the transient 'auto_accepting' status
 	// — invisible to both the operator's queue and the candidate query.
 	failRevert bool
+	// failGetAudit makes reading an audit row fail. It is how a MACHINERY
+	// fault is induced on the agent-action path: the request itself is fine,
+	// so the action must be retried rather than reported as a bad answer.
+	// Counted, so a test can let a fault clear after N reads.
+	failGetAudit  bool
+	getAuditCalls int
+}
+
+func (s *failingStore) GetAudit(ctx context.Context, id int64) (*domain.AuditRecord, error) {
+	s.mu.Lock()
+	s.getAuditCalls++
+	fail := s.failGetAudit
+	s.mu.Unlock()
+	if fail {
+		return nil, errors.New("induced audit read failure")
+	}
+	return s.StorePort.GetAudit(ctx, id)
+}
+
+func (s *failingStore) setFailGetAudit(v bool) {
+	s.mu.Lock()
+	s.failGetAudit = v
+	s.mu.Unlock()
 }
 
 func (s *failingStore) RevertAutoAccept(ctx context.Context, auditID int64) (bool, error) {
@@ -1153,7 +1175,7 @@ func TestFirstOperatorDecisionFloorsPriorLLMGuesses(t *testing.T) {
 		t.Fatalf("fixture must be contradictory (<0.5) to be meaningful, got %.3f", got)
 	}
 
-	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	app := h.frontendApp()
 	h.push("agent-floor", "blocked")
 	var esc domain.AuditRecord
 	waitFor(t, 3*time.Second, func() bool {
@@ -1219,7 +1241,7 @@ func TestFirstOperatorCorrectionFloorsLLMHistoryDespiteExistingRow(t *testing.T)
 		t.Fatalf("seed history: %d rows, %v", len(before), err)
 	}
 
-	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	app := h.frontendApp()
 	h.push("agent-floor-row", "blocked")
 	var esc domain.AuditRecord
 	waitFor(t, 3*time.Second, func() bool {
@@ -1302,7 +1324,7 @@ func TestCorrectionFloorsPostResetLLMGuesses(t *testing.T) {
 		t.Fatalf("seed history: %d rows, %v", len(before), err)
 	}
 
-	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	app := h.frontendApp()
 	h.push("agent-reset-floor", "blocked")
 	var esc domain.AuditRecord
 	waitFor(t, 3*time.Second, func() bool {
@@ -1356,7 +1378,7 @@ func TestCorrectingLLMAutoRowWithNoRuleStartsStreak(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	app := h.frontendApp()
 	if err := app.Resolve(ctx, auditID, "Yes", false); err != nil {
 		t.Fatal(err)
 	}
@@ -1398,7 +1420,7 @@ func TestCorrectingGraduatedRuleKeepsFrozenStreak(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	app := h.frontendApp()
 	// Correct it to a DIFFERENT action — the case most likely to demote.
 	if err := app.Resolve(ctx, auditID, "No", false); err != nil {
 		t.Fatal(err)
@@ -1478,7 +1500,7 @@ func TestConfirmDrivenShadowToAutoPromotion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	app := h.frontendApp()
 
 	// Phase 1: each shadow escalation is confirmed record-only (like
 	// `hap confirm` — a learning event, no pane send), growing the rule until
@@ -2395,7 +2417,7 @@ func TestRunawayGuardPausesAgent(t *testing.T) {
 	h.herdr.setAgents([]domain.AgentTransition{{
 		AgentID: "agent-8", PaneID: "agent-8", AgentType: "claude", Status: "working",
 	}})
-	app := frontend.App{Store: h.raw, Herdr: h.herdr, ControlPath: h.ctlPath, Author: "test"}
+	app := h.frontendApp()
 	if err := app.Confirm(context.Background(), escalation.ID, true); err != nil {
 		t.Fatal(err)
 	}

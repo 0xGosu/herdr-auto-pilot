@@ -50,8 +50,26 @@ type Store struct {
 
 // Open opens (creating if needed) the database at path with WAL mode and a
 // busy timeout, and applies migrations.
+// escapeSQLiteURIPath percent-encodes the three characters that mean something
+// to SQLite's URI filename parser.
+//
+// The DSN is built as "file:<path>?<pragmas>", so a path containing '?' or '#'
+// is silently TRUNCATED there and a different database is opened — with no
+// error, and with every caller under that path sharing one file. A '%' has to
+// be escaped first, or escaping the other two would corrupt a literal one.
+//
+// Not hypothetical: Go's t.TempDir() derives its directory from the test name,
+// and a subtest whose name repeats gets a "#01" suffix — so every such test
+// opened one shared database in /tmp, persisting across runs, which is how a
+// newly added column read as "no such column" in a supposedly fresh store.
+func escapeSQLiteURIPath(path string) string {
+	path = strings.ReplaceAll(path, "%", "%25")
+	path = strings.ReplaceAll(path, "?", "%3f")
+	return strings.ReplaceAll(path, "#", "%23")
+}
+
 func Open(path string) (*Store, error) {
-	dsn := "file:" + path + "?" + url.Values{
+	dsn := "file:" + escapeSQLiteURIPath(path) + "?" + url.Values{
 		"_pragma": []string{
 			"busy_timeout(5000)",
 			"journal_mode(WAL)",
@@ -257,6 +275,45 @@ CREATE TABLE IF NOT EXISTS task_reservations (
 	confirmed_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_task_res_agent ON task_reservations(agent_id);
+-- Operator-requested actions the DAEMON must perform against a live agent.
+-- The front ends may not touch herdr, so a confirmed reply, a task hand-out, a
+-- permission-mode change and a manual capture are all queued here and drained
+-- by the daemon. The control socket carries no reply channel, which is why the
+-- row itself carries status/error/result: that is the ONLY way the surface that
+-- queued the action can learn whether it landed.
+CREATE TABLE IF NOT EXISTS agent_actions (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	kind TEXT NOT NULL,
+	target TEXT NOT NULL DEFAULT '',
+	payload_json TEXT NOT NULL DEFAULT '',
+	-- The correction this action delivers, 0 for kinds that deliver none.
+	-- An explicit column rather than a field inside payload_json because the
+	-- correction drain must JOIN on it: a correction whose delivery is still
+	-- queued must not be processed yet (see UnprocessedCorrections).
+	correction_id INTEGER NOT NULL DEFAULT 0,
+	-- Herdr's terminal identity for the target pane, as it stood when the
+	-- action was queued. Herdr RECYCLES pane ids, so a pane id alone is not an
+	-- address: between queueing and delivery the terminal behind it can be
+	-- replaced, and the reply would be typed at a stranger. Empty means "not
+	-- observed", which is not evidence of sameness and is never treated as a
+	-- match. Same doctrine as task_reservations.terminal_id.
+	terminal_id TEXT NOT NULL DEFAULT '',
+	-- 1 once this action may already have had its side effect — set
+	-- IMMEDIATELY BEFORE the keystrokes, so a daemon that dies between the
+	-- send and the outcome write leaves evidence behind. Delivery is not
+	-- idempotent, so such a row must never be replayed; the startup reclaim
+	-- fails it instead of returning it to the queue.
+	side_effect INTEGER NOT NULL DEFAULT 0,
+	author TEXT NOT NULL DEFAULT 'operator',
+	status TEXT NOT NULL DEFAULT 'pending',
+	error TEXT NOT NULL DEFAULT '',
+	result_json TEXT NOT NULL DEFAULT '',
+	attempts INTEGER NOT NULL DEFAULT 0,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status, id);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_correction ON agent_actions(correction_id);
 -- Per-item hand-out counter, kept SEPARATELY from task_reservations so it
 -- survives the reservation row being retired on every reclaim. It is what caps
 -- an item that can never be delivered from being resent forever.
@@ -320,8 +377,9 @@ func (s *Store) migrate() error {
 		`ALTER TABLE llm_decisions ADD COLUMN task_actions_json TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_decisions ADD COLUMN send_task TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE llm_requests ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''`,
-		// sent = 1 when the front-end delivered the correction to the agent;
-		// drives the daemon's post-action unblock self-check.
+		// sent = 1 when the correction actually reached the agent pane;
+		// drives the daemon's post-action unblock self-check. Written by the
+		// daemon after its own delivery (front ends record it unsent).
 		`ALTER TABLE corrections ADD COLUMN sent INTEGER NOT NULL DEFAULT 0`,
 		// Per-signature decision-id floor: decisions with id <= this are kept
 		// but excluded from confidence/graduation (stamped by an operator reset).
@@ -333,6 +391,12 @@ func (s *Store) migrate() error {
 		// this is what tells "same agent" from "new terminal on a recycled
 		// pane id" (issue #158). '' = not yet observed.
 		`ALTER TABLE agent_names ADD COLUMN terminal_id TEXT NOT NULL DEFAULT ''`,
+		// The terminal behind the action's target pane at queue time, and the
+		// "this may already have been delivered" marker. Both were added after
+		// agent_actions shipped, so CREATE TABLE IF NOT EXISTS would skip them
+		// on any database that already has the table.
+		`ALTER TABLE agent_actions ADD COLUMN terminal_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agent_actions ADD COLUMN side_effect INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
@@ -667,22 +731,29 @@ func (s *Store) UpdateLLMDecisionStatus(ctx context.Context, id int64, status st
 // InsertCorrection appends a front-end-written correction record.
 func (s *Store) InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error) {
 	var id int64
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		id, err = insertCorrectionTx(ctx, tx, c)
+		return err
+	})
+	return id, err
+}
+
+// insertCorrectionTx is the insert itself, factored out so InsertCorrectionWithDelivery
+// can write a correction and its delivery request in ONE transaction.
+func insertCorrectionTx(ctx context.Context, tx *sql.Tx, c domain.CorrectionRecord) (int64, error) {
 	sent := 0
 	if c.Sent {
 		sent = 1
 	}
-	err := s.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `
-			INSERT INTO corrections (audit_id, corrected_action, author, processed, sent, created_at)
-			VALUES (?, ?, ?, 0, ?, ?)`,
-			c.AuditID, c.CorrectedAction, orDefault(c.Author, "operator"), sent, unix(c.CreatedAt))
-		if err != nil {
-			return err
-		}
-		id, err = res.LastInsertId()
-		return err
-	})
-	return id, err
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO corrections (audit_id, corrected_action, author, processed, sent, created_at)
+		VALUES (?, ?, ?, 0, ?, ?)`,
+		c.AuditID, c.CorrectedAction, orDefault(c.Author, "operator"), sent, unix(c.CreatedAt))
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 
 // InsertLLMRetry queues a front-end request to re-invoke the LLM on an
@@ -1957,10 +2028,25 @@ func (s *Store) scanEscalationExcerpts(ctx context.Context, query string, args .
 }
 
 // UnprocessedCorrections returns corrections the daemon has not consumed.
+//
+// A correction whose delivery is still QUEUED is deliberately withheld from
+// this listing. applyCorrection reads the correction's Sent flag to arm the
+// post-action unblock self-check and then marks the row processed FOR GOOD, so
+// a correction drained while its delivery is still pending is learned from and
+// then never verified — the flag flips a moment later with nothing left to read
+// it. Withholding is only ever temporary: a delivery that fails permanently
+// goes terminal, and the correction is then processed with sent=0, which is the
+// long-standing contract that a learning event survives a failed send.
 func (s *Store) UnprocessedCorrections(ctx context.Context) ([]domain.CorrectionRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, audit_id, corrected_action, author, processed, sent, created_at
-		FROM corrections WHERE processed = 0 ORDER BY id ASC`)
+		FROM corrections c
+		WHERE c.processed = 0
+		  AND NOT EXISTS (
+			SELECT 1 FROM agent_actions a
+			WHERE a.correction_id = c.id AND a.status IN ('pending', 'running')
+		  )
+		ORDER BY c.id ASC`)
 	if err != nil {
 		return nil, err
 	}

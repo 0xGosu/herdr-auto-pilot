@@ -673,10 +673,11 @@ type CorrectionRecord struct {
 	CorrectedAction string
 	Author          string
 	Processed       bool
-	// Sent reports whether the front-end actually delivered this corrected
-	// action to the agent pane (confirm/correct with --send). The daemon uses
-	// it to schedule the post-action unblock self-check only for deliveries —
-	// a record-only correction leaves the agent expectedly blocked.
+	// Sent reports whether this corrected action actually reached the agent
+	// pane. The DAEMON writes it, after its own delivery succeeds; the front
+	// end only ever records the correction unsent. It schedules the
+	// post-action unblock self-check for deliveries only — a record-only
+	// correction leaves the agent expectedly blocked.
 	Sent      bool
 	CreatedAt time.Time
 }

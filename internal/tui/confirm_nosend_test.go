@@ -96,8 +96,8 @@ func TestEscalationYConfirmsWithoutSending(t *testing.T) {
 	_, msg := pressAct(t, m, "y")
 
 	// The whole point: nothing reaches the agent.
-	if len(fh.inputs) != 0 {
-		t.Errorf("y must not send to the pane, sent %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("y must not send to the pane, sent %v", fh.delivered())
 	}
 	// The toast must say BOTH: nothing was sent, and the agent is therefore
 	// still unanswered — "confirm only" must not read as "send it later".
@@ -128,7 +128,7 @@ func TestEscalationEnterStillConfirmsAndSends(t *testing.T) {
 
 	pressAct(t, m, "enter")
 
-	if len(fh.inputs) == 0 {
+	if len(fh.delivered()) == 0 {
 		t.Fatal("enter must still deliver to the pane")
 	}
 	corrs := noSendCorrections(t, st, ids[0])
@@ -147,8 +147,8 @@ func TestEscalationYConfirmsMarkedBatchWithoutSending(t *testing.T) {
 
 	pressAct(t, m, "y")
 
-	if len(fh.inputs) != 0 {
-		t.Errorf("a batch y must not send anything, sent %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("a batch y must not send anything, sent %v", fh.delivered())
 	}
 	for _, id := range []int64{ids[0], ids[2]} {
 		if got := noSendCorrections(t, st, id); len(got) != 1 {
@@ -178,8 +178,8 @@ func TestEscalationYFallsBackToCursorRowWhenNothingMarked(t *testing.T) {
 	if got := noSendCorrections(t, st, ids[0]); len(got) != 0 {
 		t.Errorf("row #%d is neither marked nor under the cursor, got %d correction(s)", ids[0], len(got))
 	}
-	if len(fh.inputs) != 0 {
-		t.Errorf("y must not send, sent %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("y must not send, sent %v", fh.delivered())
 	}
 }
 
@@ -193,8 +193,8 @@ func TestEscalationDetailYConfirmsSnapshotWithoutSending(t *testing.T) {
 	if m.detail != nil {
 		t.Error("y should close the detail overlay")
 	}
-	if len(fh.inputs) != 0 {
-		t.Errorf("detail y must not send, sent %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("detail y must not send, sent %v", fh.delivered())
 	}
 	if got := noSendCorrections(t, st, ids[0]); len(got) != 1 || got[0].Sent {
 		t.Errorf("detail y must record an undelivered correction, got %+v", got)
@@ -226,8 +226,8 @@ func TestEscalationYClearsMarksSoRepeatPressDoesNotDoubleRecord(t *testing.T) {
 	if got := noSendCorrections(t, st, ids[2]); len(got) != 1 {
 		t.Errorf("#%d gained %d corrections across two presses, want 1", ids[2], len(got))
 	}
-	if len(fh.inputs) != 0 {
-		t.Errorf("y must not send, sent %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("y must not send, sent %v", fh.delivered())
 	}
 }
 
@@ -263,8 +263,8 @@ func TestEscalationYSkipsFailuresAndConfirmsTheRest(t *testing.T) {
 			t.Errorf("#%d: want 1 correction despite the failing sibling, got %d", id, len(got))
 		}
 	}
-	if len(fh.inputs) != 0 {
-		t.Errorf("y must not send, sent %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("y must not send, sent %v", fh.delivered())
 	}
 }
 
@@ -277,8 +277,8 @@ func TestEscalationYOnEmptyListDoesNothing(t *testing.T) {
 			t.Errorf("y on an empty list produced %+v, want no action", msg)
 		}
 	}
-	if len(fh.inputs) != 0 {
-		t.Errorf("y must not send, sent %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("y must not send, sent %v", fh.delivered())
 	}
 }
 

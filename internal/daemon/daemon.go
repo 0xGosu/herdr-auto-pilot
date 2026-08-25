@@ -1112,6 +1112,32 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Info("auto-accept: returned abandoned claims to the pending queue", "count", n)
 		}
 		d.reconcileAttention(ctx)
+		// The agent-action queue is recovered and drained LAST at startup,
+		// deliberately.
+		//
+		// Ordering against processCorrections does not matter here — the
+		// withholding filter, not the call order, is what stops a correction
+		// being processed ahead of its own delivery; the order in the sweep and
+		// nudge tails is a latency optimization, so the unblock check arms in
+		// the same pass. What DOES matter is not delaying reconcileAttention:
+		// an attention event arriving while this block runs races the reconcile
+		// for the same episode, and every extra millisecond ahead of it widens
+		// that window. (The race is pre-existing and not fixed here; this only
+		// declines to make it worse.)
+		if requeued, failed, err := d.opt.Store.ReclaimRunningAgentActions(ctx, d.opt.Clock.Now()); err != nil {
+			slog.Warn("agent actions: abandoned claims could not be reclaimed at startup", "error", err)
+		} else {
+			if requeued > 0 {
+				slog.Info("agent actions: returned abandoned claims to the queue", "count", requeued)
+			}
+			if failed > 0 {
+				// Never replayed: the keystrokes may already have landed, and
+				// answering twice is worse than not answering.
+				slog.Warn("agent actions: claims abandoned mid-delivery were failed rather than retried; check those agents",
+					"count", failed)
+			}
+		}
+		d.processAgentActions(ctx)
 		return nil
 	})
 	sweep := time.NewTicker(time.Minute)
@@ -1147,6 +1173,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				// Self-throttled to once a day and does its work on a
 				// background goroutine; the call itself is a clock compare.
 				d.maybePruneAuditExcerpts(d.opt.Clock.Now())
+				// Ahead of processCorrections: a delivered reply flips its
+				// correction's Sent flag, and processCorrections both READS
+				// that flag (to arm the unblock check) and marks the row
+				// processed for good.
+				d.processAgentActions(ctx)
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)
@@ -1202,6 +1233,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 						d.reloadWith(true)
 					}
 				}
+				d.processAgentActions(ctx)
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
 				d.expireStaleLLMWork(ctx)

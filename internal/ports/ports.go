@@ -340,6 +340,38 @@ type DaemonStore interface {
 	// disabled=true without calling fn when the operator disabled the agent.
 	WithAgentAutomation(ctx context.Context, agentID string, fn func()) (disabled bool, err error)
 
+	// The agent-action queue's daemon half: claim a pending row, write its
+	// terminal outcome, hand a claim back when it could not be carried
+	// through, and recover claims a crash left behind.
+	//
+	// ReclaimRunningAgentActions runs at daemon START and is not optional:
+	// 'running' means "a daemon holds this claim", and at startup none does,
+	// so a row left there would be invisible to the drain forever while the
+	// surface that queued it polls to its timeout.
+	PendingAgentActions(ctx context.Context) ([]domain.AgentAction, error)
+	// DeleteCorrection removes an unprocessed correction — the compensating
+	// write for a delivery the safety controls refused, so a vetoed reply
+	// cannot resolve the escalation it was never delivered for.
+	DeleteCorrection(ctx context.Context, id int64) (bool, error)
+	ClaimAgentAction(ctx context.Context, id int64, now time.Time) (bool, error)
+	FinishAgentAction(ctx context.Context, id int64, status domain.AgentActionStatus, errText, result string, now time.Time) (bool, error)
+	ReleaseAgentAction(ctx context.Context, id int64, now time.Time) (bool, error)
+	// ReclaimRunningAgentActions recovers claims a crash left behind, splitting
+	// them: an action that had not reached its side effect goes back to the
+	// queue, one that HAD is failed. Delivery is not idempotent, so a replayed
+	// action would type an operator's answer twice.
+	ReclaimRunningAgentActions(ctx context.Context, now time.Time) (requeued, failed int64, err error)
+	// MarkAgentActionSideEffect records that an action is about to do
+	// something the world will remember. Called immediately before the
+	// keystrokes, so a daemon that dies leaves evidence rather than a row that
+	// looks untouched.
+	MarkAgentActionSideEffect(ctx context.Context, id int64, now time.Time) error
+	// FinishAgentActionWithdrawn fails an action AND removes its paired
+	// correction in one transaction — the refusal path, where the audit row
+	// must be left untouched and the two writes cannot be separated to achieve
+	// that.
+	FinishAgentActionWithdrawn(ctx context.Context, id int64, errText string, correctionID int64, now time.Time) (bool, error)
+
 	UpsertSignature(ctx context.Context, s domain.SignatureState) error
 	// EnsureSignature atomically creates a fresh signature state row if none
 	// exists yet (INSERT OR IGNORE) — never touching an existing row. The
@@ -469,11 +501,22 @@ type FrontendStore interface {
 	RecordTaskReservation(ctx context.Context, r domain.TaskReservation) (int64, error)
 	DeleteTaskReservation(ctx context.Context, id int64) error
 
+	// EnqueueAgentAction queues an action for the DAEMON to perform against a
+	// live agent. Front ends do not touch herdr, so anything reaching a pane
+	// goes through here; the caller nudges afterwards and polls the row for
+	// the outcome, which is the only readback a reply-less socket allows.
+	EnqueueAgentAction(ctx context.Context, a domain.AgentAction) (int64, error)
+	// InsertCorrectionWithDelivery records a correction AND queues its
+	// delivery in ONE transaction. Separate inserts would let a sweep landing
+	// between them process the correction before the delivery exists, marking
+	// it done with sent=0 so the post-action unblock check could never arm.
+	InsertCorrectionWithDelivery(ctx context.Context, c domain.CorrectionRecord, a domain.AgentAction) (correctionID, actionID int64, err error)
 	InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error)
-	// MarkCorrectionSent flags a recorded correction as delivered to the agent
-	// (front-ends record the correction first, then flip this once delivery
-	// succeeds), so the daemon arms the post-action unblock self-check only for
-	// corrections that actually reached the pane.
+	// MarkCorrectionSent flags a recorded correction as delivered to the
+	// agent. The DAEMON calls it once its own delivery succeeds — a front end
+	// records the correction unsent and queues the delivery — so the
+	// post-action unblock self-check is armed only for corrections that
+	// actually reached the pane.
 	MarkCorrectionSent(ctx context.Context, id int64) error
 	// InsertLLMRetry queues a request to re-invoke the LLM on an escalation
 	// whose consult failed/timed out; the daemon drains it on reload.
@@ -551,6 +594,13 @@ type BatchDecisionReader interface {
 
 // ReadStore is the shared read surface.
 type ReadStore interface {
+	// AgentActionByID reads one queued action, nil when absent. Shared: the
+	// daemon executes actions, the front ends poll this for the outcome.
+	AgentActionByID(ctx context.Context, id int64) (*domain.AgentAction, error)
+	// AgentTerminalID returns herdr's terminal identity for an agent as the
+	// daemon last observed it, "" when unknown. Herdr reuses pane ids, so this
+	// is what tells "same agent" from "new terminal on a recycled pane id".
+	AgentTerminalID(ctx context.Context, agentID string) (string, error)
 	GetSignature(ctx context.Context, signature string) (*domain.SignatureState, error)
 	DecisionsForSignature(ctx context.Context, signature string, limit int) ([]domain.DecisionRecord, error)
 	// CountDecisionsForSignature counts ALL of a signature's decisions, with no

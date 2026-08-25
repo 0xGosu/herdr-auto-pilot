@@ -60,8 +60,8 @@ func TestConfirmBusyAgentOpensAddPrompt(t *testing.T) {
 		t.Errorf("prompt label should offer to add the tasks, got %q", m.prompt.label)
 	}
 	// Nothing was delivered to the busy agent.
-	if len(fh.inputs) != 0 {
-		t.Errorf("no send may reach a busy agent, got %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("no send may reach a busy agent, got %v", fh.delivered())
 	}
 }
 
@@ -82,8 +82,8 @@ func TestAddPromptYesQueuesTasks(t *testing.T) {
 	m, _ = runPromptSubmit(t, m, "y")
 
 	// Nothing delivered to the pane.
-	if len(fh.inputs) != 0 {
-		t.Errorf("queueing must deliver nothing, got %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("queueing must deliver nothing, got %v", fh.delivered())
 	}
 	// The escalation is resolved (accepted).
 	audit, _ := st.GetAudit(ctx, id)
@@ -120,8 +120,8 @@ func TestAddPromptNoLeavesPending(t *testing.T) {
 
 	runPromptSubmit(t, m, "n")
 
-	if len(fh.inputs) != 0 {
-		t.Errorf("declining must deliver nothing, got %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("declining must deliver nothing, got %v", fh.delivered())
 	}
 	audit, _ := st.GetAudit(ctx, id)
 	if audit.Status != "escalated" {
@@ -158,8 +158,8 @@ func TestAddPromptBareEnterDeclines(t *testing.T) {
 	if audit.Status != "escalated" {
 		t.Errorf("bare Enter must leave the escalation pending, got %q", audit.Status)
 	}
-	if len(fh.inputs) != 0 {
-		t.Errorf("nothing may be delivered, got %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("nothing may be delivered, got %v", fh.delivered())
 	}
 	corr, _ := st.UnprocessedCorrections(ctx)
 	if len(corr) != 0 {
@@ -187,8 +187,8 @@ func TestAddPromptDeclineTypingN(t *testing.T) {
 	if audit.Status != "escalated" {
 		t.Errorf("typing n must leave the escalation pending, got %q", audit.Status)
 	}
-	if len(fh.inputs) != 0 {
-		t.Errorf("declining must deliver nothing, got %v", fh.inputs)
+	if len(fh.delivered()) != 0 {
+		t.Errorf("declining must deliver nothing, got %v", fh.delivered())
 	}
 	corr, _ := st.UnprocessedCorrections(ctx)
 	if len(corr) != 0 {
@@ -213,7 +213,7 @@ func TestConfirmIdleAgentSendsDirectly(t *testing.T) {
 	if !ok || res.err != nil {
 		t.Fatalf("idle confirm should succeed, got %T %+v", msg, msg)
 	}
-	if len(fh.inputs) != 1 {
-		t.Errorf("idle confirm should deliver exactly one task, got %v", fh.inputs)
+	if len(fh.delivered()) != 1 {
+		t.Errorf("idle confirm should deliver exactly one task, got %v", fh.delivered())
 	}
 }

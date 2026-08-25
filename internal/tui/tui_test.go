@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1540,13 +1541,29 @@ func TestMaxContentWidthCapsRows(t *testing.T) {
 // is what most Tasks-tab tests want; the send path needs a live one, so those
 // harnesses populate it.
 type captureHerdr struct {
+	mu     sync.Mutex
 	sent   []string
 	agents []domain.AgentTransition
 }
 
 func (c *captureHerdr) Send(_ context.Context, _, input string) error {
-	c.sent = append(c.sent, input)
+	c.record(input)
 	return nil
+}
+
+// record notes a reply that reached the agent. The TUI no longer delivers
+// anything itself, so the stand-in drain reports the DAEMON's send here — see
+// startStandInDrain.
+func (c *captureHerdr) record(input string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sent = append(c.sent, input)
+}
+
+func (c *captureHerdr) delivered() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.sent...)
 }
 func (c *captureHerdr) ReadPane(context.Context, string, int) (string, error) { return "", nil }
 func (c *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
@@ -1564,6 +1581,8 @@ func TestEscalationDetailEnterConfirmsAndCloses(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	h := &captureHerdr{}
 	app := &frontend.App{Store: st, Herdr: h, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	makeDaemonLive(t, app, dir)
+	startStandInDrain(t, st, h.record)
 	ctx := context.Background()
 	st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w1:p1", SituationType: domain.SituationApproval, Trigger: "apply?",
@@ -1593,7 +1612,7 @@ func TestEscalationDetailEnterConfirmsAndCloses(t *testing.T) {
 	if !ok || res.err != nil {
 		t.Fatalf("confirm+send should succeed, got %+v (ok=%v)", res, ok)
 	}
-	if len(h.sent) != 1 || h.sent[0] != "Yes" {
+	if got := h.delivered(); len(got) != 1 || got[0] != "Yes" {
 		t.Errorf("expected the suggestion delivered to the agent, got %v", h.sent)
 	}
 }
@@ -1630,6 +1649,8 @@ func TestEscalationDetailEnterConfirmsSnapshotNotClampedCursor(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	h := &captureHerdr{}
 	app := &frontend.App{Store: st, Herdr: h, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	makeDaemonLive(t, app, dir)
+	startStandInDrain(t, st, h.record)
 	ctx := context.Background()
 	idA, _ := st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w1:pA", SituationType: domain.SituationApproval, Trigger: "a",
@@ -1666,21 +1687,31 @@ func TestEscalationDetailEnterConfirmsSnapshotNotClampedCursor(t *testing.T) {
 		t.Fatalf("expected only escalation A pending after resolve, got %+v", m.data.escalations)
 	}
 
-	// Enter must confirm B (the displayed snapshot), not A (the clamped cursor).
+	// Enter must act on B (the displayed snapshot), not A (the clamped cursor).
+	//
+	// B was resolved out from under the operator a moment ago, so the confirm
+	// is REFUSED — a closed escalation is no longer answerable, and delivering
+	// anyway would type a reply for a question nobody is asking and then
+	// overwrite whoever closed it. The refusal is what proves the targeting:
+	// it names B. Had the clamped cursor won, A is still open and the confirm
+	// would have succeeded.
 	upd, cmd := m.Update(pressKeyMsg("enter"))
 	m = upd.(Model)
 	if cmd == nil {
 		t.Fatal("enter should issue a confirm command")
 	}
 	res, ok := cmd().(actionResultMsg)
-	if !ok || res.err != nil {
-		t.Fatalf("confirm should succeed, got %+v", res)
+	if !ok {
+		t.Fatalf("expected an action result, got %+v", res)
 	}
-	if !strings.Contains(res.message, fmt.Sprintf("#%d", idB)) {
-		t.Errorf("should confirm the displayed escalation #%d, message was %q", idB, res.message)
+	if res.err == nil {
+		t.Fatalf("enter acted on the clamped cursor (A, still open) instead of the displayed snapshot B: %+v", res)
 	}
-	if len(h.sent) != 1 || h.sent[0] != "Banana" {
-		t.Errorf("should deliver B's suggestion, got %v", h.sent)
+	if !strings.Contains(res.err.Error(), fmt.Sprintf("%d", idB)) {
+		t.Errorf("refusal should name the displayed escalation %d, got %v", idB, res.err)
+	}
+	if got := h.delivered(); len(got) != 0 {
+		t.Errorf("nothing may be delivered for a closed escalation, got %v", got)
 	}
 	_ = idA
 }
