@@ -1404,11 +1404,22 @@ func TestConfigReadOnlyRowsRefuseEditAndRemove(t *testing.T) {
 }
 
 func TestConfigTUIReadOnlyFieldsNoPrompt(t *testing.T) {
-	readOnly := []string{"llm.command", "llm.command_start", "llm.task_generate_command", "embedding.model_path"}
+	// A CONFIGURED config carries argv in the three preset-capable commands,
+	// which is what keeps them read-only: an UNSET one now offers the
+	// claude/codex preset picker instead (llmpreset_prompt_test.go), and that
+	// is the only state in which the TUI writes one of these fields.
+	cfg := config.Default()
+	cfg.LLM.Command = []string{"claude", "-p", "decide"}
+	cfg.LLM.GenerateTaskCommand = []string{"claude", "-p", "suggest"}
+	cfg.LLM.LearnFromUserCommand = []string{"claude", "-p", "learn"}
+	readOnly := []string{
+		"llm.command", "llm.command_start", "llm.task_generate_command",
+		"llm.learn_from_user_command", "embedding.model_path",
+	}
 	for _, key := range readOnly {
 		for _, k := range []string{"enter", "e"} {
 			t.Run(key+"/"+k, func(t *testing.T) {
-				m := configModel(t, config.Default())
+				m := configModel(t, cfg)
 				m.cursors[m.tab] = itemIndex(t, m, func(it ruleItem) bool { return it.kind == "field" && it.key == key })
 				upd, cmd := m.Update(pressKeyMsg(k))
 				m = upd.(Model)
