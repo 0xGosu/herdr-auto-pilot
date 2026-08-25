@@ -1344,7 +1344,16 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		// a supported CLI, because the alternative — retyping a ~1 KB prompt
 		// onto this line — is not a real one. Only an UNSET field takes one;
 		// changing a configured command stays a config.toml job.
-		if args[2] == "--preset" {
+		//
+		// The FIELD gates the dispatch, not the word alone. `config set`
+		// stores whatever follows the key, so for every other scalar key
+		// "--preset" is an ordinary value — `config set
+		// llm.rewrite_action_fallback_template --preset noop` has always
+		// stored the literal string "--preset noop", and a word-only check
+		// would turn that into an error. A key WITH presets gives the word its
+		// flag meaning and loses nothing: an argv template whose first word is
+		// "--preset" is not a command anyone can run.
+		if args[2] == "--preset" && frontend.HasLLMPresets(args[1]) {
 			return configSetPreset(ctx, app, out, args[1], args[3:])
 		}
 		value := strings.Join(args[2:], " ")

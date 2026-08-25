@@ -5,8 +5,18 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 )
+
+func mustConfig(t *testing.T, app *frontend.App) config.Config {
+	t.Helper()
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
 
 // TestConfigSetPresetInstallsTheRecipe: the flag half of the feature, end to
 // end through the real dispatcher.
@@ -74,10 +84,40 @@ func TestConfigSetPresetRefusals(t *testing.T) {
 			t.Errorf("the first recipe was replaced: %#v", cfg.LLM.Command)
 		}
 	})
-	t.Run("field without presets", func(t *testing.T) {
+	t.Run("field without presets keeps the literal value", func(t *testing.T) {
+		// The FIELD gates the dispatch, not the word. `config set` stores
+		// whatever follows the key, so for a key with no presets "--preset" is
+		// an ordinary value and has always been stored as one — gating on the
+		// word alone would turn a working command into an error. Proven on the
+		// two shapes most likely to carry a dashed value: a template string
+		// and a path.
 		app, _ := testApp(t)
-		if _, err := run(t, app, "config", "set", "llm.command_start", "--preset", "claude"); err == nil {
-			t.Fatal("llm.command_start accepted a preset — an unset *_start key inherits, it is not disabled")
+		for _, c := range []struct {
+			key  string
+			want string
+		}{
+			{"llm.rewrite_action_fallback_template", "--preset noop"},
+			{"embedding.model_path", "--preset noop"},
+		} {
+			if _, err := run(t, app, "config", "set", c.key, "--preset", "noop"); err != nil {
+				t.Fatalf("%s: %v", c.key, err)
+			}
+			if got := frontend.FieldValue(mustConfig(t, app), c.key); got != c.want {
+				t.Errorf("%s = %q, want the literal %q", c.key, got, c.want)
+			}
+		}
+	})
+	t.Run("argv field without presets still takes the literal", func(t *testing.T) {
+		// llm.command_start is an argv template with no preset — an unset one
+		// INHERITS llm.command, so there is nothing disabled to bootstrap. It
+		// keeps the historical pass-through like every other non-preset key.
+		app, _ := testApp(t)
+		if _, err := run(t, app, "config", "set", "llm.command_start", "--preset", "claude"); err != nil {
+			t.Fatal(err)
+		}
+		cfg := mustConfig(t, app)
+		if !reflect.DeepEqual(cfg.LLM.CommandStart, []string{"--preset", "claude"}) {
+			t.Errorf("llm.command_start = %#v, want the literal argv", cfg.LLM.CommandStart)
 		}
 	})
 	t.Run("unknown preset", func(t *testing.T) {
