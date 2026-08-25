@@ -291,6 +291,19 @@ CREATE TABLE IF NOT EXISTS agent_actions (
 	-- correction drain must JOIN on it: a correction whose delivery is still
 	-- queued must not be processed yet (see UnprocessedCorrections).
 	correction_id INTEGER NOT NULL DEFAULT 0,
+	-- Herdr's terminal identity for the target pane, as it stood when the
+	-- action was queued. Herdr RECYCLES pane ids, so a pane id alone is not an
+	-- address: between queueing and delivery the terminal behind it can be
+	-- replaced, and the reply would be typed at a stranger. Empty means "not
+	-- observed", which is not evidence of sameness and is never treated as a
+	-- match. Same doctrine as task_reservations.terminal_id.
+	terminal_id TEXT NOT NULL DEFAULT '',
+	-- 1 once this action may already have had its side effect — set
+	-- IMMEDIATELY BEFORE the keystrokes, so a daemon that dies between the
+	-- send and the outcome write leaves evidence behind. Delivery is not
+	-- idempotent, so such a row must never be replayed; the startup reclaim
+	-- fails it instead of returning it to the queue.
+	side_effect INTEGER NOT NULL DEFAULT 0,
 	author TEXT NOT NULL DEFAULT 'operator',
 	status TEXT NOT NULL DEFAULT 'pending',
 	error TEXT NOT NULL DEFAULT '',
@@ -378,6 +391,12 @@ func (s *Store) migrate() error {
 		// this is what tells "same agent" from "new terminal on a recycled
 		// pane id" (issue #158). '' = not yet observed.
 		`ALTER TABLE agent_names ADD COLUMN terminal_id TEXT NOT NULL DEFAULT ''`,
+		// The terminal behind the action's target pane at queue time, and the
+		// "this may already have been delivered" marker. Both were added after
+		// agent_actions shipped, so CREATE TABLE IF NOT EXISTS would skip them
+		// on any database that already has the table.
+		`ALTER TABLE agent_actions ADD COLUMN terminal_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE agent_actions ADD COLUMN side_effect INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {

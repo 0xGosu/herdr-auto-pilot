@@ -48,6 +48,28 @@ var errActionUnsupported = errors.New("this hap daemon does not support that act
 // attempt already knew.
 var errActionTransient = errors.New("transient")
 
+// errEscalationClosed marks a refusal because the row this action answers is no
+// longer open — dismissed while queued, or its pane recycled under a different
+// terminal.
+//
+// Like a safety refusal it must WITHDRAW its correction rather than merely
+// fail: applyCorrection ends by flipping its audit row to "resolved" whatever
+// the delivery did, so a correction left behind for an answer that was never
+// delivered would overwrite the operator's dismissal.
+var errEscalationClosed = errors.New("this escalation is no longer open")
+
+// withdrawsCorrection reports whether a failure means the operator's answer was
+// never attempted, so the correction recording it must go too.
+//
+// Both cases are refusals ABOUT THE REQUEST, not delivery faults: the safety
+// controls vetoed the text, or the row it answers is gone. Learning from either
+// would graduate a rule toward a reply hap will refuse every time, and leaving
+// the correction lets the next correction pass resolve an escalation nothing
+// ever answered.
+func withdrawsCorrection(err error) bool {
+	return errors.Is(err, errOutboundRefused) || errors.Is(err, errEscalationClosed)
+}
+
 // agentActionStaleBound returns how long kind may wait before its request is
 // treated as stale, or 0 for kinds that never go stale.
 //
@@ -151,6 +173,10 @@ func (d *Daemon) runAgentAction(ctx context.Context, a domain.AgentAction) {
 		if attempts > 1 {
 			msg = fmt.Sprintf("%s (gave up after %d attempts)", runErr, attempts)
 		}
+		if withdrawsCorrection(runErr) {
+			d.finishWithdrawn(ctx, a, msg)
+			return
+		}
 		d.finishAgentAction(ctx, a, domain.AgentActionFailed, msg, result)
 		return
 	}
@@ -179,6 +205,33 @@ func (d *Daemon) executeAgentAction(ctx context.Context, a domain.AgentAction) (
 	default:
 		return "", fmt.Errorf("%w: %q, so it cannot be run by this build. Upgrade with `hap daemon --ensure`",
 			errActionUnsupported, a.Kind)
+	}
+}
+
+// finishWithdrawn fails an action AND removes the correction it was paired
+// with, in ONE store transaction.
+//
+// The atomicity is the whole point. applyCorrection ends by flipping its audit
+// row to "resolved" whatever the delivery did, and the withholding filter stops
+// excluding a correction the moment its action goes terminal — so a withdrawal
+// written separately and then failing would let the next correction pass
+// resolve an escalation that was never answered, which is the outcome FR-015
+// exists to prevent.
+//
+// A failed transaction leaves the action 'running', so nothing is released and
+// the next pass (or the startup reclaim) tries again.
+func (d *Daemon) finishWithdrawn(ctx context.Context, a domain.AgentAction, errText string) {
+	ok, err := d.opt.Store.FinishAgentActionWithdrawn(ctx, a.ID, errText, a.CorrectionID, d.opt.Clock.Now())
+	switch {
+	case err != nil:
+		slog.Error("agent actions: a refused reply could not be recorded and withdrawn together; "+
+			"the claim is left in place for the next pass",
+			"action", a.ID, "correction", a.CorrectionID, "error", err)
+	case !ok:
+		slog.Warn("agent actions: the refusal was not recorded; another writer moved the row",
+			"action", a.ID)
+	default:
+		slog.Warn("agent action refused", "action", a.ID, "kind", a.Kind, "reason", errText)
 	}
 }
 

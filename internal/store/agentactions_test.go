@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,9 +141,9 @@ func TestARunningActionIsReclaimedAtStartup(t *testing.T) {
 	if got, _ := s.PendingAgentActions(ctx); len(got) != 1 || got[0].ID != pending {
 		t.Fatalf("pending before reclaim = %+v; want only the unclaimed row", got)
 	}
-	n, err := s.ReclaimRunningAgentActions(ctx, time.Now())
-	if err != nil || n != 1 {
-		t.Fatalf("reclaim = %d, %v; want 1, nil", n, err)
+	requeued, failed, err := s.ReclaimRunningAgentActions(ctx, time.Now())
+	if err != nil || requeued != 1 || failed != 0 {
+		t.Fatalf("reclaim = %d requeued, %d failed, %v; want 1, 0, nil", requeued, failed, err)
 	}
 	got, err := s.PendingAgentActions(ctx)
 	if err != nil {
@@ -418,5 +420,145 @@ func TestAStorePathWithURIMetacharactersOpensItsOwnDatabase(t *testing.T) {
 				t.Errorf("no database at the path that was asked for: %v", err)
 			}
 		})
+	}
+}
+
+// Delivery is NOT idempotent. A daemon that died between the keystrokes and
+// the outcome write leaves a 'running' row; returning it to the queue would
+// type the operator's answer a second time.
+func TestAClaimAbandonedMidDeliveryIsNeverReplayed(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	sent := queueAction(t, s, domain.AgentActionDeliverReply)
+	unsent := queueAction(t, s, domain.AgentActionDeliverReply)
+	for _, id := range []int64{sent, unsent} {
+		if ok, err := s.ClaimAgentAction(ctx, id, time.Now()); err != nil || !ok {
+			t.Fatalf("claim %d: %v, %v", id, ok, err)
+		}
+	}
+	// Only one of them got as far as the keystrokes.
+	if err := s.MarkAgentActionSideEffect(ctx, sent, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	requeued, failed, err := s.ReclaimRunningAgentActions(ctx, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeued != 1 || failed != 1 {
+		t.Fatalf("reclaim = %d requeued, %d failed; want 1 and 1", requeued, failed)
+	}
+
+	got, _ := s.AgentActionByID(ctx, sent)
+	if got.Status != domain.AgentActionFailed {
+		t.Errorf("a row whose side effect may have landed was returned to the queue as %q", got.Status)
+	}
+	if !strings.Contains(got.Error, "check the agent") {
+		t.Errorf("error = %q; want it to send the operator to the only place that can settle it", got.Error)
+	}
+	got, _ = s.AgentActionByID(ctx, unsent)
+	if got.Status != domain.AgentActionPending {
+		t.Errorf("a row that never reached its side effect must be retried, got %q", got.Status)
+	}
+}
+
+// The refusal and the withdrawal are ONE transaction. applyCorrection flips its
+// audit row to "resolved" whatever the delivery did, and the withholding filter
+// releases a correction the moment its action goes terminal — so a withdrawal
+// that failed separately would let the next pass resolve an escalation nothing
+// ever answered.
+func TestARefusalAndItsWithdrawalAreOneTransaction(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	auditID := seedAuditForCorrection(t, s)
+	corrID, actID, err := s.InsertCorrectionWithDelivery(ctx,
+		domain.CorrectionRecord{AuditID: auditID, CorrectedAction: "rm -rf /", CreatedAt: time.Now()},
+		domain.AgentAction{Kind: domain.AgentActionDeliverReply, Target: "%1", CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimAgentAction(ctx, actID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := s.FinishAgentActionWithdrawn(ctx, actID, "matched never-auto", corrID, time.Now())
+	if err != nil || !ok {
+		t.Fatalf("withdraw = %v, %v; want true, nil", ok, err)
+	}
+	act, _ := s.AgentActionByID(ctx, actID)
+	if act.Status != domain.AgentActionFailed || act.Error != "matched never-auto" {
+		t.Errorf("action = %+v; want the refusal recorded", act)
+	}
+	corrections, err := s.UnprocessedCorrections(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range corrections {
+		if c.ID == corrID {
+			t.Fatal("the refused reply's correction survived; it will resolve the escalation")
+		}
+	}
+}
+
+// A failed transaction must leave the claim in place, so nothing is released
+// and the next pass tries again.
+func TestAFailedWithdrawalReleasesNothing(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	auditID := seedAuditForCorrection(t, s)
+	corrID, actID, err := s.InsertCorrectionWithDelivery(ctx,
+		domain.CorrectionRecord{AuditID: auditID, CorrectedAction: "rm -rf /", CreatedAt: time.Now()},
+		domain.AgentAction{Kind: domain.AgentActionDeliverReply, Target: "%1", CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimAgentAction(ctx, actID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE corrections RENAME TO corrections_hidden`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FinishAgentActionWithdrawn(ctx, actID, "matched never-auto", corrID, time.Now()); err == nil {
+		t.Fatal("withdrawal succeeded with no corrections table")
+	}
+	if _, err := s.db.Exec(`ALTER TABLE corrections_hidden RENAME TO corrections`); err != nil {
+		t.Fatal(err)
+	}
+	act, _ := s.AgentActionByID(ctx, actID)
+	if act.Status != domain.AgentActionRunning {
+		t.Fatalf("status = %q; a failed withdrawal must keep the claim so nothing is released", act.Status)
+	}
+	// And the correction is still withheld, because the action is not terminal.
+	if got, _ := s.UnprocessedCorrections(ctx); len(got) != 0 {
+		t.Errorf("corrections = %+v; want the correction still withheld", got)
+	}
+}
+
+// Queueing a delivery for an escalation that is no longer open must refuse
+// rather than write. A concurrent dismissal would otherwise be overwritten:
+// the daemon delivers anyway, and applyCorrection flips the dismissed row back
+// to "resolved".
+func TestQueueingRefusesAClosedEscalation(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	auditID := seedAuditForCorrection(t, s)
+	if err := s.DismissEscalation(ctx, auditID); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := s.InsertCorrectionWithDelivery(ctx,
+		domain.CorrectionRecord{AuditID: auditID, CorrectedAction: "yes", CreatedAt: time.Now()},
+		domain.AgentAction{Kind: domain.AgentActionDeliverReply, Target: "%1", CreatedAt: time.Now()})
+	if err == nil {
+		t.Fatal("queued a delivery for a dismissed escalation")
+	}
+	if !errors.Is(err, ErrEscalationNotOpen) {
+		t.Errorf("err = %v; want ErrEscalationNotOpen so callers can tell it apart", err)
+	}
+	if got, _ := s.UnprocessedCorrections(ctx); len(got) != 0 {
+		t.Errorf("corrections = %+v; nothing may be recorded for a closed escalation", got)
+	}
+	if got, _ := s.PendingAgentActions(ctx); len(got) != 0 {
+		t.Errorf("actions = %+v; want none", got)
 	}
 }

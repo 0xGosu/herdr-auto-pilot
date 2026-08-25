@@ -157,34 +157,58 @@ func TestAFinishedActionIsNotRunAgainOnTheNextNudge(t *testing.T) {
 	}
 }
 
-// The drain runs BEFORE processCorrections in every pass. A delivered reply
-// flips its correction's Sent flag, and processCorrections both READS that flag
-// (to arm the post-action unblock self-check) and marks the correction
-// processed for good — so the other order would silently lose the check for
-// that row, forever, with nothing erroring.
+// In the RECURRING passes — the sweep tick and the nudge tail — the drain runs
+// before processCorrections. A delivered reply flips its correction's Sent flag,
+// and processCorrections both reads that flag (to arm the post-action unblock
+// self-check) and marks the correction processed for good, so the other order
+// costs a whole sweep before the check can arm.
 //
-// This is checked structurally because the hazard is an ORDERING inside the
-// select loop that no single-pass behavioural test can see: swapping the two
-// lines still delivers, still learns, and only loses the verification.
-func TestTheActionDrainRunsBeforeCorrections(t *testing.T) {
+// This is a LATENCY property, not the correctness one: the withholding filter
+// in UnprocessedCorrections is what actually stops a correction being processed
+// ahead of its own delivery, and it holds whatever the call order is. Startup
+// is therefore deliberately excluded — there the drain runs last, so it cannot
+// delay reconcileAttention (see the comment at that call site).
+//
+// Checked structurally because the hazard is an ordering inside the select loop
+// that no single-pass behavioural test can see: swapping the two lines still
+// delivers, still learns, and only loses a pass.
+func TestTheActionDrainRunsBeforeCorrectionsInRecurringPasses(t *testing.T) {
 	src, err := os.ReadFile("daemon.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	drains := allIndexes(string(src), "d.processAgentActions(ctx)")
-	corrections := allIndexes(string(src), "d.processCorrections(ctx)")
-	if len(drains) == 0 {
-		t.Fatal("processAgentActions is never called from the daemon loop")
-	}
-	if len(drains) != len(corrections) {
-		t.Fatalf("%d action drains vs %d correction drains; every pass that processes corrections must drain actions first",
-			len(drains), len(corrections))
-	}
-	for i := range corrections {
-		if drains[i] >= corrections[i] {
-			t.Errorf("drain %d is at offset %d, after its processCorrections at %d",
-				i, drains[i], corrections[i])
+	lines := strings.Split(string(src), "\n")
+	var withDrain, without int
+	for i, l := range lines {
+		if strings.TrimSpace(l) != "d.processCorrections(ctx)" {
+			continue
 		}
+		// The immediately preceding statement, skipping blanks and comments.
+		j := i - 1
+		for j >= 0 {
+			prev := strings.TrimSpace(lines[j])
+			if prev == "" || strings.HasPrefix(prev, "//") {
+				j--
+				continue
+			}
+			break
+		}
+		if j >= 0 && strings.TrimSpace(lines[j]) == "d.processAgentActions(ctx)" {
+			withDrain++
+		} else {
+			without++
+		}
+	}
+	if withDrain+without == 0 {
+		t.Fatal("processCorrections is never called from the daemon loop")
+	}
+	// Exactly one pass may lack it: startup, where the drain runs last so it
+	// cannot delay reconcileAttention.
+	if without != 1 {
+		t.Errorf("%d correction passes are not immediately preceded by the action drain, want exactly 1 (startup)", without)
+	}
+	if withDrain < 2 {
+		t.Errorf("only %d recurring correction passes drain actions first; the sweep tick and the nudge tail must both", withDrain)
 	}
 }
 
@@ -238,7 +262,7 @@ type recordingActionStore struct {
 	order *[]string
 }
 
-func (s *recordingActionStore) ReclaimRunningAgentActions(ctx context.Context, now time.Time) (int64, error) {
+func (s *recordingActionStore) ReclaimRunningAgentActions(ctx context.Context, now time.Time) (int64, int64, error) {
 	s.mu.Lock()
 	*s.order = append(*s.order, "reclaim")
 	s.mu.Unlock()

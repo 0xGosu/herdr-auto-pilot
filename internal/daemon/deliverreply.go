@@ -38,6 +38,22 @@ func (d *Daemon) deliverReply(ctx context.Context, a domain.AgentAction) (string
 	if audit.AgentID == "" {
 		return "", fmt.Errorf("audit record %d names no agent to answer", p.AuditID)
 	}
+	// Re-checked HERE, not only at queue time: a dismissal can land in the gap,
+	// and delivering anyway would type an answer for a question the operator
+	// has since withdrawn — then applyCorrection would flip the dismissed row
+	// back to "resolved", erasing their decision.
+	if audit.Status != "escalated" {
+		return "", fmt.Errorf("%w: audit record %d is %q", errEscalationClosed, p.AuditID, audit.Status)
+	}
+	// Herdr RECYCLES pane ids, so the pane id is not an address. If the
+	// terminal behind it changed since the operator confirmed, the reply would
+	// be typed at a stranger. Compared against the daemon-maintained identity
+	// rather than a fresh herdr listing: that is the same evidence
+	// task_reservations uses to tell "same agent" from "new terminal on a
+	// reused pane id".
+	if err := d.terminalStillMatches(ctx, audit.AgentID, a.TerminalID); err != nil {
+		return "", err
+	}
 
 	outbound := domain.MaterializeForSend(p.Action, audit)
 
@@ -52,8 +68,15 @@ func (d *Daemon) deliverReply(ctx context.Context, a domain.AgentAction) (string
 	// carries none of the words a rule matches on, while the prompt that
 	// actually reaches the pane does.
 	if err := d.screenOutbound(audit.AgentType, outbound); err != nil {
-		d.dropRefusedCorrection(ctx, a)
 		return "", fmt.Errorf("%w: %v", errOutboundRefused, err)
+	}
+
+	// The point of no return: mark BEFORE the keystrokes, so a daemon that
+	// dies in the next instant leaves evidence instead of a row that looks
+	// untouched and gets replayed at startup. A failure here happens before
+	// anything is sent, so refusing is safe.
+	if err := d.opt.Store.MarkAgentActionSideEffect(ctx, a.ID, d.opt.Clock.Now()); err != nil {
+		return "", fmt.Errorf("%w: recording the delivery attempt: %v", errActionTransient, err)
 	}
 
 	// autoAcceptDeliver materializes the action itself, so the STORED form is
@@ -103,26 +126,25 @@ func (d *Daemon) deliverToPane(ctx context.Context, audit *domain.AuditRecord, a
 	}
 }
 
-// dropRefusedCorrection removes the correction paired with a reply the safety
-// controls refused, so the escalation stays in the operator's queue.
+// terminalStillMatches refuses when the terminal behind the target pane is not
+// the one the operator confirmed against.
 //
-// applyCorrection ends by flipping its audit row to "resolved" whatever the
-// delivery did. Leaving the correction in place would therefore clear the
-// escalation for an answer that never reached the agent — with the agent still
-// blocked and nothing to show the operator why. FR-015 says a never-auto match
-// always reaches a human, so the refusal has to leave the row where a human
-// will see it.
-//
-// This branch is NEW with the move: an operator's reply had never been screened
-// before, because the daemon's own sends are screened at Decide time and an
-// operator authors theirs afterwards.
-func (d *Daemon) dropRefusedCorrection(ctx context.Context, a domain.AgentAction) {
-	if a.CorrectionID == 0 {
-		return
+// An empty id on EITHER side is "not observed", which is not evidence of
+// sameness — but it is also not evidence of change, and refusing on it would
+// break every action queued before this column existed and every agent the
+// daemon has not yet synced. So absence passes and only a positive MISMATCH
+// refuses, which is the same bargain task_reservations strikes.
+func (d *Daemon) terminalStillMatches(ctx context.Context, agentID, want string) error {
+	if want == "" {
+		return nil
 	}
-	if _, err := d.opt.Store.DeleteCorrection(ctx, a.CorrectionID); err != nil {
-		slog.Error("agent actions: a refused reply's correction could not be withdrawn; "+
-			"the escalation may be resolved without ever being answered",
-			"correction", a.CorrectionID, "error", err)
+	live, err := d.opt.Store.AgentTerminalID(ctx, agentID)
+	if err != nil {
+		return fmt.Errorf("%w: reading the agent's terminal identity: %v", errActionTransient, err)
 	}
+	if live == "" || live == want {
+		return nil
+	}
+	return fmt.Errorf("%w: the terminal behind pane %s was replaced since you answered "+
+		"(herdr reuses pane ids), so this reply would go to a different agent", errEscalationClosed, agentID)
 }

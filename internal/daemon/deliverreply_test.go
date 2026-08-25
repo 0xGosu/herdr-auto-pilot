@@ -571,3 +571,138 @@ func TestARefusedReplyLeavesItsEscalationPending(t *testing.T) {
 		t.Errorf("sent %d inputs; nothing may reach the pane", n)
 	}
 }
+
+// Herdr RECYCLES pane ids, so a pane id is not an address. If the terminal
+// behind it was replaced between the operator's confirm and the daemon's send,
+// the reply would be typed at a stranger.
+func TestQueuedReplyRefusesARecycledPane(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setPane("Do you want to proceed?\n❯ 1. Yes\n  2. No\n")
+	auditID := h.seedEscalation(domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Suggestion: "respond: y",
+	})
+	if _, err := h.raw.EnsureAgentName(ctx, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	// The terminal the operator answered against...
+	if _, err := h.raw.SyncAgentTerminalID(ctx, "a1", "term_old"); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(domain.DeliverReplyPayload{AuditID: auditID, Action: "Yes"})
+	// ...replaced before the queue drained.
+	if _, err := h.raw.SyncAgentTerminalID(ctx, "a1", "term_new"); err != nil {
+		t.Fatal(err)
+	}
+
+	id := h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionDeliverReply, Target: "a1",
+		TerminalID: "term_old", Payload: string(payload),
+	})
+	got := h.awaitAction(id)
+	if got.Status != domain.AgentActionFailed {
+		t.Fatalf("status = %q, want failed", got.Status)
+	}
+	if !strings.Contains(got.Error, "replaced") {
+		t.Errorf("error = %q; want it to name the recycled pane", got.Error)
+	}
+	if n := len(h.herdr.sentInputs()); n != 0 {
+		t.Errorf("sent %d inputs into a stranger's terminal", n)
+	}
+}
+
+// An unobserved terminal id is not evidence of change, so it must not refuse —
+// otherwise every action queued before the column existed, and every agent the
+// daemon has not synced, would fail.
+func TestQueuedReplyWithNoTerminalIdentityStillDelivers(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane("Do you want to proceed?\n❯ 1. Yes\n  2. No\n")
+	id := h.seedEscalation(domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Suggestion: "respond: y",
+	})
+	got := h.deliverReplyNow(id, "Yes", "a1")
+	if got.Status != domain.AgentActionDone {
+		t.Fatalf("status = %q (%s), want done", got.Status, got.Error)
+	}
+}
+
+// A dismissal landing while the reply was queued must win. Delivering anyway
+// would answer a question the operator withdrew, and applyCorrection would then
+// flip the dismissed row back to "resolved" — erasing their decision.
+func TestQueuedReplyRefusesAnEscalationDismissedWhileQueued(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setPane("Do you want to proceed?\n❯ 1. Yes\n  2. No\n")
+	auditID := h.seedEscalation(domain.AuditRecord{
+		AgentID: "a1", Signature: "sig", SituationType: domain.SituationApproval,
+		Suggestion: "respond: y",
+	})
+	payload, _ := json.Marshal(domain.DeliverReplyPayload{AuditID: auditID, Action: "Yes"})
+	corrID, actID, err := h.raw.InsertCorrectionWithDelivery(ctx,
+		domain.CorrectionRecord{AuditID: auditID, CorrectedAction: "Yes", CreatedAt: time.Now()},
+		domain.AgentAction{Kind: domain.AgentActionDeliverReply, Target: "a1", Payload: string(payload), CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raw.DismissEscalation(ctx, auditID); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Nudge(ctx, h.ctlPath, control.KindWake); err != nil {
+		t.Fatal(err)
+	}
+
+	got := h.awaitAction(actID)
+	if got.Status != domain.AgentActionFailed {
+		t.Fatalf("status = %q, want failed", got.Status)
+	}
+	if n := len(h.herdr.sentInputs()); n != 0 {
+		t.Errorf("sent %d inputs for a dismissed escalation", n)
+	}
+	// The correction is withdrawn, so nothing flips the dismissal back.
+	corrections, _ := h.raw.UnprocessedCorrections(ctx)
+	for _, c := range corrections {
+		if c.ID == corrID {
+			t.Fatal("the correction survived; it will overwrite the dismissal with \"resolved\"")
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	rec, _ := h.raw.GetAudit(ctx, auditID)
+	if rec.Status != "dismissed" {
+		t.Fatalf("audit status = %q; the operator's dismissal was overwritten", rec.Status)
+	}
+}
+
+// The marker goes down BEFORE the keystrokes, so a daemon that dies in the next
+// instant leaves evidence rather than a row that looks untouched.
+func TestADeliveredReplyIsMarkedBeforeItIsSent(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane("Do you want to proceed?\n❯ 1. Yes\n  2. No\n")
+	id := h.seedEscalation(domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Suggestion: "respond: y",
+	})
+	got := h.deliverReplyNow(id, "Yes", "a1")
+	if got.Status != domain.AgentActionDone {
+		t.Fatalf("status = %q (%s), want done", got.Status, got.Error)
+	}
+	if !got.SideEffect {
+		t.Error("a delivered reply left no evidence that it had been sent; a crash would replay it")
+	}
+}
+
+// A reply the safety controls refuse never reaches the pane, so it must leave
+// no such evidence either — the marker means "this may have landed", and a
+// refusal is proof it did not.
+func TestARefusedReplyLeavesNoDeliveryEvidence(t *testing.T) {
+	h := newHarness(t, "[[rules]]\nsituation = \"*\"\nnever_auto = [\"rm -rf\"]\n")
+	h.herdr.setPane("Enter a command:\n> ")
+	id := h.seedEscalation(domain.AuditRecord{
+		AgentID: "a1", SituationType: domain.SituationApproval, Suggestion: "respond: y",
+	})
+	got := h.deliverReplyNow(id, "rm -rf /", "a1")
+	if got.Status != domain.AgentActionFailed {
+		t.Fatalf("status = %q, want failed", got.Status)
+	}
+	if got.SideEffect {
+		t.Error("a refused reply was marked as possibly delivered")
+	}
+}

@@ -43,7 +43,7 @@ func TestAnActionIsRefusedWithNoDaemonRunning(t *testing.T) {
 // definition not draining anything, which is exactly the case a bare
 // "is it running" check would wave through.
 func TestAnActionIsRefusedByAHungDaemon(t *testing.T) {
-	app := appWithDaemon(t, true, 4242, "")
+	app := appWithDaemon(t, true, 4242, buildinfo.Version)
 	if err := daemonhealth.Write(app.StateDir, daemonhealth.Health{
 		PID:         4242,
 		HeartbeatAt: time.Now().Add(-daemonhealth.StaleAfter - time.Minute),
@@ -65,7 +65,7 @@ func TestAnActionIsRefusedByAHungDaemon(t *testing.T) {
 // A daemon whose binary was replaced underneath it keeps running, but every
 // child it spawns from that path fails. It cannot be trusted with an action.
 func TestAnActionIsRefusedByADaemonWhoseBinaryWentAway(t *testing.T) {
-	app := appWithDaemon(t, true, 4242, "")
+	app := appWithDaemon(t, true, 4242, buildinfo.Version)
 	if err := daemonhealth.Write(app.StateDir, daemonhealth.Health{
 		PID: 4242, HeartbeatAt: time.Now(), BinaryReplaced: true,
 	}); err != nil {
@@ -77,7 +77,7 @@ func TestAnActionIsRefusedByADaemonWhoseBinaryWentAway(t *testing.T) {
 }
 
 func TestAHealthyDaemonAcceptsActions(t *testing.T) {
-	app := appWithDaemon(t, true, 4242, "")
+	app := appWithDaemon(t, true, 4242, buildinfo.Version)
 	if err := daemonhealth.Write(app.StateDir, daemonhealth.Health{
 		PID: 4242, HeartbeatAt: time.Now(),
 	}); err != nil {
@@ -85,6 +85,29 @@ func TestAHealthyDaemonAcceptsActions(t *testing.T) {
 	}
 	if err := app.requireLiveDaemon(); err != nil {
 		t.Fatalf("refused a healthy daemon: %v", err)
+	}
+}
+
+// A daemon OLDER than this binary may have no action drain at all — while its
+// correction pass, which predates the withholding filter, happily consumes the
+// paired correction and resolves the escalation. The answer would be gone from
+// the queue with nothing typed and the action pending forever.
+func TestAnActionIsRefusedByAStaleDaemon(t *testing.T) {
+	app := appWithDaemon(t, true, 4242, "v0.0.1-ancient")
+	if err := daemonhealth.Write(app.StateDir, daemonhealth.Health{
+		PID: 4242, HeartbeatAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := app.requireLiveDaemon()
+	if err == nil {
+		t.Fatal("queued an agent action for a daemon that may not know how to run it")
+	}
+	if !errors.Is(err, ErrDaemonUnavailable) {
+		t.Errorf("error %v does not wrap ErrDaemonUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "v0.0.1-ancient") {
+		t.Errorf("error = %q; want it to name the version actually running", err)
 	}
 }
 

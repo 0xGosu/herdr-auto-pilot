@@ -356,7 +356,21 @@ type DaemonStore interface {
 	ClaimAgentAction(ctx context.Context, id int64, now time.Time) (bool, error)
 	FinishAgentAction(ctx context.Context, id int64, status domain.AgentActionStatus, errText, result string, now time.Time) (bool, error)
 	ReleaseAgentAction(ctx context.Context, id int64, now time.Time) (bool, error)
-	ReclaimRunningAgentActions(ctx context.Context, now time.Time) (int64, error)
+	// ReclaimRunningAgentActions recovers claims a crash left behind, splitting
+	// them: an action that had not reached its side effect goes back to the
+	// queue, one that HAD is failed. Delivery is not idempotent, so a replayed
+	// action would type an operator's answer twice.
+	ReclaimRunningAgentActions(ctx context.Context, now time.Time) (requeued, failed int64, err error)
+	// MarkAgentActionSideEffect records that an action is about to do
+	// something the world will remember. Called immediately before the
+	// keystrokes, so a daemon that dies leaves evidence rather than a row that
+	// looks untouched.
+	MarkAgentActionSideEffect(ctx context.Context, id int64, now time.Time) error
+	// FinishAgentActionWithdrawn fails an action AND removes its paired
+	// correction in one transaction — the refusal path, where the audit row
+	// must be left untouched and the two writes cannot be separated to achieve
+	// that.
+	FinishAgentActionWithdrawn(ctx context.Context, id int64, errText string, correctionID int64, now time.Time) (bool, error)
 
 	UpsertSignature(ctx context.Context, s domain.SignatureState) error
 	// EnsureSignature atomically creates a fresh signature state row if none
@@ -583,6 +597,10 @@ type ReadStore interface {
 	// AgentActionByID reads one queued action, nil when absent. Shared: the
 	// daemon executes actions, the front ends poll this for the outcome.
 	AgentActionByID(ctx context.Context, id int64) (*domain.AgentAction, error)
+	// AgentTerminalID returns herdr's terminal identity for an agent as the
+	// daemon last observed it, "" when unknown. Herdr reuses pane ids, so this
+	// is what tells "same agent" from "new terminal on a recycled pane id".
+	AgentTerminalID(ctx context.Context, agentID string) (string, error)
 	GetSignature(ctx context.Context, signature string) (*domain.SignatureState, error)
 	DecisionsForSignature(ctx context.Context, signature string, limit int) ([]domain.DecisionRecord, error)
 	// CountDecisionsForSignature counts ALL of a signature's decisions, with no

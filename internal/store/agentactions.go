@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 
 // agentActionColumns is the one spelling of the row, shared by every reader so
 // a new column can never be scanned in one place and forgotten in another.
-const agentActionColumns = `id, kind, target, payload_json, correction_id, author, status, error, result_json, attempts, created_at, updated_at`
+const agentActionColumns = `id, kind, target, payload_json, correction_id, terminal_id, side_effect, author, status, error, result_json, attempts, created_at, updated_at`
 
 // EnqueueAgentAction queues an action for the daemon to perform and returns its
 // id. The caller nudges afterwards; a failed nudge only costs latency, since
@@ -40,10 +41,10 @@ func insertAgentActionTx(ctx context.Context, tx *sql.Tx, a domain.AgentAction) 
 		now = time.Now()
 	}
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_actions (kind, target, payload_json, correction_id, author, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		string(a.Kind), a.Target, a.Payload, a.CorrectionID, orDefault(a.Author, "operator"),
-		string(domain.AgentActionPending), unix(now), unix(now))
+		INSERT INTO agent_actions (kind, target, payload_json, correction_id, terminal_id, author, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		string(a.Kind), a.Target, a.Payload, a.CorrectionID, a.TerminalID,
+		orDefault(a.Author, "operator"), string(domain.AgentActionPending), unix(now), unix(now))
 	if err != nil {
 		return 0, err
 	}
@@ -162,28 +163,100 @@ func (s *Store) ReleaseAgentAction(ctx context.Context, id int64, now time.Time)
 	return released, err
 }
 
-// ReclaimRunningAgentActions returns every 'running' row to 'pending',
-// reporting how many. Called once at daemon start: 'running' means "a daemon
-// holds this claim", and at startup no daemon does, so a row left there by a
-// crash would be invisible to the drain forever while the surface that queued
-// it polls until its timeout.
+// ReclaimRunningAgentActions recovers claims a crashed daemon left behind,
+// reporting how many were returned to the queue and how many were failed
+// because their side effect may already have landed.
 //
-// Mirrors ReclaimAbandonedAutoAccepts, and is safe for the same reason: the
-// action re-runs its own guards from scratch, and its attempt counter was
-// already spent, so a row that crashes the daemon cannot loop indefinitely.
-func (s *Store) ReclaimRunningAgentActions(ctx context.Context, now time.Time) (int64, error) {
-	var n int64
-	err := s.tx(ctx, func(tx *sql.Tx) error {
+// Called once at daemon start: 'running' means "a daemon holds this claim", and
+// at startup none does, so a row left there would be invisible to the drain
+// forever while the surface that queued it polls to its timeout.
+//
+// The split is what keeps recovery safe. An action that had not yet reached its
+// side effect can be re-run — it re-takes every guard from scratch. One that HAD
+// (side_effect = 1, written immediately before the keystrokes) must never be
+// replayed: delivery is not idempotent, and typing an operator's answer a
+// second time is worse than not answering at all. Those are failed with a
+// reason that sends the operator to look at the agent, which is the only thing
+// that can actually establish what happened.
+func (s *Store) ReclaimRunningAgentActions(ctx context.Context, now time.Time) (requeued, failed int64, err error) {
+	err = s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
+			UPDATE agent_actions SET status = ?, error = ?, updated_at = ?
+			WHERE status = ? AND side_effect = 1`,
+			string(domain.AgentActionFailed),
+			"the daemon stopped after this was sent but before the result was recorded, "+
+				"so it may or may not have reached the agent; check the agent before answering again",
+			unix(now), string(domain.AgentActionRunning))
+		if err != nil {
+			return err
+		}
+		if failed, err = res.RowsAffected(); err != nil {
+			return err
+		}
+		res, err = tx.ExecContext(ctx, `
 			UPDATE agent_actions SET status = ?, updated_at = ? WHERE status = ?`,
 			string(domain.AgentActionPending), unix(now), string(domain.AgentActionRunning))
 		if err != nil {
 			return err
 		}
-		n, err = res.RowsAffected()
+		requeued, err = res.RowsAffected()
 		return err
 	})
-	return n, err
+	return requeued, failed, err
+}
+
+// MarkAgentActionSideEffect records that this action is ABOUT to do something
+// the world will remember, so a daemon that dies in the next instant leaves
+// evidence rather than a row that looks untouched.
+//
+// Called immediately before the keystrokes and before them only. A failure here
+// happens BEFORE anything is sent, so the caller can refuse safely; the reverse
+// order — send, then mark — would leave exactly the window this closes.
+func (s *Store) MarkAgentActionSideEffect(ctx context.Context, id int64, now time.Time) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE agent_actions SET side_effect = 1, updated_at = ? WHERE id = ?`,
+			unix(now), id)
+		return err
+	})
+}
+
+// FinishAgentActionWithdrawn writes an action's terminal outcome AND removes
+// the correction it was paired with, in ONE transaction.
+//
+// It is the refusal path: a reply the safety controls vetoed, or one whose
+// escalation is no longer open. Both must leave the audit row untouched, and
+// the two writes cannot be separated to achieve that. applyCorrection ends by
+// flipping its audit row to "resolved" whatever the delivery did, and the
+// withholding filter stops excluding a correction the moment its action goes
+// terminal — so a withdrawal that failed after the outcome was written would
+// let the next correction pass resolve an escalation that was never answered.
+//
+// Either both land or neither does; a failed transaction leaves the action
+// 'running' for the caller to retry.
+func (s *Store) FinishAgentActionWithdrawn(ctx context.Context, id int64, errText string, correctionID int64, now time.Time) (bool, error) {
+	var done bool
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE agent_actions SET status = ?, error = ?, updated_at = ?
+			WHERE id = ? AND status = ?`,
+			string(domain.AgentActionFailed), errText, unix(now), id, string(domain.AgentActionRunning))
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		done = n > 0
+		if !done || correctionID == 0 {
+			return nil
+		}
+		_, err = tx.ExecContext(ctx,
+			`DELETE FROM corrections WHERE id = ? AND processed = 0`, correctionID)
+		return err
+	})
+	return done, err
 }
 
 func scanAgentActions(rows *sql.Rows) ([]domain.AgentAction, error) {
@@ -192,10 +265,13 @@ func scanAgentActions(rows *sql.Rows) ([]domain.AgentAction, error) {
 		var a domain.AgentAction
 		var kind, status string
 		var created, updated int64
-		if err := rows.Scan(&a.ID, &kind, &a.Target, &a.Payload, &a.CorrectionID, &a.Author,
+		var sideEffect int
+		if err := rows.Scan(&a.ID, &kind, &a.Target, &a.Payload, &a.CorrectionID,
+			&a.TerminalID, &sideEffect, &a.Author,
 			&status, &a.Error, &a.Result, &a.Attempts, &created, &updated); err != nil {
 			return nil, err
 		}
+		a.SideEffect = sideEffect != 0
 		a.Kind = domain.AgentActionKind(kind)
 		a.Status = domain.AgentActionStatus(status)
 		a.CreatedAt = fromUnix(created)
@@ -204,6 +280,10 @@ func scanAgentActions(rows *sql.Rows) ([]domain.AgentAction, error) {
 	}
 	return out, rows.Err()
 }
+
+// ErrEscalationNotOpen reports a delivery queued for an audit row that is no
+// longer a pending escalation.
+var ErrEscalationNotOpen = errors.New("the escalation is no longer open")
 
 // InsertCorrectionWithDelivery records an operator correction AND queues the
 // delivery of it in one transaction, returning both ids.
@@ -222,6 +302,22 @@ func scanAgentActions(rows *sql.Rows) ([]domain.AgentAction, error) {
 func (s *Store) InsertCorrectionWithDelivery(ctx context.Context, c domain.CorrectionRecord, a domain.AgentAction) (correctionID, actionID int64, err error) {
 	c.Sent = false
 	err = s.tx(ctx, func(tx *sql.Tx) error {
+		// The escalation must still be OPEN, checked inside this transaction.
+		// A concurrent dismissal that wins the race would otherwise be
+		// overwritten: the daemon would deliver anyway, and applyCorrection
+		// would flip the dismissed row back to "resolved". Whoever gets here
+		// first decides.
+		var status string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT status FROM audit_log WHERE id = ?`, c.AuditID).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("audit record %d not found", c.AuditID)
+			}
+			return err
+		}
+		if status != "escalated" {
+			return fmt.Errorf("%w: audit record %d is %q", ErrEscalationNotOpen, c.AuditID, status)
+		}
 		var err error
 		if correctionID, err = insertCorrectionTx(ctx, tx, c); err != nil {
 			return err
@@ -266,4 +362,20 @@ func (s *Store) DeleteCorrection(ctx context.Context, id int64) (bool, error) {
 		return nil
 	})
 	return deleted, err
+}
+
+// AgentTerminalID returns herdr's terminal identity for an agent as the daemon
+// last observed it, or "" when unknown.
+//
+// The daemon keeps this current through SyncAgentTerminalID. Reading it is how
+// a queued action can tell "same agent" from "new terminal on a reused pane id"
+// without a herdr round trip — the same evidence task_reservations compares.
+func (s *Store) AgentTerminalID(ctx context.Context, agentID string) (string, error) {
+	var id string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT terminal_id FROM agent_names WHERE agent_id = ?`, agentID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
 }

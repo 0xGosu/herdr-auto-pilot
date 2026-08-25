@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
@@ -60,6 +61,16 @@ func (a *App) requireLiveDaemon() error {
 	case h.BinaryReplaced:
 		return fmt.Errorf("%w: the daemon's binary was replaced underneath it; hand it over with `hap daemon --ensure`",
 			ErrDaemonUnavailable)
+	case h.VersionStale:
+		// A daemon older than this binary may have no action drain at all,
+		// while its correction pass — which predates the withholding filter —
+		// happily consumes the paired correction and resolves the escalation.
+		// The answer would then be gone from the queue with nothing typed and
+		// the action pending forever. Refuse rather than negotiate: the herd
+		// is meant to be upgraded, and the remedy is one command.
+		return fmt.Errorf("%w: the running daemon is version %s, older than this %s binary, and may not "+
+			"execute queued actions; upgrade it with `hap daemon --ensure`",
+			ErrDaemonUnavailable, h.Version, buildinfo.Version)
 	}
 	return nil
 }

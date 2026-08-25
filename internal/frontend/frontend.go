@@ -739,6 +739,15 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	if err != nil {
 		return err
 	}
+	// Herdr RECYCLES pane ids, so the pane id alone is not an address: between
+	// this confirm and the daemon's send, the terminal behind it can be
+	// replaced and the reply typed at a stranger. Bind the action to the
+	// identity the daemon last observed (best-effort — an unknown one is not
+	// evidence of change, and the daemon treats it as such).
+	terminalID, err := a.Store.AgentTerminalID(ctx, audit.AgentID)
+	if err != nil {
+		return err
+	}
 	// One transaction. The daemon marks a correction processed permanently,
 	// reading its Sent flag on the way past to arm the post-action unblock
 	// self-check; a sweep landing between two separate inserts would process
@@ -750,7 +759,8 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		},
 		domain.AgentAction{
 			Kind: domain.AgentActionDeliverReply, Target: audit.AgentID,
-			Payload: string(payload), Author: a.Author, CreatedAt: time.Now(),
+			TerminalID: terminalID, Payload: string(payload),
+			Author: a.Author, CreatedAt: time.Now(),
 		})
 	if err != nil {
 		return err

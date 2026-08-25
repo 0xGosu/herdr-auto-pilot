@@ -28,6 +28,17 @@ type AgentAction struct {
 	// done for good, so the Sent flag it arms the unblock self-check from
 	// would flip a moment later with nothing left to read it.
 	CorrectionID int64
+	// TerminalID is herdr's terminal identity for Target as it stood when the
+	// action was queued. Herdr RECYCLES pane ids, so the pane id alone is not
+	// an address: between queueing and delivery the terminal behind it can be
+	// replaced, and the reply would be typed at a stranger. Empty means "not
+	// observed" and is never treated as a match.
+	TerminalID string
+	// SideEffect reports that this action may ALREADY have had its effect —
+	// set immediately before the keystrokes, so a daemon that dies between the
+	// send and the outcome write leaves evidence. Delivery is not idempotent,
+	// so such a row is failed at startup rather than replayed.
+	SideEffect bool
 	// Author is who queued it ("operator", or "daemon" for the FSP seam).
 	Author string
 	Status AgentActionStatus
