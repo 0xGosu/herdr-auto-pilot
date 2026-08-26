@@ -561,6 +561,8 @@ confirmation_weight = 2.0  # confidence weight for an operator confirmation (>=1
 max_consecutive_auto_prompts = 30  # per agent, without human interaction
 max_auto_prompts_per_minute = 5    # per agent
 max_error_retries = 2              # per error signature
+# All three are INERT while full self-prompting runs with honour_limits = false
+# (the default) — see the full self-prompting section.
 
 # Auto-accept aged escalations — OFF by default, see the section below.
 [escalations.auto_accept]
@@ -2036,10 +2038,14 @@ is active.** Neither ceiling gates a send, a runaway pause left over from before
 you turned the mode on no longer benches the agent, and — since it lives in the
 same section — `max_error_retries` stops gating too, so a failing error
 signature is retried without bound. This is blanket unattended autonomy: the
-only frequency bound is how fast the agents ask. Deliveries still *advance* the
-counters, so turning the key on later resumes against a real record, and
-`hap config show` marks the `limits:` line as not enforced so the numbers do not
-read as active.
+only frequency bound is how fast the agents ask. `hap config show` marks the
+`limits:` line as not enforced so the numbers do not read as active.
+
+Deliveries still *advance* the counters while inert — but `max_consecutive_auto_prompts`
+counts up and is reset only by human interaction, which is exactly what this mode
+does without. So turning `honour_limits` on after a long unattended run trips the
+consecutive ceiling on the very next sweep and switches the mode straight back
+off. Interact with the agent, or raise the ceiling, before flipping the key.
 
 Everything outside `[limits]` is unaffected either way: the kill switch,
 per-agent disables (`hap agent disable`), never-auto rules and the

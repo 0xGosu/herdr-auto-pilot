@@ -1531,7 +1531,7 @@ func TestFSPRechecksTheModeBeforeClaiming(t *testing.T) {
 	// row; the re-check before the claim is the only thing that can stop it.
 	h.daemon.autoAcceptOne(ctx, auditRow(t, h, id), "Yes",
 		map[string]domain.AgentTransition{"pA": {AgentID: "pA", Status: "blocked"}},
-		&paneCache{}, time.Now(), true, false,
+		&paneCache{}, time.Now(), true, false, false,
 		h.daemon.fspStillOn)
 
 	if got := auditStatus(t, h, id); got != "escalated" {
@@ -1602,7 +1602,7 @@ func TestFSPRechecksAcceptGeneratedTaskBeforeClaiming(t *testing.T) {
 	// row with the stale `true`; only the re-check before the claim can stop it.
 	h.daemon.autoAcceptOne(ctx, auditRow(t, h, id), domain.SuggestGenerateTask,
 		map[string]domain.AgentTransition{"pA": {AgentID: "pA", Status: "idle"}},
-		&paneCache{}, time.Now(), true, true, h.daemon.fspStillOn)
+		&paneCache{}, time.Now(), true, true, false, h.daemon.fspStillOn)
 
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Errorf("status = %q, want escalated — the opt-in was switched off mid-chain", got)
@@ -1638,7 +1638,7 @@ func TestAutoAcceptRechecksTheKillSwitchBeforeClaiming(t *testing.T) {
 			}
 			h.daemon.autoAcceptOne(ctx, auditRow(t, h, id), "Yes",
 				map[string]domain.AgentTransition{"pA": {AgentID: "pA", Status: "blocked"}},
-				&paneCache{}, time.Now(), fsp, false, permitted)
+				&paneCache{}, time.Now(), fsp, false, false, permitted)
 
 			if got := auditStatus(t, h, id); got != "escalated" {
 				t.Errorf("status = %q, want escalated — the kill switch was activated mid-chain", got)

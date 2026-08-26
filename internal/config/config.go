@@ -140,9 +140,15 @@ type FullSelfPrompting struct {
 	// ceiling gates a send, the Paused stand-down they set is ignored, and —
 	// because it is the third key in the same section — limits.max_error_retries
 	// stops gating too, so an error signature retries without bound and
-	// retry_exhausted is never raised. Deliveries still ADVANCE the counters
-	// (daemon.noteFSPSend), so the record is intact if the operator turns this
-	// back on.
+	// retry_exhausted is never raised.
+	//
+	// Deliveries still ADVANCE the counters (daemon.noteFSPSend), and that is a
+	// mechanism, not a reassurance: ConsecutiveAuto is reset ONLY by
+	// RegisterHumanInteraction, and the mode's premise is that nobody
+	// interacts, so it grows without bound while inert. Turning HonourLimits on
+	// after an unattended run therefore trips fspCeilingReached on the next
+	// sweep's first candidate and stands the whole mode down. Interact with the
+	// agent (or raise the ceiling) before flipping it.
 	//
 	// It used to mean only "skip the mode's own pre-check": the counters kept
 	// gating, so one decision later Decide raised rate_limited and paused that

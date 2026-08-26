@@ -588,14 +588,14 @@ func TestFSPNoopRetirementStopsWhenTheModeIsSwitchedOffMidSweep(t *testing.T) {
 		domain.ActionNoopSuggestion, time.Minute)
 	rec := auditRow(t, h, id)
 
-	h.daemon.retireNoopEscalation(ctx, rec, time.Now(), func() bool { return false })
+	h.daemon.retireNoopEscalation(ctx, rec, time.Now(), false, func() bool { return false })
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Fatalf("status = %q, want it left pending once the mode was switched off", got)
 	}
 
 	// And the control: with the mode still on, the very same call retires it — so
 	// the assertion above is about the re-check and not about something else.
-	h.daemon.retireNoopEscalation(ctx, rec, time.Now(), func() bool { return true })
+	h.daemon.retireNoopEscalation(ctx, rec, time.Now(), false, func() bool { return true })
 	if got := auditStatus(t, h, id); got != "dismissed" {
 		t.Fatalf("status = %q, want dismissed while the mode is still on", got)
 	}

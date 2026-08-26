@@ -8,6 +8,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
 // fspLimitsInert is the configuration under test: full self-prompting on with
@@ -285,8 +286,12 @@ func TestEligibleIdleAgentsInertOnlyRelaxesThePause(t *testing.T) {
 
 	t.Run("a rate pause is relaxed", func(t *testing.T) {
 		h := setup(t)
-		if got := h.daemon.eligibleIdleAgents(ctx, src, agents, time.Now(), nil, nil); len(got) != 1 {
+		if got := h.daemon.eligibleIdleAgents(ctx, src, agents, time.Now(), nil, nil, true); len(got) != 1 {
 			t.Errorf("got %d eligible agents, want 1 — a rate pause is a [limits] stand-down", len(got))
+		}
+		// The control: with the limits honoured the very same state benches it.
+		if got := h.daemon.eligibleIdleAgents(ctx, src, agents, time.Now(), nil, nil, false); len(got) != 0 {
+			t.Errorf("control: got %d eligible agents, want 0 while [limits] applies", len(got))
 		}
 	})
 	t.Run("a per-agent disable is not", func(t *testing.T) {
@@ -297,10 +302,80 @@ func TestEligibleIdleAgentsInertOnlyRelaxesThePause(t *testing.T) {
 		if err := h.raw.SetAgentDisabled(ctx, "pA", true); err != nil {
 			t.Fatal(err)
 		}
-		if got := h.daemon.eligibleIdleAgents(ctx, src, agents, time.Now(), nil, nil); len(got) != 0 {
+		if got := h.daemon.eligibleIdleAgents(ctx, src, agents, time.Now(), nil, nil, true); len(got) != 0 {
 			t.Errorf("got %d eligible agents, want 0 — a disabled agent is not a limits question", len(got))
 		}
 	})
+}
+
+// TestLLMPromotionUnderInertLimitsIsNotRateLimited covers the rate guard on the
+// LLM-promotion path (daemon.go's "at LLM promotion"), which is a SEPARATE
+// CheckRate call site from the one Decide runs. Dropping Inert there leaves the
+// reported bug reachable through a different door — and a worse one, because
+// the escalation it raises also pauses the agent.
+func TestLLMPromotionUnderInertLimitsIsNotRateLimited(t *testing.T) {
+	// No learned rule for this pane, so the episode resolves to a consult and
+	// the answer is promoted — which is what reaches the guard.
+	h := newHarnessConsult(t, fspLimitsInert+"\n[llm]\ncommand = [\"fake\"]\ntimeout_seconds = 5\nauto_act_confidence_threshold = 50\n",
+		func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+			return &domain.LLMDecision{Action: "Yes", ConfidentScore: 99}, nil
+		})
+	seedGraduatedSignatures(t, h, config.MinFSPGraduatedRules)
+	h.herdr.setPane(approvalPane)
+	saturateConsecutive(t, h, "pA", 99)
+
+	h.push("pA", "blocked")
+
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) > 0 })
+	if got := rationalesContaining(t, h, "[rate_limited]"); len(got) != 0 {
+		t.Errorf("the LLM-promotion guard must not gate a send while [limits] is inert, got %v", got)
+	}
+	rate, err := h.raw.GetAgentRate(context.Background(), "pA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate.Paused {
+		t.Error("no rate_limited escalation was raised, so nothing may have paused the agent")
+	}
+}
+
+// TestABusyPaneEscalatesAsPaneBusy drives a REAL acquirePane collision, which is
+// the only thing that pins the reason at the call sites the fix changed:
+// asserting escalate()'s behaviour on a hand-built decision leaves every one of
+// them free to go back to ReasonRateLimited with the suite still green.
+func TestABusyPaneEscalatesAsPaneBusy(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	s := domain.Situation{
+		AgentID: "pA", PaneID: "pA", AgentType: "claude",
+		Type: domain.SituationApproval, Content: remoteEnvPane,
+	}
+	sig := domain.ComputeSignature(s)
+	ks, ok := h.daemon.opt.Herdr.(ports.KeystrokeSender)
+	if !ok {
+		t.Fatal("the fake herdr must be able to send keystrokes")
+	}
+	// Another interaction already owns this agent's pane.
+	if !h.daemon.acquirePane("pA") {
+		t.Fatal("the pane must start free")
+	}
+
+	h.daemon.deliverRemoteEnv(ctx, ks, s, sig,
+		domain.Decision{Action: domain.ActionSend, Input: "Yes"},
+		domain.AgentTransition{AgentID: "pA", PaneID: "pA", AgentType: "claude", Status: "blocked"},
+		time.Now())
+
+	got := rationalesContaining(t, h, "["+string(domain.ReasonPaneBusy)+"]")
+	if len(got) == 0 {
+		t.Fatalf("want a [pane_busy] escalation, got %v", rationalesContaining(t, h, "["))
+	}
+	rate, err := h.raw.GetAgentRate(ctx, "pA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate.Paused {
+		t.Error("a momentary pane lock is not a runaway; the agent must not be paused")
+	}
 }
 
 // TestPaneBusyEscalationDoesNotPauseTheAgent: a busy pane used to be reported as

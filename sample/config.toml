@@ -42,6 +42,8 @@ disabled_seed_patterns = []      # silence individual shipped rules by id instea
 max_consecutive_auto_prompts = 30  # per agent, without human interaction
 max_auto_prompts_per_minute = 5    # per agent
 max_error_retries = 2              # per error signature
+# All three are INERT while full self-prompting runs with honour_limits =
+# false (the default) — see [full_self_prompting] below.
 # Note: the escalation duplicate-ask tuning (dedup window + large-capture jitter
 # tolerance) is a fixed internal constant and is no longer configurable.
 
