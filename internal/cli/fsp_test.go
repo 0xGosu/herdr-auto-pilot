@@ -167,3 +167,42 @@ func TestConfigSetAcceptsTheMovedFSPKey(t *testing.T) {
 		t.Errorf("confirmation should name the canonical key, got:\n%s", out)
 	}
 }
+
+// TestConfigShowMarksTheLimitsLineNotEnforced: printing three ceilings that
+// nothing enforces reads as a broken plugin, which is the whole reason the note
+// exists. Paired with the default, where the numbers ARE in force.
+func TestConfigShowMarksTheLimitsLineNotEnforced(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+
+	out, err := run(t, app, "config", "show")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "not enforced") {
+		t.Errorf("with the mode off the ceilings are in force, got:\n%s", out)
+	}
+
+	seedFullSelfPromptingPreconditions(t, app, st)
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	out, err = run(t, app, "config", "show")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "not enforced: full_self_prompting.honour_limits = false") {
+		t.Errorf("the limits line must say the ceilings are inert, got:\n%s", out)
+	}
+
+	if _, err := app.SetField(ctx, "full_self_prompting.honour_limits", "true"); err != nil {
+		t.Fatal(err)
+	}
+	out, err = run(t, app, "config", "show")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "not enforced") {
+		t.Errorf("with honour_limits on the ceilings are in force, got:\n%s", out)
+	}
+}

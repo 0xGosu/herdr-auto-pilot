@@ -88,7 +88,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	fsp := d.fspActive(ctx, cfg)
 	// One resolution for the whole pass, from the same snapshot fsp came from:
 	// every per-row gate below reads this rather than paying for fspActive again.
-	limitsInert := d.limitsInertFor(cfg, fsp)
+	limitsInert := limitsInertFor(cfg, fsp)
 	if fsp {
 		// Full self-prompting: zero wait for ALL five types — including idle
 		// and unclassifiable, whose timed auto-accept defaults are disabled.
@@ -932,13 +932,13 @@ func (d *Daemon) limitsInert(ctx context.Context, cfg config.Config) bool {
 }
 
 // limitsInertFor is limitsInert for a caller that has already resolved whether
-// full self-prompting is active. Free — no store access at all.
+// full self-prompting is active. Free — no store access, and so no receiver.
 //
 // cfg must be the SAME snapshot fsp was derived from. A mid-sweep reload would
 // otherwise pair a stale fsp with a fresh config; nothing is delivered on that
 // pairing (claimBlockedBy re-asks the mode before every claim), but the two
 // functions are only obviously equivalent when both halves come from one read.
-func (d *Daemon) limitsInertFor(cfg config.Config, fsp bool) bool {
+func limitsInertFor(cfg config.Config, fsp bool) bool {
 	return fsp && !cfg.FullSelfPrompting.HonourLimits
 }
 
@@ -1234,7 +1234,7 @@ func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
 	}
 	live := map[string]domain.AgentTransition{rec.AgentID: agent}
 	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now, true, allowGenerated,
-		d.limitsInertFor(cfg, true), permitted) == autoAcceptDelivered {
+		limitsInertFor(cfg, true), permitted) == autoAcceptDelivered {
 		d.noteFSPSend(ctx, rec.AgentID, now)
 		slog.Info("full self-prompting: escalation answered immediately",
 			"agent", rec.AgentID, "audit_id", rec.ID)

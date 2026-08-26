@@ -65,10 +65,60 @@ func TestFSPWithoutHonourLimitsIgnoresALeftoverPause(t *testing.T) {
 	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
 
 	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
-		t.Errorf("status = %q, want %q — a rate-guard pause is part of what [limits] means",
+		t.Errorf("sweep: status = %q, want %q — a rate-guard pause is part of what [limits] means",
 			got, domain.AuditStatusAutoAccepted)
 	}
 	seams.assertNeverDisabled(t)
+
+	// And the escalate-time hook, which is the path that answers NEW
+	// escalations and so the common one under this mode. It resolves
+	// limitsInert independently of the sweep, so it needs its own case: without
+	// this the hook can go back to benching paused agents with the suite green.
+	h.herdr.setAgents(parked("pA", "blocked"))
+	id2 := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 5*time.Second)
+	h.daemon.fspAcceptNow(ctx, id2, "pA", time.Now())
+	if got := auditStatus(t, h, id2); got != domain.AuditStatusAutoAccepted {
+		t.Errorf("immediate hook: status = %q, want %q", got, domain.AuditStatusAutoAccepted)
+	}
+}
+
+// TestFSPWithoutHonourLimitsRetiresANoopForAPausedAgent is the one place
+// inertness makes an IRREVERSIBLE action newly reachable: a "@noop" escalation
+// belonging to a rate-paused agent is now dismissed rather than retained. That
+// is the intended reading of "the limits are off" — only the pause clause moved,
+// and the kill switch and per-agent disable still gate the dismissal through
+// claimBlockedBy — but a destructive path deserves to be named rather than
+// implied by the Guard 1b unit test.
+func TestFSPWithoutHonourLimitsRetiresANoopForAPausedAgent(t *testing.T) {
+	ctx := context.Background()
+	seed := func(t *testing.T) (*harness, int64) {
+		t.Helper()
+		h, _ := newFSPHarnessWithSeams(t, fspLimitsInert)
+		h.herdr.setPane(approvalPane)
+		if err := h.raw.UpdateAgentRate(ctx, domain.AgentRate{
+			AgentID: "pA", Paused: true, WindowStart: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval,
+			domain.ActionNoop, 5*time.Second)
+		return h, id
+	}
+
+	t.Run("inert retires it", func(t *testing.T) {
+		h, id := seed(t)
+		h.daemon.retireNoopEscalation(ctx, auditRow(t, h, id), time.Now(), true, func() bool { return true })
+		if got := auditStatus(t, h, id); got != "dismissed" {
+			t.Errorf("status = %q, want dismissed", got)
+		}
+	})
+	t.Run("control: the pause still holds it", func(t *testing.T) {
+		h, id := seed(t)
+		h.daemon.retireNoopEscalation(ctx, auditRow(t, h, id), time.Now(), false, func() bool { return true })
+		if got := auditStatus(t, h, id); got != "escalated" {
+			t.Errorf("status = %q, want escalated — a pause holds the queue while [limits] applies", got)
+		}
+	})
 }
 
 // TestLimitsStillApplyWhenFSPCannotActivate is the first of the four bypass
