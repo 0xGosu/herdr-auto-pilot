@@ -162,6 +162,20 @@ const (
 	ReasonSuspectedIrrevers EscalateReason = "suspected_irreversible"
 	ReasonRateLimited       EscalateReason = "rate_limited"
 	ReasonRetryExhausted    EscalateReason = "retry_exhausted"
+	// ReasonPaneBusy: another pane interaction (a multi-tab form sweep, a
+	// series delivery, an auto-accept) already owns this agent's pane, so the
+	// keystrokes could not be issued without interleaving with it.
+	//
+	// It is deliberately NOT ReasonRateLimited, which it used to borrow. That
+	// reason is FR-019's runaway CEILING, and wearing its tag had two
+	// consequences neither call site wanted: escalate() pauses the agent until
+	// a human checks in (a momentary pane lock is not a runaway), and
+	// autoAcceptExcludedReasons refuses the row forever (so under full
+	// self-prompting a transient collision became permanently operator-only).
+	// A busy pane is transient by construction — the lock is released when the
+	// interaction that holds it finishes — so this reason neither pauses nor is
+	// excluded, and the row is simply reconsidered on a later pass.
+	ReasonPaneBusy EscalateReason = "pane_busy"
 	// ReasonDaemonPaused: the operator's pause/kill switch is active, so the
 	// daemon escalated instead of acting. Named for what the operator did
 	// (`p` in the TUI / `hap pause`) — "killed" read like a crash. Audit rows

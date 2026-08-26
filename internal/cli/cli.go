@@ -1420,8 +1420,16 @@ func printConfig(out io.Writer, cfg config.Config) {
 		cfg.ConfidenceThresholds.Minimum, cfg.ConfidenceThresholds.Idle, cfg.ConfidenceThresholds.Approval,
 		cfg.ConfidenceThresholds.Choice, cfg.ConfidenceThresholds.Error)
 	fmt.Fprintf(out, "learning:   graduation_n=%d confirmation_weight=%g\n", cfg.Learning.GraduationN, cfg.Learning.ConfirmationWeight)
-	fmt.Fprintf(out, "limits:     consecutive=%d per_minute=%d error_retries=%d\n",
-		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries)
+	limitsNote := ""
+	if cfg.FullSelfPrompting.Enabled && !cfg.FullSelfPrompting.HonourLimits {
+		// Printing three ceilings that nothing enforces reads as a broken
+		// plugin. Config-only, so this says what the config asks for; whether
+		// the mode's runtime preconditions currently hold is `hap status`.
+		limitsNote = " (not enforced: full_self_prompting.honour_limits = false)"
+	}
+	fmt.Fprintf(out, "limits:     consecutive=%d per_minute=%d error_retries=%d%s\n",
+		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute,
+		cfg.Limits.MaxErrorRetries, limitsNote)
 	fmt.Fprintf(out, "llm:        configured=%v timeout=%ds auto_act_confidence_threshold=%d\n",
 		len(cfg.LLM.Command) > 0, cfg.LLM.TimeoutSeconds, cfg.LLM.AutoActConfidenceThreshold)
 	for _, env := range cfg.LLM.EnvSummaries() {

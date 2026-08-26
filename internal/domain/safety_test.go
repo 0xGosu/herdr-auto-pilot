@@ -853,3 +853,35 @@ func TestSeedRuleForcedEscalationRequiresTheReasonToBeTheHit(t *testing.T) {
 		t.Error("an operator-sourced hit must not resolve through the reason gate")
 	}
 }
+
+// TestCheckRateInertIgnoresEveryCeilingAndThePause: RateLimits.Inert switches
+// the whole runaway guard off — both counters AND the Paused stand-down they
+// set. Paused matters most: it is cleared only by human interaction, so a
+// leftover pause would otherwise bench the agent for the entire life of a mode
+// whose premise is that nobody is watching. Every case is paired with its
+// non-inert control so the test cannot pass vacuously.
+func TestCheckRateInertIgnoresEveryCeilingAndThePause(t *testing.T) {
+	now := time.Now()
+	lim := RateLimits{MaxConsecutive: 5, MaxPerMinute: 10}
+	inert := RateLimits{MaxConsecutive: 5, MaxPerMinute: 10, Inert: true}
+
+	cases := []struct {
+		name string
+		rate AgentRate
+	}{
+		{"consecutive ceiling", AgentRate{ConsecutiveAuto: lim.MaxConsecutive, WindowStart: now}},
+		{"per-minute ceiling", AgentRate{WindowStart: now, CountInWindow: lim.MaxPerMinute}},
+		{"paused", PauseAgent(AgentRate{WindowStart: now})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, reason := CheckRate(tc.rate, now, lim, false); ok || reason != ReasonRateLimited {
+				t.Fatalf("control: %s must refuse without Inert, got ok=%v reason=%q", tc.name, ok, reason)
+			}
+			if ok, reason := CheckRate(tc.rate, now, inert, false); !ok || reason != ReasonNone {
+				t.Errorf("%s must not gate a send while [limits] is inert, got ok=%v reason=%q",
+					tc.name, ok, reason)
+			}
+		})
+	}
+}

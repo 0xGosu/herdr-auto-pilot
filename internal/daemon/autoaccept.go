@@ -318,7 +318,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 
 	// Guard 1b — a paused or operator-disabled agent is suppressed, never
 	// retired: a pause is a temporary operator control.
-	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID) {
+	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID, d.limitsInertFor(fsp)) {
 		d.notePending(rec, "the agent is disabled, or paused by the runaway guard")
 		return autoAcceptSkipped
 	}
@@ -727,7 +727,9 @@ func (d *Daemon) autoDismiss(ctx context.Context, rec *domain.AuditRecord,
 func (d *Daemon) retireNoopEscalation(ctx context.Context, rec *domain.AuditRecord,
 	now time.Time, stillPermitted func() bool) {
 
-	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID) {
+	// Reached only under full self-prompting (the caller gates on it), so the
+	// mode's own answer to [limits] is the one that applies.
+	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID, d.limitsInertFor(true)) {
 		return
 	}
 	// The same complete last look a claim takes. The kill switch matters most
@@ -746,7 +748,12 @@ func (d *Daemon) retireNoopEscalation(ctx context.Context, rec *domain.AuditReco
 // autoAcceptAgentSuppressed reports whether the agent is paused or
 // operator-disabled. Fails CLOSED: an unreadable state suppresses rather than
 // licenses an unattended send.
-func (d *Daemon) autoAcceptAgentSuppressed(ctx context.Context, agentID string) bool {
+//
+// limitsInert relaxes EXACTLY the pause clause (see domain.RateLimits.Inert).
+// The per-agent disable above it is an operator control, not a [limits]
+// ceiling, and is never affected — which is why this is a clause test rather
+// than an early return at the top of the function.
+func (d *Daemon) autoAcceptAgentSuppressed(ctx context.Context, agentID string, limitsInert bool) bool {
 	disabled, err := d.opt.Store.AgentDisabled(ctx, agentID)
 	if err != nil {
 		slog.Warn("auto-accept: agent-disabled read failed; skipping", "agent", agentID, "error", err)
@@ -754,6 +761,13 @@ func (d *Daemon) autoAcceptAgentSuppressed(ctx context.Context, agentID string) 
 	}
 	if disabled {
 		return true
+	}
+	if limitsInert {
+		// The pause is the only thing left to test, and it is switched off. Skip
+		// the read entirely rather than reading it and ignoring the answer: with
+		// nothing left to decide, a store error here would otherwise suppress
+		// the send over a value nobody was going to consult.
+		return false
 	}
 	rate, err := d.opt.Store.GetAgentRate(ctx, agentID)
 	if err != nil {
@@ -883,6 +897,37 @@ func (d *Daemon) screenOutbound(agentType, text string) error {
 		return fmt.Errorf("tripped irreversible %s", hit.Diagnostic())
 	}
 	return nil
+}
+
+// limitsInert reports whether the whole [limits] section is switched off right
+// now: full self-prompting ACTIVE with honour_limits = false. See
+// domain.RateLimits.Inert for what that covers and — just as important — what
+// it does not.
+//
+// Active, not merely enabled: a mode whose preconditions no longer hold has
+// reverted to the ordinary escalation flow, and the ordinary flow keeps its
+// ceilings.
+//
+// Both config reads come first and are free (in-memory), so an install that
+// never opted in never reaches d.fspActive's store query. Callers already
+// holding an fspActive answer should use limitsInertFor instead of paying for a
+// second one — and callers on a per-agent loop MUST, because fspActive also
+// owns the once-per-episode degradation warning.
+func (d *Daemon) limitsInert(ctx context.Context, cfg config.Config) bool {
+	if !cfg.FullSelfPrompting.Enabled || cfg.FullSelfPrompting.HonourLimits {
+		return false
+	}
+	return d.fspActive(ctx, cfg)
+}
+
+// limitsInertFor is limitsInert for a caller that has already resolved whether
+// full self-prompting is active. Free — the config read is in-memory.
+func (d *Daemon) limitsInertFor(fsp bool) bool {
+	if !fsp {
+		return false
+	}
+	cfg, _, _ := d.snapshot()
+	return !cfg.FullSelfPrompting.HonourLimits
 }
 
 // fspCeilingReached reports whether this agent has reached a [limits] runaway

@@ -767,6 +767,12 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
 	agents []domain.AgentTransition, now time.Time, driven, awaiting map[string]bool) []domain.AgentTransition {
 
+	// Resolved ONCE, above the loop: d.limitsInert can reach d.fspActive, which
+	// runs a store query and owns the once-per-episode degradation warning —
+	// neither belongs on a per-agent path.
+	cfg, _, _ := d.snapshot()
+	limitsInert := d.limitsInert(ctx, cfg)
+
 	var out []domain.AgentTransition
 	for _, a := range agents {
 		if driven[a.AgentID] || !autoSendParked(a.Status) {
@@ -803,8 +809,12 @@ func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
 		if disabled, err := d.opt.Store.AgentDisabled(ctx, a.AgentID); err != nil || disabled {
 			continue
 		}
-		if rate, err := d.opt.Store.GetAgentRate(ctx, a.AgentID); err != nil || rate.Paused {
-			continue
+		// The runaway guard's stand-down, and only it: the per-agent disable
+		// just above stays in force whatever [limits] says.
+		if !limitsInert {
+			if rate, err := d.opt.Store.GetAgentRate(ctx, a.AgentID); err != nil || rate.Paused {
+				continue
+			}
 		}
 		out = append(out, a)
 	}

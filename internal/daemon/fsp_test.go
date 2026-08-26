@@ -566,8 +566,12 @@ func TestFSPDeliveryAdvancesTheRunawayGuard(t *testing.T) {
 // TestFSPRatePausedAgentIsSuppressed: once the runaway guard pauses an
 // agent, full self-prompting answers nothing for it — the pause is the human-check-in
 // gate that breaks an answer loop, so it must hold on both paths.
+//
+// Scoped to honour_limits = ON. With it off the whole [limits] section is inert
+// and the pause is part of what that switches off, since the guard is the only
+// thing that ever sets one — see TestFSPWithoutHonourLimitsIgnoresALeftoverPause.
 func TestFSPRatePausedAgentIsSuppressed(t *testing.T) {
-	h := newFSPHarness(t, fspOn)
+	h := newFSPHarness(t, fspHonourLimits)
 	ctx := context.Background()
 	rate, err := h.raw.GetAgentRate(ctx, "pA")
 	if err != nil {

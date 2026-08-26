@@ -288,8 +288,15 @@ func Decide(in DecideInput) Decision {
 	// Error retry ceiling (FR-014): max automated retries per error
 	// signature; exhaustion forces escalation regardless of confidence.
 	// A noop is not a retry — doing nothing cannot loop the error.
-	if in.Situation.Type == SituationError && in.RetryCount >= in.MaxRetries &&
-		candidate != ActionNoop {
+	//
+	// limits.max_error_retries lives in the same [limits] section as the two
+	// runaway ceilings, so RateLimits.Inert switches it off with them: full
+	// self-prompting with honour_limits = false means no [limits] key gates a
+	// send. The consequence is deliberate and worth naming — an error signature
+	// then retries without bound, and ReasonRetryExhausted (and so its entry in
+	// autoAcceptExcludedReasons) is never reached.
+	if !in.RateLimits.Inert && in.Situation.Type == SituationError &&
+		in.RetryCount >= in.MaxRetries && candidate != ActionNoop {
 		return esc(ReasonRetryExhausted,
 			fmt.Sprintf("retry ceiling %d", in.MaxRetries),
 			conf.Score, suggestion)
