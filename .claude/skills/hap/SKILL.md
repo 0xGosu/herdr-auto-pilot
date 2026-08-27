@@ -3,592 +3,436 @@ name: hap
 description: "Control the Herd Auto Prompter (hap) plugin from Herdr. Check automation status, manage escalations, configure thresholds, manage agents, task sources, and safety rules — all via the hap CLI. Use when the user asks about auto-prompting, escalations, agent monitoring, or the hap plugin."
 ---
 
-# hap — Herd Auto Prompter agent skill
+# hap — Herd Auto Prompter
 
-the `hap` binary is the CLI for the **Herd Auto Prompter** herdr plugin. it watches every agent session in the herd, detects when an agent needs input (idle, waiting on approval, stuck on a choice, or stalled on an error), and automatically supplies the next prompt — learned from the operator's own past decisions.
+`hap` is the CLI for the **Herd Auto Prompter** herdr plugin. A single daemon
+watches every agent pane in the herd, classifies what each agent needs (idle,
+approval, choice, error), and answers it from a rule learned from the
+operator's own past decisions — escalating to the operator whenever it is not
+confident or a safety control says a human must look.
 
-before using this skill, confirm the plugin is installed:
+## before anything else
 
 ```bash
-herdr plugin list --json | grep herd-auto-prompter
+hap status          # daemon health, paused?, pending escalations, agent count
 ```
 
-the `hap` binary lives inside the plugin directory. find it with:
+If `hap` is not on `PATH`, it lives inside the plugin directory:
 
 ```bash
-PLUGIN_ROOT=$(herdr plugin list --json | python3 -c 'import sys,json; plugins=json.load(sys.stdin)["result"]["plugins"]; [print(p["plugin_root"]) for p in plugins if p["plugin_id"]=="herd-auto-prompter"]')
+PLUGIN_ROOT=$(herdr plugin list --json | python3 -c 'import sys,json; print(next(p["plugin_root"] for p in json.load(sys.stdin)["result"]["plugins"] if p["plugin_id"]=="herd-auto-prompter"))')
 HAP="$PLUGIN_ROOT/bin/hap"
 ```
 
-if `hap` is already on `PATH`, use it directly.
+## rules for an agent driving hap
 
-## discovering commands from the CLI itself
+These are the ones whose absence causes damage. Everything else in this
+document is convenience.
 
-the CLI documents itself, so you rarely need to guess:
+- **Never type into an agent's pane to answer something hap escalated.**
+  Respond through `hap confirm` / `hap resolve` / `hap dismiss`. Once a rule
+  is autonomous the daemon answers matching prompts itself; a digit you also
+  type races it — both keystrokes land, one picks the menu and the extra digit
+  becomes stray text in the input box.
+- **`resolve --action` takes the option's LABEL, not its digit.** hap maps the
+  label to the keystroke the agent's TUI actually needs. A label matching no
+  offered option is refused rather than sent, because a literal fall-through
+  would commit option 1.
+- **`--send` delivers to a live agent pane.** Without it nothing reaches the
+  agent — the decision is only recorded and learned. Be sure of what you send.
+- **`hap clear-data --yes` is irreversible** (all learned rules, decisions and
+  audit rows). **`hap update` mutates the install** — never run it unprompted.
+- **`@noop` means "no reply is needed"** and never sends anything to a pane.
+- **Read-only, safe to run anytime:** `status`, `agents`, `audit`,
+  `escalations` (bare), `kill-history`, `signatures list|show|search`,
+  `config show|fields|path`, `config env list` (names only, never values),
+  `config rules|task-source|classifier|capture-delay list`,
+  `task <agent> list|get`, `state-dir`, `paths`, `version`, `gc --dry-run`.
+
+## the CLI documents itself
+
+Prefer these over guessing — they are always current, this file is a snapshot:
 
 ```bash
 hap help                 # every command, grouped, plus common workflows
-hap help task            # full guide for one command: usage, every flag, details, examples
-hap escalations --help   # same page; --help (or -h) works anywhere in the arguments
+hap help task            # one command in full: usage, every flag, details, examples
+hap escalations --help   # same page; --help/-h works anywhere in the arguments
+hap config fields        # the authoritative key list `hap config set` takes
 ```
 
-most commands end with a **"Next steps"** footer listing what to run next, with real
-ids filled in (`hap confirm 42 --send`). when parsing output in a script, suppress it:
-
-```bash
-hap agents --no-hints                                  # per invocation
-HAP_NO_HINTS=1 hap agents                              # per environment
-hap config set cli.ai_agent_friendly_output false      # persistent (default true)
-```
-
-none of these affect `hap help` or `<command> --help` — those footers are part of
-the guide.
-
-listings are tab-separated; `hap state-dir` and `hap config path` print a bare value
-(never a footer) so `$(hap state-dir)` stays usable.
+Most commands end with a **"Next steps"** footer with real ids filled in.
+Suppress it when parsing output: `--no-hints` (one invocation), `HAP_NO_HINTS=1`
+(one environment), or `hap config set cli.ai_agent_friendly_output false`
+(persistent, default `true`). None of these affect help pages. Listings are
+tab-separated; `hap state-dir` and `hap config path` always print a bare value.
 
 ## concepts
 
-**situation types** — the plugin classifies agent states into four types:
-- `idle` — agent finished and is waiting for the next prompt
-- `approval` — agent is asking for permission (e.g. tool approval; also structural forms herdr reports as idle, like Codex's Plan approval and Claude's "Select remote environment" picker for remote sub-agents)
-- `choice` — agent presents a multiple-choice question
-- `error` — agent hit an error and is waiting for guidance
+**situation types** — `idle` (finished, waiting for the next prompt),
+`approval` (asking permission), `choice` (multiple-choice question), `error`
+(hit an error, waiting for guidance). Structural forms herdr reports as idle —
+Codex's Plan approval, Claude's "Select remote environment" picker — are
+detected and classified as parked approvals.
 
-**shadow mode** — the plugin starts by observing and escalating with suggestions. the operator confirms or corrects. after enough consistent confirmations, a situation signature "graduates" to autonomous.
+**signature** — a fingerprint of a classified situation, with volatile data
+(paths, hashes, numbers) masked. One learned rule per signature. Addressed by
+unique prefix, git-style: `approval:9f2c`.
 
-**escalation** — when confidence is below the threshold, the plugin surfaces the situation to the operator instead of acting automatically.
+**shadow → autonomous** — a new signature starts in shadow: hap escalates with
+a suggestion, you confirm or correct. After `learning.graduation_n` consistent
+confirmations *and* confidence above the situation's threshold, it graduates
+and hap acts on it unattended. A confirmation carries extra confidence weight
+(`learning.confirmation_weight`, default 2×). **Graduation is permanent** — a
+later correction is recorded and moves live confidence, but never demotes the
+rule. `hap signatures reset` is the only way back to shadow.
 
-**never-auto patterns** — destructive operations (force-push, `rm -rf`, deploys, credential changes, etc.) are never automated regardless of confidence. the plugin ships with 40 strict seed patterns plus broader heuristic seed rules.
+**escalation** — hap is not confident enough (or a safety control refused), so
+the situation is queued for a human instead of answered.
 
-**signatures** — a situation signature is a fingerprint of a classified agent state (volatile data like paths, hashes, timestamps is masked). signatures start in shadow mode and graduate to autonomous after enough consistent confirmations. you can inspect, filter, and delete them via the `signatures` command (alias: `sigs`).
+**never-auto patterns** — regexes that force a human decision whatever the
+confidence says. hap ships a strict set (force-push, `sudo rm`, `dd`/`mkfs`,
+`DROP TABLE`, prod deploys, `npm publish`, `terraform destroy`, cloud-resource
+deletion, credential rotation, …) plus broader heuristic rules for suspected
+irreversible language. `hap config rules list` prints the exact shipped set.
+Routine locally recoverable work (recursive `rm` of a project dir, local git
+resets, `terraform apply`, merging a PR) is deliberately **not** shipped — add
+your own pattern for anything you want escalated anyway.
 
-**semantic matching** — situations are matched to learned signatures using embedding-based vector search (bundled MiniLM model via llama.cpp). paraphrased prompts reuse the learned rule instead of re-learning from zero. the daemon falls back to normalized BM25 text matching whenever the vector search does not match — the model being unavailable, and equally a search that ran but found nothing above `similarity_threshold` — then exact hash matching. it never blocks or crashes on missing assets.
+**semantic matching** — situations resolve to learned signatures by embedding
+the masked salient content (bundled MiniLM via llama.cpp) and vector-searching
+stored signatures, so a paraphrase reuses the rule. It degrades, never blocks:
+normalized BM25 text matching takes over whenever the vector search does not
+match (the embedder being down, *and* a search that ran but found nothing above
+`similarity_threshold`), then exact hash.
 
-**@noop** — a special action meaning "no reply is needed." the agent finished or is only reporting status. a noop is recorded in the audit trail and learned like any other decision, but nothing is sent to the pane. use `resolve <id> --action @noop` to teach the plugin that a situation needs no response.
+**@noop** — the sentinel action meaning "no reply is needed". Recorded and
+learned like any other decision; nothing is sent to the pane.
 
-## architecture — how the daemon talks to agents
+## how the daemon works
 
-hap is not a wrapper around the coding agents; it observes and drives them from the outside, entirely through herdr. herdr is the terminal multiplexer that runs each agent (claude, codex, agy, …) in its own pane and exposes a local unix-socket API. hap plugs into that API.
+hap never attaches to an agent process. It observes and drives panes from the
+outside, entirely through herdr's local socket + CLI, exactly as a human would.
 
-**one long-lived daemon.** a single `hap daemon` process monitors every agent pane in the herd. it is a singleton — auto-started (and self-replaced on upgrade) by herdr firing the plugin events `pane.agent_detected` and `workspace.created`, both wired to `hap daemon --ensure`. the CLI commands in this skill (`hap status`, `hap confirm`, …) are thin front-ends that talk to the daemon over its control socket; they never drive agents directly.
+**One long-lived daemon** monitors the whole herd. It is a singleton, started
+and self-replaced on upgrade by herdr's `pane.agent_detected` /
+`workspace.created` hooks running `hap daemon --ensure`. Every CLI command here
+is a thin front-end talking to it over its control socket.
 
-**the monitor loop** — for every agent, the daemon runs this cycle:
+Per agent, the loop is:
 
-1. **subscribe** — one `events.subscribe` per socket connection to herdr's event stream; the daemon receives a status/attention event whenever an agent's pane changes (idle, waiting on a prompt, etc.). existing panes replay as `pane_created`.
-2. **capture** — on an attention event the daemon waits a short `capture_delay` (10s on an agent's first event, 2000ms after) so the agent's TUI has finished painting and event bursts coalesce, then reads the pane content via the herdr CLI (`pane read --source recent` for classification, `--source visible` to recover a standing menu at confirm time).
-3. **classify** — the pane text is classified into a situation type (`idle` / `approval` / `choice` / `error`), extracting options, permission verb, or error summary.
-4. **match** — volatile data (paths, hashes, timestamps) is masked and the situation is resolved to a learned signature via embedding vector search → BM25 text fallback (reached whenever the vector search did not match, including when it ran and found nothing similar enough) → exact hash. a matched signature carries the operator's past decision and a confidence.
-5. **decide** — if a confident, graduated (autonomous) rule applies and passes every safety gate (kill switch, never-auto patterns, irreversible heuristic, rate/retry guards), the daemon **acts**. otherwise it **escalates** to the operator — or first **consults the local LLM** (if configured), whose suggestion is re-gated through the same safety controls.
-6. **act** — the chosen reply is delivered back into the pane through herdr: a single-line reply goes through `pane send-text <pane> <text>` then `pane send-keys <pane> enter`, so a menu digit arrives as a keystroke; a multi-line reply goes through `agent prompt <pane> <text>`, which pastes it as one message and submits it. (herdr 0.7.5 removed the older `agent send`, which did both; hap falls back to it on older herdr.) a numbered menu (`1. Yes / 2. No`) is mapped to its **digit** via `MenuKeystroke` before sending — herdr menus accept the number, not the label. a `@noop` decision records/learns but sends nothing.
+1. **subscribe** — herdr's event stream reports when a pane needs attention.
+2. **capture** — wait `[[capture_delay]]` (10s on an agent's first event, 2s
+   after) so the agent TUI has painted and event bursts coalesce, then read the
+   pane.
+3. **classify** — into a situation type, extracting options, permission verb,
+   or error summary.
+4. **match** — mask volatile data, resolve to a learned signature (embedding →
+   BM25 → exact hash).
+5. **decide** — a confident, graduated rule that clears every safety gate is
+   **acted** on. Otherwise **escalate** — or first **consult the LLM** if one is
+   configured, whose suggestion is re-gated through the same controls.
+6. **act** — a single-line reply is typed (`pane send-text` + `enter`) so a menu
+   digit arrives as a keystroke; a multi-line reply is pasted as one message
+   (`agent prompt`). A numbered menu is answered with its **digit**, mapped from
+   the label. `@noop` records and learns but sends nothing.
 
-**shadow → autonomous.** a new signature starts in shadow mode: the daemon escalates with a suggestion, the operator confirms or corrects, and after enough consistent confirmations (`learning.graduation_n`) the signature graduates and the daemon acts on it unattended. an operator confirm/send weighs extra toward confidence (`learning.confirmation_weight`, default 2×), so confirmed rules build confidence faster. **graduation is permanent**: once autonomous the confirmation count is frozen and a later correction no longer demotes the rule (the correction is still recorded, so confidence — and the confidence gate — reflect it). the only way back to shadow is an explicit `hap signatures reset` (or the Rules-tab reset key).
+Everything is out-of-process and fail-safe: LLM calls and deep pane reads run
+in goroutines so the select loop keeps serving every agent, and any error
+resolves to escalate + audit rather than a crash.
 
-**everything is out-of-process and fail-safe.** the daemon never blocks the agent and never modifies the agent's process — it only reads panes and sends keystrokes, exactly as a human operator would. shelling out to the LLM CLI or doing deep pane reads happens in goroutines so the single select loop keeps serving all agents; any error resolves to escalate + audit, never a crash.
-
-## check status
-
-see overall automation state, pending escalations, and monitored agents:
-
-```bash
-hap status
-```
-
-output:
-```
-automation:          running
-daemon:              running v0.3.13 (pid 50998)
-pending escalations: 0
-monitored agents:    6
-semantic matching:   ready (1 signatures, all-MiniLM-L6-v2-f32.gguf)
-last kill event:     resumed by operator at 2026-07-11T21:49:30+08:00
-```
-
-`hap status` shows the running daemon's version and flags a stale one after an upgrade. it can also print an embedding-drift line (`run: hap signatures reembed`) when the stored embeddings no longer match the active model.
-
-## list agents
-
-see all monitored agents with their short names, pane ids, types, statuses,
-automation state, working directory, and permission mode:
-
-```bash
-hap agents
-```
-
-output (tab-separated; the last two columns are the agent's cwd and its
-permission mode, each `-` when it could not be read — the cwd tells apart two
-agents working the same repo from different checkouts. new columns are always
-appended, so existing field positions never move):
-```
-brave-otter  w6:p1   claude   idle      enabled    /workspaces/herdr-auto-pilot    plan
-cool-fox     w6:p3   claude   working   disabled   /workspaces/worktree-agent-no1  acceptEdits
-swift-hawk   w8:p1   codex    done      enabled    -                               default
-```
-
-both values appear in the TUI agent detail view (`v` on the Agents tab), as
-`Mode` and `Working dir`.
-
-## read and set an agent's permission mode
-
-the permission mode is the agent's own setting for how much it asks before
-acting — what `shift+tab` cycles inside the agent's TUI. hap can read it and
-drive it programmatically:
+## agents
 
 ```bash
-hap mode brave-otter                  # print the mode alone, for scripts
-hap mode brave-otter plan --yes       # rotate the agent into plan mode
+hap agents                        # tab-separated: name, pane id, type, status,
+                                  # automation, cwd, permission mode
+hap rename brave-otter backend-dev
+hap disable backend-dev           # stop autonomous actions; it still escalates
+hap enable backend-dev
+hap capture backend-dev           # re-run the capture pipeline for one agent now
 ```
 
-modes, per agent type:
+`cwd` and `mode` are `-` when unreadable. New columns are appended, so existing
+field positions never move.
 
-| type | modes (in `shift+tab` cycle order) |
+A disabled agent stays in the list marked `DISABLED`: autonomous actions are
+audited as `denied` with `[agent_disabled]`, and escalations are audited
+straight to `dismissed` and never enter the pending queue.
+
+Use `hap capture` when an agent looks blocked but nothing appears in
+`hap escalations`. It needs a running, current daemon.
+
+### permission mode
+
+The agent's own setting for how much it asks before acting — what `shift+tab`
+cycles inside the agent's TUI.
+
+```bash
+hap mode backend-dev                  # print the mode alone, for scripts
+hap mode backend-dev plan --yes       # rotate the agent into plan mode
+```
+
+| agent type | modes (in `shift+tab` cycle order) |
 |---|---|
 | `claude` | `acceptEdits`, `plan`, `auto`, `manual` |
 | `codex` | `default`, `plan` |
 
-the set form works by pressing `shift+tab` and re-reading the pane until the
-agent itself reports the mode you asked for, so:
+Other agent types have no toggle and report `-`.
 
-- it is **idempotent** — an agent already in the target mode gets no keystroke
-  at all, and the command still succeeds. safe to call unconditionally at the
-  top of a script:
-  ```bash
-  [ "$(hap mode brave-otter)" = plan ] || hap mode brave-otter plan --yes
-  ```
-- it **fails rather than guesses**. the mode is read from the indicator the
-  agent paints in its composer footer — neither herdr nor the agents report it
-  any other way — so if an approval or form is covering that footer, both forms
-  refuse with an explanation. that refusal is a safety control, not a
-  limitation: inside claude's approval modals `shift+tab` is rebound to
+Setting works by pressing `shift+tab` and re-reading the pane until the agent
+itself reports the target mode, so:
+
+- It is **idempotent** — an agent already in that mode gets no keystroke and
+  the command still succeeds. Safe to call unconditionally:
+  `[ "$(hap mode backend-dev)" = plan ] || hap mode backend-dev plan --yes`
+- It **fails rather than guesses.** The mode is read from the indicator the
+  agent paints in its composer footer — nothing else reports it — so if an
+  approval or form is covering that footer, both forms refuse. That refusal is
+  a safety control: inside Claude's approval modals `shift+tab` is rebound to
   "approve with this feedback", so pressing it there would answer the prompt.
-- `--yes` skips the y/N confirmation and is **required** when not on a terminal.
+- **A mode the session does not offer** is detected, not forced. The cycle is
+  per-session, not per-agent-type — a `--model haiku` claude rotates through
+  only `manual`, `acceptEdits` and `plan`. hap notices when the rotation
+  closes, rotates the agent **back to where it started**, and names the cycle
+  it observed.
+- **`bypassPermissions`** (`--dangerously-skip-permissions`) is reported but
+  cannot be set — the cycle does not pass through it.
+- `--yes` skips the y/N prompt and is **required** when not on a terminal.
 
-two more things it will not do silently:
-
-- **a mode the session does not actually offer.** the cycle is per-session, not
-  per-agent-type — a `--model haiku` claude rotates through only `manual`,
-  `acceptEdits` and `plan`, with no `auto` at all. hap notices as soon as the
-  rotation closes, rotates the agent **back to where it started**, and tells you
-  the cycle it actually observed.
-- **an agent launched with `--dangerously-skip-permissions`.** it reports
-  `bypassPermissions`, which the `shift+tab` cycle cannot leave, so hap refuses
-  immediately instead of pressing keys that cannot work.
-
-agent types other than claude and codex have no mode toggle and report `-`.
-
-## rename an agent
-
-give an agent a friendly name (used by task sources and for readability):
+## escalations
 
 ```bash
-hap rename brave-otter backend-dev
+hap escalations                       # what needs a decision, with #ids
+hap confirm <id> --send               # the suggestion is right — accept and deliver
+hap resolve <id> --action TEXT --send # it is wrong — send the right answer instead
+hap resolve <id> --action @noop       # no reply was needed (never sends)
+hap dismiss <id> [<id>...]            # drop it; nothing sent or learned
+hap escalations prune [minutes]       # bulk-dismiss everything older (default 360)
+hap escalations retry <id>            # re-invoke the LLM on a failed/timed-out consult
 ```
 
-disable or enable automation for one agent without removing it from the
-Agents list:
+- `confirm` is a **learning event**: enough consecutive confirmations graduate
+  the rule. `resolve` records a **correction** — that is what hap learns
+  instead.
+- Without `--send`, the decision is recorded and learned but nothing reaches
+  the agent, so a blocked pane stays blocked. That is how you accept work for a
+  busy agent without interrupting it.
+- `--send` requires a running daemon: the daemon types the reply, so it goes
+  through the same never-auto screen and per-agent lifecycle barrier as its own
+  sends. It is refused if the running daemon is older than the `hap` you
+  invoked.
+- `hap correct` is an alias for `hap resolve`.
+- `retry` is queued — the daemon re-consults against the agent's **live** pane,
+  so the answer reflects the screen now, not the one that failed.
+- When the suggestion is generated TASKS, `confirm` appends them to the agent's
+  task list and registers its source; `--send` also hands the first one over.
+
+## pause / resume (kill switch)
 
 ```bash
-hap disable backend-dev
-hap enable backend-dev
-```
-
-in the TUI Agents tab, `x` disables the selected agent after a `Y/n`
-confirmation and `e` enables it. disabled agents show `DISABLED`. autonomous
-actions are suppressed and audited as `denied` with `[agent_disabled]`;
-escalations are immediately audited as `dismissed` with the same rationale and
-never enter the pending queue.
-
-## manage escalations
-
-list pending escalations (situations the plugin is not confident enough to handle automatically):
-
-```bash
-hap escalations
-```
-
-confirm an escalation's suggested action:
-
-```bash
-hap confirm <id> --send
-```
-
-- `--send` also delivers the confirmed action to the agent pane immediately
-
-provide a different (correct) action instead:
-
-```bash
-hap resolve <id> --action "yes, proceed" --send
-```
-
-- without `--send`, the action is recorded for learning but not sent to the agent
-- use `--action @noop` to record that no reply was needed (nothing is ever sent)
-- `hap correct` is an alias for `hap resolve`
-
-**once a situation graduates to autonomous, let the daemon answer it — don't
-also drive the pane by hand.** confirming (`--send`) an approval a few times is
-how a shadow signature earns its way to autonomous; after it graduates the
-daemon auto-answers matching prompts itself, delivering the numbered-menu digit.
-if you *also* type the menu digit into the pane you race the daemon: both
-keystrokes land, one picks the menu and the extra digit lands in the input box
-as stray text. respond through `hap` (`confirm` / `resolve` / `dismiss`), not by
-typing into the agent pane, and once a rule is autonomous leave its approvals to
-the daemon.
-
-dismiss pending escalations without responding (audit rows kept, nothing sent or learned):
-
-```bash
-hap dismiss <id>
-hap dismiss <id1> <id2> <id3>
-```
-
-prune old escalations — dismisses all pending escalations older than N minutes (default 360):
-
-```bash
-hap escalations prune
-hap escalations prune 120
-```
-
-re-invoke the LLM on an escalation whose consult failed or timed out (and re-run a failed learn-from-correction). the request is queued: the running daemon re-consults against the agent's LIVE pane, so the answer reflects the screen now, not the one that failed:
-
-```bash
-hap escalations retry <id>
-```
-
-## pause and resume (kill switch)
-
-pause all automation globally:
-
-```bash
-hap pause
-```
-
-resume automation:
-
-```bash
+hap pause          # global: stop all autonomous actions
 hap resume
+hap kill-history   # who paused/resumed (and full-self-prompting toggles), when
 ```
 
-while paused, situations still classify and escalate — nothing is auto-answered — and those
-escalations carry the rationale `[daemon_paused]`, meaning "the operator paused automation",
-not that anything crashed.
+While paused, situations still classify and escalate — nothing is auto-answered
+— and those escalations carry the rationale `[daemon_paused]`, meaning the
+operator paused automation, not that anything crashed.
 
-view pause/resume history:
+## audit
 
 ```bash
-hap kill-history
+hap audit [--limit N]     # newest first, default 30
 ```
 
-## full self-prompting mode
+Columns: `#id`, time, status, situation type, action, confidence, LLM score,
+rule mode, rationale. Every automated action and every escalation writes a row.
+Correct a past decision with `hap resolve <audit-id> --action TEXT`.
 
-when enabled, every escalation that carries a proposed answer is accepted and delivered
-to the agent immediately — no waiting threshold, no operator action. the safety
-exclusions still wait for a human (never-auto matches, suspected-irreversible commands,
-retry-exhausted and rate-limited escalations), it never acts while paused, it never
-answers an agent that has gone back to work since the escalation was raised, it never
-learns from its own accepts, and each delivery counts against the `[limits]` runaway
-ceilings so an answer loop pauses the agent instead of running forever.
+Statuses worth knowing: `auto-sent` (a timed auto-accept answered it),
+`fsp-sent` (full self-prompting answered it), `denied`, `dismissed`,
+`reclaimed` (an unconfirmed task hand-out was returned to the queue).
+
+## learned rules (signatures)
 
 ```bash
-hap config set full_self_prompting.enabled true
-hap config set full_self_prompting.enabled false
+hap signatures list                          # alias: hap sigs
+hap signatures list --type approval          # idle|approval|choice|error
+hap signatures list --mode autonomous        # shadow|autonomous
+hap signatures list --agent-type claude
+hap signatures list --min-conf 0.85          # minimum live confidence
+
+hap signatures search terraform              # keyword substring
+hap signatures search "approve the file write" --semantic --limit 10 --min-score 0.5
+
+hap signatures show approval:9f2c            # situation, recent decisions, last context
+hap signatures reset approval:9f2c --yes     # back to shadow; history KEPT
+hap signatures delete approval:9f2c --yes    # erase the rule and its decisions
+hap signatures reembed [--force]             # after changing the embedding model
 ```
 
-two opt-in behaviors, both default false:
+**`reset` vs `delete`.** `reset` returns the rule to shadow with streak 0 and
+confidence unscored (it reads `conf=-`, not a number, because only post-reset
+decisions count and there are none yet). All decision rows are kept and the
+rule still suggests its learned answer, but pre-reset decisions no longer count
+toward confidence or graduation — it must re-earn `learning.graduation_n`
+confirmations. This is the only way to demote an autonomous rule. `delete`
+erases the rule and its decision history entirely; audit rows are kept.
 
-```bash
-# refuse a delivery that would cross a [limits] ceiling, and switch the mode OFF
-# when one is reached (rewrites enabled = false, recorded in `hap kill-history`).
-# the ceilings are per-agent while the mode is global, so ONE runaway agent
-# stands the mode down for every agent.
-hap config set full_self_prompting.honour_limits true
-
-# also act on an idle escalation whose suggestion is an LLM-GENERATED task:
-# writes the agent's task list, registers the task source, hands the first task
-# over. still records no learning event; every safety exclusion still applies.
-hap config set full_self_prompting.accept_generated_task true
-```
-
-an escalation the mode answered is flagged in the audit log (`while_fsp_mode_on`), so it
-can be told apart from a timed auto-accept — both show the status `auto-sent`. the TUI
-Audit tab renders those rows in amber.
-
-in the TUI, **press `r` twice quickly** (within ~600ms) to toggle it. a SINGLE `r` keeps
-its old meaning — resume automation — and is simply delayed by that window, so a
-double-press never resumes on its way to the toggle; any other key in between cancels the
-pending double-press. (capital `R` is unchanged and immediate: re-compute embeddings.) if
-automation is PAUSED, `rr` resumes instead of toggling — enabling is refused while paused,
-and resuming is what the operator pressing `r` almost certainly wants. the footer
-advertises `rr: full self-prompting`, and the header reads `⚡ FULL SELF-PROMPTING` while
-the mode is on (`■ PAUSED` still wins over it).
-
-enabling is refused until the daemon has earned it: at least 10 graduated (autonomous)
-rules AND a configured `[llm].command`, and never while paused — the error names every
-requirement that is missing, so one attempt tells you the whole list:
-
-```
-error: cannot enable full self-prompting: only 3 of 10 required graduated (autonomous) rules —
-keep confirming escalations until more rules graduate (see: hap signatures list --mode
-autonomous); llm.command is not configured — run: hap config set llm.command "<argv>"
-```
-
-turning it OFF is never refused. `hap status` shows one of three lines:
-
-```
-full self-prompting:           off
-full self-prompting:           ON — escalations with a proposed answer are answered automatically
-full self-prompting:           ON but INACTIVE — only 4 of 10 required graduated (autonomous) rules remain
-```
-
-the third means the mode is still enabled in config but a precondition lapsed (rules
-deleted, `llm.command` cleared, or the count could not be read) — the daemon fails closed
-and answers nothing, and your config is never rewritten. fix the precondition or turn the
-mode off; `hap status` also prints the remedy in its next-steps footer.
-
-## view audit log
-
-see the history of automated actions and escalations:
-
-```bash
-hap audit
-hap audit --limit 50
-```
-
-every automated action and every escalation writes an audit record with: trigger, situation, action, confidence, and rationale.
-
-correct a past automated decision (demotes the signature back to shadow mode):
-
-```bash
-hap resolve <audit-id> --action "the correct response"
-```
-
-## learned signatures
-
-inspect what the plugin has learned. signatures are addressed by unique prefix, git-style (e.g. `approval:9f2c`).
-
-list all learned signatures:
-
-```bash
-hap signatures list
-hap sigs list              # alias
-```
-
-filter signatures:
-
-```bash
-hap signatures list --type approval          # by situation type (idle|approval|choice|error)
-hap signatures list --mode autonomous        # by mode (shadow|autonomous)
-hap signatures list --agent-type claude       # by agent type
-hap signatures list --min-conf 0.85          # by minimum cached confidence
-```
-
-search learned signatures — keyword (case-insensitive substring over the rule's fields
-and its salient text) by default, or `--semantic` to embed the whole query and rank rules
-by meaning (cosine similarity; needs the embedding model). the same `--type` / `--mode` /
-`--agent-type` / `--min-conf` filters compose with either:
-
-```bash
-hap signatures search terraform                       # keyword substring
-hap signatures search "approve the file write" --semantic   # ranked by meaning
-hap signatures search "run tests" --semantic --limit 10 --min-score 0.5
-```
-
-the TUI mirrors this on the Rules tab: `/` starts a live keyword filter, and typing a
-2+-word query surfaces a hint to press **enter** for a semantic search (results show a
-`SEM` cosine column; editing the query returns to live keyword filtering).
-
-show full detail for a signature (recent decisions, last audit context):
-
-```bash
-hap signatures show approval:9f2c
-```
-
-delete a signature you no longer trust (erases its decision history; audit rows are kept):
-
-```bash
-hap signatures delete approval:9f2c --yes
-```
-
-reset a signature back to a fresh rule: shadow mode, streak → 0, and confidence back to
-unscored — a reset rule reads `conf=-`, not a number, because confidence counts only
-post-reset decisions and there are none yet. all decision rows are **kept** (and the rule
-still suggests its learned answer),
-but decisions recorded before the reset no longer count toward confidence or graduation — the
-rule behaves confidence-new and must re-earn `learning.graduation_n` confirmations to
-re-graduate. this is the only way to demote an autonomous rule now that graduation is
-permanent:
-
-```bash
-hap signatures reset approval:9f2c --yes
-```
-
-re-compute stored embeddings after changing the embedding model:
-
-```bash
-hap signatures reembed
-hap signatures reembed --force    # retry even when no drift is detected
-```
+A `-` in any confidence field means "not scored yet", never a measured `0.00`.
 
 ## configuration
 
-show current config:
+**Everything that writes `config.toml` is a `hap config` subcommand.** That is
+the whole surface; the file never has to be opened by hand. (`hap task` is
+deliberately not one — it edits checklist *items*, which is not configuration.)
 
 ```bash
-hap config show
+hap config show                          # the effective config, defaults filled in
+hap config fields                        # every settable key with its current value
+hap config path                          # bare path, for scripting
+hap config set <key> <value>
+hap config set-threshold approval 0.80   # minimum|idle|approval|choice|error
 ```
 
-list all configurable fields:
+Edits apply live — the command saves and nudges the running daemon to reload.
+A hand-edited `config.toml` is **not** auto-detected (there is no file watcher);
+it takes effect on the next CLI/TUI reload or daemon restart.
 
-```bash
-hap config fields
-```
-
-print the config file path (even before the file exists):
-
-```bash
-hap config path
-```
-
-set a specific config field:
-
-```bash
-hap config set <field> <value>
-```
-
-examples:
-
-```bash
-hap config set learning.graduation_n 3
-hap config set limits.max_consecutive_auto_prompts 30
-hap config set limits.max_auto_prompts_per_minute 20
-hap config set limits.max_error_retries 3
-hap config set llm.timeout_seconds 120
-hap config set llm.auto_act_confidence_threshold 80
-hap config set llm.pane_excerpt_chars 8000
-hap config set safety.disable_never_auto_seed_patterns true
-hap config set embedding.disabled true
-hap config set embedding.similarity_threshold 0.85
-hap config set embedding.model_context_window 512
-hap config set embedding.embed_timeout_ms 8000
-hap config set embedding.warm_timeout_ms 120000
-hap config set embedding.pane_salient_chars 1000
-hap config set tui.max_content_width 120
-hap config set tui.theme high-contrast
-```
-
-set a confidence threshold for a situation type:
-
-```bash
-hap config set-threshold <situation> <value>
-```
-
-examples:
-
-```bash
-hap config set-threshold idle 0.70
-hap config set-threshold approval 0.85
-hap config set-threshold choice 0.90
-hap config set-threshold error 0.80
-```
-
-edits made through `hap config set` / `set-threshold` apply live — the command saves and nudges the running daemon to reload. a hand-edited `config.toml` is NOT auto-detected (there is no file watcher); it takes effect only when another CLI/TUI command triggers a reload or the daemon restarts.
-
-### configurable fields reference
-
-| field | default | description |
-|---|---|---|
-| `confidence_thresholds.minimum` | 0.50 | variance guard minimum learned-action agreement |
-| `confidence_thresholds.idle` | 0.65 | confidence threshold for idle agents |
-| `confidence_thresholds.approval` | 0.70 | confidence threshold for approval requests |
-| `confidence_thresholds.choice` | 0.70 | confidence threshold for choices |
-| `confidence_thresholds.error` | 0.75 | confidence threshold for error situations |
-| `learning.graduation_n` | 1 | consecutive confirmations needed to graduate (1-10) |
-| `learning.confirmation_weight` | 2.0 | vote-weight multiplier for an operator confirmation in the confidence ratio (1 disables the boost) |
-| `limits.max_consecutive_auto_prompts` | 30 | max consecutive auto-prompts per agent without human interaction |
-| `limits.max_auto_prompts_per_minute` | 5 | rate limit per agent (rolling 1-minute window) |
-| `limits.max_error_retries` | 2 | max retries per error signature |
-| `full_self_prompting.enabled` | false | answer every escalation carrying a proposed answer, immediately (see full self-prompting mode) |
-| `full_self_prompting.honour_limits` | false | check the `[limits]` ceilings BEFORE each delivery and switch the mode off when one is reached |
-| `full_self_prompting.accept_generated_task` | false | also act on an idle escalation whose suggestion is an LLM-generated task |
-| `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic never-auto rule |
-| `llm.timeout_seconds` | 60 | timeout for LLM fallback calls |
-| `llm.auto_act_confidence_threshold` | 99 | min LLM self-reported confidence (0-100) to auto-act on a consult decision; below it (or no score) the situation escalates with reason `[llm_low_confidence]`. the default only auto-acts on a near-certain score; set anything above 100 (e.g. 999) to make it unreachable = never auto-act |
-| `llm.pane_excerpt_chars` | 5000 | pane excerpt size in characters for LLM consult context |
-| `llm.enable_rewrite_action` | false | have the consult LLM review/adapt learned free-text replies before delivery (see llm action review) |
-| `llm.rewrite_action_fallback_template` | `{original_text}` (original sent as-is) | optional wrapper around the original when the action review fails (placeholders: `{original_text}`, `{agent_name}`) |
-| `llm.command` | (unset) | argv template for the consult fallback CLI (see llm fallback config) |
-| `llm.command_start` | (unset) | argv template for the FIRST consult per agent; empty inherits `llm.command` (opt-in) |
-| `llm.task_generate_command` | (unset) | argv template for the one-shot task suggestion given to an idle agent with NO task source, or a declared source that ran out (see task sources); empty keeps escalate-only behavior |
-| `llm.task_generate_command_start` | (unset) | argv template for the FIRST task generation per agent (no-source case only; empty inherits `llm.task_generate_command`); an exhausted declared source only generates more tasks when BOTH this and `llm.task_generate_command` are set, and always uses `llm.task_generate_command` (never this) since a list already exists |
-| `llm.task_generate_timeout_seconds` | 0 (inherits `timeout_seconds`) | timeout for one task-generation run |
-| `llm.learn_from_user_command` | (unset) | argv template for the one-shot run fired when the operator CORRECTS an escalation (never on a confirmation): it runs in the AGENT's cwd and asks the agent to record the lesson in that project's memory file (`CLAUDE.md`, or `AGENTS.md` for codex). no MCP tools; needs write permission (e.g. `--permission-mode acceptEdits`). placeholders add `{situation_type}`, `{suggestion}` (what hap was about to answer) and `{correction}` (what you answered instead) to the usual set. it never touches the pane, never creates a rule and never escalates — each run leaves one `hap audit` row (`llm-learn-from-user`: `learn:recorded` / `learn:failed`), fires only after the correction is committed, and is suppressed by `hap pause`. NOTHING is parsed out of the reply (no sentinel, no decision) — the CLI's stdout+stderr is captured verbatim on the row, readable with `v` in the TUI's Audit tab; a `learn:failed` row is retryable with `l` on that detail view. deliberately has NO `_start` variant |
-| `llm.learn_from_user_timeout_seconds` | 0 (inherits `timeout_seconds`) | timeout for one learn-from-correction run |
-| `llm.env` / `llm.env_file` | (unset) | environment shared by all five llm commands: an inline `[llm.env]` table, and/or a path to a `.env` file (`KEY=VALUE`, `#` comments, `export`, quotes, `~/` expanded) |
-| `llm.command_env` / `llm.command_env_file` | (unset) | environment for `llm.command` only, layered over the shared one |
-| `llm.command_start_env` / `llm.command_start_env_file` | (unset) | environment for `llm.command_start` only |
-| `llm.task_generate_command_env` / `llm.task_generate_command_env_file` | (unset) | environment for `llm.task_generate_command` only — e.g. a cheaper model or a different key for task ideas |
-| `llm.task_generate_command_start_env` / `llm.task_generate_command_start_env_file` | (unset) | environment for `llm.task_generate_command_start` only |
-| `llm.learn_from_user_command_env` / `llm.learn_from_user_command_env_file` | (unset) | environment for `llm.learn_from_user_command` only |
-
-per-command env notes: layering is daemon env → `env_file` → `env` → the command's `…_env_file` → the command's `…_env`, with hap's own `HAP_*` variables injected last; names starting with `HAP_`/`HERDR_` are reserved and ignored. env files are read when the CLI is SPAWNED (edits apply with no restart, and secrets never enter `config.toml`); a configured file that cannot be read, has a malformed line, or defines nothing fails that run rather than launching the CLI without its credentials. values accept the command template's placeholders except `{pane_excerpt}`. `hap config` shows variable NAMES and file paths only — never values.
-| `embedding.disabled` | false | disable semantic matching entirely |
-| `embedding.model_path` | (bundled all-minilm-l6-v2-q8_0.gguf) | path to a .gguf embedding model |
-| `embedding.similarity_threshold` | 0.90 | min cosine similarity to reuse a learned signature |
-| `embedding.bm25_min_score` | 0.35 | min normalized BM25 similarity for the text fallback. the fallback runs whenever vector search did not match — the embedder being unavailable or errored, AND a search that ran cleanly but found nothing above `similarity_threshold`. it governs the population that has no embedding verdict to overturn: short pane-tail salients, plus everything when the embedder is down |
-| `embedding.bm25_highbar_score` | 0.70 | the STRICTER bar, used instead of `bm25_min_score` for a PANE-TAIL salient at or above `min_salient_chars` that reaches text matching after an embedding search RAN and refused it — cosine already judged the pair too dissimilar, so this bounds how far a bag-of-words score may overturn that. below the floor a salient is never embedded (no cosine verdict to overturn) and keeps `bm25_min_score`, its only matcher. structured salients (approval/choice/error) refused by cosine are not retried by text AT ALL, at any score: BM25 cannot tell WHICH token changed, so a changed approval target and a harmless rewording score alike, and the score is itself unstable on an incrementally built index. can only tighten — a value at or below `bm25_min_score` is ignored |
-| `embedding.min_salient_chars` | 0 (built-in default: 100) | length below which a situation is matched by BM25 INSTEAD of embedding, measured on the masked salient. short text embeds indiscriminately, so one almost-empty rule otherwise answers every unrelated screen. applies to both sides: a short situation is not embedded, a short rule is stored without a vector, and an existing short rule is dropped from vector search at the next daemon start — reachable by text matching and exact hash only. approval/choice/error rules are EXEMPT at any length: their salients are short by construction and are distilled identities, so a floor over them would disable paraphrase matching entirely |
-| `embedding.model_context_window` | 0 (built-in default: 512 for MiniLM) | max tokens fed to the embedder before truncation; MUST NOT exceed what the model supports (over 512 hard-aborts a BERT/MiniLM native lib). raise only when `model_path` points at a larger-window model; values below 256 clamp up |
-| `embedding.embed_timeout_ms` | 0 (built-in default: 2000) | stall guard per warm embed call. a model larger than the bundled MiniLM can exceed it on EVERY call, which latches semantic matching onto text search permanently — raise it alongside `model_path`. `hap status` reports the budgets in force and whether the failures were timeouts. values below 100 clamp up, above 600000 (10 min) clamp down |
-| `embedding.warm_timeout_ms` | 0 (built-in default: 30000) | stall guard for the FIRST call of each embed worker, which includes loading the model; raise for slow/large model loads. values below 1000 clamp up, above 600000 (10 min) clamp down |
-| `embedding.pane_salient_chars` | 500 | fallback signature window for idle/unclassified situations (trailing N chars) |
-| `tui.max_content_width` | 0 (full width) | cap variable-width list columns; 0 = full width |
-| `tui.max_content_height` | 0 (full height) | cap the rows a list body may use; 0 = full height |
-| `tui.theme` | default | TUI color theme: default, dark, light, high-contrast (in the TUI Config tab, `e` on this row opens a ↑/↓ picker of the available themes) |
-| `cli.ai_agent_friendly_output` | true | append the "Next steps" footer to command output (for AI agents driving the CLI); never affects `hap help` / `--help`, which always show theirs |
-| `tui.terminal_bell` | true | ring the terminal bell (\a) on new escalations and on pauses caused by a different process; also the fallback when a herdr notification is not displayed |
-| `tui.herdr_notification` | true | raise a herdr desktop notification on those same two events, when the TUI runs as a herdr-managed pane |
-| `tui.disable_check_for_update` | false | turn off the GitHub release check (at most every 6h, TUI only) that puts `↑ vX.Y.Z available` in the header. it is the plugin's ONLY outbound network call; a locally built (`plugin link`) binary never checks |
-| `tui.max_instances` | 1 | how many `hap tui` processes may run at once. starting one closes the OLDEST past this cap (SIGTERM — a clean exit), because each instance re-polls the whole state every 2s and shells out to herdr per agent. `0` = no limit; a lowered cap applies within 10s without restarting anything |
-
-TUI palette colors — roles: `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help`. set with `hap config set tui.palette.<role> <color>`; values are 256-color codes (`"205"`, 0-255) or hex (`"#ff5faf"`, `#rgb` or `#rrggbb`), and `""` clears a role back to the theme. anything else is rejected — lipgloss resolves an unrecognized color to NO color at all. hidden from the TUI config tab (eight colors would bury the settings you reach for), so `hap config fields` is where you read their current values.
-
-**everything that writes `config.toml` is a `hap config` subcommand** — that is the whole configuration surface, and the file never has to be opened by hand. (`hap task` is deliberately not one: it edits the checklist items inside an agent's markdown file, which is not configuration.)
-
-some settings are table-valued, so one `hap config set <key> <value>` cannot address them (a list element is addressed by position, a map entry by name). each gets a topic of its own instead:
+Array and map sections cannot be a `set` key (a list element is addressed by
+position, a map entry by name), so each has its own topic — with its own guide
+at `hap help config <topic>`:
 
 | section | command |
 |---|---|
-| `[[task_sources]]` | `hap config task-source add / set / remove` |
-| `[[classifier]]` | `hap config classifier add / remove` |
-| `[[capture_delay]]` | `hap config capture-delay set / remove` |
+| `[[task_sources]]` | `hap config task-source add / set / remove / list / provider` |
+| `[[classifier]]` | `hap config classifier add / remove / list` |
+| `[[capture_delay]]` | `hap config capture-delay set / remove / list` |
 | `safety.never_auto_patterns` | `hap config rules add / remove` |
-| `[[safety.never_auto_rules]]` | `hap config rules add --agent-type / hap config rules remove-scoped` |
+| `[[safety.never_auto_rules]]` | `hap config rules add --agent-type` / `remove-scoped` |
 | `safety.disabled_seed_patterns` | `hap config rules disable-seed / enable-seed` |
-| `[llm.*_env]` | `hap config env set / unset` (values read from stdin) |
+| `[llm.*_env]` | `hap config env set / unset / list` (values read from stdin) |
 
-`[tui.palette]` is not table-valued for this purpose: its roles are individually settable with `hap config set`, see above. `TestEveryConfigKeyIsRegistered` and `TestEveryConfigListHasACLICommand` fail the build if a new key or section ever ships without a command, and `TestConfigureGroupHasOneVisibleCommand` fails if one ships outside `hap config`.
+These four were top-level verbs once (`hap rules …`). The old spellings still
+resolve and print a migration note on **stderr**, so a script parsing their
+tab-separated stdout is unaffected.
 
-`rules`, `task-source`, `classifier` and `capture-delay` were top-level verbs (`hap config rules …`) before this. the old spellings still work and print a note naming the new one on **stderr** — stdout stays clean, so a script parsing these tab-separated listings is unaffected. each topic has its own guide: `hap help config rules`, and likewise for the other three.
+### every key, with its default
 
-`[task_source_provider]` is not table-valued either: its keys are ordinary `hap config set` fields — `task_source_provider.provider`, `.env_file`, `.timeout_seconds`, `.refresh_seconds`, `.github_gist.gist_id` (see task sources). the PER-SOURCE overrides of those live on a `[[task_sources]]` entry and go through `hap config task-source set <index> …` like its other settings.
+| key | default | what it does |
+|---|---|---|
+| `confidence_thresholds.minimum` | 0.50 | variance guard: minimum learned-action agreement |
+| `confidence_thresholds.idle` | 0.65 | confidence needed to answer an idle agent |
+| `confidence_thresholds.approval` | 0.70 | …an approval request |
+| `confidence_thresholds.choice` | 0.70 | …a multiple-choice question |
+| `confidence_thresholds.error` | 0.75 | …an error |
+| `learning.graduation_n` | 1 | consecutive confirmations to graduate (1-10) |
+| `learning.confirmation_weight` | 2.0 | vote weight of an operator confirmation (1 disables the boost) |
+| `limits.max_consecutive_auto_prompts` | 30 | per agent, without human interaction |
+| `limits.max_auto_prompts_per_minute` | 5 | per agent, rolling 1-minute window |
+| `limits.max_error_retries` | 2 | per error signature |
+| `escalations.auto_accept.enabled` | false | master switch for timed auto-accept |
+| `escalations.auto_accept.approval` | `"5m"` | how long an approval escalation waits before hap answers it |
+| `escalations.auto_accept.choice` | `"5m"` | …a choice |
+| `escalations.auto_accept.error` | `"5m"` | …an error |
+| `escalations.auto_accept.idle` | `"0"` | disabled — idle signatures are raw screen text, too weak to compare |
+| `escalations.auto_accept.unclassifiable` | `"0"` | disabled, same reason |
+| `full_self_prompting.enabled` | false | answer every escalation carrying a proposed answer, immediately |
+| `full_self_prompting.honour_limits` | false | apply the `[limits]` ceilings to the mode, and switch it off when one is reached |
+| `full_self_prompting.accept_generated_task` | false | also act on an idle escalation whose suggestion is an LLM-generated task |
+| `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic rule |
+| `llm.command` | (disabled) | argv for the consult CLI; this key alone gates the LLM fallback |
+| `llm.command_start` | inherits `command` | argv for the FIRST consult per agent |
+| `llm.timeout_seconds` | 60 | timeout for one consult |
+| `llm.auto_act_confidence_threshold` | 85 | min LLM self-reported score (0-100) to auto-act; below it (or no score) escalates as `[llm_low_confidence]`. Set >100 (e.g. 999) to never auto-act |
+| `llm.pane_excerpt_chars` | 5000 | pane excerpt size in the consult context |
+| `llm.enable_rewrite_action` | false | let the consult LLM adapt learned free-text replies before delivery |
+| `llm.run_in_agent_cwd` | true | run the CLI in the monitored agent's own project directory |
+| `llm.rewrite_action_fallback_template` | `{original_text}` | optional wrapper when an action review fails (`{original_text}`, `{agent_name}`) |
+| `llm.task_generate_command` | (disabled) | argv to synthesize a next task for an idle agent with no source |
+| `llm.task_generate_command_start` | inherits `task_generate_command` | argv for the FIRST generation per agent (no-source case only) |
+| `llm.task_generate_timeout_seconds` | inherits `timeout_seconds` | timeout for one generation run |
+| `llm.learn_from_user_command` | (disabled) | argv run when you CORRECT an escalation, to record the lesson in `AUTO.md` in the agent's project |
+| `llm.learn_from_user_timeout_seconds` | inherits `timeout_seconds` | timeout for one learn run |
+| `llm.env_file` | (none) | `.env` shared by every llm command |
+| `llm.command_env_file` etc. | (none) | per-command `.env`, layered over the shared one (one per command) |
+| `embedding.disabled` | false | turn semantic matching off entirely |
+| `embedding.model_path` | bundled `all-minilm-l6-v2-q8_0.gguf` | path to a `.gguf` embedding model |
+| `embedding.similarity_threshold` | 0.90 | min cosine similarity to reuse a learned rule |
+| `embedding.bm25_min_score` | 0.35 | min normalized BM25 score for the text fallback |
+| `embedding.bm25_highbar_score` | 0.70 | the stricter bar used instead, for a pane-tail salient that an embedding search RAN and refused. Can only tighten |
+| `embedding.min_salient_chars` | 100 | below this (masked salient) a situation is matched by BM25 instead of embedding — see below |
+| `embedding.pane_salient_chars` | 500 | signature window for idle/unclassified situations (trailing N chars) |
+| `embedding.model_context_window` | 512 | max tokens fed to the embedder; MUST NOT exceed what the model supports |
+| `embedding.embed_timeout_ms` | 2000 | stall guard per warm embed call |
+| `embedding.warm_timeout_ms` | 30000 | stall guard for the first call, which loads the model |
+| `logging.level` | info | `debug`/`info`/`warn`/`error`; read once at process start |
+| `logging.max_size_mb` | 16 | log rotation size; read once at process start |
+| `logging.audit_excerpt_retention_days` | 14 | see `hap gc` below |
+| `tui.max_content_width` | 0 | cap variable-width list columns; 0 = full width |
+| `tui.max_content_height` | 0 | cap the rows a list body may use; 0 = unlimited |
+| `tui.theme` | default | `default`, `dark`, `light`, `high-contrast` |
+| `tui.terminal_bell` | true | bell on a new escalation, and on a pause caused by another process |
+| `tui.herdr_notification` | true | herdr desktop notification on those same two events |
+| `tui.disable_check_for_update` | false | turn off the GitHub release check (TUI only, at most every 6h) |
+| `tui.max_instances` | 1 | how many `hap tui` processes may run; starting one closes the oldest past this cap. `0` = no limit |
+| `cli.ai_agent_friendly_output` | true | append the "Next steps" footer to command output |
+| `task_source_provider.provider` | `local_fs` | default storage for every task list: `local_fs` or `github_gist` |
+| `task_source_provider.env_file` | (none) | file holding `GITHUB_TOKEN` for `github_gist`; read at use time |
+| `task_source_provider.timeout_seconds` | 20 | per remote store call |
+| `task_source_provider.refresh_seconds` | 30 | how long a remote list is cached |
+| `task_source_provider.github_gist.gist_id` | (none) | the gist hex id |
+| `tui.palette.<role>` | theme default | `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help` |
 
-**capture delay** — the classification pane read waits a per-agent delay so the agent TUI has painted and event bursts coalesce. defaults: 10000ms (10s) on an agent's first event, 2000ms after. override per agent type:
+Palette values are 256-color codes (`"205"`) or hex (`"#ff5faf"`); `""` clears
+a role back to the theme. Anything else is rejected — lipgloss resolves an
+unrecognized color to no color at all. These are hidden from the TUI config
+tab, so `hap config fields` is where you read them.
+
+**About `embedding.min_salient_chars`:** short text embeds indiscriminately, so
+one almost-empty learned rule would otherwise match every unrelated screen. The
+floor applies to both sides — a short situation is not embedded, a short rule
+is stored without a vector and dropped from vector search — leaving such rules
+reachable by BM25 and exact hash only. Structured salients (approval, choice,
+error) are **exempt at any length**: they are short by construction
+(`permission:proceed | options:no;yes` is 35 chars), so a floor over them would
+switch off exactly the paraphrase matching the feature exists for.
+
+### LLM commands: use the presets
+
+The three `[llm]` command fields ship disabled and their argv is far too long
+to retype. Bootstrap one:
 
 ```bash
-hap config capture-delay list                     # the delays in force, defaults resolved
-hap config capture-delay set codex 8000 500       # <agent-type> <start-ms> <event-ms>; "*" = all types
-hap config capture-delay remove codex             # back to the built-in defaults
+hap config set llm.command --preset claude              # or: codex
+hap config set llm.task_generate_command --preset claude
+hap config set llm.learn_from_user_command --preset claude
 ```
 
-setting a type that already has a rule OVERWRITES it — the daemon reads the first matching rule, so a second one for the same type would never be reached. a `0` means "keep the built-in default for that one". the equivalent config.toml:
+A preset only ever bootstraps a field **nobody has configured** — once one is
+set, tuning it is a `config.toml` edit (or the TUI Config tab's `e` on a
+`(disabled)` row). `sample/config.toml` carries the full annotated argv.
 
-```toml
-[[capture_delay]]
-agent_type = "codex"   # or "*" for all
-start_ms = 8000        # first-event delay
-event_ms = 500         # subsequent-event delay
+### capture delay
+
+How long to wait after a herdr event before reading the pane, so the agent TUI
+has painted. Defaults: 10000ms on an agent's first event, 2000ms after.
+
+```bash
+hap config capture-delay list                # the delays in force, defaults resolved
+hap config capture-delay set codex 8000 500  # <agent-type> <start-ms> <event-ms>; "*" = all
+hap config capture-delay remove codex
 ```
 
-**classifier rules** — which situation a pane is showing. hap ships rules for the agent TUIs it knows; add your own when a screen is read as the wrong situation, or as none at all (`unclassifiable` escalations). operator rules are consulted BEFORE the shipped ones, in the order added, so position is precedence:
+Setting a type that already has a rule **overwrites** it — the daemon reads the
+first matching rule, so a second one for the same type would never be reached.
+A `0` means "keep the built-in default for that one".
+
+### classifier rules
+
+Which situation a pane is showing. Add your own when a screen is read as the
+wrong situation, or as none at all (`unclassifiable` escalations). Operator
+rules are consulted **before** the shipped ones, in the order added, so
+position is precedence.
 
 ```bash
 hap config classifier list
@@ -596,706 +440,665 @@ hap config classifier add --situation approval --agent-type claude --regex 'Do y
 hap config classifier remove 0
 ```
 
-`--situation` is approval, choice, error or idle; `--agent-type` defaults to `*`. repeat `--regex`/`--keyword` for several (a regex may contain a comma, so they are not comma-split). a rule needs at least one regex or keyword.
+`--situation` is `approval`, `choice`, `error` or `idle`; `--agent-type`
+defaults to `*`. Repeat `--regex`/`--keyword` for several (a regex may contain
+a comma, so they are never comma-split). A rule needs at least one of them.
+Approval and choice rules only fire while herdr reports the agent blocked.
 
-**LLM environment** — the variables handed to the LLM CLI, per scope (`shared`, `command`, `command_start`, `task_generate_command`, `task_generate_command_start`, `learn_from_user_command`):
+### LLM environment
+
+Per scope: `shared`, `command`, `command_start`, `task_generate_command`,
+`task_generate_command_start`, `learn_from_user_command`.
 
 ```bash
-hap config env list                                          # names only, never values
+hap config env list                                     # names only, never values
 echo -n "$ANTHROPIC_API_KEY" | hap config env set command ANTHROPIC_API_KEY
 hap config env unset command ANTHROPIC_API_KEY
 ```
 
-these hold API keys, so no read path ever prints a VALUE and `env set` reads it from stdin unless you pass `--value` — a token on argv lands in shell history and in every other user's `ps`. to keep values out of config.toml entirely, point a scope at a `.env` file instead (`hap config set llm.env_file <path>`).
+No read path ever prints a **value**, and `env set` reads it from stdin unless
+you pass `--value` — a token on argv lands in shell history and in every other
+user's `ps`. To keep values out of `config.toml` entirely, point a scope at a
+`.env` file instead (`hap config set llm.env_file <path>`).
 
-## safety rules (never-auto patterns)
+Layering, last wins: daemon env → `env_file` → `env` → the command's
+`…_env_file` → the command's `…_env`, with hap's own `HAP_*` injected last.
+Names starting with `HAP_`/`HERDR_` are reserved and ignored. Env files are read
+when the CLI is **spawned**, so edits apply with no restart. A configured file
+that cannot be read, has a malformed line, or defines nothing **fails that run**
+rather than launching the CLI without its credentials.
 
-list all rules (seed + custom):
+## safety rules (never-auto)
 
 ```bash
-hap config rules list
-```
-
-add a custom regex pattern (operations matching this are never automated):
-
-```bash
+hap config rules list                    # shipped seed rules with stable ids, then yours
 hap config rules add '(?i)restart\s+the\s+payment\s+service'
-```
-
-remove a custom rule by index:
-
-```bash
 hap config rules remove <index>
-```
 
-scope a rule to specific agent types (a phrase only dangerous in one agent's TUI should not make every other agent ask):
-
-```bash
 hap config rules add --agent-type codex,agy '(?i)compact\s+the\s+conversation'
-hap config rules remove-scoped <index>    # scoped rules have their own index space
+hap config rules remove-scoped <index>   # scoped rules have their own index space
+
+hap config rules disable-seed <id>       # silence ONE shipped rule that over-escalates
+hap config rules enable-seed <id>
 ```
 
-silence a single shipped seed rule that is too aggressive for this repo (e.g. a
-heuristic firing on a legitimate word), keeping the rest of the safety net:
+A seed rule's `id` is a short hash of its pattern, so it names the same rule
+across upgrades (and is rejected if that pattern no longer ships). One seed rule
+is a single regex that may cover several phrasings — disabling it silences all
+of them, not just the phrase you saw. To drop the whole shipped set instead, set
+`safety.disable_never_auto_seed_patterns = true`.
 
-```bash
-hap config rules list                     # take the stable `seed <id>` from the listing
-hap config rules disable-seed <id>        # writes safety.disabled_seed_patterns
-hap config rules enable-seed <id>         # restore it
-```
+Prompts that look destructive but match no explicit pattern are caught by a
+**suspected-irreversible heuristic**. It requires corroboration — a destructive
+verb aimed at a data/infrastructure target, explicit no-undo language — so
+everyday prompts like "remove the unused import" do not trip it, and it scans
+only the actionable region (the pending dialog or the next-task prompt), never
+the agent's narration.
 
-the id is a short hash of the pattern, so it names the same rule across
-upgrades (and is rejected if that pattern no longer ships). one seed rule is a
-single regex that can cover several phrasings — disabling it silences all of
-them, not just the phrase you saw.
-
-the strict seed rules are scoped to MAJOR-risk, hard-to-recover operations: force-push, `sudo rm`, `dd`/`mkfs`, `DROP TABLE`, `TRUNCATE TABLE`, `DELETE FROM`, deploys to prod, `npm publish`, `terraform destroy`, cloud-resource deletion, credential rotation, mass sends, and more; broader heuristic seed rules catch suspected irreversible language. routine locally recoverable work (recursive `rm` of a project dir — though `/` and the whole home directory still escalate — local git history resets, `terraform apply`, merging a PR…) is deliberately NOT in the shipped set — add `never_auto_patterns` for anything you want escalated anyway. all shipped rules are active unless `safety.disable_never_auto_seed_patterns=true`. the old `safety.disable_seed` key still loads with a deprecation warning and is rewritten under the new name on the next config save.
-
-the config key for custom patterns is `never_auto_patterns` (the old name `allowlist_patterns` still loads as a deprecated alias):
-
-```toml
-[safety]
-never_auto_patterns = ['(?i)restart\s+the\s+payment\s+service']
-```
-
-prompts that look destructive but match no explicit pattern are caught by a suspected-irreversible heuristic. the heuristic requires corroboration — a destructive verb aimed at a data/infrastructure target, explicit no-undo language, etc. — so everyday prompts like "remove the unused import" don't trip it. it scans only the actionable region (the pending dialog or the next-task prompt), not the agent's narration. extend it with custom regex patterns:
-
-```toml
-# scoped to specific agent types
-[[safety.never_auto_rules]]
-pattern = '(?i)compact\s+the\s+conversation'
-agent_types = ["codex", "agy"]   # "*" or omit for all agent types
-```
-
-the legacy `irreversible_indicators` and `[[safety.indicator_rules]]` settings still load with warnings and migrate to unified never-auto configuration on the next save.
+Deprecated but still loading, migrated on the next config save:
+`allowlist_patterns` → `never_auto_patterns`, `safety.disable_seed` →
+`safety.disable_never_auto_seed_patterns`, `irreversible_indicators` and
+`[[safety.indicator_rules]]` → the unified never-auto forms.
 
 ## task sources
 
-task sources point agents at a checklist file so idle agents get the next unchecked item.
-
-list configured task sources:
-
-```bash
-hap config task-source list
-```
-
-add a task source for a specific agent:
+A task source points an agent at a checklist file so idle agents get the next
+unchecked item. `hap config task-source` manages **which file**; `hap task`
+manages the **items inside it**.
 
 ```bash
-hap config task-source add --agent backend-dev ./docs/backend-tasks.md
+hap config task-source list                                   # every source, with its index
+hap config task-source add --agent backend-dev ./docs/tasks.md
+hap config task-source add --workspace "codex-*" ./docs/tasks.md   # "*" wildcards
+hap config task-source add ./docs/tasks.md                    # any agent, any workspace
+hap config task-source remove <index|agent>
 ```
 
-add a task source for a specific workspace (supports wildcards):
+Flags must come **before** the path — Go stops parsing flags at the first
+positional argument (hap detects one written after and refuses rather than
+silently ignoring it). Removal takes the config entry only; the checklist file
+stays on disk. It is unguarded — it removes the entry even while a live agent
+is mid-task, which makes it the force path.
+
+**Every field is editable in place**, addressed by agent name or index:
 
 ```bash
-hap config task-source add --workspace "codex-*" ./docs/tasks.md
+hap config task-source set backend-dev path /new/tasks.md
+hap config task-source set backend-dev agent swift-heron
+hap config task-source set backend-dev workspace 'codex-*'
+hap config task-source set backend-dev template 'Do: {next_task_content}'   # "" = default
+hap config task-source set backend-dev auto-send-when-idle true
+hap config task-source set backend-dev enable-llm-review-before-auto-send true
+hap config task-source set backend-dev max-tasks 40
+hap config task-source set backend-dev provider github_gist   # or "inherit"
+hap config task-source set backend-dev gist-id aa11bb22       # or "inherit"
 ```
 
-add a task source for any agent in any workspace:
+All of them can also be set at creation time (`--agent`, `--workspace`,
+`--template`, `--auto-send-when-idle`, `--enable-llm-review-before-auto-send`,
+`--max-tasks N`, `--provider`, `--gist-id`).
 
-```bash
-hap config task-source add ./docs/tasks.md
-```
-
-add a task source with a custom prompt template:
-
-```bash
-hap config task-source add --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
-```
-
-add a task source that also hands out tasks on the idle poll (see below —
-this makes hap send without a herdr attention event, so it is opt-in):
-
-```bash
-hap config task-source add --agent backend-dev --auto-send-when-idle ./docs/backend-tasks.md
-```
-
-add a task source with a task cap other than the default 20 (see `max_tasks`
-below):
-
-```bash
-hap config task-source add --agent backend-dev --max-tasks 40 ./docs/backend-tasks.md
-```
-
-remove a task source by index:
-
-```bash
-hap config task-source remove <index>
-```
-
-this removes the `[[task_sources]]` entry only — the checklist file is left on
-disk. it is unguarded and unconfirmed: it removes the entry even while a live
-agent is mid-task on it, which makes it the force path.
+**Prefer the agent name over the index.** The index is positional, so removing a
+source renumbers every one after it. `#0` (the spelling `list` prints) is
+accepted verbatim. A name matching no source, or more than one, is refused
+naming the indexes that disambiguate it; a workspace-scoped source has no agent
+and must take an index. The first three re-point the source, so each prints what
+it changed **from** — the next hand-out then comes from a different list, or goes
+to a different agent. Nothing is copied or removed either way. A relative `path`
+resolves against **your** shell's cwd (the daemon runs from the state dir).
 
 ### where task lists are stored
 
-by default a checklist is a file on this machine. `[task_source_provider]` sets
-the DEFAULT storage for every source, and each `[[task_sources]]` entry may
-override it — so some agents can be local and others in a gist at once:
+By default a checklist is a file on this machine. `[task_source_provider]` sets
+the **default** storage; each source may override it, so some agents can be
+local and others in a gist at once:
 
 ```bash
 hap config set task_source_provider.provider github_gist
 hap config set task_source_provider.github_gist.gist_id 3f2a1b9c4d5e6f708192a3b4c5d6e7f8
 hap config set task_source_provider.env_file ~/.config/hap/task_source.env
-
-hap config task-source set 0 provider local_fs     # this ONE source stays on disk
-hap config task-source set 0 provider inherit      # …and back to following the default
-hap config task-source set 1 gist-id aa11bb22      # this ONE source uses another gist
+hap config task-source provider           # what is in force (never prints the token)
 ```
 
-show what is in force (never prints the token):
+A source that sets no `provider` keeps **inheriting** the default, so changing
+the default moves it; hap never writes the inherited value into the entry.
 
-```bash
-hap config task-source provider
-```
+Under `github_gist` a source's `path` is a file name **inside** the gist, not a
+filesystem path. Set it and every matched agent shares one list; leave it out
+and each matched agent gets its own `<agent-name>.md`, created on first
+hand-out. hap never creates the gist — make a **secret** gist on github.com and
+paste its hex id. The token lives in the file `env_file` names (`GITHUB_TOKEN=…`,
+`gist` scope, mode 0600), is read at use time, and never enters `config.toml`.
+Enabling this sends those sources' task lists to GitHub — task text and nothing
+else.
 
-a source that sets no `provider` keeps INHERITING the default, so changing the
-default moves it. hap never writes the inherited value into the entry.
-
-under `github_gist`, a source's `path` is a file name INSIDE the gist, not a
-filesystem path. set it and every agent the source matches shares one list;
-leave it out and each matched agent gets its own `<agent-name>.md`, created on
-first hand-out. `hap config task-source add --provider github_gist --agent brave-otter`
-(no path) creates that form.
-
-hap never creates the gist — make a secret gist on github.com and paste its hex
-id. the token lives in the file `env_file` names (`GITHUB_TOKEN=…`, `gist`
-scope, mode 0600), is read at use time, and is never written to `config.toml`.
-
-`hap task <agent> …` works the same either way. `--path` always reads a LOCAL
-file, so use the agent name for a remote list.
+`hap task <agent> …` works the same either way. `hap task --path` always reads a
+**local** file, so address a remote list by agent name or source index.
 
 ### auto-send tasks to idle agents
 
-by default a task only goes out when herdr reports the agent parked, and each
-idle episode is driven once — an agent that finishes and sits there just waits.
-set `enable_auto_send_task_when_idle = true` on a `[[task_sources]]` entry and
-the daemon also polls every minute, handing its next pending `[ ]` item to any
-matching agent idle for more than a minute:
-
-```toml
-[[task_sources]]
-agent = "backend-dev"
-path = "/home/me/project/docs/tasks.md"
-enable_auto_send_task_when_idle = true
-```
-
-it can be turned on when the source is added, without editing config.toml:
+By default a task goes out only when herdr reports the agent parked, and each
+idle episode is driven once — an agent that finishes and just sits there waits.
+Set `enable_auto_send_task_when_idle` and the daemon also polls every minute,
+handing the next pending `[ ]` item to any matching agent idle for over a
+minute:
 
 ```bash
 hap config task-source add --agent backend-dev --auto-send-when-idle ./docs/tasks.md
+hap config task-source set <index|agent> auto-send-when-idle true
 ```
 
-the TUI's *Config* tab `t` prompt takes the same words:
-`<path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`.
-it is opt-in everywhere and never inferred. an EXISTING source is switched on without editing
-config.toml:
+- **The task is sent without waiting for anything to be learned.** Turning the
+  flag on is your instruction, so a declared task from that source skips shadow
+  mode and the idle confidence threshold, and a learned "do nothing" rule does
+  not park it. That is what makes it work while you are away. Sources without
+  the flag are unchanged.
+- Every **safety** control still applies: kill switch, never-auto patterns, rate
+  limits, per-agent disable, and the optional pre-delivery LLM review. Sends are
+  audited under the trigger `auto-idle-send`.
+- **A pending escalation does NOT stop the hand-out.** It is a question about
+  what to answer on the agent's screen, not a verdict on whether the agent can
+  take its next task, so queued work keeps flowing while you catch up.
+- **One task, one agent.** Agents matched by the same source get *different*
+  items, and the delivered item is marked `[-]` as it is sent. Reserving belongs
+  to the source, so ordinary event-driven sends from it are marked `[-]` too.
+- **Every sweep decides from current state, not from the last send.** A
+  successful send only proves herdr took the keystrokes — text typed into a CLI
+  that is restarting or unfocused is silently lost. So each hand-out is recorded
+  and confirmed only when herdr reports that agent *working*. An unconfirmed
+  hand-out whose agent is parked again after ~2 minutes is returned to `[ ]`
+  (audit status `reclaimed`, trigger `auto-send-reclaim`) and re-offered in the
+  same sweep. A `[-]` hap did not write itself is never touched.
+- After **3** hand-outs of the same item that were never started, hap stops
+  resending: the item is left `[-]` and escalated as `task_never_started`, and
+  the agent moves on to the next item. Clear it with
+  `hap task <agent> undone <n>`.
+- An agent whose episodes keep resolving to something other than a send is
+  re-checked on a **widening interval** (1, 2, 4 … capped at 15 minutes). Any
+  delivered task resets it — a delay, never a bench.
 
-```bash
-hap config task-source set <index> auto-send-when-idle true   # or false
-hap config task-source set <index> enable-llm-review-before-auto-send true  # composes with the above
-hap config task-source set <index> max-tasks 40               # the refill/creation cap
+### the prompt template
+
+The default points the agent at its own list with its name pre-filled:
+
+```
+Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them (if that name isn't recognized, use the task-source index `{task_source_index}` in place of `{agent_name}`).
 ```
 
-**every field of a source is editable in place**, not just those three:
+Placeholders: `{next_task_content}`, `{task_list_path}`,
+`{task_list_path_quoted}` (that path as one shell word — use this inside a
+command the agent runs), `{task_source_index}`, `{agent_name}`, `{cwd}`.
 
-```bash
-hap config task-source list                              # every source, with its index
-hap config task-source set brave-otter path /new/tasks.md   # which list it reads
-hap config task-source set brave-otter agent swift-heron    # which agent it feeds
-hap config task-source set brave-otter workspace 'codex-*'  # which workspace
-hap config task-source set brave-otter template 'Do: {next_task_content}'  # "" = default
-hap config task-source set brave-otter provider github_gist # where the list is stored
-hap config task-source set brave-otter gist-id aa11bb22
-```
+The lifecycle instructions (`start <n>`, `done <n>`, how `<n>` is addressed) are
+printed by `hap task <agent> list` itself, beside the real task numbers, rather
+than re-sent with every prompt.
 
-**`set` and `remove` take an AGENT NAME or an index.** prefer the name: the index
-is positional, so removing a source renumbers every one after it. `#0` (the
-spelling `list` prints) is accepted verbatim. a name matching no source, or more
-than one, is refused naming the indexes that disambiguate it; a workspace-scoped
-source has no agent, so it takes an index.
+**When every item is checked off the templated prompt is NOT sent.** hap
+escalates a confirmable `@noop` suggestion ("No more pending tasks",
+`task_source_exhausted`) instead — unless **both** `llm.task_generate_command`
+and `llm.task_generate_command_start` are configured, in which case it generates
+more tasks for that source instead of escalating.
 
-the first three re-point the source, so each prints what it changed FROM and
-says so — the next hand-out then comes from a different list, or goes to a
-different agent. nothing is copied or removed either way; check
-`hap config task-source list` and `hap task <agent> list` afterwards. an empty
-`agent` or `workspace` matches ANY of them, which is called out when you do it.
-a relative `path` is resolved against YOUR shell's cwd (the daemon runs from the
-state dir); an empty `path` is refused under a local provider and means "one
-list per agent" under a remote one. a whitespace-only `template` clears back to
-the default rather than being delivered as the prompt.
+**`max_tasks` (per source, default 20)** caps how large a checklist may grow.
+Once the file holds more than that many items (done, in-progress and pending
+counted alike) and its pending items are exhausted, the daemon logs a warning
+and skips generation for that agent. The same cap gates **manual** creation —
+`hap task … add` and the TUI's `a` are rejected once they would push the list
+past it. Prune the list or raise `max_tasks` to resume. The no-source bootstrap
+case and an ad-hoc `--path` file are never capped.
 
-the *Config* tab's `enter` on a task-source row is the same edit: it opens a
-picker of the three settings, then asks for the value (the three compose, so no
-row is ever blocked by another). all are also settable at creation time —
-`hap config task-source add [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`,
-and the *Config* tab's `t` prompt takes the same words:
-`<path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]`
-(either `--max-tasks 40` or `--max-tasks=40`). wherever sources are listed
-(`hap config task-source list`, the *Config* tab) an enabled source shows
-`auto_send_when_idle=true`, and every source shows its
-`enable_llm_review_before_auto_send` and `max_tasks`.
+### task items (CRUD)
 
-- one task, one agent: agents matched by the same source get *different*
-  pending items, and the delivered item is marked `[-]` as it is sent (a failed
-  send returns it to `[ ]`). reserving belongs to the source, so ordinary
-  event-driven sends from it are marked `[-]` too — the agent's own
-  `hap task <name> start <n>` then just becomes a no-op.
-- delivery runs the normal pipeline — kill switch, never-auto patterns, rate
-  limits and per-agent disable all still apply; the audit row's trigger reads
-  `auto-idle-send`.
-- **the task is sent without waiting for anything to be learned.** turning the
-  flag on is the operator's instruction, so a declared task from that source
-  skips shadow mode and the idle confidence threshold, and a learned "do
-  nothing" rule does not park it. every other source is unaffected: without the
-  flag a shadow signature still suggests rather than acts. this is why the
-  feature works while you are AFK — there is no confirmation to give.
-- the pre-delivery LLM review **composes** with this:
-  `enable_llm_review_before_auto_send` decides which task and in what shape,
-  this flag decides that a task goes at all. the two used to be mutually
-  exclusive, because a declined review escalated and — at the time — any open
-  escalation skipped the agent, so a reviewed auto-send source switched itself
-  off. the review never escalates now, and ordinary escalations no longer skip
-  the agent either (below), so the restriction is gone twice over.
-- an agent that is disabled, rate-paused, or blocked is skipped. a pending
-  **escalation does NOT stop the hand-out** — it is a question for you about
-  what to answer on screen, not a verdict on whether the agent can take its next
-  task, so queued work keeps flowing while you catch up. what bounds an
-  undeliverable task is a per-TASK limit: an item whose delivery fails
-  `maxTaskHandouts` (3) times is left `[-]` and escalated as
-  `task_never_started`, and the agent moves on to the next item.
-- an agent whose episodes keep resolving to something other than a send (a
-  standing escalation you have not answered yet) is re-checked on a **widening
-  interval** — 1, 2, 4 … up to 15 minutes — instead of every minute. it is a
-  delay, not a bench: any delivered task resets it to full speed.
-- **every sweep decides from current state, not from the last send.** a
-  successful send only means herdr took the keystrokes — text typed into a CLI
-  that is restarting or unfocused is silently lost, and the item would sit `[-]`
-  forever. so each hand-out is recorded, and confirmed only when herdr reports
-  that agent *working*. an unconfirmed hand-out whose agent is parked again
-  after ~2 minutes is returned to `[ ]` (audit status `reclaimed`) and re-offered
-  in the same sweep — to that agent or any other idle one. a `[-]` hap did not
-  write itself (yours, or one an agent marked) is never touched.
-- after **3** hand-outs of the same item that were never started — or **3**
-  deliveries herdr refused outright — hap stops resending it: the item is left
-  `[-]` and an escalation (`task_never_started:…`) asks you to look. clear it
-  with `hap task <name> undone <n>` once the agent is healthy.
+Address a list by the agent whose source it is, by the **source index** from
+`hap config task-source list`, or with `--path <file>` for any local checklist.
 
-
-### manage the task items (CRUD)
-
-`hap task` edits the checklist items *inside* a source's file (whereas
-`hap config task-source` manages which file an agent points at). Address a list either
-by the agent whose task source it is, or with `--path <file>` for any checklist
-(and for workspace-scoped sources, which aren't addressable by agent name).
-
-**addressing a task.** `list` numbers items by their **position in the file**
-(`#1..#N`, counting checked and unchecked alike, never varying with a status
-filter). a checklist may also number its own tasks in the item text — either the
-`1. `/`2. ` prefix hap's generated lists use, or hand-authored section ids like
-`3.4 create the public link`. what you pass to `get`/`start`/`done`/`undone`/
-`update`/`remove`/`send` is resolved like this:
+**Addressing a task.** `list` numbers items by their position in the file
+(`#1..#N`, counting checked and unchecked alike). A checklist may also number
+its own tasks in the item text — the `1. `/`2. ` prefix hap's generated lists
+use, or hand-authored ids like `3.4`. What you pass resolves like this:
 
 | you pass | it means |
 |---|---|
 | `3.4` | the item whose id is `3.4` |
 | `3` | the item whose id is `3` |
-| `3` — no item has that id | position 3, **unless** the item sitting there has an id of its own — then it is refused, to be spelled `#3` |
+| `3` — no item has that id | position 3, **unless** the item there has an id of its own, which is refused so you spell it `#3` |
 | `#3` | position 3, always |
 
-that ordering matters because the id is what an agent reads in its prompt: told
-to do "3.4 create the public link", it reports `done 3.4`, which must not tick
-off whatever happens to sit at position 3. the fallback keeps unlabeled items
-reachable — a generated list plus one `task add` is exactly that mix. note that
-`#3` needs quoting in a shell (`'#3'`), which otherwise strips it as a comment.
-positions *do* shift after
-`add`/`remove`, so every mutating command re-prints the renumbered list. the
-checkbox is shown
-verbatim, so an in-progress `[-]` item (what the generated-task flow writes for
-the task an agent is actively working) renders as `[-]` and is *not* counted as
-pending (only truly-unchecked `[ ]` items are).
+The id comes first because it is what the agent reads in its prompt: told to do
+"3.4 create the public link", it reports `done 3.4`, which must not tick off
+whatever sits at position 3. Note `#3` needs quoting in a shell (`'#3'`).
+Positions shift after `add`/`remove`, so every mutating command reprints the
+renumbered list.
 
 ```bash
-hap task backend-dev list                 # all items, with status + number
-hap task backend-dev list --status pending  # or: done | all (default all)
-hap task backend-dev get 3                 # show one item (by id, or #3 by position)
-hap task backend-dev done 3.4              # tick off the item the list numbers 3.4
-hap task backend-dev add "wire up retries" # append a new unchecked item
-hap task backend-dev start 2               # mark item 2 in-progress ([-])
-hap task backend-dev done 2                # tick item 2 off ([x])
-hap task backend-dev undone 2              # re-open item 2 ([ ])
-hap task backend-dev update 2 "new text"   # edit text, keep status
-hap task backend-dev remove 2              # delete item 2
-hap task backend-dev move 5 2              # reorder: put item 5 at position 2
-hap task backend-dev move 5 up             # or: up | down (one step)
-#   a task moves together with its indented detail lines and nested sub-tasks,
-#   and reorders only among its own siblings.
-hap task backend-dev send 3 [--yes]        # deliver pending item 3 to the live
-#   agent NOW (y/N confirmation unless --yes). only a pending [ ] item on a
-#   cleanly idle agent qualifies — idleness is re-checked at the moment of
-#   delivery, so a stale --yes cannot interrupt an agent that has since picked
-#   up work. the item is marked [-] BEFORE delivery (that mark is what stops
-#   the daemon's idle-time flow re-sending it); a failed send returns it to [ ].
-
-hap task --path ./docs/tasks.md list       # operate on any checklist file
-
-# multi-line text stays ONE task: real line breaks (CR/LF flavors ok) are
-# stored as the literal two-character sequence \n on the item's single line,
-# and converted back to real newlines when the task is sent to an agent.
-# hand-writing \n directly in tasks.md works the same way.
-hap task backend-dev add $'wire up retries\nadd backoff jitter'   # 1 item: "wire up retries\nadd backoff jitter"
-hap task backend-dev update 2 'part one\npart two'                # literal \n is kept as-is
+hap task backend-dev list                    # all items, with status + number
+hap task backend-dev list --status pending   # or: done | all (default all)
+hap task backend-dev get 3.4                 # show one item
+hap task backend-dev add "wire up retries"   # append a new unchecked item
+hap task backend-dev start 2                 # [-] in progress
+hap task backend-dev done 2                  # [x]
+hap task backend-dev undone 2                # [ ]
+hap task backend-dev update 2 "new text"     # edit text, keep status
+hap task backend-dev remove 2
+hap task backend-dev move 5 2                # or: up | down (one step)
+hap task backend-dev send 3 [--yes]          # deliver item 3 to the live agent NOW
+hap task 0 list                              # by source index
+hap task --path ./docs/tasks.md list         # any local checklist file
 ```
 
-resolution by agent name matches the `agent` selector a task source was
-registered with (its short name, id, or type). if the name matches no source,
-matches several, or only workspace-scoped sources exist, `hap task` errors and
-tells you to use `--path`. writes go straight to the file (atomically) — the
-daemon re-reads task files live, so no restart or reload is needed. adding a
-task doesn't interrupt a working agent; it's picked up on the agent's next idle.
+Aliases: `ls`, `show`, `create`, `wip`, `check`, `uncheck`/`reopen`, `edit`,
+`rm`/`delete`, `mv`/`reorder`. Marks: `[ ]` pending, `[-]` in progress, `[x]`
+done — an in-progress item is **not** counted as pending.
 
-the TUI's **Tasks tab** does the same CRUD without the CLI: it aggregates every
-configured source's checklist into one list (a header per source with a
-tail-truncated path — `…/dir/file.md`, file name preserved, full path still
-searchable — its items under it) and edits them in place — `enter`/`y` sends
-the pending `[ ]` task under the cursor to the cleanly idle agent its source
-feeds behind a Y/n confirmation, marking it `[-]` on success (done/in-progress
-tasks and busy agents are refused), `v` opens a task
-detail (full decoded text, full source path, live agents; `enter`/`y`, `e`,
-`x`, `f` keep working inside it), `a` add, `e` edit, `d` done/undone, `x`
-delete, `space` to mark a run so `d`/`x` act on all marked at once, `f` to
-focus the live agent a source feeds, `/` to search. `x` **on a source's header
-row** retires the whole source (config entry only, checklist file kept) behind
-a y/n confirmation — offered only when no live agent matches it or every task
-is finished, `[-]` counting as unfinished; an unknown agent list or an
-unreadable checklist refuse too (unknown is not evidence of safety), and
-marked items win over it. the add/edit prompts take
-multi-line task text: **shift+enter inserts a line break** (ctrl+j on
-terminals that can't report it), the box expands one line per break, **enter
-submits** — stored as the literal `\n` encoding above, decoded back when the
-prompt pre-fills. **long text wraps to the pane width** on its own (breaking
-after a word, never mid-word), so a line break is only for text you actually
-want on its own line — never to make a long sentence visible. an entry taller
-than the box scrolls with the caret and the label says which rows are showing.
-the input is a full line editor, so a typo in the middle of
-a long task is fixed in place: **←/→ move the caret** (ctrl+←/→ by word,
-home/end or ctrl+a/ctrl+e to the ends), typing and backspace/delete act at the
-caret, and the block cursor shows where the next keystroke lands. a prompt
-that pre-fills a value (edit, the prune default) opens with the caret after
-it. the same keys work in every hap prompt, not only the task ones. an action captured against a row aborts if that task's text
-changed before the write lands, so a stale keypress never mutates the wrong
-(renumbered) line.
+`move` reorders one task among its **siblings**; the source is a reference but
+the destination is always a position. The whole subtree travels (nested detail
+lines and sub-tasks). Moving a task under a different parent is re-parenting,
+not reordering, and is refused.
 
-### template placeholders
+`send` needs a pending `[ ]` item and a cleanly idle agent. Idleness is
+re-checked at the moment of delivery, so a stale `--yes` cannot interrupt an
+agent that has since picked up work. The item is marked `[-]` **before**
+delivery (that mark is what stops the daemon re-sending it); a failed send
+returns it to `[ ]`. Normally you do not need it — the daemon hands out the next
+task by itself.
 
-the prompt sent to the agent is rendered from a template. the default points the
-agent at its own list with its name pre-filled (and a `--path` fallback for
-sources that aren't name-addressable):
+**Multi-line text stays ONE task.** Real line breaks are stored as the literal
+two-character sequence `\n` on the item's single line and converted back to real
+newlines when the task is sent. Hand-writing `\n` in the file works the same way.
 
-```
-Your next task is {next_task_content}. Prefer the hap CLI to manage your tasks (start/done), run bash `hap task {agent_name} list` to view them (if that name isn't recognized, use `--path {task_list_path_quoted}` in place of `{agent_name}`).
+```bash
+hap task backend-dev add $'wire up retries\nadd backoff jitter'   # one item, two lines
 ```
 
-the lifecycle instructions themselves (`start <n>`, `done <n>`, how `<n>` is
-addressed, and the `--path` fallback) are printed by `hap task <agent> list` at
-the bottom of its output — stated once beside the real task numbers instead of
-being re-sent with every prompt.
+Writes go straight to the file atomically; the daemon re-reads task files live,
+so no restart or reload is needed. Adding a task never interrupts a working
+agent — it is picked up on that agent's next idle.
 
-- `{next_task_content}` — the text of the next unchecked item (or `"none"` when the list is complete)
-- `{task_list_path}` — absolute path to the checklist file
-- `{task_list_path_quoted}` — that path as one shell word (quoted only when it needs it); use this, not `{task_list_path}`, inside a command the agent is meant to run
-- `{agent_name}` — the agent's hap-owned short name
-- `{cwd}` — the agent's working directory (the project it is in)
+## the LLM fallback (optional)
 
-when every item is checked off, the prompt is still sent with `{next_task_content} = "none"`, so the template can steer what an idle agent does when the list is done.
+When no confident learned rule applies, hap can consult a local LLM/agent CLI.
+The model talks to hap's own MCP server (`hap mcp` — tools `get_context` and
+`submit_decision`); its stdout is captured for audit only. Configure it with a
+preset (see above) rather than by hand.
 
-when an `[llm].command` is configured and a source sets `enable_llm_review_before_auto_send = true`, the llm reviews — and may revise — that task list immediately before the daemon auto-sends a task from it. via `get_context` it sees the live pane, the queued task (`proposed_task`/`current_task`), the checklist path (`task_list_path`), and `tasks`: every item with the `ref` used to address it (a declared id like `3.4`, else a position like `#3`), its position and its status. it answers in ONE `submit_decision` call — `task_actions`, an ordered series of edits applied in sequence (`done` / `delete` / `edit` / `move` / `add`, each addressing a task by `ref`, with `add` taking an `as` handle), plus `send_task`, the REFERENCE of the task to deliver once they are applied. `send_task` is never task text: the daemon renders the prompt from the list itself, so nothing can be paraphrased in transit. to send the task at hand unchanged, just name it and submit no actions. everything applies atomically under the file lock, or not at all. **it never escalates** — an unusable review, one scoring below `auto_act_confidence_threshold`, or a reviewed task tripping never-auto / suspected-irreversible all send the ORIGINAL task unchanged and leave the checklist byte-identical. `send_task "@noop"` is legal only when no pending task remains afterwards. every outcome is audited under the `llm-task-review` trigger with a distinct reason, and mutations carry before/after text — so `hap audit` answers "why is task 4 gone?". only sends the DAEMON initiates are reviewed; `hap task <agent> send` and the TUI's send never are. OFF by default; opt a source in by hand in `config.toml`, with `hap config task-source set <index> enable-llm-review-before-auto-send true`, or from the TUI's config tab (`enter` on a task-source row). it composes with `enable_auto_send_task_when_idle` (see "auto-send tasks to idle agents"). the former `enable_llm_review` key still loads and migrates on the next save, but the CLI refuses that spelling; `llm_review` is no longer recognized.
+`get_context` returns the classified situation (type, options, permission verb,
+error summary), a pane excerpt (last `pane_excerpt_chars` chars), the agent's
+herdr location (`workspace_id`, `tab_id`, `pane_id`, `agent_id`), its hap-owned
+`agent_name`, and the pane's `cwd`/`foreground_cwd`. Whenever the agent has a
+matching task source it also carries `task_list_path`, `pending_task_count` with
+a truncated `next_pending_task`, and `in_progress_task_count` with a truncated
+`first_in_progress_task` — on **every** consult, not just a task review.
 
-without a declared task source, the plugin falls back to inferring the next task from the agent's own native todo rendering (currently only `claude` agent type is supported for inference). other agent types skip inference and escalate.
+`submit_decision` enforces a per-situation contract:
 
-if inference finds nothing (no task source and nothing inferable from the pane) and `llm.task_generate_command` is configured, the plugin runs that CLI once to synthesize a next task for the idle agent (placeholders: `{self}`, `{agent_name}`, `{agent_type}`, `{pane_excerpt}`, `{cwd}`). the CLI's stdout is surfaced as an escalation the operator confirms (writing a per-agent `tasks.md`) or dismisses — the plugin never sends a synthesized task unattended. leave `task_generate_command` unset to keep the default: an idle agent with no task source escalates as `no_task_source` and nothing is synthesized. `task_generate_command_start` is the first-interaction variant (empty inherits `task_generate_command`); `task_generate_timeout_seconds` bounds one run (0 inherits `llm.timeout_seconds`).
+- `approval`/`choice` **with** listed options → `select_options` (1-based option
+  numbers; one integer per tab for a multi-tab form)
+- `approval`/`choice` **without** listed options (a bare y/n) → `recommend_action`
+- `idle`/`error` → `recommend_action` (literal reply text)
+- any situation → `recommend_action "@noop"` means no reply is needed
 
-**`max_tasks` (per `[[task_sources]]`, default 20)** caps how large a source's checklist may grow. once the file holds MORE than `max_tasks` items — done, in-progress, and pending counted alike — and its pending items are exhausted, the daemon logs a warning (`maximum number of tasks reached … skipping task generation`, with the agent name) and skips LLM generation for that agent instead of appending to an already-long list. the **same cap gates manual creation**: adding tasks (the Tasks-tab `a`, or `hap task … add`) to a registered source is rejected once it would push the list past `max_tasks` (`maximum number of tasks reached …`), so a hand-added list can't grow past what the daemon would then refuse to refill. prune the checklist (or raise `max_tasks` — `hap config task-source set <index> max-tasks <n>`, `hap config task-source add --max-tasks <n>` at creation time, or the *Config* tab's `enter` on the source row) to resume. a source added by hap writes its cap explicitly (`max_tasks = 20`), and a config loaded with the key unset is saved back with the effective default rather than a bare `0`. sending the pending items of an under-cap source is unaffected; the no-task-source bootstrap case (no `[[task_sources]]` entry) and an ad-hoc `--path` file that is not a registered source are never capped.
+Every suggestion is re-gated through never-auto patterns, the kill switch and
+the rate guards. It auto-acts only when the model's own `confident_score` meets
+`llm.auto_act_confidence_threshold` **and** the action does not contradict
+learned history; below that, with no score, or on timeout / no submission, the
+situation escalates.
+
+**Where the CLI runs.** By default (`llm.run_in_agent_cwd = true`) hap launches
+it in the monitored agent's own working directory, so it reads that project's
+`CLAUDE.md`/`AGENTS.md` and its `AUTO.md`. The directory is chosen by the
+*agent*, which can `cd` anywhere — turn the key off where your agents work in
+repos you do not trust, since a cloned repo can ship its own `AUTO.md`. (The
+shipped prompts frame those rules as operator guidance, never as instructions
+that override the prompt.) It cannot bypass a safety control either way. For
+`claude`, hap appends
+`--strict-mcp-config` to any command passing `--mcp-config`, so the project's
+`.mcp.json` cannot add servers to the consult.
+
+Placeholders for the argv template: `{self}` (the hap binary), `{request_id}`,
+`{db}`, `{control}`, `{agent_name}`, `{agent_type}`, `{cwd}`, `{pane_excerpt}`,
+`{session_id}`. Common misconfigurations of known CLIs are auto-repaired at
+launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing `exec`
+inserted).
+
+`command_start` runs *instead of* `command` on an agent's first consult this
+daemon lifetime — use it for a heavier model or a warm-up prompt. Leaving it
+empty inherits `command`. A `command_start` with **no** `command` does not
+enable the fallback; `command` alone gates that.
+
+For `agy` there is no preset and no per-invocation MCP flag — register hap once
+in `~/.gemini/config/mcp_config.json` with `HAP_DB_PATH` in its `env`.
+
+### LLM action review (optional)
+
+When a learned rule resolves to literal free text (an idle next-task prompt, an
+error retry command, a free-text approval reply), the consult LLM can adapt that
+text to what is actually on screen before sending:
+
+```bash
+hap config set llm.enable_rewrite_action true    # default false; needs llm.command
+```
+
+`get_context` carries `proposed_action` (the exact text about to be sent), and
+the model submits the adapted text, `@proposed_action:send` to affirm the
+original verbatim, or `@noop` to send nothing.
+
+Invariants:
+
+- **Numbered-menu answers are never reviewed** — a mapped digit reaches the menu
+  untouched. Only literal free text goes through.
+- **Declared tasks are never reviewed here** — that is
+  `enable_llm_review_before_auto_send`'s job, per source.
+- **A review failure never blocks the send.** On error, timeout, empty or
+  invalid output the original is delivered as-is (or wrapped in
+  `rewrite_action_fallback_template`). `auto_act_confidence_threshold` does
+  **not** apply — an unsure review degrades to the original instead of
+  escalating.
+- **Safety controls still apply to the reviewed text**: output matching a
+  never-auto pattern or the irreversible heuristic is discarded in favor of the
+  original, and the kill switch, rate guard and staleness re-check run again at
+  delivery.
+- **Learning is unaffected** — decision history records the original learned
+  action, never the adapted text.
+- **Cost:** every reviewed send is one full consult on `llm.command`.
+
+### reviewing a task list before a task is sent (optional)
+
+Per source, off by default. Immediately before the daemon auto-sends a task, the
+LLM sees the live pane, the queued task (`proposed_task`/`current_task`), the
+checklist path, and `tasks` — every item with the `ref` used to address it, its
+position and status. It answers in **one** `submit_decision`: `task_actions` (an
+ordered series of `done`/`delete`/`edit`/`move`/`add`, each addressing a task by
+`ref`, with `add` taking an `as` handle) plus `send_task`, the **reference** of
+the task to deliver once they are applied.
+
+```bash
+hap config task-source set <index|agent> enable-llm-review-before-auto-send true
+```
+
+`send_task` is never task text — the daemon renders the prompt from the list
+itself, so nothing can be paraphrased in transit. To send the task at hand
+unchanged, just name it and submit no actions. Everything applies atomically
+under the file lock, or not at all.
+
+**It never escalates.** An unusable review, one scoring below
+`auto_act_confidence_threshold`, or a reviewed task tripping never-auto /
+suspected-irreversible all send the **original** task unchanged and leave the
+checklist byte-identical. `send_task "@noop"` is legal only when no pending task
+remains afterwards. Every outcome is audited under the `llm-task-review` trigger
+with a distinct reason, and mutations carry before/after text — so `hap audit`
+answers "why is task 4 gone?". Only sends the **daemon** initiates are reviewed;
+`hap task <agent> send` and the TUI's send never are.
+
+### generating tasks when no source exists (optional)
+
+If an idle agent has no matching source and nothing inferable from its own todo
+widget (only `claude` supports inference), `llm.task_generate_command` runs a
+one-shot CLI to propose next tasks. Its stdout is surfaced as an **escalation**
+you confirm or dismiss — hap never sends a synthesized task unattended. Leave
+the key unset and an idle agent with no source simply escalates as
+`no_task_source`.
+
+The CLI can decline with `@noop` alone, which escalates as a confirmable "do
+nothing". An **empty** reply is not a decline — it is indistinguishable from a
+crashed CLI, so it stays a retryable failure.
+
+### learning from your corrections (optional)
+
+When you **correct** an escalation, `llm.learn_from_user_command` runs a
+one-shot CLI in the agent's own working directory, asking it to record the
+lesson in `AUTO.md` there, under a heading spelled exactly
+`## Lessons for hap's auto-answer assistant`. Extra placeholders:
+`{situation_type}`, `{suggestion}` (what hap was about to answer),
+`{correction}` (what you answered instead).
+
+**`AUTO.md` is hap's own file, not the project's `CLAUDE.md`/`AGENTS.md`.** A
+lesson only applies to the assistant hap spawns to answer a prompt on the
+agent's screen; the shared memory file would load it into the agent's context on
+every turn of its real work. So the three hap-spawned runs share a file nothing
+else reads: this command writes it, and the shipped `llm.command` and
+`llm.task_generate_command` prompts are told to read it before deciding (via the
+`@AUTO.md` reference claude expands at prompt-parse time, so the consult needs no
+Read tool). One heading keeps it reviewable and removable in one edit; add
+`AUTO.md` to `.gitignore` if you would rather not commit it. Only the file NAME
+lives in the prompt — no code depends on it.
+
+- **Only corrections trigger it** — a confirmation means hap was right, so there
+  is no lesson and no run. Accepting a generated task does not count either.
+- **Only a standing escalation teaches.** Correcting an old **audit** row still
+  feeds normal learning but runs no CLI: herdr recycles pane ids, so the lesson
+  could land in a different project.
+- **It runs in the agent's cwd**, and is **refused** rather than redirected when
+  that cannot be resolved — the CLI has write permission and is told to edit
+  "the current directory".
+- It never touches the pane, never creates a rule, never escalates. Each run
+  leaves one `hap audit` row (`llm-learn-from-user`: `learn:recorded` /
+  `learn:failed`), retryable with `hap escalations retry <id>` or `l` in the
+  TUI's Audit tab.
+- **Nothing is parsed out of the reply** — no sentinel, no decision. Its whole
+  stdout+stderr is captured verbatim on the audit row.
+- It needs **write** permission (e.g. `--permission-mode acceptEdits`), runs
+  only after your correction is committed, and is suppressed by `hap pause`.
+  There is deliberately no `_start` variant.
+
+## unattended modes
+
+Two ways to stop an escalation queue from blocking the herd while nobody is
+watching. Both are **off by default**, neither ever learns from its own accepts,
+and both honour every safety exclusion.
+
+### timed auto-accept — the slow lane
+
+An escalation that has waited past its threshold, and whose situation is still
+demonstrably on screen, is answered automatically.
+
+```bash
+hap config set escalations.auto_accept.enabled true
+hap config set escalations.auto_accept.approval 15m     # "0" disables that type
+```
+
+Each duration is a Go duration string (`"15m"`, `"1h30m"`). A value below one
+minute — the sweep's granularity — is **rejected at load**, as is anything
+unparseable; the whole section is then ignored, so a typo can never start
+sending on your behalf.
+
+Before anything is delivered: the kill switch is off and the agent is neither
+paused nor disabled; the agent still exists and is parked; and the pane still
+shows **the same situation**, re-read and re-classified against the signature on
+the audit row. If any of that cannot be *evaluated* (an unreadable pane, an
+unreachable herdr), nothing happens and the escalation waits — only a check that
+ran and came back negative retires one.
+
+`idle` and `unclassifiable` ship disabled because their signatures fall back to
+raw screen text, which cannot be compared confidently enough to deliver or
+dismiss on.
+
+What it never does: learn from itself; touch an escalation raised by
+`never_auto_match`, `suspected_irreversible`, `retry_exhausted` or
+`rate_limited` (all four are in code and cannot be configured away); type the
+`@noop` sentinel at an agent; or answer more than **one escalation per agent per
+sweep**. Escalations raised before you upgraded can never auto-accept — the
+comparison needs a signature baseline older audit rows do not carry.
+
+Outcomes: `auto-sent` for a delivered one; `dism:stale` / `dism:gone` /
+`dism:failed` when hap retired one instead. None read as `resolved` — that stays
+yours.
+
+### full self-prompting — the fast lane
+
+Every escalation carrying a proposed answer is accepted **immediately**, rather
+than waiting out a threshold. Everything else about auto-accept holds unchanged.
+It also refuses an agent that has **gone back to work** — status is re-read from
+herdr immediately before delivery.
+
+```bash
+hap config set full_self_prompting.enabled true
+```
+
+**Enabling is refused until the daemon has earned it:** at least **10** graduated
+(autonomous) rules AND a configured `llm.command`, and never while paused. The
+error names every missing requirement at once. Turning it off is never refused.
+
+The preconditions stay live. Delete rules below the minimum or clear
+`llm.command` and the mode goes **inactive** — escalations queue for you again —
+without your config being rewritten. `hap status` shows one of:
+
+```
+full self-prompting:           off
+full self-prompting:           ON — escalations with a proposed answer are answered automatically
+full self-prompting:           ON but INACTIVE — only 4 of 10 required graduated (autonomous) rules remain
+```
+
+An escalation the mode answered is audited as `fsp-sent` (a timed auto-accept
+reads `auto-sent`), so the two are never confused.
+
+Two opt-in behaviors, both default false:
+
+```bash
+hap config set full_self_prompting.honour_limits true
+hap config set full_self_prompting.accept_generated_task true
+```
+
+**`honour_limits`** decides whether `[limits]` applies to the mode at all.
+
+- **Left off (the default), the whole `[limits]` section is inert while the mode
+  is active.** Neither runaway ceiling gates a send, a leftover runaway pause no
+  longer benches the agent, and `max_error_retries` stops gating too — so a
+  failing error signature retries without bound. This is blanket unattended
+  autonomy. `hap config show` marks the `limits:` line as not enforced.
+  Deliveries still *advance* the counters, so turning the key on after a long
+  unattended run trips the consecutive ceiling on the very next sweep. Interact
+  with the agent, or raise the ceiling, before flipping it.
+- **Turned on, the ceilings are strict** — checked *before* each delivery, and
+  reaching one switches the whole mode **off**: hap rewrites `enabled = false`,
+  records it in `hap kill-history` (author `daemon`), and notifies which agent
+  and which ceiling tripped. Note the asymmetry: the ceilings are **per agent**
+  while the mode is **global**, so one runaway agent stands the mode down for
+  the whole herd.
+
+Everything outside `[limits]` is unaffected either way — the kill switch,
+per-agent disables, never-auto rules and the irreversible heuristic all still
+stop a send.
+
+**`accept_generated_task`** lets the mode act on an idle escalation whose
+suggestion is an LLM-generated task: writing the task list, registering the
+source, handing the first task over. The generated text is screened against your
+never-auto patterns and the irreversible heuristic first — it was authored by
+the model *after* the escalation was raised, so until now your confirmation was
+the only thing that had ever looked at it. A match leaves the escalation for
+you. In practice it fires less often than you might expect: idle situations are
+compared by raw screen text, and hap leaves anything it cannot prove.
+
+## disk usage and cleanup
+
+`hap status` prints a `disk:` line. Three things grow in the state dir:
+
+| file | bounded by |
+|---|---|
+| `herd-auto-prompter.log` | `logging.max_size_mb` (16 MiB), plus one `.old` |
+| `daemon.stderr.log` | 256 KiB, plus one `.old` |
+| `herd-auto-prompter.db` | `logging.audit_excerpt_retention_days` (14) |
+
+The database grows fastest — most of it is the pane excerpt captured with each
+audit row (~3.8 KiB of a 5.0 KiB row). Retention **blanks that column and keeps
+the row**, so `hap audit` history, rationales and statuses all survive.
+
+```bash
+hap gc --dry-run     # what would be reclaimed; changes nothing
+hap gc               # reclaim now (the daemon also does this once a day)
+hap gc --days 7      # override the window for this run
+```
+
+`audit_excerpt_retention_days` takes three kinds of value: omitted = the default
+14; `0` = keep **no** excerpts (the most aggressive setting, not an off switch);
+negative (`-1`) = never prune. Rows the daemon may still read are never touched
+whatever the retention says — pending escalations at any age, rows with an
+unprocessed LLM retry, and recently answered asks. That is a safety rule:
+auto-accept reads a pending escalation's excerpt as proof a menu was standing.
+
+`hap gc` also vacuums, which is what actually returns the space to the
+filesystem.
 
 ## reset data
 
-### reset learned data (keeps config)
-
 ```bash
-hap clear-data --yes
+hap clear-data --yes    # every signature, decision, correction, counter, audit row
 ```
 
-this empties all learning-related tables (signatures, decisions, audit log, corrections, rate/retry counters, LLM requests) and nudges the running daemon to reload — no restart needed. the `--yes` is mandatory. your configuration (thresholds, never-auto rules, task sources) is kept.
+Config (thresholds, never-auto rules, task sources) is kept, and the running
+daemon is nudged to reload — no restart. `--yes` is mandatory.
 
-### full factory reset (everything, including config)
-
-there's no single CLI verb for this — stop the daemon and delete the plugin's two directories:
+For a full factory reset there is no CLI verb — stop the daemon and delete both
+directories (they are recreated automatically):
 
 ```bash
-pkill -f "hap daemon" 2>/dev/null                          # stop the daemon
+pkill -f "hap daemon" 2>/dev/null
 rm -rf ~/.local/state/herdr/plugins/herd-auto-prompter     # DB, log, socket, lock
 rm -rf ~/.config/herdr/plugins/config/herd-auto-prompter   # config.toml
 ```
 
-both directories are recreated automatically — the daemon restarts on the next `pane.agent_detected`/`workspace.created` event, or immediately via `hap daemon --ensure`.
-
-## llm fallback configuration
-
-when no confident learned rule applies, the plugin can consult a local LLM. the model uses the plugin's MCP server (`hap mcp` — tools `get_context` and `submit_decision`). common CLI misconfigurations are auto-repaired at launch.
-
-`get_context` returns: classified situation (type, options, permission verb, error summary), a pane excerpt (last `pane_excerpt_chars` characters), the agent's herdr location (`workspace_id`, `tab_id`, `pane_id`, `agent_id`), the agent's hap-owned short name (`agent_name`), and the pane's working directory (`cwd`, `foreground_cwd`). Whenever the agent has a matching `[[task_sources]]` entry, it also carries `task_list_path`, `pending_task_count` (items marked `[ ]`) with a truncated `next_pending_task`, and `in_progress_task_count` (items marked `[-]`, possibly the task the agent is currently working on) with a truncated `first_in_progress_task` — the preview field only appears when its count is at least 1 — on every consult, not just the pre-send task review below.
-
-`submit_decision` enforces a per-situation contract:
-- `approval`/`choice` with listed options → use `select_options` (1-based option numbers)
-- `approval`/`choice` without listed options (e.g. bare y/n) → use `recommend_action` (literal text)
-- `idle`/`error` → use `recommend_action` (literal reply text)
-- any situation → `recommend_action "@noop"` means no reply is needed
-
-### claude code
-
-```toml
-[llm]
-command = [
-  "claude", "--no-session-persistence", "-p",
-  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
-  "--mcp-config", '{"mcpServers":{"hap":{"command":"{self}","args":["mcp"],"env":{"HAP_REQUEST_ID":"{request_id}"}}}}',
-  "--allowedTools", "mcp__hap__get_context,mcp__hap__submit_decision",
-]
-timeout_seconds = 120
-auto_act_confidence_threshold = 85    # 0-100, default 85; >100 (e.g. 999) = never auto-act. needs an LLM CLI that reports a confidence score
-pane_excerpt_chars = 5000
-```
-
-### codex
-
-codex requires `exec` for headless runs and explicit `HAP_DB_PATH`/`HAP_CONTROL_PATH` env vars (codex sanitizes the MCP server environment):
-
-```toml
-[llm]
-command = [
-  "codex", "exec", "--ephemeral", "--skip-git-repo-check",
-  "--dangerously-bypass-approvals-and-sandbox",
-  "-c", 'mcp_servers.hap.command="{self}"',
-  "-c", 'mcp_servers.hap.args=["mcp"]',
-  "-c", 'mcp_servers.hap.env.HAP_REQUEST_ID="{request_id}"',
-  "-c", 'mcp_servers.hap.env.HAP_DB_PATH="{db}"',
-  "-c", 'mcp_servers.hap.env.HAP_CONTROL_PATH="{control}"',
-  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision. Do not run any other commands.",
-]
-timeout_seconds = 180
-```
-
-### antigravity (agy)
-
-agy has no per-invocation MCP flag — register hap once in `~/.gemini/config/mcp_config.json`:
-
-```json
-{"mcpServers": {"hap": {"command": "/path/to/plugin/bin/hap", "args": ["mcp"],
-  "env": {"HAP_DB_PATH": "~/.local/state/herdr/plugins/herd-auto-prompter/herd-auto-prompter.db"}}}}
-```
-
-then configure the llm command:
-
-```toml
-[llm]
-command = [
-  "agy", "--print",
-  "Use the hap MCP tools: call get_context, decide what the operator would answer, then call submit_decision.",
-  "--dangerously-skip-permissions",
-]
-timeout_seconds = 180
-```
-
-### placeholders
-
-- `{self}` — path to the hap binary
-- `{request_id}` — current pending request id
-- `{db}` — path to the SQLite database
-- `{control}` — path to the control socket
-- `{agent_name}` — the agent's hap-owned short name (also usable in `llm.command` argv)
-
-### first-interaction command variant
-
-set `command_start` to use a different argv on the FIRST consult for a freshly detected agent (e.g. a heavier model or a warm-up prompt), then fall back to `command` for every consult after. leaving it empty inherits `command`, so it's opt-in and existing configs are unaffected. a `command_start` with no `command` does NOT enable the LLM — `command` alone gates that.
-
-```toml
-[llm]
-command       = ["claude", "--no-session-persistence", "-p", "...", "--model", "haiku"]
-command_start = ["claude", "--no-session-persistence", "-p", "...", "--model", "opus"]   # first consult per agent only
-```
-
-every LLM suggestion is re-gated through the never-auto patterns, kill switch, and rate guards. the LLM may act automatically only when its self-reported confidence score meets `auto_act_confidence_threshold` (0-100; default 85, so a high-confidence score does auto-act — set it above 100 to disable) AND the action doesn't contradict learned history; below the threshold, with no reported score, or on timeout / no submission, the situation escalates. the old boolean `auto_act` still loads as a deprecated alias (`true` → threshold 0, `false` → 999) and is migrated on next save.
-
-## llm action review (optional)
-
-when a learned rule resolves to literal free text (idle next-task prompt, error retry command, free-text approval reply — never menu digits, and never a declared task from a `[[task_sources]]`, whose `enable_llm_review_before_auto_send` gate owns that), the consult LLM (`llm.command`) can review/adapt that text to what's actually on the agent's screen before sending. the review rides the same `get_context`/`submit_decision` MCP round-trip as any consult: `get_context` carries `proposed_action` (the exact text about to be sent), and the model submits the adapted text, `@proposed_action:send` to affirm the original, or `@noop` to send nothing.
-
-```toml
-[llm]
-command = [ ... ]              # required — the review uses the consult CLI
-enable_rewrite_action = true   # default: false
-# optional — on failure the original is sent as-is; set this only to wrap it:
-# rewrite_action_fallback_template = "You must act based on the following: {original_text}"
-```
-
-upgrading: the former one-shot rewrite CLI keys (`llm.rewrite_command`, `llm.rewrite_command_start`, `llm.rewrite_timeout_seconds`) were removed — they load with a warning and are dropped on the next save; `llm.rewrite_fallback_template` migrates to `llm.rewrite_action_fallback_template`. rewriting stays OFF until `enable_rewrite_action = true` is set.
-
-### action review invariants
-
-- numbered-menu answers are never reviewed — a mapped digit reaches the menu untouched. only literal free text goes through the review.
-- declared tasks from `[[task_sources]]` are never action-reviewed — the source's `enable_llm_review_before_auto_send` gate owns task review; a source that did not opt in delivers its tasks verbatim.
-- a review failure never blocks the send: on error, timeout, empty or invalid output the original text is delivered as-is (or wrapped in `rewrite_action_fallback_template` when configured). `auto_act_confidence_threshold` does NOT apply — an unsure review degrades to the original instead of escalating (the `confident_score` still lands on the audit row).
-- `@proposed_action:send` sends the original verbatim (bypassing any fallback template); all safety re-gates still run on it.
-- `@noop` sends nothing at all — audited as a `noop` row, runaway counter still advances, nothing learned. bare spellings (`noop`, `no_op`, `no-op`) normalize to the sentinel, as on every consult.
-- safety controls still apply to the reviewed text: output matching the never-auto patterns or the irreversible heuristic is discarded in favor of the original; kill switch, rate guard, and a staleness re-check run again at delivery time.
-- learning is unaffected: decision history records the original learned action, never the adapted text.
-- cost: every reviewed send is one full consult (MCP round-trip) on `llm.command`.
-
-## resolved paths (diagnostics)
-
-print where hap keeps its config and state — useful when reporting an issue or jumping into the state dir. these resolve paths without creating anything, and work even before the files exist:
+## paths, version, upgrade
 
 ```bash
-hap state-dir       # the state directory (DB, logs, socket, lock, match-index)
-hap config path     # the config.toml path
+hap state-dir       # state dir (DB, logs, socket, lock, match-index) — bare value
+hap config path     # the config.toml path — bare value
 hap paths           # both, labeled
-```
-
-example: `cd "$(hap state-dir)"` jumps into the state directory.
-
-## version and upgrade
-
-```bash
 hap version
-hap update            # reinstall the newest release: herdr plugin install 0xGosu/herdr-auto-pilot --yes
-hap update --force    # required on a `herdr plugin link` dev build, which an install would replace
 ```
 
-`hap update` prints the version it moved to, then the follow-up that hands the
-running daemon to the new build. **it names an absolute path on purpose** — an
-install does not repoint `hap` on your `PATH`, so a bare `hap daemon --ensure`
-can hand the daemon straight back to the binary that was just replaced:
+All resolve without creating anything and work before the files exist.
 
 ```bash
-/path/to/new/hap daemon --ensure
+hap update            # install the newest release; MUTATES the install
+hap update --force    # required on a `herdr plugin link` dev build
 ```
 
-the TUI header shows the running version and, when the release check finds a
-newer one, `↑ vX.Y.Z available`. that check is the plugin's only outbound
-network call — turn it off with `hap config set tui.disable_check_for_update
-true`. `hap update` still queries GitHub even with the switch on, because you
-asked it to.
+`hap update` runs `herdr plugin install 0xGosu/herdr-auto-pilot --yes`, then
+prints the `daemon --ensure` follow-up that hands the running daemon over. **It
+names an absolute path on purpose** — a plugin install does not repoint `hap` on
+your `PATH`, so a bare `hap daemon --ensure` could restart the binary that was
+just replaced.
 
-## recipes
+## installing this skill for other agents
 
-### quick setup for a new project
+The skill ships **inside the binary**, so no checkout is needed:
 
 ```bash
-# check status
-hap status
-
-# rename agents to meaningful names
-hap agents
-hap rename brave-otter frontend-dev
-hap rename cool-fox backend-dev
-
-# point agents at task lists with custom templates
-hap config task-source add --agent frontend-dev ./docs/frontend-tasks.md
-hap config task-source add --agent backend-dev --template 'Do this next: {next_task_content} (full list: {task_list_path})' ./docs/backend-tasks.md
-
-# lower the graduation bar during initial training
-hap config set learning.graduation_n 1
+hap skill                            # print it
+hap skill install claude codex       # → ~/.claude/skills/hap/, ~/.codex/skills/hap/
+hap skill install agents             # → ~/.agents/skills/hap/ (tools sharing ~/.agents)
 ```
 
-### handle a batch of escalations
-
-```bash
-# see what's pending
-hap escalations
-
-# confirm the ones that look correct
-hap confirm 1 --send
-hap confirm 2 --send
-
-# provide a different answer for one
-hap resolve 3 --action "skip this test for now" --send
-
-# mark a situation as needing no reply
-hap resolve 4 --action @noop --send
-
-# dismiss stale escalations without responding
-hap dismiss 5 6 7
-
-# prune all escalations older than 2 hours
-hap escalations prune 120
-```
-
-### temporarily pause automation for risky work
-
-```bash
-# pause before doing dangerous ops
-hap pause
-
-# ... do your risky work ...
-
-# resume when done
-hap resume
-```
-
-### audit recent automation and correct a mistake
-
-```bash
-# review what happened
-hap audit --limit 10
-
-# correct a bad automated decision (demotes it back to shadow mode)
-hap resolve <audit-id> --action "the correct response should have been X"
-```
-
-### inspect and prune learned signatures
-
-```bash
-# see what hap has learned
-hap signatures list
-
-# filter to only autonomous signatures with high confidence
-hap signatures list --mode autonomous --min-conf 0.90
-
-# inspect a specific signature
-hap signatures show approval:9f2c
-
-# delete one that's no longer relevant
-hap signatures delete idle:3a1b --yes
-
-# reset a graduated rule back to shadow (streak → 0; history kept)
-hap signatures reset approval:9f2c --yes
-
-# re-compute embeddings after switching embedding model
-hap signatures reembed
-```
+The TUI's Config tab offers the same install.
 
 ## troubleshooting
 
-- **an agent looks blocked but nothing shows up in `hap escalations`** — re-run the capture pipeline for it by hand: `hap capture <agent-name-or-pane-id>`. the daemon classifies that pane right now, as if herdr had raised an attention event (it needs a running, current daemon). then check `hap escalations` after a few seconds, or `hap audit --limit 10` to see the decision even if it did not escalate.
-- **escalations citing `not found in PATH`** — the daemon inherits herdr's environment, which can be narrower than your shell's. make sure the CLI is reachable from a non-login shell or use an absolute path in `llm.command`.
-- **upgrades not taking effect** — the daemon is a singleton that outlives binary upgrades. since v0.1.13, `hap daemon --ensure` (fired by herdr's event hooks) detects the version mismatch and replaces the old daemon automatically. `hap status` shows the running daemon's version and flags a stale one. on older versions run `pkill -f 'hap daemon'` once after upgrading.
-- **installing a newer release** — the TUI header shows `↑ vX.Y.Z available` when one exists. `hap update` installs it (it runs `herdr plugin install 0xGosu/herdr-auto-pilot --yes`), then run the `daemon --ensure` command it prints to hand the running daemon over immediately — it names the newly installed binary by absolute path when the `hap` on PATH is still the previous build (a plugin install does not repoint that symlink). this MUTATES the install — never run it unprompted. on a linked working-tree build it refuses without `--force`, because installing a release would replace that checkout.
+- **An agent looks blocked but nothing is in `hap escalations`** —
+  `hap capture <agent>` re-runs the classification pipeline now, as if herdr had
+  raised an attention event. Then check `hap escalations` after a few seconds,
+  or `hap audit --limit 10` to see the decision even if it did not escalate.
+- **Escalations citing `not found in PATH`** — the daemon inherits herdr's
+  environment, which can be narrower than your shell's. Use an absolute path in
+  `llm.command`, or make the CLI reachable from a non-login shell.
+- **Upgrades not taking effect** — the daemon is a singleton that outlives
+  binary upgrades. `hap daemon --ensure` detects the version mismatch and
+  replaces it; `hap status` flags a stale daemon (and one whose binary an
+  upgrade removed, as `BINARY REMOVED`).
+- **Every LLM consult comes back empty after an upgrade** — same cause: the
+  daemon can no longer launch the MCP server from a binary that is gone.
+  `hap daemon --ensure`.
+- **The daemon is crash-looping or hung** — `hap status` exits non-zero and says
+  which; `hap status --stderr` prints the captured daemon stderr tail.
+- **Semantic matching degraded** — `hap status` reports the embedder's failure
+  count, whether they were stall-guard timeouts, and the budgets in force. A
+  model larger than the bundled MiniLM can exceed them on every call: raise
+  `embedding.embed_timeout_ms` and `embedding.warm_timeout_ms`. Any `[embedding]`
+  change rebuilds the embedder and clears the degraded latch, no restart needed.
 
-## notes
+## the TUI
 
-- `hap status`, `hap agents`, `hap escalations`, `hap audit`, `hap signatures list`, `hap signatures show`, `hap config show`, `hap config fields`, `hap config path`, `hap config env list` (names only, never values), `hap config rules list`, `hap config task-source list`, `hap config classifier list`, `hap config capture-delay list`, `hap task <agent> list`, `hap task <agent> get`, `hap kill-history`, `hap state-dir`, `hap paths`, and `hap version` are read-only and safe to run anytime.
-- `hap confirm` and `hap resolve` with `--send` will deliver text to an agent pane — be mindful of what you send.
-- `hap dismiss` drops escalations without responding — safe, nothing is sent or learned, audit rows kept as `dismissed`.
-- `hap escalations prune [minutes]` bulk-dismisses old escalations (default 360 minutes).
-- `hap signatures delete` erases the signature's decision history (audit rows are kept) — the plugin must re-learn that situation from scratch.
-- `hap signatures reset` returns a signature to a fresh rule — shadow mode, streak → 0, confidence back to unscored (`conf=-`, since only post-reset decisions count and there are none yet) — while **keeping** its decision history (pre-reset decisions no longer count toward confidence/graduation, and the learned answer is still suggested). The only way to demote an autonomous rule (graduation is permanent; corrections no longer demote). It must re-earn `learning.graduation_n` confirmations to re-graduate.
-- `hap signatures reembed` re-computes stored embeddings after an embedding model change; use `--force` to retry a previously failed pass.
-- `hap pause` is the emergency kill switch — use it if automation is misbehaving.
-- `hap clear-data --yes` is irreversible — it resets all learned patterns but keeps config.
-- full factory reset requires deleting `~/.local/state/herdr/plugins/herd-auto-prompter` and `~/.config/herdr/plugins/config/herd-auto-prompter`.
-- config edits apply live; no daemon restart needed.
-- the daemon auto-starts via herdr plugin events (`pane.agent_detected`, `workspace.created`). you do not need to start it manually. `daemon --ensure` also auto-replaces a stale daemon left by an older binary.
-- the MCP server (`hap mcp`) supports `HAP_DB_PATH` and `HAP_CONTROL_PATH` env vars for agent CLIs that sanitize the environment.
-- `--workspace` in task-source supports name wildcards (e.g. `"codex-*"`, `"*-vscode3"`).
-- `resolve --action @noop` (also: `noop`, `no_op`, `no-op`) means no reply was needed — nothing is ever sent to the pane.
-- `hap tui` launches the interactive terminal UI (status, escalations, signatures, config) as an alternative to the read-only CLI commands. the escalation detail view offers per-item actions — confirm, resolve, dismiss, and **retry LLM** (re-invoke the local LLM on a consult that timed out or failed, also available as `hap escalations retry <id>`). the TUI is a convenience, not a capability: every configuration key and every action it offers is reachable from the CLI alone.
+`hap tui` (or the herdr pane) is a convenience, not a capability: every config
+key and every action it offers is reachable from the CLI alone. Tabs: Status,
+Agents, Tasks, Escalations, Audit, Rules, Config. `/` searches on most tabs, `v`
+opens a detail view, `space` marks a run for batch actions. The escalation
+detail offers confirm, resolve, dismiss, and **retry LLM** (the twin of
+`hap escalations retry <id>`).

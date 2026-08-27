@@ -13,7 +13,9 @@ import (
 // Learning from an operator correction (llm.learn_from_user_command). When the
 // operator answers an escalation with something OTHER than what hap suggested,
 // a one-shot CLI runs in the agent's own working directory and is asked to
-// record the lesson in that project's memory file (CLAUDE.md / AGENTS.md).
+// record the lesson in AUTO.md there — hap's own file, not the agent's
+// CLAUDE.md / AGENTS.md. Only the file NAME lives in the prompt; no code here
+// depends on it.
 //
 // This sits deliberately outside every decision path. It reads no rule, writes
 // no rule, sends nothing to the pane, and cannot escalate — a failure produces

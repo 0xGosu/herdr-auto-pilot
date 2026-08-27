@@ -344,7 +344,7 @@ const (
 	// learn-from-correction run writes (llm.learn_from_user_command). Like
 	// TriggerLLMTaskReview it is its own trigger rather than a field folded
 	// into the correction lineage row, because it is a distinct side effect:
-	// the run EDITS A FILE in the agent's project. "Why did CLAUDE.md change?"
+	// the run EDITS A FILE in the agent's project. "Why did AUTO.md change?"
 	// must be answerable from `hap audit`.
 	TriggerLLMLearnFromUser = "llm-learn-from-user"
 )
