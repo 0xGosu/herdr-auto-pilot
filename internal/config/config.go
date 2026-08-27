@@ -385,8 +385,11 @@ type LLM struct {
 	GenerateTaskTimeoutSeconds int `toml:"task_generate_timeout_seconds,omitempty"`
 	// LearnFromUserCommand is the argv template for the one-shot CLI run that
 	// records a lesson after the OPERATOR CORRECTS an escalation — the agent
-	// is asked to write the lesson into its own project memory (CLAUDE.md for
-	// claude, AGENTS.md for codex), so the correction outlives the signature it
+	// is asked to record the lesson in AUTO.md in that project — hap's own file,
+	// NOT the agent's CLAUDE.md / AGENTS.md, so a lesson meant for hap's
+	// auto-answering never loads into the agent's own context. The shipped
+	// Command and GenerateTaskCommand prompts read it back. The correction then
+	// outlives the signature it
 	// was learned on. Placeholders: {self}, {agent_name}, {agent_type}, {cwd},
 	// {situation_type}, {pane_excerpt}, {suggestion}, {correction},
 	// {session_id}. Empty (the default) disables the feature entirely.

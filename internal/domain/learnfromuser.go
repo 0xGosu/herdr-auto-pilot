@@ -8,13 +8,20 @@ import (
 // Learning from an operator correction (llm.learn_from_user_command): when the
 // operator answers an escalation with something OTHER than what hap suggested,
 // a one-shot CLI is run in the agent's own working directory and asked to write
-// the lesson into that project's memory file (CLAUDE.md for claude, AGENTS.md
-// for codex).
+// the lesson into AUTO.md in that project.
+//
+// AUTO.md is hap's OWN file, not the agent's CLAUDE.md / AGENTS.md. The lesson
+// only ever applies to the assistant hap spawns to answer a prompt on the
+// agent's screen, so the shared memory file would load it into the agent's
+// context on every turn of its real work; the shipped consult and
+// task-generation prompts read AUTO.md back, and nothing else does. Only the
+// file NAME lives in the prompt — no code here depends on it, so an operator's
+// own template may name whatever it likes.
 //
 // This is the durable half of correction handling. The statistical half —
 // RecordDecision, Confidence, MaybeGraduate — is keyed on a SIGNATURE, so it
-// only helps when the same screen comes back. A lesson in the project's memory
-// file survives a screen that mints a fresh signature, and survives the agent
+// only helps when the same screen comes back. A lesson written to a file
+// survives a screen that mints a fresh signature, and survives the agent
 // process itself.
 //
 // The run is advisory in the strongest sense: it never touches the pane, never
@@ -104,8 +111,8 @@ func spellOutNoop(action string) string {
 // LearnRequest is everything the learn-from-user CLI template can reference.
 type LearnRequest struct {
 	// AgentType is the agent's type ("claude", "codex", …), for {agent_type}.
-	// It is also how an operator picks the right memory file in their prompt:
-	// CLAUDE.md for claude, AGENTS.md for codex.
+	// The shipped prompt writes AUTO.md for every agent type; this is here for
+	// an operator template that wants to branch on the type anyway.
 	AgentType string
 	// AgentName is the agent's short name, for {agent_name}.
 	AgentName string

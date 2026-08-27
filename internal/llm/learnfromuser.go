@@ -21,7 +21,7 @@ import (
 // Three things set it apart from every other command in this package:
 //
 //   - it runs in the AGENT's working directory, not the daemon's, because the
-//     whole point is editing that project's CLAUDE.md/AGENTS.md;
+//     whole point is editing AUTO.md inside that project;
 //   - EMPTY output is a success. A CLI that edited a file and printed nothing
 //     did its job. Only a spawn failure, a non-zero exit, or a timeout is an
 //     error, and even those merely produce an audit row — the correction they
