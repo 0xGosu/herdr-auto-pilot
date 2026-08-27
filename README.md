@@ -561,6 +561,8 @@ confirmation_weight = 2.0  # confidence weight for an operator confirmation (>=1
 max_consecutive_auto_prompts = 30  # per agent, without human interaction
 max_auto_prompts_per_minute = 5    # per agent
 max_error_retries = 2              # per error signature
+# All three are INERT while full self-prompting runs with honour_limits = false
+# (the default) — see the full self-prompting section.
 
 # Auto-accept aged escalations — OFF by default, see the section below.
 [escalations.auto_accept]
@@ -2028,17 +2030,30 @@ comparison does not cover this on its own: a resumed agent can still be painting
 the old menu in its scrollback while it works below it. Such an escalation stays
 in your queue rather than being retired.
 
-Unlike timed auto-accept, a full self-prompting delivery **counts against the `[limits]`
-runaway ceilings** — with no waiting threshold there is no other frequency
-bound, so an agent that keeps re-raising escalations is answered only until
-`max_auto_prompts_per_minute` / `max_consecutive_auto_prompts` trip, and then
-waits for a human check-in like any other runaway.
+`honour_limits` decides whether the `[limits]` runaway ceilings apply to the
+mode at all.
 
-By default that bound arrives one decision **late**: a delivery advances the
-counters but is never refused by them, so the ceiling is noticed on the agent's
-next decision and stops that one agent. `honour_limits` makes it strict —
-the ceiling is checked *before* each delivery, nothing is sent once it is
-reached, and the whole mode is switched **off**:
+**Left off (the default), the whole `[limits]` section is inert while the mode
+is active.** Neither ceiling gates a send, a runaway pause left over from before
+you turned the mode on no longer benches the agent, and — since it lives in the
+same section — `max_error_retries` stops gating too, so a failing error
+signature is retried without bound. This is blanket unattended autonomy: the
+only frequency bound is how fast the agents ask. `hap config show` marks the
+`limits:` line as not enforced so the numbers do not read as active.
+
+Deliveries still *advance* the counters while inert — but `max_consecutive_auto_prompts`
+counts up and is reset only by human interaction, which is exactly what this mode
+does without. So turning `honour_limits` on after a long unattended run trips the
+consecutive ceiling on the very next sweep and switches the mode straight back
+off. Interact with the agent, or raise the ceiling, before flipping the key.
+
+Everything outside `[limits]` is unaffected either way: the kill switch,
+per-agent disables (`hap agent disable`), never-auto rules and the
+suspected-irreversible heuristic all still stop a send.
+
+**Turned on, the ceilings are strict** — checked *before* each delivery rather
+than being noticed one decision late, nothing is sent once one is reached, and
+the whole mode is switched **off**:
 
 ```toml
 [full_self_prompting]
@@ -2052,8 +2067,7 @@ Either ceiling counts, and the message names which one tripped —
 with no human check-in, while `max_auto_prompts_per_minute` means sends are
 outpacing the cap. Note the second is a rolling window shared with every other
 autonomous send on that agent, so on a busy herd it is the one likely to fire
-first; raise it, or leave `honour_limits` off, if you want only the
-consecutive-answer bound.
+first; raise it if you want only the consecutive-answer bound.
 
 Switching off is real and persistent: hap rewrites `enabled = false` in your
 config, records the change in `hap kill-history` (author `daemon`), and raises a

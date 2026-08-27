@@ -553,7 +553,49 @@ whose manifest carries exactly that version).
   `…HandoutCapEscalatesInsteadOfResending`).
 - **Full self-prompting's two opt-in keys are OFF by default, and each buys one narrow
   thing** — `full_self_prompting.honour_limits` and `…accept_generated_task`
-  (`config.FullSelfPrompting`). Four bounds are load-bearing:
+  (`config.FullSelfPrompting`). These bounds are load-bearing:
+  - **`honour_limits = false` means the whole `[limits]` section is INERT, and inertness is
+    one CLAUSE in each gate, never an early return.** The key used to skip only the mode's
+    own pre-check, so the ordinary decision path kept running the runaway guard: an agent
+    that reached `max_consecutive_auto_prompts` had its next decision escalated
+    `rate_limited` AND was paused until a human checked in — and `rate_limited` is in
+    `autoAcceptExcludedReasons`, so that escalation was then permanently operator-only. An
+    unattended mode that benches its own agents, and no setting that switched the ceilings
+    off. `domain.RateLimits.Inert` now short-circuits `CheckRate` (ahead of the `Paused`
+    branch, because the pause is the guard's OWN stand-down and only this guard ever sets
+    one) and gates the FR-014 retry ceiling in `Decide` — `limits.max_error_retries` is the
+    third key in the same section, so an error signature then retries without bound and
+    `retry_exhausted` is never raised. Deliveries still ADVANCE the counters
+    (`noteFSPSend`), so turning the key back on resumes against a real record.
+    The daemon resolves it through `limitsInert` (both config reads first, so an install
+    that never opted in never pays for `fspActive`'s store query) or `limitsInertFor` for a
+    caller that already has an `fspActive` answer — and a per-AGENT loop must use the
+    latter, because `fspActive` also owns the once-per-episode degradation warning.
+    **The three gates that read `rate.Paused` are SHARED** — `sweepAllowed`,
+    `autoAcceptAgentSuppressed`, `eligibleIdleAgents` each carry the per-agent disable
+    (and `sweepAllowed` the kill switch and the never-auto screen) in the same run of
+    checks — so inertness relaxes the pause clause alone. An early return at the top of any
+    of them is a safety bypass, and it passes an end-to-end test because the disable is
+    re-checked at delivery: the guards are therefore driven DIRECTLY. Keep
+    `TestSweepAllowedInertOnlyRelaxesThePause` /
+    `TestAutoAcceptAgentSuppressedInertOnlyRelaxesThePause` /
+    `TestEligibleIdleAgentsInertOnlyRelaxesThePause` (all three proved by mutation) /
+    `TestFSPWithoutHonourLimitsSendsPastTheConsecutiveCeiling` /
+    `…IgnoresALeftoverPause` / `TestLimitsStillApplyWhenFSPCannotActivate` (inert needs the
+    mode ACTIVE, not merely enabled) / `TestLimitsStillApplyWithFSPOff` /
+    `TestLimitsInertDoesNotBypassTheKillSwitch` / `…NeverAuto` /
+    `TestCheckRateInertIgnoresEveryCeilingAndThePause` /
+    `TestInertLimitsIgnoreTheErrorRetryCeiling`.
+  - **A busy pane is not a runaway ceiling.** `domain.ReasonPaneBusy`, not
+    `ReasonRateLimited`, at all four sites that fail on `acquirePane` (`sweep.go`'s series
+    and remote-env deliveries, `daemon.go`'s two LLM-promotion branches). Borrowing the
+    ceiling's tag cost two things neither site wanted: `escalate` pauses the agent on
+    `rate_limited` until a human checks in, over a lock the in-flight interaction releases
+    on its own; and `autoAcceptExcludedReasons` refuses the row forever, so under full
+    self-prompting a momentary collision became permanently operator-only. `pane_busy` is
+    deliberately NOT excluded — the sweep's own `d.paneBusy` defer and Guard 3's re-read
+    are what gate the retry. Keep `TestPaneBusyEscalationDoesNotPauseTheAgent` /
+    `TestPaneBusyIsNotAnAutoAcceptExclusion`.
   - **The ceiling check must not read a PAUSE as a ceiling.** `domain.CheckRate`'s first
     branch answers `rate_limited` for a paused agent, but `fspCeilingReached` runs BEFORE
     Guard 1b (`autoAcceptAgentSuppressed`), which already suppresses paused agents

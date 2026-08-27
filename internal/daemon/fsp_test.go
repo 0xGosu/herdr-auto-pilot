@@ -566,8 +566,12 @@ func TestFSPDeliveryAdvancesTheRunawayGuard(t *testing.T) {
 // TestFSPRatePausedAgentIsSuppressed: once the runaway guard pauses an
 // agent, full self-prompting answers nothing for it — the pause is the human-check-in
 // gate that breaks an answer loop, so it must hold on both paths.
+//
+// Scoped to honour_limits = ON. With it off the whole [limits] section is inert
+// and the pause is part of what that switches off, since the guard is the only
+// thing that ever sets one — see TestFSPWithoutHonourLimitsIgnoresALeftoverPause.
 func TestFSPRatePausedAgentIsSuppressed(t *testing.T) {
-	h := newFSPHarness(t, fspOn)
+	h := newFSPHarness(t, fspHonourLimits)
 	ctx := context.Background()
 	rate, err := h.raw.GetAgentRate(ctx, "pA")
 	if err != nil {
@@ -1527,7 +1531,7 @@ func TestFSPRechecksTheModeBeforeClaiming(t *testing.T) {
 	// row; the re-check before the claim is the only thing that can stop it.
 	h.daemon.autoAcceptOne(ctx, auditRow(t, h, id), "Yes",
 		map[string]domain.AgentTransition{"pA": {AgentID: "pA", Status: "blocked"}},
-		&paneCache{}, time.Now(), true, false,
+		&paneCache{}, time.Now(), true, false, false,
 		h.daemon.fspStillOn)
 
 	if got := auditStatus(t, h, id); got != "escalated" {
@@ -1598,7 +1602,7 @@ func TestFSPRechecksAcceptGeneratedTaskBeforeClaiming(t *testing.T) {
 	// row with the stale `true`; only the re-check before the claim can stop it.
 	h.daemon.autoAcceptOne(ctx, auditRow(t, h, id), domain.SuggestGenerateTask,
 		map[string]domain.AgentTransition{"pA": {AgentID: "pA", Status: "idle"}},
-		&paneCache{}, time.Now(), true, true, h.daemon.fspStillOn)
+		&paneCache{}, time.Now(), true, true, false, h.daemon.fspStillOn)
 
 	if got := auditStatus(t, h, id); got != "escalated" {
 		t.Errorf("status = %q, want escalated — the opt-in was switched off mid-chain", got)
@@ -1634,7 +1638,7 @@ func TestAutoAcceptRechecksTheKillSwitchBeforeClaiming(t *testing.T) {
 			}
 			h.daemon.autoAcceptOne(ctx, auditRow(t, h, id), "Yes",
 				map[string]domain.AgentTransition{"pA": {AgentID: "pA", Status: "blocked"}},
-				&paneCache{}, time.Now(), fsp, false, permitted)
+				&paneCache{}, time.Now(), fsp, false, false, permitted)
 
 			if got := auditStatus(t, h, id); got != "escalated" {
 				t.Errorf("status = %q, want escalated — the kill switch was activated mid-chain", got)

@@ -47,11 +47,16 @@ func (d *Daemon) sweepAllowed(ctx context.Context, s domain.Situation) bool {
 	if err != nil || domain.KillStateActive(kill) {
 		return false
 	}
-	rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
-	if err != nil || rate.Paused {
-		return false
+	cfg, allow, _ := d.snapshot()
+	// The runaway guard's own stand-down — relaxed, and ONLY this clause,
+	// while [limits] is inert (domain.RateLimits.Inert). The disable and kill
+	// switch above and the never-auto screen below are unaffected.
+	if !d.limitsInert(ctx, cfg) {
+		rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID)
+		if err != nil || rate.Paused {
+			return false
+		}
 	}
-	_, allow, _ := d.snapshot()
 	// This gate runs BEFORE sweepFrames builds the aggregate, so s.Content is
 	// still the raw first visible frame (scrollback included) while AnswerCount is
 	// already >1. IrreversibleScanContent's multi-tab branch assumes a
@@ -453,7 +458,7 @@ func (d *Daemon) deliverSeries(ctx context.Context, s domain.Situation, sig doma
 		return
 	}
 	if !d.acquirePane(s.AgentID) {
-		escalateWith(domain.ReasonRateLimited, "pane busy")
+		escalateWith(domain.ReasonPaneBusy, "pane busy")
 		return
 	}
 
@@ -617,7 +622,7 @@ func (d *Daemon) deliverRemoteEnv(ctx context.Context, ks ports.KeystrokeSender,
 
 	if !d.acquirePane(s.AgentID) {
 		d.escalate(ctx, s, sig, domain.Decision{
-			Action: domain.ActionEscalate, Reason: domain.ReasonRateLimited, Rationale: "pane busy",
+			Action: domain.ActionEscalate, Reason: domain.ReasonPaneBusy, Rationale: "pane busy",
 			Confidence: dec.Confidence, Suggestion: "respond: " + dec.Input,
 		}, tr, now)
 		return

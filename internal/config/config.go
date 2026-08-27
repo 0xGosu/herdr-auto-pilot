@@ -116,7 +116,10 @@ type Escalations struct {
 // the auto-accept sweep catches up with zero waiting thresholds. The
 // auto-accept safety exclusions are unchanged: never-auto matches, suspected
 // irreversible commands, retry-exhausted and rate-limited escalations (and
-// anything without a suggestion) still wait for the operator.
+// anything without a suggestion) still wait for the operator. Note that with
+// HonourLimits off the last two are never RAISED in the first place — see that
+// field — so the exclusion list is unchanged but the two ceiling reasons have
+// no population to exclude.
 //
 // The flag can be persisted here freely, but it only grants autonomy while
 // the runtime preconditions hold: at least MinFSPGraduatedRules
@@ -132,10 +135,32 @@ type FullSelfPrompting struct {
 	// moment one is reached (the daemon writes Enabled=false back to
 	// config.toml and records the toggle).
 	//
-	// Off by default, which is the historical behavior: a delivery advances
-	// the counters (daemon.noteFSPSend) but is never refused by them, so the
-	// mode is bounded only indirectly — one decision later, when the next
-	// Decide raises rate_limited and pauses that ONE agent.
+	// Off by default, and OFF now means the whole [limits] section is INERT
+	// while the mode is active (domain.RateLimits.Inert): neither runaway
+	// ceiling gates a send, the Paused stand-down they set is ignored, and —
+	// because it is the third key in the same section — limits.max_error_retries
+	// stops gating too, so an error signature retries without bound and
+	// retry_exhausted is never raised.
+	//
+	// Deliveries still ADVANCE the counters (daemon.noteFSPSend), and that is a
+	// mechanism, not a reassurance: ConsecutiveAuto is reset ONLY by
+	// RegisterHumanInteraction, and the mode's premise is that nobody
+	// interacts, so it grows without bound while inert. Turning HonourLimits on
+	// after an unattended run therefore trips fspCeilingReached on the next
+	// sweep's first candidate and stands the whole mode down. Interact with the
+	// agent (or raise the ceiling) before flipping it.
+	//
+	// It used to mean only "skip the mode's own pre-check": the counters kept
+	// gating, so one decision later Decide raised rate_limited and paused that
+	// ONE agent — and rate_limited is in domain's auto-accept exclusion list, so
+	// the escalation was then permanently operator-only. An unattended mode that
+	// benches its own agents after max_consecutive_auto_prompts answers is not
+	// what "do not honour the limits" says, and there was no setting that
+	// switched them off.
+	//
+	// Inert is scoped to [limits] and nothing else. The kill switch, the
+	// per-agent disable, never-auto rules, the suspected-irreversible heuristic
+	// and every pane-liveness guard still apply.
 	//
 	// The ceilings are per-agent while the mode is global, so one runaway
 	// agent turns the mode off for the whole herd. That is deliberate: the

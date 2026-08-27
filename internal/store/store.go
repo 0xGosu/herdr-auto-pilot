@@ -124,6 +124,10 @@ CREATE TABLE IF NOT EXISTS decisions (
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_signature ON decisions(signature, id DESC);
+-- CountSignaturesByMode is on the decision path once full self-prompting is on
+-- (fspActive, and limitsInert through it), and this is the one table the plugin
+-- grows without bound. Unindexed the count is a full scan per decision.
+CREATE INDEX IF NOT EXISTS idx_signatures_mode ON signatures(mode);
 CREATE TABLE IF NOT EXISTS audit_log (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	decision_id INTEGER NOT NULL DEFAULT 0,

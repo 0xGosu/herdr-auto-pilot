@@ -86,6 +86,9 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 
 	cutoffs := make(map[domain.SituationType]time.Time)
 	fsp := d.fspActive(ctx, cfg)
+	// One resolution for the whole pass, from the same snapshot fsp came from:
+	// every per-row gate below reads this rather than paying for fspActive again.
+	limitsInert := limitsInertFor(cfg, fsp)
 	if fsp {
 		// Full self-prompting: zero wait for ALL five types — including idle
 		// and unclassifiable, whose timed auto-accept defaults are disabled.
@@ -175,7 +178,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 			// The ONE refusal full self-prompting retires rather than leaves
 			// pending. Nothing reaches the pane on this path.
 			if fsp && why == domain.IneligibleNoopSuggestion {
-				d.retireNoopEscalation(ctx, rec, now, permitted)
+				d.retireNoopEscalation(ctx, rec, now, limitsInert, permitted)
 			}
 			continue
 		}
@@ -215,7 +218,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 			// autoAcceptOne owns what happens to such a row (absence
 			// confirmation, retirement); this only declines to read it as a
 			// ceiling.
-			if d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp, allowGenerated, permitted) == autoAcceptRetired {
+			if d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp, allowGenerated, limitsInert, permitted) == autoAcceptRetired {
 				delete(stillEligible, rec.ID)
 			}
 			continue
@@ -235,7 +238,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 			continue
 		}
 
-		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp, allowGenerated, permitted); outcome {
+		switch outcome := d.autoAcceptOne(ctx, rec, suggestion, live, panes, now, fsp, allowGenerated, limitsInert, permitted); outcome {
 		case autoAcceptDelivered:
 			handledAgent[rec.AgentID] = true
 			accepted++
@@ -302,7 +305,7 @@ const (
 // per-AGENT disable at delivery; this covers the global mode.
 func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, suggestion string,
 	live map[string]domain.AgentTransition, panes *paneCache, now time.Time,
-	fsp, allowGeneratedTask bool, stillPermitted func() bool) autoAcceptOutcome {
+	fsp, allowGeneratedTask, limitsInert bool, stillPermitted func() bool) autoAcceptOutcome {
 
 	agent, present := live[rec.AgentID]
 	if !present {
@@ -318,8 +321,16 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 
 	// Guard 1b — a paused or operator-disabled agent is suppressed, never
 	// retired: a pause is a temporary operator control.
-	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID) {
-		d.notePending(rec, "the agent is disabled, or paused by the runaway guard")
+	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID, limitsInert) {
+		// Name only what could actually be in force: with [limits] inert the
+		// pause clause is not even read, and sending an operator hunting for a
+		// runaway pause that cannot apply is exactly the failure notePending
+		// exists to prevent.
+		why := "the agent is disabled, or paused by the runaway guard"
+		if limitsInert {
+			why = "the agent is disabled"
+		}
+		d.notePending(rec, why)
 		return autoAcceptSkipped
 	}
 
@@ -725,9 +736,11 @@ func (d *Daemon) autoDismiss(ctx context.Context, rec *domain.AuditRecord,
 // dismissal is not something they can undo, which makes the re-check matter more
 // on this path, not less.
 func (d *Daemon) retireNoopEscalation(ctx context.Context, rec *domain.AuditRecord,
-	now time.Time, stillPermitted func() bool) {
+	now time.Time, limitsInert bool, stillPermitted func() bool) {
 
-	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID) {
+	// Reached only under full self-prompting (the caller gates on it), so the
+	// mode's own answer to [limits] is the one that applies.
+	if d.autoAcceptAgentSuppressed(ctx, rec.AgentID, limitsInert) {
 		return
 	}
 	// The same complete last look a claim takes. The kill switch matters most
@@ -746,7 +759,12 @@ func (d *Daemon) retireNoopEscalation(ctx context.Context, rec *domain.AuditReco
 // autoAcceptAgentSuppressed reports whether the agent is paused or
 // operator-disabled. Fails CLOSED: an unreadable state suppresses rather than
 // licenses an unattended send.
-func (d *Daemon) autoAcceptAgentSuppressed(ctx context.Context, agentID string) bool {
+//
+// limitsInert relaxes EXACTLY the pause clause (see domain.RateLimits.Inert).
+// The per-agent disable above it is an operator control, not a [limits]
+// ceiling, and is never affected — which is why this is a clause test rather
+// than an early return at the top of the function.
+func (d *Daemon) autoAcceptAgentSuppressed(ctx context.Context, agentID string, limitsInert bool) bool {
 	disabled, err := d.opt.Store.AgentDisabled(ctx, agentID)
 	if err != nil {
 		slog.Warn("auto-accept: agent-disabled read failed; skipping", "agent", agentID, "error", err)
@@ -754,6 +772,13 @@ func (d *Daemon) autoAcceptAgentSuppressed(ctx context.Context, agentID string) 
 	}
 	if disabled {
 		return true
+	}
+	if limitsInert {
+		// The pause is the only thing left to test, and it is switched off. Skip
+		// the read entirely rather than reading it and ignoring the answer: with
+		// nothing left to decide, a store error here would otherwise suppress
+		// the send over a value nobody was going to consult.
+		return false
 	}
 	rate, err := d.opt.Store.GetAgentRate(ctx, agentID)
 	if err != nil {
@@ -883,6 +908,38 @@ func (d *Daemon) screenOutbound(agentType, text string) error {
 		return fmt.Errorf("tripped irreversible %s", hit.Diagnostic())
 	}
 	return nil
+}
+
+// limitsInert reports whether the whole [limits] section is switched off right
+// now: full self-prompting ACTIVE with honour_limits = false. See
+// domain.RateLimits.Inert for what that covers and — just as important — what
+// it does not.
+//
+// Active, not merely enabled: a mode whose preconditions no longer hold has
+// reverted to the ordinary escalation flow, and the ordinary flow keeps its
+// ceilings.
+//
+// Both config reads come first and are free (in-memory), so an install that
+// never opted in never reaches d.fspActive's store query. Callers already
+// holding an fspActive answer should use limitsInertFor instead of paying for a
+// second one — and callers on a per-agent loop MUST, because fspActive also
+// owns the once-per-episode degradation warning.
+func (d *Daemon) limitsInert(ctx context.Context, cfg config.Config) bool {
+	if !cfg.FullSelfPrompting.Enabled || cfg.FullSelfPrompting.HonourLimits {
+		return false
+	}
+	return d.fspActive(ctx, cfg)
+}
+
+// limitsInertFor is limitsInert for a caller that has already resolved whether
+// full self-prompting is active. Free — no store access, and so no receiver.
+//
+// cfg must be the SAME snapshot fsp was derived from. A mid-sweep reload would
+// otherwise pair a stale fsp with a fresh config; nothing is delivered on that
+// pairing (claimBlockedBy re-asks the mode before every claim), but the two
+// functions are only obviously equivalent when both halves come from one read.
+func limitsInertFor(cfg config.Config, fsp bool) bool {
+	return fsp && !cfg.FullSelfPrompting.HonourLimits
 }
 
 // fspCeilingReached reports whether this agent has reached a [limits] runaway
@@ -1176,7 +1233,8 @@ func (d *Daemon) fspAcceptNow(ctx context.Context, auditID int64,
 		return
 	}
 	live := map[string]domain.AgentTransition{rec.AgentID: agent}
-	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now, true, allowGenerated, permitted) == autoAcceptDelivered {
+	if d.autoAcceptOne(ctx, rec, suggestion, live, &paneCache{}, now, true, allowGenerated,
+		limitsInertFor(cfg, true), permitted) == autoAcceptDelivered {
 		d.noteFSPSend(ctx, rec.AgentID, now)
 		slog.Info("full self-prompting: escalation answered immediately",
 			"agent", rec.AgentID, "audit_id", rec.ID)

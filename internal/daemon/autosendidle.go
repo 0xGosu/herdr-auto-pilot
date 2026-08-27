@@ -230,9 +230,15 @@ func (d *Daemon) autoSendIdleTasks(ctx context.Context, agents []domain.AgentTra
 	// gating on the pending escalation's SituationType — a stale approval row
 	// the operator answered in-pane but never dismissed would bench the agent
 	// forever, which is the silent stall this change exists to remove.
+	// Resolved ONCE for the whole poll: d.limitsInert can reach d.fspActive,
+	// which runs a store query and owns the once-per-episode degradation
+	// warning — and eligibleIdleAgents runs once per SOURCE, so leaving it in
+	// there would pay both N times per poll.
+	limitsInert := d.limitsInert(ctx, cfg)
+
 	driven := map[string]bool{} // agents already given a task this sweep
 	for _, src := range sources {
-		eligible := d.eligibleIdleAgents(ctx, src, agents, now, driven, awaiting)
+		eligible := d.eligibleIdleAgents(ctx, src, agents, now, driven, awaiting, limitsInert)
 		if len(eligible) == 0 {
 			continue
 		}
@@ -765,7 +771,8 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 // deterministic run to run). Every gate here is a reason NOT to send; the
 // decision core re-applies its own on the pipeline path.
 func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
-	agents []domain.AgentTransition, now time.Time, driven, awaiting map[string]bool) []domain.AgentTransition {
+	agents []domain.AgentTransition, now time.Time, driven, awaiting map[string]bool,
+	limitsInert bool) []domain.AgentTransition {
 
 	var out []domain.AgentTransition
 	for _, a := range agents {
@@ -803,8 +810,12 @@ func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
 		if disabled, err := d.opt.Store.AgentDisabled(ctx, a.AgentID); err != nil || disabled {
 			continue
 		}
-		if rate, err := d.opt.Store.GetAgentRate(ctx, a.AgentID); err != nil || rate.Paused {
-			continue
+		// The runaway guard's stand-down, and only it: the per-agent disable
+		// just above stays in force whatever [limits] says.
+		if !limitsInert {
+			if rate, err := d.opt.Store.GetAgentRate(ctx, a.AgentID); err != nil || rate.Paused {
+				continue
+			}
 		}
 		out = append(out, a)
 	}

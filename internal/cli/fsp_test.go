@@ -167,3 +167,66 @@ func TestConfigSetAcceptsTheMovedFSPKey(t *testing.T) {
 		t.Errorf("confirmation should name the canonical key, got:\n%s", out)
 	}
 }
+
+// TestConfigShowMarksTheLimitsLineNotEnforced: printing three ceilings that
+// nothing enforces reads as a broken plugin, which is the whole reason the note
+// exists — but printConfig sees only CONFIG while inertness needs the mode to be
+// ACTIVE, so the note has to be conditional. Four states: mode off, mode active,
+// mode enabled but INACTIVE (where the ceilings really are enforcing), and
+// honour_limits on.
+func TestConfigShowMarksTheLimitsLineNotEnforced(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+
+	out, err := run(t, app, "config", "show")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "not enforced") {
+		t.Errorf("with the mode off the ceilings are in force, got:\n%s", out)
+	}
+
+	seedFullSelfPromptingPreconditions(t, app, st)
+	if err := app.SetFullSelfPrompting(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	out, err = run(t, app, "config", "show")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "not enforced while full self-prompting is active: honour_limits = false") {
+		t.Errorf("the limits line must say the ceilings are inert, got:\n%s", out)
+	}
+
+	// Enabled but INACTIVE — the preconditions no longer hold, so the mode has
+	// reverted to the ordinary escalation flow and these ceilings really are
+	// enforcing. printConfig sees only config and cannot tell, which is exactly
+	// why the note is conditional: a flat "not enforced" would be a false claim
+	// about a live safety control.
+	if err := st.ClearLearnedData(ctx); err != nil {
+		t.Fatal(err)
+	}
+	out, err = run(t, app, "config", "show")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "not enforced:") || strings.Contains(out, "not enforced)") {
+		t.Errorf("an enabled-but-inactive mode must not be reported as an unconditional "+
+			"\"not enforced\" — the ceilings are still in force, got:\n%s", out)
+	}
+	if !strings.Contains(out, "not enforced while full self-prompting is active") {
+		t.Errorf("the conditional note still describes the configured behaviour, got:\n%s", out)
+	}
+
+	seedFullSelfPromptingPreconditions(t, app, st)
+	if _, err := app.SetField(ctx, "full_self_prompting.honour_limits", "true"); err != nil {
+		t.Fatal(err)
+	}
+	out, err = run(t, app, "config", "show")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "not enforced") {
+		t.Errorf("with honour_limits on the ceilings are in force, got:\n%s", out)
+	}
+}

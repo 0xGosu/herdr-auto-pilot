@@ -42,6 +42,8 @@ disabled_seed_patterns = []      # silence individual shipped rules by id instea
 max_consecutive_auto_prompts = 30  # per agent, without human interaction
 max_auto_prompts_per_minute = 5    # per agent
 max_error_retries = 2              # per error signature
+# All three are INERT while full self-prompting runs with honour_limits =
+# false (the default) — see [full_self_prompting] below.
 # Note: the escalation duplicate-ask tuning (dedup window + large-capture jitter
 # tolerance) is a fixed internal constant and is no longer configurable.
 
@@ -91,7 +93,14 @@ unclassifiable = "0"       # disabled: hap never understood the screen at all
 #[full_self_prompting]
 #enabled = false
 #
-# Refuse a delivery that would cross a [limits] ceiling, instead of
+# Apply the [limits] ceilings to this mode at all. Left FALSE, the
+# whole [limits] section is inert while the mode is active: neither
+# runaway ceiling gates a send, a leftover runaway pause no longer
+# benches an agent, and max_error_retries stops gating too, so a
+# failing error signature retries without bound. The kill switch,
+# per-agent disables, never-auto rules and the irreversible heuristic
+# still apply.
+# Set TRUE to refuse a delivery that would cross a ceiling, instead of
 # noticing one decision later, and switch this whole mode OFF when one
 # is reached (this file is rewritten to enabled = false and the change
 # is recorded in `hap kill-history`). The ceilings are per-agent while

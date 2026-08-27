@@ -2027,6 +2027,7 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 		RateLimits: domain.RateLimits{
 			MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 			MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
+			Inert:          d.limitsInert(ctx, cfg),
 		},
 		Now:                         now,
 		RetryCount:                  retries,
@@ -3940,6 +3941,7 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 		if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 			MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 			MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
+			Inert:          d.limitsInert(ctx, cfg),
 		}, false); !ok {
 			escalateWith(reason, "at action review")
 			return
@@ -3968,6 +3970,7 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 	if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
+		Inert:          d.limitsInert(ctx, cfg),
 	}, false); !ok {
 		escalateWith(reason, "at action review")
 		return
@@ -4226,6 +4229,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	if ok, reason := domain.CheckRate(*rate, now, domain.RateLimits{
 		MaxConsecutive: cfg.Limits.MaxConsecutiveAutoPrompts,
 		MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
+		Inert:          d.limitsInert(ctx, cfg),
 	}, false); !ok {
 		reject(reason, "at LLM promotion")
 		return
@@ -4457,7 +4461,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			return
 		}
 		if !d.acquirePane(s.AgentID) {
-			reject(domain.ReasonRateLimited,
+			reject(domain.ReasonPaneBusy,
 				"another pane interaction is in flight for this agent; not delivering concurrently")
 			return
 		}
@@ -4483,7 +4487,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 				return
 			}
 			if !d.acquirePane(s.AgentID) {
-				reject(domain.ReasonRateLimited,
+				reject(domain.ReasonPaneBusy,
 					"another pane interaction is in flight for this agent; not delivering concurrently")
 				return
 			}

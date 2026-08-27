@@ -792,3 +792,28 @@ func TestErrorRetryCeiling(t *testing.T) {
 		t.Fatalf("3rd error occurrence must escalate, got %+v", d)
 	}
 }
+
+// TestInertLimitsIgnoreTheErrorRetryCeiling: limits.max_error_retries is the
+// third key in the same [limits] section as the two runaway ceilings, so
+// RateLimits.Inert switches it off with them. The consequence is deliberate —
+// an error signature then retries without bound and ReasonRetryExhausted is
+// never raised — and it is only ever reached under full self-prompting with
+// honour_limits = false.
+func TestInertLimitsIgnoreTheErrorRetryCeiling(t *testing.T) {
+	mk := func(inert bool) DecideInput {
+		in := autonomous(baseInput(SituationError),
+			"retry", "retry", "retry", "retry", "retry", "retry", "retry", "retry")
+		in.RetryCount = 99
+		in.RateLimits.Inert = inert
+		return in
+	}
+
+	// The control: without Inert this is the FR-014 escalation, so the case
+	// below cannot pass vacuously.
+	if d := Decide(mk(false)); d.Action != ActionEscalate || d.Reason != ReasonRetryExhausted {
+		t.Fatalf("without Inert the retry ceiling must still escalate, got %+v", d)
+	}
+	if d := Decide(mk(true)); d.Action != ActionSend || d.Input != "retry" {
+		t.Fatalf("with [limits] inert the retry ceiling must not gate the send, got %+v", d)
+	}
+}

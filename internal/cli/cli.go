@@ -1420,8 +1420,21 @@ func printConfig(out io.Writer, cfg config.Config) {
 		cfg.ConfidenceThresholds.Minimum, cfg.ConfidenceThresholds.Idle, cfg.ConfidenceThresholds.Approval,
 		cfg.ConfidenceThresholds.Choice, cfg.ConfidenceThresholds.Error)
 	fmt.Fprintf(out, "learning:   graduation_n=%d confirmation_weight=%g\n", cfg.Learning.GraduationN, cfg.Learning.ConfirmationWeight)
-	fmt.Fprintf(out, "limits:     consecutive=%d per_minute=%d error_retries=%d\n",
-		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute, cfg.Limits.MaxErrorRetries)
+	limitsNote := ""
+	if cfg.FullSelfPrompting.Enabled && !cfg.FullSelfPrompting.HonourLimits {
+		// Printing three ceilings that nothing enforces reads as a broken
+		// plugin. But this function sees only CONFIG, and inertness needs the
+		// mode to be ACTIVE (daemon.limitsInert): a mode enabled without an
+		// llm.command, short of MinFSPGraduatedRules, or stood down by the
+		// ceiling latch has reverted to the ordinary flow, which still enforces
+		// every one of these. So the note is phrased CONDITIONALLY — a flat
+		// "not enforced" would tell an operator a live safety control is off.
+		// `hap status` is what reports whether the mode is actually active.
+		limitsNote = " (not enforced while full self-prompting is active: honour_limits = false)"
+	}
+	fmt.Fprintf(out, "limits:     consecutive=%d per_minute=%d error_retries=%d%s\n",
+		cfg.Limits.MaxConsecutiveAutoPrompts, cfg.Limits.MaxAutoPromptsPerMinute,
+		cfg.Limits.MaxErrorRetries, limitsNote)
 	fmt.Fprintf(out, "llm:        configured=%v timeout=%ds auto_act_confidence_threshold=%d\n",
 		len(cfg.LLM.Command) > 0, cfg.LLM.TimeoutSeconds, cfg.LLM.AutoActConfidenceThreshold)
 	for _, env := range cfg.LLM.EnvSummaries() {

@@ -581,6 +581,24 @@ func (a *NeverAutoList) Patterns() []string {
 type RateLimits struct {
 	MaxConsecutive int
 	MaxPerMinute   int
+	// Inert switches the WHOLE [limits] section off for this decision: both
+	// ceilings above, the Paused stand-down they set, and — because it is the
+	// third key in the same section — the FR-014 error-retry ceiling the caller
+	// carries in DecideInput.MaxRetries.
+	//
+	// It is set ONLY by full self-prompting with honour_limits = false, which
+	// the operator turns on to grant blanket unattended autonomy. It is a flag
+	// rather than a huge sentinel ceiling because Paused cannot be expressed as
+	// one: a leftover pause from before the mode was enabled would otherwise
+	// bench the agent forever under a mode whose whole premise is that nobody
+	// is watching. Paused is only ever set by this guard (escalate() on a
+	// rate_limited verdict) and only ever cleared by human interaction, so
+	// ignoring it here is the same statement as ignoring the counters.
+	//
+	// Inert is NOT a safety bypass beyond [limits]. The kill switch, the
+	// per-agent disable, never-auto rules, the suspected-irreversible heuristic
+	// and every pane-liveness guard are unaffected and are checked elsewhere.
+	Inert bool
 }
 
 // CheckRate reports whether one more automated prompt to the agent is
@@ -594,7 +612,14 @@ type RateLimits struct {
 // saturated by non-idle auto-answers would permanently stall the idle source
 // (the idle escalation never pauses, so the counter never resets). The Paused
 // state and the per-minute cap STILL gate idle hand-outs.
+//
+// lim.Inert switches the guard off entirely — see RateLimits.Inert. It is
+// checked FIRST, ahead of the Paused branch, because a pause is this guard's
+// own stand-down and so is part of what "the limits are off" has to mean.
 func CheckRate(r AgentRate, now time.Time, lim RateLimits, idleHandout bool) (ok bool, reason EscalateReason) {
+	if lim.Inert {
+		return true, ReasonNone
+	}
 	if r.Paused {
 		return false, ReasonRateLimited
 	}

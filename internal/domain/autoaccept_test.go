@@ -237,3 +237,26 @@ func TestAutoDismissReason(t *testing.T) {
 		}
 	}
 }
+
+// TestPaneBusyIsNotAnAutoAcceptExclusion: a busy pane means another interaction
+// already owns the agent, which the lock releases on its own. It used to be
+// reported as ReasonRateLimited and so was refused forever — under full
+// self-prompting that turned a momentary collision into a permanently
+// operator-only row. The two real ceilings are the control.
+func TestPaneBusyIsNotAnAutoAcceptExclusion(t *testing.T) {
+	rec := func(reason domain.EscalateReason) *domain.AuditRecord {
+		return &domain.AuditRecord{
+			Status:    "escalated",
+			Rationale: "[" + string(reason) + "] pane busy",
+			SigRaw:    "abc",
+		}
+	}
+	if why := domain.AutoAcceptIneligible(rec(domain.ReasonPaneBusy), "respond: Yes", false); why != "" {
+		t.Errorf("a pane-busy row must be reconsidered on a later pass, refused with %q", why)
+	}
+	for _, excluded := range []domain.EscalateReason{domain.ReasonRateLimited, domain.ReasonRetryExhausted} {
+		if why := domain.AutoAcceptIneligible(rec(excluded), "respond: Yes", false); why == "" {
+			t.Errorf("control: %s must stay excluded", excluded)
+		}
+	}
+}
