@@ -1211,6 +1211,14 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 	return nil
 }
 
+// confirmNextSteps is the footer for a confirm that actually confirmed. It is
+// shared with the registry entry, which renders it on the --help page.
+var confirmNextSteps = []Hint{
+	{Cmd: "hap escalations", Why: "see what is still pending"},
+	{Cmd: "hap signatures list", Why: "check whether the rule graduated"},
+	{Cmd: "hap audit --limit 10", Why: "verify the action was recorded/delivered"},
+}
+
 func confirm(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	idArg, rest := splitLeadingID(args)
 	fs := flag.NewFlagSet("confirm", flag.ContinueOnError)
@@ -1239,6 +1247,15 @@ func confirm(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 		genTask = strings.HasPrefix(audit.Suggestion, domain.SuggestTaskPrefix)
 	}
 	if err := app.Confirm(ctx, id, *send); err != nil {
+		// A [no_task_source] row with no suggestion is a NOTICE, not a failed
+		// command: nothing was ever answerable, and the fix is a config change.
+		// Print what to do and exit 0 — an `error:` prefix and a non-zero status
+		// would say the plugin broke, which is how this used to read.
+		var notice *frontend.NoTaskSourceNotice
+		if errors.As(err, &notice) {
+			fmt.Fprintln(out, notice.Guidance())
+			return nil
+		}
 		return err
 	}
 	switch {
@@ -1249,6 +1266,7 @@ func confirm(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 	default:
 		fmt.Fprintf(out, "confirmed escalation #%d (recorded as a learning event)\n", id)
 	}
+	PrintNextSteps(out, confirmNextSteps)
 	return nil
 }
 

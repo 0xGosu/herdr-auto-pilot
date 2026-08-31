@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,5 +96,89 @@ func TestConfirmGeneratedTaskSendBusyRefuses(t *testing.T) {
 	}
 	if len(h.sent) != 0 {
 		t.Errorf("refused send must not deliver, got %v", h.sent)
+	}
+}
+
+// noTaskSourceApp seeds one [no_task_source] escalation carrying no suggestion
+// — the notice raised when an idle agent has no task source and
+// llm.task_generate_command is unset.
+func noTaskSourceApp(t *testing.T) (*frontend.App, *store.Store, int64) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	app := &frontend.App{Store: st, StateDir: dir,
+		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	id, err := st.AppendAudit(context.Background(), domain.AuditRecord{
+		AgentID: "w1:p1", Signature: "sig", Trigger: "t",
+		SituationType: domain.SituationIdle, Action: "escalated", Status: "escalated",
+		Rationale: "[" + string(domain.ReasonNoTaskSource) + "]", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return app, st, id
+}
+
+// TestConfirmNoTaskSourcePrintsGuidanceAndSucceeds: confirming the notice is
+// not a failed command. It must print what to configure, exit 0 (cmd/hap turns
+// any non-nil error into an `error:` line and exit 1), and never claim it
+// confirmed anything.
+func TestConfirmNoTaskSourcePrintsGuidanceAndSucceeds(t *testing.T) {
+	for _, args := range [][]string{{"1"}, {"1", "--send"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			app, _, _ := noTaskSourceApp(t)
+
+			out, err := runConfirm(t, app, args...)
+			if err != nil {
+				t.Fatalf("a notice must not surface as a command error: %v", err)
+			}
+			for _, want := range []string{
+				"hap config set llm.task_generate_command --preset claude",
+				"hap config set llm.task_generate_command --preset codex",
+				"hap config task-source add",
+				"hap dismiss 1",
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("output is missing %q:\n%s", want, out)
+				}
+			}
+			if strings.Contains(out, "confirmed escalation") {
+				t.Errorf("nothing was confirmed, but the output says it was:\n%s", out)
+			}
+			if strings.Contains(out, "no suggestion to confirm") {
+				t.Errorf("the old refusal is still printed:\n%s", out)
+			}
+			// Nothing was recorded, so the success footer must not appear —
+			// it would send the operator to verify an action and a rule
+			// graduation that never happened.
+			if strings.Contains(out, "Next steps:") {
+				t.Errorf("a notice must not print the confirm success footer:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestConfirmNoSuggestionStillFails is the CLI-side control: every OTHER
+// unconfirmable escalation keeps failing, so the notice cannot become a
+// blanket "confirm always succeeds".
+func TestConfirmNoSuggestionStillFails(t *testing.T) {
+	app, st, _ := noTaskSourceApp(t)
+	ctx := context.Background()
+	id, err := st.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:p1", Signature: "sig2", Trigger: "t",
+		SituationType: domain.SituationApproval, Action: "escalated", Status: "escalated",
+		Rationale: "[" + string(domain.ReasonNeverAutoMatch) + "]", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = runConfirm(t, app, strconv.FormatInt(id, 10))
+	if err == nil || !strings.Contains(err.Error(), "has no suggestion to confirm") {
+		t.Fatalf("confirm error = %v, want the ordinary no-suggestion refusal", err)
 	}
 }

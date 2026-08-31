@@ -1895,9 +1895,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// as external and ring the bell.
 			m.pausePending = false
 		}
-		if msg.err != nil {
+		// A [no_task_source] notice is not a failed action: nothing was ever
+		// answerable and the fix is a config change, so it goes to the
+		// multi-line message area (rendered by BOTH the list view and the
+		// detail overlay) instead of the one-line status area, which would
+		// mark it with a red X and truncate the commands it names. msg.err
+		// stays non-nil so the cursorUndo restore below still fires — the
+		// confirm genuinely did not happen.
+		var notice *frontend.NoTaskSourceNotice
+		switch {
+		case msg.err != nil && errors.As(msg.err, &notice):
+			m.message = notice.Guidance()
+			if msg.message != "" {
+				// A batch that confirmed some rows still reports its count.
+				m.status = &statusNote{text: msg.message, at: time.Now()}
+			}
+		case msg.err != nil:
 			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
-		} else if msg.message != "" {
+		case msg.message != "":
 			m.status = &statusNote{text: msg.message, at: time.Now()}
 		}
 		// Only THIS action's own result may consume the undo it stashed. Other
@@ -2917,10 +2932,20 @@ func (m Model) confirmWithoutSend() (tea.Model, tea.Cmd) {
 		}
 		confirmed := 0
 		var skipped []string
-		var firstErr error
+		var firstErr, firstNotice error
 		for _, id := range ids {
 			if err := app.Confirm(ctx, id, false); err != nil {
 				skipped = append(skipped, fmt.Sprintf("#%d", id))
+				// A [no_task_source] notice is tracked apart from real
+				// failures: wrapping it here would bury its guidance inside an
+				// error string the status area truncates to one line.
+				var notice *frontend.NoTaskSourceNotice
+				if errors.As(err, &notice) {
+					if firstNotice == nil {
+						firstNotice = err
+					}
+					continue
+				}
 				if firstErr == nil {
 					firstErr = err
 				}
@@ -2931,6 +2956,12 @@ func (m Model) confirmWithoutSend() (tea.Model, tea.Cmd) {
 		if firstErr != nil {
 			return actionResultMsg{err: fmt.Errorf("confirmed %d, skipped %s: %w",
 				confirmed, strings.Join(skipped, " "), firstErr)}
+		}
+		if firstNotice != nil {
+			// The notice carries the guidance; the message carries the count,
+			// so a mixed batch reports both.
+			return actionResultMsg{err: firstNotice, message: fmt.Sprintf(
+				"confirmed %d, skipped %s", confirmed, strings.Join(skipped, " "))}
 		}
 		return actionResultMsg{message: fmt.Sprintf(
 			"confirmed %s — learned, nothing sent (the agent is not answered)", desc)}
