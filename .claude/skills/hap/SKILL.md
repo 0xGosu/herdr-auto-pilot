@@ -341,7 +341,6 @@ tab-separated stdout is unaffected.
 | `full_self_prompting.accept_generated_task` | false | also act on an idle escalation whose suggestion is an LLM-generated task |
 | `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic rule |
 | `llm.command` | (disabled) | argv for the consult CLI; this key alone gates the LLM fallback |
-| `llm.command_start` | inherits `command` | argv for the FIRST consult per agent |
 | `llm.timeout_seconds` | 60 | timeout for one consult |
 | `llm.auto_act_confidence_threshold` | 85 | min LLM self-reported score (0-100) to auto-act; below it (or no score) escalates as `[llm_low_confidence]`. Set >100 (e.g. 999) to never auto-act |
 | `llm.pane_excerpt_chars` | 5000 | pane excerpt size in the consult context |
@@ -349,7 +348,6 @@ tab-separated stdout is unaffected.
 | `llm.run_in_agent_cwd` | true | run the CLI in the monitored agent's own project directory |
 | `llm.rewrite_action_fallback_template` | `{original_text}` | optional wrapper when an action review fails (`{original_text}`, `{agent_name}`) |
 | `llm.task_generate_command` | (disabled) | argv to synthesize a next task for an idle agent with no source |
-| `llm.task_generate_command_start` | inherits `task_generate_command` | argv for the FIRST generation per agent (no-source case only) |
 | `llm.task_generate_timeout_seconds` | inherits `timeout_seconds` | timeout for one generation run |
 | `llm.learn_from_user_command` | (disabled) | argv run when you CORRECT an escalation, to record the lesson in `AUTO.md` in the agent's project |
 | `llm.learn_from_user_timeout_seconds` | inherits `timeout_seconds` | timeout for one learn run |
@@ -447,8 +445,8 @@ Approval and choice rules only fire while herdr reports the agent blocked.
 
 ### LLM environment
 
-Per scope: `shared`, `command`, `command_start`, `task_generate_command`,
-`task_generate_command_start`, `learn_from_user_command`.
+Per scope: `shared`, `command`, `task_generate_command`,
+`learn_from_user_command`.
 
 ```bash
 hap config env list                                     # names only, never values
@@ -635,17 +633,19 @@ than re-sent with every prompt.
 
 **When every item is checked off the templated prompt is NOT sent.** hap
 escalates a confirmable `@noop` suggestion ("No more pending tasks",
-`task_source_exhausted`) instead — unless **both** `llm.task_generate_command`
-and `llm.task_generate_command_start` are configured, in which case it generates
-more tasks for that source instead of escalating.
+`task_source_exhausted`) instead, and never refills the list on its own —
+rewriting a list the operator wrote is their call.
 
 **`max_tasks` (per source, default 20)** caps how large a checklist may grow.
-Once the file holds more than that many items (done, in-progress and pending
-counted alike) and its pending items are exhausted, the daemon logs a warning
-and skips generation for that agent. The same cap gates **manual** creation —
-`hap task … add` and the TUI's `a` are rejected once they would push the list
-past it. Prune the list or raise `max_tasks` to resume. The no-source bootstrap
-case and an ad-hoc `--path` file are never capped.
+It gates **manual** creation — `hap task … add` and the TUI's `a` are rejected
+once they would push the list past it — and confirming generated tasks whose
+count would exceed it. Prune the list or raise `max_tasks` to resume. The
+no-source bootstrap case and an ad-hoc `--path` file are never capped.
+
+The cap also guards LLM generation for an exhausted source, but that guard is
+currently dormant: refilling an exhausted source went away with
+`llm.task_generate_command_start`, so nothing generates into a registered
+source any more.
 
 ### task items (CRUD)
 
@@ -759,11 +759,6 @@ Placeholders for the argv template: `{self}` (the hap binary), `{request_id}`,
 `{session_id}`. Common misconfigurations of known CLIs are auto-repaired at
 launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing `exec`
 inserted).
-
-`command_start` runs *instead of* `command` on an agent's first consult this
-daemon lifetime — use it for a heavier model or a warm-up prompt. Leaving it
-empty inherits `command`. A `command_start` with **no** `command` does not
-enable the fallback; `command` alone gates that.
 
 For `agy` there is no preset and no per-invocation MCP flag — register hap once
 in `~/.gemini/config/mcp_config.json` with `HAP_DB_PATH` in its `env`.

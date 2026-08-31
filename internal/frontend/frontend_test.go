@@ -2127,12 +2127,10 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		{"llm.auto_act_confidence_threshold", "-1", true},
 		{"llm.auto_act_confidence_threshold", "maybe", true},
 		{"llm.command", `claude -p "decide for me"`, false},
-		{"llm.command_start", `claude -p "first: {agent_name}" --model opus`, false},
 		{"llm.enable_rewrite_action", "true", false},
 		{"llm.enable_rewrite_action", "maybe", true},
 		{"llm.rewrite_action_fallback_template", "Act on: {original_text}", false},
 		{"llm.task_generate_command", `claude -p "suggest: {agent_name}" --model haiku`, false},
-		{"llm.task_generate_command_start", `claude -p "first suggest: {agent_name}"`, false},
 		{"nonexistent.field", "1", true},
 	}
 	for _, c := range cases {
@@ -2154,22 +2152,10 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 	if len(cfg.LLM.Command) != 3 || cfg.LLM.Command[2] != "decide for me" {
 		t.Errorf("llm.command quote handling: %v", cfg.LLM.Command)
 	}
-	if len(cfg.LLM.CommandStart) != 5 || cfg.LLM.CommandStart[2] != "first: {agent_name}" {
-		t.Errorf("llm.command_start quote handling: %v", cfg.LLM.CommandStart)
-	}
 	if len(cfg.LLM.GenerateTaskCommand) != 5 || cfg.LLM.GenerateTaskCommand[2] != "suggest: {agent_name}" {
 		t.Errorf("llm.task_generate_command quote handling: %v", cfg.LLM.GenerateTaskCommand)
 	}
-	if len(cfg.LLM.GenerateTaskCommandStart) != 3 || cfg.LLM.GenerateTaskCommandStart[2] != "first suggest: {agent_name}" {
-		t.Errorf("llm.task_generate_command_start quote handling: %v", cfg.LLM.GenerateTaskCommandStart)
-	}
-	// Empty start variants render an inherit placeholder, not a blank cell.
-	if got := frontend.FieldValue(config.Config{}, "llm.command_start"); got != "(inherits command)" {
-		t.Errorf("empty command_start display = %q, want inherit placeholder", got)
-	}
-	if got := frontend.FieldValue(config.Config{}, "llm.task_generate_command_start"); got != "(inherits task_generate_command)" {
-		t.Errorf("empty task_generate_command_start display = %q, want inherit placeholder", got)
-	}
+	// An unset optional key renders an inherit placeholder, not a blank cell.
 	if got := frontend.FieldValue(config.Config{}, "llm.task_generate_timeout_seconds"); got != "(inherits timeout_seconds)" {
 		t.Errorf("empty task_generate_timeout_seconds display = %q, want inherit placeholder", got)
 	}
@@ -2220,36 +2206,32 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"full_self_prompting.honour_limits":         "true",
 		"full_self_prompting.accept_generated_task": "true",
 		"safety.disable_never_auto_seed_patterns":   "true",
-		"llm.command":                              `claude -p "decide"`,
-		"llm.command_start":                        `claude -p "first: decide"`,
-		"llm.timeout_seconds":                      "60",
-		"llm.auto_act_confidence_threshold":        "70",
-		"llm.pane_excerpt_chars":                   "4000",
-		"llm.enable_rewrite_action":                "true",
-		"llm.run_in_agent_cwd":                     "false",
-		"llm.rewrite_action_fallback_template":     "Act on: {original_text}",
-		"llm.task_generate_command":                `claude -p "suggest a task"`,
-		"llm.task_generate_command_start":          `claude -p "first suggest a task"`,
-		"llm.task_generate_timeout_seconds":        "45",
-		"llm.learn_from_user_command":              `claude -p "record the lesson"`,
-		"llm.learn_from_user_timeout_seconds":      "90",
-		"llm.env_file":                             "/etc/hap/llm.env",
-		"llm.command_env_file":                     "/etc/hap/consult.env",
-		"llm.command_start_env_file":               "/etc/hap/start.env",
-		"llm.task_generate_command_env_file":       "/etc/hap/taskgen.env",
-		"llm.task_generate_command_start_env_file": "/etc/hap/taskgen_start.env",
-		"llm.learn_from_user_command_env_file":     "/etc/hap/learn.env",
-		"embedding.disabled":                       "false",
-		"embedding.model_path":                     "/models/custom.gguf",
-		"embedding.similarity_threshold":           "0.90",
-		"embedding.bm25_min_score":                 "0.35",
-		"embedding.min_salient_chars":              "120",
-		"embedding.model_context_window":           "512",
-		"embedding.embed_timeout_ms":               "8000",
-		"embedding.warm_timeout_ms":                "120000",
-		"embedding.bm25_highbar_score":             "0.80",
-		"logging.level":                            "warn",
-		"logging.max_size_mb":                      "32",
+		"llm.command":                          `claude -p "decide"`,
+		"llm.timeout_seconds":                  "60",
+		"llm.auto_act_confidence_threshold":    "70",
+		"llm.pane_excerpt_chars":               "4000",
+		"llm.enable_rewrite_action":            "true",
+		"llm.run_in_agent_cwd":                 "false",
+		"llm.rewrite_action_fallback_template": "Act on: {original_text}",
+		"llm.task_generate_command":            `claude -p "suggest a task"`,
+		"llm.task_generate_timeout_seconds":    "45",
+		"llm.learn_from_user_command":          `claude -p "record the lesson"`,
+		"llm.learn_from_user_timeout_seconds":  "90",
+		"llm.env_file":                         "/etc/hap/llm.env",
+		"llm.command_env_file":                 "/etc/hap/consult.env",
+		"llm.task_generate_command_env_file":   "/etc/hap/taskgen.env",
+		"llm.learn_from_user_command_env_file": "/etc/hap/learn.env",
+		"embedding.disabled":                   "false",
+		"embedding.model_path":                 "/models/custom.gguf",
+		"embedding.similarity_threshold":       "0.90",
+		"embedding.bm25_min_score":             "0.35",
+		"embedding.min_salient_chars":          "120",
+		"embedding.model_context_window":       "512",
+		"embedding.embed_timeout_ms":           "8000",
+		"embedding.warm_timeout_ms":            "120000",
+		"embedding.bm25_highbar_score":         "0.80",
+		"logging.level":                        "warn",
+		"logging.max_size_mb":                  "32",
 		// github_gist and not local_fs on purpose: the sample doubles as the
 		// SetField exercise, and setting the NON-default is what proves the
 		// enum branch is reachable at all.
@@ -2383,10 +2365,8 @@ func TestPaneSalientCharsFieldDisplay(t *testing.T) {
 func TestFieldTUIEditableClassification(t *testing.T) {
 	readOnly := map[string]bool{
 		"llm.command":                          true,
-		"llm.command_start":                    true,
 		"llm.rewrite_action_fallback_template": true,
 		"llm.task_generate_command":            true,
-		"llm.task_generate_command_start":      true,
 		"llm.learn_from_user_command":          true,
 		"embedding.model_path":                 true,
 	}
@@ -2426,18 +2406,16 @@ func TestFieldTUIEditableClassification(t *testing.T) {
 // `hap config fields`, and `hap config set` keep working on them.
 func TestTUIHiddenConfigFields(t *testing.T) {
 	hidden := map[string]bool{
-		"llm.pane_excerpt_chars":                   true,
-		"llm.enable_rewrite_action":                true,
-		"llm.run_in_agent_cwd":                     true,
-		"llm.rewrite_action_fallback_template":     true,
-		"llm.env_file":                             true,
-		"llm.command_env_file":                     true,
-		"llm.command_start_env_file":               true,
-		"llm.task_generate_command_env_file":       true,
-		"llm.task_generate_command_start_env_file": true,
-		"llm.learn_from_user_command_env_file":     true,
-		"embedding.pane_salient_chars":             true,
-		"embedding.warm_timeout_ms":                true,
+		"llm.pane_excerpt_chars":               true,
+		"llm.enable_rewrite_action":            true,
+		"llm.run_in_agent_cwd":                 true,
+		"llm.rewrite_action_fallback_template": true,
+		"llm.env_file":                         true,
+		"llm.command_env_file":                 true,
+		"llm.task_generate_command_env_file":   true,
+		"llm.learn_from_user_command_env_file": true,
+		"embedding.pane_salient_chars":         true,
+		"embedding.warm_timeout_ms":            true,
 		// The env file holds a token, so it follows the llm.*_env_file rule:
 		// registered (a path is not a secret and `hap config set` must reach
 		// it) but off the TUI's Config tab. The two timing knobs are tuned once
@@ -2532,8 +2510,6 @@ func TestSetFieldNewKeysValidation(t *testing.T) {
 		{"llm.task_generate_timeout_seconds", "abc", true},
 		{"llm.task_generate_command", `claude -p "suggest"`, false},
 		{"llm.task_generate_command", "", false}, // empty disables the feature
-		{"llm.task_generate_command_start", `claude -p "first suggest"`, false},
-		{"llm.task_generate_command_start", "", false}, // empty inherits task_generate_command
 	}
 	for _, c := range cases {
 		_, err := app.SetField(ctx, c.key, c.value)
@@ -4937,9 +4913,8 @@ func TestConfigFieldsNeverRenderEnvValues(t *testing.T) {
 	const secret = "sk-ant-supersecret"
 	cfg.LLM.Env = map[string]string{"ANTHROPIC_API_KEY": secret}
 	cfg.LLM.CommandEnv = map[string]string{"ANTHROPIC_API_KEY": secret}
-	cfg.LLM.CommandStartEnv = map[string]string{"ANTHROPIC_API_KEY": secret}
 	cfg.LLM.GenerateTaskEnv = map[string]string{"ANTHROPIC_API_KEY": secret}
-	cfg.LLM.GenerateTaskStartEnv = map[string]string{"ANTHROPIC_API_KEY": secret}
+	cfg.LLM.LearnFromUserEnv = map[string]string{"ANTHROPIC_API_KEY": secret}
 	cfg.LLM.CommandEnvFile = "/etc/hap/consult.env"
 
 	for _, key := range frontend.ConfigFieldKeys {

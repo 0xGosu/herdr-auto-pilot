@@ -207,22 +207,6 @@ type Daemon struct {
 	// Guarded by mu.
 	episodeHandled map[string]bool
 
-	// firstConsult marks agents whose first LLM consult has fired, so the
-	// first interaction can use command_start and every later one uses the
-	// base template. Keyed by agentID (== paneID in herdr).
-	// NOT reset on "detected": that event also fires on every subscriber
-	// reconnect (pane-topology change), which would re-fire the kickoff
-	// prompt mid-session for long-running agents. A genuinely new agent
-	// almost always arrives in a new pane (new key → first=true naturally);
-	// the rare pane-id REUSE is caught by resetRecycledPaneState, which acts on
-	// herdr's terminal_id — a signal that means "different agent" and, unlike
-	// "detected", never fires on a mere reconnect. Guarded by mu.
-	firstConsult map[string]bool
-	// firstTaskGen marks agents whose first idle task generation has fired, so
-	// the first one can use task_generate_command_start. Same keying/semantics
-	// as firstConsult; guarded by mu.
-	firstTaskGen map[string]bool
-
 	// learnInFlight marks agents with a learn-from-correction run outstanding,
 	// so a burst of corrections cannot stack CLI subprocesses on one agent.
 	// Corrections are human-paced, so this only ever guards a burst (a batch
@@ -543,8 +527,6 @@ func New(opt Options) (*Daemon, error) {
 		pendingCapture:            map[string]*captureEntry{},
 		captureStarted:            map[string]bool{},
 		episodeHandled:            map[string]bool{},
-		firstConsult:              map[string]bool{},
-		firstTaskGen:              map[string]bool{},
 		learnInFlight:             map[string]bool{},
 		lastAutoSend:              map[string]time.Time{},
 		lastAutoNoop:              map[string]time.Time{},
@@ -1558,13 +1540,6 @@ func (d *Daemon) syncTerminalIDs(ctx context.Context, agents []domain.AgentTrans
 //     "working" transition to our own automation, suppressing the human
 //     check-in that resets the runaway counter;
 //   - a stale cwd would render the wrong {cwd} in its first task prompt.
-//
-// firstConsult/firstTaskGen are reset too: their doc notes a brand-new agent
-// normally arrives on a NEW pane (so the key is absent and priming happens
-// naturally) and that the rare pane-id reuse forgoes re-priming for want of a
-// signal. terminal_id IS that signal, so a genuinely new agent primes properly.
-// This is deliberately NOT done on a "detected" event, which also fires on
-// every subscriber reconnect.
 func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTransition) {
 	// Cancel first, outside the lock these helpers take themselves: a pending
 	// capture or review for the dead agent must not fire against the new one.
@@ -1575,8 +1550,6 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 	delete(d.episodeHandled, a.PaneID)
 	delete(d.captureStarted, a.PaneID)
 	delete(d.paneCwds, a.PaneID)
-	delete(d.firstConsult, a.AgentID)
-	delete(d.firstTaskGen, a.AgentID)
 	delete(d.lastAutoSend, a.AgentID)
 	delete(d.lastAutoNoop, a.AgentID)
 	delete(d.idleSince, a.AgentID)
@@ -2029,17 +2002,16 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 			MaxPerMinute:   cfg.Limits.MaxAutoPromptsPerMinute,
 			Inert:          d.limitsInert(ctx, cfg),
 		},
-		Now:                         now,
-		RetryCount:                  retries,
-		MaxRetries:                  cfg.Limits.MaxErrorRetries,
-		DeclaredTask:                declared,
-		LLMConfigured:               d.llmPort() != nil && d.llmPort().Configured(),
-		GenerateTaskConfigured:      d.taskGenPort() != nil,
-		GenerateTaskStartConfigured: len(cfg.LLM.GenerateTaskCommandStart) > 0,
-		NeverAutoRuleHit:            allowHit,
-		NeverAutoMatched:            allowMatched,
-		SuspectedIrreversible:       suspected,
-		IrreversibleHit:             irrevHit,
+		Now:                    now,
+		RetryCount:             retries,
+		MaxRetries:             cfg.Limits.MaxErrorRetries,
+		DeclaredTask:           declared,
+		LLMConfigured:          d.llmPort() != nil && d.llmPort().Configured(),
+		GenerateTaskConfigured: d.taskGenPort() != nil,
+		NeverAutoRuleHit:       allowHit,
+		NeverAutoMatched:       allowMatched,
+		SuspectedIrreversible:  suspected,
+		IrreversibleHit:        irrevHit,
 	}
 
 	decision := domain.Decide(in)
@@ -2070,10 +2042,12 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	case domain.ActionConsult:
 		d.consultLLM(ctx, cfg, situation, sig, now)
 	case domain.ActionGenerateTask:
-		// ActionGenerateTask for an idle situation only fires when there's no
-		// REAL pending task: declared != nil here means a task source matched
-		// but its checklist is exhausted (Task == NoTaskContent), not that
-		// none was ever declared.
+		// ActionGenerateTask for an idle situation only fires when there is no
+		// REAL pending task, and since the refill path was removed with
+		// llm.task_generate_command_start it fires ONLY for ReasonNoTaskSource
+		// — which Decide answers only when no source was declared at all. So
+		// declared is always nil here; the argument below is threaded through
+		// for the dormant exhausted-source branch (see generateTask).
 		//
 		// But "no declared task" has two very different causes, and only one of
 		// them licenses inventing work. A source may own this agent and simply
@@ -3049,17 +3023,11 @@ func (d *Daemon) consultLLM(ctx context.Context, cfg config.Config, s domain.Sit
 	sig domain.SignatureResult, now time.Time) {
 
 	llm := d.llmPort()
-	// The first consult for this agent selects command_start (when
-	// configured); mark it consumed here on the main loop, before the goroutine.
-	d.mu.Lock()
-	first := !d.firstConsult[s.AgentID]
-	d.firstConsult[s.AgentID] = true
-	d.mu.Unlock()
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("req-%s-%d", s.AgentID, now.UnixNano()),
 		SessionID: domain.NewSessionID(),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-		AgentID: s.AgentID, Status: "pending", CreatedAt: now, First: first,
+		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
 		RetryAuditID: s.RetryAuditID,
 	}
 	d.spawn(func() {
@@ -3130,9 +3098,16 @@ func (d *Daemon) taskGenPort() ports.TaskGeneratorPort {
 // suggestion funnels back through handleTaskGenOutcome as an escalation the
 // operator confirms or dismisses; it is never auto-acted. A pending
 // llm_requests row guards against concurrent generations from bursty idle
-// events and lets `l`-retry reuse the same in-flight check. sourceExhausted
-// reports whether a declared source currently matches (exhausted) rather
-// than none existing at all — see the First computation below.
+// events and lets `l`-retry reuse the same in-flight check.
+//
+// sourceExhausted reports whether a declared source currently matches
+// (exhausted) rather than none existing at all. It is DORMANT: removing
+// llm.task_generate_command_start took the refill path with it, so Decide can
+// no longer answer ActionGenerateTask for an exhausted source and the only
+// production caller always passes false. It is kept, with its max_tasks cap
+// guard, because those two belong together — a refill path that came back
+// without the cap would bury the operator silently, which is exactly what the
+// guard exists to stop. Only tests reach the true branch today.
 func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.Situation,
 	sig domain.SignatureResult, tr domain.AgentTransition, now time.Time, sourceExhausted bool) {
 
@@ -3175,24 +3150,6 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 		}
 	}
 
-	// task_generate_command_start is only for bootstrapping a list from
-	// nothing: when a declared source already exists (even exhausted), a list
-	// already exists, so this is never a "first" generation. That case must
-	// NOT touch firstTaskGen — it tracks the no-source path's own "has
-	// generation ever fired for this agent" independently, so a LATER no-
-	// source bootstrap for the same agent (e.g. its exhausted source's file
-	// is later deleted) still correctly sees first=true and selects
-	// task_generate_command_start.
-	d.mu.Lock()
-	var first bool
-	if sourceExhausted {
-		first = false
-	} else {
-		first = !d.firstTaskGen[s.AgentID]
-		d.firstTaskGen[s.AgentID] = true
-	}
-	d.mu.Unlock()
-
 	reason := domain.ReasonNoTaskSource
 	if sourceExhausted {
 		reason = domain.ReasonTaskSourceExhausted
@@ -3202,7 +3159,7 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 		RequestID: fmt.Sprintf("gentask-%s-%d", s.AgentID, now.UnixNano()),
 		SessionID: domain.NewSessionID(),
 		Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-		AgentID: s.AgentID, Status: "pending", CreatedAt: now, First: first,
+		AgentID: s.AgentID, Status: "pending", CreatedAt: now,
 	}
 	// Stage the pending row synchronously so a second idle event cannot race
 	// past the guard above before the goroutine registers the flight.
@@ -3236,7 +3193,6 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 				AgentName:   agentName,
 				PaneExcerpt: d.paneExcerpt(ctx, cfg, s),
 				Cwd:         cwd,
-				First:       first,
 				// The same id staged on the llm_requests row above, so the
 				// generation and its record name one conversation.
 				SessionID: req.SessionID,
@@ -3271,11 +3227,11 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 	// for an agent that moved on. If the agent STARTED WORKING (its live herdr
 	// status is no longer idle/done), or it now has a matching task source
 	// with a REAL pending item, the suggestion is moot — drop it instead of
-	// leaving a stale, confirmable escalation. A still-exhausted declared
-	// source (the res.reason == ReasonTaskSourceExhausted trigger) must NOT
-	// count as "now has a task source": it's the same exhausted source that
-	// triggered this generation, and dropping here would silently discard
-	// every exhausted-source suggestion. Unknown status (list error / agent
+	// leaving a stale, confirmable escalation. The "REAL pending item" test is
+	// what keeps a still-exhausted declared source from counting as "now has a
+	// task source" — it would be the same source that triggered the generation,
+	// and dropping here would silently discard the suggestion. Unknown status
+	// (list error / agent
 	// absent) falls through and still surfaces the outcome (fail-safe). The
 	// confirm path re-checks too, since the operator may act minutes later.
 	if d.agentNotCleanlyIdle(ctx, s.AgentID) {
@@ -3684,10 +3640,6 @@ func (d *Daemon) startActionReview(ctx context.Context, s domain.Situation,
 		return
 	}
 
-	// A review consults the operator's command, but the priming/first-consult
-	// variant is meant for answering pane prompts, not reviewing outbound
-	// text — always use the base command (First stays false, same rationale
-	// as consultDeclaredTask).
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("actreview-%s-%d", s.AgentID, now.UnixNano()),
 		SessionID: domain.NewSessionID(),

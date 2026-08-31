@@ -9,11 +9,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
@@ -22,56 +20,35 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 )
 
-// fastFailWindow bounds how quickly a CLI run must error out to count as a
-// "fast fail" that triggers a one-shot retry with the alternate template
-// (command ↔ command_start). It is
-// spawn-to-exit wall time, so it must comfortably exceed a healthy CLI's
-// startup cost yet stay short enough that an argument-rejection (e.g. claude's
-// `--resume <non-uuid>`) lands inside it. The clock covers the whole run, not
-// just the CLI's own validation.
-const fastFailWindow = time.Second
-
 // Adapter shells out to the operator's LLM CLI.
 type Adapter struct {
 	// CommandTemplate is the argv template from config; placeholders:
 	// {self} → this binary, {request_id}, {db}, {control}, {agent_name},
 	// {session_id}.
 	CommandTemplate []string
-	// CommandStartTemplate is used instead of CommandTemplate on an agent's
-	// first consult (req.First); empty falls back to CommandTemplate.
-	CommandStartTemplate []string
-	Timeout              time.Duration
-	DBPath               string
-	ControlPath          string
-	Store                ports.ReadStore
+	Timeout         time.Duration
+	DBPath          string
+	ControlPath     string
+	Store           ports.ReadStore
 	// BaseEnv is the environment shared by every command template; the
 	// per-command specs below layer on top of it (see buildEnv).
 	BaseEnv EnvSpec
-	// CommandEnv / CommandStartEnv are the environments for their matching
-	// consult templates. The env travels WITH the template through the
-	// fast-fail retry, so a rescue run never gets the other command's keys.
-	CommandEnv      EnvSpec
-	CommandStartEnv EnvSpec
+	// CommandEnv is the environment for CommandTemplate, layered over BaseEnv.
+	CommandEnv EnvSpec
 	// SelfPath overrides the {self} placeholder (defaults to selfpath.Resolve).
 	SelfPath string
 	// TaskGenTemplate is the argv template for the one-shot idle task
 	// suggestion (llm.task_generate_command); placeholders {self},
 	// {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. Empty disables it.
 	TaskGenTemplate []string
-	// TaskGenStartTemplate is used instead of TaskGenTemplate on an agent's
-	// first task generation (req.First); empty falls back to TaskGenTemplate.
-	TaskGenStartTemplate []string
 	// TaskGenTimeout bounds one task-generation run (<=0 falls back to Timeout).
 	TaskGenTimeout time.Duration
-	// TaskGenEnv / TaskGenStartEnv are the environments for their matching
-	// task-generation templates, layered over BaseEnv.
-	TaskGenEnv      EnvSpec
-	TaskGenStartEnv EnvSpec
+	// TaskGenEnv is the environment for TaskGenTemplate, layered over BaseEnv.
+	TaskGenEnv EnvSpec
 	// LearnTemplate is the argv template for the one-shot run that records a
 	// lesson after an operator correction (llm.learn_from_user_command);
 	// placeholders {self}, {agent_name}, {agent_type}, {cwd}, {situation_type},
-	// {pane_excerpt}, {suggestion}, {correction}. Empty disables it. There is
-	// no *Start variance — see config.LLM.LearnFromUserCommand.
+	// {pane_excerpt}, {suggestion}, {correction}. Empty disables it.
 	LearnTemplate []string
 	// LearnTimeout bounds one learn-from-user run (<=0 falls back to Timeout).
 	LearnTimeout time.Duration
@@ -92,31 +69,21 @@ func (a *Adapter) Configured() bool {
 	return a != nil && len(a.CommandTemplate) > 0
 }
 
-// consultAttempt captures the outcome of one CLI run so Consult can decide
-// whether to retry with the alternate template.
+// consultAttempt captures the outcome of one CLI run.
 type consultAttempt struct {
 	dec      *domain.LLMDecision
 	captured string
 	// sessionID is the CLI conversation this attempt actually ran as: the id
 	// hap passed in, or the one the CLI reported if it mints its own. Empty
-	// when neither applies. Per ATTEMPT, not per request — Consult retries with
-	// the alternate template, and that is a different conversation.
+	// when neither applies.
 	sessionID string
 	runErr    error
-	deadline  bool          // the run hit its own timeout
-	elapsed   time.Duration // spawn-to-exit wall time
+	deadline  bool // the run hit its own timeout
 }
 
 // staged reports whether the run left a usable (pending) decision.
 func (att *consultAttempt) staged() bool {
 	return att.dec != nil && att.dec.Status == "pending"
-}
-
-// fastFailed reports a quick error exit with no usable decision — the trigger
-// for a one-shot retry with the alternate template. A timeout (slow by
-// definition) and a clean no-submit exit are deliberately excluded.
-func (att *consultAttempt) fastFailed() bool {
-	return att.runErr != nil && !att.deadline && !att.staged() && att.elapsed < fastFailWindow
 }
 
 // failure renders the escalation error for a run that produced no usable
@@ -134,9 +101,7 @@ func (att *consultAttempt) failure(timeout time.Duration) error {
 }
 
 // Consult launches the CLI and returns the staged decision, or an error on
-// timeout / missing submission — both of which the daemon escalates. When the
-// preferred template fails fast (e.g. `command` resumes a session that does
-// not exist yet), Consult retries once with the alternate template.
+// timeout / missing submission — both of which the daemon escalates.
 func (a *Adapter) Consult(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
 	dec, _, err := a.ConsultWithSession(ctx, req)
 	return dec, err
@@ -156,62 +121,31 @@ func (a *Adapter) ConsultWithSession(ctx context.Context, req domain.LLMRequest)
 	if err != nil {
 		return nil, "", err
 	}
-	// The first consult for an agent prefers command_start when configured;
-	// the other template is the fast-fail fallback and, absent a start
-	// template, First simply reuses the base command. Each template carries
-	// its own environment so a retry cannot mix one command's argv with the
-	// other's credentials.
-	primary := commandSpec{argv: a.CommandTemplate, env: a.CommandEnv}
-	alt := commandSpec{argv: a.CommandStartTemplate, env: a.CommandStartEnv}
-	if req.First && len(a.CommandStartTemplate) > 0 {
-		primary, alt = alt, primary
-	}
+	// One template serves every consult: the `*_start` variance was removed, so
+	// there is no alternate to fall back on and no retry to attempt.
+	spec := commandSpec{argv: a.CommandTemplate, env: a.CommandEnv}
 
 	timeout := a.Timeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 
-	att, err := a.runConsult(ctx, primary, self, req, timeout)
+	att, err := a.runConsult(ctx, spec, self, req, timeout)
 	if err != nil {
-		// A preflight/store error on the PRIMARY aborts outright (a missing
-		// preferred binary is a config error worth surfacing directly); the
-		// same error on the retry is folded into retryErr so the primary wins.
+		// A preflight/store error aborts outright — a missing binary is a
+		// config error worth surfacing directly.
 		//
 		// No session id: this failed BEFORE the CLI ran, so nothing was
 		// created to name.
 		return nil, "", err
 	}
-	// A fast fail retries once with the alternate template. Skip when the
-	// parent context is already cancelled (shutdown makes every run "fail
-	// fast") or the alternate is absent / identical.
-	var retryErr error
-	// An alternate that is identical in BOTH argv and environment would just
-	// repeat the same failure; one that differs in either is worth a try (the
-	// two templates can share an argv and differ only in key or model).
-	if att.fastFailed() && ctx.Err() == nil && len(alt.argv) > 0 && !alt.sameAs(primary) {
-		altAtt, rerr := a.runConsult(ctx, alt, self, req, timeout)
-		switch {
-		case rerr != nil:
-			retryErr = rerr // preflight/store error on the retry
-		case altAtt.staged():
-			att = altAtt // the alternate rescued the consult
-		default:
-			retryErr = altAtt.failure(timeout)
-		}
-	}
-
+	// staged() is asked BEFORE att.runErr, deliberately: a CLI that submits its
+	// decision and then exits nonzero has still answered, so the exit status is
+	// not allowed to discard the answer.
 	if !att.staged() {
-		base := att.failure(timeout)
 		// att.sessionID even here: the run happened, so a transcript exists and
 		// the escalation this failure raises can still be traced back to it.
-		if retryErr != nil {
-			// Lead with the primary failure (the informative one the operator
-			// must debug); note the alternate also failed.
-			return nil, att.sessionID,
-				fmt.Errorf("%w; retry with alternate command also failed: %v", base, retryErr)
-		}
-		return nil, att.sessionID, base
+		return nil, att.sessionID, att.failure(timeout)
 	}
 	att.dec.CapturedOutput = att.captured
 	// Stamped alongside the captured output, and for the same reason: the
@@ -250,18 +184,10 @@ func (a *Adapter) consultReplacer(self string, req domain.LLMRequest) *strings.R
 }
 
 // commandSpec pairs one argv template with the environment configured for it,
-// so the two travel together through Consult's primary/alternate swap.
+// so the two travel together into runConsult.
 type commandSpec struct {
 	argv []string
 	env  EnvSpec
-}
-
-// sameAs reports whether two specs would run the same command with the same
-// environment — in which case retrying one after the other is pointless.
-func (s commandSpec) sameAs(other commandSpec) bool {
-	return slices.Equal(s.argv, other.argv) &&
-		strings.TrimSpace(s.env.File) == strings.TrimSpace(other.env.File) &&
-		maps.Equal(s.env.Vars, other.env.Vars)
 }
 
 // runConsult runs one CLI attempt with the given template and reports the
@@ -325,9 +251,7 @@ func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string,
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	cmd.Env = env
-	started := time.Now()
 	runErr := cmd.Run()
-	elapsed := time.Since(started)
 
 	raw := out.String()
 	captured := truncate(raw, 16*1024)
@@ -357,7 +281,6 @@ func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string,
 		sessionID: sessionID,
 		runErr:    runErr,
 		deadline:  runCtx.Err() == context.DeadlineExceeded,
-		elapsed:   elapsed,
 	}, nil
 }
 

@@ -488,9 +488,8 @@ rather than re-sent with every prompt.
 
 **When every item is checked off, the templated prompt is never sent.** hap
 escalates a confirmable `@noop` suggestion ("No more pending tasks",
-`task_source_exhausted`) instead — unless **both** `llm.task_generate_command`
-and `llm.task_generate_command_start` are configured, in which case it generates
-more tasks for that source.
+`task_source_exhausted`) instead, and never refills the list on its own —
+rewriting a list you wrote is your call.
 
 ### Where task lists are stored
 
@@ -645,14 +644,17 @@ newlines when the task is sent (hand-written `\n` works the same way).
 Writes go straight to the file atomically; the daemon re-reads task files live,
 so no restart is needed. Adding a task never interrupts a working agent.
 
-**`max_tasks` (per source, default 20)** caps how large a checklist may grow.
-Once the file holds more than that many items — done, in-progress and pending
-counted alike — and its pending items are exhausted, the daemon logs a warning
-and **skips** LLM generation for that agent instead of piling onto an already
-long list. The same cap gates **manual** creation: `hap task … add` and the TUI's
-`a` are rejected once they would push a registered source past it. Prune the
-list or raise the cap to resume. The no-source bootstrap case and an ad-hoc
-`--path` file are never capped.
+**`max_tasks` (per source, default 20)** caps how large a checklist may grow —
+done, in-progress and pending items counted alike. It gates **manual** creation
+(`hap task … add` and the TUI's `a` are rejected once they would push a
+registered source past it) and confirming a set of generated tasks whose count
+would exceed it. Prune the list or raise the cap to resume. The no-source
+bootstrap case and an ad-hoc `--path` file are never capped.
+
+The cap also guards LLM generation into an exhausted source, but that guard is
+dormant today: refilling an exhausted source went away with
+`llm.task_generate_command_start`, so nothing generates into a registered source
+any more.
 
 ### The Tasks tab
 
@@ -915,14 +917,13 @@ Placeholders for a command template: `{self}` (the hap binary), `{request_id}`,
 launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing `exec`
 inserted); an unrecognized shape is left untouched.
 
-An optional **`command_start`** runs *instead of* `command` on an agent's first
-consult this daemon lifetime — use it for a priming prompt or a stronger model
-on the first touch. Omitting it reuses `command`, so it is opt-in, and
-`command_start` alone never enables the fallback (`command` is what gates it).
-The preferred template also has a one-shot **fast-fail fallback**: if it exits
-with an error in under one second without staging a decision, hap tries the
-other template once, in either direction. Timeouts, clean exits without
-`submit_decision`, and cancelled runs are not retried automatically.
+> Upgrading: the first-interaction command family (`llm.command_start`,
+> `llm.task_generate_command_start` and their `_env`/`_env_file` companions) was
+> removed — one template now serves every interaction. A config still carrying
+> them loads with a warning and is rewritten without them on the next save. Two
+> behaviors went with it: the fast-fail retry that tried the other template when
+> one exited in under a second, and the refill of an exhausted declared task
+> source, which now always escalates `task_source_exhausted`.
 
 For **Antigravity (`agy`)** there is no preset and no per-invocation MCP flag —
 register hap once in `~/.gemini/config/mcp_config.json` with the database path
@@ -1006,8 +1007,7 @@ ANTHROPIC_MODEL = "haiku"                     # cheaper for task ideas
 ```
 
 The inline tables are editable from the CLI, per scope (`shared`, `command`,
-`command_start`, `task_generate_command`, `task_generate_command_start`,
-`learn_from_user_command`):
+`task_generate_command`, `learn_from_user_command`):
 
 ```sh
 hap config env list                                          # names only, never values
@@ -1158,10 +1158,9 @@ inferable native todo, `llm.task_generate_command` runs a one-shot CLI to
 propose next tasks. Opt-in: without the command the safe default remains a
 `no_task_source` escalation and hap invents nothing.
 
-The same flow refills a declared source once its checklist is fully checked off
-— but only when **both** `task_generate_command` and
-`task_generate_command_start` are configured (stricter than the no-source case,
-since it replaces content in a source that already had operator-relevant tasks).
+It never refills a declared source whose checklist is fully checked off: that
+list already had operator-relevant tasks in it, so an exhausted source escalates
+`task_source_exhausted` and waits for you.
 
 The command's stdout may be plain lines or a Markdown list. Hap normalizes it
 and surfaces it as an **escalation**; it never auto-accepts a generated task

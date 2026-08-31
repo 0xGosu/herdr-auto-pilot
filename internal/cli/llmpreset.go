@@ -43,9 +43,6 @@ func configSetPreset(ctx context.Context, app *frontend.App, out io.Writer, key 
 	}
 	fmt.Fprintf(out, "%s set to the %s default recipe%s\n", key, preset, reloadNote(reloaded))
 	fmt.Fprintf(out, "the recipe is a starting point — edit it in config.toml (a preset never overwrites a configured field)\n")
-	if note := frontend.LLMPresetFollowUp(key); note != "" {
-		fmt.Fprintf(out, "note: %s\n", note)
-	}
 	PrintNextSteps(out, configHints())
 	return nil
 }

@@ -110,13 +110,6 @@ type DecideInput struct {
 	// an idle agent with no task source generates a task suggestion instead of
 	// escalating no_task_source (FR-011 relaxation).
 	GenerateTaskConfigured bool
-	// GenerateTaskStartConfigured reports that llm.task_generate_command_start
-	// is also set. An exhausted DECLARED task source (every item checked off)
-	// only generates more tasks instead of escalating task_source_exhausted
-	// when BOTH commands are configured — a stricter, explicit opt-in than the
-	// no-task-source-at-all case above, since it replaces content in a source
-	// that already had operator-relevant tasks.
-	GenerateTaskStartConfigured bool
 	// NeverAutoRuleHit and SuspectedIrreversible are precomputed by the caller
 	// from the compiled NeverAutoList so the core stays free of regex state.
 	// IrreversibleHit carries the matching indicator for the rationale.
@@ -269,17 +262,12 @@ func Decide(in DecideInput) Decision {
 				Rationale: "idle with no task source; generating a task suggestion"}
 		}
 		// A declared task source that matched but has nothing left to do never
-		// sends the templated "none" prompt. Generating more tasks requires
-		// BOTH task_generate_command and task_generate_command_start — a
-		// stricter, explicit opt-in than the no-source case above, since this
-		// replaces content in a source that already had operator-relevant
-		// tasks. Without that opt-in, the safe default is a confirmable @noop
-		// suggestion: the list is done, nothing to send.
+		// sends the templated "none" prompt, and never refills itself either:
+		// rewriting a list the operator wrote is their call, not the daemon's,
+		// so the answer is a confirmable @noop suggestion — the list is done,
+		// nothing to send. (Refilling used to be reachable by ALSO setting
+		// llm.task_generate_command_start; that key is gone.)
 		if in.Situation.Type == SituationIdle && resolveEsc == ReasonTaskSourceExhausted {
-			if in.GenerateTaskConfigured && in.GenerateTaskStartConfigured {
-				return Decision{Action: ActionGenerateTask, Confidence: conf.Score,
-					Rationale: "declared task source exhausted; generating more tasks"}
-			}
 			return esc(ReasonTaskSourceExhausted, "No more pending tasks", conf.Score, ActionNoopSuggestion)
 		}
 		return esc(resolveEsc, rationaleFor(resolveEsc), conf.Score, suggestion)

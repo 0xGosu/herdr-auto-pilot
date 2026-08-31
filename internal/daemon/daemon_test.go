@@ -3230,23 +3230,22 @@ func TestDisabledAgentDeniesAutonomousAction(t *testing.T) {
 	}
 }
 
-func TestIdleDeclaredTaskExhaustedGeneratesMoreTasks(t *testing.T) {
-	// With BOTH task_generate_command and task_generate_command_start
-	// configured, an exhausted declared source generates more tasks instead
-	// of escalating @noop — and the suggestion must actually surface
-	// (regression: handleTaskGenOutcome's staleness re-check used to treat
-	// the same still-matched exhausted source as "now has a task source" and
-	// silently drop every exhausted-source suggestion). The very first
-	// generation for this agent must still use the base command, not
-	// task_generate_command_start — a list already exists, so this is never
-	// a bootstrap-from-nothing generation.
+func TestIdleDeclaredTaskExhaustedNeverGenerates(t *testing.T) {
+	// An exhausted declared source escalates task_source_exhausted with a
+	// confirmable @noop and NEVER calls the generator — refilling a list the
+	// operator wrote is their call. It used to refill when both
+	// task_generate_command and the removed task_generate_command_start were
+	// set; asserting zero generator calls with task_generate_command
+	// CONFIGURED is what makes this the guard against that coming back, since
+	// a half-restored refill path would satisfy the surviving half of the old
+	// gate. Nothing reaches the pane either way.
 	dir := t.TempDir()
 	taskFile := filepath.Join(dir, "tasks.md")
 	os.WriteFile(taskFile, []byte("- [x] old task\n"), 0o600)
 
 	idlePane := "All tests pass. Task is complete.\n"
 	cfg := fmt.Sprintf(
-		"[[task_sources]]\nagent = \"agent-41\"\npath = %q\n\n[llm]\ntask_generate_command = [\"fake\"]\ntask_generate_command_start = [\"fake-start\"]\n",
+		"[[task_sources]]\nagent = \"agent-41\"\npath = %q\n\n[llm]\ntask_generate_command = [\"fake\"]\n",
 		taskFile)
 	h, tg := newHarnessTaskGen(t, cfg, func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
 		return "Add more regression tests", nil
@@ -3260,73 +3259,27 @@ func TestIdleDeclaredTaskExhaustedGeneratesMoreTasks(t *testing.T) {
 		esc, _ = h.raw.PendingEscalations(ctx)
 		return len(esc) == 1
 	})
-	want := domain.SuggestTaskPrefix + "Add more regression tests"
-	if esc[0].Suggestion != want {
-		t.Errorf("escalation suggestion = %q, want %q", esc[0].Suggestion, want)
+	if esc[0].Suggestion != domain.ActionNoopSuggestion {
+		t.Errorf("escalation suggestion = %q, want %q", esc[0].Suggestion, domain.ActionNoopSuggestion)
 	}
 	if !strings.Contains(esc[0].Rationale, string(domain.ReasonTaskSourceExhausted)) {
 		t.Errorf("escalation should be tagged task_source_exhausted, got %q", esc[0].Rationale)
 	}
-	if domain.IsRetryableLLMEscalation(&esc[0]) {
-		t.Error("a successful task suggestion must NOT be retryable (operator confirms/dismisses)")
-	}
-	calls := tg.genCalls()
-	if len(calls) != 1 {
-		t.Fatalf("generator should be called once, got %d", len(calls))
-	}
-	if calls[0].First {
-		t.Error("an exhausted declared source already has a list; generation must use the base command, not task_generate_command_start")
+	if calls := tg.genCalls(); len(calls) != 0 {
+		t.Errorf("the generator ran for an exhausted declared source: %+v", calls)
 	}
 	if len(h.herdr.sentInputs()) != 0 {
-		t.Fatal("nothing may be sent to the pane before the operator confirms")
-	}
-}
-
-func TestGenerateTaskFirstFlagIndependentOfExhaustedSource(t *testing.T) {
-	// Regression: a generation triggered by an EXHAUSTED declared source must
-	// never mark firstTaskGen for the agent — that map tracks only the
-	// no-task-source-at-all path's own "first ever" state. If the exhausted
-	// path polluted it, a LATER no-source bootstrap for the same agent (e.g.
-	// its exhausted source's file is later removed) would incorrectly skip
-	// task_generate_command_start and use the regular command instead.
-	h, tg := newHarnessTaskGen(t, "[llm]\ntask_generate_command = [\"fake\"]\ntask_generate_command_start = [\"fake-start\"]\n",
-		func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
-			return "a generated task", nil
-		})
-
-	ctx := context.Background()
-	cfg, _, _ := h.daemon.snapshot()
-	agentID := "agent-99"
-	sig := domain.SignatureResult{Signature: "sig-99"}
-	situation := domain.Situation{Type: domain.SituationIdle, AgentID: agentID, AgentType: "claude"}
-	tr := domain.AgentTransition{AgentID: agentID, PaneID: agentID, Status: "idle"}
-
-	// First call: triggered by an EXHAUSTED declared source. Each call needs
-	// its own timestamp — generateTask derives the staged request's unique id
-	// from it (gentask-<agent>-<nanos>), and a repeated value collides.
-	h.daemon.generateTask(ctx, cfg, situation, sig, tr, time.Now(), true)
-	waitFor(t, 3*time.Second, func() bool {
-		pending, _ := h.raw.HasPendingLLMConsult(ctx, agentID)
-		return !pending && len(tg.genCalls()) == 1
-	})
-
-	// Second call: the SAME agent later has NO task source at all.
-	h.daemon.generateTask(ctx, cfg, situation, sig, tr, time.Now(), false)
-	waitFor(t, 3*time.Second, func() bool {
-		pending, _ := h.raw.HasPendingLLMConsult(ctx, agentID)
-		return !pending && len(tg.genCalls()) == 2
-	})
-
-	calls := tg.genCalls()
-	if calls[0].First {
-		t.Error("exhausted-source generation must never report First=true")
-	}
-	if !calls[1].First {
-		t.Error("a later no-source generation for the same agent must still see First=true — firstTaskGen must not be polluted by the exhausted-source path")
+		t.Fatal("nothing may be sent to the pane for an exhausted source")
 	}
 }
 
 func TestIdleTaskGenSkipsWhenOverMaxTasks(t *testing.T) {
+	// Drives generateTask DIRECTLY, and has to: the exhausted-source branch is
+	// dormant since the refill path went with llm.task_generate_command_start,
+	// so Decide can no longer reach it. The cap guard is kept beside the branch
+	// it protects (see generateTask), and this is what keeps it honest until a
+	// refill path returns.
+	//
 	// A source with more items than its max_tasks cap must NOT be topped up:
 	// generateTask logs a warning and returns without staging an LLM request
 	// or invoking the generator. Asserting "no staged request" (not just "no
@@ -3343,7 +3296,7 @@ func TestIdleTaskGenSkipsWhenOverMaxTasks(t *testing.T) {
 	os.WriteFile(taskFile, []byte("- [x] a\n- [x] b\n- [x] c\n"), 0o600)
 
 	cfg := fmt.Sprintf(
-		"[[task_sources]]\nagent = \"agent-77\"\npath = %q\nmax_tasks = 3\n\n[llm]\ntask_generate_command = [\"fake\"]\ntask_generate_command_start = [\"fake-start\"]\n",
+		"[[task_sources]]\nagent = \"agent-77\"\npath = %q\nmax_tasks = 3\n\n[llm]\ntask_generate_command = [\"fake\"]\n",
 		taskFile)
 	h, tg := newHarnessTaskGen(t, cfg, func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
 		return "should never be generated", nil

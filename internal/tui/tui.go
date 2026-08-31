@@ -5428,11 +5428,6 @@ func (m Model) llmPresetPrompt(key string) (tea.Model, tea.Cmd) {
 				if !reloaded {
 					msg += " (saved — no daemon running)"
 				}
-				// What the preset installs only half of, worded once in the
-				// frontend so this and the CLI cannot drift apart.
-				if note := frontend.LLMPresetFollowUp(key); note != "" {
-					msg += " — note: " + note
-				}
 				return actionResultMsg{message: msg}
 			}
 		},

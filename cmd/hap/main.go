@@ -392,28 +392,24 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 	// llm.command/timeout edits apply without a daemon restart.
 	llmFactory := func(cfg config.Config) ports.LLMPort {
 		return &llm.Adapter{
-			CommandTemplate:      cfg.LLM.Command,
-			CommandStartTemplate: cfg.LLM.CommandStart,
-			Timeout:              cfg.LLMTimeout(),
-			DBPath:               paths.DBPath(),
-			ControlPath:          paths.ControlSocketPath(),
-			Store:                st,
-			TaskGenTemplate:      cfg.LLM.GenerateTaskCommand,
-			TaskGenStartTemplate: cfg.LLM.GenerateTaskCommandStart,
-			TaskGenTimeout:       cfg.GenerateTaskTimeout(),
-			LearnTemplate:        cfg.LLM.LearnFromUserCommand,
-			LearnTimeout:         cfg.LearnFromUserTimeout(),
-			RunInAgentCwd:        cfg.RunLLMInAgentCwd(),
+			CommandTemplate: cfg.LLM.Command,
+			Timeout:         cfg.LLMTimeout(),
+			DBPath:          paths.DBPath(),
+			ControlPath:     paths.ControlSocketPath(),
+			Store:           st,
+			TaskGenTemplate: cfg.LLM.GenerateTaskCommand,
+			TaskGenTimeout:  cfg.GenerateTaskTimeout(),
+			LearnTemplate:   cfg.LLM.LearnFromUserCommand,
+			LearnTimeout:    cfg.LearnFromUserTimeout(),
+			RunInAgentCwd:   cfg.RunLLMInAgentCwd(),
 			// The `.env` files are never read here: the adapter reads them
 			// when it spawns a CLI, so editing a file applies to the next
 			// run, and changing the configured PATH applies on the next
 			// config reload (which rebuilds this adapter).
-			BaseEnv:         llm.EnvSpec{Vars: cfg.LLM.Env, File: cfg.LLM.EnvFile},
-			CommandEnv:      llm.EnvSpec{Vars: cfg.LLM.CommandEnv, File: cfg.LLM.CommandEnvFile},
-			CommandStartEnv: llm.EnvSpec{Vars: cfg.LLM.CommandStartEnv, File: cfg.LLM.CommandStartEnvFile},
-			TaskGenEnv:      llm.EnvSpec{Vars: cfg.LLM.GenerateTaskEnv, File: cfg.LLM.GenerateTaskEnvFile},
-			TaskGenStartEnv: llm.EnvSpec{Vars: cfg.LLM.GenerateTaskStartEnv, File: cfg.LLM.GenerateTaskStartEnvFile},
-			LearnEnv:        llm.EnvSpec{Vars: cfg.LLM.LearnFromUserEnv, File: cfg.LLM.LearnFromUserEnvFile},
+			BaseEnv:    llm.EnvSpec{Vars: cfg.LLM.Env, File: cfg.LLM.EnvFile},
+			CommandEnv: llm.EnvSpec{Vars: cfg.LLM.CommandEnv, File: cfg.LLM.CommandEnvFile},
+			TaskGenEnv: llm.EnvSpec{Vars: cfg.LLM.GenerateTaskEnv, File: cfg.LLM.GenerateTaskEnvFile},
+			LearnEnv:   llm.EnvSpec{Vars: cfg.LLM.LearnFromUserEnv, File: cfg.LLM.LearnFromUserEnvFile},
 		}
 	}
 

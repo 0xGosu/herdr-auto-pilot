@@ -310,13 +310,7 @@ type LLM struct {
 	// the placeholder yourself only to place it differently, which suppresses
 	// the automatic injection. `codex` mints its own and is never passed one;
 	// hap reads it back from the CLI's startup banner instead.
-	Command []string `toml:"command"`
-	// CommandStart is the argv template used on the FIRST consult per agent
-	// (a fresh agent in a pane, until superseded on the next "detected"
-	// discovery). Same placeholders as Command. Empty inherits Command, so
-	// the feature is opt-in and existing configs are unaffected. A CommandStart
-	// with no Command does NOT enable the LLM — Command alone gates that.
-	CommandStart   []string `toml:"command_start"`
+	Command        []string `toml:"command"`
 	TimeoutSeconds int      `toml:"timeout_seconds"`
 	// AutoActConfidenceThreshold gates acting on an LLM suggestion
 	// automatically (subject to every safety control and the learned-history
@@ -357,29 +351,16 @@ type LLM struct {
 	DeprecatedRewriteFallbackTemplate string `toml:"rewrite_fallback_template,omitempty"`
 	// GenerateTaskCommand is the argv template for the one-shot task
 	// suggestion an idle agent gets when it has NO task source (no declared
-	// [[task_sources]] and nothing inferable from the pane) — or when a
-	// declared source matched but its checklist is fully checked off, AND
-	// GenerateTaskCommandStart is also set (see below). Placeholders: {self},
-	// {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. The suggested task is
-	// read from the CLI's stdout and surfaced as an escalation the operator
-	// confirms (writing a per-agent tasks.md) or dismisses. Empty keeps
-	// today's behavior: idle with no task source escalates as no_task_source
-	// and the plugin never synthesizes a prompt (FR-011); an exhausted
-	// declared source escalates task_source_exhausted (a confirmable @noop
-	// suggestion, "No more pending tasks") instead of sending the templated
-	// "none" prompt.
+	// [[task_sources]] and nothing inferable from the pane). Placeholders:
+	// {self}, {agent_name}, {agent_type}, {pane_excerpt}, {cwd}. The suggested
+	// task is read from the CLI's stdout and surfaced as an escalation the
+	// operator confirms (writing a per-agent tasks.md) or dismisses. Empty
+	// keeps today's behavior: idle with no task source escalates as
+	// no_task_source and the plugin never synthesizes a prompt (FR-011). An
+	// EXHAUSTED declared source always escalates task_source_exhausted (a
+	// confirmable @noop suggestion, "No more pending tasks") — refilling a
+	// list the operator wrote is never automatic.
 	GenerateTaskCommand []string `toml:"task_generate_command"`
-	// GenerateTaskCommandStart is the argv template used on the FIRST task
-	// generation per agent (same first-interaction boundary as CommandStart).
-	// Same placeholders as GenerateTaskCommand. For the no-task-source-at-all
-	// case, empty inherits GenerateTaskCommand (tracked independently of the
-	// consult "first"). For an EXHAUSTED declared source, generating more
-	// tasks instead of escalating requires BOTH GenerateTaskCommand and this
-	// field to be set — a stricter, explicit opt-in, since it replaces
-	// content in a source that already had operator-relevant tasks; a list
-	// already exists in that case, so GenerateTaskCommandStart is never
-	// selected there (only GenerateTaskCommand is used, every time).
-	GenerateTaskCommandStart []string `toml:"task_generate_command_start,omitempty"`
 	// GenerateTaskTimeoutSeconds bounds one task-generation run; zero or
 	// omitted inherits timeout_seconds.
 	GenerateTaskTimeoutSeconds int `toml:"task_generate_timeout_seconds,omitempty"`
@@ -403,12 +384,6 @@ type LLM struct {
 	//
 	// It fires only on a real CORRECTION, never on a confirmation: a confirmed
 	// suggestion means hap was right, so there is no lesson to record.
-	//
-	// There is deliberately NO learn_from_user_command_start variance. The
-	// consult and task-generation pairs use *_start for an agent's FIRST
-	// interaction, which is a property of the agent's lifecycle; a correction
-	// is a property of a mistake, and "the first mistake" carries no different
-	// meaning from the tenth.
 	LearnFromUserCommand []string `toml:"learn_from_user_command,omitempty"`
 	// LearnFromUserTimeoutSeconds bounds one learn-from-user run; zero or
 	// omitted inherits timeout_seconds.
@@ -455,7 +430,7 @@ type LLM struct {
 	// the run (escalation) rather than silently launching without its key.
 	//
 	// Layering, last wins: the daemon's own environment, then EnvFile, Env
-	// (the shared base, applied to all five commands), then the command's
+	// (the shared base, applied to all three commands), then the command's
 	// own *EnvFile and *Env. hap's HAP_* variables are always injected last.
 	// Values support the same placeholders as the command template, minus
 	// {pane_excerpt} (untrusted pane text is never put in the environment).
@@ -466,13 +441,8 @@ type LLM struct {
 	EnvFile string `toml:"env_file,omitempty"`
 	// CommandEnvFile is the `.env` file for Command only.
 	CommandEnvFile string `toml:"command_env_file,omitempty"`
-	// CommandStartEnvFile is the `.env` file for CommandStart only.
-	CommandStartEnvFile string `toml:"command_start_env_file,omitempty"`
 	// GenerateTaskEnvFile is the `.env` file for GenerateTaskCommand only.
 	GenerateTaskEnvFile string `toml:"task_generate_command_env_file,omitempty"`
-	// GenerateTaskStartEnvFile is the `.env` file for
-	// GenerateTaskCommandStart only.
-	GenerateTaskStartEnvFile string `toml:"task_generate_command_start_env_file,omitempty"`
 	// LearnFromUserEnvFile is the `.env` file for LearnFromUserCommand only.
 	LearnFromUserEnvFile string `toml:"learn_from_user_command_env_file,omitempty"`
 
@@ -483,13 +453,8 @@ type LLM struct {
 	Env map[string]string `toml:"env,omitempty"`
 	// CommandEnv is the inline environment for Command only.
 	CommandEnv map[string]string `toml:"command_env,omitempty"`
-	// CommandStartEnv is the inline environment for CommandStart only.
-	CommandStartEnv map[string]string `toml:"command_start_env,omitempty"`
 	// GenerateTaskEnv is the inline environment for GenerateTaskCommand only.
 	GenerateTaskEnv map[string]string `toml:"task_generate_command_env,omitempty"`
-	// GenerateTaskStartEnv is the inline environment for
-	// GenerateTaskCommandStart only.
-	GenerateTaskStartEnv map[string]string `toml:"task_generate_command_start_env,omitempty"`
 	// LearnFromUserEnv is the inline environment for LearnFromUserCommand only.
 	LearnFromUserEnv map[string]string `toml:"learn_from_user_command_env,omitempty"`
 }
@@ -1579,6 +1544,16 @@ type legacyKeys struct {
 		RewriteCommand             *any `toml:"rewrite_command"`
 		RewriteCommandStart        *any `toml:"rewrite_command_start"`
 		RewriteTimeoutSeconds      *any `toml:"rewrite_timeout_seconds"`
+		// The `*_start` command family was removed: an agent's first
+		// interaction no longer selects a different argv template. These six
+		// probes exist only to say so — LLM has no corresponding fields, so
+		// Save drops the keys, and a config carrying them still loads.
+		CommandStart                    *any `toml:"command_start"`
+		CommandStartEnv                 *any `toml:"command_start_env"`
+		CommandStartEnvFile             *any `toml:"command_start_env_file"`
+		GenerateTaskCommandStart        *any `toml:"task_generate_command_start"`
+		GenerateTaskCommandStartEnv     *any `toml:"task_generate_command_start_env"`
+		GenerateTaskCommandStartEnvFile *any `toml:"task_generate_command_start_env_file"`
 	} `toml:"llm"`
 }
 
@@ -1831,6 +1806,21 @@ func Load(path string) (Config, error) {
 		warnOnce("config keys `llm.rewrite_command`, `llm.rewrite_command_start`, and `llm.rewrite_timeout_seconds` are no longer supported and are ignored; set `llm.enable_rewrite_action = true` to have the consult LLM (`llm.command`) rewrite outbound text instead",
 			"path", path)
 	}
+	// The `*_start` command family was removed: an agent's first interaction
+	// used to select a different argv template (and its own environment), which
+	// nothing in the shipped recipes ever set. Detect the removed keys only to
+	// make the change visible; Save omits them because LLM has no corresponding
+	// fields, so `llm.command` / `llm.task_generate_command` now serve every
+	// interaction. One consequence is worth naming: an EXHAUSTED declared task
+	// source used to refill itself when `task_generate_command_start` was also
+	// set, and now always escalates task_source_exhausted.
+	if legacy.LLM.CommandStart != nil || legacy.LLM.CommandStartEnv != nil ||
+		legacy.LLM.CommandStartEnvFile != nil || legacy.LLM.GenerateTaskCommandStart != nil ||
+		legacy.LLM.GenerateTaskCommandStartEnv != nil ||
+		legacy.LLM.GenerateTaskCommandStartEnvFile != nil {
+		warnOnce("config keys `llm.command_start`, `llm.task_generate_command_start` and their `_env`/`_env_file` companions are no longer supported and are ignored; `llm.command` and `llm.task_generate_command` now run on every interaction, and an exhausted declared task source always escalates instead of refilling itself",
+			"path", path)
+	}
 	// Renamed `rewrite_fallback_template` → `rewrite_action_fallback_template`:
 	// migrate only when the new key is unset (a set new key always wins — an
 	// empty canonical value is indistinguishable from absent, and empty means
@@ -2004,9 +1994,7 @@ func (l LLM) EnvSummaries() []LLMEnvSummary {
 	}{
 		{"shared", l.Env, l.EnvFile},
 		{"command", l.CommandEnv, l.CommandEnvFile},
-		{"command_start", l.CommandStartEnv, l.CommandStartEnvFile},
 		{"task_generate_command", l.GenerateTaskEnv, l.GenerateTaskEnvFile},
-		{"task_generate_command_start", l.GenerateTaskStartEnv, l.GenerateTaskStartEnvFile},
 		{"learn_from_user_command", l.LearnFromUserEnv, l.LearnFromUserEnvFile},
 	}
 	var out []LLMEnvSummary

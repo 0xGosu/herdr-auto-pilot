@@ -163,9 +163,6 @@ func (d *Daemon) startTaskListReview(ctx context.Context, s domain.Situation, si
 		}
 	}
 
-	// A review consults the operator's command, but the priming/first-consult
-	// variant is meant for answering pane prompts, not reviewing a task list —
-	// always use the base command (First stays false, same as startActionReview).
 	req := domain.LLMRequest{
 		RequestID: fmt.Sprintf("taskreview-%s-%d", s.AgentID, now.UnixNano()),
 		SessionID: domain.NewSessionID(),

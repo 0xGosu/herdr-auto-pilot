@@ -695,11 +695,11 @@ func buildCommands() {
 				"rule must be before hap answers that situation type on its own.\n" +
 				"`path` prints the config file location, bare, for scripting.\n\n" +
 				"`env` edits the inline environment handed to the LLM CLI, per scope: shared,\n" +
-				"command, command_start, task_generate_command, task_generate_command_start,\n" +
-				"learn_from_user_command. These hold API keys, so no read path ever prints a\n" +
-				"VALUE — `env list` shows names only — and `env set` reads the value from stdin\n" +
-				"unless you pass --value. For values you would rather keep out of config.toml\n" +
-				"entirely, set an env file instead (`hap config set llm.env_file <path>`).\n\n" +
+				"command, task_generate_command, learn_from_user_command. These hold API keys,\n" +
+				"so no read path ever prints a VALUE — `env list` shows names only — and\n" +
+				"`env set` reads the value from stdin unless you pass --value. For values you\n" +
+				"would rather keep out of config.toml entirely, set an env file instead\n" +
+				"(`hap config set llm.env_file <path>`).\n\n" +
 				"The array sections of config.toml have their own topics, since one key=value\n" +
 				"cannot address a list element: `rules` (never-auto patterns), `task-source`,\n" +
 				"`classifier`, `capture-delay`.\n" +

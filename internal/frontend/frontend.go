@@ -2060,8 +2060,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "escalations.auto_accept.idle", TUIEditable: true},
 	{Key: "escalations.auto_accept.unclassifiable", TUIEditable: true},
 	{Key: "safety.disable_never_auto_seed_patterns", TUIEditable: true},
-	{Key: "llm.command"},       // argv template
-	{Key: "llm.command_start"}, // argv template (first consult; inherits command)
+	{Key: "llm.command"}, // argv template
 	{Key: "llm.timeout_seconds", TUIEditable: true},
 	{Key: "llm.auto_act_confidence_threshold", TUIEditable: true},
 	{Key: "llm.pane_excerpt_chars", TUIEditable: true, TUIHidden: true},
@@ -2069,7 +2068,6 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "llm.run_in_agent_cwd", TUIEditable: true, TUIHidden: true},
 	{Key: "llm.rewrite_action_fallback_template", TUIHidden: true}, // template string
 	{Key: "llm.task_generate_command"},                             // argv template (idle task suggestion)
-	{Key: "llm.task_generate_command_start"},                       // argv template (first generation; inherits task_generate_command)
 	{Key: "llm.task_generate_timeout_seconds", TUIEditable: true},
 	{Key: "llm.learn_from_user_command"}, // argv template (lesson after an operator correction)
 	{Key: "llm.learn_from_user_timeout_seconds", TUIEditable: true},
@@ -2079,9 +2077,7 @@ var ConfigFields = []ConfigFieldDef{
 	// summarizes them by name. A path is not a secret.
 	{Key: "llm.env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "llm.command_env_file", TUIEditable: true, TUIHidden: true},
-	{Key: "llm.command_start_env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "llm.task_generate_command_env_file", TUIEditable: true, TUIHidden: true},
-	{Key: "llm.task_generate_command_start_env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "llm.learn_from_user_command_env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "embedding.disabled", TUIEditable: true},
 	{Key: "embedding.model_path"}, // path
@@ -2320,11 +2316,6 @@ func FieldValue(cfg config.Config, key string) string {
 			return "(disabled)"
 		}
 		return JoinCommand(cfg.LLM.Command)
-	case "llm.command_start":
-		if len(cfg.LLM.CommandStart) == 0 {
-			return "(inherits command)"
-		}
-		return JoinCommand(cfg.LLM.CommandStart)
 	case "llm.timeout_seconds":
 		return strconv.Itoa(cfg.LLM.TimeoutSeconds)
 	case "llm.auto_act_confidence_threshold":
@@ -2350,11 +2341,6 @@ func FieldValue(cfg config.Config, key string) string {
 			return "(disabled)"
 		}
 		return JoinCommand(cfg.LLM.GenerateTaskCommand)
-	case "llm.task_generate_command_start":
-		if len(cfg.LLM.GenerateTaskCommandStart) == 0 {
-			return "(inherits task_generate_command)"
-		}
-		return JoinCommand(cfg.LLM.GenerateTaskCommandStart)
 	case "llm.task_generate_timeout_seconds":
 		if cfg.LLM.GenerateTaskTimeoutSeconds <= 0 {
 			return "(inherits timeout_seconds)"
@@ -2374,12 +2360,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return envFileValue(cfg.LLM.EnvFile)
 	case "llm.command_env_file":
 		return envFileValue(cfg.LLM.CommandEnvFile)
-	case "llm.command_start_env_file":
-		return envFileValue(cfg.LLM.CommandStartEnvFile)
 	case "llm.task_generate_command_env_file":
 		return envFileValue(cfg.LLM.GenerateTaskEnvFile)
-	case "llm.task_generate_command_start_env_file":
-		return envFileValue(cfg.LLM.GenerateTaskStartEnvFile)
 	case "llm.learn_from_user_command_env_file":
 		return envFileValue(cfg.LLM.LearnFromUserEnvFile)
 	case "embedding.disabled":
@@ -2627,13 +2609,6 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			}
 			cfg.LLM.Command = argv // empty disables the LLM fallback
 			return nil
-		case "llm.command_start":
-			argv, err := SplitCommand(value)
-			if err != nil {
-				return fmt.Errorf("llm.command_start: %w", err)
-			}
-			cfg.LLM.CommandStart = argv // empty inherits llm.command
-			return nil
 		case "llm.enable_rewrite_action":
 			v, err := strconv.ParseBool(value)
 			if err != nil {
@@ -2661,13 +2636,6 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 				return fmt.Errorf("llm.task_generate_command: %w", err)
 			}
 			cfg.LLM.GenerateTaskCommand = argv // empty disables idle task suggestion
-			return nil
-		case "llm.task_generate_command_start":
-			argv, err := SplitCommand(value)
-			if err != nil {
-				return fmt.Errorf("llm.task_generate_command_start: %w", err)
-			}
-			cfg.LLM.GenerateTaskCommandStart = argv // empty inherits llm.task_generate_command
 			return nil
 		case "llm.task_generate_timeout_seconds":
 			// 0 inherits timeout_seconds at use time (GenerateTaskTimeout());
@@ -2714,14 +2682,8 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 		case "llm.command_env_file":
 			cfg.LLM.CommandEnvFile = strings.TrimSpace(value)
 			return nil
-		case "llm.command_start_env_file":
-			cfg.LLM.CommandStartEnvFile = strings.TrimSpace(value)
-			return nil
 		case "llm.task_generate_command_env_file":
 			cfg.LLM.GenerateTaskEnvFile = strings.TrimSpace(value)
-			return nil
-		case "llm.task_generate_command_start_env_file":
-			cfg.LLM.GenerateTaskStartEnvFile = strings.TrimSpace(value)
 			return nil
 		case "llm.learn_from_user_command_env_file":
 			cfg.LLM.LearnFromUserEnvFile = strings.TrimSpace(value)

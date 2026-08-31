@@ -47,9 +47,6 @@ func respondReview(h *harness, calls *atomic.Int32, score int, answer func(req d
 		if !req.ActionReview || req.ProposedAction == "" {
 			return nil, errors.New("expected an action-review consult with a proposed action")
 		}
-		if req.First {
-			return nil, errors.New("action reviews must not consume the first-consult priming")
-		}
 		action, err := answer(req)
 		if err != nil {
 			return nil, err

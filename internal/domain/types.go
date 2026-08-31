@@ -193,10 +193,9 @@ const (
 	ReasonShadowMode        EscalateReason = "shadow_mode"
 	ReasonNoTaskSource      EscalateReason = "no_task_source"
 	// ReasonTaskSourceExhausted: a declared task source matched but every
-	// item is checked off. Not retryable — the operator confirms or
-	// dismisses it (or, when both task_generate_command and
-	// task_generate_command_start are configured, the plugin generates more
-	// tasks instead of escalating this reason at all).
+	// item is checked off. Not retryable — the operator confirms or dismisses
+	// it, and the list is never refilled automatically: rewriting a list the
+	// operator wrote is their call.
 	ReasonTaskSourceExhausted EscalateReason = "task_source_exhausted"
 	// ReasonNoopVsPendingTasks: the learned plurality says "do nothing" but
 	// the agent's declared task source still has pending items. The source
@@ -833,10 +832,6 @@ type LLMRequest struct {
 	ContextJSON string
 	Status      string // pending | done | expired
 	CreatedAt   time.Time
-	// First marks this as the agent's first consult this daemon lifetime,
-	// selecting llm.command_start when configured. Transient: it drives adapter
-	// template selection and is not persisted with the staged request.
-	First bool
 	// TaskReview marks this consult as a pre-send review of a declared task
 	// (not an answer to a pane prompt): the LLM decides whether the proposed
 	// task should be sent to the idle agent now. Transient; drives the decline
