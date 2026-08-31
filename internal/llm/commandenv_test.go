@@ -1,8 +1,8 @@
 package llm
 
 // Tests that each command template is spawned with ITS OWN environment: the
-// four templates (command, command_start, task_generate_command,
-// task_generate_command_start) can point at different providers, so a run must
+// templates (command, task_generate_command, learn_from_user_command) can
+// point at different providers, so a run must
 // never inherit another command's credentials.
 
 import (
@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -46,31 +45,6 @@ func TestGenerateTaskUsesPerCommandEnv(t *testing.T) {
 	want := "SHARED=base\nPROVIDER=from-vars\nONLY_TASKGEN=yes"
 	if got != want {
 		t.Errorf("child env = %q, want %q", got, want)
-	}
-}
-
-func TestGenerateTaskStartTemplateGetsItsOwnEnv(t *testing.T) {
-	script := envEchoScript(t, "WHICH")
-	a := &Adapter{
-		TaskGenTemplate:      []string{script},
-		TaskGenStartTemplate: []string{script},
-		TaskGenTimeout:       5 * time.Second,
-		TaskGenEnv:           EnvSpec{Vars: map[string]string{"WHICH": "base"}},
-		TaskGenStartEnv:      EnvSpec{Vars: map[string]string{"WHICH": "start"}},
-	}
-	first, err := a.GenerateTask(context.Background(), domain.TaskGenRequest{First: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != "WHICH=start" {
-		t.Errorf("first generation env = %q, want the start template's env", first)
-	}
-	later, err := a.GenerateTask(context.Background(), domain.TaskGenRequest{First: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if later != "WHICH=base" {
-		t.Errorf("later generation env = %q, want the base template's env", later)
 	}
 }
 
@@ -137,86 +111,6 @@ func TestConsultUsesPerCommandEnv(t *testing.T) {
 	want := "PROVIDER=from-file AGENT=agent-brave-otter REQ=req-env"
 	if got != want {
 		t.Errorf("child env = %q, want %q", got, want)
-	}
-}
-
-func TestConsultFastFailRetryUsesAlternateTemplatesEnv(t *testing.T) {
-	// The rescue run must carry the ALTERNATE template's environment — mixing
-	// one command's argv with another's key is exactly what a per-command env
-	// is meant to prevent.
-	dir := t.TempDir()
-	logFile := filepath.Join(dir, "log")
-	sentinel := filepath.Join(dir, "sentinel")
-	script := writeScript(t, fmt.Sprintf(
-		"printf '%%s:%%s ' \"$1\" \"$WHICH_ENV\" >> %s\nif [ \"$1\" = start ]; then touch %s; exit 0; fi\nexit 1\n",
-		logFile, sentinel))
-	a := &Adapter{
-		CommandTemplate:      []string{script, "base"},
-		CommandStartTemplate: []string{script, "start"},
-		Timeout:              5 * time.Second,
-		DBPath:               filepath.Join(dir, "hap.db"),
-		SelfPath:             "/bin/true",
-		Store:                gatedStore{sentinel: sentinel, requestID: "req-r"},
-		CommandEnv:           EnvSpec{Vars: map[string]string{"WHICH_ENV": "base-env"}},
-		CommandStartEnv:      EnvSpec{Vars: map[string]string{"WHICH_ENV": "start-env"}},
-	}
-	if _, err := a.Consult(context.Background(), domain.LLMRequest{RequestID: "req-r", CreatedAt: time.Now()}); err != nil {
-		t.Fatal(err)
-	}
-	got := markers(t, logFile)
-	want := []string{"base:base-env", "start:start-env"}
-	if !slices.Equal(got, want) {
-		t.Errorf("runs = %v, want %v", got, want)
-	}
-}
-
-func TestConsultRetriesWhenOnlyTheEnvDiffers(t *testing.T) {
-	// The two templates may be the same CLI invocation with a different key
-	// or model — differing only in environment. That is exactly the case the
-	// fast-fail retry should still cover.
-	dir := t.TempDir()
-	logFile := filepath.Join(dir, "log")
-	sentinel := filepath.Join(dir, "sentinel")
-	script := writeScript(t, fmt.Sprintf(
-		"printf '%%s ' \"$WHICH_ENV\" >> %s\nif [ \"$WHICH_ENV\" = start-env ]; then touch %s; exit 0; fi\nexit 1\n",
-		logFile, sentinel))
-	a := &Adapter{
-		CommandTemplate:      []string{script},
-		CommandStartTemplate: []string{script}, // identical argv
-		Timeout:              5 * time.Second,
-		DBPath:               filepath.Join(dir, "hap.db"),
-		SelfPath:             "/bin/true",
-		Store:                gatedStore{sentinel: sentinel, requestID: "req-e"},
-		CommandEnv:           EnvSpec{Vars: map[string]string{"WHICH_ENV": "base-env"}},
-		CommandStartEnv:      EnvSpec{Vars: map[string]string{"WHICH_ENV": "start-env"}},
-	}
-	if _, err := a.Consult(context.Background(), domain.LLMRequest{RequestID: "req-e", CreatedAt: time.Now()}); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := markers(t, logFile), []string{"base-env", "start-env"}; !slices.Equal(got, want) {
-		t.Errorf("runs = %v, want %v — a differing env must still trigger the retry", got, want)
-	}
-}
-
-func TestConsultDoesNotRetryIdenticalCommandAndEnv(t *testing.T) {
-	dir := t.TempDir()
-	logFile := filepath.Join(dir, "log")
-	script := writeScript(t, "printf 'x ' >> "+logFile+"\nexit 1\n")
-	a := &Adapter{
-		CommandTemplate:      []string{script},
-		CommandStartTemplate: []string{script},
-		Timeout:              5 * time.Second,
-		DBPath:               filepath.Join(dir, "hap.db"),
-		SelfPath:             "/bin/true",
-		Store:                gatedStore{sentinel: filepath.Join(dir, "never"), requestID: "req-i"},
-		CommandEnv:           EnvSpec{Vars: map[string]string{"WHICH_ENV": "same"}},
-		CommandStartEnv:      EnvSpec{Vars: map[string]string{"WHICH_ENV": "same"}},
-	}
-	if _, err := a.Consult(context.Background(), domain.LLMRequest{RequestID: "req-i", CreatedAt: time.Now()}); err == nil {
-		t.Fatal("expected the consult to fail")
-	}
-	if got := markers(t, logFile); len(got) != 1 {
-		t.Errorf("runs = %v, want exactly one — an identical alternate is not retried", got)
 	}
 }
 
@@ -303,4 +197,15 @@ func TestInlineEnvKeyMustBeValid(t *testing.T) {
 			t.Errorf("key %q: expected the run to fail on an invalid variable name", key)
 		}
 	}
+}
+
+// readOptional returns the file's contents, or "" when it does not exist (a
+// script that never ran writes nothing).
+func readOptional(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }

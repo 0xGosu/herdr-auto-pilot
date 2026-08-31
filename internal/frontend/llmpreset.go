@@ -125,10 +125,7 @@ const (
 var LLMPresetNames = []string{LLMPresetClaude, LLMPresetCodex}
 
 // llmCommandPresets maps a config key to its per-CLI recipe. A key absent
-// here has no preset — deliberately including llm.command_start and
-// llm.task_generate_command_start, which render "(inherits …)": an unset
-// *_start key is a WORKING state that reuses its base command, not a
-// disabled one, so there is nothing to bootstrap.
+// here has no preset.
 var llmCommandPresets = map[string]map[string][]string{
 	LLMCommandKey: {
 		LLMPresetClaude: {
@@ -275,29 +272,6 @@ func LLMCommandUnset(cfg config.Config, key string) (unset, ok bool) {
 		return false, false
 	}
 	return len(*argv) == 0, true
-}
-
-// LLMPresetFollowUp returns the one thing a preset installs only HALF of, or
-// "" when the key is complete on its own. Both front-ends print it, from here,
-// so the CLI and the TUI cannot drift on what a preset leaves undone.
-//
-// Only task generation has such a half. Setting llm.task_generate_command
-// turns on task SUGGESTION for an idle agent with no source at all, but
-// REFILLING a declared source whose checklist is fully checked off requires
-// llm.task_generate_command_start to be set as well (domain.Decide, the
-// task_source_exhausted branch). That second key is a deliberately stricter
-// opt-in — refill replaces content in a list the operator wrote — so a preset
-// must not set it on the operator's behalf. It can, and must, say it exists:
-// an unset *_start key reads "(inherits task_generate_command)", which looks
-// like it is already covered, and the missing behavior would otherwise show up
-// only as an escalation months later on a list that quietly stopped refilling.
-func LLMPresetFollowUp(key string) string {
-	if key != LLMTaskGenerateCommandKey {
-		return ""
-	}
-	return "this turns on task suggestion for an idle agent with no task source; refilling an EXHAUSTED " +
-		"declared source additionally needs llm.task_generate_command_start (a separate opt-in — it rewrites " +
-		"a list you wrote), which reads \"(inherits …)\" until you set it in config.toml"
 }
 
 // ApplyLLMPreset installs the named built-in recipe into key, VERBATIM.

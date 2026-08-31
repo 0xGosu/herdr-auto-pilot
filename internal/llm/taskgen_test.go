@@ -58,39 +58,6 @@ printf 'cwd=%s\n' "$HAP_CWD" >> `+argvFile+"\necho 'Investigate the flaky auth t
 	}
 }
 
-func TestGenerateTaskUsesStartTemplateOnFirst(t *testing.T) {
-	script := writeScript(t, `printf '%s' "$1"`+"\n")
-	a := &Adapter{
-		TaskGenTemplate:      []string{script, "base"},
-		TaskGenStartTemplate: []string{script, "start"},
-		TaskGenTimeout:       5 * time.Second,
-	}
-	first, err := a.GenerateTask(context.Background(), domain.TaskGenRequest{First: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != "start" {
-		t.Errorf("first generation marker = %q, want start", first)
-	}
-	later, err := a.GenerateTask(context.Background(), domain.TaskGenRequest{First: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if later != "base" {
-		t.Errorf("later generation marker = %q, want base", later)
-	}
-
-	// No start template → First=true falls back to the base template.
-	b := &Adapter{TaskGenTemplate: []string{script, "base"}, TaskGenTimeout: 5 * time.Second}
-	got, err := b.GenerateTask(context.Background(), domain.TaskGenRequest{First: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "base" {
-		t.Errorf("empty start template must fall back to base, got %q", got)
-	}
-}
-
 func TestGenerateTaskEmptyOutputErrors(t *testing.T) {
 	script := writeScript(t, "echo 'why it failed' >&2\nexit 0\n")
 	a := &Adapter{TaskGenTemplate: []string{script}, TaskGenTimeout: 5 * time.Second}

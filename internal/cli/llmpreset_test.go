@@ -36,9 +36,6 @@ func TestConfigSetPresetInstallsTheRecipe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "llm.task_generate_command_start") {
-		t.Errorf("output %q does not name the second opt-in refill still needs", out)
-	}
 	want, _ := frontend.LLMPreset(frontend.LLMTaskGenerateCommandKey, frontend.LLMPresetCodex)
 	if !reflect.DeepEqual(cfg.LLM.GenerateTaskCommand, want) {
 		t.Fatalf("argv on disk\n got %#v\nwant %#v", cfg.LLM.GenerateTaskCommand, want)
@@ -108,16 +105,15 @@ func TestConfigSetPresetRefusals(t *testing.T) {
 		}
 	})
 	t.Run("argv field without presets still takes the literal", func(t *testing.T) {
-		// llm.command_start is an argv template with no preset — an unset one
-		// INHERITS llm.command, so there is nothing disabled to bootstrap. It
-		// keeps the historical pass-through like every other non-preset key.
+		// llm.rewrite_action_fallback_template has no preset, so it keeps the
+		// historical pass-through like every other non-preset key.
 		app, _ := testApp(t)
-		if _, err := run(t, app, "config", "set", "llm.command_start", "--preset", "claude"); err != nil {
+		if _, err := run(t, app, "config", "set", "llm.rewrite_action_fallback_template", "--preset", "claude"); err != nil {
 			t.Fatal(err)
 		}
 		cfg := mustConfig(t, app)
-		if !reflect.DeepEqual(cfg.LLM.CommandStart, []string{"--preset", "claude"}) {
-			t.Errorf("llm.command_start = %#v, want the literal argv", cfg.LLM.CommandStart)
+		if cfg.LLM.RewriteActionFallbackTemplate != "--preset claude" {
+			t.Errorf("llm.rewrite_action_fallback_template = %q, want the literal value", cfg.LLM.RewriteActionFallbackTemplate)
 		}
 	})
 	t.Run("unknown preset", func(t *testing.T) {

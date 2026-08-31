@@ -1413,7 +1413,7 @@ func TestConfigTUIReadOnlyFieldsNoPrompt(t *testing.T) {
 	cfg.LLM.GenerateTaskCommand = []string{"claude", "-p", "suggest"}
 	cfg.LLM.LearnFromUserCommand = []string{"claude", "-p", "learn"}
 	readOnly := []string{
-		"llm.command", "llm.command_start", "llm.task_generate_command",
+		"llm.command", "llm.task_generate_command",
 		"llm.learn_from_user_command", "embedding.model_path",
 	}
 	for _, key := range readOnly {
@@ -1453,9 +1453,7 @@ func TestConfigTUIHidesAdvancedFields(t *testing.T) {
 		"llm.rewrite_action_fallback_template",
 		"llm.env_file",
 		"llm.command_env_file",
-		"llm.command_start_env_file",
 		"llm.task_generate_command_env_file",
-		"llm.task_generate_command_start_env_file",
 		"embedding.pane_salient_chars",
 		"embedding.warm_timeout_ms",
 	}
@@ -1495,7 +1493,7 @@ func TestConfigLongValueTruncatesToOneLine(t *testing.T) {
 	m := configModel(t, cfg)
 	found := false
 	for _, ln := range strings.Split(m.View(), "\n") {
-		// Trailing space keeps this from also matching "llm.command_start".
+		// Trailing space keeps this from also matching "llm.command_env_file".
 		if !strings.Contains(ln, "llm.command ") {
 			continue
 		}

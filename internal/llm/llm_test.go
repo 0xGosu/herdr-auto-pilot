@@ -52,6 +52,37 @@ func TestConsultPreflightsMissingCommand(t *testing.T) {
 	}
 }
 
+// TestConsultStagedDecisionSurvivesANonzeroExit: a CLI that stages a decision
+// and THEN exits nonzero still yields that decision. ConsultWithSession checks
+// !att.staged() before it ever looks at att.runErr, deliberately — real CLIs do
+// exit nonzero after a successful submit_decision. This was covered only by the
+// fast-fail suite, which went with the command_start retry; every other consult
+// test uses a script that exits 0, so an inverted guard would pass without it.
+func TestConsultStagedDecisionSurvivesANonzeroExit(t *testing.T) {
+	st, db := testStore(t)
+	req := domain.LLMRequest{RequestID: "req-nz", CreatedAt: time.Now()}
+	if _, err := st.StageLLMRequest(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.InsertLLMDecision(context.Background(), domain.LLMDecision{
+		RequestID: "req-nz", Action: "y", Status: "pending", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a := &Adapter{
+		CommandTemplate: []string{writeScript(t, "echo 'submitted, then failed' >&2\nexit 3\n")},
+		Timeout:         5 * time.Second,
+		DBPath:          db, Store: st, SelfPath: "/bin/true",
+	}
+	dec, err := a.Consult(context.Background(), req)
+	if err != nil {
+		t.Fatalf("a staged decision must survive a nonzero exit, got %v", err)
+	}
+	if dec == nil || dec.Action != "y" {
+		t.Fatalf("decision = %+v, want the staged action", dec)
+	}
+}
+
 func TestConsultTimeoutEscalates(t *testing.T) {
 	// NFR-006: consultation is bounded by the timeout, after which the
 	// adapter fails safe (the daemon escalates).
@@ -157,51 +188,6 @@ func TestTemplatePlaceholderExpansion(t *testing.T) {
 		if !strings.Contains(argv, want) {
 			t.Errorf("argv missing %q: %s", want, argv)
 		}
-	}
-}
-
-func TestConsultUsesCommandStartOnFirst(t *testing.T) {
-	st, db := testStore(t)
-	out := filepath.Join(t.TempDir(), "argv.txt")
-	// The script appends its first arg (the marker) so the chosen template
-	// is observable across calls.
-	script := writeScript(t, `echo "$1" >> `+out+"\n")
-	run := func(a *Adapter, reqID string, first bool) {
-		t.Helper()
-		req := domain.LLMRequest{RequestID: reqID, First: first, CreatedAt: time.Now()}
-		st.StageLLMRequest(context.Background(), req)
-		st.InsertLLMDecision(context.Background(), domain.LLMDecision{
-			RequestID: reqID, Action: "ok", Status: "pending", CreatedAt: time.Now(),
-		})
-		if _, err := a.Consult(context.Background(), req); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	a := &Adapter{
-		CommandTemplate:      []string{script, "base"},
-		CommandStartTemplate: []string{script, "start"},
-		Timeout:              5 * time.Second,
-		DBPath:               db, Store: st, SelfPath: "/bin/true",
-	}
-	run(a, "req-1", true)  // first consult → command_start
-	run(a, "req-2", false) // later consult → command
-	if data, _ := os.ReadFile(out); string(data) != "start\nbase\n" {
-		t.Errorf("marker sequence = %q, want start then base", data)
-	}
-
-	// With no start template configured, First=true still uses the base
-	// command — the feature is opt-in.
-	out2 := filepath.Join(t.TempDir(), "argv2.txt")
-	script2 := writeScript(t, `echo "$1" >> `+out2+"\n")
-	b := &Adapter{
-		CommandTemplate: []string{script2, "base"},
-		Timeout:         5 * time.Second,
-		DBPath:          db, Store: st, SelfPath: "/bin/true",
-	}
-	run(b, "req-3", true)
-	if data, _ := os.ReadFile(out2); string(data) != "base\n" {
-		t.Errorf("empty start template must fall back to base, got %q", data)
 	}
 }
 

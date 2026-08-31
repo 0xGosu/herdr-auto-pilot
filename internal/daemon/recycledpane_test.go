@@ -70,9 +70,9 @@ func TestRecycledPaneIsReconciledAsAFreshAgent(t *testing.T) {
 func TestRecycledPaneClearsPaneScopedState(t *testing.T) {
 	// Everything the daemon remembers about the pane's previous occupant is
 	// forgotten, so the newcomer starts clean: it is reconciled, gets the LONG
-	// first-capture delay (its TUI has not painted yet), re-primes its first
-	// consult, and neither inherits a stale cwd nor has its first "working"
-	// transition misread as our own automation.
+	// first-capture delay (its TUI has not painted yet), and neither inherits a
+	// stale cwd nor has its first "working" transition misread as our own
+	// automation.
 	h := recycledFixture(t, "agent-rc2")
 	ctx := context.Background()
 	d := h.daemon
@@ -95,8 +95,6 @@ func TestRecycledPaneClearsPaneScopedState(t *testing.T) {
 	d.mu.Lock()
 	d.episodeHandled["agent-rc2"] = true
 	d.captureStarted["agent-rc2"] = true
-	d.firstConsult["agent-rc2"] = true
-	d.firstTaskGen["agent-rc2"] = true
 	d.lastAutoSend["agent-rc2"] = now
 	d.lastAutoNoop["agent-rc2"] = now
 	d.paneCwds["agent-rc2"] = paneCwdEntry{cwd: "/old/project", at: now}
@@ -113,8 +111,6 @@ func TestRecycledPaneClearsPaneScopedState(t *testing.T) {
 	for name, stale := range map[string]bool{
 		"episodeHandled": d.episodeHandled["agent-rc2"],
 		"captureStarted": d.captureStarted["agent-rc2"],
-		"firstConsult":   d.firstConsult["agent-rc2"],
-		"firstTaskGen":   d.firstTaskGen["agent-rc2"],
 	} {
 		if stale {
 			t.Errorf("%s survived the terminal replacement", name)

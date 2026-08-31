@@ -101,19 +101,20 @@ func TestDecideIdleOperatorNoopStillQuietOnExhaustedSource(t *testing.T) {
 	}
 }
 
-func TestDecideIdleLLMNoopDoesNotBlockExhaustedGeneration(t *testing.T) {
-	// The #175 repro: the LLM answered @noop once on an exhausted list, and
-	// that learned plurality must not park the task_source_exhausted →
-	// generation refill path forever.
+func TestDecideIdleLLMNoopExhaustedStillEscalatesWithGenerateConfigured(t *testing.T) {
+	// The #175 repro, under today's rules: the LLM answered @noop once on an
+	// exhausted list, and that learned plurality must not silently swallow the
+	// exhausted source. It surfaces as its own confirmable escalation — and a
+	// configured task_generate_command does not turn it into a refill, which is
+	// the half the removed task_generate_command_start used to gate.
 	in := baseInput(SituationIdle)
 	in.State = &SignatureState{Mode: ModeShadow}
 	in.History = sourcedHistory(SourceLLM, noopHistory()...)
 	in.DeclaredTask = &DeclaredTask{Task: NoTaskContent}
 	in.GenerateTaskConfigured = true
-	in.GenerateTaskStartConfigured = true
 	d := Decide(in)
-	if d.Action != ActionGenerateTask {
-		t.Fatalf("LLM noop must not block exhausted-source generation, got %+v", d)
+	if d.Action != ActionEscalate || d.Reason != ReasonTaskSourceExhausted {
+		t.Fatalf("exhausted source must escalate as such, got %+v", d)
 	}
 }
 

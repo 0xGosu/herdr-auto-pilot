@@ -45,15 +45,10 @@ func (a *Adapter) GenerateTaskWithSession(ctx context.Context, req domain.TaskGe
 	if err != nil {
 		return "", "", err
 	}
-	// The first generation for an agent uses task_generate_command_start when
-	// configured; an empty start template falls back to the base command.
 	// Auto-repair BEFORE substitution: the normalizer pattern-matches argv
 	// shapes, and substituted pane text is untrusted — it must not be able to
 	// perturb the repair (same fixes as Consult/Rewrite).
 	base, env := a.TaskGenTemplate, a.TaskGenEnv
-	if req.First && len(a.TaskGenStartTemplate) > 0 {
-		base, env = a.TaskGenStartTemplate, a.TaskGenStartEnv
-	}
 	// Session id first, then the adjacency repair: injection appends, and
 	// NormalizeLLMCommand is what puts claude's prompt back beside its -p.
 	// Guarded on a non-empty id — an unexpanded placeholder would become a

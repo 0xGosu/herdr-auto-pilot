@@ -31,10 +31,6 @@ type TaskGenRequest struct {
 	// Cwd is the agent's working directory, for {cwd} — the project the
 	// suggested task should be about.
 	Cwd string
-	// First marks this as the agent's first task generation this daemon
-	// lifetime, selecting llm.task_generate_command_start when configured.
-	// Tracked independently of the consult "first".
-	First bool
 	// SessionID identifies the CLI conversation this generation runs as, and
 	// is what the CLI names its transcript file. See LLMRequest.SessionID —
 	// task generation is the single largest producer of those transcripts, so

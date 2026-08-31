@@ -14,9 +14,9 @@ import (
 )
 
 // This file builds the environment each LLM CLI is spawned with. Every one of
-// the four command templates (command, command_start, task_generate_command,
-// task_generate_command_start) can carry its own variables, either inline in
-// the config or in a `.env` file whose path the operator configures.
+// the command templates (command, task_generate_command,
+// learn_from_user_command) can carry its own variables, either inline in the
+// config or in a `.env` file whose path the operator configures.
 //
 // Values are treated as secrets throughout: they are never logged, never
 // echoed, and never included in an error message. Failures name the file and

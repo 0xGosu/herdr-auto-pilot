@@ -544,11 +544,13 @@ func TestIdleDeclaredTaskExhaustedEscalatesWithoutGenerateConfig(t *testing.T) {
 	}
 }
 
-func TestIdleDeclaredTaskExhaustedRequiresBothGenerateCommands(t *testing.T) {
-	// Generating more tasks for an exhausted declared source needs BOTH
-	// task_generate_command and task_generate_command_start configured — a
-	// stricter opt-in than the no-task-source-at-all case. Only the base
-	// command being set must still escalate, not generate.
+func TestIdleDeclaredTaskExhaustedNeverRefills(t *testing.T) {
+	// An exhausted declared source escalates task_source_exhausted whatever
+	// the LLM config says: rewriting a list the operator wrote is their call,
+	// so task_generate_command — which DOES bootstrap a list for an agent with
+	// no source at all — must not refill one that already exists. Refilling
+	// used to be reachable by also setting task_generate_command_start; that
+	// key is gone, and this is the guard against it coming back by accident.
 	in := autonomous(baseInput(SituationIdle),
 		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
 		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
@@ -556,20 +558,10 @@ func TestIdleDeclaredTaskExhaustedRequiresBothGenerateCommands(t *testing.T) {
 	in.GenerateTaskConfigured = true
 	d := Decide(in)
 	if d.Action != ActionEscalate || d.Reason != ReasonTaskSourceExhausted {
-		t.Fatalf("exhausted declared list with only the base command configured must still escalate, got %+v", d)
+		t.Fatalf("exhausted declared list must escalate, never generate, got %+v", d)
 	}
-}
-
-func TestIdleDeclaredTaskExhaustedGeneratesWhenBothConfigured(t *testing.T) {
-	in := autonomous(baseInput(SituationIdle),
-		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask,
-		ActionNextDeclaredTask, ActionNextDeclaredTask, ActionNextDeclaredTask)
-	in.DeclaredTask = &DeclaredTask{Task: NoTaskContent, Path: "/docs/tasks.md"}
-	in.GenerateTaskConfigured = true
-	in.GenerateTaskStartConfigured = true
-	d := Decide(in)
-	if d.Action != ActionGenerateTask {
-		t.Fatalf("exhausted declared list with both generate commands configured should generate more tasks, got %+v", d)
+	if d.Suggestion != ActionNoopSuggestion {
+		t.Errorf("suggestion = %q, want %q", d.Suggestion, ActionNoopSuggestion)
 	}
 }
 

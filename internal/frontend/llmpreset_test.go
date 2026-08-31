@@ -83,9 +83,8 @@ func TestApplyLLMPresetRefusesAConfiguredKey(t *testing.T) {
 func TestApplyLLMPresetRefusesAnUnknownKeyOrPreset(t *testing.T) {
 	app, _ := testApp(t)
 	ctx := context.Background()
-	// A key with no preset — including the *_start keys, whose unset state
-	// ("inherits …") is a working state with nothing to bootstrap.
-	for _, key := range []string{"llm.command_start", "llm.task_generate_command_start", "embedding.model_path", "nonsense"} {
+	// A key with no preset.
+	for _, key := range []string{"llm.timeout_seconds", "embedding.model_path", "nonsense"} {
 		if _, err := app.ApplyLLMPreset(ctx, key, frontend.LLMPresetClaude); err == nil {
 			t.Errorf("%s accepted a preset", key)
 		}
@@ -122,7 +121,7 @@ func TestLLMCommandUnsetReadsTheStruct(t *testing.T) {
 	if unset, _ := frontend.LLMCommandUnset(cfg, frontend.LLMCommandKey); unset {
 		t.Error("a configured llm.command reads as unset")
 	}
-	if _, ok := frontend.LLMCommandUnset(cfg, "llm.command_start"); ok {
+	if _, ok := frontend.LLMCommandUnset(cfg, "llm.timeout_seconds"); ok {
 		t.Error("a key with no preset reported ok")
 	}
 }
@@ -180,39 +179,5 @@ func TestSamplePresetsMatchTheGoRecipes(t *testing.T) {
 		if !reflect.DeepEqual(c.sample, want) {
 			t.Errorf("%s: sample/config.toml and the claude preset have drifted\nsample %#v\npreset %#v", c.key, c.sample, want)
 		}
-	}
-}
-
-// TestTaskGeneratePresetNamesItsSecondOptIn: installing
-// llm.task_generate_command turns on task SUGGESTION but not refill of an
-// exhausted declared source, which needs llm.task_generate_command_start too
-// (domain.Decide's task_source_exhausted branch). The preset must not set that
-// second key — it rewrites a list the operator wrote — but leaving the gap
-// unsaid is worse than either: an unset *_start reads "(inherits …)", which
-// looks like it is covered.
-func TestTaskGeneratePresetNamesItsSecondOptIn(t *testing.T) {
-	note := frontend.LLMPresetFollowUp(frontend.LLMTaskGenerateCommandKey)
-	if note == "" {
-		t.Fatal("the task-generate preset says nothing about its second opt-in")
-	}
-	if !strings.Contains(note, "llm.task_generate_command_start") {
-		t.Errorf("note %q does not name the key that is still missing", note)
-	}
-	for _, key := range []string{frontend.LLMCommandKey, frontend.LLMLearnFromUserCommandKey} {
-		if frontend.LLMPresetFollowUp(key) != "" {
-			t.Errorf("%s is complete on its own but carries a follow-up note", key)
-		}
-	}
-	// And the preset really does leave that key alone.
-	app, _ := testApp(t)
-	if _, err := app.ApplyLLMPreset(context.Background(), frontend.LLMTaskGenerateCommandKey, frontend.LLMPresetClaude); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := app.Config()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.LLM.GenerateTaskCommandStart) != 0 {
-		t.Errorf("the preset set the stricter opt-in on the operator's behalf: %#v", cfg.LLM.GenerateTaskCommandStart)
 	}
 }

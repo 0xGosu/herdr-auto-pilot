@@ -33,12 +33,10 @@ var configListCommands = map[string]string{
 	// path (they hold API keys), which is a display rule, not a reason to make
 	// them unsettable — `hap config env set` reads the value from stdin so a
 	// token never reaches argv.
-	"llm.env":                             "hap config env set shared",
-	"llm.command_env":                     "hap config env set command",
-	"llm.command_start_env":               "hap config env set command_start",
-	"llm.task_generate_command_env":       "hap config env set task_generate_command",
-	"llm.task_generate_command_start_env": "hap config env set task_generate_command_start",
-	"llm.learn_from_user_command_env":     "hap config env set learn_from_user_command",
+	"llm.env":                         "hap config env set shared",
+	"llm.command_env":                 "hap config env set command",
+	"llm.task_generate_command_env":   "hap config env set task_generate_command",
+	"llm.learn_from_user_command_env": "hap config env set learn_from_user_command",
 }
 
 // configListsExemptFromCLI are list sections deliberately without a command.

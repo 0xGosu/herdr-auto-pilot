@@ -270,24 +270,19 @@ func (a *App) RemoveCaptureDelay(ctx context.Context, agentType string) error {
 // `hap config` prints them. They are the same names config.LLM.EnvSummaries
 // reports, so what a listing shows is what an edit takes.
 var LLMEnvScopes = []string{
-	"shared", "command", "command_start",
-	"task_generate_command", "task_generate_command_start", "learn_from_user_command",
+	"shared", "command", "task_generate_command", "learn_from_user_command",
 }
 
 // llmEnvMap returns a pointer to the inline env table for a scope, so one
-// editor serves all six without a switch per operation.
+// editor serves all four without a switch per operation.
 func llmEnvMap(llm *config.LLM, scope string) (*map[string]string, error) {
 	switch strings.ToLower(strings.TrimSpace(scope)) {
 	case "shared", "":
 		return &llm.Env, nil
 	case "command":
 		return &llm.CommandEnv, nil
-	case "command_start":
-		return &llm.CommandStartEnv, nil
 	case "task_generate_command":
 		return &llm.GenerateTaskEnv, nil
-	case "task_generate_command_start":
-		return &llm.GenerateTaskStartEnv, nil
 	case "learn_from_user_command":
 		return &llm.LearnFromUserEnv, nil
 	}

@@ -1353,7 +1353,6 @@ func TestGenerateTaskConfigKeys(t *testing.T) {
 	os.WriteFile(path, []byte(`[llm]
 timeout_seconds = 120
 task_generate_command = ["claude", "-p", "suggest a task for {agent_name}"]
-task_generate_command_start = ["claude", "-p", "first task for {agent_name}"]
 task_generate_timeout_seconds = 45
 `), 0o600)
 	if cfg, err = Load(path); err != nil {
@@ -1361,9 +1360,6 @@ task_generate_timeout_seconds = 45
 	}
 	if len(cfg.LLM.GenerateTaskCommand) != 3 || cfg.LLM.GenerateTaskCommand[2] != "suggest a task for {agent_name}" {
 		t.Errorf("task_generate_command lost: %v", cfg.LLM.GenerateTaskCommand)
-	}
-	if len(cfg.LLM.GenerateTaskCommandStart) != 3 {
-		t.Errorf("task_generate_command_start lost: %v", cfg.LLM.GenerateTaskCommandStart)
 	}
 	if cfg.LLM.GenerateTaskTimeoutSeconds != 45 || cfg.GenerateTaskTimeout() != 45*time.Second {
 		t.Errorf("explicit generate-task timeout lost: raw=%d effective=%v",
@@ -1376,8 +1372,7 @@ task_generate_timeout_seconds = 45
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rt.LLM.GenerateTaskCommand) != 3 || len(rt.LLM.GenerateTaskCommandStart) != 3 ||
-		rt.LLM.GenerateTaskTimeoutSeconds != 45 {
+	if len(rt.LLM.GenerateTaskCommand) != 3 || rt.LLM.GenerateTaskTimeoutSeconds != 45 {
 		t.Errorf("round trip lost generate-task keys: %+v", rt.LLM)
 	}
 }
@@ -1481,63 +1476,75 @@ ANTHROPIC_MODEL = "haiku"
 	}
 }
 
-// TestLearnFromUserHasNoStartVariance pins the deliberate asymmetry with
-// command/task_generate_command: there is no learn_from_user_command_start,
-// because *_start marks an agent's FIRST interaction and "the first correction"
-// carries no different meaning from the tenth. A future refactor that adds one
-// by symmetry should have to delete this test on purpose.
-func TestLearnFromUserHasNoStartVariance(t *testing.T) {
+// TestNoCommandHasAStartVariance pins the removal of the whole `*_start`
+// family: no LLM command selects a different argv template on an agent's first
+// interaction any more, so no field may declare one — not command_start, not
+// task_generate_command_start, and not the learn_from_user_command_start that
+// was never there. A refactor that reintroduces one by symmetry should have to
+// delete this test on purpose.
+func TestNoCommandHasAStartVariance(t *testing.T) {
 	for _, f := range reflect.VisibleFields(reflect.TypeFor[LLM]()) {
-		tag := f.Tag.Get("toml")
-		if name, _, _ := strings.Cut(tag, ","); name == "learn_from_user_command_start" {
-			t.Fatalf("field %s declares learn_from_user_command_start; the key is deliberately absent", f.Name)
+		name, _, _ := strings.Cut(f.Tag.Get("toml"), ",")
+		if strings.HasSuffix(name, "_start") || strings.Contains(name, "_start_env") {
+			t.Errorf("field %s declares removed key %q", f.Name, name)
 		}
-	}
-	// An unknown key must not silently become one either.
-	path := filepath.Join(t.TempDir(), "config.toml")
-	os.WriteFile(path, []byte("[llm]\nlearn_from_user_command_start = [\"claude\"]\n"), 0o600)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.LLM.LearnFromUserCommand) != 0 {
-		t.Errorf("a _start key must not populate learn_from_user_command, got %v", cfg.LLM.LearnFromUserCommand)
 	}
 }
 
-func TestCommandStartConfigKeys(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.toml")
-
-	// Omitted: the start variant defaults empty (inherits at use time).
-	os.WriteFile(path, []byte("[llm]\ncommand = [\"claude\"]\n"), 0o600)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.LLM.CommandStart) != 0 {
-		t.Errorf("command_start should default empty, got %v", cfg.LLM.CommandStart)
-	}
-
-	// Explicit values are honored and survive a Save/Load round trip.
-	os.WriteFile(path, []byte(`[llm]
-command = ["claude", "-p", "ongoing"]
-command_start = ["claude", "-p", "first: {agent_name}", "--model", "opus"]
-`), 0o600)
-	if cfg, err = Load(path); err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.LLM.CommandStart) != 5 || cfg.LLM.CommandStart[2] != "first: {agent_name}" {
-		t.Errorf("command_start lost: %v", cfg.LLM.CommandStart)
-	}
-	if err := Save(path, cfg); err != nil {
-		t.Fatal(err)
-	}
-	rt, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rt.LLM.CommandStart) != 5 {
-		t.Errorf("round trip lost start keys: %+v", rt.LLM)
+// TestRemovedStartCommandKeysWarnAndDrop pins what happens to a config that
+// still carries the removed `*_start` family: it loads without error, warns
+// naming the survivors, populates nothing, and a Save drops the key.
+//
+// One config PER KEY, deliberately: the Load-time check is one `||` chain over
+// six probes, so a single config carrying all six passes even if five of the
+// toml tags are misspelled.
+func TestRemovedStartCommandKeysWarnAndDrop(t *testing.T) {
+	for _, tc := range []struct {
+		key  string
+		body string
+	}{
+		{"command_start", `command_start = ["claude", "-p", "first: {agent_name}"]`},
+		{"command_start_env_file", `command_start_env_file = "/etc/hap/start.env"`},
+		{"task_generate_command_start", `task_generate_command_start = ["claude", "-p", "first task"]`},
+		{"task_generate_command_start_env_file", `task_generate_command_start_env_file = "/etc/hap/tg_start.env"`},
+		{"command_start_env", "[llm.command_start_env]\nANTHROPIC_API_KEY = \"sk-start\""},
+		{"task_generate_command_start_env", "[llm.task_generate_command_start_env]\nANTHROPIC_API_KEY = \"sk-tg\""},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			// The scalar keys must precede any inline table, so the survivors
+			// are written first and the case body appended.
+			body := "[llm]\ncommand = [\"claude\", \"-p\", \"ongoing\"]\n" +
+				"task_generate_command = [\"claude\", \"-p\", \"suggest\"]\n" + tc.body + "\n"
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, logs, err := loadWithLogs(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(logs, "command_start") {
+				t.Errorf("load did not warn about removed key %s, logs: %s", tc.key, logs)
+			}
+			// The surviving commands are untouched by their removed twins.
+			if len(cfg.LLM.Command) != 3 || cfg.LLM.Command[2] != "ongoing" {
+				t.Errorf("llm.command lost: %v", cfg.LLM.Command)
+			}
+			if len(cfg.LLM.GenerateTaskCommand) != 3 {
+				t.Errorf("llm.task_generate_command lost: %v", cfg.LLM.GenerateTaskCommand)
+			}
+			// A Save rewrites the file without the removed key.
+			if err := Save(path, cfg); err != nil {
+				t.Fatal(err)
+			}
+			saved, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(saved), tc.key) {
+				t.Errorf("Save kept removed key %q:\n%s", tc.key, saved)
+			}
+		})
 	}
 }
 
@@ -2031,12 +2038,8 @@ func TestLLMCommandEnvRoundTrip(t *testing.T) {
 	cfg.LLM.Env = map[string]string{"ANTHROPIC_BASE_URL": "https://example.test"}
 	cfg.LLM.CommandEnvFile = "/etc/hap/consult.env"
 	cfg.LLM.CommandEnv = map[string]string{"ANTHROPIC_MODEL": "opus"}
-	cfg.LLM.CommandStartEnvFile = "/etc/hap/start.env"
-	cfg.LLM.CommandStartEnv = map[string]string{"ANTHROPIC_MODEL": "sonnet"}
 	cfg.LLM.GenerateTaskEnvFile = "/etc/hap/taskgen.env"
 	cfg.LLM.GenerateTaskEnv = map[string]string{"ANTHROPIC_MODEL": "haiku"}
-	cfg.LLM.GenerateTaskStartEnvFile = "/etc/hap/taskgen_start.env"
-	cfg.LLM.GenerateTaskStartEnv = map[string]string{"ANTHROPIC_MODEL": "haiku-start"}
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -2056,9 +2059,7 @@ func TestLLMCommandEnvRoundTrip(t *testing.T) {
 	}{
 		{"shared", got.LLM.EnvFile, got.LLM.Env, "~/.config/hap/llm.env", "https://example.test"},
 		{"command", got.LLM.CommandEnvFile, got.LLM.CommandEnv, "/etc/hap/consult.env", "opus"},
-		{"command_start", got.LLM.CommandStartEnvFile, got.LLM.CommandStartEnv, "/etc/hap/start.env", "sonnet"},
 		{"task_generate", got.LLM.GenerateTaskEnvFile, got.LLM.GenerateTaskEnv, "/etc/hap/taskgen.env", "haiku"},
-		{"task_generate_start", got.LLM.GenerateTaskStartEnvFile, got.LLM.GenerateTaskStartEnv, "/etc/hap/taskgen_start.env", "haiku-start"},
 	} {
 		if tc.file != tc.wantF {
 			t.Errorf("%s env file = %q, want %q", tc.name, tc.file, tc.wantF)
@@ -2104,13 +2105,13 @@ func TestLLMEnvSummariesHideValues(t *testing.T) {
 	cfg.LLM.Env = map[string]string{"ANTHROPIC_BASE_URL": "https://example.test"}
 	cfg.LLM.CommandEnv = map[string]string{"ZZZ_TOKEN": "s3cret", "AAA_KEY": "s3cret"}
 	cfg.LLM.CommandEnvFile = "/etc/hap/consult.env"
-	cfg.LLM.GenerateTaskStartEnvFile = "/etc/hap/taskgen_start.env"
+	cfg.LLM.LearnFromUserEnvFile = "/etc/hap/learn.env"
 
 	got := cfg.LLM.EnvSummaries()
 	if len(got) != 3 {
 		t.Fatalf("summaries = %+v, want only the three configured scopes", got)
 	}
-	if got[0].Scope != "shared" || got[1].Scope != "command" || got[2].Scope != "task_generate_command_start" {
+	if got[0].Scope != "shared" || got[1].Scope != "command" || got[2].Scope != "learn_from_user_command" {
 		t.Errorf("scopes = %+v, want them in command order", got)
 	}
 	if len(got[1].Keys) != 2 || got[1].Keys[0] != "AAA_KEY" || got[1].Keys[1] != "ZZZ_TOKEN" {

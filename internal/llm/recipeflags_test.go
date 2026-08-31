@@ -30,11 +30,9 @@ func TestEveryDocumentedClaudeFlagIsClassifiable(t *testing.T) {
 	}
 
 	recipes := map[string][]string{
-		"command":                     cfg.LLM.Command,
-		"command_start":               cfg.LLM.CommandStart,
-		"task_generate_command":       cfg.LLM.GenerateTaskCommand,
-		"task_generate_command_start": cfg.LLM.GenerateTaskCommandStart,
-		"learn_from_user_command":     cfg.LLM.LearnFromUserCommand,
+		"command":                 cfg.LLM.Command,
+		"task_generate_command":   cfg.LLM.GenerateTaskCommand,
+		"learn_from_user_command": cfg.LLM.LearnFromUserCommand,
 	}
 
 	checked := 0
