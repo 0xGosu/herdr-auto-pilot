@@ -6,9 +6,9 @@ written by `llm.learn_from_user_command`.
 
 ## Lessons for hap's auto-answer assistant
 
-- **Finishing a change means MERGING it.** A green PR is not a delivered PR: once CI is
-  passing and every review comment is answered, squash-merge it yourself
-  (`gh pr merge --squash`, keeping `[skip ci]`-family markers out of the message), then
-  remove the worktree and delete the branch. Don't park a ready branch and wait to be told
-  — hold only when CI is red or still running, a review is requesting changes, or the merge
+- **Finishing a change means MERGING it.** A green PR is not a delivered PR: after pushing,
+  follow CI to a verdict yourself and fix what it reports — failing checks, bot and human
+  review comments — then squash-merge (`gh pr merge --squash`, keeping `[skip ci]`-family
+  markers out of the message), remove the worktree and delete the branch. CI still running
+  or red is never a reason to hand the branch back; hold only when a review or the merge
   turns on a call the operator has not already made.
