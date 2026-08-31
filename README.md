@@ -264,11 +264,16 @@ A learned rule never acts on a situation before you have taught it.
    answer is stronger evidence than an automated observation.
 4. **Stay in control.** Correct any automated decision post-hoc (`hap resolve
    <audit-id> --action …`). The correction is recorded and immediately moves the
-   rule's live confidence gate, but **graduation is permanent** — it never
-   silently demotes an autonomous rule. To retrain one, `hap signatures reset
-   <prefix> --yes` (TUI *Rules* tab: `0`), which keeps the decision history and
-   the learned answer but excludes pre-reset decisions from confidence and
-   graduation, so the rule must earn its confirmations again.
+   rule's live confidence gate, but **graduation is permanent** — nothing
+   automatic ever demotes an autonomous rule. Two explicit operator acts do. To
+   retrain one from nothing, `hap signatures reset <prefix> --yes` (TUI *Rules*
+   tab: `0`), which keeps the decision history and the learned answer but
+   excludes pre-reset decisions from confidence and graduation, so the rule must
+   earn its confirmations again. To move it one notch instead, `hap signatures
+   confirm <prefix> --delta -1` (TUI *Rules* tab: `-`), which lowers the streak
+   and demotes only once it falls below `graduation_n`, changing nothing else —
+   `+`/`--delta 1` is the same nudge upward, and graduates the rule only if its
+   confidence already clears the threshold.
 
 When your first response creates a rule, earlier LLM-only guesses for that
 signature stay in history for audit but do not seed the new rule's confidence.
@@ -288,13 +293,16 @@ hap signatures show approval:9f2c            # situation, recent decisions, last
 hap signatures search "force push"           # keyword substring
 hap signatures search "asking to overwrite the branch" --semantic --min-score 0.3
 hap signatures reset approval:9f2c --yes     # shadow + fresh streak/confidence; history kept
+hap signatures confirm approval:9f2c         # +1 the streak (--delta -1 walks it back)
 hap signatures delete approval:9f2c --yes    # erase the rule and its decisions
 hap signatures reembed [--force]             # after switching embedding model
 ```
 
 The TUI's *Rules* tab shows the same, plus the **original situation** — the pane
 snapshot first captured for the rule — so you can see what a rule answers, not
-just what it sends.
+just what it sends. On a selected rule: `v`/`enter` details · `+`/`-` nudge the
+confirmation streak (and graduate or demote it at `graduation_n`) · `0` reset ·
+`x` delete · `f` filter by mode · `/` search.
 
 ## Configuration
 

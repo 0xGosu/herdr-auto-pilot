@@ -84,7 +84,9 @@ confirmations *and* confidence above the situation's threshold, it graduates
 and hap acts on it unattended. A confirmation carries extra confidence weight
 (`learning.confirmation_weight`, default 2×). **Graduation is permanent** — a
 later correction is recorded and moves live confidence, but never demotes the
-rule. `hap signatures reset` is the only way back to shadow.
+rule. Nothing AUTOMATIC demotes; the two explicit operator acts that do are
+`hap signatures reset` (back to a fresh rule) and `hap signatures confirm
+--delta -1` (one notch down, demoting only below `graduation_n`).
 
 **escalation** — hap is not confident enough (or a safety control refused), so
 the situation is queued for a human instead of answered.
@@ -266,6 +268,8 @@ hap signatures search "approve the file write" --semantic --limit 10 --min-score
 
 hap signatures show approval:9f2c            # situation, recent decisions, last context
 hap signatures reset approval:9f2c --yes     # back to shadow; history KEPT
+hap signatures confirm approval:9f2c         # +1 the streak; no --yes needed
+hap signatures confirm approval:9f2c --delta -1  # walk the streak back one notch
 hap signatures delete approval:9f2c --yes    # erase the rule and its decisions
 hap signatures reembed [--force]             # after changing the embedding model
 ```
@@ -275,8 +279,20 @@ confidence unscored (it reads `conf=-`, not a number, because only post-reset
 decisions count and there are none yet). All decision rows are kept and the
 rule still suggests its learned answer, but pre-reset decisions no longer count
 toward confidence or graduation — it must re-earn `learning.graduation_n`
-confirmations. This is the only way to demote an autonomous rule. `delete`
-erases the rule and its decision history entirely; audit rows are kept.
+confirmations. `delete` erases the rule and its decision history entirely;
+audit rows are kept.
+
+**`confirm` — the graded alternative.** `hap signatures confirm <prefix>
+[--delta N]` moves the confirmation streak by N (default +1) and nothing else:
+the decision rows, the decision floor and the confidence all survive. Reaching
+`graduation_n` graduates the rule only if its live confidence ALSO clears the
+situation's threshold, so `+1` on a rule with no decision history reports
+`no decisions scored yet, so it cannot graduate` rather than promoting it (and
+a rule that IS scored but below its threshold says which numbers). `--delta -1`
+demotes an autonomous rule once the streak falls below `graduation_n` — reach
+for this instead of `reset` when the rule is mostly right and you want it to
+ask once or twice more. There is no `--yes` gate: nothing is destroyed, and the
+opposite delta undoes it.
 
 A `-` in any confidence field means "not scored yet", never a measured `0.00`.
 
@@ -1096,4 +1112,6 @@ key and every action it offers is reachable from the CLI alone. Tabs: Status,
 Agents, Tasks, Escalations, Audit, Rules, Config. `/` searches on most tabs, `v`
 opens a detail view, `space` marks a run for batch actions. The escalation
 detail offers confirm, resolve, dismiss, and **retry LLM** (the twin of
-`hap escalations retry <id>`).
+`hap escalations retry <id>`). On the Rules tab, `+`/`-` nudge the selected
+rule's confirmation streak (the twin of `hap signatures confirm [--delta N]`,
+graduating or demoting it at `graduation_n`) and `0` resets it.

@@ -619,6 +619,7 @@ func buildCommands() {
 				"hap signatures show <sig-or-prefix>",
 				"hap signatures delete <sig-or-prefix> [--yes]",
 				"hap signatures reset <sig-or-prefix> [--yes]",
+				"hap signatures confirm <sig-or-prefix> [--delta N]",
 				"hap signatures reembed [--force]",
 			},
 			Flags: []FlagDoc{
@@ -630,6 +631,7 @@ func buildCommands() {
 				{Name: "--limit", Arg: "N", Default: "20", Desc: "search --semantic: max matches to return"},
 				{Name: "--min-score", Arg: "S", Default: "0.3", Desc: "search --semantic: minimum cosine score in (0,1]; 0 uses the default"},
 				{Name: "--yes", Desc: "delete/reset: skip the interactive confirmation (required when stdin is not a terminal)"},
+				{Name: "--delta", Arg: "N", Default: "1", Desc: "confirm: signed change to the confirmation streak (e.g. -1 to walk it back)"},
 				{Name: "--force", Desc: "reembed: re-run even when no model drift is detected"},
 			},
 			Details: "A signature is one learned situation. `list` shows: short signature, situation,\n" +
@@ -640,17 +642,24 @@ func buildCommands() {
 				"recent decisions — pass any unique prefix. `delete` erases the rule and its\n" +
 				"decisions (audit rows are kept). `reset` keeps the history but returns the rule to\n" +
 				"shadow with a cleared streak and confidence, so it must re-earn graduation — prefer\n" +
-				"it over delete when a rule started answering wrongly. `reembed` re-computes stored\n" +
-				"embeddings after an embedding model change (via the running daemon when there is one).",
+				"it over delete when a rule started answering wrongly. `confirm` nudges the streak\n" +
+				"by --delta instead: reaching graduation N graduates the rule when its confidence\n" +
+				"also clears the threshold, and --delta -1 walks a graduated rule back one notch\n" +
+				"(demoting it below N) while KEEPING its history — the graded alternative to reset.\n" +
+				"`reembed` re-computes stored embeddings after an embedding model change (via\n" +
+				"the running daemon when there is one).",
 			Examples: []string{
 				"hap signatures list --mode autonomous",
 				"hap signatures search \"approve the file write\" --semantic",
 				"hap signatures show a1b2c3",
 				"hap signatures reset a1b2c3 --yes",
+				"hap signatures confirm a1b2c3",
+				"hap signatures confirm a1b2c3 --delta -1",
 			},
 			Next: []Hint{
 				{Cmd: "hap signatures show <prefix>", Why: "the original situation and recent decisions"},
 				{Cmd: "hap signatures reset <prefix> --yes", Why: "back to shadow; it must re-earn graduation"},
+				{Cmd: "hap signatures confirm <prefix> --delta -1", Why: "walk the streak back one notch, history kept"},
 				{Cmd: "hap escalations", Why: "confirming there is what teaches a rule"},
 			},
 			SelfHints: true,
@@ -1101,6 +1110,7 @@ var workflows = []struct {
 			"hap signatures list --mode autonomous # rules acting without asking",
 			"hap signatures show <prefix>          # the situation and its recent decisions",
 			"hap signatures reset <prefix> --yes   # back to shadow; must re-earn graduation",
+			"hap signatures confirm <prefix>       # +1 the streak (--delta -1 walks it back)",
 			"hap signatures delete <prefix> --yes  # erase the rule entirely",
 		},
 	},

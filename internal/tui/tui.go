@@ -2583,6 +2583,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.tab == tabSignatures {
 			return m.resetGraduationPrompt()
 		}
+	// A streak nudge, the graded counterpart to `0`. Deliberately unprompted:
+	// `x` and `0` type-'yes' because they destroy history, while this is
+	// reversible by the opposite key — gating it would make the feature useless.
+	case "+":
+		if m.tab == tabSignatures {
+			return m.adjustSignatureConfirmations(1)
+		}
+	case "-":
+		if m.tab == tabSignatures {
+			return m.adjustSignatureConfirmations(-1)
+		}
 	case "X":
 		switch m.tab {
 		case tabEscalations:
@@ -4978,6 +4989,34 @@ func (m Model) resetGraduationPrompt() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// adjustSignatureConfirmations moves the selected rule's confirmation streak by
+// delta (the `+`/`-` keys) and re-evaluates its mode: reaching graduation_n
+// graduates it when live confidence also clears the threshold, and falling
+// below graduation_n demotes a graduated rule back to shadow. Decision history,
+// the decision floor and the cached snapshot all survive — `0` remains the
+// harder reset.
+//
+// The reported message carries the resulting streak AND the mode, because
+// graduation_n defaults to 1: on a rule with no decision history the very first
+// `+` reaches N and still does not graduate (LiveConfidence is 0), which reads
+// as a dead key unless the status line says why.
+func (m Model) adjustSignatureConfirmations(delta int) (tea.Model, tea.Cmd) {
+	row := m.selectedSignature()
+	if row == nil {
+		return m, nil
+	}
+	sig, app := row.Signature, m.app
+	m.beginAction()
+	// doResult supplies the Model's own ctx, so nothing is captured here.
+	return m, m.doResult(func(ctx context.Context) (string, error) {
+		got, err := app.AdjustSignatureConfirmations(ctx, sig, delta)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s %s", shortSig(got.Signature), got.Summary()), nil
+	})
+}
+
 // signatureDetailLines renders the full-record overlay for one signature.
 func (m Model) signatureDetailLines(row frontend.SignatureRow, history []domain.DecisionRecord, graduationN, w int, expanded bool) []string {
 	var lines []string
@@ -6246,7 +6285,7 @@ func (m Model) helpLine() string {
 	case tabAudit:
 		return "c: correct decision  v: details  t: see rule  /: search  " + common
 	case tabSignatures:
-		return "enter/v: details  x: delete  0: reset  f: filter mode  /: search  " + common
+		return "enter/v: details  x: delete  0: reset  +/-: streak  f: filter mode  /: search  " + common
 	case tabConfig:
 		return "enter: edit/run shortcut  e: edit field/source  a: add pattern  t: add task source  x: remove  X: clear data  " + common
 	case tabKill:
