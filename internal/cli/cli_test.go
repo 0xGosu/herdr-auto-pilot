@@ -2848,3 +2848,91 @@ func TestAuditSurfacesAutoAcceptStatusesAndReasons(t *testing.T) {
 		t.Errorf("the raw auto_accepted status leaked instead of its label:\n%s", out)
 	}
 }
+
+func TestSignaturesConfirm(t *testing.T) {
+	app, st := testApp(t)
+	seedSignatures(t, st)
+	ctx := context.Background()
+
+	// approval:aaaa… is seeded shadow with a streak of 3 and two unanimous
+	// operator decisions, so its LIVE confidence is 1.00 — past the 0.70
+	// approval threshold. graduation_n defaults to 1, so one `+` graduates it.
+	out, err := run(t, app, "signatures", "confirm", "approval:aaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "streak 4/1") || !strings.Contains(out, "graduated to autonomous") {
+		t.Errorf("confirm output should name the streak and the promotion:\n%s", out)
+	}
+	sig, _ := st.GetSignature(ctx, "approval:aaaa1111bbbb2222")
+	if sig == nil || sig.Mode != domain.ModeAutonomous || sig.ConsecutiveConfirmations != 4 {
+		t.Fatalf("confirm must persist the streak and the mode: %+v", sig)
+	}
+	// A nudge is not a reset: the snapshot and the decision floor survive it.
+	if sig.CachedConfidence != 0.75 || sig.DecisionFloorID != 0 {
+		t.Errorf("confirm must not clear confidence or stamp a floor: conf=%.2f floor=%d",
+			sig.CachedConfidence, sig.DecisionFloorID)
+	}
+	if decs, _ := st.DecisionsForSignature(ctx, "approval:aaaa1111bbbb2222", 10); len(decs) != 2 {
+		t.Errorf("confirm must keep decision history, got %d", len(decs))
+	}
+
+	// choice:cccc3333 is seeded autonomous with a streak of 5. Walking it down
+	// to 4 leaves it graduated (still ≥ N); only dropping below N demotes.
+	if _, err := run(t, app, "signatures", "confirm", "choice:", "--delta", "-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetSignature(ctx, "choice:cccc3333"); got.Mode != domain.ModeAutonomous {
+		t.Fatalf("still at or above N must stay autonomous, got %s", got.Mode)
+	}
+	out, err = run(t, app, "signatures", "confirm", "choice:", "--delta", "-4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "streak 0/1") || !strings.Contains(out, "demoted to shadow") {
+		t.Errorf("confirm --delta should name the demotion:\n%s", out)
+	}
+	if got, _ := st.GetSignature(ctx, "choice:cccc3333"); got.Mode != domain.ModeShadow {
+		t.Fatalf("dropping below N must demote, got %s", got.Mode)
+	}
+
+	// choice:cccc3333 has no decisions at all, so its live confidence is 0:
+	// the streak reaches N and the rule stays shadow. That has to be SAID, or
+	// the operator reads a working command as a dead one.
+	out, err = run(t, app, "signatures", "confirm", "choice:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "streak 1/1") || !strings.Contains(out, "no decisions scored yet") {
+		t.Errorf("a confidence-blocked confirm must explain itself:\n%s", out)
+	}
+	// An unscored rule reads as "never scored", never as a measured 0.00 — the
+	// same convention every other confidence field in the CLI follows.
+	if strings.Contains(out, "0.00") {
+		t.Errorf("an unscored rule must not print a measured 0.00:\n%s", out)
+	}
+	if got, _ := st.GetSignature(ctx, "choice:cccc3333"); got.Mode != domain.ModeShadow {
+		t.Errorf("no confidence must block graduation, got %s", got.Mode)
+	}
+
+	// Flag-before-positional must still find the target: splitLeadingID skips a
+	// leading "-", and flag.Parse stops at the first non-flag argument, so the
+	// prefix is recovered from fs.Arg(0). `reset` never had a value-taking flag
+	// to expose this interaction.
+	out, err = run(t, app, "signatures", "confirm", "--delta", "-1", "choice:")
+	if err != nil {
+		t.Fatalf("flag before the positional must still resolve the target: %v", err)
+	}
+	if !strings.Contains(out, "signature choice:cccc3333") || !strings.Contains(out, "streak 0/1") {
+		t.Errorf("flag-first confirm output:\n%s", out)
+	}
+
+	// A no-op delta is refused rather than silently rewriting the row.
+	if _, err := run(t, app, "signatures", "confirm", "choice:", "--delta", "0"); err == nil {
+		t.Error("--delta 0 must be refused")
+	}
+	// And the verb needs a target.
+	if _, err := run(t, app, "signatures", "confirm"); err == nil {
+		t.Error("confirm without a signature must print usage")
+	}
+}

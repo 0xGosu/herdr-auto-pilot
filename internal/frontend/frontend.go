@@ -4832,6 +4832,150 @@ func (a *App) ResetSignatureGraduation(ctx context.Context, prefix string) (stri
 	return sig, nil
 }
 
+// SignatureAdjustment reports the outcome of a manual streak nudge. It carries
+// the numbers rather than a rendered sentence so the TUI's status line and
+// `hap signatures confirm` say the same thing from the same fields — including
+// the confidence pair, which is the ONLY way an operator can tell "the streak
+// reached N but the rule stayed shadow" apart from a key that did nothing.
+type SignatureAdjustment struct {
+	Signature     string
+	Confirmations int
+	GraduationN   int
+	Mode          domain.Mode
+	PreviousMode  domain.Mode
+	// Confidence is the LIVE score the graduation gate was evaluated against
+	// (domain.LiveConfidence over post-floor history), and Threshold the value
+	// for this rule's situation type.
+	Confidence float64
+	Threshold  float64
+}
+
+// Graduated reports that this adjustment promoted the rule.
+func (a SignatureAdjustment) Graduated() bool {
+	return a.PreviousMode != domain.ModeAutonomous && a.Mode == domain.ModeAutonomous
+}
+
+// Demoted reports that this adjustment returned the rule to shadow.
+func (a SignatureAdjustment) Demoted() bool {
+	return a.PreviousMode == domain.ModeAutonomous && a.Mode != domain.ModeAutonomous
+}
+
+// ConfidenceBlocked reports the case that otherwise reads as a broken key: the
+// streak clears graduation_n, but the rule is still in shadow because the live
+// confidence did not clear its threshold (FR-006's second condition). On a rule
+// with no post-floor decisions LiveConfidence is 0, so this is what an operator
+// meets the first time they press `+` on a freshly learned rule.
+//
+// It describes the resulting STATE, not the direction of the nudge — a `-` that
+// leaves a shadow rule above N is blocked on exactly the same thing, and saying
+// so is more use than a bare streak.
+func (a SignatureAdjustment) ConfidenceBlocked() bool {
+	return a.Mode == domain.ModeShadow && a.Confirmations >= a.GraduationN
+}
+
+// Summary renders the outcome of a nudge WITHOUT the signature, so the TUI can
+// prefix a shortened key and the CLI the full one while both say the same
+// thing. The confidence pair is spelled out on the blocked branch because that
+// is the only case where the streak moved and the mode did not — the reading an
+// operator would otherwise take for a dead key.
+func (a SignatureAdjustment) Summary() string {
+	streak := fmt.Sprintf("streak %d/%d", a.Confirmations, a.GraduationN)
+	switch {
+	case a.Graduated():
+		return streak + " — graduated to autonomous"
+	case a.Demoted():
+		return streak + " — demoted to shadow"
+	case a.ConfidenceBlocked() && a.Confidence == 0:
+		// A zero score means NEVER SCORED, not a measured 0.00 — the same
+		// convention ConfidenceLabel renders as "-". Printing "0.00 ≤ 0.70"
+		// here would read as a measurement the rule failed rather than as an
+		// absence of evidence, and the fix for the two is different.
+		return fmt.Sprintf("%s (%s; no decisions scored yet, so it cannot graduate)", streak, a.Mode)
+	case a.ConfidenceBlocked():
+		return fmt.Sprintf("%s (%s; confidence %.2f ≤ %.2f blocks graduation)",
+			streak, a.Mode, a.Confidence, a.Threshold)
+	default:
+		return fmt.Sprintf("%s (%s)", streak, a.Mode)
+	}
+}
+
+// AdjustSignatureConfirmations moves a learned rule's confirmation streak by
+// delta (the Rules tab's `+`/`-`, `hap signatures confirm`) and re-evaluates
+// its mode through domain.AdjustConfirmations: reaching graduation_n promotes
+// it only if live confidence also clears the threshold, and falling below
+// graduation_n demotes a graduated rule back to shadow.
+//
+// Unlike ResetSignatureGraduation this keeps the decision history, the decision
+// floor and the cached snapshot — it is a nudge, not a fresh start. Returns the
+// resolved key with the numbers behind the outcome. Nudges the daemon to drop
+// any in-memory state.
+func (a *App) AdjustSignatureConfirmations(ctx context.Context, prefix string, delta int) (SignatureAdjustment, error) {
+	var out SignatureAdjustment
+	sig, err := a.Store.ResolveSignature(ctx, prefix)
+	if err != nil {
+		return out, err
+	}
+	st, err := a.Store.GetSignature(ctx, sig)
+	if err != nil {
+		return out, err
+	}
+	if st == nil {
+		return out, fmt.Errorf("no learned signature %s", sig)
+	}
+	// Config is NOT best-effort here (unlike confirmationWeight, which only
+	// feeds a display): graduation_n and the threshold decide whether this
+	// write changes the rule's MODE, so a silent fallback to defaults could
+	// graduate a rule the operator's own config says is not ready.
+	cfg, err := a.Config()
+	if err != nil {
+		return out, err
+	}
+	// The LIVE score over post-floor history — the same one App.Signatures
+	// computes for the list and the same one the decision core gates on. Never
+	// st.CachedConfidence, which a reset stamps to a fake 1.0.
+	history, err := a.Store.DecisionsForSignature(ctx, sig, 50)
+	if err != nil {
+		return out, err
+	}
+	conf := domain.LiveConfidence(history, st.DecisionFloorID, cfg.Learning.ConfirmationWeight)
+	threshold := confidenceThresholds(cfg).ForType(st.SituationType)
+
+	adjusted := domain.AdjustConfirmations(*st, delta, conf.Score, threshold, cfg.Learning.GraduationN)
+	// UpdatedAt is deliberately NOT stamped. Store.ListSignatures orders by
+	// `updated_at DESC` and the TUI's cursor is a positional index into that
+	// listing with no selection-by-identity machinery, so stamping would float
+	// the nudged rule to the top on the next 2s refresh while the cursor stayed
+	// put — and the operator's SECOND `+` press would silently land on a
+	// different rule. It is also the honest reading: a manual nudge is an
+	// operator annotation, not new learned evidence. The decision rows,
+	// DecisionFloorID and LiveConfidence are all untouched by it, so when the
+	// rule's learned state last changed really has not moved.
+	if err := a.Store.UpsertSignature(ctx, adjusted); err != nil {
+		return out, err
+	}
+	a.nudge(ctx, control.KindReload)
+	return SignatureAdjustment{
+		Signature: sig, Confirmations: adjusted.ConsecutiveConfirmations,
+		GraduationN: cfg.Learning.GraduationN,
+		Mode:        adjusted.Mode, PreviousMode: st.Mode,
+		Confidence: conf.Score, Threshold: threshold,
+	}, nil
+}
+
+// confidenceThresholds maps the config section onto the domain type. Twin of
+// daemon.confidenceThresholds: internal/config does not import internal/domain
+// (so this cannot be a method on the config type) and internal/daemon must not
+// import internal/frontend, so the two front ends each carry the copy.
+func confidenceThresholds(cfg config.Config) domain.ConfidenceThresholds {
+	return domain.ConfidenceThresholds{
+		Minimum:  cfg.ConfidenceThresholds.Minimum,
+		Idle:     cfg.ConfidenceThresholds.Idle,
+		Approval: cfg.ConfidenceThresholds.Approval,
+		Choice:   cfg.ConfidenceThresholds.Choice,
+		Error:    cfg.ConfidenceThresholds.Error,
+	}
+}
+
 // ClearData resets learned history and audit data (DR-004).
 func (a *App) ClearData(ctx context.Context) error {
 	if err := a.Store.ClearLearnedData(ctx); err != nil {

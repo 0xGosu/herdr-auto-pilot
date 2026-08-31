@@ -82,3 +82,95 @@ func TestResetGraduationReturnsToShadow(t *testing.T) {
 		t.Error("signature should re-graduate after N fresh consistent confirmations")
 	}
 }
+
+func TestAdjustConfirmationsGraduatesAtN(t *testing.T) {
+	// The operator's `+` walks a shadow rule up to N; the last one graduates it
+	// because live confidence also clears the threshold.
+	const n = 3
+	state := SignatureState{Mode: ModeShadow, ConsecutiveConfirmations: 1}
+
+	state = AdjustConfirmations(state, 1, 0.95, 0.8, n)
+	if state.Mode != ModeShadow || state.ConsecutiveConfirmations != 2 {
+		t.Fatalf("below N must stay shadow, got mode=%s count=%d", state.Mode, state.ConsecutiveConfirmations)
+	}
+
+	state = AdjustConfirmations(state, 1, 0.95, 0.8, n)
+	if state.Mode != ModeAutonomous || state.ConsecutiveConfirmations != n {
+		t.Fatalf("reaching N with high confidence must graduate, got mode=%s count=%d",
+			state.Mode, state.ConsecutiveConfirmations)
+	}
+}
+
+func TestAdjustConfirmationsRespectsTheConfidenceGate(t *testing.T) {
+	// A raised streak must never outrun FR-006's second condition. This is the
+	// case an operator meets on a rule with no post-floor decisions at all,
+	// where LiveConfidence is 0 — the count moves and the mode does not.
+	const n = 3
+	state := SignatureState{Mode: ModeShadow, ConsecutiveConfirmations: 2}
+
+	state = AdjustConfirmations(state, 1, 0.0, 0.8, n)
+	if state.ConsecutiveConfirmations != n {
+		t.Fatalf("count must still advance, got %d", state.ConsecutiveConfirmations)
+	}
+	if state.Mode != ModeShadow {
+		t.Error("low confidence must block graduation even once the streak reaches N")
+	}
+
+	// Pushing further does not eventually force it through.
+	state = AdjustConfirmations(state, 5, 0.0, 0.8, n)
+	if state.Mode != ModeShadow {
+		t.Errorf("no streak may buy graduation past the confidence gate, got %s", state.Mode)
+	}
+}
+
+func TestAdjustConfirmationsDemotesBelowN(t *testing.T) {
+	// The operator's `-` is the graded counterpart to reset: it walks the
+	// streak down and demotes once it no longer clears N, WITHOUT touching the
+	// decision floor or the cached snapshot the way ResetGraduation does.
+	const n = 3
+	state := SignatureState{
+		Mode: ModeAutonomous, ConsecutiveConfirmations: 4,
+		CachedConfidence: 0.42, DecisionFloorID: 77, GuardState: "held",
+	}
+
+	state = AdjustConfirmations(state, -1, 0.95, 0.8, n)
+	if state.Mode != ModeAutonomous || state.ConsecutiveConfirmations != 3 {
+		t.Fatalf("still at N must stay autonomous, got mode=%s count=%d", state.Mode, state.ConsecutiveConfirmations)
+	}
+
+	state = AdjustConfirmations(state, -1, 0.95, 0.8, n)
+	if state.Mode != ModeShadow {
+		t.Fatalf("dropping below N must demote to shadow, got %s", state.Mode)
+	}
+	if state.ConsecutiveConfirmations != 2 {
+		t.Fatalf("demotion must not zero the streak, got %d", state.ConsecutiveConfirmations)
+	}
+	if state.CachedConfidence != 0.42 || state.DecisionFloorID != 77 || state.GuardState != "held" {
+		t.Errorf("a nudge must leave history untouched, got conf=%.2f floor=%d guard=%q",
+			state.CachedConfidence, state.DecisionFloorID, state.GuardState)
+	}
+}
+
+func TestAdjustConfirmationsFloorsAtZero(t *testing.T) {
+	// graduation_n DEFAULTS TO 1, so the arithmetic here is degenerate enough
+	// that an off-by-one reads as working. Assert the floor explicitly at the
+	// default N as well as a larger one.
+	for _, n := range []int{1, 5} {
+		state := SignatureState{Mode: ModeShadow, ConsecutiveConfirmations: 0}
+		state = AdjustConfirmations(state, -1, 0.99, 0.8, n)
+		if state.ConsecutiveConfirmations != 0 {
+			t.Errorf("n=%d: streak must floor at 0, got %d", n, state.ConsecutiveConfirmations)
+		}
+		if state.Mode != ModeShadow {
+			t.Errorf("n=%d: a floored shadow rule must not graduate, got %s", n, state.Mode)
+		}
+
+		// And a big negative delta from a graduated rule floors the same way.
+		grad := SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 2}
+		grad = AdjustConfirmations(grad, -99, 0.99, 0.8, n)
+		if grad.ConsecutiveConfirmations != 0 || grad.Mode != ModeShadow {
+			t.Errorf("n=%d: an over-decrement must floor at 0 and demote, got mode=%s count=%d",
+				n, grad.Mode, grad.ConsecutiveConfirmations)
+		}
+	}
+}

@@ -6074,3 +6074,193 @@ func TestAcceptingAGeneratedTaskAppendsItsSource(t *testing.T) {
 			cfg.TaskSources[0].Agent, cfg.TaskSources[1].Agent)
 	}
 }
+
+// seedAdjustable stores one shadow rule plus `decisions` consistent operator
+// confirmations, so LiveConfidence clears the approval threshold and the only
+// thing standing between the rule and graduation is its streak.
+func seedAdjustable(t *testing.T, st *store.Store, sig string, decisions int) time.Time {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: sig, SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, ConsecutiveConfirmations: 0,
+		CachedConfidence: 0.4, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < decisions; i++ {
+		if _, err := st.RecordDecision(ctx, domain.DecisionRecord{Signature: sig,
+			SituationType: domain.SituationApproval, AgentType: "claude",
+			ChosenAction: "1", Source: domain.SourceOperator, CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return now
+}
+
+func TestAdjustSignatureConfirmationsThroughApp(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	seedAdjustable(t, st, "approval:nudge", 2)
+
+	// graduation_n defaults to 1, so one `+` reaches N; the confirmations above
+	// carry live confidence past the 0.70 approval threshold, so it graduates.
+	up, err := app.AdjustSignatureConfirmations(ctx, "approval:nu", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.Signature != "approval:nudge" {
+		t.Errorf("resolved sig = %q, want approval:nudge", up.Signature)
+	}
+	if up.Confirmations != 1 || up.GraduationN != 1 {
+		t.Errorf("streak = %d/%d, want 1/1", up.Confirmations, up.GraduationN)
+	}
+	if !up.Graduated() || up.Mode != domain.ModeAutonomous {
+		t.Fatalf("reaching N with confidence %.2f > %.2f must graduate, got %s",
+			up.Confidence, up.Threshold, up.Mode)
+	}
+	got, _ := st.GetSignature(ctx, "approval:nudge")
+	if got == nil || got.Mode != domain.ModeAutonomous || got.ConsecutiveConfirmations != 1 {
+		t.Errorf("store must hold the graduated rule: %+v", got)
+	}
+
+	// `-` is the graded counterpart to reset: back under N demotes, and the
+	// decision history survives (unlike ResetSignatureGraduation, which stamps
+	// a floor and a fresh 1.0).
+	down, err := app.AdjustSignatureConfirmations(ctx, "approval:nu", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !down.Demoted() || down.Mode != domain.ModeShadow || down.Confirmations != 0 {
+		t.Fatalf("dropping below N must demote, got mode=%s streak=%d", down.Mode, down.Confirmations)
+	}
+	got, _ = st.GetSignature(ctx, "approval:nudge")
+	if got.CachedConfidence != 0.4 || got.DecisionFloorID != 0 {
+		t.Errorf("a nudge must not stamp the floor or the snapshot: conf=%.2f floor=%d",
+			got.CachedConfidence, got.DecisionFloorID)
+	}
+	if decs, _ := st.DecisionsForSignature(ctx, "approval:nudge", 10); len(decs) != 2 {
+		t.Errorf("a nudge must keep decision history, got %d", len(decs))
+	}
+
+	// Unknown prefix surfaces the resolution error.
+	if _, err := app.AdjustSignatureConfirmations(ctx, "nope:xyz", 1); err == nil {
+		t.Error("prefix resolution error must surface")
+	}
+}
+
+func TestAdjustSignatureConfirmationsReportsTheConfidenceBlock(t *testing.T) {
+	// A rule with NO post-floor decisions scores 0, so `+` moves the streak past
+	// graduation_n and the rule stays shadow. Without ConfidenceBlocked the
+	// operator reads that as a dead key, so the outcome has to be reportable.
+	app, st := testApp(t)
+	ctx := context.Background()
+	seedAdjustable(t, st, "approval:cold", 0)
+
+	got, err := app.AdjustSignatureConfirmations(ctx, "approval:co", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Confirmations != 1 {
+		t.Fatalf("the streak must still advance, got %d", got.Confirmations)
+	}
+	if got.Mode != domain.ModeShadow || got.Graduated() {
+		t.Fatalf("no confidence must block graduation, got %s", got.Mode)
+	}
+	if !got.ConfidenceBlocked() {
+		t.Errorf("streak %d/%d at confidence %.2f (threshold %.2f) must report as confidence-blocked",
+			got.Confirmations, got.GraduationN, got.Confidence, got.Threshold)
+	}
+	if got.Threshold != 0.70 {
+		t.Errorf("approval threshold = %.2f, want the configured 0.70", got.Threshold)
+	}
+}
+
+func TestAdjustSignatureConfirmationsDoesNotStampUpdatedAt(t *testing.T) {
+	// Store.ListSignatures orders by `updated_at DESC` and the Rules tab's
+	// cursor is a positional index into that listing, so stamping UpdatedAt
+	// here would float the nudged rule to the top on the next refresh and the
+	// operator's SECOND `+` press would silently land on a different rule.
+	// Do not "fix" the missing stamp.
+	app, st := testApp(t)
+	ctx := context.Background()
+	seeded := seedAdjustable(t, st, "approval:stable", 2)
+
+	if _, err := app.AdjustSignatureConfirmations(ctx, "approval:st", 1); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.GetSignature(ctx, "approval:stable")
+	if got == nil {
+		t.Fatal("signature vanished")
+	}
+	if !got.UpdatedAt.Equal(seeded) {
+		t.Errorf("a nudge must not restamp UpdatedAt (it is the list sort key): got %s, want %s",
+			got.UpdatedAt, seeded)
+	}
+}
+
+func TestSignatureAdjustmentSummary(t *testing.T) {
+	// Summary is the one sentence both front ends print, so its branches are
+	// pinned here rather than reimplemented in each caller's test.
+	base := frontend.SignatureAdjustment{
+		Signature: "approval:x", Confirmations: 3, GraduationN: 3,
+		Confidence: 0.9, Threshold: 0.7,
+	}
+	graduated := base
+	graduated.PreviousMode, graduated.Mode = domain.ModeShadow, domain.ModeAutonomous
+
+	demoted := base
+	demoted.Confirmations = 2
+	demoted.PreviousMode, demoted.Mode = domain.ModeAutonomous, domain.ModeShadow
+
+	// Scored but under the threshold: name the numbers, since the operator can
+	// act on them (confirm a few more times, or lower the threshold).
+	scoredBlock := base
+	scoredBlock.PreviousMode, scoredBlock.Mode = domain.ModeShadow, domain.ModeShadow
+	scoredBlock.Confidence = 0.55
+
+	// Never scored: a 0 means NO evidence, not a measured 0.00, and the fix for
+	// the two is different — so it must not print a number at all.
+	unscored := scoredBlock
+	unscored.Confidence = 0
+
+	// A `-` that leaves a shadow rule still above N is blocked on the same
+	// thing as a `+` would be. Summary describes the resulting STATE, so it
+	// says so in both directions rather than going quiet on a decrement.
+	downBlocked := unscored
+	downBlocked.Confirmations = 5
+
+	// Below N and shadow: nothing to explain, just the streak.
+	plain := base
+	plain.Confirmations = 1
+	plain.PreviousMode, plain.Mode = domain.ModeShadow, domain.ModeShadow
+
+	for _, tc := range []struct {
+		name string
+		in   frontend.SignatureAdjustment
+		want []string
+		deny []string
+	}{
+		{"graduated", graduated, []string{"streak 3/3", "graduated to autonomous"}, []string{"confidence"}},
+		{"demoted", demoted, []string{"streak 2/3", "demoted to shadow"}, []string{"confidence"}},
+		{"scored but blocked", scoredBlock, []string{"streak 3/3", "confidence 0.55 ≤ 0.70 blocks graduation"}, nil},
+		{"never scored", unscored, []string{"streak 3/3", "no decisions scored yet"}, []string{"0.00"}},
+		{"decrement still blocked", downBlocked, []string{"streak 5/3", "no decisions scored yet"}, []string{"0.00"}},
+		{"below N", plain, []string{"streak 1/3", "(shadow)"}, []string{"graduat", "confidence"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.in.Summary()
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("Summary() = %q, want it to contain %q", got, want)
+				}
+			}
+			for _, deny := range tc.deny {
+				if strings.Contains(got, deny) {
+					t.Errorf("Summary() = %q, must not contain %q", got, deny)
+				}
+			}
+		})
+	}
+}

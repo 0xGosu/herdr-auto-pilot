@@ -2673,3 +2673,87 @@ func (h *focusTestHerdr) FocusPane(ctx context.Context, tabID, paneID string) er
 	h.focused = append(h.focused, focusCall{tabID, paneID})
 	return nil
 }
+
+func TestSignatureStreakKeysAdjustTheCount(t *testing.T) {
+	m, _, st := appModel(t)
+	ctx := context.Background()
+
+	// The fixture is shadow at streak 2 with one unanimous operator decision,
+	// so its LIVE confidence is 1.00 — past the 0.70 approval threshold. With
+	// graduation_n defaulting to 1, one `+` both advances the streak and
+	// graduates the rule. Unlike `x`/`0` this opens no prompt: it is reversible
+	// by the opposite key.
+	m, msg := pressAct(t, m, "+")
+	if m.prompt != nil {
+		t.Fatal("+ must act directly, not open a prompt")
+	}
+	if !strings.Contains(msg.message, "approval:deadbee…") ||
+		!strings.Contains(msg.message, "streak 3/1") ||
+		!strings.Contains(msg.message, "graduated to autonomous") {
+		t.Fatalf("+ should report the streak and the promotion, got %q", msg.message)
+	}
+	sig, _ := st.GetSignature(ctx, "approval:deadbeef00112233")
+	if sig == nil || sig.ConsecutiveConfirmations != 3 || sig.Mode != domain.ModeAutonomous {
+		t.Fatalf("+ must persist the streak and the mode: %+v", sig)
+	}
+
+	// `-` walks it back. Still at or above N it stays autonomous; only dropping
+	// below N demotes, and the decision history survives either way.
+	m, msg = pressAct(t, m, "-")
+	if !strings.Contains(msg.message, "streak 2/1") {
+		t.Errorf("- should report the lowered streak, got %q", msg.message)
+	}
+	if sig, _ = st.GetSignature(ctx, "approval:deadbeef00112233"); sig.Mode != domain.ModeAutonomous {
+		t.Fatalf("above N must stay autonomous, got %s", sig.Mode)
+	}
+	m, _ = pressAct(t, m, "-")
+	m, msg = pressAct(t, m, "-")
+	if !strings.Contains(msg.message, "streak 0/1") || !strings.Contains(msg.message, "demoted to shadow") {
+		t.Errorf("- below N should report the demotion, got %q", msg.message)
+	}
+	sig, _ = st.GetSignature(ctx, "approval:deadbeef00112233")
+	if sig.Mode != domain.ModeShadow || sig.ConsecutiveConfirmations != 0 {
+		t.Fatalf("dropping below N must demote: %+v", sig)
+	}
+	// A nudge is not a reset: no fresh 1.0, no decision floor, history kept.
+	if sig.CachedConfidence != 0.66 || sig.DecisionFloorID != 0 {
+		t.Errorf("a nudge must not clear confidence or stamp a floor: conf=%.2f floor=%d",
+			sig.CachedConfidence, sig.DecisionFloorID)
+	}
+	if recs, _ := st.DecisionsForSignature(ctx, "approval:deadbeef00112233", 10); len(recs) != 1 {
+		t.Error("a nudge must keep decision history")
+	}
+
+	// The floor holds: another `-` at 0 leaves it there rather than going
+	// negative, and the message still reads as the rule's real state.
+	m, msg = pressAct(t, m, "-")
+	if sig, _ = st.GetSignature(ctx, "approval:deadbeef00112233"); sig.ConsecutiveConfirmations != 0 {
+		t.Errorf("the streak must floor at 0, got %d", sig.ConsecutiveConfirmations)
+	}
+	if !strings.Contains(msg.message, "streak 0/1") {
+		t.Errorf("a floored nudge should still report the streak, got %q", msg.message)
+	}
+
+	// The keys are Rules-tab only — elsewhere they must not act.
+	m.tab = tabAgents
+	if _, cmd := m.Update(pressKeyMsg("+")); cmd != nil {
+		t.Error("+ must do nothing outside the Rules tab")
+	}
+}
+
+func TestSignatureStreakKeysAreAdvertised(t *testing.T) {
+	m, _, _ := appModel(t)
+	if help := m.helpLine(); !strings.Contains(help, "+/-: streak") {
+		t.Errorf("the Rules tab footer must advertise the streak keys, got %q", help)
+	}
+	// chromeRows budgets the help line as a flat single row, so a longer hint
+	// must not cost the list body one. Checked at a short pane, the size where
+	// an extra row pushes rows the operator is reading off screen.
+	for _, size := range []struct{ w, h int }{{40, 12}, {80, 30}, {100, 44}} {
+		m.width, m.height = size.w, size.h
+		if rows := strings.Count(m.View(), "\n") + 1; rows > m.height {
+			t.Errorf("%dx%d: the Rules tab renders %d rows in a %d-row pane",
+				size.w, size.h, rows, m.height)
+		}
+	}
+}

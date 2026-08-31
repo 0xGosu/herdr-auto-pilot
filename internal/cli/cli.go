@@ -311,6 +311,8 @@ func signatures(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		return signaturesDelete(ctx, app, out, args)
 	case "reset":
 		return signaturesReset(ctx, app, out, args)
+	case "confirm":
+		return signaturesConfirm(ctx, app, out, args)
 	case "reembed":
 		return signaturesReembed(ctx, app, out, args)
 	case "search":
@@ -320,7 +322,7 @@ func signatures(ctx context.Context, app *frontend.App, out io.Writer, args []st
 	if strings.HasPrefix(sub, "-") {
 		return signaturesList(ctx, app, out, append([]string{sub}, args...))
 	}
-	return fmt.Errorf("usage: signatures [list|search <query>|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]|reset <sig-or-prefix> [--yes]|reembed [--force]] (see: hap help signatures)")
+	return fmt.Errorf("usage: signatures [list|search <query>|show <sig-or-prefix>|delete <sig-or-prefix> [--yes]|reset <sig-or-prefix> [--yes]|confirm <sig-or-prefix> [--delta N]|reembed [--force]] (see: hap help signatures)")
 }
 
 // signaturesReembed re-computes stored signature embeddings for the
@@ -713,6 +715,49 @@ func signaturesReset(ctx context.Context, app *frontend.App, out io.Writer, args
 		{Cmd: "hap signatures show " + sig, Why: "confirm the mode and streak"},
 		{Cmd: "hap escalations", Why: "it asks again now; confirm the right answer to re-teach it"},
 	})
+	return nil
+}
+
+// signaturesConfirm moves a rule's confirmation streak by --delta (default +1)
+// and re-evaluates its mode: reaching graduation_n graduates it when live
+// confidence also clears the threshold, and falling below graduation_n demotes
+// a graduated rule back to shadow. The CLI twin of the Rules tab's `+`/`-`.
+//
+// There is deliberately NO --yes gate. `delete` and `reset` have one because
+// they destroy history; this keeps every decision row, the decision floor and
+// the cached snapshot, and is undone by the opposite delta.
+func signaturesConfirm(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	prefix, rest := splitLeadingID(args)
+	fs := flag.NewFlagSet("signatures confirm", flag.ContinueOnError)
+	delta := fs.Int("delta", 1, "signed change to the confirmation streak (e.g. -1)")
+	fs.SetOutput(out)
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if prefix == "" && fs.NArg() > 0 {
+		prefix = fs.Arg(0)
+	}
+	if prefix == "" {
+		return fmt.Errorf("usage: signatures confirm <sig-or-prefix> [--delta N] (see: hap signatures list)")
+	}
+	if *delta == 0 {
+		return fmt.Errorf("--delta 0 would change nothing; pass a non-zero value")
+	}
+	got, err := app.AdjustSignatureConfirmations(ctx, prefix, *delta)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "signature %s %s\n", got.Signature, got.Summary())
+	hints := []Hint{{Cmd: "hap signatures show " + got.Signature, Why: "confirm the mode and streak"}}
+	switch {
+	case got.Graduated():
+		hints = append(hints, Hint{Cmd: "hap signatures reset " + got.Signature + " --yes",
+			Why: "back to shadow if it acts wrongly"})
+	case got.ConfidenceBlocked():
+		hints = append(hints, Hint{Cmd: "hap escalations",
+			Why: "confirm this situation to give the rule the decision history it needs"})
+	}
+	PrintNextSteps(out, hints)
 	return nil
 }
 

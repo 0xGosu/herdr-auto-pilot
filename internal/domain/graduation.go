@@ -10,9 +10,13 @@ package domain
 // consecutive-confirmation count is frozen and a later correction no longer
 // demotes it — the correction is still recorded as a decision, so the
 // recency-weighted confidence (FR-005) reflects it and the confidence gate
-// (FR-008) still applies, but the mode never auto-reverts. The ONLY path back
-// to shadow is an explicit operator reset (ResetGraduation), driven from the
-// CLI/TUI.
+// (FR-008) still applies, but the mode never auto-reverts. The only paths back
+// to shadow are the two EXPLICIT operator acts, both driven from the CLI/TUI:
+// ResetGraduation (`hap signatures reset`, the TUI's `0`), which zeroes the
+// streak and stamps a decision floor; and AdjustConfirmations
+// (`hap signatures confirm --delta -1`, the TUI's `-`), which walks the streak
+// down one notch and demotes only once it falls below N. Nothing AUTOMATIC ever
+// demotes — that is what the freeze in ObserveConfirmation protects.
 
 // ObserveConfirmation updates state for an operator confirmation of the
 // suggested/learned action. consistent is true when the confirmed action
@@ -60,4 +64,45 @@ func MaybeGraduate(state SignatureState, confidence float64, threshold float64, 
 		state.Mode = ModeAutonomous
 	}
 	return state
+}
+
+// AdjustConfirmations applies an operator's EXPLICIT streak nudge — the Rules
+// tab's `+`/`-` keys and `hap signatures confirm` — and re-evaluates the mode
+// against the same gate the learning path uses. delta is signed; the resulting
+// count is floored at 0 (a negative streak is not a state this model has).
+//
+// It deliberately bypasses the freeze ObserveConfirmation applies to a
+// graduated rule. That freeze exists to stop an AUTOMATIC demotion by a
+// correction (revised FR-007); an operator saying "this rule has earned one
+// notch less trust" is the same class of act as ResetGraduation, which already
+// demotes. Nothing on this path is inferred from a screen.
+//
+// Unlike ResetGraduation this is a NUDGE, not a fresh start: CachedConfidence,
+// DecisionFloorID and GuardState are all left exactly as they were, so the
+// rule keeps its decision history and its live score. `0`/reset stays the
+// harder hammer for an operator who wants the rule to re-earn trust from
+// nothing.
+//
+// confidence is the LIVE score over post-floor history (domain.LiveConfidence),
+// never the stale CachedConfidence snapshot — promotion must be gated on what
+// the decision core would actually read.
+func AdjustConfirmations(state SignatureState, delta int, confidence, threshold float64, graduationN int) SignatureState {
+	next := state.ConsecutiveConfirmations + delta
+	if next < 0 {
+		next = 0
+	}
+	state.ConsecutiveConfirmations = next
+	if state.Mode == ModeAutonomous {
+		// Demote only once the streak no longer clears N. MaybeGraduate is not
+		// consulted here: it returns a graduated rule untouched, so routing an
+		// autonomous rule through it would silently make `-` a no-op.
+		if next < graduationN {
+			state.Mode = ModeShadow
+		}
+		return state
+	}
+	// Promotion goes through the ONE existing gate rather than a second copy of
+	// its conditions, so a raised streak still cannot outrun the confidence
+	// threshold (FR-006).
+	return MaybeGraduate(state, confidence, threshold, graduationN)
 }
