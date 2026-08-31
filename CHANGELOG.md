@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.7.2
+
+- Added `+` and `-` on the TUI *Rules* tab to nudge the selected rule's confirmation streak by one, and `hap signatures confirm <prefix> [--delta N]` as the same action from the CLI. Reaching `learning.graduation_n` graduates the rule only when its live confidence also clears the situation's threshold — the message says so when it does not, rather than looking like a key that did nothing.
+- Changed how an autonomous rule can be demoted: `-` (or `--delta -1`) now walks the streak down and returns the rule to shadow once it falls below `learning.graduation_n`, keeping every decision row, the decision floor and the confidence. Previously `hap signatures reset` was the only way back and it cleared all three, so pulling a mostly-right rule back one notch meant making it re-earn trust from nothing. Nothing automatic demotes a rule; both paths are still explicit operator acts.
+
 ## 0.7.1
 
 - Changed confirming a `[no_task_source]` escalation: it is a notice that an idle agent has no work queued, not an answerable prompt, so confirming it now shows how to enable LLM task generation (`hap config set llm.task_generate_command --preset claude|codex`) or add a task source, instead of failing with "no suggestion to confirm". The escalation stays pending; every other unconfirmable escalation still reports the old refusal.
