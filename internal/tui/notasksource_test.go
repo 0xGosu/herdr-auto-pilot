@@ -59,9 +59,18 @@ func applyResult(t *testing.T, m Model, msg actionResultMsg) Model {
 	return upd.(Model)
 }
 
-// TestConfirmNoTaskSourceShowsANoteNotAnError: both confirm keys must render
-// the guidance in the multi-line message area, never as a red one-line ✗ that
-// truncates away the commands it names.
+// detailText joins the open overlay's lines for substring assertions.
+func detailText(t *testing.T, m Model) string {
+	t.Helper()
+	if m.detail == nil {
+		t.Fatal("no detail overlay is open")
+	}
+	return strings.Join(m.detail.lines, "\n")
+}
+
+// TestConfirmNoTaskSourceShowsANoteNotAnError: both confirm keys must open the
+// guidance in the scrollable overlay, never as a red one-line ✗ that flattens
+// away the commands it names.
 func TestConfirmNoTaskSourceShowsANoteNotAnError(t *testing.T) {
 	// enter = confirm+send, y = confirm only. App.Confirm refuses before it
 	// consults send, so both land on the notice.
@@ -71,41 +80,73 @@ func TestConfirmNoTaskSourceShowsANoteNotAnError(t *testing.T) {
 			m, msg := pressResult(t, m, key)
 			m = applyResult(t, m, msg)
 
+			got := detailText(t, m)
 			for _, want := range []string{
 				"hap config set llm.task_generate_command --preset claude",
 				"hap config set llm.task_generate_command --preset codex",
 				"hap config task-source add",
 				"hap dismiss",
 			} {
-				if !strings.Contains(m.message, want) {
-					t.Errorf("message area is missing %q:\n%s", want, m.message)
+				if !strings.Contains(got, want) {
+					t.Errorf("the overlay is missing %q:\n%s", want, got)
 				}
 			}
 			if m.status != nil && m.status.err {
 				t.Errorf("a notice must not render as an error, got %q", m.status.text)
 			}
+			// Nothing on this overlay is answerable — that is the message —
+			// so it must not offer the escalation actions.
+			if m.detail.confirmID != 0 || m.detail.retryID != 0 {
+				t.Errorf("the notice overlay must offer no confirm/retry, got %+v", m.detail)
+			}
 		})
 	}
 }
 
-// TestNoTaskSourceNoteSurvivesARefresh is the regression that would otherwise
-// ship green and be invisible: the guidance lives in the message area, which
-// must outlive the background refresh and clock ticks that run every second.
-func TestNoTaskSourceNoteSurvivesARefresh(t *testing.T) {
+// TestNoTaskSourceGuidanceFitsAShortPane is the regression this overlay exists
+// for. The guidance is a dozen lines; rendered into the ephemeral message area
+// — budgeted as a flat two rows by chromeRows — it pushed the help line and
+// the rows the operator was reading off a short terminal. The overlay scrolls,
+// so it fits at any size.
+func TestNoTaskSourceGuidanceFitsAShortPane(t *testing.T) {
+	for _, size := range []struct{ w, h int }{{40, 12}, {80, 30}} {
+		m, _, _ := noticeModel(t)
+		m.width, m.height = size.w, size.h
+		m, msg := pressResult(t, m, "y")
+		m = applyResult(t, m, msg)
+
+		view := m.View()
+		if rows := strings.Count(view, "\n") + 1; rows > m.height {
+			t.Errorf("%dx%d: the guidance renders %d rows in a %d-row pane:\n%s",
+				size.w, size.h, rows, m.height, view)
+		}
+		// Whatever does not fit must say it can be scrolled to, never be
+		// silently dropped — the commands ARE the message.
+		if !strings.Contains(view, "hap config set llm.task_generate_command") &&
+			!strings.Contains(view, "to scroll") {
+			t.Errorf("%dx%d: the guidance is neither shown nor scrollable:\n%s",
+				size.w, size.h, view)
+		}
+	}
+}
+
+// TestNoTaskSourceGuidanceIsReadableOnAnOrdinaryTerminal: the clipping above is
+// only acceptable because a normal pane shows the commands without scrolling.
+func TestNoTaskSourceGuidanceIsReadableOnAnOrdinaryTerminal(t *testing.T) {
 	m, _, _ := noticeModel(t)
+	m.width, m.height = 100, 40
 	m, msg := pressResult(t, m, "y")
 	m = applyResult(t, m, msg)
-	if m.message == "" {
-		t.Fatal("no guidance was shown at all")
-	}
 
-	upd, _ := m.Update(tickMsg(time.Now()))
-	m = upd.(Model)
-	upd, _ = m.Update(refreshMsg{})
-	m = upd.(Model)
-
-	if !strings.Contains(m.message, "hap config set llm.task_generate_command") {
-		t.Errorf("the guidance was wiped by a tick/refresh:\n%q", m.message)
+	view := m.View()
+	for _, want := range []string{
+		"hap config set llm.task_generate_command --preset claude",
+		"hap config task-source add",
+		"hap dismiss",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("a 100x40 pane must show %q without scrolling:\n%s", want, view)
+		}
 	}
 }
 
@@ -134,8 +175,8 @@ func TestConfirmNoTaskSourceBatchReportsBothHalves(t *testing.T) {
 	m, msg := pressResult(t, m, "y")
 	m = applyResult(t, m, msg)
 
-	if !strings.Contains(m.message, "hap config set llm.task_generate_command") {
-		t.Errorf("the batch dropped the notice guidance:\n%s", m.message)
+	if got := detailText(t, m); !strings.Contains(got, "hap config set llm.task_generate_command") {
+		t.Errorf("the batch dropped the notice guidance:\n%s", got)
 	}
 	if m.status == nil || m.status.err {
 		t.Fatalf("the batch must still report its counts as a non-error note, got %+v", m.status)

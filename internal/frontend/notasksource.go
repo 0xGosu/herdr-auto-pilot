@@ -37,18 +37,21 @@ import (
 //     rightly so: the fix there is the broken source, not this advice.
 //
 // That is why the guidance can name llm.task_generate_command unconditionally
-// without reading config: reaching here proves the key is unset. Which matters,
-// because ApplyLLMPreset REFUSES a configured field — advice to install a
-// preset over an existing recipe would be advice that cannot be followed.
+// without reading config. Note the precise claim: the key was unset when this
+// row was RAISED. An operator holding several notices who follows the advice
+// after the first will find ApplyLLMPreset refuse the second ("already
+// configured — a preset only bootstraps an unset command"), which is correct
+// and self-explaining; the printed `hap dismiss` is the escape for the rest.
+// Reading config here to phrase it per-row is a design change, not a fix.
 type NoTaskSourceNotice struct {
 	// AuditID is the escalation the operator tried to confirm.
 	AuditID int64
 }
 
-// Error is one line on purpose. The TUI's durable status area budgets exactly
-// one line and flattens anything longer (oneLine), so the multi-line block
-// belongs to Guidance and this stays what a log or an aggregating caller can
-// carry whole.
+// Error satisfies the error interface and is deliberately one line: every
+// production caller renders Guidance instead, so this is what is left for a
+// log, a %v, or a caller that folds several failures into one string — none of
+// which can carry a twelve-line block.
 func (n *NoTaskSourceNotice) Error() string {
 	return fmt.Sprintf("audit record %d [%s]: the agent is idle with no task source, "+
 		"so there is nothing to confirm — configure task generation or a task source",
