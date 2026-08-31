@@ -63,6 +63,13 @@ func TestConfirmGeneratedTaskWithoutSendAddsToList(t *testing.T) {
 	if !strings.Contains(out, "added the suggested task(s) to the agent's task list (not sent)") {
 		t.Errorf("message should explain tasks were queued, got %q", out)
 	}
+	// confirm is SelfHints so a [no_task_source] notice earns no footer; a real
+	// confirm must still print its own, exactly once. The registry sweep in
+	// TestNoCommandPrintsTwoFooters cannot see this — its `hap confirm 42`
+	// example errors on a missing id and is skipped.
+	if n := strings.Count(out, "Next steps:"); n != 1 {
+		t.Errorf("a real confirm must print exactly one footer, got %d:\n%s", n, out)
+	}
 	if len(h.sent) != 0 {
 		t.Errorf("nothing may be delivered to a busy agent, got %v", h.sent)
 	}
