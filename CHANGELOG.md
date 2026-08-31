@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.7.1
+
+- Changed confirming a `[no_task_source]` escalation: it is a notice that an idle agent has no work queued, not an answerable prompt, so confirming it now shows how to enable LLM task generation (`hap config set llm.task_generate_command --preset claude|codex`) or add a task source, instead of failing with "no suggestion to confirm". The escalation stays pending; every other unconfirmable escalation still reports the old refusal.
+- Fixed the TUI detail overlay losing rows off the bottom of a short pane when a message or status note was showing — its page size ignored both.
+
 ## 0.7.0
 
 - Added `AUTO.md` at the repo root — the file hap's own consult and task-generation runs read, and `llm.learn_from_user_command` writes, kept out of the agents' own instruction files.
