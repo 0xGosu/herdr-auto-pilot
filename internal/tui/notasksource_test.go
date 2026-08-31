@@ -91,8 +91,11 @@ func TestConfirmNoTaskSourceShowsANoteNotAnError(t *testing.T) {
 					t.Errorf("the overlay is missing %q:\n%s", want, got)
 				}
 			}
-			if m.status != nil && m.status.err {
-				t.Errorf("a notice must not render as an error, got %q", m.status.text)
+			// Not an error, and not a bogus success either: a lone notice
+			// confirmed nothing, so a green "confirmed 0" would be a check
+			// mark on a no-op. The overlay is the whole answer here.
+			if m.status != nil {
+				t.Errorf("a lone notice must leave no status note, got %+v", m.status)
 			}
 			// Nothing on this overlay is answerable — that is the message —
 			// so it must not offer the escalation actions.

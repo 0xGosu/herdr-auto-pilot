@@ -2963,12 +2963,18 @@ func (m Model) confirmWithoutSend() (tea.Model, tea.Cmd) {
 		}
 		if firstNotice != nil {
 			// The notice carries the guidance; the message carries the count,
-			// so a mixed batch reports both. A REAL error outranks a notice
-			// (the branch above returns first) and then the guidance is
-			// dropped: the failure is the urgent thing, and the notice row is
-			// still pending, so confirming it alone shows the guidance.
-			return actionResultMsg{err: firstNotice, message: fmt.Sprintf(
-				"confirmed %d, skipped %s", confirmed, strings.Join(skipped, " "))}
+			// and ONLY when something actually confirmed — a lone notice is
+			// the common case, where "confirmed 0, skipped #1" under a green
+			// check reads as a success that did nothing. A REAL error outranks
+			// a notice (the branch above returns first) and then the guidance
+			// is dropped: the failure is the urgent thing, and the notice row
+			// is still pending, so confirming it alone shows the guidance.
+			count := ""
+			if confirmed > 0 {
+				count = fmt.Sprintf("confirmed %d, skipped %s",
+					confirmed, strings.Join(skipped, " "))
+			}
+			return actionResultMsg{err: firstNotice, message: count}
 		}
 		return actionResultMsg{message: fmt.Sprintf(
 			"confirmed %s — learned, nothing sent (the agent is not answered)", desc)}
