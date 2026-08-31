@@ -1815,6 +1815,11 @@ func (a *App) Confirm(ctx context.Context, auditID int64, send bool) error {
 	}
 	action := SuggestedAction(audit)
 	if action == "" {
+		// One reason is not a refusal to explain but a notice to act on: see
+		// NoTaskSourceNotice for why this branch belongs INSIDE the guard.
+		if noTaskSourceNotice(audit) {
+			return &NoTaskSourceNotice{AuditID: audit.ID}
+		}
 		return errNoSuggestion(audit)
 	}
 	return a.Resolve(ctx, auditID, action, send)

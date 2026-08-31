@@ -1895,9 +1895,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// as external and ring the bell.
 			m.pausePending = false
 		}
-		if msg.err != nil {
+		// A [no_task_source] notice is not a failed action: nothing was ever
+		// answerable and the fix is a config change. The status area would
+		// mark it with a red X and, budgeting exactly one line, flatten away
+		// the commands it names — so it opens the SCROLLABLE detail overlay
+		// instead. The ephemeral message area is not an option either: it is
+		// budgeted as a flat two rows (chromeRows), and this guidance is the
+		// first multi-line message in the TUI, so it overflowed the pane on a
+		// short terminal — pushing the help line and the rows the operator was
+		// reading off screen. The overlay is the one surface that already
+		// scrolls arbitrary text at any pane size. msg.err stays non-nil so
+		// the cursorUndo restore below still fires: the confirm did not happen.
+		var notice *frontend.NoTaskSourceNotice
+		switch {
+		case msg.err != nil && errors.As(msg.err, &notice):
+			m.openNoticeDetail(notice)
+			if msg.message != "" {
+				// A batch that confirmed some rows still reports its count.
+				m.status = &statusNote{text: msg.message, at: time.Now()}
+			}
+		case msg.err != nil:
 			m.status = &statusNote{text: msg.err.Error(), err: true, at: time.Now()}
-		} else if msg.message != "" {
+		case msg.message != "":
 			m.status = &statusNote{text: msg.message, at: time.Now()}
 		}
 		// Only THIS action's own result may consume the undo it stashed. Other
@@ -2917,10 +2936,20 @@ func (m Model) confirmWithoutSend() (tea.Model, tea.Cmd) {
 		}
 		confirmed := 0
 		var skipped []string
-		var firstErr error
+		var firstErr, firstNotice error
 		for _, id := range ids {
 			if err := app.Confirm(ctx, id, false); err != nil {
 				skipped = append(skipped, fmt.Sprintf("#%d", id))
+				// A [no_task_source] notice is tracked apart from real
+				// failures: wrapping it here would bury its guidance inside an
+				// error string the status area truncates to one line.
+				var notice *frontend.NoTaskSourceNotice
+				if errors.As(err, &notice) {
+					if firstNotice == nil {
+						firstNotice = err
+					}
+					continue
+				}
 				if firstErr == nil {
 					firstErr = err
 				}
@@ -2932,8 +2961,51 @@ func (m Model) confirmWithoutSend() (tea.Model, tea.Cmd) {
 			return actionResultMsg{err: fmt.Errorf("confirmed %d, skipped %s: %w",
 				confirmed, strings.Join(skipped, " "), firstErr)}
 		}
+		if firstNotice != nil {
+			// The notice carries the guidance; the message carries the count,
+			// and ONLY when something actually confirmed — a lone notice is
+			// the common case, where "confirmed 0, skipped #1" under a green
+			// check reads as a success that did nothing. A REAL error outranks
+			// a notice (the branch above returns first) and then the guidance
+			// is dropped: the failure is the urgent thing, and the notice row
+			// is still pending, so confirming it alone shows the guidance.
+			count := ""
+			if confirmed > 0 {
+				count = fmt.Sprintf("confirmed %d, skipped %s",
+					confirmed, strings.Join(skipped, " "))
+			}
+			return actionResultMsg{err: firstNotice, message: count}
+		}
 		return actionResultMsg{message: fmt.Sprintf(
 			"confirmed %s — learned, nothing sent (the agent is not answered)", desc)}
+	}
+}
+
+// openNoticeDetail shows a NoTaskSourceNotice in the scrollable overlay.
+//
+// The overlay rather than a status toast because the guidance is a dozen lines
+// of commands the operator is meant to READ and type, and it rebuilds through
+// `build` so a resize rewraps it like every other detail. It carries no
+// confirmID/retryID/task: there is nothing on it to confirm — which is the
+// whole point — so enter and y just close it.
+func (m *Model) openNoticeDetail(notice *frontend.NoTaskSourceNotice) {
+	guidance := notice.Guidance()
+	build := func(width int, _ bool) []string {
+		var lines []string
+		for _, ln := range strings.Split(guidance, "\n") {
+			if ln == "" {
+				lines = append(lines, "")
+				continue
+			}
+			lines = append(lines, wrapText(ln, width)...)
+		}
+		return lines
+	}
+	m.message = ""
+	m.detail = &detailView{
+		title: fmt.Sprintf("Escalation #%d — nothing to confirm", notice.AuditID),
+		lines: build(m.wrapWidth(), false),
+		build: build,
 	}
 }
 
@@ -4228,6 +4300,17 @@ func (m Model) detailPageSize() int {
 	}
 	if m.data.daemonHealth.Banner() != "" {
 		chrome++
+	}
+	// renderDetail draws the message and status areas too (in-overlay actions
+	// report there), so they are chrome here exactly as they are in chromeRows
+	// — AR-002's "mirroring" is the whole reason these two stay in step. The
+	// flat 8 absorbed them silently while nothing set one before opening an
+	// overlay; the [no_task_source] notice does both at once.
+	if m.message != "" {
+		chrome += 2
+	}
+	if m.status != nil {
+		chrome += 2
 	}
 	return max(1, m.height-chrome)
 }

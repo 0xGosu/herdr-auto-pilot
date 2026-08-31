@@ -414,12 +414,16 @@ func buildCommands() {
 				"list; --send also hands the first one over. Confirming without --send is how you\n" +
 				"accept work for a busy agent without interrupting it.",
 			Examples: []string{"hap confirm 42", "hap confirm 42 --send"},
-			Next: []Hint{
-				{Cmd: "hap escalations", Why: "see what is still pending"},
-				{Cmd: "hap signatures list", Why: "check whether the rule graduated"},
-				{Cmd: "hap audit --limit 10", Why: "verify the action was recorded/delivered"},
-			},
-			Handler: confirm,
+			// Carried for the --help page even though SelfHints suppresses the
+			// runtime footer; the handler prints this same list when it really
+			// confirmed something.
+			Next: confirmNextSteps,
+			// A [no_task_source] notice confirms NOTHING — it prints what to
+			// configure and exits 0 — so the static footer would tell the
+			// operator to go verify a recorded action and a graduated rule that
+			// do not exist. Only the success path earns the footer.
+			SelfHints: true,
+			Handler:   confirm,
 		},
 		{
 			Name:    "resolve",
