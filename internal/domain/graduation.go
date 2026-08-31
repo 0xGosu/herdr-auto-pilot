@@ -71,6 +71,14 @@ func MaybeGraduate(state SignatureState, confidence float64, threshold float64, 
 // against the same gate the learning path uses. delta is signed; the resulting
 // count is floored at 0 (a negative streak is not a state this model has).
 //
+// The nudge is MONOTONE in delta, and both gates below exist to keep it that
+// way: a raise may only ever increase trust (promote, or nothing) and a lower
+// may only ever decrease it (demote, or nothing). Neither the streak nor the
+// mode may move against the operator's key, because both `graduation_n` and the
+// thresholds are editable while graduation is permanent — so the streak's
+// position relative to N is NOT on its own evidence of which way the operator
+// asked to go.
+//
 // It deliberately bypasses the freeze ObserveConfirmation applies to a
 // graduated rule. That freeze exists to stop an AUTOMATIC demotion by a
 // correction (revised FR-007); an operator saying "this rule has earned one
@@ -93,10 +101,17 @@ func AdjustConfirmations(state SignatureState, delta int, confidence, threshold 
 	}
 	state.ConsecutiveConfirmations = next
 	if state.Mode == ModeAutonomous {
-		// Demote only once the streak no longer clears N. MaybeGraduate is not
-		// consulted here: it returns a graduated rule untouched, so routing an
-		// autonomous rule through it would silently make `-` a no-op.
-		if next < graduationN {
+		// Demote only on a LOWER that drops the streak under N. MaybeGraduate is
+		// not consulted here: it returns a graduated rule untouched, so routing
+		// an autonomous rule through it would silently make `-` a no-op.
+		//
+		// The `delta < 0` half is what keeps `+` from demoting. graduation_n is
+		// operator-editable and graduation is permanent, so raising N leaves
+		// already-autonomous rules sitting BELOW it — a rule graduated at N=1
+		// with streak 1 is still autonomous after N becomes 3. Testing the
+		// streak alone then demoted it on the very key that means "trust this
+		// more": 1 → 2, still under 3, back to shadow.
+		if delta < 0 && next < graduationN {
 			state.Mode = ModeShadow
 		}
 		return state

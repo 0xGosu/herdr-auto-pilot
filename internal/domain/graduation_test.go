@@ -203,3 +203,70 @@ func TestAdjustConfirmationsDecrementNeverPromotes(t *testing.T) {
 		t.Errorf("a raise on the same row must still graduate, got %s", up.Mode)
 	}
 }
+
+func TestAdjustConfirmationsRaiseNeverDemotes(t *testing.T) {
+	// graduation_n is operator-editable and graduation is permanent, so raising
+	// N strands already-autonomous rules BELOW it: a rule graduated when N was 1
+	// is still autonomous at streak 1 after N becomes 3. Testing the streak
+	// alone then demoted it on `+` — the key that means "trust this more".
+	const raisedN = 3
+	state := SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 1}
+
+	got := AdjustConfirmations(state, 1, 0.95, 0.7, raisedN)
+	if got.ConsecutiveConfirmations != 2 {
+		t.Fatalf("the streak must still rise, got %d", got.ConsecutiveConfirmations)
+	}
+	if got.Mode != ModeAutonomous {
+		t.Errorf("a raise must never demote, got %s", got.Mode)
+	}
+
+	// A zero delta is the same class of non-lower.
+	if same := AdjustConfirmations(state, 0, 0.95, 0.7, raisedN); same.Mode != ModeAutonomous {
+		t.Errorf("a zero delta must never demote, got %s", same.Mode)
+	}
+
+	// The control: the identical row with a LOWER does demote, so the test above
+	// is not passing for want of a streak below N.
+	if down := AdjustConfirmations(state, -1, 0.95, 0.7, raisedN); down.Mode != ModeShadow {
+		t.Errorf("a lower on the same row must still demote, got %s", down.Mode)
+	}
+}
+
+func TestAdjustConfirmationsIsMonotoneInDelta(t *testing.T) {
+	// The whole contract in one sweep: a raise may only ever increase trust and
+	// a lower may only ever decrease it. Both `graduation_n` and the thresholds
+	// are editable while graduation is permanent, so the streak's position
+	// relative to N is NOT on its own evidence of which way the operator asked
+	// to go — every (mode, streak, N, confidence) combination below is a state
+	// an operator can really reach, and each of the two directional bugs this
+	// pins showed up in only a narrow corner of it.
+	rank := map[Mode]int{ModeShadow: 0, ModeAutonomous: 1}
+	for _, mode := range []Mode{ModeShadow, ModeAutonomous} {
+		for streak := 0; streak <= 4; streak++ {
+			for n := 1; n <= 4; n++ {
+				for _, conf := range []float64{0.0, 0.5, 0.95} {
+					for _, delta := range []int{-3, -1, 0, 1, 3} {
+						in := SignatureState{Mode: mode, ConsecutiveConfirmations: streak}
+						got := AdjustConfirmations(in, delta, conf, 0.7, n)
+
+						if want := max(0, streak+delta); got.ConsecutiveConfirmations != want {
+							t.Errorf("mode=%s streak=%d n=%d conf=%.2f delta=%d: streak = %d, want %d",
+								mode, streak, n, conf, delta, got.ConsecutiveConfirmations, want)
+						}
+						switch {
+						case delta > 0 && rank[got.Mode] < rank[mode]:
+							t.Errorf("mode=%s streak=%d n=%d conf=%.2f delta=%d: a raise demoted to %s",
+								mode, streak, n, conf, delta, got.Mode)
+						case delta < 0 && rank[got.Mode] > rank[mode]:
+							t.Errorf("mode=%s streak=%d n=%d conf=%.2f delta=%d: a lower promoted to %s",
+								mode, streak, n, conf, delta, got.Mode)
+						case delta == 0 && got.Mode != mode:
+							t.Errorf("mode=%s streak=%d n=%d conf=%.2f: a zero delta moved the mode to %s",
+								mode, streak, n, conf, got.Mode)
+						}
+					}
+				}
+			}
+		}
+	}
+}
