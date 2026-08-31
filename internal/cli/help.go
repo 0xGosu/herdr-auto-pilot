@@ -646,8 +646,8 @@ func buildCommands() {
 				"by --delta instead: reaching graduation N graduates the rule when its confidence\n" +
 				"also clears the threshold, and --delta -1 walks a graduated rule back one notch\n" +
 				"(demoting it below N) while KEEPING its history — the graded alternative to reset.\n" +
-				"`reembed` re-computes stored\n" +
-				"embeddings after an embedding model change (via the running daemon when there is one).",
+				"`reembed` re-computes stored embeddings after an embedding model change (via\n" +
+				"the running daemon when there is one).",
 			Examples: []string{
 				"hap signatures list --mode autonomous",
 				"hap signatures search \"approve the file write\" --semantic",
