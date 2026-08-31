@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.7.0
+
+- Added `AUTO.md` at the repo root — the file hap's own consult and task-generation runs read, and `llm.learn_from_user_command` writes, kept out of the agents' own instruction files.
+- **Breaking.** Removed the first-interaction command family: `llm.command_start`, `llm.task_generate_command_start` and their `_env`/`_env_file` companions. `llm.command` and `llm.task_generate_command` now serve every interaction. A config still carrying the old keys loads with one warning and is rewritten without them on the next save, so nothing breaks on upgrade.
+- **Breaking.** Removed the fast-fail retry that re-ran a consult with the other command template when the first exited in under a second — it existed only to pair `command` with `command_start`, and there is no second template left to try.
+- **Breaking.** An exhausted declared task source now always escalates `task_source_exhausted` with a confirmable `@noop` suggestion. Refilling it automatically used to be reachable by also setting `llm.task_generate_command_start`; rewriting a list you wrote is your call again.
+
 ## 0.6.21
 
 - Changed the built-in `claude`/`codex` LLM presets to keep hap's learned lessons out of your agents' context. `llm.learn_from_user_command` now records a correction in `AUTO.md` in the agent's project — hap's own file, under one `## Lessons for hap's auto-answer assistant` heading it edits in place — instead of appending to that project's shared `CLAUDE.md`/`AGENTS.md`, where every rule was reloaded on every turn of the agent's real work. `llm.command` and `llm.task_generate_command` are told to read `AUTO.md` before deciding, so corrections still steer auto-answering — the codex task-generation recipe gains `--sandbox read-only` so it can actually open the file, and a run that cannot read it carries on without it. The rules in `AUTO.md` are framed as the operator's guidance rather than instructions that override the prompt, because the file is read from the agent-chosen directory and a cloned repo can ship its own. Existing configured commands are untouched; a preset only ever bootstraps an unset one.
