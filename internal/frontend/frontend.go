@@ -4867,10 +4867,15 @@ func (a SignatureAdjustment) Demoted() bool {
 // meets the first time they press `+` on a freshly learned rule.
 //
 // It describes the resulting STATE, not the direction of the nudge — a `-` that
-// leaves a shadow rule above N is blocked on exactly the same thing, and saying
-// so is more use than a bare streak.
+// leaves a shadow rule above N on a confidence that never cleared its threshold
+// is blocked on exactly the same thing, and saying so is more use than a bare
+// streak. The confidence conjunct is NOT redundant: only a RAISE promotes
+// (domain.AdjustConfirmations), so a decrement can leave a shadow rule above N
+// with confidence that DOES clear the threshold, and claiming "confidence
+// 0.95 ≤ 0.70" there would be a lie.
 func (a SignatureAdjustment) ConfidenceBlocked() bool {
-	return a.Mode == domain.ModeShadow && a.Confirmations >= a.GraduationN
+	return a.Mode == domain.ModeShadow && a.Confirmations >= a.GraduationN &&
+		a.Confidence <= a.Threshold
 }
 
 // Summary renders the outcome of a nudge WITHOUT the signature, so the TUI can

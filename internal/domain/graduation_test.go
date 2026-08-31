@@ -174,3 +174,32 @@ func TestAdjustConfirmationsFloorsAtZero(t *testing.T) {
 		}
 	}
 }
+
+func TestAdjustConfirmationsDecrementNeverPromotes(t *testing.T) {
+	// A shadow rule can legitimately sit at or above N with confidence that has
+	// since risen past its threshold — nothing re-evaluates the gate between
+	// confirmations. Routing a DECREMENT through MaybeGraduate then made `-`,
+	// the operator saying "trust this less", grant the rule autonomy.
+	const n = 1
+	state := SignatureState{Mode: ModeShadow, ConsecutiveConfirmations: 2}
+
+	got := AdjustConfirmations(state, -1, 0.95, 0.7, n)
+	if got.ConsecutiveConfirmations != 1 {
+		t.Fatalf("the streak must still fall, got %d", got.ConsecutiveConfirmations)
+	}
+	if got.Mode != ModeShadow {
+		t.Errorf("a decrement must never promote, got %s", got.Mode)
+	}
+
+	// A zero delta is the same class of non-raise (the CLI refuses one, callers
+	// in general do not).
+	if same := AdjustConfirmations(state, 0, 0.95, 0.7, n); same.Mode != ModeShadow {
+		t.Errorf("a zero delta must never promote, got %s", same.Mode)
+	}
+
+	// The control: the identical row with a RAISE does graduate, so the test
+	// above is not passing for want of confidence.
+	if up := AdjustConfirmations(state, 1, 0.95, 0.7, n); up.Mode != ModeAutonomous {
+		t.Errorf("a raise on the same row must still graduate, got %s", up.Mode)
+	}
+}

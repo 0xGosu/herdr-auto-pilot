@@ -6231,6 +6231,14 @@ func TestSignatureAdjustmentSummary(t *testing.T) {
 	downBlocked := unscored
 	downBlocked.Confirmations = 5
 
+	// A decrement that leaves a shadow rule above N on a confidence that DOES
+	// clear its threshold: only a raise promotes, so this state is reachable —
+	// and it must not claim confidence blocked anything.
+	downUnblocked := base
+	downUnblocked.Confirmations = 5
+	downUnblocked.PreviousMode, downUnblocked.Mode = domain.ModeShadow, domain.ModeShadow
+	downUnblocked.Confidence = 0.95
+
 	// Below N and shadow: nothing to explain, just the streak.
 	plain := base
 	plain.Confirmations = 1
@@ -6247,6 +6255,8 @@ func TestSignatureAdjustmentSummary(t *testing.T) {
 		{"scored but blocked", scoredBlock, []string{"streak 3/3", "confidence 0.55 ≤ 0.70 blocks graduation"}, nil},
 		{"never scored", unscored, []string{"streak 3/3", "no decisions scored yet"}, []string{"0.00"}},
 		{"decrement still blocked", downBlocked, []string{"streak 5/3", "no decisions scored yet"}, []string{"0.00"}},
+		{"decrement above N but scored", downUnblocked, []string{"streak 5/3", "(shadow)"},
+			[]string{"blocks graduation", "graduat", "scored yet"}},
 		{"below N", plain, []string{"streak 1/3", "(shadow)"}, []string{"graduat", "confidence"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

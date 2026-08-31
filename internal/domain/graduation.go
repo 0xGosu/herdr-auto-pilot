@@ -101,8 +101,18 @@ func AdjustConfirmations(state SignatureState, delta int, confidence, threshold 
 		}
 		return state
 	}
-	// Promotion goes through the ONE existing gate rather than a second copy of
-	// its conditions, so a raised streak still cannot outrun the confidence
-	// threshold (FR-006).
-	return MaybeGraduate(state, confidence, threshold, graduationN)
+	// Only a RAISE may promote. A shadow rule can legitimately sit at or above
+	// N with confidence that has since risen past its threshold (nothing
+	// re-evaluates the gate between confirmations), and routing every nudge
+	// through MaybeGraduate then made `-` — the operator saying "trust this
+	// less" — hand the rule autonomy. A decrement can only ever lower the
+	// streak, so it never earns a promotion.
+	//
+	// Promotion itself goes through the ONE existing gate rather than a second
+	// copy of its conditions, so a raised streak still cannot outrun the
+	// confidence threshold (FR-006).
+	if delta > 0 {
+		return MaybeGraduate(state, confidence, threshold, graduationN)
+	}
+	return state
 }
