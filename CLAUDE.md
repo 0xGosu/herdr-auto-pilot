@@ -281,61 +281,28 @@ whose manifest carries exactly that version).
   fallback for sources a name cannot address. Keep the paired tests
   (`TestAddingATaskSourceNeverRenumbersTheExistingOnes` /
   `TestAcceptingAGeneratedTaskAppendsItsSource`).
-- **A Claude CONVERSATION name is read only from a proven composer, and its ABSENCE is
-  never evidence** — `[agents] sync_claude_session_name` (off by default) keeps an agent's hap
-  short name and the name `/rename` paints in Claude's composer rule CHARACTER-IDENTICAL: a named
-  session is folded (`domain.NormalizeAgentName`), ADOPTED (`store.AdoptAgentName`), and — when the
-  fold or a collision changed it — pushed BACK with `/rename <adopted>`; an unnamed one is simply
-  sent `/rename <hap name>`. The push-back is what makes the pair identical rather than merely
-  DERIVED, and it is why `NormalizeAgentName` must be a FIXED POINT over its own output: the next
-  capture reads back what was pushed and folds it again, so a non-idempotent fold would have the
-  two names trading spellings at every attention event, with a keystroke into the composer each
-  time (`TestNormalizeAgentNameIsAFixedPoint` / `TestSuffixedAgentNameIsAFixedPoint` /
-  `TestSessionSyncConvergesAfterOnePush`). The equality test is against the SESSION's spelling, not
-  the fold's input — comparing to `base` instead skips the push whenever the fold changed anything,
-  which is every interesting case. Five bounds are load-bearing.
-  **The name is not the terminal title.** Verified live 2026-09-01 (Claude Code 2.1.252): a session
-  whose `terminal_title_stripped` read "Say hi in one word" — the churning SUMMARY Claude
-  regenerates every few turns — painted no name in its rule at all, and only `/rename` put one
-  there. `agent list` carries the summary for free and no shell-out, which is exactly the trap:
-  adopting it renames every agent after a sentence that changes on its own.
-  **"No composer" is UNKNOWN, never "unnamed"** (`domain.ClaudeSessionFromPane` returns ok=false).
-  The daemon's classification read is `pane read --source recent`, a CONSUMING delta that
-  routinely returns no footer, and the push direction reads that state as its trigger — so
-  treating it as "unnamed" fires `/rename` at a session already carrying an operator's chosen name
-  and overwrites it. Same doctrine as `AgentModeFromPane`, and for a worse reason: this one writes.
-  **The push is a DELIVERY and carries a delivery's gates** — parked status only (Claude accepts
-  input while working and QUEUES it, and a working claude paints an ordinary empty composer, so
-  the composer alone cannot be the gate); `acquirePane`; kill switch and the per-agent disable
-  re-asked INSIDE the goroutine; the never-auto screen over the exact text; a `--source visible`
-  re-read immediately before the send (a modal may have risen in the gap, where Enter is rebound);
-  a re-read immediately after it, because a green herdr exit is not evidence a keystroke landed;
-  a proven-EMPTY composer, since `ClaudeComposerReady` proves the sandwich and not that it is
-  blank, and an operator's draft would be submitted with the command glued onto it; and a ceiling
-  per (agent, terminal, name), because the trigger is a STANDING condition rather than an event.
-  It runs on `d.spawn`, never a bare `go` — untracked it outlives `Run`, still pressing keys into
-  a pane and reading a closing store, which surfaced first as unrelated daemon tests failing at
-  random after the harness had stopped its daemon.
-  **A collision suffixes and re-aligns.** Claude permits two sessions to share a conversation name
-  (verified live, same directory), while `agent_names.name` is UNIQUE — so `AdoptAgentName` takes
-  the first free `base-N` in ONE transaction and the suffixed name is pushed back to the pane. It
-  is idempotent by `domain.AgentNameDerivedFrom`: without that, the collision loser walks to `-3`,
-  `-4`, … at every capture, renaming a settled agent forever and typing each new name at its pane.
-  **An already-identical pair costs NOTHING**, and that cheap check needs its own test: the at-send
-  screen refuses the redundant push too, so a test asserting only "nothing was typed" stays green
-  with the check removed — while every capture of every aligned agent still pays for a goroutine
-  and a herdr shell-out. `TestSessionSyncTypesNothingWhenTheNamesAlreadyMatch` therefore counts
-  pane READS, and that is the assertion mutation catches.
-  `internal/store` validates through `domain.AgentNameRE` rather than a copy, so a normalizer
-  emitting a name the store refuses cannot exist. Note the daemon suite wraps its store in
-  `failingStore`, which embeds the ports.StorePort INTERFACE — every type-asserted capability must
-  be forwarded there explicitly or the feature is silently off for the whole suite while its tests
-  pass. Keep the paired tests (`TestSessionSyncTreatsACaptureWithNoComposerAsUnknown` /
-  `…PushRefusesADraftedComposer` / `…PushRefusesAWorkingAgent` / `…PushRefusesADisabledAgent` /
-  `…PushRefusesWhileTheKillSwitchIsActive` / `…PushStopsAtItsCeiling` /
-  `…PushesTheSuffixedNameBackOnCollision` / `…CollisionIsIdempotentAcrossCaptures` — all six
-  refusals proved by mutation — plus `TestAdoptAgentNameIsIdempotentForASuffixedHolder` and
-  `TestClaudeComposerReadyAcceptsARealNamedComposer`, whose fixtures are REAL captures).
+- **A Claude CONVERSATION name is read only from a proven composer, and its ABSENCE is never
+  evidence** — `[agents] sync_claude_session_name` (off by default) keeps an agent's hap name and
+  the name `/rename` paints in Claude's composer rule byte-identical: a named session is folded
+  (`domain.NormalizeAgentName`), adopted (`store.AdoptAgentName`), and pushed BACK when either the
+  fold or a name collision changed it; an unnamed one is sent `/rename <hap name>`.
+  - **It is not the terminal title.** `agent list`'s `terminal_title_stripped` carries Claude's
+    churning conversation SUMMARY, free and with no shell-out — adopting it renames every agent
+    after a sentence that changes on its own (verified live 2026-09-01, Claude Code 2.1.252).
+  - **"No composer" is UNKNOWN, never "unnamed."** The classification read is `--source recent`, a
+    consuming delta that routinely shows no footer, and the push direction reads "unnamed" as its
+    TRIGGER — so the alternative overwrites an operator's chosen name.
+  - **The push is a DELIVERY**: parked agents only (a working claude QUEUES input and still paints
+    an ordinary composer), `acquirePane`, kill switch + per-agent disable re-asked inside the
+    goroutine, never-auto over the exact text, a `--source visible` re-read before AND after the
+    send, a proven-EMPTY composer (`ClaudeComposerReady` proves the sandwich, not that it is
+    blank), a ceiling per (agent, terminal, name), and `d.spawn` so shutdown drains it.
+  - **`NormalizeAgentName` must stay a FIXED POINT**, or the pushed name is re-folded on the next
+    capture and the two names trade spellings forever. Same for `SuffixedAgentName`; collisions
+    are idempotent via `domain.AgentNameDerivedFrom`. An identical pair must cost no pane read —
+    the at-send screen also refuses the redundant push, so only a read COUNT catches its removal.
+  - Test trap: the daemon suite's `failingStore` embeds the ports.StorePort INTERFACE, so every
+    type-asserted capability must be forwarded there or the feature is silently off suite-wide.
 - **Fail safe on the daemon path** — no panics; every error resolves to escalate + audit +
   log. Wrap new handler/adapter calls in `logging.Guard`.
 - **Safety controls are never bypassed** — LLM submissions and learned rules alike are
