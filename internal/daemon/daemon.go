@@ -253,6 +253,20 @@ type Daemon struct {
 	// (guarded by mu); outcomes return through sweepResults.
 	sweepInFlight map[string]bool
 
+	// sessionRenamePushes counts the `/rename` keystrokes spent per
+	// (agent, terminal, name) by the Claude session-name sync, so a pane that
+	// never takes the rename is not typed into on every capture forever
+	// (guarded by mu). In-memory: a restart forgets the budget, which retries
+	// a few times rather than never — the fail-safe direction for a write that
+	// changes nothing but a label.
+	sessionRenamePushes map[string]int
+
+	// sessionSyncNoted remembers the last reason the session-name sync
+	// reported for an agent, so a STANDING condition (an unfoldable session
+	// name, a collision that keeps colliding) is logged once rather than on
+	// every attention event (guarded by mu).
+	sessionSyncNoted map[string]string
+
 	// toggleAttempt records, per agent, the signature of the multi-select form
 	// this daemon last started answering — the evidence that lets a later
 	// delivery accept a tab whose boxes are ALREADY ticked. Without it,
@@ -532,6 +546,8 @@ func New(opt Options) (*Daemon, error) {
 		lastAutoNoop:              map[string]time.Time{},
 		preDeliveryReviewInFlight: map[string]preDeliveryReviewFlight{},
 		sweepInFlight:             map[string]bool{},
+		sessionRenamePushes:       map[string]int{},
+		sessionSyncNoted:          map[string]string{},
 		toggleAttempt:             map[string]string{},
 		idleSince:                 map[string]idleMark{},
 		autoTaskClaim:             map[string]taskClaim{},
@@ -1554,6 +1570,7 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 	delete(d.lastAutoNoop, a.AgentID)
 	delete(d.idleSince, a.AgentID)
 	delete(d.autoTaskClaim, a.AgentID)
+	d.forgetSessionRenamePushesLocked(a.AgentID)
 	d.mu.Unlock()
 	// sweepInFlight is deliberately left alone: it is a live-goroutine claim
 	// released by its owner's defer, and clearing it here would license a
@@ -1795,6 +1812,13 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 		}, tr, now)
 		return
 	}
+
+	// Align the agent's short name with its Claude conversation name, both
+	// directions, while the capture is in hand — Path 1 costs no shell-out at
+	// all here. Off unless [agents] sync_claude_session_name is set, and it
+	// deliberately runs BEFORE classification so a rename is not gated on the
+	// pane happening to classify into a situation.
+	agentName = d.syncClaudeSessionName(ctx, tr, agentName, pane)
 
 	situation := cls.Classify(tr.AgentType, tr.Status, pane)
 	situation.AgentID = tr.AgentID

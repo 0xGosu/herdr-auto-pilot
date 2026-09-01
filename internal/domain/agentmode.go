@@ -190,9 +190,19 @@ var (
 	// permissive twin, used only to prove a composer, never to delete.
 	//
 	// The evidence required is a long run of rule glyphs at the START and at
-	// least two more at the END, which a titled rule and a plain one both
+	// least ONE more at the END, which a titled rule and a plain one both
 	// satisfy and ordinary prose does not.
-	claudeComposerRuleRE = regexp.MustCompile(`^[─━]{8,}(?:[^\n]*[─━]{2,})?$`)
+	//
+	// One, not two. The 2026-08-09 capture this was first written against
+	// happened to end "…── create-hapmode-probe-file ──", and {2,} was read
+	// off that single sample; live Claude Code 2.1.252 renders exactly one
+	// closing glyph ("…───── add-sweep-command-grid ─", captured 2026-09-01
+	// and kept as testdata/claude_session_named.txt). So {2,} matched no real
+	// titled rule at all, and ClaudeComposerReady refused every NAMED session
+	// — the precise failure its own comment says it exists to prevent, and a
+	// silent one, because a refusal to change the mode looks like the safety
+	// gate working.
+	claudeComposerRuleRE = regexp.MustCompile(`^[─━]{8,}(?:[^\n]*[─━]+)?$`)
 
 	// codexFooterRE recognizes Codex's composer status footer — the line naming
 	// the model and the working directory ("gpt-5.6-sol high · /tmp"). It is the
@@ -331,6 +341,19 @@ func AgentModeFromPane(agentType, pane string) (AgentMode, bool) {
 // body — no second rule, which is what keeps a rule-delimited modal elsewhere on
 // screen from pairing with an unrelated caret.
 func ClaudeComposerReady(pane string) bool {
+	_, ok := claudeComposerBounds(pane)
+	return ok
+}
+
+// claudeComposerBounds locates Claude's ordinary composer inside a capture and
+// returns its boundaries. ok=false means no composer was positively shown,
+// which is the ONLY evidence ClaudeComposerReady accepts and the only state in
+// which a session name may be read from — or written to — this pane.
+//
+// It exists so ClaudeComposerReady and ClaudeSessionName cannot drift: the
+// title is rendered INSIDE the composer's top rule, so "is this a composer"
+// and "which rule carries the title" must be the same scan, answered once.
+func claudeComposerBounds(pane string) (claudeComposerRegion, bool) {
 	lines := footerWindow(pane)
 	for i := len(lines) - 2; i >= 1; i-- {
 		if !claudeComposerLineRE.MatchString(strings.TrimSpace(lines[i])) {
@@ -341,11 +364,21 @@ func ClaudeComposerReady(pane string) bool {
 		}
 		for j := i + 1; j < len(lines); j++ {
 			if claudeComposerRuleRE.MatchString(strings.TrimSpace(lines[j])) {
-				return true
+				return claudeComposerRegion{lines: lines, topRule: i - 1, caret: i, bottomRule: j}, true
 			}
 		}
 	}
-	return false
+	return claudeComposerRegion{}, false
+}
+
+// claudeComposerRegion is one located composer: the capture window it was found in
+// and the indices of its top rule (which carries the session name), its "❯"
+// caret line, and the rule closing it.
+type claudeComposerRegion struct {
+	lines      []string
+	topRule    int
+	caret      int
+	bottomRule int
 }
 
 // CodexComposerReady reports whether the capture positively shows Codex's

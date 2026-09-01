@@ -281,6 +281,28 @@ whose manifest carries exactly that version).
   fallback for sources a name cannot address. Keep the paired tests
   (`TestAddingATaskSourceNeverRenumbersTheExistingOnes` /
   `TestAcceptingAGeneratedTaskAppendsItsSource`).
+- **A Claude CONVERSATION name is read only from a proven composer, and its ABSENCE is never
+  evidence** — `[agents] sync_claude_session_name` (off by default) keeps an agent's hap name and
+  the name `/rename` paints in Claude's composer rule byte-identical: a named session is folded
+  (`domain.NormalizeAgentName`), adopted (`store.AdoptAgentName`), and pushed BACK when either the
+  fold or a name collision changed it; an unnamed one is sent `/rename <hap name>`.
+  - **It is not the terminal title.** `agent list`'s `terminal_title_stripped` carries Claude's
+    churning conversation SUMMARY, free and with no shell-out — adopting it renames every agent
+    after a sentence that changes on its own (verified live 2026-09-01, Claude Code 2.1.252).
+  - **"No composer" is UNKNOWN, never "unnamed."** The classification read is `--source recent`, a
+    consuming delta that routinely shows no footer, and the push direction reads "unnamed" as its
+    TRIGGER — so the alternative overwrites an operator's chosen name.
+  - **The push is a DELIVERY**: parked agents only (a working claude QUEUES input and still paints
+    an ordinary composer), `acquirePane`, kill switch + per-agent disable re-asked inside the
+    goroutine, never-auto over the exact text, a `--source visible` re-read before AND after the
+    send, a proven-EMPTY composer (`ClaudeComposerReady` proves the sandwich, not that it is
+    blank), a ceiling per (agent, terminal, name), and `d.spawn` so shutdown drains it.
+  - **`NormalizeAgentName` must stay a FIXED POINT**, or the pushed name is re-folded on the next
+    capture and the two names trade spellings forever. Same for `SuffixedAgentName`; collisions
+    are idempotent via `domain.AgentNameDerivedFrom`. An identical pair must cost no pane read —
+    the at-send screen also refuses the redundant push, so only a read COUNT catches its removal.
+  - Test trap: the daemon suite's `failingStore` embeds the ports.StorePort INTERFACE, so every
+    type-asserted capability must be forwarded there or the feature is silently off suite-wide.
 - **Fail safe on the daemon path** — no panics; every error resolves to escalate + audit +
   log. Wrap new handler/adapter calls in `logging.Guard`.
 - **Safety controls are never bypassed** — LLM submissions and learned rules alike are

@@ -2261,6 +2261,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"tui.disable_check_for_update":         "true",
 		"tui.max_instances":                    "2",
 		"cli.ai_agent_friendly_output":         "false",
+		"agents.sync_claude_session_name":      "true",
 	}
 
 	registry := make(map[string]bool, len(frontend.ConfigFieldKeys))

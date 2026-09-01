@@ -62,6 +62,18 @@ type InspectorPort interface {
 	PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, error)
 }
 
+// AgentNamerPort is implemented by stores that can align an agent's short
+// name with the name its agent session carries. Optional: the daemon
+// type-asserts and skips the session-name sync entirely when absent, so no
+// fake store has to grow a method to keep compiling.
+//
+// AdoptAgentName assigns base, or the first free base-N variant, and returns
+// what it actually assigned — the caller compares that to base to learn it
+// lost a collision and must push the suffixed name back to the pane.
+type AgentNamerPort interface {
+	AdoptAgentName(ctx context.Context, agentID, base string) (string, error)
+}
+
 // RetentionPort is implemented by stores that can bound their own on-disk
 // growth. Optional: callers type-assert and simply skip the sweep when absent,
 // so an in-memory or fake store needs no retention support to be usable.

@@ -6441,7 +6441,19 @@ func (m Model) renderDetail(b *strings.Builder) {
 // agentsRowFmt lays out the Agents list: name, id, type, status (all fixed
 // width so the trailing numeric columns line up), the agent's task count, then
 // the four lifetime counters right-aligned and the live age last.
-const agentsRowFmt = "%-18s %-12s %-12s %-10s %7s %5s %5s %5s %5s  %s"
+// agentNameColWidth caps how much of an agent's short name any TABLE column
+// renders. A name used to be generated ("brave-otter") and comfortably inside
+// the column, but a name synced from a Claude conversation is operator-written
+// and may run to domain.MaxAgentNameLen — long enough to push every column
+// after it out of alignment for the whole table, not just its own row.
+//
+// It bounds the DISPLAY only. The stored name is never shortened: it is the
+// selector `hap agent <name>` and every other command take, so truncating it
+// anywhere but on screen would hand the operator a name that does not resolve.
+// The detail pane (Short name) prints it in full for exactly that reason.
+const agentNameColWidth = 15
+
+const agentsRowFmt = "%-15s %-12s %-12s %-10s %7s %5s %5s %5s %5s  %s"
 
 func (m Model) renderAgents(b *strings.Builder) {
 	agents := m.visibleAgents()
@@ -6464,7 +6476,7 @@ func (m Model) renderAgents(b *strings.Builder) {
 	start, end := m.window(len(agents))
 	for i := start; i < end; i++ {
 		a := agents[i]
-		name := orDash(m.data.status.AgentName(a.AgentID))
+		name := oneLine(orDash(m.data.status.AgentName(a.AgentID)), agentNameColWidth)
 		s := m.data.status.StatsFor(a.AgentID)
 		status := a.Status
 		if m.data.status.AgentDisabled(a.AgentID) {
@@ -6587,8 +6599,13 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		// from their headers.
 		// WHEN is 12 wide to fit the humanized age ("5h 59m ago") and the
 		// exact-timestamp fallback ("Jul 19 14:30") used at ≥ 6h.
-		escRowFmt = "%-1s %-6s %-12s %-14s %-8s %-14s %4s %-6s %5s  %s"
-		escPrefix = 80
+		escRowFmt = "%-1s %-6s %-12s %-14s %-8s %-15s %4s %-6s %5s  %s"
+		// The rendered width of every column before RATIONALE, separators
+		// included: 1+6+12+14+8+15+4+6+5 fields and 10 gaps. It MUST be
+		// recomputed whenever a width above changes — it grew by one when the
+		// agent column went from 14 to 15 — or the last column overruns and is
+		// clipped by the row clamp.
+		escPrefix = 81
 	)
 	header := fmt.Sprintf(escRowFmt,
 		"", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "RATIONALE / SUGGESTION")
@@ -6607,7 +6624,7 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		rWidth, sWidth := m.budget(escPrefix, e.Suggestion != "")
 		line := fmt.Sprintf(escRowFmt,
 			mark, fmt.Sprintf("#%d", e.ID), humanizeWhen(e.CreatedAt, m.renderNow()), e.SituationType,
-			oneLine(orDash(m.agentTypeFor(e)), 8), oneLine(agent, 14),
+			oneLine(orDash(m.agentTypeFor(e)), 8), oneLine(agent, agentNameColWidth),
 			llmConfShort(e.LLMConfidence), m.ruleMarker(e.Signature), frontend.ConfidenceLabel(e.Confidence),
 			oneLine(e.Rationale, rWidth))
 		if e.Suggestion != "" {
@@ -6657,9 +6674,12 @@ func (m Model) renderAudit(b *strings.Builder) {
 	// self-reported 0-100 ("-" when the row has no LLM score).
 	// The STATUS column is sized from the label width rather than hardcoded, so
 	// adding a longer status label cannot silently shift the ACTION column.
-	auditRowFmt := fmt.Sprintf("%%-6s %%-14s %%-10s %%-8s %%-14s %%4s %%-6s %%5s %%-%ds  %%s",
+	auditRowFmt := fmt.Sprintf("%%-6s %%-14s %%-10s %%-8s %%-15s %%4s %%-6s %%5s %%-%ds  %%s",
 		frontend.AuditStatusWidth)
-	actWidth, _ := m.budget(86, false)
+	// Every column before ACTION: 6+14+10+8+15+4+6+5 fields, nine gaps, and
+	// the AuditStatusWidth-sized STATUS column (8). Grew by one with the agent
+	// column — see the note on escPrefix.
+	actWidth, _ := m.budget(87, false)
 	header := fmt.Sprintf(auditRowFmt,
 		"ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "ACTION")
 	fmt.Fprintln(b, m.styles().section.Render(header))
@@ -6672,7 +6692,7 @@ func (m Model) renderAudit(b *strings.Builder) {
 		}
 		line := fmt.Sprintf(auditRowFmt,
 			fmt.Sprintf("#%d", r.ID), humanizeWhen(r.CreatedAt, m.renderNow()),
-			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), 14),
+			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), agentNameColWidth),
 			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), frontend.ConfidenceLabel(r.Confidence),
 			frontend.AuditStatusLabel(r),
 			oneLine(r.Action, actWidth))

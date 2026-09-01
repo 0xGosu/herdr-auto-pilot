@@ -74,6 +74,11 @@ type fakeHerdr struct {
 	listAgentsCalls int
 	agentsPinned    bool
 	failListAgents  bool
+	// onSend runs (under the lock) after each accepted Send, so a test can
+	// model a pane that CHANGES in response to what was typed. The Claude
+	// session-rename push verifies its own keystroke by re-reading the pane,
+	// so a fake that never repaints could only ever prove the failure path.
+	onSend func(f *fakeHerdr, input string)
 }
 
 func (f *fakeHerdr) Send(ctx context.Context, paneID, input string) error {
@@ -83,6 +88,9 @@ func (f *fakeHerdr) Send(ctx context.Context, paneID, input string) error {
 		return errors.New("induced send failure")
 	}
 	f.sent = append(f.sent, input)
+	if f.onSend != nil {
+		f.onSend(f, input)
+	}
 	return nil
 }
 
@@ -490,6 +498,22 @@ type failingStore struct {
 	// Counted, so a test can let a fault clear after N reads.
 	failGetAudit  bool
 	getAuditCalls int
+}
+
+// AdoptAgentName forwards the OPTIONAL ports.AgentNamerPort capability.
+//
+// It is not decoration: failingStore embeds the ports.StorePort INTERFACE, so
+// a concrete method on the wrapped store is not promoted through it and the
+// daemon's type assertion answers false. Every capability reached by
+// type-assertion has to be forwarded here explicitly, or the feature is
+// silently switched off for the whole daemon suite and its tests pass while
+// asserting nothing.
+func (s *failingStore) AdoptAgentName(ctx context.Context, agentID, base string) (string, error) {
+	namer, ok := s.StorePort.(ports.AgentNamerPort)
+	if !ok {
+		return "", errors.New("wrapped store cannot rename agents")
+	}
+	return namer.AdoptAgentName(ctx, agentID, base)
 }
 
 func (s *failingStore) GetAudit(ctx context.Context, id int64) (*domain.AuditRecord, error) {

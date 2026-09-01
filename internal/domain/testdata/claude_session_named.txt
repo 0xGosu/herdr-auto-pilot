@@ -1,0 +1,12 @@
+    assumption is doing a lot of work.
+
+  If you want to keep looking: a different symbol, or the same one over a window containing more than one regime, would be a better test than re-searching this one harder — searching
+  harder raises the null benchmark and makes the gate harder to clear, by design.
+
+✻ Churned for 5m 40s · done 2:38 AM
+                                                                                                                                                  ✔ Update installed · Restart to update
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── add-sweep-command-grid ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  binance-trading-bot-optimiser (feat/exhaustive-sweep-command) | Opus 5 (45%) | Concise | 6dc81b07-1414-4175-a68c-d9690906574e
+  ⏵⏵ auto mode on (shift+tab to cycle) · PR #7 · ← for agents
