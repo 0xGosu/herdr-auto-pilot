@@ -104,6 +104,30 @@ func TestRealClaudeSessionNameAcceptsFreeText(t *testing.T) {
 	if !domain.ValidAgentName(folded) {
 		t.Fatalf("%q is not storable as an agent name", folded)
 	}
+
+	// The push-back half, against the real CLI: the fold is written to the
+	// session so the two names become BYTE-IDENTICAL rather than merely
+	// derived from one another.
+	if err := ports.SendToAgent(ctx, cli, pane, "claude", domain.ClaudeRenameCommand(folded)); err != nil {
+		t.Fatalf("send the folded name back: %v", err)
+	}
+	settled, ok := waitForSessionName(t, cli, pane, folded)
+	if !ok {
+		content, _ := cli.ReadPaneVisible(ctx, pane, 40)
+		t.Fatalf("the folded name did not land; pane tail:\n%s", tailLines(content, 12))
+	}
+	if settled.Name != folded {
+		t.Fatalf("session name is %q, want %q byte-for-byte", settled.Name, folded)
+	}
+
+	// Convergence against a REAL render. The daemon re-reads this pane on the
+	// next capture and folds what it finds; if that is not a fixed point the
+	// two names trade spellings forever, one keystroke at a time.
+	again, ok := domain.NormalizeAgentName(settled.Name)
+	if !ok || again != settled.Name {
+		t.Fatalf("the live session name %q folds to %q (ok=%v); the sync would never settle",
+			settled.Name, again, ok)
+	}
 }
 
 func readClaudeSession(t *testing.T, cli *herdr.CLI, pane string) (domain.ClaudeSession, bool) {

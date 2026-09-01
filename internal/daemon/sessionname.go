@@ -87,20 +87,35 @@ func (d *Daemon) syncClaudeSessionName(ctx context.Context, tr domain.AgentTrans
 			slog.Info("agent renamed to match its claude session", "agent", tr.AgentID,
 				"was", agentName, "now", assigned, "session_name", sess.Name)
 		}
-		if assigned == base {
+		if assigned == sess.Name {
+			// Byte-identical already: the goal state, and the only one that
+			// needs no keystroke.
 			d.clearSessionSyncNote(tr.AgentID)
+			return assigned
 		}
+		// The two spellings differ, so the session is renamed to what hap
+		// actually stored. Both causes land here and both are pushed, because
+		// the contract is a CHARACTER-IDENTICAL pair, not a pair that merely
+		// derives from one name:
+		//
+		//   fold      "My Feature: Work #2" -> my-feature-work-2
+		//   collision "feature"             -> feature-2  (another agent holds
+		//             the plain name; Claude itself permits the duplicate)
+		//
+		// Convergence depends on NormalizeAgentName being a FIXED POINT over
+		// its own output — the next capture reads back what was pushed and
+		// must fold it to itself, or the pair would trade spellings forever
+		// (see TestNormalizeAgentNameIsAFixedPoint).
+		reason := "fold:" + sess.Name + "->" + assigned
 		if assigned != base {
-			// Another agent already holds the plain name — two worktrees on
-			// one feature is the ordinary cause, and Claude itself permits the
-			// duplicate. Push the suffixed name back so the two sides land on
-			// one value again instead of silently differing.
-			d.noteSessionSyncOnce(tr.AgentID, "collision:"+base+"->"+assigned, func() {
-				slog.Info("claude session name collided; pushing the suffixed name back to the pane",
-					"agent", tr.AgentID, "wanted", base, "assigned", assigned)
-			})
-			d.startSessionRename(ctx, tr, assigned)
+			reason = "collision:" + base + "->" + assigned
 		}
+		d.noteSessionSyncOnce(tr.AgentID, reason, func() {
+			slog.Info("claude session name differs from the stored agent name; pushing it back to the pane",
+				"agent", tr.AgentID, "session_name", sess.Name, "agent_name", assigned,
+				"collision", assigned != base)
+		})
+		d.startSessionRename(ctx, tr, assigned)
 		return assigned
 	}
 

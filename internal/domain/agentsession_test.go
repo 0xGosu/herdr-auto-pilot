@@ -275,3 +275,47 @@ func TestClaudeComposerReadyRefusesEveryModalInTheCorpus(t *testing.T) {
 		t.Fatalf("only %d modal captures were checked; the corpus glob is not matching", checked)
 	}
 }
+
+// Convergence for the byte-identical sync depends on this and nothing else.
+//
+// Once hap pushes the folded name back to the session, the NEXT capture reads
+// that name and folds it again. If the fold were not a fixed point over its own
+// output the pair would never settle: each capture would find a difference,
+// rename, and push — trading spellings at every attention event, forever, with
+// a keystroke into the agent's composer each time.
+func TestNormalizeAgentNameIsAFixedPoint(t *testing.T) {
+	for _, raw := range []string{
+		"add-sweep-command-grid", "My Feature: Work #2", "  spaced  out  ",
+		"snake_case_kept", "---leading-and-trailing---", "9lives",
+		"this-is-a-really-long-conversation-name-that-goes-past-thirty-two",
+		strings.Repeat("very-long-name-", 12), "UPPER CASE", "a.b.c", "one/two\\three",
+		"tabs\tand\nnewlines", "emoji-🚀-inside", "trailing---",
+	} {
+		once, ok := NormalizeAgentName(raw)
+		if !ok {
+			continue
+		}
+		twice, ok := NormalizeAgentName(once)
+		if !ok {
+			t.Errorf("NormalizeAgentName(%q) = %q, which then failed to normalize", raw, once)
+			continue
+		}
+		if twice != once {
+			t.Errorf("not a fixed point: %q -> %q -> %q", raw, once, twice)
+		}
+	}
+}
+
+// Every suffixed variant must be a fixed point too, or a collision loser would
+// trade spellings the same way.
+func TestSuffixedAgentNameIsAFixedPoint(t *testing.T) {
+	for _, base := range []string{"feature", "my-feature-work-2", strings.Repeat("a", MaxAgentNameLen)} {
+		for n := 2; n <= MaxAgentNameSuffix; n++ {
+			name := SuffixedAgentName(base, n)
+			got, ok := NormalizeAgentName(name)
+			if !ok || got != name {
+				t.Fatalf("SuffixedAgentName(%q, %d) = %q normalizes to %q (ok=%v)", base, n, name, got, ok)
+			}
+		}
+	}
+}

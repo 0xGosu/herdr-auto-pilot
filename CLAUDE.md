@@ -283,9 +283,17 @@ whose manifest carries exactly that version).
   `TestAcceptingAGeneratedTaskAppendsItsSource`).
 - **A Claude CONVERSATION name is read only from a proven composer, and its ABSENCE is
   never evidence** — `[agents] sync_claude_session_name` (off by default) keeps an agent's hap
-  short name and the name `/rename` paints in Claude's composer rule on one value, in whichever
-  direction has one: a named session is ADOPTED (`domain.NormalizeAgentName` → `store.AdoptAgentName`),
-  an unnamed one is SENT `/rename <hap name>`. Four bounds are load-bearing.
+  short name and the name `/rename` paints in Claude's composer rule CHARACTER-IDENTICAL: a named
+  session is folded (`domain.NormalizeAgentName`), ADOPTED (`store.AdoptAgentName`), and — when the
+  fold or a collision changed it — pushed BACK with `/rename <adopted>`; an unnamed one is simply
+  sent `/rename <hap name>`. The push-back is what makes the pair identical rather than merely
+  DERIVED, and it is why `NormalizeAgentName` must be a FIXED POINT over its own output: the next
+  capture reads back what was pushed and folds it again, so a non-idempotent fold would have the
+  two names trading spellings at every attention event, with a keystroke into the composer each
+  time (`TestNormalizeAgentNameIsAFixedPoint` / `TestSuffixedAgentNameIsAFixedPoint` /
+  `TestSessionSyncConvergesAfterOnePush`). The equality test is against the SESSION's spelling, not
+  the fold's input — comparing to `base` instead skips the push whenever the fold changed anything,
+  which is every interesting case. Five bounds are load-bearing.
   **The name is not the terminal title.** Verified live 2026-09-01 (Claude Code 2.1.252): a session
   whose `terminal_title_stripped` read "Say hi in one word" — the churning SUMMARY Claude
   regenerates every few turns — painted no name in its rule at all, and only `/rename` put one
@@ -313,6 +321,11 @@ whose manifest carries exactly that version).
   the first free `base-N` in ONE transaction and the suffixed name is pushed back to the pane. It
   is idempotent by `domain.AgentNameDerivedFrom`: without that, the collision loser walks to `-3`,
   `-4`, … at every capture, renaming a settled agent forever and typing each new name at its pane.
+  **An already-identical pair costs NOTHING**, and that cheap check needs its own test: the at-send
+  screen refuses the redundant push too, so a test asserting only "nothing was typed" stays green
+  with the check removed — while every capture of every aligned agent still pays for a goroutine
+  and a herdr shell-out. `TestSessionSyncTypesNothingWhenTheNamesAlreadyMatch` therefore counts
+  pane READS, and that is the assertion mutation catches.
   `internal/store` validates through `domain.AgentNameRE` rather than a copy, so a normalizer
   emitting a name the store refuses cannot exist. Note the daemon suite wraps its store in
   `failingStore`, which embeds the ports.StorePort INTERFACE — every type-asserted capability must

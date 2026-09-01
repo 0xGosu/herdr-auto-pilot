@@ -9,6 +9,14 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
+// readPaneNow returns what the fake pane currently shows, so a test can feed
+// the daemon the screen its own push just repainted.
+func (f *fakeHerdr) readPaneNow() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pane
+}
+
 const sessionSyncOn = "[agents]\nsync_claude_session_name = true\n"
 
 // claudeComposerPane renders a Claude pane whose composer carries sessionName
@@ -73,6 +81,10 @@ func TestSessionSyncRenamesTheAgentToItsClaudeSessionName(t *testing.T) {
 	h := newHarness(t, sessionSyncOn)
 	ctx := context.Background()
 	generated := agentNameNow(t, h, "pA")
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("My Feature: Work #2", "")
+	h.herdr.onSend = renameOnSend
+	h.herdr.mu.Unlock()
 
 	got := h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
 		claudeComposerPane("My Feature: Work #2", ""))
@@ -83,9 +95,97 @@ func TestSessionSyncRenamesTheAgentToItsClaudeSessionName(t *testing.T) {
 	if stored := agentNameNow(t, h, "pA"); stored != "my-feature-work-2" {
 		t.Fatalf("stored name is %q, want my-feature-work-2", stored)
 	}
-	// The session already carries the name; nothing may be typed at the pane.
-	if !noSendWithin(t, h, 200*time.Millisecond) {
-		t.Fatalf("a named session must not be typed into, got %v", h.herdr.sentInputs())
+}
+
+// The contract is a CHARACTER-IDENTICAL pair, so the lossy fold has to be
+// pushed back: adopting "my-feature-work-2" while the session still reads
+// "My Feature: Work #2" leaves the two names merely DERIVED from one another,
+// which is what this rules out.
+func TestSessionSyncPushesTheFoldedNameBackToTheSession(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("My Feature: Work #2", "")
+	h.herdr.onSend = renameOnSend
+	h.herdr.mu.Unlock()
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
+		claudeComposerPane("My Feature: Work #2", ""))
+
+	if !waitForSend(t, h, "/rename my-feature-work-2") {
+		t.Fatalf("the folded name must be pushed back, got %v", h.herdr.sentInputs())
+	}
+	sess, ok := domain.ClaudeSessionFromPane(h.herdr.readPaneNow())
+	if !ok || sess.Name != "my-feature-work-2" {
+		t.Fatalf("session name is %q (composer seen=%v), want my-feature-work-2", sess.Name, ok)
+	}
+	if stored := agentNameNow(t, h, "pA"); stored != sess.Name {
+		t.Fatalf("agent name %q and session name %q are not byte-identical", stored, sess.Name)
+	}
+}
+
+// A pair that already matches needs no keystroke — otherwise every capture of
+// every synced agent types into its composer.
+func TestSessionSyncTypesNothingWhenTheNamesAlreadyMatch(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	if _, err := h.raw.EnsureAgentName(ctx, "pA"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.raw.AdoptAgentName(ctx, "pA", "already-aligned"); err != nil {
+		t.Fatal(err)
+	}
+	h.herdr.setPane(claudeComposerPane("already-aligned", ""))
+	reads := len(h.herdr.readLineCalls())
+
+	got := h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), "already-aligned",
+		claudeComposerPane("already-aligned", ""))
+
+	if got != "already-aligned" {
+		t.Fatalf("sync returned %q", got)
+	}
+	if !noSendWithin(t, h, 300*time.Millisecond) {
+		t.Fatalf("an already-identical pair must not be typed into, got %v", h.herdr.sentInputs())
+	}
+	// And no pane READ either. The at-send screen would also refuse this, so
+	// asserting only "nothing was typed" passes with the cheap check removed —
+	// while every capture of every aligned agent still paid for a goroutine
+	// and a herdr shell-out. The saving IS the check.
+	if got := len(h.herdr.readLineCalls()); got != reads {
+		t.Fatalf("an already-identical pair cost %d pane reads; it must cost none", got-reads)
+	}
+}
+
+// Convergence, driven the way the daemon really runs it: capture, push, then
+// capture what was pushed. The pair must SETTLE — a second push would mean the
+// fold is not a fixed point and the two names trade spellings forever.
+func TestSessionSyncConvergesAfterOnePush(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("My Feature: Work #2", "")
+	h.herdr.onSend = renameOnSend
+	h.herdr.mu.Unlock()
+
+	name := h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
+		claudeComposerPane("My Feature: Work #2", ""))
+	if !waitForSend(t, h, "/rename my-feature-work-2") {
+		t.Fatal("the first capture should have pushed the folded name")
+	}
+
+	// Every later capture reads the pushed name back and must do nothing.
+	for i := 0; i < 4; i++ {
+		pane := h.herdr.readPaneNow()
+		got := h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), name, pane)
+		if got != name {
+			t.Fatalf("capture %d moved the name from %q to %q", i, name, got)
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	if got := len(h.herdr.sentInputs()); got != 1 {
+		t.Fatalf("the pair should settle after ONE push, got %d: %v", got, h.herdr.sentInputs())
 	}
 }
 

@@ -548,12 +548,15 @@ ai_agent_friendly_output = true   # append a "Next steps" footer to command outp
 sync_claude_session_name = false  # keep a claude agent's hap short name and its
                                   # Claude CONVERSATION name — what `/rename`
                                   # sets, painted in the composer's top rule —
-                                  # on the same value, in whichever direction
-                                  # has one:
-                                  #   named session   -> hap adopts it, folded
-                                  #                      to a short name
+                                  # CHARACTER-IDENTICAL:
+                                  #   named session   -> hap folds it to a
+                                  #                      storable short name
                                   #                      ("My Feature: Work #2"
-                                  #                      -> my-feature-work-2)
+                                  #                      -> my-feature-work-2),
+                                  #                      adopts that, and sends
+                                  #                      `/rename` back so the
+                                  #                      session reads the same
+                                  #                      string
                                   #   unnamed session -> hap types
                                   #                      `/rename <hap name>`
                                   #                      into the pane
