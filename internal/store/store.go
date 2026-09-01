@@ -22,7 +22,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -2344,8 +2343,12 @@ func (s *Store) GetLLMRequest(ctx context.Context, requestID string) (*domain.LL
 // --- Agent short names ---
 
 // agentNameRE constrains operator-chosen agent names: short, lowercase,
-// shell- and TOML-friendly.
-var agentNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+// shell- and TOML-friendly. It delegates to domain.AgentNameRE rather than
+// restating the pattern, so the WRITER here and the two producers there
+// (GenerateAgentName, NormalizeAgentName) can never disagree about what is
+// storable — a normalizer emitting a name this rejected would be retried, and
+// refused, on every single pane capture.
+var agentNameRE = domain.AgentNameRE
 
 // EnsureAgentName returns the agent's short name, generating and persisting
 // one on first sight. Insert-if-absent, callable by the daemon and by
@@ -2497,6 +2500,72 @@ func (s *Store) AssignAgentName(ctx context.Context, agentID, name string) error
 			agentID, name, time.Now().UnixMilli())
 		return err
 	})
+}
+
+// AdoptAgentName gives the agent the short name `base`, or the first free
+// `base-N` variant when another agent already holds it, and returns the name
+// actually assigned. It is the write half of the Claude session-name sync.
+//
+// The whole probe-and-assign runs in ONE transaction. Split across two
+// statements, two agents whose Claude sessions carry the same conversation
+// name — two worktrees on one feature, which is ordinary rather than exotic,
+// and which Claude itself permits (verified live 2026-09-01: `/rename` accepts
+// a duplicate name even in the same directory) — would both probe "free" and
+// the loser would get a UNIQUE violation surfaced as a hard error on every
+// capture.
+//
+// It is IDEMPOTENT by construction: an agent already wearing base, or any of
+// its suffixed variants, keeps exactly what it has. Without that the collision
+// loser would be walked to the next suffix at every capture (`feature-2`,
+// `feature-3`, …), renaming a settled agent forever and pushing each new name
+// back into its pane.
+//
+// Returns ErrUnknownAgent when no name row exists: the sync adjusts an
+// existing agent's name and must never invent a row for an id herdr has not
+// reported — EnsureAgentName owns creation.
+func (s *Store) AdoptAgentName(ctx context.Context, agentID, base string) (string, error) {
+	if !agentNameRE.MatchString(base) {
+		return "", fmt.Errorf("invalid name %q: use 1-32 lowercase letters, digits, - or _", base)
+	}
+	assigned := ""
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		var current string
+		err := tx.QueryRowContext(ctx,
+			`SELECT name FROM agent_names WHERE agent_id = ?`, agentID).Scan(&current)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("no agent known as %q: %w", agentID, ports.ErrUnknownAgent)
+		}
+		if err != nil {
+			return err
+		}
+		if domain.AgentNameDerivedFrom(current, base) {
+			assigned = current // already aligned; nothing to write
+			return nil
+		}
+		for n := 1; n <= domain.MaxAgentNameSuffix; n++ {
+			candidate := domain.SuffixedAgentName(base, n)
+			var taken int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM agent_names WHERE name = ? AND agent_id != ?`,
+				candidate, agentID).Scan(&taken); err != nil {
+				return err
+			}
+			if taken > 0 {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE agent_names SET name = ? WHERE agent_id = ?`, candidate, agentID); err != nil {
+				return err
+			}
+			assigned = candidate
+			return nil
+		}
+		return fmt.Errorf("every variant of %q up to %d is taken", base, domain.MaxAgentNameSuffix)
+	})
+	if err != nil {
+		return "", err
+	}
+	return assigned, nil
 }
 
 // ResolveAgent maps a short name or agent/pane id to the agent id. Targets

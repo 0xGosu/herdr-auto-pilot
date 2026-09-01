@@ -281,6 +281,48 @@ whose manifest carries exactly that version).
   fallback for sources a name cannot address. Keep the paired tests
   (`TestAddingATaskSourceNeverRenumbersTheExistingOnes` /
   `TestAcceptingAGeneratedTaskAppendsItsSource`).
+- **A Claude CONVERSATION name is read only from a proven composer, and its ABSENCE is
+  never evidence** — `[agents] sync_claude_session_name` (off by default) keeps an agent's hap
+  short name and the name `/rename` paints in Claude's composer rule on one value, in whichever
+  direction has one: a named session is ADOPTED (`domain.NormalizeAgentName` → `store.AdoptAgentName`),
+  an unnamed one is SENT `/rename <hap name>`. Four bounds are load-bearing.
+  **The name is not the terminal title.** Verified live 2026-09-01 (Claude Code 2.1.252): a session
+  whose `terminal_title_stripped` read "Say hi in one word" — the churning SUMMARY Claude
+  regenerates every few turns — painted no name in its rule at all, and only `/rename` put one
+  there. `agent list` carries the summary for free and no shell-out, which is exactly the trap:
+  adopting it renames every agent after a sentence that changes on its own.
+  **"No composer" is UNKNOWN, never "unnamed"** (`domain.ClaudeSessionFromPane` returns ok=false).
+  The daemon's classification read is `pane read --source recent`, a CONSUMING delta that
+  routinely returns no footer, and the push direction reads that state as its trigger — so
+  treating it as "unnamed" fires `/rename` at a session already carrying an operator's chosen name
+  and overwrites it. Same doctrine as `AgentModeFromPane`, and for a worse reason: this one writes.
+  **The push is a DELIVERY and carries a delivery's gates** — parked status only (Claude accepts
+  input while working and QUEUES it, and a working claude paints an ordinary empty composer, so
+  the composer alone cannot be the gate); `acquirePane`; kill switch and the per-agent disable
+  re-asked INSIDE the goroutine; the never-auto screen over the exact text; a `--source visible`
+  re-read immediately before the send (a modal may have risen in the gap, where Enter is rebound);
+  a re-read immediately after it, because a green herdr exit is not evidence a keystroke landed;
+  a proven-EMPTY composer, since `ClaudeComposerReady` proves the sandwich and not that it is
+  blank, and an operator's draft would be submitted with the command glued onto it; and a ceiling
+  per (agent, terminal, name), because the trigger is a STANDING condition rather than an event.
+  It runs on `d.spawn`, never a bare `go` — untracked it outlives `Run`, still pressing keys into
+  a pane and reading a closing store, which surfaced first as unrelated daemon tests failing at
+  random after the harness had stopped its daemon.
+  **A collision suffixes and re-aligns.** Claude permits two sessions to share a conversation name
+  (verified live, same directory), while `agent_names.name` is UNIQUE — so `AdoptAgentName` takes
+  the first free `base-N` in ONE transaction and the suffixed name is pushed back to the pane. It
+  is idempotent by `domain.AgentNameDerivedFrom`: without that, the collision loser walks to `-3`,
+  `-4`, … at every capture, renaming a settled agent forever and typing each new name at its pane.
+  `internal/store` validates through `domain.AgentNameRE` rather than a copy, so a normalizer
+  emitting a name the store refuses cannot exist. Note the daemon suite wraps its store in
+  `failingStore`, which embeds the ports.StorePort INTERFACE — every type-asserted capability must
+  be forwarded there explicitly or the feature is silently off for the whole suite while its tests
+  pass. Keep the paired tests (`TestSessionSyncTreatsACaptureWithNoComposerAsUnknown` /
+  `…PushRefusesADraftedComposer` / `…PushRefusesAWorkingAgent` / `…PushRefusesADisabledAgent` /
+  `…PushRefusesWhileTheKillSwitchIsActive` / `…PushStopsAtItsCeiling` /
+  `…PushesTheSuffixedNameBackOnCollision` / `…CollisionIsIdempotentAcrossCaptures` — all six
+  refusals proved by mutation — plus `TestAdoptAgentNameIsIdempotentForASuffixedHolder` and
+  `TestClaudeComposerReadyAcceptsARealNamedComposer`, whose fixtures are REAL captures).
 - **Fail safe on the daemon path** — no panics; every error resolves to escalate + audit +
   log. Wrap new handler/adapter calls in `logging.Guard`.
 - **Safety controls are never bypassed** — LLM submissions and learned rules alike are

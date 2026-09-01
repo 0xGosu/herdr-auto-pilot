@@ -543,6 +543,36 @@ ai_agent_friendly_output = true   # append a "Next steps" footer to command outp
                                   # never do (a bare value stays capturable).
                                   # Per-run equivalents: --no-hints, HAP_NO_HINTS=1
 
+# ── Agents ──────────────────────────────────────────────────────────
+[agents]
+sync_claude_session_name = false  # keep a claude agent's hap short name and its
+                                  # Claude CONVERSATION name — what `/rename`
+                                  # sets, painted in the composer's top rule —
+                                  # on the same value, in whichever direction
+                                  # has one:
+                                  #   named session   -> hap adopts it, folded
+                                  #                      to a short name
+                                  #                      ("My Feature: Work #2"
+                                  #                      -> my-feature-work-2)
+                                  #   unnamed session -> hap types
+                                  #                      `/rename <hap name>`
+                                  #                      into the pane
+                                  # OFF by default because the second direction
+                                  # writes to an agent's composer. That write is
+                                  # gated like a delivery: parked agents only, a
+                                  # proven and EMPTY composer, the kill switch,
+                                  # the per-agent disable, and a bounded number
+                                  # of attempts per pane.
+                                  # Note this makes the SESSION the source of
+                                  # truth for a named agent: `hap agent rename`
+                                  # on one is reverted at the next capture, so
+                                  # rename it with Claude's own /rename instead.
+                                  # Two sessions sharing a name is allowed by
+                                  # Claude; the second agent takes "name-2" and
+                                  # that name is pushed back to its pane.
+                                  # Claude agents only — no other agent type
+                                  # paints a conversation name.
+
 # ── Where task lists are stored: the DEFAULT (per-source overridable) ──
 # This section supplies the DEFAULT storage for the checklists below. Each
 # [[task_sources]] entry may override it, so some agents can keep their lists

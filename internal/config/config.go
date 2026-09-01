@@ -1287,6 +1287,25 @@ type CLI struct {
 	AIAgentFriendlyOutput bool `toml:"ai_agent_friendly_output"`
 }
 
+// Agents holds settings about the agents hap watches, as opposed to what it
+// decides for them.
+type Agents struct {
+	// SyncClaudeSessionName keeps a claude agent's hap short name and its
+	// Claude CONVERSATION name (what `/rename` sets, painted in the composer's
+	// top rule) on the same value, in whichever direction has one:
+	//
+	//   - the session is named  → hap adopts the normalized name;
+	//   - the session is unnamed → hap sends `/rename <hap name>` to the pane.
+	//
+	// Off by default, and deliberately so: the second direction TYPES into an
+	// agent's composer, which is an outbound action an operator must opt into.
+	//
+	// Enabling it makes the SESSION the source of truth for a named agent, so
+	// `hap agent rename` on one is reverted at the next capture — rename such
+	// an agent through Claude's own /rename instead.
+	SyncClaudeSessionName bool `toml:"sync_claude_session_name"`
+}
+
 // PaletteOverrides are optional per-role color overrides for the TUI
 // palette. Values are terminal color strings lipgloss accepts ("205",
 // "#ff5faf"), or "" to inherit the selected theme. Settable with `hap config
@@ -1328,6 +1347,7 @@ type Config struct {
 	Logging     Logging     `toml:"logging"`
 	TUI         TUI         `toml:"tui"`
 	CLI         CLI         `toml:"cli"`
+	Agents      Agents      `toml:"agents"`
 	// TaskSourceProvider is the DEFAULT storage backend for task lists, which
 	// each [[task_sources]] entry may override. Declared BEFORE TaskSources on
 	// purpose: BurntSushi emits a struct's sub-tables after its scalars, and

@@ -2105,6 +2105,10 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.disable_check_for_update", TUIEditable: true},
 	{Key: "tui.max_instances", TUIEditable: true},
 	{Key: "cli.ai_agent_friendly_output", TUIEditable: true},
+	// Keeps a claude agent's hap name and its Claude conversation name on one
+	// value. Off by default: the unnamed-session direction TYPES `/rename`
+	// into the agent's composer.
+	{Key: "agents.sync_claude_session_name", TUIEditable: true},
 	// Where task lists are stored, by DEFAULT — each [[task_sources]] entry may
 	// override it (`hap config task-source set <index> provider …`), and one that does
 	// not keeps FOLLOWING this value, so changing it here really moves every
@@ -2437,6 +2441,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(cfg.TUI.MaxInstances)
 	case "cli.ai_agent_friendly_output":
 		return strconv.FormatBool(cfg.CLI.AIAgentFriendlyOutput)
+	case "agents.sync_claude_session_name":
+		return strconv.FormatBool(cfg.Agents.SyncClaudeSessionName)
 	case "task_source_provider.provider":
 		// Resolved rather than read raw, so a Config built in memory (or one
 		// predating the section) renders the provider actually in force instead
@@ -2922,6 +2928,13 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 				return fmt.Errorf("cli.ai_agent_friendly_output must be true or false, got %q", value)
 			}
 			cfg.CLI.AIAgentFriendlyOutput = v
+			return nil
+		case "agents.sync_claude_session_name":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("agents.sync_claude_session_name must be true or false, got %q", value)
+			}
+			cfg.Agents.SyncClaudeSessionName = v
 			return nil
 		}
 		return fmt.Errorf("unknown config field %q", key)
