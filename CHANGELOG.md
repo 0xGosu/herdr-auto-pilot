@@ -8,6 +8,15 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.7.3
+
+- Added `[agents] sync_claude_session_name` (off by default): keeps a claude agent's hap short name and its Claude conversation name — what `/rename` sets, painted in the composer's top rule — CHARACTER-IDENTICAL. A named session is folded into a storable short name (lowercased, non-alphanumerics to `-`, capped at 32) and, when that differs from what the session shows, `/rename <folded name>` is sent back so both sides read the same string: `My Feature: Work #2` becomes `my-feature-work-2` on the agent AND in Claude. An unnamed session is sent `/rename <hap name>` instead.
+- Added a collision rule for the above: when two claude sessions carry the same conversation name, the second agent takes `name-2` and that suffixed name is pushed back to its pane, so the pair still matches exactly. Claude itself allows the duplicate.
+- Changed: with `sync_claude_session_name` on, the Claude session is the source of truth for a named agent — `hap agent rename` on one is reverted at the next capture. Rename such an agent through Claude's own `/rename`; hap will fold the name and write the folded form back.
+- Note: with the setting on, a BRAND-NEW claude session is unnamed, so it is sent `/rename <hap name>` and your Claude conversation list fills with hap's generated animal names. It self-heals — `/rename` the session to something meaningful and hap adopts that instead.
+- Fixed a composer detection bug that made `hap mode` refuse on every NAMED Claude session: the composer's top rule was required to end in two rule glyphs, and Claude renders exactly one after the session name.
+- Changed the TUI to cap agent names at 15 characters in the Agents, Escalations and Audit tables. A synced name can run to 32 characters, which used to push every column after it out of alignment; the stored name is untouched, and the agent detail pane still prints it in full.
+
 ## 0.7.2
 
 - Added `+` and `-` on the TUI *Rules* tab to nudge the selected rule's confirmation streak by one, and `hap signatures confirm <prefix> [--delta N]` as the same action from the CLI. Reaching `learning.graduation_n` graduates the rule only when its live confidence also clears the situation's threshold — the message says so when it does not, rather than looking like a key that did nothing.
