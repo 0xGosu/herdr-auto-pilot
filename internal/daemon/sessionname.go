@@ -43,15 +43,7 @@ const maxSessionRenamePushes = 3
 // been renamed out from under it.
 func (d *Daemon) syncClaudeSessionName(ctx context.Context, tr domain.AgentTransition,
 	agentName, pane string) string {
-	cfg, _, _ := d.snapshot()
-	if !cfg.Agents.SyncClaudeSessionName {
-		return agentName
-	}
-	if !strings.EqualFold(strings.TrimSpace(tr.AgentType), "claude") {
-		return agentName
-	}
-	// Optional capability: a store that cannot rename simply has no sync.
-	namer, ok := d.opt.Store.(ports.AgentNamerPort)
+	namer, ok := d.claudeSessionNamer(tr.AgentType)
 	if !ok {
 		return agentName
 	}
@@ -59,7 +51,38 @@ func (d *Daemon) syncClaudeSessionName(ctx context.Context, tr domain.AgentTrans
 	if !ok {
 		return agentName // no composer in this capture: UNKNOWN, never "unnamed"
 	}
+	return d.applyClaudeSession(ctx, tr, namer, agentName, sess)
+}
 
+// claudeSessionNamer resolves the three preconditions every session-name sync
+// shares: the feature is on, the agent is a claude, and the store can rename.
+//
+// It re-reads the config snapshot on every call rather than taking one per
+// pass, which is what lets the one-shot flip pass stop mid-herd when an
+// operator turns the key straight back off.
+func (d *Daemon) claudeSessionNamer(agentType string) (ports.AgentNamerPort, bool) {
+	cfg, _, _ := d.snapshot()
+	if !cfg.Agents.SyncClaudeSessionName {
+		return nil, false
+	}
+	if !strings.EqualFold(strings.TrimSpace(agentType), "claude") {
+		return nil, false
+	}
+	// Optional capability: a store that cannot rename simply has no sync.
+	namer, ok := d.opt.Store.(ports.AgentNamerPort)
+	if !ok {
+		return nil, false
+	}
+	return namer, true
+}
+
+// applyClaudeSession is the decision half of the sync, over a composer that has
+// already been positively parsed. Both entry points — the capture-driven
+// syncClaudeSessionName and the flip-driven syncClaudeSessionNamesNow — go
+// through it, so Path 1 and Path 2 have exactly one implementation and a gate
+// added to either is added to both.
+func (d *Daemon) applyClaudeSession(ctx context.Context, tr domain.AgentTransition,
+	namer ports.AgentNamerPort, agentName string, sess domain.ClaudeSession) string {
 	if sess.Named {
 		base, ok := domain.NormalizeAgentName(sess.Name)
 		if !ok {
@@ -126,6 +149,117 @@ func (d *Daemon) syncClaudeSessionName(ctx context.Context, tr domain.AgentTrans
 	}
 	d.startSessionRename(ctx, tr, agentName)
 	return agentName
+}
+
+// startClaudeSessionNameSync kicks the one-shot pass a false→true flip of
+// [agents] sync_claude_session_name earns, off the caller's goroutine.
+//
+// It is spawned rather than run inline because reloadWith is called from the
+// main select loop (the KindReload nudge), and the pass shells out to herdr once
+// per live agent — a ListAgents plus a pane read each. Inline it would hold the
+// loop that serves every other agent for the length of the herd.
+//
+// The latch is what stops two flips in quick succession walking the herd twice
+// at once: a second pass would read the same panes and could type a second
+// /rename into a pane whose first one had not repainted yet. It is released by
+// the goroutine's own defer, so an early return inside the pass cannot strand it
+// — and on a refused spawn (shutdown latched in between, so no defer ever runs)
+// it is released here, or no later flip could ever start a pass.
+func (d *Daemon) startClaudeSessionNameSync() {
+	d.mu.Lock()
+	if d.sessionSyncPassRunning {
+		d.mu.Unlock()
+		return
+	}
+	d.sessionSyncPassRunning = true
+	d.mu.Unlock()
+
+	// Rooted at shutdownCtx, not a request ctx: reloadWith has none, and the
+	// pass must be cancelled by daemon teardown like every other tracked
+	// goroutine.
+	ctx := d.shutdownCtx
+	if !d.spawn(func() {
+		defer func() {
+			d.mu.Lock()
+			d.sessionSyncPassRunning = false
+			d.mu.Unlock()
+		}()
+		logging.Guard("session-name-sync-pass", func() error {
+			d.syncClaudeSessionNamesNow(ctx)
+			return nil
+		})
+	}) {
+		d.mu.Lock()
+		d.sessionSyncPassRunning = false
+		d.mu.Unlock()
+	}
+}
+
+// syncClaudeSessionNamesNow aligns every LIVE claude agent's name with its
+// session, without waiting for an attention event to bring a capture in.
+//
+// It exists because the ordinary sync is a side effect of a capture and nothing
+// re-captures on a config change: reconcileAttentionWith skips any pane already
+// in episodeHandled, which after one sweep is every parked agent, and skips
+// working agents outright. Clearing episodeHandled instead would have re-driven
+// the whole herd through classify → decide → act, raising escalations and
+// spending LLM consults for what is a naming feature — so the pass carries only
+// the sync.
+//
+// Two differences from the capture path, both deliberate:
+//
+//   - the read is `--source visible` (readClaudeSession), never ReadPane's
+//     consuming `--source recent` delta. Non-consuming is REQUIRED, not merely
+//     better: a recent read here would swallow the delta a pending classification
+//     capture is about to take, and the classifier would see an empty screen.
+//     It is also why the flip path sees a composer at all — a quiescent pane's
+//     delta is routinely empty, which is the blind spot the capture path keeps.
+//   - the agent's TYPE comes from `agent list` (verified: the envelope carries
+//     "agent", herdr 0.7), so a non-claude pane is skipped without a read.
+//
+// Every write gate stays where it was. Path 1 only touches the store; Path 2
+// goes through startSessionRename, which is idle/done-only, takes acquirePane,
+// and re-asks the kill switch, the per-agent disable, the never-auto screen and
+// the empty-composer proof inside its own goroutine.
+func (d *Daemon) syncClaudeSessionNamesNow(ctx context.Context) {
+	agents, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		slog.Warn("session-name sync: listing agents failed", "error", err)
+		return
+	}
+	synced := 0
+	for _, a := range agents {
+		if ctx.Err() != nil {
+			return
+		}
+		// Re-resolved per agent, so an operator flipping the key back off
+		// stops the rest of the herd rather than only the next flip.
+		namer, ok := d.claudeSessionNamer(a.AgentType)
+		if !ok {
+			continue
+		}
+		name, err := d.opt.Store.EnsureAgentName(ctx, a.AgentID)
+		if err != nil {
+			slog.Warn("session-name sync: agent name generation failed",
+				"agent", a.AgentID, "error", err)
+			continue
+		}
+		sess, ok, err := d.readClaudeSession(ctx, a.PaneID)
+		if err != nil {
+			slog.Warn("session-name sync: pane read failed", "agent", a.AgentID, "error", err)
+			continue
+		}
+		if !ok {
+			// No composer on screen: UNKNOWN, never "unnamed". The agent is
+			// left alone and its next capture asks again.
+			slog.Debug("session-name sync: no composer on screen", "agent", a.AgentID)
+			continue
+		}
+		d.applyClaudeSession(ctx, a, namer, name, sess)
+		synced++
+	}
+	slog.Info("session-name sync: swept live claude agents after the setting was turned on",
+		"examined", len(agents), "synced", synced)
 }
 
 // startSessionRename types `/rename <want>` into a claude pane, off the main
