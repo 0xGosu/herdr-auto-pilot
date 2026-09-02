@@ -692,17 +692,25 @@ func TestSessionSyncPassSkipsNonClaudeAgents(t *testing.T) {
 func TestSessionSyncPassDoesNotRunTwiceAtOnce(t *testing.T) {
 	h := newHarnessWrapped(t, sessionSyncOn,
 		liveClaudeHerd(claudeComposerPane("", ""), claudeTr("pA", "idle")))
+	agentNameNow(t, h, "pA")
 
 	h.daemon.mu.Lock()
 	h.daemon.sessionSyncPassRunning = true
 	h.daemon.mu.Unlock()
-	before := h.herdr.listAgentsCallCount()
 
 	h.daemon.startClaudeSessionNameSync()
-	time.Sleep(200 * time.Millisecond)
 
-	if got := h.herdr.listAgentsCallCount(); got != before {
-		t.Fatalf("a latched pass must not list agents again (%d -> %d)", before, got)
+	// Asserted on the absence of a keystroke, NOT on listAgentsCallCount — the
+	// same trap TestReloadWithoutAFlipRunsNoSessionSyncPass names. The daemon's
+	// own startup sweep and every resubscribe-driven reconcile call ListAgents
+	// too, so a before/after count taken here races them: under -race the
+	// startup calls land inside the window and the test fails on traffic it
+	// does not own. A pass that ran despite the latch would read the pane
+	// through --source visible, find an unnamed composer and type `/rename`,
+	// which nothing else in this harness can produce (the wrapper hides the
+	// composer from ReadPane).
+	if !noSendWithin(t, h, 500*time.Millisecond) {
+		t.Fatalf("a latched pass must not walk the herd, got %v", h.herdr.sentInputs())
 	}
 }
 

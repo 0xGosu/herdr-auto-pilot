@@ -316,7 +316,9 @@ whose manifest carries exactly that version).
     alternative, because that re-drives the whole herd through classify→decide→act, raising
     escalations and spending LLM consults for a naming feature; the trigger is gated on `!first`,
     since `reloadWith` also runs inside `New()` before `Run` exists and the startup reconcile
-    already re-drives every PARKED agent (the only set Path 2 can push to); and the latch
+    already re-drives every PARKED agent (the only set Path 2 can push to) — except one it marks
+    handled and then skips, an agent whose escalation row survived the restart, which is why a
+    daemon STARTED with the key on keeps the pre-fix behaviour for exactly those agents; and the latch
     (`sessionSyncPassRunning`) is released by the goroutine's own defer AND by hand when `spawn`
     refuses, or one shutdown-race flip disables the pass for the process. Both entry points share
     `applyClaudeSession`, so a gate added to either is added to both. Keep

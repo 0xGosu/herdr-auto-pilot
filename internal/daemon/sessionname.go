@@ -227,7 +227,7 @@ func (d *Daemon) syncClaudeSessionNamesNow(ctx context.Context) {
 		slog.Warn("session-name sync: listing agents failed", "error", err)
 		return
 	}
-	synced := 0
+	examined, synced := 0, 0
 	for _, a := range agents {
 		if ctx.Err() != nil {
 			return
@@ -238,12 +238,7 @@ func (d *Daemon) syncClaudeSessionNamesNow(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		name, err := d.opt.Store.EnsureAgentName(ctx, a.AgentID)
-		if err != nil {
-			slog.Warn("session-name sync: agent name generation failed",
-				"agent", a.AgentID, "error", err)
-			continue
-		}
+		examined++
 		sess, ok, err := d.readClaudeSession(ctx, a.PaneID)
 		if err != nil {
 			slog.Warn("session-name sync: pane read failed", "agent", a.AgentID, "error", err)
@@ -255,11 +250,21 @@ func (d *Daemon) syncClaudeSessionNamesNow(ctx context.Context) {
 			slog.Debug("session-name sync: no composer on screen", "agent", a.AgentID)
 			continue
 		}
+		// After the composer is in hand, never before: EnsureAgentName is a
+		// store WRITE that mints a name row for an agent hap has not seen, and
+		// on a pane showing no composer there is nothing the row could be used
+		// for on this pass.
+		name, err := d.opt.Store.EnsureAgentName(ctx, a.AgentID)
+		if err != nil {
+			slog.Warn("session-name sync: agent name generation failed",
+				"agent", a.AgentID, "error", err)
+			continue
+		}
 		d.applyClaudeSession(ctx, a, namer, name, sess)
 		synced++
 	}
 	slog.Info("session-name sync: swept live claude agents after the setting was turned on",
-		"examined", len(agents), "synced", synced)
+		"listed", len(agents), "examined", examined, "synced", synced)
 }
 
 // startSessionRename types `/rename <want>` into a claude pane, off the main
@@ -389,6 +394,14 @@ func (d *Daemon) pushSessionRename(ctx context.Context, tr domain.AgentTransitio
 // readClaudeSession reads the pane's CURRENT screen and parses its composer.
 // ok=false means no composer was shown, which every caller treats as a refusal
 // rather than as a fact about the session.
+//
+// Note the non-consuming read is a CAPABILITY, not a guarantee: readVisible
+// falls back to ReadPane's `--source recent` delta for a HerdrPort that does
+// not implement ports.VisiblePaneReader. Only internal/herdr.CLI implements
+// HerdrPort in production and it does implement it, so the fallback is latent —
+// but a port that did not would make the flip pass consume one delta per live
+// claude agent, which is exactly what syncClaudeSessionNamesNow says it never
+// does.
 func (d *Daemon) readClaudeSession(ctx context.Context, paneID string) (domain.ClaudeSession, bool, error) {
 	pane, err := d.readVisible(ctx, paneID, d.opt.PaneReadLines)
 	if err != nil {

@@ -855,10 +855,20 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	//
 	// `!first` on purpose. The New() path calls reload() before Run exists, and
 	// a pass started there would race the startup sweep's own reconcile with no
-	// loop behind it. Nothing is lost: the startup reconcile re-drives every
-	// PARKED agent (episodeHandled is empty at that point), which is exactly the
+	// loop behind it. Almost nothing is lost: the startup reconcile re-drives
+	// every PARKED agent (episodeHandled is empty at that point), which is the
 	// set a rename can be pushed to — Path 2 requires idle/done. A working agent
 	// adopts its name the moment it parks.
+	//
+	// The one gap this leaves is deliberate rather than covered:
+	// reconcileAttentionWith marks a pane handled and THEN skips it when
+	// hasOpenEscalation says a row is still open, so an agent carrying an
+	// escalation across the restart is never re-driven for the life of the
+	// process. An escalation is a durable DB row and does not imply a modal is
+	// standing, so such an agent can sit at an ordinary empty composer unsynced
+	// until it next goes working→parked. A daemon STARTED with the key on
+	// therefore still has the pre-fix behaviour for exactly those agents; the
+	// flip path covers them because it does not consult episodeHandled at all.
 	if !first && !prev.Agents.SyncClaudeSessionName && cfg.Agents.SyncClaudeSessionName {
 		d.startClaudeSessionNameSync()
 	}
