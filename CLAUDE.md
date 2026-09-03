@@ -301,6 +301,34 @@ whose manifest carries exactly that version).
     capture and the two names trade spellings forever. Same for `SuffixedAgentName`; collisions
     are idempotent via `domain.AgentNameDerivedFrom`. An identical pair must cost no pane read —
     the at-send screen also refuses the redundant push, so only a read COUNT catches its removal.
+  - **Turning the key ON drives its own one-shot pass, because a config change re-captures
+    NOTHING.** The sync is a side effect of `handleAttention`, and neither `reloadWith` nor the
+    `reconcileAttention` that follows a reload nudge schedules a capture for an already-parked
+    agent — `reconcileAttentionWith` skips every pane in `episodeHandled` (set on the first sweep
+    after start, cleared only by a `working` transition or a pane recycle), skips working agents
+    outright, and skips any agent with an open escalation. So a flip on a settled herd did nothing
+    at all until each agent next went working→parked, which is hours for a parked herd and never
+    for an agent sitting on an approval. `syncClaudeSessionNamesNow` walks the live agents once
+    instead. Four bounds are load-bearing: it reads `--source visible` (`readClaudeSession`), never
+    `ReadPane`'s consuming delta — non-consuming is REQUIRED, since a recent read here swallows the
+    delta a pending classification capture is about to take, and it is also the only reason the
+    flip sees a composer on a quiescent pane at all; clearing `episodeHandled` is NOT the
+    alternative, because that re-drives the whole herd through classify→decide→act, raising
+    escalations and spending LLM consults for a naming feature; the trigger is gated on `!first`,
+    since `reloadWith` also runs inside `New()` before `Run` exists and the startup reconcile
+    already re-drives every PARKED agent (the only set Path 2 can push to) — except one it marks
+    handled and then skips, an agent whose escalation row survived the restart, which is why a
+    daemon STARTED with the key on keeps the pre-fix behaviour for exactly those agents; and the latch
+    (`sessionSyncPassRunning`) is released by the goroutine's own defer AND by hand when `spawn`
+    refuses, or one shutdown-race flip disables the pass for the process. Both entry points share
+    `applyClaudeSession`, so a gate added to either is added to both. Keep
+    `TestFlippingSessionSyncOnRenamesTheLiveHerdWithoutACapture` /
+    `…AdoptsANamedSession` / `TestReloadWithoutAFlipRunsNoSessionSyncPass` /
+    `TestDaemonStartWithTheSettingOnRunsNoSessionSyncPass` /
+    `TestSessionSyncPassSkipsNonClaudeAgents` / `…DoesNotRunTwiceAtOnce` / `…ReleasesItsLatch`,
+    and note the tests wrap the fake so the composer is visible ONLY through `--source visible`:
+    without that the capture path could produce the same rename and none of them would
+    discriminate.
   - Test trap: the daemon suite's `failingStore` embeds the ports.StorePort INTERFACE, so every
     type-asserted capability must be forwarded there or the feature is silently off suite-wide.
 - **Fail safe on the daemon path** — no panics; every error resolves to escalate + audit +

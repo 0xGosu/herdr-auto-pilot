@@ -267,6 +267,12 @@ type Daemon struct {
 	// every attention event (guarded by mu).
 	sessionSyncNoted map[string]string
 
+	// sessionSyncPassRunning latches the one-shot sync pass a false→true flip
+	// of [agents] sync_claude_session_name starts, so two flips in quick
+	// succession cannot walk the herd twice at once (guarded by mu). Cleared
+	// by the pass's own defer, including when it returns early.
+	sessionSyncPassRunning bool
+
 	// toggleAttempt records, per agent, the signature of the multi-select form
 	// this daemon last started answering — the evidence that lets a later
 	// delivery accept a tab whose boxes are ALREADY ticked. Without it,
@@ -839,6 +845,33 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	// on the very next candidate.
 	d.fspCeilingLatched = false
 	d.mu.Unlock()
+
+	// A false→true flip of the session-name sync has nothing to act on until
+	// some agent's next attention event, which for a parked herd can be hours
+	// away: the sync is a side effect of a CAPTURE, and neither this reload nor
+	// the reconcile that follows it schedules one (reconcileAttentionWith skips
+	// every episode it has already handled). So the flip drives its own one-shot
+	// pass over the live agents — see syncClaudeSessionNamesNow.
+	//
+	// `!first` on purpose. The New() path calls reload() before Run exists, and
+	// a pass started there would race the startup sweep's own reconcile with no
+	// loop behind it. Almost nothing is lost: the startup reconcile re-drives
+	// every PARKED agent (episodeHandled is empty at that point), which is the
+	// set a rename can be pushed to — Path 2 requires idle/done. A working agent
+	// adopts its name the moment it parks.
+	//
+	// The one gap this leaves is deliberate rather than covered:
+	// reconcileAttentionWith marks a pane handled and THEN skips it when
+	// hasOpenEscalation says a row is still open, so an agent carrying an
+	// escalation across the restart is never re-driven for the life of the
+	// process. An escalation is a durable DB row and does not imply a modal is
+	// standing, so such an agent can sit at an ordinary empty composer unsynced
+	// until it next goes working→parked. A daemon STARTED with the key on
+	// therefore still has the pre-fix behaviour for exactly those agents; the
+	// flip path covers them because it does not consult episodeHandled at all.
+	if !first && !prev.Agents.SyncClaudeSessionName && cfg.Agents.SyncClaudeSessionName {
+		d.startClaudeSessionNameSync()
+	}
 
 	d.reloadEmbedder(prev, cfg, first || forceEmbedder)
 	slog.Info("configuration loaded", "path", d.opt.ConfigPath)

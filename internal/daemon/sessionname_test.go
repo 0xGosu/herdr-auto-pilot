@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
 // readPaneNow returns what the fake pane currently shows, so a test can feed
@@ -563,4 +565,170 @@ func TestSessionSyncClearsItsNoteOnceAligned(t *testing.T) {
 	if stillNoted {
 		t.Fatal("an aligned agent must not keep a stale reason recorded")
 	}
+}
+
+// --- The flip: turning the setting on syncs the live herd immediately ---
+
+// visibleOnlyComposer serves the composer through `--source visible` ONLY, and
+// answers the classification read (`--source recent`) with a consumed delta.
+//
+// That is what makes the flip tests below discriminating rather than merely
+// green. A capture-driven sync reads through ReadPane, so under this wrapper it
+// can never see a composer and can never produce a rename — every keystroke a
+// test observes therefore came from the one-shot pass. It also models the pane
+// the feature actually failed on: a quiescent agent whose recent delta was
+// consumed by an earlier read, which is exactly why the flip could not rely on
+// the capture path in the first place.
+type visibleOnlyComposer struct {
+	*fakeHerdr
+}
+
+func (v *visibleOnlyComposer) ReadPane(ctx context.Context, paneID string, lines int) (string, error) {
+	return "⏺ nothing new in this delta.\n", nil
+}
+
+func (v *visibleOnlyComposer) ReadPaneVisible(ctx context.Context, paneID string, lines int) (string, error) {
+	return v.readPaneNow(), nil
+}
+
+// liveClaudeHerd prepares the fake BEFORE New() — the only safe moment, since
+// the daemon's startup sweep reads the agent set the instant Run begins.
+func liveClaudeHerd(pane string, agents ...domain.AgentTransition) func(*fakeHerdr) ports.HerdrPort {
+	return func(f *fakeHerdr) ports.HerdrPort {
+		f.pane = pane
+		f.onSend = renameOnSend
+		f.agents = agents
+		f.agentsPinned = true
+		return &visibleOnlyComposer{fakeHerdr: f}
+	}
+}
+
+func reloadNow(t *testing.T, h *harness) {
+	t.Helper()
+	if err := control.Nudge(context.Background(), h.ctlPath, control.KindReload); err != nil {
+		t.Fatalf("reload nudge: %v", err)
+	}
+}
+
+// The whole point of the feature: no transition is ever pushed through
+// h.events, so the rename can only have come from the flip's own pass.
+func TestFlippingSessionSyncOnRenamesTheLiveHerdWithoutACapture(t *testing.T) {
+	h := newHarnessWrapped(t, "", liveClaudeHerd(claudeComposerPane("", ""), claudeTr("pA", "idle")))
+	generated := agentNameNow(t, h, "pA")
+
+	h.writeConfig(t, sessionSyncOn)
+	reloadNow(t, h)
+
+	if !waitForSend(t, h, "/rename "+generated) {
+		t.Fatalf("flipping the setting on must rename the live session, got %v", h.herdr.sentInputs())
+	}
+}
+
+// Path 1 through the same pass: a session that already carries a name is
+// adopted by the store, again with no capture in sight.
+func TestFlippingSessionSyncOnAdoptsANamedSession(t *testing.T) {
+	h := newHarnessWrapped(t, "",
+		liveClaudeHerd(claudeComposerPane("My Feature: Work #2", ""), claudeTr("pA", "idle")))
+	agentNameNow(t, h, "pA")
+
+	h.writeConfig(t, sessionSyncOn)
+	reloadNow(t, h)
+
+	waitFor(t, 3*time.Second, func() bool {
+		return agentNameNow(t, h, "pA") == "my-feature-work-2"
+	})
+}
+
+// The control for the test above: a reload that does NOT flip the key must run
+// no pass. Asserted on the absence of a keystroke rather than on
+// listAgentsCalls, which the nudge's own reconcileAttention also increments.
+func TestReloadWithoutAFlipRunsNoSessionSyncPass(t *testing.T) {
+	h := newHarnessWrapped(t, sessionSyncOn,
+		liveClaudeHerd(claudeComposerPane("", ""), claudeTr("pA", "idle")))
+	agentNameNow(t, h, "pA")
+
+	h.writeConfig(t, sessionSyncOn) // unchanged: already on
+	reloadNow(t, h)
+
+	if !noSendWithin(t, h, 300*time.Millisecond) {
+		t.Fatalf("a reload that changed nothing must not re-walk the herd, got %v", h.herdr.sentInputs())
+	}
+}
+
+// The pass is deliberately NOT started from New(): reload() runs there before
+// Run exists, so a pass would race the startup sweep with no loop behind it.
+// The parked agents that a rename can actually be pushed to are covered by the
+// startup reconcile instead.
+func TestDaemonStartWithTheSettingOnRunsNoSessionSyncPass(t *testing.T) {
+	h := newHarnessWrapped(t, sessionSyncOn,
+		liveClaudeHerd(claudeComposerPane("", ""), claudeTr("pA", "idle")))
+	agentNameNow(t, h, "pA")
+
+	if !noSendWithin(t, h, 300*time.Millisecond) {
+		t.Fatalf("startup must not run the flip pass, got %v", h.herdr.sentInputs())
+	}
+}
+
+// A non-claude agent is skipped on its listed type, before any pane read — so
+// the pass costs a codex herd nothing at all.
+func TestSessionSyncPassSkipsNonClaudeAgents(t *testing.T) {
+	codex := domain.AgentTransition{
+		AgentID: "pC", PaneID: "pC", AgentType: "codex", TerminalID: "term_pC", Status: "idle",
+	}
+	h := newHarnessWrapped(t, "", liveClaudeHerd(claudeComposerPane("", ""), codex))
+	agentNameNow(t, h, "pC")
+
+	h.writeConfig(t, sessionSyncOn)
+	reloadNow(t, h)
+
+	if !noSendWithin(t, h, 300*time.Millisecond) {
+		t.Fatalf("a codex agent must never be typed into, got %v", h.herdr.sentInputs())
+	}
+}
+
+// Two flips in quick succession must not walk the herd twice at once: a second
+// pass would read the same panes and could type a second /rename into a pane
+// whose first one had not repainted yet.
+func TestSessionSyncPassDoesNotRunTwiceAtOnce(t *testing.T) {
+	h := newHarnessWrapped(t, sessionSyncOn,
+		liveClaudeHerd(claudeComposerPane("", ""), claudeTr("pA", "idle")))
+	agentNameNow(t, h, "pA")
+
+	h.daemon.mu.Lock()
+	h.daemon.sessionSyncPassRunning = true
+	h.daemon.mu.Unlock()
+
+	h.daemon.startClaudeSessionNameSync()
+
+	// Asserted on the absence of a keystroke, NOT on listAgentsCallCount — the
+	// same trap TestReloadWithoutAFlipRunsNoSessionSyncPass names. The daemon's
+	// own startup sweep and every resubscribe-driven reconcile call ListAgents
+	// too, so a before/after count taken here races them: under -race the
+	// startup calls land inside the window and the test fails on traffic it
+	// does not own. A pass that ran despite the latch would read the pane
+	// through --source visible, find an unnamed composer and type `/rename`,
+	// which nothing else in this harness can produce (the wrapper hides the
+	// composer from ReadPane).
+	if !noSendWithin(t, h, 500*time.Millisecond) {
+		t.Fatalf("a latched pass must not walk the herd, got %v", h.herdr.sentInputs())
+	}
+}
+
+// ...and the latch is released once the pass returns, or the FIRST flip would
+// be the only one this process ever honours.
+func TestSessionSyncPassReleasesItsLatch(t *testing.T) {
+	h := newHarnessWrapped(t, "", liveClaudeHerd(claudeComposerPane("", ""), claudeTr("pA", "idle")))
+	generated := agentNameNow(t, h, "pA")
+
+	h.writeConfig(t, sessionSyncOn)
+	reloadNow(t, h)
+	if !waitForSend(t, h, "/rename "+generated) {
+		t.Fatalf("the first pass must run, got %v", h.herdr.sentInputs())
+	}
+
+	waitFor(t, 3*time.Second, func() bool {
+		h.daemon.mu.Lock()
+		defer h.daemon.mu.Unlock()
+		return !h.daemon.sessionSyncPassRunning
+	})
 }

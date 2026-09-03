@@ -575,6 +575,10 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
                                   # that name is pushed back to its pane.
                                   # Claude agents only — no other agent type
                                   # paints a conversation name.
+                                  # Turning it ON syncs every live claude agent
+                                  # at once rather than waiting for each one's
+                                  # next attention event; after that it runs on
+                                  # each agent's ordinary captures.
 
 # ── Where task lists are stored: the DEFAULT (per-source overridable) ──
 # This section supplies the DEFAULT storage for the checklists below. Each
