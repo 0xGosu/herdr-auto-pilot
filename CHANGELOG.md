@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.7.4
+
+- Changed: turning `[agents] sync_claude_session_name` on now syncs every live claude agent right away instead of waiting for each one's next attention event. The sync used to be a side effect of a pane CAPTURE, and nothing re-captures on a config change — a herd already parked could sit unsynced for hours, or until every agent had gone back to work and parked again. The flip now walks the live agents once on its own, reading each pane's CURRENT screen rather than the consuming delta the classification read takes, so a quiescent agent is seen too. Every write gate is unchanged: only parked (idle/done) agents are typed into, and the kill switch, the per-agent disable, the never-auto screen and the empty-composer proof all still apply. Ordinary captures keep their existing behaviour, including the case where the delta shows no composer and the sync silently waits for the next one.
+
 ## 0.7.3
 
 - Added `[agents] sync_claude_session_name` (off by default): keeps a claude agent's hap short name and its Claude conversation name — what `/rename` sets, painted in the composer's top rule — CHARACTER-IDENTICAL. A named session is folded into a storable short name (lowercased, non-alphanumerics to `-`, capped at 32) and, when that differs from what the session shows, `/rename <folded name>` is sent back so both sides read the same string: `My Feature: Work #2` becomes `my-feature-work-2` on the agent AND in Claude. An unnamed session is sent `/rename <hap name>` instead.
