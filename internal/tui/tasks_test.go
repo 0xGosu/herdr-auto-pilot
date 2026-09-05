@@ -30,7 +30,12 @@ func taskModel(t *testing.T) Model {
 		{Agent: "codex", Path: "/work/missing.md"},
 		{Agent: "quiet", Path: "/work/prose.md"}, // readable, no checklist items
 	}
-	m := Model{width: 100, height: 30}
+	// ctx is load-bearing now that a keypress reaching a live agent goes
+	// through the store: database/sql calls ctx.Done() on the way to a
+	// connection, which on a nil context is a nil-pointer dereference, so a
+	// model built without one panics inside the store rather than failing on
+	// anything that names the real problem.
+	m := Model{width: 100, height: 30, ctx: context.Background()}
 	upd, _ := m.Update(refreshMsg{
 		status: frontend.Status{
 			MonitoredAgents: []domain.AgentTransition{
@@ -788,9 +793,9 @@ func TestTasksTabEditPromptPrefilled(t *testing.T) {
 }
 
 func TestTasksTabFocusAgent(t *testing.T) {
-	herdr := &focusTestHerdr{}
 	m := taskModel(t)
-	m.app = &frontend.App{Herdr: herdr}
+	app, st := focusApp(t)
+	m.app = app
 	// Group 0 is fed by live agent w6:p1 — f jumps to its pane.
 	upd, cmd := m.Update(pressKeyMsg("f"))
 	m = upd.(Model)
@@ -800,8 +805,8 @@ func TestTasksTabFocusAgent(t *testing.T) {
 	if res, ok := cmd().(actionResultMsg); !ok || res.err != nil {
 		t.Fatalf("focus should succeed, got %+v", res)
 	}
-	if len(herdr.focused) != 1 || herdr.focused[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
-		t.Fatalf("focus should target the matched agent's pane, got %+v", herdr.focused)
+	if got := queuedFocuses(t, st); len(got) != 1 || got[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
+		t.Fatalf("focus should queue the matched agent's pane, got %+v", got)
 	}
 	// Group 1's selector (codex) matches no live agent.
 	for m.selectedTaskRow() == nil || m.selectedTaskRow().group != 1 {
@@ -1390,9 +1395,9 @@ func TestTaskDetailDeleteAction(t *testing.T) {
 }
 
 func TestTaskDetailFocusAction(t *testing.T) {
-	herdr := &focusTestHerdr{}
 	m := taskModel(t)
-	m.app = &frontend.App{Herdr: herdr}
+	app, st := focusApp(t)
+	m.app = app
 	m = press(t, m, "down", "v")
 	upd, cmd := m.Update(pressKeyMsg("f"))
 	m = upd.(Model)
@@ -1402,8 +1407,8 @@ func TestTaskDetailFocusAction(t *testing.T) {
 	if res, ok := cmd().(actionResultMsg); !ok || res.err != nil {
 		t.Fatalf("focus should succeed, got %+v", res)
 	}
-	if len(herdr.focused) != 1 || herdr.focused[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
-		t.Fatalf("detail f should target the matched agent's pane, got %+v", herdr.focused)
+	if got := queuedFocuses(t, st); len(got) != 1 || got[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
+		t.Fatalf("detail f should queue the matched agent's pane, got %+v", got)
 	}
 	_ = m
 }

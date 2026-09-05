@@ -76,6 +76,10 @@ const (
 	AgentActionSetMode AgentActionKind = "set_mode"
 	// AgentActionCapture re-runs the attention pipeline for a parked agent.
 	AgentActionCapture AgentActionKind = "capture"
+	// AgentActionFocus brings the herdr UI to an agent's exact pane (tab focus
+	// + pane zoom). It is the one kind that types nothing: it moves the
+	// operator's own view, so it is idempotent and never sets SideEffect.
+	AgentActionFocus AgentActionKind = "focus"
 )
 
 // AgentActionStatus is where a queued action stands.
@@ -109,7 +113,8 @@ func (s AgentActionStatus) Terminal() bool {
 // operator an answer they believe they gave.
 func ValidAgentActionKind(kind AgentActionKind) bool {
 	switch kind {
-	case AgentActionDeliverReply, AgentActionSendTask, AgentActionSetMode, AgentActionCapture:
+	case AgentActionDeliverReply, AgentActionSendTask, AgentActionSetMode, AgentActionCapture,
+		AgentActionFocus:
 		return true
 	}
 	return false
@@ -131,4 +136,16 @@ type DeliverReplyPayload struct {
 	// Action is the operator's answer in its STORED, unmaterialized form.
 	// Sentinels are expanded daemon-side, against the daemon's own audit row.
 	Action string `json:"action"`
+}
+
+// FocusPayload is the focus action's arguments.
+//
+// The coordinates are carried rather than re-resolved from Target, because the
+// front end has just rendered the row the operator pointed at and a re-resolve
+// could land on a different pane than the one on their screen. A pane that has
+// moved on is harmless here — nothing is typed — so this kind deliberately
+// does not take the terminal-identity guard the delivering kinds do.
+type FocusPayload struct {
+	TabID  string `json:"tab_id"`
+	PaneID string `json:"pane_id"`
 }

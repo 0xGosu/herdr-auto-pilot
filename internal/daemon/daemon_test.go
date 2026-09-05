@@ -31,9 +31,13 @@ type fakeHerdr struct {
 	sent          []string
 	notifications []string
 	workspaces    []domain.WorkspaceInfo
-	failSend      bool
-	panicOnRead   bool
-	failRead      bool
+	// focused records every FocusPane call (ports.FocusPort), so a test can
+	// tell "the daemon focused the right pane" from "nothing happened".
+	focused     [][2]string
+	failFocus   bool
+	failSend    bool
+	panicOnRead bool
+	failRead    bool
 	// failReadOver, when > 0, fails ReadPane calls asking for more than
 	// that many lines (isolates the deep LLM-context read from the
 	// shallow classification read).
@@ -344,6 +348,22 @@ func (f *fakeHerdr) listAgentsCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.listAgentsCalls
+}
+
+func (f *fakeHerdr) FocusPane(ctx context.Context, tabID, paneID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failFocus {
+		return errors.New("no such pane")
+	}
+	f.focused = append(f.focused, [2]string{tabID, paneID})
+	return nil
+}
+
+func (f *fakeHerdr) focusedPanes() [][2]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][2]string(nil), f.focused...)
 }
 
 func (f *fakeHerdr) ListWorkspaces(ctx context.Context) ([]domain.WorkspaceInfo, error) {

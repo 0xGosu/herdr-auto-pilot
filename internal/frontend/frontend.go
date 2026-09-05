@@ -667,13 +667,40 @@ func (a *App) Resume(ctx context.Context) (changed bool, err error) {
 }
 
 // FocusAgent brings the herdr UI to the agent's exact pane (tab focus + pane
-// zoom). Errors if the adapter doesn't support focusing.
+// zoom) by queuing the request for the daemon.
+//
+// It deliberately does NOT wait for the outcome, which makes it the exception
+// among the queued kinds rather than the template for them. Two reasons, and
+// both are about where the operator is looking: focusing moves herdr's view
+// AWAY from the pane the TUI is drawn in, so nobody is watching the surface a
+// verdict would be rendered on; and one keypress already costs the daemon a
+// full nudge pass (the drain, the correction sweep, the LLM retries and an
+// attention reconcile), so blocking the front end on top of that buys latency
+// for a message that will not be read. A focus that fails is recorded in the
+// DAEMON LOG ("agent action failed", with the reason) — not in `hap audit`,
+// which reads audit_log and has no view of this queue at all.
+//
+// Nothing is typed into the pane, so there is no delivery guard to lose by
+// not waiting — see daemon.focusAgent.
 func (a *App) FocusAgent(ctx context.Context, tabID, paneID string) error {
-	fp, ok := a.Herdr.(ports.FocusPort)
-	if !ok {
-		return fmt.Errorf("focus not supported by this herdr adapter")
+	if tabID == "" || paneID == "" {
+		return fmt.Errorf("no location known for this agent")
 	}
-	return fp.FocusPane(ctx, tabID, paneID)
+	if err := a.requireLiveDaemon(); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(domain.FocusPayload{TabID: tabID, PaneID: paneID})
+	if err != nil {
+		return err
+	}
+	if _, err := a.Store.EnqueueAgentAction(ctx, domain.AgentAction{
+		Kind: domain.AgentActionFocus, Target: paneID,
+		Payload: string(payload), Author: a.Author, CreatedAt: time.Now(),
+	}); err != nil {
+		return err
+	}
+	a.nudge(ctx, control.KindWake)
+	return nil
 }
 
 // Resolve records the operator's response to an escalation or a post-hoc

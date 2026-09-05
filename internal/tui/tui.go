@@ -4134,7 +4134,10 @@ func (m Model) focusAgent(a domain.AgentTransition) (tea.Model, tea.Cmd) {
 	}
 	m.beginAction()
 	app, tabID, paneID := m.app, a.TabID, a.PaneID
-	return m, m.do("focused agent in herdr", func(ctx context.Context) error {
+	// "asked", not "focused": the request is handed to the daemon and this
+	// returns without waiting, so a success here means the request was queued
+	// — not that herdr moved. A failure lands in `hap audit`.
+	return m, m.do("asked herdr to focus this agent", func(ctx context.Context) error {
 		return app.FocusAgent(ctx, tabID, paneID)
 	})
 }
