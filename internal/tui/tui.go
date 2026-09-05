@@ -5452,11 +5452,7 @@ func displayTaskAddress(addr string) string {
 		return "gist:" + shortGistIDForDisplay(ref.GistID) + "/" + ref.File
 	}
 	if ref, ok := tasklocator.ParseDB(addr); ok {
-		node := ref.NodeID
-		if len(node) > 8 {
-			node = node[:8]
-		}
-		return "db:" + node + "/" + ref.Name
+		return "db:" + domain.NodeLabelOrID(domain.NodeInfo{ID: ref.NodeID}) + "/" + ref.Name
 	}
 	return addr
 }

@@ -322,7 +322,7 @@ func (a *App) ResolveNode(ctx context.Context, ref string) (string, error) {
 	default:
 		var names []string
 		for _, m := range matches {
-			names = append(names, domain.NodeLabelOrID(m)+" ("+m.ID[:8]+")")
+			names = append(names, domain.NodeLabelOrID(m)+" ("+domain.NodeLabelOrID(domain.NodeInfo{ID: m.ID})+")")
 		}
 		return "", fmt.Errorf("node %q is ambiguous: %s", ref, strings.Join(names, ", "))
 	}

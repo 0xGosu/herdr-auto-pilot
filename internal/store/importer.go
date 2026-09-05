@@ -83,6 +83,7 @@ type importer struct {
 	src, dst    *Store
 	ctx         context.Context
 	legacyPath  string
+	idErr       error
 	decisions   map[int64]int64
 	audits      map[int64]int64
 	corrections map[int64]int64
@@ -112,7 +113,7 @@ func (im *importer) run(tx *sql.Tx) error {
 		{"operator", "id, label", "id", nil, nil},
 		{"decisions", decisionCols, "id", nil, func(r row) {
 			old := r["id"].(int64)
-			id := im.dst.ids.Next()
+			id := im.nextID()
 			im.decisions[old] = id
 			r["id"], r["node_id"] = id, self
 		}},
@@ -128,7 +129,7 @@ func (im *importer) run(tx *sql.Tx) error {
 		{"task_handouts", "node_id, source_path, task_text, attempts, updated_at", "source_path, task_text", nil, stampNode(self)},
 		{"audit_log", auditCols, "id", nil, func(r row) {
 			old := r["id"].(int64)
-			id := im.dst.ids.Next()
+			id := im.nextID()
 			im.audits[old] = id
 			r["id"], r["node_id"] = id, self
 			r["decision_id"] = remap(im.decisions, r["decision_id"].(int64))
@@ -139,49 +140,62 @@ func (im *importer) run(tx *sql.Tx) error {
 		}},
 		{"corrections", "id, node_id, audit_id, corrected_action, author, processed, sent, created_at", "id", nil, func(r row) {
 			old := r["id"].(int64)
-			id := im.dst.ids.Next()
+			id := im.nextID()
 			im.corrections[old] = id
 			r["id"], r["node_id"] = id, self
 			r["audit_id"] = remap(im.audits, r["audit_id"].(int64))
 		}},
 		{"llm_retries", "id, node_id, audit_id, processed, created_at", "id",
 			func(r row) bool { return r["processed"].(int64) != 0 }, func(r row) {
-				r["id"], r["node_id"] = im.dst.ids.Next(), self
+				r["id"], r["node_id"] = im.nextID(), self
 				r["audit_id"] = remap(im.audits, r["audit_id"].(int64))
 			}},
 		{"task_reservations", `id, node_id, source_path, task_text, item_index, agent_id, pane_id, terminal_id,
 			audit_id, reserved_at, restamps, confirmed_at`, "id", nil, func(r row) {
-			r["id"], r["node_id"] = im.dst.ids.Next(), self
+			r["id"], r["node_id"] = im.nextID(), self
 			r["audit_id"] = remap(im.audits, r["audit_id"].(int64))
 		}},
 		{"kill_events", "id, node_id, state, scope, author, created_at", "id", nil, func(r row) {
-			r["id"], r["node_id"] = im.dst.ids.Next(), self
+			r["id"], r["node_id"] = im.nextID(), self
 		}},
 		{"agent_actions", agentActionColumns, "id",
 			func(r row) bool {
 				st := domain.AgentActionStatus(r["status"].(string))
 				return st != domain.AgentActionPending && st != domain.AgentActionRunning
 			}, func(r row) {
-				r["id"], r["node_id"] = im.dst.ids.Next(), self
+				r["id"], r["node_id"] = im.nextID(), self
 				r["correction_id"] = remap(im.corrections, r["correction_id"].(int64))
 			}},
 		{"llm_requests", "id, node_id, request_id, signature, situation_type, agent_type, agent_id, context_json, status, created_at, session_id", "id",
 			func(r row) bool { return r["status"].(string) != "pending" }, func(r row) {
-				r["id"], r["node_id"] = im.dst.ids.Next(), self
+				r["id"], r["node_id"] = im.nextID(), self
 			}},
 		{"llm_decisions", llmDecisionCols, "id",
 			func(r row) bool { return r["status"].(string) != "pending" }, func(r row) {
-				r["id"], r["node_id"] = im.dst.ids.Next(), self
+				r["id"], r["node_id"] = im.nextID(), self
 			}},
 	}
 	for _, st := range steps {
 		if err := im.copyTable(tx, st.table, st.cols, st.order, st.keep, st.xform); err != nil {
 			return fmt.Errorf("%s: %w", st.table, err)
 		}
+		if im.idErr != nil {
+			return fmt.Errorf("%s: allocate id: %w", st.table, im.idErr)
+		}
 	}
 	_, err := tx.ExecContext(im.ctx, `INSERT INTO legacy_imports (node_id, legacy_path, imported_at) VALUES (?, ?, ?)`,
 		self, im.legacyPath, unix(time.Now()))
 	return err
+}
+
+// nextID allocates an id for an imported row, remembering the first failure;
+// run aborts the transaction on it rather than writing rows with no id.
+func (im *importer) nextID() int64 {
+	id, err := im.dst.ids.Next()
+	if err != nil && im.idErr == nil {
+		im.idErr = err
+	}
+	return id
 }
 
 func stampNode(self string) func(r row) { return func(r row) { r["node_id"] = self } }

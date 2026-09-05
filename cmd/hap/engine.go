@@ -50,14 +50,13 @@ func openProxyStore(socketPath, stateDir, nodeID string) (*store.Store, error) {
 			return nil, err
 		}
 	}
-	// Ids come from the daemon (one sequence per node); a local allocator with
-	// this node's bits is the fallback for a daemon that cannot answer.
+	// Ids come from the daemon — one sequence per node, no local fallback: an
+	// insert the daemon cannot give an id fails with the reason instead.
 	c := &sqlbridge.DialConnector{Path: socketPath}
-	local := store.NewFallbackTimeOrderedIDs(store.NodeBits(nodeID), nil)
 	return store.OpenDB(sqlbridge.OpenDB(c), store.Options{
 		NodeID:       nodeID,
 		Engine:       store.EngineTurso,
-		IDs:          sqlbridge.NewRemoteIDs(c, local.Next),
+		IDs:          sqlbridge.NewRemoteIDs(c),
 		Migrate:      false,
 		AgentLockDir: filepath.Join(stateDir, "agent-automation-locks"),
 	})

@@ -129,7 +129,7 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 				return
 			}
 		case <-pull.C:
-			if !d.fleetRun(ctx, "pull", func() { d.fleetPull(ctx, sync) }) {
+			if !d.fleetRun(ctx, "pull", func() { d.fleetPull(sync) }) {
 				return
 			}
 		}
@@ -174,7 +174,7 @@ func (d *Daemon) fleetPush(sync ports.FleetSyncPort) {
 	})
 }
 
-func (d *Daemon) fleetPull(ctx context.Context, sync ports.FleetSyncPort) {
+func (d *Daemon) fleetPull(sync ports.FleetSyncPort) {
 	_ = logging.Guard("fleet-pull", func() error {
 		now := d.opt.Clock.Now()
 		changed, err := sync.Pull()

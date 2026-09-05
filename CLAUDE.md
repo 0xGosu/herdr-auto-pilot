@@ -907,15 +907,19 @@ whose manifest carries exactly that version).
   and a Push cancelled mid-flight hangs the engine for good. Schema DDL on the shared database
   is issued only by the holder of the SCHEMA LEASE (`turso.PrepareSharedSchema` /
   `AcquireSchemaLease`: pull first; claim a row in the shared database, push it, let the remote
-  arbitrate, pull and re-read; migrate only if the row still names you) because two identical
+  arbitrate, pull and re-read; migrate only if the row still names you, RENEWING it while the
+  migration runs) because two identical
   ALTERs wedge the loser SILENTLY — and elapsed time is never ownership: a node that cannot
   establish the lease fails closed rather than migrating blind. The fleet loop runs every sync
   op off the loop and waits for it OR shutdown (`fleetRun`), and `turso.DB.Close` waits a
   bounded time for in-flight ops and refuses to close underneath one — a native call is never
   cancelled, but neither may it hold the daemon lock forever or be closed under. Config never
   enters the database. Keep the spike (`internal/store/turso/spike_test.go`, tag `tursospike`),
-  `TestTwoNodesShareEscalationsAndRemoteConfirms` and `TestSchemaLeaseIsExclusiveBetweenTwoNodes`
-  (skip without `tursodb`), and `TestFleetSyncShutdownIsNotHeldByAHungPull`.
+  `TestTwoNodesShareEscalationsAndRemoteConfirms`, `TestSchemaLeaseIsExclusiveBetweenTwoNodes` and
+  `TestASlowMigrationKeepsTheLeasePastItsNominalTTL` (skip without `tursodb`), and
+  `TestFleetSyncShutdownIsNotHeldByAHungPull`. Front ends draw ids from the daemon over the store
+  socket and have NO local fallback: an insert the daemon gave no id for fails with the reason
+  (`failedID`), because two processes minting locally in one millisecond collide.
 - **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
   shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels
   results back through a channel (see `consultLLM` / `llmResults`).

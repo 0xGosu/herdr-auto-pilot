@@ -72,7 +72,7 @@ func TestTimeOrderedIDsAreUniqueAndMonotonic(t *testing.T) {
 	seen := map[int64]bool{}
 	var prev int64 = -1
 	for i := 0; i < 5000; i++ { // well past the 1024-per-millisecond sequence
-		id := g.Next()
+		id := g.MustNext()
 		if id <= prev {
 			t.Fatalf("id %d after %d is not increasing", id, prev)
 		}
@@ -94,7 +94,7 @@ func TestTimeOrderedIDsFromDifferentNodesNeverCollide(t *testing.T) {
 	seen := map[int64]string{}
 	for i := 0; i < 2000; i++ {
 		for name, g := range map[string]*TimeOrderedIDs{"a": a, "b": b} {
-			id := g.Next()
+			id := g.MustNext()
 			if other, dup := seen[id]; dup {
 				t.Fatalf("id %d minted by both %s and %s", id, other, name)
 			}
@@ -106,9 +106,9 @@ func TestTimeOrderedIDsFromDifferentNodesNeverCollide(t *testing.T) {
 func TestTimeOrderedIDsSurviveAClockStepBackwards(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	g := NewTimeOrderedIDs(3, func() time.Time { return now })
-	first := g.Next()
+	first := g.MustNext()
 	now = now.Add(-time.Hour)
-	second := g.Next()
+	second := g.MustNext()
 	if second <= first {
 		t.Fatalf("clock regression produced a non-increasing id: %d then %d", first, second)
 	}
@@ -117,7 +117,7 @@ func TestTimeOrderedIDsSurviveAClockStepBackwards(t *testing.T) {
 func TestTimeOrderedIDsSortByTimeAcrossNodes(t *testing.T) {
 	early := NewTimeOrderedIDs(4000, func() time.Time { return time.Unix(1_800_000_000, 0) })
 	late := NewTimeOrderedIDs(1, func() time.Time { return time.Unix(1_800_000_001, 0) })
-	if early.Next() >= late.Next() {
+	if early.MustNext() >= late.MustNext() {
 		t.Fatal("an id minted a second later on a lower node must still sort after")
 	}
 }
@@ -157,28 +157,6 @@ func TestOpenDBTursoRequiresAnAllocator(t *testing.T) {
 	}
 	if _, err := OpenDB(db, Options{NodeID: "0123456789abcdef", Engine: EngineTurso, Migrate: true}); err == nil {
 		t.Fatal("turso without an id allocator must be refused")
-	}
-}
-
-// TestFallbackIDsNeverCollideWithTheDaemons: a front end that could not reach
-// the daemon mints from the upper half of the per-millisecond sequence, so the
-// same node bits in the same millisecond never yield the daemon's id.
-func TestFallbackIDsNeverCollideWithTheDaemons(t *testing.T) {
-	fixed := time.Unix(1_800_000_000, 0)
-	daemon := NewTimeOrderedIDs(7, func() time.Time { return fixed })
-	fallback := NewFallbackTimeOrderedIDs(7, func() time.Time { return fixed })
-	seen := map[int64]string{}
-	for i := 0; i < 3000; i++ { // past both halves, so the ms borrow is exercised too
-		for name, g := range map[string]*TimeOrderedIDs{"daemon": daemon, "fallback": fallback} {
-			id := g.Next()
-			if other, dup := seen[id]; dup {
-				t.Fatalf("id %d minted by both %s and %s", id, other, name)
-			}
-			seen[id] = name
-			if id>>10&0xFFF != 7 {
-				t.Fatalf("id %d lost its node bits", id)
-			}
-		}
 	}
 }
 

@@ -1,15 +1,20 @@
 package store
 
 import (
+	"database/sql/driver"
+	"fmt"
 	"sync"
 	"time"
 )
 
 // IDAllocator hands out the INTEGER PRIMARY KEY of a new row. When the store
 // has none, the database assigns rowids itself (AUTOINCREMENT, LastInsertId) —
-// the sqlite engine's behaviour, unchanged.
+// the sqlite engine's behaviour, unchanged. An allocator that cannot answer
+// (a front end whose daemon did not hand out an id) returns an error, and the
+// insert that needed the id then FAILS with it — never a locally invented id
+// that could collide with the daemon's or another front end's.
 type IDAllocator interface {
-	Next() int64
+	Next() (int64, error)
 }
 
 // idEpochMs is 2025-01-01T00:00:00Z. 41 bits of milliseconds above it run to
@@ -32,44 +37,25 @@ type TimeOrderedIDs struct {
 	now    func() time.Time
 	lastMs int64
 	seq    int64
-	// The sequence range this allocator owns within a millisecond. The
-	// daemon takes the lower half and a front end's FALLBACK allocator the
-	// upper half, so the two never mint the same id on one node even when
-	// the front end could not reach the daemon for its ids.
-	seqBase, seqLimit int64
 }
 
-// seqPerMs is the sequence space per millisecond; seqHalf splits it between
-// the daemon (lower) and a front end's fallback (upper).
-const (
-	seqPerMs = 1 << 10
-	seqHalf  = seqPerMs / 2
-)
+// seqPerMs is the sequence space per millisecond. There is exactly ONE
+// allocator per node — the daemon's; front ends draw from it over the store
+// socket (sqlbridge.RemoteIDs) and never mint locally — so the whole range is
+// its own.
+const seqPerMs = 1 << 10
 
-// NewTimeOrderedIDs returns the DAEMON's allocator for the given 12-bit node
-// value: sequence 0..511 in each millisecond. now defaults to time.Now.
+// NewTimeOrderedIDs returns the node's allocator for the given 12-bit node
+// value. now defaults to time.Now.
 func NewTimeOrderedIDs(node uint16, now func() time.Time) *TimeOrderedIDs {
-	return newTimeOrderedIDs(node, now, 0, seqHalf)
-}
-
-// NewFallbackTimeOrderedIDs returns the allocator a FRONT END uses when the
-// daemon cannot hand out ids: the same node bits, sequence 512..1023, so an id
-// minted here can never equal one the daemon minted in the same millisecond.
-// Two front ends both falling back in the same millisecond remain a
-// collision, which is why the fallback is the exception and logged.
-func NewFallbackTimeOrderedIDs(node uint16, now func() time.Time) *TimeOrderedIDs {
-	return newTimeOrderedIDs(node, now, seqHalf, seqPerMs)
-}
-
-func newTimeOrderedIDs(node uint16, now func() time.Time, base, limit int64) *TimeOrderedIDs {
 	if now == nil {
 		now = time.Now
 	}
-	return &TimeOrderedIDs{node: node & 0xFFF, now: now, lastMs: -1, seqBase: base, seqLimit: limit}
+	return &TimeOrderedIDs{node: node & 0xFFF, now: now, lastMs: -1}
 }
 
-// Next returns the next id.
-func (g *TimeOrderedIDs) Next() int64 {
+// Next returns the next id. It never fails.
+func (g *TimeOrderedIDs) Next() (int64, error) {
 	ms := g.now().UnixMilli() - idEpochMs
 	if ms < 0 {
 		ms = 0
@@ -81,15 +67,22 @@ func (g *TimeOrderedIDs) Next() int64 {
 	}
 	if ms == g.lastMs {
 		g.seq++
-		if g.seq >= g.seqLimit {
+		if g.seq >= seqPerMs {
 			ms++
-			g.seq = g.seqBase
+			g.seq = 0
 		}
 	} else {
-		g.seq = g.seqBase
+		g.seq = 0
 	}
 	g.lastMs = ms
-	return ms<<22 | int64(g.node)<<10 | g.seq
+	return ms<<22 | int64(g.node)<<10 | g.seq, nil
+}
+
+// MustNext is Next for an allocator that cannot fail (TimeOrderedIDs), for
+// callers that take a plain func() int64.
+func (g *TimeOrderedIDs) MustNext() int64 {
+	id, _ := g.Next()
+	return id
 }
 
 // nextID is what every INSERT into an INTEGER PRIMARY KEY table binds for its
@@ -100,5 +93,21 @@ func (s *Store) nextID() any {
 	if s.ids == nil {
 		return nil
 	}
-	return s.ids.Next()
+	id, err := s.ids.Next()
+	if err != nil {
+		// Bound as a driver.Valuer that fails: database/sql evaluates it when
+		// the statement's arguments are converted, so the INSERT fails with
+		// this error before anything reaches the database. Loud, and no id.
+		return failedID{err: err}
+	}
+	return id
+}
+
+// failedID is the argument bound for an id the allocator could not provide.
+// Its Value method fails, which fails the statement.
+type failedID struct{ err error }
+
+// Value implements driver.Valuer by refusing.
+func (f failedID) Value() (driver.Value, error) {
+	return nil, fmt.Errorf("store: no id for the new row: %w", f.err)
 }

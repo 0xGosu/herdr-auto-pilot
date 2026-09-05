@@ -40,7 +40,6 @@ type response struct {
 	Columns  []string      `json:"c,omitempty"`
 	Rows     [][]wireValue `json:"r,omitempty"`
 	Message  string        `json:"m,omitempty"`
-	Notified bool          `json:"w,omitempty"`
 }
 
 const (

@@ -447,7 +447,7 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		}
 		// The front ends draw their ids from this allocator too, so every
 		// process on the node shares one sequence.
-		srv := sqlbridge.Serve(ln, tdb.Executor(), sqlbridge.ServerOptions{NextID: ids.Next})
+		srv := sqlbridge.Serve(ln, tdb.Executor(), sqlbridge.ServerOptions{NextID: ids.MustNext})
 		defer srv.Close()
 		fleet = tdb
 	} else {

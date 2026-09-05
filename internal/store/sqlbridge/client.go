@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"strconv"
 	"sync"
@@ -71,26 +70,24 @@ func (d *DialConnector) NextID(ctx context.Context) (int64, error) {
 // daemon through the socket, so a front end's inserts and the daemon's own
 // share one sequence per node.
 //
-// fallback is used — and the switch logged once — when the daemon cannot
-// answer: an older daemon that allocates no ids, or a socket that has just
-// gone away (in which case the insert the id was for fails on its own). A nil
-// fallback yields 0, which the next insert refuses as a duplicate key rather
-// than letting a silent id leak through.
+// There is deliberately NO local fallback: two front ends minting locally in
+// the same millisecond would collide, and a collision surfaces as a failed
+// insert at best and a lost row at worst. When the daemon cannot answer — it
+// is gone, or allocates no ids — Next returns the error and the store binds
+// it in place of the id, so the insert fails loudly with the reason.
 type RemoteIDs struct {
-	c        *DialConnector
-	fallback func() int64
-	warn     sync.Once
-	// Timeout bounds one id request (0 = 5s).
+	c *DialConnector
+	// Timeout bounds one id request (0 = 5s). The request touches no
+	// database connection on the daemon, so it is not queued behind a sync
+	// operation; the bound is for a daemon that has stopped answering.
 	Timeout time.Duration
 }
 
-// NewRemoteIDs returns an allocator over c with the given fallback.
-func NewRemoteIDs(c *DialConnector, fallback func() int64) *RemoteIDs {
-	return &RemoteIDs{c: c, fallback: fallback}
-}
+// NewRemoteIDs returns an allocator over c.
+func NewRemoteIDs(c *DialConnector) *RemoteIDs { return &RemoteIDs{c: c} }
 
 // Next implements store.IDAllocator.
-func (r *RemoteIDs) Next() int64 {
+func (r *RemoteIDs) Next() (int64, error) {
 	timeout := r.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -98,17 +95,10 @@ func (r *RemoteIDs) Next() int64 {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	id, err := r.c.NextID(ctx)
-	if err == nil {
-		return id
+	if err != nil {
+		return 0, fmt.Errorf("the daemon did not allocate an id (%w); retry once it is running", err)
 	}
-	r.warn.Do(func() {
-		slog.Warn("store: the daemon did not allocate an id; falling back to a local allocator for this process",
-			"error", err)
-	})
-	if r.fallback == nil {
-		return 0
-	}
-	return r.fallback()
+	return id, nil
 }
 
 // Connect dials the socket. A refused or missing socket is ErrStoreUnavailable,
