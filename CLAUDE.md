@@ -907,8 +907,9 @@ whose manifest carries exactly that version).
   and a Push cancelled mid-flight hangs the engine for good. Schema DDL on the shared database
   is issued only by the holder of the SCHEMA LEASE (`turso.PrepareSharedSchema` /
   `AcquireSchemaLease`: pull first; claim a row in the shared database, push it, let the remote
-  arbitrate, pull and re-read; migrate only if the row still names you, RENEWING it while the
-  migration runs) because two identical
+  arbitrate, pull and re-read; migrate only if the row still names you, and RE-PROVE it between
+  migration steps — pull, renew, push — failing closed with `ErrSchemaLeaseLost` if the row went
+  elsewhere, since a background renewal alone is starved by a step's own write lock) because two identical
   ALTERs wedge the loser SILENTLY — and elapsed time is never ownership: a node that cannot
   establish the lease fails closed rather than migrating blind. The fleet loop runs every sync
   op off the loop and waits for it OR shutdown (`fleetRun`), and `turso.DB.Close` waits a

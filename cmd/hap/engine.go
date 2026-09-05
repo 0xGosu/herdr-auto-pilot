@@ -62,6 +62,46 @@ func openProxyStore(socketPath, stateDir, nodeID string) (*store.Store, error) {
 	})
 }
 
+// mcpStore opens the MCP server's store by the EFFECTIVE engine: the daemon's
+// proxy when the launcher said so (HAP_STORE_SOCKET_PATH), when the config
+// selects turso, or when the turso state dir exists beside the database; the
+// local file only when nothing says turso. A proxied store is pinged so a
+// missing daemon fails here, with the reason, rather than on the first query.
+func mcpStore(ctx context.Context, paths config.Paths, dbPath string) (*store.Store, error) {
+	stateDir := filepath.Dir(dbPath)
+	sock := os.Getenv("HAP_STORE_SOCKET_PATH")
+	if sock == "" && mcpEngineIsTurso(paths, stateDir) {
+		sock = filepath.Join(stateDir, filepath.Base(paths.StoreSocketPath()))
+	}
+	if sock == "" {
+		return store.Open(dbPath)
+	}
+	st, err := openProxyStore(sock, stateDir, os.Getenv("HAP_NODE_ID"))
+	if err != nil {
+		return nil, err
+	}
+	if err := st.Ping(ctx); err != nil {
+		st.Close()
+		return nil, err
+	}
+	return st, nil
+}
+
+// mcpEngineIsTurso reports whether this install runs the turso engine, from
+// either signal a sanitized environment may leave: the config file, or the
+// turso state dir a turso daemon creates beside the database.
+func mcpEngineIsTurso(paths config.Paths, stateDir string) bool {
+	if paths.ConfigDir != "" {
+		if cfg, err := config.Load(paths.File()); err == nil && cfg.Database.EngineOrDefault() == config.EngineTurso {
+			return true
+		}
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, filepath.Base(paths.TursoDir()))); err == nil {
+		return true
+	}
+	return false
+}
+
 // openTurso opens the daemon's sync database, retrying the FIRST bootstrap
 // until the remote answers. A node that has bootstrapped before opens its local
 // file whether or not the remote is reachable; a brand-new one has nothing to

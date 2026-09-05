@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 )
 
@@ -13,8 +14,16 @@ import (
 type SchemaOwner interface {
 	NodeID() string
 	SchemaCurrent(ctx context.Context) (bool, error)
-	Migrate() error
+	// MigrateWith runs the migration, calling between before every step that
+	// issues DDL; a non-nil error from it stops the migration there.
+	MigrateWith(between func() error) error
 }
+
+// ErrSchemaLeaseLost reports that another node holds the schema lease this
+// node was migrating under. The migration stops before its next DDL: the
+// other node is (or will be) migrating, and two nodes' identical DDL is the
+// wedge the lease exists to prevent.
+var ErrSchemaLeaseLost = errors.New("turso: the schema lease was taken by another node during this node's migration")
 
 // SchemaMigrationWait bounds how long a node waits for ANOTHER node's
 // migration to arrive before giving up. It fails closed: elapsed time alone
@@ -86,13 +95,14 @@ func PrepareSharedSchema(ctx context.Context, db *DB, s SchemaOwner, now func() 
 			}
 			if got {
 				slog.Info("turso: this node leads the schema migration")
-				// Hold the lease for as long as the migration takes: without
-				// renewal a migration slower than the TTL would be taken over
-				// by another node mid-flight — the very race the lease exists
-				// to prevent.
-				stop := holdSchemaLease(db, s.NodeID(), now)
-				err := s.Migrate()
-				stop()
+				// Hold the lease for as long as the migration takes, and
+				// re-PROVE it between steps: a background renewal alone can
+				// be starved by a step's own write lock, so ownership is
+				// checked (pull, renew, push) before every DDL statement and
+				// the migration fails closed if the lease went elsewhere.
+				hold := newLeaseHold(db, s.NodeID(), now)
+				err := s.MigrateWith(hold.verify)
+				hold.stop()
 				if err != nil {
 					return err
 				}
@@ -192,16 +202,31 @@ func leaseExpired(expiresMs int64, now time.Time) bool {
 	return expiresMs+schemaLeaseRenew.Milliseconds() <= now.UnixMilli()
 }
 
-// holdSchemaLease renews the lease every schemaLeaseRenew — a fresh expiry,
-// pushed — until the returned stop is called. Renewal is gated like every
-// other statement, so it interleaves with the migration's own DDL rather than
-// racing it; a renewal that fails is logged and retried on the next tick, and
-// the TTL is several renewals long so one miss changes nothing.
-func holdSchemaLease(db *DB, self string, now func() time.Time) (stop func()) {
+// leaseHold keeps the schema lease alive for the duration of a migration.
+//
+// Two mechanisms, for two failure modes. A background ticker renews the lease
+// (fresh expiry, pushed) every schemaLeaseRenew, so an ordinary migration never
+// approaches the TTL. But a renewal can be starved by the migration's own write
+// lock — a long table rebuild holds it, and the renewal's UPDATE on another
+// connection is refused as busy — so the migration also calls verify BETWEEN
+// steps, when no transaction is open: pull, renew, push, and stop the migration
+// if the row no longer names this node (ErrSchemaLeaseLost) or if renewals have
+// been failing for longer than the lease can have survived.
+type leaseHold struct {
+	db     *DB
+	self   string
+	now    func() time.Time
+	mu     sync.Mutex
+	lastOK time.Time
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func newLeaseHold(db *DB, self string, now func() time.Time) *leaseHold {
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	h := &leaseHold{db: db, self: self, now: now, lastOK: now(), cancel: cancel, done: make(chan struct{})}
 	go func() {
-		defer close(done)
+		defer close(h.done)
 		t := time.NewTicker(schemaLeaseRenew)
 		defer t.Stop()
 		for {
@@ -209,29 +234,56 @@ func holdSchemaLease(db *DB, self string, now func() time.Time) (stop func()) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if err := renewSchemaLease(db, self, now); err != nil {
-					slog.Warn("turso: schema lease renewal failed; retrying on the next tick", "error", err)
+				if err := h.verify(); err != nil {
+					slog.Warn("turso: schema lease renewal", "error", err)
 				}
 			}
 		}
 	}()
-	return func() {
-		cancel()
-		<-done
-	}
+	return h
 }
 
-func renewSchemaLease(db *DB, self string, now func() time.Time) error {
-	res, err := db.DB().ExecContext(context.Background(),
+func (h *leaseHold) stop() {
+	h.cancel()
+	<-h.done
+}
+
+// verify re-proves ownership: pull (so a takeover is SEEN — the renewal's WHERE
+// is evaluated locally and the engine replays the row unconditionally, so a
+// blind renewal would overwrite a legitimate new owner), renew, push. A
+// definitive loss is ErrSchemaLeaseLost. A transient failure (busy, offline) is
+// tolerated only while the last confirmed renewal is younger than the TTL;
+// past that the lease may have lapsed and been claimed, and the caller must
+// stop rather than issue DDL on hope.
+func (h *leaseHold) verify() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, err := h.db.Pull(); err != nil {
+		return h.tolerate(fmt.Errorf("pull: %w", err))
+	}
+	res, err := h.db.DB().ExecContext(context.Background(),
 		`UPDATE hap_schema_lease SET expires_at = ? WHERE id = 1 AND node_id = ?`,
-		now().Add(schemaLeaseTTL).UnixMilli(), self)
+		h.now().Add(schemaLeaseTTL).UnixMilli(), h.self)
 	if err != nil {
-		return err
+		return h.tolerate(fmt.Errorf("renew: %w", err))
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return errors.New("the lease is no longer this node's")
+		return ErrSchemaLeaseLost
 	}
-	return db.Push()
+	if err := h.db.Push(); err != nil {
+		return h.tolerate(fmt.Errorf("push: %w", err))
+	}
+	h.lastOK = h.now()
+	return nil
+}
+
+func (h *leaseHold) tolerate(err error) error {
+	if h.now().Sub(h.lastOK) < schemaLeaseTTL {
+		slog.Warn("turso: schema lease renewal failed; the lease still stands", "error", err)
+		return nil
+	}
+	return fmt.Errorf("turso: the schema lease could not be renewed for %s and may have lapsed; refusing to continue the migration: %w",
+		schemaLeaseTTL, err)
 }
 
 func readSchemaLease(ctx context.Context, db *sql.DB) (owner string, expiresMs int64, err error) {

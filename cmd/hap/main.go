@@ -742,14 +742,14 @@ func runMCP(ctx context.Context, paths config.Paths) error {
 	// Under the turso engine the daemon hands its MCP children the store
 	// socket and this node's id, the same way it hands them the paths above —
 	// the launching CLI may have sanitized the environment that would let this
-	// process work them out itself.
-	var st *store.Store
-	var err error
-	if sock := os.Getenv("HAP_STORE_SOCKET_PATH"); sock != "" {
-		st, err = openProxyStore(sock, filepath.Dir(dbPath), os.Getenv("HAP_NODE_ID"))
-	} else {
-		st, err = store.Open(dbPath)
-	}
+	// process work them out itself. A launch WITHOUT that hint (a direct
+	// replay, an MCP registration that only carries HAP_DB_PATH) must still
+	// never open a local SQLite file on a turso install: decisions staged there
+	// would carry local rowids the daemon never sees. mcpStore decides the
+	// engine from what this process can see — the config, or the turso state
+	// dir beside the database — and a turso install without a reachable daemon
+	// gets the same store-unavailable error every other front end gets.
+	st, err := mcpStore(ctx, paths, dbPath)
 	if err != nil {
 		return err
 	}

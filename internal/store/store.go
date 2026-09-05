@@ -257,7 +257,7 @@ func OpenDB(db *sql.DB, opts Options) (*Store, error) {
 	s := &Store{db: db, agentLockDir: lockDir, self: opts.NodeID, engine: engine,
 		ids: opts.IDs, onWrite: opts.OnWrite}
 	if opts.Migrate {
-		if err := s.migrate(); err != nil {
+		if err := s.migrate(nil); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -268,7 +268,18 @@ func OpenDB(db *sql.DB, opts Options) (*Store, error) {
 // Migrate applies the schema migration now. OpenDB runs it when Options.Migrate
 // is set; the turso daemon runs it here instead, AFTER its first pull and only
 // when it holds the schema lead (see turso.PrepareSharedSchema).
-func (s *Store) Migrate() error { return s.migrate() }
+func (s *Store) Migrate() error { return s.migrate(nil) }
+
+// MigrateWith is Migrate with a hook called BEFORE every step that issues DDL
+// or rewrites rows. Under a shared database the hook re-proves that this node
+// still holds the schema lease (turso.PrepareSharedSchema): each step is a
+// bounded transaction, so ownership is checked between them and a migration
+// whose lease lapsed stops before its next DDL rather than racing another node.
+func (s *Store) MigrateWith(between func() error) error { return s.migrate(between) }
+
+// Ping reports whether the database answers — for a proxied store, whether the
+// daemon serving it is reachable.
+func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 // noteWrite reports a committed write to the sync hook.
 func (s *Store) noteWrite() {

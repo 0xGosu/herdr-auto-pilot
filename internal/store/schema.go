@@ -535,9 +535,19 @@ var rebuilds = []rebuild{
 	{"task_handouts", createTaskHandouts, "source_path, task_text, attempts, updated_at"},
 }
 
-func (s *Store) migrate() error {
+func (s *Store) migrate(between func() error) error {
 	ctx := context.Background()
+	// step runs the caller's between-steps hook (see MigrateWith); nil = none.
+	step := func() error {
+		if between == nil {
+			return nil
+		}
+		return between()
+	}
 	ddl := schemaFor(s.engine)
+	if err := step(); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(withoutIndexes(ddl)); err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
 	}
@@ -547,6 +557,9 @@ func (s *Store) migrate() error {
 	// engine's "duplicate column name" error text instead would tie this to one
 	// engine's wording.)
 	for _, add := range columnAdds {
+		if err := step(); err != nil {
+			return err
+		}
 		if err := s.addColumnIfMissing(ctx, add.table, add.column, add.ddl); err != nil {
 			return err
 		}
@@ -554,6 +567,9 @@ func (s *Store) migrate() error {
 	// node_id on the INTEGER PRIMARY KEY tables, then every row that predates
 	// it becomes this node's: a legacy database has exactly one owner.
 	for _, table := range nodeOwnedIntegerPKTables {
+		if err := step(); err != nil {
+			return err
+		}
 		if err := s.addColumnIfMissing(ctx, table, "node_id",
 			`ALTER TABLE `+table+` ADD COLUMN node_id TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
@@ -572,6 +588,9 @@ func (s *Store) migrate() error {
 		if has {
 			continue
 		}
+		if err := step(); err != nil {
+			return err
+		}
 		if err := s.rebuildWithNodeID(ctx, r); err != nil {
 			return err
 		}
@@ -580,6 +599,9 @@ func (s *Store) migrate() error {
 	if has, err := s.hasColumn(ctx, "roster_meta", "node_id"); err != nil {
 		return err
 	} else if !has {
+		if err := step(); err != nil {
+			return err
+		}
 		if err := s.tx(ctx, func(tx *sql.Tx) error {
 			if _, err := tx.ExecContext(ctx, strings.Replace(createRosterMeta,
 				"IF NOT EXISTS roster_meta", "roster_meta_new", 1)); err != nil {
@@ -601,6 +623,9 @@ func (s *Store) migrate() error {
 	}
 	// A rebuild drops the table's indexes with it; the second pass recreates
 	// them (and is a no-op for everything else).
+	if err := step(); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(ddl); err != nil {
 		return fmt.Errorf("migrate schema (indexes): %w", err)
 	}

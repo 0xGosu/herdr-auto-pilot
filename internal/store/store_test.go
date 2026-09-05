@@ -1460,7 +1460,7 @@ func TestMigrateBackfillsSignatureRows(t *testing.T) {
 	if kept == nil || kept.Mode != domain.ModeAutonomous || kept.CachedConfidence != 0.9 {
 		t.Errorf("existing row must be untouched by the backfill: %+v", kept)
 	}
-	if err := re.migrate(); err != nil {
+	if err := re.migrate(nil); err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := re.GetSignature(ctx, "idle:orphan"); st != nil {

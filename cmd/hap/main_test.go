@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 
 	skilldoc "github.com/0xGosu/herdr-auto-pilot"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
 )
 
 // TestEmbeddingDigestStableAndChangeSensitive guards the crash-loop breaker's
@@ -155,4 +157,66 @@ func TestRunSkill(t *testing.T) {
 	if string(got) != skilldoc.HapSkill {
 		t.Fatal("installed file differs from the embedded document")
 	}
+}
+
+// TestMCPNeverOpensLocalSQLiteUnderTurso: an MCP server launched without the
+// daemon's HAP_STORE_SOCKET_PATH hint (a direct replay, an MCP registration
+// carrying only HAP_DB_PATH) must not fall back to a local SQLite file on a
+// turso install — decisions staged there would never reach the daemon. Both
+// signals a sanitized environment may leave select the proxy, and with no
+// daemon the result is the store-unavailable error, not a new database file.
+func TestMCPNeverOpensLocalSQLiteUnderTurso(t *testing.T) {
+	t.Setenv("HAP_STORE_SOCKET_PATH", "")
+	t.Setenv("HAP_NODE_ID", "")
+	ctx := context.Background()
+
+	t.Run("config selects turso", func(t *testing.T) {
+		paths := config.Paths{ConfigDir: t.TempDir(), StateDir: t.TempDir()}
+		if err := os.WriteFile(paths.File(), []byte("[database]\nengine = \"turso\"\nturso_database_url = \"libsql://x\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		st, err := mcpStore(ctx, paths, paths.DBPath())
+		if err == nil {
+			st.Close()
+			t.Fatal("a turso install with no daemon must not yield a store")
+		}
+		if !errors.Is(err, sqlbridge.ErrStoreUnavailable) {
+			t.Fatalf("err = %v, want ErrStoreUnavailable", err)
+		}
+		if _, serr := os.Stat(paths.DBPath()); serr == nil {
+			t.Fatal("a local SQLite file was created under the turso engine")
+		}
+	})
+
+	t.Run("turso state dir beside the database", func(t *testing.T) {
+		paths := config.Paths{ConfigDir: t.TempDir(), StateDir: t.TempDir()}
+		if err := os.MkdirAll(paths.TursoDir(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// HAP_DB_PATH only, config dir sanitized away: the dir is the signal.
+		sanitized := config.Paths{StateDir: paths.StateDir}
+		st, err := mcpStore(ctx, sanitized, paths.DBPath())
+		if err == nil {
+			st.Close()
+			t.Fatal("the turso state dir must select the proxy")
+		}
+		if !errors.Is(err, sqlbridge.ErrStoreUnavailable) {
+			t.Fatalf("err = %v, want ErrStoreUnavailable", err)
+		}
+		if _, serr := os.Stat(paths.DBPath()); serr == nil {
+			t.Fatal("a local SQLite file was created under the turso engine")
+		}
+	})
+
+	t.Run("sqlite install opens the local file", func(t *testing.T) {
+		paths := config.Paths{ConfigDir: t.TempDir(), StateDir: t.TempDir()}
+		st, err := mcpStore(ctx, paths, paths.DBPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.Close()
+		if _, err := os.Stat(paths.DBPath()); err != nil {
+			t.Fatalf("the sqlite engine must open the local file: %v", err)
+		}
+	})
 }
