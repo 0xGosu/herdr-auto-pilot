@@ -3,10 +3,10 @@ package daemon
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
@@ -39,7 +39,7 @@ func TestTheDaemonPublishesTheHerd(t *testing.T) {
 		{AgentID: "w1:p1", PaneID: "w1:p1", TabID: "w1:t1", WorkspaceID: "w1",
 			AgentType: "claude", Status: "idle", TerminalID: "term-a"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		agents, publishedAt := liveRoster(t, h)
 		return len(agents) == 1 && !publishedAt.IsZero()
@@ -59,7 +59,7 @@ func TestTheDaemonPublishesTheHerd(t *testing.T) {
 func TestAnEmptyHerdIsStillAPublishedRoster(t *testing.T) {
 	h := newHarness(t, "")
 	h.herdr.setAgents(nil)
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		_, publishedAt := liveRoster(t, h)
 		return !publishedAt.IsZero()
@@ -83,7 +83,7 @@ func TestAVanishedAgentLeavesTheLiveRoster(t *testing.T) {
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
 		{AgentID: "w1:p2", PaneID: "w1:p2", AgentType: "claude", Status: "idle"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		agents, _ := liveRoster(t, h)
 		return len(agents) == 2
@@ -92,7 +92,7 @@ func TestAVanishedAgentLeavesTheLiveRoster(t *testing.T) {
 	h.herdr.setAgents([]domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		agents, _ := liveRoster(t, h)
 		return len(agents) == 1
@@ -115,7 +115,7 @@ func TestARecycledPaneIDReplacesItsPredecessorsRow(t *testing.T) {
 	h.herdr.setAgents([]domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle", TerminalID: "term-a"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		agents, _ := liveRoster(t, h)
 		a, ok := rosterByID(agents, "w1:p1")
@@ -129,7 +129,7 @@ func TestARecycledPaneIDReplacesItsPredecessorsRow(t *testing.T) {
 	h.herdr.setAgents([]domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "codex", Status: "idle", TerminalID: "term-b"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		agents, _ := liveRoster(t, h)
 		a, ok := rosterByID(agents, "w1:p1")
@@ -158,7 +158,7 @@ func TestAPublishedCwdIsReusedWithinItsTTL(t *testing.T) {
 	h.herdr.setAgents([]domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		agents, _ := liveRoster(t, h)
 		a, ok := rosterByID(agents, "w1:p1")
@@ -168,7 +168,7 @@ func TestAPublishedCwdIsReusedWithinItsTTL(t *testing.T) {
 
 	// Several more publishes inside the TTL must ask herdr nothing further.
 	for range 3 {
-		nudgeDaemon(t, h)
+		publishNow(t, h)
 	}
 	// Let the publishes land. There is nothing to wait FOR here — the
 	// assertion is that nothing further happened.
@@ -193,7 +193,7 @@ func TestAFailedCwdLookupStillPublishesTheAgent(t *testing.T) {
 	h.herdr.setAgents([]domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		agents, _ := liveRoster(t, h)
 		return len(agents) == 1
@@ -209,7 +209,7 @@ func TestAFailedCwdLookupStillPublishesTheAgent(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool { return h.herdr.paneInfoCallCount() > 0 })
 	asked := h.herdr.paneInfoCallCount()
 	for range 3 {
-		nudgeDaemon(t, h)
+		publishNow(t, h)
 	}
 	// Nothing to wait FOR: the assertion is that nothing further happened.
 	time.Sleep(300 * time.Millisecond)
@@ -228,7 +228,7 @@ func TestPlaceholderRowsAreNeverPublished(t *testing.T) {
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
 		{AgentID: "w1:p9", PaneID: "w1:p9", AgentType: "", Status: "unknown"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		agents, _ := liveRoster(t, h)
 		return len(agents) >= 1
@@ -271,13 +271,18 @@ func TestTheRosterTickIsIdleWithoutATUI(t *testing.T) {
 	}
 }
 
-// nudgeDaemon wakes the daemon so it re-lists and republishes at once, instead
-// of waiting out the periodic sweep.
-func nudgeDaemon(t *testing.T, h *harness) {
+// publishNow drives the listing-and-publish the SWEEP performs, without
+// waiting a minute for one.
+//
+// A nudge deliberately does not publish: it is the daemon's busiest path, and
+// no READ ever nudges — `hap agents` and `hap status` are pure reads — so
+// publishing there cost the daemon's own bookkeeping its turn at a store that
+// admits one writer, and bought no reader anything. The publish belongs to
+// the sweep, the startup reconcile and the TUI tick, which is what this
+// drives.
+func publishNow(t *testing.T, h *harness) {
 	t.Helper()
-	if err := control.Nudge(context.Background(), h.ctlPath, control.KindWake); err != nil {
-		t.Fatal(err)
-	}
+	h.daemon.reconcileAttentionPublishing(context.Background(), true)
 }
 
 // The publisher must not shell out on the daemon's select loop.
@@ -302,21 +307,22 @@ func TestTheRosterPublishDoesNotShellOutInline(t *testing.T) {
 	h.herdr.setAgents([]domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 
-	// The row is readable while herdr is still being asked for the cwd.
-	waitFor(t, 3*time.Second, func() bool {
-		agents, _ := liveRoster(t, h)
-		return len(agents) == 1
-	})
-	if got := h.herdr.paneInfoCallCount(); got == 0 {
-		t.Fatal("no pane-info lookup was in flight; the test proves nothing " +
-			"unless the row lands WHILE herdr is being asked")
-	}
+	// Wait for a lookup to be PARKED, then read: the row must already be
+	// there. Waiting on the row first and then checking for a lookup is the
+	// wrong order — it races the pass, which writes the row before it reaches
+	// herdr at all.
+	waitFor(t, 3*time.Second, func() bool { return h.herdr.paneInfoCallCount() > 0 })
 	agents, _ := liveRoster(t, h)
-	if a, ok := rosterByID(agents, "w1:p1"); !ok || a.Cwd != "" {
-		t.Errorf("roster = %+v; the row must be committed before the cwd "+
-			"lookup, not after it", agents)
+	a, ok := rosterByID(agents, "w1:p1")
+	if !ok {
+		t.Fatalf("roster = %+v; the row must be committed BEFORE the cwd lookup, "+
+			"and one is parked right now", agents)
+	}
+	if a.Cwd != "" {
+		t.Errorf("cwd = %q while the lookup that would produce it is still "+
+			"parked", a.Cwd)
 	}
 
 	// And the cwd catches up behind it.
@@ -351,7 +357,7 @@ func TestARosterPassNeverOverlapsItself(t *testing.T) {
 	})
 	// Several publishes inside one pass's lifetime.
 	for range 4 {
-		nudgeDaemon(t, h)
+		publishNow(t, h)
 		time.Sleep(50 * time.Millisecond)
 	}
 	waitFor(t, 3*time.Second, func() bool {
@@ -378,7 +384,7 @@ func TestLocationLabelsAreNotRelistedOnEveryPublish(t *testing.T) {
 	h.herdr.setAgents([]domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", WorkspaceID: "w1", AgentType: "claude", Status: "idle"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		workspaces, _, err := h.raw.HerdrLocations(context.Background())
 		return err == nil && workspaces["w1"].Label == "main"
@@ -389,7 +395,7 @@ func TestLocationLabelsAreNotRelistedOnEveryPublish(t *testing.T) {
 	published := h.herdr.workspaceCallCount()
 
 	for range 4 {
-		nudgeDaemon(t, h)
+		publishNow(t, h)
 	}
 	// Nothing to wait FOR: the assertion is that nothing further happened.
 	time.Sleep(300 * time.Millisecond)
@@ -418,7 +424,7 @@ func TestADiscoveryEventNeverOverwritesAStatus(t *testing.T) {
 	h.herdr.setAgents([]domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		agents, _ := liveRoster(t, h)
 		a, ok := rosterByID(agents, "w1:p1")
@@ -458,7 +464,7 @@ func TestThePublishedCwdFollowsTheForegroundRule(t *testing.T) {
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
 		{AgentID: "w1:p2", PaneID: "w1:p2", AgentType: "claude", Status: "idle"},
 	})
-	nudgeDaemon(t, h)
+	publishNow(t, h)
 	waitFor(t, 3*time.Second, func() bool {
 		agents, _ := liveRoster(t, h)
 		a, ok := rosterByID(agents, "w1:p1")
@@ -534,4 +540,106 @@ func TestTheRosterTickListsOffTheSelectLoop(t *testing.T) {
 		agents, publishedAt, err := raw.LiveRoster(context.Background())
 		return err == nil && len(agents) == 1 && !publishedAt.IsZero()
 	})
+}
+
+// A listing that arrives while a pass is running must not be lost.
+//
+// The pass is single-flight, so a publish landing mid-pass cannot start its
+// own — and dropping it would lose the one thing only a full listing can say:
+// that an agent has VANISHED. No event reports a disappearance, so if the
+// empty listing is discarded the dead agent stays in the roster until some
+// later listing happens to arrive.
+//
+// Latest-wins rather than a queue: an older snapshot can only describe a herd
+// that has since moved on.
+func TestAListingArrivingMidPassIsStillPublished(t *testing.T) {
+	dir := t.TempDir()
+	raw, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+
+	fh := &fakeHerdr{}
+	// Park the pass inside its cwd lookup, so the second publish lands while
+	// the first is demonstrably still running.
+	fh.setPaneInfos(map[string]domain.PaneInfo{"w1:p1": {PaneID: "w1:p1", Cwd: "/work"}})
+	fh.setPaneInfoDelay(400 * time.Millisecond)
+	d := &Daemon{opt: Options{StateDir: dir, Store: raw, Herdr: fh, Clock: ports.SystemClock{}}}
+	ctx := context.Background()
+
+	d.publishRoster(ctx, []domain.AgentTransition{
+		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
+	})
+	waitFor(t, 3*time.Second, func() bool {
+		agents, _, err := raw.LiveRoster(ctx)
+		return err == nil && len(agents) == 1
+	})
+
+	// The agent vanished. This publish lands while the first pass is still
+	// parked in its cwd lookup.
+	d.publishRoster(ctx, nil)
+	waitFor(t, 5*time.Second, func() bool {
+		agents, _, err := raw.LiveRoster(ctx)
+		return err == nil && len(agents) == 0
+	})
+}
+
+// A listing arriving exactly as the worker stands down must still be
+// published.
+//
+// The worker finds no pending work and exits; a publish landing between that
+// decision and the latch being released would store its snapshot, see a
+// running pass, and return — and then nothing would consume it. It is not
+// lost forever, but it waits for the NEXT publish, which with no TUI open is
+// the minute sweep. An empty listing stranded that way is precisely the
+// vanish reconciliation the pass exists to guarantee.
+//
+// Driven deterministically through the stand-down hook rather than by racing:
+// the window is microseconds wide, so a timing test would pass on a bug most
+// runs.
+func TestAListingRacingTheStandDownIsStillPublished(t *testing.T) {
+	dir := t.TempDir()
+	raw, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+
+	fh := &fakeHerdr{}
+	d := &Daemon{opt: Options{StateDir: dir, Store: raw, Herdr: fh, Clock: ports.SystemClock{}}}
+	ctx := context.Background()
+
+	d.publishRoster(ctx, []domain.AgentTransition{
+		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
+	})
+	waitFor(t, 3*time.Second, func() bool {
+		agents, _, err := raw.LiveRoster(ctx)
+		return err == nil && len(agents) == 1
+	})
+
+	// The agent vanished, and its empty listing lands in the stand-down
+	// window exactly once.
+	var once sync.Once
+	d.setRosterStoodDown(func() {
+		once.Do(func() { d.publishRoster(ctx, nil) })
+	})
+	t.Cleanup(func() { d.setRosterStoodDown(nil) })
+
+	// Any publish now reaches the hook on its way out.
+	d.publishRoster(ctx, []domain.AgentTransition{
+		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
+	})
+	waitFor(t, 5*time.Second, func() bool {
+		agents, _, err := raw.LiveRoster(ctx)
+		return err == nil && len(agents) == 0
+	})
+}
+
+// setRosterStoodDown installs the stand-down hook under the lock that owns it,
+// so a test writing it cannot race the worker reading it.
+func (d *Daemon) setRosterStoodDown(fn func()) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.rosterStoodDown = fn
 }

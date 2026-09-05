@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -563,5 +564,125 @@ func TestAnEventStillIntroducesANewAgent(t *testing.T) {
 	}
 	if len(agents) != 1 {
 		t.Errorf("roster = %+v; an agent nobody has listed yet is not a retired one", agents)
+	}
+}
+
+// A publish costs the same number of statements whatever the herd's size.
+//
+// Every transaction here takes the write lock at BEGIN and holds it until
+// commit, so a publish's statement count is time every other writer in the
+// process spends waiting — and this one runs on the daemon's own cadence
+// against a herd of arbitrary size. A per-agent SELECT made that hold time
+// grow with the herd, and the goroutines queued behind it are the ones
+// recording an operator's actual work.
+//
+// Asserted as behaviour over a herd big enough that a per-agent query would
+// dominate: all the rules the loop enforces must still hold at scale.
+func TestAPublishOverALargeHerdKeepsEveryRule(t *testing.T) {
+	st := rosterStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	var rows []domain.RosterAgent
+	for i := range 50 {
+		id := "w1:p" + strconv.Itoa(i)
+		rows = append(rows, domain.RosterAgent{
+			AgentID: id, PaneID: id, AgentType: "claude", Status: "idle",
+			TerminalID: "term-" + strconv.Itoa(i), SeenAt: now,
+		})
+	}
+	if err := st.PublishRoster(ctx, rows, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetRosterCwds(ctx, map[string]domain.RosterCwd{
+		"w1:p7": {Cwd: "/work/seven", TerminalID: "term-7"},
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// One agent is recycled, one vanishes, the rest are unchanged.
+	rows[7].TerminalID = "term-recycled"
+	if err := st.PublishRoster(ctx, rows[:len(rows)-1], now); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err := st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 49 {
+		t.Fatalf("roster = %d agents, want 49 — the vanished one must be retired", len(agents))
+	}
+	for i, a := range agents {
+		if want := "w1:p" + strconv.Itoa(i); a.AgentID != want {
+			t.Fatalf("agents[%d] = %q, want %q — herdr's order must survive at scale", i, a.AgentID, want)
+		}
+	}
+	if a, _ := rosterByAgentID(agents, "w1:p7"); a.Cwd != "" {
+		t.Errorf("cwd = %q; a recycled pane must not inherit its predecessor's directory", a.Cwd)
+	}
+}
+
+func rosterByAgentID(agents []domain.RosterAgent, id string) (domain.RosterAgent, bool) {
+	for _, a := range agents {
+		if a.AgentID == id {
+			return a, true
+		}
+	}
+	return domain.RosterAgent{}, false
+}
+
+// A listing taken BEFORE a transition must not republish the state the agent
+// has already left.
+//
+// The daemon lists agents, then hands the snapshot to a background pass, so a
+// transition recorded in between describes the agent later than the snapshot
+// does. Writing the snapshot's status over it puts a stale answer in the
+// column readers act on: an agent that just went working reads as idle, and
+// `hap task send` decides whether an agent is free from exactly that field.
+func TestAStaleListingDoesNotRollBackANewerStatus(t *testing.T) {
+	st := rosterStore(t)
+	ctx := context.Background()
+	listedAt := time.Now()
+	agent := domain.RosterAgent{
+		AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude",
+		Status: "idle", TerminalID: "term-a", SeenAt: listedAt,
+	}
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, listedAt); err != nil {
+		t.Fatal(err)
+	}
+	// The agent starts working AFTER the next listing was taken.
+	event := agent
+	event.Status = "working"
+	event.SeenAt = listedAt.Add(time.Second)
+	if err := st.UpsertRosterAgent(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	// That older listing is only published now.
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, listedAt); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err := st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agents[0].Status != "working" {
+		t.Errorf("status = %q; a listing taken before the transition republished "+
+			"a state the agent had already left", agents[0].Status)
+	}
+
+	// A listing taken AFTER it is still authoritative — the rule is "older
+	// does not win", not "an event wins forever".
+	later := agent
+	later.Status = "idle"
+	later.SeenAt = listedAt.Add(2 * time.Second)
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{later}, later.SeenAt); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err = st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agents[0].Status != "idle" {
+		t.Errorf("status = %q; a newer listing must still win", agents[0].Status)
 	}
 }
