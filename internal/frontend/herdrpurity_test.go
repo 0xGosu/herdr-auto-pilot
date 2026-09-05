@@ -60,15 +60,14 @@ var herdrPorts = map[string]bool{
 // ever shrinks" a property of the test rather than of review discipline.
 var herdrPortExemptions = map[string]map[string]string{
 	"internal/frontend/frontend.go": {
-		"Herdr":         "stages 3-5: every reader below reaches the adapter through the field",
+		"Herdr":         "stage 5: the send path reaches the adapter through the field",
 		"HerdrPort":     "stage 6: the field's declared type, once every reader below is gone",
-		"ListAgents":    "stage 3: the roster snapshot replaces the live listing",
-		"InspectorPort": "stage 3: agent cwd moves to the roster",
-		"LocatorPort":   "stage 3: workspace and tab labels move to the roster",
-		"SendToAgent":   "stage 5: send_task carries the hand-out and the generated-task confirm",
+		"ListAgents":    "stage 5: the confirm staleness check and requireIdleAgent move INTO the send_task executor rather than onto the roster — deciding 'is this agent still idle' from a snapshot up to a sweep old is exactly the fail-open this guard exists to prevent",
+		"InspectorPort": "stage 5: paneCwd renders {cwd} for an outbound task, on the send path",
+		"SendToAgent":   "stage 5: the task hand-out and the generated-task confirm",
 	},
 	"internal/frontend/agentmode.go": {
-		"Herdr":             "stages 3-4: FindLiveAgent lists agents and the mode read/press use the field",
+		"Herdr":             "stage 4: the mode read and the chord press reach the adapter through the field",
 		"VisiblePaneReader": "stage 4: read_mode writes the mode to the roster",
 		"ChordSender":       "stage 4: set_mode moves the Shift+Tab rotation to the daemon",
 	},

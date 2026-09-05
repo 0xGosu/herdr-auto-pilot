@@ -13,6 +13,20 @@
   with the reason. It also refuses a daemon that holds its lock but has stopped
   making progress, or whose binary was replaced underneath it — cases the old
   version check reported as running
+- Changed every surface that shows the herd — the TUI's agent list, `hap status`,
+  `hap agents`, and anything resolving an agent by name — to read what the daemon
+  publishes instead of asking herdr itself. One process now asks, however many
+  windows you have open, and a working directory is read once for everyone rather
+  than once per agent per window. The daemon refreshes faster while a TUI is
+  actually open and otherwise only when something changes, so an install nobody
+  is watching does no polling at all. One consequence is worth knowing: an agent
+  that DISAPPEARS produces no event, so with no TUI open a pane that has closed
+  can still be listed by `hap agents` and `hap status` for up to a minute, until
+  the next sweep reconciles the herd
+- Fixed the herd reading as EMPTY when nothing had looked at it. "No agents are
+  running" and "no daemon has reported yet" are different answers, and surfaces
+  that act on an agent's absence — retiring a task source, confirming an agent is
+  idle — now refuse rather than guess when the report is missing or too old
 - Removed the last daemon signal that carried data. A manual capture used to
   smuggle its target into the signal itself, which is why it had no way to
   report a result; signals are now purely "there is new work in the database",

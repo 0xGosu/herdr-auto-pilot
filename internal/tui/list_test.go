@@ -818,12 +818,15 @@ func TestAgentsListRowsFitContentWidth(t *testing.T) {
 
 // TestAgentsListPreservesHerdrOrder pins down that the Agents tab never
 // reorders MonitoredAgents: that slice already arrives in herdr's own
-// `agent list` order (internal/herdr/cli.go's ListAgents passes the JSON
-// array through untouched, and frontend.App.GetStatus only filters
-// placeholders, never resorts), so the display layer's job is simply to not
-// break that — no workspace/tab/pane comparator belongs here, since
-// AgentTransition carries no intra-tab pane ordinal to reconstruct one
-// correctly.
+// `agent list` order, so the display layer's job is simply to not break that —
+// no workspace/tab/pane comparator belongs here, since AgentTransition carries
+// no intra-tab pane ordinal to reconstruct one correctly.
+//
+// The order now survives a round trip through the store: the daemon records
+// each agent's position in the listing (agent_roster.list_seq) and LiveRoster
+// reads it back in that order. Ordering by agent_id instead would look right
+// in every fixture here and scramble a real herd, since an agent id is a pane
+// id and "w1:p10" sorts before "w1:p2".
 func TestAgentsListPreservesHerdrOrder(t *testing.T) {
 	m := Model{width: 120, height: 30}
 	msg := refreshMsg{cfg: config.Default()}

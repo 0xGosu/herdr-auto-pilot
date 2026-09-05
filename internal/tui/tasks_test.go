@@ -242,11 +242,16 @@ func taskAppModel(t *testing.T) (Model, *frontend.App, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	// A herdr adapter reporting zero agents — "no agent matches this source",
-	// as opposed to a nil Herdr's "the agent list could not be read".
 	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
 		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
 	ctx := context.Background()
+	// A daemon that looked and found nothing — "no agent matches this source",
+	// as opposed to an unpublished roster's "nobody has looked". Only the
+	// first makes a source retirable, so publishing an EMPTY herd here is the
+	// fixture, not a formality.
+	if err := st.PublishRoster(ctx, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(dir, "tasks.md")
 	if err := os.WriteFile(path, []byte("- [ ] alpha\n- [x] beta\n- [-] gamma\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -1854,22 +1859,29 @@ func TestTasksRemoveSourceEligibility(t *testing.T) {
 	})
 }
 
-// TestTasksRemoveSourceUnknownAgentsFailsClosed pins the guard against a
-// herdr that cannot be reached: GetStatus reports an EMPTY agent list on a
-// failed query, which must not read as "no agent matches this source" and
-// retire a source that is feeding one. A finished list stays removable —
-// that arm never needed the agent list.
+// TestTasksRemoveSourceUnknownAgentsFailsClosed pins the guard against a herd
+// nothing has reported: GetStatus leaves the agent list EMPTY when no daemon
+// has published one recently, which must not read as "no agent matches this
+// source" and retire a source that is feeding one. A finished list stays
+// removable — that arm never needed the agent list.
+//
+// The refusal must also name the real cause. "Retry" was the old wording and
+// it was advice the operator could not act on: nothing changes until a daemon
+// publishes, so the message says which of "none yet" and "too old" it is.
 func TestTasksRemoveSourceUnknownAgentsFailsClosed(t *testing.T) {
 	unfinished := []domain.ChecklistItem{{Index: 1, Mark: " ", Text: "todo"}}
 	m := removeSourceModel(t, unfinished, "")
-	m.data.status.AgentsKnown = false // herdr query failed
+	m.data.status.AgentsKnown = false // nothing has published a roster
 	m.data.status.MonitoredAgents = nil
 	m = press(t, m, "x")
 	if m.confirm != nil {
 		t.Fatalf("an unknown agent list must not be read as 'no agent matches', got %q", m.confirm.label)
 	}
-	if !strings.Contains(m.message, "herdr can't say which agent it feeds") {
+	if !strings.Contains(m.message, "can't say which agent it feeds") {
 		t.Errorf("refusal should name the real cause, got %q", m.message)
+	}
+	if !strings.Contains(m.message, "no hap daemon has reported") {
+		t.Errorf("refusal should say WHY the herd is unknown, got %q", m.message)
 	}
 	// All tasks done: removable regardless of what herdr can tell us.
 	m = removeSourceModel(t, []domain.ChecklistItem{{Index: 1, Mark: "x", Done: true, Text: "t"}}, "")

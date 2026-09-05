@@ -45,6 +45,19 @@ type fakeHerdr struct {
 	readLines    []int
 	paneInfo     domain.PaneInfo
 	failPaneInfo bool
+	// paneInfos overrides paneInfo per pane, and paneInfoCalls counts every
+	// lookup — the roster's cwd TTL is only observable as a call COUNT.
+	paneInfos     map[string]domain.PaneInfo
+	paneInfoCalls int
+	// paneInfoDelay holds each lookup, and paneInfoMaxActive records how many
+	// were ever in flight at once — the only observable form of "two roster
+	// passes are running on top of each other".
+	paneInfoDelay     time.Duration
+	paneInfoActive    int
+	paneInfoMaxActive int
+	// workspaceCalls counts ListWorkspaces, since the location TTL, like the
+	// cwd one, is only observable as a call COUNT.
+	workspaceCalls int
 	// keys records every SendKey call (ports.KeystrokeSender). When frames
 	// is set, "right"/"left" keys move frameIdx and ReadPane serves the
 	// focused frame — simulating a multi-tab form under an arrow sweep.
@@ -290,11 +303,56 @@ func (f *fakeHerdr) setKeyScript(initial string, keys, frames []string) {
 
 func (f *fakeHerdr) PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, error) {
 	f.mu.Lock()
+	f.paneInfoCalls++
+	f.paneInfoActive++
+	if f.paneInfoActive > f.paneInfoMaxActive {
+		f.paneInfoMaxActive = f.paneInfoActive
+	}
+	delay := f.paneInfoDelay
+	f.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.paneInfoActive--
 	if f.failPaneInfo {
 		return domain.PaneInfo{}, errors.New("induced pane info failure")
 	}
+	if pi, ok := f.paneInfos[paneID]; ok {
+		return pi, nil
+	}
 	return f.paneInfo, nil
+}
+
+func (f *fakeHerdr) setPaneInfoDelay(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paneInfoDelay = d
+}
+
+func (f *fakeHerdr) paneInfoMaxConcurrent() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paneInfoMaxActive
+}
+
+func (f *fakeHerdr) workspaceCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.workspaceCalls
+}
+
+func (f *fakeHerdr) setPaneInfos(infos map[string]domain.PaneInfo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paneInfos = infos
+}
+
+func (f *fakeHerdr) paneInfoCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paneInfoCalls
 }
 
 func (f *fakeHerdr) readLineCalls() []int {
@@ -369,6 +427,7 @@ func (f *fakeHerdr) focusedPanes() [][2]string {
 func (f *fakeHerdr) ListWorkspaces(ctx context.Context) ([]domain.WorkspaceInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.workspaceCalls++
 	return append([]domain.WorkspaceInfo(nil), f.workspaces...), nil
 }
 

@@ -892,7 +892,14 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 		}
 	}
 	fmt.Fprintf(out, "pending escalations: %d\n", st.PendingEscalations)
-	fmt.Fprintf(out, "monitored agents:    %d\n", len(st.MonitoredAgents))
+	// The count alone cannot say whether 0 means "nothing is running" or
+	// "nobody has looked", which is the whole reason the roster records when
+	// it was published.
+	if problem := st.RosterProblem(); problem != "" {
+		fmt.Fprintf(out, "monitored agents:    %d (unknown — %s)\n", len(st.MonitoredAgents), problem)
+	} else {
+		fmt.Fprintf(out, "monitored agents:    %d\n", len(st.MonitoredAgents))
+	}
 	// Where task lists live, and why they cannot be reached when they cannot.
 	// `hap status` is the surface an operator runs first, so a broken store
 	// becomes visible without having to think to run `task-source provider`.
@@ -999,6 +1006,18 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		return err
 	}
 	if len(st.MonitoredAgents) == 0 {
+		// "Nothing is running" and "nobody has looked" are different answers,
+		// and since the herd is read from what the daemon publishes, the
+		// second is now the likelier one. Reporting it as an empty herd sends
+		// an operator looking for agents that are running fine.
+		if problem := st.RosterProblem(); problem != "" {
+			fmt.Fprintf(out, "%s\n", problem)
+			PrintNextSteps(out, []Hint{
+				{Cmd: "hap daemon --ensure", Why: "start the daemon, or replace one that has stopped reporting"},
+				{Cmd: "hap status", Why: "see whether it is running and subscribed"},
+			})
+			return nil
+		}
 		fmt.Fprintln(out, "no agents detected (is herdr running?)")
 		PrintNextSteps(out, []Hint{
 			{Cmd: "hap status", Why: "check the daemon is running and subscribed"},

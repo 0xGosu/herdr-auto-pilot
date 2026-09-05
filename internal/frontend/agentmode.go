@@ -115,25 +115,35 @@ const modeReadLines = 60
 // agent/pane ids take precedence over the operator-assigned short name, so an
 // id always means itself even if someone named another agent after it.
 func (a *App) FindLiveAgent(ctx context.Context, target string) (domain.AgentTransition, error) {
-	if a.Herdr == nil {
-		return domain.AgentTransition{}, fmt.Errorf("herdr is unavailable")
-	}
-	agents, err := a.Herdr.ListAgents(ctx)
+	roster, publishedAt, err := a.Store.LiveRoster(ctx)
 	if err != nil {
-		return domain.AgentTransition{}, fmt.Errorf("listing live agents: %w", err)
+		return domain.AgentTransition{}, fmt.Errorf("reading the published roster: %w", err)
 	}
-	for i := range agents {
-		if agents[i].AgentID == target || agents[i].PaneID == target {
-			return agents[i], nil
+	// A stale roster fails CLOSED, and the wording matters: "not found" would
+	// tell the operator their agent does not exist when the truth is that
+	// nothing has looked recently. Same rule as Status.AgentsKnown — absence
+	// of evidence is not evidence of absence.
+	if !domain.RosterFresh(publishedAt, a.now()) {
+		if publishedAt.IsZero() {
+			return domain.AgentTransition{}, fmt.Errorf(
+				"no hap daemon has reported the running agents yet; start one with `hap daemon --ensure`")
+		}
+		return domain.AgentTransition{}, fmt.Errorf(
+			"the last report of the running agents is %s old, so %q cannot be resolved; check the daemon with `hap status`",
+			a.now().Sub(publishedAt).Round(time.Second), target)
+	}
+	for i := range roster {
+		if roster[i].AgentID == target || roster[i].PaneID == target {
+			return roster[i].Transition(), nil
 		}
 	}
 	names, err := a.Store.AgentNames(ctx)
 	if err != nil {
 		return domain.AgentTransition{}, err
 	}
-	for i := range agents {
-		if names[agents[i].AgentID] == target {
-			return agents[i], nil
+	for i := range roster {
+		if names[roster[i].AgentID] == target {
+			return roster[i].Transition(), nil
 		}
 	}
 	return domain.AgentTransition{}, fmt.Errorf("live agent %q not found", target)

@@ -110,6 +110,15 @@ func TestAgentDisableLifecycleSurvivesDaemonRestartEndToEnd(t *testing.T) {
 	first := startRestartableDaemon(t, dbPath, configPath, herdr)
 	seedLifecycleAutoApproval(t, first.store)
 	app := &frontend.App{Store: first.store, Herdr: herdr, Author: "e2e"}
+	// Disabling an agent the daemon has seen but never NAMED resolves it
+	// against the published roster, so wait for the daemon's first publish
+	// rather than racing it. A front end no longer lists agents itself, which
+	// is the point — but it does mean "live" is something the daemon has to
+	// have said, not something this process can look up.
+	waitFor(t, 3*time.Second, func() bool {
+		agents, publishedAt, err := first.store.LiveRoster(context.Background())
+		return err == nil && domain.RosterFresh(publishedAt, time.Now()) && len(agents) > 0
+	})
 	if err := app.SetAgentDisabled(context.Background(), agentID, true); err != nil {
 		t.Fatalf("disable live agent: %v", err)
 	}

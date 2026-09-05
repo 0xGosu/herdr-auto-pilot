@@ -273,6 +273,24 @@ type Daemon struct {
 	// by the pass's own defer, including when it returns early.
 	sessionSyncPassRunning bool
 
+	// rosterPassRunning latches the goroutine a roster publish spawns for its
+	// shell-out half (guarded by mu). While a TUI is registered the roster
+	// ticks every rosterTickInterval, and one pass can outlive that — a slow
+	// workspace listing, a wedged pane get, the cwd budget — so without the
+	// latch each tick would stack another pass on top, and every one of them
+	// takes a transaction from a pool that hands out two connections. That is
+	// the same starvation moving the work off the select loop was meant to fix,
+	// arriving through a second door. Released by the goroutine's own defer AND
+	// by hand when spawn refuses, or one shutdown race disables the pass for
+	// the life of the process.
+	rosterPassRunning bool
+
+	// rosterLocationsAt is when the workspace and tab labels were last
+	// published (guarded by mu). They cost two herdr subprocesses and name
+	// things an operator creates by hand, so they ride their own TTL rather
+	// than the tick — which also means most passes have nothing to do at all.
+	rosterLocationsAt time.Time
+
 	// toggleAttempt records, per agent, the signature of the multi-select form
 	// this daemon last started answering — the evidence that lets a later
 	// delivery accept a tab whose boxes are ALREADY ticked. Without it,
@@ -1180,6 +1198,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	heartbeat := time.NewTicker(daemonhealth.HeartbeatInterval)
 	defer heartbeat.Stop()
 
+	// Fires at the TUI's own poll rate but only ACTS while a TUI is
+	// registered, so an install nobody is watching pays nothing for it —
+	// see rosterDemand.
+	rosterTick := time.NewTicker(rosterTickInterval)
+	defer rosterTick.Stop()
+
 	slog.Info("daemon running", "version", buildinfo.Version)
 	for {
 		select {
@@ -1199,6 +1223,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if d.opt.StateDir != "" {
 				daemonhealth.RotateOwnStderrIfNeeded(d.opt.StateDir)
 			}
+		case <-rosterTick.C:
+			logging.Guard("roster-tick", func() error {
+				if !d.rosterDemand() {
+					return nil
+				}
+				agents, err := d.opt.Herdr.ListAgents(ctx)
+				if err != nil {
+					slog.Debug("roster tick: listing agents failed", "error", err)
+					return nil
+				}
+				d.publishRoster(ctx, agents)
+				return nil
+			})
 		case <-sweep.C:
 			logging.Guard("periodic-sweep", func() error {
 				// Self-throttled to once a day and does its work on a
@@ -1222,6 +1259,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 					slog.Error("sweep: listing agents failed", "error", err)
 					return nil
 				}
+				// The reconciliation half of the roster: this listing is the
+				// only thing that can see an agent that VANISHED, which no
+				// per-agent event ever reports.
+				d.publishRoster(ctx, agents)
 				// Ahead of the reconcile and the idle poll: an escalation
 				// accepted this tick no longer blocks its agent's
 				// hasOpenEscalation guard, so the same sweep can move it on.
@@ -1369,6 +1410,11 @@ func (d *Daemon) captureLiveAgent(ctx context.Context, target string) (domain.Ca
 // handleTransition evaluates one agent-status transition end to end.
 func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition) {
 	now := d.opt.Clock.Now()
+
+	// Before anything can return early: an agent whose status changed is an
+	// agent a front end is about to render differently, and every early exit
+	// below is a case where nothing else will publish it until the sweep.
+	d.noteRosterTransition(ctx, tr)
 
 	// Auto-generate a short friendly name on first sight — for EVERY
 	// observed transition, including "detected" discovery events and
@@ -1538,6 +1584,12 @@ func (d *Daemon) reconcileAttention(ctx context.Context) {
 		slog.Error("reconcile: listing agents failed", "error", err)
 		return
 	}
+	// This is the FIRST listing a freshly started daemon makes, so publishing
+	// here is what stops a new install showing an empty herd for up to a
+	// minute — the front ends read the store now, and nothing else would have
+	// written it until the first sweep. The nudge path lands here too, which
+	// is why a front end's own wake produces a current roster.
+	d.publishRoster(ctx, agents)
 	d.reconcileAttentionWith(ctx, agents)
 }
 

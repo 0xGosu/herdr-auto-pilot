@@ -1712,6 +1712,9 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 		app.Herdr = fake
 		app.StateDir = t.TempDir()
 		ctx := context.Background()
+		// The workspace LABEL comes from the daemon's published locations now,
+		// not from a live locator call in this process.
+		seedLocations(t, st, fake.workspaces, nil)
 		name, _ := st.EnsureAgentName(ctx, "w1:p1")
 		path := filepath.Join(t.TempDir(), "declared.md")
 		os.WriteFile(path, []byte("- [x] 1. old\n"), 0o600)
@@ -2687,12 +2690,15 @@ func (f *fakeHerdrPort) ListAgents(ctx context.Context) ([]domain.AgentTransitio
 }
 
 func TestStatusHidesOnlyDoublePlaceholderAgents(t *testing.T) {
-	app, _ := testApp(t)
-	app.Herdr = &fakeHerdrPort{agents: []domain.AgentTransition{
-		{AgentID: "panel", PaneID: "panel", AgentType: "undefined", Status: "unknown"},
-		{AgentID: "real-unknown-status", PaneID: "real-unknown-status", AgentType: "claude", Status: "unknown"},
-		{AgentID: "active-unknown-type", PaneID: "active-unknown-type", AgentType: "undefined", Status: "working"},
-	}}
+	app, st := testApp(t)
+	// Seeded straight into the roster, bypassing the daemon's own filter, so
+	// this still exercises the VIEW boundary — a roster written by an older
+	// daemon predates that filter, and the reader must not trust it.
+	seedRoster(t, st,
+		domain.AgentTransition{AgentID: "panel", PaneID: "panel", AgentType: "undefined", Status: "unknown"},
+		domain.AgentTransition{AgentID: "real-unknown-status", PaneID: "real-unknown-status", AgentType: "claude", Status: "unknown"},
+		domain.AgentTransition{AgentID: "active-unknown-type", PaneID: "active-unknown-type", AgentType: "undefined", Status: "working"},
+	)
 
 	status, err := app.GetStatus(context.Background())
 	if err != nil {
@@ -2701,8 +2707,13 @@ func TestStatusHidesOnlyDoublePlaceholderAgents(t *testing.T) {
 	if len(status.MonitoredAgents) != 2 {
 		t.Fatalf("TUI agents = %+v, want two non-double-placeholder rows", status.MonitoredAgents)
 	}
-	if status.MonitoredAgents[0].AgentID != "real-unknown-status" ||
-		status.MonitoredAgents[1].AgentID != "active-unknown-type" {
+	// Order comes from the roster (by agent id), not from herdr's listing, so
+	// this asserts the SET.
+	visible := map[string]bool{}
+	for _, a := range status.MonitoredAgents {
+		visible[a.AgentID] = true
+	}
+	if !visible["real-unknown-status"] || !visible["active-unknown-type"] {
 		t.Fatalf("wrong agents remained visible: %+v", status.MonitoredAgents)
 	}
 }
@@ -2712,11 +2723,11 @@ func TestRenameLiveButUnnamedAgent(t *testing.T) {
 	// daemon only creates a name row when the agent first transitions. A
 	// live agent with no row yet ("no agent known as ...") must still be
 	// renamable — the rename verifies liveness and creates the row.
-	app, _ := testApp(t)
+	app, st := testApp(t)
 	ctx := context.Background()
-	app.Herdr = &fakeHerdrPort{agents: []domain.AgentTransition{
-		{AgentID: "w65:p1", PaneID: "w65:p1", AgentType: "claude", Status: "blocked"},
-	}}
+	seedRoster(t, st, domain.AgentTransition{
+		AgentID: "w65:p1", PaneID: "w65:p1", AgentType: "claude", Status: "blocked",
+	})
 
 	if err := app.RenameAgent(ctx, "w65:p1", "quiet-agent"); err != nil {
 		t.Fatalf("renaming a live unnamed agent must succeed: %v", err)
@@ -3331,14 +3342,14 @@ func (f *fakeLocatorPort) ListTabs(ctx context.Context) ([]domain.TabInfo, error
 func TestGetStatusNamesLiveAgentsAndReportsLocation(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
-	app.Herdr = &fakeLocatorPort{
-		fakeHerdrPort: fakeHerdrPort{agents: []domain.AgentTransition{
-			{AgentID: "w23:p5", PaneID: "w23:p5", TabID: "w23:t1", WorkspaceID: "w23",
-				AgentType: "claude", Status: "working"},
-		}},
-		workspaces: []domain.WorkspaceInfo{{ID: "w23", Label: "backend", Number: 23}},
-		tabs:       []domain.TabInfo{{ID: "w23:t1", Label: "1", Number: 1, WorkspaceID: "w23"}},
-	}
+	seedRoster(t, st, domain.AgentTransition{
+		AgentID: "w23:p5", PaneID: "w23:p5", TabID: "w23:t1", WorkspaceID: "w23",
+		AgentType: "claude", Status: "working",
+	})
+	seedLocations(t, st,
+		[]domain.WorkspaceInfo{{ID: "w23", Label: "backend", Number: 23}},
+		[]domain.TabInfo{{ID: "w23:t1", Label: "1", Number: 1, WorkspaceID: "w23"}},
+	)
 
 	stat, err := app.GetStatus(ctx)
 	if err != nil {
@@ -4318,24 +4329,33 @@ func TestUnfinishedTasks(t *testing.T) {
 	}
 }
 
-// TestStatusAgentsKnown pins the distinction callers act on: a failed agent
-// query and a genuinely empty herd both leave MonitoredAgents empty, so
+// TestStatusAgentsKnown pins the distinction callers act on: a herd nobody has
+// reported and a genuinely empty herd both leave MonitoredAgents empty, so
 // GetStatus must say which one happened. Anything deciding on an agent's
 // ABSENCE (the Tasks tab's source removal) is unsafe without it.
+//
+// It is now a question about the ROSTER's age rather than about an adapter
+// call, and the middle case is the one that did not exist before: a daemon
+// that died still leaves its last roster behind, and a reader that trusted row
+// count alone would report an hour-old herd as current.
 func TestStatusAgentsKnown(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
-		name  string
-		herdr ports.HerdrPort
-		want  bool
+		name    string
+		publish func(t *testing.T, app *frontend.App, st *store.Store)
+		want    bool
 	}{
-		{"query failed", &failingAgentsHerdr{}, false},
-		{"no adapter", nil, false},
-		{"empty herd", &emptyAgentsHerdr{}, true},
+		{"never published", func(*testing.T, *frontend.App, *store.Store) {}, false},
+		{"published too long ago", func(t *testing.T, _ *frontend.App, st *store.Store) {
+			seedRosterAt(t, st, time.Now().Add(-domain.RosterStaleAfter-time.Minute))
+		}, false},
+		{"empty herd, published just now", func(t *testing.T, _ *frontend.App, st *store.Store) {
+			seedRoster(t, st)
+		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			app, _ := testApp(t)
-			app.Herdr = tc.herdr
+			app, store := testApp(t)
+			tc.publish(t, app, store)
 			st, err := app.GetStatus(ctx)
 			if err != nil {
 				t.Fatal(err)
@@ -4350,6 +4370,37 @@ func TestStatusAgentsKnown(t *testing.T) {
 	}
 }
 
+// A first run must not render as an empty herd. Both are AgentsKnown=false
+// with no agents, so only the published-at zero value separates "no daemon has
+// looked" from "a daemon looked and found nothing" — and telling an operator
+// their herd is empty when nothing has looked is the wrong answer.
+func TestANeverPublishedRosterIsNotAnEmptyHerd(t *testing.T) {
+	ctx := context.Background()
+
+	app, _ := testApp(t)
+	fresh, err := app.GetStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.RosterNeverPublished() {
+		t.Error("a database no daemon has written reports a published roster")
+	}
+
+	app2, st2 := testApp(t)
+	seedRoster(t, st2)
+	empty, err := app2.GetStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.RosterNeverPublished() {
+		t.Error("a published-but-empty herd reads as never published; the operator " +
+			"would be told nothing has looked when something has")
+	}
+	if len(empty.MonitoredAgents) != 0 || len(fresh.MonitoredAgents) != 0 {
+		t.Fatal("both cases must be indistinguishable by agent count — that is the point")
+	}
+}
+
 type failingAgentsHerdr struct{}
 
 func (f *failingAgentsHerdr) Send(context.Context, string, string) error { return nil }
@@ -4358,16 +4409,6 @@ func (f *failingAgentsHerdr) ReadPane(context.Context, string, int) (string, err
 }
 func (f *failingAgentsHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
 	return nil, errors.New("herdr unreachable")
-}
-
-type emptyAgentsHerdr struct{}
-
-func (e *emptyAgentsHerdr) Send(context.Context, string, string) error { return nil }
-func (e *emptyAgentsHerdr) ReadPane(context.Context, string, int) (string, error) {
-	return "", nil
-}
-func (e *emptyAgentsHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
-	return nil, nil
 }
 
 // TestAddTaskSourceAutoSendWhenIdleOption pins the option that turns on

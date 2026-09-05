@@ -44,6 +44,7 @@ func sendTestApp(t *testing.T, status string) (*frontend.App, *sendRecorderHerdr
 	}}
 	app := &frontend.App{Store: st, Herdr: h,
 		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	seedRoster(t, st, h.agents...)
 	path := filepath.Join(dir, "tasks.md")
 	if err := os.WriteFile(path, []byte(`- [ ] alpha\nwith detail`+"\n- [x] beta\n"), 0o644); err != nil {
 		t.Fatal(err)

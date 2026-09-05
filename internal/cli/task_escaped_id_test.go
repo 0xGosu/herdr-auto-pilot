@@ -37,6 +37,7 @@ func escapedApp(t *testing.T) (*frontend.App, *sendRecorderHerdr, string) {
 	h := &sendRecorderHerdr{agents: []domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
 	}}
+	seedRoster(t, st, h.agents...)
 	app := &frontend.App{Store: st, Herdr: h,
 		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
 	path := filepath.Join(dir, "tasks.md")

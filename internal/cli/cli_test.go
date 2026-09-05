@@ -149,9 +149,9 @@ func TestDisableEnableAgentCLI(t *testing.T) {
 	if err := st.AssignAgentName(ctx, "pane-live", "vivid-falcon"); err != nil {
 		t.Fatal(err)
 	}
-	app.Herdr = &captureHerdr{agents: []domain.AgentTransition{{
+	seedRoster(t, st, domain.AgentTransition{
 		AgentID: "pane-live", PaneID: "pane-live", AgentType: "codex", Status: "idle",
-	}}}
+	})
 
 	out, err := run(t, app, "disable", "vivid-falcon")
 	if err != nil || !strings.Contains(out, "disabled") {
@@ -453,13 +453,17 @@ func TestStatusEmbedderTimeoutDiagnostics(t *testing.T) {
 // directory, and falls back to "-" (never a blank field) when herdr cannot
 // report one, so the column count stays stable for anything parsing it.
 func TestAgentsListsWorkingDir(t *testing.T) {
-	app, _ := testApp(t)
-	app.Herdr = &cwdCaptureHerdr{
-		captureHerdr: captureHerdr{agents: []domain.AgentTransition{
-			{AgentID: "pane-a", PaneID: "pane-a", AgentType: "claude", Status: "idle"},
-			{AgentID: "pane-b", PaneID: "pane-b", AgentType: "claude", Status: "idle"},
-		}},
-		info: map[string]domain.PaneInfo{"pane-a": {Cwd: "/repo", ForegroundCwd: "/repo/sub"}},
+	app, st := testApp(t)
+	// The cwd arrives WITH the roster now — the daemon reads it, on its own
+	// TTL, so `hap agents` renders a published column instead of shelling out
+	// once per agent itself.
+	now := time.Now()
+	if err := st.PublishRoster(context.Background(), []domain.RosterAgent{
+		{AgentID: "pane-a", PaneID: "pane-a", AgentType: "claude", Status: "idle",
+			Cwd: "/repo/sub", CwdReadAt: now, SeenAt: now},
+		{AgentID: "pane-b", PaneID: "pane-b", AgentType: "claude", Status: "idle", SeenAt: now},
+	}, now); err != nil {
+		t.Fatal(err)
 	}
 
 	out, err := run(t, app, "agents")
@@ -481,16 +485,6 @@ func TestAgentsListsWorkingDir(t *testing.T) {
 	if got, want := strings.Count(lines[0], "\t"), strings.Count(lines[1], "\t"); got != want {
 		t.Errorf("column counts differ (%d vs %d): %q / %q", got, want, lines[0], lines[1])
 	}
-}
-
-// cwdCaptureHerdr adds the optional InspectorPort to captureHerdr.
-type cwdCaptureHerdr struct {
-	captureHerdr
-	info map[string]domain.PaneInfo
-}
-
-func (f *cwdCaptureHerdr) PaneInfo(_ context.Context, paneID string) (domain.PaneInfo, error) {
-	return f.info[paneID], nil
 }
 
 func seedSignatures(t *testing.T, st *store.Store) {

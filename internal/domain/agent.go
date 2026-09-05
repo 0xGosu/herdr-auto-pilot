@@ -2,6 +2,16 @@ package domain
 
 import "strings"
 
+// AgentStatusDetected is the status herdr's discovery event carries, and it is
+// not a report about what the agent is DOING.
+//
+// The adapter synthesizes it for pane.agent_detected, which herdr replays for
+// every existing pane on every subscribe. Named here because two packages have
+// to agree on it: the adapter writes it, and a reader deciding whether an agent
+// is available has to know it means "this pane exists", not "this pane is
+// busy" — even though AgentBusy, which cannot tell, answers true.
+const AgentStatusDetected = "detected"
+
 // IsPlaceholderAgent reports whether Herdr returned an agent-list/event row
 // with no usable agent identity or status. Both fields must be placeholders:
 // a real agent whose status is temporarily unknown, or a transitioning row
