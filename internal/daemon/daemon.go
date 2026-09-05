@@ -273,6 +273,31 @@ type Daemon struct {
 	// by the pass's own defer, including when it returns early.
 	sessionSyncPassRunning bool
 
+	// rosterPassRunning latches the goroutine a roster publish spawns for its
+	// shell-out half (guarded by mu). While a TUI is registered the roster
+	// ticks every rosterTickInterval, and one pass can outlive that — a slow
+	// workspace listing, a wedged pane get, the cwd budget — so without the
+	// latch each tick would stack another pass on top, and every one of them
+	// takes a transaction from a pool that hands out two connections. That is
+	// the same starvation moving the work off the select loop was meant to fix,
+	// arriving through a second door. Released by the goroutine's own defer AND
+	// by hand when spawn refuses, or one shutdown race disables the pass for
+	// the life of the process.
+	rosterPassRunning bool
+
+	// rosterTickRunning latches the roster TICK's own goroutine (guarded by
+	// mu), which lists the herd before publishRoster can hand its shell-out
+	// half over. Same single-flight rule, one step earlier in the pass: the
+	// listing is a subprocess with a budget in seconds and the tick fires
+	// every two, so without it a slow herdr accumulates listings.
+	rosterTickRunning bool
+
+	// rosterLocationsAt is when the workspace and tab labels were last
+	// published (guarded by mu). They cost two herdr subprocesses and name
+	// things an operator creates by hand, so they ride their own TTL rather
+	// than the tick — which also means most passes have nothing to do at all.
+	rosterLocationsAt time.Time
+
 	// toggleAttempt records, per agent, the signature of the multi-select form
 	// this daemon last started answering — the evidence that lets a later
 	// delivery accept a tab whose boxes are ALREADY ticked. Without it,
@@ -1180,6 +1205,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	heartbeat := time.NewTicker(daemonhealth.HeartbeatInterval)
 	defer heartbeat.Stop()
 
+	// Fires at the TUI's own poll rate but only ACTS while a TUI is
+	// registered, so an install nobody is watching pays nothing for it —
+	// see rosterDemand.
+	rosterTick := time.NewTicker(rosterTickInterval)
+	defer rosterTick.Stop()
+
 	slog.Info("daemon running", "version", buildinfo.Version)
 	for {
 		select {
@@ -1199,6 +1230,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if d.opt.StateDir != "" {
 				daemonhealth.RotateOwnStderrIfNeeded(d.opt.StateDir)
 			}
+		case <-rosterTick.C:
+			logging.Guard("roster-tick", func() error {
+				d.startRosterTickPass(ctx)
+				return nil
+			})
 		case <-sweep.C:
 			logging.Guard("periodic-sweep", func() error {
 				// Self-throttled to once a day and does its work on a
@@ -1222,6 +1258,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 					slog.Error("sweep: listing agents failed", "error", err)
 					return nil
 				}
+				// The reconciliation half of the roster: this listing is the
+				// only thing that can see an agent that VANISHED, which no
+				// per-agent event ever reports.
+				d.publishRoster(ctx, agents)
 				// Ahead of the reconcile and the idle poll: an escalation
 				// accepted this tick no longer blocks its agent's
 				// hasOpenEscalation guard, so the same sweep can move it on.
@@ -1252,18 +1292,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 			})
 		case kind := <-d.nudges:
 			logging.Guard("nudge", func() error {
-				if target, ok := control.CaptureTarget(kind); ok {
-					d.captureLiveAgent(ctx, target)
-				} else {
-					switch kind {
-					case control.KindReload:
-						d.reload()
-					case control.KindReembed:
-						// Operator-requested re-compute: force a fresh embedder
-						// (clean degraded latch) and re-run the semantic init.
-						d.reloadWith(true)
-					}
+				switch kind {
+				case control.KindReload:
+					d.reload()
+				case control.KindReembed:
+					// Operator-requested re-compute: force a fresh embedder
+					// (clean degraded latch) and re-run the semantic init.
+					d.reloadWith(true)
 				}
+				// processAgentActions runs BEFORE reconcileAttention, which is
+				// what lets the capture executor claim its parked episode
+				// ahead of the reconcile — see captureLiveAgent.
 				d.processAgentActions(ctx)
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
@@ -1307,43 +1346,74 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 }
 
-// captureLiveAgent resolves a targeted control request against the daemon's
+// captureLiveAgent resolves an operator's capture request against the daemon's
 // current live view, then feeds the current parked state into the same delayed
 // capture pipeline as a real Herdr event. It intentionally bypasses only the
 // reconcile episode/open-escalation guards; downstream duplicate and safety
 // checks remain authoritative.
-func (d *Daemon) captureLiveAgent(ctx context.Context, target string) {
+//
+// Its refusals are RETURNED rather than logged. They used to reach nobody: the
+// request arrived as a fire-and-forget control nudge with no reply channel, so
+// an operator who typed the wrong name, or caught an agent mid-work, was told
+// their capture was queued and then watched nothing happen. As a queued action
+// the same two refusals are the row's error, and `hap capture` prints them.
+//
+// "Done" here means SCHEDULED, not classified: scheduleCapture arms a timer for
+// the configured capture delay and the pipeline runs later on delayedTr. That
+// is the same promise the CLI has always printed ("capture queued for …"), and
+// it is what keeps the caller's wait sub-second.
+func (d *Daemon) captureLiveAgent(ctx context.Context, target string) (domain.CaptureResult, error) {
+	// The operator's spelling may be the short NAME, which only the store can
+	// map. Resolving it here rather than at the requesting surface is what the
+	// Target column already promises ("a pane id, an agent id, or the
+	// operator-assigned short name … resolved by the DAEMON"), and it is the
+	// half of this move that is easy to drop: the pane-id case works without
+	// it, so a test that never names an agent would not notice `hap capture
+	// reviewer` had stopped resolving. An unknown target passes through
+	// unchanged, so the id forms still match below.
+	resolved, err := d.opt.Store.ResolveAgent(ctx, target)
+	if err != nil {
+		return domain.CaptureResult{}, fmt.Errorf("%w: resolving %q: %v", errActionTransient, target, err)
+	}
 	agents, err := d.opt.Herdr.ListAgents(ctx)
 	if err != nil {
-		slog.Error("manual capture: listing agents failed", "target", target, "error", err)
-		return
+		// The listing, not the request, is what failed — worth another pass
+		// before telling the operator their target does not exist.
+		return domain.CaptureResult{}, fmt.Errorf("%w: listing agents: %v", errActionTransient, err)
 	}
 	for _, tr := range agents {
-		if tr.AgentID != target && tr.PaneID != target {
+		if tr.AgentID != resolved && tr.PaneID != resolved {
 			continue
 		}
 		switch tr.Status {
 		case "blocked", "idle", "done":
-			tr.ManualCapture = true
-			// The nudge loop runs reconciliation immediately after this method.
-			// Claim the parked episode first so reconcile cannot coalesce a
-			// provenance-less transition over this explicit request.
-			d.mu.Lock()
-			d.episodeHandled[tr.PaneID] = true
-			d.mu.Unlock()
-			slog.Info("manual capture queued", "agent", tr.AgentID, "pane", tr.PaneID, "status", tr.Status)
-			d.scheduleCapture(ctx, tr)
 		default:
-			slog.Warn("manual capture ignored: agent is not parked", "agent", tr.AgentID, "status", tr.Status)
+			return domain.CaptureResult{}, fmt.Errorf(
+				"agent %q is %s; capture requires blocked, idle, or done", target, tr.Status)
 		}
-		return
+		tr.ManualCapture = true
+		// Reconciliation runs immediately after the action drain (see Run's
+		// nudge arm, where processAgentActions precedes reconcileAttention).
+		// Claim the parked episode first so reconcile cannot coalesce a
+		// provenance-less transition over this explicit request.
+		d.mu.Lock()
+		d.episodeHandled[tr.PaneID] = true
+		d.mu.Unlock()
+		slog.Info("manual capture queued", "agent", tr.AgentID, "pane", tr.PaneID, "status", tr.Status)
+		d.scheduleCapture(ctx, tr)
+		return domain.CaptureResult{AgentID: tr.AgentID, PaneID: tr.PaneID, Status: tr.Status}, nil
 	}
-	slog.Warn("manual capture ignored: live agent not found", "target", target)
+	return domain.CaptureResult{}, fmt.Errorf("no live agent matches %q", target)
 }
 
 // handleTransition evaluates one agent-status transition end to end.
 func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition) {
 	now := d.opt.Clock.Now()
+
+	// Before anything can return early: an agent whose status changed is an
+	// agent a front end is about to render differently, and every early exit
+	// below is a case where nothing else will publish it until the sweep.
+	d.noteRosterTransition(ctx, tr)
 
 	// Auto-generate a short friendly name on first sight — for EVERY
 	// observed transition, including "detected" discovery events and
@@ -1513,6 +1583,12 @@ func (d *Daemon) reconcileAttention(ctx context.Context) {
 		slog.Error("reconcile: listing agents failed", "error", err)
 		return
 	}
+	// This is the FIRST listing a freshly started daemon makes, so publishing
+	// here is what stops a new install showing an empty herd for up to a
+	// minute — the front ends read the store now, and nothing else would have
+	// written it until the first sweep. The nudge path lands here too, which
+	// is why a front end's own wake produces a current roster.
+	d.publishRoster(ctx, agents)
 	d.reconcileAttentionWith(ctx, agents)
 }
 

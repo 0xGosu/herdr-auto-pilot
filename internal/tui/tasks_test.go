@@ -30,7 +30,12 @@ func taskModel(t *testing.T) Model {
 		{Agent: "codex", Path: "/work/missing.md"},
 		{Agent: "quiet", Path: "/work/prose.md"}, // readable, no checklist items
 	}
-	m := Model{width: 100, height: 30}
+	// ctx is load-bearing now that a keypress reaching a live agent goes
+	// through the store: database/sql calls ctx.Done() on the way to a
+	// connection, which on a nil context is a nil-pointer dereference, so a
+	// model built without one panics inside the store rather than failing on
+	// anything that names the real problem.
+	m := Model{width: 100, height: 30, ctx: context.Background()}
 	upd, _ := m.Update(refreshMsg{
 		status: frontend.Status{
 			MonitoredAgents: []domain.AgentTransition{
@@ -237,11 +242,16 @@ func taskAppModel(t *testing.T) (Model, *frontend.App, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	// A herdr adapter reporting zero agents — "no agent matches this source",
-	// as opposed to a nil Herdr's "the agent list could not be read".
 	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
 		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
 	ctx := context.Background()
+	// A daemon that looked and found nothing — "no agent matches this source",
+	// as opposed to an unpublished roster's "nobody has looked". Only the
+	// first makes a source retirable, so publishing an EMPTY herd here is the
+	// fixture, not a formality.
+	if err := st.PublishRoster(ctx, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(dir, "tasks.md")
 	if err := os.WriteFile(path, []byte("- [ ] alpha\n- [x] beta\n- [-] gamma\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -788,9 +798,9 @@ func TestTasksTabEditPromptPrefilled(t *testing.T) {
 }
 
 func TestTasksTabFocusAgent(t *testing.T) {
-	herdr := &focusTestHerdr{}
 	m := taskModel(t)
-	m.app = &frontend.App{Herdr: herdr}
+	app, st := focusApp(t)
+	m.app = app
 	// Group 0 is fed by live agent w6:p1 — f jumps to its pane.
 	upd, cmd := m.Update(pressKeyMsg("f"))
 	m = upd.(Model)
@@ -800,8 +810,8 @@ func TestTasksTabFocusAgent(t *testing.T) {
 	if res, ok := cmd().(actionResultMsg); !ok || res.err != nil {
 		t.Fatalf("focus should succeed, got %+v", res)
 	}
-	if len(herdr.focused) != 1 || herdr.focused[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
-		t.Fatalf("focus should target the matched agent's pane, got %+v", herdr.focused)
+	if got := queuedFocuses(t, st); len(got) != 1 || got[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
+		t.Fatalf("focus should queue the matched agent's pane, got %+v", got)
 	}
 	// Group 1's selector (codex) matches no live agent.
 	for m.selectedTaskRow() == nil || m.selectedTaskRow().group != 1 {
@@ -1390,9 +1400,9 @@ func TestTaskDetailDeleteAction(t *testing.T) {
 }
 
 func TestTaskDetailFocusAction(t *testing.T) {
-	herdr := &focusTestHerdr{}
 	m := taskModel(t)
-	m.app = &frontend.App{Herdr: herdr}
+	app, st := focusApp(t)
+	m.app = app
 	m = press(t, m, "down", "v")
 	upd, cmd := m.Update(pressKeyMsg("f"))
 	m = upd.(Model)
@@ -1402,8 +1412,8 @@ func TestTaskDetailFocusAction(t *testing.T) {
 	if res, ok := cmd().(actionResultMsg); !ok || res.err != nil {
 		t.Fatalf("focus should succeed, got %+v", res)
 	}
-	if len(herdr.focused) != 1 || herdr.focused[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
-		t.Fatalf("detail f should target the matched agent's pane, got %+v", herdr.focused)
+	if got := queuedFocuses(t, st); len(got) != 1 || got[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
+		t.Fatalf("detail f should queue the matched agent's pane, got %+v", got)
 	}
 	_ = m
 }
@@ -1849,22 +1859,29 @@ func TestTasksRemoveSourceEligibility(t *testing.T) {
 	})
 }
 
-// TestTasksRemoveSourceUnknownAgentsFailsClosed pins the guard against a
-// herdr that cannot be reached: GetStatus reports an EMPTY agent list on a
-// failed query, which must not read as "no agent matches this source" and
-// retire a source that is feeding one. A finished list stays removable —
-// that arm never needed the agent list.
+// TestTasksRemoveSourceUnknownAgentsFailsClosed pins the guard against a herd
+// nothing has reported: GetStatus leaves the agent list EMPTY when no daemon
+// has published one recently, which must not read as "no agent matches this
+// source" and retire a source that is feeding one. A finished list stays
+// removable — that arm never needed the agent list.
+//
+// The refusal must also name the real cause. "Retry" was the old wording and
+// it was advice the operator could not act on: nothing changes until a daemon
+// publishes, so the message says which of "none yet" and "too old" it is.
 func TestTasksRemoveSourceUnknownAgentsFailsClosed(t *testing.T) {
 	unfinished := []domain.ChecklistItem{{Index: 1, Mark: " ", Text: "todo"}}
 	m := removeSourceModel(t, unfinished, "")
-	m.data.status.AgentsKnown = false // herdr query failed
+	m.data.status.AgentsKnown = false // nothing has published a roster
 	m.data.status.MonitoredAgents = nil
 	m = press(t, m, "x")
 	if m.confirm != nil {
 		t.Fatalf("an unknown agent list must not be read as 'no agent matches', got %q", m.confirm.label)
 	}
-	if !strings.Contains(m.message, "herdr can't say which agent it feeds") {
+	if !strings.Contains(m.message, "can't say which agent it feeds") {
 		t.Errorf("refusal should name the real cause, got %q", m.message)
+	}
+	if !strings.Contains(m.message, "no hap daemon has reported") {
+		t.Errorf("refusal should say WHY the herd is unknown, got %q", m.message)
 	}
 	// All tasks done: removable regardless of what herdr can tell us.
 	m = removeSourceModel(t, []domain.ChecklistItem{{Index: 1, Mark: "x", Done: true, Text: "t"}}, "")

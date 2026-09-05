@@ -84,9 +84,31 @@ func withdrawsCorrection(err error) bool {
 // capture is exempt for the opposite reason: it re-runs the classification
 // pipeline against whatever is on screen NOW, so there is no earlier screen for
 // the request to have gone stale against.
+//
+// focus IS bounded, even though it types nothing. What it vouches for is not a
+// screen but the operator's intent to LOOK, and that expires: a pending row
+// survives a daemon that died before draining it, so an unbounded one would be
+// replayed at the next start and yank their herdr view out of whatever pane
+// they had moved on to. The normal path is sub-second, so the bound refuses
+// nothing an operator still wants.
+// staleReason says what the age actually invalidated, which is not the same
+// thing for every bounded kind.
+//
+// A reply and a hand-out were decided against a SCREEN, and the remedy is to
+// look at it again. A focus was decided against nothing but the operator's
+// intent to look; telling them to "answer again" would name a question that
+// was never asked. Nobody polls a focus, so this text only ever reaches the
+// daemon log — which is exactly why it has to be true there.
+func staleReason(kind domain.AgentActionKind) string {
+	if kind == domain.AgentActionFocus {
+		return "the view it would have jumped to is no longer the one you asked for; press f again"
+	}
+	return "the screen it was decided against can no longer be trusted; look at the agent and answer again"
+}
+
 func agentActionStaleBound(kind domain.AgentActionKind) time.Duration {
 	switch kind {
-	case domain.AgentActionDeliverReply, domain.AgentActionSendTask:
+	case domain.AgentActionDeliverReply, domain.AgentActionSendTask, domain.AgentActionFocus:
 		return actionStaleAfter
 	}
 	return 0
@@ -151,8 +173,8 @@ func (d *Daemon) runAgentAction(ctx context.Context, a domain.AgentAction) {
 	}
 	if bound := agentActionStaleBound(a.Kind); bound > 0 && now.Sub(a.CreatedAt) > bound {
 		d.finishAgentAction(ctx, a, domain.AgentActionFailed,
-			fmt.Sprintf("the request waited %s before a daemon could run it, so the screen it was decided against can no longer be trusted; look at the agent and answer again",
-				now.Sub(a.CreatedAt).Round(time.Second)), "")
+			fmt.Sprintf("the request waited %s before a daemon could run it, so %s",
+				now.Sub(a.CreatedAt).Round(time.Second), staleReason(a.Kind)), "")
 		return
 	}
 
@@ -202,6 +224,10 @@ func (d *Daemon) executeAgentAction(ctx context.Context, a domain.AgentAction) (
 	switch a.Kind {
 	case domain.AgentActionDeliverReply:
 		return d.deliverReply(ctx, a)
+	case domain.AgentActionFocus:
+		return d.focusAgent(ctx, a)
+	case domain.AgentActionCapture:
+		return d.captureAgentAction(ctx, a)
 	default:
 		return "", fmt.Errorf("%w: %q, so it cannot be run by this build. Upgrade with `hap daemon --ensure`",
 			errActionUnsupported, a.Kind)

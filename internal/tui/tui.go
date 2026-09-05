@@ -3576,8 +3576,11 @@ func (m Model) taskSourceRemovable(g frontend.TaskGroup) (string, bool) {
 		return "", true
 	}
 	if !m.data.status.AgentsKnown {
-		return fmt.Sprintf("task source #%d: herdr can't say which agent it feeds — "+
-			"retry, or remove the entry on the Config tab (x)", g.Index), false
+		// Not "retry": nothing changes until a daemon publishes the herd, so
+		// the message has to name what is actually missing.
+		return fmt.Sprintf("task source #%d: %s, so hap can't say which agent it "+
+			"feeds — remove the entry on the Config tab (x) if it is dead",
+			g.Index, m.data.status.RosterProblem()), false
 	}
 	// Nothing matches the selectors, so the source feeds nobody — retirable
 	// whatever its file does or doesn't say. This is the case that keeps a
@@ -4134,7 +4137,10 @@ func (m Model) focusAgent(a domain.AgentTransition) (tea.Model, tea.Cmd) {
 	}
 	m.beginAction()
 	app, tabID, paneID := m.app, a.TabID, a.PaneID
-	return m, m.do("focused agent in herdr", func(ctx context.Context) error {
+	// "asked", not "focused": the request is handed to the daemon and this
+	// returns without waiting, so a success here means the request was queued
+	// — not that herdr moved. A failure lands in `hap audit`.
+	return m, m.do("asked herdr to focus this agent", func(ctx context.Context) error {
 		return app.FocusAgent(ctx, tabID, paneID)
 	})
 }

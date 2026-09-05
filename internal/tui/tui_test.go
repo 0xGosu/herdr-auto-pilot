@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -13,7 +15,9 @@ import (
 	"context"
 	"path/filepath"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
@@ -21,7 +25,12 @@ import (
 
 func testModel(t *testing.T) Model {
 	t.Helper()
-	m := Model{width: 100, height: 30}
+	// ctx is load-bearing now that a keypress reaching a live agent goes
+	// through the store: database/sql calls ctx.Done() on the way to a
+	// connection, which on a nil context is a nil-pointer dereference, so a
+	// model built without one panics inside the store rather than failing on
+	// anything that names the real problem.
+	m := Model{width: 100, height: 30, ctx: context.Background()}
 	longRationale := strings.Repeat("the operator always answers yes here because the diff was reviewed upstream ", 3)
 	upd, _ := m.Update(refreshMsg{
 		status: frontend.Status{
@@ -2535,9 +2544,8 @@ func TestFocusAgentKeystrokeOnAgentsList(t *testing.T) {
 	// f on Agents tab list should focus the selected agent.
 	m := testModel(t)
 	m.tab = tabAgents
-	m.app = &frontend.App{
-		Herdr: &focusTestHerdr{},
-	}
+	app, st := focusApp(t)
+	m.app = app
 	upd, cmd := m.Update(pressKeyMsg("f"))
 	m = upd.(Model)
 	if cmd == nil {
@@ -2555,17 +2563,23 @@ func TestFocusAgentKeystrokeOnAgentsList(t *testing.T) {
 	}
 	upd, _ = m.Update(res)
 	m = upd.(Model)
-	if m.status == nil || !strings.Contains(m.status.text, "focused") {
-		t.Errorf("focus should show a success status, got %+v", m.status)
+	// The wording is deliberately "asked", not "focused": FocusAgent returns
+	// once the row is queued, so claiming the pane moved would be a report the
+	// front end cannot stand behind.
+	if m.status == nil || !strings.Contains(m.status.text, "asked herdr to focus") {
+		t.Errorf("focus should show a queued-request status, got %+v", m.status)
+	}
+	if got := queuedFocuses(t, st); len(got) != 1 || got[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
+		t.Fatalf("focus should queue the selected agent's pane for the daemon, got %+v", got)
 	}
 }
 
 func TestFocusAgentKeystrokeOnEscalationsList(t *testing.T) {
 	// f on Escalations focuses the live pane for the selected record's agent.
-	herdr := &focusTestHerdr{}
 	m := testModel(t)
 	m.tab = tabEscalations
-	m.app = &frontend.App{Herdr: herdr}
+	app, st := focusApp(t)
+	m.app = app
 
 	upd, cmd := m.Update(pressKeyMsg("f"))
 	m = upd.(Model)
@@ -2576,17 +2590,16 @@ func TestFocusAgentKeystrokeOnEscalationsList(t *testing.T) {
 	if !ok || res.err != nil {
 		t.Fatalf("focus should succeed, got %+v", res)
 	}
-	if len(herdr.focused) != 1 || herdr.focused[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
-		t.Fatalf("focus should target the escalation agent's pane, got %+v", herdr.focused)
+	if got := queuedFocuses(t, st); len(got) != 1 || got[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
+		t.Fatalf("focus should queue the escalation agent's pane, got %+v", got)
 	}
 }
 
 func TestFocusAgentKeystrokeOnAgentDetail(t *testing.T) {
 	// f on an agent detail overlay should focus the snapshotted agent.
 	m := testModel(t)
-	m.app = &frontend.App{
-		Herdr: &focusTestHerdr{},
-	}
+	app, st := focusApp(t)
+	m.app = app
 	// Open agent detail.
 	m = press(t, m, "v")
 	if m.detail == nil {
@@ -2611,19 +2624,22 @@ func TestFocusAgentKeystrokeOnAgentDetail(t *testing.T) {
 	if res.err != nil {
 		t.Fatalf("focus command should succeed: %v", res.err)
 	}
+	if got := queuedFocuses(t, st); len(got) != 1 || got[0] != (focusCall{tabID: agent.TabID, paneID: agent.PaneID}) {
+		t.Fatalf("focus should queue the SNAPSHOTTED agent's pane, got %+v", got)
+	}
 }
 
 func TestFocusAgentKeystrokeOnEscalationDetail(t *testing.T) {
 	// The detail snapshots the escalation's agent, independently of the list
 	// cursor, then resolves that agent's current location when f is pressed.
-	herdr := &focusTestHerdr{}
 	m := testModel(t)
 	m.tab = tabEscalations
 	m = press(t, m, "v")
 	if m.detail == nil || m.detail.focusAgentID != "w6:p1" {
 		t.Fatalf("escalation detail should snapshot its agent, got %+v", m.detail)
 	}
-	m.app = &frontend.App{Herdr: herdr}
+	app, st := focusApp(t)
+	m.app = app
 
 	upd, cmd := m.Update(pressKeyMsg("f"))
 	m = upd.(Model)
@@ -2634,8 +2650,8 @@ func TestFocusAgentKeystrokeOnEscalationDetail(t *testing.T) {
 	if !ok || res.err != nil {
 		t.Fatalf("focus should succeed, got %+v", res)
 	}
-	if len(herdr.focused) != 1 || herdr.focused[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
-		t.Fatalf("focus should target the detailed escalation's agent pane, got %+v", herdr.focused)
+	if got := queuedFocuses(t, st); len(got) != 1 || got[0] != (focusCall{tabID: "w6:t1", paneID: "w6:p1"}) {
+		t.Fatalf("focus should queue the detailed escalation's agent pane, got %+v", got)
 	}
 	if m.detail == nil {
 		t.Fatal("f should leave the escalation detail open")
@@ -2659,19 +2675,58 @@ func TestFocusAgentNoLocationKnown(t *testing.T) {
 	}
 }
 
-type focusTestHerdr struct {
-	captureHerdr
-	focused []focusCall
-}
-
 type focusCall struct {
 	tabID  string
 	paneID string
 }
 
-func (h *focusTestHerdr) FocusPane(ctx context.Context, tabID, paneID string) error {
-	h.focused = append(h.focused, focusCall{tabID, paneID})
-	return nil
+// focusApp builds the App a focus keypress needs now that focusing is the
+// DAEMON's to do: a store to queue into, plus a heartbeat that reads as a
+// healthy daemon so requireLiveDaemon lets the row through.
+//
+// There is no herdr fake any more, and that absence is the point — the TUI
+// process holds no adapter to focus with, so the only evidence a keypress
+// produced anything is the queued row.
+func focusApp(t *testing.T) (*frontend.App, *store.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := daemonhealth.Write(dir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return &frontend.App{
+		Store: st, ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator",
+		StateDir:   dir,
+		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version },
+	}, st
+}
+
+// queuedFocuses reads back the focus requests a keypress left in the queue.
+func queuedFocuses(t *testing.T, st *store.Store) []focusCall {
+	t.Helper()
+	acts, err := st.PendingAgentActions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []focusCall
+	for _, a := range acts {
+		if a.Kind != domain.AgentActionFocus {
+			t.Errorf("queued a %q action for a focus keypress", a.Kind)
+			continue
+		}
+		var p domain.FocusPayload
+		if err := json.Unmarshal([]byte(a.Payload), &p); err != nil {
+			t.Fatalf("focus payload: %v", err)
+		}
+		out = append(out, focusCall{p.TabID, p.PaneID})
+	}
+	return out
 }
 
 func TestSignatureStreakKeysAdjustTheCount(t *testing.T) {

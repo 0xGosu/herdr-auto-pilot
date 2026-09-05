@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
@@ -357,6 +358,12 @@ func dupSourceModel(t *testing.T) (Model, *frontend.App, string) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
+	// A daemon that looked and found nothing, which is what makes an unmatched
+	// source retirable — an unpublished roster means nobody has looked, and
+	// that refuses.
+	if err := st.PublishRoster(ctx, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	if err := app.AddTaskSource(ctx, "alpha", "", shared, ""); err != nil {
 		t.Fatal(err)
 	}

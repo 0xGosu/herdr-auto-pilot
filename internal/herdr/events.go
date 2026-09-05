@@ -217,7 +217,7 @@ func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTr
 					PaneID:      d.PaneID,
 					TabID:       s.tabID(d.PaneID),
 					WorkspaceID: d.WorkspaceID,
-					Status:      "detected",
+					Status:      domain.AgentStatusDetected,
 					At:          time.Now(),
 				}
 				select {

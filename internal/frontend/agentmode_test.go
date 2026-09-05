@@ -138,7 +138,7 @@ var fastModes = frontend.ModeOptions{SettleTimeout: 300 * time.Millisecond, Poll
 
 func claudeApp(t *testing.T, start domain.AgentMode) (*frontend.App, *modeHerdr) {
 	t.Helper()
-	app, _ := testApp(t)
+	app, st := testApp(t)
 	fake := &modeHerdr{
 		agents: []domain.AgentTransition{{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"}},
 		cycle: []domain.AgentMode{
@@ -153,6 +153,7 @@ func claudeApp(t *testing.T, start domain.AgentMode) (*frontend.App, *modeHerdr)
 		}
 	}
 	app.Herdr = fake
+	seedRoster(t, st, fake.agents...)
 	return app, fake
 }
 
@@ -388,13 +389,14 @@ func TestSetAgentModeRefusesAnAgentStuckInBypass(t *testing.T) {
 // "auto", so accepting it would spend the whole ceiling rotating a two-mode
 // toggle (and leave it flipped).
 func TestSetAgentModeRejectsAModeTheAgentCannotReach(t *testing.T) {
-	app, _ := testApp(t)
+	app, st := testApp(t)
 	fake := &modeHerdr{
 		agents: []domain.AgentTransition{{AgentID: "w1:p2", PaneID: "w1:p2", AgentType: "codex", Status: "idle"}},
 		cycle:  []domain.AgentMode{domain.AgentModeDefault, domain.AgentModePlan},
 		render: renderCodex,
 	}
 	app.Herdr = fake
+	seedRoster(t, st, fake.agents...)
 
 	if _, err := app.SetAgentMode(context.Background(), "w1:p2", "auto", fastModes); err == nil {
 		t.Fatal("codex accepted \"auto\", which it can never report")
@@ -415,13 +417,14 @@ func TestSetAgentModeRejectsAModeTheAgentCannotReach(t *testing.T) {
 // TestSetAgentModeRefusesAnAgentWithNoToggle: an unknown agent type must not be
 // pressed into on the theory that shift+tab is harmless there.
 func TestSetAgentModeRefusesAnAgentWithNoToggle(t *testing.T) {
-	app, _ := testApp(t)
+	app, st := testApp(t)
 	fake := &modeHerdr{
 		agents: []domain.AgentTransition{{AgentID: "w1:p3", PaneID: "w1:p3", AgentType: "gemini", Status: "idle"}},
 		cycle:  []domain.AgentMode{domain.AgentModeDefault},
 		render: renderCodex,
 	}
 	app.Herdr = fake
+	seedRoster(t, st, fake.agents...)
 	_, err := app.SetAgentMode(context.Background(), "w1:p3", "plan", fastModes)
 	if !errors.Is(err, frontend.ErrModeUnsupported) {
 		t.Fatalf("err = %v; want ErrModeUnsupported", err)

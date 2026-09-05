@@ -76,11 +76,12 @@ func (f *modeHerdr) chordCount() int {
 
 func modeApp(t *testing.T) (*frontend.App, *modeHerdr) {
 	t.Helper()
-	app, _ := testApp(t)
+	app, st := testApp(t)
 	fake := &modeHerdr{agents: []domain.AgentTransition{
 		{AgentID: "pane-a", PaneID: "pane-a", AgentType: "claude", Status: "idle"},
 	}}
 	app.Herdr = fake
+	seedRoster(t, st, fake.agents...)
 	return app, fake
 }
 
@@ -221,6 +222,7 @@ func TestModeResolvesByShortName(t *testing.T) {
 		{AgentID: "pane-a", PaneID: "pane-a", AgentType: "claude", Status: "idle"},
 	}}
 	app.Herdr = fake
+	seedRoster(t, st, fake.agents...)
 
 	out, err := run(t, app, "mode", "reviewer")
 	if err != nil {
@@ -234,12 +236,13 @@ func TestModeResolvesByShortName(t *testing.T) {
 // TestAgentsListsMode: the mode rides along in `hap agents`, with a dash when
 // the agent type has none — so the column count stays constant for parsers.
 func TestAgentsListsMode(t *testing.T) {
-	app, _ := testApp(t)
+	app, st := testApp(t)
 	fake := &modeHerdr{agents: []domain.AgentTransition{
 		{AgentID: "pane-a", PaneID: "pane-a", AgentType: "claude", Status: "idle"},
 		{AgentID: "pane-b", PaneID: "pane-b", AgentType: "gemini", Status: "idle"},
 	}}
 	app.Herdr = fake
+	seedRoster(t, st, fake.agents...)
 
 	out, err := run(t, app, "agents")
 	if err != nil {

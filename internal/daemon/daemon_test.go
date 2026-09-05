@@ -31,9 +31,13 @@ type fakeHerdr struct {
 	sent          []string
 	notifications []string
 	workspaces    []domain.WorkspaceInfo
-	failSend      bool
-	panicOnRead   bool
-	failRead      bool
+	// focused records every FocusPane call (ports.FocusPort), so a test can
+	// tell "the daemon focused the right pane" from "nothing happened".
+	focused     [][2]string
+	failFocus   bool
+	failSend    bool
+	panicOnRead bool
+	failRead    bool
 	// failReadOver, when > 0, fails ReadPane calls asking for more than
 	// that many lines (isolates the deep LLM-context read from the
 	// shallow classification read).
@@ -41,6 +45,23 @@ type fakeHerdr struct {
 	readLines    []int
 	paneInfo     domain.PaneInfo
 	failPaneInfo bool
+	// paneInfos overrides paneInfo per pane, and paneInfoCalls counts every
+	// lookup — the roster's cwd TTL is only observable as a call COUNT.
+	paneInfos     map[string]domain.PaneInfo
+	paneInfoCalls int
+	// paneInfoDelay holds each lookup, and paneInfoMaxActive records how many
+	// were ever in flight at once — the only observable form of "two roster
+	// passes are running on top of each other".
+	paneInfoDelay     time.Duration
+	paneInfoActive    int
+	paneInfoMaxActive int
+	// workspaceCalls counts ListWorkspaces, since the location TTL, like the
+	// cwd one, is only observable as a call COUNT.
+	workspaceCalls int
+	// listAgentsGate, when non-nil, parks every ListAgents until it is closed.
+	// Held OUTSIDE the fake's mutex so the rest of the fake stays usable while
+	// a listing is blocked — which is the whole point of the test using it.
+	listAgentsGate chan struct{}
 	// keys records every SendKey call (ports.KeystrokeSender). When frames
 	// is set, "right"/"left" keys move frameIdx and ReadPane serves the
 	// focused frame — simulating a multi-tab form under an arrow sweep.
@@ -286,11 +307,56 @@ func (f *fakeHerdr) setKeyScript(initial string, keys, frames []string) {
 
 func (f *fakeHerdr) PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, error) {
 	f.mu.Lock()
+	f.paneInfoCalls++
+	f.paneInfoActive++
+	if f.paneInfoActive > f.paneInfoMaxActive {
+		f.paneInfoMaxActive = f.paneInfoActive
+	}
+	delay := f.paneInfoDelay
+	f.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.paneInfoActive--
 	if f.failPaneInfo {
 		return domain.PaneInfo{}, errors.New("induced pane info failure")
 	}
+	if pi, ok := f.paneInfos[paneID]; ok {
+		return pi, nil
+	}
 	return f.paneInfo, nil
+}
+
+func (f *fakeHerdr) setPaneInfoDelay(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paneInfoDelay = d
+}
+
+func (f *fakeHerdr) paneInfoMaxConcurrent() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paneInfoMaxActive
+}
+
+func (f *fakeHerdr) workspaceCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.workspaceCalls
+}
+
+func (f *fakeHerdr) setPaneInfos(infos map[string]domain.PaneInfo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paneInfos = infos
+}
+
+func (f *fakeHerdr) paneInfoCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paneInfoCalls
 }
 
 func (f *fakeHerdr) readLineCalls() []int {
@@ -301,12 +367,28 @@ func (f *fakeHerdr) readLineCalls() []int {
 
 func (f *fakeHerdr) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.listAgentsCalls++
+	gate := f.listAgentsGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.failListAgents {
 		return nil, errors.New("induced agent-list failure")
 	}
 	return append([]domain.AgentTransition(nil), f.agents...), nil
+}
+
+func (f *fakeHerdr) setListAgentsGate(gate chan struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listAgentsGate = gate
 }
 
 func (f *fakeHerdr) setAgents(agents []domain.AgentTransition) {
@@ -346,9 +428,26 @@ func (f *fakeHerdr) listAgentsCallCount() int {
 	return f.listAgentsCalls
 }
 
+func (f *fakeHerdr) FocusPane(ctx context.Context, tabID, paneID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failFocus {
+		return errors.New("no such pane")
+	}
+	f.focused = append(f.focused, [2]string{tabID, paneID})
+	return nil
+}
+
+func (f *fakeHerdr) focusedPanes() [][2]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][2]string(nil), f.focused...)
+}
+
 func (f *fakeHerdr) ListWorkspaces(ctx context.Context) ([]domain.WorkspaceInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.workspaceCalls++
 	return append([]domain.WorkspaceInfo(nil), f.workspaces...), nil
 }
 
@@ -934,8 +1033,10 @@ func TestManualCaptureNudgeUsesNormalPipeline(t *testing.T) {
 		AgentID: "agent-manual", PaneID: "agent-manual", AgentType: "claude", Status: "blocked",
 	}})
 
-	if err := control.NudgeCapture(context.Background(), h.ctlPath, "agent-manual"); err != nil {
-		t.Fatal(err)
+	if got := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: "agent-manual",
+	})); got.Status != domain.AgentActionDone {
+		t.Fatalf("capture action %q: %s", got.Status, got.Error)
 	}
 	waitFor(t, 3*time.Second, func() bool {
 		audits, _ := h.raw.AuditLog(context.Background(), 10)
@@ -963,8 +1064,10 @@ func TestManualCaptureRecognizesIdleCodexPlanApproval(t *testing.T) {
 		AgentID: "agent-codex-plan", PaneID: "agent-codex-plan", AgentType: "codex", Status: "idle",
 	}})
 
-	if err := control.NudgeCapture(context.Background(), h.ctlPath, "agent-codex-plan"); err != nil {
-		t.Fatal(err)
+	if got := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: "agent-codex-plan",
+	})); got.Status != domain.AgentActionDone {
+		t.Fatalf("capture action %q: %s", got.Status, got.Error)
 	}
 	waitFor(t, 3*time.Second, func() bool {
 		audits, _ := h.raw.AuditLog(context.Background(), 10)

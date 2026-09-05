@@ -444,6 +444,21 @@ type DaemonStore interface {
 	// current session (name and history survive). Empty terminalID and
 	// unknown agentID are no-ops. Returns reset=true when created_at moved.
 	SyncAgentTerminalID(ctx context.Context, agentID, terminalID string) (bool, error)
+
+	// PublishRoster replaces the daemon's published view of the running herd.
+	// Only the daemon writes it; the front ends read it instead of listing
+	// agents themselves.
+	PublishRoster(ctx context.Context, agents []domain.RosterAgent, now time.Time) error
+	// UpsertRosterAgent records one agent from a transition, without claiming
+	// the whole view is current — that is PublishRoster's job.
+	UpsertRosterAgent(ctx context.Context, a domain.RosterAgent) error
+	// SetRosterCwds records working directories for several agents in ONE
+	// transaction — a cwd is read per agent, and the connection pool is small.
+	SetRosterCwds(ctx context.Context, cwds map[string]domain.RosterCwd, readAt time.Time) error
+	// PublishLocations replaces the workspace and tab display metadata. A nil
+	// slice leaves that kind alone; an empty one clears it.
+	PublishLocations(ctx context.Context, workspaces []domain.WorkspaceInfo,
+		tabs []domain.TabInfo, now time.Time) error
 	StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64, error)
 	UpdateLLMRequestStatus(ctx context.Context, requestID, status string) error
 	// UpdateLLMRequestContext fills the context_json of an already-staged
@@ -613,6 +628,15 @@ type ReadStore interface {
 	// daemon last observed it, "" when unknown. Herdr reuses pane ids, so this
 	// is what tells "same agent" from "new terminal on a recycled pane id".
 	AgentTerminalID(ctx context.Context, agentID string) (string, error)
+
+	// LiveRoster returns the agents the daemon last published, plus when it
+	// published them. A ZERO time means no daemon ever has, which is not the
+	// same as "no agents are running" — callers acting on an agent's absence
+	// must tell the two apart (domain.RosterFresh).
+	LiveRoster(ctx context.Context) ([]domain.RosterAgent, time.Time, error)
+	// HerdrLocations returns the published workspace and tab metadata. Either
+	// map is nil when nothing of that kind has been published.
+	HerdrLocations(ctx context.Context) (map[string]domain.WorkspaceInfo, map[string]domain.TabInfo, error)
 	GetSignature(ctx context.Context, signature string) (*domain.SignatureState, error)
 	DecisionsForSignature(ctx context.Context, signature string, limit int) ([]domain.DecisionRecord, error)
 	// CountDecisionsForSignature counts ALL of a signature's decisions, with no

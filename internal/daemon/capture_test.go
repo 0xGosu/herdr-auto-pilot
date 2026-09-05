@@ -1,7 +1,7 @@
 package daemon
 
 import (
-	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -9,137 +9,146 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
-// The delayed-capture tests use real timers (the repo has no fake clock).
-// Margins are deliberately wide for shared CI runners (macos-14 stalls):
-// "nothing fired yet" sleeps sit far under the configured delay, and every
-// "must be the short delay" deadline sits far under the long delay it is
-// contrasted with.
-
-func TestCaptureDelaysClassificationRead(t *testing.T) {
-	cfg := "[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 1200\nevent_ms = 1\n"
-	h := newHarness(t, cfg)
-	h.herdr.setPane(approvalPane)
-
-	h.push("agent-cap1", "blocked")
-	time.Sleep(300 * time.Millisecond)
-	if n := len(h.herdr.readLineCalls()); n != 0 {
-		t.Fatalf("pane read fired %d time(s) before the start delay elapsed", n)
+func captureResult(t *testing.T, a domain.AgentAction) domain.CaptureResult {
+	t.Helper()
+	var res domain.CaptureResult
+	if err := json.Unmarshal([]byte(a.Result), &res); err != nil {
+		t.Fatalf("capture result %q: %v", a.Result, err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 1 })
+	return res
+}
 
-	// The escalation records the pane content it was classified from —
-	// the per-entry "Current situation", distinct from the signature's
-	// first-seen provenance snapshot.
-	var esc []domain.AuditRecord
-	waitFor(t, 3*time.Second, func() bool {
-		esc, _ = h.raw.PendingEscalations(context.Background())
-		return len(esc) == 1
+// The daemon resolves the operator's SHORT NAME, not just an id.
+//
+// This is the half of the migration that fails silently: the pane-id form
+// matches without any resolution at all, so a suite that never names an agent
+// would stay green while `hap capture reviewer` — the spelling an operator
+// actually types — stopped finding anything.
+func TestCaptureResolvesAnAgentsShortName(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: "pane-live", PaneID: "pane-live", AgentType: "claude", Status: "blocked",
+	}})
+	if err := h.raw.AssignAgentName(t.Context(), "pane-live", "vivid-falcon"); err != nil {
+		t.Fatal(err)
+	}
+	got := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: "vivid-falcon",
+	}))
+	if got.Status != domain.AgentActionDone {
+		t.Fatalf("status = %q (%s), want done", got.Status, got.Error)
+	}
+	if res := captureResult(t, got); res.AgentID != "pane-live" || res.Status != "blocked" {
+		t.Errorf("result = %+v, want the resolved agent", res)
+	}
+}
+
+// A pane id still works: ResolveAgent passes an unknown target through
+// unchanged, which is what keeps naming optional.
+func TestCaptureStillAcceptsAPaneID(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: "pane-live", PaneID: "pane-live", AgentType: "claude", Status: "idle",
+	}})
+	got := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: "pane-live",
+	}))
+	if got.Status != domain.AgentActionDone {
+		t.Fatalf("status = %q (%s), want done", got.Status, got.Error)
+	}
+	if res := captureResult(t, got); res.PaneID != "pane-live" || res.Status != "idle" {
+		t.Errorf("result = %+v", res)
+	}
+}
+
+// Both refusals reach the operator as the row's error. Under the old control
+// nudge they were slog.Warn lines with no reply channel to carry them, so the
+// requesting surface reported a capture that never happened.
+func TestCaptureRefusalsAreReportedNotLogged(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: "pane-busy", PaneID: "pane-busy", AgentType: "claude", Status: "working",
+	}})
+
+	busy := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: "pane-busy",
+	}))
+	if busy.Status != domain.AgentActionFailed {
+		t.Fatalf("a working agent was accepted: %q", busy.Status)
+	}
+	if !strings.Contains(busy.Error, "working") || !strings.Contains(busy.Error, "blocked, idle, or done") {
+		t.Errorf("error = %q; want the status and what capture requires", busy.Error)
+	}
+
+	missing := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: "nobody",
+	}))
+	if missing.Status != domain.AgentActionFailed {
+		t.Fatalf("an unknown target was accepted: %q", missing.Status)
+	}
+	if !strings.Contains(missing.Error, "nobody") {
+		t.Errorf("error = %q; want it to name the target it could not find", missing.Error)
+	}
+}
+
+// An empty target is refused rather than matched against the first agent that
+// happens to carry an empty id.
+func TestCaptureWithNoTargetIsRefused(t *testing.T) {
+	h := newHarness(t, "")
+	got := h.awaitAction(h.queueAction(domain.AgentAction{Kind: domain.AgentActionCapture}))
+	if got.Status != domain.AgentActionFailed {
+		t.Fatalf("status = %q, want failed", got.Status)
+	}
+}
+
+// Capture stays exempt from the staleness bound, and for a reason that
+// survives the move: it classifies whatever is on screen NOW, so there is no
+// earlier screen for the request to have gone stale against.
+func TestCaptureIsNotBoundedByStaleness(t *testing.T) {
+	if agentActionStaleBound(domain.AgentActionCapture) != 0 {
+		t.Error("capture should not be bounded — it vouches for no earlier screen")
+	}
+	h := newHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: "pane-live", PaneID: "pane-live", AgentType: "claude", Status: "blocked",
+	}})
+	got := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: "pane-live",
+		CreatedAt: time.Now().Add(-actionStaleAfter - time.Hour),
+	}))
+	if got.Status != domain.AgentActionDone {
+		t.Fatalf("status = %q (%s); an aged capture must still run", got.Status, got.Error)
+	}
+}
+
+// A crashed claim comes BACK to the queue: re-running the pipeline against the
+// current screen is idempotent, so failing it would lose a request for nothing.
+func TestACrashedCaptureClaimIsRequeuedNotFailed(t *testing.T) {
+	h := newHarness(t, "")
+	id, err := h.raw.EnqueueAgentAction(t.Context(), domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: "pane-live", CreatedAt: time.Now(),
 	})
-	if !strings.Contains(esc[0].PaneExcerpt, "Do you want to proceed") {
-		t.Errorf("escalation must carry the classified pane content, got %q", esc[0].PaneExcerpt)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestCaptureCoalescesEventBursts(t *testing.T) {
-	// Rapid events for one pane reschedule the pending capture (latest
-	// wins): exactly one read and one escalation fire for the burst.
-	cfg := "[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 500\nevent_ms = 500\n"
-	h := newHarness(t, cfg)
-	h.herdr.setPane(approvalPane)
-
-	for range 3 {
-		h.push("agent-cap2", "blocked")
+	if ok, err := h.raw.ClaimAgentAction(t.Context(), id, time.Now()); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
-	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.readLineCalls()) >= 1 })
-	// A superseded timer must never fire late: give strays time to show.
-	time.Sleep(800 * time.Millisecond)
-	if n := len(h.herdr.readLineCalls()); n != 1 {
-		t.Fatalf("burst must coalesce to exactly 1 pane read, got %d", n)
+	got, err := h.raw.AgentActionByID(t.Context(), id)
+	if err != nil {
+		t.Fatal(err)
 	}
-	esc, err := h.raw.PendingEscalations(context.Background())
-	if err != nil || len(esc) != 1 {
-		t.Fatalf("burst must produce exactly 1 escalation, got %d (%v)", len(esc), err)
+	if got.SideEffect {
+		t.Fatal("capture row carries side_effect; a crashed claim would be failed rather than retried")
 	}
-}
-
-func TestCaptureStartVsEventDelay(t *testing.T) {
-	// The first capture waits start_ms; once it has fired, later events
-	// use the (much shorter) event_ms.
-	cfg := "[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 6000\nevent_ms = 1\n"
-	h := newHarness(t, cfg)
-	h.herdr.setPane(approvalPane)
-
-	h.push("agent-cap3", "blocked")
-	time.Sleep(500 * time.Millisecond)
-	if n := len(h.herdr.readLineCalls()); n != 0 {
-		t.Fatalf("first event must wait the start delay, read fired %d time(s)", n)
+	requeued, failed, err := h.raw.ReclaimRunningAgentActions(t.Context(), time.Now())
+	if err != nil {
+		t.Fatal(err)
 	}
-	waitFor(t, 15*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 1 })
-
-	// Far beyond the event delay, far under another start delay: only the
-	// event delay can satisfy this deadline, even on a stalled runner.
-	h.push("agent-cap3", "blocked")
-	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 2 })
-}
-
-func TestCaptureTimersArePerPane(t *testing.T) {
-	// Two panes must not cancel each other's pending captures.
-	cfg := "[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 200\nevent_ms = 200\n"
-	h := newHarness(t, cfg)
-	h.herdr.setPane(approvalPane)
-
-	h.push("agent-capA", "blocked")
-	h.push("agent-capB", "blocked")
-	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 2 })
-	// Both reads have fired, but each escalation is persisted AFTER its read
-	// returns — poll for the DB writes instead of reading once (checking
-	// immediately raced the second escalation on stalled runners). waitFor
-	// t.Fatals if the second escalation never lands.
-	waitFor(t, 5*time.Second, func() bool {
-		esc, err := h.raw.PendingEscalations(context.Background())
-		return err == nil && len(esc) == 2
-	})
-}
-
-func TestCaptureCanceledByWorkingTransition(t *testing.T) {
-	// The human answered before the capture fired: the pending capture is
-	// canceled — no stale read, no escalation for a pane that moved on.
-	cfg := "[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 1500\nevent_ms = 1500\n"
-	h := newHarness(t, cfg)
-	h.herdr.setPane(approvalPane)
-
-	h.push("agent-cap4", "blocked")
-	time.Sleep(100 * time.Millisecond)
-	h.push("agent-cap4", "working")
-	time.Sleep(2500 * time.Millisecond)
-	if n := len(h.herdr.readLineCalls()); n != 0 {
-		t.Fatalf("working must cancel the pending capture, read fired %d time(s)", n)
+	if requeued != 1 || failed != 0 {
+		t.Errorf("reclaim requeued=%d failed=%d, want 1 and 0", requeued, failed)
 	}
-	esc, err := h.raw.PendingEscalations(context.Background())
-	if err != nil || len(esc) != 0 {
-		t.Fatalf("no escalation expected after cancel, got %d (%v)", len(esc), err)
-	}
-}
-
-func TestCaptureDetectedResetsStartDelay(t *testing.T) {
-	// A new agent discovered in a previously-used pane gets the full start
-	// settle again — captureStarted is per agent tenancy, not forever.
-	cfg := "[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 2000\nevent_ms = 1\n"
-	h := newHarness(t, cfg)
-	h.herdr.setPane(approvalPane)
-
-	h.push("agent-cap5", "blocked")
-	waitFor(t, 10*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 1 })
-	// Sanity: the event delay is in effect now.
-	h.push("agent-cap5", "blocked")
-	waitFor(t, 1500*time.Millisecond, func() bool { return len(h.herdr.readLineCalls()) == 2 })
-
-	// Rediscovery (pane re-created / new tenant): back to the start delay.
-	h.push("agent-cap5", "detected")
-	h.push("agent-cap5", "blocked")
-	time.Sleep(500 * time.Millisecond)
-	if n := len(h.herdr.readLineCalls()); n != 2 {
-		t.Fatalf("detected must restore the start delay, read fired %d time(s)", n)
-	}
-	waitFor(t, 10*time.Second, func() bool { return len(h.herdr.readLineCalls()) == 3 })
 }

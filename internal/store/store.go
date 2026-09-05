@@ -317,6 +317,72 @@ CREATE TABLE IF NOT EXISTS agent_actions (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status, id);
 CREATE INDEX IF NOT EXISTS idx_agent_actions_correction ON agent_actions(correction_id);
+
+-- The DAEMON's published view of what herdr is running, so the front ends can
+-- read the herd without listing agents themselves.
+--
+-- Written only by the daemon, from the ListAgents calls it already makes plus
+-- the transitions it already receives. gone_at soft-deletes rather than
+-- DELETE: herdr recycles pane ids and an agent id IS a pane id, so a row whose
+-- terminal_id changed is a DIFFERENT agent and must replace rather than merge —
+-- the same doctrine as task_reservations.terminal_id.
+CREATE TABLE IF NOT EXISTS agent_roster (
+	agent_id TEXT PRIMARY KEY,
+	pane_id TEXT NOT NULL DEFAULT '',
+	tab_id TEXT NOT NULL DEFAULT '',
+	workspace_id TEXT NOT NULL DEFAULT '',
+	agent_type TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT '',
+	terminal_id TEXT NOT NULL DEFAULT '',
+	-- The agent's working directory, refreshed on its own slower TTL: it costs
+	-- one herdr pane-get subprocess per agent, which is why the front ends only
+	-- ever asked for it on the two surfaces that display one.
+	cwd TEXT NOT NULL DEFAULT '',
+	cwd_read_at INTEGER NOT NULL DEFAULT 0,
+	-- The agent's position in herdr's own agent listing, recorded by a publish
+	-- and preserved by a per-agent event.
+	--
+	-- Reading the roster back ordered by agent_id would NOT reproduce it: an
+	-- agent id is a pane id, so the ordering is lexicographic over ids like
+	-- w1:p2 and w1:p10 -- which puts the tenth pane before the second. The
+	-- Agents tab renders the slice as given (TestAgentsListPreservesHerdrOrder),
+	-- and herdr's order is the only one AgentTransition carries enough to
+	-- reconstruct, since it has no intra-tab pane ordinal.
+	--
+	-- An agent first seen through an EVENT has no position -- rosterSeqUnknown
+	-- sorts it last until the next publish places it -- which is a new agent
+	-- appearing at the end for up to one tick, never an existing one moving.
+	list_seq INTEGER NOT NULL DEFAULT 0,
+	seen_at INTEGER NOT NULL,
+	-- 0 while live. Set when a publish no longer sees the agent.
+	gone_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_agent_roster_live ON agent_roster(gone_at, list_seq, agent_id);
+
+-- Workspace and tab display metadata, published alongside the roster. Separate
+-- from agent_roster because these are per-LOCATION, not per-agent, and the TUI
+-- renders a number as well as a label.
+CREATE TABLE IF NOT EXISTS herdr_locations (
+	kind TEXT NOT NULL,
+	id TEXT NOT NULL,
+	label TEXT NOT NULL DEFAULT '',
+	number INTEGER NOT NULL DEFAULT 0,
+	workspace_id TEXT NOT NULL DEFAULT '',
+	seen_at INTEGER NOT NULL,
+	PRIMARY KEY (kind, id)
+);
+
+-- One row (id = 1) recording when the daemon last published a roster.
+--
+-- It is what tells "no agents are running" from "no daemon has ever published",
+-- which an empty agent_roster cannot do on its own. Same doctrine as
+-- Status.AgentsKnown, which reads it: a caller acting on an agent's ABSENCE
+-- must be able to tell absence from ignorance.
+CREATE TABLE IF NOT EXISTS roster_meta (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	published_at INTEGER NOT NULL
+);
+
 -- Per-item hand-out counter, kept SEPARATELY from task_reservations so it
 -- survives the reservation row being retired on every reclaim. It is what caps
 -- an item that can never be delivered from being resent forever.
@@ -400,6 +466,7 @@ func (s *Store) migrate() error {
 		// on any database that already has the table.
 		`ALTER TABLE agent_actions ADD COLUMN terminal_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE agent_actions ADD COLUMN side_effect INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE agent_roster ADD COLUMN list_seq INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {

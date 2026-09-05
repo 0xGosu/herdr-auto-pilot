@@ -3,26 +3,24 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
-	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
-	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 func testApp(t *testing.T) (*frontend.App, *store.Store) {
@@ -37,6 +35,9 @@ func testApp(t *testing.T) (*frontend.App, *store.Store) {
 		Store:      st,
 		ConfigPath: filepath.Join(dir, "config.toml"),
 		Author:     "operator",
+		// StateDir is where the daemon health record lives, and every verb
+		// that queues an agent action reads it through requireLiveDaemon.
+		StateDir: dir,
 	}, st
 }
 
@@ -56,68 +57,77 @@ func run(t *testing.T, app *frontend.App, verb string, args ...string) (string, 
 	return out.String(), err
 }
 
-type captureHerdr struct {
-	agents []domain.AgentTransition
-}
-
-func (f *captureHerdr) Send(context.Context, string, string) error { return nil }
-func (f *captureHerdr) ReadPane(context.Context, string, int) (string, error) {
-	return "", nil
-}
-func (f *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
-	return f.agents, nil
-}
-
 func TestCaptureCLI(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
-	if err := st.AssignAgentName(ctx, "pane-live", "vivid-falcon"); err != nil {
+	app.DaemonInfo = func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version }
+	if err := daemonhealth.Write(app.StateDir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now(),
+	}); err != nil {
 		t.Fatal(err)
 	}
-	app.Herdr = &captureHerdr{agents: []domain.AgentTransition{{
-		AgentID: "pane-live", PaneID: "pane-live", AgentType: "codex", Status: "blocked",
-	}}}
-	app.DaemonInfo = func() (bool, int, string) { return true, 42, buildinfo.Version }
-	sock := filepath.Join(testutil.SocketDir(t), "capture.sock")
-	var mu sync.Mutex
-	var kinds []control.Kind
-	srv, err := control.NewServer(sock, func(k control.Kind) {
-		mu.Lock()
-		defer mu.Unlock()
-		kinds = append(kinds, k)
+
+	// Stand in for the daemon's drain. The resolution and the parked-status
+	// check are ITS job now, so the verb's contract is only that the
+	// operator's spelling reaches the queue and the answer reaches stdout.
+	result, _ := json.Marshal(domain.CaptureResult{
+		AgentID: "pane-live", PaneID: "pane-live", Status: "blocked",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Close()
-	app.ControlPath = sock
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			acts, err := st.PendingAgentActions(ctx)
+			if err == nil {
+				for _, a := range acts {
+					errText, out := "", string(result)
+					status := domain.AgentActionDone
+					if a.Target == "ghost" {
+						status, errText, out = domain.AgentActionFailed, `no live agent matches "ghost"`, ""
+					}
+					if ok, _ := st.ClaimAgentAction(ctx, a.ID, time.Now()); ok {
+						st.FinishAgentAction(ctx, a.ID, status, errText, out, time.Now())
+					}
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
 
 	out, err := run(t, app, "capture", "vivid-falcon")
 	if err != nil || !strings.Contains(out, "capture queued for vivid-falcon") || !strings.Contains(out, "pane-live") {
 		t.Fatalf("capture output=%q err=%v", out, err)
 	}
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		mu.Lock()
-		n := len(kinds)
-		mu.Unlock()
-		if n == 1 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	acts, err := st.AgentActionByID(ctx, 1)
+	if err != nil || acts == nil {
+		t.Fatalf("no action queued: %v", err)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(kinds) != 1 {
-		t.Fatalf("capture nudges = %v", kinds)
-	}
-	if target, ok := control.CaptureTarget(kinds[0]); !ok || target != "pane-live" {
-		t.Fatalf("capture target=%q ok=%v", target, ok)
+	if acts.Kind != domain.AgentActionCapture || acts.Target != "vivid-falcon" {
+		t.Fatalf("queued %+v; want a capture carrying the operator's spelling", acts)
 	}
 
-	app.DaemonInfo = func() (bool, int, string) { return true, 42, "old-version" }
-	if _, err := run(t, app, "capture", "vivid-falcon"); err == nil || !strings.Contains(err.Error(), "STALE") {
-		t.Fatalf("stale daemon should be rejected, got %v", err)
+	// The daemon's refusal is the verb's error. It used to be a log line the
+	// operator never saw, printed over by "capture queued".
+	if _, err := run(t, app, "capture", "ghost"); err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("an unresolvable target should fail with the daemon's reason, got %v", err)
+	}
+
+	// A daemon that holds the lock but has stopped making progress drains
+	// nothing, so the request is refused before it is written — something the
+	// old version-only pre-check waved through.
+	if err := daemonhealth.Write(app.StateDir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now().Add(-daemonhealth.StaleAfter - time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, app, "capture", "vivid-falcon"); err == nil ||
+		!errors.Is(err, frontend.ErrDaemonUnavailable) {
+		t.Fatalf("a hung daemon should be refused, got %v", err)
 	}
 }
 
@@ -127,9 +137,9 @@ func TestDisableEnableAgentCLI(t *testing.T) {
 	if err := st.AssignAgentName(ctx, "pane-live", "vivid-falcon"); err != nil {
 		t.Fatal(err)
 	}
-	app.Herdr = &captureHerdr{agents: []domain.AgentTransition{{
+	seedRoster(t, st, domain.AgentTransition{
 		AgentID: "pane-live", PaneID: "pane-live", AgentType: "codex", Status: "idle",
-	}}}
+	})
 
 	out, err := run(t, app, "disable", "vivid-falcon")
 	if err != nil || !strings.Contains(out, "disabled") {
@@ -431,13 +441,17 @@ func TestStatusEmbedderTimeoutDiagnostics(t *testing.T) {
 // directory, and falls back to "-" (never a blank field) when herdr cannot
 // report one, so the column count stays stable for anything parsing it.
 func TestAgentsListsWorkingDir(t *testing.T) {
-	app, _ := testApp(t)
-	app.Herdr = &cwdCaptureHerdr{
-		captureHerdr: captureHerdr{agents: []domain.AgentTransition{
-			{AgentID: "pane-a", PaneID: "pane-a", AgentType: "claude", Status: "idle"},
-			{AgentID: "pane-b", PaneID: "pane-b", AgentType: "claude", Status: "idle"},
-		}},
-		info: map[string]domain.PaneInfo{"pane-a": {Cwd: "/repo", ForegroundCwd: "/repo/sub"}},
+	app, st := testApp(t)
+	// The cwd arrives WITH the roster now — the daemon reads it, on its own
+	// TTL, so `hap agents` renders a published column instead of shelling out
+	// once per agent itself.
+	now := time.Now()
+	if err := st.PublishRoster(context.Background(), []domain.RosterAgent{
+		{AgentID: "pane-a", PaneID: "pane-a", AgentType: "claude", Status: "idle",
+			Cwd: "/repo/sub", CwdReadAt: now, SeenAt: now},
+		{AgentID: "pane-b", PaneID: "pane-b", AgentType: "claude", Status: "idle", SeenAt: now},
+	}, now); err != nil {
+		t.Fatal(err)
 	}
 
 	out, err := run(t, app, "agents")
@@ -459,16 +473,6 @@ func TestAgentsListsWorkingDir(t *testing.T) {
 	if got, want := strings.Count(lines[0], "\t"), strings.Count(lines[1], "\t"); got != want {
 		t.Errorf("column counts differ (%d vs %d): %q / %q", got, want, lines[0], lines[1])
 	}
-}
-
-// cwdCaptureHerdr adds the optional InspectorPort to captureHerdr.
-type cwdCaptureHerdr struct {
-	captureHerdr
-	info map[string]domain.PaneInfo
-}
-
-func (f *cwdCaptureHerdr) PaneInfo(_ context.Context, paneID string) (domain.PaneInfo, error) {
-	return f.info[paneID], nil
 }
 
 func seedSignatures(t *testing.T, st *store.Store) {

@@ -23,7 +23,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -110,29 +109,7 @@ type App struct {
 	// test fixture must still be a config production would ACCEPT (env_file
 	// set, gist_id set) or it proves less than it appears to.
 	TaskStoreFor func(cfg config.Config, locator string) (ports.TaskStore, error)
-
-	// cwdMu/cwdCache memoize pane working directories for FillAgentCwds.
-	// Without this, the TUI's 2s refresh would spawn one `herdr pane get` per
-	// agent per tick; the daemon caches its own lookups for the same reason. A
-	// cwd changes rarely, so a short TTL is plenty.
-	cwdMu    sync.Mutex
-	cwdCache map[string]cwdEntry
 }
-
-// cwdEntry is one memoized pane cwd and when it was read.
-type cwdEntry struct {
-	cwd string
-	at  time.Time
-}
-
-// cwdTTL bounds how stale a displayed working directory can be. Short enough
-// that a `cd` in the pane shows up within a few refreshes, long enough that a
-// 2s refresh over a dozen agents does not shell out constantly.
-const cwdTTL = 20 * time.Second
-
-// cwdCacheMax is the size past which expired entries are swept. Well above any
-// realistic live pane count, so a normal session never sweeps at all.
-const cwdCacheMax = 256
 
 // nudge wakes the daemon so it re-reads what the caller just persisted. It
 // NEVER fails the caller's operation, and so returns nothing.
@@ -182,11 +159,17 @@ type Status struct {
 	PendingEscalations int
 	MonitoredAgents    []domain.AgentTransition
 	// AgentsKnown reports that MonitoredAgents actually reflects herdr: false
-	// means the agent list could not be read (no adapter, or the query
-	// failed), which is NOT the same as "no agents are running" — an empty
-	// MonitoredAgents cannot tell the two apart on its own. Callers that
-	// would act on an agent's ABSENCE must check this first.
+	// means no daemon has published a roster recently enough to trust, which
+	// is NOT the same as "no agents are running" — an empty MonitoredAgents
+	// cannot tell the two apart on its own. Callers that would act on an
+	// agent's ABSENCE must check this first.
 	AgentsKnown bool
+	// RosterPublishedAt is when the daemon last published the herd, ZERO when
+	// it never has. The distinction is what lets a surface say "no daemon has
+	// looked yet" rather than rendering a first run as an empty herd — which
+	// is how it would read otherwise, since both are AgentsKnown=false with no
+	// agents. See RosterNeverPublished.
+	RosterPublishedAt time.Time
 	// AgentNames maps agent/pane ids to their short names.
 	AgentNames map[string]string
 	// AgentNamesKnown reports that AgentNames actually reflects the registry:
@@ -247,31 +230,42 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 		return st, err
 	}
 	st.PendingEscalations = int(pending)
-	if a.Herdr != nil {
-		if agents, err := a.Herdr.ListAgents(ctx); err == nil {
-			st.AgentsKnown = true
-			// Keep the view boundary defensive even if an alternate Herdr
-			// adapter does not normalize placeholder side-panel rows.
-			for _, agent := range agents {
-				if !domain.IsPlaceholderAgent(agent.AgentType, agent.Status) {
-					st.MonitoredAgents = append(st.MonitoredAgents, agent)
+	roster, publishedAt, rosterErr := a.Store.LiveRoster(ctx)
+	if rosterErr == nil {
+		// Freshness, not row count, is what makes the herd KNOWN. An empty
+		// roster from a daemon publishing every sweep means "nothing is
+		// running"; the same empty roster with no daemon behind it means
+		// "nobody has looked". Only the timestamp separates them.
+		st.AgentsKnown = domain.RosterFresh(publishedAt, a.now())
+		st.RosterPublishedAt = publishedAt
+		// A roster too old to trust yields NO rows, not old ones. Every
+		// consumer of MonitoredAgents treats a row as a live agent it may act
+		// on — the Agents tab, focus, task-send target resolution — and a
+		// stale row's pane id may since have been recycled onto a different
+		// process, which is the one outcome the terminal rules exist to
+		// prevent. Callers that need to say WHY the list is empty read
+		// RosterPublishedAt, which is kept either way; RosterProblem turns it
+		// into the sentence the surfaces print.
+		if !st.AgentsKnown {
+			roster = nil
+		}
+		for _, r := range roster {
+			// Kept defensive at the view boundary too: the publisher filters
+			// placeholder side-panel rows, but a roster written by an older
+			// daemon predates that.
+			if !domain.IsPlaceholderAgent(r.AgentType, r.Status) {
+				st.MonitoredAgents = append(st.MonitoredAgents, r.Transition())
+				if r.Cwd != "" {
+					if st.AgentCwds == nil {
+						st.AgentCwds = map[string]string{}
+					}
+					st.AgentCwds[r.AgentID] = r.Cwd
 				}
 			}
 		}
-		if loc, ok := a.Herdr.(ports.LocatorPort); ok {
-			if wss, err := loc.ListWorkspaces(ctx); err == nil {
-				st.Workspaces = map[string]domain.WorkspaceInfo{}
-				for _, w := range wss {
-					st.Workspaces[w.ID] = w
-				}
-			}
-			if tabs, err := loc.ListTabs(ctx); err == nil {
-				st.Tabs = map[string]domain.TabInfo{}
-				for _, t := range tabs {
-					st.Tabs[t.ID] = t
-				}
-			}
-		}
+	}
+	if wss, tabs, err := a.Store.HerdrLocations(ctx); err == nil {
+		st.Workspaces, st.Tabs = wss, tabs
 	}
 	if names, err := a.Store.AgentNames(ctx); err == nil {
 		st.AgentNames, st.AgentNamesKnown = names, true
@@ -317,60 +311,57 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 // AgentName returns the short name for an agent id ("" when unnamed).
 func (st Status) AgentName(agentID string) string { return st.AgentNames[agentID] }
 
-// AgentCwd returns the agent's working directory ("" when herdr could not
-// report one, or when the caller never asked for cwds — see FillAgentCwds).
+// AgentCwd returns the agent's working directory ("" when the daemon has not
+// read one yet). Absence is "not read", never "the agent has no cwd".
 func (st Status) AgentCwd(agentID string) string { return st.AgentCwds[agentID] }
+
+// RosterNeverPublished reports that no daemon has ever published a herd, as
+// opposed to one having published an empty herd.
+//
+// A first run is otherwise indistinguishable from an idle machine — both are
+// AgentsKnown=false with no agents — and rendering it as "no agents" tells the
+// operator their herd is empty when the real answer is that nothing has looked.
+// Before the roster the front ends listed agents themselves, so this case did
+// not exist: the question was answered by whoever asked it.
+func (st Status) RosterNeverPublished() bool { return st.RosterPublishedAt.IsZero() }
+
+// RosterProblem explains why MonitoredAgents cannot be trusted, or "" when it
+// can.
+//
+// The three surfaces that answer "what is running" — `hap agents`, `hap status`
+// and the TUI — must not report a missing roster as an empty herd, and must not
+// all word it differently. Neither answer blames herdr OR the daemon by name:
+// a healthy daemon that cannot reach herdr publishes nothing either, and
+// telling an operator to restart the wrong process is the failure this replaces.
+// `hap status` shows which one is actually unwell.
+func (st Status) RosterProblem() string {
+	switch {
+	case st.RosterNeverPublished():
+		return "no hap daemon has reported the running agents yet"
+	case !st.AgentsKnown:
+		return fmt.Sprintf("the last report of the running agents is %s old",
+			time.Since(st.RosterPublishedAt).Round(time.Second))
+	default:
+		return ""
+	}
+}
 
 // AgentMode returns the agent's permission mode (domain.AgentModeUnknown when
 // it could not be read, or when the caller never asked — see FillAgentModes).
 func (st Status) AgentMode(agentID string) domain.AgentMode { return st.AgentModes[agentID] }
 
-// cwdFillBudget bounds ONE FillAgentCwds pass end to end. Each `herdr pane get`
-// is its own subprocess with a 15s CLI budget, and the lookups run in sequence,
-// so without this a wedged herdr could stall a caller for 15s × agents. A
-// working directory is a display nicety: it gets a couple of seconds, and
-// whatever resolved in that time is what shows.
-const cwdFillBudget = 3 * time.Second
-
-// FillAgentCwds populates st.AgentCwds for the agents in st.MonitoredAgents.
+// FillAgentCwds is retained as a no-op so the two surfaces that display a
+// working directory keep their explicit "I want cwds" call site.
 //
-// It is deliberately NOT part of GetStatus: every status caller would then pay
-// one `herdr pane get` subprocess per agent for data most of them discard, and
-// one-shot commands (`hap status`, `hap task send`) can never benefit from the
-// TTL cache. Only the two surfaces that display a cwd — the TUI refresh and
-// `hap agents` — call this.
-//
-// Best-effort throughout: a missing InspectorPort, a failed lookup, or an
-// exhausted budget just leaves agents out of the map.
-func (a *App) FillAgentCwds(ctx context.Context, st *Status) {
-	if a.Herdr == nil {
-		return
-	}
-	if _, ok := a.Herdr.(ports.InspectorPort); !ok {
-		return
-	}
-	ctx, cancel := context.WithTimeout(ctx, cwdFillBudget)
-	defer cancel()
-
-	now := a.now()
-	for _, agent := range st.MonitoredAgents {
-		if ctx.Err() != nil {
-			return // budget spent: keep whatever resolved
-		}
-		// herdr identifies most agents by their pane id, but the transition
-		// carries both — fall back so an empty PaneID does not drop the row.
-		pane := agent.PaneID
-		if pane == "" {
-			pane = agent.AgentID
-		}
-		if cwd := a.paneCwdCached(ctx, pane, now); cwd != "" {
-			if st.AgentCwds == nil {
-				st.AgentCwds = map[string]string{}
-			}
-			st.AgentCwds[agent.AgentID] = cwd
-		}
-	}
-}
+// The cwd arrives with the roster now: it is read by the DAEMON, on its own
+// TTL, and GetStatus fills AgentCwds from the published rows. What used to
+// happen here — one herdr pane-get subprocess per agent, in whichever process
+// the operator ran, with a wall-clock budget and a per-process cache — is the
+// work this stage moved. Callers are left alone rather than edited away because
+// the distinction they encode is still real: only `hap agents` and the TUI
+// refresh render a cwd, and a later change could make filling one cost
+// something again.
+func (a *App) FillAgentCwds(_ context.Context, _ *Status) {}
 
 // now is the App's clock, overridable by tests (see Clock).
 func (a *App) now() time.Time {
@@ -523,23 +514,55 @@ func (a *App) Names(ctx context.Context) (map[string]string, error) {
 	return a.Store.AgentNames(ctx)
 }
 
+// errRosterUnavailable reports that the running agents have not been reported
+// recently enough to answer a question about one.
+//
+// It exists so a caller can say which of two very different things happened.
+// "No such agent" and "nobody has told us what is running" both leave a lookup
+// empty, and telling an operator their agent does not exist when the truth is
+// that nothing has looked sends them hunting for the wrong problem.
+var errRosterUnavailable = errors.New(
+	"the running agents have not been reported yet; check the daemon with `hap status`, then retry")
+
+// liveRosterAgentID resolves an agent/pane id against the published roster,
+// for the two operator commands that must work on an agent the daemon has seen
+// running but never named — a brand-new agent, or one that predates the
+// daemon's current run.
+//
+// A roster too old to trust is errRosterUnavailable, never a miss: the caller
+// pairs that with the store's own ErrUnknownAgent so the operator is told both
+// that no such agent is known AND that it could not be checked against what is
+// running. An empty id with a nil error is a genuine miss.
+func (a *App) liveRosterAgentID(ctx context.Context, target string) (string, error) {
+	roster, publishedAt, err := a.Store.LiveRoster(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !domain.RosterFresh(publishedAt, a.now()) {
+		return "", errRosterUnavailable
+	}
+	for _, r := range roster {
+		if r.AgentID == target || r.PaneID == target {
+			return r.AgentID, nil
+		}
+	}
+	return "", nil
+}
+
 // RenameAgent gives an agent a new short name; target may be the current
 // name or the agent/pane id. The name is what task-source selectors match.
 // An agent that is live in Herdr but has not transitioned since daemon
 // start has no auto-generated name row yet; for those, the rename creates
-// the row after verifying the target against Herdr's live agent list.
+// the row after verifying the target against the daemon's published roster.
 func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
 	err := a.Store.RenameAgent(ctx, target, newName)
-	if errors.Is(err, ports.ErrUnknownAgent) && a.Herdr != nil {
-		agents, listErr := a.Herdr.ListAgents(ctx)
-		if listErr != nil {
-			return fmt.Errorf("%w (and the live agent list is unavailable: %v)", err, listErr)
+	if errors.Is(err, ports.ErrUnknownAgent) {
+		agentID, rerr := a.liveRosterAgentID(ctx, target)
+		if rerr != nil {
+			return fmt.Errorf("%w (%v)", err, rerr)
 		}
-		for _, agent := range agents {
-			if agent.AgentID == target || agent.PaneID == target {
-				err = a.Store.AssignAgentName(ctx, agent.AgentID, newName)
-				break
-			}
+		if agentID != "" {
+			err = a.Store.AssignAgentName(ctx, agentID, newName)
 		}
 	}
 	if err != nil {
@@ -554,20 +577,16 @@ func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
 // remains visible and addressable after it exits.
 func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool) error {
 	err := a.Store.SetAgentDisabled(ctx, target, disabled)
-	if errors.Is(err, ports.ErrUnknownAgent) && a.Herdr != nil {
-		agents, listErr := a.Herdr.ListAgents(ctx)
-		if listErr != nil {
-			return fmt.Errorf("%w (and the live agent list is unavailable: %v)", err, listErr)
+	if errors.Is(err, ports.ErrUnknownAgent) {
+		agentID, rerr := a.liveRosterAgentID(ctx, target)
+		if rerr != nil {
+			return fmt.Errorf("%w (%v)", err, rerr)
 		}
-		for _, agent := range agents {
-			if agent.AgentID != target && agent.PaneID != target {
-				continue
-			}
-			if _, nameErr := a.Store.EnsureAgentName(ctx, agent.AgentID); nameErr != nil {
+		if agentID != "" {
+			if _, nameErr := a.Store.EnsureAgentName(ctx, agentID); nameErr != nil {
 				return nameErr
 			}
-			err = a.Store.SetAgentDisabled(ctx, agent.AgentID, disabled)
-			break
+			err = a.Store.SetAgentDisabled(ctx, agentID, disabled)
 		}
 	}
 	if err != nil {
@@ -580,30 +599,40 @@ func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool
 // CaptureAgent asks the daemon to re-run the normal attention pipeline for a
 // currently parked live agent. Exact pane/agent ids take precedence over the
 // operator-assigned short name.
-func (a *App) CaptureAgent(ctx context.Context, target string) (domain.AgentTransition, error) {
-	if a.Herdr == nil {
-		return domain.AgentTransition{}, fmt.Errorf("herdr is unavailable")
+//
+// The target is resolved by the DAEMON, not here. That is what removed this
+// command's live agent listing from the front end — and it is also why the two
+// refusals an operator actually hits (a name that matches nothing, an agent
+// caught mid-work) now come back as errors instead of a daemon-log warning
+// nobody was reading, after this call had already reported the capture queued.
+func (a *App) CaptureAgent(ctx context.Context, target string) (domain.CaptureResult, error) {
+	if strings.TrimSpace(target) == "" {
+		return domain.CaptureResult{}, fmt.Errorf("an agent is required")
 	}
-	if a.ControlPath == "" {
-		return domain.AgentTransition{}, fmt.Errorf("daemon control socket is unavailable")
+	if err := a.requireLiveDaemon(); err != nil {
+		return domain.CaptureResult{}, err
 	}
-	found, err := a.FindLiveAgent(ctx, target)
+	id, err := a.Store.EnqueueAgentAction(ctx, domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: target,
+		Author: a.Author, CreatedAt: time.Now(),
+	})
 	if err != nil {
-		return domain.AgentTransition{}, err
+		return domain.CaptureResult{}, err
 	}
-	switch found.Status {
-	case "blocked", "idle", "done":
-	default:
-		return domain.AgentTransition{}, fmt.Errorf("agent %q is %s; capture requires blocked, idle, or done", target, found.Status)
+	a.nudge(ctx, control.KindWake)
+
+	// Waited for, unlike a focus: the caller PRINTS the resolved agent, and
+	// the whole point of moving the resolution to the daemon is that its
+	// answer — including a refusal — reaches the operator.
+	result, err := a.AwaitAgentAction(ctx, id, DefaultActionTimeout)
+	if err != nil {
+		return domain.CaptureResult{}, err
 	}
-	agentID := found.AgentID
-	if agentID == "" {
-		agentID = found.PaneID
+	var res domain.CaptureResult
+	if err := json.Unmarshal([]byte(result), &res); err != nil {
+		return domain.CaptureResult{}, fmt.Errorf("the daemon's capture result could not be read: %w", err)
 	}
-	if err := control.NudgeCapture(ctx, a.ControlPath, agentID); err != nil {
-		return domain.AgentTransition{}, fmt.Errorf("requesting capture from daemon: %w", err)
-	}
-	return found, nil
+	return res, nil
 }
 
 // Escalations lists pending escalations.
@@ -667,13 +696,40 @@ func (a *App) Resume(ctx context.Context) (changed bool, err error) {
 }
 
 // FocusAgent brings the herdr UI to the agent's exact pane (tab focus + pane
-// zoom). Errors if the adapter doesn't support focusing.
+// zoom) by queuing the request for the daemon.
+//
+// It deliberately does NOT wait for the outcome, which makes it the exception
+// among the queued kinds rather than the template for them. Two reasons, and
+// both are about where the operator is looking: focusing moves herdr's view
+// AWAY from the pane the TUI is drawn in, so nobody is watching the surface a
+// verdict would be rendered on; and one keypress already costs the daemon a
+// full nudge pass (the drain, the correction sweep, the LLM retries and an
+// attention reconcile), so blocking the front end on top of that buys latency
+// for a message that will not be read. A focus that fails is recorded in the
+// DAEMON LOG ("agent action failed", with the reason) — not in `hap audit`,
+// which reads audit_log and has no view of this queue at all.
+//
+// Nothing is typed into the pane, so there is no delivery guard to lose by
+// not waiting — see daemon.focusAgent.
 func (a *App) FocusAgent(ctx context.Context, tabID, paneID string) error {
-	fp, ok := a.Herdr.(ports.FocusPort)
-	if !ok {
-		return fmt.Errorf("focus not supported by this herdr adapter")
+	if tabID == "" || paneID == "" {
+		return fmt.Errorf("no location known for this agent")
 	}
-	return fp.FocusPane(ctx, tabID, paneID)
+	if err := a.requireLiveDaemon(); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(domain.FocusPayload{TabID: tabID, PaneID: paneID})
+	if err != nil {
+		return err
+	}
+	if _, err := a.Store.EnqueueAgentAction(ctx, domain.AgentAction{
+		Kind: domain.AgentActionFocus, Target: paneID,
+		Payload: string(payload), Author: a.Author, CreatedAt: time.Now(),
+	}); err != nil {
+		return err
+	}
+	a.nudge(ctx, control.KindWake)
+	return nil
 }
 
 // Resolve records the operator's response to an escalation or a post-hoc
@@ -1378,16 +1434,16 @@ type indexedTaskSource struct {
 // name-falling-back-to-id rule as the daemon's workspaceName. "" means the
 // workspace is unknown.
 func (a *App) agentWorkspaceTarget(ctx context.Context, live *domain.AgentTransition) string {
-	if live == nil || live.WorkspaceID == "" || a.Herdr == nil {
+	if live == nil || live.WorkspaceID == "" {
 		return ""
 	}
-	if loc, ok := a.Herdr.(ports.LocatorPort); ok {
-		if wss, err := loc.ListWorkspaces(ctx); err == nil {
-			for _, w := range wss {
-				if w.ID == live.WorkspaceID && w.Label != "" {
-					return w.Label
-				}
-			}
+	// Read from the daemon's published labels. Falling back to the raw id when
+	// none is published keeps the name-falling-back-to-id rule the daemon's own
+	// workspaceName follows, so a selector written against either spelling
+	// still matches.
+	if wss, _, err := a.Store.HerdrLocations(ctx); err == nil {
+		if w, ok := wss[live.WorkspaceID]; ok && w.Label != "" {
+			return w.Label
 		}
 	}
 	return live.WorkspaceID
@@ -3810,43 +3866,6 @@ func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName,
 // so one template renders the same whoever sends it. Best-effort: the
 // inspector is an optional herdr capability and an empty {cwd} must never
 // block a send.
-// paneCwdCached is paneCwd behind the cwdTTL memo. Display paths (status /
-// agent listings) use it so a fast refresh cannot turn one `herdr pane get`
-// per agent into a subprocess storm; send paths keep using paneCwd, where a
-// stale {cwd} would be wrong rather than merely old.
-func (a *App) paneCwdCached(ctx context.Context, paneID string, now time.Time) string {
-	a.cwdMu.Lock()
-	if e, ok := a.cwdCache[paneID]; ok && now.Sub(e.at) < cwdTTL {
-		a.cwdMu.Unlock()
-		return e.cwd
-	}
-	a.cwdMu.Unlock()
-
-	cwd := a.paneCwd(ctx, paneID)
-
-	a.cwdMu.Lock()
-	defer a.cwdMu.Unlock()
-	if a.cwdCache == nil {
-		a.cwdCache = map[string]cwdEntry{}
-	}
-	// Cache the empty answer too: a herdr that cannot answer for a pane would
-	// otherwise be re-asked on every refresh. The cost is that one transient
-	// failure blanks that agent's cwd for up to cwdTTL — acceptable for a
-	// display field, and far cheaper than a subprocess per refresh.
-	a.cwdCache[paneID] = cwdEntry{cwd: cwd, at: now}
-	// Bound the map: a long-lived TUI would otherwise accumulate an entry for
-	// every pane id ever seen. Expired entries are dead weight, so drop them
-	// once the map grows past the point where any real session would sit.
-	if len(a.cwdCache) > cwdCacheMax {
-		for id, e := range a.cwdCache {
-			if now.Sub(e.at) >= cwdTTL {
-				delete(a.cwdCache, id)
-			}
-		}
-	}
-	return cwd
-}
-
 func (a *App) paneCwd(ctx context.Context, paneID string) string {
 	insp, ok := a.Herdr.(ports.InspectorPort)
 	if !ok {

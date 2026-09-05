@@ -603,10 +603,10 @@ func TestRulesAddAcceptsADashLeadingPattern(t *testing.T) {
 // notice observes rather than refuses; it must stay silent when the agent list
 // could not be read, because an absent herdr is not evidence a type is wrong.
 func TestScopedRuleNotesAnUnseenAgentType(t *testing.T) {
-	app, _ := testApp(t)
-	app.Herdr = &captureHerdr{agents: []domain.AgentTransition{{
+	app, st := testApp(t)
+	seedRoster(t, st, domain.AgentTransition{
 		AgentID: "pane-1", PaneID: "pane-1", AgentType: "claude", Status: "idle",
-	}}}
+	})
 
 	out, err := run(t, app, "rules", "add", "--agent-type", "claude-code", "x")
 	if err != nil {
