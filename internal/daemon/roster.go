@@ -91,6 +91,50 @@ func (d *Daemon) rosterShellOutTTLs() (cwd, locations time.Duration) {
 	return rosterIdleTTL, rosterIdleTTL
 }
 
+// startRosterTickPass lists the herd and publishes it, OFF the select loop.
+//
+// The listing is a herdr subprocess with a budget in SECONDS, and this fires
+// every rosterTickInterval while a TUI is open — so running it inline would
+// park the loop that handles every agent's transitions, nudges and timers for
+// as long as herdr took to answer, at a two-second cadence. That is the rule
+// the cwd refresh already follows, and the tick is the worst place to break
+// it.
+//
+// Single-flight for the same reason the shell-out pass is: a listing that
+// outlives its interval must not have the next tick stacked on top of it. The
+// latch is released by the goroutine's own defer AND by hand when spawn
+// refuses, or one shutdown race disables the tick for the life of the process.
+func (d *Daemon) startRosterTickPass(ctx context.Context) {
+	if !d.rosterDemand() {
+		return
+	}
+	d.mu.Lock()
+	if d.rosterTickRunning {
+		d.mu.Unlock()
+		return
+	}
+	d.rosterTickRunning = true
+	d.mu.Unlock()
+
+	if !d.spawn(func() {
+		defer func() {
+			d.mu.Lock()
+			d.rosterTickRunning = false
+			d.mu.Unlock()
+		}()
+		agents, err := d.opt.Herdr.ListAgents(ctx)
+		if err != nil {
+			slog.Debug("roster tick: listing agents failed", "error", err)
+			return
+		}
+		d.publishRoster(ctx, agents)
+	}) {
+		d.mu.Lock()
+		d.rosterTickRunning = false
+		d.mu.Unlock()
+	}
+}
+
 // publishRoster records the herd from a listing the caller already made.
 //
 // Callers pass the agents they listed for their own reasons — the startup

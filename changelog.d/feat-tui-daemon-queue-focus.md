@@ -23,6 +23,10 @@
   that DISAPPEARS produces no event, so with no TUI open a pane that has closed
   can still be listed by `hap agents` and `hap status` for up to a minute, until
   the next sweep reconciles the herd
+- Fixed a stale report being treated as live agents. When the last report is too
+  old to trust, the herd now reads as UNKNOWN rather than handing every surface
+  a list of agents to act on — a pane id from an old report may since have been
+  recycled onto a different process. The surfaces say how old the report is
 - Fixed the herd reading as EMPTY when nothing had looked at it. "No agents are
   running" and "no daemon has reported yet" are different answers, and surfaces
   that act on an agent's absence — retiring a task source, confirming an agent is

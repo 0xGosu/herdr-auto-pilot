@@ -2,11 +2,14 @@ package daemon
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/tuisession"
 )
 
@@ -470,4 +473,65 @@ func TestThePublishedCwdFollowsTheForegroundRule(t *testing.T) {
 		t.Errorf("cwd = %q, want the pane's own directory — a whitespace-only "+
 			"foreground reading is not an answer", b.Cwd)
 	}
+}
+
+// The roster tick's LISTING must not run on the daemon's select loop.
+//
+// It is a herdr subprocess with a budget in seconds and the tick fires every
+// two, so running it inline parks the loop that handles every agent's
+// transitions, nudges and timers for as long as herdr takes to answer. That is
+// the rule the cwd refresh already follows; the tick is the worst place to
+// break it, because it is the only one that repeats at that cadence.
+//
+// Also single-flight: a listing that outlives its interval must not have the
+// next tick stacked on top of it.
+func TestTheRosterTickListsOffTheSelectLoop(t *testing.T) {
+	dir := t.TempDir()
+	session, err := tuisession.Register(dir)
+	if err != nil {
+		t.Skipf("cannot register a TUI session here: %v", err)
+	}
+	t.Cleanup(session.Release)
+
+	raw, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+
+	fh := &fakeHerdr{}
+	fh.setAgents([]domain.AgentTransition{
+		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
+	})
+	gate := make(chan struct{})
+	fh.setListAgentsGate(gate)
+
+	d := &Daemon{opt: Options{StateDir: dir, Store: raw, Herdr: fh, Clock: ports.SystemClock{}}}
+
+	// The call must RETURN while herdr is still being asked.
+	done := make(chan struct{})
+	go func() { defer close(done); d.startRosterTickPass(context.Background()) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startRosterTickPass did not return while the listing was blocked; " +
+			"the tick is running herdr on its caller's goroutine")
+	}
+	waitFor(t, 2*time.Second, func() bool { return fh.listAgentsCallCount() == 1 })
+
+	// Four more ticks while that listing is still parked must add none.
+	for range 4 {
+		d.startRosterTickPass(context.Background())
+	}
+	if got := fh.listAgentsCallCount(); got != 1 {
+		t.Errorf("%d listings in flight at once; a pass that outlives the tick "+
+			"must refuse the next one", got)
+	}
+
+	// Released, the pass publishes.
+	close(gate)
+	waitFor(t, 3*time.Second, func() bool {
+		agents, publishedAt, err := raw.LiveRoster(context.Background())
+		return err == nil && len(agents) == 1 && !publishedAt.IsZero()
+	})
 }

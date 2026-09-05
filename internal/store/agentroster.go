@@ -59,8 +59,9 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 				}
 			}
 			// The publish is the only caller that KNOWS a position: it holds
-			// herdr's whole listing, in order.
-			if err := upsertRosterRow(ctx, tx, a, i); err != nil {
+			// herdr's whole listing, in order — and the only one entitled to
+			// bring a retired agent back, for the same reason.
+			if err := upsertRosterRow(ctx, tx, a, i, true); err != nil {
 				return err
 			}
 		}
@@ -119,12 +120,21 @@ func (s *Store) UpsertRosterAgent(ctx context.Context, a domain.RosterAgent) err
 				return err
 			}
 		}
-		return upsertRosterRow(ctx, tx, a, rosterSeqUnknown)
+		return upsertRosterRow(ctx, tx, a, rosterSeqUnknown, false)
 	})
 }
 
 // upsertRosterRow writes one roster row at the listing position seq, or at
 // rosterSeqUnknown when the caller has no listing to take one from.
+//
+// authoritative says the caller holds a full listing, and it is what may clear
+// gone_at. An EVENT may not: only a full listing can see that an agent has
+// vanished, so only a full listing can say it is back. Transitions are
+// buffered, so one for an agent the sweep has just retired routinely arrives
+// AFTER the publish that retired it — and reviving the row there would return
+// a dead agent to every reader, with no listing anywhere agreeing. A brand-new
+// agent is unaffected: its row does not exist yet, so the INSERT applies and
+// gone_at starts at 0.
 //
 // Three columns are written only when the caller HAS them and otherwise left
 // alone, and the asymmetry is the point in each case.
@@ -143,7 +153,13 @@ func (s *Store) UpsertRosterAgent(ctx context.Context, a domain.RosterAgent) err
 // status events carry no terminal id at all, so every transition would blank
 // the id a publish recorded, leaving a genuinely recycled pane id looking
 // unchanged the next time one arrived.
-func upsertRosterRow(ctx context.Context, tx *sql.Tx, a domain.RosterAgent, seq int) error {
+func upsertRosterRow(ctx context.Context, tx *sql.Tx,
+	a domain.RosterAgent, seq int, authoritative bool) error {
+	// A non-authoritative write keeps whatever gone_at the row already has.
+	goneAt := "agent_roster.gone_at"
+	if authoritative {
+		goneAt = "0"
+	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO agent_roster (`+rosterColumns+`, list_seq, gone_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
@@ -155,7 +171,7 @@ func upsertRosterRow(ctx context.Context, tx *sql.Tx, a domain.RosterAgent, seq 
 			cwd = CASE WHEN excluded.cwd = '' THEN agent_roster.cwd ELSE excluded.cwd END,
 			cwd_read_at = CASE WHEN excluded.cwd = '' THEN agent_roster.cwd_read_at ELSE excluded.cwd_read_at END,
 			list_seq = CASE WHEN excluded.list_seq = ? THEN agent_roster.list_seq ELSE excluded.list_seq END,
-			seen_at = excluded.seen_at, gone_at = 0`,
+			seen_at = excluded.seen_at, gone_at = `+goneAt,
 		a.AgentID, a.PaneID, a.TabID, a.WorkspaceID, a.AgentType,
 		a.Status, a.TerminalID, a.Cwd, unix(a.CwdReadAt), unix(a.SeenAt), seq, rosterSeqUnknown)
 	return err

@@ -107,8 +107,21 @@ func makeDaemonLive(t *testing.T, app *frontend.App, stateDir string) {
 func startStandInDrain(t *testing.T, st *store.Store, record func(string)) {
 	t.Helper()
 	done := make(chan struct{})
-	t.Cleanup(func() { close(done) })
+	// The cleanup must WAIT for the goroutine, not merely signal it. Cleanups
+	// run LIFO, so signalling alone lets this pass keep querying while
+	// st.Close() and t.TempDir()'s RemoveAll are already running behind it —
+	// and a SQLite query recreates the -wal and -shm files the moment after
+	// RemoveAll deletes them, failing the test with "directory not empty".
+	// The test that reports it is then whichever one happened to be cheap
+	// enough to reach cleanup while the goroutine was still mid-query, which
+	// is why it reads as an unrelated flake.
+	stopped := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		<-stopped
+	})
 	go func() {
+		defer close(stopped)
 		for {
 			select {
 			case <-done:

@@ -285,6 +285,13 @@ type Daemon struct {
 	// the life of the process.
 	rosterPassRunning bool
 
+	// rosterTickRunning latches the roster TICK's own goroutine (guarded by
+	// mu), which lists the herd before publishRoster can hand its shell-out
+	// half over. Same single-flight rule, one step earlier in the pass: the
+	// listing is a subprocess with a budget in seconds and the tick fires
+	// every two, so without it a slow herdr accumulates listings.
+	rosterTickRunning bool
+
 	// rosterLocationsAt is when the workspace and tab labels were last
 	// published (guarded by mu). They cost two herdr subprocesses and name
 	// things an operator creates by hand, so they ride their own TTL rather
@@ -1225,15 +1232,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		case <-rosterTick.C:
 			logging.Guard("roster-tick", func() error {
-				if !d.rosterDemand() {
-					return nil
-				}
-				agents, err := d.opt.Herdr.ListAgents(ctx)
-				if err != nil {
-					slog.Debug("roster tick: listing agents failed", "error", err)
-					return nil
-				}
-				d.publishRoster(ctx, agents)
+				d.startRosterTickPass(ctx)
 				return nil
 			})
 		case <-sweep.C:

@@ -58,6 +58,10 @@ type fakeHerdr struct {
 	// workspaceCalls counts ListWorkspaces, since the location TTL, like the
 	// cwd one, is only observable as a call COUNT.
 	workspaceCalls int
+	// listAgentsGate, when non-nil, parks every ListAgents until it is closed.
+	// Held OUTSIDE the fake's mutex so the rest of the fake stays usable while
+	// a listing is blocked — which is the whole point of the test using it.
+	listAgentsGate chan struct{}
 	// keys records every SendKey call (ports.KeystrokeSender). When frames
 	// is set, "right"/"left" keys move frameIdx and ReadPane serves the
 	// focused frame — simulating a multi-tab form under an arrow sweep.
@@ -363,12 +367,28 @@ func (f *fakeHerdr) readLineCalls() []int {
 
 func (f *fakeHerdr) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.listAgentsCalls++
+	gate := f.listAgentsGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.failListAgents {
 		return nil, errors.New("induced agent-list failure")
 	}
 	return append([]domain.AgentTransition(nil), f.agents...), nil
+}
+
+func (f *fakeHerdr) setListAgentsGate(gate chan struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listAgentsGate = gate
 }
 
 func (f *fakeHerdr) setAgents(agents []domain.AgentTransition) {

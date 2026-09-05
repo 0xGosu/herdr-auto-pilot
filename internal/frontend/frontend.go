@@ -238,6 +238,17 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 		// "nobody has looked". Only the timestamp separates them.
 		st.AgentsKnown = domain.RosterFresh(publishedAt, a.now())
 		st.RosterPublishedAt = publishedAt
+		// A roster too old to trust yields NO rows, not old ones. Every
+		// consumer of MonitoredAgents treats a row as a live agent it may act
+		// on — the Agents tab, focus, task-send target resolution — and a
+		// stale row's pane id may since have been recycled onto a different
+		// process, which is the one outcome the terminal rules exist to
+		// prevent. Callers that need to say WHY the list is empty read
+		// RosterPublishedAt, which is kept either way; RosterProblem turns it
+		// into the sentence the surfaces print.
+		if !st.AgentsKnown {
+			roster = nil
+		}
 		for _, r := range roster {
 			// Kept defensive at the view boundary too: the publisher filters
 			// placeholder side-panel rows, but a roster written by an older

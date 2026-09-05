@@ -489,3 +489,79 @@ func TestAnEventDoesNotEraseThePublishedTerminal(t *testing.T) {
 			"directory, so the terminal check was disarmed", agents[0].Cwd)
 	}
 }
+
+// A late event must not resurrect an agent an authoritative publish retired.
+//
+// Transitions are buffered, so one for an agent the sweep has just seen
+// vanish routinely arrives AFTER the publish that retired it. Only a full
+// listing can see that an agent is gone, so only a full listing may say it is
+// back — an event reviving the row returns a dead agent to every reader with
+// no listing anywhere agreeing, and its pane id may already belong to
+// something else.
+func TestALateEventDoesNotResurrectARetiredAgent(t *testing.T) {
+	st := rosterStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	agent := domain.RosterAgent{
+		AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude",
+		Status: "idle", TerminalID: "term-a", SeenAt: now,
+	}
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, now); err != nil {
+		t.Fatal(err)
+	}
+	// The agent vanished: an authoritative empty listing retires it.
+	if err := st.PublishRoster(ctx, nil, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// A transition buffered before it vanished, delivered after.
+	for _, late := range []domain.RosterAgent{
+		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "working", SeenAt: now},
+		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "working",
+			TerminalID: "term-a", SeenAt: now},
+	} {
+		if err := st.UpsertRosterAgent(ctx, late); err != nil {
+			t.Fatal(err)
+		}
+		agents, _, err := st.LiveRoster(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(agents) != 0 {
+			t.Fatalf("a late event with terminal %q brought a retired agent back: %+v",
+				late.TerminalID, agents)
+		}
+	}
+
+	// A real return is a PUBLISH, and that still works.
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, now); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err := st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Errorf("roster = %+v; a full listing must be able to bring an agent back", agents)
+	}
+}
+
+// An agent nothing has published yet still lands from its own event -- the
+// retirement rule bites only rows a publish already retired.
+func TestAnEventStillIntroducesANewAgent(t *testing.T) {
+	st := rosterStore(t)
+	ctx := context.Background()
+	if err := st.UpsertRosterAgent(ctx, domain.RosterAgent{
+		AgentID: "w1:p9", PaneID: "w1:p9", AgentType: "claude",
+		Status: "idle", SeenAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err := st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Errorf("roster = %+v; an agent nobody has listed yet is not a retired one", agents)
+	}
+}
