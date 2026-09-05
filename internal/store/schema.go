@@ -638,6 +638,9 @@ func (s *Store) migrate(between func() error) error {
 	// keys simply become unreachable. The remote-env picker's salient is
 	// verb-only by design and stays. Idempotent: matches zero rows once the
 	// old-format rows are gone.
+	if err := step(); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(
 		`DELETE FROM signature_embeddings
 		  WHERE situation_type = ?
@@ -664,6 +667,9 @@ func (s *Store) migrate(between func() error) error {
 	// turso database is created by builds that write the signatures row at
 	// decision time, so it never has the rows this repairs.
 	if s.engine == EngineSQLite {
+		if err := step(); err != nil {
+			return err
+		}
 		if _, err := s.db.Exec(
 			`INSERT OR IGNORE INTO signatures (signature, situation_type, agent_type,
 			    mode, consecutive_confirmations, cached_confidence, decision_floor_id,
@@ -676,7 +682,9 @@ func (s *Store) migrate(between func() error) error {
 			return fmt.Errorf("migrate backfill signature rows: %w", err)
 		}
 	}
-	return nil
+	// One last time AFTER the final write: a caller proving a lease must know
+	// it still held it when the last statement landed, not only before.
+	return step()
 }
 
 // SchemaCurrent reports whether every migration step has already been applied

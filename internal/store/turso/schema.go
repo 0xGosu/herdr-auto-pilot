@@ -106,6 +106,13 @@ func PrepareSharedSchema(ctx context.Context, db *DB, s SchemaOwner, now func() 
 				if err != nil {
 					return err
 				}
+				// And once more before the push that publishes the result: the
+				// background renewal's last verdict was only logged, and the
+				// migration's own final check ran before its last statement
+				// was pushed. Nothing is published under a lease not held.
+				if err := hold.verify(); err != nil {
+					return err
+				}
 				if err := releaseSchemaLease(ctx, db.DB(), s.NodeID()); err != nil {
 					slog.Warn("turso: schema lease not released; it expires on its own", "error", err)
 				}

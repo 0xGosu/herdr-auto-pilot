@@ -229,3 +229,81 @@ func TestALockedMigrationStepLosesTheLeaseAndFailsClosed(t *testing.T) {
 		t.Fatal("A completed its migration despite losing the lease")
 	}
 }
+
+// takeoverOwner is a SchemaOwner whose LAST step holds the real write lock past
+// the lease window (so the background renewal cannot land), during which
+// another node takes the lease — and which then returns success without a
+// further check, the way a final statement with no hook after it would.
+// PrepareSharedSchema must still refuse to publish.
+type takeoverOwner struct {
+	id      string
+	db      *DB
+	steal   func() error // runs while the write lock is held; makes B the owner
+	current atomic.Bool
+}
+
+func (o *takeoverOwner) NodeID() string                              { return o.id }
+func (o *takeoverOwner) SchemaCurrent(context.Context) (bool, error) { return o.current.Load(), nil }
+func (o *takeoverOwner) MigrateWith(between func() error) error {
+	ctx := context.Background()
+	if err := between(); err != nil {
+		return err
+	}
+	tx, err := o.db.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS hap_lease_test_scratch (x INTEGER)`); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO hap_lease_test_scratch (x) VALUES (2)`); err != nil {
+		tx.Rollback()
+		return err
+	}
+	stealErr := o.steal()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if stealErr != nil {
+		return stealErr
+	}
+	o.current.Store(true)
+	return nil // the migration itself never noticed
+}
+
+// TestALeaseTakenDuringTheFinalStepIsNotPublished: even when the migration
+// returns success, PrepareSharedSchema re-proves the lease before pushing —
+// and refuses when another node took it during the final, hook-less step.
+func TestALeaseTakenDuringTheFinalStepIsNotPublished(t *testing.T) {
+	ttl, renew, poll := schemaLeaseTTL, schemaLeaseRenew, schemaPollInterval
+	schemaLeaseTTL, schemaLeaseRenew, schemaPollInterval = 1500*time.Millisecond, 300*time.Millisecond, 300*time.Millisecond
+	t.Cleanup(func() { schemaLeaseTTL, schemaLeaseRenew, schemaPollInterval = ttl, renew, poll })
+
+	url := localSyncServer(t)
+	a := openLeaseNode(t, url, "aaaaaaaaaaaaaaaa")
+	if err := a.Push(); err != nil {
+		t.Fatal(err)
+	}
+	b := openLeaseNode(t, url, "bbbbbbbbbbbbbbbb")
+	ctx := context.Background()
+
+	owner := &takeoverOwner{id: "aaaaaaaaaaaaaaaa", db: a}
+	owner.steal = func() error {
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			got, err := AcquireSchemaLease(ctx, b, "bbbbbbbbbbbbbbbb", time.Now)
+			if err != nil {
+				return err
+			}
+			if got {
+				return nil
+			}
+		}
+		return errors.New("B could not take the lapsed lease")
+	}
+	err := PrepareSharedSchema(ctx, a, owner, time.Now)
+	if !errors.Is(err, ErrSchemaLeaseLost) {
+		t.Fatalf("PrepareSharedSchema = %v, want ErrSchemaLeaseLost from the post-migration proof", err)
+	}
+}
