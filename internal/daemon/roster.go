@@ -139,17 +139,22 @@ func (d *Daemon) startRosterTickPass(ctx context.Context) {
 //
 // Callers pass the agents they listed for their own reasons — the startup
 // reconcile, the sweep, the roster tick — so the ordinary path costs no extra
-// shell-out at all. Failure is logged, never propagated: publishing is
-// bookkeeping for a reader, and a front end that sees a stale roster degrades
-// to showing stale data, which domain.RosterFresh already bounds.
+// shell-out at all.
 //
-// Only the agent rows are written HERE, on the caller's goroutine. Everything
-// that shells out — the location labels, the per-agent working directories —
-// is handed to a background goroutine, because this runs on the daemon's
-// select loop and that loop handles every agent. The store also hands out very
-// few connections, so a transaction taken here is one the goroutine recording
-// an operator's actual work cannot have; that is not a theoretical cost, it is
-// what made a rename miss its deadline while a publish held the connection.
+// NOTHING is written here. The caller is usually the daemon's select loop, and
+// that loop handles every agent's transitions, nudges and timers; the store
+// hands out two connections and serializes writers, so a transaction taken on
+// the loop is one the goroutine recording an operator's actual work has to
+// wait for. That is not theoretical twice over: an inline publish made a
+// rename miss its deadline, and a publish committing between another
+// transaction's read and its write made the terminal-id sync fail outright
+// with "database is locked (517)" — a lost write nothing retried.
+//
+// So the listing is handed to a single background pass, and a listing arriving
+// while one runs REPLACES the pending one rather than queueing or being
+// dropped. Latest-wins is the correct rule for a snapshot: an older listing
+// can only describe a herd that has since moved on, and dropping it outright
+// would lose the vanish reconciliation only a full listing can perform.
 func (d *Daemon) publishRoster(ctx context.Context, agents []domain.AgentTransition) {
 	now := d.opt.Clock.Now()
 	rows := make([]domain.RosterAgent, 0, len(agents))
@@ -162,25 +167,8 @@ func (d *Daemon) publishRoster(ctx context.Context, agents []domain.AgentTransit
 		}
 		rows = append(rows, domain.RosterAgentFrom(tr, now))
 	}
-	if err := d.opt.Store.PublishRoster(ctx, rows, now); err != nil {
-		slog.Warn("roster: publishing failed", "error", err)
-		return
-	}
-	d.startRosterShellOuts(ctx, rows, now)
-}
-
-// startRosterShellOuts runs the half of a publish that costs subprocesses, once
-// at a time.
-//
-// The latch is the whole point. While a TUI is registered publishRoster runs
-// every rosterTickInterval, and one pass can outlive that interval on its own
-// budget — so an unlatched spawn would stack passes, each holding a transaction
-// on a two-connection pool, which is exactly the starvation moving this work
-// off the select loop was meant to end. A refused tick is not a lost update:
-// the pass already running is reading the same herd, and the next tick is two
-// seconds away.
-func (d *Daemon) startRosterShellOuts(ctx context.Context, rows []domain.RosterAgent, now time.Time) {
 	d.mu.Lock()
+	d.rosterPending = &rosterSnapshot{rows: rows, at: now}
 	if d.rosterPassRunning {
 		d.mu.Unlock()
 		return
@@ -188,22 +176,49 @@ func (d *Daemon) startRosterShellOuts(ctx context.Context, rows []domain.RosterA
 	d.rosterPassRunning = true
 	d.mu.Unlock()
 
-	cwdTTL, locationTTL := d.rosterShellOutTTLs()
 	if !d.spawn(func() {
 		defer func() {
 			d.mu.Lock()
 			d.rosterPassRunning = false
 			d.mu.Unlock()
 		}()
-		d.publishLocations(ctx, now, locationTTL)
-		d.refreshRosterCwds(ctx, rows, now, cwdTTL)
+		d.runRosterPasses(ctx)
 	}) {
-		// spawn refuses during shutdown, and the deferred release above never
-		// runs — release by hand, or a shutdown race would leave the latch set
-		// for the life of the process.
 		d.mu.Lock()
 		d.rosterPassRunning = false
 		d.mu.Unlock()
+	}
+}
+
+// rosterSnapshot is one listing waiting to be published.
+type rosterSnapshot struct {
+	rows []domain.RosterAgent
+	at   time.Time
+}
+
+// runRosterPasses publishes pending snapshots until none is left.
+//
+// The loop is what makes latest-wins safe: a listing that arrives while a pass
+// is running replaces the pending one and is picked up by this same goroutine
+// rather than being dropped, so the last thing the daemon saw is always what
+// ends up stored — including an empty listing, the only evidence that an agent
+// has vanished.
+func (d *Daemon) runRosterPasses(ctx context.Context) {
+	for {
+		d.mu.Lock()
+		snap := d.rosterPending
+		d.rosterPending = nil
+		d.mu.Unlock()
+		if snap == nil {
+			return
+		}
+		if err := d.opt.Store.PublishRoster(ctx, snap.rows, snap.at); err != nil {
+			slog.Warn("roster: publishing failed", "error", err)
+			continue
+		}
+		cwdTTL, locationTTL := d.rosterShellOutTTLs()
+		d.publishLocations(ctx, snap.at, locationTTL)
+		d.refreshRosterCwds(ctx, snap.rows, snap.at, cwdTTL)
 	}
 }
 

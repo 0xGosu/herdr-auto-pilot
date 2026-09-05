@@ -285,6 +285,12 @@ type Daemon struct {
 	// the life of the process.
 	rosterPassRunning bool
 
+	// rosterPending is the newest listing waiting to be published (guarded by
+	// mu). Latest-wins: a listing arriving while the pass runs replaces this
+	// rather than queueing, since an older snapshot can only describe a herd
+	// that has moved on.
+	rosterPending *rosterSnapshot
+
 	// rosterTickRunning latches the roster TICK's own goroutine (guarded by
 	// mu), which lists the herd before publishRoster can hand its shell-out
 	// half over. Same single-flight rule, one step earlier in the pass: the
@@ -1167,7 +1173,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		} else if n > 0 {
 			slog.Info("auto-accept: returned abandoned claims to the pending queue", "count", n)
 		}
-		d.reconcileAttention(ctx)
+		d.reconcileAttentionPublishing(ctx, true)
 		// The agent-action queue is recovered and drained LAST at startup,
 		// deliberately.
 		//
@@ -1578,17 +1584,33 @@ func (d *Daemon) scheduleCapture(ctx context.Context, tr domain.AgentTransition)
 // capture→classify→escalate path (like applyLLMRetry) exactly once per parked
 // episode. Runs on the sweep path, where ListAgents is already called.
 func (d *Daemon) reconcileAttention(ctx context.Context) {
+	d.reconcileAttentionPublishing(ctx, false)
+}
+
+// reconcileAttentionPublishing is reconcileAttention that may also record the
+// listing it made.
+//
+// Publishing is opt-in per caller rather than automatic, because this function
+// is also the NUDGE path — every operator action, and the daemon's own
+// self-nudges, land here. Publishing on each of those made the roster a
+// writer on the daemon's busiest path, competing for a store that hands out
+// two connections and admits one writer at a time; the herd is already
+// refreshed by the sweep every minute, and every two seconds while a TUI is
+// open, so those publishes bought nothing and cost the daemon's own
+// bookkeeping its turn at the lock.
+//
+// Startup passes true: it is the FIRST listing a freshly started daemon
+// makes, and without it a new install shows an empty herd until the first
+// sweep, since the front ends read the store and nothing else has written it.
+func (d *Daemon) reconcileAttentionPublishing(ctx context.Context, publish bool) {
 	agents, err := d.opt.Herdr.ListAgents(ctx)
 	if err != nil {
 		slog.Error("reconcile: listing agents failed", "error", err)
 		return
 	}
-	// This is the FIRST listing a freshly started daemon makes, so publishing
-	// here is what stops a new install showing an empty herd for up to a
-	// minute — the front ends read the store now, and nothing else would have
-	// written it until the first sweep. The nudge path lands here too, which
-	// is why a front end's own wake produces a current roster.
-	d.publishRoster(ctx, agents)
+	if publish {
+		d.publishRoster(ctx, agents)
+	}
 	d.reconcileAttentionWith(ctx, agents)
 }
 

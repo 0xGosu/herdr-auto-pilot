@@ -69,6 +69,34 @@ func escapeSQLiteURIPath(path string) string {
 
 func Open(path string) (*Store, error) {
 	dsn := "file:" + escapeSQLiteURIPath(path) + "?" + url.Values{
+		// Every transaction this package opens WRITES, so each one takes the
+		// write lock at BEGIN rather than upgrading to it later.
+		//
+		// The default (deferred) starts a transaction as a reader and asks for
+		// the write lock at the first write. If any other connection committed
+		// in between, the reader's snapshot is stale and SQLite answers
+		// SQLITE_BUSY_SNAPSHOT (517) — which busy_timeout deliberately does
+		// NOT retry, because waiting cannot make an outdated snapshot current.
+		// So the transaction fails outright, and callers that treat a store
+		// error as "log it and carry on" silently lose the write. Verified as
+		// `reconcile: terminal-id sync failed agent=pA error="database is
+		// locked (517)"`, which left an agent's FirstSeen unreset after its
+		// pane was recycled.
+		//
+		// Taking the lock up front turns that hard failure into a bounded wait
+		// under busy_timeout. It costs no concurrency: WAL admits exactly one
+		// writer at a time either way, so this only moves WHERE the wait
+		// happens. The hazard is as old as the mixed read-then-write
+		// transactions here; what made it routine was the roster publisher
+		// writing on the daemon's own cadence, which is why the publish has
+		// also moved off the select loop.
+		//
+		// Deliberately NOT covered by a test: every version that reproduced
+		// the 517 did so by saturating the write lock, which then times the
+		// other writer out at busy_timeout under BOTH modes — so the test
+		// passed either way and would have been a guard proving nothing. This
+		// stands on the observed failure above.
+		"_txlock": []string{"immediate"},
 		"_pragma": []string{
 			"busy_timeout(5000)",
 			"journal_mode(WAL)",
@@ -86,8 +114,22 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	// SQLite serializes writers; a small pool avoids needless SQLITE_BUSY.
-	db.SetMaxOpenConns(2)
+	// WAL admits ONE writer plus many concurrent readers, so the pool is sized
+	// for the readers; the writers serialize on SQLite's own lock either way.
+	//
+	// It used to be 2, which meant one writer and ONE reader for the whole
+	// process — every other reader queued behind them in database/sql, a
+	// bottleneck WAL does not require and SQLite never asked for. The daemon
+	// runs its select loop, the session-name sync, the action drain and the
+	// roster publisher against this pool at once; at 2 they took each other's
+	// turns, and a read waiting on an unrelated write is how a 3-second
+	// deadline is missed by a goroutine doing almost nothing.
+	//
+	// The old comment justified the cap as avoiding "needless SQLITE_BUSY",
+	// which the _txlock above now handles properly: a writer waits at BEGIN
+	// under busy_timeout instead of failing mid-transaction, so extra
+	// connections cost queueing rather than errors.
+	db.SetMaxOpenConns(8)
 	s := &Store{db: db, agentLockDir: filepath.Join(filepath.Dir(path), "agent-automation-locks")}
 	if err := s.migrate(); err != nil {
 		db.Close()
