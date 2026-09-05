@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -35,29 +36,59 @@ const rosterSeqUnknown = 1 << 30
 // would blank the column on every sweep and make the TTL pointless.
 func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, now time.Time) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		live := make(map[string]bool, len(agents))
-		for i, a := range agents {
-			live[a.AgentID] = true
-			var prevTerminal string
-			err := tx.QueryRowContext(ctx,
-				`SELECT terminal_id FROM agent_roster WHERE agent_id = ?`, a.AgentID).Scan(&prevTerminal)
-			switch {
-			case errors.Is(err, sql.ErrNoRows):
-				prevTerminal = ""
-			case err != nil:
+		// One query for the whole existing roster, not one per agent.
+		//
+		// Every transaction here takes the write lock at BEGIN and holds it
+		// until commit, so its STATEMENT COUNT is time every other writer in
+		// the process spends waiting. This runs on the daemon's own cadence
+		// against a herd of arbitrary size, so a per-agent SELECT made the
+		// hold time grow with the herd — and the goroutines waiting behind it
+		// are the ones recording an operator's actual work.
+		rows, err := tx.QueryContext(ctx,
+			`SELECT agent_id, terminal_id, gone_at FROM agent_roster`)
+		if err != nil {
+			return err
+		}
+		type stored struct {
+			terminal string
+			gone     int64
+		}
+		existing := map[string]stored{}
+		for rows.Next() {
+			var id string
+			var st stored
+			if err := rows.Scan(&id, &st.terminal, &st.gone); err != nil {
+				rows.Close()
 				return err
 			}
+			existing[id] = st
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		live := make(map[string]bool, len(agents))
+		var recycled []any
+		for _, a := range agents {
+			live[a.AgentID] = true
 			// A changed terminal is a NEW agent on a recycled id: keep nothing
 			// from the row it replaces. "Not observed" (either side empty) is
 			// not evidence of a change, so it carries over — the same rule
 			// agent_actions.terminal_id follows.
-			recycled := prevTerminal != "" && a.TerminalID != "" && prevTerminal != a.TerminalID
-			if recycled {
-				if _, err := tx.ExecContext(ctx,
-					`DELETE FROM agent_roster WHERE agent_id = ?`, a.AgentID); err != nil {
-					return err
-				}
+			prev := existing[a.AgentID].terminal
+			if prev != "" && a.TerminalID != "" && prev != a.TerminalID {
+				recycled = append(recycled, a.AgentID)
 			}
+		}
+		if len(recycled) > 0 {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM agent_roster WHERE agent_id IN (`+placeholders(len(recycled))+`)`,
+				recycled...); err != nil {
+				return err
+			}
+		}
+		for i, a := range agents {
 			// The publish is the only caller that KNOWS a position: it holds
 			// herdr's whole listing, in order — and the only one entitled to
 			// bring a retired agent back, for the same reason.
@@ -65,28 +96,18 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 				return err
 			}
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT agent_id FROM agent_roster WHERE gone_at = 0`)
-		if err != nil {
-			return err
-		}
-		var absent []string
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return err
-			}
-			if !live[id] {
+		// Everything not in the listing is marked gone, in one statement.
+		var absent []any
+		for id, st := range existing {
+			if st.gone == 0 && !live[id] {
 				absent = append(absent, id)
 			}
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		for _, id := range absent {
+		if len(absent) > 0 {
+			args := append([]any{unix(now)}, absent...)
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE agent_roster SET gone_at = ? WHERE agent_id = ?`, unix(now), id); err != nil {
+				`UPDATE agent_roster SET gone_at = ? WHERE agent_id IN (`+
+					placeholders(len(absent))+`)`, args...); err != nil {
 				return err
 			}
 		}
@@ -95,6 +116,14 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 			ON CONFLICT(id) DO UPDATE SET published_at = excluded.published_at`, unix(now))
 		return err
 	})
+}
+
+// placeholders renders n comma-separated SQL placeholders.
+func placeholders(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return strings.Repeat(",?", n)[1:]
 }
 
 // UpsertRosterAgent records ONE agent, without touching the rest of the roster.

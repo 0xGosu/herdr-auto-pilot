@@ -308,19 +308,20 @@ func TestTheRosterPublishDoesNotShellOutInline(t *testing.T) {
 	})
 	publishNow(t, h)
 
-	// The row is readable while herdr is still being asked for the cwd.
-	waitFor(t, 3*time.Second, func() bool {
-		agents, _ := liveRoster(t, h)
-		return len(agents) == 1
-	})
-	if got := h.herdr.paneInfoCallCount(); got == 0 {
-		t.Fatal("no pane-info lookup was in flight; the test proves nothing " +
-			"unless the row lands WHILE herdr is being asked")
-	}
+	// Wait for a lookup to be PARKED, then read: the row must already be
+	// there. Waiting on the row first and then checking for a lookup is the
+	// wrong order — it races the pass, which writes the row before it reaches
+	// herdr at all.
+	waitFor(t, 3*time.Second, func() bool { return h.herdr.paneInfoCallCount() > 0 })
 	agents, _ := liveRoster(t, h)
-	if a, ok := rosterByID(agents, "w1:p1"); !ok || a.Cwd != "" {
-		t.Errorf("roster = %+v; the row must be committed before the cwd "+
-			"lookup, not after it", agents)
+	a, ok := rosterByID(agents, "w1:p1")
+	if !ok {
+		t.Fatalf("roster = %+v; the row must be committed BEFORE the cwd lookup, "+
+			"and one is parked right now", agents)
+	}
+	if a.Cwd != "" {
+		t.Errorf("cwd = %q while the lookup that would produce it is still "+
+			"parked", a.Cwd)
 	}
 
 	// And the cwd catches up behind it.
