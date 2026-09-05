@@ -158,10 +158,13 @@ func (a *App) confirmationWeight() float64 {
 
 // Status summarizes daemon-relevant state.
 type Status struct {
-	Paused             bool
-	LatestKill         *domain.KillEvent
-	PendingEscalations int
-	MonitoredAgents    []domain.AgentTransition
+	Paused     bool
+	LatestKill *domain.KillEvent
+	// PendingEscalations counts the whole fleet's pending rows under a shared
+	// store; PendingEscalationsHere is this node's share of them.
+	PendingEscalations     int
+	PendingEscalationsHere int
+	MonitoredAgents        []domain.AgentTransition
 	// AgentsKnown reports that MonitoredAgents actually reflects herdr: false
 	// means no daemon has published a roster recently enough to trust, which
 	// is NOT the same as "no agents are running" — an empty MonitoredAgents
@@ -799,7 +802,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 		if self := a.Store.NodeID(); audit.NodeID != "" && audit.NodeID != self {
 			return fmt.Errorf("%w: this generated-task suggestion belongs to node %s — its list and task "+
 				"source live there, so confirm it on that machine (`hap confirm %d`)",
-				ErrRemoteAgent, a.nodeLabelFor(ctx, audit.NodeID), auditID)
+				ErrRemoteAgent, a.NodeLabelFor(ctx, audit.NodeID), auditID)
 		}
 		return a.acceptGeneratedTask(ctx, audit, send, false, nil)
 	}
@@ -3795,15 +3798,67 @@ func (a *App) taskListFor(agent, path string) (locator, sourceIndex string, err 
 		}
 		return l.Locator, strconv.Itoa(idx), nil
 	}
-	src, idx, err := resolveTaskSourceFor(cfg, agent)
+	// The operator may type either spelling of an agent — herdr's pane id or
+	// hap's short name — and a source selector may name either. The DERIVED
+	// list, though, is always named after the NAME: that is what the daemon
+	// derives on hand-out, so resolving it from an id here would open a list
+	// nobody ever reads (verified live: `hap task a1 add` refused to create
+	// "a1.md" while the daemon served "lively-mole.md").
+	id, name := a.agentSpellings(agent)
+	src, idx, err := resolveTaskSourceForAny(cfg, agent, id, name)
 	if err != nil {
 		return "", "", err
 	}
-	l, err := a.resolveSourceList(cfg, src, agent)
+	l, err := a.resolveSourceList(cfg, src, name)
 	if err != nil {
 		return "", "", err
 	}
 	return l.Locator, strconv.Itoa(idx), nil
+}
+
+// agentSpellings resolves a task target to the two spellings hap knows an
+// agent by — its id and its short name — from the names registry. A target
+// hap has never seen has only itself.
+func (a *App) agentSpellings(target string) (id, name string) {
+	if a.Store == nil {
+		return target, target
+	}
+	names, err := a.Store.AgentNames(context.Background())
+	if err != nil {
+		return target, target
+	}
+	if n, ok := names[target]; ok && n != "" {
+		return target, n
+	}
+	for id, n := range names {
+		if n == target {
+			return id, n
+		}
+	}
+	return target, target
+}
+
+// resolveTaskSourceForAny is resolveTaskSourceFor over every spelling of one
+// agent, first match wins; the first spelling's error stands when none does.
+// An ambiguity (several sources) is returned as such, never papered over by a
+// later spelling matching exactly one.
+func resolveTaskSourceForAny(cfg config.Config, spellings ...string) (config.TaskSource, int, error) {
+	var firstErr error
+	seen := map[string]bool{}
+	for _, s := range spellings {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		src, idx, err := resolveTaskSourceFor(cfg, s)
+		if err == nil {
+			return src, idx, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return config.TaskSource{}, 0, firstErr
 }
 
 // mutateTask applies one locked read-modify-write to a task list through the
@@ -4470,6 +4525,11 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 // the one whose pane has closed, which is exactly the set TaskGroups resolves
 // a row's locator from.
 func (a *App) sourceForLocator(cfg config.Config, agent, locator string) (config.TaskSource, string, bool) {
+	if agent != "" {
+		// A derived list is named after the agent's NAME, whichever spelling
+		// the caller addressed it by (see taskListFor).
+		_, agent = a.agentSpellings(agent)
+	}
 	for _, src := range cfg.TaskSources {
 		if a.sourceLocatorMatches(cfg, src, agent, locator) {
 			return src, agent, true

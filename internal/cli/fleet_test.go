@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -281,5 +282,52 @@ func TestAuditAndKillHistoryNameTheNodeLast(t *testing.T) {
 	}
 	if !strings.Contains(out, "\tglobal\tnode=laptop") {
 		t.Errorf("kill history must end each row with its node:\n%s", out)
+	}
+}
+
+// TestRemoteAnswersNameTheNodeAndStatusSplitsTheCount: answering another
+// machine's escalation says which machine acts on it, and `hap status` says
+// how many of the fleet's pending escalations are this machine's.
+func TestRemoteAnswersNameTheNodeAndStatusSplitsTheCount(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	other, err := store.OpenAs(filepath.Join(filepath.Dir(app.ConfigPath), "t.db"), "bbbbbbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := other.UpsertNode(ctx, domain.NodeInfo{Label: "laptop", LastSeen: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNode(ctx, domain.NodeInfo{Label: "here", LastSeen: now}); err != nil {
+		t.Fatal(err)
+	}
+	remoteID, err := other.AppendAudit(ctx, domain.AuditRecord{AgentID: "1", AgentType: "claude", Trigger: "t",
+		SituationType: domain.SituationApproval, Action: domain.AuditActionEscalated, Status: "escalated",
+		Suggestion: "respond: Yes", PaneExcerpt: "Allow? 1. Yes 2. No", CreatedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AppendAudit(ctx, domain.AuditRecord{AgentID: "2", AgentType: "claude", Trigger: "t",
+		SituationType: domain.SituationApproval, Action: domain.AuditActionEscalated, Status: "escalated",
+		Suggestion: "respond: Yes", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "pending escalations: 2 (1 on this node)") {
+		t.Errorf("status must split the fleet count by node:\n%s", out)
+	}
+
+	out, err = run(t, app, "resolve", strconv.FormatInt(remoteID, 10), "--action", "y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "on node laptop") {
+		t.Errorf("a remote answer must name the node acting on it:\n%s", out)
 	}
 }

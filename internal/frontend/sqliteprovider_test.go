@@ -135,3 +135,40 @@ func TestFleetTaskGroupsShowAndEditAnotherNodesList(t *testing.T) {
 		t.Errorf("ListTasks over the locator = %+v, %v", items, err)
 	}
 }
+
+// TestTaskTargetsAcceptEitherSpellingOfTheAgent: a source's selector may name
+// the agent's pane id while the operator types its name, or the reverse — and a
+// DERIVED list is named after the NAME either way, exactly as the daemon
+// derives it on hand-out. Found live: `hap task a1 add` refused to create
+// "a1.md" while the daemon served "lively-mole.md".
+func TestTaskTargetsAcceptEitherSpellingOfTheAgent(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	if err := os.WriteFile(app.ConfigPath, []byte(
+		"[task_source_provider]\nprovider = \"sqlite\"\n\n[[task_sources]]\nagent = \"a1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AssignAgentName(ctx, "a1", "lively-mole"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.AddTask("a1", "", "added by id"); err != nil {
+		t.Fatalf("add by pane id: %v", err)
+	}
+	if _, _, err := app.AddTask("lively-mole", "", "added by name"); err != nil {
+		t.Fatalf("add by name: %v", err)
+	}
+	l, err := st.ReadTaskList(ctx, st.NodeID(), "lively-mole.md")
+	if err != nil {
+		t.Fatalf("the list must be derived from the NAME: %v", err)
+	}
+	if !strings.Contains(l.Content, "added by id") || !strings.Contains(l.Content, "added by name") {
+		t.Errorf("both adds must land on one list, got %q", l.Content)
+	}
+	if _, err := st.ReadTaskList(ctx, st.NodeID(), "a1.md"); err == nil {
+		t.Error("a list named after the pane id must never be created")
+	}
+	items, err := app.ListTasks("a1", "")
+	if err != nil || len(items) != 2 {
+		t.Errorf("ListTasks by id = %d items, %v", len(items), err)
+	}
+}

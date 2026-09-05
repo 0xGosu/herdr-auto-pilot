@@ -892,7 +892,12 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 			fmt.Fprintf(out, "daemon:              %s\n", label)
 		}
 	}
-	fmt.Fprintf(out, "pending escalations: %d\n", st.PendingEscalations)
+	if len(st.Nodes) > 1 {
+		// Fleet-wide under a shared store, so say how many are this machine's.
+		fmt.Fprintf(out, "pending escalations: %d (%d on this node)\n", st.PendingEscalations, st.PendingEscalationsHere)
+	} else {
+		fmt.Fprintf(out, "pending escalations: %d\n", st.PendingEscalations)
+	}
 	// The count alone cannot say whether 0 means "nothing is running" or
 	// "nobody has looked", which is the whole reason the roster records when
 	// it was published.
@@ -1346,8 +1351,10 @@ func confirm(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 	// idle), so confirming without --send is the way to accept a suggestion for
 	// a busy agent without interrupting it (issue #180).
 	genTask := false
+	where := ""
 	if audit, gerr := app.Store.GetAudit(ctx, id); gerr == nil && audit != nil {
 		genTask = strings.HasPrefix(audit.Suggestion, domain.SuggestTaskPrefix)
+		where = remoteNodeSuffix(ctx, app, audit)
 	}
 	if err := app.Confirm(ctx, id, *send); err != nil {
 		// A [no_task_source] row with no suggestion is a NOTICE, not a failed
@@ -1363,11 +1370,11 @@ func confirm(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 	}
 	switch {
 	case genTask && *send:
-		fmt.Fprintf(out, "confirmed escalation #%d — added the suggested task(s) to the agent's task list and sent the first\n", id)
+		fmt.Fprintf(out, "confirmed escalation #%d — added the suggested task(s) to the agent's task list and sent the first%s\n", id, where)
 	case genTask:
-		fmt.Fprintf(out, "confirmed escalation #%d — added the suggested task(s) to the agent's task list (not sent)\n", id)
+		fmt.Fprintf(out, "confirmed escalation #%d — added the suggested task(s) to the agent's task list (not sent)%s\n", id, where)
 	default:
-		fmt.Fprintf(out, "confirmed escalation #%d (recorded as a learning event)\n", id)
+		fmt.Fprintf(out, "confirmed escalation #%d (recorded as a learning event)%s\n", id, where)
 	}
 	PrintNextSteps(out, confirmNextSteps)
 	return nil
@@ -1392,11 +1399,25 @@ func resolve(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 	if err != nil {
 		return fmt.Errorf("invalid audit id %q", idArg)
 	}
+	where := ""
+	if audit, gerr := app.Store.GetAudit(ctx, id); gerr == nil && audit != nil {
+		where = remoteNodeSuffix(ctx, app, audit)
+	}
 	if err := app.Resolve(ctx, id, *action, *send); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "recorded correction for audit #%d: %q\n", id, *action)
+	fmt.Fprintf(out, "recorded correction for audit #%d: %q%s\n", id, *action, where)
 	return nil
+}
+
+// remoteNodeSuffix names the machine whose daemon acts on an escalation that
+// belongs to another node, so an operator answering from here reads where the
+// answer went. "" for this node's own rows (and rows predating node ids).
+func remoteNodeSuffix(ctx context.Context, app *frontend.App, audit *domain.AuditRecord) string {
+	if audit == nil || audit.NodeID == "" || audit.NodeID == app.Store.NodeID() {
+		return ""
+	}
+	return " — on node " + app.NodeLabelFor(ctx, audit.NodeID)
 }
 
 // splitLeadingID lets verbs accept `<id>` before flags (Go's flag package

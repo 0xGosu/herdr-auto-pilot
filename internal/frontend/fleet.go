@@ -108,8 +108,12 @@ func (a *App) fillFleet(ctx context.Context, st *Status) {
 			st.SelfLabel = domain.NodeLabelOrID(n)
 		}
 	}
+	st.PendingEscalationsHere = st.PendingEscalations
 	if len(nodes) < 2 {
 		return
+	}
+	if here, err := a.Store.CountPendingEscalationsOn(ctx, st.NodeID); err == nil {
+		st.PendingEscalationsHere = int(here)
 	}
 	if names, err := a.Store.FleetAgentNames(ctx); err == nil {
 		st.FleetNames = names
@@ -220,9 +224,9 @@ func (a *App) refuseRemoteTarget(ctx context.Context, target, verb string) error
 	return nil
 }
 
-// nodeLabelFor renders a node id for an error message: its label when the
+// NodeLabelFor renders a node id for operator-facing text: its label when the
 // nodes table knows it, else the id's first eight characters.
-func (a *App) nodeLabelFor(ctx context.Context, nodeID string) string {
+func (a *App) NodeLabelFor(ctx context.Context, nodeID string) string {
 	if nodes, err := a.Store.ListNodes(ctx); err == nil {
 		for _, n := range nodes {
 			if n.ID == nodeID {
