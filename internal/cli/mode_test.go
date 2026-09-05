@@ -254,16 +254,23 @@ func TestAgentsListsMode(t *testing.T) {
 	}
 	// The mode is APPENDED, so cwd keeps its field index — inserting it mid-row
 	// would silently break every existing `cut -f6` reading a working directory.
-	if !strings.HasSuffix(rows[0], "\tacceptEdits") {
-		t.Errorf("claude row = %q, want the mode as the LAST field", rows[0])
-	}
-	if !strings.HasSuffix(rows[1], "\t-") {
-		t.Errorf("row for an agent with no mode toggle = %q, want a trailing dash", rows[1])
-	}
+	// The node label is appended AFTER the mode for the same reason (field 8),
+	// so the mode is pinned by index rather than as the row's suffix.
 	for i, row := range rows {
-		if got := strings.Split(row, "\t"); len(got) != 7 || got[5] != "-" {
-			t.Errorf("row %d = %q: want 7 fields with cwd still in field 6", i, row)
+		got := strings.Split(row, "\t")
+		if len(got) != 8 || got[5] != "-" {
+			t.Errorf("row %d = %q: want 8 fields with cwd still in field 6", i, row)
+			continue
 		}
+		if want := st.NodeID()[:8]; got[7] != want {
+			t.Errorf("row %d = %q: want the node label %q in field 8", i, row, want)
+		}
+	}
+	if got := strings.Split(rows[0], "\t"); len(got) == 8 && got[6] != "acceptEdits" {
+		t.Errorf("claude row = %q, want the mode in field 7", rows[0])
+	}
+	if got := strings.Split(rows[1], "\t"); len(got) == 8 && got[6] != "-" {
+		t.Errorf("row for an agent with no mode toggle = %q, want a dash in field 7", rows[1])
 	}
 	if got, want := strings.Count(rows[0], "\t"), strings.Count(rows[1], "\t"); got != want {
 		t.Errorf("column counts differ (%d vs %d): %q / %q", got, want, rows[0], rows[1])

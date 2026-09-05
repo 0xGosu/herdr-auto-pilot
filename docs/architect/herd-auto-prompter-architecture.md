@@ -801,6 +801,7 @@ erDiagram
 | **signature_snapshots** | Pane-excerpt provenance per signature (inspection/debugging) |
 | **task_reservations** | The `[-]` a daemon hand-out wrote, with the `terminal_id` that owns it — only a reservation hap itself holds may be released |
 | **task_handouts** | Durable ledger of unattended hand-outs (FR-011): confirms on a `working` transition, drives the ~2-min reclaim, and enforces the 3-hand-out ceiling |
+| **task_lists** | The `sqlite` task-source provider's checklists: one row per `(node_id, name)` holding the whole markdown list, an `agent_name` label and a `revision` every write compare-and-swaps on (no file lock). Addressed as `db://<node>/<name>`; node-owned like every operational table, but an operator on another node may edit a row through the unified Tasks view — the owning daemon re-reads before each hand-out. Under the turso engine these rows sync with everything else |
 | **agent_names** | Friendly short-name mapping + per-agent disabled flag + terminal id |
 | **operator** | Single operator identity row anchoring correction/kill authorship |
 

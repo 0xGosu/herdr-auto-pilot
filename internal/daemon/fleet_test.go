@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
+	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
@@ -188,5 +189,16 @@ func TestRemoteWatcherRaisesRosterCadenceToTheSyncInterval(t *testing.T) {
 	}
 	if lvl := d.rosterDemandLevel(); lvl != rosterDemandNone {
 		t.Fatalf("demand with an expired remote stamp = %v, want none", lvl)
+	}
+}
+
+// nudgeDaemon wakes the daemon over its control socket, the way a front end
+// does after filing an action. The roster publisher no longer rides the nudge
+// path (#388), but the agent-action drain still does — which is what these
+// tests exercise.
+func nudgeDaemon(t *testing.T, h *harness) {
+	t.Helper()
+	if err := control.Nudge(context.Background(), h.ctlPath, control.KindWake); err != nil {
+		t.Fatal(err)
 	}
 }

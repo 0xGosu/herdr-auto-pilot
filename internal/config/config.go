@@ -616,13 +616,20 @@ type Embedding struct {
 const (
 	ProviderLocalFS    = "local_fs"
 	ProviderGitHubGist = "github_gist"
+	// ProviderSQLite keeps a source's checklist INSIDE hap's own database
+	// (the task_lists table) rather than in a file. Under the default sqlite
+	// engine that is the local database; under engine = "turso" the rows sync
+	// with everything else, so every machine's TUI sees — and can edit — every
+	// other machine's queues. Lists are node-scoped: the daemon that owns a
+	// node is the only one handing its items out.
+	ProviderSQLite = "sqlite"
 )
 
 // ValidTaskSourceProviders are the values a provider key accepts, in display
 // order. Mirrors ValidThemes: `hap config set` and the TUI picker validate
 // against it, while a hand-edited config.toml still LOADS an unrecognized
 // value and fails at use time (see ValidateTaskSource).
-var ValidTaskSourceProviders = []string{ProviderLocalFS, ProviderGitHubGist}
+var ValidTaskSourceProviders = []string{ProviderLocalFS, ProviderGitHubGist, ProviderSQLite}
 
 // Database engines.
 const (
@@ -863,10 +870,18 @@ type ResolvedProvider struct {
 	GistIDInherited bool
 }
 
-// Remote reports whether this provider's reads and writes leave the machine.
-// It is the single definition, so a third backend is remote by adding one case
-// rather than by every call site guessing.
+// Remote reports whether this provider's lists are NOT files on this machine:
+// a source's path then names a list INSIDE the store rather than a filesystem
+// path, an empty path derives one list per matched agent, and `--path` cannot
+// reach the list. It is the single definition, so every call site that asks
+// "is this a file?" agrees. It does not mean the calls leave the machine —
+// the sqlite provider's rows live in hap's own database — which is why the
+// rules that exist for a NETWORK backend (the Windows lock refusal, the
+// credential file) are gated on the gist provider by name instead.
 func (r ResolvedProvider) Remote() bool { return r.Name != ProviderLocalFS }
+
+// Egress reports whether this provider's reads and writes leave the machine.
+func (r ResolvedProvider) Egress() bool { return r.Name == ProviderGitHubGist }
 
 // ResolveProvider returns the effective storage configuration for src,
 // applying the [task_source_provider] defaults to every field the entry leaves
@@ -1128,12 +1143,13 @@ func ValidateTaskSource(cfg Config, src TaskSource) error {
 		}
 		return nil
 	}
-	if runtime.GOOS == "windows" {
+	if p.Egress() && runtime.GOOS == "windows" {
 		// lock_windows.go's Lock is a no-op, so nothing serializes two hap
 		// processes there. That is survivable over a local file (the atomic
 		// rename still prevents a torn write) but not over a two-round-trip
 		// read-modify-write against a store with no compare-and-swap, where the
-		// loser is silently overwritten. Refuse rather than corrupt.
+		// loser is silently overwritten. Refuse rather than corrupt. The sqlite
+		// provider needs no such lock: its writes compare-and-swap a revision.
 		return fmt.Errorf("provider=%s is not supported on Windows: hap has no cross-process "+
 			"file lock there, and a remote checklist needs one to avoid losing concurrent edits", p.Name)
 	}
@@ -1207,7 +1223,9 @@ func ValidateResolvedProvider(cfg Config, index int, src TaskSource) error {
 			"(hap config set task_source_provider.provider <name>)",
 			p.Name, strings.Join(ValidTaskSourceProviders, ", "))
 	}
-	if !p.Remote() {
+	if !p.Egress() {
+		// local_fs needs nothing; the sqlite provider needs only the store,
+		// which the task-store registry checks for when it builds the backend.
 		return nil
 	}
 	// Duplicated from ValidateTaskSource on purpose. That one runs on WRITE

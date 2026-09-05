@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -900,6 +901,21 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	} else {
 		fmt.Fprintf(out, "monitored agents:    %d\n", len(st.MonitoredAgents))
 	}
+	// Only when the store is shared: one node is the normal case and needs
+	// no line. Paused remote nodes are named — a paused herd somewhere else is
+	// exactly what an operator looking at one screen would otherwise miss.
+	if total, stale := st.RemoteNodes(time.Now()); total > 0 {
+		fmt.Fprintf(out, "other nodes:         %d (%d stale, %d agents)", total, stale, len(st.RemoteAgents))
+		var paused []string
+		for id := range st.PausedNodes {
+			paused = append(paused, st.NodeLabel(id))
+		}
+		if len(paused) > 0 {
+			sort.Strings(paused)
+			fmt.Fprintf(out, "; paused: %s", strings.Join(paused, ", "))
+		}
+		fmt.Fprintln(out)
+	}
 	// Where task lists live, and why they cannot be reached when they cannot.
 	// `hap status` is the surface an operator runs first, so a broken store
 	// becomes visible without having to think to run `task-source provider`.
@@ -1062,8 +1078,25 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		if cwd == "" {
 			cwd = "-"
 		}
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			name, a.AgentID, a.AgentType, a.Status, automation, cwd, mode)
+		// The node label is the LAST field, after mode, for the same reason
+		// mode came after cwd: nothing already parsing this row moves.
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			name, a.AgentID, a.AgentType, a.Status, automation, cwd, mode, st.NodeLabel(st.NodeID))
+	}
+	// Other machines' agents, as their daemons published them, after ours.
+	// Their mode is never read remotely, and a node whose daemon has stopped
+	// reporting says so in the status field rather than pretending to be live.
+	for _, r := range st.RemoteAgents {
+		automation := "enabled"
+		if r.Disabled {
+			automation = "disabled"
+		}
+		status := r.Status
+		if r.Stale {
+			status += " (stale)"
+		}
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			orDashCLI(r.Name), r.AgentID, r.AgentType, status, automation, orDashCLI(r.Cwd), "-", r.NodeLabel)
 	}
 	// The first column is the handle every other command takes, so the footer
 	// spells the follow-ups with <agent> in that position.
@@ -1099,16 +1132,16 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 		})
 		return nil
 	}
-	names, err := app.Names(ctx)
+	// The status snapshot carries every node's names, so a row another machine
+	// raised is labelled name@node rather than mislabelled with a local agent
+	// that happens to share its pane id.
+	st, err := app.GetStatus(ctx)
 	if err != nil {
-		names = map[string]string{}
+		return err
 	}
 	rules, gradN := ruleIndex(ctx, app)
 	for _, e := range esc {
-		agent := e.AgentID
-		if n := names[e.AgentID]; n != "" {
-			agent = n
-		}
+		agent := st.EscalationAgent(e)
 		rule := "none yet"
 		if row, ok := rules[e.Signature]; ok {
 			rule = frontend.RuleSummary(row, gradN)
@@ -1117,9 +1150,9 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 				rule += "; " + via
 			}
 		}
-		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\tagent=%s\tllm=%s\tsuggestion=%q\trule=[%s]\n",
+		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\tagent=%s\tllm=%s\tsuggestion=%q\trule=[%s]\tnode=%s\n",
 			e.ID, e.CreatedAt.Format("15:04:05"), e.SituationType, e.Rationale, agent,
-			llmConfCLI(e.LLMConfidence), e.Suggestion, rule)
+			llmConfCLI(e.LLMConfidence), e.Suggestion, rule, st.NodeLabel(e.NodeID))
 		// Embedding failure is shown even without a matched rule — it explains
 		// why a paraphrase may have failed to match semantically.
 		if e.EmbedError != "" {
@@ -1581,7 +1614,7 @@ func printTaskStoreLine(out io.Writer, cfg config.Config) {
 	}
 	def := cfg.ResolveProvider(config.TaskSource{})
 	fmt.Fprintf(out, "task store: default %s", def.Name)
-	if def.Remote() {
+	if def.Egress() {
 		fmt.Fprintf(out, " gist=%s env_file=%s", shortGistID(def.GistID), describeEnvFile(def.EnvFile))
 	}
 	overrides := 0
@@ -1609,12 +1642,17 @@ func taskSourceLocation(p config.ResolvedProvider, path string) string {
 	if !p.Remote() {
 		return "path=" + path
 	}
+	// A list inside a store: a gist file, or a row in the hap database.
+	key := "gist_file"
+	if p.Name == config.ProviderSQLite {
+		key = "db_list"
+	}
 	if path == "" {
 		// The literal angle brackets are the point: this row has no single
 		// file, it has one per matched agent.
-		return "gist_file=<agent-name>.md (per matched agent)"
+		return key + "=<agent-name>.md (per matched agent)"
 	}
-	return fmt.Sprintf("gist_file=%q", path)
+	return fmt.Sprintf("%s=%q", key, path)
 }
 
 // printDiskLine reports what hap is using disk for, and under what retention.
@@ -1904,7 +1942,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		if showProvider {
 			def := cfg.ResolveProvider(config.TaskSource{})
 			fmt.Fprintf(out, "provider default: %s", def.Name)
-			if def.Remote() {
+			if def.Egress() {
 				fmt.Fprintf(out, " gist_id=%s env_file=%s", shortGistID(def.GistID), describeEnvFile(def.EnvFile))
 			}
 			fmt.Fprintln(out)
@@ -1923,7 +1961,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 				fmt.Fprintf(out, " provider=%s(%s)", p.Name, origin)
 				// The default's gist is already in the header; repeating it on
 				// every row is noise, so only an override is shown.
-				if p.Remote() && !p.GistIDInherited {
+				if p.Egress() && !p.GistIDInherited {
 					fmt.Fprintf(out, " gist_id=%s(override)", shortGistID(p.GistID))
 				}
 			}
@@ -2164,6 +2202,11 @@ func describeAddedSource(p config.ResolvedProvider, path string, inherited bool)
 	switch {
 	case !p.Remote():
 		where = path
+	case p.Name == config.ProviderSQLite && path != "":
+		where = fmt.Sprintf("%q in the hap database (shared by every agent this source matches)", path)
+	case p.Name == config.ProviderSQLite:
+		where = fmt.Sprintf("one list per matched agent (%q in the hap database, created on first hand-out)",
+			"<agent-name>.md")
 	case path != "":
 		where = fmt.Sprintf("%q in gist %s (shared by every agent this source matches)",
 			path, shortGistID(p.GistID))
@@ -2237,7 +2280,7 @@ func taskSourceProvider(app *frontend.App, out io.Writer) error {
 	}
 	def := cfg.ResolveProvider(config.TaskSource{})
 	fmt.Fprintf(out, "default provider: %s\n", def.Name)
-	if def.Remote() {
+	if def.Egress() {
 		fmt.Fprintf(out, "default gist_id:  %s\n", shortGistID(def.GistID))
 		fmt.Fprintf(out, "env_file:         %s\n", describeEnvFile(def.EnvFile))
 	}
@@ -2473,9 +2516,19 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 // Every mutating op re-prints the renumbered list so the caller always sees
 // fresh numbers.
 func task(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	agent, path, rest, err := taskTarget(args)
+	agent, path, node, rest, err := taskTarget(args)
 	if err != nil {
 		return err
+	}
+	if node != "" {
+		// Another node's database-kept list: resolved to its locator, then
+		// handled exactly like a --path target — the locator is the address
+		// every op and every hint can re-run verbatim.
+		locator, err := app.NodeTaskList(ctx, node, agent)
+		if err != nil {
+			return err
+		}
+		agent, path = "", locator
 	}
 	if err := taskOp(ctx, app, out, agent, path, rest); err != nil {
 		return err
@@ -2541,7 +2594,7 @@ func taskHints(agent, path string, listing bool) []Hint {
 
 // taskOp runs one checklist operation against an already-resolved target.
 func taskOp(ctx context.Context, app *frontend.App, out io.Writer, agent, path string, args []string) error {
-	usage := "usage: task [<agent> | <source-index> | --path <file>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | move <n> <position|up|down> | send <n> [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>; <source-index> is a position from `hap config task-source list` (e.g. 0)\nsee: hap help task"
+	usage := "usage: task [<agent> | <source-index> | --path <file> | --node <node> <agent>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | move <n> <position|up|down> | send <n> [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>; <source-index> is a position from `hap config task-source list` (e.g. 0)\nsee: hap help task"
 	if agent == "" && path == "" {
 		return fmt.Errorf("%s", usage)
 	}
@@ -2748,22 +2801,39 @@ func oneLineText(s string, limit int) string {
 // taskTarget peels the leading target off a `task` argument list: either
 // --path <file> (also --path=<file>) or a positional <agent>. It returns the
 // resolved agent/path and the remaining args (the op and its arguments).
-func taskTarget(args []string) (agent, path string, rest []string, err error) {
+func taskTarget(args []string) (agent, path, node string, rest []string, err error) {
 	if len(args) == 0 {
-		return "", "", nil, nil
+		return "", "", "", nil, nil
 	}
 	switch {
 	case args[0] == "--path" || args[0] == "-path":
 		if len(args) < 2 {
-			return "", "", nil, fmt.Errorf("--path requires a file argument")
+			return "", "", "", nil, fmt.Errorf("--path requires a file argument")
 		}
-		return "", args[1], args[2:], nil
+		return "", args[1], "", args[2:], nil
 	case strings.HasPrefix(args[0], "--path="):
-		return "", strings.TrimPrefix(args[0], "--path="), args[1:], nil
+		return "", strings.TrimPrefix(args[0], "--path="), "", args[1:], nil
+	case args[0] == "--node" || strings.HasPrefix(args[0], "--node="):
+		// --node <node> <agent> …: another machine's list, kept in the shared
+		// database by a `sqlite`-provider source. The agent (or list name)
+		// that follows is required — a node alone names no list.
+		var rest []string
+		if args[0] == "--node" {
+			if len(args) < 2 {
+				return "", "", "", nil, fmt.Errorf("--node requires a node (label or id) argument")
+			}
+			node, rest = args[1], args[2:]
+		} else {
+			node, rest = strings.TrimPrefix(args[0], "--node="), args[1:]
+		}
+		if len(rest) == 0 || strings.HasPrefix(rest[0], "-") {
+			return "", "", "", nil, fmt.Errorf("--node %s needs the agent (or list name) whose list to open before the task op", node)
+		}
+		return rest[0], "", node, rest[1:], nil
 	case strings.HasPrefix(args[0], "-"):
-		return "", "", nil, fmt.Errorf("expected an agent name, a task-source index, or --path <file> before the task op, got %q", args[0])
+		return "", "", "", nil, fmt.Errorf("expected an agent name, a task-source index, --path <file>, or --node <node> <agent> before the task op, got %q", args[0])
 	default:
-		return args[0], "", args[1:], nil
+		return args[0], "", "", args[1:], nil
 	}
 }
 
@@ -3022,12 +3092,28 @@ func taskList(app *frontend.App, out io.Writer, agent, path string, args []strin
 	// fallback selector the hints offer is the task-source INDEX, which works
 	// under every provider — --path reads a local file and under a remote one
 	// names something that does not exist.
-	if tasklocator.Remote(resolved) {
+	switch {
+	case agent == "" && isDBLocator(resolved):
+		// Another node's database list, opened with --node (or its locator):
+		// the agent is not on this machine, so the remote hints' `<agent>`
+		// placeholder would send the operator to a name hap here cannot
+		// resolve. The locator itself IS re-runnable through --path — a
+		// scheme'd string is passed to the store verbatim — so the hints
+		// spell that.
+		fmt.Fprint(out, "\n"+domain.TaskManagementHints("", resolved, sourceIndex))
+	case tasklocator.Remote(resolved):
 		fmt.Fprint(out, "\n"+domain.RemoteTaskManagementHints(agent, tasklocator.Display(resolved), sourceIndex))
-	} else {
+	default:
 		fmt.Fprint(out, "\n"+domain.TaskManagementHints(agent, resolved, sourceIndex))
 	}
 	return nil
+}
+
+// isDBLocator reports whether a resolved task-list address names a list kept in
+// the hap database (db://<node>/<name>).
+func isDBLocator(locator string) bool {
+	_, ok := tasklocator.ParseDB(locator)
+	return ok
 }
 
 // formatTask renders one item, preserving its raw checkbox rune so an
@@ -3110,4 +3196,13 @@ func reloadNote(reloaded bool) string {
 		return " (daemon reloaded)"
 	}
 	return " (saved — no daemon running; it takes effect when the daemon starts)"
+}
+
+// orDashCLI renders an optional value as "-" so tab-separated rows keep their
+// field count.
+func orDashCLI(v string) string {
+	if v == "" {
+		return "-"
+	}
+	return v
 }

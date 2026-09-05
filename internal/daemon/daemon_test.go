@@ -4668,3 +4668,25 @@ func TestAutoActRemoteEnvWithoutKeystrokesEscalates(t *testing.T) {
 		t.Fatalf("no keystroke path exists on this adapter, sent %v", h.herdr.keysSent())
 	}
 }
+
+// The sqlite task-source provider is an OPTIONAL store capability the daemon
+// type-asserts for (ports.TaskListStore). failingStore embeds the StorePort
+// INTERFACE, so without these forwarders the assertion fails and the provider
+// is silently off across the whole suite — the trap CLAUDE.md documents for
+// every type-asserted capability.
+func (f *failingStore) ReadTaskList(ctx context.Context, nodeID, name string) (domain.StoredTaskList, error) {
+	return f.StorePort.(ports.TaskListStore).ReadTaskList(ctx, nodeID, name)
+}
+
+func (f *failingStore) MutateTaskList(ctx context.Context, nodeID, name string, now time.Time,
+	fn func(string) (string, error)) (string, error) {
+	return f.StorePort.(ports.TaskListStore).MutateTaskList(ctx, nodeID, name, now, fn)
+}
+
+func (f *failingStore) EnsureTaskList(ctx context.Context, nodeID, name, agentName, initial string, now time.Time) (bool, error) {
+	return f.StorePort.(ports.TaskListStore).EnsureTaskList(ctx, nodeID, name, agentName, initial, now)
+}
+
+func (f *failingStore) ListTaskLists(ctx context.Context) ([]domain.StoredTaskList, error) {
+	return f.StorePort.(ports.TaskListStore).ListTaskLists(ctx)
+}

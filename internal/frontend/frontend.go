@@ -109,6 +109,10 @@ type App struct {
 	// test fixture must still be a config production would ACCEPT (env_file
 	// set, gist_id set) or it proves less than it appears to.
 	TaskStoreFor func(cfg config.Config, locator string) (ports.TaskStore, error)
+
+	// RemoteActionTimeout overrides how long a confirm waits for ANOTHER node's
+	// daemon to deliver (0 = DefaultRemoteActionTimeout). Tests shorten it.
+	RemoteActionTimeout time.Duration
 }
 
 // nudge wakes the daemon so it re-reads what the caller just persisted. It
@@ -214,6 +218,21 @@ type Status struct {
 	// llm.command cleared), "" when the mode is off or actually running.
 	// Best-effort, like Drift.
 	FullSelfPromptingBlocked string
+
+	// The fleet: every node sharing the store (see fleet.go). Under the local
+	// engine Nodes holds this node alone and the rest is empty.
+	NodeID    string
+	SelfLabel string
+	Nodes     []domain.NodeInfo
+	// RemoteAgents are the OTHER nodes' agents, fully resolved: they are kept
+	// out of the agent-id-keyed maps above because pane ids repeat across
+	// machines.
+	RemoteAgents []RemoteAgent
+	// PausedNodes are the other nodes whose kill switch is down.
+	PausedNodes map[string]bool
+	// FleetNames maps (node, agent) to short names, for labelling another
+	// node's escalations and audit rows.
+	FleetNames map[domain.NodeAgent]string
 }
 
 // GetStatus returns the operator-facing status summary.
@@ -305,6 +324,7 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 			st.AgentNames[agent.AgentID] = name
 		}
 	}
+	a.fillFleet(ctx, &st)
 	return st, nil
 }
 
@@ -557,6 +577,12 @@ func (a *App) liveRosterAgentID(ctx context.Context, target string) (string, err
 func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
 	err := a.Store.RenameAgent(ctx, target, newName)
 	if errors.Is(err, ports.ErrUnknownAgent) {
+		// UnlessLocal, because this is exactly the window a live local pane
+		// has no name row yet — and every herdr has a pane "1", so a bare id
+		// found on another node must not shadow the local pane it also names.
+		if rerr := a.refuseRemoteTargetUnlessLocal(ctx, target, "rename"); rerr != nil {
+			return rerr
+		}
 		agentID, rerr := a.liveRosterAgentID(ctx, target)
 		if rerr != nil {
 			return fmt.Errorf("%w (%v)", err, rerr)
@@ -578,6 +604,9 @@ func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
 func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool) error {
 	err := a.Store.SetAgentDisabled(ctx, target, disabled)
 	if errors.Is(err, ports.ErrUnknownAgent) {
+		if rerr := a.refuseRemoteTargetUnlessLocal(ctx, target, "enable/disable"); rerr != nil {
+			return rerr
+		}
 		agentID, rerr := a.liveRosterAgentID(ctx, target)
 		if rerr != nil {
 			return fmt.Errorf("%w (%v)", err, rerr)
@@ -608,6 +637,11 @@ func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool
 func (a *App) CaptureAgent(ctx context.Context, target string) (domain.CaptureResult, error) {
 	if strings.TrimSpace(target) == "" {
 		return domain.CaptureResult{}, fmt.Errorf("an agent is required")
+	}
+	// A capture runs THIS daemon's pipeline against THIS herdr, so an agent on
+	// another machine is refused here rather than resolved to nothing there.
+	if err := a.refuseRemoteTargetUnlessLocal(ctx, target, "capture"); err != nil {
+		return domain.CaptureResult{}, err
 	}
 	if err := a.requireLiveDaemon(); err != nil {
 		return domain.CaptureResult{}, err
@@ -756,6 +790,17 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// tasks.md when none exists) and, when send, hands the first task to the
 	// agent. Handle it before the send-oriented flow below.
 	if action == domain.SuggestGenerateTask {
+		// acceptGeneratedTask is node-blind by construction: it matches the
+		// row's pane id against THIS machine's herd, names a local row for it,
+		// writes a local list and registers a local task source. For another
+		// node's row every one of those lands on the wrong machine — and with
+		// send, in whichever local pane shares the id. Until a queued action
+		// carries it to the owner, it is that machine's confirm to give.
+		if self := a.Store.NodeID(); audit.NodeID != "" && audit.NodeID != self {
+			return fmt.Errorf("%w: this generated-task suggestion belongs to node %s — its list and task "+
+				"source live there, so confirm it on that machine (`hap confirm %d`)",
+				ErrRemoteAgent, a.nodeLabelFor(ctx, audit.NodeID), auditID)
+		}
 		return a.acceptGeneratedTask(ctx, audit, send, false, nil)
 	}
 	// willSend is the delivery gate. The correction is recorded FIRST (the
@@ -788,7 +833,9 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// reply with nothing draining the queue would sit in a healthy-looking
 	// table indefinitely, which is worse than the immediate, visible failure
 	// it replaces.
-	if err := a.requireLiveDaemon(); err != nil {
+	// The escalation's OWN node must have a daemon to deliver this: ours when
+	// the row is ours, otherwise that machine's heartbeat in the nodes table.
+	if err := a.requireLiveDaemonFor(ctx, audit.NodeID); err != nil {
 		return err
 	}
 	payload, err := json.Marshal(domain.DeliverReplyPayload{AuditID: auditID, Action: action})
@@ -799,8 +846,9 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// this confirm and the daemon's send, the terminal behind it can be
 	// replaced and the reply typed at a stranger. Bind the action to the
 	// identity the daemon last observed (best-effort — an unknown one is not
-	// evidence of change, and the daemon treats it as such).
-	terminalID, err := a.Store.AgentTerminalID(ctx, audit.AgentID)
+	// evidence of change, and the daemon treats it as such). The OWNING node's
+	// record, never this one's: pane ids repeat across machines.
+	terminalID, err := a.Store.AgentTerminalIDOn(ctx, orSelf(a, audit.NodeID), audit.AgentID)
 	if err != nil {
 		return err
 	}
@@ -827,10 +875,20 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// whether their answer landed. Every refusal from the deliverer is a bare
 	// sentence, so the "correction recorded, but …" prefix is still added in
 	// exactly one place.
-	if _, err := a.AwaitAgentAction(ctx, actionID, DefaultActionTimeout); err != nil {
+	// A remote node's verdict travels one push and one pull each way, so its
+	// wait is longer; a timeout still means "still queued", never "failed".
+	if _, err := a.AwaitAgentAction(ctx, actionID, a.awaitTimeoutFor(audit.NodeID)); err != nil {
 		return fmt.Errorf("correction recorded, but %w", err)
 	}
 	return nil
+}
+
+// orSelf returns nodeID, or this node's id when the row predates node ids.
+func orSelf(a *App, nodeID string) string {
+	if nodeID == "" {
+		return a.Store.NodeID()
+	}
+	return nodeID
 }
 
 // ErrSuggestionStaleAgentBusy is returned by a confirm+send (send=true) of a
@@ -3809,7 +3867,7 @@ func (a *App) TaskSourcePathFor(agent string) (string, error) {
 // the source the same way the locator was produced, and compare canonically so
 // two spellings of one local file still match.
 func (a *App) sourceLocatorMatches(cfg config.Config, src config.TaskSource, agent, locator string) bool {
-	res, err := tasklocator.Resolve(cfg, src, agent)
+	res, err := a.resolveSource(cfg, src, agent)
 	if err != nil {
 		return false
 	}
@@ -3970,7 +4028,16 @@ type TaskGroup struct {
 	Display string
 	Items   []domain.ChecklistItem
 	Err     string // "" = read OK
+	// NodeID and NodeLabel are set only on a group from FleetTaskGroups — a
+	// list another node keeps in the shared database. Such a group has no
+	// config Index (-1) and cannot be sent from here: its agent runs on that
+	// node, and only that node's daemon hands its items out.
+	NodeID    string
+	NodeLabel string
 }
+
+// Fleet reports whether the group is another node's list.
+func (g TaskGroup) Fleet() bool { return g.NodeID != "" }
 
 // TaskGroups parses every configured task source's checklist, in config
 // order. It takes the already-loaded cfg so a refresh snapshot's config and

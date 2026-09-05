@@ -26,6 +26,7 @@ var nodeScopedTables = map[string]bool{
 	"task_reservations": true, "llm_requests": true, "llm_decisions": true, "llm_retries": true,
 	"corrections": true, "kill_events": true, "audit_log": true, "agent_actions": true,
 	"agent_roster": true, "herdr_locations": true, "roster_meta": true, "nodes": true,
+	"task_lists": true,
 }
 
 // explicitIDTables are the INTEGER PRIMARY KEY tables: an INSERT must name id
@@ -75,6 +76,9 @@ var nodeScopeExemptions = map[string]string{
 	"FinishAgentActionWithdrawn#2":   "by correction id",
 	"DeleteCorrection#1":             "by id",
 	"InsertCorrectionWithDelivery#1": "by id: reads the escalation's node so the correction and its delivery are filed under it",
+	"FleetRoster#1":                  "fleet read: every node's publish time, node_id per row",
+	"FleetAgentNames#1":              "fleet read: every node's names, keyed by (node, agent)",
+	"DisabledAgentsAll#1":            "fleet read: every node's disabled agents, keyed by (node, agent)",
 }
 
 // sqlVerbRE recognises a flattened argument as a SQL statement.

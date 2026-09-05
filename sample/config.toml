@@ -624,9 +624,21 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
 # change the value here and every inheriting source moves with it. hap never
 # writes the inherited value back into a source (that would freeze it).
 #
-# Values: "local_fs" (default) | "github_gist"
+# Values: "local_fs" (default) | "github_gist" | "sqlite"
 # [task_source_provider]
 # provider = "local_fs"
+
+# ── sqlite ──────────────────────────────────────────────────────────
+# Keeps each list INSIDE hap's own database (the task_lists table) instead of a
+# file. Under the default engine nothing leaves this machine; under
+# [database] engine = "turso" the lists sync with everything else, so every
+# machine's TUI shows and edits every other machine's queues
+# (`hap task --node <machine> <agent> list`). No credential, nothing to create.
+# `path` is a list NAME inside the store, as under github_gist: set it to share
+# one list across the agents a source matches, or leave it out for one list per
+# agent ("<agent-name>.md"). A list belongs to ONE machine — only its daemon
+# hands items out — so two machines' agents never share a queue.
+# provider = "sqlite"
 
 # ── github_gist ─────────────────────────────────────────────────────
 # PRIVACY: this sends the task lists of the sources using it to GitHub. The

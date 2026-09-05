@@ -240,6 +240,25 @@ While paused, situations still classify and escalate — nothing is auto-answere
 — and those escalations carry the rationale `[daemon_paused]`, meaning the
 operator paused automation, not that anything crashed.
 
+## several machines (fleet)
+
+With `[database] engine = "turso"` (see the `database.*` keys) every machine
+pointed at the same Turso Cloud database shares one hap. From any of them:
+
+```bash
+hap status                        # fleet sync: …, other nodes: <label> (fresh|stale)
+hap agents                        # every machine's agents; the LAST field is the machine
+hap escalations                   # rows carry node=<label>
+hap escalations confirm 42        # an escalation from another machine: "queued for node <label>"
+hap pause --node laptop           # pause THAT machine's daemon (resume likewise)
+hap task --node laptop otter list # another machine's `sqlite`-provider task list
+```
+
+Rules are shared, so `hap signatures …` curates them for every machine. Rename,
+enable/disable and focus of another machine's agent are refused — those rows
+belong to its daemon. A machine is named by its `database.node_label`, else its
+hostname, else the first eight characters of its node id.
+
 ## audit
 
 ```bash
@@ -390,7 +409,7 @@ tab-separated stdout is unaffected.
 | `tui.disable_check_for_update` | false | turn off the GitHub release check (TUI only, at most every 6h) |
 | `tui.max_instances` | 1 | how many `hap tui` processes may run; starting one closes the oldest past this cap. `0` = no limit |
 | `cli.ai_agent_friendly_output` | true | append the "Next steps" footer to command output |
-| `task_source_provider.provider` | `local_fs` | default storage for every task list: `local_fs` or `github_gist` |
+| `task_source_provider.provider` | `local_fs` | default storage for every task list: `local_fs`, `github_gist`, or `sqlite` (inside hap's database; syncs under the turso engine) |
 | `task_source_provider.env_file` | (none) | file holding `GITHUB_TOKEN` for `github_gist`; read at use time |
 | `task_source_provider.timeout_seconds` | 20 | per remote store call |
 | `task_source_provider.refresh_seconds` | 30 | how long a remote list is cached |
@@ -590,6 +609,14 @@ paste its hex id. The token lives in the file `env_file` names (`GITHUB_TOKEN=�
 `gist` scope, mode 0600), is read at use time, and never enters `config.toml`.
 Enabling this sends those sources' task lists to GitHub — task text and nothing
 else.
+
+`provider = "sqlite"` keeps a source's list **inside hap's database** instead:
+no file, no credential, nothing leaves the machine — and under
+`database.engine = "turso"` those lists sync with everything else, so every
+machine's TUI shows and edits every other machine's queues (`hap task --node
+<machine> <agent> list`). `path` is a list name inside the store as under
+`github_gist`; leave it out for one list per agent. A list belongs to ONE
+machine: only its daemon hands items out.
 
 `hap task <agent> …` works the same either way. `hap task --path` always reads a
 **local** file, so address a remote list by agent name or source index.

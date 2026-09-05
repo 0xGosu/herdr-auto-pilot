@@ -15,3 +15,16 @@
 - Under the turso engine the TUI, the `hap` verbs and the MCP server reach the store through
   the running daemon; with no daemon they report that the store is served by the daemon
   instead of showing an empty database.
+- Added a unified fleet view under the turso engine: `hap agents` and the TUI Agents tab list
+  every machine's agents (remote rows carry the machine as their last field / `name@label`),
+  escalations, audit and kill history carry `node=<label>`, and `hap status` lists the other
+  machines and their sync freshness. Confirm, answer, correct, dismiss and retry work on
+  another machine's escalation and report `queued for node <label>`; `hap pause --node` /
+  `hap resume --node` pause one machine; rename, enable/disable and focus of a remote agent
+  are refused because those rows belong to the owning daemon.
+- Added the `sqlite` task-source provider (`task_source_provider.provider = "sqlite"`, or per
+  source): a checklist kept inside hap's own database rather than a file, addressed as
+  `db://<node>/<name>`, so under the turso engine every machine's Tasks tab shows and edits
+  every other machine's lists, and `hap task --node <machine> <agent> …` opens one from the
+  CLI. Lists belong to one machine — only its daemon hands items out — and edits are
+  compare-and-swapped on a revision, so no file lock is needed.

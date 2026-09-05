@@ -653,9 +653,14 @@ func TestAutoSendIdleCapsAtExactlyMaxHandouts(t *testing.T) {
 		expireRedriveBackoff(h, "agent-as6y")
 		h.daemon.autoSendIdleTasks(ctx, agents)
 		want := attempt
+		// … and the agent's in-memory claim on the item is released, which
+		// deliverAutonomous does AFTER the rollback lands. Driving the next
+		// sweep before that would see the item still promised and skip it
+		// silently — a sweep that never sends, so a ceiling that never fires.
 		waitFor(t, 5*time.Second, func() bool {
 			n, err := h.raw.TaskHandoutAttempts(ctx, sourcePath, "unsendable")
-			return err == nil && n == want &&
+			_, claimed := h.daemon.autoTaskClaimFor("agent-as6y")
+			return err == nil && n == want && !claimed &&
 				strings.Contains(readTasks(t, taskFile), "- [ ] unsendable")
 		})
 		n, err := h.raw.TaskHandoutAttempts(ctx, sourcePath, "unsendable")
@@ -1858,5 +1863,60 @@ func TestAutoSendIdleAttendedSourceStillEscalatesWithNoLearnedRule(t *testing.T)
 	}
 	if got := readTasks(t, taskFile); strings.Contains(got, "[-]") {
 		t.Errorf("an attended source must not reserve:\n%s", got)
+	}
+}
+
+// TestAutoSendIdleHandsOutFromASQLiteProviderList: a source under
+// provider = "sqlite" keeps its list in the store, and the idle hand-out reads
+// and reserves it THERE — through the registry's database backend, never a
+// file. The prompt is the remote form (no --path: there is no file to point
+// the agent at), and the reservation lands in the task_lists row.
+func TestAutoSendIdleHandsOutFromASQLiteProviderList(t *testing.T) {
+	cfg := "[task_source_provider]\nprovider = \"sqlite\"\n\n" +
+		"[[task_sources]]\nagent = \"agent-db\"\nenable_auto_send_task_when_idle = true\n"
+	h := newHarness(t, cfg)
+	h.herdr.setPane(autoSendIdlePane)
+	h.seedAutonomous(autoSendIdlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+	ctx := context.Background()
+	name, err := h.raw.EnsureAgentName(ctx, "agent-db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listName := tasklocator.DerivedFileName(name)
+	if _, err := h.raw.EnsureTaskList(ctx, h.raw.NodeID(), listName, name,
+		"- [x] done\n- [ ] step two\n- [ ] step three\n", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	agents := parkIdle(h, 2*time.Minute, "agent-db")
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	locator := tasklocator.DBLocator(h.raw.NodeID(), listName)
+	want := (&domain.DeclaredTask{
+		Task: "step two", Path: tasklocator.Display(locator), Remote: true, AgentName: name, SourceIndex: "0",
+	}).Prompt()
+	if got := h.herdr.sentInputs()[0]; got != want {
+		t.Errorf("sent %q, want the remote-form declared task prompt %q", got, want)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		l, err := h.raw.ReadTaskList(ctx, h.raw.NodeID(), listName)
+		return err == nil && strings.Contains(l.Content, "- [-] step two")
+	})
+	l, err := h.raw.ReadTaskList(ctx, h.raw.NodeID(), listName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(l.Content, "- [ ] step three") {
+		t.Errorf("only the delivered task should be reserved:\n%s", l.Content)
+	}
+	// The reservation ledger keys on the locator, so the reclaim sweep can
+	// find the row again through the same database backend.
+	res, err := h.raw.OpenTaskReservations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].SourcePath != locator {
+		t.Errorf("reservations = %+v, want one keyed on %s", res, locator)
 	}
 }

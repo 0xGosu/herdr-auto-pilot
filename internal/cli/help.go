@@ -252,14 +252,16 @@ func buildCommands() {
 		{
 			Name:    "agents",
 			Group:   groupOperate,
-			Summary: "list monitored agents (name, id, type, status, automation, mode, cwd)",
+			Summary: "list monitored agents (name, id, type, status, automation, cwd, mode, node)",
 			Usage:   []string{"hap agents"},
 			Details: "One tab-separated row per agent. \"automation\" is enabled/disabled (see\n" +
-				"`hap disable`); \"mode\" is the agent's own permission mode (see `hap mode`); the\n" +
-				"last column is the agent's working directory. Either of the last two is \"-\"\n" +
-				"when it could not be read, so the field count stays constant for parsers. Give\n" +
-				"an agent a short name with `hap rename` — task sources and `hap task <agent>`\n" +
-				"address agents by that name.",
+				"`hap disable`); \"mode\" is the agent's own permission mode (see `hap mode`); cwd\n" +
+				"is the agent's working directory. Either is \"-\" when it could not be read, so\n" +
+				"the field count stays constant for parsers. The last field is the node the\n" +
+				"agent runs on: under a shared database (`database.engine = turso`) other\n" +
+				"machines' agents follow this machine's, with \"(stale)\" in the status when\n" +
+				"that machine's daemon has stopped reporting. Give an agent a short name with\n" +
+				"`hap rename` — task sources and `hap task <agent>` address agents by that name.",
 			Next: []Hint{
 				{Cmd: "hap task <agent> list", Why: "the agent's task list"},
 				{Cmd: "hap rename <agent-or-pane-id> <name>", Why: "give it a short name"},
@@ -511,25 +513,31 @@ func buildCommands() {
 			Name:    "pause",
 			Group:   groupOperate,
 			Summary: "global kill switch: stop all autonomous actions",
-			Usage:   []string{"hap pause"},
+			Usage:   []string{"hap pause [--node <label|id>]"},
 			Details: "hap keeps watching and escalating but answers nothing on its own, for every\n" +
-				"agent. Pause before asking a human a question you do not want hap to answer.",
-			Examples: []string{"hap pause"},
+				"agent. Pause before asking a human a question you do not want hap to answer.\n" +
+				"Under a shared database `--node` pauses ANOTHER machine's herd; it takes effect\n" +
+				"when that machine next syncs (seconds).",
+			Examples: []string{"hap pause", "hap pause --node laptop"},
 			Next: []Hint{
 				{Cmd: "hap resume", Why: "turn automation back on"},
 				{Cmd: "hap status", Why: "confirm the paused state"},
 				{Cmd: "hap kill-history", Why: "see who paused and when"},
 			},
-			Handler: func(ctx context.Context, app *frontend.App, out io.Writer, _ []string) error {
-				changed, err := app.Pause(ctx)
+			Handler: func(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+				nodeID, label, err := nodeFlag(ctx, app, args)
+				if err != nil {
+					return err
+				}
+				changed, err := app.PauseNode(ctx, nodeID)
 				if err != nil {
 					return err
 				}
 				if !changed {
-					fmt.Fprintln(out, "automation already paused (kill switch active)")
+					fmt.Fprintf(out, "automation already paused%s (kill switch active)\n", label)
 					return nil
 				}
-				fmt.Fprintln(out, "automation paused (kill switch active)")
+				fmt.Fprintf(out, "automation paused%s (kill switch active)\n", label)
 				return nil
 			},
 		},
@@ -537,23 +545,27 @@ func buildCommands() {
 			Name:     "resume",
 			Group:    groupOperate,
 			Summary:  "lift the global kill switch",
-			Usage:    []string{"hap resume"},
+			Usage:    []string{"hap resume [--node <label|id>]"},
 			Details:  "Undoes `hap pause`. Per-agent `hap disable` switches stay as they are.",
-			Examples: []string{"hap resume"},
+			Examples: []string{"hap resume", "hap resume --node laptop"},
 			Next: []Hint{
 				{Cmd: "hap status", Why: "confirm automation is running"},
 				{Cmd: "hap escalations", Why: "handle what queued up while paused"},
 			},
-			Handler: func(ctx context.Context, app *frontend.App, out io.Writer, _ []string) error {
-				changed, err := app.Resume(ctx)
+			Handler: func(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+				nodeID, label, err := nodeFlag(ctx, app, args)
+				if err != nil {
+					return err
+				}
+				changed, err := app.ResumeNode(ctx, nodeID)
 				if err != nil {
 					return err
 				}
 				if !changed {
-					fmt.Fprintln(out, "automation already resumed")
+					fmt.Fprintf(out, "automation already resumed%s\n", label)
 					return nil
 				}
-				fmt.Fprintln(out, "automation resumed")
+				fmt.Fprintf(out, "automation resumed%s\n", label)
 				return nil
 			},
 		},
@@ -975,9 +987,11 @@ func buildCommands() {
 				"hap task [<agent> | <source-index> | --path <file>] remove <n>",
 				"hap task [<agent> | <source-index> | --path <file>] move <n> <position|up|down>",
 				"hap task <agent> send <n> [--yes]",
+				"hap task --node <node> <agent> list|get|add|start|done|undone|update|remove|move …",
 			},
 			Flags: []FlagDoc{
 				{Name: "--path", Arg: "FILE", Desc: "operate on any checklist file directly, instead of resolving an agent's configured source"},
+				{Name: "--node", Arg: "NODE", Desc: "operate on another machine's list kept in the shared hap database (a `sqlite`-provider source); NODE is its label or node id, followed by the agent or list name"},
 				{Name: "--status", Arg: "S", Default: "all", Desc: "list filter: all, pending, or done"},
 				{Name: "--yes, -y", Desc: "send: skip the y/N confirmation (required when stdin is not a terminal)"},
 			},
@@ -1347,4 +1361,36 @@ func suggest(verb string) string {
 	}
 	sort.Strings(hits)
 	return hits[0]
+}
+
+// nodeFlag parses an optional `--node <label|id>` for the verbs that can act on
+// another machine, returning the node id ("" = this one) and a " on <label>"
+// suffix for the confirmation line.
+func nodeFlag(ctx context.Context, app *frontend.App, args []string) (nodeID, label string, err error) {
+	ref := ""
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--node":
+			if i+1 >= len(args) {
+				return "", "", fmt.Errorf("--node requires a node (label or id)")
+			}
+			ref = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--node="):
+			ref = strings.TrimPrefix(args[i], "--node=")
+		default:
+			return "", "", fmt.Errorf("unexpected argument %q (usage: --node <label|id>)", args[i])
+		}
+	}
+	if ref == "" {
+		return "", "", nil
+	}
+	nodeID, err = app.ResolveNode(ctx, ref)
+	if err != nil {
+		return "", "", err
+	}
+	if nodeID == app.Store.NodeID() {
+		return "", "", nil
+	}
+	return nodeID, " on node " + ref, nil
 }

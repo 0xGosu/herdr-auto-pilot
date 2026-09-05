@@ -163,6 +163,22 @@ const createTaskHandouts = `CREATE TABLE IF NOT EXISTS task_handouts (
 	PRIMARY KEY (node_id, source_path, task_text)
 );`
 
+// task_lists holds the checklists of the `sqlite` task-source provider: one
+// row per (node, name), the whole markdown list as one blob, and a revision the
+// writers compare-and-swap on. Node-owned like every other operational table,
+// but unlike them an OPERATOR on another node may edit a row (the unified
+// Tasks view), which the daemon's hand-out path tolerates: it re-reads the
+// list on every sweep and reserves through the same CAS.
+const createTaskLists = `CREATE TABLE IF NOT EXISTS task_lists (
+	node_id TEXT NOT NULL,
+	name TEXT NOT NULL,
+	agent_name TEXT NOT NULL DEFAULT '',
+	content TEXT NOT NULL,
+	revision INTEGER NOT NULL DEFAULT 1,
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (node_id, name)
+);`
+
 const schema = `
 CREATE TABLE IF NOT EXISTS signatures (
 	signature TEXT PRIMARY KEY,
@@ -387,6 +403,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_roster_live ON agent_roster(node_id, gone_a
 ` + createHerdrLocations + `
 ` + createRosterMeta + `
 ` + createTaskHandouts + `
+` + createTaskLists + `
 -- One row per installation sharing this database: who is out there, what
 -- version they run, and when their daemon last checked in. A node whose
 -- last_seen is older than a few heartbeats is shown as stale, and its rows are
@@ -649,7 +666,13 @@ func (s *Store) SchemaCurrent(ctx context.Context) (bool, error) {
 			return false, err
 		}
 	}
-	for _, table := range []string{"roster_meta", "nodes"} {
+	// Tables that exist only since the node-scoped schema. Every table the
+	// migration can CREATE must be listed here: under the shared engine an
+	// already-migrated fleet reads as current and issues no DDL at all, so a
+	// table missing from this list would never be created on any node that
+	// bootstrapped before it existed. (PRAGMA table_info on an absent table
+	// yields no rows, so hasColumn answers false for it.)
+	for _, table := range []string{"roster_meta", "nodes", "task_lists"} {
 		has, err := s.hasColumn(ctx, table, "node_id")
 		if err != nil || !has {
 			return false, err

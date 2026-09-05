@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
-	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 )
 
 // resolvedSource is a task source resolved for one agent: where its list lives,
@@ -26,12 +25,12 @@ type resolvedSource struct {
 // resolveTaskSource maps a source and the agent it matched to that agent's list.
 func (d *Daemon) resolveTaskSource(src config.TaskSource, agentName string) (resolvedSource, error) {
 	d.mu.Lock()
-	cfg, stores := d.cfg, d.stores
+	stores := d.stores
 	d.mu.Unlock()
 	if stores == nil {
 		return resolvedSource{}, fmt.Errorf("task store registry is not configured")
 	}
-	res, err := tasklocator.Resolve(cfg, src, agentName)
+	res, err := stores.Resolve(src, agentName)
 	if err != nil {
 		return resolvedSource{}, err
 	}

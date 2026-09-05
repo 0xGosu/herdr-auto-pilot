@@ -305,6 +305,41 @@ type EnsureCreator interface {
 	Ensure(ctx context.Context, locator, initial string) (created bool, err error)
 }
 
+// TaskListStore is the OPTIONAL store capability behind the `sqlite`
+// task-source provider: checklists kept as rows in hap's own database, so that
+// under a shared (turso) store every node's lists are visible — and editable —
+// from every other node's TUI and CLI.
+//
+// Lists are addressed by (node, name), never by this store's own node alone: an
+// operator on one machine edits another machine's list through the same
+// methods, which is why every method takes the node id explicitly rather than
+// defaulting to NodeID(). The daemon that owns a node is still the only one
+// handing its items out, so the ownership model of every other node-owned
+// table holds for the hand-out path; a concurrent operator edit is resolved by
+// the revision compare-and-swap inside MutateTaskList (one node) or by the
+// sync engine's last-push-wins (two nodes, one sync window).
+type TaskListStore interface {
+	NodeID() string
+	// ReadTaskList returns the list, or an error wrapping fs.ErrNotExist when
+	// no such list exists — the same contract TaskStore.Read has.
+	ReadTaskList(ctx context.Context, nodeID, name string) (domain.StoredTaskList, error)
+	// MutateTaskList applies fn to the current content and writes the result
+	// only if nobody else wrote in between (compare-and-swap on the revision),
+	// re-reading and re-applying fn on a lost race. fn therefore runs inside
+	// the critical section in the sense that matters — a write is never based
+	// on a stale read — and may run more than once, so it must be a pure
+	// function of the content it is handed. A mutator error writes nothing.
+	// A missing list is an error wrapping fs.ErrNotExist; Mutate never creates.
+	MutateTaskList(ctx context.Context, nodeID, name string, now time.Time,
+		fn func(content string) (string, error)) (string, error)
+	// EnsureTaskList creates the list when it is missing and reports whether
+	// it did. It never overwrites existing content.
+	EnsureTaskList(ctx context.Context, nodeID, name, agentName, initial string, now time.Time) (created bool, err error)
+	// ListTaskLists is a FLEET read: every node's lists, ordered by node then
+	// name, so the unified Tasks view can show another machine's queues.
+	ListTaskLists(ctx context.Context) ([]domain.StoredTaskList, error)
+}
+
 // RemoteTaskStore marks a store whose reads and writes leave the machine.
 //
 // Optional, and the daemon's whole risk control: absent, every task-list read
@@ -675,6 +710,14 @@ type ReadStore interface {
 	NodeID() string
 	// ListNodes returns every installation sharing the store, this one included.
 	ListNodes(ctx context.Context) ([]domain.NodeInfo, error)
+	// The fleet reads, for the unified view: every node's rows, each keyed by
+	// (node, agent) because pane ids repeat across machines.
+	FleetRoster(ctx context.Context) ([]domain.RosterAgent, map[string]time.Time, error)
+	FleetAgentNames(ctx context.Context) (map[domain.NodeAgent]string, error)
+	DisabledAgentsAll(ctx context.Context) (map[domain.NodeAgent]bool, error)
+	FleetAgentStats(ctx context.Context) (map[domain.NodeAgent]domain.AgentStats, error)
+	// LocationsOf is HerdrLocations for any node.
+	LocationsOf(ctx context.Context, nodeID string) (map[string]domain.WorkspaceInfo, map[string]domain.TabInfo, error)
 	// RemoteWatchers counts OTHER nodes with a TUI watching the fleet as of now.
 	RemoteWatchers(ctx context.Context, now time.Time) (int, error)
 

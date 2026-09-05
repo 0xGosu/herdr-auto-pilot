@@ -235,7 +235,7 @@ func TestResolveAppliesProviderDefaultsAndOverrides(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := tasklocator.Resolve(tc.cfg, tc.src, tc.agent)
+			got, err := tasklocator.Resolve(tc.cfg, tc.src, tc.agent, "")
 			if tc.wantErr != "" {
 				if err == nil {
 					t.Fatalf("want error mentioning %q, got locator %q", tc.wantErr, got.Locator)
@@ -261,7 +261,7 @@ func TestResolveIsAPureFunctionOfConfigAndAgent(t *testing.T) {
 	cfg := remoteCfg("3f2a")
 	src := config.TaskSource{}
 
-	first, err := tasklocator.Resolve(cfg, src, "brave-otter")
+	first, err := tasklocator.Resolve(cfg, src, "brave-otter", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +276,7 @@ func TestResolveIsAPureFunctionOfConfigAndAgent(t *testing.T) {
 	if err := os.Chdir(t.TempDir()); err != nil {
 		t.Skipf("cannot chdir: %v", err)
 	}
-	second, err := tasklocator.Resolve(cfg, src, "brave-otter")
+	second, err := tasklocator.Resolve(cfg, src, "brave-otter", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +300,7 @@ func TestResolveDerivedNameIsSanitizedAndValidated(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := tasklocator.Resolve(cfg, config.TaskSource{}, tc.agent)
+			got, err := tasklocator.Resolve(cfg, config.TaskSource{}, tc.agent, "")
 			if err != nil {
 				t.Fatalf("a sanitizable name must resolve, got %v", err)
 			}
@@ -320,7 +320,7 @@ func TestResolveDerivedNameIsSanitizedAndValidated(t *testing.T) {
 }
 
 func TestResolveReportsAgentNameRequiredSentinel(t *testing.T) {
-	_, err := tasklocator.Resolve(remoteCfg("3f2a"), config.TaskSource{}, "")
+	_, err := tasklocator.Resolve(remoteCfg("3f2a"), config.TaskSource{}, "", "")
 	if !errors.Is(err, tasklocator.ErrAgentNameRequired) {
 		t.Errorf("source-enumerating surfaces match on the sentinel to render a template "+
 			"instead of failing; got %v", err)
@@ -361,5 +361,84 @@ func TestCanonicalIsStableAcrossSpellingsOfOnePath(t *testing.T) {
 			t.Errorf("Canonical(%q) = %q, want %q — two spellings of one file must share "+
 				"a lock and a claim key", spelling, got, want)
 		}
+	}
+}
+
+func sqliteCfg() config.Config {
+	return config.Config{TaskSourceProvider: config.TaskSourceProvider{Provider: config.ProviderSQLite}}
+}
+
+// TestResolveSQLiteProviderMintsANodeScopedLocator: the sqlite provider places
+// a list in the resolving node's namespace, deriving the name per agent exactly
+// like the gist provider, and refuses to mint one when no node is known — a
+// locator in nobody's namespace would be persisted and never found again.
+func TestResolveSQLiteProviderMintsANodeScopedLocator(t *testing.T) {
+	const node = "a1a1a1a1a1a1a1a1"
+	cases := []struct {
+		name    string
+		src     config.TaskSource
+		agent   string
+		node    string
+		want    string
+		wantErr error
+	}{
+		{name: "derived per agent", src: config.TaskSource{}, agent: "brave-otter", node: node,
+			want: "db://" + node + "/brave-otter.md"},
+		{name: "explicit shared name", src: config.TaskSource{Path: "backlog.md"}, agent: "x", node: node,
+			want: "db://" + node + "/backlog.md"},
+		{name: "derived with no agent", src: config.TaskSource{}, agent: "", node: node,
+			wantErr: tasklocator.ErrAgentNameRequired},
+		{name: "no node id", src: config.TaskSource{Path: "backlog.md"}, agent: "x", node: "",
+			wantErr: tasklocator.ErrNodeIDRequired},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tasklocator.Resolve(sqliteCfg(), tc.src, tc.agent, tc.node)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Locator != tc.want {
+				t.Errorf("Locator = %q, want %q", got.Locator, tc.want)
+			}
+			if !got.Remote() {
+				t.Error("a database list is not a file on this machine; Remote must be true so --path is never offered for it")
+			}
+			if got.Egress() {
+				t.Error("the sqlite provider never leaves the machine")
+			}
+			if tasklocator.Canonical(got.Locator) != got.Locator {
+				t.Errorf("Canonical(%q) = %q, must be verbatim", got.Locator, tasklocator.Canonical(got.Locator))
+			}
+			if !strings.Contains(got.Display, "hap database") || !strings.Contains(got.Display, node[:8]) {
+				t.Errorf("Display = %q, want the list named as a database list on its node", got.Display)
+			}
+		})
+	}
+}
+
+// TestParseDBRoundTrip pins the db:// shape and that every other locator is
+// refused by it, so dispatch on ParseDB is exact.
+func TestParseDBRoundTrip(t *testing.T) {
+	loc := tasklocator.DBLocator("a1a1a1a1a1a1a1a1", "otter.md")
+	ref, ok := tasklocator.ParseDB(loc)
+	if !ok || ref.NodeID != "a1a1a1a1a1a1a1a1" || ref.Name != "otter.md" {
+		t.Fatalf("ParseDB(%q) = %+v, %v", loc, ref, ok)
+	}
+	if tasklocator.Scheme(loc) != tasklocator.DBScheme || !tasklocator.Remote(loc) {
+		t.Errorf("Scheme/Remote must recognize %q", loc)
+	}
+	for _, bad := range []string{"gist://a/b.md", "/tmp/tasks.md", "db://", "db://node", "db://node/", "db:///x.md", "db://node/a/b.md"} {
+		if _, ok := tasklocator.ParseDB(bad); ok {
+			t.Errorf("ParseDB(%q) accepted a malformed locator", bad)
+		}
+	}
+	if _, ok := tasklocator.ParseGist(loc); ok {
+		t.Error("a db locator must not parse as a gist")
 	}
 }

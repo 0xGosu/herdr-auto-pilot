@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -219,5 +220,67 @@ func TestTwoFreshNodesPrepareTheSchemaWithoutWedging(t *testing.T) {
 		if err != nil || len(log) != 2 {
 			t.Fatalf("%s: audit log = %d rows (%v), want both nodes' rows — sync wedged", n.id, len(log), err)
 		}
+	}
+}
+
+// TestTwoNodesShareASQLiteProviderTaskList: a list one node keeps in the
+// database (the `sqlite` task-source provider) reaches the other node through
+// sync, the other node edits it in place — the unified Tasks view — and the
+// edit comes back to the owner, revision intact, so the owner's next hand-out
+// compare-and-swaps against the operator's version rather than a stale one.
+func TestTwoNodesShareASQLiteProviderTaskList(t *testing.T) {
+	url := startLocalSyncServer(t)
+	a := openNode(t, url, "aaaaaaaaaaaaaaaa")
+	a.sync(t)
+	b := openNode(t, url, "bbbbbbbbbbbbbbbb")
+	ctx := context.Background()
+	now := time.Now()
+
+	if _, err := a.st.EnsureTaskList(ctx, a.id, "otter.md", "otter", "# Tasks for otter\n\n- [ ] one\n", now); err != nil {
+		t.Fatal(err)
+	}
+	a.sync(t)
+	b.sync(t)
+
+	// B sees A's list under A's node, and nothing in its own namespace.
+	l, err := b.st.ReadTaskList(ctx, a.id, "otter.md")
+	if err != nil || l.AgentName != "otter" || l.Revision != 1 {
+		t.Fatalf("B reads A's list = %+v (%v)", l, err)
+	}
+	if _, err := b.st.ReadTaskList(ctx, b.id, "otter.md"); err == nil {
+		t.Fatal("A's list must not appear in B's own namespace")
+	}
+	all, _ := b.st.ListTaskLists(ctx)
+	if len(all) != 1 || all[0].NodeID != a.id {
+		t.Fatalf("B fleet listing = %+v", all)
+	}
+
+	// B (an operator's TUI on the other machine) appends a task to A's list.
+	if _, err := b.st.MutateTaskList(ctx, a.id, "otter.md", now, func(c string) (string, error) {
+		return c + "- [ ] two, added on b\n", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b.sync(t)
+	a.sync(t)
+
+	l, err = a.st.ReadTaskList(ctx, a.id, "otter.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(l.Content, "two, added on b") || l.Revision != 2 {
+		t.Fatalf("A's list after B's edit = %+v", l)
+	}
+	// A's daemon then reserves against the version it now holds.
+	if _, err := a.st.MutateTaskList(ctx, a.id, "otter.md", now, func(c string) (string, error) {
+		return domain.MarkChecklistItemInProgress(c, 2)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a.sync(t)
+	b.sync(t)
+	l, _ = b.st.ReadTaskList(ctx, a.id, "otter.md")
+	if !strings.Contains(l.Content, "- [-] two, added on b") || l.Revision != 3 {
+		t.Fatalf("B sees A's reservation = %+v", l)
 	}
 }

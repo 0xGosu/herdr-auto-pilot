@@ -1,11 +1,15 @@
 package taskstore_test
 
 import (
+	"context"
+	"io/fs"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskstore"
 )
@@ -238,5 +242,76 @@ func TestRegistryRefusesAnUnservableRemoteBackend(t *testing.T) {
 				t.Fatalf("want an error mentioning %q, got %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+// fakeTaskLists is the smallest ports.TaskListStore: the registry only needs
+// its node id to mint a locator and its presence to build the backend.
+type fakeTaskLists struct{ node string }
+
+func (f fakeTaskLists) NodeID() string { return f.node }
+func (fakeTaskLists) ReadTaskList(context.Context, string, string) (domain.StoredTaskList, error) {
+	return domain.StoredTaskList{}, fs.ErrNotExist
+}
+func (fakeTaskLists) MutateTaskList(context.Context, string, string, time.Time, func(string) (string, error)) (string, error) {
+	return "", fs.ErrNotExist
+}
+func (fakeTaskLists) EnsureTaskList(context.Context, string, string, string, string, time.Time) (bool, error) {
+	return false, nil
+}
+func (fakeTaskLists) ListTaskLists(context.Context) ([]domain.StoredTaskList, error) { return nil, nil }
+
+func sqliteCfg() config.Config {
+	return config.Config{TaskSourceProvider: config.TaskSourceProvider{Provider: config.ProviderSQLite}}
+}
+
+// TestRegistrySQLiteProviderNeedsTheStore: with a store the sqlite provider
+// mints db://<this node>/<name> and serves it; without one it is refused at use
+// time — never silently served from a file.
+func TestRegistrySQLiteProviderNeedsTheStore(t *testing.T) {
+	const node = "a1a1a1a1a1a1a1a1"
+	r := taskstore.NewRegistry(sqliteCfg(), taskstore.WithTaskLists(fakeTaskLists{node: node}))
+	store, loc, err := r.For(config.TaskSource{}, "brave-otter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "db://" + node + "/brave-otter.md"; loc != want {
+		t.Errorf("locator = %q, want %q", loc, want)
+	}
+	if ports.TaskStoreRemote(store) {
+		t.Error("the database backend is local; it must not be a RemoteTaskStore")
+	}
+	if _, ok := store.(ports.EnsureCreator); !ok {
+		t.Error("the database backend must create on demand")
+	}
+	if res, err := r.Resolve(config.TaskSource{Path: "backlog.md"}, ""); err != nil || res.Locator != "db://"+node+"/backlog.md" {
+		t.Errorf("Resolve = %+v, %v", res, err)
+	}
+
+	bare := taskstore.NewRegistry(sqliteCfg())
+	if _, _, err := bare.For(config.TaskSource{}, "brave-otter"); err == nil {
+		t.Fatal("a registry with no store must refuse a sqlite source")
+	}
+	if _, err := bare.ForLocator("db://" + node + "/brave-otter.md"); err == nil || !strings.Contains(err.Error(), "database") {
+		t.Errorf("ForLocator without a store = %v, want a refusal naming the database", err)
+	}
+}
+
+// TestRegistryDispatchesADBLocatorBySchemeAcrossNodes: a db:// row names its
+// node, so a locator for ANOTHER node's list routes to the database backend
+// regardless of what this node's config says — the unified Tasks view edits
+// other machines' lists through exactly this path.
+func TestRegistryDispatchesADBLocatorBySchemeAcrossNodes(t *testing.T) {
+	r := taskstore.NewRegistry(config.Default(), taskstore.WithTaskLists(fakeTaskLists{node: "self"}))
+	store, err := r.ForLocator("db://otherNode/brave-otter.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ports.TaskStoreRemote(store) {
+		t.Error("want the database backend")
+	}
+	local, err := r.ForLocator("/tmp/tasks.md")
+	if err != nil || local == store {
+		t.Errorf("a filesystem locator must still route to the local store (%v)", err)
 	}
 }

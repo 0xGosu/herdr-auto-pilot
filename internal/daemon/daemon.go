@@ -585,7 +585,16 @@ func New(opt Options) (*Daemon, error) {
 		opt.Clock = ports.SystemClock{}
 	}
 	if opt.TaskStoreFactory == nil {
-		opt.TaskStoreFactory = taskstore.NewRegistry
+		// The store is the sqlite provider's backend, so the default registry
+		// carries it when the store can keep lists; a store that cannot leaves
+		// the provider refused at use time rather than served from a file.
+		var lists []taskstore.Option
+		if tl, ok := opt.Store.(ports.TaskListStore); ok {
+			lists = append(lists, taskstore.WithTaskLists(tl))
+		}
+		opt.TaskStoreFactory = func(cfg config.Config) *taskstore.Registry {
+			return taskstore.NewRegistry(cfg, lists...)
+		}
 	}
 	// The two seams below are kept as func fields because tests inject them.
 	// Their production implementations close over `d`, so they are assigned

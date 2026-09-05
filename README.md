@@ -542,12 +542,23 @@ matched agent shares one list; leave it out and each gets its own
 `env_file` names (`GITHUB_TOKEN=…`, `gist` scope, mode `0600`), is read when hap
 reaches the store, and never enters `config.toml`.
 
+A third provider, **`sqlite`**, keeps a source's checklist **inside hap's own
+database** instead of a file. Nothing leaves the machine under the default
+engine; under the [central database](#central-database-turso) those lists sync
+with everything else, so the Tasks tab and `hap task --node <machine> <agent> …`
+on any machine show and edit every other machine's queues. `path` is a list
+name inside the store exactly as under `github_gist` (leave it out for one list
+per agent), there is nothing to create and no credential to hold, and the
+daemon that owns a machine is the only one handing its items out — a list is
+never shared between two machines' agents.
+
 Three things stay as they were: a `[[task_sources]]` entry is still what opts an
 agent in, every safety control still applies at delivery, and `local_fs` is
 still the default.
 
-**Privacy.** Enabling this sends those sources' task lists to GitHub. That is
-the only thing it sends — no pane content, no learned rules, no audit history.
+**Privacy.** Enabling `github_gist` sends those sources' task lists to GitHub.
+That is the only thing it sends — no pane content, no learned rules, no audit
+history.
 
 ### Keeping idle agents working
 
@@ -794,6 +805,71 @@ Deprecated but still loading, migrated on the next config save:
 `allowlist_patterns` → `never_auto_patterns`; `safety.disable_seed` →
 `safety.disable_never_auto_seed_patterns`; `irreversible_indicators` and
 `[[safety.indicator_rules]]` → `[[safety.never_auto_rules]]`.
+
+## Central database (Turso)
+
+hap keeps everything in one SQLite file per machine. If you run agents on
+**several machines**, `[database] engine = "turso"` moves that store into a
+[Turso](https://turso.tech) sync database the daemon syncs with a Turso Cloud
+database **you own**, and every machine pointed at the same database becomes one
+hap: one TUI shows every machine's agents, escalations, audit history, learned
+rules and pause state, and acts on them.
+
+```sh
+turso db create hap --tursodb                   # once, on any machine
+turso db show hap --url                         # → database.turso_database_url
+turso db tokens create hap                      # → database.turso_auth_token (or $TURSO_AUTH_TOKEN)
+hap config set database.engine turso
+hap config set database.turso_database_url libsql://hap-<org>.turso.io
+hap config set database.turso_auth_token <token>
+hap config set database.node_label laptop      # optional; the hostname otherwise
+hap daemon --ensure                             # the section is read when the store opens
+```
+
+Repeat on each machine with the same URL and token. `hap status` then reports
+`fleet sync: ok …` and the other machines under `other nodes:`; `hap agents`
+appends the machine as the last field; escalations carry `node=<label>`.
+
+**What you can do from another machine.** Confirm, answer, correct, dismiss or
+retry an escalation raised there — the owning daemon executes it and the action
+reads `queued for node <label>` until it lands; curate learned rules, which are
+shared; pause or resume a machine (`hap pause --node laptop`); read and edit its
+`sqlite`-provider task lists (`hap task --node laptop <agent> list`). Renaming,
+enabling, disabling or focusing a remote agent is refused: those are the owning
+daemon's rows.
+
+**How conflicts are avoided.** Every row a machine owns carries its node id
+(herdr pane ids repeat across machines), ids are allocated with node bits, and a
+machine's daemon only ever executes its own agents' actions — including at
+startup, so one machine's restart never reclaims another's in-flight work.
+Learned rules converge by content. What is left to last-write-wins is narrow
+and self-healing: two machines learning the same rule in one sync window, an
+operator racing the owning daemon on one escalation (re-validated before any
+keystroke, so never a double delivery), or an edit to a `sqlite` task list
+during that machine's hand-out.
+
+**What to know.**
+
+- Under `turso` only the daemon opens the store; the TUI, the `hap` verbs and
+  the MCP server reach it through the daemon. With no daemon they say so
+  (`hap daemon --ensure`) rather than showing an empty database. `hap config`
+  keeps working either way.
+- Cross-machine freshness is the push debounce plus the other machine's pull
+  interval (`database.turso_sync_interval_seconds`, default 15 s).
+- **Config stays local.** `config.toml` — task sources, LLM setup, rules,
+  `[database]` itself — is never written to the database; each machine keeps
+  its own file. Task lists stay files on their machine unless a source selects
+  the `sqlite` provider.
+- Every machine should run the same embedding model: learned rules are shared,
+  and a machine with a different model re-embeds every rule on start.
+- **Privacy.** This puts the **whole store** — pane excerpts included — in the
+  Turso Cloud database you own. The default engine is `sqlite`, a local file,
+  with no outbound call.
+- Recovery: `<state>/turso/` is a local replica; delete it and restart the
+  daemon to re-bootstrap from the cloud database. The first start needs the
+  network; until it succeeds `hap status` shows `bootstrap pending`. Switching
+  an existing install imports its local database once, then leaves the old
+  file in place.
 
 ## Health and disk usage
 

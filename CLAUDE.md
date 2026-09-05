@@ -1146,7 +1146,7 @@ The **`herdr`** skill covers CLI usage; these are the hap-specific protocol fact
 | `internal/store` | SQLite persistence (WAL; `context_json` is an opaque blob) |
 | `internal/taskfile` | advisory file lock behind every checklist read-modify-write |
 | `internal/tasklocator` | the ONE canonicalizer for a task-list locator + provider resolution (pure) |
-| `internal/taskstore` | task-list backends: `local` (default) and `gist` (opt-in, the only GitHub SDK importer) |
+| `internal/taskstore` | task-list backends: `local` (default), `gist` (opt-in, the only GitHub SDK importer) and `dbtask` (the `sqlite` provider: lists as `task_lists` rows, `db://<node>/<name>`, synced under turso) |
 | `internal/selfpath` | resolves a live `hap` binary (an upgrade unlinks the running one) |
 | `internal/tuisession` | flock registry of live `hap tui` processes; closes the oldest past `[tui] max_instances` |
 | `internal/updatecheck` | GitHub release check — one of exactly TWO `net/http` importers (NFR-007 allowlist) |
