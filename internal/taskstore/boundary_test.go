@@ -14,6 +14,7 @@ import (
 var concreteBackends = []string{
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskstore/local",
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskstore/gist",
+	"github.com/0xGosu/herdr-auto-pilot/internal/taskstore/dbtask",
 }
 
 // backendImporters are the files allowed to name a concrete backend: the
@@ -60,6 +61,7 @@ func TestOnlyTheRegistryImportsAConcreteBackend(t *testing.T) {
 		// call sites.
 		if strings.HasPrefix(rel, "internal/taskstore/local/") ||
 			strings.HasPrefix(rel, "internal/taskstore/gist/") ||
+			strings.HasPrefix(rel, "internal/taskstore/dbtask/") ||
 			strings.HasSuffix(rel, "_test.go") {
 			return nil
 		}

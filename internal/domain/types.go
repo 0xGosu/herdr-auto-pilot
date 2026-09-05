@@ -302,6 +302,10 @@ type SignatureFilter struct {
 
 // DecisionRecord is one learned/observed decision for a signature (DR-001).
 type DecisionRecord struct {
+	// NodeID is the installation that owns this row (store.LoadNodeID). Under
+	// one machine it is always that machine; under a shared database it is what
+	// keeps one node's rows apart from another's.
+	NodeID        string
 	ID            int64
 	Signature     string
 	SituationType SituationType
@@ -528,7 +532,11 @@ const (
 // `agent send` only means herdr accepted them. A confirmed row is retired; an
 // unconfirmed one whose agent is parked again past the grace window is reclaimed.
 type TaskReservation struct {
-	ID int64
+	// NodeID is the installation that owns this row (store.LoadNodeID). Under
+	// one machine it is always that machine; under a shared database it is what
+	// keeps one node's rows apart from another's.
+	NodeID string
+	ID     int64
 	// SourcePath is the canonical task-list LOCATOR the hand-out reserved in:
 	// an absolute, symlink-resolved filesystem path, or a scheme'd string like
 	// "gist://<id>/<file>" when the source is stored remotely. The column is
@@ -567,6 +575,10 @@ type AgentStats struct {
 
 // AuditRecord is one append-only audit trail entry (FR-020, DR-002).
 type AuditRecord struct {
+	// NodeID is the installation that owns this row (store.LoadNodeID). Under
+	// one machine it is always that machine; under a shared database it is what
+	// keeps one node's rows apart from another's.
+	NodeID        string
 	ID            int64
 	DecisionID    int64
 	AgentID       string
@@ -681,6 +693,10 @@ func IsRetryableLLMEscalation(a *AuditRecord) bool {
 
 // CorrectionRecord is a front-end-written correction amending an audit entry.
 type CorrectionRecord struct {
+	// NodeID is the installation that owns this row (store.LoadNodeID). Under
+	// one machine it is always that machine; under a shared database it is what
+	// keeps one node's rows apart from another's.
+	NodeID          string
 	ID              int64
 	AuditID         int64
 	CorrectedAction string
@@ -701,7 +717,11 @@ type CorrectionRecord struct {
 // they answer one operator question — "what changed hap's autonomy, and when" —
 // and the Pause/Kill tab renders them interleaved.
 type KillEvent struct {
-	ID int64
+	// NodeID is the installation that owns this row (store.LoadNodeID). Under
+	// one machine it is always that machine; under a shared database it is what
+	// keeps one node's rows apart from another's.
+	NodeID string
+	ID     int64
 	// State is scope-specific: KillStateActive/KillStateResumed for
 	// KillScopeGlobal, KillStateFSPOn/KillStateFSPOff for KillScopeFSP.
 	State     string
@@ -770,6 +790,10 @@ func KillEventLabel(e KillEvent) string {
 
 // LLMDecision is a staged submission written by the mcp process.
 type LLMDecision struct {
+	// NodeID is the installation that owns this row (store.LoadNodeID). Under
+	// one machine it is always that machine; under a shared database it is what
+	// keeps one node's rows apart from another's.
+	NodeID        string
 	ID            int64
 	RequestID     string
 	Signature     string
@@ -808,6 +832,10 @@ type LLMDecision struct {
 
 // LLMRequest is the daemon-staged context for one LLM consultation.
 type LLMRequest struct {
+	// NodeID is the installation that owns this row (store.LoadNodeID). Under
+	// one machine it is always that machine; under a shared database it is what
+	// keeps one node's rows apart from another's.
+	NodeID        string
 	ID            int64
 	RequestID     string
 	Signature     string
@@ -882,6 +910,10 @@ type LLMRequest struct {
 // escalation whose consult failed or timed out; the daemon drains it and
 // re-drives a fresh consult on the agent's live pane.
 type LLMRetry struct {
+	// NodeID is the installation that owns this row (store.LoadNodeID). Under
+	// one machine it is always that machine; under a shared database it is what
+	// keeps one node's rows apart from another's.
+	NodeID    string
 	ID        int64
 	AuditID   int64
 	Processed bool

@@ -15,6 +15,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/llm"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
+	"github.com/0xGosu/herdr-auto-pilot/internal/taskstore/dbtask"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskstore/gist"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskstore/local"
 )
@@ -36,9 +37,30 @@ var gistTokenKeys = []string{"GITHUB_TOKEN", "GH_TOKEN"}
 type Registry struct {
 	cfg config.Config
 
+	// lists is the store capability behind the sqlite provider; nil when the
+	// caller has no store (then a sqlite source is refused at use time, never
+	// silently served from a file).
+	lists ports.TaskListStore
+	db    *dbtask.Store
+
 	mu    sync.Mutex
 	local *local.Store
 	gists map[gistKey]*gist.Store
+}
+
+// Option configures a Registry.
+type Option func(*Registry)
+
+// WithTaskLists makes the sqlite provider servable: lists is the store the
+// task_lists rows live in, and its node id is the namespace a sqlite source's
+// derived locator is minted in.
+func WithTaskLists(lists ports.TaskListStore) Option {
+	return func(r *Registry) {
+		if lists != nil {
+			r.lists = lists
+			r.db = dbtask.New(lists)
+		}
+	}
 }
 
 // gistKey identifies a gist backend. It deliberately does NOT include the
@@ -57,12 +79,32 @@ type gistKey struct {
 // validated against the network. That is what lets a config reload swap
 // registries atomically — construction cannot fail for a transient reason, so
 // the daemon never has to decide whether to keep a half-built one.
-func NewRegistry(cfg config.Config) *Registry {
-	return &Registry{cfg: cfg, local: local.New(), gists: map[gistKey]*gist.Store{}}
+func NewRegistry(cfg config.Config, opts ...Option) *Registry {
+	r := &Registry{cfg: cfg, local: local.New(), gists: map[gistKey]*gist.Store{}}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
 }
 
 // Config returns the config this registry was built from.
 func (r *Registry) Config() config.Config { return r.cfg }
+
+// NodeID is the node whose namespace a sqlite source's list is minted in, ""
+// when the registry has no store.
+func (r *Registry) NodeID() string {
+	if r.lists == nil {
+		return ""
+	}
+	return r.lists.NodeID()
+}
+
+// Resolve is tasklocator.Resolve with this registry's node id supplied — the
+// ONE production entry point, so no caller has to know which provider needs
+// the node and none can mint a database locator in the wrong namespace.
+func (r *Registry) Resolve(src config.TaskSource, agentName string) (tasklocator.Resolved, error) {
+	return tasklocator.Resolve(r.cfg, src, agentName, r.NodeID())
+}
 
 // For resolves a task source, for the agent it was matched against, to the
 // backend serving it and the locator identifying its list.
@@ -79,7 +121,7 @@ func (r *Registry) For(src config.TaskSource, agentName string) (ports.TaskStore
 	if err := config.ValidateResolvedProvider(r.cfg, r.indexOf(src), src); err != nil {
 		return nil, "", err
 	}
-	res, err := tasklocator.Resolve(r.cfg, src, agentName)
+	res, err := r.Resolve(src, agentName)
 	if err != nil {
 		return nil, "", err
 	}
@@ -114,6 +156,9 @@ func (r *Registry) indexOf(src config.TaskSource) int {
 // while every NEW locator is minted by the source's current provider. Provider
 // dispatch would strand them.
 func (r *Registry) ForLocator(locator string) (ports.TaskStore, error) {
+	if _, ok := tasklocator.ParseDB(locator); ok {
+		return r.dbStore()
+	}
 	ref, ok := tasklocator.ParseGist(locator)
 	if !ok {
 		if tasklocator.Remote(locator) {
@@ -134,6 +179,9 @@ func (r *Registry) ForLocator(locator string) (ports.TaskStore, error) {
 func (r *Registry) backend(p config.ResolvedProvider) (ports.TaskStore, error) {
 	if !p.Remote() {
 		return r.local, nil
+	}
+	if p.Name == config.ProviderSQLite {
+		return r.dbStore()
 	}
 	// ONE validator for every use-time rule — unknown provider, unsupported
 	// platform, missing gist_id, missing env_file — rather than a copy here that
@@ -161,6 +209,15 @@ func (r *Registry) backend(p config.ResolvedProvider) (ports.TaskStore, error) {
 		key.Timeout)
 	r.gists[key] = s
 	return s, nil
+}
+
+// dbStore is the sqlite provider's backend, or the one error every surface
+// prints when this process has no store to keep lists in.
+func (r *Registry) dbStore() (ports.TaskStore, error) {
+	if r.db == nil {
+		return nil, fmt.Errorf("provider=%s keeps task lists in the hap database, which this process has not opened", config.ProviderSQLite)
+	}
+	return r.db, nil
 }
 
 // AnyRemote reports whether any configured source resolves to a remote backend.

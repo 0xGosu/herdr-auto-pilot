@@ -41,11 +41,70 @@ import (
 // reached for the life of the file.
 const walSizeLimit = 64 << 20 // 64 MiB
 
-// Store is the SQLite-backed implementation of ports.StorePort.
+// Engine names the database engine behind a Store.
+type Engine string
+
+const (
+	// EngineSQLite is the default: one local file, every hap process opens it.
+	EngineSQLite Engine = "sqlite"
+	// EngineTurso is the opt-in central database: a Turso sync database the
+	// daemon alone opens and syncs, which every other process reaches through
+	// the daemon. It changes two things in here — ids are allocated (never
+	// AUTOINCREMENT, whose values collide across machines) and the schema is
+	// created without AUTOINCREMENT — and nothing else: every statement is the
+	// same, node-scoped, on both engines.
+	EngineTurso Engine = "turso"
+)
+
+// Store is the implementation of ports.StorePort over a SQLite-shaped
+// database — the embedded SQLite file or a Turso sync database.
+//
+// Every row a node owns carries its node id (self), and every OPERATIONAL
+// statement — anything that leads to acting on a pane, claiming work, rate
+// limiting, reclaiming at startup, picking a pending LLM request — is scoped
+// to it. Under one machine that scope is the whole database; under a shared
+// one it is what keeps two machines' identical pane ids apart. Fleet reads
+// (the operator listings) span nodes and return each row's node id.
 type Store struct {
 	db           *sql.DB
 	agentLockDir string
+	// self is this installation's node id (LoadNodeID). Never empty.
+	self string
+	// engine decides only how ids are minted and how the schema is created.
+	engine Engine
+	// ids allocates INTEGER PRIMARY KEYs; nil leaves that to the database.
+	ids IDAllocator
+	// onWrite is called after every committed write (nil-safe). The daemon's
+	// sync loop uses it to debounce a push.
+	onWrite func()
 }
+
+// Options configures OpenDB.
+type Options struct {
+	// NodeID is this installation's node id. Required.
+	NodeID string
+	// Engine defaults to EngineSQLite.
+	Engine Engine
+	// IDs allocates INTEGER PRIMARY KEYs. Required under EngineTurso (rows
+	// from different machines must never share an id); leave nil under
+	// EngineSQLite to keep AUTOINCREMENT.
+	IDs IDAllocator
+	// Migrate runs the schema migration on open. Every process does under
+	// sqlite; under turso only the daemon may (the front ends hold a proxy).
+	Migrate bool
+	// OnWrite is called after every committed write.
+	OnWrite func()
+	// AgentLockDir holds the per-agent automation flocks (see
+	// WithAgentAutomation). Defaults to a sibling of the state dir the node id
+	// lives in when empty; callers under turso pass the state dir's.
+	AgentLockDir string
+}
+
+// NodeID returns this store's node id.
+func (s *Store) NodeID() string { return s.self }
+
+// Engine returns the engine this store runs on.
+func (s *Store) Engine() Engine { return s.engine }
 
 // Open opens (creating if needed) the database at path with WAL mode and a
 // busy timeout, and applies migrations.
@@ -67,8 +126,11 @@ func escapeSQLiteURIPath(path string) string {
 	return strings.ReplaceAll(path, "#", "%23")
 }
 
-func Open(path string) (*Store, error) {
-	dsn := "file:" + escapeSQLiteURIPath(path) + "?" + url.Values{
+// sqliteDSN builds the modernc DSN for a database file: WAL, busy timeout,
+// the WAL size cap and an IMMEDIATE transaction lock. Shared with the test
+// doubles so both open the same way.
+func sqliteDSN(path string) string {
+	return "file:" + escapeSQLiteURIPath(path) + "?" + url.Values{
 		// Every transaction this package opens WRITES, so each one takes the
 		// write lock at BEGIN rather than upgrading to it later.
 		//
@@ -110,7 +172,18 @@ func Open(path string) (*Store, error) {
 			"journal_size_limit(" + strconv.Itoa(walSizeLimit) + ")",
 		},
 	}.Encode()
-	db, err := sql.Open("sqlite", dsn)
+}
+
+// Open opens (creating if needed) the SQLite database at path with WAL mode
+// and a busy timeout, resolves the node id from the file beside it, and applies
+// migrations. This is the sqlite engine; every hap process may call it.
+func Open(path string) (*Store, error) {
+	dir := filepath.Dir(path)
+	nodeID, err := LoadNodeID(dir)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -126,436 +199,97 @@ func Open(path string) (*Store, error) {
 	// deadline is missed by a goroutine doing almost nothing.
 	//
 	// The old comment justified the cap as avoiding "needless SQLITE_BUSY",
-	// which the _txlock above now handles properly: a writer waits at BEGIN
-	// under busy_timeout instead of failing mid-transaction, so extra
+	// which the _txlock in sqliteDSN now handles properly: a writer waits at
+	// BEGIN under busy_timeout instead of failing mid-transaction, so extra
 	// connections cost queueing rather than errors.
-	db.SetMaxOpenConns(8)
-	s := &Store{db: db, agentLockDir: filepath.Join(filepath.Dir(path), "agent-automation-locks")}
-	if err := s.migrate(); err != nil {
+	db.SetMaxOpenConns(sqlitePoolSize)
+	return OpenDB(db, Options{
+		NodeID:       nodeID,
+		Engine:       EngineSQLite,
+		Migrate:      true,
+		AgentLockDir: filepath.Join(dir, "agent-automation-locks"),
+	})
+}
+
+// sqlitePoolSize is the modernc connection pool for every sqlite-engine open
+// (see Open for why it is sized for readers).
+const sqlitePoolSize = 8
+
+// OpenAs opens the SQLite database at path AS the given node, without
+// migrating — the way a second machine sharing a store sees the same rows.
+// It is what the importer and the multi-node tests use; production processes
+// open with Open, whose node id comes from the file beside the database.
+func OpenAs(path, nodeID string) (*Store, error) {
+	db, err := sql.Open("sqlite", sqliteDSN(path))
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	db.SetMaxOpenConns(sqlitePoolSize)
+	return OpenDB(db, Options{
+		NodeID:       nodeID,
+		Engine:       EngineSQLite,
+		AgentLockDir: filepath.Join(filepath.Dir(path), "agent-automation-locks-"+nodeID),
+	})
+}
+
+// OpenDB wraps an already-open database handle. It is how the turso engine is
+// wired — the daemon passes the sync database's handle, the front ends a proxy
+// to the daemon — and how the sqlite engine's Open finishes. Closing the Store
+// closes db.
+func OpenDB(db *sql.DB, opts Options) (*Store, error) {
+	if !ValidNodeID(opts.NodeID) {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("open store: node id %q is malformed", opts.NodeID)
+	}
+	engine := opts.Engine
+	if engine == "" {
+		engine = EngineSQLite
+	}
+	if engine == EngineTurso && opts.IDs == nil {
+		db.Close()
+		return nil, errors.New("open store: the turso engine needs an id allocator — " +
+			"AUTOINCREMENT ids collide across machines")
+	}
+	lockDir := opts.AgentLockDir
+	if lockDir == "" {
+		lockDir = filepath.Join(os.TempDir(), "hap-agent-automation-locks-"+opts.NodeID)
+	}
+	s := &Store{db: db, agentLockDir: lockDir, self: opts.NodeID, engine: engine,
+		ids: opts.IDs, onWrite: opts.OnWrite}
+	if opts.Migrate {
+		if err := s.migrate(nil); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }
 
+// Migrate applies the schema migration now. OpenDB runs it when Options.Migrate
+// is set; the turso daemon runs it here instead, AFTER its first pull and only
+// when it holds the schema lead (see turso.PrepareSharedSchema).
+func (s *Store) Migrate() error { return s.migrate(nil) }
+
+// MigrateWith is Migrate with a hook called BEFORE every step that issues DDL
+// or rewrites rows. Under a shared database the hook re-proves that this node
+// still holds the schema lease (turso.PrepareSharedSchema): each step is a
+// bounded transaction, so ownership is checked between them and a migration
+// whose lease lapsed stops before its next DDL rather than racing another node.
+func (s *Store) MigrateWith(between func() error) error { return s.migrate(between) }
+
+// Ping reports whether the database answers — for a proxied store, whether the
+// daemon serving it is reachable.
+func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+
+// noteWrite reports a committed write to the sync hook.
+func (s *Store) noteWrite() {
+	if s.onWrite != nil {
+		s.onWrite()
+	}
+}
+
 // Close closes the underlying database.
 func (s *Store) Close() error { return s.db.Close() }
-
-const schema = `
-CREATE TABLE IF NOT EXISTS signatures (
-	signature TEXT PRIMARY KEY,
-	situation_type TEXT NOT NULL,
-	agent_type TEXT NOT NULL,
-	mode TEXT NOT NULL DEFAULT 'shadow',
-	consecutive_confirmations INTEGER NOT NULL DEFAULT 0,
-	cached_confidence REAL NOT NULL DEFAULT 0,
-	decision_floor_id INTEGER NOT NULL DEFAULT 0,
-	guard_state TEXT NOT NULL DEFAULT '',
-	updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS decisions (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	signature TEXT NOT NULL,
-	situation_type TEXT NOT NULL,
-	agent_type TEXT NOT NULL,
-	chosen_action TEXT NOT NULL,
-	source TEXT NOT NULL,
-	confidence_at_decision REAL NOT NULL DEFAULT 0,
-	is_correction INTEGER NOT NULL DEFAULT 0,
-	created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_decisions_signature ON decisions(signature, id DESC);
--- CountSignaturesByMode is on the decision path once full self-prompting is on
--- (fspActive, and limitsInert through it), and this is the one table the plugin
--- grows without bound. Unindexed the count is a full scan per decision.
-CREATE INDEX IF NOT EXISTS idx_signatures_mode ON signatures(mode);
-CREATE TABLE IF NOT EXISTS audit_log (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	decision_id INTEGER NOT NULL DEFAULT 0,
-	agent_id TEXT NOT NULL DEFAULT '',
-	agent_type TEXT NOT NULL DEFAULT '',
-	signature TEXT NOT NULL DEFAULT '',
-	trigger TEXT NOT NULL,
-	situation_type TEXT NOT NULL,
-	action_or_escalation TEXT NOT NULL,
-	input TEXT NOT NULL DEFAULT '',
-	confidence REAL NOT NULL DEFAULT 0,
-	llm_confidence INTEGER,
-	rationale TEXT NOT NULL DEFAULT '',
-	llm_output TEXT NOT NULL DEFAULT '',
-	corrects_audit_id INTEGER NOT NULL DEFAULT 0,
-	status TEXT NOT NULL DEFAULT '',
-	suggestion TEXT NOT NULL DEFAULT '',
-	pane_excerpt TEXT NOT NULL DEFAULT '',
-	match_method TEXT NOT NULL DEFAULT '',
-	match_score REAL NOT NULL DEFAULT 0,
-	embed_error TEXT NOT NULL DEFAULT '',
-	-- The row's SignatureResult, kept as the baseline for a later staleness
-	-- comparison (see domain.AuditRecord.SigRaw). '' = no baseline.
-	sig_raw TEXT NOT NULL DEFAULT '',
-	sig_salient TEXT NOT NULL DEFAULT '',
-	sig_verdict TEXT NOT NULL DEFAULT '',
-	sig_salient_chars INTEGER NOT NULL DEFAULT 0,
-	llm_session_id TEXT NOT NULL DEFAULT '',
-	-- 1 when this row was auto-accepted while full self-prompting was active,
-	-- so an operator can tell FSP's answers from timed auto-accept's (the
-	-- status is 'auto_accepted' for both). 0 on every other row.
-	while_fsp_mode_on INTEGER NOT NULL DEFAULT 0,
-	created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_log(agent_id);
--- Serves LatestAuditForSignature (WHERE signature = ? ORDER BY id DESC LIMIT 1)
--- and the batched LatestAuditsForSignatures (MAX(id) GROUP BY signature) that
--- feeds the Rules-tab LAST column on every ~2s refresh.
-CREATE INDEX IF NOT EXISTS idx_audit_signature ON audit_log(signature, id DESC);
-CREATE TABLE IF NOT EXISTS agent_rate (
-	agent_id TEXT PRIMARY KEY,
-	consecutive_auto INTEGER NOT NULL DEFAULT 0,
-	window_start INTEGER NOT NULL DEFAULT 0,
-	count_in_window INTEGER NOT NULL DEFAULT 0,
-	paused INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS error_retries (
-	error_signature TEXT PRIMARY KEY,
-	agent_id TEXT NOT NULL DEFAULT '',
-	retry_count INTEGER NOT NULL DEFAULT 0,
-	updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS corrections (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	audit_id INTEGER NOT NULL,
-	corrected_action TEXT NOT NULL,
-	author TEXT NOT NULL DEFAULT 'operator',
-	processed INTEGER NOT NULL DEFAULT 0,
-	sent INTEGER NOT NULL DEFAULT 0,
-	created_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS kill_events (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	state TEXT NOT NULL,
-	scope TEXT NOT NULL DEFAULT 'global',
-	author TEXT NOT NULL DEFAULT 'operator',
-	created_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS llm_requests (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	request_id TEXT NOT NULL UNIQUE,
-	signature TEXT NOT NULL,
-	situation_type TEXT NOT NULL,
-	agent_type TEXT NOT NULL,
-	agent_id TEXT NOT NULL DEFAULT '',
-	context_json TEXT NOT NULL,
-	status TEXT NOT NULL DEFAULT 'pending',
-	created_at INTEGER NOT NULL,
-	session_id TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS llm_decisions (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	request_id TEXT NOT NULL,
-	signature TEXT NOT NULL DEFAULT '',
-	situation_type TEXT NOT NULL DEFAULT '',
-	agent_type TEXT NOT NULL DEFAULT '',
-	action TEXT NOT NULL,
-	option_id TEXT NOT NULL DEFAULT '',
-	rationale TEXT NOT NULL DEFAULT '',
-	confident_score INTEGER NOT NULL DEFAULT -1,
-	captured_output TEXT NOT NULL DEFAULT '',
-	status TEXT NOT NULL DEFAULT 'pending',
-	created_at INTEGER NOT NULL,
-	task_actions_json TEXT NOT NULL DEFAULT '',
-	send_task TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS llm_retries (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	audit_id INTEGER NOT NULL,
-	processed INTEGER NOT NULL DEFAULT 0,
-	created_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS operator (
-	id TEXT PRIMARY KEY,
-	label TEXT NOT NULL DEFAULT ''
-);
-INSERT OR IGNORE INTO operator (id, label) VALUES ('operator', 'Operator');
-CREATE TABLE IF NOT EXISTS agent_names (
-	agent_id TEXT PRIMARY KEY,
-	name TEXT NOT NULL UNIQUE,
-	disabled INTEGER NOT NULL DEFAULT 0,
-	terminal_id TEXT NOT NULL DEFAULT '',
-	created_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS signature_embeddings (
-	signature TEXT PRIMARY KEY,
-	situation_type TEXT NOT NULL,
-	agent_type TEXT NOT NULL,
-	model TEXT NOT NULL DEFAULT '',
-	dims INTEGER NOT NULL DEFAULT 0,
-	vector BLOB,
-	salient TEXT NOT NULL,
-	created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_sig_embed_scope
-	ON signature_embeddings(situation_type, agent_type);
-CREATE TABLE IF NOT EXISTS signature_snapshots (
-	signature TEXT PRIMARY KEY,
-	pane_excerpt TEXT NOT NULL,
-	created_at INTEGER NOT NULL
-);
--- Ledger of unattended task hand-outs: which "[-]" marks the daemon wrote
--- itself, for which agent, and whether that agent was ever seen working
--- afterwards. Unconfirmed rows whose agent parked again are what the idle
--- sweep returns to "[ ]"; a "[-]" with no row here is somebody else's and is
--- never touched.
-CREATE TABLE IF NOT EXISTS task_reservations (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	source_path TEXT NOT NULL,
-	task_text TEXT NOT NULL,
-	item_index INTEGER NOT NULL DEFAULT 0,
-	agent_id TEXT NOT NULL,
-	pane_id TEXT NOT NULL,
-	terminal_id TEXT NOT NULL DEFAULT '',
-	audit_id INTEGER NOT NULL DEFAULT 0,
-	reserved_at INTEGER NOT NULL,
-	restamps INTEGER NOT NULL DEFAULT 0,
-	confirmed_at INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_task_res_agent ON task_reservations(agent_id);
--- Operator-requested actions the DAEMON must perform against a live agent.
--- The front ends may not touch herdr, so a confirmed reply, a task hand-out, a
--- permission-mode change and a manual capture are all queued here and drained
--- by the daemon. The control socket carries no reply channel, which is why the
--- row itself carries status/error/result: that is the ONLY way the surface that
--- queued the action can learn whether it landed.
-CREATE TABLE IF NOT EXISTS agent_actions (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	kind TEXT NOT NULL,
-	target TEXT NOT NULL DEFAULT '',
-	payload_json TEXT NOT NULL DEFAULT '',
-	-- The correction this action delivers, 0 for kinds that deliver none.
-	-- An explicit column rather than a field inside payload_json because the
-	-- correction drain must JOIN on it: a correction whose delivery is still
-	-- queued must not be processed yet (see UnprocessedCorrections).
-	correction_id INTEGER NOT NULL DEFAULT 0,
-	-- Herdr's terminal identity for the target pane, as it stood when the
-	-- action was queued. Herdr RECYCLES pane ids, so a pane id alone is not an
-	-- address: between queueing and delivery the terminal behind it can be
-	-- replaced, and the reply would be typed at a stranger. Empty means "not
-	-- observed", which is not evidence of sameness and is never treated as a
-	-- match. Same doctrine as task_reservations.terminal_id.
-	terminal_id TEXT NOT NULL DEFAULT '',
-	-- 1 once this action may already have had its side effect — set
-	-- IMMEDIATELY BEFORE the keystrokes, so a daemon that dies between the
-	-- send and the outcome write leaves evidence behind. Delivery is not
-	-- idempotent, so such a row must never be replayed; the startup reclaim
-	-- fails it instead of returning it to the queue.
-	side_effect INTEGER NOT NULL DEFAULT 0,
-	author TEXT NOT NULL DEFAULT 'operator',
-	status TEXT NOT NULL DEFAULT 'pending',
-	error TEXT NOT NULL DEFAULT '',
-	result_json TEXT NOT NULL DEFAULT '',
-	attempts INTEGER NOT NULL DEFAULT 0,
-	created_at INTEGER NOT NULL,
-	updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status, id);
-CREATE INDEX IF NOT EXISTS idx_agent_actions_correction ON agent_actions(correction_id);
-
--- The DAEMON's published view of what herdr is running, so the front ends can
--- read the herd without listing agents themselves.
---
--- Written only by the daemon, from the ListAgents calls it already makes plus
--- the transitions it already receives. gone_at soft-deletes rather than
--- DELETE: herdr recycles pane ids and an agent id IS a pane id, so a row whose
--- terminal_id changed is a DIFFERENT agent and must replace rather than merge —
--- the same doctrine as task_reservations.terminal_id.
-CREATE TABLE IF NOT EXISTS agent_roster (
-	agent_id TEXT PRIMARY KEY,
-	pane_id TEXT NOT NULL DEFAULT '',
-	tab_id TEXT NOT NULL DEFAULT '',
-	workspace_id TEXT NOT NULL DEFAULT '',
-	agent_type TEXT NOT NULL DEFAULT '',
-	status TEXT NOT NULL DEFAULT '',
-	terminal_id TEXT NOT NULL DEFAULT '',
-	-- The agent's working directory, refreshed on its own slower TTL: it costs
-	-- one herdr pane-get subprocess per agent, which is why the front ends only
-	-- ever asked for it on the two surfaces that display one.
-	cwd TEXT NOT NULL DEFAULT '',
-	cwd_read_at INTEGER NOT NULL DEFAULT 0,
-	-- The agent's position in herdr's own agent listing, recorded by a publish
-	-- and preserved by a per-agent event.
-	--
-	-- Reading the roster back ordered by agent_id would NOT reproduce it: an
-	-- agent id is a pane id, so the ordering is lexicographic over ids like
-	-- w1:p2 and w1:p10 -- which puts the tenth pane before the second. The
-	-- Agents tab renders the slice as given (TestAgentsListPreservesHerdrOrder),
-	-- and herdr's order is the only one AgentTransition carries enough to
-	-- reconstruct, since it has no intra-tab pane ordinal.
-	--
-	-- An agent first seen through an EVENT has no position -- rosterSeqUnknown
-	-- sorts it last until the next publish places it -- which is a new agent
-	-- appearing at the end for up to one tick, never an existing one moving.
-	list_seq INTEGER NOT NULL DEFAULT 0,
-	seen_at INTEGER NOT NULL,
-	-- 0 while live. Set when a publish no longer sees the agent.
-	gone_at INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_agent_roster_live ON agent_roster(gone_at, list_seq, agent_id);
-
--- Workspace and tab display metadata, published alongside the roster. Separate
--- from agent_roster because these are per-LOCATION, not per-agent, and the TUI
--- renders a number as well as a label.
-CREATE TABLE IF NOT EXISTS herdr_locations (
-	kind TEXT NOT NULL,
-	id TEXT NOT NULL,
-	label TEXT NOT NULL DEFAULT '',
-	number INTEGER NOT NULL DEFAULT 0,
-	workspace_id TEXT NOT NULL DEFAULT '',
-	seen_at INTEGER NOT NULL,
-	PRIMARY KEY (kind, id)
-);
-
--- One row (id = 1) recording when the daemon last published a roster.
---
--- It is what tells "no agents are running" from "no daemon has ever published",
--- which an empty agent_roster cannot do on its own. Same doctrine as
--- Status.AgentsKnown, which reads it: a caller acting on an agent's ABSENCE
--- must be able to tell absence from ignorance.
-CREATE TABLE IF NOT EXISTS roster_meta (
-	id INTEGER PRIMARY KEY CHECK (id = 1),
-	published_at INTEGER NOT NULL
-);
-
--- Per-item hand-out counter, kept SEPARATELY from task_reservations so it
--- survives the reservation row being retired on every reclaim. It is what caps
--- an item that can never be delivered from being resent forever.
-CREATE TABLE IF NOT EXISTS task_handouts (
-	source_path TEXT NOT NULL,
-	task_text TEXT NOT NULL,
-	attempts INTEGER NOT NULL DEFAULT 0,
-	updated_at INTEGER NOT NULL,
-	PRIMARY KEY (source_path, task_text)
-);
-`
-
-func (s *Store) migrate() error {
-	_, err := s.db.Exec(schema)
-	if err != nil {
-		return fmt.Errorf("migrate schema: %w", err)
-	}
-	// Column additions to pre-existing tables (CREATE IF NOT EXISTS above
-	// only covers new tables). Idempotent: a duplicate-column error means
-	// the column is already there.
-	for _, ddl := range []string{
-		`ALTER TABLE audit_log ADD COLUMN agent_type TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE audit_log ADD COLUMN pane_excerpt TEXT NOT NULL DEFAULT ''`,
-		// Nullable: NULL = no LLM score (learned/operator/pre-decision rows),
-		// distinct from a reported 0.
-		`ALTER TABLE audit_log ADD COLUMN llm_confidence INTEGER`,
-		// How an escalation's signature resolved to its rule, plus any
-		// per-event embedding failure (empty/zero on legacy and auto rows).
-		`ALTER TABLE audit_log ADD COLUMN match_method TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE audit_log ADD COLUMN match_score REAL NOT NULL DEFAULT 0`,
-		`ALTER TABLE audit_log ADD COLUMN embed_error TEXT NOT NULL DEFAULT ''`,
-		// The row's full SignatureResult: the never-remapped content hash, the
-		// masked salient, the over-mask verdict, and the salient window used.
-		// Written on every decision-pipeline row (status 'auto' as well as
-		// 'escalated'), which is what lets a row later demoted to escalated
-		// carry a comparable baseline. NOT backfilled: '' means "no baseline",
-		// so every pre-migration row is permanently ineligible for auto-accept
-		// — the fail-closed default.
-		`ALTER TABLE audit_log ADD COLUMN sig_raw TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE audit_log ADD COLUMN sig_salient TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE audit_log ADD COLUMN sig_verdict TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE audit_log ADD COLUMN sig_salient_chars INTEGER NOT NULL DEFAULT 0`,
-		// The CLI conversation the LLM ran as, and the name of the transcript
-		// file it left behind. '' on learned/operator rows, on rows from before
-		// this column existed, and whenever the CLI neither accepted nor
-		// reported an id — it is bookkeeping, never load-bearing. NOT
-		// backfilled: there is nothing to backfill it FROM.
-		`ALTER TABLE audit_log ADD COLUMN llm_session_id TEXT NOT NULL DEFAULT ''`,
-		// 1 when full self-prompting caused this auto-accept. The status alone
-		// cannot say so — 'auto_accepted' is what timed auto-accept writes too —
-		// and the two have very different meanings to an operator reviewing the
-		// log. NOT backfilled: 0 on every pre-migration row, which reads as
-		// "not attributable to FSP" rather than as a false claim either way.
-		`ALTER TABLE audit_log ADD COLUMN while_fsp_mode_on INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE llm_requests ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`,
-		// A pre-delivery task review's submission: the ordered checklist edits
-		// (JSON) and the reference of the task to deliver once they are
-		// applied. Empty on every other kind of decision, and on every row
-		// written before the review existed.
-		`ALTER TABLE llm_decisions ADD COLUMN task_actions_json TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE llm_decisions ADD COLUMN send_task TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE llm_requests ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''`,
-		// sent = 1 when the correction actually reached the agent pane;
-		// drives the daemon's post-action unblock self-check. Written by the
-		// daemon after its own delivery (front ends record it unsent).
-		`ALTER TABLE corrections ADD COLUMN sent INTEGER NOT NULL DEFAULT 0`,
-		// Per-signature decision-id floor: decisions with id <= this are kept
-		// but excluded from confidence/graduation (stamped by an operator reset).
-		`ALTER TABLE signatures ADD COLUMN decision_floor_id INTEGER NOT NULL DEFAULT 0`,
-		// Operator-owned per-agent automation switch. Kept on agent_names so
-		// renames preserve it and disabled agents remain visible by name.
-		`ALTER TABLE agent_names ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0`,
-		// Herdr's unique per-terminal id. Herdr reuses compact pane ids, so
-		// this is what tells "same agent" from "new terminal on a recycled
-		// pane id" (issue #158). '' = not yet observed.
-		`ALTER TABLE agent_names ADD COLUMN terminal_id TEXT NOT NULL DEFAULT ''`,
-		// The terminal behind the action's target pane at queue time, and the
-		// "this may already have been delivered" marker. Both were added after
-		// agent_actions shipped, so CREATE TABLE IF NOT EXISTS would skip them
-		// on any database that already has the table.
-		`ALTER TABLE agent_actions ADD COLUMN terminal_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE agent_actions ADD COLUMN side_effect INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE agent_roster ADD COLUMN list_seq INTEGER NOT NULL DEFAULT 0`,
-	} {
-		if _, err := s.db.Exec(ddl); err != nil &&
-			!strings.Contains(err.Error(), "duplicate column name") {
-			return fmt.Errorf("migrate column: %w", err)
-		}
-	}
-	// Issue #155: pre-fix approval salients carried only the permission verb,
-	// so very different approval screens shared one embedding row. Post-fix
-	// salients always carry a "| options:" segment. The old verb-only rows
-	// must go: left in place, a new salient could cosine/BM25-match one and
-	// remap onto the old over-broad signature, re-bridging the collision the
-	// format change closed. Learned rules and audit rows are kept — their old
-	// keys simply become unreachable. The remote-env picker's salient is
-	// verb-only by design and stays. Idempotent: matches zero rows once the
-	// old-format rows are gone.
-	if _, err := s.db.Exec(
-		`DELETE FROM signature_embeddings
-		  WHERE situation_type = ?
-		    AND salient LIKE 'permission:%'
-		    AND salient NOT LIKE '%| options:%'
-		    AND salient <> 'permission:' || ?`,
-		string(domain.SituationApproval), domain.PermissionVerbSelectRemoteEnv,
-	); err != nil {
-		return fmt.Errorf("migrate prune verb-only approval embeddings: %w", err)
-	}
-	// Issue #175: LLM decisions used to be recorded without a signatures state
-	// row, leaving the learned rule invisible to `signatures list` and
-	// unaddressable by delete/reset. The daemon now creates the row at
-	// decision time; this backfills the rows such databases already lack.
-	// SQLite's bare-column-with-MAX rule makes the inner select carry each
-	// signature's newest decision BY ID — the autoincrement PK is strictly
-	// insertion-ordered, unlike created_at, whose millisecond values can tie
-	// within a burst and break the tie arbitrarily. Idempotent: INSERT OR
-	// IGNORE never touches an existing row.
-	if _, err := s.db.Exec(
-		`INSERT OR IGNORE INTO signatures (signature, situation_type, agent_type,
-		    mode, consecutive_confirmations, cached_confidence, decision_floor_id,
-		    guard_state, updated_at)
-		 SELECT signature, situation_type, agent_type, ?, 0, 0, 0, '', created_at
-		   FROM (SELECT signature, situation_type, agent_type, created_at, MAX(id)
-		           FROM decisions GROUP BY signature)`,
-		string(domain.ModeShadow),
-	); err != nil {
-		return fmt.Errorf("migrate backfill signature rows: %w", err)
-	}
-	return nil
-}
 
 // tx runs fn inside a transaction, honoring busy_timeout.
 func (s *Store) tx(ctx context.Context, fn func(*sql.Tx) error) error {
@@ -567,7 +301,11 @@ func (s *Store) tx(ctx context.Context, fn func(*sql.Tx) error) error {
 		tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.noteWrite()
+	return nil
 }
 
 func unix(t time.Time) int64 {
@@ -622,6 +360,9 @@ func (s *Store) EnsureSignature(ctx context.Context, sig domain.SignatureState) 
 			guard_state, updated_at)
 		VALUES (?, ?, ?, ?, 0, 0, 0, '', ?)`,
 		sig.Signature, string(sig.SituationType), sig.AgentType, string(sig.Mode), unix(sig.UpdatedAt))
+	if err == nil {
+		s.noteWrite()
+	}
 	return err
 }
 
@@ -630,10 +371,10 @@ func (s *Store) RecordDecision(ctx context.Context, d domain.DecisionRecord) (in
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO decisions (signature, situation_type, agent_type, chosen_action,
-				source, confidence_at_decision, is_correction, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			d.Signature, string(d.SituationType), d.AgentType, d.ChosenAction,
+				INSERT INTO decisions (id, node_id, signature, situation_type, agent_type, chosen_action,
+					source, confidence_at_decision, is_correction, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			s.nextID(), s.self, d.Signature, string(d.SituationType), d.AgentType, d.ChosenAction,
 			string(d.Source), d.Confidence, boolInt(d.IsCorrection), unix(d.CreatedAt))
 		if err != nil {
 			return err
@@ -649,13 +390,13 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO audit_log (decision_id, agent_id, agent_type, signature, trigger, situation_type,
-				action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
-				corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
-				sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id,
-				while_fsp_mode_on, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
+			INSERT INTO audit_log (id, node_id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
+					action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
+					corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
+					sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id,
+					while_fsp_mode_on, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			s.nextID(), s.self, a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
 			a.Action, a.Input, a.Confidence, llmConfArg(a.LLMConfidence), a.Rationale, a.LLMOutput,
 			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt,
 			string(a.MatchMethod), a.MatchScore, a.EmbedError,
@@ -697,14 +438,14 @@ func (s *Store) EscalateAudit(ctx context.Context, auditID int64, rationale, sug
 func (s *Store) UpdateAgentRate(ctx context.Context, r domain.AgentRate) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO agent_rate (agent_id, consecutive_auto, window_start, count_in_window, paused)
-			VALUES (?, ?, ?, ?, ?)
-			ON CONFLICT(agent_id) DO UPDATE SET
+			INSERT INTO agent_rate (node_id, agent_id, consecutive_auto, window_start, count_in_window, paused)
+				VALUES (?, ?, ?, ?, ?, ?)
+				ON CONFLICT(node_id, agent_id) DO UPDATE SET
 				consecutive_auto=excluded.consecutive_auto,
 				window_start=excluded.window_start,
 				count_in_window=excluded.count_in_window,
 				paused=excluded.paused`,
-			r.AgentID, r.ConsecutiveAuto, unix(r.WindowStart), r.CountInWindow, boolInt(r.Paused))
+			s.self, r.AgentID, r.ConsecutiveAuto, unix(r.WindowStart), r.CountInWindow, boolInt(r.Paused))
 		return err
 	})
 }
@@ -713,13 +454,13 @@ func (s *Store) UpdateAgentRate(ctx context.Context, r domain.AgentRate) error {
 func (s *Store) UpsertErrorRetry(ctx context.Context, e domain.ErrorRetry) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO error_retries (error_signature, agent_id, retry_count, updated_at)
-			VALUES (?, ?, ?, ?)
-			ON CONFLICT(error_signature) DO UPDATE SET
+			INSERT INTO error_retries (node_id, error_signature, agent_id, retry_count, updated_at)
+				VALUES (?, ?, ?, ?, ?)
+				ON CONFLICT(node_id, error_signature) DO UPDATE SET
 				agent_id=excluded.agent_id,
 				retry_count=excluded.retry_count,
 				updated_at=excluded.updated_at`,
-			e.ErrorSignature, e.AgentID, e.RetryCount, unix(e.UpdatedAt))
+			s.self, e.ErrorSignature, e.AgentID, e.RetryCount, unix(e.UpdatedAt))
 		return err
 	})
 }
@@ -728,7 +469,7 @@ func (s *Store) UpsertErrorRetry(ctx context.Context, e domain.ErrorRetry) error
 func (s *Store) ResetErrorRetry(ctx context.Context, errorSignature string) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,
-			`DELETE FROM error_retries WHERE error_signature = ?`, errorSignature)
+			`DELETE FROM error_retries WHERE node_id = ? AND error_signature = ?`, s.self, errorSignature)
 		return err
 	})
 }
@@ -758,9 +499,9 @@ func (s *Store) StageLLMRequest(ctx context.Context, r domain.LLMRequest) (int64
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO llm_requests (request_id, signature, situation_type, agent_type, agent_id, context_json, status, created_at, session_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			r.RequestID, r.Signature, string(r.SituationType), r.AgentType,
+			INSERT INTO llm_requests (id, node_id, request_id, signature, situation_type, agent_type, agent_id, context_json, status, created_at, session_id)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			s.nextID(), s.self, r.RequestID, r.Signature, string(r.SituationType), r.AgentType,
 			r.AgentID, r.ContextJSON, orDefault(r.Status, "pending"), unix(r.CreatedAt),
 			r.SessionID)
 		if err != nil {
@@ -799,10 +540,17 @@ func (s *Store) UpdateLLMRequestContext(ctx context.Context, requestID, contextJ
 // stages the row as pending, handleLLMOutcome marks it done, and
 // expireStaleLLMWork expires abandoned ones after 2×timeout.
 func (s *Store) HasPendingLLMConsult(ctx context.Context, agentID string) (bool, error) {
+	return s.HasPendingLLMConsultOn(ctx, s.self, agentID)
+}
+
+// HasPendingLLMConsultOn is HasPendingLLMConsult for an agent on any node — the
+// unified view's "retry LLM" gate reads it for an escalation another machine
+// owns. Fleet-scoped by argument, never implicitly.
+func (s *Store) HasPendingLLMConsultOn(ctx context.Context, nodeID, agentID string) (bool, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT count(*) FROM llm_requests WHERE agent_id = ? AND status = 'pending'`,
-		agentID).Scan(&count)
+		`SELECT count(*) FROM llm_requests WHERE node_id = ? AND agent_id = ? AND status = 'pending'`,
+		nodeID, agentID).Scan(&count)
 	if err != nil {
 		return false, err
 	}
@@ -818,8 +566,8 @@ func (s *Store) ExpireStalePendingLLMRequests(ctx context.Context, cutoff time.T
 	var n int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE llm_requests SET status = 'expired' WHERE status = 'pending' AND created_at < ?`,
-			unix(cutoff))
+			`UPDATE llm_requests SET status = 'expired' WHERE node_id = ? AND status = 'pending' AND created_at < ?`,
+			s.self, unix(cutoff))
 		if err != nil {
 			return err
 		}
@@ -844,24 +592,42 @@ func (s *Store) UpdateLLMDecisionStatus(ctx context.Context, id int64, status st
 func (s *Store) InsertCorrection(ctx context.Context, c domain.CorrectionRecord) (int64, error) {
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		var err error
-		id, err = insertCorrectionTx(ctx, tx, c)
+		nodeID, err := s.auditNodeTx(ctx, tx, c.AuditID)
+		if err != nil {
+			return err
+		}
+		id, err = s.insertCorrectionTx(ctx, tx, nodeID, c)
 		return err
 	})
 	return id, err
 }
 
+// auditNodeTx returns the node that owns an audit row — the node whose daemon
+// must act on anything filed against it (a correction to deliver, an LLM
+// retry). A row that does not exist yields this node, so a caller writing
+// bookkeeping for a vanished audit id still files it somewhere it can be seen.
+func (s *Store) auditNodeTx(ctx context.Context, tx *sql.Tx, auditID int64) (string, error) {
+	var nodeID string
+	err := tx.QueryRowContext(ctx, `SELECT node_id FROM audit_log WHERE id = ?`, auditID).Scan(&nodeID)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && nodeID == "") {
+		return s.self, nil
+	}
+	return nodeID, err
+}
+
 // insertCorrectionTx is the insert itself, factored out so InsertCorrectionWithDelivery
-// can write a correction and its delivery request in ONE transaction.
-func insertCorrectionTx(ctx context.Context, tx *sql.Tx, c domain.CorrectionRecord) (int64, error) {
+// can write a correction and its delivery request in ONE transaction. nodeID is
+// the AUDIT row's node: the correction is drained by the daemon that owns the
+// escalation, wherever the operator typed it.
+func (s *Store) insertCorrectionTx(ctx context.Context, tx *sql.Tx, nodeID string, c domain.CorrectionRecord) (int64, error) {
 	sent := 0
 	if c.Sent {
 		sent = 1
 	}
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO corrections (audit_id, corrected_action, author, processed, sent, created_at)
-		VALUES (?, ?, ?, 0, ?, ?)`,
-		c.AuditID, c.CorrectedAction, orDefault(c.Author, "operator"), sent, unix(c.CreatedAt))
+		INSERT INTO corrections (id, node_id, audit_id, corrected_action, author, processed, sent, created_at)
+		VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
+		s.nextID(), nodeID, c.AuditID, c.CorrectedAction, orDefault(c.Author, "operator"), sent, unix(c.CreatedAt))
 	if err != nil {
 		return 0, err
 	}
@@ -873,9 +639,13 @@ func insertCorrectionTx(ctx context.Context, tx *sql.Tx, c domain.CorrectionReco
 func (s *Store) InsertLLMRetry(ctx context.Context, auditID int64, now time.Time) (int64, error) {
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
+		nodeID, err := s.auditNodeTx(ctx, tx, auditID)
+		if err != nil {
+			return err
+		}
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO llm_retries (audit_id, processed, created_at)
-			VALUES (?, 0, ?)`, auditID, unix(now))
+			INSERT INTO llm_retries (id, node_id, audit_id, processed, created_at)
+			VALUES (?, ?, ?, 0, ?)`, s.nextID(), nodeID, auditID, unix(now))
 		if err != nil {
 			return err
 		}
@@ -891,9 +661,10 @@ func (s *Store) InsertKillEvent(ctx context.Context, e domain.KillEvent) (int64,
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO kill_events (state, scope, author, created_at)
-			VALUES (?, ?, ?, ?)`,
-			e.State, orDefault(e.Scope, domain.KillScopeGlobal), orDefault(e.Author, "operator"), unix(e.CreatedAt))
+			INSERT INTO kill_events (id, node_id, state, scope, author, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			s.nextID(), orDefault(e.NodeID, s.self), e.State, orDefault(e.Scope, domain.KillScopeGlobal),
+			orDefault(e.Author, "operator"), unix(e.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -904,11 +675,22 @@ func (s *Store) InsertKillEvent(ctx context.Context, e domain.KillEvent) (int64,
 }
 
 // ClearLearnedData resets learned history and audit data (DR-004).
+//
+// This node's operational rows (its audit log, corrections, rate and retry
+// counters, LLM queues) are cleared by node; the learned KNOWLEDGE tables —
+// signatures, decisions, embeddings, snapshots — are content-keyed and shared,
+// so they are cleared outright. Under one machine the two are the same
+// database; under a shared one the knowledge wipe reaches every node, which is
+// what "forget what was learned" means, and the callers say so.
 func (s *Store) ClearLearnedData(ctx context.Context) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		for _, table := range []string{"signatures", "decisions", "audit_log", "corrections",
-			"agent_rate", "error_retries", "llm_requests", "llm_decisions", "llm_retries",
-			"signature_embeddings", "signature_snapshots"} {
+		for _, table := range []string{"audit_log", "corrections",
+			"agent_rate", "error_retries", "llm_requests", "llm_decisions", "llm_retries"} {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE node_id = ?", s.self); err != nil {
+				return err
+			}
+		}
+		for _, table := range []string{"signatures", "decisions", "signature_embeddings", "signature_snapshots"} {
 			if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 				return err
 			}
@@ -1073,11 +855,11 @@ func (s *Store) InsertLLMDecision(ctx context.Context, d domain.LLMDecision) (in
 			taskActions = string(blob)
 		}
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO llm_decisions (request_id, signature, situation_type, agent_type,
-				action, option_id, rationale, confident_score, captured_output, status, created_at,
-				task_actions_json, send_task)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			d.RequestID, d.Signature, string(d.SituationType), d.AgentType,
+			INSERT INTO llm_decisions (id, node_id, request_id, signature, situation_type, agent_type,
+					action, option_id, rationale, confident_score, captured_output, status, created_at,
+					task_actions_json, send_task)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			s.nextID(), s.self, d.RequestID, d.Signature, string(d.SituationType), d.AgentType,
 			d.Action, d.OptionID, d.Rationale, d.ConfidentScore, d.CapturedOutput,
 			orDefault(d.Status, "pending"), unix(d.CreatedAt),
 			taskActions, d.SendTask)
@@ -1134,7 +916,7 @@ func (s *Store) CountDecisionsForSignature(ctx context.Context, signature string
 
 // decisionCols is the column list every decision read selects, in scanDecision's
 // scan order. Shared so the single and batched forms cannot drift apart.
-const decisionCols = `id, signature, situation_type, agent_type, chosen_action, source,
+const decisionCols = `id, node_id, signature, situation_type, agent_type, chosen_action, source,
 	confidence_at_decision, is_correction, created_at`
 
 // scanDecision reads one decisions row selected as decisionCols.
@@ -1143,7 +925,7 @@ func scanDecision(rows *sql.Rows) (domain.DecisionRecord, error) {
 	var situationType, source string
 	var isCorrection int
 	var created int64
-	if err := rows.Scan(&d.ID, &d.Signature, &situationType, &d.AgentType,
+	if err := rows.Scan(&d.ID, &d.NodeID, &d.Signature, &situationType, &d.AgentType,
 		&d.ChosenAction, &source, &d.Confidence, &isCorrection, &created); err != nil {
 		return d, err
 	}
@@ -1541,9 +1323,10 @@ func (s *Store) AutoAcceptableEscalations(ctx context.Context, cutoffs map[domai
 	// forever. The REASON exclusion deliberately stays in Go — LIKE-matching a
 	// free-text rationale fails open, which is the wrong direction for a safety
 	// exclusion.
-	q := `SELECT ` + auditCols + ` FROM audit_log WHERE status = 'escalated'
+	q := `SELECT ` + auditCols + ` FROM audit_log WHERE node_id = ? AND status = 'escalated'
 		AND sig_raw != '' AND suggestion != '' AND (` +
 		strings.Join(clauses, " OR ") + `) ORDER BY created_at ASC, id ASC LIMIT ?`
+	args = append([]any{s.self}, args...)
 	args = append(args, autoAcceptCandidateLimit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -1623,8 +1406,8 @@ func (s *Store) ReclaimAbandonedAutoAccepts(ctx context.Context) (int64, error) 
 	var n int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = 'escalated' WHERE status = ?`,
-			domain.AuditStatusAutoAccepting)
+			`UPDATE audit_log SET status = 'escalated' WHERE node_id = ? AND status = ?`,
+			s.self, domain.AuditStatusAutoAccepting)
 		if err != nil {
 			return err
 		}
@@ -1674,7 +1457,7 @@ func (s *Store) guardedStatus(ctx context.Context, auditID int64, from, to strin
 	var claimed bool
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = ? WHERE id = ? AND status = ?`, to, auditID, from)
+			`UPDATE audit_log SET status = ? WHERE id = ? AND status = ? AND node_id = ?`, to, auditID, from, s.self)
 		if err != nil {
 			return err
 		}
@@ -1694,8 +1477,8 @@ func (s *Store) DismissEscalationsBefore(ctx context.Context, cutoff time.Time) 
 	var dismissed int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = 'dismissed' WHERE status = 'escalated' AND created_at < ?`,
-			unix(cutoff))
+			`UPDATE audit_log SET status = 'dismissed' WHERE node_id = ? AND status = 'escalated' AND created_at < ?`,
+			s.self, unix(cutoff))
 		if err != nil {
 			return err
 		}
@@ -1786,12 +1569,18 @@ func (s *Store) LatestAuditsForSignatures(ctx context.Context) (map[string]*doma
 // operator believes the kill switch is still down. Legacy rows predate the FSP
 // stream and all carry the 'global' default, so no backfill is needed.
 func (s *Store) LatestKillEvent(ctx context.Context) (*domain.KillEvent, error) {
+	return s.LatestKillEventOn(ctx, s.self)
+}
+
+// LatestKillEventOn is LatestKillEvent for any node: the unified view shows
+// which machines are paused, and `hap pause --node` targets one.
+func (s *Store) LatestKillEventOn(ctx context.Context, nodeID string) (*domain.KillEvent, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, state, scope, author, created_at FROM kill_events
-		 WHERE scope = ? ORDER BY id DESC LIMIT 1`, domain.KillScopeGlobal)
+		`SELECT id, node_id, state, scope, author, created_at FROM kill_events
+		 WHERE node_id = ? AND scope = ? ORDER BY id DESC LIMIT 1`, nodeID, domain.KillScopeGlobal)
 	var e domain.KillEvent
 	var created int64
-	err := row.Scan(&e.ID, &e.State, &e.Scope, &e.Author, &created)
+	err := row.Scan(&e.ID, &e.NodeID, &e.State, &e.Scope, &e.Author, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1810,7 +1599,7 @@ func (s *Store) KillEvents(ctx context.Context, limit int) ([]domain.KillEvent, 
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, state, scope, author, created_at FROM kill_events ORDER BY id DESC LIMIT ?`, limit)
+		`SELECT id, node_id, state, scope, author, created_at FROM kill_events ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1819,7 +1608,7 @@ func (s *Store) KillEvents(ctx context.Context, limit int) ([]domain.KillEvent, 
 	for rows.Next() {
 		var e domain.KillEvent
 		var created int64
-		if err := rows.Scan(&e.ID, &e.State, &e.Scope, &e.Author, &created); err != nil {
+		if err := rows.Scan(&e.ID, &e.NodeID, &e.State, &e.Scope, &e.Author, &created); err != nil {
 			return nil, err
 		}
 		e.CreatedAt = fromUnix(created)
@@ -1838,7 +1627,7 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 		var sigVerdict string
 		var created int64
 		var llmConf sql.NullInt64
-		if err := rows.Scan(&a.ID, &a.DecisionID, &a.AgentID, &a.AgentType, &a.Signature, &a.Trigger,
+		if err := rows.Scan(&a.ID, &a.NodeID, &a.DecisionID, &a.AgentID, &a.AgentType, &a.Signature, &a.Trigger,
 			&situationType, &a.Action, &a.Input, &a.Confidence, &llmConf, &a.Rationale,
 			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &a.PaneExcerpt,
 			&matchMethod, &a.MatchScore, &a.EmbedError,
@@ -1861,7 +1650,7 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 
 // auditCols is the column list every audit query selects. It is POSITIONALLY
 // coupled to scanAudits and to AppendAudit's INSERT — change all three together.
-const auditCols = `id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
+const auditCols = `id, node_id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
 	action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
 	corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
 	sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id,
@@ -1911,6 +1700,31 @@ func (s *Store) CountPendingEscalations(ctx context.Context) (int64, error) {
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM audit_log WHERE status = 'escalated'`).Scan(&n)
 	return n, err
+}
+
+// CountPendingEscalationsOn counts one node's pending escalations.
+func (s *Store) CountPendingEscalationsOn(ctx context.Context, nodeID string) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM audit_log WHERE node_id = ? AND status = 'escalated'`, nodeID).Scan(&n)
+	return n, err
+}
+
+// HasOpenEscalation reports whether one of THIS node's agents has a pending
+// escalation. It is the daemon's reconcile guard, and it is node-scoped for a
+// reason that is easy to miss: an agent id is a herdr pane id, and pane "1" on
+// this machine and pane "1" on another are different agents. A fleet-wide read
+// filtered by agent id in Go would suppress this node's reconcile because of
+// the other machine's open question.
+func (s *Store) HasOpenEscalation(ctx context.Context, agentID string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM audit_log WHERE node_id = ? AND agent_id = ? AND status = 'escalated' LIMIT 1`,
+		s.self, agentID).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (s *Store) PendingEscalations(ctx context.Context) ([]domain.AuditRecord, error) {
@@ -1982,7 +1796,8 @@ func (s *Store) PruneAuditExcerpts(ctx context.Context, now, cutoff time.Time) (
 	}
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE audit_log SET pane_excerpt = ''
-			WHERE pane_excerpt != ''
+			WHERE node_id = ?
+			  AND pane_excerpt != ''
 			  AND created_at < ?
 			  AND status NOT IN ('escalated', ?)
 			  AND NOT EXISTS (SELECT 1 FROM llm_retries r
@@ -1990,10 +1805,11 @@ func (s *Store) PruneAuditExcerpts(ctx context.Context, now, cutoff time.Time) (
 			  AND NOT EXISTS (SELECT 1 FROM corrections c
 					WHERE c.audit_id = audit_log.id AND c.sent = 1
 					  AND c.created_at >= ?)`,
-		unix(cutoff), domain.AuditStatusAutoAccepting, unix(now.Add(-AuditExcerptDedupMargin)))
+		s.self, unix(cutoff), domain.AuditStatusAutoAccepting, unix(now.Add(-AuditExcerptDedupMargin)))
 	if err != nil {
 		return 0, fmt.Errorf("prune audit excerpts: %w", err)
 	}
+	s.noteWrite()
 	return res.RowsAffected()
 }
 
@@ -2092,25 +1908,25 @@ func (s *Store) PendingEscalationExcerpts(ctx context.Context, agentID, agentTyp
 	// Group 1: all still-pending escalations, unbounded in time.
 	pending, err := s.scanEscalationExcerpts(ctx,
 		`SELECT situation_type, pane_excerpt FROM audit_log a
-			WHERE a.agent_id = ? AND a.agent_type = ? AND a.status = 'escalated'
+			WHERE a.node_id = ? AND a.agent_id = ? AND a.agent_type = ? AND a.status = 'escalated'
 			  AND NOT EXISTS (SELECT 1 FROM llm_retries r
 					WHERE r.audit_id = a.id AND r.processed = 0)
 			ORDER BY a.id DESC LIMIT ?`,
-		agentID, agentType, PendingEscalationDedupLimit)
+		s.self, agentID, agentType, PendingEscalationDedupLimit)
 	if err != nil {
 		return nil, err
 	}
 	// Group 2: recently-delivered, originally-escalated resolved asks.
 	resolved, err := s.scanEscalationExcerpts(ctx,
 		`SELECT a.situation_type, a.pane_excerpt FROM audit_log a
-			WHERE a.agent_id = ? AND a.agent_type = ? AND a.status = 'resolved'
+			WHERE a.node_id = ? AND a.agent_id = ? AND a.agent_type = ? AND a.status = 'resolved'
 			  AND a.action_or_escalation = ?
 			  AND EXISTS (SELECT 1 FROM corrections c
 					WHERE c.audit_id = a.id AND c.sent = 1 AND c.created_at >= ?)
 			  AND NOT EXISTS (SELECT 1 FROM llm_retries r
 					WHERE r.audit_id = a.id AND r.processed = 0)
 			ORDER BY a.id DESC LIMIT ?`,
-		agentID, agentType, domain.AuditActionEscalated, unix(resolvedSince), PendingEscalationDedupLimit)
+		s.self, agentID, agentType, domain.AuditActionEscalated, unix(resolvedSince), PendingEscalationDedupLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -2151,14 +1967,14 @@ func (s *Store) scanEscalationExcerpts(ctx context.Context, query string, args .
 // long-standing contract that a learning event survives a failed send.
 func (s *Store) UnprocessedCorrections(ctx context.Context) ([]domain.CorrectionRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, audit_id, corrected_action, author, processed, sent, created_at
+		SELECT id, node_id, audit_id, corrected_action, author, processed, sent, created_at
 		FROM corrections c
-		WHERE c.processed = 0
+		WHERE c.node_id = ? AND c.processed = 0
 		  AND NOT EXISTS (
 			SELECT 1 FROM agent_actions a
 			WHERE a.correction_id = c.id AND a.status IN ('pending', 'running')
 		  )
-		ORDER BY c.id ASC`)
+		ORDER BY c.id ASC`, s.self)
 	if err != nil {
 		return nil, err
 	}
@@ -2168,7 +1984,7 @@ func (s *Store) UnprocessedCorrections(ctx context.Context) ([]domain.Correction
 		var c domain.CorrectionRecord
 		var processed, sent int
 		var created int64
-		if err := rows.Scan(&c.ID, &c.AuditID, &c.CorrectedAction, &c.Author, &processed, &sent, &created); err != nil {
+		if err := rows.Scan(&c.ID, &c.NodeID, &c.AuditID, &c.CorrectedAction, &c.Author, &processed, &sent, &created); err != nil {
 			return nil, err
 		}
 		c.Processed = processed != 0
@@ -2182,8 +1998,8 @@ func (s *Store) UnprocessedCorrections(ctx context.Context) ([]domain.Correction
 // UnprocessedLLMRetries returns queued LLM-retry requests in insertion order.
 func (s *Store) UnprocessedLLMRetries(ctx context.Context) ([]domain.LLMRetry, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, audit_id, processed, created_at
-		FROM llm_retries WHERE processed = 0 ORDER BY id ASC`)
+		SELECT id, node_id, audit_id, processed, created_at
+		FROM llm_retries WHERE node_id = ? AND processed = 0 ORDER BY id ASC`, s.self)
 	if err != nil {
 		return nil, err
 	}
@@ -2193,7 +2009,7 @@ func (s *Store) UnprocessedLLMRetries(ctx context.Context) ([]domain.LLMRetry, e
 		var r domain.LLMRetry
 		var processed int
 		var created int64
-		if err := rows.Scan(&r.ID, &r.AuditID, &processed, &created); err != nil {
+		if err := rows.Scan(&r.ID, &r.NodeID, &r.AuditID, &processed, &created); err != nil {
 			return nil, err
 		}
 		r.Processed = processed != 0
@@ -2238,7 +2054,7 @@ func (s *Store) RetireEscalationForRetry(ctx context.Context, auditID int64) (bo
 func (s *Store) GetAgentRate(ctx context.Context, agentID string) (*domain.AgentRate, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT agent_id, consecutive_auto, window_start, count_in_window, paused
-		FROM agent_rate WHERE agent_id = ?`, agentID)
+		FROM agent_rate WHERE node_id = ? AND agent_id = ?`, s.self, agentID)
 	var r domain.AgentRate
 	var windowStart int64
 	var paused int
@@ -2265,10 +2081,10 @@ func (s *Store) RecordTaskReservation(ctx context.Context, r domain.TaskReservat
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			INSERT INTO task_reservations
-				(source_path, task_text, item_index, agent_id, pane_id, terminal_id, audit_id,
+				(id, node_id, source_path, task_text, item_index, agent_id, pane_id, terminal_id, audit_id,
 				 reserved_at, restamps, confirmed_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`,
-			r.SourcePath, r.TaskText, r.ItemIndex, r.AgentID, r.PaneID, r.TerminalID,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`,
+			s.nextID(), s.self, r.SourcePath, r.TaskText, r.ItemIndex, r.AgentID, r.PaneID, r.TerminalID,
 			r.AuditID, unix(r.ReservedAt))
 		if err != nil {
 			return err
@@ -2277,11 +2093,11 @@ func (s *Store) RecordTaskReservation(ctx context.Context, r domain.TaskReservat
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO task_handouts (source_path, task_text, attempts, updated_at)
-			VALUES (?, ?, 1, ?)
-			ON CONFLICT(source_path, task_text)
+			INSERT INTO task_handouts (node_id, source_path, task_text, attempts, updated_at)
+			VALUES (?, ?, ?, 1, ?)
+			ON CONFLICT(node_id, source_path, task_text)
 			DO UPDATE SET attempts = attempts + 1, updated_at = excluded.updated_at`,
-			r.SourcePath, r.TaskText, unix(r.ReservedAt))
+			s.self, r.SourcePath, r.TaskText, unix(r.ReservedAt))
 		return err
 	})
 	return id, err
@@ -2302,16 +2118,16 @@ func (s *Store) RecordTaskHandoutAttempt(ctx context.Context, sourcePath, taskTe
 	var attempts int
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO task_handouts (source_path, task_text, attempts, updated_at)
-			VALUES (?, ?, 1, ?)
-			ON CONFLICT(source_path, task_text)
+			INSERT INTO task_handouts (node_id, source_path, task_text, attempts, updated_at)
+			VALUES (?, ?, ?, 1, ?)
+			ON CONFLICT(node_id, source_path, task_text)
 			DO UPDATE SET attempts = attempts + 1, updated_at = excluded.updated_at`,
-			sourcePath, taskText, unix(at)); err != nil {
+			s.self, sourcePath, taskText, unix(at)); err != nil {
 			return err
 		}
 		return tx.QueryRowContext(ctx, `
-			SELECT attempts FROM task_handouts WHERE source_path = ? AND task_text = ?`,
-			sourcePath, taskText).Scan(&attempts)
+			SELECT attempts FROM task_handouts WHERE node_id = ? AND source_path = ? AND task_text = ?`,
+			s.self, sourcePath, taskText).Scan(&attempts)
 	})
 	return attempts, err
 }
@@ -2322,9 +2138,9 @@ func (s *Store) RecordTaskHandoutAttempt(ctx context.Context, sourcePath, taskTe
 // the "[-]" it describes.
 func (s *Store) OpenTaskReservations(ctx context.Context) ([]domain.TaskReservation, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, source_path, task_text, item_index, agent_id, pane_id, terminal_id, audit_id,
+		SELECT id, node_id, source_path, task_text, item_index, agent_id, pane_id, terminal_id, audit_id,
 		       reserved_at, restamps, confirmed_at
-		FROM task_reservations ORDER BY id`)
+		FROM task_reservations WHERE node_id = ? ORDER BY id`, s.self)
 	if err != nil {
 		return nil, err
 	}
@@ -2333,7 +2149,7 @@ func (s *Store) OpenTaskReservations(ctx context.Context) ([]domain.TaskReservat
 	for rows.Next() {
 		var r domain.TaskReservation
 		var reserved, confirmed int64
-		if err := rows.Scan(&r.ID, &r.SourcePath, &r.TaskText, &r.ItemIndex, &r.AgentID, &r.PaneID,
+		if err := rows.Scan(&r.ID, &r.NodeID, &r.SourcePath, &r.TaskText, &r.ItemIndex, &r.AgentID, &r.PaneID,
 			&r.TerminalID, &r.AuditID, &reserved, &r.Restamps, &confirmed); err != nil {
 			return nil, err
 		}
@@ -2358,16 +2174,22 @@ func (s *Store) OpenTaskReservations(ctx context.Context) ([]domain.TaskReservat
 func (s *Store) ConfirmTaskReservations(ctx context.Context, agentID, terminalID string, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE task_reservations SET confirmed_at = ?
-		WHERE agent_id = ? AND confirmed_at = 0
+		WHERE node_id = ? AND agent_id = ? AND confirmed_at = 0
 		  AND (terminal_id = '' OR ? = '' OR terminal_id = ?)`,
-		unix(at), agentID, terminalID, terminalID)
+		unix(at), s.self, agentID, terminalID, terminalID)
+	if err == nil {
+		s.noteWrite()
+	}
 	return err
 }
 
 // DeleteTaskReservation retires one ledger row (confirmed, reclaimed, or gone
 // from the file).
 func (s *Store) DeleteTaskReservation(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM task_reservations WHERE id = ?`, id)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM task_reservations WHERE node_id = ? AND id = ?`, s.self, id)
+	if err == nil {
+		s.noteWrite()
+	}
 	return err
 }
 
@@ -2385,7 +2207,10 @@ func (s *Store) DeleteTaskReservation(ctx context.Context, id int64) error {
 func (s *Store) TouchTaskReservations(ctx context.Context, maxRestamps int, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE task_reservations SET reserved_at = ?, restamps = restamps + 1
-		WHERE confirmed_at = 0 AND restamps < ?`, unix(at), maxRestamps)
+		WHERE node_id = ? AND confirmed_at = 0 AND restamps < ?`, unix(at), s.self, maxRestamps)
+	if err == nil {
+		s.noteWrite()
+	}
 	return err
 }
 
@@ -2394,8 +2219,8 @@ func (s *Store) TouchTaskReservations(ctx context.Context, maxRestamps int, at t
 func (s *Store) TaskHandoutAttempts(ctx context.Context, sourcePath, taskText string) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `
-		SELECT attempts FROM task_handouts WHERE source_path = ? AND task_text = ?`,
-		sourcePath, taskText).Scan(&n)
+		SELECT attempts FROM task_handouts WHERE node_id = ? AND source_path = ? AND task_text = ?`,
+		s.self, sourcePath, taskText).Scan(&n)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -2406,7 +2231,10 @@ func (s *Store) TaskHandoutAttempts(ctx context.Context, sourcePath, taskText st
 // up (or completed, or edited) starts from zero if it is ever handed out again.
 func (s *Store) ClearTaskHandouts(ctx context.Context, sourcePath, taskText string) error {
 	_, err := s.db.ExecContext(ctx, `
-		DELETE FROM task_handouts WHERE source_path = ? AND task_text = ?`, sourcePath, taskText)
+		DELETE FROM task_handouts WHERE node_id = ? AND source_path = ? AND task_text = ?`, s.self, sourcePath, taskText)
+	if err == nil {
+		s.noteWrite()
+	}
 	return err
 }
 
@@ -2414,7 +2242,7 @@ func (s *Store) ClearTaskHandouts(ctx context.Context, sourcePath, taskText stri
 func (s *Store) GetErrorRetry(ctx context.Context, errorSignature string) (*domain.ErrorRetry, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT error_signature, agent_id, retry_count, updated_at
-		FROM error_retries WHERE error_signature = ?`, errorSignature)
+		FROM error_retries WHERE node_id = ? AND error_signature = ?`, s.self, errorSignature)
 	var e domain.ErrorRetry
 	var updated int64
 	err := row.Scan(&e.ErrorSignature, &e.AgentID, &e.RetryCount, &updated)
@@ -2431,12 +2259,12 @@ func (s *Store) GetErrorRetry(ctx context.Context, errorSignature string) (*doma
 // GetLLMRequest returns a staged LLM request by request id, or nil.
 func (s *Store) GetLLMRequest(ctx context.Context, requestID string) (*domain.LLMRequest, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, request_id, signature, situation_type, agent_type, agent_id, context_json, status, created_at
+		SELECT id, node_id, request_id, signature, situation_type, agent_type, agent_id, context_json, status, created_at
 		FROM llm_requests WHERE request_id = ?`, requestID)
 	var r domain.LLMRequest
 	var situationType string
 	var created int64
-	err := row.Scan(&r.ID, &r.RequestID, &r.Signature, &situationType, &r.AgentType,
+	err := row.Scan(&r.ID, &r.NodeID, &r.RequestID, &r.Signature, &situationType, &r.AgentType,
 		&r.AgentID, &r.ContextJSON, &r.Status, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2478,7 +2306,7 @@ func (s *Store) EnsureAgentName(ctx context.Context, agentID string) (string, er
 			}
 			var n int
 			if err := s.db.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM agent_names WHERE name = ?`, name).Scan(&n); err != nil {
+				`SELECT COUNT(*) FROM agent_names WHERE node_id = ? AND name = ?`, s.self, name).Scan(&n); err != nil {
 				probeErr = err
 				return false
 			}
@@ -2490,8 +2318,8 @@ func (s *Store) EnsureAgentName(ctx context.Context, agentID string) (string, er
 		}
 		err := s.tx(ctx, func(tx *sql.Tx) error {
 			_, err := tx.ExecContext(ctx,
-				`INSERT OR IGNORE INTO agent_names (agent_id, name, created_at) VALUES (?, ?, ?)`,
-				agentID, name, time.Now().UnixMilli())
+				`INSERT OR IGNORE INTO agent_names (node_id, agent_id, name, created_at) VALUES (?, ?, ?, ?)`,
+				s.self, agentID, name, time.Now().UnixMilli())
 			return err
 		})
 		if err != nil {
@@ -2523,7 +2351,7 @@ func (s *Store) SyncAgentTerminalID(ctx context.Context, agentID, terminalID str
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var stored string
 		err := tx.QueryRowContext(ctx,
-			`SELECT terminal_id FROM agent_names WHERE agent_id = ?`, agentID).Scan(&stored)
+			`SELECT terminal_id FROM agent_names WHERE node_id = ? AND agent_id = ?`, s.self, agentID).Scan(&stored)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -2537,13 +2365,13 @@ func (s *Store) SyncAgentTerminalID(ctx context.Context, agentID, terminalID str
 			// First observation for a pre-existing row: adopt the id without
 			// touching created_at (no evidence the terminal changed).
 			_, err = tx.ExecContext(ctx,
-				`UPDATE agent_names SET terminal_id = ? WHERE agent_id = ?`,
-				terminalID, agentID)
+				`UPDATE agent_names SET terminal_id = ? WHERE node_id = ? AND agent_id = ?`,
+				terminalID, s.self, agentID)
 			return err
 		default:
 			_, err = tx.ExecContext(ctx,
-				`UPDATE agent_names SET terminal_id = ?, created_at = ? WHERE agent_id = ?`,
-				terminalID, time.Now().UnixMilli(), agentID)
+				`UPDATE agent_names SET terminal_id = ?, created_at = ? WHERE node_id = ? AND agent_id = ?`,
+				terminalID, time.Now().UnixMilli(), s.self, agentID)
 			if err == nil {
 				wantReset = true
 			}
@@ -2559,7 +2387,7 @@ func (s *Store) SyncAgentTerminalID(ctx context.Context, agentID, terminalID str
 func (s *Store) agentNameByID(ctx context.Context, agentID string) (string, error) {
 	var name string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT name FROM agent_names WHERE agent_id = ?`, agentID).Scan(&name)
+		`SELECT name FROM agent_names WHERE node_id = ? AND agent_id = ?`, s.self, agentID).Scan(&name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -2596,17 +2424,17 @@ func (s *Store) AssignAgentName(ctx context.Context, agentID, name string) error
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		var n int
 		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM agent_names WHERE name = ? AND agent_id != ?`,
-			name, agentID).Scan(&n); err != nil {
+			`SELECT COUNT(*) FROM agent_names WHERE node_id = ? AND name = ? AND agent_id != ?`,
+			s.self, name, agentID).Scan(&n); err != nil {
 			return err
 		}
 		if n > 0 {
 			return fmt.Errorf("name %q is already taken", name)
 		}
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO agent_names (agent_id, name, created_at) VALUES (?, ?, ?)
-			ON CONFLICT(agent_id) DO UPDATE SET name = excluded.name`,
-			agentID, name, time.Now().UnixMilli())
+			INSERT INTO agent_names (node_id, agent_id, name, created_at) VALUES (?, ?, ?, ?)
+			ON CONFLICT(node_id, agent_id) DO UPDATE SET name = excluded.name`,
+			s.self, agentID, name, time.Now().UnixMilli())
 		return err
 	})
 }
@@ -2640,7 +2468,7 @@ func (s *Store) AdoptAgentName(ctx context.Context, agentID, base string) (strin
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var current string
 		err := tx.QueryRowContext(ctx,
-			`SELECT name FROM agent_names WHERE agent_id = ?`, agentID).Scan(&current)
+			`SELECT name FROM agent_names WHERE node_id = ? AND agent_id = ?`, s.self, agentID).Scan(&current)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("no agent known as %q: %w", agentID, ports.ErrUnknownAgent)
 		}
@@ -2655,15 +2483,15 @@ func (s *Store) AdoptAgentName(ctx context.Context, agentID, base string) (strin
 			candidate := domain.SuffixedAgentName(base, n)
 			var taken int
 			if err := tx.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM agent_names WHERE name = ? AND agent_id != ?`,
-				candidate, agentID).Scan(&taken); err != nil {
+				`SELECT COUNT(*) FROM agent_names WHERE node_id = ? AND name = ? AND agent_id != ?`,
+				s.self, candidate, agentID).Scan(&taken); err != nil {
 				return err
 			}
 			if taken > 0 {
 				continue
 			}
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE agent_names SET name = ? WHERE agent_id = ?`, candidate, agentID); err != nil {
+				`UPDATE agent_names SET name = ? WHERE node_id = ? AND agent_id = ?`, candidate, s.self, agentID); err != nil {
 				return err
 			}
 			assigned = candidate
@@ -2683,7 +2511,7 @@ func (s *Store) AdoptAgentName(ctx context.Context, agentID, base string) (strin
 func (s *Store) ResolveAgent(ctx context.Context, target string) (string, error) {
 	var agentID string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT agent_id FROM agent_names WHERE name = ?`, target).Scan(&agentID)
+		`SELECT agent_id FROM agent_names WHERE node_id = ? AND name = ?`, s.self, target).Scan(&agentID)
 	if err == nil {
 		return agentID, nil
 	}
@@ -2693,9 +2521,12 @@ func (s *Store) ResolveAgent(ctx context.Context, target string) (string, error)
 	return target, nil
 }
 
-// AgentNames returns every agent id → short name mapping.
+// AgentNames returns every agent id → short name mapping for THIS node's
+// agents. It is keyed by agent id, and an agent id is a pane id that repeats
+// on every machine, so this map can only ever describe one node; the fleet
+// view reads FleetAgentNames.
 func (s *Store) AgentNames(ctx context.Context) (map[string]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT agent_id, name FROM agent_names`)
+	rows, err := s.db.QueryContext(ctx, `SELECT agent_id, name FROM agent_names WHERE node_id = ?`, s.self)
 	if err != nil {
 		return nil, err
 	}
@@ -2729,7 +2560,7 @@ func (s *Store) SetAgentDisabled(ctx context.Context, target string, disabled bo
 		value = 1
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE agent_names SET disabled = ? WHERE agent_id = ?`, value, agentID)
+		`UPDATE agent_names SET disabled = ? WHERE node_id = ? AND agent_id = ?`, value, s.self, agentID)
 	if err != nil {
 		return err
 	}
@@ -2740,6 +2571,7 @@ func (s *Store) SetAgentDisabled(ctx context.Context, target string, disabled bo
 	if n == 0 {
 		return fmt.Errorf("no agent known as %q: %w", target, ports.ErrUnknownAgent)
 	}
+	s.noteWrite()
 	return nil
 }
 
@@ -2798,7 +2630,7 @@ func (s *Store) lockAgentAutomation(ctx context.Context, agentID string) (func()
 func (s *Store) AgentDisabled(ctx context.Context, agentID string) (bool, error) {
 	var disabled int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT disabled FROM agent_names WHERE agent_id = ?`, agentID).Scan(&disabled)
+		`SELECT disabled FROM agent_names WHERE node_id = ? AND agent_id = ?`, s.self, agentID).Scan(&disabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -2808,7 +2640,7 @@ func (s *Store) AgentDisabled(ctx context.Context, agentID string) (bool, error)
 // DisabledAgents returns the disabled agent ids for operator-facing views.
 func (s *Store) DisabledAgents(ctx context.Context) (map[string]bool, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT agent_id FROM agent_names WHERE disabled != 0`)
+		`SELECT agent_id FROM agent_names WHERE node_id = ? AND disabled != 0`, s.self)
 	if err != nil {
 		return nil, err
 	}
@@ -2841,11 +2673,12 @@ func (s *Store) AgentStats(ctx context.Context) (map[string]domain.AgentStats, e
 			SUM(CASE WHEN a.trigger = ? AND a.rationale = ? THEN 1 ELSE 0 END),
 			SUM(CASE WHEN a.trigger = ? AND a.rationale = ? THEN 1 ELSE 0 END)
 		FROM agent_names n
-		LEFT JOIN audit_log a ON a.agent_id = n.agent_id
+		LEFT JOIN audit_log a ON a.node_id = n.node_id AND a.agent_id = n.agent_id
+		WHERE n.node_id = ?
 		GROUP BY n.agent_id, n.created_at`,
 		domain.AuditActionAutoPrefix+"%", domain.AuditActionEscalated,
 		domain.TriggerOperatorCorrection, domain.RationaleOperatorConfirmed,
-		domain.TriggerOperatorCorrection, domain.RationaleOperatorCorrected)
+		domain.TriggerOperatorCorrection, domain.RationaleOperatorCorrected, s.self)
 	if err != nil {
 		return nil, err
 	}
@@ -2871,12 +2704,12 @@ func (s *Store) AgentStats(ctx context.Context) (map[string]domain.AgentStats, e
 // LatestPendingLLMRequest returns the newest pending staged request, or nil.
 func (s *Store) LatestPendingLLMRequest(ctx context.Context) (*domain.LLMRequest, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, request_id, signature, situation_type, agent_type, context_json, status, created_at
-		FROM llm_requests WHERE status = 'pending' ORDER BY id DESC LIMIT 1`)
+		SELECT id, node_id, request_id, signature, situation_type, agent_type, context_json, status, created_at
+		FROM llm_requests WHERE node_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`, s.self)
 	var r domain.LLMRequest
 	var situationType string
 	var created int64
-	err := row.Scan(&r.ID, &r.RequestID, &r.Signature, &situationType, &r.AgentType,
+	err := row.Scan(&r.ID, &r.NodeID, &r.RequestID, &r.Signature, &situationType, &r.AgentType,
 		&r.ContextJSON, &r.Status, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2896,7 +2729,7 @@ func (s *Store) scanLLMDecisions(rows *sql.Rows) ([]domain.LLMDecision, error) {
 		var d domain.LLMDecision
 		var situationType, taskActions string
 		var created int64
-		if err := rows.Scan(&d.ID, &d.RequestID, &d.Signature, &situationType, &d.AgentType,
+		if err := rows.Scan(&d.ID, &d.NodeID, &d.RequestID, &d.Signature, &situationType, &d.AgentType,
 			&d.Action, &d.OptionID, &d.Rationale, &d.ConfidentScore, &d.CapturedOutput, &d.Status, &created,
 			&taskActions, &d.SendTask); err != nil {
 			return nil, err
@@ -2919,14 +2752,14 @@ func (s *Store) scanLLMDecisions(rows *sql.Rows) ([]domain.LLMDecision, error) {
 	return out, rows.Err()
 }
 
-const llmDecisionCols = `id, request_id, signature, situation_type, agent_type,
+const llmDecisionCols = `id, node_id, request_id, signature, situation_type, agent_type,
 	action, option_id, rationale, confident_score, captured_output, status, created_at,
 	task_actions_json, send_task`
 
 // PendingLLMDecisions returns staged decisions awaiting daemon consumption.
 func (s *Store) PendingLLMDecisions(ctx context.Context) ([]domain.LLMDecision, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+llmDecisionCols+` FROM llm_decisions WHERE status = 'pending' ORDER BY id ASC`)
+		`SELECT `+llmDecisionCols+` FROM llm_decisions WHERE node_id = ? AND status = 'pending' ORDER BY id ASC`, s.self)
 	if err != nil {
 		return nil, err
 	}

@@ -144,6 +144,16 @@ func (d *Daemon) processAgentActions(ctx context.Context) {
 func (d *Daemon) runAgentAction(ctx context.Context, a domain.AgentAction) {
 	now := d.opt.Clock.Now()
 
+	// Belt and braces over the store's own node-scoped claim: a row filed for
+	// another machine's agent must never reach an executor here, because its
+	// target pane id is a herdr id that this machine's herdr may well ALSO
+	// have — pointing at a different agent.
+	if a.NodeID != "" && a.NodeID != d.opt.Store.NodeID() {
+		slog.Warn("agent actions: skipping an action that belongs to another node",
+			"action", a.ID, "node", a.NodeID, "self", d.opt.Store.NodeID())
+		return
+	}
+
 	// The claim comes FIRST, even for rows that are about to be refused:
 	// FinishAgentAction is guarded on 'running' so that it can only ever
 	// advance this daemon's own claim, which means a refusal written over a

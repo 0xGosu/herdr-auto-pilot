@@ -10,8 +10,10 @@ require (
 	github.com/google/go-github/v90 v90.0.0
 	github.com/mattn/go-runewidth v0.0.16
 	github.com/tcpipuk/llama-go v0.0.0-20260702185908-8fdbada9fdd0
+	github.com/tursodatabase/turso-go-platform-libs v0.7.2
 	golang.org/x/term v0.45.0
 	modernc.org/sqlite v1.53.0
+	turso.tech/database/tursogo v0.7.2
 )
 
 require (
@@ -41,6 +43,7 @@ require (
 	github.com/charmbracelet/x/cellbuf v0.0.13-0.20250311204145-2c3ea96c31dd // indirect
 	github.com/charmbracelet/x/term v0.2.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/ebitengine/purego v0.9.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect

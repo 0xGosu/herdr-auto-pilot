@@ -69,7 +69,12 @@ type refreshMsg struct {
 	kills       []domain.KillEvent
 	signatures  []frontend.SignatureRow
 	tasks       []frontend.TaskGroup
-	cfg         config.Config
+	// fleetTasks are OTHER nodes' database-kept lists (frontend.FleetTaskGroups).
+	// They render after the configured sources and are addressed by their
+	// locator alone — a row's group index for them is len(tasks)+k, which every
+	// "is this a configured source?" guard already reads as "no".
+	fleetTasks []frontend.TaskGroup
+	cfg        config.Config
 	// daemonHealth combines lock + heartbeat + crash-loop state for the health
 	// banner, so the operator sees a hung/degraded/crash-looping daemon that
 	// otherwise looks identical to "all quiet" (no escalations).
@@ -1224,6 +1229,67 @@ func (m Model) taskRows() []taskRow {
 			}
 		}
 	}
+	return append(rows, m.fleetTaskRows(len(m.data.tasks))...)
+}
+
+// fleetTaskRows lays out other nodes' database-kept lists under the configured
+// sources: one header per list naming the node and the agent it feeds, then
+// its items. Rows are addressed by locator (group = base+k is past every
+// configured index), so toggling an item goes through the same path-keyed
+// mutation the `--path` escape hatch uses — and lands on the other machine's
+// list through the shared store. Sending is refused (the agent is not here).
+func (m Model) fleetTaskRows(base int) []taskRow {
+	var rows []taskRow
+	for k, g := range m.data.fleetTasks {
+		group := base + k
+		agent := g.Source.Agent
+		if agent == "" {
+			agent = "-"
+		}
+		hdr := fmt.Sprintf("node %s  agent=%s  %s", g.NodeLabel, agent,
+			truncatePathKeepBase(displayTaskAddress(g.Locator), taskPathDisplayWidth))
+		pending := 0
+		for _, it := range g.Items {
+			if !it.Done {
+				pending++
+			}
+		}
+		if g.Err == "" {
+			hdr += fmt.Sprintf("  (%d pending / %d)", pending, len(g.Items))
+		}
+		hfields := []string{"node", g.NodeLabel, agent, g.Display}
+		rows = append(rows, taskRow{text: oneLine(hdr, max(20, m.contentWidth())),
+			fields: hfields, header: true, group: group, path: g.Locator})
+		switch {
+		case g.Err != "":
+			rows = append(rows, taskRow{text: oneLine("  ✗ "+g.Err, max(20, m.contentWidth())),
+				fields: append([]string{g.Err}, hfields...), errRow: true, group: group, path: g.Locator})
+		case len(g.Items) == 0:
+			rows = append(rows, taskRow{text: "  (no tasks in this list)", fields: hfields,
+				group: group, path: g.Locator})
+		default:
+			for _, it := range g.Items {
+				markCh := "  "
+				if m.taskMarks[taskMarkKey(group, it.Index)] {
+					markCh = "✓ "
+				}
+				shown := domain.DisplayTaskText(it.Text)
+				marker := taskDetailMarker(it)
+				body := max(20, m.contentWidth()-12) - runewidth.StringWidth(marker)
+				rows = append(rows, taskRow{
+					text:       fmt.Sprintf("%s#%d [%s] %s%s", markCh, it.Index, it.Mark, oneLine(shown, body), marker),
+					fields:     append([]string{fmt.Sprintf("#%d", it.Index), shown, it.Mark}, hfields...),
+					done:       it.Done,
+					inProgress: it.Mark == domain.MarkInProgress,
+					group:      group,
+					item:       it.Index,
+					path:       g.Locator,
+					itemText:   it.Text,
+					itemDetail: it.Detail,
+				})
+			}
+		}
+	}
 	return rows
 }
 
@@ -1528,16 +1594,19 @@ func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refr
 	// Gate "retry LLM" per agent: a consult already in flight disables it.
 	// Best-effort — a lookup error just leaves the key enabled (the daemon
 	// guards authoritatively before re-consulting).
+	// Keyed by (node, agent), not agent alone: pane ids repeat across
+	// machines, so a remote escalation must be judged by ITS node's consults.
 	msg.pendingConsult = map[string]bool{}
 	checked := map[string]bool{}
 	for i := range msg.escalations {
 		e := msg.escalations[i]
-		if !domain.IsRetryableLLMEscalation(&e) || checked[e.AgentID] {
+		key := consultKey(e.NodeID, e.AgentID)
+		if !domain.IsRetryableLLMEscalation(&e) || checked[key] {
 			continue
 		}
-		checked[e.AgentID] = true
-		if pending, perr := app.HasPendingLLMConsult(ctx, e.AgentID); perr == nil && pending {
-			msg.pendingConsult[e.AgentID] = true
+		checked[key] = true
+		if pending, perr := app.HasPendingLLMConsultOn(ctx, e.NodeID, e.AgentID); perr == nil && pending {
+			msg.pendingConsult[key] = true
 		}
 	}
 	msg.audit, msg.err = app.Audit(ctx, 50)
@@ -1559,6 +1628,7 @@ func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refr
 		return msg
 	}
 	msg.tasks = app.TaskGroups(msg.cfg, msg.status)
+	msg.fleetTasks = app.FleetTaskGroups(ctx, msg.status)
 	// Both of these read the cached check file only — the fetch itself runs in
 	// updateCheckCmd, off this path, because refreshData runs on every tick.
 	msg.update = app.UpdateStatus(msg.cfg)
@@ -1855,6 +1925,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for _, g := range msg.tasks {
 				for _, it := range g.Items {
 					valid[taskMarkKey(g.Index, it.Index)] = true
+				}
+			}
+			for k, g := range msg.fleetTasks {
+				for _, it := range g.Items {
+					valid[taskMarkKey(len(msg.tasks)+k, it.Index)] = true
 				}
 			}
 			for k := range m.taskMarks {
@@ -2858,7 +2933,7 @@ func (m Model) selectedAudit() *domain.AuditRecord {
 // be a retryable LLM failure (timeout / no-submit) with no consult currently
 // in flight for its agent.
 func (m Model) canRetry(rec domain.AuditRecord) bool {
-	return domain.IsRetryableLLMEscalation(&rec) && !m.data.pendingConsult[rec.AgentID]
+	return domain.IsRetryableLLMEscalation(&rec) && !m.data.pendingConsult[consultKey(rec.NodeID, rec.AgentID)]
 }
 
 // --- Escalation / audit actions ---
@@ -3153,7 +3228,7 @@ func (m Model) retrySelected() (tea.Model, tea.Cmd) {
 		m.message = "retry LLM: only for a failed or timed-out LLM escalation"
 		return m, nil
 	}
-	if m.data.pendingConsult[rec.AgentID] {
+	if m.data.pendingConsult[consultKey(rec.NodeID, rec.AgentID)] {
 		m.message = "retry LLM: a consult is already running for this agent"
 		return m, nil
 	}
@@ -3370,9 +3445,9 @@ func canonicalTaskPath(locator string) string {
 func (m Model) markedTaskTargets() []taskTarget {
 	var targets []taskTarget
 	seen := map[string]bool{}
-	for _, g := range m.data.tasks {
+	collect := func(group int, g frontend.TaskGroup) {
 		for _, it := range g.Items {
-			if !m.taskMarks[taskMarkKey(g.Index, it.Index)] {
+			if !m.taskMarks[taskMarkKey(group, it.Index)] {
 				continue
 			}
 			p := canonicalTaskPath(g.ListAddress())
@@ -3383,6 +3458,12 @@ func (m Model) markedTaskTargets() []taskTarget {
 			seen[key] = true
 			targets = append(targets, taskTarget{path: p, item: it.Index, done: it.Done, text: it.Text})
 		}
+	}
+	for _, g := range m.data.tasks {
+		collect(g.Index, g)
+	}
+	for k, g := range m.data.fleetTasks {
+		collect(len(m.data.tasks)+k, g)
 	}
 	if len(targets) == 0 {
 		if r := m.selectedTaskRow(); r != nil && r.item > 0 {
@@ -3402,11 +3483,13 @@ func (m *Model) applyTaskLists(lists map[string][]domain.ChecklistItem) {
 	if len(lists) == 0 {
 		return
 	}
-	for i := range m.data.tasks {
-		g := &m.data.tasks[i]
-		if items, ok := lists[canonicalTaskPath(g.ListAddress())]; ok {
-			g.Items = items
-			g.Err = ""
+	for _, groups := range [][]frontend.TaskGroup{m.data.tasks, m.data.fleetTasks} {
+		for i := range groups {
+			g := &groups[i]
+			if items, ok := lists[canonicalTaskPath(g.ListAddress())]; ok {
+				g.Items = items
+				g.Err = ""
+			}
 		}
 	}
 }
@@ -3430,22 +3513,24 @@ func (m *Model) flipTaskCheckboxes(targets []taskTarget) {
 	for _, tg := range targets {
 		byPath[tg.path] = append(byPath[tg.path], tg)
 	}
-	for i := range m.data.tasks {
-		g := &m.data.tasks[i]
-		tgs := byPath[canonicalTaskPath(g.ListAddress())]
-		if len(tgs) == 0 {
-			continue
-		}
-		for j := range g.Items {
-			it := &g.Items[j]
-			for _, tg := range tgs {
-				if it.Index != tg.item || it.Text != tg.text {
-					continue
-				}
-				if tg.done {
-					it.Mark, it.Done = " ", false
-				} else {
-					it.Mark, it.Done = "x", true
+	for _, groups := range [][]frontend.TaskGroup{m.data.tasks, m.data.fleetTasks} {
+		for i := range groups {
+			g := &groups[i]
+			tgs := byPath[canonicalTaskPath(g.ListAddress())]
+			if len(tgs) == 0 {
+				continue
+			}
+			for j := range g.Items {
+				it := &g.Items[j]
+				for _, tg := range tgs {
+					if it.Index != tg.item || it.Text != tg.text {
+						continue
+					}
+					if tg.done {
+						it.Mark, it.Done = " ", false
+					} else {
+						it.Mark, it.Done = "x", true
+					}
 				}
 			}
 		}
@@ -3965,6 +4050,12 @@ func (m Model) sendTaskRow(r taskRow) (tea.Model, tea.Cmd) {
 		m.message = "only a pending [ ] task can be sent — this one is done or in progress"
 		return m, nil
 	}
+	// Another node's list: its agent is not in this herd, so the lookup below
+	// would only ever say "no live agent" — say what is actually the case.
+	if k := r.group - len(m.data.tasks); k >= 0 && k < len(m.data.fleetTasks) {
+		m.message = fmt.Sprintf("this list belongs to node %s — its daemon hands the tasks out; send from that machine", m.data.fleetTasks[k].NodeLabel)
+		return m, nil
+	}
 	agent := m.taskGroupAgent(r.group)
 	if agent == nil {
 		m.message = "no live agent matches this task source"
@@ -4034,6 +4125,10 @@ func (m Model) taskDetailLines(r taskRow, width int) []string {
 		src := m.data.tasks[r.group].Source
 		lines = m.detailField(lines, w, "Agent selector", orDash(src.Agent))
 		lines = m.detailField(lines, w, "Workspace", orDash(src.Workspace))
+	} else if k := r.group - len(m.data.tasks); k >= 0 && k < len(m.data.fleetTasks) {
+		g := m.data.fleetTasks[k]
+		lines = m.detailField(lines, w, "Node", g.NodeLabel)
+		lines = m.detailField(lines, w, "Agent", orDash(g.Source.Agent))
 	}
 	var live []string
 	for _, a := range m.data.status.MonitoredAgents {
@@ -4171,8 +4266,18 @@ func (m Model) focusSelectedEscalation() (tea.Model, tea.Cmd) {
 	if rec == nil {
 		return m, nil
 	}
+	// A remote escalation's agent id may also name a LOCAL pane (herdr's ids
+	// repeat across machines); focusing that would move the operator's view to
+	// the wrong agent — and focus of a remote agent is local-only by design.
+	if rec.NodeID != "" && rec.NodeID != m.data.status.NodeID {
+		m.message = fmt.Sprintf("agent %s is on node %s — focus is local-only", m.data.status.EscalationAgent(*rec), m.data.status.NodeLabel(rec.NodeID))
+		return m, nil
+	}
 	return m.focusAgentByID(rec.AgentID)
 }
+
+// consultKey identifies an agent across the fleet for the pending-consult map.
+func consultKey(nodeID, agentID string) string { return nodeID + "\x00" + agentID }
 
 // --- Detail view (v) ---
 
@@ -5303,7 +5408,7 @@ func (m Model) editTaskSourcePrompt(index int, path string) (tea.Model, tea.Cmd)
 		fields = append(fields,
 			struct{ key, label string }{tsFieldProvider,
 				fmt.Sprintf("%s (currently %s, %s)", tsFieldProvider, p.Name, origin)})
-		if p.Remote() {
+		if p.Egress() {
 			gist := shortGistIDForDisplay(p.GistID)
 			if p.GistIDInherited {
 				gist += " (inherited)"
@@ -5345,6 +5450,9 @@ func (m Model) editTaskSourcePrompt(index int, path string) (tea.Model, tea.Cmd)
 func displayTaskAddress(addr string) string {
 	if ref, ok := tasklocator.ParseGist(addr); ok {
 		return "gist:" + shortGistIDForDisplay(ref.GistID) + "/" + ref.File
+	}
+	if ref, ok := tasklocator.ParseDB(addr); ok {
+		return "db:" + domain.NodeLabelOrID(domain.NodeInfo{ID: ref.NodeID}) + "/" + ref.Name
 	}
 	return addr
 }
@@ -5571,6 +5679,8 @@ func configFieldChoices(key string) (choices []string, ok bool) {
 		return config.ValidThemes, true
 	case "task_source_provider.provider":
 		return config.ValidTaskSourceProviders, true
+	case "database.engine":
+		return config.ValidDatabaseEngines, true
 	default:
 		return nil, false
 	}
@@ -6021,6 +6131,11 @@ func (m Model) View() string {
 	// including a configured-on full self-prompting mode.
 	if m.data.status.Paused {
 		stateText, stateStyle = "■ PAUSED (kill switch)", st.paused
+	}
+	// Other machines' pauses ride on the badge too: a herd stood down
+	// elsewhere is what one screen would otherwise never show.
+	if n := len(m.data.status.PausedNodes); n > 0 {
+		stateText += fmt.Sprintf(" +%d node(s) paused", n)
 	}
 	state := stateStyle.Render(stateText)
 	// Unlike list rows the header is emitted unclamped, so a header too wide
@@ -6501,6 +6616,35 @@ func (m Model) renderAgents(b *strings.Builder) {
 		fmt.Fprintln(b, line)
 	}
 	m.renderMoreRows(b, len(agents)-end)
+	m.renderRemoteAgents(b, end == len(agents), rowWidth, now)
+}
+
+// renderRemoteAgents lists the OTHER nodes' agents under this machine's, on the
+// last page only, so the paging window stays true for the rows the cursor can
+// reach. They are view-only here: every per-agent key acts on this machine's
+// herdr, and a remote agent's own machine is where those run.
+func (m Model) renderRemoteAgents(b *strings.Builder, lastPage bool, rowWidth int, now time.Time) {
+	remote := m.data.status.RemoteAgents
+	if !lastPage || len(remote) == 0 {
+		return
+	}
+	// The section line is dropped rather than wrapped, like every list row.
+	fmt.Fprintln(b, m.styles().help.Render(oneLine(fmt.Sprintf("── other nodes (%d agents) ──", len(remote)), rowWidth)))
+	for _, r := range remote {
+		status := r.Status
+		if r.Disabled {
+			status = "DISABLED"
+		}
+		if r.Stale {
+			status = oneLine(status+" stale", 8)
+		}
+		line := fmt.Sprintf(agentsRowFmt,
+			oneLine(r.Display(), agentNameColWidth), oneLine(r.Location, 12), r.AgentType, status,
+			"-", strconv.Itoa(r.Stats.Escalations), strconv.Itoa(r.Stats.AutoSends),
+			strconv.Itoa(r.Stats.Confirmed), strconv.Itoa(r.Stats.Corrections),
+			formatAge(r.Stats.FirstSeen, now))
+		fmt.Fprintln(b, m.styles().help.Render(oneLine(line, rowWidth)))
+	}
 }
 
 // formatAge renders the elapsed time since firstSeen as HH:MM:SS (hours may
@@ -6619,10 +6763,9 @@ func (m Model) renderEscalations(b *strings.Builder) {
 	start, end := m.window(len(esc))
 	for i := start; i < end; i++ {
 		e := esc[i]
-		agent := e.AgentID
-		if n := m.data.status.AgentName(e.AgentID); n != "" {
-			agent = n
-		}
+		// name@node for another machine's row: pane ids repeat across
+		// machines, so a local name lookup would mislabel it.
+		agent := m.data.status.EscalationAgent(e)
 		mark := " "
 		if m.marked[e.ID] {
 			mark = "✓"

@@ -17,6 +17,12 @@ import (
 func openTestStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "test.db")
+	if proxyMode() {
+		return openTestStoreProxy(t, path), path
+	}
+	if tursoMode() {
+		return openTestStoreTurso(t, path), path
+	}
 	s, err := Open(path)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -669,11 +675,7 @@ func TestConcurrentPartitionedWrites(t *testing.T) {
 
 	// A second connection simulates a separate front-end process on the
 	// same WAL database file.
-	frontend, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer frontend.Close()
+	frontend := openStoreAt(t, path)
 
 	const daemonWrites = 100
 	const frontendWrites = 50
@@ -970,8 +972,8 @@ func TestAgentStats(t *testing.T) {
 	seedName := func(id, name string, created time.Time) {
 		t.Helper()
 		if _, err := s.db.ExecContext(ctx,
-			`INSERT INTO agent_names (agent_id, name, created_at) VALUES (?, ?, ?)`,
-			id, name, unix(created)); err != nil {
+			`INSERT INTO agent_names (node_id, agent_id, name, created_at) VALUES (?, ?, ?, ?)`,
+			s.self, id, name, unix(created)); err != nil {
 			t.Fatalf("seed name %q: %v", id, err)
 		}
 	}
@@ -1236,16 +1238,8 @@ func TestAgentDisabledState(t *testing.T) {
 func TestAgentDisableIsBarrierForInFlightAutomation(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "barrier.db")
-	actionStore, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer actionStore.Close()
-	operatorStore, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer operatorStore.Close()
+	actionStore := openStoreAt(t, path)
+	operatorStore := openStoreAt(t, path)
 	ctx := context.Background()
 	if err := actionStore.AssignAgentName(ctx, "w1:p1", "builder"); err != nil {
 		t.Fatal(err)
@@ -1404,6 +1398,7 @@ func TestEnsureSignature(t *testing.T) {
 }
 
 func TestMigrateBackfillsSignatureRows(t *testing.T) {
+	skipUnlessSQLite(t) // reopens with the SQLite driver to exercise its migration repairs
 	// #175: databases from before LLM decisions created signatures rows hold
 	// decisions-only signatures that `signatures list/delete/reset` cannot
 	// address. Reopening the store backfills a shadow row per such signature
@@ -1465,7 +1460,7 @@ func TestMigrateBackfillsSignatureRows(t *testing.T) {
 	if kept == nil || kept.Mode != domain.ModeAutonomous || kept.CachedConfidence != 0.9 {
 		t.Errorf("existing row must be untouched by the backfill: %+v", kept)
 	}
-	if err := re.migrate(); err != nil {
+	if err := re.migrate(nil); err != nil {
 		t.Fatal(err)
 	}
 	if st, _ := re.GetSignature(ctx, "idle:orphan"); st != nil {
@@ -1697,6 +1692,7 @@ func TestSignatureEmbeddingRoundTrip(t *testing.T) {
 }
 
 func TestMigratePrunesVerbOnlyApprovalEmbeddings(t *testing.T) {
+	skipUnlessSQLite(t) // reopens with the SQLite driver to exercise its migration repairs
 	// Issue #155: pre-fix approval salients carried only the permission verb.
 	// Left in place, a post-fix salient could semantically remap onto such an
 	// over-broad row, so migrate() deletes them — and only them.

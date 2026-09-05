@@ -35,6 +35,10 @@ const (
 	KindReembed Kind = "reembed"
 )
 
+// ListenSocket creates an owner-only unix socket at path, removing a stale one
+// first — the same shape as the control socket, for the daemon's store socket.
+func ListenSocket(path string) (net.Listener, error) { return listen(path) }
+
 func validKind(kind Kind) bool {
 	return kind == KindReload || kind == KindWake || kind == KindReembed
 }

@@ -30,10 +30,26 @@ import (
 // ledger row and an existing `--path` argument all keep working untouched.
 const GistScheme = "gist://"
 
-// Scheme returns the locator's scheme ("gist://"), or "" for a filesystem path.
+// DBScheme prefixes a locator naming a list kept inside hap's own database (the
+// `sqlite` task-source provider):
+//
+//	db://<node-id>/<name>
+//
+// The node id is part of the address, not context: under a shared (turso)
+// store every node's lists are visible from every other node, and an operator
+// on one machine edits another machine's list by its full locator. Lists are
+// node-scoped in v1 on purpose — a list shared by two nodes' daemons would have
+// two reservers marking the same item, and last-push-wins would hand it out
+// twice.
+const DBScheme = "db://"
+
+// Scheme returns the locator's scheme ("gist://", "db://"), or "" for a
+// filesystem path.
 func Scheme(locator string) string {
-	if strings.HasPrefix(locator, GistScheme) {
-		return GistScheme
+	for _, s := range []string{GistScheme, DBScheme} {
+		if strings.HasPrefix(locator, s) {
+			return s
+		}
 	}
 	return ""
 }
@@ -98,6 +114,37 @@ func GistLocator(gistID, file string) string {
 	return GistScheme + gistID + "/" + file
 }
 
+// DBRef is a parsed database locator.
+type DBRef struct {
+	NodeID string
+	Name   string
+}
+
+// ParseDB splits a db:// locator into the node id and list name. ok=false for
+// anything else, including a filesystem path and a gist locator — callers
+// dispatch on it exactly as they do on ParseGist.
+func ParseDB(locator string) (DBRef, bool) {
+	if Scheme(locator) != DBScheme {
+		return DBRef{}, false
+	}
+	node, name, found := strings.Cut(strings.TrimPrefix(locator, DBScheme), "/")
+	if !found || node == "" || name == "" || strings.Contains(name, "/") {
+		return DBRef{}, false
+	}
+	return DBRef{NodeID: node, Name: name}, true
+}
+
+// DBLocator builds the locator for one list inside a node's database namespace.
+func DBLocator(nodeID, name string) string {
+	return DBScheme + nodeID + "/" + name
+}
+
+// ErrNodeIDRequired reports that a source stores its list in the database and
+// the caller did not say which node's namespace to mint the locator in. Every
+// production resolver goes through taskstore.Registry.Resolve, which supplies
+// the store's own node id; only a caller holding no store can reach this.
+var ErrNodeIDRequired = fmt.Errorf("this task source keeps its list in the hap database, so it needs the node id to resolve")
+
 // Resolved is a task source's storage identity: which backend serves it, with
 // what credentials, and which list within that backend.
 type Resolved struct {
@@ -128,10 +175,17 @@ type Resolved struct {
 // ErrAgentNameRequired for a derived source and render a template instead;
 // nothing on the delivery path can reach it.
 //
-// The result is a pure function of (config, agent name): no process state, no
-// working directory, no live lookup. That is what lets every hap process
-// compute the same locator, and what makes the locator safe to persist.
-func Resolve(cfg config.Config, src config.TaskSource, agentName string) (Resolved, error) {
+// nodeID is the installation's node id (the store's NodeID), used only by the
+// sqlite provider to place a list in this node's namespace; every hap process
+// on one machine reads the same id from <state>/node-id, so it does not make
+// the locator process-dependent. Pass "" when no store is at hand — a sqlite
+// source then fails with ErrNodeIDRequired rather than minting a locator in
+// nobody's namespace.
+//
+// The result is a pure function of (config, agent name, node id): no process
+// state, no working directory, no live lookup. That is what lets every hap
+// process compute the same locator, and what makes the locator safe to persist.
+func Resolve(cfg config.Config, src config.TaskSource, agentName, nodeID string) (Resolved, error) {
 	p := cfg.ResolveProvider(src)
 	out := Resolved{ResolvedProvider: p}
 
@@ -152,11 +206,17 @@ func Resolve(cfg config.Config, src config.TaskSource, agentName string) (Resolv
 		return out, nil
 	}
 
-	if p.Name != config.ProviderGitHubGist {
+	switch p.Name {
+	case config.ProviderGitHubGist:
+		if strings.TrimSpace(p.GistID) == "" {
+			return Resolved{}, fmt.Errorf("task source provider %s has no gist_id", p.Name)
+		}
+	case config.ProviderSQLite:
+		if strings.TrimSpace(nodeID) == "" {
+			return Resolved{}, ErrNodeIDRequired
+		}
+	default:
 		return Resolved{}, fmt.Errorf("unknown task source provider %q", p.Name)
-	}
-	if strings.TrimSpace(p.GistID) == "" {
-		return Resolved{}, fmt.Errorf("task source provider %s has no gist_id", p.Name)
 	}
 
 	file := strings.TrimSpace(src.Path)
@@ -170,7 +230,11 @@ func Resolve(cfg config.Config, src config.TaskSource, agentName string) (Resolv
 	if err := config.ValidateStoreFileName(file); err != nil {
 		return Resolved{}, fmt.Errorf("task source file name: %w", err)
 	}
-	out.Locator = Canonical(GistLocator(p.GistID, file))
+	if p.Name == config.ProviderSQLite {
+		out.Locator = Canonical(DBLocator(nodeID, file))
+	} else {
+		out.Locator = Canonical(GistLocator(p.GistID, file))
+	}
 	out.Display = Display(out.Locator)
 	return out, nil
 }
@@ -205,13 +269,27 @@ var ErrAgentNameRequired = fmt.Errorf("this task source derives one list per mat
 // is something the agent resolves against its OWN working directory, where it
 // either fails confusingly or finds an unrelated file; an empty string turns
 // "read the list at {task_list_path}" into nonsense. A URL fails loudly and is
-// something the operator can actually open.
+// something the operator can actually open. A database list is named as such,
+// with the node it belongs to, because the only way to reach one is `hap task`
+// — there is no file and no URL to point at.
 func Display(locator string) string {
+	if ref, ok := ParseDB(locator); ok {
+		return ref.Name + " (hap database, node " + shortNode(ref.NodeID) + ")"
+	}
 	ref, ok := ParseGist(locator)
 	if !ok {
 		return locator
 	}
 	return "https://gist.github.com/" + ref.GistID + "#file-" + anchorSlug(ref.File)
+}
+
+// shortNode renders a node id the way every fleet surface does: its first
+// eight characters. Pure, so it cannot consult the node's label.
+func shortNode(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 // anchorSlug renders a gist file name as GitHub's per-file anchor: lowercased,

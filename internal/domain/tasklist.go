@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Next-task resolution helpers for the idle resolver (FR-011). These are
@@ -1353,4 +1354,23 @@ func inferClaudeNextTask(transcript string) InferredTask {
 		return InferredTask{Task: firstPending, Structured: true}
 	}
 	return InferredTask{}
+}
+
+// StoredTaskList is a checklist kept INSIDE hap's database rather than in a
+// file — the `sqlite` task-source provider's storage. It belongs to one node
+// (the machine whose daemon hands its items out) and is addressed by a name
+// inside that node's namespace, exactly as a gist file is addressed inside its
+// gist; under a shared (turso) store every node's lists are visible everywhere.
+type StoredTaskList struct {
+	NodeID string
+	// Name is the list's file-style name ("<agent>.md" for the derived
+	// one-list-per-agent form, or the source's explicit path).
+	Name string
+	// AgentName is the agent the list was created for, "" for a shared list.
+	AgentName string
+	Content   string
+	// Revision counts writes. Every mutation is a compare-and-swap on it, which
+	// is what serializes two processes editing one list without a file lock.
+	Revision  int64
+	UpdatedAt time.Time
 }

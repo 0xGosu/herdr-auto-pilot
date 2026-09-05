@@ -12,7 +12,7 @@ import (
 
 // agentActionColumns is the one spelling of the row, shared by every reader so
 // a new column can never be scanned in one place and forgotten in another.
-const agentActionColumns = `id, kind, target, payload_json, correction_id, terminal_id, side_effect, author, status, error, result_json, attempts, created_at, updated_at`
+const agentActionColumns = `id, node_id, kind, target, payload_json, correction_id, terminal_id, side_effect, author, status, error, result_json, attempts, created_at, updated_at`
 
 // EnqueueAgentAction queues an action for the daemon to perform and returns its
 // id. The caller nudges afterwards; a failed nudge only costs latency, since
@@ -25,7 +25,7 @@ func (s *Store) EnqueueAgentAction(ctx context.Context, a domain.AgentAction) (i
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var err error
-		id, err = insertAgentActionTx(ctx, tx, a)
+		id, err = s.insertAgentActionTx(ctx, tx, orDefault(a.NodeID, s.self), a)
 		return err
 	})
 	return id, err
@@ -35,15 +35,18 @@ func (s *Store) EnqueueAgentAction(ctx context.Context, a domain.AgentAction) (i
 // write the action in the SAME transaction as its bookkeeping can reuse it.
 // InsertCorrectionWithDelivery is exactly that caller and the reason this
 // exists: a correction and its delivery request have to land atomically.
-func insertAgentActionTx(ctx context.Context, tx *sql.Tx, a domain.AgentAction) (int64, error) {
+//
+// nodeID is the node whose daemon must run the action — the target agent's
+// node, which is not always the node the operator is typing on.
+func (s *Store) insertAgentActionTx(ctx context.Context, tx *sql.Tx, nodeID string, a domain.AgentAction) (int64, error) {
 	now := a.CreatedAt
 	if now.IsZero() {
 		now = time.Now()
 	}
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO agent_actions (kind, target, payload_json, correction_id, terminal_id, author, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		string(a.Kind), a.Target, a.Payload, a.CorrectionID, a.TerminalID,
+		INSERT INTO agent_actions (id, node_id, kind, target, payload_json, correction_id, terminal_id, author, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.nextID(), nodeID, string(a.Kind), a.Target, a.Payload, a.CorrectionID, a.TerminalID,
 		orDefault(a.Author, "operator"), string(domain.AgentActionPending), unix(now), unix(now))
 	if err != nil {
 		return 0, err
@@ -57,7 +60,7 @@ func insertAgentActionTx(ctx context.Context, tx *sql.Tx, a domain.AgentAction) 
 func (s *Store) PendingAgentActions(ctx context.Context) ([]domain.AgentAction, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+agentActionColumns+`
-		FROM agent_actions WHERE status = ? ORDER BY id ASC`, string(domain.AgentActionPending))
+		FROM agent_actions WHERE node_id = ? AND status = ? ORDER BY id ASC`, s.self, string(domain.AgentActionPending))
 	if err != nil {
 		return nil, err
 	}
@@ -93,8 +96,8 @@ func (s *Store) ClaimAgentAction(ctx context.Context, id int64, now time.Time) (
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE agent_actions SET status = ?, attempts = attempts + 1, updated_at = ?
-			WHERE id = ? AND status = ?`,
-			string(domain.AgentActionRunning), unix(now), id, string(domain.AgentActionPending))
+			WHERE id = ? AND status = ? AND node_id = ?`,
+			string(domain.AgentActionRunning), unix(now), id, string(domain.AgentActionPending), s.self)
 		if err != nil {
 			return err
 		}
@@ -182,11 +185,11 @@ func (s *Store) ReclaimRunningAgentActions(ctx context.Context, now time.Time) (
 	err = s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE agent_actions SET status = ?, error = ?, updated_at = ?
-			WHERE status = ? AND side_effect = 1`,
+			WHERE node_id = ? AND status = ? AND side_effect = 1`,
 			string(domain.AgentActionFailed),
 			"the daemon stopped after this was sent but before the result was recorded, "+
 				"so it may or may not have reached the agent; check the agent before answering again",
-			unix(now), string(domain.AgentActionRunning))
+			unix(now), s.self, string(domain.AgentActionRunning))
 		if err != nil {
 			return err
 		}
@@ -194,8 +197,8 @@ func (s *Store) ReclaimRunningAgentActions(ctx context.Context, now time.Time) (
 			return err
 		}
 		res, err = tx.ExecContext(ctx, `
-			UPDATE agent_actions SET status = ?, updated_at = ? WHERE status = ?`,
-			string(domain.AgentActionPending), unix(now), string(domain.AgentActionRunning))
+			UPDATE agent_actions SET status = ?, updated_at = ? WHERE node_id = ? AND status = ?`,
+			string(domain.AgentActionPending), unix(now), s.self, string(domain.AgentActionRunning))
 		if err != nil {
 			return err
 		}
@@ -266,7 +269,7 @@ func scanAgentActions(rows *sql.Rows) ([]domain.AgentAction, error) {
 		var kind, status string
 		var created, updated int64
 		var sideEffect int
-		if err := rows.Scan(&a.ID, &kind, &a.Target, &a.Payload, &a.CorrectionID,
+		if err := rows.Scan(&a.ID, &a.NodeID, &kind, &a.Target, &a.Payload, &a.CorrectionID,
 			&a.TerminalID, &sideEffect, &a.Author,
 			&status, &a.Error, &a.Result, &a.Attempts, &created, &updated); err != nil {
 			return nil, err
@@ -307,9 +310,12 @@ func (s *Store) InsertCorrectionWithDelivery(ctx context.Context, c domain.Corre
 		// overwritten: the daemon would deliver anyway, and applyCorrection
 		// would flip the dismissed row back to "resolved". Whoever gets here
 		// first decides.
-		var status string
+		// The node too: the correction and its delivery are filed under the
+		// node that OWNS the escalation, so the daemon that can reach the pane
+		// is the one that drains them — however far away the operator typed.
+		var status, nodeID string
 		if err := tx.QueryRowContext(ctx,
-			`SELECT status FROM audit_log WHERE id = ?`, c.AuditID).Scan(&status); err != nil {
+			`SELECT status, node_id FROM audit_log WHERE id = ?`, c.AuditID).Scan(&status, &nodeID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("audit record %d not found", c.AuditID)
 			}
@@ -318,15 +324,16 @@ func (s *Store) InsertCorrectionWithDelivery(ctx context.Context, c domain.Corre
 		if status != "escalated" {
 			return fmt.Errorf("%w: audit record %d is %q", ErrEscalationNotOpen, c.AuditID, status)
 		}
+		nodeID = orDefault(nodeID, s.self)
 		var err error
-		if correctionID, err = insertCorrectionTx(ctx, tx, c); err != nil {
+		if correctionID, err = s.insertCorrectionTx(ctx, tx, nodeID, c); err != nil {
 			return err
 		}
 		// The link is set HERE, not by the caller: the correction's id only
 		// exists inside this transaction, and an action that lost it would let
 		// the correction drain run ahead of its own delivery.
 		a.CorrectionID = correctionID
-		actionID, err = insertAgentActionTx(ctx, tx, a)
+		actionID, err = s.insertAgentActionTx(ctx, tx, nodeID, a)
 		return err
 	})
 	return correctionID, actionID, err
@@ -371,9 +378,16 @@ func (s *Store) DeleteCorrection(ctx context.Context, id int64) (bool, error) {
 // a queued action can tell "same agent" from "new terminal on a reused pane id"
 // without a herdr round trip — the same evidence task_reservations compares.
 func (s *Store) AgentTerminalID(ctx context.Context, agentID string) (string, error) {
+	return s.AgentTerminalIDOn(ctx, s.self, agentID)
+}
+
+// AgentTerminalIDOn is AgentTerminalID for an agent on any node: a reply to
+// another machine's escalation is checked against THAT machine's record of the
+// pane, never this one's.
+func (s *Store) AgentTerminalIDOn(ctx context.Context, nodeID, agentID string) (string, error) {
 	var id string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT terminal_id FROM agent_names WHERE agent_id = ?`, agentID).Scan(&id)
+		`SELECT terminal_id FROM agent_names WHERE node_id = ? AND agent_id = ?`, nodeID, agentID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}

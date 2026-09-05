@@ -70,6 +70,45 @@ type Health struct {
 	// monitoring beats nothing), but it is degraded in a way only
 	// `hap daemon --ensure` from a fresh binary can fix.
 	BinaryReplaced bool `json:"binary_replaced,omitempty"`
+	// FleetSync is the shared database's sync state under the turso engine;
+	// absent under the local engine and on older daemons.
+	FleetSync *FleetSyncHealth `json:"fleet_sync,omitempty"`
+}
+
+// FleetSyncHealth is the heartbeat's copy of the fleet sync loop's state.
+type FleetSyncHealth struct {
+	Engine string `json:"engine"`
+	// Bootstrapped is false while the first start is still waiting for the
+	// remote to hand over the initial database.
+	Bootstrapped bool      `json:"bootstrapped"`
+	LastPullAt   time.Time `json:"last_pull_at,omitempty"`
+	LastPushAt   time.Time `json:"last_push_at,omitempty"`
+	PendingOps   int64     `json:"pending_ops,omitempty"`
+	Revision     string    `json:"revision,omitempty"`
+	LastError    string    `json:"last_error,omitempty"`
+	LastErrorAt  time.Time `json:"last_error_at,omitempty"`
+}
+
+// Line renders the state as the one line `hap status` prints.
+func (f *FleetSyncHealth) Line(now time.Time) string {
+	if f == nil {
+		return ""
+	}
+	ago := func(t time.Time) string {
+		if t.IsZero() {
+			return "never"
+		}
+		return now.Sub(t).Round(time.Second).String() + " ago"
+	}
+	if !f.Bootstrapped {
+		return fmt.Sprintf("%s — BOOTSTRAP PENDING: %s", f.Engine, f.LastError)
+	}
+	if f.LastError != "" {
+		return fmt.Sprintf("%s — DEGRADED: %s (last pull %s, last push %s, %d unpushed)",
+			f.Engine, f.LastError, ago(f.LastPullAt), ago(f.LastPushAt), f.PendingOps)
+	}
+	return fmt.Sprintf("%s — ok (last pull %s, last push %s, %d unpushed)",
+		f.Engine, ago(f.LastPullAt), ago(f.LastPushAt), f.PendingOps)
 }
 
 // EmbedderDiag is the heartbeat's copy of embedder.Diagnostics. It lives here

@@ -29,6 +29,11 @@ type Adapter struct {
 	Timeout         time.Duration
 	DBPath          string
 	ControlPath     string
+	// StoreSocketPath and NodeID are set under the turso engine: the MCP
+	// server then reaches the store through the daemon's socket, as this
+	// node. Empty under the local engine.
+	StoreSocketPath string
+	NodeID          string
 	Store           ports.ReadStore
 	// BaseEnv is the environment shared by every command template; the
 	// per-command specs below layer on top of it (see buildEnv).
@@ -225,11 +230,15 @@ func (a *Adapter) runConsult(ctx context.Context, spec commandSpec, self string,
 	// must fail the run rather than launch the CLI without its credentials,
 	// and the command is resolved against the child's PATH, which this env
 	// may redefine. The HAP_* variables are injected last and always win.
-	env, err := buildEnv(a.BaseEnv, spec.env, repl,
-		"HAP_REQUEST_ID="+req.RequestID,
-		"HAP_DB_PATH="+a.DBPath,
-		"HAP_CONTROL_PATH="+a.ControlPath,
-	)
+	extra := []string{
+		"HAP_REQUEST_ID=" + req.RequestID,
+		"HAP_DB_PATH=" + a.DBPath,
+		"HAP_CONTROL_PATH=" + a.ControlPath,
+	}
+	if a.StoreSocketPath != "" {
+		extra = append(extra, "HAP_STORE_SOCKET_PATH="+a.StoreSocketPath, "HAP_NODE_ID="+a.NodeID)
+	}
+	env, err := buildEnv(a.BaseEnv, spec.env, repl, extra...)
 	if err != nil {
 		return nil, err
 	}

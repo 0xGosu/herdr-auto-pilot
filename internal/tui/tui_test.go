@@ -2812,3 +2812,101 @@ func TestSignatureStreakKeysAreAdvertised(t *testing.T) {
 		}
 	}
 }
+
+// remoteRetryableEscalation files, under another node, a retryable escalation
+// for the SAME agent id as the local fixture's — herdr's pane ids repeat across
+// machines, which is the whole hazard.
+func remoteRetryableEscalation(t *testing.T, app *frontend.App) (nodeID string, id int64) {
+	t.Helper()
+	nodeID = "bbbbbbbbbbbbbbbb"
+	other, err := store.OpenAs(filepath.Join(filepath.Dir(app.ConfigPath), "t.db"), nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { other.Close() })
+	ctx := context.Background()
+	if err := other.UpsertNode(ctx, domain.NodeInfo{Label: "laptop", LastSeen: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	id, err = other.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: "w1:pA", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: "escalated", Rationale: "[llm_timeout] llm timeout after 2m0s without submit_decision",
+		Status: "escalated", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return nodeID, id
+}
+
+// selectEscalation puts the cursor on the row for audit id.
+func selectEscalation(t *testing.T, m Model, id int64) Model {
+	t.Helper()
+	for i, e := range m.data.escalations {
+		if e.ID == id {
+			m.cursors[tabEscalations] = i
+			return m
+		}
+	}
+	t.Fatalf("escalation %d not listed: %+v", id, m.data.escalations)
+	return m
+}
+
+// TestRetryLLMGateIsKeyedByNode: a consult in flight for THIS node's pane
+// "w1:pA" gates the local escalation's retry, not a remote escalation whose
+// agent merely shares the id.
+func TestRetryLLMGateIsKeyedByNode(t *testing.T) {
+	m, st, app, localID := retryAppModel(t)
+	ctx := context.Background()
+	remoteNode, remoteID := remoteRetryableEscalation(t, app)
+	if _, err := st.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: "req-w1:pA-1", Signature: "sig", SituationType: domain.SituationApproval,
+		AgentType: "claude", AgentID: "w1:pA", ContextJSON: "{}", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabEscalations
+
+	m = selectEscalation(t, m, localID)
+	upd, cmd := m.Update(pressKeyMsg("l"))
+	m = upd.(Model)
+	if cmd != nil || !strings.Contains(m.message, "already running") {
+		t.Fatalf("the LOCAL escalation must be gated by the local consult, got cmd=%v message=%q", cmd != nil, m.message)
+	}
+
+	m = selectEscalation(t, m, remoteID)
+	m.message = ""
+	_, cmd = m.Update(pressKeyMsg("l"))
+	if cmd == nil {
+		t.Fatalf("the REMOTE escalation (node %s) must not be gated by this node's consult", remoteNode)
+	}
+}
+
+// TestFocusRefusesARemoteEscalation: `f` on another node's escalation must not
+// focus the local pane that happens to share its agent id.
+func TestFocusRefusesARemoteEscalation(t *testing.T) {
+	m, st, app, _ := retryAppModel(t)
+	ctx := context.Background()
+	_, remoteID := remoteRetryableEscalation(t, app)
+	upd, _ := m.Update(refreshData(ctx, app))
+	m = upd.(Model)
+	m.tab = tabEscalations
+	// A live LOCAL pane with the same id, exactly what a blind focus would hit.
+	m.data.status.MonitoredAgents = []domain.AgentTransition{
+		{AgentID: "w1:pA", PaneID: "w1:pA", TabID: "w1:t1", WorkspaceID: "w1", AgentType: "claude"},
+	}
+	m = selectEscalation(t, m, remoteID)
+	upd, cmd := m.Update(pressKeyMsg("f"))
+	m = upd.(Model)
+	if cmd != nil {
+		t.Error("focus of a remote escalation must issue no command")
+	}
+	if !strings.Contains(m.message, "local-only") || !strings.Contains(m.message, "laptop") {
+		t.Errorf("message = %q, want the local-only refusal naming the node", m.message)
+	}
+	if got := queuedFocuses(t, st); len(got) != 0 {
+		t.Errorf("a focus was queued for the local namesake: %+v", got)
+	}
+}

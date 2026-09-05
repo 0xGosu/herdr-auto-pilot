@@ -42,7 +42,11 @@ func (a *App) taskStores(cfg config.Config) *taskstore.Registry {
 		sameProviderOverrides(a.taskStore.sources, cfg.TaskSources) {
 		return a.taskStore.registry
 	}
-	r := taskstore.NewRegistry(cfg)
+	var opts []taskstore.Option
+	if lists, ok := a.Store.(ports.TaskListStore); ok {
+		opts = append(opts, taskstore.WithTaskLists(lists))
+	}
+	r := taskstore.NewRegistry(cfg, opts...)
 	a.taskStore.registry = r
 	a.taskStore.builtFor = cfg.TaskSourceProvider
 	a.taskStore.sources = append([]config.TaskSource(nil), cfg.TaskSources...)
@@ -107,7 +111,7 @@ func (a *App) resolveList(cfg config.Config, locator string) (resolvedList, erro
 // resolveSourceList resolves one configured source, for the agent it was
 // matched against.
 func (a *App) resolveSourceList(cfg config.Config, src config.TaskSource, agentName string) (resolvedList, error) {
-	res, err := tasklocator.Resolve(cfg, src, agentName)
+	res, err := a.resolveSource(cfg, src, agentName)
 	if err != nil {
 		return resolvedList{}, err
 	}
@@ -121,6 +125,13 @@ func (a *App) resolveSourceList(cfg config.Config, src config.TaskSource, agentN
 		Display: res.Display,
 		Remote:  ports.TaskStoreRemote(store),
 	}, nil
+}
+
+// resolveSource is tasklocator.Resolve with this process's node id supplied,
+// via the registry — the same entry point the daemon uses, so a sqlite
+// source's locator is minted in the same namespace on every surface.
+func (a *App) resolveSource(cfg config.Config, src config.TaskSource, agentName string) (tasklocator.Resolved, error) {
+	return a.taskStores(cfg).Resolve(src, agentName)
 }
 
 // readList reads and parses a checklist through its backend.

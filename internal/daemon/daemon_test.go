@@ -731,7 +731,11 @@ type harness struct {
 	ctlPath string
 	cancel  context.CancelFunc
 	runDone chan struct{} // closed when d.Run returns (after background drain)
+	db      string        // the SQLite file, for tests that open it as another node
 }
+
+// dbPath is the harness's SQLite file.
+func (h *harness) dbPath() string { return h.db }
 
 // stop cancels the daemon and blocks until Run has fully returned — i.e. until
 // shutdownBackground has drained every background goroutine/timer. Tests use it
@@ -828,7 +832,8 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 	if err := os.WriteFile(cfgPath, []byte(cfgTOML), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := store.Open(filepath.Join(dir, "test.db"))
+	dbPath := filepath.Join(dir, "test.db")
+	raw, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -897,7 +902,7 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 
 	return &harness{
 		t: t, daemon: d, store: fs, raw: raw, herdr: fh, events: fe, llm: fl,
-		cfgPath: cfgPath, ctlPath: ctlPath, cancel: cancel, runDone: runDone,
+		cfgPath: cfgPath, ctlPath: ctlPath, cancel: cancel, runDone: runDone, db: dbPath,
 	}
 }
 
@@ -4662,4 +4667,26 @@ func TestAutoActRemoteEnvWithoutKeystrokesEscalates(t *testing.T) {
 	if len(h.herdr.keysSent()) != 0 {
 		t.Fatalf("no keystroke path exists on this adapter, sent %v", h.herdr.keysSent())
 	}
+}
+
+// The sqlite task-source provider is an OPTIONAL store capability the daemon
+// type-asserts for (ports.TaskListStore). failingStore embeds the StorePort
+// INTERFACE, so without these forwarders the assertion fails and the provider
+// is silently off across the whole suite — the trap CLAUDE.md documents for
+// every type-asserted capability.
+func (f *failingStore) ReadTaskList(ctx context.Context, nodeID, name string) (domain.StoredTaskList, error) {
+	return f.StorePort.(ports.TaskListStore).ReadTaskList(ctx, nodeID, name)
+}
+
+func (f *failingStore) MutateTaskList(ctx context.Context, nodeID, name string, now time.Time,
+	fn func(string) (string, error)) (string, error) {
+	return f.StorePort.(ports.TaskListStore).MutateTaskList(ctx, nodeID, name, now, fn)
+}
+
+func (f *failingStore) EnsureTaskList(ctx context.Context, nodeID, name, agentName, initial string, now time.Time) (bool, error) {
+	return f.StorePort.(ports.TaskListStore).EnsureTaskList(ctx, nodeID, name, agentName, initial, now)
+}
+
+func (f *failingStore) ListTaskLists(ctx context.Context) ([]domain.StoredTaskList, error) {
+	return f.StorePort.(ports.TaskListStore).ListTaskLists(ctx)
 }

@@ -2308,3 +2308,57 @@ func TestConfigTabTaskSourceRowNamesTheProvider(t *testing.T) {
 		t.Errorf("explicit source row %q must name the file AND the provider", rows[1])
 	}
 }
+
+// TestTasksTabRendersFleetGroupsAfterConfiguredOnes: another node's
+// database-kept lists render after the configured sources, are marked by a
+// group index past every configured one (so marks never alias a local group),
+// and cannot be sent from here — their agent runs on the other machine.
+func TestTasksTabRendersFleetGroupsAfterConfiguredOnes(t *testing.T) {
+	m := taskModel(t)
+	const other = "b1b1b1b1b1b1b1b1"
+	m.data.fleetTasks = []frontend.TaskGroup{{
+		Source: config.TaskSource{Agent: "badger"}, Index: -1,
+		Locator: "db://" + other + "/badger.md", Display: "badger.md (hap database, node b1b1b1b1)",
+		NodeID: other, NodeLabel: "laptop",
+		Items: []domain.ChecklistItem{
+			{Index: 1, Mark: " ", Text: "remote one"},
+			{Index: 2, Mark: "x", Done: true, Text: "remote two"},
+		},
+	}}
+	view := m.View()
+	for _, want := range []string{
+		"node laptop  agent=badger  db:b1b1b1b1/badger.md  (1 pending / 2)",
+		"#1 [ ] remote one",
+		"#2 [x] remote two",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("Tasks tab missing %q:\n%s", want, view)
+		}
+	}
+	// The fleet header must come AFTER every configured group.
+	if strings.Index(view, "node laptop") < strings.Index(view, "#2 agent=quiet") {
+		t.Errorf("fleet groups must render after the configured sources:\n%s", view)
+	}
+
+	// Rows: 3 configured headers + 3 items + error row + empty note = 8, then
+	// the fleet header at 8 and its first item at 9.
+	rows := m.taskRows()
+	if len(rows) != 11 || !rows[8].header || rows[9].item != 1 || rows[9].group != len(m.data.tasks) {
+		t.Fatalf("rows = %d, fleet header/item = %+v / %+v", len(rows), rows[8], rows[9])
+	}
+	for i := 0; i < 9; i++ {
+		m = press(t, m, "down")
+	}
+	m = press(t, m, " ")
+	if !m.taskMarks[taskMarkKey(len(m.data.tasks), 1)] {
+		t.Fatalf("space on the fleet item must key the mark past the configured groups, got %v", m.taskMarks)
+	}
+	if len(m.markedTaskTargets()) != 1 || m.markedTaskTargets()[0].path != "db://"+other+"/badger.md" {
+		t.Errorf("marked targets = %+v, want the fleet item by its locator", m.markedTaskTargets())
+	}
+	// Space advanced the cursor to #2; back up onto #1 and try to send it.
+	m = press(t, m, "up", "enter")
+	if !strings.Contains(m.message, "belongs to node laptop") {
+		t.Errorf("sending a fleet item must be refused naming the node, got message %q", m.message)
+	}
+}

@@ -10,7 +10,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
-const rosterColumns = `agent_id, pane_id, tab_id, workspace_id, agent_type, status,
+const rosterColumns = `node_id, agent_id, pane_id, tab_id, workspace_id, agent_type, status,
 	terminal_id, cwd, cwd_read_at, seen_at`
 
 // rosterSeqUnknown is the position given to an agent recorded from an EVENT,
@@ -44,8 +44,12 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 		// against a herd of arbitrary size, so a per-agent SELECT made the
 		// hold time grow with the herd — and the goroutines waiting behind it
 		// are the ones recording an operator's actual work.
+		//
+		// THIS node's rows only: another machine's agents are not in the
+		// listing this daemon made, and retiring them here would empty every
+		// other node's roster on every sweep.
 		rows, err := tx.QueryContext(ctx,
-			`SELECT agent_id, terminal_id, gone_at FROM agent_roster`)
+			`SELECT agent_id, terminal_id, gone_at FROM agent_roster WHERE node_id = ?`, s.self)
 		if err != nil {
 			return err
 		}
@@ -83,8 +87,8 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 		}
 		if len(recycled) > 0 {
 			if _, err := tx.ExecContext(ctx,
-				`DELETE FROM agent_roster WHERE agent_id IN (`+placeholders(len(recycled))+`)`,
-				recycled...); err != nil {
+				`DELETE FROM agent_roster WHERE node_id = ? AND agent_id IN (`+placeholders(len(recycled))+`)`,
+				append([]any{s.self}, recycled...)...); err != nil {
 				return err
 			}
 		}
@@ -92,11 +96,11 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 			// The publish is the only caller that KNOWS a position: it holds
 			// herdr's whole listing, in order — and the only one entitled to
 			// bring a retired agent back, for the same reason.
-			if err := upsertRosterRow(ctx, tx, a, i, true); err != nil {
+			if err := s.upsertRosterRow(ctx, tx, a, i, true); err != nil {
 				return err
 			}
 		}
-		// Everything not in the listing is marked gone, in one statement.
+		// Everything of ours not in the listing is marked gone, in one statement.
 		var absent []any
 		for id, st := range existing {
 			if st.gone == 0 && !live[id] {
@@ -104,16 +108,16 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 			}
 		}
 		if len(absent) > 0 {
-			args := append([]any{unix(now)}, absent...)
+			args := append([]any{unix(now), s.self}, absent...)
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE agent_roster SET gone_at = ? WHERE agent_id IN (`+
+				`UPDATE agent_roster SET gone_at = ? WHERE node_id = ? AND agent_id IN (`+
 					placeholders(len(absent))+`)`, args...); err != nil {
 				return err
 			}
 		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO roster_meta (id, published_at) VALUES (1, ?)
-			ON CONFLICT(id) DO UPDATE SET published_at = excluded.published_at`, unix(now))
+			INSERT INTO roster_meta (node_id, published_at) VALUES (?, ?)
+			ON CONFLICT(node_id) DO UPDATE SET published_at = excluded.published_at`, s.self, unix(now))
 		return err
 	})
 }
@@ -137,7 +141,7 @@ func (s *Store) UpsertRosterAgent(ctx context.Context, a domain.RosterAgent) err
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		var prevTerminal string
 		err := tx.QueryRowContext(ctx,
-			`SELECT terminal_id FROM agent_roster WHERE agent_id = ?`, a.AgentID).Scan(&prevTerminal)
+			`SELECT terminal_id FROM agent_roster WHERE node_id = ? AND agent_id = ?`, s.self, a.AgentID).Scan(&prevTerminal)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 		case err != nil:
@@ -145,11 +149,11 @@ func (s *Store) UpsertRosterAgent(ctx context.Context, a domain.RosterAgent) err
 		}
 		if prevTerminal != "" && a.TerminalID != "" && prevTerminal != a.TerminalID {
 			if _, err := tx.ExecContext(ctx,
-				`DELETE FROM agent_roster WHERE agent_id = ?`, a.AgentID); err != nil {
+				`DELETE FROM agent_roster WHERE node_id = ? AND agent_id = ?`, s.self, a.AgentID); err != nil {
 				return err
 			}
 		}
-		return upsertRosterRow(ctx, tx, a, rosterSeqUnknown, false)
+		return s.upsertRosterRow(ctx, tx, a, rosterSeqUnknown, false)
 	})
 }
 
@@ -195,7 +199,7 @@ func (s *Store) UpsertRosterAgent(ctx context.Context, a domain.RosterAgent) err
 //
 // Position, location and terminal are NOT guarded this way, deliberately: a
 // full listing is authoritative for them and an event reports none of them.
-func upsertRosterRow(ctx context.Context, tx *sql.Tx,
+func (s *Store) upsertRosterRow(ctx context.Context, tx *sql.Tx,
 	a domain.RosterAgent, seq int, authoritative bool) error {
 	// A non-authoritative write keeps whatever gone_at the row already has.
 	goneAt := "agent_roster.gone_at"
@@ -204,8 +208,8 @@ func upsertRosterRow(ctx context.Context, tx *sql.Tx,
 	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO agent_roster (`+rosterColumns+`, list_seq, gone_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-		ON CONFLICT(agent_id) DO UPDATE SET
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+		ON CONFLICT(node_id, agent_id) DO UPDATE SET
 			pane_id = excluded.pane_id, tab_id = excluded.tab_id,
 			workspace_id = excluded.workspace_id, agent_type = excluded.agent_type,
 			status = CASE WHEN agent_roster.seen_at > excluded.seen_at
@@ -217,7 +221,7 @@ func upsertRosterRow(ctx context.Context, tx *sql.Tx,
 			seen_at = CASE WHEN agent_roster.seen_at > excluded.seen_at
 				THEN agent_roster.seen_at ELSE excluded.seen_at END,
 			gone_at = `+goneAt,
-		a.AgentID, a.PaneID, a.TabID, a.WorkspaceID, a.AgentType,
+		s.self, a.AgentID, a.PaneID, a.TabID, a.WorkspaceID, a.AgentType,
 		a.Status, a.TerminalID, a.Cwd, unix(a.CwdReadAt), unix(a.SeenAt), seq, rosterSeqUnknown)
 	return err
 }
@@ -243,9 +247,9 @@ func (s *Store) SetRosterCwds(ctx context.Context, cwds map[string]domain.Roster
 		for agentID, c := range cwds {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE agent_roster SET cwd = ?, cwd_read_at = ?
-				WHERE agent_id = ?
+				WHERE node_id = ? AND agent_id = ?
 				  AND (terminal_id = '' OR ? = '' OR terminal_id = ?)`,
-				c.Cwd, unix(readAt), agentID, c.TerminalID, c.TerminalID); err != nil {
+				c.Cwd, unix(readAt), s.self, agentID, c.TerminalID, c.TerminalID); err != nil {
 				return err
 			}
 		}
@@ -264,12 +268,17 @@ func (s *Store) SetRosterCwds(ctx context.Context, cwds map[string]domain.Roster
 // Agents tab renders and what a read ordered by agent_id would silently
 // scramble past nine panes in a workspace.
 func (s *Store) LiveRoster(ctx context.Context) ([]domain.RosterAgent, time.Time, error) {
-	publishedAt, err := s.rosterPublishedAt(ctx)
+	return s.rosterOf(ctx, s.self)
+}
+
+// rosterOf is LiveRoster for one node.
+func (s *Store) rosterOf(ctx context.Context, nodeID string) ([]domain.RosterAgent, time.Time, error) {
+	publishedAt, err := s.rosterPublishedAt(ctx, nodeID)
 	if err != nil {
 		return nil, time.Time{}, err
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+rosterColumns+` FROM agent_roster WHERE gone_at = 0 ORDER BY list_seq, agent_id`)
+		`SELECT `+rosterColumns+` FROM agent_roster WHERE node_id = ? AND gone_at = 0 ORDER BY list_seq, agent_id`, nodeID)
 	if err != nil {
 		return nil, time.Time{}, err
 	}
@@ -278,7 +287,7 @@ func (s *Store) LiveRoster(ctx context.Context) ([]domain.RosterAgent, time.Time
 	for rows.Next() {
 		var a domain.RosterAgent
 		var cwdReadAt, seenAt int64
-		if err := rows.Scan(&a.AgentID, &a.PaneID, &a.TabID, &a.WorkspaceID,
+		if err := rows.Scan(&a.NodeID, &a.AgentID, &a.PaneID, &a.TabID, &a.WorkspaceID,
 			&a.AgentType, &a.Status, &a.TerminalID, &a.Cwd, &cwdReadAt, &seenAt); err != nil {
 			return nil, time.Time{}, err
 		}
@@ -289,9 +298,9 @@ func (s *Store) LiveRoster(ctx context.Context) ([]domain.RosterAgent, time.Time
 	return out, publishedAt, rows.Err()
 }
 
-func (s *Store) rosterPublishedAt(ctx context.Context) (time.Time, error) {
+func (s *Store) rosterPublishedAt(ctx context.Context, nodeID string) (time.Time, error) {
 	var at int64
-	err := s.db.QueryRowContext(ctx, `SELECT published_at FROM roster_meta WHERE id = 1`).Scan(&at)
+	err := s.db.QueryRowContext(ctx, `SELECT published_at FROM roster_meta WHERE node_id = ?`, nodeID).Scan(&at)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return time.Time{}, nil
@@ -316,28 +325,28 @@ func (s *Store) PublishLocations(ctx context.Context,
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		if workspaces != nil {
 			if _, err := tx.ExecContext(ctx,
-				`DELETE FROM herdr_locations WHERE kind = ?`, RosterKindWorkspace); err != nil {
+				`DELETE FROM herdr_locations WHERE node_id = ? AND kind = ?`, s.self, RosterKindWorkspace); err != nil {
 				return err
 			}
 			for _, w := range workspaces {
 				if _, err := tx.ExecContext(ctx, `
-					INSERT INTO herdr_locations (kind, id, label, number, workspace_id, seen_at)
-					VALUES (?, ?, ?, ?, '', ?)`,
-					RosterKindWorkspace, w.ID, w.Label, w.Number, unix(now)); err != nil {
+					INSERT INTO herdr_locations (node_id, kind, id, label, number, workspace_id, seen_at)
+					VALUES (?, ?, ?, ?, ?, '', ?)`,
+					s.self, RosterKindWorkspace, w.ID, w.Label, w.Number, unix(now)); err != nil {
 					return err
 				}
 			}
 		}
 		if tabs != nil {
 			if _, err := tx.ExecContext(ctx,
-				`DELETE FROM herdr_locations WHERE kind = ?`, RosterKindTab); err != nil {
+				`DELETE FROM herdr_locations WHERE node_id = ? AND kind = ?`, s.self, RosterKindTab); err != nil {
 				return err
 			}
 			for _, t := range tabs {
 				if _, err := tx.ExecContext(ctx, `
-					INSERT INTO herdr_locations (kind, id, label, number, workspace_id, seen_at)
-					VALUES (?, ?, ?, ?, ?, ?)`,
-					RosterKindTab, t.ID, t.Label, t.Number, t.WorkspaceID, unix(now)); err != nil {
+					INSERT INTO herdr_locations (node_id, kind, id, label, number, workspace_id, seen_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					s.self, RosterKindTab, t.ID, t.Label, t.Number, t.WorkspaceID, unix(now)); err != nil {
 					return err
 				}
 			}
@@ -350,8 +359,14 @@ func (s *Store) PublishLocations(ctx context.Context,
 // is nil when nothing of that kind has been published.
 func (s *Store) HerdrLocations(ctx context.Context) (
 	map[string]domain.WorkspaceInfo, map[string]domain.TabInfo, error) {
+	return s.locationsOf(ctx, s.self)
+}
+
+// locationsOf is HerdrLocations for one node.
+func (s *Store) locationsOf(ctx context.Context, nodeID string) (
+	map[string]domain.WorkspaceInfo, map[string]domain.TabInfo, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT kind, id, label, number, workspace_id FROM herdr_locations`)
+		`SELECT kind, id, label, number, workspace_id FROM herdr_locations WHERE node_id = ?`, nodeID)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -109,6 +109,10 @@ type App struct {
 	// test fixture must still be a config production would ACCEPT (env_file
 	// set, gist_id set) or it proves less than it appears to.
 	TaskStoreFor func(cfg config.Config, locator string) (ports.TaskStore, error)
+
+	// RemoteActionTimeout overrides how long a confirm waits for ANOTHER node's
+	// daemon to deliver (0 = DefaultRemoteActionTimeout). Tests shorten it.
+	RemoteActionTimeout time.Duration
 }
 
 // nudge wakes the daemon so it re-reads what the caller just persisted. It
@@ -154,10 +158,13 @@ func (a *App) confirmationWeight() float64 {
 
 // Status summarizes daemon-relevant state.
 type Status struct {
-	Paused             bool
-	LatestKill         *domain.KillEvent
-	PendingEscalations int
-	MonitoredAgents    []domain.AgentTransition
+	Paused     bool
+	LatestKill *domain.KillEvent
+	// PendingEscalations counts the whole fleet's pending rows under a shared
+	// store; PendingEscalationsHere is this node's share of them.
+	PendingEscalations     int
+	PendingEscalationsHere int
+	MonitoredAgents        []domain.AgentTransition
 	// AgentsKnown reports that MonitoredAgents actually reflects herdr: false
 	// means no daemon has published a roster recently enough to trust, which
 	// is NOT the same as "no agents are running" — an empty MonitoredAgents
@@ -214,6 +221,21 @@ type Status struct {
 	// llm.command cleared), "" when the mode is off or actually running.
 	// Best-effort, like Drift.
 	FullSelfPromptingBlocked string
+
+	// The fleet: every node sharing the store (see fleet.go). Under the local
+	// engine Nodes holds this node alone and the rest is empty.
+	NodeID    string
+	SelfLabel string
+	Nodes     []domain.NodeInfo
+	// RemoteAgents are the OTHER nodes' agents, fully resolved: they are kept
+	// out of the agent-id-keyed maps above because pane ids repeat across
+	// machines.
+	RemoteAgents []RemoteAgent
+	// PausedNodes are the other nodes whose kill switch is down.
+	PausedNodes map[string]bool
+	// FleetNames maps (node, agent) to short names, for labelling another
+	// node's escalations and audit rows.
+	FleetNames map[domain.NodeAgent]string
 }
 
 // GetStatus returns the operator-facing status summary.
@@ -305,6 +327,7 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 			st.AgentNames[agent.AgentID] = name
 		}
 	}
+	a.fillFleet(ctx, &st)
 	return st, nil
 }
 
@@ -557,6 +580,12 @@ func (a *App) liveRosterAgentID(ctx context.Context, target string) (string, err
 func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
 	err := a.Store.RenameAgent(ctx, target, newName)
 	if errors.Is(err, ports.ErrUnknownAgent) {
+		// UnlessLocal, because this is exactly the window a live local pane
+		// has no name row yet — and every herdr has a pane "1", so a bare id
+		// found on another node must not shadow the local pane it also names.
+		if rerr := a.refuseRemoteTargetUnlessLocal(ctx, target, "rename"); rerr != nil {
+			return rerr
+		}
 		agentID, rerr := a.liveRosterAgentID(ctx, target)
 		if rerr != nil {
 			return fmt.Errorf("%w (%v)", err, rerr)
@@ -578,6 +607,9 @@ func (a *App) RenameAgent(ctx context.Context, target, newName string) error {
 func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool) error {
 	err := a.Store.SetAgentDisabled(ctx, target, disabled)
 	if errors.Is(err, ports.ErrUnknownAgent) {
+		if rerr := a.refuseRemoteTargetUnlessLocal(ctx, target, "enable/disable"); rerr != nil {
+			return rerr
+		}
 		agentID, rerr := a.liveRosterAgentID(ctx, target)
 		if rerr != nil {
 			return fmt.Errorf("%w (%v)", err, rerr)
@@ -608,6 +640,11 @@ func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool
 func (a *App) CaptureAgent(ctx context.Context, target string) (domain.CaptureResult, error) {
 	if strings.TrimSpace(target) == "" {
 		return domain.CaptureResult{}, fmt.Errorf("an agent is required")
+	}
+	// A capture runs THIS daemon's pipeline against THIS herdr, so an agent on
+	// another machine is refused here rather than resolved to nothing there.
+	if err := a.refuseRemoteTargetUnlessLocal(ctx, target, "capture"); err != nil {
+		return domain.CaptureResult{}, err
 	}
 	if err := a.requireLiveDaemon(); err != nil {
 		return domain.CaptureResult{}, err
@@ -756,6 +793,17 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// tasks.md when none exists) and, when send, hands the first task to the
 	// agent. Handle it before the send-oriented flow below.
 	if action == domain.SuggestGenerateTask {
+		// acceptGeneratedTask is node-blind by construction: it matches the
+		// row's pane id against THIS machine's herd, names a local row for it,
+		// writes a local list and registers a local task source. For another
+		// node's row every one of those lands on the wrong machine — and with
+		// send, in whichever local pane shares the id. Until a queued action
+		// carries it to the owner, it is that machine's confirm to give.
+		if self := a.Store.NodeID(); audit.NodeID != "" && audit.NodeID != self {
+			return fmt.Errorf("%w: this generated-task suggestion belongs to node %s — its list and task "+
+				"source live there, so confirm it on that machine (`hap confirm %d`)",
+				ErrRemoteAgent, a.NodeLabelFor(ctx, audit.NodeID), auditID)
+		}
 		return a.acceptGeneratedTask(ctx, audit, send, false, nil)
 	}
 	// willSend is the delivery gate. The correction is recorded FIRST (the
@@ -788,7 +836,9 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// reply with nothing draining the queue would sit in a healthy-looking
 	// table indefinitely, which is worse than the immediate, visible failure
 	// it replaces.
-	if err := a.requireLiveDaemon(); err != nil {
+	// The escalation's OWN node must have a daemon to deliver this: ours when
+	// the row is ours, otherwise that machine's heartbeat in the nodes table.
+	if err := a.requireLiveDaemonFor(ctx, audit.NodeID); err != nil {
 		return err
 	}
 	payload, err := json.Marshal(domain.DeliverReplyPayload{AuditID: auditID, Action: action})
@@ -799,8 +849,9 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// this confirm and the daemon's send, the terminal behind it can be
 	// replaced and the reply typed at a stranger. Bind the action to the
 	// identity the daemon last observed (best-effort — an unknown one is not
-	// evidence of change, and the daemon treats it as such).
-	terminalID, err := a.Store.AgentTerminalID(ctx, audit.AgentID)
+	// evidence of change, and the daemon treats it as such). The OWNING node's
+	// record, never this one's: pane ids repeat across machines.
+	terminalID, err := a.Store.AgentTerminalIDOn(ctx, orSelf(a, audit.NodeID), audit.AgentID)
 	if err != nil {
 		return err
 	}
@@ -827,10 +878,20 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// whether their answer landed. Every refusal from the deliverer is a bare
 	// sentence, so the "correction recorded, but …" prefix is still added in
 	// exactly one place.
-	if _, err := a.AwaitAgentAction(ctx, actionID, DefaultActionTimeout); err != nil {
+	// A remote node's verdict travels one push and one pull each way, so its
+	// wait is longer; a timeout still means "still queued", never "failed".
+	if _, err := a.AwaitAgentAction(ctx, actionID, a.awaitTimeoutFor(audit.NodeID)); err != nil {
 		return fmt.Errorf("correction recorded, but %w", err)
 	}
 	return nil
+}
+
+// orSelf returns nodeID, or this node's id when the row predates node ids.
+func orSelf(a *App, nodeID string) string {
+	if nodeID == "" {
+		return a.Store.NodeID()
+	}
+	return nodeID
 }
 
 // ErrSuggestionStaleAgentBusy is returned by a confirm+send (send=true) of a
@@ -1966,6 +2027,16 @@ func (a *App) HasPendingLLMConsult(ctx context.Context, agentID string) (bool, e
 	return a.Store.HasPendingLLMConsult(ctx, agentID)
 }
 
+// HasPendingLLMConsultOn is HasPendingLLMConsult for an agent on a given node
+// ("" = this one). Pane ids repeat across machines, so a remote escalation's
+// retry gate must ask about ITS node's agent, not a local namesake.
+func (a *App) HasPendingLLMConsultOn(ctx context.Context, nodeID, agentID string) (bool, error) {
+	if nodeID == "" || nodeID == a.Store.NodeID() {
+		return a.Store.HasPendingLLMConsult(ctx, agentID)
+	}
+	return a.Store.HasPendingLLMConsultOn(ctx, nodeID, agentID)
+}
+
 // DefaultPruneMinutes is how old a pending escalation must be before a
 // prune dismisses it, absent an explicit age (CLI argument / TUI prompt).
 const DefaultPruneMinutes = 360
@@ -2182,6 +2253,15 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "task_source_provider.timeout_seconds", TUIEditable: true, TUIHidden: true},
 	{Key: "task_source_provider.refresh_seconds", TUIEditable: true, TUIHidden: true},
 	{Key: "task_source_provider.github_gist.gist_id", TUIEditable: true},
+	// [database]: the engine is a picker; the URL and the node label are free
+	// text (CR-036: read-only in the TUI); the token is registered so `hap
+	// config set` reaches it but rendered REDACTED everywhere and kept off the
+	// Config tab, like every other key that holds a secret.
+	{Key: "database.engine", TUIEditable: true},
+	{Key: "database.turso_database_url"},
+	{Key: "database.turso_auth_token", TUIHidden: true},
+	{Key: "database.turso_sync_interval_seconds", TUIEditable: true, TUIHidden: true},
+	{Key: "database.node_label"},
 	// Palette roles are TUIHidden, not absent: eight color strings would bury
 	// the settings a TUI operator actually reaches for, but `hap config fields`
 	// and `hap config set` must still reach every key config.toml accepts.
@@ -2515,6 +2595,27 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(int(cfg.TaskSourceProvider.SnapshotTTL() / time.Second))
 	case "task_source_provider.github_gist.gist_id":
 		return pathFieldValue(cfg.TaskSourceProvider.GitHubGist.GistID)
+	case "database.engine":
+		return cfg.Database.EngineOrDefault()
+	case "database.turso_database_url":
+		return pathFieldValue(cfg.Database.TursoDatabaseURL)
+	case "database.turso_auth_token":
+		// Never the value: a token is a secret, and every registered key is
+		// printed by `hap config fields`.
+		if strings.TrimSpace(cfg.Database.TursoAuthToken) != "" {
+			return "(set)"
+		}
+		if os.Getenv(config.TursoAuthTokenEnv) != "" {
+			return "(from " + config.TursoAuthTokenEnv + ")"
+		}
+		return "(none)"
+	case "database.turso_sync_interval_seconds":
+		return defaultedInt(cfg.Database.TursoSyncIntervalSeconds, config.DefaultTursoSyncIntervalSeconds)
+	case "database.node_label":
+		if strings.TrimSpace(cfg.Database.NodeLabel) == "" {
+			return "(hostname)"
+		}
+		return cfg.Database.NodeLabel
 	}
 	return ""
 }
@@ -2977,6 +3078,48 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 					"(the hex tail of its URL), got %q", value)
 			}
 			cfg.TaskSourceProvider.GitHubGist.GistID = id
+			return nil
+		case "database.engine":
+			// Same rule as task_source_provider.provider: the typed surface
+			// rejects a typo with the valid list; a hand-edited file still loads
+			// and fails at use time (config.ValidateDatabase).
+			e := strings.ToLower(strings.TrimSpace(value))
+			if e == "" {
+				cfg.Database.Engine = ""
+				return nil
+			}
+			if !slices.Contains(config.ValidDatabaseEngines, e) {
+				return fmt.Errorf("database.engine must be one of %s, got %q",
+					strings.Join(config.ValidDatabaseEngines, ", "), value)
+			}
+			cfg.Database.Engine = e
+			return nil
+		case "database.turso_database_url":
+			// Not validated against the engine: the three keys must not be
+			// order-dependent to set. Shape only.
+			u := strings.TrimSpace(value)
+			if strings.ContainsAny(u, " \t\r\n") {
+				return fmt.Errorf("database.turso_database_url must be a single URL, got %q", value)
+			}
+			cfg.Database.TursoDatabaseURL = u
+			return nil
+		case "database.turso_auth_token":
+			cfg.Database.TursoAuthToken = strings.TrimSpace(value)
+			return nil
+		case "database.turso_sync_interval_seconds":
+			v, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || v < 0 {
+				return fmt.Errorf("database.turso_sync_interval_seconds must be a non-negative "+
+					"integer (0 = the built-in %d), got %q", config.DefaultTursoSyncIntervalSeconds, value)
+			}
+			cfg.Database.TursoSyncIntervalSeconds = v
+			return nil
+		case "database.node_label":
+			l := strings.TrimSpace(value)
+			if strings.ContainsAny(l, "\t\r\n@") {
+				return fmt.Errorf("database.node_label must be a short label without @ or line breaks, got %q", value)
+			}
+			cfg.Database.NodeLabel = l
 			return nil
 		case "cli.ai_agent_friendly_output":
 			v, err := strconv.ParseBool(value)
@@ -3665,15 +3808,67 @@ func (a *App) taskListFor(agent, path string) (locator, sourceIndex string, err 
 		}
 		return l.Locator, strconv.Itoa(idx), nil
 	}
-	src, idx, err := resolveTaskSourceFor(cfg, agent)
+	// The operator may type either spelling of an agent — herdr's pane id or
+	// hap's short name — and a source selector may name either. The DERIVED
+	// list, though, is always named after the NAME: that is what the daemon
+	// derives on hand-out, so resolving it from an id here would open a list
+	// nobody ever reads (verified live: `hap task a1 add` refused to create
+	// "a1.md" while the daemon served "lively-mole.md").
+	id, name := a.agentSpellings(agent)
+	src, idx, err := resolveTaskSourceForAny(cfg, agent, id, name)
 	if err != nil {
 		return "", "", err
 	}
-	l, err := a.resolveSourceList(cfg, src, agent)
+	l, err := a.resolveSourceList(cfg, src, name)
 	if err != nil {
 		return "", "", err
 	}
 	return l.Locator, strconv.Itoa(idx), nil
+}
+
+// agentSpellings resolves a task target to the two spellings hap knows an
+// agent by — its id and its short name — from the names registry. A target
+// hap has never seen has only itself.
+func (a *App) agentSpellings(target string) (id, name string) {
+	if a.Store == nil {
+		return target, target
+	}
+	names, err := a.Store.AgentNames(context.Background())
+	if err != nil {
+		return target, target
+	}
+	if n, ok := names[target]; ok && n != "" {
+		return target, n
+	}
+	for id, n := range names {
+		if n == target {
+			return id, n
+		}
+	}
+	return target, target
+}
+
+// resolveTaskSourceForAny is resolveTaskSourceFor over every spelling of one
+// agent, first match wins; the first spelling's error stands when none does.
+// An ambiguity (several sources) is returned as such, never papered over by a
+// later spelling matching exactly one.
+func resolveTaskSourceForAny(cfg config.Config, spellings ...string) (config.TaskSource, int, error) {
+	var firstErr error
+	seen := map[string]bool{}
+	for _, s := range spellings {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		src, idx, err := resolveTaskSourceFor(cfg, s)
+		if err == nil {
+			return src, idx, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return config.TaskSource{}, 0, firstErr
 }
 
 // mutateTask applies one locked read-modify-write to a task list through the
@@ -3737,7 +3932,7 @@ func (a *App) TaskSourcePathFor(agent string) (string, error) {
 // the source the same way the locator was produced, and compare canonically so
 // two spellings of one local file still match.
 func (a *App) sourceLocatorMatches(cfg config.Config, src config.TaskSource, agent, locator string) bool {
-	res, err := tasklocator.Resolve(cfg, src, agent)
+	res, err := a.resolveSource(cfg, src, agent)
 	if err != nil {
 		return false
 	}
@@ -3898,7 +4093,16 @@ type TaskGroup struct {
 	Display string
 	Items   []domain.ChecklistItem
 	Err     string // "" = read OK
+	// NodeID and NodeLabel are set only on a group from FleetTaskGroups — a
+	// list another node keeps in the shared database. Such a group has no
+	// config Index (-1) and cannot be sent from here: its agent runs on that
+	// node, and only that node's daemon hands its items out.
+	NodeID    string
+	NodeLabel string
 }
+
+// Fleet reports whether the group is another node's list.
+func (g TaskGroup) Fleet() bool { return g.NodeID != "" }
 
 // TaskGroups parses every configured task source's checklist, in config
 // order. It takes the already-loaded cfg so a refresh snapshot's config and
@@ -4331,6 +4535,11 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 // the one whose pane has closed, which is exactly the set TaskGroups resolves
 // a row's locator from.
 func (a *App) sourceForLocator(cfg config.Config, agent, locator string) (config.TaskSource, string, bool) {
+	if agent != "" {
+		// A derived list is named after the agent's NAME, whichever spelling
+		// the caller addressed it by (see taskListFor).
+		_, agent = a.agentSpellings(agent)
+	}
 	for _, src := range cfg.TaskSources {
 		if a.sourceLocatorMatches(cfg, src, agent, locator) {
 			return src, agent, true

@@ -305,6 +305,41 @@ type EnsureCreator interface {
 	Ensure(ctx context.Context, locator, initial string) (created bool, err error)
 }
 
+// TaskListStore is the OPTIONAL store capability behind the `sqlite`
+// task-source provider: checklists kept as rows in hap's own database, so that
+// under a shared (turso) store every node's lists are visible — and editable —
+// from every other node's TUI and CLI.
+//
+// Lists are addressed by (node, name), never by this store's own node alone: an
+// operator on one machine edits another machine's list through the same
+// methods, which is why every method takes the node id explicitly rather than
+// defaulting to NodeID(). The daemon that owns a node is still the only one
+// handing its items out, so the ownership model of every other node-owned
+// table holds for the hand-out path; a concurrent operator edit is resolved by
+// the revision compare-and-swap inside MutateTaskList (one node) or by the
+// sync engine's last-push-wins (two nodes, one sync window).
+type TaskListStore interface {
+	NodeID() string
+	// ReadTaskList returns the list, or an error wrapping fs.ErrNotExist when
+	// no such list exists — the same contract TaskStore.Read has.
+	ReadTaskList(ctx context.Context, nodeID, name string) (domain.StoredTaskList, error)
+	// MutateTaskList applies fn to the current content and writes the result
+	// only if nobody else wrote in between (compare-and-swap on the revision),
+	// re-reading and re-applying fn on a lost race. fn therefore runs inside
+	// the critical section in the sense that matters — a write is never based
+	// on a stale read — and may run more than once, so it must be a pure
+	// function of the content it is handed. A mutator error writes nothing.
+	// A missing list is an error wrapping fs.ErrNotExist; Mutate never creates.
+	MutateTaskList(ctx context.Context, nodeID, name string, now time.Time,
+		fn func(content string) (string, error)) (string, error)
+	// EnsureTaskList creates the list when it is missing and reports whether
+	// it did. It never overwrites existing content.
+	EnsureTaskList(ctx context.Context, nodeID, name, agentName, initial string, now time.Time) (created bool, err error)
+	// ListTaskLists is a FLEET read: every node's lists, ordered by node then
+	// name, so the unified Tasks view can show another machine's queues.
+	ListTaskLists(ctx context.Context) ([]domain.StoredTaskList, error)
+}
+
 // RemoteTaskStore marks a store whose reads and writes leave the machine.
 //
 // Optional, and the daemon's whole risk control: absent, every task-list read
@@ -329,6 +364,33 @@ type RemoteTaskStore interface {
 func TaskStoreRemote(s TaskStore) bool {
 	r, ok := s.(RemoteTaskStore)
 	return ok && r.Remote()
+}
+
+// FleetSyncStats is the sync engine's view of a node's shared database.
+type FleetSyncStats struct {
+	// PendingOps counts local writes not yet pushed.
+	PendingOps int64
+	// MainWALBytes and RevertWALBytes size the local write-ahead logs, which a
+	// sync database never checkpoints on its own.
+	MainWALBytes, RevertWALBytes int64
+	LastPull, LastPush           time.Time
+	NetworkSentBytes             int64
+	NetworkReceivedBytes         int64
+	// Revision is the remote's opaque revision; displayed, never parsed.
+	Revision string
+}
+
+// FleetSyncPort is the shared database's sync engine, as the daemon drives it:
+// pull remote changes, push local ones, compact the local log. Optional — under
+// the local engine there is nothing to sync and the daemon never has one. The
+// operations take no context on purpose: the engine must never be cancelled
+// mid-flight (an abandoned operation wedges the next one), so a caller bounds
+// them by scheduling, not by deadline.
+type FleetSyncPort interface {
+	Pull() (changed bool, err error)
+	Push() error
+	Checkpoint() error
+	Stats(ctx context.Context) (FleetSyncStats, error)
 }
 
 // StorePort is the persistence boundary. Write-ownership is partitioned:
@@ -444,6 +506,15 @@ type DaemonStore interface {
 	// current session (name and history survive). Empty terminalID and
 	// unknown agentID are no-ops. Returns reset=true when created_at moved.
 	SyncAgentTerminalID(ctx context.Context, agentID, terminalID string) (bool, error)
+	// HasOpenEscalation reports whether one of THIS node's agents has a
+	// pending escalation — the reconcile guard. Node-scoped by construction:
+	// an agent id is a herdr pane id and repeats on every machine sharing the
+	// store, so a fleet-wide PendingEscalations filtered by agent id in Go
+	// would let another machine's open question block this one's reconcile.
+	HasOpenEscalation(ctx context.Context, agentID string) (bool, error)
+	// UpsertNode records this daemon's heartbeat in the nodes table (label,
+	// version, started, last seen). Only the daemon writes it.
+	UpsertNode(ctx context.Context, n domain.NodeInfo) error
 
 	// PublishRoster replaces the daemon's published view of the running herd.
 	// Only the daemon writes it; the front ends read it instead of listing
@@ -516,6 +587,9 @@ type DaemonStore interface {
 
 // FrontendStore is the front-end (TUI/CLI) write surface plus shared reads.
 type FrontendStore interface {
+	// StampWatching records that a TUI on this node is watching the fleet
+	// until the given time, so other nodes' daemons publish faster for it.
+	StampWatching(ctx context.Context, until time.Time) error
 	ReadStore
 
 	// RecordTaskReservation / DeleteTaskReservation give an UNATTENDED
@@ -628,6 +702,24 @@ type ReadStore interface {
 	// daemon last observed it, "" when unknown. Herdr reuses pane ids, so this
 	// is what tells "same agent" from "new terminal on a recycled pane id".
 	AgentTerminalID(ctx context.Context, agentID string) (string, error)
+	// AgentTerminalIDOn is AgentTerminalID for an agent on any node — a reply
+	// to another machine's escalation is checked against THAT machine's record.
+	AgentTerminalIDOn(ctx context.Context, nodeID, agentID string) (string, error)
+	// NodeID is this installation's identity (store.LoadNodeID): the value every
+	// row it owns is stamped with, and the one the fleet views call "self".
+	NodeID() string
+	// ListNodes returns every installation sharing the store, this one included.
+	ListNodes(ctx context.Context) ([]domain.NodeInfo, error)
+	// The fleet reads, for the unified view: every node's rows, each keyed by
+	// (node, agent) because pane ids repeat across machines.
+	FleetRoster(ctx context.Context) ([]domain.RosterAgent, map[string]time.Time, error)
+	FleetAgentNames(ctx context.Context) (map[domain.NodeAgent]string, error)
+	DisabledAgentsAll(ctx context.Context) (map[domain.NodeAgent]bool, error)
+	FleetAgentStats(ctx context.Context) (map[domain.NodeAgent]domain.AgentStats, error)
+	// LocationsOf is HerdrLocations for any node.
+	LocationsOf(ctx context.Context, nodeID string) (map[string]domain.WorkspaceInfo, map[string]domain.TabInfo, error)
+	// RemoteWatchers counts OTHER nodes with a TUI watching the fleet as of now.
+	RemoteWatchers(ctx context.Context, now time.Time) (int, error)
 
 	// LiveRoster returns the agents the daemon last published, plus when it
 	// published them. A ZERO time means no daemon ever has, which is not the
@@ -650,6 +742,8 @@ type ReadStore interface {
 	// resuming a paused daemon the moment the mode is switched off. Test fakes
 	// must filter too, or they pass a case that should fail.
 	LatestKillEvent(ctx context.Context) (*domain.KillEvent, error)
+	// LatestKillEventOn is LatestKillEvent for any node.
+	LatestKillEventOn(ctx context.Context, nodeID string) (*domain.KillEvent, error)
 	// KillEvents returns the merged automation history (both scopes), newest
 	// first — what the Pause/Kill tab and `hap kill-history` render.
 	KillEvents(ctx context.Context, limit int) ([]domain.KillEvent, error)
@@ -659,6 +753,8 @@ type ReadStore interface {
 	// CountPendingEscalations counts pending escalations without fetching
 	// the (pane-excerpt-heavy) rows.
 	CountPendingEscalations(ctx context.Context) (int64, error)
+	// CountPendingEscalationsOn counts one node's pending escalations.
+	CountPendingEscalationsOn(ctx context.Context, nodeID string) (int64, error)
 	// PendingEscalationExcerpts returns the pane excerpts of the escalations that
 	// dedup a re-fire for this agent + agent type: every still-pending one (any
 	// age) plus every originally-escalated ask whose answer was DELIVERED
@@ -674,6 +770,8 @@ type ReadStore interface {
 	// HasPendingLLMConsult reports whether a consult is still in flight for
 	// the agent (a pending llm_requests row) — the retry concurrency guard.
 	HasPendingLLMConsult(ctx context.Context, agentID string) (bool, error)
+	// HasPendingLLMConsultOn is HasPendingLLMConsult for an agent on any node.
+	HasPendingLLMConsultOn(ctx context.Context, nodeID, agentID string) (bool, error)
 	GetAgentRate(ctx context.Context, agentID string) (*domain.AgentRate, error)
 	GetErrorRetry(ctx context.Context, errorSignature string) (*domain.ErrorRetry, error)
 	PendingLLMDecisions(ctx context.Context) ([]domain.LLMDecision, error)

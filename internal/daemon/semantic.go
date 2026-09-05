@@ -383,6 +383,27 @@ func remapAllowed(s domain.Situation, sig domain.SignatureResult, hit match.Hit)
 	return true
 }
 
+// RefreshKnowledge rebuilds the semantic index from the store in the
+// background, WITHOUT touching the embedder or the ready flag: it is what the
+// fleet sync loop calls after a pull brought rules learned on other machines,
+// which must become matchable here. The old index keeps serving until
+// Matcher.Rebuild publishes the new one atomically, and rebuilding from the
+// store (rather than adding rows) is what also makes a rule DELETED elsewhere
+// disappear here. Superseded runs abort on the generation counter, so a burst
+// of pulls costs one rebuild.
+func (d *Daemon) RefreshKnowledge() {
+	if d.matcher == nil {
+		return
+	}
+	gen := d.semanticGen.Add(1)
+	d.spawn(func() {
+		_ = logging.Guard("semantic-refresh", func() error {
+			d.initSemantic(d.shutdownCtx, gen)
+			return nil
+		})
+	})
+}
+
 // embedderPort returns the current embedder (rebuilt on reload when the
 // embedding config changes).
 func (d *Daemon) embedderPort() ports.EmbedderPort {
