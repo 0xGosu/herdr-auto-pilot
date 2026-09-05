@@ -21,10 +21,16 @@ type fakeFleetSync struct {
 	changed     bool
 	pullErr     error
 	walBytes    int64
+	// pullBlock, when set, makes every Pull hang until it is closed — a
+	// native call stuck on the network.
+	pullBlock chan struct{}
 }
 
 func (f *fakeFleetSync) Pull() (bool, error) {
 	f.pulls.Add(1)
+	if f.pullBlock != nil {
+		<-f.pullBlock
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.changed, f.pullErr
@@ -153,4 +159,22 @@ func TestFleetSyncHealthReportsErrorsAndRecovery(t *testing.T) {
 	if line := fh.Line(time.Now()); !strings.Contains(line, "ok") {
 		t.Errorf("status line = %q, want ok", line)
 	}
+}
+
+// TestFleetSyncShutdownIsNotHeldByAHungPull: a sync operation is never
+// cancelled, but a pull stuck on the network must not stop the daemon from
+// shutting down — the loop lets go, the operation is left to the adapter.
+func TestFleetSyncShutdownIsNotHeldByAHungPull(t *testing.T) {
+	sync := &fakeFleetSync{pullBlock: make(chan struct{})}
+	h := newHarnessCore(t, "", nil, &fakeLLM{}, &fakeLLM{}, nil, func(o *Options) {
+		o.FleetSync = sync
+		o.FleetSyncInterval = 20 * time.Millisecond
+	})
+	waitFor(t, 2*time.Second, func() bool { return sync.pulls.Load() >= 1 })
+	start := time.Now()
+	h.stop() // fails the test itself if Run does not return within 5s
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("shutdown took %s with a pull in flight", elapsed)
+	}
+	close(sync.pullBlock) // release the hung operation
 }

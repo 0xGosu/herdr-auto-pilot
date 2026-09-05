@@ -53,7 +53,7 @@ func openProxyStore(socketPath, stateDir, nodeID string) (*store.Store, error) {
 	// Ids come from the daemon (one sequence per node); a local allocator with
 	// this node's bits is the fallback for a daemon that cannot answer.
 	c := &sqlbridge.DialConnector{Path: socketPath}
-	local := store.NewTimeOrderedIDs(store.NodeBits(nodeID), nil)
+	local := store.NewFallbackTimeOrderedIDs(store.NodeBits(nodeID), nil)
 	return store.OpenDB(sqlbridge.OpenDB(c), store.Options{
 		NodeID:       nodeID,
 		Engine:       store.EngineTurso,

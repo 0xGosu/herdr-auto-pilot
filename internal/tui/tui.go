@@ -1594,16 +1594,19 @@ func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refr
 	// Gate "retry LLM" per agent: a consult already in flight disables it.
 	// Best-effort — a lookup error just leaves the key enabled (the daemon
 	// guards authoritatively before re-consulting).
+	// Keyed by (node, agent), not agent alone: pane ids repeat across
+	// machines, so a remote escalation must be judged by ITS node's consults.
 	msg.pendingConsult = map[string]bool{}
 	checked := map[string]bool{}
 	for i := range msg.escalations {
 		e := msg.escalations[i]
-		if !domain.IsRetryableLLMEscalation(&e) || checked[e.AgentID] {
+		key := consultKey(e.NodeID, e.AgentID)
+		if !domain.IsRetryableLLMEscalation(&e) || checked[key] {
 			continue
 		}
-		checked[e.AgentID] = true
-		if pending, perr := app.HasPendingLLMConsult(ctx, e.AgentID); perr == nil && pending {
-			msg.pendingConsult[e.AgentID] = true
+		checked[key] = true
+		if pending, perr := app.HasPendingLLMConsultOn(ctx, e.NodeID, e.AgentID); perr == nil && pending {
+			msg.pendingConsult[key] = true
 		}
 	}
 	msg.audit, msg.err = app.Audit(ctx, 50)
@@ -2930,7 +2933,7 @@ func (m Model) selectedAudit() *domain.AuditRecord {
 // be a retryable LLM failure (timeout / no-submit) with no consult currently
 // in flight for its agent.
 func (m Model) canRetry(rec domain.AuditRecord) bool {
-	return domain.IsRetryableLLMEscalation(&rec) && !m.data.pendingConsult[rec.AgentID]
+	return domain.IsRetryableLLMEscalation(&rec) && !m.data.pendingConsult[consultKey(rec.NodeID, rec.AgentID)]
 }
 
 // --- Escalation / audit actions ---
@@ -3225,7 +3228,7 @@ func (m Model) retrySelected() (tea.Model, tea.Cmd) {
 		m.message = "retry LLM: only for a failed or timed-out LLM escalation"
 		return m, nil
 	}
-	if m.data.pendingConsult[rec.AgentID] {
+	if m.data.pendingConsult[consultKey(rec.NodeID, rec.AgentID)] {
 		m.message = "retry LLM: a consult is already running for this agent"
 		return m, nil
 	}
@@ -4263,8 +4266,18 @@ func (m Model) focusSelectedEscalation() (tea.Model, tea.Cmd) {
 	if rec == nil {
 		return m, nil
 	}
+	// A remote escalation's agent id may also name a LOCAL pane (herdr's ids
+	// repeat across machines); focusing that would move the operator's view to
+	// the wrong agent — and focus of a remote agent is local-only by design.
+	if rec.NodeID != "" && rec.NodeID != m.data.status.NodeID {
+		m.message = fmt.Sprintf("agent %s is on node %s — focus is local-only", m.data.status.EscalationAgent(*rec), m.data.status.NodeLabel(rec.NodeID))
+		return m, nil
+	}
 	return m.focusAgentByID(rec.AgentID)
 }
+
+// consultKey identifies an agent across the fleet for the pending-consult map.
+func consultKey(nodeID, agentID string) string { return nodeID + "\x00" + agentID }
 
 // --- Detail view (v) ---
 

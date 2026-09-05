@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	turso "turso.tech/database/tursogo"
@@ -61,7 +62,16 @@ type DB struct {
 	raw  *sql.DB
 	exec *sqlbridge.Executor
 	db   *sql.DB
+	// ops counts sync operations in flight, so Close can wait for them: a
+	// native operation is never cancelled, and closing the handle underneath
+	// one is a use-after-close.
+	ops sync.WaitGroup
 }
+
+// closeWait bounds how long Close waits for in-flight sync operations. Past
+// it the handle is deliberately LEFT OPEN — the process is exiting anyway, and
+// a leak is safer than closing under a native call.
+const closeWait = 10 * time.Second
 
 // ErrBootstrap reports that the local file could not be created from the
 // remote — the first start of a node needs Turso Cloud reachable. The daemon
@@ -153,6 +163,8 @@ func (d *DB) Executor() *sqlbridge.Executor { return d.exec }
 // gate and is never cancelled (see the package comment); changed reports
 // whether anything new arrived.
 func (d *DB) Pull() (changed bool, err error) {
+	d.ops.Add(1)
+	defer d.ops.Done()
 	d.exec.Lock()
 	defer d.exec.Unlock()
 	return d.sdb.Pull(context.Background())
@@ -160,6 +172,8 @@ func (d *DB) Pull() (changed bool, err error) {
 
 // Push sends local changes to the remote.
 func (d *DB) Push() error {
+	d.ops.Add(1)
+	defer d.ops.Done()
 	d.exec.Lock()
 	defer d.exec.Unlock()
 	return d.sdb.Push(context.Background())
@@ -168,14 +182,24 @@ func (d *DB) Push() error {
 // Checkpoint compacts the local WAL (auto-checkpoint is off for sync
 // databases, so a node that never checkpoints grows its WAL forever).
 func (d *DB) Checkpoint() error {
+	d.ops.Add(1)
+	defer d.ops.Done()
 	d.exec.Lock()
 	defer d.exec.Unlock()
 	return d.sdb.Checkpoint(context.Background())
 }
 
-// Stats reports the sync engine's counters.
-func (d *DB) Stats(ctx context.Context) (ports.FleetSyncStats, error) {
-	st, err := d.sdb.Stats(ctx)
+// Stats reports the sync engine's counters. Like Pull and Push it drives a
+// native sync-engine operation, so it takes the gate and runs on a background
+// context: a caller's cancellation mid-operation is exactly the abandoned op
+// that wedges the next Push (see the package comment). The ctx parameter is
+// kept for the port; it is deliberately not passed through.
+func (d *DB) Stats(_ context.Context) (ports.FleetSyncStats, error) {
+	d.ops.Add(1)
+	defer d.ops.Done()
+	d.exec.Lock()
+	defer d.exec.Unlock()
+	st, err := d.sdb.Stats(context.Background())
 	if err != nil {
 		return ports.FleetSyncStats{}, err
 	}
@@ -193,11 +217,33 @@ func (d *DB) Stats(ctx context.Context) (ports.FleetSyncStats, error) {
 	return out, nil
 }
 
-// Close closes the gated handle and the pool.
+// Close closes the gated handle and the pool — once every sync operation in
+// flight has returned. One that has not returned within closeWait is a native
+// call stuck on the network; the handle is then left open (a leak for the
+// remaining life of the process) rather than closed underneath it, and Close
+// says so.
 func (d *DB) Close() error {
+	if !waitBounded(&d.ops, closeWait) {
+		return fmt.Errorf("turso: a sync operation is still running after %s; leaving the database open rather than closing it underneath the call", closeWait)
+	}
 	err := d.db.Close()
 	if rerr := d.raw.Close(); err == nil {
 		err = rerr
 	}
 	return err
+}
+
+// waitBounded waits for wg up to d, reporting whether it finished.
+func waitBounded(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }

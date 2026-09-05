@@ -26,7 +26,7 @@ var nodeScopedTables = map[string]bool{
 	"task_reservations": true, "llm_requests": true, "llm_decisions": true, "llm_retries": true,
 	"corrections": true, "kill_events": true, "audit_log": true, "agent_actions": true,
 	"agent_roster": true, "herdr_locations": true, "roster_meta": true, "nodes": true,
-	"task_lists": true,
+	"task_lists": true, "legacy_imports": true,
 }
 
 // explicitIDTables are the INTEGER PRIMARY KEY tables: an INSERT must name id

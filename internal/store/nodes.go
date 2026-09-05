@@ -27,6 +27,24 @@ func (s *Store) UpsertNode(ctx context.Context, n domain.NodeInfo) error {
 	return err
 }
 
+// NodeBitsCollision reports another node whose 12-bit id bits equal this
+// node's. Ids carry only those 12 bits of the node id, so two such nodes would
+// share an id space and eventually mint the same PRIMARY KEY; the daemon
+// refuses to start on a collision rather than let that happen silently.
+func (s *Store) NodeBitsCollision(ctx context.Context) (domain.NodeInfo, bool, error) {
+	nodes, err := s.ListNodes(ctx)
+	if err != nil {
+		return domain.NodeInfo{}, false, err
+	}
+	mine := NodeBits(s.self)
+	for _, n := range nodes {
+		if n.ID != s.self && NodeBits(n.ID) == mine {
+			return n, true, nil
+		}
+	}
+	return domain.NodeInfo{}, false, nil
+}
+
 // StampWatching records that a TUI on THIS node is watching the fleet until
 // the given time. Other nodes' daemons read it (RemoteWatchers) to publish
 // their roster faster while anyone is looking.

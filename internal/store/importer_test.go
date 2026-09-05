@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -186,5 +185,66 @@ func TestImportLegacyWithoutALegacyFileIsANoop(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "marker")); err == nil {
 		t.Error("a no-op import must not write the marker")
 	}
-	var _ *sql.DB = s.db
+	_ = s.db
+}
+
+// TestImportRunsOnceEvenWithoutTheMarkerFile: the import records itself in the
+// shared store inside its own transaction, so losing the local marker file (a
+// crash right after the commit) cannot cause a second import that would
+// duplicate every row under fresh ids.
+func TestImportRunsOnceEvenWithoutTheMarkerFile(t *testing.T) {
+	ctx := context.Background()
+	legacyDir := t.TempDir()
+	legacyPath := filepath.Join(legacyDir, "hap.db")
+	src, err := Open(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.AppendAudit(ctx, domain.AuditRecord{AgentID: "1", AgentType: "claude", Trigger: "t",
+		SituationType: domain.SituationIdle, Action: "noop", Status: "auto", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	src.Close()
+
+	dstDir := t.TempDir()
+	dstDB, err := openRawSQLite(t, filepath.Join(dstDir, "shared.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	self, err := LoadNodeID(legacyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := OpenDB(dstDB, Options{NodeID: self, Engine: EngineSQLite, IDs: NewTimeOrderedIDs(3, nil), Migrate: true,
+		AgentLockDir: filepath.Join(dstDir, "locks")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	marker := filepath.Join(dstDir, "imported")
+	count := func() int {
+		log, err := dst.AuditLog(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(log)
+	}
+	if err := ImportLegacy(ctx, legacyPath, marker, dst); err != nil {
+		t.Fatal(err)
+	}
+	if count() != 1 {
+		t.Fatalf("after the import: %d audit rows, want 1", count())
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := ImportLegacy(ctx, legacyPath, marker, dst); err != nil {
+		t.Fatalf("second import must be a no-op, got %v", err)
+	}
+	if count() != 1 {
+		t.Fatalf("the import ran twice: %d audit rows", count())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("the marker cache should be rewritten from the store's record: %v", err)
+	}
 }

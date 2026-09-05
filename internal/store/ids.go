@@ -32,15 +32,40 @@ type TimeOrderedIDs struct {
 	now    func() time.Time
 	lastMs int64
 	seq    int64
+	// The sequence range this allocator owns within a millisecond. The
+	// daemon takes the lower half and a front end's FALLBACK allocator the
+	// upper half, so the two never mint the same id on one node even when
+	// the front end could not reach the daemon for its ids.
+	seqBase, seqLimit int64
 }
 
-// NewTimeOrderedIDs returns an allocator for the given 12-bit node value. now
-// defaults to time.Now.
+// seqPerMs is the sequence space per millisecond; seqHalf splits it between
+// the daemon (lower) and a front end's fallback (upper).
+const (
+	seqPerMs = 1 << 10
+	seqHalf  = seqPerMs / 2
+)
+
+// NewTimeOrderedIDs returns the DAEMON's allocator for the given 12-bit node
+// value: sequence 0..511 in each millisecond. now defaults to time.Now.
 func NewTimeOrderedIDs(node uint16, now func() time.Time) *TimeOrderedIDs {
+	return newTimeOrderedIDs(node, now, 0, seqHalf)
+}
+
+// NewFallbackTimeOrderedIDs returns the allocator a FRONT END uses when the
+// daemon cannot hand out ids: the same node bits, sequence 512..1023, so an id
+// minted here can never equal one the daemon minted in the same millisecond.
+// Two front ends both falling back in the same millisecond remain a
+// collision, which is why the fallback is the exception and logged.
+func NewFallbackTimeOrderedIDs(node uint16, now func() time.Time) *TimeOrderedIDs {
+	return newTimeOrderedIDs(node, now, seqHalf, seqPerMs)
+}
+
+func newTimeOrderedIDs(node uint16, now func() time.Time, base, limit int64) *TimeOrderedIDs {
 	if now == nil {
 		now = time.Now
 	}
-	return &TimeOrderedIDs{node: node & 0xFFF, now: now, lastMs: -1}
+	return &TimeOrderedIDs{node: node & 0xFFF, now: now, lastMs: -1, seqBase: base, seqLimit: limit}
 }
 
 // Next returns the next id.
@@ -56,12 +81,12 @@ func (g *TimeOrderedIDs) Next() int64 {
 	}
 	if ms == g.lastMs {
 		g.seq++
-		if g.seq >= 1<<10 {
+		if g.seq >= g.seqLimit {
 			ms++
-			g.seq = 0
+			g.seq = g.seqBase
 		}
 	} else {
-		g.seq = 0
+		g.seq = g.seqBase
 	}
 	g.lastMs = ms
 	return ms<<22 | int64(g.node)<<10 | g.seq

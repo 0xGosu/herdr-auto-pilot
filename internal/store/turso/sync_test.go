@@ -292,3 +292,42 @@ func TestTwoNodesShareASQLiteProviderTaskList(t *testing.T) {
 		t.Fatalf("B sees A's reservation = %+v", l)
 	}
 }
+
+// TestSchemaLeaseIsExclusiveBetweenTwoNodes: two nodes claiming the schema
+// lease at the same moment both write the row, the remote keeps one, and after
+// the settle exactly one of them reads itself as the owner — the property the
+// DDL race needs, which elapsed time alone never gave.
+func TestSchemaLeaseIsExclusiveBetweenTwoNodes(t *testing.T) {
+	url := startLocalSyncServer(t)
+	a := openNode(t, url, "aaaaaaaaaaaaaaaa")
+	a.sync(t)
+	b := openNode(t, url, "bbbbbbbbbbbbbbbb")
+	ctx := context.Background()
+
+	results := make(chan bool, 2)
+	errs := make(chan error, 2)
+	for _, n := range []*node{a, b} {
+		go func(n *node) {
+			got, err := turso.AcquireSchemaLease(ctx, n.db, n.id, time.Now)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- got
+		}(n)
+	}
+	owners := 0
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			t.Fatal(err)
+		case got := <-results:
+			if got {
+				owners++
+			}
+		}
+	}
+	if owners != 1 {
+		t.Fatalf("%d nodes believe they hold the schema lease, want exactly 1", owners)
+	}
+}

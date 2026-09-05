@@ -16,8 +16,13 @@ import (
 
 // ImportLegacy copies this machine's local sqlite database into dst — the
 // shared store — once: the first time the turso engine starts on a machine that
-// already has history. markerPath records that it happened; a missing legacy
-// file or a present marker is a no-op.
+// already has history. A missing legacy file is a no-op.
+//
+// "Once" is recorded in the shared store ITSELF, inside the import's
+// transaction (legacy_imports), so a crash between the commit and any
+// bookkeeping cannot cause a second import — which would duplicate every audit
+// and decision row under fresh ids. markerPath is only a local cache of that
+// fact: present, it saves opening the legacy file; absent, the row decides.
 //
 // Ids are re-allocated through dst's allocator, in ascending old-id order per
 // table so relative order (and every "newest by id" query) survives, and every
@@ -50,22 +55,34 @@ func ImportLegacy(ctx context.Context, legacyPath, markerPath string, dst *Store
 	}
 	defer src.Close()
 
-	imp := &importer{src: src, dst: dst, ctx: ctx,
+	imp := &importer{src: src, dst: dst, ctx: ctx, legacyPath: legacyPath,
 		decisions: map[int64]int64{}, audits: map[int64]int64{}, corrections: map[int64]int64{}}
-	if err := dst.tx(ctx, imp.run); err != nil {
+	err = dst.tx(ctx, imp.run)
+	switch {
+	case errors.Is(err, errAlreadyImported):
+		slog.Info("the local sqlite database was already imported into the shared store", "from", legacyPath)
+	case err != nil:
 		return fmt.Errorf("import: %w", err)
+	default:
+		slog.Info("imported the local sqlite database into the shared store",
+			"from", legacyPath, "decisions", len(imp.decisions), "audit_rows", len(imp.audits))
 	}
+	// Best effort: the row above is the record; this only spares the next
+	// start the legacy open.
 	if err := os.WriteFile(markerPath, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
-		return fmt.Errorf("import: write marker: %w", err)
+		slog.Warn("import: marker file not written; the shared store still records the import", "path", markerPath, "error", err)
 	}
-	slog.Info("imported the local sqlite database into the shared store",
-		"from", legacyPath, "decisions", len(imp.decisions), "audit_rows", len(imp.audits))
 	return nil
 }
+
+// errAlreadyImported is the importer's own signal that legacy_imports already
+// holds this node's row: the transaction rolls back untouched.
+var errAlreadyImported = errors.New("already imported")
 
 type importer struct {
 	src, dst    *Store
 	ctx         context.Context
+	legacyPath  string
 	decisions   map[int64]int64
 	audits      map[int64]int64
 	corrections map[int64]int64
@@ -76,6 +93,13 @@ type row map[string]any
 
 func (im *importer) run(tx *sql.Tx) error {
 	self := im.dst.self
+	var done int
+	if err := tx.QueryRowContext(im.ctx, `SELECT count(*) FROM legacy_imports WHERE node_id = ?`, self).Scan(&done); err != nil {
+		return err
+	}
+	if done > 0 {
+		return errAlreadyImported
+	}
 	steps := []struct {
 		table string
 		cols  string
@@ -155,7 +179,9 @@ func (im *importer) run(tx *sql.Tx) error {
 			return fmt.Errorf("%s: %w", st.table, err)
 		}
 	}
-	return nil
+	_, err := tx.ExecContext(im.ctx, `INSERT INTO legacy_imports (node_id, legacy_path, imported_at) VALUES (?, ?, ?)`,
+		self, im.legacyPath, unix(time.Now()))
+	return err
 }
 
 func stampNode(self string) func(r row) { return func(r row) { r["node_id"] = self } }

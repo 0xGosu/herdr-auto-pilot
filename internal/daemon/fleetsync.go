@@ -25,8 +25,13 @@ import (
 //
 // Every operation runs on a background goroutine, never on the select loop,
 // and — this is load-bearing — is never cancelled mid-flight: an abandoned
-// sync operation wedges the engine (see internal/store/turso). Shutdown waits
-// a bounded time for the final push and then lets it go.
+// sync operation wedges the engine (see internal/store/turso). The LOOP,
+// though, must not be held hostage by an operation that hangs (a native call
+// waiting on a dead network): each operation runs on its own goroutine and the
+// loop waits for it OR for shutdown, so shutdownBackground always returns and
+// the daemon lock is released for a successor. An operation still running at
+// shutdown is left to the adapter, whose Close waits a bounded time for it and
+// refuses to close the native handle underneath it (turso.DB.Close).
 
 // fleetPushDebounce is how long the loop waits after a local write before
 // pushing, so a burst of writes (a decision, its audit row, a rate update)
@@ -47,7 +52,6 @@ const fleetShutdownPushBudget = 5 * time.Second
 // fleetSyncState is what the health record and `hap status` report.
 type fleetSyncState struct {
 	mu          sync.Mutex
-	bootstrap   bool
 	lastPull    time.Time
 	lastPush    time.Time
 	lastError   string
@@ -121,10 +125,35 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 			}
 		case <-pushC:
 			pushTimer, pushC = nil, nil
-			d.fleetPush(sync)
+			if !d.fleetRun(ctx, "push", func() { d.fleetPush(sync) }) {
+				return
+			}
 		case <-pull.C:
-			d.fleetPull(ctx, sync)
+			if !d.fleetRun(ctx, "pull", func() { d.fleetPull(ctx, sync) }) {
+				return
+			}
 		}
+	}
+}
+
+// fleetRun runs one sync operation off the loop and waits for it to finish or
+// for ctx to end, whichever comes first. It reports false when ctx ended
+// first: the operation is still running (never cancelled — see the package
+// comment), the loop must return so shutdown can proceed, and the final push
+// is skipped, since it would only queue behind the gate the hung operation
+// holds.
+func (d *Daemon) fleetRun(ctx context.Context, name string, op func()) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		op()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		slog.Warn("fleet sync: shutting down while an operation is still running; leaving it to the adapter", "op", name)
+		return false
 	}
 }
 

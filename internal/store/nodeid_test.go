@@ -1,11 +1,16 @@
 package store
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
 func TestNodeIDFileIsStableAcrossOpens(t *testing.T) {
@@ -152,5 +157,109 @@ func TestOpenDBTursoRequiresAnAllocator(t *testing.T) {
 	}
 	if _, err := OpenDB(db, Options{NodeID: "0123456789abcdef", Engine: EngineTurso, Migrate: true}); err == nil {
 		t.Fatal("turso without an id allocator must be refused")
+	}
+}
+
+// TestFallbackIDsNeverCollideWithTheDaemons: a front end that could not reach
+// the daemon mints from the upper half of the per-millisecond sequence, so the
+// same node bits in the same millisecond never yield the daemon's id.
+func TestFallbackIDsNeverCollideWithTheDaemons(t *testing.T) {
+	fixed := time.Unix(1_800_000_000, 0)
+	daemon := NewTimeOrderedIDs(7, func() time.Time { return fixed })
+	fallback := NewFallbackTimeOrderedIDs(7, func() time.Time { return fixed })
+	seen := map[int64]string{}
+	for i := 0; i < 3000; i++ { // past both halves, so the ms borrow is exercised too
+		for name, g := range map[string]*TimeOrderedIDs{"daemon": daemon, "fallback": fallback} {
+			id := g.Next()
+			if other, dup := seen[id]; dup {
+				t.Fatalf("id %d minted by both %s and %s", id, other, name)
+			}
+			seen[id] = name
+			if id>>10&0xFFF != 7 {
+				t.Fatalf("id %d lost its node bits", id)
+			}
+		}
+	}
+}
+
+// TestLoadNodeIDConvergesUnderAConcurrentFirstStart: the daemon and a TUI
+// starting together on a fresh state dir must agree on one id and neither may
+// see a half-written file.
+func TestLoadNodeIDConvergesUnderAConcurrentFirstStart(t *testing.T) {
+	dir := t.TempDir()
+	const n = 24
+	ids := make(chan string, n)
+	errs := make(chan error, n)
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	for i := 0; i < n; i++ {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			start.Wait()
+			id, err := LoadNodeID(dir)
+			if err != nil {
+				errs <- err
+				return
+			}
+			ids <- id
+		}()
+	}
+	start.Done()
+	done.Wait()
+	close(ids)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("a concurrent first start failed: %v", err)
+	}
+	first := ""
+	for id := range ids {
+		if first == "" {
+			first = id
+		}
+		if id != first {
+			t.Fatalf("two processes minted different ids: %s vs %s", first, id)
+		}
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, NodeIDFile+".tmp.*")); len(left) != 0 {
+		t.Errorf("temporary files left behind: %v", left)
+	}
+}
+
+// TestNodeBitsCollisionIsDetected: another node whose id hashes to the same
+// 12 bits is reported, so the daemon can refuse to share an id space.
+func TestNodeBitsCollisionIsDetected(t *testing.T) {
+	s, path := openTestStore(t)
+	ctx := context.Background()
+	if _, clash, err := s.NodeBitsCollision(ctx); err != nil || clash {
+		t.Fatalf("alone: clash=%v err=%v", clash, err)
+	}
+	// Brute-force an id sharing our bits (expected ~4096 tries).
+	mine := NodeBits(s.NodeID())
+	var twin string
+	for i := 0; i < 1<<20 && twin == ""; i++ {
+		cand := fmt.Sprintf("%016x", uint64(i)*0x9E3779B97F4A7C15+0x1234)
+		if cand != s.NodeID() && NodeBits(cand) == mine {
+			twin = cand
+		}
+	}
+	if twin == "" {
+		t.Fatal("no colliding id found")
+	}
+	other := openSecondNode(t, path, twin)
+	if err := other.UpsertNode(ctx, domain.NodeInfo{Label: "twin", LastSeen: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	got, clash, err := s.NodeBitsCollision(ctx)
+	if err != nil || !clash || got.ID != twin || got.Label != "twin" {
+		t.Fatalf("collision = %+v clash=%v err=%v, want the twin", got, clash, err)
+	}
+	// The twin sees us the same way once we have heartbeated.
+	if err := s.UpsertNode(ctx, domain.NodeInfo{Label: "me", LastSeen: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if got, clash, _ := other.NodeBitsCollision(ctx); !clash || got.ID != s.NodeID() {
+		t.Errorf("twin's view = %+v clash=%v", got, clash)
 	}
 }

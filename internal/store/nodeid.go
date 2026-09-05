@@ -28,8 +28,11 @@ var nodeIDRE = regexp.MustCompile(`^[a-f0-9]{16}$`)
 func ValidNodeID(id string) bool { return nodeIDRE.MatchString(id) }
 
 // LoadNodeID returns this installation's node id, minting and persisting one
-// in dir on first use. Creation is O_EXCL so two hap processes starting at the
-// same moment on a fresh state dir converge on one id: the loser re-reads.
+// in dir on first use. The file is written COMPLETE under a temporary name and
+// then hard-linked into place, which is atomic and exclusive: two hap
+// processes starting at the same moment on a fresh state dir converge on one
+// id, and the loser re-reads a file that is already whole. (An O_EXCL create
+// followed by a write let the loser read an EMPTY file and refuse to start.)
 //
 // A malformed file is an error, never silently replaced — the id is the key
 // under which every row this node ever wrote is filed, and minting a new one
@@ -49,18 +52,17 @@ func LoadNodeID(dir string) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("create state dir for node id: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
+	tmp := path + ".tmp." + id
+	if err := os.WriteFile(tmp, []byte(id+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("write node id: %w", err)
+	}
+	defer os.Remove(tmp)
+	if err := os.Link(tmp, path); err != nil {
 		if errors.Is(err, fs.ErrExist) {
+			// Another process won; its file is complete because it, too,
+			// was linked into place whole.
 			return readNodeID(path)
 		}
-		return "", fmt.Errorf("write node id: %w", err)
-	}
-	if _, err := f.WriteString(id + "\n"); err != nil {
-		f.Close()
-		return "", fmt.Errorf("write node id: %w", err)
-	}
-	if err := f.Close(); err != nil {
 		return "", fmt.Errorf("write node id: %w", err)
 	}
 	return id, nil

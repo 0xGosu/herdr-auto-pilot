@@ -2027,6 +2027,16 @@ func (a *App) HasPendingLLMConsult(ctx context.Context, agentID string) (bool, e
 	return a.Store.HasPendingLLMConsult(ctx, agentID)
 }
 
+// HasPendingLLMConsultOn is HasPendingLLMConsult for an agent on a given node
+// ("" = this one). Pane ids repeat across machines, so a remote escalation's
+// retry gate must ask about ITS node's agent, not a local namesake.
+func (a *App) HasPendingLLMConsultOn(ctx context.Context, nodeID, agentID string) (bool, error) {
+	if nodeID == "" || nodeID == a.Store.NodeID() {
+		return a.Store.HasPendingLLMConsult(ctx, agentID)
+	}
+	return a.Store.HasPendingLLMConsultOn(ctx, nodeID, agentID)
+}
+
 // DefaultPruneMinutes is how old a pending escalation must be before a
 // prune dismisses it, absent an explicit age (CLI argument / TUI prompt).
 const DefaultPruneMinutes = 360

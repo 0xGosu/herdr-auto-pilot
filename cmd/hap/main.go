@@ -424,6 +424,19 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		if err := turso.PrepareSharedSchema(ctx, tdb, st, time.Now); err != nil {
 			return fmt.Errorf("turso: prepare schema: %w", err)
 		}
+		// Ids carry 12 bits of the node id; two nodes sharing them would share
+		// an id space. Refuse now, before this node writes anything, rather
+		// than collide later — and say which file to regenerate, and where.
+		if other, clash, err := st.NodeBitsCollision(ctx); err == nil && clash {
+			label := other.Label
+			if label == "" {
+				label = other.ID
+			}
+			return fmt.Errorf("turso: this node's id bits collide with node %s (%s), so ids minted here could equal "+
+				"that machine's — stop this daemon, move %s aside and start again on whichever of the two machines has "+
+				"never written to the shared store (its rows would otherwise stay filed under the old id)",
+				label, other.ID, filepath.Join(paths.StateDir, store.NodeIDFile))
+		}
 		if err := importLegacyStore(ctx, paths, st); err != nil {
 			slog.Warn("turso: importing the local sqlite database failed; continuing without it", "error", err)
 		}

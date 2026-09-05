@@ -179,6 +179,17 @@ const createTaskLists = `CREATE TABLE IF NOT EXISTS task_lists (
 	PRIMARY KEY (node_id, name)
 );`
 
+// legacy_imports records, inside the import's own transaction, that a node's
+// local sqlite database has been folded into the shared store. A file marker
+// written AFTER the commit could be lost to a crash in between, and the next
+// start would import everything again under fresh ids — duplicating every
+// audit and decision row, which INSERT OR IGNORE cannot catch.
+const createLegacyImports = `CREATE TABLE IF NOT EXISTS legacy_imports (
+	node_id TEXT PRIMARY KEY,
+	legacy_path TEXT NOT NULL,
+	imported_at INTEGER NOT NULL
+);`
+
 const schema = `
 CREATE TABLE IF NOT EXISTS signatures (
 	signature TEXT PRIMARY KEY,
@@ -404,6 +415,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_roster_live ON agent_roster(node_id, gone_a
 ` + createRosterMeta + `
 ` + createTaskHandouts + `
 ` + createTaskLists + `
+` + createLegacyImports + `
 -- One row per installation sharing this database: who is out there, what
 -- version they run, and when their daemon last checked in. A node whose
 -- last_seen is older than a few heartbeats is shown as stale, and its rows are
@@ -672,7 +684,7 @@ func (s *Store) SchemaCurrent(ctx context.Context) (bool, error) {
 	// table missing from this list would never be created on any node that
 	// bootstrapped before it existed. (PRAGMA table_info on an absent table
 	// yields no rows, so hasColumn answers false for it.)
-	for _, table := range []string{"roster_meta", "nodes", "task_lists"} {
+	for _, table := range []string{"roster_meta", "nodes", "task_lists", "legacy_imports"} {
 		has, err := s.hasColumn(ctx, table, "node_id")
 		if err != nil || !has {
 			return false, err
